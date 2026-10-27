@@ -1349,3 +1349,29 @@ def test_churn_watch_names_the_owning_project_only_when_the_fork_rate_stays_high
     import pathlib
     src = pathlib.Path(churnwatch.__file__).read_text()
     assert "os.kill(" not in src and "import signal" not in src, "read-only: it signals nothing"
+
+
+def test_a_workers_build_cap_is_no_core_request_of_its_detached_job_but_a_command_s_own_makeflags_is(env, tmp_path):
+    # The daemon gives every worker MAKEFLAGS=-j<k> (testslots.worker_env); its own environment has none.
+    # A job a worker detaches inherits the cap: that is no request, else every idle wait reads as under-used.
+    from ttp import testslots
+    p = make(env)
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    daemon = subprocess.Popen(["sleep", "60"], env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")})
+    try:
+        (p.state / "daemon.pid").write_text(str(daemon.pid))
+        cap = testslots.worker_env(p.config())
+        assert cap.get("MAKEFLAGS"), cap
+        run_env = {"TTP_HOME": str(env["home"]), "TTP_HOST": "testhost", "TTP_RUN_DIR": str(run_dir),
+                   "TTP_TASK": "41", "TTP_RUN_ID": "7", **cap}
+        for name, cmd, extra, want in (("idle", ["sleep", "0"], {}, {}),
+                                       ("own", ["sleep", "0"], {"MAKEFLAGS": "-j16"}, {"cores": 16}),
+                                       ("said", ["sh", "-c", "MAKEFLAGS=-j16 make"], {}, {"cores": 16})):
+            r = _ttp_run(p, "detach", name, "--", *cmd, env={**run_env, **extra})
+            assert r.returncode == 0, r.stderr
+            job = [j for j in json.loads((run_dir / "detached.json").read_text()) if j["name"] == name][0]
+            assert job["requested"] == want, (name, job["requested"])
+    finally:
+        daemon.kill()
+        daemon.wait()

@@ -4469,6 +4469,22 @@ def cmd_progress(a) -> None:
         print(f"ttp progress report: not recorded ({e})", file=sys.stderr)
 
 
+def _job_base_env(state: Path | None) -> dict | None:
+    """The environment a worker's detached job inherits without asking: the daemon's own plus the caps
+    the daemon gives every worker (testslots.worker_env: MAKEFLAGS, the test slot share), so the
+    harness's build cap is no core request (jobuse.requested). None outside a run or when the daemon's
+    environment cannot be read."""
+    from . import jobuse, testslots
+    base = jobuse.daemon_env(state / "daemon.pid") if state is not None else None
+    if base is None:
+        return None
+    try:
+        cfg = Project(state.parent).config()
+    except Exception:
+        cfg = None
+    return {**base, **testslots.worker_env(cfg)}
+
+
 def cmd_detach(a) -> None:
     """Start a long job that outlives this run: `ttp detach <name> -- <command...>`.
 
@@ -4613,8 +4629,7 @@ def cmd_detach(a) -> None:
                  **({"locks": job_locks} if job_locks else {}),
                  "requested": jobuse.requested(asked, os.environ, getattr(a, "cores", None),
                                                getattr(a, "devices", None), getattr(a, "mem_gb", None),
-                                               jobuse.daemon_env(rd.parent.parent / "daemon.pid")
-                                               if rd.parent.name == "runs" else None)})
+                                               _job_base_env(state))})
     how = (f"(pid {pid})" if pid else
            "(queued: this command's sandbox would end it, so the daemon starts it within seconds)")
     print(f"detached {a.name} {how}\nlog: {logf}\nrc:  {rc}\n"
