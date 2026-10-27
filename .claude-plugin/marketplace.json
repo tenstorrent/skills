@@ -39,6 +39,11 @@
       "name": "tt-serve-model",
       "source": "./plugins/tt-serve-model",
       "description": "Diagnose a model launch and verify a running server on Tenstorrent hardware, deterministically and evidence-based."
+    },
+    {
+      "name": "tt-dit-bringup",
+      "source": "./plugins/tt-dit-bringup",
+      "description": "tt_dit model bring-up (diffusion transformers, VAEs, text encoders): correctness, profiling, optimization and a campaign loop, with local, batch, or Slurm device runs."
     }
   ]
 }

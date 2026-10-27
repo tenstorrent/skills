@@ -1,0 +1,35 @@
+{
+  "name": "tt-dit-bringup",
+  "version": "0.1.0",
+  "description": "Bring models up in models/tt_dit (diffusion transformers, VAEs, text encoders, full image/video pipelines) on TTNN: per-component correctness against the reference, profiling, optimization, kernel research, and a multi-session campaign loop, with device runs on the local host, through a batch submit command, or in a Slurm allocation.",
+  "author": {
+    "name": "Tenstorrent"
+  },
+  "homepage": "https://github.com/tenstorrent/skills",
+  "repository": "https://github.com/tenstorrent/skills",
+  "license": "Apache-2.0",
+  "keywords": [
+    "tenstorrent",
+    "ttnn",
+    "tt_dit",
+    "diffusion",
+    "model-bringup"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Tenstorrent DiT Bring-up",
+    "shortDescription": "Bring tt_dit models up on TTNN",
+    "longDescription": "Bring models up in models/tt_dit (diffusion transformers, VAEs, text encoders, full image/video pipelines) on TTNN: per-component correctness against the reference, profiling, optimization, kernel research, and a multi-session campaign loop, with device runs on the local host, through a batch submit command, or in a Slurm allocation.",
+    "developerName": "Tenstorrent",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Staged tt_dit model bring-up",
+      "Required-artifact gates",
+      "Local, batch, and Slurm device backends"
+    ],
+    "websiteURL": "https://github.com/tenstorrent/skills",
+    "defaultPrompt": [
+      "Use dit-bringup to bring this diffusion model up in models/tt_dit."
+    ]
+  }
+}

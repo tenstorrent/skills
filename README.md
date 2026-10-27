@@ -48,6 +48,7 @@ automatically for matching tasks; you can also ask your agent to make them expli
 | `tt-debug-tools` | Drive the Tenstorrent debug tools and read their output: tt-triage, dprint, watcher, asserts, etc. See [`plugins/tt-debug-tools/README.md`](plugins/tt-debug-tools/README.md) |
 | `tt-buddy` | A coding agent with Tenstorrent operating principles: takes notes all the time, learns when needed, keeps the diff minimal. Device runs need [`tt-device-mcp`](https://github.com/tenstorrent/tt-device-mcp). See [`plugins/tt-buddy/README.md`](plugins/tt-buddy/README.md) |
 | `tt-serve-model` | Take a model from host discovery to a verified server on Tenstorrent hardware: discover the host (boards vs ASICs, `--tt-device` string, driver/firmware, hugepages, docker, device holders, reset verdict), retrieve the model (HF gating, tt-inference-server spec entry, image spec drift, GHCR tag/ancestry, tt-model-manager bundles, exact pull command), diagnose a launch (stage/hang/failure classification, mandatory docker flags, override safety, timing, displaced services) and verify the running server (health, correctness, mesh utilization, throughput/batching, reasoning-model checks). |
+| `tt-dit-bringup` | Bring tt_dit models (diffusion transformers, VAEs, text encoders, full pipelines) up on TTNN through gated stages ending in a bring-up report: per-component correctness, profiling and Tracy reading, optimization, kernel research, and a multi-session campaign loop. Device runs on the local host, through a batch submit command, or in a Slurm allocation. See [`plugins/tt-dit-bringup/README.md`](plugins/tt-dit-bringup/README.md) |
 
 AutoDebug investigates in a fresh agent process and writes `AUTODEBUG.md`. AutoFix handles source
 changes and validation. For examples and expected outputs, see the
@@ -108,6 +109,7 @@ codex plugin add tt-debug-tools@tenstorrent-skills
 codex plugin add tt-buddy@tenstorrent-skills
 # tt-buddy ships session hooks: trust them in Codex with /hooks, then t.
 codex plugin add tt-serve-model@tenstorrent-skills
+codex plugin add tt-dit-bringup@tenstorrent-skills
 # Model bring-up also requires tt-autodebug:
 codex plugin add tt-model-bringup@tenstorrent-skills
 ```
@@ -131,6 +133,7 @@ Choose any optional plugins you want:
 /plugin install tt-debug-tools@tenstorrent-skills
 /plugin install tt-buddy@tenstorrent-skills
 /plugin install tt-serve-model@tenstorrent-skills
+/plugin install tt-dit-bringup@tenstorrent-skills
 ```
 
 For model bring-up, install `tt-autodebug` above and then:
@@ -245,6 +248,7 @@ Primary author is the top contributor to that path by commit count.
 | [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `.github/bug_checker` | [@stevendae](https://github.com/stevendae) | Rules distilled from ~1,398 merged fix PRs: program-cache correctness, op validation, CCL ring buffers, stale LLK config. Strong evidence of which failures *recur* |
 | [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `tech_reports/Handling_Special_Value` | [@ttmtrajkovic](https://github.com/ttmtrajkovic) | NaN/Inf/denormal semantics and the FPU/SFPU divergence |
 | [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `docs/source/tt-metalium/tools`, `tt_metal/impl/debug`, `tt_metal/tools`, `tt_metal/hw/inc/api/debug` | *see note below* | The `tt-debug-tools` plugin: watcher, DPRINT, NoC debug dump, asserts and the LLK sanitizer, Inspector, triage, the device profiler, and TTNN's host-side debug flags |
+| [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `models/tt_dit/.claude` @ `kevinmi/tt-dit-skills` | [@kevinmi-TT](https://github.com/kevinmi-TT) | The `tt-dit-*` skills in `tt-dit-bringup`: bring-up, benchmarking and profile reading, optimization levers and fast paths, kernel research, the campaign loop, and the shared hang, parallelism and known-issue notes |
 | [`tenstorrent/tt-exalens`](https://github.com/tenstorrent/tt-exalens) | *see note below* | The `tt-exalens` skill: the command set, the server/remote and GDB modes, JTAG, and NoC selection |
 
 ### Structure and tooling

@@ -29,3 +29,6 @@
 
 # Model-deployment lifecycle (launch, verify; discover/retrieve to follow)
 /plugins/tt-serve-model/ @ctr-fmamedov-crypto @ndalyTT
+
+# tt_dit (diffusion) model bring-up
+/plugins/tt-dit-bringup/ @sosborne-TT @rsalmanTT @cglagovichTT

@@ -135,3 +135,18 @@ Install or enable it only after the user chooses it:
   Directory.
 - **Claude Code:** run `/plugin install tt-serve-model@tenstorrent-skills` after adding the
   `tenstorrent/skills` marketplace.
+
+## `tt-dit-bringup`
+
+Use for bringing tt_dit models up in TTNN: diffusion transformers, VAEs, text encoders, and full
+image or video pipelines under `models/tt_dit`. For autoregressive text LLMs, recommend
+`tt-model-bringup` instead. Covers per-component correctness, profiling, optimization, kernel
+research, and multi-session campaigns, with device runs on the local host, through a batch
+submit command, or in a Slurm allocation.
+
+Install or enable it only after the user chooses it:
+
+- **Codex / ChatGPT desktop:** select `tt-dit-bringup` under **Tenstorrent Skills** in the Plugins
+  Directory.
+- **Claude Code:** run `/plugin install tt-dit-bringup@tenstorrent-skills` after adding the
+  `tenstorrent/skills` marketplace.
