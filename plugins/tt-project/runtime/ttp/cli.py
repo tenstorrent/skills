@@ -8608,7 +8608,22 @@ def main(argv: list[str] | None = None) -> None:
 
     a = ap.parse_args(_project_name_argv(sub, _say_finding_argv(_say_all_argv(
         sys.argv[1:] if argv is None else list(argv)))))
+    dry_run_stub(a.cmd)
     a.fn(a)
+
+
+def dry_run_stub(cmd: str) -> None:
+    """Under an on_pass_cmd's dry run (onpassdry.ENV), `ttp note`, `notify` and `push` do nothing and
+    exit 0, and `ttp lock` is refused (exit 75, as a busy resource), so nothing leaves the run and no
+    device or shared machine is touched."""
+    from .onpassdry import ENV
+    if os.environ.get(ENV) != "1" or cmd not in ("note", "notify", "push", "lock"):
+        return
+    if cmd == "lock":
+        print(f"ttp lock: refused in an on_pass_cmd dry run ({ENV}=1)", file=sys.stderr)
+        sys.exit(75)
+    print(f"ttp {cmd}: skipped in an on_pass_cmd dry run ({ENV}=1)", file=sys.stderr)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

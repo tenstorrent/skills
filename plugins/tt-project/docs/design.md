@@ -80,7 +80,10 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    `on_pass_cmd`, run from the project root with the owner's HOME once its run has ended, and killed
    after `waiting.on_pass_timeout_s`; its exit 0
    with a `done` or `needs_review` hand-off at `$TTP_RESULT` ends the task; a failed or overrun
-   command wakes it at its own tier, anything else wakes it as usual.
+   command wakes it at its own tier, anything else wakes it as usual. A failed `ttp detach` job's
+   wake carries its log's last 20 lines and first error line. An `on_pass_cmd` is dry-run once when
+   its run hands off (`onpassdry.py`, `waiting.on_pass_dry_run`, on by default): a crash hands the
+   run back to its own session to fix the command.
    Before a due wait starts a model turn, the wait-wake gate (`waitgate.py`) decides whether one
    is needed. Must-wake events always wake: an escalation, any wake reason but a timer or "probe
    passed", a changed spec, a probe answer that changed since the last skip, and the cap

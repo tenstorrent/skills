@@ -202,7 +202,9 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
   prefer absolute paths). Exit 0 with a `done` or `needs_review` hand-off in
   `$TTP_RESULT` (else `on_pass`) ends the task; anything else wakes it with the output tail. It may use `ttp note` (also `--to`), nothing else that needs a run, and
   never acts as the user. Make it safe to run twice. Prefer `on_pass_cmd` to a light-wake `next_step`
-  when the check is mechanical.
+  when the check is mechanical. When you hand off, it is dry-run once with `TTP_ON_PASS_DRY_RUN=1`
+  (`ttp note`/`notify`/`push` do nothing, `ttp lock` is refused; exiting early is fine): a crash
+  (Traceback, exit 2/126/127, usage error) hands the run back to you to fix.
 <!-- ttp:if remote -->
   For a job on another machine (a device job goes through a device runner instead, when one is
   listed), start its driver there with `ttp detach --remote <ssh alias> <name> -- <command...>`

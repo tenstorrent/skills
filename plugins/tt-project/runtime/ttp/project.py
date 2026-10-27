@@ -137,6 +137,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "workstation": None,
                 # a waiting hand-off's on_pass_cmd, run model-free once its probe passes, is killed after
                 "on_pass_timeout_s": 600,
+                # and dry-run once (TTP_ON_PASS_DRY_RUN=1, this many seconds) when its run hands off, so a
+                # command that cannot run is fixed in that run's session, not after a wake (onpassdry.py)
+                "on_pass_dry_run": True, "on_pass_dry_run_timeout_s": 30,
                 # detached jobs' use of what they asked for (jobuse.py): sampled every sample_s; cores
                 # used under under_frac of the request, or an unused device, over window_s is under-use
                 # (one job_underuse event; the next check comes within check_cap_s)
@@ -1834,6 +1837,30 @@ def output_tail(text: str | bytes | None, limit: int = OUTPUT_TAIL) -> str:
     if isinstance(text, bytes):
         text = text[-4 * limit:].decode(errors="replace")
     return (text or "").strip()[-limit:].strip()
+
+
+_ESCAPES = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]")
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+TAIL_READ_BYTES = 256 * 1024   # file_tail reads at most this much of a file's end
+
+
+def clean_line(line: str, width: int = 400) -> str:
+    """One line of a command's output made safe to show a model or a chat: terminal escapes and control
+    characters out (a progress bar redrawn with carriage returns keeps its last frame), cut at `width`."""
+    line = _ESCAPES.sub("", line).rstrip("\r").rsplit("\r", 1)[-1]
+    line = _CONTROL.sub("", line)
+    return line if len(line) <= width else line[:width - 1] + "…"
+
+
+def file_tail(path, lines: int = 20, limit: int = 1500, width: int = 400) -> str:
+    """The last `lines` lines of a log (read from its last TAIL_READ_BYTES), each clean_line'd, at most
+    `limit` chars with the end kept. Raises OSError for a missing or unreadable file."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        f.seek(max(0, f.tell() - TAIL_READ_BYTES))
+        data = f.read()
+    text = "\n".join(clean_line(x, width) for x in data.decode(errors="replace").splitlines()[-lines:])
+    return text[-limit:]
 
 
 def _stamp_ts(stamp: str) -> float:

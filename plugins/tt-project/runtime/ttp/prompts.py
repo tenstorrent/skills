@@ -872,6 +872,17 @@ def worker_resume(p: Project, task: dict, lost: dict) -> str:
     own work."""
     at = lost.get("ended")
     when = timefmt.long(at, timefmt.home(p)) if isinstance(at, (int, float)) else "recently"
+    if lost.get("cause") == "dry_run":   # its hand-off stands but its on_pass_cmd cannot run (onpassdry)
+        text = (f"# Continue task #{task['id']}: {task['title']}\n"
+                f"Your waiting hand-off was not taken: {lost.get('dry_run')}\n"
+                f"This continues your session and does not count as an attempt (budget "
+                f"${task['budget_usd'] or 0:.2f}, spent ${task['spent_usd'] or 0:.2f}). Your detached jobs "
+                f"still run: do not start them again.\n")
+        if lost.get("dir"):
+            text += (f"This run has a new run directory, {RUN_DIR_MARK}: write the hand-off only to "
+                     f"$TTP_RUN_DIR/result.json, not under {lost['dir']}; a retry_when or on_pass_cmd that "
+                     f"names files under {lost['dir']} still reads them there.\n")
+        return "\n\n".join(x for x in (text, restrictions_pointer(p)) if x.strip())
     why = {"reboot": "the host rebooted", "sleep": "the host slept",
            "network": "the network went away"}.get(lost.get("cause"), "its supervisor was lost")
     free = lost.get("cause") in ("reboot", "sleep", "network")

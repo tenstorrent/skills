@@ -65,23 +65,88 @@ def failed_check(probe: str, rc) -> bool:
     that the probe itself is broken: the daemon then runs the hand-off's on_pass_cmd or wakes the task
     with the job's exit code, never as a passed probe."""
     return rc == FAILED_RC and bool(CHECK_RE.search(probe or ""))
+def _checked(probe: str, cwd=None) -> list[Path]:
+    """The local .rc paths a probe's `detach --check` names, relative to `cwd` (none for a --host one)."""
+    words = shlex.split(probe or "")
+    for i, w in enumerate(words):
+        if w == "--check":
+            out = []
+            for a in words[i + 1:]:
+                if a.startswith("-") or a in ("&&", "||", ";", "|"):
+                    break
+                out.append(Path(cwd or ".") / a)
+            return out
+    return []
+
+
 def failed_why(probe: str, rc, cwd=None) -> str:
     """How a failed check reads: "job rc=N" (the first failed job's exit code, read from the rc files the
     probe's `detach --check` names, relative to `cwd`), else "probe exit 4": 4 is the probe's, not the job's."""
     try:
-        words = shlex.split(probe or "")
-        for i, w in enumerate(words):
-            if w == "--check":
-                for a in words[i + 1:]:
-                    if a.startswith("-") or a in ("&&", "||", ";", "|"):
-                        break
-                    st, why = state(Path(cwd or ".") / a)
-                    if st == "ended" and why != "0":
-                        return f"job rc={why}"
-                break
+        for path in _checked(probe, cwd):
+            st, why = state(path)
+            if st == "ended" and why != "0":
+                return f"job rc={why}"
     except (OSError, ValueError):
         pass
     return f"probe exit {rc}"
+
+
+# The first line of a failed job's log that names its failure, case-sensitive so ordinary words do not
+# match: a Python traceback, any word ending in Error (ValueError, Error:), the word error or ERROR, and
+# FAIL or FAILED (pytest, ctest). Lower-case "fail"/"failed" is left out: "0 failed" is a pass.
+ERROR_RE = re.compile(r"Traceback \(most recent call last\)|\b\w*Error\b|\berror\b|\bERROR\b|\bFAIL(?:ED)?\b")
+ERROR_SCAN_BYTES = 8 * 1024 * 1024   # first_error reads at most this much of a log's start
+LOG_EXCERPT_CHARS = 4000             # failed_logs' whole text, every job's together
+
+
+def first_error(log: Path) -> tuple[int, str] | None:
+    """The first line of `log` ERROR_RE matches, with its line number. Raises OSError."""
+    from .project import clean_line
+    seen = 0
+    with open(log, "rb") as f:
+        for n, raw in enumerate(f, 1):
+            line = raw.decode(errors="replace")
+            if ERROR_RE.search(line):
+                return n, clean_line(line.rstrip("\n"), 300)
+            seen += len(raw)
+            if seen >= ERROR_SCAN_BYTES:
+                return None
+    return None
+
+
+def failed_logs(probe: str, cwd=None, limit: int = LOG_EXCERPT_CHARS) -> str:
+    """For each job a probe's local `detach --check` names that failed or is gone: its <name>.log's last
+    20 lines and its first error line (first_error), all within `limit` chars, so a woken run need not
+    look for them; one short line for a log that is missing or unreadable. '' when none applies."""
+    from .project import file_tail
+    try:
+        jobs = [rc for rc in _checked(probe, cwd) if (st := state(rc))[0] == "lost"
+                or st[0] == "ended" and st[1] != "0"]
+    except (OSError, ValueError):
+        return ""
+    if not jobs:
+        return ""
+    each = max(limit // len(jobs), 400)
+    parts = []
+    for rc in jobs:
+        log = rc.with_suffix(".log")
+        try:
+            hit = first_error(log)
+            tail = file_tail(log, 20, max(each - 450, 200), 200)
+        except FileNotFoundError:
+            parts.append(f"{log.name}: no log at {log}")
+            continue
+        except OSError as e:
+            parts.append(f"{log.name}: its log could not be read ({type(e).__name__}: {e.strerror or e})"[:300])
+            continue
+        first = (f"first error line (line {hit[0]}): {hit[1]}" if hit
+                 else "no line matches Traceback, *Error, error, ERROR or FAIL")
+        parts.append(f"{log.name} ({log}), last lines:\n{tail or '(empty)'}\n{first}")
+    text = "\n".join(parts)
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
 # Environment a queued job does not take from the run that queued it: the run's sandbox markers, and
 # secrets, which stay off disk (the daemon's own environment supplies them).
 _SKIP_ENV = ("TTP_PIDNS", "TTP_CGROUP")

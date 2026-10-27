@@ -88,6 +88,7 @@ from . import locks
 from . import machine_ledger
 from . import netwait
 from . import obligations
+from . import onpassdry
 from . import outagemsg
 from . import pageto
 from . import machines
@@ -136,7 +137,7 @@ from .db import (CHANGES_NEEDED, HARNESS_MERGED_KEY, NOT_ABANDONED_SQL, PAUSE_BO
                  without_deferral)
 from .project import rebase_replace
 from .project import (Project, command_env, deep_merge, layered, disk_resume_gb, durable_append, durable_write, git_fsync_env,
-                      hostname, nice_level, output_tail, own_free, own_push, push_allowed, zombie)
+                      file_tail, hostname, nice_level, output_tail, own_free, own_push, push_allowed, zombie)
 from .providers import get_provider
 from .providers.base import FUNDS_RE, last_json_object, scratch_dir, service_path
 from .providers.claude import as_windows
@@ -3015,6 +3016,8 @@ class Daemon:
             root_now = None
         if r["role"] != "coordinator" and r["task"]:
             self._prefetch_remote(r["task"], _read_result(run_dir / RESULT_FILE), run_dir)
+            if status == "ok":
+                self._dry_run_on_pass(r, run_dir, usage.session_id or note.get("session_id") or "")
         # The run's end, its spend and what it did to its task commit together: a daemon stopped
         # half way leaves the run "running", and the next tick processes it again from disk.
         with db.tx():
@@ -3756,6 +3759,11 @@ class Daemon:
                 not_before = time.time() + _retry_s(result)
                 extra["waiting_since"] = time.time()
                 reason = f"waiting for {what}; next try {timefmt.short(not_before, self.p)}"
+            if new == "queued" and "waiting_since" in extra and isinstance(result.get("on_pass_cmd"), str):
+                result, summary = self._dry_run_verdict(r, task, result, run_dir, extra, summary)
+                if onpassdry.KEY in extra:
+                    not_before = time.time()
+                    reason = "its on_pass_cmd dry run crashed; handed back to its session to fix"
             if new == "blocked":
                 # A block is the coordinator's to decide: whoever requeues it starts the count over.
                 extra["stale_wakes"] = 0
@@ -6331,7 +6339,21 @@ class Daemon:
         """The task's last run, when the host took it away (reboot, sleep, lost supervisor) after
         real progress and its agent session can be continued in the same working directory: a fresh
         start would pay again for everything that run read and did. None otherwise: failed,
-        timed-out and finished runs never resume, nor does a run whose hand-off stands."""
+        timed-out and finished runs never resume, nor does a run whose hand-off stands, except one
+        handed back because its on_pass_cmd's dry run crashed (onpassdry.KEY)."""
+        back = load_result(task["result"]).get(onpassdry.KEY)
+        if isinstance(back, dict):
+            r = self.p.db.one("SELECT * FROM runs WHERE id=?", (back.get("run"),))
+            session = back.get("session")
+            spec = _read_result(Path(r["dir"]) / "run.json") or {} if r and r["dir"] else {}
+            cwd, run_env = str(spec.get("cwd") or ""), spec.get("env") if isinstance(spec.get("env"), dict) else {}
+            prov = get_provider(provider)
+            if not r or r["provider"] != provider or not session or not cwd or not Path(cwd).is_dir() \
+                    or not prov.resume_args(session) or not prov.session_saved(session, cwd, run_env):
+                return None   # a fresh run reads the dry run's output as why it woke
+            return {"run": r["id"], "session": session, "cwd": cwd, "dir": str(r["dir"]), "ended": r["ended"],
+                    "cause": "dry_run", "dry_run": back.get("text") or "",
+                    "spec_sha": json.loads(r["note"] or "{}").get("spec_sha")}
         want = self.cfg["budget"].get("resume_lost")
         if not isinstance(want, dict):
             return None
@@ -8906,11 +8928,39 @@ class Daemon:
         except Exception:
             return ""
 
+    def _dry_run_verdict(self, r: dict, task: dict, result: dict, run_dir: Path, extra: dict,
+                         summary: str) -> tuple[dict, str]:
+        """What a waiting hand-off's on_pass_cmd dry run (_dry_run_on_pass) does to it, in `extra`: a
+        crash hands the run back to its own session at once (onpassdry.KEY; once per hand-off), or,
+        where that cannot be, keeps the hand-off with a warning in its summary and the task's notes; a
+        timeout or other non-zero exit records 'dry run inconclusive'. Returns the result and summary."""
+        got = onpassdry.load(run_dir, result.get("on_pass_cmd"))
+        if not got or got.get("verdict") == "ok":
+            return result, summary
+        if got.get("verdict") != "crash":
+            extra[onpassdry.NOTE_KEY] = onpassdry.inconclusive(got)
+            return result, summary
+        if got.get("session") and not load_result(task["result"]).get(onpassdry.KEY):
+            text = onpassdry.handback_text(got)
+            wake = (json.loads(r["note"] or "{}").get("wake") or {}).get("tier")
+            tier = wake if wake in bud.TIER_ORDER else task["tier"] if task["tier"] in bud.TIER_ORDER else "standard"
+            extra.pop("waiting_since", None)
+            extra.update({onpassdry.KEY: {"run": r["id"], "session": got["session"], "text": text},
+                          "woke": text, "escalated_wake": True})
+            log(self.p, f"task {task['id']} on_pass_cmd dry run crashed; handed back to session {got['session']}")
+            return {**result, "wake_tier": tier}, summary
+        warn = onpassdry.warning(got)
+        extra[onpassdry.NOTE_KEY] = warn
+        _task_note(run_dir, warn)
+        log(self.p, f"task {task['id']} {warn}")
+        return result, f"{warn}\n{summary}"[:1500]
+
     def _job_failed(self, task: dict, now: float) -> None:
         """A waiting task's `ttp detach --check` found its jobs ended, but one failed or left no exit
         code (detach.FAILED_RC): never a passed probe. The hand-off's on_pass_cmd, when it names one,
         decides model-free (_start_on_pass); else, or when it cannot run, the task wakes at once at
-        its own tier with the check's output (each job's `job finished rc=N`)."""
+        its own tier with the check's output (each job's `job finished rc=N`) and each failed job's log
+        tail and first error line (detach.failed_logs)."""
         out = (self._probe_out.get(task["id"]) or ("",))[0].strip()[-1500:] or "(no output)"
         why = f"{JOB_FAILED}:\n{out}"
         try:
@@ -8921,6 +8971,12 @@ class Daemon:
             return
         if started:
             why += f"\nits on_pass_cmd was not run: {started}"
+        try:   # the failed job's log tail and first error line, so the run need not look for them
+            logs = detach.failed_logs(str(load_result(task["result"]).get("retry_when") or ""), self.p.root)
+        except Exception as e:
+            logs = f"its job logs could not be read: {type(e).__name__}: {e}"[:300]
+        if logs:
+            why += f"\n{logs}"
         tier = task["tier"] if task["tier"] in bud.TIER_ORDER else "standard"
         self._wake_waiting(task, why, now, extra={"wake_tier": tier, "escalated_wake": True})
 
@@ -8963,11 +9019,10 @@ class Daemon:
         shutil.rmtree(out, ignore_errors=True)   # a result from an earlier try must not count
         out.mkdir(parents=True)
         timeout = float((self.cfg.get("waiting") or {}).get("on_pass_timeout_s") or ON_PASS_TIMEOUT_S)
-        # Only `ttp note` reads this context. Other commands must not become worker commands,
-        # even when the daemon inherited a run's environment. Keep deferred notes in the original
-        # run, where _finish_worker files them, rather than the disposable on_pass output folder.
-        env = {k: v for k, v in self._probe_env().items() if k not in ("TTP_RUN_DIR", "TTP_RUN_ID")}
-        env.update(task_env(tid), TTP_NOTE_RUN_DIR=str(r["dir"]), TTP_RESULT=str(out / RESULT_FILE))
+        # Keep deferred notes in the original run, where _finish_worker files them, rather than the
+        # disposable on_pass output folder.
+        env = self._on_pass_env(tid)
+        env.update(TTP_NOTE_RUN_DIR=str(r["dir"]), TTP_RESULT=str(out / RESULT_FILE))
         with open(out / ON_PASS_LOG, "wb") as f:
             proc = subprocess.Popen(cmd, shell=True, cwd=str(self.p.root), stdin=subprocess.DEVNULL, stdout=f,
                                     stderr=subprocess.STDOUT, start_new_session=True,
@@ -9010,10 +9065,9 @@ class Daemon:
                     or prev.get("on_pass_cmd") != cmd or prev.get("woke"):
                 continue   # cancelled, re-planned or woken meanwhile: this result is not its hand-off
             try:
-                lines = (out / ON_PASS_LOG).read_text(errors="replace").splitlines()[-20:]
+                tail = file_tail(out / ON_PASS_LOG) or "(no output)"
             except OSError:
-                lines = []
-            tail = "\n".join(lines)[-1500:] or "(no output)"
+                tail = "(no output)"
             result = _read_result(out / RESULT_FILE)
             if rc == 0 and result is None and fallback is not None:
                 result = fallback   # its checks passed and the command succeeded: the hand-off's on_pass
@@ -9123,6 +9177,36 @@ class Daemon:
             return "unclear", ("the checked commit is no longer the head of its worktree and branch, or it is not clean, "
                                "or its checks were a harness qualification (`ttp checks --purpose harness`)")
         return "pass", r, run_dir, with_waiting_followups(full["on_pass"], full), head
+
+    def _on_pass_env(self, tid: int) -> dict:
+        """The environment a task's on_pass_cmd runs with (and its dry run): the probes' (_probe_env), no
+        run's own variables, the task's. Only `ttp note` reads this context. Other commands must not
+        become worker commands, even when the daemon inherited a run's environment."""
+        env = {k: v for k, v in self._probe_env().items() if k not in ("TTP_RUN_DIR", "TTP_RUN_ID")}
+        env.update(task_env(tid))
+        return env
+
+    def _dry_run_on_pass(self, r: dict, run_dir: Path, session: str) -> None:
+        """A run that handed off `waiting` with an on_pass_cmd: that command's dry run (onpassdry), now,
+        before the transaction that records the hand-off reads it, with whether the run's agent session
+        can be continued to fix a crash. Once per run and command; any error leaves the hand-off as is."""
+        try:
+            result = _read_result(run_dir / RESULT_FILE)
+            cmd = result.get("on_pass_cmd") if isinstance(result, dict) else None
+            if not isinstance(result, dict) or result.get("status") != "waiting" or not isinstance(cmd, str) \
+                    or not cmd.strip() or not onpassdry.enabled(self.cfg) or onpassdry.load(run_dir, cmd):
+                return
+            got = onpassdry.run(cmd, self.p.root, self._on_pass_env(r["task"]), onpassdry.timeout_s(self.cfg))
+            if got["verdict"] == "crash" and session:
+                spec = _read_result(run_dir / "run.json") or {}
+                cwd, env = str(spec.get("cwd") or ""), spec.get("env") if isinstance(spec.get("env"), dict) else {}
+                prov = get_provider(r["provider"])
+                if cwd and Path(cwd).is_dir() and prov.resume_args(session) and prov.session_saved(session, cwd, env):
+                    got["session"] = session
+            onpassdry.save(run_dir, got)
+            log(self.p, f"task {r['task']} on_pass_cmd dry run: {got['verdict']} ({onpassdry.said(got)})")
+        except Exception as e:
+            log(self.p, f"task {r['task']}: the on_pass_cmd dry run could not run: {type(e).__name__}: {e}")
 
     def _probe_env(self) -> dict:
         """Probes and on_pass commands run `ttp` (e.g. `ttp lock --probe device-a`) as a worker would,
@@ -11985,7 +12069,7 @@ def _stale_wakes(prev: dict, key: dict, escalate: bool) -> int:
     if not isinstance(prev, dict) or prev.get("status") != "waiting":
         return 0
     n = bud.stale_wakes(prev)
-    if escalate or str(prev.get("woke") or "").startswith("the host rebooted"):
+    if escalate or str(prev.get("woke") or "").startswith("the host rebooted") or prev.get(onpassdry.KEY):
         return n
     before = prev.get("wait_key")
     if not isinstance(before, dict):
