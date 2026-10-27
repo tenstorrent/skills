@@ -10,8 +10,9 @@ environment) runs as it would without this plugin. This run
 keeps only the tests defined there (by the file their code is in, so a case file another module
 loads counts as itself), each case once per round, runs them round by round and starts each round at
 another fraction of a wall-clock second ("spread", default on), so a test that depends on the
-time's fraction meets another one each round. Each finished phase is appended as a JSON line to TTP_PYTEST_RERUN_OUT: {"test":
-"path::qualname", "round": k, "id": node id, "failed": bool}; a "selected" line lists the tests found.
+time's fraction meets another one each round. Each finished phase is appended as a JSON line to
+TTP_PYTEST_RERUN_OUT: {"test": "path::qualname", "round": k, "id": node id, "failed": bool}; a
+"selected" line lists the tests found.
 A run that keeps none exits 5, pytest's "no tests" status."""
 from __future__ import annotations
 

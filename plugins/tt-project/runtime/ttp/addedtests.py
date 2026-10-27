@@ -109,7 +109,8 @@ def env(tests: list[tuple[str, str]], out: Path, env: dict, rounds: int) -> dict
     pp = os.pathsep.join(filter(None, (str(PLUGIN_DIR), env.get("PYTHONPATH", ""))))
     opts = " ".join(filter(None, (env.get("PYTEST_ADDOPTS", ""), f"-p {PLUGIN}")))
     return {**env, "PYTHONPATH": pp, "PYTEST_ADDOPTS": opts,
-            ENV: json.dumps({"root": env.get("PWD", ""), "tests": [list(t) for t in tests], "rounds": rounds, "spread": SPREAD}), OUT: str(out)}
+            ENV: json.dumps({"root": env.get("PWD", ""), "tests": [list(t) for t in tests], "rounds": rounds,
+                             "spread": SPREAD}), OUT: str(out)}
 
 
 def tally(out: Path, tests: list[tuple[str, str]], rounds: int) -> dict:
