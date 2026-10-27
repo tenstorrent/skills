@@ -10,8 +10,10 @@ a running owner hears it at once through its steer.md. Attaching again changes n
 Each required owner has its own durable-progress clock (CLOCK_S, two hours). It starts when the task is
 attached and is reset only by that owner recording durable progress with evidence (`ttp obligation
 progress <id> "<commit, file or URL>"`). Nothing else resets it: task edits, token activity, the task
-running or waiting, a re-attach. A receipt (`ttp obligation receipt <id> "<evidence>"`) ends the
-obligation. An owner task that ends (done, failed, cancelled) without one leaves it owed and its clock
+running or waiting, a re-attach. An owner waiting on a `ttp detach` job of its own run is kept on time
+(not reset) while that job still runs and wrote a `ttp progress report result` line within the clock
+(_job_results): a pid or a growing log alone never counts. A receipt (`ttp obligation receipt <id>
+"<evidence>"`) ends the obligation. An owner task that ends (done, failed, cancelled) without one leaves it owed and its clock
 running. The harness records the evidence as given: checking it stays with the owner.
 
 Inside a run the CLI cannot write the project's database, so `progress` and `receipt` append to the
@@ -458,6 +460,60 @@ def overdue(o: dict, now: float) -> list[tuple[str, float]]:
     return out
 
 
+def _job_results(p, st: dict, now: float) -> dict[str, dict]:
+    """Per owner of an open obligation (task id), the latest `result` report (progress.py) a `ttp detach`
+    job of one of its own runs wrote on this boot within CLOCK_S, while that job still runs (progress._alive reads
+    detach.state: a job that wrote its .rc or is gone does not). A pid or a growing log alone never counts.
+    check reads it before its transaction: it reads the report file and each job's state."""
+    owners = {t for o in st["items"].values() if not (o["receipt"] or o.get("dropped") or o.get("promise"))
+              for t in o["owners"]}
+    if not owners:
+        return {}
+    from . import progress
+    from .runner import same_boot
+    recs = [r for r in progress.entries(p.state)
+            if r["kind"] == "result" and r.get("job") and str(r.get("task") or "") in owners
+            and 0 <= now - progress._ts(r, 0.0) < CLOCK_S and same_boot(r.get("boot"))]
+    if not recs:
+        return {}
+    ids = sorted(owners, key=int)
+    status = {str(t["id"]): t["status"] for t in
+              p.db.q(f"SELECT id, status FROM tasks WHERE id IN ({','.join('?' * len(ids))})", ids)}
+    runs = {str(r["id"]): r for r in
+            p.db.q(f"SELECT id, task, dir FROM runs WHERE dir IS NOT NULL AND task IN ({','.join('?' * len(ids))})", ids)}
+    out: dict[str, dict] = {}
+    alive: dict[str, bool] = {}
+    for r in sorted(recs, key=lambda x: progress._ts(x, 0.0), reverse=True):
+        tid, run = str(r["task"]), runs.get(str(r.get("run") or ""))
+        if tid in out or status.get(tid, "gone") in CLOSED + ("gone",) or not run or str(run["task"]) != tid \
+                or Path(r["job"]).parent.resolve() != Path(run["dir"]).resolve():   # a job its own run started
+            continue
+        if r["job"] not in alive:
+            alive[r["job"]] = progress._alive(r)
+        if alive[r["job"]]:
+            out[tid] = r
+    return out
+
+
+def _job_progress(o: dict, jobs: dict[str, dict]) -> tuple[set[str], bool]:
+    """The owners of o a live job's result (_job_results) keeps on time, each recorded on its owner as
+    `job` ({"at", "text"}, dropped once no live job's result is fresh); and whether a record changed. The
+    clock itself is not reset: once the job ends or goes quiet for CLOCK_S, the owner is late again from
+    its own last progress."""
+    kept, changed = set(), False
+    for tid, own in o["owners"].items():
+        r = jobs.get(tid)
+        if not r or float(r["ts"]) < float(own["since"]):
+            if own.pop("job", None) is not None:
+                changed = True
+            continue
+        kept.add(tid)
+        rec = {"at": float(r["ts"]), "text": f"job {Path(r['job']).stem}: {r.get('reason') or 'result'}"[:EVIDENCE_MAX]}
+        if own.get("job") != rec:
+            own["job"], changed = rec, True
+    return kept, changed
+
+
 def anomaly_text(o: dict, late: list[tuple[str, float]], status: dict[str, str]) -> str:
     parts = []
     for tid, age in late:
@@ -532,6 +588,7 @@ def check(p, now: float | None = None) -> list[str]:
     now = time.time() if now is None else now
     db = p.db
     raised: list[str] = []
+    jobs = _job_results(p, _load(db), now)
     with db.tx():
         st = _load(db)
         changed = False
@@ -542,7 +599,9 @@ def check(p, now: float | None = None) -> list[str]:
                 continue
             changed = _check_milestones(p, o, now, raised) or changed
             changed = _check_promise(p, o, st, now, raised) or changed
-            late = overdue(o, now)
+            kept, job_changed = _job_progress(o, jobs)
+            changed = job_changed or changed
+            late = [x for x in overdue(o, now) if x[0] not in kept]   # a live job of its own still producing
             late_ids = [t for t, _ in late]
             covered = [t for t in o.get("covered") or [] if t in late_ids]   # an owner back on time leaves it
             if not late:
@@ -587,9 +646,11 @@ def lines(db, now: float | None = None, where=None, open_only: bool = False) -> 
         elif o.get("promise"):
             state = "promised; " + _promise_state(o, now, where)
         else:
-            late = {t for t, _ in overdue(o, now)}
+            late = {t for t, _ in overdue(o, now)
+                    if not (o["owners"].get(t) or {}).get("job") or now - o["owners"][t]["job"]["at"] >= CLOCK_S}
             owners = ", ".join(
                 f"#{t} {(now - _last(w)) / 3600:.1f} h"
+                + (f" (job result {(now - w['job']['at']) / 3600:.1f} h ago)" if w.get("job") else "")
                 + (" OVERDUE" if t in late else "") for t, w in sorted(o["owners"].items(), key=lambda kv: int(kv[0])))
             state = "owed; " + (f"owners: {owners}" if owners else "no owner attached" + (" OVERDUE" if late else ""))
             pending = [m for m in (o.get("milestones") or {}).values() if not m["receipt"]]

@@ -20,3 +20,4 @@ Readers (runtime `progress.py`):
 
 - The daemon reads it every minute. A key whose last `waiting.progress.stall_after` reports (default 5) are refusals, stalls or failures with no result, the last one within `waiting.progress.window_s` (default 24 h), raises one keyed observation to the coordinator with the reasons, once per streak. A result ends the streak, and a new streak raises again.
 - `ttp status` and the web app show such a driver as stalled, not running, while its process still runs: the `ttp detach` job is still running, or else the reporting pid is alive on this boot.
+- An obligation owner waiting on its own `ttp detach` job: each `result` the job reports keeps the owner's 2 h durable-progress clock from running out while the job still runs, so a producing job raises no `obligation_overdue`. Report each checkpoint or finished cell, not a heartbeat.

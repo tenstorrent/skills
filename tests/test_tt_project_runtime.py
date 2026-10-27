@@ -41122,6 +41122,130 @@ def test_obligation_without_owner_raises_after_the_clock(env, monkeypatch):
     assert len(evs) == 1 and "no owner task is attached" in evs[0]["text"] and evs[0]["task"] is None
 
 
+def _ob_job(p, monkeypatch, tid, now, name="bench"):
+    """The owner waiting on a `ttp detach` job of its own run, held running (its job lock), and
+    `report(at, reason)`: the job's own `ttp progress report result` at time `at`; `job.close()` kills it."""
+    from ttp import cli, locks
+    p.db.update_task(tid, status="waiting")
+    run_dir = p.runs / f"r{tid}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    rid = p.db.x("INSERT INTO runs(task,role,started,ended,status,dir) VALUES(?,?,?,?,?,?)",
+                 (tid, "worker", now + 60, now + 300, "done", str(run_dir)))
+    rc = run_dir / f"{name}.rc"
+    job = locks.try_take([locks.job_lock(rc)], "job")
+    for k, v in {"TTP_PROJECT": str(p.base), "TTP_TASK": str(tid), "TTP_RUN_ID": str(rid),
+                 "TTP_DETACH_RC": str(rc)}.items():
+        monkeypatch.setenv(k, v)
+
+    def report(at, reason, *args):
+        monkeypatch.setattr(time, "time", lambda: at)
+        try:
+            cli.main(["progress", "report", "result", *args, reason])
+        except SystemExit as e:
+            assert not e.code, e.code
+    return rc, job, report
+
+
+def test_obligation_owner_waiting_on_its_live_job_with_a_new_result_is_not_overdue(env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the benchmark table", [tid], now=now)
+    rc, job, report = _ob_job(p, monkeypatch, tid, now)
+    try:
+        report(now + 1.5 * 3600, "cell 3 of 6 done")
+        assert check(now + 2 * 3600 + 60) == [], "a live job's result within 2 h is durable progress"
+        assert "OVERDUE" not in ob.lines(p.db, now + 2 * 3600 + 60)[0]
+        report(now + 3 * 3600, "cell 4 of 6 done")
+        assert check(now + 4 * 3600) == [], "each new result keeps it on time"
+    finally:
+        job.close()
+
+
+def test_obligation_job_side_progress_report_records_progress_on_the_owners_obligation(env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the benchmark table", [tid], now=now)
+    rc, job, report = _ob_job(p, monkeypatch, tid, now)
+    try:
+        report(now + 1800, "cell 3 of 6 done")   # in the job: `ttp progress report result "<what>"`, no key
+        check(now + 1860)
+        own = ob.get(p.db, oid)["owners"][str(tid)]
+        assert own["job"]["at"] == pytest.approx(now + 1800, abs=0.01) \
+            and own["job"]["text"] == "job bench: cell 3 of 6 done", own
+        assert f"#{tid} 0.5 h (job result 0.0 h ago)" in ob.lines(p.db, now + 1860)[0], ob.lines(p.db, now + 1860)
+        report(now + 3600, "cell 4 of 6 done")
+        check(now + 3660)
+        assert ob.get(p.db, oid)["owners"][str(tid)]["job"]["text"] == "job bench: cell 4 of 6 done"
+    finally:
+        job.close()
+    check(now + 3720)
+    assert "job" not in ob.get(p.db, oid)["owners"][str(tid)], "a dead job's record goes"
+
+
+def test_obligation_owner_on_a_live_job_with_no_new_result_for_2h_is_overdue(env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the benchmark table", [tid], now=now)
+    rc, job, report = _ob_job(p, monkeypatch, tid, now)
+    try:
+        report(now + 0.5 * 3600, "cell 1 of 6 done")
+        assert check(now + 2 * 3600 + 60) == [], "kept on time while the result is under 2 h old"
+        evs = check(now + 2.5 * 3600 + 60)
+        assert len(evs) == 1 and evs[0]["fingerprint"] == f"obligation:{oid}:1", "a quiet live job does not keep it"
+        assert "OVERDUE" in ob.lines(p.db, now + 2.5 * 3600 + 60)[0]
+        # Results that never count: one with no job (the owner's own pid), and one from a job of
+        # another task's run naming this task.
+        now2 = now + 10 * 3600
+        oid2 = ob.add(p, "another table", [tid], now=now2)
+        monkeypatch.delenv("TTP_DETACH_RC")
+        report(now2 + 3600, "a heartbeat with no job", "--key", "owner")
+        other = p.db.add_task("other", "s", kind="work", tier="light", origin="coordinator")
+        orc, ojob, oreport = _ob_job(p, monkeypatch, other, now2, name="theirs")
+        p.db.update_task(tid, status="waiting")
+        monkeypatch.setenv("TTP_TASK", str(tid))
+        oreport(now2 + 3600, "forged cell")
+        try:
+            assert [e["fingerprint"] for e in check(now2 + 2 * 3600 + 60)][-1] == f"obligation:{oid2}:1"
+        finally:
+            ojob.close()
+    finally:
+        job.close()
+
+
+def test_obligation_owner_on_a_dead_job_is_overdue_despite_a_recent_result(env, monkeypatch):
+    from ttp import obligations as ob
+    from ttp import progress
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the benchmark table", [tid], now=now)
+    rc, job, report = _ob_job(p, monkeypatch, tid, now)
+    report(now + 1.5 * 3600, "cell 3 of 6 done")
+    assert check(now + 2 * 3600 + 30) == [], "kept on time while it runs"
+    job.close()   # it died without an exit code
+    evs = check(now + 2 * 3600 + 60)
+    assert len(evs) == 1 and evs[0]["fingerprint"] == f"obligation:{oid}:1", "a dead job keeps nothing"
+    assert rc.with_suffix(".lost").exists()
+    # A job that ended (wrote its .rc) and one whose result came from another boot keep nothing either.
+    oid2 = ob.add(p, "second table", [tid], now=now + 10 * 3600)
+    rc2, job2, report2 = _ob_job(p, monkeypatch, tid, now + 10 * 3600, name="ended")
+    try:
+        report2(now + 11.5 * 3600, "cell 6 of 6 done")
+        rc2.write_text("0")
+        assert [e["fingerprint"] for e in check(now + 12 * 3600 + 60)][-1] == f"obligation:{oid2}:1"
+    finally:
+        job2.close()
+    oid3 = ob.add(p, "third table", [tid], now=now + 20 * 3600)
+    rc3, job3, report3 = _ob_job(p, monkeypatch, tid, now + 20 * 3600, name="reboot")
+    try:
+        report3(now + 21.5 * 3600, "cell 1 of 6 done")
+        lines = (p.state / progress.LOG).read_text().splitlines()
+        last = json.loads(lines[-1])
+        last["boot"] = "an-older-boot"
+        (p.state / progress.LOG).write_text("\n".join(lines[:-1] + [json.dumps(last)]) + "\n")
+        assert [e["fingerprint"] for e in check(now + 22 * 3600 + 60)][-1] == f"obligation:{oid3}:1"
+    finally:
+        job3.close()
+
+
 def test_obligation_attach_tells_a_running_owner_through_steer(env, monkeypatch):
     from ttp import obligations as ob
     p, d, now, tid, check = _ob_setup(env, monkeypatch)
