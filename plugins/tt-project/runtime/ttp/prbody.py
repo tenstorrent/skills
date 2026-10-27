@@ -219,8 +219,8 @@ class _Unread(Exception):
 
 def api_writes(endpoint: str, method: str) -> bool:
     """Whether a `gh api` call may write a PR body (api_problem decides): a REST POST or PATCH on a
-    pulls endpoint, or any GraphQL call."""
-    return endpoint == "graphql" or bool(API_PULLS_RE.match(endpoint)) and method in ("POST", "PATCH")
+    pulls endpoint, or any GraphQL call (`/graphql` too: gh posts it as REST, GitHub serves it)."""
+    return endpoint.strip("/") == "graphql" or bool(API_PULLS_RE.match(endpoint)) and method in ("POST", "PATCH")
 
 
 def api_problem(endpoint: str, method: str, args: list[str], cfg: dict, real: str | None = None,

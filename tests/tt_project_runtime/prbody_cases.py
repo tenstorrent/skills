@@ -184,6 +184,8 @@ def test_pr_body_check_covers_graphql_pr_mutations(env, tmp_path, monkeypatch):
         rc, err, ran = gh("api", "graphql", "-f", "query=" + upd % body)
         assert rc == 1 and ran == [] and "delivery.pr_body_check, exit 3" in err, (body, err)
         assert seen() == ["edit  no type"]
+    rc, err, ran = gh("api", "/graphql", "-f", "query=" + upd % 'body:"no type"')   # gh posts it as REST
+    assert rc == 1 and ran == [] and seen() == ["edit  no type"], err
     rc, err, ran = gh("api", "graphql", "-f", "query=" + upd % 'body:"Type: fix\\u0021"')
     assert rc == 0 and ran and seen() == ["edit  Type: fix!"], err
     good = tmp_path / "good.md"
