@@ -41519,6 +41519,82 @@ def test_obligation_new_owner_stall_after_an_ended_owner_is_raised(env, monkeypa
     assert len(evs) == 3 and evs[2]["fingerprint"] == f"obligation:{oid}:3", "the new owner stalling again is new"
 
 
+def _ob_ask(p, now, text="Which credential should the run use?"):
+    """An open user ask, as the coordinator's ask_user leaves it; returns its id."""
+    return p.db.x("INSERT INTO messages(ts,direction,kind,severity,text,handled) VALUES(?,?,?,?,?,0)",
+                  (now, "out", "ask", "high", text))
+
+
+def test_obligation_done_owner_beside_a_live_owner_raises_nothing_for_the_done_one(env, monkeypatch):
+    """#3982: o36 raised for #3953, a receipt task already done, while another owner was still live."""
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    live = p.db.add_task("the long run", "s", kind="work", tier="light", origin="coordinator")
+    oid = ob.add(p, "the benchmark table", [tid, live], now=now)
+    p.db.update_task(tid, status="done")
+    ob.record(p, oid, "progress", "results/cell3.json", live, now=now + 1.5 * 3600)
+    assert check(now + 2 * 3600 + 60) == [], "a finished owner beside a live one is not overdue"
+    line = ob.lines(p.db, now + 2 * 3600 + 60)[0]
+    assert f"#{tid} done, no receipt" in line and "OVERDUE" not in line, line
+    evs = check(now + 3.5 * 3600 + 60)
+    assert len(evs) == 1 and f"#{live} " in evs[0]["text"] and f"#{tid} " not in evs[0]["text"], \
+        "the live owner's own stall still raises, naming only it"
+
+
+def test_obligation_all_owners_done_without_a_receipt_raises_exactly_once(env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    other = p.db.add_task("second part", "s", kind="work", tier="light", origin="coordinator")
+    oid = ob.add(p, "the benchmark table", [tid, other], now=now)
+    ob.record(p, oid, "progress", "commit abc", other, now=now + 3600)
+    p.db.update_task(tid, status="done")
+    p.db.update_task(other, status="failed")
+    assert check(now + 2 * 3600 + 60) == [], "the newest owner's clock still runs"
+    for h in (3.1, 4, 8, 24):
+        evs = check(now + h * 3600)
+        assert len(evs) == 1, f"one event once no live owner is left, not one per owner or tick ({h} h)"
+    assert evs[0]["fingerprint"] == f"obligation:{oid}:1" and "no live owner is left" in evs[0]["text"] \
+        and f"#{tid} (done without a receipt)" in evs[0]["text"] \
+        and f"#{other} (failed without a receipt)" in evs[0]["text"] and evs[0]["task"] in (tid, other), evs[0]
+    assert "no live owner left OVERDUE" in ob.lines(p.db, now + 24 * 3600)[0]
+
+
+def test_obligation_owner_blocked_on_an_open_ask_is_covered_by_it(env, monkeypatch):
+    """#3982: o36 opened a new episode only because #3960 had been blocked 2 h on a credential choice
+    only the user can make. Both links count: a hold anchored on the ask, and an open ask naming the task."""
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    named = p.db.add_task("second part", "s", kind="work", tier="light", origin="coordinator")
+    ob.add(p, "the benchmark table", [tid, named], now=now)
+    held = _ob_ask(p, now + 600)
+    _ob_ask(p, now + 600, f"#{named} needs your pick of the token")
+    p.db.update_task(tid, status="blocked", blocked_reason="needs a credential choice",
+                     labels=json.dumps([f"waits:ask:{held}"]))
+    p.db.update_task(named, status="waiting")
+    for h in (2.1, 3, 6):
+        assert check(now + h * 3600) == [], f"an owner blocked on an open ask is covered by it ({h} h)"
+    line = ob.lines(p.db, now + 6 * 3600)[0]
+    assert f"#{tid} waiting on ask {held}" in line and f"#{named} waiting on ask " in line \
+        and "OVERDUE" not in line, line
+
+
+def test_obligation_owner_raises_again_two_hours_after_its_ask_is_resolved(env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the benchmark table", [tid], now=now)
+    aid = _ob_ask(p, now + 600)
+    p.db.update_task(tid, status="blocked", labels=json.dumps([f"waits:ask:{aid}"]))
+    assert check(now + 3 * 3600) == []
+    p.db.x("UPDATE messages SET handled=1 WHERE id=?", (aid,))
+    p.db.update_task(tid, status="queued")
+    assert check(now + 3 * 3600 + 300) == [], "its clock restarts when the ask is resolved"
+    assert "OVERDUE" not in ob.lines(p.db, now + 3 * 3600 + 600)[0]
+    assert check(now + 5 * 3600 + 200) == []
+    evs = check(now + 5 * 3600 + 400)
+    assert [e["fingerprint"] for e in evs] == [f"obligation:{oid}:1"] and f"#{tid} " in evs[0]["text"], \
+        "two hours with no progress after the answer raise again"
+    assert "OVERDUE" in ob.lines(p.db, now + 5 * 3600 + 400)[0]
+
 def test_obligation_progress_before_attach_is_clamped_to_the_attach_time(env, monkeypatch):
     from ttp import obligations as ob
     p, d, now, tid, check = _ob_setup(env, monkeypatch)
