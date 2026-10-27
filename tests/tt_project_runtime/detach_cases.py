@@ -831,3 +831,40 @@ def test_a_cancelled_tasks_detached_checks_from_an_earlier_run_are_stopped(env, 
         except OSError:
             pass
         reap_tmp_processes(tmp_path)
+
+
+def test_a_failed_job_s_wake_carries_its_log_tail_and_first_error_line_bounded(env, monkeypatch, tmp_path):
+    """A failed detached job wakes its task (no on_pass_cmd) with its log's last 20 lines and its
+    first line matching Traceback/*Error/error/FAIL, cut to about 4,000 chars, control characters
+    stripped; a job with no log gives one short line and no exception."""
+    p = make(env)
+    from ttp import daemon as dmod, detach
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    probe = _ended_jobs(tmp_path, bench=1, gone=3, fine=0)
+    jobs = tmp_path / "jobs"
+    lines = [f"step {i} ok \x1b[32mgreen\x1b[0m\x07" for i in range(200)]
+    lines[150:150] = ["Traceback (most recent call last):", '  File "bench.py", line 3, in <module>',
+                      "ModuleNotFoundError: No module named 'torch'"]
+    lines += ["x" * 5000 for _ in range(30)]
+    (jobs / "bench.log").write_text("\n".join(lines) + "\n")
+    (jobs / "fine.log").write_text("all good\n")
+    tid = _due_waiting_task(p, probe)
+    p.db.update_task(tid, not_before=time.time() + 3600)
+    _settle_probe(d, tid)
+    res = json.loads(p.db.task(tid)["result"])
+    woke = res["woke"]
+    assert _ready(p, tid) and woke.startswith("detached job failed") and "bench: job finished rc=1" in woke, woke
+    assert "bench.log (" in woke and "last lines:" in woke and "x" * 100 in woke and "x" * 400 not in woke, woke
+    assert "first error line (line 151): Traceback (most recent call last):" in woke, woke
+    assert f"gone.log: no log at {jobs / 'gone.log'}" in woke, woke
+    assert "fine.log" not in woke and "\x1b" not in woke and "\x07" not in woke
+    excerpt = detach.failed_logs(probe, p.root)
+    assert len(excerpt) <= detach.LOG_EXCERPT_CHARS and woke.endswith(excerpt), woke
+    # No line matches: it says which patterns were looked for.
+    (jobs / "bench.log").write_text("step 1\nstep 2 aborted\n")
+    assert "no line matches Traceback, *Error, error, ERROR or FAIL" in detach.failed_logs(probe, p.root)
+    assert detach.first_error(jobs / "bench.log") is None
+    # A probe with no local job, or one that only finished ok, adds nothing.
+    assert detach.failed_logs("ttp detach --check --host box-a /r/a.rc") == ""
+    assert detach.failed_logs(_ended_jobs(tmp_path, fine=0)) == ""
