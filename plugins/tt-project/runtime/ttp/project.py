@@ -458,6 +458,7 @@ EXTRA_KEYS = {
                  "checks_fast_globs", "checks_fast_exclude",   # these two: `ttp checks` fast path (push.FAST_GLOBS),
                  "checks_host",   # where checks run (remotecheck)
                  "check_prestage",   # a short foreground run before `ttp checks --detach` (checkprestage)
+                 "pr_body_check",   # a project's own PR body check before gh pr create/edit (prbody)
                  "rebase_replace", "never_force"},   # whether a rebase replaces its branch (rebase_replace)
     "jev": {"via", "url", "model"},
     "power": {"keep_awake"},
@@ -773,6 +774,8 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     out += [f"delivery.push_exclude_paths: {p}" for p in [scalar_problem(delivery.get("push_exclude_paths"))] if p]
     from .checkprestage import problems as prestage_problems
     out += prestage_problems(delivery.get("check_prestage"))
+    from .prbody import problems as pr_body_problems
+    out += pr_body_problems(delivery.get("pr_body_check"))
     if delivery.get("checks_host") not in (None, ""):
         from .remotecheck import host_problem
         out += [f"delivery.checks_host: {p}" for p in [host_problem(delivery["checks_host"])] if p]

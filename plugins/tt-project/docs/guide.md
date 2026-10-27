@@ -1149,6 +1149,17 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   coordinator asks the user before a draft PR under a code freeze, and the ask gate lets that ask
   through (an ask about a draft PR outside a freeze is still refused). Leaving draft always needs
   the user's yes, and human reviewers are never requested, whatever the setting.
+- `delivery.pr_body_check` (off by default) turns a project's own PR body rules into a model-free
+  guard: a worker's `gh pr create`, and a `gh pr edit` that sets the body, first run the command it
+  names on the body (from `--body`, `--body-file` or `-F`; on stdin and as the file in
+  `TTP_PR_BODY_FILE`, with `TTP_PR_REPO` and `TTP_PR_ACTION`). Exit 0 lets gh run; any other exit
+  refuses the call and shows the check's output. A command string, or
+  `{"run": "scripts/check_pr_body", "timeout_s": 30, "repos": ["my-org/*"], "skip_repos": ["my-org/sandbox-*"]}`
+  (globs on `owner/name`; `timeout_s` defaults to 30, at most 300). While a check applies, a body gh
+  would get some other way (`--fill`, `--editor`, a template) is refused with a hint to pass
+  `--body-file`, and a check that cannot run (no such command, a timeout) refuses with its error.
+  Edits that leave the body alone are not checked. Put the project's own rules (such as labels its
+  PR bodies must start with) in the command, never in the plugin.
 - Change windows: the template charter's Policies line `- Change windows: none` means disruptive
   work (restarts, rollouts, anything that disturbs others) may run whenever it is safe, and waiting
   for a lull is never a blocker. A team that works in change windows lists them on that line

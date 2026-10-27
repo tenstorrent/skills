@@ -12,6 +12,8 @@ It refuses, whatever the agent or provider:
 - requests for human reviewers (`gh pr create --reviewer`, `gh pr edit --add-reviewer`, REST POSTs to
   a PR's requested_reviewers and GraphQL requestReviews): the user asks for reviews, never a run.
   Bot reviewers (a login ending in `[bot]`, Copilot) may be requested.
+- with `delivery.pr_body_check` set, `gh pr create` and a `gh pr edit` that sets the body when the
+  project's own PR body check refuses the body (prbody).
 
 An approval record is written only by the coordinator's `pr_approve` action. It needs the user's
 own words, quoted: a user message that names the PR, or the user's answer to a blocking `review` or
@@ -548,6 +550,20 @@ def _project_db():
     return p.db if (p.state / "project.db").is_file() else None
 
 
+def _project_config() -> dict:
+    """The project's settings ({} outside a project), for its PR body check (prbody)."""
+    base = os.environ.get("TTP_PROJECT")
+    if not base:
+        return {}
+    from .project import Project
+    return Project(base).config()
+
+
+def _body_problem(sub: str, args: list[str], real: str, stdin_text: str | None, cfg: dict | None) -> str | None:
+    from . import prbody
+    return prbody.problem(sub, args, _project_config() if cfg is None else cfg, real, stdin_text)
+
+
 # --- reading a gh command line ----------------------------------------------------------------
 
 def _opts(args: list[str], names: tuple[str, ...]) -> list[str]:
@@ -718,10 +734,11 @@ def _no_reviewers(seen: list | None, text: str) -> str:
 
 
 def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _depth: int = 0,
-          allowed: set | None = None, seen: list | None = None) -> str | None:
+          allowed: set | None = None, seen: list | None = None, cfg: dict | None = None) -> str | None:
     """Why `gh <args>` must not run, or None when it may. `real` is the real gh (to look PRs up).
     PRs it lets out of draft on their approval are added to `allowed`, to spend once it ran. Each
-    attempt to mark a PR ready or request human reviewers is added to `seen` as (action, PR keys)."""
+    attempt to mark a PR ready or request human reviewers is added to `seen` as (action, PR keys).
+    `cfg` is the project's settings (None: read them when a PR body check may apply)."""
     if not args:
         return None
     cmd, rest = args[0], args[1:]
@@ -733,7 +750,7 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
                 if re.search(r"\bpr\s+(ready|create)\b|\bapi\b|markPullRequestReadyForReview|draft|reviewer", text):
                     return f"refused: the gh alias {cmd!r} runs a shell command that may change a PR's draft state"
                 return None
-            return check(_expand(expansion, rest), real, db, stdin_text, _depth + 1, allowed, seen)
+            return check(_expand(expansion, rest), real, db, stdin_text, _depth + 1, allowed, seen, cfg)
     if cmd == "pr" and rest:
         sub, more = rest[0], rest[1:]
         if sub == "create":
@@ -742,7 +759,7 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
             if "--dry-run" in more:
                 return None
             if any(a in ("-d", "--draft", "--draft=true") for a in more):
-                return _checks_problem()
+                return _checks_problem() or _body_problem("create", more, real, stdin_text, cfg)
             return "refused: PRs are opened as drafts only; add --draft. " + HOW
         if sub == "ready":
             if "--undo" in more:
@@ -755,8 +772,10 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
             key = pr_key(out)
             return _refuse_ready({key} if key else set(), db, "marking a PR ready for review", allowed,
                                  {key: _sha(out)} if key else {}, seen)
-        if sub == "edit" and _humans(_opts(more, ("--add-reviewer",))):
-            return _no_reviewers(seen, " ".join(more))
+        if sub == "edit":
+            if _humans(_opts(more, ("--add-reviewer",))):
+                return _no_reviewers(seen, " ".join(more))
+            return _body_problem("edit", more, real, stdin_text, cfg)
     if cmd == "api":
         return _check_api(rest, real, db, stdin_text, allowed, seen)
     return None
@@ -902,12 +921,18 @@ def main(argv: list[str], own_dir: str) -> int:
     if args[:1] == ["api"] and ("-" in _opts(args, ("--input",))
                                 or any(f.endswith("=@-") for f in _opts(args, ("-F", "--field")))):
         stdin_text = sys.stdin.read()
+    elif args[:2] in (["pr", "create"], ["pr", "edit"]):
+        from .prbody import CREATE_VALUES, EDIT_VALUES, _scan
+        given, _ = _scan(args[2:], CREATE_VALUES if args[1] == "create" else EDIT_VALUES)
+        if "-" in (given.get("--body-file"), given.get("-F")):   # the body check reads it, then gh
+            stdin_text = sys.stdin.read()
     db, allowed, seen = None, set(), []
     try:
         db = _project_db()
         why = check(args, real, db, stdin_text, allowed=allowed, seen=seen)
     except Exception as e:   # fails closed only for the calls it guards
-        guarded = args[:2] in (["pr", "ready"], ["pr", "create"]) or args[:1] == ["api"]
+        guarded = (args[:2] in (["pr", "ready"], ["pr", "create"]) or args[:1] == ["api"]
+                   or args[:2] == ["pr", "edit"] and any(a.startswith(("-b", "--body", "-F")) for a in args[2:]))
         why = f"refused: the PR draft guard failed ({e})" if guarded else None
         if args[:2] == ["pr", "ready"] and "--undo" not in args:
             seen.append(("ready", sorted(pr_keys(" ".join(args)))))
