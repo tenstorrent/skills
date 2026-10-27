@@ -282,3 +282,151 @@ def test_pr_body_check_unset_leaves_gh_api_calls_unchanged(env, tmp_path, monkey
     rc, err, ran = gh(*calls[0])
     assert rc == 0 and ran == [" ".join(calls[0])], err
     assert seen() == []
+
+
+def _lookups(tmp_path, monkeypatch, pulls="7", nodes=""):
+    """Sets the fake gh's PRs (`pulls`: numbers, or "offline") and GraphQL node types before its runner is
+    made; returns a reader of the PR lookups it answered."""
+    log = tmp_path / "lookups.log"
+    log.write_text("")
+    monkeypatch.setenv("FAKE_GH_LOOKUPS", str(log))
+    monkeypatch.setenv("FAKE_GH_PULLS", pulls)
+    monkeypatch.setenv("FAKE_GH_NODES", nodes)
+
+    def asked():
+        out = log.read_text().splitlines()
+        log.write_text("")
+        return out
+    return asked
+
+
+def test_pr_body_check_covers_issue_endpoint_edits_of_a_pr_body(env, tmp_path, monkeypatch):
+    monkeypatch.setenv("PR_CHECK_LOG", "")
+    asked = _lookups(tmp_path, monkeypatch, pulls="7")
+    p, gh, seen = _pr_body_project(env, tmp_path, lambda s: s)
+    # A PR is an issue: its issue endpoint rewrites the PR body.
+    for args in (("api", "-X", "PATCH", "repos/acme/widgets/issues/7", "-f", "body=no type"),
+                 ("api", "--method", "POST", "/repos/acme/widgets/issues/7/", "-F", "body=no type")):
+        rc, err, ran = gh(*args)
+        assert rc == 1 and ran == [] and "delivery.pr_body_check, exit 3" in err, (args, err)
+        assert seen() == ["edit acme/widgets no type"], args
+        assert asked() == ["api repos/acme/widgets/pulls/7 --jq .number"], args
+    rc, err, ran = gh("api", "-X", "PATCH", "repos/acme/widgets/issues/7", "-f", "body=Type: fix")
+    assert rc == 0 and ran and seen() == ["edit acme/widgets Type: fix"], err
+    asked()
+    # A plain issue (the PR lookup answers 404) is not checked; a title-only edit is not looked up.
+    rc, err, ran = gh("api", "-X", "PATCH", "repos/acme/widgets/issues/8", "-f", "body=no type")
+    assert rc == 0 and ran and seen() == [] and asked() == ["api repos/acme/widgets/pulls/8 --jq .number"], err
+    rc, err, ran = gh("api", "-X", "PATCH", "repos/acme/widgets/issues/7", "-f", "title=t")
+    assert rc == 0 and ran and seen() == [] and asked() == [], err
+
+
+def test_pr_body_check_covers_gh_issue_edit_of_a_pr(env, tmp_path, monkeypatch):
+    monkeypatch.setenv("PR_CHECK_LOG", "")
+    asked = _lookups(tmp_path, monkeypatch, pulls="7")
+    p, gh, seen = _pr_body_project(env, tmp_path, lambda s: s)
+    bad = tmp_path / "bad.md"
+    bad.write_text("no type\n")
+    for args in (("issue", "edit", "7", "-R", "acme/widgets", "--body", "no type"),
+                 ("issue", "edit", "7", "--repo=acme/widgets", "-F", str(bad)),
+                 ("issue", "edit", "https://github.com/acme/widgets/issues/7", "-b", "no type"),
+                 ("issue", "edit", "https://github.com/acme/widgets/pull/7", "--body-file", str(bad))):
+        rc, err, ran = gh(*args)
+        assert rc == 1 and ran == [] and "delivery.pr_body_check, exit 3" in err, (args, err)
+        assert seen() == ["edit acme/widgets no type"], args
+    rc, err, ran = gh("issue", "edit", "7", "-R", "acme/widgets", "--body", "Type: fix")
+    assert rc == 0 and ran and seen() == ["edit acme/widgets Type: fix"], err
+    asked()
+    # A plain issue, and edits that leave the body alone, run unchecked.
+    for args in (("issue", "edit", "8", "-R", "acme/widgets", "--body", "no type"),
+                 ("issue", "edit", "7", "-R", "acme/widgets", "--title", "t")):
+        rc, err, ran = gh(*args)
+        assert rc == 0 and ran == [" ".join(args)], (args, err)
+    assert seen() == [] and asked() == ["api repos/acme/widgets/pulls/8 --jq .number"]
+    from ttp import prguard   # a body from stdin is read like gh pr edit's
+    why = prguard.check(["issue", "edit", "7", "-R", "acme/widgets", "--body-file", "-"], "/bin/false",
+                        stdin_text="no type\n", cfg=p.config())
+    assert why and "exit 3" in why
+
+
+def test_pr_body_check_checks_an_issue_edit_when_the_pr_lookup_cannot_tell(env, tmp_path, monkeypatch):
+    monkeypatch.setenv("PR_CHECK_LOG", "")
+    _lookups(tmp_path, monkeypatch, pulls="offline")
+    p, gh, seen = _pr_body_project(env, tmp_path, lambda s: s)
+    for args in (("api", "-X", "PATCH", "repos/acme/widgets/issues/8", "-f", "body=no type"),
+                 ("issue", "edit", "8", "-R", "acme/widgets", "--body", "no type")):
+        rc, err, ran = gh(*args)
+        assert rc == 1 and ran == [] and "exit 3" in err, (args, err)
+        assert seen() == ["edit acme/widgets no type"], args
+    from ttp import prbody, prguard
+    for real in ("/bin/false", str(tmp_path / "missing-gh"), None):   # no auth, no gh at all
+        assert prbody.is_pull(real, "repos/acme/widgets", "8") is None
+        why = prguard.check(["api", "-X", "PATCH", "repos/acme/widgets/issues/8", "-f", "body=no type"], real,
+                            cfg=p.config())
+        assert why and "exit 3" in why, real
+    monkeypatch.setattr(prbody, "LOOKUP_TIMEOUT_S", 0.01)   # a lookup that times out
+    slow = tmp_path / "slow-gh"
+    slow.write_text("#!/bin/sh\nsleep 5\n")
+    slow.chmod(0o755)
+    assert prbody.is_pull(str(slow), "repos/acme/widgets", "8") is None
+
+
+def test_pr_body_check_covers_graphql_update_issue_on_a_pr(env, tmp_path, monkeypatch):
+    monkeypatch.setenv("PR_CHECK_LOG", "")
+    asked = _lookups(tmp_path, monkeypatch, nodes="PR_kwDOabc=PullRequest,I_kwDOdef=Issue")
+    p, gh, seen = _pr_body_project(env, tmp_path, lambda s: s)
+    upd = 'mutation{updateIssue(input:{id:"%s",body:"no type"}){issue{url}}}'
+    for node in ("PR_kwDOabc", "unknown"):   # a PR, and a node the lookup cannot type
+        rc, err, ran = gh("api", "graphql", "-f", "query=" + upd % node)
+        assert rc == 1 and ran == [] and "exit 3" in err, (node, err)
+        assert seen() == ["edit  no type"], node
+    whole = "mutation($input:UpdateIssueInput!){updateIssue(input:$input){issue{url}}}"
+    rc, err, ran = gh("api", "graphql", "-f", "query=" + whole, "-f", "input[id]=PR_kwDOabc", "-f", "input[body]=no type")
+    assert rc == 1 and ran == [] and seen() == ["edit  no type"], err
+    rc, err, ran = gh("api", "graphql", "-f", 'query=mutation($n:ID!){updateIssue(input:{id:$n,body:"no type"}){x}}',
+                      "-f", "n=PR_kwDOabc")
+    assert rc == 1 and ran == [] and seen() == ["edit  no type"], err
+    asked()
+    # A plain issue's node is not checked.
+    rc, err, ran = gh("api", "graphql", "-f", "query=" + upd % "I_kwDOdef")
+    assert rc == 0 and ran and seen() == [], err
+    assert len(asked()) == 1
+
+
+def test_pr_body_check_covers_repository_id_paths(env, tmp_path, monkeypatch):
+    monkeypatch.setenv("PR_CHECK_LOG", "")
+    asked = _lookups(tmp_path, monkeypatch, pulls="7")
+    p, gh, seen = _pr_body_project(env, tmp_path, lambda s: {"run": s, "repos": ["acme/*"]})
+    # repositories/<id>/... names no repo the globs could leave out, so the check runs.
+    for args in (("api", "-X", "PATCH", "repositories/123/pulls/7", "-f", "body=no type"),
+                 ("api", "repositories/123/pulls", "-F", "draft=true", "-f", "head=x", "-f", "body=no type"),
+                 ("api", "-X", "PATCH", "repositories/123/issues/7", "-f", "body=no type")):
+        rc, err, ran = gh(*args)
+        assert rc == 1 and ran == [] and "exit 3" in err, (args, err)
+        assert len(seen()) == 1, args
+    assert asked() == ["api repositories/123/pulls/7 --jq .number"]
+    rc, err, ran = gh("api", "-X", "PATCH", "repositories/123/issues/8", "-f", "body=no type")
+    assert rc == 0 and ran and seen() == [], err
+
+
+def test_pr_body_check_unset_leaves_issue_edits_unchanged(env, tmp_path, monkeypatch):
+    monkeypatch.setenv("PR_CHECK_LOG", "")
+    asked = _lookups(tmp_path, monkeypatch, pulls="7", nodes="PR_x=PullRequest")
+    p, gh, seen = _pr_body_project(env, tmp_path)
+    from ttp import prbody, prguard
+
+    def no_lookup(*a, **k):
+        raise AssertionError("a PR lookup ran while the check is unset")
+    monkeypatch.setattr(prbody, "is_pull", no_lookup)
+    monkeypatch.setattr(prbody, "node_type", no_lookup)
+    calls = [["api", "-X", "PATCH", "repos/acme/widgets/issues/7", "-f", "body=no type"],
+             ["api", "-X", "PATCH", "repositories/123/issues/7", "-f", "body=no type"],
+             ["issue", "edit", "7", "-R", "acme/widgets", "--body", "no type"],
+             ["issue", "edit", "7", "-R", "acme/widgets", "--body-file", "-"],
+             ["api", "graphql", "-f", 'query=mutation{updateIssue(input:{id:"PR_x",body:"no type"}){x}}']]
+    for args in calls:
+        assert prguard.check(args, "/bin/false", cfg=p.config()) is None, args
+    for args in calls[:3]:
+        rc, err, ran = gh(*args)
+        assert rc == 0 and ran == [" ".join(args)], (args, err)
+    assert seen() == [] and asked() == []

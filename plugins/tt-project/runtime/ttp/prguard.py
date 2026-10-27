@@ -14,7 +14,9 @@ It refuses, whatever the agent or provider:
   Bot reviewers (a login ending in `[bot]`, Copilot) may be requested.
 - with `delivery.pr_body_check` set, `gh pr create`, a `gh pr edit` that sets the body and a
   `gh api` REST or GraphQL call that writes a PR body when the project's own PR body check refuses
-  the body (prbody).
+  the body (prbody); also `gh issue edit` and issue body edits, when the target is a PR.
+REST routes match `repos/<o>/<r>/...` and its alias `repositories/<id>/...`; GraphQL matches the
+`graphql` endpoint however it is spelled (`/graphql`, `graphql/`, any case).
 
 An approval record is written only by the coordinator's `pr_approve` action. It needs the user's
 own words, quoted: a user message that names the PR, or the user's answer to a blocking `review` or
@@ -83,7 +85,8 @@ CHECKS_FILE = "checks.json"    # in a run's directory: {"head": sha, "passed": b
 PR_URL_RE = re.compile(r"https?://[^/\s]+/([\w.-]+)/([\w.-]+)/pull/(\d+)", re.I)
 PR_REF_RE = re.compile(r"(?<![\w./-])([\w.-]+)/([\w.-]+)#(\d+)\b")
 NODE_ID_RE = re.compile(r"\b(PR_[A-Za-z0-9_-]{6,}|MDExOlB1bGxSZXF1ZXN0[A-Za-z0-9+/=]*)")
-REST_PR_RE = re.compile(r"^/?repos/([^/]+)/([^/]+)/pulls(?:/(\d+))?/?$")
+# repos/<owner>/<repo>/pulls[/<n>], or repositories/<id>/pulls[/<n>] (GitHub serves both).
+REST_PR_RE = re.compile(r"^/?(?:repos/([^/]+)/([^/]+)|repositories/(\d+))/pulls(?:/(\d+))?/?$")
 GH_COMMANDS = {"alias", "api", "attestation", "auth", "browse", "cache", "co", "codespace", "completion",
                "config", "extension", "gist", "gpg-key", "help", "issue", "label", "org", "pr", "project",
                "release", "repo", "ruleset", "run", "search", "secret", "ssh-key", "status", "variable",
@@ -94,7 +97,7 @@ HOW = ("A PR leaves draft only after the user approves it: the coordinator asks 
 NO_REVIEWERS = ("refused: never request human reviewers on a PR; the user asks for reviews themselves. "
                 "Leave the PR as a draft without reviewers and go on.")
 BOT_REVIEWER_RE = re.compile(r"@?copilot|[\w.-]+\[bot\]", re.I)
-REVIEWERS_REST_RE = re.compile(r"^/?repos/[^/]+/[^/]+/pulls/\d+/requested_reviewers/?$")
+REVIEWERS_REST_RE = re.compile(r"^/?(?:repos/[^/]+/[^/]+|repositories/\d+)/pulls/\d+/requested_reviewers/?$")
 # `gh pr create` short flags that take no value, so `-dr alice` is --draft --reviewer alice
 PR_CREATE_BOOLS = "defw"
 PR_CREATE_LONG_BOOLS = {"--draft", "--editor", "--fill", "--fill-first", "--fill-verbose", "--web", "--dry-run",
@@ -777,6 +780,9 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
             if _humans(_opts(more, ("--add-reviewer",))):
                 return _no_reviewers(seen, " ".join(more))
             return _body_problem("edit", more, real, stdin_text, cfg)
+    if cmd == "issue" and rest[:1] == ["edit"]:   # a PR is an issue: this may rewrite a PR's body
+        from . import prbody
+        return prbody.issue_problem(rest[1:], _project_config() if cfg is None else cfg, real, stdin_text)
     if cmd == "api":
         return _check_api(rest, real, db, stdin_text, allowed, seen) or _api_body_problem(rest, real, stdin_text, cfg)
     return None
@@ -831,12 +837,13 @@ def _check_api(args: list[str], real: str, db, stdin_text: str | None, allowed: 
     endpoint, method = _api_target(args)
     draft_false = bool(re.search(r"(^|\s)draft=false\b|[\"']draft[\"']\s*:\s*false", text, re.I))
     draft_true = bool(re.search(r"(^|\s)draft=true\b|[\"']draft[\"']\s*:\s*true|\bdraft\s*:\s*true", text, re.I))
-    if endpoint == "graphql" and re.search(r"\brequestReviews", text):
+    graphql = endpoint.strip("/").lower() == "graphql"   # `/graphql` too: gh posts it as REST, GitHub serves it
+    if graphql and re.search(r"\brequestReviews", text):
         return _no_reviewers(seen, text)
     if REVIEWERS_REST_RE.match(endpoint) and method == "POST" and _reviewer_humans(fields, body):
         m = REST_PR_RE.match(endpoint.rsplit("/requested_reviewers", 1)[0])
-        return _no_reviewers(seen, f"{m.group(1)}/{m.group(2)}#{m.group(3)}" if m else "")
-    if endpoint == "graphql":
+        return _no_reviewers(seen, f"{m.group(1)}/{m.group(2)}#{m.group(4)}" if m and m.group(1) else "")
+    if graphql:
         if re.search(r"markPullRequestReadyForReview", text):
             prs, heads = set(), {}
             for node in set(NODE_ID_RE.findall(text)):
@@ -856,8 +863,8 @@ def _check_api(args: list[str], real: str, db, stdin_text: str | None, allowed: 
     m = REST_PR_RE.match(endpoint)
     if not m:
         return None
-    owner, repo, number = m.groups()
-    if "{" in owner or "{" in repo:
+    owner, repo, rid, number = m.groups()
+    if rid is None and ("{" in owner or "{" in repo):
         nwo = _gh(real, "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner")
         if "/" in nwo:
             owner, repo = nwo.split("/", 1)
@@ -866,8 +873,13 @@ def _check_api(args: list[str], real: str, db, stdin_text: str | None, allowed: 
             return _checks_problem() if draft_true else "refused: PRs are opened as drafts only; send draft=true. " + HOW
         return None
     if method in ("PATCH", "POST", "PUT") and draft_false:
-        key = f"{owner}/{repo}#{int(number)}".lower()
         host = [x for h in _opts(args, ("--hostname",))[-1:] for x in ("--hostname", h)]
+        if rid is not None:   # repositories/<id>/pulls/<n>: its URL names the PR
+            out = _gh(real, "api", *host, endpoint.strip("/"), "-q", '.html_url + " " + .head.sha')
+            key = pr_key(out)
+            return _refuse_ready({key} if key else set(), db, "setting draft=false on a PR", allowed,
+                                 {key: _sha(out)} if key else {}, seen)
+        key = f"{owner}/{repo}#{int(number)}".lower()
         head = _sha(_gh(real, "api", *host, f"repos/{owner}/{repo}/pulls/{number}", "-q", ".head.sha"))
         return _refuse_ready({key}, db, "setting draft=false on a PR", allowed, {key: head}, seen)
     return None
@@ -937,7 +949,7 @@ def main(argv: list[str], own_dir: str) -> int:
     if args[:1] == ["api"] and ("-" in _opts(args, ("--input",))
                                 or any(f.endswith("=@-") for f in _opts(args, ("-F", "--field")))):
         stdin_text = sys.stdin.read()
-    elif args[:2] in (["pr", "create"], ["pr", "edit"]):
+    elif args[:2] in (["pr", "create"], ["pr", "edit"], ["issue", "edit"]):
         from .prbody import CREATE_VALUES, EDIT_VALUES, _scan
         given, _ = _scan(args[2:], CREATE_VALUES if args[1] == "create" else EDIT_VALUES)
         if "-" in (given.get("--body-file"), given.get("-F")):   # the body check reads it, then gh
@@ -948,7 +960,8 @@ def main(argv: list[str], own_dir: str) -> int:
         why = check(args, real, db, stdin_text, allowed=allowed, seen=seen)
     except Exception as e:   # fails closed only for the calls it guards
         guarded = (args[:2] in (["pr", "ready"], ["pr", "create"]) or args[:1] == ["api"]
-                   or args[:2] == ["pr", "edit"] and any(a.startswith(("-b", "--body", "-F")) for a in args[2:]))
+                   or args[:2] in (["pr", "edit"], ["issue", "edit"])
+                   and any(a.startswith(("-b", "--body", "-F")) for a in args[2:]))
         why = f"refused: the PR draft guard failed ({e})" if guarded else None
         if args[:2] == ["pr", "ready"] and "--undo" not in args:
             seen.append(("ready", sorted(pr_keys(" ".join(args)))))

@@ -28651,6 +28651,26 @@ if a[:2] == ["pr", "view"]:
     n = pos[0] if pos and pos[0].isdigit() else "7"
     print(f"https://github.com/acme/widgets/pull/{{n}} {{head}}")
     sys.exit(0)
+if a[:1] == ["api"] and a[-2:] in (["--jq", ".number"], ["--jq", ".data.node.__typename"]):
+    if os.environ.get("FAKE_GH_LOOKUPS"):   # is this issue or node a PR?
+        with open(os.environ["FAKE_GH_LOOKUPS"], "a") as f:
+            f.write(" ".join(a) + "\\n")
+    pulls = os.environ.get("FAKE_GH_PULLS", "")
+    if pulls == "offline":
+        sys.exit("error connecting to api.github.com")
+    if a[-1] == ".number":
+        n = [x for x in a if "/pulls/" in x][0].rsplit("/", 1)[1]
+        if n in pulls.split(","):
+            print(n)
+            sys.exit(0)
+        sys.exit("gh: Not Found (HTTP 404)")
+    nodes = dict(x.split("=") for x in os.environ.get("FAKE_GH_NODES", "").split(",") if x)
+    node = [x[3:] for x in a if x.startswith("id=")][0]
+    print(nodes.get(node, ""))
+    sys.exit(0)
+if a[:1] == ["api"] and a[-1:] == ['.html_url + " " + .head.sha']:
+    print(f"https://github.com/acme/widgets/pull/7 {{head}}")
+    sys.exit(0)
 if a[:2] == ["api", "graphql"] and any("node(id:" in x for x in a):
     print(f"https://github.com/acme/widgets/pull/7 {{head}}")
     sys.exit(0)
