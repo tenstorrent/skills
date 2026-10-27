@@ -13781,6 +13781,80 @@ def test_promise_owner_task_links_resend_merges_and_done_plus_reply_closes(env, 
     assert "finished; reply #" in ob.get(p.db, o["id"])["receipt"]["evidence"]
 
 
+def test_promise_auto_attaches_the_one_open_task_it_names_in_its_chat(env, monkeypatch):
+    """A promise no batch task owns is attached to the one open task its reply names as #<id> whose
+    reply_chat is that chat, as a manual attach (spec note, owner clock), and kept in its history."""
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    monkeypatch.setattr(time, "time", lambda: now)
+    p.db.update_task(tid, reply_chat="c1", status="running")
+    other = p.db.add_task("unrelated", "s", kind="work", tier="light", origin="coordinator")
+    assert coord.apply(p, [{"type": "reply", "chat": "c1",
+                            "text": f"Task #{tid} runs the bench (see PR #{other}, message #999). "
+                                    "When it's done, I'll post the full table in this chat."}]) == []
+    [o] = ob.open_promises(p.db)
+    assert o["promise"]["tasks"] == [tid] and list(o["owners"]) == [str(tid)]
+    assert o["owners"][str(tid)]["since"] == now
+    assert o["history"][0]["event"] == "attached" and o["history"][0]["task"] == tid
+    assert f"## Obligation {o['id']} " in p.db.task(tid)["spec"]
+    assert any(f"promise {o['id']} recorded" in n and f"owned by #{tid}" in n and "attached" in n
+               for n in p.db.kv(coord.NOTES_KEY))
+
+
+def test_promise_names_no_single_open_task_in_its_chat_stays_unowned(env, monkeypatch):
+    """Two named open tasks in the chat, a named task replying to another chat, a named task that is
+    done or cancelled: the promise stays unowned, exactly as before."""
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    monkeypatch.setattr(time, "time", lambda: now)
+    two = p.db.add_task("second", "s", kind="work", tier="light", origin="coordinator")
+    p.db.update_task(tid, reply_chat="c1", status="waiting")
+    p.db.update_task(two, reply_chat="c1", status="queued")
+    cases = [("c1", f"#{tid} and #{two} run it. I'll post the full table in this chat."),
+             ("c2", f"#{tid} runs it. I'll post the full table in this chat.")]
+    for chat, text in cases:
+        assert coord.apply(p, [{"type": "reply", "chat": chat, "text": text}]) == []
+    for status in ("done", "cancelled"):
+        p.db.update_task(two, status=status)
+        assert coord.apply(p, [{"type": "reply", "chat": "c1",
+                                "text": f"#{two} ran it. I'll post the {status} table in this chat."}]) == []
+    rows = ob.open_promises(p.db)
+    assert len(rows) == 4
+    assert all(o["promise"]["tasks"] == [] and o["owners"] == {} and not o.get("history") for o in rows)
+    assert "## Obligation" not in (p.db.task(tid)["spec"] or "")
+    assert coord.apply(p, [{"type": "reply", "chat": "c1",   # the control: #two ended, #tid is the one left
+                            "text": f"#{tid} and #{two} ran it. I'll post the control table in this chat."}]) == []
+    assert [o["promise"]["tasks"] for o in ob.open_promises(p.db) if "control" in o["text"]] == [[tid]]
+
+
+def test_promise_with_explicit_owners_or_delivers_is_not_auto_attached(env, monkeypatch):
+    """A reply naming `owners` or `delivers`, or a batch task already owning the promise: no named task
+    is attached on top."""
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    monkeypatch.setattr(time, "time", lambda: now)
+    p.db.update_task(tid, reply_chat="c1", status="running")
+    for extra in ({"owners": [tid]}, {"delivers": ["o99"]}):
+        word = next(iter(extra))
+        assert coord.apply(p, [{"type": "reply", "chat": "c1", **extra,
+                                "text": f"#{tid} runs it. I'll post the {word} table in this chat."}]) == []
+    assert coord.apply(p, [{"type": "task_add", "title": "producer", "spec": "s", "reply_chat": "c1"},
+                           {"type": "reply", "chat": "c1",
+                            "text": f"#{tid} runs it. I'll post the batch table in this chat."}]) == []
+    new = p.db.one("SELECT id FROM tasks WHERE title='producer'")["id"]
+    by = {o["text"]: o for o in ob.open_promises(p.db)}
+    assert [o["promise"]["tasks"] for o in by.values() if "batch" not in o["text"]] == [[], []]
+    [batch] = [o for o in by.values() if "batch" in o["text"]]
+    assert batch["promise"]["tasks"] == [new] and batch["owners"] == {}
+    assert "## Obligation" not in (p.db.task(tid)["spec"] or "")
+    assert coord.apply(p, [{"type": "reply", "chat": "c1",   # the control: neither field, no batch owner
+                            "text": f"#{tid} runs it. I'll post the plain table in this chat."}]) == []
+    assert [o["promise"]["tasks"] for o in ob.open_promises(p.db) if "plain" in o["text"]] == [[tid]]
+
+
 def test_promise_not_recorded_for_non_commitments_questions_or_offers(env, monkeypatch):
     from ttp import coordinator as coord
     from ttp import obligations as ob

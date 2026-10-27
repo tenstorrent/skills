@@ -50,7 +50,10 @@ sha by 15:00", "ETA 18:30") is recorded as an obligation with a `promise` field 
 when the turn's actions are applied): the chat, the message, the promised sentences, the due time (the
 first time named, in the project's home zone; else coordinator.promise_default_h, PROMISE_DEFAULT_H,
 after the reply) and the tasks of the same batch that will reply to that chat (task_add or task_update
-with that `reply_chat`). It is always recorded; an obligation the same batch records or attaches is
+with that `reply_chat`). A promise no batch task owns, from a reply with no `owners` or `delivers`, is
+attached to the one open task (queued, running, waiting or blocked) the reply names as `#<id>` whose
+`reply_chat` is that chat, as a manual attach would, and the attach is kept in its `history` (_named_owner;
+none or several such tasks: it stays unowned). It is always recorded; an obligation the same batch records or attaches is
 linked to it only when one of its owners is such a task, and once every linked obligation has its
 receipt or is dropped, the promise closes too. The same promise sent again to the same chat updates the open record. A
 promise has no owner clocks: it is due once, at its due time, when check() raises one high
@@ -1011,16 +1014,33 @@ def owner_due(db) -> dict[int, float]:
     return out
 
 
+NAMED_OPEN = ("queued", "running", "waiting", "blocked")   # a task a reply names that can still produce it
+TASK_REF = re.compile(r"(?<![\w&/])#(\d+)\b")
+
+
+def _named_owner(db, chat: str, text: str) -> int | None:
+    """The one open task `text` names as #<id> whose reply_chat is `chat`; None for none or several."""
+    ids = sorted({int(m) for m in TASK_REF.findall(text or "")})
+    if not ids or chat == "all":
+        return None
+    rows = db.q(f"SELECT id, status, reply_chat FROM tasks WHERE id IN ({','.join('?' * len(ids))})", ids)
+    hits = [r["id"] for r in rows if r["status"] in NAMED_OPEN and r["reply_chat"] and _chat(r["reply_chat"]) == chat]
+    return hits[0] if len(hits) == 1 else None
+
+
 def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int, str | None],
-                    obligations: list[str] = (), now: float | None = None) -> list[str]:
+                    obligations: list[str] = (), now: float | None = None, explicit=()) -> list[str]:
     """Record the commitments in this batch's sent messages (message id, chat, text). `tasks`: the batch's
     tasks by id with their reply_chat; one replying to a promise's chat owns it. `obligations`: the ids the
     batch recorded or attached owners to; one owned by a task that owns the promise is linked to it, and
-    the promise closes with it. Every promise is recorded. Returns a note per promise."""
+    the promise closes with it. `explicit`: the message ids of replies that named `owners` or `delivers`;
+    any other promise no batch task owns is attached to the one open task its text names in that chat
+    (_named_owner). Every promise is recorded. Returns a note per promise."""
     now = time.time() if now is None else now
     found = [(mid, _chat(chat), said) for mid, chat, text in sent if (said := commitments(text))]
     if not found:
         return []
+    full = {mid: text for mid, _, text in sent}
     from . import timefmt
     tz = timefmt.tzinfo(p)
     hours = default_h(p.config())
@@ -1031,12 +1051,20 @@ def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int,
             text = " ".join(" ".join(said).split())[:PROMISE_TEXT_MAX]
             due = next((d for s in said if (d := promise_due(s, now, tz)) is not None), None)
             owners = sorted(t for t, c in tasks.items() if c is not None and _chat(c) == chat)
+            named = None if owners or mid in explicit else _named_owner(p.db, chat, full.get(mid, ""))
+            if named is not None:
+                owners = [named]
             links = sorted({oid for oid in obligations if (o := st["items"].get(oid)) and not o.get("promise")
                             and set(o["owners"]) & {str(t) for t in owners}})
             same = next((o for o in st["items"].values() if _open(o) and o.get("promise")
                          and o["promise"]["chat"] == chat and o["text"] == text), None)
             if same:
                 pr = same["promise"]
+                if named is not None and pr["tasks"]:
+                    owners = []   # it has owners already
+                elif named is not None:
+                    _auto_attach(p, same, named, mid, now)
+                    notes.append(f"promise {same['id']}: #{named} attached as its owner (named in message #{mid})")
                 pr["tasks"] = sorted(set(pr["tasks"]) | set(owners))
                 pr["obligations"] = sorted(set(pr.get("obligations") or []) | set(links))
                 if pr["message"] == mid:
@@ -1053,11 +1081,23 @@ def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int,
                                 "promise": {"chat": chat, "message": mid, "due": due if due else now + hours * 3600,
                                             "timed": due is not None, "tasks": owners, "obligations": links,
                                             "raised": None}}
+            if named is not None:
+                _auto_attach(p, st["items"][oid], named, mid, now)
             notes.append(f"promise {oid} recorded from message #{mid}: due {timefmt.long(st['items'][oid]['promise']['due'], p)}"
                          + (f", owned by #{', #'.join(map(str, owners))}" if owners else ", no task owns it")
+                         + (f" (attached: the reply names it and it replies to chat {chat})" if named is not None else "")
                          + (f", linked to {', '.join(links)}" if links else ""))
         p.db.set_kv(KV, st)
     return notes
+
+
+def _auto_attach(p, o: dict, tid: int, mid: int, now: float) -> None:
+    """Attach the task a promise's reply named (_named_owner) as a manual attach does, and keep it in the
+    promise's history."""
+    _attach(p, o, [tid], now)
+    o.setdefault("history", []).append({"at": now, "event": "attached", "task": tid,
+                                        "why": f"message #{mid} names #{tid}, an open task replying to chat "
+                                               f"{o['promise']['chat']}"})
 
 
 def _kept(db, o: dict, st: dict) -> str | None:
