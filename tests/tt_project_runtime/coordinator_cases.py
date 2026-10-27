@@ -7627,7 +7627,8 @@ def test_task_update_resources_with_an_explicit_start_still_applies_it(env):
     assert coord.deferral(t).get("when") == "test -e /tmp/go"
     tid = _waiting_on(p, ["resource:box-a"], retry_when="test -e /tmp/build.done")
     assert coord.apply(p, [{"type": "task_update", "id": tid, "resources": ["box-b"], "start_after": "now"}]) == []
-    assert p.db.task(tid)["not_before"] is None
+    t = p.db.task(tid)   # still waiting on its retry_when: its retry timer keeps the probe gating it
+    assert t["not_before"] is not None and json.loads(t["labels"])[0] == "resource:box-b"
 
 
 
