@@ -677,8 +677,11 @@ def test_worker_prompt_quotes_log_tail_before_diagnosing_a_failed_job():
 
 def test_worker_prompt_has_root_edits_committed_or_reverted_before_hand_off():
     text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
-    assert "Tracked files you edit in the project root: commit them to its repository or revert them " \
-           "before you hand off." in text
+    line = "Tracked files you edit in the project root: commit them to its repository or revert them before you hand off."
+    assert line in text
+    # Only kinds that run in the project root by default carry it: code and review get worktrees.
+    block = text.split("<!-- ttp:if !prs -->", 1)[1].split("<!-- /ttp:if !prs -->", 1)[0]
+    assert line in block
 
 
 def test_prompts_require_home_zone_times_with_abbreviation_never_utc():
