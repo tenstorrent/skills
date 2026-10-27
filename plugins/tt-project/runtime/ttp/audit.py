@@ -67,10 +67,10 @@ def _dur(s: float) -> str:
     return f"{s / 3600:.1f} h" if s >= 3600 else f"{s / 60:.0f} min"
 
 
-def asks(db: DB, since: float, now: float) -> list[dict]:
+def asks(db: DB, since: float, now: float, p: Project | None = None) -> list[dict]:
     """Asks sent since `since`, with their text, recommendation and answer (unblock.asks links them)."""
     from .coordinator import _REC_NOTE, _ask_question
-    rows = unblock.asks(db, since, now)
+    rows = unblock.asks(db, since, now, chat_min=(p.config().get("notify") or {}).get("chat_min_severity") if p else None)
     if not rows:
         return []
     msgs = {m["id"]: m for m in db.q(f"SELECT id, ts, text FROM messages WHERE id IN ({','.join('?' * len(rows))})",
@@ -281,7 +281,7 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
     now = time.time() if now is None else now
     since = now - window_s
     out: list[str] = []
-    sent = asks(db, since, now)
+    sent = asks(db, since, now, p)
     for a in sent:
         rec = f"; recommended: {a['recommendation']}" if a["recommendation"] else ""
         if a["answered"]:
@@ -427,7 +427,7 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
     now = time.time() if now is None else now
     since = now - window_s
     done = finished(db, since)
-    return {"window_h": window_s / 3600, "asks": asks(db, since, now), "asks_refused": rejected_asks(db, since),
+    return {"window_h": window_s / 3600, "asks": asks(db, since, now, p), "asks_refused": rejected_asks(db, since),
             "failed_runs": failed_runs(db, since), "lost_runs": lost_runs(db, since),
             "retried_tasks": retried_tasks(db, since), "continued_tasks": continued_tasks(db, since),
             "review_fix_tasks": continued_tasks(db, since, fixes=True),

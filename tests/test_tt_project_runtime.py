@@ -1808,6 +1808,8 @@ def test_unblock_a_reply_to_another_outbound_message_is_not_an_open_asks_answer(
     assert not unblock.asks(p.db, now - 86400, now)[1]["answered"]
     assert unblock.replies_to("re #12", None, "Re: 13", "reply to message #14", "in reply to 15") == {12, 13, 14, 15}
     assert unblock.replies_to("are 12 cells done", "more #12", "task #16", "re #17.5") == set()
+    # A contraction's 're' is not a reply-to claim.
+    assert unblock.replies_to("we're 5 minutes out", "they\u2019re 3 hours stale", "you're 2 for 2") == set()
 
 
 def test_unblock_a_broadcast_asks_newest_answer_is_about_it_or_where_it_was_delivered(env):
@@ -1822,6 +1824,30 @@ def test_unblock_a_broadcast_asks_newest_answer_is_about_it_or_where_it_was_deli
     msg("in", "ok", 4000, chat="relay")   # a bare reply is about the ask
     rows = {r["id"]: r for r in unblock.asks(p.db, now - 86400, now)}
     assert rows[b]["how"] == "newest" and not rows[a]["answered"]
+
+
+def test_unblock_a_broadcast_ask_read_by_a_relay_chat_links_its_plain_answer_there(env):
+    """A relay chat that read past a broadcast ask at or above its severity floor got it: a plain
+    reply there links; one in a chat that has not read it, or skipped it below its floor, does not."""
+    from ttp import unblock
+    p, now, msg = _ask_db(env)
+    msg("out", "Start the sweep now?", 9500, "ask")
+    for chat in ("relay", "behind", "loud", "web"):
+        msg("in", "start the sweep", 9000, chat=chat)   # the user's previous message in each chat
+    a = msg("out", "Which credential should the nightly run use?", 8000, "ask")   # broadcast, not on Slack
+    p.db.x("DELETE FROM chats")
+    for chat, read, floor in (("relay", a + 5, None), ("behind", a - 1, None), ("loud", a + 5, "high"),
+                              ("web", a + 5, None)):
+        p.db.x("INSERT INTO chats(id,created,last_read,min_severity) VALUES(?,?,?,?)", (chat, now - 9999, read, floor))
+    for chat in ("behind", "loud", "web"):
+        msg("in", "the second one", 7000, chat=chat)
+    assert not unblock.asks(p.db, now - 86400, now)[1]["answered"]
+    # The project floor applies too: 'high' everywhere means a normal ask was skipped, not read.
+    msg("in", "the second one", 6000, chat="relay")
+    assert not unblock.asks(p.db, now - 86400, now, chat_min="high")[1]["answered"]
+    row = unblock.asks(p.db, now - 86400, now)[1]
+    assert row["id"] == a and row["how"] == "newest" and row["answer"] == "the second one", row
+    assert unblock.replies_to("we're 5 minutes out", "'re #12'", "(re: 13)") == {12, 13}
 
 
 def test_unblock_a_plain_reply_where_the_ask_was_delivered_still_links(env):

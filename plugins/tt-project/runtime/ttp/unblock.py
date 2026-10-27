@@ -31,7 +31,8 @@ text or relayer context, or a reply in that message's thread), answers the one a
 about it (about_ask): sent before it, no answer linked yet and not resolved before it. With several
 open, it answers the newest only when that is the only one sent since the user's previous message in
 that chat (a plain reply answers what was just asked) and, for a broadcast ask, the reply came where
-the ask is known to have been delivered (Slack, once posted there) or is about it; otherwise it is
+the ask is known to have been delivered (Slack, once posted there, or a relay chat that read past it at
+or above its severity floor) or is about it; otherwise it is
 linked to none. The answer's part about that ask is matched against
 HANDBACK, a short phrase list of answers that give the decision back to the project.
 """
@@ -46,7 +47,7 @@ from pathlib import Path
 from typing import Any
 
 from . import anchors, reviewcap
-from .db import DB
+from .db import DB, SEVERITY_RANK, chat_floor
 
 WINDOWS = (("24 h", 86400), ("7 d", 7 * 86400))
 STUCK = {"task_blocked": "blocked", "task_waiting": "waiting", "task_review": "review"}
@@ -107,7 +108,7 @@ HANDBACK = tuple(re.compile(p, re.I) for p in (
 _MENTION = re.compile(r"(?:(?<![\w/])#|\bask\s+#?)(\d+)\b", re.I)   # "#12", "ask 12", "ask #12"
 _NOT_ASK = re.compile(r"\b(task|pr|issue|run|pull request)\s*$", re.I)
 # "re #12", "re: 12", "reply to message #12", "in reply to #12": names the message a reply is for.
-_REPLY_TO = re.compile(r"(?:\bre\b|\breply(?:ing)? to\b)\s*:?\s*(?:(?:message|msg|post)\s+)?#?(\d+)(?![\w.])", re.I)
+_REPLY_TO = re.compile(r"(?:(?<![^\W\d_]['\u2019])\bre\b|\breply(?:ing)? to\b)\s*:?\s*(?:(?:message|msg|post)\s+)?#?(\d+)(?![\w.])", re.I)
 
 
 def handback(text: str) -> str | None:
@@ -588,13 +589,14 @@ def inventory_line(rows: list[dict]) -> str:
     return line
 
 
-def asks(db: DB, since: float, now: float | None = None) -> list[dict]:
+def asks(db: DB, since: float, now: float | None = None, chat_min: str | None = None) -> list[dict]:
     """Asks sent since `since`: {id, blocking, answered, handback (the phrase or None), how (the
     first rule that linked an answer: named, thread, resolved, only_open or newest; None), answer
-    (the earliest linked answer's text, cut to 200 chars) and answered_at (its time)}."""
+    (the earliest linked answer's text, cut to 200 chars) and answered_at (its time)}. `chat_min` is the
+    project's notify.chat_min_severity, the floor under every relay chat's own."""
     now = time.time() if now is None else now
     # Older asks still count as open when a plain reply is matched, so it is not given to a newer one.
-    sent = db.q("SELECT id, ts, ref, ext_id, chat, text FROM messages WHERE direction='out' AND kind='ask' AND ts>=? "
+    sent = db.q("SELECT id, ts, ref, ext_id, chat, text, severity, channel FROM messages WHERE direction='out' AND kind='ask' AND ts>=? "
                 "ORDER BY id", (since - ANSWER_MAX_AGE_S,))
     if not any(a["ts"] >= since for a in sent):
         return []
@@ -608,6 +610,9 @@ def asks(db: DB, since: float, now: float | None = None) -> list[dict]:
     other_threads = {r["ext_id"] for r in db.q("SELECT ext_id FROM messages WHERE direction='out' AND kind!='ask' "
                                                "AND ext_id IS NOT NULL AND ts>=?", (sent[0]["ts"],))}
     resolved = db.kv(RESOLVED_KEY, {}) or {}
+    # Relay chats: what each has read and its severity floor (a broadcast below it was skipped, not read).
+    readers = {r["id"]: (int(r["last_read"] or 0), SEVERITY_RANK.get(chat_floor(r["min_severity"], chat_min), 1))
+               for r in db.q("SELECT id, last_read, min_severity FROM chats WHERE id!='web'")}
     rows = {a["id"]: {"id": a["id"], "blocking": (a["ref"] or "").split(":", 1)[1]
                       if (a["ref"] or "").startswith("blocking:") else "unset",
                       "answered": False, "handback": None, "how": None, "first": None, "answer": None} for a in sent}
@@ -628,9 +633,17 @@ def asks(db: DB, since: float, now: float | None = None) -> list[dict]:
         return rows[a["id"]]["first"] is not None and rows[a["id"]]["first"] < m["ts"]
 
     def delivered(a: dict, m: dict) -> bool:
-        """Whether the ask is known to have reached the reply's chat: its own chat, or Slack for a
-        broadcast ask posted there (its ext_id). Any other chat may only have seen it in a feed."""
-        return a["chat"] == m["chat"] or (a["chat"] is None and bool(a["ext_id"]) and m["chat"] == "slack")
+        """Whether the ask is known to have reached the reply's chat: its own chat, Slack for a
+        broadcast ask posted there (its ext_id), or a relay chat that read past a broadcast ask at or
+        above its floor. Any other chat (the web app) may only have seen it in a feed."""
+        if a["chat"] == m["chat"]:
+            return True
+        if a["chat"] is not None:
+            return False
+        if m["chat"] == "slack":
+            return bool(a["ext_id"])
+        seen, floor = readers.get(m["chat"], (0, 99))
+        return seen >= a["id"] and SEVERITY_RANK.get(a["severity"], 1) >= floor and a["channel"] != "quiet"
 
     def closed_before(a: dict, m: dict) -> bool:
         return float((resolved.get(str(a["id"])) or {}).get("ts") or m["ts"]) < m["ts"]
