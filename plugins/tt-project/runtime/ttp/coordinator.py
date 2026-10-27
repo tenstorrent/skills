@@ -1584,6 +1584,7 @@ def deferral_update(db, task: dict, a: dict, p: Project | None, labels: list | N
         after, when = _start_args(a, cur, p)
     except MissingTaskRef as e:
         raise MissingTaskRef(f"#{task['id']} rejected: {e}") from None
+    after = float(f"{after:.0f}") if after else after   # whole seconds, as its label keeps it (not_before agrees)
     if p and when and when != cur.get("when") and (stuck := chaincap.own_wait(
             p, [t["id"] for t in chaincap.chain(db, task["id"])[:-1]], when)):
         raise ValueError(f"#{task['id']} rejected: {stuck}")

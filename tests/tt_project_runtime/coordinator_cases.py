@@ -9088,6 +9088,22 @@ def test_a_cleared_start_after_lets_a_passed_retry_when_start_the_task(env, monk
     assert _ready(p, tid) and "woke" in json.loads(p.db.task(tid)["result"])
 
 
+@pytest.mark.parametrize("frac", [0.2, 0.5, 0.7, 0.9987])
+def test_a_start_after_keeps_not_before_and_its_label_in_whole_seconds(env, monkeypatch, frac):
+    """not_before and the start_after label hold the same whole second: a label rounded above
+    not_before made the start-hold path move not_before on its next pass."""
+    p = make(env)
+    from ttp import cli
+    tid = _due_waiting_task(p, "true")
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: float(int(real())) + frac)
+    cli.set_when(p.db, tid, None, p, start_after="2h")
+    monkeypatch.setattr(time, "time", real)
+    task = p.db.task(tid)
+    label = [lb for lb in json.loads(task["labels"]) if lb.startswith("start_after:")]
+    assert label == [f"start_after:{task['not_before']:.0f}"] and task["not_before"] == int(task["not_before"]), task
+
+
 def test_a_past_start_after_adds_no_delay_to_a_passed_retry_when(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dmod
