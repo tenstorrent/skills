@@ -7255,6 +7255,25 @@ def test_a_derived_check_prestage_that_times_out_leaves_its_unfinished_test_out_
         _seed_check_failure(p, rid, [hangs, quick, after])
     default = checkprestage.DEFAULT_TIMEOUT_S
     monkeypatch.setattr(checkprestage, "DEFAULT_TIMEOUT_S", 6.0)   # short enough to cut test_hangs off
+    # The 6 s count from test_hangs' start (its live row), not pytest's start-up, which a loaded
+    # host can stretch past them before any test begins: the real timeout then cuts it off.
+    real, live = checkprestage.boundedchild.run, run / checkprestage.LIVE
+
+    def hangs_began(pid):
+        end = time.monotonic() + 120
+        while time.monotonic() < end and not any(
+                f'"{hangs}"' in ln and '"start"' in ln
+                for ln in (live.read_text(errors="replace") if live.exists() else "").splitlines()):
+            time.sleep(0.05)
+        return True
+
+    gated = []
+    def first_gated(argv, timeout, **kw):
+        if gated or "test_hang.py" not in str(argv):
+            return real(argv, timeout, **kw)
+        gated.append(argv)
+        return real(argv, timeout, on_start=hangs_began, **kw)
+    monkeypatch.setattr(checkprestage.boundedchild, "run", first_gated)
     assert checkprestage.derive(p.runs) == [after, hangs, quick]
     cli.main(["checks", "--detach"])
     out = capsys.readouterr().out
