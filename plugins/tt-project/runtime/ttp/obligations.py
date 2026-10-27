@@ -11,8 +11,10 @@ Each required owner has its own durable-progress clock (CLOCK_S, two hours). It 
 attached and is reset only by that owner recording durable progress with evidence (`ttp obligation
 progress <id> "<commit, file or URL>"`). Nothing else resets it: task edits, token activity, the task
 running or waiting, a re-attach. An owner waiting on a `ttp detach` job of its own run is kept on time
-(not reset) while that job still runs and wrote a `ttp progress report result` line within the clock
-(_job_results): a pid or a growing log alone never counts. A receipt (`ttp obligation receipt <id>
+(not reset) while that job still runs and wrote a `ttp progress report result` line within the clock,
+or a new file matching the results glob it declared (`ttp detach --results <glob>`) (_job_results): a
+pid or a growing log alone never counts. An overdue owner with such a live job that reported nothing
+is named with its job and both ways to report (anomaly_text). A receipt (`ttp obligation receipt <id>
 "<evidence>"`) ends the obligation. An owner task that ends (done, failed, cancelled) without one leaves it owed and its clock
 running. The harness records the evidence as given: checking it stays with the owner.
 
@@ -65,6 +67,7 @@ Keys of closed obligations (receipt or dropped) are history and pass.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import re
@@ -460,38 +463,111 @@ def overdue(o: dict, now: float) -> list[tuple[str, float]]:
     return out
 
 
-def _job_results(p, st: dict, now: float) -> dict[str, dict]:
-    """Per owner of an open obligation (task id), the latest `result` report (progress.py) a `ttp detach`
-    job of one of its own runs wrote on this boot within CLOCK_S, while that job still runs (progress._alive reads
-    detach.state: a job that wrote its .rc or is gone does not). A pid or a growing log alone never counts.
-    check reads it before its transaction: it reads the report file and each job's state."""
-    owners = {t for o in st["items"].values() if not (o["receipt"] or o.get("dropped") or o.get("promise"))
-              for t in o["owners"]}
+RESULT_FILES_MAX = 20000   # files a results glob looks at per job and pass: a huge tree is not walked whole
+
+
+def _owner_runs(p, owners) -> tuple[dict[str, str], dict[str, dict]]:
+    """(status per owner task id, runs with a folder per run id) of these owners."""
+    ids = sorted(owners, key=int)
+    marks = ",".join("?" * len(ids))
+    status = {str(t["id"]): t["status"] for t in p.db.q(f"SELECT id, status FROM tasks WHERE id IN ({marks})", ids)}
+    runs = {str(r["id"]): r for r in
+            p.db.q(f"SELECT id, task, dir FROM runs WHERE dir IS NOT NULL AND task IN ({marks})", ids)}
+    return status, runs
+
+
+def _open_owners(st: dict) -> set[str]:
+    return {t for o in st["items"].values() if not (o["receipt"] or o.get("dropped") or o.get("promise"))
+            for t in o["owners"]}
+
+
+def _live_jobs(p, st: dict) -> dict[str, list[dict]]:
+    """Per owner of an open obligation (task id) that has not ended, the local `ttp detach` jobs of its
+    own runs that still run (detach.state: .rc absent, its lock held on this boot), each its detached.json
+    entry ("name", "rc", and "results" and "cwd" when it declared a results glob)."""
+    owners = _open_owners(st)
+    if not owners:
+        return {}
+    from . import detach
+    status, runs = _owner_runs(p, owners)
+    out: dict[str, list[dict]] = {}
+    for run in runs.values():
+        tid = str(run["task"])
+        if status.get(tid, "gone") in CLOSED + ("gone",):
+            continue
+        try:
+            jobs = json.loads((Path(run["dir"]) / detach.REGISTRY).read_text())
+        except (OSError, ValueError):
+            continue
+        for j in jobs if isinstance(jobs, list) else []:
+            if not isinstance(j, dict) or not j.get("rc") or j.get("status") in detach.CLOSED:
+                continue
+            try:
+                live = detach.state(Path(j["rc"]))[0] == "running"
+            except OSError:
+                live = False
+            if live:
+                out.setdefault(tid, []).append(j)
+    return out
+
+
+def _result_file(job: dict, now: float) -> tuple[float, str] | None:
+    """(mtime, path relative to the job's folder) of the newest file matching the job's declared results
+    glob that changed after the job started and within CLOCK_S, else None."""
+    pat, cwd = job.get("results"), job.get("cwd")
+    if not pat or not cwd or Path(pat).is_absolute():
+        return None
+    since = max(float(job.get("started") or 0), now - CLOCK_S)
+    best = None
+    try:
+        for f in itertools.islice(Path(cwd).glob(pat), RESULT_FILES_MAX):
+            try:
+                m = f.stat().st_mtime
+            except OSError:
+                continue
+            if since <= m <= now and f.is_file() and (best is None or m > best[0]):
+                best = (m, str(f.relative_to(cwd)))
+    except (OSError, ValueError, NotImplementedError):
+        return None
+    return best
+
+
+def _job_results(p, st: dict, now: float, live: dict[str, list[dict]] | None = None) -> dict[str, dict]:
+    """Per owner of an open obligation (task id), the latest result a `ttp detach` job of one of its own
+    runs made on this boot within CLOCK_S, while that job still runs: a `result` report (progress.py;
+    progress._alive reads detach.state: a job that wrote its .rc or is gone does not), or a new file
+    matching the results glob the job declared (`ttp detach --results`, _result_file; `live` is
+    _live_jobs). A pid or a growing log alone never counts. check reads it before its transaction: it
+    reads the report file, each job's state and its result files."""
+    owners = _open_owners(st)
     if not owners:
         return {}
     from . import progress
     from .runner import same_boot
+    out: dict[str, dict] = {}
+    for tid, jobs in (live or {}).items():
+        for j in jobs:
+            if (hit := _result_file(j, now)) and (tid not in out or hit[0] > out[tid]["ts"]):
+                out[tid] = {"ts": hit[0], "job": j["rc"], "task": tid, "reason": f"new result file {hit[1]}"}
     recs = [r for r in progress.entries(p.state)
             if r["kind"] == "result" and r.get("job") and str(r.get("task") or "") in owners
             and 0 <= now - progress._ts(r, 0.0) < CLOCK_S and same_boot(r.get("boot"))]
     if not recs:
-        return {}
-    ids = sorted(owners, key=int)
-    status = {str(t["id"]): t["status"] for t in
-              p.db.q(f"SELECT id, status FROM tasks WHERE id IN ({','.join('?' * len(ids))})", ids)}
-    runs = {str(r["id"]): r for r in
-            p.db.q(f"SELECT id, task, dir FROM runs WHERE dir IS NOT NULL AND task IN ({','.join('?' * len(ids))})", ids)}
-    out: dict[str, dict] = {}
+        return out
+    status, runs = _owner_runs(p, owners)
     alive: dict[str, bool] = {}
+    seen: set[str] = set()
     for r in sorted(recs, key=lambda x: progress._ts(x, 0.0), reverse=True):
         tid, run = str(r["task"]), runs.get(str(r.get("run") or ""))
-        if tid in out or status.get(tid, "gone") in CLOSED + ("gone",) or not run or str(run["task"]) != tid \
+        if tid in seen or status.get(tid, "gone") in CLOSED + ("gone",) or not run or str(run["task"]) != tid \
                 or Path(r["job"]).parent.resolve() != Path(run["dir"]).resolve():   # a job its own run started
             continue
         if r["job"] not in alive:
             alive[r["job"]] = progress._alive(r)
         if alive[r["job"]]:
-            out[tid] = r
+            seen.add(tid)
+            if tid not in out or progress._ts(r, 0.0) > float(out[tid]["ts"]):
+                out[tid] = r
     return out
 
 
@@ -514,7 +590,21 @@ def _job_progress(o: dict, jobs: dict[str, dict]) -> tuple[set[str], bool]:
     return kept, changed
 
 
-def anomaly_text(o: dict, late: list[tuple[str, float]], status: dict[str, str]) -> str:
+def _quiet_job(o: dict, tid: str, j: dict) -> str:
+    """How an overdue owner waiting on its own live job, which reported no result within CLOCK_S, gets
+    back on time without another hand-made receipt task."""
+    h = CLOCK_S // 3600
+    said = (f"declares results `{j['results']}` but no new matching file in {h} h" if j.get("results")
+            else f"reported no result in {h} h")
+    return (f"its `ttp detach` job {j.get('name') or Path(j['rc']).stem} ({j['rc']}) still runs but {said}. "
+            f"Fix it once: the driver reports each finished unit with `ttp progress report result --key <k> "
+            f"\"<what>\"` (or a job started with `ttp detach --results <glob>` writes a file matching it per unit), "
+            f"or dispatch one light run of #{tid} to record progress from the job's files (`ttp obligation "
+            f"progress {o['id']} \"<result file>\"`)")
+
+
+def anomaly_text(o: dict, late: list[tuple[str, float]], status: dict[str, str],
+                 live: dict[str, list[dict]] | None = None) -> str:
     parts = []
     for tid, age in late:
         if not tid:
@@ -522,7 +612,8 @@ def anomaly_text(o: dict, late: list[tuple[str, float]], status: dict[str, str])
             continue
         st = status.get(tid, "gone")
         tail = " without a receipt" if st in CLOSED or st == "gone" else ""
-        parts.append(f"#{tid} ({st}{tail}) has no durable progress for {age / 3600:.1f} h")
+        parts.append(f"#{tid} ({st}{tail}) has no durable progress for {age / 3600:.1f} h"
+                     + "".join(f"; {_quiet_job(o, tid, j)}" for j in (live or {}).get(tid, [])))
     return (f"Obligation {o['id']} is still owed to the user: {o['text']}\n- " + "\n- ".join(parts)
             + f"\nGet it moving: attach or start the owner that produces it (`ttp obligation attach`), or "
               f"have the owner record progress or its receipt.")
@@ -588,7 +679,9 @@ def check(p, now: float | None = None) -> list[str]:
     now = time.time() if now is None else now
     db = p.db
     raised: list[str] = []
-    jobs = _job_results(p, _load(db), now)
+    st0 = _load(db)
+    live = _live_jobs(p, st0)
+    jobs = _job_results(p, st0, now, live)
     with db.tx():
         st = _load(db)
         changed = False
@@ -624,7 +717,7 @@ def check(p, now: float | None = None) -> list[str]:
             status = {str(t["id"]): t["status"] for t in
                       db.q(f"SELECT id, status FROM tasks WHERE id IN ({','.join('?' * len(ids))})", ids)} if ids else {}
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
-                 (now, "daemon", "obligation_overdue", fp, "high", anomaly_text(o, late, status)[:4000], "queued",
+                 (now, "daemon", "obligation_overdue", fp, "high", anomaly_text(o, late, status, live)[:4000], "queued",
                   ids[0] if ids else None))
             raised.append(fp)
         if changed:

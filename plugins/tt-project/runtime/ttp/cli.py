@@ -4505,7 +4505,11 @@ def cmd_detach(a) -> None:
     again after a host reboot cut it short, while its task still waits on it (daemon._relaunch_jobs).
     `--lock <resource>` (repeatable, or A,B) runs the job's command under one `ttp lock` of them all
     (_lock_job): the job takes them all or nothing before its command starts and holds them until the
-    command ends, before its .rc is written, or its processes are gone (a job found lost)."""
+    command ends, before its .rc is written, or its processes are gone (a job found lost).
+    `--results <glob>` (relative to the job's working dir) declares the files the job writes per finished
+    unit: kept in its detached.json entry (a relaunch keeps it), each new match counts as a result report
+    from the job for its task's obligations (obligations._job_results). A task that owns an open
+    obligation and starts a job without it is reminded to report results (_results_reminder)."""
     from . import detach, jobuse
     from . import locks as lk
     from .push import _boxed, _own_ttp
@@ -4542,6 +4546,11 @@ def cmd_detach(a) -> None:
         die("usage: ttp detach <name> --lock <resource> [--lock <resource>...] -- <command...>")
     if getattr(a, "resumable", False) and (a.remote or a.check is not None):
         die("--resumable is for a local job: a --remote one already outlives a reboot here")
+    results = getattr(a, "results", None)
+    if results is not None and (a.remote or a.check is not None):
+        die("--results is for a local job: the daemon reads its result files here")
+    if results is not None and (not results.strip() or Path(results).is_absolute()):
+        die("--results needs a glob relative to the job's working dir, e.g. 'out/*.json'")
     rhost = getattr(a, "remote_host", None)
     if (getattr(a, "remote_pid", None) or getattr(a, "remote_marker", None)) and not rhost:
         die("--remote-pid and --remote-marker go with --remote-host <ssh alias>")
@@ -4627,6 +4636,7 @@ def cmd_detach(a) -> None:
                  **({"resumable": True} if getattr(a, "resumable", False) else {}),
                  **({"remote": remote} if remote else {}),
                  **({"locks": job_locks} if job_locks else {}),
+                 **({"results": results, "cwd": os.getcwd()} if results else {}),
                  "requested": jobuse.requested(asked, os.environ, getattr(a, "cores", None),
                                                getattr(a, "devices", None), getattr(a, "mem_gb", None),
                                                _job_base_env(state))})
@@ -4635,7 +4645,27 @@ def cmd_detach(a) -> None:
     print(f"detached {a.name} {how}\nlog: {logf}\nrc:  {rc}\n"
           + (f"locks: {','.join(job_locks)} (taken all or nothing before the command starts, held until it "
              f"ends; a paused one ends the job with exit 75)\n" if job_locks else "")
+          + (f"results: each new file matching {results} under {os.getcwd()} counts as a result report\n"
+             if results else _results_reminder(state))
           + f"hand off: status waiting, retry_when \"{lk.job_probe([rc], _own_ttp())}\"")
+
+
+def _results_reminder(state: Path | None) -> str:
+    """The start notice's reminder for a task that owns an open obligation and started a job with no
+    --results: a live job that reports no result leaves the obligation overdue. "" otherwise."""
+    task = os.environ.get("TTP_TASK") or ""
+    if state is None or not task.isdigit():
+        return ""
+    try:
+        from . import obligations
+        owned = obligations.owned_open(Project(state.parent).db, int(task))
+    except Exception:   # an unreadable database only loses the reminder
+        return ""
+    if not owned:
+        return ""
+    return (f"obligation {', '.join(owned)}: this job keeps it on time only while it reports results. Have "
+            f"it run `ttp progress report result --key <k> \"<what>\"` per finished unit, or start it with "
+            f"`--results <glob>` matching the file it writes per unit\n")
 
 
 def _detach_reap(what: str) -> int:
@@ -4790,7 +4820,8 @@ def _start_options(a) -> None:
     never runs as the command."""
     words = list(a.command or [])
     known = {"--cores": int, "--devices": int, "--mem-gb": float, "--resumable": None, "--lock": list,
-             **({"--dir": str} if a.remote else {"--remote-host": str, "--remote-pid": str, "--remote-marker": str})}
+             **({"--dir": str} if a.remote else {"--remote-host": str, "--remote-pid": str, "--remote-marker": str,
+                                                  "--results": str})}
     while words and words[0].startswith("-") and words[0] != "--":
         w = words.pop(0)
         key, eq, val = w.partition("=")
@@ -8371,6 +8402,10 @@ def main(argv: list[str] | None = None) -> None:
                    help="the job is safe to rerun from the start: after a host reboot cuts it short, the daemon "
                    "starts it again while the task still waits on it, with no model run (up to "
                    "budget.max_job_relaunches times, default 3)")
+    s.add_argument("--results", metavar="GLOB",
+                   help="files the job writes per finished unit, relative to its working dir (e.g. 'out/*.json'): "
+                   "each new match counts as a result report from the job, keeping an obligation its task owns on "
+                   "time with no `ttp progress report result` in the driver")
     s.add_argument("--cores", type=int, help="cores the job is meant to keep busy (default: read from -j N, "
                    "--jobs/--threads/--workers N, OMP_NUM_THREADS); the daemon flags sustained under-use")
     s.add_argument("--devices", type=int, help="devices the job is meant to use")

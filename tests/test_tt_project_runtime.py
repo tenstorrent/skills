@@ -41248,6 +41248,106 @@ def test_obligation_owner_on_a_dead_job_is_overdue_despite_a_recent_result(env, 
         job3.close()
 
 
+def _ob_detached(p, monkeypatch, tid, now, name="job1", **entry):
+    """_ob_job, with the job's detached.json entry in its run's folder as `ttp detach` writes it, and
+    the owner queued (its job relaunched after a reboot, say)."""
+    rc, job, report = _ob_job(p, monkeypatch, tid, now, name=name)
+    (rc.parent / "detached.json").write_text(json.dumps([{"name": name, "rc": str(rc), "log": str(rc.with_suffix(".log")),
+                                                          "started": now, "status": "running", **entry}]))
+    p.db.update_task(tid, status="queued")
+    return rc, job, report
+
+
+def test_obligation_owner_on_a_live_job_that_never_reports_is_named_with_both_fixes(env, monkeypatch):
+    from ttp import obligations as ob
+    from ttp import progress
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the results table", [tid], now=now)
+    rc, job, report = _ob_detached(p, monkeypatch, tid, now)
+    try:
+        assert not (p.state / progress.LOG).exists()
+        evs = check(now + 2 * 3600 + 60)
+        assert len(evs) == 1 and evs[0]["fingerprint"] == f"obligation:{oid}:1", evs
+        text = evs[0]["text"]
+        assert f"#{tid} (queued) has no durable progress" in text and "job job1 (" in text and str(rc) in text, text
+        assert "`ttp progress report result --key <k>" in text and "ttp detach --results <glob>" in text, text
+        assert f"dispatch one light run of #{tid}" in text and f"ttp obligation progress {oid}" in text, text
+        # One in-window result report from that job clears it.
+        oid2 = ob.add(p, "the second table", [tid], now=now + 10 * 3600)
+        report(now + 11.5 * 3600, "unit 3 of 6 done")
+        assert [e["fingerprint"] for e in check(now + 12 * 3600 + 60)][-1] != f"obligation:{oid2}:1"
+    finally:
+        job.close()
+    oid3 = ob.add(p, "the third table", [tid], now=now + 20 * 3600)
+    evs = check(now + 22 * 3600 + 60)
+    assert evs[-1]["fingerprint"] == f"obligation:{oid3}:1" and "job1" not in evs[-1]["text"], \
+        "a job that is no longer running is not named"
+
+
+def test_obligation_job_with_a_results_glob_keeps_its_owner_on_time_from_new_files(env, monkeypatch, tmp_path):
+    import os
+    from ttp import detach
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    work = tmp_path / "work"
+    (work / "out").mkdir(parents=True)
+    oid = ob.add(p, "the results table", [tid], now=now)
+    rc, job, report = _ob_detached(p, monkeypatch, tid, now, results="out/*.json", cwd=str(work))
+
+    def put(name, at):
+        f = work / "out" / name
+        f.write_text("{}")
+        os.utime(f, (at, at))
+    try:
+        put("unit-1.json", now + 1.5 * 3600)
+        put("notes.txt", now + 2 * 3600)   # not matching: never counts
+        assert check(now + 2 * 3600 + 60) == [], "a new matching file in the window is a result"
+        assert ob.get(p.db, oid)["owners"][str(tid)]["job"]["text"] == "job job1: new result file out/unit-1.json"
+        evs = check(now + 3.6 * 3600)
+        assert len(evs) == 1 and evs[0]["fingerprint"] == f"obligation:{oid}:1", "only a file older than the window"
+        assert "declares results `out/*.json` but no new matching file in 2 h" in evs[0]["text"], evs[0]["text"]
+        put("unit-2.json", now + 3.7 * 3600)
+        check(now + 3.8 * 3600)
+        assert "OVERDUE" not in ob.lines(p.db, now + 3.8 * 3600)[0], "a later file puts it back on time"
+        # A relaunch after a reboot keeps the declaration; a file from before the job (re)started never counts.
+        detach._restamp(rc, os.getpid(), "boot-2")
+        entry = json.loads((rc.parent / "detached.json").read_text())[0]
+        assert entry["results"] == "out/*.json" and entry["cwd"] == str(work)
+        oid2 = ob.add(p, "the second table", [tid], now=now + 10 * 3600)
+        entry["started"] = now + 11 * 3600
+        (rc.parent / "detached.json").write_text(json.dumps([entry]))
+        put("unit-3.json", now + 10.5 * 3600)
+        assert [e["fingerprint"] for e in check(now + 12 * 3600 + 60)][-1] == f"obligation:{oid2}:1"
+    finally:
+        job.close()
+
+
+def test_detach_start_notice_reminds_an_obligation_owner_to_report_results(env, monkeypatch, tmp_path):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the results table", [tid], now=now)
+    other = p.db.add_task("other", "s", kind="work", tier="light", origin="coordinator")
+    for n, (task, flags) in enumerate(((tid, []), (tid, ["--results", "out/*.json"]), (other, []))):
+        run_dir = p.runs / str(70 + n)
+        run_dir.mkdir(parents=True)
+        r = _ttp_run(p, "detach", "job1", *flags, "--", "true",
+                     env={"TTP_HOME": str(env["home"]), "TTP_HOST": "testhost", "TTP_RUN_DIR": str(run_dir),
+                          "TTP_TASK": str(task), "TTP_RUN_ID": str(70 + n)})
+        assert r.returncode == 0, r.stderr
+        reminded = f"obligation {oid}: this job keeps it on time only while it reports results" in r.stdout
+        assert reminded == (n == 0), (n, r.stdout)
+        assert ("`ttp progress report result --key <k>" in r.stdout) == (n == 0), r.stdout
+        entry = json.loads((run_dir / "detached.json").read_text())[0]
+        assert (entry.get("results"), entry.get("cwd")) == (("out/*.json", str(p.root)) if n == 1 else (None, None))
+        assert ("results: each new file matching out/*.json" in r.stdout) == (n == 1), r.stdout
+    run_dir = p.runs / "80"
+    run_dir.mkdir(parents=True)
+    for bad in ("/abs/*.json", " "):
+        r = _ttp_run(p, "detach", "job1", "--results", bad, "--", "true",
+                     env={"TTP_HOME": str(env["home"]), "TTP_RUN_DIR": str(run_dir), "TTP_TASK": str(tid)})
+        assert r.returncode != 0 and "--results needs a glob relative" in r.stderr, r.stderr
+
+
 def test_obligation_attach_tells_a_running_owner_through_steer(env, monkeypatch):
     from ttp import obligations as ob
     p, d, now, tid, check = _ob_setup(env, monkeypatch)
