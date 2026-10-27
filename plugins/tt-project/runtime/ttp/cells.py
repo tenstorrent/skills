@@ -42,18 +42,30 @@ def requested(spec) -> list[str]:
     return split(",".join(LINE.findall(str(spec or ""))))
 
 
+def _valid(value) -> bool:
+    """A dict cell's value counts as finished unless it is falsy, an 'invalid...' string or `valid: false`."""
+    if isinstance(value, str):
+        return bool(value.strip()) and not value.strip().casefold().startswith("invalid")
+    if isinstance(value, dict):
+        return bool(value) and value.get("valid", True) is not False
+    return bool(value)
+
+
 def check(spec, result) -> dict | None:
     """None when `spec` requests no cells. Else {"requested": [...], "missing": [...]}, with "missing"
-    None when the hand-off has no `cells` list (a string is read as one `cells:` line)."""
+    None when the hand-off has no `cells` list or dict (a string is read as one `cells:` line)."""
     req = requested(spec)
     if not req:
         return None
     got = result.get(FIELD) if isinstance(result, dict) else None
     if isinstance(got, str):
         got = split(got)
-    if not isinstance(got, list):
+    if not isinstance(got, (list, dict)):
         return {"requested": req, "missing": None}
-    done = {norm(c) for c in got if isinstance(c, (str, int, float)) and not isinstance(c, bool)}
+    if isinstance(got, dict):
+        done = {norm(k) for k, v in got.items() if _valid(v)}
+    else:
+        done = {norm(c) for c in got if isinstance(c, (str, int, float)) and not isinstance(c, bool)}
     return {"requested": req, "missing": [c for c in req if norm(c) not in done]}
 
 
