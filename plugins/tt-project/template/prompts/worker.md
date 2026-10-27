@@ -160,12 +160,19 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
 <!-- /ttp:if prs -->
  "artifacts": ["paths or URLs"],
  "metrics": {"name": "value"},
+<!-- ttp:if cells -->
+ "cells": ["each cell of the spec's `cells:` line finished with a valid result"],
+<!-- /ttp:if cells -->
  "outcome": "if it applies: landed, kept, shelved or rejected",
  "tried": [{"title": "each lever tried", "outcome": "kept | shelved | rejected", "result": "number or bound reached"}],
  "followups": [{"title": "...", "spec": "self-contained next step"}]}
 ```
 
 - `done` only with evidence: tests run, numbers measured, files produced.
+<!-- ttp:if cells -->
+  A cell that ran without a valid result is not finished: the daemon marks a done that leaves
+  requested cells out `partial:` (or `cells unreported:` without `cells`).
+<!-- /ttp:if cells -->
 - `waiting` when a resource is busy (a reservation, a queue, a review). It returns after
   `retry_after_s`, not counted as an attempt. Save what you learned first. Always give a
   `retry_when`: the harness runs it model-free every few minutes in the project root. Keep it

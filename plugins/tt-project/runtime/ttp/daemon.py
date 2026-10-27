@@ -42,6 +42,7 @@ from . import schedlog
 from . import replymsg
 from . import msgparts
 from . import awake
+from . import cells
 from . import budget as bud
 from . import budgetkind
 from . import pregrant
@@ -3663,6 +3664,20 @@ class Daemon:
                                                                                      "stalled", "no_handoff",
                                                                                      "refused_wait"):
             new = "queued"
+        # A done hand-off on a spec's `cells:` line that left requested cells unfinished or unreported
+        # is never passed on as complete: its summary says so, and missing cells get a `continue:`
+        # follow-up (the usual hop path queues it or leaves it to the coordinator). Status stays done.
+        # A review's verdict covers no cells, even when its spec quotes the reviewed task's line.
+        cell_chk = cells.check(task.get("spec"), result) \
+            if new == "done" and task["kind"] != "review" and isinstance(result, dict) else None
+        cell_mark = cells.prefix(cell_chk)
+        if cell_mark and not cells.marked(summary):
+            summary = f"{cell_mark}{summary}"
+            fups0 = result.get("followups") if isinstance(result.get("followups"), list) else []
+            add = [cells.followup(task, cell_chk["missing"])] \
+                if cell_chk["missing"] and not cells.has_followup(fups0) else []
+            result = {**result, "summary": summary, "followups": [*fups0, *add]}
+            log(self.p, f"task {task['id']}: {cell_mark.strip()}")
         extra: dict = {}
         reason = None
         not_before = None
@@ -3987,7 +4002,7 @@ class Daemon:
         # A finished code task's next step is its review, queued here in the same step whatever else the
         # hand-off holds: its follow-ups go into the review's spec and stay the coordinator's to queue.
         # A hand-off with nothing else to decide (no follow-ups or notes, normal severity) starts no turn.
-        plain = not fups and not notes and sev == "normal" and not hcheck_text
+        plain = not fups and not notes and sev == "normal" and not hcheck_text and not cell_mark
         # A done hop whose only proposal is the next `continue:` hop, with progress and under the
         # chain caps, gets it from the daemon (chaincap). A code task that left its change unfinished
         # (a split: a `continue:` hop for its branch, or a head its hand-off marks WIP) gets no review:

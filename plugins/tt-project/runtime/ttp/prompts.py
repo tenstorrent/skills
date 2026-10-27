@@ -466,8 +466,9 @@ def _named(alias: str, text: str) -> bool:
 def worker_features(p: Project, task: dict | None = None) -> set[str]:
     """The features whose fenced rules worker.md carries for `task` (feature_blocks): its kind's
     (`harness`, `prs`, `wait`), and the project's or task's devices, device runners (`devq`), jobs on
-    other machines (`remote`) and shared clusters (`clusters`), and `corrections` while the user has
-    corrected a fact (worker_corrections). No task: a `work` task's."""
+    other machines (`remote`) and shared clusters (`clusters`), `cells` for a spec with a `cells:` line
+    (cells.requested), and `corrections` while the user has corrected a fact (worker_corrections). No
+    task: a `work` task's."""
     from . import machines
     cfg = p.config()
     kind = (task or {}).get("kind") or "work"
@@ -520,6 +521,9 @@ def worker_features(p: Project, task: dict | None = None) -> set[str]:
         on.add("hostmap")
     if worker_corrections(p):   # the rule that reads them comes with the list
         on.add("corrections")
+    from .cells import requested
+    if requested((task or {}).get("spec")):   # the hand-off's `cells` field, only for a spec that asks for it
+        on.add("cells")
     return on | unsure
 
 
