@@ -32,6 +32,7 @@ import traceback
 import uuid
 from pathlib import Path
 
+from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import ackwait
 from . import alerts
 from . import anchors
@@ -665,6 +666,8 @@ class Daemon:
         self._pre_grant_spent = (0.0, 0.0)   # (tick it was spent in, seconds of pre-grant checks in it)
         self._lock_fd: int | None = None
         self._started = time.time()
+        self._loaded_at = runtimeload.LOADED_AT   # runtime files written later are not what this daemon runs
+        self._reload_waits: set[int] = set()   # runs logged as waiting for a restart on their runtime changes
         # what code this process loaded, captured once before the first tick (never re-read)
         self.identity = identity.capture(boot=self.boot, started=self._started)
         self._healthy = False
@@ -2092,6 +2095,8 @@ class Daemon:
             if root:
                 note = {**(note or {}), "root": root}
                 self._root_home(root.get("branch") or "")
+            if Path(cwd).resolve() == self.p.harness.resolve() and (hh := runtimeload.head(self.p.harness)):
+                note = {**(note or {}), "harness_head": hh}   # its end compares (runtimeload.check)
         db = self.p.db
         # Where the worker pid it records means something: a reader elsewhere does not judge it (locks).
         note = {**(note or {}), "pid_where": {"node": os.uname().nodename, "pidns": locks._pid_ns()}}
@@ -2893,6 +2898,20 @@ class Daemon:
 
     def finish_run(self, r: dict, exit_info: dict) -> None:
         db, p = self.p.db, self.p
+        held = ""
+        if r["role"] != "coordinator" and r["task"]:
+            # A run that changed the daemon's own runtime in the harness checkout is judged after the
+            # restart it asks for, under its new code; held if that code did not load (runtimeload).
+            try:
+                act, held = runtimeload.check(p, r, self._loaded_at)
+            except Exception:   # git failing here never costs the run its end: judged as before
+                log(p, f"run {r['id']}: runtime reload check failed\n" + traceback.format_exc())
+                act, held = "go", ""
+            if act == "defer":
+                if r["id"] not in self._reload_waits:
+                    self._reload_waits.add(r["id"])
+                    log(p, f"run {r['id']} of task {r['task']}: {held}")
+                return
         run_dir = self._run_dir(r)
         runner.remove_private(run_dir)   # the runner removes them too, unless it died first
         prov = get_provider(r["provider"]).use(r["model"] or "", (self.cfg.get("pricing") or {}).get(r["provider"]))
@@ -3033,6 +3052,7 @@ class Daemon:
                      tokens_out=usage.output_tokens, ts=ended)
             if r["task"]:
                 db.x("UPDATE tasks SET spent_usd=COALESCE(spent_usd,0)+? WHERE id=?", (usage.cost_usd, r["task"]))
+                runtimeload.clear(p, r["id"])   # finished once: a restart after this never finishes it again
             self._record_readings(db, r["provider"], r["account"] or "", usage, ended)
             if usage.limited:
                 until = time.time() + 3600
@@ -3070,7 +3090,8 @@ class Daemon:
                 self._finish_worker(r, usage, status, run_dir, cut_off if status == "ok" else None,
                                     refused=refused, rebooted=bool(note.get("lost_to_reboot")),
                                     orderly=note.get("shutdown") == "orderly",
-                                    slept=bool(note.get("lost_to_sleep") or note.get("lost_to_network")))
+                                    slept=bool(note.get("lost_to_sleep") or note.get("lost_to_network")),
+                                    held=held)
         self._check_price_table(r, usage)
         asleep = float(exit_info.get("slept_s") or 0)
         if asleep >= SLEPT_LONG_S:
@@ -3491,8 +3512,10 @@ class Daemon:
 
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,
                        rebooted: bool = False, slept: bool = False, handoff: dict | None = None,
-                       orderly: bool = False, refused: str = "", push_verified: bool = False) -> None:
+                       orderly: bool = False, refused: str = "", push_verified: bool = False,
+                       held: str = "") -> None:
         """`handoff` stands in for the run's result.json: the `on_pass` its checks earned (_probe_passed).
+        `held`: why the run's runtime changes did not load (runtimeload.check): its hand-off is not judged.
         `push_verified`: the pushes the hand-off claims were found on the remote (verify_pushes).
         `orderly`: the reboot that cut the run short was an orderly one, which never blocks the task.
         `refused`: why the runner refused to start the agent (runner.check_pin)."""
@@ -3504,6 +3527,19 @@ class Daemon:
         relay_worker_notifies(self.p, task, run_dir)
         _, past_cap = relay_worker_escalations(self.p, task, r.get("id"), run_dir)
         self._file_queued_notes(r.get("id"), task["id"], run_dir)
+        if held:
+            # Judged by the code it replaced, the hand-off could fail for the bug the run fixed: the
+            # coordinator decides, no attempt spent. The hand-off stays in the run dir and the result.
+            why = (f"held: {held}. The run's hand-off was not judged under the previous runtime; it stays in "
+                   f"{run_dir / RESULT_FILE}. Make the runtime start with the change, then requeue the task")
+            with db.tx():
+                db.update_task(task["id"], status="blocked", blocked_reason=why[:500],
+                               result=dump_result({"status": "blocked", "summary": why,
+                                                   "handoff": _read_result(run_dir / RESULT_FILE)}))
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                     (time.time(), f"task:{task['id']}", "task_blocked", "normal",
+                      f"#{task['id']} {task['title']} → blocked: {why}", "queued", task["id"]))
+            return
         if handoff is None and not (run_dir / RESULT_FILE).exists():
             self._adopt_misplaced_handoff(r, task, run_dir)
         handoff = handoff if handoff is not None else _read_result(run_dir / RESULT_FILE)
