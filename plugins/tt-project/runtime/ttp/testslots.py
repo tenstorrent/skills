@@ -33,6 +33,15 @@ that branch's one reserved slot beyond the pool (RESERVED), which task checks ne
 A project's full checks (`ttp checks`) also hold its suite lock (suite_hold()): a second full run of
 the same project waits for the first, other projects never do. It is a file lock, so an exit, a crash
 or a reboot frees it.
+
+Builds (make, ninja, cmake --build) take slots of a second pool, the build pool (BUILDS: same sizes,
+same locks and order, its own lock files and settings checks.build_pool, checks.build_run_max and
+checks.build_project_max, or TTP_BUILD_POOL / TTP_BUILD_RUN_MAX / TTP_BUILD_PROJECT_MAX). It is the
+half of the cores the test pool leaves, so a long build never takes a test slot and a full suite never
+holds up a build, and both together stay within the host's cores. A worker's environment carries one
+run's build share as MAKEFLAGS=-j<k> and CMAKE_BUILD_PARALLEL_LEVEL=<k> (ninja reads no such variable);
+`ttp clip` of a build takes k build slots, sets them for the command, lowers an explicit -j above k (and
+gives a bare ninja -j k) through clamp_build(). A build inside a check uses the check's test grant.
 """
 from __future__ import annotations
 
@@ -70,6 +79,24 @@ def _number(v) -> int | None:
     return n if n >= 0 else None
 
 
+class Kind:
+    """One slot pool: its lock-file names, settings and the words its lines use."""
+
+    def __init__(self, name: str, resource: str, own: str, held_env: str, unit: str):
+        self.name, self.resource, self.own, self.held_env, self.unit = name, resource, own, held_env, unit
+        self.env_prefix = f"TTP_{name.upper()}_"
+
+    def setting(self, what: str) -> tuple[str, str]:
+        """(environment variable, settings key) of `what` (pool, run_max, project_max)."""
+        return self.env_prefix + what.upper(), f"{self.name}_{what}"
+
+
+BUILD_HELD_ENV = "TTP_BUILD_SLOTS_HELD"   # set for a build that holds build slots: the grant
+TESTS = Kind("test", RESOURCE, OWN, HELD_ENV, "test worker")
+BUILDS = Kind("build", "build-slots", "build-slots-project", BUILD_HELD_ENV, "build job")
+CLIP_WAIT_S = 60.0   # `ttp clip` of a build waits this long for a build slot, then runs with one job
+
+
 def _setting(env: str, key: str) -> int | None:
     for v in (os.environ.get(env), (project.load_account_settings().get("checks") or {}).get(key)):
         if v not in (None, "") and (n := _number(v)) is not None:
@@ -77,36 +104,38 @@ def _setting(env: str, key: str) -> int | None:
     return None
 
 
-def sizes(cfg: dict | None = None, cores: int | None = None) -> tuple[int, int] | None:
+def sizes(cfg: dict | None = None, cores: int | None = None, kind: Kind = TESTS) -> tuple[int, int] | None:
     """(pool, run_max) on this host, or None when the pool is off (checks.test_pool 0). `cfg` is a
-    project's config: its checks.test_pool and checks.test_run_max only lower the host's."""
+    project's config: its checks.test_pool and checks.test_run_max only lower the host's. `kind`
+    BUILDS: the build pool's, from its own build_* settings."""
     c = checkcap.cores() if cores is None else cores
-    pool = _setting("TTP_TEST_POOL", "test_pool")
+    pool = _setting(*kind.setting("pool"))
     if pool == 0:
         return None
     pool = max(2, c // 2) if pool is None else pool
-    top = _setting("TTP_TEST_RUN_MAX", "test_run_max")
+    top = _setting(*kind.setting("run_max"))
     top = min(RUN_MAX, max(1, pool // 2)) if not top else top
     own = (cfg or {}).get("checks") or {}
-    if (n := _number(own.get("test_pool"))):
+    if (n := _number(own.get(kind.setting("pool")[1]))):
         pool = min(pool, n)
-    if (n := _number(own.get("test_run_max"))):
+    if (n := _number(own.get(kind.setting("run_max")[1]))):
         top = min(top, n)
     return pool, max(1, min(top, pool))
 
 
-def project_max(cfg: dict | None = None, s: tuple[int, int] | None = None) -> int:
+def project_max(cfg: dict | None = None, s: tuple[int, int] | None = None, kind: Kind = TESTS) -> int:
     """The most slots one project holds at once over all its runs (above); `s` is sizes(cfg)."""
-    s = s or sizes(cfg) or (0, 0)
-    top = _setting("TTP_TEST_PROJECT_MAX", "test_project_max") or min(s[0], 2 * s[1])
-    if (n := _number(((cfg or {}).get("checks") or {}).get("test_project_max"))):
+    s = s or sizes(cfg, kind=kind) or (0, 0)
+    top = _setting(*kind.setting("project_max")) or min(s[0], 2 * s[1])
+    if (n := _number(((cfg or {}).get("checks") or {}).get(kind.setting("project_max")[1]))):
         top = min(top, n)
     return max(s[1], min(top, s[0])) if s[0] else 0
 
 
-def own_paths(project_name: str | None, n: int) -> list:
+def own_paths(project_name: str | None, n: int, kind: Kind = TESTS) -> list:
     """One project's budget slots; none for no project (its runs only count against the pool)."""
-    return locks.slot_paths(checkcap.slot_dir(), f"{OWN}.{locks.group_id(project_name)}", n) if project_name else []
+    return (locks.slot_paths(checkcap.slot_dir(), f"{kind.own}.{locks.group_id(project_name)}", n)
+            if project_name else [])
 
 
 def reserved_path(push_key: str):
@@ -131,24 +160,43 @@ def _cfg() -> dict | None:
         return None
 
 
+def makeflags(k: int, current: str | None = None) -> str:
+    """MAKEFLAGS (default this process's) with its job count at most `k`: a lower -jN stays, a higher one,
+    a bare -j or none becomes -j<k>; its other flags stay."""
+    words = (os.environ.get("MAKEFLAGS", "") if current is None else current).split()
+    jobs = [m for w in words if (m := re.fullmatch(r"(?:-j|--jobs=?)(\d*)", w))]
+    have = [int(m.group(1)) for m in jobs if m.group(1) and int(m.group(1)) > 0]
+    rest = [w for w in words if not re.fullmatch(r"(?:-j|--jobs=?)(\d*)", w)]
+    return " ".join([f"-j{min([k, *have])}", *rest])
+
+
+def build_env(k: int) -> dict[str, str]:
+    """The variables that cap a build at `k` jobs: make (MAKEFLAGS) and cmake --build (CMAKE_BUILD_PARALLEL_LEVEL)."""
+    return {"MAKEFLAGS": makeflags(k), "CMAKE_BUILD_PARALLEL_LEVEL": str(k)} if k else {}
+
+
 def worker_env(cfg: dict | None) -> dict[str, str]:
-    """A worker's environment: tests it runs directly in its shell start at most one run's share."""
-    s = sizes(cfg)
-    return {XDIST_ENV: str(s[1]), SLOTS_ENV: str(s[1])} if s else {}
+    """A worker's environment: tests and builds it runs directly in its shell start at most one run's share."""
+    s, b = sizes(cfg), sizes(cfg, kind=BUILDS)
+    return {**({XDIST_ENV: str(s[1]), SLOTS_ENV: str(s[1])} if s else {}), **(build_env(b[1]) if b else {})}
 
 
-def paths(pool: int):
-    return locks.slot_paths(checkcap.slot_dir(), RESOURCE, pool)
+def paths(pool: int, kind: Kind = TESTS):
+    return locks.slot_paths(checkcap.slot_dir(), kind.resource, pool)
 
 
 class Grant:
     """k held slots (none with the pool off: `k` 0); `close()` frees them."""
 
-    def __init__(self, k: int = 0, files=(), waited: float = 0.0):
-        self.k, self.files, self.waited = k, list(files), waited
+    def __init__(self, k: int = 0, files=(), waited: float = 0.0, kind: Kind = TESTS):
+        self.k, self.files, self.waited, self.kind = k, list(files), waited, kind
 
     def env(self) -> dict[str, str]:
-        return {XDIST_ENV: str(self.k), SLOTS_ENV: str(self.k), HELD_ENV: str(self.k)} if self.k else {}
+        if not self.k:
+            return {}
+        if self.kind is BUILDS:
+            return {**build_env(self.k), BUILD_HELD_ENV: str(self.k)}
+        return {XDIST_ENV: str(self.k), SLOTS_ENV: str(self.k), HELD_ENV: str(self.k)}
 
     def close(self) -> None:
         for f in self.files:
@@ -162,14 +210,14 @@ class Grant:
         self.close()
 
 
-def _take(ps: list, own: list, top: int, holder: str) -> tuple[int, list]:
+def _take(ps: list, own: list, top: int, holder: str, what: str = "test slots") -> tuple[int, list]:
     """(k, files): up to `top` pool slots, each paired with one of the project's (`own`, when it has a budget)."""
     k, files = 0, []
     while k < top:
         o = None
-        if own and (o := locks.try_take(own, holder, "test slots")) is None:
+        if own and (o := locks.try_take(own, holder, what)) is None:
             break
-        if (f := locks.try_take(ps, holder, "test slots")) is None:
+        if (f := locks.try_take(ps, holder, what)) is None:
             if o is not None:
                 o.close()
             break
@@ -178,59 +226,63 @@ def _take(ps: list, own: list, top: int, holder: str) -> tuple[int, list]:
 
 
 def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: float | None = None,
-            cfg: dict | None = None, project_name: str | None = None, push_key: str = "") -> Grant | None:
+            cfg: dict | None = None, project_name: str | None = None, push_key: str = "",
+            kind: Kind = TESTS) -> Grant | None:
     """Take this run's test slots (above); waits while none is free, first-come, telling why every
     TELL_S. None only once `wait_s` passed with none free (a foreground caller hands over). Nested in a
     run that holds slots, its grant at once; with the pool off, Grant() (no limit, nothing set).
     `project_name` (default TTP_PROJECT's) is whose budget it counts against; `push_key` (push.priority_key)
-    marks push checks, which take the branch's reserved slot when the pool has none free."""
+    marks push checks, which take the branch's reserved slot when the pool has none free. `kind` BUILDS
+    takes build slots instead; a build nested in a check uses the check's test grant."""
     tell = tell or (lambda _line: None)
-    if (held := _number(os.environ.get(HELD_ENV))):
-        return Grant(held)
+    what = f"{kind.name} slots"
+    for env in (kind.held_env, HELD_ENV):   # HELD_ENV: a build in a check builds on the check's slots
+        if (held := _number(os.environ.get(env))):
+            return Grant(held, kind=kind)
     cfg = _cfg() if cfg is None else cfg
     name = _project_name() if project_name is None else project_name
     start, told, ticket = time.time(), 0.0, None
     try:
         while True:
-            s = sizes(cfg)
+            s = sizes(cfg, kind=kind)
             if s is None:
-                return Grant()
+                return Grant(kind=kind)
             pool, top = s
-            ps, own = paths(pool), own_paths(name, project_max(cfg, s))
+            ps, own = paths(pool, kind), own_paths(name, project_max(cfg, s, kind), kind)
             k, files, why = 0, [], f"all {pool} are held"
             try:
                 if own and not push_key and not locks.any_free(own):
                     # At its project's budget: out of the line (keeping its arrival) so others go first.
                     locks.dequeue(ticket)
-                    ticket, why = None, f"its project holds its {len(own)} (checks.test_project_max)"
+                    ticket, why = None, f"its project holds its {len(own)} (checks.{kind.setting('project_max')[1]})"
                 elif push_key:
-                    k, files = _take(ps, own, top, holder)
+                    k, files = _take(ps, own, top, holder, what)
                     if not k and (f := locks.try_take([reserved_path(push_key)], holder, "push test slot")):
                         k, files = 1, [f]
                 else:
                     if ticket is None:
-                        ticket = locks.enqueue(checkcap.slot_dir(), RESOURCE, holder, start, group=name)
-                    q = locks.queued(checkcap.slot_dir(), RESOURCE)
+                        ticket = locks.enqueue(checkcap.slot_dir(), kind.resource, holder, start, group=name)
+                    q = locks.queued(checkcap.slot_dir(), kind.resource)
                     if q and q[0] == ticket:
-                        k, files = _take(ps, own, top, holder)
+                        k, files = _take(ps, own, top, holder, what)
                     elif q:
                         why = f"{q.index(ticket) if ticket in q else len(q)} ahead in the host's line"
             except OSError as e:
                 for f in files:
                     f.close()
-                tell(f"test slots unavailable ({e.strerror or e}): running with 1 test worker")
-                return Grant(1, waited=time.time() - start)
+                tell(f"{what} unavailable ({e.strerror or e}): running with 1 {kind.unit}")
+                return Grant(1, waited=time.time() - start, kind=kind)
             waited = time.time() - start
             if k:
-                tell(f"test slots: {k} granted of a host pool of {pool} (at most {top} per run"
+                tell(f"{what}: {k} granted of a host pool of {pool} (at most {top} per run"
                      + (f", {len(own)} per project" if own else "") + f") after {waited:.0f} s waiting; "
-                     f"tests run with {XDIST_ENV}={k}")
-                return Grant(k, files, waited)
+                     + (f"builds run with MAKEFLAGS=-j{k}" if kind is BUILDS else f"tests run with {XDIST_ENV}={k}"))
+                return Grant(k, files, waited, kind)
             if wait_s is not None and waited >= wait_s:
                 return None
             if not told or time.time() - told >= TELL_S:
                 told = time.time()
-                tell(f"waiting for a host-wide test slot: {why} ({checkcap._some(locks.held_labels(ps))})")
+                tell(f"waiting for a host-wide {kind.name} slot: {why} ({checkcap._some(locks.held_labels(ps))})")
             time.sleep(poll_s(POLL_S))
     finally:
         locks.dequeue(ticket)
@@ -272,54 +324,172 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
             waiting(False)
 
 
-def use() -> str:
+def use(kind: Kind = TESTS) -> str:
     """One status line on the host pool's use, or "" when it is off or idle."""
-    s = sizes()
+    s = sizes(kind=kind)
     if s is None:
         return ""
     try:
-        held = len(locks.held_labels(paths(s[0])))
+        held = len(locks.held_labels(paths(s[0], kind)))
     except OSError:
         return ""
-    return f"host test slots: {held} of {s[0]} in use (at most {s[1]} per run)" if held else ""
+    return f"host {kind.name} slots: {held} of {s[0]} in use (at most {s[1]} per run)" if held else ""
 
 
-_SEP = re.compile(r"(&&|\|\||[;|\n])")
-_PYTEST = re.compile(r"(?<![\w./-])(?:pytest|py\.test)(?![\w-])")
-_NPROC = re.compile(r"(?<![\w-])(-n|--numprocesses)(\s*=?\s*)(\d+)(?![\w.])")
+def use_lines() -> list[str]:
+    """use() of the test and the build pool, each only while in use (ttp status, the web feed)."""
+    return [line for kind in (TESTS, BUILDS) if (line := use(kind))]
+
+
+_OPS = ("&&", "||", ";;", "|&", ";", "|", "&", "\n", "(", ")")
+_STOP = " \t\n;|&()"
+_PYTESTS = ("pytest", "py.test")
+_BUILDS = ("make", "gmake", "ninja")
+_WRAPPERS = ("nice", "ionice", "time", "env", "nohup", "stdbuf", "timeout", "chrt", "taskset", "ttp", "sandbox", "clip")
+
+
+def _segments(cmd: str) -> list[list[tuple[int, int, str]]]:
+    """The simple commands of shell line `cmd`, each a list of its words as (start, end, unquoted
+    text), split at the operators outside quotes, so a '|' or ';' in a quoted -k expression stays
+    inside its word. Redirections such as 2>&1 stay words; a comment ends at the line's end."""
+    segs, cur, i, n = [], [], 0, len(cmd)
+    while i < n:
+        if cmd[i] in " \t":
+            i += 1
+            continue
+        if cmd[i] == "#":
+            i = cmd.find("\n", i) if "\n" in cmd[i:] else n
+            continue
+        if not cmd.startswith("&>", i) and (op := next((o for o in _OPS if cmd.startswith(o, i)), None)):
+            segs.append(cur)
+            cur, i = [], i + len(op)
+            continue
+        start, word = i, []
+        while i < n and (cmd[i] not in _STOP or (i == start and cmd.startswith("&>", i))):
+            c = cmd[i]
+            if cmd.startswith((">&", "<&", "&>"), i):
+                word.append(cmd[i:i + 2])
+                i += 2
+            elif c == "\\":
+                word.append(cmd[i + 1:i + 2])
+                i += 2
+            elif c == "'":
+                j = cmd.find("'", i + 1)
+                j = n if j < 0 else j
+                word.append(cmd[i + 1:j])
+                i = j + 1
+            elif c == '"':
+                i += 1
+                while i < n and cmd[i] != '"':
+                    if cmd[i] == "\\" and i + 1 < n and cmd[i + 1] in '"\\$`\n':
+                        i += 1
+                    word.append(cmd[i])
+                    i += 1
+                i += 1
+            else:
+                word.append(c)
+                i += 1
+        cur.append((start, min(i, n), "".join(word)))
+    segs.append(cur)
+    return [s for s in segs if s]
+
+
+def _base(word: str) -> str:
+    return word.rsplit("/", 1)[-1]
+
+
+def _is_tool(words: list[str], i: int, build: bool) -> bool:
+    w = _base(words[i])
+    if not build:
+        return w in _PYTESTS
+    return w in _BUILDS or (w == "cmake" and "--build" in words[i + 1:])
+
+
+def _runs(words: list[str], i: int) -> bool:
+    """Whether word `i` is the command its line runs: only assignments, options, numbers and wrappers
+    (nice, env, timeout, ttp sandbox ...) before it, so `pip install ninja` runs no build."""
+    return all(re.match(r"[A-Za-z_]\w*=|-|\d", w) or _base(w) in _WRAPPERS for w in words[:i])
+
+
+def _edits(cmd: str, k: int, build: bool) -> list[tuple[int, int, str, int]]:
+    """(start, end, new text, old count) for each worker count in `cmd` above `k`: pytest's -n N /
+    --numprocesses N after a pytest word (`build` False), or a build's -j N / --jobs N / --parallel N
+    after a make, gmake, ninja or `cmake --build` word (`build` True; there a 0, unlimited, or a bare
+    make or cmake -j also becomes k, and a ninja run as the command with no -j gets -j k). Words are
+    matched unquoted and only whole flag or count words change, so `head -n 50`, `nice -n 19 pytest`
+    and a quoted -k expression keep theirs."""
+    out = []
+    if k <= 0:
+        return out
+    short, longs = ("-j", ("--jobs", "--parallel")) if build else ("-n", ("--numprocesses",))
+    for seg in _segments(cmd):
+        words = [w for _, _, w in seg]
+        tool = next((i for i, w in enumerate(words) if _is_tool(words, i, build)), None)
+        if tool is None:
+            continue
+        name = _base(words[tool])
+        seen = False
+        for i in range(tool + 1, len(seg)):
+            start, end, w = seg[i]   # a quoted flag or count counts too; its word becomes plain text
+            m = re.fullmatch(rf"({re.escape(short)}|{'|'.join(map(re.escape, longs))})(=?)(\d*)", w)
+            if not m or (m.group(1) != short and m.group(1) not in longs):
+                continue
+            seen = True
+            flag, eq, num = m.groups()
+            if not num and not eq and i + 1 < len(seg) and seg[i + 1][2].isdigit():
+                start, end, w = seg[i + 1]
+                num, prefix = w, ""
+            else:
+                prefix = flag + eq
+            if num:
+                n = int(num)
+                if n > k or (build and n == 0):
+                    out.append((start, end, f"{prefix}{k}", n))
+            elif build and not eq and name != "ninja":
+                out.append((start, end, f"{flag} {k}", 0))   # a bare make or cmake -j: unlimited
+        if build and not seen and name == "ninja" and _runs(words, tool):
+            out.append((seg[tool][1], seg[tool][1], f" -j{k}", 0))   # ninja's default is every core and then some
+    return out
+
+
+def _apply(cmd: str, edits) -> str:
+    for start, end, text, _ in sorted(edits, reverse=True):
+        cmd = cmd[:start] + text + cmd[end:]
+    return cmd
 
 
 def over(cmd: str, k: int) -> list[int]:
     """The explicit pytest `-n N` / `--numprocesses N` values in `cmd` above `k` (as clamp() finds them)."""
-    if k <= 0:
-        return []
-    return [int(x.group(3)) for part in _SEP.split(cmd) if (m := _PYTEST.search(part))
-            for x in _NPROC.finditer(part[m.end():]) if int(x.group(3)) > k]
+    return [n for *_, n in _edits(cmd, k, False)]
 
 
 def clamp(cmd: str, k: int) -> str:
     """`cmd` with each explicit pytest `-n N` / `--numprocesses N` above `k` lowered to `k`; only after
-    a pytest word in the same command, so `head -n 50` or `nice -n 19 pytest` keep theirs."""
-    if k <= 0:
-        return cmd
-    out = []
-    for part in _SEP.split(cmd):
-        m = _PYTEST.search(part)
-        if m:
-            tail = _NPROC.sub(lambda x: x.group(0) if int(x.group(3)) <= k else f"{x.group(1)}{x.group(2)}{k}",
-                              part[m.end():])
-            part = part[:m.end()] + tail
-        out.append(part)
-    return "".join(out)
+    a pytest word (by its basename: `.venv/bin/pytest`, `python3 -m pytest`) in the same command, so
+    `head -n 50` or `nice -n 19 pytest` keep theirs. The rest of the text stays as it is."""
+    return _apply(cmd, _edits(cmd, k, False))
+
+
+def builds(cmd: str) -> bool:
+    """Whether `cmd` runs a build tool: make, gmake, ninja or `cmake --build`."""
+    return any(_is_tool(words, i, True) and _runs(words, i) for seg in _segments(cmd)
+               for words in [[w for *_, w in seg]] for i in range(len(words)))
+
+
+def clamp_build(cmd: str, k: int) -> str:
+    """`cmd` with each build's job count above `k` lowered to `k` (_edits, `build`)."""
+    return _apply(cmd, _edits(cmd, k, True))
 
 
 def clamped(cmd: str, k: int) -> str:
-    """clamp(), with a first line that says on stderr which `-n` it lowered (nothing when none)."""
-    if not (big := over(cmd, k)):
+    """clamp() and clamp_build(), with a first line that says on stderr what it lowered (nothing when none)."""
+    big, jobs = over(cmd, k), _edits(cmd, k, True)
+    if not big and not jobs:
         return cmd
-    note = (f"ttp: pytest -n {', '.join(map(str, sorted(set(big))))} lowered to -n {k}, this run's "
-            f"test-worker budget on the host ({SLOTS_ENV}={k})")
-    return f"echo {shlex.quote(note)} >&2\n{clamp(cmd, k)}"
+    said = ([f"pytest -n {', '.join(map(str, sorted(set(big))))} lowered to -n {k}"] if big else []) \
+        + ([f"build jobs capped at -j {k}"] if jobs else [])
+    note = f"ttp: {'; '.join(said)}, this run's test-worker budget on the host ({SLOTS_ENV}={k})"
+    return f"echo {shlex.quote(note)} >&2\n{clamp_build(clamp(cmd, k), k)}"
 
 
 def clamp_for(cmd: str, env: dict | None) -> str:

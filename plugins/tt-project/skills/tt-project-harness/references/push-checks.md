@@ -39,6 +39,7 @@ Task checks keep their cap and order, except that priority-1 task checks (live-i
 `ttp push --own` queues like them.
 Test workers: every check run then takes up to `checks.test_run_max` slots (default min(8, half the pool)) of a host pool of `checks.test_pool` (default half the cores, at least 2; 0 turns it off), shared by all projects, so concurrent suites never start a worker per core each; a project may only lower both.
 The grant is set as `PYTEST_XDIST_AUTO_NUM_WORKERS` and `TTP_TEST_SLOTS`, a pytest `-n N` above it is lowered to it (with a line saying so), and checks run under `nice -n 10` and best-effort lowest `ionice` where present.
+Builds (make, ninja, `cmake --build`) use a separate host build pool of the same default size (`checks.build_pool`, `checks.build_run_max`), so a long build never starves test checks: workers get MAKEFLAGS=-j<k> and CMAKE_BUILD_PARALLEL_LEVEL=<k>, and `ttp clip` of a build holds k build slots and lowers an explicit -j above k; a build inside a check uses the check's test grant.
 One project holds at most `checks.test_project_max` test slots over all its runs (default twice a run's share), waiters get slots first-come, push checks take their branch's reserved test slot when the pool is full, and one full `ttp checks` runs per project at a time.
 The batch log and `ttp status` show `push priority slot: <holder>`; slots are OS file locks, so a killed holder frees its slot.
 

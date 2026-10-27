@@ -824,7 +824,12 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   project holds at most `checks.test_project_max` slots over all its runs (default twice a run's share), waiters
   are served first-come, push checks take a reserved test slot of their branch when the pool is full, and a
   project runs one full `ttp checks` at a time (a second waits; other projects never do). A pytest `-n N` above
-  the grant is lowered with a line saying so; a worker's own pytest above TTP_TEST_SLOTS is refused. Each daemon
+  the grant is lowered with a line saying so; a worker's own pytest above TTP_TEST_SLOTS is refused. Builds
+  (make, ninja, `cmake --build`) take slots of a second host pool of the same size, the build pool (`checks.build_pool`,
+  `checks.build_run_max`, `checks.build_project_max`; 0 pool turns it off), so a long build never takes a test slot: workers
+  get one run's share as MAKEFLAGS=-j<k> and CMAKE_BUILD_PARALLEL_LEVEL=<k>, and `ttp clip` of a build holds k build
+  slots and lowers an explicit -j above k (a bare ninja gets -j k). `ttp status` and the web app's feed show both
+  pools' use. Each daemon
   watches the host's fork rate (/proc/stat): above `checks.churn_forks_s` (800/s) for `checks.churn_window_s`
   (120 s), the owning project's daemon raises one `process-churn:<unit>` observation. It never stops a process. A
   `ttp checks` or push inside a check command does not wait for its parent's slot. Checks that

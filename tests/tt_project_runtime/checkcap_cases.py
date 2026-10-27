@@ -778,7 +778,7 @@ def test_test_slots_default_sizes_follow_the_cores_and_host_settings_override_th
     assert testslots.sizes() == (6, 3), "the environment wins over the account setting"
     cli.main(["config", "--account", "checks.test_pool", "0"])
     monkeypatch.delenv("TTP_TEST_POOL")
-    assert testslots.sizes() is None and testslots.worker_env({}) == {}, "test_pool 0 turns the pool off"
+    assert testslots.sizes() is None and testslots.SLOTS_ENV not in testslots.worker_env({}), "test_pool 0 turns the pool off"
 
 
 def test_test_slots_project_config_can_only_lower_the_host_limits(env, monkeypatch):
@@ -788,8 +788,10 @@ def test_test_slots_project_config_can_only_lower_the_host_limits(env, monkeypat
     assert testslots.sizes({"checks": {"test_pool": 4}}) == (4, 4)
     assert testslots.sizes({"checks": {"test_pool": 6, "test_run_max": 2}}) == (6, 2)
     assert testslots.sizes({"checks": {"test_pool": 0}}) == (16, 8), "a project cannot turn the host's pool off"
-    assert testslots.worker_env({"checks": {"test_run_max": 3}}) == {
+    got = testslots.worker_env({"checks": {"test_run_max": 3}})
+    assert {k: got[k] for k in ("PYTEST_XDIST_AUTO_NUM_WORKERS", "TTP_TEST_SLOTS")} == {
         "PYTEST_XDIST_AUTO_NUM_WORKERS": "3", "TTP_TEST_SLOTS": "3"}
+    assert got["CMAKE_BUILD_PARALLEL_LEVEL"] == "8", "the build pool keeps its own limits"
 
 
 def test_test_slots_clamp_only_lowers_pytest_worker_counts_above_the_grant(env):
@@ -803,6 +805,14 @@ def test_test_slots_clamp_only_lowers_pytest_worker_counts_above_the_grant(env):
     assert c("pytest -n auto x", 4) == "pytest -n auto x", "auto reads the environment"
     assert c("nice -n 19 pytest -n 16 | head -n 50", 4) == "nice -n 19 pytest -n 4 | head -n 50"
     assert c("make -j 64 && sort -n 64 f", 4) == "make -j 64 && sort -n 64 f", "no pytest: untouched"
+    # By the executable's basename, and split only at operators outside quotes.
+    assert c(".venv/bin/pytest -n 64", 4) == ".venv/bin/pytest -n 4"
+    assert c("/usr/bin/python3 -m pytest -n 64", 4) == "/usr/bin/python3 -m pytest -n 4"
+    assert c("pytest -k 'a | b; c' -n 64", 4) == "pytest -k 'a | b; c' -n 4"
+    assert c(".venv/bin/pytest -n 3 -k 'a | b; c'", 4) == ".venv/bin/pytest -n 3 -k 'a | b; c'", "within it: as it is"
+    assert c('pytest -k "x -n 64" -n 64 2>&1 | tail -n 99', 4) == 'pytest -k "x -n 64" -n 4 2>&1 | tail -n 99'
+    assert c("cd tests/pytest && head -n 64 f", 4) == "cd tests/pytest && head -n 64 f", "not pytest's -n"
+    assert testslots.over("pytest -k 'a; b' -n 64", 4) == [64]
     argv = push.check_argv("pytest -n 64 tests", None, {**os.environ, testslots.HELD_ENV: "3"}, isolate=False)
     assert argv[-1].endswith("pytest -n 3 tests")
     assert push.check_argv("pytest -n 64 tests", None, {}, isolate=False)[-1].endswith("pytest -n 64 tests")
@@ -1148,6 +1158,137 @@ def test_a_pytest_n_above_the_budget_is_lowered_with_a_line_saying_so_and_refuse
     assert hook.too_many_workers("head -n 50 f && sort -n 99 g") is None
     monkeypatch.delenv("TTP_TEST_SLOTS")
     assert hook.too_many_workers("pytest -n 64 tests") is None, "outside a worker run: no budget"
+
+
+# Host-wide build slots (testslots.BUILDS) ----------------------------------------------------------
+_FAKE_MAKE = """#!/bin/sh
+echo "args=$* MAKEFLAGS=$MAKEFLAGS CMAKE=$CMAKE_BUILD_PARALLEL_LEVEL" > "$MAKE_SEEN"
+echo $$ > "$MAKE_SEEN.pid"
+while [ -n "$MAKE_STOP" ] && [ ! -e "$MAKE_STOP" ]; do sleep 0.05; done
+"""
+
+
+def _fake_make(tmp_path, monkeypatch):
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir(exist_ok=True)
+    (bindir / "make").write_text(_FAKE_MAKE)
+    (bindir / "make").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    monkeypatch.setenv("MAKE_SEEN", str(tmp_path / "make.seen"))
+    monkeypatch.setenv("TTP_BUILD_POOL", "6")
+    monkeypatch.setenv("TTP_BUILD_RUN_MAX", "3")
+    return tmp_path / "make.seen"
+
+
+def _clip(cmd: list) -> int:
+    from ttp import cli
+    with pytest.raises(SystemExit) as e:
+        cli.main(["clip", "--", *cmd])
+    return e.value.code
+
+
+def test_workers_environment_carries_the_build_cap_of_the_build_pool(env, monkeypatch):
+    from ttp import cli, testslots
+    p = make(env)
+    monkeypatch.setenv("TTP_BUILD_POOL", "10")
+    monkeypatch.setenv("TTP_BUILD_RUN_MAX", "5")
+    _, run_env = _worker_env(p, monkeypatch)
+    assert run_env["MAKEFLAGS"] == "-j5" and run_env["CMAKE_BUILD_PARALLEL_LEVEL"] == "5", run_env
+    assert testslots.worker_env({"checks": {"build_run_max": 2}})["MAKEFLAGS"] == "-j2", "a project only lowers it"
+    assert testslots.makeflags(5, "-j2 -k") == "-j2 -k", "a lower -j and other flags stay"
+    assert testslots.makeflags(5, "-j64 --no-print-directory") == "-j5 --no-print-directory"
+    assert testslots.makeflags(5, "-j") == "-j5", "a bare -j (unlimited) is capped"
+    monkeypatch.delenv("TTP_BUILD_POOL")
+    cli.main(["config", "--account", "checks.build_pool", "0"])
+    assert "MAKEFLAGS" not in testslots.worker_env({}), "build_pool 0 turns the build cap off"
+    assert testslots.SLOTS_ENV in testslots.worker_env({}), "the test pool stays on"
+
+
+def test_build_job_counts_above_the_grant_are_clamped_and_others_kept_word_by_word(env):
+    from ttp import testslots
+    c = testslots.clamp_build
+    assert c("make -j 64", 4) == "make -j 4" and c("make -j64 all", 4) == "make -j4 all"
+    assert c("cd b && /usr/bin/make --jobs=64 V=1", 4) == "cd b && /usr/bin/make --jobs=4 V=1"
+    assert c("make -j", 4) == "make -j 4" and c("make -j all", 4) == "make -j 4 all", "bare -j is unlimited"
+    assert c("cmake --build build -j 64 -- -j 99", 4) == "cmake --build build -j 4 -- -j 4"
+    assert c("cmake --build build --parallel", 4) == "cmake --build build --parallel 4"
+    assert c("ninja -j0 -C b", 4) == "ninja -j4 -C b" and c("ninja -C b", 4) == "ninja -j4 -C b"
+    assert c('make "-j" 64', 4) == 'make "-j" 4' and c("make '-j64'", 4) == "make -j4", "quoting is no way around it"
+    assert c("echo $(make -j 64) # make -j 99", 4) == "echo $(make -j 4) # make -j 99"
+    for kept in ("make -j 4", "make -j2 all", "ninja -j 3", "cmake --build b --parallel 1", "cmake -S . -B b -j 64",
+                 "pip install ninja", "git commit -m 'make -j64'", "make -k 'x; -j 64'", "sort -j 64"):
+        assert c(kept, 4) == kept, kept
+    assert testslots.builds("timeout 600 nice -n 5 make") and testslots.builds("CC=gcc cmake --build b")
+    assert not testslots.builds("pip install ninja") and not testslots.builds("echo make; cmake -B b")
+
+
+def test_ttp_clip_caps_a_build_at_its_build_slot_grant_and_keeps_a_lower_j(env, tmp_path, monkeypatch, capsys):
+    from ttp import locks, testslots
+    seen = _fake_make(tmp_path, monkeypatch)
+    assert _clip(["make", "-j", "64", "all"]) == 0
+    assert seen.read_text().strip() == "args=-j 3 all MAKEFLAGS=-j3 CMAKE=3"
+    out = capsys.readouterr().out
+    assert "build slots: 3 granted of a host pool of 6" in out and "capped at -j 3" in out
+    assert not locks.held_labels(testslots.paths(6, testslots.BUILDS)), "released once the build ends"
+    assert _clip(["make", "-j", "2"]) == 0
+    assert seen.read_text().strip() == "args=-j 2 MAKEFLAGS=-j3 CMAKE=3", "a -j at or below the grant is kept"
+    assert "capped" not in capsys.readouterr().out
+    assert _clip(["sh", "-c", "make -j 3"]) == 0 and seen.read_text().startswith("args=-j 3 "), "kept"
+    monkeypatch.setenv(testslots.HELD_ENV, "2")   # inside a check: its test grant, no build slots taken
+    assert _clip(["make", "-j", "64"]) == 0 and seen.read_text().startswith("args=-j 2 MAKEFLAGS=-j2")
+    assert not locks.held_labels(testslots.paths(6, testslots.BUILDS))
+
+
+def test_build_slots_of_a_killed_ttp_clip_are_released(env, tmp_path, monkeypatch):
+    import signal
+    from ttp import locks, testslots
+    seen = _fake_make(tmp_path, monkeypatch)
+    stop = tmp_path / "make.stop"
+    monkeypatch.setenv("MAKE_STOP", str(stop))
+    proc = subprocess.Popen([sys.executable, "-m", "ttp", "clip", "--", "make"],
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME)}, stdout=subprocess.DEVNULL)
+    pid_file = seen.with_name(seen.name + ".pid")
+    try:
+        assert _wait_for(lambda: pid_file.exists() and pid_file.read_text().strip())
+        assert len(locks.held_labels(testslots.paths(6, testslots.BUILDS))) == 3
+        assert "host build slots: 3 of 6 in use (at most 3 per run)" in testslots.use_lines()
+        proc.kill()   # SIGKILL: no clean-up runs, the kernel drops its locks
+        proc.wait(10)
+        assert _wait_for(lambda: not locks.held_labels(testslots.paths(6, testslots.BUILDS)), 10), \
+            "a killed holder's build slots are free again, even while its build still runs"
+        g = testslots.acquire("after", wait_s=5, kind=testslots.BUILDS)
+        assert g is not None and g.k == 3
+        g.close()
+    finally:
+        stop.write_text("")
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(10)
+        if pid_file.exists() and (pid := pid_file.read_text().strip()):
+            try:
+                os.kill(int(pid), signal.SIGKILL)   # the fake make this test started
+            except ProcessLookupError:
+                pass
+
+
+def test_web_feed_shows_the_host_test_and_build_slot_use_ttp_status_prints(env, monkeypatch):
+    from ttp import testslots
+    from ttp.web import state_payload
+    p = make(env)
+    for var, n in (("TTP_TEST_POOL", "6"), ("TTP_TEST_RUN_MAX", "3"), ("TTP_BUILD_POOL", "4"), ("TTP_BUILD_RUN_MAX", "2")):
+        monkeypatch.setenv(var, n)
+    assert not [m for m in state_payload(p, p.db)["feed"] if m["kind"] == "slots"], "idle: no row"
+    tests = testslots.acquire("checks", wait_s=0, project_name="")
+    builds = testslots.acquire("build", wait_s=0, project_name="", kind=testslots.BUILDS)
+    try:
+        rows = [m for m in state_payload(p, p.db)["feed"] if m["kind"] == "slots"]
+        assert [m["text"] for m in rows] == ["host test slots: 3 of 6 in use (at most 3 per run)",
+                                             "host build slots: 2 of 4 in use (at most 2 per run)"]
+        assert all(m["state"] == "status" and m["severity"] == "low" for m in rows), "the feed, never the top"
+        assert not [a for a in state_payload(p, p.db)["attention"] if "slots" in json.dumps(a)]
+    finally:
+        tests.close()
+        builds.close()
 
 
 def _fake_proc(root, forks: int, procs: dict):

@@ -548,6 +548,14 @@ def uncommitted_feed(db: DB) -> list[dict]:
             for k, v in (db.kv(KV_WORKTREES_DIRTY) or {}).items()]
 
 
+def slots_feed(now: float) -> list[dict]:
+    """Feed rows (state 'status': not the top section) for the host's test and build slots in use, the
+    lines `ttp status` prints (testslots.use_lines)."""
+    from . import testslots
+    return [{"id": None, "ts": now, "kind": "slots", "severity": "low", "state": "status", "text": line}
+            for line in testslots.use_lines()]
+
+
 def run_wake(note: str | None) -> str | None:
     """The tier of a run that wakes a waiting task, from its run note; None for any other run."""
     try:
@@ -655,7 +663,7 @@ def state_payload(p: Project, db: DB) -> dict:
         "attention": attention(db, now),
         "notify": notify_state(p, db),
         "feed": sorted(alerts.feed(db, now) + uncommitted_feed(db) + startgate.feed(db, warn_s, now)
-                       + sweepskip.feed(db, now, tz), key=lambda m: -float(m["ts"] or 0)),
+                       + sweepskip.feed(db, now, tz) + slots_feed(now), key=lambda m: -float(m["ts"] or 0)),
         "offline_help": offline_help(p.name),
         "budget": bud.history(db),
         "coordinator": db.kv("last_coordinator_summary", {}),

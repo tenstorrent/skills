@@ -1338,8 +1338,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     from . import checkcap, locks, shared, testslots
     if host := checkcap.line():
         lines.append(host)
-    if pool := testslots.use():
-        lines.append(pool)
+    lines.extend(testslots.use_lines())
     if verbose and (slot_waits := checkcap.wait_line(p.state, now)):
         lines.append(slot_waits)
     for res in sorted(shared.names(p.config())):
@@ -3711,19 +3710,39 @@ def _checks_result(run_dir: Path) -> int:
 def cmd_clip(a) -> None:
     """Run one command with its whole output in a file, and print only what a model needs: a test
     run's failures, else the head and tail, plus the file's path. Exits with the command's code.
-    Inside a run the file goes in the run's folder (out/), else in a temporary one."""
-    from . import trim
+    Inside a run the file goes in the run's folder (out/), else in a temporary one. A build (make, ninja,
+    cmake --build) first takes this run's share of the host's build slots (testslots.BUILDS) and runs
+    with that many jobs, at a lower priority; none free within CLIP_WAIT_S: one job."""
+    from . import testslots, trim
     cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
     if not cmd:
         die("usage: ttp clip -- <command>")
+    line, env, grant, argv = shlex.join(cmd) if len(cmd) > 1 else cmd[0], None, None, None
+    if testslots.builds(line):
+        def tell(msg: str) -> None:
+            print(f"ttp clip: {msg}", flush=True)
+        grant = testslots.acquire(f"ttp clip (task #{os.environ.get('TTP_TASK') or '?'}, pid {os.getpid()}): "
+                                  f"{line[:80]}", tell, testslots.CLIP_WAIT_S, kind=testslots.BUILDS)
+        if grant is None:
+            tell(f"no host build slot free after {testslots.CLIP_WAIT_S:.0f} s: building with 1 job")
+            grant = testslots.Grant(1, kind=testslots.BUILDS)
+        if grant.k:
+            if (capped := testslots.clamp_build(line, grant.k)) != line:
+                tell(f"build jobs capped at -j {grant.k} (this run's share of the host's build slots): {capped}")
+            line, env = capped, {**os.environ, **grant.env()}
+            argv = testslots.low_priority(["/bin/sh", "-c", line])
     run_dir = os.environ.get("TTP_RUN_DIR")
     folder = Path(run_dir) / "out" if run_dir else Path(tempfile.mkdtemp(prefix="ttp-clip-"))
     folder.mkdir(parents=True, exist_ok=True)
     n = 1 + sum(1 for _ in folder.glob("clip-*.log"))
     log = folder / f"clip-{n}.log"
-    with open(log, "w") as out:
-        rc = subprocess.run(shlex.join(cmd) if len(cmd) > 1 else cmd[0], shell=True, stdout=out,
-                            stderr=subprocess.STDOUT).returncode
+    try:
+        with open(log, "w") as out:
+            rc = subprocess.run(argv or line, shell=argv is None, stdout=out, stderr=subprocess.STDOUT,
+                                env=env).returncode
+    finally:
+        if grant is not None:
+            grant.close()
     text = log.read_text(errors="replace")
     print(trim.summary(text, str(log), a.lines))
     print(f"(exit {rc})")
