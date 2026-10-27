@@ -4,8 +4,9 @@ A spec that asks for a set of measurements or tests (sweep levels, a test grid, 
 cells) names them on a line that starts with `cells:` (an optional list bullet before it), separated
 by commas or semicolons. Several such lines add up. Cells come only from that explicit line, never
 from titles or prose: a false 'partial' costs repeat runs. A done hand-off lists the requested cells
-it finished with a valid result in its `cells` field; a cell that ran without a valid result is not
-finished. Cells match case-insensitively, ignoring whitespace and surrounding quotes; cells beyond
+it finished with a valid result in its `cells` field, a list of names or a dict name -> row; a cell
+that ran without a valid result is not finished (a dict value that is None, False, empty, `valid:
+false` or a string starting `invalid`; a 0 is a measurement, so finished). Cells match case-insensitively, ignoring whitespace and surrounding quotes; cells beyond
 the requested ones are fine.
 """
 from __future__ import annotations
@@ -43,12 +44,17 @@ def requested(spec) -> list[str]:
 
 
 def _valid(value) -> bool:
-    """A dict cell's value counts as finished unless it is falsy, an 'invalid...' string or `valid: false`."""
+    """A dict cell's value counts as finished unless it is None, False, empty, an 'invalid...' string or
+    `valid: false`; a number, 0 included, is a measurement."""
+    if value is None or value is False:
+        return False
     if isinstance(value, str):
         return bool(value.strip()) and not value.strip().casefold().startswith("invalid")
     if isinstance(value, dict):
         return bool(value) and value.get("valid", True) is not False
-    return bool(value)
+    if isinstance(value, (list, tuple)):
+        return bool(value)
+    return True
 
 
 def check(spec, result) -> dict | None:

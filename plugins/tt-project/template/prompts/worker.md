@@ -173,7 +173,8 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
 - `done` only with evidence: tests run, numbers measured, files produced.
 <!-- ttp:if cells -->
   A cell that ran without a valid result is not finished: the daemon marks a done that leaves
-  requested cells out `partial:` (or `cells unreported:` without `cells`).
+  requested cells out `partial:` (or `cells unreported:` without `cells`). `cells` may also be
+  a dict name -> row; an empty value, a `valid: false` row or a string starting `invalid` is not finished.
 <!-- /ttp:if cells -->
 - `waiting` when a resource is busy (a reservation, a queue, a review). It returns after
   `retry_after_s`, not counted as an attempt. Save what you learned first. Always give a

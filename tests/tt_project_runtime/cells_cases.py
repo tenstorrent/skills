@@ -40,6 +40,44 @@ def test_the_cells_line_is_parsed_with_either_separator_and_compared_normalised(
     assert cells.prefix(cells.check(SWEEP, {})) == "cells unreported: 3 requested. "
 
 
+
+def test_a_dict_cells_field_counts_valid_rows_and_normalises_keys():
+    from ttp import cells
+    rows = {" 150 w ": {"tok_s": 41.2}, "`200W`": {"tok_s": 40.1, "valid": True}, "250w": "ok", "300W": None}
+    assert cells.check(SWEEP, {"cells": rows}) == {"requested": ["150W", "200W", "250W"], "missing": []}
+    # A number is a measurement, 0 included; True is a plain 'finished'.
+    assert cells.check(SWEEP, {"cells": {"150W": 0, "200W": 0.0, "250W": True}})["missing"] == []
+
+
+def test_a_dict_cell_marked_invalid_or_falsy_is_not_finished(env):
+    from ttp import cells
+    ok = {"150W": {"tok_s": 41.2}, "250W": {"tok_s": 39.0}}
+    for bad in ("Invalid: reset by other project", "INVALID", "  invalid result", None, "", "  ", {},
+                {"valid": False, "tok_s": 1}, False, []):
+        got = cells.check(SWEEP, {"cells": dict(ok, **{"200W": bad})})
+        assert got["missing"] == ["200W"], bad
+        assert cells.prefix(got) == "partial: 2 of 3 cells (missing: 200W). ", bad
+    # The daemon path names it in the summary and follows it up.
+    p = make(env)
+    res = {"status": "done", "summary": "measured", "cells": dict(ok, **{"200W": "Invalid: reset by other project"})}
+    tid, done = _finish_cells(env, p, SWEEP, res)
+    mark = "partial: 2 of 3 cells (missing: 200W). measured"
+    assert load_result(p.db.task(tid)["result"])["summary"] == mark and mark in done["text"]
+    hops = p.db.q("SELECT spec FROM tasks WHERE parent=?", (tid,))
+    fup = p.db.q("SELECT text FROM events WHERE task=? AND kind='followup_proposed'", (tid,))
+    assert cells.requested(hops[0]["spec"] if hops else fup[0]["text"]) == ["200W"]
+
+
+def test_the_list_form_is_unchanged_next_to_the_dict_form():
+    from ttp import cells
+    for listed, rows, missing in ((["150w", "250W"], {"150w": {"v": 1}, "250W": 2}, ["200W"]),
+                                  (["150W", "200W", "250W"], {c: "ok" for c in ("150W", "200W", "250W")}, []),
+                                  ([], {}, ["150W", "200W", "250W"])):
+        assert cells.check(SWEEP, {"cells": listed})["missing"] == missing
+        assert cells.check(SWEEP, {"cells": rows})["missing"] == missing
+    # List entries are names, never rows: a dict or None entry still does not count.
+    assert cells.check(SWEEP, {"cells": [{"150W": 1}, None, "200W"]})["missing"] == ["150W", "250W"]
+
 def test_a_done_hand_off_covering_all_requested_cells_stays_unchanged(env):
     p = make(env)
     res = {"status": "done", "summary": "all three levels measured", "cells": ["150W", "200W", "250W"]}
@@ -130,6 +168,7 @@ def test_only_a_worker_whose_spec_has_a_cells_line_is_told_about_the_cells_field
     without = p.db.add_task("power sweep", "Measure throughput at 150W.", kind="question", tier="light", origin="user")
     prompt = worker_prompt(p, p.db.task(with_line), str(p.root), None)
     assert '"cells": [' in prompt and "A cell that ran without a valid result is not finished" in prompt
+    assert "`cells` may also be\n  a dict name -> row" in prompt and "a string starting `invalid` is not finished" in prompt
     prompt = worker_prompt(p, p.db.task(without), str(p.root), None)
     assert '"cells": [' not in prompt and "valid result is not finished" not in prompt
 
