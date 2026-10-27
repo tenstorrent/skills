@@ -34,7 +34,16 @@ Gate, per component, on device:
 | Output used as an absolute value (VAE latents, pixels) | relative RMSE bar as well as PCC |
 | Sharded vs unsharded TT path | Data parallel bit-exact (PCC = 1.0); spatial within the unsharded bar, seams checked |
 
-Before accepting any bar below these, measure the precision floor and record why.
+These defaults are targets, not stop conditions. When a component misses one:
+
+1. Look for a real bug first: bisect against the reference as in
+   `tt-dit-add-model/testing-and-accuracy.md` "When a gate fails".
+2. If none is found, measure the precision floor (for example, the same component with the
+   reference in bf16), set the component's bar just below what it achieves, and continue.
+3. List it under "Needs review" with the measured value, the floor, and what was tried.
+
+Do not stop the bring-up for a missed default. The stage gate is that every component has a
+test, runs on device, and either meets its default or is flagged with a measured reason.
 
 Summary adds: a table of component, shape, mesh, PCC, relative RMSE, bar, pass/fail; any bar
 below the defaults under "Needs review".

@@ -67,8 +67,9 @@ Stage outputs go in `<run-root>/stages/<NN>-<name>/`. Formats are in
   pass a gate.
 - **Every stage writes its summary before its gate is marked passed.** A stage without a
   summary is not done.
-- **Do not loosen a bar silently.** Any threshold below the defaults in `references/stages.md`
-  needs a measured reason, and the summary must list it under "Needs review".
+- **Flag, don't block, on accuracy.** A missed default threshold does not stop the run: look
+  for a bug, measure the precision floor, then continue with the measured bar and list it under
+  "Needs review" (`references/stages.md` stage 2). Never loosen a bar silently.
 - **Do not go back silently.** If a later stage finds a bug in an earlier one, fix it, re-run
   that stage's gate, and add an amendment to that stage's summary.
 - At the end, write `<run-root>/BRINGUP.md` (one page linking every stage summary) and
