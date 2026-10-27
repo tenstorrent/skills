@@ -97,6 +97,27 @@ def test_the_durations_plugin_saves_the_slowest_tests_and_selects_nothing(env, t
     assert record.read_text() == before
 
 
+def test_the_durations_plugin_logs_each_tests_start_and_end_as_they_happen(tmp_path):
+    from ttp import slowtests
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    for name, text in _SLOW_SUITE.items():
+        (suite / name).write_text(text)
+    (suite / "test_live.py").write_text("import os\ndef test_e(): assert 'TTP_PYTEST_DURATIONS_LIVE' not in os.environ\n")
+    record, live = tmp_path / slowtests.FILE, tmp_path / "live.jsonl"
+    base = {k: v for k, v in os.environ.items() if k not in ("PYTEST_ADDOPTS", "PYTHONPATH")}
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "."], cwd=suite,
+                       env={**base, **slowtests.env(record, base, live=live)}, capture_output=True, text=True)
+    assert r.returncode == 0 and "4 passed" in r.stdout, r.stdout   # no test saw the live log's setting
+    rows = [json.loads(x) for x in live.read_text().splitlines()]
+    assert [(x["id"], "start" in x) for x in rows] == [(i, k) for i in ("test_live.py::test_e", "test_s.py::test_a",
+                                                                       "test_s.py::test_b", "test_s.py::test_c")
+                                                       for k in (True, False)], "each start, then its end"
+    assert {x["id"]: x["s"] for x in rows if "s" in x}["test_s.py::test_b"] == 2.25
+    assert all(abs(x["start"] - time.time()) < 600 for x in rows if "start" in x)
+    assert "live.jsonl" not in str(slowtests.env(record, base)), "no live log unless asked for"
+
+
 def test_slowest_tests_load_and_display(tmp_path):
     sys.path.insert(0, str(RUNTIME))
     from ttp import slowtests

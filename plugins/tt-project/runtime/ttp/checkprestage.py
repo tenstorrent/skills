@@ -7,8 +7,9 @@ be started or a malformed setting never holds the full checks back.
 
 With delivery.check_prestage unset, a project whose own checks run pytest here gets a derived pre-stage
 (`derive`): the DERIVE_MAX tests that failed in the most distinct detached `ttp checks` runs of the
-project over DERIVE_WINDOW_S, leaving out those a run recorded taking DERIVE_FAST_S or more. No such
-failures: no pre-stage. `''` or false turns it off; an explicit command is used as it is."""
+project over DERIVE_WINDOW_S, leaving out those a run recorded taking DERIVE_FAST_S or more. A derived
+pre-stage that times out records the tests it cut off as slow (`_learn_from_timeout`), so the next one
+leaves them out instead of timing out the same way. No such failures: no pre-stage. `''` or false turns it off; an explicit command is used as it is."""
 from __future__ import annotations
 
 import json
@@ -32,6 +33,7 @@ DERIVE_MAX, DERIVE_WINDOW_S, DERIVE_FAST_S = 10, 14 * 86400, 5.0
 DERIVED_KEY, CAUGHT_KEY = "check_prestage_derived", "check_prestage_caught"   # kv, for the daily audit
 FAILURE = "check_failure.json"   # a `ttp checks` run's last failure, in its run's directory
 DURATIONS = "prestage-slowest-tests.json"   # the derived pre-stage's own test times, beside slowtests.FILE
+LIVE = "prestage-test-times.jsonl"   # its tests' starts and ends as they happen (the durations plugin)
 NO_TESTS, SETUP = 5, (3, 4)   # pytest: no test selected (a pass here); internal and usage errors (never a failure here)
 
 
@@ -132,7 +134,8 @@ def run_derived(p, ids: list[str], checks: list, top: str, env: dict, say, run_d
     exports, and its process sandbox unless it opts out). No test selected passes, and a pytest internal or usage error never
     holds the full checks back; a failure is
     recorded for the daily audit (CAUGHT_KEY). Its test times go to DURATIONS in `run_dir`, so a
-    test found slow there is left out next time."""
+    test found slow there is left out next time; on a timeout, from each test's end as it happened,
+    with the tests cut off recorded as slow (`_learn_from_timeout`)."""
     from . import push, pushpass, slowtests
     spec = derived_command(ids, top)
     if spec is None:
@@ -140,19 +143,68 @@ def run_derived(p, ids: list[str], checks: list, top: str, env: dict, say, run_d
         return 0
     cmd, pattern = spec
     env = {**env, **pushpass.select_env(pattern, env)}
+    learn = None
     if run_dir:
-        env = {**env, **slowtests.env(Path(run_dir) / DURATIONS, env)}
+        live = Path(run_dir) / LIVE
+        try:
+            live.unlink()
+        except OSError:
+            pass
+        env = {**env, **slowtests.env(Path(run_dir) / DURATIONS, env, live=live)}
+        learn = lambda took: _learn_from_timeout(Path(run_dir), ids, took, say)
     check = push.Check(cmd)   # with the project check's exports and sandbox opt-out
     check.env = tuple(getattr(pytest_check(checks), "env", ()) or ())
     check.sandbox = getattr(pytest_check(checks), "sandbox", True) is not False
     rc = run(shlex.join(push.check_argv(check, top, env)), top, env, say,
              what="derived from this project's frequent check failures", ok=(0, NO_TESTS),
-             cannot=(*SETUP, *CANNOT_RUN), shown=cmd)
+             cannot=(*SETUP, *CANNOT_RUN), shown=cmd, on_timeout=learn)
     if rc:
         _record(p, CAUGHT_KEY, lambda rows: [*[r for r in rows or [] if isinstance(r, dict)
                                                 and r.get("ts", 0) >= time.time() - DERIVE_WINDOW_S],
                                               {"ts": time.time(), "ids": ids}])
     return rc
+
+
+def _learn_from_timeout(run_dir: Path, ids: list[str], took: float, say) -> None:
+    """After a derived pre-stage timed out: merge into DURATIONS the times of the tests that ended
+    (LIVE) and, for each test still running when it was stopped, its time so far but at least
+    DERIVE_FAST_S, so `derive` leaves it out next time. A test that never started is not guessed
+    slow, unless none started at all (collection or setup outlasted the timeout): then every
+    derived id is. A fault here never touches the checks."""
+    ended: dict[str, float] = {}
+    began: dict[str, float] = {}
+    try:
+        text = (run_dir / LIVE).read_text(errors="replace")
+    except OSError:
+        text = ""
+    for line in text.splitlines():
+        try:
+            row = json.loads(line)
+            i = str(row["id"])
+            if "s" in row:
+                ended[i] = float(row["s"])
+            else:
+                began[i] = float(row["start"])
+        except (ValueError, TypeError, KeyError):
+            continue   # a line cut off by the stop
+    now = time.time()
+    cut = {i: max(now - t, DERIVE_FAST_S) for i, t in began.items() if i not in ended}
+    if not began:
+        cut = {i: max(took, DERIVE_FAST_S) for i in ids}
+    if not cut and not ended:
+        return
+    path = run_dir / DURATIONS
+    try:
+        from . import slowtests
+        times = dict(slowtests.load(path)) | ended | cut
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"tests": [{"id": i, "s": round(t, 3)} for i, t in times.items()],
+                                   "count": len(times)}))
+        os.replace(tmp, path)
+    except Exception:
+        return
+    if cut:
+        say(f"pre-stage left out of the next derived list, cut off by the timeout: {', '.join(sorted(cut))}")
 
 
 def derived(p, checks: list, say) -> list[str] | None:
@@ -193,11 +245,11 @@ def _tail(raw: bytes, n: int = TAIL_LINES) -> str:
 
 
 def run(v, cwd: str, env: dict, say, what: str = f"delivery.{KEY}", ok: tuple = (0,),
-        cannot: tuple = CANNOT_RUN, shown: str = "") -> int:
+        cannot: tuple = CANNOT_RUN, shown: str = "", on_timeout=None) -> int:
     """Run the pre-stage `v` in `cwd`; `say` prints a line. 0: start the full checks (it passed,
     timed out, is unset, malformed or could not be started); 1: it failed, start nothing. `ok` exit
     codes pass and `cannot` ones are a setting fault (`what` names the setting); `shown` is the
-    command as printed (default `v`'s)."""
+    command as printed (default `v`'s); `on_timeout(seconds)` runs once a timed-out one is stopped."""
     try:
         spec = parse(v)
     except ValueError as e:
@@ -222,6 +274,8 @@ def run(v, cwd: str, env: dict, say, what: str = f"delivery.{KEY}", ok: tuple = 
         if rc is None:
             _stop(proc)
             say(f"pre-stage timed out after {timeout:.0f} s; starting the full checks anyway")
+            if on_timeout:
+                on_timeout(time.monotonic() - t0)
             return 0
         took = time.monotonic() - t0
         if rc in ok:

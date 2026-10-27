@@ -7197,6 +7197,68 @@ def test_a_derived_check_prestage_leaves_out_a_test_recorded_over_5_s(env, tmp_p
     assert checkprestage.derive(p.runs) == []
 
 
+def test_a_derived_check_prestage_that_times_out_leaves_its_unfinished_test_out_next_time(env, tmp_path, monkeypatch, capsys):
+    """A derived list whose unrecorded test outlasts the pre-stage timeout: the tests that ended keep
+    their times and the one cut off is recorded as slow, so the next derivation leaves it out and
+    finishes, instead of timing out on every detach until its failures age out."""
+    from ttp import checkprestage, cli, slowtests
+    p, run, started = _derived_setup(env, tmp_path, monkeypatch)
+    run = p.runs / "41"   # as in a real run, its directory is among the project's runs derive reads
+    run.mkdir(parents=True)
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    repo = tmp_path / "work"
+    (repo / "tests" / "test_hang.py").write_text(
+        "import time\n\n\ndef test_quick():\n    pass\n\n\n"
+        "def test_hangs():\n    time.sleep(120)\n\n\ndef test_after():\n    pass\n")
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t",
+                    "commit", "-qam", "hang", "--allow-empty"], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t",
+                    "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t",
+                    "commit", "-qm", "hang"], check=True)
+    quick, hangs, after = (f"tests/test_hang.py::{n}" for n in ("test_quick", "test_hangs", "test_after"))
+    for rid in (1, 2):
+        _seed_check_failure(p, rid, [hangs, quick, after])
+    monkeypatch.setattr(checkprestage, "DEFAULT_TIMEOUT_S", 6.0)
+    assert checkprestage.derive(p.runs) == [after, hangs, quick]
+    cli.main(["checks", "--detach"])
+    out = capsys.readouterr().out
+    assert len(started) == 1 and "pre-stage timed out after 6 s" in out
+    times = dict(slowtests.load(run / checkprestage.DURATIONS))
+    assert times.get(hangs, 0) >= checkprestage.DERIVE_FAST_S and times.get(quick, 9) < 1, times
+    assert after not in times, "a test that never started is not guessed slow"
+    assert checkprestage.derive(p.runs) == [after, quick]
+    cli.main(["checks", "--detach"])
+    assert len(started) == 2 and "pre-stage passed" in capsys.readouterr().out
+
+
+def test_a_derived_check_prestage_timeout_learns_only_what_its_live_log_shows(tmp_path):
+    from ttp import checkprestage, slowtests
+    said = []
+    ids = ["t.py::test_a", "t.py::test_b", "t.py::test_c"]
+    live, times = tmp_path / checkprestage.LIVE, tmp_path / checkprestage.DURATIONS
+    # Nothing started (collection or setup outlasted the timeout): every derived id is left out.
+    checkprestage._learn_from_timeout(tmp_path, ids, 7.0, said.append)
+    assert dict(slowtests.load(times)) == {i: 7.0 for i in ids} and ids[0] in said[-1]
+    # One ended, one cut off (its end line cut short by the stop), one never started; earlier
+    # times in the file are kept, its own new ones win.
+    times.write_text(json.dumps({"tests": [{"id": "t.py::test_old", "s": 9.0}, {"id": "t.py::test_a", "s": 7.0}]}))
+    now = time.time()
+    live.write_text(json.dumps({"id": "t.py::test_a", "start": now - 3}) + "\n"
+                    + json.dumps({"id": "t.py::test_a", "s": 0.2}) + "\n"
+                    + json.dumps({"id": "t.py::test_b", "start": now - 1}) + "\n" + '{"id": "t.py::test_b", "s')
+    checkprestage._learn_from_timeout(tmp_path, ids, 3.0, said.append)
+    got = dict(slowtests.load(times))
+    assert got["t.py::test_a"] == 0.2 and got["t.py::test_old"] == 9.0
+    assert got["t.py::test_b"] >= checkprestage.DERIVE_FAST_S and "t.py::test_c" not in got, "never started"
+    assert said[-1].endswith(": t.py::test_b") and not list(tmp_path.glob("*.tmp"))
+    # An unreadable live log or DURATIONS never raises.
+    live.write_text("not json\n")
+    times.write_text("{")
+    checkprestage._learn_from_timeout(tmp_path / "gone", ids, 3.0, said.append)
+    checkprestage._learn_from_timeout(tmp_path, ids, 3.0, said.append)
+
+
 def test_a_derived_check_prestage_id_that_no_longer_exists_never_fails_it(env, tmp_path, monkeypatch, capsys):
     from ttp import cli
     p, run, started = _derived_setup(env, tmp_path, monkeypatch)

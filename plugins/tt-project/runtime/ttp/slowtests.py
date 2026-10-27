@@ -17,12 +17,13 @@ PLUGIN_DIR = Path(__file__).resolve().parent / "pytest_resume"
 FILE, PLUGIN, TOP, SHOW = "slowest-tests.json", "ttp_pytest_durations", 30, 5
 
 
-def env(path: Path, env: dict) -> dict:
-    """The variables that load the durations plugin with `path` as its file, on top of `env`'s own."""
+def env(path: Path, env: dict, live: Path | None = None) -> dict:
+    """The variables that load the durations plugin with `path` as its file, on top of `env`'s own;
+    `live` also gets each test's start and end as they happen (jsonl)."""
     pp = os.pathsep.join(filter(None, (str(PLUGIN_DIR), env.get("PYTHONPATH", ""))))
     opts = " ".join(filter(None, (env.get("PYTEST_ADDOPTS", ""), f"-p {PLUGIN}")))
     return {"PYTHONPATH": pp, "PYTEST_ADDOPTS": opts, "TTP_PYTEST_DURATIONS": str(path),
-            "TTP_PYTEST_DURATIONS_TOP": str(TOP)}
+            "TTP_PYTEST_DURATIONS_TOP": str(TOP), **({"TTP_PYTEST_DURATIONS_LIVE": str(live)} if live else {})}
 
 
 def load(path: Path) -> list[tuple[str, float]]:
