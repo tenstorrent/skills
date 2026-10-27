@@ -12601,5 +12601,5 @@ def test_a_failed_review_of_an_external_change_gets_a_fix_that_publishes_to_the_
 
 def test_the_code_prompt_says_to_name_a_change_published_in_another_repo():
     text = " ".join((RUNTIME.parent / "template" / "prompts" / "kind-code.md").read_text().split())
-    assert '"published": {"repo": "<owner/name or URL>", "branch": "...", "head": "<sha>"}' in text
-    assert "so the daemon queues its review" in text
+    assert 'hand off `"published": {"repo": "<owner/name or URL>", "branch": "...", "head": "<sha>"}`' in text
+    assert "so the daemon reviews it" in text

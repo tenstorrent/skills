@@ -27,9 +27,8 @@
   `self_check` line (also in `on_pass`): what you ticked and tried.
 - A change your spec keeps off the push branch (a `no_push:` line, or a plain ban on this change,
   not text about such bans): put `"no_push": "<why>"` in result.json, so its review is review only.
-- A change delivered to another repository (its own clone, no diff in this one): name what you
-  published in result.json, `"published": {"repo": "<owner/name or URL>", "branch": "...", "head": "<sha>"}`,
-  so the daemon queues its review.
+- A change published in another repo (no diff here): hand off `"published": {"repo":
+  "<owner/name or URL>", "branch": "...", "head": "<sha>"}` so the daemon reviews it.
 <!-- ttp:if upstream_ingest -->
 - A change that fixes upstream notes (`[note <fp>]`): list them in result.json as `"resolves": ["<fp>"]`,
   in `on_pass` too, only if your commits change what the note reports (not if it only unblocks another
