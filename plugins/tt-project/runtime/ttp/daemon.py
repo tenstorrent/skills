@@ -671,6 +671,11 @@ class Daemon:
         self._reload_waits: set[int] = set()   # runs logged as waiting for a restart on their runtime changes
         # what code this process loaded, captured once before the first tick (never re-read)
         self.identity = identity.capture(boot=self.boot, started=self._started)
+        # the harness checkout's HEAD and runtime/ tree this process loaded: exact, for runtimeload and status
+        self._loaded = runtimeload.loaded(self.p.harness, self.identity.get("runtime"))
+        self.identity.update(self._loaded)
+        self._tree_asked: str | None = None   # the runtime tree a restart was last asked for (once per tree)
+        self._tree_wait = ""                  # why that restart waits, logged once per reason
         self._healthy = False
         self._progressed = 0.0   # when the daemon last told the watchdogs a tick step finished
         self._tick_began = 0.0   # when the running tick started, monotonic (0: between ticks)
@@ -798,7 +803,8 @@ class Daemon:
         signal.signal(signal.SIGINT, lambda *_: setattr(self, "stopping", True))
         r = self.identity
         log(self.p, f"daemon start pid={os.getpid()} host={hostname()} boot={self.boot} version={r['version']} "
-                    f"commit={r['commit'] or 'none'} instance={r['instance']} provenance={r['provenance']}")
+                    f"commit={r['commit'] or 'none'} instance={r['instance']} provenance={r['provenance']} "
+                    f"harness_head={r['harness_head'] or 'none'} runtime_tree={r['runtime_tree'] or 'none'}")
         self.p.db.set_kv("daemon", {"pid": os.getpid(), "host": hostname(), "started": time.time(),
                                     "instance": r["instance"]})
         self._check_config()
@@ -816,6 +822,7 @@ class Daemon:
                     service.reap_restart_request(self.p, self._started)   # a restart helper that left no result
                 except Exception:  # never in the way of a new restart request
                     log(self.p, "restart reap error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+                self._restart_on_moved_runtime()
                 service.take_restart_request(self.p, self._started)   # a sandboxed `ttp upgrade --apply` asked
             except Exception:  # a bad tick must never kill the daemon
                 log(self.p, "tick error: " + traceback.format_exc().replace("\n", " | ")[:2000])
@@ -856,6 +863,23 @@ class Daemon:
             return True
         other = _read_pid(self.p.state / "daemon.pid")
         return not (other and other != os.getpid() and _is_daemon(other))
+
+    def _restart_on_moved_runtime(self) -> None:
+        """After a tick: the harness checkout's runtime/ tree moved on from the one this daemon loaded
+        (ttp upgrade, a commit by hand, a merge, a reset): ask for the restart, with its rollback, a
+        harness run's runtime change asks for (runtimeload.tree_moved), once per tree."""
+        try:
+            tree, why = runtimeload.tree_moved(self.p, self._loaded.get("runtime_tree"), self._tree_asked)
+        except Exception:   # never in the way of the tick or of a restart already asked for
+            log(self.p, "runtime tree check error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+            return
+        if tree:
+            self._tree_asked, self._tree_wait = tree, ""
+            log(self.p, f"runtime tree moved on to {tree[:10]} (loaded {self._loaded['runtime_tree'][:10]}): "
+                        f"restart asked")
+        elif why and why != self._tree_wait:
+            log(self.p, f"runtime tree moved on: restart waits ({why})")
+        self._tree_wait = why if not tree else ""
 
     def _mark_start(self) -> None:
         """Record that this process started, and how often its first tick has failed, so `ttp restart`
@@ -2939,7 +2963,7 @@ class Daemon:
             # A run that changed the daemon's own runtime in the harness checkout is judged after the
             # restart it asks for, under its new code; held if that code did not load (runtimeload).
             try:
-                act, held = runtimeload.check(p, r, self._loaded_at)
+                act, held = runtimeload.check(p, r, self._loaded_at, self._loaded.get("runtime_tree"))
             except Exception:   # git failing here never costs the run its end: judged as before
                 log(p, f"run {r['id']}: runtime reload check failed\n" + traceback.format_exc())
                 act, held = "go", ""

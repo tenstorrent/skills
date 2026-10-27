@@ -147,13 +147,16 @@ def files_version(receipt: dict | None, fallback: Path) -> str:
 
 def summary(state: Path, pid: int, fallback: Path, where=None, now: float | None = None) -> dict:
     """{running_version, running_commit, instance, started, tick_done, files_version, provenance,
-    restart_pending, line} for daemon `pid` (0: none running). `line` is the one line `ttp status`
-    shows, times in the home zone (`where`)."""
+    restart_pending, loaded_head, loaded_tree, current_tree, runtime_stale, line} for daemon `pid`
+    (0: none running). `line` is the one line `ttp status` shows, times in the home zone (`where`).
+    The loaded runtime tree is the one the daemon recorded at start; the current one is the harness
+    checkout's (`fallback`) now. They differ: stale, and the daemon restarts itself on it."""
     from . import timefmt
     r = running(state, pid) if pid else None
     files = files_version(r, fallback)
     out = {"running_version": None, "running_commit": None, "instance": None, "started": None, "tick_done": None,
-           "files_version": files, "provenance": None, "restart_pending": False, "line": ""}
+           "files_version": files, "provenance": None, "restart_pending": False, "loaded_head": None,
+           "loaded_tree": None, "current_tree": None, "runtime_stale": False, "line": ""}
     if not pid:
         return out
     if not r:
@@ -166,6 +169,14 @@ def summary(state: Path, pid: int, fallback: Path, where=None, now: float | None
     line = f"running {r.get('version')}" + (f" ({commit})" if commit else "") + f" since {since}"
     if r.get("provenance") != "verified":
         line += f" (provenance unverified: {r.get('why') or 'unknown'})"
+    if r.get("runtime_tree"):
+        from .runtimeload import tree
+        cur = tree(fallback)
+        out.update(loaded_head=r.get("harness_head"), loaded_tree=r["runtime_tree"], current_tree=cur,
+                   runtime_stale=bool(cur and cur != r["runtime_tree"]))
+        line += f" · runtime tree {r['runtime_tree'][:10]}"
+        if out["runtime_stale"]:
+            line += f", checkout now {cur[:10]}: stale, the daemon restarts itself on it"
     if files != "unknown" and r.get("version") != files:
         out["restart_pending"] = True
         line = f"restart pending: running {r.get('version')}, files {files} · " + line

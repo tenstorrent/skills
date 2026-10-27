@@ -163,3 +163,130 @@ def test_a_failing_runtime_reload_check_finishes_the_run_as_before(env, monkeypa
     monkeypatch.setattr(runtimeload, "check", broken)
     assert _rl_finish(d, p, rid) == "ok"
     assert not (p.state / service.RESTART_REQUEST).exists()
+
+
+# The daemon records the harness runtime tree it loaded, shows it against the checkout's, and restarts
+# itself when that tree moves on (runtimeload.loaded, identity.summary, runtimeload.tree_moved).
+
+def _rl_harness_daemon(p, monkeypatch):
+    """A daemon whose code was imported from the harness checkout's runtime/ (as the service runs it)."""
+    from ttp import daemon as dmod
+    real = dmod.identity.capture
+
+    monkeypatch.setattr(dmod.identity, "capture",
+                        lambda *a, **k: {**real(*a, **k), "runtime": str(p.harness / "runtime")})
+    d = dmod.Daemon(p.base)
+    monkeypatch.setattr(dmod.identity, "capture", real)   # later daemons run their own runtime again
+    return d
+
+
+def test_the_daemon_start_receipt_records_the_harness_head_and_runtime_tree_it_loaded(env, monkeypatch, tmp_path):
+    from ttp import runtimeload
+    from ttp.daemon import Daemon, start_marker
+    p = make(env)
+    tree = _hgit(p.harness, "rev-parse", "HEAD:runtime").strip()
+    d = _rl_harness_daemon(p, monkeypatch)
+    assert d._loaded == {"harness_head": _hgit(p.harness, "rev-parse", "HEAD").strip(), "runtime_tree": tree}
+    d._mark_start()
+    rec = start_marker(p)["receipt"]
+    assert rec["runtime_tree"] == tree and rec["harness_head"] == d._loaded["harness_head"]
+    # No git, or a runtime imported from elsewhere: null, and the daemon still starts.
+    (tmp_path / "runtime").mkdir()
+    assert runtimeload.loaded(tmp_path, str(tmp_path / "runtime")) == {"harness_head": None, "runtime_tree": None}
+    assert runtimeload.loaded(p.harness, str(tmp_path)) == {"harness_head": None, "runtime_tree": None}
+    d2 = Daemon(p.base)   # the daemon's own runtime: outside the harness
+    assert d2.identity["runtime_tree"] is None and d2.identity["harness_head"] is None
+
+
+def test_status_shows_the_loaded_and_current_runtime_tree_and_marks_a_moved_one_stale(env, monkeypatch):
+    from ttp import identity, web
+    from ttp.project import hostname
+    p = make(env)
+    d = _rl_harness_daemon(p, monkeypatch)
+    loaded = d._loaded["runtime_tree"]
+    (p.state / "heartbeat").write_text(json.dumps({"pid": os.getpid(), "receipt": {**d.identity, "pid": os.getpid()}}))
+    s = identity.summary(p.state, os.getpid(), p.harness / "runtime")
+    assert s["loaded_tree"] == s["current_tree"] == loaded and not s["runtime_stale"]
+    assert f"runtime tree {loaded[:10]}" in s["line"] and "stale" not in s["line"]
+    _commit_in_harness_tree(p.harness, "runtime/ttp/ext_moved.py", "X = 2\n", "a commit by hand")
+    s = identity.summary(p.state, os.getpid(), p.harness / "runtime")
+    now = _hgit(p.harness, "rev-parse", "HEAD:runtime").strip()
+    assert s["runtime_stale"] and s["loaded_tree"] == loaded and s["current_tree"] == now != loaded
+    assert f"checkout now {now[:10]}: stale, the daemon restarts itself on it" in s["line"]
+    assert "ttp " not in s["line"]                     # nothing for the user to run
+    p.db.set_kv("daemon", {"pid": os.getpid(), "host": hostname()})
+    js = web.runtime_receipt(p, p.db)                  # what `ttp status --json` carries
+    assert js["runtime_stale"] and js["current_tree"] == now
+
+
+def test_a_moved_runtime_tree_restarts_the_daemon_once_and_waits_while_a_handoff_is_judged(env, monkeypatch):
+    from ttp import runtimeload, service
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = _rl_harness_daemon(p, monkeypatch)
+    req = p.state / service.RESTART_REQUEST
+    d._restart_on_moved_runtime()
+    assert not req.exists()                            # nothing moved
+    _commit_in_harness_tree(p.harness, "runtime/ttp/ext_up.py", "X = 1\n", "ttp upgrade")
+    now = _hgit(p.harness, "rev-parse", "HEAD:runtime").strip()
+    # Waits while a run's hand-off waits for its own restart, or a push batch is mid-flight.
+    p.db.set_kv(runtimeload.PENDING_KEY, {"7": {"at": 1.0}})
+    d._restart_on_moved_runtime()
+    assert not req.exists()
+    p.db.set_kv(runtimeload.PENDING_KEY, None)
+    p.db.x("INSERT INTO push_batches(id,marker,target,started) VALUES('b1','m','t',?)", (time.time(),))
+    d._restart_on_moved_runtime()
+    assert not req.exists()
+    p.db.x("UPDATE push_batches SET finalized=? WHERE id='b1'", (time.time(),))
+    d._restart_on_moved_runtime()                      # the same request #3873's restart takes
+    info = json.loads(req.read_text())
+    assert now[:10] in info["why"] and d._tree_asked == now
+    d._restart_on_moved_runtime()
+    assert json.loads(req.read_text())["at"] == info["at"]   # asked already: no second request
+    req.unlink()                                       # taken; the restart failed and this daemon runs on
+    d._restart_on_moved_runtime()
+    assert not req.exists()                            # once per tree, never a loop
+    _commit_in_harness_tree(p.harness, "runtime/ttp/ext_up.py", "X = 2\n", "another commit")
+    d._restart_on_moved_runtime()
+    assert req.exists()                                # a new tree asks again
+    req.unlink()
+    d0 = Daemon(p.base)                                # no recorded tree: never asks
+    _commit_in_harness_tree(p.harness, "runtime/ttp/ext_up.py", "X = 3\n", "a third commit")
+    d0._restart_on_moved_runtime()
+    assert not req.exists()
+
+
+def test_whether_a_runs_runtime_change_loaded_is_decided_by_the_recorded_tree_not_file_times(env):
+    from ttp import runtimeload, service
+    from ttp.daemon import Daemon
+    p, d, tid, start, rid = _rl_setup(env)
+    start_tree = _hgit(p.harness, "rev-parse", f"{start}:runtime").strip()
+    end_tree = _hgit(p.harness, "rev-parse", "HEAD:runtime").strip()
+    # File times say loaded (imported after the write); the recorded tree says not: the run waits.
+    d._loaded_at, d._loaded = time.time() + 1, {"harness_head": start, "runtime_tree": start_tree}
+    assert _rl_finish(d, p, rid) == "running"
+    assert (p.state / service.RESTART_REQUEST).exists()
+    # The restarted daemon loaded the run's tree; file times would say it predates the write: judged.
+    (p.state / service.RESTART_REQUEST).unlink()
+    d2 = Daemon(p.base)
+    d2._loaded_at, d2._loaded = time.time() - 3600, {"harness_head": None, "runtime_tree": end_tree}
+    assert _rl_finish(d2, p, rid) == "ok"
+    assert p.db.task(tid)["status"] not in ("running", "blocked")
+    assert str(rid) not in (p.db.kv(runtimeload.PENDING_KEY) or {})
+
+
+def test_a_restarted_daemon_whose_recorded_tree_lacks_the_runs_change_holds_its_handoff(env):
+    from ttp.daemon import Daemon
+    p, d, tid, start, rid = _rl_setup(env)
+    start_tree = _hgit(p.harness, "rev-parse", f"{start}:runtime").strip()
+    d._loaded = {"harness_head": start, "runtime_tree": start_tree}
+    assert _rl_finish(d, p, rid) == "running"
+    _hgit(p.harness, "rm", "-q", "runtime/ttp/ext_local.py")
+    _hgit(p.harness, "commit", "-q", "-m", f"roll back runtime to {start[:10]}: the daemon did not start with it")
+    d2 = Daemon(p.base)
+    d2._loaded_at = time.time() + 1
+    d2._loaded = {"harness_head": None, "runtime_tree": _hgit(p.harness, "rev-parse", "HEAD:runtime").strip()}
+    assert _rl_finish(d2, p, rid) == "ok"
+    t = p.db.task(tid)
+    assert t["status"] == "blocked"
+    assert f"the runtime change did not load, rolled back to {start[:10]}" in t["blocked_reason"]
