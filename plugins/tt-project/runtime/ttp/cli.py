@@ -7812,6 +7812,9 @@ def cmd_doctor(a) -> None:
             print(f"delivery.push_checks: {m} matches no file on {ref}; every push would fail on it")
     if line := checks_env_line(p):
         print(line)
+    from . import initiator
+    if line := initiator.doctor_line(p):
+        print(line)
     from . import upstream
     for line in upstream.doctor_lines(p):
         print(line)

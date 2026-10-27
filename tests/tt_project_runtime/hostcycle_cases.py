@@ -832,10 +832,10 @@ def _initiator_reboot(p, tmp_path, monkeypatch, journal, last_heartbeat_ago=600)
     ((0, "Oct 25 21:59:59 testhost systemd-logind[812]: System is powering down.\n", ""),
      "Initiator: a request to systemd-logind that names no user (journal: System is powering down.)."),
     ((0, "", ""), "Initiator: unknown."),
-    (_HIDDEN, "Initiator: unknown (journal not readable)."),
+    (_HIDDEN, "Initiator: unknown (journal not readable: user not in systemd-journal and no passwordless sudo)."),
     ((1, "", "No journal files were opened due to insufficient permissions.\n"),
-     "Initiator: unknown (journal not readable)."),
-    (None, "Initiator: unknown (journal not readable)."),   # journalctl missing or timed out
+     "Initiator: unknown (journal not readable: user not in systemd-journal and no passwordless sudo)."),
+    (None, "Initiator: unknown (journal not readable: journalctl did not answer, missing or timed out)."),   # journalctl missing or timed out
 ])
 def test_the_reboot_notice_names_who_started_the_shutdown_from_the_journal(env, tmp_path, monkeypatch, journal, said):
     p = make(env)
@@ -879,7 +879,8 @@ def test_the_reboot_notice_names_a_ledger_entry_recorded_just_before_the_shutdow
     feed, record, got = _initiator_reboot(p, tmp_path, monkeypatch, _HIDDEN)
     assert got == {"source": "ledger", "by": "other", "entry": hit["id"],
                    "text": f"machine-change ledger entry #{hit['id']} by project other: "
-                           f"power-cycled the host via the BMC: chips off the bus"}, got
+                           f"power-cycled the host via the BMC: chips off the bus",
+                   "unreadable": "user not in systemd-journal and no passwordless sudo"}, got
     assert f"Initiator: machine-change ledger entry #{hit['id']} by project other: power-cycled" in feed \
         and "(abrupt;" in feed, feed
 
@@ -899,7 +900,8 @@ def test_the_initiator_search_never_raises_and_never_waits_long(env, monkeypatch
     monkeypatch.setattr(hostcycle, "planned", boom)
     monkeypatch.setattr(machines, "here", boom)
     assert initiator.find(p, "0123456789abcdef0123456789abcdef", time.time(), None) == \
-        {"source": "unknown", "text": "unknown (journal not readable)"}
+        {"source": "unknown", "text": "unknown (journal not readable: journalctl did not answer, missing or timed out)",
+         "unreadable": "journalctl did not answer, missing or timed out"}
     (cmd, timeout), = seen
     assert cmd[:3] == ["journalctl", "-b", "0123456789abcdef0123456789abcdef"] and timeout == initiator.JOURNAL_TIMEOUT_S
     monkeypatch.setattr(initiator.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()))
@@ -922,3 +924,131 @@ def test_journal_lines_that_do_not_stop_the_host_name_no_initiator():
            "Oct 25 10:09:00 testhost systemd-logind[2]: Power key pressed.\n")
     assert initiator.parse(two)[0] == "the power key (journal)"
     assert initiator.parse(two.splitlines()[0])[0] == "someuser ran `shutdown -h now` via sudo (journal)"
+
+
+# The previous boot's journal as JSON (journalctl -o json), generic names only: a system service that
+# power-cycles the host, and how the read falls back to `sudo -n` when this user sees only its own entries.
+_T0 = 1_760_000_000
+
+
+def _j(dt, msg, unit="", ident="", uid="0", about=""):
+    e = {"__REALTIME_TIMESTAMP": str(int((_T0 + dt) * 1e6)), "MESSAGE": msg, "_UID": uid}
+    for k, v in (("_SYSTEMD_UNIT", unit), ("SYSLOG_IDENTIFIER", ident), ("UNIT", about)):
+        if v:
+            e[k] = v
+    return json.dumps(e)
+
+
+_BROKER = "example-broker.service"
+_CYCLE = "\n".join([
+    _j(-900, "power-cycle requested long ago", _BROKER, "example-broker"),   # outside the 10 min window
+    _j(-120, "job 41 finished", _BROKER, "example-broker"),
+    _j(-30, "Started example-broker-recover.service - Example recovery.", "init.scope", "systemd",
+       about="example-broker-recover.service"),
+    _j(-5, "power-cycle a hung shutdown: running example-power-cycle --now", "example-broker-recover.service",
+       "example-recover"),
+    _j(-1, "nothing to do", "systemd-timesyncd.service", "systemd-timesyncd"),
+    _j(0, "System is rebooting.", "systemd-logind.service", "systemd-logind"),
+    _j(3, "Stopping example-broker.service - Example broker...", "init.scope", "systemd", about=_BROKER),
+    _j(9, "Reached target reboot.target - System Reboot.", "init.scope", "systemd"),
+]) + "\n"
+_OWN_ONLY = (0, _j(-60, "my own user unit line", "user@1000.service", "example-user-app", uid=str(os.getuid())) + "\n",
+             "Hint: You are currently not seeing messages from other users and the system.\n")
+
+
+def test_the_reboot_notice_names_the_unit_that_power_cycled_the_host_from_a_readable_journal(env, tmp_path,
+                                                                                               monkeypatch):
+    from ttp import initiator
+    p = make(env)
+    monkeypatch.setattr(initiator, "run_sudo_journal", lambda boot: pytest.fail("the user's read was enough"))
+    feed, record, got = _initiator_reboot(p, tmp_path, monkeypatch, (0, _CYCLE, ""))
+    said = ("Initiator: example-broker-recover.service (power-cycle a hung shutdown: running example-power-cycle "
+            "--now).")
+    assert said in feed and got == {"source": "journal", "text": said[len("Initiator: "):-1]}, (feed, got)
+    assert initiator.doctor_line(p) == ""
+    # Logged text that reads like a journalctl hint is no hint: the read still counts as the system's.
+    noisy = _j(-9, "open /dev/example0: permission denied; no journal files were found", _BROKER, "x") + "\n"
+    assert initiator.read("boot-0", (0, noisy + _CYCLE, ""), False)[1:] == ("user", "")
+    # A 'Reached target reboot.target' line alone is a marker too; with no stop words before it, the unit
+    # started nearest before it stands in, and a stop line older than the window names nothing.
+    lines = _CYCLE.splitlines()
+    quiet = "\n".join(line for line in lines if "hung shutdown" not in line and "System is rebooting" not in line)
+    assert initiator.parse(quiet, full=True) == (
+        None, "example-broker-recover.service (Started example-broker-recover.service - Example recovery.)")
+    assert initiator.parse("\n".join([lines[0], lines[1], lines[5]]), full=True) == \
+        (None, f"{_BROKER} (job 41 finished)")
+
+
+def test_a_permission_limited_journal_is_read_through_sudo_n_never_prompting(env, tmp_path, monkeypatch):
+    import subprocess as sp
+    from ttp import initiator
+    p = make(env)
+    monkeypatch.delenv("TTP_TEST_NO_JOURNAL")
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append((cmd, kw.get("timeout"), kw.get("stdin")))
+        if cmd[0] == "journalctl":
+            return sp.CompletedProcess(cmd, *_OWN_ONLY)
+        if cmd == ["sudo", "-n", "true"]:
+            return sp.CompletedProcess(cmd, 0, "", "")
+        return sp.CompletedProcess(cmd, 0, _CYCLE, "")
+    monkeypatch.setattr(initiator.subprocess, "run", run)
+    got = initiator.find(p, "0123456789abcdef0123456789abcdef", time.time(), None)
+    assert got["source"] == "journal" and got["read"] == "sudo" \
+        and got["text"].startswith("example-broker-recover.service (power-cycle a hung shutdown"), got
+    user, check, sudo = (c[0] for c in calls)
+    assert user[:3] == ["journalctl", "-b", "0123456789abcdef0123456789abcdef"] and "json" in user
+    assert check == ["sudo", "-n", "true"] and sudo == ["sudo", "-n", *user]
+    assert all(t <= 10 and stdin == sp.DEVNULL for _, t, stdin in calls), calls   # bounded, never prompts
+    # Only the user's own entries and no hint is limited too; no passwordless sudo: one silent probe, no read.
+    calls.clear()
+    own = (0, _OWN_ONLY[1], "")
+    monkeypatch.setattr(initiator.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or sp.CompletedProcess(
+        cmd, *(own if cmd[0] == "journalctl" else (1, "", "sudo: a password is required\n"))))
+    got = initiator.find(p, "boot-0", time.time(), None)
+    assert [c[:3] for c in calls] == [["journalctl", "-b", "-1"], ["sudo", "-n", "true"]], calls
+    assert got["text"] == "unknown (journal not readable: user not in systemd-journal and no passwordless sudo)"
+    # sudo works but its read is refused: said so, never retried with a password.
+    monkeypatch.setattr(initiator.subprocess, "run", lambda cmd, **kw: sp.CompletedProcess(
+        cmd, *(own if cmd[0] == "journalctl" else (0, "", "") if cmd[-1] == "true"
+               else (1, "", "sudo: a password is required\n"))))
+    assert initiator.find(p, "boot-0", time.time(), None)["unreadable"] == \
+        "user not in systemd-journal, and sudo -n journalctl did not read it either"
+
+
+def test_an_unreadable_journal_gives_its_reason_once_in_doctor_not_a_command_to_run(env, tmp_path, monkeypatch):
+    from ttp import initiator
+    p = make(env)
+    feed, record, got = _initiator_reboot(p, tmp_path, monkeypatch, _OWN_ONLY)
+    why = "user not in systemd-journal and no passwordless sudo"
+    assert f"Initiator: unknown (journal not readable: {why})." in feed and feed.count("Initiator:") == 1, feed
+    assert got == {"source": "unknown", "text": f"unknown (journal not readable: {why})", "unreadable": why}
+    line = initiator.doctor_line(p)
+    assert line.startswith(f"reboot causes: the last reboot's journal was not readable ({why}).") \
+        and "systemd-journal group" in line and "setup-box" in line and "`" not in line, line
+    r = subprocess.run([sys.executable, "-m", "ttp", "doctor", p.name], capture_output=True, text=True,
+                       env={**os.environ, "PYTHONPATH": str(RUNTIME)}, timeout=60)
+    assert r.stdout.count("reboot causes:") == 1, r.stdout + r.stderr
+    # A missing persistent journal is no group problem: sudo is not tried and no group fix is offered.
+    stored = initiator.find(p, "boot-0", None, None, journal=(1, "", "Specifying boot ID or boot offset has no "
+                                                                      "effect, no persistent journal was found.\n"),
+                            sudo=(0, _CYCLE, ""))   # sudo would read it: never asked
+    assert stored == {"source": "unknown", "unreadable": "no persistent journal kept for the previous boot",
+                      "text": "unknown (journal not readable: no persistent journal kept for the previous boot)"}
+    p.db.set_kv("boot_prev", {**p.db.kv("boot_prev"), "initiator": stored})
+    assert "(no persistent journal" in initiator.doctor_line(p) and "group" not in initiator.doctor_line(p)
+
+
+def test_a_boot_with_no_shutdown_marker_says_no_clean_shutdown_and_names_the_last_unit_lines(env, tmp_path,
+                                                                                             monkeypatch):
+    from ttp import initiator
+    p = make(env)
+    cut = "\n".join(line for line in _CYCLE.splitlines()[:3]) + "\n" + _j(-2, "kernel line", ident="kernel") + "\n"
+    feed, record, got = _initiator_reboot(p, tmp_path, monkeypatch, (0, cut, ""))
+    said = (f"Initiator: no clean shutdown logged (power loss, hard reset or watchdog); last unit lines: "
+            f"{_BROKER}: power-cycle requested long ago; {_BROKER}: job 41 finished.")
+    assert said in feed and got["source"] == "journal", (feed, got)
+    # No unit lines at all: the wording alone. A limited read never claims an unclean boot.
+    assert initiator.parse(_j(-2, "kernel line", ident="kernel"), full=True) == (None, initiator.NO_SHUTDOWN)
+    assert initiator.parse(cut, full=False) == (None, None)
