@@ -1512,7 +1512,7 @@ def test_check_priority_invalid_values_fall_back_to_the_defaults(env, monkeypatc
     assert got == ["nice", "-n", "10", "ionice", "-c3", "pytest"]
     from ttp import project, testslots
     project.set_account_setting("checks.ionice", "best-effort:9")
-    assert testslots.ionice_args() == ["-c2", "-n7"]
+    assert testslots.ionice_args() == ["-c3"]
 
 
 def test_every_checks_key_the_runtime_reads_is_an_account_key_and_settable(env):

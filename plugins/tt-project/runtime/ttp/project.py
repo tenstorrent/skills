@@ -490,11 +490,13 @@ PROVIDER_KEYS = {"tiers", "plugin_dirs", "worker_isolation", "mcp_servers", "mcp
 def _known_keys(path: list[str]) -> set[str] | None:
     """The keys allowed at `path` in project.json, or None when anything goes there."""
     if not path:
-        return set(DEFAULT_CONFIG) | META_KEYS
+        return set(DEFAULT_CONFIG) | META_KEYS | {"checks"}
     if path[0] in OPEN_SECTIONS or path[0] in META_KEYS:
         return None
     if path[0] == "providers":
         return {"claude", "codex", "cursor", "fake", "chat"} if len(path) == 1 else PROVIDER_KEYS if len(path) == 2 else None
+    if path == ["checks"]:
+        return {"nice", "ionice"}
     if len(path) == 1 and isinstance(DEFAULT_CONFIG.get(path[0]), dict):
         return set(DEFAULT_CONFIG[path[0]]) | EXTRA_KEYS.get(path[0], set())
     return None
