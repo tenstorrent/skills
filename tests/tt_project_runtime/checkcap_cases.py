@@ -1057,6 +1057,80 @@ def test_ttp_checks_waits_for_its_project_s_other_full_checks(env, tmp_path, mon
         "with the other run gone it runs, and frees the project's suite lock at its end"
 
 
+def test_detached_checks_waiting_for_their_project_s_full_checks_are_queued_and_stop_once_their_task_ended(
+        env, tmp_path, monkeypatch, capsys):
+    """The per-project suite-lock wait is told like the checks-slot wait: CHECKS_SLOT_WAIT names it, the
+    `--result` probe says queued, and the daemon's cancel for an ended task ends it with nothing run."""
+    from ttp import cli, testslots
+    from ttp.daemon import Daemon
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    monkeypatch.setenv("TTP_TASK", "7")
+    hold = testslots.suite_hold(p.name)
+    assert hold.files
+    ran = tmp_path / "ran"
+    try:
+        cli.main(["checks", "--detach", "--", "sh", "-c", f"touch {ran}"])
+        assert _wait_for(lambda: (run / cli.CHECKS_SLOT_WAIT).exists()), (run / "checks.out").read_text()
+        info = json.loads((run / cli.CHECKS_PID).read_text())
+        assert json.loads((run / cli.CHECKS_SLOT_WAIT).read_text())["pid"] == info["pid"]
+        capsys.readouterr()
+        assert _ttp("checks", "--result", str(run)) == 1
+        assert "queued for a host-wide checks slot" in capsys.readouterr().out
+        tid = p.db.add_task("t", "s", kind="code")
+        p.db.x("UPDATE tasks SET status='done', updated=? WHERE id=?", (time.time(), tid))
+        p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+               (tid, "worker", "fake", time.time(), "ok", str(run)))
+        Daemon(p.base).reap_waiting_checks(every_s=0)
+        assert _wait_for(lambda: (run / cli.CHECKS_RC).exists()), "the cancel did not end the wait"
+    finally:
+        hold.close()
+    assert (run / cli.CHECKS_RC).read_text().strip() == "1" and not ran.exists()
+    assert not (run / cli.CHECKS_SLOT_WAIT).exists()
+    assert f"not run: stopped waiting for a host-wide checks slot: task #{tid} ended (done)" in \
+        (run / "checks.log").read_text()
+
+
+def test_foreground_checks_waiting_for_the_suite_lock_then_a_slot_hand_over_within_one_foreground_wait(
+        env, tmp_path, monkeypatch, capsys):
+    """Both waits together end after FOREGROUND_WAIT_S, and the suite wait is recorded as a lock wait
+    (outside the run's wall clock)."""
+    from ttp import checkcap, cli, locks, testslots
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 2.0)
+    detached, given = [], []
+    monkeypatch.setattr(cli, "_checks_detach", lambda *a, **k: detached.append(1))
+    acquire = checkcap.acquire
+
+    def spy(*a, **k):
+        given.append(a[4] if len(a) > 4 else k.get("max_wait_s"))
+        return acquire(*a, **k)
+    monkeypatch.setattr(checkcap, "acquire", spy)
+    holder = _cap_holder("other")
+    hold = testslots.suite_hold(p.name)
+    timer = threading.Timer(1.0, hold.close)   # the other run ends 1 s into the suite wait
+    suite_hold = testslots.suite_hold
+
+    def held(name, tell, *a, **k):
+        return suite_hold(name, lambda line: (tell(line), timer.ident or timer.start()), *a, **k)
+    monkeypatch.setattr(testslots, "suite_hold", held)
+    seen = tmp_path / "seen"
+    try:
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--", "sh", "-c", f"touch {seen}"])
+    finally:
+        timer.cancel()
+        hold.close()
+        holder.kill()
+        holder.wait()
+    assert e.value.code == 75 and detached == [1] and not seen.exists()
+    assert len(given) == 1 and given[0] is not None and given[0] <= 1.0, \
+        f"the checks slot got {given} of the foreground wait after a 1 s suite wait"
+    waits = json.loads((run / locks.WAITS_FILE).read_text())
+    assert waits and all(w["end"] is not None and w["end"] - w["start"] >= 1.0 for w in waits.values()), waits
+
 def test_a_pytest_n_above_the_budget_is_lowered_with_a_line_saying_so_and_refused_in_a_worker_shell(env, monkeypatch):
     from ttp import hook, push, testslots
     out = testslots.clamped("cd x && pytest -n 64 tests", 4)

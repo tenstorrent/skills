@@ -3137,12 +3137,18 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     # One full checks run per project at a time (testslots.suite_hold), taken before the checks slot so
     # a second run of the project never holds one of the host's slots while it waits.
     from . import testslots
-    suite = testslots.suite_hold(p.name if p else None, tell, checkcap.FOREGROUND_WAIT_S if foreground and p else None)
-    if suite is None:
-        return None
+    # Its wait is told, recorded and cancellable as the checks slot's is; the foreground wait for both
+    # together ends after FOREGROUND_WAIT_S.
+    suite = None
     try:
+        suite = testslots.suite_hold(p.name if p else None, tell,
+                                     checkcap.FOREGROUND_WAIT_S if foreground and p else None, waiting,
+                                     lambda: _checks_cancelled(run_dir))
+        if suite is None:
+            return None
+        left = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
         slot = checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell, waiting,
-                                checkcap.FOREGROUND_WAIT_S if foreground and p else None, arrived,
+                                left, arrived,
                                 p.name if p else None, prio, same, done, lambda: _checks_cancelled(run_dir),
                                 p.state if p else None, owns)
         if slot is None or slot.served:
@@ -3160,11 +3166,15 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         slot.tests.files += suite.files   # the suite lock ends with the run's test slots
         return slot
     except checkcap.Cancelled as e:
+        if suite is not None:
+            suite.close()
         said = f"not run: stopped waiting for a host-wide checks slot: {e}"
         out.write(f"ttp checks: {said}\n")
         out.flush()
         die(f"ttp checks: {said}", 1)
     except checkcap.Unavailable as e:
+        if suite is not None:
+            suite.close()
         out.write(f"ttp checks: {e}\n")
         out.flush()
         die(f"ttp checks: {e}")
