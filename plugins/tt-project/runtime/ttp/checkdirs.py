@@ -9,6 +9,14 @@ no migration. Only owned, unlocked check allocations are reclaimed; nothing else
 A check's TMPDIR is a short dir (shorttmp) its owner.json records, so an AF_UNIX socket a test
 binds beneath it stays within the path limit; it goes with the allocation. Without a usable
 short root the check keeps checks-tmp inside the allocation.
+
+The folder-wide lock (check-runs/checks-tmp.lock) covers only short steps: publishing a new
+allocation, and claiming an old one by renaming it to a trash name. Removing the tree runs after
+it is released, so a slow or stuck removal never holds up new checks. new() waits for that lock
+at most WAIT_S seconds, naming its holder once, then allocates without it: a fresh uuid name made
+with mkdir is unique on its own, and cleanup skips an allocation until its owner record names a
+live owner. Removal never follows a link and never descends into another filesystem (a mount
+point, such as /sys, /proc or /dev bound or linked into a check's scratch).
 """
 from __future__ import annotations
 
@@ -18,11 +26,16 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
+import time
 import uuid
 
 FOLDER = 'check-runs'
 SCRATCH, LOCK = 'checks-tmp', 'checks-tmp.lock'
 OWNER = 'owner.json'
+TRASH = '.trash-'   # an allocation claimed for removal; removed with no folder lock held
+WAIT_S = 5.0        # longest wait for the folder-wide lock
+PSEUDO = ('/proc', '/sys', '/dev')   # their filesystems are never descended into on removal
 
 
 @contextmanager
@@ -64,14 +77,30 @@ def writable(value, *, create=False) -> str:
 
 def new(state: Path, owner: Path | None = None) -> Path:
     from . import shorttmp
-    from .runner import boot_id, proc_start
     folder = state / FOLDER
+    tmp = shorttmp.make()
+    try:
+        name = _publish(folder, owner, tmp)
+    except BaseException:
+        shorttmp.remove(tmp)
+        raise
+    return folder / name
+
+
+def _publish(folder: Path, owner: Path | None, tmp) -> str:
+    from .runner import boot_id, proc_start
     with directory(folder, create=True) as fd:
-        # Publish the creator identity before recovery can inspect this allocation.
-        with _take_fd(fd, wait=True):
-            name = uuid.uuid4().hex
-            os.mkdir(name, mode=0o700, dir_fd=fd)
-            tmp = shorttmp.make()
+        # Publish the creator identity before recovery can inspect this allocation. A lock
+        # still held after WAIT_S does not stop it: the name is unique (uuid, mkdir).
+        with _catalogue(fd, WAIT_S, folder / LOCK):
+            for attempt in range(8):   # mkdir, not the lock, makes the name this run's own
+                name = uuid.uuid4().hex
+                try:
+                    os.mkdir(name, mode=0o700, dir_fd=fd)
+                    break
+                except FileExistsError:
+                    if attempt == 7:
+                        raise
             with directory(folder / name) as child:
                 out = os.open(OWNER, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=child)
                 with os.fdopen(out, 'w') as f:
@@ -82,7 +111,7 @@ def new(state: Path, owner: Path | None = None) -> Path:
                     os.fsync(f.fileno())
                 os.fsync(child)
             os.fsync(fd)
-    return folder / name
+    return name
 
 
 def reports(path: Path) -> Path:
@@ -171,6 +200,64 @@ def take(path: Path):
         return _take_fd(fd)
 
 
+@contextmanager
+def _catalogue(fd: int, bound: float, where=LOCK):
+    """The folder-wide lock, waited for at most `bound` seconds (none for 0); yields None when it
+    stays busy. Its holder's pid is written in the lock file, so a waiter can name it."""
+    deadline, said = time.monotonic() + bound, False
+    while (f := _take_fd(fd)) is None:
+        if bound <= 0:
+            break
+        holder = _holder(fd)
+        if not said:
+            print(f'ttp checks: {where} is busy: waiting for pid {holder or "(unknown)"} '
+                  f'(up to {bound:g} s)', file=sys.stderr, flush=True)
+            said = True
+        if time.monotonic() >= deadline:
+            print(f'ttp checks: pid {holder or "(unknown)"} still holds {where} after {bound:g} s; '
+                  'going on without it', file=sys.stderr, flush=True)
+            break
+        time.sleep(0.05)
+    if f is None:
+        yield None
+        return
+    try:
+        try:
+            f.truncate()
+            f.write(json.dumps({'pid': os.getpid()}))
+            f.flush()
+        except OSError:
+            pass
+        yield f
+    finally:
+        try:
+            f.seek(0)
+            f.truncate()
+        except OSError:
+            pass
+        f.close()
+
+
+def _holder(fd: int) -> int | None:
+    """The pid holding the folder lock: from the lock file, else (Linux) /proc/locks."""
+    pid = _read(fd, LOCK).get('pid')
+    if isinstance(pid, int) and pid > 0:
+        return pid
+    try:
+        st = os.stat(LOCK, dir_fd=fd, follow_symlinks=False)
+        want = f':{st.st_ino}'
+        with open('/proc/locks') as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) > 5 and parts[1] == 'FLOCK' and parts[5].endswith(want) \
+                        and int(parts[5].split(':')[0], 16) == os.major(st.st_dev) \
+                        and int(parts[5].split(':')[1], 16) == os.minor(st.st_dev):
+                    return int(parts[4])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 def _take_fd(fd, *, wait=False):
     lock_fd = os.open(LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=fd)
     f = os.fdopen(lock_fd, 'r+')
@@ -189,13 +276,39 @@ def _take_fd(fd, *, wait=False):
         raise
 
 
-def _remove(parent: int, name: str) -> None:
-    """Remove only through pinned directory descriptors (also on Python 3.9)."""
+def _lstat(name: str, fd: int) -> os.stat_result:
+    return os.stat(name, dir_fd=fd, follow_symlinks=False)
+
+
+def _pseudo() -> set:
+    devs = set()
+    for p in PSEUDO:
+        try:
+            devs.add(os.stat(p).st_dev)
+        except OSError:
+            pass
+    return devs
+
+
+def _remove(parent: int, name: str, *, last: str | None = None) -> None:
+    """Remove only through pinned directory descriptors (also on Python 3.9). Links are unlinked,
+    never followed; a directory on another filesystem (a mount point, or /proc, /sys, /dev) is
+    left in place, never descended into. `last` (a top-level name) is unlinked after the rest."""
+    _clear(parent, name, None, _pseudo(), last)
+
+
+def _clear(parent: int, name: str, dev, pseudo: set, last: str | None = None) -> None:
     fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
     try:
-        for entry in os.listdir(fd):
-            if stat.S_ISDIR(os.stat(entry, dir_fd=fd, follow_symlinks=False).st_mode):
-                _remove(fd, entry)
+        here = os.fstat(fd).st_dev
+        if here in pseudo or (dev is not None and here != dev):
+            raise OSError(f'{name}: on another filesystem; not removed')
+        for entry in sorted(os.listdir(fd), key=lambda e: e == last):
+            st = _lstat(entry, fd)
+            if stat.S_ISDIR(st.st_mode):
+                if st.st_dev != here or st.st_dev in pseudo:
+                    continue   # a mount point: left in place (the rmdir below then fails)
+                _clear(fd, entry, here, pseudo)
             else:
                 os.unlink(entry, dir_fd=fd)
     finally:
@@ -247,15 +360,17 @@ def _reserved(fd: int, path: Path) -> bool:
 
 
 def cleanup(path: Path, *, whole=False, wait=False) -> None:
+    """Claim an unreserved allocation under the folder lock (a rename to a trash name, waiting up
+    to WAIT_S with `wait`), then remove it with that lock released."""
     if not whole or not _allocation(path):
         return
     try:
         with directory(path.parent) as parent:
-            # Serialize allocation publication and removal; never follow a renamed path.
-            catalogue = _take_fd(parent, wait=wait)
-            if catalogue is None:
-                return
-            try:
+            claimed = False
+            # Serialize allocation publication and claims; never follow a renamed path.
+            with _catalogue(parent, WAIT_S if wait else 0, path.parent / LOCK) as catalogue:
+                if catalogue is None:
+                    return
                 with directory(path) as fd:
                     if not _read(fd, OWNER):
                         return
@@ -264,20 +379,43 @@ def cleanup(path: Path, *, whole=False, wait=False) -> None:
                         return
                     try:
                         if not _reserved(fd, path):
-                            from . import shorttmp
-                            shorttmp.remove(_read(fd, OWNER).get('tmp'))
-                            _remove(parent, path.name)
-                            try:
-                                with directory(reports(path).parent) as report_fd:
-                                    os.rmdir(path.name, dir_fd=report_fd)  # keep actual reports
-                            except OSError:
-                                pass
+                            os.rename(path.name, TRASH + path.name, src_dir_fd=parent, dst_dir_fd=parent)
+                            os.fsync(parent)
+                            claimed = True
                     finally:
                         guard.close()
-            finally:
-                catalogue.close()
+            if claimed:
+                _discard(parent, path.parent, TRASH + path.name)
     except OSError:
         pass   # unsafe, busy or already gone; recovery must never follow it elsewhere
+
+
+def _discard(parent: int, folder: Path, trash: str) -> None:
+    """Remove a claimed allocation, its short temp dir and its empty report dir; no folder lock is
+    held. Its own lock keeps a second remover (recovery) out until the rest is gone."""
+    from . import shorttmp
+    try:
+        fd = os.open(trash, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    except OSError:
+        return
+    try:
+        guard = _take_fd(fd)
+        if guard is None:
+            return
+        try:
+            shorttmp.remove(_read(fd, OWNER).get('tmp'))
+            _remove(parent, trash, last=LOCK)
+        finally:
+            guard.close()
+    except OSError:
+        return
+    finally:
+        os.close(fd)
+    try:
+        with directory(reports(folder / trash[len(TRASH):]).parent) as report_fd:
+            os.rmdir(trash[len(TRASH):], dir_fd=report_fd)  # keep actual reports
+    except OSError:
+        pass
 
 
 def recover(state: Path, runs: Path) -> None:
@@ -285,6 +423,10 @@ def recover(state: Path, runs: Path) -> None:
         with directory(state / FOLDER) as fd:
             names = os.listdir(fd)
         for name in names:
-            cleanup(state / FOLDER / name, whole=True)
+            if name.startswith(TRASH) and _allocation(state / FOLDER / name[len(TRASH):]):
+                with directory(state / FOLDER) as fd:
+                    _discard(fd, state / FOLDER, name)   # a removal a killed run left unfinished
+            else:
+                cleanup(state / FOLDER / name, whole=True)
     except OSError:
         pass

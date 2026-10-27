@@ -44183,6 +44183,177 @@ def test_check_scratch_recovery_preserves_legacy_allocation(env, finished):
     assert not checkdirs.reports(output).exists(), 'legacy allocations are not migrated'
 
 
+def _folder_holder(folder, *, record):
+    """Another process holding check-runs' folder lock, as a slow cleanup would; `record` writes its
+    pid in the lock file (this runtime), else it is a bare flock (an older runtime's holder)."""
+    code = ("import os, sys, time, fcntl; sys.path.insert(0, sys.argv[1]); from ttp import checkdirs\n"
+            "fd = os.open(sys.argv[2], os.O_RDONLY | os.O_DIRECTORY)\n"
+            "if sys.argv[3] == '1':\n"
+            "    cm = checkdirs._catalogue(fd, 0); assert cm.__enter__() is not None\n"
+            "else:\n"
+            "    f = checkdirs._take_fd(fd); assert f is not None\n"
+            "print('held', flush=True); time.sleep(120)\n")
+    folder.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.Popen([sys.executable, '-c', code, str(RUNTIME), str(folder), '1' if record else '0'],
+                            stdout=subprocess.PIPE, text=True)
+    assert proc.stdout.readline().strip() == 'held'
+    return proc
+
+
+def _within(fn, seconds=15):
+    """fn's result, or a test failure (not a hang) when it blocks past `seconds`."""
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as Late
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        return pool.submit(fn).result(timeout=seconds)
+    except Late:
+        pytest.fail(f'blocked for more than {seconds} s')
+    finally:
+        pool.shutdown(wait=False)
+
+
+@pytest.mark.parametrize('record', [True, False])
+def test_check_scratch_new_never_hangs_on_a_held_folder_lock_and_names_its_holder(env, monkeypatch, capsys, record):
+    """A run whose cleanup held check-runs/checks-tmp.lock for over an hour hung every
+    `ttp checks --detach` behind it: new() now waits WAIT_S at most, says once whom it waits for,
+    then allocates without the lock (mkdir makes the name its own)."""
+    from ttp import checkdirs
+    if not record and not os.path.exists('/proc/locks'):
+        pytest.skip('naming a bare flock holder reads /proc/locks (Linux)')
+    p = make(env)
+    monkeypatch.setattr(checkdirs, 'WAIT_S', 0.5)
+    holder = _folder_holder(p.state / checkdirs.FOLDER, record=record)
+    try:
+        started = time.monotonic()
+        output = _within(lambda: checkdirs.new(p.state))
+        assert time.monotonic() - started < 5
+    finally:
+        holder.kill()
+        holder.wait()
+    assert json.loads((output / checkdirs.OWNER).read_text())['pid'] == os.getpid()
+    err = capsys.readouterr().err
+    assert err.count('waiting for pid') == 1 and f'waiting for pid {holder.pid} ' in err, err
+    assert f'pid {holder.pid} still holds' in err, err
+    checkdirs.finish(output)
+    assert not output.exists()
+
+
+def test_check_scratch_cleanup_removes_trees_without_the_folder_lock(env, monkeypatch):
+    """Removing an old allocation (slow, or stuck in uninterruptible IO) never holds the folder-wide
+    lock: a new allocation goes ahead while it runs, without waiting."""
+    from concurrent.futures import ThreadPoolExecutor
+    from ttp import checkdirs
+    p = make(env)
+    output = checkdirs.new(p.state)
+    checkdirs.environment(output, {})
+    (output / checkdirs.SCRATCH / 'big').write_text('x')
+    folder = output.parent
+    removing, release, free = threading.Event(), threading.Event(), []
+    real = checkdirs._remove
+
+    def slow(parent, name, **kw):
+        with checkdirs.directory(folder) as fd:
+            probe = checkdirs._take_fd(fd)
+            free.append(probe is not None)
+            if probe is not None:
+                probe.close()
+        removing.set()
+        assert release.wait(30)
+        return real(parent, name, **kw)
+
+    monkeypatch.setattr(checkdirs, '_remove', slow)
+    monkeypatch.setattr(checkdirs, 'WAIT_S', 30)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        done = pool.submit(checkdirs.finish, output)
+        try:
+            assert removing.wait(10)
+            started = time.monotonic()
+            other = _within(lambda: checkdirs.new(p.state))
+            assert time.monotonic() - started < 2, 'a new allocation waited for a removal'
+        finally:
+            release.set()
+        done.result(timeout=10)
+    assert free and all(free), 'removal ran with the folder-wide lock held'
+    assert not output.exists() and not (folder / (checkdirs.TRASH + output.name)).exists()
+    assert other.is_dir()
+    monkeypatch.setattr(checkdirs, '_remove', real)
+    checkdirs.finish(other)
+    assert not other.exists()
+
+
+def test_check_scratch_removal_never_follows_links_or_enters_other_filesystems(env, tmp_path, monkeypatch):
+    """Scratch may hold a link into a device tree (a sysfs class/<driver> tree reached through
+    symlinks) or a mount of /sys or /proc: removal unlinks the link and leaves the mount alone,
+    never reading or removing what is beneath them."""
+    from ttp import checkdirs
+    p = make(env)
+    standin = tmp_path / 'sys'
+    device = standin / 'class' / 'tenstorrent' / '0'
+    device.mkdir(parents=True)
+    (device / 'keep').write_text('device attribute')
+    output = checkdirs.new(p.state)
+    checkdirs.environment(output, {})
+    scratch = output / checkdirs.SCRATCH
+    (scratch / 'class').mkdir()
+    (scratch / 'class' / 'tenstorrent').symlink_to(standin / 'class' / 'tenstorrent', target_is_directory=True)
+    (scratch / 'sys-link').symlink_to(standin, target_is_directory=True)
+    for name in ('sys', 'mnt'):
+        (scratch / name / 'deep').mkdir(parents=True)
+        (scratch / name / 'deep' / 'keep').write_text('beneath a mount')
+    sysdev, real = os.stat('/sys' if os.path.isdir('/sys') else '/dev').st_dev, checkdirs._lstat
+
+    def lstat(name, fd):
+        st = real(name, fd)
+        if name in ('sys', 'mnt') and stat.S_ISDIR(st.st_mode):
+            fields = list(st)
+            fields[2] = sysdev if name == 'sys' else st.st_dev + 1   # /sys bound in; another filesystem
+            return os.stat_result(fields)
+        return st
+
+    monkeypatch.setattr(checkdirs, '_lstat', lstat)
+    checkdirs.finish(output)
+    assert (device / 'keep').read_text() == 'device attribute'
+    trash = output.parent / (checkdirs.TRASH + output.name) / checkdirs.SCRATCH
+    for name in ('sys', 'mnt'):
+        assert (trash / name / 'deep' / 'keep').read_text() == 'beneath a mount'
+    assert not os.path.lexists(trash / 'sys-link') and not os.path.lexists(trash / 'class' / 'tenstorrent')
+    monkeypatch.setattr(checkdirs, '_lstat', real)   # the mounts are gone: recovery finishes the removal
+    checkdirs.recover(p.state, p.runs)
+    assert not trash.parent.exists() and (device / 'keep').exists()
+
+
+def test_check_scratch_concurrent_allocations_never_share_a_dir(env, monkeypatch):
+    """Without the folder lock (still held after WAIT_S), and even when two runs draw the same
+    name, mkdir gives each allocation a dir of its own."""
+    from concurrent.futures import ThreadPoolExecutor
+    from ttp import checkdirs
+    p = make(env)
+    monkeypatch.setattr(checkdirs, 'WAIT_S', 0.2)
+    real, drawn, lock = checkdirs.uuid.uuid4, [], threading.Lock()
+
+    class Same:
+        hex = 'c' * 32
+
+    def uuid4():
+        with lock:
+            drawn.append(1)
+            return Same() if len(drawn) <= 2 else real()
+
+    monkeypatch.setattr(checkdirs, 'uuid', types.SimpleNamespace(uuid4=uuid4))   # only allocation names
+    holder = _folder_holder(p.state / checkdirs.FOLDER, record=True)
+    try:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            outputs = _within(lambda: list(pool.map(lambda _: checkdirs.new(p.state), range(8))), 30)
+    finally:
+        holder.kill()
+        holder.wait()
+    assert len(set(outputs)) == 8 and all(o.is_dir() for o in outputs)
+    assert 'c' * 32 in {o.name for o in outputs}
+    for o in outputs:
+        checkdirs.finish(o)
+    assert not any(o.exists() for o in outputs)
+
+
 def _bind_deep_socket(tmp):
     """A socket where pytest's tmp_path would put one: TMPDIR/pytest-of-<user>/pytest-N/<test>0/."""
     deep = pathlib.Path(tmp) / 'pytest-of-x' / 'pytest-0' / 'test_some_long_name0'
