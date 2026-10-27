@@ -498,11 +498,43 @@ def clamp_for(cmd: str, env: dict | None) -> str:
     return clamped(cmd, k) if k else cmd
 
 
+def _section(cfg: dict | None, name: str) -> dict:
+    v = (cfg or {}).get(name)
+    return v if isinstance(v, dict) else {}
+
+
+def nice_level(cfg: dict | None = None) -> int:
+    """The nice level 0-19 of check commands: checks.nice (a number; the project's, then the account's),
+    else runner.nice, else NICE. A value that is no whole number falls back to the next source."""
+    acct = project.load_account_settings().get("checks") or {}
+    for v in (_section(cfg, "checks").get("nice"), acct.get("nice"), _section(cfg, "runner").get("nice")):
+        if isinstance(v, bool) or v in (None, ""):
+            continue
+        try:
+            return max(0, min(19, int(v)))
+        except (TypeError, ValueError):
+            continue
+    return NICE
+
+
+def ionice_args() -> list:
+    """The ionice arguments from checks.ionice (account): 'idle' is -c3, 'best-effort' or 'best-effort:N'
+    (N 0-7) is -c2 -n N; unset or invalid is IONICE."""
+    v = (project.load_account_settings().get("checks") or {}).get("ionice")
+    if isinstance(v, str):
+        cls, _, lvl = v.strip().lower().partition(":")
+        if cls == "idle" and not lvl:
+            return ["-c3"]
+        if cls == "best-effort" and (not lvl or (lvl.isdigit() and 0 <= int(lvl) <= 7)):
+            return ["-c2", "-n", lvl] if lvl else list(IONICE)
+    return list(IONICE)
+
+
 def low_priority(argv: list) -> list:
-    """A check command's argv under `nice -n NICE` and `ionice` best-effort lowest where they exist, so a
+    """A check command's argv under `nice` (nice_level) and `ionice` (ionice_args) where they exist, so a
     host's live services go first; either missing is skipped. checks.nice false (account setting)
     runs it as it is."""
     if (project.load_account_settings().get("checks") or {}).get("nice") is False:
         return list(argv)
-    return ((["nice", "-n", str(NICE)] if shutil.which("nice") else [])
-            + (["ionice", *IONICE] if shutil.which("ionice") else []) + list(argv))
+    return ((["nice", "-n", str(nice_level(_cfg()))] if shutil.which("nice") else [])
+            + (["ionice", *ionice_args()] if shutil.which("ionice") else []) + list(argv))

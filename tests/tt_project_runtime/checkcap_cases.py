@@ -1431,3 +1431,55 @@ def test_a_workers_build_cap_is_no_core_request_of_its_detached_job_but_a_comman
     finally:
         daemon.kill()
         daemon.wait()
+
+
+def _argv_with(monkeypatch, settings=None, runner=None):
+    from ttp import project, testslots
+    monkeypatch.setattr(testslots.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(testslots, "_cfg", lambda: {"runner": runner} if runner is not None else None)
+    for k, v in (settings or {}).items():
+        project.set_account_setting(k, v)
+    return testslots.low_priority(["pytest"])
+
+
+def test_check_priority_defaults_are_unchanged_without_settings(env, monkeypatch):
+    assert _argv_with(monkeypatch) == ["nice", "-n", "10", "ionice", "-c2", "-n7", "pytest"]
+
+
+def test_check_priority_follows_checks_nice_and_ionice_settings(env, monkeypatch):
+    got = _argv_with(monkeypatch, {"checks.nice": 19, "checks.ionice": "idle"})
+    assert got == ["nice", "-n", "19", "ionice", "-c3", "pytest"]
+    from ttp import project, testslots
+    project.set_account_setting("checks.ionice", "best-effort:3")
+    assert testslots.low_priority(["x"])[4:8] == ["-c2", "-n", "3", "x"]
+    project.set_account_setting("checks.nice", 40)
+    assert testslots.low_priority(["x"])[2] == "19", "clamped to 0..19"
+
+
+def test_check_priority_falls_back_to_runner_nice(env, monkeypatch):
+    assert _argv_with(monkeypatch, runner={"nice": 15})[:3] == ["nice", "-n", "15"]
+
+
+def test_check_priority_invalid_values_fall_back_to_the_defaults(env, monkeypatch):
+    got = _argv_with(monkeypatch, {"checks.nice": "soon", "checks.ionice": "bogus:9"}, runner={"nice": "x"})
+    assert got == ["nice", "-n", "10", "ionice", "-c2", "-n7", "pytest"]
+    from ttp import project, testslots
+    project.set_account_setting("checks.ionice", "best-effort:9")
+    assert testslots.ionice_args() == ["-c2", "-n7"]
+
+
+def test_every_checks_key_the_runtime_reads_is_an_account_key_and_settable(env):
+    import re
+    from pathlib import Path
+    from ttp import cli, project, testslots
+    src = "".join(f.read_text() for f in Path(project.__file__).parent.glob("*.py"))
+    read = set(re.findall(r'["\']checks\.([a-z_]+)["\']', src))
+    for kind in (testslots.TESTS, testslots.BUILDS):
+        read |= {kind.setting(s)[1] for s in ("pool", "run_max", "project_max")}
+    read -= {"json", "log", "out", "pid", "queued", "rc"}   # file names (checks.json), not keys
+    missing = read - project.ACCOUNT_KEYS["checks"]
+    assert not missing, f"checks keys read but not account keys: {sorted(missing)}"
+    for k in ("test_project_max", "test_pool", "test_run_max", "build_pool", "build_run_max",
+              "build_project_max", "nice", "ionice"):
+        cli.main(["config", "--account", f"checks.{k}", "idle" if k == "ionice" else "3"])
+    assert testslots.project_max({"checks": {"test_project_max": 1}}) >= 1
