@@ -14,7 +14,10 @@ def _approve_7(p):
     _heads_seen(p, "acme/widgets#7")
 
 
-def test_workers_gh_marks_ready_over_every_api_route_only_with_the_users_approval(env, tmp_path):
+_GHE_GRAPHQL = ("https://ghe.example.com/api/graphql", "https://GHE.example.com/API/GraphQL/")
+
+
+def test_workers_gh_marks_ready_over_every_api_route_only_with_the_users_approval(env, tmp_path, monkeypatch):
     """Each gh api spelling that takes a PR out of draft gets gh pr ready's decision: refused without the
     user's recorded approval, let through once with it."""
     p = make(env)
@@ -37,6 +40,18 @@ def test_workers_gh_marks_ready_over_every_api_route_only_with_the_users_approva
     rc, err, ran = gh("api", "/graphql", "-f",
                       'query=mutation{convertPullRequestToDraft(input:{pullRequestId:"PR_kwDOabc123"}){clientMutationId}}')
     assert rc == 0 and ran, err
+    # GitHub Enterprise: an absolute URL (gh sends it as-is; GraphQL is at /api/graphql) is the same
+    # route, and its PR is looked up on that host.
+    monkeypatch.setenv("FAKE_GH_PR_HOST", "ghe.example.com")
+    gh = _gh_runner(p, tmp_path)
+    ghe = [("api", ep, "-f", _READY) for ep in _GHE_GRAPHQL]
+    ghe += [("api", "-X", "PATCH", "https://ghe.example.com/api/v3/repos/acme/widgets/pulls/7", "-F", "draft=false")]
+    for args in ghe:
+        rc, err, ran = gh(*args)
+        assert rc == 1 and "without the user's recorded approval" in err and ran == [], (args, err)
+        _approve_7(p)
+        rc, err, ran = gh(*args)
+        assert rc == 0 and ran == [" ".join(args)], (args, err)
 
 
 def test_workers_gh_opens_drafts_only_over_every_api_route(env, tmp_path):
@@ -45,12 +60,13 @@ def test_workers_gh_opens_drafts_only_over_every_api_route(env, tmp_path):
     p = make(env)
     gh = _gh_runner(p, tmp_path)
     _approve_7(p)
-    for ep in ("graphql", "/graphql", "graphql/", "GRAPHQL"):
+    for ep in ("graphql", "/graphql", "graphql/", "GRAPHQL", *_GHE_GRAPHQL):
         rc, err, ran = gh("api", ep, "-f", _CREATE % "")
         assert rc == 1 and "drafts only" in err and ran == [], (ep, err)
         rc, err, ran = gh("api", ep, "-f", _CREATE % ",draft:true")
         assert rc == 0 and ran, (ep, err)
-    for ep in ("repos/acme/widgets/pulls", "repositories/123/pulls", "/repositories/123/pulls/"):
+    for ep in ("repos/acme/widgets/pulls", "repositories/123/pulls", "/repositories/123/pulls/",
+               "https://ghe.example.com/api/v3/repos/acme/widgets/pulls"):
         rc, err, ran = gh("api", ep, "-f", "title=t", "-f", "head=x", "-f", "base=main")
         assert rc == 1 and "drafts only" in err and ran == [], (ep, err)
         rc, err, ran = gh("api", ep, "-F", "draft=true", "-f", "title=t")
@@ -63,7 +79,7 @@ def test_workers_gh_never_requests_human_reviewers_over_any_api_route(env, tmp_p
     p = make(env)
     gh = _gh_runner(p, tmp_path)
     _approve_7(p)   # an approval to leave draft is not one to request reviews
-    refused = [("api", ep, "-f", _REVIEW) for ep in ("graphql", "/graphql", "graphql/", "GraphQL")]
+    refused = [("api", ep, "-f", _REVIEW) for ep in ("graphql", "/graphql", "graphql/", "GraphQL", *_GHE_GRAPHQL)]
     refused += [("api", "repositories/123/pulls/7/requested_reviewers", "-f", "reviewers[]=someone"),
                 ("api", "-X", "POST", "/repositories/123/pulls/7/requested_reviewers/", "-f", "team_reviewers[]=core"),
                 ("api", "/graphql", "-f", _REVIEW.replace("requestReviews", "requestReviewsByLogin"))]

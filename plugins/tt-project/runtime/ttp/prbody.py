@@ -321,8 +321,8 @@ def api_problem(endpoint: str, method: str, args: list[str], cfg: dict, real: st
     conf, why = _conf(cfg)
     if conf is None:
         return why
-    from .prguard import _opts
-    host = [x for h in _opts(args, ("--hostname",))[-1:] for x in ("--hostname", h)]
+    from .prguard import api_host
+    host = api_host(args)
     issue = API_ISSUE_RE.match(endpoint)
     rest = API_PULLS_RE.match(endpoint) or issue
     repo = ""

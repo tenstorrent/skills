@@ -319,6 +319,26 @@ def test_pr_body_check_covers_issue_endpoint_edits_of_a_pr_body(env, tmp_path, m
     assert rc == 0 and ran and seen() == [] and asked() == ["api repos/acme/widgets/pulls/8 --jq .number"], err
     rc, err, ran = gh("api", "-X", "PATCH", "repos/acme/widgets/issues/7", "-f", "title=t")
     assert rc == 0 and ran and seen() == [] and asked() == [], err
+    # GitHub Enterprise: an absolute URL's PR is looked up on its host, and /api/graphql is GraphQL.
+    monkeypatch.setenv("FAKE_GH_PR_HOST", "ghe.example.com")
+    monkeypatch.setenv("FAKE_GH_NODES", "I_kwDOplain=Issue")
+    gh = _gh_runner(p, tmp_path)
+    for ep in ("https://ghe.example.com/api/v3/repos/acme/widgets/issues/7",
+               "https://api.ghe.example.com/repos/acme/widgets/issues/7"):
+        rc, err, ran = gh("api", "-X", "PATCH", ep, "-f", "body=no type")
+        assert rc == 1 and ran == [] and "exit 3" in err and seen() == ["edit acme/widgets no type"], (ep, err)
+        assert asked() == ["api --hostname ghe.example.com repos/acme/widgets/pulls/7 --jq .number"], ep
+    rc, err, ran = gh("api", "-X", "PATCH", "https://ghe.example.com/api/v3/repos/acme/widgets/issues/8",
+                      "-f", "body=no type")
+    assert rc == 0 and ran and seen() == [], err
+    asked()
+    upd = 'query=mutation{%s(input:{%s:"%s",body:"no type"}){clientMutationId}}'
+    for ep in ("https://ghe.example.com/api/graphql", "https://GHE.example.com/Api/GraphQL/"):
+        for q in (upd % ("updatePullRequest", "pullRequestId", "PR_kwDOabc123"), upd % ("updateIssue", "id", "PR_x")):
+            rc, err, ran = gh("api", ep, "-f", q)
+            assert rc == 1 and ran == [] and "exit 3" in err and seen() == ["edit  no type"], (ep, q, err)
+        rc, err, ran = gh("api", ep, "-f", upd % ("updateIssue", "id", "I_kwDOplain"))   # a plain issue there
+        assert rc == 0 and ran and seen() == [], (ep, err)
 
 
 def test_pr_body_check_covers_gh_issue_edit_of_a_pr(env, tmp_path, monkeypatch):

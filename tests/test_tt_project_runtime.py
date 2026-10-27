@@ -28642,6 +28642,17 @@ FAKE_GH = '''#!{python}
 import os, sys
 a = sys.argv[1:]
 head = os.environ.get("FAKE_GH_HEAD", "{head}")
+log, host = a, ""
+if a[:2] == ["api", "--hostname"]:   # a lookup on a named host
+    host, a = a[2], ["api", *a[3:]]
+lookup = a[:1] == ["api"] and (a[-2:] in (["--jq", ".number"], ["--jq", ".data.node.__typename"], ["-q", ".head.sha"])
+                               or a[-1:] == ['.html_url + " " + .head.sha']
+                               or a[:2] == ["api", "graphql"] and any("node(id:" in x for x in a))
+if lookup and host != os.environ.get("FAKE_GH_PR_HOST", host):   # the PRs live on FAKE_GH_PR_HOST, if set
+    if os.environ.get("FAKE_GH_LOOKUPS"):
+        with open(os.environ["FAKE_GH_LOOKUPS"], "a") as f:
+            f.write(" ".join(log) + "\\n")
+    sys.exit("gh: Not Found (HTTP 404)")
 if a[:2] == ["alias", "list"]:
     print("rdy: pr ready")
     print("rapi: api $1 --method PATCH")
@@ -28654,7 +28665,7 @@ if a[:2] == ["pr", "view"]:
 if a[:1] == ["api"] and a[-2:] in (["--jq", ".number"], ["--jq", ".data.node.__typename"]):
     if os.environ.get("FAKE_GH_LOOKUPS"):   # is this issue or node a PR?
         with open(os.environ["FAKE_GH_LOOKUPS"], "a") as f:
-            f.write(" ".join(a) + "\\n")
+            f.write(" ".join(log) + "\\n")
     pulls = os.environ.get("FAKE_GH_PULLS", "")
     if pulls == "offline":
         sys.exit("error connecting to api.github.com")
@@ -28678,7 +28689,7 @@ if a[:1] == ["api"] and a[-2:] == ["-q", ".head.sha"]:
     print(head)
     sys.exit(0)
 with open(os.environ["FAKE_GH_LOG"], "a") as f:
-    f.write(" ".join(a) + "\\n")
+    f.write(" ".join(log) + "\\n")
 '''
 
 

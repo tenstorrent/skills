@@ -16,7 +16,8 @@ It refuses, whatever the agent or provider:
   `gh api` REST or GraphQL call that writes a PR body when the project's own PR body check refuses
   the body (prbody); also `gh issue edit` and issue body edits, when the target is a PR.
 REST routes match `repos/<o>/<r>/...` and its alias `repositories/<id>/...`; GraphQL matches the
-`graphql` endpoint however it is spelled (`/graphql`, `graphql/`, any case).
+`graphql` endpoint however it is spelled (`/graphql`, `graphql/`, any case, a full URL, GitHub
+Enterprise's `https://<host>/api/graphql`). PRs named by a full URL are looked up on its host.
 
 An approval record is written only by the coordinator's `pr_approve` action. It needs the user's
 own words, quoted: a user message that names the PR, or the user's answer to a blocking `review` or
@@ -848,7 +849,7 @@ def _check_api(args: list[str], real: str, db, stdin_text: str | None, allowed: 
             prs, heads = set(), {}
             for node in set(NODE_ID_RE.findall(text)):
                 q = f'query{{node(id:"{node}"){{... on PullRequest{{url headRefOid}}}}}}'
-                out = _gh(real, "api", "graphql", "-f", f"query={q}",
+                out = _gh(real, "api", *api_host(args), "graphql", "-f", f"query={q}",
                           "-q", '.data.node.url + " " + .data.node.headRefOid')
                 key = pr_key(out)
                 if key:
@@ -873,7 +874,7 @@ def _check_api(args: list[str], real: str, db, stdin_text: str | None, allowed: 
             return _checks_problem() if draft_true else "refused: PRs are opened as drafts only; send draft=true. " + HOW
         return None
     if method in ("PATCH", "POST", "PUT") and draft_false:
-        host = [x for h in _opts(args, ("--hostname",))[-1:] for x in ("--hostname", h)]
+        host = api_host(args)
         if rid is not None:   # repositories/<id>/pulls/<n>: its URL names the PR
             out = _gh(real, "api", *host, endpoint.strip("/"), "-q", '.html_url + " " + .head.sha')
             key = pr_key(out)
@@ -885,14 +886,32 @@ def _check_api(args: list[str], real: str, db, stdin_text: str | None, allowed: 
     return None
 
 
+# gh api's options that take a value
+API_VALUE_OPTS = ("-X", "--method", "-f", "-F", "--field", "--raw-field", "-H", "--header", "--input", "-q",
+                  "--jq", "-t", "--template", "--hostname", "--cache", "-p", "--preview")
+
+
 def _api_target(args: list[str]) -> tuple[str, str]:
     """A `gh api` call's endpoint (no host, no query) and HTTP method."""
-    pos = _positionals(args, ("-X", "--method", "-f", "-F", "--field", "--raw-field", "-H", "--header",
-                              "--input", "-q", "--jq", "-t", "--template", "--hostname", "--cache", "-p",
-                              "--preview"))
-    endpoint = re.sub(r"^https?://[^/]+/(api/v3/)?", "", (pos[0] if pos else "").split("?")[0], flags=re.I)
+    pos = _positionals(args, API_VALUE_OPTS)
+    target = re.split(r"[?#]", pos[0] if pos else "")[0]
+    endpoint = re.sub(r"^https?://[^/]+/(api/v3/)?", "", target, flags=re.I)
+    if endpoint != target and re.fullmatch(r"/*api/graphql/*", endpoint, re.I):   # GitHub Enterprise's GraphQL URL
+        endpoint = "graphql"
     sends = _opts(args, ("-f", "-F", "--field", "--raw-field", "--input"))
     return endpoint, ((_opts(args, ("-X", "--method")) or [""])[-1] or ("POST" if sends else "GET")).upper()
+
+
+def api_host(args: list[str]) -> list[str]:
+    """`--hostname <host>` for lookups about a `gh api` call's target: the host of an absolute URL
+    endpoint (gh sends it as-is, whatever --hostname says; `api.<host>` is <host>'s API), else the
+    call's own --hostname, else none (gh's default host)."""
+    pos = _positionals(args, API_VALUE_OPTS)
+    m = re.match(r"^https?://([^/:?#]+)", pos[0] if pos else "", re.I)
+    host = m.group(1).lower() if m else (_opts(args, ("--hostname",)) or [""])[-1]
+    if m and host.startswith("api.") and "." in host[4:]:
+        host = host[4:]
+    return ["--hostname", host] if host else []
 
 
 def _api_body_problem(args: list[str], real: str, stdin_text: str | None, cfg: dict | None) -> str | None:
