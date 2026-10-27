@@ -9074,6 +9074,22 @@ def test_a_passed_retry_when_waits_for_a_future_start_after(env, monkeypatch):
     assert _ready(p, tid) and "woke" in json.loads(p.db.task(tid)["result"])
 
 
+def test_a_fractional_start_after_keeps_not_before_equal_to_its_label(env, monkeypatch):
+    p = make(env)
+    from ttp import coordinator
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    fixed = int(time.time()) + 7200 + 0.84   # a fraction of .84 rounds up in its whole-second label
+    monkeypatch.setattr(coordinator, "parse_start_after", lambda *a, **k: fixed)
+    tid = _deferred_waiting_task(p, "2h")
+    task = p.db.task(tid)
+    assert task["not_before"] == coordinator.deferral(task)["after"] == round(fixed)
+    d = dmod.Daemon(p.base)
+    _settle_probe(d, tid)
+    assert d._probe_rc[tid][0] == 0 and not _ready(p, tid)
+    assert p.db.task(tid)["not_before"] == round(fixed)
+
+
 @pytest.mark.parametrize("clear", ["now", ""])
 def test_a_cleared_start_after_lets_a_passed_retry_when_start_the_task(env, monkeypatch, clear):
     p = make(env)
