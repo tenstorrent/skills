@@ -257,7 +257,9 @@ def test_draft_guard_allows_a_path_that_keeps_the_harness_bin_first(env, tmp_pat
                'PATH="$TTP_PROJECT/harness/bin:/tmp/fake:$PATH" gh pr create -t t',
                "export PATH=${TTP_PROJECT}/harness/bin:/tmp/fake:$PATH; gh api -X PATCH repos/a/b/pulls/7 -F draft=false",
                "env PATH=$TTP_PROJECT/harness/bin/:/tmp/fake gh pr ready 7", "PATH=$TTP_PROJECT/harness/bin gh pr ready 7",
-               "bash ok.sh", f"PATH={bin_}:/tmp/fake:$PATH bash ok.sh"]
+               "bash ok.sh", f"PATH={bin_}:/tmp/fake:$PATH bash ok.sh",
+               'PATH="$TTP_PROJECT/harness/bin":/tmp/fake:$PATH gh pr ready 7',
+               f"PATH='{bin_}'; gh pr ready 7", 'PATH="$TTP_PROJECT/harness/bin/" gh pr ready 7']
     for cmd in allowed:
         assert not denied(cmd), cmd
     refused = ["env -u PATH gh pr ready 7", "unset PATH; gh pr ready 7", "env -i gh pr ready 7",
@@ -273,6 +275,13 @@ def test_draft_guard_allows_a_path_that_keeps_the_harness_bin_first(env, tmp_pat
                'n=TTP_PROJ; export "${n}ECT=/tmp/x"; PATH=$TTP_PROJECT/harness/bin:$PATH gh pr ready 7',
                f"PATH={bin_}:$PATH; PATH=/tmp/fake:$PATH gh pr ready 7", "/usr/bin/gh pr ready 7",
                "command -p gh pr ready 7", "PATH=$PATH:/tmp/fake command -p gh pr ready 7",
-               "bash bad.sh", "TTP_PROJECT=/tmp/x bash ok.sh", "PATH=/tmp/fake:$PATH bash ok.sh"]
+               "bash bad.sh", "TTP_PROJECT=/tmp/x bash ok.sh", "PATH=/tmp/fake:$PATH bash ok.sh",
+               # a closing quote followed by more of the same word: the value goes on past the bin dir
+               'PATH="$TTP_PROJECT/harness/bin"/../../../tmp/fake:$PATH gh pr ready 7',
+               f'PATH="{bin_}"/../../../tmp/fake:$PATH gh pr ready 7',
+               f"PATH='{bin_}'/../../../tmp/fake:$PATH gh pr ready 7",
+               'PATH="$TTP_PROJECT/harness/bin"x:$PATH gh pr ready 7',
+               'export PATH="${TTP_PROJECT}/harness/bin""/../../../tmp/fake:$PATH"; gh pr ready 7',
+               f"PATH='{bin_}/'x:$PATH gh pr ready 7", 'PATH="$TTP_PROJECT/harness/bin"\'/x\':$PATH gh pr ready 7']
     for cmd in refused:
         assert denied(cmd), cmd

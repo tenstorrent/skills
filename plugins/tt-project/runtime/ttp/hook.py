@@ -395,7 +395,11 @@ def _keeps_harness_first(text: str, pos: int, trusted: bool) -> bool:
     for head in heads:
         if rest.startswith(head):
             tail = rest[len(head):].removeprefix("/")
-            if tail[:1] == ":" or (tail[:1] == quote if quote else not tail or tail[0].isspace() or tail[0] in ";&|)`"):
+            if quote and tail[:1] == quote:
+                tail = tail[1:]                 # past the closing quote: only ':' or the word's end
+            elif quote:
+                return tail[:1] == ":"
+            if tail[:1] == ":" or not tail or tail[0].isspace() or tail[0] in ";&|)`":
                 return True
     return False
 
