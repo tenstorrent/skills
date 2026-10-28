@@ -179,6 +179,6 @@ def test_a_hand_off_from_before_the_spec_digest_takes_its_spec_as_the_baseline(e
 
 
 def test_the_retry_when_docs_say_a_spec_change_wakes_the_task_once():
-    for rel in ("skills/tt-project-harness/SKILL.md", "template/prompts/worker.md", "docs/design.md"):
+    for rel in ("skills/tt-project-harness/SKILL.md", "docs/design.md"):
         text = " ".join((RUNTIME.parent / rel).read_text().split())
         assert "spec update wakes it once" in text, rel

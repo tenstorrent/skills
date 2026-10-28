@@ -186,7 +186,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
   is over whatever the outcome, 1 while it is not (75, a busy `ttp lock`, or 255, ssh not reaching the
   host, also keep it asleep); any other exit wakes it as broken. A failing remote command exits
   1, never `|| exit 255`; quote it as one string. A wait only time ends:
-  `test "$(date +%s)" -ge <epoch>`. A spec update wakes it once, before the probe passes.
+  `test "$(date +%s)" -ge <epoch>`.
 <!-- ttp:if wait -->
   GitHub CI: `ttp ci --repo <owner/repo> --branch <branch>` (or `--run <id>`). It also exits 0 when a
   job hangs; on waking run it again and report any `hung:` line (to keep waiting, add `--no-hang`).
