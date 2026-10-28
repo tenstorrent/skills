@@ -499,7 +499,9 @@ def _known_keys(path: list[str]) -> set[str] | None:
     if path[0] == "providers":
         return {"claude", "codex", "cursor", "fake", "chat"} if len(path) == 1 else PROVIDER_KEYS if len(path) == 2 else None
     if path == ["checks"]:
-        return {"nice", "ionice", "wall_cap_s"}
+        # wrap_cmd: the project's own lock or queue command the commands after `ttp checks --` run
+        # behind (push.wrap_of; default "", none); delivery.push_checks never go through it.
+        return {"nice", "ionice", "wall_cap_s", "wrap_cmd"}
     if len(path) == 1 and isinstance(DEFAULT_CONFIG.get(path[0]), dict):
         return set(DEFAULT_CONFIG[path[0]]) | EXTRA_KEYS.get(path[0], set())
     return None
@@ -759,7 +761,11 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     walk(raw, [])
     from .push import (allow_protected, applicability_problems, backup_problem, by_repo_problems,   # push imports this module
                        bump_problems, check_problems,
-                       fast_forward_check, lands_locally, mirror_check, push_branch_problem, scalar_problem)
+                       fast_forward_check, lands_locally, mirror_check, push_branch_problem, scalar_problem, wrap_of)
+    try:
+        wrap_of(raw)
+    except ValueError as e:
+        out.append(str(e))
     delivery = raw.get("delivery") or {}
     out += [why for why in [backup_problem(delivery)] if why]
     if not lands_locally(delivery.get("push_branch"), root, allow_protected(delivery)):

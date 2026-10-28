@@ -6056,6 +6056,105 @@ def test_ttp_checks_drops_an_extra_command_the_project_checks_already_run(env, t
     assert cli._extra_checks(["pytest", "-q"], scoped) == (["pytest -q"], [])
 
 
+
+def _arg_logging_wrapper(path, log, rc=None):
+    """A stand-in lock wrapper: logs a CALL line and each argument on its own line, then runs its
+    arguments (exit `rc` instead, when given)."""
+    tail = f'echo "wrapper says no"; exit {rc}' if rc is not None else 'if [ "$1" = --tag ]; then shift 2; fi\nexec "$@"'
+    path.write_text(f'#!/bin/sh\necho CALL >> {shlex.quote(str(log))}\n'
+                    f'for a in "$@"; do printf "%s\\n" "$a" >> {shlex.quote(str(log))}; done\n{tail}\n')
+    path.chmod(0o755)
+    return path
+
+
+def test_ttp_checks_extra_commands_run_behind_checks_wrap_cmd_and_project_checks_do_not(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    log, out, own = tmp_path / "wrap.log", tmp_path / "out", tmp_path / "own"
+    wdir = tmp_path / "lock dir"
+    wdir.mkdir()
+    wrapper = _arg_logging_wrapper(wdir / "lock.sh", log)
+    extra = f"printf '%s|' 'a  b' c > {shlex.quote(str(out))}"
+    p.set_config("delivery.push_checks", [f"echo own >> {shlex.quote(str(own))}"])
+    # Unset: nothing wraps, and a check's argv is what it was.
+    cli.main(["checks", "--fresh", "--", extra])
+    assert out.read_text() == "a  b|c|" and not log.exists()
+    assert push.with_wrap(["true"], ()) == ["true"]
+    assert push.check_argv(push.with_wrap(["true"], ())[0], isolate=False) == push.check_argv("true", isolate=False)
+    capsys.readouterr()
+    # Set: the extra runs as the wrapper's words then the command, as separate arguments.
+    p.set_config("checks.wrap_cmd", f"{shlex.quote(str(wrapper))} --tag 'x  y'")
+    out.unlink()
+    cli.main(["checks", "--fresh", "--", extra])
+    assert "run behind checks.wrap_cmd" in capsys.readouterr().out
+    lines = log.read_text().splitlines()
+    assert lines.count("CALL") == 1, "only the extra command runs behind the wrapper, never the project check"
+    assert lines[1:3] == ["--tag", "x  y"] and "-c" in lines and lines[-1].endswith(extra), lines
+    assert not any("echo own" in x for x in lines)
+    assert out.read_text() == "a  b|c|" and own.read_text().count("own") == 2
+    assert json.loads((run / "checks.json").read_text())["passed"] is True
+    # A check run on a check host is never wrapped with this machine's wrapper.
+    remote = push.with_wrap(push.with_host(["true"], "box1"), ("w",))
+    assert remote[0].wrap == () and push.with_wrap(["true"], ("w",))[0].wrap == ("w",)
+
+
+def test_ttp_checks_wrap_cmd_passes_its_exit_code_and_fails_when_missing(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli, project, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    log, marker = tmp_path / "wrap.log", tmp_path / "ran"
+    touch = f"touch {shlex.quote(str(marker))}"
+    # The wrapper's own failure and output pass through: the checks fail, the command never ran.
+    p.set_config("checks.wrap_cmd", str(_arg_logging_wrapper(tmp_path / "deny.sh", log, rc=3)))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--fresh", "--", touch])
+    assert e.value.code not in (0, None) and not marker.exists() and "CALL" in log.read_text()
+    assert "wrapper says no" in (run / "checks.log").read_text() + capsys.readouterr().out
+    assert json.loads((run / "checks.json").read_text())["passed"] is False
+    # A command's exit code passes through a wrapper that runs it.
+    p.set_config("checks.wrap_cmd", str(_arg_logging_wrapper(tmp_path / "ok.sh", log)))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--fresh", "--", "exit 7"])
+    assert e.value.code not in (0, None)
+    # Missing, not executable, not on PATH or unparsable: a clear failure naming the key, nothing runs unwrapped.
+    plain = tmp_path / "plain.sh"
+    plain.write_text("#!/bin/sh\nexec \"$@\"\n")
+    for wrap in (str(tmp_path / "nope.sh"), str(plain), "no-such-wrapper-for-ttp-checks", "'unclosed"):
+        p.set_config("checks.wrap_cmd", wrap)
+        capsys.readouterr()
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--fresh", "--", touch])
+        err = capsys.readouterr().err
+        assert e.value.code == 1 and "checks.wrap_cmd" in err and not marker.exists(), (wrap, err)
+    assert any("checks.wrap_cmd" in x for x in project.config_problems({"checks": {"wrap_cmd": "'unclosed"}}))
+    assert any("checks.wrap_cmd" in x for x in project.config_problems({"checks": {"wrap_cmd": ["a"]}}))
+    assert not [x for x in project.config_problems({"checks": {"wrap_cmd": "flock /tmp/x"}}) if "wrap" in x]
+    assert push.wrap_of({}) == () and push.wrap_of({"checks": {"wrap_cmd": ""}}) == ()
+    # No extra commands: a broken wrapper does not stop the project's own checks.
+    p.set_config("delivery.push_checks", ["true"])
+    cli.main(["checks", "--fresh"])
+
+
+def test_push_own_reruns_recorded_extras_behind_checks_wrap_cmd(env, monkeypatch, capsys, tmp_path):
+    log = tmp_path / "wrap.log"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [COND])
+    run = tmp_path / "run"
+    run.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_TASK", "60")
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t60-exp")
+    _commit(repo, "mine.dat", "mine\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    rec = json.dumps({"head": head, "passed": True, "commands": ["true"], "skipped": [], "ts": 0})
+    (run / "checks.json").write_text(rec)
+    p.set_config("checks.wrap_cmd", str(tmp_path / "nope.sh"))
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 4
+    assert "checks.wrap_cmd" in capsys.readouterr().err and _git_out(origin, "branch", "--list", "ttp/t60-exp") == ""
+    p.set_config("checks.wrap_cmd", str(_arg_logging_wrapper(tmp_path / "lock.sh", log)))
+    assert _ttp("push", "--own") == 0
+    assert log.read_text().splitlines()[0] == "CALL" and log.read_text().splitlines()[-1].endswith("true")
+    assert _git_out(origin, "rev-parse", "ttp/t60-exp") == head
+
 def _recording_venv(path, ran):
     """A venv stand-in whose python records how it was called, with a pytest on its PATH."""
     venv = _fake_venv(path)

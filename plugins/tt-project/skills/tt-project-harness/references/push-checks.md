@@ -16,6 +16,14 @@ Each repo runs its own list. `delivery.push_checks_by_repo` maps `"harness"` (th
 The harness repo never inherits the code repo's `push_checks`. With no `"harness"` entry, `ttp checks` there says `no repo checks configured for the harness repo` and runs the built-in harness default (a whitespace check, and pytest of `runtime/tests` and `bin/tests` where they exist); `--purpose harness` runs only `push_checks`' purpose harness entries, else that default.
 That pass is the harness repo's own, never a pass of the code checks; `checks.json` names the list's source in `checks_from`.
 
+## Extra commands behind a wrapper
+
+`checks.wrap_cmd` (project setting, default unset) is a project's own lock or queue command that each command given after `ttp checks --` runs behind, for a project that serializes a shared host's test suite with its own script.
+Set, an extra command runs as the wrapper's words followed by `bash -e -o pipefail -c '<command>'` as separate arguments, so quoting and spaces survive; the wrapper runs outside the process sandbox, and its exit code and output pass through unchanged.
+A wrapper (a path relative to the checkout, or a name on PATH) that is missing or not executable fails the checks with a line naming the key; the command never runs unwrapped. `ttp push --own` runs the recorded extras behind it too.
+`delivery.push_checks` never go through it (a check that needs the lock names the wrapper in its own command), nor do extras run on a check host.
+It is not chat-settable: the user sets it with `ttp config <project> checks.wrap_cmd '<command>'`.
+
 ## Fast path
 
 Opt-in, off by default: with no `delivery.checks_fast_globs`, every diff runs the full checks.

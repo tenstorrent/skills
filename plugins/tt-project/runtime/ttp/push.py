@@ -79,13 +79,15 @@ class Check(str):
     sandbox (sandbox.py); `"sandbox": false` runs it without, for a check that needs the host's
     process table. A local check runs in a clean checkout of the commit (cleantree); `"cwd": "authoring"`
     runs it in the worktree being checked instead, for a check that needs build outputs or a venv made
-    there, and `ttp checks` labels its pass as not run from a clean tree."""
+    there, and `ttp checks` labels its pass as not run from a clean tree. `wrap` (with_wrap, never part
+    of the config form) is the argv a local check runs behind: `checks.wrap_cmd` for the commands after `--`."""
     if_exists = ""
     if_changed: tuple[str, ...] = ()
     purpose = ""
     host = ""
     env: tuple[tuple[str, str], ...] = ()
     default_host = ""
+    wrap: tuple[str, ...] = ()
     sandbox = True
     cwd = ""
 
@@ -167,6 +169,56 @@ def with_host(checks: list, default: Any) -> list:
         if not c.host:
             c.default_host = default
         out.append(c)
+    return out
+
+
+WRAP_KEY = "checks.wrap_cmd"
+
+
+def wrap_of(cfg: dict | None) -> tuple[str, ...]:
+    """`checks.wrap_cmd` as argv words: a project's own lock or queue command that each command given
+    after `--` to `ttp checks` (and the ones `ttp push --own` reruns from that record) runs behind, the
+    command passed to it as separate arguments. () when unset or empty. ValueError when it is not a
+    string or its quoting does not parse; callers fail the checks then, never run the command unwrapped."""
+    v = ((cfg or {}).get("checks") or {}).get("wrap_cmd") if isinstance((cfg or {}).get("checks"), dict) else None
+    if v is None or v == "":
+        return ()
+    if not isinstance(v, str):
+        raise ValueError(f"{WRAP_KEY} must be a command string, not {type(v).__name__}")
+    try:
+        return tuple(shlex.split(v))
+    except ValueError as e:
+        raise ValueError(f"{WRAP_KEY} {v!r} does not parse: {e}") from e
+
+
+def wrap_problem(wrap: tuple[str, ...], cwd: str | Path, env: dict | None = None) -> str:
+    """Why the wrapper `wrap` cannot run in `cwd` ("" when it can): a path (relative to `cwd`) or a
+    name on `env`'s PATH that is missing or not executable."""
+    if not wrap:
+        return ""
+    exe = wrap[0]
+    if os.sep in exe:
+        path = Path(cwd) / exe
+        ok = path.is_file() and os.access(path, os.X_OK)
+    else:
+        ok = shutil.which(exe, path=(env if env is not None else os.environ).get("PATH")) is not None
+    return "" if ok else (f"{WRAP_KEY}: the wrapper {exe!r} is missing or not executable, so the commands "
+                          f"after `--` were not run (never unwrapped); fix the path or unset {WRAP_KEY}")
+
+
+def with_wrap(checks: list, wrap: tuple[str, ...]) -> list:
+    """`checks` with each one that runs on this machine behind `wrap` (check_argv); one with a check
+    host runs there unwrapped, as the wrapper is this machine's. No `wrap`: `checks` unchanged."""
+    if not wrap:
+        return list(checks)
+    out = []
+    for c in checks:
+        c2 = Check(str(c))
+        if isinstance(c, Check):
+            c2.__dict__.update(c.__dict__)
+        if not remote_host(c2):
+            c2.wrap = tuple(wrap)
+        out.append(c2)
     return out
 
 
@@ -350,6 +402,7 @@ def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None,
     in a process sandbox (sandbox.wrap) unless it opts out or `isolate` is false; sandbox_lines says
     when one cannot."""
     exports = dict(getattr(cmd, "env", ()) or ())
+    wrap = tuple(getattr(cmd, "wrap", ()) or ())
     isolate = isolate and getattr(cmd, "sandbox", True) is not False
     if host := remote_host(cmd):
         return remotecheck.argv(str(cmd), host, exports)
@@ -357,7 +410,8 @@ def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None,
     cmd = remotecheck.exports(exports) + testslots.clamp_for(cmd, env)
     bash = shutil.which("bash")
     argv = [bash, "-e", "-o", "pipefail", "-c", cmd] if bash else ["sh", "-e", "-c", cmd]
-    return sandbox.wrap(argv, isolate, env)
+    # checks.wrap_cmd goes outside the sandbox: a lock or queue script sees the host as it does elsewhere.
+    return [*wrap, *sandbox.wrap(argv, isolate, env)]
 
 
 def sandbox_lines(checks: list) -> list[str]:
@@ -3186,7 +3240,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             base: str | None = None, ff_only: bool = False, recorded: dict | None = None,
             check_run_dir: str | None = None, reuse: Callable[[str, list, list], str] | None = None,
             host: str = "", lease: bool = False, start: str = "",
-            start_ref: str = "", never_force: bool = False) -> int:
+            start_ref: str = "", never_force: bool = False, cfg: dict | None = None) -> int:
     """`ttp push --own`: run `checks` on HEAD as it is and push it to remote/branch, the task's own
     branch. No rebase and no version bump, so the pushed commit is the one reviewed; without force,
     so the remote takes only a fast-forward of what it has. Without checks, as for `ttp push`, only
@@ -3199,7 +3253,8 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
     `reuse(tree, commands, envs, parts)` names a pass `ttp checks` recorded of exactly those commands on
     HEAD's tree under the same environment (pushpass.check_envs, hashing the check_env_parts `parts`),
     or gives "": with one, nothing runs again.
-    `host` (delivery.checks_host) is where those recorded commands run, as the project's checks do.
+    `host` (delivery.checks_host) is where those recorded commands run, as the project's checks do;
+    ones run here go behind `cfg`'s checks.wrap_cmd (wrap_of), as `ttp checks` ran them.
     `lease` (own_lease: a rebase of `branch`) replaces the remote branch instead of fast-forwarding it.
     It is refused when the remote tip has a commit HEAD lacks (by patch) beyond `start`, the tip the
     rebase started from (worktree.rebase_start, kept at `start_ref`; without one, any such commit):
@@ -3259,6 +3314,16 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
         extras = False
         if checks and not todo:
             todo = extras = with_host(recorded_extras(recorded, head, checks), host)
+            if todo:
+                try:
+                    wrap = wrap_of(cfg)
+                except ValueError as e:
+                    say(f"{e}; not pushing")
+                    return CHECKS_FAILED
+                todo = extras = with_wrap(todo, wrap)
+                if any(not remote_host(c) for c in todo) and (why := wrap_problem(wrap, repo)):
+                    say(f"{why}; not pushing")
+                    return CHECKS_FAILED
             if not todo and outside_scope(checks, skipped):
                 say(f"{head[:10]}: {OUT_OF_SCOPE}")
             elif not todo:
@@ -3672,7 +3737,7 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
                      ff_only=own_ff_only(branch) and not lease, lease=lease, start=start, start_ref=start_ref,
                      recorded=recorded or recorded_checks(os.environ.get("TTP_RUN_DIR")), check_run_dir=output,
                      reuse=lambda tree, cmds, envs, parts: _own_pass(p, tree, cmds, envs, parts), host=d.get("checks_host") or "",
-                     never_force=never_force_on(p.config()))
+                     never_force=never_force_on(p.config()), cfg=p.config())
     else:
         rc = push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
                   version_bump=version_bump, timed=lambda s: record_check_s(p, s),

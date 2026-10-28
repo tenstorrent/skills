@@ -2577,6 +2577,19 @@ def cmd_checks(a) -> None:
     vpy = str(push.venv_python(top, {**os.environ, **venv_vars}) or "")
     mine, dropped = _extra_checks(a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd, own, vpy)
     mine = push.with_host(mine, checks_host)
+    if mine:   # checks.wrap_cmd: the project's own lock or queue wrapper (never the project checks)
+        try:
+            wrap = push.wrap_of(cfg)
+        except ValueError as e:
+            die(f"ttp checks: {e}; the commands after `--` were not run", 1)
+        mine = push.with_wrap(mine, wrap)
+        if wrap and any(not push.remote_host(c) for c in mine):
+            if why := push.wrap_problem(wrap, top, {**os.environ, **venv_vars}):
+                die(f"ttp checks: {why}", 1)
+            print(f"ttp checks: the commands after `--` run behind {push.WRAP_KEY}: {shlex.join(wrap)}")
+        if wrap and (remote := [c for c in mine if push.remote_host(c)]):
+            print(f"ttp checks: {', '.join(map(repr, map(str, remote)))} run on their check host without "
+                  f"{push.WRAP_KEY}, which wraps only commands run on this machine")
     if dropped:
         print(f"ttp checks: not running {', '.join(map(repr, dropped))} after `--` again: "
               f"{source} already runs it")
