@@ -273,6 +273,24 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   one spot, or upstream already ships the project's change) are settled without a model; any
   other conflict leaves one harness task and no hourly retries. At most one such task is queued
   a day; a conflict within a day of the last one waits and is tried again after it. `ttp config <name> upgrade.auto false` opts out; `ttp upgrade <name>` then applies it.
+- Power-cycle notices (cyclenotice.py). A device broker on the same host announces a pending power
+  cycle in a notice file, by default `/run/tt-device-broker/power-cycle-pending.json` (JSON with
+  `state` "possible" or "requested", `reason`, `earliest_cycle_at` and `updated_at`). While one holds,
+  `ttp upgrade` and `ttp setup` change nothing and exit 75 with one line naming the state, reason and
+  earliest cycle time; the daemon starts no automatic upgrade or host-side takeover, and a post-push
+  deploy (`delivery.after_push`) waits. Each goes ahead by itself once the file is gone, with no try
+  spent and no failure counted. `upgrade.cycle_notices` (a list of paths; `[]` turns the hold off) sets
+  the files; a missing file holds nothing. A malformed file holds for 10 min after its last write, a
+  well-formed one for 6 h after its last update. `--ignore-cycle-notice` proceeds with a warning.
+- Interrupted upgrades (upjournal.py). `ttp upgrade` journals each step in `state/upgrade.journal`
+  before it changes the harness. A run cut short (a reboot, a kill) is recovered under the upgrade
+  lock by the next `ttp upgrade` and by the daemon at start and on its release check: before the
+  merge it is dropped; mid-merge it is rolled back to main (an unfinished merge aborted, touched files
+  put back); after main moved it is finished, and a daemon left stopped or on the old code is
+  restarted. An automatic upgrade cut short is retried, at most 3 times in a row. `ttp setup` journals
+  its copy in `lib/.setup.journal` and switches `lib/current` in one rename; the next `ttp` command
+  finishes a cut-short copy from the same plugin folder or, with that gone, rolls back to the release
+  before. A post-push deploy a reboot cut short is run once more by the daemon.
   An explicit host-side `ttp upgrade <name>` (not `--auto`, not from one of the project's runs) queues
   the merge task once the last one ended `upgrade.merge_retry_h` (6) hours ago, and takes the finish
   lock over from a finish task that is blocked or has had no run or update for 6 h: that task is

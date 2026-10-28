@@ -6938,26 +6938,30 @@ def cmd_setup(a) -> None:
         die(f"ttp {installed} is installed, newer than this ttp {__version__}: not downgrading it. "
             f"Run setup from the newer plugin, or add --force to install {__version__} anyway", 1)
     stale_install_warning()
+    _recover_setup()
     commit = source_commit()
     before = recorded_commit(lib / "runtime") if (lib / "runtime").is_dir() else ""
+    cur = HOME_DIR / "lib" / "current"
+    jr = HOME_DIR / "lib" / SETUP_JOURNAL
     if RUNTIME.resolve() != (lib / "runtime").resolve():
-        for part in ("runtime", "template", "bin", "skills"):    # skills: readable by workers of any project
-            src = PLUGIN_ROOT / part
-            if src.exists():
-                _copy_tree(src, lib / part)
-        for f in (lib / "bin").iterdir():
-            f.chmod(0o755)
-    (lib / "runtime" / "ttp" / SOURCE_FILE).write_text(commit + "\n")
+        from .runner import boot_id
+        lib.parent.mkdir(parents=True, exist_ok=True)
+        durable_write(jr, json.dumps({"pid": os.getpid(), "boot": boot_id(), "source": str(PLUGIN_ROOT),
+                                      "lib": str(lib), "commit": commit, "existed": lib.exists(),
+                                      "prev": os.readlink(cur) if cur.is_symlink() else ""}))
+        _install_parts(PLUGIN_ROOT, lib)
+    durable_write(lib / "runtime" / "ttp" / SOURCE_FILE, commit + "\n", sync=False)
     sync_all()    # a reboot now must not leave empty files that upgrades take in as upstream
     # The marker goes first: a daemon check between the two steps must not undo a deliberate downgrade.
     if is_newer(installed, __version__):    # a deliberate downgrade: daemons must not undo it
         durable_write(forced_mark(), __version__ + "\n")
     elif forced_version() != __version__:  # re-running setup of the forced version keeps it forced
         forced_mark().unlink(missing_ok=True)
-    cur = HOME_DIR / "lib" / "current"
-    if cur.is_symlink() or cur.exists():
-        cur.unlink()
-    cur.symlink_to(lib)
+    if cur.exists() and not cur.is_symlink():
+        shutil.rmtree(cur) if cur.is_dir() else cur.unlink()
+    from .release import point_current
+    point_current(lib)       # in one step: a `ttp` starting meanwhile finds the old release or this one
+    jr.unlink(missing_ok=True)
     bindir = Path(a.bin_dir).expanduser()
     bindir.mkdir(parents=True, exist_ok=True)
     shim = bindir / "ttp"
@@ -7032,6 +7036,66 @@ def _cycle_hold(paths: list[str], a, where=None, auto_rec: Project | None = None
         f"(--ignore-cycle-notice proceeds anyway)", cyclenotice.BUSY)
 
 
+SETUP_JOURNAL = ".setup.journal"     # in HOME_DIR/lib while `ttp setup` copies a release in (_recover_setup)
+SETUP_PARTS = ("runtime", "template", "bin", "skills")    # skills: readable by workers of any project
+
+
+def _install_parts(src_root: Path, lib: Path) -> None:
+    for part in SETUP_PARTS:
+        src = src_root / part
+        if src.exists():
+            _copy_tree(src, lib / part)
+    for f in (lib / "bin").iterdir():
+        f.chmod(0o755)
+
+
+def _recover_setup() -> str:
+    """A `ttp setup` cut short (a reboot mid-copy) leaves its journal: the next `ttp` command finishes it
+    (the copy is redone from the same plugin folder, then lib/current points at it) or, with that folder
+    gone, rolls it back (lib/current points at the release it did before, and a release folder the run
+    created is removed). Returns the line it printed ("" when there was nothing to do)."""
+    from .project import HOME_DIR
+    from .release import point_current
+    from .runner import same_boot
+    jr = HOME_DIR / "lib" / SETUP_JOURNAL
+    try:
+        rec = json.loads(jr.read_text())
+    except FileNotFoundError:
+        return ""
+    except (OSError, ValueError):
+        rec = {}
+    rec = rec if isinstance(rec, dict) else {}
+    pid = rec.get("pid")
+    if same_boot(rec.get("boot")) and isinstance(pid, int) and pid != os.getpid():
+        try:
+            os.kill(pid, 0)
+            return ""       # it still runs
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return ""
+    lib, src = Path(rec.get("lib") or "/nonexistent"), Path(rec.get("source") or "/nonexistent")
+    if lib.parent == HOME_DIR / "lib" and (src / "runtime" / "ttp").is_dir() and (src / "template").is_dir():
+        _install_parts(src, lib)
+        durable_write(lib / "runtime" / "ttp" / SOURCE_FILE, str(rec.get("commit") or "unknown") + "\n", sync=False)
+        sync_all()
+        point_current(lib)
+        what = f"finished: {lib.name} installed again from {src}"
+    else:
+        prev = Path(str(rec.get("prev") or ""))
+        prev = prev if prev.is_absolute() else HOME_DIR / "lib" / prev
+        if str(rec.get("prev") or "") and prev.is_dir():
+            point_current(prev)
+        if lib.parent == HOME_DIR / "lib" and not rec.get("existed") and lib.is_dir() and lib != prev:
+            shutil.rmtree(lib, ignore_errors=True)
+        what = (f"rolled back to {prev.name}" if str(rec.get("prev") or "") else "rolled back") + \
+            "; rerun `ttp setup` from the plugin"
+    jr.unlink(missing_ok=True)
+    line = f"an earlier `ttp setup` was cut short (a reboot?); {what}"
+    print(line, file=sys.stderr)
+    return line
+
+
 def cmd_upgrade(a) -> None:
     """Merge the installed template into a project's harness. The harness repo keeps pristine
     template snapshots on its `upstream` branch, so this is an ordinary three-way merge. `--auto` is
@@ -7072,7 +7136,10 @@ def cmd_upgrade(a) -> None:
         die(f"upgrade refused: {what}" + (f" ({who[0]})" if who else "") + "; nothing was changed"
             + ("; main is as it was and no restart is coming: rerun this --apply once it ends"
                if a.apply is not None else ""), UPGRADE_BUSY)
+    from . import upjournal
     try:
+        upjournal.recover(p, restart=_restart_daemon)    # an earlier run cut short: finish or roll it back
+        upjournal.begin(p, "apply" if a.apply is not None else "upgrade", a.auto)
         own = _own_run(p)
         if a.apply is not None and own and release.fenced(p, os.environ.get("TTP_TASK") or ""):
             die(f"--apply refused: a host-side upgrade took the template merge over from task "
@@ -7109,7 +7176,9 @@ def cmd_upgrade(a) -> None:
             _apply_upgrade(p, a.apply)
         else:
             _upgrade(p, a.auto, explicit=not a.auto and not own, took_over=took, parked=parked)
+        upjournal.end(p)
     except SystemExit as e:
+        upjournal.end(p)        # it refused, failed or finished on purpose: whatever it changed is whole
         if a.auto and e.code and (p.db.kv(release.KV_AUTO) or {}).get("outcome") == "running":
             release.finish(p, "failed", why=f"exit {e.code}; see logs/upgrade.log")
         raise
@@ -7119,6 +7188,11 @@ def cmd_upgrade(a) -> None:
         raise
     finally:
         held.close()
+
+
+def _restart_daemon(p: Project):
+    from . import service
+    return service.restart(p)
 
 
 def _own_run(p: Project) -> bool:
@@ -7158,7 +7232,7 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
     the last one was just superseded), not only once a day. `parked`: the project is paused and this finish
     task holds the merge: a clean merge supersedes it and lands (the daemon restarts, still paused); a
     conflict retargets it and exits 75, the task finishing it once the project is resumed."""
-    from . import release
+    from . import release, upjournal
     from .project import HOME_DIR
     src = HOME_DIR / "lib" / "current"
     if not (src / "runtime").is_dir():
@@ -7182,6 +7256,7 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
     _restore_cut_runtime(h)
     left = _commit_local_changes(p, ident)
     base = _git(h, "rev-parse", "HEAD")     # the merge is checked against this; main must not move meanwhile
+    upjournal.step(p, "committed", base=base)
     _snapshot_upstream(p, src, new_v, new_c, ident)
     kept: dict[str, str] = {}
     merged, problem = _merge_upstream(h, p.state / "upgrade-merge", ident, base, kept)
@@ -7251,6 +7326,7 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
             release.finish(p, "failed", why=moved[:300])
         die(f"upgrade not applied; the running harness is unchanged. {moved}", 1)
     genv = {**os.environ, release.GUARD_ENV: "1"}
+    upjournal.step(p, "merging", base=base, merged=_git(h, "rev-parse", merged))
     r = subprocess.run(["git", "-C", str(h), *ident, "merge", "--ff-only", merged], capture_output=True, text=True,
                        env=genv)
     if r.returncode != 0:   # the daemon committed charter or memory meanwhile: those touch other files
@@ -7262,6 +7338,7 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
                 + (f"; files a running harness task changed were left for it to commit ({', '.join(left[:5])}): "
                    f"rerun `ttp upgrade {p.name}` once it has committed them" if left else ""), 1)
     sync_all()       # a reboot right after must not leave the files git just wrote empty
+    upjournal.step(p, "merged")
     if parked:      # merged without its worker: the paused project's finish task has nothing left to do
         release.fence(p, parked["task"], f"{new_v} ({new_c})")
         print(f"{p.name} is paused: merged its files without harness task #{parked['task']}, which is cancelled "
@@ -7274,6 +7351,7 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
         print(ttl_note)
     print("harness up to date with the installed template; restarting the daemon")
     from . import service
+    upjournal.step(p, "restarting")
     res = service.restart(p)
     if not auto:
         _exit_for_restart(res)
@@ -7614,7 +7692,7 @@ def _apply_upgrade(p: Project, commit: str) -> None:
     """`ttp upgrade <name> --apply <commit>`: the last step of an upgrade task. Fast-forwards main to the
     task's checked merge, under the upgrade lock, only when it takes in the current template and main
     has not moved past it; then restarts the daemon like any upgrade."""
-    from . import release
+    from . import release, upjournal
     h = p.harness
     r = subprocess.run(["git", "-C", str(h), "rev-parse", "-q", "--verify", commit + "^{commit}"],
                        capture_output=True, text=True)
@@ -7626,14 +7704,17 @@ def _apply_upgrade(p: Project, commit: str) -> None:
     if subprocess.run(["git", "-C", str(h), "merge-base", "--is-ancestor", "HEAD", merged]).returncode != 0:
         die(f"--apply refused: main moved and {commit} does not contain it; nothing was changed. In the "
             f"worktree: `git merge main`, check again, commit, then rerun with the new commit.", 1)
+    upjournal.step(p, "merging", base=_git(h, "rev-parse", "HEAD"), merged=merged)
     r = subprocess.run(["git", "-C", str(h), "merge", "--ff-only", merged], capture_output=True, text=True,
                        env={**os.environ, release.GUARD_ENV: "1"})
     if r.returncode != 0:
         die(f"--apply: could not fast-forward main to {commit}: {(r.stderr or r.stdout).strip()[-400:]}", 1)
     sync_all()
+    upjournal.step(p, "merged")
     release.clear_stuck(p)
     print(f"harness main is now {merged[:12]}; restarting the daemon")
     from . import service
+    upjournal.step(p, "restarting")
     _exit_for_restart(service.restart(p))
 
 
@@ -9306,6 +9387,10 @@ def main(argv: list[str] | None = None) -> None:
     a = ap.parse_args(_project_name_argv(sub, _say_finding_argv(_say_all_argv(_secret_value_argv(_secret_env_argv(
         sys.argv[1:] if argv is None else list(argv)))))))
     dry_run_stub(a)
+    try:
+        _recover_setup()     # a `ttp setup` a reboot cut short: finished or rolled back before anything else
+    except Exception as e:
+        print(f"ttp: could not recover an interrupted `ttp setup`: {e}", file=sys.stderr)
     a.fn(a)
 
 

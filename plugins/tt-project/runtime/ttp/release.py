@@ -500,8 +500,10 @@ def launch(p: Project) -> None:
 
 def start(p: Project, d: dict) -> None:
     """Record the try first, so a crash or a conflict is never retried for the same release."""
+    old = p.db.kv(KV_AUTO) or {}
+    cut = int(old.get("interrupted") or 0) if old.get("key") == d["key"] else 0   # upjournal: cuts in a row
     p.db.set_kv(KV_AUTO, {"key": d["key"], "from": d["current"], "to": d["installed"], "ts": time.time(),
-                          "outcome": "running"})
+                          "outcome": "running", **({"interrupted": cut} if cut else {})})
     launch(p)
 
 

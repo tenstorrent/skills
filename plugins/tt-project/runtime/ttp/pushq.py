@@ -1792,7 +1792,7 @@ def tend_receipts(p: Project, alert: Callable = lambda *a, **k: None, now: float
             continue
         rid = str(m.get("id") or receipt.stem)
         if m.get("status") == "rerun" and float(m.get("rerun_at") or 0) <= now - RERUN_START_S \
-                and int(m.get("tries") or 0) > MAX_RESUMES:
+                and int(m.get("tries") or 0) >= MAX_RESUMES:
             m["status"] = "running"     # its rerun never got going: reported below as stopped
             write_json(receipt, m)
         if m.get("status") in ("held", "rerun") or (m.get("status") == "running" and locks.any_free(

@@ -90,6 +90,7 @@ from . import lease as leasemod
 from . import localspend
 from . import lockprobe
 from . import locks
+from . import upjournal
 from . import machine_ledger
 from . import netwait
 from . import obligations
@@ -796,6 +797,7 @@ class Daemon:
         self._notify = os.environ.pop("NOTIFY_SOCKET", None)
         self._stacks = register_stack_dump(self.p.state)
         self._mark_start()
+        self._recover_upgrade()
         try:   # a project made before home zones gets one, once (timefmt.migrate)
             if timefmt.migrate(self.p, log=lambda m: log(self.p, m)):
                 self._load_config()
@@ -6981,6 +6983,23 @@ class Daemon:
             log(self.p, f"host check: project.json names {change['was']}, this machine is {change['now']}")
             self.alert("integrity-host", integrity.host_text(change), severity="high", every_s=0)
 
+    def _recover_upgrade(self) -> None:
+        """A `ttp upgrade` cut short (a reboot mid-way) is finished or rolled back (upjournal), at start and
+        on each release check, under the upgrade lock (a rerun of it may hold the lock: it recovers)."""
+        if not upjournal.path(self.p).exists():
+            return
+        held = locks.try_take([release.upgrade_lock(self.p)], f"ttp daemon (pid {os.getpid()})", "upgrade recovery")
+        if held is None:
+            return
+        try:
+            line = upjournal.recover(self.p, daemon_started=self._started, log=lambda m: log(self.p, m))
+            if line:
+                self.p.db.post("out", f"tt-project: {line}", chat=None, kind="alert", severity="low")
+        except Exception:
+            log(self.p, "upgrade recovery error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+        finally:
+            held.close()
+
     def check_release(self) -> None:
         """Hourly (and at start): is a newer tt-project installed than this harness runs? Status and
         the web app say so while it is. With upgrade.auto on, and no push or upgrade in flight, start
@@ -6988,6 +7007,7 @@ class Daemon:
         keeping workers. The same version from another commit is only shown. A project that was paused is
         checked on its first tick after the resume: the upgrade the pause held back starts then."""
         now = time.time()
+        self._recover_upgrade()
         paused = bool(self.p.db.kv("paused", False))
         if getattr(self, "_release_paused", False) and not paused:
             self._release_due = 0.0
