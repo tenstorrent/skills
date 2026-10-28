@@ -10347,7 +10347,8 @@ class Daemon:
         review.sweep_after_s, whose branch head is on no push-branch ref (local refs and push_queue
         rows only, no fetch) gets its review queued (_auto_review), with one low feed line naming it.
         Left alone: a review of it that is open or ran since its last run (or that names this head),
-        an open task continuing it or on its branch, a push-queue entry for it or its head, and a
+        an open task continuing it or on its branch (not one that waits on it landing: a split head
+        such a task waits on gets its review), a push-queue entry for it or its head, and a
         recorded reason (superseded or rejected, a `no_push`, a diff all under push_exclude_paths, a
         head its PR carries, a push branch no push can reach, a landing `ttp landed` records). At most
         review.unreviewed_per_pass reviews per pass, only tasks updated within
@@ -10429,10 +10430,14 @@ class Daemon:
         if db.one("SELECT 1 FROM task_superseded WHERE task=? UNION ALL SELECT 1 FROM task_landings WHERE task=? "
                   "UNION ALL SELECT 1 FROM push_queue WHERE task=?", (tid, tid, tid)):
             return "superseded, landed or queued"
-        if any(x["id"] != tid and (continues_id(x) == tid or x["branch"] == t["branch"]) for x in live):
+        # A task that waits on this one landing (a deploy or live check) carries none of its work: counted
+        # as its continuation, a head no review lands would hold it forever.
+        if any(x["id"] != tid and (continues_id(x) == tid or x["branch"] == t["branch"])
+               and not self._waits_landing(x, tid) for x in live):
             return "an open task continues it"
-        if chaincap.split_head(t) and db.one("SELECT 1 FROM tasks WHERE labels LIKE ? AND status!='cancelled'",
-                                             (f'%"continues:{tid}"%',)):
+        if chaincap.split_head(t) and any(
+                not self._waits_landing(x, tid) for x in db.q("SELECT id, labels FROM tasks WHERE labels LIKE ? "
+                                                              "AND status!='cancelled'", (f'%"continues:{tid}"%',))):
             return "a later hop of its split chain carries it"
         tip = worktree._git(self.p.root, "rev-parse", "--verify", "--quiet", f"{t['branch']}^{{commit}}", check=False)
         if not tip:
@@ -10459,6 +10464,15 @@ class Daemon:
         if self._landed_elsewhere(t):
             return "landed under other commits"
         return ""
+
+    def _waits_landing(self, x: dict, tid: int) -> bool:
+        """Whether task `x` (a row with id and labels) waits on task `tid` landing: its start_when, or
+        the retry_when of its waiting hand-off, names it (chaincap.waits_landing)."""
+        if chaincap.waits_landing(deferral(x).get("when"), tid):
+            return True
+        row = self.p.db.one("SELECT status, result FROM tasks WHERE id=?", (x["id"],))
+        result = load_result(row["result"]) if row and row["status"] not in TERMINAL_TASK_STATES else {}
+        return result.get("status") == "waiting" and chaincap.waits_landing(result.get("retry_when"), tid)
 
     def _auto_review(self, task: dict, summary: str, add: bool = True) -> tuple[int, bool] | None:
         """The review of a finished code task, queued here the way the coordinator would, so a
@@ -11005,7 +11019,7 @@ class Daemon:
         """chaincap.hop_ready for a done task whose only proposal is one `continue:` follow-up; ''
         otherwise or when it cannot be read (the coordinator decides then)."""
         if len(fups) != 1 or upstream.is_note(fups[0]) or fups[0].get("start_after") or fups[0].get("start_when") \
-                or not chaincap.CONT_TITLE.match(str(fups[0]["title"])):
+                or not chaincap.CONT_TITLE.match(str(fups[0]["title"])) or chaincap.post_landing(fups[0], task["id"]):
             return ""
         try:
             return chaincap.hop_ready(self.p, self.cfg, task, fups[0])
@@ -11023,11 +11037,13 @@ class Daemon:
 
     def _split(self, task: dict, result: dict, fups: list[dict]) -> str:
         """The head a done code task left unfinished, labelled chaincap.SPLIT_LABEL on it, or '': a
-        branch with changes not yet landed under other commits, and a `continue:` follow-up or a
-        hand-off that marks the head WIP or split (chaincap.marked_split)."""
+        branch with changes not yet landed under other commits, and a `continue:` follow-up that is no
+        post-landing step (chaincap.post_landing: it would wait on this head landing, which only its
+        review brings) or a hand-off that marks the head WIP or split (chaincap.marked_split)."""
         if chaincap.split_head(task):
             return chaincap.split_head(task)
-        cont = any(chaincap.CONT_TITLE.match(str(f.get("title") or "")) and not upstream.is_note(f) for f in fups)
+        cont = any(chaincap.CONT_TITLE.match(str(f.get("title") or "")) and not upstream.is_note(f)
+                   and not chaincap.post_landing(f, task["id"]) for f in fups)
         branch = task.get("branch")
         if not branch:
             return ""

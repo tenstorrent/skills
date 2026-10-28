@@ -72,3 +72,113 @@ def test_review_fix_kind_reads_labels_and_falls_back_to_the_fix_title():
     assert not fix({"title": "Fix reviewer docs", "labels": '["continues:1"]'})
     assert not fix({"title": "x", "labels": "not json"}) and not fix({"title": "x", "labels": '{"review_fix:1": 1}'})
     assert not fix({"title": None, "labels": None})
+
+
+def _finish_with_followups(env, p, title, fups):
+    """_finish_code whose done hand-off proposes `fups(tid)` (follow-ups that may name the task's id)."""
+    def before(tid, head):
+        (env["tmp"] / f"run-{tid}" / "result.json").write_text(json.dumps(
+            {"status": "done", "summary": f"{title} works", "followups": fups(tid)}))
+    return _finish_code(env, p, title, {f"{title.replace(' ', '_')}.py": 5}, before=before)
+
+
+def _hops_of(p, tid):
+    return p.db.q("SELECT * FROM tasks WHERE labels LIKE ?", (f'%"continues:{tid}"%',))
+
+
+def test_a_finished_code_task_whose_only_continue_waits_on_its_landing_is_no_split_and_gets_its_review(env):
+    """A done code task whose only `continue:` follow-up is a post-landing step (start_when landed:#<it>)
+    is no split: the daemon queues its normal review, and queues no hop that would wait forever."""
+    from ttp import chaincap
+    p = make(env)
+    tid, branch, done, reviews = _finish_with_followups(env, p, "installer fix", lambda tid: [
+        {"title": "continue: deploy and verify", "spec": "Run the installer on the hosts.",
+         "start_when": f"landed:#{tid}"}])
+    assert not chaincap.split_head(p.db.task(tid))
+    (rev,) = reviews
+    assert rev["title"] == f"Review #{tid}: installer fix" and branch in rev["spec"]
+    assert "Split at head" not in done["text"] and not _hops_of(p, tid)
+    # A wait on another task's landing is no post-landing step of this one.
+    assert not chaincap.post_landing({"title": "continue: deploy", "start_when": f"landed:#{tid}0"}, tid)
+    assert chaincap.post_landing({"title": "continue: deploy", "retry_when": f"ttp landed --task {tid}"}, tid)
+
+
+def test_a_wording_only_post_landing_continue_is_no_split(env):
+    """No wait field, but the follow-up says it runs once this task lands and names a live step: no split,
+    a review, and no daemon hop started before the landing."""
+    from ttp import chaincap
+    p = make(env)
+    tid, _, done, reviews = _finish_with_followups(env, p, "service unit", lambda tid: [
+        {"title": "continue: roll it out", "spec": "After it lands, deploy and verify the live install."}])
+    assert not chaincap.split_head(p.db.task(tid)) and len(reviews) == 1 and not _hops_of(p, tid)
+    assert chaincap.post_landing({"title": "continue: live check", "spec": f"Once #{tid} lands, verify it on each "
+                                                                         f"host."}, tid)
+    # Landing words without a live step, a live step without landing words, or another task's landing: no.
+    assert not chaincap.post_landing({"title": "continue: docs", "spec": "After it lands, update the README."}, tid)
+    assert not chaincap.post_landing({"title": "continue: install docs", "spec": "Write the install section."}, tid)
+    assert not chaincap.post_landing({"title": "continue: deploy", "spec": f"Once #{tid + 1} lands, deploy."}, tid)
+
+
+def test_a_continue_titled_to_land_push_or_fix_the_change_is_still_a_split(env):
+    from ttp import chaincap
+    for title in ("continue: land the change, then deploy", "continue: push it and roll out",
+                  "continue: fix the review findings", "continue: finish the installer and install it"):
+        assert not chaincap.post_landing({"title": title, "spec": "After it lands, deploy it."}, 7), title
+    assert chaincap.post_landing({"title": "continue: deploy the fix", "spec": "After it lands, deploy."}, 7)
+    p = make(env)
+    tid, branch, _, reviews = _finish_with_followups(env, p, "parser fix", lambda tid: [
+        {"title": "continue: push the change, then deploy it", "spec": "After it lands, deploy it on each host."}])
+    assert chaincap.split_head(p.db.task(tid)) == _git_out(env["repo"], "rev-parse", branch).strip()
+    assert not reviews
+
+
+def test_a_same_branch_continuation_is_still_a_split_beside_a_post_landing_one(env):
+    """A real `continue:` hop keeps today's split (no review until the last hop), also when a post-landing
+    follow-up rides along."""
+    from ttp import chaincap
+    p = make(env)
+    tid, branch, _, reviews = _finish_with_followups(env, p, "lexer", lambda tid: [
+        {"title": "continue: tests for the lexer", "spec": "Add the tests on this branch, then hand off."},
+        {"title": "continue: deploy", "spec": "Deploy it.", "start_when": f"landed:#{tid}"}])
+    assert chaincap.split_head(p.db.task(tid)) == _git_out(env["repo"], "rev-parse", branch).strip()
+    assert not reviews
+    assert not chaincap.post_landing({"title": "continue: tests for the lexer",
+                                      "spec": "Add the tests on this branch, then hand off."}, tid)
+
+
+def _split_at(p, tid, head):
+    """Label an _unreviewed task a split at `head`, keeping its age (the sweep skips fresh tasks)."""
+    when = p.db.task(tid)["updated"]
+    p.db.update_task(tid, labels=[f"split:{head}"])
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (when, tid))
+
+
+def test_the_unreviewed_sweep_reviews_a_split_head_an_open_task_waits_on_to_land(env):
+    """A split head with no review that an open task waits on landing (its start_when, or a waiting
+    hand-off's retry_when) gets exactly one review from the sweep, none beside it later; a split head
+    a real hop carries gets none."""
+    from ttp import daemon as dm
+    p = make(env)
+    tid, _, head = _unreviewed(env, p, "stuck head")
+    _split_at(p, tid, head)
+    p.db.add_task("deploy it", "s", kind="code", origin="coordinator",
+                  labels=[f"continues:{tid}", f"start_when:landed:#{tid}"])
+    d = dm.Daemon(p.base)
+    assert d.sweep_unreviewed(force=True) == [tid]
+    (rev,) = _daemon_reviews(p, tid)
+    assert rev["title"] == f"Review #{tid}: stuck head"
+    for st in ("queued", "running", "done"):
+        p.db.update_task(rev["id"], status=st)
+        assert d.sweep_unreviewed(force=True) == [], st
+    assert len(_daemon_reviews(p, tid)) == 1
+    # A waiting hand-off's retry_when names the landing.
+    t2, _, h2 = _unreviewed(env, p, "stuck head two")
+    _split_at(p, t2, h2)
+    w = p.db.add_task("live check", "s", kind="code", origin="coordinator", labels=[f"continues:{t2}"])
+    p.db.update_task(w, status="queued", result=json.dumps({"status": "waiting", "retry_when": f"landed:#{t2}"}))
+    assert d.sweep_unreviewed(force=True) == [t2] and len(_daemon_reviews(p, t2)) == 1
+    # A real hop carries its split head: no review.
+    t3, _, h3 = _unreviewed(env, p, "real split")
+    _split_at(p, t3, h3)
+    p.db.add_task("continue: tests", "s", kind="code", origin="daemon", labels=[f"continues:{t3}"])
+    assert d.sweep_unreviewed(force=True) == [] and not _daemon_reviews(p, t3)

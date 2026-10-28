@@ -25,7 +25,9 @@ Model-free hop (`chains.auto`, on by default): a done task whose only proposal i
 follow-up, in a lineage below every cap, that made progress gets the follow-up queued by the daemon
 with `continues` set (an AUTO_EVENT). A hop of a done task starts from the base, not its branch, with
 one exception: a split. A code task whose branch has changes and that proposes a `continue:` hop, or
-whose hand-off marks its head unfinished (marked_split), ended as a split (SPLIT_LABEL, split:<head>):
+whose hand-off marks its head unfinished (marked_split), ended as a split (SPLIT_LABEL, split:<head>);
+a `continue:` follow-up that runs only once the task has landed (post_landing: a deploy, live install or
+check) carries nothing forward and makes no split:
 its head is work in progress. It gets no review, and its hop takes the branch over (`continues:`, so
 it starts from that head) and starts at once: a start_when `landed:` on a task of its own chain could
 never pass, as those commits land only with the hop's own work (own_wait refuses it). The open tasks
@@ -73,6 +75,16 @@ SPLIT_LABEL = "split:"   # a done code task that ended as a split: split:<its he
 SPLIT_SUMMARY = re.compile(r"(?i)^\W*split\b(?=\s*(?:at|here|mid|after|before|because|per|on|by|[(:;,.]|$))"
                            r"|\bpast the split line\b")
 WIP_SUBJECT = re.compile(r"(?:^|[\s(\[])WIP(?=$|[\s):\]])|\(work in progress\)")
+# A post-landing follow-up's own words (post_landing): it runs after or once the task lands, and does a
+# live step; a title that lands, reviews, pushes, fixes or finishes the change still carries it forward.
+AFTER_LANDING = re.compile(r"(?i)\b(?:after|once|when)\b[^.;:\n]{0,40}?\b(?:lands|landed|landing|is\s+pushed"
+                           r"|reaches\s+the\s+push\s+branch)\b")
+LIVE_STEP = re.compile(r"(?i)\b(?:deploy\w*|(?:re-?)?install\w*|upgrad\w*|roll(?:s|ed|ing)?[\s-]?outs?"
+                       r"|live\s+(?:check|test|run)\w*|verif\w*\b[^.;\n]{0,40}?\bon\s+(?:a|the|each|every|its)?\s*"
+                       r"(?:host|box|machine|node)s?)\b")
+CARRIES = re.compile(r"(?i)^\s*(?:continue|mechanical)\s*:\s*(?:then\s+|and\s+)?(?:re-?)?(?:land|review|push|fix"
+                     r"|finish|complete)\w*\b|\b(?:land|review|push|fix|finish)(?:e?s)?\s+(?:it|this|the|its)\b")
+WAIT_KEYS = ("start_when", "retry_when", "wait", "waiting_for")
 
 
 def caps(cfg: dict) -> dict:
@@ -259,6 +271,30 @@ def marked_split(result: dict, subject: str = "") -> bool:
     result = result if isinstance(result, dict) else {}
     return result.get("split") is True or result.get("wip") is True \
         or bool(SPLIT_SUMMARY.search(str(result.get("summary") or ""))) or bool(WIP_SUBJECT.search(subject or ""))
+
+
+def waits_landing(probe, task_id: int) -> bool:
+    """Whether a start_when, retry_when or wait names task `task_id`'s landing: `landed:#<id>` or a
+    `ttp landed --task <id>` / `ttp landed #<id>` term."""
+    return bool(re.search(rf"(?i)\blanded:\s*#?{int(task_id)}(?!\d)|\bttp\s+landed\s+(?:--task\s+)?#?{int(task_id)}"
+                          rf"(?![\d\w])", str(probe or "")))
+
+
+def post_landing(fup: dict, task_id: int) -> bool:
+    """Whether a follow-up of task `task_id` runs only after that task lands, so it is no hop of a split:
+    its start_when or wait names the landing (waits_landing, decisive: such a task can never carry the
+    work to its landing), or its title and spec say it runs after or once the task lands (AFTER_LANDING,
+    no other task id in that phrase) and name a live step (LIVE_STEP), with no title that lands,
+    reviews, pushes, fixes or finishes the change (CARRIES)."""
+    fup = fup if isinstance(fup, dict) else {}
+    if any(waits_landing(fup.get(k), task_id) for k in WAIT_KEYS):
+        return True
+    title = str(fup.get("title") or "")
+    if CARRIES.search(title):
+        return False
+    text = f"{title}\n{fup.get('spec') or ''}"
+    return bool(LIVE_STEP.search(text)) and any(
+        all(n == str(task_id) for n in re.findall(r"#(\d+)", m.group(0))) for m in AFTER_LANDING.finditer(text))
 
 
 def split_head(task: dict | None) -> str:
