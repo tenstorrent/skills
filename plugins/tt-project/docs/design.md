@@ -64,6 +64,10 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    after the hand-off it still sleeps, and the coordinator is asked once to fix the probe or cancel.
    A probe that can never pass (command not found, a run dir or worktree that is gone, a devq job
    unknown to its runner) is raised once per wait when it is first seen.
+   A spec update wakes it once (a `task_update` by the coordinator or the user; the hand-off keeps
+   the digest of the spec it slept on), so its worker reads the new spec before the probe passes;
+   another hold (a dependency, start_after, start_when, a paused or busy resource, a gate) still
+   holds it first, and at most 3 such wakes an hour wake one task.
    A queued wait whose note names an ask or task (`ask #12`, `task #34`, `#34`) is kept current:
    once that ask is resolved or that task is done, the note says so and its probe (retry_when or
    start_when) runs again at once. Its probe, dependencies, start_when, not_before and attempts

@@ -196,7 +196,7 @@ ESCALATIONS_PER_RUN = 2
 ESCALATE_READ_MAX = 1 << 16       # bytes of ESCALATE_FILE read; lines past it count as nothing
 # What a waiting hand-off keeps across a run the account refused (limit, auth).
 WAIT_KEYS = ("retry_when", "retry_after_s", "waiting_for", "wake_tier", "next_step", "survives_reboot", "waits",
-             "waiting_since", "stale_wakes", "wait_key", "on_pass_cmd", refwaits.FACTS_KEY)
+             "waiting_since", "stale_wakes", "wait_key", "on_pass_cmd", refwaits.FACTS_KEY, "spec_seen", "spec_wakes")
 MAX_FOLLOWUPS, FOLLOWUP_SPEC_CHARS = 12, 4000   # per hand-off; each follow-up is its own event
 # What a review the daemon queues repeats of the code task's spec and hand-off.
 AUTO_REVIEW_SPEC_CHARS, AUTO_REVIEW_SUMMARY_CHARS = 2000, 1000
@@ -266,6 +266,10 @@ PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` (or a deferred
 NOT_YET_RCS = (1, 75, 255)   # probe exits meaning "not yet": 1, EX_TEMPFAIL (a busy `ttp lock`), ssh unreachable
 JOB_FAILED = "detached job failed"   # what a `ttp detach --check` exit detach.FAILED_RC found (Daemon._job_failed)
 PROBE_TIMEOUT_S = 60
+# A task asleep on its retry_when wakes once when its spec changes (Daemon._spec_wake): its hand-off keeps
+# the spec's digest it slept on (SPEC_SEEN_KEY) and its recent spec-change wakes (SPEC_WAKES_KEY), at most
+# SPEC_WAKES_PER_H an hour (a loop guard).
+SPEC_SEEN_KEY, SPEC_WAKES_KEY, SPEC_WAKES_PER_H = "spec_seen", "spec_wakes", 3
 PROBE_STALL_PASS_S = 120   # probe time one probe-stall disposition pass may spend (sweep.dispose_probe_stalls)
 # The detached rerun of a shared failure's ids on the push-branch tip (Daemon._start_tip_check):
 # argv dir worktree repo timeout_s cmd...; removes the worktree, then writes rc (124 once timed out),
@@ -742,6 +746,7 @@ class Daemon:
         self._probe_out: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last output, unchanged since, probe
         self._probe_live: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last line, when read, probe
         self._woke_on: dict[int, tuple[int | str, float, str]] = {}   # task -> the verdict its last wake came on (wake gate)
+        self._spec_capped: set[int] = set()   # tasks whose spec-change wake the loop guard holds (logged once)
         self._wait_what_errs: set[str] = set()   # causes of lock-probe errors already logged (_wait_what)
         # Exclusive slot reservations (_slot_reservations): canonical lock -> {"task", "holder", "free_since"},
         # the (lock, task) pairs whose reservation timed out, and the pass's reservers while dispatch runs.
@@ -3986,6 +3991,11 @@ class Daemon:
                 extra["stale_wakes"] = 0
             if "waiting_since" in extra and (said := worktree.probe_hold_text(task["id"], result.get("retry_when"))):
                 log(self.p, said)
+            if "waiting_since" in extra:
+                # The spec it slept on: a later change (a task_update) wakes it once (_spec_wake).
+                from .prompts import spec_digest
+                extra[SPEC_SEEN_KEY] = spec_digest(self.p.db.task(task["id"]) or task)
+                extra[SPEC_WAKES_KEY] = _recent_spec_wakes(prev_res, time.time())
         # A review that passes may hand its approved commits to the push queue instead of pushing
         # (delivery.push_queue): it waits as 'pushing' until a batch pushed them (pushq.py).
         approval, push_note, push_quiet = None, "", False
@@ -4123,7 +4133,8 @@ class Daemon:
             {"summary": summary, "status": shown, **extra,
              **({k: v for k, v in result.items()
                  if k not in ("summary", "waits", "waiting_since", "woke", "reboot_wakes", "escalated_wake",
-                              "stale_wakes", "wait_key", handoffcheck.KEY, ROOT_WAKE_KEY)}
+                              "stale_wakes", "wait_key", SPEC_SEEN_KEY, SPEC_WAKES_KEY, handoffcheck.KEY,
+                              ROOT_WAKE_KEY)}
                 if isinstance(result, dict) else {})})}
         if reason:
             upd["blocked_reason"] = reason[:500]
@@ -7950,6 +7961,8 @@ class Daemon:
             if prev.get("status") != "waiting" or not isinstance(probe, str) or not probe.strip() \
                     or deferral(t).get("when"):
                 continue
+            if t["not_before"] > now and self._spec_wake(t, prev, probe, now):
+                continue
             self._drop_stale_probe(t["id"], probe)
             if t["not_before"] <= now:
                 # Hand-offs from before the hold, and tasks already woken, keep their timer.
@@ -9032,6 +9045,63 @@ class Daemon:
         held = gate and (not gate.allow_new_work or (task["origin"] in ("schedule", "harness")
                                                       and not gate.allow_optional))
         log(self.p, f"task {tid} retry_when {why}; {f'held by gate {gate.level}' if held else 'dispatching'}")
+
+    def _spec_wake(self, t: dict, prev: dict, probe: str, now: float) -> bool:
+        """A task asleep on its retry_when whose spec changed since its waiting hand-off (a task_update by
+        the coordinator or the user; a worker writes no spec) wakes once, so its worker reads the new spec
+        now, not once the probe passes. The hand-off keeps the digest of the spec it slept on; the wake
+        stores the new one, so several edits between ticks wake it once and a re-sleep on that spec stays
+        asleep. Another hold keeps it asleep with the old digest (_spec_wake_hold): it wakes once that hold
+        is over, if the probe has not woken it first. At most SPEC_WAKES_PER_H an hour. True when it woke."""
+        from .prompts import spec_digest
+        seen, sha, tid = prev.get(SPEC_SEEN_KEY), spec_digest(t), t["id"]
+        if seen == sha:
+            return False
+        if not isinstance(seen, str):   # a hand-off from before the digest was kept: this spec is its baseline
+            self.p.db.update_task(tid, result=dump_result({**prev, SPEC_SEEN_KEY: sha}))
+            return False
+        wakes = _recent_spec_wakes(prev, now)
+        if len(wakes) >= SPEC_WAKES_PER_H:
+            if tid not in self._spec_capped:
+                self._spec_capped.add(tid)
+                log(self.p, f"task {tid}: its spec changed, but it woke {len(wakes)} times in the last hour "
+                            f"on spec changes; it sleeps on its retry_when until that falls under {SPEC_WAKES_PER_H}")
+            return False
+        try:
+            held = self._spec_wake_hold(t, probe, now)
+        except Exception as e:   # an unreadable hold keeps it asleep: its probe and timer still wake it
+            held = f"its holds could not be read ({type(e).__name__}: {e})"
+        if held:
+            return False
+        self._spec_capped.discard(tid)
+        self._wake_waiting(t, "its spec changed", now, extra={SPEC_SEEN_KEY: sha, SPEC_WAKES_KEY: wakes + [now]})
+        self.p.db.update_task(tid, blocked_reason="woken: its spec changed; it runs by rank, before its probe passes")
+        return True
+
+    def _spec_wake_hold(self, t: dict, probe: str, now: float) -> str | None:
+        """What keeps a waiting task asleep through a spec change, or None: an unmet dependency, a
+        start_after still ahead, a wait only on `ttp lock --probe` (a busy resource), or what dispatch
+        itself would hold it on (_start_hold: a paused or busy resource, a logged-out or unreachable
+        provider, the budget gate, its own budget, the caps, a branch clash). A full worker slot holds
+        nothing: the woken task waits its turn by rank."""
+        db = self.p.db
+        if db.unmet_dependencies([t]).get(t["id"]):
+            return "an unmet dependency"
+        after = deferral(t).get("after")
+        if after and after > now:
+            return "its start_after"
+        found, rest = locks.lock_probe_parts(probe)
+        if found and not rest:
+            return "a busy resource"
+        prov = t["provider"] or self.cfg.get("core_provider") or "claude"
+        busy = {r["provider"]: r["n"] for r in db.q(
+            "SELECT provider, COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running' GROUP BY provider")}
+        ctx = {"now": now, "paused": db.paused_resources(), "busy": busy, "committed": None,
+               "logged_out": {prov: self._logged_out(prov)}}
+        why = self._start_hold(t, prov, ctx)
+        if why == "device" or why == "gate" and t["id"] in ctx.get("full", {}):
+            return None
+        return why
 
     def _probe_passed(self, task: dict, now: float, why: str = "probe passed") -> None:
         """A waiting task's probe passed. A wait on its own detached `ttp checks` is settled here
@@ -12607,6 +12677,12 @@ def _last_notes(run_dir: Path, n: int = 5) -> list[str]:
     except OSError:
         return []
     return [x[:300] for x in lines if x.strip()][-n:]
+
+
+def _recent_spec_wakes(prev: dict, now: float) -> list[float]:
+    """The times of a waiting task's spec-change wakes within the last hour (Daemon._spec_wake)."""
+    got = prev.get(SPEC_WAKES_KEY)
+    return [x for x in got if isinstance(x, (int, float)) and 0 <= now - x < 3600] if isinstance(got, list) else []
 
 
 def _same_probe(full: dict, prev: dict, key: str = "retry_when") -> bool:

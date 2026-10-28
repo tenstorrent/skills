@@ -153,6 +153,9 @@ read the one for the lever you change.
   check's applicability is declared; a related change that lacks its test still fails.
 - Wait on an upstream fix with a probe (`ttp deployed`, a version check) as `retry_when`, never
   `blocked`. A hand-off is done only once the consumer acknowledged it and recovered.
+- A task asleep on its `retry_when`: a spec update wakes it once (the coordinator's or the user's
+  `task_update`, never the worker's own notes), unless another hold (a dependency, start_after,
+  start_when, a paused or busy resource, a gate) still holds it. No watcher or extra wake task.
 - See "Liveness, progress and deploys" in `docs/design.md`.
 
 ## Stored secrets never reach tool output
