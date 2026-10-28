@@ -340,7 +340,7 @@ def test_isolated_worker_with_a_connector_stays_strict_without_a_trusted_host_li
     cases = [("no list", lambda: None, "no list of this host's MCP servers yet"),
              ("unreadable", lambda: (p.state / mcpgap.CACHE).write_text("{not json"), "no list"),
              ("too old", lambda: _host_list(p, at=time.time() - mcpgap.TRUST_S - 60), "h old"),
-             ("from the future", lambda: _host_list(p, at=time.time() + 3600), "h old"),
+             ("from the future", lambda: _host_list(p, at=time.time() + 3600), "in the future"),
              ("before names", lambda: (_host_list(p), mcpgap.write_json(
                  p.state / mcpgap.CACHE, {k: v for k, v in mcpgap.read(p.state).items() if k != "names"})), "no list"),
              ("failed probe", lambda: mcpgap.write_json(p.state / mcpgap.CACHE, {"at": time.time(), "ok": False,

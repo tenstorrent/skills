@@ -139,8 +139,10 @@ def host_list(entry: dict | None, now: float | None = None) -> tuple[list[str] |
         why = entry.get("error") if entry and not entry.get("ok") else ""
         return None, "no list of this host's MCP servers yet" + (f" (`claude mcp list`: {why})" if why else "")
     age = now - float(good.get("at") or 0)
-    if not -300 <= age <= TRUST_S:
-        return None, f"the last list of this host's MCP servers is {max(age, 0) / 3600:.0f} h old"
+    if age < -300:
+        return None, "the last list of this host's MCP servers is dated in the future (clock change?)"
+    if age > TRUST_S:
+        return None, f"the last list of this host's MCP servers is {age / 3600:.0f} h old"
     return [str(n) for n in good["names"]], ""
 
 
