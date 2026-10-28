@@ -6124,9 +6124,10 @@ def test_pinned_memory_overflow_is_marked_in_the_prompt_and_alerts_the_coordinat
     system = worker_system(p)
     use = worker_context(p)[2]
     n = use["pinned_dropped"]
-    shown = [i for i in range(10) if f"RULE-{i} " in system]
+    shown = [i for i in range(10) if f"RULE-{i} " + "y" * 900 in system]
     assert 0 < n < 10 and shown == list(range(10 - n)), (n, shown)   # the oldest that fit, whole
-    assert f"({n} more entries for workers are in {p.memory_dir}/: read those your task touches)" in system
+    assert f"Shortened for room, each in full in {p.memory_dir}/<name>.md (read those your task touches):" in system
+    assert all(f"] RULE-{i} yyy" in system for i in range(10 - n, 10)), "the rest as pointers"
     assert "did not fit" not in system
     assert "NEW-FACT" not in system and "OLD-FACT" not in system
     alerts = lambda: p.db.q("SELECT text FROM events WHERE kind='memory_over_budget'")
@@ -15125,9 +15126,9 @@ def test_pinned_worker_memory_past_its_room_shows_the_task_s_entries_and_a_plain
     assert pinned[17].stem in shown and pinned[0].stem in shown and pinned[19].stem not in shown, shown
     assert not any("FACT-NEWEST" in e["line"] for e in mem)
     system = worker_system(p, task)
-    assert "WORKER-17 uses rack-17" in system and "WORKER-19 " not in system
-    assert system.rstrip().endswith(f"({n} more entries for workers are in {p.memory_dir}/: read those your task "
-                                    f"touches)")
+    assert "WORKER-17 uses rack-17 " + "w" * 600 in system and "WORKER-19 uses rack-19 " + "w" * 600 not in system
+    assert system.rstrip().endswith("…") and f"\n[{pinned[19].stem}] WORKER-19 uses rack-19 www" in system
+    assert f"Shortened for room, each in full in {p.memory_dir}/<name>.md" in system
     assert "did not fit" not in system
     # No task: the oldest that fit, as before.
     assert [e["name"] for e in worker_context(p)[1]] == [f.stem for f in pinned[:20 - n]]
@@ -15157,12 +15158,12 @@ def test_worker_memory_keeps_charter_policies_drops_restated_restrictions_and_ma
     names = [e["line"] for e in mem]
     assert not any("Push only to branch dev/widget." in x or "GENERIC" in x for x in names), names
     assert any(x.endswith("] Never push.") for x in names) and use["duplicates"] == 2
-    assert 0 < use["pinned_dropped"] < 30 and use["shown"] == len(mem)
+    assert 0 < use["pinned_dropped"] == len(use["pointers"]) <= 30 and use["shown"] == len(mem)
     n = use["pinned_dropped"]
-    assert f"{n} more entries for workers are in {p.memory_dir}/" in block
+    assert f"Shortened for room, each in full in {p.memory_dir}/<name>.md" in block
     assert len(block) <= WORKER_MEMORY_CHARS + WORKER_MEMORY_CHARS // 2, len(block)
     line = coord.worker_pinned_line(p)
-    assert f"leaves {n} of 31 pinned entries out of worker prompts" in line, line
+    assert f"shortens {n} of 31 pinned entries to a pointer in worker prompts" in line, line
     assert line in audit.lines(p.db, p=p)
     from ttp import cli
     cli.main(["doctor", p.name])
@@ -15212,9 +15213,69 @@ def test_pinned_memory_counts_each_entry_against_the_budget_of_the_prompt_that_s
     cli.main(["doctor", p.name])
     assert (f"pinned memory: coordinator {use['pinned_chars']} of {use['limit']} chars (5 pinned; shows "
             f"{use['shown']} of the 25 entries meant for it), workers {work['pinned_chars']} of "
-            f"{work['memory_limit']} chars (5 pinned; shows {work['shown']} of the {work['entries']} meant "
+            f"{work['memory_limit']} chars (5 pinned, 0 of them as pointers; shows {work['shown']} of the {work['entries']} meant "
             f"for them)") in capsys.readouterr().out
     assert use["entries"] == 25 and use["shown"] < 25 and work["entries"] == 5, (use, work)
+
+
+def test_pinned_worker_memory_past_its_room_shows_or_points_to_every_entry_and_never_shortens_a_restriction(
+        env, capsys):
+    """Memory pinned for workers several times their room: every pinned entry is in the worker's prompt,
+    whole or as a pointer (its name, its first sentence and where it is in full), a restriction is
+    always whole however large, and `ttp doctor` and the daily review name each entry pointed to."""
+    p = make(env)
+    from ttp import audit, cli, coordinator as coord
+    from ttp.project import MEMORY_POINTER_CHARS
+    from ttp.prompts import worker_context, worker_system
+    rule = "BIG-RULE never reboot a shared box mid-job. " + "r" * 5000
+    paths = _memories(p, [("restriction", rule, "workers"),
+                          ("resource", "BOX-RES box A (alias box-a) is ours. More detail follows.")]
+                      + [("decision", f"TAG-{i:02} workers use queue {i}. " + "t" * 700, "workers") for i in range(12)]
+                      + [("preference", "LONG-PREF " + "x" * 3000, "workers")])
+    _, mem, use = worker_context(p)
+    system = worker_system(p)
+    block = system[system.index("# PROJECT MEMORY"):]
+    whole = {e["name"] for e in mem}
+    pointed = {x["name"] for x in use["pointers"]}
+    assert pointed and whole | pointed == {f.stem for f in paths} and not whole & pointed, (whole, pointed)
+    assert use["pinned_dropped"] == len(pointed)
+    assert rule in block and paths[0].stem in whole, "a restriction is never shortened"
+    for i, f in enumerate(paths[2:14]):
+        if f.stem in pointed:
+            assert f"\n[{f.stem}] TAG-{i:02} workers use queue {i}.\n" in block + "\n", f.stem
+    long = paths[14].stem
+    assert long in pointed and pointed & {f.stem for f in paths[2:14]}, pointed
+    cut = next(x["line"] for x in use["pointers"] if x["name"] == long)
+    assert cut.endswith("…") and cut.startswith(f"[{long}] LONG-PREF xx") and len(cut) == MEMORY_POINTER_CHARS, cut
+    assert f"Shortened for room, each in full in {p.memory_dir}/<name>.md" in block
+    assert p.db.kv("memory_shown")["entries"].keys() >= whole | pointed
+    line = coord.worker_pinned_line(p)
+    assert all(n in line for n in pointed) and f"shortens {len(pointed)} of {use['pinned']}" in line, line
+    assert line in audit.lines(p.db, p=p)
+    cli.main(["doctor", p.name])
+    out = capsys.readouterr().out
+    assert line in out
+    assert f"{use['pinned']} pinned, {len(pointed)} of them as pointers;" in out, out
+
+
+def test_doctor_prints_the_coordinator_and_worker_pinned_counts_against_their_limits(env, capsys):
+    """`ttp doctor` gives the memory pinned for the coordinator and for workers, each against its own
+    limit, with how many pinned entries reach workers only as a pointer."""
+    p = make(env)
+    from ttp import cli
+    from ttp.project import COORDINATOR_MEMORY_CHARS
+    from ttp.prompts import worker_context
+    _memories(p, [("resource", "BOX-RES box A (alias box-a) is ours.")]
+              + [("decision", f"TAG-{i:02} " + "t" * 900, "workers") for i in range(10)])
+    coord_use, work = p.memory_select(COORDINATOR_MEMORY_CHARS)[1], worker_context(p)[2]
+    n = len(work["pointers"])
+    assert n and coord_use["pinned"] == 1
+    cli.main(["doctor", p.name])
+    out = capsys.readouterr().out
+    assert (f"pinned memory: coordinator {coord_use['pinned_chars']} of {COORDINATOR_MEMORY_CHARS} chars (1 pinned; "
+            f"shows {coord_use['shown']} of the {coord_use['entries']} entries meant for it), workers "
+            f"{work['pinned_chars']} of {work['memory_limit']} chars ({work['pinned']} pinned, {n} of them as "
+            f"pointers; shows {work['shown']} of the {work['entries']} meant for them)") in out, out
 
 
 def test_a_sandboxed_worker_queues_machine_changes_for_its_daemon_when_the_shared_ledger_is_read_only(
@@ -15405,8 +15466,8 @@ def test_memory_cli_add_prints_the_pinned_worker_total_and_warns_once_it_outgrow
     assert n > 0 and total > use["memory_limit"]
     assert f"pinned worker memory: {total} of {use['memory_limit']} chars ({use['pinned']} entries)" in out.out
     assert out.err.startswith("warning: pinned worker memory over budget: "
-                              f"{total} chars for {use['memory_limit']} of room leaves {n} of {use['pinned']} "
-                              "pinned entries out of worker prompts"), out.err
+                              f"{total} chars for {use['memory_limit']} of room shortens {n} of {use['pinned']} "
+                              "pinned entries to a pointer in worker prompts"), out.err
     cli.main(["memory", "demo", "A plain fact for workers.", "--kind", "fact"])
     assert "warning: pinned worker memory over budget" in capsys.readouterr().err
     cli.main(["memory", "demo", "--forget", old[2].stem])
@@ -15515,9 +15576,9 @@ def test_worker_policies_keep_their_own_room_beside_long_goals_and_large_pinned_
     assert use["charter_dropped"] == 0
     for item in policies + ["- Delivery: workers commit on their own branch", "- Style: workers keep answers short"]:
         assert item in text, item[:20]
-    assert 0 < use["pinned_dropped"] < 30
+    assert 0 < use["pinned_dropped"] == len(use["pointers"]) <= 30   # 30 pointers alone fill the room
     block = worker_system(p)
-    assert "Policy 9: workers open a draft PR" in block and "more entries for workers are in" in block
+    assert "Policy 9: workers open a draft PR" in block and "Shortened for room, each in full in" in block
 
 
 def test_worker_memory_gives_task_ranked_entries_a_floor_past_a_long_charter(env):
@@ -16259,7 +16320,8 @@ def test_every_worker_prompt_carries_every_standing_entry_for_workers(env, kind,
         assert gone not in system, gone
     use = worker_context(p, task)[2]
     assert use["pinned_dropped"] > 0, "the fixture must overflow the workers' pinned room"
-    assert "STANDING-" not in "".join(x for x in block.splitlines() if x.startswith("(")), "a pointer stands in"
+    pointers = block[block.index("Shortened for room"):]
+    assert "STANDING-" not in pointers, "a pointer stands in for none of them"
 
 
 def test_standing_worker_memory_past_its_room_is_kept_whole_and_alerts_once(env):
@@ -16549,9 +16611,11 @@ def test_the_reported_light_harness_run_carries_every_restriction_resource_and_s
         assert line in block, f.stem
     assert "COORD-DECISION" not in block and "FACT-2" not in block
     assert tagged.stem not in shown and use["pinned_dropped"] == 1
-    assert f"(1 more entries for workers are in {p.memory_dir}/" in block
+    assert f"Shortened for room, each in full in {p.memory_dir}/<name>.md" in block
+    assert f"\n[{tagged.stem}] " in block
     line = coord.worker_pinned_line(p)
     assert line.startswith("pinned worker memory over budget: ") and "1 of 6 pinned entries" in line, line
+    assert f"where it is in full): {tagged.stem};" in line, line
     coord.memory_budget_check(p)
     alerts = p.db.q("SELECT text FROM events WHERE kind='memory_over_budget'")
     assert len(alerts) == 1 and "so 1 of them reach workers only as a pointer" in alerts[0]["text"], alerts

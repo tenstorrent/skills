@@ -3761,13 +3761,13 @@ def pinned_memory_line(p: Project) -> str:
     coord, work = p.memory_select(COORDINATOR_MEMORY_CHARS)[1], worker_context(p)[2]
     return (f"pinned memory: coordinator {coord['pinned_chars']} of {coord['limit']} chars ({coord['pinned']} "
             f"pinned; shows {coord['shown']} of the {coord['entries']} entries meant for it), workers "
-            f"{work['pinned_chars']} of {work['memory_limit']} chars ({work['pinned']} pinned; shows "
-            f"{work['shown']} of the {work['entries']} meant for them)")
+            f"{work['pinned_chars']} of {work['memory_limit']} chars ({work['pinned']} pinned, "
+            f"{len(work['pointers'])} of them as pointers; shows {work['shown']} of the {work['entries']} meant for them)")
 
 
 def worker_pinned_line(p: Project, use: dict | None = None) -> str:
     """One line, for `ttp doctor` and the daily review, while memory pinned for workers outgrows its
-    room in their prompt, so some of it reaches them only as a pointer to memory/. `use`: a
+    room in their prompt, so some of it reaches them only as a pointer, naming each. `use`: a
     worker_context usage already at hand."""
     from .prompts import worker_context
     use = use or worker_context(p)[2]
@@ -3776,8 +3776,14 @@ def worker_pinned_line(p: Project, use: dict | None = None) -> str:
                 f"workers ({use['kept_chars']} chars) outgrow their {use['memory_limit']} chars of room; every "
                 f"worker prompt still carries them whole; merge or shorten them") if use["kept_over"] else ""
     return (f"pinned worker memory over budget: {use['pinned_chars']} chars for {use['memory_limit']} of room "
-            f"leaves {use['pinned_dropped']} of {use['pinned']} pinned entries out of worker prompts (they get "
-            f"a pointer to memory/); merge or shorten restrictions, resources and entries for workers")
+            f"shortens {use['pinned_dropped']} of {use['pinned']} pinned entries to a pointer in worker prompts "
+            f"(name, first sentence and where it is in full): {pointed_names(use)}; merge or shorten "
+            f"restrictions, resources and entries for workers")
+
+
+def pointed_names(use: dict) -> str:
+    """The entries a worker_context usage `use` shows only as pointers, by name."""
+    return ", ".join(x["name"] for x in use["pointers"])
 
 
 def worker_pinned_total(p: Project) -> tuple[str, str]:
@@ -3912,7 +3918,8 @@ def memory_budget_check(p: Project) -> None:
                 f"Memory pinned for workers ({over['pinned']} restriction, resource, standing or workers' entries, "
                 f"{over['pinned_chars']} chars) exceeds the {over['memory_limit']} chars their prompt leaves it "
                 f"after the charter digest ({over['charter_chars']} chars), so {over['pinned_dropped']} of them "
-                f"reach workers only as a pointer to memory/, and no other entries do. Merge or retire those "
+                f"reach workers only as a pointer (name, first sentence and where it is in full): "
+                f"{pointed_names(over)}; and no other entries do. Merge or retire those "
                 f"entries (`memory_add` with `supersedes`, or `memory_forget`). Shorten (standing) entries "
                 f"with a standing `memory_add` that supersedes them; never retire them for space.", "queued"))
         p.db.set_kv(MEMORY_ALERT_KEY, True)

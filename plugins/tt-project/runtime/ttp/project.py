@@ -940,6 +940,10 @@ WORKER_POLICY_MIN_CHARS = WORKER_MEMORY_CHARS // 2
 # Room for a worker's unpinned (task-ranked) memory past the pinned entries shown, whatever the
 # charter digest leaves: ranking always has room to show something.
 WORKER_RANKED_MIN_CHARS = 1500
+# A pinned entry for workers with no room left in their prompt is shown as a pointer: its name and
+# its first sentence, the line cut to this many chars (memory_pointer), so even dozens of them stay
+# within about the room. Restrictions are never shortened.
+MEMORY_POINTER_CHARS = 120
 # A user's correction of a fact (a `fact` whose text starts CORRECTION_PREFIX) is listed first, under
 # CORRECTIONS_HEADER, in every worker's prompt and the coordinator's digest for CORRECTION_DAYS, and no
 # memory budget drops it there; past CORRECTION_MAX entries or CORRECTION_CHARS the oldest go first.
@@ -985,6 +989,16 @@ def coordinator_memory(e: dict) -> bool:
     those tagged for workers alone (`audience: workers`), which only worker_memory counts. A
     restriction binds everyone, whatever its audience."""
     return e.get("audience") != "workers" or e["kind"] == "restriction"
+
+
+def memory_pointer(e: dict) -> str:
+    """The line a worker's prompt shows for pinned entry `e` its room cannot hold whole: its name and
+    first sentence, the line at most MEMORY_POINTER_CHARS (its name whole). The prompt says where
+    the whole entry is."""
+    text = " ".join(e.get("body", "").split())
+    line = f"[{e['name']}] " + re.split(r"(?<=[.!?;])\s", text, maxsplit=1)[0]
+    return line if len(line) <= MEMORY_POINTER_CHARS else \
+        line[:max(MEMORY_POINTER_CHARS, len(e["name"]) + 13) - 1].rstrip() + "…"
 
 
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./#:-]*[A-Za-z0-9]")
@@ -1444,10 +1458,13 @@ class Project:
         then, only if every pinned one fits: for `task`, the
         others that share words with its title and spec (task_words; a word few entries share weighs
         more), most shared first, then newest, each that fits; then those that speak of workers and
-        then the facts, newest first while all fit `limit_chars`. An entry whose text `restated(text)`
+        then the facts, newest first while all fit `limit_chars`. A pinned one with no room whole is
+        never left out: it gets a pointer (memory_pointer), whose room is set aside before any of
+        them is shown whole; a restriction is never one. An entry whose text `restated(text)`
         says the prompt already states (the charter's restrictions) is left out. Usage numbers as
         memory_select's, counting only the entries meant for workers, plus `duplicates` (left out as
-        restated), `pinned_dropped` (pinned ones past `pinned_limit`), `kept`, `kept_chars` and
+        restated), `pinned_dropped` (pinned ones past `pinned_limit`, shown as `pointers`: dicts of
+        `name` and `line`, oldest first), `kept`, `kept_chars` and
         `kept_over` (those always carried alone outgrow `pinned_limit`, or `limit_chars` without one).
         user_corrections are left out: worker_system lists them on their own, outside this budget.
         `entries`: the live entries to select from in place of memory/'s (a write not made yet)."""
@@ -1473,13 +1490,18 @@ class Project:
         chosen = {e["name"] for e in kept}
         over = pinned_limit is not None and pinned_chars > pinned_limit
         score = scores(pinned) if over and want else {}
+        # Past the room, each of the others is at least pointed to: their pointers' room comes first,
+        # then each shown whole (in place of its pointer) while that fits.
+        short = {e["name"]: memory_pointer(e) for e in pinned if over and e["name"] not in chosen}
+        used += sum(len(x) + 1 for x in short.values())
         for _, e in sorted(enumerate(pinned), key=lambda x: (-score.get(x[1]["name"], 0), x[0])):
             if e["name"] in chosen:
                 continue
-            if pinned_limit is None or used + len(e["line"]) + 1 <= pinned_limit:
+            ptr = len(short[e["name"]]) + 1 if e["name"] in short else 0
+            if pinned_limit is None or used - ptr + len(e["line"]) + 1 <= pinned_limit:
                 chosen.add(e["name"])
-                used += len(e["line"]) + 1
-        # None of the others while a pinned one is left out.
+                used += len(e["line"]) + 1 - ptr
+        # None of the others while a pinned one is only pointed to.
         rest = [e for e in entries if worker_memory(e) != 1 and e["name"] not in dup] \
             if len(chosen) == len(pinned) else []
         if task:
@@ -1497,7 +1519,8 @@ class Project:
                 chosen.add(e["name"])
                 used += len(e["line"]) + 1
         shown = [e for e in entries if e["name"] in chosen]
-        return shown, {"entries": len(entries), "shown": len(shown), "pinned": len(pinned),
+        pointers = [{"name": e["name"], "line": short[e["name"]]} for e in pinned if e["name"] not in chosen]
+        return shown, {"entries": len(entries), "shown": len(shown), "pinned": len(pinned), "pointers": pointers,
                        "chars": sum(len(e["line"]) + 1 for e in entries), "pinned_chars": pinned_chars,
                        "limit": limit_chars, "duplicates": len(dup),
                        "pinned_over": pinned_chars > (limit_chars if pinned_limit is None else pinned_limit),

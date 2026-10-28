@@ -360,8 +360,9 @@ def _worker_heads(p: Project, dropped: int, n: int) -> tuple[str, str]:
     return _CHARTER_HEAD.format(more=more, path=p.charter_path), _MEMORY_HEAD.format(n=n, path=p.memory_index)
 
 
-# Where a worker finds the memory pinned for it that its prompt has no room for: a pointer, not a fault.
-_PINNED_MORE = "({n} more entries for workers are in {path}/: read those your task touches)"
+# Heads the pointers to the memory pinned for workers that its prompt has no room for whole (see
+# Project.worker_memory_select): where each is in full; not a fault.
+_PINNED_MORE = "Shortened for room, each in full in {path}/<name>.md (read those your task touches):"
 
 
 def _norm(text: str) -> str:
@@ -407,7 +408,7 @@ def worker_context(p: Project, task: dict | None = None,
     or WORKER_RANKED_MIN_CHARS past the pinned ones if that is more (see worker_memory_select).
     Memory never pushes out a policy. Memory entries that restate the charter's restrictions are left
     out: the prompt states those whole in their own block. Pinned entries past their budget are
-    counted in `pinned_dropped` (worker_system says where to read them). `entries`: memory entries in
+    shown as pointers (`pointers`, counted in `pinned_dropped`; worker_system says where to read them). `entries`: memory entries in
     place of memory/'s (see Project.worker_memory_select). Returns (charter text, memory entries, usage)."""
     raw = p.charter_path.read_text() if p.charter_path.exists() else ""
     secs = [(h, b) for h, b in charter_sections(charter_without_placeholders(raw))
@@ -443,8 +444,8 @@ def worker_context(p: Project, task: dict | None = None,
     room = max(rest, WORKER_PINNED_MIN_CHARS)   # for pinned entries
     restated = restated_in(charter_restrictions(raw))
     mem, use = p.worker_memory_select(rest, task, room, restated, entries)
-    if use["pinned_dropped"]:   # make room for the line saying so
-        room -= len(_PINNED_MORE.format(n=999, path=p.memory_dir)) + 1
+    if use["pinned_dropped"]:   # make room for the line heading the pointers
+        room -= len(_PINNED_MORE.format(path=p.memory_dir)) + 1
         mem, use = p.worker_memory_select(min(rest, room), task, room, restated, entries)
     elif use["pinned_chars"] + WORKER_RANKED_MIN_CHARS > rest:   # every pinned one shown: the others' floor
         mem, use = p.worker_memory_select(use["pinned_chars"] + WORKER_RANKED_MIN_CHARS, task, room, restated, entries)
@@ -545,12 +546,12 @@ def worker_system(p: Project, task: dict | None = None) -> str:
     charter, mem, use = worker_context(p, task)
     # The user's corrections come before the rest of memory, outside its budget (Project.user_corrections).
     fixed = worker_corrections(p)
-    p.note_memory_shown([e["name"] for e in fixed + mem])
+    p.note_memory_shown([e["name"] for e in fixed + mem + use["pointers"]])
     head, mem_head = _worker_heads(p, use["charter_dropped"], len(p._memory_entries()))
     parts.append(head + (charter or "(none)"))
     if fixed:
         parts.append(f"# {CORRECTIONS_HEADER.upper()}\n" + "\n".join(e["line"] for e in fixed))
-    more = [_PINNED_MORE.format(n=use["pinned_dropped"], path=p.memory_dir)] if use["pinned_dropped"] else []
+    more = [_PINNED_MORE.format(path=p.memory_dir)] + [x["line"] for x in use["pointers"]] if use["pointers"] else []
     if mem or more:
         parts.append(mem_head + "\n".join([e["line"] for e in mem] + more))
     return "\n\n".join(x for x in parts if x.strip())
