@@ -16957,3 +16957,24 @@ def test_config_set_accepts_checks_nice_and_ionice_and_rejects_bad_values(env):
                       {"type": "config_set", "key": "checks.ionice", "value": "best-effort:8"}])
     assert len(probs) == 4
     assert p.config()["checks"] == {"nice": 15, "ionice": "best-effort:3"}
+
+
+def _promise_text(tasks, owners):
+    from ttp import obligations as ob
+    o = {"promise": {"chat": "c1", "message": 7, "tasks": tasks, "due": 2e9, "timed": True},
+         "owners": {str(t): {} for t in owners}}
+    return ob._promise_state(o, 1e9, None)
+
+
+def test_promise_state_shows_owners_attached_to_the_obligation():
+    text = _promise_text([], [901, 902])
+    assert "owner #901, #902" in text and "no owner task" not in text
+
+
+def test_promise_state_shows_the_union_of_promise_tasks_and_obligation_owners():
+    text = _promise_text([903, 901], [902, 901])
+    assert "owner #901, #902, #903" in text and "no owner task" not in text
+
+
+def test_promise_state_without_any_owner_says_no_owner_task():
+    assert "no owner task" in _promise_text([], [])

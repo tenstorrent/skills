@@ -1152,8 +1152,9 @@ def _promise_state(o: dict, now: float, where) -> str:
     from . import timefmt
     pr = o["promise"]
     late = now >= pr["due"]
+    ids = _owner_ids(o)
     return (f"chat {pr['chat']}, message #{pr['message']}, "
-            + (f"owner #{', #'.join(map(str, pr['tasks']))}" if pr["tasks"] else "no owner task")
+            + (f"owner #{', #'.join(map(str, ids))}" if ids else "no owner task")
             + f"; due {timefmt.long(pr['due'], where)}" + ("" if pr["timed"] else " (default)")
             + (f" OVERDUE {(now - pr['due']) / 3600:.1f} h" if late else ""))
 
