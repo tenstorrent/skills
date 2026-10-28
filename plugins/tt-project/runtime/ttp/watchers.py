@@ -22,7 +22,9 @@ deadline stops, keeps what it read, and reports one error saying it was cut shor
 `pr_workers` PRs at once, each PR within `pr_timeout_s`, so one slow PR times out alone while the others are
 read. Its gh reads are batched (PrCycle): one GraphQL query per repo and poll (PR_BATCH PRs a query) answers
 every PR's view and findings, and later asks in the same cycle reuse it, so gh runs do not grow with the PR
-count; each gh runs in a process group of its own. It reads the least recently checked PRs first
+count; each gh runs in a process group of its own. The batch reads each PR's first page only and never pages:
+a PR with more (over 100 checks, comments or reviews) is read per PR (gh pr view, then its findings) within
+its own deadline. Accepted gap: such a PR costs one extra per-PR read in that poll. It reads the least recently checked PRs first
 (PR_TRIED_KEY), so a run cut short is continued by the next and every PR gets its turn; a merged or closed
 PR is no longer read. Each run logs every gh call's duration per PR and which PRs it did not check, and why.
 A PR is read once per run however many tasks name it (a hand-off's `pr` sets its task's pr_url, so fix,
@@ -83,7 +85,9 @@ def _seconds(*values, default: float) -> float:
 
 def bounds(daemon, payload: dict, kind: str | None = None) -> tuple[float, float]:
     """(deadline_s, gh_timeout_s) of one run: the payload's, else the config's `watchers`, else the
-    defaults. The deadline is capped at DEADLINE_MAX_S and a gh call never outlasts it. A `prs` run
+    defaults. The deadline is capped at DEADLINE_MAX_S. Invariant: a gh call never outlasts the run's
+    deadline, nor its PR's: each call takes its timeout as it starts (_call_timeout), never before a
+    batched read or a lock wait, and with no time left no call is made. A `prs` run
     (`kind`, else the payload's builtin) whose payload sets no deadline gets at least the time its PR
     count needs (_sized_deadline)."""
     cfg = (getattr(daemon, "cfg", None) or {}).get("watchers") or {}
@@ -134,6 +138,13 @@ def _left() -> float | None:
     """Seconds left before the running builtin's deadline (None: unbounded)."""
     b = _BOUND.get()
     return None if b is None else b[0] - _now()
+
+
+def _call_timeout() -> float:
+    """The timeout of a gh call starting now: gh_timeout_s cut to the time left on the deadline in force
+    (a PR read's, which _read_prs never sets past the run's; else the run's). <= 0: make no call."""
+    b = _BOUND.get()
+    return GH_TIMEOUT_S if b is None else min(b[1], b[0] - _now())
 
 
 def _over() -> bool:
@@ -192,19 +203,20 @@ def _timed(timeout: float) -> None:
 
 
 def _gh(args: list[str], cwd: str) -> dict | None:
-    """gh's JSON answer, or None. Its timeout is the running builtin's per-call one, cut to the time
-    left before its deadline; past the deadline or once its schedule run was stopped it is not called.
-    A PR the poll cycle planned (PrCycle) is answered from its repo's one batched read. A call that
-    timed out is told to _read_pr (_TIMED_OUT)."""
-    left, b, run = _left(), _BOUND.get(), _RUN.get()
-    timeout = GH_TIMEOUT_S if b is None else min(b[1], left)
-    if timeout <= 0 or (run is not None and run.stopping.is_set()):
+    """gh's JSON answer, or None. Its timeout (_call_timeout) is taken as the call starts; past the
+    deadline or once its schedule run was stopped it is not called. A PR the poll cycle planned (PrCycle)
+    is answered from its repo's one batched read. A call that timed out is told to _read_pr (_TIMED_OUT)."""
+    run = _RUN.get()
+    if _call_timeout() <= 0 or (run is not None and run.stopping.is_set()):
         return None
     cycle = _CYCLE.get()
     if cycle is not None:
-        hit, answer = cycle.answer(args, cwd, timeout, run)
+        hit, answer = cycle.answer(args, cwd, run)
         if hit:
             return answer
+    timeout = _call_timeout()   # after any batched read or wait on one
+    if timeout <= 0 or (run is not None and run.stopping.is_set()):
+        return None
     res = _spawn(args, timeout, cwd, run)
     if res.timed_out:
         _timed(timeout)
@@ -219,22 +231,22 @@ def _gh(args: list[str], cwd: str) -> dict | None:
 
 # One batched read: a GraphQL query per repo and poll for up to PR_BATCH of its PRs, aliased p0, p1...,
 # fetching what `gh pr view --json PR_FIELDS` and BOT_QUERY return for each. About 10k nodes a PR, so a
-# batch stays far below GitHub's 500k-node cap per query. A connection with more pages than one (over 100
-# comments, reviews or checks) is read on, so the answers are whole, as gh's own are.
+# batch stays far below GitHub's 500k-node cap per query. Only first pages are read: a PR with a connection of
+# more pages than one (over 100 comments, reviews or checks) is read per PR, so the answers are whole.
 PR_BATCH = 20
-_PAGE = "pageInfo{hasNextPage endCursor} "
+_PAGE = "pageInfo{hasNextPage} "
 _AUTHOR = "author{__typename login} "
-# connection: (selection, "%s" taking its `after`; its path from the pullRequest node)
+# connection: (selection, its path from the pullRequest node)
 _CONNS = {
-    "comments": ("comments(first:100%s){" + _PAGE + "nodes{" + _AUTHOR + "body createdAt url}}", ("comments",)),
-    "reviews": ("reviews(first:100%s){" + _PAGE + "nodes{id " + _AUTHOR + "state body submittedAt url "
+    "comments": ("comments(first:100){" + _PAGE + "nodes{" + _AUTHOR + "body createdAt url}}", ("comments",)),
+    "reviews": ("reviews(first:100){" + _PAGE + "nodes{id " + _AUTHOR + "state body submittedAt url "
                 "comments(first:50){totalCount nodes{" + _AUTHOR + "body}}}}", ("reviews",)),
-    "checks": ("commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100%s){" + _PAGE
+    "checks": ("commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){" + _PAGE
                + "nodes{__typename ... on CheckRun{name status conclusion} ... on StatusContext{context state}}}}}}}",
                ("commits", "nodes", -1, "commit", "statusCheckRollup", "contexts")),
 }
 _PR_SEL = ("state isDraft mergeable reviewDecision url title headRefOid headRefName " + _AUTHOR
-           + "".join(sel % "" for sel, _ in _CONNS.values())
+           + "".join(sel for sel, _ in _CONNS.values())
            + "reviewThreads(first:100){nodes{isResolved isOutdated path comments(first:50){nodes{" + _AUTHOR
            + "body url}}}}")
 # A failed batch whose per-PR asks would fail alike (rate limit, auth): its PRs fail with it, no gh per PR.
@@ -287,11 +299,10 @@ class PrCycle:
     """One poll cycle's PR reads. The PRs it plans are read one batched GraphQL query per repo (PR_BATCH
     a query) when the first of them is asked for; every later ask in the cycle, from any consumer, is
     answered from that read with no gh call. A read that fails or times out fails each of its PRs, once
-    (a hung read cuts its whole batch): the next poll tries again, as with per-PR calls. A PR with more
-    pages (over 100 comments, reviews or checks) is read on by its own ask, in that ask's time: one PR's
-    pages never spend another's, and a PR whose pages were not read is never answered as read. Asks it
-    cannot answer (a PR it did not plan, other fields, an answer without the PR's alias or an error other
-    than NOT_FOUND on it) go to gh as before."""
+    (a hung read cuts its whole batch): the next poll tries again, as with per-PR calls. The batch reads
+    first pages only and never pages: a PR with more (over 100 comments, reviews or checks) asks gh per
+    PR, under its own deadline, as do asks it cannot answer otherwise (a PR it did not plan, other fields,
+    an answer without the PR's alias or an error other than NOT_FOUND on it)."""
 
     def __init__(self) -> None:
         import threading
@@ -313,8 +324,8 @@ class PrCycle:
                 for i in range(0, len(prs), PR_BATCH):
                     part = prs[i:i + PR_BATCH]
                     batch = {"host": host, "owner": owner, "name": name, "prs": part, "lock": threading.Lock(),
-                             "done": False, "timed_out": False, "refused": False, "got": {}, "unknown": set(),
-                             "pages": {}}   # pr_key: [number, node, nodes, cursors, its lock] still to page
+                             "done": False, "timed_out": False, "refused": False, "timeout": 0.0, "got": {},
+                             "unknown": set()}   # unknown: PRs that ask gh themselves (more pages, say)
                     self.where.update({k: batch for k, _ in part})
 
     @staticmethod
@@ -330,54 +341,45 @@ class PrCycle:
                 return prguard.pr_key(f"{vals['owner']}/{vals['name']}#{vals['number']}"), "data"
         return None, None
 
-    def answer(self, args: list[str], cwd: str, timeout: float, run=None) -> tuple[bool, dict | None]:
-        """(True, the answer) for an ask about a planned PR, reading its batch first if need be; else (False, None)."""
+    def answer(self, args: list[str], cwd: str, run=None) -> tuple[bool, dict | None]:
+        """(True, the answer) for an ask about a planned PR, reading its batch first if need be; else (False, None).
+        With no time left to read the batch: (True, None), no call; the asker's read is out of time."""
         key, what = self._ask(args)
         batch = self.where.get(key) if key else None
         if batch is None:
             return False, None
         with batch["lock"]:
             if not batch["done"]:
+                timeout = _call_timeout()   # taken now, after any wait on the lock
+                if timeout <= 0:
+                    return True, None   # left for a later ask with time
                 self._read(batch, cwd, timeout, run)
         if key in batch["unknown"]:
             return False, None
         if batch["timed_out"]:
-            _timed(timeout)
-        if key in batch["pages"]:
-            self._page(batch, key, cwd, timeout, run)
-            if key in batch["unknown"]:
-                return False, None
+            _timed(batch["timeout"])
         got = batch["got"].get(key)
         if got is None:
             return True, None
         view, data = json.loads(json.dumps(got))   # each consumer its own copy
         return True, data if what == "data" else {f: view.get(f) for f in what}
 
-    def _call(self, batch: dict, query: str, more: list[str], cwd: str, end: float, run,
-              flags: dict) -> dict | None:
-        """The answer's body, or None; a timeout (the time to `end` spent too) or a refusal is set in `flags`."""
+    def _read(self, batch: dict, cwd: str, timeout: float, run) -> None:
+        """The batched query within `timeout`, first pages only: a PR with more is left to ask gh itself."""
+        batch["done"], batch["timeout"] = True, timeout
         if run is not None and run.stopping.is_set():
-            return None
-        left = end - _now()
-        if left <= 0:
-            flags["timed_out"] = True
-            return None
+            return
+        query = ("query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
+                 + "".join(f"p{i}:pullRequest(number:{n}){{{_PR_SEL}}}" for i, (_, n) in enumerate(batch["prs"]))
+                 + "}}")
         host = [] if batch["host"] == "github.com" else ["--hostname", batch["host"]]
         with self._lock:
             self.spawned += 1
         res = _spawn(["api", "graphql", *host, "-f", f"query={query}", "-f", f"owner={batch['owner']}",
-                      "-f", f"name={batch['name']}", *more], left, cwd, run)
-        flags["timed_out"] |= bool(res is not None and res.timed_out)
-        flags["refused"] |= bool(res is not None and _REFUSED_RE.search(str(res.err or "")))
-        return _graphql(res)
-
-    def _read(self, batch: dict, cwd: str, timeout: float, run) -> None:
-        import threading
-        batch["done"] = True
-        query = ("query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
-                 + "".join(f"p{i}:pullRequest(number:{n}){{{_PR_SEL}}}" for i, (_, n) in enumerate(batch["prs"]))
-                 + "}}")
-        body = self._call(batch, query, [], cwd, _now() + timeout, run, batch)
+                      "-f", f"name={batch['name']}"], timeout, cwd, run)
+        batch["timed_out"] = bool(res is not None and res.timed_out)
+        batch["refused"] = bool(res is not None and _REFUSED_RE.search(str(res.err or "")))
+        body = _graphql(res)
         if body is None and not (batch["timed_out"] or batch["refused"] or _over()
                                  or run is not None and run.stopping.is_set()):
             batch["unknown"].update(k for k, _ in batch["prs"])   # gh failed otherwise: each PR asks itself
@@ -385,57 +387,17 @@ class PrCycle:
         repo = (body or {}).get("data", {}).get("repository")
         if not isinstance(repo, dict):
             return
-        for i, (key, number) in enumerate(batch["prs"]):
+        for i, (key, _) in enumerate(batch["prs"]):
             node = repo.get(f"p{i}")
             if not isinstance(node, dict):
                 if not _not_found(body, f"p{i}"):   # no alias, or an error other than gone: ask gh per PR
                     batch["unknown"].add(key)
                 continue   # gone: gh pr view would fail too
-            nodes, cursors = {}, {}
-            for conn, (_, path) in _CONNS.items():
-                page = _at(node, path) or {}
-                nodes[conn] = list(page.get("nodes") or [])
-                if (page.get("pageInfo") or {}).get("hasNextPage"):
-                    cursors[conn] = page["pageInfo"].get("endCursor")
-            if cursors:   # read on by the PR's own ask, in its own time (_page)
-                batch["pages"][key] = [number, node, nodes, cursors, threading.Lock()]
+            pages = {conn: _at(node, path) or {} for conn, (_, path) in _CONNS.items()}
+            if any((page.get("pageInfo") or {}).get("hasNextPage") for page in pages.values()):
+                batch["unknown"].add(key)   # more pages: read whole per PR, in its own time (never paged here)
             else:
-                batch["got"][key] = _views(node, nodes)
-
-    def _page(self, batch: dict, key: str, cwd: str, timeout: float, run) -> None:
-        """Read the PR's further pages within `timeout` (the asker's gh call time, as for gh pr view's own
-        paging). Answered once all are read. Out of time: the ask timed out and a later ask reads on from
-        there. A refusal answers nothing (as gh would); any other failure lets the PR ask gh itself."""
-        held = batch["pages"].get(key)
-        if held is None:
-            return
-        with held[4]:
-            if key not in batch["pages"]:
-                return   # another ask read it meanwhile
-            number, node, nodes, cursors, _ = held
-            end, flags = _now() + timeout, {"timed_out": False, "refused": False}
-            for conn in list(cursors):
-                sel, path = _CONNS[conn]
-                q = ("query($owner:String!,$name:String!,$number:Int!,$after:String!){repository(owner:$owner,"
-                     "name:$name){pullRequest(number:$number){" + sel % ",after:$after" + "}}}")
-                while conn in cursors:
-                    more = self._call(batch, q, ["-F", f"number={number}", "-f", f"after={cursors[conn]}"],
-                                      cwd, end, run, flags)
-                    page = _at((more or {}).get("data"), ("repository", "pullRequest", *path))
-                    if not isinstance(page, dict):
-                        if flags["timed_out"]:
-                            _timed(timeout)
-                        elif not (flags["refused"] or _over() or run is not None and run.stopping.is_set()):
-                            batch["unknown"].add(key)
-                            del batch["pages"][key]
-                        return
-                    nodes[conn] += page.get("nodes") or []
-                    if (page.get("pageInfo") or {}).get("hasNextPage"):
-                        cursors[conn] = page["pageInfo"].get("endCursor")
-                    else:
-                        del cursors[conn]
-            batch["got"][key] = _views(node, nodes)
-            del batch["pages"][key]
+                batch["got"][key] = _views(node, {conn: list(page.get("nodes") or []) for conn, page in pages.items()})
 
 
 _CYCLE: contextvars.ContextVar[PrCycle | None] = contextvars.ContextVar("watcher_pr_cycle", default=None)

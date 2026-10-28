@@ -2022,7 +2022,7 @@ def test_pr_watch_batched_reads_find_what_per_pr_reads_find(env, monkeypatch):
         findings = {k: {**r, "owner": r["owner"] and "#new"} for k, r in p.db.kv(prguard.FINDINGS_KEY).items()}
         got.append((p.db.kv("pr_signatures"), findings, events, p.db.kv(prguard.HEADS_KEY).keys()))
         if batched:
-            assert len(gh.calls) == 2 + 2 * 1 + 1, gh.calls   # a query a poll, 130 comments twice, 105 checks once
+            assert len(gh.calls) == 2 + 2 * 2 + 2, gh.calls   # a query a poll; per PR: 130 comments twice, 105 checks once
     assert got[0] == got[1]
     sigs, findings, events, _ = got[1]
     kinds = {k for k, *_ in events}
@@ -2058,21 +2058,29 @@ def test_a_failed_batched_read_fails_its_prs_or_lets_each_ask_gh(env, monkeypatc
         assert status == "ok (5 PRs, 0 changed)", status
 
 
-def _slow_gh(monkeypatch, gh, step: float = 3.0) -> None:
-    """Each gh call takes `step` seconds on the watcher's clock."""
+def _slow_gh(monkeypatch, gh, step=3.0) -> list:
+    """Each gh call takes `step` seconds (or step(argv)) on the watcher's clock, or times out at its timeout
+    if that is shorter. Returns the list of (start, timeout, end) of each call."""
     from ttp import boundedchild, watchers
-    clock = [1000.0]
+    clock, spans = [1000.0], []
 
     def slow(argv, timeout, **kw):
-        clock[0] += step
+        took = step(argv) if callable(step) else step
+        start = clock[0]
+        clock[0] += min(took, timeout)
+        spans.append((start, timeout, clock[0]))
+        if took > timeout:
+            gh.calls.append(argv[1:])
+            return boundedchild.Result(None, "", "", timed_out=True, error=f"timed out after {timeout} s")
         return gh(argv, timeout, **kw)
     monkeypatch.setattr(watchers, "_now", lambda: clock[0])
     monkeypatch.setattr(boundedchild, "run", slow)
+    return spans
 
 
 def test_batched_prs_with_more_pages_each_read_them_in_their_own_time(env, monkeypatch):
-    """PRs over 100 checks read their further pages on their own asks, each in its own gh call time: with
-    3 s a gh call, 8 such PRs all get signatures (as per-PR reads do), none spends another's time."""
+    """PRs over 100 checks are read per PR, each in its own gh call time: with 3 s a gh call, 8 such PRs
+    all get signatures (as per-PR reads do), none spends another's time."""
     from ttp import watchers
     from ttp.daemon import Daemon
     many = [(f"job{i}", "COMPLETED", "FAILURE" if i == 7 else "SUCCESS") for i in range(250)]
@@ -2088,20 +2096,91 @@ def test_batched_prs_with_more_pages_each_read_them_in_their_own_time(env, monke
         sigs.append(p.db.kv("pr_signatures"))
     assert len(sigs[1]) == 8 and sigs[0] == sigs[1]
     assert all(s["failing"] == ["job7"] for s in sigs[1].values())
-    assert len(gh.calls) == 8 * 2 + 1 + 8 * 2, "per-PR: view and findings; batched: one query, 2 pages a PR"
+    assert len(gh.calls) == 8 * 2 + 1 + 8 * 2, "per-PR: view and findings; batched: one query, then each PR's"
 
 
 def test_a_batched_pr_whose_pages_outlast_its_time_shows_as_not_checked(env, monkeypatch):
-    """A PR whose further pages do not fit its gh call time is reported cut by that timeout, never read
-    as answered with nothing to report; the PR batched with it is read."""
+    """A PR with more pages whose per-PR read does not fit its gh call time is reported cut by that timeout,
+    never read as answered with nothing to report; the PR batched with it is read."""
     from ttp import watchers
     from ttp.daemon import Daemon
     many = [(f"job{i}", "COMPLETED", "SUCCESS") for i in range(400)]
     p, gh = _pr_batch_setup(env, monkeypatch, {1: _gql_node(1, checks=many), 2: _gql_node(2)})
-    _slow_gh(monkeypatch, gh)
+    _slow_gh(monkeypatch, gh, lambda argv: 8.0 if argv[1:3] == ["pr", "view"] else 3.0)
     status = watchers.run_builtin(Daemon(p.base), "prs", {"deadline_s": 60, "gh_timeout_s": 5, "pr_workers": 1})
     assert status.startswith("cut short (1 of 2") and "acme/widgets#1 (5 s gh call timeout)" in status, status
     assert set(p.db.kv("pr_signatures")) == {"https://github.com/acme/widgets/pull/2"}
+
+
+def test_no_gh_call_of_a_multi_page_batched_pr_outlasts_the_run_deadline(env, monkeypatch):
+    """#4017: one PR of 250 checks and one plain PR, each gh call 15 s (timed out past its timeout), a 25 s
+    run with 20 s calls. No gh call ends past the run's deadline, and the multi-page PR is either read whole
+    in time or listed as not checked, never read as nothing to report."""
+    from ttp import watchers
+    from ttp.daemon import Daemon
+    many = [(f"job{i}", "COMPLETED", "FAILURE" if i == 210 else "SUCCESS") for i in range(250)]
+    p, gh = _pr_batch_setup(env, monkeypatch, {1: _gql_node(1, checks=many), 2: _gql_node(2)})
+    spans = _slow_gh(monkeypatch, gh, 15.0)
+    status = watchers.run_builtin(Daemon(p.base), "prs", {"deadline_s": 25, "gh_timeout_s": 20, "pr_workers": 1})
+    assert spans and all(end <= 1000.0 + 25 for _, _, end in spans), spans
+    sigs = p.db.kv("pr_signatures") or {}
+    url = "https://github.com/acme/widgets/pull/1"
+    assert (url in sigs and sigs[url]["failing"] == ["job210"]) or "acme/widgets#1 (" in status, (status, sigs)
+    assert not any("$after" in x for c in gh.calls for x in c), "the batch never pages"
+
+
+def test_a_worker_that_waited_on_the_batch_lock_times_its_call_from_its_start(env, monkeypatch):
+    """Two workers ask PRs of one batch; one reads it (15 s) while the other waits on its lock. Both PRs need
+    a per-PR read after: each call's timeout is the time left when it starts, so none ends past the run's
+    deadline (the timeout was once taken before the wait)."""
+    import threading
+    from ttp import watchers
+    from ttp.daemon import Daemon
+    many = [(f"job{i}", "COMPLETED", "SUCCESS") for i in range(150)]
+    p, gh = _pr_batch_setup(env, monkeypatch, {1: _gql_node(1, checks=many), 2: _gql_node(2, checks=many)})
+    waiting, plan = threading.Event(), watchers.PrCycle.plan
+
+    class Lock:   # the batch's lock, telling when a second asker waits on it
+        def __init__(self):
+            self.lock, self.n = threading.Lock(), 0
+
+        def __enter__(self):
+            self.n += 1
+            if self.n > 1:
+                waiting.set()
+            self.lock.acquire()
+
+        def __exit__(self, *exc):
+            self.lock.release()
+
+    def planned(self, urls):
+        plan(self, urls)
+        for batch in self.where.values():
+            batch["lock"] = Lock()
+    monkeypatch.setattr(watchers.PrCycle, "plan", planned)
+
+    def took(argv):
+        if any("pullRequest(number:" in x for x in argv):
+            assert waiting.wait(10), "the other worker waits on the batch's lock"
+        return 15.0
+    spans = _slow_gh(monkeypatch, gh, took)
+    watchers.run_builtin(Daemon(p.base), "prs", {"deadline_s": 25, "gh_timeout_s": 20, "pr_workers": 2})
+    assert waiting.is_set() and len(spans) >= 2, spans
+    assert all(start + timeout <= 1000.0 + 25 for start, timeout, _ in spans), spans
+
+
+def test_a_multi_page_batched_pr_is_read_per_pr_with_no_paging_in_the_batch(env, monkeypatch):
+    """A PR whose checks need a second page makes no paging call in the batch: it is read whole by gh pr
+    view and its findings query, its PR-mates from the one batched query."""
+    from ttp import watchers
+    from ttp.daemon import Daemon
+    many = [(f"job{i}", "COMPLETED", "FAILURE" if i == 120 else "SUCCESS") for i in range(130)]
+    p, gh = _pr_batch_setup(env, monkeypatch, {1: _gql_node(1), 2: _gql_node(2, checks=many), 3: _gql_node(3)})
+    assert watchers.watch_prs(Daemon(p.base)).startswith("ok (3 PRs, 3 changed)")
+    assert not any("$after" in x for c in gh.calls for x in c), gh.calls
+    assert len(gh.calls) == 3, gh.calls   # the batched query, then PR 2's view and findings
+    assert gh.calls[1][:3] == ["pr", "view", "https://github.com/acme/widgets/pull/2"] and "number=2" in gh.calls[2]
+    assert p.db.kv("pr_signatures")["https://github.com/acme/widgets/pull/2"]["failing"] == ["job120"]
 
 
 def test_a_batched_pr_null_for_a_reason_other_than_not_found_asks_gh_itself(env, monkeypatch):
