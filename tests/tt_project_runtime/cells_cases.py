@@ -7,11 +7,11 @@ from ttp.db import load_result
 SWEEP = "Measure throughput at each power level.\ncells: 150W, 200W; 250W\nReport each as a metric."
 
 
-def _finish_cells(env, p, spec, result, kind="question", title="power sweep"):
+def _finish_cells(env, p, spec, result, kind="question", title="power sweep", **kw):
     """A `kind` task with `spec` that hands off `result`; its done event's row."""
     from ttp.daemon import Daemon
     from ttp.providers.base import RunUsage as Usage
-    tid = p.db.add_task(title, spec, kind=kind, tier="standard", origin="coordinator")
+    tid = p.db.add_task(title, spec, kind=kind, tier="standard", origin="coordinator", **kw)
     p.db.update_task(tid, status="running")
     run_dir = env["tmp"] / f"run-{tid}"
     run_dir.mkdir()
@@ -256,3 +256,96 @@ def test_a_stored_descriptive_cells_line_never_marks_a_done_partial_or_starts_a_
         assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (tid,))
         assert not p.db.q("SELECT id FROM events WHERE task=? AND kind='followup_proposed'", (tid,))
         assert f"task {tid}: ignored a non-enumerable cells: line" in (p.logs / "daemon.log").read_text()
+
+
+GRID = "Run each model at each effort.\ncells: model-a lo, model-b hi, model-c lo, model-d lo"
+
+
+def _hop_cells_of(p, tid):
+    """The cells of #tid's `continue:` hop, queued or proposed; None when there is neither."""
+    from ttp import cells
+    hops = p.db.q("SELECT spec FROM tasks WHERE parent=? AND title LIKE 'continue:%'", (tid,))
+    fup = [e["text"] for e in p.db.q("SELECT text FROM events WHERE task=? AND kind='followup_proposed'", (tid,))
+           if "continue:" in e["text"]]
+    assert len(hops) + len(fup) <= 1, (hops, fup)
+    return cells.requested(hops[0]["spec"]) if hops else cells.requested(fup[0]) if fup else None
+
+
+def test_the_unrunnable_field_takes_a_dict_lines_or_rows_and_needs_a_reason():
+    from ttp import cells
+    want = {"model-blo": "gone", "81:00.0": "card removed"}
+    for got in ({"model-b lo": "gone", "81:00.0": "card removed", "x": ""},
+                ["model-b lo: gone", "81:00.0: card removed", "x", {"cell": "y"}],
+                "model-b lo: gone\n81:00.0: card removed; x:",
+                [{"cell": "Model-B  lo", "why": "gone"}, {"cell": "81:00.0", "reason": "card removed"}]):
+        assert {k: v[1] for k, v in cells.unrunnable({"cells_unrunnable": got}).items()} == want, got
+    assert cells.unrunnable({"cells_unrunnable": 3}) == {} and cells.unrunnable(None) == {}
+
+
+def test_a_tried_rejection_counts_only_as_the_newest_entry_naming_the_whole_cell():
+    from ttp import cells
+    rej = {"title": "model-a lo at max", "outcome": "rejected", "result": "404 model_not_found"}
+    assert list(cells.rejected([rej], ["model-a lo", "model-a"])) == ["model-alo"]
+    assert cells.rejected([rej, {"title": "model-a lo retry", "outcome": "kept"}], ["model-a lo"]) == {}
+    assert cells.rejected([{"title": "model-a lot", "outcome": "rejected"}], ["model-a lo"]) == {}
+    assert list(cells.rejected([{"title": "x", "outcome": "kept"}, rej], ["model-a lo"])) == ["model-alo"]
+
+
+def test_a_partial_whose_missing_cells_no_hop_can_produce_gets_no_hop_and_a_recorded_reason(env):
+    p = make(env)
+    # model-c lo is another open task's; reviews and finished tasks naming a cell own nothing.
+    owner = p.db.add_task("work: run model-c", "Run it.\ncells: model-c lo", kind="work")
+    p.db.add_task("review #1", "Check it.\ncells: model-d lo", kind="review")
+    gone = p.db.add_task("work: run model-d", "Run it.\ncells: model-d lo", kind="work")
+    p.db.update_task(gone, status="done")
+    res = {"status": "done", "summary": "ran the grid", "cells": ["model-a lo"],
+           "cells_unrunnable": {"model-b hi": "provider returns 404 model_not_found"},
+           "tried": [{"title": "model-d lo", "outcome": "rejected", "result": "not listed by the provider"}]}
+    tid, done = _finish_cells(env, p, GRID, res)
+    got = load_result(p.db.task(tid)["result"])
+    assert got["summary"].startswith("partial: 1 of 4 cells (missing: model-b hi, model-c lo, model-d lo).")
+    assert _hop_cells_of(p, tid) is None and got["followups"] == []
+    assert got["cells_no_hop"] == ["model-b hi: unrunnable (provider returns 404 model_not_found)",
+                                   f"model-c lo: owned by open #{owner}",
+                                   "model-d lo: tried and rejected: not listed by the provider"]
+    assert "No continue hop for missing cells" in done["text"] and f"owned by open #{owner}" in done["text"]
+    assert done["status"] == "queued"   # the coordinator sees the reason
+
+
+def test_a_mixed_partial_hops_only_for_its_runnable_unowned_cells(env):
+    p = make(env)
+    p.db.add_task("work: run model-c", "Run it.\ncells: model-c lo", kind="work")
+    res = {"status": "done", "summary": "ran the grid", "cells": ["model-a lo"],
+           "cells_unrunnable": ["model-b hi: provider returns 404 model_not_found"]}
+    tid, done = _finish_cells(env, p, GRID, res)
+    assert _hop_cells_of(p, tid) == ["model-d lo"]
+    got = load_result(p.db.task(tid)["result"])
+    assert [x.split(":")[0] for x in got["cells_no_hop"]] == ["model-b hi", "model-c lo"]
+    assert "No continue hop for missing cells" in done["text"]
+
+
+def test_a_plain_partial_hops_for_every_missing_cell_as_before(env):
+    p = make(env)
+    # A rejection with newer evidence after it, and one for a finished cell, take nothing out.
+    res = {"status": "done", "summary": "ran the grid", "cells": ["model-a lo"],
+           "tried": [{"title": "model-b hi", "outcome": "rejected"}, {"title": "model-b hi", "outcome": "kept"},
+                     {"title": "model-a lo", "outcome": "rejected"}]}
+    tid, done = _finish_cells(env, p, GRID, res)
+    assert _hop_cells_of(p, tid) == ["model-b hi", "model-c lo", "model-d lo"]
+    assert "cells_no_hop" not in load_result(p.db.task(tid)["result"])
+    assert "No continue hop" not in done["text"]
+
+
+def test_a_rejection_by_an_earlier_hop_of_the_chain_counts_for_a_day(env):
+    import time as _t
+    p = make(env)
+    first = p.db.add_task("grid", GRID, kind="question")
+    p.db.update_task(first, status="done", result=json.dumps(
+        {"status": "done", "tried": [{"title": "model-b hi", "outcome": "rejected", "result": "404"}]}))
+    res = {"status": "done", "summary": "ran more", "cells": ["model-a lo", "model-c lo"]}
+    tid, _ = _finish_cells(env, p, GRID, res, title="continue: missing cells of grid", parent=first)
+    assert _hop_cells_of(p, tid) == ["model-d lo"]
+    # Older than a day, it is no evidence any more.
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (_t.time() - 2 * 86400, first))
+    tid2, _ = _finish_cells(env, p, GRID, res, title="continue: missing cells of grid", parent=first)
+    assert _hop_cells_of(p, tid2) == ["model-b hi", "model-d lo"]

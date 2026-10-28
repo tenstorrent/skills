@@ -164,6 +164,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
  "metrics": {"name": "value"},
 <!-- ttp:if cells -->
  "cells": ["each cell of the spec's `cells:` line finished with a valid result"],
+ "cells_unrunnable": {"cell": "why no run of ours can produce it (e.g. the provider no longer serves the model)"},
 <!-- /ttp:if cells -->
  "outcome": "if it applies: landed, kept, shelved or rejected",
  "tried": [{"title": "each lever tried", "outcome": "kept | shelved | rejected", "result": "number or bound reached"}],
@@ -175,6 +176,8 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
   A cell that ran without a valid result is not finished: the daemon marks a done that leaves
   requested cells out `partial:` (or `cells unreported:` without `cells`). `cells` may also be
   a dict name -> row; an empty value, a `valid: false` row or a string starting `invalid` is not finished.
+  Its `continue:` hop leaves out cells in `cells_unrunnable`, cells your `tried` marks `rejected`
+  and cells another open task's `cells:` line names; with none left, no hop.
 <!-- /ttp:if cells -->
 - `waiting` when a resource is busy (a reservation, a queue, a review). It returns after
   `retry_after_s`, not counted as an attempt. Save what you learned first. Always give a

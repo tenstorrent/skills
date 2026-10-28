@@ -12,12 +12,22 @@ it finished with a valid result in its `cells` field, a list of names or a dict 
 that ran without a valid result is not finished (a dict value that is None, False, empty, `valid:
 false` or a string starting `invalid`; a 0 is a measurement, so finished). Cells match case-insensitively, ignoring whitespace and surrounding quotes; cells beyond
 the requested ones are fine.
+
+A missing cell gets a `continue:` hop only when a hop could produce it (hop_cells): not one the
+hand-off marks unrunnable with a reason (`cells_unrunnable`: a dict cell -> why, or a list of
+`cell: why` lines), not one whose newest tried entry naming it (the hand-off's own `tried`, then its
+chain's from the last REJECTED_S) is `rejected`, and not one another open task names on its own
+`cells:` line. With none left no hop is proposed and the reason is recorded instead.
 """
 from __future__ import annotations
 
 import re
 
 FIELD = "cells"   # the hand-off field: the requested cells finished with a valid result
+UNRUNNABLE = "cells_unrunnable"   # the hand-off field: requested cells no run can produce, each with why
+NO_HOP = "cells_no_hop"   # the daemon's record of missing cells it left out of the continue hop
+REJECTED_S = 86400   # a chain's tried entry rejecting a cell counts this long
+WHY_CHARS = 160   # a reason's length in the recorded line
 LINE = re.compile(r"(?im)^[ \t]*(?:[-*][ \t]+)?cells[ \t]*:(.*)$")
 SEP = re.compile(r"[,;]")
 PARTIAL = "partial:"
@@ -151,3 +161,90 @@ def has_followup(fups: list) -> bool:
     """Whether the hand-off already proposes a `continue:` follow-up with its own `cells:` line."""
     return any(isinstance(f, dict) and re.match(r"(?i)^\s*continue\s*:", str(f.get("title") or ""))
                and requested(f.get("spec")) for f in fups or [])
+
+
+def _why(text) -> str:
+    one = " ".join(str(text or "").split())
+    return one if len(one) <= WHY_CHARS else one[:WHY_CHARS - 1] + "…"
+
+
+def unrunnable(result) -> dict[str, tuple[str, str]]:
+    """The hand-off's `cells_unrunnable`: {norm(cell): (cell, why)}. A dict maps cell -> why; a list (or
+    a string, one entry per line or ';') holds `cell: why` entries (split at the first ': ', so a ':'
+    inside a cell name such as 81:00.0 stays) or {cell, why} dicts. An entry without a reason counts
+    for nothing: the cell keeps its hop."""
+    got = result.get(UNRUNNABLE) if isinstance(result, dict) else None
+    pairs: list = []
+    if isinstance(got, dict):
+        pairs = list(got.items())
+    else:
+        items = re.split(r"[\n;]", got) if isinstance(got, str) else got if isinstance(got, list) else []
+        for i in items:
+            if isinstance(i, dict):
+                pairs.append((i.get("cell"), i.get("why") or i.get("reason")))
+            elif isinstance(i, str) and ": " in i:
+                pairs.append(tuple(i.split(": ", 1)))
+    out = {}
+    for cell, why in pairs:
+        if isinstance(cell, (str, int, float)) and norm(cell) and isinstance(why, str) and why.strip():
+            out.setdefault(norm(cell), (str(cell).strip(), _why(why)))
+    return out
+
+
+def _names(title: str, cell: str) -> bool:
+    """Whether a tried entry's title names `cell` as a whole name, case- and whitespace-insensitively."""
+    t = " ".join(str(title or "").split()).casefold()
+    c = " ".join(str(cell).split()).strip("`'\"").casefold()
+    return bool(c) and re.search(rf"(?<![\w.]){re.escape(c)}(?![\w])", t) is not None
+
+
+def rejected(items: list, cells: list[str]) -> dict[str, str]:
+    """{norm(cell): why} for each of `cells` whose newest entry in `items` (tried entries, oldest first)
+    that names it in its title has outcome `rejected`; a later entry with any other outcome is newer
+    evidence and keeps the cell. A title naming a longer cell that holds a shorter one ('m x 2' and
+    'm') names only the longer."""
+    named: dict[int, set[str]] = {}
+    for n, i in enumerate(items):
+        if isinstance(i, dict):
+            hit = {c for c in cells if _names(i.get("title"), c)}
+            named[n] = {c for c in hit if not any(c != o and _names(o, c) for o in hit)}
+    out = {}
+    for cell in cells:
+        last = None
+        for n, i in enumerate(items):
+            if cell in named.get(n, ()):
+                last = i
+        if last and str(last.get("outcome") or "").strip().lower() == "rejected":
+            out[norm(cell)] = _why(f"tried and rejected: {last.get('result') or last.get('title')}")
+    return out
+
+
+def owners(tasks: list, cells: list[str]) -> dict[str, int]:
+    """{norm(cell): task id} for each of `cells` an open task in `tasks` ({id, spec}) names on its own
+    enumerable `cells:` line (the lowest id when several do)."""
+    want = {norm(c) for c in cells}
+    out: dict[str, int] = {}
+    for t in sorted(tasks or [], key=lambda t: t["id"]):
+        for c in requested(t["spec"]):
+            if norm(c) in want:
+                out.setdefault(norm(c), t["id"])
+    return out
+
+
+def hop_cells(missing: list[str], result, tried_items: list, open_tasks: list) -> tuple[list[str], list[str]]:
+    """The missing cells a `continue:` hop could produce, and one line per cell left out with why."""
+    off = unrunnable(result)
+    rej = rejected(tried_items, missing)
+    own = owners(open_tasks, missing)
+    keep, skipped = [], []
+    for c in missing:
+        k = norm(c)
+        if k in off:
+            skipped.append(f"{c}: unrunnable ({off[k][1]})")
+        elif k in rej:
+            skipped.append(f"{c}: {rej[k]}")
+        elif k in own:
+            skipped.append(f"{c}: owned by open #{own[k]}")
+        else:
+            keep.append(c)
+    return keep, skipped

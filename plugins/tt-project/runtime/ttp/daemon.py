@@ -3856,10 +3856,16 @@ class Daemon:
         if cell_mark and not result.get("cells_checked"):
             summary = summary if cells.marked(summary) else f"{cell_mark}{summary}"
             fups0 = result.get("followups") if isinstance(result.get("followups"), list) else []
-            add = [cells.followup(task, cell_chk["missing"])] \
-                if cell_chk["missing"] and not cells.has_followup(fups0) else []
+            # A hop gets only the cells it could produce: none marked unrunnable, rejected in the
+            # chain's tried ledger or named on another open task's `cells:` line (cells.hop_cells).
+            hop, skipped = self._hop_cells(task, result, cell_chk["missing"]) \
+                if cell_chk["missing"] else ([], [])
+            add = [cells.followup(task, hop)] if hop and not cells.has_followup(fups0) else []
             result = {**result, "summary": summary, "followups": [*fups0, *add], "cells_checked": True}
-            log(self.p, f"task {task['id']}: {cell_mark.strip()}")
+            if skipped:
+                result[cells.NO_HOP] = skipped
+            log(self.p, f"task {task['id']}: {cell_mark.strip()}"
+                        + (f"; no hop for {len(skipped)}: {'; '.join(skipped)[:300]}" if skipped else ""))
         extra: dict = {}
         reason = None
         not_before = None
@@ -4181,6 +4187,9 @@ class Daemon:
         head = (f"#{task['id']} {task['title']} → {outcome} (run {ended or status}, {'~' if usage.estimated else ''}"
                 f"${usage.cost_usd:.2f}): ")
         text = hcheck_text   # the daemon's own lines after the summary, which the digest must show whole
+        if new == "done" and isinstance(result, dict) and isinstance(result.get(cells.NO_HOP), list):
+            text += f"\nNo continue hop for missing cells (none a hop could produce): " \
+                    + "; ".join(str(x) for x in result[cells.NO_HOP])[:600]
         if undelivered:
             text += (f"\nNot posted to the chat: {undelivered}. The user got nothing: post the deliverable "
                      f"(a `reply`) or rerun the task asking for it in result.json `{replymsg.FIELD}`.")
@@ -10930,6 +10939,24 @@ class Daemon:
         log(self.p, f"review {task['id']}: its precheck failed on {head[:12]} ({len(ids)} failing test(s)); "
                     f"failed with no reviewer run")
         return True
+
+    def _hop_cells(self, task: dict, result: dict, missing: list[str]) -> tuple[list[str], list[str]]:
+        """cells.hop_cells for done `task`'s missing cells: the tried entries are its chain's earlier
+        hops' from the last cells.REJECTED_S, oldest first, then its own hand-off's; the open tasks are
+        every other unfinished task but reviews (a review's spec may quote the reviewed line)."""
+        db = self.p.db
+        items: list = []
+        since = time.time() - cells.REJECTED_S
+        for t in chaincap.chain(db, task["id"])[:-1]:
+            if float(t.get("updated") or t.get("created") or 0) >= since:
+                got = load_result(t.get("result")).get("tried")
+                items += got if isinstance(got, list) else []
+        own = result.get("tried")
+        items += own if isinstance(own, list) else []
+        marks = ",".join("?" * len(TERMINAL_TASK_STATES))
+        open_tasks = db.q(f"SELECT id, spec FROM tasks WHERE status NOT IN ({marks}) AND kind != 'review' "
+                          f"AND id != ?", (*TERMINAL_TASK_STATES, task["id"]))
+        return cells.hop_cells(missing, result, items, open_tasks)
 
     def _continue_ready(self, task: dict, fups: list[dict]) -> str:
         """chaincap.hop_ready for a done task whose only proposal is one `continue:` follow-up; ''
