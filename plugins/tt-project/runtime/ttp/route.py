@@ -189,7 +189,8 @@ def phrase(db, now: float | None = None) -> str:
     if not rows:
         return ""
     on = [r for r in rows if r["provider"] == r["to"]]
-    fell = [r for r in rows if r["fallback"] != "none"]
+    fell = [r for r in rows if r["fallback"] not in ("none", "rerun")]
+    reruns = sum(1 for r in rows if r["fallback"] == "rerun")   # the same task starting again, not a new fallback
     to = ", ".join(sorted({str(r["to"]) for r in rows}))
     text = f"routed 24h: {len(on)} run{'s' if len(on) != 1 else ''} to {to}"
     if fell:
@@ -197,6 +198,8 @@ def phrase(db, now: float | None = None) -> str:
         for r in fell:
             why[r["fallback"]] = why.get(r["fallback"], 0) + 1
         text += f", {len(fell)} fell back ({', '.join(f'{k} {n}' for k, n in sorted(why.items()))})"
+    if reruns:
+        text += f", {reruns} rerun{'s' if reruns != 1 else ''} on core"
     last = {}   # each routed tier's latest effort fields (effort_fields), as the endpoint got them
     for r in on:
         if r["effort"]:

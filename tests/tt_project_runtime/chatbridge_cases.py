@@ -1266,3 +1266,17 @@ def test_a_routed_run_records_its_effort_fields_logs_a_rejection_once_and_shows_
     assert route.phrase(p.db).endswith(want + " (rejected)")
     plain = _route_finish(p, d, tid, {"rc": 0, "bridge": {"last_fault": "", "faults": {}}})[0]
     assert "effort" not in json.loads(plain["note"])["route"]
+
+
+def test_route_phrase_counts_reruns_apart_from_real_fallbacks(env, monkeypatch):
+    from ttp import route
+    p = make(env)
+    row = lambda fb, prov="chat": {"provider": prov, "to": "chat", "fallback": fb, "tier": "light", "effort": None}
+    seen = {}
+    monkeypatch.setattr(route, "_rows", lambda *a, **k: seen["rows"])
+    seen["rows"] = [row("none"), row("timeout", "claude"), row("rerun", "claude"), row("rerun", "claude")]
+    assert route.phrase(p.db) == "routed 24h: 1 run to chat, 1 fell back (timeout 1), 2 reruns on core"
+    seen["rows"] = [row("none"), row("none")]
+    assert route.phrase(p.db) == "routed 24h: 2 runs to chat"
+    seen["rows"] = [row("none"), row("rate_limit", "claude")]
+    assert route.phrase(p.db) == "routed 24h: 1 run to chat, 1 fell back (rate_limit 1)"
