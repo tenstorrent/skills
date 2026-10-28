@@ -1003,6 +1003,58 @@ def test_chatbridge_an_answer_that_is_not_json_is_a_malformed_endpoint_fault(env
     assert "cause" not in route.of(run["note"]) and route.cooling(p.db, "chat", time.time()) == "malformed"
 
 
+_CB_HI_STREAM = {"max_tokens": 5, "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+
+
+@pytest.mark.parametrize("bad", [b"{not json", b"<html>gateway</html>", b"[1, 2]", b"5", b"null",
+                                 f'{{"echo": "{_CB_KEY}"'.encode()])
+def test_chatbridge_a_streamed_chunk_that_is_not_a_json_object_is_a_malformed_endpoint_fault(mock_chat, bad):
+    from ttp.chatbridge import Bridge
+    # Mixed with good chunks: the answer ends in an error (a lost piece may be a tool call's arguments),
+    # what came before it stays, and nothing after it is sent.
+    up = mock_chat((200, [{"choices": [{"delta": {"content": "par"}}]}, bad,
+                          {"choices": [{"delta": {"content": "tial"}, "finish_reason": "stop"}]}]))
+    with Bridge(up.url, _CB_KEY, "m") as b:
+        code, text = _post(b, _CB_HI_STREAM)
+        st = b.stats()
+    ev = _cb_events(text)
+    assert code == 200 and st == {"last_fault": "malformed", "faults": {"malformed": 1}}
+    assert ev[-1]["type"] == "error" and ev[-1]["error"]["type"] == "api_error"
+    deltas = [e["delta"]["text"] for e in ev if e["type"] == "content_block_delta"]
+    assert deltas == ["par"] and not any(e["type"] == "message_stop" for e in ev)
+    assert _CB_KEY not in text and _CB_KEY not in json.dumps(st)   # no upstream text in the fault
+
+
+def test_chatbridge_a_stream_with_blank_data_lines_is_no_fault(mock_chat):
+    from ttp.chatbridge import Bridge
+    up = mock_chat((200, [b"", {"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}]))
+    with Bridge(up.url, _CB_KEY, "m") as b:
+        code, text = _post(b, _CB_HI_STREAM)
+        st = b.stats()
+    assert st == {"last_fault": "", "faults": {}} and _cb_events(text)[-1]["type"] == "message_stop"
+
+
+def test_chatbridge_a_stream_of_only_bad_chunks_falls_back_and_cools_the_endpoint(env, monkeypatch, mock_chat):
+    from ttp import route
+    from ttp.chatbridge import Bridge
+    from ttp.daemon import Daemon
+    up = mock_chat((200, [b"<html>bad gateway</html>", b"{oops"]))
+    with Bridge(up.url, _CB_KEY, "m") as b:
+        code, text = _post(b, _CB_HI_STREAM)
+        st = b.stats()
+    ev = _cb_events(text)
+    assert [e["type"] for e in ev] == ["error"] and ev[0]["error"]["type"] == "api_error"
+    assert st == {"last_fault": "malformed", "faults": {"malformed": 1}}
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    tid = p.db.add_task("build", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    run, _ = _route_finish(p, d, tid, {"bridge": st})
+    assert run["status"] == "fallback" and route.of(run["note"])["fallback"] == "malformed"
+    assert route.cooling(p.db, "chat", time.time()) == "malformed"
+
+
 def test_routed_spend_uses_the_chat_price_or_is_zero_and_unpriced():
     from types import SimpleNamespace
     from ttp import route

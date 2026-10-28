@@ -562,6 +562,11 @@ class Bridge:
         self._fault(code, str((err.get("error") or {}).get("message") or ""))
         return code, err
 
+    def _malformed(self, detail: str) -> tuple[int, dict]:
+        self.last_fault = "malformed"   # an endpoint fault for routing (route.py), not the run's
+        self.faults["malformed"] = self.faults.get("malformed", 0) + 1
+        return error_for(502, detail)
+
     def stats(self) -> dict:
         """For the run's exit record: fault kinds only, never upstream text (it may echo a key); the
         effort fields sent and whether the endpoint rejected them, when the run had any."""
@@ -609,9 +614,7 @@ class Bridge:
                 try:
                     data = json.loads(resp.read())
                 except ValueError:
-                    self.last_fault = "malformed"   # an endpoint fault for routing (route.py), not the run's
-                    self.faults["malformed"] = self.faults.get("malformed", 0) + 1
-                    return h._reply(*error_for(502, "the upstream answer is not JSON"))
+                    return h._reply(*self._malformed("the upstream answer is not JSON"))
                 if data.get("error"):
                     return h._reply(*self._fault_reply(_chunk_error(data, self._scrub)))
                 self.last_fault = ""
@@ -639,10 +642,18 @@ class Bridge:
                 payload = line[5:].strip()
                 if payload == "[DONE]":
                     break
+                if not payload:
+                    continue
                 try:
                     chunk = json.loads(payload)
                 except ValueError:
-                    continue
+                    chunk = None
+                if not isinstance(chunk, dict):
+                    # Fails the answer, even after good chunks: the lost piece may hold a tool call's
+                    # arguments, and a retry beats a silently wrong call. No upstream text: it may echo the key.
+                    send(_sse("error", self._malformed("the upstream stream sent a chunk that is not a JSON object")[1]))
+                    errored = True
+                    break
                 if chunk.get("error"):
                     code, err = self._fault_reply(_chunk_error(chunk, self._scrub))
                     send(_sse("error", err))
