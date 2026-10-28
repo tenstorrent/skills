@@ -98,7 +98,8 @@ def lookup(repo, branch: str, base_url: str = "") -> tuple[dict | None, str]:
         out = _ask(repo, branch, base_url)
         if f and (out[0] or out[1].startswith(("no open PR", "the PR"))):   # answers, not gh failures
             try:
-                f.write_text(json.dumps({**(kept if isinstance(kept, dict) else {}), ck: list(out)}))
+                from .project import durable_write
+                durable_write(f, json.dumps({**(kept if isinstance(kept, dict) else {}), ck: list(out)}))
             except OSError:
                 pass
     _memo[key] = (time.time(), out)
