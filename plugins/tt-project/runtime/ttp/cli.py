@@ -1026,7 +1026,7 @@ def _say_all_argv(argv: list[str]) -> list[str]:
     return ["say", SAY_ALL, *argv[1:]]
 
 
-_SECRET_VALUED = ("--keys", "--host", "--via", "--url", "--email", "--user-id")
+_SECRET_VALUED = ("--keys", "--host", "--via", "--url", "--email", "--user-id", "--secret")
 VALUE_GIVEN = "<value>"
 
 
@@ -1052,6 +1052,27 @@ def _secret_value_argv(argv: list[str]) -> list[str]:
         else:
             stray.append(VALUE_GIVEN)
     return ["secret", *pos, *stray[:1], *opts]
+
+
+def _secret_env_argv(argv: list[str]) -> list[str]:
+    """`ttp secret env [alias] --secret <name>[:<key>]=<VAR> ... -- <command...>`: argparse takes no
+    positional after an option and drops a '--' inside the command, so the options go first and each
+    command word rides exactly in a hidden --cmd-word=:<word> (the ':' keeps argparse from dropping a
+    '--' word)."""
+    if argv[:2] != ["secret", "env"]:
+        return argv
+    end = argv.index("--") if "--" in argv else len(argv)
+    if not any(w == "--secret" or w.startswith("--secret=") for w in argv[2:end]):
+        return argv
+    opts, pos, it = [], [], iter(argv[2:end])
+    for w in it:
+        if w == "--secret":
+            opts += [w, *(v for v in [next(it, None)] if v is not None)]
+        elif w.startswith("-"):
+            opts.append(w)
+        else:
+            pos.append(w)
+    return ["secret", *opts, "env", *pos, *(f"--cmd-word=:{w}" for w in argv[end + 1:])]
 
 
 _SAY_VALUED = ("--chat", "--context", "--finding", "--except", "--broadcast", "--client-id")
@@ -6638,6 +6659,8 @@ def cmd_secret(a) -> None:
         die(f"`ttp secret {a.kind}` takes no alias (only endpoint, check, env, set and generate do)")
     if a.keys is not None and a.kind != "generate":
         die("--keys goes only with `ttp secret generate <name> --keys a,b,c`")
+    if (a.secret or a.cmd_word) and a.kind != "env":
+        die("--secret goes only with `ttp secret env --secret <name>[:<key>]=<VAR> -- <command>`")
     if a.kind in ("set", "generate"):
         return cmd_secret_custom(a)
     if a.command and a.kind != "env":
@@ -6766,28 +6789,90 @@ def cmd_secret_custom(a) -> None:
     print(f"stored secret {name} with a new random token for each of: {', '.join(keys)}")
 
 
+ENV_VAR_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _secret_env_vars(specs: list[str]) -> dict[str, str]:
+    """{VAR: stored value} for each `--secret <name>[:<key>]=<VAR>` (custom secrets only). Errors name
+    the secret and key only once they are valid names, and never a value."""
+    from . import redact
+    store, out, by = load_secrets(), {}, {}
+    for spec in specs:
+        ref, eq, var = spec.partition("=")
+        name, colon, key = ref.partition(":")
+        if not eq:
+            die("--secret takes <name>[:<key>]=<VAR>")
+        if not SECRET_NAME_RE.fullmatch(name):
+            die("bad secret name in --secret: lowercase letters, digits, '-' and '_'")
+        if colon and not SECRET_NAME_RE.fullmatch(key):
+            die(f"bad key name for secret {name}: lowercase letters, digits, '-' and '_'")
+        label = f"{name}:{key}" if colon else name
+        if name in SECRET_KINDS or not redact.custom(name):
+            die(f"secret {name} is built in (`ttp secret {name}`); --secret gives only secrets made with "
+                "`ttp secret set` or `ttp secret generate`")
+        if not ENV_VAR_RE.fullmatch(var):
+            die(f"bad variable name for {label}: letters, digits and '_', not starting with a digit")
+        if var in by:
+            die(f"{by[var]} and {label} set the same variable")
+        if name not in store:
+            die(f"no secret {name}: store it with `ttp secret set {name}` or `ttp secret generate {name} --keys ...`")
+        v = store[name]
+        if colon and not isinstance(v, dict):
+            die(f"secret {name} is a single value, not keys: use --secret {name}=<VAR>")
+        if colon and key not in v:
+            die(f"secret {name} has no key {key} (its keys: {', '.join(sorted(map(str, v)))})")
+        if not colon and isinstance(v, dict):
+            die(f"secret {name} holds keys ({', '.join(sorted(map(str, v)))}): "
+                f"pick one with --secret {name}:<key>=<VAR>")
+        v = v[key] if colon else v
+        if not isinstance(v, str) or "\0" in v:
+            die(f"secret {label} is not a text value")
+        out[var], by[var] = v, label
+    return out
+
+
 def cmd_secret_env(a) -> None:
     """`ttp secret env <alias> -- <command>`: runs the command with the endpoint's key and URL in its
-    environment (OPENAI_API_KEY, OPENAI_BASE_URL), its output passed on with every stored secret masked."""
+    environment (OPENAI_API_KEY, OPENAI_BASE_URL), its output passed on with every stored secret masked.
+    `--secret <name>[:<key>]=<VAR>` (repeatable, with or without an alias) adds a custom secret as VAR."""
     from . import endpoint, redact
-    argv = a.command[1:] if a.command[:1] == ["--"] else a.command
-    if not a.alias or not argv:
-        die("usage: ttp secret env <alias> -- <command...>")
-    try:
-        env = {**os.environ, **endpoint.env_for(a.alias)}
-    except ValueError as e:
-        die(f"{e}: `ttp secret endpoint {a.alias} --url <base url>`")
+    if a.secret:
+        argv = [w[1:] for w in a.cmd_word or []]
+        if a.command:   # more than one word before `--`
+            argv = []
+    else:
+        argv = a.command[1:] if a.command[:1] == ["--"] else a.command
+    if not (a.alias or a.secret) or not argv:
+        die("usage: ttp secret env <alias> -- <command...>, or "
+            "ttp secret env [alias] --secret <name>[:<key>]=<VAR> ... -- <command...>")
+    env = dict(os.environ)
+    if a.alias:
+        try:
+            env.update(endpoint.env_for(a.alias))
+        except ValueError as e:
+            die(f"{e}: `ttp secret endpoint {a.alias} --url <base url>`")
+    given = _secret_env_vars(a.secret or [])
+    env.update(given)
+    # A multi-line value is masked line by line too: the output is passed on one line at a time.
+    parts = sorted({(p.strip(), spec.partition("=")[0].partition(":")[0])
+                    for spec, v in zip(a.secret or [], given.values())
+                    for p in v.splitlines() if "\n" in v.strip() and len(p.strip()) >= redact.MIN_LEN},
+                   key=lambda x: -len(x[0]))
     try:
         child = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     except OSError as e:
         die(f"cannot run {argv[0]}: {e.strerror or e}")
     try:
         for line in iter(child.stdout.readline, b""):
-            sys.stdout.write(redact.scrub(line.decode(errors="replace")))
+            line = redact.scrub(line.decode(errors="replace"))
+            for p, name in parts:
+                line = line.replace(p, redact.mask(name))
+            sys.stdout.write(line)
             sys.stdout.flush()
     except KeyboardInterrupt:
         child.terminate()
-    sys.exit(child.wait())
+    rc = child.wait()
+    sys.exit(128 - rc if rc < 0 else rc)
 
 
 def cmd_logs(a) -> None:
@@ -9101,7 +9186,8 @@ def main(argv: list[str] | None = None) -> None:
                         "show: list what is saved (never the keys); check [alias]: test saved endpoint keys "
                         "(reachable, auth ok or auth failed; never the key); env <alias> -- <command>: run "
                         "a command with the key in OPENAI_API_KEY and the URL in OPENAI_BASE_URL, its output "
-                        "masked; push: copy your saved keys to --host; set <name>: a value of your own, "
+                        "masked; env --secret <name>[:<key>]=<VAR> -- <command>: the same with a secret of your own "
+                        "in VAR; push: copy your saved keys to --host; set <name>: a value of your own, "
                         "read from stdin; generate <name> --keys a,b,c: a fresh random token per key, "
                         "stored as a JSON object. No command prints a saved key. "
                         "Keys go to secrets.json in your ttp home (~/.tt-project, mode 0600)")
@@ -9117,6 +9203,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--keys", help="with generate: the key names, comma-separated")
     s.add_argument("--email", help="with slack: your Slack email, to find your user")
     s.add_argument("--user-id", help="with slack: your Slack user id (instead of --email)")
+    s.add_argument("--secret", action="append", metavar="NAME[:KEY]=VAR",
+                   help="with env (repeatable): put a secret made with set or generate (one key of it with "
+                        ":KEY) in the command's environment as VAR; the command line carries only names")
+    s.add_argument("--cmd-word", action="append", help=argparse.SUPPRESS)
     s.add_argument("--force", action="store_true",
                    help="with jev or endpoint: save the key even if the check fails; with generate: "
                         "replace an existing secret")
@@ -9180,8 +9270,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("dir", help="the project's tt-project folder")
     s.set_defaults(fn=cmd_daemon)
 
-    a = ap.parse_args(_project_name_argv(sub, _say_finding_argv(_say_all_argv(_secret_value_argv(
-        sys.argv[1:] if argv is None else list(argv))))))
+    a = ap.parse_args(_project_name_argv(sub, _say_finding_argv(_say_all_argv(_secret_value_argv(_secret_env_argv(
+        sys.argv[1:] if argv is None else list(argv)))))))
     dry_run_stub(a)
     a.fn(a)
 

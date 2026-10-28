@@ -420,7 +420,7 @@ def _segments(cmd: str, strip: bool = True) -> list[list[str]]:
 
 
 def _strip_prefix(argv: list[str], ttp_wrappers: list[list[str]] | None = None) -> list[str]:
-    """`argv` without its wrappers; each `ttp lock|clip|detach|sandbox ... --` stripped is added to
+    """`argv` without its wrappers; each `ttp lock|clip|detach|sandbox|secret env ... --` stripped is added to
     `ttp_wrappers` when given."""
     i = 0
     while i < len(argv):
@@ -430,7 +430,8 @@ def _strip_prefix(argv: list[str], ttp_wrappers: list[list[str]] | None = None) 
         elif re.match(r"^\w+=", w) or w.startswith("-") or re.fullmatch(r"\d+[smhd]?", w) \
                 or os.path.basename(w) in WRAPPERS or w in RESERVED:
             i += 1
-        elif w == "ttp" and argv[i + 1:i + 2] in (["lock"], ["clip"], ["detach"], ["sandbox"]) and "--" in argv[i:]:
+        elif w == "ttp" and (argv[i + 1:i + 2] in (["lock"], ["clip"], ["detach"], ["sandbox"])
+                             or argv[i + 1:i + 3] == ["secret", "env"]) and "--" in argv[i:]:
             end = argv.index("--", i)
             if ttp_wrappers is not None:
                 ttp_wrappers.append(argv[i + 1:end])
@@ -509,7 +510,7 @@ def _log_bypass(cmd: str) -> None:
 WEB_TOKEN_RE = re.compile(r"state/+web\.token\b")
 # The per-user secrets store by path, and the runtime calls that hand back its values: a tool call's
 # output stays in the run's log and its agent's transcript, so a run tests a key with
-# `ttp secret check` and gives one to a command with `ttp secret env` instead.
+# `ttp secret check` and gives one to a command with `ttp secret env` (also `--secret`) instead.
 SECRET_FILE_RE = re.compile(r"(?:\.tt-project|TTP_HOME\}?)/+secrets\.json\b")
 SECRET_CALL_RE = re.compile(r"(?<!def )\b(?:credentials|load_secrets|env_for)\s*\(|\bendpoint\.saved\s*\(|\bsecrets_path\s*\(")
 
@@ -519,8 +520,9 @@ def secret_read(cmd: str, segments: list[list[str]], cwd: str) -> str | None:
     path, or an interpreter (inline code, stdin or a script it runs) calling the runtime's readers."""
     why = ("a run must never read stored secrets (`ttp secret`): what it prints stays in the run's log and "
            "transcript. Test a saved endpoint key with `ttp secret check <alias>` (reachable, auth ok or "
-           "auth failed), give one to a command with `ttp secret env <alias> -- <command>`, and call the "
-           "secrets file 'the secrets store' in text")
+           "auth failed), give one to a command with `ttp secret env <alias> -- <command>` (a secret stored with "
+           "`ttp secret set` or `generate`: `ttp secret env --secret <name>[:<key>]=<VAR> -- <command>`), "
+           "and call the secrets file 'the secrets store' in text")
     if SECRET_FILE_RE.search(cmd):
         return why
     try:

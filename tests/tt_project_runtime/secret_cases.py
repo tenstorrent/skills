@@ -396,6 +396,10 @@ def test_endpoint_errors_mask_every_stored_secret(env, monkeypatch):
     ("ttp secret env tt-cloud -- python3 probe.py", False),
     ("ttp secret set peer-key < value.txt", False),
     ("ttp secret generate peer-set --keys alpha,beta", False),
+    ("ttp secret env --secret peer-set:alpha=PEER -- python3 probe.py", False),
+    ("ttp secret env tt-cloud --secret alpha-key=ALPHA -- sh -c 'curl -H \"x: $ALPHA\" localhost'", False),
+    ("ttp secret env --secret alpha-key=A -- cat ~/.tt-project/secrets.json", True),
+    ("ttp secret env --secret alpha-key=A -- python3 -c 'from ttp import project; print(project.load_secrets())'", True),
     ("python3 - <<'EOF'\ndef credentials(alias):\n    return None\nEOF", False),
 ])
 def test_hook_refuses_ad_hoc_reads_of_the_secret_store(env, monkeypatch, cmd, refused):
@@ -406,6 +410,7 @@ def test_hook_refuses_ad_hoc_reads_of_the_secret_store(env, monkeypatch, cmd, re
     assert denied == refused, out
     if refused:
         assert "ttp secret check" in out["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "ttp secret env --secret <name>" in out["hookSpecificOutput"]["permissionDecisionReason"]
 
 
 def test_hook_refuses_a_script_file_that_reads_the_secret_store(env, monkeypatch):
@@ -546,3 +551,106 @@ def test_custom_secrets_are_masked_in_tool_output_logs_and_handoffs_and_show(env
     out = capsys.readouterr().out
     assert _CUSTOM not in out and not any(t in out for t in tokens.values())
     assert json.loads(out.splitlines()[0]) == {"alpha-key": "set", "peer-set": ["alpha", "beta"]}
+
+
+def _env_run(monkeypatch, capfd, *argv):
+    """`ttp secret env <argv>`; (exit code, stdout + stderr as the caller sees them)."""
+    from ttp import cli
+    try:
+        cli.main(["secret", "env", *argv])
+        code = 0
+    except SystemExit as e:
+        code = e.code or 0
+    out = capfd.readouterr()
+    return code, out.out + out.err
+
+
+def _custom_store(env, monkeypatch, capsys):
+    project = _stored(monkeypatch, env["tmp"] / "secrets-home")
+    assert _custom(monkeypatch, capsys, "set", "alpha-key", stdin=_CUSTOM + "\n")[0] == 0
+    assert _custom(monkeypatch, capsys, "generate", "peer-set", "--keys", "alpha,beta")[0] == 0
+    return project.load_secrets()
+
+
+def test_secret_env_injects_custom_secrets_by_environment_and_masks_the_output(env, monkeypatch, capfd, tmp_path):
+    store = _custom_store(env, monkeypatch, capfd)
+    tokens = store["peer-set"]
+    probe = tmp_path / "probe.json"
+    code, out = _env_run(monkeypatch, capfd, "--secret", "alpha-key=ALPHA", "--secret=peer-set:beta=PEER_BETA", "--",
+                         sys.executable, "-c",
+                         "import json, os, sys; e = os.environ; "
+                         f"json.dump({{'argv': sys.argv, 'a': e['ALPHA'], 'b': e['PEER_BETA']}}, open({str(probe)!r}, 'w')); "
+                         "print('a=' + e['ALPHA']); print('b=' + e['PEER_BETA'], file=sys.stderr); sys.exit(3)")
+    seen = json.loads(probe.read_text())
+    assert seen["a"] == _CUSTOM and seen["b"] == tokens["beta"]                 # injected by environment
+    assert not any(_CUSTOM in w or tokens["beta"] in w for w in seen["argv"])    # never in argv
+    assert code == 3                                                            # exit code passed through
+    assert "a=[secret:alpha-key]" in out and "b=[secret:peer-set]" in out
+    assert _CUSTOM not in out and not any(t in out for t in tokens.values())
+
+
+def test_secret_env_keeps_the_command_exact_and_combines_with_an_endpoint_alias(env, monkeypatch, capfd):
+    _custom_store(env, monkeypatch, capfd)
+    code, out = _env_run(monkeypatch, capfd, "tt-cloud", "--secret", "peer-set:alpha=TOK", "--", sys.executable,
+                         "-c", "import os, sys; print(sys.argv[1:], os.environ['OPENAI_BASE_URL'], "
+                               "len(os.environ['TOK']))", "--", "-x", "--secret=y")
+    assert code == 0 and f"['--', '-x', '--secret=y'] {_EP_URL} 43" in out, out
+    code, out = _env_run(monkeypatch, capfd, "--secret", "alpha-key=A", "--", sys.executable, "-c",
+                         "import os, signal; os.kill(os.getpid(), signal.SIGTERM)")
+    assert code == 128 + 15
+
+
+@pytest.mark.parametrize("spec, why", [
+    ("nope=X", "no secret nope"),
+    ("peer-set:gamma=X", "secret peer-set has no key gamma"),
+    ("alpha-key:alpha=X", "secret alpha-key is a single value"),
+    ("peer-set=X", "secret peer-set holds keys"),
+    ("alpha-key=1BAD", "bad variable name for alpha-key"),
+    ("alpha-key=A-B", "bad variable name for alpha-key"),
+    ("peer-set:alpha=", "bad variable name for peer-set:alpha"),
+    ("jev=X", "secret jev is built in"),
+    ("slack=X", "secret slack is built in"),
+    ("endpoint=X", "secret endpoint is built in"),
+    ("endpoint/tt-cloud=X", "bad secret name"),
+    (_CUSTOM, "--secret takes <name>[:<key>]=<VAR>"),
+    (f"{_CUSTOM.upper()}=X", "bad secret name"),
+    (f"peer-set:{_CUSTOM.upper()}=X", "bad key name for secret peer-set"),
+])
+def test_secret_env_refuses_bad_or_unknown_secrets_naming_no_value(env, monkeypatch, capfd, spec, why):
+    store = _custom_store(env, monkeypatch, capfd)
+    store_values = [_CUSTOM, *store["peer-set"].values(), _EP_KEY]
+    code, out = _env_run(monkeypatch, capfd, "--secret", spec, "--", "true")
+    assert code != 0 and why in out, out
+    assert not any(v in out or v.upper() in out for v in store_values), out
+
+
+@pytest.mark.parametrize("argv, why", [
+    (["--secret", "alpha-key=A"], "usage"),                                 # no command
+    (["--secret", "alpha-key=A", "extra", "words", "--", "true"], "usage"),  # more than one word before --
+    (["--secret", "alpha-key=A", "--secret", "peer-set:alpha=A", "--", "true"], "set the same variable"),
+])
+def test_secret_env_refuses_a_bad_command_line(env, monkeypatch, capfd, argv, why):
+    _custom_store(env, monkeypatch, capfd)
+    code, out = _env_run(monkeypatch, capfd, *argv)
+    assert code != 0 and why in out and _CUSTOM not in out, out
+
+
+def test_secret_flag_goes_only_with_env(env, monkeypatch, capsys):
+    _stored(monkeypatch, env["tmp"] / "secrets-home")
+    code, out = _custom(monkeypatch, capsys, "show", "--secret", "alpha-key=A")
+    assert code != 0 and "--secret goes only with" in out
+    code, out = _custom(monkeypatch, capsys, "--help")
+    assert code == 0 and "env --secret <name>[:<key>]=<VAR>" in " ".join(out.split())
+    plugin = RUNTIME.parent
+    for doc in ("docs/guide.md", "skills/tt-project-harness/SKILL.md"):
+        assert "ttp secret env --secret <name>[:<key>]=<VAR> -- <command>" in (plugin / doc).read_text(), doc
+
+
+def test_secret_env_masks_each_line_of_a_multi_line_secret(env, monkeypatch, capfd):
+    project = _stored(monkeypatch, env["tmp"] / "secrets-home")
+    pem = "-----BEGIN-----\nline-one-0123456789\nline-two-0123456789\n-----END-----"
+    assert _custom(monkeypatch, capfd, "set", "pem-key", stdin=pem + "\n")[0] == 0
+    assert project.load_secrets()["pem-key"] == pem
+    code, out = _env_run(monkeypatch, capfd, "--secret", "pem-key=PEM", "--", sys.executable, "-c",
+                         "import os; print(os.environ['PEM'])")
+    assert code == 0 and "line-one" not in out and "line-two" not in out and "[secret:pem-key]" in out, out

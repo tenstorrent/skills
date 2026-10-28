@@ -1483,6 +1483,8 @@ Workers can read Slack links you paste, using your Slack connector if you have o
 - A secret of your own: `ttp secret set <name>` stores the value read from stdin (never from the
   command line); `ttp secret generate <name> --keys a,b,c` stores a fresh random token per key as a
   JSON object (`--force` replaces one). Neither prints a value; both are masked like the others.
+  `ttp secret env --secret <name>[:<key>]=<VAR> -- <command>` (repeatable) runs a command with one in
+  `VAR`, its output masked and its exit code passed on; the command line carries only names.
 - No `ttp` command prints a saved key. `ttp secret check [alias]` tests one (reachable, auth ok or
   auth failed) and `ttp secret env <alias> -- <command>` gives it to a command in `OPENAI_API_KEY`
   (URL in `OPENAI_BASE_URL`). A worker's Bash calls that read the secrets store are refused.

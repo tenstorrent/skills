@@ -164,6 +164,7 @@ read the one for the lever you change.
   it to a command with `ttp secret env <alias> -- <command>` (`OPENAI_API_KEY`, `OPENAI_BASE_URL`).
 - Store a value of your own with `ttp secret set <name> < file` (stdin only), or a set of fresh random
   tokens with `ttp secret generate <name> --keys a,b,c`; neither prints a value.
+  Give one to a command with `ttp secret env --secret <name>[:<key>]=<VAR> -- <command>`.
 
 ## CPU-only runs never open a device
 
