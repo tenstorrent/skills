@@ -287,3 +287,56 @@ def test_a_setup_cut_short_is_finished_or_rolled_back_by_the_next_ttp_command(en
     cli.main(["list"])
     assert "rolled back" in capsys.readouterr().err
     assert _os.readlink(lib_dir / "current") == str(old) and not lib.exists() and not journal.exists()
+
+
+def test_a_setup_cut_short_whose_plugin_folder_now_holds_another_version_is_rolled_back(env, tmp_path, capsys):
+    """The plugin was updated between the cut and the next command: copying it in would put that version
+    in a release folder named for the one setup started, so the recovery rolls back instead."""
+    import os as _os
+    import re as _re
+    from ttp import __version__, cli
+    from ttp.runner import boot_id
+    lib_dir = env["home"] / "lib"
+    lib = lib_dir / __version__
+    (lib / "runtime" / "ttp").mkdir(parents=True)
+    (lib / "runtime" / "ttp" / "cli.py").write_text("")          # the copy stopped half way
+    old = lib_dir / "0.0.1"
+    (old / "runtime").mkdir(parents=True)
+    plugin = _plugin_copy(tmp_path)
+    init = plugin / "runtime" / "ttp" / "__init__.py"
+    init.write_text(_re.sub(r'__version__ = "[^"]+"', '__version__ = "99.0.0"', init.read_text()))
+    journal = lib_dir / cli.SETUP_JOURNAL
+    journal.write_text(json.dumps({"pid": _cn_exited_pid(), "boot": boot_id(), "source": str(plugin), "lib": str(lib),
+                                   "commit": "abc123", "existed": False, "prev": str(old)}))
+    assert "rolled back to 0.0.1" in cli._recover_setup()
+    assert _os.readlink(lib_dir / "current") == str(old) and not lib.exists() and not journal.exists()
+
+def test_a_push_batch_after_push_waits_for_the_notice_and_the_daemon_resumes_it_once_it_is_gone(env, monkeypatch):
+    """The batch pushes but holds its deploy (marker after_held); ticks while the notice exists start nothing and
+    say so once; once it is gone one tick resumes it, the deploy runs once and no resume try is spent."""
+    from ttp import pushq
+    deploys = env["tmp"] / "deploys.log"
+    s = _pq_real(env, monkeypatch, after_push=[f"git rev-parse HEAD >> {deploys}"])
+    notice = _notice(env, monkeypatch, "requested")
+    _pq_hand_off(env, s)
+    bid = _pq_batch(s)
+    marker = s.p.state / "pushes" / f"{bid}.json"
+    m = json.loads(marker.read_text())
+    assert m["outcome"] == "pushed" and "state requested" in m["after_held"]["why"], m
+    assert not deploys.exists()
+    for _ in range(3):
+        _pq_tend(s)     # the first one reaps the batch process; none starts a resume while the notice holds
+        assert bid not in pushq._children and not deploys.exists(), "no resume while the notice holds"
+    held = s.p.db.q("SELECT text FROM events WHERE kind='after_push_held'")
+    assert len(held) == 1 and bid in held[0]["text"], held
+    notice.unlink()
+    _pq_tend(s)
+    assert bid in pushq._children, "one tick after the notice is gone resumes the batch"
+    child = pushq._children[bid]
+    child.wait(timeout=60)
+    assert child.returncode == 0, (s.p.state / "pushes" / f"{bid}.log").read_text()
+    _pq_tend(s)
+    m = json.loads(marker.read_text())
+    assert m["after_push"]["status"] == "ok" and len(deploys.read_text().split()) == 1, m.get("after_push")
+    assert s.p.db.one("SELECT after_tries FROM push_batches WHERE id=?", (bid,))["after_tries"] == 0
+    assert not s.p.db.one("SELECT id FROM events WHERE kind='after_push_failed'")

@@ -289,8 +289,8 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   put back); after main moved it is finished, and a daemon left stopped or on the old code is
   restarted. An automatic upgrade cut short is retried, at most 3 times in a row. `ttp setup` journals
   its copy in `lib/.setup.journal` and switches `lib/current` in one rename; the next `ttp` command
-  finishes a cut-short copy from the same plugin folder or, with that gone, rolls back to the release
-  before. A post-push deploy a reboot cut short is run once more by the daemon.
+  finishes a cut-short copy from the same plugin folder or, with that gone or now holding another
+  version, rolls back to the release before. A post-push deploy a reboot cut short is run once more by the daemon.
   An explicit host-side `ttp upgrade <name>` (not `--auto`, not from one of the project's runs) queues
   the merge task once the last one ended `upgrade.merge_retry_h` (6) hours ago, and takes the finish
   lock over from a finish task that is blocked or has had no run or update for 6 h: that task is

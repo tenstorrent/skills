@@ -7052,10 +7052,10 @@ def _install_parts(src_root: Path, lib: Path) -> None:
 def _recover_setup() -> str:
     """A `ttp setup` cut short (a reboot mid-copy) leaves its journal: the next `ttp` command finishes it
     (the copy is redone from the same plugin folder, then lib/current points at it) or, with that folder
-    gone, rolls it back (lib/current points at the release it did before, and a release folder the run
+    gone or updated to another version, rolls it back (lib/current points at the release it did before, and a release folder the run
     created is removed). Returns the line it printed ("" when there was nothing to do)."""
     from .project import HOME_DIR
-    from .release import point_current
+    from .release import point_current, runtime_version
     from .runner import same_boot
     jr = HOME_DIR / "lib" / SETUP_JOURNAL
     try:
@@ -7075,7 +7075,9 @@ def _recover_setup() -> str:
         except PermissionError:
             return ""
     lib, src = Path(rec.get("lib") or "/nonexistent"), Path(rec.get("source") or "/nonexistent")
-    if lib.parent == HOME_DIR / "lib" and (src / "runtime" / "ttp").is_dir() and (src / "template").is_dir():
+    # The plugin folder updated meanwhile holds another version than the folder setup named: roll back.
+    if lib.parent == HOME_DIR / "lib" and (src / "runtime" / "ttp").is_dir() and (src / "template").is_dir() \
+            and runtime_version(src / "runtime") == lib.name:
         _install_parts(src, lib)
         durable_write(lib / "runtime" / "ttp" / SOURCE_FILE, str(rec.get("commit") or "unknown") + "\n", sync=False)
         sync_all()
