@@ -2217,7 +2217,8 @@ def test_the_global_cap_alert_clears_by_itself_at_the_day_reset(env, tmp_path, m
     from ttp import alerts
     from ttp import globalcap as gcap
     from ttp.daemon import Daemon
-    clock = [time.time()]
+    # An hour into the budget day: a step of LOCAL_CACHE_S from a real clock near the reset crossed it.
+    clock = [gcap.day_bounds(p.config()["budget"], time.time())[0] + 3600]
     monkeypatch.setattr(time, "time", lambda: clock[0])
     d = Daemon(p.base)
     d.update_gates()
