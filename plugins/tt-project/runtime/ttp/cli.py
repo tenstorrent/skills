@@ -7882,7 +7882,8 @@ def cmd_doctor(a) -> None:
     from . import upstream
     for line in upstream.doctor_lines(p):
         print(line)
-    from .coordinator import worker_pinned_line
+    from .coordinator import pinned_memory_line, worker_pinned_line
+    print(pinned_memory_line(p))
     if line := worker_pinned_line(p):
         print(line)
     for c in _push.unexcluded_log_checks(checks):

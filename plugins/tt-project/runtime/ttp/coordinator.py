@@ -35,7 +35,7 @@ from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_
                  task_outcome, without_deferral)
 from .project import rebase_problems, rebase_replace, rebase_replace_mode
 from .project import (CORRECTIONS_HEADER, COORDINATOR_MEMORY_CHARS, COORDINATOR_PINNED_WARN_SHARE,
-                      PINNED_MEMORY_KINDS, Project, code_tasks_may_push,
+                      PINNED_MEMORY_KINDS, Project, code_tasks_may_push, coordinator_memory,
                       durable_append, own_push, own_push_mode,
                       durable_write, pin_verify_mode, push_queue_number, push_queue_on)
 from .runner import stop_runs
@@ -442,7 +442,8 @@ def _sha(text: str) -> str:
 
 
 def _standing_entry(e: dict) -> bool:
-    return e["kind"] in PINNED_MEMORY_KINDS or bool(e.get("standing"))
+    """A pinned entry the coordinator's prompt carries (entries tagged for workers alone never)."""
+    return (e["kind"] in PINNED_MEMORY_KINDS or bool(e.get("standing"))) and coordinator_memory(e)
 
 
 def cache_ttl_s(c: dict) -> float:
@@ -3729,11 +3730,31 @@ def memory_budget_line(p: Project) -> str:
            if coord["crowded"] else "older or too big for the room left")
     out = (f"; {left} decision/fact entr{'y' if left == 1 else 'ies'} left out of your prompt, {why}; "
            f"still in memory/ (`ttp memory {p.name} --search <words>`)" if left else "")
-    return (f"## Memory over budget: {coord['entries']} entries, {coord['chars']} chars; you see "
-            f"{coord['shown']}, workers see {work['shown']} of the {work['entries']} meant for them "
-            f"(pinned restrictions/preferences/resources {coord['pinned_chars']} chars, always shown){out}. Retire "
+    every = p._memory_entries()
+    return (f"## Memory over budget: {len(every)} entries, {sum(len(e['line']) + 1 for e in every)} chars; you see "
+            f"{coord['shown']} of the {coord['entries']} meant for you, workers see {work['shown']} of the "
+            f"{work['entries']} meant for them ({pinned_figures(coord, work)}; pinned ones always shown){out}. Retire "
             f"stale entries with `memory_forget`, or `supersedes` when a new one replaces them; a (standing) "
             f"entry is only shortened (a standing `memory_add` that supersedes it), never retired for space")
+
+
+def pinned_figures(coord: dict, work: dict) -> str:
+    """The memory pinned for each audience against its own budget, each counting only the entries its
+    prompt carries: `coord` a memory_select usage, `work` a worker_context one."""
+    return (f"pinned for you {coord['pinned_chars']} of {coord['limit']} chars, "
+            f"for workers {work['pinned_chars']} of {work['memory_limit']}")
+
+
+def pinned_memory_line(p: Project) -> str:
+    """For `ttp doctor`: the memory pinned for the coordinator against its budget and the entries its
+    prompt shows of those meant for it, next to the same for workers (pinned against the room their
+    prompt leaves it)."""
+    from .prompts import worker_context
+    coord, work = p.memory_select(COORDINATOR_MEMORY_CHARS)[1], worker_context(p)[2]
+    return (f"pinned memory: coordinator {coord['pinned_chars']} of {coord['limit']} chars ({coord['pinned']} "
+            f"pinned; shows {coord['shown']} of the {coord['entries']} entries meant for it), workers "
+            f"{work['pinned_chars']} of {work['memory_limit']} chars ({work['pinned']} pinned; shows "
+            f"{work['shown']} of the {work['entries']} meant for them)")
 
 
 def worker_pinned_line(p: Project, use: dict | None = None) -> str:

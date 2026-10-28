@@ -980,6 +980,13 @@ def worker_always(e: dict) -> bool:
     return bool(e["kind"] in ("restriction", "resource") or e.get("standing"))
 
 
+def coordinator_memory(e: dict) -> bool:
+    """Whether the coordinator's prompt carries memory entry `e` (and its budget counts it): all but
+    those tagged for workers alone (`audience: workers`), which only worker_memory counts. A
+    restriction binds everyone, whatever its audience."""
+    return e.get("audience") != "workers" or e["kind"] == "restriction"
+
+
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./#:-]*[A-Za-z0-9]")
 # A word that names something: a digit, an inner _ / . : # or -, camelCase, or ALL CAPS.
 _NAMING = re.compile(r"\d|[_/.:#-]|[a-z][A-Z]|^[A-Z]{3,}$")
@@ -1404,10 +1411,11 @@ class Project:
         facts that fit the room pinned entries leave, never less than `recent_min` (capped at
         `limit_chars`): past the budget that reserve goes on top. One too big for the room left is
         skipped and older, smaller ones still considered. Pinned entries are kept even past the budget.
+        Only entries the coordinator sees count (coordinator_memory; user_corrections always do).
         Also returns the usage numbers for the digest: `recent_left` decisions and facts left out,
         `crowded` when pinned entries took all but the reserve so that some were."""
-        entries = self._memory_entries()
         corrected = {e["name"] for e in self.user_corrections()}
+        entries = [e for e in self._memory_entries() if coordinator_memory(e) or e["name"] in corrected]
         pin = lambda e: e["kind"] in PINNED_MEMORY_KINDS or e["standing"] or e["name"] in corrected
         pinned = [e for e in entries if pin(e)]
         pinned_chars = sum(len(e["line"]) + 1 for e in pinned)

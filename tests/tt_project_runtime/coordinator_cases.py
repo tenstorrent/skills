@@ -15172,6 +15172,51 @@ def test_worker_memory_keeps_charter_policies_drops_restated_restrictions_and_ma
     assert len(alerts) == 1 and f"{n} of them" in alerts[0]["text"]
 
 
+def test_pinned_memory_counts_each_entry_against_the_budget_of_the_prompt_that_shows_it(env, capsys):
+    """An entry for workers alone counts only against the workers' pinned budget and is not in the
+    coordinator's prompt; one for the coordinator only against its own; one with no audience where it
+    is shown. Restrictions reach both whatever their audience. `ttp doctor` and the digest's budget
+    line give both pinned figures from the same counts."""
+    p = make(env)
+    from ttp import cli, coordinator as coord
+    from ttp.prompts import worker_context, worker_system
+    paths = _memories(p, [("preference", "W-PREF " + "w" * 2000, "workers"),
+                          ("resource", "W-RES " + "v" * 1500, "workers"),
+                          ("restriction", "W-RULE never reboot the shared box.", "workers"),
+                          ("preference", "C-PREF " + "c" * 1000, "coordinator"),
+                          ("restriction", "C-RULE never open a pull request.", "coordinator"),
+                          ("preference", "D-PREF short replies."),
+                          ("resource", "D-RES the build box is ours.")]
+              + [("decision", f"D-DEC-{i} " + "d" * 900) for i in range(20)])
+    entries = {e["name"]: e for e in p._memory_entries()}
+    tag = lambda n: entries[n]["line"].split("] ")[1].split(" ")[0]
+    size = lambda tags: sum(len(entries[f.stem]["line"]) + 1 for f in paths if tag(f.stem) in tags)
+    shown, use = p.memory_select()
+    pinned = {tag(e["name"]) for e in shown[:use["pinned"]]}
+    assert pinned == {"W-RULE", "C-PREF", "C-RULE", "D-PREF", "D-RES"}, pinned
+    assert use["pinned_chars"] == size(pinned)
+    assert not {"W-PREF", "W-RES"} & {tag(e["name"]) for e in shown}
+    work = worker_context(p)[2]
+    _, wuse = p.worker_memory_select(10 ** 6)
+    assert wuse["pinned_chars"] == size({"W-PREF", "W-RES", "W-RULE", "C-RULE", "D-RES"}) == work["pinned_chars"]
+    system = worker_system(p)
+    assert "W-RULE never reboot" in system and "C-RULE never open" in system and "C-PREF" not in system
+    context = coord.prompt_state(p)[0]["context"]
+    assert "W-PREF" not in context and "W-RES" not in context
+    assert all(x in context for x in ("W-RULE", "C-RULE", "C-PREF", "D-PREF", "D-RES"))
+    line = coord.memory_budget_line(p)
+    figures = (f"pinned for you {use['pinned_chars']} of {use['limit']} chars, "
+               f"for workers {work['pinned_chars']} of {work['memory_limit']}")
+    assert f"## Memory over budget: {len(entries)} entries" in line and figures in line, line
+    assert f"you see {use['shown']} of the {use['entries']} meant for you" in line, line
+    cli.main(["doctor", p.name])
+    assert (f"pinned memory: coordinator {use['pinned_chars']} of {use['limit']} chars (5 pinned; shows "
+            f"{use['shown']} of the 25 entries meant for it), workers {work['pinned_chars']} of "
+            f"{work['memory_limit']} chars (5 pinned; shows {work['shown']} of the {work['entries']} meant "
+            f"for them)") in capsys.readouterr().out
+    assert use["entries"] == 25 and use["shown"] < 25 and work["entries"] == 5, (use, work)
+
+
 def test_a_sandboxed_worker_queues_machine_changes_for_its_daemon_when_the_shared_ledger_is_read_only(
         env, monkeypatch, capsys):
     """A worker whose sandbox keeps the user's tt-project home read-only (no ledger lock) queues `ttp machines
