@@ -1025,15 +1025,18 @@ def run_gh_hooks(args: list[str], own_dir: str, real: str = "") -> str | None:
     for hook in hooks:
         name = f"{HOOKS_DIR}/{os.path.basename(hook)}"
         try:
+            # own session: the hook is a short checked child killed on its timeout; a session keeps
+            # its killpg from taking the wrapper or the run with it
             proc = subprocess.Popen([hook, *args], stdin=subprocess.DEVNULL if data is None else subprocess.PIPE,
-                                    stdout=2, start_new_session=True, env={**os.environ, "TTP_GH_REAL": real})
+                                    stdout=2, start_new_session=True,   # own session: a gh pre-hook is killed with its group on timeout
+                                    env={**os.environ, "TTP_GH_REAL": real})
         except OSError as e:
             return f"refused: the project's gh hook {name} could not run ({e})"
         try:
             proc.communicate(data, timeout=HOOK_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)   # its own session, started above
+                os.killpg(proc.pid, signal.SIGKILL)   # own session: a gh hook past its timeout, killed here
             except OSError:
                 pass
             proc.wait()
