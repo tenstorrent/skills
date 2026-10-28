@@ -142,8 +142,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "on_pass_dry_run": True, "on_pass_dry_run_timeout_s": 30,
                 # detached jobs' use of what they asked for (jobuse.py): sampled every sample_s; cores
                 # used under under_frac of the request, or an unused device, over window_s is under-use
-                # (one job_underuse event; the next check comes within check_cap_s)
-                "job_use": {"sample_s": 60, "window_s": 900, "under_frac": 0.25, "check_cap_s": 1800},
+                # (one job_underuse event per job and repeat_s; the next check comes within check_cap_s)
+                "job_use": {"sample_s": 60, "window_s": 900, "under_frac": 0.25, "check_cap_s": 1800,
+                            "repeat_s": 21600},
                 # `ttp progress report` (progress.py): stall_after refusals, stalls or failures in a row
                 # with no result, the last within window_s, are a stalled driver (one observation)
                 "progress": {"stall_after": 5, "window_s": 86400}},

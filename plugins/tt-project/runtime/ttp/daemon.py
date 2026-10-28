@@ -8885,8 +8885,9 @@ class Daemon:
 
     def sample_jobs(self) -> None:
         """Detached jobs of live tasks: what each asked for against what it uses (jobuse.py), model-free,
-        every `waiting.job_use.sample_s`. An under-use stretch is recorded (kv job_use), raises one
-        `job_underuse` event and pulls its waiting task's next check in to `check_cap_s` away."""
+        every `waiting.job_use.sample_s`. An under-use stretch is recorded (kv job_use) and pulls its
+        waiting task's next check in to `check_cap_s` away; the job raises one `job_underuse` event per
+        `repeat_s`, whatever its stretches do (_underuse_event)."""
         s, now = jobuse.settings(self.cfg), time.time()
         if now - self._jobs_sampled < s["sample_s"]:
             return
@@ -8921,13 +8922,15 @@ class Daemon:
                     pid = jobuse.root_pid(j)
                     was = old.get(str(rc)) or {}
                     got = with_containers(jobuse.sample(pid, nodes)) if pid else None
-                    st, fire = jobuse.assess(was.get("st"), got, req, now, s)
+                    st = jobuse.assess(was.get("st"), got, req, now, s)[0]
                     entry = {"task": t["id"], "name": j["name"], "req": req, "st": st, "line": jobuse.line(req, st)}
                     if was.get("pulled") and was.get("pulled") == st.get("under"):
                         entry["pulled"] = was["pulled"]
+                    if was.get("raised"):
+                        entry["raised"] = was["raised"]
                     new[str(rc)] = entry
-                    if fire:
-                        self._underuse_event(t, entry, now, s)
+                    if st.get("under"):
+                        self._underuse_event(t, entry, rc, now, s)
                     if st.get("under") and "pulled" not in entry and self._pull_check(t["id"], st["why"], now, s):
                         entry["pulled"] = st["under"]
         # A stretch that ended (use recovered, or the job ended) before its pulled-in check: that check
@@ -8972,11 +8975,23 @@ class Daemon:
         if keep != raised:
             db.set_kv(PROGRESS_KEY, keep)
 
-    def _underuse_event(self, task: dict, entry: dict, now: float, s: dict) -> None:
+    def _underuse_event(self, task: dict, entry: dict, rc: Path, now: float, s: dict) -> None:
+        """One `job_underuse` event per job and `repeat_s`, keyed on the job (its .rc, its root's start,
+        its request), not on the stretch: an under-use stretch that ends and starts again (an unmeasured
+        sample, a CPU total that drops as processes exit) raises nothing new. A restarted job or a changed
+        request raises again. entry["raised"] (kv job_use) remembers the last one; the events table
+        backs it up."""
         db, st = self.p.db, entry["st"]
-        fp = f"job_underuse:{task['id']}:{entry['name']}:{st['under']:.0f}"
-        if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+        key = hashlib.sha1(json.dumps([str(rc), st.get("start"), entry["req"]], sort_keys=True).encode()).hexdigest()[:12]
+        last = entry.get("raised") or {}
+        if last.get("key") == key and now - float(last.get("at") or 0) < s["repeat_s"]:
             return
+        fp = f"job_underuse:{task['id']}:{entry['name']}:{key}"
+        row = db.one("SELECT ts FROM events WHERE fingerprint=? ORDER BY id DESC LIMIT 1", (fp,))
+        if row and now - float(row["ts"]) < s["repeat_s"]:
+            entry["raised"] = {"key": key, "at": float(row["ts"])}
+            return
+        entry["raised"] = {"key": key, "at": now}
         text = (f"#{task['id']} {task['title']}: its detached job {entry['name']} {st['why']} ({entry['line']}). "
                 f"Its next check comes within {s['check_cap_s'] / 60:g} min. Decide: let it run, or have it "
                 f"restarted with what it really uses so the cores or device go to other work.")

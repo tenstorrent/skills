@@ -117,3 +117,83 @@ def test_the_daemon_counts_a_jobs_busy_containers_and_degrades_without_docker(en
             assert len(calls) == (2 if ctrs == [] else 1), "an unreadable docker is not asked every pass"
     finally:
         lock.close()
+
+
+def test_a_steadily_idle_job_sampled_at_uneven_gaps_stays_one_stretch():
+    from ttp import jobuse
+    # A busy daemon samples every 1 to 4 min: no sample may fall a full window back, yet the window
+    # keeps its base and the stretch never ends and starts again.
+    st, t, cpu, fired, ends = None, 0.0, 0.0, 0, 0
+    for gap in [60, 65, 190, 250, 120, 185, 62, 240] * 20:
+        t, cpu = t + gap, cpu + gap * 0.05
+        was = (st or {}).get("under")
+        st, fire = jobuse.assess(st, {"cpu": cpu, "start": "S", "dev": None}, {"cores": 16}, t, _JOB_USE)
+        fired += fire
+        ends += bool(was and not st.get("under"))
+    assert fired == 1 and ends == 0 and st["used"] == 0.05
+
+
+def _replay(d, clock, cpu, steps):
+    """Sample the job once per (gap, cpu or None for an unmeasured sample) step."""
+    for gap, v in steps:
+        clock[0] += gap
+        cpu["v"] = v
+        d._jobs_sampled = 0
+        d.sample_jobs()
+
+
+def test_a_flapping_under_used_job_raises_one_event_until_restart_request_change_or_hold_off(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod, jobuse
+    tid = p.db.add_task("bench", "s", kind="work", tier="light", origin="user")
+    rc, lock = _job_of_waiting_task(p, tid, {"cores": 8})
+    try:
+        clock, cpu, start = [time.time()], {"v": 0.0}, {"v": "S"}
+        monkeypatch.setattr(time, "time", lambda: clock[0])
+        monkeypatch.setattr(jobuse, "sample", lambda pid, nodes=None: None if cpu["v"] is None else
+                            {"cpu": cpu["v"], "start": start["v"], "dev": None})
+        d = dmod.Daemon(p.base)
+
+        def events():
+            return p.db.q("SELECT * FROM events WHERE kind='job_underuse' AND task=? ORDER BY id", (tid,))
+        # An API-bound job: about 0.05 cores, its CPU total drops each time a child process ends and
+        # one sample cannot be measured; each restarts the stretch. Over 2.5 h: one event.
+        steps, v = [], 0.0
+        for i in range(60):
+            v += 9.0
+            if i in (20, 35, 50):
+                v -= 30.0   # child processes ended: their CPU left the tree
+            steps.append((150, None if i == 28 else v))
+        _replay(d, clock, cpu, steps)
+        assert len(events()) == 1
+        entry = p.db.kv(jobuse.KV)[str(rc)]
+        assert entry["st"].get("under") and entry["raised"]["at"] < clock[0] - 3600
+        # The kv record forgot it (or an A-B-A request flip): the events table still holds it off.
+        entry.pop("raised")
+        p.db.set_kv(jobuse.KV, {str(rc): entry})
+        _replay(d, clock, cpu, [(60, v + 1.0)])
+        assert len(events()) == 1 and p.db.kv(jobuse.KV)[str(rc)]["raised"]
+        # Its request changes (re-recorded with fewer cores): a new event.
+        run_dir = rc.parent
+        jobs = json.loads((run_dir / "detached.json").read_text())
+        jobs[0]["requested"] = {"cores": 4}
+        (run_dir / "detached.json").write_text(json.dumps(jobs))
+        _replay(d, clock, cpu, [(60, v + 3.0)])
+        assert len(events()) == 2 and "asked for 4 cores" in events()[-1]["text"]
+        # Restarted (a new root process): a new stretch and a new event once it has a full window.
+        start["v"], v = "S2", 0.0
+        for _ in range(20):
+            v += 3.0
+            _replay(d, clock, cpu, [(60, v)])
+        assert len(events()) == 3
+        # Still under-used, flapping, past the 6 h hold-off: raised once more, not per stretch.
+        steps = []
+        for i in range(150):
+            v += 9.0 - (30.0 if i % 25 == 24 else 0.0)
+            steps.append((150, v))
+        _replay(d, clock, cpu, steps)
+        assert len(events()) == 4
+        fps = [e["fingerprint"] for e in events()]
+        assert fps[3] == fps[2] and len(set(fps)) == 3
+    finally:
+        lock.close()

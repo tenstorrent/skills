@@ -19,9 +19,11 @@ total. Containers started by other work after the job began also count: that can
 never invent it. Without docker, or when it cannot be read, only the tree counts. Averaged over
 `window_s`, cores used under `under_frac` of the request, or a requested device that no process of
 the job held open for the whole window, is under-use: the stretch is recorded on the task (kv
-`job_use`, shown by `ttp status` and the web app), raises one `job_underuse` event per stretch, and
-pulls the task's next check in to at most `check_cap_s` away (one worker check per stretch). Where
-sampling is unavailable the job shows as unmeasured and nothing fires.
+`job_use`, shown by `ttp status` and the web app) and pulls the task's next check in to at most
+`check_cap_s` away (one worker check per stretch). It raises one `job_underuse` event per job, keyed
+on the job (its .rc, its root's start and its request), not on the stretch: a stretch that ends and
+starts again raises nothing more until `repeat_s` has passed, unless the job was restarted or its
+request changed. Where sampling is unavailable the job shows as unmeasured and nothing fires.
 """
 from __future__ import annotations
 
@@ -34,7 +36,7 @@ import sys
 from pathlib import Path
 
 KV = "job_use"
-DEFAULTS = {"sample_s": 60, "window_s": 900, "under_frac": 0.25, "check_cap_s": 1800}
+DEFAULTS = {"sample_s": 60, "window_s": 900, "under_frac": 0.25, "check_cap_s": 1800, "repeat_s": 21600}
 MIN_CORES = 2   # a single-core request is never judged: an idle wait on one core is no waste
 
 _CORES = [re.compile(r"(?:^|\s)-j\s*(\d+)\b"), re.compile(r"--(?:jobs|threads|workers|parallel)[= ](\d+)\b"),
@@ -307,7 +309,9 @@ def assess(state: dict | None, got: dict | None, req: dict, now: float, s: dict)
     st.pop("unmeasured", None)
     st.setdefault("since", now)
     st["start"] = got["start"]
-    ring = [r for r in ring if now - r[0] <= win + 2 * s["sample_s"]] + [[now, cpu]]
+    # The window plus its newest older sample, the base: uneven sample gaps never leave the window
+    # without a base, which would end the stretch on that sample and start a new one on the next.
+    ring = [r for r in ring if now - r[0] >= win][-1:] + [r for r in ring if now - r[0] < win] + [[now, cpu]]
     st["ring"] = ring
     full = [r for r in ring if now - r[0] >= win]
     base = full[-1] if full else None

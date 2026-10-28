@@ -649,7 +649,8 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   cgroup CPU of docker containers the daemon's user can see that started after the job did (no docker,
   or unreadable: the tree alone), and a job using under
   a quarter of its cores, or none of a held device, for `waiting.job_use.window_s` raises one
-  `job_underuse` event and brings its task's next check within `check_cap_s`. `ttp status` and the web
+  `job_underuse` event (one per job: again only after `repeat_s`, 6 h, or once the job restarts or
+  its request changes) and brings its task's next check within `check_cap_s`. `ttp status` and the web
   app show requested vs used per job ("unmeasured" where it cannot sample). Each local job's record in
   the run's `detached.json` says `running` (or `queued`) until it is over, then `ended` with its exit
   code and the .rc's time, or `died` (no exit code, with why) once its job lock is free with no .rc;
