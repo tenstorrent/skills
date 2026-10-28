@@ -19,8 +19,10 @@
 Each run has a total deadline (`watchers.deadline_s`, a payload's `deadline_s` wins, up to DEADLINE_MAX_S)
 and each gh call a timeout (`watchers.gh_timeout_s`, or the payload's), cut to the time left: a run past its
 deadline stops, keeps what it read, and reports one error saying it was cut short. The `prs` watcher reads
-`pr_workers` PRs at once, each PR's gh calls in their own process groups and within `pr_timeout_s`, so one
-slow or hung PR times out alone while the others are read. It reads the least recently checked PRs first
+`pr_workers` PRs at once, each PR within `pr_timeout_s`, so one slow PR times out alone while the others are
+read. Its gh reads are batched (PrCycle): one GraphQL query per repo and poll (PR_BATCH PRs a query) answers
+every PR's view and findings, and later asks in the same cycle reuse it, so gh runs do not grow with the PR
+count; each gh runs in a process group of its own. It reads the least recently checked PRs first
 (PR_TRIED_KEY), so a run cut short is continued by the next and every PR gets its turn; a merged or closed
 PR is no longer read. Each run logs every gh call's duration per PR and which PRs it did not check, and why.
 A PR is read once per run however many tasks name it (a hand-off's `pr` sets its task's pr_url, so fix,
@@ -34,6 +36,7 @@ import hashlib
 import json
 import os
 import re
+import contextlib
 import contextvars
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -165,16 +168,9 @@ def run_builtin(daemon, name: str, payload: dict) -> str:
     return status
 
 
-def _gh(args: list[str], cwd: str) -> dict | None:
-    """gh's JSON answer, or None. Its timeout is the running builtin's per-call one, cut to the time
-    left before its deadline; past the deadline or once its schedule run was stopped it is not called.
-    gh runs through boundedchild, in a process group of its own killed whole at the timeout, and known
-    to the schedule run while it lives (schedrun.track), so a daemon stop kills it too. A call that timed
-    out is told to _read_pr (_TIMED_OUT)."""
-    left, b, run = _left(), _BOUND.get(), _RUN.get()
-    timeout = GH_TIMEOUT_S if b is None else min(b[1], left)
-    if timeout <= 0 or (run is not None and run.stopping.is_set()):
-        return None
+def _spawn(args: list[str], timeout: float, cwd: str, run=None):
+    """gh `args` through boundedchild (its own process group, killed whole at `timeout`), known to the
+    schedule run `run` while it lives (schedrun.track), so a daemon stop kills it too."""
     from . import boundedchild, schedrun
     pids: list[int] = []
 
@@ -183,14 +179,35 @@ def _gh(args: list[str], cwd: str) -> dict | None:
         return run is None or schedrun.track(run, pid)
 
     try:
-        res = boundedchild.run(["gh", *args], timeout, cwd=cwd, on_start=started)
+        return boundedchild.run(["gh", *args], timeout, cwd=cwd, on_start=started)
     finally:
         if run is not None and pids:
             run.groups.pop(pids[0], None)
+
+
+def _timed(timeout: float) -> None:
+    timed = _TIMED_OUT.get()
+    if timed is not None:
+        timed.append(timeout)
+
+
+def _gh(args: list[str], cwd: str) -> dict | None:
+    """gh's JSON answer, or None. Its timeout is the running builtin's per-call one, cut to the time
+    left before its deadline; past the deadline or once its schedule run was stopped it is not called.
+    A PR the poll cycle planned (PrCycle) is answered from its repo's one batched read. A call that
+    timed out is told to _read_pr (_TIMED_OUT)."""
+    left, b, run = _left(), _BOUND.get(), _RUN.get()
+    timeout = GH_TIMEOUT_S if b is None else min(b[1], left)
+    if timeout <= 0 or (run is not None and run.stopping.is_set()):
+        return None
+    cycle = _CYCLE.get()
+    if cycle is not None:
+        hit, answer = cycle.answer(args, cwd, timeout, run)
+        if hit:
+            return answer
+    res = _spawn(args, timeout, cwd, run)
     if res.timed_out:
-        timed = _TIMED_OUT.get()
-        if timed is not None:
-            timed.append(timeout)
+        _timed(timeout)
         return None
     if res.rc != 0:
         return None
@@ -198,6 +215,199 @@ def _gh(args: list[str], cwd: str) -> dict | None:
         return json.loads(res.out)
     except ValueError:
         return None
+
+
+# One batched read: a GraphQL query per repo and poll for up to PR_BATCH of its PRs, aliased p0, p1...,
+# fetching what `gh pr view --json PR_FIELDS` and BOT_QUERY return for each. About 10k nodes a PR, so a
+# batch stays far below GitHub's 500k-node cap per query. A connection with more pages than one (over 100
+# comments, reviews or checks) is read on, so the answers are whole, as gh's own are.
+PR_BATCH = 20
+_PAGE = "pageInfo{hasNextPage endCursor} "
+_AUTHOR = "author{__typename login} "
+# connection: (selection, "%s" taking its `after`; its path from the pullRequest node)
+_CONNS = {
+    "comments": ("comments(first:100%s){" + _PAGE + "nodes{" + _AUTHOR + "body createdAt url}}", ("comments",)),
+    "reviews": ("reviews(first:100%s){" + _PAGE + "nodes{id " + _AUTHOR + "state body submittedAt url "
+                "comments(first:50){totalCount nodes{" + _AUTHOR + "body}}}}", ("reviews",)),
+    "checks": ("commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100%s){" + _PAGE
+               + "nodes{__typename ... on CheckRun{name status conclusion} ... on StatusContext{context state}}}}}}}",
+               ("commits", "nodes", -1, "commit", "statusCheckRollup", "contexts")),
+}
+_PR_SEL = ("state isDraft mergeable reviewDecision url title headRefOid headRefName " + _AUTHOR
+           + "".join(sel % "" for sel, _ in _CONNS.values())
+           + "reviewThreads(first:100){nodes{isResolved isOutdated path comments(first:50){nodes{" + _AUTHOR
+           + "body url}}}}")
+# A failed batch whose per-PR asks would fail alike (rate limit, auth): its PRs fail with it, no gh per PR.
+_REFUSED_RE = re.compile(r"rate limit|abuse detection|HTTP 40[13]\b|bad credentials|gh auth login", re.I)
+_HOST_RE = re.compile(r"https?://([^/\s]+)/", re.I)
+
+
+def _at(node, path):
+    for step in path:
+        if isinstance(step, int):
+            node = node[step] if isinstance(node, list) and node else None
+        else:
+            node = node.get(step) if isinstance(node, dict) else None
+    return node
+
+
+def _graphql(res) -> dict | None:
+    """The `data` of a GraphQL answer. gh exits 1 when the answer carries errors (one alias naming a PR
+    that is gone, say), yet prints it: what did resolve is used."""
+    try:
+        body = json.loads(res.out) if res is not None and not res.timed_out else None
+    except ValueError:
+        return None
+    return body.get("data") if isinstance(body, dict) and isinstance(body.get("data"), dict) else None
+
+
+def _views(node: dict, nodes: dict) -> tuple[dict, dict]:
+    """(`gh pr view --json PR_FIELDS` answer, BOT_QUERY answer) of one PR's batched node, with each
+    connection's whole `nodes`. gh gives a null review decision as "" and reviews without their inline
+    comments; BOT_QUERY reads the last 100 comments and reviews."""
+    reviews = nodes["reviews"]
+    view = {"state": node.get("state"), "isDraft": node.get("isDraft"), "mergeable": node.get("mergeable") or "",
+            "reviewDecision": node.get("reviewDecision") or "", "statusCheckRollup": nodes["checks"],
+            "comments": nodes["comments"], "reviews": [{k: v for k, v in r.items() if k != "comments"} for r in reviews],
+            "url": node.get("url"), "title": node.get("title"), "author": node.get("author"),
+            "headRefOid": node.get("headRefOid"), "headRefName": node.get("headRefName")}
+    data = {"data": {"repository": {"pullRequest": {
+        "comments": {"nodes": nodes["comments"][-100:]}, "reviews": {"nodes": reviews[-100:]},
+        "reviewThreads": node.get("reviewThreads") or {"nodes": []}}}}}
+    return view, data
+
+
+class PrCycle:
+    """One poll cycle's PR reads. The PRs it plans are read one batched GraphQL query per repo (PR_BATCH
+    a query) when the first of them is asked for; every later ask in the cycle, from any consumer, is
+    answered from that read with no gh call. A read that fails or times out fails each of its PRs, once
+    (a hung read cuts its whole batch): the next poll tries again, as with per-PR calls. Asks it cannot
+    answer (a PR it did not plan, other fields, an answer without the PR's alias) go to gh as before."""
+
+    def __init__(self) -> None:
+        import threading
+        self._lock = threading.Lock()
+        self.where: dict[str, dict] = {}   # pr_key: its batch
+        self.spawned = 0                   # gh processes the batches started
+
+    def plan(self, urls) -> None:
+        import threading
+        groups: dict[tuple, list] = {}
+        with self._lock:
+            for url in urls:
+                key, host = prguard.pr_key(url), _HOST_RE.match(url or "")
+                if key and host and key not in self.where:
+                    owner, rest = key.split("/", 1)
+                    name, number = rest.split("#")
+                    groups.setdefault((host.group(1).lower(), owner, name), []).append((key, int(number)))
+            for (host, owner, name), prs in groups.items():
+                for i in range(0, len(prs), PR_BATCH):
+                    part = prs[i:i + PR_BATCH]
+                    batch = {"host": host, "owner": owner, "name": name, "prs": part, "lock": threading.Lock(),
+                             "done": False, "timed_out": False, "refused": False, "got": {}, "unknown": set()}
+                    self.where.update({k: batch for k, _ in part})
+
+    @staticmethod
+    def _ask(args: list[str]) -> tuple[str | None, object]:
+        """(pr_key, the fields asked for, or "data" for BOT_QUERY) of an ask the cycle can answer."""
+        if len(args) == 5 and args[:2] == ["pr", "view"] and args[3] == "--json":
+            fields = args[4].split(",")
+            if set(fields) <= set(PR_FIELDS.split(",")):
+                return prguard.pr_key(args[2]) if _HOST_RE.match(args[2]) else None, fields
+        if args[:2] == ["api", "graphql"] and f"query={BOT_QUERY}" in args:
+            vals = dict(a.split("=", 1) for a in args[2:] if "=" in a and not a.startswith("query="))
+            if {"owner", "name", "number"} <= set(vals):
+                return prguard.pr_key(f"{vals['owner']}/{vals['name']}#{vals['number']}"), "data"
+        return None, None
+
+    def answer(self, args: list[str], cwd: str, timeout: float, run=None) -> tuple[bool, dict | None]:
+        """(True, the answer) for an ask about a planned PR, reading its batch first if need be; else (False, None)."""
+        key, what = self._ask(args)
+        batch = self.where.get(key) if key else None
+        if batch is None:
+            return False, None
+        with batch["lock"]:
+            if not batch["done"]:
+                self._read(batch, cwd, timeout, run)
+        if key in batch["unknown"]:
+            return False, None
+        if batch["timed_out"]:
+            _timed(timeout)
+        got = batch["got"].get(key)
+        if got is None:
+            return True, None
+        view, data = json.loads(json.dumps(got))   # each consumer its own copy
+        return True, data if what == "data" else {f: view.get(f) for f in what}
+
+    def _call(self, batch: dict, query: str, more: list[str], cwd: str, end: float, run) -> dict | None:
+        left = end - _now()
+        if left <= 0 or (run is not None and run.stopping.is_set()):
+            return None
+        host = [] if batch["host"] == "github.com" else ["--hostname", batch["host"]]
+        self.spawned += 1
+        res = _spawn(["api", "graphql", *host, "-f", f"query={query}", "-f", f"owner={batch['owner']}",
+                      "-f", f"name={batch['name']}", *more], left, cwd, run)
+        batch["timed_out"] |= bool(res is not None and res.timed_out)
+        batch["refused"] |= bool(res is not None and _REFUSED_RE.search(str(res.err or "")))
+        return _graphql(res)
+
+    def _read(self, batch: dict, cwd: str, timeout: float, run) -> None:
+        batch["done"] = True
+        end = _now() + timeout
+        query = ("query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
+                 + "".join(f"p{i}:pullRequest(number:{n}){{{_PR_SEL}}}" for i, (_, n) in enumerate(batch["prs"]))
+                 + "}}")
+        got = self._call(batch, query, [], cwd, end, run)
+        if got is None and not (batch["timed_out"] or batch["refused"] or _over()
+                                or run is not None and run.stopping.is_set()):
+            batch["unknown"].update(k for k, _ in batch["prs"])   # gh failed otherwise: each PR asks itself
+            return
+        repo = (got or {}).get("repository")
+        if not isinstance(repo, dict):
+            return
+        for i, (key, number) in enumerate(batch["prs"]):
+            if f"p{i}" not in repo:   # an answer without the alias is not one to this query: ask gh per PR
+                batch["unknown"].add(key)
+                continue
+            node = repo[f"p{i}"]
+            if not isinstance(node, dict):
+                continue   # gone, or not readable (null): gh pr view would fail too
+            nodes = {}
+            for conn, (sel, path) in _CONNS.items():
+                page = _at(node, path) or {}
+                nodes[conn] = list(page.get("nodes") or [])
+                while (page.get("pageInfo") or {}).get("hasNextPage"):
+                    q = ("query($owner:String!,$name:String!,$number:Int!,$after:String!){repository(owner:$owner,"
+                         "name:$name){pullRequest(number:$number){" + sel % ",after:$after" + "}}}")
+                    more = self._call(batch, q, ["-F", f"number={number}", "-f",
+                                                 f"after={page['pageInfo'].get('endCursor')}"], cwd, end, run)
+                    page = _at(more, ("repository", "pullRequest", *path))
+                    if not isinstance(page, dict):
+                        break
+                    nodes[conn] += page.get("nodes") or []
+                else:
+                    continue
+                break   # a page could not be read: this PR is unread, as its gh pr view would be
+            else:
+                batch["got"][key] = _views(node, nodes)
+
+
+_CYCLE: contextvars.ContextVar[PrCycle | None] = contextvars.ContextVar("watcher_pr_cycle", default=None)
+
+
+@contextlib.contextmanager
+def pr_cycle():
+    """The poll cycle's PR reads (PrCycle): the one in progress, else a new one for this block."""
+    cycle = _CYCLE.get()
+    if cycle is not None:
+        yield cycle
+        return
+    cycle = PrCycle()
+    token = _CYCLE.set(cycle)
+    try:
+        yield cycle
+    finally:
+        _CYCLE.reset(token)
 
 
 TTP_MARKER = "<!-- ttp -->"
@@ -356,7 +566,11 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
     stint = max(tried.values(), default=0) + 1
     order = sorted(watch, key=lambda t: tried.get(t["pr_url"], 0))
     t0 = _now()
-    results = _read_prs(order, root, workers, pr_timeout)
+    with pr_cycle() as cycle:   # one batched read per repo; later asks in the cycle reuse it
+        spawned = cycle.spawned
+        cycle.plan(t["pr_url"] for t in order)
+        results = _read_prs(order, root, workers, pr_timeout)
+        spawned = cycle.spawned - spawned
     from . import schedrun
     schedrun.check_stopped()   # a daemon stop (or the timeout's kill) killed its reads: no result to save
     read, missed, timings = 0, [], []
@@ -429,7 +643,8 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
     keys = {prguard.pr_key(t["pr_url"]) for t in rows}
     db.set_kv(prguard.DRAFT_SEEN_KEY, {k: v for k, v in drafts.items() if k in keys})
     db.set_kv(PR_TRIED_KEY, tried)
-    _log(daemon, f"pr-watch: {len(order)} PRs in {_now() - t0:.1f} s ({workers} at once); gh calls: "
+    _log(daemon, f"pr-watch: {len(order)} PRs in {_now() - t0:.1f} s ({workers} at once, {spawned} batched "
+         f"gh reads); gh calls: "
          + ("; ".join(timings) or "none") + (f"; not checked: {'; '.join(missed)}" if missed else ""))
     unapproved = f", {len(flagged)} out of draft unapproved" if flagged else ""
     if missed:
