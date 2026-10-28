@@ -32,7 +32,12 @@ that branch's one reserved slot beyond the pool (RESERVED), which task checks ne
 
 A project's full checks (`ttp checks`) also hold its suite lock (suite_hold()): a second full run of
 the same project waits for the first, other projects never do. It is a file lock, so an exit, a crash
-or a reboot frees it.
+or a reboot frees it. Its waiters queue (a locks.enqueue ticket each) and it goes to the most urgent
+task priority first (p1 before p2 ...; an obligation owner's 0 before all), then arrival (suite_order);
+a running holder is never pre-empted. A waiter ages one priority step per SUITE_AGE_S waited, down to
+0, so a waiter of priority p waits at most p * SUITE_AGE_S plus the runs of those that arrived before it.
+A run holding it is stopped at the checks wall-time cap (checkwall); suite_line shows the holder's
+time against that cap and the waiting order (`ttp status`).
 
 Builds (make, ninja, cmake --build) take slots of a second pool, the build pool (BUILDS: same sizes,
 same locks and order, its own lock files and settings checks.build_pool, checks.build_run_max and
@@ -64,6 +69,8 @@ OWN = "test-slots-project"     # check-slots/test-slots-project.<project id>.<i>
 RESERVED = "test-slots-push"   # check-slots/test-slots-push.<branch id>.lock: a push branch's reserved slot
 SUITE = "test-suite"           # check-slots/test-suite.<project id>.lock: one project's full checks
 POLL_S = 5.0
+SUITE_AGE_S = 900.0   # a suite waiter gains one priority step per this many seconds waited
+NO_PRIORITY = 6      # a ticket without a priority (no task, an older runtime) ages from here
 TELL_S = 300.0
 NICE = 10
 IONICE = ["-c3"]    # idle class: a live service's IO always goes first
@@ -290,29 +297,61 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
 
 def suite_path(project_name: str):
     """Project `project_name`'s suite lock file (SUITE)."""
-    return locks.slot_paths(checkcap.slot_dir(), f"{SUITE}.{locks.group_id(project_name)}", 1)[0]
+    return locks.slot_paths(checkcap.slot_dir(), _suite_resource(project_name), 1)[0]
+
+
+def _suite_resource(project_name: str) -> str:
+    return f"{SUITE}.{locks.group_id(project_name)}"
+
+
+def suite_priority(ticket, now: float | None = None) -> float:
+    """A suite waiter's priority now: its task priority (NO_PRIORITY without one), one step more urgent
+    per SUITE_AGE_S it has waited, never below 0."""
+    prio = locks.ticket_priority(ticket)
+    prio = NO_PRIORITY if prio == float("inf") else prio
+    waited = max(0.0, (time.time() if now is None else now) - locks._arrival(ticket))
+    return max(0.0, prio - waited // SUITE_AGE_S)
+
+
+def suite_order(project_name: str, q: list | None = None, now: float | None = None) -> list:
+    """The project's suite waiters in the order the lock goes to them: by suite_priority, then arrival."""
+    q = locks.queued(checkcap.slot_dir(), _suite_resource(project_name)) if q is None else q
+    return sorted(q, key=lambda t: (suite_priority(t, now), locks._arrival(t), t.name))
 
 
 def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = None,
                wait_s: float | None = None, waiting: Callable[[bool], None] | None = None,
-               stop: Callable[[], str] | None = None, who: str = "") -> Grant | None:
+               stop: Callable[[], str] | None = None, who: str = "", priority: int | None = None,
+               since: float | None = None) -> Grant | None:
     """Hold project `project_name`'s suite lock for its full checks (above), waiting while another of its
-    runs holds it; Grant(0) holding it, Grant() with no project or nested in a check, None once `wait_s`
-    passed. It never waits for another project's runs. `waiting` and `stop` as for checkcap.acquire:
-    `waiting(True)` once the wait starts and `waiting(False)` once it ends; a reason from `stop()` ends
-    the wait with checkcap.Cancelled. `who` (e.g. "run 12") goes in its label, so a waiting run names
-    the run it waits for."""
+    runs holds it or a more urgent waiter is ahead (suite_order); Grant(0) holding it, Grant() with no
+    project or nested in a check, None once `wait_s` passed. It never waits for another project's runs.
+    `waiting` and `stop` as for checkcap.acquire: `waiting(True)` once the wait starts and `waiting(False)`
+    once it ends; a reason from `stop()` ends the wait with checkcap.Cancelled. `who` (e.g. "run 12") goes
+    in its label, so a waiting run names the run it waits for. `priority`: the task's (lower first);
+    `since`: the arrival to queue at (default now), kept by a run that hands over."""
     if not project_name or os.environ.get(HELD_ENV) or os.environ.get(checkcap.HELD_ENV):
         return Grant()
     path = [suite_path(project_name)]
+    task = os.environ.get("TTP_TASK") or ""
+    label = f"{project_name}: full checks ({who + ', ' if who else ''}pid {os.getpid()})"
+    try:   # the ticket names its task for suite_line
+        ticket = locks.enqueue(checkcap.slot_dir(), _suite_resource(project_name),
+                               f"task #{task} {label}" if task.isdigit() else label, since, priority=priority)
+    except OSError:
+        return Grant()   # an unwritable slot directory: the checks slot says so
     start, told = time.time(), 0.0
     try:
         while True:
-            try:
-                f = locks.try_take(path, f"{project_name}: full checks ({who + ', ' if who else ''}pid {os.getpid()})",
-                                   "full checks")
-            except OSError:
-                return Grant()   # an unwritable slot directory: the checks slot says so
+            q = suite_order(project_name)
+            f = None
+            if ticket not in q or q[0] == ticket:
+                try:
+                    f = locks.try_take(path, label, "full checks",
+                                       extra={**({"task": task} if task.isdigit() else {}),
+                                              **({"priority": priority} if priority is not None else {})})
+                except OSError:
+                    return Grant()
             if f is not None:
                 return Grant(0, [f], time.time() - start)
             if stop and (why := stop()):
@@ -323,12 +362,66 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                 if not told and waiting:
                     waiting(True)
                 told = time.time()
-                tell and tell(f"waiting for this project's other full checks to end (one at a time per project), "
+                ahead = q.index(ticket) if ticket in q else 0
+                tell and tell(f"waiting for this project's other full checks to end (one at a time per project, "
+                              f"most urgent priority first; {ahead} waiter(s) ahead), "
                               f"held by {checkcap._some(locks.held_labels(path)) or 'a run that just ended'}")
             time.sleep(poll_s(POLL_S))
     finally:
+        locks.dequeue(ticket)
         if told and waiting:
             waiting(False)
+
+
+def suite_running(grant, cap_s: float) -> None:
+    """Mark the suite lock `grant` holds as running its commands from now under a wall-time cap of
+    `cap_s` seconds (0: none), for suite_line."""
+    for f in getattr(grant, "files", None) or []:
+        if os.path.basename(getattr(f, "name", "")).startswith(SUITE + "."):
+            locks.relabel(f, {"run_since": time.time(), "cap_s": float(cap_s or 0)})
+
+
+def _mins(s: float) -> str:
+    m = int(max(0.0, s) // 60)
+    return f"{m // 60} h {m % 60} min" if m >= 60 else f"{m} min"
+
+
+def suite_line(project_name: str, now: float | None = None) -> str:
+    """`ttp status`'s line on the project's full checks slot: its holder, how long it has run against
+    its wall-time cap, and the waiting order (suite_order); "" while it is free and nobody waits."""
+    now = time.time() if now is None else now
+    try:
+        recs = locks.holder_records([suite_path(project_name)])
+        q = suite_order(project_name, now=now)
+    except OSError:
+        return ""
+    if not recs and not q:
+        return ""
+    if recs:
+        h = recs[0]
+        what = f"#{h['task']}" if h.get("task") else str(h.get("holder") or "a run")
+        what += f" p{h['priority']}" if h.get("priority") is not None else ""
+        if h.get("run_since"):
+            cap = float(h.get("cap_s") or 0)
+            what += (f" running {_mins(now - float(h['run_since']))}"
+                     + (f" of its {_mins(cap)} cap" if cap else " (no cap)"))
+        else:
+            what += f" held {_mins(now - float(h.get('since') or now))}, not running yet"
+    else:
+        what = "free"
+    waits = []
+    for t in q:
+        try:
+            m = re.search(r"task #(\d+)", t.read_text())
+        except OSError:
+            m = None
+        prio, aged = locks.ticket_priority(t), suite_priority(t, now)
+        p = "" if prio == float("inf") else f" p{int(prio)}"
+        p += f" (aged to p{int(aged)})" if prio != float("inf") and aged < prio else ""
+        waits.append(f"{'#' + m.group(1) if m else 'a run'}{p} waited {_mins(now - locks._arrival(t))}")
+    return (f"full checks slot: {what}"
+            + (f"; waiting in order: {', '.join(waits[:6])}" + (f" +{len(waits) - 6}" if len(waits) > 6 else "")
+               if waits else ""))
 
 
 def use(kind: Kind = TESTS) -> str:

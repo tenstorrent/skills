@@ -1572,3 +1572,184 @@ def test_every_checks_key_the_runtime_reads_is_an_account_key_and_settable(env):
               "build_project_max", "nice", "ionice"):
         cli.main(["config", "--account", f"checks.{k}", "idle" if k == "ionice" else "3"])
     assert testslots.project_max({"checks": {"test_project_max": 1}}) >= 1
+
+
+def _suite_ticket(name: str, prio, since: float, task: str = ""):
+    from ttp import checkcap, locks, testslots
+    return locks.enqueue(checkcap.slot_dir(), testslots._suite_resource(name),
+                         f"task #{task} x" if task else "x", since, priority=prio)
+
+
+def test_suite_slot_order_is_task_priority_then_arrival_and_a_long_waiter_ages_up(env):
+    from ttp import locks, testslots
+    now = time.time()
+    age = testslots.SUITE_AGE_S
+    p3_old = _suite_ticket("pa", 3, now - 0.5 * age)   # arrived first, waited under one aging step
+    p1_new = _suite_ticket("pa", 1, now - 60)
+    p2_a = _suite_ticket("pa", 2, now - 50)
+    p2_b = _suite_ticket("pa", 2, now - 40)
+    none = _suite_ticket("pa", None, now - 30)
+    other = _suite_ticket("pb", 1, now - 9000)   # another project's waiters never count
+    try:
+        assert testslots.suite_order("pa", now=now) == [p1_new, p2_a, p2_b, p3_old, none], \
+            "p1 before an earlier p3; equal priorities by arrival; no priority last"
+        # No starvation: each SUITE_AGE_S waited is one step more urgent, down to 0, so a p5 waiter
+        # waits at most 5 steps plus the runs of those that arrived before it.
+        p5_starved = _suite_ticket("pa", 5, now - 5 * age - 1)
+        p5_aging = _suite_ticket("pa", 5, now - 2 * age - 1)
+        assert testslots.suite_priority(p5_starved, now) == 0 and testslots.suite_priority(p5_aging, now) == 3
+        order = testslots.suite_order("pa", now=now)
+        assert order[0] == p5_starved, "a waiter aged to 0 goes before any newer p1"
+        assert order.index(p5_aging) > order.index(p2_b) and order.index(p5_aging) < order.index(p3_old), \
+            "aged to p3, it goes after the p2s and, arrived earlier, before the p3 that waits"
+        assert other not in order
+    finally:
+        for t in list(locks._TICKETS):
+            locks.dequeue(t)
+
+
+def test_suite_slot_frees_to_the_most_urgent_waiter_not_the_first_arrival(env, monkeypatch):
+    import threading
+    from ttp import checkcap, locks, testslots
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    monkeypatch.delenv(testslots.HELD_ENV, raising=False)
+    monkeypatch.delenv(checkcap.HELD_ENV, raising=False)
+    hold = testslots.suite_hold("pa")
+    assert hold.files
+    got, lock = [], threading.Lock()
+
+    def wait(name, prio, since):
+        g = testslots.suite_hold("pa", priority=prio, since=since, wait_s=30)
+        with lock:
+            got.append(name)
+        time.sleep(0.3)   # holds it a moment: the next waiter waits for it, never pre-empts it
+        g.close()
+
+    now = time.time()
+    ts = [threading.Thread(target=wait, args=a) for a in
+          (("p3 early", 3, now - 600), ("p2 later", 2, now - 300), ("p1 last", 1, now - 30), ("p2 last", 2, now - 20))]
+    for t in ts:
+        t.start()
+    q = lambda: locks.queued(checkcap.slot_dir(), testslots._suite_resource("pa"))
+    assert _wait_for(lambda: len(q()) == 4)
+    assert got == [], "a running holder is never pre-empted"
+    hold.close()
+    for t in ts:
+        t.join(30)
+    assert got == ["p1 last", "p2 later", "p2 last", "p3 early"], got
+
+
+def test_suite_slot_status_line_shows_the_holder_s_time_against_its_cap_and_the_waiting_order(env, monkeypatch):
+    from ttp import checkcap, locks, testslots
+    monkeypatch.delenv(testslots.HELD_ENV, raising=False)
+    monkeypatch.delenv(checkcap.HELD_ENV, raising=False)
+    assert testslots.suite_line("pa") == "", "free and nobody waits: no line"
+    monkeypatch.setenv("TTP_TASK", "12")
+    hold = testslots.suite_hold("pa", priority=2)
+    now = time.time()
+    try:
+        assert "#12 p2 held 0 min, not running yet" in testslots.suite_line("pa", now)
+        testslots.suite_running(hold, 7200)
+        _suite_ticket("pa", 3, now - 60, "31")
+        _suite_ticket("pa", 4, now - 2 * testslots.SUITE_AGE_S + 60, "32")
+        line = testslots.suite_line("pa", now + 601)
+        assert line.startswith("full checks slot: #12 p2 running 10 min of its 2 h 0 min cap"), line
+        assert line.endswith("waiting in order: #32 p4 (aged to p2) waited 39 min, #31 p3 waited 11 min"), line
+    finally:
+        for t in list(locks._TICKETS):
+            locks.dequeue(t)
+        hold.close()
+
+
+_SUITE_RUNNER = """
+import os, sys, time
+from pathlib import Path
+from ttp import checkcap, locks, testslots
+if sys.argv[3] == "hold":
+    g = testslots.suite_hold(sys.argv[1])
+    testslots.suite_running(g, 3600)
+else:
+    locks.enqueue(checkcap.slot_dir(), testslots._suite_resource(sys.argv[1]), "task #5 w", priority=1)
+Path(sys.argv[2]).write_text("ready")
+while True:
+    time.sleep(1)
+"""
+
+
+def test_suite_slot_of_a_reboot_cut_holder_and_waiter_is_free_at_once(env, tmp_path, monkeypatch):
+    # A reboot (here: both processes killed outright) leaves their label and ticket files behind;
+    # neither holds anything, so the status line shows none and the next run takes the slot at once.
+    from ttp import checkcap, testslots
+    monkeypatch.delenv(testslots.HELD_ENV, raising=False)
+    monkeypatch.delenv(checkcap.HELD_ENV, raising=False)
+    procs = []
+    for role in ("hold", "wait"):
+        ready = tmp_path / role
+        procs.append(subprocess.Popen([sys.executable, "-c", _SUITE_RUNNER, "pa", str(ready), role],
+                                      env={**os.environ, "PYTHONPATH": str(RUNTIME)}))
+        assert _wait_for(ready.exists)
+    try:
+        line = testslots.suite_line("pa")
+        assert "running 0 min of its 1 h 0 min cap" in line and "#5 p1" in line, line
+    finally:
+        for proc in procs:
+            proc.kill()
+            proc.wait(10)
+    assert testslots.suite_path("pa").read_text(), "the holder's label stays on disk"
+    assert testslots.suite_line("pa") == "", "a dead holder and waiter show nothing"
+    t0 = time.time()
+    again = testslots.suite_hold("pa", priority=4, wait_s=5)
+    assert again is not None and again.files and time.time() - t0 < 2, "taken at once, not behind the dead p1"
+    again.close()
+
+
+def test_checks_wall_cap_default_follows_recent_runs_within_its_floor_and_ceiling(env, monkeypatch):
+    from ttp import checkwall
+    monkeypatch.delenv(checkwall.ENV, raising=False)
+    p = make(env)
+    assert checkwall.cap(p)[0] == checkwall.DEFAULT_S, "on with no setup before any timed run"
+    for s in (100, 200, 300):
+        checkwall.record_run(p.state, s, True)
+    assert checkwall.cap(p)[0] == checkwall.FLOOR_S, "3 x 5 min is under the floor"
+    for s in (1800, 2400, 1200):
+        checkwall.record_run(p.state, s, False)
+    assert checkwall.cap(p)[0] == 3 * 2400, "three times the longest recent run"
+    checkwall.record_run(p.state, 4 * 3600, True)
+    assert checkwall.cap(p)[0] == checkwall.CEILING_S
+    p.set_config("checks.wall_cap_s", 90)
+    assert checkwall.cap(p) == (90, "checks.wall_cap_s")
+    p.set_config("checks.wall_cap_s", 0)
+    assert checkwall.cap(p)[0] == 0, "0 turns it off"
+
+
+def test_ttp_checks_past_the_wall_cap_is_stopped_releases_the_slot_and_records_a_timeout(env, tmp_path, monkeypatch, capsys):
+    from ttp import checkcap, checkwall, cli, locks, testslots
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_TASK", "7")
+    p.set_config("checks.wall_cap_s", 2)
+    child = tmp_path / "child.pid"
+    stuck = ["sh", "-c", f"sleep 300 & echo $! > {child}; wait"]
+    t0 = time.time()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", *stuck])
+    assert e.value.code == 1 and time.time() - t0 < 60
+    err = capsys.readouterr().err
+    assert "stopped" in err and "wall-time cap of 0 min (checks.wall_cap_s): a timeout, not a pass" in err, err
+    pid = int(child.read_text())
+    def ended():   # gone, a zombie, or its pid reused by another process (a sandbox's PID namespace)
+        try:
+            stat = open(f"/proc/{pid}/stat").read()
+        except OSError:
+            return True
+        return stat.split()[2] == "Z" or "(sleep)" not in stat
+    assert _wait_for(ended, 10), "what the stuck check started is ended"
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is False and rec["timed_out"]["cap_s"] == 2, rec
+    assert json.loads((run / "check_failure.json").read_text())["timed_out"]["how"] == "checks.wall_cap_s"
+    assert not locks.held_labels([testslots.suite_path(p.name)]) and checkcap.line() == "", "the slot is free"
+    assert checkwall.last_timeout(p.state, "7")["head"] == rec["head"]
+    assert not checkwall.recent(p.state), "a timed-out run is no sample for the default cap"
+    p.set_config("checks.wall_cap_s", 0)
+    cli.main(["checks", "--", "true"])
+    assert "this task's last checks run (run 41" in capsys.readouterr().out, "its next try says so"
+    assert len(checkwall.recent(p.state)) == 1

@@ -82,6 +82,21 @@ def test_ttp_checks_reports_a_capped_rerun_as_skipped_never_passed(env, tmp_path
     assert rec["passed"] is True and rec["added_tests"]["status"] == "skipped"
 
 
+def test_ttp_checks_rerun_stopped_at_the_wall_cap_is_a_timeout_not_a_skip(env, tmp_path, monkeypatch, capsys):
+    # The main run passes; the rerun of the added test hangs past the run's wall-time cap.
+    from ttp import cli
+    run, runs = _added_repo(env, tmp_path, monkeypatch,
+                            "\n\ndef test_new():\n    import time\n    if _bump():\n        time.sleep(300)\n")
+    monkeypatch.setenv("TTP_CHECKS_WALL_CAP_S", "8")
+    t0 = time.time()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", _ADDED_CHECK])
+    assert e.value.code == 1 and time.time() - t0 < 60
+    assert "a timeout, not a pass" in capsys.readouterr().err
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is False and rec["timed_out"]["check"] == _ADDED_CHECK
+
+
 def test_added_tests_rerun_past_its_time_cap_is_skipped_unless_a_round_already_failed(tmp_path):
     from ttp import addedtests
     out, tests = tmp_path / "rows.jsonl", [("tests/test_a.py", "test_a")]

@@ -837,7 +837,13 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   a project may only lower them) and passes its grant as PYTEST_XDIST_AUTO_NUM_WORKERS and TTP_TEST_SLOTS. A
   project holds at most `checks.test_project_max` slots over all its runs (default twice a run's share), waiters
   are served first-come, push checks take a reserved test slot of their branch when the pool is full, and a
-  project runs one full `ttp checks` at a time (a second waits; other projects never do). A pytest `-n N` above
+  project runs one full `ttp checks` at a time (a second waits; other projects never do). That slot goes to the
+  most urgent waiting task priority first, then arrival; a running holder is never pre-empted, and a waiter gains
+  one priority step per 15 min waited, so none starves. A run's check commands stop at a wall-time cap: on by
+  default, 3x the longest of the project's last 20 completed runs within 1-6 h (3 h before 3 runs are known);
+  `checks.wall_cap_s` sets it, 0 turns it off. A run past it has its process group ended, frees the slot and is
+  recorded as a timeout, never a pass; `ttp status` shows the holder's time against its cap and the waiting
+  order. A pytest `-n N` above
   the grant is lowered with a line saying so; a worker's own pytest above TTP_TEST_SLOTS is refused. Builds
   (make, ninja, `cmake --build`) take slots of a second host pool of the same size, the build pool (`checks.build_pool`,
   `checks.build_run_max`, `checks.build_project_max`; 0 pool turns it off), so a long build never takes a test slot: workers

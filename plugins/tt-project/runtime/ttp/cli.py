@@ -1339,6 +1339,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
     if host := checkcap.line():
         lines.append(host)
     lines.extend(testslots.use_lines())
+    if suite := testslots.suite_line(p.name, now):
+        lines.append(suite)
     if verbose and (slot_waits := checkcap.wait_line(p.state, now)):
         lines.append(slot_waits)
     for res in sorted(shared.names(p.config())):
@@ -2579,6 +2581,7 @@ def cmd_checks(a) -> None:
     clean_note = ""   # why a check found no clean checkout, or what only this worktree has
     fast_skipped, fast_cmds = [], []
     executed, selected, rerun = [], [], None
+    timed_out, deadline, ran_since = None, None, 0.0   # the wall-time cap (checkwall) and its outcome
     run_env: dict = {}   # what the checks run in, for the pass's envs (pushpass.check_envs)
     base = _checks_base(p, Path(top), cmds)
     (Path(run_dir) / "check_failure.json").unlink(missing_ok=True)
@@ -2747,6 +2750,18 @@ def cmd_checks(a) -> None:
                         reap_rec = None
                 if not getattr(a, "own_group", False):
                     stop_handlers = _foreground_stop()
+                # The run's wall-time cap from its first command on (checkwall); the status line shows it.
+                from . import checkwall, testslots
+                wall, wall_how = checkwall.cap(p)
+                ran_since = time.time()
+                deadline = ran_since + wall if wall > 0 else None
+                testslots.suite_running(getattr(slot, "suite", None), wall)
+                if p and (last := checkwall.last_timeout(p.state, os.environ.get("TTP_TASK"))):
+                    said_last = (f"this task's last checks run (run {last.get('run') or '?'} on "
+                                 f"{str(last.get('head') or '')[:12]}) was stopped at the wall-time cap: a timeout, "
+                                 f"not a pass")
+                    print(f"ttp checks: {said_last}", flush=True)
+                    out.write(f"ttp checks: {said_last}\n")
             for c in [] if hit or handover or not passed else todo:
                 executed.append(c)
                 cwd = top if _in_place(c) else str(clean.path)
@@ -2769,12 +2784,21 @@ def cmd_checks(a) -> None:
                     out.flush()
                     check_start = out.tell()
                 began = time.monotonic()
-                rc = scriptwatch.rerun(
-                    lambda: _run_check(_low_priority(push.check_argv(c, cwd, env)), group, record=reap_rec, cwd=cwd,
-                                       stdout=out,
-                                       stderr=subprocess.STDOUT, env=env,
-                                       pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ()),
-                    bool, None if push.remote_host(c) else str(c), cwd, env, said)
+                try:
+                    rc = scriptwatch.rerun(
+                        lambda: _run_check(_low_priority(push.check_argv(c, cwd, env)), group, record=reap_rec, cwd=cwd,
+                                           stdout=out,
+                                           stderr=subprocess.STDOUT, env=env, timeout=checkwall.deadline_left(deadline),
+                                           pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ()),
+                        bool, None if push.remote_host(c) else str(c), cwd, env, said)
+                except subprocess.TimeoutExpired:
+                    # Past the wall-time cap: _run_check ended its group and what it left; never a pass.
+                    passed, failed, rc = False, c, checkwall.RC
+                    timed_out = {"check": str(c), "cap_s": wall, "how": wall_how, "head": head,
+                                 "run": os.environ.get("TTP_RUN_ID") or "?"}
+                    out.write(f"ttp checks: {checkwall.said(str(c), wall, wall_how, head)}\n")
+                    out.write(_check_took(c, rc, began))
+                    break
                 if rc != 0:
                     passed, failed = False, c
                     if cwd != top:   # what only this worktree has may be what the check missed
@@ -2799,17 +2823,30 @@ def cmd_checks(a) -> None:
                 out.write(f"$ {py_check} (rerun of the added tests: {', '.join(map('::'.join, new_tests))})\n")
                 out.flush()
                 check_start = out.tell()
-                rerun = addedtests.run(
-                    new_tests, str(py_check),
-                    lambda e, t: _run_check(_low_priority(push.check_argv(py_check, cwd, e)), True, record=reap_rec,
-                                            cwd=cwd, stdout=out, stderr=subprocess.STDOUT, env=e, timeout=t,
-                                            pass_fds=(a.tmp_fd,) if tmp_fd else ()),
-                    Path(run_dir) / addedtests.FILE, env)
+                wall_hit = []   # the rerun ended at the run's wall-time cap, not its own
+
+                def rerun_check(e, t):
+                    left = checkwall.deadline_left(deadline)
+                    try:
+                        return _run_check(_low_priority(push.check_argv(py_check, cwd, e)), True, record=reap_rec,
+                                          cwd=cwd, stdout=out, stderr=subprocess.STDOUT, env=e,
+                                          timeout=left if left is not None and (t is None or left < t) else t,
+                                          pass_fds=(a.tmp_fd,) if tmp_fd else ())
+                    except subprocess.TimeoutExpired:
+                        if left is not None and (t is None or left < t):
+                            wall_hit.append(1)
+                        raise
+                rerun = addedtests.run(new_tests, str(py_check), rerun_check, Path(run_dir) / addedtests.FILE, env)
                 for line in addedtests.lines(rerun):
                     print(f"ttp checks: {line}", flush=True)
                     out.write(f"ttp checks: {line}\n")
                 if rerun["status"] in ("flaky", "failed"):
                     passed, failed, rc = False, py_check, rerun.get("rc") or 1
+                elif wall_hit:
+                    passed, failed, rc = False, py_check, checkwall.RC
+                    timed_out = {"check": str(py_check), "cap_s": wall, "how": wall_how, "head": head,
+                                 "run": os.environ.get("TTP_RUN_ID") or "?"}
+                    out.write(f"ttp checks: {checkwall.said(str(py_check), wall, wall_how, head)}\n")
         finally:
             if reap_tok:
                 _checks_reaped(out, reap_tok, reap_rec, clean, rc)
@@ -2819,6 +2856,11 @@ def cmd_checks(a) -> None:
                 signal.signal(sig, h)
             if stop_handlers:
                 _CHECK_STOP["stopped"] = None
+        if ran_since and p:
+            if timed_out:
+                checkwall.record_timeout(p.state, os.environ.get("TTP_TASK"), timed_out)
+            elif executed:
+                checkwall.record_run(p.state, time.time() - ran_since, passed)
         if slot and not passed:
             slot.close()
         # A check host ssh could not reach (or that could not take the tree) is the environment, as a
@@ -2875,6 +2917,7 @@ def cmd_checks(a) -> None:
                            "base": base, "worktree": top, "rc": rc if ran else None,
                            "output": output[-8000:], "unrelated": False}),
             "purpose": purpose, "not_executed": not_executed,
+            **({"timed_out": timed_out} if timed_out else {}),
             **({"env_problem": env_problem} if env_problem else {}),
             **({"flaky": rerun.get("flaky") or []} if rerun and failed is py_check else {})})
     write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": passed,
@@ -2886,6 +2929,7 @@ def cmd_checks(a) -> None:
                                                         if fast_cmds else {}),
                                                      **({"not_run": not_run} if not_run else {}),
                                                      **({"not_executed": not_executed} if not passed else {}),
+                                                     **({"timed_out": timed_out} if timed_out else {}),
                                                      **({"env_problem": env_problem} if env_problem else {}),
                                                      **({"hosts": hosts} if (hosts := push.hosts_of(todo)) else {}),
                                                      **({"authoring_tree": in_authoring} if in_authoring else {}),
@@ -2899,6 +2943,9 @@ def cmd_checks(a) -> None:
             die(f"ttp checks --purpose harness: {HARNESS_SKIPPED} on {head[:12]}, so nothing qualifies this "
                 f"head; the purpose harness check must apply to it (full output: {log})", 1)
         print(trim.summary(text))   # a test run's failures, else head and tail
+        if timed_out:
+            die(f"ttp checks: {checkwall.said(str(failed), timed_out['cap_s'], timed_out['how'], head)} "
+                f"(full output: {log})", 1)
         if also:
             die(f"ttp checks: {failed!r} failed on {head[:12]}: tests failed, and there is also an environment "
                 f"problem: {env_problem} (full output: {log})", 1)
@@ -3165,7 +3212,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         suite = testslots.suite_hold(p.name if p else None, tell,
                                      checkcap.FOREGROUND_WAIT_S if foreground and p else None,
                                      lambda on: waiting(on, str(testslots.suite_path(p.name))),
-                                     lambda: _checks_cancelled(run_dir), f"run {run_dir.name}")
+                                     lambda: _checks_cancelled(run_dir), f"run {run_dir.name}", prio, arrived)
         if suite is None:
             return None
         left = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
@@ -3186,6 +3233,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             suite.close()
             return None
         slot.tests.files += suite.files   # the suite lock ends with the run's test slots
+        slot.suite = suite   # its label shows the run's wall-time cap (testslots.suite_running)
         return slot
     except checkcap.Cancelled as e:
         if suite is not None:

@@ -498,7 +498,7 @@ def _known_keys(path: list[str]) -> set[str] | None:
     if path[0] == "providers":
         return {"claude", "codex", "cursor", "fake", "chat"} if len(path) == 1 else PROVIDER_KEYS if len(path) == 2 else None
     if path == ["checks"]:
-        return {"nice", "ionice"}
+        return {"nice", "ionice", "wall_cap_s"}
     if len(path) == 1 and isinstance(DEFAULT_CONFIG.get(path[0]), dict):
         return set(DEFAULT_CONFIG[path[0]]) | EXTRA_KEYS.get(path[0], set())
     return None
@@ -2087,7 +2087,7 @@ def unregister(name: str) -> None:
 # project's own project.json, so the projects on a machine agree unless one overrides a key.
 ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_spend_to"}, "pricing": {"claude"},
                 "checks": {"host_max", "load_extra", "nice", "ionice", "priority_turns", "test_pool", "test_run_max",
-                           "test_project_max", "build_pool", "build_run_max", "build_project_max"}}
+                           "test_project_max", "build_pool", "build_run_max", "build_project_max", "wall_cap_s"}}
 
 
 def layered(raw: dict) -> dict:

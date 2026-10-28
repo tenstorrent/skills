@@ -82,6 +82,19 @@ def try_take(paths: list[Path], holder: str, what: str = "", key: str = "", extr
     return None
 
 
+def relabel(f, fields: dict) -> None:
+    """Add `fields` to the label of the held slot file `f` (try_take's), keeping the rest."""
+    try:
+        f.seek(0)
+        h = json.loads(f.read() or "{}")
+        f.seek(0)
+        f.truncate()
+        f.write(json.dumps({**(h if isinstance(h, dict) else {}), **fields}))
+        f.flush()
+    except (OSError, ValueError, TypeError):
+        pass
+
+
 def _pid_ns() -> str | None:
     """This process's PID namespace ("" on hosts without them); None when it cannot tell."""
     if not sys.platform.startswith("linux"):
