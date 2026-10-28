@@ -235,6 +235,10 @@ For generation or serving stages, also inspect:
   sampler) the same way: `Required next step: operator decision`, with the
   work-log record named. When every remaining finding is of these two kinds,
   say so in the verdict so the stage can end `blocked` instead of looping.
+  On a re-review, judge the evidence, not the prose written to answer the
+  previous pass: a wording defect in a document that changed only to address
+  earlier findings, with the underlying evidence unchanged, is a note in the
+  verdict, not a reason to return `more-work-needed` again.
 - declared `model_capabilities`: every key in `tt/generator_vllm.py` is
   documented by the pinned plugin, and each declared value has evidence.
 

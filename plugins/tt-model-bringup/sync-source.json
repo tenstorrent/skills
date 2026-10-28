@@ -85,7 +85,7 @@
       "destination": "prompts/model_bringup_multigoal/09-vllm.txt",
       "blob": "fc930a5472158d07221c2c5440786a7c5aed9ed2",
       "source_sha256": "65e532c7e54a6e1bd348575f4471fa0708990fe93e91ef06bbfa9695c60ca727",
-      "packaged_sha256": "38f0d0de115bfd5da27c6764ef2abe7a3418c8e519000b39eb4c110f2021ead9"
+      "packaged_sha256": "98d429478b968f106097b08cf0ff9277d0313f5f92332f12cbc4be134a79b0c7"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/10-optimized-vllm.check.sh",
@@ -225,7 +225,7 @@
       "destination": "skills/stage-review/SKILL.md",
       "blob": "7c89b9d281aa1a853a273d3ff4b1c16ad8ccac0d",
       "source_sha256": "b84c344e6a2c0130569dc7e4147ad748d44aa04afa11f181b0711d00afbe3466",
-      "packaged_sha256": "4ad57e0c28f5965696c733a4bddcf9022ad637f36b8d33def936aca15750df8c"
+      "packaged_sha256": "bee4319b3b8969d66a02d8e71586cdbd69fec8abf562f54d5559a73cb297247c"
     },
     {
       "source": ".agents/skills/stage-review/agents/openai.yaml",
@@ -274,7 +274,7 @@
       "destination": "skills/vllm-integration/SKILL.md",
       "blob": "05d9e19f7cfbb596d209c504cc49e063b9361da1",
       "source_sha256": "a23a516ab0e8afc3a5dd6ddd72a42781997fb454872139e70605ecbd234e114c",
-      "packaged_sha256": "dfc445f25ade85b754e404655b1b255cc3c5da71431d79526bc41e0ef198c589"
+      "packaged_sha256": "d38b830c61250fbd87192fb3d1200397acfe3bdadd506593ed42337bc0f656c7"
     },
     {
       "source": ".agents/skills/vllm-integration/agents/openai.yaml",
