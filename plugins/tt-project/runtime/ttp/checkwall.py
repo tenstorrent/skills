@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 
 from . import project
-from .project import durable_append, write_json
+from .project import durable_append, durable_write, write_json
 
 FLOOR_S = 3600.0          # never below 1 h, however fast recent runs were
 CEILING_S = 6 * 3600.0    # never above 6 h by default (a set checks.wall_cap_s may be higher)
@@ -92,10 +92,7 @@ def record_run(state: Path | None, seconds: float, passed: bool) -> None:
     path = Path(state) / RUNS_LOG
     try:
         if path.exists() and path.stat().st_size > RUNS_MAX_BYTES:
-            keep = path.read_text().splitlines()[-RECENT:]
-            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-            tmp.write_text("".join(f"{x}\n" for x in keep))
-            os.replace(tmp, path)
+            durable_write(path, "".join(f"{x}\n" for x in path.read_text().splitlines()[-RECENT:]))
         durable_append(path, json.dumps({"ts": time.time(), "s": round(seconds, 3), "passed": bool(passed)}) + "\n")
     except OSError:
         pass
