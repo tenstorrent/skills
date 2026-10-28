@@ -2395,7 +2395,8 @@ def test_setup_box_connectors_verify_is_one_read_only_call_per_family_and_report
            "headless_1=Google Drive:needs-auth;Google Docs:connected\nverify_1=|CONNECTOR_ERROR=no Drive\n")
     v = bc.read_verify(out, targets)
     assert v["Atlassian"] == {"ok": True, "tool": "mcp__claude_ai_Atlassian__search", "items": 5, "error": "",
-                              "headless": {"Atlassian": "connected"}, "loaded": {}, "auth_error": False, "tries": None}
+                              "headless": {"Atlassian": "connected"}, "loaded": {}, "auth_error": False, "tries": None,
+                              "capped": False}
     assert not v["Google"]["ok"] and v["Google"]["error"] == "no Drive"
     assert v["Google"]["headless"] == {"Google Drive": "needs-auth", "Google Docs": "connected"}
     # Another family's tool, or an OK with no tool called, does not pass.
@@ -2415,15 +2416,19 @@ def test_setup_box_connectors_verify_is_one_read_only_call_per_family_and_report
                      "`claude` session there and read its error"]
 
 
-def _fake_claude(tmp_path, runs):
-    """A `claude` on PATH whose n-th `claude -p` prints runs[n] (stream-json lines), recording each run's MCP wait env."""
+def _fake_claude(tmp_path, runs, sleeps=None):
+    """A `claude` on PATH whose n-th `claude -p` sleeps sleeps[n] seconds, then prints runs[n] (stream-json lines),
+    recording each run's MCP wait env."""
     bindir = tmp_path / "bin"
     bindir.mkdir()
     for n, lines in enumerate(runs):
         (tmp_path / f"run{n}.out").write_text("".join(json.dumps(x, separators=(",", ":")) + "\n" for x in lines))
+        if (sleeps or {}).get(n):
+            (tmp_path / f"run{n}.sleep").write_text(str(sleeps[n]))
     fake = bindir / "claude"
     fake.write_text('#!/bin/sh\nn=$(cat "$HOME/n" 2>/dev/null || echo 0); echo $((n + 1)) > "$HOME/n"\n'
                     'echo "$MCP_CONNECTION_NONBLOCKING $MCP_TIMEOUT" >> "$HOME/env"\n'
+                    '[ -f "$HOME/run$n.sleep" ] && sleep "$(cat "$HOME/run$n.sleep")" >/dev/null 2>&1\n'
                     'cat "$HOME/run$n.out" 2>/dev/null\n')
     fake.chmod(0o755)
     return {"PATH": f"{bindir}:/usr/bin:/bin", "HOME": str(tmp_path)}
@@ -2437,7 +2442,7 @@ def _init(tools=(), status="connected", name="Atlassian"):
 _CALL = {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "mcp__claude_ai_Atlassian__search"}]}}
 
 
-def _verify_run(monkeypatch, tmp_path, runs, cap=None):
+def _verify_run(monkeypatch, tmp_path, runs, cap=None, targets=None, sleeps=None, min_try=None):
     """box_connectors.verify_script() run for real against _fake_claude(): (read_verify result, claude runs, env)."""
     import subprocess
     monkeypatch.syspath_prepend(str(BOX_PY.parent))
@@ -2445,9 +2450,11 @@ def _verify_run(monkeypatch, tmp_path, runs, cap=None):
     monkeypatch.setattr(bc, "VERIFY_RETRY_PAUSE_S", 0)
     if cap is not None:
         monkeypatch.setattr(bc, "VERIFY_CAP_S", cap)
-    targets = {"Atlassian": ["Atlassian"]}
-    r = subprocess.run(["sh", "-c", bc.verify_script(targets)], env=_fake_claude(tmp_path, runs), capture_output=True,
-                       text=True, timeout=60)
+    if min_try is not None:
+        monkeypatch.setattr(bc, "VERIFY_MIN_TRY_S", min_try)
+    targets = targets or {"Atlassian": ["Atlassian"]}
+    r = subprocess.run(["sh", "-c", bc.verify_script(targets)], env=_fake_claude(tmp_path, runs, sleeps),
+                       capture_output=True, text=True, timeout=60)
     n = int((tmp_path / "n").read_text()) if (tmp_path / "n").exists() else 0
     env = (tmp_path / "env").read_text().split("\n")[0] if n else ""
     return bc, bc.read_verify(r.stdout, targets), n, env
@@ -2526,6 +2533,50 @@ def test_setup_box_connectors_verify_needs_auth_only_from_a_real_auth_error(monk
     # An auth word with no connector tool called (the model's own words, or another tool) is no auth error.
     v = bc.read_verify("loaded_0=0\nautherr_0=1\nverify_0=|CONNECTOR_ERROR=unauthorized\n", {"Atlassian": ["Atlassian"]})
     assert v["Atlassian"]["auth_error"] is False
+
+
+def test_setup_box_connectors_verify_auth_error_reads_only_the_tool_result_not_its_ids(monkeypatch, tmp_path):
+    # Stream-json user lines carry session_id, uuid and tool_use_id: random hex that can hold 401 or 403.
+    ids = {"parent_tool_use_id": None, "session_id": "9b401c2e-7f40-4a1d-8403-0c1f2e3d4401",
+           "uuid": "403a1b2c-0d4e-4f5a-9401-6b7c8d9e0f12"}
+    for n, (reply, auth) in enumerate((("rate limited, try later", False), ("upstream 502 a401b", False),
+                                       ("Request failed with status 401", True), ("HTTP 403: Forbidden", True),
+                                       ("Error: 401", True))):
+        d = tmp_path / str(n)
+        d.mkdir()
+        res = {"type": "user", "message": {"role": "user", "content": [
+            {"tool_use_id": "toolu_01403AbC401dEf", "type": "tool_result", "content": reply, "is_error": True}]}, **ids}
+        bc, v, _, _ = _verify_run(monkeypatch, d, [[_init(["mcp__claude_ai_Atlassian__search"]), _CALL, res,
+                                                    {"type": "result", "result": "CONNECTOR_ERROR=call failed"}]])
+        assert v["Atlassian"]["auth_error"] is auth, reply
+        _, problems, fixes = bc.report("here", bc.read_probe(_connector_probe(states={"Atlassian": "connected"})),
+                                       None, {"Atlassian": ["Atlassian"]}, v)
+        assert any("Settings > Connectors" in f for f in fixes) is auth, reply
+
+
+def test_setup_box_connectors_verify_one_family_that_never_loads_cannot_starve_the_next(monkeypatch, tmp_path):
+    # Atlassian's sessions hang past any share (tools never load); Google loads at once. Pass 1 gives each family a
+    # share of the cap, so Google still runs and passes; Atlassian is not verified (cap reached), no problem or step.
+    fams = {"Atlassian": ["Atlassian"], "Google": ["Google Drive"]}
+    hang = [_init(status="needs-auth")]
+    google = [_init(["mcp__claude_ai_Google_Drive__search_files"], name="Google Drive"),
+              {"type": "assistant", "message": {"content": [{"type": "tool_use",
+                                                             "name": "mcp__claude_ai_Google_Drive__search_files"}]}},
+              {"type": "result", "result": "CONNECTOR_OK=2"}]
+    bc, v, n, _ = _verify_run(monkeypatch, tmp_path, [hang, google, hang], cap=4, targets=fams,
+                              sleeps={0: 10, 2: 10}, min_try=1)
+    assert v["Google"]["ok"] and v["Google"]["tries"] == 1
+    assert not v["Atlassian"]["ok"] and v["Atlassian"]["capped"] and v["Atlassian"]["tries"] >= 1
+    p = bc.read_probe(_connector_probe(states={"Atlassian": "connected", "Google Drive": "connected"}))
+    lines, problems, fixes = bc.report("here", p, None, fams, v)
+    assert "here Google verify: pass (mcp__claude_ai_Google_Drive__search_files, 2 items)" in lines
+    assert "here Atlassian verify: not verified, the 4s cap was reached (stopped at its share of the 4s cap)" in lines
+    assert not problems and not fixes
+    # A family the cap left unrun: not verified, never a failure with a rerun step.
+    out = "tries_0=1\nloaded_0=1\nverify_0=mcp__claude_ai_Atlassian__search|CONNECTOR_OK=1\ntries_1=0\nverify_1=|\n"
+    lines, problems, fixes = bc.report("here", p, None, fams, bc.read_verify(out, fams))
+    assert "here Google verify: not verified, the 4s cap was reached (not run: the 4s cap was spent)" in lines
+    assert not problems and not fixes
 
 
 def test_setup_box_agents_check_adds_connector_findings_and_the_plan_runs_the_check(tmp_path, monkeypatch, capsys):

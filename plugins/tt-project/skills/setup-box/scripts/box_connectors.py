@@ -15,9 +15,11 @@
   to them by a PreToolUse hook). Only pass or fail, the tool's name and an item count leave the machine.
   Headless sessions load claude.ai connectors asynchronously, so neither `claude mcp list`'s Connected nor an early
   needs-auth proves anything: the call waits for MCP connections (MCP_CONNECTION_NONBLOCKING=false, MCP_TIMEOUT)
-  and, when no tool of the family loaded, tries once more, all within VERIFY_CAP_S per machine. A connector whose
-  tools still did not load is "connected, not loaded in headless runs" (a note, no Settings step); only an auth
-  error from a connector call after the wait is "needs authentication" with the reconnect step.
+  and, when no tool of the family loaded, tries once more after every family's first try, all within VERIFY_CAP_S
+  per machine, each try held to a fair share of the time left; a family the cap left unrun or stopped is "not
+  verified" (no step). A connector whose tools still did not load is "connected, not loaded in headless runs" (a
+  note, no Settings step); only an auth error from a connector call after the wait is "needs authentication" with
+  the reconnect step.
 - It never logs in or out, switches accounts or adds a connector: each finding names the one step that fixes it,
   and an account switch only on the user's yes.
 Exit 0 all set, 1 a finding, 255 ssh to a box failed.
@@ -63,8 +65,11 @@ _T = 'T=; command -v timeout >/dev/null 2>&1 && T="timeout 150"; '
 VERIFY_CAP_S = 120         # every --verify call on one machine, the retry included
 VERIFY_MCP_TIMEOUT_MS = 60000
 VERIFY_RETRY_PAUSE_S = 15  # before the one retry of a family whose tools did not load
+VERIFY_MIN_TRY_S = 5       # a try's share of the cap below this: not run
 # A connector call's error that means its authorization, not a missing or slow tool.
-AUTH_ERROR = "(401|403|unauthori[sz]ed|unauthenticated|authenticat|re-?authori[sz]e|invalid[_ ]token|expired)"
+# Status codes anchored: no digit or letter on either side (hex ids hold 401 and 403).
+AUTH_ERROR = ("(^|[^0-9A-Za-z])(401|403)([^0-9A-Za-z]|$)|unauthori[sz]ed|unauthenticated|authenticat|"
+              "re-?authori[sz]e|invalid[_ ]token|expired")
 NOT_LOADED = "connected, not loaded in headless runs"
 HEADLESS_NOTE = ("note: claude.ai connectors can show Connected in `claude mcp list` yet load no tools in a headless "
                  "`claude -p` run, as tt-project workers run; workers then use other configured MCP tools. Nothing to "
@@ -166,11 +171,13 @@ def verify_prompt(names: Sequence[str]) -> str:
 
 
 def verify_script(targets: Dict[str, List[str]]) -> str:
-    """Shell: for each family, one `claude -p` on its connected connectors that waits for MCP connections, and once
-    more after VERIFY_RETRY_PAUSE_S when none of their tools loaded, all within VERIFY_CAP_S. It prints
-    `verify_<n>=<tool called>|<answer>`, `headless_<n>=` each connector's state in the init event, `loaded_<n>=` each
-    connector's tool count there (empty: no init event), `autherr_<n>=1` when a connector call answered an auth error
-    and `tries_<n>=`. The run's output stays in a shell variable on the machine: only these are printed."""
+    """Shell: for each family, one `claude -p` on its connected connectors that waits for MCP connections; then, after
+    VERIFY_RETRY_PAUSE_S, once more for each family none of whose tools loaded, all within VERIFY_CAP_S. Each try gets
+    a fair share of the time left (split over the families still to try), so one family that never loads cannot
+    starve the rest. It prints `verify_<n>=<tool called>|<answer>`, `headless_<n>=` each connector's state in the
+    init event, `loaded_<n>=` each connector's tool count there (empty: no init event), `autherr_<n>=1` when a
+    connector call answered an auth error, `tries_<n>=` and `capped_<n>=1` when its last try was stopped at its
+    share. The run's output stays in a shell variable on the machine: only these are printed."""
     s = (box_agents._find("claude") + 'cd "$HOME" || exit 1; TO=; command -v timeout >/dev/null 2>&1 && TO=timeout; '
          f'end=$(( $(date +%s) + {VERIFY_CAP_S} )); ')
     for n, names in enumerate(targets.values()):
@@ -178,31 +185,42 @@ def verify_script(targets: Dict[str, List[str]]) -> str:
                 "--max-turns", VERIFY_TURNS, "--output-format", "stream-json", "--verbose",
                 "--allowedTools", *[tool_prefix(x)[:-2] for x in names], "ToolSearch", "--settings", hook_settings()]
         count = ''.join(f'$(printf "%s" "$i" | grep -o \'"{tool_prefix(x)}\' | wc -l | tr -d " "),' for x in names)
-        s += ('t=0; c=; a=; h=; l=; e=; while [ "$t" -lt 2 ]; do left=$(( end - $(date +%s) )); '
-              '[ "$left" -gt 5 ] || break; t=$((t + 1)); '
-              f'o=$(MCP_CONNECTION_NONBLOCKING=false MCP_TIMEOUT={VERIFY_MCP_TIMEOUT_MS} $TO ${{TO:+$left}} '
-              f'"$b" {shlex.join(argv)} </dev/null 2>/dev/null); '
-              'i=$(printf "%s\\n" "$o" | grep -m 1 \'"subtype":"init"\'); '
-              f'c=$(printf "%s" "$o" | grep -oiE \'"name":"{READ_TOOL}"\' | head -n 1 | cut -d\'"\' -f4); '
-              'a=$(printf "%s" "$o" | grep -oE "CONNECTOR_(OK=[0-9]+|ERROR=[A-Za-z0-9 _.,:()-]{0,80})" | tail -n 1); '
-              'h=$(printf "%s" "$i" | grep -oE \'"name":"claude\\.ai [^"]*","status":"[^"]*"\' '
-              '| sed \'s/"name":"claude\\.ai \\([^"]*\\)","status":"\\([^"]*\\)"/\\1:\\2/\' | paste -sd ";" -); '
-              f'l=; [ -n "$i" ] && l="{count[:-1]}"; '
-              'e=; printf "%s\\n" "$o" | grep \'"type":"user"\' | grep \'"is_error":true\' '
-              f'| grep -Eiq \'{AUTH_ERROR}\' && e=1; '
-              '[ -n "$c" ] && break; case ",$l," in *,[1-9]*) break;; esac; '
-              f'[ "$t" -lt 2 ] && [ $(( end - $(date +%s) )) -gt {VERIFY_RETRY_PAUSE_S * 2} ] '
-              f'&& sleep {VERIFY_RETRY_PAUSE_S}; done; '
-              f'echo "headless_{n}=$h"; echo "loaded_{n}=$l"; echo "autherr_{n}=$e"; echo "tries_{n}=$t"; '
-              f'echo "verify_{n}=$c|$a"; ')
+        s += f't_{n}=0; d_{n}=; c_{n}=; a_{n}=; h_{n}=; l_{n}=; e_{n}=; x_{n}=; '
+        # v_<n>: one try with $k families still to try, held to its share of the time left (none below the minimum).
+        s += (
+            f'v_{n}() {{ q=$(( (end - $(date +%s)) / k )); if [ "$q" -ge {VERIFY_MIN_TRY_S} ]; then t_{n}=$((t_{n} + 1)); '
+            f'o=$(MCP_CONNECTION_NONBLOCKING=false MCP_TIMEOUT={VERIFY_MCP_TIMEOUT_MS} $TO ${{TO:+$q}} '
+            f'"$b" {shlex.join(argv)} </dev/null 2>/dev/null); rc=$?; x_{n}=; [ -n "$TO" ] && [ "$rc" -eq 124 ] '
+            f'&& x_{n}=1; '
+            'i=$(printf "%s\\n" "$o" | grep -m 1 \'"subtype":"init"\'); '
+            f'c_{n}=$(printf "%s" "$o" | grep -oiE \'"name":"{READ_TOOL}"\' | head -n 1 | cut -d\'"\' -f4); '
+            f'a_{n}=$(printf "%s" "$o" | grep -oE "CONNECTOR_(OK=[0-9]+|ERROR=[A-Za-z0-9 _.,:()-]{{0,80}})" | tail -n 1); '
+            f'[ -n "$i" ] && {{ h_{n}=$(printf "%s" "$i" | grep -oE \'"name":"claude\\.ai [^"]*","status":"[^"]*"\' '
+            '| sed \'s/"name":"claude\\.ai \\([^"]*\\)","status":"\\([^"]*\\)"/\\1:\\2/\' | paste -sd ";" -); '
+            f'l_{n}="{count[:-1]}"; }}; '
+            # Only an errored tool result's own text: ids (session_id, uuid, tool_use_id, ...) can hold 401 or 403.
+            f'e_{n}=; printf "%s\\n" "$o" | grep \'"type":"user"\' | grep \'"is_error":true\' '
+            f'| sed -E \'s/"[A-Za-z_]*(id|Id|ID)":"[^"]*"//g\' | grep -Eiq \'{AUTH_ERROR}\' && e_{n}=1; '
+            f'[ -n "$c_{n}" ] && d_{n}=1; case ",$l_{n}," in *,[1-9]*) d_{n}=1;; esac; fi; }}; ')
+    k = len(targets)
+    s += ''.join(f'k={k - n}; v_{n}; ' for n in range(k))
+    # The retries: each family none of whose tools loaded, sharing what is left.
+    s += 'r=0; ' + ''.join(f'[ "$d_{n}" = 1 ] || r=$((r + 1)); ' for n in range(k))
+    s += (f'[ "$r" -gt 0 ] && [ $(( end - $(date +%s) )) -gt {VERIFY_RETRY_PAUSE_S * 2} ] '
+          f'&& sleep {VERIFY_RETRY_PAUSE_S}; ')
+    s += ''.join(f'[ "$d_{n}" = 1 ] || {{ k=$r; v_{n}; r=$((r - 1)); }}; ' for n in range(k))
+    for n in range(k):
+        s += (f'echo "headless_{n}=$h_{n}"; echo "loaded_{n}=$l_{n}"; echo "autherr_{n}=$e_{n}"; '
+              f'echo "tries_{n}=$t_{n}"; echo "capped_{n}=$x_{n}"; echo "verify_{n}=$c_{n}|$a_{n}"; ')
     return s + "true"
 
 
 def read_verify(out: str, targets: Dict[str, List[str]]) -> Dict[str, dict]:
-    """{family: {"ok", "tool", "items", "error", "headless", "loaded", "auth_error", "tries"}}: pass only when one of
-    the family's connector tools was called and answered OK; `headless` maps each of its connectors to the state the
-    headless session's init event showed, `loaded` to its tool count there (absent: no init event)."""
-    keys = ("verify_", "headless_", "loaded_", "autherr_", "tries_")
+    """{family: {"ok", "tool", "items", "error", "headless", "loaded", "auth_error", "tries", "capped"}}: pass only when
+    one of the family's connector tools was called and answered OK; `headless` maps each of its connectors to the state
+    the headless session's init event showed, `loaded` to its tool count there (absent: no init event); `capped`: the
+    per-machine cap left it unrun or stopped its last try."""
+    keys = ("verify_", "headless_", "loaded_", "autherr_", "tries_", "capped_")
     kv = dict(ln.split("=", 1) for ln in out.splitlines() if ln.startswith(keys) and "=" in ln)
     res: Dict[str, dict] = {}
     for n, (fam, names) in enumerate(targets.items()):
@@ -215,12 +233,14 @@ def read_verify(out: str, targets: Dict[str, List[str]]) -> Dict[str, dict]:
         counts = kv.get(f"loaded_{n}", "").split(",")
         loaded = {x: int(c) for x, c in zip(names, counts) if c.strip().isdigit()} if len(counts) == len(names) else {}
         tries = kv.get(f"tries_{n}", "")
+        stopped = kv.get(f"capped_{n}", "").strip() == "1"
         res[fam] = {"ok": bool(mine and ok), "tool": mine, "items": int(ok.group(1)) if ok else None,
                     "error": err or ("no connector tool was called" if ok and not mine else "" if ok
-                                     else f"not run: the {VERIFY_CAP_S}s cap was spent" if tries == "0" else "no answer"),
+                                     else f"not run: the {VERIFY_CAP_S}s cap was spent" if tries == "0"
+                                     else f"stopped at its share of the {VERIFY_CAP_S}s cap" if stopped else "no answer"),
                     "headless": {x: seen[x] for x in names if x in seen}, "loaded": loaded,
                     "auth_error": bool(mine) and kv.get(f"autherr_{n}", "").strip() == "1",
-                    "tries": int(tries) if tries.isdigit() else None}
+                    "tries": int(tries) if tries.isdigit() else None, "capped": tries == "0" or stopped}
     return res
 
 
@@ -338,6 +358,9 @@ def report(machine: str, p: dict, ref: Optional[dict], fams: Dict[str, List[str]
             lines.append(f"{machine} {fam} verify: not verified, no read-only call made ({v['error']}); "
                          + ", ".join(x for x, k in loaded.items() if k) + " loaded")
             note = note or bool(idle)
+        elif v.get("capped") and not v["tool"]:
+            # The time ran out, not the connector: nothing to fix, and a rerun meets the same cap.
+            lines.append(f"{machine} {fam} verify: not verified, the {VERIFY_CAP_S}s cap was reached ({v['error']})")
         else:
             lines.append(f"{machine} {fam} verify: fail ({v['error']})")
             find(f"{fam} verify failed ({v['error']})", "rerun with --verify; if it fails again, make the same "

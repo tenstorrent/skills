@@ -50,11 +50,13 @@ box.py connectors check ... --family Notes=Notion,Confluence   # add a family or
 - Headless sessions (`claude -p`, as tt-project workers run) load claude.ai connectors asynchronously:
   neither Connected in `claude mcp list` nor needs-auth in an early session event proves anything. Each
   call waits for MCP connections (`MCP_CONNECTION_NONBLOCKING=false`, a long `MCP_TIMEOUT`) and, when
-  none of the family's tools loaded, tries once more; all calls on one machine stop within 2 min.
+  none of the family's tools loaded, tries once more after every family's first try; all calls on one
+  machine stop within 2 min, each try held to a fair share of the time left.
 - Then per family: pass; needs authentication with the reconnect step only when a connector call
   answered an auth error; "connected, not loaded in headless runs" with a note and no Settings step
   when its tools still did not load (workers then use other configured MCP tools); not verified when
-  tools loaded but none could make a read-only call; any other failure says to rerun.
+  tools loaded but none could make a read-only call, or when the 2 min cap left it unrun or stopped it
+  (no step); any other failure says to rerun.
 - Without `--verify`, connector states are `claude mcp list`'s and labelled not verified for headless
   runs.
 
