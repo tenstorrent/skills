@@ -41959,7 +41959,7 @@ def _ob_quiet_until_the_clock(p, monkeypatch, oid, check, now):
     assert [f for f, _ in _ob_queued(p)] == [f"obligation:{oid}:1"]
 
 
-@pytest.mark.parametrize("wait", ["waiting", "resource_busy", "start_when", "review_checks"])
+@pytest.mark.parametrize("wait", ["waiting", "resource_busy", "start_when_no_reason", "review_checks"])
 def test_obligation_queued_owner_waiting_raises_no_event(env, monkeypatch, wait):
     from ttp import obligations as ob
     p, d, now, tid, check = _ob_setup(env, monkeypatch)
@@ -41970,14 +41970,149 @@ def test_obligation_queued_owner_waiting_raises_no_event(env, monkeypatch, wait)
     elif wait == "resource_busy":     # the daemon's 30 s backoff after losing the race for a resource
         p.db.update_task(tid, not_before=now + 30,
                          blocked_reason="its resource stayed busy before the run could start; retries")
-    elif wait == "start_when":
-        p.db.update_task(tid, labels=json.dumps(["start_when:false", "start_why:waiting for CI"]))
+    elif wait == "start_when_no_reason":     # a reasoned deferral is asleep by design (test_obligation_owner_asleep_*)
+        p.db.update_task(tid, labels=json.dumps(["start_when:false"]))
     else:     # the owner is in review and its reviewer waits on its own detached checks
         p.db.update_task(tid, kind="code", status="review", branch="feature/owed")
         rid = p.db.add_task(f"Review #{tid}: build the deliverable", "review feature/owed", kind="review",
                             tier="light", origin="daemon", depends_on=[tid], labels=[f"auto_review:{tid}"])
         p.db.update_task(rid, not_before=now + 900, blocked_reason="waiting for ttp checks --detach; its probe says not yet")
     _ob_quiet_until_the_clock(p, monkeypatch, oid, check, now)
+
+
+QUOTA_RESET_H = 6   # the owner sleeps until an external quota reset this far ahead
+
+
+def _ob_sleep(p, tid, now, kind, probe=None):
+    """Put owner `tid` to sleep by design on a model-free wake (an external quota reset QUOTA_RESET_H ahead)."""
+    from ttp.db import dump_result
+    wake = now + QUOTA_RESET_H * 3600
+    if kind == "retry_when":
+        probe = probe or f'test "$(date +%s)" -ge {int(wake)}'
+        p.db.update_task(tid, status="waiting", not_before=now + 900,
+                         blocked_reason="waiting for an external quota reset; its probe says not yet",
+                         result=dump_result({"status": "waiting", "waiting_for": "an external quota reset",
+                                             "retry_when": probe, "waiting_since": now + 600}))
+    elif kind == "start_after":
+        p.db.update_task(tid, status="queued", not_before=wake,
+                         labels=json.dumps([f"start_after:{wake}", "start_why:an external quota reset"]))
+    else:
+        p.db.update_task(tid, status="queued", labels=json.dumps(
+            [f"start_when:{probe or 'test -e /nonexistent/quota-reset'}", "start_why:an external quota reset",
+             f"deferred_since:{now + 600}"]))
+    return wake
+
+
+@pytest.mark.parametrize("kind", ["retry_when", "start_after", "start_when"])
+def test_obligation_owner_asleep_on_a_model_free_wake_is_not_stalled(env, monkeypatch, kind):
+    """An owner asleep by design until an external quota reset cannot record progress: the 2 h stall line
+    and obligation_overdue stay quiet for the whole wait, every check, and lines() says what it sleeps on."""
+    from ttp import obligations as ob, startgate
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the benchmark table", [tid], now=now)
+    _ob_sleep(p, tid, now, kind)
+    if kind == "start_when":   # the daemon's last answer: not yet
+        startgate.record(p.db, tid, "test -e /nonexistent/quota-reset", 1, "not yet", now + 700)
+    for h in (2.1, 3, 4.1, 5.9):
+        assert check(now + h * 3600) == [], f"no stall while it sleeps on its {kind} ({h} h)"
+    line = ob.lines(p.db, now + 5.9 * 3600)[0]
+    assert f"#{tid} asleep on {kind}" in line and "OVERDUE" not in line, line
+    assert ob.items(p.db)[0]["owners"][str(tid)]["sleep"]["what"].startswith(kind), oid
+
+
+@pytest.mark.parametrize("kind", ["retry_when", "start_after", "start_when"])
+def test_obligation_owner_stalls_again_two_hours_after_its_wake(env, monkeypatch, kind):
+    from ttp import obligations as ob, startgate
+    from ttp.db import load_result, dump_result
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the benchmark table", [tid], now=now)
+    wake = _ob_sleep(p, tid, now, kind)
+    assert check(now + 3 * 3600) == []
+    if kind == "retry_when":     # the probe passed: the daemon woke it and it went back to the queue
+        p.db.update_task(tid, status="queued",
+                         result=dump_result({**load_result(p.db.task(tid)["result"]), "woke": "probe passed"}))
+    elif kind == "start_when":   # its start_when passed: it starts
+        startgate.record(p.db, tid, "test -e /nonexistent/quota-reset", 0, "passed", wake)
+    seen = wake if kind == "start_after" else wake + 300   # a start_after's wake is known; else the check that saw it
+    assert check(wake + 300) == [], "the clock restarts from the wake"
+    p.db.update_task(tid, status="running")
+    assert check(seen + ob.CLOCK_S - 60) == []
+    evs = check(seen + ob.CLOCK_S + 60)
+    assert [e["fingerprint"] for e in evs] == [f"obligation:{oid}:1"] and f"#{tid} (running)" in evs[0]["text"], \
+        "two hours after the wake with no progress raise again"
+
+
+def test_obligation_start_after_wake_counts_from_the_wake_not_the_next_check(env, monkeypatch):
+    """A start_after's wake is known: a check that first sees the owner awake hours later raises at once."""
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the benchmark table", [tid], now=now)
+    wake = _ob_sleep(p, tid, now, "start_after")
+    assert check(now + 3 * 3600) == []
+    evs = check(wake + ob.CLOCK_S + 60)
+    assert [e["fingerprint"] for e in evs] == [f"obligation:{oid}:1"]
+
+
+@pytest.mark.parametrize("kind", ["retry_when", "start_after", "start_when"])
+def test_obligation_milestone_raises_while_its_owner_sleeps(env, monkeypatch, kind):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = _ob_milestone(p, tid, now)
+    _ob_sleep(p, tid, now, kind)
+    evs = check(now + 1900)
+    assert [e["fingerprint"] for e in evs] == [f"obligation:{oid}:milestone:report:1"], \
+        "an absolute milestone stays the overdue source whatever the owner's sleep"
+
+
+def test_obligation_with_no_owner_raises_while_other_tasks_sleep(env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    _ob_sleep(p, tid, now, "start_after")
+    ob.add(p, "a deliverable nobody owns", now=now)
+    evs = check(now + ob.CLOCK_S + 60)
+    assert len(evs) == 1 and "no owner task is attached" in evs[0]["text"]
+
+
+@pytest.mark.parametrize("case", ["running", "queued", "woke", "no_reason", "own_job_probe", "live_job",
+                                  "broken_start_when", "dead_ref", "past_defer_max", "start_after_passed"])
+def test_obligation_owner_not_asleep_by_design_still_stalls(env, monkeypatch, case):
+    """Only a reasoned model-free sleep covers an owner: running or plain queued owners, a woken wait, a wait
+    with no reason, a probe on its own detach job (the job rule governs), a broken or dead probe, a wait past
+    coordinator.defer_max_days and a start_after already past still stall after 2 h."""
+    from ttp import obligations as ob, startgate
+    from ttp.db import load_result, dump_result
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the benchmark table", [tid], now=now)
+    if case == "running":
+        p.db.update_task(tid, status="running")
+    elif case == "woke":
+        _ob_sleep(p, tid, now, "retry_when")
+        p.db.update_task(tid, result=dump_result({**load_result(p.db.task(tid)["result"]), "woke": "probe broken: exit 2"}))
+    elif case == "no_reason":
+        p.db.update_task(tid, status="waiting", result=dump_result(
+            {"status": "waiting", "retry_when": "false", "waiting_since": now + 600}))
+    elif case == "own_job_probe":
+        _ob_sleep(p, tid, now, "retry_when", probe="ttp detach --check /tmp/run/bench")
+    elif case == "live_job":
+        _ob_sleep(p, tid, now, "retry_when")
+        monkeypatch.setattr(ob, "_live_jobs", lambda _p, _st: {str(tid): [{"name": "bench", "rc": "/tmp/bench.rc"}]})
+    elif case == "broken_start_when":
+        _ob_sleep(p, tid, now, "start_when")
+        startgate.record(p.db, tid, "test -e /nonexistent/quota-reset", 2, "syntax error", now + 700)
+    elif case == "dead_ref":
+        gone = p.db.add_task("the build it waits on", "s", kind="work", tier="light", origin="coordinator")
+        p.db.update_task(gone, status="cancelled")
+        _ob_sleep(p, tid, now, "retry_when", probe=f"landed:#{gone}")
+    elif case == "past_defer_max":
+        cfg = p.config()
+        cfg.setdefault("coordinator", {})["defer_max_days"] = 0.05   # 1.2 h
+        monkeypatch.setattr(type(p), "config", lambda self: cfg)
+        d.cfg = cfg
+        _ob_sleep(p, tid, now, "start_when")
+    elif case == "start_after_passed":
+        p.db.update_task(tid, labels=json.dumps([f"start_after:{now + 60}", "start_why:an external quota reset"]))
+    evs = check(now + ob.CLOCK_S + 60)
+    assert [e["fingerprint"] for e in evs] == [f"obligation:{oid}:1"], case
 
 
 def test_obligation_owner_in_review_with_rereview_of_done_fix_raises_no_event(env, monkeypatch):

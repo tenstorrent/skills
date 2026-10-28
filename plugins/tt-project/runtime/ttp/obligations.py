@@ -21,7 +21,13 @@ while another owner is still live, and once every owner ended without a receipt 
 episode, "no live owner is left", when the newest owner's clock runs out. An owner blocked on an open user
 ask (a hold anchored on it, `waits:ask:<id>`, or an open ask naming it as #<id> while it is blocked or
 waiting) is covered by that ask: never late while the ask is open, and its clock restarts when the ask is
-resolved (`ask_end`). The harness records the evidence as given: checking it stays with the owner.
+resolved (`ask_end`). An owner asleep by design on a model-free wake (_asleep: a waiting hand-off's
+retry_when, a deferral's start_when or a start_after still ahead, with a recorded reason) is covered the
+same way while that wait lasts: its clock restarts from the wake (`sleep_end`: the start_after time, else
+the check that saw it wake). Not covered: a probe on its own `ttp detach` job or an owner with a live job
+(the job rule above governs), a woken wait, a start_when whose last answer is broken or passed, a probe
+naming a missing, failed or cancelled task, and a wait older than coordinator.defer_max_days. Milestones
+raise whatever the owners do. The harness records the evidence as given: checking it stays with the owner.
 
 Inside a run the CLI cannot write the project's database, so `progress` and `receipt` append to the
 run's RUN_FILE, and the daemon files them (only for an obligation that run's task owns). Outside a run
@@ -38,7 +44,7 @@ its obligation action; an owner records a checked milestone with `ttp obligation
 time raises one durable high episode, even with fresh owner progress or a healthy heartbeat. A milestone
 episode that ends (its receipt, the obligation's receipt, a drop) retires its still-queued event, so the
 coordinator is not woken for it. Status and the web app show the next deadline in the project's home time zone.
-Known gap: beyond ended owners and open asks, nothing checks whether an owner can advance the obligation,
+Known gap: beyond ended owners, open asks and model-free sleeps, nothing checks whether an owner can advance the obligation,
 so one whose owners all wait or stall is caught only by the 2 h progress rule (or a milestone falling due).
 A wider coverage check was dropped: it took ordinary waits, backoffs and review stacks for stuck owners
 and woke the coordinator.
@@ -92,6 +98,7 @@ CHECK_EVERY_S = 300
 RUN_FILES_DAYS = 7            # run records are looked for in runs started this recently (or still running)
 RUN_IDS_PER_QUERY = 500       # kept run offsets checked per query (SQLite caps the variables in one)
 CLOSED = ("done", "failed", "cancelled")
+DEFER_MAX_DAYS = 14.0         # coordinator.defer_max_days: a sleep this old no longer covers its owner
 TEXT_MAX = 500
 EVIDENCE_MAX = 300
 EVIDENCE_KEPT = 10
@@ -455,20 +462,67 @@ def file_runs(p, now: float | None = None) -> list[str]:
 def _last(own: dict) -> float:
     """When an owner's clock last started: its attach time, its latest progress, or the end of the user
     ask it was blocked on (ask_end), whichever is latest."""
-    return max(float(own["since"]), float(own.get("progress") or 0), float(own.get("ask_end") or 0))
+    return max(float(own["since"]), float(own.get("progress") or 0), float(own.get("ask_end") or 0),
+               float(own.get("sleep_end") or 0))
 
 
-def _owner_cover(db, obs) -> dict[str, tuple[str, str]]:
+def _max_sleep_s(cfg) -> float:
+    try:
+        return float(((cfg or {}).get("coordinator") or {}).get("defer_max_days") or DEFER_MAX_DAYS) * 86400
+    except (AttributeError, TypeError, ValueError):
+        return DEFER_MAX_DAYS * 86400
+
+
+def _asleep(db, t, now: float, max_s: float, gates: dict) -> tuple[str, float | None] | None:
+    """(what it sleeps on, its known wake or None) for an owner asleep by design on a model-free wake with a
+    recorded reason, else None (module doc)."""
+    from . import detach, ends
+    from .db import deferral, load_result
+    from .sweepskip import _dead_refs
+    if t["status"] == "waiting":
+        prev = load_result(t["result"])
+        probe = prev.get("retry_when")
+        if prev.get("woke") or not isinstance(probe, str) or not probe.strip() or detach.CHECK_RE.search(probe) \
+                or not (prev.get("waiting_for") or t["blocked_reason"]):
+            return None
+        try:
+            since = float(prev["waiting_since"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if now - since >= max_s or _dead_refs(db, t, probe):
+            return None
+        return f"retry_when `{probe.strip()[:120]}`", None
+    if t["status"] != "queued":
+        return None
+    d = deferral(t)
+    if not (d.get("why") or t["blocked_reason"]):
+        return None
+    if d.get("after") is not None and d["after"] > now:
+        return "start_after", d["after"]
+    when = d.get("when")
+    if not when or detach.CHECK_RE.search(when) or now - float(d.get("since") or t["created"]) >= max_s \
+            or _dead_refs(db, t, when):
+        return None
+    got = gates.get(str(t["id"])) or {}
+    if got.get("when") == when and got.get("rc") not in ends.NOT_YET_RCS:
+        return None   # broken, or it passed and the task starts
+    return f"start_when `{when.strip()[:120]}`", None
+
+
+def _owner_cover(db, obs, now: float | None = None, cfg=None, jobs=()) -> dict[str, tuple]:
     """Per owner task id of these obligations that cannot act now: ("finished", its status, or "gone" for
-    a task that no longer exists), or ("ask", the id of the open user ask it is blocked on: a hold anchored
-    on it, or an open ask naming it as #<id> while it is blocked or waiting). Database reads only."""
-    from . import waits
+    a task that no longer exists), ("ask", the id of the open user ask it is blocked on: a hold anchored
+    on it, or an open ask naming it as #<id> while it is blocked or waiting), or ("asleep", what it sleeps
+    on, its known wake or None) (_asleep; never an owner in `jobs`, those with a live job). Database reads
+    only."""
+    from . import startgate, waits
     ids = sorted({int(t) for o in obs for t in o["owners"]})
     if not ids:
         return {}
+    now = time.time() if now is None else now
     rows = {str(t["id"]): t for t in
-            db.q(f"SELECT id, status, labels FROM tasks WHERE id IN ({','.join('?' * len(ids))})", ids)}
-    asks, out = None, {}
+            db.q(f"SELECT * FROM tasks WHERE id IN ({','.join('?' * len(ids))})", ids)}
+    asks, gates, out = None, None, {}
     for tid in map(str, ids):
         t = rows.get(tid)
         if t is None or t["status"] in CLOSED:
@@ -479,10 +533,33 @@ def _owner_cover(db, obs) -> dict[str, tuple[str, str]]:
             linked = [a["id"] for a in asks if a["id"] == held] + [a["id"] for a in waits.asks_for(int(tid), asks)]
             if linked:
                 out[tid] = ("ask", str(linked[0]))
+        if tid not in out and tid not in jobs and t["status"] in ("waiting", "queued"):
+            gates = (db.kv(startgate.KEY, {}) or {}) if gates is None else gates
+            try:
+                sleep = _asleep(db, t, now, _max_sleep_s(cfg), gates)
+            except Exception:   # an unreadable record covers nothing: the owner keeps its clock
+                sleep = None
+            if sleep:
+                out[tid] = ("asleep", *sleep)
     return out
 
 
-def _ask_clocks(o: dict, cover: dict[str, tuple[str, str]], now: float) -> bool:
+def _sleep_clocks(o: dict, cover: dict[str, tuple], now: float) -> bool:
+    """Record on each owner the wake it sleeps on (`sleep`: {what, until}); once it no longer sleeps, its
+    clock restarts from the wake (`sleep_end`: its known wake, else now). Returns whether a record changed."""
+    changed = False
+    for tid, own in o["owners"].items():
+        c = cover.get(tid)
+        rec = {"what": c[1], "until": c[2]} if c and c[0] == "asleep" else None
+        if rec is not None and own.get("sleep") != rec:
+            own["sleep"], changed = rec, True
+        elif rec is None and own.get("sleep") is not None:
+            until = own.pop("sleep").get("until")
+            own["sleep_end"], changed = min(now, float(until)) if until is not None else now, True
+    return changed
+
+
+def _ask_clocks(o: dict, cover: dict[str, tuple], now: float) -> bool:
     """Record on each owner the open ask it is blocked on (`ask`); once that ask is no longer open, its clock
     restarts then (`ask_end`). Returns whether a record changed."""
     changed = False
@@ -497,7 +574,7 @@ def _ask_clocks(o: dict, cover: dict[str, tuple[str, str]], now: float) -> bool:
     return changed
 
 
-def overdue(o: dict, now: float, cover: dict[str, tuple[str, str]] | None = None) -> list[tuple[str, float]]:
+def overdue(o: dict, now: float, cover: dict[str, tuple] | None = None) -> list[tuple[str, float]]:
     """(owner task id, or "" for no owner or no live owner left; seconds since its last durable progress)
     for each clock run out. `cover` (_owner_cover) leaves out owners that finished or wait on an open ask
     (and one whose recorded ask just ended, until check restarts its clock); once every owner finished, the
@@ -514,7 +591,7 @@ def overdue(o: dict, now: float, cover: dict[str, tuple[str, str]] | None = None
         return [("", age)] if age >= CLOCK_S else []
     out = []
     for tid, own in sorted(o["owners"].items(), key=lambda kv: int(kv[0])):
-        if tid in cover or own.get("ask") is not None:
+        if tid in cover or own.get("ask") is not None or own.get("sleep") is not None:
             continue
         age = now - _last(own)
         if age >= CLOCK_S:
@@ -787,11 +864,16 @@ def _check_milestones(p, o: dict, now: float, raised: list[str]) -> bool:
     return changed
 
 
-def check(p, now: float | None = None) -> list[str]:
+def check(p, now: float | None = None, cfg: dict | None = None) -> list[str]:
     """Raise one keyed observation per stall (file_runs first). An episode covers the owners late when it
     was raised: none again while they stay late, a new one when an owner it does not cover runs late, and
     it ends once no owner is late. Returns the fingerprints raised."""
     now = time.time() if now is None else now
+    if cfg is None:
+        try:
+            cfg = p.config()
+        except Exception:   # an unreadable config keeps the default defer_max_days
+            cfg = {}
     db = p.db
     raised: list[str] = []
     st0 = _load(db)
@@ -799,7 +881,8 @@ def check(p, now: float | None = None) -> list[str]:
     jobs = _job_results(p, st0, now, live)
     with db.tx():
         st = _load(db)
-        cover = _owner_cover(db, [o for o in st["items"].values() if _open(o) and not o.get("promise")])
+        cover = _owner_cover(db, [o for o in st["items"].values() if _open(o) and not o.get("promise")],
+                             now, cfg, set(live))
         changed = False
         for o in st["items"].values():
             if (ev := _delivered(db, o)) is not None:   # a reply delivered it and its last owner finished
@@ -812,6 +895,7 @@ def check(p, now: float | None = None) -> list[str]:
             changed = job_changed or changed
             if _open(o) and not o.get("promise"):
                 changed = _ask_clocks(o, cover, now) or changed
+                changed = _sleep_clocks(o, cover, now) or changed
             late = [x for x in overdue(o, now, cover) if x[0] not in kept]   # a live job of its own still producing
             late_ids = [t for t, _ in late]
             covered = [t for t in o.get("covered") or [] if t in late_ids]   # an owner back on time leaves it
@@ -848,7 +932,8 @@ def lines(db, now: float | None = None, where=None, open_only: bool = False) -> 
     now = time.time() if now is None else now
     out = []
     obs = items(db)
-    cover = _owner_cover(db, [o for o in obs if _open(o) and not o.get("promise")])
+    cover = _owner_cover(db, [o for o in obs if _open(o) and not o.get("promise")], now,
+                         where if isinstance(where, dict) else None)
     for o in obs:
         if open_only and (o["receipt"] or o.get("dropped")):
             continue
@@ -877,9 +962,11 @@ def lines(db, now: float | None = None, where=None, open_only: bool = False) -> 
 
 def _owner_state(tid: str, own: dict, cover: tuple[str, str] | None, late: set, now: float) -> str:
     """One owner in lines(): 'done, no receipt' once it ended, 'waiting on ask <id>' while an open ask
-    covers it, else its clock (and OVERDUE when late)."""
+    covers it, 'asleep on <what>' while it sleeps on a model-free wake, else its clock (and OVERDUE when late)."""
     if cover and cover[0] == "finished":
         return f"#{tid} {cover[1]}, no receipt"
+    if cover and cover[0] == "asleep":
+        return f"#{tid} asleep on {cover[1]}"
     if cover:
         return f"#{tid} waiting on ask {cover[1]}"
     return (f"#{tid} {(now - _last(own)) / 3600:.1f} h"

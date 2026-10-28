@@ -5760,7 +5760,7 @@ class Daemon:
         try:
             for line in obligations.file_runs(self.p, now):
                 log(self.p, f"obligation record refused: {line}")
-            for fp in obligations.check(self.p, now):
+            for fp in obligations.check(self.p, now, self.cfg):
                 log(self.p, f"obligation overdue: raised {fp}")
         except Exception:
             log(self.p, "obligations: check failed\n" + traceback.format_exc())
