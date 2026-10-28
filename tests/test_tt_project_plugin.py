@@ -644,6 +644,22 @@ def test_shipped_prompts_and_templates_hold_no_one_users_cluster_policy():
     assert "add none of your own" in flat("skills", "tt-project", "create.md")
 
 
+def test_prompts_skills_and_docs_say_how_to_reply_to_another_projects_note():
+    """A note from another project is answered by `ttp note --reply <fp>` over its own route, also to a
+    project `ttp list` does not show: the coordinator prompt, the skills and the design doc say so (the
+    note event itself carries the command, and a worker's `--to` the sender gets the hint in its refusal)."""
+    def flat(*parts):
+        return " ".join((PLUGIN / pathlib.Path(*parts)).read_text(encoding="utf-8").split())
+    coord = flat("template", "prompts", "coordinator.md")
+    assert "go by `ttp note --reply <fp>`, even to a project `ttp list` lacks" in coord
+    operate = flat("skills", "tt-project", "operate.md")
+    assert '| `ttp note --reply <fp> "<text>"` |' in operate and "`ttp note --to <project>@<machine>`" in operate
+    assert "exits non-zero saying it was not sent" in operate
+    harness = flat("skills", "tt-project-harness", "SKILL.md")
+    assert "`ttp note --reply <fp>`" in harness and "takes the replies held for it on its next call" in harness
+    assert "`ttp note --reply <fp>` sends the answer back that way" in flat("docs", "design.md")
+
+
 def test_prompts_and_charter_template_say_self_heal_then_report():
     def flat(*parts):
         return " ".join((PLUGIN / "template" / pathlib.Path(*parts)).read_text(encoding="utf-8").split())

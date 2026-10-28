@@ -25103,8 +25103,9 @@ def test_an_ingesting_project_turns_new_notes_into_events_once(env):
     d.cfg = p.config()
     d.read_upstream()
     evs = p.db.q("SELECT text, status FROM events WHERE kind='upstream_note'")
+    fp = upstream.fingerprint('upstream: first', 'one')
     assert [e["text"] for e in evs] == ["upstream note from other #3 on testhost: upstream: first — one "
-                                        f"[note {upstream.fingerprint('upstream: first', 'one')}]"]
+                                        f"[note {fp}] Reply: `ttp note --reply {fp} \"<text>\"`."]
     assert "1 upstream note not yet read" in cli.status_text(p)
     assert upstream.ingest(p, p.config()) == 0, "a note was read twice"
     # A torn last line waits for the rest; the cursor moves past whole lines only.

@@ -104,7 +104,13 @@ read the one for the lever you change.
   there, with the user's keys and known hosts and no new port. Notes go only where they are read;
   one for a project (`ttp note --to`) goes only to the machine that runs it. A project this
   machine's registry does not know is looked up on the forward targets over ssh (`ttp upstream
-  --has-project <name>` there); an unknown name fails naming each machine asked. `ttp upstream
+  --has-project <name>` there); an unknown name fails naming each machine asked, and the
+  `ttp note --reply <fp>` to use when that name sent this project a note. Each received note keeps
+  its route (sender, its machine, the machine it came through) in the reading project's database,
+  and its event ends with that reply command: a reply goes back the same way, also as
+  `ttp note --to <project>@<machine>`. A machine that pushes notes here but cannot be reached from
+  here takes the replies held for it on its next call (it asks at least hourly for a week after
+  sending notes here); with no route a reply exits non-zero, not sent. `ttp upstream
   --forward-status` shows each target's cursor, last success and last error; `ttp upstream
   --forward-to <aliases>|default|none` sets the targets. Received notes stay untrusted data.
   A target the daemon has failed to reach for an hour shows in `ttp status` and `ttp note --to`;

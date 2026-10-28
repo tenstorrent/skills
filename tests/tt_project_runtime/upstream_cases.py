@@ -469,3 +469,136 @@ def test_upstream_resolve_prints_the_sender_and_answers_a_local_sending_project_
     assert "answer queued in this run's directory to second" in capsys.readouterr().out
     (q,) = [json.loads(x) for x in (run_dir / upstream.QUEUED_FILE).read_text().splitlines()]
     assert q["to"] == "second" and "fixed in tt-project 0.3.3" in q["text"] and len(answers()) == 2
+
+
+def _pushed_note(to, spec, sender="alpha", host="laptop", task=3, ts=None):
+    """A note project `sender` on machine `host` addressed to `to`, as a --receive line."""
+    from ttp import upstream
+    return {"ts": ts or time.time(), "project": sender, "host": host, "task": task, "to": to, "severity": "normal",
+            "title": f"note to {to}", "spec": spec, "fp": upstream.fingerprint(f"to:{to}", spec)}
+
+
+def test_a_note_pushed_from_an_unreachable_machine_keeps_its_route_and_the_reply_goes_back_on_its_next_call(
+        env, monkeypatch, capsys):
+    """A note another machine pushed here (`--receive`, `via` its alias) from a project `ttp list` does not
+    show: its route is kept in the reading project's database, its event says how to answer, `--to <sender>`
+    names `--reply`, and `ttp note --reply <fp>` files the answer as a `back` note the forwarder never sends:
+    the sending machine's next call here takes it, and `--status` follows it to sent back."""
+    from ttp import cli, upstream
+    p = make(env)
+    _note_run(env, monkeypatch, p)
+    sent = _pushed_note(p.name, "can you share the sweep logs?")
+    ack, rc = upstream.receive((json.dumps(sent) + "\n").encode(), "laptop")
+    assert (rc, ack["accepted"], ack["replies"]) == (0, 1, [])
+    assert upstream.ingest(p, {}) == 1
+    route = p.db.kv(upstream.KV_ROUTES)[sent["fp"]]
+    assert (route["project"], route["host"], route["via"], route["src"], route["task"]) == (
+        "alpha", "laptop", "laptop", upstream.LOCAL_TO, 3)
+    (ev,) = p.db.q("SELECT text FROM events WHERE kind='upstream_note'")
+    assert ev["text"].endswith(f"[note {sent['fp']}] Reply: `ttp note --reply {sent['fp']} \"<text>\"`.")
+    # The sender is unknown here: the error says how to answer instead of only 'unknown project'.
+    assert _note(cli, "--to", "alpha", "logs attached") == 2
+    err = capsys.readouterr().err
+    assert "unknown project alpha" in err and f"`ttp note --reply {sent['fp']} \"<text>\"`" in err
+    assert "`--to alpha@laptop`" in err
+    assert len(_upstream_inbox(env)) == 1, "nothing filed"
+    assert _note(cli, "--reply", sent["fp"], "logs are in the run folder") == 0
+    out = capsys.readouterr().out
+    reply = _upstream_inbox(env)[-1]
+    assert (reply["to"], reply["back"], reply["project"], reply["task"]) == ("alpha", "laptop", p.name, 57)
+    assert "at" not in reply and f"as {reply['fp']}" in out and "waits here until laptop's daemon" in out
+    assert _note(cli, "--status", reply["fp"]) == 1
+    assert capsys.readouterr().out.startswith(f"waiting: note {reply['fp']} is in this machine's inbox")
+    # The forwarder never sends a `back` note, not even to a target that runs a project of that name.
+    fake = _fake_forward_ssh(env, monkeypatch)
+    from ttp.project import register
+    register("alpha", {"host": "farbox", "dir": "/w/alpha"})
+    upstream.forward(time.time())
+    assert not any(n.get("fp") == reply["fp"] for n in _remote_inbox(fake, "farbox"))
+    # Another machine's call does not get it; the sending machine's next call does, each time until it is old.
+    assert upstream.receive(b"", "otherbox")[0]["replies"] == []
+    (got,) = upstream.receive(b"", "laptop")[0]["replies"]
+    assert upstream._valid(got)["fp"] == reply["fp"] and "back" not in got
+    assert _note(cli, "--status", reply["fp"]) == 0
+    assert capsys.readouterr().out.startswith(f"sent back: laptop's daemon took note {reply['fp']}")
+    assert upstream.receive(b"", "laptop", now=time.time() + upstream.REPLY_BACK_S + 1)[0]["replies"] == []
+
+
+def test_a_reply_by_note_id_goes_to_a_forward_target_and_a_target_hands_back_replies_it_cannot_send(
+        env, monkeypatch, capsys):
+    """`--to <project>@<machine>` on a forward target goes there (`at`) though no registry entry names the
+    project. After addressed notes went to a target, the forwarder asks it for replies; the `back` replies
+    it holds for this machine are filed here with `via` the target, and `--reply` answers them directly."""
+    from ttp import cli, upstream
+    p = make(env)
+    _note_run(env, monkeypatch, p)
+    fake = _fake_forward_ssh(env, monkeypatch)
+    upstream.set_forward_to(["farbox"])
+    assert _note(cli, "--to", "alpha@farbox", "is the sweep done?") == 0
+    (n,) = _upstream_inbox(env)
+    assert (n["to"], n["at"]) == ("alpha", "farbox") and "sends it on to farbox" in capsys.readouterr().out
+    now = time.time()
+    assert upstream.forward(now) == 1
+    assert [x["fp"] for x in _remote_inbox(fake, "farbox")] == [n["fp"]]
+    assert _fwd_state("farbox")["addressed"] == now
+    # farbox holds a reply for this machine it cannot send (its project answered with --reply).
+    back = {**_pushed_note(p.name, "yes, results are in", host="farbox"), "back": "testhost", "from": "worker"}
+    with open(fake["remote"] / "farbox" / ".tt-project" / "upstream.jsonl", "a") as f:
+        f.write(json.dumps(back) + "\n")
+    assert upstream.forward(now + 60) == 0 and not any(x["fp"] == back["fp"] for x in _upstream_inbox(env)), \
+        "asked again only after PULL_EVERY_S"
+    upstream.forward(now + upstream.PULL_EVERY_S + 1)
+    got = [x for x in _upstream_inbox(env) if x["fp"] == back["fp"]]
+    assert len(got) == 1 and (got[0]["via"], got[0]["project"], got[0]["to"]) == ("farbox", "alpha", p.name)
+    assert "back" not in got[0]
+    upstream.forward(now + 2 * upstream.PULL_EVERY_S + 2)
+    assert len([x for x in _upstream_inbox(env) if x["fp"] == back["fp"]]) == 1, "filed once"
+    assert upstream.ingest(p, {}) == 1
+    capsys.readouterr()
+    assert _note(cli, "--reply", back["fp"], "thanks, closing") == 0
+    r = _upstream_inbox(env)[-1]
+    assert (r["to"], r["at"]) == ("alpha", "farbox") and "back" not in r
+
+
+def test_a_reply_or_peer_note_with_no_route_is_refused_never_dropped(env, monkeypatch, capsys):
+    """No route: a non-zero exit saying it was not sent, and nothing filed. An unknown id, a sender that
+    no longer runs here, a note read from another machine's inbox that came there from a third one, and
+    `<project>@<machine>` for a machine there is no route to."""
+    from ttp import cli, upstream
+    p = make(env)
+    _note_run(env, monkeypatch, p)
+    assert _note(cli, "--reply", "0123456789abcdef", "hi") == 2
+    assert "not sent: no note 0123456789abcdef from another project came to demo" in capsys.readouterr().err
+    assert _note(cli, "--reply", "nope", "hi") == 2
+    assert "not sent: not a note fingerprint" in capsys.readouterr().err
+    local = _pushed_note(p.name, "from a project that is gone", host="testhost")
+    remote = _pushed_note(p.name, "read from a far inbox", host="laptop")
+    p.db.set_kv(upstream.KV_ROUTES, {
+        local["fp"]: upstream._route(local, upstream.LOCAL, time.time()),
+        remote["fp"]: upstream._route({**remote, "via": "laptop"}, "farbox", time.time())})
+    assert _note(cli, "--reply", local["fp"], "hi") == 2
+    assert "not sent: project alpha wrote it on this machine but no longer runs here" in capsys.readouterr().err
+    assert _note(cli, "--reply", remote["fp"], "hi") == 2
+    assert "this machine has no route back to laptop" in capsys.readouterr().err
+    assert _note(cli, "--to", "alpha@nowhere", "hi") == 2
+    assert "not sent: this machine does not send notes to nowhere" in capsys.readouterr().err
+    assert _note(cli, "--to", "alpha@testhost", "hi") == 2
+    assert "no project alpha runs on this machine" in capsys.readouterr().err
+    assert _note(cli, "--to", "alpha", "--reply", local["fp"], "hi") == 2
+    assert not (env["home"] / "upstream.jsonl").exists(), "nothing was filed"
+    # Read from a far inbox, written there: the reply goes there once that machine is a forward target.
+    p.db.set_kv(upstream.KV_ROUTES, {remote["fp"]: upstream._route(remote, "farbox", time.time())})
+    assert _note(cli, "--reply", remote["fp"], "hi") == 2
+    assert "does not send notes there" in capsys.readouterr().err
+    upstream.set_forward_to(["farbox"])
+    assert _note(cli, "--reply", remote["fp"], "hi") == 0
+    assert (_upstream_inbox(env)[-1]["to"], _upstream_inbox(env)[-1]["at"]) == ("alpha", "farbox")
+
+
+def test_a_long_note_event_keeps_its_id_and_reply_hint(env):
+    from ttp import upstream
+    from ttp.coordinator import EVENT_CHARS_BY_KIND
+    cap = EVENT_CHARS_BY_KIND["upstream_note"]
+    n = _pushed_note("demo", "x" * upstream.SPEC_CHARS)
+    sev, text = upstream._event({**n, "via": "laptop" * 10}, cap)
+    assert len(text) <= cap and text.endswith(f"[note {n['fp']}] Reply: `ttp note --reply {n['fp']} \"<text>\"`.")

@@ -1778,7 +1778,9 @@ def cmd_note(a) -> None:
         die("ttp note: the note's text is required", 2)
     if not run_dir:
         die("ttp note only works inside a tt-project run")
-    if a.to:
+    if getattr(a, "reply", None) and a.to:
+        die("ttp note: --reply answers the note's sender by its own route; leave out --to", 2)
+    if a.to or getattr(a, "reply", None):
         _note_to(a, run_dir)
     durable_append(Path(run_dir) / "progress.md", f"{timefmt.clock()} {a.text}\n")
     from . import upstream
@@ -1821,32 +1823,46 @@ def _note_to(a, run_dir: str) -> None:
     note as untrusted data from this worker. A note past upstream.SPEC_CHARS once whitespace is joined
     is refused whole, never cut; a filed or queued one prints the stored length and a short hash. A name
     this machine's registry does not know is looked up on the forward targets (upstream.find_peer), and
-    the note goes to the one that runs it."""
+    the note goes to the one that runs it. `--reply <fp>` and `--to <project>@<machine>` take the route a
+    received note came in by (upstream.reply_route, upstream.peer_route), so a sender this machine does
+    not know is still answered; with no route the note is refused, never dropped."""
     from . import upstream
     base = os.environ.get("TTP_PROJECT")
     me = Project(base) if base else None
     if not me or not me.exists():
         die("ttp note --to: this run has no project (TTP_PROJECT)")
+    at = back = None
+    routed = bool(getattr(a, "reply", None)) or "@" in a.to
+    if routed:
+        try:
+            a.to, at, back = (upstream.reply_route(me, a.reply) if getattr(a, "reply", None)
+                              else upstream.peer_route(me, *a.to.split("@", 1)))
+        except ValueError as e:
+            die(f"not sent: {e}. Nothing was filed; put the note in the hand-off instead")
     if a.to == me.name:
         die("ttp note --to names this run's own project; report to it with `ttp note` and the hand-off")
-    far = remote_entry(a.to)
+    far = None if routed else remote_entry(a.to)
     targets = upstream.forward_to()
     if far and targets is not None and (far.get("ssh") or far["host"]) not in targets:
         die(f"project {a.to} runs on another machine, and upstream.forward_to does not send notes there. "
             f"Put the note in the hand-off as a follow-up titled `upstream: ...` instead")
-    if not far and not local_project(a.to) and a.to == upstream.MAINTAINERS:
+    if not routed and not far and not local_project(a.to) and a.to == upstream.MAINTAINERS:
         return _note_upstream(a, me)
     if not a.text.strip():
         die("empty note")
-    at = None
-    if not far and not local_project(a.to):
+    if not routed and not far and not local_project(a.to):
         checked = []
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@+-]{0,79}", a.to):
             at, checked = upstream.find_peer(a.to)
         if not at:
+            got = upstream.senders(me, a.to)
+            how = (f". {a.to} sent this project note {got[0][0]}"
+                   + (f" from {got[0][1]['via']}" if got[0][1].get("via") else "")
+                   + f": answer it with `ttp note --reply {got[0][0]} \"<text>\"`, which takes the route it came by"
+                   + (f" (or `--to {a.to}@{got[0][1]['via']}`)" if got[0][1].get("via") else "")) if got else ""
             die(f"unknown project {a.to}: not on this machine (`ttp list`), "
                 + (f"nor on the machines notes are sent on to: {'; '.join(checked)}" if checked
-                   else "and there is no other machine to ask (`ttp upstream --forward-status`)"))
+                   else "and there is no other machine to ask (`ttp upstream --forward-status`)") + how)
     try:
         text = upstream.note_text(a.text)
     except upstream.NoteTooLong as e:
@@ -1859,11 +1875,11 @@ def _note_to(a, run_dir: str) -> None:
     task = os.environ.get("TTP_TASK") or ""
     try:
         got, place = upstream.send_or_queue(me.state, me.name, int(task) if task.isdigit() else None, a.to,
-                                            text, a.severity, at=at)
+                                            text, a.severity, at=at, back=back)
     except OSError as e:
         # A sandbox that cannot write the inbox (read-only home): the run's directory keeps the note,
         # and this project's daemon files it when the run ends (upstream.send_queued).
-        upstream.queue(Path(run_dir), a.to, text, a.severity, at=at)
+        upstream.queue(Path(run_dir), a.to, text, a.severity, at=at, back=back)
         print(f"note for {a.to} queued in this run's directory ({e.strerror or e}); this project's daemon files "
               f"it in its inbox as {upstream.note_id(a.to, text)} when the run ends{sent}")
         return
@@ -1877,6 +1893,8 @@ def _note_to(a, run_dir: str) -> None:
         return
     print(f"note for {a.to} " + ("already in its inbox" if got == "duplicate" else "filed in its inbox")
           + f" as {upstream.note_id(a.to, text)}" + sent
+          + (f"; this machine cannot reach {back}, so it waits here until {back}'s daemon takes it on its next "
+             f"call (it asks at least hourly for a week after sending notes here)" if back else "")
           + (f"; this machine's daemon sends it on to {(far.get('ssh') or far['host']) if far else at}" if far or at else "")
           + f"; `ttp note --status {upstream.note_id(a.to, text)}` shows whether {a.to} read it")
     target = (far.get("ssh") or far["host"]) if far else at
@@ -1889,7 +1907,7 @@ def _note_status(a, run_dir: str | None) -> None:
     """`ttp note --status <id>`: where a `ttp note --to` note stands (upstream.note_status). Exit 0 once
     the project it is for read it, 1 while it is on its way, 2 when it cannot tell: a retry_when."""
     from . import upstream
-    if a.text is not None or a.to:
+    if a.text is not None or a.to or getattr(a, "reply", None):
         die("ttp note --status takes only the note's id", 2)
     base = os.environ.get("TTP_PROJECT")
     try:
@@ -8013,7 +8031,11 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("text", nargs="?", help="the note, one line")
     s.add_argument("--to", metavar="PROJECT",
                    help="also file the note in the inbox of another project, as this worker's; tt-project: an "
-                        "`upstream: ...` note for its maintainers")
+                        "`upstream: ...` note for its maintainers; PROJECT@MACHINE: the project on that machine, "
+                        "by a forward target or the route its notes came by")
+    s.add_argument("--reply", metavar="FP",
+                   help="answer note FP (its `[note <fp>]`) from another project, over the route it came by, "
+                        "even when that project is not in `ttp list`")
     s.add_argument("--severity", choices=["low", "normal", "high"], default="normal",
                    help="with --to: the severity of the event the other project's coordinator gets")
     s.add_argument("--status", metavar="ID",

@@ -312,6 +312,11 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   reads it, and the inboxes on its remote projects' machines over ssh at most hourly, keeping its
   own cursor; new notes become `upstream_note` events for its coordinator. Coordinators pass the
   notes on to the user only while no project reads the inbox.
+- A note from another project can always be answered: its route (sender, machine, the machine it
+  came through) is kept in the reader's database, and `ttp note --reply <fp>` sends the answer
+  back that way. A sender's machine that cannot be reached from here (a laptop behind NAT) takes
+  the replies held for it in the answer to its next `ttp upstream --receive` call. With no route
+  the reply is refused, never dropped.
 
 ## Maintainer notes
 

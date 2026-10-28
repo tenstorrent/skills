@@ -240,11 +240,12 @@ def note_id(to: str, text: str) -> str:
 
 def send(source: str, task: int | None, to: str, text: str, severity: str = "normal",
          now: float | None = None, sender: str = "worker", at: str | None = None,
-         extra: dict | None = None) -> str:
+         extra: dict | None = None, back: str | None = None) -> str:
     """File a worker's note for project `to` in this machine's inbox. Returns "sent", "duplicate" (the
     same text to the same project is already there) or "limited" (`source` filed NOTES_PER_HOUR
     addressed notes in the last hour). `at`: the forward target that runs `to` when this machine's
-    registry does not know it (`find_peer`); the forwarder sends the note there. `sender` "daemon": the source project's daemon routed it, model-free
+    registry does not know it (`find_peer`); the forwarder sends the note there. `back`: the machine a
+    reply goes back to on its own next call here (`reply_route`), never sent from here. `sender` "daemon": the source project's daemon routed it, model-free
     (machine_ledger.py); such a page is not limited and does not count against the workers' notes, and
     `extra` (a daemon's only) adds fields such as an `outage` record (outagetask.py) the target files."""
     now = now or time.time()
@@ -268,6 +269,7 @@ def send(source: str, task: int | None, to: str, text: str, severity: str = "nor
         f.write((json.dumps({"ts": now, "project": source, "host": project.hostname(), "task": task,
                              "from": "daemon" if sender == "daemon" else "worker", "to": to, "severity": severity if severity in NOTE_SEVERITIES
                              else "normal", "title": title, "spec": text, "fp": fp, **({"at": at} if at else {}),
+                             **({"back": back} if back and not at else {}),
                              **({k: v for k, v in extra.items() if k == "outage"}
                                 if extra and sender == "daemon" else {})},
                             sort_keys=True) + "\n").encode())
@@ -310,7 +312,7 @@ def outbox_pending(state: Path) -> int:
 
 
 def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str, severity: str = "normal",
-                  now: float | None = None, at: str | None = None) -> tuple[str, int]:
+                  now: float | None = None, at: str | None = None, back: str | None = None) -> tuple[str, int]:
     """`send`, except that a note past the hourly limit, or behind notes already waiting, is appended to
     the project's outbox (state/OUTBOX_FILE) for its daemon to file in order as the limit allows
     (`drain_outbox`): the limit caps how fast notes reach the inbox, never the worker that wrote one.
@@ -324,7 +326,7 @@ def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str
             if n["fp"] == fp:
                 return "queued", i
         if not waiting:
-            got = send(source, task, to, text, severity, now, at=at)
+            got = send(source, task, to, text, severity, now, at=at, back=back)
             if got != "limited":
                 return got, 0
         elif _filed(fp):
@@ -335,7 +337,7 @@ def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str
         torn = box.exists() and box.stat().st_size and not box.read_bytes().endswith(b"\n")
         durable_append(box, ("\n" if torn else "") + json.dumps(
             {"ts": now, "task": task, "to": to, "text": text, "fp": fp, **({"at": at} if at else {}),
-             "severity": severity if severity in NOTE_SEVERITIES else "normal"}, sort_keys=True) + "\n")
+             **({"back": back} if back and not at else {}), "severity": severity if severity in NOTE_SEVERITIES else "normal"}, sort_keys=True) + "\n")
         return "queued", len(waiting) + 1
 
 
@@ -363,7 +365,7 @@ def drain_outbox(state: Path, source: str, now: float | None = None) -> tuple[in
         while waiting:
             n = waiting[0]
             if send(source, n.get("task"), n["to"], n["text"], str(n.get("severity") or "normal"), now,
-                    at=_at(n)) == "limited":
+                    at=_at(n), back=_at(n, "back")) == "limited":
                 break
             waiting.pop(0)
             filed += 1
@@ -387,18 +389,19 @@ QUEUED_FILE = "notes-to.jsonl"   # in a run's directory: notes a sandboxed worke
 QUEUED_MAX = 50                  # queued notes one run may leave
 
 
-def _at(n: dict) -> str | None:
-    """A queued note's `at` (send): the forwarder only ever sends to one of its own targets, so this
-    only has to be a string."""
-    at = n.get("at")
+def _at(n: dict, key: str = "at") -> str | None:
+    """A queued note's `at` (or `back`, send): the forwarder only ever sends to one of its own targets,
+    and a `back` note goes only to the machine that asks for it, so this only has to be a string."""
+    at = n.get(key)
     return at if isinstance(at, str) and at else None
 
 
-def queue(run_dir: Path, to: str, text: str, severity: str = "normal", at: str | None = None) -> None:
+def queue(run_dir: Path, to: str, text: str, severity: str = "normal", at: str | None = None,
+          back: str | None = None) -> None:
     """Keep a worker's note for project `to` in its run's directory, for a worker whose sandbox cannot
     write the inbox: its daemon files it with `send_queued` when the run ends."""
-    line = json.dumps({"to": to, "text": note_text(text), "severity": severity, **({"at": at} if at else {})},
-                      sort_keys=True) + "\n"
+    line = json.dumps({"to": to, "text": note_text(text), "severity": severity, **({"at": at} if at else {}),
+                       **({"back": back} if back and not at else {})}, sort_keys=True) + "\n"
     fd = os.open(Path(run_dir) / QUEUED_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         os.write(fd, line.encode())
@@ -432,9 +435,9 @@ def send_queued(run_dir: Path, source: str, task: int | None, state: Path | None
         sev = str(n.get("severity") or "normal")
         try:
             if state is None:
-                got[send(source, task, to, text, sev, at=_at(n))] += 1
+                got[send(source, task, to, text, sev, at=_at(n), back=_at(n, "back"))] += 1
             else:
-                r = send_or_queue(state, source, task, to, text, sev, at=_at(n))[0]
+                r = send_or_queue(state, source, task, to, text, sev, at=_at(n), back=_at(n, "back"))[0]
                 got["limited" if r == "full" else r] += 1
         except NoteTooLong:
             got["invalid"] += 1   # `queue` refuses these: only a line written past it is this long
@@ -442,10 +445,14 @@ def send_queued(run_dir: Path, source: str, task: int | None, state: Path | None
     return got
 
 
-def _event(n: dict) -> tuple[str, str]:
-    """An inbox note as an event's (severity, text), ending with its fingerprint (`ttp upstream --resolve`)."""
+def _event(n: dict, cap: int | None = None) -> tuple[str, str]:
+    """An inbox note as an event's (severity, text), ending with its fingerprint (`ttp upstream --resolve`)
+    and how to answer it (`reply_route`); past `cap` the note's text is cut, never that ending."""
     sev, text = _event_text(n)
-    return sev, f"{text} [note {n.get('fp')}]"
+    tail = f" [note {n.get('fp')}]" + (f" Reply: `ttp note --reply {n.get('fp')} \"<text>\"`." if n.get("project") else "")
+    if cap and len(text) + len(tail) > cap:
+        text = text[:max(0, cap - len(tail) - 1)] + "…"
+    return sev, text + tail
 
 
 def _event_text(n: dict) -> tuple[str, str]:
@@ -562,6 +569,7 @@ def _file(p: project.Project, sources, offsets: dict, known: set, seen: list, no
     me = (p.name, project.hostname())
     from .coordinator import EVENT_CHARS_BY_KIND
     cap = EVENT_CHARS_BY_KIND["upstream_note"]
+    routes: dict = {}
     for src, raw, size in sources:
         start = int(offsets.get(src, 0))
         if size < start:      # the inbox was cut or replaced: read it again; fingerprints skip the old notes
@@ -579,7 +587,9 @@ def _file(p: project.Project, sources, offsets: dict, known: set, seen: list, no
             seen.append(n["fp"])
             if not to and (n.get("project"), n.get("host")) == me:
                 continue      # this project's own notes reached its coordinator with the hand-off
-            sev, text = _event(n)
+            sev, text = _event(n, cap)
+            if n.get("project") and (n["project"], n.get("host")) != me:
+                routes[n["fp"]] = _route(n, src, now)
             p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                    (now, "upstream", "upstream_note", sev, text[:cap], "queued"))
             added += 1
@@ -592,7 +602,140 @@ def _file(p: project.Project, sources, offsets: dict, known: set, seen: list, no
                 from . import relay, sweep
                 if to and n.get("from") != "daemon" and relay.carries_user_words(n.get("spec")):
                     sweep.user_words_relayed(p.db, now)   # the user's words relayed: re-judge pause covers
+    if routes:
+        kept = {**(p.db.kv(KV_ROUTES) or {}), **routes}
+        p.db.set_kv(KV_ROUTES, dict(list(kept.items())[-ROUTES_KEPT:]))
     return added
+
+
+# Replying to a received note (`ttp note --reply <fp>`, `ttp note --to <project>@<machine>`) ------------
+# Each note from another project that reaches a project's coordinator leaves its route in that project's
+# own database (KV_ROUTES): the sending project, its machine, the machine it came through (`via`) and the
+# inbox it was read from. A reply goes back the same way: to a project on this machine through the inbox;
+# to one whose machine is a forward target (`lookup_targets`) through the forwarder (`at`); and to one
+# whose machine pushed the note here but cannot be reached from here (a laptop behind NAT), as a `back`
+# note this machine's inbox keeps and hands to that machine in the answer to its next `--receive` call
+# (`_replies_for`); that machine files it in its own inbox (`_take_replies`). A machine that sent addressed
+# notes to a target asks it for replies at least every PULL_EVERY_S for REPLY_WATCH_S. No route at all:
+# the reply is refused with the reason, never dropped.
+KV_ROUTES = "upstream_routes"   # {fp: the route a received note came in by}
+ROUTES_KEPT = 1000
+REPLY_BACK_S = 30 * 86400       # a `back` reply is handed out this long, to every call from its machine
+REPLY_BACK_MAX = 50             # replies one answer carries (the latest)
+REPLY_WATCH_S = 7 * 86400       # how long after its last addressed note a sender asks a target for replies
+BACK_FILE = "upstream-back.json"   # in the user's tt-project home: {"carried": {fp: when an answer first carried it}}
+CARRIED_KEPT = 1000
+
+
+def _route(n: dict, src: str, now: float) -> dict:
+    return {"project": n.get("project"), "host": n.get("host"), "via": n.get("via"), "src": src,
+            "task": n.get("task"), "ts": now}
+
+
+def back_path() -> Path:
+    return project.HOME_DIR / BACK_FILE
+
+
+class NoRoute(ValueError):
+    """No way to send a reply or a peer-qualified note: it was not sent."""
+
+
+def _resolve_route(name: str, via: str | None, src: str) -> tuple[str, str | None, str | None]:
+    """(to, at, back) for a note to project `name`, whose note came through machine `via` (None: written
+    on the machine of inbox `src`) into the inbox `src` (LOCAL, LOCAL_TO or a remote host read over ssh)."""
+    if not project.NAME_RE.match(name or ""):
+        raise NoRoute(f"the sender's name {name!r} is not a project name")
+    targets = lookup_targets()
+    if src in (LOCAL, LOCAL_TO):
+        if not via:
+            if has_project(name):
+                return name, None, None
+            raise NoRoute(f"project {name} wrote it on this machine but no longer runs here (`ttp list`)")
+        return (name, via, None) if via in targets else (name, None, via)
+    if via:
+        raise NoRoute(f"it came from {via} into the inbox on {src}, and this machine has no route back to {via}")
+    if src in targets:
+        return name, src, None
+    raise NoRoute(f"this machine reads the inbox on {src} but does not send notes there "
+                  f"(`ttp upstream --forward-to`)")
+
+
+def received(p: project.Project, fp: str) -> dict | None:
+    """The route note `fp` from another project came to `p` by: the record its reading left, else the note
+    in this machine's inbox when it is for `p` (addressed to it, or a general note it may read)."""
+    r = (p.db.kv(KV_ROUTES) or {}).get(fp)
+    if isinstance(r, dict):
+        return r
+    n, _ = _find(fp)
+    if not n or not n.get("project") or (n.get("to") and n["to"] != p.name) \
+            or (not n.get("via") and n.get("project") == p.name):
+        return None
+    return _route(n, LOCAL, float(n.get("ts") or 0))
+
+
+def reply_route(p: project.Project, fp: str) -> tuple[str, str | None, str | None]:
+    """(to, at, back) for a reply to note `fp` (`ttp note --reply`); NoRoute when it cannot be sent."""
+    fp = _check_fp(fp)
+    r = received(p, fp)
+    if r is None:
+        raise NoRoute(f"no note {fp} from another project came to {p.name} (use the id in the note's `[note <fp>]`)")
+    return _resolve_route(str(r.get("project") or ""), r.get("via"), str(r.get("src") or LOCAL))
+
+
+def senders(p: project.Project, name: str) -> list[tuple[str, dict]]:
+    """The notes (fp, route) project `name` sent to `p`, newest first."""
+    return [(fp, r) for fp, r in reversed(list((p.db.kv(KV_ROUTES) or {}).items()))
+            if isinstance(r, dict) and r.get("project") == name]
+
+
+def peer_route(p: project.Project, name: str, machine: str) -> tuple[str, str | None, str | None]:
+    """(to, at, back) for `ttp note --to <name>@<machine>`: `machine` is this one, a forward target, or
+    one notes from `name` came through; NoRoute otherwise."""
+    from .machines import ALIAS_RE
+    if not project.NAME_RE.match(name) or not ALIAS_RE.fullmatch(machine):
+        raise NoRoute(f"{name}@{machine} is not <project>@<machine alias>")
+    if machine in (alias(), project.hostname()):
+        if has_project(name):
+            return name, None, None
+        raise NoRoute(f"no project {name} runs on this machine (`ttp list`)")
+    if machine in lookup_targets():
+        return name, machine, None
+    for _fp, r in senders(p, name):
+        if r.get("via") == machine and r.get("src") in (LOCAL, LOCAL_TO):
+            return name, None, machine
+    raise NoRoute(f"this machine does not send notes to {machine} (`ttp upstream --forward-status`), and no "
+                  f"note from {name} came from there")
+
+
+def _replies_for(via: str, now: float | None = None) -> list[dict]:
+    """This machine's `back` notes for machine `via` filed within REPLY_BACK_S (the latest REPLY_BACK_MAX),
+    as `--receive` lines; each is marked carried the first time an answer holds it."""
+    now = now or time.time()
+    here = project.hostname()
+    try:
+        with open(path(), "rb") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            notes = _lines(f.read())[0]
+    except FileNotFoundError:
+        return []
+    out = [{k: n.get(k) for k in ("ts", "project", "host", "task", "to", "severity", "title", "spec", "fp")}
+           for n in notes if n.get("back") == via and n.get("to") and n.get("host") == here and not n.get("via")
+           and now - float(n.get("ts") or 0) < REPLY_BACK_S][-REPLY_BACK_MAX:]
+    if out:
+        doc = _json(back_path())
+        carried = dict(doc.get("carried") or {})
+        if any(n["fp"] not in carried for n in out):
+            carried.update({n["fp"]: now for n in out if n["fp"] not in carried})
+            project.write_json(back_path(), {**doc, "carried": dict(list(carried.items())[-CARRIED_KEPT:])}, mode=0o600)
+    return out
+
+
+def _take_replies(target: str, got: list) -> int:
+    """File the replies `target`'s answer carried (`_replies_for`) in this machine's inbox, with `via`
+    `target`, once each: the project here they are for reads them as notes from that machine."""
+    here = project.hostname()
+    notes = [n for n in (_valid(r) for r in got[:REPLY_BACK_MAX]) if n and n.get("to") and n["host"] != here]
+    return _append_received(notes, target)[0] if notes else 0
 
 
 def unread(db) -> int:
@@ -1380,27 +1523,38 @@ def receive(stream: bytes, via: str, now: float | None = None) -> tuple[dict, in
         ack[k] += v
     notes = [n for n in got if n]
     if notes:
-        project.HOME_DIR.mkdir(parents=True, exist_ok=True)
-        fd = os.open(path(), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
-        with os.fdopen(fd, "rb+") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            f.seek(0)
-            have = {n["fp"] for n in _lines(f.read())[0]}
-            out = b""
-            for n in notes:
-                if n["fp"] in have:
-                    ack["duplicates"] += 1
-                else:
-                    have.add(n["fp"])
-                    out += (json.dumps({**n, "via": via}, sort_keys=True) + "\n").encode()
-                    ack["accepted"] += 1
-            if out:
-                f.write(out)
-                f.flush()
-                os.fsync(f.fileno())   # the ack says it is filed: it must outlast a power cut here
+        accepted, duplicates = _append_received(notes, via)
+        ack["accepted"] += accepted
+        ack["duplicates"] += duplicates
         ack["last_fp"] = notes[-1]["fp"]
     ack["resolved"] = _resolved_for(via)
+    ack["replies"] = _replies_for(via, now)
     return ack, 0
+
+
+def _append_received(notes: list[dict], via: str) -> tuple[int, int]:
+    """File notes another machine sent (`_valid` ones) in this machine's inbox with `via`, skipping the
+    fingerprints it has: (accepted, duplicates)."""
+    accepted = duplicates = 0
+    project.HOME_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path(), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "rb+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.seek(0)
+        have = {n["fp"] for n in _lines(f.read())[0]}
+        out = b""
+        for n in notes:
+            if n["fp"] in have:
+                duplicates += 1
+            else:
+                have.add(n["fp"])
+                out += (json.dumps({**n, "via": via}, sort_keys=True) + "\n").encode()
+                accepted += 1
+        if out:
+            f.write(out)
+            f.flush()
+            os.fsync(f.fileno())   # the ack says it is filed: it must outlast a power cut here
+    return accepted, duplicates
 
 
 # closing a forwarded note: the sender's forwarder carries resolutions back and acks over --------
@@ -1701,7 +1855,16 @@ def note_status(fp: str, state: Path | None = None, run_dir: Path | None = None)
     to = n.get("to")
     if not to:
         return UNKNOWN, f"unknown: note {fp} is for tt-project's maintainers, not a project (`ttp upstream --mine`)"
-    target = None if n.get("via") else _remote_projects().get(to) or n.get("at")
+    if n.get("back") and not n.get("via"):
+        if (when := (_json(back_path()).get("carried") or {}).get(fp)) is not None:
+            return DELIVERED, (f"sent back: {n['back']}'s daemon took note {fp} on its call here "
+                               f"{max(0.0, time.time() - float(when)) / 3600:.1f} h ago; that machine files it for {to}")
+        if time.time() - float(n.get("ts") or 0) >= REPLY_BACK_S:
+            return UNKNOWN, (f"not sent: {n['back']}'s daemon did not call here within {REPLY_BACK_S // 86400} days "
+                             f"to take note {fp}; send it again once there is a route (`ttp upstream --forward-to`)")
+        return ON_ITS_WAY, (f"waiting: note {fp} is in this machine's inbox until {n['back']}'s daemon takes it on "
+                            f"its next call here (this machine cannot reach {n['back']})")
+    target = None if n.get("via") else n.get("at") or _remote_projects().get(to)
     if not target:
         read = read_by(to, fp)
         if read is None:
@@ -1855,6 +2018,8 @@ def _forward(now: float, budget_s: float, context: str = "daemon") -> int:
                       closure=isinstance(ack.get("resolved"), list))
             if st["closure"] and ack["resolved"]:
                 st["resolutions"] = int(st.get("resolutions") or 0) + _take_resolved(target, ack["resolved"])
+            if isinstance(ack.get("replies"), list) and ack["replies"]:
+                st["replies"] = int(st.get("replies") or 0) + _take_replies(target, ack["replies"])
         targets_st[target] = st
         save()
         return ack
@@ -1876,7 +2041,7 @@ def _forward(now: float, budget_s: float, context: str = "daemon") -> int:
         if size < offset:                 # the inbox was cut or replaced: send it again; the target dedupes
             offset, (raw, size) = 0, _read_local(0)
             st.pop("skipped_at", None)
-        batch, end, pos, nbytes = [], offset, offset, 0
+        batch, end, pos, nbytes, addressed = [], offset, offset, 0, False
         cap = RECEIVE_BYTES - RECEIVE_BYTES // 32   # a margin under what the receiver reads
         for ln in raw[:raw.rfind(b"\n") + 1].splitlines(keepends=True):
             try:
@@ -1884,8 +2049,9 @@ def _forward(now: float, budget_s: float, context: str = "daemon") -> int:
             except ValueError:
                 n = None
             # Only this machine's own notes: one received from elsewhere (`via`) is never sent on again.
-            if isinstance(n, dict) and n.get("fp") and not n.get("via") and n.get("host") == here and (
-                    (projects.get(n["to"]) or n.get("at")) == target if n.get("to") else reads):
+            # A peer-qualified note or a reply (`at`) goes where it names; a `back` reply waits to be asked for.
+            if isinstance(n, dict) and n.get("fp") and not n.get("via") and not n.get("back") and n.get("host") == here and (
+                    (n.get("at") or projects.get(n["to"])) == target if n.get("to") else reads):
                 if len(ln) > cap:
                     # The receiver would refuse any stream holding it: skip it, or it stalls the queue.
                     # Counted once: a failed send leaves the cursor before it, so later passes see it again.
@@ -1901,6 +2067,7 @@ def _forward(now: float, budget_s: float, context: str = "daemon") -> int:
                 else:
                     batch.append(ln)
                     nbytes += len(ln)
+                    addressed = addressed or bool(n.get("to"))
             pos += len(ln)
             end = pos
         # Acks of resolutions that came from the target go back with the notes (only to a target whose
@@ -1910,6 +2077,9 @@ def _forward(now: float, budget_s: float, context: str = "daemon") -> int:
         every = PULL_EVERY_S if st.get("closure") is not False else FORWARD_PROBE_S
         pull = reads and bool(st.get("accepted")) and now - float(st.get("pulled") or 0) >= every and bool(
             open_fps if open_fps is not None else (open_fps := _own_open(now)))
+        # After addressed notes went there, the target may hold replies it cannot send (`_replies_for`).
+        pull = pull or (now - float(st.get("addressed") or 0) < REPLY_WATCH_S
+                        and now - float(st.get("pulled") or 0) >= PULL_EVERY_S)
         # A target the daemon has been failing to reach gets an empty send when nothing is left for it (a
         # run's fallback sent it): the daemon learns it is reachable again, and its failure record ends.
         if not batch and not acks and not pull and not (daemon and st.get("fails")):
@@ -1922,7 +2092,8 @@ def _forward(now: float, budget_s: float, context: str = "daemon") -> int:
             break
         st_sent = dict(st)
         if send(target, st_sent, batch + acks) is not None:
-            targets_st[target] = {**st_sent, "cursor": end}   # moves only once the target has them
+            targets_st[target] = {**st_sent, "cursor": end,   # moves only once the target has them
+                                  **({"addressed": now} if addressed else {})}
             if acks:
                 targets_st[target]["acks_cursor"] = acks_end
             save()
