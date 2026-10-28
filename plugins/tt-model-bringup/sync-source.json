@@ -155,7 +155,7 @@
       "destination": "skills/functional-decoder/SKILL.md",
       "blob": "5ea84505c81347d6773fc8325c3115d31094e5d8",
       "source_sha256": "133caffc050d9bb0343a37509ce09a6b2a4e640294761e7226e52f8f82037b71",
-      "packaged_sha256": "ffbd01a51a268f57e62e503475b6b73295d2e723e64271217213e13064c9f01c"
+      "packaged_sha256": "bc27657687980b27b7a4424c9e83e3cf41c6dcea27db7fa149a8901351c77d04"
     },
     {
       "source": ".agents/skills/functional-decoder/agents/openai.yaml",
@@ -253,7 +253,7 @@
       "destination": "skills/tt-enable-tracing/SKILL.md",
       "blob": "379f135ff209af802207532f5ad1dc1a88a70627",
       "source_sha256": "2b708c499a67a0fccd6618d6f0c2956f532605b5643c6d70e18a5c70f5bbb1da",
-      "packaged_sha256": "3ec31494c1355fc0dcb81fa7c4f250ef635b2bcd567fef6d3978b2e266212966"
+      "packaged_sha256": "bf2e858982e2c94822f0d4b063a5cde9eb026c7e22994e5cceafd05a8c079d97"
     },
     {
       "source": ".agents/skills/tt-enable-tracing/advanced_perf_optimizations.md",
