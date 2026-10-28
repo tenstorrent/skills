@@ -252,13 +252,19 @@ def _at(node, path):
 
 
 def _graphql(res) -> dict | None:
-    """The `data` of a GraphQL answer. gh exits 1 when the answer carries errors (one alias naming a PR
-    that is gone, say), yet prints it: what did resolve is used."""
+    """A GraphQL answer's body ({"data": ..., "errors": ...}) when it carries `data`. gh exits 1 when the
+    answer carries errors (one alias naming a PR that is gone, say), yet prints it: what did resolve is used."""
     try:
         body = json.loads(res.out) if res is not None and not res.timed_out else None
     except ValueError:
         return None
-    return body.get("data") if isinstance(body, dict) and isinstance(body.get("data"), dict) else None
+    return body if isinstance(body, dict) and isinstance(body.get("data"), dict) else None
+
+
+def _not_found(body: dict, alias: str) -> bool:
+    """The answer says the PR under `alias` does not exist (GraphQL NOT_FOUND on its path)."""
+    return any(isinstance(e, dict) and e.get("type") == "NOT_FOUND" and (e.get("path") or [None])[-1] == alias
+               for e in body.get("errors") or [])
 
 
 def _views(node: dict, nodes: dict) -> tuple[dict, dict]:
@@ -281,8 +287,11 @@ class PrCycle:
     """One poll cycle's PR reads. The PRs it plans are read one batched GraphQL query per repo (PR_BATCH
     a query) when the first of them is asked for; every later ask in the cycle, from any consumer, is
     answered from that read with no gh call. A read that fails or times out fails each of its PRs, once
-    (a hung read cuts its whole batch): the next poll tries again, as with per-PR calls. Asks it cannot
-    answer (a PR it did not plan, other fields, an answer without the PR's alias) go to gh as before."""
+    (a hung read cuts its whole batch): the next poll tries again, as with per-PR calls. A PR with more
+    pages (over 100 comments, reviews or checks) is read on by its own ask, in that ask's time: one PR's
+    pages never spend another's, and a PR whose pages were not read is never answered as read. Asks it
+    cannot answer (a PR it did not plan, other fields, an answer without the PR's alias or an error other
+    than NOT_FOUND on it) go to gh as before."""
 
     def __init__(self) -> None:
         import threading
@@ -304,7 +313,8 @@ class PrCycle:
                 for i in range(0, len(prs), PR_BATCH):
                     part = prs[i:i + PR_BATCH]
                     batch = {"host": host, "owner": owner, "name": name, "prs": part, "lock": threading.Lock(),
-                             "done": False, "timed_out": False, "refused": False, "got": {}, "unknown": set()}
+                             "done": False, "timed_out": False, "refused": False, "got": {}, "unknown": set(),
+                             "pages": {}}   # pr_key: [number, node, nodes, cursors, its lock] still to page
                     self.where.update({k: batch for k, _ in part})
 
     @staticmethod
@@ -333,64 +343,99 @@ class PrCycle:
             return False, None
         if batch["timed_out"]:
             _timed(timeout)
+        if key in batch["pages"]:
+            self._page(batch, key, cwd, timeout, run)
+            if key in batch["unknown"]:
+                return False, None
         got = batch["got"].get(key)
         if got is None:
             return True, None
         view, data = json.loads(json.dumps(got))   # each consumer its own copy
         return True, data if what == "data" else {f: view.get(f) for f in what}
 
-    def _call(self, batch: dict, query: str, more: list[str], cwd: str, end: float, run) -> dict | None:
+    def _call(self, batch: dict, query: str, more: list[str], cwd: str, end: float, run,
+              flags: dict) -> dict | None:
+        """The answer's body, or None; a timeout (the time to `end` spent too) or a refusal is set in `flags`."""
+        if run is not None and run.stopping.is_set():
+            return None
         left = end - _now()
-        if left <= 0 or (run is not None and run.stopping.is_set()):
+        if left <= 0:
+            flags["timed_out"] = True
             return None
         host = [] if batch["host"] == "github.com" else ["--hostname", batch["host"]]
         with self._lock:
             self.spawned += 1
         res = _spawn(["api", "graphql", *host, "-f", f"query={query}", "-f", f"owner={batch['owner']}",
                       "-f", f"name={batch['name']}", *more], left, cwd, run)
-        batch["timed_out"] |= bool(res is not None and res.timed_out)
-        batch["refused"] |= bool(res is not None and _REFUSED_RE.search(str(res.err or "")))
+        flags["timed_out"] |= bool(res is not None and res.timed_out)
+        flags["refused"] |= bool(res is not None and _REFUSED_RE.search(str(res.err or "")))
         return _graphql(res)
 
     def _read(self, batch: dict, cwd: str, timeout: float, run) -> None:
+        import threading
         batch["done"] = True
-        end = _now() + timeout
         query = ("query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
                  + "".join(f"p{i}:pullRequest(number:{n}){{{_PR_SEL}}}" for i, (_, n) in enumerate(batch["prs"]))
                  + "}}")
-        got = self._call(batch, query, [], cwd, end, run)
-        if got is None and not (batch["timed_out"] or batch["refused"] or _over()
-                                or run is not None and run.stopping.is_set()):
+        body = self._call(batch, query, [], cwd, _now() + timeout, run, batch)
+        if body is None and not (batch["timed_out"] or batch["refused"] or _over()
+                                 or run is not None and run.stopping.is_set()):
             batch["unknown"].update(k for k, _ in batch["prs"])   # gh failed otherwise: each PR asks itself
             return
-        repo = (got or {}).get("repository")
+        repo = (body or {}).get("data", {}).get("repository")
         if not isinstance(repo, dict):
             return
         for i, (key, number) in enumerate(batch["prs"]):
-            if f"p{i}" not in repo:   # an answer without the alias is not one to this query: ask gh per PR
-                batch["unknown"].add(key)
-                continue
-            node = repo[f"p{i}"]
+            node = repo.get(f"p{i}")
             if not isinstance(node, dict):
-                continue   # gone, or not readable (null): gh pr view would fail too
-            nodes = {}
-            for conn, (sel, path) in _CONNS.items():
+                if not _not_found(body, f"p{i}"):   # no alias, or an error other than gone: ask gh per PR
+                    batch["unknown"].add(key)
+                continue   # gone: gh pr view would fail too
+            nodes, cursors = {}, {}
+            for conn, (_, path) in _CONNS.items():
                 page = _at(node, path) or {}
                 nodes[conn] = list(page.get("nodes") or [])
-                while (page.get("pageInfo") or {}).get("hasNextPage"):
-                    q = ("query($owner:String!,$name:String!,$number:Int!,$after:String!){repository(owner:$owner,"
-                         "name:$name){pullRequest(number:$number){" + sel % ",after:$after" + "}}}")
-                    more = self._call(batch, q, ["-F", f"number={number}", "-f",
-                                                 f"after={page['pageInfo'].get('endCursor')}"], cwd, end, run)
-                    page = _at(more, ("repository", "pullRequest", *path))
-                    if not isinstance(page, dict):
-                        break
-                    nodes[conn] += page.get("nodes") or []
-                else:
-                    continue
-                break   # a page could not be read: this PR is unread, as its gh pr view would be
+                if (page.get("pageInfo") or {}).get("hasNextPage"):
+                    cursors[conn] = page["pageInfo"].get("endCursor")
+            if cursors:   # read on by the PR's own ask, in its own time (_page)
+                batch["pages"][key] = [number, node, nodes, cursors, threading.Lock()]
             else:
                 batch["got"][key] = _views(node, nodes)
+
+    def _page(self, batch: dict, key: str, cwd: str, timeout: float, run) -> None:
+        """Read the PR's further pages within `timeout` (the asker's gh call time, as for gh pr view's own
+        paging). Answered once all are read. Out of time: the ask timed out and a later ask reads on from
+        there. A refusal answers nothing (as gh would); any other failure lets the PR ask gh itself."""
+        held = batch["pages"].get(key)
+        if held is None:
+            return
+        with held[4]:
+            if key not in batch["pages"]:
+                return   # another ask read it meanwhile
+            number, node, nodes, cursors, _ = held
+            end, flags = _now() + timeout, {"timed_out": False, "refused": False}
+            for conn in list(cursors):
+                sel, path = _CONNS[conn]
+                q = ("query($owner:String!,$name:String!,$number:Int!,$after:String!){repository(owner:$owner,"
+                     "name:$name){pullRequest(number:$number){" + sel % ",after:$after" + "}}}")
+                while conn in cursors:
+                    more = self._call(batch, q, ["-F", f"number={number}", "-f", f"after={cursors[conn]}"],
+                                      cwd, end, run, flags)
+                    page = _at((more or {}).get("data"), ("repository", "pullRequest", *path))
+                    if not isinstance(page, dict):
+                        if flags["timed_out"]:
+                            _timed(timeout)
+                        elif not (flags["refused"] or _over() or run is not None and run.stopping.is_set()):
+                            batch["unknown"].add(key)
+                            del batch["pages"][key]
+                        return
+                    nodes[conn] += page.get("nodes") or []
+                    if (page.get("pageInfo") or {}).get("hasNextPage"):
+                        cursors[conn] = page["pageInfo"].get("endCursor")
+                    else:
+                        del cursors[conn]
+            batch["got"][key] = _views(node, nodes)
+            del batch["pages"][key]
 
 
 _CYCLE: contextvars.ContextVar[PrCycle | None] = contextvars.ContextVar("watcher_pr_cycle", default=None)

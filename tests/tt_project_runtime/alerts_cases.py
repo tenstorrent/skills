@@ -1887,10 +1887,11 @@ def _gql_node(n: int, *, state="OPEN", draft=True, decision=None, checks=(("buil
 class _BatchGh:
     """A fake gh (boundedchild.run) over _gql_node PRs that records each invocation. It answers `gh pr view
     --json` as gh does (a null review decision as "", reviews without inline comments), BOT_QUERY, and the
-    batched query, 100 nodes a page. `fail` answers each GraphQL query: None, "hang", or (rc, stderr)."""
+    batched query, 100 nodes a page, a PR it lacks as NOT_FOUND. `fail` answers each GraphQL query: None, "hang",
+    or (rc, stderr); a `hidden` PR is null in the batched answer with a FORBIDDEN error, yet gh pr view reads it."""
 
     def __init__(self, prs: dict):
-        self.prs, self.calls, self.fail = prs, [], None
+        self.prs, self.calls, self.fail, self.hidden = prs, [], None, set()
 
     def _page(self, items: list, after: str | None) -> dict:
         start = int(after or 0)
@@ -1935,9 +1936,12 @@ class _BatchGh:
             only = re.search(r"(comments|reviews|contexts)\(first:100,after", q).group(1)
             return ok({"data": {"repository": {"pullRequest": self._gql(self.prs[int(vals["number"])],
                                                                          vals["after"], only)}}})
-        repo = {f"p{i}": self._gql(self.prs[int(n)]) if int(n) in self.prs else None
-                for i, n in re.findall(r"p(\d+):pullRequest\(number:(\d+)\)", q)}
-        return boundedchild.Result(0 if all(repo.values()) else 1, json.dumps({"data": {"repository": repo}}), "")
+        aliases = re.findall(r"p(\d+):pullRequest\(number:(\d+)\)", q)
+        repo = {f"p{i}": self._gql(self.prs[int(n)]) if int(n) in self.prs and int(n) not in self.hidden else None
+                for i, n in aliases}
+        errors = [{"type": "FORBIDDEN" if int(n) in self.hidden else "NOT_FOUND", "path": ["repository", f"p{i}"]}
+                  for i, n in aliases if repo[f"p{i}"] is None]
+        return boundedchild.Result(1 if errors else 0, json.dumps({"data": {"repository": repo}, "errors": errors}), "")
 
 
 def _pr_batch_setup(env, monkeypatch, prs: dict):
@@ -2052,6 +2056,67 @@ def test_a_failed_batched_read_fails_its_prs_or_lets_each_ask_gh(env, monkeypatc
         assert status.startswith("cut short (0 of 5") and "acme/widgets#1 (5 s gh call timeout)" in status, status
     else:
         assert status == "ok (5 PRs, 0 changed)", status
+
+
+def _slow_gh(monkeypatch, gh, step: float = 3.0) -> None:
+    """Each gh call takes `step` seconds on the watcher's clock."""
+    from ttp import boundedchild, watchers
+    clock = [1000.0]
+
+    def slow(argv, timeout, **kw):
+        clock[0] += step
+        return gh(argv, timeout, **kw)
+    monkeypatch.setattr(watchers, "_now", lambda: clock[0])
+    monkeypatch.setattr(boundedchild, "run", slow)
+
+
+def test_batched_prs_with_more_pages_each_read_them_in_their_own_time(env, monkeypatch):
+    """PRs over 100 checks read their further pages on their own asks, each in its own gh call time: with
+    3 s a gh call, 8 such PRs all get signatures (as per-PR reads do), none spends another's time."""
+    from ttp import watchers
+    from ttp.daemon import Daemon
+    many = [(f"job{i}", "COMPLETED", "FAILURE" if i == 7 else "SUCCESS") for i in range(250)]
+    p, gh = _pr_batch_setup(env, monkeypatch, {i: _gql_node(i, checks=many) for i in range(1, 9)})
+    _slow_gh(monkeypatch, gh)
+    sigs = []
+    for batched in (False, True):
+        p.db.x("DELETE FROM kv WHERE key='pr_signatures'")
+        with monkeypatch.context() as m:
+            if not batched:
+                m.setattr(watchers.PrCycle, "plan", lambda self, urls: None)
+            assert watchers.watch_prs(Daemon(p.base), {"pr_workers": 1}).startswith("ok (8 PRs, 8 changed)")
+        sigs.append(p.db.kv("pr_signatures"))
+    assert len(sigs[1]) == 8 and sigs[0] == sigs[1]
+    assert all(s["failing"] == ["job7"] for s in sigs[1].values())
+    assert len(gh.calls) == 8 * 2 + 1 + 8 * 2, "per-PR: view and findings; batched: one query, 2 pages a PR"
+
+
+def test_a_batched_pr_whose_pages_outlast_its_time_shows_as_not_checked(env, monkeypatch):
+    """A PR whose further pages do not fit its gh call time is reported cut by that timeout, never read
+    as answered with nothing to report; the PR batched with it is read."""
+    from ttp import watchers
+    from ttp.daemon import Daemon
+    many = [(f"job{i}", "COMPLETED", "SUCCESS") for i in range(400)]
+    p, gh = _pr_batch_setup(env, monkeypatch, {1: _gql_node(1, checks=many), 2: _gql_node(2)})
+    _slow_gh(monkeypatch, gh)
+    status = watchers.run_builtin(Daemon(p.base), "prs", {"deadline_s": 60, "gh_timeout_s": 5, "pr_workers": 1})
+    assert status.startswith("cut short (1 of 2") and "acme/widgets#1 (5 s gh call timeout)" in status, status
+    assert set(p.db.kv("pr_signatures")) == {"https://github.com/acme/widgets/pull/2"}
+
+
+def test_a_batched_pr_null_for_a_reason_other_than_not_found_asks_gh_itself(env, monkeypatch):
+    """A null alias counts as a PR gone only when the answer says NOT_FOUND for it; any other error lets
+    the PR ask gh per PR."""
+    from ttp import watchers
+    from ttp.daemon import Daemon
+    p, gh = _pr_batch_setup(env, monkeypatch, {i: _gql_node(i) for i in range(1, 4)})
+    p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
+           ("t", "code", "done", "https://github.com/acme/widgets/pull/9", time.time()))   # gone on GitHub
+    gh.hidden = {2}
+    assert watchers.watch_prs(Daemon(p.base)).startswith("ok (4 PRs, 3 changed)")
+    assert set(p.db.kv("pr_signatures")) == {f"https://github.com/acme/widgets/pull/{i}" for i in range(1, 4)}
+    assert len(gh.calls) == 3, gh.calls   # the query, then PR 2's view and findings; PR 9 asks nothing more
+    assert "acme/widgets/pull/2" in gh.calls[1][2] and "number=2" in gh.calls[2]
 
 
 def test_pr_watch_batches_per_repo_in_chunks(env, monkeypatch):
