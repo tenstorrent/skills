@@ -35,8 +35,8 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, cleantree, envfault, landed, locks, machines, prguard, remotecheck, runner, sandbox,
-               scriptwatch, settinghold, testslots, timefmt, worktree)
+from . import (checkcap, checkdirs, cleantree, envfault, landed, locks, machines, prguard, prhead, remotecheck, runner,
+               sandbox, scriptwatch, settinghold, testslots, timefmt, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, code_tasks_may_push, durable_append, durable_write, git_fsync_env, hostname,
@@ -1621,6 +1621,8 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
         remote = LOCAL
     elif why := local_remote_problem(p, repo, remote):
         raise ValueError(why)
+    if carried and remote != LOCAL:
+        remote = _pr_head(repo, branch, remote)
     if task and not notes and (why := foreign_pr_branch(p, task, branch, f"{remote}/{branch}")):
         raise ValueError(why)
     base = str(d.get("base_ref") or "").strip()
@@ -1633,6 +1635,16 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
             raise ValueError(f"this task's pr_branch {branch} exists neither here nor on {remote}: --own "
                              f"publishes onto an existing branch only, never creates one")
     return remote, branch
+
+
+def _pr_head(repo: Path, branch: str, remote: str) -> str:
+    """The remote a pr_branch goes to: the open PR's head repository when that is a fork other than
+    `remote` (prhead.fork_remote, which refuses the fork's main, master and default branch), else
+    `remote`, saying why when gh could not tell."""
+    fork, note = prhead.fork_remote(repo, branch, remote)
+    if note:
+        print(f"ttp push: {note}" if fork else f"ttp push: {note}; pushing to {remote} as before", file=sys.stderr)
+    return fork or remote
 
 
 OWN_REMOTE_KEY = "delivery.own_push_remote"

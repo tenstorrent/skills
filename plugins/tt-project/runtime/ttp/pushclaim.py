@@ -238,12 +238,38 @@ def claims(p, task: dict, result: dict, run: dict | None) -> list[dict]:
         found = [c for c in found if not _self_stopped(p, c)]
     found += own
     seen, out = set(), []
+    pr = _pr_branch(p, task)
     for c in found:
         k = c.get("marker") or (c["sha"], c["remote"], c["ref"])
         if k not in seen:
             seen.add(k)
+            if pr and (c.get("marker") or c["ref"] == f"refs/heads/{pr}"):
+                c["pr_branch"] = pr
             out.append(c)
     return out
+
+
+def _pr_branch(p, task: dict) -> str:
+    """The pr_branch task `task` delivers onto, "" when none (local reads only)."""
+    from . import push
+    try:
+        return push.pr_branch_of(p, p.db.task(int(task["id"])) or task)
+    except Exception:
+        return ""
+
+
+def _on_pr_head(c: dict, repo, remote: str, ref: str, sha: str, cache: dict) -> tuple[str, str] | None:
+    """`sha` claimed on its task's pr_branch (`ref`) that `remote` lacks, confirmed on the open PR's
+    head repository when that is a fork (prhead.claim_remote): where `ttp push` sends such a branch,
+    and where a push made by hand went. None when it is not such a claim or not there."""
+    from . import prhead
+    if not c.get("pr_branch") or ref != f"refs/heads/{c['pr_branch']}":
+        return None
+    fork = prhead.claim_remote(repo, c["pr_branch"])
+    if not fork or fork == remote:
+        return None
+    state, why = verify(repo, fork, ref, sha, cache)
+    return (state, f"{why}, the open PR's head repository") if state == CONFIRMED else None
 
 
 class OutOfTime(Exception):
@@ -436,6 +462,8 @@ def _check_marker(p, c: dict, cache: dict) -> tuple[str, str]:
               or "no outcome")
     if head:
         state, said = verify(repo, to[0], to[1], head, cache)
+        if state == MISSING and (fork := _on_pr_head(c, repo, to[0], to[1], head, cache)):
+            state, said = fork
         if state == CONFIRMED:
             return state, f"{said} (pushed another way after {c['source']} ended {status})"
         if state == UNKNOWN:
@@ -452,6 +480,8 @@ def check(p, c: dict, cache: dict) -> tuple[str, str]:
         return _check_marker(p, c, cache)
     repo = c.get("repo") or p.root
     state, why = verify(repo, c["remote"], c["ref"], c["sha"], cache)
+    if state == MISSING and (head := _on_pr_head(c, repo, c["remote"], c["ref"], c["sha"], cache)):
+        return head[0], f"{head[1]} ({why})"
     if state == MISSING and not c.get("strict") and (d := _default(p, repo)) and d != (c["remote"], c["ref"]):
         s2, w2 = verify(repo, d[0], d[1], c["sha"], cache)
         if s2 == CONFIRMED:

@@ -12883,3 +12883,179 @@ def test_push_check_passes_recorded_before_env_parts_just_miss(env, monkeypatch)
         envs, parts = cli._check_envs(wt2, ["pytest -q"], cenv)
         assert cli._recorded_pass(p, tree, ["pytest -q"], "candidate", envs) is None
         assert isinstance(cli._env_miss(p, tree, ["pytest -q"], parts), str)
+
+
+_FORK_GH = ("#!/bin/sh\necho \"$@\" >> \"$FAKE_GH_LOG\"\n"
+            "if [ -n \"$FAKE_GH_ERR\" ]; then echo \"$FAKE_GH_ERR\" >&2; exit 1; fi\ncat \"$FAKE_GH_JSON\"\n")
+
+
+def _fork_pr(env, monkeypatch, repo, branch="feature-x", cross=True, err="", default="main"):
+    """origin moved to <tmp>/acme/widgets.git and a fork of it at <tmp>/forker/widgets.git (default
+    branch `default`), with a stub gh on PATH answering that `branch`'s open PR has its head on the fork
+    (`cross`) or on origin, or failing with `err`. Returns (upstream, fork, gh log)."""
+    from ttp import prhead
+    tmp = env["tmp"]
+    up, fork = tmp / "acme" / "widgets.git", tmp / "forker" / "widgets.git"
+    up.parent.mkdir()
+    fork.parent.mkdir()
+    _git_out(repo, "clone", "-q", "--bare", _git_out(repo, "remote", "get-url", "origin"), str(up))
+    _git_out(repo, "remote", "set-url", "origin", str(up))
+    _git_out(repo, "clone", "-q", "--bare", str(up), str(fork))
+    _git_out(repo, "push", "-q", str(fork), f"HEAD:refs/heads/{default}")
+    _git_out(fork, "symbolic-ref", "HEAD", f"refs/heads/{default}")
+    bin_, log = tmp / "gh-bin", tmp / "gh.log"
+    bin_.mkdir()
+    (bin_ / "gh").write_text(_FORK_GH)
+    (bin_ / "gh").chmod(0o755)
+    (tmp / "gh.json").write_text(json.dumps({
+        "headRepository": {"name": "widgets"}, "headRepositoryOwner": {"login": "forker" if cross else "acme"},
+        "isCrossRepository": cross, "headRefName": branch, "state": "OPEN",
+        "url": "https://example.com/acme/widgets/pull/7"}))
+    monkeypatch.setenv("PATH", f"{bin_}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_GH_JSON", str(tmp / "gh.json"))
+    monkeypatch.setenv("FAKE_GH_LOG", str(log))
+    monkeypatch.setenv("FAKE_GH_ERR", err)
+    monkeypatch.delenv("TTP_RUN_DIR", raising=False)
+    monkeypatch.setattr(prhead, "_memo", {})
+    return up, fork, log
+
+
+def _pr_fix_task(p, repo, pr, start):
+    """A code task labelled pr_branch:<pr> in a worktree on its own branch, one commit past `start`."""
+    tid = p.db.add_task("Fix the PR", "s", kind="code", labels=[f"pr_branch:{pr}"])
+    own = f"ttp/t{tid}-fix-the-pr"
+    path = repo.parent / f"wt{tid}"
+    _git_out(repo, "worktree", "add", "-q", "-b", own, str(path), start)
+    p.db.update_task(tid, branch=own)
+    _commit(path, f"fix{tid}.txt", "fix\n")
+    return tid, path
+
+
+def _fork_publish(env, monkeypatch, capsys, cross=True, err="", on_origin=False):
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    up, fork, log = _fork_pr(env, monkeypatch, repo, cross=cross, err=err)
+    _git_out(repo, "push", "-q", str(up if on_origin else fork), "HEAD:refs/heads/feature-x")
+    _git_out(repo, "fetch", "-q", "origin")
+    tid, path = _pr_fix_task(p, repo, "feature-x", "HEAD")
+    monkeypatch.chdir(path)
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    rc = _ttp("push", "--own")
+    return p, repo, path, up, fork, log, rc, capsys.readouterr().err, tid
+
+
+def _branch_tip(bare, branch):
+    r = subprocess.run(["git", "-C", str(bare), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+                       capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def test_a_pr_branch_whose_open_pr_has_its_head_on_a_fork_is_pushed_there_and_verified(env, monkeypatch, capsys):
+    """(a) The open PR's head repository is a fork: `ttp push --own` publishes the pr_branch on a remote
+    for the fork (added, origin's URL unchanged), origin gets nothing, and the claimed push (the push's
+    record and the hand-off's line) is confirmed on the fork, not failed on origin."""
+    from ttp import push, pushclaim
+    p, repo, path, up, fork, log, rc, err, tid = _fork_publish(env, monkeypatch, capsys)
+    head = _git_out(path, "rev-parse", "HEAD")
+    assert rc == 0, err
+    assert "has its head on forker/widgets" in err and "ttp-head-forker" in err
+    assert _branch_tip(fork, "feature-x") == head
+    assert _branch_tip(up, "feature-x") == ""
+    assert _git_out(repo, "remote", "get-url", "origin") == str(up)
+    assert _git_out(repo, "remote", "get-url", "ttp-head-forker") == str(fork)
+    assert "pr view feature-x --json" in log.read_text()
+    assert push.resolve(p, path, own=True)[:2] == ("ttp-head-forker", "feature-x")
+    assert len(log.read_text().splitlines()) == 1   # answered once for the process
+    # The push record names the fork's remote; the summary line names the bare branch (origin's).
+    pushes = p.state / "pushes"
+    pushes.mkdir(parents=True, exist_ok=True)
+    (pushes / f"t{tid}-x.json").write_text(json.dumps({
+        "repo": str(path), "remote": "ttp-head-forker", "branch": "feature-x", "target": "ttp-head-forker/feature-x",
+        "status": "pushed", "sha": head, "head": head}))
+    cs = pushclaim.claims(p, p.db.task(tid), {"summary": f"pushed {head[:10]} to feature-x"}, None)
+    cs += [{"marker": f"t{tid}-x.json", "source": "its detached push"}]
+    state, why, _ = pushclaim.check_all(p, cs)
+    assert state == pushclaim.CONFIRMED, why
+    assert "the open PR's head repository" in why
+
+
+def test_a_same_repo_pr_branch_is_pushed_to_origin_as_before(env, monkeypatch, capsys):
+    """(b) The open PR's head is on origin's own repository: the push goes to origin, no remote added."""
+    p, repo, path, up, fork, log, rc, err, _ = _fork_publish(env, monkeypatch, capsys, cross=False, on_origin=True)
+    assert rc == 0, err
+    assert _branch_tip(up, "feature-x") == _git_out(path, "rev-parse", "HEAD")
+    assert "ttp-head" not in _git_out(repo, "remote")
+    assert "pr view feature-x" in log.read_text()
+
+
+@pytest.mark.parametrize("gh_err, said", [
+    ("HTTP 502: Bad Gateway (https://example.com/graphql)", "gh could not answer (HTTP 502"),
+    ("no pull requests found for branch \"feature-x\"", "no open PR has feature-x as its head"),
+])
+def test_a_pr_branch_gh_cannot_place_goes_to_origin_saying_why(env, monkeypatch, capsys, gh_err, said):
+    """(c) gh fails or finds no open PR: origin as before, with the reason on stderr."""
+    p, repo, path, up, fork, log, rc, err, _ = _fork_publish(env, monkeypatch, capsys, err=gh_err, on_origin=True)
+    assert rc == 0, err
+    assert said in err and "pushing to origin as before" in err
+    assert _branch_tip(up, "feature-x") == _git_out(path, "rev-parse", "HEAD")
+    assert _branch_tip(fork, "feature-x") == ""
+    assert "ttp-head" not in _git_out(repo, "remote")
+
+
+@pytest.mark.parametrize("branch", ["main", "master", "trunk"])
+def test_a_fork_heads_main_master_or_default_branch_is_never_pushed(env, monkeypatch, capsys, branch):
+    """(d) A fork PR whose head branch is main, master or the fork's default branch is refused."""
+    from ttp import prhead
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    up, fork, _ = _fork_pr(env, monkeypatch, repo, branch=branch, default="trunk")
+    with pytest.raises(ValueError, match="never pushed this way"):
+        prhead.fork_remote(repo, branch, "origin")
+    if branch == "trunk":   # through `ttp push --own` too
+        tid, path = _pr_fix_task(p, repo, branch, "HEAD")
+        monkeypatch.chdir(path)
+        monkeypatch.setenv("TTP_TASK", str(tid))
+        tip = _branch_tip(fork, branch)
+        assert _ttp("push", "--own") == 2
+        assert "default branch of ttp-head-forker" in capsys.readouterr().err
+        assert _branch_tip(fork, branch) == tip
+
+
+def test_a_fork_pr_branch_head_that_does_not_fast_forward_is_refused(env, monkeypatch, capsys):
+    """(d) No force push: a fork pr_branch that moved past the task's base is not rewritten."""
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    up, fork, _ = _fork_pr(env, monkeypatch, repo)
+    _git_out(repo, "push", "-q", str(fork), "HEAD:refs/heads/feature-x")
+    tid, path = _pr_fix_task(p, repo, "feature-x", "HEAD")
+    other = env["tmp"] / "fork-clone"
+    _git_out(repo, "clone", "-q", "-b", "feature-x", str(fork), str(other))
+    _commit(other, "theirs.txt", "theirs\n")
+    _git_out(other, "push", "-q", "origin", "feature-x")
+    tip = _branch_tip(fork, "feature-x")
+    monkeypatch.chdir(path)
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    assert _ttp("push", "--own") == 2
+    assert "not an ancestor" in capsys.readouterr().err
+    assert _branch_tip(fork, "feature-x") == tip
+
+
+def test_a_hand_pushed_pr_head_on_the_fork_is_verified_there_not_failed(env, monkeypatch, tmp_path):
+    """(e) Replay: the push to origin was refused, the worker pushed the PR's fork head by hand and its
+    done says 'pushed <sha> to <pr_branch>' (read as origin's). The daemon reads the fork, where the
+    commit is the PR's head, and records done with the proof instead of failing the task."""
+    p, d, tid, path, head, _ = _claim_setup(env, monkeypatch, tmp_path,
+                                            {"status": "done", "summary": "pushed {head} to feature-x"})
+    p.db.x("UPDATE tasks SET labels=? WHERE id=?", ('["pr_branch:feature-x"]', tid))
+    up, fork, log = _fork_pr(env, monkeypatch, env["repo"])
+    _git_out(path, "push", "-q", str(fork), "HEAD:refs/heads/feature-x")
+    run = p.db.one("SELECT id FROM runs WHERE task=? ORDER BY id DESC", (tid,))["id"]
+    pushes = p.state / "pushes"   # its own `ttp push` to origin, refused before the push by hand
+    pushes.mkdir(parents=True, exist_ok=True)
+    (pushes / f"t{tid}-refused.json").write_text(json.dumps({
+        "run": run, "head": head, "remote": "origin", "branch": "feature-x", "target": "origin/feature-x",
+        "status": "failed", "exit": 6}))
+    _settle_probe(d, tid)
+    d.verify_pushes()
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert task["status"] == "done", (task["status"], res)
+    assert "the open PR's head repository" in res["summary"]
+    assert "pr view feature-x" in log.read_text()
