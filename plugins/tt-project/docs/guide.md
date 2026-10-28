@@ -633,7 +633,9 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   hand-off's `on_pass_cmd` decides model-free, else the task wakes at once at its own tier with that
   output; a `start_when` on it raises `deferral_job_failed` instead of starting. Other probes on it (a `when:` hold, an `until_probe`, a pause or mute `end_when`, a machine change's `--until-probe`) take 4 as over and say the job failed. `ttp detach` records what the job asks for (`--cores`, `--devices`,
   `--mem-gb`, else `-j N`-style flags in its command); the daemon samples the CPU time of the job's own
-  process tree (Linux /proc, macOS ps; device files from `device.nodes` on Linux), and a job using under
+  process tree (Linux /proc, macOS ps; device files from `device.nodes` on Linux) plus, on Linux, the
+  cgroup CPU of docker containers the daemon's user can see that started after the job did (no docker,
+  or unreadable: the tree alone), and a job using under
   a quarter of its cores, or none of a held device, for `waiting.job_use.window_s` raises one
   `job_underuse` event and brings its task's next check within `check_cap_s`. `ttp status` and the web
   app show requested vs used per job ("unmeasured" where it cannot sample). Each local job's record in

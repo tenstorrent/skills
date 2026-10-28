@@ -11,7 +11,12 @@ holding a device lock (`device.locks`) asks for the device too.
 The daemon samples each running job of a live task, model-free, every `sample_s`: the CPU time of
 the job's own process tree (its wrapper's pid in <name>.started and that pid's descendants; Linux
 /proc, macOS ps over the wrapper's process group) and, with `device.nodes` globs set (Linux), the
-device nodes the tree holds open. Nothing outside the job's tree is measured. Averaged over
+device nodes the tree holds open. Docker containers run outside that tree (their processes hang under
+the container runtime's shim), so on Linux the CPU of each running container the daemon's user can
+see (`docker ps`) that started after the job's root process is counted too, read from the container's
+cgroup (else its init process's tree). A container that ends keeps its last reading in the job's
+total. Containers started by other work after the job began also count: that can hide under-use,
+never invent it. Without docker, or when it cannot be read, only the tree counts. Averaged over
 `window_s`, cores used under `under_frac` of the request, or a requested device that no process of
 the job held open for the whole window, is under-use: the stretch is recorded on the task (kv
 `job_use`, shown by `ttp status` and the web app), raises one `job_underuse` event per stretch, and
@@ -23,6 +28,7 @@ from __future__ import annotations
 import glob
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -136,6 +142,90 @@ def _clock(s: str) -> float:
     return total + (int(days) * 86400 if days else 0)
 
 
+def _cpu(pid: int, hz: float) -> float:
+    f = _stat(pid)   # utime, stime, cutime, cstime: reaped children count in their parent
+    return sum(int(x) for x in f[11:15]) / hz if f else 0.0
+
+
+def _hz() -> float:
+    return os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+
+
+def containers(timeout: float = 10) -> list[dict] | None:
+    """Running docker containers the daemon's user can see: [{"id", "pid"}] (short id, init pid on this
+    host). [] where docker is absent or this is not Linux; None when docker is there but cannot be
+    read (no permission, its daemon down or hung)."""
+    if not Path("/proc/self/stat").exists() or not shutil.which("docker"):
+        return []
+    try:
+        ps = subprocess.run(["docker", "ps", "-q", "--no-trunc"], capture_output=True, text=True,
+                            timeout=timeout, stdin=subprocess.DEVNULL)
+        if ps.returncode:
+            return None
+        ids = ps.stdout.split()
+        if not ids:
+            return []
+        # A container that ended between the two calls makes inspect exit non-zero: the rest still print.
+        out = subprocess.run(["docker", "inspect", "--format", "{{.Id}} {{.State.Pid}}", *ids],
+                             capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found = []
+    for row in out.splitlines():
+        f = row.split()
+        if len(f) == 2 and f[1].isdigit() and int(f[1]) > 0:
+            found.append({"id": f[0][:12], "pid": int(f[1])})
+    return found
+
+
+def _cgroup_cpu(pid: int) -> float | None:
+    """CPU seconds of the cgroup `pid` runs in (cgroup v2 cpu.stat, else v1 cpuacct), None if unreadable."""
+    try:
+        rows = Path(f"/proc/{pid}/cgroup").read_text().splitlines()
+    except OSError:
+        return None
+    for row in rows:
+        num, ctrl, path = (row.split(":", 2) + ["", ""])[:3]
+        if num == "0" and ctrl == "":
+            try:
+                for kv in Path(f"/sys/fs/cgroup{path}/cpu.stat").read_text().splitlines():
+                    if kv.startswith("usage_usec "):
+                        return int(kv.split()[1]) / 1e6
+            except (OSError, ValueError):
+                pass
+        elif "cpuacct" in ctrl.split(","):
+            for mount in (ctrl, "cpuacct", "cpu,cpuacct"):
+                try:
+                    return int(Path(f"/sys/fs/cgroup/{mount}{path}/cpuacct.usage").read_text()) / 1e9
+                except (OSError, ValueError):
+                    continue
+    return None
+
+
+def container_cpu(ctrs: list | None, start) -> dict:
+    """CPU seconds so far of each container in `ctrs` (from containers()) whose init process started at
+    or after `start`, the job root's start (/proc clock ticks since boot): id -> seconds. A container
+    started before the job is not its work. Read from the container's cgroup, which also holds what
+    `docker exec` runs; else the init process's tree."""
+    try:
+        since = int(start)
+    except (TypeError, ValueError):
+        return {}
+    out = {}
+    for c in ctrs or []:
+        st = _stat(c["pid"])
+        try:
+            if not st or int(st[19]) < since:
+                continue
+        except ValueError:
+            continue
+        cpu = _cgroup_cpu(c["pid"])
+        if cpu is None:
+            cpu = sum(_cpu(q, _hz()) for q in _tree(c["pid"]) or [])
+        out[c["id"]] = round(cpu, 2)
+    return out
+
+
 def sample(pid: int, nodes: list | None = None) -> dict | None:
     """The job tree's CPU seconds so far (`cpu`), its root's start (`start`, to tell a reused pid) and,
     with device globs on Linux, how many device nodes it holds open (`dev`, else None). None when
@@ -146,12 +236,10 @@ def sample(pid: int, nodes: list | None = None) -> dict | None:
         if not st or not pids:
             return None
         cpu, dev = 0.0, set() if nodes else None
-        hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+        hz = _hz()
         wanted = {os.path.realpath(x) for g in nodes or [] for x in glob.glob(g)}
         for q in pids:
-            f = _stat(q)
-            if f:   # utime, stime, cutime, cstime: reaped children count in their parent
-                cpu += sum(int(x) for x in f[11:15]) / hz
+            cpu += _cpu(q, hz)
             if dev is not None:
                 try:
                     for fd in Path(f"/proc/{q}/fd").iterdir():
@@ -188,9 +276,11 @@ def sample(pid: int, nodes: list | None = None) -> dict | None:
 def assess(state: dict | None, got: dict | None, req: dict, now: float, s: dict) -> tuple[dict, bool]:
     """Fold one sample into a job's state; True when an under-use stretch begins (fire once).
 
+    got: `cpu` (the tree's), `start`, `dev` and optionally `ctr` (container_cpu()), whose CPU adds in.
     state: `ring` of [t, cpu] over the last window, `start` (root's start), `used` (cores, window
     average), `dev_seen` (last time a device node was open), `since` (first sample), `under`
-    (the stretch's start or absent), `why`, `unmeasured`."""
+    (the stretch's start or absent), `why`, `unmeasured`, `ctr` (last container readings) and
+    `ctr_done` (CPU of the job's containers that ended, kept so the total never drops)."""
     st = dict(state or {})
     if got is None:
         st.update(unmeasured=True, ring=[])
@@ -198,17 +288,31 @@ def assess(state: dict | None, got: dict | None, req: dict, now: float, s: dict)
         return st, False
     win = s["window_s"]
     ring = st.get("ring") or []
-    if st.get("start") != got["start"] or (ring and (now - ring[-1][0] > win or got["cpu"] < ring[-1][1])):
+    ctr = {k: float(v) for k, v in (got.get("ctr") or {}).items()}
+
+    def total(st: dict) -> tuple[float, float]:
+        last = st.get("ctr") or {}
+        done = float(st.get("ctr_done") or 0) + sum(float(v) for k, v in last.items() if k not in ctr)
+        return got["cpu"] + done + sum(ctr.values()), done
+
+    cpu, done = total(st)
+    if st.get("start") != got["start"] or (ring and (now - ring[-1][0] > win or cpu < ring[-1][1])):
         ring, st = [], {}   # a new process under that pid, a long gap (host asleep) or a lost tree: start over
+        cpu, done = total(st)
+    if ctr or done:
+        st.update(ctr=ctr, ctr_done=round(done, 2))
+    else:
+        st.pop("ctr", None)
+        st.pop("ctr_done", None)
     st.pop("unmeasured", None)
     st.setdefault("since", now)
     st["start"] = got["start"]
-    ring = [r for r in ring if now - r[0] <= win + 2 * s["sample_s"]] + [[now, got["cpu"]]]
+    ring = [r for r in ring if now - r[0] <= win + 2 * s["sample_s"]] + [[now, cpu]]
     st["ring"] = ring
     full = [r for r in ring if now - r[0] >= win]
     base = full[-1] if full else None
     if base and now > base[0]:
-        st["used"] = round((got["cpu"] - base[1]) / (now - base[0]), 2)
+        st["used"] = round((cpu - base[1]) / (now - base[0]), 2)
     if got.get("dev"):
         st["dev_seen"] = now
     if got.get("dev") is not None:

@@ -727,6 +727,7 @@ class Daemon:
         self._probes: dict[int, tuple[subprocess.Popen, float, str]] = {}   # running: proc, started, probe
         self._probed: dict[int, float] = {}
         self._jobs_sampled = 0.0   # sample_jobs' last pass
+        self._docker_off_until = 0.0   # sample_jobs skips docker until then after it could not be read
         self._ends = ends.Ends(self.p, log=lambda m: log(self.p, m))   # temporary instructions' end conditions
         self._pause_ends = pauseends.PauseEnds(self.p, log=lambda m: log(self.p, m))   # resource pauses' ends
         self._mute_ends = pauseends.MuteEnds(self.p, log=lambda m: log(self.p, m))   # observation mutes' end_when
@@ -8827,6 +8828,20 @@ class Daemon:
         db = self.p.db
         nodes = [str(x) for x in (self.cfg.get("device") or {}).get("nodes") or []]
         old, new = db.kv(jobuse.KV, {}) or {}, {}
+        ctrs = None   # docker containers, read once per pass and only when a job runs
+
+        def with_containers(got: dict | None) -> dict | None:
+            nonlocal ctrs
+            if not got:
+                return got
+            if ctrs is None:
+                ctrs = [] if now < self._docker_off_until else jobuse.containers()
+                if ctrs is None:   # docker there but unreadable: the tree alone counts; retry later
+                    ctrs, self._docker_off_until = [], now + 900
+            if ctrs:
+                got["ctr"] = jobuse.container_cpu(ctrs, got.get("start"))
+            return got
+
         for t in db.q("SELECT * FROM tasks WHERE status IN ('queued','running')"):
             for r in db.q("SELECT dir FROM runs WHERE task=? AND dir IS NOT NULL AND started>? ORDER BY id DESC",
                           (t["id"], now - 7 * 86400)):
@@ -8839,7 +8854,8 @@ class Daemon:
                         req["devices"] = 1   # the task holds the device while the job runs
                     pid = jobuse.root_pid(j)
                     was = old.get(str(rc)) or {}
-                    st, fire = jobuse.assess(was.get("st"), jobuse.sample(pid, nodes) if pid else None, req, now, s)
+                    got = with_containers(jobuse.sample(pid, nodes)) if pid else None
+                    st, fire = jobuse.assess(was.get("st"), got, req, now, s)
                     entry = {"task": t["id"], "name": j["name"], "req": req, "st": st, "line": jobuse.line(req, st)}
                     if was.get("pulled") and was.get("pulled") == st.get("under"):
                         entry["pulled"] = was["pulled"]
