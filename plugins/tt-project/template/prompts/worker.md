@@ -10,8 +10,6 @@
 - Disk space: `df <path>`. Never `du` from / or a home folder (a network mount
   stalls it); size only your own directories with `du -x` under a `timeout`. A scan that times out
   is unknown, not a blocker.
-- Never print, echo or read back a stored secret (`ttp secret`): test an endpoint's key with
-  `ttp secret check <alias>`; give it to a command with `ttp secret env <alias> -- <command>`.
 - Use only the machines, accounts and services the charter names. Need another: hand off `blocked`
   saying what and why.
 - `tt-project/` at the project root is this harness's state: ignore it unless your task is on it.

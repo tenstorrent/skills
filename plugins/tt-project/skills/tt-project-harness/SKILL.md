@@ -155,6 +155,14 @@ read the one for the lever you change.
   `blocked`. A hand-off is done only once the consumer acknowledged it and recovered.
 - See "Liveness, progress and deploys" in `docs/design.md`.
 
+## Stored secrets never reach tool output
+
+- Never print, echo or read back a value saved with `ttp secret` (no `credentials()` or secrets-store
+  read in an ad-hoc command): the output stays in the run's log and transcript. The Bash hook refuses
+  such reads.
+- Test an endpoint's key with `ttp secret check <alias>` (reachable, auth ok or auth failed). Give
+  it to a command with `ttp secret env <alias> -- <command>` (`OPENAI_API_KEY`, `OPENAI_BASE_URL`).
+
 ## CPU-only runs never open a device
 
 - The daemon sets `TTP_NO_DEVICE=1` for a task run that holds no device (not tagged `needs_device`,
