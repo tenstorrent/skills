@@ -344,7 +344,8 @@ class PrCycle:
         if left <= 0 or (run is not None and run.stopping.is_set()):
             return None
         host = [] if batch["host"] == "github.com" else ["--hostname", batch["host"]]
-        self.spawned += 1
+        with self._lock:
+            self.spawned += 1
         res = _spawn(["api", "graphql", *host, "-f", f"query={query}", "-f", f"owner={batch['owner']}",
                       "-f", f"name={batch['name']}", *more], left, cwd, run)
         batch["timed_out"] |= bool(res is not None and res.timed_out)

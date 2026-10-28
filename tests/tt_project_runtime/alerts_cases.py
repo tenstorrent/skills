@@ -1866,6 +1866,207 @@ def test_a_daemon_stop_mid_pass_kills_pr_watchs_gh_and_starts_no_more(env, monke
     assert not p.db.kv("pr_signatures"), "the killed reads saved no result"
 
 
+def _gql_node(n: int, *, state="OPEN", draft=True, decision=None, checks=(("build", "COMPLETED", "SUCCESS"),),
+              comments=(), reviews=(), threads=()) -> dict:
+    """One PR as GitHub's GraphQL holds it, for the fake gh below (whole connections, unpaged)."""
+    who = lambda login: {"__typename": "Bot" if login.endswith("[bot]") else "User", "login": login}
+    return {"state": state, "isDraft": draft, "mergeable": "MERGEABLE", "reviewDecision": decision,
+            "url": f"https://github.com/acme/widgets/pull/{n}", "title": f"t{n}", "headRefOid": HEAD,
+            "headRefName": f"b{n}", "author": who("dev"),
+            "comments": [{"author": who(a), "body": b, "createdAt": f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}Z",
+                          "url": f"c{n}-{i}"} for i, (a, b) in enumerate(comments)],
+            "reviews": [{"id": f"R{n}-{i}", "author": who(a), "state": st, "body": b, "submittedAt": "2026-01-02",
+                         "url": f"r{n}-{i}", "comments": {"totalCount": len(inl), "nodes": [
+                             {"author": who(x), "body": y} for x, y in inl]}}
+                        for i, (a, st, b, inl) in enumerate(reviews)],
+            "reviewThreads": {"nodes": [{"isResolved": res, "isOutdated": False, "path": "f.py", "comments": {
+                "nodes": [{"author": who(a), "body": b, "url": f"t{n}-{i}"}]}} for i, (a, b, res) in enumerate(threads)]},
+            "checks": [{"__typename": "CheckRun", "name": c, "status": s, "conclusion": k} for c, s, k in checks]}
+
+
+class _BatchGh:
+    """A fake gh (boundedchild.run) over _gql_node PRs that records each invocation. It answers `gh pr view
+    --json` as gh does (a null review decision as "", reviews without inline comments), BOT_QUERY, and the
+    batched query, 100 nodes a page. `fail` answers each GraphQL query: None, "hang", or (rc, stderr)."""
+
+    def __init__(self, prs: dict):
+        self.prs, self.calls, self.fail = prs, [], None
+
+    def _page(self, items: list, after: str | None) -> dict:
+        start = int(after or 0)
+        return {"pageInfo": {"hasNextPage": start + 100 < len(items), "endCursor": str(start + 100)},
+                "nodes": items[start:start + 100]}
+
+    def _gql(self, pr: dict, after: str | None = None, only: str | None = None) -> dict:
+        out = {k: v for k, v in pr.items() if k not in ("comments", "reviews", "checks")}
+        for k in ("comments", "reviews"):
+            out[k] = self._page(pr[k], after if only == k else None)
+        out["commits"] = {"nodes": [{"commit": {"statusCheckRollup": {"contexts": self._page(
+            pr["checks"], after if only == "contexts" else None)}}}]}
+        return out
+
+    def __call__(self, argv, timeout, **kw):
+        from ttp import boundedchild, watchers
+        a = argv[1:]
+        self.calls.append(a)
+        ok = lambda body: boundedchild.Result(0, json.dumps(body), "")
+        if a[:2] == ["pr", "view"]:
+            pr = self.prs.get(int(a[2].rsplit("/", 1)[1]))
+            if pr is None:
+                return boundedchild.Result(1, "", "GraphQL: Could not resolve to a PullRequest")
+            view = {"state": pr["state"], "isDraft": pr["isDraft"], "mergeable": pr["mergeable"],
+                    "reviewDecision": pr["reviewDecision"] or "", "statusCheckRollup": pr["checks"],
+                    "comments": [{"author": {"login": c["author"]["login"]}, "body": c["body"]} for c in pr["comments"]],
+                    "reviews": [{k: v for k, v in r.items() if k != "comments"} for r in pr["reviews"]],
+                    **{k: pr[k] for k in ("url", "title", "author", "headRefOid", "headRefName")}}
+            return ok({k: view[k] for k in a[4].split(",")})
+        if self.fail == "hang":
+            return boundedchild.Result(None, "", "", timed_out=True, error=f"timed out after {timeout} s")
+        if self.fail:
+            return boundedchild.Result(self.fail[0], "", self.fail[1])
+        q = next(x for x in a if x.startswith("query="))[6:]
+        vals = dict(x.split("=", 1) for x in a if "=" in x and not x.startswith("query="))
+        if q == watchers.BOT_QUERY:
+            pr = self.prs[int(vals["number"])]
+            return ok({"data": {"repository": {"pullRequest": {
+                "comments": {"nodes": pr["comments"][-100:]}, "reviews": {"nodes": pr["reviews"][-100:]},
+                "reviewThreads": pr["reviewThreads"]}}}})
+        if "$after" in q:
+            only = re.search(r"(comments|reviews|contexts)\(first:100,after", q).group(1)
+            return ok({"data": {"repository": {"pullRequest": self._gql(self.prs[int(vals["number"])],
+                                                                         vals["after"], only)}}})
+        repo = {f"p{i}": self._gql(self.prs[int(n)]) if int(n) in self.prs else None
+                for i, n in re.findall(r"p(\d+):pullRequest\(number:(\d+)\)", q)}
+        return boundedchild.Result(0 if all(repo.values()) else 1, json.dumps({"data": {"repository": repo}}), "")
+
+
+def _pr_batch_setup(env, monkeypatch, prs: dict):
+    from ttp import boundedchild
+    p = make(env)
+    for n in prs:
+        p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
+               ("t", "code", "done", f"https://github.com/acme/widgets/pull/{n}", time.time()))
+    gh = _BatchGh(prs)
+    monkeypatch.setattr(boundedchild, "run", gh)
+    return p, gh
+
+
+@pytest.mark.parametrize("n", [5, 12])
+def test_pr_watch_makes_one_gh_call_per_repo_per_poll_and_the_cycle_reuses_it(env, monkeypatch, n):
+    """A poll over N open PRs of one repo runs gh once (a batched GraphQL query), not twice per PR (view,
+    then findings) as per-PR reads do; a second consumer in the same cycle runs gh no more."""
+    from ttp import watchers
+    from ttp.daemon import Daemon
+    p, gh = _pr_batch_setup(env, monkeypatch, {i: _gql_node(i) for i in range(1, n + 1)})
+    d = Daemon(p.base)
+    with monkeypatch.context() as m:   # per-PR reads, as before batching: 2 gh calls a PR
+        m.setattr(watchers.PrCycle, "plan", lambda self, urls: None)
+        assert watchers.watch_prs(d).startswith(f"ok ({n} PRs")
+    assert len(gh.calls) == 2 * n, gh.calls
+    gh.calls.clear()
+    with watchers.pr_cycle():
+        assert watchers.watch_prs(d).startswith(f"ok ({n} PRs")
+        assert len(gh.calls) == 1 and gh.calls[0][:2] == ["api", "graphql"], gh.calls
+        url = "https://github.com/acme/widgets/pull/3"
+        assert watchers._gh(["pr", "view", url, "--json", "state,isDraft,headRefOid"], str(p.root)) == \
+            {"state": "OPEN", "isDraft": True, "headRefOid": HEAD}
+        assert watchers.watch_prs(d).startswith(f"ok ({n} PRs")
+        assert len(gh.calls) == 1, "a second consumer in the cycle reads the cached answers"
+    assert watchers.watch_prs(d).startswith(f"ok ({n} PRs") and len(gh.calls) == 2, "the next poll reads afresh"
+
+
+def test_pr_watch_batched_reads_find_what_per_pr_reads_find(env, monkeypatch):
+    """Mixed PRs over two polls (draft or ready, CI failing, bot findings open or resolved, an inline-only
+    wrapper review, a null review decision, a merge, a PR gone, over 100 comments): the batched read records
+    the same signatures, findings and events as per-PR gh reads."""
+    from ttp import prguard, watchers
+    from ttp.daemon import Daemon
+    many = [("dev2", f"note {i}") for i in range(130)]
+    first = {1: _gql_node(1),
+             2: _gql_node(2, draft=False, checks=(("build", "COMPLETED", "FAILURE"), ("lint", "IN_PROGRESS", None))),
+             3: _gql_node(3, threads=[("rev[bot]", "nit: rename x", False)]),
+             4: _gql_node(4, decision="CHANGES_REQUESTED", comments=[("dev2", "why?"), ("ci[bot]", "coverage down")],
+                          reviews=[("dev2", "COMMENTED", "", [("lint[bot]", "style")]),
+                                   ("dev3", "CHANGES_REQUESTED", "please fix", [])]),
+             5: _gql_node(5, checks=[(f"job{i}", "COMPLETED", "SUCCESS") for i in range(105)]),
+             6: _gql_node(6, comments=many)}
+    second = {**first, 1: _gql_node(1, draft=False), 3: _gql_node(3, threads=[("rev[bot]", "nit: rename x", True)]),
+              5: _gql_node(5, state="MERGED"), 6: _gql_node(6, comments=many + [("dev3", "lgtm")])}
+    p, gh = _pr_batch_setup(env, monkeypatch, dict(first))
+    top = p.db.one("SELECT MAX(id) AS n FROM tasks")["n"]
+    p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
+           ("t", "code", "done", "https://github.com/acme/widgets/pull/7", time.time()))   # gone on GitHub
+    top += 1
+    keys = ("pr_signatures", prguard.UNAPPROVED_KEY, prguard.FINDINGS_KEY, prguard.HEADS_KEY,
+            prguard.DRAFT_SEEN_KEY, watchers.PR_TRIED_KEY, prguard.PREDATES_KEY, prguard.APPROVALS_KEY)
+    got = []
+    for batched in (False, True):
+        p.db.x(f"DELETE FROM kv WHERE key IN ({','.join('?' * len(keys))})", keys)
+        p.db.x("DELETE FROM events")
+        p.db.x("DELETE FROM tasks WHERE id > ?", (top,))
+        gh.calls.clear()
+        with monkeypatch.context() as m:
+            if not batched:
+                m.setattr(watchers.PrCycle, "plan", lambda self, urls: None)
+            for prs in (first, second):
+                gh.prs.clear()
+                gh.prs.update(prs)
+                watchers.watch_prs(Daemon(p.base))
+        new = lambda mt: "#new" if int(mt.group(1)) > top else mt.group(0)
+        events = sorted((e["kind"], e["task"], e["severity"], re.sub(r"#(\d+)", new, e["text"]))
+                        for e in p.db.q("SELECT * FROM events WHERE source='pr'"))
+        findings = {k: {**r, "owner": r["owner"] and "#new"} for k, r in p.db.kv(prguard.FINDINGS_KEY).items()}
+        got.append((p.db.kv("pr_signatures"), findings, events, p.db.kv(prguard.HEADS_KEY).keys()))
+        if batched:
+            assert len(gh.calls) == 2 + 2 * 1 + 1, gh.calls   # a query a poll, 130 comments twice, 105 checks once
+    assert got[0] == got[1]
+    sigs, findings, events, _ = got[1]
+    kinds = {k for k, *_ in events}
+    assert {"pr_findings", "pr_changed", "pr_ready_by_user"} <= kinds, events
+    assert sigs["https://github.com/acme/widgets/pull/6"]["n_human"] == 131
+    assert sigs["https://github.com/acme/widgets/pull/2"]["checks"] == "pending"
+    assert sigs["https://github.com/acme/widgets/pull/5"]["state"] == "MERGED"
+    assert sigs["https://github.com/acme/widgets/pull/4"]["decision"] == "CHANGES_REQUESTED"
+    assert sigs["https://github.com/acme/widgets/pull/1"]["decision"] == ""
+    assert "https://github.com/acme/widgets/pull/7" not in sigs
+
+
+@pytest.mark.parametrize("fail, per_pr", [("hang", False), ((1, "gh: API rate limit exceeded"), False),
+                                           ((1, "HTTP 401: Bad credentials"), False), ((1, "gh: boom"), True)])
+def test_a_failed_batched_read_fails_its_prs_or_lets_each_ask_gh(env, monkeypatch, fail, per_pr):
+    """A batched read that times out, or is refused (rate limit, auth), fails each of its PRs as per-PR
+    calls would, with no gh call per PR: a timeout reports them cut by the call timeout, a refusal reads
+    them as gh errors. Any other failure lets each PR ask gh itself, as before batching."""
+    from ttp import watchers
+    from ttp.daemon import Daemon
+    p, gh = _pr_batch_setup(env, monkeypatch, {i: _gql_node(i) for i in range(1, 6)})
+    gh.fail = fail
+    status = watchers.run_builtin(Daemon(p.base), "prs", {"deadline_s": 60, "gh_timeout_s": 5})
+    if per_pr:
+        assert status == "ok (5 PRs, 5 changed)" and len(gh.calls) == 1 + 5 * 2, (status, gh.calls)
+        assert set(p.db.kv("pr_signatures")) == {f"https://github.com/acme/widgets/pull/{i}" for i in range(1, 6)}
+        return
+    assert len(gh.calls) == 1, gh.calls
+    assert not p.db.kv("pr_signatures")
+    if fail == "hang":
+        assert status.startswith("cut short (0 of 5") and "acme/widgets#1 (5 s gh call timeout)" in status, status
+    else:
+        assert status == "ok (5 PRs, 0 changed)", status
+
+
+def test_pr_watch_batches_per_repo_in_chunks(env, monkeypatch):
+    """PRs of two repos are read one query per repo, PR_BATCH PRs a query."""
+    from ttp import boundedchild, watchers
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(watchers, "PR_BATCH", 3)
+    p, gh = _pr_batch_setup(env, monkeypatch, {i: _gql_node(i) for i in range(1, 8)})
+    p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
+           ("t", "code", "done", "https://github.com/acme/gadgets/pull/1", time.time()))
+    assert watchers.watch_prs(Daemon(p.base)).startswith("ok (8 PRs")
+    repos = sorted(next(x for x in c if x.startswith("name=")) for c in gh.calls)
+    assert repos == ["name=gadgets"] + ["name=widgets"] * 3, gh.calls
+
+
 
 def test_the_global_cap_alert_clears_by_itself_at_the_day_reset(env, tmp_path, monkeypatch):
     p, other = _global_cap_setup(env, tmp_path)
