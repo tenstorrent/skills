@@ -22,9 +22,9 @@ episode, "no live owner is left", when the newest owner's clock runs out. An own
 ask (a hold anchored on it, `waits:ask:<id>`, or an open ask naming it as #<id> while it is blocked or
 waiting) is covered by that ask: never late while the ask is open, and its clock restarts when the ask is
 resolved (`ask_end`). An owner asleep by design on a model-free wake (_asleep: a waiting hand-off's
-retry_when, a deferral's start_when or a start_after still ahead, with a recorded reason) is covered the
-same way while that wait lasts: its clock restarts from the wake (`sleep_end`: the start_after time, else
-the check that saw it wake). Not covered: a probe on its own `ttp detach` job or an owner with a live job
+retry_when while its not_before is ahead, a deferral's start_when or a start_after still ahead, with a
+recorded reason) is covered the same way while that wait lasts: its clock restarts from the wake
+(`sleep_end`: the start_after time, else the check that saw it wake). Not covered: a probe on its own `ttp detach` job or an owner with a live job
 (the job rule above governs), a woken wait, a start_when whose last answer is broken or passed, a probe
 naming a missing, failed or cancelled task, and a wait older than coordinator.defer_max_days. Milestones
 raise whatever the owners do. The harness records the evidence as given: checking it stays with the owner.
@@ -479,11 +479,15 @@ def _asleep(db, t, now: float, max_s: float, gates: dict) -> tuple[str, float | 
     from . import detach, ends
     from .db import deferral, load_result
     from .sweepskip import _dead_refs
-    if t["status"] == "waiting":
-        prev = load_result(t["result"])
+    if t["status"] != "queued":
+        return None
+    prev = load_result(t["result"])
+    if prev.get("status") == "waiting" and not deferral(t).get("when"):
+        # A waiting hand-off is stored queued; probe_waiting keeps not_before ahead while its probe says
+        # not yet and brings it to now once the probe passes (or its timer runs out): then it is due.
         probe = prev.get("retry_when")
         if prev.get("woke") or not isinstance(probe, str) or not probe.strip() or detach.CHECK_RE.search(probe) \
-                or not (prev.get("waiting_for") or t["blocked_reason"]):
+                or not (prev.get("waiting_for") or t["blocked_reason"]) or float(t["not_before"] or 0) <= now:
             return None
         try:
             since = float(prev["waiting_since"])
@@ -492,8 +496,6 @@ def _asleep(db, t, now: float, max_s: float, gates: dict) -> tuple[str, float | 
         if now - since >= max_s or _dead_refs(db, t, probe):
             return None
         return f"retry_when `{probe.strip()[:120]}`", None
-    if t["status"] != "queued":
-        return None
     d = deferral(t)
     if not (d.get("why") or t["blocked_reason"]):
         return None
@@ -533,7 +535,7 @@ def _owner_cover(db, obs, now: float | None = None, cfg=None, jobs=()) -> dict[s
             linked = [a["id"] for a in asks if a["id"] == held] + [a["id"] for a in waits.asks_for(int(tid), asks)]
             if linked:
                 out[tid] = ("ask", str(linked[0]))
-        if tid not in out and tid not in jobs and t["status"] in ("waiting", "queued"):
+        if tid not in out and tid not in jobs and t["status"] == "queued":
             gates = (db.kv(startgate.KEY, {}) or {}) if gates is None else gates
             try:
                 sleep = _asleep(db, t, now, _max_sleep_s(cfg), gates)

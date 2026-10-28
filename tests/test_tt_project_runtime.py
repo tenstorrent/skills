@@ -41989,7 +41989,8 @@ def _ob_sleep(p, tid, now, kind, probe=None):
     wake = now + QUOTA_RESET_H * 3600
     if kind == "retry_when":
         probe = probe or f'test "$(date +%s)" -ge {int(wake)}'
-        p.db.update_task(tid, status="waiting", not_before=now + 900,
+        # The daemon's shape (#4078): queued, not_before ahead while the probe says not yet.
+        p.db.update_task(tid, status="queued", not_before=wake,
                          blocked_reason="waiting for an external quota reset; its probe says not yet",
                          result=dump_result({"status": "waiting", "waiting_for": "an external quota reset",
                                              "retry_when": probe, "waiting_since": now + 600}))
@@ -42023,14 +42024,12 @@ def test_obligation_owner_asleep_on_a_model_free_wake_is_not_stalled(env, monkey
 @pytest.mark.parametrize("kind", ["retry_when", "start_after", "start_when"])
 def test_obligation_owner_stalls_again_two_hours_after_its_wake(env, monkeypatch, kind):
     from ttp import obligations as ob, startgate
-    from ttp.db import load_result, dump_result
     p, d, now, tid, check = _ob_setup(env, monkeypatch)
     oid = ob.add(p, "the benchmark table", [tid], now=now)
     wake = _ob_sleep(p, tid, now, kind)
     assert check(now + 3 * 3600) == []
-    if kind == "retry_when":     # the probe passed: the daemon woke it and it went back to the queue
-        p.db.update_task(tid, status="queued",
-                         result=dump_result({**load_result(p.db.task(tid)["result"]), "woke": "probe passed"}))
+    if kind == "retry_when":     # the probe passed: _probe_passed makes it due now, still queued, no `woke`
+        p.db.update_task(tid, not_before=wake)
     elif kind == "start_when":   # its start_when passed: it starts
         startgate.record(p.db, tid, "test -e /nonexistent/quota-reset", 0, "passed", wake)
     seen = wake if kind == "start_after" else wake + 300   # a start_after's wake is known; else the check that saw it
@@ -42040,6 +42039,27 @@ def test_obligation_owner_stalls_again_two_hours_after_its_wake(env, monkeypatch
     evs = check(seen + ob.CLOCK_S + 60)
     assert [e["fingerprint"] for e in evs] == [f"obligation:{oid}:1"] and f"#{tid} (running)" in evs[0]["text"], \
         "two hours after the wake with no progress raise again"
+
+
+def test_obligation_retry_when_owner_queued_for_a_slot_after_its_probe_passed_stalls(env, monkeypatch):
+    """The daemon's waiting shape (#4078: queued, result.status waiting, retry_when, waiting_since,
+    waiting_for): quiet past 2 h while not_before is ahead; once the probe passes (not_before brought to
+    now, no `woke` key) and it sits queued for a slot, it raises 2 h after that."""
+    from ttp import obligations as ob
+    from ttp.db import load_result
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the benchmark table", [tid], now=now)
+    _ob_sleep(p, tid, now, "retry_when")
+    t = p.db.task(tid)
+    assert t["status"] == "queued" and load_result(t["result"])["status"] == "waiting"
+    assert check(now + 2.1 * 3600) == [] and check(now + 4 * 3600) == []
+    passed = now + 4.5 * 3600   # before its scheduled wake: the probe passed early
+    p.db.update_task(tid, not_before=passed)
+    assert "woke" not in load_result(p.db.task(tid)["result"])
+    assert check(passed + 60) == []
+    assert check(passed + 60 + ob.CLOCK_S - 120) == []
+    evs = check(passed + 60 + ob.CLOCK_S + 60)
+    assert [e["fingerprint"] for e in evs] == [f"obligation:{oid}:1"], "2 h after the probe passed it raises"
 
 
 def test_obligation_start_after_wake_counts_from_the_wake_not_the_next_check(env, monkeypatch):
@@ -42089,7 +42109,7 @@ def test_obligation_owner_not_asleep_by_design_still_stalls(env, monkeypatch, ca
         _ob_sleep(p, tid, now, "retry_when")
         p.db.update_task(tid, result=dump_result({**load_result(p.db.task(tid)["result"]), "woke": "probe broken: exit 2"}))
     elif case == "no_reason":
-        p.db.update_task(tid, status="waiting", result=dump_result(
+        p.db.update_task(tid, status="queued", not_before=now + 6 * 3600, result=dump_result(
             {"status": "waiting", "retry_when": "false", "waiting_since": now + 600}))
     elif case == "own_job_probe":
         _ob_sleep(p, tid, now, "retry_when", probe="ttp detach --check /tmp/run/bench")
