@@ -2910,6 +2910,8 @@ def cmd_checks(a) -> None:
                 checkwall.record_timeout(p.state, os.environ.get("TTP_TASK"), timed_out)
             elif executed:
                 checkwall.record_run(p.state, time.time() - ran_since, passed)
+                # A completed run no longer reports the task's old wall-time timeout (TIMEOUTS entry).
+                checkwall.clear_timeout(p.state, os.environ.get("TTP_TASK"))
         if slot and not passed:
             slot.close()
         # A check host ssh could not reach (or that could not take the tree) is the environment, as a

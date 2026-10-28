@@ -1753,3 +1753,20 @@ def test_ttp_checks_past_the_wall_cap_is_stopped_releases_the_slot_and_records_a
     cli.main(["checks", "--", "true"])
     assert "this task's last checks run (run 41" in capsys.readouterr().out, "its next try says so"
     assert len(checkwall.recent(p.state)) == 1
+
+
+def test_a_completed_checks_run_stops_reporting_the_task_s_old_timeout(env, tmp_path, monkeypatch, capsys):
+    from ttp import checkwall, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_TASK", "7")
+    p.set_config("checks.wall_cap_s", 2)
+    with pytest.raises(SystemExit):
+        cli.main(["checks", "--", "sleep", "300"])   # times out at the cap and records it
+    assert checkwall.last_timeout(p.state, "7") is not None, "the timeout is recorded"
+    p.set_config("checks.wall_cap_s", 0)
+    cli.main(["checks", "--", "true"])   # a later run completes: the TIMEOUTS entry is dropped
+    capsys.readouterr()
+    cli.main(["checks", "--", "true"])   # a further run prints no old-timeout line
+    out = capsys.readouterr().out
+    assert "was stopped at the wall-time cap" not in out, out
+    assert checkwall.last_timeout(p.state, "7") is None

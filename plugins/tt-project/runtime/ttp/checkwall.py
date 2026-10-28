@@ -131,6 +131,25 @@ def record_timeout(state: Path | None, task: str | None, rec: dict) -> None:
         pass
 
 
+def clear_timeout(state: Path | None, task: str | None) -> None:
+    """Drop the task's TIMEOUTS entry once a later run completed without the wall-time cap,
+    so the task's next run no longer reports the old timeout as its last checks run."""
+    if state is None or not task:
+        return
+    path = Path(state) / TIMEOUTS
+    try:
+        try:
+            got = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return
+        if not (isinstance(got, dict) and str(task) in got):
+            return
+        got.pop(str(task), None)
+        write_json(path, got)
+    except OSError:
+        pass
+
+
 def last_timeout(state: Path | None, task: str | None) -> dict | None:
     """The task's last recorded checks timeout, or None."""
     if state is None or not task:
