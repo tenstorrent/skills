@@ -7811,12 +7811,21 @@ def cmd_doctor(a) -> None:
     names = name_list(claude_cfg.get("mcp_servers") or [])
     if names:
         from .providers import get_provider
-        _, unknown = get_provider("claude").mcp_servers(names, [str(p.root), str(p.root.resolve())])
+        prov = get_provider("claude")
+        dirs = [str(p.root), str(p.root.resolve())]
+        _, unknown = prov.mcp_servers([n for n in names if not prov.is_connector(n)], dirs)
         print(f"mcp servers for workers: {', '.join(names)}"
               + (f" · not defined in your Claude config: {', '.join(unknown)} (servers from a plugin "
                  "cannot be listed; add them with `claude mcp add`)" if unknown else "")
               + ("" if claude_cfg.get("worker_isolation") else " · worker_isolation is off, so workers load "
                  "all your servers; a claude.ai name here keeps your claude.ai connectors too"))
+        if claude_cfg.get("worker_isolation") and any(prov.is_connector(n) for n in names):
+            from .coordinator import dir_list
+            plugin_dirs = [str(Path(os.path.expanduser(d))) for d in dir_list(claude_cfg.get("plugin_dirs") or [])]
+            plan = mcpgap.plan(claude_cfg, mcpgap.read(p.state), prov.mcp_server_names(dirs), plugin_dirs)
+            print(f"claude.ai connectors for isolated workers: {', '.join(plan['connectors'])}, every other server "
+                  f"kept out ({len(plan['deny'])} by name)" if not plan["why"] else
+                  f"claude.ai connectors for isolated workers: none, workers stay strict ({plan['why']})")
     sec = load_secrets()
     print(f"jev: {'key saved' if (sec.get('jev') or {}).get('key') else 'no key (rules-only screening)'}"
           f" · enabled in project: {p.config()['jev'].get('enabled')}")

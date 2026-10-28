@@ -1287,9 +1287,9 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
 - `providers.claude.worker_isolation: true` starts Claude workers and reviewers without your own
   MCP servers, plugins, hooks and user settings; the project's `plugin_dirs` and its hook still
   load. In one measurement it cut a worker's first turn from about 38k to 23k input tokens.
-  Isolated workers never get your claude.ai account connectors: `--strict-mcp-config` drops every
-  server not passed in its own config file, and connectors are not defined in any file, so there is
-  no way to pass them on.
+  Isolated workers get no claude.ai account connector unless `mcp_servers` lists it (below):
+  `--strict-mcp-config` drops every server not passed in its own config file, and connectors are
+  not defined in any file.
   `ttp new` turns it on; projects created earlier keep it off until you set it.
 - `providers.claude.mcp_servers: ["name", ...]` lists the MCP servers isolated workers still get.
   Each run copies just those entries from your Claude config (local, then `.mcp.json`, then user
@@ -1297,15 +1297,25 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   Listing a server approves it for workers. A name your config does not define is skipped: the
   run still starts, and `ttp doctor` and a low alert name it. Servers that come from a Claude plugin
   are not in those files, so they cannot be listed; add the server with `claude mcp add` to list it.
+  To give isolated workers a claude.ai connector, list it by its `claude mcp list` name
+  (`"claude.ai <name>"`). Such a run leaves out `--strict-mcp-config` and keeps every other MCP
+  server out by name: each server and connector on the last `claude mcp list` (below), connected or
+  not, and each one your Claude config defines for the worktree or the project root, except the
+  listed ones. Each is denied in the run's settings (`deniedMcpServers`, so it never starts) and its
+  tools in `--disallowedTools` (`mcp__<name>`). That needs a list to trust: until the daemon has one
+  no older than 12 hours, or while a `plugin_dirs` plugin brings MCP servers of its own, the run
+  stays strict without the connector, and `ttp doctor`, the feed and a low alert say why.
 - While `worker_isolation` is on, the daemon runs `claude mcp list` from the project root in the
   background (at most every 6 hours, bounded to 90 s) and keeps the answer in the project's state.
   A server it reports connected that `mcp_servers` does not list gets one line in `ttp status` and
   the web app's feed: `MCP servers connected on this host but not given to workers: ...`. List a
   server you keep from workers on purpose in `providers.claude.mcp_withheld: ["name", ...]` and the
   line drops it. Plugin servers are left out (`mcp_servers` cannot list them). Connected claude.ai
-  connectors get a line of their own, `Connected claude.ai connectors (...) are not available to
-  isolated workers`: turn off `worker_isolation` to use them, or list them in `mcp_withheld` to drop
-  the line (listing one in `mcp_servers` does not reach isolated workers, so it stays named). A probe that fails or times out shows as unknown in `ttp doctor`, never as either line.
+  connectors get a line of their own, `Connected claude.ai connectors (...) are not given to isolated
+  workers`: list one in `mcp_servers` to give it to them, or list them in `mcp_withheld` to drop the
+  line. A listed connector that cannot be kept (see above) is named with the reason. A probe that
+  fails or times out shows as unknown in `ttp doctor`, never as either line; the last good list
+  still counts while it is no older than 12 hours.
 - With `worker_isolation` off, Claude workers and reviewers still load your own, the project's and
   plugins' MCP servers, but not your claude.ai connectors (about 2k tokens on every call), unless
   the project needs them: `mcp_servers` names one (`"claude.ai <name>"`), or one of its runs called

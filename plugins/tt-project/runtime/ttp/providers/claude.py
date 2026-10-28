@@ -256,13 +256,47 @@ class Claude(Provider):
         # Flag settings (the harness hook) and --plugin-dir load whatever the sources are.
         return ["--strict-mcp-config", "--setting-sources", "project,local"]
 
-    def mcp_servers(self, names: list[str], dirs: list[str]) -> tuple[dict, list[str]]:
+    def keep_connectors(self, argv: list[str], deny: list[str]) -> list[str] | None:
+        # Not strict, so the account's connectors load; every server in `deny` is kept out twice:
+        # deniedMcpServers in the run's flag settings stops it starting at all, and a whole-server
+        # --disallowedTools rule (mcp__<server>) hides its tools (both checked live, CLI 2.1.296).
+        argv = list(argv)
+        tail = ["-"] if argv[-1:] == ["-"] else []
+        argv = argv[:len(argv) - len(tail)]
+        if "--settings" in argv:
+            i = argv.index("--settings") + 1
+            try:
+                settings = json.loads(argv[i])
+            except ValueError:
+                return None   # a settings file, not JSON: stay strict rather than lose either
+        else:
+            settings, i = {}, None
+        if deny:
+            settings = {**settings, "deniedMcpServers": [*(settings.get("deniedMcpServers") or []),
+                                                         *({"serverName": n} for n in deny)]}
+        if i is None:
+            argv += ["--settings", json.dumps(settings)]
+        else:
+            argv[i] = json.dumps(settings)
+        from ..mcpgap import tool_name
+        if deny:   # one comma-separated value; --disallowedTools takes several, so a flag follows it
+            argv += ["--disallowedTools", ",".join(dict.fromkeys(f"mcp__{tool_name(n)}" for n in deny))]
+        return argv + ["--setting-sources", "project,local"] + tail
+
+    def mcp_server_names(self, dirs: list[str]) -> list[str]:
+        return list(dict.fromkeys(n for scope in self._scopes(dirs) if isinstance(scope, dict) for n in scope))
+
+    def _scopes(self, dirs: list[str]) -> list:
         # Claude Code's own scopes, most specific first: local (per directory, in the user's
         # config), project (`.mcp.json`), user. `claude mcp get` has no machine-readable output.
         user_cfg = _read_json(claude_config_path())
         scopes = [((user_cfg.get("projects") or {}).get(d) or {}).get("mcpServers") for d in dirs]
         scopes += [_read_json(Path(d) / ".mcp.json").get("mcpServers") for d in dirs]
         scopes.append(user_cfg.get("mcpServers"))
+        return scopes
+
+    def mcp_servers(self, names: list[str], dirs: list[str]) -> tuple[dict, list[str]]:
+        scopes = self._scopes(dirs)
         found: dict = {}
         for name in names:
             for scope in scopes:
@@ -279,7 +313,9 @@ class Claude(Provider):
 
     def with_mcp_config(self, argv: list[str], path: Path) -> list[str]:
         # --mcp-config takes several values, so a flag must follow it, never a positional argument.
-        i = argv.index("--strict-mcp-config") if "--strict-mcp-config" in argv else len(argv)
+        # A run that keeps connectors (keep_connectors) has --setting-sources in place of the strict flag.
+        flag = next((f for f in ("--strict-mcp-config", "--setting-sources") if f in argv), None)
+        i = argv.index(flag) if flag else len(argv)
         return argv[:i] + ["--mcp-config", str(path)] + argv[i:]
 
     def session_args(self, session_id: str) -> list[str]:

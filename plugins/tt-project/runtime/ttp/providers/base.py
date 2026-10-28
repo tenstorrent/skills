@@ -310,6 +310,16 @@ class Provider:
         worker (the project's approved plugins and the harness hook still load); [] if unsupported."""
         return []
 
+    def keep_connectors(self, argv: list[str], deny: list[str]) -> list[str] | None:
+        """`argv` for an isolated run that keeps the account connectors the project lists, in place of
+        isolation_args(): not strict, and every MCP server in `deny` kept out by name; None if this
+        agent cannot (the run then stays strict)."""
+        return None
+
+    def mcp_server_names(self, dirs: list[str]) -> list[str]:
+        """Every MCP server the user's own agent config defines for the directories `dirs`."""
+        return []
+
     def mcp_servers(self, names: list[str], dirs: list[str]) -> tuple[dict, list[str]]:
         """The named MCP server definitions from the user's own agent config, looked up for the
         directories `dirs`, and the names not found. They may hold secrets: never log them."""

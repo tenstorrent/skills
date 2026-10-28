@@ -1993,10 +1993,10 @@ class Daemon:
         """The project's allowlisted MCP servers (`providers.<p>.mcp_servers`) for an isolated run,
         looked up for the worktree and the project root."""
         names = coord.name_list(self.cfg["providers"].get(provider, {}).get("mcp_servers") or [])
+        names = [n for n in names if not prov.is_connector(n)]   # no file defines one: _connector_deny
         if not names:
             return {}
-        dirs = list(dict.fromkeys(str(d) for d in (cwd, Path(cwd).resolve(), self.p.root, self.p.root.resolve())))
-        found, unknown = prov.mcp_servers(names, dirs)
+        found, unknown = prov.mcp_servers(names, self._mcp_dirs(cwd))
         if unknown:
             self.alert(f"mcp_servers_unknown:{provider}",
                        f"Workers run without these MCP servers, which your {provider} config does not define: "
@@ -2004,6 +2004,26 @@ class Daemon:
                        "(servers from a plugin cannot be listed).",
                        severity="low", every_s=86400)
         return found
+
+    def _mcp_dirs(self, cwd: str) -> list[str]:
+        return list(dict.fromkeys(str(d) for d in (cwd, Path(cwd).resolve(), self.p.root, self.p.root.resolve())))
+
+    def _connector_deny(self, prov, provider: str, cwd: str, plugin_dirs: list[str]) -> list[str] | None:
+        """The MCP servers an isolated run keeps out by name so that it can keep the account connectors
+        the project lists in `providers.<p>.mcp_servers` (mcpgap.plan); None: the run stays strict, as
+        it does for a project that lists none. A listed connector that cannot be kept is a low alert."""
+        cfg = self.cfg["providers"].get(provider, {})
+        if not any(prov.is_connector(n) for n in coord.name_list(cfg.get("mcp_servers") or [])):
+            return None
+        from . import mcpgap
+        plan = mcpgap.plan(cfg, mcpgap.read(self.p.state), prov.mcp_server_names(self._mcp_dirs(cwd)), plugin_dirs)
+        if plan["why"]:
+            self.alert(f"mcp_connectors_strict:{provider}",
+                       f"Isolated workers run without the claude.ai connectors in providers.{provider}.mcp_servers: "
+                       f"{plan['why']}. They stay strict (no MCP server but the listed files) until that clears.",
+                       severity="low", every_s=86400)
+            return None
+        return plan["deny"]
 
     def start_run(self, role: str, prompt: str, provider: str, tier: str, cwd: str, *, task: dict | None = None,
                   budget_usd: float | None = None, timeout_s: float | None = None, read_only: bool = False,
@@ -2135,7 +2155,12 @@ class Daemon:
             sandboxed = bool(fence)
             extra = fence + prov.plugin_args([d for d in dirs if d not in missing])
             if self.cfg["providers"].get(provider, {}).get("worker_isolation"):
-                extra += prov.isolation_args()
+                deny = self._connector_deny(prov, provider, cwd, [d for d in dirs if d not in missing])
+                kept = prov.keep_connectors(argv, deny) if deny is not None else None
+                if kept is None:
+                    extra += prov.isolation_args()
+                else:
+                    argv = kept
                 mcp_servers = self._approved_mcp(prov, provider, cwd)
             elif prov.connector_env(False):
                 env = {**env, **prov.connector_env(self._connectors_needed(prov, provider))}
