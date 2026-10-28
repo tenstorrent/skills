@@ -558,9 +558,9 @@ def worker_system(p: Project, task: dict | None = None) -> str:
 
 def _zone_line(p: Project, now: float | None = None) -> str:
     """The project's home zone and the time there now, for the task header."""
-    tz = timefmt.home(p)
-    return (f"home time zone: {tz}, now {timefmt.long(time.time() if now is None else now, tz)}: write times "
-            f"for the user in it\n")
+    tz, now = timefmt.home(p), time.time() if now is None else now
+    return (f"home time zone: {tz}, now {timefmt.long_utc(now, tz)}; today is {timefmt.today(now, tz)} there: "
+            f"write dates and times for the user in it, over any other 'today' line\n")
 
 
 def _reboot_note(reboot, tz: str | None = None) -> str:

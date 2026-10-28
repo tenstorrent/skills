@@ -132,6 +132,17 @@ def long(ts: float, where) -> str:
     return datetime.fromtimestamp(ts, _tz(where)).strftime("%Y-%m-%d %H:%M %Z")
 
 
+def long_utc(ts: float, where) -> str:
+    """'2026-10-27 18:45 PDT (2026-10-28 01:45 UTC)': long() with the UTC moment, once when the zone is UTC."""
+    here, utc = long(ts, where), long(ts, None)
+    return here if here == utc else f"{here} ({utc})"
+
+
+def today(ts: float, where) -> str:
+    """'2026-10-27': the date at `ts` in the zone of `where`, which may differ from the UTC date."""
+    return datetime.fromtimestamp(ts, _tz(where)).strftime("%Y-%m-%d")
+
+
 def short(ts: float, where, now: float | None = None) -> str:
     """'23:32 UTC' within 20 hours of now, else 'Fri 23:32 UTC'."""
     fmt = "%H:%M %Z" if abs(ts - (now if now is not None else time.time())) < 20 * 3600 else "%a %H:%M %Z"

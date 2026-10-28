@@ -6216,6 +6216,33 @@ def test_push_queue_backoff_shows_the_home_zone_on_a_utc_box(env, monkeypatch, u
     assert rows == [] and re.fullmatch(r"backing off until \d\d:\d\d P[DS]T", why), why
 
 
+def test_prompt_headers_give_the_home_zone_date_past_utc_midnight(env, monkeypatch):
+    """A home zone behind UTC, past UTC midnight: the worker header and the coordinator's STATE line
+    give today's date in the home zone (with the UTC moment) and say it wins over any other 'today'
+    line, so a run never dates user-facing text with the host's UTC date."""
+    import time as _time
+    from ttp import coordinator as coord
+    from ttp import prompts
+    p = make(env)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    tid = p.db.add_task("t", "spec", kind="work")
+    at = _utc(2026, 10, 28, 1, 45)  # 2026-10-27 18:45 PDT
+    with monkeypatch.context() as m:
+        m.setattr(_time, "time", lambda: at)
+        text = prompts.worker_task(p, p.db.task(tid), str(p.root), None)
+        d = coord.digest(p, {}, [], [])
+    line = next(x for x in text.split("\n") if x.startswith("home time zone:"))
+    assert "now 2026-10-27 18:45 PDT (2026-10-28 01:45 UTC)" in line, line
+    assert "today is 2026-10-27" in line and "over any other" in line, line
+    head = d.split("\n")[0]
+    assert head.startswith("# STATE at 2026-10-27 18:45 PDT (2026-10-28 01:45 UTC; "), head
+    assert "today is 2026-10-27" in head and "over any other" in head, head
+    # A UTC home zone gives the time once.
+    p.set_config("home_timezone", "UTC")
+    assert prompts._zone_line(p, at).startswith("home time zone: UTC, now 2026-10-28 01:45 UTC; today is 2026-10-28 "), \
+        prompts._zone_line(p, at)
+
+
 def test_digest_daily_review_and_prompt_headers_carry_the_home_zone(env):
     from ttp import coordinator as coord
     from ttp import prompts
@@ -6223,12 +6250,12 @@ def test_digest_daily_review_and_prompt_headers_carry_the_home_zone(env):
     p = make(env)
     p.set_config("home_timezone", "America/Los_Angeles")
     d = coord.digest(p, {}, [], [])
-    assert re.search(r"^# STATE at \d{4}-\d\d-\d\d \d\d:\d\d P[DS]T \(the project's home zone, America/Los_Angeles\)",
+    assert re.search(r"^# STATE at \d{4}-\d\d-\d\d \d\d:\d\d P[DS]T \(.*the project's home zone, America/Los_Angeles\)",
                      d, re.M), d[:200]
     tid = p.db.add_task("t", "spec", kind="work")
     text = prompts.worker_task(p, p.db.task(tid), str(p.root), None)
-    assert re.search(r"home time zone: America/Los_Angeles, now \d{4}-\d\d-\d\d \d\d:\d\d P[DS]T: write times "
-                     r"for the user in it", text)
+    assert re.search(r"home time zone: America/Los_Angeles, now \d{4}-\d\d-\d\d \d\d:\d\d P[DS]T \(.* UTC\); today is "
+                     r"\d{4}-\d\d-\d\d there: write dates and times for the user in it", text)
     tpl = RUNTIME.parent / "template" / "prompts"
     assert "home zone" in (tpl / "coordinator.md").read_text() and "home zone" in (tpl / "worker.md").read_text()
     assert "(HH:MM in the home zone)" in (tpl / "coordinator.md").read_text()

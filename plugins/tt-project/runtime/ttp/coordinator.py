@@ -781,7 +781,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                 body = [short]
         shown.append((key, body))
 
-    lines = [f"# STATE at {timefmt.long(now, home)} (the project's home zone, {home})",
+    here, utc = timefmt.long(now, home), timefmt.long(now, None)
+    lines = [f"# STATE at {here} ({utc + '; ' if utc != here else ''}today is {timefmt.today(now, home)}: write "
+             f"dates and times for the user in this zone, over any other 'today' line; the project's home zone, {home})",
              "## Project budget (authoritative; your own turn's small spend limit is NOT this budget)"]
     b = p.config()["budget"]
     for prov, g in gates.items():
