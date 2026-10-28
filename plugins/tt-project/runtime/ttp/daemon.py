@@ -10065,8 +10065,8 @@ class Daemon:
         CONTINUE_UNQUEUED_WINDOW_S) whose hand-off proposed a `continue:` follow-up that no task has
         taken up yet raises one high CONTINUE_UNQUEUED event, so a hop no turn queued is not lost. A
         continuing task is any later task that continues it (chaincap.prev_of), has the follow-up's
-        title or waits on its landing (a start_when, as chaincap.deploy_proposal asks). One
-        event per task, ever."""
+        title or, for a post-landing deploy step only (chaincap.deploy_proposal), waits on its
+        landing (a start_when); every `continue:` follow-up must be taken up. One event per task, ever."""
         now = time.time()
         if now - self._continues_checked < CONTINUE_CHECK_EVERY_S:
             return
@@ -10080,22 +10080,27 @@ class Daemon:
             task = db.task(row["task"])
             result = load_result(task["result"]) if task else None
             fups = result.get("followups") if isinstance(result, dict) else None
-            conts = [str(f["title"]).strip() for f in fups if isinstance(f, dict) and f.get("title")
+            cfups = [f for f in fups if isinstance(f, dict) and f.get("title")
                      and chaincap.CONT_TITLE.match(str(f["title"]))] if isinstance(fups, list) else []
-            if not conts:
+            if not cfups:
                 continue
+            conts = [str(f["title"]).strip() for f in cfups]
             later = db.q("SELECT id, title, labels, parent FROM tasks WHERE id>? ORDER BY id", (task["id"],))
-            # A post-landing step is taken up by a task that waits on this one's landing (deploy_proposal).
-            if any(chaincap.prev_of(t) == task["id"] or t["title"].strip().lower() in {c.lower() for c in conts}
-                   or chaincap.waits_landing(deferral(t).get("when"), task["id"]) for t in later):
+            hop = any(chaincap.prev_of(t) == task["id"] for t in later)
+            titles = {t["title"].strip().lower() for t in later}
+            waiter = any(chaincap.waits_landing(deferral(t).get("when"), task["id"]) for t in later)
+            # Each follow-up by its own rule: a landing waiter takes up only a post-landing deploy step
+            # (deploy_proposal), never a split's hop (that head lands only through its hop).
+            left = [(c, f) for c, f in zip(conts, cfups)
+                    if not (hop or c.lower() in titles or (waiter and chaincap.deploy_proposal(f, task["id"])))]
+            if not left:
                 continue
             db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
                  (now, f"task:{task['id']}", CONTINUE_UNQUEUED, "high",
-                  f"#{task['id']} {headline.clip(task['title'], 160)}: its follow-up {conts[0][:200]!r} is {UNQUEUED_TAG} and no "
+                  f"#{task['id']} {headline.clip(task['title'], 160)}: its follow-up {left[0][0][:200]!r} is {UNQUEUED_TAG} and no "
                   f"task continues it {int(CONTINUE_UNQUEUED_AFTER_S // 60)} min after it finished. " + (
-                      f"{deploy[0][0].upper()}{deploy[0][1:]} on purpose." if (deploy := [
-                          d for f in fups if isinstance(f, dict) and chaincap.CONT_TITLE.match(str(f.get("title") or ""))
-                          and (d := chaincap.deploy_proposal(f, task["id"]))]) else
+                      f"{deploy[0].upper()}{deploy[1:]} on purpose." if (
+                          deploy := chaincap.deploy_proposal(left[0][1], task["id"])) else
                       f"Add it with task_add continues #{task['id']}, or drop it on purpose."),
                   json.dumps({"followups": conts}), "queued", task["id"]))
             log(self.p, f"task {task['id']}: continue follow-up not taken up; {CONTINUE_UNQUEUED} raised")

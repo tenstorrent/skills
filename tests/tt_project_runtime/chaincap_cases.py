@@ -242,6 +242,41 @@ def test_a_deploy_task_waiting_on_the_landing_takes_up_a_post_landing_continue(e
     assert f"one deploy task per target with start_when landed:#{ids[1]}" in rows[0]["text"]
 
 
+def test_a_landing_waiter_never_takes_up_a_split_hop(env):
+    """A split's `continue:` hops are no post-landing step: a later task that only waits on the parent's
+    landing (a dependent, not a hop) takes none of them up, so continue_unqueued still fires (the split
+    head never lands without its hop, and the dependent would wait forever)."""
+    import time
+    from ttp import chaincap
+    from ttp import daemon as dmod
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid, *_ = _finish_with_followups(env, p, "split change", lambda tid: [
+        {"title": "continue: finish the parser", "spec": "Carry on with the parser."},
+        {"title": "continue: finish the writer", "spec": "Carry on with the writer."}])
+    assert not _hops_of(p, tid) and chaincap.split_head(p.db.task(tid))
+    p.db.add_task("use the new parser", "Use it.", kind="code", origin="coordinator",
+                  labels=[f"start_when:landed:#{tid}"])
+    p.db.x("UPDATE events SET ts=? WHERE kind='task_done'", (time.time() - dmod.CONTINUE_UNQUEUED_AFTER_S - 60,))
+    d = Daemon(p.base)
+    d._continues_checked = 0
+    d.check_unqueued_continues()
+    rows = p.db.q("SELECT * FROM events WHERE kind=?", (dmod.CONTINUE_UNQUEUED,))
+    assert [r["task"] for r in rows] == [tid]
+    assert f"continues #{tid}" in rows[0]["text"] and "'continue: finish the parser'" in rows[0]["text"]
+    # Mixed: a landing waiter takes up the post-landing deploy, never the split hop beside it.
+    mix, *_ = _finish_with_followups(env, p, "mixed change", lambda tid: [
+        {"title": "continue: deploy", "spec": f"After landed:#{tid}, deploy to target A."},
+        {"title": "continue: finish the writer", "spec": "Carry on with the writer."}])
+    p.db.add_task("deploy to target A", "Deploy.", kind="code", origin="coordinator",
+                  labels=[f"start_when:landed:#{mix}"])
+    p.db.x("UPDATE events SET ts=? WHERE kind='task_done'", (time.time() - dmod.CONTINUE_UNQUEUED_AFTER_S - 60,))
+    d._continues_checked = 0
+    d.check_unqueued_continues()
+    (row,) = p.db.q("SELECT * FROM events WHERE kind=? AND task=?", (dmod.CONTINUE_UNQUEUED, mix))
+    assert "'continue: finish the writer'" in row["text"] and f"continues #{mix}" in row["text"]
+
+
 def test_a_continue_titled_to_land_push_or_fix_the_change_is_still_a_split(env):
     from ttp import chaincap
     for title in ("continue: land the change, then deploy", "continue: push it and roll out",
