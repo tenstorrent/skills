@@ -1026,6 +1026,34 @@ def _say_all_argv(argv: list[str]) -> list[str]:
     return ["say", SAY_ALL, *argv[1:]]
 
 
+_SECRET_VALUED = ("--keys", "--host", "--via", "--url", "--email", "--user-id")
+VALUE_GIVEN = "<value>"
+
+
+def _secret_value_argv(argv: list[str]) -> list[str]:
+    """`ttp secret set|generate <name> <value...>`: argparse would echo a stray word ("unrecognized
+    arguments: <value>"), so each word after the name that is no option of `ttp secret` becomes
+    VALUE_GIVEN, after the name and before the options, and cmd_secret_custom refuses it."""
+    if argv[:1] != ["secret"] or argv[1:2] not in (["set"], ["generate"]):
+        return argv
+    pos, opts, stray, it = argv[1:2], [], [], iter(argv[2:])
+    for w in it:
+        if w == "--":
+            stray.append(VALUE_GIVEN)
+            break
+        elif w in _SECRET_VALUED:
+            opts += [w, *(v for v in [next(it, None)] if v is not None)]
+        elif w in ("--force", "-h", "--help") or w.split("=", 1)[0] in _SECRET_VALUED:
+            opts.append(w)
+        elif len(pos) == 1 and not w.startswith("-"):
+            pos.append(w)
+        elif len(pos) == 1:
+            opts.append(w)   # an unknown option before any name: argparse refuses it (not a value)
+        else:
+            stray.append(VALUE_GIVEN)
+    return ["secret", *pos, *stray[:1], *opts]
+
+
 _SAY_VALUED = ("--chat", "--context", "--finding", "--except", "--broadcast", "--client-id")
 
 
@@ -6600,9 +6628,18 @@ def cmd_config(a) -> None:
     print(f"{a.key} = {json.dumps(val)}")
 
 
+SECRET_KINDS = ("jev", "slack", "endpoint", "show", "check", "env", "push", "set", "generate")
+SECRET_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+SECRET_MAX_BYTES = 64 << 10
+
+
 def cmd_secret(a) -> None:
-    if a.alias is not None and a.kind not in ("endpoint", "check", "env"):
-        die(f"`ttp secret {a.kind}` takes no alias (only endpoint, check and env do)")
+    if a.alias is not None and a.kind not in ("endpoint", "check", "env", "set", "generate"):
+        die(f"`ttp secret {a.kind}` takes no alias (only endpoint, check, env, set and generate do)")
+    if a.keys is not None and a.kind != "generate":
+        die("--keys goes only with `ttp secret generate <name> --keys a,b,c`")
+    if a.kind in ("set", "generate"):
+        return cmd_secret_custom(a)
     if a.command and a.kind != "env":
         die(f"`ttp secret {a.kind}` runs no command (only `ttp secret env <alias> -- <command>` does)")
     if a.kind == "jev":
@@ -6669,6 +6706,64 @@ def cmd_secret(a) -> None:
                           if not k.startswith(endpoint.PREFIX)}))
         for line in endpoint.show_lines():
             print(line)
+
+
+def _secret_name(name: str | None, usage: str) -> str:
+    """A custom secret's name, or die: lowercase letters, digits, '-' and '_', never a built-in one."""
+    if not name:
+        die(f"give a name: `ttp secret {usage}`")
+    if not SECRET_NAME_RE.fullmatch(name):
+        die(f"bad secret name {name!r}: lowercase letters, digits, '-' and '_' (up to 64, starting "
+            "with a letter or digit)")
+    from . import redact
+    if name in SECRET_KINDS or not redact.custom(name):
+        die(f"secret name {name!r} is taken by `ttp secret {name}`; pick another name")
+    return name
+
+
+def cmd_secret_custom(a) -> None:
+    """`ttp secret set <name>` (the value from stdin) and `ttp secret generate <name> --keys a,b,c`
+    (a fresh random token per key, stored as a JSON object). Neither prints a value."""
+    from . import redact
+    for opt in ("host", "url", "email", "user_id"):
+        if getattr(a, opt):   # never echo it: it may be the value
+            die(f"`ttp secret {a.kind}` takes no --{opt.replace('_', '-')}")
+    if a.kind == "set":
+        name = _secret_name(a.alias, "set <name> < file-with-the-value")
+        if a.command:   # never echo it back: it is in argv already
+            die("the value is read from stdin, never the command line (that lands in shell history and "
+                f"logs): `ttp secret set {name} < file`, or type it at the prompt")
+        if sys.stdin.isatty():
+            value = getpass.getpass(f"value for {name}: ")
+        else:
+            value = sys.stdin.read(SECRET_MAX_BYTES + 1)
+            value = value[:-2] if value.endswith("\r\n") else value[:-1] if value.endswith("\n") else value
+        if len(value.encode()) > SECRET_MAX_BYTES:
+            die(f"the value is over {SECRET_MAX_BYTES >> 10} KiB; not saved")
+        if not value.strip():
+            die("empty value on stdin; not saved")
+        if len(value.strip()) < redact.MIN_LEN:
+            die(f"the value has fewer than {redact.MIN_LEN} characters, too short to be masked in logs; "
+                "not saved")
+        old = name in load_secrets()
+        save_secret(name, value)
+        print(f"stored secret {name}" + (" (replaced the earlier value)" if old else ""))
+        return
+    name = _secret_name(a.alias, "generate <name> --keys a,b,c")
+    if a.command:
+        die("`ttp secret generate` takes no value: it makes the tokens itself")
+    keys = [k.strip() for k in (a.keys or "").split(",")]
+    if keys == [""]:
+        die(f"give the key names: `ttp secret generate {name} --keys a,b,c`")
+    for k in keys:
+        if not SECRET_NAME_RE.fullmatch(k):
+            die(f"bad key name {k!r}: lowercase letters, digits, '-' and '_'")
+    if len(set(keys)) != len(keys):
+        die("a key name is listed twice")
+    if name in load_secrets() and not a.force:
+        die(f"secret {name} exists; --force replaces it with new tokens")
+    save_secret(name, {k: pysecrets.token_urlsafe(32) for k in keys})
+    print(f"stored secret {name} with a new random token for each of: {', '.join(keys)}")
 
 
 def cmd_secret_env(a) -> None:
@@ -8998,7 +9093,7 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_config)
 
     s = sub.add_parser("secret", help="store per-user credentials (read from stdin)")
-    s.add_argument("kind", choices=["jev", "slack", "endpoint", "show", "check", "env", "push"],
+    s.add_argument("kind", choices=SECRET_KINDS,
                    help="jev: a key for Jev, the optional add-on that sends log and alert text to an "
                         "outside paid service; slack: a Slack bot token; "
                         "endpoint <alias> --url <base url>: an API key for an OpenAI-compatible endpoint, "
@@ -9006,20 +9101,25 @@ def main(argv: list[str] | None = None) -> None:
                         "show: list what is saved (never the keys); check [alias]: test saved endpoint keys "
                         "(reachable, auth ok or auth failed; never the key); env <alias> -- <command>: run "
                         "a command with the key in OPENAI_API_KEY and the URL in OPENAI_BASE_URL, its output "
-                        "masked; push: copy your saved keys to --host. No command prints a saved key. "
+                        "masked; push: copy your saved keys to --host; set <name>: a value of your own, "
+                        "read from stdin; generate <name> --keys a,b,c: a fresh random token per key, "
+                        "stored as a JSON object. No command prints a saved key. "
                         "Keys go to secrets.json in your ttp home (~/.tt-project, mode 0600)")
     s.add_argument("alias", nargs="?", help="with endpoint: a name for it (letters, digits, '-' and '_'); "
-                                            "with check or env: the saved endpoint")
+                                            "with check or env: the saved endpoint; with set or generate: "
+                                            "the secret's name (lowercase letters, digits, '-' and '_')")
     s.add_argument("command", nargs="*", help="with env: -- then the command to run")
     s.add_argument("--host", help="with push: the machine to copy your saved keys to")
     s.add_argument("--via", default="typesafe", choices=["typesafe", "openrouter"],
                    help="with jev: the service the key is for (default typesafe)")
     s.add_argument("--url", help="with jev: the service's address, if not its usual one; with endpoint "
                                  "(required): its base URL, e.g. https://api.example.com/v1")
+    s.add_argument("--keys", help="with generate: the key names, comma-separated")
     s.add_argument("--email", help="with slack: your Slack email, to find your user")
     s.add_argument("--user-id", help="with slack: your Slack user id (instead of --email)")
     s.add_argument("--force", action="store_true",
-                   help="with jev or endpoint: save the key even if the check fails")
+                   help="with jev or endpoint: save the key even if the check fails; with generate: "
+                        "replace an existing secret")
     s.set_defaults(fn=cmd_secret)
 
     s = sub.add_parser("setup", help="install ttp for this user (stable copy + shim on PATH)")
@@ -9080,8 +9180,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("dir", help="the project's tt-project folder")
     s.set_defaults(fn=cmd_daemon)
 
-    a = ap.parse_args(_project_name_argv(sub, _say_finding_argv(_say_all_argv(
-        sys.argv[1:] if argv is None else list(argv)))))
+    a = ap.parse_args(_project_name_argv(sub, _say_finding_argv(_say_all_argv(_secret_value_argv(
+        sys.argv[1:] if argv is None else list(argv))))))
     dry_run_stub(a)
     a.fn(a)
 

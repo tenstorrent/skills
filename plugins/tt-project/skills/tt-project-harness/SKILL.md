@@ -162,6 +162,8 @@ read the one for the lever you change.
   such reads.
 - Test an endpoint's key with `ttp secret check <alias>` (reachable, auth ok or auth failed). Give
   it to a command with `ttp secret env <alias> -- <command>` (`OPENAI_API_KEY`, `OPENAI_BASE_URL`).
+- Store a value of your own with `ttp secret set <name> < file` (stdin only), or a set of fresh random
+  tokens with `ttp secret generate <name> --keys a,b,c`; neither prints a value.
 
 ## CPU-only runs never open a device
 

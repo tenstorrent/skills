@@ -1480,6 +1480,9 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   An OpenAI-compatible endpoint's API key: `ttp secret endpoint <alias> --url <base url>` checks it with
   `GET <base url>/models` and saves it with its URL as `endpoint/<alias>`; `ttp secret show` lists it
   without the key.
+- A secret of your own: `ttp secret set <name>` stores the value read from stdin (never from the
+  command line); `ttp secret generate <name> --keys a,b,c` stores a fresh random token per key as a
+  JSON object (`--force` replaces one). Neither prints a value; both are masked like the others.
 - No `ttp` command prints a saved key. `ttp secret check [alias]` tests one (reachable, auth ok or
   auth failed) and `ttp secret env <alias> -- <command>` gives it to a command in `OPENAI_API_KEY`
   (URL in `OPENAI_BASE_URL`). A worker's Bash calls that read the secrets store are refused.

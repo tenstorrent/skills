@@ -394,6 +394,8 @@ def test_endpoint_errors_mask_every_stored_secret(env, monkeypatch):
     ("grep -n 'credentials(' plugins/tt-project/runtime/ttp/endpoint.py", False),
     ("ttp secret check tt-cloud", False),
     ("ttp secret env tt-cloud -- python3 probe.py", False),
+    ("ttp secret set peer-key < value.txt", False),
+    ("ttp secret generate peer-set --keys alpha,beta", False),
     ("python3 - <<'EOF'\ndef credentials(alias):\n    return None\nEOF", False),
 ])
 def test_hook_refuses_ad_hoc_reads_of_the_secret_store(env, monkeypatch, cmd, refused):
@@ -412,3 +414,135 @@ def test_hook_refuses_a_script_file_that_reads_the_secret_store(env, monkeypatch
     (env["tmp"] / "probe.py").write_text("from ttp import endpoint\nprint(endpoint.credentials('tt-cloud'))\n")
     out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "python3 probe.py"}, "cwd": str(env["tmp"])})
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+_CUSTOM = "fake-custom-value-0123456789"
+
+
+def _custom(monkeypatch, capsys, *argv, stdin=""):
+    """`ttp secret <argv>` with `stdin`; (exit code, stdout + stderr)."""
+    from ttp import cli
+    monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
+    try:
+        cli.main(["secret", *argv])
+        code = 0
+    except SystemExit as e:
+        code = e.code or 0
+    out = capsys.readouterr()
+    return code, out.out + out.err
+
+
+def test_secret_set_reads_the_value_from_stdin_and_stores_it_owner_only(env, monkeypatch, capsys):
+    project = _endpoint_home(env, monkeypatch)
+    code, out = _custom(monkeypatch, capsys, "set", "alpha-key", stdin=_CUSTOM + "\n")
+    assert code == 0 and "alpha-key" in out and _CUSTOM not in out
+    assert project.load_secrets()["alpha-key"] == _CUSTOM
+    assert project.secrets_path().stat().st_mode & 0o777 == 0o600
+    code, out = _custom(monkeypatch, capsys, "set", "alpha-key", stdin=_CUSTOM + "-2\r\n")   # replaces it
+    assert code == 0 and project.load_secrets()["alpha-key"] == _CUSTOM + "-2" and _CUSTOM not in out
+    code, _ = _custom(monkeypatch, capsys, "set", "multi_line", stdin=_CUSTOM + "\nsecond line\n\n")
+    assert code == 0 and project.load_secrets()["multi_line"] == _CUSTOM + "\nsecond line\n"   # one newline off
+
+
+@pytest.mark.parametrize("argv, stdin, why", [
+    (["set", "alpha", _CUSTOM], "", "stdin"),                  # a value on the command line
+    (["set", "alpha", "--", _CUSTOM], "", "stdin"),
+    (["set", "alpha", "--force", _CUSTOM], "", "stdin"),       # after an option: argparse would echo it
+    (["set", "alpha", "-" + _CUSTOM], "", "stdin"),            # a value that looks like an option
+    (["set", "alpha", _CUSTOM, "--keys"], "", "--keys"),       # a valued option with no value
+    (["set", "alpha", "--url", _CUSTOM], "", "--url"),          # an option set does not take
+    (["set", "alpha"], "", "empty"),
+    (["set", "alpha"], "\n", "empty"),
+    (["set", "alpha"], "short\n", "characters"),               # too short to be masked in logs
+    (["set"], _CUSTOM, "name"),
+    (["set", "alpha", "--keys", "a,b"], _CUSTOM, "--keys"),
+])
+def test_secret_set_refuses_a_command_line_value_an_empty_or_short_value(env, monkeypatch, capsys, argv, stdin, why):
+    project = _endpoint_home(env, monkeypatch)
+    code, out = _custom(monkeypatch, capsys, *argv, stdin=stdin)
+    assert code != 0 and why in out and _CUSTOM not in out
+    assert "alpha" not in project.load_secrets()
+
+
+def test_secret_generate_stores_fresh_tokens_and_refuses_to_overwrite_unless_forced(env, monkeypatch, capsys):
+    project = _endpoint_home(env, monkeypatch)
+    code, out = _custom(monkeypatch, capsys, "generate", "peer-set", "--keys", "alpha,beta, gamma_2")
+    first = project.load_secrets()["peer-set"]
+    assert code == 0 and sorted(first) == ["alpha", "beta", "gamma_2"]
+    assert len(set(first.values())) == 3 and all(len(t) >= 32 for t in first.values())
+    assert "peer-set" in out and "alpha" in out and "gamma_2" in out
+    assert not any(t in out for t in first.values())
+    code, out = _custom(monkeypatch, capsys, "generate", "peer-set", "--keys", "alpha")
+    assert code != 0 and "--force" in out and project.load_secrets()["peer-set"] == first
+    code, out = _custom(monkeypatch, capsys, "set", "alpha-key", stdin=_CUSTOM)
+    code, out = _custom(monkeypatch, capsys, "generate", "alpha-key", "--keys", "alpha")   # a `set` one too
+    assert code != 0 and project.load_secrets()["alpha-key"] == _CUSTOM
+    code, out = _custom(monkeypatch, capsys, "generate", "peer-set", "--keys", "alpha,delta", "--force")
+    again = project.load_secrets()["peer-set"]
+    assert code == 0 and sorted(again) == ["alpha", "delta"] and again["alpha"] != first["alpha"]
+    assert not any(t in out for t in again.values())
+
+
+@pytest.mark.parametrize("argv, why", [
+    (["generate", "peer"], "--keys"),
+    (["generate", "peer", "--keys", ""], "--keys"),
+    (["generate", "peer", "--keys", "alpha,,beta"], "key name"),
+    (["generate", "peer", "--keys", "Alpha"], "key name"),
+    (["generate", "peer", "--keys", "alpha,alpha"], "twice"),
+    (["generate", "peer", "--keys", "alpha", "beta"], "no value"),
+    (["generate", "peer", "--keys=alpha", "--", "beta"], "no value"),
+    (["generate", "--keys", "alpha"], "name"),
+    (["endpoint", "tt-cloud", "--keys", "alpha"], "--keys"),
+])
+def test_secret_generate_refuses_bad_key_lists(env, monkeypatch, capsys, argv, why):
+    project = _endpoint_home(env, monkeypatch)
+    code, out = _custom(monkeypatch, capsys, *argv)
+    assert code != 0 and why in out
+    assert "peer" not in project.load_secrets()
+
+
+@pytest.mark.parametrize("name", ["jev", "slack", "endpoint", "show", "check", "env", "push", "set", "generate",
+                                  "Alpha", "a/b", "endpoint/x", "_alpha", "al.pha", "a" * 65])
+@pytest.mark.parametrize("kind", ["set", "generate"])
+def test_secret_custom_names_are_checked_and_builtin_secrets_unchanged(env, monkeypatch, capsys, name, kind):
+    from ttp import endpoint
+    project = _endpoint_home(env, monkeypatch)
+    project.save_secret("jev", {"via": "typesafe", "key": "jev-placeholder-key-42"})
+    endpoint.save("x", _EP_URL, _EP_KEY, True, "HTTP 200")
+    before = project.load_secrets()
+    extra = ["--keys", "alpha"] if kind == "generate" else []
+    code, out = _custom(monkeypatch, capsys, kind, name, *extra, "--force", stdin=_CUSTOM)
+    assert code != 0 and "name" in out and _CUSTOM not in out
+    assert project.load_secrets() == before
+
+
+def test_custom_secrets_are_masked_in_tool_output_logs_and_handoffs_and_show(env, monkeypatch, capsys):
+    from ttp import cli, daemon, redact
+    p = make(env)
+    project = _stored(monkeypatch, env["tmp"] / "secrets-home")
+    assert _custom(monkeypatch, capsys, "set", "alpha-key", stdin=_CUSTOM + "\n")[0] == 0
+    assert _custom(monkeypatch, capsys, "generate", "peer-set", "--keys", "alpha,beta")[0] == 0
+    tokens = project.load_secrets()["peer-set"]
+    text = f"tool printed {_CUSTOM} and {tokens['alpha']} then {tokens['beta']} and {_EP_KEY}"
+    assert redact.scrub(text) == ("tool printed [secret:alpha-key] and [secret:peer-set] then [secret:peer-set] "
+                                  f"and {_MASK}")
+    run = env["tmp"] / "runs" / "11"
+    run.mkdir(parents=True)
+    (run / "output.jsonl").write_text(json.dumps({"type": "user", "content": text}) + "\n")
+    (run / "job.log").write_text(text + "\n")
+    (run / "result.json").write_text(json.dumps({"status": "done", "summary": text,
+                                                 "metrics": {"peer": json.dumps(tokens)}}))
+    assert redact.scrub_run(run) >= 3
+    for f in run.iterdir():
+        body = f.read_text()
+        assert _CUSTOM not in body and not any(t in body for t in tokens.values()), f.name
+        assert "[secret:peer-set]" in body
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+           (time.time(), "worker", "note", "low", text, "new"))
+    daemon.log(p, text)
+    for body in (json.dumps(p.db.q("SELECT * FROM events")), (p.logs / "daemon.log").read_text()):
+        assert _CUSTOM not in body and not any(t in body for t in tokens.values()) and "[secret:alpha-key]" in body
+    cli.main(["secret", "show"])
+    out = capsys.readouterr().out
+    assert _CUSTOM not in out and not any(t in out for t in tokens.values())
+    assert json.loads(out.splitlines()[0]) == {"alpha-key": "set", "peer-set": ["alpha", "beta"]}

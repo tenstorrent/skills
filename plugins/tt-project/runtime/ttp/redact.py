@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Masks every stored secret (`ttp secret`) in text the harness keeps or sends on.
 
-The values come from the per-user secrets store (project.load_secrets): each field whose name says
-it holds a credential (key, token, secret, password) and is at least MIN_LEN characters long. Each
+The values come from the per-user secrets store (project.load_secrets): in a built-in slot (BUILTIN:
+jev, slack, endpoint/<alias>) each field whose name says it holds a credential (key, token, secret,
+password), in a custom one (`ttp secret set` or `generate`) every string; each at least MIN_LEN
+characters long. Each
 becomes `[secret:<slot>]`, e.g. `[secret:endpoint/tt-cloud]`. One helper for every route:
 
 - the database (Db.x): event, note, notify, message and hand-off text, so every `ttp` command and the
@@ -25,7 +27,14 @@ from typing import Any
 MIN_LEN = 8                      # shorter values would mask ordinary words
 SECRET_FIELD_RE = re.compile(r"key|token|secret|passw", re.I)
 MAX_FILE_BYTES = 256 << 20       # a run file bigger than this is left alone (never seen in practice)
+BUILTIN = ("jev", "slack")       # slots whose other fields (via, user_id, url) are not secret
 _cache: dict[str, Any] = {"sig": None, "pairs": []}
+
+
+def custom(slot: str) -> bool:
+    """A slot `ttp secret set` or `generate` made: every string in it is secret."""
+    from .endpoint import PREFIX
+    return slot not in BUILTIN and not slot.startswith(PREFIX)
 
 
 def _sig(path: Path):
@@ -36,14 +45,14 @@ def _sig(path: Path):
     return (str(path), st.st_mtime_ns, st.st_size, st.st_ino)
 
 
-def _collect(slot: str, v: Any, field: str, out: list[tuple[str, str]]) -> None:
+def _collect(slot: str, v: Any, field: str, out: list[tuple[str, str]], every: bool = False) -> None:
     if isinstance(v, dict):
         for k, x in v.items():
-            _collect(slot, x, str(k), out)
+            _collect(slot, x, str(k), out, every)
     elif isinstance(v, list):
         for x in v:
-            _collect(slot, x, field, out)
-    elif isinstance(v, str) and len(v.strip()) >= MIN_LEN and SECRET_FIELD_RE.search(field):
+            _collect(slot, x, field, out, every)
+    elif isinstance(v, str) and len(v.strip()) >= MIN_LEN and (every or SECRET_FIELD_RE.search(field)):
         out.append((v.strip(), slot))
 
 
@@ -62,7 +71,7 @@ def pairs() -> list[tuple[str, str]]:
             return _cache["pairs"]
         out: list[tuple[str, str]] = []
         for slot, v in data.items():
-            _collect(str(slot), v, "key" if isinstance(v, str) else "", out)
+            _collect(str(slot), v, "key" if isinstance(v, str) else "", out, custom(str(slot)))
     except Exception:
         return _cache["pairs"]
     _cache["pairs"] = sorted(set(out), key=lambda p: -len(p[0]))
