@@ -24,6 +24,9 @@ description: "Get a Tenstorrent device box and work on it over ssh: pick a route
   on a box: `box.py agents check <box-alias>` names each gap and the command the skill runs to fix
   it: `agents.md`. A login link lapses: start one only inside the user's usual hours
   (`ttp hours --check`, see `agents.md`).
+- Setting up this machine or a box also covers the user's claude.ai connectors (Atlassian, Google):
+  `box.py connectors check [<box-alias> ...] --verify` checks the same account as this machine,
+  each connector's state and one real read-only call per family: `connectors.md`.
 
 ## Route picker
 

@@ -2217,8 +2217,216 @@ def test_setup_box_agents_check_names_each_gap_with_the_fix_the_skill_runs(tmp_p
     ok = out.replace("ni_claude=\n", "ni_claude=/h/.local/bin/claude\n").replace("auth_claude=no", "auth_claude=yes")
     for stdout, rc, want in ((ok, 0, 0), (out, 0, 1), ("", 255, 255)):
         monkeypatch.setattr(box, "ssh_run", lambda *a, _o=stdout, _r=rc, **k: subprocess.CompletedProcess(a, _r, _o, "x"))
-        args = box.build_parser().parse_args(["--site", str(site), "agents", "check", "<box-alias>"])
+        args = box.build_parser().parse_args(["--site", str(site), "agents", "check", "<box-alias>",
+                                              "--no-connectors"])
         assert args.func(args) == want
+
+
+_CONNECTOR_GOOGLE = ("Google Drive", "Gmail", "Google Calendar", "Google Docs", "Google Sheets", "Google Slides")
+
+
+def _connector_probe(signed_in=True, email="someone@example.invalid", org="org-a", method="claude.ai",
+                     states=None, listed=True, off=""):
+    """What `box_connectors.probe_script()` prints on a machine: sign-in JSON, then `claude mcp list`."""
+    if signed_in is None:
+        return "cauth=none\n"
+    auth = {"loggedIn": signed_in, "authMethod": method if signed_in else "none"}
+    if signed_in:
+        auth.update(email=email, orgId=org, orgName="Example Org")
+    marks = {"connected": "✔ Connected", "needs_auth": "! Needs authentication", "failed": "✗ Failed to connect"}
+    states = {"Atlassian": "connected", **{g: "connected" for g in _CONNECTOR_GOOGLE}} if states is None else states
+    body = "".join(f"claude.ai {n}: https://example.invalid/{i} - {marks[s]}\n" for i, (n, s) in enumerate(states.items()))
+    return (f"coff={off}\ncauth={json.dumps(auth)}\ncmcp=begin\nChecking MCP server health…\n\n{body}"
+            f"local: npx local-mcp - ✔ Connected\ncmcp=end {0 if listed else 1}\n")
+
+
+def _connectors(monkeypatch, probes, verify_out=""):
+    """box_connectors with `here` and each box answering from `probes` ({machine: stdout or (rc, stdout)})."""
+    import subprocess
+    monkeypatch.syspath_prepend(str(BOX_PY.parent))
+    import box
+    import box_connectors as bc
+    ran = []
+
+    def answer(machine, script):
+        ran.append((machine, script))
+        if "cmcp=begin" not in script:
+            return subprocess.CompletedProcess(["sh"], 0, verify_out, "")
+        r = probes[machine]
+        rc, out = r if isinstance(r, tuple) else (0, r)
+        return subprocess.CompletedProcess(["sh"], rc, out, "ssh: connect failed" if rc == 255 else "")
+    monkeypatch.setattr(bc, "_here", lambda script, timeout: answer("here", script))
+    monkeypatch.setattr(box, "ssh_run", lambda m, argv, **k: answer(m, argv[-1]))
+    return bc, ran
+
+
+def test_setup_box_connectors_check_reports_each_state_and_the_one_step_per_account(monkeypatch):
+    # All connected, same account here and on the box: no finding, exit 0.
+    bc, ran = _connectors(monkeypatch, {"here": _connector_probe(), "<box-alias>": _connector_probe()})
+    fams = bc.families()
+    assert fams == {"Atlassian": ["Atlassian"], "Google": list(_CONNECTOR_GOOGLE)}
+    lines, problems, fixes, rc = bc.inspect(["<box-alias>"], fams)
+    assert (problems, fixes, rc) == ([], [], 0), lines
+    assert "<box-alias>: signed in to claude.ai, account same as here" in lines
+    assert "<box-alias> Atlassian: Atlassian connected" in lines
+    assert [m for m, _ in ran] == ["here", "<box-alias>"]
+    # Some need authentication, one failed: each named, the Settings step once per connector.
+    some = {"Atlassian": "needs_auth", "Google Drive": "connected", "Gmail": "needs_auth", "Google Calendar": "failed"}
+    bc, _ = _connectors(monkeypatch, {"here": _connector_probe(), "<box-alias>": _connector_probe(states=some)})
+    lines, problems, fixes, rc = bc.inspect(["<box-alias>"], fams)
+    assert rc == 1
+    assert "<box-alias>: Atlassian needs authentication" in problems and "<box-alias>: Gmail needs authentication" in problems
+    assert "<box-alias>: Google Calendar failed to connect" in problems and "<box-alias>: Google Docs missing" in problems
+    assert any(f.startswith("in claude.ai Settings > Connectors, connect Gmail: once per account") for f in fixes)
+    assert "<box-alias> Google: Google Drive connected, Gmail needs authentication, Google Calendar failed to connect, " \
+        "Google Docs missing, Google Sheets missing, Google Slides missing" in lines
+    # None listed (no claude.ai connector at all): every one missing, with the add step.
+    bc, _ = _connectors(monkeypatch, {"here": _connector_probe(states={})})
+    lines, problems, fixes, rc = bc.inspect([], fams)
+    assert rc == 1 and len(problems) == 7 and all(p.endswith(" missing") for p in problems)
+    assert all("add and connect" in f for f in fixes)
+    # The listing failed: said so, no connector guessed missing.
+    bc, _ = _connectors(monkeypatch, {"here": _connector_probe(listed=False)})
+    lines, problems, _, rc = bc.inspect([], fams)
+    assert problems == ["here: could not list connectors (`claude mcp list` exit 1)"] and rc == 1
+    # Turned off in the environment: a finding.
+    bc, _ = _connectors(monkeypatch, {"here": _connector_probe(off="false")})
+    assert any("turned off" in p for p in bc.inspect([], fams)[1])
+
+
+def test_setup_box_connectors_check_names_a_different_account_or_sign_in_without_printing_it(monkeypatch, capsys):
+    fams = {"Atlassian": ["Atlassian"]}
+    # A different account in the same organization: said plainly, the one fix only on the user's yes.
+    bc, _ = _connectors(monkeypatch, {"here": _connector_probe(),
+                                      "<box-alias>": _connector_probe(email="other@example.invalid")})
+    lines, problems, fixes, rc = bc.inspect(["<box-alias>"], fams)
+    assert "<box-alias>: signed in to claude.ai, account different (same organization) from here" in lines
+    assert rc == 1 and problems[0].startswith("<box-alias>: signed in to a different claude.ai account")
+    assert fixes[0].startswith("only on the user's yes") and "claude auth logout" in fixes[0]
+    # Another organization: no "same organization"; its connector steps name the box's own account.
+    bc, _ = _connectors(monkeypatch, {"here": _connector_probe(), "<box-alias>": _connector_probe(
+        email="other@example.invalid", org="org-b", states={"Atlassian": "needs_auth"})})
+    lines, problems, fixes, rc = bc.inspect(["<box-alias>"], fams)
+    assert "<box-alias>: signed in to claude.ai, account different from here" in lines
+    assert any("connect Atlassian (on the account <box-alias> is signed into)" in f for f in fixes)
+    # Signed out, not installed, an API key, ssh failing: each named, with its fix; nothing logs in by itself.
+    bc, ran = _connectors(monkeypatch, {"here": _connector_probe(), "<box-alias>": _connector_probe(signed_in=False),
+                                        "b2": _connector_probe(signed_in=None), "b3": _connector_probe(method="apiKey"),
+                                        "b4": (255, "")})
+    lines, problems, fixes, rc = bc.inspect(["<box-alias>", "b2", "b3", "b4"], fams)
+    assert "<box-alias>: Claude Code is signed out" in problems and "b2: Claude Code not installed" in problems
+    assert any(p.startswith("b3: Claude Code is signed in with apiKey") for p in problems)
+    assert "b4: unreachable over ssh" in problems and rc == 255
+    assert any(f.startswith(f"{bc.BOX_PY} agents login <box-alias> claude") for f in fixes)
+    assert all(" login" not in s and "logout" not in s for _, s in ran)
+    # Here signed out: the boxes are not compared.
+    bc, _ = _connectors(monkeypatch, {"here": _connector_probe(signed_in=False), "<box-alias>": _connector_probe()})
+    lines, problems, _, _ = bc.inspect(["<box-alias>"], fams)
+    assert "here: Claude Code is signed out" in problems
+    assert "<box-alias>: signed in to claude.ai; account not compared (here is not signed in)" in lines
+    # The command prints no email, organization name or id, also as JSON; the probe reads no credential file.
+    bc, _ = _connectors(monkeypatch, {"here": _connector_probe(),
+                                      "<box-alias>": _connector_probe(email="other@example.invalid")})
+    import box
+    for extra in ([], ["--json"]):
+        args = box.build_parser().parse_args(["--site", "/nonexistent", "connectors", "check", "<box-alias>", *extra])
+        assert args.func(args) == 1
+        out = capsys.readouterr().out
+        assert "different" in out and not any(x in out for x in ("example.invalid", "Example Org", "org-a"))
+    script = bc.probe_script()
+    assert "auth status --json" in script and "mcp list" in script
+    assert ".credentials" not in script and "login" not in script and "logout" not in script
+
+
+def test_setup_box_connectors_families_extend_from_the_site_file_and_flag(monkeypatch):
+    monkeypatch.syspath_prepend(str(BOX_PY.parent))
+    import box_connectors as bc
+    fams = bc.families({"connectors": {"Google": ["Google Drive", "Google Forms"], "Notes": ["Example Notes"]}},
+                       ["Notes=Other Notes, Example Notes"])
+    assert fams["Google"] == list(_CONNECTOR_GOOGLE) + ["Google Forms"]
+    assert fams["Notes"] == ["Example Notes", "Other Notes"] and fams["Atlassian"] == ["Atlassian"]
+    for bad in ({"connectors": ["Atlassian"]}, {"connectors": {"X": "Atlassian"}}, {"connectors": {"X": [""]}}):
+        with pytest.raises(ValueError):
+            bc.families(bad)
+    with pytest.raises(ValueError):
+        bc.families(None, ["Notes"])
+
+
+def test_setup_box_connectors_verify_is_one_read_only_call_per_family_and_reports_pass_or_fail(monkeypatch):
+    import re
+    import subprocess
+    monkeypatch.syspath_prepend(str(BOX_PY.parent))
+    import box_connectors as bc
+    targets = {"Atlassian": ["Atlassian"], "Google": ["Google Drive", "Google Docs"]}
+    script = bc.verify_script(targets)
+    assert script.count(" -p ") == 2 and script.count("--max-budget-usd 0.25") == 2
+    assert "--model haiku" in script and "mcp__claude_ai_Google_Drive" in script and "mcp__claude_ai_Atlassian" in script
+    # The hook lets through only ToolSearch and a connector's read tools; any write or other tool is refused.
+    hook = json.loads(bc.hook_settings())["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    for tool, allowed in (("ToolSearch", True), ("mcp__claude_ai_Atlassian__search", True),
+                          ("mcp__claude_ai_Google_Drive__list_files", True), ("mcp__claude_ai_Gmail__get_thread", True),
+                          ("mcp__claude_ai_Atlassian__createJiraIssue", False), ("mcp__claude_ai_Google_Docs__update_doc", False),
+                          ("mcp__claude_ai_Gmail__send_message", False), ("Bash", False), ("Write", False),
+                          ("mcp__claude_ai_X__search__delete", False)):
+        r = subprocess.run(["sh", "-c", hook], input=json.dumps({"tool_name": tool}), capture_output=True, text=True)
+        assert (r.returncode == 0) is allowed, (tool, r.returncode)
+    assert re.fullmatch(bc.READ_TOOL, "mcp__claude_ai_Atlassian__getJiraIssue")
+    # Only the tool's name, the answer line and each connector's headless state come back.
+    out = ("headless_0=Atlassian:connected\nverify_0=mcp__claude_ai_Atlassian__search|CONNECTOR_OK=5\n"
+           "headless_1=Google Drive:needs-auth;Google Docs:connected\nverify_1=|CONNECTOR_ERROR=no Drive\n")
+    v = bc.read_verify(out, targets)
+    assert v["Atlassian"] == {"ok": True, "tool": "mcp__claude_ai_Atlassian__search", "items": 5, "error": "",
+                              "headless": {"Atlassian": "connected"}}
+    assert not v["Google"]["ok"] and v["Google"]["error"] == "no Drive"
+    assert v["Google"]["headless"] == {"Google Drive": "needs-auth", "Google Docs": "connected"}
+    # Another family's tool, or an OK with no tool called, does not pass.
+    v = bc.read_verify("verify_0=mcp__claude_ai_Gmail__search|CONNECTOR_OK=3\n", {"Atlassian": ["Atlassian"]})
+    assert v["Atlassian"]["ok"] is False and v["Atlassian"]["error"] == "no connector tool was called"
+    # Through inspect: verify runs only for connected families, and the report says pass or fail with the fix.
+    probe = _connector_probe(states={"Atlassian": "connected", "Google Drive": "connected", "Google Docs": "connected"})
+    bc2, ran = _connectors(monkeypatch, {"here": probe}, verify_out=out)
+    lines, problems, fixes, rc = bc2.inspect([], {"Atlassian": ["Atlassian"], "Google": ["Google Drive", "Google Docs"]},
+                                             verify=True)
+    assert len(ran) == 2 and rc == 1
+    assert "here Atlassian verify: pass (mcp__claude_ai_Atlassian__search, 5 items)" in lines
+    assert "here Google verify: fail (no Drive)" in lines
+    assert any(ln.startswith("here Google headless (`claude -p`") and "Google Drive needs-auth" in ln for ln in lines)
+    assert problems == ["here: Google verify failed (no Drive)"]
+    assert fixes == ["in claude.ai Settings > Connectors, reconnect Google Drive, then rerun with --verify"]
+
+
+def test_setup_box_agents_check_adds_connector_findings_and_the_plan_runs_the_check(tmp_path, monkeypatch, capsys):
+    import subprocess
+    bc, _ = _connectors(monkeypatch, {"here": _connector_probe(),
+                                      "<box-alias>": _connector_probe(states={"Atlassian": "needs_auth"})})
+    import box
+    agents_out = ("ni_claude=/h/.local/bin/claude\nlogin_claude=/h/.local/bin/claude\nbin_claude=/h/.local/bin/claude\n"
+                  "ver_claude=2.1.0 (Claude Code)\nauth_claude=yes\n"
+                  "server=/h/.cursor-server/bin/linux-x64/aaa/bin/cursor-server|anthropic.claude-code,openai.chatgpt,\n")
+
+    def ssh(m, argv, **k):
+        script = argv[-1]
+        if "cmcp=begin" in script:
+            return subprocess.CompletedProcess(argv, 0, _connector_probe(states={"Atlassian": "needs_auth"}), "")
+        return subprocess.CompletedProcess(argv, 0, agents_out, "")
+    monkeypatch.setattr(box, "ssh_run", ssh)
+    site = tmp_path / "boxes.json"
+    site.write_text(json.dumps({"version": 1, "boxes": {"<box-alias>": {"route": "bare", "workdir_root": "~/w"}}}))
+    args = box.build_parser().parse_args(["--site", str(site), "agents", "check", "<box-alias>", "--cli", "claude"])
+    assert args.func(args) == 1
+    out = capsys.readouterr().out
+    assert "connectors <box-alias>: Atlassian needs authentication" in out and "Google Docs missing" in out
+    assert "connectors here" not in out
+    args = box.build_parser().parse_args(["--site", str(site), "agents", "check", "<box-alias>", "--cli", "claude",
+                                          "--no-connectors"])
+    assert args.func(args) == 0
+    # The setup plan checks connectors after the logins.
+    page = (SKILLS / "setup-box" / "connectors.md").read_text(encoding="utf-8")
+    for want in ("claude auth status --json", "claude.ai Settings > Connectors", "--max-budget-usd 0.25",
+                 "codex mcp add", "codex mcp login", "only on the user's yes", "--no-connectors", "tt-buddy"):
+        assert want in page, want
+    for f in ("SKILL.md", "agents.md", "new-box.md", "site.md"):
+        assert "`connectors.md`" in (SKILLS / "setup-box" / f).read_text(encoding="utf-8"), f
 
 
 def test_setup_box_agents_login_relays_link_and_code_and_keeps_tokens_on_the_box(tmp_path, monkeypatch):
@@ -2717,11 +2925,13 @@ def test_setup_box_agents_questions_default_yes_and_plan_runs_the_scripted_steps
     assert "glean MCP server" in by["agent_clis"][0]["action"]
     assert "--cli none --extensions --run" in by["agents.extensions"][0]["action"]
     assert "agents editor-defaults --run" in by["agents.defaults"][0]["action"]
+    assert by["connectors"][0]["check"].startswith(f"{box_py} connectors check <box-alias> --verify")
+    assert [s["id"] for s in steps].index("connectors") > [s["id"] for s in steps].index("agents.login")
     # No editor: no extension or editor-settings step; no CLIs: no login question.
     answers = bs.merge(saved, {"editor": "none", "agent_clis": "none"})
     assert bs.pending(answers) == []
     ids = {s["id"] for s in bs.plan("<box-alias>", {"workdir_root": "~/w"}, answers["answers"])}
-    assert not ids & {"agent_clis", "agents.login", "agents.extensions", "agents.defaults"}
+    assert not ids & {"agent_clis", "agents.login", "agents.extensions", "agents.defaults", "connectors"}
 
 
 def test_setup_box_agents_page_says_extensions_log_in_on_the_box():

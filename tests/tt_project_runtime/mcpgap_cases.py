@@ -220,3 +220,12 @@ def test_mcp_gap_connector_listed_in_mcp_servers_stays_named_only_withheld_drops
     g = mcpgap.gap({"worker_isolation": True, "mcp_servers": ["search"], "mcp_withheld": ["tickets"]},
                    {"ok": True, "connected": ["search", "tickets"]})
     assert g["state"] == "none"
+
+
+def test_mcp_list_states_names_connected_needs_auth_and_failed():
+    from ttp import mcpgap
+    st = mcpgap.states(MCP_LIST)
+    assert st["claude.ai Gmail"] == "connected" and st["claude.ai Example Calendar"] == "needs_auth"
+    assert st["claude.ai Example Drive"] == "failed" and st["wiki"] == "failed" and st["chat"] == "needs_auth"
+    assert "Checking MCP server health…" not in st and mcpgap.states("") == {}
+    assert mcpgap.parse(MCP_LIST) == [n for n, s in st.items() if s == "connected"]

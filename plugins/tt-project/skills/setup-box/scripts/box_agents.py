@@ -631,6 +631,8 @@ def cmd_check(args) -> int:
             search = {ln.split("=", 1)[0][7:]: ln.split("=", 1)[1].strip()
                       for ln in rs.stdout.splitlines() if ln.startswith("search_")}
     lines, problems, fixes = read_check(r.stdout, args.alias, clis, exts, glean_url(args)[0], search)
+    if "claude" in clis and "auth_claude=yes" in r.stdout.splitlines() and not getattr(args, "no_connectors", False):
+        lines, problems, fixes = connector_findings(args, lines, problems, fixes)
     if args.json:
         print(json.dumps({"alias": args.alias, "lines": lines, "problems": problems, "fixes": fixes}))
     else:
@@ -638,6 +640,19 @@ def cmd_check(args) -> int:
                         + (["fix (the skill runs these; a login needs the user only to enter its code):"]
                            + [f"  {f}" for f in fixes] if fixes else [])))
     return 1 if problems else 0
+
+
+def connector_findings(args, lines: List[str], problems: List[str], fixes: List[str]):
+    """The box's claude.ai account connectors (`box.py connectors check <alias>`, `connectors.md`) as more findings:
+    a different account than this machine's, and each connector that needs authentication or is missing."""
+    import box_connectors
+    try:
+        fams = box_connectors.families(_site_entry(args)[0])
+    except ValueError as e:
+        return lines, problems + [f"connectors: {e}"], fixes
+    ln, pr, fx, _ = box_connectors.inspect([args.alias], fams, here=False)
+    return (lines + [f"connectors {x}" for x in ln], problems + [f"connectors {x}" for x in pr],
+            fixes + [f for f in fx if f not in fixes])
 
 
 def cmd_install(args) -> int:
@@ -964,6 +979,8 @@ def register(sub) -> None:
     c.add_argument("--glean-url", help="the Glean MCP URL to expect (default as for install)")
     c.add_argument("--search", action="store_true",
                    help="prove Glean works: one real one-shot Glean search per signed-in CLI (a model call each)")
+    c.add_argument("--no-connectors", action="store_true",
+                   help="skip the claude.ai account connectors (`box.py connectors check`)")
     c.set_defaults(func=cmd_check)
     i = ag.add_parser("install", help="CLIs, PATH lines and editor extensions (dry run unless --run)")
     i.add_argument("alias")

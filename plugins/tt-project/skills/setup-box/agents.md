@@ -110,6 +110,8 @@ Link to the tt-buddy plugin's recipes and skills; do not copy them here.
 - Claude Code also lists the account's own connectors, such as `claude.ai Glean`, beside the
   `glean` server. That connector is separate and needs its own sign-in (`/mcp` in Claude Code, or
   the connector settings on claude.ai). A `Needs authentication` on it says nothing about `glean`.
+- Account connectors (Atlassian, Google and others) follow the claude.ai account, not the box:
+  `connectors.md`. `check` adds their findings for a logged-in Claude Code (`--no-connectors` skips).
 - `check` reports Glean per agent: missing, configured but signed out, or working, and each
   editor's entry as configured or missing. `check --search` proves working: each signed-in CLI
   runs one real non-interactive Glean search (`claude -p ... --allowedTools=mcp__glean`,

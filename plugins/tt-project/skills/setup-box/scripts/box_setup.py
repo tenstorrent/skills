@@ -429,6 +429,12 @@ def agent_steps(alias: str, answers: dict, box_py: str, step) -> None:
             step("agents.login", f"`{box_py} agents login {alias} {c} --mcp {box_agents.MCP}` once its server is set "
                                  "up: tell the user its sign-in link; pass back the address the browser ends on",
                  f"{box_py} agents login {alias} {c} --mcp {box_agents.MCP} --status  (exit 0 signed in)")
+    if "claude" in clis and answers.get("agents.login") == "yes":
+        step("connectors", f"`{box_py} connectors check {alias} --verify`: the box's Claude Code on the same claude.ai "
+                           "account as this machine (a switch only on the user's yes), its Atlassian and Google "
+                           "connectors connected, one read-only call per family (`connectors.md`)",
+             f"{box_py} connectors check {alias} --verify  (expect: account same; each connector connected; "
+             "each verify pass)")
     if answers.get("editor", "none") != "none" and answers.get("agents.extensions") == "yes":
         step("agents.extensions", f"`{box_py} agents install {alias} --cli none --extensions --run`: "
                                   f"{' and '.join(box_agents.EXTENSIONS)} on every Cursor and VS Code server build on "

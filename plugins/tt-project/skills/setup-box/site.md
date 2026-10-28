@@ -26,7 +26,8 @@ prompt template or skill.
       "mcp": {"<server-name>": "<endpoint>"}
     }
   },
-  "mcp": {"glean": "<glean-mcp-url>"}
+  "mcp": {"glean": "<glean-mcp-url>"},
+  "connectors": {"<family>": ["<connector>"]}
 }
 ```
 
@@ -55,6 +56,8 @@ fails `box.py site check` with `missing version/boxes wrapper`.
 | `note` | no | free text for the reader |
 
 A top-level `mcp` (beside `boxes`) holds endpoints for every box; a box's own `mcp` wins.
+A top-level `connectors` adds claude.ai connector families, or extends a default one (Atlassian,
+Google), for `box.py connectors check`: family name to a list of connector names (`connectors.md`).
 Other keys are reported as warnings, not errors.
 
 ## Check it

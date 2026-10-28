@@ -94,6 +94,8 @@ not skipped.
   place). A broker job needs an env too: the `tt-buddy:run` skill's `skills/run/mcp.md`.
 - Agent CLIs, logins and editor extensions: `box.py agents install|login|editor-defaults`, checked
   with `box.py agents check <box-alias>`: `agents.md`. The user only enters a login code.
+- claude.ai connectors (Atlassian, Google): `box.py connectors check <box-alias> --verify`; an
+  account switch only on the user's yes: `connectors.md`.
 - Projects: the box goes into each named project's charter Resources; the plan does not edit
   charters.
 - Recovery, device lock and disk guard: `ttp machines add <box-alias>` with `--owner`/`--fallback`,

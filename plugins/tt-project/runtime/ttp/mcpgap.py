@@ -29,17 +29,23 @@ CONNECTOR_PREFIXES = ("claude.ai", "claude_ai_")   # as providers.claude: accoun
 PLUGIN_PREFIX = "plugin:"
 
 
-def parse(text: str) -> list[str]:
-    """The names `claude mcp list` reports as connected: lines `<name>: <target> - <mark> Connected`."""
-    out: list[str] = []
+def states(text: str) -> dict[str, str]:
+    """Each server `claude mcp list` reports, by name: "connected", "needs_auth", or "failed" (any other mark,
+    such as a connected server whose tools could not be read). Lines `<name>: <target> - <mark> <status>`."""
+    out: dict[str, str] = {}
     for ln in text.splitlines():
         name, sep, rest = ln.strip().partition(": ")
-        if not sep or " - " not in rest:
+        if not sep or " - " not in rest or name in out:
             continue
         status = rest.rsplit(" - ", 1)[1].strip().lower()
-        if status.endswith("connected") and "not connected" not in status and name not in out:
-            out.append(name)
+        out[name] = ("connected" if status.endswith("connected") and "not connected" not in status
+                     else "needs_auth" if "needs auth" in status else "failed")
     return out
+
+
+def parse(text: str) -> list[str]:
+    """The names `claude mcp list` reports as connected."""
+    return [n for n, s in states(text).items() if s == "connected"]
 
 
 def split(names: list[str]) -> tuple[list[str], list[str]]:
