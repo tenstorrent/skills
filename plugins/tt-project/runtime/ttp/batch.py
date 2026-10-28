@@ -23,7 +23,12 @@ upgrades wait only for that one). It then runs `delivery.after_push` (a deploy) 
 under a lock of its own, `after_push:run-<id>`. A marker that has an outcome but whose after_push did
 not finish is resumed: only the after_push step runs. Before `git push` the marker records what the push
 lands (`pushing`), so a process that dies between the push and its outcome (a reboot) is settled as
-pushed once its head is found on the branch, never pushed twice (pushq.finalize)."""
+pushed once its head is found on the branch, never pushed twice (pushq.finalize).
+
+While a device broker announces a power cycle of this host (cyclenotice.py), after_push does not start:
+the marker (or an ordinary push's receipt) records `after_held`, and the daemon runs it once the notice
+is gone, spending no resume. An ordinary push's after_push that a reboot cut short is run once more after
+the boot, like a batch's (pushq.tend_receipts)."""
 from __future__ import annotations
 
 import difflib
@@ -42,7 +47,8 @@ import tokenize
 from collections import deque
 from pathlib import Path
 
-from . import (checkcap, checkdirs, conflictfix, envfault, locks, push, pushpass, runner, scopehold, scriptwatch,
+from . import (checkcap, checkdirs, conflictfix, cyclenotice, envfault, locks, push, pushpass, runner, scopehold,
+               scriptwatch,
                sharedchecks, slowtests, suitecost, worktree)
 from .project import Project, command_env, durable_write, write_json
 
@@ -1628,6 +1634,11 @@ def after_ordinary_push(p: Project, repo: Path, sha: str, target: str, tip: str 
         m["version"] = push.pushed_version(p, repo, sha)
     except Exception:      # an unreadable version leaves TTP_PUSHED_VERSION empty; the deploy still runs
         m["version"] = None
+    if why := _notice_hold(p):    # the daemon runs it once the notice is gone (pushq.tend_receipts)
+        say(f"after_push held: {why}; the daemon runs it once the notice is gone")
+        m.update(status="held", after_held={"at": time.time(), "why": why})
+        write_json(receipt, m)
+        return {"status": "held", "reason": why, "receipt": str(receipt)}
     lock = locks.try_take([_after_lock(p, rid)], f"after_push of {sha[:10]}", "ttp push")
     write_json(receipt, m)
     try:
@@ -1644,6 +1655,68 @@ def after_ordinary_push(p: Project, repo: Path, sha: str, target: str, tip: str 
             lock.close()
     _forget(_after_lock(p, rid))
     return {**after, "receipt": str(receipt)}
+
+
+def _notice_hold(p: Project) -> str:
+    """The line of a power cycle of this host a device broker announced, or "" (cyclenotice.py)."""
+    if not push.after_set(p):
+        return ""
+    h = cyclenotice.held(cyclenotice.project_paths(p))
+    return cyclenotice.line(h, p) if h else ""
+
+
+def _deploy_held(p: Project, marker: Path, m: dict, lock_path: Path, lock) -> bool:
+    """While a power cycle is announced, after_push waits: the marker records `after_held` and the lock goes,
+    so the daemon (pushq.finalize) resumes it once the notice is gone, without spending a resume."""
+    why = _notice_hold(p)
+    if not why:
+        return False
+    say(f"after_push held: {why}; the daemon runs it once the notice is gone")
+    m.update(after_held={"at": time.time(), "why": why})
+    write_json(marker, m)
+    _forget(lock_path)
+    lock.close()
+    return True
+
+
+def rerun_argv(p: Project, receipt: Path) -> list[str]:
+    """The process that runs an ordinary push's held or reboot-cut after_push (rerun_receipt); tests stub it."""
+    return [sys.executable, "-c", "import sys; from ttp import batch; from ttp.project import Project; "
+            "sys.exit(batch.rerun_receipt(Project(sys.argv[1]), sys.argv[2]))", str(p.base), str(receipt)]
+
+
+def rerun_receipt(p: Project, receipt) -> int:
+    """Run the after_push a receipt names once more (pushq.tend_receipts started this): held again while
+    a power cycle is still announced."""
+    receipt = Path(receipt)
+    m = push._read(receipt)
+    rid = str(m.get("id") or receipt.stem)
+    lock = locks.try_take([_after_lock(p, rid)], f"after_push of {str(m.get('pushed_sha') or '')[:10]} (again)",
+                          "the push queue")
+    if lock is None:
+        return push.BUSY
+    try:
+        m = push._read(receipt) or m
+        if m.get("status") not in ("held", "rerun"):
+            return 0      # another process ran it meanwhile
+        if why := _notice_hold(p):
+            m.update(status="held", after_held={"at": time.time(), "why": why})
+            write_json(receipt, m)
+            return 0
+        m.update(status="running", pid=os.getpid(), boot=runner.boot_id(), resumed=time.time())
+        m.pop("after_held", None)
+        write_json(receipt, m)
+        try:
+            after = after_push(p, receipt, m)
+        except Exception as e:
+            after = {"status": "failed", "exit": None, "cmd": None, "tail": f"{type(e).__name__}: {e}",
+                     "started": m.get("resumed"), "ended": time.time()}
+        m.update(after_push=after, status="finished", ended=time.time())
+        write_json(receipt, m)
+    finally:
+        lock.close()
+    _forget(_after_lock(p, rid))
+    return 0
 
 
 def _finish(p: Project, marker: Path, m: dict, after: dict, lock) -> None:
@@ -1731,6 +1804,8 @@ def run_batch(p: Project, marker: Path) -> int:
     run_lock.close()
     if b.target_lock is not None:
         b.target_lock.close()
+    if ap_lock is not None and outcome == "pushed" and _deploy_held(p, marker, m, ap_path, ap_lock):
+        return EXIT.get(outcome, 1)
     if ap_lock is None:
         after = {"status": "skipped", "reason": "another process holds this batch's after_push lock"}
     else:
@@ -1757,8 +1832,10 @@ def _resume(p: Project, marker: Path, m: dict, bid: str) -> int:
                 _Fd(fd).close()
     m.update(lock=str(ap_path), phase="after_push")
     write_json(marker, m)
-    say(f"resuming the after_push of batch {bid} ({m.get('outcome')})")
     done = m.get("after_push") if isinstance(m.get("after_push"), dict) and m["after_push"].get("ended") else None
+    if not done and m.get("outcome") == "pushed" and _deploy_held(p, marker, m, ap_path, lock):
+        return 0
+    say(f"resuming the after_push of batch {bid} ({m.get('outcome')})")
     try:
         after = done or after_push(p, marker, m)
     except Exception as e:

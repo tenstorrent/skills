@@ -458,6 +458,10 @@ def push_in_flight(p: Project) -> bool:
 
 def hold_reason(p: Project, d: dict) -> str:
     """Why the daemon must not start an automatic upgrade to `d` now ("" = go)."""
+    from . import cyclenotice
+    h = cyclenotice.held(cyclenotice.project_paths(p))
+    if h:       # busy, not a try: nothing is recorded, so it starts once the notice is gone
+        return cyclenotice.line(h, p) + "; " + CYCLE_HELD
     if _taken(upgrade_lock(p)):
         return "an upgrade is in flight"
     if push_in_flight(p):
@@ -476,6 +480,9 @@ def hold_reason(p: Project, d: dict) -> str:
     if rec.get("key") == d["key"] and rec.get("outcome") != "held":
         return "already tried for this release"
     return ""
+
+
+CYCLE_HELD = "held until it is gone"   # the tail of hold_reason's power-cycle line: rechecked soon
 
 
 def launch(p: Project) -> None:

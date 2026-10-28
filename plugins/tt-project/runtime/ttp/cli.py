@@ -6929,6 +6929,8 @@ def cmd_setup(a) -> None:
     from .project import HOME_DIR
     from .release import forced_mark, forced_version, is_newer, runtime_version
     lib = HOME_DIR / "lib" / __version__
+    from . import cyclenotice
+    _cycle_hold(cyclenotice.host_paths(), a)
     if not (PLUGIN_ROOT / "template").is_dir():
         die(f"{RUNTIME} is a project's harness copy, not the plugin; run `<plugin-root>/bin/ttp setup`", 1)
     installed = runtime_version(HOME_DIR / "lib" / "current" / "runtime")
@@ -7006,6 +7008,30 @@ def cmd_uninstall(a) -> None:
         print(f"  {ln}")
 
 
+def cyclenotice_paths(p: Project) -> list[str]:
+    from . import cyclenotice
+    return cyclenotice.project_paths(p)
+
+
+def _cycle_hold(paths: list[str], a, where=None, auto_rec: Project | None = None) -> None:
+    """Exit 75 (busy), changing nothing, while a device broker announces a power cycle of this host
+    (cyclenotice.py); with --ignore-cycle-notice go on with a warning. `auto_rec`: the daemon's own
+    upgrade, recorded as held (no attempt spent; the daemon retries once the notice is gone)."""
+    from . import cyclenotice
+    h = cyclenotice.held(paths)
+    if not h:
+        return
+    why = cyclenotice.line(h, where)
+    if getattr(a, "ignore_cycle_notice", False):
+        print(f"warning: {why}; going ahead (--ignore-cycle-notice)", file=sys.stderr)
+        return
+    if auto_rec is not None:
+        from . import release
+        release.finish(auto_rec, "held", why=why)
+    die(f"held: {why}; nothing was changed. It goes ahead once the notice is gone "
+        f"(--ignore-cycle-notice proceeds anyway)", cyclenotice.BUSY)
+
+
 def cmd_upgrade(a) -> None:
     """Merge the installed template into a project's harness. The harness repo keeps pristine
     template snapshots on its `upstream` branch, so this is an ordinary three-way merge. `--auto` is
@@ -7030,6 +7056,7 @@ def cmd_upgrade(a) -> None:
             print(mm.push(entry.get("ssh") or entry["host"]))
             sys.exit(forward(entry, sys.argv[1:]))
         p = need(a.name, sys.argv[1:])
+    _cycle_hold(cyclenotice_paths(p), a, p, auto_rec=p if a.auto else None)
     from . import notifier
     for ln in notifier.refresh(send_test=not a.auto):   # this machine's notifier on the installed code too
         print(ln)
@@ -9217,6 +9244,8 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("setup", help="install ttp for this user (stable copy + shim on PATH)")
     s.add_argument("--bin-dir", default="~/.local/bin", help="where the ttp command goes (default ~/.local/bin)")
     s.add_argument("--force", action="store_true", help="install even over a newer installed ttp")
+    s.add_argument("--ignore-cycle-notice", action="store_true",
+                   help="go ahead although a device broker announced a power cycle of this host (a warning is printed)")
     s.add_argument("--no-shortcut", action="store_true",
                    help="remove (and do not install) the plain /tt-project command for Claude Code")
     s.set_defaults(fn=cmd_setup)
@@ -9235,6 +9264,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--apply", metavar="COMMIT",
                    help="an upgrade task's last step: fast-forward main to its checked merge and restart")
     s.add_argument("--project-dir", help=argparse.SUPPRESS)
+    s.add_argument("--ignore-cycle-notice", action="store_true",
+                   help="go ahead although a device broker announced a power cycle of this host (a warning is printed)")
     s.add_argument("--take-over-from", metavar="TASK", type=int,
                    help="host-side takeover: harness task TASK missed its takeover deadline, so this upgrade "
                         "takes the template merge over from it even while it still shows activity")

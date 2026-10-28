@@ -7017,9 +7017,10 @@ class Daemon:
             return
         why = release.hold_reason(self.p, d)
         if why:
-            if why.endswith("in flight"):
+            soon = why.endswith(("in flight", release.CYCLE_HELD))
+            if soon:
                 self._release_due = now + release.HELD_RECHECK_S
-            if (db.kv(release.KV_AUTO) or {}).get("key") != d["key"] or why.endswith("in flight"):
+            if (db.kv(release.KV_AUTO) or {}).get("key") != d["key"] or soon:
                 log(self.p, f"automatic upgrade to {d['installed']} held: {why}")
             return
         log(self.p, f"automatic upgrade from {d['current']} to {d['installed']}: starting `ttp upgrade`")

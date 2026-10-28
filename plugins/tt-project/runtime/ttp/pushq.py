@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import checkdirs, batch, conflictfix, coordinator as coord, envfault, locks, msgparts, prhead, push, pushclaim, replymsg, runner, scopehold, sharedchecks, timefmt, upstream
+from . import checkdirs, batch, conflictfix, coordinator as coord, cyclenotice, envfault, locks, msgparts, prhead, push, pushclaim, replymsg, runner, scopehold, sharedchecks, timefmt, upstream
 from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
                  pin_of, review_subject, reviewed_ids)
 from .landed import on_branch
@@ -45,6 +45,7 @@ DEFAULT_LANDING_ALERT_H = 4     # delivery.push_landing_alert_h: approvals waiti
 LANDING_ALERT = "push_not_landing"   # the keyed alert while nothing lands despite batches (alerts.holds)
 LANDED_OUTCOMES = ("pushed", "landed")   # batch outcomes that put the approvals on the push branch
 DEPLOY_ALERTED = "deploy_alerted"   # deploy.ALERTED: the last deploy alert, by commit
+RERUN_START_S = 900              # a receipt's rerun that has not taken it up in this long never started
 MAX_RESUMES = 1                 # respawns of an after_push that died (a reboot killed the deploy)
 RECOVER_S = 1800                # a batch that died mid-push: how long its remote may stay unreadable
 RECOVER_GAP_S = 120             # ... asked at most this often meanwhile
@@ -1728,7 +1729,13 @@ def _after_push_set(p: Project, cfg: dict | None) -> bool:
         return True
 
 
-def _resume(p: Project, b: dict, marker: Path, now: float) -> bool:
+def _cycle_held(p: Project, cfg: dict | None) -> str:
+    """The line of a power cycle of this host a device broker announced, or "" (cyclenotice.py)."""
+    h = cyclenotice.held(cyclenotice.paths(cfg) if cfg else cyclenotice.project_paths(p))
+    return cyclenotice.line(h, p) if h else ""
+
+
+def _resume(p: Project, b: dict, marker: Path, now: float, free: bool = False) -> bool:
     """Run the after_push of a batch whose process died in it once more: the same
     `ttp push --batch <marker>`, which resumes at after_push since the marker has an outcome. It holds
     the batch's after_push lock (not `push:`, so upgrades do not wait for it), passed down as at the
@@ -1739,10 +1746,14 @@ def _resume(p: Project, b: dict, marker: Path, now: float) -> bool:
     if lock is None:
         return False
     try:
-        if not db.conn.execute("UPDATE push_batches SET after_tries=after_tries+1 WHERE id=? AND after_tries<? AND "
-                               "after_finalized IS NULL", (b["id"], MAX_RESUMES)).rowcount:
+        # One the batch itself held for a power-cycle notice (`free`) spends no resume.
+        if not db.conn.execute("UPDATE push_batches SET after_tries=after_tries+? WHERE id=? AND (after_tries<? OR ?) "
+                               "AND after_finalized IS NULL", (0 if free else 1, b["id"], MAX_RESUMES,
+                                                               int(free))).rowcount:
             return False
         m = _read(marker)
+        for k in ("after_held", "held_said"):
+            m.pop(k, None)
         m.update(lock=str(lock_path), phase="after_push", resumed=now)
         write_json(marker, m)
         child = _spawn(p, b["id"], marker, lock)
@@ -1780,6 +1791,15 @@ def tend_receipts(p: Project, alert: Callable = lambda *a, **k: None, now: float
                 receipt.unlink(missing_ok=True)
             continue
         rid = str(m.get("id") or receipt.stem)
+        if m.get("status") == "rerun" and float(m.get("rerun_at") or 0) <= now - RERUN_START_S \
+                and int(m.get("tries") or 0) > MAX_RESUMES:
+            m["status"] = "running"     # its rerun never got going: reported below as stopped
+            write_json(receipt, m)
+        if m.get("status") in ("held", "rerun") or (m.get("status") == "running" and locks.any_free(
+                [batch._after_lock(p, rid)]) and _read(receipt).get("status") == "running"
+                and m.get("boot") and not runner.same_boot(m.get("boot")) and int(m.get("tries") or 0) < MAX_RESUMES):
+            _rerun_receipt(p, receipt, rid, now)      # held for a power cycle, or a reboot cut it short
+            continue
         if m.get("status") == "running":
             if not locks.any_free([batch._after_lock(p, rid)]):
                 continue
@@ -1810,6 +1830,34 @@ def tend_receipts(p: Project, alert: Callable = lambda *a, **k: None, now: float
         write_json(receipt, m)
         done.append(rid)
     return done
+
+
+def _rerun_receipt(p: Project, receipt: Path, rid: str, now: float) -> None:
+    """An ordinary push's after_push that waited for a power-cycle notice (no resume spent) or that a reboot
+    cut short (once, MAX_RESUMES): run it again, detached (batch.rerun_receipt), once no notice holds."""
+    m = _read(receipt)
+    if _cycle_held(p, None):
+        return
+    if m.get("status") == "rerun" and float(m.get("rerun_at") or 0) > now - RERUN_START_S:
+        return          # its process is starting (or another tick started it): not twice
+    if m.get("status") in ("running", "rerun"):
+        m["tries"] = int(m.get("tries") or 0) + 1
+        why = "a reboot cut it short"
+    else:
+        why = "the power-cycle notice it waited for is gone" if m.get("status") == "held" else "its rerun did not start"
+    m.update(status="rerun", rerun_at=now)
+    write_json(receipt, m)
+    try:
+        subprocess.Popen(batch.rerun_argv(p, receipt), cwd=str(p.root), stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                         env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+                              "TTP_PROJECT": str(p.base)})
+    except OSError as e:
+        _event(p.db, None, "after_push_failed", f"after_push of {_short(m.get('pushed_sha'))} could not run again: "
+                                                f"{e}", queued=True, severity="high")
+        return
+    _event(p.db, None, "after_push_resumed", f"after_push of {_short(m.get('pushed_sha'))}: running it again "
+                                             f"({why})", queued=False)
 
 
 def finalize(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, **k: None,
@@ -1859,8 +1907,14 @@ def finalize(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, *
             continue
         elif m.get("outcome") != "pushed" or not _after_push_set(p, cfg):
             _after(p, b, m, "skipped", alert, now_)   # nothing to deploy
-        elif int(b["after_tries"] or 0) < MAX_RESUMES:
-            if _resume(p, b, marker, now_):
+        elif why := _cycle_held(p, cfg):     # busy, not a try: resumed once the notice is gone
+            if not m.get("held_said"):
+                _event(db, None, "after_push_held", f"push batch {b['id']}: its after_push waits: {why}",
+                       queued=False)
+                write_json(marker, {**m, "held_said": now_})
+            continue
+        elif m.get("after_held") or int(b["after_tries"] or 0) < MAX_RESUMES:
+            if _resume(p, b, marker, now_, free=bool(m.get("after_held"))):
                 changed.append(b["id"])
             continue
         else:
