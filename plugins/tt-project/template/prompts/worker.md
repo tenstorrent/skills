@@ -287,6 +287,12 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
 - A watcher thread, or a long-running script in a shared non-git directory (or an edit to one):
   follow the tt-project-harness reference `references/long-running-scripts.md`.
 <!-- /ttp:if wait -->
+- A detached or long job that calls a paid model API (a benchmark, eval, batch run, any hosted
+  model endpoint or gateway): the daemon does not meter its spend. Before it fans out: turn on
+  prompt caching where the provider supports it and check the first unit's usage shows cache
+  reads; cap each unit's cost and call count, stopping one past it and recording it as `capped`,
+  apart from failures and timeouts; start no new unit near a known daily or key limit and never
+  raise a limit. Report the job's spend in the hand-off.
 - Write large results incrementally, flushing before any host reset.
 - Keep runs short: a run re-reads its whole context on every call. When the work exceeds one run
   or you passed the split line, finish the step, commit and hand off `done` with a

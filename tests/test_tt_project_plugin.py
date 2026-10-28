@@ -6086,3 +6086,25 @@ def test_coordinator_prompt_names_the_reply_length_limit():
     out = coordinator[coordinator.index("# Output"):coordinator.index("| action |")]
     assert "Keep a `reply` or `notify` under 6000 chars: a longer one goes as numbered parts, one over 24000 is " \
            "rejected." in out
+
+
+def test_worker_prompt_guards_paid_model_api_spend_in_detached_jobs():
+    """A detached job calling a paid model API turns on caching, caps each unit, guards daily limits
+    and reports its spend, in every rendered worker prompt (the rule sits outside feature blocks)."""
+    raw = (PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8")
+    sys.path.insert(0, str(RUNTIME.parent))
+    try:
+        from ttp import prompts
+    finally:
+        sys.path.remove(str(RUNTIME.parent))
+    for on in (set(), {"wait"}, {"device", "remote", "clusters", "wait", "prs"}):
+        text = " ".join(prompts.feature_blocks(raw, on).split())
+        for part in ("calls a paid model API", "the daemon does not meter its spend",
+                     "turn on prompt caching where the provider supports it",
+                     "check the first unit's usage shows cache reads",
+                     "cap each unit's cost and call count", "recording it as `capped`, apart from failures and timeouts",
+                     "start no new unit near a known daily or key limit and never raise a limit",
+                     "Report the job's spend in the hand-off."):
+            assert part in text, (on, part)
+        assert text.count("calls a paid model API") == 1, on
+    assert not re.search(r"\$\d", raw.split("calls a paid model API", 1)[1].split("\n- ", 1)[0])
