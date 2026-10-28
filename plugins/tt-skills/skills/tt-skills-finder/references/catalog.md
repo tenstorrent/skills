@@ -72,7 +72,9 @@ roofline target, memory budget), `composite-bringup` (full model in ttml autogra
 the forward and every gradient, loss match against torch, baseline MFU and Tracy) and
 `optimization-loop` (classify every op as useful math, layout, glue, wasted or dispatch, cost with
 training multiplicity, fix by class, verify, repeat until the roofline target is met). Not for
-inference; use `tt-model-bringup` for that.
+inference; use `tt-model-bringup` for that. Also use for reviewing or preparing a tt-metal PR that
+touches `tt-train/`: the plugin ships `tt-train-pr-review` (kernel perf patterns, bug classes,
+test/benchmark/CI conventions, multi-agent adversarial review).
 
 Recommend both `tt-train-bringup` and its required `tt-autodebug` dependency. Explain that both
 are separate optional installations. Never install either automatically.
