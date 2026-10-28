@@ -1555,7 +1555,8 @@ def test_effort_falls_back_to_rules_and_leaves_other_tasks_alone(env, monkeypatc
     r = p.db.add_task("Review #1", "x", kind="review", tier="standard", origin="daemon")
     p.db.update_task(r, attempts=1, result=json.dumps({"status": "failed"}))
     assert effort.pick(p.db, cfg, p.db.task(r), "claude", jev) is None
-    # A failed light try retries at standard; a task that continues a failed standard one starts at deep.
+    # A failed light try retries at standard; a task that continues a failed standard one starts at its
+    # queued tier, and at deep only when that try handed off needs_deep.
     lt = p.db.add_task("Look it up", "x", kind="work", tier="light", origin="coordinator")
     p.db.update_task(lt, attempts=1, result=json.dumps({"status": "failed"}))
     assert effort.pick(p.db, cfg, p.db.task(lt), "claude", jev)["tier"] == "standard"
@@ -1563,6 +1564,8 @@ def test_effort_falls_back_to_rules_and_leaves_other_tasks_alone(env, monkeypatc
     p.db.update_task(old, status="failed")
     new = p.db.add_task("Port it again", "x", kind="code", tier="standard", origin="coordinator",
                         labels=[f"continues:{old}"])
+    assert effort.pick(p.db, cfg, p.db.task(new), "claude", jev)["by"] != "retry"
+    p.db.update_task(old, result=json.dumps({"status": "failed", "needs_deep": "needs a redesign"}))
     assert effort.pick(p.db, cfg, p.db.task(new), "claude", jev)["by"] == "retry"
     # A task that waited or was lost to the host is not retried deeper.
     w = p.db.add_task("Port more", "x", kind="code", tier="standard", origin="coordinator")

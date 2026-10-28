@@ -1,6 +1,7 @@
 # Continue hops
 
 A done task's only follow-up titled `continue: ...` is queued by the daemon at the parent's tier (caps under `chains`).
+The parent's tier is the one it was queued at (`assigned_tier`), never one a retry raised it to.
 A hop that only runs checks, pushes or edits spec or PR text costs less at light: title it `mechanical: ...`, or give the follow-up `"tier": "light"` (lower only, never above the parent's).
 Its spec is unchanged; a light hop that needs judgment is retried a tier up.
 
@@ -13,3 +14,14 @@ With none left there is no hop; the reasons go in the result's `cells_no_hop` an
 
 A record an older or buggy check marked wrongly: `ttp task <project> rejudge <id> [--dry-run]` reruns the daemon's cells check and the project's `worker.handoff_checks` on the stored hand-off and rewrites the mark and the daemon's keys to the verdict, logged as a `task_rejudged` event.
 A still-failing check changes nothing. It cancels the hop the daemon queued for a cleared mark if that hop never started, and reports one that did.
+
+## Tiers of continues and review fixes
+
+A task the coordinator queues with `continues` and no `tier` starts at its predecessor's queued tier, also when that try failed; it is not a retry of it.
+It starts a tier up only when the failed try handed off `needs_deep`; a failure of its own still raises its retry a tier.
+A daemon `Fix review #<id>` starts at standard (one tier below the code task's queued tier when lower, never light).
+It starts deep only when the user asked for deep on the chain (`user_deep`), or the review marks the fix as needing deep: `needs_deep` with a reason in its hand-off or in a finding (`{"title": ..., "spec": ..., "needs_deep": "why"}`).
+A `tier` the coordinator gives a continue or fix task wins over these defaults; provider, model and effort pins carry over as before.
+
+Each task records why it has its tier in `tier_source`, shown by `ttp task show`: `task_add` (given), `default`, `user_deep`, `parent_copy`, `hop_followup` (a follow-up's lower tier), `fix_review_default`, `review_needs_deep`, `retry_tier_up`, `effort_pick`, `review_diff` or `failover`; `assigned_tier` keeps the tier it was queued at.
+Records from before the field show no source.

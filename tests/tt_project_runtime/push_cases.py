@@ -9731,6 +9731,39 @@ def test_a_fix_of_a_failed_review_runs_at_least_standard(env, monkeypatch):
     assert p.db.task(fid)["tier"] == "standard"
 
 
+def test_a_fix_of_a_failed_review_starts_at_standard_not_the_reviewed_tasks_raised_tier(env, monkeypatch):
+    """A reported case, replayed: the daemon's 'Fix review #<id>' of a code task whose retry had run at
+    deep was queued at deep too. A fix now starts at standard (one tier below the code task's queued
+    tier, kept at standard by a fix's light floor), with tier_source fix_review_default and the code
+    task's pins. Deep only when the user asked for deep on the chain (user_deep) or the review marks
+    the fix as needing it (`needs_deep` in a finding or in its hand-off)."""
+    from ttp import effort
+    from ttp.daemon import Daemon
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _, _, _, (rev,) = _finish_code(env, p, "rd", {"rd.py": 3})
+    code = p.db.task(json.loads(rev["depends_on"])[0])
+    assert code["assigned_tier"] == "standard"
+    p.db.update_task(code["id"], tier="deep", tier_source="retry_tier_up", model="opus", effort="max")
+    p.db.update_task(rev["id"], status="failed")
+    fid, _, _ = Daemon(p.base)._fix_failed_review(p.db.task(rev["id"]), [{"title": "bug", "spec": "fix it"}], "bug")
+    fix = p.db.task(fid)
+    assert (fix["tier"], fix["tier_source"], fix["model"], fix["effort"]) == \
+        ("standard", "fix_review_default", "opus", "max")
+    review, code = p.db.task(rev["id"]), p.db.task(code["id"])
+    plain = [{"title": "bug", "spec": "fix it"}]
+    for assigned in ("deep", "standard", "light"):
+        p.db.update_task(code["id"], assigned_tier=assigned)
+        assert effort.fix_tier(p.db, p.db.task(code["id"]), review, plain) == \
+            ({"deep": "standard"}.get(assigned, "light"), "fix_review_default")
+    assert effort.fix_tier(p.db, code, review, [{"title": "race", "spec": "s", "needs_deep": "a lock-order redesign"}]) \
+        == ("deep", "review_needs_deep")
+    p.db.update_task(rev["id"], result=json.dumps({"status": "done", "needs_deep": "the design is wrong"}))
+    assert effort.fix_tier(p.db, code, p.db.task(rev["id"]), plain) == ("deep", "review_needs_deep")
+    p.db.update_task(rev["id"], result=json.dumps({"status": "done"}))
+    p.db.update_task(code["id"], labels=json.dumps(json.loads(code["labels"] or "[]") + [effort.USER_DEEP]))
+    assert effort.fix_tier(p.db, p.db.task(code["id"]), p.db.task(rev["id"]), plain) == ("deep", "user_deep")
+
+
 def test_own_push_existing_only_refusal_of_another_tasks_branch_names_the_own_branch_route(env, monkeypatch, capsys):
     """A reported case, replayed: with delivery.own_push unset, a code task whose spec's `pr_branch:`
     line named another task's never-published ttp/t<id>-... branch was refused by `ttp push --own`

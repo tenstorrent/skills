@@ -19,6 +19,15 @@ from . import billing
 
 SCHEMA_VERSION = 1
 STUCK_STATUSES = "('blocked','waiting','review')"   # task statuses a stuck episode spans (tasks.stuck_since)
+# Why a task's tier is what it is (tasks.tier_source), shown by `ttp task show` for cost reviews.
+TIER_SOURCES = {
+    "task_add": "given when it was queued", "default": "queued without one (standard)",
+    "user_deep": "the user asked for deep", "parent_copy": "its parent's queued tier (a continue hop)",
+    "hop_followup": "lowered by its parent's follow-up", "fix_review_default": "the default for a review fix",
+    "review_needs_deep": "the failed review marked the fix as needing deep",
+    "retry_tier_up": "raised one tier after a failed try", "effort_pick": "picked from its spec at its first start",
+    "review_diff": "sized by the reviewed diff", "failover": "moved to another provider",
+}
 PAUSED_RESOURCES_KEY = "paused_resources"   # kv: see DB.paused_resources
 PAUSE_BOOT_KEY = "pause_until_boot"   # kv: {"boot", "since"} of a `ttp pause --until-reboot`; see DB.set_paused
 SHARED_SEEN_KEY = "shared_pauses_seen"   # kv: {resource: pause} of the shared pauses this project acted on
@@ -59,7 +68,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   origin TEXT NOT NULL DEFAULT 'coordinator', branch TEXT, pr_url TEXT, result TEXT,
   blocked_reason TEXT, depends_on TEXT NOT NULL DEFAULT '[]', labels TEXT NOT NULL DEFAULT '[]',
   not_before REAL,
-  model TEXT, effort TEXT, pin_verify TEXT); -- NULL pins follow the tier; NULL verification follows the project
+  model TEXT, effort TEXT, pin_verify TEXT, -- NULL pins follow the tier; NULL verification follows the project
+  assigned_tier TEXT, tier_source TEXT); -- the tier it was queued at, and why its tier is what it is (TIER_SOURCES)
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status, priority);
 -- A hold's anchor (anchors.py, the label `waits:<kind>:<value>`) lives only while the task is blocked.
 -- Every write that leaves it on a task not blocked, raw SQL included, drops it: else a later block
@@ -349,6 +359,18 @@ class DB:
         self._migrate_message_broadcast()
         self._migrate_ttr_sample()
         self._migrate_review_self_check()
+        self._migrate_tier_source()
+
+    def _migrate_tier_source(self) -> None:
+        # The tier a task was queued at and why its current tier is what it is (TIER_SOURCES). Older
+        # tasks keep NULL: hops then copy their tier, and show prints no source.
+        if {"assigned_tier", "tier_source"} <= {r["name"] for r in self.q("PRAGMA table_info(tasks)")}:
+            return
+        with self.tx():
+            have = {r["name"] for r in self.q("PRAGMA table_info(tasks)")}
+            for col in ("assigned_tier", "tier_source"):
+                if col not in have:
+                    self.x(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
 
     def _migrate_review_self_check(self) -> None:
         # Whether the reviewed hand-off carried a `self_check` line. Older rows have none (NULL).
@@ -828,7 +850,8 @@ END""")
         now = time.time()
         cols = {"created": now, "updated": now, "title": title.strip()[:200], "spec": spec}
         for k in ("kind", "status", "priority", "tier", "provider", "budget_usd", "max_attempts",
-                  "parent", "reply_chat", "origin", "branch", "not_before", "model", "effort", "pin_verify"):
+                  "parent", "reply_chat", "origin", "branch", "not_before", "model", "effort", "pin_verify",
+                  "tier_source"):
             if kw.get(k) is not None:
                 cols[k] = kw[k]
         for k in ("depends_on", "labels"):
@@ -836,6 +859,9 @@ END""")
                 cols[k] = json.dumps(list(kw[k]))
         if cols.get("tier") == "light" and kw.get("kind", "code") == "code" and self._continues_failed_review(kw.get("labels")):
             cols["tier"] = "standard"   # a fix of a failed review runs at least standard
+        # The tier it is queued at: a continue hop copies this, never a tier the daemon raised for a retry.
+        cols["assigned_tier"] = cols.get("tier") or "standard"
+        cols.setdefault("tier_source", "task_add" if kw.get("tier") else "default")
         keys = ",".join(cols)
         return self.x(f"INSERT INTO tasks({keys}) VALUES({','.join('?' * len(cols))})", cols.values())
 
@@ -1086,6 +1112,13 @@ def dependency_ids(task: dict) -> list:
         except (TypeError, ValueError):
             out.append(None)
     return out
+
+
+def assigned_tier(task: dict | None) -> str:
+    """The tier `task` was queued at (task_add, the coordinator, the daemon's hop or fix), never one the
+    daemon raised for a retry; its current tier for a task older than the record."""
+    t = task or {}
+    return str(t.get("assigned_tier") or t.get("tier") or "standard")
 
 
 def pin_of(task: dict | None) -> dict:

@@ -22,7 +22,7 @@ import re
 import time
 
 from . import jevuse, machines
-from .db import DB, dump_result, task_outcome
+from .db import DB, assigned_tier, dump_result, task_outcome
 
 JEV_USE = "effort"
 SHORT_SPEC = 800    # characters: a longer spec is not a lookup
@@ -57,6 +57,23 @@ def _labels(task: dict) -> list[str]:
 UP = {"light": "standard", "standard": "deep"}
 NEEDS_DEEP = "needs_deep"   # hand-off key: the problem a standard run could not solve at its tier
 USER_DEEP = "user_deep"     # label: the user asked for deep, so a device task keeps it on its first start
+
+
+def fix_tier(db: DB, code: dict, review: dict, findings: list[dict]) -> tuple[str, str]:
+    """The tier of the daemon's fix of failed review `review` of code task `code`, with its tier_source:
+    deep when the user asked for deep on the chain (a `user_deep` label on the review or any task of the
+    code task's chain) or the review marks the fix as needing deep (`needs_deep` in its hand-off or in a
+    finding); else standard, or one tier below the code task's queued tier when that is lower, which a
+    review fix's light floor (db.add_task) keeps at standard. Never the code task's own deep or a tier a
+    retry raised it to."""
+    from . import chaincap
+    if USER_DEEP in _labels(review) or any(USER_DEEP in _labels(t) for t in chaincap.chain(db, code["id"])):
+        return "deep", "user_deep"
+    if wants_deep(review.get("result")) or any(isinstance(f, dict) and str(f.get(NEEDS_DEEP) or "").strip()
+                                              for f in findings):
+        return "deep", "review_needs_deep"
+    return {"deep": "standard", "standard": "light", "light": "light"}.get(assigned_tier(code), "standard"), \
+        "fix_review_default"
 
 
 def _resource_names(task: dict) -> list[str]:
@@ -101,8 +118,9 @@ def _continued(db: DB, task: dict) -> list[dict]:
 
 def retry_tier(db: DB, task: dict) -> str | None:
     """One tier up when this start retries a light or standard try that failed (its last run handed off
-    `failed` or ended without a hand-off, or the task continues one that failed): deep only after a
-    failed standard try, and for a device task only when that try handed off `needs_deep`. None otherwise. A failed try raises the tier once: a start that is requeued
+    `failed` or ended without a hand-off, or the task continues one at its tier that handed off
+    `needs_deep`): deep only after a failed standard try, and for a device task only when that try handed
+    off `needs_deep`. A task continuing a failed one otherwise starts at its queued tier. None otherwise. A failed try raises the tier once: a start that is requeued
     without spending an attempt keeps the failed result, so `mark_raised` notes the raise in it."""
     up = UP.get(task.get("tier") or "")
     if task.get("kind") == "review" or not up:
@@ -117,8 +135,11 @@ def retry_tier(db: DB, task: dict) -> str | None:
         if gated and not wants_deep(last):
             return None
         return up if last.get(RAISED) != attempts else None
-    for old in _continued(db, task):   # a fix after a review that asked for changes is no retry
-        if old["kind"] != "review" and task_outcome(old) == "failed" and old["tier"] == task["tier"] and not (gated and not wants_deep(old["result"])):
+    # A task that continues a failed one starts at the tier it was queued at (its own failure raises it,
+    # above), unless that try handed off `needs_deep`. A fix after a review that asked for changes is no retry.
+    for old in _continued(db, task):
+        if old["kind"] != "review" and task_outcome(old) == "failed" and old["tier"] == task["tier"] \
+                and wants_deep(old["result"]):
             return up
     return None
 

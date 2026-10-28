@@ -137,7 +137,7 @@ from . import screen as scr
 from . import shared
 from . import shorttmp
 from . import worktree
-from .db import (CHANGES_NEEDED, HARNESS_MERGED_KEY, NOT_ABANDONED_SQL, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, WORKSPACE_TRIES_KEY, BranchIndex, continues_id, deferral,
+from .db import (CHANGES_NEEDED, HARNESS_MERGED_KEY, NOT_ABANDONED_SQL, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, WORKSPACE_TRIES_KEY, BranchIndex, assigned_tier, continues_id, deferral,
                  dependency_ids, pin_of, dump_result, load_result, review_subject, reviewed_ids, task_outcome, unplanned_abrupt,
                  without_deferral)
 from .project import rebase_replace
@@ -6601,7 +6601,8 @@ class Daemon:
         if picked["tier"] != task["tier"]:
             log(self.p, f"task {task['id']}: tier {task['tier']} -> {picked['tier']} ({picked['by']})")
             marked = effort.mark_raised(task) if picked["by"] == "retry" else None
-            self.p.db.update_task(task["id"], tier=picked["tier"], **({"result": marked} if marked else {}))
+            self.p.db.update_task(task["id"], tier=picked["tier"], **({"result": marked} if marked else {}),
+                                  tier_source="retry_tier_up" if picked["by"] == "retry" else "effort_pick")
         return picked
 
     def _route(self, task: dict, tier: str, picked: dict | None, now: float) -> dict | None:
@@ -9947,7 +9948,7 @@ class Daemon:
                 "lines": sum(n or 0 for n in changes.values())}
         if tier != task["tier"]:
             log(self.p, f"task {task['id']}: review tier {task['tier']} -> {tier} ({why})")
-            self.p.db.update_task(task["id"], tier=tier)
+            self.p.db.update_task(task["id"], tier=tier, tier_source="review_diff")
         return dict(task, tier=tier), pick
 
     def _landed_elsewhere(self, task: dict) -> str:
@@ -11151,7 +11152,7 @@ class Daemon:
         base_title = re.sub(r"^(?:Fix review #\d+: )+", "", code["title"])
         # A stack kept off the push branch stays review only through its fix and re-review.
         only = push.REVIEW_ONLY_LABEL in push._labels(review) + push._labels(first)
-        tier = code["tier"] if code["tier"] in bud.TIER_ORDER and code["tier"] != "light" else "standard"   # a fix never runs light
+        tier, tsrc = effort.fix_tier(db, code, review, fups)   # db.add_task: a fix never runs light
         rtier = "deep" if review["tier"] == "deep" else "standard"   # a re-review never runs light
         found = "\n".join(f"{n}. {str(f['title'])[:200]}: {coord.clip(f.get('spec'), FOLLOWUP_SPEC_CHARS)}"
                           for n, f in enumerate(fups, 1))
@@ -11173,7 +11174,7 @@ class Daemon:
                 fbranch = (prfix or hop)["branch"] or f"ttp/t{fid}-{worktree.slug((prfix or hop)['title'])}"
             else:
                 fid = db.add_task(f"Fix review #{review['id']}: {base_title}"[:200], "", kind="code", tier=tier,
-                                  priority=review["priority"], origin="daemon",
+                                  tier_source=tsrc, priority=review["priority"], origin="daemon",
                                   budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
                                   labels=[f"continues:{code['id']}", f"review_fix:{review['id']}"], **pin_of(code))
                 fbranch = f"ttp/t{fid}-{worktree.slug(base_title)}"
@@ -11286,14 +11287,14 @@ class Daemon:
         failed review's dependents. Neither touches the project's own git."""
         cfg, db = self.cfg, self.p.db
         base_title = re.sub(r"^(?:Fix review #\d+: )+", "", code["title"])
-        tier = code["tier"] if code["tier"] in bud.TIER_ORDER and code["tier"] != "light" else "standard"
+        tier, tsrc = effort.fix_tier(db, code, review, fups)
         rtier = "deep" if review["tier"] == "deep" else "standard"
         found = "\n".join(f"{n}. {str(f['title'])[:200]}: {coord.clip(f.get('spec'), FOLLOWUP_SPEC_CHARS)}"
                           for n, f in enumerate(fups, 1))
         where = f"repo {ch['repo']}, branch {ch['branch']}"
         with db.tx():
             fid = db.add_task(f"Fix review #{review['id']}: {base_title}"[:200], "", kind="code", tier=tier,
-                              priority=review["priority"], origin="daemon",
+                              tier_source=tsrc, priority=review["priority"], origin="daemon",
                               budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
                               labels=[f"continues:{code['id']}", f"review_fix:{review['id']}"], **pin_of(code))
             rid = db.add_task(
@@ -11398,7 +11399,7 @@ class Daemon:
         except Exception:
             held = True
         base_title = re.sub(r"^(?:Fix PR findings: )+", "", src["title"])
-        tier = src["tier"] if src["tier"] in bud.TIER_ORDER else "standard"
+        tier = assigned_tier(src) if assigned_tier(src) in bud.TIER_ORDER else "standard"
         url = rec.get("url") or key
         off = own_push(self.cfg) == "off"
         on = (f"This task's branch is the PR's branch {branch}: build on it" if branch and not held else
@@ -11417,7 +11418,7 @@ class Daemon:
             f"Put {url} in the hand-off's `pr`."])
         with db.tx():
             fid = db.add_task(f"Fix PR findings: {base_title}"[:200], spec, kind="code", tier=tier,
-                              priority=src["priority"], origin="daemon",
+                              tier_source="parent_copy", priority=src["priority"], origin="daemon",
                               budget_usd=float(self.cfg["budget"]["task_default_usd"].get(tier, 8.0)),
                               branch=branch if branch and not held else None,
                               labels=[f"continues:{src['id']}", f"pr_fix:{key}"]

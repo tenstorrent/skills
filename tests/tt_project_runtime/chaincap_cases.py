@@ -202,3 +202,126 @@ def test_the_unreviewed_sweep_reviews_a_split_head_an_open_task_waits_on_to_land
     _split_at(p, t3, h3)
     p.db.add_task("continue: tests", "s", kind="code", origin="daemon", labels=[f"continues:{t3}"])
     assert d.sweep_unreviewed(force=True) == [] and not _daemon_reviews(p, t3)
+
+
+def _failed_parent(p, d, raised, title="Port the parser"):
+    """A coordinator code task queued at standard that failed; `raised`: its retry ran a tier up first."""
+    import json
+    t = p.db.add_task(title, "Port it.", kind="code", tier="standard", origin="coordinator", provider="claude")
+    if raised:
+        p.db.update_task(t, attempts=1, result=json.dumps({"status": "failed", "summary": "stuck"}))
+        assert d._pick_effort(p.db.task(t), "claude")["by"] == "retry"
+        assert (p.db.task(t)["tier"], p.db.task(t)["tier_source"]) == ("deep", "retry_tier_up")
+    p.db.update_task(t, status="failed", attempts=2 if raised else 1,
+                     result=json.dumps({"status": "failed", "summary": "stuck"}))
+    return p.db.task(t)
+
+
+def test_a_continue_hop_of_a_failed_parent_starts_at_its_queued_tier_not_a_retry_raised_one(env):
+    """A reported case, replayed: the continue hop of a failed parent queued at standard ran at deep, both
+    when the parent's retry had raised it to deep and when it failed at standard (the hop's first start
+    counted as a retry of it). The hop now starts at the parent's queued tier (tier_source parent_copy),
+    also a daemon hop of a done parent whose retry was raised; a failure of the hop itself still raises
+    its retry a tier, and so does a parent's `needs_deep` hand-off."""
+    import json
+    from ttp import chaincap, coordinator as coord
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    d.jev = None
+    for n, (raised, name) in enumerate(((True, "Port the lexer"), (False, "Tune scheduler queues"))):
+        parent = _failed_parent(p, d, raised, name)
+        assert chaincap.hop_tier(parent, {"title": "continue: port"}) == "standard"
+        assert not coord.apply(p, [{"type": "task_add", "title": f"continue: {name.lower()}", "spec": "Go on.",
+                                    "kind": "code", "continues": parent["id"], "force": True}])
+        hop = p.db.one("SELECT * FROM tasks WHERE title=?", (f"continue: {name.lower()}",))
+        assert (hop["tier"], hop["assigned_tier"], hop["tier_source"]) == ("standard", "standard", "parent_copy")
+        d._pick_effort(hop, "claude")
+        assert p.db.task(hop["id"])["tier"] == "standard", raised
+        p.db.update_task(hop["id"], attempts=1, result=json.dumps({"status": "failed", "summary": "still stuck"}))
+        assert d._pick_effort(p.db.task(hop["id"]), "claude")["by"] == "retry"
+        hop = p.db.task(hop["id"])
+        assert (hop["tier"], hop["assigned_tier"], hop["tier_source"]) == ("deep", "standard", "retry_tier_up")
+    # A failed try that handed off needs_deep: its continuation's first start runs a tier up.
+    asked = _failed_parent(p, d, False, "Hard part")
+    p.db.update_task(asked["id"], result=json.dumps({"status": "failed", "needs_deep": "too hard at standard"}))
+    assert not coord.apply(p, [{"type": "task_add", "title": "continue: hard part", "spec": "s", "kind": "code",
+                                "continues": asked["id"], "force": True}])
+    hop = p.db.one("SELECT * FROM tasks WHERE title='continue: hard part'")
+    assert d._pick_effort(hop, "claude")["by"] == "retry" and p.db.task(hop["id"])["tier"] == "deep"
+    # The daemon's own hop of a done parent whose retry ran at deep copies its queued tier, or a lower one.
+    for title, fup, want in (("Split work", {"title": "continue: split work"}, ("standard", "parent_copy")),
+                             ("Push work", {"title": "mechanical: push it"}, ("light", "hop_followup"))):
+        t = p.db.add_task(title, "s", kind="code", tier="standard", origin="coordinator")
+        p.db.update_task(t, tier="deep", tier_source="retry_tier_up", status="done")
+        hop_id = p.db.add_task("placeholder", "s")   # auto_hop finds its hop by parent and title
+        p.db.update_task(hop_id, status="cancelled")
+        assert chaincap.hop_tier(p.db.task(t), fup) == want[0]
+        monkey = coord.apply
+        try:
+            coord.apply = lambda p_, acts, **k: [] if p_.db.add_task(
+                acts[0]["title"], "", kind="code", tier=acts[0]["tier"], parent=t, origin="coordinator") else ["x"]
+            new_id, _ = chaincap.auto_hop(p, p.config(), p.db.task(t), fup, why="test")
+        finally:
+            coord.apply = monkey
+        assert (p.db.task(new_id)["tier"], p.db.task(new_id)["tier_source"]) == want
+
+
+def test_user_deep_chains_and_explicit_coordinator_tiers_keep_their_tier(env):
+    """The user's deep stays deep along its continue chain; a tier the coordinator gives a continue or fix
+    task wins over the hop and fix defaults; explicit model and effort pins carry over as before."""
+    import json
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    d.jev = None
+    assert not coord.apply(p, [{"type": "task_add", "title": "Hard redesign", "spec": "s", "kind": "code",
+                                "tier": "deep", "user_deep": True, "model": "opus", "effort": "max"}])
+    deep = p.db.one("SELECT * FROM tasks WHERE title='Hard redesign'")
+    assert (deep["tier"], deep["tier_source"], deep["model"], deep["effort"]) == ("deep", "user_deep", "opus", "max")
+    p.db.update_task(deep["id"], status="failed", attempts=1, result=json.dumps({"status": "failed"}))
+    assert not coord.apply(p, [{"type": "task_add", "title": "continue: redesign", "spec": "s", "kind": "code",
+                                "continues": deep["id"], "model": "opus", "effort": "max", "force": True}])
+    hop = p.db.one("SELECT * FROM tasks WHERE title='continue: redesign'")
+    assert (hop["tier"], hop["tier_source"], hop["model"], hop["effort"]) == ("deep", "parent_copy", "opus", "max")
+    assert d._pick_effort(hop, "claude") is None and p.db.task(hop["id"])["tier"] == "deep"
+    # Explicit coordinator tiers on a continue task and on a fix it queues by title.
+    old = p.db.add_task("Old try", "s", kind="code", tier="deep", origin="coordinator")
+    p.db.update_task(old, status="failed", attempts=1, result=json.dumps({"status": "failed"}))
+    assert not coord.apply(p, [{"type": "task_add", "title": "Redo it at standard", "spec": "s", "kind": "code",
+                                "tier": "standard", "continues": old, "force": True},
+                               {"type": "task_add", "title": "Fix review #77: by hand", "spec": "s", "kind": "code",
+                                "tier": "deep"}])
+    for title, tier in (("Redo it at standard", "standard"), ("Fix review #77: by hand", "deep")):
+        t = p.db.one("SELECT * FROM tasks WHERE title=?", (title,))
+        assert (t["tier"], t["tier_source"]) == (tier, "task_add"), title
+
+
+def test_task_show_names_why_a_task_has_its_tier_and_old_records_still_load(env, tmp_path):
+    """`ttp task show` prints the tier's source (and the queued tier when a retry raised it); a task
+    database from before the record gains the columns, and its tasks load, show and hop as before."""
+    import sqlite3
+    from ttp import chaincap
+    from ttp.cli import show_task
+    from ttp.db import DB, TIER_SOURCES
+    p = make(env)
+    t = p.db.add_task("Raised", "s", kind="code", tier="standard", origin="coordinator")
+    p.db.update_task(t, tier="deep", tier_source="retry_tier_up")
+    assert "tier: deep (retry_tier_up, queued at standard)" in show_task(p.db.task(t))
+    q = p.db.add_task("Plain", "s", kind="question")
+    assert "tier: standard (default)\n" in show_task(p.db.task(q)) + "\n"
+    assert {"task_add", "parent_copy", "retry_tier_up", "review_diff", "fix_review_default",
+            "user_deep"} <= set(TIER_SOURCES)
+    path = tmp_path / "old.db"
+    DB(path).conn.close()
+    con = sqlite3.connect(path)
+    con.execute("ALTER TABLE tasks DROP COLUMN tier_source")
+    con.execute("ALTER TABLE tasks DROP COLUMN assigned_tier")
+    con.execute("INSERT INTO tasks(title, kind, tier) VALUES('legacy', 'code', 'deep')")
+    con.commit()
+    con.close()
+    old = DB(path).task(1)
+    assert old["tier_source"] is None and old["assigned_tier"] is None
+    assert "tier: deep\n" in show_task(old) + "\n" and "(" not in show_task(old).splitlines()[1]
+    assert chaincap.hop_tier(old, {"title": "continue: x"}) == "deep"

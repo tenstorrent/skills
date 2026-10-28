@@ -29,7 +29,7 @@ from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, cel
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
-from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
+from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, assigned_tier, continues_id, deferral,
                  dependency_ids, dump_result, host_line, load_result, names_branch, pin_of, review_subject,
                  reviewed_ids,
                  task_outcome, without_deferral)
@@ -1798,6 +1798,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                                    "why": f"task_add {title!r}: {why}"})
                     raise ValueError(why)
                 tier = a.get("tier") if a.get("tier") in ("light", "standard", "deep") else "standard"
+                tier_source = "task_add" if a.get("tier") == tier else "default"
                 budget = a.get("budget_usd") or cfg["budget"]["task_default_usd"].get(tier, 8.0)
                 kind_label = "exclusive" if a.get("exclusive") else "resource"
                 names = _resource_names(a.get("resources") or [], t, problems)
@@ -1878,6 +1879,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     labels.append(f"{'rebases' if rebase else 'pr_branch'}:{onto}")
                 if old:
                     labels.append(f"continues:{old['id']}")
+                    if tier_source == "default" and assigned_tier(old) in ("light", "standard", "deep"):
+                        # Without a tier of its own it keeps the one its predecessor was queued at, never
+                        # a tier the daemon raised that one to for a retry.
+                        tier, tier_source = assigned_tier(old), "parent_copy"
+                        budget = a.get("budget_usd") or cfg["budget"]["task_default_usd"].get(tier, 8.0)
                 elif followup and followup["kind"] != "review":   # a hop of its lineage, whatever its title (chaincap)
                     labels.append(f"{chaincap.FOLLOWS}{followup['id']}")
                 # A continuation carries the branch its predecessors carry (push.pr_branch_of) unless
@@ -1943,6 +1949,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 labels += defer_labels(after, when, why_after)
                 with db.tx():
                     new_id = db.add_task(title, a.get("spec") or "", kind=kind, tier=tier,
+                                         tier_source="user_deep" if effort.USER_DEEP in labels else tier_source,
                                          priority=int(a.get("priority") or 3), **pin,
                                          budget_usd=float(budget), depends_on=deps,
                                          reply_chat=a.get("reply_chat") or None, origin="coordinator",

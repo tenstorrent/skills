@@ -47,7 +47,7 @@ import re
 import time
 
 from . import headline
-from .db import DB, continues_id, load_result
+from .db import DB, assigned_tier, continues_id, load_result
 
 CONT_TITLE = re.compile(r"(?i)^\s*(?:continue|mechanical)\s*:")
 # A hop that only runs checks, pushes or edits spec or PR text: queued at the light tier (hop_tier).
@@ -345,10 +345,11 @@ def own_wait(p, lineage: list[int], probe: str | None) -> str:
 
 
 def hop_tier(task: dict, fup: dict) -> str:
-    """The tier of the hop queued for `fup`: the parent's, or lower when the follow-up asks for it with
-    `"tier"` or a `mechanical:` title (light). Never above the parent's: a hop that needs more is
-    retried a tier up by the daemon."""
-    tier = task["tier"] if task.get("tier") in TIERS else "standard"
+    """The tier of the hop queued for `fup`: the parent's queued tier (db.assigned_tier, never one the
+    daemon raised for a failed try's retry), or lower when the follow-up asks for it with `"tier"` or a
+    `mechanical:` title (light). Never above it: a hop that needs more is retried a tier up by the daemon."""
+    tier = assigned_tier(task)
+    tier = tier if tier in TIERS else "standard"
     want = "light" if MECH_TITLE.match(str(fup.get("title") or "")) else str(fup.get("tier") or "").strip().lower()
     return want if want in TIERS and TIERS.index(want) < TIERS.index(tier) else tier
 
@@ -437,6 +438,8 @@ def auto_hop(p, cfg: dict, task: dict, fup: dict, why: str | None = None) -> tup
     new = db.one("SELECT id FROM tasks WHERE parent=? AND title=? ORDER BY id DESC", (task["id"], title))
     if problems or not new:
         return None
+    copied = action["tier"] == (assigned_tier(task) if assigned_tier(task) in TIERS else "standard")
+    db.update_task(new["id"], tier_source="parent_copy" if copied else "hop_followup")
     db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
          (time.time(), f"task:{task['id']}", AUTO_EVENT, "low", f"#{new['id']} {title} queued by the daemon ({why})",
           json.dumps({"root": ch[0]["id"], "next": new["id"], "hops": len(ch), "why": why}), "handled", task["id"]))

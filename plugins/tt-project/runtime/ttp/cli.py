@@ -5396,7 +5396,10 @@ def show_task(t: dict) -> str:
     review findings). Read-only."""
     from .db import load_result
     r = load_result(t["result"])
-    out = [f"#{t['id']} {t['title']}", f"kind: {t['kind']}   status: {task_outcome(t)}   tier: {t['tier']}",
+    why = t.get("tier_source")   # NULL on tasks older than the record
+    queued = t.get("assigned_tier")
+    src = (f" ({why}" + (f", queued at {queued}" if queued and queued != t["tier"] else "") + ")") if why else ""
+    out = [f"#{t['id']} {t['title']}", f"kind: {t['kind']}   status: {task_outcome(t)}   tier: {t['tier']}{src}",
            "", "spec:", t["spec"] or "(none)"]
     for key, v in task_timing(t).items():
         out.insert(2, f"{key}: {v}")

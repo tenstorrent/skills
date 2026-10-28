@@ -272,6 +272,7 @@ def apply(db: DB, cfg: dict, move: dict, now: float, where) -> str:
     line = headline.join(t["title"], body, 80, f"#{t['id']} ")
     with db.tx():
         db.update_task(t["id"], provider=move["new"], model=None, effort=move.get("effort"), tier=move["tier"],
+                       **({"tier_source": "failover"} if move["tier"] != t.get("tier") else {}),
                        spec=f"{t['spec']}\n\n{text}" if t["spec"] else text)
         db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
              (now, "daemon", KIND, "low", line[:500], "handled", t["id"]))
