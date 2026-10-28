@@ -1566,6 +1566,9 @@ def test_every_checks_key_the_runtime_reads_is_an_account_key_and_settable(env):
     for kind in (testslots.TESTS, testslots.BUILDS):
         read |= {kind.setting(s)[1] for s in ("pool", "run_max", "project_max")}
     read -= {"json", "log", "out", "pid", "queued", "rc"}   # file names (checks.json), not keys
+    # project-only: the project's own lock or queue wrapper, set by the user per project
+    read -= {"wrap_cmd"}
+    assert "wrap_cmd" in project._known_keys(["checks"])
     missing = read - project.ACCOUNT_KEYS["checks"]
     assert not missing, f"checks keys read but not account keys: {sorted(missing)}"
     for k in ("test_project_max", "test_pool", "test_run_max", "build_pool", "build_run_max",
