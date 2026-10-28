@@ -494,3 +494,131 @@ def test_rejudge_is_refused_for_an_unfinished_task_or_from_another_projects_run(
     monkeypatch.setenv("TTP_PROJECT", str(env["tmp"] / "another-root"))
     code, out = _rejudge(p, capsys, tid)
     assert code and "another project" in out, out
+
+
+# A pair grid named '<group> x <seed>/<seed>': '/' is part of a cell's name, never a separator.
+PAIRS = ("grp-a x 101/202", "grp-a x 303/404", "grp-a x 505/606", "grp-b x 101/202", "grp-b x 303/404",
+         "grp-b x 505/606")
+PAIR_SPEC = "Score each seed pair against the sheet.\n\ncells: " + ", ".join(PAIRS) + "\n\nReturn: one row per cell."
+
+
+def test_a_cells_line_keeps_names_with_a_slash_whole():
+    from ttp import cells
+    assert cells.requested(PAIR_SPEC) == list(PAIRS)
+    assert cells.split("grp-a/101, grp-a/202; grp-b/101/202") == ["grp-a/101", "grp-a/202", "grp-b/101/202"]
+    assert cells.enumerable(", ".join(PAIRS)) and cells.ignored(PAIR_SPEC) == []
+    row = {"verdict": "pass", "score": 0.25}
+    assert cells.check(PAIR_SPEC, {"cells": {c: row for c in PAIRS}})["missing"] == []
+    assert cells.check(PAIR_SPEC, {"cells": "grp-a x 101/202, grp-b x 505/606"})["missing"] == list(PAIRS[1:5])
+
+
+def _slash_split_mark(env, p, cells_done, started=False):
+    """A done task whose stored hand-off a project-local cells rule marked by splitting its cells line on '/'
+    as well: a 'partial: 0 of 32' prefix over the worker's summary (cut to 1500 chars), the finding under
+    `partial` and a `continue:` follow-up with a `cells:` line, which a hop task and a queued proposal took
+    up. The worker's own result.json stays in its run's folder. (task id, hop id, the stored result)"""
+    import itertools
+    tid = p.db.add_task("score the pair grid", PAIR_SPEC, kind="work", origin="coordinator")
+    own = {"status": "done", "summary": "scored all six pairs; every one passes",
+           "cells": {c: {"verdict": "pass"} for c in cells_done},
+           "followups": [{"title": "enable the anchor for both groups", "spec": "Turn it on and check one job."}]}
+    run_dir = env["tmp"] / f"run-{tid}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps(own))
+    p.db.x("INSERT INTO runs(task, role, started, ended, dir, status) VALUES(?, 'worker', ?, ?, ?, 'ok')",
+           (tid, time.time() - 60, time.time(), str(run_dir)))
+    bogus = ["/".join(x) for x in itertools.product(*[("grp-a", "101/202/303/404")] * 5)]   # names over 40 chars
+    head = f"partial: 0 of {len(bogus)} cells (missing: {', '.join(bogus)})"
+    title = f"continue: score the pair grid: cells {', '.join(bogus)}"[:200]
+    stored = {**own, "summary": f"{head}. Not finished: never report this as the full result. {own['summary']}"[:1500],
+              "partial": {"have": 0, "of": len(bogus), "valid": [], "missing": bogus},
+              "followups": [*own["followups"], {"title": title, "spec": f"Finish #{tid}.\ncells: {', '.join(bogus)}"}]}
+    p.db.update_task(tid, status="done", result=json.dumps(stored))
+    hop = p.db.add_task(title, f"cells: {', '.join(bogus)}", parent=tid, origin="coordinator")
+    if started:
+        p.db.update_task(hop, status="running")
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+           (time.time(), "daemon", "followup_proposed", "low", f"#{tid} proposes: {title}", "queued", tid))
+    return tid, hop, stored
+
+
+def test_rejudge_drops_a_cells_mark_a_project_rule_built_by_splitting_on_slash(env, monkeypatch, capsys):
+    p = make(env)
+    tid, hop, stored = _slash_split_mark(env, p, PAIRS)
+    row = p.db.task(tid)["result"]
+    # The dry run names every change and writes nothing.
+    code, out = _rejudge(p, capsys, tid, "--dry-run")
+    assert code == 0 and "nothing to change" not in out, out
+    assert "- summary: partial: 0 of 32 cells" in out and "+ summary: scored all six pairs" in out, out
+    assert "all 6 requested cells reported" in out, out
+    assert "- key: partial" in out and f"- followup: {stored['followups'][1]['title']}" in out, out
+    assert f"would cancel #{hop}" in out, out
+    assert p.db.task(tid)["result"] == row and p.db.task(hop)["status"] == "queued"
+    assert not p.db.q("SELECT id FROM events WHERE kind='task_rejudged'")
+    # The real run applies exactly those changes.
+    code, out = _rejudge(p, capsys, tid)
+    assert code == 0 and f"cancelled #{hop}" in out, out
+    got = load_result(p.db.task(tid)["result"])
+    assert got["summary"] == "scored all six pairs; every one passes" and "partial" not in got, got
+    assert [f["title"] for f in got["followups"]] == ["enable the anchor for both groups"], got
+    assert got["cells"] == stored["cells"] and p.db.task(tid)["status"] == "done"
+    assert p.db.task(hop)["status"] == "cancelled"
+    assert not p.db.q("SELECT id FROM events WHERE task=? AND kind='followup_proposed' AND status='queued'", (tid,))
+    ev = p.db.q("SELECT * FROM events WHERE task=? AND kind='task_rejudged'", (tid,))
+    assert len(ev) == 1 and "partial: 0 of 32 cells" in ev[0]["text"], ev
+    assert json.loads(ev[0]["data"])["cancelled"] == [hop]
+    # A second run finds the record right.
+    row = p.db.task(tid)["result"]
+    code, out = _rejudge(p, capsys, tid)
+    assert code == 0 and "nothing to change" in out and p.db.task(tid)["result"] == row, out
+
+
+def test_rejudge_keeps_a_started_hop_of_a_dropped_project_rule_mark_and_reports_it(env, monkeypatch, capsys):
+    p = make(env)
+    tid, hop, _ = _slash_split_mark(env, p, PAIRS, started=True)
+    code, out = _rejudge(p, capsys, tid)
+    assert code == 0 and f"kept #{hop}" in out and "(running)" in out, out
+    assert p.db.task(hop)["status"] == "running"
+    assert load_result(p.db.task(tid)["result"])["summary"] == "scored all six pairs; every one passes"
+
+
+def test_rejudge_keeps_a_project_rule_mark_the_cells_still_earn_or_cannot_place(env, monkeypatch, capsys):
+    from pathlib import Path
+    p = make(env)
+    # Two pairs really missing from the hand-off: the mark, its finding, follow-up and hop all stay.
+    tid, hop, stored = _slash_split_mark(env, p, PAIRS[:4])
+    code, out = _rejudge(p, capsys, tid)
+    got = load_result(p.db.task(tid)["result"])
+    assert code == 0 and got["summary"] == stored["summary"] and got["partial"] == stored["partial"], out
+    assert got["followups"] == stored["followups"] and p.db.task(hop)["status"] == "queued", out
+    assert "all 6 requested" not in out and "cancel" not in out, out
+    # A spec with no `cells:` line (the rule enumerated a title or labelled lines): nothing to judge it by.
+    tid, hop, _ = _slash_split_mark(env, p, PAIRS)
+    p.db.update_task(tid, spec="Score each seed pair against the sheet (a sweep).")
+    row = p.db.task(tid)["result"]
+    code, out = _rejudge(p, capsys, tid)
+    assert code == 0 and "nothing to change" in out and p.db.task(tid)["result"] == row, out
+    # The run's result.json is not this hand-off (another run, or gone): the mark is not provably the
+    # daemon's, so it stays.
+    for change in ("other", "gone"):
+        tid, hop, _ = _slash_split_mark(env, p, PAIRS)
+        rdir = Path(p.db.one("SELECT dir FROM runs WHERE task=?", (tid,))["dir"])
+        if change == "gone":
+            (rdir / "result.json").unlink()
+        else:
+            (rdir / "result.json").write_text(json.dumps({"status": "done", "summary": "x", "cells": {}}))
+        row = p.db.task(tid)["result"]
+        code, out = _rejudge(p, capsys, tid)
+        assert code == 0 and "nothing to change" in out and p.db.task(tid)["result"] == row, (change, out)
+    # A worker that wrote the 'partial:' words itself keeps them.
+    tid = p.db.add_task("score again", PAIR_SPEC, kind="work", origin="coordinator")
+    own = {"status": "done", "summary": "partial: 0 of 9 cells (missing: x). my words",
+           "cells": {c: {"verdict": "pass"} for c in PAIRS}}
+    rdir = env["tmp"] / f"run-{tid}"
+    rdir.mkdir()
+    (rdir / "result.json").write_text(json.dumps(own))
+    p.db.x("INSERT INTO runs(task, role, started, dir, status) VALUES(?, 'worker', ?, ?, 'ok')",
+           (tid, time.time(), str(rdir)))
+    p.db.update_task(tid, status="done", result=json.dumps(own))
+    code, out = _rejudge(p, capsys, tid)
+    assert code == 0 and "nothing to change" in out, out
