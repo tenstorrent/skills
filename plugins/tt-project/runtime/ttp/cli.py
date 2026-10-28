@@ -1505,7 +1505,7 @@ def _project_name_argv(sub, argv: list[str]) -> list[str]:
     _HERE = None
     if not argv or argv[0] not in PROJECT_CMDS or argv[0] not in sub.choices:
         return argv
-    if argv[0] == "config" and "--account" in argv:   # its first word is the account key
+    if argv[0] == "config" and ("--account" in argv or "--chat-settable" in argv):   # its first word is the key
         return argv
     sp = sub.choices[argv[0]]
     slots = [x for x in sp._actions if not x.option_strings]
@@ -6461,8 +6461,33 @@ def _refuse_user_only_in_run(key: str) -> None:
         f"so the coordinator can ask the user")
 
 
+def cmd_chat_settable(key: str, value: str | None) -> None:
+    """`ttp config --chat-settable KEY [VALUE]`: whether a coordinator config_set accepts the key (and the
+    value, checked as config_set checks it), without setting anything; `list` prints every accepted key.
+    Exit 0 when accepted, 1 when refused."""
+    from . import chatset
+    from .coordinator import USER_SETTABLE, settable
+    if key == "list":
+        print("\n".join([*sorted(USER_SETTABLE), *chatset.PATTERNS]))
+        return
+    try:
+        conv = settable(key)
+        if value is not None:
+            try:
+                val = json.loads(value)
+            except ValueError:
+                val = value
+            val = conv(val)
+    except (ValueError, TypeError) as e:
+        print(f"refused: {e}" if str(e).startswith(key) else f"{key}: refused: {e}")
+        sys.exit(1)
+    print(f"{key}: accepted" + (f" as {json.dumps(val)}" if value is not None else ""))
+
+
 def cmd_config(a) -> None:
     run = in_run()
+    if a.chat_settable:
+        return cmd_chat_settable(a.name, a.key)
     if a.account:
         if a.value is not None:
             die("usage: ttp config --account KEY [VALUE]")
@@ -8876,6 +8901,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--account", action="store_true",
                    help="the account-level setting (" + ", ".join(
                        f"{sec}.{k}" for sec, ks in ACCOUNT_KEYS.items() for k in sorted(ks)) + "); '' removes it")
+    s.add_argument("--chat-settable", action="store_true",
+                   help="check, without setting it, whether a coordinator config_set accepts KEY (and VALUE): "
+                        "ttp config --chat-settable KEY [VALUE]; KEY `list` prints every accepted key")
     s.set_defaults(fn=cmd_config)
 
     s = sub.add_parser("secret", help="store per-user credentials (read from stdin)")

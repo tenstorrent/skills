@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, cells, chaincap, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, relay, responsibilities, restriction_audit, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, cells, chaincap, chatset, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, relay, responsibilities, restriction_audit, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -262,6 +262,17 @@ USER_SETTABLE = {
     "coordinator.provider_failover_after_h": lambda v: failover.after_h_of(v),
     "coordinator.provider_failover_to": lambda v: v,   # checked against the configured providers in config_set
 }
+
+
+def settable(key: str):
+    """The validator config_set applies to `key` (USER_SETTABLE, else a provider key chatset.py accepts:
+    per-tier routing, the saved endpoint's alias); ValueError saying why when chat may not set it."""
+    if key in USER_SETTABLE:
+        return USER_SETTABLE[key]
+    if conv := chatset.setter(key):
+        return conv
+    from .project import unknown_key_hint
+    raise ValueError(chatset.refusal(key) or unknown_key_hint(key) or f"{key} is not user-settable from chat")
 
 CHARTER_HISTORY = ends.CHARTER_HISTORY   # harness file: charter sections replaced or retired
 # kv: [{"id", "messages", "ask", "section", "quote", "replaces", "candidates", "text", "sha", "ts",
@@ -2541,11 +2552,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      f"health coverage counts it for nothing ({hint})")
             elif t == "config_set":
                 key = a.get("key", "")
-                if key not in USER_SETTABLE:
-                    from .project import unknown_key_hint
-                    hint = unknown_key_hint(key)
-                    raise ValueError(hint or f"{key} is not user-settable from chat")
-                value = USER_SETTABLE[key](a.get("value"))
+                value = settable(key)(a.get("value"))
+                chatset.route_ready(cfg, key, value)
                 if key == "delivery.backup_remote" and (why := push.backup_problem({**(cfg.get("delivery") or {}),
                                                                                     "backup_remote": value})):
                     raise ValueError(why)

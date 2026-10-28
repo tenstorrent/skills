@@ -17187,3 +17187,164 @@ def test_a_user_end_shared_pause_lifts_once_through_the_shared_file(env):
     assert t in {x["id"] for x in p.db.ready_tasks()}
     assert [k for k, _ in _pause_end_events(p)] == [pauseends.USER_END_KIND]
     assert not p.db.kv(pauseends.RELEASE_KEY)
+
+
+
+_CS_KEY = "sk-chatset-placeholder-5a4b3c2d1e"
+
+
+def _cs_home(env, monkeypatch):
+    from ttp import project
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "chatset-home")
+
+
+def _cs_set(p, *pairs, user_turn=True):
+    from ttp.coordinator import apply
+    return apply(p, [{"type": "config_set", "key": k, "value": v} for k, v in pairs], user_turn=user_turn)
+
+
+def test_config_set_takes_per_tier_routing_keys_and_refuses_bad_values(env, monkeypatch):
+    _cs_home(env, monkeypatch)
+    from ttp import endpoint, route
+    p = make(env)
+    endpoint.save("cloud", "https://api.example.com/v1", _CS_KEY, True, "HTTP 200")
+    good = [("providers.chat.endpoint", "cloud"), ("providers.chat.tiers.light.model", "org/model-1.5"),
+            ("providers.chat.tiers.light.effort", "low"), ("providers.chat.tiers.light.route_timeout_s", "2700"),
+            ("providers.chat.effort_fields", {"org/model-1.5": {"low": {"reasoning_effort": "low"}}}),
+            ("providers.claude.tiers.light.model", "sonnet"), ("providers.codex.tiers.deep.effort", "xhigh"),
+            ("providers.chat.tiers.light.route", True)]
+    assert _cs_set(p, *good) == []
+    chat = p.raw_config()["providers"]["chat"]
+    assert chat["endpoint"] == "cloud" and "base_url" not in chat
+    assert chat["tiers"]["light"] == {"model": "org/model-1.5", "effort": "low", "route_timeout_s": 2700, "route": True}
+    assert route.target(p.config(), "light") == ("chat", "org/model-1.5") and route.config_problems(p.raw_config()) == []
+    before = p.raw_config()
+    bad = {("providers.chat.tiers.medium.model", "m"): "unknown tier 'medium'",
+           ("providers.nope.tiers.light.model", "m"): "unknown provider 'nope'",
+           ("providers.chat.tiers.light.effort", "turbo"): "give one of",
+           ("providers.chat.tiers.light.effort", "minimal"): "give one of",
+           ("providers.chat.tiers.light.route", "yes"): "give true or false",
+           ("providers.chat.tiers.light.route", 1): "give true or false",
+           ("providers.claude.tiers.light.route", True): "only providers.chat tiers can be routed",
+           ("providers.codex.tiers.light.route_timeout_s", 60): "only providers.chat tiers can be routed",
+           ("providers.chat.tiers.light.model", "https://evil.example.com/v1"): "not a URL",
+           ("providers.chat.tiers.light.model", "a model"): "give a model name",
+           ("providers.chat.tiers.light.max_tokens", 5): "per tier it takes model, effort, route",
+           **{("providers.chat.tiers.light.route_timeout_s", v): "more than 0 and at most 14400"
+              for v in (0, -5, 10 ** 9, True, "abc", "nan", "inf", None)}}
+    for (k, v), want in bad.items():
+        probs = _cs_set(p, (k, v))
+        assert len(probs) == 1 and want in probs[0], (k, v, probs)
+    assert p.raw_config() == before
+
+
+def test_config_set_turns_routing_on_only_after_its_model_and_endpoint(env, monkeypatch):
+    _cs_home(env, monkeypatch)
+    from ttp import endpoint
+    p = make(env)
+    probs = _cs_set(p, ("providers.chat.tiers.light.route", True))
+    assert len(probs) == 1 and "set providers.chat.tiers.light.model and providers.chat.endpoint first" in probs[0]
+    assert _cs_set(p, ("providers.chat.tiers.light.route", False)) == []   # off is always fine
+    endpoint.save("cloud", "https://api.example.com/v1", _CS_KEY, True, "HTTP 200")
+    assert _cs_set(p, ("providers.chat.endpoint", "cloud"), ("providers.chat.tiers.light.model", "m"),
+                   ("providers.chat.tiers.light.route", "true")) == []
+    assert p.raw_config()["providers"]["chat"]["tiers"]["light"]["route"] is True
+
+
+def test_config_set_endpoint_names_only_a_saved_secret_and_never_echoes_its_key(env, monkeypatch):
+    _cs_home(env, monkeypatch)
+    from ttp import chatbridge, endpoint
+    p = make(env)
+    for v, want in (("cloud", "no endpoint 'cloud' is saved on this host"),
+                    ("https://api.example.com/v1", "never a URL"), ("", "never a URL"), (["cloud"], "never a URL")):
+        probs = _cs_set(p, ("providers.chat.endpoint", v))
+        assert len(probs) == 1 and want in probs[0], (v, probs)
+    assert "chat" not in (p.raw_config().get("providers") or {})
+    endpoint.save("cloud", "https://api.example.com/v1", _CS_KEY, True, "HTTP 200")
+    assert _cs_set(p, ("providers.chat.endpoint", "cloud"), ("providers.chat.tiers.light.model", "m")) == []
+    # base_url unset: the bridge calls the URL saved with the key.
+    s = chatbridge.settings(p.config(), "light", "m")
+    assert s["base_url"] == "" and chatbridge.Bridge.from_settings(s).base_url == "https://api.example.com/v1"
+    seen = (p.config_path.read_text() + json.dumps(p.db.q("SELECT * FROM events")))
+    assert _CS_KEY not in seen
+
+
+def test_config_set_never_takes_a_base_url_from_chat(env, monkeypatch):
+    _cs_home(env, monkeypatch)
+    p = make(env)
+    for k in ("providers.chat.base_url", "providers.claude.base_url", "providers.codex.base_url"):
+        probs = _cs_set(p, (k, "https://api.example.com/v1"))
+        assert len(probs) == 1 and "never set from chat" in probs[0] and "saved with the endpoint's key" in probs[0], probs
+    assert "providers" not in p.raw_config() or "chat" not in p.raw_config()["providers"]
+
+
+def test_config_set_effort_fields_takes_only_a_plain_field_mapping(env, monkeypatch):
+    _cs_home(env, monkeypatch)
+    p = make(env)
+    ok = {"org/m": {"low": {"reasoning_effort": "low"}, "*": {"temperature": 0.2, "think": False}}}
+    assert _cs_set(p, ("providers.chat.effort_fields", json.dumps(ok))) == []   # as JSON text too
+    assert p.raw_config()["providers"]["chat"]["effort_fields"] == ok
+    assert _cs_set(p, ("providers.chat.effort_fields", ok)) == []
+    assert p.raw_config()["providers"]["chat"]["effort_fields"] == ok
+    for v in ({}, "low", "{not json", [], {"org/m": "low"}, {"org/m": {"turbo": {"a": 1}}}, {"org/m": {"low": []}},
+              {"org/m": {"low": {"messages": "x"}}}, {"org/m": {"low": {"model": "other"}}},
+              {"org/m": {"low": {"a-b": 1}}}, {"org/m": {"low": {"api_base": "evil.example.com"}}},
+              {"org/m": {"low": {"api_key": "x"}}}, {"org/m": {"*": {"extra_headers": "x"}}}, {"org/m": {"low": {"thinking": {"type": "on"}}}},
+              {"org/m": {"low": {"extra": ["a"]}}}, {"org/m": {"low": {"cb": "https://evil.example.com"}}},
+              {"org/m": {"low": {"note": "x" * 65}}}, {"https://evil.example.com/m": {"low": {"a": 1}}}):
+        probs = _cs_set(p, ("providers.chat.effort_fields", v))
+        assert len(probs) == 1 and "providers.chat.effort_fields" in probs[0], (v, probs)
+    assert p.raw_config()["providers"]["chat"]["effort_fields"] == ok
+
+
+def test_config_set_still_refuses_every_key_it_refused_before(env):
+    """Only USER_SETTABLE and the routing keys pass: every other key the runtime reads stays refused."""
+    from ttp import chatset
+    from ttp.coordinator import USER_SETTABLE, settable
+    from ttp.project import DEFAULT_CONFIG, PROVIDER_KEYS
+
+    def leaves(node, path=()):
+        for k, v in node.items():
+            yield from leaves(v, (*path, k)) if isinstance(v, dict) and v else [".".join((*path, k))]
+    keys = set(leaves(DEFAULT_CONFIG))
+    for prov in (*chatset.PROVIDERS, "fake"):
+        keys |= {f"providers.{prov}.{k}" for k in PROVIDER_KEYS}
+        keys |= {f"providers.{prov}.tiers.{t}.{k}" for t in (*chatset.TIERS, "medium")
+                 for k in ("model", "effort", "route", "route_timeout_s", "max_tokens", "context_window")}
+    new = ({f"providers.{p}.tiers.{t}.{k}" for p in chatset.PROVIDERS for t in chatset.TIERS for k in ("model", "effort")}
+           | {f"providers.chat.tiers.{t}.{k}" for t in chatset.TIERS for k in ("route", "route_timeout_s")}
+           | {"providers.chat.endpoint", "providers.chat.effort_fields"})
+    accepted = set()
+    for k in keys:
+        try:
+            settable(k)
+            accepted.add(k)
+        except ValueError:
+            pass
+    assert accepted == (keys & set(USER_SETTABLE)) | new
+
+
+def test_chat_settable_query_answers_without_setting_and_the_skill_lists_it(env, monkeypatch, capsys):
+    _cs_home(env, monkeypatch)
+    from ttp import chatset, cli, endpoint
+    from ttp.coordinator import USER_SETTABLE
+
+    def ask(*argv):
+        try:
+            cli.main(["config", "--chat-settable", *argv])
+            rc = 0
+        except SystemExit as e:
+            rc = e.code
+        return rc, capsys.readouterr().out
+    rc, out = ask("list")
+    assert rc == 0 and out.split() == [*sorted(USER_SETTABLE), *chatset.PATTERNS]
+    assert ask("providers.chat.tiers.light.route_timeout_s", "2700") == (
+        0, "providers.chat.tiers.light.route_timeout_s: accepted as 2700\n")
+    assert ask("providers.chat.base_url")[0] == 1 and "never set from chat" in ask("providers.chat.base_url")[1]
+    assert ask("providers.chat.endpoint", "cloud")[0] == 1
+    endpoint.save("cloud", "https://api.example.com/v1", _CS_KEY, True, "HTTP 200")
+    rc, out = ask("providers.chat.endpoint", "cloud")
+    assert rc == 0 and _CS_KEY not in out and "api.example.com" not in out
+    assert ask("budget.daly_usd")[0] == 1
+    ref = (RUNTIME.parent / "skills" / "tt-project-harness" / "references" / "chat-settable-config.md").read_text()
+    assert "ttp config --chat-settable" in ref and all(f"`{x}`" in ref for x in chatset.PATTERNS)
