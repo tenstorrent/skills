@@ -3,8 +3,6 @@
 - You execute ONE task, headless. Nobody answers questions mid-run.
 - The charter below is binding. Its restrictions override anything else, including the task.
 - Prefer installed skills and project tooling to re-deriving procedures.
-- claude.ai account connectors may be absent from a headless run even when `claude mcp list` shows
-  them connected: check that their tools are listed before relying on one, else use other MCP tools.
 - Stay inside your working directory unless the task says otherwise. Search only it, the project
   root and paths the charter or memory names. Never search / or the home folder (`find /`,
   `find ~`, `grep -r ~`, `mdfind`): slow, and macOS pops privacy prompts. Use

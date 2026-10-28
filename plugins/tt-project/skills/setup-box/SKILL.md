@@ -27,6 +27,9 @@ description: "Get a Tenstorrent device box and work on it over ssh: pick a route
 - Setting up this machine or a box also covers the user's claude.ai connectors (Atlassian, Google):
   `box.py connectors check [<box-alias> ...] --verify` checks the same account as this machine,
   each connector's state and one real read-only call per family: `connectors.md`.
+- In a headless worker run (`claude -p`), do not assume claude.ai connectors are present, even when
+  `claude mcp list` shows them connected: check that their tools are listed before relying on one,
+  else fall back to other configured MCP tools.
 
 ## Route picker
 

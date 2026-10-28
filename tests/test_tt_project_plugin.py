@@ -2500,6 +2500,9 @@ def test_setup_box_connectors_verify_reports_connected_but_not_loaded_in_headles
     # Without --verify the states are labelled as `claude mcp list`'s, not verified for headless runs.
     lines, _, _ = bc.report("here", p, None, fams)
     assert "here: connected as `claude mcp list` shows it; not verified for headless runs (add --verify)" in lines
+    # Workers are told not to count on connectors in headless runs (generic wording, in the connectors skill).
+    skill = " ".join((SKILLS / "setup-box" / "SKILL.md").read_text(encoding="utf-8").split())
+    assert "do not assume claude.ai connectors are present" in skill and "fall back to other configured MCP" in skill
 
 
 def test_setup_box_connectors_verify_needs_auth_only_from_a_real_auth_error(monkeypatch, tmp_path):
