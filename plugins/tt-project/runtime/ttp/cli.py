@@ -6601,8 +6601,10 @@ def cmd_config(a) -> None:
 
 
 def cmd_secret(a) -> None:
-    if a.alias is not None and a.kind != "endpoint":
-        die(f"`ttp secret {a.kind}` takes no alias (only `ttp secret endpoint <alias>` does)")
+    if a.alias is not None and a.kind not in ("endpoint", "check", "env"):
+        die(f"`ttp secret {a.kind}` takes no alias (only endpoint, check and env do)")
+    if a.command and a.kind != "env":
+        die(f"`ttp secret {a.kind}` runs no command (only `ttp secret env <alias> -- <command>` does)")
     if a.kind == "jev":
         key = sys.stdin.readline().strip() if not sys.stdin.isatty() else getpass.getpass("Jev key: ")
         from .providers.jev import verify
@@ -6643,6 +6645,23 @@ def cmd_secret(a) -> None:
         if not a.host:
             die("--host is required")
         print(push_secrets(a.host))
+    elif a.kind == "check":
+        # Tests a saved key without ever showing it: reachable / auth ok / auth failed.
+        from . import endpoint
+        aliases = [a.alias] if a.alias else sorted(endpoint.saved())
+        if not aliases:
+            die("no endpoint key saved: `ttp secret endpoint <alias> --url <base url>`")
+        bad = 0
+        for alias in aliases:
+            try:
+                ok, msg = endpoint.check(alias)
+            except ValueError as e:
+                die(str(e))
+            print(msg)
+            bad += not ok
+        sys.exit(1 if bad else 0)
+    elif a.kind == "env":
+        cmd_secret_env(a)
     elif a.kind == "show":
         from . import endpoint
         sec = load_secrets()
@@ -6650,6 +6669,30 @@ def cmd_secret(a) -> None:
                           if not k.startswith(endpoint.PREFIX)}))
         for line in endpoint.show_lines():
             print(line)
+
+
+def cmd_secret_env(a) -> None:
+    """`ttp secret env <alias> -- <command>`: runs the command with the endpoint's key and URL in its
+    environment (OPENAI_API_KEY, OPENAI_BASE_URL), its output passed on with every stored secret masked."""
+    from . import endpoint, redact
+    argv = a.command[1:] if a.command[:1] == ["--"] else a.command
+    if not a.alias or not argv:
+        die("usage: ttp secret env <alias> -- <command...>")
+    try:
+        env = {**os.environ, **endpoint.env_for(a.alias)}
+    except ValueError as e:
+        die(f"{e}: `ttp secret endpoint {a.alias} --url <base url>`")
+    try:
+        child = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except OSError as e:
+        die(f"cannot run {argv[0]}: {e.strerror or e}")
+    try:
+        for line in iter(child.stdout.readline, b""):
+            sys.stdout.write(redact.scrub(line.decode(errors="replace")))
+            sys.stdout.flush()
+    except KeyboardInterrupt:
+        child.terminate()
+    sys.exit(child.wait())
 
 
 def cmd_logs(a) -> None:
@@ -8955,14 +8998,19 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_config)
 
     s = sub.add_parser("secret", help="store per-user credentials (read from stdin)")
-    s.add_argument("kind", choices=["jev", "slack", "endpoint", "show", "push"],
+    s.add_argument("kind", choices=["jev", "slack", "endpoint", "show", "check", "env", "push"],
                    help="jev: a key for Jev, the optional add-on that sends log and alert text to an "
                         "outside paid service; slack: a Slack bot token; "
                         "endpoint <alias> --url <base url>: an API key for an OpenAI-compatible endpoint, "
                         "checked with GET <base url>/models and saved with its URL as endpoint/<alias>; "
-                        "show: list what is saved (never the keys); push: copy your saved keys to --host. "
+                        "show: list what is saved (never the keys); check [alias]: test saved endpoint keys "
+                        "(reachable, auth ok or auth failed; never the key); env <alias> -- <command>: run "
+                        "a command with the key in OPENAI_API_KEY and the URL in OPENAI_BASE_URL, its output "
+                        "masked; push: copy your saved keys to --host. No command prints a saved key. "
                         "Keys go to secrets.json in your ttp home (~/.tt-project, mode 0600)")
-    s.add_argument("alias", nargs="?", help="with endpoint: a name for it (letters, digits, '-' and '_')")
+    s.add_argument("alias", nargs="?", help="with endpoint: a name for it (letters, digits, '-' and '_'); "
+                                            "with check or env: the saved endpoint")
+    s.add_argument("command", nargs="*", help="with env: -- then the command to run")
     s.add_argument("--host", help="with push: the machine to copy your saved keys to")
     s.add_argument("--via", default="typesafe", choices=["typesafe", "openrouter"],
                    help="with jev: the service the key is for (default typesafe)")

@@ -1480,6 +1480,13 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   An OpenAI-compatible endpoint's API key: `ttp secret endpoint <alias> --url <base url>` checks it with
   `GET <base url>/models` and saves it with its URL as `endpoint/<alias>`; `ttp secret show` lists it
   without the key.
+- No `ttp` command prints a saved key. `ttp secret check [alias]` tests one (reachable, auth ok or
+  auth failed) and `ttp secret env <alias> -- <command>` gives it to a command in `OPENAI_API_KEY`
+  (URL in `OPENAI_BASE_URL`). A worker's Bash calls that read the secrets store are refused.
+- The harness masks every saved secret as `[REDACTED-<name>]` in what it keeps or sends on: the
+  database (events, notes, notify text, hand-offs), the daemon log, each run's folder and its agent's
+  session transcript once the run ends, and text for Jev and Slack. The secrets store is mode 0600
+  and run folders 0700.
 
 ## Limits
 

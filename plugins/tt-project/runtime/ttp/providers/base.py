@@ -295,6 +295,11 @@ class Provider:
         own, which may point the agent at another config directory), is still on disk to resume."""
         return False
 
+    def session_paths(self, session_id: str, cwd: str, env: dict | None = None) -> list[Path]:
+        """The transcript files the agent keeps for `session_id` (subagents' too), for masking stored
+        secrets in them once a run ends (redact.scrub_run); [] when the agent keeps none."""
+        return []
+
     def append_system_args(self, path: Path) -> list[str]:
         """Arguments that add the text in `path` to the agent's system prompt, where a provider
         caches it across runs; [] when the agent cannot, and the text then leads the prompt."""

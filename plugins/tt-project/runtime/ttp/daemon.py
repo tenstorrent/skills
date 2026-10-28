@@ -39,6 +39,7 @@ from . import alerts
 from . import anchors
 from . import askrethink
 from . import audit
+from . import redact
 from . import replica
 from . import schedlog
 from . import replymsg
@@ -406,7 +407,7 @@ def _push_not_landed(probe, rc) -> bool:
 
 def log(p: Project, msg: str) -> None:
     p.logs.mkdir(parents=True, exist_ok=True)
-    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}\n"
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {redact.scrub(msg)}\n"
     with open(p.logs / "daemon.log", "a") as f:
         f.write(line)
 
@@ -2071,10 +2072,11 @@ class Daemon:
         if read_only and prov.isolate_read_only:
             cwd = scratch_dir(str(self.p.base))
         denied = coord.tool_list(self.cfg["providers"].get(provider, {}).get("disallowed_tools") or [])
+        from .project import secrets_path
         from .web import token_path
         argv, env = prov.build(role=role, model=model, effort=effort, cwd=cwd, budget_usd=budget_usd,
                                read_only=read_only, schema=schema, restrictions=restrictions,
-                               disallowed_tools=denied, denied_reads=[str(token_path(self.p).resolve())],
+                               disallowed_tools=denied, denied_reads=[str(token_path(self.p).resolve()), str(secrets_path().resolve())],
                                web=role == "coordinator" or web_needed(role, task))
         cache_fp = None
         if role != "coordinator" and not cache_ttl:
@@ -2201,7 +2203,7 @@ class Daemon:
         # Raising from here on means nothing was launched: the run row must not stay "running".
         tmp_env: dict = {}
         try:
-            run_dir.mkdir(parents=True, exist_ok=True)
+            redact.private_dir(run_dir)   # owner-only: it holds the run's output and transcript
             # A fenced worker gets a temp dir of its own (a writable root; never in the worktree): on
             # macOS git's xcrun shim otherwise fails to write its cache, and tools that honour TMPDIR
             # stay off the shared /tmp. A short one (shorttmp), so a socket a test binds beneath it
@@ -3037,6 +3039,10 @@ class Daemon:
                 return
         run_dir = self._run_dir(r)
         runner.remove_private(run_dir)   # the runner removes them too, unless it died first
+        try:   # the runner masks them too, unless it died first: before the output or hand-off is read
+            redact.scrub_run(run_dir)
+        except Exception:
+            log(p, f"run {r['id']}: masking stored secrets failed\n" + traceback.format_exc())
         prov = get_provider(r["provider"]).use(r["model"] or "", (self.cfg.get("pricing") or {}).get(r["provider"]))
         usage = prov.parse(run_dir / "output.jsonl", run_dir / "stderr.log")
         if exit_info.get("launch_auth"):
@@ -3473,7 +3479,7 @@ class Daemon:
             return
         src = max(found)[1]
         try:
-            run_dir.mkdir(parents=True, exist_ok=True)
+            redact.private_dir(run_dir)
             shutil.copyfile(src, run_dir / RESULT_FILE)
         except OSError as e:
             log(self.p, f"run {r['id']} of #{task['id']}: could not adopt the hand-off at {src}: {e}")

@@ -490,6 +490,11 @@ def supervise(run_dir: Path) -> int:
                  "slept_s": round(max((ended - started) - min(mono_end - mono_start, up), 0.0), 1), "nice": niceness}
     if bridge is not None:
         exit_info["bridge"] = bridge.stats()   # endpoint fault kinds for routing's fallback (route.py)
+    try:   # before exit.json: the daemon reads the run's output and hand-off only after it
+        from . import redact
+        redact.scrub_run(run_dir)
+    except Exception as e:
+        print(f"runner: could not mask stored secrets in the run: {type(e).__name__}", flush=True)
     _write_exit(run_dir, exit_info)
     return rc
 

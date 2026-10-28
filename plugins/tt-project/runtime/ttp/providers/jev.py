@@ -62,7 +62,8 @@ class Jev:
                timeout: float = 20.0) -> dict[str, Any] | None:
         if not self.enabled():
             return None
-        body = json.dumps({"model": self.model, "state": state, "questions": questions}).encode()
+        from ..redact import scrub, scrub_obj   # a helper service never gets a stored secret
+        body = json.dumps({"model": self.model, "state": scrub(state), "questions": scrub_obj(questions)}).encode()
         req = urllib.request.Request(self.url, data=body, method="POST", headers={
             "Authorization": f"Bearer {self.key}", "Content-Type": "application/json"})
         try:

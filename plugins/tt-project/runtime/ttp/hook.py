@@ -507,6 +507,38 @@ def _log_bypass(cmd: str) -> None:
 
 # The project's web app token (state/web.token), named in a command
 WEB_TOKEN_RE = re.compile(r"state/+web\.token\b")
+# The per-user secrets store by path, and the runtime calls that hand back its values: a tool call's
+# output stays in the run's log and its agent's transcript, so a run tests a key with
+# `ttp secret check` and gives one to a command with `ttp secret env` instead.
+SECRET_FILE_RE = re.compile(r"(?:\.tt-project|TTP_HOME\}?)/+secrets\.json\b")
+SECRET_CALL_RE = re.compile(r"(?<!def )\b(?:credentials|load_secrets|env_for)\s*\(|\bendpoint\.saved\s*\(|\bsecrets_path\s*\(")
+
+
+def secret_read(cmd: str, segments: list[list[str]], cwd: str) -> str | None:
+    """Why a Bash call that reads the secrets store is refused, else None: a command naming the store's
+    path, or an interpreter (inline code, stdin or a script it runs) calling the runtime's readers."""
+    why = ("a run must never read stored secrets (`ttp secret`): what it prints stays in the run's log and "
+           "transcript. Test a saved endpoint key with `ttp secret check <alias>` (reachable, auth ok or "
+           "auth failed), give one to a command with `ttp secret env <alias> -- <command>`, and call the "
+           "secrets file 'the secrets store' in text")
+    if SECRET_FILE_RE.search(cmd):
+        return why
+    try:
+        from .project import secrets_path
+        if str(secrets_path()) in cmd:
+            return why
+    except Exception:
+        pass
+    runs = [s for s in segments if s and _interpreter_args(s) is not None]
+    if runs and SECRET_CALL_RE.search(cmd):
+        return why
+    for f in _scripts(segments, cwd) if runs else []:
+        try:
+            if SECRET_CALL_RE.search(f.read_text(errors="replace")):
+                return why
+        except OSError:
+            continue
+    return None
 
 
 def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
@@ -527,6 +559,8 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         # Whoever holds it acts as the user in the web app; the Read deny rule covers the file tools.
         why = ("the web token is the user's credential and a run must not read it; any command naming its "
                "path is refused, so write a commit message with `git commit -F <file>` or call it 'the web token file'")
+    if not why:
+        why = secret_read(cmd, segments, str(payload.get("cwd") or os.getcwd()))
     if not why:
         why = git_push_bypass(segments)
     if not why:

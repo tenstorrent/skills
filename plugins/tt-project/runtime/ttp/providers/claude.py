@@ -338,6 +338,16 @@ class Claude(Provider):
                 return True
         return False
 
+    def session_paths(self, session_id: str, cwd: str, env: dict | None = None) -> list[Path]:
+        if not session_id or not re.fullmatch(r"[A-Za-z0-9-]+", session_id):
+            return []
+        own = (env or {}).get("CLAUDE_CONFIG_DIR")
+        out: list[Path] = []
+        for base in dict.fromkeys(([Path(own).expanduser()] if own else []) + [claude_config_dir()]):
+            projects = base / "projects"
+            out += [*projects.glob(f"*/{session_id}.jsonl"), *projects.glob(f"*/{session_id}/**/*.jsonl")]
+        return out
+
     def plugin_args(self, dirs: list[str]) -> list[str]:
         out: list[str] = []
         for d in dirs:

@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping
 
-from . import billing
+from . import billing, redact
 
 SCHEMA_VERSION = 1
 STUCK_STATUSES = "('blocked','waiting','review')"   # task statuses a stuck episode spans (tasks.stuck_since)
@@ -625,7 +625,8 @@ END""")
         return dict(r) if r else None
 
     def x(self, sql: str, args: Iterable[Any] = ()) -> int:
-        args = tuple(args)
+        # No stored secret (`ttp secret`) is ever kept: every command, web view and relay reads it back.
+        args = tuple(redact.scrub(a) if isinstance(a, str) else a for a in args)
         if self.conn.in_transaction:   # the transaction holds the write lock (BEGIN IMMEDIATE)
             cur = self.conn.execute(sql, args)
         else:                          # a write on its own: it commits or fails whole, so it is safe to retry

@@ -43,7 +43,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-from . import endpoint
+from . import endpoint, redact
 
 UPSTREAM_TIMEOUT_S = 600
 STOP_REASONS = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use",
@@ -549,7 +549,7 @@ class Bridge:
         self.stop()
 
     def _scrub(self, text: str) -> str:
-        return text.replace(self._key, "<key>") if self._key else text
+        return redact.scrub(text.replace(self._key, "<key>") if self._key else text)
 
     def _fault(self, status: int, detail: str = "") -> None:
         kind = fault_of(status, detail)

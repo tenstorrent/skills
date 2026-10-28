@@ -90,7 +90,8 @@ class Slack:
         return self._dm
 
     def post(self, project: str, text: str, thread_ts: str | None = None) -> str:
-        body = text if thread_ts else f"[{project}] {text}"
+        from .redact import scrub
+        body = scrub(text if thread_ts else f"[{project}] {text}")
         return self.call("chat.postMessage", channel=self.dm_channel(), text=body[:39000],
                          thread_ts=thread_ts, unfurl_links=False)["ts"]
 

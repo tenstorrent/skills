@@ -6077,7 +6077,8 @@ def test_a_claude_worker_is_denied_reading_the_web_token(env, monkeypatch):
     p = make(env)
     argv, run_dir, _ = _dispatch_claude_worker(p, monkeypatch, {})
     settings = json.loads(argv[argv.index("--settings") + 1])
-    assert settings["permissions"]["deny"] == [f"Read(/{token_path(p).resolve()})"]
+    from ttp.project import secrets_path   # the per-user secrets store too
+    assert settings["permissions"]["deny"] == [f"Read(/{token_path(p).resolve()})", f"Read(/{secrets_path().resolve()})"]
     assert settings["permissions"]["deny"][0].startswith("Read(//")
     assert "PreToolUse" in settings["hooks"]
     assert "permissions" not in claude.worker_settings()

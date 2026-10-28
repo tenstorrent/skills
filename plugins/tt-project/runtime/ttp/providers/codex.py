@@ -105,6 +105,13 @@ class Codex(Provider):
         homes = ([Path(own).expanduser()] if own else []) + [codex_home()]
         return any(any((h / "sessions").glob(f"*/*/*/rollout-*-{session_id}.jsonl")) for h in dict.fromkeys(homes))
 
+    def session_paths(self, session_id: str, cwd: str, env: dict | None = None) -> list[Path]:
+        if not session_id or not re.fullmatch(r"[A-Za-z0-9-]+", session_id):
+            return []
+        own = (env or {}).get("CODEX_HOME")
+        homes = ([Path(own).expanduser()] if own else []) + [codex_home()]
+        return [f for h in dict.fromkeys(homes) for f in (h / "sessions").glob(f"*/*/*/rollout-*-{session_id}.jsonl")]
+
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions,
               disallowed_tools=(), denied_reads=(), web=True):
         exe = self.binary() or "codex"
