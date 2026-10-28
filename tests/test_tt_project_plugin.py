@@ -2277,14 +2277,17 @@ def test_setup_box_connectors_check_reports_each_state_and_the_one_step_per_acco
     assert rc == 1
     assert "<box-alias>: Atlassian needs authentication" in problems and "<box-alias>: Gmail needs authentication" in problems
     assert "<box-alias>: Google Calendar failed to connect" in problems and "<box-alias>: Google Docs missing" in problems
-    assert any(f.startswith("in claude.ai Settings > Connectors, connect Gmail: once per account") for f in fixes)
+    assert "in claude.ai Settings > Connectors, connect Atlassian, Gmail: once per account, every machine signed " \
+        "into it then has them; then rerun this check" in fixes
+    assert sum(f.startswith("in claude.ai Settings > Connectors, add and connect Google Docs, Google Sheets, "
+                            "Google Slides") for f in fixes) == 1 and len(fixes) == 3
     assert "<box-alias> Google: Google Drive connected, Gmail needs authentication, Google Calendar failed to connect, " \
         "Google Docs missing, Google Sheets missing, Google Slides missing" in lines
     # None listed (no claude.ai connector at all): every one missing, with the add step.
     bc, _ = _connectors(monkeypatch, {"here": _connector_probe(states={})})
     lines, problems, fixes, rc = bc.inspect([], fams)
     assert rc == 1 and len(problems) == 7 and all(p.endswith(" missing") for p in problems)
-    assert all("add and connect" in f for f in fixes)
+    assert len(fixes) == 1 and fixes[0].startswith("in claude.ai Settings > Connectors, add and connect Atlassian, ")
     # The listing failed: said so, no connector guessed missing.
     bc, _ = _connectors(monkeypatch, {"here": _connector_probe(listed=False)})
     lines, problems, _, rc = bc.inspect([], fams)
@@ -2308,7 +2311,7 @@ def test_setup_box_connectors_check_names_a_different_account_or_sign_in_without
         email="other@example.invalid", org="org-b", states={"Atlassian": "needs_auth"})})
     lines, problems, fixes, rc = bc.inspect(["<box-alias>"], fams)
     assert "<box-alias>: signed in to claude.ai, account different from here" in lines
-    assert any("connect Atlassian (on the account <box-alias> is signed into)" in f for f in fixes)
+    assert any("connect Atlassian (on the account <box-alias> is signed into; or switch" in f for f in fixes)
     # Signed out, not installed, an API key, ssh failing: each named, with its fix; nothing logs in by itself.
     bc, ran = _connectors(monkeypatch, {"here": _connector_probe(), "<box-alias>": _connector_probe(signed_in=False),
                                         "b2": _connector_probe(signed_in=None), "b3": _connector_probe(method="apiKey"),

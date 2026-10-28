@@ -248,22 +248,31 @@ def report(machine: str, p: dict, ref: Optional[dict], fams: Dict[str, List[str]
         find(f"could not list connectors (`claude mcp list` exit {p['rc']})", "rerun this check; if it fails again, "
              "run `claude mcp list` there and read its error")
         return lines, problems, fixes
-    acct = f" (on the account {machine} is signed into)" if other else ""
+    acct = f" (on the account {machine} is signed into; or switch accounts as above)" if other else ""
+    by_state: Dict[str, List[str]] = {"needs_auth": [], "missing": [], "failed": []}
     for fam, names in fams.items():
         parts = []
         for name in names:
             st = connector_state(p, name)
             parts.append(f"{name} {STATE_WORDS[st]}")
-            if st == "needs_auth":
-                find(f"{name} needs authentication", f"in {SETTINGS_STEP}, connect {name}{acct}: once per account, "
-                     "every machine signed into it then has it; then rerun this check")
-            elif st == "missing":
-                find(f"{name} missing", f"in {SETTINGS_STEP}, add and connect {name}{acct} (an organization admin "
-                     "may have to allow it first); then rerun this check")
-            elif st == "failed":
-                find(f"{name} failed to connect", f"rerun this check; if {name} still fails, reconnect it in "
-                     f"{SETTINGS_STEP}{acct}")
+            if st in by_state:
+                problems.append(f"{machine}: {name} {STATE_WORDS[st]}")
+                if name not in by_state[st]:
+                    by_state[st].append(name)
         lines.append(f"{machine} {fam}: " + ", ".join(parts))
+    # One step per state for all its connectors: authorization is per account, not per connector or machine.
+    if by_state["needs_auth"]:
+        fix = (f"in {SETTINGS_STEP}, connect {', '.join(by_state['needs_auth'])}{acct}: once per account, every "
+               "machine signed into it then has them; then rerun this check")
+        fixes += [fix] if fix not in fixes else []
+    if by_state["missing"]:
+        fix = (f"in {SETTINGS_STEP}, add and connect {', '.join(by_state['missing'])}{acct} (an organization admin "
+               "may have to allow them first); then rerun this check")
+        fixes += [fix] if fix not in fixes else []
+    if by_state["failed"]:
+        fix = (f"rerun this check; if {', '.join(by_state['failed'])} still fail, reconnect them in "
+               f"{SETTINGS_STEP}{acct}")
+        fixes += [fix] if fix not in fixes else []
     for fam, v in (verified or {}).items():
         off = [x for x, st in v.get("headless", {}).items() if st != "connected"]
         if off:
