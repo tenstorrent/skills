@@ -1685,6 +1685,48 @@ def test_a_detached_push_cut_by_a_reboot_is_queued_again_and_pushes_within_its_r
         _release_detached(gate, pids)
 
 
+def test_ttp_status_shows_a_detached_push_that_retried_with_its_cause_and_attempt(env):
+    """A running or queued detached push that has retried shows in `ttp status` with its attempt and
+    causes; one that has not retried, or has finished, adds no line."""
+    from ttp import push
+    from ttp.cli import status_text
+    p = make(env)
+    folder = p.state / push.DETACHED
+    folder.mkdir(parents=True)
+    now = time.time()
+    base = {"queued": now, "target": "origin/proj", "retry_max": 2, "log": str(folder / "x.log")}
+    for rid, extra in {"t5-retried": {"status": "queued", "task": 5, "retries": [{"cause": "reboot"}]},
+                       "t6-first": {"status": "queued", "task": 6},
+                       "t7-done": {"status": "pushed", "task": 7, "retries": [{"cause": "non_fast_forward"}]}}.items():
+        (folder / f"{rid}.json").write_text(json.dumps({**base, "id": rid, **extra}))
+    text = status_text(p)
+    assert "push t5-retried queued (task #5, origin/proj): attempt 2 of at most 3, retried after reboot" in text, text
+    assert "t6-first" not in text and "t7-done" not in text, text
+
+
+@pytest.mark.parametrize("retries", [3, "reboot", {"cause": "reboot"}, None, [1, {"cause": "reboot"}]])
+def test_a_marker_whose_retries_is_not_a_list_breaks_neither_the_tick_nor_the_probe(env, capsys, retries):
+    """`retries` damaged or hand-edited (a number, a string, a dict): tend never raises out of the
+    daemon's tick, the probe answers with a verdict and status still renders."""
+    from ttp import push
+    from ttp.cli import status_text
+    p = make(env)
+    folder = p.state / push.DETACHED
+    folder.mkdir(parents=True)
+    log = folder / "t1-bad.log"
+    log.write_text("")
+    for rid, status in (("t1-bad", "running"), ("t2-bad", "failed")):
+        (folder / f"{rid}.json").write_text(json.dumps(
+            {"id": rid, "status": status, "pid": 1, "boot": "an-earlier-boot", "alive": time.time(),
+             "log": str(log), "retry_max": 2, "retries": retries}))
+    push.tend(p)
+    status_text(p)
+    for rid in ("t1-bad", "t2-bad"):
+        assert push.result(folder / f"{rid}.json") == 0
+        assert json.loads((folder / f"{rid}.json").read_text())["status"] == "failed"
+    assert "not pushed" in capsys.readouterr().out
+
+
 def test_a_malformed_queued_push_marker_is_recorded_as_failed_and_the_tick_goes_on(env):
     """A queued marker the daemon cannot use (a non-numeric queued time, no repo or log, an env that
     is not a dict) is recorded as a failed push with the reason, and the rest of the tick still runs."""

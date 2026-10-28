@@ -1355,6 +1355,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
         what = f"#{w['task']} {w['title']}" if w["task"] else w["role"]
         lines.append(f"  running {since(w['started'], now)}: {what}" + (f" ({w['wake']} wake)" if w.get("wake") else "")
                      + (f" — {w['note']}" if w["note"] else ""))
+    from . import push
+    lines.extend(push.status_lines(p))
     in_review = db.review_since()
     if stuck:
         lines.append("stuck, the project is on it:")

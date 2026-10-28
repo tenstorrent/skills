@@ -3882,10 +3882,17 @@ def retries_of(v: Any) -> int:
         return DEFAULT_RETRIES
 
 
+def _retries(m: dict) -> list[dict]:
+    """The retries a marker records; [] when its `retries` is not a list (a hand-edited or damaged
+    marker), so neither the daemon's tick nor the probe fails on it."""
+    v = m.get("retries")
+    return [r for r in v if isinstance(r, dict)] if isinstance(v, list) else []
+
+
 def retry_words(m: dict) -> str:
     """The retries of a detached push in a few words ('' with none): `attempt 3 of at most 3, retried
     after non_fast_forward, reboot`."""
-    done = [r for r in m.get("retries") or [] if isinstance(r, dict)]
+    done = _retries(m)
     if not done:
         return ""
     return (f"attempt {len(done) + 1} of at most {retries_of(m.get('retry_max')) + 1}, retried after "
@@ -3894,7 +3901,7 @@ def retry_words(m: dict) -> str:
 
 def _note_retry(marker: Path, m: dict, cause: str, detail: str) -> dict:
     """Record a retry of cause `cause` in `m` (the marker as read) and write it."""
-    done = [r for r in m.get("retries") or [] if isinstance(r, dict)]
+    done = _retries(m)
     done.append({"cause": cause, "attempt": len(done) + 2, "at": time.time(), "detail": detail})
     m.update(retries=done, attempt=len(done) + 1, retry_cause=cause)
     write_json(marker, m)
@@ -4096,7 +4103,7 @@ def _run_retrying(p: Project, repo: Path, marker: Path, own: bool, rec: dict | N
     retries, counting a reboot's requeue. (exit code, the reason to record or None)."""
     m = _read(marker)
     remote, branch = str(m.get("remote") or ""), str(m.get("branch") or "")
-    done = [r for r in m.get("retries") or [] if isinstance(r, dict)]
+    done = _retries(m)
     if done and done[-1].get("cause") == REBOOT and _rebasing(repo):
         print("ttp push: aborting the rebase the reboot cut short", file=sys.stderr, flush=True)
         _git(repo, "rebase", "--abort")
@@ -4107,7 +4114,7 @@ def _run_retrying(p: Project, repo: Path, marker: Path, own: bool, rec: dict | N
         if not tip:
             return rc, None
         m = _read(marker)
-        n, limit = len([r for r in m.get("retries") or [] if isinstance(r, dict)]), retries_of(m.get("retry_max"))
+        n, limit = len(_retries(m)), retries_of(m.get("retry_max"))
         if n >= limit:
             why = (f"{NON_FF}: {remote}/{branch} moved on to {tip[:10]}; already retried {n} time(s), "
                    f"the most delivery.push_retries allows")
@@ -4172,7 +4179,7 @@ def _restartable(m: dict) -> bool:
 
 
 def _spent(m: dict) -> str:
-    n = len([r for r in m.get("retries") or [] if isinstance(r, dict)])
+    n = len(_retries(m))
     if not (_rebooted(m) and _restartable(m)) or n < retries_of(m.get("retry_max")):
         return ""
     return f"; {REBOOT}: already retried {n} time(s), the most delivery.push_retries allows"
@@ -4184,7 +4191,7 @@ def _requeue(marker: Path, m: dict) -> bool:
     its run lock is taken), False to record it as failed."""
     if not (_rebooted(m) and _restartable(m)):
         return False
-    if len([r for r in m.get("retries") or [] if isinstance(r, dict)]) >= retries_of(m.get("retry_max")):
+    if len(_retries(m)) >= retries_of(m.get("retry_max")):
         return False
     lock = locks.try_take([_run_lock(marker)], f"detached push {m.get('id')}", "requeue after a reboot")
     if lock is None:
@@ -4249,7 +4256,7 @@ def tend(p: Project) -> list[str]:
         except Exception as e:   # a malformed marker: recorded as failed, never aborts the daemon's tick
             _malformed(marker, e)
             m = _read(marker)
-        if len(m.get("retries") or []) > len(before.get("retries") or []):
+        if len(_retries(m)) > len(_retries(before)):
             cleared.append(f"requeued push marker {marker.name} after a host reboot ({retry_words(m)})")
         before = before.get("status")
         if before in ("running", "queued") and m.get("status") == "failed":
@@ -4396,6 +4403,18 @@ def running(p: Project) -> list[dict]:
         m = _read(marker)
         if m.get("status") == "queued" or m.get("status") == "running" and not locks.any_free([_run_lock(marker)]):
             out.append({**m, "marker": str(marker)})
+    return out
+
+
+def status_lines(p: Project) -> list[str]:
+    """`ttp status`: a line per running or queued detached push that has retried, naming its attempt
+    and the causes, so the coordinator and the user see a push that tries again by itself."""
+    out = []
+    for m in running(p):
+        if words := retry_words(m):
+            task = f"task #{m['task']}, " if m.get("task") else ""
+            out.append(f"  push {m.get('id') or Path(m['marker']).stem} {m.get('status')} "
+                       f"({task}{m.get('target') or 'no target'}): {words}")
     return out
 
 
