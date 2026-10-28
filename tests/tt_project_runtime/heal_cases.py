@@ -3770,6 +3770,61 @@ def test_a_noop_undo_change_closes_only_after_its_until_probe_passes_twice_in_a_
             assert c["closed_why"] == f"auto-closed: {rule}" and c["closed_by"] == f"auto-close: {rule}"
 
 
+def test_a_noop_undo_change_closes_itself_once_its_until_task_is_done_failed_or_cancelled(env):
+    """An --until-task entry with a no-op undo closes itself (no page) once its project's daemon saw the task
+    done, failed or cancelled, the rule naming the task. A real undo still pages; an open task keeps it open;
+    an until-task that cannot be resolved (deleted, unknown id, or a project whose daemon never marks it)
+    pages as before."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    t0 = time.time()
+    task = {n: p.db.add_task(n, "s", kind="work", tier="light", origin="user")
+            for n in ("done", "failed", "cancelled", "real", "open", "deleted", "elsewhere")}
+    noop = "none: the jobs end themselves"
+    ids = {n: ml.add_change("box-a", n, noop, p.name, until_task=task[n], now=t0)["id"]
+           for n in ("done", "failed", "cancelled", "open", "deleted")}
+    _set_undo(ml, ids["failed"], "true")
+    ids["real"] = ml.add_change("box-a", "real", "release it", p.name, until_task=task["real"], now=t0)["id"]
+    ids["unknown"] = ml.add_change("box-a", "unknown", noop, p.name, until_task=99999, now=t0)["id"]
+    ids["elsewhere"] = ml.add_change("box-a", "elsewhere", noop, "gone-project", until_task=task["elsewhere"],
+                                     now=t0)["id"]
+    for n in ("done", "failed", "cancelled", "real"):
+        p.db.x("UPDATE tasks SET status=? WHERE id=?", ("done" if n == "real" else n, task[n]))
+    p.db.x("DELETE FROM tasks WHERE id=?", (task["deleted"],))
+    able, logs = (lambda n: (True, "")), []
+    ml.Probes(p, log=lambda m: None).tick(t0 + 1)
+    pages = ml.route(t0 + 2, able=able, claimer=p.name, log=logs.append)
+    paged = {int(x["key"].split(":")[1]) for x in pages if x["kind"] == "machine_change_overdue"}
+    assert paged == {ids["real"], ids["deleted"], ids["unknown"]}, pages
+    left = {c["id"] for c in ml.changes()}
+    assert left == {ids[n] for n in ("real", "open", "deleted", "unknown", "elsewhere")}
+    closed = {c["id"]: c for c in ml.changes(open_only=False) if c.get("closed")}
+    for n in ("done", "failed", "cancelled"):
+        rule = f"no-op undo, its until-task #{task[n]} is {n}"
+        c = closed[ids[n]]
+        assert c["closed_why"] == f"auto-closed: {rule}" and c["closed_by"] == f"auto-close: {rule}"
+        assert c["auto_closed"]["rule"] == rule and "page" not in c
+    assert len(logs) == 3 and all("auto-closed (no-op undo, its until-task #" in m for m in logs)
+    [still] = [c for c in ml.changes() if c["id"] == ids["open"]]
+    assert not ml.overdue(still, t0 + 2) and not ml.auto_close_rule(still, t0 + 2)
+    # The open task ends later: the next pass closes it too.
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (task["open"],))
+    ml.Probes(p, log=lambda m: None).tick(t0 + 3)
+    pages = ml.route(t0 + 4, able=able, claimer=p.name)
+    assert ids["open"] not in {int(x["key"].split(":")[1]) for x in pages}
+    assert ids["open"] not in {c["id"] for c in ml.changes()}
+    # One whose project never marks its task ends at its latest end and pages, as before.
+    late = t0 + ml.PROBE_END_S + 1
+    pages = ml.route(late, able=able, claimer=p.name)
+    assert f"machine-change:{ids['elsewhere']}" in {x["key"] for x in pages}
+    assert ids["elsewhere"] in {c["id"] for c in ml.changes()}
+    # An edit to a new until-task forgets the old task's end.
+    c = ml.edit_change(ids["real"], p.name, undo=noop, until_task=task["open"], now=t0 + 5)
+    assert "task_ended" not in c and "task_status" not in c
+
+
 def test_a_noop_undo_change_with_a_failing_broken_or_trivial_probe_is_never_auto_closed(env):
     """Past its --expires, an entry whose probe still fails, broke, or always exits 0 (ends.always_succeeds)
     keeps paging, as does a pass whose job failed."""

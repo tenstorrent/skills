@@ -49,8 +49,9 @@ owner, then its fallback, each after the one before cannot act for UNAVAILABLE_S
 then the user. Nothing is undone automatically unless asked (Auto-undo): whoever is paged runs the undo and closes the entry
 (`ttp machines change close <id>`). An entry whose undo is a no-op (noop_undo: empty, `true`, `:`, or
 `none` as a word, as in `none: <why>`) is never paged: once its until-probe passed PROBE_PASSES times in a row
-(not one ends.always_succeeds refuses, nor a pass whose job failed) or, with no until-probe or until-task, its
-time passed, the first daemon's route closes it under the lock, model-free and once (auto_close_rule), with
+(not one ends.always_succeeds refuses, nor a pass whose job failed), its until-task is done, failed or cancelled
+(task_status; a deleted or unknown task, or one no daemon marks, pages as before) or, with no until-probe or
+until-task, its time passed, the first daemon's route closes it under the lock, model-free and once (auto_close_rule), with
 `auto_closed` and closed_by naming the rule. Probes run only in the daemon of the project that made the entry,
 from its root, as end probes do, starting PROBE_GRACE_S after the entry; a probe counts as passed only after
 PROBE_PASSES passes in a row (each logged with its output's tail), keeps running while the entry is open, and a
@@ -690,7 +691,7 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
             for k in AUTO_UNDO_STATE:   # a new undo or end gets its tries afresh (its runs stay in the history)
                 c.pop(k, None)
         if "expires" in was or reprobe:
-            for k in ("probe_passed", "probe_job_failed", "probe_out", "task_ended", "page"):
+            for k in ("probe_passed", "probe_job_failed", "probe_out", "task_ended", "task_status", "page"):
                 c.pop(k, None)
             c["page_from"] = now   # a new page episode: its pages get ids of their own, not the delivered ones'
         c.setdefault("edits", []).append({"at": now, "by": by, "was": was})
@@ -770,10 +771,14 @@ def _due(c: dict, now: float) -> str:
 
 def auto_close_rule(c: dict, now: float) -> str:
     """The rule that closes open entry `c` with no page ("" when none does): its undo is a no-op and it is
-    due (_due)."""
+    due (_due), or its project's daemon saw its until-task done, failed or cancelled (task_status; never a
+    task it could not resolve, which pages as before)."""
     if not noop_undo(c.get("undo")):
         return ""
     due = _due(c, now)
+    if not due and c.get("until_task") and c.get("task_ended") and c.get("task_status") in TERMINAL_TASK_STATES \
+            and not c.get("closed"):
+        due = f"its until-task #{c['until_task']} is {c['task_status']}"
     return f"no-op undo, {due}" if due else ""
 
 
@@ -1671,11 +1676,17 @@ class Probes:
                 and c.get("until_task") and not c.get("task_ended") and (why := task_over(self.p, c["until_task"]))}
         if not over:
             return
+        status = {}   # the task's end when it resolved to one (auto_close_rule); none when deleted or unknown
+        for _, tid in over:
+            row = self.p.db.task(int(tid)) if str(tid).isdigit() else None
+            if row is not None and row["status"] in TERMINAL_TASK_STATES:
+                status[tid] = row["status"]
         with _locked():
             doc = _read(LEDGER, {"next": 1, "changes": []})
             for c in doc.get("changes", []):   # not an until-task an edit replaced meanwhile
                 if (c.get("id"), c.get("until_task")) in over and not c.get("closed") and not c.get("task_ended"):
-                    c.update(task_ended=now, task_end_why=over[(c["id"], c["until_task"])])
+                    c.update(task_ended=now, task_end_why=over[(c["id"], c["until_task"])],
+                             **({"task_status": status[c["until_task"]]} if c["until_task"] in status else {}))
             _write(LEDGER, doc)
 
     def _auto_undos(self, now: float) -> None:
