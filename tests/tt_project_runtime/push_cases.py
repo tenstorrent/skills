@@ -12886,6 +12886,7 @@ def test_push_check_passes_recorded_before_env_parts_just_miss(env, monkeypatch)
 
 
 _FORK_GH = ("#!/bin/sh\necho \"$@\" >> \"$FAKE_GH_LOG\"\n"
+            "if [ -n \"$FAKE_GH_SLEEP\" ]; then exec sleep \"$FAKE_GH_SLEEP\"; fi\n"
             "if [ -n \"$FAKE_GH_ERR\" ]; then echo \"$FAKE_GH_ERR\" >&2; exit 1; fi\ncat \"$FAKE_GH_JSON\"\n")
 
 
@@ -13059,3 +13060,119 @@ def test_a_hand_pushed_pr_head_on_the_fork_is_verified_there_not_failed(env, mon
     assert task["status"] == "done", (task["status"], res)
     assert "the open PR's head repository" in res["summary"]
     assert "pr view feature-x" in log.read_text()
+
+
+def _pq_fork(env, monkeypatch, cross=True, err="", on_fork=True):
+    """A push-queue project (_pq) whose code task is labelled pr_branch:feature-x, origin moved and
+    forked as in _fork_pr, and feature-x pushed only to the fork (`on_fork`). Returns (s, fork, gh log,
+    the git commands prhead ran)."""
+    from ttp import prhead, pushq
+    s = _pq(env, monkeypatch)
+    up, fork, log = _fork_pr(env, monkeypatch, s.repo, cross=cross, err=err)
+    if on_fork:
+        _git_out(s.path, "push", "-q", str(fork), "HEAD:refs/heads/feature-x")
+    s.p.db.update_task(s.code, labels=json.dumps(["pr_branch:feature-x"]))
+    pushq._absent_seen.clear()
+    ran, real = [], prhead._git
+    monkeypatch.setattr(prhead, "_git", lambda repo, *a, **k: ran.append(a) or real(repo, *a, **k))
+    return s, fork, log, ran
+
+
+def test_a_review_approved_pr_branch_on_the_open_prs_fork_head_is_found_there_not_absent(env, monkeypatch):
+    """(1) The push remote lacks the reviewed task's pr_branch, but its open PR has its head on a fork
+    that has it: the push queue finds it there (the remote `ttp push --own` publishes to), so the
+    label is not ignored as absent and the approval is refused toward `ttp push --own`. (A1) The
+    fork's default branch is never read: no `ls-remote --symref`. origin is left as it was."""
+    from ttp import pushq
+    s, fork, log, ran = _pq_fork(env, monkeypatch)
+    origin = _git_out(s.repo, "remote", "get-url", "origin")
+    assert not pushq._absent(s.p, "origin", "feature-x", True)
+    out = pushq.check_approval(s.p, s.p.db.task(s.review), [{"branch": s.branch, "head": s.head}])
+    assert "ttp push --own" in out.get("invalid", ""), out
+    assert "feature-x is on remote ttp-head-forker" in out["invalid"], out
+    assert "pr view feature-x" in log.read_text()
+    assert not [a for a in ran if "--symref" in a], ran
+    assert _git_out(s.repo, "remote", "get-url", "origin") == origin
+
+
+@pytest.mark.parametrize("cross,err,why", [
+    (False, "", "has its head on origin's repository"),
+    (True, 'no pull requests found for branch "feature-x"', "no open PR has feature-x as its head"),
+    (True, "HTTP 502: Bad Gateway", "gh could not answer (HTTP 502: Bad Gateway)")])
+def test_a_pr_branch_whose_pr_is_same_repo_absent_or_unreadable_stays_absent_with_the_reason(env, monkeypatch,
+                                                                                            cross, err, why):
+    """(2) A same-repository PR, no open PR, or gh failing: only the push remote's answer counts, as
+    before (the fork having the branch changes nothing), and the reason is in the approval's note."""
+    from ttp import pushq
+    s, fork, log, ran = _pq_fork(env, monkeypatch, cross=cross, err=err)
+    assert pushq._absent(s.p, "origin", "feature-x", True)
+    out = pushq.check_approval(s.p, s.p.db.task(s.review), [{"branch": s.branch, "head": s.head}])
+    assert "invalid" not in out, out
+    assert any("feature-x was ignored" in n and why in n for n in out["notes"]), out["notes"]
+    assert log.read_text().count("pr view feature-x") == 1
+
+
+def test_a_pr_branch_missing_on_both_the_push_remote_and_the_fork_is_still_absent(env, monkeypatch):
+    """(3) The open PR's head is a fork, but neither it nor the push remote has the branch: absent, and
+    the note says the fork was read too."""
+    from ttp import pushq
+    s, fork, log, ran = _pq_fork(env, monkeypatch, on_fork=False)
+    assert pushq._absent(s.p, "origin", "feature-x", True)
+    out = pushq.check_approval(s.p, s.p.db.task(s.review), [{"branch": s.branch, "head": s.head}])
+    assert any("remote ttp-head-forker has no feature-x either" in n for n in out.get("notes", [])), out
+    assert not [a for a in ran if "--symref" in a], ran
+
+
+def test_the_push_queues_fork_check_asks_gh_nothing_when_prheads_cache_has_the_answer(env, monkeypatch, tmp_path):
+    """(4) A second check of the same pr_branch, in this process (prhead's memo) or after it (the run
+    folder's pr_head.json), reads the kept answer: gh is asked once."""
+    from ttp import prhead, pushq
+    s, fork, log, ran = _pq_fork(env, monkeypatch)
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    assert not pushq._absent(s.p, "origin", "feature-x", True)
+    pushq._absent_seen.clear()
+    assert not pushq._absent(s.p, "origin", "feature-x", True)
+    pushq._absent_seen.clear()
+    monkeypatch.setattr(prhead, "_memo", {})
+    assert not pushq._absent(s.p, "origin", "feature-x", True)
+    assert (tmp_path / prhead.CACHE).is_file()
+    assert log.read_text().count("pr view") == 1, log.read_text()
+
+
+@pytest.mark.parametrize("left", ["cut", "spent"])
+def test_a_slow_gh_in_a_push_claim_check_is_deferred_within_the_ticks_budget(env, monkeypatch, left):
+    """(A2, A3) pushclaim._on_pr_head asks gh within the tick's Budget: with a slow gh its timeout is
+    cut to what is left and the claim is deferred (OutOfTime), not failed; with the Budget spent gh is
+    not run at all. The fork's default branch is never read (no `ls-remote --symref`)."""
+    from ttp import prhead, pushclaim
+    _, repo, _, _ = _push_setup(env, monkeypatch, ["true"])
+    up, fork, log = _fork_pr(env, monkeypatch, repo)
+    _git_out(repo, "push", "-q", str(fork), "HEAD:refs/heads/feature-x")
+    monkeypatch.setenv("FAKE_GH_SLEEP", "30")
+    ran, real = [], prhead._git
+    monkeypatch.setattr(prhead, "_git", lambda r, *a, **k: ran.append(a) or real(r, *a, **k))
+    b = pushclaim.Budget(2 if left == "cut" else 0.5)
+    b.call(repo, "ls-remote", "origin", timeout=30)   # the tick's first call (it may take all its timeout)
+    began = time.monotonic()
+    with pytest.raises(pushclaim.OutOfTime):
+        pushclaim._on_pr_head({"pr_branch": "feature-x"}, repo, "origin", "refs/heads/feature-x",
+                              _git_out(repo, "rev-parse", "HEAD"), {pushclaim.Budget.KEY: b})
+    assert time.monotonic() - began < 10
+    assert (log.read_text().count("pr view") if log.exists() else 0) == (1 if left == "cut" else 0)
+    assert not [a for a in ran if "--symref" in a], ran
+    assert not prhead._memo, "a gh timeout is no answer: a later tick asks again"
+
+
+def test_a_push_claim_on_the_fork_head_is_confirmed_without_reading_its_default_branch(env, monkeypatch):
+    """(A1) The daemon's claim check confirms a pr_branch commit on the PR's fork head, within its
+    Budget, and never runs `ls-remote --symref` (only a push refusal needs the default branch)."""
+    from ttp import prhead, pushclaim
+    _, repo, _, _ = _push_setup(env, monkeypatch, ["true"])
+    up, fork, log = _fork_pr(env, monkeypatch, repo)
+    _git_out(repo, "push", "-q", str(fork), "HEAD:refs/heads/feature-x")
+    ran, real = [], prhead._git
+    monkeypatch.setattr(prhead, "_git", lambda r, *a, **k: ran.append(a) or real(r, *a, **k))
+    out = pushclaim._on_pr_head({"pr_branch": "feature-x"}, repo, "origin", "refs/heads/feature-x",
+                                _git_out(repo, "rev-parse", "HEAD"), {pushclaim.Budget.KEY: pushclaim.Budget(30)})
+    assert out and out[0] == pushclaim.CONFIRMED, out
+    assert not [a for a in ran if "--symref" in a], ran

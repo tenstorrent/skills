@@ -70,7 +70,7 @@ REBASE_LABEL = "push_rebase:"   # + the conflicting head: a review the daemon qu
 _children: dict[str, subprocess.Popen] = {}   # batch processes this daemon started, reaped by finalize
 _default_branches: dict[tuple[str, str], tuple[float, str | None]] = {}   # (root, remote): (until, branch)
 _recover_asked: dict[str, float] = {}         # batch id: when its remote was last asked (_recover)
-_absent_seen: dict[tuple[str, str, str], tuple[float, bool]] = {}   # (root, remote, branch): (until, absent)
+_absent_seen: dict[tuple[str, str, str], tuple[float, bool, str]] = {}   # (root, remote, branch): (until, absent, why)
 
 
 # settings -----------------------------------------------------------------------------------------
@@ -387,11 +387,12 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
     for t in push._reviewed(p, str(task["id"])):
         if onto := push.pr_elsewhere(p, t, d):
             if tgt and _absent(p, tgt[0], onto):
-                notes.append(f"#{t['id']}'s pr_branch label {onto} was ignored: {tgt[0]} has no such branch, "
-                             f"so the review's approval delivers it to the push branch")
+                notes.append(f"#{t['id']}'s pr_branch label {onto} was ignored: {tgt[0]} has no such branch"
+                             f"{_fork_why(p, tgt[0], onto)}, so the review's approval delivers it to the push branch")
                 continue
-            return {"invalid": f"#{t['id']} delivers onto its pr_branch {onto}, not the push branch: publish it "
-                               f"there with `ttp push --own --detach` instead of approving it for the push queue"}
+            return {"invalid": f"#{t['id']} delivers onto its pr_branch {onto}, not the push branch"
+                               f"{_fork_why(p, tgt[0], onto) if tgt else ''}: publish it there with "
+                               f"`ttp push --own --detach` instead of approving it for the push queue"}
     if not tgt:
         return {"invalid": "no target branch: set delivery.push_branch"}
     why = _refusal(p, *tgt, push.allow_protected(d))
@@ -449,9 +450,10 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
 
 
 def _absent(p: Project, remote: str, branch: str, ask: bool | None = None) -> bool:
-    """Whether `remote` answers that it has no branch `branch` (one bounded `git ls-remote`). An
-    unreachable remote is not an answer: False, so the approval is refused as before. Inside a
-    transaction (see _asks) it reads the answer prefetch got within ABSENT_TTL_S, else False."""
+    """Whether `remote` answers that it has no branch `branch` (one bounded `git ls-remote`), nor has
+    the open PR's head repository when that is a fork (_on_fork). An unreachable remote is not an
+    answer: False, so the approval is refused as before. Inside a transaction (see _asks) it reads the
+    answer prefetch got within ABSENT_TTL_S, else False."""
     key, now = (str(p.root), remote, branch), time.time()
     if not _asks(p, ask):
         hit = _absent_seen.get(key)
@@ -463,9 +465,41 @@ def _absent(p: Project, remote: str, branch: str, ask: bool | None = None) -> bo
         return False
     if ls.returncode != 0:
         return False
-    absent = not any(ln.endswith(f"\trefs/heads/{branch}") for ln in ls.stdout.splitlines())
-    _absent_seen[key] = (now + ABSENT_TTL_S, absent)
+    absent, why = not any(ln.endswith(f"\trefs/heads/{branch}") for ln in ls.stdout.splitlines()), ""
+    if absent:
+        on, why = _on_fork(p, remote, branch)
+        if on is None:
+            return False
+        absent = not on
+    _absent_seen[key] = (now + ABSENT_TTL_S, absent, why)
     return absent
+
+
+def _on_fork(p: Project, remote: str, branch: str) -> tuple[bool | None, str]:
+    """(whether the open PR's head repository has `branch`, why) for a branch `remote` lacks: the fork
+    remote `ttp push --own` publishes it to (prhead.claim_remote). False with the reason, so `remote`'s
+    answer stands, when the PR is not on a fork, there is none or gh cannot answer; None when the fork
+    cannot be read in time (no answer, as an unreachable remote). gh and the fork's `git ls-remote`
+    share one REFUSAL_TIMEOUT_S Budget; the fork's default branch is never read."""
+    from . import prhead, pushclaim
+    b = pushclaim.Budget(REFUSAL_TIMEOUT_S)
+    try:
+        fork, why = prhead.claim_remote(p.root, branch, b, remote)
+        if not fork:
+            return False, why or f"the open PR for {branch} has its head on {remote}'s repository"
+        ls = b.call(p.root, "ls-remote", "--heads", fork, f"refs/heads/{branch}", timeout=REFUSAL_TIMEOUT_S)
+    except pushclaim.OutOfTime as e:
+        return None, f"the open PR's head repository could not be read in time ({e})"
+    if ls.returncode != 0:
+        return None, f"remote {fork}, the open PR's head repository, could not be read"
+    on = any(ln.endswith(f"\trefs/heads/{branch}") for ln in ls.stdout.splitlines())
+    return on, f"{why}: {branch} is on remote {fork}" if on else f"{why}: remote {fork} has no {branch} either"
+
+
+def _fork_why(p: Project, remote: str, branch: str) -> str:
+    """What _absent found on the open PR's head repository for `branch`, as " (...)", or ""."""
+    hit = _absent_seen.get((str(p.root), remote, branch))
+    return f" ({hit[2]})" if hit and len(hit) > 2 and hit[2] else ""
 
 
 def prefetch(p: Project, task: dict, cfg: dict | None = None) -> None:

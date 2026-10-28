@@ -261,11 +261,12 @@ def _pr_branch(p, task: dict) -> str:
 def _on_pr_head(c: dict, repo, remote: str, ref: str, sha: str, cache: dict) -> tuple[str, str] | None:
     """`sha` claimed on its task's pr_branch (`ref`) that `remote` lacks, confirmed on the open PR's
     head repository when that is a fork (prhead.claim_remote): where `ttp push` sends such a branch,
-    and where a push made by hand went. None when it is not such a claim or not there."""
+    and where a push made by hand went. None when it is not such a claim or not there. gh asks within
+    the cache's Budget (OutOfTime once it is spent), and the fork's default branch is never read."""
     from . import prhead
     if not c.get("pr_branch") or ref != f"refs/heads/{c['pr_branch']}":
         return None
-    fork = prhead.claim_remote(repo, c["pr_branch"])
+    fork, _ = prhead.claim_remote(repo, c["pr_branch"], cache.get(Budget.KEY))
     if not fork or fork == remote:
         return None
     state, why = verify(repo, fork, ref, sha, cache)
@@ -288,17 +289,22 @@ class Budget:
         self.left, self.calls = self.seconds, 0
 
     def call(self, repo, *args: str, timeout: float) -> subprocess.CompletedProcess:
+        return self.run(f"git {args[0]}", timeout, lambda t: _git(repo, *args, timeout=t),
+                        lambda r: r.returncode == 124 and "TimeoutExpired" in (r.stderr or ""))
+
+    def run(self, what: str, timeout: float, fn, timed_out):
+        """fn(its timeout) under this Budget (a git or gh call); timed_out(its result) tells a timeout."""
         t = min(timeout, self.left) if self.calls else timeout
         if self.calls and self.left < min(timeout, 1.0):
             raise OutOfTime(f"{max(self.left, 0):.0f} s of this tick's {self.seconds:.0f} s left")
         self.calls += 1
         began = time.monotonic()
         try:
-            r = _git(repo, *args, timeout=t)
+            r = fn(t)
         finally:
             self.left -= time.monotonic() - began
-        if t < timeout and r.returncode == 124 and "TimeoutExpired" in (r.stderr or ""):
-            raise OutOfTime(f"git {args[0]} outlasted this tick's {self.seconds:.0f} s")
+        if t < timeout and timed_out(r):
+            raise OutOfTime(f"{what} outlasted this tick's {self.seconds:.0f} s")
         return r
 
 

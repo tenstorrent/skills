@@ -6,7 +6,11 @@ PR of that branch (lookup) and, when its head is such a fork, pushes through a g
 this repo already has for that repository on the same host, else one it adds as ttp-head-<owner>
 (fork_remote). origin is never rewritten. The fork's main, master and default branch are refused.
 The daemon's push verification reads the same remote when a claim on the pr_branch is missing on
-origin (claim_remote), so a commit that is the PR's head is not taken for a lost push.
+origin (claim_remote), so a commit that is the PR's head is not taken for a lost push; the push
+queue reads it before taking a review-approved pr_branch the push remote lacks for absent. Those
+daemon-tick callers never read the fork's default branch (only a push refusal needs it) and pass their
+pushclaim.Budget: gh then asks only while it has time left, its timeout cut to what is left, and
+pushclaim.OutOfTime passes through once it is spent.
 
 No open PR, a same-repository PR, or gh unable to answer: the push goes where it went before, with
 the reason said. Answers are kept for the process (and in the run's folder, for the run).
@@ -79,9 +83,10 @@ def _cache_file() -> Path | None:
     return Path(d) / CACHE if d and Path(d).is_dir() else None
 
 
-def lookup(repo, branch: str, base_url: str = "") -> tuple[dict | None, str]:
+def lookup(repo, branch: str, base_url: str = "", budget=None) -> tuple[dict | None, str]:
     """(the open PR whose head branch is `branch`, why none): {"owner", "name", "cross", "url"} as
-    gh answers for the repository at `base_url` (else the one gh finds from the repo's remotes)."""
+    gh answers for the repository at `base_url` (else the one gh finds from the repo's remotes). gh
+    asks within `budget` (a pushclaim.Budget) when given; a kept answer asks nothing."""
     key = (str(Path(repo).resolve()), branch, base_url)
     hit = _memo.get(key)
     if hit and time.time() - hit[0] < MEMO_TTL_S:
@@ -95,7 +100,7 @@ def lookup(repo, branch: str, base_url: str = "") -> tuple[dict | None, str]:
     if isinstance(kept, dict) and isinstance(kept.get(ck), list) and len(kept[ck]) == 2:
         out = (kept[ck][0], kept[ck][1])
     else:
-        out = _ask(repo, branch, base_url)
+        out = _ask(repo, branch, base_url, budget)
         if f and (out[0] or out[1].startswith(("no open PR", "the PR"))):   # answers, not gh failures
             try:
                 from .project import durable_write
@@ -106,13 +111,20 @@ def lookup(repo, branch: str, base_url: str = "") -> tuple[dict | None, str]:
     return out
 
 
-def _ask(repo, branch: str, base_url: str) -> tuple[dict | None, str]:
+def _ask(repo, branch: str, base_url: str, budget=None) -> tuple[dict | None, str]:
     args = ["gh", "pr", "view", branch, "--json", FIELDS]
     if r := _gh_repo(base_url):
         args += ["--repo", r]
+
+    def gh(t: float) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(args, cwd=str(repo), capture_output=True, text=True, timeout=t,
+                                  stdin=subprocess.DEVNULL, env={**os.environ, "GH_PROMPT_DISABLED": "1"})
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(args, 124, "", "TimeoutExpired")
     try:
-        r = subprocess.run(args, cwd=str(repo), capture_output=True, text=True, timeout=GH_TIMEOUT_S,
-                           stdin=subprocess.DEVNULL, env={**os.environ, "GH_PROMPT_DISABLED": "1"})
+        r = (budget.run("gh pr view", GH_TIMEOUT_S, gh, lambda r: r.returncode == 124 and r.stderr == "TimeoutExpired")
+             if budget is not None else gh(GH_TIMEOUT_S))
     except FileNotFoundError:
         return None, "gh is not installed, so the PR for it could not be looked up"
     except (OSError, subprocess.SubprocessError) as e:
@@ -164,12 +176,13 @@ def _ensure(repo, url: str, owner: str) -> str:
     return name
 
 
-def fork_remote(repo, branch: str, remote: str) -> tuple[str, str]:
+def fork_remote(repo, branch: str, remote: str, budget=None, refusal: bool = True) -> tuple[str, str]:
     """(remote, note) for a push of `branch` that would go to `remote`: the remote of the open PR's
     head repository when that is a fork, else ("", why the push stays on `remote`, or "").
-    Raises ValueError for the fork's main, master or default branch: never pushed this way."""
+    Raises ValueError for the fork's main, master or default branch (the default branch read only
+    with `refusal`): never pushed this way. gh asks within `budget` (see lookup)."""
     base = _url(repo, "origin") or _url(repo, remote)
-    info, why = lookup(repo, branch, base)
+    info, why = lookup(repo, branch, base, budget)
     if not info:
         return "", why
     target = _url(repo, remote)
@@ -181,6 +194,8 @@ def fork_remote(repo, branch: str, remote: str) -> tuple[str, str]:
     if branch in PROTECTED:
         raise ValueError(f"the PR's head branch on {info['owner']}/{info['name']} is {branch}: never pushed this way")
     fork = _ensure(repo, url, info["owner"])
+    if not refusal:
+        return fork, f"the open PR {info['url'] or 'for ' + branch} has its head on {info['owner']}/{info['name']}"
     default = default_branch(repo, fork)
     if not default:
         raise ValueError(f"could not read the default branch of {fork} ({url}), the PR's head repository; "
@@ -192,10 +207,11 @@ def fork_remote(repo, branch: str, remote: str) -> tuple[str, str]:
                   f"not {remote}: pushing to remote {fork}")
 
 
-def claim_remote(repo, branch: str) -> str:
-    """For the push checks: the remote of `branch`'s open PR head when that is a fork ("" otherwise, or
-    when it cannot be told). Never raises."""
+def claim_remote(repo, branch: str, budget=None, remote: str = "origin") -> tuple[str, str]:
+    """For the daemon's push checks: (the remote of `branch`'s open PR head when that is a fork, why
+    else or how). No default-branch read; gh asks within `budget` (see lookup). Raises only
+    pushclaim.OutOfTime, when `budget` is spent: the caller asks again on a later tick."""
     try:
-        return fork_remote(repo, branch, "origin")[0]
-    except (ValueError, OSError):
-        return ""
+        return fork_remote(repo, branch, remote, budget, refusal=False)
+    except (ValueError, OSError) as e:
+        return "", str(e)
