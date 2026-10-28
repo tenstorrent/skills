@@ -32,7 +32,7 @@ from . import project
 
 FILE = "fleet-holds.json"
 LOCK = "fleet-holds.lock"
-END_FIELDS = ("until", "end_when", "report_from")
+END_FIELDS = ("until", "end_when", "report_from", "user_end")
 KEPT_S = 30 * 86400   # lifted holds are kept this long, for status and audit
 
 
@@ -121,11 +121,29 @@ def lift(alias: str, users_word: bool, by: str, now: float | None = None) -> dic
             raise ValueError(f"{alias} is held machine-wide for the user (hold {hold.get('id')}); only the user "
                              f"lifts it: `ttp resume --machine {alias}` outside a run, or in a turn that carries "
                              f"their own words")
-        doc["holds"].pop(alias)
-        doc["lifted"] = [x for x in doc["lifted"] if now - float(x.get("lifted") or 0) < KEPT_S] \
-            + [{**hold, "lifted": now, "lifted_by": by}]
-        project.write_json(_path(FILE), doc, 0o600)
+        _drop(doc, alias, {"lifted": now, "lifted_by": by}, now)
     return hold
+
+
+def lift_at_user_end(alias: str, generation: Any, by: str, now: float | None = None) -> dict | None:
+    """Lift the user's hold of `alias` at the end their own words gave (`user_end`, pauseends): only the
+    hold of that `generation`, once its `until` passed. None when there is no such hold."""
+    now = time.time() if now is None else now
+    with _locked():
+        doc = _read()
+        hold = doc["holds"].get(alias)
+        if not (isinstance(hold, dict) and hold.get("generation") == generation and hold.get("user_end")
+                and hold.get("until") and float(hold["until"]) <= now):
+            return None
+        _drop(doc, alias, {"lifted": now, "lifted_by": by, "ended": "the user's own end"}, now)
+    return hold
+
+
+def _drop(doc: dict, alias: str, how: dict, now: float) -> None:
+    """Move the hold of `alias` to the lifted list (kept KEPT_S), under the caller's lock."""
+    hold = doc["holds"].pop(alias)
+    doc["lifted"] = [x for x in doc["lifted"] if now - float(x.get("lifted") or 0) < KEPT_S] + [{**hold, **how}]
+    project.write_json(_path(FILE), doc, 0o600)
 
 
 def covering(res: str, holds: dict[str, dict] | None = None) -> dict | None:

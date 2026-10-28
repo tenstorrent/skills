@@ -7280,10 +7280,12 @@ def test_the_digest_shows_a_user_pause_of_a_decommissioned_machine_as_staying_as
     assert "by coordinator" in next(x for x in text.splitlines() if x.startswith("- box-a:"))
 
 
-def test_the_coordinator_prompt_says_a_user_pause_end_never_lifts_it():
+def test_the_coordinator_prompt_says_a_user_pause_end_never_lifts_it_unless_the_user_gave_it():
     text = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text(encoding="utf-8").split())
-    assert ("A pause the user set is lifted only on their word: its `end_when` or `until` only signals; say it is "
-            "lifting only in a turn with their word.") in text
+    assert ("A user's pause lifts only on their word (say so only in a turn with it); its end only signals, "
+            "unless `user_end`.") in text
+    assert ("`user_end` only if their verbatim words (not relayer context) give its end or length: it lifts at "
+            "`until`, never ask.") in text
 
 
 def _settle_end_probes(owner, now):
@@ -9473,7 +9475,7 @@ def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are
     assert "A PR leaves draft ONLY on the user's explicit yes" in role
     # The coordinator's own pause in a turn where the user asks to pause something else stays its
     # own: coordinator._users_pause makes an unset `user_asked` the user's in such a turn.
-    assert "`false` for your\n  own pause in a turn where the user's words ask to pause something else" in role
+    assert "`false` for yours in a\n  turn whose user words ask to pause something else" in role
     # Every fence names a feature coordinator_features can turn on, and each opens and closes once.
     import inspect, re as _re
     from ttp import prompts
@@ -16978,3 +16980,165 @@ def test_promise_state_shows_the_union_of_promise_tasks_and_obligation_owners():
 
 def test_promise_state_without_any_owner_says_no_owner_task():
     assert "no owner task" in _promise_text([], [])
+
+
+def _user_end_waiter(p, res):
+    """A task that handed off waiting on the pause of `res`."""
+    t = p.db.add_task("waits", "s", kind="work", tier="light", origin="user", labels=[f"resource:{res}"])
+    p.db.update_task(t, status="queued", not_before=time.time() + 7200, blocked_reason=f"waiting for {res}",
+                     result=json.dumps({"status": "waiting", "waiting_for": f"{res} (paused)",
+                                        "retry_after_s": 7200, "waiting_since": time.time()}))
+    return t
+
+
+def _pause_end_events(p):
+    return [(r["kind"], r["text"]) for r in p.db.q(
+        "SELECT kind, text FROM events WHERE kind IN ('pause_end_due', 'observation', 'pause_ended', ?) ORDER BY id",
+        ("pause_user_end_lifted",))]
+
+
+def test_a_user_end_pause_lifts_at_the_users_own_end_with_one_wake_and_no_ask(env):
+    p = make(env)
+    from ttp import coordinator as coord, ends, pauseends
+    from ttp.cli import status_text
+    from ttp.web import state_payload
+    msg = p.db.post("in", "Stay off rig for 4 hours")
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "rig", "paused": True, "user_asked": True,
+                            "user_end": True, "until": "4h", "reason": "the user's"}],
+                       user_turn=True, messages=[msg]) == []
+    v = p.db.paused_resources()["rig"]
+    assert v["by"] == "user" and v["user_end"] is True
+    shown = f"set by the user; ends {ends.shown(float(v['until']), p)}, user's end"
+    assert shown in status_text(p) and shown in coord.digest(p, {}, [], [])
+    (row,) = state_payload(p, p.db)["health"]["resources_paused"]
+    assert row["end"] == shown, "the web app shows the user's end"
+    t = _user_end_waiter(p, "rig")
+    asks = p.db.one("SELECT COUNT(*) n FROM messages WHERE kind='ask'")["n"]
+    pe = pauseends.PauseEnds(p)
+    assert pe.tick(float(v["until"]) - 60) == [] and "rig" in p.db.paused_resources(), "not before its end"
+    end = float(v["until"]) + 1
+    assert pauseends.PauseEnds(p).tick(end) == ["rig"]
+    assert "rig" not in p.db.paused_resources()
+    assert t in {x["id"] for x in p.db.ready_tasks()}, "the task it held is due"
+    ((kind, text),) = _pause_end_events(p)
+    assert kind == pauseends.USER_END_KIND and "ended at the user's own end" in text and "never ask" in text
+    (ev,) = p.db.q("SELECT status, severity, data FROM events WHERE kind=?", (pauseends.USER_END_KIND,))
+    assert ev["status"] == "queued" and json.loads(ev["data"])["why"].startswith("ended at the user's own end")
+    assert p.db.one("SELECT COUNT(*) n FROM messages WHERE kind='ask'")["n"] == asks, "no ask"
+    for k in (1, 2):   # once: later ticks add nothing
+        assert pauseends.PauseEnds(p).tick(end + k * 600) == []
+    assert len(_pause_end_events(p)) == 1
+
+
+@pytest.mark.parametrize("case", ["user", "coordinator", "users_flag_outside_their_turn"])
+def test_a_pause_without_user_end_keeps_its_end_a_signal_or_a_pause_end_due(env, case):
+    p = make(env)
+    from ttp import coordinator as coord, pauseends
+    action = {"type": "resource_pause", "resource": "rig", "paused": True, "until": "4h", "reason": "r"}
+    if case == "user":
+        msg = p.db.post("in", "Stay off rig until I say so")
+        assert coord.apply(p, [{**action, "user_asked": True}], user_turn=True, messages=[msg]) == []
+    elif case == "coordinator":
+        assert coord.apply(p, [action]) == []
+    else:   # the flag without the user's own words in the turn is not their end
+        assert coord.apply(p, [{**action, "user_asked": True, "user_end": True}]) == []
+    v = p.db.paused_resources()["rig"]
+    assert "user_end" not in v
+    assert pauseends.PauseEnds(p).tick(float(v["until"]) + 1) == ["rig"]
+    assert "rig" in p.db.paused_resources(), "only the user's own end lifts a pause by itself"
+    ((kind, text),) = _pause_end_events(p)
+    assert kind == ("observation" if case == "user" else "pause_end_due"), (kind, text)
+
+
+@pytest.mark.parametrize("extra,error", [
+    ({"end_when": "test -e /nonexistent/flag"}, "user_end needs an `until`"),
+    ({"until": "4h", "user_asked": False}, "user_end needs `user_asked: true`"),
+    ({"until": "4h", "user_asked": None}, "user_end needs `user_asked: true`"),
+    ({"until": "4h", "user_asked": True, "user_end": "yes"}, "user_end must be true or false"),
+])
+@pytest.mark.parametrize("target", [{"resource": "rig"}, {"machine": "box1"}])
+def test_user_end_without_an_until_or_the_users_ask_is_rejected(env, extra, error, target):
+    from ttp import coordinator as coord, fleethold
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box1", tags="device")
+    msg = p.db.post("in", "Stay off it for 4 hours")
+    action = {"type": "resource_pause", **target, "paused": True, "user_end": True,
+              **({"user_asked": True} if "user_asked" not in extra else {}), **extra}
+    action = {k: v for k, v in action.items() if v is not None}
+    problems = coord.apply(p, [action], user_turn=True, messages=[msg])
+    assert any(error in x for x in problems), problems
+    assert "rig" not in p.db.paused_resources() and not fleethold.active()
+
+
+def test_a_user_end_pause_whose_end_passed_while_the_daemon_was_down_lifts_once_on_restart(env):
+    p = make(env)
+    from ttp import coordinator as coord, pauseends
+    coord.pause_resource(p, "rig", True, reason="r", by="user", end={"until": time.time() - 3600, "user_end": True})
+    t = _user_end_waiter(p, "rig")
+    assert pauseends.PauseEnds(p).tick() == ["rig"], "the first tick after a restart lifts it"
+    assert pauseends.PauseEnds(p).tick() == [] and pauseends.PauseEnds(p).tick() == []
+    assert "rig" not in p.db.paused_resources() and t in {x["id"] for x in p.db.ready_tasks()}
+    assert [k for k, _ in _pause_end_events(p)] == [pauseends.USER_END_KIND]
+
+
+def test_a_user_end_machine_hold_lifts_for_every_project_and_a_cut_short_lift_is_finished_once(env, tmp_path,
+                                                                                              monkeypatch):
+    from ttp import coordinator as coord, ends, fleethold, pauseends
+    from ttp import machine_ledger as ml
+    from ttp.cli import status_text
+    a, b, _ = _fleet(env, tmp_path)
+    monkeypatch.setattr(ml, "can_act", lambda name, here=None: (True, ""))
+    msg = a.db.post("in", "Keep off box1 for 2 hours")
+    assert coord.apply(a, [{"type": "resource_pause", "machine": "box1", "paused": True, "user_asked": True,
+                            "user_end": True, "until": "2h"}], user_turn=True, messages=[msg]) == []
+    hold = fleethold.active()["box1"]
+    assert hold["by"] == "user" and hold["user_end"] is True
+    assert f"ends {ends.shown(float(hold['until']), a)}, user's end" in status_text(a)
+    coord.sync_shared_pauses(b)
+    waits = _fleet_waits(a, b)
+    coord.sync_shared_pauses(a)
+    asks = a.db.one("SELECT COUNT(*) n FROM messages WHERE kind='ask'")["n"]
+    end = float(hold["until"]) + 1
+    assert pauseends.PauseEnds(a).tick(end) == ["machine:box1"]
+    assert not fleethold.active() and "box1-device" not in a.db.paused_resources()
+    assert waits["demo"] in {t["id"] for t in a.db.ready_tasks()}
+    coord.sync_shared_pauses(b)
+    assert waits["other"] in {t["id"] for t in b.db.ready_tasks()}, "every project's waiters wake"
+    ((kind, text),) = _pause_end_events(a)
+    assert kind == pauseends.USER_END_KIND and "machine-wide hold of `box1`" in text
+    assert not _pause_end_events(b), "only the checking project's coordinator is woken"
+    assert a.db.one("SELECT COUNT(*) n FROM messages WHERE kind='ask'")["n"] == asks
+    assert pauseends.PauseEnds(a).tick(end + 600) == [] and len(_pause_end_events(a)) == 1
+    # A lift cut short after the file changed and before its receipt is finished once on restart.
+    hold, _ = fleethold.set_hold("box1", "", "user", "demo", {"until": time.time() - 60, "user_end": True})
+    pe = pauseends.PauseEnds(a)
+    with monkeypatch.context() as m:
+        m.setattr(pauseends.PauseEnds, "_recover", lambda self, now: [])   # the crash
+        assert pe.tick() == []
+    assert not fleethold.active() and "machine:box1" in (a.db.kv(pauseends.RELEASE_KEY) or {})
+    assert pauseends.PauseEnds(a).tick() == ["machine:box1"]
+    assert pauseends.PauseEnds(a).tick() == [] and not a.db.kv(pauseends.RELEASE_KEY)
+    assert [k for k, _ in _pause_end_events(a)] == [pauseends.USER_END_KIND] * 2
+    lifted = fleethold._read()["lifted"][-1]
+    assert lifted["generation"] == hold["generation"] and lifted["ended"] == "the user's own end"
+
+
+def test_a_user_end_shared_pause_lifts_once_through_the_shared_file(env):
+    p = make(env)
+    from ttp import coordinator as coord, pauseends, shared
+    p.set_config("shared_resources", ["rig"])
+    msg = p.db.post("in", "Pause rig until tomorrow 9am")
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "rig", "paused": True, "user_asked": True,
+                            "user_end": True, "until": "1d", "reason": "the user's"}],
+                       user_turn=True, messages=[msg]) == []
+    v = shared.read_pause("rig")
+    assert v and v["user_end"] is True and v["by"] == "user"
+    t = _user_end_waiter(p, "rig")
+    end = float(v["until"]) + 1
+    for k in range(3):   # once, however often the daemon ticks
+        pauseends.PauseEnds(p).tick(end + k * 600)
+    assert shared.read_pause("rig") is None and "rig" not in p.db.paused_resources()
+    assert t in {x["id"] for x in p.db.ready_tasks()}
+    assert [k for k, _ in _pause_end_events(p)] == [pauseends.USER_END_KIND]
+    assert not p.db.kv(pauseends.RELEASE_KEY)

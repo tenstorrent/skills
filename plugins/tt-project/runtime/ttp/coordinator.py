@@ -95,7 +95,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"},
             "needs_device": {"type": "boolean"}, "user_deep": {"type": "boolean"}, "standing": {"type": "boolean"},
             "continues": {"type": "integer"}, "resource": {"type": "string"}, "machine": {"type": "string"}, "paused": {"type": "boolean"},
-            "user_asked": {"type": "boolean"}, "outage": {"type": "boolean"},
+            "user_asked": {"type": "boolean"}, "user_end": {"type": "boolean"}, "outage": {"type": "boolean"},
             "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}}, "permanent": {"type": "boolean"},
             "replaces": {"type": "string"}, "over": {"type": "string"}, "both_hold": {"type": "boolean"},
             "expires": {"type": "string"}, "until": {"type": "string"}, "until_probe": {"type": "string"},
@@ -2610,10 +2610,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     # One hold every project on this host honours (fleethold.py). Only a turn with the
                     # user's own words makes it theirs or lifts theirs.
                     mine = a["paused"] and _users_pause(db, a, user_turn, messages)
+                    end = _own_end(pauseends.from_action(a, where=p), mine) if a["paused"] else None
                     pause_machine(p, str(a["machine"]).strip(), a["paused"], reason=a.get("reason") or a.get("text") or "",
                                   by="user" if mine else "coordinator",
                                   users_word=user_turn and bool(_users_own(db, messages or [])),
-                                  end=pauseends.from_action(a, where=p) if a["paused"] else None, key=key,
+                                  end=end, key=key,
                                   user_msg=_users_own(db, messages or [])[-1] if mine else None)
                     continue
                 name = str(a.get("resource") or "").strip()
@@ -2629,8 +2630,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 by = "user" if a["paused"] and _users_pause(db, a, user_turn, messages) else "coordinator"
                 # A re-pause keeps the user's pause theirs (pause_resource), so its end is chosen as theirs.
                 owner = "user" if "user" in (by, (held or {}).get("by")) else by
-                line = pause_resource(p, name, a["paused"], reason=a.get("reason") or a.get("text") or "",
-                                      by=by, key=key, end=pauseends.from_action(a, p=p, by=owner) if a["paused"] else None)
+                line = pause_resource(p, name, a["paused"], reason=a.get("reason") or a.get("text") or "", by=by, key=key,
+                                      end=_own_end(pauseends.from_action(a, p=p, by=owner), by == "user")
+                                      if a["paused"] else None)
                 if "machine-wide" in line:   # a no-op under a fleet hold: never told to the user as a new pause
                     notes.append(f"resource_pause {name}: {line}")
             elif t == "observation_mute":
@@ -5050,6 +5052,12 @@ def _users_own(db, messages: list[int]) -> list[int]:
 
 _PAUSE_ASK_RE = re.compile(r"\b(?:paus\w*|hold\w*|halt\w*|stop\w*|freez\w*|block\w*|off[- ]limits|"
                            r"(?:do not|don'?t|never) (?:use|touch|run)|stay off|keep off|leave\b.*\balone)", re.I)
+
+
+def _own_end(end: dict, users: bool) -> dict:
+    """A pause's end, keeping `user_end` only when this pause is the user's own request (_users_pause):
+    without their words in the turn its `until` is the coordinator's, reported when it passes."""
+    return end if users else {k: v for k, v in end.items() if k != "user_end"}
 
 
 def _users_pause(db, a: dict, user_turn: bool, messages: list[int] | None) -> bool:

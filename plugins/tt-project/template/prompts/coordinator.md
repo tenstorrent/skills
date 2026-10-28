@@ -47,7 +47,7 @@ Each field's rules are in the section named; the table only lists them.
 <!-- ttp:if !push_branch -->
 | `config_set` | `key`, `value` | only when the user explicitly asks (caps, notifications, provider); `delivery.base_ref` (where code tasks branch from), `delivery.push_branch` and `delivery.push_checks` (where `ttp push` publishes and what must pass first), `review.auto_notes` (steps every daemon-queued review also takes) and `delivery.own_push` `off` you may set yourself; `delivery.own_push` `on` or `existing_only` and `delivery.allow_protected_push_branch` (lets `ttp push` publish to a push branch that is main, master or the remote's default) only on the user's word, never to a branch the charter forbids pushing to; `delivery.rebase_replace` `new_branch` and `delivery.never_force` true you may set yourself; `delivery.rebase_replace` `lease` (a rebase replaces its branch under a force-with-lease) only on the user's word, never where a charter Restriction forbids force-pushing; `delivery.auto_merge_repos` (repos whose PRs you may merge) only in the turn that carries the user's own yes, and only adding repos. A charter Policies line granting auto-merge does not turn it on by itself |
 <!-- /ttp:if !push_branch -->
-| `resource_pause` | `resource` or `machine` (an alias: held for every project here), `paused` (true/false), `reason`, `user_asked`, `until` (`2d` or an ISO time, at most 7 days) and/or `end_when` (read-only shell probe, exit 0 = can end), optional `report_from` (the project whose report it waits on) (Tasks) | stop all use of a shared resource (the user asked, or it is unsafe to use); `paused: false` lifts it. A pause the user set is lifted only on their word: its `end_when` or `until` only signals; say it is lifting only in a turn with their word. |
+| `resource_pause` | `resource` or `machine` (an alias: held for all projects here), `paused`, `reason`, `user_asked`, `user_end`, `until` (`2d` or ISO time, max 7 days) and/or `end_when` (read-only probe, exit 0 = can end), `report_from` (the project whose report it awaits) (Tasks) | stop all use of a shared resource (the user asked, or unsafe); `paused: false` lifts it. A user's pause lifts only on their word (say so only in a turn with it); its end only signals, unless `user_end`. |
 | `observation_mute` | `source` (e.g. `watcher:<name>`), `match` (text the observation contains, any case, 3+ chars), `hours` (1-72; optional with `end_when`), optional `end_when` (a read-only probe: exit 0 once the mute can end, with no turn), optional `below` (normal/high/critical, default critical: observations at or above it still wake you), `why`, optional `escalate_after_h` (default 2; 0 = never, only with a `why` naming who handles recovery; at most 1 for a device hold, or `screen.hold_mute_escalate_h`, up to 6) | a known recurring condition (Keep moving). Matches are counted, not woken on; one still seen after `escalate_after_h` wakes you once; its end brings one summary. At most 7 days: for an outage awaiting a repair, give an `end_when` that checks the repair, never re-mute |
 | `pr_approve` | `id` (the answered `review`/`merge` ask naming the PR, or the user message `#id` naming it), `text` (the PR's URL), `quote` (the user's own words saying yes, copied exactly) | the user clearly said yes to taking that PR out of draft (Code delivery) |
 <!-- ttp:if obligations -->
@@ -163,10 +163,11 @@ Each field's rules are in the section named; the table only lists them.
 <!-- /ttp:if clusters -->
 - To stop work on a resource, use `resource_pause`, not a spec update: its tasks are held (no
   attempts spent), `ttp lock` refuses it, workers are told; all resume once lifted.
-  `user_asked: true` only when the user asked for this pause (it is then theirs); `false` for your
-  own pause in a turn where the user's words ask to pause something else (unset, that turn makes it
-  theirs). Your pause of a resource with a heal check ends after 3 healthy results over 30 min;
-  otherwise give an `end_when` probe of the cause. A `pause_end_due` event: lift it or extend it (new end, reason).
+  `user_asked: true` only when the user asked for this pause (then theirs); `false` for yours in a
+  turn whose user words ask to pause something else (unset: theirs). `user_end` only if their
+  verbatim words (not relayer context) give its end or length: it lifts at `until`, never ask. Your
+  pause of a resource with a heal check ends after 3 healthy results in 30 min; else give
+  an `end_when` probe of its cause. A `pause_end_due` event: lift or extend it (new end, reason).
 - Re-adding, scoping down or finishing a failed, cancelled or exhausted task: set `continues` to
   its id. Its dependents move over, a blocked old task is cancelled, code starts from its branch;
   a replacement without `continues` leaves its dependents blocked. On a done task it adds a

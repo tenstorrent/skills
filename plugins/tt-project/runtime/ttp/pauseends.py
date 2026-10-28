@@ -17,7 +17,10 @@ daemon queues one `pause_end_due` event and the coordinator lifts the pause or e
 reason. A note from the `report_from` project re-prompts it the same way. A pause the user set is
 lifted only on their word: its end is a signal, never an end. Once it passes the pause stays, the
 time is kept (PASSED_KEY; describe shows it) and the coordinator gets one low observation: tell the
-user once, never say it is lifting. A broken probe, or a failed job it waits on, is told as an end
+user once, never say it is lifting. The exception is `user_end`: an `until` the user's own words gave
+(a length or a time) is their word in advance, so at it the daemon lifts the pause with no model,
+wakes its waiters and queues one `pause_user_end_lifted` event (USER_END_KIND); an `end_when` is the
+coordinator's reading of their words and stays a signal. A broken probe, or a failed job it waits on, is told as an end
 that can no longer be checked, never as passed. A pause recorded without
 an end (from before ends were required) gets DEFAULT_S and one info message saying so.
 
@@ -37,12 +40,14 @@ from .project import Project
 MAX_UNTIL_S = 7 * 86400
 DEFAULT_S = 7 * 86400
 HEALTHY_N, CLEAN_S = 3, 1800   # a health end's thresholds: the same for every pause
-END_FIELDS = ("until", "end_when", "report_from", "end_default")
+END_FIELDS = ("until", "end_when", "report_from", "end_default", "user_end")
 FLEET_PREFIX = "machine:"   # owned() keys a fleet hold this project checks by its machine
 DUE_KEY = "pause_end_due"      # kv: {resource: end signature} whose end was reported to the coordinator
 HEALTH_KEY = "pause_health"   # kv: consecutive check results fenced to each pause's identity
 RELEASE_KEY = "pause_release"  # kv: shared pauses whose file removal began, so a crash cannot lose the receipt
 PASSED_KEY = "pause_end_passed"  # kv: {resource: {"sig", "at"}}: when a user pause's end condition passed
+USER_END_KIND = "pause_user_end_lifted"   # the event of a pause lifted at the end the user's own words gave
+USER_END_WHY = "ended at the user's own end"
 CHECK_EVERY_S = 60
 PROBE_EVERY_S = ends.PROBE_EVERY_S
 PROJECT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@+-]{0,79}")
@@ -51,7 +56,8 @@ NEEDS_END = ("a resource pause needs an end: `until` (a delay such as 2d or an I
 
 
 def from_action(a: dict, now: float | None = None, p: Project | None = None, by: str = "", where=None) -> dict:
-    """Validate `until`, an `end_when` shell probe and `report_from`. With `p`, a pause of a resource
+    """Validate `until`, an `end_when` shell probe, `report_from` and `user_end` (only with `user_asked`
+    true and an `until`: the end the user's own words gave). With `p`, a pause of a resource
     with an enabled heal check gets its health end: a pause `by` the coordinator unless it names a
     probe (its `until` stays the reported deadline), any other only when it names no end. A zone-less
     `until` is read in the home zone of `where` (else `p`; ends.parse_expires)."""
@@ -81,6 +87,17 @@ def from_action(a: dict, now: float | None = None, p: Project | None = None, by:
         out["report_from"] = who
     if not (out.get("until") or out.get("end_when")):
         raise ValueError(NEEDS_END)
+    flag = a.get("user_end")
+    if flag is not None and not isinstance(flag, bool):
+        raise ValueError("user_end must be true or false")
+    if flag:
+        if a.get("user_asked") is not True:
+            raise ValueError("user_end needs `user_asked: true`: only an end the user's own words gave lifts "
+                             "their pause by itself")
+        if not out.get("until"):
+            raise ValueError("user_end needs an `until` (the delay or time the user gave); an `end_when` probe "
+                             "only signals the end of a user's pause")
+        out["user_end"] = True
     return out
 
 
@@ -96,13 +113,17 @@ def health_end(p: Project, resource: str) -> dict | None:
 def describe(v: dict, where=None, passed: float | None = None, now: float | None = None) -> str:
     """'ends 2026-10-06 05:00 UTC, or when `probe` passes; waits on project x's report' (or ''). A
     pause the user set never ends by itself: its end is shown as a condition, and once it passed
-    (`passed`, see passed_at, or an `until` before `now`) as passed, needing the user's word."""
+    (`passed`, see passed_at, or an `until` before `now`) as passed, needing the user's word. Its
+    `user_end` time is the exception: shown as the user's end, the time it lifts."""
     end = v.get("end_when")
     when = (f"when heal `{end['heal']}` has {end['healthy_n']} healthy results over {end['clean_s']:g} s"
             if isinstance(end, dict) else f"when `{end}` passes")
     parts = ([ends.shown(float(v["until"]), where)] if v.get("until") else []) + ([when] if end else [])
     out = "ends " + ", or ".join(parts) if parts else ""
-    if v.get("by") == "user":
+    if v.get("by") == "user" and v.get("user_end") and v.get("until"):
+        out = (f"set by the user; ends {ends.shown(float(v['until']), where)}, user's end"
+               + (f"; end condition: {when}" if end else ""))
+    elif v.get("by") == "user":
         now = time.time() if now is None else now
         if passed is None and v.get("until") and float(v["until"]) <= now:
             passed = float(v["until"])
@@ -310,6 +331,10 @@ class PauseEnds:
         for name, v in sorted(pauses.items()):
             if name in gone:
                 continue   # the user's pause of a retired machine: no end to report or probe; it stays as set
+            if v.get("user_end") and v.get("by") == "user" and v.get("until") and float(v["until"]) <= now:
+                if self._user_end(name, v, now):   # the user's own end: lifted, never reported as due
+                    due.append(name)
+                continue
             probe, rc = v.get("end_when"), verdicts.get(name, (None, "", ""))
             if isinstance(probe, dict):
                 probe = None   # health results come from heal.run, never a shell probe; `until` still ends it
@@ -422,9 +447,39 @@ class PauseEnds:
             due.append(name)
         return due
 
+    def _user_end(self, name: str, v: dict, now: float) -> bool:
+        """Lift the user's pause `name` at the end their own words gave (`user_end`), with no model,
+        fenced to the pause's identity. A shared pause or fleet hold is journalled first (RELEASE_KEY),
+        so a crash between its file and the receipt is finished once by _recover."""
+        from . import fleethold
+        db = self.p.db
+        entry = {"sig": _sig(v), "since": v.get("since"), "origin": v.get("by"), "project": v.get("project"),
+                 "generation": v.get("generation"), "ts": now, "kind": USER_END_KIND, "reason": v.get("reason") or "",
+                 "why": f"{USER_END_WHY} ({ends.shown(float(v['until']), self.p)})",
+                 **({"fleet": v["fleet"], "machine": v.get("machine")} if v.get("fleet") else {})}
+        if not (v.get("fleet") or v.get("shared")):
+            with db.tx():
+                local = db.paused_resources(shared=False)
+                if name not in local or _sig(local[name]) != entry["sig"]:
+                    return False
+                local.pop(name)
+                db.set_kv(PAUSED_RESOURCES_KEY, local)
+                self._ended(name, entry)
+            self._after(name, entry)
+            self.log(f"pause of {name} {entry['why']}: lifted")
+            return True
+        with db.tx():
+            db.set_kv(RELEASE_KEY, {**(db.kv(RELEASE_KEY) or {}), name: entry})
+        if v.get("fleet"):
+            fleethold.lift_at_user_end(str(v.get("machine")), v.get("generation"), self.p.name, now)
+        else:
+            shared.update_pause(name, lambda w: None if w and _sig(w) == entry["sig"] else w)
+        return name in self._recover(now)
+
     def _ended(self, name: str, entry: dict) -> None:
         """The receipt of one release, inside the caller's transaction: its audit event and one sweep
-        signal, its evidence and journal entry cleared, and its waiters made due."""
+        signal, its evidence and journal entry cleared, and its waiters made due (a fleet hold's by
+        sync_shared_pauses, in _after). A `user_end` lift's event is USER_END_KIND, for the coordinator."""
         from . import coordinator as coord
         db = self.p.db
         journal = db.kv(RELEASE_KEY) or {}
@@ -439,19 +494,26 @@ class PauseEnds:
         if saved.get(name, {}).get("sig") == entry["sig"]:
             saved.pop(name)
             db.set_kv(HEALTH_KEY, saved or None)
-        if name not in db.paused_resources():
+        if not entry.get("fleet") and name not in db.paused_resources():
             coord._wake_pause_waiters(db, name, float(entry.get("since") or 0))
+        kind = entry.get("kind") or "pause_ended"
+        what = (f"machine-wide hold of `{entry.get('machine')}` (hold {entry['fleet']})" if entry.get("fleet")
+                else f"pause of `{name}`")
         db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
-             (entry["ts"], "daemon", "pause_ended", "low",
-              f"Pause ended: {name}; daemon lifted it because {entry['why']}.",
+             (entry["ts"], "daemon", kind, "normal" if kind == USER_END_KIND else "low",
+              f"The user's {what} ({entry.get('reason') or 'no reason given'}) {entry['why']}: the daemon lifted "
+              f"it and the tasks that waited on it are due. Submit the work it held; never ask the user to lift it."
+              if kind == USER_END_KIND else f"Pause ended: {name}; daemon lifted it because {entry['why']}.",
               json.dumps({"resource": name, "by": "daemon", "origin": entry.get("origin"),
                           "project": entry.get("project"), "generation": entry.get("generation"),
                           "why": entry["why"]}), "queued"))
         sweep.signal(db, f"pause ended: {name}", rearm=True)
 
-    def _after(self, name: str) -> None:
+    def _after(self, name: str, entry: dict | None = None) -> None:
         from . import coordinator as coord
-        if name not in self.p.db.paused_resources():
+        if (entry or {}).get("fleet"):
+            coord.sync_shared_pauses(self.p)   # tells this project's workers and wakes its waiters
+        elif name not in self.p.db.paused_resources():
             coord._tell_runs(self.p.db, name, False)
 
     def _recover(self, now: float) -> list[str]:
@@ -459,8 +521,13 @@ class PauseEnds:
         removed: the entry goes and the pause stays. One replaced in place (same `since`) was not
         removed by us either. Otherwise the removal happened: its receipt is written once."""
         db, done = self.p.db, []
+        from . import fleethold
         for name, entry in sorted((db.kv(RELEASE_KEY) or {}).items()):
-            w = shared.read_pause(name)
+            if entry.get("fleet"):
+                hold = fleethold.active().get(str(entry.get("machine")))
+                w = fleethold.entry(hold) if hold else None
+            else:
+                w = shared.read_pause(name)
             released = w is None or (_sig(w) != entry.get("sig") and w.get("since") != entry.get("since"))
             with db.tx():
                 journal = db.kv(RELEASE_KEY) or {}
@@ -472,7 +539,7 @@ class PauseEnds:
                     journal.pop(name)
                     db.set_kv(RELEASE_KEY, journal or None)
             if released:
-                self._after(name)
+                self._after(name, entry)
                 done.append(name)
         if done:
             self.log(f"pause release recovered: {', '.join(done)}")
