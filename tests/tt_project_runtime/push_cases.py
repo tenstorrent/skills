@@ -1564,6 +1564,127 @@ def test_a_push_that_died_in_a_reboot_says_so(env, monkeypatch):
     assert "the host rebooted while it ran" in json.loads(marker.read_text())["reason"]
 
 
+# Someone else's next commit to ttp/t7-exp, pushed from the check (run $n) while the push checks it.
+_THEIRS = ('echo "$n" > "$OTHER/{file}" && git -C "$OTHER" add {file} && git -C "$OTHER" commit -qm "theirs $n" '
+           '&& git -C "$OTHER" push -q origin t7:refs/heads/ttp/t7-exp\n')
+
+
+def _own_moving_setup(env, monkeypatch, script, retries=None):
+    """A `ttp push --own --detach` of ttp/t7-exp whose check runs `script` with $n its run count and
+    $OTHER a clone that holds someone else's work on that branch."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    count, chk = env["tmp"] / "runs", env["tmp"] / "check.sh"
+    chk.write_text(f'n=$(( $(cat {count} 2>/dev/null || echo 0) + 1 )); echo $n > {count}\n' + script)
+    p.set_config("delivery.push_checks", [f"OTHER={other} sh {chk}"])
+    if retries is not None:
+        p.set_config("delivery.push_retries", retries)
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t7-exp")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/ttp/t7-exp")
+    _git_out(other, "fetch", "-q", "origin", "ttp/t7-exp")
+    _git_out(other, "checkout", "-q", "-b", "t7", "FETCH_HEAD")
+    monkeypatch.setenv("TTP_TASK", "7")
+    _commit(repo, "mine.txt", "mine\n")
+    return p, repo, origin, other, count
+
+
+def _own_detach_until_done(p, capsys):
+    """`ttp push --own --detach`, then its probe until the push ends: (probe result, marker as written)."""
+    assert _ttp("push", "--own", "--detach") == 0
+    out = capsys.readouterr().out
+    lines = dict(ln.split(": ", 1) for ln in out.splitlines() if ln.startswith(("marker: ", "retry_when: ")))
+    marker = pathlib.Path(lines["marker"])
+    r = _probe_until_done(p, lines["retry_when"])
+    m = json.loads(marker.read_text())
+    _wait_gone(m["pid"], time.time() + 10)
+    return r, json.loads(marker.read_text())
+
+
+def test_a_detached_own_push_refused_as_not_a_fast_forward_rebases_checks_again_and_pushes(env, monkeypatch, capsys):
+    """The branch moved on during the checks: with no setting, the push rebases onto the new tip, runs
+    the checks again on the rebased commit and pushes it, never forced; the marker names the retry."""
+    p, repo, origin, other, count = _own_moving_setup(
+        env, monkeypatch, 'if [ "$n" -eq 1 ]; then\n' + _THEIRS.format(file="theirs.txt") + 'fi\n')
+    r, m = _own_detach_until_done(p, capsys)
+    head = _git_out(repo, "rev-parse", "HEAD")
+    assert r.returncode == 0 and f"pushed {head} to origin/ttp/t7-exp" in r.stdout, r
+    assert "attempt 2 of at most 3, retried after non_fast_forward" in r.stdout, r
+    assert _git_out(origin, "rev-parse", "ttp/t7-exp") == head
+    assert subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", _git_out(other, "rev-parse", "t7"),
+                           head]).returncode == 0, "their commit is kept under ours"
+    assert count.read_text().strip() == "2", "the rebased commit is checked before it is pushed"
+    assert [x["cause"] for x in m["retries"]] == ["non_fast_forward"] and m["attempt"] == 2 and m["exit"] == 0
+
+
+def test_a_detached_own_push_stops_on_a_rebase_conflict_after_a_non_fast_forward(env, monkeypatch, capsys):
+    p, repo, origin, other, count = _own_moving_setup(
+        env, monkeypatch, 'if [ "$n" -eq 1 ]; then\n' + _THEIRS.format(file="mine.txt") + 'fi\n')
+    before = _git_out(repo, "rev-parse", "HEAD")
+    r, m = _own_detach_until_done(p, capsys)
+    assert r.returncode == 0 and "not pushed (non_fast_forward: rebase onto origin/ttp/t7-exp" in r.stdout, r
+    assert m["exit"] == 3 and "conflicts" in m["reason"] and not m.get("retries")
+    assert _git_out(repo, "rev-parse", "HEAD") == before and not _git_out(repo, "status", "--porcelain")
+    assert _git_out(origin, "rev-parse", "ttp/t7-exp") == _git_out(other, "rev-parse", "t7")
+
+
+def test_a_detached_own_push_stops_when_the_check_fails_on_the_rebased_commit(env, monkeypatch, capsys):
+    p, repo, origin, other, count = _own_moving_setup(
+        env, monkeypatch, 'if [ "$n" -eq 1 ]; then\n' + _THEIRS.format(file="theirs.txt")
+        + 'else\necho fails-on-the-rebase; exit 1\nfi\n')
+    r, m = _own_detach_until_done(p, capsys)
+    assert r.returncode == 0 and "not pushed" in r.stdout and "check failed" in r.stdout, r
+    assert m["exit"] == 4 and [x["cause"] for x in m["retries"]] == ["non_fast_forward"]
+    assert _git_out(origin, "rev-parse", "ttp/t7-exp") == _git_out(other, "rev-parse", "t7")
+
+
+def test_a_detached_own_push_retries_a_non_fast_forward_at_most_push_retries_times(env, monkeypatch, capsys):
+    p, repo, origin, other, count = _own_moving_setup(
+        env, monkeypatch, _THEIRS.format(file="theirs.txt"), retries=1)
+    r, m = _own_detach_until_done(p, capsys)
+    assert r.returncode == 0 and "not pushed (non_fast_forward" in r.stdout and "already retried 1 time(s)" in r.stdout, r
+    assert m["exit"] == 6 and len(m["retries"]) == 1 and count.read_text().strip() == "2"
+    assert _git_out(origin, "rev-parse", "ttp/t7-exp") == _git_out(other, "rev-parse", "t7")
+
+
+def test_a_detached_push_cut_by_a_reboot_is_queued_again_and_pushes_within_its_retries(env, monkeypatch, capsys):
+    """A reboot ends the push with no outcome: the daemon queues it again and starts it, model-free,
+    instead of recording it as failed; once its retries are spent it is recorded as failed, saying so."""
+    from ttp import push
+    started, gate = env["tmp"] / "started", env["tmp"] / "gate"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_gated_check(started, gate)])
+    _commit(repo, "mine.txt", "mine\n")
+    rc, marker, probe = _detach(capsys)
+    pids = [json.loads(marker.read_text())["pid"]]
+    try:
+        deadline = time.time() + 30
+        while not started.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        os.killpg(pids[0], signal.SIGKILL)   # the reboot: no outcome written
+        _wait_gone(pids[0], time.time() + 10)
+        _wait_free(marker)
+        m = json.loads(marker.read_text())
+        marker.write_text(json.dumps({**m, "boot": "an-earlier-boot"}))
+        gate.touch()
+        lines = push.tend(p)
+        assert any("requeued push marker" in ln and "retried after reboot" in ln for ln in lines), lines
+        m = json.loads(marker.read_text())
+        pids.append(m["pid"])
+        assert m["status"] in ("running", "pushed") and [x["cause"] for x in m["retries"]] == ["reboot"]
+        r = _probe_until_done(p, probe)
+        head = _git_out(repo, "rev-parse", "HEAD")
+        assert r.returncode == 0 and f"pushed {head} to origin/proj" in r.stdout, r
+        assert "attempt 2 of at most 3, retried after reboot" in r.stdout, r
+        _wait_gone(pids[1], time.time() + 10)
+        # Spent: two reboots already retried, the third is recorded as failed and names the bound.
+        spent = marker.with_name("t1-spent.json")
+        spent.write_text(json.dumps({**json.loads(marker.read_text()), "id": "t1-spent", "status": "running",
+                                     "boot": "an-earlier-boot", "retries": [{"cause": "reboot"}] * 2}))
+        push.tend(p)
+        m = json.loads(spent.read_text())
+        assert m["status"] == "failed" and "rebooted" in m["reason"] and "reboot: already retried 2" in m["reason"], m
+    finally:
+        _release_detached(gate, pids)
+
+
 def test_a_malformed_queued_push_marker_is_recorded_as_failed_and_the_tick_goes_on(env):
     """A queued marker the daemon cannot use (a non-numeric queued time, no repo or log, an env that
     is not a dict) is recorded as a failed push with the reason, and the rest of the tick still runs."""

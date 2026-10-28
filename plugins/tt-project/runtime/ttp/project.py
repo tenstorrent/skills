@@ -449,8 +449,10 @@ EXTRA_KEYS = {
     # landed_probe: with no push_branch, the read-only command (`{id}`: the task id) that answers
     # `landed:#<id>` (landed.landed_probe); unset there, the harness chains with depends_on instead.
     # push_checks_timeout_s: the time limit of each `ttp push` check (push.check_limit_of; 0: none).
+    # push_retries: how often a detached push retries a cause it clears itself, a non-fast-forward
+    # (--own) or a reboot that cut it short (push.retries_of; default 2, 0: never).
     "delivery": {"base_ref", "push_branch", "landed_probe", "push_checks", "push_checks_by_repo", "push_exclude_paths", "push_rounds", "push_wait_s",
-                 "push_checks_timeout_s",
+                 "push_checks_timeout_s", "push_retries",
                  "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "push_landing_alert_h", "after_push",
                  "push_solo_paths", "push_cap_tests", "push_rerun_s",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",

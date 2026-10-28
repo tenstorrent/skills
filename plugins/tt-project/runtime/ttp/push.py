@@ -3770,6 +3770,14 @@ QUEUED_S = 900             # a queued push the daemon has not started by then is
 # The environment a queued push takes from the run that queued it; the rest is the daemon's.
 QUEUE_ENV = ("PATH", "VIRTUAL_ENV", "TTP_TASK", "TTP_TASK_ID", "TTP_RUN_ID", "TTP_PYTHON", "GIT_CEILING_DIRECTORIES",
              OWN_BRANCH_ENV, LAND_ENV)
+# A detached push tries again by itself, model-free, at most `delivery.push_retries` times in all
+# (DEFAULT_RETRIES with none set), for two causes ttp can clear: the remote branch moved on during its
+# checks so the push was refused as not a fast-forward (NON_FF: fetch, rebase, the checks again at the
+# rebased commit, push; never forced), and a host reboot that cut it short (REBOOT: queued again and
+# started by the daemon, which fetches, rebases and checks as any push does). The marker lists each
+# retry's cause and attempt (`retries`, `attempt`); a rebase conflict or a failed check stops it.
+DEFAULT_RETRIES = 2
+NON_FF, REBOOT = "non_fast_forward", "reboot"
 
 
 def _run_lock(marker: Path) -> Path:
@@ -3863,6 +3871,36 @@ def _log_line(log: Path, text: str) -> None:
         os.fsync(out.fileno())
 
 
+def retries_of(v: Any) -> int:
+    """`delivery.push_retries` (or a marker's `retry_max`) as an integer of at least 0; DEFAULT_RETRIES
+    when unset or not an integer, so a typo never turns the retries off nor fails the push."""
+    if isinstance(v, bool) or not isinstance(v, (int, str)) or v == "":
+        return DEFAULT_RETRIES
+    try:
+        return max(0, int(v))
+    except ValueError:
+        return DEFAULT_RETRIES
+
+
+def retry_words(m: dict) -> str:
+    """The retries of a detached push in a few words ('' with none): `attempt 3 of at most 3, retried
+    after non_fast_forward, reboot`."""
+    done = [r for r in m.get("retries") or [] if isinstance(r, dict)]
+    if not done:
+        return ""
+    return (f"attempt {len(done) + 1} of at most {retries_of(m.get('retry_max')) + 1}, retried after "
+            + ", ".join(str(r.get("cause")) for r in done))
+
+
+def _note_retry(marker: Path, m: dict, cause: str, detail: str) -> dict:
+    """Record a retry of cause `cause` in `m` (the marker as read) and write it."""
+    done = [r for r in m.get("retries") or [] if isinstance(r, dict)]
+    done.append({"cause": cause, "attempt": len(done) + 2, "at": time.time(), "detail": detail})
+    m.update(retries=done, attempt=len(done) + 1, retry_cause=cause)
+    write_json(marker, m)
+    return m
+
+
 def _start(p: Project, marker: Path, m: dict, lock, env: dict, nice: int = 0) -> int:
     """Start the push process of `marker`, holding `lock` (its run lock, taken by the caller), `nice`
     levels below this process, write the marker as running, then give the go. Returns the pid."""
@@ -3942,7 +3980,10 @@ def detach(p: Project, repo: Path, own: bool = False) -> int:
     m = {"id": rid, "repo": str(top), "head": _git(top, "rev-parse", "HEAD").stdout.strip(),
          "target": f"{remote}/{branch}", "remote": remote, "branch": branch,
          "log": str(log), "lock": str(_run_lock(marker)),
-         "task": task, "run": os.environ.get("TTP_RUN_ID"), "own": own}
+         "task": task, "run": os.environ.get("TTP_RUN_ID"), "own": own,
+         "retry_max": retries_of(d.get("push_retries")), "attempt": 1,
+         # what the daemon needs to start it again after a reboot, as for a queued push
+         "env": {k: os.environ[k] for k in os.environ if k in QUEUE_ENV or k.startswith("GIT_CONFIG_")}}
     try:
         m["check_run_dir"] = str(checkdirs.new(p.state, marker))
         m["check_report_dir"] = str(checkdirs.reports(Path(m["check_run_dir"])))
@@ -3952,8 +3993,7 @@ def detach(p: Project, repo: Path, own: bool = False) -> int:
     if own and (rec := recorded_checks(os.environ.get("TTP_RUN_DIR"))):
         m["recorded_checks"] = rec   # the push process has a different TTP_RUN_DIR
     if _boxed():
-        m.update(status="queued", queued=time.time(),
-                 env={k: os.environ[k] for k in os.environ if k in QUEUE_ENV or k.startswith("GIT_CONFIG_")})
+        m.update(status="queued", queued=time.time())
         _log_line(log, "queued for the daemon: this command's sandbox would end a push started here")
         write_json(marker, m)
         print(f"ttp push: queued; the daemon starts it outside this command's sandbox, pushing {top} "
@@ -4004,7 +4044,7 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
         if os.environ.get("TTP_RUN_DIR") != str(checkdirs.reports(output)):
             raise OSError("TTP_RUN_DIR is missing or differs from the queued check output directory")
         rec = m.get("recorded_checks")
-        rc = run(p, repo, own, rec if isinstance(rec, dict) else None, after=False)
+        rc, reason = _run_retrying(p, repo, marker, own, rec if isinstance(rec, dict) else None)
     except Exception as e:     # recorded as a failure, never left as "running"
         print(f"ttp push: {type(e).__name__}: {e}", file=sys.stderr)
         reason = str(e) if isinstance(e, _Stopped) else None
@@ -4048,6 +4088,61 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
     return rc
 
 
+def _run_retrying(p: Project, repo: Path, marker: Path, own: bool, rec: dict | None) -> tuple[int, str | None]:
+    """run(), and again while it is refused as not a fast-forward because the remote branch moved on
+    since this attempt began (moved_on): HEAD is rebased onto the new tip and run() checks the rebased
+    commit before it pushes. The push branch's own rounds (_rounds) already do this for a move during
+    the checks; this covers `--own`, whose publish never rebases. At most the marker's retry_max
+    retries, counting a reboot's requeue. (exit code, the reason to record or None)."""
+    m = _read(marker)
+    remote, branch = str(m.get("remote") or ""), str(m.get("branch") or "")
+    done = [r for r in m.get("retries") or [] if isinstance(r, dict)]
+    if done and done[-1].get("cause") == REBOOT and _rebasing(repo):
+        print("ttp push: aborting the rebase the reboot cut short", file=sys.stderr, flush=True)
+        _git(repo, "rebase", "--abort")
+    while True:
+        start = _existing_tip(repo, remote, branch) if own and remote and remote != LOCAL else ""
+        rc = run(p, repo, own, rec, after=False)
+        tip = moved_on(p, repo, remote, branch, start) if rc == REJECTED and own else ""
+        if not tip:
+            return rc, None
+        m = _read(marker)
+        n, limit = len([r for r in m.get("retries") or [] if isinstance(r, dict)]), retries_of(m.get("retry_max"))
+        if n >= limit:
+            why = (f"{NON_FF}: {remote}/{branch} moved on to {tip[:10]}; already retried {n} time(s), "
+                   f"the most delivery.push_retries allows")
+            print(f"ttp push: {why}; not pushing", file=sys.stderr, flush=True)
+            return rc, why
+        if not _rebase(repo, tip):
+            _git(repo, "rebase", "--abort")
+            why = (f"{NON_FF}: rebase onto {remote}/{branch} ({tip[:10]}) conflicts; resolve it keeping "
+                   f"both sides' intents, then rerun")
+            print(f"ttp push: {why}", file=sys.stderr, flush=True)
+            return CONFLICT, why
+        _note_retry(marker, m, NON_FF, f"{remote}/{branch} moved from {start[:10]} to {tip[:10]}")
+        print(f"ttp push: {remote}/{branch} moved on to {tip[:10]} during the push: rebased onto it, "
+              f"retrying ({retry_words(_read(marker))})", file=sys.stderr, flush=True)
+
+
+def moved_on(p: Project, repo: Path, remote: str, branch: str, start: str) -> str:
+    """The remote branch's new tip when a push of HEAD was refused only because the branch moved on
+    since `start`, its tip when the attempt began: HEAD then fast-forwarded `start`, the branch only
+    fast-forwarded from it (nobody rewrote it) and HEAD lacks the new tip, so a rebase onto it keeps
+    everything. '' otherwise: a rewritten branch (a task that rebased its own), a refusal for another
+    cause, a lease push (own_rebase: never retried, never forced) or no remote."""
+    if not start or not branch or remote in ("", LOCAL) or own_rebase(p, branch) is not None:
+        return ""
+    tip = _existing_tip(repo, remote, branch)
+    if not tip or tip == start or descends(repo, tip, "HEAD"):
+        return ""
+    return tip if descends(repo, start, "HEAD") and descends(repo, start, tip) else ""
+
+
+def _rebasing(repo: Path) -> bool:
+    git_dir = Path(_git(repo, "rev-parse", "--absolute-git-dir").stdout.strip() or ".")
+    return any((git_dir / d).is_dir() for d in ("rebase-merge", "rebase-apply"))
+
+
 def after_set(p: Project) -> bool:
     """Whether `delivery.after_push` names a command (a malformed value counts: it fails loudly)."""
     v = (p.config().get("delivery") or {}).get("after_push")
@@ -4066,6 +4161,50 @@ def _dead_reason(m: dict) -> str:
     return "the push process ended without writing an outcome (killed, crashed or rebooted)"
 
 
+def _rebooted(m: dict) -> bool:
+    return bool(m.get("boot")) and not runner.same_boot(m["boot"])
+
+
+def _restartable(m: dict) -> bool:
+    """Whether a marker holds what the daemon needs to start its push again (one written before
+    push_retries existed has no env)."""
+    return bool(m.get("repo") and m.get("log") and m.get("check_run_dir")) and isinstance(m.get("env"), dict)
+
+
+def _spent(m: dict) -> str:
+    n = len([r for r in m.get("retries") or [] if isinstance(r, dict)])
+    if not (_rebooted(m) and _restartable(m)) or n < retries_of(m.get("retry_max")):
+        return ""
+    return f"; {REBOOT}: already retried {n} time(s), the most delivery.push_retries allows"
+
+
+def _requeue(marker: Path, m: dict) -> bool:
+    """Queue again, for the daemon to start (_tend_one), the push of `marker` that a host reboot cut
+    short, while its retries last. True when it is queued (or another process is handling it right now:
+    its run lock is taken), False to record it as failed."""
+    if not (_rebooted(m) and _restartable(m)):
+        return False
+    if len([r for r in m.get("retries") or [] if isinstance(r, dict)]) >= retries_of(m.get("retry_max")):
+        return False
+    lock = locks.try_take([_run_lock(marker)], f"detached push {m.get('id')}", "requeue after a reboot")
+    if lock is None:
+        return True
+    with lock:
+        m = _read(marker)
+        if m.get("status") != "running" or not _rebooted(m):
+            return True
+        for k in ("pid", "alive", "started"):
+            m.pop(k, None)
+        m.update(status="queued", queued=time.time())
+        m = _note_retry(marker, m, REBOOT, "the host rebooted while it ran")
+        try:
+            _log_line(Path(m["log"]), f"the host rebooted while this push ran: queued again for the daemon "
+                                      f"({retry_words(m)})")
+        except OSError:
+            pass
+    return True
+
+
 def _settle(marker: Path) -> dict:
     """The marker of a push that cannot run any more recorded as failed: one that runs with its run
     lock free died; one queued longer than QUEUED_S was never started. Others come back as read, and
@@ -4076,8 +4215,10 @@ def _settle(marker: Path) -> dict:
         return m
     if m.get("status") == "running" and locks.any_free([_run_lock(marker)]):
         m = _read(marker)      # read after the lock: the push writes its outcome before letting go
+        if m.get("status") == "running" and _requeue(marker, m):
+            return _read(marker)
         if m.get("status") == "running":
-            m.update(status="failed", exit=None, ended=time.time(), reason=_dead_reason(m))
+            m.update(status="failed", exit=None, ended=time.time(), reason=_dead_reason(m) + _spent(m))
             write_json(marker, m)
             _forget_lock(marker)
     elif m.get("status") == "queued" and time.time() - float(m.get("queued") or 0) > QUEUED_S:
@@ -4102,12 +4243,15 @@ def tend(p: Project) -> list[str]:
     folder = p.state / DETACHED
     cleared: list[str] = []
     for marker in sorted(folder.glob("*.json")) if folder.is_dir() else []:
-        before = _read(marker).get("status")
+        before = _read(marker)
         try:
             m = _tend_one(p, marker)
         except Exception as e:   # a malformed marker: recorded as failed, never aborts the daemon's tick
             _malformed(marker, e)
             m = _read(marker)
+        if len(m.get("retries") or []) > len(before.get("retries") or []):
+            cleared.append(f"requeued push marker {marker.name} after a host reboot ({retry_words(m)})")
+        before = before.get("status")
         if before in ("running", "queued") and m.get("status") == "failed":
             task = f" of task {m['task']}" if m.get("task") else ""
             cleared.append(f"cleared stale push marker {marker.name}{task} ({m.get('target') or 'no target'}): "
@@ -4183,12 +4327,15 @@ def result(marker: Path, pushed_only: bool = False) -> int:
         m = {**_read(marker), "status": "failed", "exit": None,
              "reason": f"malformed marker ({type(e).__name__}: {e})"}
         took = 0
+    retried = f"; {retry_words(m)}" if retry_words(m) else ""
     if m.get("status") == "running":
-        print(f"ttp push: still running (pid {m.get('pid')}, {took:.0f} s); log: {m.get('log')}")
+        print(f"ttp push: still running (pid {m.get('pid')}, {took:.0f} s{retried}); log: {m.get('log')}")
         return 1
     if m.get("status") == "queued":
-        print(f"ttp push: queued for the daemon ({took:.0f} s); log: {m.get('log')}")
+        print(f"ttp push: queued for the daemon ({took:.0f} s{retried}); log: {m.get('log')}")
         return 1
+    if retried:
+        print(f"ttp push: {retry_words(m)}")
     if m.get("status") == "pushed":
         v = f", version {m['version']}" if m.get("version") else ""
         print(f"ttp push: pushed {m.get('sha')} to {m.get('target')}{v}{reach_words(m.get('reach'))}")
