@@ -24,6 +24,17 @@ what runs: heredocs and echo/printf/cat text written to files that the command d
 argument, piped into a shell, through eval or after a move), and files that are only named, read
 or edited, are data.
 
+A PATH set in front of a gh call is fine when it visibly keeps the run's harness bin dir first: its
+literal path, or `$TTP_PROJECT/harness/bin` (not in single quotes) where the text names TTP_PROJECT
+only as a plain expansion and sets no variable by a built name (`eval`, `declare`, `export "$n=..."`,
+os.environ). A test can so put a fake gh behind the wrapper. Known gap: a script that sets TTP_PROJECT
+some other way it cannot see.
+
+Outside a harness task it denies Edit/Write calls on the harness's bin/gh and the project's gh.d
+pre-hooks (prguard.run_gh_hooks), and Bash calls naming their path (`$TTP_PROJECT/harness/bin/gh`,
+`$TTP_PROJECT/harness/bin/gh.d`, or gh.d together with the bin dir), as the web token check does:
+any mention.
+
 In a code task's run that may not push to the push branch (gitguard.py) it denies `git push` with
 git called by a path, which skips the run's bin/git.
 
@@ -104,7 +115,18 @@ PATH_GH_RE = re.compile(r"(?:\S*/|\\)gh[\"']?\s*,?\s*[\"']?" + GUARDED)
 OTHER_GH_RE = re.compile(r"\b(?:which\s+-a\w*|whereis|type\s+-\w*a\w*)\s+[\"']?gh\b|\bhash\s+-p\b")
 # A PATH that no longer starts with the run's own: a bypass only if gh then runs a guarded write
 PATH_CHANGE_RE = re.compile(r"(?:^|[\s;&|(`])(?:export\s+)?PATH=(?![\"']?\$\{?PATH\b)|\benv\s+(?:-\w*[iu]\b"
-                            r"|--ignore-env|--unset)|\bunset\s+PATH\b")
+                            r"|--ignore-env|--unset)|\bunset\s+PATH\b|\bcommand\s+(?:-\w+\s+)*-\w*p")
+# The run's harness bin dir at the head of a new PATH, as `$TTP_PROJECT/harness/bin` (or `${TTP_PROJECT}`)
+HARNESS_BIN_VARS = ("$TTP_PROJECT/harness/bin", "${TTP_PROJECT}/harness/bin")
+# TTP_PROJECT as a plain expansion; named any other way (set, unset, a default) its value may not be the run's
+PROJECT_EXPANSION_RE = re.compile(r"\$TTP_PROJECT(?!\w)|\$\{TTP_PROJECT\}")
+# Ways to set a variable whose name is built at run time (TTP_PROJECT spelled in pieces), or a child's env
+DYNAMIC_SET_RE = re.compile(r"\b(?:eval|declare|typeset|read|readarray|mapfile|environ|putenv|setenv)\b|\benv\s*="
+                            r"|\bprintf\s+-v\b|\b(?:export|local)\s+(?:-\w+\s+)*[\"']?\$")
+# The harness's gh wrapper and its gh.d pre-hooks, named in a command (also as gh.d after a cd to the bin dir)
+HARNESS_GH_RE = re.compile(r"(?<![\w.-])harness/+bin/+gh(?:\.d)?(?![\w.-])")
+HARNESS_BIN_RE = re.compile(r"(?<![\w.-])harness/+bin(?![\w.-])")
+GH_D_RE = re.compile(r"(?<![\w.-])gh\.d(?![\w.-])")
 # gh in a script's argument list running a guarded command: ['gh', 'pr', 'ready', ...]
 GH_ARGV_RE = re.compile(r"[\"']gh[\"']\s*,\s*[\"'](?:pr[\"']\s*,\s*[\"'](?:ready|create)|api)[\"']")
 SHELLS = {"sh", "bash", "dash", "zsh", "ksh"}
@@ -355,16 +377,50 @@ def _gh_writes(commands: str, text: str) -> bool:
     return bool(GUARDED_RE.search(text)) and len(GH_WORD_RE.findall(text)) > len(calls)
 
 
-def draft_bypass(text: str, path_changed: bool = False) -> str | None:
+def _project_trusted(text: str) -> bool:
+    """`text` names TTP_PROJECT only as a plain expansion and sets no variable by a built name, so
+    `$TTP_PROJECT` there is the run's own."""
+    return text.count("TTP_PROJECT") == len(PROJECT_EXPANSION_RE.findall(text)) and not DYNAMIC_SET_RE.search(text)
+
+
+def _keeps_harness_first(text: str, pos: int, trusted: bool) -> bool:
+    """The `PATH=` value starting at `pos` in `text` visibly starts with the run's harness bin dir:
+    its literal path, or `$TTP_PROJECT/harness/bin` outside single quotes when `trusted`."""
+    quote = text[pos:pos + 1] if text[pos:pos + 1] in ("'", '"') else ""
+    rest = text[pos + len(quote):]
+    base = os.environ.get("TTP_PROJECT", "")
+    heads = [posixpath.join(base, "harness", "bin")] if posixpath.isabs(base) else []
+    if trusted and quote != "'":
+        heads += HARNESS_BIN_VARS
+    for head in heads:
+        if rest.startswith(head):
+            tail = rest[len(head):].removeprefix("/")
+            if tail[:1] == ":" or (tail[:1] == quote if quote else not tail or tail[0].isspace() or tail[0] in ";&|)`"):
+                return True
+    return False
+
+
+def path_change(text: str, trusted: bool | None = None) -> bool:
+    """`text` changes PATH so that the run's harness bin dir may no longer come first: a `PATH=` whose
+    value does not visibly start with it (_keeps_harness_first; appending to $PATH is fine), `env -i`,
+    `env -u` or `unset PATH`. `trusted`: `$TTP_PROJECT` is the run's (default: judged from `text`)."""
+    trusted = _project_trusted(text) if trusted is None else trusted
+    return any(not (m.group().endswith("PATH=") and _keeps_harness_first(text, m.end(), trusted))
+               for m in PATH_CHANGE_RE.finditer(text))
+
+
+def draft_bypass(text: str, path_changed: bool = False, trusted: bool = True) -> str | None:
     """Why `text` (a command line or a script it runs) gets around the gh draft guard, else None.
-    `path_changed`: the command line that runs this script changes PATH (`PATH=/x bash s.sh`)."""
+    `path_changed`: the command line that runs this script changes PATH (`PATH=/x bash s.sh`).
+    `trusted`: that command line leaves TTP_PROJECT alone, so the script's `$TTP_PROJECT` is the run's."""
     full = text
     commands, text = _split(text)
     if PATH_GH_RE.search(text):
         return ("call gh by its name only: the harness's gh checks that a PR leaves draft only with the "
                 "user's recorded approval")
     if (GUARDED_RE.search(text) and ((OTHER_GH_RE.search(text) and GH_WORD_RE.search(text)) or VAR_GH_RE.search(text))
-            or (path_changed or PATH_CHANGE_RE.search(text)) and (GH_ARGV_RE.search(text) or _gh_writes(commands, text))):
+            or (path_changed or path_change(text, trusted and _project_trusted(full)))
+            and (GH_ARGV_RE.search(text) or _gh_writes(commands, text))):
         return ("call gh by its name, with PATH as the run set it: the harness's gh comes first and checks "
                 "that a PR leaves draft only with the user's recorded approval")
     if _api_draft_change(text, full):
@@ -543,8 +599,53 @@ def secret_read(cmd: str, segments: list[list[str]], cwd: str) -> str | None:
     return None
 
 
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+HARNESS_GH_WHY = ("the harness's gh wrapper (bin/gh) and the project's gh pre-hooks (bin/gh.d) change only in a "
+                  "harness task: other runs never edit, move or disable them, and a command naming their path is "
+                  "refused (call gh by its name; read them with the Read tool)")
+
+
+def _harness_task() -> bool:
+    """This run works on a harness task of TTP_PROJECT (False when that cannot be read)."""
+    task, base = os.environ.get("TTP_TASK", ""), os.environ.get("TTP_PROJECT", "")
+    if not task.isdigit() or not base:
+        return False
+    try:
+        from .project import Project
+        p = Project(base)
+        t = p.db.task(int(task)) if (p.state / "project.db").is_file() else None
+    except Exception:
+        return False
+    return bool(t) and t.get("kind") == "harness"
+
+
+def harness_gh_edit(payload: dict) -> str | None:
+    """Why an Edit/Write tool call may not change the file it names: the run's harness bin/gh or a file
+    in bin/gh.d, outside a harness task."""
+    inp = payload.get("tool_input") or {}
+    name = str(inp.get("file_path") or inp.get("notebook_path") or "")
+    base = os.environ.get("TTP_PROJECT", "")
+    if not name or not base:
+        return None
+    path = os.path.realpath(os.path.join(str(payload.get("cwd") or os.getcwd()), os.path.expanduser(name)))
+    gh = os.path.join(os.path.realpath(os.path.join(base, "harness", "bin")), "gh")
+    if path not in (gh, gh + ".d") and not path.startswith(gh + ".d" + os.sep) and not HARNESS_GH_RE.search(name):
+        return None
+    return None if _harness_task() else HARNESS_GH_WHY
+
+
+def _deny(why: str) -> dict:
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                   "permissionDecisionReason": f"tt-project: {why}."}}
+
+
 def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
-    if payload.get("tool_name") != "Bash" or not os.environ.get("TTP_RUN_DIR"):
+    if not os.environ.get("TTP_RUN_DIR"):
+        return None, None
+    if payload.get("tool_name") in EDIT_TOOLS:
+        why = harness_gh_edit(payload)
+        return (_deny(why) if why else None), None
+    if payload.get("tool_name") != "Bash":
         return None, None
     cmd = str((payload.get("tool_input") or {}).get("command") or "")
     commands, scan = _split(cmd)
@@ -561,6 +662,9 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         # Whoever holds it acts as the user in the web app; the Read deny rule covers the file tools.
         why = ("the web token is the user's credential and a run must not read it; any command naming its "
                "path is refused, so write a commit message with `git commit -F <file>` or call it 'the web token file'")
+    if not why and (HARNESS_GH_RE.search(cmd) or HARNESS_BIN_RE.search(cmd) and GH_D_RE.search(cmd)) \
+            and not _harness_task():
+        why = HARNESS_GH_WHY
     if not why:
         why = secret_read(cmd, segments, str(payload.get("cwd") or os.getcwd()))
     if not why:
@@ -569,10 +673,10 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         from . import killguard
         why = killguard.refusal(cmd, str(payload.get("cwd") or os.getcwd()))
     if not why:
-        path_changed = bool(PATH_CHANGE_RE.search(scan))
+        path_changed, trusted = path_change(scan), _project_trusted(cmd)
         for f in _scripts(segments, str(payload.get("cwd") or os.getcwd())):
             try:
-                why = draft_bypass(f.read_text(errors="replace"), path_changed)
+                why = draft_bypass(f.read_text(errors="replace"), path_changed, trusted)
             except OSError:
                 continue
             if why:
@@ -594,8 +698,7 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         hint = "\n\n".join(h for h in (hint, wide_read(commands, str(payload.get("cwd") or os.getcwd()))) if h)
         return ({"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": hint}}
                 if hint else None), None
-    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                   "permissionDecisionReason": f"tt-project: {why}."}}, None
+    return _deny(why), None
 
 
 # A command that prints more than this many lines of one file gets a reminder (never a refusal):

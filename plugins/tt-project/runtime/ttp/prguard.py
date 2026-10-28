@@ -38,6 +38,12 @@ An ask that never reached Slack cannot back an approval.
 Claude Code workers also get a PreToolUse hook (hook.py) that denies the obvious ways around this
 wrapper: gh called by its full path, or curl and the like talking to the GitHub API about drafts.
 
+Before any of this the wrapper runs the project's own gh pre-hooks (run_gh_hooks): each executable,
+non-hidden regular file in `gh.d/` beside it, by name, with gh's arguments and gh's stdin. A hook
+can only refuse: a non-zero exit, a hook that cannot start or one that runs past HOOK_TIMEOUT_S
+refuses the call, and the guards above still run once every hook passed. `ttp upgrade` never
+touches a project's own gh.d files (only the template's README there).
+
 Inside a run the wrapper appends each call that marks a PR ready or requests human reviewers, run or
 refused, to GH_LOG in the project's state. The user and the harness may share one GitHub account, so
 GitHub cannot say who took a PR out of draft: pr-watch (watchers.py) reads this log instead. It never
@@ -48,9 +54,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import select
 import shlex
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -944,6 +953,98 @@ def _reviewer_humans(fields: list[str], body: str) -> bool:
     return bool(teams) or not names or bool(_humans(names))
 
 
+# --- the project's gh pre-hooks ---------------------------------------------------------------
+
+HOOKS_DIR = "gh.d"           # beside the wrapper: the project's own checks, run before every gh call
+HOOK_TIMEOUT_S = 30          # each hook; also how long gh's stdin may take to end
+HOOK_STDIN_MAX = 16 << 20    # gh's stdin is read whole for the hooks, up to this many bytes
+
+
+def gh_hooks(own_dir: str) -> list[str]:
+    """The project's gh pre-hooks: executable, non-hidden regular files in `gh.d/`, sorted by name.
+    Raises OSError when gh.d exists but cannot be listed."""
+    d = os.path.join(own_dir, HOOKS_DIR)
+    if not os.path.lexists(d):
+        return []
+    out = []
+    for name in sorted(os.listdir(d)):
+        path = os.path.join(d, name)
+        if not name.startswith(".") and os.path.isfile(path) and os.access(path, os.X_OK):
+            out.append(path)
+    return out
+
+
+def _read_stdin(deadline: float) -> bytes:
+    """All of fd 0, by `deadline`: TimeoutError past it, ValueError over HOOK_STDIN_MAX."""
+    chunks, size = [], 0
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0 or not select.select([0], [], [], left)[0]:
+            raise TimeoutError
+        b = os.read(0, 1 << 16)
+        if not b:
+            return b"".join(chunks)
+        size += len(b)
+        if size > HOOK_STDIN_MAX:
+            raise ValueError
+        chunks.append(b)
+
+
+def _restore_stdin(data: bytes) -> None:
+    """Put `data` back on fd 0, for the guards below and the real gh (which inherits fd 0)."""
+    with tempfile.TemporaryFile() as f:
+        f.write(data)
+        f.flush()
+        f.seek(0)
+        os.dup2(f.fileno(), 0)
+
+
+def run_gh_hooks(args: list[str], own_dir: str, real: str = "") -> str | None:
+    """Why the project's gh pre-hooks refuse gh `args`, else None. gh's stdin (when a hook exists and
+    it is not a terminal) is read once and given to every hook, then back to gh. Fails closed: a
+    hook that cannot start or runs past HOOK_TIMEOUT_S, or a stdin that cannot be read whole, refuses.
+    A hook's own output goes to stderr, never into gh's stdout. TTP_GH_REAL names the real gh, for a
+    hook that calls gh itself (plain `gh` would run the hooks again)."""
+    try:
+        hooks = gh_hooks(own_dir)
+    except OSError as e:
+        return f"refused: the project's gh hooks in {HOOKS_DIR}/ cannot be listed ({e})"
+    if not hooks:
+        return None
+    data = None
+    try:
+        if not os.isatty(0):
+            data = _read_stdin(time.monotonic() + HOOK_TIMEOUT_S)
+    except TimeoutError:
+        return (f"refused: gh's stdin did not end within {HOOK_TIMEOUT_S} s, so the project's gh hooks "
+                f"could not check it; give gh its input from a file or </dev/null")
+    except ValueError:
+        return f"refused: gh's stdin is over {HOOK_STDIN_MAX >> 20} MiB, more than the project's gh hooks check"
+    except OSError:
+        data = None   # no stdin (fd 0 closed)
+    for hook in hooks:
+        name = f"{HOOKS_DIR}/{os.path.basename(hook)}"
+        try:
+            proc = subprocess.Popen([hook, *args], stdin=subprocess.DEVNULL if data is None else subprocess.PIPE,
+                                    stdout=2, start_new_session=True, env={**os.environ, "TTP_GH_REAL": real})
+        except OSError as e:
+            return f"refused: the project's gh hook {name} could not run ({e})"
+        try:
+            proc.communicate(data, timeout=HOOK_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)   # its own session, started above
+            except OSError:
+                pass
+            proc.wait()
+            return f"refused: the project's gh hook {name} ran past {HOOK_TIMEOUT_S} s"
+        if proc.returncode != 0:
+            return f"refused by the project's gh hook {name} (exit {proc.returncode})"
+    if data is not None:
+        _restore_stdin(data)
+    return None
+
+
 # --- the wrapper ------------------------------------------------------------------------------
 
 def real_gh(own_dir: str) -> str | None:
@@ -964,6 +1065,10 @@ def main(argv: list[str], own_dir: str) -> int:
         print("gh: not found on PATH", file=sys.stderr)
         return 127
     args = argv[1:]
+    why = run_gh_hooks(args, own_dir, real)   # the project's own checks first: they can only refuse
+    if why:
+        print(f"gh (tt-project): {why}", file=sys.stderr)
+        return 1
     stdin_text = None
     if args[:1] == ["api"] and ("-" in _opts(args, ("--input",))
                                 or any(f.endswith("=@-") for f in _opts(args, ("-F", "--field")))):

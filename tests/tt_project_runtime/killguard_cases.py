@@ -222,7 +222,7 @@ def test_worker_pretooluse_hook_denies_kills_outside_the_task(kill_tree, monkeyp
     from ttp.providers import claude
     t = kill_tree
     pre = claude.hook_settings()["hooks"]["PreToolUse"]
-    assert pre[0]["matcher"] == "Bash" and pre[0]["hooks"][0]["command"].endswith("-m ttp.hook PreToolUse")
+    assert pre[0]["matcher"].split("|")[0] == "Bash" and pre[0]["hooks"][0]["command"].endswith("-m ttp.hook PreToolUse")
 
     def decide(cmd):
         out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(t.run_dir)})
