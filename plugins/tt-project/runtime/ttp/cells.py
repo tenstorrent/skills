@@ -144,6 +144,21 @@ def marked(summary: str) -> bool:
     return str(summary or "").startswith((PARTIAL, UNREPORTED))
 
 
+MARK = re.compile(rf"(?:{PARTIAL} \d+ of \d+ cells \(missing: .*?\)\. |{UNREPORTED} \d+ requested\. )", re.S)
+
+
+def mark_of(summary: str) -> str:
+    """The prefix prefix() put on `summary`, '' when it starts with none (a worker's own 'partial:' words
+    in another form are not one)."""
+    m = MARK.match(str(summary or ""))
+    return m.group(0) if m else ""
+
+
+def hop_title(task: dict) -> str:
+    """The title of followup()'s `continue:` follow-up for `task`."""
+    return f"continue: missing cells of #{task['id']} {task.get('title') or ''}".strip()[:200]
+
+
 def followup(task: dict, missing: list[str]) -> dict:
     """The `continue:` follow-up for the cells done `task` left missing: its own `cells:` line lists
     only those, and its parent's spec follows without its `cells:` lines."""
@@ -153,8 +168,7 @@ def followup(task: dict, missing: list[str]) -> dict:
             f"are done, so do not rerun them.\ncells: {', '.join(missing)}")
     if rest:
         spec += f"\n\n#{task['id']}'s spec, its `cells:` line replaced by the one above:\n{rest}"
-    return {"title": f"continue: missing cells of #{task['id']} {task.get('title') or ''}".strip()[:200],
-            "spec": spec}
+    return {"title": hop_title(task), "spec": spec}
 
 
 def has_followup(fups: list) -> bool:

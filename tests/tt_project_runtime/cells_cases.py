@@ -349,3 +349,121 @@ def test_a_rejection_by_an_earlier_hop_of_the_chain_counts_for_a_day(env):
     p.db.x("UPDATE tasks SET updated=? WHERE id=?", (_t.time() - 2 * 86400, first))
     tid2, _ = _finish_cells(env, p, GRID, res, title="continue: missing cells of grid", parent=first)
     assert _hop_cells_of(p, tid2) == ["model-b hi", "model-d lo"]
+
+
+def _wrongly_partial(env, p, monkeypatch, res, title="power sweep"):
+    """A done SWEEP task an older, buggy cells check marked as finishing none of its cells, then the check
+    fixed; its daemon `continue:` hop (queued as a task when the daemon did not queue it itself)."""
+    from ttp import cells
+    with monkeypatch.context() as m:
+        m.setattr(cells, "check", lambda spec, r: {"requested": cells.requested(spec),
+                                                    "missing": cells.requested(spec)})
+        tid, _ = _finish_cells(env, p, SWEEP, res, title=title)
+    assert load_result(p.db.task(tid)["result"])["summary"].startswith("partial: 0 of 3 cells")
+    hop = p.db.one("SELECT id FROM tasks WHERE parent=? AND title=?", (tid, cells.hop_title(p.db.task(tid))))
+    hop_id = hop["id"] if hop else p.db.add_task(cells.hop_title(p.db.task(tid)), "cells: 150W", parent=tid,
+                                                 origin="coordinator")
+    return tid, hop_id
+
+
+def _rejudge(p, capsys, *args):
+    from ttp import cli
+    code = 0
+    try:
+        cli.main(["task", p.name, "rejudge", *map(str, args)])
+    except SystemExit as e:
+        code = e.code
+    out = capsys.readouterr()
+    return code, out.out + out.err
+
+
+ALL_CELLS = {"status": "done", "summary": "measured the sweep", "cells": ["150W", "200W", "250W"]}
+
+
+def test_rejudge_clears_a_wrong_partial_mark_cancels_its_unstarted_hop_and_a_second_run_is_a_no_op(
+        env, monkeypatch, capsys):
+    from ttp import cells
+    p = make(env)
+    tid, hop = _wrongly_partial(env, p, monkeypatch, ALL_CELLS)
+    code, out = _rejudge(p, capsys, tid)
+    assert code == 0, out
+    got = load_result(p.db.task(tid)["result"])
+    assert got["summary"] == "measured the sweep" and "cells_checked" not in got, got
+    assert not any(f.get("title") == cells.hop_title(p.db.task(tid)) for f in got.get("followups") or [])
+    assert p.db.task(tid)["status"] == "done"
+    assert "- summary: partial: 0 of 3 cells" in out and "+ summary: measured the sweep" in out, out
+    assert f"cancelled #{hop}" in out, out
+    h = p.db.task(hop)
+    assert h["status"] == "cancelled" and f"rejudge of #{tid}" in h["blocked_reason"], h
+    ev = p.db.q("SELECT * FROM events WHERE task=? AND kind='task_rejudged'", (tid,))
+    assert len(ev) == 1 and "partial: 0 of 3" in ev[0]["text"], ev
+    data = json.loads(ev[0]["data"])
+    assert data["before"]["prefix"].startswith("partial: 0 of 3") and data["before"]["keys"]["cells_checked"]
+    assert data["after"] == {"prefix": "", "keys": {}} and data["cancelled"] == [hop], data
+    assert not p.db.q("SELECT id FROM events WHERE task=? AND kind='followup_proposed' AND status='queued'", (tid,))
+    # Idempotent: the same verdict changes nothing and logs nothing.
+    row = p.db.task(tid)["result"]
+    code, out = _rejudge(p, capsys, tid)
+    assert code == 0 and "nothing to change" in out, out
+    assert p.db.task(tid)["result"] == row
+    assert len(p.db.q("SELECT id FROM events WHERE task=? AND kind='task_rejudged'", (tid,))) == 1
+
+
+def test_rejudge_keeps_a_hop_that_started_and_reports_it(env, monkeypatch, capsys):
+    p = make(env)
+    tid, hop = _wrongly_partial(env, p, monkeypatch, ALL_CELLS)
+    p.db.update_task(hop, status="running")
+    code, out = _rejudge(p, capsys, tid)
+    assert code == 0 and f"kept #{hop}" in out and "(running)" in out, out
+    assert p.db.task(hop)["status"] == "running"
+    assert load_result(p.db.task(tid)["result"])["summary"] == "measured the sweep"
+    # A queued hop that already had a run (a retry) started too: kept.
+    tid2, hop2 = _wrongly_partial(env, p, monkeypatch, ALL_CELLS, title="second sweep")
+    p.db.x("INSERT INTO runs(task, role, started, status) VALUES(?, 'worker', ?, 'failed')", (hop2, time.time()))
+    code, out = _rejudge(p, capsys, tid2)
+    assert code == 0 and f"kept #{hop2}" in out and p.db.task(hop2)["status"] == "queued", out
+
+
+def test_rejudge_dry_run_shows_the_change_and_writes_nothing(env, monkeypatch, capsys):
+    p = make(env)
+    tid, hop = _wrongly_partial(env, p, monkeypatch, ALL_CELLS)
+    row = p.db.task(tid)["result"]
+    code, out = _rejudge(p, capsys, tid, "--dry-run")
+    assert code == 0 and "dry run" in out and "+ summary: measured the sweep" in out, out
+    assert f"would cancel #{hop}" in out, out
+    assert p.db.task(tid)["result"] == row and p.db.task(hop)["status"] == "queued"
+    assert not p.db.q("SELECT id FROM events WHERE kind='task_rejudged'")
+
+
+def test_rejudge_never_clears_a_mark_the_cells_or_a_project_check_still_earn(env, monkeypatch, capsys):
+    from ttp import cells
+    p = make(env)
+    # 250W is really missing: the mark is updated to the true detail, the seal and the hop stay.
+    tid, hop = _wrongly_partial(env, p, monkeypatch, dict(ALL_CELLS, cells=["150W", "200W"]))
+    code, out = _rejudge(p, capsys, tid)
+    got = load_result(p.db.task(tid)["result"])
+    assert code == 0 and got["summary"] == "partial: 2 of 3 cells (missing: 250W). measured the sweep", (out, got)
+    assert got["cells_checked"] is True and p.db.task(hop)["status"] == "queued"
+    assert any(f.get("title") == cells.hop_title(p.db.task(tid)) for f in got.get("followups") or [])
+    row = p.db.task(tid)["result"]
+    code, out = _rejudge(p, capsys, tid)
+    assert "nothing to change" in out and p.db.task(tid)["result"] == row
+    # A project hand-off check that fails leaves the wrong-looking record as it is, exit 1.
+    tid2, hop2 = _wrongly_partial(env, p, monkeypatch, ALL_CELLS, title="second sweep")
+    row = p.db.task(tid2)["result"]
+    cfg = json.loads(p.config_path.read_text())
+    cfg["worker"] = {"handoff_checks": [{"name": "verified", "run": "echo not verified; exit 1"}]}
+    p.config_path.write_text(json.dumps(cfg))
+    code, out = _rejudge(p, capsys, tid2)
+    assert code == 1 and "'verified' still fails" in out and "not verified" in out, out
+    assert p.db.task(tid2)["result"] == row and p.db.task(hop2)["status"] == "queued"
+
+
+def test_rejudge_is_refused_for_an_unfinished_task_or_from_another_projects_run(env, monkeypatch, capsys):
+    p = make(env)
+    tid = p.db.add_task("still queued", SWEEP, origin="coordinator")
+    code, out = _rejudge(p, capsys, tid)
+    assert code and "needs a done or failed task" in out, out
+    monkeypatch.setenv("TTP_PROJECT", str(env["tmp"] / "another-root"))
+    code, out = _rejudge(p, capsys, tid)
+    assert code and "another project" in out, out

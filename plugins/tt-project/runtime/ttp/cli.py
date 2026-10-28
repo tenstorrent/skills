@@ -5268,8 +5268,10 @@ def list_tasks(p, a) -> tuple[list[dict], int, int | None]:
 
 def cmd_task(a) -> None:
     p = need(a.name, sys.argv[1:])
-    if a.action != "add" and (a.start_when, a.why) != (None, None):
-        die("--start-when and --why go with add; for a queued task use set-when")
+    if a.action != "add" and a.start_when is not None or a.action not in ("add", "rejudge") and a.why is not None:
+        die("--start-when and --why go with add (--why also with rejudge); for a queued task use set-when")
+    if a.action != "rejudge" and a.dry_run:
+        die("--dry-run goes with rejudge")
     if a.action not in ("add", "set-when") and a.start_after is not None:
         die("--start-after goes with add or set-when")
     if a.action != "add" and a.budget is not None:
@@ -5348,6 +5350,20 @@ def cmd_task(a) -> None:
             print(set_when(p.db, int(a.title), a.probe, p, on_pass_cmd=a.on_pass_cmd, start_after=a.start_after))
         except ValueError as e:
             die(str(e))
+    elif a.action == "rejudge":
+        from .rejudge import rejudge
+        if not a.title.strip().isdigit():
+            die(f"rejudge needs a task id, not {a.title!r}")
+        base = os.environ.get("TTP_PROJECT")
+        if base and Project(base).base != p.base:
+            die("rejudge from a run of another project is refused: it changes only its own project's tasks")
+        try:
+            lines, rc = rejudge(p, p.config(), int(a.title), dry_run=a.dry_run, why=a.why or "")
+        except ValueError as e:
+            die(str(e))
+        print("\n".join(lines))
+        if rc:
+            raise SystemExit(rc)
     elif a.action == "superseded":
         from .landed import record_superseded
         if not a.title.strip().isdigit() or not a.probe:
@@ -8523,12 +8539,13 @@ def main(argv: list[str] | None = None) -> None:
                                     "landed, or a harness task in review whose commit is merged into the harness: "
                                     "it is then closed as done); abandon records that a done code task's "
                                     "work will never land (its branch is kept), so local-only, push-audit and landed "
-                                    "checks leave it out")
+                                    "checks leave it out; rejudge reruns the daemon's hand-off checks on a done or "
+                                    "failed task's stored hand-off and corrects a wrong partial mark")
     s.add_argument("name", help="the project")
     s.add_argument("action", choices=["add", "list", "show", "cancel", "requeue", "set-when", "superseded",
-                                          "abandon"],
+                                          "abandon", "rejudge"],
                    help="what to do")
-    s.add_argument("title", nargs="?", default="", help="add: the title; show/cancel/requeue/set-when/superseded/abandon: the task id")
+    s.add_argument("title", nargs="?", default="", help="add: the title; show/cancel/requeue/set-when/superseded/abandon/rejudge: the task id")
     s.add_argument("probe", nargs="?", help="set-when: the new retry_when/start_when command (\"\" clears it); "
                    "superseded: the commit on the push branch that carries the task's work (for a harness task: "
                    "the commit merged into the harness); abandon: why its work will never land")
@@ -8555,7 +8572,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--start-when", help="add: a probe; the task starts only once it exits 0 (e.g. landed:#<id>)")
     s.add_argument("--start-after", help="add, set-when: a delay (2h, 3d) or ISO time (home zone unless it names "
                    "one) before which it does not start; set-when: now or \"\" clears it")
-    s.add_argument("--why", help="add: plain words for --start-when, shown instead of the probe")
+    s.add_argument("--why", help="add: plain words for --start-when, shown instead of the probe; rejudge: "
+                   "the reason logged with the change")
+    s.add_argument("--dry-run", action="store_true", help="rejudge: show what would change, write nothing")
     s.add_argument("--on-pass-cmd", help="set-when: a waiting task's model-free completion command, run once its "
                    "retry_when passes (\"\" clears it); without a probe its retry_when stays; an "
                    "always-passing probe alone is refused while the hand-off's on_pass_cmd stays")
