@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import checkdirs, batch, conflictfix, coordinator as coord, envfault, locks, msgparts, push, replymsg, runner, scopehold, sharedchecks, timefmt, upstream
+from . import checkdirs, batch, conflictfix, coordinator as coord, envfault, locks, msgparts, prhead, push, pushclaim, replymsg, runner, scopehold, sharedchecks, timefmt, upstream
 from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
                  pin_of, review_subject, reviewed_ids)
 from .landed import on_branch
@@ -481,7 +481,6 @@ def _on_fork(p: Project, remote: str, branch: str) -> tuple[bool | None, str]:
     answer stands, when the PR is not on a fork, there is none or gh cannot answer; None when the fork
     cannot be read in time (no answer, as an unreachable remote). gh and the fork's `git ls-remote`
     share one REFUSAL_TIMEOUT_S Budget; the fork's default branch is never read."""
-    from . import prhead, pushclaim
     b = pushclaim.Budget(REFUSAL_TIMEOUT_S)
     try:
         fork, why = prhead.claim_remote(p.root, branch, b, remote)
