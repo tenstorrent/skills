@@ -33604,6 +33604,11 @@ def test_each_tiers_configured_stall_s_reaches_its_run(env):
 
 ENOTFOUND = "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)"
 
+# A provider's api_base_env (e.g. ANTHROPIC_BASE_URL) points its reachability check at a local
+# proxy instead of the real API host: the net fixture must unset it, not just the proxy vars.
+PROXY_BASE_URL_VARS = ("ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "GEMINI_API_BASE_URL",
+                        "GOOGLE_GENAI_BASE_URL", "CURSOR_API_BASE_URL")
+
 
 def _api_error(text):
     return [{"type": "result", "subtype": "success", "is_error": True, "result": text, "num_turns": 1,
@@ -33617,7 +33622,7 @@ def net(monkeypatch):
     state = types.SimpleNamespace(up=set(), looked=[], pending=[])
     monkeypatch.setattr(dm, "_resolves", lambda host: state.looked.append(host) or host in state.up)
     monkeypatch.setattr(dm, "_background", state.pending.append)
-    for var in dm.PROXY_ENV:
+    for var in (*dm.PROXY_ENV, *PROXY_BASE_URL_VARS):
         monkeypatch.delenv(var, raising=False)
 
     def run_lookups():
