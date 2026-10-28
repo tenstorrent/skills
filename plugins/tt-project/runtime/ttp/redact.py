@@ -4,7 +4,7 @@
 
 The values come from the per-user secrets store (project.load_secrets): each field whose name says
 it holds a credential (key, token, secret, password) and is at least MIN_LEN characters long. Each
-becomes `[REDACTED-<slot>]`, e.g. `[REDACTED-endpoint/tt-cloud]`. One helper for every route:
+becomes `[secret:<slot>]`, e.g. `[secret:endpoint/tt-cloud]`. One helper for every route:
 
 - the database (Db.x): event, note, notify, message and hand-off text, so every `ttp` command and the
   chat relay that read it back never show a value;
@@ -49,20 +49,29 @@ def _collect(slot: str, v: Any, field: str, out: list[tuple[str, str]]) -> None:
 
 def pairs() -> list[tuple[str, str]]:
     """(value, slot) for every stored secret, longest first so a value inside another is masked whole.
-    Re-read only when the store changes."""
+    Re-read only when the store changes. Never raises: every DB write and daemon log line calls this,
+    so a store it cannot read or parse (wrong owner or mode, a folder, bad bytes, not a JSON object)
+    keeps the last good pairs (none if never read) and is read again on the next call."""
     from .project import load_secrets, secrets_path
-    sig = _sig(secrets_path())
-    if sig != _cache["sig"]:
+    try:
+        sig = _sig(secrets_path())
+        if sig == _cache["sig"]:
+            return _cache["pairs"]
+        data = load_secrets() if sig else {}
+        if not isinstance(data, dict):
+            return _cache["pairs"]
         out: list[tuple[str, str]] = []
-        for slot, v in (load_secrets() if sig else {}).items():
+        for slot, v in data.items():
             _collect(str(slot), v, "key" if isinstance(v, str) else "", out)
-        _cache["pairs"] = sorted(set(out), key=lambda p: -len(p[0]))
-        _cache["sig"] = sig
+    except Exception:
+        return _cache["pairs"]
+    _cache["pairs"] = sorted(set(out), key=lambda p: -len(p[0]))
+    _cache["sig"] = sig
     return _cache["pairs"]
 
 
 def mask(slot: str) -> str:
-    return f"[REDACTED-{slot}]"
+    return f"[secret:{slot}]"
 
 
 def scrub(text: Any) -> Any:

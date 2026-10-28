@@ -149,7 +149,7 @@ def test_endpoint_verify_never_forwards_the_key_on_a_cross_host_or_downgraded_re
 
 
 # Stored secrets never reach tool output, run logs, hand-offs, notes or helper services (redact.py).
-_MASK = "[REDACTED-endpoint/tt-cloud]"
+_MASK = "[secret:endpoint/tt-cloud]"
 
 
 def _stored(monkeypatch, home):
@@ -215,7 +215,7 @@ def test_redact_masks_every_stored_secret_and_only_secret_fields(env, monkeypatc
     project.save_secret("slack", {"bot_token": "slack-placeholder-token", "user_id": "U0PLACEHOLDER", "user_email": "a@b.c"})
     text = f"a {_EP_KEY} b jev-placeholder-key-42 c slack-placeholder-token d U0PLACEHOLDER {_EP_URL} typesafe"
     got = redact.scrub(text)
-    assert got == (f"a {_MASK} b [REDACTED-jev] c [REDACTED-slack] d U0PLACEHOLDER {_EP_URL} typesafe")
+    assert got == (f"a {_MASK} b [secret:jev] c [secret:slack] d U0PLACEHOLDER {_EP_URL} typesafe")
     assert redact.scrub_obj({"s": [text], _EP_KEY: 1}) == {"s": [got], _MASK: 1}
     assert redact.scrub(None) is None and redact.scrub(5) == 5
 
@@ -281,6 +281,51 @@ def test_db_writes_and_daemon_log_mask_stored_secrets(env, monkeypatch):
     assert _EP_KEY not in log and _MASK in log
 
 
+@pytest.mark.parametrize("damage", ["mode0", "directory", "json-list", "non-utf8"])
+def test_a_damaged_secret_store_never_breaks_db_writes_or_the_daemon_log(env, monkeypatch, damage):
+    """Db.x and daemon.log scrub every write: a store that cannot be read or parsed keeps the values read
+    before it was damaged (none if never read) and never raises."""
+    p = make(env)
+    from ttp import daemon, redact
+    project = _stored(monkeypatch, env["tmp"] / "secrets-home")
+    store = project.secrets_path()
+    monkeypatch.setattr(redact, "_cache", {"sig": None, "pairs": []})
+
+    def damage_store():
+        if damage == "mode0":
+            store.chmod(0)
+        elif damage == "directory":
+            store.unlink()
+            store.mkdir()
+        else:
+            store.write_bytes(b"[]" if damage == "json-list" else b'{"x": "\xff\xfe' + bytes([0xff, 0xfe]) + b'"}')
+
+    def write(text):
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+               (time.time(), "worker", "note", "low", text, "new"))
+        daemon.log(p, text)
+
+    try:
+        damage_store()                                  # damaged before it was ever read
+        write("never read")
+        assert redact.scrub(f"k {_EP_KEY}") == f"k {_EP_KEY}"
+        if store.is_dir():
+            store.rmdir()
+        else:
+            store.chmod(0o600)
+            store.unlink()
+        _stored(monkeypatch, env["tmp"] / "secrets-home")
+        write(f"read {_EP_KEY}")                        # read once, then damaged: the old value stays masked
+        damage_store()
+        write(f"after {_EP_KEY}")
+    finally:
+        if store.exists() and not store.is_dir():
+            store.chmod(0o600)
+    dump = json.dumps(p.db.q("SELECT text FROM events")) + (p.logs / "daemon.log").read_text()
+    assert "never read" in dump and f"read {_MASK}" in dump and f"after {_MASK}" in dump
+    assert _EP_KEY not in dump
+
+
 def test_a_run_that_prints_a_stored_secret_keeps_it_out_of_its_log_handoff_and_records(env, monkeypatch):
     p = make(env)
     _stored(monkeypatch, os.environ["TTP_HOME"])   # the runner subprocess reads the same store
@@ -336,7 +381,7 @@ def test_endpoint_errors_mask_every_stored_secret(env, monkeypatch):
             raise urllib.error.URLError(f"echoed jev-placeholder-key-42 and {_EP_KEY}")
     monkeypatch.setattr(endpoint.urllib.request, "build_opener", lambda *a: Opener())
     ok, msg = endpoint.verify("https://other.example.com/v1", "another-placeholder-key")
-    assert not ok and "jev-placeholder-key-42" not in msg and _EP_KEY not in msg and "[REDACTED-jev]" in msg
+    assert not ok and "jev-placeholder-key-42" not in msg and _EP_KEY not in msg and "[secret:jev]" in msg
 
 
 @pytest.mark.parametrize("cmd, refused", [
