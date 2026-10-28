@@ -4346,7 +4346,11 @@ class Daemon:
             text += f"\nContinue hop #{hop[0]} queued by the daemon ({hop[1]})" + (
                 f"; it builds on #{task['id']}'s branch and starts now." if split else ".")
         elif new == "done" and any(chaincap.CONT_TITLE.match(str(f["title"])) for f in fups):
-            text += f"\nContinue follow-up {UNQUEUED_TAG}: add it with continues #{task['id']} or drop it."
+            # A post-landing live step (a deploy, install or rollout) is no hop: it is proposed as deploy tasks.
+            deploys = [d for f in fups if chaincap.CONT_TITLE.match(str(f["title"]))
+                       and (d := chaincap.deploy_proposal(f, task["id"]))]
+            text += f"\nContinue follow-up {UNQUEUED_TAG}: " + (
+                deploys[0] + "." if deploys else f"add it with continues #{task['id']} or drop it.")
         elif split:
             text += (f"\nNo continue hop finishes its split head: add one with continues #{task['id']} (it builds "
                      f"on this branch), or a review of it if the work is complete.")
@@ -4381,7 +4385,8 @@ class Daemon:
             start = "; ".join(f"{k}: {str(f[k])[:300]}" for k in ("start_after", "start_when") if f.get(k))
             # A `continue:` follow-up the daemon did not queue as the next hop says so: only a task_add
             # with `continues` starts it (else continue_unqueued is raised, check_unqueued_continues).
-            tag = f" ({UNQUEUED_TAG}: add it with continues #{task['id']} or drop it)" \
+            tag = f" ({UNQUEUED_TAG}: " + (chaincap.deploy_proposal(f, task["id"])
+                                            or f"add it with continues #{task['id']} or drop it") + ")" \
                 if id(f) not in folded and chaincap.CONT_TITLE.match(str(f["title"])) else ""
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "followup_proposed", "normal",
@@ -10059,8 +10064,9 @@ class Daemon:
         """Model-free, every CONTINUE_CHECK_EVERY_S: a task done CONTINUE_UNQUEUED_AFTER_S ago (within
         CONTINUE_UNQUEUED_WINDOW_S) whose hand-off proposed a `continue:` follow-up that no task has
         taken up yet raises one high CONTINUE_UNQUEUED event, so a hop no turn queued is not lost. A
-        continuing task is any later task that continues it (chaincap.prev_of) or has the follow-up's
-        title. One event per task, ever."""
+        continuing task is any later task that continues it (chaincap.prev_of), has the follow-up's
+        title or waits on its landing (a start_when, as chaincap.deploy_proposal asks). One
+        event per task, ever."""
         now = time.time()
         if now - self._continues_checked < CONTINUE_CHECK_EVERY_S:
             return
@@ -10079,14 +10085,18 @@ class Daemon:
             if not conts:
                 continue
             later = db.q("SELECT id, title, labels, parent FROM tasks WHERE id>? ORDER BY id", (task["id"],))
-            if any(chaincap.prev_of(t) == task["id"] or t["title"].strip().lower() in
-                   {c.lower() for c in conts} for t in later):
+            # A post-landing step is taken up by a task that waits on this one's landing (deploy_proposal).
+            if any(chaincap.prev_of(t) == task["id"] or t["title"].strip().lower() in {c.lower() for c in conts}
+                   or chaincap.waits_landing(deferral(t).get("when"), task["id"]) for t in later):
                 continue
             db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
                  (now, f"task:{task['id']}", CONTINUE_UNQUEUED, "high",
                   f"#{task['id']} {headline.clip(task['title'], 160)}: its follow-up {conts[0][:200]!r} is {UNQUEUED_TAG} and no "
-                  f"task continues it {int(CONTINUE_UNQUEUED_AFTER_S // 60)} min after it finished. Add it with "
-                  f"task_add continues #{task['id']}, or drop it on purpose.",
+                  f"task continues it {int(CONTINUE_UNQUEUED_AFTER_S // 60)} min after it finished. " + (
+                      f"{deploy[0][0].upper()}{deploy[0][1:]} on purpose." if (deploy := [
+                          d for f in fups if isinstance(f, dict) and chaincap.CONT_TITLE.match(str(f.get("title") or ""))
+                          and (d := chaincap.deploy_proposal(f, task["id"]))]) else
+                      f"Add it with task_add continues #{task['id']}, or drop it on purpose."),
                   json.dumps({"followups": conts}), "queued", task["id"]))
             log(self.p, f"task {task['id']}: continue follow-up not taken up; {CONTINUE_UNQUEUED} raised")
 

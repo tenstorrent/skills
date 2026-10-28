@@ -27,8 +27,10 @@ with `continues` set (an AUTO_EVENT). A hop of a done task starts from the base,
 one exception: a split. A code task whose branch has changes and that proposes a `continue:` hop, or
 whose hand-off marks its head unfinished (marked_split), ended as a split (SPLIT_LABEL, split:<head>);
 a `continue:` follow-up that runs only once the task has landed (post_landing: a deploy, live install or
-check) carries nothing forward and makes no split:
-its head is work in progress. It gets no review, and its hop takes the branch over (`continues:`, so
+check, or any follow-up that names `landed:#<the task>`) carries nothing forward, makes no split and
+is never queued here; one that names a live step (live_step) reaches the coordinator NOT queued, with
+deploy_proposal's words (one deploy task per target, start_when `landed:#<the task>`). A split's
+head is work in progress. It gets no review, and its hop takes the branch over (`continues:`, so
 it starts from that head) and starts at once: a start_when `landed:` on a task of its own chain could
 never pass, as those commits land only with the hop's own work (own_wait refuses it). The open tasks
 that waited on the split task wait on the hop. The last hop, the first that ends without a split,
@@ -76,12 +78,18 @@ SPLIT_SUMMARY = re.compile(r"(?i)^\W*split\b(?=\s*(?:at|here|mid|after|before|be
                            r"|\bpast the split line\b")
 WIP_SUBJECT = re.compile(r"(?:^|[\s(\[])WIP(?=$|[\s):\]])|\(work in progress\)")
 # A post-landing follow-up's own words (post_landing): 'after' or 'once' this task (it, this task or change,
-# the change, #<id>) lands, and a live step in its title or that sentence; a title that lands, reviews,
-# pushes, fixes or finishes the change still carries it forward.
-AFTER_LANDING = re.compile(r"(?i)\b(?:after|once)\s+(?:it|this\s+(?:task|change)|the\s+change|#(\d+))\s+"
-                           r"(?:lands|has\s+landed|is\s+landed|is\s+pushed|reaches\s+the\s+push\s+branch)\b")
+# the change, #<id>, or 'the <a few words>': 'after the parser fix lands') lands, or 'after landed:#<id>',
+# and a live step in its title or that sentence; a title that lands, reviews, pushes, fixes or finishes the
+# change still carries it forward.
+AFTER_LANDING = re.compile(r"(?i)\b(?:after|once)\s+(?:(?:it|this\s+(?:task|change)|the\s+change|#(\d+))\s+"
+                           r"(?:lands|has\s+landed|is\s+landed|is\s+pushed|reaches\s+the\s+push\s+branch)\b"
+                           r"|landed:\s*#?(\d+)(?!\d)"
+                           r"|the\s+(?:[a-z][\w.-]*\s+){1,4}(?:lands|has\s+landed|is\s+landed)\b)")
 SENTENCE_END = re.compile(r"[.!?;](?=\s|$)|\n")
+# The live steps a post-landing follow-up names (deploy, install, upgrade, rollout or roll out, restart, a live
+# step, check or run, verify on a host): one list for post_landing's wording and for live_step.
 LIVE_STEP = re.compile(r"(?i)\b(?:deploy\w*|(?:re-?)?install\w*|upgrad\w*|roll(?:s|ed|ing)?(?:\s+(?:it|them))?[\s-]?outs?"
+                       r"|restart\w*|live\s+steps?"
                        r"|live\s+(?:check|test|run)\w*|verif\w*\b[^.;\n]{0,40}?\bon\s+(?:a|the|each|every|its)?\s*"
                        r"(?:host|box|machine|node)s?)\b(?!\.\w)")   # not a file name (install.sh)
 CARRIES = re.compile(r"(?i)^\s*(?:continue|mechanical)\s*:\s*(?:then\s+|and\s+)?(?:re-?)?(?:land|review|push|fix"
@@ -284,26 +292,43 @@ def waits_landing(probe, task_id: int) -> bool:
 
 def post_landing(fup: dict, task_id: int) -> bool:
     """Whether a follow-up of task `task_id` runs only after that task lands, so it is no hop of a split:
-    its start_when or wait names the landing (waits_landing, decisive: such a task can never carry the
-    work to its landing), or its title and spec say it runs after or once the task lands (AFTER_LANDING,
+    its start_when, wait, title or spec names the landing (waits_landing: `landed:#<task_id>` or `ttp
+    landed --task <task_id>`, decisive: such a task can never carry the work to its landing), or its title and spec say it runs after or once the task lands (AFTER_LANDING,
     no other task id in that phrase) and name a live step (LIVE_STEP), with no title that lands,
     reviews, pushes, fixes or finishes the change (CARRIES). The live step counts only in the title or in
     the sentence that says so, never anywhere in the spec."""
     fup = fup if isinstance(fup, dict) else {}
-    if any(waits_landing(fup.get(k), task_id) for k in WAIT_KEYS):
-        return True
     title = str(fup.get("title") or "")
+    text = f"{title}\n{fup.get('spec') or ''}"
+    if any(waits_landing(v, task_id) for v in (*(fup.get(k) for k in WAIT_KEYS), text)):
+        return True
     if CARRIES.search(title):
         return False
-    text = f"{title}\n{fup.get('spec') or ''}"
     for m in AFTER_LANDING.finditer(text):
-        if m.group(1) and m.group(1) != str(task_id):
+        if (ref := m.group(1) or m.group(2)) and ref != str(task_id):
             continue
         start = max((e.end() for e in SENTENCE_END.finditer(text, 0, m.start())), default=0)
         end = SENTENCE_END.search(text, m.end())
         if LIVE_STEP.search(title) or LIVE_STEP.search(text[start:end.start() if end else len(text)]):
             return True
     return False
+
+
+def live_step(fup: dict) -> bool:
+    """Whether a follow-up's title or spec names a live step (LIVE_STEP)."""
+    fup = fup if isinstance(fup, dict) else {}
+    return bool(LIVE_STEP.search(f"{fup.get('title') or ''}\n{fup.get('spec') or ''}"))
+
+
+def deploy_proposal(fup: dict, task_id: int) -> str:
+    """The coordinator's words for a `continue:` follow-up of task `task_id` that runs only after it lands
+    (post_landing) and names a live step: no hop of it (it would wait on its own chain's landing, or deploy
+    beside the task that already does), but one deploy task per target waiting on the landing; '' otherwise."""
+    if not post_landing(fup, task_id) or not live_step(fup):
+        return ""
+    return (f"it runs only after #{task_id} lands and names a live step, so no hop of #{task_id} was queued: add "
+            f"one deploy task per target with start_when landed:#{task_id} (no continues: a landed wait inside "
+            f"its own chain is refused), unless an open task already deploys it, or drop it")
 
 
 def split_head(task: dict | None) -> str:

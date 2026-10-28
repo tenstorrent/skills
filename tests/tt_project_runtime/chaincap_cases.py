@@ -130,13 +130,116 @@ def test_post_landing_wording_needs_this_task_landing_and_a_live_step_in_that_se
                  "spec": "after the push queue reports landing, the daemon marks it; update install.sh"},
                 {"title": "continue: part 2", "spec": "After it lands, the sweep reviews it. Then install it."},
                 {"title": "continue: part 2", "spec": "After it lands, update install.sh and the docs."},
-                {"title": "continue: part 2", "spec": "When it lands, deploy it."},
-                {"title": "continue: part 2", "spec": "After the parser lands, deploy it."}):
+                {"title": "continue: part 2", "spec": "When it lands, deploy it."}):
         assert not chaincap.post_landing(fup, 7), fup
     for fup in ({"title": "continue: deploy", "spec": "Do it after this change is pushed."},
                 {"title": "continue: part 2", "spec": "Write docs. Once #7 has landed, upgrade each box."},
                 {"title": "continue: part 2", "spec": "After the change reaches the push branch, roll it out."}):
         assert chaincap.post_landing(fup, 7), fup
+
+
+def test_a_landed_wait_on_the_own_task_anywhere_in_a_follow_up_is_decisive_for_post_landing():
+    """`landed:#<own id>` or `ttp landed --task <own id>` in the title or spec makes a follow-up post-landing,
+    live step or not, also under a title that carries the change; another task's landing does not."""
+    from ttp import chaincap
+    for fup in ({"title": "continue: part 2", "spec": "Continues #6; wait landed:#7. One target per task."},
+                {"title": "continue: part 2 (landed:#7)", "spec": "Update the changelog."},
+                {"title": "continue: part 2", "spec": "Start when `ttp landed --task 7` passes, then check it."},
+                {"title": "continue: push it", "spec": "Then wait for landed: #7 and update the notes."}):
+        assert chaincap.post_landing(fup, 7), fup
+    for fup in ({"title": "continue: part 2", "spec": "Continues #6; wait landed:#70. One target per task."},
+                {"title": "continue: part 2", "spec": "Rebase once landed:#8 is in, then add the tests."},
+                {"title": "continue: part 2", "spec": "Like `ttp landed --task 70`, add a probe."}):
+        assert not chaincap.post_landing(fup, 7), fup
+
+
+def test_after_landing_wording_takes_a_landed_ref_and_a_short_noun_phrase():
+    from ttp import chaincap
+    for fup in ({"title": "continue: deploy", "spec": "After landed:#7, deploy by the rollout command on target A."},
+                {"title": "continue: part 2", "spec": "Once the cutover mask fix lands, restart the service."},
+                {"title": "continue: part 2", "spec": "After the parser lands, deploy it."},
+                {"title": "continue: part 2", "spec": "Write docs. Once the new unit has landed, roll out to target A."}):
+        assert chaincap.post_landing(fup, 7), fup
+    for fup in ({"title": "continue: part 2", "spec": "Describe the landscape after the release, then deploy it."},
+                {"title": "continue: part 2", "spec": "After landed:#8, deploy it on target A."},
+                {"title": "continue: part 2", "spec": "After the fix in #12 lands, deploy it."},
+                {"title": "continue: part 2", "spec": "After the release of the new big shiny parser lands, deploy."},
+                {"title": "continue: part 2", "spec": "After the parser lands, update the docs."}):
+        assert not chaincap.post_landing(fup, 7), fup
+    assert chaincap.live_step({"title": "continue: restart the service"})
+    assert chaincap.live_step({"spec": "the one live step left"}) and not chaincap.live_step({"spec": "docs"})
+
+
+def _no_hop_waits_on_its_parent(p):
+    from ttp import chaincap
+    for t in p.db.q("SELECT * FROM tasks"):
+        if (prev := chaincap.prev_of(t)) is not None and chaincap.auto_continued(p.db, prev):
+            assert not chaincap.waits_landing(t["spec"], prev), t["spec"]
+
+
+def test_post_landing_live_step_continues_are_proposed_as_deploys_never_auto_hopped(env):
+    """The two shapes that were hopped: a follow-up that waits on its own parent's landing in its spec, and one
+    that deploys 'after landed:#<parent>'. Neither is queued or makes a split; the coordinator gets them NOT
+    queued, with one deploy task per target waiting on the parent's landing."""
+    from ttp import chaincap
+    shapes = [lambda tid: [{"title": "continue: roll out to each target",
+                            "spec": f"Continues #{tid - 1}; wait landed:#{tid}. One target per task through the "
+                                    f"rollout script."}],
+              lambda tid: [{"title": "continue: deploy to target A",
+                            "spec": f"After landed:#{tid}, deploy by the rollout start command on target A."}]]
+    p = make(env)
+    for i, fups in enumerate(shapes):
+        tid, _, done, reviews = _finish_with_followups(env, p, f"unit change {i}", fups)
+        assert not chaincap.split_head(p.db.task(tid)) and len(reviews) == 1, i
+        assert not _hops_of(p, tid) and not p.db.q("SELECT 1 FROM tasks WHERE parent=?", (tid,))
+        assert not p.db.q("SELECT 1 FROM events WHERE kind=? AND task=?", (chaincap.AUTO_EVENT, tid))
+        want = f"one deploy task per target with start_when landed:#{tid}"
+        assert "NOT queued by the daemon" in done["text"] and want in done["text"], done["text"]
+        (prop,) = p.db.q("SELECT * FROM events WHERE kind='followup_proposed' AND task=?", (tid,))
+        assert "NOT queued by the daemon" in prop["text"] and want in prop["text"] and prop["status"] == "queued"
+    _no_hop_waits_on_its_parent(p)
+
+
+def test_post_landing_continues_without_a_live_step_and_plain_continues_keep_their_paths(env):
+    from ttp import chaincap
+    p = make(env)
+    # Post-landing, no live step: no hop, no split, a review, and the plain NOT-queued words.
+    tid, _, done, reviews = _finish_with_followups(env, p, "notes change", lambda tid: [
+        {"title": "continue: changelog", "spec": f"Wait landed:#{tid}, then update the changelog."}])
+    assert not chaincap.split_head(p.db.task(tid)) and len(reviews) == 1 and not _hops_of(p, tid)
+    assert f"add it with continues #{tid} or drop it" in done["text"] and "deploy task" not in done["text"]
+    # Not post-landing: today's split and its daemon hop, which waits on nothing.
+    tid, branch, done, reviews = _finish_with_followups(env, p, "lexer part", lambda tid: [
+        {"title": "continue: tests for the lexer", "spec": "Add the tests on this branch, then deploy nothing."}])
+    assert chaincap.split_head(p.db.task(tid)) and not reviews
+    (hop,) = _hops_of(p, tid)
+    assert p.db.q("SELECT 1 FROM events WHERE kind=? AND task=?", (chaincap.AUTO_EVENT, tid))
+    assert f"Continue hop #{hop['id']} queued by the daemon" in done["text"]
+    _no_hop_waits_on_its_parent(p)
+
+
+def test_a_deploy_task_waiting_on_the_landing_takes_up_a_post_landing_continue(env):
+    """check_unqueued_continues counts a later task that waits on the parent's landing (what deploy_proposal
+    asks for), so following the proposal raises no continue_unqueued; with none, its words repeat it."""
+    import time
+    from ttp import daemon as dmod
+    from ttp.daemon import Daemon
+    p = make(env)
+    ids = []
+    for i in range(2):
+        tid, *_ = _finish_with_followups(env, p, f"svc change {i}", lambda tid: [
+            {"title": "continue: deploy", "spec": f"After landed:#{tid}, deploy to target A."}])
+        ids.append(tid)
+    p.db.add_task("deploy to target A", "Deploy.", kind="code", origin="coordinator",
+                  labels=[f"start_when:landed:#{ids[0]}"])
+    old = time.time() - dmod.CONTINUE_UNQUEUED_AFTER_S - 60
+    p.db.x("UPDATE events SET ts=? WHERE kind='task_done'", (old,))
+    d = Daemon(p.base)
+    d._continues_checked = 0
+    d.check_unqueued_continues()
+    rows = p.db.q("SELECT * FROM events WHERE kind=?", (dmod.CONTINUE_UNQUEUED,))
+    assert [r["task"] for r in rows] == [ids[1]]
+    assert f"one deploy task per target with start_when landed:#{ids[1]}" in rows[0]["text"]
 
 
 def test_a_continue_titled_to_land_push_or_fix_the_change_is_still_a_split(env):
