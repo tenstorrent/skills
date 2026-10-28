@@ -13,6 +13,11 @@
 - `--verify` makes one real read-only call per family on each machine that shows it connected (`claude -p` on a
   small model and budget, only that connector's search, fetch, get, list, read, find, query or lookup tools, held
   to them by a PreToolUse hook). Only pass or fail, the tool's name and an item count leave the machine.
+  Headless sessions load claude.ai connectors asynchronously, so neither `claude mcp list`'s Connected nor an early
+  needs-auth proves anything: the call waits for MCP connections (MCP_CONNECTION_NONBLOCKING=false, MCP_TIMEOUT)
+  and, when no tool of the family loaded, tries once more, all within VERIFY_CAP_S per machine. A connector whose
+  tools still did not load is "connected, not loaded in headless runs" (a note, no Settings step); only an auth
+  error from a connector call after the wait is "needs authentication" with the reconnect step.
 - It never logs in or out, switches accounts or adds a connector: each finding names the one step that fixes it,
   and an account switch only on the user's yes.
 Exit 0 all set, 1 a finding, 255 ssh to a box failed.
@@ -55,6 +60,15 @@ VERIFY_TURNS = "6"
 # A connector's read tool: `mcp__claude_ai_<name>__<verb>...`, no `__` inside the name.
 READ_TOOL = "mcp__claude_ai_[A-Za-z0-9]+(_[A-Za-z0-9]+)*__(" + "|".join(READ_VERBS) + ")[A-Za-z0-9]*(_[A-Za-z0-9]+)*"
 _T = 'T=; command -v timeout >/dev/null 2>&1 && T="timeout 150"; '
+VERIFY_CAP_S = 120         # every --verify call on one machine, the retry included
+VERIFY_MCP_TIMEOUT_MS = 60000
+VERIFY_RETRY_PAUSE_S = 15  # before the one retry of a family whose tools did not load
+# A connector call's error that means its authorization, not a missing or slow tool.
+AUTH_ERROR = "(401|403|unauthori[sz]ed|unauthenticated|authenticat|re-?authori[sz]e|invalid[_ ]token|expired)"
+NOT_LOADED = "connected, not loaded in headless runs"
+HEADLESS_NOTE = ("note: claude.ai connectors can show Connected in `claude mcp list` yet load no tools in a headless "
+                 "`claude -p` run, as tt-project workers run; workers then use other configured MCP tools. Nothing to "
+                 "fix in Settings.")
 
 
 def probe_script() -> str:
@@ -152,27 +166,44 @@ def verify_prompt(names: Sequence[str]) -> str:
 
 
 def verify_script(targets: Dict[str, List[str]]) -> str:
-    """Shell: for each family, one `claude -p` on its connected connectors: `verify_<n>=<tool called>|<answer>`, and
-    `headless_<n>=` each connector's state as that headless session saw it (its init event). The run's output stays
-    in a shell variable on the machine: only those names, states and the answer line are printed."""
-    s = _T.replace("150", "300") + box_agents._find("claude") + 'cd "$HOME" || exit 1; '
+    """Shell: for each family, one `claude -p` on its connected connectors that waits for MCP connections, and once
+    more after VERIFY_RETRY_PAUSE_S when none of their tools loaded, all within VERIFY_CAP_S. It prints
+    `verify_<n>=<tool called>|<answer>`, `headless_<n>=` each connector's state in the init event, `loaded_<n>=` each
+    connector's tool count there (empty: no init event), `autherr_<n>=1` when a connector call answered an auth error
+    and `tries_<n>=`. The run's output stays in a shell variable on the machine: only these are printed."""
+    s = (box_agents._find("claude") + 'cd "$HOME" || exit 1; TO=; command -v timeout >/dev/null 2>&1 && TO=timeout; '
+         f'end=$(( $(date +%s) + {VERIFY_CAP_S} )); ')
     for n, names in enumerate(targets.values()):
         argv = ["-p", verify_prompt(names), "--model", VERIFY_MODEL, "--max-budget-usd", VERIFY_BUDGET_USD,
                 "--max-turns", VERIFY_TURNS, "--output-format", "stream-json", "--verbose",
                 "--allowedTools", *[tool_prefix(x)[:-2] for x in names], "ToolSearch", "--settings", hook_settings()]
-        s += (f'o=$($T "$b" {shlex.join(argv)} </dev/null 2>/dev/null); '
+        count = ''.join(f'$(printf "%s" "$i" | grep -o \'"{tool_prefix(x)}\' | wc -l | tr -d " "),' for x in names)
+        s += ('t=0; c=; a=; h=; l=; e=; while [ "$t" -lt 2 ]; do left=$(( end - $(date +%s) )); '
+              '[ "$left" -gt 5 ] || break; t=$((t + 1)); '
+              f'o=$(MCP_CONNECTION_NONBLOCKING=false MCP_TIMEOUT={VERIFY_MCP_TIMEOUT_MS} $TO ${{TO:+$left}} '
+              f'"$b" {shlex.join(argv)} </dev/null 2>/dev/null); '
+              'i=$(printf "%s\\n" "$o" | grep -m 1 \'"subtype":"init"\'); '
               f'c=$(printf "%s" "$o" | grep -oiE \'"name":"{READ_TOOL}"\' | head -n 1 | cut -d\'"\' -f4); '
               'a=$(printf "%s" "$o" | grep -oE "CONNECTOR_(OK=[0-9]+|ERROR=[A-Za-z0-9 _.,:()-]{0,80})" | tail -n 1); '
-              'h=$(printf "%s" "$o" | head -n 1 | grep -oE \'"name":"claude\\.ai [^"]*","status":"[^"]*"\' '
+              'h=$(printf "%s" "$i" | grep -oE \'"name":"claude\\.ai [^"]*","status":"[^"]*"\' '
               '| sed \'s/"name":"claude\\.ai \\([^"]*\\)","status":"\\([^"]*\\)"/\\1:\\2/\' | paste -sd ";" -); '
-              f'echo "headless_{n}=$h"; echo "verify_{n}=$c|$a"; ')
+              f'l=; [ -n "$i" ] && l="{count[:-1]}"; '
+              'e=; printf "%s\\n" "$o" | grep \'"type":"user"\' | grep \'"is_error":true\' '
+              f'| grep -Eiq \'{AUTH_ERROR}\' && e=1; '
+              '[ -n "$c" ] && break; case ",$l," in *,[1-9]*) break;; esac; '
+              f'[ "$t" -lt 2 ] && [ $(( end - $(date +%s) )) -gt {VERIFY_RETRY_PAUSE_S * 2} ] '
+              f'&& sleep {VERIFY_RETRY_PAUSE_S}; done; '
+              f'echo "headless_{n}=$h"; echo "loaded_{n}=$l"; echo "autherr_{n}=$e"; echo "tries_{n}=$t"; '
+              f'echo "verify_{n}=$c|$a"; ')
     return s + "true"
 
 
 def read_verify(out: str, targets: Dict[str, List[str]]) -> Dict[str, dict]:
-    """{family: {"ok", "tool", "items", "error", "headless"}}: pass only when one of the family's connector tools
-    was called and answered OK; `headless` maps each of its connectors to the state the headless session saw."""
-    kv = dict(ln.split("=", 1) for ln in out.splitlines() if ln.startswith(("verify_", "headless_")) and "=" in ln)
+    """{family: {"ok", "tool", "items", "error", "headless", "loaded", "auth_error", "tries"}}: pass only when one of
+    the family's connector tools was called and answered OK; `headless` maps each of its connectors to the state the
+    headless session's init event showed, `loaded` to its tool count there (absent: no init event)."""
+    keys = ("verify_", "headless_", "loaded_", "autherr_", "tries_")
+    kv = dict(ln.split("=", 1) for ln in out.splitlines() if ln.startswith(keys) and "=" in ln)
     res: Dict[str, dict] = {}
     for n, (fam, names) in enumerate(targets.items()):
         tool, _, ans = kv.get(f"verify_{n}", "|").partition("|")
@@ -181,9 +212,14 @@ def read_verify(out: str, targets: Dict[str, List[str]]) -> Dict[str, dict]:
         ok = re.fullmatch(r"CONNECTOR_OK=(\d+)", ans)
         err = ans[len("CONNECTOR_ERROR="):] if ans.startswith("CONNECTOR_ERROR=") else ""
         seen = dict(x.split(":", 1) for x in kv.get(f"headless_{n}", "").split(";") if ":" in x)
+        counts = kv.get(f"loaded_{n}", "").split(",")
+        loaded = {x: int(c) for x, c in zip(names, counts) if c.strip().isdigit()} if len(counts) == len(names) else {}
+        tries = kv.get(f"tries_{n}", "")
         res[fam] = {"ok": bool(mine and ok), "tool": mine, "items": int(ok.group(1)) if ok else None,
                     "error": err or ("no connector tool was called" if ok and not mine else "" if ok else "no answer"),
-                    "headless": {x: seen[x] for x in names if x in seen}}
+                    "headless": {x: seen[x] for x in names if x in seen}, "loaded": loaded,
+                    "auth_error": bool(mine) and kv.get(f"autherr_{n}", "").strip() == "1",
+                    "tries": int(tries) if tries.isdigit() else None}
     return res
 
 
@@ -273,18 +309,40 @@ def report(machine: str, p: dict, ref: Optional[dict], fams: Dict[str, List[str]
         fix = (f"rerun this check; if {', '.join(by_state['failed'])} still fail, reconnect them in "
                f"{SETTINGS_STEP}{acct}")
         fixes += [fix] if fix not in fixes else []
+    if verified is None and any(connector_state(p, x) == "connected" for names in fams.values() for x in names):
+        lines.append(f"{machine}: connected as `claude mcp list` shows it; not verified for headless runs "
+                     "(add --verify)")
+    note = False
     for fam, v in (verified or {}).items():
-        off = [x for x, st in v.get("headless", {}).items() if st != "connected"]
-        if off:
+        loaded = v.get("loaded") or {}
+        idle = [x for x, k in loaded.items() if k == 0]
+        if loaded:
+            up = [f"{x} {k} tools loaded" for x, k in loaded.items() if k]
             lines.append(f"{machine} {fam} headless (`claude -p`, as tt-project workers run): "
-                         + ", ".join(f"{x} {v['headless'][x]}" for x in off) + "; the rest connected")
+                         + "; ".join(up + ([f"{NOT_LOADED}: {', '.join(idle)}"] if idle else [])))
         if v["ok"]:
             lines.append(f"{machine} {fam} verify: pass ({v['tool']}, {v['items']} items)")
+            note = note or bool(idle)
+        elif v.get("auth_error"):
+            who = next((x for x in fams[fam] if v["tool"].startswith(tool_prefix(x))), fam)
+            lines.append(f"{machine} {fam} verify: fail ({v['tool']} answered an auth error after the wait)")
+            find(f"{who} needs authentication (an auth error in a headless call)",
+                 f"in {SETTINGS_STEP}, reconnect {who}{acct}, then rerun with --verify")
+        elif loaded and not v["tool"] and not any(loaded.values()):
+            lines.append(f"{machine} {fam} verify: {NOT_LOADED} (no tool loaded after waiting, {v.get('tries') or 1} "
+                         f"tries within {VERIFY_CAP_S}s)")
+            note = True
+        elif loaded and not v["tool"]:
+            # Some tools loaded, so no auth fault; none of them made a read-only call (e.g. only a read by id).
+            lines.append(f"{machine} {fam} verify: not verified, no read-only call made ({v['error']}); "
+                         + ", ".join(x for x, k in loaded.items() if k) + " loaded")
+            note = note or bool(idle)
         else:
             lines.append(f"{machine} {fam} verify: fail ({v['error']})")
-            again = ", ".join(off) or " and ".join(fams[fam][:1]) or fam
-            find(f"{fam} verify failed ({v['error']})", f"in {SETTINGS_STEP}, reconnect {again}{acct}, then rerun "
-                 "with --verify")
+            find(f"{fam} verify failed ({v['error']})", "rerun with --verify; if it fails again, make the same "
+                 "read-only call in an interactive `claude` session there and read its error")
+    if note:
+        lines.append(f"{machine} {HEADLESS_NOTE}")
     return lines, problems, fixes
 
 
@@ -325,7 +383,7 @@ def inspect(aliases: Sequence[str], fams: Dict[str, List[str]], verify: bool = F
         if verify and p["signed_in"] and p["listed"]:
             targets = verify_targets(p, fams)
             if targets:
-                v = _run(m, verify_script(targets), 900)
+                v = _run(m, verify_script(targets), VERIFY_CAP_S + 60)
                 verified = read_verify(v.stdout, targets)
         if m == HERE_NAME:
             ref = p

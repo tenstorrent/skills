@@ -2395,7 +2395,7 @@ def test_setup_box_connectors_verify_is_one_read_only_call_per_family_and_report
            "headless_1=Google Drive:needs-auth;Google Docs:connected\nverify_1=|CONNECTOR_ERROR=no Drive\n")
     v = bc.read_verify(out, targets)
     assert v["Atlassian"] == {"ok": True, "tool": "mcp__claude_ai_Atlassian__search", "items": 5, "error": "",
-                              "headless": {"Atlassian": "connected"}}
+                              "headless": {"Atlassian": "connected"}, "loaded": {}, "auth_error": False, "tries": None}
     assert not v["Google"]["ok"] and v["Google"]["error"] == "no Drive"
     assert v["Google"]["headless"] == {"Google Drive": "needs-auth", "Google Docs": "connected"}
     # Another family's tool, or an OK with no tool called, does not pass.
@@ -2409,9 +2409,119 @@ def test_setup_box_connectors_verify_is_one_read_only_call_per_family_and_report
     assert len(ran) == 2 and rc == 1
     assert "here Atlassian verify: pass (mcp__claude_ai_Atlassian__search, 5 items)" in lines
     assert "here Google verify: fail (no Drive)" in lines
-    assert any(ln.startswith("here Google headless (`claude -p`") and "Google Drive needs-auth" in ln for ln in lines)
     assert problems == ["here: Google verify failed (no Drive)"]
-    assert fixes == ["in claude.ai Settings > Connectors, reconnect Google Drive, then rerun with --verify"]
+    # No auth error from a connector call: no Settings step, an early needs-auth in the init event included.
+    assert fixes == ["rerun with --verify; if it fails again, make the same read-only call in an interactive "
+                     "`claude` session there and read its error"]
+
+
+def _fake_claude(tmp_path, runs):
+    """A `claude` on PATH whose n-th `claude -p` prints runs[n] (stream-json lines), recording each run's MCP wait env."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for n, lines in enumerate(runs):
+        (tmp_path / f"run{n}.out").write_text("".join(json.dumps(x, separators=(",", ":")) + "\n" for x in lines))
+    fake = bindir / "claude"
+    fake.write_text('#!/bin/sh\nn=$(cat "$HOME/n" 2>/dev/null || echo 0); echo $((n + 1)) > "$HOME/n"\n'
+                    'echo "$MCP_CONNECTION_NONBLOCKING $MCP_TIMEOUT" >> "$HOME/env"\n'
+                    'cat "$HOME/run$n.out" 2>/dev/null\n')
+    fake.chmod(0o755)
+    return {"PATH": f"{bindir}:/usr/bin:/bin", "HOME": str(tmp_path)}
+
+
+def _init(tools=(), status="connected", name="Atlassian"):
+    return {"type": "system", "subtype": "init", "tools": ["ToolSearch", *tools],
+            "mcp_servers": [{"name": f"claude.ai {name}", "status": status}]}
+
+
+_CALL = {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "mcp__claude_ai_Atlassian__search"}]}}
+
+
+def _verify_run(monkeypatch, tmp_path, runs, cap=None):
+    """box_connectors.verify_script() run for real against _fake_claude(): (read_verify result, claude runs, env)."""
+    import subprocess
+    monkeypatch.syspath_prepend(str(BOX_PY.parent))
+    import box_connectors as bc
+    monkeypatch.setattr(bc, "VERIFY_RETRY_PAUSE_S", 0)
+    if cap is not None:
+        monkeypatch.setattr(bc, "VERIFY_CAP_S", cap)
+    targets = {"Atlassian": ["Atlassian"]}
+    r = subprocess.run(["sh", "-c", bc.verify_script(targets)], env=_fake_claude(tmp_path, runs), capture_output=True,
+                       text=True, timeout=60)
+    n = int((tmp_path / "n").read_text()) if (tmp_path / "n").exists() else 0
+    env = (tmp_path / "env").read_text().split("\n")[0] if n else ""
+    return bc, bc.read_verify(r.stdout, targets), n, env
+
+
+def test_setup_box_connectors_verify_waits_for_late_connector_tools_and_passes(monkeypatch, tmp_path):
+    # The first headless session's init shows no Atlassian tool (needs-auth while it loads); the retry has them.
+    late = [[_init(status="needs-auth"), {"type": "result", "result": "CONNECTOR_ERROR=tools not loaded"}],
+            [_init(["mcp__claude_ai_Atlassian__search"]), _CALL, {"type": "result", "result": "CONNECTOR_OK=3"}]]
+    bc, v, n, env = _verify_run(monkeypatch, tmp_path, late)
+    assert n == 2 and env == f"false {bc.VERIFY_MCP_TIMEOUT_MS}"   # -p waits for MCP connections, a long timeout
+    assert v["Atlassian"]["ok"] and v["Atlassian"]["tries"] == 2 and v["Atlassian"]["loaded"] == {"Atlassian": 1}
+    lines, problems, fixes = bc.report("here", bc.read_probe(_connector_probe(states={"Atlassian": "connected"})),
+                                       None, {"Atlassian": ["Atlassian"]}, v)
+    assert "here Atlassian verify: pass (mcp__claude_ai_Atlassian__search, 3 items)" in lines and not problems
+    # Tools loaded on the first try: no retry. The cap bounds it: no time left, no call at all.
+    (tmp_path / "a").mkdir()
+    bc, v, n, _ = _verify_run(monkeypatch, tmp_path / "a", late[1:])
+    assert n == 1 and v["Atlassian"]["ok"] and v["Atlassian"]["tries"] == 1
+    (tmp_path / "b").mkdir()
+    bc, v, n, _ = _verify_run(monkeypatch, tmp_path / "b", late, cap=3)
+    assert n == 0 and not v["Atlassian"]["ok"] and v["Atlassian"]["tries"] == 0
+    assert bc.verify_script({"A": ["A"]}).count(f"end=$(( $(date +%s) + {bc.VERIFY_CAP_S} ))") == 1
+    assert bc.VERIFY_CAP_S <= 120
+
+
+def test_setup_box_connectors_verify_reports_connected_but_not_loaded_in_headless_runs(monkeypatch, tmp_path):
+    never = [[_init(status="needs-auth"), {"type": "result", "result": "CONNECTOR_ERROR=connector is not authorized"}]] * 2
+    bc, v, n, _ = _verify_run(monkeypatch, tmp_path, never)
+    assert n == 2 and not v["Atlassian"]["ok"] and v["Atlassian"]["loaded"] == {"Atlassian": 0}
+    assert not v["Atlassian"]["auth_error"]
+    p = bc.read_probe(_connector_probe())
+    lines, problems, fixes = bc.report("here", p, None, {"Atlassian": ["Atlassian"]}, v)
+    assert "here Atlassian verify: connected, not loaded in headless runs (no tool loaded after waiting, 2 tries " \
+           f"within {bc.VERIFY_CAP_S}s)" in lines
+    assert any(ln.startswith("here note: claude.ai connectors can show Connected") for ln in lines)
+    assert not problems and not fixes   # the model's "not authorized" and the early needs-auth prove nothing
+    # Part of a family loaded: the rest named not loaded, the family still passes through a loaded one.
+    fams = {"Google": ["Google Drive", "Gmail"]}
+    out = ("loaded_0=0,4\nheadless_0=Google Drive:needs-auth;Gmail:connected\ntries_0=1\n"
+           "verify_0=mcp__claude_ai_Gmail__search_threads|CONNECTOR_OK=2\n")
+    lines, problems, fixes = bc.report("here", p, None, fams, bc.read_verify(out, fams))
+    assert "here Google headless (`claude -p`, as tt-project workers run): Gmail 4 tools loaded; connected, not " \
+           "loaded in headless runs: Google Drive" in lines and not problems and not fixes
+    # Loaded, but no read-only call was possible (e.g. only a read by id): not verified, no Settings step.
+    out = "loaded_0=0,2\ntries_0=1\nverify_0=|CONNECTOR_ERROR=no search tool\n"
+    lines, problems, fixes = bc.report("here", p, None, fams, bc.read_verify(out, fams))
+    assert "here Google verify: not verified, no read-only call made (no search tool); Gmail loaded" in lines
+    assert not problems and not fixes
+    # Without --verify the states are labelled as `claude mcp list`'s, not verified for headless runs.
+    lines, _, _ = bc.report("here", p, None, fams)
+    assert "here: connected as `claude mcp list` shows it; not verified for headless runs (add --verify)" in lines
+
+
+def test_setup_box_connectors_verify_needs_auth_only_from_a_real_auth_error(monkeypatch, tmp_path):
+    p_ok = _connector_probe(states={"Atlassian": "connected"})
+    for reply, auth in (("401 Unauthorized: token expired", True), ("Authentication required", True),
+                        ("rate limited, try later", False), ("no results", False)):
+        d = tmp_path / str(abs(hash(reply)))
+        d.mkdir()
+        res = {"type": "user", "message": {"content": [{"type": "tool_result", "is_error": True, "content": reply}]}}
+        bc, v, n, _ = _verify_run(monkeypatch, d, [[_init(["mcp__claude_ai_Atlassian__search"]), _CALL, res,
+                                                    {"type": "result", "result": "CONNECTOR_ERROR=call failed"}]])
+        assert n == 1 and v["Atlassian"]["auth_error"] is auth, reply
+        lines, problems, fixes = bc.report("here", bc.read_probe(p_ok), None, {"Atlassian": ["Atlassian"]}, v)
+        settings = [f for f in fixes if "Settings > Connectors" in f]
+        if auth:
+            assert problems == ["here: Atlassian needs authentication (an auth error in a headless call)"]
+            assert settings == ["in claude.ai Settings > Connectors, reconnect Atlassian, then rerun with --verify"]
+        else:
+            assert problems == ["here: Atlassian verify failed (call failed)"] and not settings, reply
+    # An auth word with no connector tool called (the model's own words, or another tool) is no auth error.
+    v = bc.read_verify("loaded_0=0\nautherr_0=1\nverify_0=|CONNECTOR_ERROR=unauthorized\n", {"Atlassian": ["Atlassian"]})
+    assert v["Atlassian"]["auth_error"] is False
 
 
 def test_setup_box_agents_check_adds_connector_findings_and_the_plan_runs_the_check(tmp_path, monkeypatch, capsys):
