@@ -15,7 +15,7 @@ Use this skill for the hardware-facing parts of model bringup. It covers only no
 
 ## Basic Rules
 
-- Run TT hardware-facing commands one at a time: `tt-smi`, resets, TTNN import/open-device probes, watcher runs, Tracy/device-profiler runs, tests, benchmarks, and serving jobs.
+- Run TT hardware-facing commands one at a time per chip: `tt-smi`, resets, TTNN import/open-device probes, watcher runs, Tracy/device-profiler runs, tests, benchmarks, and serving jobs. On a multi-chip host, one process per chip with `TT_VISIBLE_DEVICES=<n>` is allowed when the operator assigns chips; set it on host-only test sweeps too, because a parametrized device fixture in an unrelated module opens every chip. Resets and `tt-smi` stay one at a time for the whole host.
 - Close devices before starting the next device-facing command. Kill stale processes from the same run before reset or retry.
 - Keep watcher and profiler evidence in separate runs. Do not combine `TT_METAL_WATCHER` with device-profiler or Tracy collection.
 - Do not profile live vLLM serving stages. Use serving benchmark JSON and logs instead.

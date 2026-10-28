@@ -239,7 +239,7 @@
       "destination": "skills/tt-device-usage/SKILL.md",
       "blob": "273f20c58cbd80640677004635e43ce47d759891",
       "source_sha256": "b32b5685e47932e1356762c96f70f2ee5cc226ce23d5e1781f9a6bfe26a66502",
-      "packaged_sha256": "81658919686214af2c25d97695e88fc6e3ed0913d5d1d5664d92eb5bf8712c00"
+      "packaged_sha256": "e26a220c3dd7e90e84a34e7649344bd7d4b2d2c79251e9c8f885d62e074bdb43"
     },
     {
       "source": ".agents/skills/tt-device-usage/agents/openai.yaml",
