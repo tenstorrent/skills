@@ -17,6 +17,8 @@ It waits, unpaged, while the machine is under an outage, a fleet hold or a resou
 A worker whose sandbox keeps the user's tt-project home read-only still runs `ttp machines change add` and `close` as usual: the CLI then queues the request in the project's own state, and the project's daemon records it within a few minutes (`ttp machines change list` shows it as queued until then).
 Running the command again adds nothing. `ttp machines change edit` is not queued (close the entry and add a new one), except `edit <id> --test` or `--no-test`.
 
+Closing your own machine-change entry (with or without an undo) is routine bookkeeping: it needs no upstream note to tt-project. `ttp upstream --fp` is only for a tt-project harness fault; `ttp note --to` only when another project's work needs a request or an answer.
+
 An `--expires` (or `--power-cycle-at`, `ttp machines outage --expires`, a note's or a pause's `--until`) takes a delay (`6h`, `3d`) or an ISO time.
 A time with an offset or `Z` keeps it; a zone-less one (`2026-10-26T15:30`, or a date alone, its midnight) is read in the project's home zone, or with no project in hand the account's `budget.timezone`, else this machine's zone, never UTC by default.
 The confirmation and `ttp machines change list` show the stored end in the home zone with its abbreviation (`15:30 PDT`), so a wrong reading shows at once.
