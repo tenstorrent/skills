@@ -925,9 +925,10 @@ def other_pid_ns() -> bool:
 
 
 def _ancestors() -> set[int]:
-    """The pids above this process, up to init (this process too)."""
+    """The pids above this process, up to and with init (this process too): an agent may be its PID
+    namespace's init (a container's first process, or a test's parent right under `ttp sandbox`)."""
     out, pid = set(), os.getpid()
-    while pid > 1 and pid not in out and len(out) < 256:
+    while pid > 0 and pid not in out and len(out) < 256:
         out.add(pid)
         pid = _parent(pid) or 0
     return out

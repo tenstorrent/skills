@@ -248,3 +248,25 @@ def test_a_run_that_unset_its_environment_still_cannot_say(env, monkeypatch, cap
     cli.main(["say", "demo", "the user's own", "--chat", "c1"])
     assert [r["text"] for r in p.db.q("SELECT text FROM messages WHERE id>? AND direction='in' ORDER BY id", (before,))] == [
         "reused pid", "the user's own"]
+
+
+def test_a_run_whose_agent_is_its_namespaces_init_still_cannot_say(env, monkeypatch, capsys):
+    """The ancestry walk reaches pid 1 too: a run's agent may be its PID namespace's init (a
+    container's first process), as the test's parent is when one pytest process runs right under
+    `ttp sandbox`."""
+    from ttp import cli, locks
+    p = make(env)
+    run_dir = env["tmp"] / "run-agent"
+    run_dir.mkdir()
+    p.db.x("INSERT INTO runs(role,status,started,dir) VALUES('worker','running',?,?)", (time.time(), str(run_dir)))
+    for var in ("TTP_RUN_ID", "TTP_RUN_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(locks.os, "getpid", lambda: 7)
+    monkeypatch.setattr(locks, "_parent", {7: 1, 1: 0}.get)
+    monkeypatch.setattr("ttp.runner.proc_start", lambda pid: "init-start" if pid == 1 else None)
+    assert locks._ancestors() == {7, 1}
+    (run_dir / "child.pid").write_text("1\ninit-start\n")
+    before = p.db.one("SELECT COALESCE(MAX(id),0) n FROM messages")["n"]
+    assert _say(cli, "demo", "approve it", "--chat", "c1") == 2
+    assert "refused inside a run" in capsys.readouterr().err
+    assert not p.db.q("SELECT id FROM messages WHERE id>?", (before,))
