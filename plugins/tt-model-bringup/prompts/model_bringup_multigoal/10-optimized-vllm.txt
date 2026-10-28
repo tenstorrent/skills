@@ -21,7 +21,7 @@ Goal completion requirements:
 - Token, position, RoPE, page-table, cache, and sampler trace inputs are persistent device tensors. Refresh them only when scheduler state changes. Stale-input tests cover changed token/current-position and changed/unchanged page tables.
 - No Tracy, tt-perf-report, or device/adapter profiler here; use benchmark JSON, sampling tests, stale-input, async, and no-host-fallback evidence.
 - Runtime fallback and cleanup clean: no unnecessary torch conversions, tilize/untilize, reshard, blocking readback, standalone-cache assumption, or leftover EngineCore process.
-- Batched prefill: `prefill_burst` TTFT ratio against the serial path meets the $vllm-integration gate; single-user TTFT/TPOT within 5%; the resume check still passes.
+- Batched prefill: `prefill_burst` TTFT ratio against the serial path meets the $vllm-integration gate; single-user TTFT/TPOT within 5%; resume check (or exclusion row) still holds.
 - optimized_vllm README/work_log record commands, before/after single-user and CI burst metrics, full-model comparison, trace/async decisions, rejected options, limitations, artifacts.
 - Relevant $optimize checklist items are completed with evidence for the vLLM serving path.
 - Use $tt-enable-tracing for trace capture, nonblocking replay, async readback, stale inputs, or serving trace correctness.
