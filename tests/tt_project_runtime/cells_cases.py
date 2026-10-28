@@ -459,6 +459,33 @@ def test_rejudge_never_clears_a_mark_the_cells_or_a_project_check_still_earn(env
     assert p.db.task(tid2)["result"] == row and p.db.task(hop2)["status"] == "queued"
 
 
+def test_rejudge_keeps_a_true_mark_on_a_failed_task_and_adds_none(env, monkeypatch, capsys):
+    """A partial task requeued and its run reaped as failed keeps its stored hand-off: the cells verdict
+    still runs on it, so a mark the cells earn is updated, never cleared, and its hop stays queued."""
+    from ttp import cells
+    p = make(env)
+    tid, hop = _wrongly_partial(env, p, monkeypatch, dict(ALL_CELLS, cells=["150W", "200W"]))
+    p.db.update_task(tid, status="failed")
+    code, out = _rejudge(p, capsys, tid)
+    got = load_result(p.db.task(tid)["result"])
+    assert code == 0 and got["summary"] == "partial: 2 of 3 cells (missing: 250W). measured the sweep", (out, got)
+    assert got["cells_checked"] is True and p.db.task(hop)["status"] == "queued", out
+    assert any(f.get("title") == cells.hop_title(p.db.task(tid)) for f in got.get("followups") or [])
+    assert p.db.task(tid)["status"] == "failed"
+    # A wrong mark on a failed task whose cells all finished is still cleared.
+    tid2, hop2 = _wrongly_partial(env, p, monkeypatch, ALL_CELLS, title="second sweep")
+    p.db.update_task(tid2, status="failed")
+    code, out = _rejudge(p, capsys, tid2)
+    assert code == 0 and load_result(p.db.task(tid2)["result"])["summary"] == "measured the sweep", out
+    assert p.db.task(hop2)["status"] == "cancelled"
+    # A failed task the daemon never marked gets no mark (the daemon marks only done hand-offs).
+    tid3 = p.db.add_task("third sweep", SWEEP, origin="coordinator")
+    row = json.dumps({"status": "failed", "summary": "box died", "cells": ["150W"]})
+    p.db.update_task(tid3, status="failed", result=row)
+    code, out = _rejudge(p, capsys, tid3)
+    assert code == 0 and "nothing to change" in out and p.db.task(tid3)["result"] == row, out
+
+
 def test_rejudge_is_refused_for_an_unfinished_task_or_from_another_projects_run(env, monkeypatch, capsys):
     p = make(env)
     tid = p.db.add_task("still queued", SWEEP, origin="coordinator")

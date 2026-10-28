@@ -9,9 +9,10 @@ check (cells.check and cells.prefix on the task's `cells:` line) and the project
 marks. A failing project check leaves the record as it is. Else, when the cells verdict changed, the
 summary's prefix and the daemon's keys (cells.FIELD's seal `cells_checked`, cells.NO_HOP) are rewritten
 to what the daemon stores today; a mark the cells still earn is kept or updated, never dropped, so a
-task is never passed as complete on a failing check. A cleared mark also drops the daemon's `continue:`
-follow-up for the missing cells: its hop is cancelled when it never started, else kept and reported,
-and a proposal still waiting for the coordinator is marked handled. The before and after go into a
+task is never passed as complete on a failing check, done or failed (a failed task gets no new mark).
+A cleared mark also drops the daemon's `continue:` follow-up for the missing cells: its hop is cancelled
+when it never started, else kept and reported, and a proposal still waiting for the coordinator is
+marked handled. The before and after go into a
 `task_rejudged` event and the result's REJUDGED key. The task's status never changes. A second run finds
 the same verdict and changes nothing; a dry run writes nothing."""
 from __future__ import annotations
@@ -72,9 +73,12 @@ def rejudge(p, cfg: dict, task_id: int, dry_run: bool = False, why: str = "") ->
         lines.append(f"hand-off check '{bad['name']}' still fails, so the record is left as it is:\n"
                      f"{handoffcheck.event_tail(bad['output'])}")
         return lines, 1
-    chk = cells.check(t.get("spec"), hand) if t["status"] == "done" and t["kind"] != "review" else None
+    # Every task it accepts gets the cells verdict: a failed task (a partial one requeued, its run reaped)
+    # keeps the mark its done hand-off earned. The daemon marks only done hand-offs, so a failed task
+    # with no mark gets none.
+    chk = cells.check(t.get("spec"), hand) if t["kind"] != "review" else None
     new_mark = cells.prefix(chk)
-    if new_mark == old_mark:
+    if new_mark == old_mark or (new_mark and not old_mark and t["status"] != "done"):
         lines.append("the checks give the verdict already on record; nothing to change")
         return lines, 0
     after = {k: v for k, v in result.items() if k not in DAEMON_KEYS}
