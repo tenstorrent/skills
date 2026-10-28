@@ -4644,7 +4644,9 @@ def cmd_detach(a) -> None:
     `--results <glob>` (relative to the job's working dir) declares the files the job writes per finished
     unit: kept in its detached.json entry (a relaunch keeps it), each new match counts as a result report
     from the job for its task's obligations (obligations._job_results). A task that owns an open
-    obligation and starts a job without it is reminded to report results (_results_reminder)."""
+    obligation and starts a job without it is reminded to report results (_results_reminder).
+    `--spend-cmd <cmd> --spend-cap <usd> [--spend-every <s>]` (together) has the daemon read a paid-API
+    job's spend model-free and stop it at the cap (spendcap.py)."""
     from . import detach, jobuse
     from . import locks as lk
     from .push import _boxed, _own_ttp
@@ -4686,6 +4688,12 @@ def cmd_detach(a) -> None:
         die("--results is for a local job: the daemon reads its result files here")
     if results is not None and (not results.strip() or Path(results).is_absolute()):
         die("--results needs a glob relative to the job's working dir, e.g. 'out/*.json'")
+    from . import spendcap
+    spend_opts = (getattr(a, "spend_cmd", None), getattr(a, "spend_cap", None), getattr(a, "spend_every", None))
+    if any(x is not None for x in spend_opts) and (a.remote or a.check is not None):
+        die("--spend-cmd, --spend-cap and --spend-every are for a local job: the daemon here reads its spend")
+    if why := spendcap.options_error(*spend_opts):
+        die(why)
     rhost = getattr(a, "remote_host", None)
     if (getattr(a, "remote_pid", None) or getattr(a, "remote_marker", None)) and not rhost:
         die("--remote-pid and --remote-marker go with --remote-host <ssh alias>")
@@ -4772,6 +4780,7 @@ def cmd_detach(a) -> None:
                  **({"remote": remote} if remote else {}),
                  **({"locks": job_locks} if job_locks else {}),
                  **({"results": results, "cwd": os.getcwd()} if results else {}),
+                 **({"spend": spendcap.entry(*spend_opts)} if spend_opts[0] is not None else {}),
                  "requested": jobuse.requested(asked, os.environ, getattr(a, "cores", None),
                                                getattr(a, "devices", None), getattr(a, "mem_gb", None),
                                                _job_base_env(state))})
@@ -4780,6 +4789,8 @@ def cmd_detach(a) -> None:
     print(f"detached {a.name} {how}\nlog: {logf}\nrc:  {rc}\n"
           + (f"locks: {','.join(job_locks)} (taken all or nothing before the command starts, held until it "
              f"ends; a paused one ends the job with exit 75)\n" if job_locks else "")
+          + (f"spend cap: ${spend_opts[1]:.2f}, read every {spendcap.entry(*spend_opts)['every']} s by the daemon\n"
+             if spend_opts[0] is not None else "")
           + (f"results: each new file matching {results} under {os.getcwd()} counts as a result report\n"
              if results else _results_reminder(state))
           + f"hand off: status waiting, retry_when \"{lk.job_probe([rc], _own_ttp())}\"")
@@ -4956,7 +4967,8 @@ def _start_options(a) -> None:
     words = list(a.command or [])
     known = {"--cores": int, "--devices": int, "--mem-gb": float, "--resumable": None, "--lock": list,
              **({"--dir": str} if a.remote else {"--remote-host": str, "--remote-pid": str, "--remote-marker": str,
-                                                  "--results": str})}
+                                                  "--results": str, "--spend-cmd": str, "--spend-cap": float,
+                                                  "--spend-every": int})}
     while words and words[0].startswith("-") and words[0] != "--":
         w = words.pop(0)
         key, eq, val = w.partition("=")
@@ -8886,6 +8898,15 @@ def main(argv: list[str] | None = None) -> None:
                    help="files the job writes per finished unit, relative to its working dir (e.g. 'out/*.json'): "
                    "each new match counts as a result report from the job, keeping an obligation its task owns on "
                    "time with no `ttp progress report result` in the driver")
+    s.add_argument("--spend-cmd", metavar="CMD",
+                   help="with --spend-cap, for a job that calls a paid API: a shell command printing one number, the "
+                   "job's spend so far in USD; while the job runs the daemon runs it model-free from the project "
+                   "root every --spend-every s, stops the job's process group once a read reaches the cap and raises "
+                   "one event; 3 failed reads in a row raise one event and leave the job running. Only the number "
+                   "and a failure reason are logged, never its output or environment (it may use `ttp secret env`)")
+    s.add_argument("--spend-cap", type=float, metavar="USD", help="with --spend-cmd: the job's spend cap in USD")
+    s.add_argument("--spend-every", type=int, metavar="S",
+                   help="with --spend-cmd: seconds between spend reads (default 300, at least 60)")
     s.add_argument("--cores", type=int, help="cores the job is meant to keep busy (default: read from -j N, "
                    "--jobs/--threads/--workers N, OMP_NUM_THREADS); the daemon flags sustained under-use")
     s.add_argument("--devices", type=int, help="devices the job is meant to use")

@@ -289,8 +289,9 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
 - A detached job calling a paid model API (benchmark, eval, batch run, hosted endpoint) is not
   metered by the daemon. Before it fans out: turn on prompt caching where supported and check the
   first unit reads cache; cap each unit's cost and calls (stop it, record it `capped`, apart from
-  failures and timeouts); start no unit near a known daily or key limit, never raise one. Report
-  its spend in the hand-off.
+  failures and timeouts); start no unit near a known daily or key limit, never raise one. If its
+  spend is readable, add `--spend-cmd "<cmd printing USD so far>" --spend-cap <usd>`: the daemon
+  stops it at the cap. Report its spend in the hand-off.
 <!-- /ttp:if wait -->
 - Write large results incrementally, flushing before any host reset.
 - Keep runs short: a run re-reads its whole context on every call. When the work exceeds one run

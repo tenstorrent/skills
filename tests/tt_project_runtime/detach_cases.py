@@ -955,3 +955,166 @@ def test_result_file_glob_resolves_literal_dotdot_and_whole_paths(tmp_path):
     now = _t.time()
     got = ob._result_file({"results": "../res/*.json", "cwd": job, "started": now - 60}, now + 1)
     assert got[1] == "../res/r.json"
+
+
+# `ttp detach --spend-cmd/--spend-cap`: the daemon's model-free spend cap (spendcap.py). Every process
+# signalled is a job this test started.
+
+def _spend_run(p, tid):
+    run_dir = p.runs / f"spend-{tid}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time() - 60, "running", str(run_dir)))
+    return run_dir
+
+
+def _spend_job(p, run_dir, name, *opts):
+    """Start `ttp detach [opts] <name> -- sleep 60` in run_dir; its (rc, pgid, stdout)."""
+    r = _ttp_run(p, "detach", *opts, name, "--", "sleep", "60", env={"TTP_RUN_DIR": str(run_dir)})
+    assert r.returncode == 0, r.stderr
+    rc = (run_dir / f"{name}.rc").resolve()
+    assert _wait_for_path(rc.with_suffix(".started"))
+    return rc, int(rc.with_suffix(".started").read_text().split()[0]), r.stdout
+
+
+def _spend_events(p):
+    return p.db.q("SELECT * FROM events WHERE kind LIKE 'detached_job_spend%' ORDER BY id")
+
+
+def _spend_state(run_dir, name):
+    (j,) = [j for j in json.loads((run_dir / "detached.json").read_text()) if j["name"] == name]
+    return j["spend"]
+
+
+def test_a_spend_cap_reached_stops_only_that_jobs_group_and_raises_one_event(env, tmp_path):
+    from ttp import jobstop, locks as lk, progress, spendcap
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid = p.db.add_task("bench", "s", kind="work", tier="light", origin="user")
+    run_dir = _spend_run(p, tid)
+    rc, pgid, out = _spend_job(p, run_dir, "paid", "--spend-cmd", "echo '$12.50'", "--spend-cap", "10",
+                               "--spend-every", "60")
+    rc2, pgid2, _ = _spend_job(p, run_dir, "other")
+    try:
+        assert "spend cap: $10.00, read every 60 s" in out
+        Daemon(p.base).tend_pushes()   # the daemon's tick runs the check
+        assert lk.any_free([lk.job_lock(rc)]) and not jobstop.members(pgid)
+        assert "spend cap" in rc.with_suffix(".lost").read_text()
+        assert jobstop.running(rc2) and jobstop.members(pgid2)   # the other job is untouched
+        (ev,) = _spend_events(p)
+        assert (ev["kind"], ev["severity"], ev["status"], ev["task"]) == (spendcap.CAP_EVENT, "normal", "queued", tid)
+        assert "paid" in ev["text"] and "$12.50" in ev["text"] and "$10.00" in ev["text"]
+        (rep,) = [r for r in progress.entries(p.state) if r["kind"] == "failure"]
+        assert rep["key"] == "paid" and rep["reason"] == "spend cap" and rep["job"] == str(rc)
+        assert _spend_state(run_dir, "paid")["capped"] is True
+        # Once: a later pass neither reads nor raises again.
+        assert spendcap.tend(p, now=time.time() + 3600) == [] and len(_spend_events(p)) == 1
+    finally:
+        _end_group(pgid)
+        _end_group(pgid2)
+
+
+def test_a_failing_spend_command_never_stops_the_job_and_raises_one_event_per_streak(env, tmp_path, monkeypatch):
+    from ttp import jobstop, spendcap
+    p = make(env)
+    monkeypatch.setattr(spendcap, "TIMEOUT_S", 1)
+    tid = p.db.add_task("bench", "s", kind="work", tier="light", origin="user")
+    run_dir = _spend_run(p, tid)
+    script = tmp_path / "spend.sh"
+    script.write_text("exit 3\n")
+    rc, pgid, _ = _spend_job(p, run_dir, "paid", "--spend-cmd", f"sh {shlex.quote(str(script))}",
+                             "--spend-cap", "5")
+    t = time.time()
+    try:
+        # A non-zero exit, a timeout and output that is not one number each count; the third raises.
+        for k, body in enumerate(["exit 3\n", "sleep 5\n", "echo 'about 3 dollars'\n"]):
+            script.write_text(body)
+            spendcap.tend(p, now=t + (k + 1) * 301)
+            assert len(_spend_events(p)) == (1 if k == 2 else 0)
+        script.write_text("echo nope\n")
+        spendcap.tend(p, now=t + 4 * 301)
+        (ev,) = _spend_events(p)
+        assert ev["kind"] == spendcap.FAIL_EVENT and ev["severity"] == "normal" and ev["status"] == "queued"
+        assert "paid" in ev["text"] and "3 times in a row" in ev["text"] and "about 3 dollars" not in ev["text"]
+        assert jobstop.running(rc) and jobstop.members(pgid)
+        # Not due yet: the cadence holds (default 300 s).
+        script.write_text("echo 1\n")
+        spendcap.tend(p, now=t + 4 * 301 + 10)
+        assert _spend_state(run_dir, "paid")["fails"] == 4
+        # A good read resets the count; a new streak of three raises a new event.
+        spendcap.tend(p, now=t + 5 * 301)
+        assert _spend_state(run_dir, "paid")["fails"] == 0 and _spend_state(run_dir, "paid")["read"] == 1.0
+        script.write_text("exit 1\n")
+        for k in range(6, 9):
+            spendcap.tend(p, now=t + k * 301)
+        assert len(_spend_events(p)) == 2 and jobstop.running(rc)
+    finally:
+        _end_group(pgid)
+
+
+def test_a_job_without_spend_options_is_never_checked(env, tmp_path, monkeypatch):
+    from ttp import jobstop, spendcap
+    p = make(env)
+    tid = p.db.add_task("bench", "s", kind="work", tier="light", origin="user")
+    run_dir = _spend_run(p, tid)
+    rc, pgid, out = _spend_job(p, run_dir, "plain")
+    calls = []
+    monkeypatch.setattr(spendcap, "read", lambda *a, **k: calls.append(a) or (99.0, ""))
+    try:
+        assert "spend cap" not in out
+        assert "spend" not in json.loads((run_dir / "detached.json").read_text())[0]
+        assert spendcap.tend(p, now=time.time() + 3600) == [] and calls == []
+        assert jobstop.running(rc) and not _spend_events(p)
+    finally:
+        _end_group(pgid)
+
+
+def test_detach_refuses_a_spend_command_without_a_cap_and_the_reverse(env, tmp_path):
+    p = make(env)
+    run_dir = p.runs / "spend-usage"
+    run_dir.mkdir(parents=True)
+    bad = [["--spend-cmd", "echo 1"], ["--spend-cap", "5"], ["--spend-every", "300"],
+           ["--spend-cmd", "echo 1", "--spend-cap", "0"], ["--spend-cmd", "echo 1", "--spend-cap", "nan"],
+           ["--spend-cmd", " ", "--spend-cap", "5"],
+           ["--spend-cmd", "echo 1", "--spend-cap", "5", "--spend-every", "5"]]
+    for opts in bad:
+        r = _ttp_run(p, "detach", *opts, "job", "--", "true", env={"TTP_RUN_DIR": str(run_dir)})
+        assert r.returncode != 0 and "--spend" in r.stderr, (opts, r.stderr)
+    # Also after the name, where the options are taken back out of the command's words.
+    r = _ttp_run(p, "detach", "job", "--spend-cap", "5", "--", "true", env={"TTP_RUN_DIR": str(run_dir)})
+    assert r.returncode != 0 and "--spend-cmd and --spend-cap go together" in r.stderr
+    r = _ttp_run(p, "detach", "--remote", "box", "--spend-cmd", "echo 1", "--spend-cap", "5", "job", "--", "true",
+                 env={"TTP_RUN_DIR": str(run_dir)})
+    assert r.returncode != 0 and "local job" in r.stderr
+    assert not list(run_dir.iterdir())   # nothing started or recorded
+
+
+def test_the_spend_check_never_logs_the_commands_output_or_environment(env, tmp_path, monkeypatch):
+    from ttp import jobstop, spendcap
+    p = make(env)
+    secret = "sk-test-not-a-real-key-4126"
+    monkeypatch.setenv("PAID_API_KEY", secret)   # in the daemon's environment, as `ttp secret env` would set it
+    tid = p.db.add_task("bench", "s", kind="work", tier="light", origin="user")
+    run_dir = _spend_run(p, tid)
+    script = tmp_path / "spend.sh"
+    script.write_text('echo "$PAID_API_KEY"; echo "$PAID_API_KEY" >&2; exit 1\n')
+    rc, pgid, _ = _spend_job(p, run_dir, "paid", "--spend-cmd", f"sh {shlex.quote(str(script))}",
+                             "--spend-cap", "5")
+    t = time.time()
+    try:
+        for k in range(3):
+            spendcap.tend(p, now=t + (k + 1) * 301)
+        script.write_text('echo "$PAID_API_KEY"\n')   # the key and no number
+        spendcap.tend(p, now=t + 4 * 301)
+        script.write_text('echo "$PAID_API_KEY" >&2; echo 7.25\n')
+        lines = spendcap.tend(p, now=t + 5 * 301)
+        assert lines and secret not in "".join(lines)
+        assert [e["kind"] for e in _spend_events(p)] == [spendcap.FAIL_EVENT, spendcap.CAP_EVENT]
+        assert not jobstop.running(rc)
+        rows = [dict(r) for t in ("events", "messages", "kv") for r in p.db.q(f"SELECT * FROM {t}")]
+        assert secret not in json.dumps(rows, default=str)
+        for f in p.state.rglob("*"):
+            if f.is_file() and not f.name.endswith((".db", ".db-wal", ".db-shm")):
+                assert secret.encode() not in f.read_bytes(), f
+    finally:
+        _end_group(pgid)
