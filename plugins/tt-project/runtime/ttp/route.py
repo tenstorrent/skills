@@ -7,8 +7,15 @@ Off unless project.json sets `providers.chat.tiers.<tier>.route: true` next to t
 A worker run of a routed tier starts on chat when its task pins no provider or model and the start is
 no tier-up retry; reviews and coordinator turns never route. The run's note gets a `route` entry:
 the tier, where it was routed (`to`, `model`), its `fallback` reason (none, down, error, rate_limit,
-auth or busy), whether its spend is `priced`, its wall time and, when the model has effort_fields
-(chatbridge.py), the `effort` it ran at with the fields sent and whether the endpoint `rejected` them.
+auth, malformed, timeout, failed, no_handoff, busy or rerun, with a short `cause` for a run's own end),
+whether its spend is `priced`, its wall time and, when the model has effort_fields (chatbridge.py), the
+`effort` it ran at with the fields sent and whether the endpoint `rejected` them.
+
+Effort: a routed run runs at its tier's `providers.chat.tiers.<tier>.effort`, and every request carries
+the fields `providers.chat.effort_fields` gives its model at that effort; config_problems names a
+routed tier whose requests would carry none. Time limit: `providers.chat.tiers.<tier>.route_timeout_s`
+replaces the tier's budget.run_timeout_s for its routed runs (timeout_s); a fallback start on the core
+provider keeps the tier default.
 
 Slots: a routed start takes a worker slot under the routed-to provider's gate (its max_parallel,
 allow_new_work, pause and net hold), never the core provider's; when that has no room the run starts
@@ -16,9 +23,14 @@ on the core provider, under the core gate, with fallback `busy` (no fault: no co
 
 Fallback: a routed run that ended on an endpoint fault (unreachable or timed out: down; 5xx or a
 missing model: error; 429 or rate-limit wording: rate_limit; a refused key: auth, through the auth
-gate) ends as `fallback` (or `limit`/`auth`), costs no attempt and requeues at the same tier; the
-endpoint then cools down for `providers.chat.route_cooldown_s` (COOLDOWN_S), during which the
-tier's runs start on the core provider. A run that failed on its merits is not a fallback.
+gate; an answer that is not JSON: malformed) ends as `fallback` (or `limit`/`auth`), costs no attempt
+and requeues at the same tier; the endpoint then cools down for `providers.chat.route_cooldown_s`
+(COOLDOWN_S), during which the tier's runs start on the core provider. A routed run that ended without
+a hand-off on its own (own_cause: timed out or stalled: timeout; a failed exit or a refused request:
+failed; a clean exit without a valid result.json: no_handoff) falls back the same way, with no
+cool-down: the endpoint is fine, the run was not. Its task's later runs start on the core provider
+(`rerun`), so a task falls back on its own at most once. A run that handed off (even `failed`) ended
+on its merits: no fallback; a failed light try is retried a tier up as usual.
 """
 from __future__ import annotations
 
@@ -30,8 +42,10 @@ KEY = "route"               # the run note's entry
 COOL = "route_cooldown:"    # kv: {"until", "reason", "run"} per routed-to provider
 REJECTED = "route_effort_rejected:"   # kv: <model>|<effort> whose effort_fields an endpoint rejected (logged once)
 COOLDOWN_S = 900
-FAULTS = ("down", "error", "rate_limit", "auth")
-REASONS = ("none", *FAULTS, "busy")   # busy: the routed-to provider had no free slot (its gate), no fault
+FAULTS = ("down", "error", "rate_limit", "auth", "malformed")
+RUN_CAUSES = ("timeout", "failed", "no_handoff")   # a routed run's own end without a hand-off (own_cause)
+# busy: the routed-to provider had no free slot (its gate), no fault; rerun: the task fell back on its own before.
+REASONS = ("none", *FAULTS, *RUN_CAUSES, "busy", "rerun")
 # Run ends a bridge fault turns into a fallback; any other end is the run's own.
 FAULT_ENDS = ("failed", "request_error", "timeout", "stalled")
 
@@ -45,6 +59,14 @@ def target(cfg: dict, tier: str) -> tuple[str, str] | None:
     if not isinstance(t, dict) or t.get("route") is not True or not str(t.get("model") or ""):
         return None
     return TO, str(t["model"])
+
+
+def timeout_s(cfg: dict, tier: str) -> float | None:
+    """The tier's routed run time limit (providers.chat.tiers.<tier>.route_timeout_s), or None: the
+    tier's budget.run_timeout_s applies."""
+    t = (((cfg.get("providers") or {}).get(TO) or {}).get("tiers") or {}).get(tier) or {}
+    v = t.get("route_timeout_s") if isinstance(t, dict) else None
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else None
 
 
 def eligible(task: dict, picked: dict | None) -> bool:
@@ -93,6 +115,24 @@ def fell_back(status: str, exit_info: dict) -> str:
     if str(exit_info.get("launch_error") or "").find("chat bridge:") >= 0:
         return "error"   # the bridge could not start (not a key fault: that is auth)
     return ""
+
+
+def own_cause(status: str) -> str:
+    """Why a routed run that handed off nothing falls back on its own (RUN_CAUSES), '' for an end that
+    is no fallback (killed, out of budget, lost, a limit or the auth gate)."""
+    return {"timeout": "timeout", "stalled": "timeout", "failed": "failed", "request_error": "failed",
+            "ok": "no_handoff"}.get(status, "")
+
+
+def fell_back_before(db, task_id: int) -> int | None:
+    """The task's routed run that fell back on its own (RUN_CAUSES), or None: its later runs start on
+    the core provider."""
+    for r in db.q("SELECT id, provider, note FROM runs WHERE task=? AND role='worker' AND note LIKE ? "
+                  "ORDER BY id DESC", (task_id, f'%"{KEY}"%')):
+        e = of(r["note"]) or {}
+        if e.get("fallback") in RUN_CAUSES and r["provider"] == e.get("to"):
+            return int(r["id"])
+    return None
 
 
 def price(cfg: dict, prov: str, model: str, usage) -> bool:
@@ -222,7 +262,21 @@ def config_problems(raw: dict) -> list[str]:
                 out.append(f"providers.{TO}.tiers.{tier}.route: set providers.{TO}.tiers.{tier}.model too; not routed")
             elif t["route"] and (raw.get("core_provider") or "claude") == TO:
                 out.append(f"providers.{TO}.tiers.{tier}.route: {TO} is the core provider; nothing to route")
-    v = (provs.get(TO) or {}).get("route_cooldown_s") if isinstance(provs.get(TO), dict) else None
+    chat = provs.get(TO) if isinstance(provs.get(TO), dict) else {}
+    for tier, t in ((chat.get("tiers") or {}).items() if isinstance(chat.get("tiers"), dict) else ()):
+        if not isinstance(t, dict):
+            continue
+        v = t.get("route_timeout_s")
+        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0):
+            out.append(f"providers.{TO}.tiers.{tier}.route_timeout_s: give seconds (more than 0); "
+                       "the tier's budget.run_timeout_s is used")
+        if t.get("route") is True and str(t.get("model") or "") and (raw.get("core_provider") or "claude") != TO:
+            from .chatbridge import effort_fields
+            if not effort_fields(chat, str(t["model"]), str(t.get("effort") or "")):
+                out.append(f"providers.{TO}.tiers.{tier}: its routed requests carry no reasoning effort; set "
+                           f"providers.{TO}.tiers.{tier}.effort and providers.{TO}.effort_fields.<model>.<effort> "
+                           '(such as {"reasoning_effort": "low"})')
+    v = chat.get("route_cooldown_s")
     if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
         out.append(f"providers.{TO}.route_cooldown_s: give seconds (0 or more); {COOLDOWN_S} is used")
     return out

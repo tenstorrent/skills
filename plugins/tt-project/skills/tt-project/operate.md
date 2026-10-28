@@ -100,7 +100,9 @@
 - A run cut off before it reports its cost counts at an estimate, labelled as such.
 - Tier routing (off by default): `providers.chat.tiers.<tier>.route: true` sends that tier's unpinned
   worker runs to the OpenAI-compatible `chat` provider; endpoint faults fall back to the core provider
-  with no attempt spent and a cool-down (`route_cooldown_s`, default 900). Spend uses `pricing.chat`
+  with no attempt spent and a cool-down (`route_cooldown_s`, default 900). A routed run that times out,
+  fails or ends without a valid hand-off also falls back, once per task, recorded with its cause. Per
+  tier: `effort` with `effort_fields` sets the reasoning effort sent; `route_timeout_s` the time limit. Spend uses `pricing.chat`
   (unpriced: $0, labelled). `ttp status` shows a `routed 24h:` phrase; `ttp stats --runs --tier <t>` lists runs.
 - Gates tighten as spend rises: `green` → `yellow` → `orange` → `red` (paused).
 - A spend spike far above the project's norm pauses it ("runaway guard").

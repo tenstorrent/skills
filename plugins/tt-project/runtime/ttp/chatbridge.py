@@ -609,6 +609,8 @@ class Bridge:
                 try:
                     data = json.loads(resp.read())
                 except ValueError:
+                    self.last_fault = "malformed"   # an endpoint fault for routing (route.py), not the run's
+                    self.faults["malformed"] = self.faults.get("malformed", 0) + 1
                     return h._reply(*error_for(502, "the upstream answer is not JSON"))
                 if data.get("error"):
                     return h._reply(*self._fault_reply(_chunk_error(data, self._scrub)))

@@ -3093,8 +3093,12 @@ class Daemon:
             # the same way. The task fails at once (_finish_worker); a resume still starts fresh.
             status = "request_error"
         fell = route.fell_back(status, exit_info) if on_route and not handed_off else ""
+        # A routed run that ended without a hand-off on its own (timed out, failed, no valid result.json)
+        # also falls back, unless a host sleep cut it (lost to the sleep, as any run).
+        own = route.own_cause(status) if on_route and not handed_off and not fell and not slept else ""
+        fell = fell or own
         if fell and status not in ("limit", "auth"):
-            status = "fallback"   # the endpoint failed, not the run: no attempt, the same tier on the core provider
+            status = "fallback"   # the endpoint or the routed run failed: no attempt, the same tier on the core provider
         net_lost = status in SLEEP_CUT and bool(NET_LOST_RE.search(usage.error or ""))
         if net_lost:
             self.hold_offline(r["provider"], f"run {r['id']} could not reach its API")
@@ -3103,6 +3107,7 @@ class Daemon:
         note = json.loads(r["note"] or "{}")
         if routed:
             note[route.KEY] = {**routed, **({"fallback": fell} if fell else {}),
+                               **({"cause": _route_cause(stopped or status, exit_info, usage, run_dir)} if own else {}),
                                **({"priced": priced} if priced is not None else {}),
                                "wall_s": round(float(exit_info.get("ended") or time.time()) - float(r["started"] or 0), 1)}
             sent = route.effort_entry(exit_info.get("bridge") or {}) if on_route else None
@@ -3112,7 +3117,7 @@ class Daemon:
                     db.set_kv(seen, {"run": r["id"], "ts": time.time()})   # logged once per model and effort
                     log(self.p, f"route: {r['model']} rejected its effort_fields at effort "
                                 f"{sent['effort'] or '-'} ({', '.join(sent['fields'])}); run {r['id']} went on without them")
-            if fell:
+            if fell and not own:   # an endpoint fault cools the endpoint; a run's own end only its task
                 route.cool(db, self.cfg, routed["to"], fell, r["id"], time.time())
         if "split" not in note:   # the split steer may have fired after `r` was read
             split = json.loads((db.one("SELECT note FROM runs WHERE id=?", (r["id"],)) or {}).get("note") or "{}")
@@ -6381,6 +6386,8 @@ class Daemon:
             if routed and routed["fallback"] == "none":
                 routed["fallback"] = self._no_room(routed["to"], ctx) or "none"
             run_prov = routed["to"] if routed and routed["fallback"] == "none" else provider
+            if run_prov != provider and (limit := route.timeout_s(self.cfg, tier)):
+                routed["timeout_s"] = limit   # the tier's routed run time limit, in place of its run_timeout_s
             if run_prov != ctx["slot"].get(task["id"], provider):
                 # Its tier or the route changed after the slot check: it takes a slot where it runs.
                 why = self._start_hold(task, run_prov, ctx, reserve=True, reroute=False)
@@ -6431,6 +6438,7 @@ class Daemon:
                 db.update_task(task["id"], status="running", branch=branch, blocked_reason=None)
                 self.start_run("worker" if task["kind"] != "review" else "reviewer", prompt, run_prov, tier, cwd,
                                task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] else None,
+                               timeout_s=(routed or {}).get("timeout_s"),
                                read_only=False, append_system=system, note=note,
                                resume=lost["session"] if lost else None)
             except Exception as e:
@@ -6613,6 +6621,9 @@ class Daemon:
         if not to or not route.eligible(task, picked):
             return None
         name, model = to
+        after = route.fell_back_before(self.p.db, task["id"]) if task.get("id") else None
+        if after:   # the task fell back on its own once: the rest of its runs stay on the core provider
+            return {"tier": tier, "to": name, "model": model, "fallback": "rerun", "after": after}
         why = route.cooling(self.p.db, name, now)
         if not why and self._logged_out(name) and not self._may_probe(name, now):
             why = "auth"   # the auth gate holds it; its one login check may be a routed run
@@ -12334,6 +12345,21 @@ def _daemon_precheck(r: dict, handoff) -> bool:
 def _push_rechecked(task: dict) -> bool:
     """The task's hand-off is back from verify_pushes: its hand-off checks already passed it once."""
     return task.get("status") == "pushing" and pushclaim.KEY in load_result(task.get("result"))
+
+
+def _route_cause(end: str, exit_info: dict, usage, run_dir: Path) -> str:
+    """A short cause for a routed run's own fallback (route.own_cause), for its route record."""
+    if end in ("timeout", "stalled") or end in HUNG_STOPS:
+        return "timed out" if end == "timeout" else "stalled"
+    if not (run_dir / RESULT_FILE).exists():
+        if exit_info.get("rc") == 0 and not usage.error:
+            return "exited without result.json"
+    elif _read_result(run_dir / RESULT_FILE) is None:
+        return "result.json is not a JSON object"
+    elif exit_info.get("rc") == 0 and not usage.error:
+        got = str((_read_result(run_dir / RESULT_FILE) or {}).get("status") or "")[:40]
+        return f"result.json status {got!r} is not a hand-off"
+    return (str(usage.error or "") or f"exit {exit_info.get('rc')}")[:200]
 
 
 def _read_result(path: Path) -> dict | None:

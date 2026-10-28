@@ -34,7 +34,7 @@ class _MockChat:
                         self.wfile.flush()
                     self.wfile.write(b"data: [DONE]\n\n")
                     return
-                data = json.dumps(reply).encode()
+                data = reply if isinstance(reply, bytes) else json.dumps(reply).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
@@ -811,7 +811,7 @@ def test_a_start_whose_tier_leaves_the_route_rechecks_the_core_slots(env, monkey
     assert _route_slots(p, d, monkeypatch, 2, chat_max=2, tag="free") == [(core, None)]
 
 
-def _route_finish(p, d, tid, exit_info, provider="chat"):
+def _route_finish(p, d, tid, exit_info, provider="chat", result=None):
     p.db.update_task(tid, status="running")
     note = {"route": {"tier": "light", "to": "chat", "model": _RT_MODEL, "fallback": "none"}}
     rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) "
@@ -819,6 +819,8 @@ def _route_finish(p, d, tid, exit_info, provider="chat"):
                  (tid, provider, _RT_MODEL, time.time() - 30, d.boot, json.dumps(note)))
     rd = p.runs / str(rid)
     rd.mkdir(parents=True)
+    if result is not None:
+        (rd / "result.json").write_text(result if isinstance(result, str) else json.dumps(result))
     p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(rd), rid))
     d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
                  {"rc": 1, "started": time.time() - 30, "ended": time.time(), **exit_info})
@@ -870,7 +872,7 @@ def test_a_routed_run_with_a_refused_key_goes_through_the_auth_gate_then_falls_b
     assert prov == d.cfg.get("core_provider", "claude") and note[route.KEY]["fallback"] == "auth"
 
 
-def test_a_routed_run_that_fails_on_its_merits_is_no_fallback(env, monkeypatch):
+def test_a_routed_run_that_hands_off_failed_is_no_fallback(env, monkeypatch):
     from ttp import route
     from ttp.daemon import Daemon
     p = make(env)
@@ -879,15 +881,126 @@ def test_a_routed_run_that_fails_on_its_merits_is_no_fallback(env, monkeypatch):
     d = Daemon(p.base)
     monkeypatch.setattr(d, "observe", lambda *a, **k: None)
     tid = p.db.add_task("build", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
-    # The endpoint answered (an earlier fault cleared by a later reply): the run's own failure.
-    run, task = _route_finish(p, d, tid, {"bridge": {"last_fault": "", "faults": {"error": 1}}})
-    assert run["status"] == "failed" and int(task["attempts"] or 0) == 1
+    # The endpoint answered (an earlier fault cleared by a later reply) and the worker handed off
+    # failed: its own verdict, retried as usual (a tier up), not a fallback.
+    run, task = _route_finish(p, d, tid, {"rc": 0, "bridge": {"last_fault": "", "faults": {"error": 1}}},
+                              result={"status": "failed", "summary": "the approach does not work"})
+    assert run["status"] == "ok" and int(task["attempts"] or 0) == 1
     e = route.of(run["note"])
-    assert e["fallback"] == "none" and e["priced"] is True
-    assert route.cooling(p.db, "chat", time.time()) == ""
+    assert e["fallback"] == "none" and e["priced"] is True and "cause" not in e
+    assert route.cooling(p.db, "chat", time.time()) == "" and route.fell_back_before(p.db, tid) is None
     # A run that fell back to the core provider is booked as usual, not at the chat price.
     run, _ = _route_finish(p, d, tid, {"bridge": {"last_fault": "down"}}, provider=d.cfg.get("core_provider", "claude"))
     assert run["status"] == "failed" and "priced" not in route.of(run["note"])
+
+
+def _dispatch_task(p, d, monkeypatch, tid):
+    """Dispatch with only task `tid` queued; returns (provider, tier, kwargs) of its start."""
+    from ttp import budget as bud
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda role, prompt, provider, tier, cwd, **k: started.append(
+        (provider, tier, k)) or 0)
+    monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.root), None))
+    for prov in (d.cfg.get("core_provider", "claude"), "chat"):
+        d.gates[prov] = bud.Gate(prov, regime="windows", max_parallel=6)
+    p.db.x("UPDATE tasks SET status='done' WHERE status='queued' AND id!=?", (tid,))
+    d.dispatch()
+    return started[-1]
+
+
+@pytest.mark.parametrize("exit_info,result,cause,why", [
+    ({"rc": 1}, None, "failed", "exit 1"),                                    # crashed, no hand-off
+    ({"rc": None, "stopped": "timeout"}, None, "timeout", "timed out"),       # its time limit
+    ({"rc": None, "stopped": "stalled"}, None, "timeout", "stalled"),         # no output for too long
+    ({"rc": 0}, None, "no_handoff", "exited without result.json"),            # a clean exit, nothing handed off
+    ({"rc": 0}, "{not json", "no_handoff", "result.json is not a JSON object"),   # malformed output
+    ({"rc": 0}, {"status": "finished"}, "no_handoff", "result.json status 'finished' is not a hand-off"),
+])
+def test_a_routed_run_that_ends_without_a_hand_off_falls_back_once(env, monkeypatch, exit_info, result, cause, why):
+    from ttp import route
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    core = d.cfg.get("core_provider", "claude")
+    tid = p.db.add_task("build", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    run, task = _route_finish(p, d, tid, {**exit_info, "bridge": {"last_fault": "", "faults": {}}}, result=result)
+    assert run["status"] == "fallback", run["status"]
+    assert task["status"] == "queued" and int(task["attempts"] or 0) == 0 and task["tier"] == "light"
+    e = route.of(run["note"])
+    assert e["fallback"] == cause and e["cause"] == why, e
+    # The endpoint is fine: no cool-down, other tasks still route; this task's next run is on the core
+    # provider at the same tier (at most one free fallback per task), naming the run it follows.
+    assert route.cooling(p.db, "chat", time.time()) == "" and route.fell_back_before(p.db, tid) == run["id"]
+    prov, tier, k = _dispatch_task(p, d, monkeypatch, tid)
+    assert (prov, tier) == (core, "light")
+    assert k["note"][route.KEY] == {"tier": "light", "to": "chat", "model": _RT_MODEL, "fallback": "rerun",
+                                    "after": run["id"]} and k.get("timeout_s") is None
+    prov, _, note = _route_dispatch(p, d, monkeypatch, title="other")
+    assert prov == "chat" and note[route.KEY]["fallback"] == "none"
+    assert f"fell back ({cause} 1)" in route.phrase(p.db)
+
+
+def test_a_routed_run_cut_by_the_budget_or_a_kill_is_no_fallback(env, monkeypatch):
+    from ttp import route
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    for stopped in ("budget", "stopped"):
+        tid = p.db.add_task(f"build {stopped}", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+        run, _ = _route_finish(p, d, tid, {"rc": None, "stopped": stopped, "bridge": {"last_fault": ""}})
+        assert run["status"] != "fallback" and route.of(run["note"])["fallback"] == "none", run["status"]
+        assert route.fell_back_before(p.db, tid) is None
+    assert route.own_cause("lost") == route.own_cause("limit") == route.own_cause("auth") == ""
+
+
+def test_a_routed_run_takes_the_tiers_routed_time_limit(env, monkeypatch):
+    from ttp import route
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.set_config("providers.chat", {"endpoint": "placeholder", "base_url": _RT_URL, "tiers": {
+        "light": {"model": _RT_MODEL, "route": True, "route_timeout_s": 2700},
+        "standard": {"model": _RT_MODEL, "route": True}}})
+    d = Daemon(p.base)
+    tid = p.db.add_task("a", "s", kind="work", tier="light", priority=1, budget_usd=8.0, labels=[])
+    prov, tier, k = _dispatch_task(p, d, monkeypatch, tid)
+    assert (prov, tier, k["timeout_s"]) == ("chat", "light", 2700.0) and k["note"][route.KEY]["timeout_s"] == 2700.0
+    # Unset for the tier: the tier default (start_run's run_timeout_s), as before.
+    tid = p.db.add_task("b", "s", kind="work", tier="standard", priority=1, budget_usd=8.0, labels=[])
+    monkeypatch.setattr(d, "_pick_effort", lambda task, provider: None)
+    prov, tier, k = _dispatch_task(p, d, monkeypatch, tid)
+    assert (prov, tier) == ("chat", "standard") and k.get("timeout_s") is None and "timeout_s" not in k["note"][route.KEY]
+    # A start on the core provider (a cool-down) keeps the tier default too.
+    p.db.set_kv(route.COOL + "chat", {"until": time.time() + 600, "reason": "down"})
+    tid = p.db.add_task("c", "s", kind="work", tier="light", priority=1, budget_usd=8.0, labels=[])
+    prov, _, k = _dispatch_task(p, d, monkeypatch, tid)
+    assert prov == d.cfg.get("core_provider", "claude") and k.get("timeout_s") is None
+    assert route.timeout_s({"providers": {"chat": {"tiers": {"light": {"route_timeout_s": True}}}}}, "light") is None
+    assert route.timeout_s({"providers": {"chat": {"tiers": {"light": {"route_timeout_s": 0}}}}}, "light") is None
+
+
+def test_chatbridge_an_answer_that_is_not_json_is_a_malformed_endpoint_fault(env, monkeypatch, mock_chat):
+    from ttp import route
+    from ttp.chatbridge import Bridge
+    hi = {"max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}
+    up = mock_chat((200, b"<html>gateway</html>"))
+    with Bridge(up.url, _CB_KEY, "m") as b:
+        code, _ = _post(b, hi)
+        st = b.stats()
+    assert code == 502 and st == {"last_fault": "malformed", "faults": {"malformed": 1}}
+    # A routed run that ended on it falls back with the endpoint cooling down, as for any endpoint fault.
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    tid = p.db.add_task("build", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    run, _ = _route_finish(p, d, tid, {"bridge": st})
+    assert run["status"] == "fallback" and route.of(run["note"])["fallback"] == "malformed"
+    assert "cause" not in route.of(run["note"]) and route.cooling(p.db, "chat", time.time()) == "malformed"
 
 
 def test_routed_spend_uses_the_chat_price_or_is_zero_and_unpriced():
@@ -910,7 +1023,8 @@ def test_routed_runs_show_in_status_web_and_stats_runs(env, monkeypatch, capsys)
     d = Daemon(p.base)
     monkeypatch.setattr(d, "observe", lambda *a, **k: None)
     tid = p.db.add_task("build", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
-    _route_finish(p, d, tid, {"rc": 0})
+    _route_finish(p, d, tid, {"rc": 0}, result={"status": "done", "summary": "built"})
+    tid = p.db.add_task("build more", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
     _route_finish(p, d, tid, {"bridge": {"last_fault": "rate_limit"}})
     want = "routed 24h: 2 runs to chat, 1 fell back (rate_limit 1)"
     assert route.phrase(p.db) == want
@@ -937,6 +1051,18 @@ def test_route_config_problems():
     assert "core provider" in route.config_problems({"core_provider": "chat", "providers": {"chat": {
         "tiers": {"light": {"model": "m", "route": True}}}}})[0]
     assert route.cooldown_s({"providers": {"chat": {"route_cooldown_s": "x"}}}) == route.COOLDOWN_S
+    # A routed run time limit must be positive seconds.
+    for bad in (0, -5, "2700", True):
+        got = route.config_problems({"providers": {"chat": {"tiers": {"light": {"route_timeout_s": bad}}}}})
+        assert got and "light.route_timeout_s: give seconds" in got[0], (bad, got)
+    # A routed tier whose requests would carry no reasoning effort is named; one with fields is not.
+    tier = {"model": "m", "route": True, "effort": "low"}
+    got = route.config_problems({"providers": {"chat": {"tiers": {"light": tier}}}})
+    assert got == ["providers.chat.tiers.light: its routed requests carry no reasoning effort; set "
+                   "providers.chat.tiers.light.effort and providers.chat.effort_fields.<model>.<effort> "
+                   '(such as {"reasoning_effort": "low"})']
+    assert route.config_problems({"providers": {"chat": {"tiers": {"light": {**tier, "route_timeout_s": 2700}},
+                                                         "effort_fields": {"m": {"low": {"reasoning_effort": "low"}}}}}}) == []
 
 
 def test_chatbridge_records_endpoint_fault_kinds_without_their_text(mock_chat):
@@ -1124,7 +1250,8 @@ def test_a_routed_run_records_its_effort_fields_logs_a_rejection_once_and_shows_
     monkeypatch.setattr(d, "observe", lambda *a, **k: None)
     tid = p.db.add_task("build", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
     stats = {"last_fault": "", "faults": {}, "effort": "high", "fields": {"reasoning_effort": "xhigh"}}
-    runs = [_route_finish(p, d, tid, {"rc": 0, "bridge": {**stats, "rejected": r}})[0] for r in (True, True, False)]
+    runs = [_route_finish(p, d, tid, {"rc": 0, "bridge": {**stats, "rejected": r}},
+                          result={"status": "done", "summary": "built"})[0] for r in (True, True, False)]
     notes = [json.loads(r["note"])["route"]["effort"] for r in runs]
     assert notes[0] == {"effort": "high", "fields": {"reasoning_effort": "xhigh"}, "rejected": True}
     assert [n["rejected"] for n in notes] == [True, True, False]

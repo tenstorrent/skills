@@ -539,8 +539,16 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    endpoint then cools down for `providers.chat.route_cooldown_s` seconds (default 900), while the
    tier's runs start on the core provider. Routed runs take worker slots under the `chat` gate (its
    `max_parallel`), not the core provider's; when `chat` has no free slot the run starts on the core
-   provider instead, under its gate, with the reason `busy`. A run that fails on its own merits is retried a tier up
-   as usual. Routed spend uses the `pricing.chat` row for the model (or its `default` row:
+   provider instead, under its gate, with the reason `busy`. An answer that is not JSON is an
+   endpoint fault too (`malformed`). A routed run that ends without a hand-off on its own (it timed
+   out or stalled: `timeout`; it failed or its request was refused: `failed`; it exited cleanly with
+   no valid `result.json`: `no_handoff`) also falls back with no attempt spent, but without a
+   cool-down; the task's later runs start on the core provider (`rerun`), so each task falls back
+   this way at most once. Each fallback's reason (and, for a run's own end, a short `cause`) is in
+   the run's `route` record. A run that hands off, even `failed`, is retried a tier up as usual.
+   `"route_timeout_s"` next to a routed tier's `model` sets the time limit of its routed runs in
+   place of the tier's `budget.run_timeout_s`; a start on the core provider keeps the tier default.
+   Routed spend uses the `pricing.chat` row for the model (or its `default` row:
    `[$/M input, cached input, output]`); with no row it is zero and labelled unpriced. `ttp status`
    and the web budget line show the last 24 h as one phrase (`routed 24h: 6 runs to chat, 2 fell
    back (down 1, rate_limit 1)`), and `ttp stats --runs --tier light` lists each run's provider,
@@ -556,6 +564,10 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    request without the fields for the rest of the run, logs it once per model and effort, and the
    run's route record says so. The `ttp status` routing phrase ends with each routed tier's latest
    fields (`; light high: reasoning_effort=xhigh`).
+   A routed run runs at its tier's `effort` (`providers.chat.tiers.<tier>.effort`), so a tier
+   routed with `"effort": "low"` and `"effort_fields": {"<model id>": {"low": {"reasoning_effort": "low"}}}`
+   sends `reasoning_effort: low` on every request. `ttp doctor` names a routed tier whose requests
+   would carry no effort fields.
 
 The key stays in the per-user secrets store and the bridge's upstream requests: the agent gets
 only the bridge's address and a per-run token. Reasoning text from the endpoint is dropped,
