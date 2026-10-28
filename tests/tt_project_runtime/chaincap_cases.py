@@ -119,6 +119,26 @@ def test_a_wording_only_post_landing_continue_is_no_split(env):
     assert not chaincap.post_landing({"title": "continue: deploy", "spec": f"Once #{tid + 1} lands, deploy."}, tid)
 
 
+def test_post_landing_wording_needs_this_task_landing_and_a_live_step_in_that_sentence():
+    """Landing talk about something else ('when ... landing', 'after the push queue reports landing') or a
+    live-step word elsewhere in the spec or in a file name is a real continuation, still a split."""
+    from ttp import chaincap
+    for fup in ({"title": "continue: part 2, the sweep safety net",
+                 "spec": "When a split head's landing is awaited by an open task, queue a review. Then run ttp setup "
+                         "to install it locally and test."},
+                {"title": "continue: wire the landing check",
+                 "spec": "after the push queue reports landing, the daemon marks it; update install.sh"},
+                {"title": "continue: part 2", "spec": "After it lands, the sweep reviews it. Then install it."},
+                {"title": "continue: part 2", "spec": "After it lands, update install.sh and the docs."},
+                {"title": "continue: part 2", "spec": "When it lands, deploy it."},
+                {"title": "continue: part 2", "spec": "After the parser lands, deploy it."}):
+        assert not chaincap.post_landing(fup, 7), fup
+    for fup in ({"title": "continue: deploy", "spec": "Do it after this change is pushed."},
+                {"title": "continue: part 2", "spec": "Write docs. Once #7 has landed, upgrade each box."},
+                {"title": "continue: part 2", "spec": "After the change reaches the push branch, roll it out."}):
+        assert chaincap.post_landing(fup, 7), fup
+
+
 def test_a_continue_titled_to_land_push_or_fix_the_change_is_still_a_split(env):
     from ttp import chaincap
     for title in ("continue: land the change, then deploy", "continue: push it and roll out",

@@ -75,13 +75,15 @@ SPLIT_LABEL = "split:"   # a done code task that ended as a split: split:<its he
 SPLIT_SUMMARY = re.compile(r"(?i)^\W*split\b(?=\s*(?:at|here|mid|after|before|because|per|on|by|[(:;,.]|$))"
                            r"|\bpast the split line\b")
 WIP_SUBJECT = re.compile(r"(?:^|[\s(\[])WIP(?=$|[\s):\]])|\(work in progress\)")
-# A post-landing follow-up's own words (post_landing): it runs after or once the task lands, and does a
-# live step; a title that lands, reviews, pushes, fixes or finishes the change still carries it forward.
-AFTER_LANDING = re.compile(r"(?i)\b(?:after|once|when)\b[^.;:\n]{0,40}?\b(?:lands|landed|landing|is\s+pushed"
-                           r"|reaches\s+the\s+push\s+branch)\b")
-LIVE_STEP = re.compile(r"(?i)\b(?:deploy\w*|(?:re-?)?install\w*|upgrad\w*|roll(?:s|ed|ing)?[\s-]?outs?"
+# A post-landing follow-up's own words (post_landing): 'after' or 'once' this task (it, this task or change,
+# the change, #<id>) lands, and a live step in its title or that sentence; a title that lands, reviews,
+# pushes, fixes or finishes the change still carries it forward.
+AFTER_LANDING = re.compile(r"(?i)\b(?:after|once)\s+(?:it|this\s+(?:task|change)|the\s+change|#(\d+))\s+"
+                           r"(?:lands|has\s+landed|is\s+landed|is\s+pushed|reaches\s+the\s+push\s+branch)\b")
+SENTENCE_END = re.compile(r"[.!?;](?=\s|$)|\n")
+LIVE_STEP = re.compile(r"(?i)\b(?:deploy\w*|(?:re-?)?install\w*|upgrad\w*|roll(?:s|ed|ing)?(?:\s+(?:it|them))?[\s-]?outs?"
                        r"|live\s+(?:check|test|run)\w*|verif\w*\b[^.;\n]{0,40}?\bon\s+(?:a|the|each|every|its)?\s*"
-                       r"(?:host|box|machine|node)s?)\b")
+                       r"(?:host|box|machine|node)s?)\b(?!\.\w)")   # not a file name (install.sh)
 CARRIES = re.compile(r"(?i)^\s*(?:continue|mechanical)\s*:\s*(?:then\s+|and\s+)?(?:re-?)?(?:land|review|push|fix"
                      r"|finish|complete)\w*\b|\b(?:land|review|push|fix|finish)(?:e?s)?\s+(?:it|this|the|its)\b")
 WAIT_KEYS = ("start_when", "retry_when", "wait", "waiting_for")
@@ -285,7 +287,8 @@ def post_landing(fup: dict, task_id: int) -> bool:
     its start_when or wait names the landing (waits_landing, decisive: such a task can never carry the
     work to its landing), or its title and spec say it runs after or once the task lands (AFTER_LANDING,
     no other task id in that phrase) and name a live step (LIVE_STEP), with no title that lands,
-    reviews, pushes, fixes or finishes the change (CARRIES)."""
+    reviews, pushes, fixes or finishes the change (CARRIES). The live step counts only in the title or in
+    the sentence that says so, never anywhere in the spec."""
     fup = fup if isinstance(fup, dict) else {}
     if any(waits_landing(fup.get(k), task_id) for k in WAIT_KEYS):
         return True
@@ -293,8 +296,14 @@ def post_landing(fup: dict, task_id: int) -> bool:
     if CARRIES.search(title):
         return False
     text = f"{title}\n{fup.get('spec') or ''}"
-    return bool(LIVE_STEP.search(text)) and any(
-        all(n == str(task_id) for n in re.findall(r"#(\d+)", m.group(0))) for m in AFTER_LANDING.finditer(text))
+    for m in AFTER_LANDING.finditer(text):
+        if m.group(1) and m.group(1) != str(task_id):
+            continue
+        start = max((e.end() for e in SENTENCE_END.finditer(text, 0, m.start())), default=0)
+        end = SENTENCE_END.search(text, m.end())
+        if LIVE_STEP.search(title) or LIVE_STEP.search(text[start:end.start() if end else len(text)]):
+            return True
+    return False
 
 
 def split_head(task: dict | None) -> str:
