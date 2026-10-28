@@ -1848,6 +1848,7 @@ def _rerun_receipt(p: Project, receipt: Path, rid: str, now: float) -> None:
     m.update(status="rerun", rerun_at=now)
     write_json(receipt, m)
     try:
+        # own session: the rerun deploy outlives this tick, like the after_push run it replaces
         subprocess.Popen(batch.rerun_argv(p, receipt), cwd=str(p.root), stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
                          env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
