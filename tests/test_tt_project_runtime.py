@@ -45244,6 +45244,26 @@ def _job_of_waiting_task(p, tid, requested, next_in=3.7 * 3600):
     return rc, lock
 
 
+def test_a_job_underuse_event_is_muted_by_a_matching_observation_mute(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod, jobuse, screen as scr
+    tid = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
+    rc, lock = _job_of_waiting_task(p, tid, {"cores": 8})
+    try:
+        now = time.time()
+        monkeypatch.setattr(jobuse, "sample", lambda pid, nodes=None: {"cpu": 100.0, "start": "S", "dev": None})
+        scr.mute(p.db, "daemon:job_underuse", "build", 2)
+        p.db.set_kv(jobuse.KV, {str(rc): {"task": tid, "name": "build", "req": {"cores": 8},
+                                          "st": {"ring": [[now - 960, 0.0], [now - 60, 95.0]], "start": "S",
+                                                 "since": now - 960}}})
+        dmod.Daemon(p.base).sample_jobs()
+        ev = p.db.q("SELECT * FROM events WHERE kind='job_underuse' AND task=?", (tid,))
+        assert len(ev) == 1 and ev[0]["status"] == "muted"
+        assert scr.mutes(p.db)[0]["count"] == 1
+    finally:
+        lock.close()
+
+
 def test_the_daemon_flags_an_under_used_job_once_and_pulls_its_next_check_in(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dmod, jobuse

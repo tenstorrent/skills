@@ -8911,11 +8911,13 @@ class Daemon:
         fp = f"job_underuse:{task['id']}:{entry['name']}:{st['under']:.0f}"
         if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
             return
+        text = (f"#{task['id']} {task['title']}: its detached job {entry['name']} {st['why']} ({entry['line']}). "
+                f"Its next check comes within {s['check_cap_s'] / 60:g} min. Decide: let it run, or have it "
+                f"restarted with what it really uses so the cores or device go to other work.")
+        # An active 'daemon:job_underuse' mute covering it: recorded and counted there, no coordinator wake.
+        status = "muted" if scr.count_muted(db, "daemon:job_underuse", text, "normal", now) else "queued"
         db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
-             (now, "daemon", "job_underuse", fp, "normal",
-              f"#{task['id']} {task['title']}: its detached job {entry['name']} {st['why']} ({entry['line']}). "
-              f"Its next check comes within {s['check_cap_s'] / 60:g} min. Decide: let it run, or have it "
-              f"restarted with what it really uses so the cores or device go to other work.", "queued", task["id"]))
+             (now, "daemon", "job_underuse", fp, "normal", text, status, task["id"]))
         log(self.p, f"task {task['id']} job {entry['name']} under-used: {st['why']}")
 
     def _pull_check(self, tid: int, why: str, now: float, s: dict) -> bool:
