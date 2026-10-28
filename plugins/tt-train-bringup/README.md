@@ -12,7 +12,7 @@ Three phases, run in order by `scripts/multigoal` or one at a time by hand:
    layout / glue / wasted / dispatch, cost with training multiplicity, fix the top item by class,
    verify, repeat until the roofline target is met.
 
-Tracy never profiles the full layer stack: profiles are taken at 2, 4 and 8 layers with real shapes,
+Tracy never profiles the full layer stack: profiles are taken at 2, 4, 8 and 16 layers with real shapes,
 fitted to a per-layer plus fixed cost, and projected to the full depth (see the
 [measurement protocol](skills/optimization-loop/SKILL.md#measurement-protocol)).
 

@@ -42,10 +42,10 @@ collect; small shapes are for debugging only.
 
 Before leaving this phase, take the first measurement so the loop has a baseline: an MFU run without
 the profiler on the full model (ms/step, MFU computed with the plan's FLOP count) and Tracy runs at
-2, 4 and 8 layers with real shapes, fitted and projected to the full depth as described in the
+2, 4, 8 and 16 layers with real shapes, fitted and projected to the full depth as described in the
 [optimisation loop's measurement protocol](../optimization-loop/SKILL.md#measurement-protocol).
 Never profile the full layer stack. Create `doc/perf_analysis.md` with the MFU history table (one
-row: composite baseline), the three raw Tracy measurements with their fit and projection, and the
+row: composite baseline), the four raw Tracy measurements with their fit, residuals and projection, and the
 first ranked cost table at projected full depth.
 
 ## Gate

@@ -2,7 +2,7 @@
   "name": "tt-train-bringup",
   "displayName": "Tenstorrent Training Bring-up",
   "version": "0.1.0",
-  "description": "Bring up and optimise training of a Hugging Face model in tt-train on one chip through three phases: plan (kernel inventory, freeze map, roofline target, memory budget), composite bring-up with a PCC harness on the forward and every gradient, and an optimisation loop that classifies every op as useful math, layout, glue, wasted or dispatch, costs it with training multiplicity and fixes it until the roofline target is met. Tracy profiles are taken at 2, 4 and 8 layers and projected to the full depth. Also ships tt-train-pr-review, a strict pre-merge review skill for tt-metal PRs that touch tt-train/. Requires tt-autodebug.",
+  "description": "Bring up and optimise training of a Hugging Face model in tt-train on one chip through three phases: plan (kernel inventory, freeze map, roofline target, memory budget), composite bring-up with a PCC harness on the forward and every gradient, and an optimisation loop that classifies every op as useful math, layout, glue, wasted or dispatch, costs it with training multiplicity and fixes it until the roofline target is met. Tracy profiles are taken at 2, 4, 8 and 16 layers and projected to the full depth. Also ships tt-train-pr-review, a strict pre-merge review skill for tt-metal PRs that touch tt-train/. Requires tt-autodebug.",
   "author": {
     "name": "Tenstorrent"
   },

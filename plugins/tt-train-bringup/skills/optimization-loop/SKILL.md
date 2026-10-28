@@ -15,7 +15,7 @@ Repeat until the roofline target is met or every remaining item is a math kernel
 own roofline.
 
 1. Measure. An MFU run without the profiler gives ms/step and MFU (plan's FLOP count). Tracy runs
-   at 2, 4 and 8 layers (real shapes, every layer kind present at every depth, warm-up steps
+   at 2, 4, 8 and 16 layers (real shapes, every layer kind present at every depth, warm-up steps
    excluded, op-support count sized for the op count) give per-op device time, input shapes with
    padding, and core count; fit per-layer and fixed cost and project to the full depth as in the
    [measurement protocol](#measurement-protocol).
@@ -103,29 +103,34 @@ time, not wall-clock. Never run the watcher and the device profiler together. Us
 `tt-device-usage` for resets and hang triage.
 
 Tracy runs never profile the full depth: an LLM's full layer stack under the profiler is too
-expensive to collect and to analyse. Instead profile the model at three depths and extrapolate:
+expensive to collect and to analyse. Instead profile the model at four depths and extrapolate:
 
-1. Build the model at 2, 4 and 8 layers. Keep hidden size, heads, sequence length, batch, dtype
-   and recipe at their real values; only the layer count changes. For a model whose layers follow
-   a repeating pattern of several kinds, use 2, 4 and 8 repetitions of the pattern so every layer
-   kind is present at every depth. Analyse one device and divide by the number of profiled steps.
-2. Fit. Per-layer cost is the slope, `(t8 - t4) / 4`, cross-checked against `(t4 - t2) / 2`; fixed
-   cost is the intercept, `t2 - 2 × per-layer` (embedding, final norm, lm head, loss, optimiser
+1. Build the model at 2, 4, 8 and 16 layers. Keep hidden size, heads, sequence length, batch,
+   dtype and recipe at their real values; only the layer count changes. For a model whose layers
+   follow a repeating pattern of several kinds, use 2, 4, 8 and 16 repetitions of the pattern so
+   every layer kind is present at every depth. If the real model has fewer than 16 layers, stop
+   at the largest depth below the real count. Analyse one device and divide by the number of
+   profiled steps.
+2. Fit. Fit a least-squares line `t(L) = fixed + L × per-layer` through the four points. Per-layer
+   cost is the slope; fixed cost is the intercept (embedding, final norm, lm head, loss, optimiser
    on non-layer parameters, per-step dispatch). Do the same fit per op class and per ranked item,
    with ops per layer from the attribution.
-3. Check collinearity. The two per-layer estimates must agree within a stated tolerance (five
-   percent is a reasonable default). If they do not, something in the step does not scale with
-   depth (memory pressure, program-cache churn, a host sync that appears past some depth); find
-   it and explain it before using the projection.
+3. Check the residuals. Every measured depth must sit on the fitted line within a stated tolerance
+   (five percent of its own step time is a reasonable default), and the 16-layer point matters
+   most because it is nearest the extrapolation. A point off the line means something in the
+   step does not scale with depth (memory pressure, program-cache churn, a host sync that
+   appears past some depth); find it and explain it before using the projection. If the
+   deviation is real and grows with depth, say so and give the projection as a range, not a
+   number.
 4. Project. Full-model step time is `fixed + L × per-layer` for the real layer count `L`; the
    ranked cost table is reported at full depth and labelled as a projection.
 5. Validate. Compare the projection with the full-model MFU wall-clock taken without the profiler.
    The difference is the host/dispatch gap plus profiler overhead; a difference beyond the
    expected dispatch gap is a finding, not noise.
 
-Before/after Tracy diffs for a change use the same three depths; a change whose benefit does not
-show at all three is reported with the depth where it stops showing. Record the three raw
-measurements, the fit, the projection and the validation in `doc/perf_analysis.md`.
+Before/after Tracy diffs for a change use the same four depths; a change whose benefit does not
+show at every depth is reported with the depth where it stops showing. Record the four raw
+measurements, the fit with residuals, the projection and the validation in `doc/perf_analysis.md`.
 
 ## Adding a kernel
 
