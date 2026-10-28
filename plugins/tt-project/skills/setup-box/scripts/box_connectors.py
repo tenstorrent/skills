@@ -216,7 +216,8 @@ def read_verify(out: str, targets: Dict[str, List[str]]) -> Dict[str, dict]:
         loaded = {x: int(c) for x, c in zip(names, counts) if c.strip().isdigit()} if len(counts) == len(names) else {}
         tries = kv.get(f"tries_{n}", "")
         res[fam] = {"ok": bool(mine and ok), "tool": mine, "items": int(ok.group(1)) if ok else None,
-                    "error": err or ("no connector tool was called" if ok and not mine else "" if ok else "no answer"),
+                    "error": err or ("no connector tool was called" if ok and not mine else "" if ok
+                                     else f"not run: the {VERIFY_CAP_S}s cap was spent" if tries == "0" else "no answer"),
                     "headless": {x: seen[x] for x in names if x in seen}, "loaded": loaded,
                     "auth_error": bool(mine) and kv.get(f"autherr_{n}", "").strip() == "1",
                     "tries": int(tries) if tries.isdigit() else None}

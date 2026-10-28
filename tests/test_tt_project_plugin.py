@@ -2470,6 +2470,7 @@ def test_setup_box_connectors_verify_waits_for_late_connector_tools_and_passes(m
     (tmp_path / "b").mkdir()
     bc, v, n, _ = _verify_run(monkeypatch, tmp_path / "b", late, cap=3)
     assert n == 0 and not v["Atlassian"]["ok"] and v["Atlassian"]["tries"] == 0
+    assert v["Atlassian"]["error"] == "not run: the 3s cap was spent"
     assert bc.verify_script({"A": ["A"]}).count(f"end=$(( $(date +%s) + {bc.VERIFY_CAP_S} ))") == 1
     assert bc.VERIFY_CAP_S <= 120
 
