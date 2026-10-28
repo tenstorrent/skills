@@ -895,6 +895,41 @@ def end_schedule_mutes(db: DB, names: Any, why: str, now: float | None = None,
     return done
 
 
+TASK_MUTE_RE = re.compile(r"(?:probe:)?#(\d+)", re.I | re.A)   # a mute keyed to one task: its whole match
+
+
+def task_of(match: Any) -> int | None:
+    """The task a mute's whole `match` names ('#<id>' or 'probe:#<id>'); None for any other text."""
+    hit = TASK_MUTE_RE.fullmatch(str(match or "").strip())
+    return int(hit.group(1)) if hit else None
+
+
+def end_task_mutes(db: DB, now: float | None = None, where: Any = None) -> list[dict]:
+    """End the active mutes keyed to one task (any source) whose task finished (done, failed or
+    cancelled), recording each one's summary event with 'task #<id> ended' as handled: the condition
+    they muted went with the task. Reads task states, so every way a task finishes is covered."""
+    from .db import TERMINAL_TASK_STATES
+    now = time.time() if now is None else now
+    if not db.kv(MUTES_KEY):
+        return []
+    with db.tx():
+        active = db.kv(MUTES_KEY, []) or []
+        keyed = {id(m): t for m in active if float(m["until"]) > now and (t := task_of(m["match"])) is not None}
+        if not keyed:
+            return []
+        ids = sorted(set(keyed.values()))
+        ended = {r["id"] for r in db.q(f"SELECT id FROM tasks WHERE id IN ({','.join('?' * len(ids))}) AND status IN "
+                                       f"({','.join('?' * len(TERMINAL_TASK_STATES))})",
+                                       (*ids, *TERMINAL_TASK_STATES))}
+        done = [m for m in active if keyed.get(id(m)) in ended]
+        if not done:
+            return []
+        db.set_kv(MUTES_KEY, [m for m in active if not any(m is d for d in done)])
+        for m in done:
+            _ended(db, m, now, now, f"task #{keyed[id(m)]} ended", where, settled=True)
+    return done
+
+
 def off_schedule_mute(db: DB, m: dict) -> bool:
     """Whether mute `m` belongs to a schedule that is off or gone, so it mutes nothing."""
     name = schedule_of(m.get("source"))

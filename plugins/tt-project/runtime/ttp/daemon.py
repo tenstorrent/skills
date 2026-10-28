@@ -1200,6 +1200,7 @@ class Daemon:
         self._run_step(lambda: coord.expire_asks(self.p, hold=any(g.level == "red" for g in self.gates.values())),
                        "expire_asks")
         self._run_step(lambda: scr.expire_mutes(self.p.db, where=self.p), "expire_mutes")
+        self._run_step(lambda: scr.end_task_mutes(self.p.db, where=self.p), "end_task_mutes")
         self._run_step(self.check_mute_ends)
         self._run_step(self.sweep_watcher_issues)
         self._run_step(self.sweep_schedule_gaps)

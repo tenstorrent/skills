@@ -4351,7 +4351,7 @@ def test_the_desktop_notifier_never_lets_a_later_alert_replace_an_earlier_one(mo
 
 
 @pytest.mark.parametrize("bare", ["_refresh_meters", "update_gates", "coord.expire_asks", "scr.expire_mutes",
-                                  "check_mute_ends", "sweep_watcher_issues", "review_jev", "settling"])
+                                  "scr.end_task_mutes", "check_mute_ends", "sweep_watcher_issues", "review_jev", "settling"])
 def test_a_failing_call_between_the_tick_step_loops_does_not_stop_dispatch_or_delivery(env, monkeypatch, bare):
     """The calls between the two step loops run guarded like the steps: one that raises is logged
     with its name and the second loop (dispatch, deliver_outbound) still runs in that tick."""
@@ -4920,3 +4920,69 @@ def test_ttp_notifier_test_says_when_macos_muted_the_test_for_screen_sharing_or_
         ([] if says is None else [next(ln for ln in lines if ln.startswith(says))])
     assert json.loads((tmp_path / "log.calls").read_text().splitlines()[0])[-1].endswith(
         'CONTAINS "com.apple.ScriptEditor2"'), "only the test sender's lines"
+
+
+def _task_with_id(p, tid):
+    p.db.x("UPDATE tasks SET id=? WHERE id=?", (tid, p.db.add_task(f"task {tid}")))
+    return tid
+
+
+def _task_mute(p, match, source="daemon:wait_stale"):
+    """A mute of `source` on `match`, written as screen.mute writes one (it refuses a match under 3 characters)."""
+    from ttp import screen
+    m = screen.mute(p.db, source, "placeholder", 48, why="known")
+    p.db.set_kv(screen.MUTES_KEY, [x for x in p.db.kv(screen.MUTES_KEY) if x["match"] != "placeholder"]
+                + [{**m, "match": match}])
+
+
+@pytest.mark.parametrize("finish", ["done", "failed", "cancelled"])
+def test_a_mute_keyed_to_a_task_ends_when_that_task_finishes_and_no_other_mute_does(env, finish):
+    """A coordinator mute of daemon:wait_stale '#<id>' outlived its task by a day, so status kept showing it and
+    the daily audit listed it as an override held past its premise. Once the task is done, failed or cancelled,
+    its '#<id>' and 'probe:#<id>' mutes (any source) end; another task's, a prefix's and free text's stay."""
+    from ttp import screen
+    p = make(env)
+    for tid in (4, 7, 41):
+        _task_with_id(p, tid)
+    _task_mute(p, "#7")
+    _task_mute(p, "probe:#7", source="daemon:probe")
+    _task_mute(p, "#4")
+    _task_mute(p, "#41")
+    _task_mute(p, "probe:#71")
+    _task_mute(p, "task #7 is slow")
+    active = lambda: sorted(m["match"] for m in screen.mutes(p.db))
+    every = sorted(["#7", "probe:#7", "#4", "#41", "probe:#71", "task #7 is slow"])
+    assert screen.end_task_mutes(p.db) == [] and active() == every, "a running task keeps its mutes"
+
+    if finish == "cancelled":
+        assert p.db.cancel(7) == ""
+    else:
+        p.db.update_task(7, status=finish)
+    ended = screen.end_task_mutes(p.db, where=p)
+    assert sorted(m["match"] for m in ended) == ["#7", "probe:#7"]
+    assert active() == sorted(["#4", "#41", "probe:#71", "task #7 is slow"])
+    events = p.db.q("SELECT status, text FROM events WHERE text LIKE 'mute ended:%'")
+    assert len(events) == 2 and all("(task #7 ended)" in e["text"] and e["status"] == "handled" for e in events)
+    assert screen.end_task_mutes(p.db) == [] and len(p.db.q("SELECT 1 FROM events WHERE text LIKE 'mute ended:%'")) == 2, \
+        "ending again is a no-op"
+
+    p.db.update_task(41, status=finish)   # the whole key: '#4' is not '#41'
+    assert [m["match"] for m in screen.end_task_mutes(p.db)] == ["#41"] and "#4" in active()
+    p.db.update_task(41, status="queued")
+    _task_mute(p, "#41")
+    p.db.update_task(4, status=finish)    # and '#41' is not '#4'
+    assert [m["match"] for m in screen.end_task_mutes(p.db)] == ["#4"]
+    assert active() == sorted(["#41", "probe:#71", "task #7 is slow"])
+
+
+def test_the_daemon_tick_ends_the_mutes_of_a_finished_task(env):
+    """The tick's sweep covers every way a task finishes: a status written by any path ends its mutes."""
+    from ttp import screen
+    p = make(env)
+    _task_with_id(p, 12)
+    _task_mute(p, "#12")
+    _task_mute(p, "#13")
+    p.db.x("UPDATE tasks SET status='done' WHERE id=12")   # as the push queue and landing checks close a task
+    _failing_step_daemon(p.base, []).tick()
+    assert [m["match"] for m in screen.mutes(p.db)] == ["#13"]
+    assert p.db.q("SELECT 1 FROM events WHERE text LIKE 'mute ended:%#12%(task #12 ended)%'")
