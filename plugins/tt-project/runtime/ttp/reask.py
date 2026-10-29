@@ -23,7 +23,8 @@ and either their Jaccard is at least JACCARD, or they share a hard anchor (a tas
 resource alias, config key) and the Jaccard is at least ANCHORED_JACCARD with the record covering at
 least CONTAINS of the ask's words and MIN_SHARED shared words besides the anchors. Asks and records
 that both carry anchors but share none are about different things and never match; an anchor alone
-with low word overlap is not enough. When unsure the ask goes out: the thresholds favour a missed re-ask over a false refusal.
+with low word overlap is not enough. When unsure the ask goes out: the thresholds favour a missed
+re-ask over a false refusal.
 """
 from __future__ import annotations
 
@@ -59,8 +60,8 @@ _USER_MSG = re.compile(r"\buser (?:msg|message)s? #\d+", re.I)
 _ASK_FIRST = re.compile(r"\b(?:ask|check with|confirm with|tell|ping) me\b|\bask (?:first|before)\b", re.I)
 _CHARTER_SECTIONS = ("policies", "goals")
 _LINKED = re.compile(r"^\s*#\d+\s*:")   # '#<id>: ...', the user's answer to ask #id
-DECIDED = re.compile(r"\b(?:do not|does not|don't|dont|never|keep|stop|no(?! (?:rush|hurry))|not(?! sure)|instead|rather|already "
-                     r"(?:said|told|answered|decided)|decide (?:it |that |this )?yourself|your call|yes|approved?|"
+DECIDED = re.compile(r"\b(?:do not|does not|don't|dont|never|keep|stop|no(?! (?:rush|hurry))|not(?! sure)|"
+                     r"instead|rather|already (?:said|told|answered|decided)|decide (?:it |that |this )?yourself|your call|yes|approved?|"
                      r"denied|declined?|rejected?|leave it|as is)\b", re.I)
 
 
