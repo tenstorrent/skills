@@ -79,7 +79,9 @@ class Check(str):
     sandbox (sandbox.py); `"sandbox": false` runs it without, for a check that needs the host's
     process table. A local check runs in a clean checkout of the commit (cleantree); `"cwd": "authoring"`
     runs it in the worktree being checked instead, for a check that needs build outputs or a venv made
-    there, and `ttp checks` labels its pass as not run from a clean tree. `wrap` (with_wrap, never part
+    there, and `ttp checks` labels its pass as not run from a clean tree. `"silent_s": <seconds>` is how long
+    `ttp checks` lets it run with no new output before stopping it as hung (checkwall.SILENT_S by default; 0
+    turns it off), for a check that is silent longer by design. `wrap` (with_wrap, never part
     of the config form) is the argv a local check runs behind: `checks.wrap_cmd` for the commands after `--`."""
     if_exists = ""
     if_changed: tuple[str, ...] = ()
@@ -90,11 +92,12 @@ class Check(str):
     wrap: tuple[str, ...] = ()
     sandbox = True
     cwd = ""
+    silent_s: float | None = None
 
     def config(self) -> str | dict:
         """The form project.json keeps."""
         if not (self.if_exists or self.if_changed or self.purpose or self.host or self.env or not self.sandbox
-                or self.cwd):
+                or self.cwd or self.silent_s is not None):
             return str(self)
         out: dict = {"run": str(self)}
         if self.if_exists:
@@ -111,10 +114,12 @@ class Check(str):
             out["sandbox"] = False
         if self.cwd:
             out["cwd"] = self.cwd
+        if self.silent_s is not None:
+            out["silent_s"] = self.silent_s
         return out
 
 
-CHECK_KEYS = {"run", "if_exists", "if_changed", "purpose", "host", "env", "sandbox", "cwd"}
+CHECK_KEYS = {"run", "if_exists", "if_changed", "purpose", "host", "env", "sandbox", "cwd", "silent_s"}
 PURPOSES = ("candidate", "harness")   # `ttp checks --purpose`; candidate is the default and publication evidence
 
 
@@ -149,6 +154,7 @@ def _check(c: Any) -> Check | None:
         out.env = tuple(sorted((c.get("env") or {}).items()))
         out.sandbox = c.get("sandbox") is not False
         out.cwd = "" if c.get("cwd") in (None, "clean") else c["cwd"]
+        out.silent_s = c.get("silent_s")
     return out
 
 
@@ -1096,7 +1102,7 @@ def _form_problem(c: dict) -> str | None:
     extra = sorted(set(map(str, c)) - CHECK_KEYS)
     if extra:
         return (f"{c!r}: unknown key(s) {', '.join(extra)}; a check object takes only run, if_exists, if_changed, "
-                "purpose, host, env, sandbox and cwd")
+                "purpose, host, env, sandbox, cwd and silent_s")
     cond = c.get("if_exists")
     if cond is not None and not _inside(cond):
         return f"{c!r}: if_exists must be a path or glob inside the repository"
@@ -1112,6 +1118,9 @@ def _form_problem(c: dict) -> str | None:
         return f"{c!r}: {why}"
     if "sandbox" in c and not isinstance(c["sandbox"], bool):
         return f"{c!r}: sandbox must be true or false"
+    if "silent_s" in c and (isinstance(c["silent_s"], bool) or not isinstance(c["silent_s"], (int, float))
+                            or not 0 <= c["silent_s"] < float("inf")):
+        return f"{c!r}: silent_s must be a number of seconds, 0 or more (0 turns the no-output stop off)"
     if "cwd" in c and c["cwd"] not in cleantree.CWDS:
         return f"{c!r}: cwd must be \"authoring\" (run in the worktree being checked) or \"clean\" (the default)"
     if purpose == "harness":

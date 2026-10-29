@@ -2846,8 +2846,9 @@ def cmd_checks(a) -> None:
                 testslots.suite_running(getattr(slot, "suite", None), wall)
                 if p and (last := checkwall.last_timeout(p.state, os.environ.get("TTP_TASK"))):
                     said_last = (f"this task's last checks run (run {last.get('run') or '?'} on "
-                                 f"{str(last.get('head') or '')[:12]}) was stopped at the wall-time cap: a timeout, "
-                                 f"not a pass")
+                                 f"{str(last.get('head') or '')[:12]}) was stopped "
+                                 + (f"after no output for {checkwall.span(float(last['silent_s']))}"
+                                    if last.get("silent_s") else "at the wall-time cap") + ": a timeout, not a pass")
                     print(f"ttp checks: {said_last}", flush=True)
                     out.write(f"ttp checks: {said_last}\n")
             for c in [] if hit or handover or not passed else todo:
@@ -2877,8 +2878,16 @@ def cmd_checks(a) -> None:
                         lambda: _run_check(_low_priority(push.check_argv(c, cwd, env)), group, record=reap_rec, cwd=cwd,
                                            stdout=out,
                                            stderr=subprocess.STDOUT, env=env, timeout=checkwall.deadline_left(deadline),
-                                           pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ()),
+                                           silent_s=checkwall.silent_limit(c), pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ()),
                         bool, None if push.remote_host(c) else str(c), cwd, env, said)
+                except checkwall.Silent as e:
+                    # No output for its silence limit: a hang, stopped as at the wall-time cap; never a pass.
+                    passed, failed, rc = False, c, checkwall.RC
+                    timed_out = {"check": str(c), "cap_s": wall, "how": wall_how, "head": head,
+                                 "silent_s": e.timeout, "run": os.environ.get("TTP_RUN_ID") or "?"}
+                    out.write(f"ttp checks: {checkwall.said_for(timed_out)}\n")
+                    out.write(_check_took(c, rc, began))
+                    break
                 except subprocess.TimeoutExpired:
                     # Past the wall-time cap: _run_check ended its group and what it left; never a pass.
                     passed, failed, rc = False, c, checkwall.RC
@@ -3051,8 +3060,7 @@ def cmd_checks(a) -> None:
                 f"head; the purpose harness check must apply to it (full output: {log})", 1)
         print(trim.summary(text))   # a test run's failures, else head and tail
         if timed_out:
-            die(f"ttp checks: {checkwall.said(str(failed), timed_out['cap_s'], timed_out['how'], head)} "
-                f"(full output: {log})", 1)
+            die(f"ttp checks: {checkwall.said_for(timed_out)} (full output: {log})", 1)
         if also:
             die(f"ttp checks: {failed!r} failed on {head[:12]}: tests failed, and there is also an environment "
                 f"problem: {env_problem} (full output: {log})", 1)
@@ -3565,13 +3573,16 @@ def _check_took(c, rc: int, began: float) -> str:
     return f"ttp checks: {c} took {time.monotonic() - began:.1f} s (exit {rc})\n"
 
 
-def _run_check(argv: list, group: bool, record=None, timeout: float | None = None, **kw) -> int:
+def _run_check(argv: list, group: bool, record=None, timeout: float | None = None, silent_s: float = 0,
+               **kw) -> int:
     """Run one check command to its exit code. In its own group (`group`) a stop always ends it:
     a stop during Popen would otherwise leave the started command running. Once its exit code is
     known, and when it is stopped or fails, every process it left (checkreap: tied by the run's
     token in its environment, or by its group and a working directory in its tree) is ended too;
     the check log says how many. `record` (checkreap.Record) learns the check's group. Past `timeout`
-    seconds it is ended and subprocess.TimeoutExpired raised."""
+    seconds it is ended and subprocess.TimeoutExpired raised; once its `stdout` file has not grown for
+    `silent_s` seconds (0: never), it is ended and checkwall.Silent raised (checkwall.wait)."""
+    from . import checkwall
     proc = None
     _CHECK_STOP.update(defer=True, pending=None)
     try:
@@ -3583,7 +3594,7 @@ def _run_check(argv: list, group: bool, record=None, timeout: float | None = Non
         _CHECK_STOP["defer"] = False
         if _CHECK_STOP["pending"]:
             raise SystemExit(_CHECK_STOP["pending"])
-        rc = proc.wait(timeout=timeout)
+        rc = checkwall.wait(proc, kw.get("stdout"), timeout, silent_s)
         _reap_check(proc, group, kw)
         return rc
     except BaseException:

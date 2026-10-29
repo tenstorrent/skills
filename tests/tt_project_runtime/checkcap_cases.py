@@ -1859,6 +1859,106 @@ def test_a_completed_checks_run_stops_reporting_the_task_s_old_timeout(env, tmp_
     assert checkwall.last_timeout(p.state, "7") is None
 
 
+class _SilenceProc:
+    """A stand-in check process for checkwall.wait: each wait() is one poll, writing to `out` when it
+    `prints`, exiting 0 at poll `exit_at` (None: never; never with no timeout either)."""
+    args = "stand-in"
+
+    def __init__(self, out, prints=False, exit_at=None):
+        self.out, self.prints, self.exit_at, self.polls = out, prints, exit_at, 0
+
+    def wait(self, timeout=None):
+        while True:   # no timeout: blocks to its exit, as Popen.wait does
+            self.polls += 1
+            if self.prints:
+                self.out.write("line\n")
+                self.out.flush()
+            if self.exit_at is not None and self.polls >= self.exit_at:
+                return 0
+            if timeout is not None:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+
+
+def test_checks_watchdog_stops_a_silent_command_at_its_limit_on_a_test_clock(tmp_path, monkeypatch):
+    from ttp import checkwall, push
+    now = [0.0]
+    def clock():   # a test clock: each read is a minute later, so no real 10-minute wait
+        now[0] += 60.0
+        return now[0]
+    monkeypatch.setattr(checkwall, "clock", clock)
+    out = open(tmp_path / "checks.out", "a")
+    try:
+        assert checkwall.silent_limit("pytest -q") == checkwall.SILENT_S == 600, "on by default: 10 min"
+        silent = _SilenceProc(out)
+        with pytest.raises(checkwall.Silent) as e:
+            checkwall.wait(silent, out, None, checkwall.SILENT_S)
+        assert e.value.timeout == 600 and 600 <= now[0] - 60 <= 720, ("stopped at the limit, not before", now)
+        now[0] = 0.0
+        busy = _SilenceProc(out, prints=True, exit_at=50)   # 50 test minutes of steady output
+        assert checkwall.wait(busy, out, None, 600) == 0 and busy.polls == 50, "a printing command is never stopped"
+        now[0] = 0.0
+        late = _SilenceProc(out)   # goes quiet after printing for a while: its silence counts from its last line
+        orig = late.wait
+        def wait(timeout=None):
+            late.prints = late.polls < 20
+            return orig(timeout)
+        late.wait = wait
+        with pytest.raises(checkwall.Silent):
+            checkwall.wait(late, out, None, 600)
+        assert late.polls >= 30, late.polls
+        # The per-check limit, and 0 turns it off.
+        own = push._check({"run": "make slow", "silent_s": 1800})
+        assert checkwall.silent_limit(own) == 1800 and own.config() == {"run": "make slow", "silent_s": 1800}
+        now[0] = 0.0
+        with pytest.raises(checkwall.Silent):
+            checkwall.wait(_SilenceProc(out), out, None, checkwall.silent_limit(own))
+        assert now[0] - 60 >= 1800, "the check's own longer limit holds"
+        off = push._check({"run": "make slow", "silent_s": 0})
+        assert checkwall.silent_limit(off) == 0
+        assert checkwall.wait(_SilenceProc(out, exit_at=100), out, None, 0) == 0, "0: never stopped for silence"
+        # The wall-time cap still ends it as before (plain TimeoutExpired, not a silence stop).
+        now[0] = 0.0
+        with pytest.raises(subprocess.TimeoutExpired) as e:
+            checkwall.wait(_SilenceProc(out, prints=True), out, 300, 600)
+        assert not isinstance(e.value, checkwall.Silent)
+        # No output file to watch: watches nothing (a plain wait).
+        assert checkwall.wait(_SilenceProc(None, exit_at=1), None, None, 600) == 0
+    finally:
+        out.close()
+    for bad in (-1, "600", True, float("nan"), float("inf")):
+        assert "silent_s must be" in push._form_problem({"run": "true", "silent_s": bad}), bad
+    assert push._form_problem({"run": "true", "silent_s": 0}) is None
+
+
+def test_ttp_checks_stops_a_check_with_no_output_as_a_timeout_and_spares_one_that_prints(env, tmp_path, monkeypatch, capsys):
+    from ttp import checkwall, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_TASK", "7")
+    p.set_config("checks.wall_cap_s", 0)
+    monkeypatch.setattr(checkwall, "SILENT_S", 1.0)
+    monkeypatch.setattr(checkwall, "POLL_S", 0.05)
+    cli.main(["checks", "--", "sh", "-c", "for i in 1 2 3 4 5 6 7 8; do echo $i; sleep 0.4; done"])
+    assert json.loads((run / "checks.json").read_text())["passed"], "steady output for 3 s passes a 1 s limit"
+    capsys.readouterr()
+    t0 = time.time()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", "sleep", "300"])
+    assert e.value.code == 1 and time.time() - t0 < 60
+    err = capsys.readouterr().err
+    assert "after no output for 1 s (its silence limit, silent_s): a hang, a timeout, not a pass" in err, err
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is False and rec["timed_out"]["silent_s"] == 1.0, rec
+    assert json.loads((run / "check_failure.json").read_text())["timed_out"]["silent_s"] == 1.0
+    assert "after no output for 1 s" in (run / "checks.log").read_text()
+    assert checkwall.last_timeout(p.state, "7")["silent_s"] == 1.0
+    # A check object's silent_s overrides the default; 0 turns the stop off.
+    p.set_config("delivery.push_checks", [{"run": "sleep 2", "silent_s": 0}])
+    cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert "was stopped after no output for 1 s: a timeout, not a pass" in out, "the next run says why the last one stopped"
+    assert json.loads((run / "checks.json").read_text())["passed"], "silent_s 0: a silent check runs to its end"
+    assert "no output for 10 min" in checkwall.said_silent("pytest", 600, "abc")
+
 # Checks lanes (checklane): light checks never queue, N lanes per project and repository, dead holders
 # reclaimed, a cheaper waiter's overflow lane, visible waits, and `ttp checks status`.
 
