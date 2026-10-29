@@ -410,7 +410,7 @@ def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: 
     per holder). Every other waiter shows in the digest and ttp status only."""
     if not events:
         return [], None
-    inc = dict(incident) if isinstance(incident, dict) else {}
+    inc = json.loads(json.dumps(incident)) if isinstance(incident, dict) else {}   # never the caller's lists
     why = [] if inc else ["new"]
     inc.setdefault("start", now)
     inc["waiters"] = len(events)
@@ -425,7 +425,7 @@ def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: 
     for name, test in (("hang", lambda h: factor > 0 and median_s and median_s > 0 and now - float(
                             h.get("run_since") or h.get("since") or now) > factor * median_s),
                        ("ownerless", lambda h: h.get("stale") or (h.get("task") and ended(h.get("task"))))):
-        seen = inc.setdefault(name, [])
+        seen = list(inc.get(name) or [])
         for k, h in holders.items():
             if k not in seen and test(h):
                 seen.append(k)

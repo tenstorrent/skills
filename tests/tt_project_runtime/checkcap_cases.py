@@ -3532,6 +3532,9 @@ def test_a_checks_queue_incident_rewakes_for_a_likely_hung_holder_and_for_an_own
     assert len(wakes) == 2 and "likely hang" in wakes[1]["text"], wakes
     assert checklane.wait_wake(evs, {"start": 1.0}, {"checks": {"wait_hang_factor": 0}}, now, 600.0)[0] == [], \
         "checks.wait_hang_factor 0: never"
+    kept = {"start": 1.0, "hang": [], "ownerless": []}
+    assert checklane.wait_wake(evs, kept, {}, now, 600.0)[0] == ["hang"]
+    assert kept == {"start": 1.0, "hang": [], "ownerless": []}, "the stored incident is never changed in place"
     # the holder set changes to one whose task has ended: nobody owns its fix
     t = p.db.add_task("finished work", kind="code") if hasattr(p.db, "add_task") else None
     tid = t if isinstance(t, int) else 12
