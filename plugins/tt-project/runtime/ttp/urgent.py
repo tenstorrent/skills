@@ -29,6 +29,8 @@ PRIORITY = 1                    # a task at this priority or better is urgent
 # A spec line `urgent: <why>`; `urgent: no` (none, not, false, n/a) says it is not.
 LINE = re.compile(r"^[ \t]*urgent:[ \t]*(?!(?:no|none|not|false|n/?a)\b)(\S.*)$", re.I | re.M)
 EXTRA_SLOTS = 1                 # default of budget.urgent_extra_slots
+RESERVE_SLOTS = 1               # default of budget.urgent_reserve_slots
+RESERVE_DUE_S = 3600            # a waiting urgent task due within this long keeps the reserve
 WAIT_S = 600                    # an urgent task in review this long raises review_stall
 
 
@@ -64,6 +66,22 @@ def extra_slots(cfg: dict) -> int:
         return max(int(((cfg or {}).get("budget") or {}).get("urgent_extra_slots", EXTRA_SLOTS)), 0)
     except (TypeError, ValueError):
         return EXTRA_SLOTS
+
+
+def reserve_slots(cfg: dict, db, now: float, max_parallel: int) -> int:
+    """Worker slots routine work leaves free (budget.urgent_reserve_slots, default 1, 0: off) while a
+    task of priority 1 or better is queued, or waiting with its retry due within RESERVE_DUE_S: so a ready
+    urgent task never waits for routine runs to end. Bounded: at least one slot stays open to routine work,
+    and with no such task none is kept."""
+    try:
+        keep = max(int(((cfg or {}).get("budget") or {}).get("urgent_reserve_slots", RESERVE_SLOTS)), 0)
+    except (TypeError, ValueError):
+        keep = RESERVE_SLOTS
+    keep = min(keep, max_parallel - 1)
+    if keep <= 0 or not db.one("SELECT 1 FROM tasks WHERE priority<=? AND (status='queued' OR (status='waiting' "
+                               "AND COALESCE(not_before, 0)<?)) LIMIT 1", (PRIORITY, now + RESERVE_DUE_S)):
+        return 0
+    return keep
 
 
 def covers_urgent(db, task: dict | None) -> bool:

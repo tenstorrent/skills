@@ -445,7 +445,9 @@ HANDOFF_KINDS = ("task_done", "task_failed", "task_changes_needed", "task_cancel
 # Events that may wait up to coordinator.batch_s for company while no worker slot would sit idle.
 # Failed, blocked and review hand-offs, high or critical events and user messages wake at once.
 # A budget change re-plans on the next turn: the daemon already released its holds model-free.
-BATCH_KINDS = ("task_done", "followup_proposed", "task_notes", "observation", "upstream_note", budgetkind.KIND)
+# The unstarted watches (unstarted.py) are counted observations: they ride with the next turn.
+BATCH_KINDS = ("task_done", "followup_proposed", "task_notes", "observation", "upstream_note", budgetkind.KIND,
+               unstarted.ANNOUNCED_KIND, unstarted.READY_KIND)
 
 
 def batchable(kind: str, severity: str) -> bool:

@@ -1176,6 +1176,47 @@ def test_an_urgent_task_starts_first_and_takes_one_extra_slot_past_full_routine_
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
 
 
+def test_routine_work_leaves_one_slot_for_queued_or_soon_due_urgent_work_and_dispatch_starts_it_model_free(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """budget.urgent_reserve_slots (default 1): while a priority 1 task is queued or waiting with its retry
+    due within the hour, routine work fills all slots but one, so the urgent task starts in the same
+    dispatch pass it turns ready, with no coordinator turn. No urgent work open, or 0: routine fills all."""
+    from ttp import urgent
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=3)
+    try:
+        hot = p.db.add_task("urgent fix", "s", kind="work", tier="light", origin="user", priority=1)
+        p.db.update_task(hot, status="waiting", not_before=time.time() + 300)
+        routine = [p.db.add_task(f"routine {i}", "s", kind="work", tier="light", origin="user", priority=2)
+                   for i in range(3)]
+        d.dispatch()
+        assert _slot_tasks(p) == routine[:2], "one slot kept for the urgent task due in 5 min"
+        p.db.update_task(hot, status="queued", not_before=None)   # its probe passed
+        d.dispatch()
+        assert _slot_tasks(p) == routine[:2] + [hot], "it starts at once, in a regular slot"
+        assert not p.db.q("SELECT 1 FROM runs WHERE role='coordinator'"), "dispatch is model-free"
+        settle(d)
+        far = p.db.add_task("urgent, waiting on a user", "s", kind="work", tier="light", origin="user", priority=1)
+        p.db.update_task(far, status="waiting", not_before=time.time() + 6 * 3600)
+        for i in range(3):
+            p.db.add_task(f"routine more {i}", "s", kind="work", tier="light", origin="user", priority=3)
+        d.dispatch()
+        assert len(_slot_tasks(p)) == 3, "a wait due hours away keeps no slot"
+        p.db.update_task(far, status="queued", not_before=None)
+        assert urgent.reserve_slots(d.cfg, p.db, time.time(), 3) == 1
+        assert urgent.reserve_slots(d.cfg, p.db, time.time(), 1) == 0, "one slot always stays open to routine"
+        d.cfg["budget"]["urgent_reserve_slots"] = 0
+        assert urgent.reserve_slots(d.cfg, p.db, time.time(), 3) == 0, "0 turns it off"
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_unstarted_events_ride_with_the_next_turn_and_never_wake_alone():
+    from ttp import coordinator, unstarted
+    assert coordinator.batchable(unstarted.READY_KIND, "normal")
+    assert coordinator.batchable(unstarted.ANNOUNCED_KIND, "normal")
+
+
 def test_the_spend_gate_still_holds_an_urgent_task(env, monkeypatch, tmp_path, reap_tmp_processes):
     """allow_new_work False, or a gate of no slots, holds an urgent task like any other: no extra slot."""
     import dataclasses

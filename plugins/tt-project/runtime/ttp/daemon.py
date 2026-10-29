@@ -7331,6 +7331,8 @@ class Daemon:
         # An urgent task may take budget.urgent_extra_slots beyond them, unless the gate allows no slot.
         slots = gate.max_parallel + (urgent.extra_slots(self.cfg) if gate.max_parallel > 0
                                      and urgent.is_urgent(task) else 0)
+        if not urgent.is_urgent(task):   # routine work leaves a slot for queued or soon-due urgent work
+            slots -= urgent.reserve_slots(self.cfg, self.p.db, now, gate.max_parallel)
         if not gate.allow_new_work or ctx["busy"].get(provider, 0) >= slots:
             if gate.allow_new_work:   # held only because every worker slot is taken (check_slot_wait)
                 ctx.setdefault("full", {})[task["id"]] = slots
