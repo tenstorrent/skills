@@ -32,7 +32,9 @@ FAULT_RC = 75
 LOCAL = "local"      # a check's `host` that keeps it here when delivery.checks_host is set
 HOST_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.@+:-]{0,252}")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
+# A link that drops mid-check ends in exit 255 within about a minute, never hangs to the wall-time cap.
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15",
+       "-o", "ServerAliveCountMax=4"]
 SETUP_TIMEOUT_S = 900
 CLEANUP_TIMEOUT_S = 120
 PROBE_TIMEOUT_S = 45

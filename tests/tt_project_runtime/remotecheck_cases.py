@@ -359,6 +359,76 @@ def test_a_run_that_does_not_pass_on_a_spill_host_runs_again_here(env, tmp_path,
         assert not any(k.startswith("env:check-host:") for k in envfault.open_faults(p))
 
 
+def _spill_lock_paths(p, alias):
+    from ttp import locks, shared
+    cfg = p.config()
+    res = locks.canonical(cfg, alias)
+    return locks.slot_paths(shared.locks_dir(p, res, cfg), res, shared.slots(p, res, cfg))
+
+
+def test_spill_skips_a_host_whose_lock_is_held_and_holds_the_lock_it_runs_under(env, tmp_path, monkeypatch):
+    """A spill host's machine lock (`ttp lock <alias>`) held exclusively by someone else: the run skips
+    it, says who holds it, and runs on the next host. The run holds its host's lock shared while it runs:
+    a second spilled run shares it, an exclusive taker is kept off, and it is freed with the claim."""
+    from ttp import checkspill, cli, lockprobe, locks
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    held = locks.try_take(_spill_lock_paths(p, "check-host-a"), "task #9 (run 1)", "make bench")
+    assert held is not None
+    try:
+        log = tmp_path / "where.log"
+        cmd = f"pwd >> {log}"
+        p.set_config("delivery.push_checks", [cmd])
+        lane = _spill_lane(p, repo)
+        try:
+            cli.main(["checks", "--fresh"])
+        finally:
+            lane.close()
+        rec = json.loads((run / "checks.json").read_text())
+        assert rec["passed"] is True and rec["spilled_to"] == "check-host-b", rec
+        text = (run / "checks.log").read_text()
+        assert "check-host-a (busy (held by task #9" in text and "spilling to check-host-b" in text, text
+        cfg = p.config()
+        claims = [checkspill.pick(p, cfg, lambda line: None, "pytest -q") for _ in range(2)]
+        try:
+            assert [c.host for c in claims] == ["check-host-b"] * 2, "spilled runs share the host's lock"
+            assert lockprobe.answer(p, cfg, "check-host-b")[0] == 75, "an exclusive taker waits for them"
+            assert locks.try_take(_spill_lock_paths(p, "check-host-b"), "task #8 (run 2)") is None
+        finally:
+            for c in claims:
+                c.close()
+        assert lockprobe.answer(p, cfg, "check-host-b")[0] == 0, "freed with the claim"
+    finally:
+        held.close()
+    assert checkspill.lock_busy(p, p.config(), "check-host-a") == ""
+
+
+def test_a_spill_run_past_the_wall_cap_or_on_a_stalled_link_runs_again_here(env, tmp_path, monkeypatch):
+    """A spill host slower than the wall-time cap (or an ssh link that stalls there) is the host's
+    environment, not the change's: the checks run again here, only that result counts, and no task
+    timeout stays recorded. The check-host ssh ends a dropped link through keepalives."""
+    import threading
+    from ttp import checkwall, cli, remotecheck
+    assert "ServerAliveInterval=15" in remotecheck.SSH and "ServerAliveCountMax=4" in remotecheck.SSH
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    monkeypatch.setenv("TTP_TASK", "4212")
+    monkeypatch.setenv(checkwall.ENV, "3")
+    log = tmp_path / "where.log"
+    cmd = f'case "$PWD" in */ttp-check.*) pwd >> {log}; sleep 30;; esac; pwd >> {log}'
+    p.set_config("delivery.push_checks", [cmd])
+    lane = _spill_lane(p, repo)
+    threading.Timer(1.5, lane.close).start()
+    t0 = time.time()
+    cli.main(["checks", "--fresh"])
+    assert time.time() - t0 < 25, "the spill host's check was ended at the cap"
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and "spilled_to" not in rec and "timed_out" not in rec, rec
+    text = (run / "checks.log").read_text()
+    assert "did not pass on spill host check-host-a (past the 3 s wall-time cap)" in text, text
+    where = log.read_text().splitlines()
+    assert "/ttp-check." in where[0] and "/ttp-check." not in where[-1], where
+    assert checkwall.last_timeout(p.state, "4212") is None
+
+
 def test_no_spill_hosts_keeps_todays_wait_and_unspillable_checks_never_spill(env, tmp_path, monkeypatch):
     """Unset (the default) or for checks that must run here (own host, authoring tree, wrap_cmd), the
     wait is the plain foreground wait and no spill host is tried."""

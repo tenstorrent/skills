@@ -12,12 +12,16 @@ bound. The run says where it went, checks.json records it (`hosts`, `spilled_to`
 and `ttp checks status` show it while it runs (status_lines).
 
 Allowed: named in the project's charter and in the user's machines list (not retired), and not
-paused (a pause of its alias, or a fleet hold of the machine). A host that is not allowed, that ssh
-does not reach, that lacks git or tar, or whose slots are full is skipped, never a failure. Its slots:
+paused (a pause of its alias, or a fleet hold of the machine), and its machine lock (`ttp lock <alias>`)
+neither held nor reserved by anyone else. The run holds that lock while it runs, shared where the
+resource allows it (several spilled checks share it; an exclusive holder or waiter keeps them off),
+exclusively on a device lock. A host that is not allowed, whose lock is busy, that ssh does not reach,
+that lacks git or tar, or whose slots are full is skipped, never a failure. Its slots:
 the lanes its cores and available memory give (checklane.default_slots) less the remote checks
 running there from any machine (their ttp-check.* folders); this machine also holds one claim file
 per slot it uses there (spill/<alias>.<n>.json in the checks slot folder), so its own runs never
-take more.
+take more. A claim whose remote ttp-check.* folder is not made yet (the few seconds of its copy) is
+counted by neither, so the host can take one run more than its slots in that gap: a bound, not a guard.
 
 Only a run whose every check would run here spills: none with a host of its own (`host`,
 delivery.checks_host), none run in the authoring worktree ("cwd": "authoring"), none behind
@@ -172,14 +176,43 @@ def claim_dir() -> Path:
     return checkcap.slot_dir() / "spill"
 
 
-class Claim:
-    """This machine's hold of one slot on spill host `host`; `close()` frees it."""
+def lock_busy(p, cfg: dict, alias: str) -> str:
+    """"" when `alias`'s machine lock is free for a shared taker (as `ttp lock --probe --shared` answers),
+    else why not: "busy (held by ...; N waiting)"."""
+    from . import lockprobe
+    try:
+        rc, said = lockprobe.answer(p, cfg, alias, shared_mode=True)
+    except OSError as e:
+        return f"its lock cannot be read: {e}"
+    return "" if rc == 0 else str(said).split(": ", 1)[-1]
 
-    def __init__(self, host: str, f):
+
+def _hold(p, cfg: dict, alias: str, what: str):
+    """The run's hold of `alias`'s machine lock (shared, exclusive on a device lock), or None if taken."""
+    from . import hold, locks, shared
+    res = locks.canonical(cfg, alias)
+    paths = locks.slot_paths(shared.locks_dir(p, res, cfg), res, shared.slots(p, res, cfg))
+    who = shared.holder(p, res, hold.label(hold.who(os.environ.get("TTP_TASK")), os.environ.get("TTP_RUN_ID")), cfg)
+    device = res in locks.device_locks(cfg) or res.endswith("-device") or alias.endswith("-device")
+    try:
+        return (locks.try_take if device else locks.try_take_shared)(paths, who, f"ttp checks (spilled): {what}")
+    except OSError:
+        return None
+
+
+class Claim:
+    """This machine's hold of one slot on spill host `host`, and the run's hold of its machine lock;
+    `close()` frees both."""
+
+    def __init__(self, host: str, f, lock=None):
         self.host = host
         self.f = f
+        self.lock = lock
 
     def close(self) -> None:
+        if self.lock is not None:
+            self.lock.close()
+            self.lock = None
         if self.f is not None:
             try:
                 self.f.truncate(0)
@@ -219,11 +252,16 @@ def pick(p, cfg: dict, tell, what: str = "") -> Claim | None:
            "pid": os.getpid(), "since": time.time(), "what": what[:300]}
     skipped = []
     for alias in hosts(cfg):
-        why = allowed(p, cfg, alias)
+        why = allowed(p, cfg, alias) or lock_busy(p, cfg, alias)
         free = 0
         if not why:
             free, why = probe(alias)
         if not why and (got := _claim(alias, free, {**rec, "host": alias})) is not None:
+            got.lock = _hold(p, cfg, alias, what)
+            if got.lock is None:
+                got.close()
+                skipped.append(f"{alias} (busy: its lock was taken just now)")
+                continue
             tell(f"spilling to {alias}: the slots here stayed busy for {after_s(cfg):g} s "
                  f"(delivery.{KEY}); the checks run there on a copy of the commit"
                  + (f"; skipped: {'; '.join(skipped)}" if skipped else ""))

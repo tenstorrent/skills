@@ -872,7 +872,8 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   `checks_slot_wait` event per wait past `checks.wait_event_s` (default 900, 0 turns it off).
   `delivery.checks_spill_hosts` (an ordered list of ssh aliases, default empty: checks never leave this machine)
   lets a run that has waited `delivery.checks_spill_after_s` (default 60 s) here run on the first listed host the
-  charter names, the machines list holds and no pause covers, that ssh reaches and that has a free slot; others
+  charter names, the machines list holds, no pause covers and whose `ttp lock <alias>` nobody else holds (the run
+  holds it shared while it runs), that ssh reaches and that has a free slot; others
   are skipped with the reason and the run keeps its place here. Runs with a check host, the authoring tree or
   `checks.wrap_cmd` never spill; a run that does not pass on a spill host runs again here, and that result
   counts. `checks.json` (`spilled_to`), `ttp status` and `ttp checks status` name the host.

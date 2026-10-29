@@ -2761,7 +2761,8 @@ def cmd_checks(a) -> None:
         arrived = _checks_arrived()
         from . import checklane, checkspill
         # A rerun here of checks that did not pass on a spill host never spills again (checkspill).
-        spill_ok = not os.environ.pop(checkspill.OFF_ENV, "") and checkspill.spillable(todo)
+        no_spill = bool(os.environ.pop(checkspill.OFF_ENV, ""))
+        spill_ok = not no_spill and checkspill.spillable(todo)
         fresh_ok = not a.fresh
         slot = None
         while todo and not hit:
@@ -2937,7 +2938,9 @@ def cmd_checks(a) -> None:
             if stop_handlers:
                 _CHECK_STOP["stopped"] = None
         if ran_since and p:
-            if timed_out:
+            if timed_out and spilled:
+                pass   # a spill host's wall time (a slower host, a stalled link) is no timeout of the task's: rerun here
+            elif timed_out:
                 checkwall.record_timeout(p.state, os.environ.get("TTP_TASK"), timed_out)
             elif executed:
                 checkwall.record_run(p.state, time.time() - ran_since, passed,
@@ -2947,9 +2950,11 @@ def cmd_checks(a) -> None:
         if slot and not passed:
             slot.close()
         # A spill host's own environment never fails a change (a fault there, a missing tool): what did
-        # not pass there runs again here, in its place in the queue, and only that verdict counts.
-        if spilled and not passed and executed and not timed_out and not _CHECK_STOP.get("stopped"):
-            said = (f"the checks did not pass on spill host {spilled.host} (exit {rc}); running them again on "
+        # not pass there (a timeout included) runs again here, in its place in the queue, and only that
+        # verdict counts.
+        if spilled and not passed and (executed or timed_out) and not _CHECK_STOP.get("stopped"):
+            how = f"past the {timed_out['cap_s']:g} s wall-time cap" if timed_out else f"exit {rc}"
+            said = (f"the checks did not pass on spill host {spilled.host} ({how}); running them again on "
                     "this machine, whose result counts")
             out.write(f"ttp checks: {said}\n")
             out.flush()
@@ -2972,7 +2977,7 @@ def cmd_checks(a) -> None:
             sys.exit(75)
     if handover:
         try:
-            _checks_detach(a, Path(run_dir), p, top, head, arrived)
+            _checks_detach(a, Path(run_dir), p, top, head, arrived, no_spill)
         except OSError as e:
             die(f"ttp checks: {e}")
         # Told only once they were started: a failed start says so, never that they run.
@@ -3679,7 +3684,7 @@ def _checks_owner(run_dir: Path, top: str, purpose) -> str:
 
 
 def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str = "",
-                   arrived: float | None = None) -> None:
+                   arrived: float | None = None, no_spill: bool = False) -> None:
     """Start `ttp checks` in a session of its own. It writes checks.rc however it ends (a stop by
     TERM, HUP or INT included); the printed `--result` probe also wakes the task when it was killed
     outright. This run's earlier detached checks for the same worktree and purpose are stopped
@@ -3701,6 +3706,9 @@ def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
     if arrived is not None:
         env[checkcap.ARRIVED_ENV] = repr(arrived)
+    if no_spill:   # the rerun here of checks that did not pass on a spill host keeps off the spill hosts
+        from . import checkspill
+        env[checkspill.OFF_ENV] = "1"
     detach.lost(rc).unlink(missing_ok=True)
     # A request the daemon has not finished starting is replaced through the queue too, so the daemon
     # never starts an older request after this one.
