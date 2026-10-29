@@ -122,7 +122,8 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
     No question blocks: each stores its recommendation as its default, shown with the time it
     applies, and after `coordinator.ask_timeout_h` (0.5 h; 0 turns it off) unanswered the daemon
     resolves it to that (`askauto.py`, `expire_asks`), tells the chat at low and records a decision
-    memory. A restriction ask whose recommendation would loosen it keeps the restriction as written.
+    memory. A restriction ask whose recommendation would loosen it stays open for the user instead,
+    holding only the tasks anchored on it: only the user's own words loosen a restriction.
     Asks only the user can answer stay open: review, merge, another human's request, a
     recommendation that acts as the user, a credential or money grant, and an irreversible step that
     does not decline. Nothing resolves at a red gate or when the user has written since the ask (the

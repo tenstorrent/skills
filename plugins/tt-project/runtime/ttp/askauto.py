@@ -3,10 +3,10 @@
 """Non-blocking asks. Every ask stores its default when it is filed: the coordinator's
 recommendation. Left unanswered for `coordinator.ask_timeout_h` (default 0.5; 0 never), the daemon
 resolves it to that default (coordinator.expire_asks) and the coordinator acts on it. outcome() says
-what the timer does with an ask: apply its recommendation, keep a restriction as written (only the
-user's own words loosen one), or leave it open for the user (an action that could affect people
-badly or speaks as the user, a credential or money only the user holds). An open one never holds
-unrelated work. The timer itself performs nothing; the coordinator's gates still check what it does.
+what the timer does with an ask: apply its recommendation, or leave it open for the user (a
+recommendation that would loosen a restriction, since only the user's own words do that; an action
+that could affect people badly or speaks as the user; a credential or money only the user holds).
+An open one never holds unrelated work. The timer itself performs nothing; the coordinator's gates still check what it does.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import re
 DEFAULTS_KEY = "ask_defaults"   # kv the timer reads (coordinator.ASK_DEFAULTS_KEY)
 FLAGS_KEY = "ask_timer_flags"   # kv: the problems check() last reported, so each is raised once
 DEFAULT_H = 0.5
-STAY = "keep the restriction as written (only the user's own words loosen it)"
+LOOSENS = "its recommendation would loosen a restriction, and only the user's own words do that"
 # Only the user may give these: a review or merge, an answer to another person's request.
 AS_USER_REASONS = ("review", "merge", "human")
 # These resolve only to a recommendation that grants nothing only the user holds.
@@ -33,7 +33,7 @@ _GRANT_RE = re.compile(r"\b(yes|y|ok|okay|approve[ds]?|grant|raise|increase|lift
                        r"access|cap|budget|reserve)\b", re.I)
 # The only recommendations the timer reads as a decline: the whole text, case and end punctuation
 # aside, is one of these. No prose is parsed for meaning ("no, don't keep it" means act), so any other
-# wording stays open, or stays as written for a restriction, until the user answers.
+# wording stays open until the user answers.
 DECLINES = frozenset(("no", "decline", "skip", "keep it", "leave it", "do nothing", "no change"))
 
 
@@ -51,12 +51,12 @@ def hours(cfg: dict | None) -> float:
 
 
 def outcome(blocking: str | None, rec: str | None) -> tuple[str, str]:
-    """What the timer does with an ask: ("apply", rec), ("stay", STAY) or ("open", why it waits)."""
+    """What the timer does with an ask: ("apply", rec) or ("open", why it waits)."""
     rec = " ".join((rec or "").split())
     if not rec:
         return "open", "it has no recommendation"
     if blocking == "restriction":
-        return ("apply", rec) if declines(rec) else ("stay", STAY)
+        return ("apply", rec) if declines(rec) else ("open", LOOSENS)
     if blocking in AS_USER_REASONS:
         return "open", f"only the user gives a {blocking} answer"
     if declines(rec):
@@ -99,7 +99,7 @@ def shown(db, cfg: dict | None, ask: dict, where, now: float | None = None) -> s
 
 def check(db, cfg: dict | None, now: float, grace_s: float = 900) -> list[str]:
     """Model-free check of the ask timer: each open ask with no stored default, and each that should
-    have resolved over `grace_s` ago (outcome apply or stay) but is still open."""
+    have resolved over `grace_s` ago (outcome apply) but is still open."""
     defaults = db.kv(DEFAULTS_KEY, {}) or {}
     out = []
     for a in db.q("SELECT id, ts FROM messages WHERE direction='out' AND kind='ask' AND handled=0 ORDER BY id"):

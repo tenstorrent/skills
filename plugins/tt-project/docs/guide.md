@@ -445,15 +445,17 @@ prolonged whole-box outage.
 - Asks never block: every ask stores its recommendation as its default and shows when it applies
   ("acts on X at HH:MM ZONE unless answered") in the chat, `ttp status`, the web app and the
   digest. Unanswered after `coordinator.ask_timeout_h` (0.5; 0 turns it off; settable from the
-  chat), the daemon resolves it: it applies the recommendation, or for a restriction ask whose
-  recommendation would loosen it keeps the restriction as written. It tells the chat at low, records
+  chat), the daemon resolves it by applying the recommendation. It tells the chat at low, records
   a decision memory, raises one `ask_timeout` event per tick and refuses a re-ask; tasks anchored on
   the ask are released. Asks only the user can answer stay open (review, merge, another human's
   request, a recommendation that acts as the user, a credential or money grant, an irreversible
-  step). For an irreversible or restriction ask the timer reads no prose for meaning: only a
-  recommendation that is wholly one bare decline (no, decline, skip, keep it, leave it, do nothing,
-  no change) applies; any longer wording, even a decline, keeps a restriction as written and leaves
-  an irreversible ask open for the user. Accepted gap: an as-user action worded outside the timer's
+  step, a restriction ask whose recommendation would loosen it: only the user's own words loosen a
+  restriction). An open ask never blocks other work; it holds only the tasks anchored on it. For an
+  irreversible or restriction ask the timer reads no prose for meaning: only a recommendation that
+  is wholly one bare decline (no, decline, skip, keep it, leave it, do nothing, no change) applies;
+  any longer wording, even a decline, leaves the ask open for the user. A re-ask of an answered
+  question is refused also when one of its question clauses repeats one of the earlier ask's in
+  other words; `not_covered` saying what is new still lets it through. Accepted gap: an as-user action worded outside the timer's
   word list in another kind is left to the ask gate and the coordinator's classification. Nothing
   resolves at a red gate or after the user wrote since the ask (the coordinator checks instead). A model-free check raises an open ask with no default, or one
   past its timeout and still open, once per change.

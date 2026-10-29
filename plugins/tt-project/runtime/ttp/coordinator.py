@@ -3697,9 +3697,9 @@ def expire_asks(p: Project, *, hold: bool = False, now: float | None = None) -> 
 
     Every ask stores its default when filed (askauto.entry); an open ask with none gets one here
     (_ask_default), so asks filed before that time out too. askauto.outcome says what the timer does:
-    apply the recommendation, keep a restriction as written, or leave the ask open for the user (an
-    exempt class: shown as waiting, it holds only the tasks anchored on it). An older ask with a
-    plain-string default applies it and alerts at high as before. Nothing expires while `hold` is
+    apply the recommendation, or leave the ask open for the user (an exempt class, and a restriction
+    ask whose recommendation would loosen it: shown as waiting, it holds only the tasks anchored on
+    it). An older ask with a plain-string default applies it and alerts at high as before. Nothing expires while `hold` is
     set (a red gate) or while a user message is unhandled, since that message may be the answer. A
     due ask with any user message after it, handled or not, may have been answered without a
     `resolve`: it is not applied, its default is cleared (None: it waits) and the coordinator is
@@ -3742,7 +3742,7 @@ def expire_asks(p: Project, *, hold: bool = False, now: float | None = None) -> 
         floor = max(("low", cfg["notify"].get("chat_min_severity")), key=lambda n: SEVERITY_RANK.get(n, -1))
         for k in due:
             ask, v = open_asks[k], live.pop(k)
-            kind, to = resolves(v)
+            to = resolves(v)[1]
             db.x("UPDATE messages SET handled=1 WHERE id=?", (ask["id"],))
             unblock.record_resolve(db, int(k), [], auto=to)
             question = _ask_question(ask["text"])[:300]
@@ -3756,17 +3756,15 @@ def expire_asks(p: Project, *, hold: bool = False, now: float | None = None) -> 
                              f"applies: {to}. Act on it; it is not permission for anything beyond that choice. "
                              f"The question was: {question}")
                 continue
-            said = (f"the restriction stays as written, since the recommendation ({v.get('rec')}) would loosen "
-                    f"it and only your own words do that" if kind == "stay" else f"I went with my recommendation: {to}")
-            db.post("out", f"No answer to ask {k} in {wait}, so it no longer waits: {said}.\n"
+            db.post("out", f"No answer to ask {k} in {wait}, so it no longer waits: I went with my "
+                           f"recommendation: {to}.\n"
                            f"Reply to change it.\nThe question was: {question}",
                     chat=None, kind="alert", severity=floor)
             decided.append((k, question, to))
             lines.append(f"Ask #{k} got no answer in {wait} and auto-resolved to its default: {to}. "
-                         + ("Do not act on its recommendation: it would loosen a restriction. " if kind == "stay"
-                            else "Act on it now; it is not permission for anything beyond that choice, and every "
-                                 "gate still applies. ")
-                         + f"The user was told at low and a decision memory was recorded. The question was: {question}")
+                         "Act on it now; it is not permission for anything beyond that choice, and every "
+                         "gate still applies. "
+                         f"The user was told at low and a decision memory was recorded. The question was: {question}")
         if lines:   # one wake for the whole tick
             db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                  (now, "daemon", "ask_timeout", "normal", "\n".join(lines), "queued"))

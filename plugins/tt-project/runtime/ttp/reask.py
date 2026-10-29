@@ -27,7 +27,9 @@ with low word overlap is not enough. A new question about a settled subject neve
 the ask's question clauses (a '?' sentence, from its last ':', ';', dash or ', which/should...'
 lead-in) brings at least MIN_NEW words the record lacks and the record holds less than CONTAINS of
 its words. A question that is the whole ask never passes this way: a Jaccard match already holds
-at least CONTAINS of the ask's words. When unsure the ask goes out: the thresholds favour a missed
+at least CONTAINS of the ask's words. An earlier ask's question also matches clause to clause
+(same_question): a question clause of the ask that shares at least MIN_SHARED words and JACCARD with
+one of the earlier ask's, unless the two asks carry anchors and share none. When unsure the ask goes out: the thresholds favour a missed
 re-ask over a false refusal.
 """
 from __future__ import annotations
@@ -156,6 +158,27 @@ def _hit(ask: str, text: str, settling: bool = True, decided: bool = False) -> s
     return None
 
 
+def _same_clause(ask: str, old: str) -> bool:
+    """A question clause of `ask` is one of `old`'s in other words ('Make X permanent?', 'Should X
+    become permanent?'), where the context around them differs too much for matches(). A clause that
+    brings MIN_NEW words the other lacks asks something new ('Should X run at 2am?')."""
+    for q in _questions(ask):
+        for o in _questions(old):
+            shared = q & o
+            if len(shared) >= MIN_SHARED and len(shared) / len(q | o) >= JACCARD and len(q - o) < MIN_NEW:
+                return True
+    return False
+
+
+def same_question(ask: str, old: str) -> bool:
+    """`ask` asks `old` (an earlier ask's question) again: as a whole, in one of its sentences, or in
+    one of its question clauses. Anchors still tell asks about different things apart."""
+    if matches(ask, old) or _hit(ask, old, False):
+        return True
+    aa, oa = anchors(ask), anchors(old)
+    return not (aa and oa and not aa & oa) and _same_clause(ask, old)
+
+
 def _resolved(db, ask: str, since: float, question) -> str | None:
     from .unblock import RESOLVED_KEY
     rec = db.kv(RESOLVED_KEY, {}) or {}
@@ -163,7 +186,7 @@ def _resolved(db, ask: str, since: float, question) -> str | None:
         if not isinstance(r, dict) or float(r.get("ts") or 0) < since or not (r.get("messages") or r.get("auto")):
             continue
         row = db.one("SELECT text FROM messages WHERE id=? AND kind='ask' AND direction='out'", (int(aid),))
-        if not row or not (matches(ask, question(row["text"])) or _hit(ask, question(row["text"]), False)):
+        if not row or not same_question(ask, question(row["text"])):
             continue
         if r.get("auto") and not r.get("messages"):   # unanswered: it resolved to its recommendation
             return f'ask #{aid}, auto-resolved unanswered to its recommendation: "{_line(str(r["auto"]))}"'

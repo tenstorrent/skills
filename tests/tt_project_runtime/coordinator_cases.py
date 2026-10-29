@@ -4879,6 +4879,32 @@ def test_a_review_or_merge_ask_with_a_pr_approve_record_is_refused_once_naming_i
 
 
 
+def test_a_re_ask_of_an_answered_question_in_other_words_and_other_context_is_refused(env):
+    p = make(env)
+    from ttp import coordinator as coord, reask
+    db = p.db
+    first = ("Make the nightly cleanup rule permanent? Right now the charter allows the cleanup only under your "
+             "exception, which ends on Friday. Yes = drop the end date.")
+    problems, sent = _ask(p, first, **_OWN_ACCESS)
+    assert problems == []
+    mid = db.post("in", f"#{sent['id']}: yes, permanent", chat=None, kind="user", provenance="web-session")
+    assert coord.apply(p, [{"type": "resolve", "id": sent["id"]}], messages=[mid]) == []
+    # The same question in other words, wrapped in context the first ask did not have.
+    again = ("Should the nightly cleanup rule become permanent? Your exception covers the cleanup on idle hosts "
+             "only, and it ends on Friday unless you say otherwise. Yes = no end date.")
+    assert not reask.matches(again, first) and reask.same_question(again, first)
+    problems, last = _ask(p, again, **_OWN_ACCESS)
+    assert problems and f"already settled by ask #{sent['id']}, answered in user msg #{mid}" in problems[0], problems
+    assert last["id"] == sent["id"], "the re-ask reached the user"
+    # Another question on the subject, or the same question about another machine, goes out.
+    assert not reask.same_question("Should the nightly cleanup also cover the scratch volume?", first)
+    assert not reask.same_question("Make the cleanup rule on box-b2 permanent?",
+                                   "Make the cleanup rule on box-a1 permanent?")
+    assert reask.same_question("Should the cleanup rule on box-a1 become permanent?",
+                               "Make the cleanup rule on box-a1 permanent?")
+    assert _ask(p, "Should the nightly cleanup also cover the scratch volume?", **_OWN_ACCESS)[0] == []
+
+
 def test_a_restriction_ask_must_name_the_least_disruptive_way_forward(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -4955,9 +4981,9 @@ def test_an_unanswered_ask_resolves_to_its_recommendation_at_the_deadline(env):
     ("access", "Merge it", "open"),
     ("irreversible", "wait an hour, then delete the data", "open"),
     ("irreversible", "never delete the data", "open"),      # only a bare decline from askauto.DECLINES
-    ("restriction", "wait for Monday, then lift it", "stay"),
-    ("restriction", "Yes", "stay"),
-    ("restriction", "no, leave it as written", "stay"),
+    ("restriction", "wait for Monday, then lift it", "open"),
+    ("restriction", "Yes", "open"),
+    ("restriction", "no, leave it as written", "open"),
     ("access", "don't post the summary", "open"),
     ("spend", "use the cheaper runner", "apply"),
     ("review", "no", "open"),
@@ -4967,11 +4993,11 @@ def test_an_unanswered_ask_resolves_to_its_recommendation_at_the_deadline(env):
     ("irreversible", "no - delete the branch", "open"),
     ("funds", "No, raise the cap to $50", "open"),
     ("access", "No; use the API key from the vault", "open"),
-    ("restriction", "No, lift it", "stay"),
+    ("restriction", "No, lift it", "open"),
     ("access", "Don't wait; merge it now", "open"),
     ("access", "skip the review and merge", "open"),
     ("spend", "no, keep the cap and spend the rest", "open"),
-    ("restriction", "no, leave it as written and lift the other one", "stay"),
+    ("restriction", "no, leave it as written and lift the other one", "open"),
     ("access", "send the vendor a message asking for a quote", "open"),   # speaks to people as the user
     ("spend", "reply to the issue reporter with the numbers", "open"),
     ("access", "comment on their PR with the fix", "open"),
@@ -4984,7 +5010,7 @@ def test_an_unanswered_ask_resolves_to_its_recommendation_at_the_deadline(env):
     ("access", "no, don't message the vendor", "open"),
     ("irreversible", "No, keep it", "open"),
     ("irreversible", "no. leave the branch as is.", "open"),
-    ("restriction", "no, don't keep it", "stay"),              # a double negative means act (review #4421)
+    ("restriction", "no, don't keep it", "open"),              # a double negative means act (review #4421)
     ("irreversible", "don't keep the branch", "open"),
     ("irreversible", "don't wait to merge it", "open"),
     ("funds", "don't hesitate to raise the cap", "open"),
@@ -4999,19 +5025,29 @@ def test_the_ask_timer_applies_only_a_recommendation_that_grants_nothing_only_th
     assert askauto.outcome(blocking, rec)[0] == kind
 
 
-def test_a_restriction_ask_keeps_the_restriction_as_written_at_the_timeout(env):
+def test_a_restriction_ask_stays_open_past_the_timeout_and_never_loosens_it(env):
     p = make(env)
-    from ttp import coordinator as coord
+    from ttp import askauto, coordinator as coord, unblock
+    db = p.db
     way = "a canary on one box breaks the no-shared-machines restriction"
     _, loosen = _ask(p, "Lift the shared-machine ban?", blocking="restriction", classify="restriction_change",
                      least_disruptive=way, recommendation="lift it for one run")
-    assert "acts on keep the restriction as written" in loosen["text"]
-    assert coord.expire_asks(p, now=loosen["ts"] + 3600) == [loosen["id"]]
-    told = p.db.one("SELECT text FROM messages WHERE kind='alert' ORDER BY id DESC LIMIT 1")["text"]
-    assert "the restriction stays as written" in told and "lift it for one run" in told
-    ev = p.db.one("SELECT text FROM events WHERE kind='ask_timeout'")["text"]
-    assert "Do not act on its recommendation" in ev
+    # The ask says model-free what waits and why; the timer neither loosens it nor closes it as a decision.
+    assert "waits for the user (its recommendation would loosen a restriction, and only the user's own words " \
+        "do that); other work goes on" in loosen["text"]
+    late = loosen["ts"] + 3600
+    assert coord.expire_asks(p, now=late) == []
+    assert db.one("SELECT handled FROM messages WHERE id=?", (loosen["id"],))["handled"] == 0
+    assert db.one("SELECT 1 FROM messages WHERE kind='alert'") is None
+    assert db.one("SELECT 1 FROM events WHERE kind='ask_timeout'") is None
+    assert str(loosen["id"]) not in (db.kv(unblock.RESOLVED_KEY, {}) or {})
+    assert askauto.check(db, p.config(), late + 7200) == []
+    assert not any("auto-resolved" in m.read_text() for m in p.memory_dir.glob("*.md"))
     assert "lift it for one run" not in p.charter_path.read_text()
+    # It stays answerable: the user's later yes resolves it like any other ask.
+    mid = db.post("in", f"#{loosen['id']}: yes, for one run", chat=None, kind="user", provenance="web-session")
+    assert coord.apply(p, [{"type": "resolve", "id": loosen["id"]}], messages=[mid]) == []
+    assert db.one("SELECT handled FROM messages WHERE id=?", (loosen["id"],))["handled"] == 1
 
 
 def test_the_ask_deadline_shows_in_status_the_web_app_and_the_digest(env):
@@ -5565,11 +5601,10 @@ def test_exempt_asks_stay_open_past_the_timeout(env):
                      least_disruptive="a canary on one box breaks the no-shared-machines restriction",
                      recommendation="no, don't keep it")
     assert pk == [], pk
-    assert "waits for the user" in worded["text"] and "acts on keep the restriction as written" in loosen["text"]
-    assert sorted(coord.expire_asks(p, now=time.time() + 3600)) == sorted([no["id"], keep["id"], loosen["id"]])
-    assert p.db.one("SELECT handled FROM messages WHERE id=?", (worded["id"],))["handled"] == 0
-    ev = p.db.one("SELECT text FROM events WHERE kind='ask_timeout' ORDER BY id DESC LIMIT 1")["text"]
-    assert f"Ask #{loosen['id']} got no answer in 30 min and auto-resolved to its default: keep the restriction" in ev
+    assert "waits for the user" in worded["text"] and "waits for the user" in loosen["text"]
+    assert sorted(coord.expire_asks(p, now=time.time() + 3600)) == sorted([no["id"], keep["id"]])
+    assert all(p.db.one("SELECT handled FROM messages WHERE id=?", (a["id"],))["handled"] == 0
+               for a in (worded, loosen))
 
 
 
