@@ -16,7 +16,8 @@ spawned many tasks joins none.
 
 With review.area_fail_cap (default 3; 0 off) or more reviews of one area failed or asking for
 changes within AREA_WINDOW_S, the daemon queues no automatic fix for it and raises a
-REVIEW_AREA_EVENT, which makes the coordinator's turn a tricky one (TRIGGER) that re-plans.
+REVIEW_AREA_EVENT, which makes the coordinator's turn a tricky one (TRIGGER) that re-plans. The
+event names each failed review's first finding in one line (first_finding).
 A review whose hand-off says `review_failure: check_only` (daemon.review_failure) found no code
 problem, only a missing or inapplicable check, so it does not count toward the cap; nor does one
 the push queue failed because only its batch checks failed (pushq._settle writes check_only too),
@@ -44,6 +45,8 @@ TITLE_REF = re.compile(r"(?i)^\s*(?:fix\s+)?(?:re-?)?review\s+#(\d+)|#(\d+)\s+fo
 LINK_LABELS = ("review_fix:", "auto_review:")
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@ ?(.*)$")
 DEF = re.compile(r"^\s*(?:export\s+)?(?:async\s+)?(?:def|class|function|fn|func|sub)\s+([A-Za-z_]\w*)")
+FINDING_CHARS = 200   # one failed review's first finding in the event
+MAX_FINDINGS = 6      # the newest failed reviews whose first finding the event names
 TEST_PATH = re.compile(r"(^|/)(tests?|testing)/|(^|/)test_[^/]*$|_test\.[^/]+$|\.(spec|test)\.[^/]+$")
 
 
@@ -229,7 +232,20 @@ def area(p, cfg: dict, review: dict, now: float | None = None) -> dict | None:
     files = sorted({f for i in hit if (f := mains[i] if i in mains else main_file(p, db.task(i) or review))})
     root = db.task(min(line)) or review
     return {"root": root["id"], "title": str(root["title"])[:120], "reviews": sorted(hit),
-            "own": sorted(hit & line), "pooled": sorted(hit - line), "tasks": sorted(line | hit), "files": files}
+            "own": sorted(hit & line), "pooled": sorted(hit - line), "tasks": sorted(line | hit), "files": files,
+            "findings": {str(i): first_finding(review if i == review["id"] else db.task(i))
+                         for i in sorted(hit)[-MAX_FINDINGS:]}}
+
+
+def first_finding(task: dict | None) -> str:
+    """Review `task`'s first finding in one line (FINDING_CHARS): its first follow-up (title: spec),
+    else its hand-off summary, so the area's re-plan needs no extra reads."""
+    r = load_result((task or {}).get("result"))
+    fups = [f for f in r.get("followups") or [] if isinstance(f, dict) and (f.get("title") or f.get("spec"))]
+    text = ": ".join(str(fups[0].get(k) or "").strip() for k in ("title", "spec") if fups[0].get(k)) if fups \
+        else str(r.get("summary") or "")
+    text = " ".join(text.split())
+    return (text[:FINDING_CHARS - 1] + "…" if len(text) > FINDING_CHARS else text) or "no finding recorded"
 
 
 def _refs(ids) -> str:
@@ -251,7 +267,9 @@ def event_text(a: dict) -> str:
             f"{AREA_WINDOW_S / 3600:g} h in the lineage of #{a['root']} ({a['title']}): "
             + _split(a) + f"; tasks {tasks}; main files: "
             + (", ".join(a["files"]) or "unknown")
-            + ". The daemon queues no more automatic fixes for it. Re-plan this area: narrow the scope, accept "
+            + "." + "".join(f"\n- #{i} first finding: {f}" for i, f in (a.get("findings") or {}).items())
+            + ("\n" if a.get("findings") else " ")
+            + "The daemon queues no more automatic fixes for it. Re-plan this area: narrow the scope, accept "
               "and document the known gaps, or redesign. Do not add another edge-case fix, and do not raise "
               "the tier to deep for this alone. Record the settled design with `memory_add` `memory_kind: "
               "settled_area` (`files`, `title` as the one-line rule, `text` the decision, `reviews` the failed "

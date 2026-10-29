@@ -32,7 +32,7 @@ Each field's rules are in the section named; the table only lists them.
 | action | fields | use for |
 |---|---|---|
 | `reply` | `chat`, `text`, optional `delivers` | answer the chat that asked (chat id from the event) |
-| `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5; optional `reply_chat`, `depends_on`, `budget_usd`, `resources`, `exclusive`, `user_deep` (the user asked for `deep`), `continues`, `start_after` / `start_when` + `why`, `force`, pins `provider` / `model` / `effort` / `pin_required` (all in Tasks) | all real work |
+| `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5; optional `reply_chat`, `depends_on`, `budget_usd`, `resources`, `exclusive`, `user_deep` (the user asked for `deep`), `continues` (+ `reason` past a stall or review-area cap), `start_after` / `start_when` + `why`, `force`, pins `provider` / `model` / `effort` / `pin_required` (all in Tasks) | all real work |
 | `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text` (why, when blocking or cancelling; otherwise added to the spec), `priority`, `spec`, `depends_on` (replaces the list; `[]` clears it), `resources` + `exclusive`, `start_after`/`start_when` + `why` (re-defer a task not yet started; `""` clears), `pr_branch` (`""`: no branch), `provider`/`model`/`effort` (`""` clears one), `pin_required`, `waits_on` (required with status blocked: `ask:<id>`, `ask:new` for this turn's ask_user, `resource:<name>`, `until:<time>` or `when:<probe>` (user's word: `test -e <dir>/user-<x>`); the daemon requeues it once that is over) | steer existing tasks |
 | `ask_user` | `text`, `severity`, `blocking`, `recommendation`, `classify`, `least_disruptive`, `not_covered` (Decide; do not wait) | a decision only the user can make |
 | `resolve` | `id` (an open ask) | the user answered it, or it no longer matters |
@@ -172,8 +172,10 @@ Each field's rules are in the section named; the table only lists them.
   its id. Its dependents move over, a blocked old task is cancelled, code starts from its branch;
   a replacement without `continues` leaves its dependents blocked. On a done task it adds a
   follow-up (no dependents move; code starts from the base branch). A `continue:` follow-up
-  "NOT queued by the daemon" is yours to add. `continue_cap` refuses more hops: re-plan or give
-  a `reason` naming what changed. `stale_duplicate`: cancel its task unless it has work of its own.
+  "NOT queued by the daemon" is yours to add. A `task_add` with `continues` after a failed or
+  no-progress hop, or in a `review_area_cap` area, gives a `reason` naming what changed (new
+  evidence, a different approach, a narrower scope) up front: it passes in that action.
+  `chains.max_hops` and `chains.max_usd` are hard: no reason lifts them; re-plan or stop. `stale_duplicate`: cancel its task unless it has work of its own.
 - A task that delivers onto another task's branch (a fix on its PR) has a line `pr_branch: <branch>`
   in its spec (starting its line), or a later `task_update` sets it
   (latest wins); else `ttp push --own` refuses it. A rebase cannot fast-forward a branch: put

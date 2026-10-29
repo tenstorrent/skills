@@ -463,3 +463,45 @@ def test_task_show_names_why_a_task_has_its_tier_and_old_records_still_load(env,
     assert old["tier_source"] is None and old["assigned_tier"] is None
     assert "tier: deep\n" in show_task(old) + "\n" and "(" not in show_task(old).splitlines()[1]
     assert chaincap.hop_tier(old, {"title": "continue: x"}) == "deep"
+
+
+def test_a_continue_over_a_soft_cap_with_a_reason_passes_in_the_same_action_and_hard_caps_hold(env):
+    """Plan #4141: every continue refusal passed on the next turn once a `reason` came, so each cost a
+    turn. A reason sent with the first task_add passes a soft cap (stalls, review area) at once and is
+    recorded with the cap it lifted; one without it is told the field to add; max_usd and max_hops
+    stay hard whatever the reason."""
+    import json
+    p = make(env)
+    from ttp import chaincap
+    from ttp import coordinator as coord
+    why = "new evidence: the header parser was the slow step, a different approach caches it"
+    _, _, tip = _chain(p, 2)   # two done hops with no progress: the stall cap
+    act = {"type": "task_add", "title": "continue: parser, next", "spec": "carry on", "kind": "code", "continues": tip}
+    assert "chains.max_stalls is 2" in chaincap.refusal(p, p.config(), chaincap.chain(p.db, tip))
+    assert coord.apply(p, [dict(act, reason=why)]) == []
+    (new,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (tip,))
+    (ev,) = p.db.q("SELECT * FROM events WHERE kind=?", (chaincap.OVERRIDE_EVENT,))
+    data = json.loads(ev["data"])
+    assert (data["cap"], data["reason"], ev["task"]) == ("max_stalls", why, tip)
+    assert not p.db.q("SELECT 1 FROM events WHERE kind=?", (chaincap.CAP_EVENT,)), "no extra turn"
+    # No reason: refused, naming the field to add and the words it needs.
+    _, _, tip2 = _chain(p, 2)
+    (bare,) = coord.apply(p, [dict(act, title="continue: lexer", continues=tip2)])
+    assert "refused" in bare and "it has no `reason`" in bare and "add a `reason` field" in bare, bare
+    assert "new evidence, a different approach or a narrower scope" in bare
+    for wording in ("narrower scope: only the header parser, not the body",
+                    "new evidence: the profile shows the header is the slow step"):
+        assert chaincap.reason_ok(wording), wording
+    # Over max_usd (or max_hops) a valid reason is still refused, and the event says no reason lifts it.
+    ids = _chain(p, 1)
+    p.db.x("UPDATE tasks SET spent_usd=25 WHERE id IN (?,?)", ids)
+    (over,) = coord.apply(p, [dict(act, title="continue: emitter", continues=ids[-1], reason=why)])
+    assert "chains.max_usd is $40" in over and "chains.max_usd is hard" in over, over
+    assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (ids[-1],))
+    cap = p.db.one("SELECT * FROM events WHERE kind=? AND task=?", (chaincap.CAP_EVENT, ids[-1]))
+    assert "no `reason` lifts it" in cap["text"] and json.loads(cap["data"])["cap"] == "max_usd"
+    assert len(p.db.q("SELECT 1 FROM events WHERE kind=?", (chaincap.OVERRIDE_EVENT,))) == 1
+    p.set_config("chains.max_hops", 2)
+    ids = _chain(p, 2)
+    (hops,) = coord.apply(p, [dict(act, title="continue: linker", continues=ids[-1], reason=why)])
+    assert "chains.max_hops is hard" in hops, hops

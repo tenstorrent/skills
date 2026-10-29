@@ -382,7 +382,7 @@ CACHED_SECTIONS = ("memory_recent",)
 EVENT_CHARS = 1500
 # A plan's product arrives as these events; the daemon sizes them to fit, so they show whole.
 EVENT_CHARS_BY_KIND = {"followup_proposed": 4300, "task_notes": 6000, "upstream_note": 4300,
-                       "charter_retry": 8000, budgetkind.KIND: 2000}
+                       "charter_retry": 8000, budgetkind.KIND: 2000, reviewcap.REVIEW_AREA_EVENT: 2600}
 # A refusal that carries the user's approved charter text to resend exactly (_charter_approval) keeps
 # up to this much of it in the digest and the charter_retry event: a clipped copy gets reworded.
 RESEND_CHARS = 6000

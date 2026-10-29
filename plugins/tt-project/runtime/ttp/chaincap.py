@@ -17,9 +17,11 @@ Caps (`chains` in project.json; 0 turns one off): max_hops (DEFAULTS: 8), max_st
 no-progress hops in a row) and max_usd (40 for the whole lineage). Once one is reached, or while
 the lineage's area is under review.area_fail_cap (a reviewcap.REVIEW_AREA_EVENT within
 reviewcap.AREA_WINDOW_S naming one of its tasks), a task_add that continues the lineage is refused,
-and a CAP_EVENT makes the next coordinator turn a triggered one (TRIGGER). The only way past is
-the action's `reason` naming what changed (REASON_RE: a new approach, a rescoped spec, new
-evidence); that override is recorded as an OVERRIDE_EVENT.
+and a CAP_EVENT makes the next coordinator turn a triggered one (TRIGGER). The only way past the
+soft caps (max_stalls, the review area) is the action's `reason` naming what changed (REASON_RE: a
+new approach, a rescoped spec, new evidence): given with the first task_add it passes in that same
+action, recorded as an OVERRIDE_EVENT with the cap it lifted; the refusal names the field to add.
+max_hops and max_usd (HARD) are spend safety: no reason lifts them.
 
 Model-free hop (`chains.auto`, on by default): a done task whose only proposal is one `continue:`
 follow-up, in a lineage below every cap, that made progress gets the follow-up queued by the daemon
@@ -59,6 +61,9 @@ TIERS = ("light", "standard", "deep")
 REASON_RE = re.compile(r"(?i)\b(?:new|different|changed|other)\s+(?:approach|evidence|design|strategy)\b"
                        r"|\bre-?scop\w*|\bnarrow\w*\s+(?:the\s+)?scope|\bscope[sd]?\s+(?:down|narrow\w*)")
 MIN_REASON = 20
+HARD = ("max_hops", "max_usd")   # caps no `reason` lifts (spend safety); max_stalls and review.area_fail_cap take one
+REASON_HINT = ("add a `reason` field to the task_add that names what changed, in these words: new evidence, "
+               f"a different approach or a narrower scope (at least {MIN_REASON} characters); it then passes in the same action")
 DEFAULTS = {"max_hops": 8, "max_stalls": 2, "max_usd": 40.0, "auto": True}
 CAP_EVENT = "continue_cap"
 OVERRIDE_EVENT = "continue_cap_override"
@@ -214,22 +219,28 @@ def area_held(db: DB, ch: list[dict], now: float | None = None) -> int | None:
     return None
 
 
-def refusal(p, cfg: dict, ch: list[dict]) -> str:
-    """Why another hop after the chain `ch` is refused, '' when it may follow."""
+def cap_hit(p, cfg: dict, ch: list[dict]) -> tuple[str, str]:
+    """The cap another hop after the chain `ch` reaches and why: (its key, the reason), ('', '') when it may follow."""
     if not ch:
-        return ""
+        return "", ""
     c, root = caps(cfg), ch[0]
     hops, usd = len(ch) - 1, spend(ch)
     head = f"the continue chain of #{root['id']} ({str(root['title'])[:80]}) "
     if c["max_hops"] and hops + 1 > c["max_hops"]:
-        return head + f"has {hops} hops; chains.max_hops is {c['max_hops']:g}"
+        return "max_hops", head + f"has {hops} hops; chains.max_hops is {c['max_hops']:g}"
     if c["max_usd"] and usd >= c["max_usd"]:
-        return head + f"spent ${usd:.2f}; chains.max_usd is ${c['max_usd']:g}"
+        return "max_usd", head + f"spent ${usd:.2f}; chains.max_usd is ${c['max_usd']:g}"
     if (a := area_held(p.db, ch)) is not None:
-        return head + f"is in the review area of #{a}, under review.area_fail_cap (re-plan it first)"
+        return "area_fail_cap", head + f"is in the review area of #{a}, under review.area_fail_cap (re-plan it first)"
     if c["max_stalls"] and (n := stalls(p, ch)) >= c["max_stalls"]:
-        return head + f"ended with {n} failed or no-progress hops in a row; chains.max_stalls is {c['max_stalls']:g}"
-    return ""
+        return "max_stalls", head + (f"ended with {n} failed or no-progress hops in a row; chains.max_stalls is "
+                                     f"{c['max_stalls']:g}")
+    return "", ""
+
+
+def refusal(p, cfg: dict, ch: list[dict]) -> str:
+    """Why another hop after the chain `ch` is refused, '' when it may follow."""
+    return cap_hit(p, cfg, ch)[1]
 
 
 def reason_ok(reason) -> bool:
@@ -240,27 +251,35 @@ def reason_ok(reason) -> bool:
 
 def check_add(p, cfg: dict, prev: int, reason) -> str:
     """For a task_add continuing `prev`: '' when its lineage is under every cap, a note when `reason`
-    takes it past one; otherwise raises ValueError, with a CAP_EVENT for the
-    next turn (once per lineage and hop count)."""
+    takes it past a soft one (max_stalls, review.area_fail_cap) in the same action; otherwise raises
+    ValueError naming the field to add, with a CAP_EVENT for the next turn (once per lineage and hop
+    count). No reason lifts a HARD cap (max_hops, max_usd)."""
     db = p.db
     ch = chain(db, prev)
-    why = refusal(p, cfg, ch)
+    cap, why = cap_hit(p, cfg, ch)
     if not why:
         return ""
-    data = {"root": ch[0]["id"], "tip": prev, "hops": len(ch) - 1, "usd": round(spend(ch), 2), "why": why}
-    if reason_ok(reason):
+    hard = cap in HARD
+    data = {"root": ch[0]["id"], "tip": prev, "hops": len(ch) - 1, "usd": round(spend(ch), 2), "why": why, "cap": cap}
+    if not hard and reason_ok(reason):
         db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
              (time.time(), "coordinator", OVERRIDE_EVENT, "low", f"{why}; passed with reason: {str(reason)[:300]}",
               json.dumps({**data, "reason": str(reason)[:300]}), "handled", prev))
         return f"task_add continues #{prev} past its cap ({why}) with reason: {str(reason)[:200]}"
     fp = f"{CAP_EVENT}:{ch[0]['id']}:{len(ch) - 1}"
+    way = (f"chains.{cap} is hard: no `reason` lifts it" if hard else
+           "a task_add that continues it passes only with a `reason` naming what changed")
     if not db.one("SELECT 1 FROM events WHERE fingerprint=?", (fp,)):
         db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
              (time.time(), "coordinator", CAP_EVENT, fp, "normal",
               f"{TRIGGER}: {why}. Another hop is refused. Re-plan: narrow the scope, change the approach, or stop "
-              f"and report what is left; a task_add that continues it passes only with a `reason` naming what "
-              f"changed.", json.dumps(data), "queued", prev))
-    hint = "its `reason` does not name what changed (a new approach, a rescoped spec, new evidence)"
+              f"and report what is left; {way}.", json.dumps(data), "queued", prev))
+    if hard:
+        hint = f"chains.{cap} is hard and no `reason` lifts it: re-plan (narrow the scope) or stop and report what is left"
+    elif str(reason or "").strip():
+        hint = f"its `reason` does not name what changed; {REASON_HINT}"
+    else:
+        hint = f"it has no `reason`: {REASON_HINT}"
     raise ValueError(f"task_add continues #{prev} refused: {why}; {hint}")
 
 

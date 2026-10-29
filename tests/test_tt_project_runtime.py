@@ -32228,6 +32228,11 @@ def test_a_continue_chain_over_its_cap_is_refused_unless_its_reason_names_what_c
     coord.apply(p, [act])
     assert len(p.db.q("SELECT id FROM events WHERE kind=?", (chaincap.CAP_EVENT,))) == 1, "one event per lineage and hop"
     why = "new approach: parse the header once instead of per line"
+    # chains.max_hops is hard: no reason lifts it. Its done hops made no progress, so with it off
+    # the stall cap holds, and that one a reason passes.
+    problems = coord.apply(p, [dict(act, reason=why)])
+    assert any("chains.max_hops is hard" in x for x in problems), problems
+    p.set_config("chains.max_hops", 0)
     problems = coord.apply(p, [dict(act, reason="keep going, it is almost there")])
     assert any("does not name what changed" in x for x in problems)
     assert coord.apply(p, [dict(act, reason=why)]) == []

@@ -12311,6 +12311,31 @@ def test_a_failed_review_at_the_review_area_cap_gets_no_fix_or_re_review_and_one
     assert len(area) == 1 and reviewcap.TRIGGER in failed["text"]
 
 
+
+def test_the_review_area_cap_event_names_each_failed_reviews_first_finding(env):
+    """The re-plan of a capped area read every failed review's hand-off first. The event now carries
+    each one's first finding in one line, so it needs no extra reads."""
+    from ttp import reviewcap
+    from ttp import coordinator as coord
+    p = make(env)
+    p.set_config("review.area_fail_cap", 2)
+    code_a, _, _, (rev_a,) = _finish_code(env, p, "feature", {"a.py": 40})
+    _fail_review(env, p, rev_a["id"], [{"title": "parse('') raises", "spec": "an empty\n input   must give []"},
+                                       {"title": "second finding", "spec": "not shown"}])
+    _, _, _, (rev_b,) = _finish_code(env, p, f"#{code_a} follow-up: feature", {"b.py": 40})
+    _fail_review(env, p, rev_b["id"], [{"title": "x" * 400, "spec": "long"}])
+    (ev,) = p.db.q("SELECT * FROM events WHERE task=? AND kind=?", (rev_b["id"], reviewcap.REVIEW_AREA_EVENT))
+    found = json.loads(ev["data"])["findings"]
+    assert found[str(rev_a["id"])] == "parse('') raises: an empty input must give []"
+    assert len(found[str(rev_b["id"])]) == reviewcap.FINDING_CHARS and found[str(rev_b["id"])].endswith("…")
+    assert f"\n- #{rev_a['id']} first finding: parse('') raises: an empty input must give []\n" in ev["text"]
+    assert "second finding" not in ev["text"] and ev["text"].rstrip().endswith("touch those files.")
+    assert reviewcap.first_finding({"result": json.dumps({"summary": "the lock  is\nnever freed"})}) \
+        == "the lock is never freed"
+    assert reviewcap.first_finding({"result": None}) == "no finding recorded"
+    # The digest shows it whole.
+    assert len(ev["text"]) <= coord.EVENT_CHARS_BY_KIND[reviewcap.REVIEW_AREA_EVENT]
+
 def _ttp_task(p, *args):
     """`ttp task <p> <args>`: its exit code (0 when it returned)."""
     from ttp import cli
