@@ -121,3 +121,96 @@ def test_obligation_no_live_owner_event_says_so_when_no_open_task_names_one(env,
     p.db.update_task(tid, status="failed")
     evs = check(now + 2 * 3600 + 60)
     assert len(evs) == 1 and "no open task names a former owner" in evs[0]["text"], evs
+
+
+def _handle_overdue(p):
+    p.db.x("UPDATE events SET status='handled' WHERE kind='obligation_overdue' AND status='queued'")
+
+
+def test_obligation_with_every_owner_ended_is_reowned_once_its_wake_was_handled(env, monkeypatch):
+    """The 2026-10-27 case: every owner ended without a receipt (one cancelled, three done), the overdue wake
+    went out once, and the coordinator's attach of a task that had just finished was rejected. The episode
+    then stayed covered and nothing woke for 48 h. Now the daemon starts one owner, once per owner set."""
+    from ttp import coordinator as coord, obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    others = [p.db.add_task(f"pass {i}", "s", kind="work", tier="light", origin="coordinator") for i in range(3)]
+    oid = ob.add(p, "post each CI run's result", [tid, *others], now=now)
+    p.db.update_task(tid, status="cancelled")
+    for t in others:
+        p.db.update_task(t, status="done")
+    t0 = now + 2 * 3600 + 60
+    assert len(check(t0)) == 1, "the no-live-owner wake"
+    # Its turn names a task that finished meanwhile: the attach is rejected, nothing is attached.
+    late = p.db.add_task("continue: CI read", "s", kind="work", tier="light", status="done")
+    problems = coord.apply(p, [{"type": "obligation", "key": oid, "owners": [late]}])
+    assert problems and "is done" in problems[0], problems
+    assert len(check(t0 + 600)) == 1, "an unanswered wake: the daemon waits for the turn"
+    _handle_overdue(p)
+    p.db.x("INSERT INTO runs(task, role, status, started) VALUES(NULL, 'coordinator', 'running', ?)", (t0,))
+    check(t0 + 900)
+    check(t0 + 1200)
+    assert set(ob.get(p.db, oid)["owners"]) == {str(t) for t in (tid, *others)}, "the answering turn may still attach"
+    p.db.x("UPDATE runs SET status='ok'")
+    # A turn started after the wake was seen answered never saw it: it does not hold the re-owning back.
+    p.db.x("INSERT INTO runs(task, role, status, started) VALUES(NULL, 'coordinator', 'running', ?)", (t0 + 1300,))
+    check(t0 + 1500)
+    o = ob.get(p.db, oid)
+    new = [int(t) for t in o["owners"] if int(t) not in (tid, *others)]
+    assert len(new) == 1, o["owners"]
+    t = p.db.task(new[0])
+    assert t["status"] == "queued" and t["origin"] == "daemon" and t["priority"] == 1
+    assert f"{ob.REOWN_LABEL}{oid}" in t["labels"] and f"## Obligation {oid} " in t["spec"]
+    assert f"#{tid} (cancelled)" in t["spec"] and "post each CI run's result" in t["spec"]
+    assert "no live owner" not in ob.lines(p.db, t0 + 1500)[0]
+    # A second pass starts nothing more.
+    check(t0 + 2100)
+    assert len(ob.get(p.db, oid)["owners"]) == 5
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+
+
+def test_obligation_daemon_owner_ending_without_receipt_wakes_once_never_a_second_owner(env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    oid = ob.add(p, "the benchmark table", [tid], now=now)
+    p.db.update_task(tid, status="failed")
+    t0 = now + 2 * 3600 + 60
+    assert len(check(t0)) == 1
+    _handle_overdue(p)
+    check(t0 + 300)
+    mine = [int(t) for t in ob.get(p.db, oid)["owners"] if int(t) != tid]
+    assert len(mine) == 1, "no turn running: re-owned on the first pass that sees the wake answered"
+    t1 = t0 + 600
+    check(t1)   # its owner is live: the episode ends
+    assert ob.get(p.db, oid)["raised"] is None
+    p.db.update_task(mine[0], status="done")   # the daemon's owner also ends without a receipt
+    t2 = t1 + 2 * 3600 + 60
+    evs = check(t2)
+    assert len(evs) == 2, "the new episode's wake"
+    _handle_overdue(p)
+    evs = check(t2 + 300)
+    assert len(evs) == 3 and evs[-1]["fingerprint"] == f"obligation:{oid}:reown:{tid}-{mine[0]}", evs
+    assert f"#{mine[0]} ended without a receipt" in evs[-1]["text"] and evs[-1]["severity"] == "high"
+    _handle_overdue(p)
+    for k in range(1, 6):   # never a loop: no second owner, no repeated wake while the owners stay the same
+        evs = check(t2 + 300 + k * 3 * 3600)
+    assert len(evs) == 3
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+
+
+def test_obligation_reown_skips_a_wake_answered_with_an_owner_dropped_or_received(env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    a = ob.add(p, "answered", [tid], now=now)
+    b = ob.add(p, "dropped", [tid], now=now)
+    c = ob.add(p, "received", [tid], now=now)
+    p.db.update_task(tid, status="done")
+    t0 = now + 2 * 3600 + 60
+    assert len(check(t0)) == 3
+    _handle_overdue(p)
+    carrier = p.db.add_task("carry it on", "s", kind="work", tier="light", origin="coordinator")
+    ob.attach(p, a, [carrier], now=t0 + 60)
+    ob.drop(p, b, "no longer wanted", by="coordinator")
+    ob.record(p, c, "receipt", "results/table.md", None, now=t0 + 60)
+    check(t0 + 300)
+    check(t0 + 600)
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 0

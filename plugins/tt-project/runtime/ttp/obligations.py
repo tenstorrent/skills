@@ -100,6 +100,7 @@ KV = "obligations"            # kv: {"next": n, "items": {id: record}, "runs": {
 RUN_FILE = "obligations.jsonl"
 CLOCK_S = 2 * 3600
 CHECK_EVERY_S = 300
+REOWN_LABEL = "reown:"        # + obligation id: the owner task the daemon started for it
 RUN_FILES_DAYS = 7            # run records are looked for in runs started this recently (or still running)
 RUN_IDS_PER_QUERY = 500       # kept run offsets checked per query (SQLite caps the variables in one)
 CLOSED = ("done", "failed", "cancelled")
@@ -971,6 +972,61 @@ def _check_milestones(p, o: dict, now: float, raised: list[str]) -> bool:
     return changed
 
 
+def _reown(p, o: dict, now: float, raised: list[str]) -> bool:
+    """An obligation whose no-live-owner wake was answered and still has no live owner once the turns that
+    could have answered it ended: that fix did not land (an attach of a task that finished meanwhile, a
+    rejected task_add). Once per owner set (`reowned`), model-free: a new owner task, or, once the
+    daemon's own owner also ended without a receipt, one more high wake; never a second daemon owner.
+    Returns whether it changed."""
+    db, oid = p.db, o["id"]
+    state = sorted(o["owners"], key=int)
+    if (o.get("reowned") or {}).get("state") == state:
+        return False
+    if db.one("SELECT id FROM events WHERE fingerprint=? AND status IN ('new','queued')",
+              (f"obligation:{oid}:{o['episode']}",)):
+        return False   # the wake is not answered yet
+    first = (o.get("answered") or {}).get("episode") != o["episode"]
+    if first:   # first seen answered: only a turn already running then can have answered it
+        o["answered"] = {"episode": o["episode"], "at": now}
+    if db.one("SELECT id FROM runs WHERE role='coordinator' AND status='running' AND started<=?",
+              (o["answered"]["at"],)):
+        return first   # the turn that answered it may still attach an owner
+    label = f"{REOWN_LABEL}{oid}"
+    rows = db.q(f"SELECT id, status, labels FROM tasks WHERE id IN ({','.join('?' * len(state))})",
+                [int(t) for t in state]) if state else []
+    status = {str(r["id"]): r["status"] for r in rows}
+    former = ", ".join(f"#{t} ({status.get(t, 'gone')})" for t in state) or "none"
+    mine = [str(r["id"]) for r in rows if f'"{label}"' in (r["labels"] or "")]   # labels: a JSON list of strings
+    o["reowned"] = {"state": state, "at": now}
+    if mine:
+        fp = f"obligation:{oid}:reown:{'-'.join(state)}"
+        o["reowned"]["wake"] = fp
+        text = (f"Obligation {oid} is still owed to the user with no live owner: {o['text']}\n"
+                f"- its overdue wake was handled but no owner was attached, and the daemon's own owner "
+                f"#{', #'.join(mine)} ended without a receipt; owners: {former}; last evidence: {_evidence(o)}\n"
+                f"Attach the task that produces it (`ttp obligation attach {oid} <task>`), record the receipt, "
+                f"or drop it with the reason. The daemon starts no second owner for it.")
+        if _raise(db, now, fp, "obligation_overdue", text, int(mine[-1])):
+            raised.append(fp)
+        return True
+    spec = (f"Obligation {oid} is owed to the user and has had no live owner since its overdue wake: "
+            f"{o['text']}\n\nFormer owners, each ended without a receipt: {former}. Their last evidence: "
+            f"{_evidence(o)}.\n\nThe daemon started this task because the coordinator's answer to the wake attached "
+            "no owner. Read the former owners' results, then produce what is owed and record the receipt, or, if "
+            "it is already delivered, record the receipt with that evidence. Do only what the charter and its "
+            "policies allow: a step that needs the user's approval (a PR leaving draft, a merge, a post as the "
+            "user) is named in your hand-off as the decision needed, never taken here. If it cannot be produced, "
+            "say why in your hand-off.")
+    tid = db.add_task(f"Carry obligation {oid} to its receipt: {' '.join(o['text'].split())[:120]}", spec,
+                      kind="work", tier="standard", priority=1, origin="daemon", labels=[label])
+    _attach(p, o, [tid], now)
+    o.setdefault("history", []).append({
+        "at": now, "event": "attached", "task": tid,
+        "why": f"the daemon: no live owner after its overdue wake was answered (owners {former})"})
+    o["reowned"]["task"] = tid
+    return True
+
+
 def check(p, now: float | None = None, cfg: dict | None = None) -> list[str]:
     """Raise one keyed observation per stall (file_runs first). An episode covers the owners late when it
     was raised: none again while they stay late, a new one when an owner it does not cover runs late, and
@@ -1015,6 +1071,8 @@ def check(p, now: float | None = None, cfg: dict | None = None) -> list[str]:
                 if covered != o.get("covered"):
                     o["covered"] = covered
                     changed = True
+                if late_ids == [""]:
+                    changed = _reown(p, o, now, raised) or changed
                 continue
             o["episode"] = int(o.get("episode") or 0) + 1
             o["raised"], o["covered"] = now, late_ids
