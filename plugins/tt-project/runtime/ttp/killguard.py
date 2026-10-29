@@ -71,7 +71,8 @@ PIDFILE_RE = re.compile(r"\s*(?:<\s*(\S+)|cat\s+(\S+)|head\s+(?:-n\s*1|-1)\s+(\S
 ADVICE = ("kill only what this task started: record `$!` when you start a process and kill that pid, end your "
           "own process group (`kill -- -<pgid>`), and let ttp's own controls (`ttp detach`, `ttp lock`, "
           "`ttp checks`) end their jobs; never kill by name or pattern; an ended task's detached job, or one "
-          "holding your priority-1 task's resource: `ttp detach --stop <rc>`")
+          "holding your priority-1 task's resource: `ttp detach --stop <rc>`; a driver this task started that "
+          "listed its pids in a file under the task's results dir: `ttp detach --stop-pids <file>`")
 PARSE = ("the kill guard could not parse this command, and a command with kill, pkill or killall that cannot be "
          "parsed is refused; split it into simpler commands")
 

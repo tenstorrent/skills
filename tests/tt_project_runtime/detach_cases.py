@@ -1383,3 +1383,147 @@ def test_launcher_stop_never_targets_its_caller_nor_writes_through_a_stop_symlin
         assert not target.exists() and (res / "STOP").is_symlink()
     finally:
         _end_launcher(proc)
+
+
+def _task_proc(p, tid, project=None, argv=("sleep", "60")):
+    """A process started as a run of task tid (its TTP_TASK and TTP_PROJECT), in a session of its own."""
+    e = {**os.environ, "TTP_TASK": str(tid), "TTP_TASK_ID": str(tid), "TTP_PROJECT": str(project or p.base)}
+    return subprocess.Popen(list(argv), env=e, start_new_session=True)
+
+
+def _pidfile(path, *lines):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(f"{x}\n" for x in lines))
+    return path
+
+
+def test_stop_pids_stops_only_the_listed_processes_of_the_tasks_own_driver(env, tmp_path):
+    """`ttp detach --stop-pids`: a task stops what its driver listed in a pid file under its own results dir
+    (SIGTERM; a pid that is gone is skipped), never a process of the same task the file does not list."""
+    from ttp import jobstop
+    from ttp.runner import proc_start
+    p = make(env)
+    tid = p.db.add_task("driver", "s", kind="work", tier="light", origin="user")
+    a, b, unlisted = _task_proc(p, tid), _task_proc(p, tid), _task_proc(p, tid)
+    try:
+        time.sleep(0.2)
+        f = _pidfile(p.root / "results" / f"t{tid}" / "driver.pids", a.pid, f"{b.pid} start={proc_start(b.pid)}",
+                     _dead_pid())
+        r = _ttp_run(p, "detach", "--stop-pids", str(f), env={"TTP_TASK": str(tid), "TTP_PIDNS": "", "TTP_CGROUP": ""})
+        assert r.returncode == 0 and f"SIGTERM to {a.pid}, {b.pid}" in r.stdout and "already gone" in r.stdout, r
+        assert a.wait(5) == -signal.SIGTERM and b.wait(5) == -signal.SIGTERM and unlisted.poll() is None
+        assert [e["text"] for e in _stopped_events(p) if f"task #{tid}" in e["text"]]
+        r = _ttp_run(p, "detach", "--stop-pids", str(f), env={"TTP_TASK": str(tid), "TTP_PIDNS": "", "TTP_CGROUP": ""})
+        assert r.returncode == 0 and "nothing to stop" in r.stdout, r
+        # A run dir of the task is one of its results dirs too.
+        run = p.runs / "drv"
+        run.mkdir(parents=True)
+        p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+               (tid, "worker", "fake", time.time() - 60, "ok", str(run)))
+        targets, _, why = jobstop.plan_pids(p, _pidfile(run / "pids", unlisted.pid), str(tid))
+        assert why is None and [t[0] for t in targets] == [unlisted.pid]
+    finally:
+        for x in (a, b, unlisted):
+            x.kill()
+            x.wait()
+
+
+def test_stop_pids_refuses_a_file_outside_the_tasks_results_dir_or_reached_by_a_symlink(env, tmp_path):
+    from ttp import jobstop
+    p = make(env)
+    tid = p.db.add_task("driver", "s", kind="work", tier="light", origin="user")
+    other = p.db.add_task("other", "s", kind="work", tier="light", origin="user")
+    proc = _task_proc(p, tid)
+    try:
+        time.sleep(0.2)
+        outside = _pidfile(tmp_path / "elsewhere" / "pids", proc.pid)
+        others = _pidfile(p.root / "results" / f"t{other}" / "pids", proc.pid)
+        (p.root / "results" / f"t{tid}").mkdir(parents=True)
+        linked_file = p.root / "results" / f"t{tid}" / "pids"
+        linked_file.symlink_to(outside)
+        linked_dir = p.root / "results" / f"task-{tid}"
+        linked_dir.symlink_to(outside.parent, target_is_directory=True)
+        for f in (outside, others, linked_file, linked_dir / "pids", tmp_path / "missing"):
+            targets, _, why = jobstop.plan_pids(p, f, str(tid))
+            assert targets == [] and why and ("not under a results dir" in why or "no pid file" in why), (f, why)
+        targets, _, why = jobstop.plan_pids(p, others, "")
+        assert why and "only a task" in why
+        r = _ttp_run(p, "detach", "--stop-pids", str(linked_file), env={"TTP_TASK": str(tid)})
+        assert r.returncode == 3 and "not under a results dir" in r.stderr, r
+        assert proc.poll() is None
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_stop_pids_refuses_a_reused_pid_another_tasks_or_projects_process_and_a_foreign_lock_holder(env, tmp_path):
+    """Each listed pid must still be the process the file recorded and the task's own; one refusal refuses
+    the whole file, so the allowed pid beside it is not stopped either."""
+    from ttp import jobstop
+    from ttp.runner import proc_start
+    p = make(env)
+    tid = p.db.add_task("driver", "s", kind="work", tier="light", origin="user")
+    other = p.db.add_task("other", "s", kind="work", tier="light", origin="user")
+    slot = p.state / "locks" / "device.0.lock"
+    slot.parent.mkdir(parents=True, exist_ok=True)
+    holder = ("import fcntl, json, os, sys, time\nf = open(sys.argv[1], 'a+')\nfcntl.flock(f, fcntl.LOCK_EX)\n"
+              "f.truncate(0)\nf.write(json.dumps({'holder': 'someone else', 'pid': os.getpid()}))\nf.flush()\n"
+              "time.sleep(60)\n")
+    mine, theirs, foreign = _task_proc(p, tid), _task_proc(p, other), _task_proc(p, tid, project=tmp_path / "other")
+    locker = _task_proc(p, tid, argv=(sys.executable, "-c", holder, str(slot)))
+    procs = [mine, theirs, foreign, locker]
+    try:
+        assert _wait_for(lambda: slot.exists() and "someone else" in slot.read_text(), 10)
+        lock_pid = json.loads(slot.read_text())["pid"]
+        d = p.root / "results" / f"t{tid}"
+        cases = {
+            "reused": (f"{mine.pid} start=1", "pid was reused"),
+            "task": (theirs.pid, f"belongs to task #{other}"),
+            "project": (foreign.pid, "not started by this project"),
+            "lock": (lock_pid, "holds lock slot device.0.lock"),
+            "self": (os.getpid(), "is the caller"),
+        }
+        for name, (line, want) in cases.items():
+            targets, _, why = jobstop.plan_pids(p, _pidfile(d / f"{name}.pids", mine.pid, line), str(tid))
+            assert targets == [] and why and "nothing stopped" in why and want in why, (name, why)
+        # No start token: a process that started after the file was last written is a reused pid.
+        late = _pidfile(d / "late.pids", mine.pid)
+        os.utime(late, (time.time() - 3600, time.time() - 3600))
+        targets, _, why = jobstop.plan_pids(p, late, str(tid))
+        assert why and "started after the pid file was last written" in why
+        targets, _, why = jobstop.plan_pids(p, _pidfile(d / "ok.pids", f"{mine.pid} start={proc_start(mine.pid)}"),
+                                            str(tid))
+        assert why is None and [t[0] for t in targets] == [mine.pid]
+        r = _ttp_run(p, "detach", "--stop-pids", str(d / "task.pids"), env={"TTP_TASK": str(tid)})
+        assert r.returncode == 3 and "refused" in r.stderr, r
+        assert all(x.poll() is None for x in procs)
+    finally:
+        for x in procs:
+            try:
+                os.killpg(x.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            x.wait()
+
+
+def test_a_sandboxed_stop_pids_is_queued_and_the_daemon_checks_and_stops(env, tmp_path):
+    from ttp import jobstop
+    p = make(env)
+    tid = p.db.add_task("driver", "s", kind="work", tier="light", origin="user")
+    proc, theirs = _task_proc(p, tid), _task_proc(p, tid + 1)
+    try:
+        time.sleep(0.2)
+        d = p.root / "results" / f"t{tid}"
+        f = _pidfile(d / "pids", proc.pid)
+        jobstop.request_pids(p, f, str(tid))
+        assert [r["pids"] for r in jobstop.serve_requests(p)] == [[proc.pid]]
+        assert proc.wait(5) == -signal.SIGTERM and "SIGTERM to" in (d / "pids.stopped").read_text()
+        bad = _pidfile(d / "bad.pids", theirs.pid)
+        jobstop.request_pids(p, bad, str(tid))
+        assert jobstop.serve_requests(p) == [] and theirs.poll() is None
+        assert "nothing stopped" in (d / "bad.pids.stopped").read_text()
+        assert not list((p.state / jobstop.QUEUE).glob("*.json"))
+    finally:
+        for x in (proc, theirs):
+            x.kill()
+            x.wait()

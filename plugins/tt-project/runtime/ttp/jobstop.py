@@ -28,6 +28,10 @@ session of its own outside every run: a queued one is recorded as failed before 
 a running one gets SIGTERM to its group (it ends its check and writes a failed outcome), then SIGKILL.
 A push queue batch serves many tasks and is never stopped here.
 
+`ttp detach --stop-pids <file>` stops the processes a task's own driver listed in a pid file (stop_pids),
+for a driver started some other way than `ttp detach` (setsid and a pid file, its own launcher), so the
+task need not rely on the driver's own stop path (a STOP file its loop may skip). See plan_pids.
+
 A job counts as running while its job lock is held, whatever its .rc or .lost say: a daemon that dies
 mid-stop finds it still running on its next tick and finishes the stop; a stopped one is skipped and
 logs nothing new.
@@ -39,6 +43,7 @@ the daemon carries it out on its next tick, checking it again.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pwd
@@ -560,8 +565,12 @@ def serve_requests(p: Project) -> list[dict]:
     for q in sorted(folder.glob("*.json")) if folder.is_dir() else []:
         try:
             m = json.loads(q.read_text())
+            if m.get("pidfile"):
+                out += _serve_pids(p, m)
+                q.unlink(missing_ok=True)
+                continue
             rc = Path(m["rc"])
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
             q.unlink(missing_ok=True)
             continue
         ok, why = may_stop(p, rc, m.get("caller"))
@@ -572,3 +581,234 @@ def serve_requests(p: Project) -> list[dict]:
                 out.append(r)
         q.unlink(missing_ok=True)
     return out
+
+
+# Pid files --------------------------------------------------------------------------------------
+# `ttp detach --stop-pids <file>`: a task stops the processes its own driver listed in a pid file, one pid
+# per line (the line's first word; `start=<token>`, the token runner.proc_start gives, pins it to that
+# process; other words and `#` lines are ignored). plan_pids allows it only when all of these hold:
+# - the file's resolved path (symlinks followed) lies under one of the calling task's own results dirs: a
+#   run dir of the task, or a folder named for it (t<id>, task<id> or task-<id>) inside the project root;
+# - each live pid in it runs as the caller's user, carries the task's own TTP_TASK and this project's
+#   TTP_PROJECT in its environment (so it was started from one of the task's runs), and is still the
+#   process the file recorded: its start= token matches, else it started no later than the file was
+#   last written (a later one reuses the pid);
+# - none is the caller, one of its ancestors or a running worker, and none holds a lock slot for another
+#   task or holder.
+# A pid that is gone is skipped; any other refusal refuses the whole file, so nothing is stopped in part.
+# stop_pids then sends SIGTERM, waits PIDS_TERM_S and sends SIGKILL to those still the same process.
+
+PIDS_TERM_S = 10.0
+PIDS_MAX = 256
+TASK_DIR_RE = re.compile(r"(?:t|task-?)(\d+)")
+
+
+def task_results(p: Project, task: int, f: Path) -> bool:
+    """Whether the resolved path f lies under one of the task's results dirs (see above)."""
+    for r in p.db.q("SELECT dir FROM runs WHERE task=? AND COALESCE(dir,'')!=''", (task,)):
+        if f.is_relative_to(Path(r["dir"]).resolve()):
+            return True
+    root = p.root.resolve()
+    if not f.is_relative_to(root):
+        return False
+    return any((m := TASK_DIR_RE.fullmatch(x)) and int(m[1]) == task for x in f.relative_to(root).parts[:-1])
+
+
+def read_pidfile(f: Path) -> list[tuple[int, str | None]]:
+    """(pid, start token or None) per line; ValueError for a line whose first word is not a pid."""
+    out = []
+    for line in f.read_text(errors="replace")[:65536].splitlines():
+        w = line.split()
+        if not w or w[0].startswith("#"):
+            continue
+        if not w[0].isdigit():
+            raise ValueError(f"line {line.strip()[:80]!r} does not start with a pid")
+        out.append((int(w[0]), next((x.split("=", 1)[1] for x in w[1:] if x.startswith("start=")), None)))
+    return out
+
+
+def _environ(pid: int) -> dict[str, str] | None:
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return None
+    return dict(x.decode(errors="replace").split("=", 1) for x in raw.split(b"\0") if b"=" in x)
+
+
+def _started_at(pid: int) -> float | None:
+    """When pid started, in seconds since the epoch (Linux /proc), else None."""
+    from .runner import proc_start
+    try:
+        btime = next(float(x.split()[1]) for x in Path("/proc/stat").read_text().splitlines() if x.startswith("btime"))
+        return btime + int(proc_start(pid) or "") / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, StopIteration):
+        return None
+
+
+def _guarded(p: Project) -> set[int]:
+    """The caller and its ancestors, and every running worker: never a stop target."""
+    out, pid = set(), os.getpid()
+    while pid > 1 and pid not in out:
+        out.add(pid)
+        try:
+            pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            break
+    out |= {int(r["pid"]) for r in p.db.q("SELECT pid FROM runs WHERE status='running' AND pid IS NOT NULL")}
+    return out
+
+
+def _foreign_slot(p: Project, pid: int, task: int) -> str | None:
+    """The name of a held lock slot whose holder process is pid and whose holder is not this task."""
+    from . import hold
+    node = os.uname().nodename
+    for d in lock_dirs(p):
+        try:
+            slots = sorted(d.glob("*.lock"))
+        except OSError:
+            continue
+        for s in slots:
+            try:
+                h = json.loads(s.read_text() or "{}")
+            except (OSError, ValueError):
+                continue
+            if (isinstance(h, dict) and h.get("pid") == pid and h.get("node") in (None, node)
+                    and hold.task_of(h.get("holder"), p.name) != task and not locks.any_free([s])):
+                return s.name
+    return None
+
+
+def pid_refusal(p: Project, task: int, pid: int, token: str | None, written: float, guarded: set[int]) -> str | None:
+    """Why pid (live) may not be stopped for this task, else None (see above)."""
+    from .runner import proc_start
+    if pid <= 1 or pid in guarded:
+        return "is the caller, one of its ancestors or a running worker"
+    try:
+        if Path(f"/proc/{pid}").stat().st_uid != os.getuid():
+            return "runs as another user"
+    except OSError:
+        return "cannot be read"
+    env = _environ(pid)
+    if env is None:
+        return "its environment cannot be read, so it cannot be told to be this task's"
+    there = env.get("TTP_PROJECT") or ""
+    if not there or Path(there).resolve() != p.base.resolve():
+        return "was not started by this project" + (f" (TTP_PROJECT {there})" if there else "")
+    if (env.get("TTP_TASK") or env.get("TTP_TASK_ID") or "") != str(task):
+        return f"belongs to task #{env.get('TTP_TASK') or '?'}, not #{task}"
+    if token is not None:
+        if proc_start(pid) != token:
+            return f"is not the process the file recorded (start token {token}): the pid was reused"
+    else:
+        at = _started_at(pid)
+        if at is None or at > written + 1:
+            return "started after the pid file was last written: the pid was reused"
+    if slot := _foreign_slot(p, pid, task):
+        return f"holds lock slot {slot} for another holder"
+    return None
+
+
+def plan_pids(p: Project, pidfile: str | Path, caller: str | None,
+              procs: bool = True) -> tuple[list[tuple[int, str]], list[int], str | None]:
+    """(targets as (pid, start token), pids already gone, refusal or None) for a stop of the pid file by
+    task `caller`. procs=False checks only the caller and the file (a sandboxed caller cannot see them)."""
+    if not (caller and str(caller).isdigit() and p.db.task(int(caller))):
+        return [], [], "only a task of this project may stop processes from a pid file (TTP_TASK is not one)"
+    task = int(caller)
+    f = Path(pidfile).expanduser()
+    try:
+        real = f.resolve(strict=True)
+        written = real.stat().st_mtime
+    except (OSError, RuntimeError):
+        return [], [], f"no pid file at {f}"
+    if not real.is_file():
+        return [], [], f"{real} is not a file"
+    if not task_results(p, task, real):
+        return [], [], (f"{real} is not under a results dir of task #{task} (one of its run dirs, or a folder "
+                        f"t{task}, task{task} or task-{task} inside the project root {p.root})")
+    try:
+        listed = read_pidfile(real)
+    except (OSError, ValueError) as e:
+        return [], [], f"{real}: {e}"
+    if len(listed) > PIDS_MAX:
+        return [], [], f"{real} lists {len(listed)} pids, over {PIDS_MAX}"
+    if not procs:
+        return [(pid, tok or "") for pid, tok in listed], [], None
+    from .runner import proc_start
+    guarded, targets, gone, bad = _guarded(p), [], [], []
+    for pid, tok in dict.fromkeys(listed):
+        st = _stat(pid) if pid > 0 else None
+        if st is None:
+            gone.append(pid)
+            continue
+        if why := pid_refusal(p, task, pid, tok, written, guarded):
+            bad.append(f"pid {pid} {why}")
+        elif (now := proc_start(pid)) is not None:
+            targets.append((pid, now))
+        else:
+            gone.append(pid)
+    if bad:
+        return [], gone, "refused, nothing stopped: " + "; ".join(bad)
+    return targets, gone, None
+
+
+def stop_pids(p: Project, pidfile: str | Path, task: int, targets: list[tuple[int, str]], gone: list[int],
+              why: str) -> dict:
+    """SIGTERM each target that is still the same process, SIGKILL those left after PIDS_TERM_S; one event."""
+    from .runner import proc_start
+
+    def same(pid, tok):
+        return _stat(pid) is not None and proc_start(pid) == tok
+
+    for sig, wait in ((signal.SIGTERM, PIDS_TERM_S), (signal.SIGKILL, FREE_WAIT_S)):
+        sent = []
+        for pid, tok in targets:
+            if same(pid, tok):
+                try:
+                    os.kill(pid, sig)
+                    sent.append((pid, tok))
+                except OSError:
+                    pass
+        deadline = time.monotonic() + wait
+        while any(same(*t) for t in sent) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if sig == signal.SIGTERM:
+            killed = [pid for pid, tok in targets if same(pid, tok)]
+    left = [pid for pid, tok in targets if same(pid, tok)]
+    pids = [pid for pid, _ in targets]
+    text = (f"stopped the processes of pid file {pidfile} (task #{task}): {why}; "
+            f"SIGTERM to {', '.join(map(str, pids)) or 'none'}"
+            + (f"; SIGKILL after {PIDS_TERM_S:g}s to {', '.join(map(str, killed))}" if killed else "")
+            + (f"; already gone: {', '.join(map(str, gone))}" if gone else "")
+            + (f"; still running: {', '.join(map(str, left))}" if left else ""))
+    out = {"task": task, "job": Path(pidfile).name, "pidfile": str(pidfile), "pids": pids, "killed": killed,
+           "gone": gone, "left": left, "text": text}
+    if pids:
+        fp = "pids_stopped:" + hashlib.sha256(f"{pidfile}:{targets}".encode()).hexdigest()[:16]
+        p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
+               (time.time(), "daemon", EVENT, fp, "low", text, json.dumps(out), "handled", task))
+    return out
+
+
+def request_pids(p: Project, pidfile: Path, caller: str) -> Path:
+    """Queue a pid file stop for the daemon (a sandboxed caller cannot see or signal the processes)."""
+    key = hashlib.sha256(str(pidfile).encode()).hexdigest()[:12]
+    q = p.state / QUEUE / f"pids-{caller}-{key}.json"
+    q.parent.mkdir(parents=True, exist_ok=True)
+    write_json(q, {"pidfile": str(pidfile), "caller": caller, "at": time.time()})
+    return q
+
+
+def _serve_pids(p: Project, m: dict) -> list[dict]:
+    """The daemon's side of request_pids: check again, stop, and leave the outcome beside the pid file
+    (<file>.stopped) for the task to read."""
+    f, caller = Path(m["pidfile"]), str(m.get("caller") or "")
+    targets, gone, why = plan_pids(p, f, caller)
+    r = None if why else stop_pids(p, f, int(caller), targets, gone, "stopped by `ttp detach --stop-pids` (queued)")
+    try:   # only into the task's own results dir, never through a link out of it
+        out = f.resolve().with_name(f.name + ".stopped")
+        if caller.isdigit() and task_results(p, int(caller), out) and not out.is_symlink():
+            out.write_text(f"{r['text'] if r else why}\n")
+    except (OSError, RuntimeError):
+        pass
+    return [r] if r and r["pids"] else []

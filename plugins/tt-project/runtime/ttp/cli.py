@@ -5096,6 +5096,8 @@ def cmd_detach(a) -> None:
         sys.exit(_detach_reap(a.reap))
     if getattr(a, "stop", None):
         sys.exit(_detach_stop(a.stop))
+    if getattr(a, "stop_pids", None):
+        sys.exit(_detach_stop_pids(a.stop_pids))
     if a.check is None:
         _start_options(a)
     if a.check is None and (getattr(a, "rows", None) is not None or getattr(a, "after", None) is not None):
@@ -5337,6 +5339,36 @@ def _launcher_stop(what: str, rc: Path) -> int:
         return 3
     print(r["text"])
     return 1 if r["left"] else 0
+
+
+def _detach_stop_pids(what: str) -> int:
+    """`ttp detach --stop-pids <file>`: stop the processes the calling task's own driver listed in a pid file
+    under its own results dir (jobstop.plan_pids): SIGTERM, then SIGKILL after a grace. 0 once stopped or
+    when none still runs, 2 outside a tt-project task run, 3 when refused (nothing is stopped then).
+    A sandboxed caller, which cannot see or signal them, queues the stop for the daemon, which checks again."""
+    from . import jobstop
+    from .push import _boxed
+    base, caller = os.environ.get("TTP_PROJECT"), os.environ.get("TTP_TASK") or ""
+    if not base or not caller:
+        print("ttp detach --stop-pids: only works inside a tt-project task run (TTP_PROJECT and TTP_TASK set)",
+              file=sys.stderr)
+        return 2
+    p, f = Project(base), Path(what).expanduser().absolute()
+    boxed = _boxed()
+    targets, gone, why = jobstop.plan_pids(p, f, caller, procs=not boxed)
+    if why:
+        print(f"ttp detach --stop-pids: {why}", file=sys.stderr)
+        return 3
+    if boxed:
+        jobstop.request_pids(p, f, caller)
+        print(f"{f.name}: queued; the daemon checks and stops them within seconds and writes the outcome to "
+              f"{f.name}.stopped beside it")
+        return 0
+    if not targets:
+        print(f"{f.name}: none of its processes still runs; nothing to stop")
+        return 0
+    print(jobstop.stop_pids(p, f, int(caller), targets, gone, "stopped by `ttp detach --stop-pids`")["text"])
+    return 0
 
 
 def _lock_job(names: list, cmd: list) -> list:
@@ -9401,6 +9433,12 @@ def main(argv: list[str] | None = None) -> None:
                    "refused (exit 3) otherwise; idempotent. With no job recorded, a driver a launcher of the "
                    "project's own started: NAME.pid in the path's folder, $TTP_RUN_DIR or the task's t<id> folder "
                    "gets a STOP file beside it, then SIGTERM and SIGKILL if it does not exit (exit 2: none found)")
+    s.add_argument("--stop-pids", metavar="FILE",
+                   help="stop the processes the calling task's own driver listed in a pid file (one pid per line, "
+                   "optional start=<token>) under one of the task's results dirs (its run dirs, or a folder t<id>, "
+                   "task<id> or task-<id> in the project root): SIGTERM, then SIGKILL after 10 s; each pid must "
+                   "carry the task's TTP_TASK and still be the recorded process; refused (exit 3) otherwise, "
+                   "stopping nothing; idempotent")
     s.add_argument("--resumable", action="store_true",
                    help="the job is safe to rerun from the start: after a host reboot cuts it short, the daemon "
                    "starts it again while the task still waits on it, with no model run (up to "

@@ -97,6 +97,8 @@ Other workers run other tasks of this project at the same time.
   `ps | grep` feeding a kill). If it finds one, run it first with `ttp killscan --shim <dir>`
   stand-ins on PATH (`PATH=<dir>:"$PATH" <script>`) and edit out any `ps | grep` or call by absolute
   path.
+  A driver your task started that listed its pids in a file under the task's results dir (a run dir
+  or a `t<id>` folder): `ttp detach --stop-pids <file>`.
 <!-- ttp:if clusters -->
 
 ## Shared clusters (Slurm and other shared machines)

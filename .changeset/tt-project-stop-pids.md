@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: `ttp detach --stop-pids <file>` lets a task stop the processes its own driver listed in a pid file, for a driver started without `ttp detach`. Before, the kill guard allowed a kill only of the current run's own processes, so a later run could not stop the driver an earlier run started, and the task depended on the driver's own STOP file, which its loop may skip. The file must resolve, with no symlink escape, to a path under one of the task's results dirs: a run dir of the task, or a `t<id>`, `task<id>` or `task-<id>` folder in the project root. Each pid must carry the task's own `TTP_TASK` and `TTP_PROJECT`, and must still be the process the file recorded: its `start=` token matches, or it started no later than the file was last written. A pid is also refused when it is the caller, a running worker, or a process holding a lock slot for someone else. It sends SIGTERM, then SIGKILL after 10 s. Any refusal stops nothing (exit 3). In a sandbox the daemon runs the checks again before it stops anything. The kill guard's advice, the worker prompt and the harness guide name the command.
