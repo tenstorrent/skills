@@ -539,3 +539,34 @@ def test_a_continue_hop_drops_overlap_depends_on_onto_device_or_waiting_tasks(en
     assert coord.apply(p, [{"type": "task_add", "title": "on purpose", "kind": "code",
                             "spec": "Finish the delivery.", "depends_on": [a, b]}]) == []
     assert dependency_ids(p.db.one("SELECT * FROM tasks WHERE title='on purpose'")) == [a, b]
+
+
+def test_an_urgent_task_keeps_its_new_file_chain_through_task_add_task_update_and_the_tick_sweep(env):
+    """The chain task_add adds for a file another open task adds is a real dependency (convgate's
+    'a dependency on another task's new file or symbol'): an urgent task keeps it at task_add, after
+    a task_update that keeps the same start_when with another why, and through the urgent gate sweep.
+    One parked by an older harness (its overlap label, no start_safety label) keeps it too."""
+    from ttp import coordinator as coord, convgate
+    from ttp.daemon import Daemon
+    from ttp.db import deferral
+    p = make(env)
+    p.set_config("delivery.landed_probe", "test -e landed/{id}")
+    _on_base(p, "runtime/ttp/relay.py")
+    maker = p.db.add_task("maker", "Add runtime/ttp/stall.py with a detector.", kind="code", status="running")
+    assert coord.apply(p, [{"type": "task_add", "title": "hot user", "kind": "code", "priority": 1,
+                            "spec": "Call the detector in runtime/ttp/stall.py from the sweep."}]) == []
+    t = p.db.one("SELECT * FROM tasks WHERE title='hot user'")
+    assert deferral(t)["when"] == f"landed:#{maker}", deferral(t)
+    assert convgate.kept_class(json.loads(t["labels"])) == convgate.DEPENDENCY
+    coord.apply(p, [{"type": "task_update", "id": t["id"], "start_when": f"landed:#{maker}", "why": "tidier"}])
+    assert deferral(p.db.task(t["id"]))["when"] == f"landed:#{maker}", "a task_update keeping the when keeps it"
+    old = p.db.add_task("parked user", "s", kind="code", tier="light", origin="coordinator", priority=1,
+                        labels=[f"overlap:{maker}:overlaps #{maker} (runtime/ttp/stall.py (new file))"]
+                        + coord.defer_labels(None, f"landed:#{maker}", f"#{maker} lands (it needs runtime/ttp/stall.py, "
+                                             f"which #{maker} adds (not on the base branch yet))"))
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    d.release_urgent_gates(time.time())
+    for tid in (t["id"], old):
+        assert deferral(p.db.task(tid))["when"] == f"landed:#{maker}", tid
+    assert not p.db.q("SELECT id FROM events WHERE fingerprint LIKE 'urgent_gate_released:%'")

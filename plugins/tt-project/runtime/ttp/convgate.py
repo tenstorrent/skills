@@ -19,8 +19,12 @@ task's new file or symbol. Any other gate is a convenience and is dropped:
 - Daemon.check_slot_wait raises one event for an urgent task whose dependencies are met, held by
   a kept gate for coordinator.urgent_slot_wait_min while a worker slot is free, naming the gate.
 
+The chain task_add adds for a file or symbol another open task adds (coordinator._overlap_chain) is
+the last class by construction: task_add records it, and `tie_class` reads it from the task's overlap
+label and its `landed:#<id>` wait, so a task parked before the label existed keeps it too.
+
 A review chained behind its own suite gate (its only unmet dependencies are checks or suite tasks of
-the change it reviews, `suite_waits`) is a convenience too: Daemon.release_urgent_gates drops those
+the change it reviews: work tasks with no branch, never a code, harness or review task, `suite_waits`) is a convenience too: Daemon.release_urgent_gates drops those
 dependencies so the pair runs side by side, with one low observation (`review_suite_gate`), unless
 the review's spec names that task's output (a result, log or report it reads).
 
@@ -35,6 +39,7 @@ import re
 from . import urgent
 
 LABEL = "start_safety"   # a kept gate's safety class (one of CLASSES' names); cleared with the deferral
+DEPENDENCY = "a dependency on another task's new file or symbol"   # the class of task_add's overlap chain
 
 # (class, words in the gate's why or the probe that name it)
 CLASSES = (
@@ -52,7 +57,7 @@ CLASSES = (
     ("the user's word", r"\buser'?s? (?:own )?(?:word|go|ok|okay|approval|answer|decision|call|sign[- ]?off)\b"
                         r"|\buntil the user\b|\b(?:waits?|waiting) (?:for|on) the user\b"
                         r"|\btest -[ef] \S*/user-[\w.-]+"),
-    ("a dependency on another task's new file or symbol",
+    (DEPENDENCY,
      r"(?:#\d+|another task|its producer)\b.*\b(?:new |its )?(?:files?|symbols?|functions?|modules?|helpers?|api"
      r"|class(?:es)?|commands?|flags?|schema|columns?|tables?)\b"
      r"|\b(?:uses?|needs?|imports?|calls?|reuses?|builds? on) #\d+'?s?\b"),
@@ -76,6 +81,18 @@ def kept_class(labels: list) -> str | None:
     return None
 
 
+def tie_class(labels: list, when: str | None) -> str | None:
+    """DEPENDENCY when `when` waits on a task landing that the task's overlap label names (the chain
+    task_add adds for a new file or symbol another task adds, coordinator._overlap_chain), else None."""
+    if not when:
+        return None
+    from . import landed, overlap
+    refs = {x for x in landed.task_refs(when) if str(x).isdigit()}
+    named = {x for lb in labels if isinstance(lb, str) and lb.startswith(overlap.LABEL)
+             for x in lb[len(overlap.LABEL):].partition(":")[0].split(",")}
+    return DEPENDENCY if refs & named else None
+
+
 def judge(task: dict, after, when: str | None, why: str | None, labels: list | None = None
           ) -> tuple[bool, str | None]:
     """(drop, class) for gate (`after`, `when`, `why`) of `task` (its priority and spec as they will be):
@@ -83,7 +100,7 @@ def judge(task: dict, after, when: str | None, why: str | None, labels: list | N
     found (also for a task that is not urgent, so a later raise keeps the gate)."""
     if not after and not when:
         return False, None
-    cls = safety_class(why, when) or kept_class(labels or [])
+    cls = safety_class(why, when) or kept_class(labels or []) or tie_class(labels or [], when)
     return (urgent.is_urgent(task) and cls is None), cls
 
 
@@ -123,7 +140,7 @@ def stored(task: dict) -> tuple[list, dict]:
     return (labels if isinstance(labels, list) else []), deferral(task)
 
 
-# A checks or suite task, by its title.
+# A checks or suite task: a work task with no branch (it changes nothing) whose title says so.
 SUITE = re.compile(r"\b(?:checks?|suites?|tests?|pytest|ci)\b", re.I)
 _OUTPUT = r"\b(?:output|results?|logs?|reports?|numbers|measurements?|artifacts?|findings)\b"
 
@@ -134,8 +151,8 @@ def needs_output(spec: str, tid: int) -> bool:
 
 
 def suite_waits(db, review: dict) -> list[int]:
-    """A queued review's unmet dependencies when every one is a checks or suite task (SUITE in its title,
-    not a review) of the change it reviews (it depends on that task, or names `#<id>` of it) and the
+    """A queued review's unmet dependencies when every one is a checks or suite task (a work task with no
+    branch, SUITE in its title: a code, harness or review task changes the subject) of the change it reviews (it depends on that task, or names `#<id>` of it) and the
     review needs none's output; [] otherwise."""
     from .db import dependency_ids, review_subject
     if review.get("kind") != "review" or review.get("status") != "queued":
@@ -146,7 +163,7 @@ def suite_waits(db, review: dict) -> list[int]:
         return []
     for d in unmet:
         t = db.task(d)
-        if not t or t["kind"] == "review" or not SUITE.search(t["title"] or "") or needs_output(review["spec"], d):
+        if not t or t["kind"] != "work" or t.get("branch") or not SUITE.search(t["title"] or "") or needs_output(review["spec"], d):
             return []
         if subject not in dependency_ids(t) and not re.search(rf"#{subject}\b", f"{t['title']}\n{t['spec']}"):
             return []

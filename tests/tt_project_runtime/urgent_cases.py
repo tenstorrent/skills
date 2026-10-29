@@ -259,3 +259,28 @@ def test_a_review_behind_its_own_suite_gate_runs_beside_it_unless_it_reads_its_o
     assert [(e["task"], e["severity"]) for e in ev] == [(beside, "low")]
     d.release_urgent_gates(time.time())
     assert len(p.db.q("SELECT id FROM events WHERE fingerprint LIKE 'review_suite_gate:%'")) == 1
+
+
+def test_a_review_keeps_its_dependency_on_a_code_task_that_changes_its_subject(env):
+    """Only a task that runs checks and changes nothing is a suite gate: a code (or harness) task, or
+    one with a branch, whose title says tests or checks changes the subject, and the review waits."""
+    from ttp.daemon import Daemon
+    from ttp.db import dependency_ids
+    p = make(env)
+    _no_events(p)
+    a = p.db.add_task("change", "s", kind="code", tier="light", origin="user", priority=3)
+    p.db.update_task(a, status="done")
+    fix = p.db.add_task(f"code: add the missing tests to #{a}'s branch", "s", kind="code", tier="light",
+                        origin="user", priority=3)
+    hx = p.db.add_task(f"fix the checks for #{a}", "s", kind="harness", tier="light", origin="user", priority=3)
+    br = p.db.add_task(f"run the suite for #{a}", "s", kind="work", tier="light", origin="user", priority=3)
+    p.db.update_task(br, branch=f"ttp/t{br}-suite")
+    rs = [p.db.add_task(f"Review #{a}: change ({i})", f"Independently review the change of code task #{a}",
+                        kind="review", tier="light", origin="daemon", priority=3, depends_on=[dep])
+          for i, dep in enumerate((fix, hx, br))]
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    d.release_urgent_gates(time.time())
+    for r, dep in zip(rs, (fix, hx, br)):
+        assert dep in dependency_ids(p.db.task(r)), (r, dep)
+    assert not p.db.q("SELECT id FROM events WHERE fingerprint LIKE 'review_suite_gate:%'")

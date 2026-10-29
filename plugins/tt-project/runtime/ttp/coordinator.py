@@ -1745,8 +1745,9 @@ def deferral_update(db, task: dict, a: dict, p: Project | None, labels: list | N
     why = a.get("why") if a.get("why") is not None else cur.get("why") if when and when == cur.get("when") else None
     as_now = {"priority": a.get("priority") or task.get("priority"),
               "spec": "\n".join(x for x in (task.get("spec"), a.get("spec")) if x)}
-    drop, safe = convgate.judge(as_now, after, when, why,
-                                json.loads(task["labels"] or "[]") if same and a.get("why") is None else [])
+    held = json.loads(task["labels"] or "[]")   # its kept class counts for the same gate; its overlap tie always
+    drop, safe = convgate.judge(as_now, after, when, why, held if same and a.get("why") is None
+                                else [lb for lb in held if str(lb).startswith(file_overlap.LABEL)])
     note = convgate.dropped_note(f"task_update: #{task['id']}", as_now, after, when) if drop else ""
     if drop:
         after, when = None, None
@@ -2084,6 +2085,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         and (both := _and_landed(p, tie[0], when)):
                     when = both
                     why_after = "; ".join(x for x in (why_after, f"#{tie[0]} lands ({tie[1]})") if x)[:START_WHY_CHARS]
+                    safe = safe or convgate.DEPENDENCY   # a real dependency: an urgent task keeps it too
                 else:
                     tie = None
                 labels += [file_overlap.label(clash, tie and tie[0], landing)] if clash else []
