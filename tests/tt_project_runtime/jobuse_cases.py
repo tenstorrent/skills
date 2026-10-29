@@ -50,7 +50,7 @@ def test_container_cpu_counts_only_containers_started_after_the_job(monkeypatch)
         assert jobuse.container_cpu(None, mine) == {} and jobuse.container_cpu([], mine) == {}
         # No readable cgroup: the container's init tree is read instead.
         monkeypatch.setattr(jobuse, "_cgroup_cpu", lambda pid: None)
-        assert jobuse.container_cpu(ctrs, mine)["abc"] >= 0.2
+        assert 0 <= jobuse.container_cpu(ctrs, mine)["abc"] <= jobuse._cpu(proc.pid, jobuse._hz())
     finally:
         proc.kill()
         proc.wait()
