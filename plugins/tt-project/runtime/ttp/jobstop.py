@@ -687,10 +687,10 @@ def pid_refusal(p: Project, task: int, pid: int, token: str | None, written: flo
         if Path(f"/proc/{pid}").stat().st_uid != os.getuid():
             return "runs as another user"
     except OSError:
-        return "cannot be read"
+        return "its /proc/<pid> cannot be read, so it cannot be checked or stopped (Linux only)"
     env = _environ(pid)
     if env is None:
-        return "its environment cannot be read, so it cannot be told to be this task's"
+        return "its /proc/<pid>/environ cannot be read, so it cannot be told to be this task's"
     there = env.get("TTP_PROJECT") or ""
     if not there or Path(there).resolve() != p.base.resolve():
         return "was not started by this project" + (f" (TTP_PROJECT {there})" if there else "")
@@ -715,6 +715,9 @@ def plan_pids(p: Project, pidfile: str | Path, caller: str | None,
     if not (caller and str(caller).isdigit() and p.db.task(int(caller))):
         return [], [], "only a task of this project may stop processes from a pid file (TTP_TASK is not one)"
     task = int(caller)
+    if procs and not (Path("/proc").is_dir() and Path("/proc/stat").is_file()):
+        return [], [], ("no /proc on this host: `ttp detach --stop-pids` is Linux-only, and a live pid "
+                        "cannot be verified or stopped without it")
     f = Path(pidfile).expanduser()
     try:
         real = f.resolve(strict=True)

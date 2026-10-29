@@ -9548,7 +9548,8 @@ def main(argv: list[str] | None = None) -> None:
                    "optional start=<token>) under one of the task's results dirs (its run dirs, or a folder t<id>, "
                    "task<id> or task-<id> in the project root): SIGTERM, then SIGKILL after 10 s; each pid must "
                    "carry the task's TTP_TASK and still be the recorded process; refused (exit 3) otherwise, "
-                   "stopping nothing; idempotent")
+                   "stopping nothing; idempotent. Linux only: it reads /proc for the pids' identity and start, "
+                   "so a host without /proc refuses every pid as unreadable")
     s.add_argument("--resumable", action="store_true",
                    help="the job is safe to rerun from the start: after a host reboot cuts it short, the daemon "
                    "starts it again while the task still waits on it, with no model run (up to "

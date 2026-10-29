@@ -1428,6 +1428,34 @@ def test_stop_pids_stops_only_the_listed_processes_of_the_tasks_own_driver(env, 
             x.wait()
 
 
+def test_stop_pids_escalates_to_sigkill_when_sigterm_is_ignored(env, tmp_path, monkeypatch):
+    """A listed process that ignores SIGTERM is stopped by the SIGKILL step, and the outcome names its pid
+    under the SIGKILL step (PIDS_TERM_S monkeypatched short so the test stays fast)."""
+    from ttp import jobstop
+    p = make(env)
+    tid = p.db.add_task("driver", "s", kind="work", tier="light", origin="user")
+    # sleep 60 with SIGTERM ignored: only the SIGKILL step can stop it.
+    stub = _task_proc(p, tid, argv=(sys.executable, "-c",
+                                    "import signal, time\n"
+                                    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                                    "time.sleep(60)"))
+    try:
+        time.sleep(0.2)
+        monkeypatch.setattr(jobstop, "PIDS_TERM_S", 0.3)
+        f = _pidfile(p.root / "results" / f"t{tid}" / "driver.pids", stub.pid)
+        targets, gone, why = jobstop.plan_pids(p, f, str(tid))
+        assert why is None and [t[0] for t in targets] == [stub.pid], why
+        out = jobstop.stop_pids(p, f, tid, targets, gone, "stopped by `ttp detach --stop-pids`")
+        assert stub.wait(10) == -signal.SIGKILL, "the process ignores SIGTERM; only the SIGKILL step can stop it"
+        assert f"SIGKILL after {jobstop.PIDS_TERM_S:g}s to {stub.pid}" in out["text"], out["text"]
+        assert f"SIGTERM to {stub.pid}" in out["text"] and out["killed"] == [stub.pid], out["text"]
+        assert not out["left"] and out["pids"] == [stub.pid], out
+        assert [e for e in _stopped_events(p) if f"task #{tid}" in e["text"] and "SIGKILL" in e["text"]]
+    finally:
+        stub.kill()
+        stub.wait()
+
+
 def test_stop_pids_refuses_a_file_outside_the_tasks_results_dir_or_reached_by_a_symlink(env, tmp_path):
     from ttp import jobstop
     p = make(env)
