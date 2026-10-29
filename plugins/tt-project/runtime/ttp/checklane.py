@@ -369,7 +369,6 @@ def long_wait_lines(project_name: str, cfg: dict | None, now: float | None = Non
     out = []
     for w in waits(project_name, cfg, now, over_s):
         held = "; ".join(holder_text(h, now) for h in w["holders"][:3]) or "lanes free, about to start"
-        key = {"project_cap": "checks.test_project_max", "lanes": "checks.slots"}[w["limit"]]
         out.append(f"checks slot wait: {'#' + w['task'] if w['task'] else 'a run'} has waited {mins(w['waited_s'])} "
                    f"(position {w['position']} of {w['of']}), behind {held}")
     return out
@@ -394,12 +393,8 @@ def wait_events(project_name: str, cfg: dict | None, now: float | None = None) -
                              f"per repository, one per checks.wrap_cmd lock, checks.test_project_max per project; "
                              f"a waiter cheaper than the holders gets a lane after checks.max_wait_s; light "
                              f"checks (ttp checks --light, checks.light_cmds) never wait. This wait was held "
-                             f"by the per-repository lane limit ({key})." if w["limit"] == "lanes" else
-                             f"checks (position {w['position']} of {w['of']}), behind {held}. Lanes: checks.slots "
-                             f"per repository, one per checks.wrap_cmd lock, checks.test_project_max per project; "
-                             f"a waiter cheaper than the holders gets a lane after checks.max_wait_s; light "
-                             f"checks (ttp checks --light, checks.light_cmds) never wait. This wait was held "
-                             f"by the project cap (checks.test_project_max).")})
+                             f"by " + ("the per-repository lane limit (checks.slots)." if w["limit"] == "lanes"
+                                       else "the project cap (checks.test_project_max)."))})
     return out
 
 

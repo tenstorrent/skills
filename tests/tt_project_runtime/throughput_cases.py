@@ -223,36 +223,58 @@ def test_throughput_measures_requeue_waits_by_reason_and_a_slow_checks_lane_gets
     assert p.db.one("SELECT priority FROM tasks WHERE id=?", (fid,))["priority"] == 1
 
 
-def test_throughput_checks_lane_names_the_limit_that_held_the_wait(env):
-    from ttp import throughput
+# Unequal waits so each limit wins once: the lane holds 3 h against the cap's 2 h, then the reverse.
+@pytest.mark.parametrize("lane_h, cap_h, want, n", [(3, 2, "checks.slots", 2),
+                                                (2, 3, "checks.test_project_max", 5)])
+def test_throughput_checks_lane_names_the_limit_that_held_the_wait(env, monkeypatch, lane_h, cap_h, want, n):
+    from ttp import checkcap, checklane, locks, testslots, throughput
+
+    def writer_text(p, task, lock):
+        """checklane.wait_events' text for `task` queued on the repository's lanes while #12 holds a
+        lane: the repository's own lane (lane limit), or a wrapper lock's lane (lanes free: the cap)."""
+        _lane_env(monkeypatch)
+        monkeypatch.setenv("TTP_TASK", "12")
+        hold = testslots.suite_hold(p.name, repo=_LANE_REPO, slots=1, lock=lock, what="pytest -q tests/a.py")
+        monkeypatch.delenv("TTP_TASK")
+        ticket = locks.enqueue(checkcap.slot_dir(), testslots.suite_base(p.name, _LANE_REPO),
+                               f"task #{task} {p.name}: full checks (run 9, pid 1)", time.time() - 1000, priority=2)
+        try:
+            ev = [e for e in checklane.wait_events(p.name, {}) if e["task"] == task]
+        finally:
+            locks.dequeue(ticket)
+            hold.close()
+        assert len(ev) == 1 and f"#{task} has waited" in ev[0]["text"] and "#12" in ev[0]["text"], ev
+        return ev[0]["text"]
+
+    def requeued_wait(p, now, hours, lock):
+        # A finished task re-queued from a checks wait: a task_waiting hand-off then the wait to now,
+        # with the checks_slot_wait event the daemon writes (checklane.wait_events) inside it.
+        t = _tp_task(p, "checks wait", now - (hours + 1) * 3600, prio=1)
+        p.db.x("INSERT INTO runs(task, role, started, ended, status, note) VALUES(?,?,?,?,?,?)",
+               (t, "worker", now - (hours + 1) * 3600, now - hours * 3600, "ok", "{}"))
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+               (now - hours * 3600, f"task:{t}", "task_waiting", "low",
+                f"#{t} waits: the project's other full checks", "handled", t))
+        text = writer_text(p, t, lock)
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+               (now - (hours - 0.5) * 3600, "daemon", "checks_slot_wait", "low", text, "handled", t))
+        p.db.x("UPDATE tasks SET status='queued', blocked_reason='waiting for the checks slot' WHERE id=?", (t,))
+        return text
+
     p = make(env)
     now = time.time()
     p.set_config("checks.slots", 2)
     p.set_config("checks.test_project_max", 5)
-
-    def requeued_wait(holder_text, ev_text):
-        # A finished task re-queued from a checks wait: a task_waiting hand-off then the wait to now,
-        # with a checks_slot_wait event inside it naming the limit that held it.
-        t = _tp_task(p, f"held by {holder_text}", now - 4 * 3600, prio=1)
-        p.db.x("INSERT INTO runs(task, role, started, ended, status, note) VALUES(?,?,?,?,?,?)",
-               (t, "worker", now - 4 * 3600, now - 3 * 3600, "ok", "{}"))
-        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-               (now - 3 * 3600, f"task:{t}", "task_waiting", "low",
-                f"#{t} waits: the project's other full checks", "handled", t))
-        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-               (now - 2.5 * 3600, "daemon", "checks_slot_wait", "low", ev_text, "handled", t))
-        p.db.x("UPDATE tasks SET status='queued', blocked_reason='waiting for the checks slot' WHERE id=?", (t,))
-        return t
-
-    requeued_wait("lanes", "Checks slot wait: held by the per-repository lane limit (checks.slots).")
-    requeued_wait("cap", "Checks slot wait: held by the project cap (checks.test_project_max).")
+    lane_text = requeued_wait(p, now, lane_h, "")
+    cap_text = requeued_wait(p, now, cap_h, _WRAP_A)
+    assert throughput.slot_limit(lane_text) == "checks.slots", lane_text
+    assert throughput.slot_limit(cap_text) == "checks.test_project_max", cap_text
     rep = throughput.measure(p.db, p.config(), now=now, gates={})
     ck = _tp_lane(rep, "checks_slots")
     assert ck["count"] == 2
-    # Both limits read through checklane from config, each wait named by its own event's wording, and
-    # the lane names whichever held more of its wait time (a tie keeps the tally's order: slots).
+    # Both limits read through checklane from config; the lane names whichever held more of its wait time.
     assert ck["limits"] == {"checks.slots": 2, "checks.test_project_max": 5}
-    assert ck["limit_key"] == "checks.slots" and ck["limit"] == 2
+    assert (ck["limit_key"], ck["limit"]) == (want, n), ck
     assert "checks.slots" in ck["note"] and "checks.test_project_max" in ck["note"]
     assert "config_set" in ck["note"]
 

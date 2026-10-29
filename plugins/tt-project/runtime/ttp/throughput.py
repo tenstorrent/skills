@@ -387,10 +387,6 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     # checks_slot_wait events name the holder; a logged wait with no event defaults to the
     # per-repository lane limit; a wait known only from its reason text, the project cap).
     # Both limits are read through checklane, never second-guessed here.
-    # The lane's limit is whichever of the two checks limits held more of its wait time (its
-    # checks_slot_wait events name the holder; a logged wait with no event defaults to the
-    # per-repository lane limit; a wait known only from its reason text, the project cap).
-    # Both limits are read through checklane, never second-guessed here.
     slot_key = max(slot_tally, key=slot_tally.get) if any(slot_tally.values()) else CAP_KEY
     ck_lane = lane("checks_slots", slot_key, cap_n if slot_key == CAP_KEY else lanes_n)
     if ck_lane["limit_key"] != slot_key:  # lane() keeps the first key it was created with
