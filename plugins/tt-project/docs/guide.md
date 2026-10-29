@@ -942,7 +942,11 @@ queues behind routine work; nothing running is interrupted:
   `checks.wrap_cmd` never spill; a run that does not pass on a spill host runs again here, and that result
   counts. `checks.json` (`spilled_to`), `ttp status` and `ttp checks status` name the host.
   `ttp checks status` (also `--slot-status`, `--json`) prints each repository's lane holders (pid, task, run,
-  age, alive or dead) and its waiters in queue order, the next one marked; it is read only and never queues.
+  age, alive or dead, what it checks and whether its task has finished) and its waiters in queue order, the next
+  one marked; it is read only and never queues. Every lane group has a name (its repository, else the project
+  folder). `status` is the only subcommand: an unknown word or flag before `--` (`ttp checks statuz`,
+  `ttp checks --foo`, `status --bogus`, `--slot-status` with a command) is refused with exit 2 and queues
+  nothing; check commands go after `--`.
   A task never runs the same suite twice at once: a full `ttp checks` of a task that is still waiting joins
   the same task's checks with the same head, commands, purpose and environment that already wait ahead of it or
   run now. It leaves the queue, runs nothing and reports that run's outcome (passed, failed or timed out, exit 1
@@ -952,7 +956,18 @@ queues behind routine work; nothing running is interrupted:
   queued later (after a reset, or a second worktree) runs its own checks. A run that has started is never stopped, and another command, environment, purpose, task or
   repository is never a duplicate. If the run it follows ends without a result, the waiter queues again in its
   old place. `ttp checks status` and `ttp status` list joined and superseded waiters, and the `--result` probe
-  says the run waits on another. A run's check commands stop at a wall-time cap: on by
+  says the run waits on another.
+  Each task and check waits once in the lane queue: should two waits for the same check of a task still be
+  queued (one did not join, e.g. queued by an older runtime), the older run's wait is cancelled as superseded
+  and the newer run keeps the earlier place. A waiter whose process is gone is dropped with a one-line note,
+  a waiter whose ticket vanished queues again at its old place, and the head of the queue looks for a free
+  lane every half second. A lane still held by a check
+  whose task has finished (done, failed, cancelled or exhausted) raises one `checks_lane_finished` event
+  (pid, task, run, time since the task ended) once `checks.done_holder_flag_s` past the end (default 300,
+  0 turns it off); once `checks.done_holder_grace_s` past it (default 1.5x the check's usual run time,
+  else its wall-time cap, else 1 h; never under the flag time) the daemon stops that check, only when it
+  is the task's own detached `ttp checks` run, so the lane goes to the next waiter; any other holder is
+  only reported. A run's check commands stop at a wall-time cap: on by
   default, 3x the longest of the project's last 20 completed runs within 1-6 h (3 h before 3 runs are known);
   `checks.wall_cap_s` sets it, 0 turns it off. A run past it has its process group ended, frees the slot and is
   recorded as a timeout, never a pass; `ttp status` shows the holder's time against its cap and the waiting
