@@ -214,9 +214,10 @@ STEP_BUDGET_S = 60
 # that had 120-300 s timeouts take the cap through gitmemo.timeout(): worktree._git, inspect, _ignored,
 # _ignores, is_ancestor, _closest_ancestor, is_superseded, queue_pushed, _patch_ids, _delivered,
 # _sweep_stray's patch; archive.tracked_files and tracked_patch; reviewcap._touched; verified.changed_since;
-# reviewreuse._patches; landed._git and overlap._git too. Git writes outside a transaction keep their own
-# timeouts (worktree add/remove/prune, cleantree, checkreap, harnesstree's merge): killing one midway can
-# leave a lock or a half-removed tree. pushq's inherit check is bounded at INHERIT_GIT_S already.
+# reviewreuse._patches; landed._git, overlap._git, pushq._git and _patch_ids (check_approval runs in the
+# finish transaction) and push._git too. Git writes outside a transaction keep their own timeouts (worktree
+# add/remove/prune, cleantree, checkreap, harnesstree's merge): killing one midway can leave a lock or a
+# half-removed tree. Every git helper takes the cap or is allowlisted (test_every_git_helper_takes_gitmemos_cap).
 STEP_SLOW_EVERY_S = 3600
 WATCHER_MAX_S = HEARTBEAT_STALE_S - 60   # a command watcher's timeout_s is capped here, well below WATCHDOG_S
 # Schedule runs go on off the tick (schedrun); a tick waits this long for them, so quick ones are recorded
@@ -4325,8 +4326,11 @@ class Daemon:
         approval, push_note, push_quiet = None, "", False
         entries = result.get("push") if isinstance(result, dict) else None
         if new == "done" and entries not in (None, "", []):
-            check = (pushq.check_approval(self.p, task, entries, cfg=self.cfg) if task["kind"] == "review"
-                     else {"ignored": "only a review task approves pushes"})
+            try:
+                check = (pushq.check_approval(self.p, task, entries, cfg=self.cfg) if task["kind"] == "review"
+                         else {"ignored": "only a review task approves pushes"})
+            except subprocess.TimeoutExpired as e:   # gitmemo.TX_GIT_S ran out: invalid, so the review runs again
+                check = {"invalid": f"local git timed out checking it (after {e.timeout:.0f} s)"}
             if check.get("ignored"):
                 log(self.p, f"task {task['id']}: its push list was ignored: {check['ignored']}")
                 push_note = f" Its push list was ignored: {check['ignored']}."

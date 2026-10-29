@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, cleantree, envfault, landed, locks, machines, prguard, prhead, remotecheck, runner,
+from . import (checkcap, checkdirs, cleantree, envfault, gitmemo, landed, locks, machines, prguard, prhead, remotecheck, runner,
                sandbox, scriptwatch, settinghold, testslots, timefmt, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
@@ -1419,9 +1419,10 @@ def unmatched_paths(repo: Path, remote: str, branch: str, checks: list[str]) -> 
 
 def _git(repo: Path, *args: str, quiet: bool = True) -> subprocess.CompletedProcess:
     """Run git; when not quiet its output goes to stderr, keeping stdout for the verdict."""
+    t = gitmemo.timeout(None, args)   # none of its own; capped within a daemon tick step or finish transaction
     if quiet:
-        return subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True)
-    return subprocess.run(["git", "-C", str(repo), *args], text=True, stdout=2)
+        return subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True, timeout=t)
+    return subprocess.run(["git", "-C", str(repo), *args], text=True, stdout=2, timeout=t)
 
 
 def _fetch(repo: Path, remote: str, branch: str) -> str:

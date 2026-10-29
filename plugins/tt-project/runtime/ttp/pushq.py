@@ -113,7 +113,9 @@ def target(p: Project) -> tuple[str, str] | None:
 
 
 def _git(p: Project, *args: str, timeout: float = 120, **kw) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(p.root), *args], text=True, capture_output=True, timeout=timeout,
+    # Within a daemon tick step or finish transaction gitmemo caps it (check_approval runs in one).
+    return subprocess.run(["git", "-C", str(p.root), *args], text=True, capture_output=True,
+                          timeout=gitmemo.timeout(timeout, args),
                           stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}, **kw)
 
 
@@ -318,7 +320,7 @@ def _patch_ids(p: Project, shas: list[str]) -> dict[str, str]:
         return {}
     show = _git(p, "show", "--no-color", "--format=commit %H", "-p", *shas, timeout=INHERIT_GIT_S)
     pid = subprocess.run(["git", "-C", str(p.root), "patch-id", "--stable"], input=show.stdout, text=True,
-                         capture_output=True, timeout=INHERIT_GIT_S)
+                         capture_output=True, timeout=gitmemo.timeout(INHERIT_GIT_S, ("patch-id",)))
     return {f[0]: f[1] for f in (line.split() for line in pid.stdout.splitlines()) if len(f) == 2}
 
 

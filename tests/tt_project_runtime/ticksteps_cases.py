@@ -528,7 +528,7 @@ def test_each_library_git_read_with_a_long_timeout_takes_the_tick_cap(env, monke
     """The library git reads that had 120-300 s timeouts (reachable from tick steps and the finish
     transaction) each take gitmemo's cap: within bounded(), none waits longer than it."""
     p = make(env)
-    from ttp import archive, gitmemo, landed, overlap, reviewcap, reviewreuse, verified, worktree
+    from ttp import archive, gitmemo, landed, overlap, push, pushq, reviewcap, reviewreuse, verified, worktree
     seen = _git_timeouts(monkeypatch)
     review = {"id": 9, "kind": "review", "spec": "", "labels": "[]", "depends_on": "[]"}
     sites = {
@@ -548,6 +548,9 @@ def test_each_library_git_read_with_a_long_timeout_takes_the_tick_cap(env, monke
         "reviewreuse._patches": lambda: reviewreuse._patches(p, "a" * 40, "b" * 40),
         "landed._git": lambda: landed._git(p.root, "rev-parse", "HEAD", timeout=300),
         "overlap._git": lambda: overlap._git(p.root, "ls-files"),
+        "pushq._git": lambda: pushq._git(p, "rev-parse", "HEAD"),
+        "pushq._patch_ids": lambda: pushq._patch_ids(p, ["a" * 40]),
+        "push._git": lambda: push._git(p.root, "rev-parse", "HEAD"),
     }
     for name, call in sites.items():
         seen.clear()
@@ -566,12 +569,14 @@ def test_each_library_git_read_with_a_long_timeout_takes_the_tick_cap(env, monke
     assert seen[0][1] == 120, "outside a bounded scope (a worker, the CLI) the call keeps its own timeout"
 
 
-def _hung_git(tmp_path, monkeypatch):
-    """A `git` first on PATH that hangs while the returned flag file exists, else runs the real git."""
+def _hung_git(tmp_path, monkeypatch, only="*"):
+    """A `git` first on PATH that hangs while the returned flag file exists (on a command line matching
+    the shell pattern `only`), else runs the real git."""
     bindir, flag = tmp_path / "hungbin", tmp_path / "git-hangs"
     bindir.mkdir()
     exe = bindir / "git"
-    exe.write_text(f"#!/bin/sh\nif [ -e {flag} ]; then echo \"$(date +%s.%N) $*\" >> {flag}.log; exec sleep 60; fi\n"
+    exe.write_text(f"#!/bin/sh\nif [ -e {flag} ]; then case \"$*\" in {only}) echo \"$(date +%s.%N) $*\" >> {flag}.log;"
+                   f" exec sleep 60;; esac; fi\n"
                    f"PATH='{os.environ['PATH']}' exec {shutil.which('git')} \"$@\"\n")   # a git wrapper finds no shim
     exe.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
@@ -636,3 +641,45 @@ def test_a_hung_git_in_the_finish_transaction_ends_by_its_cap_and_the_review_is_
     assert d.sweep_unreviewed(force=True) == [tid]
     (rev,) = p.db.q("SELECT * FROM tasks WHERE kind='review'")
     assert rev["title"] == f"Review #{tid}: small fix"
+
+
+@pytest.mark.parametrize("only", ["*", "*rev-parse?--verify?--quiet*^{commit}"])   # ?: a space
+def test_a_hung_git_in_a_push_approving_reviews_finish_ends_by_the_transaction_cap(env, monkeypatch, tmp_path, only):
+    """pushq.check_approval runs its local git (push._git's remote list, pushq._commit, _contains, the
+    conflicted log) inside the finish transaction unwarmed. A hung one (any, or only pushq._commit's)
+    ends within gitmemo.TX_GIT_S (+ FLOOR_S per late call), the review's finish completes, and the
+    approval is judged invalid so the review runs again, never lost."""
+    from ttp import gitmemo
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    s = _pq(env, monkeypatch)
+    s.p.db.update_task(s.review, status="running")
+    run_dir = env["tmp"] / "run-review"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps(
+        {"status": "done", "summary": "looks good", "push": [{"branch": s.branch, "head": s.head}]}))
+    d = Daemon(s.p.base)
+    flag = _hung_git(tmp_path, monkeypatch, only)
+    monkeypatch.setattr(gitmemo, "TX_GIT_S", 1.0)
+    monkeypatch.setattr(gitmemo, "FLOOR_S", 0.1)
+    monkeypatch.setattr(gitmemo, "TICK_GIT_S", 10.0)   # above the budget: only the transaction's cap holds
+    held: list = []
+
+    def committed():
+        held.append(time.monotonic() - t0)
+        flag.unlink()
+    t0 = time.monotonic()
+    with gitmemo.bounded(gitmemo.TICK_GIT_S):   # as in a tick step (Daemon._run_step)
+        with d._finish_tx(s.review):
+            flag.touch()
+            d.p.db.after_commit(committed)
+            d._finish_worker({"task": s.review, "id": 7, "note": "{}"}, Usage(cost_usd=1.0), "ok", run_dir)
+    hung = (tmp_path / "git-hangs.log").read_text().splitlines()
+    assert hung, "no git ran inside the finish transaction"
+    assert only == "*" or f"{s.head}^{{commit}}" in hung[0], hung   # pushq._commit's read hung
+    assert held and held[0] < 1.0 + 0.1 * len(hung) + 2, f"the write lock was held {held} s on a hung git: {hung}"
+    task = s.p.db.task(s.review)
+    assert task["status"] == "queued", (task["status"], task["result"])
+    assert json.loads(task["result"])["push_invalid"] == 1
+    assert "timed out" in json.loads(task["result"])["woke"]
+    assert not s.p.db.q("SELECT id FROM push_queue"), "no approval queued from a hung git"
