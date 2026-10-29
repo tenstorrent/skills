@@ -3228,7 +3228,7 @@ def _settle(d, name, within=20.0):
     return d.p.db.one("SELECT * FROM schedules WHERE name=?", (name,))
 
 
-def _alive(pid):
+def _proc_alive(pid):
     try:
         os.kill(pid, 0)
     except OSError:
@@ -3273,9 +3273,9 @@ def test_a_command_schedule_past_its_timeout_has_its_group_killed_and_counts_as_
         assert row["last_status"] == "error: timed out after 1 s", row["last_status"]
         child = int(pidfile.read_text())
         deadline = time.monotonic() + 5
-        while _alive(child) and time.monotonic() < deadline:
+        while _proc_alive(child) and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert not _alive(child), "the command's background child outlived its timeout"
+        assert not _proc_alive(child), "the command's background child outlived its timeout"
     assert p.db.q("SELECT id FROM issues WHERE source=? AND status='open'", (scr.error_source("watcher:hangs"),))
     assert "hangs" in (p.db.kv(d.SCHEDULE_FIXES_KEY) or {}), "two failed runs in a row queue the fix task"
     assert not p.db.kv(schedrun.GROUPS_KEY), "an ended group is no longer kept"
@@ -3479,7 +3479,7 @@ def test_a_restarted_daemon_kills_the_groups_its_predecessors_runs_left_and_runs
     assert p.db.one("SELECT last_run FROM schedules WHERE name='long'")["last_run"] is None
     d2 = dm.Daemon(p.base)   # d1 is gone: its tick never records that run
     row = _settle(d2, "long")
-    assert not _alive(pid), "the earlier daemon's command was killed"
+    assert not _proc_alive(pid), "the earlier daemon's command was killed"
     assert row["last_status"] == "ok (0 observations)", "the schedule ran once more, recorded once"
 
 
