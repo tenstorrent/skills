@@ -46361,28 +46361,39 @@ def test_archiving_a_named_directory_of_many_files_takes_linear_time(tmp_path, m
 
 
 class _stack_dumped:
-    """Waits for the watch thread's stack dump on the real condition: the STACKS_FILE changing.
-    A loaded host can take arbitrarily long to write it; polling ends the wait the moment it
-    appears, with HANG_S as a hang bound only."""
+    """Waits for the watch thread's stack dump on the real condition: check_overrun done, which its
+    last act, the daemon.log line naming the stacks file, shows. Not the STACKS_FILE changing: its
+    header line lands before the stacks, so a loaded host left a reader with the header alone.
+    Polling ends the wait the moment the line appears, with HANG_S as a hang bound only."""
 
     def __init__(self, daemon):
-        import ttp.daemon as dm
-        self._path = daemon.p.state / dm.STACKS_FILE
-        self._before = self._mtime()
+        self._log = daemon.p.logs / "daemon.log"
+        self._before = self._dumps()
 
-    def _mtime(self):
+    def _dumps(self):
         try:
-            return self._path.stat().st_mtime_ns
+            return self._log.read_text().count("every thread's stack is in ")
         except OSError:
             return 0
 
     def waited(self):
         deadline = time.monotonic() + HANG_S
         while time.monotonic() < deadline:
-            if self._mtime() not in (0, self._before):
+            if self._dumps() > self._before:
                 return True
             time.sleep(0.05)
         return False
+
+
+def _slow_stack_dump(monkeypatch, delay_s=0.5):
+    """A loaded host: the stack dump lands well after the header line it follows in STACKS_FILE."""
+    import faulthandler
+    real = faulthandler.dump_traceback
+
+    def slow(*a, **kw):
+        time.sleep(delay_s)
+        return real(*a, **kw)
+    monkeypatch.setattr(faulthandler, "dump_traceback", slow)
 
 
 def test_a_tick_step_that_blocks_is_logged_with_every_threads_stack_and_alerted(env, monkeypatch):
@@ -46391,6 +46402,7 @@ def test_a_tick_step_that_blocks_is_logged_with_every_threads_stack_and_alerted(
     d = dm.Daemon(p.base)
     d.cfg = p.config()
     monkeypatch.setattr(dm, "TICK_OVERRUN_S", 0.3)
+    _slow_stack_dump(monkeypatch)
 
     def step_that_blocks():   # a step stuck in a call with no timeout, still telling the watchdogs it moves
         for _ in range(HANG_S):   # ends the moment the watch thread dumps, or at HANG_S (a hang) at the latest
@@ -46429,6 +46441,7 @@ def test_a_tick_step_blocked_without_progress_leaves_its_stacks_before_the_watch
     # seen progress (throttled to PROGRESS_EVERY_S) is WATCHDOG_S old; the long-tick dump does not.
     assert dm.TICK_STALL_S + 30 < dm.WATCHDOG_S - dm.PROGRESS_EVERY_S < dm.TICK_OVERRUN_S
     monkeypatch.setattr(dm, "TICK_STALL_S", 0.3)
+    _slow_stack_dump(monkeypatch)
     seen = {}
 
     def step_stuck_silently():   # a subprocess or lock wait with no timeout: never calls _progress
