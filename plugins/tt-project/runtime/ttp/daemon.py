@@ -311,6 +311,10 @@ HARNESS_HEAD_S = 10
 # the spec's digest it slept on (SPEC_SEEN_KEY) and its recent spec-change wakes (SPEC_WAKES_KEY), at most
 # SPEC_WAKES_PER_H an hour (a loop guard).
 SPEC_SEEN_KEY, SPEC_WAKES_KEY, SPEC_WAKES_PER_H = "spec_seen", "spec_wakes", 3
+# Why a spec change woke a task. The wake runs at the task's own tier, not as a light check of its wait: a
+# light wake whose wait was over handed off the old work as done without the change.
+SPEC_WOKE = ("its spec changed: act on what the change adds (the spec's latest `## Update`) before you hand "
+             "off; the last hand-off does not cover it")
 PROBE_STALL_PASS_S = 120   # probe time one probe-stall disposition pass may spend (sweep.dispose_probe_stalls)
 # The detached rerun of a shared failure's ids on the push-branch tip (Daemon._start_tip_check):
 # argv dir worktree repo timeout_s cmd...; removes the worktree, then writes rc (124 once timed out),
@@ -4197,6 +4201,7 @@ class Daemon:
         extra: dict = {}
         reason = None
         not_before = None
+        missed = self._missed_update(r, task, run_dir, handoff) if status == "ok" else None
         if rebooted:
             extra["reboot"] = {"at": self.boot_at, "notes": _last_notes(run_dir)}
         wakes = _reboot_wakes(task)
@@ -4280,8 +4285,19 @@ class Daemon:
             if "waiting_since" in extra:
                 # The spec it slept on: a later change (a task_update) wakes it once (_spec_wake).
                 from .prompts import spec_digest
-                extra[SPEC_SEEN_KEY] = spec_digest(self.p.db.task(task["id"]) or task)
+                # An update the run never read keeps the spec it started on, so that change wakes it.
+                extra[SPEC_SEEN_KEY] = missed["started"] if missed else spec_digest(self.p.db.task(task["id"]) or task)
                 extra[SPEC_WAKES_KEY] = _recent_spec_wakes(prev_res, time.time())
+        if missed and new in ("done", "review"):
+            # The spec changed during the run and the update carrying it stayed unread: the hand-off is
+            # not accepted, the task runs again now with the change (its next run starts on that spec).
+            new, not_before, push_quiet = "queued", time.time(), True
+            attempts = int(task["attempts"] or 0)
+            extra["woke"] = ("an update to your task reached your last run after it last read its updates, so "
+                             "that run's hand-off does not cover it. Act on it, then hand off again. The update:\n"
+                             + coord.clip(missed["text"], 4000))
+            reason = "its spec changed during the run and the update stayed unread; sent back with it"
+            log(self.p, f"task {task['id']}: run {r.get('id')} {reason}")
         # A review that passes may hand its approved commits to the push queue instead of pushing
         # (delivery.push_queue): it waits as 'pushing' until a batch pushed them (pushq.py).
         approval, push_note, push_quiet = None, "", False
@@ -9878,9 +9894,38 @@ class Daemon:
         if held:
             return False
         self._spec_capped.discard(tid)
-        self._wake_waiting(t, "its spec changed", now, extra={SPEC_SEEN_KEY: sha, SPEC_WAKES_KEY: wakes + [now]})
+        self._wake_waiting(t, SPEC_WOKE, now, extra={SPEC_SEEN_KEY: sha, SPEC_WAKES_KEY: wakes + [now],
+                                                     "wake_tier": _own_tier(t), "escalated_wake": True})
         self.p.db.update_task(tid, blocked_reason="woken: its spec changed; it runs by rank, before its probe passes")
         return True
+
+    def _missed_update(self, r: dict, task: dict, run_dir: Path, handoff: dict | None) -> dict | None:
+        """{"started": spec digest the run started on, "text": its unread updates} when the task's spec
+        changed after the run started and the steer.md update carrying the change was not read before
+        the run ended; else None. A worker with the update hook (provider steer_hook) has read up to its
+        steer.offset; one without reads steer.md between steps, so only an update newer than its
+        result.json is surely unread. A model-free on_pass (`handoff`) is checked in _probe_passed."""
+        if handoff is not None:
+            return None
+        from .hook import STEER_FILE, unread_update
+        from .prompts import spec_digest
+        started = load_result(r.get("note")).get("spec_sha")
+        if not isinstance(started, str) or started == spec_digest(task):
+            return None
+        text = unread_update(run_dir)[0]
+        if not text:
+            return None
+        try:
+            hooked = bool(getattr(get_provider(r["provider"]), "steer_hook", False))
+        except Exception:
+            hooked = True
+        if not hooked:
+            try:
+                if (run_dir / STEER_FILE).stat().st_mtime <= (run_dir / RESULT_FILE).stat().st_mtime:
+                    return None
+            except OSError:
+                pass
+        return {"started": started, "text": text}
 
     def _spec_wake_hold(self, t: dict, probe: str, now: float) -> str | None:
         """What keeps a waiting task asleep through a spec change, or None: an unmet dependency, a
@@ -9922,6 +9967,13 @@ class Daemon:
         if after and after > now:
             if (task["not_before"] or 0) < after:
                 self.p.db.update_task(task["id"], not_before=after)
+            return
+        from .prompts import spec_digest
+        seen, sha = load_result(task["result"]).get(SPEC_SEEN_KEY), spec_digest(task)
+        if isinstance(seen, str) and seen != sha:
+            # Its spec changed since the hand-off: no on_pass (written before the change) is recorded.
+            self._wake_waiting(task, f"{why}, but {SPEC_WOKE}", now,
+                               extra={SPEC_SEEN_KEY: sha, "wake_tier": _own_tier(task), "escalated_wake": True})
             return
         try:
             got = self._checks_wait(task)
@@ -13531,6 +13583,11 @@ def _last_notes(run_dir: Path, n: int = 5) -> list[str]:
     except OSError:
         return []
     return [x[:300] for x in lines if x.strip()][-n:]
+
+
+def _own_tier(task: dict) -> str:
+    """The tier a wake that found real work runs at: the task's own."""
+    return task["tier"] if task["tier"] in bud.TIER_ORDER else "standard"
 
 
 def _recent_spec_wakes(prev: dict, now: float) -> list[float]:

@@ -45,7 +45,7 @@ def test_a_spec_change_wakes_a_task_asleep_on_its_retry_when_once(env, monkeypat
     t = p.db.task(tid)
     res = json.loads(t["result"])
     assert t["status"] == "queued" and t["not_before"] <= time.time(), "the spec change did not wake it"
-    assert res["woke"] == "its spec changed" and len(res["spec_wakes"]) == 1
+    assert res["woke"].startswith("its spec changed") and len(res["spec_wakes"]) == 1
     assert t["blocked_reason"].startswith("woken: its spec changed")
     from ttp.prompts import spec_digest
     assert res["spec_seen"] == spec_digest(t)
