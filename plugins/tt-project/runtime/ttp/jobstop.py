@@ -56,7 +56,7 @@ from pathlib import Path
 
 from . import detach, locks
 from .db import load_result
-from .project import Project, write_json
+from .project import Project, durable_write, write_json
 
 ENDED = ("cancelled", "failed", "exhausted")   # task states whose jobs the daemon stops
 HANDED_OFF = ("done", "blocked")                # hand-offs whose jobs the daemon stops unless the hand-off names them
@@ -808,7 +808,7 @@ def _serve_pids(p: Project, m: dict) -> list[dict]:
     try:   # only into the task's own results dir, never through a link out of it
         out = f.resolve().with_name(f.name + ".stopped")
         if caller.isdigit() and task_results(p, int(caller), out) and not out.is_symlink():
-            out.write_text(f"{r['text'] if r else why}\n")
+            durable_write(out, f"{r['text'] if r else why}\n")
     except (OSError, RuntimeError):
         pass
     return [r] if r and r["pids"] else []
