@@ -4,9 +4,11 @@
 
 A harness task works in the project's harness checkout, where the daemon reads prompts, config and
 runtime live. Two at once there would sweep up each other's uncommitted edits in a commit. So a
-harness task starts in the harness checkout only while no other harness task's run works there.
+harness task starts in the harness checkout only while no other harness task's run works there and the
+checkout is not left on a harness task's branch.
 Otherwise it gets a git worktree of the harness repo of its own (state/harness-worktrees/t<id>,
-branch ttp/harness-t<id>), and keeps it on later runs while it exists.
+branch ttp/harness-t<id>, started from the harness main line, never from what the checkout has checked
+out), and keeps it on later runs while it exists.
 
 When its run ends the daemon lands it (land): the branch's commits are merged into the harness
 checkout. The worktree and branch stay while the task is open (a waiting task's detached job may run
@@ -34,6 +36,7 @@ REPORTED_KEY = "harness_merge_reported"   # kv: task id -> the branch head a con
 CONFLICT_KEY = "harness_merge_conflicted"  # kv: task id -> [branch head, harness HEAD, "conflict"|"refused"] last seen
 MERGE_MSG = "tt-project: land harness task"   # the start of land's merge message (MERGE_MSG mid-merge)
 SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
+TASK_BRANCH_RE = re.compile(r"ttp/harness-t\d+")   # a harness task's own branch
 
 
 def path(p: Project, tid: int) -> Path:
@@ -68,22 +71,65 @@ def checkout_busy(p: Project, tid: int) -> bool:
     return False
 
 
+def on_branch(cwd: Path) -> str:
+    """The branch working tree `cwd` has checked out, or "" (detached, or git cannot tell)."""
+    r = _git(cwd, "symbolic-ref", "-q", "--short", "HEAD")
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def main_branch(p: Project) -> str:
+    """The harness repo's main line, which a new task branch starts from: `main` (or `master`) when it
+    has one, else the checkout's own branch unless that is a harness task's branch; "" when none."""
+    for b in ("main", "master"):
+        if _git(p.harness, "rev-parse", "--verify", "-q", f"refs/heads/{b}").returncode == 0:
+            return b
+    here = on_branch(p.harness)
+    return "" if TASK_BRANCH_RE.fullmatch(here) else here
+
+
+def off_branch(p: Project, tid: int) -> str:
+    """Where harness task `tid`'s commits go when that is not its own line, or "": its worktree is on
+    another branch than ttp/harness-t<tid> (or detached), or the harness checkout (where its work is
+    merged, or done) sits on a harness task's branch instead of its main line."""
+    own = path(p, tid)
+    if own.exists() and (got := on_branch(own)) != branch(tid):
+        return got or "a detached HEAD"
+    if _is_repo(p) and TASK_BRANCH_RE.fullmatch(here := on_branch(p.harness)):
+        return here
+    return ""
+
+
+def _checked(p: Project, tid: int, own: Path) -> Path:
+    got = on_branch(own)
+    if got != branch(tid):
+        raise RuntimeError(f"harness worktree for #{tid} ({own}) is on {got or 'a detached HEAD'}, not its own "
+                           f"branch {branch(tid)}: not run there, so its commits cannot land on another branch")
+    return own
+
+
 def workdir(p: Project, tid: int) -> Path:
     """Where harness task `tid` works: its worktree when it has one, else the harness checkout while
-    that is free, else a new worktree of its own."""
+    that is free and on its main line, else a new worktree of its own: branch ttp/harness-t<tid>,
+    kept as it is when it exists (a retry), else started from the main line (main_branch), never from
+    whatever the checkout has checked out. A worktree not on that branch is refused (RuntimeError)."""
     own = path(p, tid)
     if own.exists():
-        return own
-    if not _is_repo(p) or not checkout_busy(p, tid):
+        return _checked(p, tid, own)
+    if not _is_repo(p) or not (checkout_busy(p, tid) or TASK_BRANCH_RE.fullmatch(on_branch(p.harness))):
         return p.harness
     own.parent.mkdir(parents=True, exist_ok=True)
     have = _git(p.harness, "rev-parse", "--verify", "-q", f"refs/heads/{branch(tid)}").returncode == 0
-    args = ["worktree", "add", "-q", str(own), branch(tid)] if have else \
-        ["worktree", "add", "-q", "-b", branch(tid), str(own), "HEAD"]
+    if have:
+        args = ["worktree", "add", "-q", str(own), branch(tid)]
+    elif start := main_branch(p):
+        args = ["worktree", "add", "-q", "-b", branch(tid), str(own), start]
+    else:
+        raise RuntimeError(f"harness worktree for #{tid}: the harness repo has no main branch to start "
+                           f"{branch(tid)} from (its checkout is on {on_branch(p.harness) or 'a detached HEAD'})")
     r = _git(p.harness, *args, timeout=120)
     if r.returncode != 0:
         raise RuntimeError(f"harness worktree for #{tid}: {(r.stderr or r.stdout).strip()[-400:]}")
-    return own
+    return _checked(p, tid, own)
 
 
 def held(p: Project, tid: int) -> str | None:
@@ -115,12 +161,13 @@ def land(p: Project, tid: int) -> str:
     them (held). Returns what happened: '' (no worktree), 'merged' (and removed), 'kept' (its commits
     landed; the worktree stays, for the open task or its live jobs, or with uncommitted changes for
     the task's next run), 'busy' (git refused, e.g. over the checkout's own changes), 'conflict' (new)
-    or 'conflict-known' (the same branch head and harness HEAD as last time: not merged again)."""
+    or 'conflict-known' (the same branch head and harness HEAD as last time: not merged again). While
+    the checkout sits on a harness task's branch, not its main line, nothing is merged ('busy')."""
     own = path(p, tid)
     if not own.exists():
         return ""
-    if not _is_repo(p):
-        return "busy"
+    if not _is_repo(p) or TASK_BRANCH_RE.fullmatch(on_branch(p.harness)):
+        return "busy"   # never merged into another task's branch the checkout was left on
     b = branch(tid)
     ahead = _git(p.harness, "rev-list", "--count", f"HEAD..{b}")
     outcome = ""

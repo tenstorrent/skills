@@ -421,6 +421,7 @@ STALE_REVIEWS_PER_PASS = 20   # queued reviews whose subject is looked up on the
 KV_KEPT_MESSAGES = "kept_messages"   # kv: user message ids kept unhandled once after a fixable task_add rejection
 REVIEW_SWEEP_EVERY_S = 300   # how often sweep_reviews looks for code and harness tasks left in review with no review
 HARNESS_UNMERGED = "harness_review_unmerged"   # event: a harness task passed review but its branch is not merged
+HARNESS_OFF_BRANCH = "harness_off_branch"   # event: a harness task's work is on a branch not its own
 # sweep_unreviewed: a done (or long externally waiting) code task with an unlanded head and no review
 UNREVIEWED_EVENT = "review_unqueued"
 UNREVIEWED_PER_PASS = 2        # review.unreviewed_per_pass unreadable: most reviews one pass queues (unset: loadcaps)
@@ -10822,6 +10823,8 @@ class Daemon:
             old = db.kv(HARNESS_MERGED_KEY, {}) or {}
             new = {}
             for t in db.q("SELECT * FROM tasks WHERE kind='harness' AND status='review' ORDER BY id"):
+                if harnesstree.off_branch(self.p, t["id"]):   # not delivered (_sweep_harness_review flags it)
+                    continue
                 sha = old.get(str(t["id"])) or harnesstree.merged_commit(self.p, t)
                 if sha:
                     new[str(t["id"])] = sha
@@ -10843,6 +10846,9 @@ class Daemon:
         whose worktree branch has nothing unmerged (harnesstree.sweep may have merged and deleted it);
         a branch still holding unmerged commits then raises one HARNESS_UNMERGED event for the
         coordinator. Else it gets one review of its own (_auto_review_harness)."""
+        if wrong := harnesstree.off_branch(self.p, t["id"]):
+            self._harness_off_branch(t, wrong, start, now)
+            return
         mine = [r for r in reviews if t["id"] in dependency_ids(r) or review_subject(r) == t["id"]]
         if any(r["status"] not in ("done", "failed") for r in mine):
             return
@@ -10897,6 +10903,20 @@ class Daemon:
               f"into the harness (`git -C {self.p.harness} log HEAD..{b}`), so it stays in review: merge them "
               f"(or close it with `ttp task superseded`), or requeue it.", "queued", t["id"]))
         log(self.p, f"task {t['id']}: review #{rid} passed but branch {b} has {n} unmerged commits; told the coordinator")
+
+    def _harness_off_branch(self, t: dict, wrong: str, start: float, now: float) -> None:
+        """Harness task `t`'s worktree, or the harness checkout its work lands in, is on `wrong`, not its
+        own branch or the harness's main line: one queued event per stay in review; it stays in review."""
+        db = self.p.db
+        if db.one("SELECT id FROM events WHERE kind=? AND task=? AND ts>=?", (HARNESS_OFF_BRANCH, t["id"], start)):
+            return
+        b = harnesstree.branch(t["id"])
+        db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+             (now, "daemon", HARNESS_OFF_BRANCH, "normal",
+              f"#{t['id']} {t['title']}: its work is on branch {wrong}, not its own {b} or the harness's main "
+              f"line, so it is not delivered and stays in review: move its commits to {b} (or main) in "
+              f"{self.p.harness}, put the checkout back on main, or requeue it.", "queued", t["id"]))
+        log(self.p, f"task {t['id']}: work on branch {wrong}, not {b}: not delivered; told the coordinator")
 
     def _auto_review_harness(self, task: dict) -> tuple[int, bool] | None:
         """The review of harness task `task`, left in 'review' with its commits not merged into the harness
