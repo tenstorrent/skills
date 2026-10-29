@@ -182,9 +182,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # `ttp detach` jobs or `ttp lock` resources counts only past live_waits_max waits on the same ones
     # in 24 h or once a job's log stops growing (0: every such wait counts as before).
     # effort_skip_triggers: trigger labels (as recorded in the turn's note) that never count.
-    # auto_resolve_min: minutes before an unanswered ask that is not exempt resolves to its
-    # recommendation (askauto.py); 0 never.
-    "asks": {"auto_resolve_min": 30},
     "coordinator": {"tier": "light", "model": "", "model_tier": "standard", "effort": "",
                     "repeat_fails_24h": 2, "repeat_waits_24h": 8, "live_waits_max": 6,
                     "effort_skip_triggers": [],
@@ -249,7 +246,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # raised past the runtime's one-hour hard bound.
                     "turn_timeout_s": 0, "turn_timeouts_s": {},
                     "turn_timeout_ceiling_s": 3600, "sweep_prompt_chars": 12000,
-                    "ask_timeout_h": 1,
+                    "ask_timeout_h": 0.5,   # unanswered asks resolve to their default (askauto.py)
                     # An open restriction, irreversible or human ask that holds a blocked task longer
                     # than this goes back to a tricky turn once to decide it (askrethink.py); 0 off.
                     "ask_rethink_h": 2,

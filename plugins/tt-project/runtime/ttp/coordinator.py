@@ -297,11 +297,8 @@ USER_SETTABLE = {
     "providers.claude.mcp_withheld": lambda v: name_list(v, strict=True),
     # Tools workers and reviewers may not call, on top of the built-in denylist (mcp__<server>__*).
     "providers.claude.disallowed_tools": lambda v: tool_list(v, strict=True),
-    # Hours before an unanswered ask registered with a default falls back to it; 0 turns it off.
-    # New asks never get a default, so this only drains asks registered with one.
+    # Hours before an unanswered ask resolves to its default (askauto.py, expire_asks); 0 turns it off.
     "coordinator.ask_timeout_h": float,
-    # Minutes before an unanswered ask that is not exempt resolves to its recommendation (askauto.py); 0 never.
-    askauto.KEY: askauto.setting,
     # Days a user's yes to a charter change that failed to apply stays valid for a retry (_charter_approval).
     "coordinator.charter_approval_days": float,
     # Days a pr_approve record refuses a repeated review or merge ask (_prior_approval).
@@ -455,11 +452,11 @@ def batchable(kind: str, severity: str) -> bool:
     # An info observation (a mute that ended, a recovery) never needs a turn of its own either.
     return kind in BATCH_KINDS and (severity in ("low", "normal") or (kind == "observation" and severity == "info"))
 MAX_TASKS_PER_DAY = 1000
-# kv: {ask message id: recommendation (an older ask with its own default, after coordinator.ask_timeout_h)
-#      or {"rec", "auto": 1} (a new ask that auto-resolves after asks.auto_resolve_min, askauto.py)}
+# kv: {ask message id: its default, resolved after coordinator.ask_timeout_h: {"rec", "blocking", "auto": 1}
+#      (askauto.entry, stored for every ask) or a plain recommendation (an older ask)}
 ASK_DEFAULTS_KEY = askauto.DEFAULTS_KEY
 _DEFAULT_NOTE = "\n\nIf there is no answer within "
-_AUTO_NOTE = "\n\nNon-blocking: "   # askauto.note on a new ask the timer resolves
+_AUTO_NOTE = "\n\nNon-blocking: "   # askauto.note: when and to what the timer resolves the ask
 # Shown so the user can answer in one word; never applied without their answer.
 _REC_NOTE = "\n\nMy recommendation: "
 _LEAST_NOTE = "\n\nLeast-disruptive way considered: "
@@ -1066,7 +1063,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         for b in blockers:
             v = pending.get(str(b["id"]))
             if isinstance(v, dict) and (at := askauto.due(b["ts"], p.config())):
-                when = f"non-blocking; {askauto.note(str(v.get('rec') or ''), timefmt.short(at, p, now))}"
+                when = f"non-blocking; {askauto.note(v, timefmt.short(at, p, now))}"
             elif v is not None and not isinstance(v, dict) and hours > 0:
                 left = max(0.0, (b["ts"] + hours * 3600 - now) / 3600)
                 when = f"reversible; defaults to its recommendation in {left:.1f}h"
@@ -2444,15 +2441,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     text += f"{_REVERSIBLE_NOTE}{least}"
                 if rec:
                     text += f"{_REC_NOTE}{rec}"
-                auto_at = None if askauto.exempt(a["blocking"], rec) else askauto.due(time.time(), cfg)
-                if auto_at:   # shown wherever the ask is: the chat, ttp status, the web app
-                    text += f"{_AUTO_NOTE}{askauto.note(rec, timefmt.short(auto_at, p))}."
+                default = askauto.entry(a["blocking"], rec)   # every ask stores one
+                if auto_at := askauto.due(time.time(), cfg):   # shown in the chat, ttp status, the web app
+                    text += f"{_AUTO_NOTE}{askauto.note(default, timefmt.short(auto_at, p))}."
                 turn_asks.append((k, db.post("out", text, chat=None, kind="ask",
                                              severity=_norm_severity(a.get("severity") or "high"),
                                              ref=f"{prguard.BLOCKING_REF}{a['blocking']}")))
-                if auto_at:
-                    db.set_kv(ASK_DEFAULTS_KEY, {**db.kv(ASK_DEFAULTS_KEY, {}),
-                                                 str(turn_asks[-1][1]): {"rec": rec, "auto": 1}})
+                db.set_kv(ASK_DEFAULTS_KEY, {**db.kv(ASK_DEFAULTS_KEY, {}), str(turn_asks[-1][1]): default})
                 if seen:   # sent on its not_covered reason: counted for the daily audit
                     _count_refusal(db, f"{key}:reask" if key else None, "already settled (not_covered)",
                                    f"{nc} [over {seen}] {a['text'].strip()}", kind=ASK_FLAGGED_KIND)
@@ -3636,89 +3631,108 @@ def existing_dirs(dirs: list[str]) -> list[str]:
 
 
 def ask_timeout_h(cfg: dict) -> float:
-    try:
-        return max(0.0, float(cfg["coordinator"].get("ask_timeout_h", 1) or 0))
-    except (TypeError, ValueError):
-        return 0.0
+    return askauto.hours(cfg)
+
+
+def _ask_default(ask: dict) -> dict:
+    """The default an open ask filed without one gets: its recommendation and blocking reason, read
+    back from its text and ref (asks filed before every ask stored one)."""
+    text, ref = str(ask.get("text") or ""), str(ask.get("ref") or "")
+    rec = text.split(_REC_NOTE, 1)[1] if _REC_NOTE in text else ""
+    for note in (_AUTO_NOTE, _DEFAULT_NOTE, _LEAST_NOTE, _REVERSIBLE_NOTE):
+        rec = rec.split(note)[0]
+    return askauto.entry(ref.removeprefix(prguard.BLOCKING_REF) if ref.startswith(prguard.BLOCKING_REF) else "",
+                         rec)
 
 
 def expire_asks(p: Project, *, hold: bool = False, now: float | None = None) -> list[int]:
-    """Resolve asks registered with a recommendation and left unanswered past their timeout into it.
+    """Resolve each ask left unanswered past coordinator.ask_timeout_h into its default.
 
-    New asks that are not exempt (askauto.exempt) are registered when sent and resolve after
-    asks.auto_resolve_min; asks registered with their own default before that drain after
-    coordinator.ask_timeout_h. Exempt asks are never registered: they wait for the user. Nothing
-    expires while `hold` is set (the project is at a cap) or while a user message is unhandled, since
-    that message may be the answer. A due ask with any user message after it, handled or not, may
-    have been answered without a `resolve`: it is not applied and the coordinator is asked to check.
-    Each resolved ask is recorded answered by its recommendation (unblock.record_resolve), so a
-    re-ask is refused like an answered one. All of a tick's expiries wake the coordinator once, in
-    one event naming each ask and its recommendation. Returns expired ask ids.
+    Every ask stores its default when filed (askauto.entry); an open ask with none gets one here
+    (_ask_default), so asks filed before that time out too. askauto.outcome says what the timer does:
+    apply the recommendation, keep a restriction as written, or leave the ask open for the user (an
+    exempt class: shown as waiting, it holds only the tasks anchored on it). An older ask with a
+    plain-string default applies it and alerts at high as before. Nothing expires while `hold` is
+    set (a red gate) or while a user message is unhandled, since that message may be the answer. A
+    due ask with any user message after it, handled or not, may have been answered without a
+    `resolve`: it is not applied, its default is cleared (None: it waits) and the coordinator is
+    asked to check. Each resolved ask is recorded answered by its default (unblock.record_resolve), so
+    a re-ask is refused like an answered one; the daemon tells the chat at low (never under its
+    floor) and records a decision memory, and the hold sweep releases tasks anchored on it. All of a
+    tick's expiries wake the coordinator once, in one event naming each ask and what it resolved to.
+    Returns expired ask ids.
     """
     db = p.db
-    if not db.kv(ASK_DEFAULTS_KEY, {}):
-        return []
     now = now or time.time()
     cfg = p.config()
-    hours = ask_timeout_h(cfg)
+    hours = askauto.hours(cfg)
+    wait = f"{hours * 60:g} min" if 0 < hours < 1 else f"{hours:g}h"
 
-    def due_at(ts: float, v) -> float | None:
-        if isinstance(v, dict):
-            return askauto.due(ts, cfg)
-        return ts + hours * 3600 if hours > 0 else None
+    def resolves(v) -> tuple[str, str]:
+        if v is None:
+            return "open", "the user wrote after it"
+        return askauto.outcome(v.get("blocking"), v.get("rec")) if isinstance(v, dict) else ("apply", str(v))
 
-    def wait_text(v) -> str:
-        return f"{askauto.minutes(cfg):g} min" if isinstance(v, dict) else f"{hours:g}h"
-
-    def rec_of(v) -> str:
-        return str(v.get("rec") or "") if isinstance(v, dict) else str(v)
-
+    decided = []   # (ask id, question, resolved to): a decision memory each, written after the tx
     with db.tx():   # re-read inside: a resolve or a new ask may land between ticks
-        pending = db.kv(ASK_DEFAULTS_KEY, {})
-        open_asks = {str(r["id"]): r for r in db.q(
-            f"SELECT * FROM messages WHERE kind='ask' AND handled=0 AND id IN ({','.join('?' * len(pending))})",
-            [int(k) for k in pending])}
-        live = {k: v for k, v in pending.items() if k in open_asks}
-        due = [k for k, v in live.items() if (at := due_at(open_asks[k]["ts"], v)) is not None and at <= now]
+        pending = db.kv(ASK_DEFAULTS_KEY, {}) or {}
+        open_asks = {str(r["id"]): r for r in db.q("SELECT * FROM messages WHERE kind='ask' AND handled=0")}
+        live = {k: pending[k] if k in pending else _ask_default(a) for k, a in open_asks.items()}
+        due = [k for k, v in live.items()
+               if hours > 0 and resolves(v)[0] != "open" and open_asks[k]["ts"] + hours * 3600 <= now]
         if hold or (due and db.one("SELECT id FROM messages WHERE direction='in' AND handled=0")):
             due = []
         lines = []
         for k in [k for k in due if db.one("SELECT id FROM messages WHERE direction='in' AND id>?", (int(k),))]:
             due.remove(k)
-            v = live.pop(k)
-            then = ("act on its recommendation now, `resolve` it, memory_add the decision and notify at "
-                    f"severity low (recommendation: {rec_of(v)})" if isinstance(v, dict)
-                    else "it now waits for the user")
-            lines.append(f"Ask #{k} reached its {wait_text(v)} timeout, but the user wrote after it was asked, so "
-                         f"its recommendation was NOT applied. If the user answered it, act on the answer and "
-                         f"`resolve` it; otherwise {then}. The question was: "
+            kind, to = resolves(live[k])
+            live[k] = None
+            lines.append(f"Ask #{k} reached its {wait} timeout, but the user wrote after it was asked, so "
+                         f"its default was NOT applied. If the user answered it, act on the answer and "
+                         f"`resolve` it; otherwise decide it yourself (its default: {to}), `resolve` it, "
+                         f"memory_add the decision and notify at severity low. The question was: "
                          f"{_ask_question(open_asks[k]['text'])[:300]}")
+        floor = max(("low", cfg["notify"].get("chat_min_severity")), key=lambda n: SEVERITY_RANK.get(n, -1))
         for k in due:
             ask, v = open_asks[k], live.pop(k)
-            rec = rec_of(v)
+            kind, to = resolves(v)
             db.x("UPDATE messages SET handled=1 WHERE id=?", (ask["id"],))
-            unblock.record_resolve(db, int(k), [], auto=rec)
+            unblock.record_resolve(db, int(k), [], auto=to)
             question = _ask_question(ask["text"])[:300]
-            if isinstance(v, dict):   # the coordinator acts on it and tells the user at low
-                lines.append(f"Ask #{k} got no answer in {wait_text(v)} and auto-resolved to its recommendation: "
-                             f"{rec}. Act on it now, memory_add the decision and notify at severity low; it is "
-                             f"not permission for anything beyond that choice, and every gate still applies. "
+            if not isinstance(v, dict):
+                # at least high, and never under the chat floor: the user must see what was decided for them
+                severity = max((ask["severity"], "high", floor), key=lambda n: SEVERITY_RANK.get(n, -1))
+                db.post("out", f"No answer to ask {k} after {wait}, so I went with the recommendation: {to}\n"
+                               f"It can be reversed: reply to change it.\nThe question was: {question}",
+                        chat=None, kind="alert", severity=severity)
+                lines.append(f"Ask #{k} got no answer in {wait}. The user was told its recommendation now "
+                             f"applies: {to}. Act on it; it is not permission for anything beyond that choice. "
                              f"The question was: {question}")
                 continue
-            # at least high, and never under the chat floor: the user must see what was decided for them
-            severity = max((ask["severity"], "high", cfg["notify"].get("chat_min_severity")),
-                           key=lambda n: SEVERITY_RANK.get(n, -1))
-            db.post("out", f"No answer to ask {k} after {wait_text(v)}, so I went with the recommendation: {rec}\n"
-                           f"It can be reversed: reply to change it.\nThe question was: {question}",
-                    chat=None, kind="alert", severity=severity)
-            lines.append(f"Ask #{k} got no answer in {wait_text(v)}. The user was told its recommendation now "
-                         f"applies: {rec}. Act on it; it is not permission for anything beyond that choice. "
-                         f"The question was: {question}")
+            said = (f"the restriction stays as written, since the recommendation ({v.get('rec')}) would loosen "
+                    f"it and only your own words do that" if kind == "stay" else f"I went with my recommendation: {to}")
+            db.post("out", f"No answer to ask {k} in {wait}, so it no longer waits: {said}.\n"
+                           f"Reply to change it.\nThe question was: {question}",
+                    chat=None, kind="alert", severity=floor)
+            decided.append((k, question, to))
+            lines.append(f"Ask #{k} got no answer in {wait} and auto-resolved to its default: {to}. "
+                         + ("Do not act on its recommendation: it would loosen a restriction. " if kind == "stay"
+                            else "Act on it now; it is not permission for anything beyond that choice, and every "
+                                 "gate still applies. ")
+                         + f"The user was told at low and a decision memory was recorded. The question was: {question}")
         if lines:   # one wake for the whole tick
             db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                  (now, "daemon", "ask_timeout", "normal", "\n".join(lines), "queued"))
         if live != pending:
             db.set_kv(ASK_DEFAULTS_KEY, live)
+    for k, question, to in decided:   # outside the tx: add_memory commits the harness
+        try:
+            p.add_memory(f"Ask #{k} got no answer in {wait}, so it auto-resolved to its default: {to}. "
+                         f"The question was: {question}", kind="decision", title=f"Ask {k} auto-resolved",
+                         key=f"ask-{k}-auto-resolved", audience="coordinator")
+        except Exception as e:   # the ask is resolved and the chat told; a lost memory is only logged
+            from .daemon import log   # daemon imports this module
+            log(p, f"ask {k}: decision memory not written: {e}")
     return [int(k) for k in due]
 
 
