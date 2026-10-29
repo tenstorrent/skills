@@ -68,7 +68,12 @@ def settings(p) -> dict:
 
 
 def tracked(root: Path) -> list[str]:
-    """The repo's tracked files (git ls-files), kept LS_TTL_S per root; [] outside git."""
+    """The repo's tracked files (git ls-files), kept LS_TTL_S per root and read once within a gitmemo
+    scope, so the TTL cache never decides what a transaction reads; [] outside git."""
+    return gitmemo.cached(("overlap.tracked", str(root)), lambda: _tracked(root))
+
+
+def _tracked(root: Path) -> list[str]:
     key, now = str(root), time.time()
     hit = _ls_cache.get(key)
     if hit and now - hit[0] < LS_TTL_S:

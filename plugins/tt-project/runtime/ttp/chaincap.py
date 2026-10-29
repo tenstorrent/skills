@@ -50,7 +50,7 @@ import json
 import re
 import time
 
-from . import headline
+from . import gitmemo, headline
 from .db import DB, assigned_tier, continues_id, load_result
 
 CONT_TITLE = re.compile(r"(?i)^\s*(?:continue|mechanical)\s*:")
@@ -173,15 +173,17 @@ def progress(p, ch: list[dict], i: int) -> str:
     hop = ch[i]
     if hop["status"] != "done":
         return ""
-    try:
+    def count() -> str:
         base = worktree.resolve_base(p)
         refs = [b for t in ch[:i + 1] if (b := t.get("branch"))
                 and worktree._git(p.root, "rev-parse", "--verify", "--quiet", f"{b}^{{commit}}", check=False)]
-        if refs:
-            n = worktree._git(p.root, "rev-list", "--count", f"--since=@{int(hop['created'] or 0)}", *refs,
-                              f"^{base}", check=False)
-            if n.isdigit() and int(n):
-                return f"{n} new commit{'' if n == '1' else 's'}"
+        return worktree._git(p.root, "rev-list", "--count", f"--since=@{int(hop['created'] or 0)}", *refs,
+                             f"^{base}", check=False) if refs else ""
+    try:   # read once within a gitmemo scope (the daemon warms it before the finish transaction)
+        n = gitmemo.cached(("chaincap.progress", tuple(t.get("branch") or "" for t in ch[:i + 1]),
+                            int(hop["created"] or 0)), count)
+        if n.isdigit() and int(n):
+            return f"{n} new commit{'' if n == '1' else 's'}"
     except Exception:   # unreadable branches: only the evidence can show progress
         pass
     old = _metrics(ch[i - 1]) if i else {}
@@ -403,15 +405,23 @@ def branch_brief(p, task: dict) -> str:
     with its hunk line ranges (on the head; `-N`: lines deleted after line N) against the merge base with
     the base ref, at most BRIEF_MAX_LINES lines. '' when the task has no branch, the branch is missing
     or git cannot read it: the hop is queued without it."""
-    from . import landed, worktree
+    from . import landed
     branch = str(task.get("branch") or "").strip()
     if not branch:
         return ""
-    try:
-        repo = p.root
-        head = landed._commit(repo, f"refs/heads/{branch}")
+    try:   # within a gitmemo scope read once per branch and head (warmed before the finish transaction)
+        head = gitmemo.cached(("chaincap.brief_head", branch), lambda: landed._commit(p.root, f"refs/heads/{branch}"))
         if not head:
             return ""
+        return gitmemo.cached(("chaincap.branch_brief", branch, head), lambda: _brief(p, branch, head))
+    except Exception:
+        return ""
+
+
+def _brief(p, branch: str, head: str) -> str:
+    from . import landed, worktree
+    try:
+        repo = p.root
         out = [f"Parent branch {branch}, head {head} (added by the daemon)."]
         ref = worktree.base_ref(p)
         base = landed._git(repo, "merge-base", ref, head).stdout.strip() if ref else ""
@@ -457,6 +467,14 @@ def branch_brief(p, task: dict) -> str:
         return ""
 
 
+def hop_spec(p, task: dict, fup: dict) -> str:
+    """The spec auto_hop queues `fup` with: its own, then `task`'s branch_brief."""
+    spec = str(fup.get("spec") or "")
+    if brief := branch_brief(p, task):
+        spec = f"{spec.rstrip()}\n\n{brief}" if spec.strip() else brief
+    return spec
+
+
 def auto_hop(p, cfg: dict, task: dict, fup: dict, why: str | None = None) -> tuple[int, str] | None:
     """Queue `fup` when hop_ready (`why`, when the caller checked it already): (new task id, why it
     progressed), else None. The hop of a split task (split_head) takes its branch over and starts at
@@ -468,9 +486,7 @@ def auto_hop(p, cfg: dict, task: dict, fup: dict, why: str | None = None) -> tup
         return None
     ch = chain(db, task["id"])
     title = str(fup["title"]).strip()[:200]
-    spec = str(fup.get("spec") or "")
-    if brief := branch_brief(p, task):
-        spec = f"{spec.rstrip()}\n\n{brief}" if spec.strip() else brief
+    spec = hop_spec(p, task, fup)
     action = {"type": "task_add", "title": title, "spec": spec, "kind": task["kind"],
               "tier": hop_tier(task, fup), "priority": task["priority"], "budget_usd": task["budget_usd"],
               "continues": task["id"]}

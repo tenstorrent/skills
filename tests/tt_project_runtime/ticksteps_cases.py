@@ -316,7 +316,7 @@ def test_a_failed_reviews_area_and_followup_overlaps_read_no_git_inside_the_fini
         assert overlap.find(p, spec) == want_hits
         assert overlap.find(p, spec, {want_hits[0]["id"]}) == want_hits[1:]   # skip filters what was read
         assert [coord._overlap_chain(p, "code", spec, coord._file_overlaps(p, "code", spec, skip), roots, skip)
-                for skip in (set(), roots)] == want_ties   # the hop's task_add (chaincap.auto_hop), done or split
+                for skip in (set(), roots)] == want_ties   # a plain follow-up's own spec, done or split (a hop's: test below)
     assert not spawned, f"git ran inside the finish transaction: {spawned}"
     assert rev["id"] not in d._git_memo and gitmemo.current() is None, "the memo outlived its transaction"
     # Through the hand-off itself (the way finish_run records it): the area is judged inside, git-free.
@@ -433,3 +433,57 @@ def test_a_probes_raw_result_is_kept_beside_its_verdict(env, monkeypatch):
     [ev] = p.db.q("SELECT * FROM events WHERE kind='hold_probe_broken' AND task=?", (held,))
     assert "(exit -9; its last run: killed by signal 9; only 0" in ev["text"], ev["text"]
     assert p.db.task(held)["status"] == "blocked"
+
+
+def test_a_daemon_queued_continue_hop_reads_no_git_inside_the_finish_transaction(env, monkeypatch):
+    """A done code task whose only follow-up is a `continue:` hop gets it from the daemon inside the
+    finish transaction (chaincap.auto_hop), and that ran about 20 git calls there: the hop's progress
+    (hop_ready), the split check (_split, _has_changes, landed.equivalent), the parent's branch brief
+    and the overlaps of the spec auto_hop builds (follow-up spec + brief: the parent's changed files,
+    tracked paths, a symbol's git grep). _prefetch_git now reads them all before the transaction."""
+    p = make(env)
+    from ttp import chaincap, overlap, worktree
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    (p.root / "app").mkdir()
+    (p.root / "app" / "core.py").write_text("def f0():\n    return 0\n")
+    _git_out(p.root, "add", "app/core.py")
+    _git_out(p.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "core")
+
+    def adds(line):
+        return lambda path: (path / "app" / "core.py").write_text((path / "app" / "core.py").read_text() + line)
+    _finish_code(env, p, "another take", {}, edit=adds("\n\ndef take():\n    return 1\n"))   # unlanded, on core.py
+    tid = p.db.add_task("parser", "spec of parser", kind="code", tier="standard", origin="coordinator")
+    path, branch = worktree.ensure(p, p.db.task(tid))
+    adds("\n\ndef parse():\n    return 2\n")(path)
+    _git_out(path, "add", ".")
+    _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "parser")
+    p.db.update_task(tid, status="running", branch=branch)
+    # It names a file the parent changed and a `symbol()` on the other unlanded branch only.
+    fups = [{"title": "continue: wire the parser", "spec": "Left: call parse() from f0 in app/core.py via `take()`."}]
+    handoff = {"status": "done", "summary": "parser done, wiring left", "followups": fups}
+    run_dir = env["tmp"] / f"run-{tid}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps(handoff))
+
+    d = Daemon(p.base)
+    in_tx = lambda: p.db.conn.in_transaction or d.p.db.conn.in_transaction   # noqa: E731
+    spawned: list = []
+    real = subprocess.Popen
+
+    def popen(argv, *a, **k):
+        if in_tx():
+            spawned.append(argv)
+            raise OSError("no subprocess inside the finish transaction")
+        return real(argv, *a, **k)
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    monkeypatch.setattr(overlap, "LS_TTL_S", 0)   # the ls-files TTL cache expires before the transaction
+    d._prefetch_remote(tid, handoff, run_dir)
+    with d._finish_tx(tid):
+        d._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir)
+    assert not spawned, f"git ran inside the finish transaction: {spawned}"
+    (hop,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (tid,))
+    assert f"Parent branch {branch}, head " in hop["spec"] and "app/core.py" in hop["spec"], hop["spec"]
+    assert chaincap.SPLIT_LABEL in (p.db.task(tid)["labels"] or ""), "the split was read from the warm-up"
+    done = p.db.one("SELECT text FROM events WHERE task=? AND kind='task_done'", (tid,))
+    assert f"Continue hop #{hop['id']} queued by the daemon" in done["text"]

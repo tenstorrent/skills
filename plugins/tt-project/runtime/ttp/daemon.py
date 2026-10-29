@@ -3902,11 +3902,13 @@ class Daemon:
 
     def _prefetch_git(self, task: dict | None, result) -> None:
         """The git facts _finish_worker judges a hand-off by, read before its write transaction: a failed
-        review's area (reviewcap.area) and each follow-up's file overlaps and chain (coordinator
-        _file_overlaps, _overlap_chain) as the hop the daemon may queue in it reads them (chaincap.auto_hop:
-        a task_add continuing this task, so its lineage roots, and its skip when it is a split's hop).
-        Kept in self._git_memo for the transaction's gitmemo scope (_finish_tx), where those calls read
-        them; one not read here runs its git there, as before."""
+        review's area (reviewcap.area); for a done code task its split (_split: the branch tip, its
+        changes, landed.equivalent) and a lone `continue:` hop's progress (chaincap.hop_ready); and each
+        follow-up's file overlaps and chain (coordinator _file_overlaps, _overlap_chain) as the hop the
+        daemon may queue reads them (chaincap.auto_hop: a task_add of chaincap.hop_spec, the follow-up's
+        spec plus the parent's branch brief, continuing this task, so its lineage roots, and its skip when
+        it is a split's hop). Kept in self._git_memo for the transaction's gitmemo scope (_finish_tx),
+        where those calls read them; one not read here runs its git there, as before."""
         if not task:
             return
         memo = self._git_memo[task["id"]] = {}
@@ -3915,13 +3917,35 @@ class Daemon:
             with gitmemo.scope(memo):
                 if task["kind"] == "review" and result.get("status") != "done":
                     self._review_area(dict(task, result=dump_result(result)))
-                for f in result.get("followups") or []:
-                    if isinstance(f, dict) and isinstance(f.get("spec"), str) and f["spec"].strip():
+                fups = [f for f in result.get("followups") or [] if isinstance(f, dict)]
+                if result.get("status") == "done":
+                    self._prefetch_hop(task, fups)
+                for f in fups:
+                    if isinstance(f.get("spec"), str) and f["spec"].strip():
+                        spec = chaincap.hop_spec(self.p, task, f) \
+                            if chaincap.CONT_TITLE.match(str(f.get("title") or "")) else f["spec"]
                         for skip in (set(), {task["id"]}):   # a done task's follow-up, a split's hop
-                            clash = coord._file_overlaps(self.p, "code", f["spec"], skip)
-                            coord._overlap_chain(self.p, "code", f["spec"], clash, {task["id"]}, skip)
+                            clash = coord._file_overlaps(self.p, "code", spec, skip)
+                            coord._overlap_chain(self.p, "code", spec, clash, {task["id"]}, skip)
         except Exception as e:
             log(self.p, f"task {task['id']}: reading git before finishing failed: {type(e).__name__}: {e}")
+
+    def _prefetch_hop(self, task: dict, fups: list[dict]) -> None:
+        """For _prefetch_git: what _split and _continue_ready read from git for a done task."""
+        branch = task.get("branch")
+        if task["kind"] == "code" and branch and not chaincap.split_head(task):
+            head, _ = self._branch_tip(branch)
+            if head:
+                self._has_changes(task)
+                if (self.cfg.get("delivery") or {}).get("push_branch"):
+                    gitmemo.cached(("landed.equivalent", branch), lambda: landed.equivalent(
+                        self.p, branch, (self.cfg.get("delivery") or {}).get("version_bump")))
+        if self._lone_continue(task, fups):
+            ch = chaincap.chain(self.p.db, task["id"])
+            if ch and ch[-1]["id"] == task["id"]:
+                ch[-1] = dict(ch[-1], status="done")   # as it is inside the transaction
+            for i in range(len(ch)):   # hop_ready's progress, and its stalls cap's
+                chaincap.progress(self.p, ch, i)
 
     def _finish_tx(self, task_id: int):
         """The write transaction a hand-off is recorded in, within the gitmemo scope _prefetch_git filled."""
@@ -10753,7 +10777,8 @@ class Daemon:
         if task.get("kind") != "code" or not branch or not d.get("push_branch"):
             return ""
         try:
-            found = landed.equivalent(self.p, branch, d.get("version_bump"))
+            found = gitmemo.cached(("landed.equivalent", branch),   # warmed before a finish transaction
+                                   lambda: landed.equivalent(self.p, branch, d.get("version_bump")))
         except Exception as e:
             log(self.p, f"task {task['id']}: could not compare its change with the push branch: {e}")
             return ""
@@ -11848,14 +11873,20 @@ class Daemon:
     def _continue_ready(self, task: dict, fups: list[dict]) -> str:
         """chaincap.hop_ready for a done task whose only proposal is one `continue:` follow-up; ''
         otherwise or when it cannot be read (the coordinator decides then)."""
-        if len(fups) != 1 or upstream.is_note(fups[0]) or fups[0].get("start_after") or fups[0].get("start_when") \
-                or not chaincap.CONT_TITLE.match(str(fups[0]["title"])) or chaincap.post_landing(fups[0], task["id"]):
+        if not self._lone_continue(task, fups):
             return ""
         try:
             return chaincap.hop_ready(self.p, self.cfg, task, fups[0])
         except Exception:
             log(self.p, f"continue hop after #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
             return ""
+
+    @staticmethod
+    def _lone_continue(task: dict, fups: list[dict]) -> bool:
+        """`fups` is one `continue:` follow-up the daemon may queue itself (_continue_ready)."""
+        return len(fups) == 1 and not upstream.is_note(fups[0]) and not fups[0].get("start_after") \
+            and not fups[0].get("start_when") and bool(chaincap.CONT_TITLE.match(str(fups[0].get("title") or ""))) \
+            and not chaincap.post_landing(fups[0], task["id"])
 
     def _auto_continue(self, task: dict, fups: list[dict], why: str) -> tuple[int, str] | None:
         """chaincap.auto_hop for a task _continue_ready passed; None when it cannot be queued."""
@@ -11878,8 +11909,7 @@ class Daemon:
         if not branch:
             return ""
         try:
-            head = worktree._git(self.p.root, "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}", check=False)
-            subject = worktree._git(self.p.root, "log", "-1", "--format=%s", head, check=False) if head else ""
+            head, subject = self._branch_tip(branch)
             if not head or not (cont or chaincap.marked_split(result, subject)) or not self._has_changes(task) \
                     or self.p.db.one("SELECT 1 FROM task_superseded WHERE task=?", (task["id"],)) \
                     or self._landed_elsewhere(task):
@@ -11892,12 +11922,21 @@ class Daemon:
         log(self.p, f"task {task['id']}: split at {head[:12]}: no review until its last continue hop finishes")
         return head
 
+    def _branch_tip(self, branch: str) -> tuple[str, str]:
+        """(head, its subject) of `branch`, ('', '') when it is missing; read once within a gitmemo scope."""
+        def read() -> tuple[str, str]:
+            head = worktree._git(self.p.root, "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}", check=False)
+            return head, worktree._git(self.p.root, "log", "-1", "--format=%s", head, check=False) if head else ""
+        return gitmemo.cached(("daemon.branch_tip", branch), read)
+
     def _has_changes(self, task: dict) -> bool:
-        """Whether a task's branch changes anything against the base; True when that cannot be read."""
+        """Whether a task's branch changes anything against the base; True when that cannot be read.
+        Read once within a gitmemo scope."""
         if not task.get("branch"):
             return False
         try:
-            return bool(worktree.diff_lines(self.p, [task["branch"]]))
+            return bool(gitmemo.cached(("worktree.diff_lines", task["branch"]),
+                                       lambda: worktree.diff_lines(self.p, [task["branch"]])))
         except Exception:
             return True
 
