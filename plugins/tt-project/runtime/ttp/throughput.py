@@ -21,10 +21,12 @@ to its first run, or to now for one still queued:
   only on the rows the window alone held (no other batch ran while they waited).
 - landed_chain / deferral: `start_when` waits (a `landed:#<id>` chain or another probe); provider_gate:
   a task held because its provider is logged out or paused. Reported with their cause, no limit.
-- Re-queue waits: a run ending `waiting` to the task's next run (or now while it waits), sorted by
-  its reason (the task's blocked_reason for the current wait, the run's note for earlier ones):
-  checks_slots (waiting for this project's other `ttp checks`; limit checks.test_project_max, an
-  account setting a project may only lower: reported), own_job (its own detached job or checks: no
+- Re-queue waits: each waiting hand-off (its task_waiting event) to the task's next run, and the current
+  wait of a task that has run (queued, blocked or waiting) from its last run's end to now, sorted by
+  its reason (the event's "for" or text; the task's blocked_reason for the current wait), or by the
+  checks slot's own records (a checks_slot_wait event in the wait, or checkcap's waits log covering
+  half of it): checks_slots (waiting for this project's other `ttp checks`; limit
+  checks.test_project_max, an account setting a project may only lower: reported), own_job (its own detached job or checks: no
   limit), the rules above for a deferral, provider or resource, else retry_wait (its own retry
   condition, then a slot, not told apart: no limit, never counted against worker slots).
 
@@ -47,6 +49,7 @@ import json
 import os
 import re
 import time
+from pathlib import Path
 
 from .db import DB, deferral
 
@@ -128,6 +131,20 @@ def _peak(spans: list[tuple[float, float]], t0: float, t1: float) -> int:
     """The most spans running at once at any point of [t0, t1]."""
     pts = [t0] + [s for s, _ in spans if t0 < s <= t1]
     return max((sum(1 for s, e in spans if s <= x < e) for x in pts), default=0)
+
+
+def _wait_for(t: dict, e: dict) -> str:
+    """What a task_waiting event waits for, lower case: its data's "for", else its text without the
+    "#<id> <title>: " prefix (a title may name checks the task does not wait on)."""
+    try:
+        data = json.loads(e["data"] or "{}")
+    except (ValueError, TypeError):
+        data = {}
+    if isinstance(data, dict) and data.get("for"):
+        return str(data["for"]).lower()
+    text = e["text"] or ""
+    head = f"#{t['id']} {t.get('title') or ''}: "
+    return (text[len(head):] if text.startswith(head) else text).lower()
 
 
 def _cfg(cfg: dict, dotted: str, default):
@@ -227,12 +244,44 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             return False
         return True
 
+    # Re-queue waits read what the daemon writes: task_waiting events, each waiting task's last run, and
+    # the checks slot's own records (checks_slot_wait events, checkcap's waits log) for its slot waits.
+    wait_ids = [t["id"] for t in tasks if t["status"] in ("queued", "blocked", "waiting")]
+    last_run = {r["task"]: r for r in db.q(
+        "SELECT task, MAX(ended) AS ended, SUM(ended IS NULL) AS live FROM runs WHERE role!='coordinator' "
+        "AND started IS NOT NULL AND task IN (SELECT value FROM json_each(?)) GROUP BY task",
+        (json.dumps(wait_ids),))} if wait_ids else {}
+    ev_waits: dict[int, list] = {}
+    for e in db.q("SELECT ts, task, text, data FROM events WHERE kind='task_waiting' AND task IS NOT NULL AND ts>? "
+                  "ORDER BY ts LIMIT ?", (t0 - DAY, ROWS)):
+        ev_waits.setdefault(e["task"], []).append(e)
+    slot_ev: dict[int, list[float]] = {}
+    for e in db.q("SELECT ts, task FROM events WHERE kind='checks_slot_wait' AND task IS NOT NULL AND ts>?", (t0 - DAY,)):
+        slot_ev.setdefault(e["task"], []).append(float(e["ts"]))
+    slot_log: dict[int, list[tuple[float, float]]] = {}
+    try:
+        from . import checkcap
+        for r in checkcap.wait_records(Path(db.path).parent, now, now - t0 + DAY):
+            if isinstance(r.get("task"), int):
+                slot_log.setdefault(r["task"], []).append((r["queued_at"], r["granted_at"]))
+    except Exception:
+        pass
+
+    def slot_held(task: int, w0: float, w1: float) -> bool:
+        """Whether the checks slot held `task` in [w0, w1]: a checks_slot_wait event in it, or logged slot
+        waits covering at least half of it."""
+        if any(w0 <= ts <= w1 for ts in slot_ev.get(task, ())):
+            return True
+        held = sum(max(0.0, min(g, w1) - max(q, w0)) for q, g in slot_log.get(task, ()))
+        return w1 > w0 and held * 2 >= w1 - w0
+
     for t in tasks:
         start = first.get(t["id"])
         d = deferral(t)
         prio = int(t["priority"] or 3)
         why = (t.get("blocked_reason") or "").lower()
-        if (start is not None or t["status"] in ("queued", "blocked")) and not (start is not None and start < t0):
+        if (start is not None or (t["status"] in ("queued", "blocked") and t["id"] not in last_run)) \
+                and not (start is not None and start < t0):
             base = max(float(t["created"] or now), float(d.get("after") or 0), float(t.get("not_before") or 0))
             dones = [done_at(t, dep, start) for dep in _deps(t)]
             end, queued = (start if start is not None else now), start is None
@@ -242,24 +291,29 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                 ready = max([base, *[x for x in dones if x is not None]])
                 add(lane("worker_slots", "budget.max_parallel_workers", workers), max(0.0, end - ready), prio, ready,
                     end, workers, queued)
-        # Re-queue waits: a run handed off `waiting` to the next run, or to now while the task still waits.
+        # Re-queue waits: from each task_waiting event (a waiting hand-off) to the task's next run, and
+        # the current one from the last run's end to now while the task still waits.
         trs = by_task.get(t["id"], [])
-        for k, r in enumerate(trs):
-            if r["status"] != "waiting" or not r["ended"]:
-                continue
-            nxt = trs[k + 1]["started"] if k + 1 < len(trs) else None
-            if nxt is None and t["status"] not in ("queued", "blocked", "waiting"):
-                continue
-            w0, w1 = float(r["ended"]), float(nxt) if nxt is not None else now
+        spans_w = []
+        evs = ev_waits.get(t["id"], [])
+        for k, e in enumerate(evs):
+            w0 = float(e["ts"])
+            nxt = next((float(r["started"]) for r in trs if float(r["started"]) > w0), None)
+            if nxt is None or (k + 1 < len(evs) and float(evs[k + 1]["ts"]) < nxt):
+                continue   # the current wait below, or a later hand-off before the same run
+            spans_w.append((w0, nxt, _wait_for(t, e), False))
+        lr = last_run.get(t["id"])
+        if lr and not lr["live"] and lr["ended"] and t["status"] in ("queued", "blocked", "waiting"):
+            spans_w.append((float(lr["ended"]), now, why, True))
+        for w0, w1, reason, queued in spans_w:
             if w1 <= t0 or w1 < w0:
                 continue
-            reason, queued = (why if nxt is None else (r["note"] or "").lower()), nxt is None
-            if "other full checks" in reason or "ttp checks: waiting" in reason:
+            if "other full checks" in reason or "ttp checks: waiting" in reason or slot_held(t["id"], w0, w1):
                 add(lane("checks_slots", "checks.test_project_max", ck), w1 - w0, prio, w0, w1, None, queued)
             elif "detach" in reason or "ttp checks" in reason or "own job" in reason:
                 lane("own_job", None, None)["note"] = "the task's own detached job or checks ran: no limit"
                 add(lanes["own_job"], w1 - w0, prio, w0, w1, None, queued)
-            elif not by_rule(t, d if nxt is None else {}, reason, w0, w1, prio, queued):
+            elif not by_rule(t, d if queued else {}, reason, w0, w1, prio, queued):
                 lane("retry_wait", None, None)["note"] = ("its own retry condition, then a slot, not told apart: "
                                                          "never counted against worker slots")
                 add(lanes["retry_wait"], w1 - w0, prio, w0, w1, None, queued)

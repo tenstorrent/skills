@@ -3,6 +3,8 @@
 # come from that file, and pytest collects these tests under it.
 from __future__ import annotations
 
+from pathlib import Path
+
 
 def _tp_task(p, title, created, prio=3, **kw):
     tid = p.db.add_task(title, "s", priority=prio, origin="user", **{k: v for k, v in kw.items() if k != "labels"})
@@ -170,24 +172,46 @@ def test_throughput_measures_requeue_waits_by_reason_and_a_slow_checks_lane_gets
     now = time.time()
     checks = "waiting for ttp checks: waiting (pid 5, not running) for this project's other full checks to end"
 
-    def requeued(title, gap_end, status, reason, note=""):
-        t = _tp_task(p, title, now - 5 * 3600, prio=1)
+    def requeued(title, gap_end, status, reason, wait_for=None, data=True, ended=now - 4 * 3600):
+        # As the daemon records it: the run ends 'ok' (finish_run's process outcome), the waiting hand-off
+        # is a task_waiting event and the task's status and blocked_reason.
+        t = _tp_task(p, title, ended - 3600, prio=1)
         p.db.x("INSERT INTO runs(task, role, started, ended, status, note) VALUES(?,?,?,?,?,?)",
-               (t, "worker", now - 5 * 3600, now - 4 * 3600, "waiting", note))
+               (t, "worker", ended - 3600, ended, "ok", json.dumps({"spec_sha": "x", "pick": {}})))
+        w = reason if wait_for is None else wait_for
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+               (ended + 1, f"task:{t}", "task_waiting", "low", f"#{t} {title}: {w}",
+                json.dumps({"wait": "self", "why": "hand-off", "for": w} if data else {}), "handled", t))
         if gap_end:
             _tp_run(p, t, gap_end, gap_end + 600)
         p.db.x("UPDATE tasks SET status=?, blocked_reason=? WHERE id=?", (status, reason, t))
         return t
 
-    requeued("ran again", now - 2 * 3600, "done", "", note=checks)
+    requeued("ran again", now - 2 * 3600, "done", "", wait_for=checks)
     requeued("still queued", None, "queued", checks)
     requeued("own job", None, "waiting", "own ttp checks --detach running")
     requeued("retry", None, "waiting", "CI on the branch")
     requeued("old done", None, "done", checks)
+    # The title names checks, the wait does not: the "#<id> <title>: " prefix is not the reason.
+    requeued("ttp checks lanes", now - 3 * 3600, "done", "", wait_for="CI on the branch", data=False)
+    # A task that ran three days ago and waits again: a re-queue wait, not a first start for a slot.
+    requeued("ran long ago", None, "queued", "", ended=now - 3 * 86400)
+    # Read as its own checks, but the checks slot's records show the slot held it.
+    ev = requeued("slot event", now - 2 * 3600, "done", "", wait_for="the detached ttp checks to pass")
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+           (now - 3 * 3600, "daemon", "checks_slot_wait", "low", f"Checks slot wait: #{ev} has waited 15 min", "handled", ev))
+    lg = requeued("slot log", now - 2 * 3600, "done", "", wait_for="the detached ttp checks to pass")
+    from ttp import checkcap
+    (Path(p.db.path).parent / checkcap.WAITS_LOG).write_text(json.dumps(
+        {"task": lg, "queued_at": now - 4 * 3600 + 60, "granted_at": now - 2 * 3600 - 60, "slot": "queue"}) + "\n")
+    short = requeued("short slot", now - 2 * 3600, "done", "", wait_for="the detached ttp checks to pass")
+    with open(Path(p.db.path).parent / checkcap.WAITS_LOG, "a") as fh:   # 10 of 120 min: its own job held it
+        fh.write(json.dumps({"task": short, "queued_at": now - 3 * 3600, "granted_at": now - 3 * 3600 + 600}) + "\n")
     rep = throughput.measure(p.db, p.config(), now=now, gates={})
     ck = _tp_lane(rep, "checks_slots")
-    assert (ck["count"], ck["waiting_now"], ck["p1_p90_s"]) == (2, 1, 4 * 3600) and ck["slow"]
-    assert _tp_lane(rep, "own_job")["count"] == 1 and _tp_lane(rep, "retry_wait")["count"] == 1
+    assert (ck["count"], ck["waiting_now"], ck["p1_p90_s"]) == (4, 1, 4 * 3600) and ck["slow"]
+    assert (_tp_lane(rep, "own_job")["count"], _tp_lane(rep, "retry_wait")["count"]) == (2, 3)
+    assert _tp_lane(rep, "retry_wait")["waiting_now"] == 2
     assert "worker_slots" not in {ln["lane"] for ln in rep["lanes"] if ln["count"] and ln["lane"] != "dependency"} \
         or _tp_lane(rep, "worker_slots")["waiting_now"] == 0
     _, kept = throughput.plan(p.db, p.config(), rep)

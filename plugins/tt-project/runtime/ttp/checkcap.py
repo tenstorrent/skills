@@ -619,8 +619,9 @@ def record_grant(rec: dict, owns: list[str] | tuple = ()) -> None:
     _append(d, GRANTS_LOG, GRANTS_OLD, GRANTS_LOCK, GRANTS_MAX_BYTES, row)
 
 
-def waits(state: Path, now: float | None = None, window_s: float = WAITS_WINDOW_S) -> list[float]:
-    """The slot waits in seconds that `state`'s log holds for slots taken in the last `window_s`."""
+def wait_records(state: Path, now: float | None = None, window_s: float = WAITS_WINDOW_S) -> list[dict]:
+    """The records (record_wait's) that `state`'s log holds for slots taken in the last `window_s`,
+    with "queued_at" and "granted_at" as floats."""
     now = time.time() if now is None else now
     out = []
     for name in (WAITS_OLD, WAITS_LOG):
@@ -635,8 +636,13 @@ def waits(state: Path, now: float | None = None, window_s: float = WAITS_WINDOW_
             except (ValueError, KeyError, TypeError):
                 continue
             if now - window_s <= g <= now:
-                out.append(max(0.0, g - q))
+                out.append({**r, "queued_at": q, "granted_at": g})
     return out
+
+
+def waits(state: Path, now: float | None = None, window_s: float = WAITS_WINDOW_S) -> list[float]:
+    """The slot waits in seconds that `state`'s log holds for slots taken in the last `window_s`."""
+    return [max(0.0, r["granted_at"] - r["queued_at"]) for r in wait_records(state, now, window_s)]
 
 
 def wait_stats(state: Path, now: float | None = None) -> dict | None:
