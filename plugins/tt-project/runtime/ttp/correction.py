@@ -7,18 +7,27 @@ detector, rule or default that would have caught it), so the next case is not le
 Model-free, no model calls. At a coordinator turn's start the daemon flags each new inbound message
 that is a likely correction (`flag`): one matching a small generic phrase list (PHRASES), one
 repeating an earlier instruction (`repeats`: a sentence of REPEAT_WORDS+ words matching an inbound
-sentence of the last REPEAT_S, exactly once normalized or nearly over the last REPEAT_NEAR), or any
-message that arrives while something says the project is stuck (`open_stall`: a stall event or a
-Course check line; a correction still without a class fix is not one, or it would flag every later
-message, and neither is Resource trouble, a machine fault rather than a miss). A relayer's own findings
-(kind 'finding') and a relay re-send (`resends`: the same words delivered twice within RESEND_S, or
-relayed again with context) are never flagged: neither is the user saying something again. The digest
-tags the message `[likely correction: <why>]`. After the turn (`settle`), each flagged message is recorded
-with its class fix: a `harness` task (or one titled `upstream: ...`) the turn added, or the turn's
-`summary` naming `correction #<id>` with its reason. One with neither gets a Course check line in the
-next digest, once (`digest_lines`); a later harness task clears it. The daily review's efficiency
-audit lists each correction of the last 24 h and the task that fixed its class, or none, and counts
-the repeated instructions (`audit_line`)."""
+sentence of the last REPEAT_S, exactly once normalized or nearly over the last REPEAT_NEAR; or an
+instruction of any length sharing an anchor (`anchors`: a model name, an effort level, a config key,
+a task id) and at least half its content words with one), or a message that answers or rejects
+earlier output (`answers`: it quotes it or contradicts it; never a new instruction or a question)
+while something says the project is stuck (`open_stall`: a stall event or a Course check line; a
+correction still without a class fix is not one, or it would flag every later message, and neither is
+Resource trouble, a machine fault rather than a miss). A relayer's own findings (kind 'finding') and a
+relay re-send (`resends`: the same words delivered twice within RESEND_S, or relayed again with
+context) are never flagged: neither is the user saying something again. The digest tags the message
+`[likely correction: <why>]`. After the turn (`settle`), each flagged message is recorded with its
+class fix: a `harness` task (or one titled `upstream: ...`) the turn added, or the turn's `summary`
+naming `correction #<id>` with its reason. A second reason ('none') within REFUSE_S for the same class
+(a shared anchor, or a repeat of the same first message) is refused: it stays without a class fix.
+One with neither, or refused, gets a Course check line in the next digest (a refused one until a
+harness task comes, for up to a day; `digest_lines`). The daily review's efficiency audit lists each
+correction of the last 24 h and the task that fixed its class, or none, and counts the repeated
+instructions (`audit_line`).
+
+A worker's result rows that name a model or effort (`metrics`, or a `tried`, `cells` or `results` row
+with its `run`) carry what that run used, read from its runs row (`check_claims`); a mismatch is
+flagged in the result and the hand-off's digest notes."""
 from __future__ import annotations
 
 import re
@@ -51,6 +60,33 @@ REPEAT_J = 0.75
 REPEAT_NEAR = 400
 REPEAT_ROWS = 1000
 RESEND_S = 60   # the same words again this soon are one message delivered twice, not a repeat
+# Anchors: what makes a short instruction specific enough that its repeat is one ('yes go ahead' has
+# none). An anchored instruction repeats an earlier one sharing an anchor and at least half its content
+# words (ANCHOR_SHARE), checked against at most REPEAT_NEAR earlier clauses per anchor.
+EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
+_LEVEL = r"(minimal|low|medium|high|xhigh|max|extra[- ]high)"
+_EFFORT = re.compile(rf"\b{_LEVEL}[- ]effort\b|\beffort\s*(?:[=:]|of|at|to|is)?\s*{_LEVEL}\b")
+_MODEL = re.compile(r"\b(opus|sonnet|haiku|fable|codex|gemini|composer|gpt-?\d[\w.]*|o[134](?:-mini)?)\b")
+_KEY = re.compile(r"\b[a-z][a-z0-9_]+(?:\.[a-z][a-z0-9_]+)+\b")   # checks.wrap_cmd; e.g. and i.e. are too short
+NOT_KEYS = frozenset("py md json jsonl sh txt yaml yml toml js ts html css log cfg ini csv com org net io dev "
+                     "ai".split())   # a file name or a domain, not a config key
+_TASK = re.compile(r"(?:#|\btask\s+#?)(\d+)\b")
+ANCHOR_SHARE = 0.5
+STOP = frozenset("a an the to of for on in at and or is are be it its this that these those with by from as "
+                 "please pls now just again also do does you we i me my our your all any then than so but if "
+                 "can could would should will it's that's".split())
+_CLAUSE = re.compile(r"(?<=[?!;\n])|\.(?:\s+|$)")   # a dot inside a key or version does not end one
+# A message that answers or rejects earlier output: it quotes it (a '>' line, or a quoted span of
+# QUOTE_WORDS+ words an outbound message of the last REPEAT_S had) or contradicts it (REJECTS in a
+# clause that is not a question, or a clause that is only 'no'). Only such a message counts as a
+# correction by arriving during an open stall: a new instruction or a question there is not one.
+REJECTS = ("that's wrong", "that is wrong", "is wrong", "was wrong", "not true", "not what i", "not right",
+           "incorrect", "that's not", "that is not", "you said", "you claimed", "you reported", "you wrote",
+           "but you", "no, ", "nope", "actually,")
+QUOTE_WORDS = 3
+_QUOTED = re.compile(r'"([^"\n]{8,300})"|“([^”\n]{8,300})”')
+REFUSE_S = 7 * 86400   # a second 'none' for the same class this soon is refused
+CLAIM_KEYS = ("tried", "cells", "results", "rows")   # hand-off fields whose dict rows may name a run
 
 
 def phrase(text: str) -> str:
@@ -69,17 +105,45 @@ def sentences(text: str) -> list[tuple[str, ...]]:
     return out
 
 
+def _effort(level: str) -> str:
+    return "xhigh" if level.startswith("extra") else level
+
+
+def anchors(text: str) -> frozenset:
+    """The anchors `text` names: 'model:<family>', 'effort:<level>', 'key:<dotted.key>', '#<task id>'."""
+    low = str(text or "").lower().replace("’", "'")
+    out = {f"effort:{_effort(next(g for g in m.groups() if g))}" for m in _EFFORT.finditer(low)}
+    out |= {f"model:{m.group(1)}" for m in _MODEL.finditer(low)}
+    out |= {f"key:{m.group(0)}" for m in _KEY.finditer(low) if m.group(0).rsplit(".", 1)[1] not in NOT_KEYS}
+    out |= {f"#{m.group(1)}" for m in _TASK.finditer(low)}
+    return frozenset(out)
+
+
+def clauses(text: str) -> list[tuple[tuple[str, ...], frozenset, bool]]:
+    """`text`'s clauses of any length: (its words, its anchors, whether it is a question)."""
+    out = []
+    for part in _CLAUSE.split(str(text or "").replace("’", "'")):
+        words = tuple(re.findall(r"[a-z0-9]+(?:'[a-z]+)?", part.lower()))
+        if words:
+            out.append((words, anchors(part), part.rstrip().endswith("?")))
+    return out
+
+
+def _content(words: tuple) -> frozenset:
+    return frozenset(w for w in words if w not in STOP)
+
+
 def _near(a: frozenset, b: frozenset) -> bool:
     return len(a & b) >= REPEAT_J * len(a | b)
 
 
 def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tuple[int, str]]:
     """{message id: (first id, sentence)} for the inbound messages in `msgs` with a sentence an earlier
-    inbound message of the last REPEAT_S already had: the first message that said it, and the
-    sentence as first said."""
+    inbound message of the last REPEAT_S already had (or an anchored instruction of any length one
+    already gave): the first message that said it, and the sentence as first said."""
     now = time.time() if now is None else now
     new = sorted((m for m in msgs if m.get("direction", "in") == "in" and m.get("kind", "user") != "finding"
-                  and sentences(m.get("text") or "")), key=lambda m: int(m["id"]))
+                  and (m.get("text") or "").strip()), key=lambda m: int(m["id"]))
     if not new:
         return {}
     rows = db.q("SELECT id, ts, text FROM messages WHERE direction='in' AND kind!='finding' AND ts>=? AND id<? "
@@ -87,6 +151,7 @@ def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tup
     first: dict[tuple, tuple[int, str]] = {}   # normalized sentence: (first id, its words)
     last: dict[tuple, float] = {}              # normalized sentence: when it was last said
     recent: list[tuple[frozenset, tuple]] = []
+    by_anchor: dict[str, list[tuple[int, float, frozenset, str]]] = {}   # anchor: (id, ts, content, clause)
     out, i = {}, 0
     for m in new:
         mid = int(m["id"])
@@ -96,6 +161,11 @@ def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tup
                     first[s] = (int(rows[i]["id"]), " ".join(s))
                     recent.append((frozenset(s), s))
                 last[s] = float(rows[i]["ts"] or 0)
+            for words, anc, ask in clauses(rows[i]["text"]):
+                for a in anc if not ask else ():
+                    got = by_anchor.setdefault(a, [])
+                    got.append((int(rows[i]["id"]), float(rows[i]["ts"] or 0), _content(words), " ".join(words)))
+                    del got[:-REPEAT_NEAR]
             i += 1
         recent = recent[-REPEAT_NEAR:]
         ts = float(m.get("ts") or now)
@@ -106,6 +176,18 @@ def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tup
                 hit = next((o for t, o in recent if _near(toks, t)), None)   # oldest first
             if hit and ts - last[hit] > RESEND_S:   # sooner: one message delivered twice (`resends`)
                 out[mid] = first[hit]
+                break
+        if mid in out:
+            continue
+        for words, anc, ask in clauses(m.get("text") or ""):
+            said = _content(words)
+            if ask or not anc or len(said) < 2:
+                continue
+            cands = sorted({c for a in anc for c in by_anchor.get(a, ())})   # oldest first
+            hit = next((c for c in cands if len(said & c[2]) >= ANCHOR_SHARE * len(said) and ts - c[1] > RESEND_S),
+                       None)
+            if hit:
+                out[mid] = (hit[0], hit[3])
                 break
     return out
 
@@ -141,11 +223,11 @@ def _records(db: DB) -> list[dict]:
 
 
 def _pending(db: DB, now: float) -> list[dict]:
-    """Recorded corrections with no class fix, not shown yet, younger than a day, with no harness task
-    added since they arrived."""
+    """Recorded corrections with no class fix, not shown yet (or refused a second 'none'), younger than a
+    day, with no harness task added since they arrived."""
     out = []
     for r in _records(db):
-        if r.get("fix") or r.get("shown") or now - float(r.get("ts") or 0) > DAY:
+        if r.get("fix") or r.get("shown") and not r.get("refused") or now - float(r.get("ts") or 0) > DAY:
             continue
         if _later_fix(db, float(r.get("ts") or 0)):
             continue
@@ -168,6 +250,30 @@ def open_stall(db: DB, cfg: dict | None, now: float | None = None) -> str:
     from . import course
     if course.digest_lines(db, cfg, now)[0]:
         return "open Course check"
+    return ""
+
+
+def answers(db: DB, m: dict, now: float | None = None) -> str:
+    """How message `m` answers or rejects earlier output ('quotes earlier output', 'contradicts it'),
+    or '' for a new instruction, a question or anything else."""
+    now = time.time() if now is None else now
+    text = str(m.get("text") or "").replace("’", "'")
+    if any(line.lstrip().startswith(">") for line in text.splitlines()):
+        return "quotes earlier output"
+    spans = [_same(a or b) for a, b in _QUOTED.findall(text)]
+    spans = [x for x in spans if len(x.split()) >= QUOTE_WORDS]
+    if spans:
+        outs = db.q("SELECT text FROM messages WHERE direction='out' AND ts>=? AND id<? ORDER BY id DESC LIMIT ?",
+                    (now - REPEAT_S, int(m["id"]), REPEAT_NEAR))
+        said = [_same(r["text"]) for r in outs]
+        if any(x in o for x in spans for o in said):
+            return "quotes earlier output"
+    for part in _CLAUSE.split(text):
+        low = " ".join(part.lower().split())
+        if not low or low.endswith("?"):
+            continue
+        if re.fullmatch(r"(no|nope|wrong)\W*", low) or any(x in low + " " for x in REJECTS):
+            return "contradicts it"
     return ""
 
 
@@ -197,8 +303,8 @@ def flag(db: DB, cfg: dict | None, msgs: list[dict], now: float | None = None) -
             continue
         if stall is None:
             stall = open_stall(db, cfg, now)
-        if stall:
-            out[int(m["id"])] = stall
+        if stall and (how := answers(db, m, now)):
+            out[int(m["id"])] = f"{stall}: {how}"
     return out
 
 
@@ -220,24 +326,53 @@ def class_fix(db: DB, actions: list, summary: str, mid: int, since: float) -> st
     return ""
 
 
+def _class(why: str, text: str) -> list[str]:
+    """A correction's class: its message's anchors, and for a repeat the message it repeats."""
+    out = set(anchors(text))
+    if m := re.fullmatch(r"repeats #(\d+)", str(why or "")):
+        out.add(f"msg#{m.group(1)}")
+    return sorted(out)
+
+
+def _refuse(recs: list[dict], rec: dict, fix: str, now: float) -> str:
+    """`fix` for `rec`, or '' when it is a reason ('none') and another correction of the same class
+    already got one within REFUSE_S: then `rec` is marked refused with that one's id."""
+    if fix != "reason":
+        if fix:
+            rec.pop("refused", None)
+        return fix
+    cls = set(rec.get("class") or [])
+    prior = next((r for r in recs if r is not rec and r.get("fix") == "reason" and cls & set(r.get("class") or [])
+                  and now - float(r.get("ts") or 0) <= REFUSE_S), None) if cls else None
+    if not prior:
+        return fix
+    rec["refused"] = f"#{prior['msg']}"
+    return ""
+
+
 def settle(db: DB, note: dict, actions: list, summary: str, started: float, now: float | None = None) -> None:
     """After a coordinator turn: record its flagged messages with their class fix, and mark the
     correction lines its digest showed (those recorded before it started) as shown, with this turn's
-    class fix if it made one."""
+    class fix if it made one. A second 'none' for one class within REFUSE_S is refused (_refuse)."""
     now = time.time() if now is None else now
     recs = _records(db)
     by_msg = {int(r["msg"]): r for r in recs}
     for r in recs:
-        if not r.get("fix") and not r.get("shown") and float(r.get("ts") or 0) < started:
+        if not r.get("fix") and (not r.get("shown") or r.get("refused")) and float(r.get("ts") or 0) < started:
             r["shown"] = True
-            r["fix"] = class_fix(db, actions, summary, int(r["msg"]), started) or _later_fix(db, float(r["ts"]))
-    for mid, why in (note.get("corrections") or {}).items():
-        mid = int(mid)
+            r["fix"] = _refuse(recs, r, class_fix(db, actions, summary, int(r["msg"]), started)
+                               or _later_fix(db, float(r["ts"])), now)
+    got = {int(k): v for k, v in (note.get("corrections") or {}).items()}
+    texts = {int(r["id"]): r["text"] or "" for r in db.q(
+        f"SELECT id, text FROM messages WHERE id IN ({','.join('?' * len(got))})", list(got))} if got else {}
+    for mid, why in got.items():
         fix = class_fix(db, actions, summary, mid, started)
         if mid in by_msg:
-            by_msg[mid]["fix"] = by_msg[mid].get("fix") or fix
+            by_msg[mid]["fix"] = by_msg[mid].get("fix") or _refuse(recs, by_msg[mid], fix, now)
             continue
-        rec = {"msg": mid, "ts": now, "why": str(why)[:80], "fix": fix, "shown": False}
+        rec = {"msg": mid, "ts": now, "why": str(why)[:80], "class": _class(str(why), texts.get(mid, "")),
+               "shown": False}
+        rec["fix"] = _refuse(recs, rec, fix, now)
         recs.append(rec)
         by_msg[mid] = rec
     recs = [r for r in recs if now - float(r.get("ts") or 0) <= KEEP_S][-KEEP_N:]
@@ -245,17 +380,25 @@ def settle(db: DB, note: dict, actions: list, summary: str, started: float, now:
 
 
 def digest_lines(db: DB, now: float | None = None) -> list[str]:
-    """One Course check line for the corrections the turn that handled them gave no class fix; []
-    when there are none."""
+    """One Course check line for the corrections the turn that handled them gave no class fix, and one
+    for those whose 'none' was refused; [] when there are none."""
     now = time.time() if now is None else now
     got = _pending(db, now)
-    if not got:
-        return []
-    ids = ", ".join(f"#{r['msg']}" for r in got)
-    one = got[0]["msg"] if len(got) == 1 else "<id>"
-    return [f"- correction without a class fix: user message{'s' if len(got) > 1 else ''} {ids} pointed out a "
-            "miss and got no `harness` task or `upstream:` note | add a `harness` task for the detector, rule or "
-            f"default that would have caught it, or say `correction #{one}: <why not>` in summary"]
+    out = []
+    plain = [r for r in got if not r.get("refused")]
+    if plain:
+        ids = ", ".join(f"#{r['msg']}" for r in plain)
+        one = plain[0]["msg"] if len(plain) == 1 else "<id>"
+        out.append(f"- correction without a class fix: user message{'s' if len(plain) > 1 else ''} {ids} pointed "
+                   "out a miss and got no `harness` task or `upstream:` note | add a `harness` task for the detector, "
+                   f"rule or default that would have caught it, or say `correction #{one}: <why not>` in summary")
+    refused = [r for r in got if r.get("refused")]
+    if refused:
+        out.append("- correction 'none' refused: " + ", ".join(f"#{r['msg']} (same class as {r['refused']})"
+                                                              for r in refused)
+                   + " got a reason instead of a class fix twice within 7 days | record the class fix or add a "
+                   "`harness` task for it; another reason is not accepted")
+    return out
 
 
 def audit_line(db: DB, since: float) -> str:
@@ -266,6 +409,8 @@ def audit_line(db: DB, since: float) -> str:
         return ""
     def fixed(r: dict) -> str:
         fix = r.get("fix") or ""
+        if not fix and r.get("refused"):
+            return f"none (refused: same class as {r['refused']})"
         return f"class fix {fix}" if fix.startswith("#") else "none (reason given)" if fix == "reason" else "none"
     return (f"corrections from the user or a chat: {len(got)}, {sum(str(r.get('fix') or '').startswith('#') for r in got)} "
             "with a class fix: " + "; ".join(f"#{r['msg']} ({r.get('why')}) {fixed(r)}" for r in got[:8])
@@ -298,3 +443,65 @@ def _repeat_clause(db: DB, since: float) -> str:
         return ""
     return (f"; repeated instructions, 24 h: {s['count']} (top: "
             + (f'"{s["top_sentence"]}" ' if s["top_sentence"] else "") + f"x{s['top_count']}, first #{s['first_id']})")
+
+
+def _norm_effort(v) -> str:
+    low = " ".join(str(v or "").lower().replace("_", "-").split())
+    return _effort(low) if low in (*EFFORTS, "extra-high", "extra high") else low
+
+
+def _model_ok(claimed: str, used: str) -> bool:
+    a, b = claimed.lower().strip(), used.lower().strip()
+    return a in b or b in a
+
+
+def _run_id(v) -> int | None:
+    m = re.fullmatch(r"\s*#?(\d+)\s*", str(v)) if isinstance(v, (int, str)) and not isinstance(v, bool) else None
+    return int(m.group(1)) if m else None
+
+
+def check_claims(db: DB, result, run_id: int | None) -> tuple:
+    """(result, lines): a worker's result rows that name a `model` or `effort` given what the run used,
+    read from its runs row. The hand-off's `metrics` speak for its own run (`run_id`) unless they name a
+    `run`; a dict row of CLAIM_KEYS (a list, or a dict of rows such as `cells`) is checked only when it
+    names its `run`. Each checked row gets `used` {model, effort} (the metrics: `metrics_used`); each mismatch a line, also kept in
+    the result's `claim_mismatch`. A run with no record of the field is unknown, never a mismatch."""
+    if not isinstance(result, dict):
+        return result, []
+    rows: list[tuple[str, dict, int | None]] = []
+    if isinstance(result.get("metrics"), dict):
+        rows.append(("metrics", result["metrics"], _run_id(result["metrics"].get("run", run_id))))
+    for key in CLAIM_KEYS:
+        got = result.get(key)
+        items = got.items() if isinstance(got, dict) else enumerate(got) if isinstance(got, list) else ()
+        for name, row in items:
+            if isinstance(row, dict) and "run" in row:
+                rows.append((f"{key}[{name!r}]" if isinstance(name, str) else f"{key}[{name}]", row, _run_id(row["run"])))
+    rows = [(w, r, rid) for w, r, rid in rows if rid and any(isinstance(r.get(k), str) and r[k].strip()
+                                                             for k in ("model", "effort"))]
+    if not rows:
+        return result, []
+    have = {int(r["id"]): r for r in db.q(f"SELECT id, model, effort FROM runs WHERE id IN "
+                                          f"({','.join('?' * len(rows))})", [rid for _, _, rid in rows])}
+    lines = []
+    result = dict(result)
+    for where, row, rid in rows:
+        run = have.get(rid)
+        used = {"model": str(run["model"] or "") if run else "", "effort": str(run["effort"] or "") if run else ""}
+        if where == "metrics":   # beside them: `metrics` stays name -> value for its readers (trend)
+            result["metrics_used"] = used
+        else:
+            row["used"] = used
+        bad = []
+        if isinstance(row.get("effort"), str) and row["effort"].strip() and used["effort"] \
+                and _norm_effort(row["effort"]) != _norm_effort(used["effort"]):
+            bad.append(f"effort {row['effort']!r}, run #{rid} recorded {used['effort']!r}")
+        if isinstance(row.get("model"), str) and row["model"].strip() and used["model"] \
+                and not _model_ok(row["model"], used["model"]):
+            bad.append(f"model {row['model']!r}, run #{rid} recorded {used['model']!r}")
+        if bad:
+            lines.append(f"result check: {where} claims " + " and ".join(bad)
+                         + ": the row reports a run that did not use what it names; correct it or rerun")
+    if lines:
+        result["claim_mismatch"] = lines
+    return result, lines

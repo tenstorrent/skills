@@ -4083,6 +4083,10 @@ class Daemon:
                 result[cells.NO_HOP] = skipped
             log(self.p, f"task {task['id']}: {cell_mark.strip()}"
                         + (f"; no hop for {len(skipped)}: {'; '.join(skipped)[:300]}" if skipped else ""))
+        # Result rows naming a model or effort carry what their run used; a mismatch is flagged.
+        result, claim_lines = correction.check_claims(db, result, r.get("id"))
+        for line in claim_lines:
+            log(self.p, f"task {task['id']}: {line}")
         extra: dict = {}
         reason = None
         not_before = None
@@ -4418,6 +4422,7 @@ class Daemon:
                      f"(a `reply`) or rerun the task asking for it in result.json `{replymsg.FIELD}`.")
         notes = "".join(f"\nNot an upstream note (names nothing of tt-project), so proposed as this project's "
                         f"follow-up: {t[:200]}" for t in local)
+        notes += "".join(f"\n{line}" for line in claim_lines)
         if len(fups) > MAX_FOLLOWUPS:
             notes += (f"\nMore proposed follow-ups (their specs are in {where}): "
                       + "; ".join(str(f["title"])[:120] for f in fups[MAX_FOLLOWUPS:]))

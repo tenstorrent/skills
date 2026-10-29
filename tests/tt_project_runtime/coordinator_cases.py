@@ -16176,16 +16176,40 @@ def test_correction_flags_a_phrase_or_any_message_during_an_open_stall_but_not_a
     assert f"user message #{why} " in digest and "[likely correction: phrase 'keeps failing']" in digest
     assert digest.count("likely correction") == 1, "the plain question was tagged"
     # A stall event not yet handled (the no-progress detector's hook) flags any message.
+    # A stall event not yet handled (the no-progress detector's hook) flags a message rejecting earlier
+    # output; a question is never one.
+    nope = p.db.post("in", "No, that is not what I asked for.", chat="c1")
     ev = p.db.x("INSERT INTO events(ts,source,kind,text) VALUES(?,?,?,?)", (time.time(), "daemon", "no_progress", "x"))
-    assert correction.flag(p.db, p.config(), _rows(p, plain)) == {plain: "open stall"}
+    assert correction.flag(p.db, p.config(), _rows(p, plain, nope)) == {nope: "open stall: contradicts it"}
     p.db.x("UPDATE events SET status='handled'")
-    assert correction.flag(p.db, p.config(), _rows(p, plain)) == {}
+    assert correction.flag(p.db, p.config(), _rows(p, nope)) == {}
     # So does an open Course check line.
     tid = p.db.add_task("port the kernel", "s", origin="user")
     for _ in range(3):
         _course_run(p.db, tid)
-    assert correction.flag(p.db, p.config(), _rows(p, plain)) == {plain: "open Course check"}
+    assert correction.flag(p.db, p.config(), _rows(p, plain, nope)) == {nope: "open Course check: contradicts it"}
     assert ev is not None
+
+
+def test_during_an_open_stall_only_a_message_answering_earlier_output_is_a_correction(env):
+    """A new instruction or a question during a stall is the user moving on, not a miss; a message
+    that quotes our output or contradicts it is."""
+    from ttp import correction
+    p = make(env)
+    p.db.post("out", "The build passed on every box last night.", chat="c1")
+    p.db.x("INSERT INTO events(ts,source,kind,text) VALUES(?,?,?,?)", (time.time(), "daemon", "no_progress", "x"))
+    new = [p.db.post("in", text, chat="c1") for text in (
+        "Deploy the web app to staging tonight.",
+        "Rename the option to \"fast path mode\" everywhere.",   # quoted, but nothing we said
+        "Isn't the queue empty by now?",
+        "Status of #4100?")]
+    assert correction.flag(p.db, p.config(), _rows(p, *new)) == {}
+    quoted = p.db.post("in", "About “the build passed on every box”: the logs show two boxes skipped.", chat="c1")
+    reply = p.db.post("in", "> The build passed on every box\nCheck the logs first.", chat="c1")
+    wrong = p.db.post("in", "That's wrong. Two boxes never ran it.", chat="c1")
+    assert correction.flag(p.db, p.config(), _rows(p, quoted, reply, wrong)) == {
+        quoted: "open stall: quotes earlier output", reply: "open stall: quotes earlier output",
+        wrong: "open stall: contradicts it"}
 
 
 def test_correction_phrase_is_flagged_on_the_daemons_turn_start_path(env, monkeypatch):
@@ -16334,6 +16358,102 @@ def test_a_near_duplicate_instruction_flags_but_one_sharing_three_words_does_not
     near = _said(p, "always restart the broker daemon after every update")
     other = _said(p, "Check the broker queue every hour, please.")
     assert correction.flag(p.db, p.config(), _rows(p, near, other)) == {near: f"repeats #{first}"}
+
+
+def test_a_short_instruction_repeating_an_earlier_one_on_shared_anchors_is_flagged(env):
+    """A repeat shorter than REPEAT_WORDS, or reworded past the near-match bar, still repeats when it
+    shares an anchor (model, effort level, config key, task id) and half its content words."""
+    from ttp import correction
+    p = make(env)
+    review = _said(p, "Run every review of #4100 at high effort, always.", days=2)
+    bench = _said(p, "Run the benchmarks on opus with max effort.", days=1)
+    key = _said(p, "Set checks.wrap_cmd to the queue wrapper.", days=1)
+    _said(p, "Use the sonnet model for the nightly docs build.", days=8)   # older than a week
+    six = _said(p, "Use high effort for #4100 reviews")
+    four = _said(p, "opus at max effort!")
+    keyed = _said(p, "checks.wrap_cmd: the queue wrapper")
+    assert correction.flag(p.db, p.config(), _rows(p, six, four, keyed)) == {
+        six: f"repeats #{review}", four: f"repeats #{bench}", keyed: f"repeats #{key}"}
+    # No anchor, a shared anchor with few shared words, a question or a week-old one: none repeats.
+    later = [_said(p, "Yes go ahead."), _said(p, "Use opus for the release notes."),
+             _said(p, "max effort on opus?"), _said(p, "Use the sonnet model for the nightly docs.")]
+    assert correction.flag(p.db, p.config(), _rows(p, *later)) == {}
+    assert correction.anchors("Set checks.wrap_cmd, task 12 and #13 to extra-high effort on claude-opus-5-5, e.g. now, in correction.py") \
+        == {"key:checks.wrap_cmd", "#12", "#13", "effort:xhigh", "model:opus"}
+
+
+def test_a_second_none_for_the_same_class_within_a_week_is_refused_until_a_class_fix(env):
+    """A correction answered with a reason ('none') twice for one class (a shared anchor) is refused:
+    it keeps its Course check line until the turn records a class fix or adds a harness task."""
+    from ttp import correction
+    p = make(env)
+    now = time.time() - 1000   # before the harness task below is created
+    first = p.db.post("in", "Why didn't the review run at max effort?", chat="c1")
+    correction.settle(p.db, {"corrections": {str(first): "phrase 'why didn't'"}}, [],
+                      f"correction #{first}: a one-off pin", now - 1, now)
+    other = p.db.post("in", "Nobody noticed the watcher died", chat="c1")   # another class: its reason stands
+    correction.settle(p.db, {"corrections": {str(other): "phrase 'nobody noticed'"}}, [],
+                      f"correction #{other}: the box rebooted", now - 1, now)
+    again = p.db.post("in", "You missed that #4100 ran at high effort, not max effort", chat="c1")
+    correction.settle(p.db, {"corrections": {str(again): "phrase 'you missed'"}}, [],
+                      f"correction #{again}: another one-off", now - 1, now + 1)
+    recs = {r["msg"]: r for r in p.db.kv(correction.KEY)}
+    assert (recs[first]["fix"], recs[other]["fix"], recs[again]["fix"]) == ("reason", "reason", "")
+    assert recs[again]["refused"] == f"#{first}"
+    lines = correction.digest_lines(p.db, now + 2)
+    assert len(lines) == 1 and f"#{again} (same class as #{first})" in lines[0] and "refused" in lines[0], lines
+    # Another reason next turn is refused again; the line stays.
+    correction.settle(p.db, {}, [], f"correction #{again}: still a one-off", now + 2, now + 3)
+    assert correction.digest_lines(p.db, now + 4) == lines
+    assert f"#{again} (phrase 'you missed') none (refused: same class as #{first})" in correction.audit_line(p.db, now - 60)
+    # A harness task for the class clears it.
+    tid = p.db.add_task("pin review effort", "s", kind="harness", origin="coordinator")
+    assert correction.digest_lines(p.db, now + 5) == []
+    correction.settle(p.db, {}, [{"type": "task_add", "kind": "harness", "title": "pin review effort", "spec": "s"}],
+                      "handled", now + 4, now + 5)
+    rec = {r["msg"]: r for r in p.db.kv(correction.KEY)}[again]
+    assert rec["fix"] == f"#{tid}" and "refused" not in rec
+
+
+def test_result_rows_naming_a_model_or_effort_carry_what_the_run_used_and_a_mismatch_is_flagged(env):
+    import json
+    from ttp import correction
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    p = make(env)
+    run = lambda model, effort: p.db.x("INSERT INTO runs(task, role, model, effort) VALUES(?,?,?,?)",
+                                       (None, "worker", model, effort))
+    high, maxed, blank = run("claude-opus-5-5", "high"), run("claude-opus-5-5", "max"), run("", "")
+    result = {"metrics": {"effort": "max", "score": 0.8},
+              "tried": [{"title": "max", "run": f"#{maxed}", "effort": "max", "model": "opus"},
+                        {"title": "lever", "effort": "low"},                      # names no run: not checked
+                        {"title": "unknown", "run": blank, "effort": "max"}],      # nothing recorded: unknown
+              "cells": {"a": {"run": high, "effort": "Extra-High", "model": "sonnet"}}}
+    got, lines = correction.check_claims(p.db, result, high)
+    assert lines == [
+        f"result check: metrics claims effort 'max', run #{high} recorded 'high': the row reports a run that did "
+        "not use what it names; correct it or rerun",
+        f"result check: cells['a'] claims effort 'Extra-High', run #{high} recorded 'high' and model 'sonnet', "
+        f"run #{high} recorded 'claude-opus-5-5': the row reports a run that did not use what it names; correct it "
+        "or rerun"]
+    assert got["claim_mismatch"] == lines
+    assert got["tried"][0]["used"] == {"model": "claude-opus-5-5", "effort": "max"}
+    assert "used" not in got["tried"][1] and got["tried"][2]["used"] == {"model": "", "effort": ""}
+    assert correction.check_claims(p.db, {"metrics": {"effort": "high"}}, high) == (
+        {"metrics": {"effort": "high"}, "metrics_used": {"model": "claude-opus-5-5", "effort": "high"}}, [])
+    # The daemon flags it on the hand-off: in the stored result and the coordinator's event.
+    tid = p.db.add_task("measure efforts", "s", kind="question", tier="standard", origin="coordinator")
+    p.db.update_task(tid, status="running")
+    rid = p.db.x("INSERT INTO runs(task, role, model, effort) VALUES(?,?,?,?)", (tid, "worker", "opus", "high"))
+    run_dir = env["tmp"] / f"run-{tid}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "measured",
+                                                     "metrics": {"effort": "max", "tokens": 9}}))
+    Daemon(p.base)._finish_worker({"task": tid, "id": rid}, Usage(cost_usd=1.0), "ok", run_dir)
+    stored = load_result(p.db.task(tid)["result"])
+    assert stored["claim_mismatch"] and stored["metrics_used"]["effort"] == "high"
+    ev = p.db.one("SELECT text FROM events WHERE task=? AND kind='task_notes'", (tid,))
+    assert ev and "result check: metrics claims effort 'max', run" in ev["text"], ev
 
 
 def test_the_audit_line_counts_repeated_instructions_and_names_the_top_one(env):
