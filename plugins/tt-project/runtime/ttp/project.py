@@ -153,7 +153,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "progress": {"stall_after": 5, "window_s": 86400}},
     "resources": {},                    # shared-slot limits, e.g. {"device": 1}
     # Lock names that all mean the one device (they share one `ttp lock` slot), and how many tasks
-    # tagged needs_device may run at once; `ttp lock` admits one of them at a time to the device.
+    # tagged needs_device may run at once (max_tasks null: derived from the project's device resources
+    # and budget.max_parallel_workers, loadcaps.py); `ttp lock` admits one of them at a time to the device.
     # runners: serial device-job runners by name, each {"host", "dir", "health", "drop_check", ...}
     # (devq.RUNNER_DEFAULTS); tasks queue device jobs on one with `ttp devq submit` instead of each
     # running its own detached driver. Empty: none, and workers keep the detached-driver path.
@@ -161,7 +162,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # task holding the device that opens none of them counts as leaving it unused (jobuse.py).
     # hosts: {resource: ssh host} for `ttp ssh-preflight @<resource>` (hostmap.py), so a probe
     # follows a resource that moves to another box; runners' hosts count too.
-    "device": {"locks": [], "max_tasks": 2, "runners": {}, "runner_restarts_per_day": 6, "nodes": [],
+    "device": {"locks": [], "max_tasks": None, "runners": {}, "runner_restarts_per_day": 6, "nodes": [],
                "hosts": {}},
     # pre_grant_check: a shell command asked before a task gets a resource's lock (pregrant.py), for
     # a project's own holds on top of the locks; it gets the resource and task id, exit 0 grants, 1 or
@@ -249,7 +250,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     "hold_max_h": 12,
                     # A queued task waiting on a task in 'review' longer than this is raised to the
                     # coordinator once per review stint; 0 turns it off.
-                    "review_stall_s": 14400,
+                    "review_stall_s": 1800,
                     # A task in 'review' whose latest review failed or asked for changes, with no fix
                     # or re-review open, is raised once per failed review this long after it ended; 0 off.
                     "review_failed_unhandled_s": 3600,
@@ -280,12 +281,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # from the daemon (sweep_reviews), which only queues reviews and never closes a task. A harness
     # task gets one too, unless its commit is merged into the harness: then it is closed as done. A done code
     # task with an unlanded head and no review gets one too (sweep_unreviewed): at most
-    # unreviewed_per_pass (0 off) per pass, for tasks updated within unreviewed_max_age_h hours.
+    # unreviewed_per_pass (0 off; null: budget.max_parallel_workers) per pass, for tasks updated within
+    # unreviewed_max_age_h hours.
     # A review whose head carries a change with a failed review and an open fix waits for that fix
     # to land or its chain to end, at most carried_hold_max_h hours (0: no cap; reviewhold).
     "review": {"light_max_lines": 80, "risky_paths": [], "light_paths": [], "auto": True, "auto_notes": "",
-               "area_fail_cap": 3, "blocked_long_h": 12, "rule_blocks_min": 3, "sweep_after_s": 1800,
-               "unreviewed_per_pass": 2, "unreviewed_max_age_h": 72, "carried_hold_max_h": 24},
+               "area_fail_cap": 3, "blocked_long_h": 12, "rule_blocks_min": 3, "sweep_after_s": 300,
+               "unreviewed_per_pass": None, "unreviewed_max_age_h": 72, "carried_hold_max_h": 24},
     # Continue chains (chaincap): a task_add that continues a lineage past max_hops hops, max_stalls
     # failed or no-progress hops in a row or max_usd spent (0 turns one off), or one in an area under
     # review.area_fail_cap, is refused unless its `reason` names what changed in a tricky turn.

@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, cells, chaincap, chainprio, chatset, checkspill, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, relay, responsibilities, restriction_audit, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, throughmute, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, cells, chaincap, chainprio, chatset, checkspill, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, relay, responsibilities, restriction_audit, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, throughmute, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -3314,9 +3314,9 @@ def _routine_review(db, cfg: dict, r) -> str:
         return f"review #{got['id']} queued by the daemon"
     d, rules = cfg.get("delivery") or {}, cfg.get("review") or {}
     try:
-        after = float(rules.get("sweep_after_s", 1800) or 0)
+        after = float(rules.get("sweep_after_s", loadcaps.SWEEP_AFTER_S) or 0)
     except (TypeError, ValueError):
-        after = 1800.0
+        after = loadcaps.SWEEP_AFTER_S
     if rules.get("auto", True) and (d.get("review_before_pr", True) or d.get("push_branch")) and after > 0:
         return "the daemon's review sweep queues its review"
     return ""

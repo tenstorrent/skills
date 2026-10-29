@@ -91,6 +91,8 @@ from . import jevuse
 from . import jobuse
 from . import land
 from . import landed
+from . import loadcaps
+from .loadcaps import REVIEW_STALL_S, SWEEP_AFTER_S
 from . import lease as leasemod
 from . import localspend
 from . import lockprobe
@@ -410,7 +412,7 @@ REVIEW_SWEEP_EVERY_S = 300   # how often sweep_reviews looks for code and harnes
 HARNESS_UNMERGED = "harness_review_unmerged"   # event: a harness task passed review but its branch is not merged
 # sweep_unreviewed: a done (or long externally waiting) code task with an unlanded head and no review
 UNREVIEWED_EVENT = "review_unqueued"
-UNREVIEWED_PER_PASS = 2        # review.unreviewed_per_pass: most reviews one pass queues (0 off)
+UNREVIEWED_PER_PASS = 2        # review.unreviewed_per_pass unreadable: most reviews one pass queues (unset: loadcaps)
 UNREVIEWED_MAX_AGE_H = 72      # review.unreviewed_max_age_h: tasks last updated longer ago are left alone
 UNREVIEWED_GRACE_S = 120       # a task updated more recently than this is still settling
 UNREVIEWED_PASS_S = 20         # the pass stops looking after this long, so the tick stays short
@@ -1296,7 +1298,7 @@ class Daemon:
         core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
         cycle = self._run_step(lambda: self.host_cycle_held(now), "host_cycle_held", default=False)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_checks_wait, self.check_progress, self.check_churn, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_checks_wait, self.check_cap_wait, self.check_progress, self.check_churn, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -2875,9 +2877,9 @@ class Daemon:
         without ever looking dead. Past coordinator.review_stall_s it is raised once per review stint."""
         db = self.p.db
         try:
-            stall_s = float(self.cfg["coordinator"].get("review_stall_s", 14400) or 0)
+            stall_s = float(self.cfg["coordinator"].get("review_stall_s", REVIEW_STALL_S) or 0)
         except (TypeError, ValueError):
-            stall_s = 14400.0
+            stall_s = REVIEW_STALL_S
         for rev, since, deps in db.stalled_reviews(stall_s, now):
             fp = f"review_stall:{rev['id']}:{since:.0f}"
             if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
@@ -5743,6 +5745,43 @@ class Daemon:
                  (now, "daemon", "checks_slot_wait", ev["fingerprint"], "normal", ev["text"][:4000], "queued",
                   ev["task"]))
             log(self.p, f"checks slot wait: {ev['text'][:300]}")
+
+    def check_cap_wait(self, every_s: float = 60) -> None:
+        """Model-free cap wait (loadcaps): a ready device task held only by device.max_tasks for
+        loadcaps.CAP_WAIT_S or more while the device lock is free and a worker slot is open raises one
+        normal `cap_wait` event naming the cap and its config key, once per task per stay in the queue
+        (keyed on its last run). Any other hold, a busy device or full slots restart its clock, which is
+        kept in memory like check_slot_wait's."""
+        now = time.time()
+        last = getattr(self, "_cap_wait_checked", 0.0)
+        if now - last < every_s:
+            return
+        self._cap_wait_checked = now
+        dev = locks.device_locks(self.cfg)
+        if not dev or self.cfg_status == "unavailable" or self.settling() or now - last > STALL_GAP_S:
+            self._cap_waits = {}
+            return
+        db, cap = self.p.db, self._device_max_tasks()
+        running = db.one("SELECT COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running'")["n"]
+        held = {}
+        if self._device_tasks_running() >= cap and running < loadcaps.workers(self.cfg) \
+                and self._resource_ready(sorted(dev)[0]):
+            held = {t["id"]: t for t in db.ready_tasks() if needs_device(t, self.cfg) and self._resources_free(t)}
+        seen = getattr(self, "_cap_waits", {})
+        self._cap_waits = {tid: seen.get(tid, now) for tid in held}
+        for tid, t in held.items():
+            waited = now - self._cap_waits[tid]
+            if waited < loadcaps.CAP_WAIT_S:
+                continue
+            ran = db.one("SELECT MAX(id) id FROM runs WHERE task=?", (tid,))
+            fp = f"{loadcaps.CAP_WAIT}:{tid}:{(ran or {}).get('id') or 0}"
+            if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+                continue
+            text = loadcaps.cap_wait_text(t, "device", waited, cap, "the device lock is free and "
+                                          f"{running} of {loadcaps.workers(self.cfg)} worker slots are in use")
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                 (now, "daemon", loadcaps.CAP_WAIT, fp, "normal", text[:4000], "queued", tid))
+            log(self.p, f"cap wait: task {tid} held {waited / 60:.0f} min by device.max_tasks ({cap}) with the device free")
 
     def _log_resource_wait(self, task: dict, held: dict | None) -> None:
         """Log once per wait that dispatch skips ready `task` because a resource it needs is held, with
@@ -10080,10 +10119,17 @@ class Daemon:
         db.set_kv(PRE_GRANT_KEY, raised)
 
     def _device_max_tasks(self) -> int:
-        try:
-            return max(int((self.cfg.get("device") or {}).get("max_tasks", 2) or 1), 1)
-        except (TypeError, ValueError):
-            return 2
+        """device.max_tasks, or derived from the project's device resources (loadcaps), counted at most
+        once a minute: it reads the charter and the machines list."""
+        now = time.time()
+        got = getattr(self, "_device_count", None)
+        if got is None or now - got[0] >= 60:
+            try:
+                n = len(idlecap.candidates(self.cfg, set(), machine_ledger.resource_machines(self.p), machines.load()))
+            except Exception:   # an unreadable charter or machines list leaves the floor
+                n = 0
+            self._device_count = got = (now, n)
+        return loadcaps.device_max_tasks(self.cfg, got[1])
 
     def _device_tasks_running(self) -> int:
         """Running tasks tagged needs_device. They prepare in parallel; `ttp lock` admits one at a
@@ -10515,9 +10561,9 @@ class Daemon:
         db = self.p.db
         merged = self._mark_harness_merged()
         try:
-            after = float((self.cfg.get("review") or {}).get("sweep_after_s", 1800) or 0)
+            after = float((self.cfg.get("review") or {}).get("sweep_after_s", SWEEP_AFTER_S) or 0)
         except (TypeError, ValueError):
-            after = 1800.0
+            after = SWEEP_AFTER_S
         if after <= 0:
             return
         try:
@@ -10723,11 +10769,11 @@ class Daemon:
         cfg, db, done = self.cfg, self.p.db, []
         rules, d = cfg.get("review") or {}, cfg.get("delivery") or {}
         try:
-            cap = int(rules.get("unreviewed_per_pass", UNREVIEWED_PER_PASS))
+            cap = loadcaps.unreviewed_per_pass(cfg)
             age = float(rules.get("unreviewed_max_age_h", UNREVIEWED_MAX_AGE_H)) * 3600
-            waited = float(rules.get("sweep_after_s", 1800) or 0)
+            waited = float(rules.get("sweep_after_s", SWEEP_AFTER_S) or 0)
         except (TypeError, ValueError):
-            cap, age, waited = UNREVIEWED_PER_PASS, UNREVIEWED_MAX_AGE_H * 3600.0, 1800.0
+            cap, age, waited = UNREVIEWED_PER_PASS, UNREVIEWED_MAX_AGE_H * 3600.0, SWEEP_AFTER_S
         if cap <= 0 or not rules.get("auto", True) or not (d.get("review_before_pr", True) or d.get("push_branch")):
             return []
         try:

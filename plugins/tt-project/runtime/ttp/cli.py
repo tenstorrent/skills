@@ -7512,6 +7512,8 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
         print(keep_note)
     if ttl_note := _auto_cache_ttl(p):
         print(ttl_note)
+    if caps_note := _migrate_load_caps(p):
+        print(caps_note)
     print("harness up to date with the installed template; restarting the daemon")
     from . import service
     upjournal.step(p, "restarting")
@@ -7566,6 +7568,24 @@ def _auto_cache_ttl(p: Project) -> str:
     except Exception:
         return ""
     return 'upgrade note: coordinator.cache_ttl was "" (from an older template) and is now "auto"'
+
+
+def _migrate_load_caps(p: Project) -> str:
+    """Each loadcaps.OLD_DEFAULTS key project.json still holds at its old fixed default is removed, so the
+    default sized to the project's load applies; any other value is the project's own and stays, and no
+    other key is touched. A second run changes nothing. Returns the note."""
+    from . import loadcaps
+    try:
+        raw = p.raw_config()
+        if p.config_status == "unavailable":
+            return ""
+        new, done = loadcaps.migrate(raw)
+        if not done:
+            return ""
+        write_json(p.config_path, new)
+    except Exception:
+        return ""
+    return "upgrade note: defaults now sized to the project's load: " + "; ".join(done)
 
 
 def _running_harness_start(p: Project) -> tuple[float, int] | None:

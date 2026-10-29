@@ -70,7 +70,7 @@ $0.21). Cursor agent: not measured, CLI not installed.
   2026-10-21 a Claude Code worker whose task said to land its change pushed it straight to the
   remote, before any review; `ttp doctor --loop` fails such a landing.
 - A code task's plain `needs_review` hand-off gets its review from the daemon's review sweep,
-  `review.sweep_after_s` (default 30 min) after its run ended; a `done` hand-off gets it at once.
+  `review.sweep_after_s` (default 5 min) after its run ended; a `done` hand-off gets it at once.
 - Claude Code: workers have no write fence. They run with `bypassPermissions`, and the Bash
   sandbox that would fence them needs bubblewrap.
 - Codex: the harness hook runs only where hooks are on and no other hook source exists.

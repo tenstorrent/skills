@@ -199,10 +199,11 @@ prolonged whole-box outage.
   `review.sweep_after_s`) whose head is on no push-branch ref, with no review, open continuation,
   push-queue entry or recorded reason (superseded, rejected, `no_push`, all push-excluded, a PR
   that carries the head, a push branch no push reaches, a recorded landing), gets its review and
-  a low feed line, at most `review.unreviewed_per_pass` (default 2, 0 off) per pass, for tasks
+  a low feed line, at most `review.unreviewed_per_pass` (default: the project's
+  `budget.max_parallel_workers`, 0 off) per pass, for tasks
   updated within `review.unreviewed_max_age_h` (default 72); it runs every 5 minutes and in the
   blocker sweep, reads local refs only, and never queues a second review of one head. A code task still in review
-  with no review `review.sweep_after_s` (default 1800, 0 off) after its last run gets its review
+  with no review `review.sweep_after_s` (default 300, 0 off) after its last run gets its review
   from the daemon. The sweep only queues reviews and never closes a task, so a task whose
   continuation already passed review still gets its own review (one review each, no work lost).
   The exception is a task whose change already landed on the push branch under other commits
@@ -650,7 +651,8 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   `ttp lock --probe <resource> --task <id>` asks it too; a lock that waited is asked again once taken);
   any other exit or no answer holds as well, for every task on the resource, and raises one observation
   per resource and exit. The daemon's checks take at most about one timeout per tick. Config `device.locks` (opt-in) names one device by several names: all share the first name's lock and pause, tasks that use one
-  get the `needs_device` label, and at most `device.max_tasks` of them run at once. A worker starts
+  get the `needs_device` label, and at most `device.max_tasks` of them run at once (default: one per device resource the
+  project has, at most `budget.max_parallel_workers`, at least 2; a set value is kept). A worker starts
   a long job with `ttp detach <name> -- <command>`; a run that ends without a hand-off, or waiting
   without a `retry_when`, then waits on `ttp detach --check`, which exits 0 once each job wrote exit
   code 0, 4 once all ended but one wrote another exit code or is gone without one (it prints `job
@@ -1407,6 +1409,29 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   build has those flags. A config that sets your own model provider, API or ChatGPT endpoint,
   login method or credentials store is kept, since runs need it.
   Codex has no per-run MCP list, so isolated Codex workers get no MCP servers of yours.
+
+### Caps that can hold ready work
+
+Each cap is either safety (it guards a device, a host, spend or a branch) or convenience (it only
+paces work). Convenience defaults are sized to the project's own capacity. `ttp upgrade` drops a
+convenience key that a project.json still holds at its old fixed default, so the new default applies.
+It logs each key it drops and changes nothing else. A value the project set itself is kept.
+A ready task held 5 minutes or more by `device.max_tasks` while the device is free and a worker slot
+is open raises one `cap_wait` event naming the key.
+
+| Cap | Default | What it holds | Class |
+|---|---|---|---|
+| `device.max_tasks` | one per device resource, at most the worker slots, at least 2 (old: 2) | device tasks preparing at once | convenience |
+| `review.unreviewed_per_pass` | `budget.max_parallel_workers` (old: 2) | reviews the backstop sweep queues per pass | convenience |
+| `review.sweep_after_s` | 300 s (old: 1800) | a code task left in review before its review is queued | convenience |
+| `coordinator.review_stall_s` | 1800 s (old: 14400) | a dependency in review before the coordinator hears of it | convenience |
+| `checks.test_project_max` | from cores and memory, at least 2 | a project's suites at once | convenience |
+| `push_batch_s` | 300 s, none after a clean batch | changes gathered into one push | convenience |
+| `ttp lock` on a device | one command at a time | device commands | safety |
+| suite lock | one full suite per worktree | a second run of the same suite | safety |
+| `checks.host_max` | from the host's cores and load | suites on one host | safety |
+| `push_min_gap_s` | 1800 s, only after a batch that did not end clean | the next push | safety |
+| `budget.max_parallel_workers` | 6 | worker runs at once | safety (spend) |
 
 ## Standby snapshots
 
