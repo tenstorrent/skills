@@ -869,14 +869,19 @@ queues behind routine work; nothing running is interrupted:
   0 turns them off); check commands run under `nice -n 10`/`ionice -c3` (idle IO) unless `checks.nice` is false (`checks.nice` N, 0-19, sets the level, else `runner.nice`; `checks.ionice` `idle` or `best-effort[:0-7]`; both per project or account). Each check
   run also takes test-worker slots from a host pool shared by all projects (testslots: default half the cores, at
   least 2; at most min(8, half the pool) per run; `checks.test_pool`, `checks.test_run_max`, 0 pool turns it off;
-  a project may only lower them) and passes its grant as PYTEST_XDIST_AUTO_NUM_WORKERS and TTP_TEST_SLOTS. A
-  project holds at most `checks.test_project_max` slots over all its runs (default twice a run's share), waiters
-  are served first-come, push checks take a reserved test slot of their branch when the pool is full, and a
+  a project may only lower them) and passes its grant as PYTEST_XDIST_AUTO_NUM_WORKERS and TTP_TEST_SLOTS (a
+  suite's `-n auto` uses the whole grant). A project's test-worker budget is its checks at once
+  (`checks.test_project_max`, below) times one run's grant, at most the pool, so every check under that cap gets its
+  workers; `checks.test_project_slots` (chat-settable, a whole number of at least 1) sets the budget outright.
+  Waiters are served first-come: one whose project is at its budget lets other projects go first but keeps its
+  place in its project's line, so the project's earliest waiter gets the next freed slots; push checks take a reserved test slot of their branch when the pool is full, and a
   project runs at most `checks.slots` full `ttp checks` at a time per git repository (its lanes; worktrees of one
   repository share them; other repositories and projects never wait). A run whose commands go behind
   `checks.wrap_cmd` takes that wrapper lock's own single lane instead, so runs behind one wrapper lock go one at
   a time and lock-free checks run beside them. At most `checks.test_project_max` of a project's checks run at once
-  over all its lanes (chat-settable, a whole number of at least 1; unset, the project's test-worker budget); waiting
+  over all its lanes (chat-settable, a whole number of at least 1; unset, the runs the test-slot pool fits side by side, at least
+  `checks.slots`); a run counts against it
+  only once its test workers are granted, so one still waiting for them never holds up the others; waiting
   checks start in task-priority order across them, and a priority-1 check whose lanes are held only by less urgent
   runs starts beside them in an extra lane while the load is under half the cores, never in a worktree that already
   runs checks. Unset, `checks.slots` (chat-settable, a whole number; `checks.suite_concurrency` is its chat-settable

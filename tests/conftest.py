@@ -78,9 +78,12 @@ def _on_ci(env) -> bool:
 def _auto_jobs(cpus: int, env) -> int:
     """The default worker count: one per CPU up to MAX_AUTO_JOBS on CI, else half the CPUs up to
     MAX_LOCAL_JOBS, so a run on a laptop or a shared host leaves room for everything else; never more
-    than the host-wide test slots tt-project granted the run (TTP_TEST_SLOTS)."""
+    than the host-wide test slots tt-project granted the run (TTP_TEST_SLOTS). A run that holds its grant
+    (TTP_TEST_SLOTS_HELD: `ttp checks`) uses all of it, so a granted slot never sits idle."""
     slots = env.get("TTP_TEST_SLOTS", "").strip()
     cap = int(slots) if slots.isdigit() and int(slots) > 0 else cpus
+    if env.get("TTP_TEST_SLOTS_HELD", "").strip().isdigit() and slots.isdigit() and int(slots) > 0:
+        return max(1, min(cpus, cap))
     if _on_ci(env):
         return max(1, min(MAX_AUTO_JOBS, cpus, cap))
     return max(1, min(MAX_LOCAL_JOBS, cpus // 2, cap))

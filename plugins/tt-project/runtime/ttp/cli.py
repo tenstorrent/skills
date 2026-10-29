@@ -3400,10 +3400,10 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                                     state=p.state if p else None, what=what, age=checklane.priority_age_s(cfg), **lane)
     try:
         if in_tree:
-            if (tree := hold(testslots.tree_key(top), 1)) is None:
+            if (tree := hold(testslots.tree_key(top), 1, pending=True)) is None:
                 return None
         if (suite := hold(repo, checklane.slots(cfg), lock=lock, cap=checklane.project_cap(cfg),
-                          worktree=top, headroom=checklane.headroom)) is None:
+                          worktree=top, headroom=checklane.headroom, pending=True)) is None:
             if tree is not None:
                 tree.close()
             return None
@@ -3427,6 +3427,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
             slot.close()
             suite.close()
             return None
+        testslots.slots_granted(suite)   # only now does its lane count against the project's cap
         slot.tests.files += suite.files   # the suite lock ends with the run's test slots
         slot.suite = suite   # its label shows the run's wall-time cap (testslots.suite_running)
         if not os.environ.get(testslots.HELD_ENV) and (ports := testslots.port_block(checkcap.label(p.name if p else None))):

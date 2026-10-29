@@ -1153,6 +1153,20 @@ def test_the_test_runner_uses_half_the_cpus_up_to_4_off_ci_and_up_to_8_on_ci(cpu
     assert _test_conftest()._auto_jobs(cpus, env) == jobs
 
 
+def test_a_run_holding_a_test_slot_grant_starts_one_worker_per_slot_never_more():
+    # `ttp checks` grants k slots (TTP_TEST_SLOTS, TTP_TEST_SLOTS_HELD): the suite starts k workers, so no
+    # granted slot sits idle and the grant never exceeds the workers; never more than the CPUs.
+    c = _test_conftest()
+    for k in range(1, 17):
+        held = {"TTP_TEST_SLOTS": str(k), "TTP_TEST_SLOTS_HELD": str(k)}
+        assert c._auto_jobs(64, held) == k
+        assert c._auto_jobs(64, {**held, "CI": "true"}) == k
+    assert c._auto_jobs(4, {"TTP_TEST_SLOTS": "8", "TTP_TEST_SLOTS_HELD": "8"}) == 4
+    # A worker's shell carries one run's share (testslots.worker_env) but holds no slots: the local default.
+    assert c._auto_jobs(64, {"TTP_TEST_SLOTS": "8"}) == 4
+    assert c._auto_jobs(64, {"TTP_TEST_SLOTS": "x", "TTP_TEST_SLOTS_HELD": "8"}) == 4
+
+
 def _version(text):
     return tuple(int(x) for x in re.match(r"\d+(?:\.\d+)*", text).group(0).split("."))
 

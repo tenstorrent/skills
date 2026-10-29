@@ -22,11 +22,16 @@ runs always fit side by side and no suite takes the pool. The account settings c
 checks.test_run_max (or TTP_TEST_POOL / TTP_TEST_RUN_MAX) set them; checks.test_pool 0 turns the pool
 off. A project's own checks.test_pool / checks.test_run_max may only lower them.
 
-One project holds at most project_max() slots at once over all its runs (default twice a run's share,
-at most the pool; checks.test_project_max or TTP_TEST_PROJECT_MAX), as per-project lock files beside
-the pool's, so a burst of one project's checks leaves room for the others. Waiters are served
-first-come (a locks.enqueue ticket each, freed with its process): a waiter whose project is at its
-budget steps out of the line, keeping its arrival, so it never holds up other projects. Checks gating
+One project holds at most project_max() slots at once over all its runs, as per-project lock files
+beside the pool's, so a burst of one project's checks leaves room for the others. Its default is the
+project's checks at once (checklane.project_cap: checks.test_project_max, else its lanes) times one
+run's grant, at most the pool, so every check under the cap gets its slots; an explicit slot budget
+(checks.test_project_slots or TTP_TEST_PROJECT_SLOTS) wins. Waiters are served first-come (a
+locks.enqueue ticket each, freed with its process). A waiter whose project is at its budget steps out
+of the host's line, so it never holds up other projects, but keeps its ticket in its project's line
+(the "<own>.<project id>" queue): it re-enters the host's line at its first arrival, and a later
+arrival of the same project waits until every earlier one is back in the host's line, so a freed slot
+goes to the project's earliest waiter, never to whichever polls first. Checks gating
 a push to the push branch (`push_key`) never wait behind task checks: with no pool slot free they take
 that branch's one reserved slot beyond the pool (RESERVED), which task checks never use.
 
@@ -56,6 +61,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -104,18 +110,21 @@ def _number(v) -> int | None:
 class Kind:
     """One slot pool: its lock-file names, settings and the words its lines use."""
 
-    def __init__(self, name: str, resource: str, own: str, held_env: str, unit: str):
+    def __init__(self, name: str, resource: str, own: str, held_env: str, unit: str, budget: str):
         self.name, self.resource, self.own, self.held_env, self.unit = name, resource, own, held_env, unit
         self.env_prefix = f"TTP_{name.upper()}_"
+        self.budget = budget   # what setting() names a project's slot budget by
 
     def setting(self, what: str) -> tuple[str, str]:
-        """(environment variable, settings key) of `what` (pool, run_max, project_max)."""
+        """(environment variable, settings key) of `what` (pool, run_max, project_max, project_slots)."""
         return self.env_prefix + what.upper(), f"{self.name}_{what}"
 
 
 BUILD_HELD_ENV = "TTP_BUILD_SLOTS_HELD"   # set for a build that holds build slots: the grant
-TESTS = Kind("test", RESOURCE, OWN, HELD_ENV, "test worker")
-BUILDS = Kind("build", "build-slots", "build-slots-project", BUILD_HELD_ENV, "build job")
+# Tests: checks.test_project_max is how many checks run at once (checklane.project_cap), so the slot
+# budget has a key of its own; builds keep build_project_max as their slot budget.
+TESTS = Kind("test", RESOURCE, OWN, HELD_ENV, "test worker", "project_slots")
+BUILDS = Kind("build", "build-slots", "build-slots-project", BUILD_HELD_ENV, "build job", "project_max")
 CLIP_WAIT_S = 60.0   # `ttp clip` of a build waits this long for a build slot, then runs with one job
 
 
@@ -146,12 +155,27 @@ def sizes(cfg: dict | None = None, cores: int | None = None, kind: Kind = TESTS)
 
 
 def project_max(cfg: dict | None = None, s: tuple[int, int] | None = None, kind: Kind = TESTS) -> int:
-    """The most slots one project holds at once over all its runs (above); `s` is sizes(cfg)."""
+    """The most slots one project holds at once over all its runs (above): tests, its checks at once
+    (checklane.project_cap) times one run's grant; builds, twice a run's share. An explicit slot budget
+    (checks.test_project_slots, checks.build_project_max) wins, a project's own one only lowering the
+    account's; never below one run's grant, never above the pool. `s` is sizes(cfg)."""
+    from . import checklane
     s = s or sizes(cfg, kind=kind) or (0, 0)
-    top = _setting(*kind.setting("project_max")) or min(s[0], 2 * s[1])
-    if (n := _number(_section(cfg, "checks").get(kind.setting("project_max")[1]))):
-        top = min(top, n)
-    return max(s[1], min(top, s[0])) if s[0] else 0
+    if not s[0]:
+        return 0
+    env, key = kind.setting(kind.budget)
+    mine = _number(_section(cfg, "checks").get(key))
+    top = _setting(env, key) or (mine if kind is TESTS else None)
+    top = top or (min(s[0], 2 * s[1]) if kind is BUILDS else max(1, checklane.project_cap(cfg)) * s[1])
+    if mine:
+        top = min(top, mine)
+    return max(s[1], min(top, s[0]))
+
+
+def _arrived(t) -> str:
+    """A ticket's '<arrival>-<pid>': the same for one waiter's tickets in the host's and its project's line."""
+    m = re.match(r"[0-9.]+-\d+", t.name)
+    return m.group(0) if m else t.name
 
 
 def own_paths(project_name: str | None, n: int, kind: Kind = TESTS) -> list:
@@ -264,7 +288,7 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
             return Grant(held, kind=kind)
     cfg = _cfg() if cfg is None else cfg
     name = _project_name() if project_name is None else project_name
-    start, told, ticket = time.time(), 0.0, None
+    start, told, ticket, mine = time.time(), 0.0, None, None
     try:
         while True:
             s = sizes(cfg, kind=kind)
@@ -274,10 +298,27 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
             ps, own = paths(pool, kind), own_paths(name, project_max(cfg, s, kind), kind)
             k, files, why = 0, [], f"all {pool} are held"
             try:
+                ahead = []
+                if own and not push_key:
+                    # Its place in its project's line, kept while it is out of the host's line.
+                    line_of = f"{kind.own}.{locks.group_id(name)}"
+                    if mine is None:
+                        mine = locks.enqueue(checkcap.slot_dir(), line_of, holder, start)
+                    line = locks.queued(checkcap.slot_dir(), line_of)
+                    back = {_arrived(t) for t in locks.queued(checkcap.slot_dir(), kind.resource)}
+                    ahead = [t for t in line[:line.index(mine) if mine in line else len(line)]
+                             if _arrived(t) not in back]
                 if own and not push_key and not locks.any_free(own):
-                    # At its project's budget: out of the line (keeping its arrival) so others go first.
+                    # At its project's budget: out of the host's line so others go first, keeping its
+                    # place in its project's line.
                     locks.dequeue(ticket)
-                    ticket, why = None, f"its project holds its {len(own)} (checks.{kind.setting('project_max')[1]})"
+                    ticket, why = None, (f"its project holds its {len(own)} (checks.{kind.setting(kind.budget)[1]}"
+                                         + (", or checks.test_project_max x one run's grant" if kind is TESTS else "")
+                                         + ")")
+                elif ahead:
+                    # An earlier waiter of its project goes back into the host's line first.
+                    locks.dequeue(ticket)
+                    ticket, why = None, f"{len(ahead)} earlier waiter(s) of its project go first"
                 elif push_key:
                     k, files = _take(ps, own, top, holder, what)
                     if not k and (f := locks.try_take([reserved_path(push_key)], holder, "push test slot")):
@@ -309,6 +350,7 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
             time.sleep(poll_s(POLL_S))
     finally:
         locks.dequeue(ticket)
+        locks.dequeue(mine)
 
 
 def port_block(holder: str):
@@ -444,9 +486,25 @@ def suite_order(project_name: str, q: list | None = None, now: float | None = No
     return sorted(q, key=lambda t: _order_key(t, now, age))
 
 
+def _pending(path) -> bool:
+    """Whether a held lane's run still waits for its test slots (suite_hold's `pending`)."""
+    try:
+        return json.loads(path.read_text() or "{}").get("granted") is False
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def project_held(project_name: str) -> list:
-    """The lane files of every repository and wrapper lock of the project held right now."""
-    return [x for x in lane_paths(project_name, repo=None) if locks._slot_labels([x])]
+    """The lane files of every repository and wrapper lock of the project held right now by a run that
+    has its test slots: a run still waiting for them does not count against the project's cap."""
+    return [x for x in lane_paths(project_name, repo=None) if locks._slot_labels([x]) and not _pending(x)]
+
+
+def slots_granted(grant) -> None:
+    """Mark the lanes `grant` (suite_hold's, taken `pending`) holds as running with their test slots."""
+    for f in getattr(grant, "files", None) or []:
+        if os.path.basename(getattr(f, "name", "")).startswith(SUITE + "."):
+            locks.relabel(f, {"granted": True})
 
 
 @contextlib.contextmanager
@@ -536,7 +594,7 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                since: float | None = None, slots: int = 1, repo: str = "", cost: dict | None = None,
                max_wait: float = 0.0, state=None, what: str = "full checks", lock: str = "", cap: int = 0,
                worktree: str = "", headroom: Callable[[], bool] | None = None,
-               age: float | None = None) -> Grant | None:
+               age: float | None = None, pending: bool = False) -> Grant | None:
     """Hold one of project `project_name`'s `slots` checks lanes in repository `repo` (repo_key) for its
     full checks (above), waiting while its other runs there hold them all or a more urgent waiter is ahead
     (suite_order); Grant(0) holding one, Grant() with no project or nested in a check, None once `wait_s`
@@ -557,7 +615,8 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     going to the most urgent waiter (cap_turn). A priority-1 waiter (`priority` <= 1) whose lanes are held
     only by less urgent runs takes an overflow lane beside them while `headroom()` says the host has room,
     never beside a holder in the same `worktree` (one suite per worktree). `age`: the aging step
-    (age_s(), checks.priority_age_s; default the account's or SUITE_AGE_S)."""
+    (age_s(), checks.priority_age_s; default the account's or SUITE_AGE_S). `pending`: the run takes its
+    test slots after the lane, so the lane counts against `cap` only once slots_granted() marks it."""
     from . import checklane
     age = age_s() if age is None else age
     if not project_name or os.environ.get(HELD_ENV) or os.environ.get(checkcap.HELD_ENV):
@@ -577,7 +636,8 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     arrival = locks._arrival(ticket)
     fields = {**({"task": task} if task.isdigit() else {}), **({"priority": priority} if priority is not None else {}),
               **({"cost": cost} if cost else {}), **({"lock": lock} if lock else {}),
-              **({"worktree": str(worktree)} if worktree else {}), "hb": checklane.HEARTBEAT_S}
+              **({"worktree": str(worktree)} if worktree else {}), **({"granted": False} if pending else {}),
+              "hb": checklane.HEARTBEAT_S}
     start, told = time.time(), 0.0
     try:
         while True:

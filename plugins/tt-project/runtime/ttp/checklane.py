@@ -29,7 +29,10 @@ harness checks) run in their repository's lanes beside it instead of waiting beh
 
 Project cap. At most project_cap() of a project's checks run at once over all its repository and
 wrapper-lock lanes: checks.test_project_max (project, then account, then TTP_TEST_PROJECT_MAX), else the
-project's test-worker budget (testslots.project_max, its default unchanged). A lane under the cap goes to
+runs the host's test pool fits side by side, at least its lanes per repository (slots()). It counts checks, never test workers: the project's test-worker budget is
+this cap times one run's grant (testslots.project_max), so every check under the cap gets its slots, and
+a run counts against the cap only once its test slots are granted (testslots.project_held), so a run
+still waiting for them never keeps another from its turn. A lane under the cap goes to
 the most urgent waiter of the project (task priority, 1 first, then age: testslots.cap_turn). A
 priority-1 waiter whose lanes are held only by less urgent runs takes an overflow lane beside them while
 the host has room (headroom()), never beside a run in its own worktree (one suite per worktree).
@@ -157,7 +160,8 @@ def slots(cfg: dict | None) -> int:
 
 def project_cap(cfg: dict | None) -> int:
     """The most of a project's checks that run at once (above): checks.test_project_max (project, then
-    account), TTP_TEST_PROJECT_MAX, else testslots.project_max(cfg); 0 (the test pool off): no cap."""
+    account), TTP_TEST_PROJECT_MAX, else the runs the host's test pool fits side by side, at least its lanes
+    per repository (slots()); 0 (unset with the test pool off): no cap."""
     own = ((cfg or {}).get("checks") or {}) if isinstance((cfg or {}).get("checks"), dict) else {}
     for v in (own.get("test_project_max"), setting({}, "test_project_max"), os.environ.get("TTP_TEST_PROJECT_MAX")):
         try:
@@ -166,7 +170,8 @@ def project_cap(cfg: dict | None) -> int:
             continue
         if n >= 1:
             return n
-    return testslots.project_max(cfg)
+    s = testslots.sizes(cfg)
+    return max(slots(cfg), s[0] // s[1]) if s else 0
 
 
 def group_name(key: str) -> str:

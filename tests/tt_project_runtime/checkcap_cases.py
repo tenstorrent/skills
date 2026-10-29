@@ -949,7 +949,9 @@ def test_test_slots_one_project_holds_at_most_its_budget_and_never_blocks_the_ot
     monkeypatch.setenv("TTP_TEST_POOL", "8")
     monkeypatch.setenv("TTP_TEST_RUN_MAX", "2")
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
-    assert testslots.project_max() == 4, "default: twice a run's share, within the pool"
+    assert testslots.project_max() == 8, "default: the runs the pool fits x a run's grant, within the pool"
+    monkeypatch.setenv("TTP_TEST_PROJECT_MAX", "2")
+    assert testslots.project_max() == 4, "2 checks at once x a run's grant, within the pool"
     a1 = testslots.acquire("a1", project_name="pa")
     a2 = testslots.acquire("a2", project_name="pa")
     assert (a1.k, a2.k) == (2, 2)
@@ -989,7 +991,7 @@ def test_push_checks_take_a_reserved_test_slot_when_task_checks_fill_the_pool(en
     other.close()
     tasks.pop().close()
     # (c) with free pool slots a push takes them within the per-run and per-project budgets.
-    monkeypatch.setenv("TTP_TEST_PROJECT_MAX", "2")
+    monkeypatch.setenv("TTP_TEST_PROJECT_SLOTS", "2")
     push = testslots.acquire("push", project_name="pb", push_key="remote main", wait_s=0)
     assert push.k == 2 and not locks.held_labels([testslots.reserved_path("remote main")])
     push.close()
@@ -2284,31 +2286,37 @@ def test_checks_test_project_max_caps_a_projects_checks_at_once_over_all_its_lan
     assert b and b.files, "a lane under the cap again"
     a.close(), b.close()
     monkeypatch.delenv("TTP_TEST_PROJECT_MAX", raising=False)
-    monkeypatch.setattr(testslots, "project_max", lambda cfg=None, *a, **k: 7)
-    assert checklane.project_cap({}) == 7, "unset: the test-worker budget, its default unchanged"
+    monkeypatch.setenv("TTP_TEST_POOL", "32")
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", "8")
+    assert checklane.project_cap({}) == 4, "unset: the runs the test pool fits side by side"
+    assert checklane.project_cap({"checks": {"slots": 6}}) == 6, "at least its lanes per repository"
+    monkeypatch.setenv("TTP_TEST_POOL", "0")
+    assert checklane.project_cap({}) == 0, "unset with the test pool off: no cap"
+    monkeypatch.delenv("TTP_TEST_POOL")
     project.set_account_setting("checks.test_project_max", 3)
     assert checklane.project_cap({}) == 3
     assert checklane.project_cap({"checks": {"test_project_max": 5}}) == 5, "the project's setting wins"
     assert checklane.project_cap({"checks": {"test_project_max": "x"}}) == 3, "an invalid one falls back"
 
 
-def test_checks_test_project_max_is_chat_settable_as_a_whole_number_of_at_least_one(env, capsys):
+@pytest.mark.parametrize("key", ["checks.test_project_max", "checks.test_project_slots"])
+def test_checks_test_project_max_is_chat_settable_as_a_whole_number_of_at_least_one(env, capsys, key):
     from ttp import cli, coordinator, project
     for v in ("3", "1"):
-        cli.main(["config", "--chat-settable", "checks.test_project_max", v])
+        cli.main(["config", "--chat-settable", key, v])
         assert f"accepted as {v}" in capsys.readouterr().out
-    conv = coordinator.settable("checks.test_project_max")
+    conv = coordinator.settable(key)
     assert conv(4) == 4 and conv(" 2 ") == 2
     for bad in ("0", "1.5", "x", '{"slots": 2}', "true", "-1"):
         with pytest.raises(SystemExit) as e:
-            cli.main(["config", "--chat-settable", "checks.test_project_max", bad])
+            cli.main(["config", "--chat-settable", key, bad])
         assert e.value.code == 1 and "refused" in capsys.readouterr().out, bad
     for bad in (0, 1.5, True, {"slots": 2}, [2], None):
         with pytest.raises(ValueError):
             conv(bad)
     with pytest.raises(ValueError):   # the section itself takes no scalar
         coordinator.settable("checks")
-    assert project.unknown_key_hint("checks.test_project_max") is None, "a project-level checks key"
+    assert project.unknown_key_hint(key) is None, "a project-level checks key"
 
 
 def test_a_wrapper_lock_or_project_cap_wait_names_its_holder_and_raises_the_lane_wait_event(
@@ -2611,3 +2619,139 @@ def test_two_checks_of_one_project_with_different_or_no_locks_run_together(env, 
         for t in list(locks._TICKETS):
             locks.dequeue(t)
         hold.close()
+
+
+def _slot_sizes(monkeypatch, pool: int, run: int, **more):
+    from ttp import checkcap, testslots
+    monkeypatch.setenv("TTP_TEST_POOL", str(pool))
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", str(run))
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.02")
+    for k in ("TTP_TEST_PROJECT_MAX", "TTP_TEST_PROJECT_SLOTS", testslots.HELD_ENV, checkcap.HELD_ENV):
+        monkeypatch.delenv(k, raising=False)
+    for k, v in more.items():
+        monkeypatch.setenv(k, str(v))
+
+
+def test_three_checks_at_once_with_a_grant_of_4_each_get_their_slots_inside_a_pool_of_32(env, monkeypatch):
+    """checks.test_project_max counts checks, never slots: the slot budget is it times one run's grant,
+    so 3 lanes run 3 suites at once instead of 1 holding the slots while the other 2 wait."""
+    from ttp import checklane, testslots
+    _slot_sizes(monkeypatch, 32, 4, TTP_TEST_PROJECT_MAX=3)
+    assert checklane.project_cap({}) == 3 and testslots.project_max() == 12
+    lanes = [testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, cap=3, wait_s=0, pending=True) for _ in range(3)]
+    grants = [testslots.acquire(f"run {i}", project_name="pa", wait_s=0) for i in range(3)]
+    try:
+        assert all(x and x.files for x in lanes)
+        assert [g and g.k for g in grants] == [4, 4, 4], "3 suites at once, 4 workers each"
+        for x in lanes:
+            testslots.slots_granted(x)
+        assert len(testslots.project_held("pa")) == 3
+        told = []
+        assert testslots.acquire("run 3", project_name="pa", wait_s=0.5, tell=told.append) is None
+        assert "its project holds its 12" in told[-1] and "checks.test_project_slots" in told[-1], told
+        assert testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, cap=3, wait_s=0) is None, "the cap of 3 checks"
+        other = testslots.acquire("other project", project_name="pb", wait_s=0)
+        assert other and other.k == 4, "the pool's other 20 slots stay for other projects"
+        other.close()
+    finally:
+        for g in grants + lanes:
+            g and g.close()
+
+
+def test_a_lane_counts_against_the_project_cap_only_once_its_run_has_its_test_slots(env, monkeypatch):
+    from ttp import testslots
+    _slot_sizes(monkeypatch, 32, 4, TTP_TEST_PROJECT_MAX=1)
+    waiting = testslots.suite_hold("pa", repo=_LANE_REPO, slots=2, cap=1, wait_s=0, pending=True)
+    try:
+        assert waiting and testslots.project_held("pa") == [], "still waiting for its slots: not counted"
+        second = testslots.suite_hold("pa", repo=_LANE_REPO, slots=2, cap=1, wait_s=0, pending=True)
+        assert second and second.files, "a run waiting for slots never keeps another from its turn"
+        second.close()
+        testslots.slots_granted(waiting)
+        assert len(testslots.project_held("pa")) == 1
+        assert testslots.suite_hold("pa", repo=_LANE_REPO, slots=2, cap=1, wait_s=0, pending=True) is None
+        old = testslots.suite_hold("pb", repo=_LANE_REPO, slots=2, cap=1, wait_s=0)
+        assert len(testslots.project_held("pb")) == 1, "a lane taken without `pending` (an older runtime) counts"
+        old.close()
+    finally:
+        waiting.close()
+
+
+def test_a_waiter_at_its_projects_budget_keeps_its_place_and_is_never_passed_by_a_later_one(env, monkeypatch):
+    import threading
+    from ttp import checkcap, locks, testslots
+    _slot_sizes(monkeypatch, 8, 2, TTP_TEST_PROJECT_SLOTS=2)
+    first = testslots.acquire("first", project_name="pa", wait_s=0)
+    assert first and first.k == 2 and testslots.project_max() == 2
+    line = f"{testslots.OWN}.{locks.group_id('pa')}"
+    # (a) An earlier waiter still out of the host's line (at budget when it last looked) goes first:
+    # a later one finds budget free but waits for it, deterministically.
+    earlier = locks.enqueue(checkcap.slot_dir(), line, "earlier", time.time() - 60)
+    first.close()
+    told = []
+    assert testslots.acquire("later", project_name="pa", wait_s=0.5, tell=told.append) is None
+    assert "1 earlier waiter(s) of its project go first" in told[-1], told
+    back = locks.enqueue(checkcap.slot_dir(), testslots.RESOURCE, "earlier", locks._arrival(earlier), group="pa")
+    told.clear()
+    assert testslots.acquire("later", project_name="pa", wait_s=0.5, tell=told.append) is None
+    assert "ahead in the host's line" in told[-1], "back in the host's line at its first arrival, it is ahead"
+    locks.dequeue(back), locks.dequeue(earlier)
+    g = testslots.acquire("later", project_name="pa", wait_s=0)
+    assert g and g.k == 2
+    assert locks.queued(checkcap.slot_dir(), line) == [], "a granted waiter leaves its project's line"
+    # (b) Real waiters: the earlier arrival is granted first, every time.
+    got, order = {}, []
+
+    def wait(name):
+        x = testslots.acquire(name, project_name="pa", wait_s=30)
+        order.append(name)
+        got[name] = x
+
+    def queued(n):
+        deadline = time.time() + 20
+        while len(locks.queued(checkcap.slot_dir(), line)) < n and time.time() < deadline:
+            time.sleep(0.01)
+        assert len(locks.queued(checkcap.slot_dir(), line)) == n
+
+    ts = []
+    for name, n in (("e", 1), ("l", 2)):
+        ts.append(threading.Thread(target=wait, args=(name,)))
+        ts[-1].start()
+        queued(n)   # "l" arrives only once "e" holds its place
+    g.close()
+    ts[0].join(30)
+    assert order == ["e"] and got["e"].k == 2, "the earlier waiter is granted first"
+    got["e"].close()
+    ts[1].join(30)
+    assert order == ["e", "l"]
+    got["l"].close()
+
+
+@pytest.mark.parametrize("pool,run,old", [(2, 1, 2), (4, 2, 4), (8, 4, 8), (16, 8, 16)])
+def test_a_project_on_a_small_pool_keeps_its_old_budget_and_a_single_run_its_whole_share(env, monkeypatch, pool, run, old):
+    """Unset, the budget was twice a run's share within the pool; on a pool that fits at most two runs
+    the runs-it-fits x grant default is the same, and one run still gets its whole share at once."""
+    from ttp import testslots
+    _slot_sizes(monkeypatch, pool, run)
+    assert testslots.project_max() == old
+    g = testslots.acquire("one", project_name="pa", wait_s=0)
+    assert g and g.k == run
+    g.close()
+
+
+def test_the_project_slot_budget_never_exceeds_the_host_pool(env, monkeypatch):
+    from ttp import locks, testslots
+    _slot_sizes(monkeypatch, 8, 4, TTP_TEST_PROJECT_MAX=10)
+    assert testslots.project_max() == 8, "10 checks x 4 slots, within the pool of 8"
+    monkeypatch.setenv("TTP_TEST_PROJECT_SLOTS", "100")
+    assert testslots.project_max() == 8, "an explicit slot budget wins, within the pool"
+    assert testslots.project_max({"checks": {"test_project_slots": 4}}) == 4, "a project's own only lowers it"
+    monkeypatch.delenv("TTP_TEST_PROJECT_SLOTS")
+    assert testslots.project_max({"checks": {"test_project_slots": 1}}) == 4, "never below one run's grant"
+    held = [testslots.acquire(n, project_name=pr, wait_s=0) for n, pr in (("a", "pa"), ("b", "pa"), ("c", "pb"))]
+    try:
+        assert [g and g.k for g in held] == [4, 4, None], "a full pool grants nothing more"
+        assert len(locks.held_labels(testslots.paths(8))) == 8
+    finally:
+        for g in held:
+            g and g.close()

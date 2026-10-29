@@ -511,9 +511,9 @@ def _known_keys(path: list[str]) -> set[str] | None:
         # wrap_cmd: the project's own lock or queue command the commands after `ttp checks --` run
         # behind (push.wrap_of; default "", none); delivery.push_checks never go through it.
         # slots, light_cmds, max_wait_s, wait_event_s, priority_age_s, test_project_max: the checks lanes
-        # (checklane).
+        # (checklane); test_project_slots: the project's test-worker budget (testslots.project_max).
         return {"nice", "ionice", "wall_cap_s", "wrap_cmd", "slots", "light_cmds", "max_wait_s", "wait_event_s",
-                "priority_age_s", "test_project_max"}
+                "priority_age_s", "test_project_max", "test_project_slots"}
     if len(path) == 1 and isinstance(DEFAULT_CONFIG.get(path[0]), dict):
         return set(DEFAULT_CONFIG[path[0]]) | EXTRA_KEYS.get(path[0], set())
     return None
@@ -2186,7 +2186,7 @@ def unregister(name: str) -> None:
 # project's own project.json, so the projects on a machine agree unless one overrides a key.
 ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_spend_to"}, "pricing": {"claude"},
                 "checks": {"host_max", "load_extra", "nice", "ionice", "priority_turns", "test_pool", "test_run_max",
-                           "test_project_max", "build_pool", "build_run_max", "build_project_max", "wall_cap_s",
+                           "test_project_max", "test_project_slots", "build_pool", "build_run_max", "build_project_max", "wall_cap_s",
                            "slots", "light_cmds", "max_wait_s", "wait_event_s", "priority_age_s"}}
 
 
