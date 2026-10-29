@@ -128,7 +128,6 @@ OWN_SESSION_ALLOWED = {
     "cli.py::<module>": "ttp detach --remote's driver script, meant to outlive ssh and this run",
     "daemon.py::<module>": "the detached tip-check driver script, meant to outlive the daemon's tick",
     "daemon.py::Daemon.start_run": "a run's supervisor, meant to outlive a daemon restart",
-    "daemon.py::Daemon._probe_now": "daemon probe on its own timeout clock; kills its group itself",
     "daemon.py::Daemon._start_tip_check": "detached tip-check rerun, meant to outlive the daemon's tick",
     "daemon.py::Daemon._start_on_pass": "detached on_pass check, polled across ticks",
     "deploy.py::launch_takeover": "a host-side upgrade takeover, meant to outlive its caller",

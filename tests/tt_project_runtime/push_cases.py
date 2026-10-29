@@ -5590,6 +5590,61 @@ def test_the_push_queue_refuses_a_head_carrying_commits_of_a_failed_review_unles
     assert pushq.check_approval(s.p, s.p.db.task(s.review), [{"branch": s.branch, "head": s.head}]).get("entries")
 
 
+
+def test_a_passed_probe_reads_the_push_queues_rejected_commit_git_before_its_finish_transaction(env, monkeypatch):
+    """_probe_passed records a waiting task's on_pass inside one write transaction, and the push queue's
+    rejected-commit check (pushq._inherited: `git show -p`, patch-id, rev-list), read there for a code
+    task's review (carried) and a review's approval (check_approval), held the write lock while git ran.
+    Now _prefetch_git reads it before (pushq.prefetch_git) and the same calls inside read the memo."""
+    from ttp import pushq
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(Daemon, "_precheck", lambda self, task, head: None)
+    x, xbranch, _, _ = _pq_stacked(s, "rejected", review="failed")
+    c, cbranch, chead, crev = _pq_stacked(s, "stacked", on=xbranch, review="running")
+    d = Daemon(s.p.base)   # its own connection: a transaction is open on either
+    in_tx = lambda: s.p.db.conn.in_transaction or d.p.db.conn.in_transaction   # noqa: E731
+    reads, spawned, real_read, real_popen = [], [], pushq._read_inherited, subprocess.Popen
+
+    def read(*a, **k):
+        reads.append(in_tx())
+        return real_read(*a, **k)
+
+    def popen(argv, *a, **k):
+        if in_tx():
+            spawned.append(argv)
+        return real_popen(argv, *a, **k)
+    monkeypatch.setattr(pushq, "_read_inherited", read)
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    # Without the warm-up the check runs its git inside a transaction (what this guards against).
+    with s.p.db.tx():
+        assert pushq.carried(s.p, s.p.db.task(c), chead) and reads == [True]
+    reads.clear()
+    spawned.clear()
+
+    def passed(tid, on_pass):
+        run_dir = env["tmp"] / f"run-{tid}"
+        run_dir.mkdir()
+        s.p.db.update_task(tid, status="queued", result=json.dumps({"status": "waiting", "summary": "checks",
+                                                                     "retry_when": "exit 1"}))
+        monkeypatch.setattr(d, "_checks_wait", lambda task: ("pass", {"task": tid}, run_dir, on_pass, chead))
+        d._probe_passed(s.p.db.task(tid), time.time())
+    # A code task's checks passed: its review is queued, naming the rejected commits its head carries.
+    s.p.db.update_task(crev, status="cancelled")
+    passed(c, {"status": "done", "summary": "made the change"})
+    rid = s.p.db.one("SELECT id FROM tasks WHERE kind='review' AND status='queued' AND depends_on LIKE ?",
+                     (f"%{c}%",))["id"]
+    assert f"carries unreviewed commits from tasks whose latest review failed (#{x}: " in s.p.db.task(rid)["spec"]
+    # Its review approves that head: refused for the same commits, judged by the memo too.
+    passed(rid, {"status": "done", "summary": "passes", "push": [{"branch": cbranch, "head": chead}]})
+    t = s.p.db.task(rid)
+    assert t["status"] == "queued" and f"carries unreviewed commits from #{x}" in json.loads(t["result"])["woke"]
+    assert reads == [False, False], f"the rejected-commit check read git inside the transaction: {reads}"
+    git = [a for a in spawned if isinstance(a, list)   # _read_inherited's commands
+           and ({"show", "patch-id", "for-each-ref"} & set(a) or {"rev-list", "--no-merges"} <= set(a))]
+    assert not git, f"the push queue's git ran inside the finish transaction: {git}"
+    assert not d._git_memo, "a memo outlived its transaction"
+
 def test_the_push_queue_accepts_a_head_stacked_on_a_passed_branch_landed_or_not(env, monkeypatch):
     from ttp import pushq
     s = _pq(env, monkeypatch)

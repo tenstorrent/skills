@@ -1186,7 +1186,11 @@ def test_a_probe_stall_on_a_done_dependency_releases_the_task_once_with_a_note(e
     d, now = Daemon(p.base), time.time()
     dep = _done_task(p)
     tid = _stalled(p, d, _LIVE_START, deps=[dep], now=now)
-    d.blocker_sweep()                     # runs the real probe in the project root: still not yet
+    d.blocker_sweep()                     # starts the real probe in the project root, off the tick
+    assert deferral(p.db.task(tid)).get("when") == _LIVE_START, "judged before the probe answered"
+    d._stall_probes[_LIVE_START][0].wait(_load_scaled(30))
+    d._sweep_checked = 0
+    d.blocker_sweep()                     # reads its answer: still not yet
     t = p.db.task(tid)
     assert not deferral(t).get("when") and t["not_before"] is None and t["tier"] == "light"
     assert "your probe has said not yet for" in t["spec"] and "check it still tests what you wait for" in t["spec"]
@@ -1311,6 +1315,71 @@ def test_a_probe_stall_on_a_landed_task_ref_rechecks_the_landing_before_releasin
     assert f"#{dep} done" in p.db.kv(sweep.PROBE_STALL_KEY)[str(tid)]["why"]
     assert _dispose(p, d, later + sweep.PROBE_STALL_RECHECK_S + 1, rcs={f"landed:#{dep}": 0}) == ({}, [])
 
+
+
+def test_a_stalled_probe_stall_recheck_never_holds_the_blocker_sweep(env, monkeypatch, tmp_path):
+    """The blocker sweep re-ran a probe stall's probe inline (Daemon._probe_now), up to 120 s of one
+    tick. It now starts it off the tick (probespawn) and judges it on a later pass; one still running
+    past PROBE_TIMEOUT_S is killed whole and counts as not yet."""
+    from ttp import daemon as dmod, sweep
+    from ttp.db import deferral
+    p = make(env)
+    d, now = dmod.Daemon(p.base), time.time()
+    pidf = tmp_path / "probe.pid"
+    probe = f"echo $$ > {pidf}; sleep 60; exit 0"
+    tid = _stalled(p, d, probe, deps=[_done_task(p)], now=now)
+    t0 = time.monotonic()
+    d.blocker_sweep()
+    assert time.monotonic() - t0 < 5, "the tick waited on the probe"
+    proc = d._stall_probes[probe][0]
+    assert proc.poll() is None and deferral(p.db.task(tid)).get("when") == probe
+    deadline = time.monotonic() + _load_scaled(10)
+    while not pidf.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    pid = int(pidf.read_text())
+    monkeypatch.setattr(dmod, "PROBE_TIMEOUT_S", 0)
+    d._sweep_checked = 0
+    t0 = time.monotonic()
+    d.blocker_sweep()   # past its timeout: killed, a not yet
+    assert time.monotonic() - t0 < 10
+    assert proc.poll() is not None and not _alive(pid), "the stalled probe outlived its timeout"
+    assert p.db.kv(sweep.PROBE_STALL_KEY)[str(tid)]["disposition"] == "released-stale"
+    assert not deferral(p.db.task(tid)).get("when")
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)   # probespawn.kill reaped it: gone, not a zombie
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_probe_stall_rechecks_start_together_keep_their_answer_and_are_dropped_when_stale(env, monkeypatch):
+    """Off the tick, a re-check answers on a later pass: every `landed:#N` and the probe start in one
+    pass (one waiting on the next would restart forever), each answer is kept for later passes until
+    STALL_PROBE_KEEP_S after its start, at most STALL_PROBES_AT_ONCE run at once, and a stale one is
+    killed and forgotten."""
+    from ttp import daemon as dmod
+    p = make(env)
+    d, now = dmod.Daemon(p.base), time.time()
+    a, b = _done_task(p), _done_task(p)
+    probe = f"ttp landed --task {a} && ttp landed --task {b} && test -e state/out-ready || exit 1"
+    tid = _repointed(p, d, probe, now=now)
+    got, ran = _dispose(p, d, now, rcs={f"landed:#{a}": None, f"landed:#{b}": 0})
+    assert got == {} and ran == [f"landed:#{a}", f"landed:#{b}", probe], "not all started in one pass"
+    got, ran = _dispose(p, d, now, rcs={f"landed:#{a}": 1, f"landed:#{b}": None})
+    assert got == {tid: "listed"} and ran == [f"landed:#{a}"]
+    # The daemon's own run_probe: an answer stays readable, the cap counts only running ones.
+    monkeypatch.setattr(dmod, "STALL_PROBES_AT_ONCE", 2)
+    assert d._probe_now("exit 0") is None and d._probe_now("sleep 60") is None
+    assert d._probe_now("exit 3") is None and "exit 3" not in d._stall_probes, "started past the cap"
+    d._stall_probes["exit 0"][0].wait(_load_scaled(30))
+    assert d._probe_now("exit 0") == 0 and d._probe_now("exit 0") == 0
+    assert d._probe_now("exit 3") is None and "exit 3" in d._stall_probes
+    slow = d._stall_probes["sleep 60"][0]
+    d._drop_stall_probes(time.time() + dmod.STALL_PROBE_KEEP_S)
+    assert d._stall_probes == {} and slow.poll() is not None
 
 def _stalled_waiting(p, d, tmp_path, probe, deps, now, ago=7200):
     """A task that handed off waiting on `probe` through the daemon's hand-off path (status queued,

@@ -21,6 +21,7 @@ from typing import Any, Callable
 from . import checkdirs, batch, conflictfix, coordinator as coord, cyclenotice, envfault, locks, msgparts, overlap, pagesev, prhead, push, pushclaim, replymsg, runner, scopehold, sharedchecks, timefmt, upstream, urgent
 from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
                  pin_of, review_subject, reviewed_ids)
+from . import gitmemo
 from .landed import on_branch
 from .project import Project, nice_level, push_allowed, push_queue_on, renice, write_json
 from .worktree import fix_branches, named_refs
@@ -325,7 +326,15 @@ def _inherited(p: Project, task: dict, entries: list[dict], tip: str, now: float
     """Commits each head adds over the target's `tip` that come from another task whose latest review
     failed: {head: {task id: ["<short sha> <subject>", ...]}}. A commit counts by its hash or by its
     patch-id, so a rebased or cherry-picked copy of a rejected commit is caught too. A rejected
-    branch's commits that a passed task's branch also holds are that task's (it was stacked on it)."""
+    branch's commits that a passed task's branch also holds are that task's (it was stacked on it).
+    Within a gitmemo scope the answer is kept by task, heads and tip: prefetch_git reads it before the
+    transaction that judges a hand-off, so its git (`git show -p` among it) never holds the write lock."""
+    key = ("pushq.inherited", task["id"], str(task.get("depends_on") or ""),
+           tuple((e.get("branch"), e["head"]) for e in entries), tip)
+    return gitmemo.cached(key, lambda: _read_inherited(p, task, entries, tip, now))
+
+
+def _read_inherited(p: Project, task: dict, entries: list[dict], tip: str, now: float) -> dict[str, dict[int, list[str]]]:
     failed, passed, branch_of = _verdicts(p.db, task, {e["branch"] for e in entries if e["branch"]}, now)
     have = set(_git(p, "for-each-ref", "--format=%(refname:short)", "refs/heads/",
                     timeout=INHERIT_GIT_S).stdout.split())
@@ -368,6 +377,39 @@ def carried(p: Project, task: dict, head: str, cfg: dict | None = None) -> dict[
         return _inherited(p, review, [{"branch": task["branch"], "head": head}], tip, time.time()).get(head, {})
     except (subprocess.SubprocessError, OSError):
         return {}
+
+
+def _entry(e: dict) -> dict:
+    """An approval entry as check_approval keeps it."""
+    return {"branch": str(e.get("branch") or "").strip()[:200], "head": str(e.get("head") or "").strip().lower()}
+
+
+def prefetch_git(p: Project, task: dict, result: dict, cfg: dict | None = None) -> None:
+    """Within the caller's gitmemo scope, before the transaction that judges `task`'s finished
+    hand-off: what _inherited reads from git for it. That is a review's approval (check_approval) or the
+    commits a finished code task's head carries (carried, in Daemon._auto_review). Inside the
+    transaction the same calls read the memo; one not read here (a moved head or tip) runs as before."""
+    if result.get("status") != "done":
+        return
+    if task.get("kind") == "code":
+        head = _commit(p, task["branch"]) if task.get("branch") else ""
+        if head:
+            carried(p, task, head, cfg)
+        return
+    entries = result.get("push")
+    d = _delivery(p, cfg)
+    if task.get("kind") != "review" or not isinstance(entries, list) or not entries \
+            or d.get("push_queue") is not True or not push_allowed(d):
+        return
+    out = [_entry(e) for e in entries if isinstance(e, dict)]
+    tgt = target(p) if enabled(p, cfg) else None
+    tip = _tracking_tip(p, *tgt) if tgt else ""
+    if not tip or len(out) != len(entries) or not all(_HEX40.fullmatch(e["head"]) for e in out):
+        return   # check_approval refuses it before reading _inherited
+    try:
+        _inherited(p, task, out, tip, time.time())
+    except subprocess.TimeoutExpired:
+        pass   # not kept: check_approval reads it again, bounded, as before
 
 
 def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None) -> dict:
@@ -439,7 +481,7 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
             if not _contains(p, reviewed, head) and \
                     not any(_contains(p, [tip], head) and _contains(p, [head], on) for tip, on in built):
                 return {"invalid": f"{head} is none of the reviewed refs ({names}) nor an ancestor of one"}
-        out.append({"branch": str(e.get("branch") or "").strip()[:200], "head": head})
+        out.append(_entry(e))
         ids = e.get("inherited") if isinstance(e.get("inherited"), list) else []
         accepted[head] = {int(str(i).lstrip("#")) for i in ids if str(i).lstrip("#").isdigit()}
     tip = _tracking_tip(p, *tgt)

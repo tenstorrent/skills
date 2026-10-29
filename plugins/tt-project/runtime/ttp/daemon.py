@@ -315,7 +315,9 @@ SPEC_SEEN_KEY, SPEC_WAKES_KEY, SPEC_WAKES_PER_H = "spec_seen", "spec_wakes", 3
 # light wake whose wait was over handed off the old work as done without the change.
 SPEC_WOKE = ("its spec changed: act on what the change adds (the spec's latest `## Update`) before you hand "
              "off; the last hand-off does not cover it")
-PROBE_STALL_PASS_S = 120   # probe time one probe-stall disposition pass may spend (sweep.dispose_probe_stalls)
+# A probe stall's re-check (sweep.dispose_probe_stalls, Daemon._probe_now) runs off the tick: at most this
+# many at once, and one no disposition pass asks for again within STALL_PROBE_KEEP_S is dropped.
+STALL_PROBES_AT_ONCE, STALL_PROBE_KEEP_S = 4, PROBE_TIMEOUT_S + PROBE_EVERY_S
 # The detached rerun of a shared failure's ids on the push-branch tip (Daemon._start_tip_check):
 # argv dir worktree repo timeout_s cmd...; removes the worktree, then writes rc (124 once timed out),
 # so a present rc means the rerun is wholly done.
@@ -812,6 +814,7 @@ class Daemon:
         self._machines_routed = 0.0
         self._coverage_at = 0.0
         self._probe_rc: dict[int, tuple[int | str, float, str]] = {}   # last verdict: exit code or why, when, probe
+        self._stall_probes: dict[str, list] = {}   # probe -> its stall re-check: [Pending, started, answer or None]
         self._git_memo: dict[int, dict] = {}   # task -> git facts its hand-off is judged by, read before the tx (_prefetch_git)
         self._start_rc: dict[int, tuple[int | str, float, str]] = {}   # a start_when's last not-yet or broken verdict
         self._checks_gone_at: dict[int, tuple[str, float]] = {}   # task -> probe on gone checks, first seen (checksgone)
@@ -3923,8 +3926,9 @@ class Daemon:
         follow-up's file overlaps and chain (coordinator _file_overlaps, _overlap_chain) as the hop the
         daemon may queue reads them (chaincap.auto_hop: a task_add of chaincap.hop_spec, the follow-up's
         spec plus the parent's branch brief, continuing this task, so its lineage roots, and its skip when
-        it is a split's hop). Kept in self._git_memo for the transaction's gitmemo scope (_finish_tx),
-        where those calls read them; one not read here runs its git there, as before."""
+        it is a split's hop); and the commits a review's approval or a finished code task's head carries
+        from rejected work (pushq.prefetch_git). Kept in self._git_memo for the transaction's gitmemo
+        scope (_finish_tx), where those calls read them; one not read here runs its git there, as before."""
         if not task:
             return
         memo = self._git_memo[task["id"]] = {}
@@ -3943,6 +3947,7 @@ class Daemon:
                         for skip in (set(), {task["id"]}):   # a done task's follow-up, a split's hop
                             clash = coord._file_overlaps(self.p, "code", spec, skip)
                             coord._overlap_chain(self.p, "code", spec, clash, {task["id"]}, skip)
+                pushq.prefetch_git(self.p, task, result, self.cfg)
         except Exception as e:
             log(self.p, f"task {task['id']}: reading git before finishing failed: {type(e).__name__}: {e}")
 
@@ -6535,7 +6540,7 @@ class Daemon:
         self._sweep_checked = now
         db = self.p.db
         try:
-            self._probe_budget = now + PROBE_STALL_PASS_S
+            self._drop_stall_probes(now)
             for rec in sweep.dispose_probe_stalls(db, self.cfg, now, _current_probe, self._probe_now,
                                                   self._probe_stall_act):
                 log(self.p, f"task {rec['task']} probe stall ({rec['hours']} h not yet): {rec['disposition']}: {rec['why']}")
@@ -6572,22 +6577,43 @@ class Daemon:
             log(self.p, "blocker sweep failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
 
     def _probe_now(self, probe: str) -> int | str | None:
-        """Run one probe to its end (a probe stall's re-check): its exit code, "timeout" or "could not
-        start"; None once this pass's probe time (PROBE_STALL_PASS_S) is spent."""
-        left = getattr(self, "_probe_budget", 0.0) - time.time()
-        if left <= 0:
+        """A probe stall's re-check of `probe`, run off the tick (probespawn) so a stalled probe never holds
+        it: None while it starts or runs (judged on a later pass), then its exit code, "timeout" (killed
+        after PROBE_TIMEOUT_S) or "could not start", kept for every pass until STALL_PROBE_KEEP_S after
+        its start (_drop_stall_probes). At most STALL_PROBES_AT_ONCE run at once: a probe past them
+        starts on a later pass."""
+        now = time.time()
+        run = self._stall_probes.get(probe)
+        if run is None:
+            if sum(r[2] is None for r in self._stall_probes.values()) >= STALL_PROBES_AT_ONCE:
+                return None
+            self._stall_probes[probe] = [probespawn.Pending(landed.probe_command(probe, self.p), cwd=str(self.p.root),
+                                                            env=self._probe_env(), stdout=False), now, None]
             return None
-        try:
-            proc = subprocess.Popen(landed.probe_command(probe, self.p), shell=True, cwd=str(self.p.root),
-                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL, start_new_session=True, env=self._probe_env())
-        except OSError:
-            return "could not start"
-        try:
-            return proc.wait(timeout=min(PROBE_TIMEOUT_S, left))
-        except subprocess.TimeoutExpired:
-            _kill_group(proc)
-            return "timeout"
+        if run[2] is None:
+            rc = run[0].poll()
+            if rc is None and now - run[1] >= PROBE_TIMEOUT_S:
+                probespawn.kill(run[0])
+                rc = "timeout"
+            if rc is not None:
+                run[2] = rc
+                self._close_stall_probe(run[0])
+        return run[2]
+
+    @staticmethod
+    def _close_stall_probe(proc) -> None:
+        if f := proc.take_file():   # its stderr: unread, the verdict is the exit code
+            f.close()
+
+    def _drop_stall_probes(self, now: float) -> None:
+        """End and forget the stall re-checks started STALL_PROBE_KEEP_S ago or more: an answer that old
+        is stale, and one still running past PROBE_TIMEOUT_S that no pass asked for is killed."""
+        for probe, (proc, started, rc) in list(self._stall_probes.items()):
+            if now - started >= STALL_PROBE_KEEP_S:
+                del self._stall_probes[probe]
+                if rc is None:
+                    probespawn.kill(proc)
+                    self._close_stall_probe(proc)
 
     def _probe_stall_act(self, task: dict, what: str, note: str) -> None:
         """Lift a probe stall's hold model-free: 'passed' as a passed probe does; 'release' appends

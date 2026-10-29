@@ -993,7 +993,8 @@ def dispose_probe_stalls(db: DB, cfg: dict, now: float, current_probe: Callable[
     """Settle every probe stall (progress.probe_stalls' `stall:probe:#<id>`) open longer than
     coordinator.probe_stall_dispose_h (0 off) without a model call. When every task the wait names
     (`landed:#N`, a dependency) is done, and each `landed:` one is on the push branch, the probe is
-    re-run now (run_probe returns its exit code, None when the pass has no probe time left): a pass lifts the hold (act 'passed'); a not yet
+    re-run (run_probe returns its exit code, None while it has none yet: Daemon._probe_now runs it off the
+    tick and a later pass reads it): a pass lifts the hold (act 'passed'); a not yet
     marks the probe stale and releases the task once with a spec note (act 'release'), at most once
     per task and probe text. A probe that greps a literal sha is flagged; one only the user can end is
     left. Each item records its disposition (PROBE_STALL_DISPOSITIONS) in PROBE_STALL_KEY."""
@@ -1045,17 +1046,14 @@ def dispose_probe_stalls(db: DB, cfg: dict, now: float, current_probe: Callable[
             unrun = False
             for n in refs if finished else ():
                 got = run_probe(f"landed:#{n}")
-                if got is None:   # no probe time left in this pass: judged on a later one
+                if got is None:   # no answer yet: the rest start too, all judged on a later pass
                     unrun = True
-                    break
-                if got != 0:
+                elif got != 0:
                     finished = False
                     break
-            if unrun:
-                continue
             if finished:
                 rc = run_probe(probe)
-                if rc is None:
+                if rc is None or unrun:
                     continue
                 names = ", ".join(f"#{n}" for n in named)
                 if rc == 0:
