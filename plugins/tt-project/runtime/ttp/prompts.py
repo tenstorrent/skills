@@ -670,6 +670,8 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                     + f": `git worktree add <dir>/t{task['id']} -b ttp/t{task['id']}-<topic> <start>`, <start> "
                     "the branch you build on. Never edit another task's worktree.\n")
     history += verified_line(p, task, cwd)
+    if kind == "review":
+        history += no_commit_line(p, task)
     own_off = own_push(cfg) == "off"
     if own_off and branch and (onto := carried_branch(task) or rebased_branch(task)):
         history += (f"\nThis task builds on branch {onto}, but own pushes are off in this project "
@@ -858,6 +860,25 @@ def verified_line(p: Project, task: dict, cwd: str) -> str:
     return (f"\nInherited marker: {m['line']}. Verify only the commits after it (`git log {m['sha'][:12]}..HEAD`) "
             f"and your own: do not re-review or re-test the inherited commits. `ttp checks` scopes its "
             f"if_changed checks the same way; the push checks still run in full on the final head.\n")
+
+
+def no_commit_line(p: Project, task: dict) -> str:
+    """A review that covers no commit (worktree.reviewed_head None, no extchange published head: its
+    target is an external artifact or a hash-pinned report) is told `ttp checks` has no target there,
+    so it never runs candidate checks at an unrelated HEAD. "" for a review of a commit, or on error."""
+    from . import extchange
+    from .push import _labels
+    from .worktree import reviewed_head
+    try:
+        if extchange.heads(_labels(dict(task))) or reviewed_head(p, dict(task)):
+            return ""
+    except Exception:
+        return ""
+    return ("\nThis review covers no commit, so `ttp checks` and the push checks have no target: never run "
+            "them at whatever HEAD a checkout has. Decide it on the spec's artifact hashes (re-hash each against "
+            "its manifest; missing or changed fails) and focused reruns of the commands behind its claims "
+            "(nonzero fails). A claim resting on code names that commit and runs `ttp checks` in its worktree. "
+            "Such a failure is substantive, never check_only for a gate that does not apply.\n")
 
 
 def spec_digest(task: dict) -> str:

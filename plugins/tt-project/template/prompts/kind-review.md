@@ -17,6 +17,9 @@
   When only the verdict and its push (or approval) are left once they pass, put that final hand-off
   in `on_pass`: a pass on the same head records it without a model run, and a failure wakes the
   review at its tier with the output.
+- A review that covers no commit (an external artifact or a hash-pinned report; the task header says
+  so) has no `ttp checks` target: re-hash its artifacts against the manifest and rerun the commands
+  behind its claims; a missing or changed hash or a nonzero exit is a `substantive` failure.
 - A `ttp checks --purpose harness` pass only qualifies a harness-preparation head; it is never
   candidate evidence. Fail a change that whitelists its own harness commit's SHA in a publication gate.
 <!-- ttp:result-rule: kept as one block across upgrades; a project may reword it (see the README) -->

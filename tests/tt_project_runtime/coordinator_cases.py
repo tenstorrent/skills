@@ -19027,3 +19027,34 @@ def test_an_off_topic_answer_leaves_the_ask_open_and_is_linked_as_a_new_instruct
     assert unblock.off_topic("Please add a changelog entry for the web app", ask)
     assert unblock.off_topic("fix the flaky cache test first", restart)
     assert unblock.off_topic("From now on, keep the release notes under twenty lines.", box)
+
+
+def test_a_review_that_covers_no_commit_is_told_ttp_checks_has_no_target(env):
+    """A review of an external artifact (no covered head, no published head) gets the no-commit line;
+    a review of a commit and a review of an external change do not; kind-review.md says the same."""
+    import json as _json
+    from ttp import extchange
+    from ttp.prompts import worker_task
+    p = make(env)
+    mark = "This review covers no commit, so `ttp checks`"
+
+    def prompt(tid):
+        return worker_task(p, p.db.task(tid), str(p.root), None)
+
+    art = p.db.add_task("review the report", "Re-hash the manifest (sha256 in manifest.json) and rerun the eval.",
+                        kind="review", tier="light", origin="user")
+    text = prompt(art)
+    assert mark in text and "missing or changed fails" in text and "never check_only" in text
+    head = subprocess.run(["git", "-C", str(p.root), "rev-parse", "HEAD"], capture_output=True, text=True,
+                          check=True).stdout.strip()
+    code = p.db.add_task("review it", f"Review commit {head}.", kind="review", tier="light", origin="user")
+    assert mark not in prompt(code)
+    ext = p.db.add_task("review ext", "Review the published change.", kind="review", tier="light", origin="user")
+    p.db.x("UPDATE tasks SET labels=? WHERE id=?", (_json.dumps([extchange.HEAD_LABEL + "a" * 40]), ext))
+    assert mark not in prompt(ext)
+    # Other kinds never get it.
+    work = p.db.add_task("do it", "s", kind="work", tier="light", origin="user")
+    assert mark not in prompt(work)
+    review = " ".join((RUNTIME.parent / "template" / "prompts" / "kind-review.md").read_text().split())
+    assert "A review that covers no commit" in review and "has no `ttp checks` target" in review
+    assert "is a `substantive` failure" in review
