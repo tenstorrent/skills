@@ -669,6 +669,51 @@ def test_a_mute_with_an_end_when_probe_ends_on_its_pass_and_reports_a_broken_pro
 
 
 
+def test_a_mute_whose_match_names_one_open_task_with_a_probe_takes_it_as_its_owner(env):
+    p = make(env)
+    from ttp import screen as scr
+    from ttp import throughmute as tm
+    # A queued task with a start_when probe: a throughput-class mute with no stored owner whose
+    # match names exactly this task takes it as its owner, so the review shows no PROBLEM line.
+    tid = p.db.add_task("held on the device", "s", status="queued",
+                         labels=["start_when:test -e flag", "deferred_since:0"])
+    scr.mute(p.db, "daemon:progress", f"#{tid} made no progress", 12)
+    scr.count_muted(p.db, "daemon:progress", f"#{tid}: no progress", "normal")
+    [line] = [x for x in tm.review_lines(p.db) if x.startswith("daemon:progress")]
+    assert f"owner task #{tid}" in line and "PROBLEM" not in line, line
+    # The same mute once the task is done: the existing owner-done PROBLEM takes over.
+    p.db.update_task(tid, status="done")
+    [line] = [x for x in tm.review_lines(p.db) if x.startswith("daemon:progress")]
+    assert f"PROBLEM: its owner task #{tid} is done" in line, line
+
+
+def test_a_match_named_owner_does_not_replace_a_stored_one_and_needs_exactly_one_live_task(env):
+    p = make(env)
+    from ttp import screen as scr
+    from ttp import throughmute as tm
+    # A stored owner is not replaced by the match: once it goes terminal the owner-done PROBLEM
+    # fires even though the match names another open task.
+    a = p.db.add_task("named by the match", "s", status="queued")
+    b = p.db.add_task("stored owner", "s", status="queued")
+    vet = tm.vet(p.db, "daemon:wait_stale", "waiting", f"#{b} owns the fix", None)
+    scr.mute(p.db, "daemon:wait_stale", f"#{a} waits", 12, throughput=vet)
+    scr.count_muted(p.db, "daemon:wait_stale", "waited long", "normal")
+    p.db.update_task(b, status="done")
+    [line] = [x for x in tm.review_lines(p.db) if x.startswith("daemon:wait_stale")]
+    assert f"PROBLEM: its owner task #{b} is done" in line, line
+    # A match naming two tasks is no owner: the mute stays ownerless.
+    scr.mute(p.db, "daemon:job_underuse", f"#{a} and #{b}", 12)
+    scr.count_muted(p.db, "daemon:job_underuse", "under-used", "normal")
+    [line] = [x for x in tm.review_lines(p.db) if x.startswith("daemon:job_underuse")]
+    assert "PROBLEM: throughput-class with no owner" in line, line
+    p.db.update_task(a, status="done")
+    # A match naming a terminal task keeps the owner-done PROBLEM through the match too.
+    scr.mute(p.db, "daemon:progress", f"#{a} stalled", 12)
+    scr.count_muted(p.db, "daemon:progress", "stalled", "normal")
+    [line] = [x for x in tm.review_lines(p.db) if "stalled" in x]
+    assert f"PROBLEM: its owner task #{a} is done" in line, line
+
+
 def test_mute_escalates_once_when_a_muted_condition_persists(env):
     p = make(env)
     from ttp import coordinator as coord

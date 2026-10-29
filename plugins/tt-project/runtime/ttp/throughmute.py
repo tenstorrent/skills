@@ -71,14 +71,35 @@ def marked(m: dict) -> bool:
     return bool(m.get("throughput")) or is_class(m.get("source"), m.get("match"))
 
 
-def open_task(db: Any, why: str) -> int | None:
+def open_task(db, why):
     """The first task `why` names (#<id>) that exists and has not finished; None when none does."""
     from .db import TERMINAL_TASK_STATES
-    for tid in dict.fromkeys(int(x) for x in TASK_RE.findall(why or "")):
+    for tid in named_tasks(why):
         row = db.one("SELECT status FROM tasks WHERE id=?", (tid,))
         if row and row["status"] not in TERMINAL_TASK_STATES:
             return tid
     return None
+
+
+def named_tasks(text):
+    """Every task id `text` names (#<id>), deduped, in order; open_task picks the first open one."""
+    return [int(x) for x in dict.fromkeys(TASK_RE.findall(str(text or "")))]
+
+
+def match_owner(db, match):
+    """The owner a mute's `match` itself names: exactly one existing task id, terminal ones included
+    (the existing owner-done PROBLEM in review_lines covers it once the task ends), with its
+    `start_when` probe as its probe. `None` when the match names no or several tasks, or a task
+    that does not exist. A stored owner is never overridden; this only fills an ownerless mute."""
+    from .db import deferral
+    ids = named_tasks(match)
+    if len(ids) != 1:
+        return None
+    row = db.one("SELECT status, labels FROM tasks WHERE id=?", (ids[0],))
+    if row is None:
+        return None
+    probe = deferral(row).get("when")
+    return {"task": ids[0], "probe": probe} if probe else {"task": ids[0]}
 
 
 def vet(db: Any, source: Any, match: Any, why: Any, end_when: Any, cfg: dict | None = None,
@@ -129,8 +150,9 @@ def cap_note(m: dict, hours: Any) -> str:
             f"{asked:g}; renew it then with fresh evidence if its owner still works on it")
 
 
-def owner_text(m: dict) -> str:
-    o = (m.get("throughput") or {}).get("owner") or {}
+def owner_text(m: dict, owner: dict | None = None) -> str:
+    """The mute's owner as shown in review lines; `owner` overrides the stored one (a match-derived owner)."""
+    o = owner if owner is not None else (m.get("throughput") or {}).get("owner") or {}
     if "task" in o:
         return f"task #{o['task']}"
     if "probe" in o:
@@ -181,6 +203,8 @@ def review_lines(db: Any, now: float | None = None, where: Any = None) -> list[s
     for m in mutes(db, now):
         cls = marked(m)
         o = (m.get("throughput") or {}).get("owner") or {}
+        if cls and not o:
+            o = match_owner(db, m.get("match")) or {}   # the match itself may name its owner task
         problem = ""
         if cls and "task" in o:
             row = db.one("SELECT status FROM tasks WHERE id=?", (int(o["task"]),))
@@ -192,7 +216,7 @@ def review_lines(db: Any, now: float | None = None, where: Any = None) -> list[s
         first = m.get("first_seen") or min((float(c["first_at"]) for c in (m.get("conds") or {}).values()
                                             if c.get("first_at") is not None), default=None)
         out.append(f"{m['source']} {str(m['match'])[:60]!r}{' (throughput)' if cls else ''}: {int(m['count'])} "
-                   f"matched, first seen {_when(first, where)}, owner {owner_text(m)}, ends in "
+                   f"matched, first seen {_when(first, where)}, owner {owner_text(m, o)}, ends in "
                    f"{max(0.0, (float(m['until']) - now) / 3600):.1f} h" + (rate_text(m, now) if cls else "")
                    + (f"; {problem}" if problem else ""))
     return out
