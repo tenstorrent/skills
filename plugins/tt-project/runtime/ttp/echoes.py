@@ -199,7 +199,10 @@ def scan(p, now: float | None = None) -> list[dict]:
 def digest_lines(p, now: float | None = None) -> list[str]:
     """The digest's Retired-rule echoes section, at most SECTION_LINES lines; [] when nothing echoes. A
     hit already shown in an earlier turn is marked. Never posts, wakes or holds anything."""
-    hits = scan(p, now)
+    try:
+        hits = scan(p, now)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):   # a notice never fails the turn
+        return []
     db = p.db
     turn = db.kv("last_coordinator_turn", 0) or 0
     old = db.kv(SEEN_KEY, {}) or {}

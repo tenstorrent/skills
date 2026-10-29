@@ -363,6 +363,19 @@ prolonged whole-box outage.
   that added neither that nor an `upstream:` task, and gave no `correction #<id>: <why>` in its
   summary, gets one Course check line in the next digest. The daily review's efficiency audit lists
   each correction of the last 24 h with its class fix task, or none.
+- Retired-rule echoes: when a `charter_update` replaces text (`quote`, `replaces`), a `memory_add`
+  `supersedes` entries (or `ttp memory --supersedes`) or a user Correction names a wrong value in
+  prose, the daemon keeps the retired text's distinctive phrases (quoted and backticked spans, config
+  keys and identifiers, its first sentence; a phrase the new text keeps is left out) for 30 days. Each
+  coordinator turn it searches, model-free and case-insensitively, live memory entries, charter
+  sections, schedules (command, precheck, heal check, prompt, description), open tasks' specs and
+  `start_when` probes and config values, and lists the hits in a `Retired-rule echoes` digest section
+  (place, matching line, which retirement; at most 10 lines; a hit still there a turn later is marked
+  `still here`). The replacing text and the archives are not searched; a Correction's phrase right
+  after a negation ("never ...") is no hit. The coordinator fixes each in that turn (memory_forget or
+  `supersedes`, charter_update `quote`, schedule_set, task_update, config_set). It is a notice: no
+  event, wake, hold or model call of its own. A task whose spec quotes the old rule to remove it is
+  listed too.
 - Progress and stall check: each minute the daemon checks, without a model, that work keeps yielding
   results (a task done, a worker hand-off, a driver's `result` report). It judges only work that has
   run. A `no_progress` event names a task with a worker run running, a resource running worker runs
