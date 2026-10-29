@@ -248,11 +248,22 @@ def _holder_alive(h: dict, owner: str, projects: dict) -> bool | None:
     base = projects.get(lbl["project"] or (owner if owner != "shared" else ""))
     if not base:
         return None   # no run of a project here to judge it through
-    from .project import Project
-    try:
-        run = Project(base).db.one("SELECT pid, status, dir, boot_id FROM runs WHERE id=?", (int(lbl["run"]),))
-    except Exception:
-        run = None
+    from . import globalcap
+    db, run = Path(base) / "state" / "project.db", None
+    if db.is_file():   # another project's state: read only, never through its DB (that migrates it)
+        try:
+            conn = globalcap.connect_ro(db)
+        except Exception:
+            conn = None
+        if conn is not None:
+            try:
+                row = conn.execute("SELECT pid, status, dir, boot_id FROM runs WHERE id=?",
+                                   (int(lbl["run"]),)).fetchone()
+                run = dict(zip(("pid", "status", "dir", "boot_id"), row)) if row else None
+            except Exception:
+                run = None
+            finally:
+                conn.close()
     return locks._through_run(h, lbl, run)[0]
 
 

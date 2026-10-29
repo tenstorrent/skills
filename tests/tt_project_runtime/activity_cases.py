@@ -204,3 +204,41 @@ def test_machines_activity_judges_an_unseen_foreign_holder_through_its_run(env, 
         assert h["alive"] is True, h   # a visible pid is judged as before
     finally:
         held.close()
+
+
+def test_machines_activity_reads_another_projects_run_record_read_only(env, tmp_path, monkeypatch):
+    """An unseen holder in another project's lock is judged through that project's run record, read
+    without writing a byte of its project.db: no WAL switch, no schema or migrations, no -wal/-shm."""
+    from ttp import activity, hold, locks
+    from ttp import machines as mm
+    monkeypatch.setattr(locks, "_PROC", str(tmp_path / "no-proc"))   # nothing of its PID namespace is visible
+    make(env)
+    q = _second_project(env)
+    t = q.db.add_task("holder", "s", kind="work", origin="user")
+    mm.add("box-a")
+    rd = _foreign_run(q, t, 77)
+    holder = f"task #{t} (run 77), detached jobs"
+    hold._write(rd, {"task": str(t), "run": "77", "state": "holding", "keeper": 4242, "jobs": []})
+    (rd / hold.BEAT).touch()   # a fresh beat: the keeper lives
+    held = _held_build_lock(q, "box-a-device", holder)
+    db = q.state / "project.db"
+    q.db.close()
+    conn = sqlite3.connect(db)
+    conn.execute("PRAGMA journal_mode=DELETE")   # a database nobody has open: any writer would show
+    conn.close()
+    try:
+        _label(held, {"holder": holder, "pid": 4242, "node": os.uname().nodename, "pidns": "pid:[999]",
+                      "via": "keeper", "taker_pid": 9})
+        before = db.read_bytes()
+        view = activity.machine_view("box-a", time.time() - 60)
+        h = next(h for h in view["holders"] if h["resource"] == "box-a-device")
+        assert h["where"] == "other" and h["alive"] is True, h   # judged through the other project's run
+        assert db.read_bytes() == before, "reading another project's run record wrote its project.db"
+        assert not db.with_name("project.db-wal").exists() and not db.with_name("project.db-shm").exists()
+        conn = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True)
+        try:
+            assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        finally:
+            conn.close()
+    finally:
+        held.close()
