@@ -50,7 +50,8 @@ for their result outside the queue, keeping its arrival time; `done` ends any wa
 pass makes the run needless, and `stop` ends it when the task the checks belong to ended.
 
 Each slot taken is logged in the taker's project state (record_wait: WAITS_LOG, one synced JSON line
-with the project, task, priority, queued_at and granted_at); `ttp status` shows that project's median
+with the project, task, priority, queued_at and granted_at, and "cap": the project cap in force at
+the grant (checklane.project_cap) when the taker held a project lane); `ttp status` shows that project's median
 and p90 wait over the last 24 h (wait_line). Each grant is also logged host-wide (record_grant: GRANTS_LOG
 under ~/.tt-project, readable by every run), and a grant after a wait of more than GRANT_TELL_S from its
 arrival (queued here, or inherited by a relaunch) says its priority, the obligations behind a boost and
@@ -363,7 +364,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             since: float | None = None, project_name: str | None = None,
             priority: int | None = None, same: str = "", done: Callable[[], bool] | None = None,
             stop: Callable[[], str] | None = None, state: Path | None = None,
-            owns: list[str] | tuple = ()) -> Slot | None:
+            owns: list[str] | tuple = (), cap: int | None = None) -> Slot | None:
     """Take a host-wide checks slot, waiting while all are held. Waiters take turns by project
     (`project_name`; none form their own group), within one by task priority (`priority`, 1 first;
     OBLIGATION_PRIORITY before it, its ticket marked OBLIGATION_MARK; none last), then arrival (locks.fair_order),
@@ -379,7 +380,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     true (their pass was recorded) ends any wait with no slot held, Slot(served=True); a reason from `stop()`
     ends it with Cancelled. Slots beyond the cap open while the host is lightly loaded (extra()).
     With `state` (a project's state directory) each slot taken is logged there (record_wait); every one is
-    logged host-wide (record_grant). `owns`: the ids behind a boost to OBLIGATION_PRIORITY (task_rank).
+    logged host-wide (record_grant); `cap` (the project cap the run's lane was held under) goes in
+    the project's record. `owns`: the ids behind a boost to OBLIGATION_PRIORITY (task_rank).
     A slot taken more than GRANT_TELL_S after `since` is told with its priority and arrival (grant_line),
     also when a relaunch that inherited `since` takes it at once."""
     n = limit()
@@ -393,7 +395,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
         if f:
             locks.mark_served(slot_dir(), RESOURCE, project_name)
             locks.mark_turn(slot_dir(), RESOURCE, None)
-            _granted(tell, state, project_name, priority, owns, since)
+            _granted(tell, state, project_name, priority, owns, since, cap=cap)
             return Slot(f)
         ticket = locks.enqueue(slot_dir(), RESOURCE, queued_as, since, group=project_name, priority=priority)
     except OSError as e:
@@ -433,7 +435,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             if f:
                 locks.mark_served(slot_dir(), RESOURCE, project_name)
                 locks.mark_turn(slot_dir(), RESOURCE, ticket)
-                _granted(tell, state, project_name, priority, owns, since, bool(told))
+                _granted(tell, state, project_name, priority, owns, since, bool(told), cap)
                 return Slot(f)
             if time.time() - told >= TELL_S:
                 if tell and ticket is not None:
@@ -472,10 +474,11 @@ def grant_line(priority: int | None, owns, since: float, now: float | None = Non
             f"(priority {prio}{owner}, arrived {at})")
 
 
-def _granted(tell, state, project_name, priority, owns, since: float, told: bool = False) -> None:
+def _granted(tell, state, project_name, priority, owns, since: float, told: bool = False,
+             cap: int | None = None) -> None:
     """Log a slot taken (record_wait) and tell it when it waited, here or before a relaunch."""
     now = time.time()
-    record_wait(state, project_name, priority, since, now, owns=owns)
+    record_wait(state, project_name, priority, since, now, owns=owns, cap=cap)
     if tell and (told or now - since > GRANT_TELL_S):
         tell(grant_line(priority, owns, since, now))
 
@@ -563,14 +566,18 @@ WAITS_WINDOW_S = 24 * 3600
 
 
 def record_wait(state: Path | None, project_name: str | None, priority: int | None, queued_at: float,
-                granted_at: float, slot: str = "queue", owns: list[str] | tuple = ()) -> None:
+                granted_at: float, slot: str = "queue", owns: list[str] | tuple = (),
+                cap: int | None = None) -> None:
     """Append one slot wait to `state`/WAITS_LOG and sync it, and the grant to the host-wide log
     (record_grant). Never raises: a log that cannot be written must not cost the checks their slot.
-    No `state`: only the host-wide line is logged."""
+    No `state`: only the host-wide line is logged. `cap`: the project cap in force (checklane.project_cap,
+    0: none), stored as "cap" so throughput judges the wait by it; None (no project lane): no field."""
     task = os.environ.get("TTP_TASK") or ""
     rec = {"project": project_name, "task": int(task) if task.isdigit() else None,
            "run": os.environ.get("TTP_RUN_ID") or None, "priority": priority, "slot": slot,
            "queued_at": round(queued_at, 3), "granted_at": round(granted_at, 3)}
+    if cap is not None:
+        rec["cap"] = int(cap)
     if state is not None:
         _append(Path(state), WAITS_LOG, WAITS_OLD, WAITS_LOCK, WAITS_MAX_BYTES, rec)
     record_grant(rec, owns)

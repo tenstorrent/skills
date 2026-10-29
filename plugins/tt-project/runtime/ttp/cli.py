@@ -3686,7 +3686,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         slot = checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell, waiting,
                                 left, arrived,
                                 p.name if p else None, prio, same, done, stop,
-                                p.state if p else None, owns)
+                                p.state if p else None, owns, cap=checklane.project_cap(cfg))
         if slot is None or slot.served:
             suite.close()
             return slot

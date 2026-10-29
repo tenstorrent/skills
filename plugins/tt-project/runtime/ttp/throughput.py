@@ -43,8 +43,9 @@ to its first run, or to now for one still queued:
   project settings, reported, never raised; a wait is at the limit only when checkcap's waits log has it
   queued, [queued, granted), while the project's recorded checks runs (checkwall) were at the cap in
   force then: the most of them that ran at once for SUSTAIN_S in all while the queue stayed non-empty
-  (a shorter peak is an urgent run past the cap), at most
-  checklane.project_cap, as no record keeps the cap's history; no per-repository run record exists;
+  (a shorter peak is an urgent run past the cap), at most checklane.project_cap; a record that stores
+  the cap in force at its grant ("cap", record_wait) is judged by that instead; no per-repository run
+  record exists;
   `serialized` when they ran one at a time back to back, each start and the grant within SERIAL_S of a
   run's end, a queue served one run at a time rather than the cap), own_job (its own detached job or checks,
   or a retry_when on its own driver: no limit), the resource rule above only with a dispatch hold recorded
@@ -370,11 +371,14 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                   (t0 - DAY,)):
         slot_ev.setdefault(e["task"], []).append((float(e["ts"]), slot_limit(e["text"] or "")))
     slot_log: dict[int, list[tuple[float, float]]] = {}
+    slot_cap: dict[tuple[int, float, float], int] = {}   # the cap in force a record stored at its grant
     try:
         from . import checkcap
         for r in checkcap.wait_records(Path(db.path).parent, now, now - t0 + DAY):
             if isinstance(r.get("task"), int):
                 slot_log.setdefault(r["task"], []).append((r["queued_at"], r["granted_at"]))
+                if isinstance(r.get("cap"), int) and not isinstance(r["cap"], bool) and r["cap"] >= 0:
+                    slot_cap[(r["task"], r["queued_at"], r["granted_at"])] = r["cap"]
     except Exception:
         pass
     try:
@@ -413,18 +417,21 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
         at its grant): "at_limit" when the project's recorded checks runs (checkwall) reached the cap in
         force then, the most of them that ran at once for SUSTAIN_S in all while the queue stayed non-empty
         (one busy period; a shorter peak is an urgent run past the cap),
-        at most checklane.project_cap (no record keeps the cap's history: a cap raised since then is not
-        today's); "serialized" when they ran one at a time back to back, each start and the grant within
+        at most checklane.project_cap (a cap raised since then is not today's); a record that stored the
+        cap in force at its grant ("cap", 0: none) is judged by that, not the estimate; "serialized" when they ran one at a time back to back, each start and the grant within
         SERIAL_S of a run's end (a queue served one run at a time, not the cap); else "idle". No grant
         record, or one granted at once: not at the limit."""
         serial = False
         for q, g in slot_log.get(task, ()):
             a, b = max(q, w0), min(g, w1)
-            if not cap_n or b <= a:
+            cap = slot_cap.get((task, q, g), cap_n)
+            if not cap or b <= a:
                 continue
-            seen = max((ck_held(x0, x1) for x0, x1 in busy if x0 <= q and g <= x1), default=0)
+            if (task, q, g) not in slot_cap:
+                seen = max((ck_held(x0, x1) for x0, x1 in busy if x0 <= q and g <= x1), default=0)
+                cap = min(cap, seen) if seen >= 2 else cap
             k = ck_peak(a, b)
-            if k >= (min(cap_n, seen) if seen >= 2 else cap_n):
+            if k >= cap:
                 return "at_limit"
             ends = [e for _, e in ck_runs]
             serial = serial or (k <= 1 and all(any(abs(x - e) <= SERIAL_S for e in ends)

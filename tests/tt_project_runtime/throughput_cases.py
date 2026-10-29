@@ -881,3 +881,62 @@ def test_throughput_checks_wait_is_judged_at_the_cap_then_and_a_one_at_a_time_qu
     _tp_slot_wait(p, monkeypatch, peak, w4, w4 + 500)
     ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
     assert (ck["count"], ck["at_limit"], ck["serialized"], ck["idle"]) == (4, 2, 1, 1), ck
+
+
+def _tp_slot_grant(p, monkeypatch, tmp_path, task, queued_at, granted_at):
+    """A checks slot wait of `task` taken by `ttp checks`' own grant path (cli._checks_slot: the project
+    lane, then the host-wide slot), arrived at `queued_at` and granted at `granted_at`; the waits-log record."""
+    from ttp import checkcap, cli
+    run_dir = tmp_path / f"grant-{task}-{int(queued_at)}"
+    run_dir.mkdir()
+    with monkeypatch.context() as m:
+        m.setenv("TTP_TASK", str(task))
+        m.setenv("TTP_RUN_DIR", str(run_dir))
+        m.setenv("TTP_CHECKS_HOST_MAX", "8")
+        m.setattr(time, "time", lambda: granted_at)
+        slot = cli._checks_slot(p, run_dir, io.StringIO(), "f" * 40, True, arrived=queued_at, cmds=["true"],
+                                top=str(p.base))
+        assert slot
+        slot.close()
+    return json.loads((Path(p.db.path).parent / checkcap.WAITS_LOG).read_text().splitlines()[-1])
+
+
+def test_throughput_judges_a_checks_wait_by_the_cap_its_record_stored_else_the_estimate(
+        env, monkeypatch, tmp_path):
+    """#4490: `ttp checks`' grant stores the project cap in force (checklane.project_cap) in its waits-log
+    record, and throughput judges the wait by it. Three runs held for long under a stored cap of 4: idle,
+    where the estimate (the most held at once in the busy period, 3) says at the limit; an older record
+    with no cap and the same runs keeps the estimate. Two runs under a stored cap of 2 while three ran
+    earlier in the busy period: at the limit, where the estimate (3) says idle."""
+    from ttp import throughput
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.set_config("checks.test_project_max", 4)
+    d, now = Daemon(p.base), time.time()
+    w1 = now - 6 * 3600   # three runs at once under a stored cap of 4
+    roomy = _tp_checks_requeue(p, d, monkeypatch, tmp_path, "below the stored cap", w1, 999)
+    for s0 in (w1 - 60, w1 - 50, w1 - 40):
+        _tp_checks_run(p, monkeypatch, s0, 1200)
+    rec = _tp_slot_grant(p, monkeypatch, tmp_path, roomy, w1, w1 + 700)
+    assert (rec["task"], rec["cap"], rec["queued_at"], rec["granted_at"]) == (roomy, 4, round(w1, 3), round(w1 + 700, 3))
+    w2 = now - 4 * 3600   # the same runs, an older record without the cap: the estimate
+    old = _tp_checks_requeue(p, d, monkeypatch, tmp_path, "an old record", w2, 999)
+    for s0 in (w2 - 60, w2 - 50, w2 - 40):
+        _tp_checks_run(p, monkeypatch, s0, 1200)
+    _tp_slot_wait(p, monkeypatch, old, w2, w2 + 700)
+    ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
+    assert (ck["count"], ck["at_limit"], ck["idle"]) == (2, 1, 1), ck
+    # Two runs under the then-cap of 2, after three held 720 s earlier in the same busy period.
+    w3 = now - 2 * 3600
+    other = _tp_task(p, "earlier waiter", w3 - 3600)
+    _tp_slot_wait(p, monkeypatch, other, w3 - 700, w3 + 50)
+    capped = _tp_checks_requeue(p, d, monkeypatch, tmp_path, "at the stored cap", w3, 999)
+    for s0 in (w3 - 800, w3 - 790, w3 - 780):
+        _tp_checks_run(p, monkeypatch, s0, 820 - (s0 - (w3 - 800)))
+    for s0 in (w3 + 30, w3 + 35):
+        _tp_checks_run(p, monkeypatch, s0, 1500)
+    p.set_config("checks.test_project_max", 2)
+    assert _tp_slot_grant(p, monkeypatch, tmp_path, capped, w3 + 40, w3 + 600)["cap"] == 2
+    p.set_config("checks.test_project_max", 4)
+    ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
+    assert (ck["count"], ck["at_limit"], ck["idle"]) == (3, 2, 1), ck
