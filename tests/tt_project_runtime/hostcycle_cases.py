@@ -646,7 +646,7 @@ def test_a_waiting_task_whose_job_held_a_device_at_an_abrupt_reboot_is_blocked_n
     t = p.db.task(tid)
     assert t["status"] == "blocked" and "held board" in t["blocked_reason"], dict(t)
     ev = p.db.q("SELECT severity FROM events WHERE kind='task_blocked' AND task=?", (tid,))
-    assert ev and ev[-1]["severity"] == "high"
+    assert ev and ev[-1]["severity"] == "normal"   # high only for an urgent task or an ask (pagesev.raise_blocked)
     # The coordinator's requeue is its word that the attempt was not implicated: the next reboot
     # without a hold wakes it as before.
     assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "queued"}]) == []
