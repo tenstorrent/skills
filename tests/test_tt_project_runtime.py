@@ -30441,7 +30441,7 @@ def test_the_daemon_queues_the_review_of_a_finished_code_task(env):
     assert len(reviews) == 1, "no review queued"
     rev = reviews[0]
     assert rev["title"] == f"Review #{tid}: small fix" and rev["origin"] == "daemon" and rev["tier"] == "light"
-    assert rev["priority"] == 2 and rev["budget_usd"] == p.config()["budget"]["task_default_usd"]["light"]
+    assert rev["priority"] == 3 and rev["budget_usd"] == p.config()["budget"]["task_default_usd"]["light"]
     head = _git_out(p.root, "rev-parse", "--short=12", branch)
     assert branch in rev["spec"] and head in rev["spec"] and "spec of small fix" in rev["spec"]
     assert "small fix works" in rev["spec"] and "Review only" in rev["spec"] and "ttp push" not in rev["spec"]

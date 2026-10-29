@@ -438,6 +438,9 @@ prolonged whole-box outage.
   first), then priority 1 first, then the oldest. Gates, locks, deferrals and `max_parallel` still
   apply, and no running task is stopped. A task waiting on its own detached job holds no worker
   slot: only live model runs count against `max_parallel`.
+- Review hop priority: a daemon-queued `Review #N`, `Fix review #N` or `Re-review #N` takes the most urgent
+  priority of the task it covers and its chain's root, and follows when task_update changes theirs, unless
+  its own priority was set with task_update.
 - Urgent slot wait (model-free): an obligation owner or priority-1 task that dispatch holds only
   because every worker slot is taken, for `coordinator.urgent_slot_wait_min` (15; 0 turns it off),
   raises one observation (high for an obligation owner) naming it and the running tasks holding the

@@ -35,6 +35,7 @@ from pathlib import Path
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import ackwait
 from . import lanewait
+from . import chainprio
 from . import churnwatch
 from . import alerts
 from . import anchors
@@ -10526,7 +10527,7 @@ class Daemon:
                  "commits and branches as they are.",
                  "Return the verdict and findings."]
         tier = "light" if task.get("tier") == "light" else "standard"
-        rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=2, origin="daemon",
+        rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=chainprio.of(db, task), origin="daemon",
                           budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
                           depends_on=[task["id"]], labels=[f"auto_review:{task['id']}", push.REVIEW_ONLY_LABEL],
                           **pin_of(task))
@@ -10905,7 +10906,7 @@ class Daemon:
             + ([PRECHECK_LABEL + checks.name] if checks else []) + ([push.REVIEW_ONLY_LABEL] if elsewhere or off or never or ext else []) + ([push.LAND_LABEL] if lands else []) \
             + ([f"pr_branch:{elsewhere}"] if own_step else []) + reviewhold.labels(full, held) \
             + ([extchange.HEAD_LABEL + ext["head"]] if ext else [])
-        rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=2, origin="daemon",
+        rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=chainprio.of(db, task), origin="daemon",
                           budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
                           depends_on=[task["id"]], labels=labels, **pin_of(task))
         log(self.p, f"task {task['id']}: queued review #{rid} ({tier})" + (
@@ -11364,7 +11365,7 @@ class Daemon:
                 fbranch = (prfix or hop)["branch"] or f"ttp/t{fid}-{worktree.slug((prfix or hop)['title'])}"
             else:
                 fid = db.add_task(f"Fix review #{review['id']}: {base_title}"[:200], "", kind="code", tier=tier,
-                                  tier_source=tsrc, priority=review["priority"], origin="daemon",
+                                  tier_source=tsrc, priority=chainprio.of(db, code, review), origin="daemon",
                                   budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
                                   labels=[f"continues:{code['id']}", f"review_fix:{review['id']}"], **pin_of(code))
                 fbranch = f"ttp/t{fid}-{worktree.slug(base_title)}"
@@ -11430,7 +11431,7 @@ class Daemon:
                                   f"#{code['id']}'s worktree), use #{fid}'s branch and worktree.",
                                   *([step] if step else []),
                                   f"The first review's spec (#{first['id']}):\n{first_spec}"]),
-                              kind="review", tier=rtier, priority=review["priority"], origin="daemon",
+                              kind="review", tier=rtier, priority=chainprio.of(db, db.task(fid), review), origin="daemon",
                               budget_usd=float(cfg["budget"]["task_default_usd"].get(rtier, 8.0)),
                               depends_on=[fid], labels=[f"auto_review:{fid}", f"continues:{review['id']}",
                                                         f"{FIX_BASE_LABEL}{head}"]
@@ -11484,7 +11485,7 @@ class Daemon:
         where = f"repo {ch['repo']}, branch {ch['branch']}"
         with db.tx():
             fid = db.add_task(f"Fix review #{review['id']}: {base_title}"[:200], "", kind="code", tier=tier,
-                              tier_source=tsrc, priority=review["priority"], origin="daemon",
+                              tier_source=tsrc, priority=chainprio.of(db, code, review), origin="daemon",
                               budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
                               labels=[f"continues:{code['id']}", f"review_fix:{review['id']}"], **pin_of(code))
             rid = db.add_task(
@@ -11497,7 +11498,7 @@ class Daemon:
                     f"done): check each finding against `git diff {ch['head']}..<new head>` first, then what "
                     f"the fix could regress.", extchange.NO_PUSH_LINE, extchange.REVIEW_ONLY,
                     f"The first review's spec (#{first['id']}):\n{(first.get('spec') or '')[:REVIEW_FIX_SPEC_CHARS]}"]),
-                kind="review", tier=rtier, priority=review["priority"], origin="daemon",
+                kind="review", tier=rtier, priority=chainprio.of(db, db.task(fid), review), origin="daemon",
                 budget_usd=float(cfg["budget"]["task_default_usd"].get(rtier, 8.0)),
                 depends_on=[fid], labels=[f"auto_review:{fid}", f"continues:{review['id']}", push.REVIEW_ONLY_LABEL],
                 **(pin_of(review) or pin_of(code)))

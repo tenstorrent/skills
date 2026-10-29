@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, cells, chaincap, chatset, checkspill, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, relay, responsibilities, restriction_audit, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, throughmute, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, cells, chaincap, chainprio, chatset, checkspill, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, relay, responsibilities, restriction_audit, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, throughmute, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -2186,6 +2186,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 spec = "\n\n".join(x for x in (spec, branch_line) if x)
                 if a.get("priority"):
                     upd["priority"] = int(a["priority"])
+                    # A review hop given a priority keeps it; its chain's changes no longer move it.
+                    if (marked := chainprio.set_labels(task, upd)) is not None:
+                        upd["labels"] = marked
                 if any(a.get(k) is not None for k in ("provider", "model", "effort", "pin_verify")):
                     if task["status"] == "running":
                         raise InfoRejection(f"task #{task['id']} is running: its provider, model, effort and pin verification change only "
@@ -2239,6 +2242,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if waits or anchors.without(labels) != labels:
                         upd["labels"] = anchors.without(labels) + ([waits] if waits else [])
                 db.update_task(task["id"], **upd)
+                if upd.get("priority") is not None and upd["priority"] != task["priority"] \
+                        and (moved := chainprio.follow(db, task["id"])):
+                    notes.append(f"task_update: #{task['id']} priority {upd['priority']}: its review hops follow ("
+                                 + ", ".join(f"#{i} p{o}->p{n}" for i, o, n in moved) + ")")
                 if lull:
                     notes.append(lull)
                 if as_deps:
