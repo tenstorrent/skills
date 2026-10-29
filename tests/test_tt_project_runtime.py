@@ -21749,6 +21749,7 @@ def test_a_shared_probe_run_is_kept_when_one_task_re_points_its_probe(env):
     for tid in (a, b):
         p.db.update_task(tid, not_before=time.time() + 3600)
     d.probe_waiting()
+    _probe_starts_done(d)
     run = d._probes[b]
     assert d._probes[a] is run
     d._drop_stale_probe(a, "exit 1")
