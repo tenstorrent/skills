@@ -50,9 +50,6 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 - `ttp say` replies "queued on this machine": the project is unreachable right now and the message
   is safe. It goes out by itself, in order and once, when the project is reachable. Tell the user;
   do not resend it.
-- A task waiting on a machine whose ssh host is down needs no poll loop of its own: the daemon
-  re-probes its `retry_when` at 15, 30, 60, then every 120 s, and once per down episode runs the
-  project's heal fix or raises one `host_down` event naming the machine and its recovery owner.
 - Alerts arrive in every attached chat. Replies arrive only in the chat that asked.
 - A repeated message id was already shown. Skip it.
 - The user asks what is running, costs, or blockers → `ttp status <name>`.

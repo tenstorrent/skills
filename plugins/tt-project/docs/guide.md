@@ -368,8 +368,12 @@ prolonged whole-box outage.
   streak check (`waiting.progress.stall_after`). A probe that waits on a down or paused resource the
   task itself is meant to fix (or whose holder waits on the task) is flagged "waits on what it fixes".
   A probe whose ssh host is confirmed down is re-probed at 15, 30, 60, then every 120 s (not
-  every few minutes), and once per down episode the project's heal fix runs or one `host_down`
-  event names the machine and its recovery owner; a worker writes no poll loop for it.
+  every few minutes), so a worker writes no poll loop for it. For a machines.json alias the ssh
+  target names, the daemon also acts once per down episode: a `recovery_owner` that is another
+  project gets one high note and nothing runs here; a pause on the machine or the fix's resource,
+  its lock held or an open machine change runs nothing (logged); else this project's heal check
+  with a fix runs at once (kicked again hourly while down); with none, one `host_down` event. See
+  the tt-project-harness self-healing reference.
   Each key wakes the coordinator once, again when its count or stuck time reaches `escalate_x` (2)
   times what it was at the last wake or after `rewake_h` (12) hours. A key that drops out of one
   check (between two runs) is not cleared and never wakes again as new: it clears only
