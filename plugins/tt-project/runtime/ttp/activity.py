@@ -104,6 +104,14 @@ def _held(path: Path) -> bool:
         return False
 
 
+def _own_pid(s: dict) -> bool:
+    """Whether a take's pid means a process to this one: seen in this PID namespace (a take from before
+    pidns was logged counts) and not a kernel thread here (a sandboxed taker's own pid 2 or 13 is one on
+    the host, alive for the whole boot)."""
+    from .locks import _pid_ns, kthread
+    return ("pidns" not in s or (s["pidns"] is not None and s["pidns"] == _pid_ns())) and not kthread(s["pid"])
+
+
 def spans(recs: list[dict], here: str | None = None) -> list[dict]:
     """Take and release (or job start and end) entries joined into one span each: kind lock or job,
     start, end (None while open), rc and state: ended, running or unknown (no end logged: a kill
@@ -132,7 +140,7 @@ def spans(recs: list[dict], here: str | None = None) -> list[dict]:
             s["state"] = "running" if s.get("host") == here and _held(Path(s["job_rc"]).with_suffix(".lock")) \
                 else "unknown"   # held, never by a pid another process may reuse
         elif s["kind"] == "lock" and s.get("host") == here and s.get("pid") and _same_boot(s.get("boot")) \
-                and _alive(int(s["pid"])):
+                and _own_pid(s) and _alive(int(s["pid"])):
             s["state"] = "running"
         else:
             s["state"] = "unknown"

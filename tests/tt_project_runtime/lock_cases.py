@@ -791,3 +791,96 @@ def test_a_runs_lock_passes_through_at_once_while_its_lineage_holds_the_resource
             r = lock(e, "--timeout", "2")
             assert r.returncode == 75 and "board is paused" in r.stderr and not ran.exists(), r
             coord.pause_resource(p, "board", False)
+
+
+def _fake_stat(proc, pid, flags):
+    (proc / str(pid)).mkdir(parents=True, exist_ok=True)
+    (proc / str(pid) / "stat").write_text(f"{pid} (some name) S 1 {pid} {pid} 0 -1 {flags} 0 0 0 0\n")
+
+
+def test_kthread_reads_the_pf_kthread_flag_and_is_false_when_it_cannot_tell(tmp_path):
+    from ttp import locks
+    _fake_stat(tmp_path, 2, 0x00208040)      # kthreadd
+    _fake_stat(tmp_path, 13, 0x00200000)
+    _fake_stat(tmp_path, 400, 0x00400100)    # a user process
+    assert locks.kthread(2, proc=str(tmp_path)) and locks.kthread(13, proc=str(tmp_path))
+    assert not locks.kthread(400, proc=str(tmp_path))
+    assert not locks.kthread(401, proc=str(tmp_path)) and not locks.kthread("x", proc=str(tmp_path))
+    (tmp_path / "5").mkdir()
+    (tmp_path / "5" / "stat").write_text("garbage")
+    assert not locks.kthread(5, proc=str(tmp_path))
+
+
+def test_a_take_in_its_runs_pid_namespace_names_itself_with_its_process_group(tmp_path, monkeypatch):
+    from ttp import locks
+    for k in ("TTP_PIDNS", "TTP_RUN_DIR"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(locks, "_pid_ns", lambda: "pid:[1]")
+    got = locks.taker({"TTP_PIDNS": "pid:[1]", "TTP_RUN_DIR": str(tmp_path)})
+    assert (got["pid"], got["pgid"], got["pidns"]) == (os.getpid(), os.getpgid(0), "pid:[1]")
+    assert "ns_pid" not in got and "owner_fallback" not in got
+    assert locks.taker({}) == got    # outside a run: the same
+
+
+def test_a_sandboxed_take_names_its_runs_agent_never_its_own_low_namespace_pid(tmp_path, monkeypatch):
+    from ttp import locks
+    (tmp_path / "child.pid").write_text("4321\ntoken\n")
+    monkeypatch.setattr(locks, "_pid_ns", lambda: "pid:[2]")   # a `ttp sandbox`'s namespace
+    monkeypatch.setattr(locks.os, "getpid", lambda: 13)
+    monkeypatch.setattr(locks, "_pgid", lambda pid: 1)
+    monkeypatch.setattr(locks, "kthread", lambda pid, proc="/proc": False)
+    got = locks.taker({"TTP_PIDNS": "pid:[1]", "TTP_RUN_DIR": str(tmp_path)})
+    assert (got["pid"], got["pgid"], got["pidns"]) == (4321, 4321, "pid:[1]")
+    assert (got["ns_pid"], got["ns_pidns"]) == (13, "pid:[2]")
+    # the label of a slot such a take holds says the same; without its run's namespace, its own
+    for run_env, want in (({"TTP_PIDNS": "pid:[1]", "TTP_RUN_DIR": str(tmp_path)}, (4321, "pid:[1]", 4321)),
+                          ({}, (13, "pid:[2]", 1))):
+        for k in ("TTP_PIDNS", "TTP_RUN_DIR"):
+            monkeypatch.delenv(k, raising=False)
+        for k, v in run_env.items():
+            monkeypatch.setenv(k, v)
+        f = locks.try_take([tmp_path / "r.0.lock"], "task #1 (run 2)", "cmd")
+        try:
+            lbl = json.loads((tmp_path / "r.0.lock").read_text())
+        finally:
+            f.close()
+        assert (lbl["pid"], lbl["pidns"], lbl["pgid"]) == want
+
+
+def test_a_take_whose_agent_is_a_kernel_thread_falls_back_to_itself_and_says_so(tmp_path, monkeypatch):
+    from ttp import locks
+    monkeypatch.setattr(locks, "_pid_ns", lambda: "pid:[2]")
+    monkeypatch.setattr(locks.os, "getpid", lambda: 13)
+    monkeypatch.setattr(locks, "_pgid", lambda pid: 1)
+    for agent, kthreads in (("2", set()), ("77", {77})):
+        (tmp_path / "child.pid").write_text(f"{agent}\n")
+        monkeypatch.setattr(locks, "kthread", lambda pid, proc="/proc", k=kthreads: int(pid) in k)
+        got = locks.taker({"TTP_PIDNS": "pid:[1]", "TTP_RUN_DIR": str(tmp_path)})
+        assert (got["pid"], got["pidns"], got["pgid"]) == (13, "pid:[2]", 1)
+        assert f"pid {agent} is a kernel thread" in got["owner_fallback"]
+    (tmp_path / "child.pid").write_text("junk\n")     # an unreadable record: itself, no claim
+    got = locks.taker({"TTP_PIDNS": "pid:[1]", "TTP_RUN_DIR": str(tmp_path)})
+    assert got["pid"] == 13 and "owner_fallback" not in got
+
+
+def test_a_held_label_naming_a_kernel_thread_is_holder_unverifiable_and_its_run_worker_judges(env, monkeypatch):
+    from ttp import locks
+    from ttp.runner import boot_id
+    p = make(env)
+    kt = 2 if os.getpid() != 2 else 3    # under `ttp sandbox` this test may be pid 2 itself
+    monkeypatch.setattr(locks, "kthread", lambda pid, proc="/proc": int(pid) == kt)
+    here = {"node": os.uname().nodename, "pidns": locks._pid_ns()}
+    tid = p.db.add_task("Holder", "s", kind="work", tier="light", origin="coordinator")
+    rid = p.db.x("INSERT INTO runs(task, role, started, status, pid, boot_id) VALUES(?, 'worker', ?, 'ok', 999999, ?)",
+                 (tid, time.time(), boot_id()))
+    lbl = f"task #{tid} (run {rid})"
+    bad = {"holder": lbl, **here, "pid": kt}
+    assert locks.pid_alive(bad) is None
+    assert locks._pid_note(bad) == f", pid {kt} is a kernel thread here: holder unverifiable"
+    good = {"holder": lbl, **here, "pid": os.getpid()}    # a valid label: unchanged
+    assert locks.pid_alive(good) is True and locks._pid_note(good) == f", pid {os.getpid()} alive"
+    note = locks._holder_note(bad, where=p)
+    assert f"holder unverifiable; pid 999999 gone (run {rid}'s worker)" in note, note
+    assert "stale" not in note      # its task is not done
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+    assert locks._holder_note(bad, where=p).endswith(f"; stale: task #{tid} is done")

@@ -76,7 +76,7 @@ def try_take(paths: list[Path], holder: str, what: str = "", key: str = "", extr
         f.seek(0)
         f.truncate()
         f.write(json.dumps({"holder": holder, "since": time.time(), "command": what[:300], **({"key": key} if key else {}),
-                            **(extra or {}), **_owner(os.getpid())}))
+                            **(extra or {}), **taker()}))
         f.flush()
         return f
     return None
@@ -113,6 +113,47 @@ def _owner(pid: int) -> dict:
     return {"pid": int(pid), "node": os.uname().nodename, "pidns": _pid_ns()}
 
 
+PF_KTHREAD = 0x00200000   # /proc/<pid>/stat flags: a kernel thread
+
+
+def kthread(pid, proc: str = "/proc") -> bool:
+    """Whether `pid` is a kernel thread in this process's /proc (PF_KTHREAD in its stat flags): it lives
+    for the whole boot, so it never names a lock's holder. False when it is gone or this cannot tell."""
+    try:
+        return bool(int(Path(f"{proc}/{int(pid)}/stat").read_text().rsplit(")", 1)[1].split()[6]) & PF_KTHREAD)
+    except (OSError, IndexError, ValueError, TypeError):
+        return False
+
+
+def _pgid(pid: int) -> int | None:
+    try:
+        return os.getpgid(pid)
+    except OSError:
+        return None
+
+
+def taker(env=None) -> dict:
+    """The fields a take gives the process that owns its hold (a slot label, the activity log): pid,
+    pgid, node and pidns. That is this process, except in a PID namespace other than its run's (TTP_PIDNS;
+    a `ttp sandbox`), where its own pid (often 2 or 13: a kernel thread's on the host) means nothing to a
+    reader there: it names the run's agent instead (child.pid in TTP_RUN_DIR, the leader of its own
+    process group) and keeps its own as ns_pid and ns_pidns. A candidate that is a kernel thread is never
+    named: the fields fall back to this process and say so in owner_fallback."""
+    env = os.environ if env is None else env
+    me = os.getpid()
+    out = {**_owner(me), "pgid": _pgid(me)}
+    run_ns = env.get("TTP_PIDNS")
+    if not run_ns or run_ns == out["pidns"] or not env.get("TTP_RUN_DIR"):
+        return out
+    try:
+        agent = int((Path(env["TTP_RUN_DIR"]) / "child.pid").read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return out
+    if agent <= 2 or kthread(agent):
+        return {**out, "owner_fallback": f"the run's agent pid {agent} is a kernel thread"}
+    return {**out, "pid": agent, "pgid": agent, "pidns": run_ns, "ns_pid": me, "ns_pidns": out["pidns"]}
+
+
 def job_fields(env=None) -> dict:
     """What a slot label adds for a taker inside a `ttp detach` job (TTP_DETACHED and the job's .rc in
     TTP_DETACH_RC): the job's name, its .rc and the pid `ttp detach` recorded for it (its wrapper's, from
@@ -144,10 +185,11 @@ def label_pid(f, pid: int) -> None:
     try:
         f.seek(0)
         h = json.loads(f.read() or "{}")
-        taker = h.get("pid")
+        taker = h.get("ns_pid") or h.get("pid")
+        h = {k: v for k, v in h.items() if k not in ("ns_pid", "ns_pidns", "owner_fallback")}   # the taker's
         f.seek(0)
         f.truncate()
-        f.write(json.dumps({**h, **_owner(pid), "via": "keeper",
+        f.write(json.dumps({**h, **_owner(pid), "pgid": _pgid(pid), "via": "keeper",
                             **({"taker_pid": taker} if taker and taker != pid else {})}))
         f.flush()
     except (OSError, ValueError, TypeError):
@@ -163,6 +205,8 @@ def _pid_note(h: dict) -> str:
         return ""
     if pid <= 0:
         return ""
+    if _judgeable(h) and kthread(pid):
+        return f", pid {pid} {UNVERIFIABLE}"
     return f", pid {pid}" + ((" alive" if _alive(pid) else " gone") if _judgeable(h) else "")
 
 
@@ -173,7 +217,10 @@ def pid_alive(h: dict) -> bool | None:
         pid = int(h.get("pid") or 0)
     except (TypeError, ValueError):
         return None
-    return _alive(pid) if pid > 0 and _judgeable(h) else None
+    return _alive(pid) if pid > 0 and _judgeable(h) and not kthread(pid) else None
+
+
+UNVERIFIABLE = "is a kernel thread here: holder unverifiable"   # a label from a taker in another PID namespace
 
 
 def _judgeable(h: dict) -> bool:
@@ -220,6 +267,9 @@ def _holder_note(h: dict, where=None) -> str:
     except Exception:
         run = task = None
     live = note.endswith(" alive")
+    if UNVERIFIABLE in note and run and int(run.get("pid") or 0) > 0:   # its run's worker says instead
+        worker, live = _worker_note(run, lbl["run"])
+        note += ";" + worker.removeprefix(",")
     if not note:
         wp = int(run.get("pid") or 0) if run else 0
         if wp > 0:
@@ -290,7 +340,7 @@ def try_take_shared(paths: list[Path], holder: str, what: str = "", extra: dict 
         lf = open(tmp, "a+")
         fcntl.flock(lf, fcntl.LOCK_EX)
         lf.write(json.dumps({"holder": holder + SHARED_MARK, "since": time.time(), "command": what[:300],
-                             **(extra or {}), **_owner(os.getpid())}))
+                             **(extra or {}), **taker()}))
         lf.flush()
         os.rename(tmp, d / name)
     except OSError:

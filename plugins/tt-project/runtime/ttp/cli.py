@@ -4452,7 +4452,8 @@ def cmd_lock(a) -> None:
         ids = [activity.new_id() for _ in ls]
         for aid, L in zip(ids, ls):
             activity.append(p.state, activity.base(p.name, ev="take", id=aid, resource=L["res"], mode=mode,
-                                                   cmd=activity.head(cmd), start=time.time(), pid=os.getpid(),
+                                                   cmd=activity.head(cmd), start=time.time(),
+                                                   **{k: v for k, v in lk.taker().items() if k != "node"},
                                                    boot=boot_id(), **({"disruptive": True} if a.disruptive else {}),
                                                    **({"job_rc": j} if (j := lk.job_fields().get("job_rc")) else {})))
         rc = 1

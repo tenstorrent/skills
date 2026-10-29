@@ -143,3 +143,20 @@ def test_spans_join_an_end_logged_before_its_start_and_read_a_job_rc_file_as_a_n
     a, b = activity.spans(recs, here="h")
     assert (a["state"], a["end"], a["rc"]) == ("ended", 20, 3)
     assert (b["state"], b["rc"]) == ("ended", 4)
+
+
+def test_an_open_take_whose_pid_is_a_kernel_thread_or_another_namespaces_is_unknown_not_running(monkeypatch):
+    from ttp import activity, locks
+    me, ns, b = os.getpid(), locks._pid_ns(), "b"
+    k1, k2 = [k for k in (2, 13, 14) if k != me][:2]   # under `ttp sandbox` this test may be pid 2 itself
+    monkeypatch.setattr(locks, "kthread", lambda pid, proc="/proc": int(pid) in (k1, k2))
+    monkeypatch.setattr(activity, "_same_boot", lambda boot: boot == "b")
+    recs = [{"ev": "take", "id": "old13", "host": "h", "start": 1, "pid": k2, "boot": b},   # logged before pidns
+            {"ev": "take", "id": "ns2", "host": "h", "start": 2, "pid": k1, "pidns": ns, "boot": b},
+            {"ev": "take", "id": "other", "host": "h", "start": 3, "pid": me, "pidns": "pid:[other]", "boot": b},
+            {"ev": "take", "id": "none", "host": "h", "start": 4, "pid": me, "pidns": None, "boot": b},
+            {"ev": "take", "id": "mine", "host": "h", "start": 5, "pid": me, "pidns": ns, "boot": b},
+            {"ev": "take", "id": "legacy", "host": "h", "start": 6, "pid": me, "boot": b}]
+    got = {s["id"]: s["state"] for s in activity.spans(recs, here="h")}
+    assert got == {"old13": "unknown", "ns2": "unknown", "other": "unknown", "none": "unknown",
+                   "mine": "running", "legacy": "running"}
