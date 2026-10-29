@@ -12,18 +12,18 @@ head). A branch counts while its task is open, or once done only while it finish
 of a successor carrying it on, a supersession), not merged into the base nor on the push branch by
 patch (landed.py), and its hand-off did not shelve or reject the change. An overlap gives one short
 line (warning) in task_add's result and the new task's line in the digest's open tasks, naming the
-most recent few tasks (then '+N more'), the shared paths (new files flagged) and the fix:
-`depends_on` an open task, `start_when landed:#<id>` a done one. A code worker's prompt lists the
+most recent few tasks (then '+N more') and the shared paths (new files flagged). A code worker's prompt lists the
 unlanded branches that touch what its spec names (prompt_block). Common files never count: the
 `overlap.ignore` globs (changelogs, changesets, manifests, `__init__.py`) and hubs, tracked files
 larger than `overlap.hub_bytes`, which most changes touch in passing, and the files the check
 commands (`delivery.push_checks`) name, which specs cite as the required suite. Folders are no
-paths. A shared file in a hot area, one a review failed on within reviewcap.AREA_WINDOW_S (its main
-file) with that change not landed, or a settled area's file, is more than a warning: task_add
-chains the new task after the newest open, unlanded task sharing it (chain), unless its spec has a
-`parallel: <why>` line. An open task that holds or waits for a device or machine (it may run for
+paths. A shared file alone never chains: the tasks run side by side and the conflict-fix path settles
+them at landing. task_add chains the new task (chain) only on a real build dependency: its spec names
+a file another open or unlanded task adds (not yet on the base branch), or a symbol (`name()` or a
+backticked identifier) found only on that task's branch. A `parallel: <why>` spec line still parses
+and is recorded, a no-op now. An open task that holds or waits for a device or machine (it may run for
 hours) or that waits itself (blocked, deferred, or on unfinished tasks) is exempt (exempt): it stays
-in the warning and label, but no fix or chain waits on it. No network, no model.
+in the warning and label, but no chain waits on it. No network, no model.
 """
 from __future__ import annotations
 
@@ -35,12 +35,12 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import reviewcap, settled
+from . import settled
 
 KINDS = ("code", "harness")
 OPEN = ("queued", "running", "review", "pushing", "waiting", "blocked")
 LABEL = "overlap:"           # a task's label: overlap:<ids>:<warning>, shown in the digest while queued
-PARALLEL_LABEL = "parallel:"  # a task's label: why its spec runs it beside a hot or settled area's task
+PARALLEL_LABEL = "parallel:"  # a task's label: the why of its spec's `parallel:` line (a no-op kept for old specs)
 PARALLEL = re.compile(r"^[ \t]*parallel:[ \t]*(\S.*?)[ \t]*$", re.M)
 CACHE = "overlap_diffs.json"  # state/: {head: [[status, path], ...]}, one git diff per head ever
 CACHE_MAX = 400
@@ -51,6 +51,10 @@ MAX_BRANCHES = 8              # branches a worker's prompt lists, the most recen
 LS_TTL_S = 60
 # A slash path without a known extension (bin/tool, skills/tt-x/SKILL): kept when its folder is in the repo.
 _PLAIN = re.compile(r"(?<![\w./:@-])((?:[\w.-]+/)+[\w-][\w.-]*)(?![\w/-])")
+# A symbol a spec names: `name()` / `mod.name()`, or a backticked identifier with `_` or `.` in it.
+_CALL = re.compile(r"(?<![\w.])((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*)\(\)")
+_TICK = re.compile(r"`((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*)`")
+MAX_SYMBOLS = 8               # symbols of one spec looked up on the base and the branches
 _ls_cache: dict[str, tuple[float, list[str]]] = {}
 
 
@@ -302,7 +306,7 @@ def exempt(p, task: dict | None, now: float | None = None, _seen: frozenset = fr
     the shared resources or `ttp machines` name, a `-device` lock, or needs_device), so it may run for
     hours, or it waits itself (blocked, a future start_after, a start_when or unfinished depends_on).
     A wait that is only its own overlap chain (on tasks its overlap label names, label_ids) counts
-    only when a task it waits on is exempt, so a hot area's tasks still chain in line. A fault
+    only when a task it waits on is exempt, so build-dependency chains still form in line. A fault
     reading it is no exemption."""
     if not task or task["id"] in _seen or len(_seen) > 20:
         return ""
@@ -357,20 +361,9 @@ def label_ids(task: dict | None) -> set[int]:
     return out
 
 
-def advice(hits: list[dict], landing: bool = True) -> tuple[list[int], str]:
-    """(the ids it names, the fix) for the tasks a warning lists: `depends_on` the open ones, and
-    `start_when landed:#<id>` the most recent done one with a head (its landed probe can pass), only
-    with `landing` (landed.can_check: a project with no way to check a landing gets no such wait)."""
-    shown = hits[:MAX_TASKS]
-    deps = [h["id"] for h in shown if h.get("open") and not h.get("exempt")]
-    land = next((h["id"] for h in shown if not h.get("open") and h.get("head")), None) if landing else None
-    fix = ([f"depends_on [{', '.join(map(str, deps))}]"] if deps else []) + \
-        ([f"start_when landed:#{land}"] if land is not None else [])
-    return deps + ([land] if land is not None else []), " and ".join(fix)
-
-
 def warning(hits: list[dict], landing: bool = True) -> str:
-    """One line naming the most recent few other tasks, the shared paths (new files flagged) and the fix."""
+    """One line naming the most recent few other tasks and the shared paths (new files flagged): the
+    tasks run side by side and conflicts settle at landing. `landing` is kept for callers."""
     if not hits:
         return ""
     parts = []
@@ -380,18 +373,15 @@ def warning(hits: list[dict], landing: bool = True) -> str:
         parts.append(f"#{h['id']} ({', '.join(names)}{f', +{more} more' if more > 0 else ''})")
     more = len(hits) - MAX_TASKS
     it = "it" if len(hits) == 1 else "them"
-    fix = advice(hits, landing)[1]
-    free = [f"#{h['id']} {h['exempt']}" for h in hits[:MAX_TASKS] if h.get("open") and h.get("exempt")]
-    free_s = f"; no depends_on on {', '.join(free)}: a device or machine task or one that waits " \
-             f"itself stays a label only" if free else ""
-    return (f"overlaps {'; '.join(parts)}{f'; +{more} more tasks' if more > 0 else ''}: build on {it}, not "
-            f"beside {it}{f': {fix}' if fix else ''}{free_s}")
+    return (f"overlaps {'; '.join(parts)}{f'; +{more} more tasks' if more > 0 else ''}: runs beside {it}, "
+            f"conflicts settle at landing; chain only if it needs {'its' if it == 'it' else 'their'} new file "
+            f"or symbol")
 
 
 def label(hits: list[dict], chained: int | None = None, landing: bool = True) -> str:
-    """overlap:<ids the fix names>:<warning>: the digest drops it once the task waits on them all
-    (only on `chained` once task_add chained it after that task). `landing` as for advice."""
-    ids = [chained] if chained is not None else advice(hits, landing)[0]
+    """overlap:<ids>:<warning>: the digest drops it once the task waits on them all: the task task_add
+    chained it after (`chained`), else the non-exempt tasks the warning names."""
+    ids = [chained] if chained is not None else [h["id"] for h in hits[:MAX_TASKS] if not h.get("exempt")]
     return f"{LABEL}{','.join(map(str, ids))}:{warning(hits, landing)}" if hits else ""
 
 
@@ -416,19 +406,6 @@ def digest_note(task: dict) -> str:
     return ""
 
 
-def hot_files(p, now: float | None = None) -> list[str]:
-    """The main files (reviewcap.main_file) of reviews failed within reviewcap.AREA_WINDOW_S whose
-    change has not landed: the review areas a new task should not run beside."""
-    from .db import dependency_ids
-    now = time.time() if now is None else now
-    landed, out = _landed_ids(p.db), []
-    for rid in reviewcap.failed_reviews(p.db, now - reviewcap.AREA_WINDOW_S):
-        r = p.db.task(rid)
-        if r and rid not in landed and not set(dependency_ids(r)) & landed and (f := reviewcap.main_file(p, r)):
-            out.append(f)
-    return out
-
-
 def waits_on(db, tid: int, ids: set[int], landed: set[int] | None = None, limit: int = 200) -> bool:
     """Whether task `tid` is one of `ids` or waits on one: its depends_on and start_when task refs
     (landed.task_refs), followed through the tasks they name. A landed task's wait is over."""
@@ -447,23 +424,66 @@ def waits_on(db, tid: int, ids: set[int], landed: set[int] | None = None, limit:
     return False
 
 
-def chain(p, hits: list[dict], now: float | None = None, lineage: set[int] | None = None) -> tuple[int, str] | None:
-    """(id, why) of the newest open, unlanded task in `hits` (find) sharing a settled area's file or a
-    hot review area's (hot_files): a new task waits for it to land. None for plain overlaps. A task
-    in the new one's `lineage`, or waiting on it (waits_on), is passed over: its work lands only with
-    the new task's, so waiting on it would never end. An exempt one (exempt) is passed over too."""
+def base_files(p, base: str) -> list[str]:
+    """The files on `base` (git ls-tree), kept LS_TTL_S per root and base; [] when unreadable."""
+    key, now = f"{p.root}\0{base}", time.time()
+    hit = _ls_cache.get(key)
+    if hit and now - hit[0] < LS_TTL_S:
+        return hit[1]
+    r = _git(p.root, "ls-tree", "-r", "--name-only", base)
+    out = r.stdout.splitlines() if r.returncode == 0 else []
+    _ls_cache[key] = (now, out)
+    return out
+
+
+def symbols(spec: str) -> list[str]:
+    """The symbols `spec` names (`name()`, or a backticked identifier with `_` or `.`), by last part."""
+    text = re.sub(r"\b[a-z]+://\S+", " ", spec or "")
+    names = _CALL.findall(text) + [t for t in _TICK.findall(text) if "_" in t or "." in t]
+    out = [n.rsplit(".", 1)[-1] for n in names if not settled.FILE_RE.fullmatch(n)]
+    return list(dict.fromkeys(n for n in out if len(n) >= 4))[:MAX_SYMBOLS]
+
+
+def _has(p, ref: str, sym: str) -> bool | None:
+    """Whether the tree at `ref` has `sym` as a word (git grep); None when unreadable."""
+    r = _git(p.root, "grep", "-q", "-w", "-F", "-e", sym, ref, "--")
+    return True if r.returncode == 0 else False if r.returncode == 1 else None
+
+
+def chain(p, hits: list[dict], spec: str = "", now: float | None = None, lineage: set[int] | None = None,
+          skip=()) -> tuple[int, str] | None:
+    """(id, why) of the newest open or unlanded task the new one needs the work of: a path the new
+    spec shares with it (`hits`, find) that is not on the base branch yet (that task adds it), or a
+    symbol the spec names (symbols) that the base lacks and that task's branch has. None otherwise: a
+    shared file alone never chains. A task in the new one's `lineage`, or waiting on it (waits_on),
+    is passed over: its work lands only with the new task's. An exempt one (exempt) is passed over too,
+    and so is everything when the base cannot be read."""
+    from . import worktree
     landed = _landed_ids(p.db)
-    shown = [h for h in hits if h.get("open") and h["id"] not in landed and not h.get("exempt")
-             and not (lineage and waits_on(p.db, h["id"], lineage, landed))]
-    zones = {settled._base(f) for r in settled.live(p, now) for f in r.get("files") or []} if shown else set()
-    hot = None
+
+    def ok(tid: int, is_open: bool) -> bool:
+        return tid not in landed and tid not in skip and not (lineage and waits_on(p.db, tid, lineage, landed)) \
+            and not (is_open and exempt(p, p.db.task(tid), now))
+    shown = [h for h in hits if (h.get("open") or h.get("head")) and not h.get("exempt") and ok(h["id"], h.get("open"))]
+    syms = symbols(spec)
+    if not shown and not syms:
+        return None
+    try:
+        base = worktree.resolve_base(p)
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        return None
+    on_base = base_files(p, base)
+    if not on_base:
+        return None
     for h in shown:   # the most recent first
-        paths = [f for f, _ in h["paths"]]
-        if f := next((f for f in paths if settled._base(f) in zones), None):
-            return h["id"], f"{f} is a settled area"
-        hot = hot_files(p, now) if hot is None else hot
-        if f := next((f for f in paths if any(same(f, x) for x in hot)), None):
-            return h["id"], f"{f} had a failed review within {reviewcap.AREA_WINDOW_S / 3600:g} h"
+        if f := next((f for f, _ in h["paths"] if not any(same(f, x) for x in on_base)), None):
+            return h["id"], f"it needs {f}, which #{h['id']} adds (not on the base branch yet)"
+    syms = [s for s in syms if _has(p, base, s) is False]
+    if syms:
+        for b in sorted(branches(p, skip), key=lambda b: -b["id"]):
+            if ok(b["id"], b["open"]) and (s := next((s for s in syms if _has(p, b["head"], s)), None)) \
+                    and not _on_push_branch(p, b, []):
+                return b["id"], f"it needs {s}, which only #{b['id']}'s branch has"
     return None
 
 

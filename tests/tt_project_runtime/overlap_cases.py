@@ -21,19 +21,36 @@ def _branch_adding(p, branch, files):
     return head
 
 
+def _on_base(p, *files):
+    """Commit `files` on the root's checked-out base: shared files that are no new file of anyone's."""
+    for f in files:
+        (p.root / f).parent.mkdir(parents=True, exist_ok=True)
+        (p.root / f).write_text("x = 1\n")
+    subprocess.run(["git", "-C", str(p.root), "add", *files], check=True)
+    subprocess.run(["git", "-C", str(p.root), "commit", "-q", "-m", "base files"], check=True)
+    from ttp import overlap
+    overlap._ls_cache.clear()
+
+
+def _plain(it="it"):
+    return f"runs beside {it}, conflicts settle at landing; chain only if it needs {'its' if it == 'it' else 'their'} " \
+        "new file or symbol"
+
+
 def test_task_add_warns_when_another_open_code_task_names_the_same_new_file(env):
     """#3466 and #3467 each built their own runtime/ttp/progress.py side by side. A new code task
     whose spec names a file an open code task's spec names is still added, and its result and its
-    open-tasks line in the digest name the other task, the shared path and the fix; once it waits on
-    that task the digest line drops the warning."""
+    open-tasks line in the digest name the other task and the shared path; a file already on the base
+    is no build dependency, so it runs beside; once it waits on that task the digest line drops the warning."""
     from ttp import coordinator as coord
     p = make(env)
+    _on_base(p, "runtime/ttp/progress.py")
     first = p.db.add_task("progress check", "Add runtime/ttp/progress.py and tests/tt_project_runtime/"
                           "progress_cases.py with a stall detector.", kind="code", status="running")
     assert coord.apply(p, [{"type": "task_add", "title": "driver reports", "kind": "code",
                             "spec": "Record driver results in `runtime/ttp/progress.py` (append, KINDS)."}]) == []
     new = p.db.one("SELECT id FROM tasks WHERE title='driver reports'")["id"]
-    want = f"overlaps #{first} (runtime/ttp/progress.py): build on it, not beside it: depends_on [{first}]"
+    want = f"overlaps #{first} (runtime/ttp/progress.py): {_plain()}"
     assert f"task_add: #{new} added; {want}" in p.db.kv(coord.NOTES_KEY)
     assert _labels(p, new) == [f"overlap:{first}:{want}"]
     line = next(x for x in coord.digest(p, {}, [], []).splitlines() if x.startswith(f"- #{new} |"))
@@ -56,6 +73,7 @@ def test_task_add_flags_a_file_an_unlanded_finished_branch_adds_as_a_new_file(en
     that file is warned with the file flagged as new; one that names a file the branch only changes
     is warned without the flag. Once the records show the task landed, nothing is flagged."""
     from ttp import coordinator as coord, overlap
+    from ttp.db import deferral
     p = make(env)
     p.set_config("delivery.landed_probe", "test -e landed/{id}")   # no push branch: how landed:#<id> is checked
     (p.root / "runtime" / "ttp").mkdir(parents=True, exist_ok=True)
@@ -72,12 +90,16 @@ def test_task_add_flags_a_file_an_unlanded_finished_branch_adds_as_a_new_file(en
     new = p.db.one("SELECT id FROM tasks WHERE title='stall watcher'")["id"]
     note = next(n for n in p.db.kv(coord.NOTES_KEY) if n.startswith(f"task_add: #{new} added; "))
     assert f"overlaps #{done} (plugins/tt-project/runtime/ttp/progress.py (new file))" in note, note
-    assert f"start_when landed:#{done}" in note
+    # It needs the file that branch adds: chained after its landing, the note naming the file.
+    assert deferral(p.db.task(new))["when"] == f"landed:#{done}"
+    assert any(n.startswith(f"task_add: #{new} chained after #{done} (start_when landed:#{done}): it needs "
+                            f"plugins/tt-project/runtime/ttp/progress.py, which #{done} adds") for n in p.db.kv(coord.NOTES_KEY))
     assert coord.apply(p, [{"type": "task_add", "title": "relay tweak", "kind": "code",
                             "spec": "Tidy runtime/ttp/relay.py."}]) == []
     tweak = p.db.one("SELECT id FROM tasks WHERE title='relay tweak'")["id"]
     assert overlap.digest_note(p.db.task(tweak)).startswith(f"overlaps #{done} (runtime/ttp/relay.py): "), \
         _labels(p, tweak)
+    assert not deferral(p.db.task(tweak)) and not json.loads(p.db.task(tweak)["depends_on"] or "[]")
     # The diff is read once per head and kept in state/.
     assert json.loads((p.state / overlap.CACHE).read_text())[head] == [["A", "runtime/ttp/progress.py"],
                                                                        ["M", "runtime/ttp/relay.py"]]
@@ -173,7 +195,7 @@ def test_task_add_gives_no_warning_for_folders_or_the_required_check_files(env):
     assert [(h["id"], h["paths"]) for h in hits] == [(first, [("runtime/ttp/progress.py", False)])]
 
 
-def test_overlap_lists_only_open_or_recent_unlanded_tasks_with_advice_each_can_follow(env):
+def test_overlap_lists_only_open_or_recent_unlanded_tasks(env):
     """#3526's warning listed #1115 and 27 more tasks done two weeks earlier whose work had long landed
     through a successor (a review, a fix) or was shelved, telling it to wait on `landed:#1115`. Only
     an open task (depends_on) or a done one that finished within overlap.branch_days with a head
@@ -208,15 +230,14 @@ def test_overlap_lists_only_open_or_recent_unlanded_tasks_with_advice_each_can_f
     opened = p.db.add_task("open one", f"Add {path}.", kind="code", status="queued")
     hits = overlap.find(p, f"Extend {path}.")
     assert [(h["id"], h["open"]) for h in hits] == [(opened, True), (recent, False)], (hits, old, carried, shelved)
-    want = (f"overlaps #{opened} ({path}); #{recent} ({path} (new file)): build on them, not beside them: "
-            f"depends_on [{opened}] and start_when landed:#{recent}")
+    want = f"overlaps #{opened} ({path}); #{recent} ({path} (new file)): {_plain('them')}"
     assert overlap.warning(hits) == want
     assert overlap.label(hits) == f"overlap:{opened},{recent}:{want}"
     assert json.loads((p.state / overlap.LANDED_CACHE).read_text()) == [git("rev-parse", f"ttp/t{picked}-x")]
     # Only the done one: a landed wait it can pass; once it lands, nothing.
     p.db.update_task(opened, status="cancelled")
     assert overlap.warning(overlap.find(p, f"Extend {path}.")) == (
-        f"overlaps #{recent} ({path} (new file)): build on it, not beside it: start_when landed:#{recent}")
+        f"overlaps #{recent} ({path} (new file)): {_plain()}")
     p.db.x("INSERT INTO task_landings(marker, task, sha, target) VALUES('m2', ?, 'def5678', 'b')", (recent,))
     assert overlap.find(p, f"Extend {path}.") == []
     assert coord.apply(p, [{"type": "task_add", "title": "stall", "kind": "code", "spec": f"Extend {path}."}]) == []
@@ -224,17 +245,17 @@ def test_overlap_lists_only_open_or_recent_unlanded_tasks_with_advice_each_can_f
 
 
 def test_overlap_warning_names_the_most_recent_few_then_a_count(env):
-    """Many matches: the warning names the MAX_TASKS most recent, then '+N more tasks', and its fix
-    and label name only those; the digest drops it once the task depends on them."""
+    """Many matches: the warning names the MAX_TASKS most recent, then '+N more tasks', and its label
+    names only those; the digest drops it once the task depends on them."""
     from ttp import coordinator as coord, overlap
     p = make(env)
+    _on_base(p, "runtime/ttp/relay.py")
     ids = [p.db.add_task(f"t{i}", "Change runtime/ttp/relay.py.", kind="code", status="queued") for i in range(5)]
     assert coord.apply(p, [{"type": "task_add", "title": "mine", "kind": "code",
                             "spec": "Tidy runtime/ttp/relay.py."}]) == []
     new = p.db.one("SELECT id FROM tasks WHERE title='mine'")["id"]
     top = ids[::-1][:overlap.MAX_TASKS]
-    want = ("overlaps " + "; ".join(f"#{i} (runtime/ttp/relay.py)" for i in top) + "; +2 more tasks: build on "
-            f"them, not beside them: depends_on [{', '.join(map(str, top))}]")
+    want = "overlaps " + "; ".join(f"#{i} (runtime/ttp/relay.py)" for i in top) + f"; +2 more tasks: {_plain('them')}"
     assert f"task_add: #{new} added; {want}" in p.db.kv(coord.NOTES_KEY)
     assert _labels(p, new) == [f"overlap:{','.join(map(str, top))}:{want}"]
     p.db.update_task(new, depends_on=json.dumps(top))
@@ -249,17 +270,17 @@ def _failed_review(p, of, ago=3600):
     return rid
 
 
-def test_task_add_chains_a_new_task_on_a_hot_or_settled_file_after_the_newest_open_task(env, monkeypatch):
-    """Five lineages changed runtime/ttp/progress.py side by side and broke each other's reviews. A new
-    code task naming a file a review failed on within 48 h (its main file, change not landed) waits
-    for the newest open task sharing it to land (start_when landed:#<id>, ANDed with its own wait);
-    a `parallel: <why>` line skips that and is recorded; a file with no failed review keeps only the
-    warning; a landed or cancelled open task chains nothing; a settled area's file chains too."""
+def test_a_shared_hot_or_settled_file_alone_never_chains_a_task(env, monkeypatch):
+    """Code tasks spent 88 task-hours in 7 days chained behind others only for sharing a file. Two
+    code tasks sharing an existing file in a hot area (a review failed on it within 48 h) both stay
+    runnable: no depends_on, no start_when, only the warning. A settled area's file gives its turn
+    note and no chain. A spec's `parallel: <why>` line still parses and is recorded, and runs."""
     from ttp import coordinator as coord, overlap, reviewcap, settled
-    from ttp.db import deferral
+    from ttp.db import deferral, dependency_ids
     p = make(env)
     p.set_config("delivery.landed_probe", "test -e landed/{id}")   # no push branch: how landed:#<id> is checked
-    hot, cold, calm = "runtime/ttp/progress.py", "runtime/ttp/relay.py", "runtime/ttp/sweep.py"
+    hot, calm = "runtime/ttp/progress.py", "runtime/ttp/sweep.py"
+    _on_base(p, hot, calm)
     mains = {}
     monkeypatch.setattr(reviewcap, "main_file", lambda p, r: mains.get(r["id"]))
 
@@ -269,68 +290,99 @@ def test_task_add_chains_a_new_task_on_a_hot_or_settled_file_after_the_newest_op
 
     older = p.db.add_task("older", f"Change {hot}.", kind="code", status="done")
     mains[_failed_review(p, older)] = hot
-    first = p.db.add_task("first", f"Change {hot}.", kind="code", status="queued")
-    newest = p.db.add_task("newest", f"Change {hot} and {cold}.", kind="code", status="running")
-    t = add("chained", f"Extend {hot}.")
-    assert deferral(t)["when"] == f"landed:#{newest}", deferral(t)
-    assert f"#{newest} lands" in deferral(t)["why"]
-    assert any(n.startswith(f"task_add: #{t['id']} chained after #{newest} (start_when landed:#{newest}): {hot}")
-               for n in p.db.kv(coord.NOTES_KEY)), p.db.kv(coord.NOTES_KEY)
-    assert overlap.digest_note(t) == ""   # waiting on the newest settles the warning
-    # The next one chains after that one (now the newest), the caller's own wait kept as an AND.
-    prev = t["id"]
-    t = add("own wait", f"Extend {hot}.", start_when=f"landed:#{first}")
-    assert deferral(t)["when"] == f"ttp landed --task {prev} && ttp landed --task {first}"
-    prev = t["id"]
-    t = add("own probe", f"Extend {hot}.", start_when="test -e /tmp/x || false")
-    assert deferral(t)["when"] == f"ttp landed --task {prev} && (test -e /tmp/x || false)"
-    # An ancestor probe keeps landed.probe_command's rewrite, so a sha the push queue rebased still counts.
-    # "own probe" waits on a probe of its own (overlap.exempt): it is passed over for the one before it.
-    sha = "abcdef1234567"
-    t = add("rebased sha check", f"Extend {hot} for the queue.", start_when=f"git merge-base --is-ancestor {sha} origin/tt/push")
-    assert deferral(t)["when"] == f"ttp landed --task {prev} && ttp landed {sha} --onto origin/tt/push"
-    # A combined probe over the start_when limit chains nothing: the caller's own wait stays.
-    long = "test -e /tmp/" + "x" * (coord.START_WHEN_CHARS - 30)
-    t = add("oversized shell gate", f"Guard {hot} with a file test.", start_when=long)
-    assert deferral(t)["when"] == long
-    # A `parallel:` line skips the chain and is recorded on the task.
-    t = add("beside", f"Extend {hot}.\nparallel: a one-line hotfix the other task does not touch")
-    assert not deferral(t)
-    assert "parallel:a one-line hotfix the other task does not touch" in json.loads(t["labels"])
-    assert any(f"#{t['id']} runs beside" in n for n in p.db.kv(coord.NOTES_KEY))
-    # A file with no failed review: the warning label only.
-    t = add("cold", f"Extend {cold}.")
-    assert not deferral(t) and [x for x in json.loads(t["labels"]) if x.startswith("overlap:")]
-    # Once the failed review's change landed, the area is no longer hot.
-    p.db.x("INSERT INTO task_landings(marker, task, sha, target) VALUES('m1', ?, 'abc1234', 'b')", (older,))
-    assert not deferral(add("after landing", f"Extend {hot}."))
-    # A landed or cancelled open task chains nothing, while the area stays hot.
-    mains[_failed_review(p, p.db.add_task("stray", f"Change {hot}.", kind="code", status="done"))] = hot
-    p.db.x("UPDATE tasks SET status='cancelled' WHERE kind='code' AND status='queued' AND id>?", (newest,))
-    assert overlap.chain(p, overlap.find(p, f"Extend {hot}."))[0] == newest
-    p.db.update_task(newest, status="cancelled")
-    p.db.x("INSERT INTO task_landings(marker, task, sha, target) VALUES('m2', ?, 'def5678', 'b')", (first,))
-    assert [h["id"] for h in overlap.find(p, f"Extend {hot}.")] == [first]
-    assert overlap.chain(p, overlap.find(p, f"Extend {hot}.")) is None
-    # A settled area's file chains after the newest open task touching it, failed review or not.
-    p.db.update_task(newest, status="queued")
+    newest = p.db.add_task("newest", f"Change {hot}.", kind="code", status="running")
+    t = add("beside a hot file", f"Extend {hot}.")
+    assert t["status"] == "queued" and not deferral(t) and dependency_ids(t) == [], (deferral(t), t["depends_on"])
+    assert overlap.chain(p, overlap.find(p, f"Extend {hot}."), f"Extend {hot}.") is None
+    notes = p.db.kv(coord.NOTES_KEY)
+    assert not [n for n in notes if "chained after" in n], notes
+    assert f"task_add: #{t['id']} added; overlaps #{newest} ({hot}): {_plain()}" in notes, notes
+    # A settled area's file: its rule as a note, no chain.
     settled.add(p, [calm], "one rule", commit=False)
-    p.db.update_task(first, spec=f"Change {calm}.")
-    later = p.db.add_task("later", f"Change {calm}.", kind="code", status="queued")
+    p.db.add_task("settled work", f"Change {calm}.", kind="code", status="queued")
     t = add("settled", f"Extend {calm}.")
-    assert deferral(t)["when"] == f"landed:#{later}"
-    assert f"{calm} is a settled area" in deferral(t)["why"]
+    assert not deferral(t) and dependency_ids(t) == []
+    assert any(n.startswith(f"task_add: #{t['id']}: its spec names a settled area") and "one rule" in n
+               for n in p.db.kv(coord.NOTES_KEY))
+    # A `parallel:` line still parses and is recorded; the task runs.
+    t = add("beside", f"Extend {hot}.\nparallel: a one-line hotfix the other task does not touch")
+    assert t["status"] == "queued" and not deferral(t) and dependency_ids(t) == []
+    assert "parallel:a one-line hotfix the other task does not touch" in json.loads(t["labels"])
+
+
+def test_task_add_chains_only_on_a_new_file_or_symbol_of_another_task(env):
+    """A real build dependency still chains: a spec naming a file an open task's spec adds (not on
+    the base yet) waits for that task, and one naming a symbol only another open task's branch has
+    waits for it; each note names the file or symbol. A symbol already on the base, or one no branch
+    has, chains nothing."""
+    from ttp import coordinator as coord, overlap
+    from ttp.db import deferral, dependency_ids
+    p = make(env)
+    p.set_config("delivery.landed_probe", "test -e landed/{id}")
+    _on_base(p, "runtime/ttp/relay.py")
+    (p.root / "runtime/ttp/relay.py").write_text("def send_once(x):\n    return x\n")
+    subprocess.run(["git", "-C", str(p.root), "commit", "-qam", "send_once"], check=True)
+
+    def add(title, spec):
+        assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec}]) == []
+        return p.db.one("SELECT * FROM tasks WHERE title=?", (title,))
+
+    maker = p.db.add_task("maker", "Add runtime/ttp/stall.py with a detector.", kind="code", status="running")
+    t = add("user of the file", "Call the detector in runtime/ttp/stall.py from the sweep.")
+    assert deferral(t)["when"] == f"landed:#{maker}", deferral(t)
+    assert any(n.startswith(f"task_add: #{t['id']} chained after #{maker} (start_when landed:#{maker}): it needs "
+                            f"runtime/ttp/stall.py, which #{maker} adds") for n in p.db.kv(coord.NOTES_KEY))
+    p.db.update_task(maker, status="cancelled")
+    p.db.update_task(t["id"], status="cancelled")
+    # A symbol only an open task's branch has.
+    sym = p.db.add_task("symbol maker", "Add a retry helper.", kind="code", status="running")
+    branch = f"ttp/t{sym}-retry"
+    _branch_adding(p, branch, {"runtime/ttp/retry.py": "def retry_twice(fn):\n    return fn() or fn()\n"})
+    p.db.update_task(sym, branch=branch)
+    t = add("symbol user", "Wrap the relay's send in `retry_twice()`.")
+    assert deferral(t)["when"] == f"landed:#{sym}", deferral(t)
+    assert any(f"chained after #{sym}" in n and f"it needs retry_twice, which only #{sym}'s branch has" in n
+               for n in p.db.kv(coord.NOTES_KEY)), p.db.kv(coord.NOTES_KEY)
+    # On the base already, or on no branch: no chain.
+    for title, spec in (("on base", "Make `send_once()` log."), ("nowhere", "Add `brand_new_helper()`.")):
+        t = add(title, spec)
+        assert not deferral(t) and dependency_ids(t) == [], title
+    assert overlap.symbols("Use `a.bc_d`, run() and `retry_twice`; see `x.py`, foo_bar() and `plain`.") == [
+        "bc_d", "retry_twice", "foo_bar"]
+
+
+def test_settled_records_lapse_after_14_days_unless_given_an_expiry(env):
+    """Settled areas count for overlap.settled_days (14) after they were settled: an older record,
+    even one written with the old 30-day expiry, is ignored; one given an expiry of its own keeps it,
+    and the setting is configurable."""
+    from ttp import settled
+    p = make(env)
+    now = time.time()
+    old = settled.add(p, ["runtime/ttp/a.py"], "old rule", created=now - 15 * 86400,
+                      expires=None, commit=False)
+    assert old["expires"] == pytest.approx(old["created"] + 14 * 86400) and "expires_given" not in old
+    recs = settled.load(p)
+    recs[0]["expires"] = recs[0]["created"] + 30 * 86400   # written under the old 30-day default
+    settled.path(p).write_text(json.dumps(recs))
+    fresh = settled.add(p, ["runtime/ttp/b.py"], "fresh rule", created=now - 10 * 86400, commit=False)
+    given = settled.add(p, ["runtime/ttp/c.py"], "given rule", created=now - 20 * 86400,
+                        expires=now + 86400, commit=False)
+    assert [r["id"] for r in settled.live(p, now)] == [fresh["id"], given["id"]]
+    assert settled.turn_note(p, "Change runtime/ttp/a.py.", "task_add: #1") == ""
+    assert "fresh rule" in settled.turn_note(p, "Change runtime/ttp/b.py.", "task_add: #1")
+    p.set_config("overlap.settled_days", 20)
+    assert [r["id"] for r in settled.live(p, now)] == [old["id"], fresh["id"], given["id"]]
 
 
 def test_overlap_chain_never_waits_on_a_task_that_waits_on_the_new_tasks_own_lineage(env, monkeypatch):
-    """A failed review's code task A, then B chained after it (start_when landed:#A): the fix of A
+    """A code task A adding a new file, then B chained after it (start_when landed:#A): the fix of A
     (continues A) must not wait on B, as B waits on A, whose work lands only with the fix. Two hops
     (C waits on B, which waits on A) are followed too; an unrelated open task is still chained."""
     from ttp import coordinator as coord, reviewcap
     from ttp.db import deferral
     p = make(env)
     p.set_config("delivery.landed_probe", "test -e landed/{id}")   # no push branch: how landed:#<id> is checked
-    hot = "runtime/ttp/progress.py"
+    hot = "runtime/ttp/progress.py"   # on no base yet: each task here adds it
     monkeypatch.setattr(reviewcap, "main_file", lambda p, r: hot)
 
     def add(title, spec, **kw):
@@ -359,36 +411,25 @@ def test_overlap_chain_never_waits_on_a_task_that_waits_on_the_new_tasks_own_lin
 
 def test_an_automatic_chain_uses_depends_on_where_no_landing_can_be_checked(env, monkeypatch):
     """A project with no delivery.push_branch lands its work some other way, so `landed:#<id>` would
-    exit 2 on every check. With no delivery.landed_probe either, task_add's automatic chains (a
-    settled area's file, a file a review failed on within 48 h) wait on the open task with depends_on,
-    and the overlap warning suggests no landed wait. With delivery.landed_probe set they keep
-    `landed:#<id>`, as does a project with a push branch."""
-    from ttp import coordinator as coord, overlap, reviewcap, settled
+    exit 2 on every check. With no delivery.landed_probe either, task_add's automatic chain (a file
+    another open task adds) waits on the open task with depends_on. With delivery.landed_probe set it
+    keeps `landed:#<id>`, as does a project with a push branch."""
+    from ttp import coordinator as coord, overlap
     from ttp.db import deferral, dependency_ids
     p = make(env)
-    hot, calm = "runtime/ttp/progress.py", "runtime/ttp/sweep.py"
-    mains = {}
-    monkeypatch.setattr(reviewcap, "main_file", lambda p, r: mains.get(r["id"]))
+    hot = calm = "runtime/ttp/progress.py"   # on no base yet: the open task adds it
 
     def add(title, spec, **kw):
         assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec, **kw}]) == []
         return p.db.one("SELECT * FROM tasks WHERE title=?", (title,))
 
-    older = p.db.add_task("older", f"Change {hot}.", kind="code", status="done")
-    mains[_failed_review(p, older)] = hot
-    open_ = p.db.add_task("open", f"Change {hot}.", kind="code", status="running")
-    t = add("failed review file", f"Extend {hot}.")
+    open_ = p.db.add_task("open", f"Add {hot}.", kind="code", status="running")
+    t = add("new file user", f"Extend {hot}.")
     assert not deferral(t) and dependency_ids(t) == [open_], (deferral(t), t["depends_on"])
     assert any(n.startswith(f"task_add: #{t['id']} chained after #{open_} (depends_on [{open_}]") and
                "landed:#" not in n for n in p.db.kv(coord.NOTES_KEY)), p.db.kv(coord.NOTES_KEY)
     assert overlap.digest_note(t) == ""   # it waits on the task its label names
-    settled.add(p, [calm], "one rule", commit=False)
-    other = p.db.add_task("settled work", f"Change {calm}.", kind="code", status="queued")
-    t = add("settled area", f"Extend {calm}.")
-    assert not deferral(t) and dependency_ids(t) == [other]
-    # A done task with a head off the branch: no `start_when landed:#<id>` advice here.
-    hits = [{"id": 7, "open": False, "head": "abc1234", "paths": [(hot, False)]}]
-    assert "landed:#" not in overlap.warning(hits, landing=False) and "landed:#7" in overlap.warning(hits)
+    assert "landed:#" not in overlap.warning(overlap.find(p, f"Extend {hot}."), landing=False)
     # With a landed probe, or a push branch, the chain is a landed wait as before.
     p.set_config("delivery.landed_probe", "test -e landed/{id}")
     t = add("with a landed probe", f"Extend {calm}.")
@@ -401,22 +442,20 @@ def test_an_automatic_chain_uses_depends_on_where_no_landing_can_be_checked(env,
 
 def test_overlap_never_chains_or_suggests_depends_on_onto_device_or_waiting_tasks(env, monkeypatch):
     """A delivery sat behind a long device A/B run and a fix that itself waited on another task,
-    because an overlap became depends_on. A new task sharing a hot file with an open task that holds
+    because an overlap became depends_on. A new task needing a new file of an open task that holds
     or waits for a device or machine lock, or that is blocked, deferred or waits on unfinished
-    depends_on, gets no depends_on or chain on it: the overlap stays a label and the warning says
-    why. An ordinary open code task is still chained after, as before."""
+    depends_on, gets no depends_on or chain on it: the overlap stays a label. An ordinary open code
+    task adding the file is still chained after, as before."""
     from ttp import coordinator as coord, overlap, reviewcap
     from ttp.db import deferral, dependency_ids
     p = make(env)
     p.set_config("device.locks", ["board0"])
-    hot = "runtime/ttp/progress.py"
-    monkeypatch.setattr(reviewcap, "main_file", lambda p, r: hot)
+    hot = "runtime/ttp/progress.py"   # on no base yet: every task here adds it
 
     def add(title, spec, **kw):
         assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec, **kw}]) == []
         return p.db.one("SELECT * FROM tasks WHERE title=?", (title,))
 
-    _failed_review(p, p.db.add_task("older", f"Change {hot}.", kind="code", status="done"))
     ordinary = p.db.add_task("ordinary", f"Change {hot}.", kind="code", status="queued")
     other = p.db.add_task("unrelated", "Write the notes.", kind="work", status="queued")
     cases = [("device run", "running", {"labels": ["exclusive:box-device"]}, "holds or waits for box-device"),
@@ -432,8 +471,8 @@ def test_overlap_never_chains_or_suggests_depends_on_onto_device_or_waiting_task
         assert overlap.exempt(p, p.db.task(h)) == why
         lb = [x for x in json.loads(t["labels"]) if x.startswith("overlap:")]
         assert lb and f"#{h} (" in lb[0] and lb[0].startswith(f"overlap:{ordinary}:"), lb
-        note = next(n for n in p.db.kv(coord.NOTES_KEY) if n.startswith(f"task_add: #{t['id']} added; overlaps"))
-        assert f"no depends_on on #{h} {why}" in note and f"depends_on [{h}" not in note, note
+        note = next(n for n in p.db.kv(coord.NOTES_KEY) if n.startswith(f"task_add: #{t['id']} chained after"))
+        assert f"#{ordinary} (depends_on [{ordinary}]" in note, note
         p.db.update_task(t["id"], status="cancelled")
         p.db.update_task(h, status="cancelled")
     held = p.db.one("SELECT id FROM tasks WHERE title='device run'")["id"]
@@ -474,7 +513,8 @@ def test_a_continue_hop_drops_overlap_depends_on_onto_device_or_waiting_tasks(en
         p.db.update_task(t["id"], status="cancelled")
     # The coordinator's prompt states the exemption.
     rule = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
-    assert "chain it as warned or say why, never onto a device or machine task or one that waits itself" in rule
+    assert ("run side by side unless one needs the other's new file or symbol; never chain onto a device or "
+            "machine task or one that waits.") in rule
     # A plain task_add (no hop) keeps the depends_on the coordinator gave, device task or not.
     assert coord.apply(p, [{"type": "task_add", "title": "on purpose", "kind": "code",
                             "spec": "Finish the delivery.", "depends_on": [a, b]}]) == []

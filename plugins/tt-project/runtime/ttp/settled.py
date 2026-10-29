@@ -7,12 +7,15 @@ more edge-case fixes there". Kept as memory decisions, they are the newest entri
 older decisions made on the user's word out of the coordinator's memory budget, and the daily
 archive then retires those. Here each settlement is one record in harness/settled_areas.json
 (committed like memory): the file(s), the functions if known, a one-line rule, the decision text,
-the failed review ids, created and expires (DEFAULT_DAYS after created unless given).
+the failed review ids, created and expires (DEFAULT_DAYS after created unless given). A record
+without an expiry of its own counts for `overlap.settled_days` (DEFAULT_DAYS) after it was created,
+so older records written with a longer default lapse too.
 
 The coordinator's digest carries one short line for the register (digest_line). A record's rule
 and decision reach a prompt only where they apply: the coordinator's turn notes when a task spec it
 adds or updates names a settled file (turn_note; a note, never a refusal), and a worker's or
-reviewer's prompt when its spec or reviewed diff touches one (prompt_block). A file is matched by
+reviewer's prompt when its spec or reviewed diff touches one (prompt_block); a settled area never
+chains or holds a task (overlap.chain). A file is matched by
 its base name, so `landwait.py` matches `runtime/ttp/landwait.py`.
 
 migrate() moves existing memory entries into the register and archives them from memory, keeping
@@ -26,7 +29,7 @@ import time
 from pathlib import Path
 
 FILE = "settled_areas.json"
-DEFAULT_DAYS = 30
+DEFAULT_DAYS = 14
 KIND = "settled_area"          # memory_add's memory_kind that adds a record instead of a memory entry
 RULE_CHARS, DECISION_CHARS, PROMPT_CHARS = 240, 1500, 4000
 # A file name a decision names: a path or base name with a source-like extension.
@@ -52,9 +55,34 @@ def load(p) -> list[dict]:
     return [r for r in data if isinstance(r, dict)] if isinstance(data, list) else []
 
 
+def days(p) -> float:
+    """How long a record without an expiry of its own counts: `overlap.settled_days`, else DEFAULT_DAYS."""
+    try:
+        return float(((p.config().get("overlap") or {}) if p is not None else {}).get("settled_days") or DEFAULT_DAYS)
+    except (TypeError, ValueError):
+        return float(DEFAULT_DAYS)
+
+
+def _until(r: dict, max_days: float) -> float:
+    """When record `r` lapses: its own expiry if it was given one, else the earlier of its stored
+    expiry and created + max_days; 0 for none."""
+    until = float(r.get("expires") or 0)
+    if not r.get("expires_given") and r.get("created"):
+        cap = float(r["created"]) + max_days * 86400
+        until = min(until, cap) if until else cap
+    return until
+
+
 def live(p, now: float | None = None) -> list[dict]:
+    """The records still in force, each with its effective `expires` (_until)."""
     now = time.time() if now is None else now
-    return [r for r in load(p) if not r.get("expires") or float(r["expires"]) > now]
+    n = days(p)
+    out = []
+    for r in load(p):
+        until = _until(r, n)
+        if not until or until > now:
+            out.append({**r, "expires": until} if until else r)
+    return out
 
 
 def _clean(xs) -> list[str]:
@@ -102,7 +130,9 @@ def add(p, files, rule: str, decision: str = "", reviews=(), functions=(), creat
     rec = {"id": f"sa{n}",
            "files": files, "functions": _clean(functions), "rule": rule, "decision": decision,
            "reviews": _reviews(reviews), "created": created,
-           "expires": float(expires) if expires else created + DEFAULT_DAYS * 86400}
+           "expires": float(expires) if expires else created + days(p) * 86400}
+    if expires:
+        rec["expires_given"] = True
     if key:
         rec["key"] = key
     if source:

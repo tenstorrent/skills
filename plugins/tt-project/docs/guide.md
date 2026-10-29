@@ -646,16 +646,20 @@ queues behind routine work; nothing running is interrupted:
   paths another open code task's spec or branch names, or that a done task's branch still to land
   adds or changes, the task is still added, but its task_add result and its line in the coordinator's
   open tasks say `overlaps #<id> (<paths>, new files flagged)` for the three most recent such tasks
-  (then `+N more tasks`) with the fix: `depends_on` an open task, `start_when landed:#<id>` a done
-  one. An open task that holds or waits for a device or machine lock, or that waits itself (blocked,
-  deferred or on unfinished tasks), is named but never waited on: no fix, no automatic chain, and a
-  continue hop drops the depends_on its predecessor's overlap warning named onto it. A done task counts only while it finished within `branch_days`, has a branch head, is not
+  (then `+N more tasks`). A shared file alone never chains: the tasks run side by side and conflicts
+  settle at landing. task_add chains the new task only on a real build dependency: its spec names a
+  file another open or unlanded task adds (not yet on the base branch), or a symbol (`name()` or a
+  backticked identifier) only that task's branch has; the note names it. A settled area is a note,
+  never a chain, and its records lapse after `settled_days` (14) unless given an expiry; a spec's
+  `parallel:` line is a no-op kept for old specs. An open task that holds or waits for a device or
+  machine lock, or that waits itself (blocked, deferred or on unfinished tasks), is never waited on,
+  and a continue hop drops the depends_on its predecessor's overlap warning named onto it. A done task counts only while it finished within `branch_days`, has a branch head, is not
   landed (itself or through a review, fix or continuation that carried it), merged or on the push
   branch by patch, and was not shelved, rejected, superseded or cancelled, so a landed wait it names
   can pass. Its worker's prompt lists the eight most recent such branches and says to reuse their
   module. Model-free: each branch's diff is read once per head. Config `overlap`: `enabled` (on), `ignore` (globs such as
   changelogs, changesets, manifests, `__init__.py`), `hub_bytes` (tracked files larger than this,
-  150000, touched by most changes, never count) and `branch_days` (14). Folders and the files the
+  150000, touched by most changes, never count), `branch_days` (14) and `settled_days` (14). Folders and the files the
   check commands (`delivery.push_checks`) name never count either: specs cite those as the required suite.
 - On macOS, while the project has work (a running run or push, or queued work that can start now)
   and the machine is on AC power, the daemon keeps it from idle and maintenance sleep with

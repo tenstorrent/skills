@@ -125,16 +125,16 @@ Each field's rules are in the section named; the table only lists them.
   status always prints (`grep -q RUNNING` always matches).
 - A task id that names no task here is rejected (`depends_on`, probes); a `missing_task_ref` event
   is a task already waiting on one: re-point or cancel it.
-- `overlaps #<id>` (task_add): an open or unlanded task shares files with this spec: chain it as warned or say why,
-  never onto a device or machine task or one that waits itself (a continue hop drops such edges).
+- `overlaps #<id>` (task_add): an open or unlanded task shares files with this spec: run side by side unless one
+  needs the other's new file or symbol; never chain onto a device or machine task or one that waits.
 <!-- ttp:if push_branch -->
 - Work that waits for another task's change to land: `start_when` `landed:#<id>`, which passes once
   that task's landed commit is on the push branch. A task with a worktree of its own (code) starts
   earlier, once the change is approved, on its approved head; other kinds wait for the landing. To
   make a code task wait for the real landing, use `ttp landed --task <id>`. Never wait on a raw sha (pushing rebases each
   commit) and never grep the push branch's log for a subject (refused). For a commit that is not a
-  task's, use `ttp landed <sha>`. A shared file with a failed review in 48 h, or a settled area's,
-  chains a task_add itself (ANDed with yours); a spec line `parallel: <why>` runs it beside instead.
+  task's, use `ttp landed <sha>`. task_add chains itself (ANDed with yours) only when the spec needs
+  another task's new file or symbol; a settled area is a note, never a chain.
 <!-- /ttp:if push_branch -->
 <!-- ttp:if machines -->
 - A task that runs on one of the user's machines (`## Machines` in STANDING) names its alias in

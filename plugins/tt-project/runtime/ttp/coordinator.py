@@ -1614,15 +1614,16 @@ def _file_overlaps(p: Project, kind: str, spec: str, skip: set) -> list[dict]:
         return []
 
 
-def _overlap_chain(p: Project, clash: list[dict], roots: set[int] = frozenset()) -> tuple[int, str] | None:
-    """The open task a new one sharing a hot or settled area's file waits for (overlap.chain), never
-    one in or waiting on the lineage of `roots` (the tasks it continues, follows or carries); a fault
-    reading the areas leaves today's warning only."""
+def _overlap_chain(p: Project, kind: str, spec: str, clash: list[dict], roots: set[int] = frozenset(),
+                   skip: set = frozenset()) -> tuple[int, str] | None:
+    """The open or unlanded task a new code task needs the new file or symbol of (overlap.chain), never
+    one in or waiting on the lineage of `roots` (the tasks it continues, follows or carries) or in
+    `skip`; a shared file alone never chains, and a fault reading the base leaves the warning only."""
     try:
-        if not clash:
+        if kind not in file_overlap.KINDS or not file_overlap.settings(p).get("enabled", True):
             return None
         lineage = set(roots) | {t["id"] for r in roots for t in chaincap.chain(p.db, r)}
-        return file_overlap.chain(p, clash, lineage=lineage)
+        return file_overlap.chain(p, clash, spec, lineage=lineage, skip=skip)
     except Exception:
         return None
 
@@ -1644,8 +1645,8 @@ def _lineage_tie(p: Project, kind: str, labels: list[str], skip: set) -> tuple[i
     """(id, what it shares) of the newest queued, running or waiting task a new task of `kind` with
     `labels` shares a branch or worktree with (worktree.claims: the branch it carries or rebases, the task it
     continues and that task's branch): the new task starts only once that one ends (worktree.LINEAGE_HOLD,
-    Daemon._branch_clash). Tasks in `skip` (the one it continues) never count; files alone chain only
-    through _overlap_chain."""
+    Daemon._branch_clash). Tasks in `skip` (the one it continues) never count; files chain only
+    through _overlap_chain (a new file or symbol the new task needs)."""
     if kind in worktree.NEVER_OWN_KINDS:
         return None
     branches, paths = worktree.claims(p, {"id": 0, "kind": kind, "branch": None, "labels": json.dumps(labels)})
@@ -2026,13 +2027,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 why_after = start_why(a, {}, when)
                 roots = {int(a["continues"])} if a.get("continues") is not None else set()
                 roots |= {t["id"] for t in (old, followup, carried and carried[0]) if t}
-                tie, parallel = _overlap_chain(p, clash, roots), file_overlap.PARALLEL.search(a.get("spec") or "")
+                tie = _overlap_chain(p, kind, a.get("spec") or "", clash, roots, {old["id"]} if old else set())
                 landing = landed.can_check(p)
-                beside = clip(parallel.group(1), START_WHY_CHARS) if tie and parallel else ""
-                if beside:
-                    labels.append(file_overlap.PARALLEL_LABEL + beside)
-                    tie = None
-                elif tie and tie[0] not in deps and str(tie[0]) not in landed.task_refs(when) \
+                if parallel := file_overlap.PARALLEL.search(a.get("spec") or ""):   # a no-op kept for old specs
+                    labels.append(file_overlap.PARALLEL_LABEL + clip(parallel.group(1), START_WHY_CHARS))
+                if tie and tie[0] not in deps and str(tie[0]) not in landed.task_refs(when) \
                         and not landing:   # no landing to wait for here (landed.can_check): its end instead
                     deps = [*deps, tie[0]]
                 elif tie and tie[0] not in deps and str(tie[0]) not in landed.task_refs(when) \
@@ -2110,10 +2109,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     how = (f"start_when {when}" if landing else
                            f"depends_on [{tie[0]}]: no push branch or landed probe to wait on its landing")
                     notes.append(f"task_add: #{new_id} chained after #{tie[0]} ({how}): {tie[1]}; "
-                                 f"a `parallel: <why>` spec line runs it beside instead")
-                elif beside:
-                    notes.append(f"task_add: #{new_id} runs beside a hot or settled area's task, as its spec's "
-                                 f"`parallel:` line asks: {beside}")
+                                 f"clear it with task_update if the task does not need that")
                 if hit := settled.turn_note(p, str(a.get("spec") or ""), f"task_add: #{new_id}"):
                     notes.append(hit)
                 if (after or when) and (lull := lull_note(f"task_add: #{new_id}", labels, a.get("why"),

@@ -15034,7 +15034,7 @@ def test_memory_add_settled_area_writes_a_register_record_and_one_collapsible_di
     assert r["files"] == ["runtime/ttp/landwait.py"] and r["reviews"] == [101, 102]
     assert r["rule"] == "Narrowed; no more edge-case fixes" and "wait_landed() is narrowed" in r["decision"]
     assert r["functions"] == ["wait_landed"]
-    assert abs(r["expires"] - r["created"] - 30 * 86400) < 1 and r["created"] >= t0 - 1
+    assert abs(r["expires"] - r["created"] - 14 * 86400) < 1 and r["created"] >= t0 - 1
     assert {e["name"] for e in p._memory_entries()} == before, "it went to memory too"
     assert any("settled area sa1 added" in n for n in p.db.kv(coord.NOTES_KEY, []))
     # Files and reviews come from the text when not given; an explicit expiry is kept.
