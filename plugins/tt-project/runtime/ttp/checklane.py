@@ -18,6 +18,18 @@ one-at-a-time slot). `checks.slots` sets it (project, then account, then TTP_CHE
 follows the machine: one lane per CORES_PER_LANE cores and per GIB_PER_LANE GiB of available memory,
 the smaller, at least 1, at most MAX_LANES.
 
+Wrapper locks. A run whose commands go behind the project's checks.wrap_cmd (a lock or queue command,
+such as a shared device's lock) takes that wrapper lock's own single lane (wrap_key), not a repository
+lane: runs behind one wrapper lock go one at a time, and lock-free runs (lint, other trees' tests,
+harness checks) run in their repository's lanes beside it instead of waiting behind it.
+
+Project cap. At most project_cap() of a project's checks run at once over all its repository and
+wrapper-lock lanes: checks.test_project_max (project, then account, then TTP_TEST_PROJECT_MAX), else the
+project's test-worker budget (testslots.project_max, its default unchanged). A lane under the cap goes to
+the most urgent waiter of the project (task priority, 1 first, then age: testslots.cap_turn). A
+priority-1 waiter whose lanes are held only by less urgent runs takes an overflow lane beside them while
+the host has room (headroom()), never beside a run in its own worktree (one suite per worktree).
+
 Bounded wait (testslots.suite_hold). A lane whose holder process is gone, or whose heartbeat (the lane
 file's mtime, touched every HEARTBEAT_S by the holder) is older than HEARTBEAT_DEAD_S, is reclaimed and
 the reclaim logged (RECLAIM_LOG). A waiter that has waited past `checks.max_wait_s` (default
@@ -32,9 +44,11 @@ WAIT_EVENT_S; 0 turns it off) naming holder and waiter (wait_events).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shlex
 import statistics
 import time
 from pathlib import Path
@@ -123,6 +137,38 @@ def slots(cfg: dict | None) -> int:
         if n >= 1:
             return n
     return default_slots()
+
+
+def project_cap(cfg: dict | None) -> int:
+    """The most of a project's checks that run at once (above): checks.test_project_max (project, then
+    account), TTP_TEST_PROJECT_MAX, else testslots.project_max(cfg); 0 (the test pool off): no cap."""
+    own = ((cfg or {}).get("checks") or {}) if isinstance((cfg or {}).get("checks"), dict) else {}
+    for v in (own.get("test_project_max"), setting({}, "test_project_max"), os.environ.get("TTP_TEST_PROJECT_MAX")):
+        try:
+            n = int(str(v).strip())
+        except (TypeError, ValueError):
+            continue
+        if n >= 1:
+            return n
+    return testslots.project_max(cfg)
+
+
+def group_name(key: str) -> str:
+    """What a lane base's key names, for status: a wrapper lock, a repository or the project's own lanes."""
+    if key.startswith("w"):
+        return f"wrapper lock {key[1:]} (checks.wrap_cmd)"
+    return f"repository {key}" if key else "project (no repository)"
+
+
+def wrap_key(wrap) -> str:
+    """The id of the wrapper lock a run's commands go behind (checks.wrap_cmd as argv words); "" for none."""
+    return hashlib.sha256(shlex.join(map(str, wrap)).encode()).hexdigest()[:12] if wrap else ""
+
+
+def headroom() -> bool:
+    """Whether the host has room for a priority-1 run beside the lanes' holders: its 1-minute load
+    average is under half its cores."""
+    return checkcap._load() < checkcap.cores() / 2
 
 
 def light_patterns(cfg: dict | None) -> list[list[str]]:
@@ -259,6 +305,8 @@ def waits(project_name: str, now: float | None = None, over_s: float = 0.0) -> l
         for base in testslots.suite_bases(project_name):
             q = testslots.suite_order(project_name, now=now, repo=base[len(pre) + 1:])
             recs = locks.holder_records(testslots._lanes_of(base)) if q else []
+            if q and not recs:   # its lanes are free: it waits for the project's cap (project_cap)
+                recs = locks.holder_records(testslots.project_held(project_name))
             for i, t in enumerate(q):
                 waited = now - locks._arrival(t)
                 if waited > over_s:
@@ -294,7 +342,8 @@ def wait_events(project_name: str, cfg: dict | None, now: float | None = None) -
         out.append({"fingerprint": f"checks_slot_wait:{w['task'] or 'run'}:{w['since']:.0f}",
                     "task": int(w["task"]) if w["task"] else None,
                     "text": (f"Checks slot wait: {who} has waited {mins(w['waited_s'])} for its project's checks "
-                             f"slot (position {w['position']} of {w['of']}), behind {held}. Lanes: checks.slots; "
+                             f"slot (position {w['position']} of {w['of']}), behind {held}. Lanes: checks.slots "
+                             f"per repository, one per checks.wrap_cmd lock, checks.test_project_max per project; "
                              f"a waiter cheaper than the holders gets a lane after checks.max_wait_s; light "
                              f"checks (ttp checks --light, checks.light_cmds) never wait.")})
     return out
@@ -358,7 +407,8 @@ def lane_status(project_name: str, now: float | None = None) -> list[dict]:
                             "priority": None if prio == float("inf") else prio,
                             "waited_s": round(now - locks._arrival(t), 1), "next": i == 0})
         if lanes or waiters:
-            out.append({"repo": base[len(pre) + 1:], "lanes": lanes, "waiters": waiters})
+            key = base[len(pre) + 1:]
+            out.append({"repo": key, "group": group_name(key), "lanes": lanes, "waiters": waiters})
     return out
 
 
@@ -372,12 +422,16 @@ def status_text(project_name: str, cfg: dict | None, here_repo: str = "", now: f
     """lane_status as lines for a person (`ttp checks status`)."""
     now = time.time() if now is None else now
     n = slots(cfg)
-    lines = [f"checks lanes of {project_name}: {n} per repository (checks.slots), light checks never wait"]
+    lines = [f"checks lanes of {project_name}: {n} per repository (checks.slots), one per wrapper lock "
+             f"(checks.wrap_cmd), at most {project_cap(cfg) or 'any number'} at once (checks.test_project_max); "
+             f"light checks never wait"]
     got = lane_status(project_name, now)
     if not got:
         lines.append("  no lane held and nobody waiting")
     for r in got:
-        lines.append(f"  repository {r['repo'] or '(not keyed: an older runtime, one lane per project)'}" + (" (this one)" if r["repo"] == here_repo else ""))
+        where = (f"wrapper lock {r['repo'][1:]} (checks.wrap_cmd, one at a time)" if r["repo"].startswith("w")
+                 else f"repository {r['repo'] or '(not keyed: an older runtime, one lane per project)'}")
+        lines.append(f"  {where}" + (" (this one)" if r["repo"] == here_repo else ""))
         for h in r["lanes"]:
             alive = {True: "alive", False: "DEAD (its lane is reclaimed by the next waiter)"}.get(h["alive"], "alive unknown")
             run = f", running {h['command']!r} for {mins(h['running_s'])}" if h["running_s"] is not None else ", not running yet"

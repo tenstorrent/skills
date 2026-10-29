@@ -50,6 +50,7 @@ gives a bare ninja -j k) through clamp_build(). A build inside a check uses the 
 """
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import hashlib
 import os
@@ -343,9 +344,10 @@ def _lanes_of(base: str) -> list:
 
 
 def suite_bases(project_name: str) -> list[str]:
-    """The project's suite lane resources in use: one per repository that has lanes or waiters."""
+    """The project's suite lane resources in use: one per repository, and one per wrapper lock ("w" and
+    its checklane.wrap_key), that has lanes or waiters."""
     pre = f"{SUITE}.{locks.group_id(project_name)}"
-    pat = re.compile(re.escape(pre) + r"(\.[0-9a-f]{12})?(?:-x)?(?:\.\d+\.lock|\.queue)")
+    pat = re.compile(re.escape(pre) + r"(\.w?[0-9a-f]{12})?(?:-x)?(?:\.\d+\.lock|\.queue)")
     try:
         names = [x.name for x in checkcap.slot_dir().iterdir()]
     except OSError:
@@ -376,11 +378,54 @@ def suite_priority(ticket, now: float | None = None) -> float:
     return max(0.0, prio - waited // SUITE_AGE_S)
 
 
+def _order_key(t, now: float | None = None) -> tuple:
+    return suite_priority(t, now), locks._arrival(t), t.name
+
+
 def suite_order(project_name: str, q: list | None = None, now: float | None = None, repo: str = "") -> list:
     """The project's suite waiters in repository `repo` in the order the lanes go to them: by
     suite_priority, then arrival."""
     q = locks.queued(checkcap.slot_dir(), _suite_resource(project_name, repo)) if q is None else q
-    return sorted(q, key=lambda t: (suite_priority(t, now), locks._arrival(t), t.name))
+    return sorted(q, key=lambda t: _order_key(t, now))
+
+
+def project_held(project_name: str) -> list:
+    """The lane files of every repository and wrapper lock of the project held right now."""
+    return [x for x in lane_paths(project_name, repo=None) if locks._slot_labels([x])]
+
+
+@contextlib.contextmanager
+def _cap_guard(project_name: str, cap: int):
+    """Serialize the count-and-take of the project's lanes under its cap (none without one)."""
+    if cap <= 0:
+        yield
+        return
+    with open(checkcap.slot_dir() / f"{SUITE}.{locks.group_id(project_name)}.cap.guard", "a+") as g:
+        fcntl.flock(g, fcntl.LOCK_EX)
+        yield
+
+
+def cap_turn(project_name: str, cap: int, ticket, slots: int, now: float | None = None) -> bool:
+    """Whether waiter `ticket` may take a lane under the project's cap of `cap` checks at once (0: none):
+    fewer than `cap` lanes held over all its repositories and wrapper locks, and `ticket` among the most
+    urgent (_order_key) of the waiters a free lane of their own lets start, as many as the cap has room."""
+    if cap <= 0:
+        return True
+    room = cap - len(project_held(project_name))
+    if room <= 0:
+        return False
+    pre = f"{SUITE}.{locks.group_id(project_name)}"
+    ready = []
+    for base in suite_bases(project_name):
+        key = base[len(pre) + 1:]
+        n = 1 if key.startswith("w") else max(1, int(slots or 1))
+        free = n - len([x for x in locks.slot_paths(checkcap.slot_dir(), base, n) if locks._slot_labels([x])])
+        if free > 0:
+            ready += suite_order(project_name, repo=key, now=now)[:free]
+    if ticket not in ready:
+        ready.append(ticket)   # one taking an overflow lane
+    ready.sort(key=lambda t: _order_key(t, now))
+    return ready.index(ticket) < room
 
 
 def _reclaim(path, tell, state) -> bool:
@@ -432,7 +477,8 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                wait_s: float | None = None, waiting: Callable[[bool], None] | None = None,
                stop: Callable[[], str] | None = None, who: str = "", priority: int | None = None,
                since: float | None = None, slots: int = 1, repo: str = "", cost: dict | None = None,
-               max_wait: float = 0.0, state=None, what: str = "full checks") -> Grant | None:
+               max_wait: float = 0.0, state=None, what: str = "full checks", lock: str = "", cap: int = 0,
+               worktree: str = "", headroom: Callable[[], bool] | None = None) -> Grant | None:
     """Hold one of project `project_name`'s `slots` checks lanes in repository `repo` (repo_key) for its
     full checks (above), waiting while its other runs there hold them all or a more urgent waiter is ahead
     (suite_order); Grant(0) holding one, Grant() with no project or nested in a check, None once `wait_s`
@@ -444,10 +490,20 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     in its label, so a waiting run names the run it waits for; `what`: the commands it runs. `priority`:
     the task's (lower first); `since`: the arrival to queue at (default now), kept by a run that hands
     over. `state`: the project's state folder, for the reclaim log. It says who holds the lanes and its
-    place in the queue at once and every checklane.TELL_S."""
+    place in the queue at once and every checklane.TELL_S.
+
+    `lock`: the run goes behind the wrapper lock of that checklane.wrap_key (checks.wrap_cmd), so it takes
+    that lock's one lane, whatever its repository, and never a repository lane or an overflow lane: runs
+    behind one wrapper lock go one at a time, and lock-free runs never wait behind them. `cap`: the most of
+    the project's checks that run at once over all its lanes (checklane.project_cap; 0: none), the lane
+    going to the most urgent waiter (cap_turn). A priority-1 waiter (`priority` <= 1) whose lanes are held
+    only by less urgent runs takes an overflow lane beside them while `headroom()` says the host has room,
+    never beside a holder in the same `worktree` (one suite per worktree)."""
     from . import checklane
     if not project_name or os.environ.get(HELD_ENV) or os.environ.get(checkcap.HELD_ENV):
         return Grant()
+    if lock:   # one wrapper lock: its own single lane, never an overflow one
+        repo, slots, max_wait, headroom = f"w{lock}", 1, 0.0, None
     slots = max(1, int(slots or 1))
     lanes = lane_paths(project_name, slots, repo)
     extra_lanes = lane_paths(project_name, slots, repo, overflow=True)
@@ -460,7 +516,8 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
         return Grant()   # an unwritable slot directory: the checks slot says so
     arrival = locks._arrival(ticket)
     fields = {**({"task": task} if task.isdigit() else {}), **({"priority": priority} if priority is not None else {}),
-              **({"cost": cost} if cost else {}), "hb": checklane.HEARTBEAT_S}
+              **({"cost": cost} if cost else {}), **({"lock": lock} if lock else {}),
+              **({"worktree": str(worktree)} if worktree else {}), "hb": checklane.HEARTBEAT_S}
     start, told = time.time(), 0.0
     try:
         while True:
@@ -473,15 +530,25 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
             free = slots - len([x for x in lanes if locks._slot_labels([x])])
             q = suite_order(project_name, repo=repo)
             f = None
+            cheaper = (max_wait > 0 and cost and time.time() - arrival >= max_wait and recs
+                       and all(checklane.cheaper(cost, r.get("cost") or {}) for r in recs))
+            urgent = (not cheaper and priority is not None and priority <= 1 and recs and headroom is not None
+                      and all((r["priority"] if isinstance(r.get("priority"), (int, float)) else NO_PRIORITY) > 1 for r in recs)
+                      and not (worktree and any(r.get("worktree") == str(worktree) for r in recs)) and headroom())
             try:
-                if free > 0 and (ticket not in q or q.index(ticket) < free):
-                    f = locks.try_take(lanes, label, what, extra=fields)
-                elif (max_wait > 0 and cost and time.time() - arrival >= max_wait and recs
-                      and all(checklane.cheaper(cost, r.get("cost") or {}) for r in recs)):
-                    f = locks.try_take(extra_lanes, label, what, extra={**fields, "overflow": True})
-                    if f is not None and tell:
-                        tell(f"took an extra checks lane alongside the holders after {_mins(time.time() - arrival)}: "
-                             f"this run is cheaper than {'; '.join(checklane.holder_text(r, time.time()) for r in recs[:3])}")
+                with _cap_guard(project_name, cap):
+                    if free > 0 and (ticket not in q or q.index(ticket) < free):
+                        if cap_turn(project_name, cap, ticket, slots):
+                            f = locks.try_take(lanes, label, what, extra=fields)
+                    elif (cheaper or urgent) and cap_turn(project_name, cap, ticket, slots):
+                        f = locks.try_take(extra_lanes, label, what, extra={**fields, "overflow": True})
+                        held_by = "; ".join(checklane.holder_text(r, time.time()) for r in recs[:3])
+                        if f is not None and tell and cheaper:
+                            tell(f"took an extra checks lane alongside the holders after {_mins(time.time() - arrival)}: "
+                                 f"this run is cheaper than {held_by}")
+                        elif f is not None and tell:
+                            tell(f"took an extra checks lane beside less urgent runs ({held_by}): this run's task is "
+                                 f"priority {priority:g} and the host has room")
             except OSError:
                 return Grant()
             if f is not None:
@@ -496,8 +563,11 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                     waiting(True)
                 told = time.time()
                 pos = (q.index(ticket) + 1) if ticket in q else 1
-                rule = ("one at a time per project and repository" if slots == 1
+                rule = ("one at a time behind this wrapper lock (checks.wrap_cmd)" if lock else
+                        "one at a time per project and repository" if slots == 1
                         else f"{slots} at a time per project and repository")
+                rule += f"; at most {cap} of the project's checks at once (checks.test_project_max)" if cap > 0 else ""
+                recs = recs or locks.holder_records(project_held(project_name))
                 held_by = "; ".join(checklane.holder_text(r, told) for r in recs[:3]) or "a run that just ended"
                 tell and tell(f"waiting for this project's other full checks to end ({rule}, most urgent priority "
                               f"first; position {pos} of {max(len(q), pos)}, {pos - 1} waiter(s) ahead, waited "

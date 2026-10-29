@@ -505,8 +505,9 @@ def _known_keys(path: list[str]) -> set[str] | None:
     if path == ["checks"]:
         # wrap_cmd: the project's own lock or queue command the commands after `ttp checks --` run
         # behind (push.wrap_of; default "", none); delivery.push_checks never go through it.
-        # slots, light_cmds, max_wait_s, wait_event_s: the checks lanes (checklane).
-        return {"nice", "ionice", "wall_cap_s", "wrap_cmd", "slots", "light_cmds", "max_wait_s", "wait_event_s"}
+        # slots, light_cmds, max_wait_s, wait_event_s, test_project_max: the checks lanes (checklane).
+        return {"nice", "ionice", "wall_cap_s", "wrap_cmd", "slots", "light_cmds", "max_wait_s", "wait_event_s",
+                "test_project_max"}
     if len(path) == 1 and isinstance(DEFAULT_CONFIG.get(path[0]), dict):
         return set(DEFAULT_CONFIG[path[0]]) | EXTRA_KEYS.get(path[0], set())
     return None

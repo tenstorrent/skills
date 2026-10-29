@@ -2581,12 +2581,14 @@ def cmd_checks(a) -> None:
     vpy = str(push.venv_python(top, {**os.environ, **venv_vars}) or "")
     mine, dropped = _extra_checks(a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd, own, vpy)
     mine = push.with_host(mine, checks_host)
+    wrapped, wrap = set(), ()
     if mine:   # checks.wrap_cmd: the project's own lock or queue wrapper (never the project checks)
         try:
             wrap = push.wrap_of(cfg)
         except ValueError as e:
             die(f"ttp checks: {e}; the commands after `--` were not run", 1)
         mine = push.with_wrap(mine, wrap)
+        wrapped = {str(c) for c in mine if getattr(c, "wrap", None)}   # their run takes the lock's lane
         if wrap and any(not push.remote_host(c) for c in mine):
             if why := push.wrap_problem(wrap, top, {**os.environ, **venv_vars}):
                 die(f"ttp checks: {why}", 1)
@@ -2763,7 +2765,7 @@ def cmd_checks(a) -> None:
                                 _checks_key(p, tree, todo, purpose) if fresh_ok else "",
                                 (lambda: bool(_recorded_pass(p, tree, todo, purpose))) if fresh_ok else None,
                                 todo, checklane.all_light(todo, cfg, mine if getattr(a, "light", False) else ()),
-                                str(top))
+                                str(top), checklane.wrap_key(wrap) if any(str(c) in wrapped for c in todo) else "")
             # Checks of the same tree may have passed while these waited (the same checks running beside
             # them, a review's pre-started ones): that pass serves, and the slot goes to the next waiter.
             if slot is not None and fresh_ok and (again := _recorded_pass(p, tree, todo, purpose)):
@@ -3246,7 +3248,8 @@ def _checks_lane_status(as_json: bool) -> int:
                          text=True).stdout.strip()
     here_repo = testslots.repo_key(top) if top else ""
     if as_json:
-        print(json.dumps({"project": p.name, "slots": checklane.slots(p.config()), "this_repo": here_repo,
+        print(json.dumps({"project": p.name, "slots": checklane.slots(p.config()),
+                          "project_max": checklane.project_cap(p.config()), "this_repo": here_repo,
                           "repos": checklane.lane_status(p.name)}, indent=2))
     else:
         print(checklane.status_text(p.name, p.config(), here_repo))
@@ -3255,7 +3258,7 @@ def _checks_lane_status(as_json: bool) -> int:
 
 def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: bool = False,
                  arrived: float | None = None, same: str = "", done=None, cmds: list | None = None,
-                 light: bool = False, top: str = ""):
+                 light: bool = False, top: str = "", lock: str = ""):
     """Wait for a host-wide checks slot (checkcap). The wait is told in the log, the run's notes
     (progress.md) and CHECKS_SLOT_WAIT, which the `--result` probe and `ttp status` read. In the
     foreground it is recorded like a `ttp lock` wait, so it does not count toward the run's wall
@@ -3265,7 +3268,9 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     for this process (CHECKS_SLOT_CANCEL) ends the wait and the run (exit 1). Slots it cannot write end
     the run (exit 2), never uncapped. Light checks (`light`: checklane.all_light) run at once, outside
     every slot; full checks queue for one of the lanes of the project's repository at `top` (checklane:
-    checks.slots, checks.max_wait_s), told with the holder and the queue position each minute."""
+    checks.slots, checks.max_wait_s), or with `lock` (checklane.wrap_key: commands behind checks.wrap_cmd)
+    for that wrapper lock's one lane, at most checklane.project_cap of the project's at once, told with
+    the holder and the queue position each minute."""
     from . import checkcap, checklane, locks as lk
     foreground = not detached and not os.environ.get("TTP_DETACHED")
     key = f"checks:{os.getpid()}:{time.time()}"
@@ -3302,6 +3307,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     cfg = p.config() if p else {}
     from . import testslots
     repo = testslots.repo_key(top) if p else ""
+    lane_repo = f"w{lock}" if lock else repo
     cmds = cmds or []
     what = " && ".join(str(c) for c in cmds)[:300] or "full checks"
     # One full checks run per project at a time (testslots.suite_hold), taken before the checks slot so
@@ -3313,12 +3319,13 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     try:
         suite = testslots.suite_hold(p.name if p else None, tell,
                                      checkcap.FOREGROUND_WAIT_S if foreground and p else None,
-                                     lambda on: waiting(on, str(testslots.suite_path(p.name, repo))),
+                                     lambda on: waiting(on, str(testslots.suite_path(p.name, lane_repo))),
                                      lambda: _checks_cancelled(run_dir), f"run {run_dir.name}", prio, arrived,
                                      slots=checklane.slots(cfg), repo=repo,
                                      cost=checklane.cost(p.state if p else None, _commands_hash(cmds), cmds, cfg),
                                      max_wait=checklane.max_wait_s(cfg), state=p.state if p else None,
-                                     what=what)
+                                     what=what, lock=lock, cap=checklane.project_cap(cfg), worktree=top,
+                                     headroom=checklane.headroom)
         if suite is None:
             return None
         left = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None

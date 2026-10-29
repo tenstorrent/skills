@@ -2097,3 +2097,203 @@ def test_checks_status_reads_the_lanes_and_never_queues_or_writes(env, tmp_path,
     finally:
         _stop(holder)
         waiter.join(10)
+
+
+_WRAP_A, _WRAP_B = "aaaaaaaaaaaa", "bbbbbbbbbbbb"   # two wrapper locks (checklane.wrap_key)
+
+
+def test_lock_free_checks_run_beside_a_run_behind_a_wrapper_lock_which_holds_only_its_lock_lane(
+        env, tmp_path, monkeypatch):
+    from ttp import checklane, testslots
+    _lane_env(monkeypatch)
+    locked = testslots.suite_hold("pa", repo=_LANE_REPO, slots=2, lock=_WRAP_A, cap=4, wait_s=0)
+    assert locked and locked.files and ".w" + _WRAP_A + "." in locked.files[0].name, "the wrapper lock's own lane"
+    a = testslots.suite_hold("pa", repo=_LANE_REPO, slots=2, cap=4, wait_s=0)
+    b = testslots.suite_hold("pa", repo=_LANE_REPO, slots=2, cap=4, wait_s=0)
+    assert a and a.files and b and b.files, "both repository lanes stay free for lock-free checks"
+    assert testslots.suite_hold("pa", repo=_LANE_REPO, slots=2, cap=4, wait_s=0.2) is None, "a third waits"
+    bases = testslots.suite_bases("pa")
+    assert any(x.endswith(".w" + _WRAP_A) for x in bases), bases
+    assert checklane.wrap_key(("ttp", "lock", "dev", "--")) == checklane.wrap_key(["ttp", "lock", "dev", "--"])
+    assert checklane.wrap_key(()) == "" and len(checklane.wrap_key(("flock", "/tmp/x"))) == 12
+    for g in (locked, a, b):
+        g.close()
+
+
+def test_runs_behind_one_wrapper_lock_go_one_at_a_time_and_another_lock_does_not_wait(env, tmp_path, monkeypatch):
+    from ttp import testslots
+    _lane_env(monkeypatch)
+    first = testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, lock=_WRAP_A, cap=8, wait_s=0)
+    assert first and first.files
+    told = []
+    assert testslots.suite_hold("pa", repo="ba9876543210", slots=4, lock=_WRAP_A, cap=8, wait_s=0.3,
+                                tell=told.append) is None, "the same wrapper lock waits, whatever the repository"
+    assert told and "behind this wrapper lock" in told[0], told
+    # Overflow lanes never serve a wrapper lock: its runs would only queue on the lock itself.
+    assert testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, lock=_WRAP_A, cap=8, wait_s=0.5, max_wait=0.1,
+                                cost={"cls": 0}, priority=1, headroom=lambda: True) is None
+    other = testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, lock=_WRAP_B, cap=8, wait_s=0)
+    assert other and other.files, "another wrapper lock has its own lane"
+    first.close(), other.close()
+
+
+def test_checks_test_project_max_caps_a_projects_checks_at_once_over_all_its_lanes(env, tmp_path, monkeypatch):
+    from ttp import checklane, project, testslots
+    _lane_env(monkeypatch)
+    locked = testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, lock=_WRAP_A, cap=2, wait_s=0)
+    a = testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, cap=2, wait_s=0)
+    assert locked and a and a.files
+    told = []
+    assert testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, cap=2, wait_s=0.3, tell=told.append) is None, \
+        "a free repository lane past the project's cap waits"
+    assert "at most 2 of the project's checks" in told[0] and "running" in told[0], told
+    assert testslots.suite_hold("pb", repo=_LANE_REPO, slots=4, cap=2, wait_s=0), "another project never waits"
+    locked.close()
+    b = testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, cap=2, wait_s=1)
+    assert b and b.files, "a lane under the cap again"
+    a.close(), b.close()
+    monkeypatch.delenv("TTP_TEST_PROJECT_MAX", raising=False)
+    monkeypatch.setattr(testslots, "project_max", lambda cfg=None, *a, **k: 7)
+    assert checklane.project_cap({}) == 7, "unset: the test-worker budget, its default unchanged"
+    project.set_account_setting("checks.test_project_max", 3)
+    assert checklane.project_cap({}) == 3
+    assert checklane.project_cap({"checks": {"test_project_max": 5}}) == 5, "the project's setting wins"
+    assert checklane.project_cap({"checks": {"test_project_max": "x"}}) == 3, "an invalid one falls back"
+
+
+def test_checks_test_project_max_is_chat_settable_as_a_whole_number_of_at_least_one(env, capsys):
+    from ttp import cli, coordinator, project
+    for v in ("3", "1"):
+        cli.main(["config", "--chat-settable", "checks.test_project_max", v])
+        assert f"accepted as {v}" in capsys.readouterr().out
+    conv = coordinator.settable("checks.test_project_max")
+    assert conv(4) == 4 and conv(" 2 ") == 2
+    for bad in ("0", "1.5", "x", '{"slots": 2}', "true", "-1"):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["config", "--chat-settable", "checks.test_project_max", bad])
+        assert e.value.code == 1 and "refused" in capsys.readouterr().out, bad
+    for bad in (0, 1.5, True, {"slots": 2}, [2], None):
+        with pytest.raises(ValueError):
+            conv(bad)
+    with pytest.raises(ValueError):   # the section itself takes no scalar
+        coordinator.settable("checks")
+    assert project.unknown_key_hint("checks.test_project_max") is None, "a project-level checks key"
+
+
+def test_a_wrapper_lock_or_project_cap_wait_names_its_holder_and_raises_the_lane_wait_event(
+        env, tmp_path, monkeypatch):
+    from ttp import checkcap, checklane, locks, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.setenv("TTP_TASK", "12")
+    hold = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, lock=_WRAP_A, what="pytest -q tests/dev")
+    monkeypatch.delenv("TTP_TASK")
+    tickets = []
+    try:
+        for base in (testslots.suite_base("pa", "w" + _WRAP_A), testslots.suite_base("pa", _LANE_REPO)):
+            tickets.append(locks.enqueue(checkcap.slot_dir(), base, "task #13 pa: full checks (run 9, pid 1)",
+                                         time.time() - 1000, priority=2))
+            ev = checklane.wait_events("pa", {})
+            assert ev and all("#12" in x["text"] and "#13" in x["text"] for x in ev), (base, ev)
+            assert all("checks.wrap_cmd" in x["text"] for x in ev)
+            locks.dequeue(tickets.pop())
+        lines = checklane.status_text("pa", {})
+        assert "wrapper lock " + _WRAP_A in lines and "#12" in lines, lines
+    finally:
+        for t in tickets:
+            locks.dequeue(t)
+        hold.close()
+
+
+def test_a_priority_1_check_starts_before_routine_ones_across_the_projects_lanes(env, tmp_path, monkeypatch):
+    from ttp import checkcap, locks, testslots
+    _lane_env(monkeypatch)
+    hold = testslots.suite_hold("pa", repo=_LANE_REPO, slots=2, cap=1, priority=5)
+    order = []
+
+    def wait(name, prio, **kw):
+        g = testslots.suite_hold("pa", repo=_LANE_REPO, slots=2, cap=1, priority=prio, wait_s=30, **kw)
+        order.append(name)
+        time.sleep(0.2)
+        g.close()
+
+    def queued():
+        return sum(len(locks.queued(checkcap.slot_dir(), b)) for b in testslots.suite_bases("pa"))
+    threads = []
+    for name, prio, kw in (("locked routine", 5, {"lock": _WRAP_A}), ("routine", 5, {}),
+                           ("routine 2", 6, {}), ("urgent", 1, {})):
+        threads.append(threading.Thread(target=wait, args=(name, prio), kwargs=kw))
+        threads[-1].start()
+        assert _wait_for(lambda: queued() == len(threads)), name
+    hold.close()
+    for t in threads:
+        t.join(60)
+    assert order == ["urgent", "locked routine", "routine", "routine 2"], order
+
+
+def test_a_priority_1_check_starts_beside_routine_holders_only_with_headroom_and_another_worktree(
+        env, tmp_path, monkeypatch):
+    from ttp import testslots
+    _lane_env(monkeypatch)
+    hold = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, priority=4, worktree="/w/one")
+    try:
+        for why, kw in (("no headroom", {"headroom": lambda: False, "worktree": "/w/two"}),
+                        ("same worktree", {"headroom": lambda: True, "worktree": "/w/one"}),
+                        ("routine waiter", {"headroom": lambda: True, "worktree": "/w/two", "prio": 3})):
+            prio = kw.pop("prio", 1)
+            assert testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, priority=prio, wait_s=0.3, **kw) is None, why
+        told = []
+        g = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, priority=1, wait_s=5, headroom=lambda: True,
+                                 worktree="/w/two", tell=told.append)
+        assert g and "-x." in g.files[0].name and any("priority 1" in x for x in told), told
+        assert testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, priority=1, wait_s=0.3, headroom=lambda: True,
+                                    worktree="/w/three") is None, "never beside another priority-1 run"
+        g.close()
+    finally:
+        hold.close()
+
+
+def test_ttp_checks_behind_checks_wrap_cmd_take_the_wrapper_lane_not_the_repository_lane(
+        env, tmp_path, monkeypatch, capsys):
+    from ttp import checkcap, cli, testslots
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _lane_env(monkeypatch)
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 0.3)
+    monkeypatch.setattr(cli, "_checks_detach", lambda *a, **k: None)
+    p.set_config("checks.slots", 1)
+    p.set_config("checks.wrap_cmd", "/usr/bin/env")
+    hold = testslots.suite_hold(p.name, repo=testslots.repo_key(repo))
+    seen = tmp_path / "seen"
+    try:
+        cli.main(["checks", "--", f"sh -c 'touch {seen}'"])
+        assert seen.exists(), "a run behind the wrapper lock waited behind the repository's lock-free run"
+    finally:
+        hold.close()
+
+
+def test_a_quick_device_query_check_runs_beside_a_long_device_check_in_another_lane_and_status_names_both(
+        env, tmp_path, monkeypatch, capsys):
+    # A project with a tt-smi check and a long device check, behind different wrapper locks or none: they
+    # run at once in separate lanes (a quick query once waited hours behind the long one), and
+    # `ttp checks --slot-status --json` names each lane's group, never an empty repository.
+    import json as _json
+    from ttp import cli, testslots
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _lane_env(monkeypatch)
+    key = testslots.repo_key(repo)
+    long_run = testslots.suite_hold(p.name, repo=key, slots=1, lock=_WRAP_A, cap=4, wait_s=0,
+                                    what="pytest -q tests/device_long")
+    smi = testslots.suite_hold(p.name, repo=key, slots=1, cap=4, wait_s=0, what="tt-smi -s")
+    smi_locked = testslots.suite_hold(p.name, repo=key, slots=1, lock=_WRAP_B, cap=4, wait_s=0, what="tt-smi -s")
+    try:
+        assert long_run and smi and smi_locked and smi.files and smi_locked.files, "no wait behind the long check"
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--slot-status", "--json"])
+        assert e.value.code == 0
+        out = _json.loads(capsys.readouterr().out)
+        groups = [r["group"] for r in out["repos"]]
+        assert len(groups) == 3 and all(g.strip() for g in groups) and all(r["repo"] for r in out["repos"]), out
+        assert {"wrapper lock " + _WRAP_A, "wrapper lock " + _WRAP_B, "repository " + key} == \
+            {g.replace(" (checks.wrap_cmd)", "") for g in groups}, groups
+    finally:
+        for g in (long_run, smi, smi_locked):
+            g and g.close()

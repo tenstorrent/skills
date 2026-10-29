@@ -176,6 +176,16 @@ def _checks_ionice(v):
     return t
 
 
+def _checks_project_max(v):
+    """checks.test_project_max as config_set takes it: a whole number, at least 1."""
+    n = v if isinstance(v, int) and not isinstance(v, bool) else None
+    if isinstance(v, str) and v.strip().isdigit():
+        n = int(v.strip())
+    if n is None or n < 1:
+        raise ValueError(f"checks.test_project_max: {v!r} is not a whole number of at least 1")
+    return n
+
+
 USER_SETTABLE = {
     "budget.daily_usd": float, "budget.weekly_usd": float, "budget.reserve_pct": float,
     "budget.global_daily_usd": float, "budget.day_start": str, "budget.timezone": str,
@@ -190,6 +200,8 @@ USER_SETTABLE = {
     # Check commands' CPU and IO priority (testslots.nice_level, ionice_args): nice 0-19; ionice idle or best-effort[:0-7].
     "checks.nice": lambda v: _checks_nice(v),
     "checks.ionice": lambda v: _checks_ionice(v),
+    # How many of the project's checks run at once over all its lanes (checklane.project_cap).
+    "checks.test_project_max": lambda v: _checks_project_max(v),
     # Where code tasks branch from: the project's working branch once it has one.
     "delivery.base_ref": str,
     # Where `ttp push` publishes (required; never main, master or the remote's default branch) and

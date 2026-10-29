@@ -849,7 +849,13 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   project holds at most `checks.test_project_max` slots over all its runs (default twice a run's share), waiters
   are served first-come, push checks take a reserved test slot of their branch when the pool is full, and a
   project runs at most `checks.slots` full `ttp checks` at a time per git repository (its lanes; worktrees of one
-  repository share them; other repositories and projects never wait). Unset, `checks.slots` follows the machine:
+  repository share them; other repositories and projects never wait). A run whose commands go behind
+  `checks.wrap_cmd` takes that wrapper lock's own single lane instead, so runs behind one wrapper lock go one at
+  a time and lock-free checks run beside them. At most `checks.test_project_max` of a project's checks run at once
+  over all its lanes (chat-settable, a whole number of at least 1; unset, the project's test-worker budget); waiting
+  checks start in task-priority order across them, and a priority-1 check whose lanes are held only by less urgent
+  runs starts beside them in an extra lane while the load is under half the cores, never in a worktree that already
+  runs checks. Unset, `checks.slots` follows the machine:
   one lane per 8 cores and per 8 GiB of available memory, the smaller, 1 to 4. A lane goes to the most urgent
   waiting task priority first, then arrival; a running holder is never pre-empted, and a waiter gains one
   priority step per 15 min waited, so none starves. Light checks never wait: a run whose every command is a
