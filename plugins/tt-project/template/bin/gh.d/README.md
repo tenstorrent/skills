@@ -8,8 +8,10 @@ Before each `gh` call from a run, `bin/gh` runs every executable, non-hidden reg
 sorted by name:
 
 - Arguments: gh's own (`pr comment 7 --body-file -` for `gh pr comment 7 --body-file -`).
-- Stdin: the same bytes gh gets (empty when gh's stdin is a terminal). It is read whole once,
-  up to 16 MiB, and handed to every hook and then to gh.
+- Stdin: the same bytes gh gets when the call reads stdin (`--input -`, `-F name=@-`,
+  `--body-file -` and the like; empty when gh's stdin is a terminal). It is read whole once, up to
+  16 MiB, and handed to every hook and then to gh. Any other call gives the hooks and gh /dev/null,
+  so a caller's open stdin pipe never stalls it.
 - Environment: the run's, plus `TTP_GH_REAL`, the real gh. A hook that calls gh itself uses
   `"$TTP_GH_REAL"`; plain `gh` would run the hooks again.
 - Stdout and stderr go to the caller's stderr: say why a call is refused there.

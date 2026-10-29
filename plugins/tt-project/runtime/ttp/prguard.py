@@ -39,7 +39,8 @@ Claude Code workers also get a PreToolUse hook (hook.py) that denies the obvious
 wrapper: gh called by its full path, or curl and the like talking to the GitHub API about drafts.
 
 Before any of this the wrapper runs the project's own gh pre-hooks (run_gh_hooks): each executable,
-non-hidden regular file in `gh.d/` beside it, by name, with gh's arguments and gh's stdin. A hook
+non-hidden regular file in `gh.d/` beside it, by name, with gh's arguments and gh's stdin (/dev/null
+when the call does not read stdin, see needs_stdin, so an open pipe never stalls it). A hook
 can only refuse: a non-zero exit, a hook that cannot start or one that runs past HOOK_TIMEOUT_S
 refuses the call, and the guards above still run once every hook passed. `ttp upgrade` never
 touches a project's own gh.d files (only the template's README there).
@@ -999,10 +1000,58 @@ def _restore_stdin(data: bytes) -> None:
         os.dup2(f.fileno(), 0)
 
 
+# Commands that read stdin without a `-` argument when it is not a terminal (a secret or variable
+# value, a gist's content, a key, a token, workflow inputs as JSON): they keep it.
+STDIN_COMMANDS = frozenset((("secret", "set"), ("variable", "set"), ("gist", "create"), ("ssh-key", "add"),
+                            ("gpg-key", "add"), ("auth", "login"), ("workflow", "run"), ("alias", "import"),
+                            ("extension", "exec")))
+
+
+def needs_stdin(args: list[str]) -> bool:
+    """Whether gh `args` may read gh's stdin. The wrapper gives the gh.d hooks and the real gh /dev/null
+    otherwise, so an open pipe nobody writes to or closes (a parent's) never stalls a call. Keeps stdin:
+    - `--input -`, `--input=-` (gh api's request body);
+    - `-F name=@-`, `-Fname=@-`, `-F=name=@-`, `--field name=@-`, `--field=name=@-` (gh api: a typed
+      field's value from stdin). `-f`/`--raw-field name=@-` does not read stdin: gh sends `@-` as-is;
+    - `--body-file -`, `--body-file=-`, `--notes-file -`, `--notes-file=-`, `-F -`, `-F-`, `-F=-` (pr and
+      issue create/edit/comment/review, pr merge, release create/edit: the text from stdin);
+    - any lone `-` argument (gist create -, ssh-key add -, secret set -f -, alias import -);
+    - STDIN_COMMANDS, and a first word that is not one of GH_COMMANDS (an extension or alias, which
+      may read it)."""
+    if not args or args[0] == "--":
+        return False
+    if not args[0].startswith("-") and args[0] not in GH_COMMANDS:
+        return True
+    if tuple(args[:2]) in STDIN_COMMANDS or "-" in args:
+        return True
+    if "-" in _opts(args, ("--input", "--body-file", "--notes-file")):
+        return True
+    fields = [v.removeprefix("=") for v in _opts(args, ("-F", "--field"))]   # -F=x is -F x to gh
+    return any(v == "-" or v.endswith("=@-") for v in fields)
+
+
+def _stdin_devnull() -> None:
+    """Point fd 0 at /dev/null (the hooks and the real gh inherit it), unless it is a terminal: gh may
+    prompt there."""
+    try:
+        if os.isatty(0):
+            return
+    except OSError:
+        pass
+    try:
+        fd = os.open(os.devnull, os.O_RDONLY)
+    except OSError:
+        return
+    if fd != 0:
+        os.dup2(fd, 0)
+        os.close(fd)
+
+
 def run_gh_hooks(args: list[str], own_dir: str, real: str = "") -> str | None:
-    """Why the project's gh pre-hooks refuse gh `args`, else None. gh's stdin (when a hook exists and
-    it is not a terminal) is read once and given to every hook, then back to gh. Fails closed: a
-    hook that cannot start or runs past HOOK_TIMEOUT_S, or a stdin that cannot be read whole, refuses.
+    """Why the project's gh pre-hooks refuse gh `args`, else None. gh's stdin (when gh reads it, see
+    needs_stdin, and it is not a terminal) is read once and given to every hook, then back to gh;
+    otherwise the hooks get /dev/null. Fails closed: a hook that cannot start or runs past
+    HOOK_TIMEOUT_S, or a stdin that cannot be read whole, refuses.
     A hook's own output goes to stderr, never into gh's stdout. TTP_GH_REAL names the real gh, for a
     hook that calls gh itself (plain `gh` would run the hooks again)."""
     try:
@@ -1013,7 +1062,7 @@ def run_gh_hooks(args: list[str], own_dir: str, real: str = "") -> str | None:
         return None
     data = None
     try:
-        if not os.isatty(0):
+        if needs_stdin(args) and not os.isatty(0):
             data = _read_stdin(time.monotonic() + HOOK_TIMEOUT_S)
     except TimeoutError:
         return (f"refused: gh's stdin did not end within {HOOK_TIMEOUT_S} s, so the project's gh hooks "
@@ -1068,6 +1117,8 @@ def main(argv: list[str], own_dir: str) -> int:
         print("gh: not found on PATH", file=sys.stderr)
         return 127
     args = argv[1:]
+    if not needs_stdin(args):
+        _stdin_devnull()   # a parent's open pipe never reaches the hooks or the real gh
     why = run_gh_hooks(args, own_dir, real)   # the project's own checks first: they can only refuse
     if why:
         print(f"gh (tt-project): {why}", file=sys.stderr)

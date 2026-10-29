@@ -208,8 +208,10 @@ def run_group(cmd: str, *, cwd: str, timeout: float, env: dict | None,
 
 
 def _run_group(cmd: str, *, cwd: str, timeout: float, env: dict | None) -> subprocess.CompletedProcess:
-    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                            cwd=cwd, env=env, start_new_session=True)
+    # stdin /dev/null: a command that reads it gets EOF, never the daemon's own stdin (an open pipe would
+    # hold it to its timeout)
+    proc = subprocess.Popen(cmd, shell=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, cwd=cwd, env=env, start_new_session=True)
     spawned(proc.pid)
     try:
         try:

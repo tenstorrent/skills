@@ -881,3 +881,22 @@ def test_an_over_cap_precheck_and_heal_timeout_name_the_cap_and_the_value_asked(
     assert "timeout_asked_s" not in under and heal.run_fix(under, str(p.root), {}) == (124, "timed out after 240 s")
     fix = heal.validate({"check": "true", "fix": "true", "fix_detached": True, "fix_timeout_s": 20000})
     assert fix["fix_timeout_s"] == heal.FIX_MAX_TIMEOUT_S and fix["fix_timeout_asked_s"] == 20000
+
+
+def test_schedule_and_heal_commands_read_eof_not_the_daemons_open_stdin_pipe(tmp_path):
+    """The daemon's stdin an open pipe nobody writes to or closes: a command schedule (or precheck) and a
+    heal check that read stdin get EOF at once instead of blocking until their timeout."""
+    from ttp import heal, schedrun
+    rd, wr = os.pipe()
+    saved = os.dup(0)
+    os.dup2(rd, 0)
+    try:
+        t0 = time.monotonic()
+        out = schedrun.run_group("cat; echo done", cwd=str(tmp_path), timeout=10, env=None)
+        assert out.returncode == 0 and out.stdout == "done\n" and time.monotonic() - t0 < 5, out
+        t0 = time.monotonic()
+        assert heal._exec("cat; echo done", str(tmp_path), 10) == (0, "done") and time.monotonic() - t0 < 5
+    finally:
+        os.dup2(saved, 0)
+        for fd in (saved, rd, wr):
+            os.close(fd)

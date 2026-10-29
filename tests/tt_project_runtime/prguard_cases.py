@@ -174,14 +174,78 @@ def test_gh_pre_hooks_and_gh_get_the_same_stdin_and_a_slow_hook_or_stdin_refuses
     assert r.returncode == 1 and b"gh.d/30-slow ran past 1 s" in r.stderr and time.monotonic() - t0 < 20, r.stderr
     assert not (tmp_path / "gh.stdin").exists()
     (p.harness / "bin" / "gh.d" / "30-slow").unlink()
-    # A stdin that never ends refuses instead of hanging.
+    # A stdin gh reads that never ends refuses instead of hanging.
     rd, wr = os.pipe()
     try:
-        r = _gh_main(p, tmp_path, ["pr", "list"], fake=fake, timeout_s=1, stdin=rd)
+        r = _gh_main(p, tmp_path, ["issue", "comment", "7", "--body-file", "-"], fake=fake, timeout_s=1, stdin=rd)
     finally:
         os.close(rd)
         os.close(wr)
     assert r.returncode == 1 and b"stdin did not end within 1 s" in r.stderr and not (tmp_path / "gh.stdin").exists()
+
+
+def test_gh_needs_stdin_only_for_the_forms_that_read_it():
+    from ttp.prguard import needs_stdin
+    reads = [["api", "x", "--input", "-"], ["api", "x", "--input=-"], ["api", "x", "-F", "b=@-"], ["api", "x", "-Fb=@-"],
+             ["api", "x", "-F=b=@-"], ["api", "x", "--field", "b=@-"], ["api", "x", "--field=b=@-"],
+             ["pr", "create", "--body-file", "-"], ["pr", "edit", "7", "--body-file=-"], ["pr", "comment", "7", "-F", "-"],
+             ["issue", "comment", "7", "-F-"], ["pr", "review", "7", "-F=-"], ["release", "create", "v1", "--notes-file", "-"],
+             ["gist", "create"], ["secret", "set", "X"], ["variable", "set", "X"], ["auth", "login", "--with-token"],
+             ["ssh-key", "add", "-"], ["alias", "import", "-"], ["some-extension", "x"]]
+    quiet = [["api", "repos/<owner>/<repo>/commits?sha=main&per_page=1", "--jq", ".[0].sha"],
+             ["api", "x", "-f", "b=@-"], ["api", "x", "--raw-field", "b=@-"], ["api", "x", "-F", "b=@file"],
+             ["api", "x", "--input", "body.json"], ["api", "x", "--input=-x"], ["pr", "create", "--body-file", "b.md"],
+             ["pr", "list"], ["pr", "view", "7", "--json", "body"], ["--version"], []]
+    assert [a for a in reads if not needs_stdin(a)] == [] and [a for a in quiet if needs_stdin(a)] == []
+
+
+_STDIN_STATE_GH = """#!{python}
+import os, select, sys
+r = select.select([0], [], [], 0)[0]
+state = ("eof" if not os.read(0, 1) else "data") if r else "open"
+open({out!r}, "w").write(state)
+"""
+
+
+def test_gh_and_its_hooks_never_stall_on_an_open_stdin_pipe_gh_does_not_read(env, tmp_path):
+    """A parent's stdin pipe that nobody writes to or closes: a gh call that does not read stdin answers at
+    once, its gh.d hooks and the real gh see EOF (/dev/null), not a hang until HOOK_TIMEOUT_S."""
+    p = make(env)
+    fake = tmp_path / "statebin"
+    fake.mkdir()
+    (fake / "gh").write_text(_STDIN_STATE_GH.format(python=sys.executable, out=str(tmp_path / "gh.state")))
+    (fake / "gh").chmod(0o755)
+    args = ["api", "repos/<owner>/<repo>/commits?sha=main&per_page=1", "--jq", ".[0].sha"]
+    for hooked in (False, True):
+        if hooked:
+            _gh_hook(p, "10-reads", f"#!/bin/sh\ncat > {tmp_path / 'hook.stdin'}\n")
+        rd, wr = os.pipe()
+        try:
+            t0 = time.monotonic()
+            r = _gh_main(p, tmp_path, args, fake=fake, stdin=rd)   # the default 30 s hook timeout
+            took = time.monotonic() - t0
+        finally:
+            os.close(rd)
+            os.close(wr)
+        assert r.returncode == 0 and took < 5, (hooked, took, r.stderr)
+        assert (tmp_path / "gh.state").read_text() == "eof", hooked
+        assert not hooked or (tmp_path / "hook.stdin").read_bytes() == b""
+
+
+def test_gh_api_stdin_forms_still_reach_hooks_and_gh_intact(env, tmp_path):
+    p = make(env)
+    fake = tmp_path / "stdinbin"
+    fake.mkdir()
+    (fake / "gh").write_text(f"#!{sys.executable}\nimport sys\n"
+                             f"open({str(tmp_path / 'gh.stdin')!r}, 'wb').write(sys.stdin.buffer.read())\n")
+    (fake / "gh").chmod(0o755)
+    _gh_hook(p, "10-a", f"#!/bin/sh\ncat > {tmp_path / 'hook.stdin'}\n")
+    ep = "repos/<owner>/<repo>/issues/7/comments"
+    for i, extra in enumerate((["--input", "-"], ["--input=-"], ["-F", "body=@-"], ["--field=body=@-"])):
+        data = f'{{"body": "comment {i}"}}\n'.encode()
+        r = _gh_main(p, tmp_path, ["api", ep, *extra], data, fake=fake)
+        assert r.returncode == 0, (extra, r.stderr)
+        assert (tmp_path / "hook.stdin").read_bytes() == data and (tmp_path / "gh.stdin").read_bytes() == data, extra
 
 
 def test_upgrade_leaves_the_projects_gh_pre_hooks_alone(env, monkeypatch):

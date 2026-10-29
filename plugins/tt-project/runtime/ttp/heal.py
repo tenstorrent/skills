@@ -446,10 +446,11 @@ def _env() -> dict:
 
 
 def _exec(args: str | list[str], cwd: str, timeout: float, env: dict | None = None) -> tuple[int, str]:
-    """Run in a session of its own; a timeout kills the whole group (a hung ssh, a fix's children)."""
+    """Run in a session of its own; a timeout kills the whole group (a hung ssh, a fix's children). stdin
+    is /dev/null, never the daemon's (an open pipe would hold a command that reads it to its timeout)."""
     try:
-        proc = subprocess.Popen(args, shell=isinstance(args, str), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, cwd=cwd, env=env or _env(), start_new_session=True)
+        proc = subprocess.Popen(args, shell=isinstance(args, str), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, cwd=cwd, env=env or _env(), start_new_session=True)
     except OSError as e:
         return 127, str(e)
     schedrun.spawned(proc.pid)   # a daemon that stops or restarts meanwhile kills the group
