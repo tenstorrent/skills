@@ -161,6 +161,7 @@ def test_obligation_with_every_owner_ended_is_reowned_once_its_wake_was_handled(
     assert t["status"] == "queued" and t["origin"] == "daemon" and t["priority"] == 1
     assert f"{ob.REOWN_LABEL}{oid}" in t["labels"] and f"## Obligation {oid} " in t["spec"]
     assert f"#{tid} (cancelled)" in t["spec"] and "post each CI run's result" in t["spec"]
+    assert "no longer owed" in t["spec"] and "superseded" in t["spec"], "an ended subject: say so, the drop is asked once"
     assert "no live owner" not in ob.lines(p.db, t0 + 1500)[0]
     # A second pass starts nothing more.
     check(t0 + 2100)
@@ -182,7 +183,9 @@ def test_obligation_daemon_owner_ending_without_receipt_wakes_once_never_a_secon
     t1 = t0 + 600
     check(t1)   # its owner is live: the episode ends
     assert ob.get(p.db, oid)["raised"] is None
-    p.db.update_task(mine[0], status="done")   # the daemon's owner also ends without a receipt
+    # its subject ended (a PR closed and replaced): the daemon's owner says so and ends without a receipt
+    ob.record(p, oid, "progress", "not owed: the PR was closed and replaced", mine[0], now=t1 + 60)
+    p.db.update_task(mine[0], status="done")
     t2 = t1 + 2 * 3600 + 60
     evs = check(t2)
     assert len(evs) == 2, "the new episode's wake"
@@ -190,6 +193,7 @@ def test_obligation_daemon_owner_ending_without_receipt_wakes_once_never_a_secon
     evs = check(t2 + 300)
     assert len(evs) == 3 and evs[-1]["fingerprint"] == f"obligation:{oid}:reown:{tid}-{mine[0]}", evs
     assert f"#{mine[0]} ended without a receipt" in evs[-1]["text"] and evs[-1]["severity"] == "high"
+    assert "not owed: the PR was closed and replaced" in evs[-1]["text"] and "drop it" in evs[-1]["text"]
     _handle_overdue(p)
     for k in range(1, 6):   # never a loop: no second owner, no repeated wake while the owners stay the same
         evs = check(t2 + 300 + k * 3 * 3600)

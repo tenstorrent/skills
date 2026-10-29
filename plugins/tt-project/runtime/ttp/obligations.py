@@ -1005,7 +1005,8 @@ def _reown(p, o: dict, now: float, raised: list[str]) -> bool:
                 f"- its overdue wake was handled but no owner was attached, and the daemon's own owner "
                 f"#{', #'.join(mine)} ended without a receipt; owners: {former}; last evidence: {_evidence(o)}\n"
                 f"Attach the task that produces it (`ttp obligation attach {oid} <task>`), record the receipt, "
-                f"or drop it with the reason. The daemon starts no second owner for it.")
+                f"or drop it with the reason (evidence starting 'not owed:' is the owner's case for dropping it). "
+                f"The daemon starts no second owner for it.")
         if _raise(db, now, fp, "obligation_overdue", text, int(mine[-1])):
             raised.append(fp)
         return True
@@ -1013,7 +1014,10 @@ def _reown(p, o: dict, now: float, raised: list[str]) -> bool:
             f"{o['text']}\n\nFormer owners, each ended without a receipt: {former}. Their last evidence: "
             f"{_evidence(o)}.\n\nThe daemon started this task because the coordinator's answer to the wake attached "
             "no owner. Read the former owners' results, then produce what is owed and record the receipt, or, if "
-            "it is already delivered, record the receipt with that evidence. Do only what the charter and its "
+            "it is already delivered, record the receipt with that evidence. If it is no longer owed (its subject "
+            "ended or was superseded, such as a PR closed and replaced, or a user decision covered it), record no "
+            f"receipt: record `ttp obligation progress {oid} \"not owed: <evidence>\"`; once this task ends the daemon "
+            "wakes the coordinator once, quoting it, to drop it. Do only what the charter and its "
             "policies allow: a step that needs the user's approval (a PR leaving draft, a merge, a post as the "
             "user) is named in your hand-off as the decision needed, never taken here. If it cannot be produced, "
             "say why in your hand-off.")
