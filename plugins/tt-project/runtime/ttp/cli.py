@@ -4201,9 +4201,9 @@ def _checks_result(run_dir: Path) -> int:
         return 1
     if detach.lost(rc_file).exists():
         why = detach.lost(rc_file).read_text().strip()
-        if not rc_file.exists():   # they left the queue unrun: a waiting owner reads 'dropped'
+        if not _checks_dropped(run_dir):   # they left the queue unrun: a waiting owner reads 'dropped'
             _checks_drop(run_dir, why or "not started", rc=False)
-            durable_write(rc_file, "killed\n")
+        durable_write(rc_file, "killed\n")   # also over an earlier run's exit code: it never answers this one
         print(f"ttp checks: not started: {why}")
         return 0
     info = _read_checks_pid(run_dir)
