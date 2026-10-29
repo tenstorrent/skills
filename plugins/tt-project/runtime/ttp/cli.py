@@ -3422,7 +3422,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         # in the foreground none free by the end of the same wait hands over to detached checks too.
         left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
         slot.tests = testslots.acquire(checkcap.label(p.name if p else None), tell, left,
-                                       p.config() if p else {}, p.name if p else "")
+                                       p.config() if p else {}, p.name if p else "", priority=prio)
         if slot.tests is None:
             slot.close()
             suite.close()

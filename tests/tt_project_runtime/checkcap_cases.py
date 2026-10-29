@@ -2691,11 +2691,7 @@ def test_a_waiter_at_its_projects_budget_keeps_its_place_and_is_never_passed_by_
     told = []
     assert testslots.acquire("later", project_name="pa", wait_s=0.5, tell=told.append) is None
     assert "1 earlier waiter(s) of its project go first" in told[-1], told
-    back = locks.enqueue(checkcap.slot_dir(), testslots.RESOURCE, "earlier", locks._arrival(earlier), group="pa")
-    told.clear()
-    assert testslots.acquire("later", project_name="pa", wait_s=0.5, tell=told.append) is None
-    assert "ahead in the host's line" in told[-1], "back in the host's line at its first arrival, it is ahead"
-    locks.dequeue(back), locks.dequeue(earlier)
+    locks.dequeue(earlier)
     g = testslots.acquire("later", project_name="pa", wait_s=0)
     assert g and g.k == 2
     assert locks.queued(checkcap.slot_dir(), line) == [], "a granted waiter leaves its project's line"
@@ -2752,6 +2748,63 @@ def test_the_project_slot_budget_never_exceeds_the_host_pool(env, monkeypatch):
     try:
         assert [g and g.k for g in held] == [4, 4, None], "a full pool grants nothing more"
         assert len(locks.held_labels(testslots.paths(8))) == 8
+    finally:
+        for g in held:
+            g and g.close()
+
+
+def test_a_projects_waiters_go_most_urgent_first_then_by_arrival_within_one_priority(env, monkeypatch):
+    from ttp import checkcap, locks, testslots
+    _slot_sizes(monkeypatch, 8, 2, TTP_TEST_PROJECT_SLOTS=2)
+    line = f"{testslots.OWN}.{locks.group_id('pa')}"
+    p2 = locks.enqueue(checkcap.slot_dir(), line, "earlier p2", time.time() - 60, priority=2)
+    try:
+        g = testslots.acquire("later p1", project_name="pa", wait_s=0, priority=1)
+        assert g and g.k == 2, "a p1 waiter goes before an earlier p2 one"
+        g.close()
+        p1 = locks.enqueue(checkcap.slot_dir(), line, "earlier p1", time.time() - 30, priority=1)
+        told = []
+        assert testslots.acquire("later p2", project_name="pa", wait_s=0.5, priority=2, tell=told.append) is None
+        assert "2 earlier waiter(s) of its project go first" in told[-1], told
+        locks.dequeue(p1)
+        told.clear()
+        assert testslots.acquire("later p2", project_name="pa", wait_s=0.5, priority=2, tell=told.append) is None
+        assert "1 earlier waiter(s) of its project go first" in told[-1], "within one priority, arrival order"
+    finally:
+        locks.dequeue(p2)
+    g = testslots.acquire("later p2", project_name="pa", wait_s=0, priority=2)
+    assert g and g.k == 2
+    g.close()
+
+
+def test_a_p1_check_takes_one_urgent_grant_beyond_its_projects_budget_held_by_less_urgent_runs(env, monkeypatch):
+    from ttp import locks, testslots
+    _slot_sizes(monkeypatch, 16, 4, TTP_TEST_PROJECT_SLOTS=4)
+    long_p2 = testslots.acquire("long p2 check", project_name="pa", wait_s=0, priority=2)
+    held = [long_p2]
+    try:
+        assert long_p2.k == 4
+        assert testslots.acquire("p2 waiter", project_name="pa", wait_s=0, priority=2) is None, "at budget"
+        assert testslots.acquire("no-task waiter", project_name="pa", wait_s=0) is None
+        told = []
+        urgent = testslots.acquire("p1 check", project_name="pa", wait_s=0, priority=1, tell=told.append)
+        held.append(urgent)
+        assert urgent and urgent.k == 4 and "urgent" in told[-1], "beside the p2 run, which keeps running"
+        assert testslots.acquire("second p1", project_name="pa", wait_s=0, priority=1) is None, "one extra grant only"
+        urgent.close()
+        held.remove(urgent)
+        top = testslots.acquire("top p1", project_name="pa", wait_s=0, priority=1)
+        held.append(top)
+        assert top and top.k == 4
+        assert testslots.acquire("p1 behind a p1", project_name="pa", wait_s=0, priority=1) is None, \
+            "a budget held by an equally urgent run gives no extra grant"
+        for g in held:
+            g.close()
+        held = [testslots.acquire(n, project_name=pr, wait_s=0, priority=2) for n, pr in
+                (("p2", "pa"), ("other a", "pb"), ("other b", "pc"), ("other c", "pd"))]
+        assert [g and g.k for g in held] == [4, 4, 4, 4]
+        assert testslots.acquire("p1 on a full pool", project_name="pa", wait_s=0, priority=1) is None, \
+            "the urgent grant only takes free slots of the host's pool"
     finally:
         for g in held:
             g and g.close()

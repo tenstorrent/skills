@@ -874,7 +874,9 @@ queues behind routine work; nothing running is interrupted:
   (`checks.test_project_max`, below) times one run's grant, at most the pool, so every check under that cap gets its
   workers; `checks.test_project_slots` (chat-settable, a whole number of at least 1) sets the budget outright.
   Waiters are served first-come: one whose project is at its budget lets other projects go first but keeps its
-  place in its project's line, so the project's earliest waiter gets the next freed slots; push checks take a reserved test slot of their branch when the pool is full, and a
+  place in its project's line, where the most urgent task priority goes first, then arrival, so that waiter gets
+  the next freed slots. A priority-1 check whose project's budget is held only by less urgent runs takes one extra
+  run's grant from the pool's free slots instead of waiting, and stops none; push checks take a reserved test slot of their branch when the pool is full, and a
   project runs at most `checks.slots` full `ttp checks` at a time per git repository (its lanes; worktrees of one
   repository share them; other repositories and projects never wait). A run whose commands go behind
   `checks.wrap_cmd` takes that wrapper lock's own single lane instead, so runs behind one wrapper lock go one at

@@ -172,16 +172,23 @@ def project_max(cfg: dict | None = None, s: tuple[int, int] | None = None, kind:
     return max(s[1], min(top, s[0]))
 
 
-def _arrived(t) -> str:
-    """A ticket's '<arrival>-<pid>': the same for one waiter's tickets in the host's and its project's line."""
-    m = re.match(r"[0-9.]+-\d+", t.name)
-    return m.group(0) if m else t.name
-
-
 def own_paths(project_name: str | None, n: int, kind: Kind = TESTS) -> list:
     """One project's budget slots; none for no project (its runs only count against the pool)."""
     return (locks.slot_paths(checkcap.slot_dir(), f"{kind.own}.{locks.group_id(project_name)}", n)
             if project_name else [])
+
+
+def urgent_paths(project_name: str | None, n: int, kind: Kind = TESTS) -> list:
+    """One project's urgent slots beyond its budget: one run's grant (`n`), for a priority-1 waiter whose
+    project's budget is held only by less urgent runs (acquire)."""
+    return (locks.slot_paths(checkcap.slot_dir(), f"{kind.own}.{locks.group_id(project_name)}-x", n)
+            if project_name else [])
+
+
+def _rank(rec: dict) -> float:
+    """A slot holder's task priority from its label; NO_PRIORITY without one (no task, an older runtime)."""
+    v = rec.get("priority")
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else NO_PRIORITY
 
 
 def reserved_path(push_key: str):
@@ -257,14 +264,15 @@ class Grant:
         self.close()
 
 
-def _take(ps: list, own: list, top: int, holder: str, what: str = "test slots") -> tuple[int, list]:
+def _take(ps: list, own: list, top: int, holder: str, what: str = "test slots",
+          extra: dict | None = None) -> tuple[int, list]:
     """(k, files): up to `top` pool slots, each paired with one of the project's (`own`, when it has a budget)."""
     k, files = 0, []
     while k < top:
         o = None
-        if own and (o := locks.try_take(own, holder, what)) is None:
+        if own and (o := locks.try_take(own, holder, what, extra=extra)) is None:
             break
-        if (f := locks.try_take(ps, holder, what)) is None:
+        if (f := locks.try_take(ps, holder, what, extra=extra)) is None:
             if o is not None:
                 o.close()
             break
@@ -274,13 +282,17 @@ def _take(ps: list, own: list, top: int, holder: str, what: str = "test slots") 
 
 def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: float | None = None,
             cfg: dict | None = None, project_name: str | None = None, push_key: str = "",
-            kind: Kind = TESTS) -> Grant | None:
+            kind: Kind = TESTS, priority: int | None = None) -> Grant | None:
     """Take this run's test slots (above); waits while none is free, first-come, telling why every
     TELL_S. None only once `wait_s` passed with none free (a foreground caller hands over). Nested in a
     run that holds slots, its grant at once; with the pool off, Grant() (no limit, nothing set).
     `project_name` (default TTP_PROJECT's) is whose budget it counts against; `push_key` (push.priority_key)
     marks push checks, which take the branch's reserved slot when the pool has none free. `kind` BUILDS
-    takes build slots instead; a build nested in a check uses the check's test grant."""
+    takes build slots instead; a build nested in a check uses the check's test grant. `priority` (the
+    task's) orders its project's waiters, most urgent first, then arrival (suite_priority: a waiter ages
+    one step per SUITE_AGE_S); a priority-1 waiter whose project's budget is held only by less urgent runs
+    takes one extra run's grant beyond it (urgent_paths) from the pool's free slots, so it never waits
+    behind a long, less urgent check and stops none."""
     tell = tell or (lambda _line: None)
     what = f"{kind.name} slots"
     for env in (kind.held_env, HELD_ENV):   # HELD_ENV: a build in a check builds on the check's slots
@@ -298,16 +310,19 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
             ps, own = paths(pool, kind), own_paths(name, project_max(cfg, s, kind), kind)
             k, files, why = 0, [], f"all {pool} are held"
             try:
-                ahead = []
+                ahead, extra = [], ({"priority": priority} if priority is not None else None)
                 if own and not push_key:
-                    # Its place in its project's line, kept while it is out of the host's line.
+                    # Its place in its project's line (most urgent first, then arrival), kept while it is
+                    # out of the host's line; an earlier waiter there goes first.
                     line_of = f"{kind.own}.{locks.group_id(name)}"
                     if mine is None:
-                        mine = locks.enqueue(checkcap.slot_dir(), line_of, holder, start)
-                    line = locks.queued(checkcap.slot_dir(), line_of)
-                    back = {_arrived(t) for t in locks.queued(checkcap.slot_dir(), kind.resource)}
-                    ahead = [t for t in line[:line.index(mine) if mine in line else len(line)]
-                             if _arrived(t) not in back]
+                        mine = locks.enqueue(checkcap.slot_dir(), line_of, holder, start, priority=priority)
+                    line = sorted(locks.queued(checkcap.slot_dir(), line_of), key=_order_key)
+                    ahead = line[:line.index(mine)] if mine in line else line
+                    if (not ahead and not locks.any_free(own) and priority is not None and priority <= 1
+                            and (recs := locks.holder_records(own))
+                            and all(_rank(r) > 1 for r in recs) and locks.any_free(urgent := urgent_paths(name, top, kind))):
+                        own, what = urgent, f"{kind.name} slots (urgent: its project's budget is held by less urgent runs)"
                 if own and not push_key and not locks.any_free(own):
                     # At its project's budget: out of the host's line so others go first, keeping its
                     # place in its project's line.
@@ -320,7 +335,7 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                     locks.dequeue(ticket)
                     ticket, why = None, f"{len(ahead)} earlier waiter(s) of its project go first"
                 elif push_key:
-                    k, files = _take(ps, own, top, holder, what)
+                    k, files = _take(ps, own, top, holder, what, extra)
                     if not k and (f := locks.try_take([reserved_path(push_key)], holder, "push test slot")):
                         k, files = 1, [f]
                 else:
@@ -328,7 +343,7 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                         ticket = locks.enqueue(checkcap.slot_dir(), kind.resource, holder, start, group=name)
                     q = locks.queued(checkcap.slot_dir(), kind.resource)
                     if q and q[0] == ticket:
-                        k, files = _take(ps, own, top, holder, what)
+                        k, files = _take(ps, own, top, holder, what, extra)
                     elif q:
                         why = f"{q.index(ticket) if ticket in q else len(q)} ahead in the host's line"
             except OSError as e:
