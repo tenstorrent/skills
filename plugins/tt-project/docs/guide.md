@@ -930,7 +930,16 @@ queues behind routine work; nothing running is interrupted:
   `checks.wrap_cmd` never spill; a run that does not pass on a spill host runs again here, and that result
   counts. `checks.json` (`spilled_to`), `ttp status` and `ttp checks status` name the host.
   `ttp checks status` (also `--slot-status`, `--json`) prints each repository's lane holders (pid, task, run,
-  age, alive or dead) and its waiters in queue order, the next one marked; it is read only and never queues. A run's check commands stop at a wall-time cap: on by
+  age, alive or dead) and its waiters in queue order, the next one marked; it is read only and never queues.
+  A task never runs the same suite twice at once: a full `ttp checks` of a task that is still waiting joins
+  the same task's checks with the same head, commands, purpose and environment that already wait ahead of it or
+  run now. It leaves the queue, runs nothing and reports that run's outcome (passed, failed or timed out, exit 1
+  on a failure). A waiter is superseded when the same task queues the same checks on a newer head (a later commit
+  time): it reports the newer head's result, naming that head and saying its own head was not checked, never a
+  pass of its own. A run that has started is never stopped, and another command, environment, purpose, task or
+  repository is never a duplicate. If the run it follows ends without a result, the waiter queues again in its
+  old place. `ttp checks status` and `ttp status` list joined and superseded waiters, and the `--result` probe
+  says the run waits on another. A run's check commands stop at a wall-time cap: on by
   default, 3x the longest of the project's last 20 completed runs within 1-6 h (3 h before 3 runs are known);
   `checks.wall_cap_s` sets it, 0 turns it off. A run past it has its process group ended, frees the slot and is
   recorded as a timeout, never a pass; `ttp status` shows the holder's time against its cap and the waiting

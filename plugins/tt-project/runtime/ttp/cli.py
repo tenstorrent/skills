@@ -1393,6 +1393,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(suite)
     lines.extend(checklane.long_wait_lines(p.name, p.config(), now))
     lines.extend(checkspill.status_lines(p.name, now))
+    from . import checkjoin
+    lines.extend(f"checks {x.strip()}" for x in checkjoin.status_lines(p.state, now))
     if verbose and (slot_waits := checkcap.wait_line(p.state, now)):
         lines.append(slot_waits)
     for res in sorted(shared.names(p.config())):
@@ -2663,6 +2665,7 @@ def cmd_checks(a) -> None:
     timed_out, deadline, ran_since = None, None, 0.0   # the wall-time cap (checkwall) and its outcome
     spilled = None   # the spill host's claim when the checks run there (checkspill)
     run_env: dict = {}   # what the checks run in, for the pass's envs (pushpass.check_envs)
+    join_rec, joined = None, None   # this run's checkjoin record; the run it followed and how
     base = _checks_base(p, Path(top), cmds)
     (Path(run_dir) / "check_failure.json").unlink(missing_ok=True)
     (Path(run_dir) / slowtests.FILE).unlink(missing_ok=True)   # this run's slowest tests only
@@ -2769,19 +2772,33 @@ def cmd_checks(a) -> None:
         if p:
             envfault.recheck(p)   # a runner back: its open fault closes
         arrived = _checks_arrived()
-        from . import checklane, checkspill
+        from . import checkjoin, checklane, checkspill
         # A rerun here of checks that did not pass on a spill host never spills again (checkspill).
         no_spill = bool(os.environ.pop(checkspill.OFF_ENV, ""))
         spill_ok = not no_spill and checkspill.spillable(todo)
         fresh_ok = not a.fresh
         slot = None
+        light = bool(todo) and checklane.all_light(todo, cfg, mine if getattr(a, "light", False) else ())
+        # The task's same checks queued twice run one suite; a newer head's supersede an older waiter (checkjoin).
+        if todo and not hit and not light:
+            join_rec = _checks_join_register(p, str(top), head, todo, purpose, pre_env, Path(run_dir), arrived)
         while todo and not hit:
-            slot = _checks_slot(p, Path(run_dir), out, head, bool(getattr(a, "own_group", False)), arrived,
-                                _checks_key(p, tree, todo, purpose) if fresh_ok else "",
-                                (lambda: bool(_recorded_pass(p, tree, todo, purpose))) if fresh_ok else None,
-                                todo, checklane.all_light(todo, cfg, mine if getattr(a, "light", False) else ()),
-                                str(top), checklane.wrap_key(wrap) if any(str(c) in wrapped for c in todo) else "",
-                                spill_ok)
+            try:
+                if join_rec:
+                    _checks_yield(p, join_rec)
+                slot = _checks_slot(p, Path(run_dir), out, head, bool(getattr(a, "own_group", False)), arrived,
+                                    _checks_key(p, tree, todo, purpose) if fresh_ok else "",
+                                    (lambda: bool(_recorded_pass(p, tree, todo, purpose))) if fresh_ok else None,
+                                    todo, light, str(top),
+                                    checklane.wrap_key(wrap) if any(str(c) in wrapped for c in todo) else "",
+                                    spill_ok, (lambda: _checks_yield(p, join_rec)) if join_rec else None)
+            except checkjoin.Yield as y:
+                slot = None
+                joined = _checks_follow(p, Path(run_dir), out, head, join_rec, y, bool(getattr(a, "own_group", False)))
+                if joined is None:   # the run followed ended without a result: queue again, same arrival
+                    checkjoin.update(join_rec, phase=checkjoin.WAITING, follows=None)
+                    continue
+                break
             # Checks of the same tree may have passed while these waited (the same checks running beside
             # them, a review's pre-started ones): that pass serves, and the slot goes to the next waiter.
             if slot is not None and fresh_ok and (again := _recorded_pass(p, tree, todo, purpose)):
@@ -2795,12 +2812,17 @@ def cmd_checks(a) -> None:
             # (same arrival time), never run the checks uncapped.
             if slot is None or not slot.served:
                 break
+        if joined and joined[0] != "handover":
+            _checks_report_joined(join_rec, Path(run_dir), out, joined, head, str(top), todo, skipped, purpose)
+            return
         # Every host-wide slot stayed busy: a tool call must not block for the whole queue.
         handover = bool(todo) and not hit and slot is None
         # The slots here stayed busy and a spill host took the run: its checks run there (remotecheck).
         spilled = getattr(slot, "spill", None) if slot is not None and not hit else None
         if spilled:
             todo = push.with_host(todo, spilled.host)
+        if join_rec and todo and not hit and not handover:
+            checkjoin.update(join_rec, phase=checkjoin.RUNNING, run_since=time.time())
         child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}
         run_env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), **child_env}
         for line in [] if hit or handover else push.sandbox_lines(todo):
@@ -3053,6 +3075,10 @@ def cmd_checks(a) -> None:
                                                      **({"spilled_to": spilled.host} if spilled else {}),
                                                      **({"authoring_tree": in_authoring} if in_authoring else {}),
                                                      **({"added_tests": rerun} if rerun else {})})
+    if join_rec:   # the outcome the runs that joined this one report (checkjoin)
+        from . import checkjoin, trim
+        checkjoin.finish(join_rec, passed=passed, head=head, rc=0 if passed else 1, failed=str(failed or ""),
+                         timed_out=bool(timed_out), summary="" if passed else trim.summary(text), log=str(log))
     source = ("the default harness plan" if any(str(c) == str(failed) for c in defaults)
               else source if any(str(c) == str(failed) for c in own) else "ttp checks --")
     _note_checks_env(p, str(failed) if env_problem else None, env_problem, head, source, also)
@@ -3281,6 +3307,125 @@ def _checks_cancelled(run_dir: Path) -> str:
     return str(req.get("why") or "the task ended")
 
 
+def _checks_join_register(p: Project | None, top: str, head: str, todo: list, purpose: str, env: dict,
+                          run_dir: Path, arrived: float) -> Path | None:
+    """This run's checkjoin record, for a task's full checks; None without a project or task, or when it
+    cannot be written (the checks then queue as before)."""
+    from . import checkjoin, testslots
+    task = os.environ.get("TTP_TASK") or ""
+    if not p or not task.isdigit() or not head:
+        return None
+    try:
+        envs = _check_envs(top, todo, env)[0] or []
+    except (OSError, ValueError):
+        envs = []
+    r = subprocess.run(["git", "-C", top, "show", "-s", "--format=%ct", head], capture_output=True, text=True)
+    try:
+        commit_ts = float(r.stdout.strip() or 0)
+    except ValueError:
+        commit_ts = 0.0
+    cmds = _commands_hash(todo)
+    try:
+        return checkjoin.register(p.state, task=task, head=head, commit_ts=commit_ts,
+                                  key=checkjoin.key(task, head, cmds, purpose, envs),
+                                  group=checkjoin.group(task, testslots.repo_key(top), cmds, purpose, envs),
+                                  run=run_dir.name, arrived=arrived)
+    except OSError:
+        return None
+
+
+def _checks_yield(p: Project | None, me: Path | None) -> str:
+    """Raise checkjoin.Yield when this waiting run should follow another (checkjoin.target); else ""."""
+    from . import checkjoin
+    if not p or me is None or (rec := checkjoin.read(me)) is None:
+        return ""
+    if got := checkjoin.target(rec, checkjoin.records(p.state)):
+        raise checkjoin.Yield(*got)
+    return ""
+
+
+def _checks_follow(p: Project, run_dir: Path, out, head: str, me: Path | None, y, detached: bool = False):
+    """Follow the run this one yielded to (checkjoin.Yield `y`) until it ends: (how, the record with its
+    outcome); None once it ended without one (queue again); ("handover", None) once a foreground wait
+    ran out (checkcap.FOREGROUND_WAIT_S: detached checks follow on). The wait is told, marked in
+    CHECKS_SLOT_WAIT (so the daemon stops it when the task ends) and cancellable as a slot wait is."""
+    from . import checkcap, checkjoin, checklane, locks as lk
+    foreground = not detached and not os.environ.get("TTP_DETACHED")
+    how, lead, start = y.how, y.target, time.time()
+    key = f"checks-join:{os.getpid()}:{start}"
+
+    def tell(line: str) -> None:
+        out.write(f"ttp checks: {line}\n")
+        out.flush()
+        print(f"ttp checks: {line}", flush=True)
+        try:
+            durable_append(run_dir / "progress.md", f"{timefmt.clock()} checks: {line}\n")
+        except OSError:
+            pass
+
+    line = checkjoin.said(how, head, lead)
+    checkjoin.update(me, phase=how, follows=lead.get("id"), since=start)
+    tell(line)
+    if foreground:
+        lk.record_wait(run_dir, key, start, None)
+    try:
+        write_json(run_dir / CHECKS_SLOT_WAIT, {"since": start, "pid": os.getpid(), "head": head, "follows": line})
+    except OSError:
+        pass
+    told = time.time()
+    try:
+        while True:
+            if why := _checks_cancelled(run_dir):
+                said = f"not run: stopped waiting for the checks it {how}: {why}"
+                out.write(f"ttp checks: {said}\n")
+                out.flush()
+                die(f"ttp checks: {said}", 1)
+            got, rec = checkjoin.resolve(str(lead.get("id")), checkjoin.records(p.state))
+            if got == "done":
+                return how, rec
+            if got == "lost":
+                tell(f"run {lead.get('run') or '?'} ended without a result; queueing again at the same place")
+                return None
+            if foreground and time.time() - start >= checkcap.FOREGROUND_WAIT_S:
+                return "handover", None
+            if time.time() - told >= checklane.TELL_S:
+                told = time.time()
+                tell(f"still {how}: run {rec.get('run') or '?'} is {rec.get('phase') or 'waiting'}")
+            time.sleep(poll_s(checkcap.POLL_S))
+    finally:
+        (run_dir / CHECKS_SLOT_WAIT).unlink(missing_ok=True)
+        if foreground:
+            lk.record_wait(run_dir, key, start, time.time())
+
+
+def _checks_report_joined(me: Path | None, run_dir: Path, out, joined: tuple, head: str, top: str, todo: list,
+                          skipped: list, purpose: str) -> None:
+    """Report the outcome of the run this one followed (_checks_follow) as this run's: its checks.json
+    names the head that ran and how this run joined, its own record passes the outcome on, and a failure
+    or timeout exits 1. Never a pass of this run's own head when another head ran."""
+    from . import checkjoin, prguard
+    how, lead = joined
+    o = lead.get("outcome") or {}
+    passed, ran = bool(o.get("passed")), str(o.get("head") or "")
+    checkjoin.finish(me, passed=passed, head=ran, rc=int(o.get("rc") or (0 if passed else 1)),
+                     failed=str(o.get("failed") or ""), timed_out=bool(o.get("timed_out")),
+                     summary=str(o.get("summary") or ""), log=str(o.get("log") or ""))
+    line = checkjoin.result_line(how, head, lead)
+    write_json(run_dir / prguard.CHECKS_FILE, {"head": ran, "worktree": top, "passed": passed, "commands": todo,
+                                               "skipped": skipped, "ts": time.time(), "purpose": purpose,
+                                               "joined": {"how": how, "run": lead.get("run"), "pid": lead.get("pid"),
+                                                          "own_head": head},
+                                               **({"timed_out": True} if o.get("timed_out") else {})})
+    out.write(f"ttp checks: {line}\n")
+    out.flush()
+    if passed:
+        print(f"ttp checks: {line}")
+        return
+    if o.get("summary"):
+        print(o["summary"])
+    die(f"ttp checks: {line}", 1)
+
+
 def _checks_lane_status(as_json: bool) -> int:
     """`ttp checks status` (also --slot-status): the project's checks lanes, their holders and waiters
     (checklane.lane_status). Read only: it never queues, takes or writes a lock, or starts a check."""
@@ -3291,22 +3436,27 @@ def _checks_lane_status(as_json: bool) -> int:
     top = subprocess.run(["git", "-C", str(Path.cwd()), "rev-parse", "--show-toplevel"], capture_output=True,
                          text=True).stdout.strip()
     here_repo = testslots.repo_key(top) if top else ""
-    from . import checkspill
+    from . import checkjoin, checkspill
+    followers = checkjoin.status_lines(p.state)   # joined or superseded waiters: they run no suite of their own
     if as_json:
         print(json.dumps({"project": p.name, "slots": checklane.slots(p.config()),
                           "project_max": checklane.project_cap(p.config()), "this_repo": here_repo,
-                          "repos": checklane.lane_status(p.name, cfg=p.config()), "spilled": checkspill.holders(p.name)},
+                          "repos": checklane.lane_status(p.name, cfg=p.config()), "spilled": checkspill.holders(p.name),
+                          "followers": [x.strip() for x in followers]},
                          indent=2))
     else:
         print(checklane.status_text(p.name, p.config(), here_repo))
         for line in checkspill.status_lines(p.name):
             print(f"  {line}")
+        if followers:
+            print("following another run of their task (checkjoin), no suite of their own:")
+            print("\n".join(followers))
     return 0
 
 
 def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: bool = False,
                  arrived: float | None = None, same: str = "", done=None, cmds: list | None = None,
-                 light: bool = False, top: str = "", lock: str = "", spill: bool = False):
+                 light: bool = False, top: str = "", lock: str = "", spill: bool = False, yielder=None):
     """Wait for a host-wide checks slot (checkcap). The wait is told in the log, the run's notes
     (progress.md) and CHECKS_SLOT_WAIT, which the `--result` probe and `ttp status` read. In the
     foreground it is recorded like a `ttp lock` wait, so it does not count toward the run's wall
@@ -3320,7 +3470,9 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     for that wrapper lock's one lane, at most checklane.project_cap of the project's at once, told with
     the holder and the queue position each minute. With `spill` and delivery.checks_spill_hosts set, a
     wait past delivery.checks_spill_after_s tries those hosts (checkspill.pick) and keeps its place here
-    when none can take the run: a slot whose `spill` claim names the host the checks then run on."""
+    when none can take the run: a slot whose `spill` claim names the host the checks then run on.
+    `yielder()`, asked while it waits, raises checkjoin.Yield when the task's same checks run or wait
+    ahead, or a newer head's do: the wait ends holding nothing."""
     from . import checkcap, checklane, checkspill, locks as lk
     foreground = not detached and not os.environ.get("TTP_DETACHED")
     key = f"checks:{os.getpid()}:{time.time()}"
@@ -3373,7 +3525,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             limit = checkspill.after_s(cfg) if limit is None else min(limit, checkspill.after_s(cfg))
         try:
             slot = _checks_slot_take(p, run_dir, out, head, tell, waiting, limit, arrived, same, done, prio, owns,
-                                     cfg, repo, cmds, what, top, lock, restart=detached)
+                                     cfg, repo, cmds, what, top, lock, restart=detached, yielder=yielder)
         except checkcap.Upgraded as e:
             _checks_reexec(str(e), arrived, prio, spill, tell, out, getattr(e, "lanes", None))
             continue   # it could not re-execute: wait again with the code it runs
@@ -3391,13 +3543,14 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
 
 def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: float | None, arrived, same: str,
                       done, prio, owns, cfg: dict, repo: str, cmds: list, what: str, top: str = "",
-                      lock: str = "", restart: bool = False):
+                      lock: str = "", restart: bool = False, yielder=None):
     """One wait of _checks_slot for the repository's lane (or `lock`'s), a host-wide checks slot and
     test-worker slots, at most `limit` seconds (None: no limit): the slot, or None once `limit` passed.
     With `restart` (detached checks), a newer runtime installed while it waits (checkcap.upgraded) ends the
     wait with checkcap.Upgraded once it let go of all it held; it is asked only while waiting, never once
-    the slot is granted and the commands may start."""
-    from . import checkcap, checklane, cleantree, push, testslots
+    the slot is granted and the commands may start. `yielder()` as for _checks_slot: its checkjoin.Yield
+    ends the wait with all it held let go."""
+    from . import checkcap, checkjoin, checklane, cleantree, push, testslots
     t0 = time.time()
 
     def stop() -> str:
@@ -3405,7 +3558,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
             return why
         if restart and (new := checkcap.upgraded()):
             raise checkcap.Upgraded(new)
-        return ""
+        return (yielder() if yielder else "") or ""
 
     # Concurrent runs are isolated (own clean checkout, scratch, output folder and port block); what is
     # not keeps a lock: checks run in the authoring worktree also hold its one lane (testslots.tree_key).
@@ -3465,6 +3618,11 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
             slot.tests.files.append(ports[0])   # the run's own ports, freed with its test slots
             slot.tests.extra.update(ports[1])
         return slot
+    except checkjoin.Yield:
+        for g in (slot, suite, tree):   # a yield in the test-slot wait already holds the checks slot
+            if g is not None:
+                g.close()
+        raise
     except checkcap.Cancelled as e:
         for g in (suite, tree):
             if g is not None:
@@ -4027,7 +4185,9 @@ def _checks_result(run_dir: Path) -> int:
             wait = json.loads((run_dir / CHECKS_SLOT_WAIT).read_text())
         except (OSError, ValueError):
             wait = None
-        if isinstance(wait, dict) and wait.get("suite"):
+        if isinstance(wait, dict) and wait.get("follows"):   # joined or superseded (checkjoin): no suite of its own
+            print(f"ttp checks: waiting (pid {info['pid']}, not running): {wait['follows']}")
+        elif isinstance(wait, dict) and wait.get("suite"):
             from . import checkcap, locks as lk
             try:
                 held = checkcap._some(lk.held_labels([Path(wait["suite"])]))
