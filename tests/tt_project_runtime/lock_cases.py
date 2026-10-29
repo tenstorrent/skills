@@ -910,7 +910,7 @@ def test_an_urgent_lock_waiter_goes_ahead_of_routine_ones_and_only_an_urgent_tas
     assert cli._urgent_priority(p, "#12") is None, "only a plain task id"
 
 
-def _fake_proc(root, procs):
+def _fake_pidns_proc(root, procs):
     """A /proc stand-in under `root` with each (pid here, pid namespace, NSpid, state) of `procs`."""
     root.mkdir(exist_ok=True)
     for here, ns, nspid, state in procs:
@@ -952,7 +952,7 @@ def test_lock_probe_judges_a_pid_from_another_pid_namespace_through_that_namespa
     paths = [pathlib.Path(held.name)]
     try:
         for name, procs, alive, note in cases:
-            monkeypatch.setattr(locks, "_PROC", str(_fake_proc(tmp_path / name, procs)))
+            monkeypatch.setattr(locks, "_PROC", str(_fake_pidns_proc(tmp_path / name, procs)))
             assert locks._pid_note(foreign) == note, name
             assert locks.pid_alive(foreign) is alive, name
             held.seek(0)
