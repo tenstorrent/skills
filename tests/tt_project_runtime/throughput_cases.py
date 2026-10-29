@@ -28,6 +28,8 @@ def _tp_busy_fixture(p, now, slots=2):
     waiting = [_tp_task(p, f"queued {i}", now - 2 * 3600) for i in range(2)]
     quick = _tp_task(p, "quick", now - 7 * 3600)
     _tp_run(p, quick, now - 7 * 3600 + 5, now - 6 * 3600)
+    # Finished, as finish_run leaves them: a queued task with an ended run is a re-queue wait.
+    p.db.x("UPDATE tasks SET status='done' WHERE id IN (?,?)", (urgent, quick))
     return urgent, waiting
 
 
