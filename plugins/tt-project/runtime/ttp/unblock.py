@@ -338,24 +338,39 @@ def about_ask(text: str, ask_id: int, ask_text: str | None) -> bool:
     return bool(_subject(text) & _subject(ask_text))
 
 
-# A reply that gives an order: a sentence opening with an order verb, or an instruction phrase.
+# A reply that gives an order: a sentence opening with an order verb (the rest of its sentence is the
+# object), or an instruction phrase. Bare 'please' is politeness, not an order.
 _INSTRUCTION = re.compile(
     r"(?:^|[.!?;\n]\s*)(?:please\s+|also\s+|now\s+|first\s+|and\s+)?(?:fix|add|run|stop|start|use|make|check|"
     r"set|remove|delete|keep|move|update|change|build|deploy|test|push|merge|open|close|restart|retry|rerun|"
     r"switch|try|write|send|install|upgrade|investigate|look|find|create|enable|disable|drop|skip|turn|"
     r"focus|prioriti[sz]e|clean|split|rename|document|replace|revert|pause|resume|cancel|finish|ship)\b"
-    r"|\b(?:please|from now on|make sure|going forward|you should|we need to|i want you to)\b", re.I)
+    r"|\b(?:from now on|make sure|going forward|you should|we need to|i want you to)\b", re.I)
+# A reply that refers back to the ask's subject or options ('it', 'that one', 'the first', 'instead',
+# 'the cheaper one'): it may be the answer, whatever verb it opens with.
+_REFERS = re.compile(
+    r"\b(?:it|its|that|this|these|those|them|either|neither|both|instead|same|former|latter|ones?|"
+    r"option\s+\w+|(?:the\s+)?(?:first|second|third|fourth|last|other|\d+(?:st|nd|rd|th))\s+(?:one|option|choice)"
+    r"|the\s+(?:first|second|third|fourth|last|other)|(?:cheap|fast|slow|small|big|larg|new|old|bett|saf|"
+    r"simpl|short|long|earli|lat|light|heavi|quick|easi)(?:er|est))\b", re.I)
+OWN_WORDS_SHORT = 2   # a short reply (<= BARE_MAX_WORDS) is an order only when its object brings this many new words
 NOT_ANSWER_HOLD_S = 3600   # an ask a new instruction came in place of an answer is not asked again this soon
 
 
 def off_topic(text: str, ask_text: str | None) -> bool:
-    """A reply that does not address the ask: no bare answer or hand-back, no content word shared with
-    the ask (reask.words), and a new instruction (_INSTRUCTION)."""
+    """A reply that does not address the ask: no bare answer or hand-back, nothing referring back
+    (_REFERS), no content word shared with the ask (reask.words), and a new instruction (_INSTRUCTION)
+    whose object brings content words of its own (two in a short reply)."""
     from . import reask
     text = (text or "").strip()
     if not text or handback(text) or (len(text.split()) <= BARE_MAX_WORDS and _BARE.search(text)):
         return False
-    return not reask.words(text) & reask.words(ask_text or "") and bool(_INSTRUCTION.search(text))
+    asked = reask.words(ask_text or "")
+    if _REFERS.search(text) or reask.words(text) & asked:
+        return False
+    need = OWN_WORDS_SHORT if len(text.split()) <= BARE_MAX_WORDS else 1
+    return any(len(reask.words(re.split(r"[.!?;\n]", text[m.end():], maxsplit=1)[0]) - asked) >= need
+               for m in _INSTRUCTION.finditer(text))
 
 
 def not_answers(db: DB, msgs: list[dict], question=lambda t: t) -> dict[int, int]:
