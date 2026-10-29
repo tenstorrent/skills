@@ -35,7 +35,7 @@ def test_an_urgent_code_task_gets_its_review_at_priority_one_on_a_needs_review_h
     tid, _, _, reviews = _finish_code(env, p, "routine", {"c.py": 5}, result={"status": "needs_review", "summary": "ok"})
     assert reviews == [], "a routine needs_review hand-off still waits for the coordinator or the sweep"
     tid, _, _, reviews = _finish_code(env, p, "routine done", {"d.py": 5})
-    assert [r["priority"] for r in reviews] == [2]
+    assert [r["priority"] for r in reviews] == [p.db.task(tid)["priority"]], "a routine review keeps its chain's (chainprio)"
 
 
 def test_the_review_sweeps_take_an_urgent_task_at_once_and_past_the_cap(env):
@@ -47,7 +47,7 @@ def test_the_review_sweeps_take_an_urgent_task_at_once_and_past_the_cap(env):
     d = Daemon(p.base)
     assert d.sweep_unreviewed(force=True) == [hot, old[0]], "the cap counts routine tasks only"
     assert [r["priority"] for r in _daemon_reviews(p, hot)] == [1]
-    assert [r["priority"] for r in _daemon_reviews(p, old[0])] == [2]
+    assert [r["priority"] for r in _daemon_reviews(p, old[0])] == [p.db.task(old[0])["priority"]]
     # Left in review by a hand-off (follow-ups leave the review to the coordinator): no sweep_after_s wait.
     tid, _, _, reviews = _finish_code(env, p, "noted", {"n.py": 5}, result={
         "status": "needs_review", "summary": "ok", "followups": [{"title": "later", "spec": "more"}]})
