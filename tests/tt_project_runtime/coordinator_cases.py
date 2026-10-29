@@ -18140,3 +18140,163 @@ def test_a_stale_wait_on_checks_taken_out_of_the_queue_says_so(env, tmp_path):
     d._stale_wait_event(task, json.loads(task["result"]), time.time() - 7 * 3600, 6 * 3600)
     text = _events(p, tid, "wait_stale")[0]["text"]
     assert f"the checks it waits on ({run}) are neither queued nor running" in text, text
+
+
+def _cool_event(p, kind, text, severity="normal", task=None, source="daemon", ts=1000.0):
+    return p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                  (ts, source, kind, severity, text, "queued", task))
+
+
+def _cool_queued(p):
+    return p.db.q("SELECT id, ts, kind, severity, task, source FROM events WHERE status='queued' ORDER BY id")
+
+
+def test_rejected_action_cools_its_trigger_and_counts_unchanged_repeats(env):
+    """A turn whose action was rejected puts its trigger's key in a cooldown: the same unchanged cause
+    (counters aside) is counted and muted, shown once in the digest, and at the end one summary wakes."""
+    from ttp import coordinator as coord, rejcool
+    p = make(env)
+    cfg = {"coordinator": {"rejection_cooldown_s": 900}}
+    t0 = time.time()   # the digest reads the wall clock; every other step is given its time
+    first = _cool_event(p, "stall", "no worker started for 3 h: #7, #8", task=7)
+    assert rejcool.start(p.db, cfg, [first], ["task_add rejected: duplicate of #7"], t0) == ["stall:daemon:#7"]
+    p.db.x("UPDATE events SET status='handled' WHERE id=?", (first,))
+    # Information-only rejections, no rejection and an empty batch start nothing.
+    other = _cool_event(p, "stall", "x", task=9)
+    assert rejcool.start(p.db, cfg, [other], [f"x {coord.INFO_MARK}"], t0) == []
+    assert rejcool.start(p.db, cfg, [other], [], t0) == []
+    p.db.x("UPDATE events SET status='handled' WHERE id=?", (other,))
+    # Same key, only the counters changed: counted, muted, not woken.
+    for n in (4, 5):
+        _cool_event(p, "stall", f"no worker started for {n} h: #7, #8", task=7)
+        assert rejcool.screen_queued(p.db, cfg, _cool_queued(p), t0 + 60 * n) == []
+    assert p.db.one("SELECT COUNT(*) n FROM events WHERE status='muted'")["n"] == 2
+    # Another key passes untouched.
+    else_id = _cool_event(p, "stall", "no worker started for 3 h: #7, #8", task=8)
+    assert [e["id"] for e in rejcool.screen_queued(p.db, cfg, _cool_queued(p), t0 + 400)] == [else_id]
+    p.db.x("UPDATE events SET status='handled' WHERE id=?", (else_id,))
+    lines = rejcool.digest_lines(p.db, t0 + 400)
+    assert len(lines) == 1 and lines[0].startswith(
+        "cooldown: stall:daemon:#7, 2 events since rejection, rejected because task_add rejected: duplicate of #7")
+    assert "cooldown: stall:daemon:#7, 2 events since rejection" in coord.digest(p, {}, [], [])
+    # Time up with the condition persisting: one summary event wakes; the cooldown is gone.
+    woke = rejcool.screen_queued(p.db, cfg, _cool_queued(p), t0 + 901)
+    assert [e["kind"] for e in woke] == [rejcool.KIND]
+    text = p.db.one("SELECT text FROM events WHERE id=?", (woke[0]["id"],))["text"]
+    assert text.startswith("cooldown: stall:daemon:#7, 2 events since rejection") and "its time is up" in text
+    assert p.db.kv(rejcool.KEY) == {}
+    # A turn on that summary that is rejected again cools the same key once more.
+    assert rejcool.start(p.db, cfg, [woke[0]["id"]], ["again"], t0 + 950) == ["stall:daemon:#7"]
+    # A cooldown that counted nothing ends quietly.
+    assert rejcool.screen_queued(p.db, cfg, [], t0 + 950 + 901) == []
+    assert p.db.kv(rejcool.KEY) == {}
+
+
+def test_rejection_cooldown_ends_early_on_change_severity_or_the_user(env):
+    """Changed evidence, a higher severity or a user message end the cooldown at once: the event wakes,
+    with the counted ones summarized in the same batch."""
+    from ttp import rejcool
+    p = make(env)
+    cfg = {}
+    for i, (sev, text, user) in enumerate([("normal", "review of #5 stalled: no reviewer", False),   # evidence
+                                           ("high", "review of #5 stalled: checks pending", False),  # severity
+                                           ("normal", "review of #5 stalled: checks pending", True)]):  # user
+        p.db.x("DELETE FROM events")
+        p.db.set_kv(rejcool.KEY, {})
+        t = 1000.0 + i * 10000
+        first = _cool_event(p, "review_stall", "review of #5 stalled: checks pending", task=5)
+        rejcool.start(p.db, cfg, [first], ["task_update rejected"], t)
+        p.db.x("UPDATE events SET status='handled'")
+        _cool_event(p, "review_stall", "review of #5 stalled: checks pending", task=5)
+        assert rejcool.screen_queued(p.db, cfg, _cool_queued(p), t + 10) == []
+        new = _cool_event(p, "review_stall", text, severity=sev, task=5)
+        woke = rejcool.screen_queued(p.db, cfg, _cool_queued(p), t + 20, user_spoke=user)
+        assert [e["id"] for e in woke][0] == new and woke[-1]["kind"] == rejcool.KIND, (sev, text, user)
+        why = p.db.one("SELECT text FROM events WHERE kind=?", (rejcool.KIND,))["text"]
+        assert ("the user spoke" if user else "severity rose to high" if sev == "high"
+                else "the evidence changed") in why
+        assert p.db.kv(rejcool.KEY) == {}
+
+
+def test_rejection_cooldown_never_holds_critical_or_safety_events_and_0_turns_it_off(env):
+    """Critical events, answered asks and the safety class (spend or budget caps, restrictions, data
+    loss, device or machine holds) neither start a cooldown nor meet one; a setting of 0 disables it
+    and ends one already running."""
+    from ttp import rejcool
+    p = make(env)
+    safety = [("observation", "spend cap reached for today", "normal"),
+              ("restriction_tools", "a restriction is at risk", "normal"),
+              ("observation", "data loss in the results folder", "normal"),
+              ("resource_trouble", "device hold on board-a never released", "normal"),
+              ("ask_answered", "ask #3 answered", "normal"),
+              ("observation", "the run failed again", "critical")]
+    for kind, text, sev in safety:
+        eid = _cool_event(p, kind, text, severity=sev)
+        assert rejcool.start(p.db, {}, [eid], ["rejected"], 1000.0) == [], kind
+        p.db.x("UPDATE events SET status='handled'")
+    # A critical event of a key already cooling is never counted.
+    plain = _cool_event(p, "observation", "the run failed again")
+    rejcool.start(p.db, {}, [plain], ["rejected"], 1000.0)
+    p.db.x("UPDATE events SET status='handled'")
+    crit = _cool_event(p, "observation", "the run failed again", severity="critical")
+    assert [e["id"] for e in rejcool.screen_queued(p.db, {}, _cool_queued(p), 1010.0)] == [crit]
+    p.db.x("UPDATE events SET status='handled'")
+    # 0: nothing starts, and a running cooldown ends.
+    off = {"coordinator": {"rejection_cooldown_s": 0}}
+    again = _cool_event(p, "observation", "the run failed again")
+    assert rejcool.start(p.db, off, [again], ["rejected"], 1020.0) == []
+    assert [e["id"] for e in rejcool.screen_queued(p.db, off, _cool_queued(p), 1030.0)] == [again]
+    assert p.db.kv(rejcool.KEY) == {}
+
+
+def test_rejection_cooldown_survives_a_restart_and_gates_the_daemon_turn(env, monkeypatch):
+    """End to end: a turn whose action the daemon rejects cools its trigger; after a restart (a fresh
+    project and daemon) the same unchanged event starts no turn, and the cooldown's end wakes one."""
+    from types import SimpleNamespace
+    from ttp import rejcool
+    from ttp.daemon import Daemon
+    from ttp.project import Project
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    clock = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    notes = []
+
+    def daemon(proj):
+        d = Daemon(proj.base)
+        d.update_gates()
+
+        def start_run(role, prompt, *a, **k):
+            notes.append(k["note"])
+            return proj.db.x("INSERT INTO runs(role,started,status,note) VALUES('coordinator',?,'ok',?)",
+                             (clock[0], json.dumps(k["note"])))
+        monkeypatch.setattr(d, "start_run", start_run)
+        monkeypatch.setattr(d, "_batch_hold", lambda *a: False)
+        return d
+
+    d = daemon(p)
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+           (clock[0], "watcher:w", "observation", "high", "queue q has 12 jobs stuck", "queued"))
+    clock[0] += 60
+    d.maybe_coordinate()
+    assert len(notes) == 1
+    rid = p.db.one("SELECT MAX(id) id FROM runs")["id"]
+    usage = SimpleNamespace(structured={"actions": [{"type": "bogus_action"}], "summary": ""}, error="",
+                            final_text="", cost_usd=0.2)
+    d._finish_coordinator({"id": rid, "dir": "x"}, usage, "ok", notes[-1])
+    assert "observation:watcher:w" in (p.db.kv(rejcool.KEY) or {})
+    fresh = Project(p.base)   # a daemon restart: only what is on disk
+    d2 = daemon(fresh)
+    clock[0] += 60
+    fresh.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+               (clock[0], "watcher:w", "observation", "high", "queue q has 13 jobs stuck", "queued"))
+    clock[0] += 60
+    d2.maybe_coordinate()
+    assert len(notes) == 1, "the unchanged cause of a rejected action woke the coordinator again"
+    assert fresh.db.one("SELECT status FROM events ORDER BY id DESC LIMIT 1")["status"] == "muted"
+    clock[0] += 900
+    d2.maybe_coordinate()   # queues the summary; it wakes once past the debounce, as any event does
+    clock[0] += 60
+    d2.maybe_coordinate()
+    assert len(notes) == 2 and notes[-1]["events"]
+    assert fresh.db.one("SELECT kind FROM events WHERE id=?", (notes[-1]["events"][0],))["kind"] == rejcool.KIND

@@ -191,6 +191,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # An event batch that a turn which decided nothing already met, against the same
                     # state, is settled without a model run for this long after it (turngate.py; 0: off).
                     "skip_repeat_window_s": 86400,
+                    # After a turn's action is rejected, the same unchanged cause (event kind, source and
+                    # task) is counted, not woken, for this long (rejcool.py; 0: off).
+                    "rejection_cooldown_s": 900,
                     # A routine batch (quiet_held_kinds) or idle wake while every open task is held by a
                     # user pause, a deferral or a paused resource, and nothing changed since the last
                     # turn, is settled without a model run; one runs once the last turn started

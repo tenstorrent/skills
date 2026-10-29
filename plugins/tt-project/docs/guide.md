@@ -302,6 +302,16 @@ prolonged whole-box outage.
   (`machine_change_overdue`) is normal, high only on a machine tagged `serving`, `live` or `server`
   past its end with no passing until-probe, and each project hears of one change once per episode,
   whether from its own daemon or relayed by another project's.
+- Rejected-action cooldown: when the daemon rejects a turn's action (not an information-only
+  refusal), each event that woke that turn puts its key (event kind, source and task) in a cooldown
+  of `coordinator.rejection_cooldown_s` (default 900; 0 turns it off). Inside it, an event with the
+  same key, the same text (counters, ids and times aside) and no higher severity is counted and
+  muted, not woken, and the next turn's digest shows one line per key: `cooldown: <key>, N events
+  since rejection, rejected because <reason>`. Changed text, a higher severity or a user message
+  ends it at once and wakes; when it ends with events counted, one summary event wakes one turn (a
+  turn that rejects again on it restarts the cooldown). Never cooled: user messages, critical
+  events, answered asks, and the safety class (spend or budget caps, restrictions, data loss, device
+  or machine holds). The state is kept in the project's database, so it survives a restart.
 - Blocker sweep: every `coordinator.blocker_sweep_h` (6; 0 turns it off) hours while anything is
   stuck, and sooner (never within `coordinator.blocker_sweep_min_gap_h`, 1) when a pause ends, an
   ask is resolved, a dependency finishes, a provider pause ends or a re-check comes due, a

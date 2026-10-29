@@ -35,6 +35,7 @@ from pathlib import Path
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import ackwait
 from . import checksgone
+from . import rejcool
 from . import lanewait
 from . import chainprio
 from . import churnwatch
@@ -3585,6 +3586,10 @@ class Daemon:
                 log(self.p, "coordinator turn gate record failed: "
                     + traceback.format_exc().replace("\n", " | ")[:1000])
         self._record_rejections([coord.clip_rejection(x) for x in problems])
+        try:
+            rejcool.start(db, self.cfg, evs, problems)   # its triggers' same cause does not wake again at once
+        except Exception:   # bookkeeping: without it the next repeat wakes as before
+            log(self.p, "rejection cooldown not started: " + traceback.format_exc().replace("\n", " | ")[:1000])
         db.set_kv("last_coordinator_summary", {"ts": time.time(), "summary": (out or {}).get("summary", "")})
         try:
             quietgate.left(db, self._quiet_fp({k: g.as_dict() for k, g in self.gates.items()}), r.get("id"),
@@ -6591,6 +6596,11 @@ class Daemon:
             return
         msgs = db.q("SELECT id, ts, chat FROM messages WHERE direction='in' AND handled=0 ORDER BY id")
         queued = db.q("SELECT id, ts, kind, severity, task, source, data FROM events WHERE status='queued' ORDER BY id")
+        try:
+            # The same unchanged cause as a just-rejected action is counted, not woken (rejcool.py).
+            queued = rejcool.screen_queued(db, self.cfg, queued, now, user_spoke=bool(msgs))
+        except Exception:   # the cooldown only saves turns: a failure wakes as before
+            log(self.p, "rejection cooldown failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         max_evs = int(c.get("max_events_per_turn", 40))
         budget = float(c.get("turn_budget_usd", 1.0))
         # Items whose turn went over its cap are split, raised once or parked, never retried as is (turnsize.py).
