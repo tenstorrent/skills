@@ -3731,23 +3731,54 @@ def test_a_lane_held_by_a_finished_task_s_check_is_flagged_then_only_its_own_che
         _stop(proc)
 
 
+# A review precheck as `ttp checks --detach` holds its lane: cli._checks_slot under Daemon._start_checks' env.
+_PRECHECK_HOLDER = """
+import os, sys, time
+from pathlib import Path
+from ttp import checklane, cli
+from ttp.project import Project
+checklane.HEARTBEAT_S = 3600.0
+slot = cli._checks_slot(Project(sys.argv[1]), Path(os.environ["TTP_RUN_DIR"]), sys.stdout, sys.argv[3], True,
+                        cmds=["true"], top=sys.argv[1])
+Path(sys.argv[2]).write_text("held" if slot else "none")
+while True:
+    time.sleep(1)
+"""
+
+
 def test_a_daemon_review_precheck_of_a_just_finished_task_is_not_a_finished_task_s_lane_while_its_review_is_open(
         env, tmp_path, monkeypatch, capsys):
-    from ttp import checklane, daemon
+    from ttp import checkcap, checklane, daemon, locks, testslots, worktree
     from ttp.daemon import Daemon
     assert checklane.PRECHECK_LABEL == daemon.PRECHECK_LABEL
     p = make(env)
     _lane_env(monkeypatch)
     tid = p.db.add_task("t", "s", kind="code")
-    token = f"t{tid}-0123456789ab"   # Daemon._precheck's run folder: prechecks/t<task>-<head12>
+    head = worktree._git(p.root, "rev-parse", "HEAD")
+    out = p.state / daemon.PRECHECKS_DIR / f"t{tid}-{head[:12]}"   # Daemon._precheck's run folder
+    out.mkdir(parents=True)
+    token = out.name
     rev = p.db.add_task("review", "r", kind="review", labels=[checklane.PRECHECK_LABEL + token])
     p.db.add_task("review", "r", kind="review", labels=[f"{checklane.PRECHECK_LABEL}t{tid}-ba9876543210"])
+    run_env = {"TTP_RUN_DIR": str(out), "TTP_PROJECT": str(p.base), "TTP_RUN_ID": daemon.precheck_run_id(out),
+               **daemon.task_env(tid)}   # as Daemon._start_checks sets them
     got = tmp_path / "held"
-    proc = subprocess.Popen([sys.executable, "-c", _DONE_HOLDER, p.name, str(got), _LANE_REPO, f"run {token}"],
-                            env={**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_TASK": str(tid)},
-                            start_new_session=True)
+    proc = subprocess.Popen([sys.executable, "-c", _PRECHECK_HOLDER, str(p.base), str(got), head],
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME), **run_env}, cwd=p.root,
+                            start_new_session=True, stdout=subprocess.DEVNULL)
     try:
-        assert _wait_for(got.exists)
+        assert _wait_for(got.exists, 60) and got.read_text() == "held"
+        recs = [r for b in testslots.suite_bases(p.name) for x in testslots._lanes_of(b)
+                for r in locks.holder_records([x])]
+        assert len(recs) == 1 and str(recs[0].get("task")) == str(tid) and recs[0].get("pid") == proc.pid, recs
+        lane = [recs[0]["holder"]]
+        for k, v in run_env.items():
+            monkeypatch.setenv(k, v)
+        slot_label = checkcap.label(p.name)   # its checks and test slots' label
+        for k in run_env:
+            monkeypatch.delenv(k)
+        assert checklane.open_precheck(p.db, str(tid), lane[0]), lane
+        assert checklane.open_precheck(p.db, str(tid), slot_label), slot_label
         d = Daemon(p.base)
         ev = lambda: p.db.q("SELECT text FROM events WHERE kind='checks_lane_finished'")
         later = time.time() + 400   # past the 5 min flag: a full suite runs about 9 min
@@ -3757,13 +3788,14 @@ def test_a_daemon_review_precheck_of_a_just_finished_task_is_not_a_finished_task
         monkeypatch.setenv("TTP_PROJECT", str(p.base))
         monkeypatch.chdir(p.root)
         assert _ttp("checks", "status") == 0
-        out = capsys.readouterr().out
-        assert f"#{tid}" in out and "its task is DONE" not in out, out
+        out_text = capsys.readouterr().out
+        assert f"#{tid}" in out_text and "its task is DONE" not in out_text, out_text
         # bypasses: another task's precheck token, or a review of another head only, is not exempt
-        assert not checklane.open_precheck(p.db, str(tid + 1), f"run {token}")
+        assert not checklane.open_precheck(p.db, str(tid + 1), lane[0])
+        assert not checklane.open_precheck(p.db, str(tid + 1), slot_label)
         assert not checklane.open_precheck(p.db, str(tid), "run 7")
         p.db.x("UPDATE tasks SET status='done' WHERE id=?", (rev,))
-        assert not checklane.open_precheck(p.db, str(tid), f"run {token}"), "the open review is of another head"
+        assert not checklane.open_precheck(p.db, str(tid), lane[0]), "the open review is of another head"
         # its review ended: the lane is reported as a finished task's again (never stopped: no worker run)
         d.check_checks_owner(every_s=0, now=later + 60)
         texts = [r["text"] for r in ev()]

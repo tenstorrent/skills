@@ -232,6 +232,12 @@ AUTO_REVIEW_SPEC_CHARS, AUTO_REVIEW_SUMMARY_CHARS = 2000, 1000
 # its review (Daemon._precheck): their folder under the project's state, how long the review waits
 # for them before it starts anyway, and how long finished ones are kept.
 PRECHECKS_DIR, PRECHECK_LABEL = "prechecks", "precheck:"
+
+
+def precheck_run_id(out: Path) -> str:
+    """TTP_RUN_ID of a review precheck run in folder `out` (t<task>-<head12>): precheck-t<task>-<head12>,
+    so labels built from it (checkcap.label) name the folder, as checklane.open_precheck reads them."""
+    return f"precheck-{Path(out).name}"
 PRECHECK_HOLD_S, PRECHECK_KEEP_S = 3600, 7 * 86400
 # A failed review with fix specs gets its fix and re-review from the daemon this many rounds per stack;
 # the re-review repeats the failed review's spec (its push and after-push steps) up to this length.
@@ -11782,7 +11788,7 @@ class Daemon:
         base = self.p.state / PRECHECKS_DIR
         self._prune_prechecks(base)
         out = base / f"t{task['id']}-{full[:12]}"
-        if not self._start_checks(path, out, f"precheck-t{task['id']}", task["id"], []):
+        if not self._start_checks(path, out, precheck_run_id(out), task["id"], []):
             return None
         log(self.p, f"task {task['id']}: started the checks on {full[:12]} for its review ({out})")
         return out

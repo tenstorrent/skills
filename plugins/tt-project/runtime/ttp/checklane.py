@@ -381,8 +381,10 @@ def open_precheck(db, task: str, holder) -> bool:
     """Whether lane holder label `holder` of task `task` is the daemon's review precheck of that task
     (Daemon._precheck: `ttp checks` run as the code task, its run folder prechecks/t<task>-<head>) and a
     review that reads it (labelled precheck:t<task>-<head>) is still open. Such a check starts as its
-    task ends, so it is not a finished task's lane until that review ends too."""
-    m = re.search(r"\brun (t(\d+)-[0-9a-f]{7,40})\b", str(holder or ""))
+    task ends, so it is not a finished task's lane until that review ends too. Its lane label names its
+    run folder ("run t<task>-<head>", cli._checks_slot); its slot labels name its run id
+    ("run precheck-t<task>-<head>", daemon.precheck_run_id)."""
+    m = re.search(r"\brun (?:precheck-)?(t(\d+)-[0-9a-f]{7,40})\b", str(holder or ""))
     if db is None or not m or m.group(2) != str(task):
         return False
     want = PRECHECK_LABEL + m.group(1)
