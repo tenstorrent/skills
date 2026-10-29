@@ -1389,8 +1389,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(host)
     lines.extend(testslots.use_lines())
     from . import checklane, checkspill
-    if suite := testslots.suite_line(p.name, now, checklane.slots(p.config()), checklane.priority_age_s(p.config())):
-        lines.append(suite)
+    lines.extend(checklane.lane_lines(p.name, p.config(), now))
     lines.extend(checklane.long_wait_lines(p.name, p.config(), now))
     lines.extend(checkspill.status_lines(p.name, now))
     from . import checkjoin
@@ -3645,6 +3644,13 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
     suite = tree = slot = None
     # The lanes these checks held when they re-executed for an upgraded runtime (_checks_reexec): kept.
     kept = testslots.adopt_lanes(os.environ.pop(testslots.LANE_ENV, ""))
+    # The lanes' names for status (checklane.lane_labels): the repository's directory, the wrapper command.
+    names = {"repo": testslots.repo_name(top) if p else "", "lock": ""}
+    try:
+        if lock and checklane.wrap_key(wrap := push.wrap_of(cfg)) == lock:
+            names["lock"] = checklane.wrap_name(wrap)
+    except ValueError:
+        pass
 
     def hold(key: str, n: int, **lane):
         left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
@@ -3659,7 +3665,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                                     state=p.state if p else None, what=what, age=checklane.priority_age_s(cfg),
                                     check=f"{head[:12]}.{_commands_hash(cmds)[:12]}",
                                     repo_name=testslots.repo_name(top) if p and key == repo and not lane.get("lock") else "",
-                                    **lane)
+                                    name=names["lock" if lane.get("lock") else "repo"] if key in (repo, "") else "", **lane)
     try:
         if kept is not None:
             suite, kept = kept, None

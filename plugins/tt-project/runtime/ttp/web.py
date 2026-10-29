@@ -549,12 +549,13 @@ def uncommitted_feed(db: DB) -> list[dict]:
             for k, v in (db.kv(KV_WORKTREES_DIRTY) or {}).items()]
 
 
-def slots_feed(now: float) -> list[dict]:
-    """Feed rows (state 'status': not the top section) for the host's test and build slots in use, the
-    lines `ttp status` prints (testslots.use_lines)."""
-    from . import testslots
+def slots_feed(now: float, p=None) -> list[dict]:
+    """Feed rows (state 'status': not the top section) for the host's test and build slots in use and
+    project `p`'s checks lanes, the lines `ttp status` prints (testslots.use_lines, checklane.lane_lines)."""
+    from . import checklane, testslots
+    lanes = checklane.lane_lines(p.name, p.config(), now) if p else []
     return [{"id": None, "ts": now, "kind": "slots", "severity": "low", "state": "status", "text": line}
-            for line in testslots.use_lines()]
+            for line in testslots.use_lines() + lanes]
 
 
 def run_wake(note: str | None) -> str | None:
@@ -668,7 +669,7 @@ def state_payload(p: Project, db: DB) -> dict:
         "attention": attention(db, now),
         "notify": notify_state(p, db),
         "feed": sorted(alerts.feed(db, now) + uncommitted_feed(db) + startgate.feed(db, warn_s, now)
-                       + sweepskip.feed(db, now, tz) + slots_feed(now), key=lambda m: -float(m["ts"] or 0)),
+                       + sweepskip.feed(db, now, tz) + slots_feed(now, p), key=lambda m: -float(m["ts"] or 0)),
         "offline_help": offline_help(p.name),
         "budget": bud.history(db),
         "coordinator": db.kv("last_coordinator_summary", {}),

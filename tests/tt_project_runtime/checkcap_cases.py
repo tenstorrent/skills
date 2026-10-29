@@ -1166,8 +1166,8 @@ def test_foreground_checks_waiting_for_the_suite_lock_then_a_slot_hand_over_with
     timer = threading.Timer(1.0, hold.close)   # the other run ends 1 s into the suite wait
     suite_hold = testslots.suite_hold
 
-    def held(name, tell, *a, **k):
-        return suite_hold(name, lambda line: (tell(line), timer.ident or timer.start()), *a, **k)
+    def held(project, tell, *a, **k):
+        return suite_hold(project, lambda line: (tell(line), timer.ident or timer.start()), *a, **k)
     monkeypatch.setattr(testslots, "suite_hold", held)
     seen = tmp_path / "seen"
     try:
@@ -1781,21 +1781,26 @@ def test_suite_slot_frees_to_the_most_urgent_waiter_not_the_first_arrival(env, m
 
 
 def test_suite_slot_status_line_shows_the_holder_s_time_against_its_cap_and_the_waiting_order(env, monkeypatch):
-    from ttp import checkcap, locks, testslots
+    from ttp import checkcap, checklane, locks, testslots
     monkeypatch.delenv(testslots.HELD_ENV, raising=False)
     monkeypatch.delenv(checkcap.HELD_ENV, raising=False)
-    assert testslots.suite_line("pa") == "", "free and nobody waits: no line"
+    assert checklane.lane_lines("pa") == [], "free and nobody waits: no line"
     monkeypatch.setenv("TTP_TASK", "12")
+    monkeypatch.setattr(checklane, "children", lambda rec: 2)
     hold = testslots.suite_hold("pa", priority=2)
     now = time.time()
     try:
-        assert "#12 p2 held 0 min, not running yet" in testslots.suite_line("pa", now)
+        assert ("#12 p2 queued 0 min, has a lane 0 min, not running yet: waits on no host queue (starting, or an "
+                "older runtime), 2 child processes alive") in checklane.lane_lines("pa", {}, now)[0]
         testslots.suite_running(hold, 7200)
         _suite_ticket("pa", 3, now - 60, "31")
         _suite_ticket("pa", 4, now - 2 * testslots.SUITE_AGE_S + 60, "32")
-        line = testslots.suite_line("pa", now + 601)
-        assert line.startswith("full checks slot: #12 p2 running 10 min of its 2 h 0 min cap"), line
-        assert line.endswith("waiting in order: #32 p4 ranked p2 (aged) waited 39 min, #31 p3 ranked p3 waited 11 min"), line
+        line, = checklane.lane_lines("pa", {"checks": {"slots": 1}}, now + 601)
+        unkeyed = checklane.group_name("")   # an unkeyed lane (no repository key): no run named it
+        assert line.startswith(f"checks lane {unkeyed} (1 at a time per repository; checks.slots raises it): "
+                               "#12 p2 queued 10 min, running 10 min of its 2 h 0 min cap, 2 child processes alive"), line
+        assert line.endswith(f"held: #32 p4 ranked p2 (aged) 39 min, waits on {unkeyed}, "
+                             f"#31 p3 ranked p3 11 min, waits on {unkeyed}"), line
     finally:
         for t in list(locks._TICKETS):
             locks.dequeue(t)
@@ -1932,7 +1937,7 @@ while True:
 def test_suite_slot_of_a_reboot_cut_holder_and_waiter_is_free_at_once(env, tmp_path, monkeypatch):
     # A reboot (here: both processes killed outright) leaves their label and ticket files behind;
     # neither holds anything, so the status line shows none and the next run takes the slot at once.
-    from ttp import checkcap, testslots
+    from ttp import checkcap, checklane, testslots
     monkeypatch.delenv(testslots.HELD_ENV, raising=False)
     monkeypatch.delenv(checkcap.HELD_ENV, raising=False)
     procs = []
@@ -1942,14 +1947,14 @@ def test_suite_slot_of_a_reboot_cut_holder_and_waiter_is_free_at_once(env, tmp_p
                                       env={**os.environ, "PYTHONPATH": str(RUNTIME)}))
         assert _wait_for(ready.exists)
     try:
-        line = testslots.suite_line("pa")
+        line = "\n".join(checklane.lane_lines("pa"))
         assert "running 0 min of its 1 h 0 min cap" in line and "#5 p1" in line, line
     finally:
         for proc in procs:
             proc.kill()
             proc.wait(10)
     assert testslots.suite_path("pa").read_text(), "the holder's label stays on disk"
-    assert testslots.suite_line("pa") == "", "a dead holder and waiter show nothing"
+    assert checklane.lane_lines("pa") == [], "a dead holder and waiter show nothing"
     t0 = time.time()
     again = testslots.suite_hold("pa", priority=4, wait_s=5)
     assert again is not None and again.files and time.time() - t0 < 2, "taken at once, not behind the dead p1"
@@ -2400,7 +2405,8 @@ def test_a_lane_wait_names_the_holder_and_the_queue_position(env, tmp_path, monk
     try:
         told = []
         assert testslots.suite_hold("pa", repo=_LANE_REPO, wait_s=0.3, tell=told.append) is None
-        assert "position 1 of 1" in told[0] and "#12 running 'pytest -q tests/a.py' for 0 min" in told[0], told
+        assert "position 1 of 1" in told[0] and ("#12 'pytest -q tests/a.py' queued 0 min, has the lane 0 min, "
+                                                 "not running yet, no child process") in told[0], told
     finally:
         _stop(holder)
 
@@ -2783,8 +2789,10 @@ def test_a_quick_device_query_check_runs_beside_a_long_device_check_in_another_l
         out = _json.loads(capsys.readouterr().out)
         groups = [r["group"] for r in out["repos"]]
         assert len(groups) == 3 and all(g.strip() for g in groups) and all(r["repo"] for r in out["repos"]), out
-        assert {"wrapper lock " + _WRAP_A, "wrapper lock " + _WRAP_B, "repository " + key} == \
+        # The caller's own repository is named by its directory (lane_labels' known names), the locks by key.
+        assert {"wrapper lock " + _WRAP_A, "wrapper lock " + _WRAP_B, "repository " + testslots.repo_name(repo)} == \
             {g.replace(" (checks.wrap_cmd, one at a time)", "") for g in groups}, groups
+        assert {r["id"] for r in out["repos"]} == {key, "w" + _WRAP_A, "w" + _WRAP_B}, out
     finally:
         for g in (long_run, smi, smi_locked):
             g and g.close()
@@ -2875,7 +2883,7 @@ def test_checks_slots_is_chat_settable_as_a_whole_number_only(env, capsys):
 
 
 def test_a_lane_wait_and_the_status_line_name_the_limit_and_checks_slots(env, tmp_path, monkeypatch):
-    from ttp import testslots
+    from ttp import checklane, testslots
     _lane_env(monkeypatch)
     hold = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1)
     try:
@@ -2885,8 +2893,9 @@ def test_a_lane_wait_and_the_status_line_name_the_limit_and_checks_slots(env, tm
         waiter = threading.Thread(target=testslots.suite_hold, args=("pa",),
                                   kwargs={"repo": _LANE_REPO, "slots": 1, "wait_s": 1.5})
         waiter.start()
-        assert _wait_for(lambda: "checks.slots raises it" in testslots.suite_line("pa", limit=1))
-        assert "(1 at a time per repository; checks.slots raises it)" in testslots.suite_line("pa", limit=1)
+        cfg = {"checks": {"slots": 1}}
+        assert _wait_for(lambda: "checks.slots raises it" in "".join(checklane.lane_lines("pa", cfg)))
+        assert "(1 at a time per repository; checks.slots raises it)" in checklane.lane_lines("pa", cfg)[0]
         waiter.join(10)
     finally:
         hold.close()
@@ -3878,3 +3887,162 @@ def test_a_waiter_whose_ticket_vanished_queues_again_at_its_place(env, monkeypat
         hold.close()
         w.join(10)
         got and got[0] and got[0].close()
+
+
+def test_lane_labels_name_the_repository_directory_and_wrapper_command_and_keep_the_id(env, tmp_path, monkeypatch):
+    # A lane is labelled by what a person knows (the repository's directory name, the wrapper command),
+    # with a short id only when two repositories share a name; the JSON keeps the id apart.
+    from ttp import checklane, testslots
+    _lane_env(monkeypatch)
+    main = tmp_path / "work" / "toolkit"
+    main.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(main)], check=True)
+    subprocess.run(["git", "-C", str(main), "-c", "user.email=a@b", "-c", "user.name=a", "commit", "-q",
+                    "--allow-empty", "-m", "x"], check=True)
+    wt = tmp_path / "wt" / "t1"
+    subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", str(wt)], check=True)
+    bare = tmp_path / "other" / "toolkit.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    assert testslots.repo_name(main) == testslots.repo_name(wt) == "toolkit", "a worktree names its repository"
+    assert testslots.repo_name(bare) == "toolkit" and testslots.repo_name(tmp_path) == ""
+    assert checklane.wrap_name(("/usr/local/bin/ttp", "lock", "dev-device", "--")) == "ttp lock dev-device"
+    assert checklane.wrap_name(()) == "" and len(checklane.wrap_name(("x" * 99,))) == 60
+    k1, k2, wk = testslots.repo_key(main), testslots.repo_key(bare), checklane.wrap_key(("ttp", "lock", "dev"))
+    assert testslots.repo_key(wt) == k1 != k2
+    holds = [testslots.suite_hold("pa", repo=k1, slots=1, name="toolkit"),
+             testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, name="other-repo"),
+             testslots.suite_hold("pa", repo=k1, slots=1, lock=wk, name="ttp lock dev")]
+    try:
+        st = {r["id"]: r for r in checklane.lane_status("pa")}
+        assert st[k1]["label"] == "repository toolkit" and st[_LANE_REPO]["label"] == "repository other-repo", st
+        assert st["w" + wk]["label"] == "wrapper lock ttp lock dev" and st["w" + wk]["kind"] == "wrapper lock", st
+        assert all(r["group"] == r["label"] and r["repo"] == r["id"] for r in st.values()), "old fields kept"
+        holds.append(testslots.suite_hold("pa", repo=k2, slots=1, name="toolkit"))
+        labels = {r["id"]: r["label"] for r in checklane.lane_status("pa")}
+        assert labels[k1] == f"repository toolkit ({k1[:6]})" and labels[k2] == f"repository toolkit ({k2[:6]})"
+        # a lane no run named (an older runtime): the project's own checks.wrap_cmd names it, else its id
+        (checklane._name_path("pa", "w" + wk)).unlink()
+        cfg = {"checks": {"wrap_cmd": "ttp lock dev"}}
+        assert checklane.lane_labels("pa", ["w" + wk], cfg)["w" + wk] == "wrapper lock ttp lock dev"
+        assert checklane.lane_labels("pa", ["w" + wk], {})["w" + wk] == f"wrapper lock {wk} (checks.wrap_cmd, one at a time)"
+        assert checklane.lane_labels("pa", [""], {})[""] == checklane.group_name("")
+    finally:
+        for g in holds:
+            g and g.close()
+
+
+def test_status_lines_say_which_lane_or_cap_each_held_check_waits_on(env, tmp_path, monkeypatch):
+    # Two repositories' checks never share a lane: a held check of another repository than the holder
+    # shows its real reason (the project cap, or the host-wide checks slot for one holding its lane).
+    from ttp import checkcap, checklane, locks, testslots
+    _lane_env(monkeypatch)
+    cfg = {"checks": {"slots": 1, "test_project_max": 2}}
+    monkeypatch.setattr(checklane, "children", lambda rec: 3)
+    monkeypatch.setenv("TTP_TASK", "12")
+    a = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, priority=2, name="alpha")
+    testslots.suite_running(a, 3600)
+    monkeypatch.setenv("TTP_TASK", "14")
+    b = testslots.suite_hold("pa", repo="ba9876543210", slots=1, priority=2, name="beta")
+    monkeypatch.delenv("TTP_TASK")
+    now = time.time()
+    host = locks.enqueue(checkcap.slot_dir(), checkcap.RESOURCE, "pa b", now)   # #14 waits for the host slot
+    tickets = [locks.enqueue(checkcap.slot_dir(), testslots.suite_base("pa", _LANE_REPO), "task #31 pa: x",
+                             now - 1500, priority=2),
+               locks.enqueue(checkcap.slot_dir(), testslots.suite_base("pa", "cd0123456789"), "task #32 pa: x",
+                             now - 1560, priority=2),
+               locks.enqueue(checkcap.slot_dir(), testslots.suite_base("pa", "cd0123456789"), "task #33 pa: x",
+                             now - 60, priority=2)]
+    checklane.remember_name("pa", "cd0123456789", "gamma")
+    try:
+        lines = checklane.lane_lines("pa", cfg, now)
+        by = {ln.split(" (")[0]: ln for ln in lines}
+        assert set(by) == {"checks lane repository alpha", "checks lane repository beta",
+                           "checks lane repository gamma"}, lines
+        assert ("#12 p2 queued 0 min, running 0 min of its 1 h 0 min cap, 3 child processes alive; held: #31 p2 "
+                "ranked p1 (aged) 25 min, waits on repository alpha") \
+            in by["checks lane repository alpha"], lines
+        assert ("#14 p2 queued 0 min, has a lane 0 min, not running yet: waits on the host-wide checks slot, "
+                "3 child processes alive") \
+            in by["checks lane repository beta"], lines
+        assert by["checks lane repository gamma"].endswith(
+            "no holder; held: #32 p2 ranked p1 (aged) 26 min, waits on project cap (checks.test_project_max), "
+            "#33 p2 ranked p2 1 min, waits on project cap (checks.test_project_max)"), "behind a capped waiter: the cap"
+        assert not any("full checks slot" in ln for ln in lines)
+        long = checklane.long_wait_lines("pa", cfg, now)
+        assert any("#32 has waited 2" in ln and " min on project cap (checks.test_project_max) (position 1 of 2 in "
+                   "repository gamma), behind #12" in ln for ln in long), long
+        ev = {e["task"]: e["text"] for e in checklane.wait_events("pa", cfg, now)}
+        assert " min on repository alpha (position 1 of 1 in repository alpha)" in ev[31], ev
+        assert "on project cap (checks.test_project_max)" in ev[32] and "#14" in ev[32], ev
+        js = {r["label"]: r for r in checklane.lane_status("pa", now, cfg)}
+        assert js["repository gamma"]["waiters"][0]["waits_on"] == checklane.CAP_LABEL
+        assert js["repository beta"]["lanes"][0]["waits_on"] == "the host-wide checks slot"
+        # without the cap the free lane's waiter is about to start, not held by anything
+        assert "waits on nothing (about to start)" in "".join(checklane.lane_lines("pa", {"checks": {"slots": 1}}, now)) \
+            or checklane.project_cap({"checks": {"slots": 1}}) > 0
+    finally:
+        for t in tickets + [host]:
+            locks.dequeue(t)
+        a.close()
+        b.close()
+
+
+def test_a_holder_s_queue_age_run_time_and_children_show_apart(env, tmp_path, monkeypatch):
+    # A holder whose check sat queued for hours reads as queued that long and running from its pytest
+    # start, never a frozen 'running 0 min'; its live children say it is not a stale holder.
+    from ttp import checklane, locks, testslots
+    _lane_env(monkeypatch)
+    now = time.time()
+    rec = {"task": "12", "command": "full checks", "queued": now - 3 * 3600, "since": now - 600,
+           "run_since": now - 540, "pid": os.getpid(), "node": os.uname().nodename, "pidns": locks._pid_ns()}
+    kid = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        t = checklane.holder_times(rec, now)
+        assert (t["queued_s"], t["held_s"], t["running_s"]) == (10800.0, 600.0, 540.0), t
+        assert t["children"] >= 1, t
+        text = checklane.holder_text(rec, now)
+        assert text.startswith("#12 'full checks' queued 3 h 0 min, running 9 min, ") and " alive" in text, text
+    finally:
+        _stop(kid)
+    # Not running yet: the lane's age, not a run time; an older label without "queued" uses the lane's age.
+    old = {"task": "12", "since": now - 120}
+    assert checklane.holder_text(old, now) == "#12 queued 2 min, has the lane 2 min, not running yet, child processes unknown"
+    bad = {**old, "queued": "x", "run_since": "y", "pid": "z"}
+    assert checklane.holder_text(bad, now) == checklane.holder_text(old, now), "a garbled label reads as an old one"
+    # Children: none for a live childless pid (said as a hint), unknown on another host or for a gone pid.
+    lone = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        mine = {"pid": lone.pid, "node": os.uname().nodename, "pidns": locks._pid_ns(), "run_since": now}
+        assert checklane.children(mine) == 0
+        assert "no child process (stuck or between commands?)" in checklane.holder_text(mine, now)
+        assert checklane.children({**mine, "node": "elsewhere"}) is None
+    finally:
+        _stop(lone)
+    assert checklane.children(mine) is None, "a gone pid: unknown, not 'no children'"
+    # The lane record carries the arrival as "queued", and the JSON shows the clocks apart.
+    monkeypatch.setenv("TTP_TASK", "12")
+    g = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, priority=2, name="alpha")
+    try:
+        lane, = checklane.lane_status("pa", time.time() + 120)[0]["lanes"]
+        assert lane["queued_s"] >= lane["age_s"] >= 120 and lane["running_s"] is None, lane
+        assert lane["children"] is None or lane["children"] >= 0, lane
+        testslots.suite_running(g, 0)
+        lane, = checklane.lane_status("pa", time.time() + 60)[0]["lanes"]
+        assert 59 <= lane["running_s"] <= 61, lane
+    finally:
+        g.close()
+
+
+def test_status_and_the_web_feed_show_the_lane_lines(env, monkeypatch):
+    from ttp import checklane, cli, testslots, web
+    _lane_env(monkeypatch)
+    p = make(env)
+    g = testslots.suite_hold(p.name, repo=_LANE_REPO, slots=1, priority=3, name="alpha")
+    try:
+        text = cli.status_text(p)
+        assert "checks lane repository alpha (" in text and "full checks slot" not in text, text
+        rows = [r["text"] for r in web.slots_feed(time.time(), p)]
+        assert rows == checklane.lane_lines(p.name, p.config()) or any("repository alpha" in r for r in rows), rows
+        assert any("checks lane repository alpha" in r for r in rows), rows
+    finally:
+        g.close()

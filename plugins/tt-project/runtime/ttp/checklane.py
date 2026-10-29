@@ -45,7 +45,11 @@ duration of this command list's recorded passing runs, else its class: light, ot
 build) takes one of as many overflow lanes alongside them, not after.
 
 Visible. A waiter says who holds the lanes (task, command, running for) and its queue position every
-TELL_S; `ttp status` and the coordinator digest list waits over LONG_WAIT_S (long_wait_lines), and the
+TELL_S. Each lane is named for people (lane_labels): 'repository <directory name>', 'wrapper lock
+<command>' or, for a waiter whose lane is free but the project is at its cap, 'project cap
+(checks.test_project_max)'. `ttp status` and the web app show one line per lane (lane_lines: who runs,
+who is held and what each waits on); `ttp status` and the coordinator digest list waits over LONG_WAIT_S
+(long_wait_lines), and the
 daemon records one `checks_slot_wait` event per wait episode past `checks.wait_event_s` (default
 WAIT_EVENT_S; 0 turns it off) naming holder and waiter (wait_events). Only one of them wakes the coordinator
 per queue incident (wait_wake: from the first waiter past the threshold until none is); the incident wakes it
@@ -193,16 +197,118 @@ def project_cap(cfg: dict | None) -> int:
     return max(slots(cfg), s[0] // s[1]) if s else 0
 
 
+NAME_SUFFIX = ".name"   # beside a lane's files: its repository's or wrapper command's name (remember_name)
+CAP_LABEL = "project cap (checks.test_project_max)"
+
+
+def wrap_name(wrap) -> str:
+    """A wrapper lock's name for its lane's label: checks.wrap_cmd's words, its program by its base name,
+    without a closing `--`, at most 60 characters; "" for none."""
+    words = [str(w) for w in (wrap or ())]
+    while words and words[-1] == "--":
+        words.pop()
+    if not words:
+        return ""
+    words[0] = os.path.basename(words[0]) or words[0]
+    text = " ".join(words)
+    return text if len(text) <= 60 else text[:59] + "…"
+
+
+def _name_path(project_name: str, key: str) -> Path:
+    return checkcap.slot_dir() / (testslots.suite_base(project_name, key) + NAME_SUFFIX)
+
+
+def remember_name(project_name: str | None, key: str, name: str) -> None:
+    """Keep lane `key`'s name (testslots.repo_name or wrap_name) beside its files, for lane_labels:
+    written only when it differs, by a rename, so a reader never sees half of it (a cache: no sync)."""
+    if not (project_name and key and name):
+        return
+    path = _name_path(project_name, key)
+    try:
+        if path.read_text() == name:
+            return
+    except OSError:
+        pass
+    try:
+        project.durable_write(path, name, sync=False)
+    except OSError:
+        pass
+
+
 def group_name(key: str, name: str = "") -> str:
-    """What a lane base's key names, for status (the one naming rule: lane_status, status_text): a wrapper
-    lock, a repository, or an unkeyed group (an older runtime's one lane per project), with `name` (the
-    repository's or project folder's name, lane_status's "name") beside the key when given. Never empty."""
+    """What a lane key names when lane_labels has no name for it (its fallback, the one naming rule): a
+    wrapper lock, a repository, or an unkeyed group (an older runtime's one lane per project), with `name`
+    (the project folder's name for the unkeyed group) beside the key when given. Never empty."""
     if key.startswith("w"):
         return f"wrapper lock {key[1:]} (checks.wrap_cmd, one at a time)"
     if not key:
         return (f"repository {name} (not keyed: an older runtime, one lane per project)" if name
                 else "not keyed (no repository key: an older runtime, one lane per project)")
     return f"repository {name} (key {key})" if name and name != key else f"repository {key}"
+
+
+def _lane_name(project_name: str, key: str, known: dict | None = None) -> str:
+    """Lane `key`'s name: the one a run kept beside it (remember_name), else `known[key]` (a holder's
+    repo_name, or the caller's name for its own repository or the unkeyed group); "" for none."""
+    if key:
+        try:
+            got = " ".join(_name_path(project_name, key).read_text().split())[:80]
+            if got:
+                return got
+        except OSError:
+            pass
+    return " ".join(str((known or {}).get(key) or "").split())[:80]
+
+
+def lane_labels(project_name: str, keys, cfg: dict | None = None, known: dict | None = None) -> dict:
+    """Each lane key's label for a person: 'repository <directory name>' (with a short id when two of
+    `keys` share a name), 'wrapper lock <command>' (wrap_name), 'not keyed (...)' for an unkeyed
+    lane (group_name, with the project folder's name when `known` gives it). A name no run recorded
+    (an older runtime took the lane) is `known[key]` (_lane_name), else the project's checks.wrap_cmd
+    when its key matches, else the id (group_name)."""
+    try:
+        from . import push
+        own = wrap_key(push.wrap_of(cfg)), wrap_name(push.wrap_of(cfg))
+    except ValueError:
+        own = "", ""
+    names = {}
+    for k in keys:
+        names[k] = (_lane_name(project_name, k, known)
+                    or (own[1] if k.startswith("w") and own[0] and k[1:] == own[0] else ""))
+    seen = [n for k, n in names.items() if n and k and not k.startswith("w")]
+    out = {}
+    for k, n in names.items():
+        if not k:
+            out[k] = group_name(k, n)
+        elif not n:
+            out[k] = group_name(k)
+        elif k.startswith("w"):
+            out[k] = f"wrapper lock {n}"
+        else:
+            out[k] = f"repository {n}" + (f" ({k[:6]})" if seen.count(n) > 1 else "")
+    return out
+
+
+def _lane_waits_on(project_name: str, base: str, key: str, q: list, cfg: dict | None, label: str) -> list[str]:
+    """What each waiter in lane `base`'s queue `q` (in turn order) waits on: the lane itself while its
+    lanes are all held; with one free, the project cap (testslots.cap_turn: a waiter behind the lane's
+    first ones waits for them, and they for the cap)."""
+    n = 1 if key.startswith("w") else max(1, slots(cfg))
+    held = len([x for x in locks.slot_paths(checkcap.slot_dir(), base, n) if locks._slot_labels([x])])
+    capped = project_cap(cfg) > 0
+    return [label if held >= n else CAP_LABEL if capped else "nothing (about to start)" for _ in q]
+
+
+def _pid_queued(pid) -> str:
+    """What a lane holder that is not running yet waits on: the host-wide checks slot or the host's
+    test-worker slots (its ticket in their queue), else "" (it is starting, or an older runtime holds it)."""
+    for res, what in ((checkcap.RESOURCE, "the host-wide checks slot"),
+                      (testslots.TESTS.resource, "the host's test-worker slots")):
+        for t in _live_tickets(res):
+            m = re.match(r"\d+(?:\.\d+)?-(\d+)", t.name)
+            if pid and m and int(m.group(1)) == pid:
+                return what
+    return ""
 
 
 def wrap_key(wrap) -> str:
@@ -421,12 +527,50 @@ def mins(s: float) -> str:
     return testslots._mins(s)
 
 
+def children(rec: dict) -> int | None:
+    """How many live child processes (its whole tree) a lane holder's pid has, or None when this process
+    cannot judge it (no pid, another host or PID namespace, no /proc) or the pid is gone."""
+    from . import jobuse
+    if locks.pid_alive(rec) is not True:
+        return None
+    tree = jobuse._tree(int(rec["pid"]))
+    return None if tree is None else len(tree) - 1
+
+
+def holder_times(rec: dict, now: float) -> dict:
+    """A lane holder's clocks, apart: queued_s (from its arrival in the queue: since the lane was taken
+    for an older runtime's label), held_s (from taking the lane), running_s (from its first command,
+    the pytest start: suite_running; None while not running yet), and children (children())."""
+    def at(k, default):
+        try:
+            return float(rec.get(k) or default) if default is not None or rec.get(k) else None
+        except (TypeError, ValueError):
+            return default
+    since = at("since", now)
+    run = at("run_since", None)
+    return {"queued_s": round(now - at("queued", since), 1), "held_s": round(now - since, 1),
+            "running_s": round(now - run, 1) if run else None, "children": children(rec)}
+
+
+def _kids(n: int | None, running: bool) -> str:
+    if n is None:
+        return "child processes unknown"
+    if n == 0:
+        return "no child process" + (" (stuck or between commands?)" if running else "")
+    return f"{n} child process{'es' if n > 1 else ''} alive"
+
+
 def holder_text(rec: dict, now: float) -> str:
-    """'#12 running `pytest -q` for 14 min' for a lane's label."""
+    """"#12 'pytest -q' queued 3 h 0 min, running 14 min, 4 child processes alive" for a waiter's line:
+    the holder's queue age and its run time from the pytest start shown apart (holder_times), so a holder
+    whose check sat queued for hours does not read as a frozen 'running 0 min'."""
     who = f"#{rec['task']}" if rec.get("task") else str(rec.get("holder") or "a run")
     cmd = str(rec.get("command") or "").strip()
-    since = float(rec.get("run_since") or rec.get("since") or now)
-    return f"{who} running {cmd!r} for {mins(now - since)}" if cmd else f"{who} for {mins(now - since)}"
+    t = holder_times(rec, now)
+    run = (f"running {mins(t['running_s'])}" if t["running_s"] is not None
+           else f"has the lane {mins(t['held_s'])}, not running yet")
+    return (f"{who}{f' {cmd!r}' if cmd else ''} queued {mins(t['queued_s'])}, {run}, "
+            f"{_kids(t['children'], t['running_s'] is not None)}")
 
 
 def _ticket_task(t: Path) -> str:
@@ -440,23 +584,29 @@ def _ticket_task(t: Path) -> str:
 def waits(project_name: str, cfg: dict | None, now: float | None = None, over_s: float = 0.0) -> list[dict]:
     """The project's waiters for a lane that have waited over `over_s`, in queue order (the aging step
     of `cfg`, checks.priority_age_s — the order the lanes grant): task, waited_s, since (arrival),
-    position (1-based) and the lane holders' records."""
+    position (1-based), the lane's label (lane_labels), what it waits on (the lane, or the project cap:
+    _lane_waits_on), the limit holding it ("lanes" or "project_cap") and the holders' records (of the
+    lane, or of every lane for the cap)."""
     now = time.time() if now is None else now
     age = priority_age_s(cfg)
     pre = f"{testslots.SUITE}.{locks.group_id(project_name)}"
     out = []
     try:
-        for base in testslots.suite_bases(project_name):
-            q = testslots.suite_order(project_name, now=now, repo=base[len(pre) + 1:], age=age)
-            # A free lane with waiters means the project's cap (cap_turn) is what holds them.
-            cap_wait = not locks.holder_records(testslots._lanes_of(base))
-            recs = locks.holder_records(testslots.project_held(project_name)) if cap_wait \
-                else locks.holder_records(testslots._lanes_of(base))
+        bases = testslots.suite_bases(project_name)
+        labels = lane_labels(project_name, [b[len(pre) + 1:] for b in bases], cfg)
+        for base in bases:
+            key = base[len(pre) + 1:]
+            q = testslots.suite_order(project_name, now=now, repo=key, age=age)
+            on = _lane_waits_on(project_name, base, key, q, cfg, labels[key]) if q else []
+            lane_recs = locks.holder_records(testslots._lanes_of(base)) if q else []
+            all_recs = locks.holder_records(testslots.project_held(project_name)) if q else []
             for i, t in enumerate(q):
                 waited = now - locks._arrival(t)
                 if waited > over_s:
                     out.append({"task": _ticket_task(t), "waited_s": waited, "since": locks._arrival(t),
-                                "position": i + 1, "of": len(q), "holders": recs, "limit": "project_cap" if cap_wait else "lanes"})
+                                "position": i + 1, "of": len(q), "lane": labels[key], "waits_on": on[i],
+                                "holders": lane_recs if on[i] == labels[key] else all_recs,
+                                "limit": "lanes" if on[i] == labels[key] else "project_cap"})
     except OSError:
         return []
     return out
@@ -469,8 +619,8 @@ def long_wait_lines(project_name: str, cfg: dict | None, now: float | None = Non
     out = []
     for w in waits(project_name, cfg, now, over_s):
         held = "; ".join(holder_text(h, now) for h in w["holders"][:3]) or "lanes free, about to start"
-        out.append(f"checks slot wait: {'#' + w['task'] if w['task'] else 'a run'} has waited {mins(w['waited_s'])} "
-                   f"(position {w['position']} of {w['of']}), behind {held}")
+        out.append(f"checks lane wait: {'#' + w['task'] if w['task'] else 'a run'} has waited {mins(w['waited_s'])} "
+                   f"on {w['waits_on']} (position {w['position']} of {w['of']} in {w['lane']}), behind {held}")
     return out
 
 
@@ -488,11 +638,11 @@ def wait_events(project_name: str, cfg: dict | None, now: float | None = None) -
         out.append({"fingerprint": f"checks_slot_wait:{w['task'] or 'run'}:{w['since']:.0f}",
                     "task": int(w["task"]) if w["task"] else None,
                     "waited_s": w["waited_s"], "holders": w["holders"],
-                    "text": (f"Checks slot wait: {who} has waited {mins(w['waited_s'])} for its project's checks "
-                             f"slot (position {w['position']} of {w['of']}), behind {held}. Lanes: checks.slots "
-                             f"per repository, one per checks.wrap_cmd lock, checks.test_project_max per project; "
-                             f"a waiter cheaper than the holders gets a lane after checks.max_wait_s; light "
-                             f"checks (ttp checks --light, checks.light_cmds) never wait. This wait was held "
+                    "text": (f"Checks lane wait: {who} has waited {mins(w['waited_s'])} on {w['waits_on']} "
+                             f"(position {w['position']} of {w['of']} in {w['lane']}), behind {held}. Lanes: "
+                             f"checks.slots per repository, one per checks.wrap_cmd lock, checks.test_project_max "
+                             f"per project; a waiter cheaper than the holders gets a lane after checks.max_wait_s; "
+                             f"light checks (ttp checks --light, checks.light_cmds) never wait. This wait was held "
                              f"by " + ("the per-repository lane limit (checks.slots)." if w["limit"] == "lanes"
                                        else "the project cap (checks.test_project_max)."))})
     return out
@@ -582,31 +732,43 @@ def _run_of(text: str) -> str:
 
 def lane_status(project_name: str, now: float | None = None, cfg: dict | None = None,
                 names: dict | None = None, db=None) -> list[dict]:
-    """`ttp checks status`: per repository with a held lane or a waiter, its name, its lanes' holders
-    (task, run, pid, age, alive, command) and its waiters in the order the lanes go to them
+    """`ttp checks status`: per lane (a repository's or a wrapper lock's) with a holder or a waiter, its
+    id (the key), label (lane_labels), name, holders (task, run, pid, priority, age, alive, command, and
+    for one not running yet what it waits on) and its waiters in the order the lanes go to them
     (testslots.suite_order, the aging step of `cfg`), the first one next, each with its task priority
-    (None without one) and its rank now (testslots.suite_priority). The name is the one its holders
-    recorded, else `names[repo key]` (the caller's: its own repository, and the project folder's name for
-    the unkeyed group, key ""), else the lane key: never empty. Each holder says why it holds the lane
-    (`why`: its label, e.g. "full checks") and, given the project's `db`, its task's status
-    (`task_status`) and whether that task has ended (`finished`). Read only: it probes the lock files
-    without holding them and never queues, reclaims a lane, removes a dead ticket or writes a file."""
+    (None without one), its rank now (testslots.suite_priority) and what it waits on (_lane_waits_on).
+    The name is the one its runs recorded (remember_name, else a holder's repo_name), else
+    `names[repo key]` (the caller's: its own repository, and the project folder's name for the unkeyed
+    group, key ""), else the lane key: never empty. Each holder says why it holds the lane (`why`: its
+    label, e.g. "full checks") and, given the project's `db`, its task's status (`task_status`) and
+    whether that task has ended (`finished`). Read only: it probes the lock files without holding them
+    and never queues, reclaims a lane, removes a dead ticket or writes a file."""
     now = time.time() if now is None else now
     age = priority_age_s(cfg)
     pre = f"{testslots.SUITE}.{locks.group_id(project_name)}"
+    bases = testslots.suite_bases(project_name)
+    recs = {b: locks.holder_records(testslots._lanes_of(b)) for b in bases}
+    known = {b[len(pre) + 1:]: (next((str(r["repo_name"]) for r in recs[b] if r.get("repo_name")), "")
+                                or (names or {}).get(b[len(pre) + 1:]) or "") for b in bases}
+    labels = lane_labels(project_name, list(known), cfg, known)
     out = []
-    for base in testslots.suite_bases(project_name):
+    for base in bases:
+        key = base[len(pre) + 1:]
         lanes = []
-        recs = locks.holder_records(testslots._lanes_of(base))
-        for r in recs:
-            since = float(r.get("since") or now)
+        for r in recs[base]:
+            t = holder_times(r, now)
+            running = t["running_s"]
             lanes.append({"task": str(r.get("task") or ""), "run": _run_of(r.get("holder")), "pid": r.get("pid"),
-                          "age_s": round(now - since, 1), "alive": r.get("alive"),
-                          "running_s": round(now - float(r["run_since"]), 1) if r.get("run_since") else None,
+                          "priority": r.get("priority"), "age_s": t["held_s"], "queued_s": t["queued_s"],
+                          "alive": r.get("alive"), "children": t["children"],
+                          "running_s": running, "cap_s": float(r.get("cap_s") or 0),
                           "command": str(r.get("command") or ""), "overflow": bool(r.get("overflow")),
-                          "cost": r.get("cost") or {}, "why": _why(r.get("holder")), **_task_state(db, r)})
+                          "cost": r.get("cost") or {}, "why": _why(r.get("holder")), **_task_state(db, r),
+                          **({} if running is not None else {"waits_on": _pid_queued(r.get("pid")) or "no host queue (starting, or an older runtime)"})})
+        q = testslots.suite_order(project_name, _live_tickets(base), now, age=age)
+        on = _lane_waits_on(project_name, base, key, q, cfg, labels[key])
         waiters = []
-        for i, t in enumerate(testslots.suite_order(project_name, _live_tickets(base), now, age=age)):
+        for i, t in enumerate(q):
             m = re.match(r"\d+(?:\.\d+)?-(\d+)", t.name)
             prio = locks.ticket_priority(t)
             try:
@@ -617,12 +779,12 @@ def lane_status(project_name: str, now: float | None = None, cfg: dict | None = 
                             "pid": int(m.group(1)) if m else None,
                             "priority": None if prio == float("inf") else prio,
                             "rank": testslots.suite_priority(t, now, age), "label": testslots.rank_text(t, now, age),
-                            "waited_s": round(now - locks._arrival(t), 1), "next": i == 0})
+                            "waited_s": round(now - locks._arrival(t), 1), "next": i == 0, "waits_on": on[i]})
         if lanes or waiters:
-            repo = base[len(pre) + 1:]
-            name = (next((str(r["repo_name"]) for r in recs if r.get("repo_name")), "")
-                    or (names or {}).get(repo) or repo or base)
-            out.append({"repo": repo, "group": group_name(repo), "name": name, "lanes": lanes, "waiters": waiters})
+            out.append({"id": key, "label": labels[key], "repo": key, "group": labels[key],
+                        "name": _lane_name(project_name, key, known) or key or base,
+                        "kind": "wrapper lock" if key.startswith("w") else "repository" if key else "project",
+                        "lanes": lanes, "waiters": waiters})
     return out
 
 
@@ -649,6 +811,47 @@ def _who(x: dict) -> str:
                                 (f"pid {x['pid']}" if x.get("pid") else "")) if w)
 
 
+def _rule(r: dict, cfg: dict | None) -> str:
+    if r["kind"] == "wrapper lock":
+        return "" if "one at a time" in r["label"] else "one at a time, checks.wrap_cmd"
+    n = slots(cfg)
+    return f"{n} at a time per repository; checks.slots raises it"
+
+
+def lane_lines(project_name: str, cfg: dict | None = None, now: float | None = None) -> list[str]:
+    """`ttp status` and the web app's feed: one line per checks lane with a holder or a waiter (lane_status):
+    its label, who runs and for how long against the wall-time cap, who holds a lane but is not running
+    yet and what it waits on, and who is held in turn order, each with its priority and rank now
+    (testslots.rank_text) and the lane or cap it waits on."""
+    now = time.time() if now is None else now
+    out = []
+    try:
+        got = lane_status(project_name, now, cfg)
+    except OSError:
+        return []
+    for r in got:
+        parts = []
+        for h in r["lanes"]:
+            who = (f"#{h['task']}" if h["task"] else "a run") + (f" p{h['priority']}" if h["priority"] is not None else "")
+            kids = _kids(h["children"], h["running_s"] is not None)
+            if h["running_s"] is not None:
+                parts.append(f"{who} queued {mins(h['queued_s'])}, running {mins(h['running_s'])}"
+                             + (f" of its {mins(h['cap_s'])} cap" if h["cap_s"] else " (no cap)") + f", {kids}")
+            else:
+                parts.append(f"{who} queued {mins(h['queued_s'])}, has a lane {mins(h['age_s'])}, not running yet: "
+                             f"waits on {h['waits_on']}, {kids}")
+        held = []
+        for w in r["waiters"]:
+            who = f"#{w['task']}" if w["task"] else "a run"
+            held.append(f"{who} {w['label']} {mins(w['waited_s'])}, waits on {w['waits_on']}")
+        rule = _rule(r, cfg)
+        line = f"checks lane {r['label']}" + (f" ({rule})" if rule else "") + ": " + ("; ".join(parts) or "no holder")
+        if held:
+            line += f"; held: {', '.join(held[:6])}" + (f" +{len(held) - 6}" if len(held) > 6 else "")
+        out.append(line)
+    return out
+
+
 def status_text(project_name: str, cfg: dict | None, here_repo: str = "", now: float | None = None,
                 names: dict | None = None, db=None) -> str:
     """lane_status as lines for a person (`ttp checks status`)."""
@@ -661,21 +864,26 @@ def status_text(project_name: str, cfg: dict | None, here_repo: str = "", now: f
     if not got:
         lines.append("  no lane held and nobody waiting")
     for r in got:
-        lines.append(f"  {group_name(r['repo'], r['name'])}" + (" (this one)" if r["repo"] == here_repo else ""))
+        # The one naming rule: the row's group (its label, lane_labels; group_name when no run named it).
+        where = r["group"] + (" (checks.wrap_cmd, one at a time)"
+                              if r["kind"] == "wrapper lock" and "one at a time" not in r["group"] else "")
+        lines.append(f"  {where}" + (" (this one)" if r["id"] == here_repo else ""))
         for h in r["lanes"]:
             alive = {True: "alive", False: "DEAD (its lane is reclaimed by the next waiter)"}.get(h["alive"], "alive unknown")
-            run = f", running {h['command']!r} for {mins(h['running_s'])}" if h["running_s"] is not None else ", not running yet"
+            run = (f", running {h['command']!r} for {mins(h['running_s'])}" if h["running_s"] is not None
+                   else f", not running yet: waits on {h['waits_on']}")
             why = f" for {h['why']}" if h.get("why") else ""
             ended = (f", its task is {h['task_status'].upper()} (the lane is reported, and its own detached checks "
                      f"stopped after checks.done_holder_grace_s)") if h.get("finished") else ""
             lines.append(f"    holder{' (extra lane)' if h['overflow'] else ''}: {_who(h)}{why}, {alive}, "
-                         f"held {mins(h['age_s'])}{run}{ended}")
+                         f"queued {mins(h['queued_s'])}, held {mins(h['age_s'])}{run}, "
+                         f"{_kids(h['children'], h['running_s'] is not None)}{ended}")
         if not r["lanes"]:
             lines.append("    holder: none (a waiter is about to start)")
         for w in r["waiters"]:
             lines.append(f"    waiter {w['position']}{' (next)' if w['next'] else ''}: {_who(w)}"
                          + f", {w['label']}"
-                         + f", waited {mins(w['waited_s'])}")
+                         + f", waited {mins(w['waited_s'])}, waits on {w['waits_on']}")
         if not r["waiters"]:
             lines.append("    waiters: none")
     return "\n".join(lines)

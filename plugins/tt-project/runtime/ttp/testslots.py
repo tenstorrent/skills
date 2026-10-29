@@ -45,8 +45,8 @@ waited (default SUITE_AGE_S; checklane.priority_age_s), never past p1 (AGE_FLOOR
 0 stays 0), so a waiter of priority p waits at most (p - 1) aging steps plus the runs of those that
 arrived before it. Among equal ranks a native priority goes before an aged one (a native p1 before a p3
 aged to p1), until the aged one has waited FAIR_STEPS steps: then arrival decides (_order_key). Wait lines show each waiter's priority and its rank now (rank_text).
-A run holding it is stopped at the checks wall-time cap (checkwall); suite_line shows the holder's
-time against that cap and the waiting order (`ttp status`).
+A run holding it is stopped at the checks wall-time cap (checkwall); checklane.lane_lines shows the
+holder's time against that cap and each lane's waiters with what each waits on (`ttp status`).
 
 Builds (make, ninja, cmake --build) take slots of a second pool, the build pool (BUILDS: same sizes,
 same locks and order, its own lock files and settings checks.build_pool, checks.build_run_max and
@@ -402,9 +402,8 @@ def tree_key(top) -> str:
     return "t" + hashlib.sha256(os.path.realpath(str(top)).encode()).hexdigest()[:12] if top else ""
 
 
-def repo_key(top) -> str:
-    """The short id of the git repository at `top` (its common git dir, so all its worktrees share it);
-    "" when `top` is not in one."""
+def _common_dir(top) -> str:
+    """The real path of the common git dir of the repository at `top`; "" when `top` is not in one."""
     if not top:
         return ""
     try:
@@ -415,24 +414,21 @@ def repo_key(top) -> str:
     if r.returncode or not r.stdout.strip():
         return ""
     common = Path(r.stdout.strip())
-    common = common if common.is_absolute() else Path(top) / common
-    return hashlib.sha256(os.path.realpath(common).encode()).hexdigest()[:12]
+    return os.path.realpath(common if common.is_absolute() else Path(top) / common)
+
+
+def repo_key(top) -> str:
+    """The short id of the git repository at `top` (its common git dir, so all its worktrees share it);
+    "" when `top` is not in one."""
+    common = _common_dir(top)
+    return hashlib.sha256(common.encode()).hexdigest()[:12] if common else ""
 
 
 def repo_name(top) -> str:
-    """The name of the git repository at `top` for people (its main checkout's folder, shared by its
-    worktrees); "" when `top` is not in one."""
-    if not top:
-        return ""
-    try:
-        r = subprocess.run(["git", "-C", str(top), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                           capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    common = Path(r.stdout.strip()) if not r.returncode and r.stdout.strip() else None
-    if common is None:
-        return ""
-    return common.parent.name if common.name == ".git" else common.name.removesuffix(".git")
+    """The directory name of the git repository at `top` (its main checkout's, or a bare repository's
+    without .git, so all its worktrees share it), for its checks lane's label; "" when not in one."""
+    common = Path(_common_dir(top) or ".")
+    return (common.parent.name if common.name == ".git" else common.name.removesuffix(".git")) if str(common) != "." else ""
 
 
 def suite_base(project_name: str, repo: str = "") -> str:
@@ -761,7 +757,7 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                max_wait: float = 0.0, state=None, what: str = "full checks", lock: str = "", cap: int = 0,
                worktree: str = "", headroom: Callable[[], bool] | None = None,
                age: float | None = None, pending: bool = False, check: str = "",
-               repo_name: str = "") -> Grant | None:
+               repo_name: str = "", name: str = "") -> Grant | None:
     """Hold one of project `project_name`'s `slots` checks lanes in repository `repo` (repo_key) for its
     full checks (above), waiting while its other runs there hold them all or a more urgent waiter is ahead
     (suite_order); Grant(0) holding one, Grant() with no project or nested in a check, None once `wait_s`
@@ -787,7 +783,9 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     only by less urgent runs takes an overflow lane beside them while `headroom()` says the host has room,
     never beside a holder in the same `worktree` (one suite per worktree). `age`: the aging step
     (age_s(), checks.priority_age_s; default the account's or SUITE_AGE_S). `pending`: the run takes its
-    test slots after the lane, so the lane counts against `cap` only once slots_granted() marks it."""
+    test slots after the lane, so the lane counts against `cap` only once slots_granted() marks it.
+    `name`: the lane's name for status (the repository's directory name, or with `lock` the wrapper
+    command's: checklane.lane_labels)."""
     from . import checklane
     age = age_s() if age is None else age
     if not project_name or os.environ.get(HELD_ENV) or os.environ.get(checkcap.HELD_ENV):
@@ -801,17 +799,19 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     label = f"{project_name}: full checks ({who + ', ' if who else ''}pid {os.getpid()})"
     ns = locks._pid_ns()
     text = ((f"task #{task} {label}" if task.isdigit() else label) + (f" [check {check}]" if check else "")
-            + (f" [pidns {ns}]" if ns else ""))   # the ticket names its task for suite_line
+            + (f" [pidns {ns}]" if ns else ""))   # the ticket names its task for checklane.lane_lines
     resource = _suite_resource(project_name, repo)
     try:
         ticket = locks.enqueue(checkcap.slot_dir(), resource, text, since, priority=priority)
     except OSError:
         return Grant()   # an unwritable slot directory: the checks slot says so
     arrival = locks._arrival(ticket)
+    checklane.remember_name(project_name, repo, name or repo_name)
     fields = {**({"task": task} if task.isdigit() else {}), **({"priority": priority} if priority is not None else {}),
               **({"cost": cost} if cost else {}), **({"lock": lock} if lock else {}),
               **({"worktree": str(worktree)} if worktree else {}), **({"granted": False} if pending else {}),
-              **({"repo_name": repo_name} if repo_name else {}), "hb": checklane.HEARTBEAT_S}
+              **({"repo_name": repo_name} if repo_name else {}), "hb": checklane.HEARTBEAT_S,
+              "queued": arrival}   # the holder's queue age, apart from its run time (checklane.holder_times)
     start, told = time.time(), 0.0
     try:
         while True:
@@ -896,7 +896,7 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
 
 def suite_running(grant, cap_s: float) -> None:
     """Mark the suite lock `grant` holds as running its commands from now under a wall-time cap of
-    `cap_s` seconds (0: none), for suite_line."""
+    `cap_s` seconds (0: none), for checklane.lane_lines."""
     for f in getattr(grant, "files", None) or []:
         if os.path.basename(getattr(f, "name", "")).startswith(SUITE + "."):
             locks.relabel(f, {"run_since": time.time(), "cap_s": float(cap_s or 0)})
@@ -905,50 +905,6 @@ def suite_running(grant, cap_s: float) -> None:
 def _mins(s: float) -> str:
     m = int(max(0.0, s) // 60)
     return f"{m // 60} h {m % 60} min" if m >= 60 else f"{m} min"
-
-
-def suite_line(project_name: str, now: float | None = None, limit: int = 0, age: float | None = None) -> str:
-    """`ttp status`'s line on the project's full checks slot: its holder, how long it has run against
-    its wall-time cap, and the waiting order (suite_order, aging step `age`) with each waiter's priority
-    and rank (rank_text), with a wait naming the `limit` (lanes per repository) and checks.slots, which
-    raises it; "" while it is free and nobody waits."""
-    now = time.time() if now is None else now
-    age = age_s() if age is None else age
-    try:
-        recs = locks.holder_records(lane_paths(project_name, None, None))
-        q = []
-        pre = f"{SUITE}.{locks.group_id(project_name)}"
-        for base in suite_bases(project_name):
-            q += suite_order(project_name, now=now, repo=base[len(pre) + 1:], age=age)
-        q.sort(key=lambda t: _order_key(t, now, age))
-    except OSError:
-        return ""
-    if not recs and not q:
-        return ""
-    held = []
-    for h in recs:
-        what = f"#{h['task']}" if h.get("task") else str(h.get("holder") or "a run")
-        what += f" p{h['priority']}" if h.get("priority") is not None else ""
-        if h.get("run_since"):
-            cap = float(h.get("cap_s") or 0)
-            what += (f" running {_mins(now - float(h['run_since']))}"
-                     + (f" of its {_mins(cap)} cap" if cap else " (no cap)"))
-        else:
-            what += f" held {_mins(now - float(h.get('since') or now))}, not running yet"
-        held.append(what)
-    what = "; ".join(held) or "free"
-    waits = []
-    for t in q:
-        try:
-            m = re.search(r"task #(\d+)", t.read_text())
-        except OSError:
-            m = None
-        waits.append(f"{'#' + m.group(1) if m else 'a run'} {rank_text(t, now, age)} "
-                     f"waited {_mins(now - locks._arrival(t))}")
-    return (f"full checks slot: {what}"
-            + (f"; waiting in order: {', '.join(waits[:6])}" + (f" +{len(waits) - 6}" if len(waits) > 6 else "")
-               + (f" ({limit} at a time per repository; checks.{SLOTS_KEY} raises it)" if limit else "")
-               if waits else ""))
 
 
 def use(kind: Kind = TESTS) -> str:

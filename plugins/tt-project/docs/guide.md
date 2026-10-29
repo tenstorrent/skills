@@ -1021,7 +1021,17 @@ queues behind routine work; nothing running is interrupted:
   only reported. The checks the daemon starts for a code task's review as that task finishes are not a
   finished task's lane while a review that reads them is still open; once it ends, a precheck still
   holding the lane is reported but never stopped (it is no worker run; the wall-time cap below ends it).
-  A run's check commands stop at a wall-time cap: on by
+  Each lane is named for people: `repository <directory name>` (a short id is added only when two repositories
+  share a name), `wrapper lock <command>` for a `checks.wrap_cmd` lane, and a waiter whose lane is free but whose
+  project is at its cap waits on `project cap (checks.test_project_max)`; the JSON keeps the stable `id` beside
+  the `label`. `ttp status` and the web app show one line per lane: who runs, who has a lane but
+  is not running yet (and waits on the host-wide checks slot or test-worker slots), and each held check with its
+  priority, its rank now and
+  what it waits on; the `checks_slot_wait` event uses the same names. Each holder shows its queue age (from
+  joining the queue), its run time (from its first command) and how many child processes it has alive, apart,
+  so a holder that queued for hours never reads as a frozen `running 0 min`, and one with no live children
+  stands out. Two checks of one repository share its
+  lanes by design; checks of different repositories never do. A run's check commands stop at a wall-time cap: on by
   default, 3x the longest of the project's last 20 completed runs within 1-6 h (3 h before 3 runs are known);
   `checks.wall_cap_s` sets it, 0 turns it off. A run past it has its process group ended, frees the slot and is
   recorded as a timeout, never a pass; `ttp status` shows the holder's time against its cap and the waiting
