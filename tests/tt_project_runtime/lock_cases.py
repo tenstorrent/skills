@@ -1213,16 +1213,21 @@ def _gone(pid, timeout=30):
     return _until_true(_done, timeout)
 
 
+@pytest.mark.parametrize("closes", [False, True])
 @pytest.mark.parametrize("mode", [(), ("--shared",)])
-def test_ttp_lock_stays_held_while_its_command_runs_after_ttp_lock_is_sigkilled(env, mode):
+def test_ttp_lock_stays_held_while_its_command_runs_after_ttp_lock_is_sigkilled(env, mode, closes):
     # A SIGKILL (or the OOM killer) of `ttp lock` cannot be caught. The lock lives on the open file the
-    # command is handed too, so it stays held, and reads as held by the live command, until it ends.
+    # command is handed too, and on a keeper's for a command that closes the fds it inherits (as ssh
+    # does), so it stays held, and reads as held by the live command, until the command ends.
     p = make(env)
     pidf, go = env["tmp"] / "cmd.pid", env["tmp"] / "go"
     script = (f"echo $$ > {shlex.quote(str(pidf))}.tmp; mv {shlex.quote(str(pidf))}.tmp {shlex.quote(str(pidf))}; "
               f"while [ ! -e {shlex.quote(str(go))} ]; do sleep 0.05; done")
+    cmd = ("sh", "-c", script)
+    if closes:
+        cmd = (sys.executable, "-c", "import os, sys; os.closerange(3, 65536); os.execvp(sys.argv[1], sys.argv[1:])", *cmd)
     run_env = _lock_env(env, p)
-    first = _lock(run_env, *mode, "board", cmd=("sh", "-c", script))
+    first = _lock(run_env, *mode, "board", cmd=cmd)
     pid = None
     try:
         assert _until_true(lambda: pidf.exists()), first.stderr.read()

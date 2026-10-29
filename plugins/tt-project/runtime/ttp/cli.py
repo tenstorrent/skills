@@ -5006,11 +5006,13 @@ def cmd_lock(a) -> None:
 
             for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
                 signal.signal(sig, _forward)
-            # The command gets the lock's open files too (hold_fds): a SIGKILL or OOM kill of this
+            # The command gets the lock's open files too (hold_fds), and a keeper holds them until it
+            # ends (keep_open: for a command that closes them, as ssh does): a SIGKILL or OOM kill of this
             # process, which no handler sees, leaves the lock held until the command (and anything it
             # left running with them) ends, and its label names the command (hand_to_command).
             proc = subprocess.Popen(cmd, env=child_env, pass_fds=lk.hold_fds(fs))
             started.append(proc)
+            keeper = lk.keep_open(fs, proc.pid)
             lk.hand_to_command(fs, proc.pid)
             while pending:
                 _forward(pending.pop(0), None)
@@ -5019,6 +5021,9 @@ def cmd_lock(a) -> None:
                 try:
                     return proc.wait()
                 finally:
+                    if keeper:
+                        keeper.kill()
+                        keeper.wait()
                     for f in fs:
                         f.close()
 

@@ -205,6 +205,44 @@ def hold_fds(held: list) -> list[int]:
     return [g.fileno() for x in held for g in (x.files if isinstance(x, SharedHold) else [x])]
 
 
+_KEEP_OPEN = (
+    "import os, select, signal, sys, time\n"
+    "for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):\n"
+    "    signal.signal(s, signal.SIG_IGN)\n"
+    "pid, pfd = int(sys.argv[1]), int(sys.argv[2])\n"
+    "if pfd >= 0:\n"
+    "    select.select([pfd], [], [])\n"
+    "else:\n"
+    "    while True:\n"
+    "        try:\n"
+    "            os.kill(pid, 0)\n"
+    "        except ProcessLookupError:\n"
+    "            break\n"
+    "        except OSError:\n"
+    "            pass\n"
+    "        time.sleep(0.5)\n")
+
+
+def keep_open(held: list, pid: int) -> subprocess.Popen | None:
+    """A small process that holds the open files of `held` (hold_fds) until the command `pid` ends, for a
+    command that closes the fds it inherits (ssh does): the lock then still outlives a killed `ttp lock`.
+    It ignores SIGINT, SIGTERM and SIGHUP and waits on a pidfd of the command (a 0.5 s poll where there
+    is none); the `ttp lock` that started it ends it once the command has ended. None if it cannot start."""
+    try:
+        pfd = os.pidfd_open(pid)
+    except (AttributeError, OSError):
+        pfd = -1
+    try:
+        return subprocess.Popen([sys.executable, "-I", "-S", "-c", _KEEP_OPEN, str(pid), str(pfd)],
+                                pass_fds=hold_fds(held) + ([pfd] if pfd >= 0 else []), stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+    finally:
+        if pfd >= 0:
+            os.close(pfd)
+
+
 def hand_to_command(held: list, pid: int) -> None:
     """Names the command `pid` a `ttp lock` runs (and hands hold_fds to) as the holder process of each
     hold in `held` (label_pid, via "command"), so a hold whose `ttp lock` died reads as held by its live
