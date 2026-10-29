@@ -61,7 +61,7 @@ def test_throughput_measures_waits_per_lane_from_task_run_and_push_records(env):
     rs, rt = _tp_lane(rep, "review_sweep"), _tp_lane(rep, "review_stall")
     assert (rs["count"], rs["p90_s"], rt["p90_s"]) == (1, 2400, 3000)
     assert _tp_lane(rep, "push_batch")["p90_s"] == 3000
-    assert not _tp_lane(rep, "checks_slots")["measured"]
+    assert _tp_lane(rep, "checks_slots")["count"] == 0 and "dependency" not in {ln["lane"] for ln in rep["lanes"]}
     assert rep["lanes"][0]["slow"], "slow lanes come first"
     # A task that started before the window is outside it; the text names lanes and limits.
     assert _tp_lane(throughput.measure(p.db, p.config(), since_s=3600, now=now, gates={}), "worker_slots")["count"] == 2
@@ -106,6 +106,130 @@ def test_throughput_apply_raises_only_at_limit_with_headroom_bounded_by_load_and
     assert "no throughput change" in throughput.undo(p, 999)
     # A second review lists the earlier changes.
     assert {e["id"] for e in throughput.review(p, p.config(), gates={}, now=now)["earlier_changes"]} >= {c["id"], c2["id"]}
+
+
+def test_throughput_worker_raise_moves_no_spend_limit(env, monkeypatch):
+    from ttp import budget as bud, throughput
+    p = make(env)
+    now = time.time()
+    _tp_busy_fixture(p, now)
+    prov = p.config()["core_provider"]
+    assert not p.config()["budget"].get("hourly_floor_usd"), "the floor is sized from the worker count"
+    # Four failed runs at once in the last hour: the waste cap is sized per worker, up to the slot count.
+    for i in range(4):
+        t = _tp_task(p, f"failing {i}", now - 1800)
+        p.db.x("INSERT INTO runs(task, role, provider, started, ended, status, cost_usd) VALUES(?,?,?,?,?,?,?)",
+               (t, "worker", prov, now - 1800, now - 600, "failed", 1.0))
+    before = bud.evaluate(p.db, p.config(), prov, [], now=now).numbers
+    monkeypatch.setattr(throughput, "cpu_free", lambda: (True, ""))
+    monkeypatch.setattr(throughput.os, "cpu_count", lambda: 64)
+    rep = throughput.review(p, p.config(), do_apply=True, gates={}, now=now)
+    (c,) = [c for c in rep["changes"] if c["key"] == "budget.max_parallel_workers"]
+    assert c["new"] > c["old"] == 2 and p.config()["budget"]["max_parallel_workers"] == c["new"]
+    after = bud.evaluate(p.db, p.config(), prov, [], now=now).numbers
+    assert (after["hourly_ceiling"], after["waste_limit"]) == (before["hourly_ceiling"], before["waste_limit"])
+    assert throughput.spend_workers(p.db, c["new"]) == 2
+    # A hand edit after the raise is the user's own count; an undo ends the pin; old records stay pinned.
+    assert throughput.spend_workers(p.db, 7) == 7
+    p.db.set_kv(throughput.KV, [{**r, "ts": now - 30 * 86400} for r in p.db.kv(throughput.KV)])
+    throughput.apply(p, p.config(), {"lanes": [], "thresholds_s": {"p1": 600, "other": 1800}}, now=now)
+    assert throughput.spend_workers(p.db, c["new"]) == 2
+    throughput.undo(p, c["id"])
+    assert throughput.spend_workers(p.db, 2) == 2 and throughput.spend_workers(p.db, c["new"]) == c["new"]
+
+
+def test_throughput_dependency_waits_are_their_own_lane_and_raise_no_workers(env, monkeypatch):
+    from ttp import throughput
+    p = make(env)
+    now = time.time()
+    p.set_config("budget.max_parallel_workers", 1)
+    _tp_run(p, _tp_task(p, "long", now - 3 * 3600), now - 3 * 3600, None)
+    # A code task held by a deferral and a priority 1 review queued behind it for 2 h.
+    code = _tp_task(p, "code", now - 2 * 3600, labels=["start_when:landed:#5", f"deferred_since:{now - 2 * 3600}"])
+    rv = _tp_task(p, "Review", now - 2 * 3600, prio=1, depends_on=[code])
+    p.db.x("UPDATE tasks SET kind='review' WHERE id=?", (rv,))
+    # A task whose dependency was done 1 h ago and that started a minute later waited a minute.
+    dep = _tp_task(p, "dep", now - 4 * 3600)
+    _tp_run(p, dep, now - 4 * 3600 + 5, now - 3 * 3600)
+    p.db.x("UPDATE tasks SET status='done', updated=? WHERE id=?", (now - 3600, dep))
+    later = _tp_task(p, "later", now - 4 * 3600, prio=1, depends_on=[dep])
+    _tp_run(p, later, now - 3600 + 60, now - 1800)
+    monkeypatch.setattr(throughput, "cpu_free", lambda: (True, ""))
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    d = _tp_lane(rep, "dependency")
+    assert (d["count"], d["waiting_now"], d["limit_key"]) == (1, 1, None) and d["p1_p90_s"] >= 2 * 3600 - 1
+    w = _tp_lane(rep, "worker_slots")
+    assert w["p1_count"] == 1 and w["p1_p90_s"] == 60 and w["waiting_now"] == 0 and not w["slow"]
+    changes, _ = throughput.plan(p.db, p.config(), rep)
+    assert not [c for c in changes if c["key"] == "budget.max_parallel_workers"]
+
+
+def test_throughput_measures_requeue_waits_by_reason_and_a_slow_checks_lane_gets_a_p1_followup(env, monkeypatch):
+    from ttp import slowcomplaint, throughput
+    p = make(env)
+    now = time.time()
+    checks = "waiting for ttp checks: waiting (pid 5, not running) for this project's other full checks to end"
+
+    def requeued(title, gap_end, status, reason, note=""):
+        t = _tp_task(p, title, now - 5 * 3600, prio=1)
+        p.db.x("INSERT INTO runs(task, role, started, ended, status, note) VALUES(?,?,?,?,?,?)",
+               (t, "worker", now - 5 * 3600, now - 4 * 3600, "waiting", note))
+        if gap_end:
+            _tp_run(p, t, gap_end, gap_end + 600)
+        p.db.x("UPDATE tasks SET status=?, blocked_reason=? WHERE id=?", (status, reason, t))
+        return t
+
+    requeued("ran again", now - 2 * 3600, "done", "", note=checks)
+    requeued("still queued", None, "queued", checks)
+    requeued("own job", None, "waiting", "own ttp checks --detach running")
+    requeued("retry", None, "waiting", "CI on the branch")
+    requeued("old done", None, "done", checks)
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    ck = _tp_lane(rep, "checks_slots")
+    assert (ck["count"], ck["waiting_now"], ck["p1_p90_s"]) == (2, 1, 4 * 3600) and ck["slow"]
+    assert _tp_lane(rep, "own_job")["count"] == 1 and _tp_lane(rep, "retry_wait")["count"] == 1
+    assert "worker_slots" not in {ln["lane"] for ln in rep["lanes"] if ln["count"] and ln["lane"] != "dependency"} \
+        or _tp_lane(rep, "worker_slots")["waiting_now"] == 0
+    _, kept = throughput.plan(p.db, p.config(), rep)
+    assert any(k["lane"] == "checks_slots" for k in kept)
+    (fid,) = [t for t in slowcomplaint._followups(p.db, {**rep, "kept": kept}, [1])
+              if "checks_slots" in p.db.one("SELECT title FROM tasks WHERE id=?", (t,))["title"]]
+    assert p.db.one("SELECT priority FROM tasks WHERE id=?", (fid,))["priority"] == 1
+
+
+def test_throughput_keeps_push_window_and_sweep_unless_they_held_the_waits(env):
+    from ttp import throughput
+    p = make(env)
+    now = time.time()
+    p.set_config("delivery.push_batch_s", 3600)
+    # A row that waited 50 min while another batch ran: the batch held it, not the window.
+    code = _tp_task(p, "code change", now - 4 * 3600)
+    _tp_run(p, code, now - 4 * 3600, now - 4 * 3600 + 600)
+    p.db.x("INSERT INTO push_batches(id, marker, target, started, ended) VALUES('b0','m','br',?,?)",
+           (now - 3 * 3600, now - 3600 - 60))
+    p.db.x("INSERT INTO push_batches(id, marker, target, started) VALUES('b1','m','br',?)", (now - 3600,))
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, batch, created, updated) VALUES(?,?,?,?,?,?,?)",
+           (code, "b", "h", "br", "b1", now - 3600 - 3000, now))
+    # A review queued at finish, 40 min after the work ended (not by the sweep).
+    rv = _tp_task(p, "Review", now - 4 * 3600 + 3000, labels=[f"auto_review:{code}"])
+    p.db.x("UPDATE tasks SET kind='review' WHERE id=?", (rv,))
+    _tp_run(p, rv, now - 4 * 3600 + 3100, now - 4 * 3600 + 3600, role="reviewer")
+    p.set_config("review.sweep_after_s", 1200)
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    assert _tp_lane(rep, "push_batch")["slow"] and _tp_lane(rep, "review_sweep")["slow"]
+    levers = ("delivery.push_batch_s", "review.sweep_after_s")
+    changes, kept = throughput.plan(p.db, p.config(), rep)
+    assert not [c for c in changes if c["key"] in levers], changes
+    why = {k["lane"]: k["why"] for k in kept}
+    assert "1 of 1 row(s) waited behind a running batch" in why["push_batch"]
+    assert "1 of 1 review(s) were queued at finish, not by the sweep" in why["review_sweep"]
+    # The window alone held the row, and the sweep queued the review: both levers change.
+    p.db.x("DELETE FROM push_batches WHERE id='b0'")
+    p.db.x("INSERT INTO events(ts, source, kind, severity, text, status, task) VALUES(?,?,?,?,?,?,?)",
+           (now - 4 * 3600 + 3000, "daemon", "review_swept", "normal", f"#{code} x; review #{rv} queued by the "
+            "daemon.", "handled", code))
+    changes, _ = throughput.plan(p.db, p.config(), throughput.measure(p.db, p.config(), now=now, gates={}))
+    assert {(c["key"], c["new"]) for c in changes if c["key"] in levers} == {("delivery.push_batch_s", 1800), ("review.sweep_after_s", 600)}
 
 
 def test_throughput_idle_slots_are_not_raised_and_resource_lanes_are_only_reported(env, monkeypatch):

@@ -252,7 +252,9 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     thrash = sum(float(r["cost_usd"] or 0) for r in coord_h) - asked
     norm = db.spent_since(now - WEEK, provider) / (7 * 24)
     per_task = max((b.get("task_default_usd") or {"deep": 25.0}).values())
-    floor = float(b.get("hourly_floor_usd") or max(int(b.get("max_parallel_workers", 2)), 1) * per_task)
+    # Spend limits are sized from the worker count before any `ttp throughput` raise: it adds slots, never spend.
+    from .throughput import spend_workers
+    floor = float(b.get("hourly_floor_usd") or max(spend_workers(db, int(b.get("max_parallel_workers", 2))), 1) * per_task)
     ceiling = max(float(b.get("hourly_alarm_x", 4.0)) * norm, floor)
     # The waste limit is per worker: parallel workers each losing a run (a shared device kept them
     # all waiting) are not a loop. Workers are the most tasks whose wasted runs went at once, so one
@@ -260,7 +262,7 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     spans = [r for r in db.q(f"SELECT task, started, ended, status, note FROM runs WHERE provider=? "
                              f"AND role!='coordinator' AND ended>=? AND status IN ({','.join('?' * len(WASTED))})",
                              (provider, hour_ago, *WASTED)) if wasted(r)]
-    workers = min(max(_peak_tasks(spans, now), 1), max(int(b.get("max_parallel_workers", 6)), 1))
+    workers = min(max(_peak_tasks(spans, now), 1), max(spend_workers(db, int(b.get("max_parallel_workers", 6))), 1))
     waste_cap = float(b.get("hourly_waste_usd", 8.0)) * workers
     thrash_cap = float(b.get("hourly_coordinator_usd", 4.0))
     # Each signal's share of its limit: red past 1, and a red alert's episode ends only well below it
