@@ -1909,6 +1909,40 @@ def test_two_lanes_let_two_runs_proceed_and_one_lane_keeps_priority_order(env, t
     assert order == [1, 5], "one lane: the more urgent waiter goes first"
 
 
+def test_a_lane_freed_after_a_waiters_queue_read_goes_to_the_more_urgent_waiter(env, tmp_path, monkeypatch):
+    # The less urgent waiter stalls right after reading the queue until the holder frees the lane:
+    # a free-lane count taken after that stale read must not let it jump the more urgent waiter.
+    from ttp import checklane, testslots
+    _lane_env(monkeypatch)
+    hold = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1)
+    stalled, released, order = threading.Event(), threading.Event(), []
+    orig = testslots.suite_order
+
+    def slow(*a, **k):
+        q = orig(*a, **k)
+        if threading.current_thread().name == "late" and not stalled.is_set():
+            stalled.set()
+            released.wait(10)
+        return q
+    monkeypatch.setattr(testslots, "suite_order", slow)
+
+    def wait(prio):
+        g = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, priority=prio, wait_s=20)
+        order.append(prio)
+        time.sleep(0.2)
+        g.close()
+    late = threading.Thread(target=wait, args=(5,), name="late")
+    late.start()
+    assert stalled.wait(10)
+    urgent = threading.Thread(target=wait, args=(1,))
+    urgent.start()
+    assert _wait_for(lambda: len(checklane._live_tickets(testslots.suite_base("pa", _LANE_REPO))) == 2)
+    hold.close()
+    released.set()
+    late.join(30), urgent.join(30)
+    assert order == [1, 5], "a lane freed after a stale queue read went to the less urgent waiter"
+
+
 def test_dead_or_silent_lane_holders_are_reclaimed_and_logged(env, tmp_path, monkeypatch):
     from ttp import checklane, locks, testslots
     _lane_env(monkeypatch)

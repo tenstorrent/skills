@@ -467,9 +467,11 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
             held = [x for x in lanes + extra_lanes if locks._slot_labels([x])]
             for x in held:
                 _reclaim(x, tell, state)
-            q = suite_order(project_name, repo=repo)
+            # Free lanes before the queue: a lane freed after this count waits for the next turn, so the
+            # queue that decides holds every waiter that arrived before it was freed.
             recs = locks.holder_records(lanes + extra_lanes)
             free = slots - len([x for x in lanes if locks._slot_labels([x])])
+            q = suite_order(project_name, repo=repo)
             f = None
             try:
                 if free > 0 and (ticket not in q or q.index(ticket) < free):
