@@ -3512,40 +3512,104 @@ def test_a_drained_checks_queue_ends_its_incident_and_a_new_queue_wakes_afresh(e
     assert len(wakes) == 2 and wakes[1]["task"] == 60 and "incident started (2 waiting" in wakes[1]["text"], wakes
 
 
-def test_a_checks_queue_incident_rewakes_for_a_likely_hung_holder_and_for_an_ownerless_one(env, monkeypatch):
-    from ttp import checklane, checkwall
+_RUN_HOLDER = """
+import os, sys, time
+from pathlib import Path
+from ttp import checklane, cli
+from ttp.project import Project
+checklane.HEARTBEAT_S = 3600.0
+slot = cli._checks_slot(Project(sys.argv[1]), Path(os.environ["TTP_RUN_DIR"]), sys.stdout, sys.argv[3], True,
+                        cmds=["true"], top=sys.argv[1])
+Path(sys.argv[2]).write_text("held" if slot else "none")
+while True:
+    time.sleep(1)
+"""
+
+
+def _run_holder(p, tmp_path, run_env: dict):
+    """A `ttp checks` run holding one of the project's checks lanes through cli._checks_slot under `run_env`
+    (the variables a worker's run or Daemon._start_checks sets): (its process, its lane's holder record)."""
+    from ttp import locks, testslots, worktree
+    got = tmp_path / f"held-{time.time_ns()}"
+    proc = subprocess.Popen([sys.executable, "-c", _RUN_HOLDER, str(p.base), str(got),
+                             worktree._git(p.root, "rev-parse", "HEAD")],
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_PROJECT": str(p.base), **run_env},
+                            cwd=p.root, start_new_session=True, stdout=subprocess.DEVNULL)
+    assert _wait_for(got.exists, 60) and got.read_text() == "held", "the run never took its lane"
+    recs = [r for b in testslots.suite_bases(p.name) for x in testslots._lanes_of(b)
+            for r in locks.holder_records([x]) if r.get("pid") == proc.pid]
+    assert len(recs) == 1 and recs[0].get("task") == run_env["TTP_TASK"], recs
+    return proc, recs[0]
+
+
+def test_a_checks_queue_incident_rewakes_for_a_likely_hung_holder_and_for_an_ownerless_one(
+        env, tmp_path, monkeypatch):
+    from ttp import checklane, checkwall, daemon, worktree
     from ttp.daemon import Daemon
+    assert checklane.PRECHECK_LABEL == daemon.PRECHECK_LABEL
     p = make(env)
+    _lane_env(monkeypatch)
+    p.set_config("checks.slots", 3)
     for _ in range(checkwall.MIN_RUNS):
         checkwall.record_run(p.state, 600.0, True)
-    now = time.time()
-    holder = {"task": "12", "pid": 4242, "run_since": now - 600, "command": "pytest -q"}
-    evs = _queue_events(3, holders=[holder])
-    monkeypatch.setattr(checklane, "wait_events", lambda *a, **k: evs)
-    d = Daemon(p.base)
-    d.check_checks_wait(every_s=0)
-    assert len(_queue_wakes(p)) == 1, "a holder at the median: no hang"
-    holder["run_since"] = now - 4 * 600   # over checks.wait_hang_factor (3) x the 10 min median
-    for _ in range(2):
+    work = p.db.add_task("w", "s", kind="code")
+    p.db.x("UPDATE tasks SET status='running' WHERE id=?", (work,))
+    run = p.state / "runs" / "77"
+    run.mkdir(parents=True)
+    procs = []
+    try:
+        a, rec = _run_holder(p, tmp_path, {"TTP_RUN_DIR": str(run), "TTP_RUN_ID": "77", **daemon.task_env(work)})
+        procs.append(a)
+        evs = _queue_events(3, holders=[rec])
+        monkeypatch.setattr(checklane, "wait_events", lambda *a, **k: evs)
+        d = Daemon(p.base)
         d.check_checks_wait(every_s=0)
-    wakes = _queue_wakes(p)
-    assert len(wakes) == 2 and "likely hang" in wakes[1]["text"], wakes
-    assert checklane.wait_wake(evs, {"start": 1.0}, {"checks": {"wait_hang_factor": 0}}, now, 600.0)[0] == [], \
-        "checks.wait_hang_factor 0: never"
-    kept = {"start": 1.0, "hang": [], "ownerless": []}
-    assert checklane.wait_wake(evs, kept, {}, now, 600.0)[0] == ["hang"]
-    assert kept == {"start": 1.0, "hang": [], "ownerless": []}, "the stored incident is never changed in place"
-    # the holder set changes to one whose task has ended: nobody owns its fix
-    t = p.db.add_task("finished work", kind="code") if hasattr(p.db, "add_task") else None
-    tid = t if isinstance(t, int) else 12
-    p.db.x("INSERT OR IGNORE INTO tasks(id,title,status,created,updated) VALUES(?,?,?,?,?)",
-           (tid, "finished work", "done", now, now)) if t is None else None
-    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
-    evs[:] = _queue_events(3, holders=[{"task": str(tid), "pid": 5151, "run_since": now - 60, "command": "pytest"}])
-    for _ in range(2):
+        assert len(_queue_wakes(p)) == 1, "a holder at the median: no hang"
+        d.cfg.setdefault("checks", {})["wait_hang_factor"] = 1e-6   # its run is now far over the median
+        for _ in range(2):
+            d.check_checks_wait(every_s=0)
+        wakes = _queue_wakes(p)
+        assert len(wakes) == 2 and "likely hang" in wakes[1]["text"], wakes
+        now = time.time()
+        assert checklane.wait_wake(evs, {"start": 1.0}, {"checks": {"wait_hang_factor": 0}}, now, 600.0)[0] == [], \
+            "checks.wait_hang_factor 0: never"
+        kept = {"start": 1.0, "hang": [], "ownerless": []}
+        assert checklane.wait_wake(evs, kept, {"checks": {"wait_hang_factor": 1e-6}}, now, 600.0)[0] == ["hang"]
+        assert kept == {"start": 1.0, "hang": [], "ownerless": []}, "the stored incident is never changed in place"
+        d.cfg["checks"]["wait_hang_factor"] = 0
+        # the daemon's review precheck of a just-finished code task joins the holders: its review reads it
+        code = p.db.add_task("c", "s", kind="code")
+        head = worktree._git(p.root, "rev-parse", "HEAD")
+        out = p.state / daemon.PRECHECKS_DIR / f"t{code}-{head[:12]}"   # Daemon._precheck's run folder
+        out.mkdir(parents=True)
+        rev = p.db.add_task("review", "r", kind="review", labels=[daemon.PRECHECK_LABEL + out.name])
+        p.db.x("UPDATE tasks SET status='done' WHERE id=?", (code,))
+        b, pre = _run_holder(p, tmp_path, {"TTP_RUN_DIR": str(out), "TTP_RUN_ID": f"precheck-t{code}",
+                                           **daemon.task_env(code)})   # as Daemon._precheck starts it
+        procs.append(b)
+        evs[:] = _queue_events(3, holders=[rec, pre])
+        for status in ("queued", "running"):
+            p.db.x("UPDATE tasks SET status=? WHERE id=?", (status, rev))
+            d.check_checks_wait(every_s=0)
+        assert len(_queue_wakes(p)) == 2, "a precheck its open review reads is not a finished task's holder"
+        # bypasses: a review of another head, or of another task's precheck, keeps no holder owned
+        assert not checklane.open_precheck(p.db, str(code), "run t%d-ba9876543210" % code)
+        assert not checklane.open_precheck(p.db, str(work), pre["holder"])
+        assert not checklane.open_precheck(p.db, str(code), rec["holder"])
+        # its review closed: nobody owns its fix, one wake
+        p.db.x("UPDATE tasks SET status='done' WHERE id=?", (rev,))
+        for _ in range(2):
+            d.check_checks_wait(every_s=0)
+        wakes = _queue_wakes(p)
+        assert len(wakes) == 3 and "nobody owns its fix" in wakes[2]["text"], wakes
+        # a worker run's own holder whose task ended: ownerless at once
+        p.db.x("UPDATE tasks SET status='failed' WHERE id=?", (work,))
         d.check_checks_wait(every_s=0)
-    wakes = _queue_wakes(p)
-    assert len(wakes) == 3 and "nobody owns its fix" in wakes[2]["text"], wakes
+        assert len(_queue_wakes(p)) == 4
+    finally:
+        for x in procs:
+            os.killpg(x.pid, 9)
+            x.wait(10)
 
 
 def test_checks_slot_wait_events_count_against_an_observation_mute_on_daemon_checks_slot_wait(env, monkeypatch):

@@ -5908,9 +5908,11 @@ class Daemon:
         recent = checkwall.recent(self.p.state, now)
         median = statistics.median(recent) if len(recent) >= checkwall.MIN_RUNS else None
 
-        def ended(task) -> bool:
-            row = db.one("SELECT status FROM tasks WHERE id=?", (int(task),)) if str(task).isdigit() else None
-            return bool(row) and row["status"] in ("done", "failed", "cancelled")
+        def ended(h: dict) -> bool:   # its task ended; a review precheck: once no review reading it is open
+            task = str(h.get("task") or "")
+            row = db.one("SELECT status FROM tasks WHERE id=?", (int(task),)) if task.isdigit() else None
+            return bool(row) and row["status"] in ("done", "failed", "cancelled") \
+                and not checklane.open_precheck(db, task, h.get("holder"))
 
         was = db.kv(checklane.INCIDENT_KEY)
         why, inc = checklane.wait_wake(events, was, self.cfg, now, median, ended)

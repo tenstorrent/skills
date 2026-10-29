@@ -399,15 +399,39 @@ def _holder_key(rec: dict) -> str:
     return f"{rec.get('task') or rec.get('holder') or 'run'}:{rec.get('pid')}:{rec.get('run_since') or rec.get('since')}"
 
 
+PRECHECK_LABEL = "precheck:"   # daemon.PRECHECK_LABEL: the review task's label naming its precheck folder
+
+
+def open_precheck(db, task: str, holder) -> bool:
+    """Whether lane holder label `holder` of task `task` is the daemon's review precheck of that task
+    (Daemon._precheck: `ttp checks` run as the code task, its run folder prechecks/t<task>-<head>) and a
+    review that reads it (labelled precheck:t<task>-<head>) is still open. Such a check starts as its
+    task ends, so it is not a finished task's holder until that review ends too. Its lane label names its
+    run folder ("run t<task>-<head>", cli._checks_slot)."""
+    m = re.search(r"\brun (?:precheck-)?(t(\d+)-[0-9a-f]{7,40})\b", str(holder or ""))
+    if db is None or not m or m.group(2) != str(task):
+        return False
+    want = PRECHECK_LABEL + m.group(1)
+    rows = db.q("SELECT labels FROM tasks WHERE kind='review' AND status NOT IN ('done','failed','cancelled') "
+                "AND labels LIKE ?", (f"%{want}%",))
+    for r in rows:
+        try:
+            if want in json.loads(r["labels"] or "[]"):
+                return True
+        except (ValueError, TypeError):
+            continue
+    return False
+
+
 def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: float,
-              median_s: float | None = None, ended=lambda task: False) -> tuple[list[str], dict | None]:
+              median_s: float | None = None, ended=lambda holder: False) -> tuple[list[str], dict | None]:
     """Whether this tick's `checks_slot_wait` events (wait_events) wake the coordinator: (the reasons, none
     when they do not, and the queue incident to keep). An incident opens with the first waiter past
     checks.wait_event_s (reason "new") and closes once no waiter is past it (None). Within it, a wake again
     only for: "escalate" (its longest wait past checks.wait_escalate_s, then once per as long again), "hang"
     (a holder running checks.wait_hang_factor times `median_s`, the recent median checks run, once per
-    holder) and "ownerless" (a holder whose task has ended (`ended(task)`) or whose hold is stale, once
-    per holder). Every other waiter shows in the digest and ttp status only."""
+    holder) and "ownerless" (a holder whose task has ended (`ended(holder record)`; a review precheck
+    only once no review reading it is open, open_precheck) or whose hold is stale, once per holder). Every other waiter shows in the digest and ttp status only."""
     if not events:
         return [], None
     inc = json.loads(json.dumps(incident)) if isinstance(incident, dict) else {}   # never the caller's lists
@@ -424,7 +448,7 @@ def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: 
     factor = wait_hang_factor(cfg)
     for name, test in (("hang", lambda h: factor > 0 and median_s and median_s > 0 and now - float(
                             h.get("run_since") or h.get("since") or now) > factor * median_s),
-                       ("ownerless", lambda h: h.get("stale") or (h.get("task") and ended(h.get("task"))))):
+                       ("ownerless", lambda h: h.get("stale") or (h.get("task") and ended(h)))):
         seen = list(inc.get(name) or [])
         for k, h in holders.items():
             if k not in seen and test(h):
