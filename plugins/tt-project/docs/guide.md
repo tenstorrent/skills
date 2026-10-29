@@ -848,9 +848,21 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   a project may only lower them) and passes its grant as PYTEST_XDIST_AUTO_NUM_WORKERS and TTP_TEST_SLOTS. A
   project holds at most `checks.test_project_max` slots over all its runs (default twice a run's share), waiters
   are served first-come, push checks take a reserved test slot of their branch when the pool is full, and a
-  project runs one full `ttp checks` at a time (a second waits; other projects never do). That slot goes to the
-  most urgent waiting task priority first, then arrival; a running holder is never pre-empted, and a waiter gains
-  one priority step per 15 min waited, so none starves. A run's check commands stop at a wall-time cap: on by
+  project runs at most `checks.slots` full `ttp checks` at a time per git repository (its lanes; worktrees of one
+  repository share them; other repositories and projects never wait). Unset, `checks.slots` follows the machine:
+  one lane per 8 cores and per 8 GiB of available memory, the smaller, 1 to 4. A lane goes to the most urgent
+  waiting task priority first, then arrival; a running holder is never pre-empted, and a waiter gains one
+  priority step per 15 min waited, so none starves. Light checks never wait: a run whose every command is a
+  syntax, lint, format or validation check (`python -m py_compile`, `ruff check`, `black --check`,
+  `git diff --check`, `shellcheck`, `bash -n`, ...; the words of `checks.light_cmds` add more; `ttp checks
+  --light -- <cmds>` declares its own) runs at once outside every slot, and still fails when it fails. A lane
+  whose holder's process is gone or whose heartbeat stopped is reclaimed and logged. A waiter that has waited
+  `checks.max_wait_s` (default 300, 0 turns it off) and is cheaper than every holder (by recorded run time,
+  else by kind) takes an extra lane beside them. A waiter says who holds the lanes and its place in the queue
+  each minute; `ttp status` and the coordinator's digest list waits over 10 min, and the daemon raises one
+  `checks_slot_wait` event per wait past `checks.wait_event_s` (default 900, 0 turns it off).
+  `ttp checks status` (also `--slot-status`, `--json`) prints each repository's lane holders (pid, task, run,
+  age, alive or dead) and its waiters in queue order, the next one marked; it is read only and never queues. A run's check commands stop at a wall-time cap: on by
   default, 3x the longest of the project's last 20 completed runs within 1-6 h (3 h before 3 runs are known);
   `checks.wall_cap_s` sets it, 0 turns it off. A run past it has its process group ended, frees the slot and is
   recorded as a timeout, never a pass; `ttp status` shows the holder's time against its cap and the waiting
