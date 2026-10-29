@@ -967,7 +967,10 @@ queues behind routine work; nothing running is interrupted:
   0 turns it off); once `checks.done_holder_grace_s` past it (default 1.5x the check's usual run time,
   else its wall-time cap, else 1 h; never under the flag time) the daemon stops that check, only when it
   is the task's own detached `ttp checks` run, so the lane goes to the next waiter; any other holder is
-  only reported. A run's check commands stop at a wall-time cap: on by
+  only reported. The checks the daemon starts for a code task's review as that task finishes are not a
+  finished task's lane while a review that reads them is still open; once it ends, a precheck still
+  holding the lane is reported but never stopped (it is no worker run; the wall-time cap below ends it).
+  A run's check commands stop at a wall-time cap: on by
   default, 3x the longest of the project's last 20 completed runs within 1-6 h (3 h before 3 runs are known);
   `checks.wall_cap_s` sets it, 0 turns it off. A run past it has its process group ended, frees the slot and is
   recorded as a timeout, never a pass; `ttp status` shows the holder's time against its cap and the waiting

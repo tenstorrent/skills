@@ -361,7 +361,7 @@ def finished_holders(p, cfg: dict | None, now: float | None = None) -> list[dict
                 if not task.isdigit() or rec.get("alive") is False:
                     continue
                 row = p.db.one("SELECT status, updated FROM tasks WHERE id=?", (int(task),))
-                if not row or row["status"] not in FINISHED:
+                if not row or row["status"] not in FINISHED or open_precheck(p.db, task, rec.get("holder")):
                     continue
                 since = float(rec.get("since") or now)
                 ended = now - max(float(row["updated"] or 0), since)
@@ -372,6 +372,29 @@ def finished_holders(p, cfg: dict | None, now: float | None = None) -> list[dict
                             "status": row["status"], "since": since, "ended_s": ended, "held_s": now - since,
                             "grace_s": grace, "stop": ended >= grace, "command": str(rec.get("command") or "")})
     return out
+
+
+PRECHECK_LABEL = "precheck:"   # daemon.PRECHECK_LABEL: the review task's label naming its precheck folder
+
+
+def open_precheck(db, task: str, holder) -> bool:
+    """Whether lane holder label `holder` of task `task` is the daemon's review precheck of that task
+    (Daemon._precheck: `ttp checks` run as the code task, its run folder prechecks/t<task>-<head>) and a
+    review that reads it (labelled precheck:t<task>-<head>) is still open. Such a check starts as its
+    task ends, so it is not a finished task's lane until that review ends too."""
+    m = re.search(r"\brun (t(\d+)-[0-9a-f]{7,40})\b", str(holder or ""))
+    if db is None or not m or m.group(2) != str(task):
+        return False
+    want = PRECHECK_LABEL + m.group(1)
+    rows = db.q("SELECT labels FROM tasks WHERE kind='review' AND status NOT IN (?,?,?,?) AND labels LIKE ?",
+                (*FINISHED, f"%{want}%"))
+    for r in rows:
+        try:
+            if want in json.loads(r["labels"] or "[]"):
+                return True
+        except (ValueError, TypeError):
+            continue
+    return False
 
 
 def stop_finished(p, h: dict) -> dict | None:
@@ -636,7 +659,10 @@ def _task_state(db, rec: dict) -> dict:
     if db is None or not task.isdigit():
         return {}
     row = db.one("SELECT status FROM tasks WHERE id=?", (int(task),))
-    return {"task_status": row["status"], "finished": row["status"] in FINISHED} if row else {}
+    if not row:
+        return {}
+    return {"task_status": row["status"],
+            "finished": row["status"] in FINISHED and not open_precheck(db, task, rec.get("holder"))}
 
 
 def _who(x: dict) -> str:
