@@ -3002,6 +3002,8 @@ def cmd_checks(a) -> None:
             print(f"ttp checks: {said}", flush=True)
             os.environ[checkcap.ARRIVED_ENV] = str(arrived)
             os.environ[checkspill.OFF_ENV] = "1"
+            if join_rec:   # the run here registers again; its followers queue again and join that one (checkjoin)
+                checkjoin.forget(p.state)
             return cmd_checks(a)
         # A check host ssh could not reach (or that could not take the tree) is the environment, as a
         # missing runner is: wait for it, counting nothing against the change (envfault).
@@ -3473,7 +3475,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     when none can take the run: a slot whose `spill` claim names the host the checks then run on.
     `yielder()`, asked while it waits, raises checkjoin.Yield when the task's same checks run or wait
     ahead, or a newer head's do: the wait ends holding nothing."""
-    from . import checkcap, checklane, checkspill, locks as lk
+    from . import checkcap, checkjoin, checklane, checkspill, locks as lk
     foreground = not detached and not os.environ.get("TTP_DETACHED")
     key = f"checks:{os.getpid()}:{time.time()}"
 
@@ -3527,6 +3529,8 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             slot = _checks_slot_take(p, run_dir, out, head, tell, waiting, limit, arrived, same, done, prio, owns,
                                      cfg, repo, cmds, what, top, lock, restart=detached, yielder=yielder)
         except checkcap.Upgraded as e:
+            if p:   # its checkjoin record goes: the re-executed run registers again at the same arrival
+                checkjoin.forget(p.state)
             _checks_reexec(str(e), arrived, prio, spill, tell, out, getattr(e, "lanes", None))
             continue   # it could not re-execute: wait again with the code it runs
         if slot is not None or not spill_to:

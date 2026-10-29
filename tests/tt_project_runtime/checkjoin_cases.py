@@ -48,6 +48,26 @@ def test_checkjoin_target_joins_the_same_checks_supersedes_an_older_head_and_not
     assert cj.target(me, [me, {**newer, "group": "g2"}]) is None
 
 
+def test_checkjoin_forget_drops_a_waiting_runs_own_record_before_it_re_executes(tmp_path):
+    # A waiting detached run re-executes for an upgraded runtime as the same pid (_checks_reexec): its old
+    # record would look alive, and the re-executed run, registered again at the same arrival, would join it
+    # and wait for ever. forget() removes only this process's records that have no outcome.
+    import os
+    from ttp import checkjoin as cj
+    kw = dict(task="7", head="a" * 40, commit_ts=100.0, key="k", group="g", run="r", arrived=10.0)
+    old = cj.register(tmp_path, now=11.0, **kw)
+    again = cj.register(tmp_path, now=12.0, **kw)
+    me = cj.read(again)
+    assert cj.target(me, cj.records(tmp_path))[0]["id"] == cj.read(old)["id"]   # the hang forget() prevents
+    other = cj.register(tmp_path, pid=os.getppid(), now=11.0, **kw)
+    ended = cj.register(tmp_path, now=11.0, **{**kw, "key": "k2"})
+    cj.finish(ended, passed=True, head="a" * 40, rc=0)
+    assert cj.forget(tmp_path) == 2   # both of this process's: another pid's and an ended one stay
+    left = {r["id"] for r in cj.records(tmp_path)}
+    assert left == {cj.read(other)["id"], cj.read(ended)["id"]}
+    assert not old.exists() and not again.exists()
+
+
 def test_checkjoin_resolve_follows_the_chain_to_the_run_that_ran():
     from ttp import checkjoin as cj
     lead = _join_rec("lead", phase="running")

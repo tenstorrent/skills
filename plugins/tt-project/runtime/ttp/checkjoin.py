@@ -135,6 +135,23 @@ def records(state: Path, now: float | None = None, prune: bool = True) -> list[d
     return out
 
 
+def forget(state: Path, pid: int | None = None) -> int:
+    """Remove the records of the live process `pid` (default this one) that have no outcome, before it
+    re-executes as the same pid (cli._checks_reexec): left behind, its old record would look alive and
+    the re-executed run, registered again at the same arrival, would join it and wait for ever. Its
+    followers then find their lead gone and queue again (behind it). Returns how many it removed."""
+    pid = os.getpid() if pid is None else pid
+    n = 0
+    for rec in records(state, prune=False):
+        if rec.get("pid") == pid and rec.get("alive") and not rec.get("outcome") and rec.get("id"):
+            try:
+                (folder(state) / f"{rec['id']}.json").unlink(missing_ok=True)
+                n += 1
+            except OSError:
+                pass
+    return n
+
+
 def _order(r: dict) -> tuple:
     return (float(r.get("arrived") or 0), float(r.get("ts") or 0), str(r.get("id") or ""))
 
