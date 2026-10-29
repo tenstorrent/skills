@@ -43,6 +43,7 @@ from . import audit
 from . import redact
 from . import replica
 from . import schedlog
+from . import throughmute
 from . import replymsg
 from . import msgparts
 from . import awake
@@ -5380,6 +5381,14 @@ class Daemon:
                              + "\n".join(f"- {line}" for line in recover))
             except Exception as e:   # nor must the incident report
                 log(self.p, f"ttr lines failed: {type(e).__name__}: {e}")
+        if payload.get("audit_report", s["name"] == "daily-review"):
+            try:
+                muted = throughmute.review_lines(db, where=self.p)
+                if muted:
+                    spec += ("\n\nActive observation mutes (source, match, matched count, first seen, owner; fix "
+                             "each PROBLEM today):\n" + "\n".join(f"- {line}" for line in muted))
+            except Exception as e:   # nor must the mute list
+                log(self.p, f"mute review lines failed: {type(e).__name__}: {e}")
         if (self.cfg.get("upstream") or {}).get("ingest") and payload.get("audit_report", s["name"] == "daily-review"):
             try:
                 line = upstream.orphans_line()

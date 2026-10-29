@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, cells, chaincap, chatset, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, relay, responsibilities, restriction_audit, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, cells, chaincap, chatset, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, relay, responsibilities, restriction_audit, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, throughmute, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -993,7 +993,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
             + "; ".join(f"{m['source']} {m['match']!r}: {int(m['count'])} muted, "
                         + (f"persisting {', '.join(scr.mute_ages(m, now))}, " if scr.mute_ages(m, now) else "")
                         + f"ends in {max(0.0, (float(m['until']) - now) / 3600):.1f} h" + scr.mute_probe(m)
-                        for m in muted))
+                        + throughmute.rate_text(m, now) for m in muted))
     # Open asks of any age: one still waits on the user however long ago it was sent.
     lines = []
     blockers = db.q("SELECT * FROM messages WHERE kind='ask' AND handled=0 ORDER BY id DESC LIMIT 10")
@@ -2647,12 +2647,16 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if "machine-wide" in line:   # a no-op under a fleet hold: never told to the user as a new pause
                     notes.append(f"resource_pause {name}: {line}")
             elif t == "observation_mute":
-                m = scr.mute(db, a.get("source"), a.get("match"), a.get("hours"), a.get("below"),
-                             a.get("why") or a.get("reason") or a.get("text") or "",
+                why = a.get("why") or a.get("reason") or a.get("text") or ""
+                m = scr.mute(db, a.get("source"), a.get("match"), a.get("hours"), a.get("below"), why,
                              escalate_after_h=a.get("escalate_after_h"), end_when=a.get("end_when"),
-                             hold_cap_h=scr.hold_cap(cfg))
+                             hold_cap_h=scr.hold_cap(cfg),
+                             throughput=throughmute.vet(db, a.get("source"), a.get("match"), why,
+                                                        a.get("end_when"), cfg))
                 if scr.hold_cap_note(m, a.get("escalate_after_h")):
                     notes.append(scr.hold_cap_note(m, a.get("escalate_after_h")))
+                if throughmute.cap_note(m, a.get("hours")):
+                    notes.append(throughmute.cap_note(m, a.get("hours")))
             elif t == "sweep":
                 sweep.record(db, a, parse_start_after(a.get("start_after") or "now", tz=timefmt.home(p)), where=p)
             elif t in ("noop", None):

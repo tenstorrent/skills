@@ -476,7 +476,8 @@ EXTRA_KEYS = {
     # machine's outage becomes a tracked task and when that task escalates (outagetask.py).
     "heal": {"outage_owner_budget_min", "outage_task_due_min", "outage_escalate_min"},
     # hold_mute_escalate_h: the longest a mute covering a device hold stays silent (screen.hold_cap; 1).
-    "screen": {"hold_mute_escalate_h"},
+    # throughput_mute_max_h: the longest a throughput-class mute lasts before renewal (throughmute.max_h; 12).
+    "screen": {"hold_mute_escalate_h", "throughput_mute_max_h"},
     # standby: where state snapshots go (off: unset); fleet: the identity projects driving one fleet share
     # (also the shared lease identity). The project lease (lease.py), off while lease_remote is unset:
     # lease_remote, a git remote (URL or a code-repo remote name) for refs/ttp/lease/<identity>, never the

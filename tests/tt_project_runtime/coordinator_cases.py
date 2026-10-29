@@ -504,6 +504,117 @@ def test_observation_mute_rejects_bad_input(env):
 
 
 
+def test_a_throughput_class_mute_needs_an_owner_and_is_bounded(env):
+    """Efficiency and progress alerts sat muted for days instead of driving fixes: a mute of work not
+    moving (by its source, or text naming a limit, queue or wait) needs an owner, lasts at most 12 h
+    and is renewed only with fresh evidence. Any other mute keeps the general rules."""
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import screen as scr
+    from ttp import throughmute as tm
+    live, done = p.db.add_task("fix the slow lane"), p.db.add_task("old fix")
+    p.db.update_task(done, status="done")
+    base = {"type": "observation_mute", "hours": 48}
+    no_owner = [{**base, "source": "daemon:progress", "match": "no progress since", "why": "known"},
+                {**base, "source": "daemon:wait_stale", "match": "has waited", "why": "see #999"},
+                {**base, "source": "daemon:job_underuse", "match": "build", "why": f"owned by #{done}"},
+                {**base, "source": "watcher:efficiency-watch", "match": "idle slots", "why": "not only the user can clear it"},
+                {**base, "source": "watcher:ci", "match": "runner queue full", "why": "noise"},
+                {**base, "source": "watcher:lanes", "match": "lane_wait", "why": "the user knows"}]
+    bad = coord.apply(p, no_owner)
+    assert len(bad) == len(no_owner) and all("throughput-class" in b and "owner" in b for b in bad), bad
+    assert "#999 is not an open task" in bad[1] and f"#{done} is not an open task" in bad[2], bad
+    assert scr.mutes(p.db) == []
+    # A watcher's own words are classified too: a match with no cause word that covers a queue observation.
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+           (time.time(), "watcher:ci", "observation", "normal", "builds pile up: queue at 40", "queued"))
+    assert "throughput-class" in coord.apply(p, [{**base, "source": "watcher:ci", "match": "builds pile up"}])[0]
+
+    owned = [{**base, "source": "daemon:progress", "match": "no progress since", "why": f"fix is #{live}"},
+             {**base, "source": "daemon:wait_stale", "match": "has waited", "end_when": "test -e /nonexistent/x"},
+             {**base, "source": "watcher:ci", "match": "runner queue full",
+              "why": "only an outside party can clear it: the hosted runners are rate-limited"}]
+    assert coord.apply(p, owned) == []
+    notes = [n for n in p.db.kv(coord.NOTES_KEY, []) if "throughput-class, so it lasts 12 h, not 48" in n]
+    assert len(notes) == 3, notes
+    got = {m["source"]: m for m in scr.mutes(p.db)}
+    assert got["daemon:progress"]["throughput"]["owner"] == {"task": live}
+    assert got["daemon:wait_stale"]["throughput"]["owner"] == {"probe": "test -e /nonexistent/x"}
+    assert "outside" in got["watcher:ci"]["throughput"]["owner"]
+    assert all(m["until"] <= time.time() + 12 * 3600 + 5 for m in got.values())
+    # A general mute keeps its 48 h and needs no owner.
+    assert coord.apply(p, [{**base, "source": "watcher:hw", "match": "tray dropped", "why": "known"}]) == []
+    assert "throughput" not in [m for m in scr.mutes(p.db) if m["source"] == "watcher:hw"][0]
+    # A renewal needs fresh evidence; with it, its life restarts from now, still capped.
+    again = {**owned[0], "hours": 6}
+    assert "fresh evidence" in coord.apply(p, [again])[0]
+    assert coord.apply(p, [{**again, "why": f"#{live} is in review; 3 matched in the last hour"}]) == []
+    # The cap is configurable and bounded.
+    assert tm.max_h({"screen": {"throughput_mute_max_h": 4}}) == 4 and tm.max_h({"screen": {"throughput_mute_max_h": 999}}) == 72
+    assert tm.max_h(None) == 12
+
+
+def test_a_throughput_class_mute_expires_and_the_digest_shows_its_hourly_rate(env):
+    p = make(env)
+    from ttp import screen as scr
+    from ttp import throughmute as tm
+    tid = p.db.add_task("fix the stall")
+    t0 = 1_800_000_000.0
+    vet = tm.vet(p.db, "daemon:review_stall", "review of", f"#{tid} owns it", None, {}, now=t0)
+    assert vet == {"owner": {"task": tid}, "max_h": 12.0}
+    m = scr.mute(p.db, "daemon:review_stall", "review of", None, why=f"#{tid} owns it",
+                 end_when="test -e /nonexistent/y", now=t0, throughput=vet)
+    assert m["until"] == t0 + 12 * 3600   # a probe alone does not stretch it to 7 days
+    for h, n in ((0, 1), (1, 2), (2, 5)):
+        for i in range(n):
+            scr.count_muted(p.db, "daemon:review_stall", "review of #5 stalled", "normal", now=t0 + h * 3600 + 60 + i)
+    [m] = scr.mutes(p.db, now=t0 + 2 * 3600 + 600)
+    assert m["first_seen"] == t0 + 60 and m["count"] == 8
+    line = scr.mute_line(m, t0 + 2 * 3600 + 600)
+    assert "1, 2, 5/h over the last 3 h (rising)" in line, line
+    # A general mute shows no rate.
+    g = scr.mute(p.db, "watcher:hw", "tray dropped", 24, now=t0)
+    assert tm.rate_text(g, t0 + 60) == ""
+    # It ends at its cap with the one summary event.
+    assert [x["source"] for x in scr.expire_mutes(p.db, now=t0 + 12 * 3600 + 1)] == ["daemon:review_stall"]
+
+
+def test_the_daily_review_lists_every_mute_and_flags_a_throughput_mute_whose_owner_finished(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import daemon as dm
+    from ttp import screen as scr
+    from ttp import throughmute as tm
+    tid = p.db.add_task("fix the slow lane")
+    assert coord.apply(p, [{"type": "observation_mute", "source": "daemon:progress", "match": "no progress",
+                            "hours": 6, "why": f"#{tid} owns it"},
+                           {"type": "observation_mute", "source": "watcher:hw", "match": "tray dropped",
+                            "hours": 24, "why": "known"}]) == []
+    scr.count_muted(p.db, "daemon:progress", "Driver x made no progress", "normal")
+    # A mute stored before this rule, with no owner, is flagged too.
+    old = scr.mute(p.db, "daemon:job_underuse", "under-used", 24, why="known")
+    lines = tm.review_lines(p.db)
+    assert len(lines) == 3, lines
+    prog = next(x for x in lines if x.startswith("daemon:progress"))
+    assert "(throughput): 1 matched, first seen" in prog and f"owner task #{tid}" in prog and "PROBLEM" not in prog
+    hw = next(x for x in lines if x.startswith("watcher:hw"))
+    assert "0 matched, first seen -" in hw and "owner none" in hw and "PROBLEM" not in hw and "/h" not in hw
+    assert "PROBLEM: throughput-class with no owner" in next(x for x in lines if x.startswith(old["source"]))
+    p.db.update_task(tid, status="done")
+    prog = next(x for x in tm.review_lines(p.db) if x.startswith("daemon:progress"))
+    assert f"PROBLEM: its owner task #{tid} is done" in prog
+    p.db.x("DELETE FROM tasks WHERE id=?", (tid,))
+    assert f"#{tid} is gone" in next(x for x in tm.review_lines(p.db) if x.startswith("daemon:progress"))
+    # The daily review's spec carries the section.
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    s = {"name": "daily-review", "budget_usd_day": None, "last_run": None, "description": "review"}
+    assert d._schedule_llm(s, {}) == "queued"
+    spec = p.db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
+    assert "Active observation mutes" in spec and f"- daemon:progress 'no progress' (throughput)" in spec
+    assert f"owner task #{tid} is gone" in spec
+
+
 def test_a_mute_with_an_end_when_probe_ends_on_its_pass_and_reports_a_broken_probe_once(env):
     p = make(env)
     from ttp import coordinator as coord, pauseends

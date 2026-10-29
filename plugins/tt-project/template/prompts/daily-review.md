@@ -33,7 +33,8 @@ Assess the last day of this project, then hand off.
    that will recur gets a follow-up too: fix it the same day, not in a later review. Then name the
    top 1-3 inefficiencies (wasted runs, turns that decided nothing, idle wakes, $ per outcome,
    review loops, long blocks or waits) with their cost and a fix. An override held past its premise (a pause, a mute, a temporary instruction possibly over)
-   is retired if it clearly is over, else gets an end condition. A resource pause the user set is
+   is retired if it clearly is over, else gets an end condition. Each PROBLEM in "Active observation mutes" (a
+   throughput-class mute whose owner task is done or gone, or with no owner) gets its fix queued today. A resource pause the user set is
    never lifted without the user's word: propose an end condition, or ask the user. In the
    summary: one line, `needless asks: N of M` and the top inefficiency. `nothing to grade`: say so
    in a few words.

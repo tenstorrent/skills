@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import jevuse, timefmt, watchdup
+from . import jevuse, throughmute, timefmt, watchdup
 from .db import DB, SEVERITY_RANK
 from .providers.jev import JevOutOfFunds
 
@@ -568,7 +568,7 @@ MUTE_PERSISTS = "under mute: is the expected recovery happening?"   # the escala
 
 def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: Any = "",
          now: float | None = None, escalate_after_h: Any = None, end_when: Any = None,
-         hold_cap_h: float | None = None) -> dict:
+         hold_cap_h: float | None = None, throughput: dict | None = None) -> dict:
     """Mute observations from `source` whose text contains `match` (any case) and whose severity is
     below `below` (default critical), for `hours`, or until probe `end_when` passes (`hours` is then
     optional), never past MUTE_CAP_S from its start. A matching condition still seen `escalate_after_h`
@@ -576,7 +576,8 @@ def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: An
     a `why`. Muting the same source and match again replaces its end, threshold, reason, escalation
     and probe (the last two kept when not given) and keeps its start, its count and the clocks of its
     conditions, except those that already escalated, which re-arm from now. Raises ValueError on bad
-    input."""
+    input. `throughput` (throughmute.vet: a throughput-class mute's owner and max_h) caps its life at
+    max_h from now and is kept on it."""
     now = time.time() if now is None else now
     source, match = str(source or "").strip(), str(match or "").strip()
     why = str(why or "").strip()[:300]
@@ -640,6 +641,8 @@ def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: An
                              f"{MUTE_CAP_S // 86400} days, the most a mute lasts; let it end and check why its "
                              f"condition still recurs before muting it again")
         until = min(cap, now + (h * 3600 if h is not None else MUTE_CAP_S))
+        if throughput:
+            until = min(until, now + float(throughput["max_h"]) * 3600)
         conds = {k: ({**c, "first_at": now, "escalated": False} if c.get("escalated") else c)
                  for k, c in ((old or {}).get("conds") or {}).items()}
         m = {"source": source, "match": match, "below": below, "hours": h, "why": why,
@@ -647,6 +650,11 @@ def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: An
              "count": old["count"] if old else 0, "last_at": old["last_at"] if old else None,
              "escalate_after_h": esc, "armed_at": now, "conds": conds}
         m["hold_cap_h"] = cap_h
+        for k in ("first_seen", "hourly"):   # throughmute's counts outlive a renewal
+            if (old or {}).get(k):
+                m[k] = old[k]
+        if throughput:
+            m["throughput"] = throughput
         if held:
             m["hold"] = True
         if probe:
@@ -733,6 +741,7 @@ def count_muted(db: DB, source: str, text: str, severity: str, now: float | None
             if (float(m["until"]) > now and m["source"].lower() == source.lower() and m["match"].lower() in low
                     and rank < SEVERITY_RANK[m["below"]]):
                 m["count"], m["last_at"] = int(m["count"]) + 1, now
+                throughmute.tally(m, now)
                 _track(db, m, source, text, now, whole, key)
                 db.set_kv(MUTES_KEY, active)
                 return m
@@ -984,7 +993,7 @@ def mute_line(m: dict, now: float | None = None, where: Any = None) -> str:
             + (f"persisting {', '.join(ages)}; " if ages else "")
             + (f"asks after {_h(esc * 3600)} h; " if esc > 0 else "never asks; ")
             + f"ends in {max(0.0, (float(m['until']) - now) / 3600):.1f} h" + mute_probe(m)
-            + (f" ({m['why']})" if m.get("why") else ""))
+            + throughmute.rate_text(m, now) + (f" ({m['why']})" if m.get("why") else ""))
 
 
 def mute_probe(m: dict) -> str:
