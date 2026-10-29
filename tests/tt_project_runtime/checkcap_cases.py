@@ -2154,6 +2154,61 @@ def test_dead_or_silent_lane_holders_are_reclaimed_and_logged(env, tmp_path, mon
     assert log[0]["holder"]["task"] == "7"
 
 
+_ORPHANING_HOLDER = """
+import subprocess, sys, time
+from pathlib import Path
+from ttp import checklane, testslots
+checklane.HEARTBEAT_S = 3600.0
+g = testslots.suite_hold(sys.argv[1], repo=sys.argv[3])
+fd = g.files[0].fileno()
+child = subprocess.Popen(["sleep", "60"], pass_fds=[fd], start_new_session=True)   # keeps the lane's lock open
+Path(sys.argv[2]).write_text(str(child.pid))
+while True:
+    time.sleep(1)
+"""
+
+
+def test_a_holder_killed_mid_suite_without_releasing_its_lane_frees_or_reaps_it(env, tmp_path, monkeypatch):
+    """A lane holder SIGKILLed mid-suite: its flock dies with it, so the next waiter takes the lane at once;
+    if a stray child kept the lock open, the next waiter reaps the lane (its labelled pid is gone)."""
+    from ttp import checklane, locks, testslots
+    _lane_env(monkeypatch)
+    state = tmp_path / "state"
+    state.mkdir()
+    holder = _lane_holder(tmp_path, "pa", _LANE_REPO, task="7")
+    try:
+        assert testslots.suite_hold("pa", repo=_LANE_REPO, wait_s=0.3) is None, "a live holder keeps its lane"
+        holder.kill()   # SIGKILL: no close, no release, no exit handler
+        holder.wait(10)
+        g = testslots.suite_hold("pa", repo=_LANE_REPO, wait_s=5, state=state)
+        assert g and g.files, "the killed holder's lane was never freed"
+        g.close()
+    finally:
+        _stop(holder)
+    assert not (state / checklane.RECLAIM_LOG).exists(), "the kernel freed it; nothing needed reaping"
+    got = tmp_path / "held-orphan"
+    holder = subprocess.Popen([sys.executable, "-c", _ORPHANING_HOLDER, "pa", str(got), _LANE_REPO],
+                              env={**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_TASK": "8"})
+    lane = testslots.lane_paths("pa", 1, _LANE_REPO)[0]
+    try:
+        assert _wait_for(got.exists), "the orphaning holder never took its lane"
+        holder.kill()
+        holder.wait(10)
+        assert locks._slot_labels([lane]), "the stray child still holds the lane's lock"
+        told = []
+        g = testslots.suite_hold("pa", repo=_LANE_REPO, wait_s=5, state=state, tell=told.append)
+        assert g and g.files, "a lane held only by a dead holder's stray child was never reaped"
+        g.close()
+    finally:
+        _stop(holder)
+        if got.exists():
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(got.read_text()), signal.SIGKILL)   # the stray child, by its pid
+    log = [json.loads(x) for x in (state / checklane.RECLAIM_LOG).read_text().splitlines()]
+    assert len(log) == 1 and "process is gone" in log[0]["why"] and log[0]["holder"]["task"] == "8", log
+    assert any("reclaimed a checks lane" in x for x in told), told
+
+
 def test_a_cheaper_waiter_gets_an_overflow_lane_after_max_wait_and_only_then(env, tmp_path, monkeypatch):
     from ttp import checklane, testslots
     _lane_env(monkeypatch)
