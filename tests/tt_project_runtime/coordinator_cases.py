@@ -4826,7 +4826,7 @@ def test_an_unanswered_ask_resolves_to_its_recommendation_at_the_deadline(env):
     p = make(env)
     from ttp import coordinator as coord
     q = "Should the nightly benchmark run on the larger runner pool or on the smaller runner pool?"
-    problems, ask = _ask(p, q, blocking="access", recommendation="use option A", severity="normal")
+    problems, ask = _ask(p, q, **_OWN_ACCESS, recommendation="use option A", severity="normal")
     assert problems == []
     assert coord.expire_asks(p, now=ask["ts"] + 0.5 * 3600 - 1) == []
     assert coord.expire_asks(p, now=ask["ts"] + 0.5 * 3600) == [ask["id"]]
@@ -4840,7 +4840,7 @@ def test_an_unanswered_ask_resolves_to_its_recommendation_at_the_deadline(env):
     mem = p.memory_dir.glob("*.md")
     assert any("auto-resolved to its default: use option A" in f.read_text() for f in mem), "no decision memory"
     assert coord.expire_asks(p, now=ask["ts"] + 99 * 3600) == [], "an ask expired twice"
-    problems, again = _ask(p, q, blocking="access", recommendation="use option B")
+    problems, again = _ask(p, q, **_OWN_ACCESS, recommendation="use option B")
     assert problems and "auto-resolved unanswered" in " ".join(problems), "a re-ask of a resolved ask was sent"
     assert again["id"] == ask["id"]
 
@@ -4918,7 +4918,7 @@ def test_the_ask_deadline_shows_in_status_the_web_app_and_the_digest(env):
     from ttp import coordinator as coord, timefmt
     from ttp.cli import status_text
     from ttp.web import state_payload
-    _, ask = _ask(p, blocking="access", recommendation="use option A")
+    _, ask = _ask(p, **_OWN_ACCESS, recommendation="use option A")
     at = timefmt.short(ask["ts"] + 0.5 * 3600, p)
     line = f"acts on use option A at {at} unless answered"
     assert line in ask["text"]
@@ -4932,7 +4932,7 @@ def test_ask_timeout_zero_turns_the_ask_timer_off(env):
     p = make(env)
     from ttp import coordinator as coord
     assert coord.apply(p, [{"type": "config_set", "key": "coordinator.ask_timeout_h", "value": "0"}]) == []
-    _, ask = _ask(p, blocking="access", recommendation="use option A")
+    _, ask = _ask(p, **_OWN_ACCESS, recommendation="use option A")
     assert "Non-blocking" not in ask["text"]
     assert coord.expire_asks(p, now=ask["ts"] + 1000 * 3600) == []
     assert p.db.one("SELECT handled FROM messages WHERE id=?", (ask["id"],))["handled"] == 0
@@ -4980,7 +4980,7 @@ def test_a_task_held_on_an_ask_is_released_once_it_auto_resolves(env):
     from ttp import coordinator as coord
     from ttp.daemon import Daemon
     d = Daemon(p.base)
-    _, ask = _ask(p, blocking="access", recommendation="use option A")
+    _, ask = _ask(p, **_OWN_ACCESS, recommendation="use option A")
     tid = p.db.add_task("on the ask", "s", origin="user")
     p.db.update_task(tid, status="blocked", blocked_reason="r", labels=[f"waits:ask:{ask['id']}"])
     d.sweep_holds()
@@ -18887,7 +18887,7 @@ def test_no_false_correction_hits_on_an_unrelated_spec_or_ask(env):
     assert not [n for n in p.db.kv(coord.NOTES_KEY, []) if "repeats a value the user corrected" in n]
     ask = "Can you grant the bot account sudo on box-a1 for the firmware flash tonight?"
     problems, sent = _ask(p, ask, blocking="access")
-    assert problems == [] and sent["text"] == ask, problems
+    assert problems == [] and coord._ask_question(sent["text"]) == ask, problems
 
 
 def test_an_off_topic_answer_leaves_the_ask_open_and_is_linked_as_a_new_instruction(env):
