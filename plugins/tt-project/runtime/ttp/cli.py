@@ -1388,9 +1388,9 @@ def status_text(p: Project, verbose: bool = False) -> str:
     if host := checkcap.line():
         lines.append(host)
     lines.extend(testslots.use_lines())
-    if suite := testslots.suite_line(p.name, now):
-        lines.append(suite)
     from . import checklane
+    if suite := testslots.suite_line(p.name, now, checklane.slots(p.config())):
+        lines.append(suite)
     lines.extend(checklane.long_wait_lines(p.name, now))
     if verbose and (slot_waits := checkcap.wait_line(p.state, now)):
         lines.append(slot_waits)
@@ -3284,15 +3284,17 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         except OSError:
             pass
 
-    def waiting(on: bool, suite: str = "") -> None:
+    def waiting(on: bool, suite: str = "", limit: int = 0) -> None:
         # The wait is recorded before the marker shows it, so whoever sees the marker sees both. `suite`:
-        # the project's suite lock it waits on (testslots.suite_hold), which the `--result` probe names.
+        # the project's suite lock it waits on (testslots.suite_hold), which the `--result` probe names
+        # with its `limit` (lanes at once).
         if foreground:
             lk.record_wait(run_dir, key, start, None if on else time.time())
         try:
             if on:
                 write_json(run_dir / CHECKS_SLOT_WAIT, {"since": time.time(), "pid": os.getpid(), "head": head,
-                                                        **({"suite": suite} if suite else {})})
+                                                        **({"suite": suite} if suite else {}),
+                                                        **({"limit": limit} if suite and limit else {})})
             else:
                 (run_dir / CHECKS_SLOT_WAIT).unlink(missing_ok=True)
         except OSError:
@@ -3307,27 +3309,43 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     cfg = p.config() if p else {}
     from . import testslots
     repo = testslots.repo_key(top) if p else ""
-    lane_repo = f"w{lock}" if lock else repo
     cmds = cmds or []
     what = " && ".join(str(c) for c in cmds)[:300] or "full checks"
-    # One full checks run per project at a time (testslots.suite_hold), taken before the checks slot so
-    # a second run of the project never holds one of the host's slots while it waits.
-    from . import testslots
-    # Its wait is told, recorded and cancellable as the checks slot's is; the foreground wait for both
-    # together ends after FOREGROUND_WAIT_S.
-    suite = None
+    # One of the repository's checks lanes (testslots.suite_hold; checks.slots of them, checklane), or with
+    # `lock` its wrapper lock's one lane, taken before the checks slot so a run never holds one of the
+    # host's slots while it waits.
+    from . import cleantree, push
+    # Concurrent runs are isolated (own clean checkout, scratch, output folder and port block); what is
+    # not keeps a lock: checks run in the authoring worktree also hold its one lane (testslots.tree_key).
+    local = [c for c in cmds if not push.remote_host(c)]
+    in_tree = bool(p and top and any(cleantree.authoring(c) for c in local))
+    # Its wait is told, recorded and cancellable as the checks slot's is; the foreground wait for all of
+    # them together ends after FOREGROUND_WAIT_S.
+    suite = tree = None
+
+    def hold(key: str, n: int, **lane):
+        left = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
+        on_key = f"w{lane['lock']}" if lane.get("lock") else key
+        return testslots.suite_hold(p.name if p else None, tell, left,
+                                    lambda on: waiting(on, str(testslots.suite_path(p.name, on_key)),
+                                                       1 if lane.get("lock") else n),
+                                    lambda: _checks_cancelled(run_dir), f"run {run_dir.name}", prio, arrived,
+                                    slots=n, repo=key,
+                                    cost=checklane.cost(p.state if p else None, _commands_hash(cmds), cmds, cfg),
+                                    max_wait=checklane.max_wait_s(cfg) if key == repo else 0.0,
+                                    state=p.state if p else None, what=what, **lane)
     try:
-        suite = testslots.suite_hold(p.name if p else None, tell,
-                                     checkcap.FOREGROUND_WAIT_S if foreground and p else None,
-                                     lambda on: waiting(on, str(testslots.suite_path(p.name, lane_repo))),
-                                     lambda: _checks_cancelled(run_dir), f"run {run_dir.name}", prio, arrived,
-                                     slots=checklane.slots(cfg), repo=repo,
-                                     cost=checklane.cost(p.state if p else None, _commands_hash(cmds), cmds, cfg),
-                                     max_wait=checklane.max_wait_s(cfg), state=p.state if p else None,
-                                     what=what, lock=lock, cap=checklane.project_cap(cfg), worktree=top,
-                                     headroom=checklane.headroom)
-        if suite is None:
+        if in_tree:
+            if (tree := hold(testslots.tree_key(top), 1)) is None:
+                return None
+        if (suite := hold(repo, checklane.slots(cfg), lock=lock, cap=checklane.project_cap(cfg),
+                          worktree=top, headroom=checklane.headroom)) is None:
+            if tree is not None:
+                tree.close()
             return None
+        if tree is not None:
+            suite.files += tree.files
+            tree = None
         left = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
         slot = checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell, waiting,
                                 left, arrived,
@@ -3347,18 +3365,23 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             return None
         slot.tests.files += suite.files   # the suite lock ends with the run's test slots
         slot.suite = suite   # its label shows the run's wall-time cap (testslots.suite_running)
+        if not os.environ.get(testslots.HELD_ENV) and (ports := testslots.port_block(checkcap.label(p.name if p else None))):
+            slot.tests.files.append(ports[0])   # the run's own ports, freed with its test slots
+            slot.tests.extra.update(ports[1])
         return slot
     except checkcap.Cancelled as e:
-        if suite is not None:
-            suite.close()
+        for g in (suite, tree):
+            if g is not None:
+                g.close()
         said = ("not run: stopped waiting for "
                 + ("this project's other full checks" if suite is None else "a host-wide checks slot") + f": {e}")
         out.write(f"ttp checks: {said}\n")
         out.flush()
         die(f"ttp checks: {said}", 1)
     except checkcap.Unavailable as e:
-        if suite is not None:
-            suite.close()
+        for g in (suite, tree):
+            if g is not None:
+                g.close()
         out.write(f"ttp checks: {e}\n")
         out.flush()
         die(f"ttp checks: {e}")
@@ -3871,8 +3894,10 @@ def _checks_result(run_dir: Path) -> int:
                 held = checkcap._some(lk.held_labels([Path(wait["suite"])]))
             except OSError:
                 held = ""
+            n = wait.get("limit") if isinstance(wait.get("limit"), int) else 1
             print(f"ttp checks: waiting (pid {info['pid']}, not running) for this project's other full checks "
-                  f"to end, one at a time per project: held by {held or 'a run that just ended'}")
+                  f"to end, {'one' if n == 1 else n} at a time per project and repository (checks.slots sets "
+                  f"it): held by {held or 'a run that just ended'}")
         elif wait is not None or (run_dir / CHECKS_SLOT_WAIT).exists():
             from . import checkcap
             print(f"ttp checks: queued for a host-wide checks slot (pid {info['pid']}); "

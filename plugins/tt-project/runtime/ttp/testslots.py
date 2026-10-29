@@ -73,6 +73,12 @@ HELD_ENV = "TTP_TEST_SLOTS_HELD"   # set for the commands of a run that holds sl
 OWN = "test-slots-project"     # check-slots/test-slots-project.<project id>.<i>.lock: one project's budget
 RESERVED = "test-slots-push"   # check-slots/test-slots-push.<branch id>.lock: a push branch's reserved slot
 SUITE = "test-suite"           # check-slots/test-suite.<project id>.lock: one project's full checks
+SLOTS_KEY = "slots"            # checks.slots: how many full checks of one project and repository run at once
+PORTS = "check-ports"          # check-slots/check-ports.<i>.lock: one running check run's port block
+# A check run's own ports (port_block): PORT_BLOCKS blocks of PORT_SPAN from PORT_FIRST, 20000-31999,
+# below Linux's ephemeral range (32768-60999), so two suites that run at once never pick the same port.
+PORT_FIRST, PORT_SPAN, PORT_BLOCKS = 20000, 100, 120
+PORT_BASE_ENV, PORT_COUNT_ENV = "TTP_PORT_BASE", "TTP_PORT_COUNT"
 POLL_S = 5.0
 SUITE_AGE_S = 900.0   # a suite waiter gains one priority step per this many seconds waited
 NO_PRIORITY = 6      # a ticket without a priority (no task, an older runtime) ages from here
@@ -202,13 +208,14 @@ class Grant:
 
     def __init__(self, k: int = 0, files=(), waited: float = 0.0, kind: Kind = TESTS):
         self.k, self.files, self.waited, self.kind = k, list(files), waited, kind
+        self.extra: dict[str, str] = {}   # more variables for the commands, e.g. the run's ports (port_block)
 
     def env(self) -> dict[str, str]:
         if not self.k:
-            return {}
+            return dict(self.extra)
         if self.kind is BUILDS:
-            return {**build_env(self.k), BUILD_HELD_ENV: str(self.k)}
-        return {XDIST_ENV: str(self.k), SLOTS_ENV: str(self.k), HELD_ENV: str(self.k)}
+            return {**build_env(self.k), BUILD_HELD_ENV: str(self.k), **self.extra}
+        return {XDIST_ENV: str(self.k), SLOTS_ENV: str(self.k), HELD_ENV: str(self.k), **self.extra}
 
     def close(self) -> None:
         for f in self.files:
@@ -298,6 +305,30 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
             time.sleep(poll_s(POLL_S))
     finally:
         locks.dequeue(ticket)
+
+
+def port_block(holder: str):
+    """(held lock file, environment) of one free block of the host's check ports, never waiting: the
+    block's first port and size as TTP_PORT_BASE and TTP_PORT_COUNT, for a suite that binds fixed ports,
+    so check runs that run at once never share one. The lock frees with its run (a crash, a reboot). None
+    when all PORT_BLOCKS are held or the slot directory cannot be written: the run then has no own block."""
+    paths = locks.slot_paths(checkcap.slot_dir(), PORTS, PORT_BLOCKS)
+    try:
+        f = locks.try_take(paths, holder, "check ports")
+    except OSError:
+        return None
+    if f is None:
+        return None
+    i = [str(x) for x in paths].index(str(f.name))
+    return f, {PORT_BASE_ENV: str(PORT_FIRST + i * PORT_SPAN), PORT_COUNT_ENV: str(PORT_SPAN)}
+
+
+def tree_key(top) -> str:
+    """The short id of worktree `top` itself (its real path), for checks that run in it (cwd "authoring"):
+    they share its files, so two such runs of one worktree never run at once (suite_hold with it as
+    `repo`). "" without `top`. Its "t" prefix keeps the lane out of suite_bases, so it never counts
+    against the project cap (project_held, cap_turn) beside the run's own repository lane."""
+    return "t" + hashlib.sha256(os.path.realpath(str(top)).encode()).hexdigest()[:12] if top else ""
 
 
 def repo_key(top) -> str:
@@ -564,8 +595,8 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                 told = time.time()
                 pos = (q.index(ticket) + 1) if ticket in q else 1
                 rule = ("one at a time behind this wrapper lock (checks.wrap_cmd)" if lock else
-                        "one at a time per project and repository" if slots == 1
-                        else f"{slots} at a time per project and repository")
+                        f"{'one' if slots == 1 else slots} at a time per project and repository, "
+                        f"checks.{SLOTS_KEY} sets it")
                 rule += f"; at most {cap} of the project's checks at once (checks.test_project_max)" if cap > 0 else ""
                 recs = recs or locks.holder_records(project_held(project_name))
                 held_by = "; ".join(checklane.holder_text(r, told) for r in recs[:3]) or "a run that just ended"
@@ -592,9 +623,10 @@ def _mins(s: float) -> str:
     return f"{m // 60} h {m % 60} min" if m >= 60 else f"{m} min"
 
 
-def suite_line(project_name: str, now: float | None = None) -> str:
+def suite_line(project_name: str, now: float | None = None, limit: int = 0) -> str:
     """`ttp status`'s line on the project's full checks slot: its holder, how long it has run against
-    its wall-time cap, and the waiting order (suite_order); "" while it is free and nobody waits."""
+    its wall-time cap, and the waiting order (suite_order), with a wait naming the `limit` (lanes per
+    repository) and checks.slots, which raises it; "" while it is free and nobody waits."""
     now = time.time() if now is None else now
     try:
         recs = locks.holder_records(lane_paths(project_name, None, None))
@@ -631,6 +663,7 @@ def suite_line(project_name: str, now: float | None = None) -> str:
         waits.append(f"{'#' + m.group(1) if m else 'a run'}{p} waited {_mins(now - locks._arrival(t))}")
     return (f"full checks slot: {what}"
             + (f"; waiting in order: {', '.join(waits[:6])}" + (f" +{len(waits) - 6}" if len(waits) > 6 else "")
+               + (f" ({limit} at a time per repository; checks.{SLOTS_KEY} raises it)" if limit else "")
                if waits else ""))
 
 

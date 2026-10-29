@@ -186,6 +186,18 @@ def _checks_project_max(v):
     return n
 
 
+def _checks_slots(v):
+    """checks.slots as config_set takes it: a whole number 1-64 (how many full checks of one project and
+    repository run at once, checklane)."""
+    try:
+        n = int(v) if isinstance(v, int) else int(str(v).strip(), 10)
+    except ValueError:
+        n = 0
+    if isinstance(v, bool) or isinstance(v, float) or not 1 <= n <= 64:
+        raise ValueError(f"checks.slots: {v!r} is not a whole number 1-64")
+    return n
+
+
 USER_SETTABLE = {
     "budget.daily_usd": float, "budget.weekly_usd": float, "budget.reserve_pct": float,
     "budget.global_daily_usd": float, "budget.day_start": str, "budget.timezone": str,
@@ -202,6 +214,8 @@ USER_SETTABLE = {
     "checks.ionice": lambda v: _checks_ionice(v),
     # How many of the project's checks run at once over all its lanes (checklane.project_cap).
     "checks.test_project_max": lambda v: _checks_project_max(v),
+    # How many full checks of one project and repository run at once (checklane.slots; unset: sized to the host).
+    "checks.slots": lambda v: _checks_slots(v),
     # Where code tasks branch from: the project's working branch once it has one.
     "delivery.base_ref": str,
     # Where `ttp push` publishes (required; never main, master or the remote's default branch) and

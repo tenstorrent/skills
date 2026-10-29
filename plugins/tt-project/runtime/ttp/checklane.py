@@ -14,9 +14,13 @@ words in order, after only wrappers (env, nice, timeout ...) and with only extra
 
 Heavy lanes. Other runs take one of the project's `slots()` lanes (testslots.suite_hold), so that many
 heavy checks of a project run at once, in task-priority order (#4065's order; one lane keeps the old
-one-at-a-time slot). `checks.slots` sets it (project, then account, then TTP_CHECKS_SLOTS); unset, it
-follows the machine: one lane per CORES_PER_LANE cores and per GIB_PER_LANE GiB of available memory,
-the smaller, at least 1, at most MAX_LANES.
+one-at-a-time slot). Lanes are per repository under check (testslots.repo_key), so checks of unrelated
+repos never share them. `checks.slots` sets it (project, then account, then TTP_CHECKS_SLOTS); unset, it
+follows the machine (default_slots): the runs its test pool fits side by side, at least 2 (each run is
+isolated: its own clean checkout, scratch, output folder and port block, testslots.port_block), at most
+MAX_LANES, lowered only by little available memory. What runs cannot isolate keeps a lock of its own:
+checks run in the authoring worktree (cwd "authoring") also hold that worktree's one lane
+(testslots.tree_key). Runs behind checks.wrap_cmd take its wrapper lock's lane instead (below).
 
 Wrapper locks. A run whose commands go behind the project's checks.wrap_cmd (a lock or queue command,
 such as a shared device's lock) takes that wrapper lock's own single lane (wrap_key), not a repository
@@ -117,26 +121,30 @@ def _mem_gib() -> float | None:
     return None
 
 
-def default_slots(n_cores: int | None = None, mem_gib: float | None = None) -> int:
-    """Lanes on this machine: per CORES_PER_LANE cores and GIB_PER_LANE GiB available, the smaller, in 1..MAX_LANES."""
+def default_slots(n_cores: int | None = None, mem_gib: float | None = None, cfg: dict | None = None) -> int:
+    """Lanes on this machine: as many runs as the host's test pool fits side by side (testslots.sizes:
+    pool // run_max; with the pool off, one per CORES_PER_LANE cores), at least 2, at most MAX_LANES,
+    as each run has its own checkout, scratch, output folder and ports (cli._checks_slot). Only little
+    available memory (one lane per GIB_PER_LANE GiB) lowers it, to 1 at the least."""
     c = checkcap.cores() if n_cores is None else n_cores
     m = _mem_gib() if mem_gib is None else mem_gib
-    n = c // CORES_PER_LANE
+    s = testslots.sizes(cfg, cores=c)
+    n = max(2, min(MAX_LANES, s[0] // s[1] if s else c // CORES_PER_LANE))
     if m is not None:
         n = min(n, int(m // GIB_PER_LANE))
-    return max(1, min(MAX_LANES, n))
+    return max(1, n)
 
 
 def slots(cfg: dict | None) -> int:
     """The project's heavy lanes: checks.slots (project, then account), TTP_CHECKS_SLOTS, else default_slots()."""
-    for v in (setting(cfg, "slots"), os.environ.get(SLOTS_ENV)):
+    for v in (setting(cfg, testslots.SLOTS_KEY), os.environ.get(SLOTS_ENV)):
         try:
             n = int(str(v).strip())
         except (TypeError, ValueError):
             continue
         if n >= 1:
             return n
-    return default_slots()
+    return default_slots(cfg=cfg)
 
 
 def project_cap(cfg: dict | None) -> int:

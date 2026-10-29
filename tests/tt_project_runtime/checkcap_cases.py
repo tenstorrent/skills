@@ -1867,12 +1867,13 @@ def test_only_whole_light_commands_are_light(env):
 
 def test_checks_lanes_default_from_the_machine_and_follow_checks_slots(env, monkeypatch):
     from ttp import checklane, project
-    assert checklane.default_slots(1, 100) == 1 and checklane.default_slots(0, 0) == 1
+    assert checklane.default_slots(1, 100) == 2, "runs are isolated: at least two lanes"
+    assert checklane.default_slots(0, 0) == 1, "only too little memory keeps one lane"
     assert checklane.default_slots(64, 1000) == checklane.MAX_LANES
     assert checklane.default_slots(64, 10) == 1, "little free memory keeps one lane"
     assert checklane.default_slots(16, None) == 2
     monkeypatch.delenv(checklane.SLOTS_ENV)
-    monkeypatch.setattr(checklane, "default_slots", lambda: 3)
+    monkeypatch.setattr(checklane, "default_slots", lambda **_: 3)
     assert checklane.slots({}) == 3
     monkeypatch.setenv(checklane.SLOTS_ENV, "junk")
     assert checklane.slots({}) == 3
@@ -2297,3 +2298,104 @@ def test_a_quick_device_query_check_runs_beside_a_long_device_check_in_another_l
     finally:
         for g in (long_run, smi, smi_locked):
             g and g.close()
+
+
+_CONCURRENT_CHECK = r'''
+set -e
+me=$1; other=$2; dir=$3
+{ echo "port=$TTP_PORT_BASE"; echo "tmp=$TMPDIR"; echo "out=$TTP_CHECK_OUTPUT_DIR"; echo "pwd=$(pwd)"; } > "$dir/$me.env"
+mkdir "$TMPDIR/scratch" && touch "$TTP_CHECK_OUTPUT_DIR/$me.mark"
+touch "$dir/$me.up"
+i=0; while [ ! -e "$dir/$other.up" ]; do i=$((i+1)); [ $i -lt 600 ] || exit 9; sleep 0.05; done
+'''
+
+
+def test_two_full_checks_of_one_repository_run_at_once_without_sharing_ports_scratch_or_output(
+        env, tmp_path, monkeypatch):
+    """checks.slots 2: two `ttp checks` runs of one project and repository proceed together (each waits
+    for the other inside its check) and get their own port block, TMPDIR, output folder and checkout."""
+    from ttp import testslots
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _lane_env(monkeypatch)
+    p.set_config("checks.slots", 2)
+    script = tmp_path / "both.sh"
+    script.write_text(_CONCURRENT_CHECK)
+    rds = []
+    for me, other in (("a", "b"), ("b", "a")):
+        rd = tmp_path / f"run-{me}"
+        rd.mkdir()
+        rds.append(rd)
+        r = subprocess.run(
+            [sys.executable, "-m", "ttp", "checks", "--detach", "--fresh", "--", "sh", str(script), me, other,
+             str(tmp_path)], cwd=repo, capture_output=True, text=True,
+            env={**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_RUN_DIR": str(rd), "TTP_CHECKS_HOST_MAX": "4",
+                 "TTP_RUN_ID": f"5{len(rds)}"})
+        assert r.returncode == 0, r.stdout + r.stderr
+    rcs = [rd / "checks.rc" for rd in rds]
+    assert _wait_for(lambda: all(x.exists() for x in rcs), 120), [(rd / "checks.out").read_text() for rd in rds]
+    assert [x.read_text().strip() for x in rcs] == ["0", "0"], [(rd / "checks.out").read_text() for rd in rds]
+    seen = [dict(x.split("=", 1) for x in (tmp_path / f"{m}.env").read_text().split()) for m in "ab"]
+    for k in ("port", "tmp", "out", "pwd"):
+        assert seen[0][k] and seen[0][k] != seen[1][k], (k, seen)
+    assert int(seen[0]["port"]) >= testslots.PORT_FIRST and int(seen[1]["port"]) >= testslots.PORT_FIRST
+    assert abs(int(seen[0]["port"]) - int(seen[1]["port"])) >= testslots.PORT_SPAN
+
+
+def test_port_blocks_are_distinct_while_held_and_free_with_their_holder(env, tmp_path, monkeypatch):
+    from ttp import checkcap, testslots
+    monkeypatch.setattr(checkcap, "slot_dir", lambda: tmp_path / "slots")
+    (tmp_path / "slots").mkdir()
+    monkeypatch.setattr(testslots, "PORT_BLOCKS", 2)
+    a, b = testslots.port_block("run a"), testslots.port_block("run b")
+    assert a and b and a[1][testslots.PORT_BASE_ENV] != b[1][testslots.PORT_BASE_ENV]
+    assert a[1][testslots.PORT_COUNT_ENV] == str(testslots.PORT_SPAN)
+    assert testslots.port_block("run c") is None, "all blocks held: none, never a shared one"
+    a[0].close()
+    c = testslots.port_block("run c")
+    assert c and c[1] == a[1], "a freed block is taken again"
+    b[0].close(), c[0].close()
+
+
+def test_checks_in_the_authoring_worktree_hold_its_one_tree_lane(env, tmp_path, monkeypatch):
+    from ttp import testslots
+    _lane_env(monkeypatch)
+    key = testslots.tree_key(tmp_path)
+    assert key and key == testslots.tree_key(str(tmp_path) + "/") and key != testslots.tree_key(tmp_path / "x")
+    a = testslots.suite_hold("pa", repo=key, slots=1, wait_s=0)
+    assert a and testslots.suite_hold("pa", repo=key, slots=1, wait_s=0.2) is None, "one run per worktree"
+    other = testslots.suite_hold("pa", repo=testslots.tree_key(tmp_path / "x"), slots=1, wait_s=0)
+    assert other, "another worktree is not held up"
+    a.close(), other.close()
+
+
+def test_checks_slots_is_chat_settable_as_a_whole_number_only(env, capsys):
+    from ttp import cli, coordinator
+    assert coordinator.settable("checks.slots")("3") == 3
+    for bad in ("2.5", "abc", "0", "65", "true", True, 1.5):
+        with pytest.raises(ValueError):
+            coordinator.settable("checks.slots")(bad)
+    try:
+        cli.main(["config", "--chat-settable", "checks.slots", "2"])
+    except SystemExit as e:
+        assert e.code in (0, None)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["config", "--chat-settable", "checks.slots", "2.5"])
+    assert e.value.code == 1
+
+
+def test_a_lane_wait_and_the_status_line_name_the_limit_and_checks_slots(env, tmp_path, monkeypatch):
+    from ttp import testslots
+    _lane_env(monkeypatch)
+    hold = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1)
+    try:
+        told = []
+        assert testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, wait_s=0.3, tell=told.append) is None
+        assert "one at a time per project and repository, checks.slots sets it" in told[0], told
+        waiter = threading.Thread(target=testslots.suite_hold, args=("pa",),
+                                  kwargs={"repo": _LANE_REPO, "slots": 1, "wait_s": 1.5})
+        waiter.start()
+        assert _wait_for(lambda: "checks.slots raises it" in testslots.suite_line("pa", limit=1))
+        assert "(1 at a time per repository; checks.slots raises it)" in testslots.suite_line("pa", limit=1)
+        waiter.join(10)
+    finally:
+        hold.close()
