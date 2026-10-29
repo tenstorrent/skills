@@ -4557,6 +4557,10 @@ class Daemon:
             text += (f"\nSplit at head {split[:12]}: no review of it; its continue hop builds on this branch, and "
                      f"the chain's last hop gets the one review.")
         # An urgent one's review is queued at once on a needs_review hand-off too (no sweep_after_s wait).
+        # Accepted gap: _auto_review (and _fix_without_commits below) still run a few local ref-metadata git
+        # reads inside this transaction (rev-parse, the diff base, rev-list --count), each milliseconds; they
+        # are not warmed by gitmemo. Long-timeout git calls are bounded separately (changeset
+        # tt-project-bounded-inline-children).
         review = self._auto_review(dict(task, **upd), summary) \
             if (new == "done" or new == "review" and urgent.is_urgent(task)) and task["kind"] == "code" \
             and not split else None
