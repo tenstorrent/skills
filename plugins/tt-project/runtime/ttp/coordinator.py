@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import ackwait, anchors, askauto, askrethink, broadcast, budgetkind, cachettl, causefix, cells, chaincap, convgate, chainprio, chatset, checkspill, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, rejcool, relay, responsibilities, restriction_audit, reviewcap, selfreview, reviewreuse, settinghold, settled, shared, sharedchecks, startbreaker, sweep, throughmute, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import ackwait, anchors, askauto, askrethink, broadcast, budgetkind, cachettl, causefix, cells, chaincap, convgate, chainprio, chatset, checkspill, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, rejcool, relay, responsibilities, restriction_audit, reviewcap, selfreview, reviewreuse, settinghold, settled, shared, sharedchecks, startbreaker, sweep, throughmute, timefmt, tried, unblock, unstarted, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -2172,6 +2172,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if (after or when) and (lull := lull_note(f"task_add: #{new_id}", labels, a.get("why"),
                                                           title, a.get("spec") or "")):
                     notes.append(lull)
+                if nudge := unstarted.parked_nudge(f"task_add: #{new_id}", a.get("why") or why_after, after, when):
+                    notes.append(nudge)
+                    unstarted.count_nudge(db)
                 if pr_ask:
                     notes.append(f"task_add: #{new_id} added as `code`, not `{a.get('kind') or 'work'}`: it asks for "
                                  f"PR delivery ({pr_ask!r}) and only code tasks open or update PRs")
@@ -2354,6 +2357,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                  + ", ".join(f"#{i} p{o}->p{n}" for i, o, n in moved) + ")")
                 if lull:
                     notes.append(lull)
+                if upd.get("spec") and (nudge := unstarted.update_nudge(f"task_update: #{task['id']}",
+                                                                       db.task(task["id"]) or {}, time.time())):
+                    notes.append(nudge)
+                    unstarted.count_nudge(db)
                 if as_deps:
                     notes.append(f"task_update: #{task['id']} {as_deps}")
                 if as_deferral:
