@@ -420,9 +420,8 @@ def _locked(prov: str):
 
 
 def _write(path: Path, leases: dict) -> None:
-    tmp = path.with_name(f".{path.name}.{os.getpid()}")
-    tmp.write_text(json.dumps(leases))
-    os.replace(tmp, path)
+    from . import project
+    project.durable_write(path, json.dumps(leases))
 
 
 def host_used(prov: str, now: float | None = None) -> int:
