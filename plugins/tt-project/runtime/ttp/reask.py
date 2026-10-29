@@ -160,11 +160,13 @@ def _resolved(db, ask: str, since: float, question) -> str | None:
     from .unblock import RESOLVED_KEY
     rec = db.kv(RESOLVED_KEY, {}) or {}
     for aid, r in sorted(rec.items(), key=lambda kv: -int(kv[0])):
-        if not isinstance(r, dict) or float(r.get("ts") or 0) < since or not r.get("messages"):
+        if not isinstance(r, dict) or float(r.get("ts") or 0) < since or not (r.get("messages") or r.get("auto")):
             continue
         row = db.one("SELECT text FROM messages WHERE id=? AND kind='ask' AND direction='out'", (int(aid),))
         if not row or not (matches(ask, question(row["text"])) or _hit(ask, question(row["text"]), False)):
             continue
+        if r.get("auto") and not r.get("messages"):   # unanswered: it resolved to its recommendation
+            return f'ask #{aid}, auto-resolved unanswered to its recommendation: "{_line(str(r["auto"]))}"'
         ids = [int(m) for m in r["messages"]][:50]
         said = db.q(f"SELECT id, text, context FROM messages WHERE direction='in' AND kind='user' "
                     f"AND id IN ({','.join('?' * len(ids))}) ORDER BY id", ids)

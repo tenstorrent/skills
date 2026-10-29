@@ -567,9 +567,17 @@ def run_wake(note: str | None) -> str | None:
     return str(wake.get("tier")) if isinstance(wake, dict) and wake.get("tier") else None
 
 
-def attention(db: DB, now: float) -> list[dict]:
-    """The top section: open asks and alerts about problems active now (see alerts.needs_you)."""
-    return alerts.needs_you(db, now)
+def attention(db: DB, now: float, p: Project | None = None) -> list[dict]:
+    """The top section: open asks and alerts about problems active now (see alerts.needs_you). With
+    `p`, an ask that auto-resolves carries `auto`: 'acts on <recommendation> at HH:MM <zone> unless answered'."""
+    out = alerts.needs_you(db, now)
+    if p is not None:
+        from . import askauto
+        cfg = p.config()
+        for m in out:
+            if m["kind"] == "ask" and (line := askauto.shown(db, cfg, m, p, now)):
+                m["auto"] = line
+    return out
 
 
 def notify_state(p: Project, db: DB) -> dict:
@@ -666,7 +674,7 @@ def state_payload(p: Project, db: DB) -> dict:
         "issues": db.q("SELECT id,source,title,severity,status,count,first_seen,last_seen,task FROM issues "
                        "WHERE status IN ('open','tracking') ORDER BY last_seen DESC LIMIT 100"),
         "schedules": sched.with_costs(db, timefmt.home(p)),
-        "attention": attention(db, now),
+        "attention": attention(db, now, p),
         "notify": notify_state(p, db),
         "feed": sorted(alerts.feed(db, now) + uncommitted_feed(db) + startgate.feed(db, warn_s, now)
                        + sweepskip.feed(db, now, tz) + slots_feed(now, p), key=lambda m: -float(m["ts"] or 0)),

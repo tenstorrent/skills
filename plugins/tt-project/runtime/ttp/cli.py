@@ -1330,9 +1330,9 @@ def status_text(p: Project, verbose: bool = False) -> str:
     from . import lease
     if lease_line := lease.status_line(p, p.config(), now):
         lines.append(lease_line)
-    for m in attention(db, now)[:6]:
+    for m in attention(db, now, p)[:6]:
         text = " ".join(m["text"].split())
-        what = f"ask {m['id']}" if m["kind"] == "ask" else "alert"
+        what = (f"ask {m['id']}" + (f"; {m['auto']}" if m.get("auto") else "")) if m["kind"] == "ask" else "alert"
         lines.append(f"  needs you ({what}, {since(m['ts'], now)} ago): {clip(text, 300)}")
     # Blocked tasks: those that wait on the user join the top; the rest are the project's to move.
     from . import waits

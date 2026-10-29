@@ -559,14 +559,18 @@ def stuck_line(eps: list[dict]) -> str:
             f"longest #{top['task']} {top['title'][:70]} {_dur(top['s'])}{' (still open)' if top['open'] else ''}")
 
 
-def record_resolve(db: DB, ask_id: int, messages: list[int], landed: list[int] | None = None) -> None:
+def record_resolve(db: DB, ask_id: int, messages: list[int], landed: list[int] | None = None,
+                   auto: str | None = None) -> None:
     """Remember that the coordinator resolved `ask_id` now, in a turn started for `messages` (the
     user messages it answered; none for a turn of its own). asks() links those messages to it.
-    `landed`: the tasks whose landing closed it instead (close_landed)."""
+    `landed`: the tasks whose landing closed it instead (close_landed). `auto`: the recommendation
+    it auto-resolved to, unanswered (coordinator.expire_asks)."""
     rec = db.kv(RESOLVED_KEY, {}) or {}
     rec[str(ask_id)] = {"ts": time.time(), "messages": [int(m) for m in messages]}
     if landed:
         rec[str(ask_id)]["landed"] = [int(t) for t in landed]
+    if auto:
+        rec[str(ask_id)]["auto"] = str(auto)[:500]
     db.set_kv(RESOLVED_KEY, dict(sorted(rec.items(), key=lambda kv: int(kv[0]))[-RESOLVED_KEEP:]))
 
 

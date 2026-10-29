@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, causefix, cells, chaincap, chainprio, chatset, checkspill, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, rejcool, relay, responsibilities, restriction_audit, reviewcap, selfreview, reviewreuse, settinghold, settled, shared, sharedchecks, startbreaker, sweep, throughmute, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import ackwait, anchors, askauto, askrethink, broadcast, budgetkind, cachettl, causefix, cells, chaincap, chainprio, chatset, checkspill, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, rejcool, relay, responsibilities, restriction_audit, reviewcap, selfreview, reviewreuse, settinghold, settled, shared, sharedchecks, startbreaker, sweep, throughmute, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -300,6 +300,8 @@ USER_SETTABLE = {
     # Hours before an unanswered ask registered with a default falls back to it; 0 turns it off.
     # New asks never get a default, so this only drains asks registered with one.
     "coordinator.ask_timeout_h": float,
+    # Minutes before an unanswered ask that is not exempt resolves to its recommendation (askauto.py); 0 never.
+    askauto.KEY: askauto.setting,
     # Days a user's yes to a charter change that failed to apply stays valid for a retry (_charter_approval).
     "coordinator.charter_approval_days": float,
     # Days a pr_approve record refuses a repeated review or merge ask (_prior_approval).
@@ -453,8 +455,11 @@ def batchable(kind: str, severity: str) -> bool:
     # An info observation (a mute that ended, a recovery) never needs a turn of its own either.
     return kind in BATCH_KINDS and (severity in ("low", "normal") or (kind == "observation" and severity == "info"))
 MAX_TASKS_PER_DAY = 1000
-ASK_DEFAULTS_KEY = "ask_defaults"   # kv: {ask message id: recommendation}; no new ask is added
+# kv: {ask message id: recommendation (an older ask with its own default, after coordinator.ask_timeout_h)
+#      or {"rec", "auto": 1} (a new ask that auto-resolves after asks.auto_resolve_min, askauto.py)}
+ASK_DEFAULTS_KEY = askauto.DEFAULTS_KEY
 _DEFAULT_NOTE = "\n\nIf there is no answer within "
+_AUTO_NOTE = "\n\nNon-blocking: "   # askauto.note on a new ask the timer resolves
 # Shown so the user can answer in one word; never applied without their answer.
 _REC_NOTE = "\n\nMy recommendation: "
 _LEAST_NOTE = "\n\nLeast-disruptive way considered: "
@@ -1059,7 +1064,10 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         pending = p.db.kv(ASK_DEFAULTS_KEY, {})
         hours = ask_timeout_h(p.config())
         for b in blockers:
-            if str(b["id"]) in pending and hours > 0:
+            v = pending.get(str(b["id"]))
+            if isinstance(v, dict) and (at := askauto.due(b["ts"], p.config())):
+                when = f"non-blocking; {askauto.note(str(v.get('rec') or ''), timefmt.short(at, p, now))}"
+            elif v is not None and not isinstance(v, dict) and hours > 0:
                 left = max(0.0, (b["ts"] + hours * 3600 - now) / 3600)
                 when = f"reversible; defaults to its recommendation in {left:.1f}h"
             else:
@@ -2436,9 +2444,15 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     text += f"{_REVERSIBLE_NOTE}{least}"
                 if rec:
                     text += f"{_REC_NOTE}{rec}"
+                auto_at = None if askauto.exempt(a["blocking"], rec) else askauto.due(time.time(), cfg)
+                if auto_at:   # shown wherever the ask is: the chat, ttp status, the web app
+                    text += f"{_AUTO_NOTE}{askauto.note(rec, timefmt.short(auto_at, p))}."
                 turn_asks.append((k, db.post("out", text, chat=None, kind="ask",
                                              severity=_norm_severity(a.get("severity") or "high"),
                                              ref=f"{prguard.BLOCKING_REF}{a['blocking']}")))
+                if auto_at:
+                    db.set_kv(ASK_DEFAULTS_KEY, {**db.kv(ASK_DEFAULTS_KEY, {}),
+                                                 str(turn_asks[-1][1]): {"rec": rec, "auto": 1}})
                 if seen:   # sent on its not_covered reason: counted for the daily audit
                     _count_refusal(db, f"{key}:reask" if key else None, "already settled (not_covered)",
                                    f"{nc} [over {seen}] {a['text'].strip()}", kind=ASK_FLAGGED_KIND)
@@ -2893,7 +2907,7 @@ def _delivery_kind(kind: str, text: str) -> tuple[str, str | None]:
 
 
 def _ask_question(text: str) -> str:
-    return text.split(_DEFAULT_NOTE)[0].split(_REC_NOTE)[0].split(_LEAST_NOTE)[0]
+    return text.split(_DEFAULT_NOTE)[0].split(_REC_NOTE)[0].split(_LEAST_NOTE)[0].split(_AUTO_NOTE)[0]
 
 
 def _same_text(a: str, b: str) -> bool:
@@ -3629,14 +3643,17 @@ def ask_timeout_h(cfg: dict) -> float:
 
 
 def expire_asks(p: Project, *, hold: bool = False, now: float | None = None) -> list[int]:
-    """Resolve asks registered with a default and left unanswered past the timeout into it.
+    """Resolve asks registered with a recommendation and left unanswered past their timeout into it.
 
-    New asks are never registered, so this only drains asks that got a default when they were
-    asked; every other ask waits for the user indefinitely. Nothing expires while `hold` is set (the project is at a
-    cap) or while a user message is unhandled, since that message may be the answer. A due ask
-    with any user message after it, handled or not, may have been answered without a `resolve`:
-    it keeps waiting for the user and the coordinator is asked to confirm instead. The user is
-    told what was decided and the coordinator gets an event to act on it. Returns expired ask ids.
+    New asks that are not exempt (askauto.exempt) are registered when sent and resolve after
+    asks.auto_resolve_min; asks registered with their own default before that drain after
+    coordinator.ask_timeout_h. Exempt asks are never registered: they wait for the user. Nothing
+    expires while `hold` is set (the project is at a cap) or while a user message is unhandled, since
+    that message may be the answer. A due ask with any user message after it, handled or not, may
+    have been answered without a `resolve`: it is not applied and the coordinator is asked to check.
+    Each resolved ask is recorded answered by its recommendation (unblock.record_resolve), so a
+    re-ask is refused like an answered one. All of a tick's expiries wake the coordinator once, in
+    one event naming each ask and its recommendation. Returns expired ask ids.
     """
     db = p.db
     if not db.kv(ASK_DEFAULTS_KEY, {}):
@@ -3644,39 +3661,62 @@ def expire_asks(p: Project, *, hold: bool = False, now: float | None = None) -> 
     now = now or time.time()
     cfg = p.config()
     hours = ask_timeout_h(cfg)
+
+    def due_at(ts: float, v) -> float | None:
+        if isinstance(v, dict):
+            return askauto.due(ts, cfg)
+        return ts + hours * 3600 if hours > 0 else None
+
+    def wait_text(v) -> str:
+        return f"{askauto.minutes(cfg):g} min" if isinstance(v, dict) else f"{hours:g}h"
+
+    def rec_of(v) -> str:
+        return str(v.get("rec") or "") if isinstance(v, dict) else str(v)
+
     with db.tx():   # re-read inside: a resolve or a new ask may land between ticks
         pending = db.kv(ASK_DEFAULTS_KEY, {})
         open_asks = {str(r["id"]): r for r in db.q(
             f"SELECT * FROM messages WHERE kind='ask' AND handled=0 AND id IN ({','.join('?' * len(pending))})",
             [int(k) for k in pending])}
         live = {k: v for k, v in pending.items() if k in open_asks}
-        due = [k for k in live if hours > 0 and open_asks[k]["ts"] + hours * 3600 <= now]
+        due = [k for k, v in live.items() if (at := due_at(open_asks[k]["ts"], v)) is not None and at <= now]
         if hold or (due and db.one("SELECT id FROM messages WHERE direction='in' AND handled=0")):
             due = []
+        lines = []
         for k in [k for k in due if db.one("SELECT id FROM messages WHERE direction='in' AND id>?", (int(k),))]:
             due.remove(k)
-            live.pop(k)
-            db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-                 (now, "daemon", "ask_timeout", "normal",
-                  f"Ask #{k} reached its {hours:g}h timeout, but the user wrote after it was asked, so its "
-                  f"recommendation was NOT applied. If the user answered it, act on the answer and `resolve` "
-                  f"it; otherwise it now waits for the user. The question was: "
-                  f"{open_asks[k]['text'].split(_DEFAULT_NOTE)[0][:300]}", "queued"))
+            v = live.pop(k)
+            then = ("act on its recommendation now, `resolve` it, memory_add the decision and notify at "
+                    f"severity low (recommendation: {rec_of(v)})" if isinstance(v, dict)
+                    else "it now waits for the user")
+            lines.append(f"Ask #{k} reached its {wait_text(v)} timeout, but the user wrote after it was asked, so "
+                         f"its recommendation was NOT applied. If the user answered it, act on the answer and "
+                         f"`resolve` it; otherwise {then}. The question was: "
+                         f"{_ask_question(open_asks[k]['text'])[:300]}")
         for k in due:
-            ask, rec = open_asks[k], live.pop(k)
+            ask, v = open_asks[k], live.pop(k)
+            rec = rec_of(v)
+            db.x("UPDATE messages SET handled=1 WHERE id=?", (ask["id"],))
+            unblock.record_resolve(db, int(k), [], auto=rec)
+            question = _ask_question(ask["text"])[:300]
+            if isinstance(v, dict):   # the coordinator acts on it and tells the user at low
+                lines.append(f"Ask #{k} got no answer in {wait_text(v)} and auto-resolved to its recommendation: "
+                             f"{rec}. Act on it now, memory_add the decision and notify at severity low; it is "
+                             f"not permission for anything beyond that choice, and every gate still applies. "
+                             f"The question was: {question}")
+                continue
             # at least high, and never under the chat floor: the user must see what was decided for them
             severity = max((ask["severity"], "high", cfg["notify"].get("chat_min_severity")),
                            key=lambda n: SEVERITY_RANK.get(n, -1))
-            db.x("UPDATE messages SET handled=1 WHERE id=?", (ask["id"],))
-            question = ask["text"].split(_DEFAULT_NOTE)[0][:300]
-            db.post("out", f"No answer to ask {k} after {hours:g}h, so I went with the recommendation: {rec}\n"
+            db.post("out", f"No answer to ask {k} after {wait_text(v)}, so I went with the recommendation: {rec}\n"
                            f"It can be reversed: reply to change it.\nThe question was: {question}",
                     chat=None, kind="alert", severity=severity)
+            lines.append(f"Ask #{k} got no answer in {wait_text(v)}. The user was told its recommendation now "
+                         f"applies: {rec}. Act on it; it is not permission for anything beyond that choice. "
+                         f"The question was: {question}")
+        if lines:   # one wake for the whole tick
             db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-                 (now, "daemon", "ask_timeout", "normal",
-                  f"Ask #{k} got no answer in {hours:g}h. The user was told its recommendation now applies: "
-                  f"{rec}. Act on it; it is not permission for anything beyond that choice. "
-                  f"The question was: {question}", "queued"))
+                 (now, "daemon", "ask_timeout", "normal", "\n".join(lines), "queued"))
         if live != pending:
             db.set_kv(ASK_DEFAULTS_KEY, live)
     return [int(k) for k in due]
