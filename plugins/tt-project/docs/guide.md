@@ -159,6 +159,14 @@ prolonged whole-box outage.
   (`coordinator.turn_budget_ceiling_usd`, 0: twice the cap, never above the hourly coordinator limit
   or the dollar caps). One that fails even then is parked and you get one alert naming every parked
   item; it runs again once you raise the cap or the ceiling. The other items go on.
+- High events that arrive close together share coordinator turns. The first one after a quiet
+  spell wakes the coordinator at once; high events within `coordinator.burst_window_s` (120 s) after
+  that turn ended start no turn of their own and are read together by one follow-up turn when the
+  window ends, so a burst costs at most two turns. They stay queued in the database, so a daemon
+  restart inside the window keeps them. User messages (answers to asks too), critical events and
+  safety-class events (spend caps, restrictions at risk, data loss, device or machine holds and
+  pauses) never wait: they start a turn at once, with the held events in it. 0 turns it off. The
+  follow-up turn's run note lists the held events under `burst`.
 - A review runs light when the diff it checks touches no `review.risky_paths` glob and no code file
   with a risky name (`review.risky_names`: state, database, schema, migration, push, budget, billing,
   spend, spend cap, release and upgrade files by default; `[]` turns it off), and is docs and tests
@@ -1579,6 +1587,7 @@ is open raises one `cap_wait` event naming the key.
 | `checks.test_project_max` | from cores and memory, at least 2 | a project's suites at once | convenience |
 | `delivery.push_batch_s` | 300 s, none after a clean batch | changes gathered into one push | convenience |
 | `delivery.push_batch_max` | 8 | most changes in one push batch (a full batch starts at once) | convenience |
+| `coordinator.burst_window_s` | 120 s (0: off) | high events after a turn high events woke, until one follow-up turn reads them all; never user messages, critical or safety-class events | convenience |
 | `retry_when` / `start_when` probe (`PROBE_EVERY_S`) | 180 s | a waiting or deferred task before its probe runs again | convenience |
 | auth re-probe (`AUTH_PROBE_S`) | 900 s | work for a logged-out provider with no login check, before one run checks it | safety (spend) |
 | `ttp lock` on a device | one command at a time | device commands | safety |

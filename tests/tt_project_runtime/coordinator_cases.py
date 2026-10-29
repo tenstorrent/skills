@@ -18396,3 +18396,138 @@ def test_rejection_cooldown_survives_a_restart_and_gates_the_daemon_turn(env, mo
     d2.maybe_coordinate()
     assert len(notes) == 2 and notes[-1]["events"]
     assert fresh.db.one("SELECT kind FROM events WHERE id=?", (notes[-1]["events"][0],))["kind"] == rejcool.KIND
+
+
+def _burst_rig(env, monkeypatch, window=None):
+    """A daemon whose coordinator turns are stubbed: each start records its note and opens a running
+    run row; `finish` ends it and settles its events as a real turn would. Time is a test clock."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    if window is not None:
+        p.set_config("coordinator.burst_window_s", window)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    p.db.x("UPDATE events SET status='handled'")
+    clock = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    rig = {"p": p, "clock": clock, "notes": []}
+
+    def daemon():
+        d = Daemon(p.base)
+        d.update_gates()
+
+        def start_run(role, prompt, *a, **k):
+            rig["notes"].append(k["note"])
+            return p.db.x("INSERT INTO runs(role,started,status,note) VALUES('coordinator',?,'running',?)",
+                          (clock[0], json.dumps(k["note"])))
+        monkeypatch.setattr(d, "start_run", start_run)
+        rig["d"] = d
+        return d
+
+    def add(severity="high", kind="observation", text=None):
+        return p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                      (clock[0], "watcher", kind, severity, text or f"a check failed at {clock[0]}", "queued"))
+
+    def tick(dt=20):
+        clock[0] += dt
+        rig["d"].maybe_coordinate()
+        return len(rig["notes"])
+
+    def finish(after=60):
+        clock[0] += after
+        run = p.db.one("SELECT id, note FROM runs WHERE role='coordinator' AND status='running'")
+        ids = json.loads(run["note"])["events"]
+        p.db.x(f"UPDATE events SET status='handled' WHERE id IN ({','.join('?' * len(ids))})", ids)
+        p.db.x("UPDATE runs SET status='ok', ended=? WHERE id=?", (clock[0], run["id"]))
+        p.db.set_kv("last_coordinator_turn", clock[0])
+
+    rig.update(daemon=daemon, add=add, tick=tick, finish=finish)
+    daemon()
+    return rig
+
+
+def test_high_events_in_a_burst_wake_the_coordinator_at_once_then_share_one_follow_up_turn(env, monkeypatch):
+    r = _burst_rig(env, monkeypatch)
+    add, tick, finish, notes = r["add"], r["tick"], r["finish"], r["notes"]
+    first = add()
+    assert tick() == 1, "the first high event after a quiet spell waits for no window"
+    assert notes[0]["events"] == [first] and "burst" not in notes[0]
+    finish(60)
+    held = []
+    for _ in range(5):
+        held.append(add())
+        assert tick() == 1, "a high event inside the window started a turn of its own"
+    held.append(add())   # still inside the window: ended + 120 s
+    assert tick(15) == 1
+    assert r["p"].db.one("SELECT COUNT(*) n FROM events WHERE status='queued'")["n"] == 6, "none dropped"
+    assert tick(30) == 2, "the window ended: one follow-up turn"
+    assert notes[1]["events"] == held, "the follow-up carries every held event"
+    assert notes[1]["burst"] == {"held": held}
+    assert "high severity event" in notes[1]["triggers"]
+    finish(60)
+    # A burst costs at most two turns; a high event after a quiet spell is immediate again.
+    r["clock"][0] += 600
+    late = add()
+    assert tick() == 3 and notes[2]["events"] == [late]
+
+
+def test_user_messages_critical_and_safety_events_are_never_held_by_a_burst_window(env, monkeypatch):
+    from ttp import bursthold
+    r = _burst_rig(env, monkeypatch)
+    p, add, tick, finish, notes = r["p"], r["add"], r["tick"], r["finish"], r["notes"]
+    turns = 0
+    for case in ("critical", "user", "kind", "text"):
+        add()
+        turns += 1
+        assert tick() == turns
+        finish(30)
+        held = add()
+        assert tick() == turns, "inside the window a plain high event waits"
+        if case == "critical":
+            urgent = add(severity="critical")
+        elif case == "user":
+            urgent = None
+            p.db.x("INSERT INTO messages(ts,direction,chat,text,handled) VALUES(?,?,?,?,0)",
+                   (r["clock"][0], "in", "c", "yes, go ahead"))
+        elif case == "kind":
+            urgent = add(kind="machine_condition")
+        else:
+            urgent = add(text="the shared device hold on the box never cleared")
+        turns += 1
+        assert tick() == turns, f"a {case} item waited for the burst window"
+        assert held in notes[-1]["events"], "the held events ride along at once"
+        if urgent:
+            assert urgent in notes[-1]["events"]
+        p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+        finish(30)
+        r["clock"][0] += 600
+    # Routine kinds of the work itself stay holdable; safety words match whole kind words only.
+    assert not bursthold.safety("task_blocked", "x") and not bursthold.safety("task_failed", "")
+    assert bursthold.safety("detached_job_spend_cap", "") and bursthold.safety("ask_timeout", "")
+    assert bursthold.safety("observation", "Spend cap reached") and not bursthold.safety("observation", "holdout")
+    # A clock that went back holds nothing on the old window.
+    p.db.set_kv(bursthold.KEY, {"run": None, "start": r["clock"][0] + 3600, "held": []})
+    assert bursthold.until(p.db, {"coordinator": {"burst_window_s": 120}}, r["clock"][0]) is None
+
+
+def test_a_daemon_restart_inside_a_burst_window_keeps_the_held_events(env, monkeypatch):
+    r = _burst_rig(env, monkeypatch)
+    add, tick, finish, notes = r["add"], r["tick"], r["finish"], r["notes"]
+    add()
+    assert tick() == 1
+    finish(60)
+    held = [add(), add()]
+    assert tick() == 1
+    r["daemon"]()   # a new daemon process: nothing held in memory
+    held.append(add())
+    assert tick() == 1, "the restarted daemon forgot the open window"
+    assert tick(100) == 2
+    assert notes[1]["events"] == held and notes[1]["burst"] == {"held": held}
+
+
+def test_a_burst_window_of_zero_turns_the_merge_off(env, monkeypatch):
+    r = _burst_rig(env, monkeypatch, window=0)
+    add, tick, finish = r["add"], r["tick"], r["finish"]
+    for n in range(1, 4):
+        add()
+        assert tick() == n, "with the window off each high event wakes its own turn"
+        finish(30)

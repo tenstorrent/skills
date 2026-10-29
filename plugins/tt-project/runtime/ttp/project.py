@@ -214,6 +214,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # Routine events (task done, follow-ups, notes, normal observations) wait up to
                     # this long for company while every worker slot is busy or runnable work is queued.
                     "batch_s": 300,
+                    # High events within this long after the turn high events woke (from its end) start
+                    # no turn of their own: one follow-up turn reads them all when it ends. User
+                    # messages, critical and safety-class events never wait (bursthold.py; 0: off).
+                    "burst_window_s": 120,
                     # The coordinator's system prompt (role, charter, STANDING, standing memory) is a
                     # snapshot, re-rendered when no turn ran for cache_ttl (the cache is cold anyway),
                     # once it is this old, or at once for a restrictions change or a charter edit on

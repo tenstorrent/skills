@@ -43,6 +43,7 @@ from . import alerts
 from . import anchors
 from . import pagesev
 from . import askrethink
+from . import bursthold
 from . import audit
 from . import redact
 from . import replica
@@ -6642,7 +6643,10 @@ class Daemon:
             debounce = float(c.get("debounce_s", 15))
             if now - newest < debounce and now - oldest < 4 * debounce:
                 return
-            if not msgs and self._batch_hold([e for e in queued if not pagesev.rides_along(e)], now):
+            own = [e for e in queued if not pagesev.rides_along(e)]   # ride-alongs neither hold nor start a turn
+            if not msgs and self._burst_hold(own, now):
+                return
+            if not msgs and self._batch_hold(own, now):
                 return
         if not msgs:
             try:
@@ -6724,7 +6728,8 @@ class Daemon:
             prompt = "\n".join(text for _, text in parts)
             head, context = coord.prompt_parts(self.p)
             context = coord.with_cached(context, cached)
-            self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
+            burst = bursthold.carried(db, evs)
+            rid = self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
                            read_only=True, schema=coord.ACTIONS_SCHEMA, system=head, context=context,
                            cache_ttl=cachettl.setting(c),
                            budget_usd=budget,
@@ -6734,7 +6739,8 @@ class Daemon:
                                  "triggers": triggers, **({"lowered": lowered} if lowered else {}),
                                  **({"corrections": {str(k): v for k, v in flagged.items()}} if flagged else {}),
                                  **({"wake_due": due} if due else {}),
-                                 "digest": {**coord.digest_size(parts), "cached_chars": len(cached)}, **({"gate": seen_now} if seen_now else {})})
+                                 "digest": {**coord.digest_size(parts), "cached_chars": len(cached)}, **({"gate": seen_now} if seen_now else {}),
+                                 **({"burst": burst} if burst else {})})
         except Exception as e:
             # A turn that cannot even start backs off like a failed turn instead of retrying every tick.
             log(self.p, "coordinator start failed: " + traceback.format_exc().replace("\n", " | ")[:2000])
@@ -6742,11 +6748,29 @@ class Daemon:
             return
         db.set_kv("last_coordinator_turn", now)
         quietgate.started(db)
+        bursthold.started(db, evs, rid, now)
         db.set_kv(coord.EFFORT_SEEN_KEY, seen)
         db.set_kv(coord.DIGEST_SEEN_KEY, shown)
         db.set_kv("idle_wake", wake)
         if logged_out:
             db.set_kv(f"auth_probe:{provider}", now)
+
+    def _burst_hold(self, queued: list[dict], now: float) -> bool:
+        """High events within coordinator.burst_window_s after the turn high events woke wait for one
+        follow-up turn when the window ends (bursthold.py). They stay queued, so a restart keeps them."""
+        db = self.p.db
+        try:
+            end = bursthold.hold(db, self.cfg, [], queued, now, coord.batchable)
+            if end is None:
+                return False
+            new = bursthold.held(db, queued)
+        except Exception:   # the hold only saves money: a failure runs the turn
+            log(self.p, "coordinator burst hold failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
+            return False
+        if new:
+            log(self.p, f"coordinator turn held (burst): high events {new} wait {end - now:.0f} s for one turn "
+                f"with the others since the last turn")
+        return True
 
     def _batch_hold(self, evs: list[dict], now: float) -> bool:
         """Routine events (a task done, its follow-ups and notes, normal upstream notes, info to normal
