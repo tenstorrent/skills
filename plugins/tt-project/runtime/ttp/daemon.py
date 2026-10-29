@@ -49,6 +49,7 @@ from . import schedlog
 from . import throughmute
 from . import probespawn
 from . import urgent
+from . import boundedchild
 from . import replymsg
 from . import msgparts
 from . import awake
@@ -293,6 +294,10 @@ NOT_YET_RCS = (1, 75, 255)   # probe exits meaning "not yet": 1, EX_TEMPFAIL (a 
 JOB_FAILED = "detached job failed"   # what a `ttp detach --check` exit detach.FAILED_RC found (Daemon._job_failed)
 PROBE_TIMEOUT_S = 60
 LANDED_REPROBE_S = 30   # a landing gate reruns after a recorded push at most this often (_start_probe_due)
+# A child the tick itself waits on (a device runner start, `ttp checks --detach`) runs in a session of
+# its own and is killed whole after this: under a minute, so one never holds a step past STEP_BUDGET_S.
+INLINE_CHILD_S = 50
+HARNESS_HEAD_S = 10
 # A task asleep on its retry_when wakes once when its spec changes (Daemon._spec_wake): its hand-off keeps
 # the spec's digest it slept on (SPEC_SEEN_KEY) and its recent spec-change wakes (SPEC_WAKES_KEY), at most
 # SPEC_WAKES_PER_H an hour (a loop guard).
@@ -1090,13 +1095,17 @@ class Daemon:
             hang = self.p.db.kv("daemon_hang")   # ttp.watchdog restarted a hung daemon: this one ticks
             if hang and hang.get("pid") != os.getpid():
                 self.p.db.set_kv("daemon_hang", None)
-            try:
-                head = subprocess.run(["git", "-C", str(self.p.harness), "rev-parse", "HEAD"], capture_output=True,
-                                      text=True, timeout=30)
-                if head.returncode == 0:
-                    self.p.db.set_kv("harness_good", {"commit": head.stdout.strip(), "ts": time.time()})
-            except (OSError, subprocess.SubprocessError):
-                pass
+            self._record_harness_head()
+
+    def _record_harness_head(self) -> None:
+        """kv harness_good: the harness commit this daemon ticks on. git runs in a session of its own,
+        killed whole after HARNESS_HEAD_S: a stalled git never holds the tick."""
+        head = boundedchild.run(["git", "-C", str(self.p.harness), "rev-parse", "HEAD"], HARNESS_HEAD_S,
+                                stderr="devnull", grace=1)
+        if head.rc == 0:
+            self.p.db.set_kv("harness_good", {"commit": head.out.strip(), "ts": time.time()})
+        elif head.timed_out:
+            log(self.p, f"harness head not recorded: git rev-parse {head.error}")
 
     def _stacks_file(self):
         """The open STACKS_FILE (register_stack_dump), else state/STACKS_FILE opened for appending."""
@@ -9018,13 +9027,16 @@ class Daemon:
         argv = (["nice", "-n", str(level)] if level else []) + [sys.executable, "-m", "ttp", "checks", "--detach", "--no-prestage", *extra]
         try:
             out.mkdir(parents=True, exist_ok=True)
-            r = subprocess.run(argv, cwd=path, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                               timeout=PROBE_TIMEOUT_S)
-        except (OSError, subprocess.SubprocessError) as e:
+        except OSError as e:
             log(self.p, f"task {tid}: checks not started: {e}")
             return False
-        if r.returncode:
-            log(self.p, f"task {tid}: checks not started: {(r.stderr or r.stdout).strip()[:300]}")
+        # Its own session, killed whole on timeout (`--detach` starts the checks in a session of their own).
+        r = boundedchild.run(argv, INLINE_CHILD_S, cwd=str(path), env=env, grace=1)
+        if r.rc is None:
+            log(self.p, f"task {tid}: checks not started: {r.error}")
+            return False
+        if r.rc:
+            log(self.p, f"task {tid}: checks not started: {(r.err or r.out).strip()[:300]}")
             return False
         return True
 
@@ -9270,6 +9282,7 @@ class Daemon:
                 self._report_runner(runner, f"went down again after {cap} restarts today", st.get("error") or "", tid)
                 db.set_kv(waitheal.RUNNER_RESTARTS_KEY, {**every, runner: st})
             return
+        self._step_over(f"device runner {runner} restart", tid)   # a slow start shows in tick_step_slow
         rc, out = self._devq_start(runner)
         ok = rc in (0, waitheal.DEVQ_RUNNER_DOWN_RC)   # 3: an outside device user still runs, not a failure
         st.update(last=now, n=int(st.get("n") or 0) + 1, fails=0 if ok else int(st.get("fails") or 0) + 1,
@@ -9290,13 +9303,13 @@ class Daemon:
         self._progress()
 
     def _devq_start(self, runner: str) -> tuple[int, str]:
-        try:
-            r = subprocess.run([sys.executable, "-m", "ttp", "devq", "start", runner], cwd=str(self.p.root),
-                               env=self._probe_env(), stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                               timeout=2 * PROBE_TIMEOUT_S + 30)
-        except (OSError, subprocess.SubprocessError) as e:
-            return 1, f"{type(e).__name__}: {e}"
-        return r.returncode, f"{r.stdout or ''} {r.stderr or ''}".strip()
+        """`ttp devq start runner` in a session of its own, killed whole after INLINE_CHILD_S (the runner it
+        starts runs in a session of its own). A start that did not finish is a failed one: rc 1."""
+        r = boundedchild.run([sys.executable, "-m", "ttp", "devq", "start", runner], INLINE_CHILD_S,
+                             cwd=str(self.p.root), env=self._probe_env(), grace=1)
+        if r.rc is None:
+            return 1, f"{r.error} {r.out or ''} {r.err or ''}".strip()
+        return r.rc, f"{r.out or ''} {r.err or ''}".strip()
 
     def _report_runner(self, runner: str, why: str, error: str, tid: int) -> None:
         """One low line for the user and one open harness task to fix the runner."""

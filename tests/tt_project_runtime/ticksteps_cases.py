@@ -185,3 +185,72 @@ def test_the_daemons_checks_start_skips_a_pre_stage_longer_than_its_inline_bound
     assert d._restart_checks(tid, again, {"worktree": str(path), "head": head, "cmd": ["true"]}, "r1") == ""
     assert _wait_precheck(again) == "0", (again / cli.CHECKS_OUT).read_text()
     assert not mark.exists(), "the daemon's start ran the pre-stage"
+
+
+def _hung_child(tmp_path, name="hung"):
+    """An executable that leaves a grandchild in its group (its pid in `<name>.pid`) and hangs."""
+    exe, pidf = tmp_path / name, tmp_path / f"{name}.pid"
+    exe.write_text(f"#!/bin/sh\nsleep 300 &\necho $! > {pidf}\nsleep 300\n")
+    exe.chmod(0o755)
+    return exe, pidf
+
+
+def _gone(pidf):
+    pid = int(pidf.read_text().strip())
+    for _ in range(50):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                if f.read().split(") ")[-1].startswith("Z"):
+                    return True
+        except OSError:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def test_a_hung_device_runner_start_is_killed_whole_within_its_bound(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    exe, pidf = _hung_child(tmp_path)
+    monkeypatch.setattr(dmod.sys, "executable", str(exe))
+    monkeypatch.setattr(dmod, "INLINE_CHILD_S", 1)
+    assert dmod.INLINE_CHILD_S < dmod.STEP_BUDGET_S
+    t0 = time.monotonic()
+    rc, out = d._devq_start("r1")
+    assert time.monotonic() - t0 < 5, "the tick waited on the hung start"
+    assert rc == 1 and "timed out" in out
+    assert _gone(pidf), "the start's grandchild outlived it"
+
+
+def test_a_hung_checks_start_is_killed_whole_within_its_bound(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    exe, pidf = _hung_child(tmp_path)
+    monkeypatch.setattr(dmod.sys, "executable", str(exe))
+    monkeypatch.setattr(dmod, "INLINE_CHILD_S", 1)
+    t0 = time.monotonic()
+    assert d._start_checks(p.root, tmp_path / "run", "r1", 1, []) is False
+    assert time.monotonic() - t0 < 5, "the tick waited on the hung checks start"
+    assert _gone(pidf), "the checks start's grandchild outlived it"
+
+
+def test_a_hung_harness_head_git_is_killed_whole_within_its_bound(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    _, pidf = _hung_child(bindir, "git")
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    monkeypatch.setattr(dmod, "HARNESS_HEAD_S", 1)
+    t0 = time.monotonic()
+    d._record_harness_head()
+    assert time.monotonic() - t0 < 5, "the tick waited on the hung git"
+    assert p.db.kv("harness_good") is None
+    assert _gone(pidf), "git's grandchild outlived it"
