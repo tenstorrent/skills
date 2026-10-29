@@ -8,7 +8,8 @@ without the head, plus the repository), pid, arrival and phase (waiting, running
 A run that is still waiting looks at the others (target) and stops waiting when
 
 - the same task's same checks on the same head wait ahead of it or run now: it joins them;
-- the same task queued the same checks on a newer head (a later commit time): it is superseded.
+- the same task queued the same checks on a newer head (a later commit time) that runs, waits or ended
+  while this one waited: it is superseded (a newer head that ended before this run queued is not).
 
 Either way it leaves the queue, follows that run (through any run it joined in turn) and reports that
 run's outcome (finish) as its own: passed, failed or timed out, naming the head that ran, never a pass
@@ -138,16 +139,25 @@ def _order(r: dict) -> tuple:
     return (float(r.get("arrived") or 0), float(r.get("ts") or 0), str(r.get("id") or ""))
 
 
+def _while_waiting(r: dict, me: dict) -> bool:
+    """Whether run r was live while `me` waited: no outcome yet and alive, or an outcome recorded after
+    `me` registered (it ran and ended between two polls). One that ended before `me` queued is not."""
+    if done := r.get("outcome"):
+        return float(done.get("ts") or 0) > float(me.get("ts") or 0)
+    return bool(r.get("alive"))
+
+
 def target(me: dict, recs: list[dict]) -> tuple[dict, str] | None:
     """(the run this waiting run should follow, joined or superseded), or None to keep waiting.
-    Superseded: the same task's group on another head with a later commit time, live or finished.
+    Superseded: the same task's group on another head with a later commit time, live now or ended
+    while this run waited (never one that ended before it queued: that older head runs its own checks).
     Joined: the same key, waiting ahead of it or running now (a running one first)."""
     if not me.get("task"):
         return None
     others = [r for r in recs if r.get("id") != me.get("id") and r.get("task") == me.get("task")]
     newer = [r for r in others if r.get("group") == me.get("group")
              and r.get("head") != me.get("head") and float(r.get("commit_ts") or 0) > float(me.get("commit_ts") or 0)
-             and (r.get("outcome") or r.get("alive"))]
+             and _while_waiting(r, me)]
     if newer:
         return max(newer, key=lambda r: (float(r.get("commit_ts") or 0), _order(r))), SUPERSEDED
     same = [r for r in others if r.get("key") == me.get("key") and r.get("alive") and not r.get("outcome")

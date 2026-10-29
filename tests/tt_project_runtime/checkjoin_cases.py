@@ -26,11 +26,23 @@ def test_checkjoin_target_joins_the_same_checks_supersedes_an_older_head_and_not
     assert cj.target(me, [me, _join_rec("t", task="8", key="k", phase="running", group="g8")]) is None
     assert cj.target(me, [me, _join_rec("dead", phase="running", alive=False)]) is None
     assert cj.target(me, [me, _join_rec("over", phase="running", outcome={"passed": True})]) is None
-    # A newer head (later commit time) of the same task's same checks supersedes this waiter, live or finished.
+    # A newer head (later commit time) of the same task's same checks supersedes this waiter while live,
+    # or once it ended after this waiter queued (it ran and finished between two polls).
     newer = _join_rec("new", head="b" * 40, commit_ts=200.0, key="k-b", arrived=40.0)
     assert cj.target(me, [me, newer]) == (newer, cj.SUPERSEDED)
-    done = _join_rec("new", head="b" * 40, commit_ts=200.0, key="k-b", alive=False, outcome={"passed": False})
+    done = _join_rec("new", head="b" * 40, commit_ts=200.0, key="k-b", alive=False,
+                     outcome={"passed": False, "ts": 25.0})
     assert cj.target(me, [me, done])[1] == cj.SUPERSEDED
+    # Live when this waiter queued, ended before its first poll: still superseded.
+    early = _join_rec("new", head="b" * 40, commit_ts=200.0, key="k-b", arrived=5.0, alive=False,
+                      outcome={"passed": True, "ts": 21.0})
+    assert cj.target(me, [me, early])[1] == cj.SUPERSEDED
+    # Ended before this waiter queued (outcome before its registration), dead or still exiting: not
+    # superseded, whatever the outcome or field types; the older head runs its own checks.
+    for alive in (False, True):
+        for out in ({"passed": True, "ts": 19.0}, {"passed": False, "ts": "19"}, {"passed": True}):
+            gone = _join_rec("new", head="b" * 40, commit_ts=200.0, key="k-b", arrived=1.0, alive=alive, outcome=out)
+            assert cj.target(me, [me, gone]) is None, (alive, out)
     # An older head never supersedes a newer one, nor does another group's newer head.
     assert cj.target({**newer, "id": "n2"}, [me, {**newer, "id": "n2"}]) is None
     assert cj.target(me, [me, {**newer, "group": "g2"}]) is None
@@ -224,6 +236,38 @@ def test_a_newer_head_supersedes_an_older_waiter_which_reports_that_heads_result
     assert res["head"] == newer != own and res["joined"] == {"how": "superseded", "run": "run-lead",
                                                              "pid": lead_proc.pid, "own_head": own}
     assert f"{own[:12]} itself was not checked" in capsys.readouterr().out
+
+
+def test_an_older_head_queued_after_a_newer_heads_checks_ended_runs_its_own_checks(env, tmp_path, monkeypatch,
+                                                                                   capsys):
+    """A task that resets to drop a bad commit, or checks its base in a second worktree: the newer head's
+    run that ended before this one queued (pass or fail) supersedes nothing."""
+    from ttp import checkjoin, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_TASK", "7")
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.02")
+    real = cli._checks_join_register
+
+    def register(p_, top, head, todo, purpose, env_, run_dir, arrived):
+        me = real(p_, top, head, todo, purpose, env_, run_dir, arrived)
+        rec = checkjoin.read(me)
+        lead = checkjoin.register(p_.state, task=rec["task"], head="b" * 40, commit_ts=rec["commit_ts"] + 60,
+                                  key="newer-key", group=rec["group"], run="run-lead", arrived=arrived - 980,
+                                  now=rec["ts"] - 990)
+        checkjoin.update(lead, phase=checkjoin.RUNNING,
+                         outcome={"passed": True, "head": "b" * 40, "rc": 0, "ts": rec["ts"] - 1.0})
+        return me
+
+    monkeypatch.setattr(cli, "_checks_join_register", register)
+    ran = tmp_path / "ran"
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", "sh", "-c", f"touch {ran}; exit 3"])
+    assert e.value.code == 1, "its own failing check, not the newer head's pass"
+    own = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    assert ran.exists(), "its own checks ran"
+    res = json.loads((run / "checks.json").read_text())
+    assert res["head"] == own and res["passed"] is False and not res.get("joined"), res
+    assert "superseded" not in capsys.readouterr().out
 
 
 def test_a_follower_whose_lead_ends_without_a_result_queues_again_and_runs(env, tmp_path, monkeypatch):

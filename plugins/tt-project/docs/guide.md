@@ -936,7 +936,8 @@ queues behind routine work; nothing running is interrupted:
   run now. It leaves the queue, runs nothing and reports that run's outcome (passed, failed or timed out, exit 1
   on a failure). A waiter is superseded when the same task queues the same checks on a newer head (a later commit
   time): it reports the newer head's result, naming that head and saying its own head was not checked, never a
-  pass of its own. A run that has started is never stopped, and another command, environment, purpose, task or
+  pass of its own. A newer head's checks that ended before the waiter queued supersede nothing: an older head
+  queued later (after a reset, or a second worktree) runs its own checks. A run that has started is never stopped, and another command, environment, purpose, task or
   repository is never a duplicate. If the run it follows ends without a result, the waiter queues again in its
   old place. `ttp checks status` and `ttp status` list joined and superseded waiters, and the `--result` probe
   says the run waits on another. A run's check commands stop at a wall-time cap: on by
