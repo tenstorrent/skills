@@ -3,19 +3,40 @@
 """A deferred task's start_when gate as status and the web app show it: its last result (exit code
 and a short reason), when it last ran and how long it has said not yet. The daemon records each
 verdict (probe_deferred); past `waiting.start_gate_warn_s` still false while the daemon ran (a host
-down for hours is no staleness) it is a warning in the feed (state 'status', clears itself once the
-gate passes), never a 'needs you' item. A `landed:#<id>` gate whose producer is approved or in a
-batch in the push queue names that instead: it is waiting, not stale. Model-free."""
+down for hours is no staleness) a stuck gate (stuck) is a warning in the feed (state 'status', clears
+itself once the gate passes), never a 'needs you' item. A healthy not-yet (exit 1, 75 or 255 of a
+gate that can still pass) is no warning however long it lasts: the progress check's probe stall
+(once per wait) and the coordinator's defer_max_days cover a gate that never passes. Stuck is a
+broken verdict (another exit, a timeout, a probe that cannot start) or a `landed:#<id>` gate whose
+producer is abandoned, failed or cancelled, whose change is pushed yet the gate still says not
+yet, or that nothing open can land (deadwait.path). A `landed:#<id>` gate whose producer is approved
+or in a batch in the push queue names that instead: it is waiting, not stale.
+
+Cadence (every): a start_when probe runs every PROBE_EVERY_S at first; a healthy not-yet of an
+arbitrary command (a remote head, an API) backs off with the wait's length, up to MAX_EVERY_S. A
+gate on a landing, a time, the task's own job or another local clock never backs off, and a
+landing gate reruns on the tick after the push queue records a push (Daemon._start_probe_due).
+Model-free."""
 from __future__ import annotations
 
 import json
 
-from . import landed
+import re
+
+from . import deadwait, landed
 from .db import deferral
 
 KEY = "start_gates"   # kv: task id -> {when, rc, reason, at, since, run_s} of its start_when's last verdict
 WARN_S = 1800         # default of waiting.start_gate_warn_s
 GAP_S = 900           # verdicts come every few minutes; a longer gap was the daemon down: only this much counts
+NOT_YET = (1, 75, 255)   # daemon.NOT_YET_RCS: a healthy not-yet
+PROBE_EVERY_S = 180      # daemon.PROBE_EVERY_S: a start_when probe's first cadence
+MAX_EVERY_S = 600        # the longest a healthy not-yet of an arbitrary command waits between runs
+BACKOFF_DIV = 6          # its interval: the wait so far over this, between the two above
+# Gates that never back off: a landing, a time, the task's own job, a push, checks, CI, a reply, a fix.
+_PROMPT_RE = re.compile(r"^\s*landed:|ttp landed|detach --check|checks --result|push --result|\bttp ci\b|"
+                        r"ack-wait|upstream --fixed|^\s*test \"\$\(date")
+_DEAD = ("failed", "cancelled")
 _STATES = {"review": "in review", "pushing": "being pushed", "done": "done, not on the branch yet"}
 
 
@@ -68,18 +89,47 @@ def view(db, task: dict, now: float, warn_s: float, gates: dict | None = None) -
     rc = g.get("rc")
     false_s = now - float(g.get("since") or now)
     run_s = float(g.get("run_s") or 0) + _gap(now - float(g.get("at") or now))   # none recorded: from its next verdict
-    warn = bool(warn_s) and run_s >= warn_s
+    long = bool(warn_s) and run_s >= warn_s
     text = (f"gate {'not yet' if rc in (1, 75, 255) else 'broken'} "
             f"({rc if isinstance(rc, str) else f'exit {rc}'}: {g.get('reason') or '?'}), "
             f"checked {_ago(now - float(g.get('at') or now))} ago, false for {_ago(false_s)}")
     if false_s - run_s >= GAP_S:
         text += f" ({_ago(run_s)} of it with the daemon running)"
-    if warn and (queued := push_state(db, when)):
-        warn, text = False, f"{text}; {queued}"
-    elif warn:
-        text += f"; warning: still false after {_ago(warn_s)} of daemon time, check the gate is not stale"
+    warn = False
+    if long and (queued := push_state(db, when)):
+        text = f"{text}; {queued}"
+    elif long and (why := stuck(db, when, rc)):
+        warn = True
+        text += f"; warning: still false after {_ago(warn_s)} of daemon time ({why}), check the gate is not stale"
     return {"text": text, "warn": warn, "rc": rc, "reason": g.get("reason"), "at": g.get("at"),
             "since": g.get("since")}
+
+
+def stuck(db, when: str, rc) -> str:
+    """Why gate `when` with verdict `rc` is stuck, '' when it is a healthy not-yet (module doc)."""
+    if rc not in NOT_YET:
+        return "broken"
+    refs = landed.task_refs(when)
+    if not (refs and refs[0].isdigit() and (t := db.task(int(refs[0])))):
+        return ""
+    x = t["id"]
+    if (gone := landed.abandoned(db, x)) or t["status"] in _DEAD:
+        return f"producer #{x} {'abandoned' if gone else t['status']}"
+    ids = set(landed.carriers(db, x)) | {x}
+    if db.one(f"SELECT 1 FROM push_queue WHERE status IN ('pushed','landed') "
+              f"AND task IN ({','.join('?' * len(ids))})", tuple(sorted(ids))):
+        return f"#{x}'s change is pushed"
+    return "" if deadwait.path(db, x, set()) else f"nothing open can land #{x}"
+
+
+def every(when: str, rc, waited_s: float, base: float = PROBE_EVERY_S) -> float:
+    """Seconds between runs of start_when probe `when` whose last verdict is `rc` after `waited_s` of
+    saying not yet: `base` (the daemon's PROBE_EVERY_S), backing off to MAX_EVERY_S / PROBE_EVERY_S
+    times it for a healthy not-yet of an arbitrary command (module doc). A broken verdict keeps the
+    first cadence: a fix to its probe shows soon."""
+    if rc not in NOT_YET or _PROMPT_RE.search(when or "") or landed.probe_command(when) != when:
+        return base
+    return base * min(MAX_EVERY_S / PROBE_EVERY_S, max(1.0, waited_s / BACKOFF_DIV / PROBE_EVERY_S))
 
 
 def push_state(db, when: str) -> str | None:

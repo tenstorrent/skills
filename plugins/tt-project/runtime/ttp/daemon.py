@@ -277,6 +277,7 @@ PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` (or a deferred
 NOT_YET_RCS = (1, 75, 255)   # probe exits meaning "not yet": 1, EX_TEMPFAIL (a busy `ttp lock`), ssh unreachable
 JOB_FAILED = "detached job failed"   # what a `ttp detach --check` exit detach.FAILED_RC found (Daemon._job_failed)
 PROBE_TIMEOUT_S = 60
+LANDED_REPROBE_S = 30   # a landing gate reruns after a recorded push at most this often (_start_probe_due)
 # A task asleep on its retry_when wakes once when its spec changes (Daemon._spec_wake): its hand-off keeps
 # the spec's digest it slept on (SPEC_SEEN_KEY) and its recent spec-change wakes (SPEC_WAKES_KEY), at most
 # SPEC_WAKES_PER_H an hour (a loop guard).
@@ -8148,6 +8149,9 @@ class Daemon:
         for tid in [k for k in self._start_rc if k not in ids]:
             del self._start_rc[tid]   # started, cancelled or no longer deferred
         startgate.forget(db, keep=ids)
+        gates = (db.kv(startgate.KEY, {}) or {}) if deferred else {}
+        pushed = (db.one("SELECT MAX(updated) m FROM push_queue WHERE status IN ('pushed','landed')") or {}).get("m") \
+            if deferred else None
         order = self._resume_order("probe_deferred", deferred)
         for i, t in enumerate(order):
             if self._step_over(f"task #{t['id']}'s start_when probe", t["id"]) and i:
@@ -8161,7 +8165,7 @@ class Daemon:
                 self._deferral_event(t, since, "deferral_expired",
                                      f"its start_when has not passed in {max_days:g} days: {d['when'][:300]}")
             self._drop_stale_probe(t["id"], d["when"])
-            if t["id"] in self._probes or now - self._probed.get(t["id"], 0) < PROBE_EVERY_S:
+            if not self._start_probe_due(t["id"], d["when"], gates.get(str(t["id"])), pushed, now):
                 continue
             if landed.missing_task_refs(db, d["when"]):
                 continue   # it can never pass: _raise_missing_task_refs raised it, once
@@ -8183,6 +8187,20 @@ class Daemon:
         except Exception:
             log(self.p, "lane waits: " + traceback.format_exc().replace("\n", " | ")[:1000])
         self.release_review_holds(now)
+
+    def _start_probe_due(self, tid: int, when: str, gate: dict | None, pushed: float | None, now: float) -> bool:
+        """Whether task `tid`'s start_when probe runs now: none of it running, and its cadence
+        (startgate.every: a healthy not-yet of an arbitrary command backs off with the wait's length)
+        passed since its last run. A landing gate also runs on the tick after the push queue records a
+        push (`pushed`, the newest pushed or landed row's time), so it starts within about a tick."""
+        if tid in self._probes:
+            return False
+        last = self._probed.get(tid, 0)
+        g = gate if gate and gate.get("when") == when else {}
+        if now - last >= startgate.every(when, g.get("rc"), now - float(g.get("since") or now), PROBE_EVERY_S):
+            return True
+        landing = landed.probe_command(when, self.p) != when
+        return landing and pushed is not None and pushed > last and now - last >= LANDED_REPROBE_S
 
     def _dead_landed_waits(self, deferred: list[dict], now: float) -> None:
         """deadwait.check over the queued tasks whose start_when is exactly `landed:#<id>`: one event

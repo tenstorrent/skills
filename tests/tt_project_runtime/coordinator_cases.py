@@ -11495,8 +11495,9 @@ def test_a_start_when_that_waits_for_hours_on_a_device_resource_raises_one_event
 
 def test_a_false_start_when_shows_its_last_result_and_age_and_warns_only_past_the_threshold(env):
     """A deferred task's start_when gate shows its last result (exit code and the probe's last word),
-    when it last ran and how long it has said not yet, in ttp status and the web app's task row. Past
-    waiting.start_gate_warn_s it is a warning in the feed (a status row), never a 'needs you' item."""
+    when it last ran and how long it has said not yet, in ttp status and the web app's task row. A healthy
+    not-yet stays quiet however long it waits; a stuck gate (here a broken exit code) past
+    waiting.start_gate_warn_s is a warning in the feed (a status row), never a 'needs you' item."""
     from ttp import startgate
     from ttp.cli import status_text
     from ttp.daemon import Daemon
@@ -11515,12 +11516,18 @@ def test_a_false_start_when_shows_its_last_result_and_age_and_warns_only_past_th
     row = next(t for t in state_payload(p, p.db)["tasks"] if t["id"] == tid)
     assert row["gate"]["rc"] == 1 and not row["gate"]["warn"] and "false for 20 min" in row["gate"]["text"]
     assert not [m for m in state_payload(p, p.db)["feed"] if m["kind"] == "gate"]
-    # Past the threshold (first false 40 min ago): a warning, in the feed as a status row.
+    # Past the threshold (first false 40 min ago) but a healthy not-yet: no warning.
     gates = p.db.kv(startgate.KEY)
     gates[str(tid)]["since"], gates[str(tid)]["run_s"] = now - 40 * 60, 38 * 60   # the daemon ran throughout
     p.db.set_kv(startgate.KEY, gates)
     line = next(ln for ln in status_text(p).splitlines() if f"#{tid} deferred" in ln)
-    assert "false for 40 min; warning: still false after 30 min" in line, line
+    assert "false for 40 min" in line and "warning" not in line, line
+    assert not [m for m in state_payload(p, p.db)["feed"] if m["kind"] == "gate"]
+    # A broken probe (exit 2) past the threshold: a warning, in the feed as a status row.
+    gates[str(tid)]["rc"] = 2
+    p.db.set_kv(startgate.KEY, gates)
+    line = next(ln for ln in status_text(p).splitlines() if f"#{tid} deferred" in ln)
+    assert "false for 40 min; warning: still false after 30 min of daemon time (broken)" in line, line
     pay = state_payload(p, p.db)
     assert next(t for t in pay["tasks"] if t["id"] == tid)["gate"]["warn"]
     rows = [m for m in pay["feed"] if m["kind"] == "gate"]
@@ -11566,7 +11573,8 @@ def test_a_landed_start_gate_names_its_producers_state(env):
 def test_a_start_gate_warns_on_daemon_running_time_not_wall_time(env):
     """The stale-gate warning counts only time the daemon ran: a host down for 40 h between two
     verdicts adds at most startgate.GAP_S, so a gate set before the outage is not called stale
-    on the daemon's first verdicts back; it warns once 30 min of daemon time have passed."""
+    on the daemon's first verdicts back; a stuck one (a broken probe) warns once 30 min of daemon
+    time have passed."""
     from ttp import startgate
     from ttp.daemon import Daemon
     p = make(env)
@@ -11574,18 +11582,110 @@ def test_a_start_gate_warns_on_daemon_running_time_not_wall_time(env):
     tid = p.db.add_task("bench", "s", kind="work", tier="light", origin="user",
                         labels=["start_when:test -e /nonexistent/marker", f"deferred_since:{time.time()}"])
     now = time.time()
-    d._start_verdict(p.db.task(tid), 1, now - 40 * 3600 - 300)   # set, then the host went down
-    d._start_verdict(p.db.task(tid), 1, now - 120)               # back up
+    d._start_verdict(p.db.task(tid), 2, now - 40 * 3600 - 300)   # set, then the host went down
+    d._start_verdict(p.db.task(tid), 2, now - 120)               # back up
     v = startgate.view(p.db, p.db.task(tid), now, 1800)
     assert not v["warn"] and "warning" not in v["text"], v
     assert "false for 40.1 h (17 min of it with the daemon running)" in v["text"], v["text"]
     assert not startgate.feed(p.db, 1800, now)
     for k in range(1, 6):   # the daemon keeps running: 3-min verdicts until 32 min of daemon time
-        d._start_verdict(p.db.task(tid), 1, now - 120 + k * 180)
+        d._start_verdict(p.db.task(tid), 2, now - 120 + k * 180)
     later = now - 120 + 5 * 180
     v = startgate.view(p.db, p.db.task(tid), later, 1800)
     assert v["warn"] and "warning: still false after 30 min of daemon time" in v["text"], v["text"]
     assert len(startgate.feed(p.db, 1800, later)) == 1
+
+
+def test_a_healthy_long_start_gate_never_warns_and_a_stuck_one_names_why(env):
+    """A gate that keeps answering not yet (exit 1) is a healthy wait however long it lasts: no warning,
+    no feed row. Only a stuck one warns past the threshold: a broken exit code, or a landed:# gate whose
+    producer failed or that nothing open can land."""
+    from ttp import startgate
+    p = make(env)
+    now = time.time()
+    tid = p.db.add_task("bench", "s", kind="work", tier="light", origin="user",
+                        labels=["start_when:test -e /nonexistent/marker", f"deferred_since:{now}"])
+    for rc, warns in ((1, False), (75, False), (255, False), (2, True), (124, True)):
+        startgate.record(p.db, tid, "test -e /nonexistent/marker", rc, "x", now - 6 * 3600)
+        gates = p.db.kv(startgate.KEY)
+        gates[str(tid)].update(at=now - 60, run_s=6 * 3600)          # six hours of daemon time
+        p.db.set_kv(startgate.KEY, gates)
+        v = startgate.view(p.db, p.db.task(tid), now, 1800)
+        assert v["warn"] is warns and ("warning" in v["text"]) is warns, (rc, v["text"])
+        assert bool(startgate.feed(p.db, 1800, now)) is warns
+        startgate.forget(p.db, tid=tid)
+    prod = p.db.add_task("producer", "s", kind="code", origin="user")
+    p.db.update_task(prod, status="review")
+    when = f"landed:#{prod}"
+    cons = p.db.add_task("consumer", "s", kind="work", tier="light", origin="user",
+                         labels=[f"start_when:{when}", f"deferred_since:{now}"])
+    startgate.record(p.db, cons, when, 1, "x", now - 6 * 3600)
+    gates = p.db.kv(startgate.KEY)
+    gates[str(cons)].update(at=now - 60, run_s=6 * 3600)
+    p.db.set_kv(startgate.KEY, gates)
+    assert startgate.stuck(p.db, when, 1) == ""
+    assert not startgate.view(p.db, p.db.task(cons), now, 1800)["warn"], "a producer in review can still land"
+    p.db.update_task(prod, status="failed")
+    assert startgate.stuck(p.db, when, 1) == f"producer #{prod} failed"
+    v = startgate.view(p.db, p.db.task(cons), now, 1800)
+    assert v["warn"] and f"(producer #{prod} failed)" in v["text"], v["text"]
+
+
+def test_start_when_probes_back_off_on_a_long_healthy_wait_within_a_cap(env):
+    """A healthy not-yet start_when probe runs every PROBE_EVERY_S at first, then less often the longer
+    it waits, at most every MAX_EVERY_S. A broken probe and the probes that must notice their condition
+    promptly (landed:#, ttp landed, detach/checks results, ttp ci, ack-wait, date waits) keep the base."""
+    from ttp import startgate
+    base, cap = startgate.PROBE_EVERY_S, startgate.MAX_EVERY_S
+    probe = "ssh box-a test -e /tmp/ready"
+    assert startgate.every(probe, 1, 0) == base
+    assert base < startgate.every(probe, 1, 1800) < cap
+    assert startgate.every(probe, 1, 6 * 3600) == startgate.every(probe, 75, 48 * 3600) == cap
+    assert startgate.every(probe, 2, 6 * 3600) == base, "a broken probe is not backed off"
+    for prompt in ("landed:#12", "ttp landed --task 12", "ttp detach --check run/x", "ttp checks --result ab",
+                   "ttp ci --repo o/r --branch b", "ttp ack-wait probe --from a --hash 1",
+                   "ttp upstream --fixed ab", 'test "$(date +%s)" -ge 1900000000'):
+        assert startgate.every(prompt, 1, 6 * 3600) == base, prompt
+    assert startgate.every(probe, 1, 6 * 3600, base=0) == 0, "a zero base (tests) stays zero"
+
+
+def test_a_backed_off_start_when_probe_still_starts_its_task_once_true(env):
+    """A probe whose wait has backed off is due again at the cap and starts the task once its condition
+    holds; a landed:# gate is re-probed LANDED_REPROBE_S after a push row lands, not at its interval."""
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    from ttp import startgate
+    p = make(env)
+    flag = env["tmp"] / "ready.flag"
+    assert coord.apply(p, [{"type": "task_add", "title": "after the run", "spec": "s",
+                            "start_when": f"test -f {flag}"}]) == []
+    tid = _added(p, "after the run")
+    d = dmod.Daemon(p.base)
+    _settle_deferred(d, tid)
+    assert not _ready(p, tid)
+    gates = p.db.kv(startgate.KEY)
+    gates[str(tid)]["since"] -= 6 * 3600                               # six hours of not yet
+    p.db.set_kv(startgate.KEY, gates)
+    now = time.time()
+    when, g = f"test -f {flag}", p.db.kv(startgate.KEY)[str(tid)]
+    d._probed[tid] = now - startgate.MAX_EVERY_S + 60
+    assert not d._start_probe_due(tid, when, g, None, now), "backed off: not due before the cap"
+    flag.write_text("")
+    _settle_deferred(d, tid)
+    assert not _ready(p, tid), "not probed before the cap"
+    d._probed[tid] = time.time() - startgate.MAX_EVERY_S - 1
+    _settle_deferred(d, tid)
+    assert _ready(p, tid), "due at the cap: the passing probe starts the task"
+    # landed:# keeps the base interval, and a recorded push makes it due after LANDED_REPROBE_S.
+    lw, g = "landed:#99", {"when": "landed:#99", "rc": 1, "since": now - 6 * 3600}
+    d._probed[7] = now - 60
+    assert not d._start_probe_due(7, lw, g, None, now)
+    assert not d._start_probe_due(7, lw, g, now - 120, now), "a push before the last probe changes nothing"
+    assert d._start_probe_due(7, lw, g, now - 30, now)
+    d._probed[7] = now - dmod.LANDED_REPROBE_S + 5
+    assert not d._start_probe_due(7, lw, g, now - 1, now), "at most one re-probe per LANDED_REPROBE_S"
+    d._probed[7] = now - dmod.PROBE_EVERY_S
+    assert d._start_probe_due(7, lw, g, None, now)
 
 
 def _stale_landed_gate(p, prod):

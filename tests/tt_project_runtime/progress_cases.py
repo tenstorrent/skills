@@ -479,7 +479,8 @@ def test_progress_the_resource_key_ignores_ready_but_unstarted_tasks(env):
     assert got and got[0]["keys"] == ["resource:box-a"]
 
 
-def test_progress_probe_stall_wakes_once_escalates_and_clears(env):
+def test_progress_probe_stall_wakes_once_then_only_at_rewake_and_clears(env):
+    """A probe stall's count grows with time alone, so it never escalates: one wake, then one per rewake_h."""
     from ttp import progress
     p = make(env)
     probe = "ssh box-a test -e /tmp/ready"
@@ -497,16 +498,15 @@ def test_progress_probe_stall_wakes_once_escalates_and_clears(env):
     for i in range(5):                               # still failing, below double: no new wake
         progress.note_probe(p.db, tid, probe, 1, "no such file /tmp/ready", now + 60 + i)
     assert progress.check(p.db, {}, p.state, now + 120, current_probe=cur) == []
-    for i in range(5):                               # 20: twice the count at the last wake
+    for i in range(5):                               # 20: twice the count, still no new wake
         progress.note_probe(p.db, tid, probe, 1, "no such file /tmp/ready", now + 200 + i)
-    got = progress.check(p.db, {}, p.state, now + 300, current_probe=cur)
-    assert got and "(escalated)" in got[0]["text"]
+    assert progress.check(p.db, {}, p.state, now + 300, current_probe=cur) == []
     assert progress.check(p.db, {}, p.state, now + 13 * 3600, current_probe=cur)[0]["text"].endswith("(still)")
     progress.forget_probe(p.db, tid)                 # the probe passed
     _prog_clear(p, {}, now + 14 * 3600, cur)
     assert progress.digest_lines(p.db, now + 15 * 3600) == ([], "")
     hist = progress.load(p.db)["history"]
-    assert hist[-1]["key"] == f"stall:probe:#{tid}" and hist[-1]["wakes"] == 3
+    assert hist[-1]["key"] == f"stall:probe:#{tid}" and hist[-1]["wakes"] == 2
     # A wait on the task's own job is expected to be long: never counted as a stall.
     own = _prog_waiting(p, "Wait for checks", "ttp checks --result abc")
     for i in range(30):
@@ -1024,7 +1024,8 @@ def test_a_start_when_probe_that_stopped_answering_is_not_judged(env):
     """A start_when probe with no answer for two probe intervals and its timeout is not running: its count is dropped
     (its next answer starts afresh). A waiting task's retry_when, probed at its own retry, keeps its count."""
     from ttp import daemon, progress
-    assert progress.QUIET_S == 2 * daemon.PROBE_EVERY_S + daemon.PROBE_TIMEOUT_S
+    from ttp import startgate
+    assert progress.QUIET_S == 2 * startgate.MAX_EVERY_S + daemon.PROBE_TIMEOUT_S
     p = make(env)
     now = time.time()
     tid = _deferred(p, _LIVE_START, now - 9000)

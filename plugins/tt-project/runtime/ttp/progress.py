@@ -65,7 +65,9 @@ Repeat detectors, each one keyed `stall` event with the count, first and last se
   reports it, once a day.
 
 Each key wakes once per condition. It wakes again only when its count (or stuck time) reaches
-`escalate_x` (2) times what it was at the last wake, or after `rewake_h` (12) hours. Hysteresis: a
+`escalate_x` (2) times what it was at the last wake, or after `rewake_h` (12) hours. A probe stall's
+count grows with time alone (one verdict per probe interval), so it never escalates: one wake per
+wait, then one per `rewake_h`. Hysteresis: a
 raised key that drops out of a check is not cleared at once (a resource or project key drops out
 between two runs). It stays raised, quiet, and clears only once it has stayed healthy for
 `clear_n` (3) checks in a row spanning at least `clear_min` (30) minutes; coming back before that
@@ -84,7 +86,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import ackwait, userpause
+from . import ackwait, startgate, userpause
 from .db import DB, TERMINAL_TASK_STATES, deferral, load_result
 from .project import durable_append
 
@@ -269,9 +271,11 @@ HEADS = {"no_progress": "No progress: running work produced no result past its t
 CHECK_DEFAULTS = {"task_h": 2, "resource_h": 2, "project_h": 2, "probe_n": 10, "probe_h": 1, "repeat_n": 5,
                   "fail_n": 3, "escalate_x": 2, "rewake_h": 12, "quiet_h": 6, "clear_n": 3, "clear_min": 30,
                   "change_probe_m": 15}
-# A start_when probe starts every daemon.PROBE_EVERY_S (180 s) and answers within PROBE_TIMEOUT_S (60 s):
-# no answer for two intervals and a timeout means it is not running.
-QUIET_S = 2 * 180 + 60
+# A start_when probe starts at most every startgate.MAX_EVERY_S (600 s; a healthy long wait backs off to
+# it) and answers within daemon.PROBE_TIMEOUT_S (60 s): no answer for two intervals and a timeout means
+# it is not running. A shorter span dropped the count of a backed-off or briefly slow probe and re-raised
+# its stall as new.
+QUIET_S = 2 * startgate.MAX_EVERY_S + 60
 HEADER = "## Progress (stuck work: re-plan, re-tier, re-point the probe, route around, cancel or fix the cause)"
 BAD_RUNS = ("failed", "timeout", "stalled")
 # Waits expected to be long, whose producer has its own clock: the task's own detached job or checks,
@@ -678,7 +682,7 @@ def _decide(st: dict, conds: list[dict], s: dict, now: float, kinds: tuple = CHE
         seen.add(key)
         r = st["raised"].get(key)
         why = ("new" if r is None else
-               "escalated" if s["escalate_x"] and float(c["n"]) >= float(r["n"]) * s["escalate_x"] else
+               "escalated" if s["escalate_x"] and not _by_time(c) and float(c["n"]) >= float(r["n"]) * s["escalate_x"] else
                "still" if s["rewake_h"] and now - float(r["at"]) >= s["rewake_h"] * 3600 else "")
         keep = {"kind": c["kind"], "what": c["what"], "since": c["since"], "reason": c["reason"],
                 "cur": c["n"], "selfref": c.get("selfref") or "", "first": (r or {}).get("first", now),
@@ -695,6 +699,12 @@ def _decide(st: dict, conds: list[dict], s: dict, now: float, kinds: tuple = CHE
             continue
         _unraise(st, key, now)
     return due
+
+
+def _by_time(c: dict) -> bool:
+    """A probe stall: its count is one verdict per probe interval, so it grows with time alone and
+    never escalates; it wakes again only at rewake_h."""
+    return c["kind"] == "stall" and str(c["key"]).startswith("probe:")
 
 
 def _unraise(st: dict, key: str, now: float) -> None:
