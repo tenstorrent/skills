@@ -26762,6 +26762,8 @@ DURABLE_EXEMPT = {
     ("ttp_pytest_durations.py", "os.replace(tmp, self.path)"): "renames that timing note into place: a rename lost to a crash leaves the old note or none",
     ("ttp_pytest_durations.py", 'open(self.live, "a")'): "runs inside the checked repo's pytest, not the runtime: appends one timing line per test start and end; a cut last line is ignored on read, a lost one costs only the note",
     ("checkdirs.py", "os.fdopen(out, 'w')"): "new owner record: file and both directories synced before releasing the catalogue lock; descriptor-relative to refuse links",
+    ("churnwatch.py", 'open(f, "ab")'): "the churn event log (one diagnostic line per event, capped); a cut last line is skipped on read, a lost one costs one event",
+    ("churnwatch.py", 'os.replace(f, f.with_name(f.name + ".1"))'): "rotates that churn log to .1 past its cap: a rename lost to a crash leaves the old file, rotated on the next event",
     ("project.py", "os.replace(src, dst)"): "memory archive move: a rename, both directories synced after",
     ("project.py", "os.replace(a, b)"): "rolled-back memory retirement moves the file back: a rename, both directories synced after",
     ("gitlocks.py", "os.replace(path, to)"): "moves a stale git lock aside, never its content; a rename lost to a crash leaves the lock for the next sweep",
