@@ -544,7 +544,7 @@ def test_speed_complaint_on_the_turn_start_runs_the_review_applies_and_queues_p1
     p.db.post("in", "still so slow", chat="c1")
     monkeypatch.setattr(time, "time", lambda: later + 1200)
     d.maybe_coordinate()
-    assert f"Not reopened (unchanged evidence since a closed follow-up): landed_chain (#{fu[0]['id']})" in calls[-1][0]
+    assert f"Not reopened (unchanged evidence since a closed follow-up): resource:boxA (#{fu[0]['id']})" in calls[-1][0]
     assert "- landed_chain SLOW: 1 wait(s)" in calls[-1][0] and "Not changed: landed_chain" in calls[-1][0]
     assert len(p.db.q("SELECT * FROM tasks WHERE title LIKE 'throughput: %'")) == 1
     # A plain message adds no section.
@@ -556,10 +556,11 @@ def test_speed_complaint_on_the_turn_start_runs_the_review_applies_and_queues_p1
 
 
 def _tp_kept(*lanes):
-    """A review's slow lanes as throughput.review returns them: (name, count, p90_s) each, none raised."""
+    """A review's slow lanes as throughput.review returns them: (name, count, p90_s) each, none raised.
+    Each names a setting: a lane with none opens no task (test_throughput_a_wait_inside_a_pause_is_a_hold_*)."""
     return {"lanes": [{"lane": n, "count": c, "median_s": p90 // 2, "p90_s": p90, "p1_p90_s": p90, "limit": None}
                       for n, c, p90 in lanes],
-            "kept": [{"lane": n, "key": None, "why": "no setting"} for n, _, _ in lanes]}
+            "kept": [{"lane": n, "key": f"{n}.limit", "why": "not raised"} for n, _, _ in lanes]}
 
 
 def test_speed_complaint_keeps_one_open_throughput_task_listing_every_slow_lane(env):
@@ -825,7 +826,8 @@ def test_slow_information_only_lane_opens_no_followup_on_a_speed_complaint(env, 
     (rs,) = [k for k in kept if k["lane"] == "review_stall"]
     assert rs.get("info") and rs.get("key"), rs
     made = slowcomplaint._followups(p.db, {**rep, "kept": kept}, [1])
-    # The fixture's own worker_slots waits may open theirs; none names review_stall.
-    titles = [r["title"] for r in p.db.q("SELECT title FROM tasks WHERE title LIKE 'throughput: %'")]
-    assert len(titles) == len(made) and not [x for x in titles if "review_stall" in x], titles
+    # The fixture's own worker_slots waits may open theirs; none lists review_stall.
+    rows = p.db.q("SELECT id, title, spec FROM tasks WHERE title LIKE 'throughput: %'")
+    assert [r["id"] for r in rows] == ([made["opened"]] if made["opened"] else []) and made["listed"] is None
+    assert not [r for r in rows if "review_stall" in r["title"] or "lane review_stall " in r["spec"]], rows
     assert "review_stall SLOW" in throughput.text({**rep, "kept": kept})
