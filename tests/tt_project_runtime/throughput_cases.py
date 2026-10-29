@@ -232,9 +232,9 @@ def test_throughput_measures_requeue_waits_by_reason_and_a_slow_checks_lane_gets
         or _tp_lane(rep, "worker_slots")["waiting_now"] == 0
     _, kept = throughput.plan(p.db, p.config(), rep)
     assert any(k["lane"] == "checks_slots" for k in kept)
-    (fid,) = [t for t in slowcomplaint._followups(p.db, {**rep, "kept": kept}, [1])
-              if "checks_slots" in p.db.one("SELECT title FROM tasks WHERE id=?", (t,))["title"]]
-    assert p.db.one("SELECT priority FROM tasks WHERE id=?", (fid,))["priority"] == 1
+    fid = slowcomplaint._followups(p.db, {**rep, "kept": kept}, [1])["opened"]
+    t = p.db.one("SELECT priority, spec FROM tasks WHERE id=?", (fid,))
+    assert t["priority"] == 1 and "lane checks_slots slow: 4 wait(s)" in t["spec"]
 
 
 # Unequal waits so each limit wins once: the lane holds 3 h against the cap's 2 h, then the reverse.
@@ -503,12 +503,91 @@ def test_speed_complaint_on_the_turn_start_runs_the_review_applies_and_queues_p1
     d.maybe_coordinate()
     assert "Earlier (last 24 h) #" in calls[-1][0]
     assert len(p.db.q("SELECT * FROM tasks WHERE title LIKE 'throughput: %'")) == 1
+    # Cancelled, its lane is not reopened on the same evidence; the model-free review still reports the lane.
+    p.db.update_task(fu[0]["id"], status="cancelled")
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    p.db.post("in", "still so slow", chat="c1")
+    monkeypatch.setattr(time, "time", lambda: later + 1200)
+    d.maybe_coordinate()
+    assert f"Not reopened (unchanged evidence since a closed follow-up): landed_chain (#{fu[0]['id']})" in calls[-1][0]
+    assert "- landed_chain SLOW: 1 wait(s)" in calls[-1][0] and "Not changed: landed_chain" in calls[-1][0]
+    assert len(p.db.q("SELECT * FROM tasks WHERE title LIKE 'throughput: %'")) == 1
     # A plain message adds no section.
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
     p.db.post("in", "Thanks, approved", chat="c1")
-    monkeypatch.setattr(time, "time", lambda: later + 1800)
+    monkeypatch.setattr(time, "time", lambda: later + 2400)
     d.maybe_coordinate()
     assert "Speed complaint" not in calls[-1][0]
+
+
+def _tp_kept(*lanes):
+    """A review's slow lanes as throughput.review returns them: (name, count, p90_s) each, none raised."""
+    return {"lanes": [{"lane": n, "count": c, "median_s": p90 // 2, "p90_s": p90, "p1_p90_s": p90, "limit": None}
+                      for n, c, p90 in lanes],
+            "kept": [{"lane": n, "key": None, "why": "no setting"} for n, _, _ in lanes]}
+
+
+def test_speed_complaint_keeps_one_open_throughput_task_listing_every_slow_lane(env):
+    from ttp import slowcomplaint
+    p = make(env)
+    now = time.time()
+    fu = slowcomplaint._followups(p.db, _tp_kept(("resource:box", 3, 4000), ("retry_wait", 5, 9000)), [7], now)
+    assert fu["listed"] is None and not fu["held"]
+    (t,) = p.db.q("SELECT * FROM tasks WHERE title LIKE 'throughput: %'")
+    assert t["id"] == fu["opened"] and t["priority"] == 1 and t["spec"].startswith("urgent:")
+    assert "resource:box, retry_wait" in t["title"]
+    assert "lane resource:box slow: 3 wait(s)" in t["spec"] and "lane retry_wait slow: 5 wait(s)" in t["spec"]
+    # While it is open, two more slow lanes (and the two it lists) add no task: the new ones join its spec.
+    run_dir = Path(p.base) / "state" / "runs" / "77"
+    run_dir.mkdir(parents=True)
+    p.db.update_task(t["id"], status="running")
+    p.db.x("INSERT INTO runs(task, role, started, status, dir) VALUES(?,?,?,?,?)",
+           (t["id"], "worker", now, "running", str(run_dir)))
+    rep = _tp_kept(("resource:box", 3, 4000), ("retry_wait", 5, 9000), ("own_job", 2, 5000), ("push_batch", 4, 3000))
+    fu = slowcomplaint._followups(p.db, rep, [8], now + 60)
+    assert fu["opened"] is None and fu["listed"] == (t["id"], ["own_job", "push_batch"])
+    (t2,) = p.db.q("SELECT * FROM tasks WHERE title LIKE 'throughput: %'")
+    assert t2["spec"].count("lane own_job slow:") == 1 and t2["spec"].count("lane resource:box slow:") == 1
+    assert "lane push_batch slow: 4 wait(s)" in (run_dir / "steer.md").read_text()
+    # A third complaint with the same lanes changes nothing.
+    fu = slowcomplaint._followups(p.db, rep, [9], now + 120)
+    assert fu == {"opened": None, "listed": None, "held": []}
+    assert p.db.one("SELECT spec FROM tasks WHERE id=?", (t["id"],))["spec"] == t2["spec"]
+
+
+def test_speed_complaint_does_not_reopen_a_closed_lane_on_unchanged_evidence(env):
+    from ttp import slowcomplaint
+    p = make(env)
+    now = time.time()
+    rep = _tp_kept(("checks_slots", 4, 6000), ("deferral", 2, 3000))
+    tid = slowcomplaint._followups(p.db, rep, [1], now)["opened"]
+    p.db.update_task(tid, status="cancelled")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (now, tid))
+    # Unchanged (or a little worse) evidence inside the cooldown: held, no task.
+    for same in (rep, _tp_kept(("checks_slots", 5, 7000), ("deferral", 2, 3000))):
+        fu = slowcomplaint._followups(p.db, same, [2], now + 600)
+        assert fu["opened"] is None and fu["held"] == [("checks_slots", tid), ("deferral", tid)]
+    assert len(p.db.q("SELECT id FROM tasks WHERE title LIKE 'throughput: %'")) == 1
+    # A done task holds its lanes the same way: its window still holds the old waits.
+    p.db.update_task(tid, status="done")
+    assert slowcomplaint._followups(p.db, rep, [3], now + 700)["opened"] is None
+    # Waits grown past FACTOR reopen that lane alone; so does a grown p90.
+    grown = _tp_kept(("checks_slots", 4 * 2, 6000), ("deferral", 2, 3000))
+    fu = slowcomplaint._followups(p.db, grown, [4], now + 900)
+    assert fu["held"] == [("deferral", tid)] and fu["opened"]
+    new = p.db.one("SELECT title, spec FROM tasks WHERE id=?", (fu["opened"],))
+    assert "checks_slots" in new["title"] and "deferral" not in new["spec"]
+    p.db.update_task(fu["opened"], status="cancelled")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (now + 900, fu["opened"]))
+    second = fu["opened"]
+    fu = slowcomplaint._followups(p.db, _tp_kept(("checks_slots", 8, 6000), ("deferral", 2, 3000 * 2)), [5], now + 960)
+    assert fu["held"] == [("checks_slots", second)]
+    assert "deferral" in p.db.one("SELECT title FROM tasks WHERE id=?", (fu["opened"],))["title"]
+    # After the cooldown, unchanged evidence reopens it too.
+    p.db.update_task(fu["opened"], status="cancelled")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (now + 960, fu["opened"]))
+    later = now + 960 + slowcomplaint.COOLDOWN_S + 1
+    assert slowcomplaint._followups(p.db, _tp_kept(("deferral", 2, 6000)), [6], later)["opened"]
 
 
 def test_ttp_throughput_cli_prints_text_and_json(env):
