@@ -31,6 +31,11 @@ DEFAULT_BATCH_S = 300           # delivery.push_batch_s: the oldest approval wai
 DEFAULT_BATCH_MAX = 8           # delivery.push_batch_max: start at once with this many; also a batch's most
 DEFAULT_MIN_GAP_S = 1800        # delivery.push_min_gap_s: after a batch that did not end clean, the least time to the next start
 CLEAN_OUTCOMES = ("pushed", "landed", "nothing")   # the tip passed and the push went: no gap after these
+FAST_PRIORITY = 2               # an approval of this priority or better goes in a batch of its own at once (fast_ids)
+FAST_WAIT_S = 900               # a fast approval still waiting this long raises one FAST_WAIT_EVENT
+FAST_WAIT_EVENT = "push_fast_waiting"
+FAST_KV = "push_fast_told"      # kv: [row ids] FAST_WAIT_EVENT was raised for (pruned to the approved rows)
+OPEN_ROWS = ("approved", "batched", "held")   # rows approved but not landed nor sent back
 # delivery.push_solo_paths: git pathspecs; a batch takes at most one approval whose change touches them.
 # Two prompt changes that each fit a size cap may not fit together, which fails the whole batch.
 TRIM_EVENT = "its review runs again as a light trim-to-fit fix"   # counts them per review
@@ -71,6 +76,7 @@ _HEX40 = re.compile(r"[0-9a-f]{40}")
 REBASE_LABEL = "push_rebase:"   # + the conflicting head: a review the daemon queued to rebase it (auto_rebase)
 _children: dict[str, subprocess.Popen] = {}   # batch processes this daemon started, reaped by finalize
 _default_branches: dict[tuple[str, str], tuple[float, str | None]] = {}   # (root, remote): (until, branch)
+_files_seen: dict[tuple[str, str], frozenset | None] = {}   # (tip, head): the files the head changes (_changed)
 _recover_asked: dict[str, float] = {}         # batch id: when its remote was last asked (_recover)
 _absent_seen: dict[tuple[str, str, str], tuple[float, bool, str]] = {}   # (root, remote, branch): (until, absent, why)
 
@@ -661,9 +667,10 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     while the last one or its after_push (the deploy) still runs. After a clean batch an approval
     starts one at once unless a review is running or ready, which it waits for at most
     delivery.push_batch_s. After a batch that did not end clean (a failing tip, a dead batch), unless
-    the batch is full or holds an urgent approval (urgent.covers_urgent: a priority-1 review, or a
-    review of an urgent task: it starts at once) or one the last batch requeued untested, it
-    waits for delivery.push_min_gap_s since the last one."""
+    the batch is full or holds one the last batch requeued untested, it waits for
+    delivery.push_min_gap_s since the last one. Fast approvals (fast_ids: urgent, priority 1-2, or
+    sharing no file with an earlier unlanded approval) wait for neither: they start a batch of
+    their own at once, ahead of the routine ones, which wait for the next batch."""
     now = time.time() if now is None else now
     if not enabled(p, cfg):
         return [], "the push queue is off"
@@ -678,8 +685,6 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     rows = _approved(db, f"{remote}/{branch}")
     if not rows:
         return [], "nothing approved"
-    hot = {r["id"] for r in rows if urgent.covers_urgent(db, db.task(r["task"]))}
-    rows.sort(key=lambda r: r["id"] not in hot)   # urgent approvals first (stable: priority, id within)
     paused = db.paused_resources()
     if push.lock_name(remote, branch) in paused or "push" in paused:
         return [], "the push resource is paused"
@@ -692,6 +697,7 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
             not locks.any_free([x]) for x in sorted((p.state / "locks").glob("push:run-*.lock"))):
         return [], "another push holds its turn"
     bad = st.get("bad_tip") or {}
+    tried: set = set()
     if bad.get("tip") and _tracking_tip(p, remote, branch) == bad["tip"]:
         # Approvals not yet tried on the failing tip go first: one of them may fix it. With none, the
         # tried ones wait, so the same tip is not checked again and again.
@@ -709,12 +715,19 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     # Approvals the last batch requeued after a blamed entry without checking them: no gap, as it
     # spent its checks on the others (batch._close marks them "untested").
     untested = [r for r in rows if last and r["batch"] == last["id"] and _detail(r).get("untested")]
-    if len(rows) >= cap:
-        why = f"{len(rows)} approvals"
-    elif last and last["outcome"] == "rebooted":
+    fast = fast_ids(p, rows, _tracking_tip(p, remote, branch), skip=tried)
+    if last and last["outcome"] == "rebooted":
         why = f"a rerun of {last['id']}, cut short by a reboot"
-    elif hot & {r["id"] for r in rows}:
-        why = "an urgent review"
+    elif fast:
+        # Independent, urgent or priority 1-2 approvals go now, alone: no window, no gap, and no
+        # routine approval in the batch whose failure would cost them a bisect round.
+        rows = [r for r in rows if r["id"] in fast]
+        hot = sum(1 for r in rows if urgent.covers_urgent(db, db.task(r["task"])))
+        why = (f"{len(rows)} approval{'s' if len(rows) != 1 else ''} that "
+               f"{'is' if len(rows) == 1 else 'are'} urgent, priority 1-{FAST_PRIORITY} or share no file with an "
+               f"earlier unlanded one" + (f" ({hot} an urgent review)" if hot else ""))
+    elif len(rows) >= cap:
+        why = f"{len(rows)} approvals"
     elif untested:
         why = f"{len(untested)} approval{'s' if len(untested) != 1 else ''} {last['id']} requeued untested"
     elif last and last["outcome"] not in CLEAN_OUTCOMES and (left := _gap_left(db, now, gap)) > 0:
@@ -731,6 +744,80 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
         why += (f"; {len(held)} more approval{'s' if len(held) != 1 else ''} touching delivery.push_solo_paths "
                 f"wait{'s' if len(held) == 1 else ''} for a later batch (one per batch)")
     return taken, why
+
+
+def _changed(p: Project, tip: str, head: str) -> frozenset | None:
+    """The files `head` changes over its merge base with `tip` (`git diff tip...head`), cached per
+    (tip, head); None when git cannot tell."""
+    if (tip, head) in _files_seen:
+        return _files_seen[(tip, head)]
+    try:
+        r = _git(p, "diff", "--name-only", "--no-renames", f"{tip}...{head}", timeout=INHERIT_GIT_S)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    got = frozenset(r.stdout.split("\n")) - {""} if r.returncode == 0 else None
+    if len(_files_seen) > 512:
+        _files_seen.clear()
+    _files_seen[(tip, head)] = got
+    return got
+
+
+def fast_ids(p: Project, rows: list[dict], tip: str, skip: set = frozenset()) -> set[int]:
+    """The ids of `rows` (approved, same target) that go in a batch of their own at once: urgent
+    (urgent.covers_urgent), of priority FAST_PRIORITY or better, or changing no file that an earlier
+    row still in the queue (approved, batched or held) changes. Files overlap.ignore lists
+    (changesets, changelogs, manifests) do not count. A row git cannot read is not independent, nor
+    is any with no fetched tip; rows in `skip` (already tried on a failing tip) are never fast."""
+    if not rows:
+        return set()
+    db = p.db
+    out = {r["id"] for r in rows if r["id"] not in skip and (
+        int(r["priority"] if r["priority"] is not None else 9) <= FAST_PRIORITY or urgent.covers_urgent(db, db.task(r["task"])))}
+    if not tip:
+        return out
+    from . import overlap
+    globs = overlap.settings(p).get("ignore")
+    earlier = db.q(f"SELECT id, head FROM push_queue WHERE status IN ({','.join('?' * len(OPEN_ROWS))}) "
+                   f"AND target=? AND id<=? ORDER BY id", (*OPEN_ROWS, rows[0]["target"], max(r["id"] for r in rows)))
+    files: dict[int, frozenset | None] = {}
+    for e in earlier:
+        got = _changed(p, tip, e["head"]) if e["head"] else None
+        files[e["id"]] = None if got is None else frozenset(f for f in got if not overlap._ignored(f, globs))
+    for r in rows:
+        mine = files.get(r["id"])
+        if r["id"] in skip or r["id"] in out or not mine:
+            continue
+        if all(files[e["id"]] is not None and not (mine & files[e["id"]]) for e in earlier if e["id"] < r["id"]):
+            out.add(r["id"])
+    return out
+
+
+def fast_waits(p: Project, why: str, now: float | None = None, cfg: dict | None = None) -> list[int]:
+    """Model-free: one FAST_WAIT_EVENT per fast approval (fast_ids) still approved FAST_WAIT_S after
+    it was queued, naming `why` (due's answer: what holds the queue). Returns the row ids it raised for."""
+    now = time.time() if now is None else now
+    db = p.db
+    tgt = target(p) if enabled(p, cfg) else None
+    if not tgt:
+        return []
+    rows = _approved(db, f"{tgt[0]}/{tgt[1]}")
+    told = [i for i in (db.kv(FAST_KV) or []) if isinstance(i, int)]
+    live = {r["id"] for r in rows}
+    old = [r for r in rows if now - float(r["created"]) >= FAST_WAIT_S and r["id"] not in told]
+    out = []
+    if old:
+        fast = fast_ids(p, rows, _tracking_tip(p, *tgt))
+        for r in old:
+            if r["id"] in fast:
+                _event(db, db.task(r["task"]), FAST_WAIT_EVENT,
+                       f"push queue row {r['id']} (#{r['task']}, head {_short(r['head'])}) is independent or "
+                       f"priority 1-{FAST_PRIORITY} and still waits after {_age(now - float(r['created']))}: {why}",
+                       queued=False)
+                out.append(r["id"])
+    keep = [i for i in told if i in live] + out
+    if keep != told:
+        db.set_kv(FAST_KV, keep)
+    return out
 
 
 def _solo_paths(d: dict) -> list[str]:
@@ -929,6 +1016,7 @@ def schedule(p: Project, cfg: dict | None = None, log: Callable[[str], None] = l
         log(f"push queue: approvals for an old target sent back to their reviews (target now {name})")
     rows, why = due(p, cfg=cfg)
     if not rows:
+        fast_waits(p, why, cfg=cfg)
         return None
     bid = start(p, rows, name)
     if bid:
