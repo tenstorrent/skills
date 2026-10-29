@@ -26536,15 +26536,24 @@ def _tasks_up_to(p, n):
 def _settle_deferred(d, tid, until=None):
     """One probe round. Each round reaps a probe and may start the next, so a probe started before
     the test changed the world can still say "not yet": with `until`, keep going until it holds (up
-    to HANG_S)."""
+    to HANG_S). Every running probe is joined before a reap, so none is reaped as timed out."""
     deadline = time.monotonic() + HANG_S
     while True:
+        _join_probes(d)
         d.probe_waiting()
         if tid in d._probes:
-            d._probes[tid][0].wait(HANG_S)
+            _join_probes(d)
             d.probe_waiting()
         if until is None or until() or time.monotonic() > deadline:
             return
+
+
+def _join_probes(d):
+    """Waits for every probe the daemon runs to exit (up to HANG_S each) before it reaps them: it
+    kills one older than its 60 s PROBE_TIMEOUT_S as broken, and on a loaded host another task's
+    probe, started during an earlier round, can pass that age before its own round reaps it."""
+    for proc in {id(r[0]): r[0] for r in d._probes.values()}.values():
+        proc.wait(HANG_S)
 
 
 def _events(p, tid, kind):
