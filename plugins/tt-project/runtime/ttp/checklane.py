@@ -348,14 +348,15 @@ def waits(project_name: str, cfg: dict | None, now: float | None = None, over_s:
     try:
         for base in testslots.suite_bases(project_name):
             q = testslots.suite_order(project_name, now=now, repo=base[len(pre) + 1:], age=age)
-            recs = locks.holder_records(testslots._lanes_of(base)) if q else []
-            if q and not recs:   # its lanes are free: it waits for the project's cap (project_cap)
-                recs = locks.holder_records(testslots.project_held(project_name))
+            # A free lane with waiters means the project's cap (cap_turn) is what holds them.
+            cap_wait = not locks.holder_records(testslots._lanes_of(base))
+            recs = locks.holder_records(testslots.project_held(project_name)) if cap_wait \
+                else locks.holder_records(testslots._lanes_of(base))
             for i, t in enumerate(q):
                 waited = now - locks._arrival(t)
                 if waited > over_s:
                     out.append({"task": _ticket_task(t), "waited_s": waited, "since": locks._arrival(t),
-                                "position": i + 1, "of": len(q), "holders": recs})
+                                "position": i + 1, "of": len(q), "holders": recs, "limit": "project_cap" if cap_wait else "lanes"})
     except OSError:
         return []
     return out
@@ -368,6 +369,7 @@ def long_wait_lines(project_name: str, cfg: dict | None, now: float | None = Non
     out = []
     for w in waits(project_name, cfg, now, over_s):
         held = "; ".join(holder_text(h, now) for h in w["holders"][:3]) or "lanes free, about to start"
+        key = {"project_cap": "checks.test_project_max", "lanes": "checks.slots"}[w["limit"]]
         out.append(f"checks slot wait: {'#' + w['task'] if w['task'] else 'a run'} has waited {mins(w['waited_s'])} "
                    f"(position {w['position']} of {w['of']}), behind {held}")
     return out
@@ -391,7 +393,13 @@ def wait_events(project_name: str, cfg: dict | None, now: float | None = None) -
                              f"slot (position {w['position']} of {w['of']}), behind {held}. Lanes: checks.slots "
                              f"per repository, one per checks.wrap_cmd lock, checks.test_project_max per project; "
                              f"a waiter cheaper than the holders gets a lane after checks.max_wait_s; light "
-                             f"checks (ttp checks --light, checks.light_cmds) never wait.")})
+                             f"checks (ttp checks --light, checks.light_cmds) never wait. This wait was held "
+                             f"by the per-repository lane limit ({key})." if w["limit"] == "lanes" else
+                             f"checks (position {w['position']} of {w['of']}), behind {held}. Lanes: checks.slots "
+                             f"per repository, one per checks.wrap_cmd lock, checks.test_project_max per project; "
+                             f"a waiter cheaper than the holders gets a lane after checks.max_wait_s; light "
+                             f"checks (ttp checks --light, checks.light_cmds) never wait. This wait was held "
+                             f"by the project cap (checks.test_project_max).")})
     return out
 
 

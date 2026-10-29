@@ -25,8 +25,9 @@ to its first run, or to now for one still queued:
   wait of a task that has run (queued, blocked or waiting) from its last run's end to now, sorted by
   its reason (the event's "for" or text; the task's blocked_reason for the current wait), or by the
   checks slot's own records (a checks_slot_wait event in the wait, or checkcap's waits log covering
-  half of it): checks_slots (waiting for this project's other `ttp checks`; limit
-  checks.test_project_max, an account setting a project may only lower: reported), own_job (its own detached job or checks: no
+  half of it): checks_slots (waiting for this project's other `ttp checks`; limit checks.slots per
+  repository or checks.test_project_max per project, whichever of the two held the wait: both are
+  project settings, reported, never raised), own_job (its own detached job or checks: no
   limit), the rules above for a deferral, provider or resource, else retry_wait (its own retry
   condition, then a slot, not told apart: no limit, never counted against worker slots).
 
@@ -162,6 +163,22 @@ def thresholds(spans: list[tuple[float, float]]) -> tuple[float, float]:
     return float(P1_WAIT_S), max(float(WAIT_S), _pct(durs, 0.5))
 
 
+CAP_KEY = "checks.test_project_max"
+SLOTS_KEY = "checks.slots"
+
+
+def slot_limit(text: str) -> str:
+    """The limit a checks_slot_wait event's text names, in checklane's own wording ("the
+    per-repository lane limit (checks.slots)" / "the project cap (checks.test_project_max)");
+    the default is the project cap, the limit every pre-#4316 event and every reason text was
+    held under."""
+    if "per-repository lane limit" in text:
+        return SLOTS_KEY
+    if "project cap" in text:
+        return CAP_KEY
+    return CAP_KEY
+
+
 def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, gates: dict | None = None) -> dict:
     """The waits per lane over the last `since_s` seconds (module doc)."""
     from . import locks, shared
@@ -207,10 +224,10 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     dep_rows = {r["id"]: r for r in db.q("SELECT id, status, kind, updated FROM tasks WHERE id IN "
                                          "(SELECT value FROM json_each(?))", (json.dumps(dep_ids),))} if dep_ids else {}
     try:
-        from . import testslots
-        ck = testslots.project_max(cfg)
+        from . import checklane
+        lanes_n, cap_n = checklane.slots(cfg), checklane.project_cap(cfg)
     except Exception:
-        ck = None
+        lanes_n = cap_n = None
 
     def done_at(t: dict, dep: int, start: float | None) -> float | None:
         """When dependency `dep` of `t` was done (DB.unmet_dependencies' rule), or None while it is not."""
@@ -255,9 +272,10 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     for e in db.q("SELECT ts, task, text, data FROM events WHERE kind='task_waiting' AND task IS NOT NULL AND ts>? "
                   "ORDER BY ts LIMIT ?", (t0 - DAY, ROWS)):
         ev_waits.setdefault(e["task"], []).append(e)
-    slot_ev: dict[int, list[float]] = {}
-    for e in db.q("SELECT ts, task FROM events WHERE kind='checks_slot_wait' AND task IS NOT NULL AND ts>?", (t0 - DAY,)):
-        slot_ev.setdefault(e["task"], []).append(float(e["ts"]))
+    slot_ev: dict[int, list[tuple[float, str]]] = {}
+    for e in db.q("SELECT ts, task, text FROM events WHERE kind='checks_slot_wait' AND task IS NOT NULL AND ts>?",
+                  (t0 - DAY,)):
+        slot_ev.setdefault(e["task"], []).append((float(e["ts"]), slot_limit(e["text"] or "")))
     slot_log: dict[int, list[tuple[float, float]]] = {}
     try:
         from . import checkcap
@@ -267,14 +285,20 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     except Exception:
         pass
 
-    def slot_held(task: int, w0: float, w1: float) -> bool:
-        """Whether the checks slot held `task` in [w0, w1]: a checks_slot_wait event in it, or logged slot
-        waits covering at least half of it."""
-        if any(w0 <= ts <= w1 for ts in slot_ev.get(task, ())):
-            return True
+    def slot_held(task: int, w0: float, w1: float) -> str | None:
+        """Which checks limit held `task` in [w0, w1] — "checks.slots" (its repository's lanes) or
+        "checks.test_project_max" (the project's cap) — or None when the checks slot did not hold it:
+        a checks_slot_wait event in the wait (its text names the limit; older events named none:
+        the project cap, the limit those waits were held under), or checkcap's logged slot waits
+        covering at least half of it (no limit recorded: the per-repository limit, the default
+        holder of a queue wait)."""
+        for ts, key in slot_ev.get(task, ()):
+            if w0 <= ts <= w1:
+                return key
         held = sum(max(0.0, min(g, w1) - max(q, w0)) for q, g in slot_log.get(task, ()))
-        return w1 > w0 and held * 2 >= w1 - w0
+        return SLOTS_KEY if w1 > w0 and held * 2 >= w1 - w0 else None
 
+    slot_tally: dict[str, float] = {SLOTS_KEY: 0.0, CAP_KEY: 0.0}
     for t in tasks:
         start = first.get(t["id"])
         d = deferral(t)
@@ -309,7 +333,10 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             if w1 <= t0 or w1 < w0:
                 continue
             if "other full checks" in reason or "ttp checks: waiting" in reason or slot_held(t["id"], w0, w1):
-                add(lane("checks_slots", "checks.test_project_max", ck), w1 - w0, prio, w0, w1, None, queued)
+                # Which of the two checks limits held it: a checks_slot_wait event or checkcap record
+                # names the limit; a reason text alone means the legacy default, the project cap.
+                slot_tally[slot_held(t["id"], w0, w1) or CAP_KEY] += w1 - w0
+                add(lane("checks_slots", CAP_KEY, cap_n), w1 - w0, prio, w0, w1, None, queued)
             elif "detach" in reason or "ttp checks" in reason or "own job" in reason:
                 lane("own_job", None, None)["note"] = "the task's own detached job or checks ran: no limit"
                 add(lanes["own_job"], w1 - w0, prio, w0, w1, None, queued)
@@ -356,9 +383,24 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
         if s1 - c <= 1.25 * push_s + 60 and not any(b["id"] != r["b"] and float(b["started"]) < s1
                                                     and float(b["ended"] or now) > c for b in batches):
             pb["window"].append(s1 - c)
-    lane("checks_slots", "checks.test_project_max", ck).setdefault(
-        "note", "a project's checks.test_project_max may only lower the account's limit (an account setting, "
-                "shared by every project on the host): find what holds the checks")
+    # The lane's limit is whichever of the two checks limits held more of its wait time (its
+    # checks_slot_wait events name the holder; a logged wait with no event defaults to the
+    # per-repository lane limit; a wait known only from its reason text, the project cap).
+    # Both limits are read through checklane, never second-guessed here.
+    # The lane's limit is whichever of the two checks limits held more of its wait time (its
+    # checks_slot_wait events name the holder; a logged wait with no event defaults to the
+    # per-repository lane limit; a wait known only from its reason text, the project cap).
+    # Both limits are read through checklane, never second-guessed here.
+    slot_key = max(slot_tally, key=slot_tally.get) if any(slot_tally.values()) else CAP_KEY
+    ck_lane = lane("checks_slots", slot_key, cap_n if slot_key == CAP_KEY else lanes_n)
+    if ck_lane["limit_key"] != slot_key:  # lane() keeps the first key it was created with
+        ck_lane["limit_key"], ck_lane["limit"] = slot_key, (cap_n if slot_key == CAP_KEY else lanes_n)
+    ck_lane["limits"] = {SLOTS_KEY: lanes_n, CAP_KEY: cap_n}
+    ck_lane.setdefault(
+        "note", "a wait was held by the per-repository lane limit (checks.slots) or the project cap "
+                "(checks.test_project_max), whichever held more of this lane's wait time; both are "
+                "project settings (config_set checks.slots / checks.test_project_max): raise the one "
+                "that held it, or find what else runs on its lanes")
     peak = _peak(spans, t0, now)
     out = []
     for ln in lanes.values():
