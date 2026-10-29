@@ -2658,6 +2658,30 @@ def test_three_checks_at_once_with_a_grant_of_4_each_get_their_slots_inside_a_po
             g and g.close()
 
 
+@pytest.mark.parametrize("cores", [64, 16])
+def test_the_account_cap_of_3_checks_with_the_default_run_max_splits_the_slot_budget_across_lanes(
+        env, monkeypatch, cores):
+    """checks.test_project_max 3 with the default checks.test_run_max: one run's grant is its share of the
+    project's budget, never the whole of it, so two suites hold slots at the same time."""
+    from ttp import checkcap, project, testslots
+    _slot_sizes(monkeypatch, 0, 0)
+    for k in ("TTP_TEST_POOL", "TTP_TEST_RUN_MAX"):   # the host's defaults: half the cores, min(8, half the pool)
+        monkeypatch.delenv(k)
+    monkeypatch.setattr(checkcap, "cores", lambda: cores)
+    project.set_account_setting("checks.test_project_max", 3)
+    pool, run = testslots.sizes()
+    budget = testslots.project_max()
+    assert budget == min(pool, 3 * run) and run < budget, (pool, run, budget)
+    grants = []
+    try:
+        for i in range(min(3, budget // run)):
+            grants.append(testslots.acquire(f"run {i}", project_name="pa", wait_s=0))
+        assert len(grants) >= 2 and all(g and g.k == run for g in grants), [g and g.k for g in grants]
+        assert sum(g.k for g in grants) <= min(budget, pool)
+    finally:
+        for g in grants:
+            g and g.close()
+
 def test_a_lane_counts_against_the_project_cap_only_once_its_run_has_its_test_slots(env, monkeypatch):
     from ttp import testslots
     _slot_sizes(monkeypatch, 32, 4, TTP_TEST_PROJECT_MAX=1)

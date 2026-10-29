@@ -872,7 +872,7 @@ queues behind routine work; nothing running is interrupted:
   a project may only lower them) and passes its grant as PYTEST_XDIST_AUTO_NUM_WORKERS and TTP_TEST_SLOTS (a
   suite's `-n auto` uses the whole grant). A project's test-worker budget is its checks at once
   (`checks.test_project_max`, below) times one run's grant, at most the pool, so every check under that cap gets its
-  workers; `checks.test_project_slots` (chat-settable, a whole number of at least 1) sets the budget outright.
+  workers (3 checks at once with a grant of 8 make a budget of 24: each run gets 8, never the whole budget); `checks.test_project_slots` (chat-settable, a whole number of at least 1) sets the budget outright.
   Waiters are served first-come: one whose project is at its budget lets other projects go first but keeps its
   place in its project's line, where the most urgent task priority goes first, then arrival, so that waiter gets
   the next freed slots. A priority-1 check whose project's budget is held only by less urgent runs takes one extra
