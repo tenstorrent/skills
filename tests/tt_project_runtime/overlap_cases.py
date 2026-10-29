@@ -351,6 +351,23 @@ def test_task_add_chains_only_on_a_new_file_or_symbol_of_another_task(env):
         "bc_d", "retry_twice", "foo_bar"]
 
 
+def test_task_add_never_chains_on_a_shared_path_outside_the_repo(env):
+    """Paths two specs share that are no repo file (a run dir, harness state, another repo's file)
+    are missing from the base but no task adds them: no chain."""
+    from ttp import coordinator as coord
+    from ttp.db import deferral, dependency_ids
+    p = make(env)
+    p.set_config("delivery.landed_probe", "test -e landed/{id}")
+    _on_base(p, "runtime/ttp/relay.py")
+    outside = "Write `$TTP_RUN_DIR/result.json`, note it in tt-project/harness/MEMORY.md, read " \
+              "state/runs/7/checks.log and ttnn/cpp/ttnn/op.cpp."
+    p.db.add_task("other", "Fix the relay. " + outside, kind="code", status="running")
+    assert coord.apply(p, [{"type": "task_add", "title": "mine", "kind": "code",
+                            "spec": "Tune the sweep. " + outside}]) == []
+    t = p.db.one("SELECT * FROM tasks WHERE title='mine'")
+    assert not deferral(t) and dependency_ids(t) == [], (deferral(t), t["depends_on"])
+
+
 def test_settled_records_lapse_after_14_days_unless_given_an_expiry(env):
     """Settled areas count for overlap.settled_days (14) after they were settled: an older record,
     even one written with the old 30-day expiry, is ignored; one given an expiry of its own keeps it,
@@ -382,7 +399,8 @@ def test_overlap_chain_never_waits_on_a_task_that_waits_on_the_new_tasks_own_lin
     from ttp.db import deferral
     p = make(env)
     p.set_config("delivery.landed_probe", "test -e landed/{id}")   # no push branch: how landed:#<id> is checked
-    hot = "runtime/ttp/progress.py"   # on no base yet: each task here adds it
+    hot = "runtime/ttp/progress.py"   # on no base yet (its folder is): each task here adds it
+    _on_base(p, "runtime/ttp/relay.py")
     monkeypatch.setattr(reviewcap, "main_file", lambda p, r: hot)
 
     def add(title, spec, **kw):
@@ -417,7 +435,8 @@ def test_an_automatic_chain_uses_depends_on_where_no_landing_can_be_checked(env,
     from ttp import coordinator as coord, overlap
     from ttp.db import deferral, dependency_ids
     p = make(env)
-    hot = calm = "runtime/ttp/progress.py"   # on no base yet: the open task adds it
+    hot = calm = "runtime/ttp/progress.py"   # on no base yet (its folder is): the open task adds it
+    _on_base(p, "runtime/ttp/relay.py")
 
     def add(title, spec, **kw):
         assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec, **kw}]) == []
@@ -450,7 +469,8 @@ def test_overlap_never_chains_or_suggests_depends_on_onto_device_or_waiting_task
     from ttp.db import deferral, dependency_ids
     p = make(env)
     p.set_config("device.locks", ["board0"])
-    hot = "runtime/ttp/progress.py"   # on no base yet: every task here adds it
+    hot = "runtime/ttp/progress.py"   # on no base yet (its folder is): every task here adds it
+    _on_base(p, "runtime/ttp/relay.py")
 
     def add(title, spec, **kw):
         assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec, **kw}]) == []

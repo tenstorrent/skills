@@ -456,7 +456,8 @@ def _has(p, ref: str, sym: str) -> bool | None:
 def chain(p, hits: list[dict], spec: str = "", now: float | None = None, lineage: set[int] | None = None,
           skip=()) -> tuple[int, str] | None:
     """(id, why) of the newest open or unlanded task the new one needs the work of: a path the new
-    spec shares with it (`hits`, find) that is not on the base branch yet (that task adds it), or a
+    spec shares with it (`hits`, find) that is not on the base branch yet and that task adds (its
+    branch adds it; with no branch, its folder or top folder is on the base), or a
     symbol the spec names (symbols) that the base lacks and that task's branch has. None otherwise: a
     shared file alone never chains. A task in the new one's `lineage`, or waiting on it (waits_on),
     is passed over: its work lands only with the new task's. An exempt one (exempt) is passed over too,
@@ -478,8 +479,18 @@ def chain(p, hits: list[dict], spec: str = "", now: float | None = None, lineage
     on_base = base_files(p, base)
     if not on_base:
         return None
+    dirs, tops = _dirs(on_base), {x.split("/", 1)[0] for x in on_base if "/" in x}
+
+    def adds(h: dict, f: str, new: bool) -> bool:
+        """`h`'s task adds repo file `f`: its branch adds it, or (no branch yet) `f` is missing from the
+        base under a folder the base has. A run dir, harness state or another repo's file never counts."""
+        if any(same(f, x) for x in on_base):
+            return False
+        if h.get("head"):
+            return new
+        return f.rsplit("/", 1)[0] in dirs or f.split("/", 1)[0] in tops
     for h in shown:   # the most recent first
-        if f := next((f for f, _ in h["paths"] if not any(same(f, x) for x in on_base)), None):
+        if f := next((f for f, new in h["paths"] if adds(h, f, new)), None):
             return h["id"], f"it needs {f}, which #{h['id']} adds (not on the base branch yet)"
     syms = [s for s in syms if _has(p, base, s) is False]
     if syms:
