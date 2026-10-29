@@ -292,6 +292,16 @@ prolonged whole-box outage.
   change add ... --expect <fingerprint|down|held>`); and a review's failed hand-off counts once, as
   "failed review". `coordinator.effort_skip_triggers` (none by default) lists trigger labels, as
   recorded in the note, that never count.
+  Three daemon events that rarely need a decision are high only when it matters (pagesev.py). A
+  done task's `continue:` follow-up no task took up (`continue_unqueued`) is normal and rides
+  along with the next turn due anyway, at most an hour later. A task the daemon or the push queue
+  blocks (`task_blocked`) is normal; the same task blocked again for the same reason within 6 h is
+  counted on the queued event, or queued once to ride along. Both are high for an urgent task:
+  priority 1, an `urgent:` line in its spec or a required owner of an open obligation, and a block
+  is also high while the task waits on an ask. An overdue machine change
+  (`machine_change_overdue`) is normal, high only on a machine tagged `serving`, `live` or `server`
+  past its end with no passing until-probe, and each project hears of one change once per episode,
+  whether from its own daemon or relayed by another project's.
 - Blocker sweep: every `coordinator.blocker_sweep_h` (6; 0 turns it off) hours while anything is
   stuck, and sooner (never within `coordinator.blocker_sweep_min_gap_h`, 1) when a pause ends, an
   ask is resolved, a dependency finishes, a provider pause ends or a re-check comes due, a

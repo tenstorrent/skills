@@ -46,7 +46,10 @@ cancelled or gone; a probe-only or task-only entry also expires after PROBE_END_
 re-extends it with `ttp machines change edit <id> --until-task <its own id>`. The daily review lists the
 project's open entries whose task is over (task_lines). An overdue entry pages the project that made it, then the machine's
 owner, then its fallback, each after the one before cannot act for UNAVAILABLE_S or let REPAGE_S pass,
-then the user. Nothing is undone automatically unless asked (Auto-undo): whoever is paged runs the undo and closes the entry
+then the user. Unlike a condition's page, an overdue entry's page is normal: high only on a live serving machine
+(tagged serving, live or server) past its end with no passing until-probe (pagesev.change_severity). Each page
+carries one fingerprint per entry and episode (pagesev.change_fingerprint), so a project files its own event
+and copies relayed by other projects' daemons once. Nothing is undone automatically unless asked (Auto-undo): whoever is paged runs the undo and closes the entry
 (`ttp machines change close <id>`). An entry whose undo is a no-op (noop_undo: empty, `true`, `:`, or
 `none` as a word, as in `none: <why>`) is never paged: once its until-probe passed PROBE_PASSES times in a row
 (not one ends.always_succeeds refuses, nor a pass whose job failed), its until-task is done, failed or cancelled
