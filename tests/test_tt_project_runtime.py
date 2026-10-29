@@ -21826,7 +21826,8 @@ def test_three_boot_time_wakes_of_a_waiting_task_block_it(env):
     assert t["blocked_reason"] == "lost to a host reboot 3 times; it may be causing them"
     assert "reboot_wakes" not in json.loads(t["result"]), "a block kept the old count"
     ev = p.db.q("SELECT severity, status FROM events WHERE kind='task_blocked' AND task=?", (tid,))
-    assert ev and ev[-1]["severity"] == "high" and ev[-1]["status"] == "queued", ev
+    # a plain task's block is normal (pagesev.raise_blocked); urgent ones page high
+    assert ev and ev[-1]["severity"] == "normal" and ev[-1]["status"] == "queued", ev
 
 
 @pytest.mark.parametrize("probe, job, wakes", [
