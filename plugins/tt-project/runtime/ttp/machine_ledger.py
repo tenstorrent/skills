@@ -134,7 +134,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from . import detach, ends, machines, netwait, outagetask, project
+from . import detach, ends, machines, netwait, outagetask, pagesev, project
 from .db import TERMINAL_TASK_STATES
 
 LEDGER = "machine-changes.json"
@@ -1433,8 +1433,8 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
             changed = True
             gave_up = c.get("auto_undo_failed") or {}
             if target:
-                _pending(page, target, "machine_change_overdue", f"machine-change:{c['id']}", c["alias"],
-                         float(c.get("page_from") or c["added"]),
+                episode = float(c.get("page_from") or c["added"])
+                _pending(page, target, "machine_change_overdue", f"machine-change:{c['id']}", c["alias"], episode,
                          f"Machine change #{c['id']} on {c['alias']} is overdue ({late}): {c['what']} "
                          f"(by {c.get('by')}). "
                          + (f"Its auto-undo gave up ({gave_up.get('why')})"
@@ -1442,6 +1442,11 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                                if gave_up.get("tail") else "") + ". " if gave_up else "")
                          + f"Page {page['stage'] + 1}: undo it with `{c['undo']}`, "
                          f"then `ttp machines change close {c['id']}`.")
+                # Normal unless a live serving machine's change is past its end unconfirmed; one
+                # fingerprint per change and episode, so each project hears of it once (pagesev.py).
+                page["pending"].update(
+                    severity=pagesev.change_severity(c, now, pagesev.serving_machine(machines.load().get(c["alias"]))),
+                    fp=pagesev.change_fingerprint(f"machine-change:{c['id']}", episode))
             claim(page)
         if changed:
             _write(LEDGER, ledger)

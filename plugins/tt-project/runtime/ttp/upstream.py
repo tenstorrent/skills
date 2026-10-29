@@ -270,7 +270,7 @@ def send(source: str, task: int | None, to: str, text: str, severity: str = "nor
                              "from": "daemon" if sender == "daemon" else "worker", "to": to, "severity": severity if severity in NOTE_SEVERITIES
                              else "normal", "title": title, "spec": text, "fp": fp, **({"at": at} if at else {}),
                              **({"back": back} if back and not at else {}),
-                             **({k: v for k, v in extra.items() if k == "outage"}
+                             **({k: v for k, v in extra.items() if k in ("outage", "page_fp")}
                                 if extra and sender == "daemon" else {})},
                             sort_keys=True) + "\n").encode())
         f.flush()
@@ -590,8 +590,13 @@ def _file(p: project.Project, sources, offsets: dict, known: set, seen: list, no
             sev, text = _event(n, cap)
             if n.get("project") and (n["project"], n.get("host")) != me:
                 routes[n["fp"]] = _route(n, src, now)
-            p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-                   (now, "upstream", "upstream_note", sev, text[:cap], "queued"))
+            # A daemon's page with a fingerprint (an overdue machine change, pagesev.change_fingerprint)
+            # reaches the coordinator once: a copy of one this project already has is kept, handled.
+            page_fp = str(n.get("page_fp") or "") if to and n.get("from") == "daemon" else ""
+            had = bool(page_fp) and bool(p.db.one("SELECT id FROM events WHERE fingerprint=?", (page_fp,)))
+            p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+                   (now, "upstream", "upstream_note", None if had else (page_fp or None), "low" if had else sev,
+                    text[:cap], "handled" if had else "queued"))
             added += 1
             if to and n.get("from") == "daemon" and n.get("outage"):
                 from . import outagetask   # a routed outage hand-off: the tracked task, in this project's own state

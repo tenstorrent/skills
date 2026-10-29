@@ -39,6 +39,7 @@ from . import chainprio
 from . import churnwatch
 from . import alerts
 from . import anchors
+from . import pagesev
 from . import askrethink
 from . import audit
 from . import redact
@@ -1846,6 +1847,13 @@ class Daemon:
         elif target == self.p.name and severity == "low":   # a held page's note: a feed line, no coordinator turn
             if not self.p.db.one("SELECT id FROM messages WHERE ref=? AND text=?", (page.get("id"), text)):
                 self.p.db.post("out", text, chat=None, kind="info", severity="low", ref=page.get("id"))
+        elif target == self.p.name and page.get("fp"):
+            # An overdue change: once per change and episode, also against a copy relayed by another
+            # project's daemon (upstream._file files it with the same fingerprint).
+            with self.p.db.tx():
+                if not self.p.db.one("SELECT id FROM events WHERE fingerprint=?", (page["fp"],)):
+                    self.p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) "
+                                "VALUES(?,?,?,?,?,?,?)", (now, "daemon", page["kind"], page["fp"], severity, text, "queued"))
         elif target == self.p.name:
             fp = page.get("id") or page["key"]
             with self.p.db.tx():
@@ -1853,8 +1861,9 @@ class Daemon:
                     self.p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) "
                                 "VALUES(?,?,?,?,?,?,?)", (now, "daemon", page["kind"], fp, "high", text, "queued"))
         else:
+            extra = {**({"outage": rec} if rec is not None else {}), **({"page_fp": page["fp"]} if page.get("fp") else {})}
             got = upstream.send(self.p.name, None, target, text, severity, now=now, sender="daemon",
-                                extra={"outage": rec} if rec is not None else None)
+                                extra=extra or None)
             if got not in ("sent", "duplicate"):
                 log(self.p, f"page for {page['key']} to {target}: {got}; retried on a later tick")
                 return False
@@ -6427,7 +6436,7 @@ class Daemon:
         if now < float(db.kv("coordinator_backoff_until", 0)):
             return
         msgs = db.q("SELECT id, ts, chat FROM messages WHERE direction='in' AND handled=0 ORDER BY id")
-        queued = db.q("SELECT id, ts, kind, severity, task, source FROM events WHERE status='queued' ORDER BY id")
+        queued = db.q("SELECT id, ts, kind, severity, task, source, data FROM events WHERE status='queued' ORDER BY id")
         max_evs = int(c.get("max_events_per_turn", 40))
         budget = float(c.get("turn_budget_usd", 1.0))
         # Items whose turn went over its cap are split, raised once or parked, never retried as is (turnsize.py).
@@ -6449,7 +6458,11 @@ class Daemon:
         evs = [e for e in evs if e["kind"] != sweep.SWEEP_KIND or e["id"] == sweep_event]
         wake: dict = {}
         w: dict | None = None
-        if not msgs and not evs:
+        # Ride-along events (pagesev.rides_along) start no turn: they join the next one something else
+        # starts, or start one themselves RIDE_ALONG_MAX_S after the oldest was raised.
+        rides = [e for e in evs if pagesev.rides_along(e)]
+        if not msgs and len(rides) == len(evs) and (
+                not rides or now - min(e["ts"] for e in rides) < pagesev.RIDE_ALONG_MAX_S):
             last = float(db.kv("last_coordinator_turn", 0))
             if now - last <= min(float(c.get("idle_wake_s", 3600)), float(c.get("starve_wake_s", 300))):
                 return
@@ -6465,7 +6478,7 @@ class Daemon:
             debounce = float(c.get("debounce_s", 15))
             if now - newest < debounce and now - oldest < 4 * debounce:
                 return
-            if not msgs and self._batch_hold(queued, now):
+            if not msgs and self._batch_hold([e for e in queued if not pagesev.rides_along(e)], now):
                 return
         if not msgs:
             try:
@@ -8736,14 +8749,13 @@ class Daemon:
             log(self.p, f"task {t['id']} waited from before the reboot; due now")
 
     def _block_after_reboot(self, t: dict, prev: dict, reason: str) -> None:
-        """Block waiting task t at boot for `reason`, with a high task_blocked event for the coordinator."""
+        """Block waiting task t at boot for `reason`, with a task_blocked event for the coordinator
+        (its severity and repeat folding: pagesev.raise_blocked)."""
         db = self.p.db
         prev.pop("reboot_wakes", None)
         with db.tx():
             db.update_task(t["id"], status="blocked", blocked_reason=reason[:500], result=dump_result(prev))
-            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-                 (time.time(), f"task:{t['id']}", "task_blocked", "high",
-                  f"#{t['id']} {t['title']} → blocked: {reason}", "queued", t["id"]))
+            pagesev.raise_blocked(db, t, reason, f"#{t['id']} {t['title']} → blocked: {reason}")
         log(self.p, f"task {t['id']} blocked: {reason}")
 
     def _relaunch_checks(self, t: dict, prev: dict) -> tuple[bool, int]:
@@ -10603,7 +10615,8 @@ class Daemon:
     def check_unqueued_continues(self) -> None:
         """Model-free, every CONTINUE_CHECK_EVERY_S: a task done CONTINUE_UNQUEUED_AFTER_S ago (within
         CONTINUE_UNQUEUED_WINDOW_S) whose hand-off proposed a `continue:` follow-up that no task has
-        taken up yet raises one high CONTINUE_UNQUEUED event, so a hop no turn queued is not lost. A
+        taken up yet raises one CONTINUE_UNQUEUED event, so a hop no turn queued is not lost (normal and
+        riding along with the next turn, high for an urgent task: pagesev.py). A
         continuing task is any later task that continues it (chaincap.prev_of), has the follow-up's
         title or, for a post-landing deploy step only (chaincap.deploy_proposal), waits on its
         landing (a start_when); every `continue:` follow-up must be taken up. One event per task, ever."""
@@ -10635,15 +10648,18 @@ class Daemon:
                     if not (hop or c.lower() in titles or (waiter and chaincap.deploy_proposal(f, task["id"])))]
             if not left:
                 continue
+            # Normal, riding along with the next turn due anyway; high for an urgent task (pagesev.py).
+            sev = pagesev.continue_severity(db, task)
             db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
-                 (now, f"task:{task['id']}", CONTINUE_UNQUEUED, "high",
+                 (now, f"task:{task['id']}", CONTINUE_UNQUEUED, sev,
                   f"#{task['id']} {headline.clip(task['title'], 160)}: its follow-up {left[0][0][:200]!r} is {UNQUEUED_TAG} and no "
                   f"task continues it {int(CONTINUE_UNQUEUED_AFTER_S // 60)} min after it finished. " + (
                       f"{deploy[0].upper()}{deploy[1:]} on purpose." if (
                           deploy := chaincap.deploy_proposal(left[0][1], task["id"])) else
                       f"Add it with task_add continues #{task['id']}, or drop it on purpose."),
-                  json.dumps({"followups": conts}), "queued", task["id"]))
-            log(self.p, f"task {task['id']}: continue follow-up not taken up; {CONTINUE_UNQUEUED} raised")
+                  json.dumps({"followups": conts, **({pagesev.RIDE_ALONG: True} if sev != "high" else {})}),
+                  "queued", task["id"]))
+            log(self.p, f"task {task['id']}: continue follow-up not taken up; {CONTINUE_UNQUEUED} raised ({sev})")
 
     def check_stale_duplicates(self) -> None:
         """Model-free, every CONTINUE_CHECK_EVERY_S: open work the plan no longer needs, surfaced once per

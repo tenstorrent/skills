@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import checkdirs, batch, conflictfix, coordinator as coord, cyclenotice, envfault, locks, msgparts, prhead, push, pushclaim, replymsg, runner, scopehold, sharedchecks, timefmt, upstream, urgent
+from . import checkdirs, batch, conflictfix, coordinator as coord, cyclenotice, envfault, locks, msgparts, pagesev, prhead, push, pushclaim, replymsg, runner, scopehold, sharedchecks, timefmt, upstream, urgent
 from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
                  pin_of, review_subject, reviewed_ids)
 from .landed import on_branch
@@ -1206,7 +1206,7 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
         reason = f"push refused: {why}"[:500]
         db.update_task(tid, status="blocked", blocked_reason=reason,
                        result=dump_result({**prev, "status": "blocked", "summary": summary}))
-        _event(db, task, "task_blocked", f"#{tid} {task['title']} → blocked: {reason}", queued=True, severity="high")
+        pagesev.raise_blocked(db, task, reason, f"#{tid} {task['title']} → blocked: {reason}")
         _reply(db, task, "blocked", summary, need=reason)
     elif "conflict" in states:
         r = next(r for r in current if r["status"] == "conflict")
