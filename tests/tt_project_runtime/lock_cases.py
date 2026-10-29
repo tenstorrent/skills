@@ -884,6 +884,9 @@ def test_a_held_label_naming_a_kernel_thread_is_holder_unverifiable_and_its_run_
     assert "stale" not in note      # its task is not done
     p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
     assert locks._holder_note(bad, where=p).endswith(f"; stale: task #{tid} is done")
+    p.db.x("UPDATE runs SET pid=NULL WHERE id=?", (rid,))    # no worker to ask: neither alive nor dead
+    note = locks._holder_note(bad, where=p)
+    assert "holder unverifiable" in note and "stale" not in note, note
 
 
 def test_an_urgent_lock_waiter_goes_ahead_of_routine_ones_and_only_an_urgent_task_gets_the_mark(env, tmp_path):
