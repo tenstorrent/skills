@@ -1454,9 +1454,54 @@ def marker_only_probe(probe: str | None, root: Path | str | None = None) -> str 
 
 
 HOLD_NEEDS_ANCHOR = ("a hold needs `waits_on`: ask:<id> (an open ask, or ask:new for the ask_user of this turn), "
-                     "resource:<name>, until:<time> or when:<probe>. A hold never replaces an ask or a decision: "
-                     "decide it yourself (requeue or cancel, memory_add the decision), or ask_user with a valid "
-                     "blocking category and waits_on ask:new, or set an end with until or when")
+                     "resource:<name>, until:<time> or when:<probe> (these two are stored as a deferral: the task "
+                     "is queued with start_after or start_when, model-free). A hold never replaces an ask or a "
+                     "decision: decide it yourself (requeue or cancel, memory_add the decision), or ask_user with "
+                     "a valid blocking category and waits_on ask:new, or set an end with until or when")
+
+
+def _hold_as_deferral(db, task: dict, a: dict, home: str | None = None) -> tuple[dict, str]:
+    """A task_update that holds a task on `until:<time>` or `when:<probe>` only (status blocked, or no
+    status on a blocked task) becomes a deferral: status queued with start_after or start_when, its
+    `why` (else `text`) as the start why, so no blocker sweep re-reads a hold only a time or a probe
+    ends. A plain time also records the why in the spec. Holds on an ask, a resource or a landing
+    (`when:landed:#<id>`, any probe whose landing terms split out) stay blocked (_hold_anchor):
+    (the action rewritten, the words saying so; '' when unchanged). Raises on a time not in the future
+    or a bad probe, as _hold_anchor does."""
+    raw = a.get("waits_on")
+    raw = raw.strip() if isinstance(raw, str) else ""
+    status = a.get("status")
+    if not raw or not (status == "blocked" or (status is None and task["status"] == "blocked")):
+        return a, ""
+    kind, _, value = raw.partition(":")
+    kind, value = kind.strip().lower(), value.strip()
+    if kind not in ("until", "when") or not value or (kind == "when" and landed.split_landed(value)[0]):
+        return a, ""
+    why = " ".join(str(a.get("why") if a.get("why") is not None else a.get("text") or "").split())
+    a = {k: v for k, v in a.items() if k != "waits_on"}
+    a["status"] = "queued"
+    if kind == "until":
+        try:
+            at = parse_start_after(value, tz=home)
+        except ValueError as e:
+            raise ValueError(f"#{task['id']} rejected: waits_on until: {str(e).replace('start_after ', '', 1)}") \
+                from None
+        if at is None:
+            raise ValueError(f"#{task['id']} rejected: waits_on until {value!r} is not in the future")
+        a["start_after"] = value
+        if why:   # the spec keeps it (a text that is not the why too: a queued task's text goes there)
+            a["text"] = "\n\n".join(x for x in (a.get("text") if a.get("why") is not None else None,
+                                                  f"Deferred until {value}: {why}") if x)
+        return a, f"waits_on until:{clip(value, 80)} was stored as start_after (queued, not blocked)"
+    check_probe(value, "waits_on when")
+    try:
+        check_task_refs(db, value, "waits_on when")
+    except MissingTaskRef as e:
+        raise MissingTaskRef(f"#{task['id']} rejected: {e}") from None
+    a["start_when"] = value
+    if why:
+        a["why"] = why
+    return a, f"waits_on when:{clip(value, 80)} was stored as start_when (queued, not blocked)"
 
 
 def _hold_anchor(db, task: dict, a: dict, turn_asks: list[tuple[int, int]], later_ask: bool,
@@ -1465,7 +1510,8 @@ def _hold_anchor(db, task: dict, a: dict, turn_asks: list[tuple[int, int]], late
     (anchors.py), or None when it sets none. `ask:new` names this turn's newest ask so far, or, with an
     ask_user later in the turn, stays `ask:new` until apply re-points it. Raises when the update would
     hold the task on nothing: blocked with no anchor (unless it keeps its own), or an anchor that is not
-    a valid one."""
+    a valid one. A hold on only a time or a probe reaches it already rewritten to a deferral
+    (_hold_as_deferral); its until/when branches keep landing holds and older anchors valid."""
     raw = a.get("waits_on")
     raw = raw.strip() if isinstance(raw, str) else ""
     status = a.get("status") if a.get("status") in ("queued", "blocked", "cancelled", "done", "waiting") else None
@@ -2082,6 +2128,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError(f"no task #{a.get('id')}")
                 batch_tasks[task["id"]] = task["reply_chat"]
                 a, as_deps = _landed_as_deps(p, a, dependency_ids(task))
+                a, as_deferral = _hold_as_deferral(db, task, a, timefmt.home(p))
                 upd: dict[str, Any] = {}
                 lull = None
                 if a.get("status") in ("queued", "blocked", "cancelled", "done", "waiting"):
@@ -2254,6 +2301,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     notes.append(lull)
                 if as_deps:
                     notes.append(f"task_update: #{task['id']} {as_deps}")
+                if as_deferral:
+                    notes.append(f"task_update: #{task['id']} {as_deferral}")
                 if waits == anchors.label("ask", anchors.NEW_ASK):
                     new_ask_holds.append((k, task, upd))
                 held_on = anchors.label("when", "")

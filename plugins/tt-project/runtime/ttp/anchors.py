@@ -7,7 +7,9 @@ The coordinator sets a task blocked (task_update status=blocked) only with `wait
 - `resource:<name>`: over once the resource is not paused and its lock is free,
 - `until:<time>`: over at that time (a delay such as 6h or an ISO time, as start_after),
 - `when:<probe>`: over once the shell probe exits 0 (as start_when; the daemon runs it).
-It is kept as the task label `waits:<kind>:<value>` (an until as epoch seconds). The daemon requeues an
+A coordinator hold on only `until:` or `when:` (not a landing) is stored as a deferral instead: the
+task is queued with start_after or start_when (coordinator._hold_as_deferral), so no blocker sweep
+re-reads it. Any other is kept as the task label `waits:<kind>:<value>` (an until as epoch seconds). The daemon requeues an
 anchored hold once its anchor is over, model-free (Daemon.sweep_holds). It lives only while the task is
 blocked: a trigger in db.py drops it from any write that leaves it on a task in another status.
 

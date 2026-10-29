@@ -6856,7 +6856,9 @@ def test_a_failed_detached_job_releases_a_when_hold_saying_it_failed(env, tmp_pa
     d = Daemon(p.base)
     tid = _hold_task(p)
     probe = _ended_jobs(tmp_path, bench=3)
-    assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "blocked", "waits_on": f"when:{probe}"}]) == []
+    # A `when:` hold the coordinator sets is stored as a deferral now; a hold kept from before still
+    # carries the anchor, and the daemon still releases it.
+    p.db.update_task(tid, status="blocked", labels=[f"waits:when:{probe}"])
     d.sweep_holds()
     d._probes[tid][0].wait(30)
     d.probe_waiting()
@@ -9021,7 +9023,7 @@ def test_a_broken_waits_on_when_probe_raises_one_event_and_a_log_line(env, monke
     monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
     d = dmod.Daemon(p.base)
     tid = _hold_task(p)
-    coord.apply(p, [{"type": "task_update", "id": tid, "status": "blocked", "waits_on": f"when:{probe}"}])
+    p.db.update_task(tid, status="blocked", labels=[f"waits:when:{probe}"])   # an anchor kept from before
     for _ in range(4):   # several polls: still one event
         d.sweep_holds()
         if tid in d._probes:
@@ -11061,13 +11063,62 @@ def test_a_hold_without_an_anchor_is_rejected_and_a_bad_anchor_too(env):
     assert "goes with status blocked" in got[0]
     # A daemon-made block stays as it is, and a text change on an anchored hold keeps its anchor.
     p.db.update_task(tid, status="blocked", blocked_reason="task budget exhausted")
-    assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "blocked", "waits_on": "until:6h",
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "blocked", "waits_on": "resource:board-a",
                             "text": "after the window"}]) == []
     assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "blocked", "text": "still"}]) == []
-    assert p.db.task(tid)["blocked_reason"] == "still" and "waits:until:" in p.db.task(tid)["labels"]
+    assert p.db.task(tid)["blocked_reason"] == "still" and "waits:resource:board-a" in p.db.task(tid)["labels"]
     # Leaving blocked drops the anchor.
     assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "queued"}]) == []
     assert "waits:" not in p.db.task(tid)["labels"]
+
+
+
+def test_a_hold_on_only_a_time_or_a_probe_is_stored_as_a_deferral(env, tmp_path):
+    """A task_update blocking on `until:` or `when:` only becomes a queued deferral (start_after or
+    start_when, its why kept), so no blocker sweep re-reads it; ask, resource and landing holds stay
+    blocked."""
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.db import deferral
+    until_t, when_t, kept_t, ask_t, res_t, land_t, bad_t = (_hold_task(p, n) for n in (
+        "until", "when", "already blocked", "ask", "resource", "landing", "bad"))
+    other = p.db.add_task("the change", "s", origin="user")
+    flag = tmp_path / "go"
+    assert coord.apply(p, [
+        {"type": "task_update", "id": until_t, "status": "blocked", "waits_on": "until:6h",
+         "why": "after the gate expires"},
+        {"type": "task_update", "id": when_t, "status": "blocked", "waits_on": f"when:test -e {flag}",
+         "text": "until the user saves the file"},
+        {"type": "ask_user", "text": "May I spend $40 on the long run?", "blocking": "spend"},
+        {"type": "task_update", "id": ask_t, "status": "blocked", "waits_on": "ask:new"},
+        {"type": "task_update", "id": res_t, "status": "blocked", "waits_on": "resource:board-a"},
+        {"type": "task_update", "id": land_t, "status": "blocked", "waits_on": f"when:landed:#{other}"}]) == []
+    t = p.db.task(until_t)
+    assert t["status"] == "queued" and "waits:" not in t["labels"] and t["blocked_reason"] is None
+    assert 6 * 3600 - 120 < deferral(t)["after"] - time.time() <= 6 * 3600 + 1
+    assert t["not_before"] and "Deferred until 6h: after the gate expires" in t["spec"]
+    t = p.db.task(when_t)
+    assert t["status"] == "queued" and "waits:" not in t["labels"]
+    assert deferral(t)["when"] == f"test -e {flag}" and deferral(t)["why"] == "until the user saves the file"
+    notes = p.db.kv(coord.NOTES_KEY) or []
+    assert any(f"#{until_t} waits_on until:6h was stored as start_after" in n for n in notes), notes
+    assert any(f"#{when_t} waits_on when:" in n and "start_when" in n for n in notes), notes
+    for tid, lb in ((ask_t, '"waits:ask:'), (res_t, '"waits:resource:board-a"'), (land_t, f'"waits:when:landed:#{other}"')):
+        t = p.db.task(tid)
+        assert t["status"] == "blocked" and lb in t["labels"] and not deferral(t), t["title"]
+    # No status on a task already blocked: still a deferral. A bad time or probe is still rejected.
+    p.db.update_task(kept_t, status="blocked", blocked_reason="task budget exhausted")
+    assert coord.apply(p, [{"type": "task_update", "id": kept_t, "waits_on": "until:2h"}]) == []
+    assert p.db.task(kept_t)["status"] == "queued" and deferral(p.db.task(kept_t))["after"]
+    for bad in ("until:2001-01-01T00:00", "until:soon", "when:sleep 999999 & true"):
+        got = coord.apply(p, [{"type": "task_update", "id": bad_t, "status": "blocked", "waits_on": bad}])
+        assert len(got) == 1 and ("rejected" in got[0] or "waits_on when" in got[0]), (bad, got)
+        assert p.db.task(bad_t)["status"] == "queued" and not deferral(p.db.task(bad_t)), bad
+    # A running task is not deferred by it either.
+    p.db.update_task(bad_t, status="running")
+    got = coord.apply(p, [{"type": "task_update", "id": bad_t, "status": "blocked", "waits_on": "until:2h"}])
+    assert len(got) == 1 and "is running" in got[0]
+    assert p.db.task(bad_t)["status"] == "running"
 
 
 
@@ -11103,10 +11154,11 @@ def test_each_hold_anchor_releases_its_task_once_it_is_over(env, tmp_path):
     flag = tmp_path / "go"
     assert coord.apply(p, [{"type": "ask_user", "text": "May I spend $40 on the long run?", "blocking": "spend"},
                            {"type": "task_update", "id": ask_t, "status": "blocked", "waits_on": "ask:new"},
-                           {"type": "task_update", "id": until_t, "status": "blocked", "waits_on": "until:2h"},
-                           {"type": "task_update", "id": res_t, "status": "blocked", "waits_on": "resource:board-a"},
-                           {"type": "task_update", "id": when_t, "status": "blocked",
-                            "waits_on": f"when:test -e {flag}"}]) == []
+                           {"type": "task_update", "id": res_t, "status": "blocked", "waits_on": "resource:board-a"}]) == []
+    # The coordinator's until/when holds are stored as deferrals (test below); anchors kept from
+    # before still release.
+    p.db.update_task(until_t, status="blocked", labels=[f"waits:until:{time.time() + 7200:.0f}"])
+    p.db.update_task(when_t, status="blocked", labels=[f"waits:when:test -e {flag}"])
     coord.pause_resource(p, "board-a", True, "maintenance")
     d.sweep_holds()
     if when_t in d._probes:
@@ -12296,7 +12348,7 @@ def test_blocker_sweep_age_of_a_coordinator_block_survives_a_spec_addendum(env):
     t = db.add_task("coordinator block", spec="do the thing")
     db.x("UPDATE messages SET handled=1 WHERE direction='in'")
     assert coord.apply(p, [{"type": "task_update", "id": t, "status": "blocked", "text": "until the rig is back",
-                            "waits_on": "when:test -e /nonexistent-rig-marker"}]) == []
+                            "waits_on": "resource:rig-a"}]) == []
     assert db.task(t)["status"] == "blocked"
     assert not db.q("SELECT id FROM events WHERE task=? AND kind='task_blocked'", (t,))
     then = time.time() - 20 * 3600

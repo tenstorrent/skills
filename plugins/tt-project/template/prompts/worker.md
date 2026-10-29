@@ -152,7 +152,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
  "next_step": "if waiting: one short mechanical command a light wake runs",
  "on_pass": {"status": "done", "summary": "if waiting on your own `ttp checks --detach`: the final hand-off if they pass"},
  "on_pass_cmd": "if waiting: a check that writes the final hand-off (below)",
- "wait_kind": "if waiting: self (your own detached checks or jobs, a window you planned) or external",
+ "wait_kind": "if waiting: self (your own detached checks or jobs, a window you planned), user (only the user's step ends it) or external",
 <!-- /ttp:if wait -->
 <!-- ttp:if device -->
  "needs_deep": "device task only: the problem you could not solve at this tier; its retry runs deep",

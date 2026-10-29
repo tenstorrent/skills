@@ -71,7 +71,10 @@ PLANNED_WINDOW = re.compile(
     r"settling|cool-?down|data[- ]collection)\s+(time\s+)?(window|period|interval|run)\b"
     r"|\b(window|period|delay)\s+(it|I|the task|this task|we)\s+(set|planned|chose)\b"
     r"|\bstart_(after|when)\b", re.I)
-WAIT_KINDS = ("self", "external")
+WAIT_KINDS = ("self", "external", "user")
+# A wait only the user's step ends (a sign-in, a confirmation): no worker can end it, so it is never a
+# self-wait and raises no probe stall (progress.probe_stalls); it counts as an external wait otherwise.
+USER_WAIT_KINDS = ("user", "user-action")
 LIVE_WAITS_MAX = 6   # coordinator.live_waits_max: waits on the same live jobs or locks in 24 h that stay routine
 _SHELL_OPS = frozenset({"&&", "||", ";", "|", "&"})
 # A cheap wake that found work and runs again at once: the same wait going on, never a new one.
@@ -124,10 +127,13 @@ def handback(text: str) -> str | None:
 def classify_wait(result: dict | None) -> tuple[str, str]:
     """(kind, why) of a waiting hand-off: kind 'self' when the task waits on its own progress (its
     detached checks or jobs, the push queue, a time window or start_after/start_when it set), else
-    'external' (a busy resource or lock, another task, a human, a review). The hand-off's own
-    `wait_kind` wins; an unknown wait counts as external, so a real one still raises effort."""
+    'external' (a busy resource or lock, another task, a human, a review), or 'user' when the hand-off
+    says only the user's step ends it (`user` or `user-action`; never a self-wait, counted as external).
+    The hand-off's own `wait_kind` wins; an unknown wait counts as external, so a real one still raises effort."""
     r = result if isinstance(result, dict) else {}
     own = str(r.get("wait_kind") or "").strip().lower()
+    if own in USER_WAIT_KINDS:
+        return "user", "hand-off"
     if own in WAIT_KINDS:
         return own, "hand-off"
     probe = str(r.get("retry_when") or "")

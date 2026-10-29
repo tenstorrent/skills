@@ -350,7 +350,8 @@ prolonged whole-box outage.
   `stall` event
   names a repeat: a retry_when or start_when probe still saying not yet after `probe_n` (10)
   verdicts and `probe_h` (1) hour (waits
-  on the task's own job, a push, CI, another task or a time are left out), a task's or schedule's
+  on the task's own job, a push, CI, another task, a time or the user's step (wait_kind `user`, or an
+  obligation owner whose wait names the user) are left out), a task's or schedule's
   worker runs failing `fail_n` (3) times in a row the same way, or a schedule failing `repeat_n` (5)
   times in a row the same way (a skip on its own daily cap is the schedule-budget observation's, not
   counted again). A driver's refusals and failures are counted once, by the `ttp progress report`

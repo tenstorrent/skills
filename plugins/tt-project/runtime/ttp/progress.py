@@ -282,6 +282,10 @@ BAD_RUNS = ("failed", "timeout", "stalled")
 # a push, CI, another task landing, another project's reply, an upstream fix, a time.
 OWN_WAIT_RE = re.compile(r"detach --check|checks --result|push --result|\bttp ci\b|ack-wait|landed:|ttp landed|"
                          r"upstream --fixed|^\s*test \"\$\(date")
+# A wait only the user ends: the hand-off's wait_kind (unblock.USER_WAIT_KINDS), or a waiting_for or
+# blocked_reason naming the user on a task that owns an open obligation.
+NAMES_USER_RE = re.compile(r"\b(?:the user|user's|user’s|user to|user (?:must|has to|needs to|signs?|confirms?|"
+                           r"approves?|answers?|replies|reply|acts?|does|takes?)|user-action|user action)\b", re.I)
 FIX_RE = re.compile(r"\b(fix\w*|repair\w*|recover\w*|restor\w*|reboot\w*|reset\w*|heal\w*|unstick\w*|revive\w*)\b", re.I)
 REASON_CHARS = 200
 HISTORY_KEEP = 200
@@ -547,6 +551,19 @@ def _self_ref(db: DB, t: dict, probe: str, rc: Any, paused: dict, trouble: dict)
     return ""
 
 
+def _user_wait(db: DB, t: dict, res: dict) -> bool:
+    """Whether task `t` waits model-free on the user's step: its hand-off's wait_kind is `user` (or
+    `user-action`), or it owns an open obligation and its waiting_for or blocked_reason names the user."""
+    from .unblock import USER_WAIT_KINDS
+    if str(res.get("wait_kind") or "").strip().lower() in USER_WAIT_KINDS:
+        return True
+    said = " ".join(str(x or "") for x in (res.get("waiting_for"), t.get("blocked_reason")))
+    if not NAMES_USER_RE.search(said):
+        return False
+    from .obligations import _load, _open_owners
+    return str(t["id"]) in _open_owners(_load(db))
+
+
 def probe_stalls(db: DB, s: dict, st: dict, now: float, current_probe: Callable[[dict], str | None],
                  cfg: dict | None = None, gone: set | None = None, harness=None) -> list[dict]:
     """Probe stalls; adds to `gone` the raised keys whose count was dropped as no longer valid. `harness`:
@@ -568,8 +585,11 @@ def probe_stalls(db: DB, s: dict, st: dict, now: float, current_probe: Callable[
             if gone is not None:
                 gone.add(f"stall:probe:#{k}")
             continue
-        if t["status"] == "waiting" and load_result(t["result"]).get("wait_kind") == "self":
+        res = load_result(t["result"])
+        if t["status"] == "waiting" and res.get("wait_kind") == "self":
             continue   # its own job or window: the wait checks cover a job that hangs
+        if _user_wait(db, t, res):
+            continue   # only the user's step ends it: no worker can speed it up (the probe keeps counting)
         if userpause.is_probe(rec["probe"], cfg):
             continue   # a user pause: only the user's word ends it, so saying not yet is no stall
         if not s["probe_n"] or OWN_WAIT_RE.search(rec["probe"]) or ackwait.is_probe(rec["probe"], cfg, harness) \

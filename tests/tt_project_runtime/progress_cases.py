@@ -1068,6 +1068,43 @@ def test_a_reply_wait_on_the_projects_own_ack_wait_wrapper_raises_no_probe_stall
     assert set(progress.load(p.db)["raised"]) == {f"stall:probe:#{flagged}"}
 
 
+def test_a_wait_on_the_users_step_raises_no_probe_stall_and_self_or_external_waits_still_do(env):
+    """A wait only the user's step ends (wait_kind `user` or `user-action`, or an obligation owner whose
+    waiting_for or blocked_reason names the user) raises no probe stall: no worker can speed it up. The
+    probe still counts. A self or external wait, or a user-naming wait with no open obligation, is
+    judged as before."""
+    from ttp import obligations, progress, unblock
+    p = make(env)
+    now, probes = time.time(), {}
+    probe = "test -e out/signed-in.flag"
+    cases = {"user": {"wait_kind": "user"}, "user-action": {"wait_kind": "User-Action"},
+             "owed": {"waiting_for": "the user to sign in on the box"},
+             "owed-blocked": {"waiting_for": "a board"},
+             "external": {"wait_kind": "external"},
+             "unowed": {"waiting_for": "the user to sign in on the box"},
+             "owed-not-user": {"waiting_for": "a board"}}
+    ids = {}
+    for name, extra in cases.items():
+        tid = ids[name] = _due_waiting_task(p, probe, since_ago=5000, **extra)
+        probes[tid] = probe
+        for i in range(21):
+            progress.note_probe(p.db, tid, probe, 1, "not yet", now - 4000 + i * 180)
+    p.db.update_task(ids["owed-blocked"], status="blocked", blocked_reason="waits for the user's sign-in")
+    for name in ("owed", "owed-blocked", "owed-not-user"):
+        obligations.add(p, f"deliverable of #{ids[name]}", owners=[ids[name]])
+    cur = lambda t: probes.get(t["id"])
+    got = progress.check(p.db, p.config(), p.state, now, where=p, current_probe=cur)
+    raised = {k for e in got for k in e["keys"]}
+    assert raised == {f"probe:#{ids[n]}" for n in ("external", "unowed", "owed-not-user")}, (raised, ids)
+    assert int(progress.load(p.db)["probes"][str(ids["user"])]["n"]) == 21   # the probe still counts
+    # unblock: a user wait is its own kind, never a self-wait a worker could end.
+    assert unblock.classify_wait({"wait_kind": "user"}) == ("user", "hand-off")
+    assert unblock.classify_wait({"wait_kind": "user-action", "retry_when": "ttp detach --check x"})[0] == "user"
+    assert unblock.classify_wait({"wait_kind": "bogus"})[0] == "external"
+    assert unblock.wait_data(json.dumps({"wait": "user", "why": "hand-off"})) \
+        and not unblock.is_self_wait(json.dumps({"wait": "user"}))
+
+
 def test_a_reply_wait_stays_quiet_while_its_peer_recovers_and_re_arms_once_it_is_ready(env, monkeypatch):
     """While the project a reply wait waits on cannot act (read-only from its own state through
     machine_ledger.can_act), the wait raises no wait_stale and its note says the peer is recovering. Once
