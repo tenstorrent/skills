@@ -7,7 +7,7 @@ A project's own checks on `gh` calls go in `bin/gh.d/`, never in `bin/gh`.
 
 Before each `gh` call from a run, `bin/gh` runs every executable, non-hidden regular file in `bin/gh.d/`, sorted by name.
 Each hook gets gh's arguments as its own (`pr comment 7 --body-file -`).
-When the call reads stdin (`--input -`, `-F name=@-`, `--body-file -` and the like; see `needs_stdin` in `ttp/prguard.py`), stdin is read whole once, up to 16 MiB, and the same bytes go to every hook and then to gh (empty when gh's stdin is a terminal).
+When the call reads stdin (`--input -`, `-F name=@-`, `--body-file -` and the like, also with `/dev/stdin`, `/dev/fd/0` or `/proc/self/fd/0` for `-`; see `needs_stdin` in `ttp/prguard.py`), stdin is read whole once, up to 16 MiB, and the same bytes go to every hook and then to gh (empty when gh's stdin is a terminal).
 Any other call gives the hooks and gh /dev/null, so a caller's open stdin pipe never stalls it.
 The environment is the run's plus `TTP_GH_REAL`, the real gh: a hook that calls gh itself uses `"$TTP_GH_REAL"`, since plain `gh` would run the hooks again.
 A hook's stdout and stderr go to the caller's stderr, so it says there why it refused.

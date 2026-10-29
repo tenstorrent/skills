@@ -1004,7 +1004,9 @@ def _restore_stdin(data: bytes) -> None:
 # value, a gist's content, a key, a token, workflow inputs as JSON): they keep it.
 STDIN_COMMANDS = frozenset((("secret", "set"), ("variable", "set"), ("gist", "create"), ("ssh-key", "add"),
                             ("gpg-key", "add"), ("auth", "login"), ("workflow", "run"), ("alias", "import"),
-                            ("extension", "exec")))
+                            ("extension", "exec"), ("codespace", "ssh")))
+# What gh reads as stdin: `-` and the paths that name fd 0.
+STDIN_PATHS = frozenset(("-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"))
 
 
 def needs_stdin(args: list[str]) -> bool:
@@ -1016,18 +1018,20 @@ def needs_stdin(args: list[str]) -> bool:
     - `--body-file -`, `--body-file=-`, `--notes-file -`, `--notes-file=-`, `-F -`, `-F-`, `-F=-` (pr and
       issue create/edit/comment/review, pr merge, release create/edit: the text from stdin);
     - any lone `-` argument (gist create -, ssh-key add -, secret set -f -, alias import -);
-    - STDIN_COMMANDS, and a first word that is not one of GH_COMMANDS (an extension or alias, which
-      may read it)."""
+    - each of these with a path that names stdin in place of `-` (STDIN_PATHS: /dev/stdin, /dev/fd/0,
+      /proc/self/fd/0), e.g. `--body-file /dev/stdin`, `-F name=@/dev/fd/0`, a lone `/dev/stdin`;
+    - STDIN_COMMANDS (codespace ssh passes it to the remote command), and a first word that is not one
+      of GH_COMMANDS (an extension or alias, which may read it)."""
     if not args or args[0] == "--":
         return False
     if not args[0].startswith("-") and args[0] not in GH_COMMANDS:
         return True
-    if tuple(args[:2]) in STDIN_COMMANDS or "-" in args:
+    if tuple(args[:2]) in STDIN_COMMANDS or STDIN_PATHS.intersection(args):
         return True
-    if "-" in _opts(args, ("--input", "--body-file", "--notes-file")):
+    if STDIN_PATHS.intersection(_opts(args, ("--input", "--body-file", "--notes-file"))):
         return True
     fields = [v.removeprefix("=") for v in _opts(args, ("-F", "--field"))]   # -F=x is -F x to gh
-    return any(v == "-" or v.endswith("=@-") for v in fields)
+    return any(v in STDIN_PATHS or v.partition("=")[2] in {"@" + s for s in STDIN_PATHS} for v in fields)
 
 
 def _stdin_devnull() -> None:

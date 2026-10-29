@@ -191,11 +191,19 @@ def test_gh_needs_stdin_only_for_the_forms_that_read_it():
              ["pr", "create", "--body-file", "-"], ["pr", "edit", "7", "--body-file=-"], ["pr", "comment", "7", "-F", "-"],
              ["issue", "comment", "7", "-F-"], ["pr", "review", "7", "-F=-"], ["release", "create", "v1", "--notes-file", "-"],
              ["gist", "create"], ["secret", "set", "X"], ["variable", "set", "X"], ["auth", "login", "--with-token"],
-             ["ssh-key", "add", "-"], ["alias", "import", "-"], ["some-extension", "x"]]
+             ["ssh-key", "add", "-"], ["alias", "import", "-"], ["some-extension", "x"],
+             ["pr", "comment", "7", "--body-file", "/dev/stdin"], ["pr", "edit", "7", "--body-file=/dev/fd/0"],
+             ["release", "create", "v1", "--notes-file", "/dev/stdin"], ["pr", "comment", "7", "-F", "/dev/stdin"],
+             ["issue", "comment", "7", "-F/proc/self/fd/0"], ["api", "x", "--input", "/dev/stdin"],
+             ["api", "x", "--input=/proc/self/fd/0"], ["api", "x", "-F", "b=@/dev/stdin"],
+             ["api", "x", "--field", "b=@/proc/self/fd/0"], ["api", "x", "-F=b=@/dev/fd/0"],
+             ["ssh-key", "add", "/dev/stdin"], ["gist", "view", "/dev/fd/0"], ["codespace", "ssh", "-c", "c", "cat"]]
     quiet = [["api", "repos/<owner>/<repo>/commits?sha=main&per_page=1", "--jq", ".[0].sha"],
              ["api", "x", "-f", "b=@-"], ["api", "x", "--raw-field", "b=@-"], ["api", "x", "-F", "b=@file"],
              ["api", "x", "--input", "body.json"], ["api", "x", "--input=-x"], ["pr", "create", "--body-file", "b.md"],
-             ["pr", "list"], ["pr", "view", "7", "--json", "body"], ["--version"], []]
+             ["pr", "list"], ["pr", "view", "7", "--json", "body"], ["--version"], [],
+             ["api", "x", "-f", "b=@/dev/stdin"], ["api", "x", "-F", "b=/dev/stdin"], ["api", "x", "-F", "b=-"],
+             ["pr", "create", "--body-file", "/dev/stdinx"], ["codespace", "list"]]
     assert [a for a in reads if not needs_stdin(a)] == [] and [a for a in quiet if needs_stdin(a)] == []
 
 
@@ -246,6 +254,24 @@ def test_gh_api_stdin_forms_still_reach_hooks_and_gh_intact(env, tmp_path):
         r = _gh_main(p, tmp_path, ["api", ep, *extra], data, fake=fake)
         assert r.returncode == 0, (extra, r.stderr)
         assert (tmp_path / "hook.stdin").read_bytes() == data and (tmp_path / "gh.stdin").read_bytes() == data, extra
+
+
+def test_gh_body_file_dev_stdin_reaches_gh_intact(env, tmp_path):
+    """`echo body | gh pr comment 7 --body-file /dev/stdin`: gh reads the piped body, not /dev/null."""
+    p = make(env)
+    fake = tmp_path / "stdinbin"
+    fake.mkdir()
+    (fake / "gh").write_text(f"#!{sys.executable}\nimport sys\n"
+                             f"open({str(tmp_path / 'gh.stdin')!r}, 'wb').write(open(sys.argv[-1], 'rb').read())\n")
+    (fake / "gh").chmod(0o755)
+    for hooked in (False, True):
+        if hooked:
+            _gh_hook(p, "10-a", f"#!/bin/sh\ncat > {tmp_path / 'hook.stdin'}\n")
+        data = f"hello body {hooked}\n".encode()
+        r = _gh_main(p, tmp_path, ["pr", "comment", "7", "--body-file", "/dev/stdin"], data, fake=fake)
+        assert r.returncode == 0, (hooked, r.stderr)
+        assert (tmp_path / "gh.stdin").read_bytes() == data, hooked
+        assert not hooked or (tmp_path / "hook.stdin").read_bytes() == data
 
 
 def test_upgrade_leaves_the_projects_gh_pre_hooks_alone(env, monkeypatch):
