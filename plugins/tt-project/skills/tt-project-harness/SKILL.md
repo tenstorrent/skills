@@ -201,7 +201,7 @@ read the one for the lever you change.
 
 ## Resetting a Blackhole Galaxy host
 
-Company-wide practice; the long form is in the `tt-project:setup-box` skill's `recovery.md`.
+Company-wide practice; the long form is in the `tt-project:setup-box` skill's recovery reference (recovery.md).
 
 - Reset a host's own chips with `tt-smi -glx_reset`, then rescan the root ports and recount the
   chips by BDF and tray. `tt-smi -r` is never used, not even as a fallback. Where glx_reset cannot

@@ -6299,7 +6299,7 @@ def test_worker_prompt_and_harness_skill_state_the_glx_reset_only_practice():
     skill = re.sub(r"\s+", " ", (SKILLS / "tt-project-harness" / "SKILL.md").read_text())
     for part in ("rescan the root ports and recount the chips by BDF and tray", "never `sudo -n true`",
                  "`sudo -n -l`", "never affects other hosts", "op 0x3 only", "are junk",
-                 "`tt-project:setup-box` skill's `recovery.md`"):
+                 "`tt-project:setup-box` skill's recovery reference"):
         assert part in skill, part
 
 
