@@ -5,8 +5,12 @@
 Before an ask_user goes out, `settled_by` compares it with what is already settled, within
 coordinator.reask_window_days (default WINDOW_DAYS; 0 turns the gate off):
 - asks resolved with a linked user answer (unblock.RESOLVED_KEY; a 'decide it yourself' answer too),
-- the user's own verbatim messages (the relayer's context is dropped; a question, or an 'ask me
-  first' sentence, settles nothing),
+- the user's own verbatim messages that answer or correct something (the relayer's context is
+  dropped): a message linked to an ask (a '#<id>:' prefix, or recorded as an ask's answer) counts
+  whole; any other message only by its sentences that carry a decision or correction marker
+  (DECIDED: do not, never, keep, stop, instead, yes, decide yourself...). A plain request ('Set up
+  X') answers nothing, so it never refuses the follow-up ask it leads to; a question, or an 'ask me
+  first' sentence, settles nothing,
 - memory entries of kind decision, preference, restriction or fact that cite a user message or are a
   `Correction (user msg #id)` fact,
 - the charter's Policies and Goals items (no age: the charter is current).
@@ -17,9 +21,9 @@ Match: each record is cut into sentences; an ask matches a sentence by content w
 punctuation and STOP words dropped, a light suffix stem) when they share at least MIN_SHARED words
 and either their Jaccard is at least JACCARD, or they share a hard anchor (a task id, PR, machine or
 resource alias, config key) and the Jaccard is at least ANCHORED_JACCARD with the record covering at
-least CONTAINS of the ask's words. Asks and records that both carry anchors but share none are about
-different things and never match; an anchor alone with low word overlap is not enough. When unsure
-the ask goes out: the thresholds favour a missed re-ask over a false refusal.
+least CONTAINS of the ask's words and MIN_SHARED shared words besides the anchors. Asks and records
+that both carry anchors but share none are about different things and never match; an anchor alone
+with low word overlap is not enough. When unsure the ask goes out: the thresholds favour a missed re-ask over a false refusal.
 """
 from __future__ import annotations
 
@@ -54,6 +58,10 @@ _ALIAS = re.compile(r"\b[a-z][a-z0-9_-]*\d[a-z0-9_-]*\b")
 _USER_MSG = re.compile(r"\buser (?:msg|message)s? #\d+", re.I)
 _ASK_FIRST = re.compile(r"\b(?:ask|check with|confirm with|tell|ping) me\b|\bask (?:first|before)\b", re.I)
 _CHARTER_SECTIONS = ("policies", "goals")
+_LINKED = re.compile(r"^\s*#\d+\s*:")   # '#<id>: ...', the user's answer to ask #id
+DECIDED = re.compile(r"\b(?:do not|does not|don't|dont|never|keep|stop|no(?! (?:rush|hurry))|not(?! sure)|instead|rather|already "
+                     r"(?:said|told|answered|decided)|decide (?:it |that |this )?yourself|your call|yes|approved?|"
+                     r"denied|declined?|rejected?|leave it|as is)\b", re.I)
 
 
 def window_days(cfg: dict | None) -> float:
@@ -101,7 +109,11 @@ def matches(ask: str, record: str) -> bool:
     if aa and ra and not aa & ra:
         return False
     jac = len(shared) / len(a | r)
-    return jac >= JACCARD or bool(aa & ra) and jac >= ANCHORED_JACCARD and len(shared) / len(a) >= CONTAINS
+    if jac >= JACCARD:
+        return True
+    plain = {w for w in shared if not re.search(r"\d|[.:/#]", w)}   # an alias, id or key is no word here
+    return bool(aa & ra) and jac >= ANCHORED_JACCARD and len(shared) / len(a) >= CONTAINS \
+        and len(plain) >= MIN_SHARED
 
 
 def _sentences(text: str) -> list[str]:
@@ -113,11 +125,14 @@ def _line(text: str) -> str:
     return text if len(text) <= QUOTE else text[:QUOTE - 3].rstrip() + "..."
 
 
-def _hit(ask: str, text: str, settling: bool = True) -> str | None:
+def _hit(ask: str, text: str, settling: bool = True, decided: bool = False) -> str | None:
     """The first sentence of `text` that matches `ask`. With `settling`, a question or an
-    'ask me first' sentence never settles anything."""
+    'ask me first' sentence never settles anything; with `decided`, only a sentence with a
+    decision or correction marker does."""
     for s in _sentences(text):
         if settling and (s.endswith("?") or _ASK_FIRST.search(s)):
+            continue
+        if decided and not DECIDED.search(s):
             continue
         if matches(ask, s):
             return s
@@ -161,9 +176,13 @@ def settled_by(p, cfg: dict | None, ask: str, change: bool = False, now: float |
     if found:
         return found
     from .relay import split
+    from .unblock import RESOLVED_KEY
+    answers = {int(m) for r in (db.kv(RESOLVED_KEY, {}) or {}).values() if isinstance(r, dict)
+               for m in r.get("messages") or [] if str(m).isdigit()}
     for m in db.q("SELECT id, text, context FROM messages WHERE direction='in' AND kind='user' "
                   "AND COALESCE(provenance,'')!='system' AND ts>=? ORDER BY id DESC", (since,)):
-        s = _hit(ask, split(m["text"] or "", m["context"])[0])
+        said = split(m["text"] or "", m["context"])[0]
+        s = _hit(ask, said, decided=not (m["id"] in answers or _LINKED.match(said)))
         if s:
             return f'user msg #{m["id"]}: "{_line(s)}"'
     from .project import CORRECTION_PREFIX, _stamp_ts

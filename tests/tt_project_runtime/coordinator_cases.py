@@ -4638,6 +4638,34 @@ def test_the_re_ask_gate_lets_unrelated_old_and_charter_only_restriction_asks_th
     assert "coordinator.reask_window_days" in coord.USER_SETTABLE
 
 
+def test_a_users_request_never_refuses_the_follow_up_ask_it_leads_to(env):
+    """A plain request answers nothing: its clarifying or access ask goes out. The same words as a
+    decision, or linked to an ask, still settle it."""
+    p = make(env)
+    from ttp import reask
+    db = p.db
+    for said, ask in (("Switch the dogfood channel to weekly cuts.",
+                       "Switch the dogfood channel to weekly cuts: which weekday should the cut run?"),
+                      ("No rush, not sure when: switch the dogfood channel to weekly cuts.",
+                       "Switch the dogfood channel to weekly cuts: which weekday should the cut run?"),
+                      ("Set up the Atlassian connector on box-a1.",
+                       "The Atlassian connector on box-a1 needs an API token; please create one.")):
+        db.x("DELETE FROM messages WHERE direction='in'")
+        db.post("in", said, chat=None, kind="user", provenance="web-session")
+        problems, sent = _ask(p, ask, blocking="access")
+        assert problems == [] and sent["text"].startswith(ask), (said, problems)
+        db.x("UPDATE messages SET handled=1 WHERE kind='ask'")
+    # The alias as one of only 3 shared words never fires the anchored path.
+    assert not reask.matches("The Atlassian connector on box-a1 needs an API token; please create one.",
+                             "Keep the Atlassian connector on box-a1.")
+    # A decision marker, or a '#<id>:' answer, still settles the same subject.
+    ask = "Should the dogfood channel switch to weekly cuts?"
+    for said in ("Keep the dogfood channel on weekly cuts.", "#12: switch the dogfood channel to weekly cuts."):
+        db.x("DELETE FROM messages WHERE direction='in'")
+        mid = db.post("in", said, chat=None, kind="user", provenance="web-session")
+        assert reask.settled_by(p, p.config(), ask) == f'user msg #{mid}: "{said}"', said
+
+
 def test_a_review_or_merge_ask_with_a_pr_approve_record_is_refused_once_naming_it(env):
     p = make(env)
     from ttp import coordinator as coord, prguard, timefmt
