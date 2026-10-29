@@ -3903,8 +3903,10 @@ class Daemon:
     def _prefetch_git(self, task: dict | None, result) -> None:
         """The git facts _finish_worker judges a hand-off by, read before its write transaction: a failed
         review's area (reviewcap.area) and each follow-up's file overlaps and chain (coordinator
-        _file_overlaps, _overlap_chain). Kept in self._git_memo for the transaction's gitmemo scope
-        (_finish_tx), where those calls read them; one not read here runs its git there, as before."""
+        _file_overlaps, _overlap_chain) as the hop the daemon may queue in it reads them (chaincap.auto_hop:
+        a task_add continuing this task, so its lineage roots, and its skip when it is a split's hop).
+        Kept in self._git_memo for the transaction's gitmemo scope (_finish_tx), where those calls read
+        them; one not read here runs its git there, as before."""
         if not task:
             return
         memo = self._git_memo[task["id"]] = {}
@@ -3915,7 +3917,9 @@ class Daemon:
                     self._review_area(dict(task, result=dump_result(result)))
                 for f in result.get("followups") or []:
                     if isinstance(f, dict) and isinstance(f.get("spec"), str) and f["spec"].strip():
-                        coord._overlap_chain(self.p, coord._file_overlaps(self.p, "code", f["spec"], set()))
+                        for skip in (set(), {task["id"]}):   # a done task's follow-up, a split's hop
+                            clash = coord._file_overlaps(self.p, "code", f["spec"], skip)
+                            coord._overlap_chain(self.p, "code", f["spec"], clash, {task["id"]}, skip)
         except Exception as e:
             log(self.p, f"task {task['id']}: reading git before finishing failed: {type(e).__name__}: {e}")
 

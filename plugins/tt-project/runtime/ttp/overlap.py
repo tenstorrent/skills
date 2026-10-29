@@ -442,7 +442,12 @@ def waits_on(db, tid: int, ids: set[int], landed: set[int] | None = None, limit:
 
 
 def base_files(p, base: str) -> list[str]:
-    """The files on `base` (git ls-tree), kept LS_TTL_S per root and base; [] when unreadable."""
+    """The files on `base` (git ls-tree), kept LS_TTL_S per root and base; [] when unreadable. Within a
+    gitmemo scope read once, so the TTL cache never decides what a transaction reads."""
+    return gitmemo.cached(("overlap.base_files", base), lambda: _base_files(p, base))
+
+
+def _base_files(p, base: str) -> list[str]:
     key, now = f"{p.root}\0{base}", time.time()
     hit = _ls_cache.get(key)
     if hit and now - hit[0] < LS_TTL_S:
@@ -465,9 +470,12 @@ def symbols(spec: str) -> list[str]:
 
 
 def _has(p, ref: str, sym: str) -> bool | None:
-    """Whether the tree at `ref` has `sym` as a word (git grep); None when unreadable."""
-    r = _git(p.root, "grep", "-q", "-w", "-F", "-e", sym, ref, "--")
-    return True if r.returncode == 0 else False if r.returncode == 1 else None
+    """Whether the tree at `ref` has `sym` as a word (git grep); None when unreadable. Read once per
+    ref and symbol within a gitmemo scope."""
+    def read() -> bool | None:
+        r = _git(p.root, "grep", "-q", "-w", "-F", "-e", sym, ref, "--")
+        return True if r.returncode == 0 else False if r.returncode == 1 else None
+    return gitmemo.cached(("overlap.has", ref, sym), read)
 
 
 def chain(p, hits: list[dict], spec: str = "", now: float | None = None, lineage: set[int] | None = None,
@@ -490,7 +498,7 @@ def chain(p, hits: list[dict], spec: str = "", now: float | None = None, lineage
     if not shown and not syms:
         return None
     try:
-        base = worktree.resolve_base(p)
+        base = gitmemo.cached(("overlap.base",), lambda: worktree.resolve_base(p))
     except (RuntimeError, OSError, subprocess.SubprocessError):
         return None
     on_base = base_files(p, base)

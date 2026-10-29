@@ -280,12 +280,17 @@ def test_a_failed_reviews_area_and_followup_overlaps_read_no_git_inside_the_fini
     for title in ("one take on f0", "another take on f0"):   # separate lineages, so the third pools them
         _fail_review(env, p, review_of(title)["id"], [{"title": "fix", "spec": "it breaks"}])
     rev = review_of("a third take on f0")
-    fups = [{"title": "fix f0", "spec": "Fix f0 in app/core.py so it returns the right value."}]
+    # `take()` is on the reviewed branches only (their comments), so the chain greps the base and each branch.
+    fups = [{"title": "fix f0", "spec": "Fix f0 in app/core.py so it returns the right value; reuse `take()`."}]
     handoff = {"status": "failed", "summary": "blocking findings", "followups": fups}
     task, cfg, spec = dict(p.db.task(rev["id"]), result=json.dumps(handoff)), p.config(), fups[0]["spec"]
     want_area, want_hits = reviewcap.area(p, cfg, task), overlap.find(p, spec)
     assert want_area and want_area["pooled"], "the setup must pool other lineages' reviews (main_file, touched)"
     assert sum(bool(h.get("head")) for h in want_hits) >= 2, "the setup must find unlanded branches on app/core.py"
+    roots = {rev["id"]}
+    want_ties = [coord._overlap_chain(p, "code", spec, coord._file_overlaps(p, "code", spec, skip), roots, skip)
+                 for skip in (set(), roots)]
+    assert all(t and "it needs take" in t[1] for t in want_ties), f"the setup must chain on the symbol: {want_ties}"
 
     d = Daemon(p.base)   # its own connection: a transaction is open on either
     in_tx = lambda: p.db.conn.in_transaction or d.p.db.conn.in_transaction   # noqa: E731
@@ -310,8 +315,8 @@ def test_a_failed_reviews_area_and_followup_overlaps_read_no_git_inside_the_fini
         assert reviewcap.area(p, cfg, task) == want_area
         assert overlap.find(p, spec) == want_hits
         assert overlap.find(p, spec, {want_hits[0]["id"]}) == want_hits[1:]   # skip filters what was read
-        assert coord._overlap_chain(p, coord._file_overlaps(p, "code", spec, set())) \
-            == coord._overlap_chain(p, want_hits)
+        assert [coord._overlap_chain(p, "code", spec, coord._file_overlaps(p, "code", spec, skip), roots, skip)
+                for skip in (set(), roots)] == want_ties   # the hop's task_add (chaincap.auto_hop), done or split
     assert not spawned, f"git ran inside the finish transaction: {spawned}"
     assert rev["id"] not in d._git_memo and gitmemo.current() is None, "the memo outlived its transaction"
     # Through the hand-off itself (the way finish_run records it): the area is judged inside, git-free.

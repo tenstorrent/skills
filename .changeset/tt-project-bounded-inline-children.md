@@ -8,8 +8,9 @@ killed whole after under a minute, so a hung one never holds a tick step past it
 stray process. A device runner restart is named in `tick_step_slow`.
 
 Finishing a run no longer reads git inside its write transaction: a failed review's area and the
-follow-ups' file overlaps are read just before it (gitmemo) and reused inside, so a slow repository no
-longer holds the database lock. Tasks share a probe run only when its command, directory and
+follow-ups' file overlaps and overlap chain (the base, its files and the per-symbol `git grep`, as the
+daemon's own continue hop reads them) are read just before it (gitmemo) and reused inside, so a slow
+repository no longer holds the database lock. Tasks share a probe run only when its command, directory and
 environment match and the run started once their own wait began; each keeps its own verdict and output
 note. A probe's raw result (killed on its timeout, killed by a signal, its last output) is kept beside
 its verdict and shown in a broken probe's wake reason and its hold_probe_broken event; a hold still
