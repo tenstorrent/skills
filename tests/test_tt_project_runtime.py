@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import errno
 import gettext
@@ -590,6 +591,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
            "_make": (_git_session, patched, stdlib), "_probes": probes}
     _stop_left_probes(probes)
     _stop_left_checks(repo)
+    _stop_probe_starters(sys.modules.get("ttp.probespawn"))
     sys.path.remove(str(RUNTIME))
     assert not real_agents, f"a test reached a real agent CLI: {real_agents}"
 
@@ -602,6 +604,43 @@ def _stop_left_probes(probes: list) -> None:
         proc.stop()
     for proc in probes:
         proc.started.wait(probespawn.KILL_WAIT_S + 5)
+
+
+class _ProbeStartsEnded:
+    """A probespawn module's job queue after its test: a start thread that asks it for a job ends
+    (SystemExit ends a thread quietly), and a late start is dropped."""
+
+    def get(self, *a, **k):
+        raise SystemExit
+
+    def put(self, job):
+        pass
+
+
+def _stop_probe_starters(mod, wait_s: float = 10.0) -> None:
+    """End the probe-start threads of the test's own probespawn module. Each test loads ttp afresh,
+    and each load's threads (up to probespawn.SLOTS, idle on their queue for good) would otherwise
+    pile up in the test process: past 100 threads faulthandler (Python 3.10 lists at most 100, newest
+    first) leaves the main thread out of a stack dump, which the tick-stack tests read."""
+    if mod is None:
+        return
+    with mod._lock:
+        threads, jobs = list(mod._started), mod._jobs
+        mod._jobs = _ProbeStartsEnded()
+    hook = threading.excepthook
+
+    def quiet(args):   # their SystemExit is the planned end (threading's own hook ignores it; pytest's warns)
+        if not (args.exc_type is SystemExit and args.thread in threads):
+            hook(args)
+    threading.excepthook = quiet
+    try:
+        for _ in threads:
+            jobs.put(lambda: None)   # wakes an idle thread; it then looks up _jobs for the next job and ends
+        deadline = time.monotonic() + wait_s
+        for t in threads:
+            t.join(max(0.0, deadline - time.monotonic()))
+    finally:
+        threading.excepthook = hook
 
 
 def _stop_left_checks(root: pathlib.Path, grace: float = 10.0) -> list[pathlib.Path]:
@@ -46396,6 +46435,16 @@ class _stack_dumped:
         return False
 
 
+def _main_thread_in_dumps():
+    """faulthandler (Python 3.10) lists at most 100 threads, newest first: past that a dump leaves out
+    the main thread, whose stack the tick-stack tests read. Threads a test leaves behind are ended at
+    teardown (_stop_probe_starters); this names any kind that still piles up instead of a dump
+    missing its main thread."""
+    alive = threading.enumerate()
+    kinds = collections.Counter(t.name.rstrip("0123456789") for t in alive).most_common(5)
+    assert len(alive) < 90, f"{len(alive)} threads alive in the test process, most of them: {kinds}"
+
+
 def _slow_stack_dump(monkeypatch, delay_s=0.5):
     """A loaded host: the stack dump lands well after the header line it follows in STACKS_FILE."""
     import faulthandler
@@ -46410,6 +46459,7 @@ def _slow_stack_dump(monkeypatch, delay_s=0.5):
 def test_a_tick_step_that_blocks_is_logged_with_every_threads_stack_and_alerted(env, monkeypatch):
     import ttp.daemon as dm
     p = make(env)
+    _main_thread_in_dumps()
     d = dm.Daemon(p.base)
     d.cfg = p.config()
     monkeypatch.setattr(dm, "TICK_OVERRUN_S", 0.3)
@@ -46446,6 +46496,7 @@ def test_a_tick_step_that_blocks_is_logged_with_every_threads_stack_and_alerted(
 def test_a_tick_step_blocked_without_progress_leaves_its_stacks_before_the_watchdogs_restart(env, monkeypatch):
     import ttp.daemon as dm
     p = make(env)
+    _main_thread_in_dumps()
     d = dm.Daemon(p.base)
     d.cfg = p.config()
     # The stall dump (plus one watch interval) comes before the watchdogs restart a daemon whose last
@@ -46478,6 +46529,7 @@ def test_a_tick_step_blocked_without_progress_leaves_its_stacks_before_the_watch
 def test_both_signals_and_the_tick_overrun_dump_write_to_the_one_stacks_file(env):
     import ttp.daemon as dm
     p = make(env)
+    _main_thread_in_dumps()
     stacks = p.state / dm.STACKS_FILE
     stacks.write_text("x" * (dm.STACKS_MAX_BYTES + 1))
     d = dm.Daemon(p.base)
