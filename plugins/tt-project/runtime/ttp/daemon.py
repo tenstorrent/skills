@@ -1211,7 +1211,7 @@ class Daemon:
         core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
         cycle = self._run_step(lambda: self.host_cycle_held(now), "host_cycle_held", default=False)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_progress, self.check_churn, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_checks_wait, self.check_progress, self.check_churn, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -5632,6 +5632,25 @@ class Daemon:
                  (now, "daemon", "observation", fp, "high" if owns else "normal", text[:4000], "queued", tid))
             log(self.p, f"slot wait: task {tid} ({why}) waited {mins:g} min or more for a {provider} worker slot")
 
+    def check_checks_wait(self, every_s: float = 60) -> None:
+        """Model-free checks slot wait: a `ttp checks` run of this project waiting for its repository's
+        checks lane longer than checks.wait_event_s (default 900, 0: off) raises one `checks_slot_wait`
+        event naming the waiter and the holders (checklane.wait_events); one per wait episode (keyed on the
+        waiter's task and arrival), never for a short wait."""
+        now = time.time()
+        if now - getattr(self, "_checks_wait_checked", 0.0) < every_s:
+            return
+        self._checks_wait_checked = now
+        from . import checklane
+        db = self.p.db
+        for ev in checklane.wait_events(self.p.name, self.cfg, now):
+            if db.one("SELECT id FROM events WHERE fingerprint=?", (ev["fingerprint"],)):
+                continue
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                 (now, "daemon", "checks_slot_wait", ev["fingerprint"], "normal", ev["text"][:4000], "queued",
+                  ev["task"]))
+            log(self.p, f"checks slot wait: {ev['text'][:300]}")
+
     def _log_resource_wait(self, task: dict, held: dict | None) -> None:
         """Log once per wait that dispatch skips ready `task` because a resource it needs is held, with
         the hold it recorded (`held`, _resource_hold's; check_stall forgets the task once nothing holds it)."""
@@ -8517,6 +8536,7 @@ class Daemon:
         if why:
             return why
         argv = (["--fresh"] if info.get("fresh") else []) + (["--full"] if info.get("full") else []) \
+            + (["--light"] if info.get("light") else []) \
             + (["--purpose", "harness"] if info.get("purpose") == "harness" else []) + [str(c) for c in cmd]
         return "" if self._start_checks(Path(wt), out, run_id, tid, argv) else "they could not be started"
 

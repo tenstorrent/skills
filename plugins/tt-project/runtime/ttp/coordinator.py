@@ -883,6 +883,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                      + ", ".join(f"{k} {n}" for k, n in sorted(got.items())) + f"); all use the smallest, "
                      f"{min(got.values())}")
     section("shared", lines)
+    from . import checklane
+    section("checks_wait", checklane.long_wait_lines(p.name, now))
     ledger = ledger_section(p, db, seen, machine_events(db, event_ids), now)
     if ledger:
         shown.append(("machine_ledger", ledger[0]))

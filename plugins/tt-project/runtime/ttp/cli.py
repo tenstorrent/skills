@@ -1390,6 +1390,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
     lines.extend(testslots.use_lines())
     if suite := testslots.suite_line(p.name, now):
         lines.append(suite)
+    from . import checklane
+    lines.extend(checklane.long_wait_lines(p.name, now))
     if verbose and (slot_waits := checkcap.wait_line(p.state, now)):
         lines.append(slot_waits)
     for res in sorted(shared.names(p.config())):
@@ -2751,12 +2753,15 @@ def cmd_checks(a) -> None:
         if p:
             envfault.recheck(p)   # a runner back: its open fault closes
         arrived = _checks_arrived()
+        from . import checklane
         fresh_ok = not a.fresh
         slot = None
         while todo and not hit:
             slot = _checks_slot(p, Path(run_dir), out, head, bool(getattr(a, "own_group", False)), arrived,
                                 _checks_key(p, tree, todo, purpose) if fresh_ok else "",
-                                (lambda: bool(_recorded_pass(p, tree, todo, purpose))) if fresh_ok else None)
+                                (lambda: bool(_recorded_pass(p, tree, todo, purpose))) if fresh_ok else None,
+                                todo, checklane.all_light(todo, cfg, mine if getattr(a, "light", False) else ()),
+                                str(top))
             # Checks of the same tree may have passed while these waited (the same checks running beside
             # them, a review's pre-started ones): that pass serves, and the slot goes to the next waiter.
             if slot is not None and fresh_ok and (again := _recorded_pass(p, tree, todo, purpose)):
@@ -2922,7 +2927,8 @@ def cmd_checks(a) -> None:
             if timed_out:
                 checkwall.record_timeout(p.state, os.environ.get("TTP_TASK"), timed_out)
             elif executed:
-                checkwall.record_run(p.state, time.time() - ran_since, passed)
+                checkwall.record_run(p.state, time.time() - ran_since, passed,
+                                     _commands_hash(todo) if passed and executed == todo else "")
                 # A completed run no longer reports the task's old wall-time timeout (TIMEOUTS entry).
                 checkwall.clear_timeout(p.state, os.environ.get("TTP_TASK"))
         if slot and not passed:
@@ -3228,7 +3234,8 @@ def _checks_cancelled(run_dir: Path) -> str:
 
 
 def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: bool = False,
-                 arrived: float | None = None, same: str = "", done=None):
+                 arrived: float | None = None, same: str = "", done=None, cmds: list | None = None,
+                 light: bool = False, top: str = ""):
     """Wait for a host-wide checks slot (checkcap). The wait is told in the log, the run's notes
     (progress.md) and CHECKS_SLOT_WAIT, which the `--result` probe and `ttp status` read. In the
     foreground it is recorded like a `ttp lock` wait, so it does not count toward the run's wall
@@ -3236,8 +3243,10 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     detached checks. With no project there is nobody to start them detached, so it waits on. `arrived`
     is the place in the queue (default now); `same` and `done` as for checkcap.acquire. A cancel request
     for this process (CHECKS_SLOT_CANCEL) ends the wait and the run (exit 1). Slots it cannot write end
-    the run (exit 2), never uncapped."""
-    from . import checkcap, locks as lk
+    the run (exit 2), never uncapped. Light checks (`light`: checklane.all_light) run at once, outside
+    every slot; full checks queue for one of the lanes of the project's repository at `top` (checklane:
+    checks.slots, checks.max_wait_s), told with the holder and the queue position each minute."""
+    from . import checkcap, checklane, locks as lk
     foreground = not detached and not os.environ.get("TTP_DETACHED")
     key = f"checks:{os.getpid()}:{time.time()}"
 
@@ -3265,7 +3274,16 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             pass
 
     start = time.time()
+    if light:
+        tell("light checks only (syntax, lint, format or validation: checklane, checks.light_cmds, --light): "
+             "running now, outside the project's checks slot")
+        return checkcap.Slot()
     prio, owns = checkcap.task_rank(p)
+    cfg = p.config() if p else {}
+    from . import testslots
+    repo = testslots.repo_key(top) if p else ""
+    cmds = cmds or []
+    what = " && ".join(str(c) for c in cmds)[:300] or "full checks"
     # One full checks run per project at a time (testslots.suite_hold), taken before the checks slot so
     # a second run of the project never holds one of the host's slots while it waits.
     from . import testslots
@@ -3275,8 +3293,12 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     try:
         suite = testslots.suite_hold(p.name if p else None, tell,
                                      checkcap.FOREGROUND_WAIT_S if foreground and p else None,
-                                     lambda on: waiting(on, str(testslots.suite_path(p.name))),
-                                     lambda: _checks_cancelled(run_dir), f"run {run_dir.name}", prio, arrived)
+                                     lambda on: waiting(on, str(testslots.suite_path(p.name, repo))),
+                                     lambda: _checks_cancelled(run_dir), f"run {run_dir.name}", prio, arrived,
+                                     slots=checklane.slots(cfg), repo=repo,
+                                     cost=checklane.cost(p.state if p else None, _commands_hash(cmds), cmds, cfg),
+                                     max_wait=checklane.max_wait_s(cfg), state=p.state if p else None,
+                                     what=what)
         if suite is None:
             return None
         left = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
@@ -3677,6 +3699,7 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
         with open(run_dir / CHECKS_OUT, "wb") as out:
             child = subprocess.Popen([sys.executable, "-m", "ttp", "checks", "--rc", str(run_dir / CHECKS_RC),
                                       *(["--fresh"] if a.fresh else []), *(["--full"] if getattr(a, "full", False) else []),
+                                      *(["--light"] if getattr(a, "light", False) else []),
                                       *(["--purpose", a.purpose] if getattr(a, "purpose", None) else []), *a.cmd],
                                      cwd=top or Path.cwd(), env=env, stdin=subprocess.PIPE, stdout=out,
                                      stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(guard.fileno(),))
@@ -3684,6 +3707,7 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
             write_json(run_dir / CHECKS_PID, {"pid": child.pid, "started": proc_start(child.pid), "ts": time.time(),
                                               "boot": boot_id(), "worktree": top, "head": head, "cmd": list(a.cmd),
                                               "fresh": bool(a.fresh), "full": bool(getattr(a, "full", False)),
+                                              "light": bool(getattr(a, "light", False)),
                                               **_harness_purpose(a), "req": req, "pidns": pid_ns(), "arrived": arrived,
                                               "check_run_dir": str(output), "check_report_dir": str(checkdirs.reports(output))})
         except BaseException:
@@ -8611,6 +8635,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="run the checks even when they already passed on this tree")
     s.add_argument("--full", action="store_true",
                    help="run the project's checks even for a docs/data-only diff (no fast path)")
+    s.add_argument("--light", action="store_true",
+                   help="the commands after -- are light checks (syntax, lint, format, validation): with only "
+                        "light checks to run they run at once, without waiting for a checks slot (checklane)")
     s.add_argument("--purpose", choices=["candidate", "harness"], default="candidate",
                    help="harness: qualify a harness-preparation head with the purpose harness (else the default "
                         "harness plan) and untagged checks; "

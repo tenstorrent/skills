@@ -85,15 +85,17 @@ def cap(p, now: float | None = None) -> tuple[float, str]:
             f"{FACTOR:g}x the longest of the last {len(runs)} runs, within {FLOOR_S / 3600:g}-{CEILING_S / 3600:g} h")
 
 
-def record_run(state: Path | None, seconds: float, passed: bool) -> None:
-    """Keep one completed run's wall time for cap(); a failed write only loses a sample."""
+def record_run(state: Path | None, seconds: float, passed: bool, key: str = "") -> None:
+    """Keep one completed run's wall time for cap(), with `key` (its command list's hash, for
+    checklane.median_s) when given; a failed write only loses a sample."""
     if state is None or seconds <= 0:
         return
     path = Path(state) / RUNS_LOG
     try:
         if path.exists() and path.stat().st_size > RUNS_MAX_BYTES:
             durable_write(path, "".join(f"{x}\n" for x in path.read_text().splitlines()[-RECENT:]))
-        durable_append(path, json.dumps({"ts": time.time(), "s": round(seconds, 3), "passed": bool(passed)}) + "\n")
+        durable_append(path, json.dumps({"ts": time.time(), "s": round(seconds, 3), "passed": bool(passed),
+                                            **({"k": key} if key else {})}) + "\n")
     except OSError:
         pass
 
