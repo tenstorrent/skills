@@ -5196,6 +5196,10 @@ _COPY_SEARCHED_RE = re.compile(r"\b(?:search\w*|looked|checked|found|no)\b[^.;\n
 _SPACE_CHECKED_RE = re.compile(r"\bdf\b|\b\d+(?:\.\d+)?\s*[KMGTP]i?B?\s+(?:free|left|available)\b|"
                                r"\b(?:checked|compared|measured)\b[^.;\n]{0,80}?\b(?:free|space|room)\b", re.I)
 _UNREADABLE_RE = re.compile(r"\b(?:encrypt\w*|privacy[- ]protected|protected\s+folder|unlock\w*)\b", re.I)
+# An access ask must name what is missing: a credential, account, permission or sign-in (or a user-only step).
+_ACCESS_NAMED_RE = re.compile(r"\b(?:accounts?|access|permissions?|permit\w*|grant\w*|sign[- ]?(?:in|on)|"
+                              r"log[- ]?in|login|vpn|credentials?|certificates?|licen[cs]es?|authori[sz]\w*|"
+                              r"auth|2fa|mfa|sudo)\b", re.I)
 
 
 def _resolve_first_ask(a: dict, text: str, least: str = "") -> tuple[str, str] | None:
@@ -5203,7 +5207,8 @@ def _resolve_first_ask(a: dict, text: str, least: str = "") -> tuple[str, str] |
     coordinator's own call: an irreversible ask naming no harm to people and no one-way step; a go/no-go
     on its own step (not under a restriction or irreversible ask that names its limit, unless the
     recommendation is to skip or drop the work); an ask about copying inputs or about space that lists
-    no copies searched and no free space checked. None for exempt asks (see above)."""
+    no copies searched and no free space checked; an access ask naming no credential, account, permission
+    or sign-in, no user-only step and no host it cannot reach. None for exempt asks (see above)."""
     blocking = a.get("blocking")
     if blocking not in ("access", "irreversible", "restriction"):
         return None
@@ -5230,6 +5235,11 @@ def _resolve_first_ask(a: dict, text: str, least: str = "") -> tuple[str, str] |
                     "(2) pick a common location with enough free space (check it with df) and use it. Ask only if "
                     "a restriction forbids every route found, listing each copy searched and the free space "
                     "checked." + do)
+    if blocking == "access" and not (_ACCESS_NAMED_RE.search(said) or _REACH_RE.search(said)
+                                    or _UNREADABLE_RE.search(said)):
+        return ("no access named", f"decide it yourself: {ASK_TEST}. An access ask names the credential, account, "
+                "permission or sign-in that is missing, or a step only the user can take; this one names none, "
+                "so the choice is yours." + do)
     return None
 
 

@@ -654,7 +654,8 @@ Everything else is decided: pick the route, act, record the decision (`memory_ad
   and no communication as the user; a go/no-go on the project's own step ("want me to give the
   go-ahead?", "reply A to allow, B to drop", "proceed or skip?"), always when it recommends
   skipping or dropping the work; and an inputs-or-space ask that lists no copies searched and no
-  free space checked. Exempt: review, merge, funds, spend and another person's request, a
+  free space checked; and an `access` ask naming no credential, account, permission or sign-in, no
+  step only the user can take and no host it cannot reach ("run on the slower disk or skip?"). Exempt: review, merge, funds, spend and another person's request, a
   credential, money, a step only the user can take, a setting only the user may change, and a
   go/no-go under a restriction its `least_disruptive` names (unless it recommends skipping the
   work). `not_own_call` (why only the

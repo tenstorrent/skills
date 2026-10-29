@@ -4489,6 +4489,10 @@ def _restricted(p, item=_RQ):
 
 
 
+# An access ask the re-ask gate judges; it names no access, so it says why only the user can decide it.
+_OWN_ACCESS = {"blocking": "access", "not_own_call": "the user set this themself and only they can change it"}
+
+
 def test_an_ask_needs_a_blocking_reason_and_never_gets_a_default(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -4496,8 +4500,8 @@ def test_an_ask_needs_a_blocking_reason_and_never_gets_a_default(env):
         problems, ask = _ask(p, **fields)
         assert problems and "`blocking` must be one of" in problems[0], fields
         assert ask is None, "a rejected ask reached the user"
-    problems, ask = _ask(p, blocking="access", recommendation="use option A")
-    assert problems == [] and ask["text"].startswith("Option A or B?")
+    problems, ask = _ask(p, "Option A or B for the account?", blocking="access", recommendation="use option A")
+    assert problems == [] and ask["text"].startswith("Option A or B for the account?")
     assert p.db.kv(coord.ASK_DEFAULTS_KEY, {}) == {}, "a new ask was registered to fall back on a timer"
     assert coord.expire_asks(p, now=time.time() + 1000 * 3600) == []
     assert f"ask #{ask['id']} (waits for the user)" in coord.digest(p, {}, [], [])
@@ -4588,14 +4592,14 @@ def test_an_ask_the_user_already_settled_is_refused_naming_the_record_and_quotin
     assert problems and f'already settled by user msg #{mid}: "Keep the soak timeout on box-a1 at 60 minutes;"' \
         in problems[0], problems
     fact = p.add_memory("Correction (user msg #7): the weekly cleanup job runs on Sundays, not Mondays.")
-    problems, _ = _ask(p, "Does the weekly cleanup job run on Mondays or on Sundays?", blocking="access")
+    problems, _ = _ask(p, "Does the weekly cleanup job run on Mondays or on Sundays?", **_OWN_ACCESS)
     assert problems and f"already settled by memory [{fact.stem}]" in problems[0], problems
     # D: resent with not_covered naming what is new: sent, and the reason recorded.
     problems, sent = _ask(p, "May I raise the soak timeout on box-a1 to 90 minutes?", **_TIMEOUT, not_covered=_NEW)
     assert problems == [] and sent["text"].startswith("May I raise the soak timeout"), problems
     flag = db.one("SELECT text FROM events WHERE kind=? ORDER BY id DESC LIMIT 1", (coord.ASK_FLAGGED_KIND,))
     assert flag["text"].startswith(f"already settled (not_covered): {_NEW} [over user msg #{mid}")
-    assert _ask(p, "Does the weekly cleanup job run on Mondays now?", blocking="access", not_covered="too short")[0]
+    assert _ask(p, "Does the weekly cleanup job run on Mondays now?", **_OWN_ACCESS, not_covered="too short")[0]
     # F: counted where the daily review reads them.
     assert unblock.refused_line(db, since) == "4 refused (already settled 4)"
     assert unblock.refused_line(db, since, flagged=True) == "1 flagged (already settled (not_covered) 1)"
@@ -4614,10 +4618,10 @@ def test_the_re_ask_gate_lets_unrelated_old_and_charter_only_restriction_asks_th
     for text in ("Please grant the CI account read access to the artifact store.",
                  "May I raise the soak timeout on box-b2 to 90 minutes?",
                  "Is box-a1 free for the firmware flash tonight?"):
-        problems, sent = _ask(p, text, blocking="access")
+        problems, sent = _ask(p, text, **_OWN_ACCESS)
         assert problems == [] and sent["text"] == text, (text, problems)
     # A charter Policies item settles a plain ask, never a restriction-change ask, which only names a charter item.
-    problems, _ = _ask(p, "Should nightly report results go out as a notify?", blocking="access")
+    problems, _ = _ask(p, "Should nightly report results go out as a notify?", **_OWN_ACCESS)
     assert problems and "already settled by the charter's Policies item" in problems[0], problems
     assert reask.settled_by(p, p.config(), "Should nightly report results go out as a notify?", change=True) is None
     problems, sent = _ask(p, "May I push the hotfix to the release branch once?", **_TIMEOUT)
@@ -4626,7 +4630,7 @@ def test_the_re_ask_gate_lets_unrelated_old_and_charter_only_restriction_asks_th
     db.post("in", "Can we raise the nightly fuzz budget? Ask me before you change the fuzz seed list.",
             chat=None, kind="user", provenance="web-session")
     for text in ("May I raise the nightly fuzz budget to 3 hours?", "May I change the fuzz seed list?"):
-        assert _ask(p, text, blocking="access")[0] == [], text
+        assert _ask(p, text, **_OWN_ACCESS)[0] == [], text
     # E: an answer older than the window, or the gate off, refuses nothing.
     ask = "May I raise the soak timeout on box-a1 to 90 minutes?"
     db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 31 * 86400, mid))
@@ -4652,7 +4656,7 @@ def test_a_users_request_never_refuses_the_follow_up_ask_it_leads_to(env):
                        "The Atlassian connector on box-a1 needs an API token; please create one.")):
         db.x("DELETE FROM messages WHERE direction='in'")
         db.post("in", said, chat=None, kind="user", provenance="web-session")
-        problems, sent = _ask(p, ask, blocking="access")
+        problems, sent = _ask(p, ask, **_OWN_ACCESS)
         assert problems == [] and sent["text"].startswith(ask), (said, problems)
         db.x("UPDATE messages SET handled=1 WHERE kind='ask'")
     # The alias as one of only 3 shared words never fires the anchored path.
@@ -4679,7 +4683,7 @@ def test_a_new_question_about_a_settled_request_goes_out_while_a_re_ask_is_refus
                 "Should I switch the dogfood channel to weekly cuts? Which weekday should the cut run?"):
         assert not reask.matches(ask, said), ask
         assert reask.settled_by(p, p.config(), ask) is None, ask
-    problems, sent = _ask(p, weekday, blocking="access")
+    problems, sent = _ask(p, weekday, **_OWN_ACCESS)
     assert problems == [] and sent["text"].startswith(weekday), problems
     db.x("UPDATE messages SET handled=1 WHERE kind='ask'")
     # A restated correction: no new words, or one filler word, in the question.
@@ -4694,7 +4698,7 @@ def test_a_new_question_about_a_settled_request_goes_out_while_a_re_ask_is_refus
     assert coord.apply(p, [{"type": "resolve", "id": sent["id"]}], messages=[mid]) == []
     for ask in (weekday, "Switch the dogfood channel to weekly cuts: on which weekday should the cut run?"):
         assert reask.matches(ask, weekday), ask
-        problems, again = _ask(p, ask, blocking="access")
+        problems, again = _ask(p, ask, **_OWN_ACCESS)
         assert problems and f'already settled by ask #{sent["id"]}, answered in user msg #{mid}' in problems[0], ask
 
 
@@ -5091,6 +5095,16 @@ _RESOLVE_FIRST_CASES = [
       "least_disruptive": "keep the old route; it is slower but works"}, "no harm named"),
     ({"text": "Use the second build machine for the sweep?", **_RF_I,
       "least_disruptive": "wait for the first machine; it frees up tonight"}, "no harm named"),
+    # Access naming no credential, account, permission or sign-in and no step only the user can take.
+    ({"text": "Run the soak on the slower storage area, or skip the soak?", "blocking": "access"},
+     "no access named"),
+    ({"text": "Use build machine B for the sweep instead of waiting?", "blocking": "access"}, "no access named"),
+    # Sent: access naming a missing permission or credential, or a physical step.
+    ({"text": "I need write permission on the shared results folder; can you grant it?", "blocking": "access"},
+     None),
+    ({"text": "The API token expired; the nightly upload stops until a new one is set.", "blocking": "access"},
+     None),
+    ({"text": "The card in the second slot needs reseating by hand before the sweep.", "blocking": "access"}, None),
     # Sent: every route tried and a restriction forbids each; harm to people; speaking as the user;
     # a credential, money, another person's request; unreadable inputs; a restriction-breaking yes.
     ({"text": "The charter restriction keeps the dataset inside the lab network. I searched for an existing copy "
@@ -11263,7 +11277,7 @@ def test_a_hold_on_this_turns_ask_points_at_it_and_is_undone_when_the_ask_is_rej
     from ttp import coordinator as coord
     tid = _hold_task(p)
     hold = {"type": "task_update", "id": tid, "status": "blocked", "text": "needs access", "waits_on": "ask:new"}
-    ask = {"type": "ask_user", "text": "May I use the shared bucket for the results?", "blocking": "access",
+    ask = {"type": "ask_user", "text": "May I get write permission on the shared bucket for the results?", "blocking": "access",
            "recommendation": "yes"}
     assert coord.apply(p, [hold, ask]) == []
     aid = p.db.one("SELECT MAX(id) id FROM messages WHERE kind='ask'")["id"]

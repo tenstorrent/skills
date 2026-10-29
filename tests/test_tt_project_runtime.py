@@ -7686,7 +7686,7 @@ def test_status_says_when_questions_are_not_reaching_any_chat(env):
     from ttp.web import health
     p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
            (time.time(), "relay", time.time()))
-    problems, ask = _ask(p, blocking="access")
+    problems, ask = _ask(p, "Option A or B for the account?", blocking="access")
     assert problems == []
     assert health(p, p.db, now=ask["ts"] + 60)["undelivered"] is None, "reported before the relay had a chance"
     late = health(p, p.db, now=ask["ts"] + 3600)["undelivered"]
@@ -7703,7 +7703,7 @@ def test_a_chat_that_filtered_an_ask_out_did_not_deliver_it(env):
     from ttp.web import health
     p.db.x("INSERT INTO chats(id,created,label,last_active,last_read,min_severity) VALUES('c1',?,?,?,0,'critical')",
            (time.time(), "relay", time.time()))
-    problems, ask = _ask(p, blocking="access")
+    problems, ask = _ask(p, "Option A or B for the account?", blocking="access")
     assert problems == [] and ask["severity"] != "critical"
     p.db.x("UPDATE chats SET last_read=? WHERE id='c1'", (ask["id"],))
     late = health(p, p.db, now=ask["ts"] + 3600)["undelivered"]
@@ -7721,7 +7721,7 @@ def test_a_chat_that_filtered_an_ask_out_did_not_deliver_it(env):
 def test_the_web_app_shows_every_open_ask(env):
     p = make(env)
     from ttp.web import state_payload
-    problems, ask = _ask(p, severity="normal", blocking="access")
+    problems, ask = _ask(p, "Option A or B for the account?", severity="normal", blocking="access")
     assert problems == [] and ask["severity"] == "normal"
     p.db.post("out", "fyi", chat=None, kind="alert", severity="normal")
     shown = {m["id"]: m["kind"] for m in state_payload(p, p.db)["attention"]}
