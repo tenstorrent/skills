@@ -1200,7 +1200,7 @@ def test_ttp_lock_holds_until_its_command_ends_when_signalled_as_the_command_sta
                 pass
 
 
-def _gone(pid, timeout=30):
+def _cmd_ended(pid, timeout=30):
     """Whether process pid ended (or is a zombie no one reaped yet) within timeout."""
     from ttp import locks
 
@@ -1247,7 +1247,7 @@ def test_ttp_lock_stays_held_while_its_command_runs_after_ttp_lock_is_sigkilled(
         assert f"pid {pid} alive" in _lock_probe(run_env, "board").stdout
     finally:
         go.touch()
-    assert pid and _gone(pid)
+    assert pid and _cmd_ended(pid)
     assert _until_true(lambda: _lock_probe(run_env, "board").returncode == 0), _lock_probe(run_env, "board").stdout
 
 
@@ -1275,5 +1275,5 @@ def test_ttp_lock_stays_held_while_a_process_its_command_left_running_keeps_it_o
         assert "a process it left running keeps the lock" in _lock_probe(run_env, "board").stdout
     finally:
         go.touch()
-    assert _gone(bg_pid)
+    assert _cmd_ended(bg_pid)
     assert _until_true(lambda: _lock_probe(run_env, "board").returncode == 0), _lock_probe(run_env, "board").stdout
