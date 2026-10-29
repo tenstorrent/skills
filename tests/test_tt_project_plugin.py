@@ -6171,7 +6171,9 @@ CLAIM_OK = "corrected-claim-ok"
 CORRECTED_CLAIMS = {
     1: [r"no (?:passwordless )?sudo,? so no (?:tt-smi )?-?glx_reset", r"sudo -n true"],
     2: [r"tt-smi -r\b.{0,60}\b(?:usable|tray reset|works) on (?:a )?(?:BH|Blackhole) Galaxy",
-        r"(?:use|run) `?tt-smi -r`? (?:on|for) (?:a )?(?:BH|Blackhole) Galaxy"],
+        r"(?:use|run) `?tt-smi -r`? (?:on|for) (?:a )?(?:BH|Blackhole) Galaxy",
+        r"tt-smi -r`?,? (?:is |as |stays )?(?:a |the |only )?(?:a )?fallback",
+        r"fall(?:s|ing)? back to `?tt-smi -r\b"],
     3: [r"glx_reset (?:needs|requires) no (?:root|sudo)", r"glx_reset.{0,30}\bwithout (?:root|sudo)\b"],
     4: [r"skip(?:s|ping)? (?:the )?(?:tt-smi )?-?glx_reset after a (?:tray )?power (?:drop|loss)",
         r"after a tray power (?:drop|loss),? (?:skip|do not run|don't run|never run) (?:tt-smi )?-?glx_reset"],
@@ -6251,7 +6253,10 @@ def test_corrected_claims_patterns_catch_the_claim_and_spare_the_true_practice()
              10: "A settled answer must be re-asked because it was relayed."}
     for n, line in false.items():
         assert n in {k for k, _ in corrected_claims_in(line)}, (n, line)
+    for line in ("`tt-smi -r` drops chips; tt-smi -r as a fallback only.", "Else fall back to tt-smi -r."):
+        assert 2 in {k for k, _ in corrected_claims_in(line)}, line
     true = ["Check with `sudo -n -l`, never `sudo -n true`.", "On BH Galaxy use `tt-smi -glx_reset`.",
+            "`tt-smi -r` is never used, not even as a fallback.",
             "Its IPMI step needs root.", "Always try glx_reset first, then the single-host power cycle.",
             "A reset never affects other hosts.", "Use op 0x3 only.",
             "Readings after a power loss are junk.", "A tenant is an open /dev/tenstorrent handle.",
@@ -6278,6 +6283,24 @@ def test_setup_box_states_the_true_galaxy_reset_practice():
     for linker in ("SKILL.md", "device-runs.md"):
         text = " ".join((box / linker).read_text(encoding="utf-8").split())
         assert "`recovery.md`" in text and "before and after" in text and "tt-smi -glx_reset" in text, linker
+
+
+def test_worker_prompt_and_harness_skill_state_the_glx_reset_only_practice():
+    """Workers and harness authors read the true reset practice where they read their rules (user msg
+    #1171): `tt-smi -glx_reset`, and `tt-smi -r` or `sudo -n true` only in a sentence saying never."""
+    for path in (PLUGIN / "template" / "prompts" / "worker.md", SKILLS / "tt-project-harness" / "SKILL.md"):
+        flat = re.sub(r"\s+", " ", path.read_text())
+        assert "tt-smi -glx_reset" in flat, path
+        for pat in (r"tt-smi -r\b", r"sudo -n true"):
+            for m in re.finditer(pat, flat):
+                end = flat.find(". ", m.end())
+                sentence = flat[flat.rfind(". ", 0, m.start()) + 1:end if end >= 0 else None]
+                assert re.search(r"\bnever\b", sentence), (path, sentence)
+    skill = re.sub(r"\s+", " ", (SKILLS / "tt-project-harness" / "SKILL.md").read_text())
+    for part in ("rescan the root ports and recount the chips by BDF and tray", "never `sudo -n true`",
+                 "`sudo -n -l`", "never affects other hosts", "op 0x3 only", "are junk",
+                 "`tt-project:setup-box` skill's `recovery.md`"):
+        assert part in skill, part
 
 
 def test_no_shipped_text_states_a_corrected_claim():

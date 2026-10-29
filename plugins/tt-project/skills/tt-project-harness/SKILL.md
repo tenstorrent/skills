@@ -199,6 +199,21 @@ read the one for the lever you change.
   run as before and say why; `ttp doctor` names the setting. `"sandbox": false` on a push_checks
   entry is only for a check that needs the host's process table, and is reported each run.
 
+## Resetting a Blackhole Galaxy host
+
+Company-wide practice; the long form is in the `tt-project:setup-box` skill's `recovery.md`.
+
+- Reset a host's own chips with `tt-smi -glx_reset`, then rescan the root ports and recount the
+  chips by BDF and tray. `tt-smi -r` is never used, not even as a fallback. Where glx_reset cannot
+  run (no root, no NOPASSWD rule for it), no reset runs and the output says so.
+- Check sudo rights with `sudo -n -l` (or `sudo -n -l <command>`), never `sudo -n true`: a host
+  may grant NOPASSWD only for specific commands.
+- A reset or a single-host power cycle never affects other hosts: nothing waits on or snapshots
+  them first. Only a quad serving a quad-wide workload goes down and up as a quad.
+- After a tray power drop, try glx_reset first, then the single-host BMC power cycle with op 0x3
+  only (op 0x0 also resets the PCIe retimers carrying NVMe). Tray temperatures read right after a
+  power loss are junk.
+
 ## Rebooting the harness's own host
 
 A reboot ends every run in flight, and nothing lifts a plain pause afterwards: schedules and probes

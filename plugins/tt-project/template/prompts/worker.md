@@ -293,7 +293,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
   spend is readable, add `--spend-cmd "<cmd printing USD so far>" --spend-cap <usd>`: the daemon
   stops it at the cap. Report its spend in the hand-off.
 <!-- /ttp:if wait -->
-- Write large results incrementally, flushing before any host reset.
+- Flush results as you go. Reset: tt-smi -glx_reset (harness skill).
 - Keep runs short: a run re-reads its whole context on every call. When the work exceeds one run
   or you passed the split line, finish the step, commit and hand off `done` with a
   `followups` entry titled `continue: ...` (what is done, branch and head, what is left).
