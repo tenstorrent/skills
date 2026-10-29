@@ -311,3 +311,84 @@ def log_reclaim(state: Path | None, rec: dict, why: str) -> None:
         project.durable_append(path, json.dumps({"ts": time.time(), "why": why, "holder": rec}) + "\n")
     except OSError:
         pass
+
+
+def _live_tickets(base: str) -> list[Path]:
+    """Lane resource `base`'s live waiter tickets, read only: a dead one is skipped, never removed."""
+    d = locks.queue_dir(checkcap.slot_dir(), base)
+    try:
+        names = sorted(n for n in os.listdir(d) if not n.startswith("."))
+    except OSError:
+        return []
+    return [d / n for n in names if locks._ticket_live(d / n)]
+
+
+def _run_of(text: str) -> str:
+    m = re.search(r"\brun (\d+)", str(text or ""))
+    return m.group(1) if m else ""
+
+
+def lane_status(project_name: str, now: float | None = None) -> list[dict]:
+    """`ttp checks status`: per repository with a held lane or a waiter, its lanes' holders (task, run,
+    pid, age, alive, command) and its waiters in the order the lanes go to them (testslots.suite_order),
+    the first one next. Read only: it probes the lock files without holding them and never queues,
+    reclaims a lane, removes a dead ticket or writes a file."""
+    now = time.time() if now is None else now
+    pre = f"{testslots.SUITE}.{locks.group_id(project_name)}"
+    out = []
+    for base in testslots.suite_bases(project_name):
+        lanes = []
+        for r in locks.holder_records(testslots._lanes_of(base)):
+            since = float(r.get("since") or now)
+            lanes.append({"task": str(r.get("task") or ""), "run": _run_of(r.get("holder")), "pid": r.get("pid"),
+                          "age_s": round(now - since, 1), "alive": r.get("alive"),
+                          "running_s": round(now - float(r["run_since"]), 1) if r.get("run_since") else None,
+                          "command": str(r.get("command") or ""), "overflow": bool(r.get("overflow")),
+                          "cost": r.get("cost") or {}})
+        waiters = []
+        for i, t in enumerate(testslots.suite_order(project_name, _live_tickets(base), now)):
+            m = re.match(r"\d+(?:\.\d+)?-(\d+)", t.name)
+            prio = locks.ticket_priority(t)
+            try:
+                label = t.read_text()
+            except OSError:
+                label = ""
+            waiters.append({"position": i + 1, "task": _ticket_task(t), "run": _run_of(label),
+                            "pid": int(m.group(1)) if m else None,
+                            "priority": None if prio == float("inf") else prio,
+                            "waited_s": round(now - locks._arrival(t), 1), "next": i == 0})
+        if lanes or waiters:
+            out.append({"repo": base[len(pre) + 1:], "lanes": lanes, "waiters": waiters})
+    return out
+
+
+def _who(x: dict) -> str:
+    return " ".join(w for w in ((f"#{x['task']}" if x.get("task") else "no task"),
+                                (f"run {x['run']}" if x.get("run") else ""),
+                                (f"pid {x['pid']}" if x.get("pid") else "")) if w)
+
+
+def status_text(project_name: str, cfg: dict | None, here_repo: str = "", now: float | None = None) -> str:
+    """lane_status as lines for a person (`ttp checks status`)."""
+    now = time.time() if now is None else now
+    n = slots(cfg)
+    lines = [f"checks lanes of {project_name}: {n} per repository (checks.slots), light checks never wait"]
+    got = lane_status(project_name, now)
+    if not got:
+        lines.append("  no lane held and nobody waiting")
+    for r in got:
+        lines.append(f"  repository {r['repo'] or '(not keyed: an older runtime, one lane per project)'}" + (" (this one)" if r["repo"] == here_repo else ""))
+        for h in r["lanes"]:
+            alive = {True: "alive", False: "DEAD (its lane is reclaimed by the next waiter)"}.get(h["alive"], "alive unknown")
+            run = f", running {h['command']!r} for {mins(h['running_s'])}" if h["running_s"] is not None else ", not running yet"
+            lines.append(f"    holder{' (extra lane)' if h['overflow'] else ''}: {_who(h)}, {alive}, "
+                         f"held {mins(h['age_s'])}{run}")
+        if not r["lanes"]:
+            lines.append("    holder: none (a waiter is about to start)")
+        for w in r["waiters"]:
+            lines.append(f"    waiter {w['position']}{' (next)' if w['next'] else ''}: {_who(w)}"
+                         + (f", priority {w['priority']:g}" if w["priority"] is not None else "")
+                         + f", waited {mins(w['waited_s'])}")
+        if not r["waiters"]:
+            lines.append("    waiters: none")
+    return "\n".join(lines)

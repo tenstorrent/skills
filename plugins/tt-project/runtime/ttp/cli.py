@@ -2510,6 +2510,8 @@ def cmd_checks(a) -> None:
         sys.exit(0 if checkgaps.ready(p, a.gap, getattr(a, "gap_config", None)) else 1)
     if a.result:
         sys.exit(_checks_result(Path(a.result)))
+    if getattr(a, "slot_status", False) or a.cmd in (["status"], ["status", "--json"]):
+        sys.exit(_checks_lane_status(bool(getattr(a, "json", False)) or a.cmd == ["status", "--json"]))
     if getattr(a, "env_ok", None) is not None:
         sys.exit(_checks_env_ok(here(), a.env_ok))
     run_dir = os.environ.get("TTP_RUN_DIR")
@@ -3231,6 +3233,24 @@ def _checks_cancelled(run_dir: Path) -> str:
     if not isinstance(req, dict) or req.get("pid") != os.getpid() or req.get("started") != proc_start(os.getpid()):
         return ""
     return str(req.get("why") or "the task ended")
+
+
+def _checks_lane_status(as_json: bool) -> int:
+    """`ttp checks status` (also --slot-status): the project's checks lanes, their holders and waiters
+    (checklane.lane_status). Read only: it never queues, takes or writes a lock, or starts a check."""
+    from . import checklane, testslots
+    p = here()
+    if not p:
+        die("ttp checks status: no project found")
+    top = subprocess.run(["git", "-C", str(Path.cwd()), "rev-parse", "--show-toplevel"], capture_output=True,
+                         text=True).stdout.strip()
+    here_repo = testslots.repo_key(top) if top else ""
+    if as_json:
+        print(json.dumps({"project": p.name, "slots": checklane.slots(p.config()), "this_repo": here_repo,
+                          "repos": checklane.lane_status(p.name)}, indent=2))
+    else:
+        print(checklane.status_text(p.name, p.config(), here_repo))
+    return 0
 
 
 def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: bool = False,
@@ -8651,6 +8671,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--env-ok", nargs="*", metavar="SIG", default=None,
                    help="run nothing: exit 0 once the named environment faults (or, with none named, every "
                         "open one) no longer hit a missing check runner, 1 while one does")
+    s.add_argument("--slot-status", action="store_true",
+                   help="run nothing (also `ttp checks status`): print each repository's checks lanes, their "
+                        "holders (pid, task, run, age, alive) and the waiters in queue order; never queues")
+    s.add_argument("--json", action="store_true", help="with --slot-status or status: as JSON")
     s.add_argument("--rc", help=argparse.SUPPRESS)   # the detached process itself: where it writes its exit code
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="extra check commands after --: one quoted string runs through the shell "
                         "(ttp checks -- 'FOO=1 pytest -q && ruff check'); several quoted strings run as "
