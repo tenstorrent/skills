@@ -503,6 +503,24 @@ prolonged whole-box outage.
   task (below) raises one once it has waited that long since it was queued and anything holds it
   (slots, the spend or auth gate, a pause, a lock, a branch), naming the hold. One per task until it
   runs again.
+- Announced, not started (model-free, observation only): each open promise and each task announced
+  in a reply (`reply_chat`) that no owner task has started a run for within 10 min (5 min when an
+  owner has priority 1) raises one `announced_not_started` event naming it, its owner (`none` when it
+  has none), its age and what parks it (a `start_after`, a dependency not started, nothing). An owner
+  held by a recorded external condition (an open ask naming it, a review, a `start_when` or
+  `retry_when` probe that is not only a time, a paused resource, a dependency that is running or
+  waiting) raises nothing. It clears once an owner starts or the promise closes; one per promise or
+  task, and only for those under a day old. It holds no dispatch.
+- Ready, not started (model-free): a queued task with no unmet dependency, deferral, pause or
+  resource hold, while a worker slot of its provider is free, that has not started 10 min after it
+  became ready (2 min at priority 1) raises one `ready_not_started` event naming what holds it. Full
+  slots, pauses, locks, device holds and login or network holds are left to their own events and
+  `ttp throughput`; an urgent wait the check above already raised is not raised twice.
+- Deferral rule: work whose inputs are ready starts now in its own task without `start_after`; defer
+  only for a named external fact (a time another party sets, data that must accumulate, a person, a
+  shared resource). A `task_add` with `start_after` or `start_when` whose `why` names none, or a
+  `task_update` adding spec to a task deferred more than 10 min, gets this as an action note. It
+  never refuses; the count is kept in `parked_work_nudges`.
 - Idle capacity (model-free): a device resource of the project (its device lock, a `*-device` name its
   config or recent tasks use, or a machine tagged `device` that its charter's Resources names) that
   no open task, `ttp lock` slot, reservation or detached-job hold uses for `coordinator.idle_capacity_s`

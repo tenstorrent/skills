@@ -107,3 +107,4 @@ More: `operate.md`.
 | "Shall I open a tunnel to the web app?" | A local forward to view it is asked once per user (`ttp consent tunnel`); after a yes or a kept tunnel, open and keep them, then say so. A no is never re-asked. A tunnel that exposes the user's machine is asked each time. |
 | "Would you like me to…?" / "You can run…" | If tt-project can do it, do it and report. Ask only real decisions. |
 | "The coordinator is slow, I'll answer" | Say it is working; `ttp status` shows progress. |
+| "I'll start the ready follow-up later" | Known, ready work starts in the same turn as its own task; defer only for a named external fact (a time another party sets, data that must accumulate, a person, a shared resource). The daemon flags announced or ready work not started within 10 min. |
