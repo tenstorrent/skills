@@ -4942,9 +4942,13 @@ _RUN_BEFORE = {"a", "an", "the", "this", "that", "its", "their", "our", "my", "l
 _AUTO_POWER_RE = re.compile(r"\b(?:auto(?:matic)?[- ]?power[- ]?cycl\w*|power[- ]cycling)\b", re.I)
 _POWER_OFF_RE = re.compile(r"\b(?:is off|are off|turned off|switched off|disabled|re-?enabl\w*|turn (?:it )?back on)\b",
                            re.I)
-# Exemptions, checked first. A real credential (bare "key" or "login" is not one):
-_CREDENTIAL_RE = re.compile(r"\b(?:ssh keys?|api keys?|tokens?|logged out|log in again|needs? an? login|passwords?)\b",
-                            re.I)
+# Exemptions, checked first. A real credential (bare "key", "login" or "device code" is not one; nor is a
+# key-value store):
+_CREDENTIAL_RE = re.compile(r"\b(?:(?:ssh|api|public|private|deploy)[- ]keys?(?![-\w])|tokens?|logged out|"
+                            r"log in again|needs? an? login|passwords?|sso|"
+                            r"device[- ]code\s+(?:[a-z0-9]{4,}-[a-z0-9]{4,}|flow|login|sign[- ]?in|prompt)|"
+                            r"(?:enter|type|paste)\s+(?:the\s+|this\s+)?(?:device\s+|one[- ]time\s+)?code|"
+                            r"one[- ]time\s+code)\b", re.I)
 # Under access or human only: a step only the user can take, or another person's request.
 _USER_ONLY_RE = re.compile(r"\b(?:physical(?:ly)?|on[- ]site|by hand|power button|your (?:laptop|machine)|"
                            r"the user's (?:laptop|machine)|reverse tunnel)\b", re.I)
@@ -5204,7 +5208,9 @@ _UNREADABLE_RE = re.compile(r"\b(?:encrypt\w*|privacy[- ]protected|protected\s+f
 # An access ask must name what is missing: a credential, account, permission or sign-in (or a user-only step).
 _ACCESS_NAMED_RE = re.compile(r"\b(?:accounts?|access|permissions?|permit\w*|grant\w*|sign[- ]?(?:in|on)|"
                               r"log[- ]?in|login|vpn|credentials?|certificates?|licen[cs]es?|authori[sz]\w*|"
-                              r"auth|2fa|mfa|sudo)\b", re.I)
+                              r"auth|authenticat\w*|2fa|mfa|sudo|collaborators?|membership|invit(?:e|es|ed|ation)s?|"
+                              r"(?:as|become)\s+an?\s+(?:\w+\s+)?members?|members?\s+of\s+the\s+"
+                              r"(?:org\w*|organi[sz]ation|group|repo\w*|project|workspace)|reserv\w*\s+in\s+your\s+name)\b", re.I)
 
 
 def _resolve_first_ask(a: dict, text: str, least: str = "") -> tuple[str, str] | None:

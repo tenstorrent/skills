@@ -5099,12 +5099,28 @@ _RESOLVE_FIRST_CASES = [
     ({"text": "Run the soak on the slower storage area, or skip the soak?", "blocking": "access"},
      "no access named"),
     ({"text": "Use build machine B for the sweep instead of waiting?", "blocking": "access"}, "no access named"),
+    # A credential or access word in another sense lets no route question through.
+    ({"text": "Keep the results in the private key-value store, or in plain files on the build disk?",
+      "blocking": "access"}, "no access named"),
+    ({"text": "Report the team member count in the weekly summary, or leave it out?", "blocking": "access"},
+     "no access named"),
+    ({"text": "Rebuild the device code on build machine B, or wait for the faster one?", "blocking": "access"},
+     "no access named"),
     # Sent: access naming a missing permission or credential, or a physical step.
     ({"text": "I need write permission on the shared results folder; can you grant it?", "blocking": "access"},
      None),
     ({"text": "The API token expired; the nightly upload stops until a new one is set.", "blocking": "access"},
      None),
     ({"text": "The card in the second slot needs reseating by hand before the sweep.", "blocking": "access"}, None),
+    # Sent: a sign-in, key, device code, membership or reservation only the user holds.
+    ({"text": "The org SSO session lapsed; re-authenticate in the browser.", "blocking": "access"}, None),
+    ({"text": "Add my public key to the build box so I can run there.", "blocking": "access"}, None),
+    ({"text": "Please open https://example.com/device and enter code WXYZ-9876.", "blocking": "access"}, None),
+    ({"text": "The repo is private; add the bot as a collaborator so the sweep can clone it.",
+      "blocking": "access"}, None),
+    ({"text": "Please accept the invitation to the org so the bot can read the repo.", "blocking": "access"}, None),
+    ({"text": "The sweep needs a reservation in your name on the shared cluster; can you make one?",
+      "blocking": "access"}, None),
     # Sent: every route tried and a restriction forbids each; harm to people; speaking as the user;
     # a credential, money, another person's request; unreadable inputs; a restriction-breaking yes.
     ({"text": "The charter restriction keeps the dataset inside the lab network. I searched for an existing copy "
