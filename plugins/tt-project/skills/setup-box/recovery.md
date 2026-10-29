@@ -5,8 +5,9 @@ General device recovery is tt-buddy's (`skills/run/recovery.md`); this page adds
 
 ## Reset
 
-- The reset is `tt-smi -glx_reset`. `tt-smi -r` drops chips: use it only as a fallback when
-  glx_reset's own output names it.
+- The reset is `tt-smi -glx_reset` (with its root-port rescan and a recount by BDF and tray).
+  `tt-smi -r` is never run on a Blackhole Galaxy, per the vendor's BH Galaxy reset documentation:
+  it drops chips. Where glx_reset cannot run on a host, no reset runs and the output says so plainly.
 - Run glx_reset before and after every device run.
 - After glx_reset, rescan the PCIe root ports and recount the chips by BDF and tray
   (`lspci -d 1e52:`).

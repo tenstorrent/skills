@@ -6154,7 +6154,7 @@ def test_worker_prompt_guards_paid_model_api_spend_in_detached_jobs():
 # script or changeset may state one again. The true practice, per claim:
 #  1. Some clusters grant passwordless sudo only for specific reset and diagnostic commands: check
 #     with `sudo -n -l <command>`, never `sudo -n true`; "no sudo, so no glx_reset" is false.
-#  2. On BH Galaxy reset with `tt-smi -glx_reset`; `tt-smi -r` drops chips, a fallback only.
+#  2. On BH Galaxy reset with `tt-smi -glx_reset`; `tt-smi -r` drops chips and is never used.
 #  3. glx_reset's IPMI step needs root (or a NOPASSWD rule for it); the root-port rescan needs root.
 #  4. After a tray power drop still try glx_reset first, then a single-host BMC power cycle.
 #  5. A reset or single-host power cycle never affects other hosts: no neighbour gate or snapshot.
@@ -6195,8 +6195,10 @@ CLAIM_SUFFIXES = {".md", ".json", ".toml", ".yaml", ".yml", ".txt", ".py", ".sh"
 # The true practice that replaces the claims (user msg #1171), per point: phrases the shipped
 # setup-box page `recovery.md` states.
 TRUE_PRACTICE = {
-    "glx_reset is the reset": ["The reset is `tt-smi -glx_reset`.", "`tt-smi -r` drops chips: use it only as a "
-                               "fallback when glx_reset's own output names it.",
+    "glx_reset is the reset": ["The reset is `tt-smi -glx_reset` (with its root-port rescan and a "
+                               "recount by BDF and tray).",
+                               "`tt-smi -r` is never run on a Blackhole Galaxy, per the vendor's BH "
+                               "Galaxy reset documentation: it drops chips.",
                                "Run glx_reset before and after every device run."],
     "privileges": ["glx_reset's IPMI step needs root or a NOPASSWD sudo rule for its exact commands; the "
                    "root-port rescan needs root.", "the exact glx_reset IPMI commands",
@@ -6256,10 +6258,16 @@ def test_corrected_claims_patterns_catch_the_claim_and_spare_the_true_practice()
 
 def test_setup_box_states_the_true_galaxy_reset_practice():
     box = SKILLS / "setup-box"
-    page = " ".join((box / "recovery.md").read_text(encoding="utf-8").split())
+    raw = (box / "recovery.md").read_text(encoding="utf-8")
+    page = " ".join(raw.split())
     missing = [(point, part) for point, parts in TRUE_PRACTICE.items() for part in parts if part not in page]
     assert missing == [], missing
     assert corrected_claims_in(page) == []
+    # tt-smi -r is never run on a BH Galaxy, and no 'fallback' wording for it survives near it.
+    assert re.search(r"tt-smi -r.{0,40}never run", page), "recovery.md must say -r is never run"
+    r_block = page[page.index("tt-smi -r"):]
+    r_block = r_block[: r_block.index("Privileges")]
+    assert "fallback" not in r_block, "no fallback wording for tt-smi -r"
     for linker in ("SKILL.md", "device-runs.md"):
         text = " ".join((box / linker).read_text(encoding="utf-8").split())
         assert "`recovery.md`" in text and "before and after" in text and "tt-smi -glx_reset" in text, linker
