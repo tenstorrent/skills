@@ -18,10 +18,10 @@ to its first run, or to now for one still queued:
 - review_stall: the same end to the review's first run, against coordinator.review_stall_s (the age at
   which a waiting review is raised). Reported only: plan() never lowers it, since a sooner alarm starts
   no review sooner. Its waits the checks did not hold (free) are reported apart, as information.
-  A review wait the checks held (slot-held) does not lower review.sweep_after_s and is not free:
-  checkcap's waits log for the code task (its own checks, or the precheck the daemon starts on its head
-  as it queues the review) and, for the stall, the review's precheck hold (Daemon._precheck_holds)
-  cover half of it.
+  A review wait the checks held (slot-held) does not lower review.sweep_after_s and is not free: a
+  checks_slot_wait event for the code task inside it, or checkcap's waits log for the code task (its
+  own checks, or the precheck the daemon starts on its head as it queues the review) and, for the
+  stall, the review's precheck hold (Daemon._precheck_holds) covering half of it.
 - push_batch: a push-queue row's approval to its batch's start. Limit delivery.push_batch_s, judged
   only on the rows the window alone held (no other batch ran while they waited).
 - landed_chain / deferral: `start_when` waits (a `landed:#<id>` chain or another probe); provider_gate:
@@ -29,10 +29,11 @@ to its first run, or to now for one still queued:
 - Re-queue waits: each waiting hand-off (its task_waiting event) to the task's next run, and the current
   wait of a task that has run (queued, blocked or waiting) from its last run's end to now, sorted by
   its reason (the event's "for" or text; the task's blocked_reason for the current wait), or by the
-  checks slot's own records (checkcap's waits log covering half of it): checks_slots (waiting for this
-  project's other `ttp checks`; limit checks.slots per repository or checks.test_project_max per project,
-  whichever of the two held the wait: both are project settings, reported, never raised), own_job (its own
-  detached job or checks: no limit), the rules above for a deferral, provider or resource, else retry_wait (its own retry
+  checks slot's own records (a checks_slot_wait event in the wait, or checkcap's waits log covering
+  half of it): checks_slots (waiting for this project's other `ttp checks`; limit checks.slots per
+  repository or checks.test_project_max per project, whichever of the two held the wait: both are
+  project settings, reported, never raised), own_job (its own detached job or checks: no
+  limit), the rules above for a deferral, provider or resource, else retry_wait (its own retry
   condition, then a slot, not told apart: no limit, never counted against worker slots).
 
 A lane is slow when the 90th percentile of its waits is over the threshold: P1_WAIT_S for priority 1
@@ -276,7 +277,8 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
         return True
 
     # Re-queue waits read what the daemon writes: task_waiting events, each waiting task's last run, and
-    # the checks slot's own records (checkcap's waits log) for its slot waits.
+    # the checks slot's own records for its slot waits: the checks_slot_wait events Daemon.check_checks_wait
+    # writes from checklane.wait_events while a task still waits, and checkcap's waits log (a row only at grant).
     wait_ids = [t["id"] for t in tasks if t["status"] in ("queued", "blocked", "waiting")]
     last_run = {r["task"]: r for r in db.q(
         "SELECT task, MAX(ended) AS ended, SUM(ended IS NULL) AS live FROM runs WHERE role!='coordinator' "
@@ -286,6 +288,10 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     for e in db.q("SELECT ts, task, text, data FROM events WHERE kind='task_waiting' AND task IS NOT NULL AND ts>? "
                   "ORDER BY ts LIMIT ?", (t0 - DAY, ROWS)):
         ev_waits.setdefault(e["task"], []).append(e)
+    slot_ev: dict[int, list[tuple[float, str]]] = {}
+    for e in db.q("SELECT ts, task, text FROM events WHERE kind='checks_slot_wait' AND task IS NOT NULL AND ts>?",
+                  (t0 - DAY,)):
+        slot_ev.setdefault(e["task"], []).append((float(e["ts"]), slot_limit(e["text"] or "")))
     slot_log: dict[int, list[tuple[float, float]]] = {}
     try:
         from . import checkcap
@@ -297,9 +303,14 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
 
     def slot_held(task: int, w0: float, w1: float, extra: list | tuple = ()) -> str | None:
         """Which checks limit held `task` in [w0, w1] — "checks.slots" (its repository's lanes) or
-        "checks.test_project_max" (the project's cap) — or None when the checks did not hold it: its
-        logged slot waits and `extra` spans cover at least half of it (no limit recorded: the
-        per-repository limit, the default holder of a queue wait)."""
+        "checks.test_project_max" (the project's cap) — or None when the checks did not hold it:
+        a checks_slot_wait event in the wait (its text names the limit; older events named none:
+        the project cap, the limit those waits were held under), or its logged slot waits and
+        `extra` spans covering at least half of it (no limit recorded: the per-repository limit,
+        the default holder of a queue wait)."""
+        for ts, key in slot_ev.get(task, ()):
+            if w0 <= ts <= w1:
+                return key
         return SLOTS_KEY if w1 > w0 and _covered([*slot_log.get(task, ()), *extra], w0, w1) * 2 >= w1 - w0 else None
 
     def precheck_hold(t: dict) -> list[tuple[float, float]]:

@@ -198,9 +198,23 @@ def test_throughput_measures_requeue_waits_by_reason_and_a_slow_checks_lane_gets
     requeued("ttp checks lanes", now - 3 * 3600, "done", "", wait_for="CI on the branch", data=False)
     # A task that ran three days ago and waits again: a re-queue wait, not a first start for a slot.
     requeued("ran long ago", None, "queued", "", ended=now - 3 * 86400)
+    # Read as its own checks, but the event Daemon.check_checks_wait raised while it waited for a slot (from
+    # checklane.wait_events, at now - 3 h) shows the slot held it.
+    ev = requeued("slot event", now - 2 * 3600, "done", "", wait_for="the detached ttp checks to pass")
+    from ttp import checkcap, locks, testslots
+    from ttp.daemon import Daemon
+    ticket = locks.enqueue(checkcap.slot_dir(), testslots.suite_base(p.name, "0123456789ab"),
+                           f"task #{ev} {p.name}: full checks (run 9, pid 1)", now - 4 * 3600 + 60, priority=1)
+    real_time = time.time
+    try:
+        monkeypatch.setattr(time, "time", lambda: now - 3 * 3600)
+        Daemon(p.base).check_checks_wait(every_s=0)
+    finally:
+        monkeypatch.setattr(time, "time", real_time)
+        locks.dequeue(ticket)
+    assert [r["task"] for r in p.db.q("SELECT task FROM events WHERE kind='checks_slot_wait'")] == [ev]
     # Read as its own checks, but checkcap's waits log shows the slot held it.
     lg = requeued("slot log", now - 2 * 3600, "done", "", wait_for="the detached ttp checks to pass")
-    from ttp import checkcap
     (Path(p.db.path).parent / checkcap.WAITS_LOG).write_text(json.dumps(
         {"task": lg, "queued_at": now - 4 * 3600 + 60, "granted_at": now - 2 * 3600 - 60, "slot": "queue"}) + "\n")
     short = requeued("short slot", now - 2 * 3600, "done", "", wait_for="the detached ttp checks to pass")
@@ -208,7 +222,7 @@ def test_throughput_measures_requeue_waits_by_reason_and_a_slow_checks_lane_gets
         fh.write(json.dumps({"task": short, "queued_at": now - 3 * 3600, "granted_at": now - 3 * 3600 + 600}) + "\n")
     rep = throughput.measure(p.db, p.config(), now=now, gates={})
     ck = _tp_lane(rep, "checks_slots")
-    assert (ck["count"], ck["waiting_now"], ck["p1_p90_s"]) == (3, 1, 4 * 3600) and ck["slow"]
+    assert (ck["count"], ck["waiting_now"], ck["p1_p90_s"]) == (4, 1, 4 * 3600) and ck["slow"]
     assert (_tp_lane(rep, "own_job")["count"], _tp_lane(rep, "retry_wait")["count"]) == (2, 3)
     assert _tp_lane(rep, "retry_wait")["waiting_now"] == 2
     assert "worker_slots" not in {ln["lane"] for ln in rep["lanes"] if ln["count"] and ln["lane"] != "dependency"} \
