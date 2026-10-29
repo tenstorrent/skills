@@ -99,10 +99,13 @@ def test_a_process_ending_inside_the_transaction_leaves_no_uncommitted_retiremen
     p = make(env)
     old = p.add_memory("An old decision.", kind="decision")
     end = "sys.exit(3)" if how == "exit" else "os._exit(3)"
-    code = (f"import os, sys\nfrom ttp.project import Project\np = Project({str(p.base)!r})\n"
+    # The child skips fsync as this process does (the env fixture): on a loaded host each one can stall
+    # for tens of seconds, and what reaches the disk is not what this test checks.
+    code = (f"import os, sys\nos.fsync = lambda fd: None\nfrom ttp.project import Project\n"
+            f"p = Project({str(p.base)!r})\n"
             f"with p.db.tx():\n    p.forget_memory({old.stem!r}, why='done')\n    {end}\n")
     r = subprocess.run([sys.executable, "-c", code], env={**os.environ, "PYTHONPATH": str(RUNTIME)},
-                       capture_output=True, text=True, timeout=60)
+                       capture_output=True, text=True, timeout=HANG_S)
     assert r.returncode == 3, r.stderr
     if how == "exit":
         assert old.exists() and f"](memory/{old.name})" in p.memory_index.read_text()

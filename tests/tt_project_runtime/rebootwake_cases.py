@@ -11,11 +11,11 @@ def _live_job(p, tid, name="soak"):
     from ttp import detach
     run_dir = p.runs / f"live-{tid}"
     run_dir.mkdir(parents=True, exist_ok=True)
-    r = _ttp_run(p, "detach", name, "--", "sleep", "60", env={"TTP_RUN_DIR": str(run_dir)})
+    r = _ttp_run(p, "detach", name, "--", "sleep", "60", env={"TTP_RUN_DIR": str(run_dir)}, timeout=HANG_S)
     assert r.returncode == 0, r.stderr
     rc = (run_dir / f"{name}.rc").resolve()
-    deadline = time.time() + 10
-    while not (pid := detach.running_pid(rc, lambda b: bool(b))) and time.time() < deadline:
+    deadline = time.monotonic() + HANG_S
+    while not (pid := detach.running_pid(rc, lambda b: bool(b))) and time.monotonic() < deadline:
         time.sleep(0.05)
     assert pid, "the job did not start"
     p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir,boot_id) VALUES(?,?,?,?,?,?,?,?)",

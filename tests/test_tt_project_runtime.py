@@ -297,6 +297,10 @@ TTP = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "
 NO_SYNC = [sys.executable, "-c", "import os, runpy, sys; os.sync = lambda: None; del sys.argv[0]; "
            "runpy.run_path(sys.argv[0], run_name='__main__')"]   # + the launcher to run
 TTP_NO_SYNC = [*NO_SYNC, str(TTP)]
+# The bound on waiting for a child process to end, or for the state it brings about, where it normally
+# takes well under a second. Only a hang reaches it: on a loaded host (other suites and builds alongside)
+# a child's fsync or directory write can stall for tens of seconds, so a tight bound fails working tests.
+HANG_S = 300
 # Tests without the env fixture import ttp too; each must also pass when run alone.
 sys.path.insert(0, str(RUNTIME))
 
@@ -22101,9 +22105,9 @@ def _resumable_job_cut_by_reboot(p, tmp_path, tid, name="job", resumable=True):
     if not detach.resume_file(rc).exists() and not rc.exists():
         r = _ttp_run(p, "detach", *(["--resumable"] if resumable else []), name, "--", "sh", "-c",
                      f'echo run >>{counter}; echo "token=${{MY_API_TOKEN:-}}"',
-                     env={"TTP_RUN_DIR": str(run_dir), "MY_API_TOKEN": "s3cret"})
+                     env={"TTP_RUN_DIR": str(run_dir), "MY_API_TOKEN": "s3cret"}, timeout=HANG_S)
         assert r.returncode == 0, r.stderr
-        assert _wait_for_path(rc)
+        assert _wait_for_path(rc, HANG_S)
     rc = rc.resolve()
     rc.unlink()
     if resumable:
@@ -26531,14 +26535,15 @@ def _tasks_up_to(p, n):
 
 def _settle_deferred(d, tid, until=None):
     """One probe round. Each round reaps a probe and may start the next, so a probe started before
-    the test changed the world can still say "not yet": with `until`, keep going up to ~10 s."""
-    deadline = time.time() + 10
+    the test changed the world can still say "not yet": with `until`, keep going until it holds (up
+    to HANG_S)."""
+    deadline = time.monotonic() + HANG_S
     while True:
         d.probe_waiting()
         if tid in d._probes:
-            d._probes[tid][0].wait(10)
+            d._probes[tid][0].wait(HANG_S)
             d.probe_waiting()
-        if until is None or until() or time.time() > deadline:
+        if until is None or until() or time.monotonic() > deadline:
             return
 
 
