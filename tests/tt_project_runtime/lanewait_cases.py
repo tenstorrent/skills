@@ -65,6 +65,24 @@ def test_a_task_without_its_own_worktree_waits_for_the_real_landing(env, monkeyp
     assert not _ready(p, dep) and deferral(p.db.task(dep)), f"a {kind} task waits for the landing"
 
 
+def test_a_landed_probe_a_test_leaves_running_is_stopped_at_teardown(env, monkeypatch):
+    """The landed probe the test above starts runs off the tick and outlived it: once pytest removed
+    the test's tmp_path, it recreated repo/tt-project there, and the next parametrization, given the
+    same path, failed in make(). The env fixture records each probe and its teardown stops them."""
+    from ttp import daemon as dmod
+    p = make(env)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    dep = p.db.add_task("check it", "s", kind="work", status="queued",
+                        labels=["start_when:sleep 60", f"deferred_since:{time.time():.0f}"])
+    d = dmod.Daemon(p.base)
+    d.probe_deferred(time.time())
+    proc = d._probes[dep][0]
+    assert proc in env["_probes"]
+    assert proc.started.wait(30) and proc.poll() is None, "the probe runs on after the tick"
+    _stop_left_probes(env["_probes"])
+    assert proc.proc.poll() is not None, "teardown leaves no probe running"
+
+
 def test_a_carried_branch_task_waits_for_the_real_landing(env, monkeypatch):
     """A code task carrying a branch works on that branch, not the approved head: no early start."""
     from ttp import daemon as dmod

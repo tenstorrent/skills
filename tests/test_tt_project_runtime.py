@@ -556,6 +556,17 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     # the tests of forwarding turn it back on, with a fake ssh.
     from ttp import upstream
     monkeypatch.setattr(upstream, "FORWARD_EVERY_S", float("inf"))
+    # A daemon's start_when and retry_when probes run off the tick (probespawn) and outlive a test that
+    # never polls them again: stopped at teardown, so none recreates a folder of this test's tmp_path
+    # after pytest removed it, where the next test of the same name prefix gets the same path.
+    from ttp import probespawn as _probespawn
+    probes = []
+    real_pending_init = _probespawn.Pending.__init__
+
+    def pending_init(self, *args, **kwargs):
+        probes.append(self)
+        real_pending_init(self, *args, **kwargs)
+    monkeypatch.setattr(_probespawn.Pending, "__init__", pending_init)
     monkeypatch.setenv("GIT_ALTERNATE_OBJECT_DIRECTORIES", str(_git_session["objects"]))
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(_git_session["config"]))
     repo = tmp_path / "repo"   # a git repository with one commit of README.md
@@ -576,10 +587,21 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setattr(pytest.MonkeyPatch, "delattr", recording(real_delattr))
     stdlib = {m: dict(vars(m)) for m in _MAKE_STDLIB}
     yield {"home": home, "repo": repo, "tmp": tmp_path, "real_agents": real_agents,
-           "_make": (_git_session, patched, stdlib)}
+           "_make": (_git_session, patched, stdlib), "_probes": probes}
+    _stop_left_probes(probes)
     _stop_left_checks(repo)
     sys.path.remove(str(RUNTIME))
     assert not real_agents, f"a test reached a real agent CLI: {real_agents}"
+
+
+def _stop_left_probes(probes: list) -> None:
+    """Stops the daemon probes (probespawn.Pending) a test started: a start still queued never runs, a
+    running probe's session is killed and reaped, and a start under way kills its own probe."""
+    from ttp import probespawn
+    for proc in probes:
+        proc.stop()
+    for proc in probes:
+        proc.started.wait(probespawn.KILL_WAIT_S + 5)
 
 
 def _stop_left_checks(root: pathlib.Path, grace: float = 10.0) -> list[pathlib.Path]:
