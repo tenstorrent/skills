@@ -6325,6 +6325,8 @@ def test_worker_prompt_and_harness_skill_state_the_glx_reset_only_practice():
         end = worker.find(". ", m.end())
         sentence = worker[worker.rfind(". ", 0, m.start()) + 1:end if end >= 0 else None]
         assert "Galaxy" in sentence, sentence
+        # Both halves of the rule: never -r, and where glx_reset cannot run no other reset stands in.
+        assert "never tt-smi -r" in sentence and "no reset where it cannot run" in sentence, sentence
     skill = re.sub(r"\s+", " ", (SKILLS / "tt-project-harness" / "SKILL.md").read_text())
     for part in ("rescan the root ports and recount the chips by BDF and tray", "never `sudo -n true`",
                  "`sudo -n -l`", "never affects other hosts", "op 0x3 only", "are junk",
