@@ -21734,11 +21734,16 @@ def test_a_probe_that_cannot_start_is_broken(env, monkeypatch):
     d = dmod.Daemon(p.base)
     tid = _due_waiting_task(p, "exit 1")
 
+    tick_done = threading.Event()
+
     def refuse(*a, **k):
+        tick_done.wait(_load_scaled(60))   # the start fails only after the tick returned, as under load
         raise OSError("no shell")
     monkeypatch.setattr(dmod.subprocess, "Popen", refuse)
-    d.probe_waiting()          # asks the probe first; it cannot start
+    d.probe_waiting()          # asks the probe first, off the tick (probespawn); it cannot start
+    tick_done.set()
     _probe_starts_done(d)
+    assert d._probes[tid][0].wait(_load_scaled(60)) == "could not start"   # its start ended
     p.db.update_task(tid, not_before=time.time() - 1)
     d.probe_waiting()
     assert _ready(p, tid) and json.loads(p.db.task(tid)["result"])["woke"] == "probe broken: could not start"
