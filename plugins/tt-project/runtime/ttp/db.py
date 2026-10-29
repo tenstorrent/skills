@@ -176,12 +176,14 @@ CREATE TABLE IF NOT EXISTS ttr_incidents (
 CREATE UNIQUE INDEX IF NOT EXISTS ttr_open ON ttr_incidents(alias) WHERE ended IS NULL;
 CREATE INDEX IF NOT EXISTS ttr_alias ON ttr_incidents(alias, started);
 
--- One row per finished review (reviewstats.py): reviewed head, changed lines against its merge-base,
+-- One row per finished review (reviewstats.py): reviewed head, changed lines against its merge-base
+-- (lines; code_lines: outside tests and docs, NULL on older rows),
 -- areas touched, tier, re-review flag, outcome, cost and whether the reviewed hand-off carried a
 -- `self_check` line (1/0; NULL: no reviewed task found). A later verdict of the same review replaces it.
 CREATE TABLE IF NOT EXISTS review_stats (
   task INTEGER PRIMARY KEY, ts REAL NOT NULL, head TEXT, lines INTEGER, areas TEXT, tier TEXT,
-  rereview INTEGER NOT NULL DEFAULT 0, outcome TEXT, cost_usd REAL NOT NULL DEFAULT 0, self_check INTEGER);
+  rereview INTEGER NOT NULL DEFAULT 0, outcome TEXT, cost_usd REAL NOT NULL DEFAULT 0, self_check INTEGER,
+  code_lines INTEGER);
 CREATE INDEX IF NOT EXISTS review_stats_ts ON review_stats(ts);
 """
 
@@ -362,6 +364,7 @@ class DB:
         self._migrate_message_broadcast()
         self._migrate_ttr_sample()
         self._migrate_review_self_check()
+        self._migrate_review_code_lines()
         self._migrate_tier_source()
 
     def _migrate_tier_source(self) -> None:
@@ -382,6 +385,14 @@ class DB:
         with self.tx():
             if "self_check" not in {r["name"] for r in self.q("PRAGMA table_info(review_stats)")}:
                 self.x("ALTER TABLE review_stats ADD COLUMN self_check INTEGER")
+
+    def _migrate_review_code_lines(self) -> None:
+        # Changed lines outside tests and docs (reviewstats.code_lines). Older rows have none (NULL).
+        if "code_lines" in {r["name"] for r in self.q("PRAGMA table_info(review_stats)")}:
+            return
+        with self.tx():
+            if "code_lines" not in {r["name"] for r in self.q("PRAGMA table_info(review_stats)")}:
+                self.x("ALTER TABLE review_stats ADD COLUMN code_lines INTEGER")
 
     def _migrate_ttr_sample(self) -> None:
         # A heal-sourced incident's last unhealthy sample and check period (ttr.observe caps its end by

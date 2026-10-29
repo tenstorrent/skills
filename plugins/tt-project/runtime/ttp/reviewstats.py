@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 """One row per finished review (table review_stats), so review routing can be measured and retested:
-the reviewed head, its changed lines against its merge-base with the base branch, the areas the
+the reviewed head, its changed lines against its merge-base with the base branch (all lines, and
+`code_lines`: those outside tests, docs and changesets), the areas the
 change touches (runtime, skills-prompts-config, tests-docs), the review's tier, whether it was a
 re-review after a failed one, its outcome, its cost and whether the reviewed hand-off carried a
 `self_check` line (kind-code.md's try-to-break-it step). The daemon writes a row each time a review's
@@ -47,6 +48,11 @@ def areas(changes: dict[str, int | None] | None) -> list[str]:
     """The areas `changes` (path -> changed lines) touch, in AREAS order."""
     hit = {area(path) for path in changes or {}}
     return [a for a in AREAS if a in hit]
+
+
+def code_lines(changes: dict[str, int | None] | None) -> int | None:
+    """Changed lines outside tests, docs and changesets (area tests-docs), None when `changes` is."""
+    return None if changes is None else sum(n or 0 for path, n in changes.items() if area(path) != "tests-docs")
 
 
 def is_rereview(db: DB, review: dict) -> bool:
@@ -95,29 +101,30 @@ def _reviewed(p, review: dict) -> tuple[str, str]:
 
 
 def record(p, review: dict, outcome: str, now: float | None = None) -> dict | None:
-    """Write the review's row: its head, changed lines against the merge-base, areas, tier,
-    re-review flag, outcome (OUTCOMES), cost so far and self-check flag (has_self_check). Git trouble
-    leaves lines and areas empty."""
+    """Write the review's row: its head, changed lines against the merge-base (all, and code_lines),
+    areas, tier, re-review flag, outcome (OUTCOMES), cost so far and self-check flag (has_self_check).
+    Git trouble leaves lines and areas empty."""
     from . import worktree
     db = p.db
     if review.get("kind") != "review":
         return None
-    head, lines, touched = "", None, []
+    head, lines, code, touched = "", None, None, []
     try:
         _, head = _reviewed(p, review)
         changes = worktree.diff_lines(p, [head]) if head else None
         if changes is not None:
             lines = sum(n or 0 for n in changes.values())
+            code = code_lines(changes)
             touched = areas(changes)
     except Exception:
         pass
     t = db.task(review["id"]) or review
     row = {"task": review["id"], "ts": time.time() if now is None else now, "head": head[:40] or None,
-           "lines": lines, "areas": ",".join(touched), "tier": t.get("tier") or "standard",
+           "lines": lines, "code_lines": code, "areas": ",".join(touched), "tier": t.get("tier") or "standard",
            "rereview": int(is_rereview(db, t)), "outcome": OUTCOMES.get(outcome, outcome),
            "cost_usd": float(t.get("spent_usd") or 0), "self_check": has_self_check(db, t)}
-    db.x("INSERT OR REPLACE INTO review_stats(task,ts,head,lines,areas,tier,rereview,outcome,cost_usd,self_check) "
-         "VALUES(?,?,?,?,?,?,?,?,?,?)", tuple(row.values()))
+    db.x("INSERT OR REPLACE INTO review_stats(task,ts,head,lines,code_lines,areas,tier,rereview,outcome,cost_usd,"
+         "self_check) VALUES(?,?,?,?,?,?,?,?,?,?,?)", tuple(row.values()))
     return row
 
 
@@ -158,14 +165,17 @@ def size_bucket(lines: int | None) -> str:
 
 def summary(db: DB, since: float) -> dict[str, Any]:
     """Reviews finished since `since`: counts, cost and the failure rate (failed or changes_needed)
-    per size bucket, per tier, for first reviews against re-reviews and by whether the reviewed hand-off
-    carried a self-check (rows from before the field, or with no reviewed task, count as unknown)."""
-    out: dict[str, Any] = {"n": 0, "usd": 0.0, "by_size": {}, "by_tier": {}, "by_kind": {}, "by_self_check": {}}
+    per size bucket (of all changed lines, and of non-test lines: code_lines), per tier, for first
+    reviews against re-reviews and by whether the reviewed hand-off carried a self-check (rows from
+    before a field, or with no reviewed task, count as unknown)."""
+    out: dict[str, Any] = {"n": 0, "usd": 0.0, "by_size": {}, "by_code_size": {}, "by_tier": {}, "by_kind": {},
+                           "by_self_check": {}}
     for r in rows(db, since):
         out["n"] += 1
         out["usd"] += float(r["cost_usd"] or 0)
         bad = r["outcome"] in ("failed", "changes_needed")
-        for key, val in (("by_size", size_bucket(r["lines"])), ("by_tier", r["tier"]),
+        for key, val in (("by_size", size_bucket(r["lines"])), ("by_code_size", size_bucket(r["code_lines"])),
+                         ("by_tier", r["tier"]),
                          ("by_kind", "re-review" if r["rereview"] else "first"),
                          ("by_self_check", {1: "self-checked", 0: "not self-checked"}.get(r["self_check"], "unknown"))):
             g = out[key].setdefault(val, {"n": 0, "failed": 0, "usd": 0.0})
@@ -183,5 +193,6 @@ def audit_line(db: DB, since: float) -> str:
 
     def part(groups: dict) -> str:
         return ", ".join(f"{k} {g['n']} ({g['failed']} failed, ${g['usd']:.2f})" for k, g in sorted(groups.items()))
-    return (f"reviews finished: {s['n']}, ${s['usd']:.2f}; by diff lines: {part(s['by_size'])}; by tier: "
+    return (f"reviews finished: {s['n']}, ${s['usd']:.2f}; by diff lines: {part(s['by_size'])}; "
+            f"by non-test lines: {part(s['by_code_size'])}; by tier: "
             f"{part(s['by_tier'])}; {part(s['by_kind'])}; {part(s['by_self_check'])}")

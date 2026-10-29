@@ -19,6 +19,28 @@ def test_review_stats_areas_split_runtime_prompts_and_tests():
                                                                              "50-200", ">200"]
 
 
+def test_review_stats_bucket_reviews_by_non_test_lines_too(env):
+    from ttp import audit, reviewstats
+    assert reviewstats.code_lines({"a.py": 3, "tests/t.py": 300, "x/test_b.py": 9, "README.md": 50,
+                                   "docs/g.txt": 4, ".changeset/c.md": 2, "s/SKILL.md": 5, "bin.so": None}) == 8
+    assert reviewstats.code_lines({}) == 0 and reviewstats.code_lines(None) is None
+    p = make(env)
+    # Mostly tests and docs: over 200 lines in all, under 50 outside them.
+    _, _, _, (rev,) = _finish_code(env, p, "tested", {"app.py": 40, "tests/test_app.py": 250, "docs/app.md": 20})
+    _fail_review(env, p, rev["id"], [{"title": "split it", "spec": "x"}])
+    row = p.db.one("SELECT * FROM review_stats WHERE task=?", (rev["id"],))
+    assert (row["lines"], row["code_lines"]) == (310, 40), row
+    p.db.x("UPDATE review_stats SET code_lines=NULL WHERE task=?", (rev["id"],))   # a row from before the field
+    _, _, _, (rev2,) = _finish_code(env, p, "big", {"big.py": 230})
+    _fail_review(env, p, rev2["id"], status="done", summary="fine")
+    s = reviewstats.summary(p.db, 0)
+    assert {k: (g["n"], g["failed"]) for k, g in s["by_size"].items()} == {">200": (2, 1)}, s
+    assert {k: (g["n"], g["failed"]) for k, g in s["by_code_size"].items()} == {">200": (1, 0), "unknown": (1, 1)}, s
+    line = next(x for x in audit.lines(p.db, p=p) if x.startswith("reviews finished: 2"))
+    assert "by diff lines: >200 2 (1 failed" in line, line
+    assert "by non-test lines: >200 1 (0 failed" in line and "unknown 1 (1 failed" in line, line
+
+
 def test_review_stats_table_is_added_to_an_existing_database(env):
     import sqlite3
     from ttp.db import DB
@@ -123,9 +145,10 @@ def test_the_self_check_column_is_added_to_an_existing_review_stats_table(env):
     old.conn.commit()
     old.conn.close()
     db = DB(path)
-    assert db.one("SELECT * FROM review_stats WHERE task=7")["self_check"] is None, "older rows keep NULL"
+    row = db.one("SELECT * FROM review_stats WHERE task=7")
+    assert row["self_check"] is None and row["code_lines"] is None, "older rows keep NULL"
     db.conn.close()
-    assert "self_check" in {r["name"] for r in DB(path).q("PRAGMA table_info(review_stats)")}   # a no-op again
+    assert {"self_check", "code_lines"} <= {r["name"] for r in DB(path).q("PRAGMA table_info(review_stats)")}
 
 
 def test_a_coordinator_fix_review_leads_with_the_delta_from_the_recorded_failed_head(env):

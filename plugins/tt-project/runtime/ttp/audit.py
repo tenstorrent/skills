@@ -20,7 +20,7 @@ the project could have saved. Model-free; the review grades it.
 - tasks blocked or waiting longer than `blocked_h` hours now, longest first;
 - review loops: per change whose review moved in the window, its review rounds and their spend
   plus the fixes they asked for (a review's `auto_review:<task>` and `continues:<review>` labels);
-- reviews finished (reviewstats): count, spend and failures by diff size, tier and first review
+- reviews finished (reviewstats): count, spend and failures by diff size (all and non-test lines), tier and first review
   against re-review, for retesting review routing;
 - overrides held longer than `blocked_h`: resource pauses and active mutes, and temporary instructions
   whose end only a model can judge that were listed as possibly over a day or more ago; and at any
