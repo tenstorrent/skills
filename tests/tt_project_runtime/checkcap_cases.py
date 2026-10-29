@@ -2890,18 +2890,22 @@ class _ReExec(BaseException):
 def _upgrade_child_checks(monkeypatch, upgrade) -> list:
     # cli.main's `ttp checks` as the detached child runs it (own_group: _checks_slot's `detached`), with
     # checkcap.upgraded answering `upgrade()` and os.execv recorded instead of run.
-    from ttp import checkcap, checkspill, cli
+    from ttp import checkcap, checkspill, cli, testslots
     real = cli._checks_slot
     monkeypatch.setattr(cli, "_checks_slot",
                         lambda p, run_dir, out, head, detached=False, *a, **k: real(p, run_dir, out, head, True, *a, **k))
     monkeypatch.setattr(checkcap, "upgraded", upgrade)
-    keys = (checkcap.ARRIVED_ENV, checkcap.REEXEC_ENV, checkspill.OFF_ENV)
+    keys = (checkcap.ARRIVED_ENV, checkcap.REEXEC_ENV, checkspill.OFF_ENV, testslots.LANE_ENV)
     for k in keys:
         monkeypatch.setenv(k, "")   # restored after the test, whatever the re-exec set
     execs = []
 
     def execv(path, argv):
-        execs.append((path, list(argv), {k: os.environ.get(k) for k in keys}))
+        # The lanes handed over: each still the open, inheritable file it names, labelled with this pid.
+        lanes = [(os.get_inheritable(fd), os.path.samestat(os.fstat(fd), os.stat(name)),
+                  json.loads(pathlib.Path(name).read_text()).get("pid"))
+                 for fd, name in json.loads(os.environ.get(testslots.LANE_ENV) or "[]")]
+        execs.append((path, list(argv), {k: os.environ.get(k) for k in keys}, lanes))
         raise _ReExec()
     monkeypatch.setattr(os, "execv", execv)
     return execs
@@ -2941,13 +2945,15 @@ def test_a_waiting_detached_checks_run_reexecutes_with_an_upgraded_runtime_and_k
         new.append("99.0.0")
         t.join(30)
         assert not t.is_alive() and ended == ["exec"] and not ran.exists()
-        (path, argv, envs), = execs
+        (path, argv, envs, lanes), = execs
         assert path == sys.executable and argv == [sys.executable, "-m", "ttp", *sys.argv[1:]]
         assert envs[checkcap.REEXEC_ENV] == "99.0.0" and not envs[checkspill.OFF_ENV], "spill hosts stay allowed"
         log = (run / "checks.log").read_text()
         assert log.count("re-executing with it") == 1, log
-        # It let go of its lane, slots and queue places first; the new process queues at its old arrival.
-        assert not locks.holder_records(testslots.project_held(p.name))
+        # It keeps its lane for the new process and lets go of its slots and queue places; the new process
+        # queues for them at its old arrival.
+        assert lanes == [(True, True, os.getpid())], lanes
+        assert "keeping its checks lane" in log
         assert not locks.queued(checkcap.slot_dir(), checkcap.RESOURCE)
         assert not locks.queued(checkcap.slot_dir(), testslots.TESTS.resource)
         assert envs[checkcap.ARRIVED_ENV] == repr(arrived) and cli._checks_arrived() == arrived
@@ -2965,6 +2971,64 @@ def test_a_detached_checks_run_that_got_its_slots_runs_its_commands_and_is_never
     cli.main(["checks", "--", "sh", "-c", f"touch {ran}; sleep 0.5"])
     assert ran.exists() and not execs, "only a waiting run re-executes; a running suite is never cut"
     assert "re-executing" not in (run / "checks.log").read_text()
+
+
+def test_a_checks_run_waiting_for_test_slots_is_cancelled_and_frees_its_lane(env, tmp_path, monkeypatch):
+    # checks-slot.cancel (the task ended; Daemon.reap_waiting_checks) reaches a run waiting for test slots
+    # too, not only one waiting for its lane or the checks slot (#4283: such a wrapper held its lane).
+    import threading
+    from ttp import checkcap, cli, locks, testslots
+    from ttp.runner import proc_start
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_TEST_POOL", "2")
+    held = [testslots.acquire("other 1", project_name="px"), testslots.acquire("other 2", project_name="px")]
+    ran, ended = tmp_path / "ran", []
+
+    def go():
+        try:
+            cli.main(["checks", "--", "sh", "-c", f"touch {ran}"])
+        except SystemExit as e:
+            ended.append(e.code)
+    t = threading.Thread(target=go)
+    t.start()
+    try:
+        assert _wait_for(lambda: "waiting for a host-wide test slot" in (run / "checks.log").read_text()
+                         if (run / "checks.log").exists() else False)
+        assert locks.holder_records(testslots.lane_paths(p.name, None, None)), "it waits holding its lane"
+        (run / cli.CHECKS_SLOT_CANCEL).write_text(json.dumps(
+            {"pid": os.getpid(), "started": proc_start(os.getpid()), "why": "task #3 ended (done)"}))
+        t.join(30)
+        assert not t.is_alive() and ended and ended[0] not in (0, None) and not ran.exists()
+        assert "task #3 ended (done)" in (run / "checks.log").read_text()
+        assert not locks.holder_records(testslots.lane_paths(p.name, None, None)), "its lane is free"
+        assert not locks.queued(checkcap.slot_dir(), testslots.TESTS.resource)
+    finally:
+        for g in held:
+            g.close()
+        t.join(30)
+
+
+def test_adopt_lanes_takes_only_the_open_lane_files_it_names(env, tmp_path):
+    from ttp import locks, testslots
+    a = locks.try_take([tmp_path / "lane-a"], "run 1")
+    b = tmp_path / "lane-b"
+    b.write_text("{}")
+    assert testslots.keep_lanes(testslots.Grant()) == "" and testslots.adopt_lanes("") is None
+    assert testslots.adopt_lanes("not json") is None
+    spec = testslots.keep_lanes(testslots.Grant(0, [a]))
+    fd = a.fileno()
+    assert os.get_inheritable(fd) and json.loads(spec) == [[fd, str(tmp_path / "lane-a")]]
+    # A spec naming another file than its fd is refused and lets that fd go (no double owner).
+    dup = os.dup(fd)
+    assert testslots.adopt_lanes(json.dumps([[dup, str(b)]])) is None
+    os.close(dup)
+    dup = os.dup(fd)
+    g = testslots.adopt_lanes(json.dumps([[dup, str(tmp_path / "lane-a")]]))
+    assert g is not None and g.k == 0 and not os.get_inheritable(dup) and g.files[0].name == str(tmp_path / "lane-a")
+    assert locks.try_take([tmp_path / "lane-a"], "run 2") is None, "still held"
+    g.close()
+    a.close()
+    assert locks.try_take([tmp_path / "lane-a"], "run 2") is not None
 
 
 def test_test_slots_waiter_queues_at_its_arrival_and_a_stop_ends_its_wait_leaving_no_ticket(env, monkeypatch):
@@ -3013,7 +3077,7 @@ def test_a_real_detached_checks_child_reexecutes_in_place_after_an_install_and_s
     # version is installed there; it re-executes as the same process (checks.pid still names it, so it
     # runs without a new `go`), waits on with the new code and writes checks.rc once its commands ran.
     import signal
-    from ttp import checkcap, cli
+    from ttp import checkcap, cli, locks, testslots
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     rt = tmp_path / "installed"
     shutil.copytree(pathlib.Path(cli.__file__).parents[1], rt, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
@@ -3027,17 +3091,22 @@ def test_a_real_detached_checks_child_reexecutes_in_place_after_an_install_and_s
     ran = tmp_path / "ran"
     pid = None
     try:
-        pid = _detached_checks(run, capsys, "sh", "-c", f"echo x >> {ran}")
+        fds = tmp_path / "fds"
+        pid = _detached_checks(run, capsys, "sh", "-c", f"echo x >> {ran}; ls -l /proc/$$/fd > {fds} 2>&1; true")
         assert _wait_for(lambda: (run / cli.CHECKS_SLOT_WAIT).exists())
         init = rt / "ttp" / "__init__.py"
         init.write_text(re.sub(r'__version__ = "[^"]+"', '__version__ = "99.0.0"', init.read_text()))
         assert _wait_for(lambda: "re-executing with it" in (run / "checks.log").read_text())
         assert _wait_for(lambda: (run / cli.CHECKS_SLOT_WAIT).exists()), "it waits again, with the new code"
         assert json.loads((run / "checks.pid").read_text())["pid"] == pid and not (run / cli.CHECKS_RC).exists()
+        assert "keeping its checks lane" in (run / "checks.log").read_text()
+        lanes = locks.holder_records(testslots.lane_paths(p.name, None, None))
+        assert [r.get("pid") for r in lanes] == [pid], "its lane stayed held by the same process"
         held.close()
         assert _wait_for(lambda: (run / cli.CHECKS_RC).exists())
-        assert (run / cli.CHECKS_RC).read_text().strip() == "0" and ran.read_text() == "x\n"
+        assert (run / cli.CHECKS_RC).read_text().strip() == "0" and ran.read_text() == "x\n", {x.name: x.read_text(errors="replace")[-1500:] for x in run.iterdir() if x.is_file() and x.name.startswith("checks")}
         assert (run / "checks.log").read_text().count("re-executing with it") == 1
+        assert testslots.SUITE not in fds.read_text(), "the commands do not inherit the lane"
     finally:
         held.close()
         if pid and not _gone_pid(pid):

@@ -610,6 +610,59 @@ def _heartbeat(f, every: float) -> None:
     threading.Thread(target=beat, daemon=True, name="checks-lane-heartbeat").start()
 
 
+LANE_ENV = "TTP_CHECKS_LANES"   # the lanes a re-executing `ttp checks` keeps: [[fd, path], ...] (keep_lanes)
+
+
+def keep_lanes(grant) -> str:
+    """The checks lanes `grant` (suite_hold's) holds, made to survive this process's exec: the open
+    files become inheritable and the returned text (for LANE_ENV) names them for adopt_lanes. A lane's
+    lock belongs to its open file and its label to this pid, which exec keeps, so the lane is never free."""
+    kept = []
+    for f in getattr(grant, "files", None) or []:
+        try:
+            os.set_inheritable(f.fileno(), True)
+            kept.append([f.fileno(), f.name])
+        except (OSError, ValueError):
+            pass
+    return json.dumps(kept) if kept else ""
+
+
+def adopt_lanes(spec: str) -> Grant | None:
+    """Grant(0) of the lanes keep_lanes() named in `spec`, taken over after the exec (heartbeat again,
+    no longer inherited by the commands it starts); None when there are none or one is not the open,
+    still locked lane file it names (those that are get closed: the run then queues for a lane again)."""
+    try:
+        kept = [(int(fd), str(path)) for fd, path in json.loads(spec or "[]")]
+    except (ValueError, TypeError):
+        return None
+    files, ok = [], bool(kept)
+    for fd, path in kept:
+        try:
+            st, own = os.fstat(fd), os.stat(path)
+            if (st.st_dev, st.st_ino) != (own.st_dev, own.st_ino):
+                ok = False
+                continue
+            f = os.fdopen(fd, "a+")
+            files.append(f)
+            f.buffer.raw.name = path   # named as try_take's are (suite_running, the heartbeat read it)
+            os.set_inheritable(fd, False)
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)   # its own lock: taken again at once
+        except (OSError, ValueError):
+            ok = False
+    if not ok:
+        for f in files:
+            f.close()
+        return None
+    for f in files:
+        _heartbeat(f, _lane_beat())
+    return Grant(0, files)
+
+
+def _lane_beat() -> float:
+    from . import checklane
+    return checklane.HEARTBEAT_S
+
+
 def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = None,
                wait_s: float | None = None, waiting: Callable[[bool], None] | None = None,
                stop: Callable[[], str] | None = None, who: str = "", priority: int | None = None,

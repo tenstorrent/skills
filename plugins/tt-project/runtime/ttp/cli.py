@@ -3364,7 +3364,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             slot = _checks_slot_take(p, run_dir, out, head, tell, waiting, limit, arrived, same, done, prio, owns,
                                      cfg, repo, cmds, what, top, lock, restart=detached)
         except checkcap.Upgraded as e:
-            _checks_reexec(str(e), arrived, prio, spill, tell, out)
+            _checks_reexec(str(e), arrived, prio, spill, tell, out, getattr(e, "lanes", None))
             continue   # it could not re-execute: wait again with the code it runs
         if slot is not None or not spill_to:
             return slot
@@ -3401,6 +3401,8 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
     local = [c for c in cmds if not push.remote_host(c)]
     in_tree = bool(p and top and any(cleantree.authoring(c) for c in local))
     suite = tree = slot = None
+    # The lanes these checks held when they re-executed for an upgraded runtime (_checks_reexec): kept.
+    kept = testslots.adopt_lanes(os.environ.pop(testslots.LANE_ENV, ""))
 
     def hold(key: str, n: int, **lane):
         left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
@@ -3414,11 +3416,13 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                                     max_wait=checklane.max_wait_s(cfg) if key == repo else 0.0,
                                     state=p.state if p else None, what=what, age=checklane.priority_age_s(cfg), **lane)
     try:
-        if in_tree:
+        if kept is not None:
+            suite, kept = kept, None
+        elif in_tree:
             if (tree := hold(testslots.tree_key(top), 1, pending=True)) is None:
                 return None
-        if (suite := hold(repo, checklane.slots(cfg), lock=lock, cap=checklane.project_cap(cfg),
-                          worktree=top, headroom=checklane.headroom, pending=True)) is None:
+        if suite is None and (suite := hold(repo, checklane.slots(cfg), lock=lock, cap=checklane.project_cap(cfg),
+                                            worktree=top, headroom=checklane.headroom, pending=True)) is None:
             if tree is not None:
                 tree.close()
             return None
@@ -3459,10 +3463,12 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         out.write(f"ttp checks: {said}\n")
         out.flush()
         die(f"ttp checks: {said}", 1)
-    except checkcap.Upgraded:
-        for g in (slot, suite, tree):   # its lane, checks slot and queue places go back before it re-executes
+    except checkcap.Upgraded as e:
+        # Its checks slot and queue places go back before it re-executes; a lane it holds is kept.
+        for g in (slot, tree):
             if g is not None:
                 g.close()
+        e.lanes = suite
         raise
     except checkcap.Unavailable as e:
         for g in (suite, tree):
@@ -3473,26 +3479,33 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         die(f"ttp checks: {e}")
 
 
-def _checks_reexec(new: str, arrived: float | None, prio, spill: bool, tell, out) -> None:
+def _checks_reexec(new: str, arrived: float | None, prio, spill: bool, tell, out, lanes=None) -> None:
     """Run these waiting detached checks again with the runtime installed now (version `new`,
     checkcap.Upgraded), as the same process: exec keeps its pid and start time, so checks.pid, the
     launcher's `go` and a cancel request still name it, and its checks.rc is written once at its end.
-    It queues again at its arrival time `arrived` and its task's priority `prio`, so it keeps its place.
-    Called only while it waits, holding nothing; returns only when the exec failed."""
-    from . import checkcap, checkspill
+    It keeps the checks lanes it holds (`lanes`, testslots.keep_lanes) and queues again for the rest at
+    its arrival time `arrived` and its task's priority `prio`, so it keeps its place. Called only while it
+    waits, holding nothing else; returns only when the exec failed, with the lanes let go."""
+    from . import checkcap, checkspill, testslots
     if arrived is not None:
         os.environ[checkcap.ARRIVED_ENV] = repr(arrived)
     if not spill:   # what cmd_checks took out of the environment: no spill host for these checks
         os.environ[checkspill.OFF_ENV] = "1"
     os.environ[checkcap.REEXEC_ENV] = new
+    if lanes is not None and (spec := testslots.keep_lanes(lanes)):
+        os.environ[testslots.LANE_ENV] = spec
     tell(f"runtime {__version__} was upgraded to {new} while these checks waited: re-executing with it "
-         f"(same pid), queueing again at their arrival "
+         f"(same pid{', keeping its checks lane' if os.environ.get(testslots.LANE_ENV) else ''}), "
+         f"queueing again at their arrival "
          f"{timefmt.clock(now=arrived) if arrived is not None else 'now'} and priority {prio if prio is not None else '-'}")
     for f in (out, sys.stdout, sys.stderr):
         f.flush()
     try:
         os.execv(sys.executable, [sys.executable, "-m", "ttp", *sys.argv[1:]])
     except OSError as e:
+        os.environ.pop(testslots.LANE_ENV, None)
+        if lanes is not None:
+            lanes.close()   # the wait starts again from its lane
         tell(f"could not re-execute with runtime {new} ({e.strerror or e}): waiting on with {__version__}")
 
 
