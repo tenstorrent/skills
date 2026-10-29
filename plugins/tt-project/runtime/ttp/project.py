@@ -282,12 +282,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # task gets one too, unless its commit is merged into the harness: then it is closed as done. A done code
     # task with an unlanded head and no review gets one too (sweep_unreviewed): at most
     # unreviewed_per_pass (0 off; null: budget.max_parallel_workers) per pass, for tasks updated within
-    # unreviewed_max_age_h hours.
+    # unreviewed_max_age_h hours; one waiting externally (a busy lock too) only after unreviewed_wait_s.
     # A review whose head carries a change with a failed review and an open fix waits for that fix
     # to land or its chain to end, at most carried_hold_max_h hours (0: no cap; reviewhold).
     "review": {"light_max_lines": 80, "risky_paths": [], "light_paths": [], "auto": True, "auto_notes": "",
                "area_fail_cap": 3, "blocked_long_h": 12, "rule_blocks_min": 3, "sweep_after_s": 300,
-               "unreviewed_per_pass": None, "unreviewed_max_age_h": 72, "carried_hold_max_h": 24},
+               "unreviewed_per_pass": None, "unreviewed_max_age_h": 72, "unreviewed_wait_s": 1800,
+               "carried_hold_max_h": 24},
     # Continue chains (chaincap): a task_add that continues a lineage past max_hops hops, max_stalls
     # failed or no-progress hops in a row or max_usd spent (0 turns one off), or one in an area under
     # review.area_fail_cap, is refused unless its `reason` names what changed in a tricky turn.

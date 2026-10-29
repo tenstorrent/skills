@@ -31329,7 +31329,7 @@ def test_the_unreviewed_invariant_leaves_each_excluded_task_alone(env, monkeypat
     _git_out(env["repo"], "update-ref", "refs/remotes/origin/work", head)   # a local ref: no fetch
     case("still waiting on its checks", status="queued", age=7200, result={
         "status": "waiting", "summary": "checks", "retry_when": "ttp checks --result x", "wait_kind": "self"})
-    case("waiting briefly", status="queued", age=200, result={"status": "waiting", "summary": "x",
+    case("waiting briefly", status="queued", age=600, result={"status": "waiting", "summary": "x",
                                                                  "wait_kind": "external"})
     case("queued again", status="queued", age=7200)
     case("too old", age=dm.UNREVIEWED_MAX_AGE_H * 3600 + 600)

@@ -122,3 +122,23 @@ def test_a_device_task_held_by_the_device_cap_with_the_device_idle_raises_one_ca
     d.cfg = p.config()
     assert len(check(32)) == 1 and q["id"] not in d._cap_waits
 
+
+
+def test_a_short_external_wait_keeps_its_unfinished_head_unreviewed_while_review_is_swept_at_5_min(env):
+    # review.sweep_after_s (300) paces only tasks in review: a worker that committed part of its
+    # work and waits on a busy lock (external) gets no review of that head for unreviewed_wait_s.
+    from ttp import daemon as dm
+    p = make(env)
+    busy = {"status": "waiting", "summary": "half done", "waiting_for": "device-a busy",
+            "retry_when": "ttp lock --probe device-a", "wait_kind": "external"}
+    waiting, _, _ = _unreviewed(env, p, "waits on a lock", status="queued", age=600, result=busy)
+    assert dm.Daemon(p.base).sweep_unreviewed(force=True) == [], "10 min external wait: not reviewed"
+    tid, _, _, reviews = _finish_code(env, p, "left in review", {"app.py": 20}, result={
+        "status": "needs_review", "summary": "it works", "followups": [{"title": "later", "spec": "more"}]})
+    assert p.db.task(tid)["status"] == "review" and not reviews
+    _ran(p, tid, time.time() - 360)
+    _sweep(dm.Daemon(p.base))
+    assert [r["depends_on"] for r in p.db.q("SELECT depends_on FROM tasks WHERE kind='review'")] == [f"[{tid}]"]
+    long_wait, _, _ = _unreviewed(env, p, "waits long", status="queued", age=2400, result=busy)
+    assert dm.Daemon(p.base).sweep_unreviewed(force=True) == [long_wait], "40 min: its head is reviewed"
+    assert not _daemon_reviews(p, waiting)

@@ -415,6 +415,7 @@ UNREVIEWED_EVENT = "review_unqueued"
 UNREVIEWED_PER_PASS = 2        # review.unreviewed_per_pass unreadable: most reviews one pass queues (unset: loadcaps)
 UNREVIEWED_MAX_AGE_H = 72      # review.unreviewed_max_age_h: tasks last updated longer ago are left alone
 UNREVIEWED_GRACE_S = 120       # a task updated more recently than this is still settling
+UNREVIEWED_WAIT_S = 1800.0     # review.unreviewed_wait_s: an external wait (a busy lock too) this long gets its head reviewed
 UNREVIEWED_PASS_S = 20         # the pass stops looking after this long, so the tick stays short
 PUSH_REFS_EVERY_S = 600   # how often the push queue's pins (refs/ttp/push/<id>) of settled rows are pruned
 
@@ -10751,7 +10752,7 @@ class Daemon:
 
     def sweep_unreviewed(self, force: bool = False) -> list[int]:
         """Model-free invariant backstop: a code task that is done, or has waited externally for
-        review.sweep_after_s, whose branch head is on no push-branch ref (local refs and push_queue
+        review.unreviewed_wait_s (not review.sweep_after_s: a busy lock is external too), whose branch head is on no push-branch ref (local refs and push_queue
         rows only, no fetch) gets its review queued (_auto_review), with one low feed line naming it.
         Left alone: a review of it that is open or ran since its last run (or that names this head),
         an open task continuing it or on its branch (not one that waits on it landing: a split head
@@ -10771,9 +10772,9 @@ class Daemon:
         try:
             cap = loadcaps.unreviewed_per_pass(cfg)
             age = float(rules.get("unreviewed_max_age_h", UNREVIEWED_MAX_AGE_H)) * 3600
-            waited = float(rules.get("sweep_after_s", SWEEP_AFTER_S) or 0)
+            waited = float(rules.get("unreviewed_wait_s", UNREVIEWED_WAIT_S) or 0)
         except (TypeError, ValueError):
-            cap, age, waited = UNREVIEWED_PER_PASS, UNREVIEWED_MAX_AGE_H * 3600.0, SWEEP_AFTER_S
+            cap, age, waited = UNREVIEWED_PER_PASS, UNREVIEWED_MAX_AGE_H * 3600.0, UNREVIEWED_WAIT_S
         if cap <= 0 or not rules.get("auto", True) or not (d.get("review_before_pr", True) or d.get("push_branch")):
             return []
         try:

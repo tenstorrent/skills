@@ -195,8 +195,8 @@ prolonged whole-box outage.
   cancelled (its spec then says so), or after `review.carried_hold_max_h` hours (default 24, 0 no
   cap). A hand-off with no follow-ups, notes or findings starts no
   coordinator turn; any other still goes to the coordinator for those, and the review's spec lists
-  its follow-ups. As a backstop, a done code task (or one waiting on something else for
-  `review.sweep_after_s`) whose head is on no push-branch ref, with no review, open continuation,
+  its follow-ups. As a backstop, a done code task (or one waiting on something else, a busy lock
+  too, for `review.unreviewed_wait_s`, default 1800) whose head is on no push-branch ref, with no review, open continuation,
   push-queue entry or recorded reason (superseded, rejected, `no_push`, all push-excluded, a PR
   that carries the head, a push branch no push reaches, a recorded landing), gets its review and
   a low feed line, at most `review.unreviewed_per_pass` (default: the project's
@@ -1424,13 +1424,19 @@ is open raises one `cap_wait` event naming the key.
 | `device.max_tasks` | one per device resource, at most the worker slots, at least 2 (old: 2) | device tasks preparing at once | convenience |
 | `review.unreviewed_per_pass` | `budget.max_parallel_workers` (old: 2) | reviews the backstop sweep queues per pass | convenience |
 | `review.sweep_after_s` | 300 s (old: 1800) | a code task left in review before its review is queued | convenience |
+| `review.unreviewed_wait_s` | 1800 s | a code task waiting externally (a busy lock too) before the backstop reviews its head | convenience |
+| review sweep cadence (`REVIEW_SWEEP_EVERY_S`) | 300 s | how often both review sweeps look | convenience |
+| review settle grace (`UNREVIEWED_GRACE_S`) | 120 s | a task updated this recently before the backstop sweep looks at it | convenience |
 | `coordinator.review_stall_s` | 1800 s (old: 14400) | a dependency in review before the coordinator hears of it | convenience |
 | `checks.test_project_max` | from cores and memory, at least 2 | a project's suites at once | convenience |
-| `push_batch_s` | 300 s, none after a clean batch | changes gathered into one push | convenience |
+| `delivery.push_batch_s` | 300 s, none after a clean batch | changes gathered into one push | convenience |
+| `delivery.push_batch_max` | 8 | most changes in one push batch (a full batch starts at once) | convenience |
+| `retry_when` / `start_when` probe (`PROBE_EVERY_S`) | 180 s | a waiting or deferred task before its probe runs again | convenience |
+| auth re-probe (`AUTH_PROBE_S`) | 900 s | work for a logged-out provider with no login check, before one run checks it | safety (spend) |
 | `ttp lock` on a device | one command at a time | device commands | safety |
 | suite lock | one full suite per worktree | a second run of the same suite | safety |
 | `checks.host_max` | from the host's cores and load | suites on one host | safety |
-| `push_min_gap_s` | 1800 s, only after a batch that did not end clean | the next push | safety |
+| `delivery.push_min_gap_s` | 1800 s, only after a batch that did not end clean | the next push | safety |
 | `budget.max_parallel_workers` | 6 | worker runs at once | safety (spend) |
 
 ## Standby snapshots
