@@ -10819,7 +10819,7 @@ def test_a_coordinator_review_replaces_the_daemons_until_it_starts(env):
 def test_an_unqueued_continue_follow_up_says_so_and_raises_continue_unqueued_once(env):
     """A done code hop with changes and one `continue:` follow-up the daemon did not queue (automatic
     hops off) says NOT queued in its task_done and followup_proposed events. Left alone for 30 min, it
-    raises one high continue_unqueued event; a task that continues it raises none."""
+    raises one normal, ride-along continue_unqueued event; a task that continues it raises none."""
     p = make(env)
     from ttp import daemon as dm
     p.set_config("chains.auto", False)
@@ -10838,7 +10838,8 @@ def test_an_unqueued_continue_follow_up_says_so_and_raises_continue_unqueued_onc
         return p.db.q("SELECT * FROM events WHERE kind=?", (dm.CONTINUE_UNQUEUED,))
     assert check(600) == [], "raised before 30 min"
     (ev,) = check(dm.CONTINUE_UNQUEUED_AFTER_S + 60)
-    assert ev["task"] == tid and ev["severity"] == "high" and ev["status"] == "queued"
+    assert ev["task"] == tid and ev["severity"] == "normal" and ev["status"] == "queued"
+    assert json.loads(ev["data"])["ride_along"] is True
     assert "'continue: widget'" in ev["text"] and dm.UNQUEUED_TAG in ev["text"] and f"continues #{tid}" in ev["text"]
     assert len(check(dm.CONTINUE_UNQUEUED_AFTER_S + 60)) == 1, "raised twice for one task"
     # A follow-up a turn did add with continues is taken up: nothing to raise.
