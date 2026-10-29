@@ -6,7 +6,10 @@
   task carrying it on, landed.carriers) has an approved or batched push queue row, without waiting
   through the batch and the landing. Its start_when goes; START_FROM names the row's head (the
   approved head), which worktree.ensure branches a new worktree from instead of the base, and
-  EARLY names X and the row. A held row (a missing token scope) does not count.
+  EARLY names X and the row. A held row (a missing token scope) does not count. Only a task that
+  branches from that head takes it (worktree.branches_early: a worktree of its own, no carried
+  branch, PR clone or continued head); any other (plan, ops, review, harness, work unless
+  worktree.kinds lists it) would run on code without X, so it waits for the real landing.
 - Rebase note: once that row is sent back (conflict, failed checks, refused, cancelled) the task
   gets a note in its spec, and in a running run's steer.md, to rebase onto the branch once X's
   change lands; it is never cancelled. EARLY then goes, as it does once the row is pushed or landed.

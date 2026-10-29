@@ -982,6 +982,19 @@ def early_head(p: Project, task: dict) -> str | None:
     return _git(p.root, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}", check=False) or None
 
 
+def branches_early(p: Project, task: dict) -> bool:
+    """Whether a task would branch a new worktree from early_head (lanewait's early start): it gets a
+    worktree of its own in the root's repository (gets_worktree), carries no branch, fixes no PR in
+    another repository and continues no task whose head it would take instead. Any other task runs on
+    the code as it is, so it must wait for the real landing."""
+    t = dict(task)
+    if t.get("kind") in NEVER_OWN_KINDS or not gets_worktree(p, t.get("kind") or ""):
+        return False
+    if carried_branch(t) or pr_repo(p, t) or not is_git(p.root):
+        return False
+    return not continued_head(p, t)
+
+
 def resolve_base(p: Project) -> str:
     """The configured base as a commit git can find: the name itself, else the remote's branch of
     that name (a fresh clone has `origin/<name>` but no local `<name>`). A miss names close matches,

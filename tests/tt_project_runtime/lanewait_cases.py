@@ -50,6 +50,35 @@ def test_a_landed_wait_starts_on_the_producers_approved_head(env, monkeypatch, s
     assert got == head and (path / "feature.txt").exists()
 
 
+@pytest.mark.parametrize("kind", ["ops", "plan", "work", "review", "harness"])
+def test_a_task_without_its_own_worktree_waits_for_the_real_landing(env, monkeypatch, kind):
+    """Only a task that branches from the approved head starts early: any other kind would run on code
+    without X, so it stays deferred on the landed probe while X is only approved."""
+    from ttp import daemon as dmod
+    from ttp.db import deferral
+    p = make(env)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    prod, _, _ = _approved_producer(p)
+    dep = p.db.add_task("check it", "s", kind=kind, status="queued",
+                        labels=[f"start_when:landed:#{prod}", f"deferred_since:{time.time():.0f}"])
+    dmod.Daemon(p.base).probe_deferred(time.time())
+    assert not _ready(p, dep) and deferral(p.db.task(dep)), f"a {kind} task waits for the landing"
+
+
+def test_a_carried_branch_task_waits_for_the_real_landing(env, monkeypatch):
+    """A code task carrying a branch works on that branch, not the approved head: no early start."""
+    from ttp import daemon as dmod
+    from ttp.db import deferral
+    p = make(env)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    prod, _, _ = _approved_producer(p)
+    dep = p.db.add_task("fix pr", "s", kind="code", status="queued",
+                        labels=[f"start_when:landed:#{prod}", f"deferred_since:{time.time():.0f}",
+                                "pr_branch:feature/x"])
+    dmod.Daemon(p.base).probe_deferred(time.time())
+    assert not _ready(p, dep) and deferral(p.db.task(dep))
+
+
 def test_a_held_or_missing_push_row_keeps_the_landed_wait(env, monkeypatch):
     """A row held for a token scope, or none at all, is no early start; neither is a longer probe."""
     from ttp import lanewait

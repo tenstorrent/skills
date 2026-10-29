@@ -8039,8 +8039,9 @@ class Daemon:
                 continue
             if landed.missing_task_refs(db, d["when"]):
                 continue   # it can never pass: _raise_missing_task_refs raised it, once
-            if early := lanewait.batched(db, d["when"]):
+            if worktree.branches_early(self.p, t) and (early := lanewait.batched(db, d["when"])):
                 # Its producer's change is approved or batched: it starts now, on that head (lanewait).
+                # A task that would not branch from that head keeps the landed probe below.
                 self._start_verdict(dict(t, labels=json.dumps(lanewait.early_labels(
                     json.loads(t["labels"] or "[]"), early))), 0, now)
                 log(self.p, f"task {t['id']} starts on #{early[0]}'s approved head {early[2][:12]} "

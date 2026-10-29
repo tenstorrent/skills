@@ -129,7 +129,9 @@ Each field's rules are in the section named; the table only lists them.
   never onto a device or machine task or one that waits itself (a continue hop drops such edges).
 <!-- ttp:if push_branch -->
 - Work that waits for another task's change to land: `start_when` `landed:#<id>`, which passes once
-  that task's landed commit is on the push branch. Never wait on a raw sha (pushing rebases each
+  that task's landed commit is on the push branch. A task with a worktree of its own (code) starts
+  earlier, once the change is approved, on its approved head; other kinds wait for the landing. To
+  make a code task wait for the real landing, use `ttp landed --task <id>`. Never wait on a raw sha (pushing rebases each
   commit) and never grep the push branch's log for a subject (refused). For a commit that is not a
   task's, use `ttp landed <sha>`. A shared file with a failed review in 48 h, or a settled area's,
   chains a task_add itself (ANDed with yours); a spec line `parallel: <why>` runs it beside instead.

@@ -407,7 +407,9 @@ prolonged whole-box outage.
   sweep covers it.
 - Task-to-task waits (model-free, lanewait.py): a queued task whose start_when is exactly
   `landed:#<id>` starts as soon as that change is approved or batched in the push queue, branching
-  from its approved head instead of the base; if the batch later sends it back, the task gets a
+  from its approved head instead of the base, when the task gets a worktree of its own (code, or a
+  kind `worktree.kinds` lists; no carried branch or continued head). Any other task waits for the
+  real landing, as it would run on code without that change. If the batch later sends it back, the task gets a
   rebase note (its spec and a running run's steer.md), never a cancel. A queued code or work task
   that has waited on another task (`landed:#`, depends_on, a lineage hold) longer than
   `waiting.lane_wait_event_s` (600; 0: never) raises one `lane_wait` event naming both tasks, the
