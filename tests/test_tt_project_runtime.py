@@ -46456,16 +46456,34 @@ def _slow_stack_dump(monkeypatch, delay_s=0.5):
     monkeypatch.setattr(faulthandler, "dump_traceback", slow)
 
 
+def _slow_tick_around(d, monkeypatch, delay_s=1.0):
+    """A loaded host: the tick's work before its first step and the step after the test's own one each
+    take longer than the test's short overrun or stall limit plus a slow stack dump (_slow_stack_dump),
+    so that limit must hold only in the test's own step."""
+    import functools
+    for name in ("tend_lease", "reap_runs"):   # before the steps; the step after lift_boot_pause
+        real = getattr(d, name)
+
+        @functools.wraps(real)
+        def slow(*a, real=real, **kw):
+            time.sleep(delay_s)
+            return real(*a, **kw)
+        monkeypatch.setattr(d, name, slow)
+
+
 def test_a_tick_step_that_blocks_is_logged_with_every_threads_stack_and_alerted(env, monkeypatch):
     import ttp.daemon as dm
     p = make(env)
     _main_thread_in_dumps()
     d = dm.Daemon(p.base)
     d.cfg = p.config()
-    monkeypatch.setattr(dm, "TICK_OVERRUN_S", 0.3)
     _slow_stack_dump(monkeypatch)
+    _slow_tick_around(d, monkeypatch)
 
     def step_that_blocks():   # a step stuck in a call with no timeout, still telling the watchdogs it moves
+        # The short limit starts with this step: set before the tick, a slow start of the tick passed
+        # it, and that once-per-tick dump named no step and left this one none of its own.
+        monkeypatch.setattr(dm, "TICK_OVERRUN_S", 0.3)
         for _ in range(HANG_S):   # ends the moment the watch thread dumps, or at HANG_S (a hang) at the latest
             time.sleep(0.05)
             d._progress()
@@ -46502,12 +46520,16 @@ def test_a_tick_step_blocked_without_progress_leaves_its_stacks_before_the_watch
     # The stall dump (plus one watch interval) comes before the watchdogs restart a daemon whose last
     # seen progress (throttled to PROGRESS_EVERY_S) is WATCHDOG_S old; the long-tick dump does not.
     assert dm.TICK_STALL_S + 30 < dm.WATCHDOG_S - dm.PROGRESS_EVERY_S < dm.TICK_OVERRUN_S
-    monkeypatch.setattr(dm, "TICK_STALL_S", 0.3)
     _slow_stack_dump(monkeypatch)
-    seen = {}
+    _slow_tick_around(d, monkeypatch)
+    seen, stall_s = {}, dm.TICK_STALL_S
 
     def step_stuck_silently():   # a subprocess or lock wait with no timeout: never calls _progress
+        # The short limit holds only in this step: a slow start of the tick, or a slow step after this
+        # one, stalled past it too, and that stall's dump (and the alert) named another step.
+        monkeypatch.setattr(dm, "TICK_STALL_S", 0.3)
         dump.waited()   # ends the moment the watch thread dumps, or at HANG_S (a hang) at the latest
+        monkeypatch.setattr(dm, "TICK_STALL_S", stall_s)
         stacks = p.state / dm.STACKS_FILE
         seen["stacks"] = stacks.read_text() if stacks.exists() else ""
     d.lift_boot_pause = step_stuck_silently
