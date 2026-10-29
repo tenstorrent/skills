@@ -4004,6 +4004,7 @@ class Daemon:
             return
         if handoff is None and not (run_dir / RESULT_FILE).exists():
             self._adopt_misplaced_handoff(r, task, run_dir)
+        own = handoff is None   # the run's own result.json, not an on_pass recorded model-free
         handoff = handoff if handoff is not None else _read_result(run_dir / RESULT_FILE)
         result = handoff or last_json_object(usage.final_text or "") or {}
         if past_cap and isinstance(result, dict):
@@ -4201,7 +4202,7 @@ class Daemon:
         extra: dict = {}
         reason = None
         not_before = None
-        missed = self._missed_update(r, task, run_dir, handoff) if status == "ok" else None
+        missed = self._missed_update(r, task, run_dir) if status == "ok" and own else None
         if rebooted:
             extra["reboot"] = {"at": self.boot_at, "notes": _last_notes(run_dir)}
         wakes = _reboot_wakes(task)
@@ -4291,7 +4292,7 @@ class Daemon:
         if missed and new in ("done", "review"):
             # The spec changed during the run and the update carrying it stayed unread: the hand-off is
             # not accepted, the task runs again now with the change (its next run starts on that spec).
-            new, not_before, push_quiet = "queued", time.time(), True
+            new, not_before = "queued", time.time()
             attempts = int(task["attempts"] or 0)
             extra["woke"] = ("an update to your task reached your last run after it last read its updates, so "
                              "that run's hand-off does not cover it. Act on it, then hand off again. The update:\n"
@@ -9899,14 +9900,12 @@ class Daemon:
         self.p.db.update_task(tid, blocked_reason="woken: its spec changed; it runs by rank, before its probe passes")
         return True
 
-    def _missed_update(self, r: dict, task: dict, run_dir: Path, handoff: dict | None) -> dict | None:
+    def _missed_update(self, r: dict, task: dict, run_dir: Path) -> dict | None:
         """{"started": spec digest the run started on, "text": its unread updates} when the task's spec
         changed after the run started and the steer.md update carrying the change was not read before
         the run ended; else None. A worker with the update hook (provider steer_hook) has read up to its
         steer.offset; one without reads steer.md between steps, so only an update newer than its
-        result.json is surely unread. A model-free on_pass (`handoff`) is checked in _probe_passed."""
-        if handoff is not None:
-            return None
+        result.json is surely unread. A model-free on_pass is checked in _probe_passed instead."""
         from .hook import STEER_FILE, unread_update
         from .prompts import spec_digest
         started = load_result(r.get("note")).get("spec_sha")

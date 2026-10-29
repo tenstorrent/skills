@@ -182,3 +182,95 @@ def test_the_retry_when_docs_say_a_spec_change_wakes_the_task_once():
     for rel in ("skills/tt-project-harness/SKILL.md", "docs/design.md"):
         text = " ".join((RUNTIME.parent / rel).read_text().split())
         assert "spec update wakes it once" in text, rel
+
+
+def test_a_spec_change_wakes_a_task_waiting_on_its_checks_at_its_own_tier(env, monkeypatch):
+    # Task #4397: woken by a spec change while waiting on its own `ttp checks --result`, it ran as a light
+    # "is the wait over?" check, saw the checks pass and handed off done without the addition.
+    from ttp import budget as bud, push
+    p = make(env)
+    for tier, want in (("standard", "standard"), ("light", "light")):
+        tid = _spec_sleeper(p, probe=f"{push._own_ttp(p)} checks --result /tmp/no-such-run")
+        p.db.update_task(tid, tier=tier)
+        assert bud.wake_tier(tier, json.loads(p.db.task(tid)["result"])) == "light"
+        _edit_spec(p, tid, "also report the peak memory")
+        _spec_daemon(p, monkeypatch).probe_waiting()
+        res = json.loads(p.db.task(tid)["result"])
+        assert res["wake_tier"] == tier and res["escalated_wake"] is True
+        assert bud.wake_tier(tier, res) == want, (tier, res)
+        assert "## Update" in res["woke"]
+
+
+def test_passed_checks_after_a_spec_change_wake_the_task_instead_of_recording_its_on_pass(env, monkeypatch,
+                                                                                          tmp_path):
+    from ttp import budget as bud, daemon as dmod
+    from ttp.prompts import spec_digest
+    p = make(env)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tid, _ = _checks_wait_task(p, tmp_path, DONE_ON_PASS)
+    res = json.loads(p.db.task(tid)["result"])
+    p.db.update_task(tid, result=json.dumps({**res, "spec_seen": spec_digest(p.db.task(tid))}))
+    _edit_spec(p, tid, "also report the parse time")
+    p.db.update_task(tid, not_before=time.time() - 1)   # already due: the spec wake does not fire first
+    _settle_probe(d, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert task["status"] == "queued" and _ready(p, tid), (task["status"], task["blocked_reason"], res)
+    assert "its spec changed" in res["woke"] and res["spec_seen"] == spec_digest(task)
+    assert bud.wake_tier(task["tier"], res) == "standard"
+    assert not _on_pass_reviews(p), "the stale on_pass was recorded"
+
+
+def _run_ended_after_a_spec_change(env, p, result, read=False, provider="claude"):
+    """A worker run started on the task's first spec; the coordinator changed the spec while it ran (its
+    update went to the run's steer.md) and the run then handed off `result`, having read its updates
+    only if `read`."""
+    from ttp.daemon import Daemon
+    from ttp.hook import STEER_FILE, mark_seen
+    from ttp.prompts import spec_digest
+    from ttp.providers.base import RunUsage as Usage
+    tid = p.db.add_task("fix the parser", "fix the parser", kind="work", tier="standard", origin="user")
+    run_dir = env["tmp"] / f"run-spec-{tid}"
+    run_dir.mkdir()
+    note = {"spec_sha": spec_digest(p.db.task(tid))}
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,note) VALUES(?,?,?,?,?,?,?)",
+           (tid, "worker", provider, time.time() - 600, "running", str(run_dir), json.dumps(note)))
+    rid = p.db.one("SELECT id FROM runs WHERE task=?", (tid,))["id"]
+    p.db.update_task(tid, status="running")
+    _edit_spec(p, tid, "also report the parse time")
+    steer = run_dir / STEER_FILE
+    assert "also report the parse time" in steer.read_text(), "the update did not reach the running run"
+    if read:
+        mark_seen(run_dir, steer.stat().st_size)
+    (run_dir / "result.json").write_text(json.dumps(result))
+    d = Daemon(p.base)
+    r = dict(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)))
+    with d.p.db.tx():
+        d._finish_worker(r, Usage(cost_usd=0.4), "ok", run_dir)
+    return p.db.task(tid), note["spec_sha"]
+
+
+def test_a_done_from_a_run_that_never_read_its_spec_update_is_sent_back_with_it(env):
+    p = make(env)
+    done = {"status": "done", "summary": "parser fixed"}
+    task, _ = _run_ended_after_a_spec_change(env, p, done)
+    res = json.loads(task["result"])
+    assert task["status"] == "queued" and task["not_before"] <= time.time(), (task["status"], res)
+    assert "also report the parse time" in res["woke"] and int(task["attempts"] or 0) == 0
+    assert not _on_pass_reviews(p), "a review started on a hand-off that misses the update"
+    # Read before the hand-off: the done stands.
+    task, _ = _run_ended_after_a_spec_change(env, p, done, read=True)
+    assert task["status"] == "done", json.loads(task["result"])
+
+
+def test_a_waiting_hand_off_that_missed_a_spec_update_keeps_the_spec_it_started_on(env):
+    from ttp.prompts import spec_digest
+    p = make(env)
+    wait = {"status": "waiting", "summary": "job running", "waiting_for": "the job", "retry_after_s": 3600,
+            "retry_when": "exit 1"}
+    task, started = _run_ended_after_a_spec_change(env, p, wait)
+    res = json.loads(task["result"])
+    assert task["status"] == "queued" and res["spec_seen"] == started != spec_digest(task)
+    task, _ = _run_ended_after_a_spec_change(env, p, wait, read=True)
+    assert json.loads(task["result"])["spec_seen"] == spec_digest(task)
