@@ -412,12 +412,15 @@ def ended_pushes(p: Project) -> list[tuple[Path, int, str]]:
 
 def names_job(result: dict, rc: Path) -> bool:
     """Whether this hand-off's retry_when, on_pass_cmd, on_pass or next_step names the job: its .rc, or
-    `<run>/<name>` as `ttp detach --check <dir>/<name>` writes it (a longer name such as <name>2 is not it)."""
+    `<run>/<name>` as `ttp detach --check <dir>/<name>` writes it (a longer name such as <name>2 is not it).
+    A file of another kind (a push marker's .json) counts only by its full name."""
     rc = Path(rc)
     text = " ".join(str(result.get(k) or "") for k in ("retry_when", "on_pass_cmd", "next_step"))
     text += " " + json.dumps(result.get("on_pass") or "")
-    tail = re.escape(f"{rc.parent.name}/{rc.stem}")
-    return re.search(rf"(?<![\w.-]){tail}(?:\.rc)?(?![\w.-])", text) is not None
+    names = [re.escape(f"{rc.parent.name}/{rc.name}") + r"(?![\w-])"]
+    if rc.suffix == ".rc":
+        names.append(re.escape(f"{rc.parent.name}/{rc.stem}") + r"(?![\w.-])")
+    return re.search(rf"(?<![\w.-])(?:{'|'.join(names)})", text) is not None
 
 
 def waited_on(p: Project, rc: Path) -> int | None:

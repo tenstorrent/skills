@@ -817,6 +817,22 @@ def test_handed_off_4_the_run_slash_name_form_counts_as_a_waiter(env, tmp_path):
         _end_group(pgid)
 
 
+def test_handed_off_4b_a_file_of_another_kind_counts_only_by_its_full_name():
+    """A push marker (<dir>/<name>.json) is named by its full path or <dir>/<name>.json, never its bare stem."""
+    from ttp import jobstop
+    marker = pathlib.Path("/x/state/pushes/t1-20261029-033950-5.json")
+    for text in (f"ttp push --result {marker}", "pushes/t1-20261029-033950-5.json", f'"{marker}"'):
+        assert jobstop.names_job({"retry_when": text}, marker), text
+    for text in ("pushes/t1-20261029-033950-5", "pushes/t1-20261029-033950-5.json2", "pushes/t1-20261029-033950-50.json",
+                 "xpushes/t1-20261029-033950-5.json"):
+        assert not jobstop.names_job({"retry_when": text}, marker), text
+    rc = pathlib.Path("/x/runs/8605/build.rc")
+    for text in ("8605/build.rc", "8605/build", "ttp detach --check /x/runs/8605/build;"):
+        assert jobstop.names_job({"on_pass_cmd": text}, rc), text
+    for text in ("8605/build.rc2", "8605/build.log", "8605/builder", "18605/build"):
+        assert not jobstop.names_job({"on_pass_cmd": text}, rc), text
+
+
 def test_handed_off_5_a_blocked_task_keeps_its_jobs_only_when_its_hand_off_names_one(env, tmp_path):
     from ttp import jobstop, locks as lk
     p = make(env)
