@@ -4895,13 +4895,13 @@ _I = {"blocking": "irreversible", "classify": "irreversible"}
 # wrongly refused when these checks refused.
 _REVERSIBLE_CASES = [
     ({"text": "Rename the field?", **_R, "least_disruptive": _QUO}, "status quo"),
-    ({"text": "Rename the field?", **_I,
+    ({"text": "Rename the field others use?", **_I,
       "least_disruptive": "keep things as they are; the status quo breaks no rule at all"}, "status quo"),
-    ({"text": "Rename results/ to results-old/ and keep a backup?", **_I,
+    ({"text": "Rename results/ to results-old/ and keep a backup? Other teams read it.", **_I,
       "least_disruptive": "write to a new folder; the dashboards read the old path"}, "reversible step"),
-    ({"text": "The cache fills up. Raise the disk quota to 50 GB?", **_I,
+    ({"text": "The cache fills up; df shows 2 GB free on every disk checked. Raise the disk quota to 50 GB on the shared box?", **_I,
       "least_disruptive": "move the cache elsewhere; the jobs read it from this path"}, "reversible step"),
-    ({"text": "Flip the verbose_logs config flag on?", **_I,
+    ({"text": "Flip the verbose_logs config flag on? It disturbs the shared service.", **_I,
       "least_disruptive": "log to a side file; the collector reads only the main one"}, "reversible step"),
     # blocking human is never flagged, reversible step or not.
     ({"text": "Extend the hold's expiry by a week?", "blocking": "human", "recommendation": "yes"}, None),
@@ -5060,6 +5060,88 @@ def test_a_rerun_or_a_later_deadline_is_the_coordinators_call(env):
     flagged = next(x for x in lines if x.startswith("asks sent but flagged by the gate, 24 h"))
     assert "1 flagged (own call (not_own_call) 1)" in flagged, flagged
     assert "not_own_call" in coord.ACTIONS_SCHEMA["properties"]["actions"]["items"]["properties"]
+
+
+
+_RF_R = {"blocking": "restriction", "classify": "restriction_change"}
+_RF_I = {"blocking": "irreversible", "classify": "irreversible"}
+_RF_LIMIT = "keep the inputs where they are; the charter restriction keeps them on approved storage"
+# (fields, refusal label or None when sent). The ask test: ask only on harm to people or speaking as the user.
+_RESOLVE_FIRST_CASES = [
+    # A go/no-go on the project's own step, or one recommending to skip or drop the work.
+    ({"text": "The one-line interim fix is ready. Want me to give the go-ahead?", **_RF_R,
+      "least_disruptive": "land the fix now; it breaks no restriction"}, "go-ahead"),
+    ({"text": "Reply A to allow copying the weights to scratch, or reply B to drop the run.", **_RF_R,
+      "recommendation": "drop", "least_disruptive": _RF_LIMIT}, "go-ahead"),
+    ({"text": "Reply allow to copy the weights to scratch, or reply drop to skip the run.", **_RF_R,
+      "recommendation": "drop", "least_disruptive": _RF_LIMIT}, "go-ahead"),
+    ({"text": "Shall I proceed with the cleanup of the project's temp folder?", "blocking": "access"}, "go-ahead"),
+    ({"text": "Ok to proceed with the new layout, or skip it?", "blocking": "access"}, "go-ahead"),
+    # Inputs or space, with no copy searched and no free space checked.
+    ({"text": "Copy the model weights from the archive to the build disk?", **_RF_R,
+      "least_disruptive": _RF_LIMIT}, "untried inputs"),
+    ({"text": "Should the dataset be moved to the second volume, or should the eval wait?", "blocking": "access"},
+     "untried inputs"),
+    ({"text": "The build disk is out of space. Which folder should I clear?", "blocking": "access"},
+     "untried inputs"),
+    ({"text": "I searched every readable share and found no copy. Copy the images to the fast disk?",
+      "blocking": "access"}, "untried inputs"),
+    # Irreversible, naming no harm to people and no communication as the user (which route, which resource).
+    ({"text": "Switch the nightly to the new route?", **_RF_I,
+      "least_disruptive": "keep the old route; it is slower but works"}, "no harm named"),
+    ({"text": "Use the second build machine for the sweep?", **_RF_I,
+      "least_disruptive": "wait for the first machine; it frees up tonight"}, "no harm named"),
+    # Sent: every route tried and a restriction forbids each; harm to people; speaking as the user;
+    # a credential, money, another person's request; unreadable inputs; a restriction-breaking yes.
+    ({"text": "The charter restriction keeps the dataset inside the lab network. I searched for an existing copy "
+              "on every readable share (none) and checked free space with df: 20 GB free, 300 GB needed. Copy it "
+              "to the cloud bucket?", **_RF_R,
+      "least_disruptive": "keep the dataset inside; the restriction forbids the cloud copy"}, None),
+    ({"text": "Delete the shared scratch folder other teams use?", **_RF_I,
+      "least_disruptive": "archive it first; the archive is too small for it"}, None),
+    ({"text": "Post the release notes in the user's name on the public tracker?", **_RF_I,
+      "least_disruptive": "keep them as a draft file; nobody sees them then"}, None),
+    ({"text": "The API token expired. Want me to give the go-ahead to use a new one?", "blocking": "access"}, None),
+    ({"text": "Copy the weights to the paid bucket for $40 a month?", "blocking": "access"}, None),
+    ({"text": "Another team asked us to copy their dataset to our disk; shall I proceed?", "blocking": "access"},
+     None),
+    ({"text": "Copy the encrypted inputs into the inputs folder once they are unlocked?", "blocking": "access"},
+     None),
+    ({"text": "The charter forbids pushing to main. Shall I proceed with the hotfix push to main?", **_RF_R,
+      "recommendation": "yes", "least_disruptive": "push to the work branch; the restriction forbids main"}, None),
+]
+
+
+
+@pytest.mark.parametrize("fields,label", _RESOLVE_FIRST_CASES)
+def test_the_ask_gate_refuses_asks_that_name_no_harm_and_no_routes_tried(env, fields, label):
+    p = make(env)
+    from ttp import coordinator as coord, unblock
+    problems, ask = _ask(p, **fields)
+    if label is None:
+        assert problems == [] and ask is not None and ask["text"].startswith(fields["text"]), problems
+        return
+    assert problems and f"ask_user rejected: decide it yourself: {coord.ASK_TEST}" in problems[0], problems
+    assert "memory_add the decision and notify low" in problems[0] and ask is None, problems
+    if label == "untried inputs":
+        assert "accessible copy" in problems[0] and "free space" in problems[0]
+    line = next(x for x in unblock.lines(p.db) if x.startswith("asks refused by the gate, 24 h"))
+    assert f"{label} 1" in line, line
+    # Only the user can decide it: sent on `not_own_call`, and counted for the daily audit.
+    why = "a restriction the user set reserves exactly this choice to them; no route fits it"
+    problems, ask = _ask(p, **{**fields, "text": fields["text"] + " (again)"}, not_own_call=why)
+    assert problems == [] and ask is not None, problems
+    flagged = next(x for x in unblock.lines(p.db) if x.startswith("asks sent but flagged by the gate, 24 h"))
+    assert f"{label} (not_own_call) 1" in flagged, flagged
+
+
+
+def test_the_resolve_first_gate_leaves_review_merge_money_and_human_asks_alone(env):
+    from ttp import coordinator as coord
+    for blocking in ("review", "merge", "funds", "spend", "human"):
+        for text in ("Want me to give the go-ahead?", "Copy the model weights to the build disk?",
+                     "The build disk is out of space. Which folder should I clear?"):
+            assert coord._resolve_first_ask({"blocking": blocking}, text) is None, (blocking, text)
 
 
 

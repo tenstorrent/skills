@@ -2391,7 +2391,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         "it yourself. A `human` ask says who else asked (\"another team asked ...\"), or names them "
                         "in `requester`: an inbound message id, an upstream note fingerprint, an issue or PR URL "
                         "this project has seen, or the person's role (a reviewer, a maintainer, the platform team)")
-                why = _own_call_ask(a, text)
+                why = _own_call_ask(a, text) or _resolve_first_ask(a, text, least)
                 if why and len(str(a.get("not_own_call") or "").strip()) < LEAST_DISRUPTIVE_MIN:
                     _count_refusal(db, key, why[0], text)
                     raise ValueError(f"ask_user rejected: {why[1]}")
@@ -2432,7 +2432,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if seen:   # sent on its not_covered reason: counted for the daily audit
                     _count_refusal(db, f"{key}:reask" if key else None, "already settled (not_covered)",
                                    f"{nc} [over {seen}] {a['text'].strip()}", kind=ASK_FLAGGED_KIND)
-                own = _own_call_ask(a, a["text"].strip())
+                own = _own_call_ask(a, a["text"].strip()) or _resolve_first_ask(a, a["text"].strip(), least)
                 if own:   # sent on its not_own_call override: counted for the daily audit
                     _count_refusal(db, key, f"{own[0]} (not_own_call)", a["text"].strip(), kind=ASK_FLAGGED_KIND)
                 flag = None if own else _reversible_ask(a, a["text"].strip(), least)
@@ -5155,6 +5155,81 @@ def _own_call_ask(a: dict, text: str) -> tuple[str, str] | None:
             return ("own call", "a rerun or a later deadline is your call: decide, memory_add the decision, notify "
                     "low. If only the user can decide it, say why in `not_own_call` (at least "
                     f"{LEAST_DISRUPTIVE_MIN} characters)")
+    return None
+
+
+# The ask test (user rule): an ask goes to the user only when the step could affect people badly or
+# speaks to people as the user. Three model-free checks back it: an irreversible ask naming no such
+# harm, a go/no-go on the project's own step (or one recommending to skip or drop the work), and an
+# inputs-or-space ask that lists no routes tried. Exempt: money, a credential, a step only the user
+# can take, another person's request, a NEEDS_USER setting; overridden by `not_own_call`. Known gaps,
+# accepted: paraphrases without these words get through; the prompt rule is the main guard.
+ASK_TEST = ("ask only when the step could affect people badly (destroy someone's work or data, disturb a machine "
+            "or service others use) or speaks to people as the user (a post or message in their name, a PR "
+            "leaving draft, a merge, another person's request)")
+_HARM_RE = re.compile(
+    r"\b(?:erase\w*|los(?:e|es|ing)|lost|gone|for\s+good|forever|remov\w*|drop(?:s|ped|ping)?|disrupt\w*|"
+    r"disturb\w*|interrupt\w*|evict\w*|preempt\w*|kill\w*|"
+    r"outage|downtime|merg\w*|post(?:s|ed|ing)?|announc\w*|e-?mail\w*|reply\s+to|in\s+(?:your|the\s+user's)\s+name|"
+    r"on\s+(?:your|the\s+user's)\s+behalf|as\s+(?:you|the\s+user)\b|leav\w*\s+draft|ready\s+for\s+review|"
+    r"(?:others?'?|another|shared|other\s+people's|someone(?:'s|\s+else's))[\s-]+(?:\w+[\s-]+)?(?:users?|people|teams?|"
+    r"work|data|jobs?|machines?|box(?:es)?|nodes?|services?|clusters?|tenants?|use))\b", re.I)
+_GO_AHEAD_RE = re.compile(
+    r"\b(?:(?:do\s+you\s+)?want\s+me\s+to|would\s+you\s+like\s+me\s+to|shall\s+i|should\s+i|may\s+i|"
+    r"ok(?:ay)?\s+(?:to|if\s+i))\s+(?:\w+\s+){0,3}?(?:proceed|go\s+ahead|continue|land|apply|do\s+(?:it|this|that)|"
+    r"give\s+(?:it\s+)?the\s+go[- ]ahead)\b|\bgo[- ]ahead\b[^.?!\n]*\?|\bgo\s*/\s*no[- ]go\b|"
+    r"\breply\s+\S+\s+(?:to|for)\b[^\n]*\breply\s+\S+\s+(?:to|for)\b|"
+    r"\b(?:proceed|go\s+ahead|continue)\s+or\s+(?:skip|drop|stop|wait|hold|abandon)\b", re.I)
+_SKIP_REC_RE = re.compile(r"^\W*(?:skip|drop|abandon|stop|cancel|hold\s+off|don'?t|do\s+not|no)\b", re.I)
+_DATA_MOVE_RE = re.compile(r"\b(?:cop(?:y|ies|ying|ied)|mov(?:e|es|ing|ed)|transfer\w*|r?sync\w*|download\w*|"
+                           r"stag(?:e|es|ing|ed)|mirror\w*|duplicat\w*)\b", re.I)
+_DATA_OBJ_RE = re.compile(r"\b(?:weights?|checkpoints?|models?|datasets?|data|images?|inputs?|corp(?:us|ora)|"
+                          r"tensors?|artifacts?)\b", re.I)
+_SPACE_RE = re.compile(r"\b(?:(?:free|disk|enough|more|no|storage)\s+(?:disk\s+)?(?:space|room)|out\s+of\s+(?:disk\s+)?"
+                       r"space|(?:disk|volume|partition|filesystem|drive)\s+(?:is\s+)?(?:\w+\s+)?full|"
+                       r"space\s+(?:left|available)|fill(?:s|ed|ing)?\s+up|enospc)\b", re.I)
+# A least-disruptive way that breaks no restriction: then a go/no-go on it is the coordinator's.
+_BREAKS_NONE_RE = re.compile(r"\b(?:breaks?|violates?)\s+(?:no|none|nothing)\b|"
+                             r"\bno\s+restriction\s+(?:applies|is\s+broken)\b", re.I)
+_COPY_SEARCHED_RE = re.compile(r"\b(?:search\w*|looked|checked|found|no)\b[^.;\n]{0,80}?\b(?:cop(?:y|ies)|mirrors?|"
+                               r"replicas?|caches?)\b", re.I)
+_SPACE_CHECKED_RE = re.compile(r"\bdf\b|\b\d+(?:\.\d+)?\s*[KMGTP]i?B?\s+(?:free|left|available)\b|"
+                               r"\b(?:checked|compared|measured)\b[^.;\n]{0,80}?\b(?:free|space|room)\b", re.I)
+_UNREADABLE_RE = re.compile(r"\b(?:encrypt\w*|privacy[- ]protected|protected\s+folder|unlock\w*)\b", re.I)
+
+
+def _resolve_first_ask(a: dict, text: str, least: str = "") -> tuple[str, str] | None:
+    """(label, hint) for an access, irreversible or restriction ask the ask test says is the
+    coordinator's own call: an irreversible ask naming no harm to people and no one-way step; a go/no-go
+    on its own step (not under a restriction or irreversible ask that names its limit, unless the
+    recommendation is to skip or drop the work); an ask about copying inputs or about space that lists
+    no copies searched and no free space checked. None for exempt asks (see above)."""
+    blocking = a.get("blocking")
+    if blocking not in ("access", "irreversible", "restriction"):
+        return None
+    rec = str(a.get("recommendation") or "")
+    said = f"{text} {rec}".replace("’", "'")
+    if (_names_needs_user(said) or _MONEY_RE.search(said) or _CREDENTIAL_RE.search(said)
+            or _USER_ONLY_RE.search(said) or _OTHERS_ASK_RE.search(said)):
+        return None
+    do = (" Instead: pick the route, do it, memory_add the decision and notify low. If only the user can decide "
+          f"it, say why in `not_own_call` (at least {LEAST_DISRUPTIVE_MIN} characters)")
+    if blocking == "irreversible" and not (_HARM_RE.search(f"{said} {least}") or _ONE_WAY_RE.search(said)):
+        return ("no harm named", f"decide it yourself: {ASK_TEST}; this one names neither." + do)
+    if _GO_AHEAD_RE.search(said) and (_SKIP_REC_RE.search(rec) or blocking == "access"
+                                      or not _NAMES_LIMIT_RE.search(least) or _BREAKS_NONE_RE.search(least)):
+        return ("go-ahead", f"decide it yourself: {ASK_TEST}. A go/no-go on your own step, or skipping or dropping "
+                "the work, is yours; a small fix that unblocks others lands alone, never as a question." + do)
+    data = any(_DATA_MOVE_RE.search(s) and _DATA_OBJ_RE.search(s) for s in re.split(r"[.;:!?\n]+", said))
+    space = bool(_SPACE_RE.search(said))
+    if (data or space) and not _UNREADABLE_RE.search(said):
+        searched, checked = _COPY_SEARCHED_RE.search(said), _SPACE_CHECKED_RE.search(said)
+        if (data and not (searched and checked)) or (space and not checked):
+            return ("untried inputs", f"decide it yourself: {ASK_TEST}. A blocker on inputs or space is yours: "
+                    "(1) find an already accessible copy (shared storage, caches, machines the project reads), "
+                    "(2) pick a common location with enough free space (check it with df) and use it. Ask only if "
+                    "a restriction forbids every route found, listing each copy searched and the free space "
+                    "checked." + do)
     return None
 
 
