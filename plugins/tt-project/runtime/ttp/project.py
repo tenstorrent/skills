@@ -1175,9 +1175,15 @@ class Project:
             raise ValueError(why)
         node = raw
         parts = dotted.split(".")
-        for p in parts[:-1]:
-            if not isinstance(node.get(p), dict):
-                node[p] = {}   # a section saved as one plain value (bad_sections) is replaced, not crashed on
+        for i, p in enumerate(parts[:-1]):
+            cur = node.get(p)
+            if not isinstance(cur, dict):
+                # Only an unset key or a section saved as one plain value (bad_sections) becomes a new
+                # section: any other value (a list, a string setting) is refused, never overwritten.
+                if cur is not None and not _is_section(parts[:i + 1]):
+                    raise ValueError(f"{'.'.join(parts[:i + 1])} is one value, not a section of settings "
+                                     f"({json.dumps(cur)[:60]}): set it as a whole")
+                node[p] = {}
             node = node[p]
         node[parts[-1]] = value
         write_json(self.config_path, raw)

@@ -881,6 +881,21 @@ def test_a_scalar_config_section_is_refused_never_kept_as_last_good_and_a_missin
     p.set_config("checks.test_pool", 4)   # a key inside the section is fine
     assert p.raw_config()["checks"] == {"test_pool": 4}
 
+    # A dotted path through a plain value is refused and writes nothing; only a scalar section is replaced.
+    raw = p.raw_config()
+    raw.update(core_provider="claude", delivery={"push_checks": ["pytest -q"]}, checks="host_max")
+    p.config_path.write_text(json.dumps(raw))
+    for key, val, prefix in (("delivery.push_checks.0", "x", "delivery.push_checks"),
+                             ("core_provider.x", 1, "core_provider")):
+        with pytest.raises(ValueError, match=f"{re.escape(prefix)} is one value, not a section"):
+            p.set_config(key, val)
+        assert p.raw_config() == raw
+    probs = apply(p, [{"type": "config_set", "key": "core_provider.x", "value": 1}])
+    assert any(x.startswith("config_set: core_provider.x") for x in probs), probs
+    assert p.raw_config() == raw
+    p.set_config("checks.test_pool", 4)
+    assert p.raw_config()["checks"] == {"test_pool": 4}
+
     good.unlink(missing_ok=True)   # no snapshot yet: not an error, and the valid config becomes one
     fresh = Project(p.base)
     assert fresh.config()["checks"]["test_pool"] == 4 and fresh.config_status == "ok"
