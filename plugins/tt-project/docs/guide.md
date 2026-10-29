@@ -931,7 +931,10 @@ queues behind routine work; nothing running is interrupted:
   default, 3x the longest of the project's last 20 completed runs within 1-6 h (3 h before 3 runs are known);
   `checks.wall_cap_s` sets it, 0 turns it off. A run past it has its process group ended, frees the slot and is
   recorded as a timeout, never a pass; `ttp status` shows the holder's time against its cap and the waiting
-  order. `checks.wrap_cmd` (project setting, default unset) runs each command given after `ttp checks --`
+  order. A hung command need not wait for the cap: one whose output has not grown for 10 min is stopped the
+  same way and reported as "no output for 10 min" (a timeout, never a pass). A check object's `"silent_s"`
+  (seconds) sets that limit for a check that is silent longer by design, and 0 turns it off. A full run of
+  the tt-project test suite lists its 15 slowest test calls just above its `ttp-suite:` line. `checks.wrap_cmd` (project setting, default unset) runs each command given after `ttp checks --`
   behind the project's own lock or queue command, the command passed as separate arguments; a missing wrapper
   fails the checks, and `delivery.push_checks` never go through it. A pytest `-n N` above
   the grant is lowered with a line saying so; a worker's own pytest above TTP_TEST_SLOTS is refused. Builds

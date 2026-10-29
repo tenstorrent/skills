@@ -1131,6 +1131,10 @@ def test_the_forked_test_runner_reports_every_test_once_as_one_process_would(tmp
     nice = os.nice(0)
     assert {int((out / f"nice-{i}").read_text()) for i in range(60)} == {min(19, nice + 10)}
     assert re.search(r"^ttp-suite: wall \d+\.\ds cpu \d+\.\ds workers 3$", forked.stdout, re.M), forked.stdout
+    # A full-suite run lists its 15 slowest test calls just above that line.
+    slow = re.search(r"^ttp-suite: slowest 15 test calls:\n((?:ttp-suite: +\d+\.\d\ds \S+\n){15})ttp-suite: wall ",
+                     forked.stdout, re.M)
+    assert slow and "test_tt_project_sample.py::test_" in slow.group(1), forked.stdout
     # One process runs the same tests the same way, but for the test that ends its process.
     single, _ = run(1)
     assert single.returncode != 0 and "2 failed" not in single.stdout, single.stdout
@@ -1210,6 +1214,21 @@ def test_the_macos_ci_job_runs_existing_launchd_and_service_tests():
 def test_the_test_runner_summary_line_is_stable_and_greppable():
     line = _test_conftest()._suite_line(312.44, 1840.16, 4)
     assert line == "ttp-suite: wall 312.4s cpu 1840.2s workers 4"
+
+
+def test_a_full_suite_run_lists_its_15_slowest_test_calls_slowest_first():
+    from types import SimpleNamespace as R
+    conftest = _test_conftest()
+    calls = [R(when="call", duration=float(i), nodeid=f"tests/test_tt_project_runtime.py::t{i}") for i in range(60)]
+    other = [R(when="setup", duration=999.0, nodeid="tests/test_tt_project_runtime.py::t0"),
+             R(when="call", duration=None, nodeid="tests/test_tt_project_runtime.py::t1"), "a warning"]
+    got = conftest._slowest_lines(calls + other)
+    assert got[0] == "ttp-suite: slowest 15 test calls:" and len(got) == 16
+    assert got[1] == "ttp-suite:    59.00s tests/test_tt_project_runtime.py::t59"
+    assert got[-1].endswith("::t45"), "slowest first, setup times left out"
+    assert conftest._slowest_lines(calls[:conftest.MIN_ITEMS - 1]) == [], "a focused run lists none"
+    others = [R(when="call", duration=1.0, nodeid=f"tests/test_x.py::t{i}") for i in range(100)]
+    assert conftest._slowest_lines(others) == [], "only tt-project tests make a full-suite run"
 
 
 def test_the_suite_puts_its_temp_files_on_a_free_tmpfs_on_linux_only(tmp_path, pytestconfig):

@@ -20,7 +20,10 @@ gives a test the same reaping for its own tmp_path.
 
 Every run ends its summary with one line of wall time and CPU time (user + system, of the main
 process and every child it waited for: workers and the processes the tests started), e.g.
-`ttp-suite: wall 312.4s cpu 1840.2s workers 4`, so a slower or costlier suite shows in push logs.
+`ttp-suite: wall 312.4s cpu 1840.2s workers 4`, so a slower or costlier suite shows in push logs. A
+full-suite run (MIN_ITEMS or more tt-project tests) also prints its SLOWEST slowest test calls just above
+that line (`ttp-suite: slowest 15 test calls:`, then `ttp-suite:   61.20s <test id>` each), so slow or
+wall-clock-bound tests can be ranked from any run's log.
 """
 
 from __future__ import annotations
@@ -41,6 +44,7 @@ from pathlib import Path
 import pytest
 
 MIN_ITEMS = 50
+SLOWEST = 15           # the slowest test calls a full-suite run lists
 MAX_AUTO_JOBS = 8      # on CI
 MAX_LOCAL_JOBS = 4     # anywhere else: half the CPUs, at most this
 WORKER_NICE = 10
@@ -93,6 +97,16 @@ def _suite_line(wall: float, cpu: float, workers: int) -> str:
     return f"ttp-suite: wall {wall:.1f}s cpu {cpu:.1f}s workers {workers}"
 
 
+def _slowest_lines(reports, n: int = SLOWEST) -> list[str]:
+    """The `n` slowest test calls of a full-suite run's `reports` (MIN_ITEMS or more tt-project tests),
+    slowest first; [] for a smaller run."""
+    calls = [r for r in reports if getattr(r, "when", None) == "call" and isinstance(getattr(r, "duration", None), float)]
+    if sum(1 for r in calls if Path(r.nodeid.split("::", 1)[0]).name.startswith(_SHARDED)) < MIN_ITEMS:
+        return []
+    top = sorted(calls, key=lambda r: -r.duration)[:n]
+    return [f"ttp-suite: slowest {len(top)} test calls:"] + [f"ttp-suite: {r.duration:8.2f}s {r.nodeid}" for r in top]
+
+
 @pytest.hookimpl(trylast=True)   # after pytest's own tmpdir plugin made the factory _use_tmpfs patches
 def pytest_configure(config):
     config._ttp_started = time.monotonic()
@@ -110,6 +124,8 @@ def pytest_terminal_summary(terminalreporter, config):
                                                      resource.getrusage(resource.RUSAGE_CHILDREN)))
     except ImportError:   # no resource module (Windows): this process's own CPU time only
         cpu = time.process_time()
+    for line in _slowest_lines([r for reps in terminalreporter.stats.values() for r in reps]):
+        terminalreporter.write_line(line)
     terminalreporter.write_line(_suite_line(time.monotonic() - started, cpu, getattr(config, "_ttp_workers", 1)))
 
 
