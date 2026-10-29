@@ -2862,3 +2862,183 @@ def test_a_p1_check_takes_one_urgent_grant_beyond_its_projects_budget_held_by_le
     finally:
         for g in held:
             g and g.close()
+
+
+def test_upgraded_names_a_newly_installed_runtime_once_it_settled_and_never_twice(env, tmp_path, monkeypatch):
+    import ttp
+    from ttp import checkcap
+    monkeypatch.setattr(checkcap, "_SEEN", {})
+    monkeypatch.setenv(checkcap.REEXEC_ENV, "")
+    init = tmp_path / "__init__.py"
+    init.write_text(f'"""runtime"""\n__version__ = "{ttp.__version__}"\n')
+    assert checkcap.upgraded(init, now=100.0) == "", "the version it runs"
+    init.write_text('"""runtime"""\n__version__ = "99.0.0"\n')
+    assert checkcap.upgraded(init, now=200.0) == "", "just installed: its other files may still be copying"
+    assert checkcap.upgraded(init, now=200.0 + checkcap.UPGRADE_SETTLE_S) == "99.0.0"
+    monkeypatch.setenv(checkcap.REEXEC_ENV, "99.0.0")
+    assert checkcap.upgraded(init, now=9999.0, settle=0) == "", "re-executed for it once already: never a loop"
+    init.write_text("no version here\n")
+    assert checkcap.upgraded(init, now=9999.0, settle=0) == ""
+    init.unlink()
+    assert checkcap.upgraded(init, now=9999.0, settle=0) == "", "an unreadable install is no upgrade"
+
+
+class _ReExec(BaseException):
+    """What the stand-in for os.execv raises: the process would be replaced here."""
+
+
+def _upgrade_child_checks(monkeypatch, upgrade) -> list:
+    # cli.main's `ttp checks` as the detached child runs it (own_group: _checks_slot's `detached`), with
+    # checkcap.upgraded answering `upgrade()` and os.execv recorded instead of run.
+    from ttp import checkcap, checkspill, cli
+    real = cli._checks_slot
+    monkeypatch.setattr(cli, "_checks_slot",
+                        lambda p, run_dir, out, head, detached=False, *a, **k: real(p, run_dir, out, head, True, *a, **k))
+    monkeypatch.setattr(checkcap, "upgraded", upgrade)
+    keys = (checkcap.ARRIVED_ENV, checkcap.REEXEC_ENV, checkspill.OFF_ENV)
+    for k in keys:
+        monkeypatch.setenv(k, "")   # restored after the test, whatever the re-exec set
+    execs = []
+
+    def execv(path, argv):
+        execs.append((path, list(argv), {k: os.environ.get(k) for k in keys}))
+        raise _ReExec()
+    monkeypatch.setattr(os, "execv", execv)
+    return execs
+
+
+@pytest.mark.parametrize("waits_for", ["checks slot", "test slots"])
+def test_a_waiting_detached_checks_run_reexecutes_with_an_upgraded_runtime_and_keeps_its_place(
+        env, tmp_path, monkeypatch, waits_for):
+    # A wrapper queued before a runtime upgrade adopts it while it waits (#4252: lanes held by wrappers
+    # enforcing the old slot arithmetic), for the checks slot and, holding its lane, for its test slots.
+    import threading
+    from ttp import checkcap, checkspill, cli, locks, testslots
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    new = []
+    execs = _upgrade_child_checks(monkeypatch, lambda: new[0] if new else "")
+    arrived = time.time() - 600
+    monkeypatch.setenv(checkcap.ARRIVED_ENV, repr(arrived))
+    if waits_for == "checks slot":
+        monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+        held, marker = [checkcap.acquire("other")], "queued for a host-wide checks slot"
+    else:
+        monkeypatch.setenv("TTP_TEST_POOL", "2")
+        held = [testslots.acquire("other 1", project_name="px"), testslots.acquire("other 2", project_name="px")]
+        marker = "waiting for a host-wide test slot"
+    ran, ended = tmp_path / "ran", []
+
+    def go():
+        try:
+            cli.main(["checks", "--", "sh", "-c", f"touch {ran}"])
+        except _ReExec:
+            ended.append("exec")
+    t = threading.Thread(target=go)
+    t.start()
+    try:
+        assert _wait_for(lambda: marker in ((run / "checks.log").read_text() if (run / "checks.log").exists() else ""))
+        assert not execs, "no upgrade installed: it waits on"
+        new.append("99.0.0")
+        t.join(30)
+        assert not t.is_alive() and ended == ["exec"] and not ran.exists()
+        (path, argv, envs), = execs
+        assert path == sys.executable and argv == [sys.executable, "-m", "ttp", *sys.argv[1:]]
+        assert envs[checkcap.REEXEC_ENV] == "99.0.0" and not envs[checkspill.OFF_ENV], "spill hosts stay allowed"
+        log = (run / "checks.log").read_text()
+        assert log.count("re-executing with it") == 1, log
+        # It let go of its lane, slots and queue places first; the new process queues at its old arrival.
+        assert not locks.holder_records(testslots.project_held(p.name))
+        assert not locks.queued(checkcap.slot_dir(), checkcap.RESOURCE)
+        assert not locks.queued(checkcap.slot_dir(), testslots.TESTS.resource)
+        assert envs[checkcap.ARRIVED_ENV] == repr(arrived) and cli._checks_arrived() == arrived
+    finally:
+        for g in held:
+            g.close()
+        t.join(30)
+
+
+def test_a_detached_checks_run_that_got_its_slots_runs_its_commands_and_is_never_reexecuted(env, tmp_path, monkeypatch):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    execs = _upgrade_child_checks(monkeypatch, lambda: "99.0.0")   # an upgrade installed all along
+    ran = tmp_path / "ran"
+    cli.main(["checks", "--", "sh", "-c", f"touch {ran}; sleep 0.5"])
+    assert ran.exists() and not execs, "only a waiting run re-executes; a running suite is never cut"
+    assert "re-executing" not in (run / "checks.log").read_text()
+
+
+def test_test_slots_waiter_queues_at_its_arrival_and_a_stop_ends_its_wait_leaving_no_ticket(env, monkeypatch):
+    import threading
+    from ttp import checkcap, locks, testslots
+    monkeypatch.setenv("TTP_TEST_POOL", "2")
+    held = [testslots.acquire("h1", project_name="px"), testslots.acquire("h2", project_name="px")]
+    stopped, got = [], {}
+
+    def late():
+        try:
+            got["late"] = testslots.acquire("late", project_name="pb",
+                                            stop=lambda: "the task ended" if stopped else "")
+        except checkcap.Cancelled as e:
+            got["late stopped"] = str(e)
+    lt = threading.Thread(target=late)
+    lt.start()
+    assert _wait_for(lambda: len(locks.queued(checkcap.slot_dir(), testslots.TESTS.resource)) == 1)
+
+    def early():
+        got["early"] = testslots.acquire("early", project_name="pc", since=time.time() - 600)
+    e = threading.Thread(target=early)
+    e.start()
+    try:
+        assert _wait_for(lambda: len(locks.queued(checkcap.slot_dir(), testslots.TESTS.resource)) == 2)
+        held.pop().close()
+        e.join(10)
+        assert got.get("early") and got["early"].k == 1, "its earlier arrival goes first"
+        assert "late" not in got
+        stopped.append(1)
+        lt.join(10)
+        assert not lt.is_alive() and got.get("late stopped") == "the task ended"
+        assert not locks.queued(checkcap.slot_dir(), testslots.TESTS.resource)
+    finally:
+        for g in held + [got.get("early")]:
+            if g:
+                g.close()
+        stopped.append(1)
+        for th in (lt, e):
+            th.join(10)
+
+
+def test_a_real_detached_checks_child_reexecutes_in_place_after_an_install_and_still_writes_its_rc(
+        env, tmp_path, monkeypatch, capsys):
+    # The whole path: a detached child started from an installed runtime waits for the checks slot; a new
+    # version is installed there; it re-executes as the same process (checks.pid still names it, so it
+    # runs without a new `go`), waits on with the new code and writes checks.rc once its commands ran.
+    import signal
+    from ttp import checkcap, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    rt = tmp_path / "installed"
+    shutil.copytree(pathlib.Path(cli.__file__).parents[1], rt, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    cc = rt / "ttp" / "checkcap.py"
+    cc.write_text(cc.read_text().replace("UPGRADE_SETTLE_S = 10.0", "UPGRADE_SETTLE_S = 0.2", 1))
+    monkeypatch.setattr(cli, "__file__", str(rt / "ttp" / "cli.py"))   # the child imports the installed copy
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    monkeypatch.delenv(checkcap.REEXEC_ENV, raising=False)
+    held = checkcap.acquire("other")
+    ran = tmp_path / "ran"
+    pid = None
+    try:
+        pid = _detached_checks(run, capsys, "sh", "-c", f"echo x >> {ran}")
+        assert _wait_for(lambda: (run / cli.CHECKS_SLOT_WAIT).exists())
+        init = rt / "ttp" / "__init__.py"
+        init.write_text(re.sub(r'__version__ = "[^"]+"', '__version__ = "99.0.0"', init.read_text()))
+        assert _wait_for(lambda: "re-executing with it" in (run / "checks.log").read_text())
+        assert _wait_for(lambda: (run / cli.CHECKS_SLOT_WAIT).exists()), "it waits again, with the new code"
+        assert json.loads((run / "checks.pid").read_text())["pid"] == pid and not (run / cli.CHECKS_RC).exists()
+        held.close()
+        assert _wait_for(lambda: (run / cli.CHECKS_RC).exists())
+        assert (run / cli.CHECKS_RC).read_text().strip() == "0" and ran.read_text() == "x\n"
+        assert (run / "checks.log").read_text().count("re-executing with it") == 1
+    finally:
+        held.close()
+        if pid and not _gone_pid(pid):
+            os.killpg(pid, signal.SIGKILL)

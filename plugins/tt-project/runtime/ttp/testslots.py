@@ -282,7 +282,8 @@ def _take(ps: list, own: list, top: int, holder: str, what: str = "test slots",
 
 def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: float | None = None,
             cfg: dict | None = None, project_name: str | None = None, push_key: str = "",
-            kind: Kind = TESTS, priority: int | None = None) -> Grant | None:
+            kind: Kind = TESTS, priority: int | None = None, stop: Callable[[], str] | None = None,
+            since: float | None = None) -> Grant | None:
     """Take this run's test slots (above); waits while none is free, first-come, telling why every
     TELL_S. None only once `wait_s` passed with none free (a foreground caller hands over). Nested in a
     run that holds slots, its grant at once; with the pool off, Grant() (no limit, nothing set).
@@ -292,7 +293,9 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
     task's) orders its project's waiters, most urgent first, then arrival (suite_priority: a waiter ages
     one step per age_s(cfg), checks.priority_age_s); a priority-1 waiter whose project's budget is held
     only by less urgent runs takes one extra run's grant beyond it (urgent_paths) from the pool's free
-    slots, so it never waits behind a long, less urgent check and stops none."""
+    slots, so it never waits behind a long, less urgent check and stops none. `stop` as for suite_hold
+    (a reason ends the wait with checkcap.Cancelled); `since`: the arrival to queue at (default now),
+    kept by a run that hands over or re-executes itself (checkcap.Upgraded)."""
     tell = tell or (lambda _line: None)
     what = f"{kind.name} slots"
     for env in (kind.held_env, HELD_ENV):   # HELD_ENV: a build in a check builds on the check's slots
@@ -301,6 +304,7 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
     cfg = _cfg() if cfg is None else cfg
     name = _project_name() if project_name is None else project_name
     start, told, ticket, mine = time.time(), 0.0, None, None
+    arrival = start if since is None else since
     try:
         while True:
             s = sizes(cfg, kind=kind)
@@ -316,7 +320,7 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                     # out of the host's line; an earlier waiter there goes first.
                     line_of = f"{kind.own}.{locks.group_id(name)}"
                     if mine is None:
-                        mine = locks.enqueue(checkcap.slot_dir(), line_of, holder, start, priority=priority)
+                        mine = locks.enqueue(checkcap.slot_dir(), line_of, holder, arrival, priority=priority)
                     step = age_s(cfg)
                     line = sorted(locks.queued(checkcap.slot_dir(), line_of), key=lambda t: _order_key(t, age=step))
                     ahead = line[:line.index(mine)] if mine in line else line
@@ -341,7 +345,7 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                         k, files = 1, [f]
                 else:
                     if ticket is None:
-                        ticket = locks.enqueue(checkcap.slot_dir(), kind.resource, holder, start, group=name)
+                        ticket = locks.enqueue(checkcap.slot_dir(), kind.resource, holder, arrival, group=name)
                     q = locks.queued(checkcap.slot_dir(), kind.resource)
                     if q and q[0] == ticket:
                         k, files = _take(ps, own, top, holder, what, extra)
@@ -358,6 +362,8 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                      + (f", {len(own)} per project" if own else "") + f") after {waited:.0f} s waiting; "
                      + (f"builds run with MAKEFLAGS=-j{k}" if kind is BUILDS else f"tests run with {XDIST_ENV}={k}"))
                 return Grant(k, files, waited, kind)
+            if stop and (why := stop()):
+                raise checkcap.Cancelled(why)
             if wait_s is not None and waited >= wait_s:
                 return None
             if not told or time.time() - told >= TELL_S:

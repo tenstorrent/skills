@@ -62,6 +62,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Callable
@@ -83,6 +84,9 @@ TELL_S = 300.0
 FOREGROUND_WAIT_S = 60.0
 # The arrival time a foreground run hands to its detached checks, so they keep its place in the queue.
 ARRIVED_ENV = "TTP_CHECKS_ARRIVED"
+# The runtime version a waiting detached `ttp checks` re-executed itself for (upgraded()): never again for it.
+REEXEC_ENV = "TTP_CHECKS_REEXEC"
+UPGRADE_SETTLE_S = 10.0   # a newly installed version is adopted once seen this long (an install copies file by file)
 EXTRA_SLOTS = 2   # at most this many slots beyond the cap while the host is lightly loaded (extra())
 PRIORITY_TURNS = 3   # at most this many priority-1 turns in a row while other checks wait (priority_turns())
 
@@ -192,6 +196,35 @@ def extra(n: int | None = None) -> int:
 
 class Cancelled(RuntimeError):
     """`stop` ended the wait: the checks' task ended while they waited (the reason is the message)."""
+
+
+class Upgraded(Exception):
+    """A waiting detached `ttp checks` found a newer runtime installed (upgraded(); the message is its
+    version): it lets go of what it holds and re-executes itself with it (cli._checks_reexec)."""
+
+
+_SEEN: dict = {}   # upgraded(): the installed version it last saw differ, and since when
+
+
+def upgraded(init: Path | None = None, now: float | None = None, settle: float | None = None) -> str:
+    """The runtime version now installed where this process imported its code from (`init`: that package's
+    __init__.py), when it differs from the version it runs and has stayed for `settle` seconds
+    (UPGRADE_SETTLE_S), else "". A version it re-executed for already (REEXEC_ENV) is never returned
+    again, so a re-execution that did not take the new code cannot loop."""
+    from . import __file__ as own_init, __version__
+    now = time.time() if now is None else now
+    try:
+        text = Path(init or own_init).read_text(errors="replace")
+    except OSError:
+        return ""
+    m = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', text, re.M)
+    new = m.group(1) if m else ""
+    if not new or new == __version__ or new == os.environ.get(REEXEC_ENV):
+        _SEEN.clear()
+        return ""
+    if _SEEN.get("version") != new:
+        _SEEN.update(version=new, since=now)
+    return new if now - _SEEN["since"] >= (UPGRADE_SETTLE_S if settle is None else settle) else ""
 
 
 def label(project_name: str | None, what: str = "") -> str:
