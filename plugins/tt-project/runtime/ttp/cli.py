@@ -4987,16 +4987,26 @@ def cmd_lock(a) -> None:
             # The lock is held until the command itself has ended. A signal to this process (a
             # timeout, a cancel) is passed on to the command, and the lock is released only once
             # the command is gone, so nobody else ever gets the resource while it is still in use.
-            proc = subprocess.Popen(cmd, env=child_env)
+            # The forwarding is set up before the command starts: a signal that comes while it starts
+            # is kept and passed on as soon as it runs (the command inherits no handler: exec resets them).
+            started: list = []
+            pending: list = []
 
             def _forward(signum, _frame):
+                if not started:
+                    pending.append(signum)
+                    return
                 try:
-                    proc.send_signal(signum)
+                    started[0].send_signal(signum)
                 except OSError:
                     pass
 
             for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
                 signal.signal(sig, _forward)
+            proc = subprocess.Popen(cmd, env=child_env)
+            started.append(proc)
+            while pending:
+                _forward(pending.pop(0), None)
 
             def _wait() -> int:
                 try:

@@ -1149,3 +1149,51 @@ def test_lock_probe_inside_a_real_sandbox_sees_a_live_keeper_outside_it_through_
         assert rec["alive"] is False and "keeper ended its hold (handed_over)) gone" in rec["note"], rec
     finally:
         held.close()
+
+
+def test_ttp_lock_holds_until_its_command_ends_when_signalled_as_the_command_starts(env):
+    # A signal right after the command started, before ttp lock had set up its forwarding, used to end
+    # ttp lock at once (rc 143): the lock was freed while the command still ran. A sitecustomize stretches
+    # that window by sleeping after the command's Popen.
+    p = make(env)
+    sc, marks, pidf = env["tmp"] / "sc", env["tmp"] / "marks.txt", env["tmp"] / "cmd.pid"
+    sc.mkdir()
+    (sc / "sitecustomize.py").write_text(
+        "import os, subprocess, time\n"
+        "_real = subprocess.Popen.__init__\n"
+        "def _slow(self, *a, **k):\n"
+        "    _real(self, *a, **k)\n"
+        "    if 'started' in str(a[:1]):\n"
+        "        time.sleep(float(os.environ['LOCK_TEST_POPEN_DELAY']))\n"
+        "subprocess.Popen.__init__ = _slow\n")
+    run_env = _lock_env(env, p, LOCK_TEST_POPEN_DELAY="2",
+                        PYTHONPATH=os.pathsep.join(filter(None, [str(sc), os.environ.get("PYTHONPATH")])))
+    script = (f"echo $$ > {shlex.quote(str(pidf))}; echo started >> {shlex.quote(str(marks))}; "
+              f"sleep 4; echo ended >> {shlex.quote(str(marks))}")
+    first = _lock(run_env, "board", cmd=("sh", "-c", script))
+    pid = None
+    try:
+        deadline = time.time() + 30
+        while time.time() < deadline and not (marks.exists() and "started" in marks.read_text()):
+            time.sleep(0.02)
+        pid = int(pidf.read_text())
+        first.send_signal(signal.SIGTERM)       # inside the stretched window after Popen
+        first.wait(timeout=30)
+        # ttp lock ended only once its command was gone: the command got the signal (no 'ended').
+        alive = True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            alive = False
+        assert not alive, "ttp lock ended while its command still ran"
+        assert "ended" not in marks.read_text(), "the signal was not passed on to the command"
+        assert _lock_probe(run_env, "board").returncode == 0
+    finally:
+        if first.poll() is None:
+            first.kill()
+            first.wait()
+        if pid:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
