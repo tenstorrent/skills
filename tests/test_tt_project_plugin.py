@@ -3580,7 +3580,9 @@ def test_setup_box_account_existence_is_checked_as_root_and_no_other_account_cha
     script = ba.probe_script("me", 1234, 1234)
     # Every root check goes through sudo -n; a plain test of another user's home is never used.
     assert 'sudo -n test -e "$h"' in script and re.search(r'(?<!-n )test -e "\$h"', script) is None
-    (env_bin / "sudo").write_text('#!/bin/bash\n[ "$1" = -n ] && shift; [ "$1" = true ] && exit 0; exec "$@"\n')
+    # Passwordless sudo is asked for the command --run uses (`sudo -n -l bash`), never with `sudo -n true`.
+    assert "sudo -n -l bash" in script and "sudo -n true" not in script
+    (env_bin / "sudo").write_text('#!/bin/bash\n[ "$1" = -n ] && shift; [ "$1" = -l ] && exit 0; exec "$@"\n')
     (env_bin / "sudo").chmod(0o755)
     p = ba.read_probe(_bash(script, env).stdout)
     assert p["sudo"] and p["home_exists"] == "yes" and p["account"] is None and p["docker"]
@@ -3588,12 +3590,16 @@ def test_setup_box_account_existence_is_checked_as_root_and_no_other_account_cha
     (env_bin / "sudo").write_text("#!/bin/bash\nexit 1\n")
     p_nosudo = ba.read_probe(_bash(script, env).stdout)
     assert not p_nosudo["sudo"] and p_nosudo["home_exists"] == "unknown"
+    # NOPASSWD only for specific commands (a reset tool): `sudo -n true` fails there, and so does a root shell.
+    (env_bin / "sudo").write_text('#!/bin/bash\n[ "$1" = -n ] && shift; [ "$1" = -l ] && shift\n'
+                                  '[ "$1" = tt-smi ] && exit 0; exit 1\n')
+    assert not ba.read_probe(_bash(script, env).stdout)["sudo"]
 
     ids = {"uid": 1234, "gid": 1234, "group": "me", "from": "here"}
     todo, problems = ba.decide("me", ids, dict(p, home_owner="1234"))
     assert problems == [] and any("visudo -cf" in t for t in todo) and any("docker" in t for t in todo)
     _, problems = ba.decide("me", ids, p_nosudo)
-    assert any("no passwordless sudo" in x for x in problems)
+    assert any("no passwordless sudo for a root shell (`sudo -n -l bash`)" in x for x in problems)
     _, problems = ba.decide("me", ids, dict(p, home_owner="4242"))
     assert any("left alone" in x for x in problems)
     _, problems = ba.decide("me", ids, dict(p, uid_owner="other"))
@@ -6123,3 +6129,101 @@ def test_worker_prompt_guards_paid_model_api_spend_in_detached_jobs():
         assert text.count("calling a paid model API") == 1, on
     assert "paid model API" not in prompts.feature_blocks(raw, set())
     assert not re.search(r"\$\d", raw.split("calling a paid model API", 1)[1].split("\n- ", 1)[0])
+
+
+# Device and ask claims the user corrected (user msg #1171). No shipped skill, prompt, doc, default,
+# script or changeset may state one again. The true practice, per claim:
+#  1. Some clusters grant passwordless sudo only for specific reset and diagnostic commands: check
+#     with `sudo -n -l <command>`, never `sudo -n true`; "no sudo, so no glx_reset" is false.
+#  2. On BH Galaxy reset with `tt-smi -glx_reset`; `tt-smi -r` drops chips, a fallback only.
+#  3. glx_reset's IPMI step needs root (or a NOPASSWD rule for it); the root-port rescan needs root.
+#  4. After a tray power drop still try glx_reset first, then a single-host BMC power cycle.
+#  5. A reset or single-host power cycle never affects other hosts: no neighbour gate or snapshot.
+#     Only a quad serving a quad-wide workload goes down and up as one unit.
+#  6. BMC op 0x0 also resets the PCIe retimers carrying NVMe: it is no safe fallback.
+#  7. Tray temperatures read after a power loss are junk, not a retimer overheat.
+#  8. Idle BH chips draw tens of watts: a tenant is an open device handle or a tenant process or
+#     container, never a power reading; fabric-manager and DRA agents are plumbing.
+#  9. A cable short keeps a tray off from power-on; a bus bar drops it under load.
+# 10. Act on answers the user already gave: never re-ask one because it was relayed.
+# Text that quotes a claim only to call it false carries CLAIM_OK within 300 characters before it;
+# `sudo -n true` right after "never" or "not" is that kind of quote too.
+CLAIM_OK = "corrected-claim-ok"
+CORRECTED_CLAIMS = {
+    1: [r"no (?:passwordless )?sudo,? so no (?:tt-smi )?-?glx_reset", r"sudo -n true"],
+    2: [r"tt-smi -r\b.{0,60}\b(?:usable|tray reset|works) on (?:a )?(?:BH|Blackhole) Galaxy",
+        r"(?:use|run) `?tt-smi -r`? (?:on|for) (?:a )?(?:BH|Blackhole) Galaxy"],
+    3: [r"glx_reset (?:needs|requires) no (?:root|sudo)", r"glx_reset.{0,30}\bwithout (?:root|sudo)\b"],
+    4: [r"skip(?:s|ping)? (?:the )?(?:tt-smi )?-?glx_reset after a (?:tray )?power (?:drop|loss)",
+        r"after a tray power (?:drop|loss),? (?:skip|do not run|don't run|never run) (?:tt-smi )?-?glx_reset"],
+    5: [r"(?:reset|power[- ]cycle)s? (?:would |can |may |will |could )?(?:affect|disturb|take down|hit) "
+        r"(?:the |its |their )?neighbou?r",
+        r"(?:wait for|snapshot) (?:the |its )?neighbou?rs? before (?:a |the |any )?(?:reset|power[- ]cycle)",
+        r"neighbou?r (?:gate|snapshot)s?\b"],
+    6: [r"0x0.{0,40}\bsafe fallback", r"fall(?:s|ing)? back to (?:BMC |IPMI )?op(?:code)? 0x0"],
+    7: [r"RT0.{0,60}\b(?:11[6-9]|12[0-7]) ?C.{0,60}overheat",
+        r"retimer overheat.{0,40}tray (?:drop|power loss)"],
+    8: [r"power above idle.{0,40}(?:means|is|signals|shows) a tenant",
+        r"(?:watts|draw) (?:above|over) idle.{0,30}tenant",
+        r"tt-(?:fabric-manager-agent|dra-driver).{0,30}\bis a tenant"],
+    9: [r"cable.{0,40}same signature as a bus ?bar", r"bus ?bar.{0,40}same signature as a (?:bad )?cable"],
+    10: [r"re-?ask.{0,40}(?:because|since|as) (?:it|they) (?:was|were) relayed",
+         r"relayed (?:answer|reply|replies|answers) (?:must|should) be re-?asked",
+         r"settled answer.{0,30}\bre-?ask(?!ed)\b(?<!never re-ask)"],
+}
+CLAIM_SUFFIXES = {".md", ".json", ".toml", ".yaml", ".yml", ".txt", ".py", ".sh", ""}
+
+
+def corrected_claims_in(text: str) -> list[tuple[int, str]]:
+    """(claim number, matched text) for each corrected claim `text` states, whitespace-normalized."""
+    flat = re.sub(r"\s+", " ", text)
+    hits = []
+    for n, pats in CORRECTED_CLAIMS.items():
+        for pat in pats:
+            for m in re.finditer(pat, flat, re.I):
+                before = flat[max(0, m.start() - 300):m.start()]
+                if CLAIM_OK in before or n == 1 and pat == r"sudo -n true" and \
+                        re.search(r"\b(?:never|not)\W{0,3}$", before, re.I):
+                    continue
+                hits.append((n, m.group(0)))
+    return hits
+
+
+def test_corrected_claims_patterns_catch_the_claim_and_spare_the_true_practice():
+    false = {1: "There is no sudo, so no glx_reset on that host.", 2: "Use tt-smi -r on a BH Galaxy tray.",
+             3: "glx_reset needs no root.", 4: "Skip glx_reset after a tray power drop.",
+             5: "A power cycle would affect the neighbours, so snapshot neighbours before a reset.",
+             6: "BMC op 0x0 is a safe fallback.", 7: "RT0 at 121 C at the drop means a retimer overheat.",
+             8: "Chip power above idle watts means a tenant.",
+             9: "A bad cable gives the same signature as a bus bar.",
+             10: "A settled answer must be re-asked because it was relayed."}
+    for n, line in false.items():
+        assert n in {k for k, _ in corrected_claims_in(line)}, (n, line)
+    true = ["Check with `sudo -n -l`, never `sudo -n true`.", "On BH Galaxy use `tt-smi -glx_reset`.",
+            "Its IPMI step needs root.", "Always try glx_reset first, then the single-host power cycle.",
+            "A reset never affects other hosts.", "Use op 0x3 only.",
+            "Readings after a power loss are junk.", "A tenant is an open /dev/tenstorrent handle.",
+            "A cable short keeps the tray off from power-on; a bus bar drops it under load.",
+            "Act on answers the user already gave; never re-ask.", "A no is never re-asked.",
+            "scriptwatch keeps watching every neighbour script.",
+            f"<!-- {CLAIM_OK} --> The old note said 'BMC op 0x0 is a safe fallback'; it is false."]
+    for line in true:
+        assert corrected_claims_in(line) == [], line
+
+
+def test_no_shipped_text_states_a_corrected_claim():
+    import subprocess
+    top = PLUGIN.parents[1]
+    files = subprocess.run(["git", "ls-files", "plugins/tt-project", ".changeset"], cwd=top,
+                           capture_output=True, text=True, check=True).stdout.split()
+    found = []
+    for rel in files:
+        path = top / rel
+        if path.suffix not in CLAIM_SUFFIXES or not path.is_file():
+            continue
+        try:
+            text = path.read_text()
+        except UnicodeDecodeError:
+            continue
+        found += [(rel, n, hit) for n, hit in corrected_claims_in(text)]
+    assert found == [], found

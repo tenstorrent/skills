@@ -871,10 +871,10 @@ def _initiator_reboot(p, tmp_path, monkeypatch, journal, last_heartbeat_ago=600)
     ((0, "Oct 25 21:59:59 testhost systemd-logind[812]: System is powering down.\n", ""),
      "Initiator: a request to systemd-logind that names no user (journal: System is powering down.)."),
     ((0, "", ""), "Initiator: unknown (journal not readable: no system entries visible for the previous boot and "
-                  "no passwordless sudo)."),
-    (_HIDDEN, "Initiator: unknown (journal not readable: user not in systemd-journal and no passwordless sudo)."),
+                  "no passwordless sudo for journalctl)."),
+    (_HIDDEN, "Initiator: unknown (journal not readable: user not in systemd-journal and no passwordless sudo for journalctl)."),
     ((1, "", "No journal files were opened due to insufficient permissions.\n"),
-     "Initiator: unknown (journal not readable: user not in systemd-journal and no passwordless sudo)."),
+     "Initiator: unknown (journal not readable: user not in systemd-journal and no passwordless sudo for journalctl)."),
     (None, "Initiator: unknown (journal not readable: journalctl did not answer, missing or timed out)."),   # journalctl missing or timed out
 ])
 def test_the_reboot_notice_names_who_started_the_shutdown_from_the_journal(env, tmp_path, monkeypatch, journal, said):
@@ -920,7 +920,7 @@ def test_the_reboot_notice_names_a_ledger_entry_recorded_just_before_the_shutdow
     assert got == {"source": "ledger", "by": "other", "entry": hit["id"],
                    "text": f"machine-change ledger entry #{hit['id']} by project other: "
                            f"power-cycled the host via the BMC: chips off the bus",
-                   "unreadable": "user not in systemd-journal and no passwordless sudo"}, got
+                   "unreadable": "user not in systemd-journal and no passwordless sudo for journalctl"}, got
     assert f"Initiator: machine-change ledger entry #{hit['id']} by project other: power-cycled" in feed \
         and "(abrupt;" in feed, feed
 
@@ -947,7 +947,7 @@ def test_the_initiator_search_never_raises_and_never_waits_long(env, monkeypatch
     monkeypatch.setattr(initiator.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()))
     assert initiator.run_journal("boot-0") is None
     assert initiator.find(p, "b", None, None, journal=(0, None, None))["text"] == \
-        "unknown (journal not readable: no system entries visible for the previous boot and no passwordless sudo)"
+        "unknown (journal not readable: no system entries visible for the previous boot and no passwordless sudo for journalctl)"
 
 
 def test_journal_lines_that_do_not_stop_the_host_name_no_initiator():
@@ -1164,7 +1164,7 @@ def test_a_permission_limited_journal_is_read_through_sudo_n_never_prompting(env
         calls.append((cmd, kw.get("timeout"), kw.get("stdin")))
         if cmd[0] == "journalctl":
             return sp.CompletedProcess(cmd, *_OWN_ONLY)
-        if cmd == ["sudo", "-n", "true"]:
+        if cmd == ["sudo", "-n", "-l", "journalctl"]:
             return sp.CompletedProcess(cmd, 0, "", "")
         return sp.CompletedProcess(cmd, *_newest_first((0, _CYCLE, ""), cmd))
     monkeypatch.setattr(initiator.subprocess, "run", run)
@@ -1174,7 +1174,7 @@ def test_a_permission_limited_journal_is_read_through_sudo_n_never_prompting(env
     user, check, sudo, commands, window = (c[0] for c in calls)
     assert user[:3] == ["journalctl", "-b", "0123456789abcdef0123456789abcdef"] and "json" in user \
         and "SYSLOG_IDENTIFIER=systemd-logind" in user
-    assert check == ["sudo", "-n", "true"] and sudo == ["sudo", "-n", *user]
+    assert check == ["sudo", "-n", "-l", "journalctl"] and sudo == ["sudo", "-n", *user]
     assert commands[:2] == ["sudo", "-n"] and commands[-2:] == ["SYSLOG_IDENTIFIER=sudo", "SYSLOG_IDENTIFIER=pkexec"]
     assert window[:2] == ["sudo", "-n"] and window[window.index("--since") + 1] == f"@{_T0 - 600}" \
         and window[window.index("--until") + 1] == f"@{_T0 + 1}", window   # the 10 min before the marker
@@ -1185,11 +1185,11 @@ def test_a_permission_limited_journal_is_read_through_sudo_n_never_prompting(env
     monkeypatch.setattr(initiator.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or sp.CompletedProcess(
         cmd, *(own if cmd[0] == "journalctl" else (1, "", "sudo: a password is required\n"))))
     got = initiator.find(p, "boot-0", time.time(), None)
-    assert [c[:3] for c in calls] == [["journalctl", "-b", "-1"], ["sudo", "-n", "true"]], calls
-    assert got["text"] == "unknown (journal not readable: user not in systemd-journal and no passwordless sudo)"
+    assert calls[0][:3] == ["journalctl", "-b", "-1"] and calls[1:] == [["sudo", "-n", "-l", "journalctl"]], calls
+    assert got["text"] == "unknown (journal not readable: user not in systemd-journal and no passwordless sudo for journalctl)"
     # sudo works but its read is refused: said so, never retried with a password.
     monkeypatch.setattr(initiator.subprocess, "run", lambda cmd, **kw: sp.CompletedProcess(
-        cmd, *(own if cmd[0] == "journalctl" else (0, "", "") if cmd[-1] == "true"
+        cmd, *(own if cmd[0] == "journalctl" else (0, "", "") if cmd[:3] == ["sudo", "-n", "-l"]
                else (1, "", "sudo: a password is required\n"))))
     assert initiator.find(p, "boot-0", time.time(), None)["unreadable"] == \
         "user not in systemd-journal, and sudo -n journalctl did not read it either"
@@ -1199,7 +1199,7 @@ def test_an_unreadable_journal_gives_its_reason_once_in_doctor_not_a_command_to_
     from ttp import initiator
     p = make(env)
     feed, record, got = _initiator_reboot(p, tmp_path, monkeypatch, _OWN_ONLY)
-    why = "user not in systemd-journal and no passwordless sudo"
+    why = "user not in systemd-journal and no passwordless sudo for journalctl"
     assert f"Initiator: unknown (journal not readable: {why})." in feed and feed.count("Initiator:") == 1, feed
     assert got == {"source": "unknown", "text": f"unknown (journal not readable: {why})", "unreadable": why}
     line = initiator.doctor_line(p)

@@ -100,19 +100,21 @@ def discover_ids(source: str, via: Optional[str] = None, run=None) -> dict:
 
 
 def probe_script(user: str, uid: int, gid: int) -> str:
-    """Read-only, as the admin login. Root checks go through `sudo -n`, never a plain test."""
+    """Read-only, as the admin login. Root checks go through `sudo -n`, never a plain test. Whether the admin
+    may run the root script is asked with `sudo -n -l bash` (the command `--run` uses), never `sudo -n true`:
+    a host may grant passwordless sudo only for specific commands."""
     u = shlex.quote(user)
     return (
         f"u={u}; "
         'echo "admin_user=$(id -un)"; echo "admin_home=$HOME"; '
-        'if sudo -n true 2>/dev/null; then echo sudo=yes; else echo sudo=no; fi; '
+        'if sudo -n -l bash >/dev/null 2>&1; then echo sudo=yes; else echo sudo=no; fi; '
         'echo "account=$(getent passwd "$u" | cut -d: -f3,4,6,7)"; '
         f'echo "uid_owner=$(getent passwd {int(uid)} | cut -d: -f1)"; '
         f'echo "gid_owner=$(getent group {int(gid)} | cut -d: -f1)"; '
         'getent group docker >/dev/null && echo docker=yes || echo docker=no; '
         'base=$(useradd -D 2>/dev/null | sed -n "s/^HOME=//p"); echo "home_base=${base:-/home}"; '
         'h="${base:-/home}/$u"; '
-        'if sudo -n true 2>/dev/null; then '
+        'if sudo -n -l bash >/dev/null 2>&1; then '
         'sudo -n test -e "$h" && echo "home_exists=yes" || echo "home_exists=no"; '
         'echo "home_owner=$(sudo -n stat -c %u "$h" 2>/dev/null)"; '
         'else echo home_exists=unknown; fi; true'
@@ -160,7 +162,8 @@ def decide(user: str, ids: dict, probe: dict) -> "tuple[List[str], List[str]]":
             todo.append(f"create {user} with uid {uid} gid {gid}, home {probe['home_base']}/{user}, "
                         f"shell {DEFAULT_SHELL}; {grp_note}")
     if not probe["sudo"]:
-        problems.append("the admin login has no passwordless sudo: the box's admin creates the account; "
+        problems.append("the admin login has no passwordless sudo for a root shell (`sudo -n -l bash`): the box's admin "
+                        "creates the account; "
                         "setup-box does not")
     elif not problems:
         todo.append(f"sudo for {user}: the admin login has it, so a sudoers.d drop-in, checked with visudo -cf")

@@ -38,7 +38,9 @@ box.py account create ... --run
   - enables linger, so project daemons run as systemd user services.
 - It never changes or deletes another account. It stops, changing nothing, when the login exists
   with other ids, the uid belongs to someone else, the home exists owned by another uid, or the
-  admin login has no passwordless sudo: then the box's admin creates the account. Ask the user.
+  admin login has no passwordless sudo for a root shell (checked with `sudo -n -l bash`, never
+  `sudo -n true`; some hosts grant it only for specific commands): then the box's admin creates the
+  account. Ask the user.
 - The user's own login already works: `box.py account keys <box-alias> [--pubkey ...] --run` adds
   the keys as the user, and `ssh <box-alias> loginctl enable-linger` turns linger on (through the
   admin if the box refuses it).

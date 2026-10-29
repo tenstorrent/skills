@@ -7,7 +7,7 @@ question such as "did tt-project reboot this host?" is answered by the record it
 order; each is bounded and never raises:
 
 1. The previous boot's journal as JSON, read as this user, else through `sudo -n` (bounded, never
-   prompts, stores nothing) when that showed only the user's own entries and `sudo -n true` works. Three
+   prompts, stores nothing) when that showed only the user's own entries and `sudo -n -l journalctl` allows it. Three
    bounded reads the same way: the boot's last MARK_ENTRIES lines of logind and of systemd about the
    shutdown targets, which the shutdown's own Stopping/Stopped lines cannot push out; the boot's last
    MARK_ENTRIES lines of sudo and pkexec; then the WINDOW_S before the shutdown marker found in the
@@ -42,7 +42,7 @@ import time
 from pathlib import Path
 
 JOURNAL_TIMEOUT_S = 5
-SUDO_TIMEOUT_S = 8    # each `sudo -n journalctl`; `sudo -n true` before them takes SUDO_CHECK_S
+SUDO_TIMEOUT_S = 8    # each `sudo -n journalctl`; `sudo -n -l journalctl` before them takes SUDO_CHECK_S
 SUDO_CHECK_S = 3
 MARK_ENTRIES = 5000   # the marker read (logind, systemd's shutdown-target lines) and the command read (sudo, pkexec)
 WINDOW_S = 600        # the window read: this long before the shutdown marker, at most WINDOW_ENTRIES
@@ -130,10 +130,11 @@ def run_journal(boot: str | None, extra=(), sudo: bool = False) -> tuple[int, st
 
 
 def sudo_ok() -> bool:
-    """Whether `sudo -n` works here (passwordless): checked once per reboot, silently."""
+    """Whether passwordless sudo may run journalctl here: checked once per reboot, silently. It asks
+    `sudo -n -l journalctl`, never `sudo -n true`: a host may grant NOPASSWD only for specific commands."""
     if os.environ.get("TTP_TEST_NO_JOURNAL"):
         return False
-    r = _run(["sudo", "-n", "true"], SUDO_CHECK_S)
+    r = _run(["sudo", "-n", "-l", "journalctl"], SUDO_CHECK_S)
     return bool(r) and r[0] == 0
 
 
@@ -191,7 +192,7 @@ def read(boot: str | None, journal=None, sudo=None):
     """(the marker read, ask, how, why): ask(extra) reads more the same way, how is 'user', 'sudo' or ''
     when no read showed the system's entries (ask is then None), why says why not. As this user first,
     then through `sudo -n` when that showed only the user's own entries or none. `journal`/`sudo`: fixed answers
-    (tests; sudo False: no passwordless sudo), read here when None."""
+    (tests; sudo False: no passwordless sudo for journalctl), read here when None."""
     as_user = (lambda extra: journal) if journal is not None else (lambda extra: run_journal(boot, extra))
     got = as_user(marker_args())
     if not got:
@@ -202,7 +203,7 @@ def read(boot: str | None, journal=None, sudo=None):
     if why not in ("user not in systemd-journal", EMPTY):
         return got, None, "", why
     if sudo is False or sudo is None and not sudo_ok():
-        return got, None, "", f"{why} and no passwordless sudo"
+        return got, None, "", f"{why} and no passwordless sudo for journalctl"
     as_root = (lambda extra: sudo) if sudo is not None else (lambda extra: run_journal(boot, extra, sudo=True))
     s = as_root(marker_args())
     if not s or _limited(s):
