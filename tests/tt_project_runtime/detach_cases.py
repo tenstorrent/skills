@@ -1362,3 +1362,24 @@ def test_detach_stop_of_an_unknown_name_says_where_it_looked(env, tmp_path):
     assert str(p.root / "t9") in r.stderr and "launcher's own stop" in r.stderr
     r = _ttp_run(p, "detach", "--stop", str(tmp_path / "x" / "ghost.rc"))
     assert r.returncode == 2 and str(tmp_path / "x") in r.stderr and "launcher's own stop" in r.stderr
+
+
+def test_launcher_stop_never_targets_its_caller_nor_writes_through_a_stop_symlink(env, tmp_path, monkeypatch):
+    """A pid file naming this process (or an ancestor) is refused; a STOP planted as a symlink is left as
+    it is, its target never written, and the launcher is still stopped by the escalation."""
+    from ttp import launcherstop
+    res = tmp_path / "res"
+    res.mkdir()
+    (res / "self.pid").write_text(f"{os.getpid()}\n")
+    assert launcherstop.identify(res / "self.pid", None)[0] == "refused"
+    monkeypatch.setattr(launcherstop, "STOP_WAIT_S", 0.3)
+    target = tmp_path / "elsewhere"
+    proc = _launcher(res, obey=False)
+    try:
+        (res / "STOP").symlink_to(target)
+        state, pid, token = launcherstop.identify(res / "drive.pid", None)
+        assert state == "live"
+        assert launcherstop.stop(res / "drive.pid", pid, token, "test")["how"] == "sigterm"
+        assert not target.exists() and (res / "STOP").is_symlink()
+    finally:
+        _end_launcher(proc)

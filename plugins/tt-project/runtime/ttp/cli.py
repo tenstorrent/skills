@@ -5139,7 +5139,12 @@ def _launcher_stop(what: str, rc: Path) -> int:
         print(f"ttp detach --stop: {f}: {detail}; nothing was stopped", file=sys.stderr)
         return 3
     caller = env.get("TTP_TASK")
-    r = launcherstop.stop(f, pid, detail, "stop requested by `ttp detach --stop`" + (f" (task #{caller})" if caller else ""))
+    try:
+        r = launcherstop.stop(f, pid, detail, "stop requested by `ttp detach --stop`" + (f" (task #{caller})" if caller else ""))
+    except OSError as e:
+        print(f"ttp detach --stop: cannot write {f.parent / launcherstop.STOP_FILE} ({e}); nothing was signalled",
+              file=sys.stderr)
+        return 3
     print(r["text"])
     return 1 if r["left"] else 0
 

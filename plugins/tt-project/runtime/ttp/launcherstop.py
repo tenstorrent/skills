@@ -13,8 +13,8 @@ A live pid counts as that launcher's only while it runs as this user, is the pro
 started later) and, where its environment names a tt-project project, names this one. Then stop()
 writes RESULTS_DIR/STOP, waits STOP_WAIT_S for it to exit, then sends SIGTERM (to its process group
 when it leads one), waits TERM_WAIT_S and sends SIGKILL, checking before each signal that the pid is
-still the same process. A pid that is gone or reused is reported already stopped; no STOP file is
-written then, so a later launch does not stop at once.
+still the same process (never this command or one of its ancestors). A pid that is gone or reused
+is reported already stopped; no STOP file is written then, so a later launch does not stop at once.
 """
 from __future__ import annotations
 
@@ -85,6 +85,17 @@ def _project_of(pid: int) -> str | None:
     return None
 
 
+def _ancestors() -> set[int]:
+    out, pid = set(), os.getpid()
+    while pid > 1 and pid not in out:
+        out.add(pid)
+        try:
+            pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            break
+    return out
+
+
 def identify(pidfile: Path, project: str | None) -> tuple[str, int, str]:
     """(state, pid, detail) for the pid file: ("live", pid, start token), ("gone", pid, why) or
     ("refused", pid, why)."""
@@ -94,6 +105,8 @@ def identify(pidfile: Path, project: str | None) -> tuple[str, int, str]:
     now = proc_start(pid)
     if st is None or now is None:
         return "gone", pid, "its process is gone"
+    if pid in _ancestors():
+        return "refused", pid, f"pid {pid} is this command or one of its ancestors"
     if st[1] != os.getuid():
         return "refused", pid, f"pid {pid} runs as another user"
     if token is not None and now != token:
@@ -139,8 +152,10 @@ def _signal(pid: int, token: str, sig: int) -> None:
 def stop(pidfile: Path, pid: int, token: str, why: str) -> dict:
     """Write RESULTS_DIR/STOP and wait for the launcher's process to exit, then SIGTERM, then SIGKILL."""
     stop_file = pidfile.parent / STOP_FILE
-    if not stop_file.exists():
-        stop_file.write_text(f"{why} at {time.strftime('%Y-%m-%d %H:%M:%S %Z')}\n")
+    if not os.path.lexists(stop_file):   # never through a symlink planted as STOP
+        fd = os.open(stop_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "w") as out:
+            out.write(f"{why} at {time.strftime('%Y-%m-%d %H:%M:%S %Z')}\n")
     name = pidfile.stem
     if _wait(pid, token, STOP_WAIT_S):
         return {"how": "stop_file", "left": False,
