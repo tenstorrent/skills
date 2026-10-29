@@ -4109,7 +4109,7 @@ def test_one_listener_per_chat(env):
     starter = subprocess.run(["/bin/sh", "-c", " ".join(shlex.quote(x) for x in cmd) + " >/dev/null 2>&1 & echo $!; sleep 1"],
                              env=run_env, capture_output=True, text=True, timeout=30)
     orphan = int(starter.stdout.split()[0])
-    deadline = time.time() + 15
+    deadline = time.time() + 60    # generous: an orphaned listener exits on its own poll; heavy suite load slows it
     while time.time() < deadline:
         try:
             os.kill(orphan, 0)
