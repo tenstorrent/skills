@@ -90,6 +90,7 @@ PORTS = "check-ports"          # check-slots/check-ports.<i>.lock: one running c
 PORT_FIRST, PORT_SPAN, PORT_BLOCKS = 20000, 100, 120
 PORT_BASE_ENV, PORT_COUNT_ENV = "TTP_PORT_BASE", "TTP_PORT_COUNT"
 POLL_S = 5.0
+HEAD_POLL_S = 0.5     # a suite waiter next in line checks this often, so a freed lane goes to it at once
 SUITE_AGE_S = 900.0   # default checks.priority_age_s: a suite waiter gains one priority step per this many seconds waited
 NO_PRIORITY = 3      # a ticket without a priority (no task, a task without one, an older runtime) ranks as p3
 AGE_FLOOR = 1        # aging never ranks a waiter above p1 (an obligation owner's 0 is its own, not aged to)
@@ -418,6 +419,22 @@ def repo_key(top) -> str:
     return hashlib.sha256(os.path.realpath(common).encode()).hexdigest()[:12]
 
 
+def repo_name(top) -> str:
+    """The name of the git repository at `top` for people (its main checkout's folder, shared by its
+    worktrees); "" when `top` is not in one."""
+    if not top:
+        return ""
+    try:
+        r = subprocess.run(["git", "-C", str(top), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    common = Path(r.stdout.strip()) if not r.returncode and r.stdout.strip() else None
+    if common is None:
+        return ""
+    return common.parent.name if common.name == ".git" else common.name.removesuffix(".git")
+
+
 def suite_base(project_name: str, repo: str = "") -> str:
     """The lane resource of project `project_name`'s full checks in repository `repo` (repo_key; "": the
     project's own, for callers that name none): each repository has its own lanes and queue."""
@@ -477,13 +494,16 @@ def age_s(cfg: dict | None = None) -> float:
     return checklane.priority_age_s(cfg)
 
 
-def suite_priority(ticket, now: float | None = None, age: float | None = None) -> float:
+def suite_priority(ticket, now: float | None = None, age: float | None = None,
+                   arrival: float | None = None) -> float:
     """A suite waiter's rank now: its task priority (NO_PRIORITY without one), one step more urgent
-    per `age` seconds it has waited (default age_s()), never past AGE_FLOOR (p1) nor its own priority."""
+    per `age` seconds it has waited (default age_s()) since `arrival` (default its ticket's), never past
+    AGE_FLOOR (p1) nor its own priority."""
     prio = locks.ticket_priority(ticket)
     prio = NO_PRIORITY if prio == float("inf") else prio
     age = age_s() if age is None else age
-    waited = max(0.0, (time.time() if now is None else now) - locks._arrival(ticket))
+    arrival = locks._arrival(ticket) if arrival is None else arrival
+    waited = max(0.0, (time.time() if now is None else now) - arrival)
     return max(min(prio, AGE_FLOOR), prio - waited // age) if age > 0 else prio
 
 
@@ -497,26 +517,86 @@ def rank_text(ticket, now: float | None = None, age: float | None = None) -> str
     return f"p{prio:g} ranked p{rank:g}" + (" (aged)" if rank < prio else "")
 
 
-def _order_key(t, now: float | None = None, age: float | None = None) -> tuple:
+def _order_key(t, now: float | None = None, age: float | None = None, arrival: float | None = None) -> tuple:
     """Rank (suite_priority), then native priority, then arrival: among equal ranks a native p1 goes
     before a waiter that only aged up to p1. One that has waited FAIR_STEPS aging steps goes by arrival
-    among its rank (0 sorts it first: it arrived before all who have not), so native p1s never starve it."""
+    among its rank (0 sorts it first: it arrived before all who have not), so native p1s never starve it.
+    `arrival` overrides the ticket's own (a re-queued waiter keeps its place, waiter_sets)."""
     now = time.time() if now is None else now
     age = age_s() if age is None else age
-    arrival, prio = locks._arrival(t), locks.ticket_priority(t)
+    arrival = locks._arrival(t) if arrival is None else arrival
+    prio = locks.ticket_priority(t)
     native = NO_PRIORITY if prio == float("inf") else prio
     if age > 0 and now - arrival >= FAIR_STEPS * age:
         native = 0
-    return suite_priority(t, now, age), native, arrival, t.name
+    return suite_priority(t, now, age, arrival), native, arrival, t.name
+
+
+_CHECK = re.compile(r"\[check ([^\]\s]+)\]")
+_PIDNS = re.compile(r"\[pidns (\S+)\]")   # a namespace reads "pid:[4026531836]"
+
+
+def _ticket_text(t) -> str:
+    try:
+        return t.read_text()
+    except OSError:
+        return ""
+
+
+def ticket_pid(t) -> int | None:
+    m = re.match(r"\d+(?:\.\d+)?-(\d+)", t.name)
+    return int(m.group(1)) if m else None
+
+
+def _run_no(text: str) -> int:
+    m = re.search(r"\brun (\d+)", text)
+    return int(m.group(1)) if m else 0
+
+
+def waiter_sets(q: list) -> tuple[list, dict, dict, list]:
+    """Suite waiter tickets `q` sorted out: (kept, arrival, superseded, dead). One entry per task and
+    check (its head and commands, the ticket's "[check ...]"): of several, the latest run's is kept and
+    queues at the earliest arrival among them; each older run's is superseded (ticket -> the kept one), as
+    a task's next attempt starting the same checks replaces its earlier attempt's. Two of the same run
+    count once. A ticket whose pid is gone, judged only in the pid namespace it names ("[pidns ...]"), is
+    dead. Read only."""
+    ns = locks._pid_ns()
+    kept, dead, groups = [], [], {}
+    for t in q:
+        text = _ticket_text(t)
+        pid, tns = ticket_pid(t), _PIDNS.search(text)
+        if pid and tns and ns and tns.group(1) == ns and not locks._alive(pid):
+            dead.append(t)
+            continue
+        task, check = re.search(r"task #(\d+)", text), _CHECK.search(text)
+        if task and check:
+            groups.setdefault((task.group(1), check.group(1)), []).append((_run_no(text), locks._arrival(t), t))
+        else:
+            kept.append(t)
+    arrival = {t: locks._arrival(t) for t in kept}
+    superseded = {}
+    for g in groups.values():
+        g.sort(key=lambda x: (x[0], -x[1], x[2].name))
+        keep = g[-1][2]
+        kept.append(keep)
+        arrival[keep] = min(x[1] for x in g)
+        superseded.update({x[2]: keep for x in g if x[0] < g[-1][0]})
+    return kept, arrival, superseded, dead
+
+
+def _ordered(kept: list, arrival: dict, now: float | None = None, age: float | None = None) -> list:
+    return sorted(kept, key=lambda t: _order_key(t, now, age, arrival[t]))
 
 
 def suite_order(project_name: str, q: list | None = None, now: float | None = None, repo: str = "",
                 age: float | None = None) -> list:
     """The project's suite waiters in repository `repo` in the order the lanes go to them: by
-    suite_priority (aging step `age`, default age_s()), then arrival."""
+    suite_priority (aging step `age`, default age_s()), then arrival, one entry per task and check, dead
+    ones left out (waiter_sets)."""
     q = locks.queued(checkcap.slot_dir(), _suite_resource(project_name, repo)) if q is None else q
     age = age_s() if age is None else age
-    return sorted(q, key=lambda t: _order_key(t, now, age))
+    kept, arrival, _, _ = waiter_sets(q)
+    return _ordered(kept, arrival, now, age)
 
 
 def _pending(path) -> bool:
@@ -680,7 +760,8 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                since: float | None = None, slots: int = 1, repo: str = "", cost: dict | None = None,
                max_wait: float = 0.0, state=None, what: str = "full checks", lock: str = "", cap: int = 0,
                worktree: str = "", headroom: Callable[[], bool] | None = None,
-               age: float | None = None, pending: bool = False) -> Grant | None:
+               age: float | None = None, pending: bool = False, check: str = "",
+               repo_name: str = "") -> Grant | None:
     """Hold one of project `project_name`'s `slots` checks lanes in repository `repo` (repo_key) for its
     full checks (above), waiting while its other runs there hold them all or a more urgent waiter is ahead
     (suite_order); Grant(0) holding one, Grant() with no project or nested in a check, None once `wait_s`
@@ -692,7 +773,11 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     in its label, so a waiting run names the run it waits for; `what`: the commands it runs. `priority`:
     the task's (lower first); `since`: the arrival to queue at (default now), kept by a run that hands
     over. `state`: the project's state folder, for the reclaim log. It says who holds the lanes and its
-    place in the queue at once and every checklane.TELL_S.
+    place in the queue at once and every checklane.TELL_S. `check` (its head and commands) names the
+    check: a later run of the same task queueing the same check supersedes this wait, which then ends
+    with checkcap.Cancelled (waiter_sets). A waiter whose process is gone is dropped from the queue with
+    a note; one whose ticket vanished queues again at its place. The waiter next in line checks every
+    HEAD_POLL_S, so a freed lane goes to it at once. `repo_name` goes in the lane's label for status.
 
     `lock`: the run goes behind the wrapper lock of that checklane.wrap_key (checks.wrap_cmd), so it takes
     that lock's one lane, whatever its repository, and never a repository lane or an overflow lane: runs
@@ -714,16 +799,19 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     extra_lanes = lane_paths(project_name, slots, repo, overflow=True)
     task = os.environ.get("TTP_TASK") or ""
     label = f"{project_name}: full checks ({who + ', ' if who else ''}pid {os.getpid()})"
-    try:   # the ticket names its task for suite_line
-        ticket = locks.enqueue(checkcap.slot_dir(), _suite_resource(project_name, repo),
-                               f"task #{task} {label}" if task.isdigit() else label, since, priority=priority)
+    ns = locks._pid_ns()
+    text = ((f"task #{task} {label}" if task.isdigit() else label) + (f" [check {check}]" if check else "")
+            + (f" [pidns {ns}]" if ns else ""))   # the ticket names its task for suite_line
+    resource = _suite_resource(project_name, repo)
+    try:
+        ticket = locks.enqueue(checkcap.slot_dir(), resource, text, since, priority=priority)
     except OSError:
         return Grant()   # an unwritable slot directory: the checks slot says so
     arrival = locks._arrival(ticket)
     fields = {**({"task": task} if task.isdigit() else {}), **({"priority": priority} if priority is not None else {}),
               **({"cost": cost} if cost else {}), **({"lock": lock} if lock else {}),
               **({"worktree": str(worktree)} if worktree else {}), **({"granted": False} if pending else {}),
-              "hb": checklane.HEARTBEAT_S}
+              **({"repo_name": repo_name} if repo_name else {}), "hb": checklane.HEARTBEAT_S}
     start, told = time.time(), 0.0
     try:
         while True:
@@ -734,7 +822,27 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
             # queue that decides holds every waiter that arrived before it was freed.
             recs = locks.holder_records(lanes + extra_lanes)
             free = slots - len([x for x in lanes if locks._slot_labels([x])])
-            q = suite_order(project_name, repo=repo, age=age)
+            every = locks.queued(checkcap.slot_dir(), resource)
+            if ticket not in every:   # removed under it: queue again at its place, never past the line
+                locks.dequeue(ticket)
+                try:
+                    ticket = locks.enqueue(checkcap.slot_dir(), resource, text, arrival, priority=priority)
+                except OSError:
+                    return Grant()
+                every = locks.queued(checkcap.slot_dir(), resource)
+            kept, arrivals, superseded, dead = waiter_sets(every)
+            for t in dead:
+                who_ = _ticket_text(t).split(" [")[0]
+                try:
+                    t.unlink()
+                except OSError:
+                    continue
+                tell and tell(f"dropped a dead waiter from the checks queue: {who_} (pid {ticket_pid(t)} is gone)")
+            if ticket in superseded:
+                raise checkcap.Cancelled(f"superseded: {_ticket_text(superseded[ticket]).split(' [')[0]} "
+                                         f"queues the same check of the same task")
+            q = _ordered(kept, arrivals, age=age)
+            pos = q.index(ticket) if ticket in q else len(q)
             f = None
             cheaper = (max_wait > 0 and cost and time.time() - arrival >= max_wait and recs
                        and all(checklane.cheaper(cost, r.get("cost") or {}) for r in recs))
@@ -743,7 +851,7 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                       and not (worktree and any(r.get("worktree") == str(worktree) for r in recs)) and headroom())
             try:
                 with _cap_guard(project_name, cap):
-                    if free > 0 and (ticket not in q or q.index(ticket) < free):
+                    if free > 0 and pos < free:
                         if cap_turn(project_name, cap, ticket, slots, age=age):
                             f = locks.try_take(lanes, label, what, extra=fields)
                     elif (cheaper or urgent) and cap_turn(project_name, cap, ticket, slots, age=age):
@@ -768,7 +876,7 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                 if not told and waiting:
                     waiting(True)
                 told = time.time()
-                pos = (q.index(ticket) + 1) if ticket in q else 1
+                place = pos + 1
                 rule = ("one at a time behind this wrapper lock (checks.wrap_cmd)" if lock else
                         f"{'one' if slots == 1 else slots} at a time per project and repository, "
                         f"checks.{SLOTS_KEY} sets it")
@@ -776,9 +884,10 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                 recs = recs or locks.holder_records(project_held(project_name))
                 held_by = "; ".join(checklane.holder_text(r, told) for r in recs[:3]) or "a run that just ended"
                 tell and tell(f"waiting for this project's other full checks to end ({rule}, most urgent priority "
-                              f"first; this run {rank_text(ticket, told, age)}, position {pos} of {max(len(q), pos)}, "
-                              f"{pos - 1} waiter(s) ahead, waited {_mins(told - arrival)}), held by {held_by}")
-            time.sleep(poll_s(POLL_S))
+                              f"first; this run {rank_text(ticket, told, age)}, position {place} of "
+                              f"{max(len(q), place)}, {place - 1} waiter(s) ahead, waited {_mins(told - arrival)}), "
+                              f"held by {held_by}")
+            time.sleep(poll_s(HEAD_POLL_S if pos < slots else POLL_S))
     finally:
         locks.dequeue(ticket)
         if told and waiting:

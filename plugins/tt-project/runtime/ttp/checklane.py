@@ -87,6 +87,9 @@ LONG_WAIT_S = 600.0       # ttp status and the digest list a wait longer than th
 TELL_S = 60.0             # a waiter says who holds the lanes this often
 HEARTBEAT_S = 30.0        # a holder touches its lane file this often
 HEARTBEAT_DEAD_S = 300.0  # a lane file untouched this long has a dead holder
+DONE_FLAG_S = 300.0       # a lane still held by a finished task's check is flagged this long after the task ended
+DONE_GRACE_S = 3600.0     # ... and its own detached checks stopped after this, when no run time is known
+FINISHED = ("done", "failed", "cancelled", "exhausted")
 RECLAIM_LOG = "checks-lane-reclaims.jsonl"
 RECLAIM_KEEP = 50
 SLOTS_ENV = "TTP_CHECKS_SLOTS"
@@ -190,12 +193,16 @@ def project_cap(cfg: dict | None) -> int:
     return max(slots(cfg), s[0] // s[1]) if s else 0
 
 
-def group_name(key: str) -> str:
+def group_name(key: str, name: str = "") -> str:
     """What a lane base's key names, for status (the one naming rule: lane_status, status_text): a wrapper
-    lock, a repository, or an unkeyed group (an older runtime's one lane per project). Never empty."""
+    lock, a repository, or an unkeyed group (an older runtime's one lane per project), with `name` (the
+    repository's or project folder's name, lane_status's "name") beside the key when given. Never empty."""
     if key.startswith("w"):
         return f"wrapper lock {key[1:]} (checks.wrap_cmd, one at a time)"
-    return f"repository {key}" if key else "not keyed (no repository key: an older runtime, one lane per project)"
+    if not key:
+        return (f"repository {name} (not keyed: an older runtime, one lane per project)" if name
+                else "not keyed (no repository key: an older runtime, one lane per project)")
+    return f"repository {name} (key {key})" if name and name != key else f"repository {key}"
 
 
 def wrap_key(wrap) -> str:
@@ -315,6 +322,74 @@ def cheaper(mine: dict | None, theirs: dict) -> bool:
         return a < b
     t = theirs.get("cls")
     return int(mine.get("cls", SUITE)) < (int(t) if isinstance(t, int) else SUITE)
+
+
+def done_flag_s(cfg: dict | None) -> float:
+    return _seconds(cfg, "done_holder_flag_s", DONE_FLAG_S)
+
+
+def done_grace_s(cfg: dict | None, rec: dict) -> float:
+    """How long after its task ended a check still holding a lane may run on before it is stopped:
+    checks.done_holder_grace_s, else one and a half of the check's usual run time (its label's est_s,
+    median_s), else its wall-time cap, else DONE_GRACE_S; never under done_flag_s."""
+    v = setting(cfg, "done_holder_grace_s")
+    try:
+        if v is not None and float(v) >= 0:
+            return max(float(v), done_flag_s(cfg))
+    except (TypeError, ValueError):
+        pass
+    est = (rec.get("cost") or {}).get("est_s") if isinstance(rec.get("cost"), dict) else None
+    cap = rec.get("cap_s")
+    base = (1.5 * float(est) if isinstance(est, (int, float)) and est > 0
+            else float(cap) if isinstance(cap, (int, float)) and cap > 0 else DONE_GRACE_S)
+    return max(base, done_flag_s(cfg))
+
+
+def finished_holders(p, cfg: dict | None, now: float | None = None) -> list[dict]:
+    """The project's lanes held by a check whose task has ended (FINISHED) for done_flag_s or longer (0:
+    off): lane, pid, task, run, status, ended_s (since the task ended, or the lane was taken if later),
+    held_s, grace_s (done_grace_s) and stop (ended_s past grace_s). Read only."""
+    now = time.time() if now is None else now
+    flag = done_flag_s(cfg)
+    if flag <= 0:
+        return []
+    out = []
+    for base in testslots.suite_bases(p.name):
+        for path in testslots._lanes_of(base):
+            for rec in locks.holder_records([path]):
+                task = str(rec.get("task") or "")
+                if not task.isdigit() or rec.get("alive") is False:
+                    continue
+                row = p.db.one("SELECT status, updated FROM tasks WHERE id=?", (int(task),))
+                if not row or row["status"] not in FINISHED:
+                    continue
+                since = float(rec.get("since") or now)
+                ended = now - max(float(row["updated"] or 0), since)
+                if ended < flag:
+                    continue
+                grace = done_grace_s(cfg, rec)
+                out.append({"lane": str(path), "pid": rec.get("pid"), "task": task, "run": _run_of(rec.get("holder")),
+                            "status": row["status"], "since": since, "ended_s": ended, "held_s": now - since,
+                            "grace_s": grace, "stop": ended >= grace, "command": str(rec.get("command") or "")})
+    return out
+
+
+def stop_finished(p, h: dict) -> dict | None:
+    """Stop finished_holders' entry `h` through jobstop.end_checks, only when its pid is the detached
+    `ttp checks` of its own run (checks.pid in that run's folder) and that run is its task's: never any
+    other process. None when it is not, or it already ended."""
+    from . import jobstop
+    from .cli import _read_checks_pid
+    if not (h.get("run") and h.get("task") and isinstance(h.get("pid"), int)):
+        return None
+    row = p.db.one("SELECT dir, task FROM runs WHERE id=?", (int(h["run"]),))
+    if not row or not row["dir"] or str(row["task"]) != str(h["task"]):
+        return None
+    if _read_checks_pid(Path(row["dir"])).get("pid") != h["pid"]:
+        return None
+    return jobstop.end_checks(p, Path(row["dir"]),
+                              f"task #{h['task']} is {h['status']} and its check held a checks lane "
+                              f"{mins(h['ended_s'])} after (grace {mins(h['grace_s'])})", int(h["task"]))
 
 
 def mins(s: float) -> str:
@@ -504,25 +579,31 @@ def _run_of(text: str) -> str:
     return m.group(1) if m else ""
 
 
-def lane_status(project_name: str, now: float | None = None, cfg: dict | None = None) -> list[dict]:
-    """`ttp checks status`: per repository with a held lane or a waiter, its lanes' holders (task, run,
-    pid, age, alive, command) and its waiters in the order the lanes go to them (testslots.suite_order,
-    the aging step of `cfg`), the first one next, each with its task priority (None without one) and its
-    rank now (testslots.suite_priority). Read only: it probes the lock files without holding them and
-    never queues, reclaims a lane, removes a dead ticket or writes a file."""
+def lane_status(project_name: str, now: float | None = None, cfg: dict | None = None,
+                names: dict | None = None, db=None) -> list[dict]:
+    """`ttp checks status`: per repository with a held lane or a waiter, its name, its lanes' holders
+    (task, run, pid, age, alive, command) and its waiters in the order the lanes go to them
+    (testslots.suite_order, the aging step of `cfg`), the first one next, each with its task priority
+    (None without one) and its rank now (testslots.suite_priority). The name is the one its holders
+    recorded, else `names[repo key]` (the caller's: its own repository, and the project folder's name for
+    the unkeyed group, key ""), else the lane key: never empty. Each holder says why it holds the lane
+    (`why`: its label, e.g. "full checks") and, given the project's `db`, its task's status
+    (`task_status`) and whether that task has ended (`finished`). Read only: it probes the lock files
+    without holding them and never queues, reclaims a lane, removes a dead ticket or writes a file."""
     now = time.time() if now is None else now
     age = priority_age_s(cfg)
     pre = f"{testslots.SUITE}.{locks.group_id(project_name)}"
     out = []
     for base in testslots.suite_bases(project_name):
         lanes = []
-        for r in locks.holder_records(testslots._lanes_of(base)):
+        recs = locks.holder_records(testslots._lanes_of(base))
+        for r in recs:
             since = float(r.get("since") or now)
             lanes.append({"task": str(r.get("task") or ""), "run": _run_of(r.get("holder")), "pid": r.get("pid"),
                           "age_s": round(now - since, 1), "alive": r.get("alive"),
                           "running_s": round(now - float(r["run_since"]), 1) if r.get("run_since") else None,
                           "command": str(r.get("command") or ""), "overflow": bool(r.get("overflow")),
-                          "cost": r.get("cost") or {}})
+                          "cost": r.get("cost") or {}, "why": _why(r.get("holder")), **_task_state(db, r)})
         waiters = []
         for i, t in enumerate(testslots.suite_order(project_name, _live_tickets(base), now, age=age)):
             m = re.match(r"\d+(?:\.\d+)?-(\d+)", t.name)
@@ -537,9 +618,25 @@ def lane_status(project_name: str, now: float | None = None, cfg: dict | None = 
                             "rank": testslots.suite_priority(t, now, age), "label": testslots.rank_text(t, now, age),
                             "waited_s": round(now - locks._arrival(t), 1), "next": i == 0})
         if lanes or waiters:
-            key = base[len(pre) + 1:]
-            out.append({"repo": key, "group": group_name(key), "lanes": lanes, "waiters": waiters})
+            repo = base[len(pre) + 1:]
+            name = (next((str(r["repo_name"]) for r in recs if r.get("repo_name")), "")
+                    or (names or {}).get(repo) or repo or base)
+            out.append({"repo": repo, "group": group_name(repo), "name": name, "lanes": lanes, "waiters": waiters})
     return out
+
+
+def _why(text) -> str:
+    """What a holder label says the lane is for: "task #N proj: full checks (run R, pid P)" -> "full checks"."""
+    t = re.sub(r"\s*\((?:run|pid) [^)]*\)\s*$", "", str(text or "")).strip()
+    return t.split(": ", 1)[1] if ": " in t else t
+
+
+def _task_state(db, rec: dict) -> dict:
+    task = str(rec.get("task") or "")
+    if db is None or not task.isdigit():
+        return {}
+    row = db.one("SELECT status FROM tasks WHERE id=?", (int(task),))
+    return {"task_status": row["status"], "finished": row["status"] in FINISHED} if row else {}
 
 
 def _who(x: dict) -> str:
@@ -548,23 +645,27 @@ def _who(x: dict) -> str:
                                 (f"pid {x['pid']}" if x.get("pid") else "")) if w)
 
 
-def status_text(project_name: str, cfg: dict | None, here_repo: str = "", now: float | None = None) -> str:
+def status_text(project_name: str, cfg: dict | None, here_repo: str = "", now: float | None = None,
+                names: dict | None = None, db=None) -> str:
     """lane_status as lines for a person (`ttp checks status`)."""
     now = time.time() if now is None else now
     n = slots(cfg)
     lines = [f"checks lanes of {project_name}: {n} per repository (checks.slots), one per wrapper lock "
              f"(checks.wrap_cmd), at most {project_cap(cfg) or 'any number'} at once (checks.test_project_max); "
              f"light checks never wait"]
-    got = lane_status(project_name, now, cfg)
+    got = lane_status(project_name, now, cfg, names, db)
     if not got:
         lines.append("  no lane held and nobody waiting")
     for r in got:
-        lines.append(f"  {r['group']}" + (" (this one)" if r["repo"] == here_repo else ""))
+        lines.append(f"  {group_name(r['repo'], r['name'])}" + (" (this one)" if r["repo"] == here_repo else ""))
         for h in r["lanes"]:
             alive = {True: "alive", False: "DEAD (its lane is reclaimed by the next waiter)"}.get(h["alive"], "alive unknown")
             run = f", running {h['command']!r} for {mins(h['running_s'])}" if h["running_s"] is not None else ", not running yet"
-            lines.append(f"    holder{' (extra lane)' if h['overflow'] else ''}: {_who(h)}, {alive}, "
-                         f"held {mins(h['age_s'])}{run}")
+            why = f" for {h['why']}" if h.get("why") else ""
+            ended = (f", its task is {h['task_status'].upper()} (the lane is reported, and its own detached checks "
+                     f"stopped after checks.done_holder_grace_s)") if h.get("finished") else ""
+            lines.append(f"    holder{' (extra lane)' if h['overflow'] else ''}: {_who(h)}{why}, {alive}, "
+                         f"held {mins(h['age_s'])}{run}{ended}")
         if not r["lanes"]:
             lines.append("    holder: none (a waiter is about to start)")
         for w in r["waiters"]:

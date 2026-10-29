@@ -2268,7 +2268,7 @@ def test_a_lane_freed_after_a_waiters_queue_read_goes_to_the_more_urgent_waiter(
     _lane_env(monkeypatch)
     hold = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1)
     stalled, released, order = threading.Event(), threading.Event(), []
-    orig = testslots.suite_order
+    orig = testslots._ordered
 
     def slow(*a, **k):
         q = orig(*a, **k)
@@ -2276,7 +2276,7 @@ def test_a_lane_freed_after_a_waiters_queue_read_goes_to_the_more_urgent_waiter(
             stalled.set()
             released.wait(10)
         return q
-    monkeypatch.setattr(testslots, "suite_order", slow)
+    monkeypatch.setattr(testslots, "_ordered", slow)
 
     def wait(prio):
         g = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, priority=prio, wait_s=20)
@@ -2520,7 +2520,7 @@ def test_checks_status_reads_the_lanes_and_never_queues_or_writes(env, tmp_path,
         before = snap()
         assert _ttp("checks", "status") == 0
         out = capsys.readouterr().out
-        assert f"pid {holder.pid}, alive" in out and "#12" in out and "(this one)" in out, out
+        assert f"pid {holder.pid} for full checks, alive" in out and "#12" in out and "(this one)" in out, out
         assert "waiter 1 (next): #13" in out and "p3 ranked p3" in out, out
         assert _ttp("checks", "--slot-status", "--json") == 0
         got = json.loads(capsys.readouterr().out)
@@ -3621,3 +3621,185 @@ def test_checks_slot_wait_events_count_against_an_observation_mute_on_daemon_che
     Daemon(p.base).check_checks_wait(every_s=0)
     assert _queue_wakes(p) == [] and len(_queue_wakes(p, "muted")) == 4, "the wake and the waiters: muted"
     assert screen.mutes(p.db)[0]["count"] == 4
+
+
+@pytest.mark.parametrize("args", [["bogus"], ["status", "--bogus"], ["status", "extra"], ["--bogus"],
+                                  ["--slot-status", "--", "true"]])
+def test_ttp_checks_refuses_an_unknown_subcommand_or_flag_and_queues_nothing(env, tmp_path, monkeypatch, capsys, args):
+    from ttp import checkcap
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _lane_env(monkeypatch)
+    assert _ttp("checks", *args) != 0
+    err = capsys.readouterr().err
+    assert "ttp checks:" in err or "unrecognized arguments" in err, err
+    assert not (run / "checks.log").exists(), "an unknown word ran as a check"
+    assert not [x for x in checkcap.slot_dir().rglob("*") if ".queue" in str(x) and x.is_file()], "it queued"
+
+
+@pytest.mark.parametrize("args", [["status"], ["status", "--json"], ["--slot-status"], ["--slot-status", "--json"],
+                                  ["status", "--slot-status"]])
+def test_ttp_checks_status_spellings_read_the_lanes(env, tmp_path, monkeypatch, capsys, args):
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _lane_env(monkeypatch)
+    assert _ttp("checks", *args) == 0
+    assert "checks lanes" in capsys.readouterr().out or "--json" in args
+    assert not (run / "checks.log").exists()
+
+
+def test_ttp_checks_still_runs_a_real_command(env, tmp_path, monkeypatch):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _lane_env(monkeypatch)
+    assert cli.main(["checks", "--", "true"]) in (0, None)
+    assert (run / "checks.log").exists()
+
+
+def test_slot_status_names_an_unkeyed_lane_group_by_the_project_folder_never_empty(env, tmp_path, monkeypatch, capsys):
+    from ttp import locks, testslots
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _lane_env(monkeypatch)
+    f = locks.try_take(testslots.lane_paths(p.name, 1, ""), f"{p.name}: full checks (run 7, pid 1)", "pytest",
+                       extra={"task": "7"})
+    try:
+        assert _ttp("checks", "--slot-status", "--json") == 0
+        got = json.loads(capsys.readouterr().out)["repos"]
+        assert [(r["repo"], r["name"]) for r in got] == [("", p.root.name)], got
+        assert _ttp("checks", "status") == 0
+        assert f"repository {p.root.name} (not keyed" in capsys.readouterr().out
+    finally:
+        f.close()
+
+
+_DONE_HOLDER = """
+import sys, time
+from pathlib import Path
+from ttp import checklane, testslots
+checklane.HEARTBEAT_S = 3600.0
+g = testslots.suite_hold(sys.argv[1], repo=sys.argv[3], who=sys.argv[4])
+Path(sys.argv[2]).write_text("held")
+while True:
+    time.sleep(1)
+"""
+
+
+def test_a_lane_held_by_a_finished_task_s_check_is_flagged_then_only_its_own_checks_are_stopped(
+        env, tmp_path, monkeypatch, capsys):
+    from ttp import checklane, cli
+    from ttp.daemon import Daemon
+    from ttp.runner import proc_start
+    p = make(env)
+    _lane_env(monkeypatch)
+    tid = p.db.add_task("t", "s", kind="code")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time(), "ok", str(run_dir)))
+    rid = p.db.one("SELECT max(id) AS id FROM runs")["id"]
+    got = tmp_path / "held"
+    proc = subprocess.Popen([sys.executable, "-c", _DONE_HOLDER, p.name, str(got), _LANE_REPO, f"run {rid}"],
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_TASK": str(tid)},
+                            start_new_session=True)
+    try:
+        assert _wait_for(got.exists)
+        d = Daemon(p.base)
+        ev = lambda: p.db.q("SELECT text FROM events WHERE kind='checks_lane_finished'")
+        d.check_checks_owner(every_s=0)
+        assert not ev(), "a running task's lane is left alone"
+        later = time.time() + 400   # 6 min 40 s after the lane was taken and the task ended: past the 5 min flag,
+        p.db.x("UPDATE tasks SET status='done', updated=? WHERE id=?", (time.time(), tid))   # inside the 1 h grace
+        d.check_checks_owner(every_s=0, now=later)
+        d.check_checks_owner(every_s=0, now=later)
+        texts = [r["text"] for r in ev()]
+        assert len(texts) == 1 and f"pid {proc.pid} of task #{tid}" in texts[0] and f"run {rid}" in texts[0], texts
+        assert proc.poll() is None, "flagged inside the grace, not stopped"
+        monkeypatch.setenv("TTP_PROJECT", str(p.base))
+        monkeypatch.chdir(p.root)
+        assert _ttp("checks", "status") == 0
+        out = capsys.readouterr().out
+        assert f"#{tid} run {rid} pid {proc.pid} for full checks" in out and "its task is DONE" in out, out
+        # past the grace: stopped only when the run's checks.pid is that holder
+        h = checklane.finished_holders(p, {"checks": {"done_holder_grace_s": 0}}, later)
+        assert h and h[0]["stop"]
+        (run_dir / cli.CHECKS_PID).write_text(json.dumps({"pid": os.getpid(), "started": proc_start(os.getpid())}))
+        assert checklane.stop_finished(p, h[0]) is None, "another pid is never stopped"
+        (run_dir / cli.CHECKS_PID).write_text(json.dumps({"pid": proc.pid, "started": proc_start(proc.pid)}))
+        r = checklane.stop_finished(p, {**h[0], "run": str(rid + 1000)})
+        assert r is None, "a run that is not the holder's is not used"
+        r = checklane.stop_finished(p, h[0])
+        assert r and r["pgid"] == proc.pid and proc.wait(30) is not None
+    finally:
+        _stop(proc)
+
+
+def test_a_duplicate_and_a_dead_waiter_ahead_of_a_live_one_are_dropped_and_the_live_one_takes_the_lane(
+        env, tmp_path, monkeypatch):
+    from ttp import checkcap, checklane, locks, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.setenv("TTP_TASK", "21")
+    monkeypatch.setattr(locks, "_pid_ns", lambda: "pid:[1]")   # a sandbox's /proc may not tell its namespace
+    tag = " [pidns pid:[1]]"
+    res = testslots._suite_resource("pa", _LANE_REPO)
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    hold = testslots.suite_hold("pa", repo=_LANE_REPO)
+    t0 = time.time() - 600
+    # a dead waiter (its pid is gone) and an older run's wait for the same check of task 21, both first in line
+    dead = locks.enqueue(checkcap.slot_dir(), res, f"task #30 pa: full checks (run 3, pid {gone.pid}){tag}", t0)
+    dead.rename(dead.with_name(f"{t0:.6f}-{gone.pid}"))
+    old_text = f"task #21 pa: full checks (run 4, pid 1) [check abc]{tag}"
+    told, got = [], []
+    w = threading.Thread(target=lambda: got.append(testslots.suite_hold(
+        "pa", repo=_LANE_REPO, check="abc", who="run 5", tell=told.append, wait_s=20)))
+    old = locks.enqueue(checkcap.slot_dir(), res, old_text, t0 + 1)
+    try:
+        w.start()
+        assert _wait_for(lambda: any("dropped a dead waiter" in x for x in told)), told
+        assert not dead.with_name(f"{t0:.6f}-{gone.pid}").exists()
+        assert [t.read_text().split(" [")[0] for t in testslots.suite_order("pa", repo=_LANE_REPO)] == \
+            ["task #21 pa: full checks (run 5, pid %d)" % os.getpid()], "one entry per task and check"
+        kept, arrival, superseded, _ = testslots.waiter_sets(locks.queued(checkcap.slot_dir(), res))
+        assert old in superseded and min(arrival.values()) == pytest.approx(t0 + 1, abs=1), \
+            "the later run keeps the earliest place"
+        hold.close()
+        w.join(10)
+        assert got and got[0].files, "the live waiter took the freed lane"
+        got[0].close()
+    finally:
+        hold.close()
+        locks.dequeue(old)
+
+
+def test_an_older_run_waiting_for_the_same_check_of_its_task_stops_waiting(env, monkeypatch):
+    from ttp import checkcap, locks, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.setenv("TTP_TASK", "21")
+    hold = testslots.suite_hold("pa", repo=_LANE_REPO)
+    res = testslots._suite_resource("pa", _LANE_REPO)
+    newer = locks.enqueue(checkcap.slot_dir(), res, "task #21 pa: full checks (run 9, pid 1) [check abc]")
+    try:
+        with pytest.raises(checkcap.Cancelled, match="superseded"):
+            testslots.suite_hold("pa", repo=_LANE_REPO, check="abc", who="run 5", wait_s=5)
+    finally:
+        locks.dequeue(newer)
+        hold.close()
+
+
+def test_a_waiter_whose_ticket_vanished_queues_again_at_its_place(env, monkeypatch):
+    from ttp import checkcap, locks, testslots
+    _lane_env(monkeypatch)
+    hold = testslots.suite_hold("pa", repo=_LANE_REPO)
+    res = testslots._suite_resource("pa", _LANE_REPO)
+    got = []
+    w = threading.Thread(target=lambda: got.append(testslots.suite_hold("pa", repo=_LANE_REPO, since=1000.0, wait_s=20)))
+    w.start()
+    try:
+        assert _wait_for(lambda: locks.queued(checkcap.slot_dir(), res))
+        t = locks.queued(checkcap.slot_dir(), res)[0]
+        t.unlink()
+        assert _wait_for(lambda: locks.queued(checkcap.slot_dir(), res)), "it queued again"
+        assert locks._arrival(locks.queued(checkcap.slot_dir(), res)[0]) == pytest.approx(1000.0)
+        assert not got, "a vanished ticket never takes a lane past the line"
+    finally:
+        hold.close()
+        w.join(10)
+        got and got[0] and got[0].close()

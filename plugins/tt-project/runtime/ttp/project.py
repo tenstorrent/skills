@@ -512,10 +512,11 @@ def _known_keys(path: list[str]) -> set[str] | None:
         # wrap_cmd: the project's own lock or queue command the commands after `ttp checks --` run
         # behind (push.wrap_of; default "", none); delivery.push_checks never go through it.
         # slots, light_cmds, max_wait_s, wait_event_s, wait_escalate_s, wait_hang_factor, priority_age_s,
-        # test_project_max: the checks lanes (checklane); test_project_slots: the project's test-worker budget
-        # (testslots.project_max).
+        # test_project_max, done_holder_flag_s, done_holder_grace_s: the checks lanes (checklane);
+        # test_project_slots: the project's test-worker budget (testslots.project_max).
         return {"nice", "ionice", "wall_cap_s", "wrap_cmd", "slots", "light_cmds", "max_wait_s", "wait_event_s",
-                "wait_escalate_s", "wait_hang_factor", "priority_age_s", "test_project_max", "test_project_slots"}
+                "wait_escalate_s", "wait_hang_factor", "priority_age_s", "test_project_max", "test_project_slots",
+                "done_holder_flag_s", "done_holder_grace_s"}
     if len(path) == 1 and isinstance(DEFAULT_CONFIG.get(path[0]), dict):
         return set(DEFAULT_CONFIG[path[0]]) | EXTRA_KEYS.get(path[0], set())
     return None
@@ -2190,7 +2191,7 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_sp
                 "checks": {"host_max", "load_extra", "nice", "ionice", "priority_turns", "test_pool", "test_run_max",
                            "test_project_max", "test_project_slots", "build_pool", "build_run_max", "build_project_max", "wall_cap_s",
                            "slots", "light_cmds", "max_wait_s", "wait_event_s", "priority_age_s",
-                           "wait_escalate_s", "wait_hang_factor"}}
+                           "wait_escalate_s", "wait_hang_factor", "done_holder_flag_s", "done_holder_grace_s"}}
 
 
 def layered(raw: dict) -> dict:

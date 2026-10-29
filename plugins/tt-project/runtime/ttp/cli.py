@@ -2523,8 +2523,10 @@ def cmd_checks(a) -> None:
         sys.exit(0 if checkgaps.ready(p, a.gap, getattr(a, "gap_config", None)) else 1)
     if a.result:
         sys.exit(_checks_result(Path(a.result)))
-    if getattr(a, "slot_status", False) or a.cmd in (["status"], ["status", "--json"]):
-        sys.exit(_checks_lane_status(bool(getattr(a, "json", False)) or a.cmd == ["status", "--json"]))
+    if bad := _checks_cmd_error(a):
+        die(f"ttp checks: {bad}")
+    if getattr(a, "slot_status", False) or a.cmd[:1] == ["status"]:
+        sys.exit(_checks_lane_status(bool(getattr(a, "json", False)) or "--json" in a.cmd))
     if getattr(a, "env_ok", None) is not None:
         sys.exit(_checks_env_ok(here(), a.env_ok))
     run_dir = os.environ.get("TTP_RUN_DIR")
@@ -3458,6 +3460,35 @@ def _checks_report_joined(me: Path | None, run_dir: Path, out, joined: tuple, he
     die(f"ttp checks: {line}", 1)
 
 
+_CHECKS_STATUS_FLAGS = ("--json", "--slot-status")
+
+
+def _checks_cmd_error(a) -> str:
+    """Why `ttp checks`'s words are no check to run, or "": its one subcommand is `status` (flags
+    --json, --slot-status, nothing else); --slot-status takes no command; check commands go after `--`,
+    and without it only a quoted shell string or an executable on PATH runs. An unknown subcommand or
+    flag is refused, never queued as a check."""
+    cmd = list(a.cmd or [])
+    if cmd[:1] == ["status"]:
+        extra = [w for w in cmd[1:] if w not in _CHECKS_STATUS_FLAGS]
+        return (f"`status` takes only {', '.join(_CHECKS_STATUS_FLAGS)}; unknown: {' '.join(extra)}" if extra else "")
+    if getattr(a, "slot_status", False):
+        return f"--slot-status runs nothing and takes no command; got: {' '.join(cmd)}" if cmd else ""
+    if not cmd or cmd[0] == "--":
+        return ""
+    first = cmd[0]
+    if first.startswith("-"):
+        return f"unknown flag {first}; check commands go after `--` (ttp checks -- 'pytest -q')"
+    try:
+        words = shlex.split(first)
+    except ValueError:
+        words = [first]
+    if len(words) > 1 or (words and (shutil.which(words[0]) or "/" in words[0] or "=" in words[0])):
+        return ""
+    return (f"unknown subcommand {first!r} (the only one is `status`); check commands go after `--` "
+            f"(ttp checks -- 'pytest -q')")
+
+
 def _checks_lane_status(as_json: bool) -> int:
     """`ttp checks status` (also --slot-status): the project's checks lanes, their holders and waiters
     (checklane.lane_status). Read only: it never queues, takes or writes a lock, or starts a check."""
@@ -3470,14 +3501,16 @@ def _checks_lane_status(as_json: bool) -> int:
     here_repo = testslots.repo_key(top) if top else ""
     from . import checkjoin, checkspill
     followers = checkjoin.status_lines(p.state)   # joined or superseded waiters: they run no suite of their own
+    names = {"": p.root.name, **({here_repo: testslots.repo_name(top) or here_repo} if here_repo else {})}
     if as_json:
         print(json.dumps({"project": p.name, "slots": checklane.slots(p.config()),
                           "project_max": checklane.project_cap(p.config()), "this_repo": here_repo,
-                          "repos": checklane.lane_status(p.name, cfg=p.config()), "spilled": checkspill.holders(p.name),
+                          "repos": checklane.lane_status(p.name, cfg=p.config(), names=names, db=p.db),
+                          "spilled": checkspill.holders(p.name),
                           "followers": [x.strip() for x in followers]},
                          indent=2))
     else:
-        print(checklane.status_text(p.name, p.config(), here_repo))
+        print(checklane.status_text(p.name, p.config(), here_repo, names=names, db=p.db))
         for line in checkspill.status_lines(p.name):
             print(f"  {line}")
         if followers:
@@ -3612,7 +3645,10 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                                     slots=n, repo=key,
                                     cost=checklane.cost(p.state if p else None, _commands_hash(cmds), cmds, cfg),
                                     max_wait=checklane.max_wait_s(cfg) if key == repo else 0.0,
-                                    state=p.state if p else None, what=what, age=checklane.priority_age_s(cfg), **lane)
+                                    state=p.state if p else None, what=what, age=checklane.priority_age_s(cfg),
+                                    check=f"{head[:12]}.{_commands_hash(cmds)[:12]}",
+                                    repo_name=testslots.repo_name(top) if p and key == repo and not lane.get("lock") else "",
+                                    **lane)
     try:
         if kept is not None:
             suite, kept = kept, None
