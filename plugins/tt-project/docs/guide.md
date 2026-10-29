@@ -928,7 +928,7 @@ queues behind routine work; nothing running is interrupted:
   rest are recorded `coalesced` and show in the digest and `ttp status`. The incident wakes it again only when
   a decision is due: its longest wait passes `checks.wait_escalate_s` (default 7200, then once per as long
   again; 0 never), a holder has run `checks.wait_hang_factor` (default 3, 0 never) times the recent median
-  checks run (a likely hang), or a holder's task has ended. An `observation_mute` on source
+  checks run (a likely hang), or a holder's task has ended (a review precheck: once no review reading it is open). An `observation_mute` on source
   `daemon:checks_slot_wait` covers these events too (recorded `muted`); coalescing already keeps a long queue
   to one wake, so a mute is only for a queue the coordinator has already decided to leave alone.
   `delivery.checks_spill_hosts` (an ordered list of ssh aliases, default empty: checks never leave this machine)
