@@ -437,7 +437,7 @@ def test_no_spill_hosts_keeps_todays_wait_and_unspillable_checks_never_spill(env
     p.set_config("delivery.push_checks", ["true"])
     limits = []
 
-    def take(*args):
+    def take(*args, **kw):
         limits.append(args[6])
         return checkcap.Slot()
     monkeypatch.setattr(cli, "_checks_slot_take", take)
