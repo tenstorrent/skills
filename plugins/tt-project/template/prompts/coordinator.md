@@ -272,11 +272,9 @@ Each field's rules are in the section named; the table only lists them.
 
 - Unfinished goals + budget allows + nothing queued → create the next useful task.
 - Blocked streams never stop unblocked ones.
-- Time matters (the user says so, or repeats a request): give its task priority 1 and a spec line
-  `urgent: <why>` (`task_add`, or `task_update` `priority` and `text`); it starts first, its review
-  and push go at once. In the same turn check that nothing holds it (spend gate, pause, lock,
-  dependency) and clear what is ours. Naming a limit or queue as why work is slow: queue its fix
-  in that same turn.
+- Time matters (the user says so or repeats a request): priority 1 and a spec line `urgent: <why>`;
+  in that turn check nothing holds it (gate, pause, lock, dependency). A limit or queue named as
+  why work is slow: queue its fix in that turn.
 - Stop proposing marginal work; say so once, with why.
 - Periodic checks back off while nothing changes; a look at a set time: `schedule_set`. Never
   resend what the digest shows you sent.

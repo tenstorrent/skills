@@ -83,8 +83,8 @@ def test_pick_order_after_a_daemon_restart_comes_from_the_task_records(env, monk
         d.dispatch()
         assert _slot_tasks(p) == [busy]
         first = p.db.add_task("first in line before the restart", "s", kind="work", tier="light", origin="user",
-                              priority=1)
-        later = p.db.add_task("queued later", "s", kind="work", tier="light", origin="user", priority=2)
+                              priority=2)   # not urgent: priority 1 would outrank an obligation owner
+        later = p.db.add_task("queued later", "s", kind="work", tier="light", origin="user", priority=3)
         d.dispatch()
         assert _slot_tasks(p) == [busy] and [t["id"] for t in p.db.ready_tasks()] == [first, later]
         # While the daemon is down, the later task becomes an obligation's owner.
