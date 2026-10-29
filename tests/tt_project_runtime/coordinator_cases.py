@@ -9703,7 +9703,8 @@ def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are
     # +240: the urgent-lane rule (time matters: priority 1, an `urgent:` line, check nothing holds it)
     # +30: a hold on only until:/when: is stored as start_after/start_when
     # +150: a speed complaint's measured throughput section is reported with its numbers, never prose only
-    assert len(role) <= 34_180, len(role)
+    # +190: a reply naming a cause of waiting queues its fix in the same batch (causefix)
+    assert len(role) <= 34_370, len(role)
     assert "<!-- ttp:" not in role and "<!-- /ttp:" not in role
     assert role in coord.prompt_parts(p)[0]
     # Rules for features that are off are left out; turning one on brings its rules in.

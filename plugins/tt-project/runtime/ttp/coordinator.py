@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, cells, chaincap, chainprio, chatset, checkspill, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, relay, responsibilities, restriction_audit, reviewcap, selfreview, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, throughmute, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, causefix, cells, chaincap, chainprio, chatset, checkspill, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, relay, responsibilities, restriction_audit, reviewcap, selfreview, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, throughmute, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -961,6 +961,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     if missed := correction.digest_lines(db, now):
         course_lines = (course_lines or [course.HEADER]) + missed
         course_id += "\ncorrection:" + missed[0].split(" pointed out")[0]
+    if unfixed := causefix.digest_lines(db, now):
+        course_lines = (course_lines or [course.HEADER]) + unfixed
+        course_id += "\ncausefix:" + unfixed[0].split(" | ")[0]
     section("course_check", course_lines, course_id,
             f"## Course check: {len(course_lines) - 1} lines (as last turn; correct course or say why it is fine)")
     prog_lines, prog_id = progress.digest_lines(db, now)
@@ -1845,6 +1848,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 attaching |= {(str(a["key"]).strip(), int(x)) for x in a.get("owners") or []}
         except (TypeError, ValueError):
             pass   # the action itself is refused with its reason when it is applied
+    failed: set[int] = set()   # indexes of refused actions (causefix: a refused fix is no fix)
     for k, (i, a) in enumerate(order):
         t = a.get("type")
         key = f"{turn}.{i}" if turn is not None else None
@@ -2789,6 +2793,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             else:
                 raise ValueError(f"unknown action {t!r}")
         except Exception as e:   # one bad action is reported back; it never aborts the turn
+            failed.add(i)
             sent_as = f"; {GATE_MARK}: {json.dumps(order[k][1], ensure_ascii=False, default=str)}" \
                 if isinstance(e, DraftGateRejection) else ""
             problems.append(f"{t}: {e}{sent_as}"[:RESEND_CHARS] if sent_as else f"{t}: {e}")
@@ -2820,6 +2825,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
         notes += obligations.record_promises(p, sent, batch_tasks, batch_obls, explicit=explicit)
     except Exception as e:
         notes.append(f"promise not recorded: {type(e).__name__}: {str(e)[:200]}")
+    try:   # flag only: a reply naming a cause of slowness with no fix in this batch (causefix)
+        causefix.check(db, [(mid, "reply" if mid in replies else "notify", text) for mid, _, text in sent],
+                       [a for i, a in enumerate(actions) if i not in failed and isinstance(a, dict)], turn=turn)
+    except Exception as e:
+        notes.append(f"cause check not recorded: {type(e).__name__}: {str(e)[:200]}")
     db.set_kv(NOTES_KEY, notes)
     # Rejections go back to the coordinator in its next digest, never into the user's chat: a reply
     # already sent is corrected there by the coordinator itself, only when it told the user otherwise.
