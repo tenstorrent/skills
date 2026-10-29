@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import detach, netwait, timefmt
+from . import detach, netwait, probespawn, timefmt
 from .detach import failed_check
 from .project import Project, command_env, durable_append, durable_write, output_tail
 
@@ -489,10 +489,18 @@ class Ends:
         stop_probes(self._procs, self._errs)
 
 
-def spawn_probe(p: Project, probe: str, errs: dict[int, Any], stdout: bool = False) -> subprocess.Popen:
+def spawn_probe(p: Project, probe: str, errs: dict[int, Any], stdout: bool = False) -> probespawn.Pending:
     """Start shell probe `probe` in a session of its own, in its project's context (cwd p.root,
-    project.command_env). Its stderr (with `stdout`, its stdout too) goes to a file in `errs` (a pipe
-    nobody reads could fill)."""
+    project.command_env), off the caller's thread (probespawn: opening its file or forking can stall).
+    Its stderr (with `stdout`, its stdout too) goes to a file (a pipe nobody reads could fill), read
+    through `errs` (_err_tail). A probe that cannot start polls "could not start"."""
+    proc = probespawn.Pending(probe, cwd=str(p.root), env=command_env(p), stdout=stdout)
+    errs[id(proc)] = proc
+    return proc
+
+
+def _spawn_now(p: Project, probe: str, errs: dict[int, Any], stdout: bool = False) -> subprocess.Popen:
+    """spawn_probe on the caller's thread, for a caller that waits on the probe anyway (probe_once)."""
     err = tempfile.TemporaryFile()
     try:
         proc = subprocess.Popen(probe, shell=True, cwd=str(p.root), env=command_env(p), stdin=subprocess.DEVNULL,
@@ -509,7 +517,7 @@ def probe_once(p: Project, probe: str, timeout_s: float) -> tuple[Any, str]:
     (its exit code, "timeout" (killed) or "cannot run: <why>", its output tail)."""
     errs: dict[int, Any] = {}
     try:
-        proc = spawn_probe(p, probe, errs, stdout=True)
+        proc = _spawn_now(p, probe, errs, stdout=True)
     except OSError as e:
         return f"cannot run: {e}", ""
     try:
@@ -527,6 +535,8 @@ def probe_once(p: Project, probe: str, timeout_s: float) -> tuple[Any, str]:
 def _err_tail(errs: dict[int, Any], proc: subprocess.Popen) -> str:
     """The bounded end of a finished probe's stderr, once (its file is closed after)."""
     f = errs.pop(id(proc), None)
+    if isinstance(f, probespawn.Pending):
+        f = f.take_file()
     if f is None:
         return ""
     try:
@@ -608,13 +618,9 @@ def stop_probes(procs: dict, errs: dict[int, Any]) -> None:
     procs.clear()
 
 
-def _kill(proc: subprocess.Popen) -> None:
-    """A probe runs in a session of its own: end it and whatever it started."""
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-        proc.wait(timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        pass
+def _kill(proc) -> None:
+    """A probe runs in a session of its own: end it and whatever it started (probespawn.kill)."""
+    probespawn.kill(proc)
 
 
 # digest -------------------------------------------------------------------------------------------

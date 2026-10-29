@@ -8998,6 +8998,9 @@ def test_a_start_when_probe_that_cannot_start_raises_an_event(env, monkeypatch):
     def refuse(*a, **k):
         raise OSError("no shell")
     monkeypatch.setattr(dmod.subprocess, "Popen", refuse)
+    d.probe_waiting()   # its start runs off the tick (probespawn); the next tick reads its verdict
+    for proc, _, _ in list(d._probes.values()):
+        assert proc.started.wait(10)
     d.probe_waiting()
     assert len(_events(p, tid, "deferral_probe_broken")) == 1 and not _ready(p, tid)
 

@@ -45,6 +45,7 @@ from . import redact
 from . import replica
 from . import schedlog
 from . import throughmute
+from . import probespawn
 from . import replymsg
 from . import msgparts
 from . import awake
@@ -8714,21 +8715,11 @@ class Daemon:
             if other != tid and got[2] == probe and now - got[1] < PROBE_EVERY_S:
                 self._probe_rc[tid] = got
                 return
-        out = None
-        try:
-            # Its output (the blocking gate's last word) goes to a file: a pipe nobody reads could fill.
-            out = tempfile.TemporaryFile()
-            proc = subprocess.Popen(landed.probe_command(probe, self.p), shell=True, cwd=str(self.p.root),
-                                    stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
-                                    start_new_session=True, env=self._probe_env())
-        except OSError as e:
-            if out:
-                out.close()
-            log(self.p, f"task {tid} {what} probe could not start: {e}")
-            self._probe_rc[tid] = ("could not start", now, probe)
-            return
+        # Its output (the blocking gate's last word) goes to a file: a pipe nobody reads could fill. Opening
+        # that file and forking run off the tick (probespawn): either can stall when /tmp's file system does.
+        proc = probespawn.Pending(landed.probe_command(probe, self.p), cwd=str(self.p.root), env=self._probe_env())
         self._probes[tid] = (proc, now, probe)
-        self._probe_files[id(proc)] = out
+        self._probe_files[id(proc)] = proc
 
     def _probe_text(self, proc) -> str:
         """The end of a finished probe run's output, once (its file is closed after)."""
@@ -8737,6 +8728,8 @@ class Daemon:
     def _probe_texts(self, proc) -> tuple[str, str]:
         """_probe_text, and the output's last non-empty line (waitheal.last_line) for a wait note."""
         f = self._probe_files.pop(id(proc), None)
+        if isinstance(f, probespawn.Pending):
+            f = f.take_file()
         if f is None:
             return "", ""
         try:
@@ -12864,11 +12857,9 @@ def _current_probe(task: dict) -> str | None:
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except OSError:
-        pass
-    proc.wait()
+    """Kill proc's session, waiting at most probespawn.KILL_WAIT_S for it (one stuck in the kernel must
+    not hold the tick)."""
+    probespawn.kill(proc)
 
 
 def _read_pid(path: Path) -> int | None:
