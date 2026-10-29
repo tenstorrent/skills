@@ -705,6 +705,19 @@ queues behind routine work; nothing running is interrupted:
 - Waiting lists: resource reservations, `ttp lock` waiters and device runner queues serve urgent
   waiters first. Held locks, holds, pauses and recovery owners stay as they are.
 - `ttp status` and the web app mark urgent tasks with how long each has waited.
+- Start gates: an urgent task whose dependencies are met never sleeps on a convenience gate. Its
+  `start_after`, `start_when` or `landed:#<id>` chain stays only when the gate's `why` (or the probe)
+  names a safety class: data loss, a spend cap or provider window, a shared device or machine (lock,
+  hold, pause, a lull for a restart, upgrade, reboot or power cycle), a charter Restriction, another
+  person's work, the user's word (a `test -e <dir>/user-<x>` probe), or a real dependency on another
+  task's new file or symbol. task_add and task_update drop any other gate at once and say so in their
+  reply note; a kept gate records its class in the `start_safety:<class>` label. Each tick, a
+  model-free sweep applies the same rule to queued tasks parked earlier (one low observation each, no
+  coordinator wake). An urgent task held by a kept gate for 10 minutes while a slot is free raises one
+  event naming the gate. `urgent: no` (or none, false, n/a) is not urgent.
+- Reviews: a queued review whose only unmet dependencies are checks or suite tasks of the change it
+  reviews runs beside them (one low observation), unless its spec reads that task's output (`#<id>`
+  and output, result, log or report on one line).
 
 ## Parallel work
 

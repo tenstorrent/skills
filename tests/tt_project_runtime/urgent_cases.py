@@ -15,7 +15,9 @@ def test_a_task_is_urgent_at_priority_one_or_with_an_urgent_spec_line_only():
               {"priority": 3, "spec": "this is not urgent: really"},   # not at the line's start
               {"priority": 3, "spec": "urgent:\nnext line"},           # no reason given
               {"priority": 3, "spec": "urgent:   \n"},
-              {"priority": 3, "spec": "urgently: soon"}):
+              {"priority": 3, "spec": "urgently: soon"},
+              {"priority": 3, "spec": "urgent: no. parallel: runs beside other work"},   # says it is not
+              {"priority": 3, "spec": "Urgent: None"}, {"priority": 3, "spec": "urgent: n/a"}):
         assert not urgent.is_urgent(t), t
         assert urgent.why(t or {}) == "", t
     assert urgent.extra_slots({}) == 1 and urgent.extra_slots({"budget": {"urgent_extra_slots": 0}}) == 0

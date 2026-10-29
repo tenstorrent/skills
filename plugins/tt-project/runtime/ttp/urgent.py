@@ -26,7 +26,8 @@ from __future__ import annotations
 import re
 
 PRIORITY = 1                    # a task at this priority or better is urgent
-LINE = re.compile(r"^[ \t]*urgent:[ \t]*(\S.*)$", re.I | re.M)   # a spec line `urgent: <why>`
+# A spec line `urgent: <why>`; `urgent: no` (none, not, false, n/a) says it is not.
+LINE = re.compile(r"^[ \t]*urgent:[ \t]*(?!(?:no|none|not|false|n/?a)\b)(\S.*)$", re.I | re.M)
 EXTRA_SLOTS = 1                 # default of budget.urgent_extra_slots
 WAIT_S = 600                    # an urgent task in review this long raises review_stall
 
