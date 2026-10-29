@@ -19,11 +19,12 @@ FILE = "scheduler.jsonl"
 OLD = "scheduler.1.jsonl"
 MAX_BYTES = 2 * 1024 * 1024
 TOP = 20
-# Why a queued task could not start: its start_when probe, its start_after or retry timer (not_before),
-# a busy resource or `ttp lock` (device slots too), a pause or hold (a paused resource, a branch or
-# worktree another task uses, a setting hold, the disk guard, a review's prechecks), its provider's gate
-# (logged out, API host down, budget gate), an unfinished depends_on, or anything else.
-REASONS = ("start_when", "start_after", "lock", "hold", "provider_gate", "depends_on", "other")
+# Why a queued task could not start: its start_when probe, its start_after or another start timer
+# (not_before), its own retry_when wait (a waiting hand-off's timer), a busy resource or `ttp lock`
+# (device slots too), a pause or hold (a paused resource, a branch or worktree another task uses, a
+# setting hold, the disk guard, a review's prechecks), its provider's gate (logged out, API host down,
+# budget gate), an unfinished depends_on, or anything else.
+REASONS = ("start_when", "start_after", "retry_when", "lock", "hold", "provider_gate", "depends_on", "other")
 
 
 def path(p) -> Path:

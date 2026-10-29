@@ -7176,8 +7176,7 @@ class Daemon:
         rest = [r for r in db.q("SELECT * FROM tasks WHERE status='queued'") if r["id"] not in seen]
         unmet = db.unmet_dependencies(rest) if rest else {}
         for r in rest:
-            held["start_after" if (r["not_before"] or 0) > ctx["now"] else "start_when" if "when" in deferral(r)
-                 else "depends_on" if unmet.get(r["id"]) else "other"] += 1
+            held[_queued_held_by(r, ctx["now"], unmet.get(r["id"]))] += 1
         schedlog.record(schedlog.path(self.p), schedlog.entry(free, runnable, held, picked, ctx["now"]),
                         self.__dict__.setdefault("_schedlog", {}), lambda msg: log(self.p, msg))
 
@@ -13782,6 +13781,24 @@ def _stale_wakes(prev: dict, key: dict, escalate: bool) -> int:
     if not isinstance(before, dict):
         before = {"key": _wait_key(prev), "head": key.get("head")}   # a hand-off from before this was kept
     return n + 1 if before.get("key") == key.get("key") and before.get("head") == key.get("head") else 0
+
+
+def _queued_held_by(task: dict, now: float, unmet) -> str:
+    """The schedlog reason a queued task dispatch did not walk is held by: a start_after still ahead,
+    then its start_when probe (a not_before set only as the probe's backoff stays start_when), then
+    its own retry_when wait (a waiting hand-off's timer), then any other timer (start_after), an
+    unfinished depends_on, or other."""
+    d = deferral(task)
+    if (d.get("after") or 0) > now:
+        return "start_after"
+    if d.get("when"):
+        return "start_when"
+    if (task["not_before"] or 0) > now:
+        prev = load_result(task["result"])
+        probe = prev.get("retry_when")
+        own = prev.get("status") == "waiting" and isinstance(probe, str) and probe.strip()
+        return "retry_when" if own else "start_after"
+    return "depends_on" if unmet else "other"
 
 
 def _retry_s(result: dict) -> float:

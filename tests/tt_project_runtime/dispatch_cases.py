@@ -765,6 +765,33 @@ def test_idle_slot_fills_with_nothing_changed_add_no_scheduler_line_even_after_a
     assert {k: v for k, v in lines[1]["held"].items() if v} == {"start_when": 1, "start_after": 1, "depends_on": 1}
 
 
+def test_a_slot_fill_files_a_retry_when_wait_under_retry_when_not_start_after(env, monkeypatch, tmp_path):
+    """The held counts tell a task's own retry_when timer from a planned start: a waiting hand-off's
+    not_before is retry_when; a start_when task whose not_before is only its probe's backoff (its
+    start_after over) is start_when; a start_after still ahead is start_after, start_when or not, and
+    so is a bare start timer that is no retry_when wait."""
+    from ttp.db import dump_result
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
+    start = time.time()
+    monkeypatch.setattr(time, "time", lambda: start + 600)
+    wait = dump_result({"status": "waiting", "retry_when": "false", "waiting_since": start})
+    try:
+        _sched_held(p, "own wait", not_before=start + 3600, result=wait)
+        _sched_held(p, "own wait, timer up", not_before=start + 900, result=wait)
+        _sched_held(p, "probe backoff", not_before=start + 900,
+                    labels=json.dumps(["start_when:false", f"start_after:{start:.0f}"]))
+        _sched_held(p, "planned", not_before=start + 7200, labels=json.dumps([f"start_after:{start + 7200:.0f}"]))
+        _sched_held(p, "planned, then probe", not_before=start + 7200,
+                    labels=json.dumps(["start_when:false", f"start_after:{start + 7200:.0f}"]))
+        _sched_held(p, "start timer", not_before=start + 3600)
+        d.dispatch()
+        line, = _sched_lines(p)
+        assert line["picked"] == [] and line["runnable"] == []
+        assert {k: v for k, v in line["held"].items() if v} == {"retry_when": 2, "start_when": 1, "start_after": 3}, line
+    finally:
+        drain(d)
+
+
 def test_the_scheduler_log_rotates_under_its_cap_and_keeps_one_old_copy(tmp_path, monkeypatch):
     from ttp import schedlog
     monkeypatch.setattr(schedlog, "MAX_BYTES", 2000)
