@@ -214,6 +214,8 @@ def _pid_note(h: dict) -> str:
     if (got := _foreign_pid(h)) is None:
         return f", pid {pid}"
     here, why = got
+    if why == TAKER:
+        return f", pid {pid} (from another PID namespace; its taker is pid {here} here) alive"
     return (f", pid {pid} (from another PID namespace; pid {here} here) alive" if here else
             f", pid {pid} (from another PID namespace, which no longer has it) gone" if here == 0 else
             f", pid {pid} (from another PID namespace, not meaningful here; alive unknown: {why})")
@@ -237,6 +239,7 @@ def pid_alive(h: dict) -> bool | None:
 
 UNVERIFIABLE = "is a kernel thread here: holder unverifiable"   # a label from a taker in another PID namespace
 _PROC = "/proc"
+TAKER = "taker"   # _foreign_pid's why for a label judged through its taker's own pid (ns_pid) in this namespace
 
 
 def _foreign_pid(h: dict) -> tuple[int | None, str] | None:
@@ -245,10 +248,18 @@ def _foreign_pid(h: dict) -> tuple[int | None, str] | None:
     namespace still has processes but none with that pid, or (None, why) when this cannot tell (its
     namespace has no process visible from here: one beside or above this one). None for any other label
     (this host and namespace, another host, or a side that cannot tell its namespace). Only held slots
-    are judged, so a namespace with nothing visible holds the slot from where this cannot see."""
+    are judged, so a namespace with nothing visible holds the slot from where this cannot see. A taker
+    that named its run's agent (taker: in a sandbox) and shares this namespace is judged by its own pid
+    there (ns_pid): alive is (that pid, TAKER); gone proves nothing, the agent may live on."""
     ns, mine = h.get("pidns"), _pid_ns()
     if h.get("node") != os.uname().nodename or not ns or not isinstance(ns, str) or not mine or ns == mine:
         return None
+    try:
+        own = int(h.get("ns_pid") or 0) if h.get("ns_pidns") == mine else 0
+    except (TypeError, ValueError):
+        own = 0
+    if own > 0 and not kthread(own, _PROC) and _alive(own):
+        return own, TAKER
     try:
         pid, names = int(h.get("pid") or 0), os.listdir(_PROC)
     except (OSError, TypeError, ValueError) as e:
@@ -296,18 +307,82 @@ def _worker_note(run: dict, run_id) -> tuple[str, bool]:
     return f", pid {wp} {'alive' if live else 'gone'} (run {run_id}'s worker)", live
 
 
-def _holder_note(h: dict, where=None) -> str:
+_BEAT_STALE_S = 180   # as the daemon's LEASE_STALE_S: a run's lease or keeper's beat older than this proves nothing
+
+
+def _through_run(h: dict, lbl: dict, run: dict | None) -> tuple[bool | None, str]:
+    """Whether the holder pid of a label lives when it is another PID namespace's and none of that
+    namespace's processes is visible here (a probe in one sandbox, the holder on the host or in another
+    sandbox), judged through what the label's run keeps in its folder, which every namespace on this host
+    reads: a keeper of detached jobs (via "keeper") lives while its run's hold.json names it, still
+    holding, and its hold.beat is fresh, and is gone once that record ended the hold; a run's agent
+    (child.pid) or supervisor (runner.pid) lives while the run's lease is fresh, and the agent is gone once
+    the run wrote exit.json. A stale beat or lease alone never makes it gone (the slot is still held).
+    (verdict, how) with verdict None and how naming the route tried and why it cannot tell."""
+    from . import hold
+    from .runner import same_boot
+    if not run or not run.get("dir"):
+        return None, f"no record of run {lbl['run']} to judge it through"
+    if not same_boot(run.get("boot_id")):
+        return None, f"run {lbl['run']} was recorded on an earlier boot"
+    rd, r = Path(run["dir"]), lbl["run"]
+    try:
+        pid = int(h.get("pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+
+    def age(name: str) -> float | None:
+        try:
+            return max(0.0, time.time() - (rd / name).stat().st_mtime)
+        except OSError:
+            return None
+
+    def first(name: str) -> int:
+        try:
+            return int((rd / name).read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            return 0
+
+    if h.get("via") == "keeper":
+        rec = hold.read(rd) or {}
+        if rec.get("keeper") != pid:
+            return None, f"run {r}'s hold record names no keeper pid {pid}"
+        if rec.get("state") != "holding":
+            return False, f"run {r}'s keeper ended its hold ({rec.get('state') or 'no state'})"
+        a = age(hold.BEAT)
+        if a is not None and a <= _BEAT_STALE_S:
+            return True, f"run {r}'s keeper beat {int(a)} s ago"
+        return None, f"run {r}'s keeper beat is " + ("missing" if a is None else f"{int(a)} s old")
+    if pid > 0 and pid == first("child.pid"):
+        if (rd / "exit.json").exists():
+            return False, f"run {r}'s agent exited"
+        who = "agent"
+    elif pid > 0 and pid == first("runner.pid"):
+        who = "supervisor"
+    else:
+        return None, f"pid {pid} is not run {r}'s agent, supervisor or keeper"
+    a = age("lease")
+    if a is not None and a <= _BEAT_STALE_S:
+        return True, f"run {r}'s {who}, its lease renewed {int(a)} s ago"
+    return None, f"run {r}'s {who}, its lease is " + ("missing" if a is None else f"{int(a)} s old")
+
+
+def _holder_note(h: dict, where=None, verdict: dict | None = None) -> str:
     """What follows a holder's label and since when in a busy or wait line: its pid and whether it lives
     (_pid_note), never nothing. Where `where` is the holder's project, a task's hold is looked up in its
     run record: one with no pid in its label (from before pids) names its run's worker pid instead, else
     "pid unknown" and whether the run is still active or ended; the keeper of a task's detached jobs also
     names each job's own pid and whether it still runs. A hold whose task is done and that has no live
     pid (its own, its run's worker or a job's) is marked stale: it is not a live holder, though the lock
-    stays taken until whatever process has its file open lets go."""
+    stays taken until whatever process has its file open lets go. A pid of another PID namespace this one
+    cannot see is judged through its run (_through_run); `verdict`, when given, gets that answer as
+    "alive"."""
     from . import detach, hold
     from .project import Project
     note, lbl = _pid_note(h), hold.parse(h.get("holder"))
     if not isinstance(where, Project) or not lbl or lbl["project"] not in (None, where.name):
+        if "alive unknown: " in note:
+            note = note.removesuffix(")") + "; no run of this project's to judge it through)"
         return (note or ", pid unknown") + _job_note(h)
     try:   # an unreadable database or a run id that is not a number: only what the label says
         run = where.db.one("SELECT pid, status, dir, boot_id, note FROM runs WHERE id=?", (int(lbl["run"]),))
@@ -316,6 +391,16 @@ def _holder_note(h: dict, where=None) -> str:
         run = task = None
     live = note.endswith(" alive")
     unknown = "alive unknown: " in note   # another PID namespace's, not judged dead
+    if unknown:   # none of that namespace is visible here: what its run keeps on disk says
+        alive, how = _through_run(h, lbl, run)
+        if alive is None:
+            note = note.removesuffix(")") + f"; {how})"
+        else:
+            note = f", pid {h.get('pid')} (from another PID namespace, not visible here; {how}) " \
+                   + ("alive" if alive else "gone")
+            unknown, live = False, alive
+            if verdict is not None:
+                verdict["alive"] = alive
     if UNVERIFIABLE in note:   # its run's worker says instead; with none to ask, neither alive nor dead
         unknown = not (run and int(run.get("pid") or 0) > 0)
         if not unknown:
@@ -487,8 +572,9 @@ def holder_records(paths: list[Path], where=None) -> list[dict]:
     out += [(h, True) for h in (shared_holders(paths) if paths else []) if isinstance(h, dict)]
     recs = []
     for h, sh in out:
-        note = _holder_note(h, where)
-        recs.append({**h, "shared": sh, "alive": pid_alive(h), "note": note.removeprefix(", "),
+        got: dict = {}
+        note = _holder_note(h, where, got)
+        recs.append({**h, "shared": sh, "alive": got.get("alive", pid_alive(h)), "note": note.removeprefix(", "),
                      "stale": "; stale: " in note})
     return recs
 

@@ -964,7 +964,8 @@ def test_lock_probe_judges_a_pid_from_another_pid_namespace_through_that_namespa
             held.flush()
             rec = locks.holder_records(paths, p)[0]
             assert rec["alive"] is alive and rec["stale"] is (alive is False), (name, rec)
-            assert rec["note"].startswith(note.removeprefix(", ")), (name, rec)
+            assert rec["note"].startswith(note.removeprefix(", ").removesuffix(")")), (name, rec)
+            assert alive is not None or rec["note"].endswith("; no record of run 99 to judge it through)"), rec
         # A side that cannot tell its own namespace judges nothing, as before.
         monkeypatch.setattr(locks, "_pid_ns", lambda: None)
         assert locks._pid_note(foreign) == ", pid 2" and locks.pid_alive(foreign) is None
@@ -1011,3 +1012,140 @@ def test_lock_probe_sees_a_sandboxed_keeper_alive_then_gone(env, tmp_path):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
+
+
+def _foreign_run(p, task, run_id):
+    """A running run row of `task` whose folder is a temp dir, recorded on this boot: what a sandboxed probe
+    judges a foreign holder through."""
+    from ttp import runner
+    rd = p.runs / str(run_id)
+    rd.mkdir(parents=True, exist_ok=True)
+    p.db.x("INSERT INTO runs(id,task,role,provider,status,started,dir,boot_id) VALUES(?,?,'worker','claude','running',?,?,?)",
+           (run_id, task, time.time(), str(rd), runner.boot_id()))
+    return rd
+
+
+def _label(held, fields):
+    held.seek(0)
+    held.truncate()
+    held.write(json.dumps({"since": time.time(), "command": "x", **fields}))
+    held.flush()
+
+
+def test_lock_probe_in_a_sandbox_judges_an_unseen_foreign_holder_through_its_run(env, tmp_path, monkeypatch):
+    """A probe inside one sandbox sees none of the holder's PID namespace (the host's, or another sandbox's):
+    it judges the holder through its run's folder instead of 'alive unknown'. A keeper lives while its
+    hold.json names it, holding, with a fresh hold.beat, and is gone once the record ended the hold; a run's
+    agent (child.pid) lives while the run's lease is fresh and is gone once exit.json exists. A stale beat or
+    lease, a pid the run does not name, no run record or a holder outside this project stay unknown with the
+    route tried, and never make a done task's hold stale. A taker that shares the probe's namespace is judged
+    by its own pid (ns_pid)."""
+    from ttp import hold, locks
+    me = os.uname().nodename
+    monkeypatch.setattr(locks, "_PROC", str(_fake_pidns_proc(tmp_path / "proc", [(4322, "pid:[5]", "4322 2", "S")])))
+    p = make(env)
+    t = p.db.add_task("holder", "s", kind="work", origin="user")
+    p.db.update_task(t, status="done")
+    rd = _foreign_run(p, t, 77)
+    held = _held_build_lock(p, "build-a", "x")
+    paths = [pathlib.Path(held.name)]
+    foreign = {"node": me, "pidns": "pid:[999]"}
+    keeper = {"holder": f"task #{t} (run 77), detached jobs", "pid": 4242, "via": "keeper", "taker_pid": 9, **foreign}
+    agent = {"holder": f"task #{t} (run 77)", "pid": 4243, **foreign}
+
+    def probe(fields):
+        _label(held, fields)
+        rec = locks.holder_records(paths, p)[0]
+        return rec["alive"], rec["stale"], rec["note"], locks.holders_now(paths, p)[0]
+
+    old = time.time() - 600
+    try:
+        hold._write(rd, {"task": str(t), "run": "77", "state": "holding", "keeper": 4242, "jobs": []})
+        (rd / hold.BEAT).touch()
+        alive, stale, note, line = probe(keeper)
+        assert alive is True and not stale, note
+        assert note.startswith("pid 4242 (from another PID namespace, not visible here; run 77's keeper beat ")
+        assert note.split(";")[1].endswith(" alive") and "alive unknown" not in line and "stale" not in line, line
+        os.utime(rd / hold.BEAT, (old, old))   # a stale beat: unknown, never gone
+        alive, stale, note, _ = probe(keeper)
+        assert alive is None and not stale and "alive unknown: " in note and "run 77's keeper beat is 6" in note, note
+        (rd / hold.BEAT).unlink()
+        assert "run 77's keeper beat is missing" in probe(keeper)[2]
+        hold._write(rd, {"task": str(t), "run": "77", "state": "holding", "keeper": 1111, "jobs": []})
+        alive, stale, note, _ = probe(keeper)
+        assert alive is None and not stale and "hold record names no keeper pid 4242" in note, note
+        hold._write(rd, {"task": str(t), "run": "77", "state": "released", "keeper": 4242, "jobs": []})
+        alive, stale, note, _ = probe(keeper)
+        assert alive is False and stale and "run 77's keeper ended its hold (released)) gone" in note, note
+
+        (rd / "child.pid").write_text("4243\n123\n")
+        (rd / "lease").touch()
+        alive, stale, note, _ = probe(agent)
+        assert alive is True and not stale and "run 77's agent, its lease renewed " in note, note
+        os.utime(rd / "lease", (old, old))
+        alive, stale, note, _ = probe(agent)
+        assert alive is None and not stale and "run 77's agent, its lease is 6" in note, note
+        (rd / "exit.json").write_text("{}")
+        alive, stale, note, _ = probe(agent)
+        assert alive is False and stale and "run 77's agent exited) gone" in note, note
+        (rd / "runner.pid").write_text("4244\n")
+        (rd / "lease").touch()
+        assert probe({**agent, "pid": 4244})[0] is True, "a whole-run supervisor lives while the lease is fresh"
+
+        alive, stale, note, _ = probe({**agent, "pid": 4999})
+        assert alive is None and not stale and "pid 4999 is not run 77's agent, supervisor or keeper" in note, note
+        alive, stale, note, _ = probe({**agent, "holder": f"task #{t} (run 78)"})
+        assert alive is None and not stale and "no record of run 78 to judge it through" in note, note
+        _label(held, {**agent, "holder": "someone else"})
+        assert locks.holders_now(paths, p)[0].endswith(
+            "alive unknown: no process of its PID namespace is visible from here; "
+            "no run of this project's to judge it through)"), locks.holders_now(paths, p)
+        p.db.x("UPDATE runs SET boot_id='an-earlier-boot' WHERE id=77")
+        assert "run 77 was recorded on an earlier boot" in probe(keeper)[2]
+
+        # The taker shares this namespace (a probe in the taker's own sandbox): its ns_pid answers.
+        mine = {**agent, "ns_pid": os.getpid(), "ns_pidns": locks._pid_ns()}
+        assert locks._pid_note(mine) == f", pid 4243 (from another PID namespace; its taker is pid {os.getpid()} here) alive"
+        assert locks.pid_alive(mine) is True and probe(mine)[:2] == (True, False)
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        assert "alive unknown: " in locks._pid_note({**mine, "ns_pid": gone.pid}), "a gone taker proves nothing"
+        assert "alive unknown: " in locks._pid_note({**mine, "ns_pidns": "pid:[6]"})
+    finally:
+        held.close()
+
+
+def test_lock_probe_inside_a_real_sandbox_sees_a_live_keeper_outside_it_through_its_beat(env, tmp_path):
+    """End to end: a slot held on the host, labelled as a run's keeper of detached jobs; `ttp lock --probe`
+    run inside a fresh PID namespace (as `ttp sandbox` runs commands) cannot see the host's processes, yet
+    reports the keeper alive through its run's hold.beat, then gone once its hold record ended."""
+    from ttp import hold, locks
+    unshare = shutil.which("unshare")
+    ns = [unshare, "--user", "--map-current-user", "--pid", "--fork", "--mount-proc"] if unshare else []
+    if not unshare or subprocess.run(ns + ["true"], capture_output=True, timeout=30).returncode:
+        pytest.skip("no unprivileged PID namespaces here")
+    p = make(env)
+    t = p.db.add_task("holder", "s", kind="work", origin="user")
+    rd = _foreign_run(p, t, 81)
+    held = _held_build_lock(p, "build-a", f"task #{t} (run 81)")
+    try:
+        locks.label_pid(held, os.getpid())
+        h = json.loads(pathlib.Path(held.name).read_text())
+        assert h["via"] == "keeper" and h["pidns"] == locks._pid_ns()
+        hold._write(rd, {"task": str(t), "run": "81", "state": "holding", "keeper": os.getpid(), "jobs": []})
+        (rd / hold.BEAT).touch()
+
+        def inside():
+            r = subprocess.run(ns + [sys.executable, str(TTP), "lock", "--probe", "--json", "build-a"],
+                               capture_output=True, text=True, timeout=60, env=dict(os.environ, TTP_PROJECT=str(p.base)))
+            assert r.returncode == 75, (r.returncode, r.stdout, r.stderr)
+            return json.loads(r.stdout)["holders"][0]
+
+        rec = inside()
+        assert rec["alive"] is True and "run 81's keeper beat " in rec["note"], rec
+        assert "alive unknown" not in rec["note"] and rec["note"].endswith(" alive"), rec
+        hold._write(rd, {"task": str(t), "run": "81", "state": "handed_over", "keeper": os.getpid(), "jobs": []})
+        rec = inside()
+        assert rec["alive"] is False and "keeper ended its hold (handed_over)) gone" in rec["note"], rec
+    finally:
+        held.close()

@@ -13,7 +13,9 @@ gone with no completion marker: the keeper asks the host every REMOTE_PROBE_S, f
 so a slow ssh never delays a handover, and ends the job with that verdict (detach.remote_verdict). The same probe refreshes the mirrored
 exit code and log tail of the run's `ttp detach --remote` jobs (detach.mirror_refresh).
 
-<run_dir>/hold.json records the hold; the keeper holds <run_dir>/hold.lock while it lives. The
+<run_dir>/hold.json records the hold; the keeper holds <run_dir>/hold.lock while it lives and touches
+<run_dir>/hold.beat every BEAT_EVERY_S, so a lock probe in another PID namespace, which can neither see its
+pid nor read its flock, still tells it lives (locks._through_run). The
 project's state/holds/<run>.json points at it, so the daemon (tend) logs each release, and rebuilds the
 hold of a keeper gone while its jobs still run (a `ttp stop --kill`, a crash): a dead keeper never
 keeps a slot, and a lost one is taken again unless someone else got it meanwhile.
@@ -34,7 +36,8 @@ from .project import durable_write
 
 POLL_S = 2
 REMOTE_PROBE_S = 120   # how often a keeper asks a remote host whether a job's remote side lives
-RECORD, LIVE, HANDOVER = "hold.json", "hold.lock", "hold.handover"
+RECORD, LIVE, HANDOVER, BEAT = "hold.json", "hold.lock", "hold.handover", "hold.beat"
+BEAT_EVERY_S = 30   # how often a keeper touches BEAT while it holds
 LABEL = "detached jobs"
 WHOLE_RUN = "whole run"
 
@@ -247,6 +250,7 @@ def watch(run_dir: Path, fds: list[int]) -> int:
     memo: dict = {}
     verdicts: list[str] = []
     probe, next_probe = None, time.time() + poll_s(REMOTE_PROBE_S)
+    beat = 0.0
     while True:
         rec = read(run_dir)
         if rec is None or rec.get("state") != "holding":
@@ -265,6 +269,12 @@ def watch(run_dir: Path, fds: list[int]) -> int:
                 probe = threading.Thread(target=_remote_round, args=(live(rec.get("jobs") or []), memo, verdicts, run_dir),
                                          daemon=True)
                 probe.start()
+            if time.time() - beat >= BEAT_EVERY_S:
+                try:
+                    (run_dir / BEAT).touch()
+                except OSError:
+                    pass
+                beat = time.time()
             time.sleep(poll_s(POLL_S))
             continue
         if why:   # recorded first, so a slot seen free always reads as released

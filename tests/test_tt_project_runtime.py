@@ -14768,6 +14768,7 @@ def test_a_slot_handed_to_a_keeper_names_the_keeper_as_its_live_holder_until_it_
     try:
         keeper = hold.read(run_dir)["keeper"]
         assert not locks._alive(taker) and locks._alive(keeper)
+        assert _until_true(lambda: (run_dir / hold.BEAT).exists()), "a holding keeper never touched its beat"
         p.db.x("UPDATE tasks SET status='done' WHERE id=?", (mine["id"],))   # a done task: only a live pid keeps it
         rc, got = probe_json()
         assert rc == 75 and not got["free"] and len(got["holders"]) == 1, got
