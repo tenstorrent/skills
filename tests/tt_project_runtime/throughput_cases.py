@@ -212,7 +212,10 @@ def test_throughput_measures_requeue_waits_by_reason_and_a_slow_checks_lane_gets
     finally:
         monkeypatch.setattr(time, "time", real_time)
         locks.dequeue(ticket)
-    assert [r["task"] for r in p.db.q("SELECT task FROM events WHERE kind='checks_slot_wait'")] == [ev]
+    # Its episode row, and the incident's waking row (checklane.wait_wake) naming the same waiter.
+    assert [r["task"] for r in p.db.q("SELECT task FROM events WHERE kind='checks_slot_wait' AND status='coalesced'")] \
+        == [ev]
+    assert {r["task"] for r in p.db.q("SELECT task FROM events WHERE kind='checks_slot_wait'")} == {ev}
     # Read as its own checks, but checkcap's waits log shows the slot held it.
     lg = requeued("slot log", now - 2 * 3600, "done", "", wait_for="the detached ttp checks to pass")
     (Path(p.db.path).parent / checkcap.WAITS_LOG).write_text(json.dumps(
