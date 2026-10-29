@@ -1772,3 +1772,294 @@ def test_a_completed_checks_run_stops_reporting_the_task_s_old_timeout(env, tmp_
     out = capsys.readouterr().out
     assert "was stopped at the wall-time cap" not in out, out
     assert checkwall.last_timeout(p.state, "7") is None
+
+
+# Checks lanes (checklane): light checks never queue, N lanes per project and repository, dead holders
+# reclaimed, a cheaper waiter's overflow lane, visible waits, and `ttp checks status`.
+
+_LANE_REPO = "0123456789ab"   # a repository key (testslots.repo_key)
+
+_LANE_HOLDER = """
+import json, sys, time
+from pathlib import Path
+from ttp import checklane, testslots
+checklane.HEARTBEAT_S = 3600.0   # no touch of the lane file while a test compares it
+g = testslots.suite_hold(sys.argv[1], repo=sys.argv[3], what=sys.argv[4], cost=json.loads(sys.argv[5]))
+Path(sys.argv[2]).write_text("held")
+while True:
+    time.sleep(1)
+"""
+
+
+def _lane_holder(tmp_path, name, repo, what="pytest -q", cost=None, task="12"):
+    got = tmp_path / f"held-{time.time_ns()}"
+    proc = subprocess.Popen([sys.executable, "-c", _LANE_HOLDER, name, str(got), repo, what, json.dumps(cost or {})],
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_TASK": task})
+    assert _wait_for(got.exists), "the lane holder never took its lane"
+    return proc
+
+
+def _stop(proc):
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait(10)
+
+
+def _lane_env(monkeypatch):
+    from ttp import checkcap, testslots
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    for k in (testslots.HELD_ENV, checkcap.HELD_ENV):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_light_checks_run_at_once_while_a_heavy_run_holds_the_lane_and_a_failing_one_fails(
+        env, tmp_path, monkeypatch, capsys):
+    from ttp import checkcap, checkwall, cli, testslots
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _lane_env(monkeypatch)
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 0.3)
+    detached = []
+    monkeypatch.setattr(cli, "_checks_detach", lambda *a, **k: detached.append(1))
+    (repo / "ok.py").write_text("x = 1\n")
+    (repo / "bad.py").write_text("def (:\n")
+    subprocess.run([*git, "add", "ok.py", "bad.py"], check=True)
+    subprocess.run([*git, "commit", "-qm", "py"], check=True)
+    hold = testslots.suite_hold(p.name, repo=testslots.repo_key(repo))
+    seen = tmp_path / "seen"
+    try:
+        cli.main(["checks", "--", "python3 -m py_compile ok.py && git diff --check"])
+        assert "light checks only" in capsys.readouterr().out
+        cli.main(["checks", "--light", "--", f"touch {seen}"])
+        assert seen.exists(), "--light runs the commands after -- at once"
+        p.set_config("checks.light_cmds", ["touch"])
+        cli.main(["checks", "--", f"touch {seen}.2"])
+        assert (tmp_path / "seen.2").exists(), "checks.light_cmds adds light commands"
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--", "python3 -m py_compile bad.py"])
+        assert e.value.code not in (0, None, 75), "a failing light check fails, it never waits or passes"
+        runs = [json.loads(x) for x in (p.state / checkwall.RUNS_LOG).read_text().splitlines()]
+        assert runs[-1]["passed"] is False and "k" not in runs[-1]
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--", f"sh -c 'touch {seen}.3'"])
+        assert e.value.code == 75 and detached == [1] and not (tmp_path / "seen.3").exists(), \
+            "a heavy check still waits for the lane"
+    finally:
+        hold.close()
+
+
+def test_only_whole_light_commands_are_light(env):
+    from ttp import checklane
+    pats = checklane.light_patterns({})
+    for cmd in ("python3 -m py_compile a.py", "python3 -m py_compile a.py && git diff --check", "ruff check .",
+                "timeout 60 ruff check .", "FOO=1 ruff check .", "black --check .", "git diff --check"):
+        assert checklane.is_light(cmd, pats), cmd
+    for cmd in ("black . --check", "ruff check . && pytest", "$CMD", "${CMD} -n", "bash script.sh -n",
+                "sh -c 'ruff check .'", "ruff check .; rm -rf x", "ruff check . | sh", "eval ruff check .",
+                "ruff checkx .", "pytest", "", "python3 -m pytest -q", "`pytest` --check"):
+        assert not checklane.is_light(cmd, pats), cmd
+    assert checklane.all_light(["make"], {}, ["make"]), "--light declares its own commands light"
+    assert not checklane.all_light(["make", "ruff check ."], {}, ["ruff check ."])
+    assert checklane.all_light(["mylint src"], {"checks": {"light_cmds": "mylint, other -q"}})
+    assert not checklane.all_light([], {}), "nothing to run is not a light run"
+    assert checklane.run_class(["ruff check . && pytest"]) == checklane.SUITE
+    assert checklane.run_class(["sh build.sh"]) == checklane.OTHER
+
+
+def test_checks_lanes_default_from_the_machine_and_follow_checks_slots(env, monkeypatch):
+    from ttp import checklane, project
+    assert checklane.default_slots(1, 100) == 1 and checklane.default_slots(0, 0) == 1
+    assert checklane.default_slots(64, 1000) == checklane.MAX_LANES
+    assert checklane.default_slots(64, 10) == 1, "little free memory keeps one lane"
+    assert checklane.default_slots(16, None) == 2
+    monkeypatch.delenv(checklane.SLOTS_ENV)
+    monkeypatch.setattr(checklane, "default_slots", lambda: 3)
+    assert checklane.slots({}) == 3
+    monkeypatch.setenv(checklane.SLOTS_ENV, "junk")
+    assert checklane.slots({}) == 3
+    project.set_account_setting("checks.slots", 2)
+    assert checklane.slots({}) == 2
+    assert checklane.slots({"checks": {"slots": 1}}) == 1, "the project's setting wins"
+    assert checklane.slots({"checks": {"slots": 0}}) == 3, "an invalid setting falls back to the machine's"
+
+
+def test_two_lanes_let_two_runs_proceed_and_one_lane_keeps_priority_order(env, tmp_path, monkeypatch):
+    from ttp import checklane, testslots
+    _lane_env(monkeypatch)
+    a = testslots.suite_hold("pa", repo=_LANE_REPO, slots=2, wait_s=0)
+    b = testslots.suite_hold("pa", repo=_LANE_REPO, slots=2, wait_s=0)
+    assert a and a.files and b and b.files, "two lanes: two runs at once"
+    assert testslots.suite_hold("pa", repo=_LANE_REPO, slots=2, wait_s=0.2) is None, "a third waits"
+    a.close(), b.close()
+    hold = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1)
+    order = []
+
+    def wait(prio):
+        g = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, priority=prio, wait_s=20)
+        order.append(prio)
+        time.sleep(0.2)
+        g.close()
+    late = threading.Thread(target=wait, args=(5,))
+    late.start()
+    assert _wait_for(lambda: len(checklane._live_tickets(testslots.suite_base("pa", _LANE_REPO))) == 1)
+    urgent = threading.Thread(target=wait, args=(1,))
+    urgent.start()
+    assert _wait_for(lambda: len(checklane._live_tickets(testslots.suite_base("pa", _LANE_REPO))) == 2)
+    hold.close()
+    late.join(30), urgent.join(30)
+    assert order == [1, 5], "one lane: the more urgent waiter goes first"
+
+
+def test_dead_or_silent_lane_holders_are_reclaimed_and_logged(env, tmp_path, monkeypatch):
+    from ttp import checklane, locks, testslots
+    _lane_env(monkeypatch)
+    state = tmp_path / "state"
+    state.mkdir()
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    lane = testslots.lane_paths("pa", 1, _LANE_REPO)
+    for label in ({"pid": gone.pid}, {"hb": 1}):
+        f = locks.try_take(lane, "pa: full checks (run 7, pid x)", "pytest", extra={"task": "7", "hb": 30})
+        locks.relabel(f, label)
+        if "hb" in label:
+            assert testslots.suite_hold("pa", repo=_LANE_REPO, wait_s=0.3) is None, "a live, beating holder keeps it"
+            os.utime(lane[0], (time.time() - 1000, time.time() - 1000))
+        told = []
+        g = testslots.suite_hold("pa", repo=_LANE_REPO, wait_s=5, state=state, tell=told.append)
+        assert g and g.files, f"a lane held by {label} was not reclaimed"
+        assert any("reclaimed a checks lane" in x for x in told), told
+        g.close()
+        f.close()
+    log = [json.loads(x) for x in (state / checklane.RECLAIM_LOG).read_text().splitlines()]
+    assert ["process is gone" in log[0]["why"], "heartbeat stopped" in log[1]["why"]] == [True, True], log
+    assert log[0]["holder"]["task"] == "7"
+
+
+def test_a_cheaper_waiter_gets_an_overflow_lane_after_max_wait_and_only_then(env, tmp_path, monkeypatch):
+    from ttp import checklane, testslots
+    _lane_env(monkeypatch)
+    holder = _lane_holder(tmp_path, "pa", _LANE_REPO, cost={"cls": checklane.SUITE, "est_s": 600})
+    try:
+        for cost, max_wait in (({"cls": checklane.SUITE}, 0.3), ({"cls": checklane.OTHER, "est_s": 900}, 0.3),
+                               ({"cls": checklane.OTHER}, 0)):
+            assert testslots.suite_hold("pa", repo=_LANE_REPO, cost=cost, max_wait=max_wait, wait_s=1) is None, cost
+        told = []
+        g = testslots.suite_hold("pa", repo=_LANE_REPO, cost={"cls": checklane.OTHER}, max_wait=0.3, wait_s=5,
+                                 tell=told.append)
+        assert g and g.files and "-x." in g.files[0].name and g.waited >= 0.3
+        assert any("extra checks lane" in x and "#12" in x for x in told), told
+        g.close()
+    finally:
+        _stop(holder)
+
+
+def test_a_lane_wait_names_the_holder_and_the_queue_position(env, tmp_path, monkeypatch):
+    from ttp import testslots
+    _lane_env(monkeypatch)
+    holder = _lane_holder(tmp_path, "pa", _LANE_REPO, what="pytest -q tests/a.py")
+    try:
+        told = []
+        assert testslots.suite_hold("pa", repo=_LANE_REPO, wait_s=0.3, tell=told.append) is None
+        assert "position 1 of 1" in told[0] and "#12 running 'pytest -q tests/a.py' for 0 min" in told[0], told
+    finally:
+        _stop(holder)
+
+
+def test_long_lane_waits_show_in_status_and_the_digest_and_raise_one_event_past_wait_event_s(
+        env, tmp_path, monkeypatch):
+    from ttp import checkcap, checklane, cli, coordinator, locks, testslots
+    from ttp.daemon import Daemon
+    p = make(env)
+    _lane_env(monkeypatch)
+    holder = _lane_holder(tmp_path, p.name, _LANE_REPO)
+    base = testslots.suite_base(p.name, _LANE_REPO)
+    ticket = locks.enqueue(checkcap.slot_dir(), base, f"task #13 {p.name}: full checks (run 9, pid 1)",
+                           time.time() - 800, priority=2)
+    try:
+        assert checklane.wait_events(p.name, {}) == [], "no event before checks.wait_event_s"
+        lines = checklane.long_wait_lines(p.name)
+        assert lines and "#13 has waited 13 min" in lines[0] and "#12" in lines[0], lines
+        assert lines[0] in cli.status_text(p)
+        gates = {"claude": {"level": "green", "reasons": [], "numbers": {}, "max_tier": "deep", "max_parallel": 6,
+                            "allow_optional": True, "allow_new_work": True, "regime": "dollars"}}
+        assert lines[0] in dict(coordinator.digest_parts(p, gates, [], [])[0]).get("checks_wait", "")
+        d = Daemon(p.base)
+        d.check_checks_wait(every_s=0)
+        assert not p.db.q("SELECT id FROM events WHERE kind='checks_slot_wait'")
+        assert checklane.wait_events(p.name, {"checks": {"wait_event_s": 600}}), "checks.wait_event_s sets it"
+        assert checklane.wait_events(p.name, {"checks": {"wait_event_s": 0}}) == [], "0 turns it off"
+        locks.dequeue(ticket)
+        ticket = locks.enqueue(checkcap.slot_dir(), base, f"task #13 {p.name}: full checks (run 9, pid 1)",
+                               time.time() - 1000, priority=2)
+        for _ in range(2):
+            d.check_checks_wait(every_s=0)
+        ev = p.db.q("SELECT task, text FROM events WHERE kind='checks_slot_wait'")
+        assert len(ev) == 1 and ev[0]["task"] == 13 and "#12" in ev[0]["text"], ev
+    finally:
+        locks.dequeue(ticket)
+        _stop(holder)
+
+
+def test_two_repositories_check_side_by_side_while_one_repository_takes_turns(env, tmp_path, monkeypatch, capsys):
+    from ttp import checkcap, cli, testslots
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _lane_env(monkeypatch)
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 0.3)
+    monkeypatch.setattr(cli, "_checks_detach", lambda *a, **k: None)
+    other = tmp_path / "other"
+    subprocess.run(["git", "init", "-q", str(other)], check=True)
+    wt = tmp_path / "wt"
+    subprocess.run([*git, "worktree", "add", "-q", str(wt)], check=True)
+    mine, theirs = testslots.repo_key(repo), testslots.repo_key(other)
+    assert mine and theirs and mine != theirs and testslots.repo_key(wt) == mine, "worktrees share their repository's"
+    holder = _lane_holder(tmp_path, p.name, theirs)
+    seen = tmp_path / "seen"
+    try:
+        cli.main(["checks", "--", f"sh -c 'touch {seen}'"])
+        assert seen.exists(), "another repository's run never holds this one back (slots=1)"
+        hold = testslots.suite_hold(p.name, repo=mine)
+        try:
+            monkeypatch.chdir(wt)
+            with pytest.raises(SystemExit) as e:
+                cli.main(["checks", "--", f"sh -c 'touch {seen}.2'"])
+            assert e.value.code == 75 and not (tmp_path / "seen.2").exists(), "the same repository takes turns"
+        finally:
+            hold.close()
+    finally:
+        _stop(holder)
+
+
+def test_checks_status_reads_the_lanes_and_never_queues_or_writes(env, tmp_path, monkeypatch, capsys):
+    from ttp import checkcap, testslots
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _lane_env(monkeypatch)
+    assert _ttp("checks", "status") == 0 and "no lane held and nobody waiting" in capsys.readouterr().out
+    key = testslots.repo_key(repo)
+    holder = _lane_holder(tmp_path, p.name, key)
+    monkeypatch.setenv("TTP_TASK", "13")
+    waiter = threading.Thread(target=lambda: testslots.suite_hold(p.name, repo=key, priority=3, wait_s=3))
+    waiter.start()
+
+    def snap():
+        d = checkcap.slot_dir()
+        return {str(x): (x.stat().st_mtime_ns, x.stat().st_size, x.read_bytes() if x.is_file() else b"")
+                for x in sorted(d.rglob("*")) if not x.name.startswith(".")}
+    try:
+        assert _wait_for(lambda: any(".queue/" in k and not k.rsplit("/", 1)[1].startswith(".") for k in snap()))
+        before = snap()
+        assert _ttp("checks", "status") == 0
+        out = capsys.readouterr().out
+        assert f"pid {holder.pid}, alive" in out and "#12" in out and "(this one)" in out, out
+        assert "waiter 1 (next): #13" in out and "priority 3" in out, out
+        assert _ttp("checks", "--slot-status", "--json") == 0
+        got = json.loads(capsys.readouterr().out)
+        assert _ttp("checks", "status", "--json") == 0
+        assert [r["repo"] for r in json.loads(capsys.readouterr().out)["repos"]] == [r["repo"] for r in got["repos"]]
+        lane = got["repos"][0]
+        assert got["this_repo"] == key == lane["repo"] and lane["lanes"][0]["pid"] == holder.pid
+        assert lane["lanes"][0]["alive"] is True and lane["lanes"][0]["task"] == "12"
+        assert [(w["task"], w["next"]) for w in lane["waiters"]] == [("13", True)]
+        assert snap() == before, "status queued, took or wrote a lane or queue file"
+        assert not (run / "checks.log").exists(), "status started no check"
+    finally:
+        _stop(holder)
+        waiter.join(10)
