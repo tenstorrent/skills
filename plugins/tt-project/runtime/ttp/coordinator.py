@@ -198,6 +198,17 @@ def _checks_slots(v):
     return n
 
 
+def _count(key: str, v, top: int) -> int:
+    """A whole number from 0 to `top` (seconds or a count)."""
+    try:
+        n = float(v) if not isinstance(v, bool) else None
+    except (TypeError, ValueError):
+        n = None
+    if n is None or n != n or n < 0 or n > top or n != int(n):
+        raise ValueError(f"{key}: give a whole number from 0 to {top}")
+    return int(n)
+
+
 USER_SETTABLE = {
     "budget.daily_usd": float, "budget.weekly_usd": float, "budget.reserve_pct": float,
     "budget.global_daily_usd": float, "budget.day_start": str, "budget.timezone": str,
@@ -270,6 +281,11 @@ USER_SETTABLE = {
     # Whether the daemon queues each finished code task's review, and what every such review also does.
     "review.auto": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "review.auto_notes": str,
+    # Throughput levers (throughput.py): how soon a finished task's review is queued and how many per
+    # sweep, and how long a waiting review goes before it is raised. Whole seconds or counts, 0 off.
+    "review.sweep_after_s": lambda v: _count("review.sweep_after_s", v, 7 * 86400),
+    "review.unreviewed_per_pass": lambda v: _count("review.unreviewed_per_pass", v, 100),
+    "coordinator.review_stall_s": lambda v: _count("coordinator.review_stall_s", v, 7 * 86400),
     # Skill plugins loaded for this project's workers only (a plan may recommend them).
     "providers.claude.plugin_dirs": lambda v: existing_dirs(dir_list(v)),
     # Workers load none of the user's own MCP servers, plugins, hooks or settings.

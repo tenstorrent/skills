@@ -65,6 +65,7 @@ from . import route
 from . import checkcap
 from . import conflictfix
 from . import correction
+from . import slowcomplaint
 from . import credits
 from . import globalcap as gcap
 from . import coordinator as coord
@@ -6553,11 +6554,13 @@ class Daemon:
                                                    coord.charter_conflicts(self.p), lowered, harness=self.p.harness)
             unblock = ", ".join(triggers)
             flagged = correction.flag(db, self.cfg, msgs, now)   # likely corrections, tagged in the digest
+            speed = slowcomplaint.on_messages(self.p, self.cfg, msgs, now, gates)   # a speed complaint: measured review
             # Every turn sees background sections the previous turn saw as one line each.
             parts, shown = coord.digest_parts(self.p, gates, [e["id"] for e in evs], [m["id"] for m in msgs],
                                               db.kv(coord.DIGEST_SEEN_KEY) or {}, flagged)
             # The sections rendered from the prompt snapshot end the cached context block.
             cached, parts = coord.split_cached(parts)
+            parts += [(slowcomplaint.SECTION, speed)] if speed else []
             prompt = "\n".join(text for _, text in parts)
             head, context = coord.prompt_parts(self.p)
             context = coord.with_cached(context, cached)

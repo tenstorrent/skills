@@ -1596,6 +1596,9 @@ def cmd_status(a) -> None:
         print(json.dumps(state_payload(p, p.db), default=str, indent=1))
     else:
         print(status_text(p, verbose=a.verbose))
+        from . import throughput
+        if ln := throughput.status_line(p.db):
+            print(ln)
         from . import notifier
         for ln in notifier.status_lines():   # this machine's notifier: on old code, or failing to deliver
             print(ln)
@@ -4153,6 +4156,29 @@ def cmd_sandbox(a) -> None:
     if not cmd:
         die("usage: ttp sandbox -- <command...>")
     sys.exit(sandbox.run(cmd))
+
+
+def _since_s(v: str) -> float:
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*", str(v))
+    if not m or float(m.group(1)) <= 0:
+        die(f"--since: give a duration such as 24h, 90m or 2d, not {v!r}")
+    return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def cmd_throughput(a) -> None:
+    """`ttp throughput`: where tasks waited over the window, per lane against its limit (throughput.py);
+    --apply raises the sizing limits that held work while there was headroom; --undo N reverts one."""
+    from . import throughput
+    p = need(a.name, sys.argv[1:]) if a.name else here()
+    if p is None:
+        die("ttp throughput: no project here (run it in a project or its run, or name one)")
+    if a.undo is not None:
+        msg = throughput.undo(p, a.undo)
+        print(msg)
+        sys.exit(0 if " back to " in msg else 1)
+    rep = throughput.review(p, p.config(), _since_s(a.since), do_apply=a.apply, trigger="ttp throughput"
+                            + (" --apply" if a.apply else ""))
+    print(json.dumps(rep, default=str, indent=1) if a.json else throughput.text(rep))
 
 
 def cmd_hours(a) -> None:
@@ -8628,7 +8654,7 @@ COMMAND_GROUPS = (
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
-               "push-audit", "ttr", "spend-today", "uninstall")),
+               "push-audit", "ttr", "spend-today", "throughput", "uninstall")),
 )
 
 
@@ -9017,6 +9043,16 @@ def main(argv: list[str] | None = None) -> None:
                    help="also need this much of the window left (a step's time to act)")
     s.add_argument("--days", type=float, default=14, help="look back this many days (default 14)")
     s.set_defaults(fn=cmd_hours)
+
+    s = sub.add_parser("throughput", help="waits per lane (worker, resource, checks, review, push, chains, deferrals, "
+                                          "provider) against their limits; --apply raises the limits that held work "
+                                          "back while there was headroom, each with an undo")
+    s.add_argument("name", nargs="?", help="project (default: the one here)")
+    s.add_argument("--json", action="store_true", help="print the review as JSON")
+    s.add_argument("--apply", action="store_true", help="raise the sizing limits that held work back (bounded, recorded)")
+    s.add_argument("--since", default="24h", help="the window to measure (default 24h; s, m, h or d)")
+    s.add_argument("--undo", type=int, metavar="ID", help="set change ID back to its old value")
+    s.set_defaults(fn=cmd_throughput)
 
     s = sub.add_parser("killscan", help="flag kills by name or pattern (pkill, killall, pgrep/pidof, ps | grep into kill) "
                                         "in scripts before running them; --shim writes stand-ins that only log")

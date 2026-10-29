@@ -21,6 +21,9 @@ Assess the last day of this project, then hand off.
    would have let the coordinator decide it, as a `harness:` follow-up when one is missing.
    With `Stuck longer than 6h` lines, list each item with its reason and sweep outcome; one with no
    outcome or a LOOP is a defect: say why the sweep did not resolve it.
+   Throughput: run `ttp throughput <name> --apply`. Report each slow lane (p90 wait, limit), each
+   change it made with its undo line, and each limit it left and why; a slow lane it could not
+   change gets a `harness:` follow-up naming the setting or cause.
 5. Self-efficiency: if this spec ends with `Self-efficiency audit` lines (`ttp audit <name>` prints
    them, `--json` the rows), grade them. Grade every ask, one line each, `human-only` or
    `avoidable`: was it truly blocked on access, funds, spend, review, merge, an irreversible step,
