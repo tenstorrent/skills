@@ -16840,6 +16840,9 @@ def test_the_reaper_ends_the_tools_of_an_agent_that_already_exited(env, tmp_path
         assert _wait(lambda: _environ_has(tool, mine), 15), "the tool never started"
         if mid_exec:   # its first looks find the tool mid-exec
             real, empty = dmod._read_environ, iter(range(5))
+            # The five empty reads end the exec, not the settle window: a loaded host must not run
+            # the window out before they are done (that would test the clock, not the look-again).
+            monkeypatch.setattr(dmod, "EXEC_SETTLE_S", 600.0)
             monkeypatch.setattr(dmod, "_read_environ",
                                 lambda pid: b"" if int(pid) == tool and next(empty, None) is not None else real(pid))
         (run_dir / "child.pid").write_text(f"{leader.pid}\n1\n")
