@@ -21,4 +21,11 @@ A generic example: the coordinator decides routine benchmark spend itself, unles
 ]}}
 ```
 
+No ask blocks. An ask the gate lets through stores its `recommendation` as its default; unanswered
+after `coordinator.ask_timeout_h` (0.5 h; 0 off) the daemon resolves it to that (`askauto.py`), or for
+a restriction ask whose recommendation would loosen it keeps the restriction as written. Asks only the
+user can answer stay open: review, merge, another human's request, a recommendation that acts as the
+user, a credential or money grant, an irreversible step that does not decline. A refusal rule therefore
+matters most for asks the timer would leave open, and a good recommendation matters for every ask.
+
 The user's own rules belong in their project's `project.json` and charter, never in the plugin's defaults.

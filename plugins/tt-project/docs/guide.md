@@ -426,6 +426,17 @@ prolonged whole-box outage.
   to 2048–16000); reasons and diagnoses are clipped to 200 characters each. This bounds added sweep
   context while preserving every identity and outcome request, including items beyond the old
   60-item cutoff. A restart or failed turn retries its batch; remaining batches stay queued.
+- Asks never block: every ask stores its recommendation as its default and shows when it applies
+  ("acts on X at HH:MM ZONE unless answered") in the chat, `ttp status`, the web app and the
+  digest. Unanswered after `coordinator.ask_timeout_h` (0.5; 0 turns it off; settable from the
+  chat), the daemon resolves it: it applies the recommendation, or for a restriction ask whose
+  recommendation would loosen it keeps the restriction as written. It tells the chat at low, records
+  a decision memory, raises one `ask_timeout` event per tick and refuses a re-ask; tasks anchored on
+  the ask are released. Asks only the user can answer stay open (review, merge, another human's
+  request, a recommendation that acts as the user, a credential or money grant, an irreversible
+  step that does not decline). Nothing resolves at a red gate or after the user wrote since the ask
+  (the coordinator checks instead). A model-free check raises an open ask with no default, or one
+  past its timeout and still open, once per change.
 - Ask rethink: an open `restriction`, `irreversible` or `human` ask that holds a blocked task
   longer than `coordinator.ask_rethink_h` (2; 0 turns it off) raises one `ask_rethink` event, a
   tricky turn that decides the ask itself unless only the user can (then `human_indispensable`

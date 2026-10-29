@@ -53,6 +53,9 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 - Alerts arrive in every attached chat. Replies arrive only in the chat that asked.
 - A repeated message id was already shown. Skip it.
 - The user asks what is running, costs, or blockers → `ttp status <name>`.
+- A project's questions never block it: each shows "acts on X at HH:MM unless answered" and goes
+  with that recommendation if unanswered (`coordinator.ask_timeout_h`, 0.5 h), except asks only the
+  user can answer (review, merge, credentials, money, acting as the user).
 - Never give an unverified web app link. Give only a `web app: http…` line that `ttp new`,
   `ttp connect` or `ttp web` just printed: they check it first (HTTP 200 naming this project,
   through that exact port and token). Never build a link by hand or reuse an old one.

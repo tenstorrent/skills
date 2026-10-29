@@ -457,7 +457,7 @@ MAX_TASKS_PER_DAY = 1000
 ASK_DEFAULTS_KEY = askauto.DEFAULTS_KEY
 _DEFAULT_NOTE = "\n\nIf there is no answer within "
 _AUTO_NOTE = "\n\nNon-blocking: "   # askauto.note: when and to what the timer resolves the ask
-# Shown so the user can answer in one word; never applied without their answer.
+# Shown so the user can answer in one word; applied unanswered after the timeout (askauto.outcome).
 _REC_NOTE = "\n\nMy recommendation: "
 _LEAST_NOTE = "\n\nLeast-disruptive way considered: "
 _REVERSIBLE_NOTE = "\n\nReversible alternative considered: "
@@ -2357,7 +2357,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      "call: act on it, memory_add a decision and notify at severity low")
                 if a.get("blocking") not in BLOCKING_REASONS:
                     raise ValueError(f"ask_user rejected: `blocking` must be one of {', '.join(BLOCKING_REASONS)}; "
-                                     f"got {a.get('blocking')!r}. Anything else, decide it yourself")
+                                     f"got {a.get('blocking')!r}. Anything else, decide it yourself. No ask "
+                                     f"blocks: unanswered, it resolves to its `recommendation` after "
+                                     f"coordinator.ask_timeout_h unless only the user can answer it")
                 least = str(a.get("least_disruptive") or "").strip()
                 text = a["text"].strip()
                 why = _unclassified_ask(a, least)

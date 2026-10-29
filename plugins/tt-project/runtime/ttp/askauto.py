@@ -28,8 +28,10 @@ _AS_USER_RE = re.compile(r"\b(merge|merging|ready for review|out of draft|leave 
 _GRANT_RE = re.compile(r"\b(yes|y|ok|okay|approve[ds]?|grant|raise|increase|lift|extend|top[- ]?up|buy|purchase|"
                        r"pay|spend|credentials?|token|password|secret|api[- ]?key|ssh[- ]?key|log ?in|sign ?in|"
                        r"access|cap|budget|reserve)\b", re.I)
-# A recommendation that declines: it keeps things as they are.
-_DECLINE_RE = re.compile(r"^\W*(no|don'?t|do not|skip|keep|wait|decline|leave|hold|stay|not now|drop|never)\b", re.I)
+# A recommendation that declines: it starts with a plain no and adds no later step ("no, then post
+# it", "wait a day, then raise the cap" and "keep merging" do not decline), so it keeps things as they are.
+_DECLINE_RE = re.compile(r"^\W*(no|don'?t|do not|skip|decline|not now|never)\b", re.I)
+_LATER_RE = re.compile(r"\b(then|but|after(wards?)?|later|until|unless|instead|except)\b", re.I)
 
 
 def hours(cfg: dict | None) -> float:
@@ -43,7 +45,7 @@ def hours(cfg: dict | None) -> float:
 def outcome(blocking: str | None, rec: str | None) -> tuple[str, str]:
     """What the timer does with an ask: ("apply", rec), ("stay", STAY) or ("open", why it waits)."""
     rec = " ".join((rec or "").split())
-    declines = bool(_DECLINE_RE.match(rec))
+    declines = bool(_DECLINE_RE.match(rec)) and not _LATER_RE.search(rec)
     if not rec:
         return "open", "it has no recommendation"
     if blocking == "restriction":

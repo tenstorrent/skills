@@ -4664,7 +4664,7 @@ def test_the_re_ask_gate_lets_unrelated_old_and_charter_only_restriction_asks_th
                  "May I raise the soak timeout on box-b2 to 90 minutes?",
                  "Is box-a1 free for the firmware flash tonight?"):
         problems, sent = _ask(p, text, **_OWN_ACCESS)
-        assert problems == [] and sent["text"] == text, (text, problems)
+        assert problems == [] and coord._ask_question(sent["text"]) == text, (text, problems)
     # A charter Policies item settles a plain ask, never a restriction-change ask, which only names a charter item.
     problems, _ = _ask(p, "Should nightly report results go out as a notify?", **_OWN_ACCESS)
     assert problems and "already settled by the charter's Policies item" in problems[0], problems
@@ -4800,7 +4800,7 @@ def test_a_restriction_ask_must_name_the_least_disruptive_way_forward(env):
     problems, ask = _ask(p, "Grant repo access?", blocking="access", least_disruptive=way)
     assert problems == [] and "Least-disruptive" not in ask["text"]
     problems, ask = _ask(p, "Approve the spend?", blocking="spend")
-    assert problems == [] and ask["text"] == "Approve the spend?"
+    assert problems == [] and coord._ask_question(ask["text"]) == "Approve the spend?"
 
 
 
@@ -4843,6 +4843,28 @@ def test_an_unanswered_ask_resolves_to_its_recommendation_at_the_deadline(env):
     problems, again = _ask(p, q, blocking="access", recommendation="use option B")
     assert problems and "auto-resolved unanswered" in " ".join(problems), "a re-ask of a resolved ask was sent"
     assert again["id"] == ask["id"]
+
+
+@pytest.mark.parametrize("blocking,rec,kind", [
+    ("spend", "wait a day, then raise the cap", "open"),       # a later step is no decline
+    ("funds", "no, then top up the account", "open"),
+    ("funds", "keep the current cap", "open"),                 # only a plain no declines
+    ("access", "keep merging the fixes", "open"),
+    ("access", "hold off and post it later", "open"),
+    ("access", "Merge it", "open"),
+    ("irreversible", "wait an hour, then delete the data", "open"),
+    ("irreversible", "never delete the data", "apply"),
+    ("restriction", "wait for Monday, then lift it", "stay"),
+    ("restriction", "Yes", "stay"),
+    ("restriction", "no, leave it as written", "apply"),
+    ("access", "don't post the summary", "apply"),
+    ("spend", "use the cheaper runner", "apply"),
+    ("review", "no", "open"),
+    ("access", "", "open"),
+])
+def test_the_ask_timer_applies_only_a_recommendation_that_grants_nothing_only_the_user_holds(blocking, rec, kind):
+    from ttp import askauto
+    assert askauto.outcome(blocking, rec)[0] == kind
 
 
 def test_a_restriction_ask_keeps_the_restriction_as_written_at_the_timeout(env):
@@ -5402,7 +5424,7 @@ def test_exempt_asks_stay_open_past_the_timeout(env):
     assert all(f"ask #{a['id']} (non-blocking; waits for the user (" in d for a in held), d
     # A declining recommendation grants nothing, so it resolves even for money or an irreversible step.
     _, no = _ask(p, "Spend $500 on a bigger box?", blocking="funds", recommendation="no, keep the current box")
-    pk, keep = _ask(p, "Wipe the cache?", blocking="irreversible", reversible=False, recommendation="keep the cache",
+    pk, keep = _ask(p, "Wipe the cache?", blocking="irreversible", reversible=False, recommendation="don't wipe the cache",
                    classify="irreversible", least_disruptive="moving the cache instead; the disk is full, so moving does not free the space")
     assert pk == [], pk
     assert sorted(coord.expire_asks(p, now=time.time() + 3600)) == sorted([no["id"], keep["id"]])

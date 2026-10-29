@@ -117,13 +117,16 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
     re-pointing `depends_on`, or by adding a replacement with `continues`, which takes over the
     dependents (and, for code, the branch) in one transaction. A requeue onto a dead dependency is
     rejected, never silently undone; a block left after a coordinator turn is raised once.
-13. A question to the user carries a blocking reason (access, funds, spend, review, merge,
-    irreversible, restriction, human) and waits for the user; anything else is a judgment call
-    the coordinator decides and records. Its recommendation is shown so the user can answer in
-    one word, but no new question falls back to it or to anything else on a timer. Questions asked
-    before this rule with a default still drain: after `coordinator.ask_timeout_h`, never at a
-    cap or when the user has written since it was asked (the coordinator is asked to confirm
-    instead); the user is told what was decided, at `high` severity or above.
+13. A question to the user carries a reason (access, funds, spend, review, merge, irreversible,
+    restriction, human); anything else is a judgment call the coordinator decides and records.
+    No question blocks: each stores its recommendation as its default, shown with the time it
+    applies, and after `coordinator.ask_timeout_h` (0.5 h; 0 turns it off) unanswered the daemon
+    resolves it to that (`askauto.py`, `expire_asks`), tells the chat at low and records a decision
+    memory. A restriction ask whose recommendation would loosen it keeps the restriction as written.
+    Asks only the user can answer stay open: review, merge, another human's request, a
+    recommendation that acts as the user, a credential or money grant, and an irreversible step that
+    does not decline. Nothing resolves at a red gate or when the user has written since the ask (the
+    coordinator is asked to check instead). An open ask holds only the tasks anchored on it.
 
 ## Known gaps (accepted)
 

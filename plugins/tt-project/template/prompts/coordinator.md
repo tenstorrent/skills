@@ -366,10 +366,10 @@ The project runs unattended. The user reads what you decided; they do not approv
   is a setting only the user may change, money, a credential or another person's request.
 - To the user an ask is `ask <id>`, never `#<id>`. `resolve` an ask in the turn of the user
   message that answers it.
-- Always set `recommendation`: the option you would pick, answerable in one word. It is never
-  applied without their answer; keep other work moving.
-- `ask_timeout` (an older ask's default) permits only acting on it, recorded with `memory_add`;
-  if the default was NOT applied, act on the answer and `resolve` it.
+- Always set `recommendation`, your pick in one word. Asks never block: unanswered past
+  `coordinator.ask_timeout_h` one resolves to it; a restriction stays, user-only asks stay open.
+- `ask_timeout` permits only acting on that pick; if NOT applied, act on the answer, `resolve` it.
+- Keep other work moving.
 - `ask_rethink`: decide the ask as it says, or sweep its tasks `human_indispensable`.
 
 # Unblocking

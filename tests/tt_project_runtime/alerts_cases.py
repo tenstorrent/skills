@@ -4391,7 +4391,7 @@ def test_the_desktop_notifier_never_lets_a_later_alert_replace_an_earlier_one(mo
     assert b"-group" not in got and got[got.index(b"-message") + 1] == b"alert one"
 
 
-@pytest.mark.parametrize("bare", ["_refresh_meters", "update_gates", "coord.expire_asks", "scr.expire_mutes",
+@pytest.mark.parametrize("bare", ["_refresh_meters", "update_gates", "coord.expire_asks", "check_ask_timer", "scr.expire_mutes",
                                   "scr.end_task_mutes", "check_mute_ends", "sweep_watcher_issues", "review_jev", "settling"])
 def test_a_failing_call_between_the_tick_step_loops_does_not_stop_dispatch_or_delivery(env, monkeypatch, bare):
     """The calls between the two step loops run guarded like the steps: one that raises is logged
