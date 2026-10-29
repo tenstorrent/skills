@@ -6234,8 +6234,10 @@ def _set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None =
              **({"start_after": start_after} if start_after is not None else {})}
         if d:
             cur = deferral(task)
-            upd, after, when = deferral_update(db, task, d, p)
+            upd, after, when, dropped = deferral_update(db, task, d, p)
             db.update_task(tid, **upd)
+            if dropped:
+                said.append(dropped)
             if "start_when" in d:
                 stale = marker_only_probe(when, p.root if p else None) if when != cur.get("when") else None
                 said.append("start_when " + (f"set: {when}" if when else "cleared") + (f"; flagged: {stale}" if stale else ""))

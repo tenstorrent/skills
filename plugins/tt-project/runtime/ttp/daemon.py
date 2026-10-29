@@ -51,6 +51,7 @@ from . import schedlog
 from . import throughmute
 from . import probespawn
 from . import urgent
+from . import convgate
 from . import boundedchild
 from . import replymsg
 from . import msgparts
@@ -5968,6 +5969,16 @@ class Daemon:
                               lambda m: log(self.p, m))
             self.observe("daemon:process-churn", obs["text"], obs["severity"], whole=True, key=obs["key"])
 
+    def _gated_urgent(self, now: float) -> list[dict]:
+        """Queued urgent tasks whose dependencies are met, held only from dispatch by a start gate
+        (start_after still to come, or start_when): check_slot_wait names the gate once they waited."""
+        db = self.p.db
+        rows = [t for t in db.q("SELECT * FROM tasks WHERE status='queued' AND (labels LIKE '%\"start_when:%' "
+                                "OR labels LIKE '%\"start_after:%')") if urgent.is_urgent(t)]
+        rows = [t for t in rows if deferral(t).get("when") or (deferral(t).get("after") or 0) > now]
+        unmet = db.unmet_dependencies(rows) if rows else {}
+        return [t for t in rows if not unmet.get(t["id"])]
+
     def check_slot_wait(self, every_s: float = 60) -> None:
         """Model-free urgent slot wait: a ready task that is a required owner of an open obligation, or has
         priority 1, held only because every worker slot of its provider is taken (_start_hold's 'gate' with
@@ -5993,13 +6004,21 @@ class Daemon:
         db = self.p.db
         due = obligations.owner_due(db)
         hot = [t for t in db.ready_tasks() if t["id"] in due or urgent.is_urgent(t)]
+        gated = self._gated_urgent(now)
         core = self.cfg.get("core_provider", "claude")
         ctx = {"now": now, "paused": db.paused_resources(), "committed": None,
                "busy": {r["provider"]: r["n"] for r in db.q(
                    "SELECT provider, COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running' "
                    "GROUP BY provider")},
-               "logged_out": {prov: self._logged_out(prov) for prov in {t["provider"] or core for t in hot}}}
+               "logged_out": {prov: self._logged_out(prov) for prov in {t["provider"] or core for t in hot + gated}}}
         full, other = {}, {}   # held only by the slots; an urgent task held by anything else (its words)
+        for t in gated:   # dependencies met, a worker slot free and nothing else holds it: only its kept gate
+            if self._start_hold(t, t["provider"] or core, ctx) is None:
+                labels, d = convgate.stored(t)
+                kept = convgate.safety_class(d.get("why"), d.get("when")) or convgate.kept_class(labels)
+                other[t["id"]] = (t, f"its start gate ({kept or 'no safety class'}): "
+                                     f"{convgate.gate_words((d.get('after') or 0) > now and d.get('after'), d.get('when'), now)}"
+                                     f"{'; ' + d['why'][:120] if d.get('why') else ''}, while a worker slot is free")
         for t in hot:
             why = self._start_hold(t, t["provider"] or core, ctx)
             if why == "gate" and t["id"] in ctx.get("full", {}):
@@ -8675,7 +8694,43 @@ class Daemon:
                     and (got[0] == 0 or detach.failed_check(probe, got[0])) \
                     and self._gate_answer(t, probe, got[0], (self._probe_out.get(t["id"]) or ("",))[0], now) != "same":
                 (self._probe_passed if got[0] == 0 else self._job_failed)(db.task(t["id"]) or t, now)
+        self.release_urgent_gates(now)
         self.probe_deferred(now)
+
+    def release_urgent_gates(self, now: float) -> None:
+        """Model-free, database only: a queued urgent task (urgent.is_urgent) deferred with start_after or
+        start_when whose gate names no safety class (convgate) starts now. Its deferral labels and
+        not_before are cleared and one low observation per release is recorded handled (no coordinator
+        wake). A gate kept for a safety class stays; dependencies and retry timers are untouched."""
+        db = self.p.db
+        for t in db.q("SELECT * FROM tasks WHERE status='queued' AND (labels LIKE '%\"start_when:%' "
+                      "OR labels LIKE '%\"start_after:%')"):
+            labels, d = convgate.stored(t)
+            after = d.get("after") if (d.get("after") or 0) > now else None
+            drop, _ = convgate.judge(t, after, d.get("when"), d.get("why"), labels)
+            if not drop:
+                continue
+            words = convgate.gate_words(after, d.get("when"), now)
+            with db.tx():
+                db.update_task(t["id"], labels=without_deferral(labels),
+                               not_before=None if after or (t["not_before"] or 0) <= now else t["not_before"])
+                db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                     (now, "daemon", "observation", f"urgent_gate_released:{t['id']}:{d.get('since') or 0:.0f}",
+                      "low", f"Urgent #{t['id']} {t['title'][:80]} ({urgent.why(t)}): released its {words}, whose why "
+                      f"names no safety class; it starts once its dependencies are met.", "handled", t["id"]))
+            startgate.forget(db, tid=t["id"])
+            self._start_rc.pop(t["id"], None)
+            log(self.p, f"task {t['id']} urgent: convenience gate released ({words[:200]})")
+        for r in db.q("SELECT * FROM tasks WHERE status='queued' AND kind='review' AND depends_on NOT IN ('', '[]')"):
+            if not (gate := convgate.suite_waits(db, r)):
+                continue
+            with db.tx():
+                db.update_task(r["id"], depends_on=[d for d in dependency_ids(r) if d not in gate])
+                db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                     (now, "daemon", "observation", f"review_suite_gate:{r['id']}:{','.join(map(str, gate))}", "low",
+                      f"Review #{r['id']} waited only on {', '.join(f'#{d}' for d in gate)}, checks or a suite of the "
+                      f"same change, and reads none's output: it now runs side by side with them.", "handled", r["id"]))
+            log(self.p, f"review {r['id']}: suite gate {gate} dropped; runs beside it")
 
     def probe_deferred(self, now: float) -> None:
         """A task added with `start_when` stays queued, undispatched, until its probe exits 0; the

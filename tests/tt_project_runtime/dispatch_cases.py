@@ -444,8 +444,8 @@ def test_a_command_user_still_on_its_retry_timer_does_not_stop_a_slot_reservatio
         assert _slot_tasks(p) == [a]
         _board_slots(p, d, 1)
         assert coord.apply(p, [{"type": "task_add", "title": "N uses board later", "spec": "s", "kind": "work",
-                                "tier": "light", "resources": ["board"], "priority": 1,
-                                "start_after": "6h"}]) == []
+                                "tier": "light", "resources": ["board"], "priority": 1, "start_after": "6h",
+                                "why": "the board's maintenance window"}]) == []
         n = p.db.one("SELECT id FROM tasks WHERE title=?", ("N uses board later",))["id"]
         assert p.db.task(n)["not_before"] > time.time() + 3600
         d.dispatch()

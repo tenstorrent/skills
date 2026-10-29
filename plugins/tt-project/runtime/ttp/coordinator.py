@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import ackwait, anchors, askauto, askrethink, broadcast, budgetkind, cachettl, causefix, cells, chaincap, chainprio, chatset, checkspill, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, rejcool, relay, responsibilities, restriction_audit, reviewcap, selfreview, reviewreuse, settinghold, settled, shared, sharedchecks, startbreaker, sweep, throughmute, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import ackwait, anchors, askauto, askrethink, broadcast, budgetkind, cachettl, causefix, cells, chaincap, convgate, chainprio, chatset, checkspill, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, rejcool, relay, responsibilities, restriction_audit, reviewcap, selfreview, reviewreuse, settinghold, settled, shared, sharedchecks, startbreaker, sweep, throughmute, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -1730,16 +1730,26 @@ def _landed_as_deps(p: Project, a: dict, deps: list | None = None) -> tuple[dict
 
 
 def deferral_update(db, task: dict, a: dict, p: Project | None, labels: list | None = None
-                    ) -> tuple[dict, float | None, str | None]:
+                    ) -> tuple[dict, float | None, str | None, str]:
     """The one path from a task_update's or `ttp task set-when`'s start_after/start_when/why (`a`) to
-    the columns of a task not yet started: ({labels, not_before}, start_after, start_when). Each part
+    the columns of a task not yet started: ({labels, not_before}, start_after, start_when, note). Each part
     `a` leaves out stays as it was; `now` or "" clears it. `labels` are the ones to build on (the
-    task's own when None). A new future start_after drops the progress probe's old answers."""
+    task's own when None). A new future start_after drops the progress probe's old answers. An urgent
+    task's gate whose why names no safety class is dropped (convgate), `note` saying so ('' else)."""
     cur = deferral(task)
     try:
         after, when = _start_args(a, cur, p)
     except MissingTaskRef as e:
         raise MissingTaskRef(f"#{task['id']} rejected: {e}") from None
+    same = after == cur.get("after") and when == cur.get("when")
+    why = a.get("why") if a.get("why") is not None else cur.get("why") if when and when == cur.get("when") else None
+    as_now = {"priority": a.get("priority") or task.get("priority"),
+              "spec": "\n".join(x for x in (task.get("spec"), a.get("spec")) if x)}
+    drop, safe = convgate.judge(as_now, after, when, why,
+                                json.loads(task["labels"] or "[]") if same and a.get("why") is None else [])
+    note = convgate.dropped_note(f"task_update: #{task['id']}", as_now, after, when) if drop else ""
+    if drop:
+        after, when = None, None
     after = float(f"{after:.0f}") if after else after   # whole seconds, as its label keeps it (not_before agrees)
     if p and when and when != cur.get("when") and (stuck := chaincap.own_wait(
             p, [t["id"] for t in chaincap.chain(db, task["id"])[:-1]], when)):
@@ -1756,8 +1766,8 @@ def deferral_update(db, task: dict, a: dict, p: Project | None, labels: list | N
         # keep its retry timer (a new one when the deferral replaced it), as the hand-off set it.
         from .daemon import _retry_s   # daemon imports this module
         nb = task["not_before"] if task["not_before"] and not cur.get("after") else time.time() + _retry_s(prev)
-    return {"labels": without_deferral(labels) + defer_labels(after, when, start_why(a, cur, when)),
-            "not_before": nb}, after, when
+    return {"labels": without_deferral(labels) + defer_labels(after, when, start_why(a, cur, when))
+            + convgate.labels_for(safe, after, when), "not_before": nb}, after, when, note
 
 
 def defer_labels(after: float | None, when: str | None, why: str | None = None) -> list[str]:
@@ -2036,6 +2046,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     after, when = _start_args(a, {}, p)
                 except MissingTaskRef as e:
                     raise MissingTaskRef(f"{json.dumps(title, ensure_ascii=False)}: {e}") from None
+                as_now = {"priority": int(a.get("priority") or 3), "spec": a.get("spec") or ""}
+                drop_gate, safe = convgate.judge(as_now, after, when, a.get("why"))
+                gate_dropped = (as_now, after, when) if drop_gate else None
+                if drop_gate:   # an urgent task never sleeps on a convenience gate
+                    after, when = None, None
                 if when and a.get("continues") is not None and (stuck := chaincap.own_wait(
                         p, [t["id"] for t in chaincap.chain(db, int(a["continues"]))], when)):
                     raise ValueError(f"task_add rejected: {stuck}")
@@ -2074,7 +2089,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 labels += [file_overlap.label(clash, tie and tie[0], landing)] if clash else []
                 if lineage := _lineage_tie(p, kind, labels, {old["id"]} if old else set()):
                     labels.append(f"{worktree.LINEAGE_HOLD}{lineage[0]}")
-                labels += defer_labels(after, when, why_after)
+                labels += defer_labels(after, when, why_after) + convgate.labels_for(safe, after, when)
                 with db.tx():
                     new_id = db.add_task(title, a.get("spec") or "", kind=kind, tier=tier,
                                          tier_source="user_deep" if effort.USER_DEEP in labels else tier_source,
@@ -2145,6 +2160,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                            f"depends_on [{tie[0]}]: no push branch or landed probe to wait on its landing")
                     notes.append(f"task_add: #{new_id} chained after #{tie[0]} ({how}): {tie[1]}; "
                                  f"clear it with task_update if the task does not need that")
+                if gate_dropped:
+                    notes.append(convgate.dropped_note(f"task_add: #{new_id}", *gate_dropped))
                 if hit := settled.turn_note(p, str(a.get("spec") or ""), f"task_add: #{new_id}"):
                     notes.append(hit)
                 if hit := correction.repeated(p, f"{title}\n{a.get('spec') or ''}"):
@@ -2244,8 +2261,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         raise InfoRejection(f"task #{task['id']} is {task['status']}: only a task that has not "
                                          f"started can be deferred; add a new one with start_after/start_when")
                     cur = deferral(task)
-                    new, after, when = deferral_update(db, task, a, p, upd.get("labels"))
+                    new, after, when, dropped = deferral_update(db, task, a, p, upd.get("labels"))
                     upd.update(new)
+                    if dropped:
+                        notes.append(dropped)
                     stale = marker_only_probe(when, p.root) if when != cur.get("when") else None
                     if stale:
                         notes.append(f"task_update: #{task['id']} flagged: {stale}")

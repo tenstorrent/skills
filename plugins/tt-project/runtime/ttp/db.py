@@ -1262,7 +1262,7 @@ def names_branch(spec: str, branch: str | None) -> bool:
     return False
 
 
-DEFER_LABELS = ("start_after", "start_when", "start_why", "deferred_since")
+DEFER_LABELS = ("start_after", "start_when", "start_why", "deferred_since", "start_safety")
 
 
 def deferral(task: dict) -> dict:
