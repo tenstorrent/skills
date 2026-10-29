@@ -164,6 +164,24 @@ def test_parked_nudge_for_a_deferral_naming_no_external_fact_never_refuses_and_c
     assert p.db.kv(unstarted.NUDGE_KV)["n"] == 1
 
 
+def test_parked_nudge_folds_into_the_tasks_existing_note_one_note_per_action(env):
+    # A note already written for the task (a flag) keeps its place; the nudge rides in it.
+    from ttp import coordinator as coord
+    from ttp import unstarted
+    p = make(env)
+    for probe in ("test -f out/now", "test -f state/ready/box1.READY"):   # a live probe is the named fact
+        assert coord.apply(p, [{"type": "task_add", "title": probe, "spec": "s", "start_when": probe}]) == []
+        assert not any(unstarted.RULE in n for n in p.db.kv(coord.NOTES_KEY) or [])
+    assert coord.apply(p, [{"type": "task_add", "title": "both", "spec": "s", "start_after": "2h",
+                            "start_when": "test -f out/now"}]) == []
+    assert _notes(p) == [] and not p.db.kv(unstarted.NUDGE_KV)
+    out = ["task_add: #12 added", "task_add: #1 added; flagged: x"]
+    unstarted.add_nudge(out, "task_add: #1", "task_add: #1 is deferred: rule")
+    assert out == ["task_add: #12 added", "task_add: #1 added; flagged: x; is deferred: rule"]
+    unstarted.add_nudge(out, "task_add: #2", "task_add: #2 is deferred: rule")
+    assert out[-1] == "task_add: #2 is deferred: rule"   # no note of its own yet: a new one
+
+
 @pytest.mark.parametrize("why", ["after #12 lands", "the nightly data must accumulate first",
                                  "the user answers the ask", "the shared box is reserved until then",
                                  "the release window opens at 18:00"])

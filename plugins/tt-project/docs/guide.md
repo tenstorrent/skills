@@ -521,9 +521,10 @@ prolonged whole-box outage.
   coordinator turn; neither wakes it on its own.
 - Deferral rule: work whose inputs are ready starts now in its own task without `start_after`; defer
   only for a named external fact (a time another party sets, data that must accumulate, a person, a
-  shared resource). A `task_add` with `start_after` or `start_when` whose `why` names none, or a
-  `task_update` adding spec to a task deferred more than 10 min, gets this as an action note. It
-  never refuses; the count is kept in `parked_work_nudges`.
+  shared resource). A `task_add` with `start_after` whose `why` names none (a `start_when` probe is
+  itself the named fact: the daemon checks it live), or a `task_update` adding spec to a task
+  deferred more than 10 min, gets this as an action note, inside the task's own note when the action
+  already has one. It never refuses; the count is kept in `parked_work_nudges`.
 - Ready steps of a waiting worker: a worker does every independent step of its spec before it hands
   off `waiting`, and lists each step it cannot finish whose inputs are ready as a follow-up titled
   `ready: ...`. The coordinator starts each one at once in its own task, never folded into a task

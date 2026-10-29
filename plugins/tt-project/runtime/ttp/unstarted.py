@@ -218,9 +218,10 @@ RULE = ("work whose inputs are ready starts now in its own task without start_af
 
 
 def parked_nudge(where: str, why: str | None, after: float | None, when: str | None) -> str | None:
-    """The advice for a deferral (start_after or start_when) whose `why` (or start_when probe) names no
-    external fact; None when there is no deferral or one is named (EXTERNAL)."""
-    if not (after or when) or EXTERNAL.search(f"{why or ''} {when or ''}"):
+    """The advice for a time-only deferral (start_after) whose `why` names no external fact; None when
+    there is none, one is named (EXTERNAL), or a start_when probe is set: the daemon checks that
+    condition live, so it is the named fact."""
+    if not after or when or EXTERNAL.search(why or ""):
         return None
     return (f"{where} is deferred with no external fact named"
             + (f" (why: {' '.join(str(why).split())[:80]!r})" if why else "") + f": {RULE}")
@@ -233,6 +234,16 @@ def update_nudge(where: str, task: dict, now: float) -> str | None:
     if task.get("status") not in ("queued", "waiting") or at - now <= DEFER_S:
         return None
     return f"{where} added work to a task that starts in {(at - now) / 60:.0f} min: {RULE}"
+
+
+def add_nudge(notes: list[str], where: str, nudge: str) -> None:
+    """Fold the nudge into this action's note for the same task, if one was written: one note per
+    action, so a flag already shown (a marker probe, a missing file) keeps its place."""
+    for i in range(len(notes) - 1, -1, -1):
+        if notes[i].startswith(where + " ") or notes[i].startswith(where + ";"):
+            notes[i] += "; " + nudge[len(where):].lstrip()
+            return
+    notes.append(nudge)
 
 
 def count_nudge(db, now: float | None = None) -> None:
