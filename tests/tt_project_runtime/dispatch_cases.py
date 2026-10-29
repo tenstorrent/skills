@@ -893,12 +893,15 @@ def test_one_cause_failing_three_tasks_starts_opens_the_breaker_holds_dispatch_a
         p.db.x("UPDATE tasks SET not_before=NULL")
         d.dispatch()
         assert p.db.one("SELECT COUNT(*) n FROM runs WHERE role!='coordinator'")["n"] == 3
-        # The retry: one start only, which fails at the same line; the breaker stays open.
-        p.db.set_kv(startbreaker.KEY, dict(startbreaker.state(p.db), tried=time.time() - startbreaker.RETRY_S - 1))
-        d.dispatch()
+        # The retry: one start only, on the task the cause has not failed yet, which fails at the same
+        # line; the breaker stays open. The next goes to the failed task tried least recently.
+        for _ in range(2):
+            p.db.x("UPDATE tasks SET not_before=NULL")
+            p.db.set_kv(startbreaker.KEY, dict(startbreaker.state(p.db), tried=time.time() - startbreaker.RETRY_S - 1))
+            d.dispatch()
         assert [r["task"] for r in p.db.q("SELECT task FROM runs WHERE role!='coordinator' ORDER BY id")] == \
-            ids[:3] + [ids[0]]
-        assert startbreaker.is_open(p.db)
+            ids[:3] + [ids[3], ids[0]]
+        assert startbreaker.is_open(p.db) and startbreaker.state(p.db)["tasks"] == ids
         assert all(int(p.db.task(t)["attempts"] or 0) == 0 for t in ids)
         # Task 0 failed twice, but both runs never started: they fold into the breaker's one alert.
         trig = coord.effort_triggers(p.db, d.cfg, [], None)[0]
@@ -915,6 +918,75 @@ def test_one_cause_failing_three_tasks_starts_opens_the_breaker_holds_dispatch_a
         assert not alerts.holds(p.db, "run-start", now - 5, now)
         # Closed, the never-started runs count again.
         assert "repeated failures" in coord.effort_triggers(p.db, d.cfg, [], None)[0]
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_cause_failing_only_some_tasks_never_holds_a_healthy_task_past_one_retry(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """Three urgent tasks fail at one shared line (their kind's prompt), which opens the breaker. The
+    retry goes to a queued task the cause has not failed, ahead of the failed ones, so the healthy task
+    starts on the first retry and closes the breaker, rather than each retry re-failing a bad task."""
+    from ttp import prompts, startbreaker
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=5)
+    try:
+        bad = [p.db.add_task(f"bad{i}", "s", kind="work", tier="light", origin="user", priority=1) for i in range(3)]
+        real = prompts.worker_system
+
+        def system(proj, task):
+            if task["id"] in bad:
+                raise KeyError("its kind's prompt")
+            return real(proj, task)
+        monkeypatch.setattr(prompts, "worker_system", system)
+        d.dispatch()
+        assert startbreaker.is_open(p.db) and startbreaker.state(p.db)["tasks"] == bad
+        good = p.db.add_task("healthy", "s", kind="work", tier="light", origin="user", priority=3)
+        p.db.x("UPDATE tasks SET not_before=NULL")
+        d.dispatch()
+        assert _slot_tasks(p) == [] and p.db.task(good)["blocked_reason"].startswith(startbreaker.HELD_NOTE)
+        p.db.set_kv(startbreaker.KEY, dict(startbreaker.state(p.db), tried=time.time() - startbreaker.RETRY_S - 1))
+        d.dispatch()
+        assert _slot_tasks(p) == [good] and not p.db.task(good)["blocked_reason"]
+        # Closed by that start, the bad tasks tried again in the same pass and reopened it: the cause is live.
+        assert startbreaker.is_open(p.db) and startbreaker.state(p.db)["tasks"] == bad
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_good_start_forgets_the_failures_before_it_and_a_retry_failing_elsewhere_holds_nothing(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """Failures on either side of a good start never add up to an open breaker; a retry that fails at
+    another line closes it, and the rest of that pass starts with no held note."""
+    from ttp import prompts, startbreaker
+    now = time.time()
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=5)
+    try:
+        for t in (1, 2):
+            startbreaker.record(p.db, "E at a.py:1", "E", 9000 + t, now, d._breaker_stamp())
+        good = p.db.add_task("starts fine", "s", kind="work", tier="light", origin="user", priority=3)
+        d.dispatch()
+        assert _slot_tasks(p) == [good] and not startbreaker.state(p.db).get("fails")
+        assert startbreaker.record(p.db, "E at a.py:1", "E", 9003, now, d._breaker_stamp())[0] is None
+        # Open on one line; the retry fails at another, and the next task starts in the same pass.
+        for t in (4, 5):
+            startbreaker.record(p.db, "E at a.py:1", "E", 9000 + t, now, d._breaker_stamp())
+        assert startbreaker.is_open(p.db)
+        first = p.db.add_task("fails elsewhere", "s", kind="work", tier="light", origin="user", priority=1)
+        second = p.db.add_task("starts", "s", kind="work", tier="light", origin="user", priority=2)
+        real = prompts.worker_system
+
+        def system(proj, task):
+            if task["id"] == first:
+                raise ValueError("elsewhere")
+            return real(proj, task)
+        monkeypatch.setattr(prompts, "worker_system", system)
+        p.db.set_kv(startbreaker.KEY, dict(startbreaker.state(p.db), tried=time.time() - startbreaker.RETRY_S - 1))
+        d.dispatch()
+        assert not startbreaker.is_open(p.db)
+        assert _slot_tasks(p) == [good, second] and not p.db.task(second)["blocked_reason"]
+        assert "None" not in (p.db.task(first)["blocked_reason"] or "")
     finally:
         drain(d)
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"

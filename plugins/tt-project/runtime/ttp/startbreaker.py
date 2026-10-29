@@ -2,15 +2,19 @@
 broken install) holds dispatch behind one alert instead of failing each queued task in turn.
 
 Model-free. Its state is the kv KEY, so it survives a daemon restart:
-{"fails": [[ts, sig, task], ...] (the last WINDOW_S of failed starts), and while open
-"open" (when), "sig", "why" (the first error), "tasks", "tried" (the last retry) and "stamp"
-(the config and runtime it opened under)}.
+{"fails": [[ts, sig, task], ...] (the last WINDOW_S of failed starts since the last good start), and
+while open "open" (when), "sig", "why" (the first error), "tasks" (the tasks it failed), "tried" (the
+last retry), "tried_at" (task id -> its last failed start) and "stamp" (the config and runtime it
+opened under)}.
 
 A failed start's signature is its exception type and the runtime file:line it was raised at
 (daemon._raised_at). The same signature on MIN_TASKS different tasks within WINDOW_S opens the
-breaker: no worker starts (a held start is no attempt), except one retry every RETRY_S. It closes
-once a start succeeds, the retry fails elsewhere (that line no longer fails it), or the config or
-runtime changes. A single task's own failures never open it."""
+breaker: no worker starts (a held start is no attempt), except one retry every RETRY_S. The retry
+goes to a ready task the cause has not failed yet, else to the failed one tried least recently
+(probe_first), so a cause that fails only some tasks cannot hold the healthy ones. It closes once a
+start succeeds, the retry fails elsewhere (that line no longer fails it), or the config or runtime
+changes. A single task's own failures never open it, and any good start forgets the failures before
+it (started)."""
 from __future__ import annotations
 
 from typing import Callable
@@ -43,12 +47,15 @@ def record(db, sig: str, why: str, task_id: int, now: float, stamp: str) -> tupl
         said = f"run-start breaker closed: the retry failed elsewhere ({sig}), not at {st.get('sig')}"
         st = {}
     st["fails"] = fails
-    if st.get("open"):
+    if st.get("open"):   # the retry failed at its line again: open, with one more task tried
         st["tried"] = now
+        st["tasks"] = sorted(set(st.get("tasks") or []) | {task_id})
+        st["tried_at"] = {**(st.get("tried_at") or {}), str(task_id): now}
     else:
         tasks = sorted({f[2] for f in fails if f[1] == sig})
         if len(tasks) >= MIN_TASKS:
-            st.update(open=now, sig=sig, why=why[:300], tasks=tasks, tried=now, stamp=stamp)
+            st.update(open=now, sig=sig, why=why[:300], tasks=tasks, tried=now, stamp=stamp,
+                      tried_at={str(f[2]): f[0] for f in fails if f[1] == sig})
             said = f"run-start breaker opened: {sig} failed the starts of tasks {', '.join(f'#{t}' for t in tasks)}"
     db.set_kv(KEY, st)
     return (st if st.get("open") else None), said
@@ -68,6 +75,25 @@ def gate(db, now: float, stamp: Callable[[], str]) -> tuple[str, str]:
     if now - float(st.get("tried") or 0) >= RETRY_S:
         return "probe", ""
     return "held", ""
+
+
+def probe_first(db, ready: list, now: float) -> list:
+    """`ready` in the order a due retry tries it: tasks the open breaker's cause has not failed first
+    (in their own order), then the failed ones, least recently tried first. Unchanged otherwise."""
+    st = state(db)
+    if not st.get("open") or now - float(st.get("tried") or 0) < RETRY_S:
+        return ready
+    failed, tried = set(st.get("tasks") or []), st.get("tried_at") or {}
+    return sorted(ready, key=lambda t: (t["id"] in failed, float(tried.get(str(t["id"])) or 0)))
+
+
+def started(db) -> bool:
+    """A start succeeded: the breaker closes and its failures are forgotten, so failures on either
+    side of a good start never add up. Whether it was open."""
+    st = state(db)
+    if st:
+        close(db)
+    return bool(st.get("open"))
 
 
 def close(db) -> None:

@@ -6905,6 +6905,7 @@ class Daemon:
         free = max(gate0.max_parallel - busy.get(core, 0), 0) if gate0 and gate0.allow_new_work else 0
         fate: dict[int, str] = {}   # task id -> a schedlog reason, "full" or "picked" (_log_slot_fill)
         probing, probe_tried = None, False   # the task whose start retries an open run-start breaker this tick
+        ready = startbreaker.probe_first(db, ready, now)   # a due retry goes to a task its cause has not failed
         for task in ready:
             if not self.lease_held():   # lapsed during this tick (a slow start or store): start nothing more
                 break
@@ -7068,10 +7069,11 @@ class Daemon:
             except Exception as e:
                 self._start_failed(task, e)
                 self._unreserve(task)
+                if probing == task["id"] and not startbreaker.is_open(db):   # it failed elsewhere: closed
+                    probing, probe_tried = None, False
                 continue
             self._start_failures = 0
-            if probing == task["id"]:   # the retry started: the breaker closes and dispatch resumes
-                startbreaker.close(db)
+            if startbreaker.started(db):   # the retry started: the breaker closes and dispatch resumes
                 log(self.p, f"run-start breaker closed: task {task['id']}'s run started")
                 probing, probe_tried = None, False
             fate[task["id"]] = "picked"
