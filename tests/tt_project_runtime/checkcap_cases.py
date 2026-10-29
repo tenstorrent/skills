@@ -1701,7 +1701,7 @@ def test_every_checks_key_the_runtime_reads_is_an_account_key_and_settable(env):
     read = set(re.findall(r'["\']checks\.([a-z_]+)["\']', src))
     for kind in (testslots.TESTS, testslots.BUILDS):
         read |= {kind.setting(s)[1] for s in ("pool", "run_max", "project_max")}
-    read -= {"json", "log", "out", "pid", "queued", "rc"}   # file names (checks.json), not keys
+    read -= {"dropped", "json", "log", "out", "pid", "queued", "rc"}   # file names (checks.json), not keys
     # project-only: the project's own lock or queue wrapper, set by the user per project
     read -= {"wrap_cmd"}
     # a chat-only alias of checks.slots (coordinator.ALIASES), not a key the runtime reads

@@ -26804,6 +26804,7 @@ DURABLE_EXEMPT = {
     ("cli.py", 'open(log, "a")'): "the output log of `ttp checks`; its result is written with write_json",
     ("cli.py", "CHECKS_OUT, \"wb\")"): "the output of detached `ttp checks`; its exit code goes to checks.rc, durably",
     ("cli.py", '"checks.log", "a")'): "the output log of `ttp checks`; a stop notice",
+    ("cli.py", 'open(run_dir / name, "a")'): "a dropped-from-the-queue notice in checks.out and checks.log; the result goes to checks.dropped and checks.rc, durably",
     ("cli.py", 'open(log, "w")'): "the output of `ttp clip`, for reading; the command's exit code is passed on",
     ("cli.py", '"upgrade.log", "a")'): "a log",
     ("cli.py", "SOURCE_FILE).write_text"): "part of a copied runtime tree; committed or re-installed by setup",
