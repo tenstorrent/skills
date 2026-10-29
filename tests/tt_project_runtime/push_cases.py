@@ -5640,9 +5640,21 @@ def test_a_passed_probe_reads_the_push_queues_rejected_commit_git_before_its_fin
     t = s.p.db.task(rid)
     assert t["status"] == "queued" and f"carries unreviewed commits from #{x}" in json.loads(t["result"])["woke"]
     assert reads == [False, False], f"the rejected-commit check read git inside the transaction: {reads}"
-    git = [a for a in spawned if isinstance(a, list)   # _read_inherited's commands
-           and ({"show", "patch-id", "for-each-ref"} & set(a) or {"rev-list", "--no-merges"} <= set(a))]
-    assert not git, f"the push queue's git ran inside the finish transaction: {git}"
+    # Nothing else spawns inside either probe-pass transaction but local ref-metadata git, millisecond
+    # reads a settled design accepts there: a code task's _auto_review (rev-parse, remote, diff --numstat,
+    # a one-commit rev-list) and a review's check_approval (rev-parse, merge-base --is-ancestor). No
+    # history walk, patch or other child holds the write lock.
+    def ref_read(a):
+        if not isinstance(a, list) or not a or a[0] != "git":
+            return False
+        i = 1
+        while i < len(a) and a[i] in ("-C", "-c"):
+            i += 2
+        sub, rest = (a[i], set(a[i + 1:])) if i < len(a) else ("", set())
+        return sub in ("rev-parse", "remote", "symbolic-ref") or (sub == "merge-base" and "--is-ancestor" in rest) \
+            or (sub == "rev-list" and bool({"-n1", "--count"} & rest)) or (sub == "diff" and "--numstat" in rest)
+    other = [a for a in spawned if not ref_read(a)]
+    assert not other, f"a child other than a local ref read ran inside the finish transaction: {other}"
     assert not d._git_memo, "a memo outlived its transaction"
 
 def test_the_push_queue_accepts_a_head_stacked_on_a_passed_branch_landed_or_not(env, monkeypatch):
