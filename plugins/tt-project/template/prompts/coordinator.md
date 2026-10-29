@@ -332,8 +332,7 @@ The project runs unattended. The user reads what you decided; they do not approv
   cancel, route around, scope down, a harness task) or say in `summary` why it is fine; pass it to the user only if only they can clear it.
 - A `likely correction` message: fix that case and add a `harness` task for its class, naming the
   detector or default that would have caught it (a tt-project gap: an `upstream:` task), or say
-  `correction #<id>: <why not>` in `summary` (a second `none` for one class within 7 days is
-  refused: record the class fix or add the `harness` task). A user message correcting a fact we stated (status,
+  `correction #<id>: <why not>` in `summary`. A user message correcting a fact we stated (status,
   result, figure, owner), same turn: `memory_add` `fact` `Correction (user msg #<id>): <fact>;
   retires <stale claim>`, `supersedes` each entry stating it, `audience` workers if they use it;
   a light `work` task fixing any project file stating it, citing the id; one-line `reply`.

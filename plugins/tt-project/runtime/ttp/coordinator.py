@@ -1088,7 +1088,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
             if m["broadcast"]:   # `ttp say --all`: every project got these words; none relays them on
                 head += f" [{broadcast.label(m['broadcast'])}]"
             if m["id"] in flagged:
-                head += correction.tag(flagged[m["id"]])
+                head += correction.tag(flagged[m["id"]], m["id"])
             if (m["context"] or "").strip():   # relayed with the relayer's own text: keep the two apart
                 lines.append(f"{head} {relay.VERBATIM}: {m['text']}")
                 lines.append(f"  {relay.CONTEXT}: {m['context']}")

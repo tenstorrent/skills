@@ -16336,6 +16336,41 @@ def test_a_repeated_instruction_is_flagged_with_its_first_message_and_needs_a_cl
         assert correction.phrase(said)
 
 
+def test_a_repeated_request_needs_a_queued_change_or_a_correction_line_never_an_explanation_alone(env):
+    """A user saying a request was already made and answered with no change ('I told you a million
+    times', 'like 10 times', 'why was nothing done') is flagged as a repeated request. Its tag and
+    Course check line ask for a queued task with a measurable change or `correction #<id>: <why not>`:
+    a reply alone leaves it open; a queued code task (not a question) or the line clears it."""
+    from ttp import correction
+    p = make(env)
+    told = _said(p, "I told you a million times: cut the idle wakes.")
+    tens = _said(p, "I asked you and the other project to optimize this like 10 times")
+    none = _said(p, "Why was nothing done about the slow reviews?")
+    plain = [_said(p, "Retry the flaky job 3 times."), _said(p, "Tell me again what the status is"),
+             _said(p, "Run it again tomorrow."), _said(p, "What is the status of the docs?")]
+    flagged = correction.flag(p.db, p.config(), _rows(p, told, tens, none, *plain))
+    assert set(flagged) == {told, tens, none}, flagged
+    assert all(w.startswith("repeated request '") for w in flagged.values()), flagged
+    tag = correction.tag(flagged[told], told)
+    assert f"`correction #{told}: <why not>`" in tag and "measurable change" in tag
+    now = time.time()
+    # An explanation alone (a reply, a question task) is no fix: the Course check line asks again.
+    correction.settle(p.db, {"corrections": {str(told): flagged[told]}},
+                      [{"type": "reply", "text": "the queue was full"},
+                       {"type": "task_add", "kind": "question", "title": "why idle wakes"}], "explained", now - 1, now)
+    lines = correction.digest_lines(p.db, now + 1)
+    assert len(lines) == 1 and f"user message #{told} repeats a request" in lines[0], lines
+    assert "an explanation alone is no answer" in lines[0]
+    # A queued code task clears the next one; a `correction #<id>:` line clears the other.
+    correction.settle(p.db, {"corrections": {str(tens): flagged[tens]}},
+                      [{"type": "task_add", "kind": "code", "title": "cut idle wakes by half"}], "queued", now - 1, now)
+    p.db.add_task("cut idle wakes by half", kind="code") if hasattr(p.db, "add_task") else None
+    correction.settle(p.db, {"corrections": {str(none): flagged[none]}}, [],
+                      f"correction #{none}: the reviews were fixed in #12", now - 1, now)
+    recs = {r["msg"]: r for r in p.db.kv(correction.KEY)}
+    assert recs[none]["fix"] == "reason" and recs[told]["fix"] == ""
+
+
 def test_short_outbound_and_week_old_sentences_never_count_as_repeats(env):
     from ttp import correction
     p = make(env)

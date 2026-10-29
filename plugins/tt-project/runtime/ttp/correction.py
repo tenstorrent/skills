@@ -18,7 +18,11 @@ relay re-send (`resends`: the same words delivered twice within RESEND_S, or rel
 context) are never flagged: neither is the user saying something again. The digest tags the message
 `[likely correction: <why>]`. After the turn (`settle`), each flagged message is recorded with its
 class fix: a `harness` task (or one titled `upstream: ...`) the turn added, or the turn's `summary`
-naming `correction #<id>` with its reason. A second reason ('none') within REFUSE_S for the same class
+naming `correction #<id>` with its reason. A repeated request (`request`: 'I told you', 'N times',
+'asked ... again', 'why was nothing done') is one the user says was already made and answered with no
+change: its tag and Course check line ask for a queued task with a measurable change (any task kind
+but a question or plan counts as its fix) or `correction #<id>: <why not>`; an explanation alone is no
+fix. A second reason ('none') within REFUSE_S for the same class
 (a shared anchor, or a repeat of the same first message) is refused: it stays without a class fix.
 One with neither, or refused, gets a Course check line in the next digest (a refused one until a
 harness task comes, for up to a day; `digest_lines`). The daily review's efficiency audit lists each
@@ -46,6 +50,16 @@ PHRASES = ("why didn't", "why did nobody", "why did no one", "why hasn't", "why 
            "nobody noticed", "no one noticed", "didn't notice", "failed to notice", "failing to notice",
            "should have noticed", "should have caught", "lack of progress", "no progress",
            "i already asked", "i already told", "i told you", "as i said", "many times")
+# A repeated request: the user says a request was already made and answered without a change.
+_ASKED = r"(?:asked|asking|told|telling|said|saying|requested|mentioned|reminded)"
+_REQUEST = re.compile(
+    r"\bi(?: have| had|'ve)? (?:already )?(?:told|asked) you\b"
+    rf"|\b{_ASKED}\b[^.?!\n]{{0,60}}\b(?:\d+|many|several|multiple|countless)\s+times\b"
+    r"|\b(?:a (?:million|hundred|thousand|dozen)|so many|countless) times\b"
+    r"|\bwhy (?:was|is|has|did) nothing\b|\bnothing (?:was|has been|got|is being) done\b"
+    rf"|\b{_ASKED}\b[^.?!\n]{{0,40}}\bagain\b|\b(?:once|yet) again\b")
+REQUEST = "repeated request"
+NOT_FIX_KINDS = ("question", "plan")   # a repeated request's fix is a queued change, not more analysis
 # Event kinds of a stall detector (no progress on a task or the project). Any such event not yet
 # handled makes the next user message a likely correction.
 STALL_KINDS = ("no_progress", "stall")
@@ -93,6 +107,13 @@ def phrase(text: str) -> str:
     """The first PHRASES entry in `text`, or ''."""
     low = " ".join(str(text or "").lower().replace("’", "'").split())
     return next((x for x in PHRASES if x in low), "")
+
+
+def request(text: str) -> str:
+    """The words of `text` saying a request was already made and answered without a change, or ''."""
+    low = " ".join(str(text or "").lower().replace("’", "'").split())
+    m = _REQUEST.search(low)
+    return m.group(0) if m else ""
 
 
 def sentences(text: str) -> list[tuple[str, ...]]:
@@ -292,6 +313,9 @@ def flag(db: DB, cfg: dict | None, msgs: list[dict], now: float | None = None) -
     for m in msgs:
         if m.get("direction", "in") != "in":
             continue
+        if hit := request(m.get("text") or ""):
+            out[int(m["id"])] = f"{REQUEST} '{hit[:40]}'"
+            continue
         hit = phrase(m.get("text") or "")
         if hit:
             out[int(m["id"])] = f"phrase '{hit}'"
@@ -308,14 +332,21 @@ def flag(db: DB, cfg: dict | None, msgs: list[dict], now: float | None = None) -
     return out
 
 
-def tag(why: str) -> str:
+def tag(why: str, mid: int | None = None) -> str:
+    if str(why).startswith(REQUEST):   # answered before with no change: this turn queues one or says why not
+        return (f" [likely correction: {why}: queue a task with a measurable change or say "
+                f"`correction #{mid if mid is not None else '<id>'}: <why not>` in summary; an explanation alone "
+                "is no answer]")
     return f" [likely correction: {why}]"
 
 
-def class_fix(db: DB, actions: list, summary: str, mid: int, since: float) -> str:
-    """The turn's class fix for message `mid`: '#<task>' it added, 'reason' its summary gave, or ''."""
+def class_fix(db: DB, actions: list, summary: str, mid: int, since: float, why: str = "") -> str:
+    """The turn's class fix for message `mid`: '#<task>' it added, 'reason' its summary gave, or ''.
+    For a repeated request (`why`) any queued change counts: a task of a kind not in NOT_FIX_KINDS."""
+    req = str(why or "").startswith(REQUEST)
     titles = [str(a.get("title") or "") for a in actions if isinstance(a, dict) and a.get("type") == "task_add"
-              and (a.get("kind") in FIX_KINDS or str(a.get("title") or "").strip().lower().startswith("upstream:"))]
+              and (a.get("kind") in FIX_KINDS or str(a.get("title") or "").strip().lower().startswith("upstream:")
+                   or (req and str(a.get("kind") or "work") not in NOT_FIX_KINDS))]
     if titles:
         row = db.one(f"SELECT id FROM tasks WHERE created>=? AND title IN ({','.join('?' * len(titles))}) "
                      "ORDER BY id LIMIT 1", (since, *titles))
@@ -360,13 +391,13 @@ def settle(db: DB, note: dict, actions: list, summary: str, started: float, now:
     for r in recs:
         if not r.get("fix") and (not r.get("shown") or r.get("refused")) and float(r.get("ts") or 0) < started:
             r["shown"] = True
-            r["fix"] = _refuse(recs, r, class_fix(db, actions, summary, int(r["msg"]), started)
+            r["fix"] = _refuse(recs, r, class_fix(db, actions, summary, int(r["msg"]), started, r.get("why") or "")
                                or _later_fix(db, float(r["ts"])), now)
     got = {int(k): v for k, v in (note.get("corrections") or {}).items()}
     texts = {int(r["id"]): r["text"] or "" for r in db.q(
         f"SELECT id, text FROM messages WHERE id IN ({','.join('?' * len(got))})", list(got))} if got else {}
     for mid, why in got.items():
-        fix = class_fix(db, actions, summary, mid, started)
+        fix = class_fix(db, actions, summary, mid, started, str(why))
         if mid in by_msg:
             by_msg[mid]["fix"] = by_msg[mid].get("fix") or _refuse(recs, by_msg[mid], fix, now)
             continue
@@ -385,7 +416,12 @@ def digest_lines(db: DB, now: float | None = None) -> list[str]:
     now = time.time() if now is None else now
     got = _pending(db, now)
     out = []
-    plain = [r for r in got if not r.get("refused")]
+    asks = [r for r in got if not r.get("refused") and str(r.get("why") or "").startswith(REQUEST)]
+    for r in asks:
+        out.append(f"- repeated request without a change: user message #{r['msg']} repeats a request already "
+                   "answered and got no queued task | queue a task with a measurable change, or say "
+                   f"`correction #{r['msg']}: <why not>` in summary; an explanation alone is no answer")
+    plain = [r for r in got if not r.get("refused") and r not in asks]
     if plain:
         ids = ", ".join(f"#{r['msg']}" for r in plain)
         one = plain[0]["msg"] if len(plain) == 1 else "<id>"
