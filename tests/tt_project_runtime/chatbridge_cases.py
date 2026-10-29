@@ -812,7 +812,8 @@ def test_a_start_whose_tier_leaves_the_route_rechecks_the_core_slots(env, monkey
     assert _route_slots(p, d, monkeypatch, 2, chat_max=2, tag="free") == [(core, None)]
 
 
-def _route_finish(p, d, tid, exit_info, provider="chat", result=None):
+def _route_finish(p, d, tid, exit_info, provider="chat", result=None, reply=None, earlier=None):
+    """`reply`: the run's final reply text (its output.jsonl result line); `earlier`: an earlier turn's text."""
     p.db.update_task(tid, status="running")
     note = {"route": {"tier": "light", "to": "chat", "model": _RT_MODEL, "fallback": "none"}}
     rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) "
@@ -822,6 +823,12 @@ def _route_finish(p, d, tid, exit_info, provider="chat", result=None):
     rd.mkdir(parents=True)
     if result is not None:
         (rd / "result.json").write_text(result if isinstance(result, str) else json.dumps(result))
+    if reply is not None:
+        turn = lambda text: {"type": "assistant", "message": {"id": f"m{len(text)}", "content": [{"type": "text", "text": text}]}}
+        lines = [turn(earlier)] if earlier is not None else []
+        lines += [turn(reply), {"type": "result", "subtype": "success", "is_error": False, "total_cost_usd": 0.0,
+                                "usage": {}, "result": reply, "session_id": "s-1"}]
+        (rd / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
     p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(rd), rid))
     d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
                  {"rc": 1, "started": time.time() - 30, "ended": time.time(), **exit_info})
@@ -941,6 +948,70 @@ def test_a_routed_run_that_ends_without_a_hand_off_falls_back_once(env, monkeypa
     prov, _, note = _route_dispatch(p, d, monkeypatch, title="other")
     assert prov == "chat" and note[route.KEY]["fallback"] == "none"
     assert f"fell back ({cause} 1)" in route.phrase(p.db)
+
+
+_SALVAGE_OBJ = {"status": "done", "summary": "removed the claims {and kept a brace} in a string", "artifacts": ["a.md"]}
+
+
+@pytest.mark.parametrize("reply,kept", [
+    (f"Done.\n\n```json\n{json.dumps(_SALVAGE_OBJ, indent=1)}\n```\n", True),        # one fenced object
+    (f"All done, hand-off: {json.dumps(_SALVAGE_OBJ)} -- that is all.", True),          # one bare object
+    (f"```json\n{json.dumps(_SALVAGE_OBJ)}\n```\nor {json.dumps(_SALVAGE_OBJ)}", False),  # two objects
+    ('```json\n{"status": "done", "summary": "x",}\n```', False),                       # does not parse
+    ('{"status": "finished", "summary": "x"}', False),                                   # no hand-off status
+    ('["done"]', False),                                                                 # not an object
+    ('{"status": "done", "summary": "cut off', False),                                    # never closed
+    ("I wrote the hand-off.", False),                                                    # none
+])
+def test_a_routed_run_keeps_one_hand_off_from_its_final_reply(env, monkeypatch, reply, kept):
+    from ttp import route
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    tid = p.db.add_task("build", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    run, task = _route_finish(p, d, tid, {"rc": 0, "bridge": {"last_fault": "", "faults": {}}}, reply=reply)
+    e = route.of(run["note"])
+    path = Path(run["dir"]) / "result.json"
+    if kept:   # written as its result.json and judged as a hand-off: no fallback, the task done
+        assert json.loads(path.read_text()) == _SALVAGE_OBJ
+        assert run["status"] == "ok" and task["status"] == "done" and e["salvaged"] is True
+        assert e["fallback"] == "none" and route.fell_back_before(p.db, tid) is None
+        assert route.phrase(p.db) == "routed 24h: 1 run to chat, 1 hand-off salvaged"
+        assert "ok (salvaged)" in route.runs_text(route.runs(p.db, "light", time.time() - 3600))
+    else:      # exactly as before: no file, a no_handoff fallback
+        assert not path.exists() and run["status"] == "fallback" and "salvaged" not in e
+        assert e["fallback"] == "no_handoff" and e["cause"] == "exited without result.json"
+
+
+def test_hand_off_salvage_leaves_written_results_other_providers_failed_runs_and_earlier_turns(env, monkeypatch):
+    from ttp import route
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    ok = {"rc": 0, "bridge": {"last_fault": "", "faults": {}}}
+    reply = json.dumps(_SALVAGE_OBJ)
+    new = lambda: p.db.add_task(f"build {time.time()}", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    # A result.json the run wrote stays as it is, valid or not, whatever its reply says.
+    for written, status in (({"status": "failed", "summary": "own"}, "ok"), ({"status": "finished"}, "fallback")):
+        run, _ = _route_finish(p, d, new(), ok, result=written, reply=reply)
+        assert json.loads((Path(run["dir"]) / "result.json").read_text()) == written
+        assert run["status"] == status and "salvaged" not in route.of(run["note"])
+    # A run on the core provider (a fallback start) is never salvaged here.
+    core = d.cfg.get("core_provider", "claude")
+    run, _ = _route_finish(p, d, new(), {"rc": 0}, provider=core, reply=reply)
+    assert not (Path(run["dir"]) / "result.json").exists() and "salvaged" not in route.of(run["note"])
+    # A failed or timed-out run has no final reply: no salvage, it falls back.
+    for end in ({"rc": 1}, {"rc": None, "stopped": "timeout"}):
+        run, _ = _route_finish(p, d, new(), {**end, "bridge": {"last_fault": ""}}, reply=reply)
+        assert not (Path(run["dir"]) / "result.json").exists() and run["status"] == "fallback"
+    # Only the final reply is read: a hand-off in an earlier turn is not.
+    run, _ = _route_finish(p, d, new(), ok, reply="Finished.", earlier=reply)
+    assert not (Path(run["dir"]) / "result.json").exists() and route.of(run["note"])["fallback"] == "no_handoff"
+    assert route.salvage(reply, ("done",)) == _SALVAGE_OBJ and route.salvage(reply, ("waiting",)) is None
 
 
 def test_a_routed_run_cut_by_the_budget_or_a_kill_is_no_fallback(env, monkeypatch):

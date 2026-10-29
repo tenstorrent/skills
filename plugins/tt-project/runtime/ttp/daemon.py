@@ -3279,6 +3279,17 @@ class Daemon:
             task = db.task(r["task"])
             if task:
                 self._adopt_misplaced_handoff(r, task, run_dir)
+        # A routed run that printed its hand-off in its final reply instead of writing it keeps it
+        # (route.salvage): written as its result.json, so it is judged as one and does not fall back.
+        salvaged = on_route and bool(r["task"]) and status == "ok" and not (run_dir / RESULT_FILE).exists() \
+            and (found := route.salvage(usage.final_text, HANDOFF_STATES)) is not None
+        if salvaged:
+            try:
+                durable_write(run_dir / RESULT_FILE, json.dumps(found, indent=1))
+                log(p, f"run {r['id']} of task {r['task']}: hand-off salvaged from its final reply into {RESULT_FILE}")
+            except OSError as e:   # not written: the run falls back as it would have
+                salvaged = False
+                log(p, f"run {r['id']}: salvaging its hand-off failed: {e}")
         handed_off = r["role"] != "coordinator" and \
             (_read_result(run_dir / RESULT_FILE) or {}).get("status") in HANDOFF_STATES
         if status == "timeout" and handed_off:
@@ -3305,7 +3316,7 @@ class Daemon:
             self._end_net_hold(r["provider"], f"run {r['id']} reached its API")
         note = json.loads(r["note"] or "{}")
         if routed:
-            note[route.KEY] = {**routed, **({"fallback": fell} if fell else {}),
+            note[route.KEY] = {**routed, **({"fallback": fell} if fell else {}), **({"salvaged": True} if salvaged else {}),
                                **({"cause": _route_cause(stopped or status, exit_info, usage, run_dir)} if own else {}),
                                **({"priced": priced} if priced is not None else {}),
                                "wall_s": round(float(exit_info.get("ended") or time.time()) - float(r["started"] or 0), 1)}

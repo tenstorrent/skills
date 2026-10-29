@@ -31,6 +31,14 @@ failed; a clean exit without a valid result.json: no_handoff) falls back the sam
 cool-down: the endpoint is fine, the run was not. Its task's later runs start on the core provider
 (`rerun`), so a task falls back on its own at most once. A run that handed off (even `failed`) ended
 on its merits: no fallback; a failed light try is retried a tier up as usual.
+
+Salvage: a routed run on the endpoint that exited cleanly without a result.json but printed its
+hand-off in its final reply keeps it (salvage): exactly one top-level JSON object in that reply,
+fenced (```json) or bare, that passes the check a written result.json gets (a JSON object whose
+status is a hand-off state) is written as result.json, and the run's route entry says `salvaged`.
+No object, several, or one that does not parse or pass: no salvage, the run falls back as above.
+Tool output and earlier turns are never read, no field is filled in, and a run that wrote its own
+result.json (valid or not) is left as it is.
 """
 from __future__ import annotations
 
@@ -117,6 +125,41 @@ def fell_back(status: str, exit_info: dict) -> str:
     return ""
 
 
+def _objects(text: str) -> list[str]:
+    """Each top-level {...} span of `text`, braces inside JSON strings ignored; an unclosed one counts
+    too, so a cut-off object is never mistaken for none."""
+    spans, depth, start, quoted, escaped = [], 0, 0, False, False
+    for i, ch in enumerate(text):
+        if quoted:
+            escaped, quoted = (False, True) if escaped else (ch == "\\", ch != '"')
+        elif ch == '"' and depth:
+            quoted = True
+        elif ch == "{":
+            start = i if depth == 0 else start
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0:
+                spans.append(text[start:i + 1])
+    if depth:
+        spans.append(text[start:])
+    return spans
+
+
+def salvage(final_text: str, states) -> dict | None:
+    """The hand-off a routed run printed in its final reply instead of writing result.json: its one
+    top-level JSON object when that is a hand-off (status in `states`), else None (none, several, or
+    one that does not parse or pass)."""
+    spans = _objects(final_text or "")
+    if len(spans) != 1:
+        return None
+    try:
+        data = json.loads(spans[0])
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) and data.get("status") in states else None
+
+
 def own_cause(status: str) -> str:
     """Why a routed run that handed off nothing falls back on its own (RUN_CAUSES), '' for an end that
     is no fallback (killed, out of budget, lost, a limit or the auth gate)."""
@@ -174,7 +217,7 @@ def _rows(db, since: float, until: float | None = None) -> list[dict]:
         if e:
             out.append({**{k: r[k] for k in ("id", "task", "provider", "model", "status", "cost_usd")},
                         "tier": e.get("tier"), "to": e.get("to"), "fallback": e.get("fallback") or "none",
-                        "priced": e.get("priced"),
+                        "priced": e.get("priced"), "salvaged": bool(e.get("salvaged")),
                         "effort": e.get("effort") if isinstance(e.get("effort"), dict) else None,
                         "wall_s": round(float(r["ended"]) - float(r["started"]), 1) if r["ended"] and r["started"] else None})
     return out
@@ -182,7 +225,8 @@ def _rows(db, since: float, until: float | None = None) -> list[dict]:
 
 def phrase(db, now: float | None = None) -> str:
     """The last 24 h of routing in one short phrase for `ttp status` and the web budget line
-    ('routed 24h: 6 runs to chat, 2 fell back (down 1, rate_limit 1); light high: reasoning_effort=xhigh',
+    ('routed 24h: 6 runs to chat, 2 fell back (down 1, rate_limit 1), 1 hand-off salvaged; light high:
+    reasoning_effort=xhigh',
     each routed tier's latest effort fields last), '' with none."""
     now = now or time.time()
     rows = _rows(db, now - 86400, now + 1)
@@ -200,6 +244,8 @@ def phrase(db, now: float | None = None) -> str:
         text += f", {len(fell)} fell back ({', '.join(f'{k} {n}' for k, n in sorted(why.items()))})"
     if reruns:
         text += f", {reruns} rerun{'s' if reruns != 1 else ''} on core"
+    if salvaged := sum(1 for r in on if r.get("salvaged")):   # hand-offs kept from a final reply (salvage)
+        text += f", {salvaged} hand-off{'s' if salvaged != 1 else ''} salvaged"
     last = {}   # each routed tier's latest effort fields (effort_fields), as the endpoint got them
     for r in on:
         if r["effort"]:
@@ -230,6 +276,7 @@ def runs(db, tier: str | None, since: float, until: float | None = None) -> list
             continue
         out.append({"id": r["id"], "task": r["task"], "tier": t, "provider": r["provider"], "model": r["model"],
                     "outcome": r["status"], "fallback": (e or {}).get("fallback", ""),
+                    "salvaged": bool((e or {}).get("salvaged")),
                     "priced": (e or {}).get("priced"), "cost_usd": round(float(r["cost_usd"] or 0), 4),
                     "wall_s": round(float(r["ended"]) - float(r["started"]), 1) if r["ended"] and r["started"] else None})
     return out
@@ -241,7 +288,8 @@ def runs_text(rows: list[dict]) -> str:
     lines = ["run    task   tier      provider  model                          outcome                wall      cost"]
     for r in rows:
         cost = "unpriced" if r["priced"] is False else f"${r['cost_usd']:.2f}"
-        out = r["outcome"] + (f" ({r['fallback']})" if r["fallback"] not in ("", "none") else "")
+        out = r["outcome"] + (f" ({r['fallback']})" if r["fallback"] not in ("", "none") else "") \
+            + (" (salvaged)" if r.get("salvaged") else "")
         wall = f"{r['wall_s'] / 60:.1f}m" if r["wall_s"] is not None else "-"
         lines.append(f"{r['id']:<6} {str(r['task'] or ''):<6} {str(r['tier'] or '-'):<9} {str(r['provider']):<9} "
                      f"{str(r['model'] or '-')[:30]:<30} {out[:22]:<22} {wall:>6} {cost:>9}")

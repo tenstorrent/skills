@@ -571,7 +571,10 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    out or stalled: `timeout`; it failed or its request was refused: `failed`; it exited cleanly with
    no valid `result.json`: `no_handoff`) also falls back with no attempt spent, but without a
    cool-down; the task's later runs start on the core provider (`rerun`), so each task falls back
-   this way at most once. Each fallback's reason (and, for a run's own end, a short `cause`) is in
+   this way at most once. A routed run that exits cleanly with no `result.json` but prints exactly
+   one valid hand-off JSON object (fenced or bare) in its final reply keeps it: the daemon writes it
+   as `result.json` and marks the run `salvaged`, counted in the `routed 24h:` phrase and `ttp stats
+   --runs`. Each fallback's reason (and, for a run's own end, a short `cause`) is in
    the run's `route` record. A run that hands off, even `failed`, is retried a tier up as usual.
    `"route_timeout_s"` next to a routed tier's `model` sets the time limit of its routed runs in
    place of the tier's `budget.run_timeout_s`; a start on the core provider keeps the tier default.
