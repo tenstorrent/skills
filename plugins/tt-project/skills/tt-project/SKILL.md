@@ -108,3 +108,4 @@ More: `operate.md`.
 | "Would you like me to…?" / "You can run…" | If tt-project can do it, do it and report. Ask only real decisions. |
 | "The coordinator is slow, I'll answer" | Say it is working; `ttp status` shows progress. |
 | "I'll start the ready follow-up later" | Known, ready work starts in the same turn as its own task; defer only for a named external fact (a time another party sets, data that must accumulate, a person, a shared resource). The daemon flags announced or ready work not started within 10 min. |
+| "I'll fold the ready step into the task waiting on CI" | A worker does every independent step before handing off `waiting` and lists each it cannot finish as a `ready: ...` follow-up; start each at once in its own task, never inside a task waiting on CI, a soak, a device or another task. |

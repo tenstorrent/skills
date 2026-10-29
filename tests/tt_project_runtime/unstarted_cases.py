@@ -191,3 +191,42 @@ def test_parked_nudge_when_task_update_adds_spec_to_work_deferred_over_10_min(en
     assert coord.apply(p, [{"type": "task_update", "id": far, "spec": "also do the second step"}]) == []
     assert [n.split(" added")[0] for n in _notes(p)] == [f"task_update: #{far}"]
     assert p.db.kv(unstarted.NUDGE_KV)["n"] == 1
+
+
+def test_ready_followup_of_a_hand_off_is_announced_work_owned_by_the_task_that_takes_it_up(env):
+    """A `ready:` follow-up is a ready-work signal: none taken up in 10 min names owner none; a later task
+    titled as it is its owner, held externally raises nothing, and its run clears the event."""
+    from ttp import unstarted
+    p = make(env)
+    _no_events(p)
+    src = p.db.add_task("wait on the soak", "s", kind="code", tier="light", origin="coordinator", priority=3)
+    fups = [{"title": "ready: write the release notes for the soak change", "spec": "x"},
+            {"title": "continue: read the soak result", "spec": "y"}]
+    p.db.update_task(src, status="waiting", result=json.dumps({"status": "waiting", "followups": fups}))
+    t0 = time.time()
+    p.db.x("INSERT INTO runs(task, role, provider, started, ended, status) VALUES(?,?,?,?,?,?)",
+           (src, "worker", "claude", t0 - 300, t0, "done"))
+    assert unstarted.announced(p, t0 + 540) == []
+    assert unstarted.announced(p, t0 + 610) == [f"announced_not_started:f{src}.0"], "only the ready: one"
+    ev = _unstarted_events(p, "announced_not_started")[0]
+    assert "Owner: none" in ev["text"] and "write the release notes" in ev["text"]
+    # Taken up by a task with the step as its title, parked behind a dependency on the waiting task.
+    own = p.db.add_task("Write the release notes for the soak change", "s", kind="work", tier="light",
+                        origin="coordinator", priority=3, depends_on=[src])
+    assert "dependency" in (unstarted.external_hold(p.db, p.db.task(own), {}) or "")
+    unstarted.announced(p, t0 + 620)
+    assert p.db.one("SELECT status FROM events WHERE id=?", (ev["id"],))["status"] == "handled", \
+        "an owner held by a task still waiting is an external hold: retired, no turn"
+    # A short step text is not matched by chance in another task's spec.
+    src2 = p.db.add_task("other", "s", kind="code", tier="light", origin="coordinator", priority=3)
+    p.db.update_task(src2, status="done", result=json.dumps({"followups": [{"title": "Ready: bump"}]}))
+    p.db.x("INSERT INTO runs(task, role, provider, started, ended, status) VALUES(?,?,?,?,?,?)",
+           (src2, "worker", "claude", t0 - 300, t0, "done"))
+    p.db.add_task("unrelated", "please bump the counter", kind="work", tier="light", origin="coordinator")
+    assert unstarted.announced(p, t0 + 700) == [f"announced_not_started:f{src2}.0"]
+    taker = p.db.add_task("bump", "s", kind="work", tier="light", origin="coordinator")
+    p.db.x("INSERT INTO runs(task, role, provider, started, status) VALUES(?,?,?,?,?)",
+           (taker, "worker", "claude", t0 + 710, "running"))
+    unstarted.announced(p, t0 + 720)
+    assert p.db.one("SELECT status FROM events WHERE fingerprint=?",
+                    (f"announced_not_started:f{src2}.0",))["status"] == "handled", "its owner started"

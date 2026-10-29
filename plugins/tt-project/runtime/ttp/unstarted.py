@@ -4,7 +4,8 @@
 (Daemon.check_unstarted). Observation only: dispatch never reads these events.
 
 announced(): each open promise (obligations.py's records, no second ledger) and each queued, blocked or
-waiting task announced in a reply (reply_chat set) that no open promise owns. When ANNOUNCED_S after it
+waiting task announced in a reply (reply_chat set) that no open promise owns, and each `ready:` follow-up
+of a hand-off (_ready_followups: owned by the later task that takes it up, else 'none'). When ANNOUNCED_S after it
 was made (ANNOUNCED_P1_S when an owner has priority 1) no owner task has a run started since then, and
 no owner is held by a recorded external condition (external_hold), one keyed `announced_not_started`
 event names it, its owner ('none' when it has none), its age and what parks it (parked). The event is
@@ -36,6 +37,7 @@ READY_S = 600           # a ready task with a free slot not started after this
 READY_P1_S = 120        # priority 1 or urgent
 DEFER_S = 600           # task_update adding spec to a task deferred further than this gets the nudge
 MAX_AGE_S = 86400
+READY_TITLE = re.compile(r"(?i)^\s*ready\s*:\s*")   # a hand-off follow-up whose inputs are ready now
 START_SLACK_S = 60      # a run started just before the reply that announced it counts
 NUDGE_KV = "parked_work_nudges"   # kv: {"n": total, "day": "YYYY-MM-DD", "today": n, "at": ts}
 LIVE = ("queued", "blocked", "waiting", "review")
@@ -137,6 +139,29 @@ def _subjects(db, now: float) -> list[dict]:
         if t["id"] not in owned:
             out.append({"key": f"t{t['id']}", "what": f"task #{t['id']} {t['title'][:100]} (announced in a reply)",
                         "created": float(t["created"]), "owners": [t["id"]]})
+    return out + _ready_followups(db, now)
+
+
+def _ready_followups(db, now: float) -> list[dict]:
+    """Each `ready:` follow-up of a hand-off (a step the worker could not finish whose inputs are ready),
+    from when its run ended. Its owners are the later tasks titled as it (with or without the `ready:`
+    prefix) or whose spec quotes its title; none yet is owner 'none'."""
+    out = []
+    for src in db.q("SELECT t.id, t.result, MAX(r.ended) ended FROM tasks t JOIN runs r ON r.task=t.id "
+                    "WHERE t.result LIKE '%ready:%' AND r.ended>=? GROUP BY t.id", (now - MAX_AGE_S,)):
+        fups = load_result(src["result"]).get("followups")
+        titles = [str(f["title"]).strip() for f in fups if isinstance(f, dict)
+                  and READY_TITLE.match(str(f.get("title") or ""))] if isinstance(fups, list) else []
+        if not titles:
+            continue
+        later = db.q("SELECT id, title, spec FROM tasks WHERE id>?", (src["id"],))
+        for i, title in enumerate(titles):
+            step = READY_TITLE.sub("", title).strip().lower()
+            quotes = [title.lower()] + ([step] if len(step) >= 20 else [])   # a short step text matches by chance
+            owners = [t["id"] for t in later if (t["title"] or "").strip().lower() in (title.lower(), step)
+                      or any(q in (t["spec"] or "").lower() for q in quotes)]
+            out.append({"key": f"f{src['id']}.{i}", "what": f"follow-up {title[:160]!r} of #{src['id']}",
+                        "created": float(src["ended"]), "owners": owners})
     return out
 
 
