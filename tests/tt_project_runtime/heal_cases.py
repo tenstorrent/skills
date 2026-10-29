@@ -638,7 +638,7 @@ def test_heal_detached_fix_holds_its_lock_and_reads_busy_until_it_ends(env):
     from ttp.daemon import Daemon
     held, go, runs = (env["repo"] / n for n in ("held", "go", "runs"))
     p, d, up = _heal_setup(env, resource="dev-x", fix_detached=True, check=f"echo x >> {runs}; test -e {env['repo'] / 'up'}",
-                           fix=f'echo "$TTP_LOCKS_HELD" > {held}; while [ ! -e {go} ]; do sleep 0.1; done; '
+                           fix=f'echo "$TTP_LOCKS_HELD" > {held}; while [ ! -e {go} ]; do {_nap(0.1)}; done; '
                                f'touch {env["repo"] / "up"}')
     spec, now = _heal_spec(p), time.time()
     assert spec["fix_timeout_s"] == heal.FIX_TIMEOUT_S > heal.MAX_TIMEOUT_S
@@ -4077,7 +4077,7 @@ def test_an_auto_undo_claim_survives_a_restart_and_is_paged_never_run_twice(env,
     mm.add("box-a", tags="device")
     t0 = time.time()
     ran, gate = tmp_path / "ran", tmp_path / "gate"
-    cid = _auto_change(ml, p, f"echo ran >> {ran}; while ! test -e {gate}; do sleep 0.05; done", t0)
+    cid = _auto_change(ml, p, f"echo ran >> {ran}; while ! test -e {gate}; do {_nap()}; done", t0)
     crashed = _auto_change(ml, p, f"echo crashed >> {ran}", t0)
     at = t0 + 3601
     first = ml.Probes(p, log=lambda m: None)

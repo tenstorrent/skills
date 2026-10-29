@@ -1295,10 +1295,10 @@ def test_a_build_within_its_share_through_clip_or_checks_or_outside_a_worker_is_
 
 
 # Host-wide build slots (testslots.BUILDS) ----------------------------------------------------------
-_FAKE_MAKE = """#!/bin/sh
+_FAKE_MAKE = f"""#!/bin/bash
 echo "args=$* MAKEFLAGS=$MAKEFLAGS CMAKE=$CMAKE_BUILD_PARALLEL_LEVEL" > "$MAKE_SEEN"
 echo $$ > "$MAKE_SEEN.pid"
-while [ -n "$MAKE_STOP" ] && [ ! -e "$MAKE_STOP" ]; do sleep 0.05; done
+while [ -n "$MAKE_STOP" ] && [ ! -e "$MAKE_STOP" ]; do {_nap()}; done
 """
 
 
@@ -2796,8 +2796,8 @@ me=$1; other=$2; dir=$3
 { echo "port=$TTP_PORT_BASE"; echo "tmp=$TMPDIR"; echo "out=$TTP_CHECK_OUTPUT_DIR"; echo "pwd=$(pwd)"; } > "$dir/$me.env"
 mkdir "$TMPDIR/scratch" && touch "$TTP_CHECK_OUTPUT_DIR/$me.mark"
 touch "$dir/$me.up"
-i=0; while [ ! -e "$dir/$other.up" ]; do i=$((i+1)); [ $i -lt 600 ] || exit 9; sleep 0.05; done
-'''
+i=0; while [ ! -e "$dir/$other.up" ]; do i=$((i+1)); [ $i -lt 600 ] || exit 9; ''' + _nap() + """; done
+"""
 
 
 def test_two_full_checks_of_one_repository_run_at_once_without_sharing_ports_scratch_or_output(

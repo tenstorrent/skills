@@ -115,7 +115,7 @@ def test_two_identical_queued_checks_of_a_task_run_one_suite_and_both_report_its
     from ttp import checkjoin
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     count, go = tmp_path / "count", tmp_path / "go"
-    cmd = f"echo x >> {count}; while [ ! -e {go} ]; do sleep 0.05; done; exit {rc}"
+    cmd = f"echo x >> {count}; while [ ! -e {go} ]; do {_nap()}; done; exit {rc}"
     first = _checks_proc(p, repo, tmp_path / "run-a", 7, cmd)
     second = None
     try:
@@ -143,7 +143,7 @@ def test_two_identical_queued_checks_of_a_task_run_one_suite_and_both_report_its
 def test_a_newer_head_does_not_stop_a_running_check_and_a_different_head_is_not_joined(env, tmp_path, monkeypatch):
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     count, go = tmp_path / "count", tmp_path / "go"
-    cmd = f"echo x >> {count}; while [ ! -e {go} ]; do sleep 0.05; done"
+    cmd = f"echo x >> {count}; while [ ! -e {go} ]; do {_nap()}; done"
     first = _checks_proc(p, repo, tmp_path / "run-a", 7, cmd)
     second = None
     try:

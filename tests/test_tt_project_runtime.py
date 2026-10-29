@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+import atexit
 import contextlib
 import errno
 import gettext
@@ -14601,9 +14602,25 @@ def test_one_dispatch_tick_does_not_commit_past_the_caps(env):
     assert p.db.task(huge)["status"] == "blocked", "a task that can never fit must say so, not wait forever"
 
 
+_NAP_FIFO: list[str] = []
+
+
+def _nap(seconds=0.05):
+    """A wait loop's pause as a shell command that forks nothing under bash 4+: `read -t` on a FIFO
+    nobody writes returns after `seconds`. Other shells (dash, bash 3) fail the read at once and take
+    the `sleep`. Polling with `sleep` forked tens of processes a second per waiting test, enough to
+    load a host running three suites side by side."""
+    if not _NAP_FIFO:
+        d = tempfile.mkdtemp(prefix="ttp-nap-")
+        atexit.register(shutil.rmtree, d, True)
+        os.mkfifo(os.path.join(d, "fifo"))
+        _NAP_FIFO.append(os.path.join(d, "fifo"))
+    return f"{{ read -t {seconds} <>{shlex.quote(_NAP_FIFO[0])} || [ $? -gt 128 ] || sleep {seconds}; }} 2>/dev/null"
+
+
 def _until(flag):
     """A command that runs until the file `flag` exists: the test decides when it ends."""
-    return ["sh", "-c", f"while [ ! -e {shlex.quote(str(flag))} ]; do sleep 0.05; done"]
+    return ["bash", "-c", f"while [ ! -e {shlex.quote(str(flag))} ]; do {_nap()}; done"]
 
 
 def _exclusive_run_detaching(p, task_id, run_id, run_dir, job_cmd, wait=True, opts=()):
@@ -18114,7 +18131,7 @@ def _probe_until_done(p, probe, timeout=60):
 
 def _gated_check(started, gate):
     """A check that touches started, then waits for gate (or for the test's folder to go away)."""
-    return f"touch {started}; while [ ! -e {gate} ] && [ -d {gate.parent} ]; do sleep 0.05; done"
+    return f"touch {started}; while [ ! -e {gate} ] && [ -d {gate.parent} ]; do {_nap()}; done"
 
 
 def _wait_gone(pid, deadline):
@@ -23289,7 +23306,7 @@ def test_machines_add_copies_the_list_in_the_background_past_a_down_host(env, tm
     bin_, gate, calls = tmp_path / "bin", tmp_path / "gate", tmp_path / "ssh.log"
     bin_.mkdir()
     (bin_ / "ssh").write_text(f"#!/bin/bash\necho \"$*\" >> {calls}\n"
-                              f"for i in $(seq 300); do [ -e {gate} ] && break; sleep 0.1; done\n"
+                              f"for i in $(seq 300); do [ -e {gate} ] && break; {_nap(0.1)}; done\n"
                               "echo 'connect to host far-down port 22: Connection timed out' >&2; exit 255\n")
     (bin_ / "ssh").chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
@@ -23327,7 +23344,7 @@ def test_two_quick_machine_changes_keep_both_background_copies_results(env, tmp_
     from ttp.project import register
     bin_, gate = tmp_path / "bin", tmp_path / "gate"
     bin_.mkdir()
-    (bin_ / "ssh").write_text(f"#!/bin/bash\nfor i in $(seq 300); do [ -e {gate} ] && break; sleep 0.1; done\n"
+    (bin_ / "ssh").write_text(f"#!/bin/bash\nfor i in $(seq 300); do [ -e {gate} ] && break; {_nap(0.1)}; done\n"
                               "echo \"connection timed out (copy $COPY_ID)\" >&2; exit 255\n")
     (bin_ / "ssh").chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
@@ -34895,7 +34912,7 @@ def test_a_detached_job_keeps_its_own_temp_dir_after_its_run_ends_and_it_goes_wh
     run_dir = p.runs / "8"
     (run_dir / "tmp").mkdir(parents=True)
     go, seen = tmp_path / "go", tmp_path / "seen"
-    script = (f'while [ ! -e {go} ]; do sleep 0.05; done; echo "$TMPDIR $TMP $TEMP" >{seen}; '
+    script = (f'while [ ! -e {go} ]; do {_nap()}; done; echo "$TMPDIR $TMP $TEMP" >{seen}; '
               'echo scratch >"$TMPDIR/x.s" && cat "$TMPDIR/x.s"')
     tmp_env = {var: str(run_dir / "tmp") for var in ("TMPDIR", "TMP", "TEMP")}
     r = _ttp_run(p, "detach", "build", "--", "sh", "-c", script, env={"TTP_RUN_DIR": str(run_dir), **tmp_env})
@@ -35061,8 +35078,8 @@ def test_detach_remote_runs_the_driver_over_ssh_and_its_check_reports_running_th
     run_dir.mkdir(parents=True)
     e = {**_ssh_stub(tmp_path), "TTP_RUN_DIR": str(run_dir)}
     go = tmp_path / "go"
-    r = _ttp_run(p, "detach", "--remote", "box-a", "drv", "--", "sh", "-c",
-                 f"echo hi; while [ ! -e {go} ]; do sleep 0.1; done; exit 3", env=e)
+    r = _ttp_run(p, "detach", "--remote", "box-a", "drv", "--", "bash", "-c",
+                 f"echo hi; while [ ! -e {go} ]; do {_nap(0.1)}; done; exit 3", env=e)
     assert r.returncode == 0, r.stderr
     remote = tmp_path / "home" / ".ttp-detach" / "21"   # the default folder, under the remote home
     for ext in ("pid", "boot", "start"):
@@ -36492,7 +36509,7 @@ def test_devq_runner_records_an_attempt_before_the_job_starts_so_a_successor_can
     started the attempt again, found its lock held, and failed the job without its exit code."""
     d, go, seen = devq_dir, tmp_path / "go", tmp_path / "seen"
     _devq_submit(d, {}, "rec-1", f"cat {d}/running/rec-1.state.json > {seen}.t; mv {seen}.t {seen}; "
-                 f"while [ ! -e {go} ]; do sleep 0.05; done; exit 7")
+                 f"while [ ! -e {go} ]; do {_nap()}; done; exit 7")
     assert _wait_for_path(seen)
     pid = _devq_job_pid(d, "rec-1")
     st = json.loads(seen.read_text() or "{}")
@@ -36575,7 +36592,7 @@ def test_devq_restart_requeues_a_job_a_reboot_killed_and_adopts_one_still_runnin
     assert "kind=interrupted" in (d / "drops.log").read_text()
     # Only the runner dies: its successor waits for the job and takes its exit code, no drop.
     go = tmp_path / "go"
-    _devq_submit(d, {}, "long-2", f"touch {tmp_path / 'started2'}; while [ ! -e {go} ]; do sleep 0.05; done; exit 7")
+    _devq_submit(d, {}, "long-2", f"touch {tmp_path / 'started2'}; while [ ! -e {go} ]; do {_nap()}; done; exit 7")
     assert _wait_for_path(tmp_path / "started2")
     _devq_job_pid(d, "long-2")
     os.kill(int((d / "runner.pid").read_text()), signal.SIGKILL)

@@ -15,8 +15,8 @@ def _lock(run_env, *args, cmd=("true",)):
 
 def _mark(marks, name, flag=None):
     """A command that appends `start <name>` to marks, runs until `flag` exists (when given), then `end <name>`."""
-    wait = f"while [ ! -e {shlex.quote(str(flag))} ]; do sleep 0.05; done; " if flag else ""
-    return ("sh", "-c", f"echo 'start {name}' >> {shlex.quote(str(marks))}; {wait}"
+    wait = f"while [ ! -e {shlex.quote(str(flag))} ]; do {_nap()}; done; " if flag else ""
+    return ("bash", "-c", f"echo 'start {name}' >> {shlex.quote(str(marks))}; {wait}"
                         f"echo 'end {name}' >> {shlex.quote(str(marks))}")
 
 
@@ -208,7 +208,7 @@ def test_one_resource_lock_runs_its_whole_command_and_probe_parsing_is_unchanged
 def _nested_lock(flag, res):
     """A command that waits for `flag`, then runs a `ttp lock <res> -- true` inside it."""
     inner = shlex.join([sys.executable, str(TTP), "lock", res, "--", "true"])
-    return ("sh", "-c", f"while [ ! -e {shlex.quote(str(flag))} ]; do sleep 0.05; done; {inner}")
+    return ("bash", "-c", f"while [ ! -e {shlex.quote(str(flag))} ]; do {_nap()}; done; {inner}")
 
 
 def test_a_lock_holders_nested_lock_never_waits_behind_a_multi_waiter_for_its_own_lock(env, tmp_path):
@@ -624,11 +624,11 @@ def _probing_driver(marks, release, tries=15):
     after `tries` busy probes; its try runs under `ttp lock board`, then it runs until `release` exists."""
     q = shlex.quote
     ttp = f"{q(sys.executable)} {q(str(TTP))}"
-    return ["sh", "-c",
+    return ["bash", "-c",
             f"n=0; until {ttp} lock --probe board >> {q(str(marks))}.probe 2>&1; do n=$((n+1)); "
-            f"[ $n -ge {tries} ] && {{ echo 'gave up' >> {q(str(marks))}; exit 9; }}; sleep 0.1; done; "
+            f"[ $n -ge {tries} ] && {{ echo 'gave up' >> {q(str(marks))}; exit 9; }}; {_nap(0.1)}; done; "
             f"{ttp} lock board -- sh -c 'echo try1 >> {q(str(marks))}' || exit 8; "
-            f"while [ ! -e {q(str(release))} ]; do sleep 0.05; done"]
+            f"while [ ! -e {q(str(release))} ]; do {_nap()}; done"]
 
 
 def test_a_driver_probing_its_own_runs_kept_hold_starts_its_try_and_the_hold_then_ends(env, tmp_path):

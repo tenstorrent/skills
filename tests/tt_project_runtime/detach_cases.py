@@ -185,7 +185,7 @@ def _remote_mirror_job(env, tmp_path, script, name="drv"):
     run_dir.mkdir(parents=True)
     e = _ssh_stub(tmp_path)
     rdir = tmp_path / "remote"
-    r = _ttp_run(p, "detach", "--remote", "box-m", "--dir", str(rdir), name, "--", "sh", "-c", script,
+    r = _ttp_run(p, "detach", "--remote", "box-m", "--dir", str(rdir), name, "--", "bash", "-c", script,
                  env={**e, "TTP_RUN_DIR": str(run_dir)})
     assert r.returncode == 0, r.stderr
     return p, run_dir, rdir, _remote_probe(r.stdout), e
@@ -274,7 +274,7 @@ def test_detach_remote_mirror_unreachable_before_the_end_stays_255_and_the_keepe
     from ttp import detach, hold
     go = tmp_path / "go"
     p, run_dir, rdir, probe, e = _remote_mirror_job(
-        env, tmp_path, f"echo step1; while [ ! -e {go} ]; do sleep 0.1; done; echo step2; exit 5")
+        env, tmp_path, f"echo step1; while [ ! -e {go} ]; do {_nap(0.1)}; done; echo step2; exit 5")
     pid = int((rdir / "drv.pid").read_text())
     try:
         assert _wait_for_path(rdir / "drv.log") and _until_true(lambda: (rdir / "drv.log").read_text().strip())
