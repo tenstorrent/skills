@@ -15,11 +15,13 @@ to its first run, or to now for one still queued:
 - review_sweep: a code task's last run ending to its review task being queued. Limits
   review.sweep_after_s, judged only on the reviews the sweep queued (its review_swept events), and
   review.unreviewed_per_pass (against the backlog of tasks in review now).
-- review_stall: the same end to the review's first run. Limit coordinator.review_stall_s, the age at
-  which a waiting review is raised at all.
-  Neither limit is lowered for a review wait the checks held (slot-held): checkcap's waits log for the
-  code task (its own checks, or the precheck the daemon starts on its head as it queues the review)
-  and, for the stall, the review's precheck hold (Daemon._precheck_holds) cover half of it.
+- review_stall: the same end to the review's first run, against coordinator.review_stall_s (the age at
+  which a waiting review is raised). Reported only: plan() never lowers it, since a sooner alarm starts
+  no review sooner. Its waits the checks did not hold (free) are reported apart, as information.
+  A review wait the checks held (slot-held) does not lower review.sweep_after_s and is not free:
+  checkcap's waits log for the code task (its own checks, or the precheck the daemon starts on its head
+  as it queues the review) and, for the stall, the review's precheck hold (Daemon._precheck_holds)
+  cover half of it.
 - push_batch: a push-queue row's approval to its batch's start. Limit delivery.push_batch_s, judged
   only on the rows the window alone held (no other batch ran while they waited).
 - landed_chain / deferral: `start_when` waits (a `landed:#<id>` chain or another probe); provider_gate:
@@ -65,12 +67,13 @@ WAIT_S = 1800         # any other task: tens of minutes, or one median run if ru
 CPU_FREE = 0.75       # headroom: 1-minute load under this share of the host's cores
 ROWS = 5000
 # The settings apply() may change: each sizes how soon queued work starts and is accepted by config_set.
+# coordinator.review_stall_s stays only so `--undo` can restore an earlier change: plan() never proposes it.
 LEVERS = ("budget.max_parallel_workers", "review.sweep_after_s", "review.unreviewed_per_pass",
           "coordinator.review_stall_s", "delivery.push_batch_s")
 # Keys never changed here, whatever LEVERS says.
 FORBIDDEN = re.compile(r"usd|spend|cap\b|_cap|gate|lock|hold|pause|restrict|review\.auto|before_push|reserve"
                        r"|credit|provider|budget\.(?!max_parallel_workers$)", re.I)
-FLOORS = {"review.sweep_after_s": 300, "coordinator.review_stall_s": 1800, "delivery.push_batch_s": 60}
+FLOORS = {"review.sweep_after_s": 300, "delivery.push_batch_s": 60}
 
 
 def safe(key: str) -> bool:
@@ -483,6 +486,13 @@ def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
             continue
         key, cur, name = ln.get("limit_key"), ln.get("limit"), ln["lane"]
         p90 = max(ln["p90_s"], ln["p1_p90_s"])
+        if name == "review_stall":
+            # Never lowered: a sooner alarm starts no review sooner, it only adds coordinator wakes.
+            n, fp90, held = ln.get("free_count", 0), ln.get("free_p90_s", 0), ln.get("slot_held", 0)
+            kept.append({"lane": name, "key": key, "why": f"{n} review wait(s) not held by the checks (p90 {fp90}s), "
+                         f"{held} held by their precheck or a checks slot: information only, no {key} change is "
+                         "proposed from them (a lower stall alarm only adds coordinator wakes)"})
+            continue
         if not key or not safe(key):
             kept.append({"lane": name, "key": key, "why": ln.get("note") or (
                 f"{name} has no setting this may change: its cause is outside the project's sizing limits"
@@ -534,18 +544,6 @@ def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
                 kept.append({"lane": name, "key": key, "why": f"{ln['count'] - n} of {ln['count']} row(s) waited "
                              f"behind a running batch or its checks; {n} held by the {int(cur)}s window alone "
                              f"(p90 {wp90}s): a shorter window only means more batches, each a full check run"})
-        elif name == "review_stall":
-            target = max(FLOORS[key], int(cur // 2), int(th["other"]))
-            n, fp90, held = ln.get("free_count", 0), ln.get("free_p90_s", 0), ln.get("slot_held", 0)
-            if cur and int(cur) > target and n and th["other"] < fp90 < cur:
-                changes.append({"key": key, "old": int(cur), "new": target, "why": f"{n} review wait(s) not held by "
-                                f"the checks, p90 {fp90}s over threshold, under the {int(cur)}s alarm, so no stall "
-                                "was raised"})
-            elif held and not (n and fp90 > th["other"]):
-                kept.append({"lane": name, "key": key, "why": f"{held} of {ln['count']} review wait(s) were held by "
-                             "their precheck or a checks slot: a lower alarm only adds coordinator wakes"})
-            else:
-                kept.append({"lane": name, "key": key, "why": f"{key} is at its floor or not what held the waits"})
     return [c for c in changes if safe(c["key"])], kept
 
 

@@ -311,31 +311,44 @@ def test_throughput_keeps_push_window_and_sweep_unless_they_held_the_waits(env):
     assert {(c["key"], c["new"]) for c in changes if c["key"] in levers} == {("delivery.push_batch_s", 1800), ("review.sweep_after_s", 600)}
 
 
-def test_throughput_review_limits_are_not_lowered_for_waits_the_checks_held(env):
+def _tp_review(p, code_created, run_end, queued, started, labels=()):
+    """A code task whose run ended at `run_end`, and its review queued at `queued`, first run at `started`."""
+    code = _tp_task(p, "code change", code_created)
+    _tp_run(p, code, code_created, run_end)
+    rv = _tp_task(p, "Review", queued, labels=[f"auto_review:{code}", *labels])
+    p.db.x("UPDATE tasks SET kind='review' WHERE id=?", (rv,))
+    _tp_run(p, rv, started, started + 600, role="reviewer")
+    return code, rv
+
+
+def _tp_slot_wait(p, monkeypatch, task, queued_at, granted_at):
+    """A checks slot wait of `task`, logged by checkcap's own writer as the task's checks log it."""
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_TASK", str(task))
+    checkcap.record_wait(Path(p.db.path).parent, p.name, 3, queued_at, granted_at)
+    monkeypatch.delenv("TTP_TASK")
+
+
+def test_throughput_review_sweep_is_not_lowered_for_waits_the_checks_held(env, monkeypatch):
     from ttp import checkcap, throughput
     p = make(env)
     now = time.time()
     state = Path(p.db.path).parent
+    p.set_config("review.sweep_after_s", 1800)
+    p.set_config("coordinator.review_stall_s", 14400)
     # Swept 1 h after its code task's run ended, then 2.9 h to its first run: the code task's own checks
     # and the precheck the daemon started on its head waited for a checks slot most of both spans.
     t0 = now - 6 * 3600
-    code = _tp_task(p, "code change", t0 - 1800)
-    _tp_run(p, code, t0 - 1800, t0)
-    rv = _tp_task(p, "Review", t0 + 3600, labels=[f"auto_review:{code}"])
-    p.db.x("UPDATE tasks SET kind='review' WHERE id=?", (rv,))
-    _tp_run(p, rv, t0 + 14000, t0 + 14600, role="reviewer")
+    code, rv = _tp_review(p, t0 - 1800, t0, t0 + 3600, t0 + 14000)
     p.db.x("INSERT INTO events(ts, source, kind, severity, text, status, task) VALUES(?,?,?,?,?,?,?)",
            (t0 + 3600, "daemon", "review_swept", "normal", f"#{code} x; review #{rv} queued by the daemon.", "handled", code))
-    (state / checkcap.WAITS_LOG).write_text("".join(json.dumps({"task": code, "queued_at": q, "granted_at": g}) + "\n"
-                                                    for q, g in ((t0 + 60, t0 + 3000), (t0 + 3700, t0 + 13500))))
+    _tp_slot_wait(p, monkeypatch, code, t0 + 60, t0 + 3000)
+    _tp_slot_wait(p, monkeypatch, code, t0 + 3700, t0 + 13500)
     # Queued at finish, held about an hour by its precheck (its checks.pid start to its checks.rc).
     t1 = now - 3 * 3600
-    code2 = _tp_task(p, "code change 2", t1 - 1800)
-    _tp_run(p, code2, t1 - 1800, t1)
+    code2, rv2 = _tp_review(p, t1 - 1800, t1, t1 + 100, t1 + 5000)
     name = f"t{code2}-0123456789ab"
-    rv2 = _tp_task(p, "Review 2", t1 + 100, labels=[f"auto_review:{code2}", f"precheck:{name}"])
-    p.db.x("UPDATE tasks SET kind='review' WHERE id=?", (rv2,))
-    _tp_run(p, rv2, t1 + 5000, t1 + 5600, role="reviewer")
+    p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps([f"auto_review:{code2}", f"precheck:{name}"]), rv2))
     pc = state / "prechecks" / name
     pc.mkdir(parents=True)
     (pc / "checks.pid").write_text(json.dumps({"pid": 1, "ts": t1 + 100}))
@@ -349,16 +362,48 @@ def test_throughput_review_limits_are_not_lowered_for_waits_the_checks_held(env)
     changes, kept = throughput.plan(p.db, p.config(), rep)
     assert not [c for c in changes if c["key"] in levers], changes
     why = {k["lane"]: k["why"] for k in kept}
-    assert "2 of 2 review wait(s) were held by their precheck or a checks slot" in why["review_stall"]
+    assert "0 review wait(s) not held by the checks (p90 0s), 2 held by their precheck" in why["review_stall"]
     assert "1 held by the checks" in why["review_sweep"]
-    # Without the checks' records the same waits are the limits' own: both are lowered.
+    # Without the checks' records the sweep held its wait: it is lowered, the stall alarm still is not.
     (state / checkcap.WAITS_LOG).unlink()
     shutil.rmtree(pc)
     rep = throughput.measure(p.db, p.config(), now=now, gates={})
     assert (_tp_lane(rep, "review_stall")["free_count"], _tp_lane(rep, "review_sweep")["swept_count"]) == (2, 1)
     changes, _ = throughput.plan(p.db, p.config(), rep)
-    assert {(c["key"], c["old"], c["new"]) for c in changes if c["key"] in levers} == {
-        ("coordinator.review_stall_s", 14400, 7200), ("review.sweep_after_s", 1800, 900)}
+    assert {(c["key"], c["old"], c["new"]) for c in changes if c["key"] in levers} == {("review.sweep_after_s", 1800, 900)}
+
+
+def test_throughput_never_proposes_a_review_stall_change(env, monkeypatch):
+    from ttp import throughput
+    p = make(env)
+    now = time.time()
+    p.set_config("coordinator.review_stall_s", 14400)
+    # Live shape: one review held 4 h behind a checks slot, the free ones all under half the alarm.
+    t0 = now - 10 * 3600
+    code, _ = _tp_review(p, t0 - 600, t0, t0 + 60, t0 + 4 * 3600)
+    _tp_slot_wait(p, monkeypatch, code, t0 + 30, t0 + 4 * 3600 - 100)
+    for i, wait in enumerate((2352, 6012)):
+        start = t0 + 3600 * (i + 1)
+        _tp_review(p, start - 600, start, start + 60, start + wait)
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    rt = _tp_lane(rep, "review_stall")
+    assert rt["slow"] and (rt["count"], rt["slot_held"], rt["free_count"]) == (3, 1, 2) and rt["free_p90_s"] > 1800
+    changes, kept = throughput.plan(p.db, p.config(), rep)
+    assert "coordinator.review_stall_s" not in {c["key"] for c in changes}, changes
+    why = {k["lane"]: k["why"] for k in kept}["review_stall"]
+    assert "2 review wait(s) not held by the checks" in why and "1 held" in why and "information only" in why
+    # Free waits between half the alarm and the alarm, none held: still no change.
+    for i, wait in enumerate((9000, 11000)):
+        start = now - 7 * 3600 + 1800 * i
+        _tp_review(p, start - 600, start, start + 60, start + wait)
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    rt = _tp_lane(rep, "review_stall")
+    assert rt["free_count"] == 4 and 7200 < rt["free_p90_s"] < 14400
+    changes, _ = throughput.plan(p.db, p.config(), rep)
+    assert "coordinator.review_stall_s" not in {c["key"] for c in changes}, changes
+    rep = throughput.review(p, p.config(), do_apply=True, gates={}, now=now)
+    assert throughput._cfg(p.config(), "coordinator.review_stall_s", 0) == 14400 and not [
+        c for c in rep["changes"] if c["key"] == "coordinator.review_stall_s"]
 
 
 def test_throughput_idle_slots_are_not_raised_and_resource_lanes_are_only_reported(env, monkeypatch):
