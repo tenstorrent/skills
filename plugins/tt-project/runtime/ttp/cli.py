@@ -6806,7 +6806,7 @@ def cmd_config(a) -> None:
         _refuse_user_only_in_run(k)
     try:
         p.set_config(a.key, val)
-    except RuntimeError as e:   # project.json unreadable with no last good copy
+    except (RuntimeError, ValueError) as e:   # project.json unreadable with no last good copy; a section given one value
         die(str(e))
     print(f"{a.key} = {json.dumps(val)}")
 

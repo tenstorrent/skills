@@ -46,6 +46,8 @@ REMIND_S = DAY          # an open episode is broadcast again once, this long aft
 QUIET = "quiet"         # channel of a broadcast that stays out of chats (another project has the claim)
 CLAIM_TTL = DAY + 3600  # a claim its holder stopped renewing (gone, or no reminder) passes on after this
 FEED_DAYS = 7
+START_FAILED = "could not start a run: "   # a queued task's note after a failed run start (Daemon._start_failed)
+START_RETRY_S = 600.0   # a start failure retries within a minute; a task not due this soon was deferred
 LOGOUT_REMIND_S = (3600.0, 4 * 3600.0, 12 * 3600.0)   # a logout is reminded this long after it began, then daily
 WAITER_TTL = 1800.0     # a project's report into a logout claim counts this long (it renews every few minutes)
 # What the chat hears once an episode clears.
@@ -207,7 +209,10 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
     if kind == "pr-ready":   # the pr-watch watcher keeps the flag while the PR is out of draft unapproved
         return arg in (db.kv(prguard.UNAPPROVED_KEY, {}) or {}) and not prguard.approved(db, arg)
     if key == "run-start":
-        return not db.one("SELECT id FROM runs WHERE role!='coordinator' AND started>? LIMIT 1", (since,))
+        # Until every task whose start failed has started, been cancelled or deferred past its one-minute
+        # retry (START_FAILED): another task's run starting proves nothing about the cause.
+        return bool(db.one("SELECT id FROM tasks WHERE status='queued' AND blocked_reason LIKE ? "
+                           "AND COALESCE(not_before,0)<=? LIMIT 1", (START_FAILED + "%", now + START_RETRY_S)))
     if kind == "deploy":
         from . import deploy
         return deploy.holds(db, arg, now)

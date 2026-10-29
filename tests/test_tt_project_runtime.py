@@ -4654,10 +4654,15 @@ def test_the_web_app_drops_high_alerts_once_their_condition_clears(env):
     now = shown()
     assert now == ["an alert with no known condition"], "a cleared alert still asks for attention"
     assert status() == ["cleared"]
+    failed = p.db.add_task("its start failed", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(failed, status="queued", not_before=time.time() + 60,
+                     blocked_reason="could not start a run: AttributeError: x at daemon.py:1")
     d.alert("run-start", "Runs cannot start", "high")
     assert "Runs cannot start" in shown()
     p.db.x("INSERT INTO runs(role,provider,started,status) VALUES('worker','fake',?,'running')", (time.time() + 1,))
-    assert "Runs cannot start" not in shown(), "a run started since, yet the alert stayed"
+    assert "Runs cannot start" in shown(), "another task's run started: the failed one still cannot"
+    p.db.update_task(failed, status="running", blocked_reason=None)
+    assert "Runs cannot start" not in shown(), "the task whose start failed started, yet the alert stayed"
 
 
 def test_the_red_budget_alert_is_posted_after_the_gates_show_red(env, monkeypatch):

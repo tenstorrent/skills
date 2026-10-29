@@ -147,7 +147,7 @@ from .db import (CHANGES_NEEDED, HARNESS_MERGED_KEY, NOT_ABANDONED_SQL, PAUSE_BO
                  dependency_ids, pin_of, dump_result, load_result, review_subject, reviewed_ids, task_outcome, unplanned_abrupt,
                  without_deferral)
 from .project import rebase_replace
-from .project import (Project, command_env, deep_merge, layered, disk_resume_gb, durable_append, durable_write, git_fsync_env,
+from .project import (Project, bad_sections, command_env, deep_merge, layered, disk_resume_gb, durable_append, durable_write, git_fsync_env,
                       file_tail, hostname, nice_level, output_tail, own_free, own_push, push_allowed, zombie)
 from .providers import get_provider
 from .providers.base import FUNDS_RE, last_json_object, scratch_dir, service_path
@@ -420,6 +420,17 @@ def _push_not_landed(probe, rc) -> bool:
     return rc == push.NOT_PUSHED and (bud.result_wait(probe) or ("",))[0] == "push"
 
 
+def _raised_at(e: BaseException) -> str:
+    """ " at <file>:<line>" of the last frame of this runtime that the exception passed through (where
+    a start failure's cause is, without digging in the log), "" when none did."""
+    here = str(Path(__file__).resolve().parent)
+    at = ""
+    for fr in traceback.extract_tb(e.__traceback__):
+        if str(Path(fr.filename).resolve()).startswith(here + os.sep):
+            at = f" at {Path(fr.filename).name}:{fr.lineno}"
+    return at
+
+
 def log(p: Project, msg: str) -> None:
     p.logs.mkdir(parents=True, exist_ok=True)
     line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {redact.scrub(msg)}\n"
@@ -665,6 +676,7 @@ class Daemon:
         self.boot_at = runner.boot_time()
         self.gates: dict[str, bud.Gate] = {}
         self.cfg_status = "ok"
+        self._bad_sections: list[str] = []   # project.json sections holding no object, as last logged
         self._load_config()
         self._jev_pause = JevPause()
         self.jev = Jev(self.cfg, db=self.p.db, pause=self._jev_pause)
@@ -936,6 +948,13 @@ class Daemon:
                          "unavailable": "project.json is missing or not valid JSON and there is no last good copy: "
                                         "no new coordinator turns or worker runs"}[status])
         self.cfg_status = status
+        bad = bad_sections(raw)
+        if sorted(bad) != self._bad_sections:
+            if bad:   # once per distinct set: layered reads them as absent, so runs still start
+                log(self.p, "warning: project.json " + ", ".join(f"{k} = {json.dumps(v)[:60]}" for k, v in sorted(bad.items()))
+                    + ": a section of settings holds no object; read as absent (set its keys one by one: "
+                      "ttp config <section>.<key> VALUE)")
+            self._bad_sections = sorted(bad)
         db = self.p.db
         bad = status == "unavailable"
         if bad != bool(db.kv(CONFIG_UNREADABLE_KEY)):
@@ -9838,8 +9857,8 @@ class Daemon:
         """Nothing was launched, so no attempt is spent. The task waits a minute before the next try,
         so a lasting cause (a full disk, a broken install) cannot spin; three failures in a row alert."""
         db = self.p.db
-        why = f"could not start a run: {type(e).__name__}: {e}"[:400]
-        log(self.p, f"task {task['id']} {why}")
+        why = f"{alerts.START_FAILED}{type(e).__name__}: {e}{_raised_at(e)}"[:400]
+        log(self.p, f"task {task['id']} {why}\n" + "".join(traceback.format_exception(e)).rstrip()[-4000:])
         with db.tx():
             db.update_task(task["id"], status="queued", not_before=time.time() + 60, blocked_reason=why)
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",

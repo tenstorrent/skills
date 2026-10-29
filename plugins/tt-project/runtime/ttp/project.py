@@ -514,6 +514,45 @@ def _known_keys(path: list[str]) -> set[str] | None:
     return None
 
 
+def _is_section(parts: list[str]) -> bool:
+    """Whether project.json's `parts` holds an object of settings: a top-level section (budget, checks,
+    delivery, ...) or one provider's entry (providers.<name>)."""
+    if len(parts) == 1:
+        return isinstance(DEFAULT_CONFIG.get(parts[0]), dict) or parts[0] in EXTRA_KEYS or parts[0] == "checks"
+    return len(parts) == 2 and parts[0] == "providers"
+
+
+def section_value_problem(dotted: str, value: Any) -> str | None:
+    """Why `value` cannot be saved at `dotted`: a section of settings given one plain value (`ttp config
+    checks host_max` once saved "checks": "host_max", and every worker start then failed). None when fine."""
+    if value is None or isinstance(value, dict) or not _is_section(dotted.split(".")):
+        return None
+    hint = (" (host-wide checks settings are account-level: ttp config --account checks.host_max N)"
+            if dotted == "checks" else "")
+    return (f"{dotted} is a section of settings, not one value ({json.dumps(value)[:60]}): set one key in it, "
+            f"ttp config {dotted}.<key> VALUE{hint}")
+
+
+def bad_sections(raw: dict) -> dict[str, Any]:
+    """The sections of a project's own settings that hold no object ({dotted key: its value}): read as
+    absent (layered), never kept as the last good copy, and named by config_problems and the daemon."""
+    out = {k: v for k, v in raw.items() if v is not None and not isinstance(v, dict) and _is_section([k])}
+    prov = raw.get("providers")
+    if isinstance(prov, dict):
+        out.update({f"providers.{k}": v for k, v in prov.items() if v is not None and not isinstance(v, dict)})
+    return out
+
+
+def _without_bad_sections(raw: dict) -> dict:
+    bad = bad_sections(raw)
+    if not bad:
+        return raw
+    out = {k: v for k, v in raw.items() if k not in bad}
+    if any(k.startswith("providers.") for k in bad):
+        out["providers"] = {k: v for k, v in raw["providers"].items() if f"providers.{k}" not in bad}
+    return out
+
+
 def unknown_key_hint(dotted: str) -> str | None:
     """'unknown key ... (did you mean ...?)' when no part of the runtime reads `dotted`, else None."""
     parts = dotted.split(".")
@@ -757,7 +796,8 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     settings out of range and a push branch that can never be pushed to (push_branch_problem; with
     `root`, the code repo, its remotes are checked too) in a project's own settings, one line each. A
     local push branch of a repo with no remote is not one: reviews land on it (lands_locally)."""
-    out: list[str] = []
+    out: list[str] = [f"{k}: a section of settings holds {json.dumps(v)[:60]}, not an object: read as absent "
+                      f"(set its keys one by one: ttp config {k}.<key> VALUE)" for k, v in bad_sections(raw).items()]
 
     def walk(node: dict, path: list[str]) -> None:
         for k, v in node.items():
@@ -1105,6 +1145,8 @@ class Project:
                 if isinstance(kept, dict):
                     return copy.deepcopy(kept), "fallback"
             return {}, "unavailable" if self.established() else "ok"
+        if bad_sections(data):
+            return data, "ok"   # read with those sections absent (layered), never kept as the last good copy
         self._last_good = copy.deepcopy(data)
         try:
             # <=: two writes within one filesystem clock tick share an mtime.
@@ -1127,10 +1169,14 @@ class Project:
             # Writing the one key would make a project.json of defaults and that key alone.
             raise RuntimeError(f"{self.config_path} is missing or not valid JSON and there is no last good copy: "
                                f"restore it before changing settings")
+        if why := section_value_problem(dotted, value):
+            raise ValueError(why)
         node = raw
         parts = dotted.split(".")
         for p in parts[:-1]:
-            node = node.setdefault(p, {})
+            if not isinstance(node.get(p), dict):
+                node[p] = {}   # a section saved as one plain value (bad_sections) is replaced, not crashed on
+            node = node[p]
         node[parts[-1]] = value
         write_json(self.config_path, raw)
 
@@ -2132,10 +2178,10 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_sp
 
 
 def layered(raw: dict) -> dict:
-    """A project's settings: the defaults, then the account-level ones, then its project.json.
-    budget.timezone set nowhere is the project's home zone (UTC without one)."""
+    """A project's settings: the defaults, then the account-level ones, then its project.json (a section
+    holding no object read as absent: bad_sections). budget.timezone set nowhere is the project's home zone (UTC without one)."""
     cfg = deep_merge(DEFAULT_CONFIG, load_account_settings())
-    _merge_into(cfg, raw)
+    _merge_into(cfg, _without_bad_sections(raw))
     if isinstance(cfg.get("budget"), dict) and not cfg["budget"].get("timezone"):
         from .timefmt import zone_name
         cfg["budget"]["timezone"] = zone_name(raw)

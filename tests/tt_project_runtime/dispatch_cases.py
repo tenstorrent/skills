@@ -797,3 +797,61 @@ def test_an_unwritable_scheduler_log_never_stops_dispatch_and_is_reported_once(
     finally:
         drain(d)
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_config_section_saved_as_a_string_still_lets_runs_start(env, monkeypatch, tmp_path, reap_tmp_processes):
+    """`ttp config checks host_max` once saved project.json's "checks" as the string "host_max": every
+    run start then failed with "AttributeError: 'str' object has no attribute 'get'". A section that is
+    not an object reads as absent, with one warning naming the key, and the run starts."""
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
+    try:
+        raw = json.loads(p.config_path.read_text())
+        raw["checks"] = "host_max"
+        p.config_path.write_text(json.dumps(raw))
+        d._load_config()
+        d._load_config()   # warned once per distinct set of bad sections, not on every reload
+        tid = p.db.add_task("work", "s", kind="work", tier="light", origin="user", priority=3)
+        d.dispatch()
+        assert _slot_tasks(p) == [tid], p.db.task(tid)["blocked_reason"]
+        warned = [ln for ln in (p.logs / "daemon.log").read_text().splitlines() if 'checks = "host_max"' in ln]
+        assert len(warned) == 1 and "read as absent" in warned[0], warned
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_failed_start_names_its_line_logs_the_traceback_and_never_stops_the_next_task(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """One task's start failing leaves it queued with a note naming the runtime file and line the error
+    came from, logs the full traceback with the task id, and the next task in line still starts. The
+    run-start alert stays up while the failed task is queued for its retry, though another run started;
+    deferred past that retry, it clears."""
+    from ttp import alerts, prompts
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
+    try:
+        bad = p.db.add_task("breaks at start", "s", kind="work", tier="light", origin="user", priority=1)
+        good = p.db.add_task("starts fine", "s", kind="work", tier="light", origin="user", priority=3)
+        real = prompts.worker_system
+
+        def system(proj, task):
+            if task["id"] == bad:
+                return {"checks": "host_max"}["checks"].get("pool")   # the AttributeError of a str section
+            return real(proj, task)
+        monkeypatch.setattr(prompts, "worker_system", system)
+        d._start_failures = 2   # the third failure in a row raises the alert
+        d.dispatch()
+        assert _slot_tasks(p) == [good], "the failed start kept the next task from starting"
+        why = p.db.task(bad)["blocked_reason"]
+        assert p.db.task(bad)["status"] == "queued"
+        assert re.fullmatch(r"could not start a run: AttributeError: 'str' object has no attribute 'get' "
+                            r"at daemon\.py:\d+", why), why   # the last runtime frame; the stand-in is no runtime file
+        log_text = (p.logs / "daemon.log").read_text()
+        assert f"task {bad} could not start a run" in log_text and "Traceback (most recent call last)" in log_text
+        assert "'str' object has no attribute 'get'" in log_text.split("Traceback", 1)[1]
+        now = time.time()
+        assert alerts.holds(p.db, "run-start", now - 5, now), "the failed task is still queued: the alert must hold"
+        p.db.update_task(bad, not_before=now + 7200)   # deferred by the coordinator
+        assert not alerts.holds(p.db, "run-start", now - 5, now)
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"

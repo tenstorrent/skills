@@ -133,7 +133,7 @@ def sizes(cfg: dict | None = None, cores: int | None = None, kind: Kind = TESTS)
     pool = max(2, c // 2) if pool is None else pool
     top = _setting(*kind.setting("run_max"))
     top = min(RUN_MAX, max(1, pool // 2)) if not top else top
-    own = (cfg or {}).get("checks") or {}
+    own = _section(cfg, "checks")
     if (n := _number(own.get(kind.setting("pool")[1]))):
         pool = min(pool, n)
     if (n := _number(own.get(kind.setting("run_max")[1]))):
@@ -145,7 +145,7 @@ def project_max(cfg: dict | None = None, s: tuple[int, int] | None = None, kind:
     """The most slots one project holds at once over all its runs (above); `s` is sizes(cfg)."""
     s = s or sizes(cfg, kind=kind) or (0, 0)
     top = _setting(*kind.setting("project_max")) or min(s[0], 2 * s[1])
-    if (n := _number(((cfg or {}).get("checks") or {}).get(kind.setting("project_max")[1]))):
+    if (n := _number(_section(cfg, "checks").get(kind.setting("project_max")[1]))):
         top = min(top, n)
     return max(s[1], min(top, s[0])) if s[0] else 0
 
