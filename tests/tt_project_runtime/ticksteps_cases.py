@@ -487,3 +487,147 @@ def test_a_daemon_queued_continue_hop_reads_no_git_inside_the_finish_transaction
     assert chaincap.SPLIT_LABEL in (p.db.task(tid)["labels"] or ""), "the split was read from the warm-up"
     done = p.db.one("SELECT text FROM events WHERE task=? AND kind='task_done'", (tid,))
     assert f"Continue hop #{hop['id']} queued by the daemon" in done["text"]
+
+
+def test_gitmemo_bounded_caps_reads_and_a_deadline_caps_every_call(monkeypatch):
+    from ttp import gitmemo
+    assert gitmemo.timeout(300, ("diff",)) == 300, "outside a bounded scope a call keeps its own timeout"
+    with gitmemo.bounded(45):
+        assert gitmemo.timeout(300, ("rev-parse", "HEAD")) == 45
+        assert gitmemo.timeout(10, ("log",)) == 10, "a shorter own timeout stays"
+        assert gitmemo.timeout(120, ("worktree", "remove")) == 120, "a write outside a transaction keeps its own"
+        assert gitmemo.timeout(300, read=True) == 45 and gitmemo.timeout(None, ("show",)) == 45
+        with gitmemo.bounded(60, 20):   # a transaction inside a tick step: it only narrows
+            assert gitmemo.timeout(300, ("diff",)) <= 20 and gitmemo.timeout(120, ("commit",)) <= 20
+            assert gitmemo.timeout(None, ("fetch",)) <= 20
+        assert gitmemo.timeout(300, ("rev-list",)) == 45
+    clock = [1000.0]
+    monkeypatch.setattr(gitmemo.time, "monotonic", lambda: clock[0])
+    with gitmemo.bounded(45, 20):
+        clock[0] += 19.5
+        assert gitmemo.timeout(120, ("rev-parse",)) == gitmemo.FLOOR_S, "past the deadline but its floor"
+        clock[0] += 100
+        assert gitmemo.timeout(120, ("merge-base",)) == gitmemo.FLOOR_S
+
+
+def _git_timeouts(monkeypatch):
+    """Record the timeout of every git subprocess.run, which then times out."""
+    seen: list = []
+    real = subprocess.run
+
+    def run(argv, *a, **k):
+        if isinstance(argv, (list, tuple)) and argv and argv[0] == "git":
+            seen.append((argv, k.get("timeout")))
+            raise subprocess.TimeoutExpired(argv, k.get("timeout") or 0)
+        return real(argv, *a, **k)
+    monkeypatch.setattr(subprocess, "run", run)
+    return seen
+
+
+def test_each_library_git_read_with_a_long_timeout_takes_the_tick_cap(env, monkeypatch, tmp_path):
+    """The library git reads that had 120-300 s timeouts (reachable from tick steps and the finish
+    transaction) each take gitmemo's cap: within bounded(), none waits longer than it."""
+    p = make(env)
+    from ttp import archive, gitmemo, landed, overlap, reviewcap, reviewreuse, verified, worktree
+    seen = _git_timeouts(monkeypatch)
+    review = {"id": 9, "kind": "review", "spec": "", "labels": "[]", "depends_on": "[]"}
+    sites = {
+        "worktree._git": lambda: worktree._git(p.root, "rev-parse", "HEAD", timeout=300),
+        "worktree._ignores": lambda: worktree._ignores(p.root, "x"),
+        "worktree.is_ancestor": lambda: worktree.is_ancestor(p, "a" * 40, "b" * 40),
+        "worktree.inspect": lambda: worktree.inspect(p.root),
+        "worktree._ignored": lambda: worktree._ignored(p.root),
+        "worktree.is_superseded": lambda: worktree.is_superseded(p.root, "a" * 40, [("b" * 40, "c" * 40)]),
+        "worktree.queue_pushed": lambda: worktree.queue_pushed(p.root, "a" * 40, {"b" * 40}),
+        "worktree._patch_ids": lambda: worktree._patch_ids(p.root, ["log", "-p"]),
+        "worktree._delivered": lambda: worktree._delivered(p.root, "a" * 40, "main"),
+        "archive.tracked_files": lambda: archive.tracked_files(p.root),
+        "archive.tracked_patch": lambda: archive.tracked_patch(p.root),
+        "reviewcap._touched": lambda: reviewcap._touched(p, review, "app.py"),
+        "verified.changed_since": lambda: verified.changed_since(p.root, "a" * 40, "b" * 40),
+        "reviewreuse._patches": lambda: reviewreuse._patches(p, "a" * 40, "b" * 40),
+        "landed._git": lambda: landed._git(p.root, "rev-parse", "HEAD", timeout=300),
+        "overlap._git": lambda: overlap._git(p.root, "ls-files"),
+    }
+    for name, call in sites.items():
+        seen.clear()
+        with gitmemo.bounded(0.5):
+            try:
+                call()
+            except (subprocess.SubprocessError, RuntimeError, ValueError):
+                pass
+        assert seen, f"{name} ran no git"
+        assert all(t is not None and t <= 0.5 for _, t in seen), f"{name} ran git past the cap: {seen}"
+    seen.clear()
+    try:
+        worktree.is_ancestor(p, "a" * 40, "b" * 40)
+    except subprocess.SubprocessError:
+        pass
+    assert seen[0][1] == 120, "outside a bounded scope (a worker, the CLI) the call keeps its own timeout"
+
+
+def _hung_git(tmp_path, monkeypatch):
+    """A `git` first on PATH that hangs while the returned flag file exists, else runs the real git."""
+    bindir, flag = tmp_path / "hungbin", tmp_path / "git-hangs"
+    bindir.mkdir()
+    exe = bindir / "git"
+    exe.write_text(f"#!/bin/sh\nif [ -e {flag} ]; then echo \"$(date +%s.%N) $*\" >> {flag}.log; exec sleep 60; fi\n"
+                   f"PATH='{os.environ['PATH']}' exec {shutil.which('git')} \"$@\"\n")   # a git wrapper finds no shim
+    exe.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    return flag
+
+
+def test_a_hung_git_read_never_holds_a_tick_step_past_its_cap(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import daemon as dmod, gitmemo, worktree
+    d = dmod.Daemon(p.base)
+    flag = _hung_git(tmp_path, monkeypatch)
+    flag.touch()
+    monkeypatch.setattr(gitmemo, "TICK_GIT_S", 0.5)
+    assert gitmemo.TICK_GIT_S < dmod.STEP_BUDGET_S
+    t0 = time.monotonic()
+    out = d._run_step(lambda: worktree._git(p.root, "rev-parse", "HEAD", timeout=300), "git_read", default="held")
+    assert time.monotonic() - t0 < 5, "the tick step waited on the hung git"
+    assert out == "held" and d._step_fails["git_read"][0] == 1
+
+
+def test_a_hung_git_in_the_finish_transaction_ends_by_its_cap_and_the_review_is_still_queued(env, monkeypatch, tmp_path):
+    """_auto_review's local ref reads run inside the finish transaction unwarmed (accepted); a hung one
+    ends within gitmemo.TX_GIT_S in all, the task still finishes, and sweep_unreviewed queues its review."""
+    p = make(env)
+    _with_origin(env, clone=False)   # review only
+    from ttp import daemon as dmod, gitmemo, worktree
+    from ttp.providers.base import RunUsage as Usage
+    tid = p.db.add_task("small fix", "spec of small fix", kind="code", tier="standard", origin="coordinator")
+    path, branch = worktree.ensure(p, p.db.task(tid))
+    (path / "app.py").write_text("x = 1\n")
+    _git_out(path, "add", ".")
+    _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "small fix")
+    p.db.update_task(tid, status="running", branch=branch)
+    run_dir = env["tmp"] / f"run-{tid}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "small fix works"}))
+    d = dmod.Daemon(p.base)
+    flag = _hung_git(tmp_path, monkeypatch)
+    monkeypatch.setattr(gitmemo, "TX_GIT_S", 1.0)
+    monkeypatch.setattr(gitmemo, "FLOOR_S", 0.1)
+    monkeypatch.setattr(gitmemo, "TICK_GIT_S", 0.5)   # what runs after the commit (_note_dirty_main)
+    flag.touch()
+    held: list = []
+    t0 = time.monotonic()
+    with gitmemo.bounded(gitmemo.TICK_GIT_S):   # as in a tick step (Daemon._run_step)
+        with d._finish_tx(tid):
+            d.p.db.after_commit(lambda: held.append(time.monotonic() - t0))   # first after the commit
+            d._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir)
+    took = time.monotonic() - t0
+    flag.unlink()
+    hung = (tmp_path / "git-hangs.log").read_text()
+    assert held and held[0] < 1.0 + 3, f"the finish transaction held the write lock {held} s on a hung git:\n{hung}"
+    assert took < 15, f"the finish held its tick step {took:.1f} s on a hung git:\n{hung}"
+    assert p.db.task(tid)["status"] == "done"
+    assert not p.db.q("SELECT id FROM tasks WHERE kind='review'"), "no review read from a hung git"
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 3600, tid))
+    assert d.sweep_unreviewed(force=True) == [tid]
+    (rev,) = p.db.q("SELECT * FROM tasks WHERE kind='review'")
+    assert rev["title"] == f"Review #{tid}: small fix"

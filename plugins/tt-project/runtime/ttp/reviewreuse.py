@@ -115,13 +115,13 @@ def _patches(p, base: str, head: str) -> list[str]:
     """The patch-ids of `head`'s commits past `base`, oldest first. Raises on a merge in that range,
     whose patch has no patch-id to compare."""
     import subprocess
-    from . import worktree
+    from . import gitmemo, worktree
     if worktree._git(p.root, "rev-list", "--merges", f"{base}..{head}"):
         raise ValueError(f"{head[:12]} has a merge past {base}")
     commits = worktree._git(p.root, "rev-list", "--reverse", f"{base}..{head}").split()
     log = worktree._git(p.root, "log", "--reverse", "-p", "--no-color", "--format=commit %H", f"{base}..{head}")
     out = subprocess.run(["git", "-C", str(p.root), "patch-id", "--stable"], input=log + "\n",
-                         capture_output=True, text=True, timeout=120, check=True).stdout
+                         capture_output=True, text=True, timeout=gitmemo.timeout(120), check=True).stdout
     ids = {c: pid for pid, c in (line.split()[:2] for line in out.splitlines() if line.strip())}
     return [ids.get(c, "empty") for c in commits]
 

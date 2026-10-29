@@ -17,8 +17,14 @@ database lock on those paths. The push queue's check for commits carried from re
 read before the transaction too. A done code task's auto review and its no-new-commits check, and a
 review's approval check, still run a few local ref-metadata git reads (rev-parse, the diff base,
 rev-list --count, merge-base --is-ancestor) inside the transaction;
-these take milliseconds and are accepted, while git calls with long timeouts are bounded by separate
-timeout work. Tasks share a probe run only when its command, directory and environment match and the
+these normally take milliseconds and are accepted.
+
+Library git calls with 120-300 s timeouts that a tick or a finish can reach are now bounded by time
+(gitmemo.bounded): inside a tick step each git read ends within 45 s, and all git inside a finish's
+write transaction ends within 20 s in total. A timed-out read degrades: the finish still completes
+and the review is queued later by the unreviewed sweep. Git writes outside a transaction (worktree
+add, remove and prune, merges) keep their own timeouts, since killing one midway can leave a lock.
+Tasks share a probe run only when its command, directory and environment match and the
 run started once their own wait began; each keeps its own verdict and output note.
 A probe's raw result (killed on its timeout, killed by a signal, its last output) is kept beside its
 verdict and shown in a broken probe's wake reason and its hold_probe_broken event; a hold still

@@ -12,12 +12,14 @@ import subprocess
 import time
 from pathlib import Path
 
+from . import gitmemo
 from .db import continues_id
 from .project import Project, durable_write
 
 
 def _git(cwd: Path, *args: str, check: bool = True, timeout: float = 120, env: dict | None = None) -> str:
-    out = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=timeout, env=env)
+    out = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True,
+                         timeout=gitmemo.timeout(timeout, args), env=env)
     if check and out.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {out.stderr.strip()[:300]}")
     return out.stdout.strip()
@@ -738,7 +740,7 @@ def own_worktree(task) -> bool:
 def _ignores(repo: Path, rel: str) -> bool:
     """Git ignores `rel` in `repo` (a tracked path never counts as ignored)."""
     return subprocess.run(["git", "-C", str(repo), "check-ignore", "-q", "--", rel],
-                          capture_output=True, timeout=120).returncode == 0
+                          capture_output=True, timeout=gitmemo.timeout(120)).returncode == 0
 
 
 def prepare(p: Project, path: str | Path, root: str | Path | None = None) -> list[str]:
@@ -863,7 +865,7 @@ def covered_heads(p: Project, review: dict) -> list[str]:
 
 def is_ancestor(p: Project, older: str, newer: str) -> bool:
     return older == newer or subprocess.run(["git", "-C", str(p.root), "merge-base", "--is-ancestor", older, newer],
-                                            capture_output=True, timeout=120).returncode == 0
+                                            capture_output=True, timeout=gitmemo.timeout(120)).returncode == 0
 
 
 def reviewed_head(p: Project, review: dict) -> str | None:
@@ -1303,7 +1305,7 @@ def _sweep_stray(p: Project, w: dict, open_tasks: list[dict], now: float, older_
                     shutil.copy2(src, to, follow_symlinks=False)
             if tracked:
                 patch = subprocess.run(["git", "-C", str(path), "diff", "HEAD", "--binary"], capture_output=True,
-                                       timeout=300, check=True).stdout
+                                       timeout=gitmemo.timeout(300), check=True).stdout
                 durable_write(dest / "tracked.patch", patch)
             durable_write(dest / "manifest.json", json.dumps(
                 {"path": str(path), "repo": str(w["repo"]), "task": w["task"], "branch": res["branch"], "head": head,
@@ -1328,7 +1330,8 @@ def inspect(path: Path) -> dict:
     import hashlib
 
     def git(*args: str, text: bool = True) -> subprocess.CompletedProcess:
-        return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=text, timeout=300)
+        return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=text,
+                              timeout=gitmemo.timeout(300, args))
     out = {"why": None, "dirty": None}
     # A submodule's repository lives in the worktree's own git directory (modules/), so commits made
     # in it exist nowhere else and removing the worktree would delete them. Such a worktree stays.
@@ -1458,7 +1461,8 @@ def _ignored(path: Path) -> set[str] | None:
     """Git-ignored entries in a worktree, relative to it. With --directory git lists a directory
     itself only when everything in it is ignored. None when git fails."""
     out = subprocess.run(["git", "-C", str(path), "ls-files", "--others", "--ignored", "--exclude-standard",
-                          "--directory", "-z"], capture_output=True, text=True, timeout=300)
+                          "--directory", "-z"], capture_output=True, text=True,
+                         timeout=gitmemo.timeout(300))
     return {e.rstrip("/") for e in out.stdout.split("\0") if e} if out.returncode == 0 else None
 
 
@@ -2093,7 +2097,7 @@ def _closest_ancestor(p: Project, heads: list[str], ref: str) -> str | None:
         if not _git(p.root, "rev-parse", "--verify", "--quiet", f"{head}^{{commit}}", check=False):
             continue
         if subprocess.run(["git", "-C", str(p.root), "merge-base", "--is-ancestor", head, ref],
-                          capture_output=True, timeout=120).returncode != 0:
+                          capture_output=True, timeout=gitmemo.timeout(120)).returncode != 0:
             continue
         n = int(_git(p.root, "rev-list", "--count", f"{head}..{ref}") or 0)
         if best is None or n < best[0]:
@@ -2110,7 +2114,8 @@ def dirty_tracked(repo: Path, timeout_s: float = 30) -> list[str] | None:
     tree or git fails or is slow. Reads only: nothing is staged, committed or changed."""
     try:
         out = subprocess.run(["git", "-C", str(repo), "status", "--porcelain=v1", "-z", "--untracked-files=no",
-                              "--ignore-submodules=dirty"], capture_output=True, text=True, timeout=timeout_s,
+                              "--ignore-submodules=dirty"], capture_output=True, text=True,
+                             timeout=gitmemo.timeout(timeout_s),
                              stdin=subprocess.DEVNULL, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
     except (OSError, subprocess.SubprocessError):
         return None
@@ -2135,11 +2140,11 @@ def checkout_state(repo: Path, timeout_s: float = 30, dirty: bool = True) -> dic
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
     try:
         head = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", "HEAD"],
-                              capture_output=True, text=True, timeout=timeout_s, stdin=subprocess.DEVNULL, env=env)
+                              capture_output=True, text=True, timeout=gitmemo.timeout(timeout_s), stdin=subprocess.DEVNULL, env=env)
         if head.returncode != 0:
             return None
         branch = subprocess.run(["git", "-C", str(repo), "symbolic-ref", "--quiet", "--short", "HEAD"],
-                                capture_output=True, text=True, timeout=timeout_s, stdin=subprocess.DEVNULL, env=env)
+                                capture_output=True, text=True, timeout=gitmemo.timeout(timeout_s), stdin=subprocess.DEVNULL, env=env)
     except (OSError, subprocess.SubprocessError):
         return None
     dirty = dirty_tracked(repo, timeout_s) if dirty else None
@@ -2202,7 +2207,7 @@ def is_superseded(repo: Path, head: str, records) -> bool:
     contains. A branch that moved past its recorded head has work the record does not cover."""
     for rec_head, sha in records:
         if rec_head != head and subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", head, rec_head],
-                                               capture_output=True, timeout=120).returncode != 0:
+                                               capture_output=True, timeout=gitmemo.timeout(120)).returncode != 0:
             continue
         if _git(repo, "branch", "-r", "--contains", sha, check=False):
             return True
@@ -2218,7 +2223,7 @@ def queue_pushed(repo: Path, head: str, pushed: set | frozenset) -> bool:
     if head in pushed:
         return True
     r = subprocess.run(["git", "-C", str(repo), "rev-list", "--ignore-missing", "-n1", head, "--not", *sorted(pushed)],
-                       capture_output=True, text=True, timeout=120)
+                       capture_output=True, text=True, timeout=gitmemo.timeout(120))
     return r.returncode == 0 and not r.stdout.strip()
 
 
@@ -2255,9 +2260,9 @@ def delivered(repo: Path, head: str, ref: str, pushed: set | frozenset = frozens
 
 def _patch_ids(repo: Path, cmd: list[str]) -> set[str]:
     """The `git patch-id --stable` ids of the patches git `cmd` prints."""
-    out = subprocess.run(["git", "-C", str(repo), *cmd], capture_output=True, timeout=120).stdout
+    out = subprocess.run(["git", "-C", str(repo), *cmd], capture_output=True, timeout=gitmemo.timeout(120)).stdout
     ids = subprocess.run(["git", "-C", str(repo), "patch-id", "--stable"], input=out, capture_output=True,
-                         timeout=120).stdout.decode(errors="replace")
+                         timeout=gitmemo.timeout(120)).stdout.decode(errors="replace")
     return {ln.split()[0] for ln in ids.splitlines() if ln.split()}
 
 
@@ -2266,7 +2271,8 @@ def _delivered(repo: Path, head: str, ref: str) -> bool:
     base = _git(repo, "merge-base", ref, head, check=False)
     if not base:
         return False
-    cherry = subprocess.run(["git", "-C", str(repo), "cherry", ref, head], capture_output=True, text=True, timeout=120)
+    cherry = subprocess.run(["git", "-C", str(repo), "cherry", ref, head], capture_output=True, text=True,
+                            timeout=gitmemo.timeout(120))
     if cherry.returncode == 0 and not any(line.startswith("+") for line in cherry.stdout.splitlines()):
         return True
     fmt = "--format=%an%x00%ae%x00%at%x00%s"
@@ -2286,11 +2292,11 @@ def _delivered(repo: Path, head: str, ref: str) -> bool:
     if not set(files) <= theirs:
         return False   # a file `ref` left as it was at `base` cannot hold `head`'s change to it
     patch = subprocess.run(["git", "-C", str(repo), "diff", "--binary", "--no-renames", base, head],
-                           capture_output=True, timeout=120).stdout
+                           capture_output=True, timeout=gitmemo.timeout(120)).stdout
     with tempfile.TemporaryDirectory() as tmp:
         env = {**os.environ, "GIT_INDEX_FILE": str(Path(tmp) / "index")}
         if subprocess.run(["git", "-C", str(repo), "read-tree", ref], capture_output=True, env=env,
-                          timeout=120).returncode != 0:
+                          timeout=gitmemo.timeout(120)).returncode != 0:
             return False
         return subprocess.run(["git", "-C", str(repo), "apply", "--cached", "--reverse", "--check"], input=patch,
-                              capture_output=True, env=env, timeout=120).returncode == 0
+                              capture_output=True, env=env, timeout=gitmemo.timeout(120)).returncode == 0

@@ -59,8 +59,8 @@ _ls_cache: dict[str, tuple[float, list[str]]] = {}
 
 
 def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(root), *args], text=True, capture_output=True, timeout=20,
-                          stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    return subprocess.run(["git", "-C", str(root), *args], text=True, capture_output=True,
+                          timeout=gitmemo.timeout(20, args), stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
 
 
 def settings(p) -> dict:

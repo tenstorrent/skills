@@ -27,7 +27,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import push
+from . import gitmemo, push
 from .db import TERMINAL_TASK_STATES, dependency_ids, review_subject
 
 LANDED_PROBE = re.compile(r"\s*landed:\s*#?(\d+)\s*")
@@ -123,8 +123,8 @@ def missing_words(missing: list[str]) -> str:
 
 
 def _git(repo: Path, *args: str, timeout: float = 30) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True, timeout=timeout,
-                          stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    return subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True,
+                          timeout=gitmemo.timeout(timeout, args), stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
 
 
 def _commit(repo: Path, rev: str) -> str:

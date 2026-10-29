@@ -18,6 +18,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from . import gitmemo
 from .db import DB, continues_id, dependency_ids
 
 KEY = "verified_through:"
@@ -110,7 +111,8 @@ def changed_since(repo: str | Path, sha: str, head: str) -> list[str] | None:
     """The files the commits after `sha` up to `head` change, or None when git cannot tell."""
     try:
         r = subprocess.run(["git", "-C", str(repo), "-c", "core.quotePath=false", "diff", "--name-only",
-                            "--no-renames", f"{sha}..{head}"], capture_output=True, text=True, timeout=120)
+                            "--no-renames", f"{sha}..{head}"], capture_output=True, text=True,
+                           timeout=gitmemo.timeout(120))
     except (OSError, subprocess.SubprocessError):
         return None
     return [f for f in r.stdout.splitlines() if f] if r.returncode == 0 else None

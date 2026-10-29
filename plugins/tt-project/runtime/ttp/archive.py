@@ -42,6 +42,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from . import gitmemo
 from .project import Project, durable_append, fsync_dir, write_json
 
 ARCHIVE_DIR = "archive/tasks"
@@ -105,7 +106,8 @@ def tracked_files(root: Path) -> set[str]:
     """The files git tracks in the checkout `root`, relative to it (empty when it is no checkout).
     They are on the branch or in the tracked patch, so never archived or taken out of the worktree."""
     try:
-        r = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True, timeout=300)
+        r = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True,
+                           timeout=gitmemo.timeout(300))
     except (OSError, subprocess.SubprocessError):
         return set()
     return {f for f in r.stdout.decode(errors="surrogateescape").split("\0") if f} if r.returncode == 0 else set()
@@ -116,7 +118,8 @@ def tracked_patch(root: Path) -> bytes:
     HEAD in a scratch index (`git apply --check --cached`). Raises when there is none or it does not
     apply, so the worktree is then kept."""
     def git(*args: str, **kw) -> subprocess.CompletedProcess:
-        return subprocess.run(["git", "-C", str(root), *args], capture_output=True, timeout=300, **kw)
+        return subprocess.run(["git", "-C", str(root), *args], capture_output=True,   # diff, and apply --check
+                              timeout=gitmemo.timeout(300, read=True), **kw)          # on a scratch index: reads
     diff = git("diff", "--binary", "HEAD")
     if diff.returncode != 0 or not diff.stdout.strip():
         raise RuntimeError("no patch of the tracked changes: " + (diff.stderr.decode(errors="replace")[:200]

@@ -209,6 +209,14 @@ TICK_STALL_S = HEARTBEAT_STALE_S
 # always run. A step that took longer raises one model-free tick_step_slow event naming the item that
 # held it longest, at most once per STEP_SLOW_EVERY_S per step.
 STEP_BUDGET_S = 60
+# Git a step runs is capped by time, not per call site (gitmemo.bounded): each read under
+# gitmemo.TICK_GIT_S, and all git inside a finish transaction within gitmemo.TX_GIT_S. The library reads
+# that had 120-300 s timeouts take the cap through gitmemo.timeout(): worktree._git, inspect, _ignored,
+# _ignores, is_ancestor, _closest_ancestor, is_superseded, queue_pushed, _patch_ids, _delivered,
+# _sweep_stray's patch; archive.tracked_files and tracked_patch; reviewcap._touched; verified.changed_since;
+# reviewreuse._patches; landed._git and overlap._git too. Git writes outside a transaction keep their own
+# timeouts (worktree add/remove/prune, cleantree, checkreap, harnesstree's merge): killing one midway can
+# leave a lock or a half-removed tree. pushq's inherit check is bounded at INHERIT_GIT_S already.
 STEP_SLOW_EVERY_S = 3600
 WATCHER_MAX_S = HEARTBEAT_STALE_S - 60   # a command watcher's timeout_s is capped here, well below WATCHDOG_S
 # Schedule runs go on off the tick (schedrun); a tick waits this long for them, so quick ones are recorded
@@ -1220,7 +1228,8 @@ class Daemon:
         self._step_holder, self._step_task, self._step_worst = "", None, (0.0, "", None)
         result = default
         try:
-            result = step()
+            with gitmemo.bounded(gitmemo.TICK_GIT_S):   # one slow git read never holds the step long
+                result = step()
         except Exception as e:  # one bad step must not stop the rest of the tick
             self._log_step_error(f"tick step {name}", e)
             n, since = self._step_fails.get(name, (0, time.time()))
@@ -3972,10 +3981,14 @@ class Daemon:
                 chaincap.progress(self.p, ch, i)
 
     def _finish_tx(self, task_id: int):
-        """The write transaction a hand-off is recorded in, within the gitmemo scope _prefetch_git filled."""
+        """The write transaction a hand-off is recorded in, within the gitmemo scope _prefetch_git filled.
+        The git it still runs (a key the warm-up missed, _auto_review's local ref reads) ends within
+        gitmemo.TX_GIT_S in all: a timed-out read degrades as a git failure does (no review queued here;
+        sweep_unreviewed queues it on a later tick)."""
         stack = contextlib.ExitStack()
         stack.enter_context(gitmemo.scope(self._git_memo.pop(task_id, None)))
         stack.enter_context(self.p.db.tx())
+        stack.enter_context(gitmemo.bounded(gitmemo.TX_GIT_S, gitmemo.TX_GIT_S))
         return stack
 
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,
@@ -4596,8 +4609,7 @@ class Daemon:
         # An urgent one's review is queued at once on a needs_review hand-off too (no sweep_after_s wait).
         # Accepted gap: _auto_review (and _fix_without_commits below) still run a few local ref-metadata git
         # reads inside this transaction (rev-parse, the diff base, rev-list --count), each milliseconds; they
-        # are not warmed by gitmemo. Long-timeout git calls are bounded separately (changeset
-        # tt-project-bounded-inline-children).
+        # are not warmed by gitmemo. All git in this transaction ends within gitmemo.TX_GIT_S (_finish_tx).
         review = self._auto_review(dict(task, **upd), summary) \
             if (new == "done" or new == "review" and urgent.is_urgent(task)) and task["kind"] == "code" \
             and not split else None
