@@ -434,6 +434,17 @@ Verdict: clean-pass | more-work-needed
 
 Only `clean-pass` with no required work satisfies this skill.
 
+Required Work is reserved for correctness, contract, or missing-evidence gaps.
+A performance candidate that was not measured is Other Concerns unless the goal
+names it. Record push state from the run plan (the supervisor pushes stage
+commits; the stage agent never does) instead of inferring it from the reflog.
+
+Closure after the allowed rereviews: a P2 raised after the second rereview
+carries to the next optimize stage with a work-log entry naming it, and the
+recorded verdict stays `more-work-needed`; a P2 that the stage then fixes with
+device evidence is recorded as fixed under that unchanged verdict, with the
+evidence path. The next stage's review checks that carried items were closed.
+
 If the main agent could not obtain an independent review, report
 `not-independent` as a fallback status outside the reviewer verdict. Do not use
 it to complete the stage.

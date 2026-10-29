@@ -16,7 +16,9 @@ Use this skill for the hardware-facing parts of model bringup. It covers only no
 ## Basic Rules
 
 - Run TT hardware-facing commands one at a time per chip: `tt-smi`, resets, TTNN import/open-device probes, watcher runs, Tracy/device-profiler runs, tests, benchmarks, and serving jobs. On a multi-chip host, one process per chip with `TT_VISIBLE_DEVICES=<n>` is allowed when the operator assigns chips; set it on host-only test sweeps too, because a parametrized device fixture in an unrelated module opens every chip. Resets and `tt-smi` stay one at a time for the whole host.
-- Close devices before starting the next device-facing command. Kill stale processes from the same run before reset or retry.
+- Close devices before starting the next device-facing command. Kill stale processes from the same run before reset or retry. On a shared host, check `fuser /dev/tenstorrent/<n>` before using a chip; a chip held by a process this run did not start is unavailable, and that process is never killed.
+- Run every device job under a bounded `timeout`. Do not SIGTERM a process with outstanding device work: it leaves the dispatch path wedged, a later open hangs on a trivial op, and only an operator reset recovers the chip. Let the timeout end the job, record it, and stop device work on that chip when a mesh smoke no longer completes.
+- Host-wall numbers from concurrent one-process-per-chip runs are not same-regime: report device time, or serialize the runs that back a host-wall or TTFT claim, and say which.
 - Keep watcher and profiler evidence in separate runs. Do not combine `TT_METAL_WATCHER` with device-profiler or Tracy collection.
 - Do not profile live vLLM serving stages. Use serving benchmark JSON and logs instead.
 - Before launching a bringup, keep the workspace, multigoal log directory, and `CODEX_HOME` on storage that survives reboot and, when applicable, container recreation. The runner defaults to `<repo>/bringup/artifacts/multigoal-runs/<timestamp>`; any `--log-dir` or `RUN_MULTIGOAL_LOG_DIR` override must also use persistent storage. Do not put resume state in `/tmp`: recovery needs both the manifest's stage/thread mapping and the Codex session state.
@@ -31,6 +33,8 @@ timeout 60 tt-smi -ls --local
 timeout 180 tt-smi -r
 timeout 60 tt-smi -ls --local
 ```
+
+A reset is an operator action. A bringup agent runs it only when the operator's brief authorizes resets; otherwise it records the wedged chips, keeps evidence, and reports the reset as the operator's next step.
 
 After reset, check that the expected devices are visible. On a T3K this usually means all eight chips. If reset returns but not all expected devices or Ethernet links come back, run the bounded reset sequence one more time before escalating. A first reset can leave part of the mesh or Ethernet fabric missing.
 
@@ -100,7 +104,7 @@ If dependencies are missing, install the repo-local triage requirements in the a
 python -m pip install -r tools/triage/requirements.txt
 ```
 
-Read `tools/triage/tt-triage.md` for command details and available scripts. Keep the triage output with the stage evidence.
+Read `tools/triage/tt-triage.md` for command details and available scripts. Keep the triage output with the stage evidence. Under `TT_VISIBLE_DEVICES`, pass `--dev=<visible index>`; without it the tool addresses the wrong chip or returns only health checks.
 
 After capturing triage, use `$autofix` for the failure if ordinary log reading does not explain it. `$autofix` will run `$autodebug` when needed. Give it the failing command, console log, `tt-triage.txt`, current stage work log, and relevant source paths. Do not declare a stage blocked for a hang until `$autofix` has tried and failed, unless the remaining blocker is unavailable hardware or operator-only recovery.
 

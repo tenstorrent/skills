@@ -26,6 +26,7 @@ BURST_PATH = Path("readiness_vllm/vllm_prefill_burst_benchmark.json")
 PREFIX_CACHE_EXCLUSIONS = ("block_output", "recurrent_state")
 DEFAULT_BURST_TTFT_RATIO_MAX = 0.6
 DEFAULT_BURST_TTFT_MEAN_RATIO_MAX = 0.5
+RESUME_DEFAULT_THRESHOLDS = {"pcc_mean_min": 0.99, "pcc_min_min": 0.98, "top1_min": 0.98}
 
 EXIT_PASS = 0
 EXIT_ADVISORY = 1
@@ -111,6 +112,20 @@ def check_prefix_cache(model_dir: Path, row: dict, critical: list[str], advisory
         status = resume.get("status")
         if status != "pass":
             critical.append(f"resumed-prefill check status is {status!r}: {resume.get('reasons')}")
+        thresholds = resume.get("thresholds")
+        if not isinstance(thresholds, dict):
+            advisory.append("resumed-prefill check records no thresholds; rerun it with the current runner")
+        else:
+            lowered = {
+                key: thresholds.get(key)
+                for key, default in RESUME_DEFAULT_THRESHOLDS.items()
+                if not isinstance(thresholds.get(key), (int, float)) or thresholds[key] < default
+            }
+            if lowered:
+                advisory.append(
+                    f"resumed-prefill check passed with thresholds below the defaults {RESUME_DEFAULT_THRESHOLDS}: "
+                    f"{lowered}; keep a default-threshold run and margin probes beside it"
+                )
         for case in resume.get("cases") or []:
             for name, control in (case.get("controls") or {}).items():
                 if control.get("failed_as_expected") is False:

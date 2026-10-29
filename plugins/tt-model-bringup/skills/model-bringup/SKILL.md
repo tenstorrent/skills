@@ -13,6 +13,9 @@ or replace acceptance criteria with a review plugin's criteria.
 
 1. Resolve this plugin root from this file: two directories above its skill directory. Set
    `TT_MODEL_BRINGUP_ROOT` to that absolute path. Keep the installed package read-only.
+   The `SKILL.md` files on disk under that root are the authority; if the host's skill tool
+   serves text from a different version than `.claude-plugin/plugin.json` records, read the
+   files directly.
    For a new Codex multigoal run, follow [automatic telemetry setup](references/telemetry-setup.md):
    use an enabled integration or quietly check access to `tenstorrent/ar-dashboard`
    and automatically install/use its telemetry plugin when accessible. Continue silently
@@ -75,6 +78,10 @@ The eleven [goal templates](../../prompts/model_bringup_multigoal) run in order:
 
 For an optional standalone TTI release handoff once serving is ready, use
 [`tti-release`](../tti-release/SKILL.md).
+
+When the authorized hardware is one chip, stages 4 and 5 are recorded as skipped by the
+operator in the run record and the full-model goal starts from `tt/optimized_decoder.py`;
+single-chip is then the target topology, not a fallback, and the later stages say so.
 
 `tt-device-usage`, `tt-enable-tracing`, `qualitative-check` and `stage-review` provide shared
 requirements. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Implementation
@@ -156,7 +163,10 @@ checker errors once and stops by default; it runs bounded remediation goals for 
 
 The readiness runtime provides generator/serving contracts, HF reference generation, prefill,
 traced teacher-forcing, autoregressive and vLLM runners. Use `python -m readiness_check.<runner>`
-after startup. Hardware runners require the active tt-metal/TTNN environment plus torch,
+after startup. The runners open the mesh with the runtime's default trace region;
+`READINESS_TRACE_REGION_SIZE=<bytes>` overrides it for generators whose split-sampling path holds
+more than one trace. The runners write no provenance: keep a sidecar JSON with the commit and
+chip for every run. Hardware runners require the active tt-metal/TTNN environment plus torch,
 transformers, requests and openai as applicable. Book/AIME input corpora are read from the target
 checkout's documented `models/` paths; generated references belong under `bringup/references/`.
 No reference tensors or experiment outputs are bundled.

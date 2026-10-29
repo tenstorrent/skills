@@ -32,7 +32,7 @@ Use the strongest correct implementation available as your block stack. If there
 
 ## Capability And Context Contract
 
-The full model must support the context length advertised by the HF config. Start from `models/autoports/<model>/doc/context_contract.json`, then recompute it for the full layer stack. Include all loaded weights, the full-layer KV cache, page tables, trace buffers, persistent CCL buffers, and other long-lived tensors that consume device DRAM.
+The full model must support the context length advertised by the HF config. Start from `models/autoports/<model>/doc/context_contract.json`, then recompute it for the full layer stack. Include all loaded weights, the full-layer KV cache, page tables, trace buffers, persistent CCL buffers, and other long-lived tensors that consume device DRAM. Byte arithmetic is a plan, not the measurement: after the model loads, record the device memory view (`ttnn.get_memory_view` or the runtime's equivalent) and derive the KV budget from the measured free DRAM. Per-layer RoPE tables and allocator padding put Qwen3-8B 2.1 GB above its arithmetic.
 
 Also preserve the rest of the advertised model capability contract established by earlier stages: cache/state semantics, layer kinds, mode switches, and the externally visible generation behavior. Do not reduce the advertised model capability to make bringup, tests, profiling, or serving easier. A reduction is acceptable only when a hard physical device limit prevents the advertised capability from fitting or running, such as device DRAM capacity for weights + KV/cache/state + required persistent buffers. If reduced, record the byte calculation or failed capacity probe, the largest feasible supported value, and the exact construction/serving setting that uses it.
 
@@ -44,7 +44,7 @@ Batch handling is part of the capability contract. Optimize primarily for batch-
 
 Find serving gaps before the generator, sampler, and datatype policy are optimized and frozen. Before you choose the sampler and fix the low-level generator API, resolve and pin the serving stack as [serving stack setup](../vllm-integration/references/serving-stack.md) describes. This check only reads the pinned plugin checkout. It does not install the stack or launch a server, and it is not vLLM integration work.
 
-Read the pinned plugin's model interface guide (currently `docs/MODEL_INTERFACE.md`) and every document it links for setup, execution, lifecycle, capabilities, decode reload, and other extension contracts that the model could use. Inspect the pinned plugin source where those documents do not say which adapter calls or declarations the plugin uses. Read its device test suite (`tests/tt`). Then write `models/autoports/<model>/doc/full_model/serving_contract.json`:
+Read the pinned plugin's model interface guide (currently `docs/MODEL_INTERFACE.md`) and every document it links for setup, execution, lifecycle, capabilities, decode reload, and other extension contracts that the model could use. Inspect the pinned plugin source where those documents do not say which adapter calls or declarations the plugin uses. Read its device test suite (`tests/tt`). When the pinned plugin has no interface guide, read its model-runner and sampling source and `tests/tt` instead, and list every file read in `documents_read`; the gate checks that each `supported` row's evidence path exists under the model directory. Then write `models/autoports/<model>/doc/full_model/serving_contract.json`:
 
 ```json
 {
@@ -185,7 +185,7 @@ python "${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/check_degenerate_output
 
 and include its verdict in the stage evidence. Mechanical degeneracy - doubled tokens, single-token collapse - is a decode-loop bug, never a model property. The runner-side stage gate runs the same check.
 
-Shift qualitative checks left: as soon as the full model can generate text, use `$qualitative-check` to run the shared qualitative prompt suite through both the HF reference and TT generator. Later stages may add serving-specific checks, but they should not be the first place these prompts are tried.
+Shift qualitative checks left: as soon as the full model can generate text, use `$qualitative-check` to run the shared qualitative prompt suite through both the HF reference and TT generator. Later stages may add serving-specific checks, but they should not be the first place these prompts are tried. No packaged runner sends the suite through a generator before the vLLM stage; keep the script that does it under `doc/full_model/qualitative/` with its outputs, so later stages rerun the same prompts.
 
 Add a focused split-sampling trace test before marking the stage complete:
 

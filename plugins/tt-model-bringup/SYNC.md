@@ -152,3 +152,14 @@ plugin and runs last in the stage 9 and stage 10 gates; stage 10 passes `--requi
 Only packaged hashes for three edited stage prompts, two edited check scripts, six edited skills,
 `contract.py` and `run_vllm_server.py` change in `sync-source.json`; the original import
 provenance stays intact.
+
+The second trial (Qwen3-8B from stage 1 on one chip, Ornith 1.5 9B stages 9 and 10) folded its
+findings back in. The skills now require short-prefix and per-user cache-dtype evidence, a watcher
+battery over every changed prefill path, a byte budget for a second weight copy and a per-chunk-size
+kernel table, bounded device jobs with no SIGTERM mid-dispatch and operator-only resets, a review
+closure rule for findings raised after the last allowed rereview, a measured memory view behind the
+context contract, and a single-chip rule for skipped multichip stages. The resume gate reports a
+pass under lowered thresholds as advisory, the serving-contract gate reports a missing evidence path
+as advisory, the stage 9 gate runs the prefill-feature check after a serving-contract advisory,
+`generate.py` accepts the transformers 5 chat-template return type, and the readiness mesh open takes
+`READINESS_TRACE_REGION_SIZE`.

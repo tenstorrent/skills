@@ -78,7 +78,7 @@
       "destination": "prompts/model_bringup_multigoal/09-vllm.check.sh",
       "blob": "54873057b0cd77d369de89e8732a5f7bf6810027",
       "source_sha256": "e5860d4f3d9a3f5076062814db09b403ad7de9d0bef6d8aeec02325bccb626ba",
-      "packaged_sha256": "be1c76f121bbdd70dd49b9edd6e04aa5690747f3216004464fc00f335e0cbdd8"
+      "packaged_sha256": "a098cefdfd7fa4dc0d363bbb1f20ba545ea9c95e4a7bed4b0573631abb962c49"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/09-vllm.txt",
@@ -141,7 +141,7 @@
       "destination": "skills/full-model/SKILL.md",
       "blob": "de994d5552a74b4f1cdcaf64f6ba364178b8d5a4",
       "source_sha256": "0618a7bd6ee01f995cb98dd73a9b2c46d8fd3daab9fcecdafde67501c529d2f8",
-      "packaged_sha256": "8ad2f0b3b118e432e2f2e9e963f248a61189c830e7fd363801f75edb09c8f3b6"
+      "packaged_sha256": "98e35f77020ea016ac2c75c5c56cc61d58d3d4f49a4b781de8d650f9a2e38d7e"
     },
     {
       "source": ".agents/skills/full-model/agents/openai.yaml",
@@ -197,7 +197,7 @@
       "destination": "skills/optimize/SKILL.md",
       "blob": "280abb027d839f1f076ab8a524fc6f61ed6df587",
       "source_sha256": "c4b4015ed198c305ed19f73c2ef6a539923212457588319767d08489a5331c8b",
-      "packaged_sha256": "82674119389923b7f0856d9532759639efaa496d93e83351976eaa310caa3342"
+      "packaged_sha256": "ffb1bced88d425899e739776a81d8274bd46d084758334db8f82988386a47c94"
     },
     {
       "source": ".agents/skills/optimize/agents/openai.yaml",
@@ -225,7 +225,7 @@
       "destination": "skills/stage-review/SKILL.md",
       "blob": "7c89b9d281aa1a853a273d3ff4b1c16ad8ccac0d",
       "source_sha256": "b84c344e6a2c0130569dc7e4147ad748d44aa04afa11f181b0711d00afbe3466",
-      "packaged_sha256": "bee4319b3b8969d66a02d8e71586cdbd69fec8abf562f54d5559a73cb297247c"
+      "packaged_sha256": "4b84682e1a5a84f3bcce588e1336d1748c1c34b98ac3218f1f3b77acbe6884fa"
     },
     {
       "source": ".agents/skills/stage-review/agents/openai.yaml",
@@ -239,7 +239,7 @@
       "destination": "skills/tt-device-usage/SKILL.md",
       "blob": "273f20c58cbd80640677004635e43ce47d759891",
       "source_sha256": "b32b5685e47932e1356762c96f70f2ee5cc226ce23d5e1781f9a6bfe26a66502",
-      "packaged_sha256": "e26a220c3dd7e90e84a34e7649344bd7d4b2d2c79251e9c8f885d62e074bdb43"
+      "packaged_sha256": "099ea6497f3efd5047c29b7b4346d4cd7b20bd607a563f261522bd6106fe998b"
     },
     {
       "source": ".agents/skills/tt-device-usage/agents/openai.yaml",
@@ -253,7 +253,7 @@
       "destination": "skills/tt-enable-tracing/SKILL.md",
       "blob": "379f135ff209af802207532f5ad1dc1a88a70627",
       "source_sha256": "2b708c499a67a0fccd6618d6f0c2956f532605b5643c6d70e18a5c70f5bbb1da",
-      "packaged_sha256": "bf2e858982e2c94822f0d4b063a5cde9eb026c7e22994e5cceafd05a8c079d97"
+      "packaged_sha256": "88bdcbb6c50639fef584f7c41a4821a994a2d277e63254f1f6dc77d2ba094be7"
     },
     {
       "source": ".agents/skills/tt-enable-tracing/advanced_perf_optimizations.md",
@@ -330,14 +330,14 @@
       "destination": "runtime/readiness_check/generate.py",
       "blob": "645b6c947b04066a9c1f65671c0a0d18948c62c4",
       "source_sha256": "2d4b380d325f964aa2b1d65d51c6a8657802f7069082fa1cd78f144610aab347",
-      "packaged_sha256": "82adcf94f9579a78971dfb5aaf47611478a18e9657c770f69ca4fc8b02d41954"
+      "packaged_sha256": "d8014f9fb34c94893e2daf1e502a3eec13de64ac8e176e6ef3af08f4f3cd2500"
     },
     {
       "source": "models/common/readiness_check/mesh_device.py",
       "destination": "runtime/readiness_check/mesh_device.py",
       "blob": "cd7b66bc550f71518884f1c45193a06704980d60",
       "source_sha256": "13a3295cf60e9ff0a4e7b628eb1f231d13c299cfbba5b22d64dd1a2dd7c1f894",
-      "packaged_sha256": "71ce700470d89a8d4c5c8ddefbe653b1b008307f135354ca52f1a6bef591ebb8"
+      "packaged_sha256": "9346770796bcf9228ff130effefc19de7aad961636b955d5f6965c2342e90247"
     },
     {
       "source": "models/common/readiness_check/run_autoregressive.py",
@@ -393,7 +393,7 @@
       "destination": "runtime/readiness_check/test_generate.py",
       "blob": "e7ae3c07d8abe34053bccff5c754c52fa5d396df",
       "source_sha256": "c9f3c0566985fb4d566e02996ed70db8dd9112bc5dddb45e27626a7e8d3ed271",
-      "packaged_sha256": "004a91d18a074ab3136eefe2ead4d981e71ddb09329903dd3213d66d41109d9c"
+      "packaged_sha256": "ff86fbadd363967c8a20eea6f93a97e009b8a0f3c730e09f38d2d9c4dec2b329"
     },
     {
       "source": "models/common/readiness_check/test_run_prefill_check.py",

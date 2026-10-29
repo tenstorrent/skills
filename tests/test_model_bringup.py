@@ -162,6 +162,10 @@ def test_full_model_gate_accepts_valid_evidence_and_rejects_context_reduction(in
     env['MODEL_DIR'] = str(model)
     gate = plugin / 'prompts/model_bringup_multigoal/06-full-model.check.sh'
     result = run('bash', str(gate), cwd=target, env=env)
+    assert result.returncode == 1, result.stderr + result.stdout
+    assert 'evidence doc/full_model/logprobs.log does not exist' in result.stderr
+    (doc / 'full_model/logprobs.log').write_text('ok')
+    result = run('bash', str(gate), cwd=target, env=env)
     assert result.returncode == 0, result.stderr + result.stdout
     contract.write_text(json.dumps({'hf_advertised_context': 8192, 'current_supported_context': 1024}))
     result = run('bash', str(gate), cwd=target, env=env)
@@ -191,6 +195,7 @@ def test_serving_contract_checker(tmp_path, mutate, message):
     contract = valid_serving_contract()
     mutate(contract)
     (model / 'doc/full_model').mkdir(parents=True)
+    (model / 'doc/full_model/logprobs.log').write_text('ok')
     (model / 'doc/full_model/serving_contract.json').write_text(json.dumps(contract))
     result = run(*args, cwd=tmp_path)
     if message is None:
@@ -219,6 +224,7 @@ def test_gates_fail_critical_for_malformed_serving_contract(installed, stage, fi
          'serial_reference': {'ttft_ratio_p99': 0.4, 'ttft_ratio_mean': 0.4, 'config_matches': True}}))
     (doc / 'context_contract.json').write_text(json.dumps({'hf_advertised_context': 8192, 'current_supported_context': 8192}))
     contract = valid_serving_contract()
+    (doc / 'full_model/logprobs.log').write_text('ok')
     path = doc / 'full_model/serving_contract.json'
     path.write_text(json.dumps(contract))
     env['MODEL_DIR'] = str(model)
