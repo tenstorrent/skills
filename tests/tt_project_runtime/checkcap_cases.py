@@ -4046,3 +4046,65 @@ def test_status_and_the_web_feed_show_the_lane_lines(env, monkeypatch):
         assert any("checks lane repository alpha" in r for r in rows), rows
     finally:
         g.close()
+
+
+_REPO_B = "ba9876543210"
+
+
+def test_a_p1_check_takes_one_lane_past_a_cap_full_of_routine_runs_only_with_headroom(env, monkeypatch):
+    # The project's cap of 2 is full of p2 runs (one per repository). A p1 run starts at once beside them
+    # past the cap, both when its own repository's lanes are full and when they are free; a second p1 waits
+    # while the first over-cap lane is held; no headroom, the same worktree or a p1 holder: no overflow.
+    from ttp import locks, testslots
+    _lane_env(monkeypatch)
+    room = {"ok": True}
+    kw = dict(slots=1, cap=2, priority=1, wait_s=0, headroom=lambda: room["ok"])
+    hold = [testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, cap=2, priority=2, worktree="/w/a", wait_s=0),
+            testslots.suite_hold("pa", repo=_REPO_B, slots=1, cap=2, priority=2, worktree="/w/b", wait_s=0)]
+    try:
+        assert all(g and g.files for g in hold) and len(testslots.project_held("pa")) == 2
+        free_repo = "c0ffee000000"   # a repository whose lanes are free: the cap alone holds it
+        room["ok"] = False
+        assert testslots.suite_hold("pa", repo=free_repo, worktree="/w/c", **kw) is None, "no headroom"
+        room["ok"] = True
+        assert testslots.suite_hold("pa", repo=_LANE_REPO, worktree="/w/a", **kw) is None, "same worktree"
+        assert testslots.suite_hold("pa", repo=free_repo, **{**kw, "priority": 2}) is None, "a routine run waits"
+        told = []
+        first = testslots.suite_hold("pa", repo=free_repo, worktree="/w/c", tell=told.append, **kw)
+        assert first and "-x." in first.files[0].name, "a p1 starts at once past a cap full of p2 runs"
+        rec, = [r for r in locks.holder_records(testslots.lane_paths("pa", repo=None)) if r.get("over_cap")]
+        assert rec["overflow"] is True and any("cap" in x for x in told), told
+        assert testslots.suite_hold("pa", repo=_LANE_REPO, worktree="/w/d", **kw) is None, \
+            "one over-cap lane at a time: a second p1 waits while the first is held"
+        first.close()
+        second = testslots.suite_hold("pa", repo=_LANE_REPO, worktree="/w/d", **kw)
+        assert second and "-x." in second.files[0].name, "its own repository's lanes full: the same overflow"
+        second.close()
+        p1 = testslots.suite_hold("pa", repo=free_repo, slots=1, cap=3, priority=1, wait_s=0)
+        assert p1 and "-x." not in p1.files[0].name, "under the cap: an ordinary lane"
+        try:
+            assert testslots.suite_hold("pa", repo="d00d00000000", worktree="/w/e", **{**kw, "cap": 3}) is None, \
+                "a cap holder as urgent as the waiter: no overflow"
+        finally:
+            p1.close()
+    finally:
+        for g in hold:
+            g and g.close()
+
+
+def test_cap_turn_counts_one_lane_for_the_old_unkeyed_base(env, monkeypatch):
+    # The old one-slot base ('test-suite.<gid>', no repository key) has one lane: with it held, its aged
+    # waiter cannot start and must not take the cap's last room from a repository waiter with a free lane.
+    from ttp import checkcap, locks, testslots
+    _lane_env(monkeypatch)
+    old = testslots.suite_hold("pa", slots=1, wait_s=0)
+    now = time.time()
+    aged = _suite_ticket("pa", 4, now - 10 * testslots.SUITE_AGE_S)
+    mine = locks.enqueue(checkcap.slot_dir(), testslots.suite_base("pa", _LANE_REPO), "x", now, priority=3)
+    try:
+        assert old and old.files and len(testslots.project_held("pa")) == 1
+        assert testslots.cap_turn("pa", 2, mine, 4, now=now), "the old base's waiter has no free lane"
+    finally:
+        for t in (aged, mine):
+            locks.dequeue(t)
+        old.close()

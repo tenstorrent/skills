@@ -977,7 +977,8 @@ queues behind routine work; nothing running is interrupted:
   only once its test workers are granted, so one still waiting for them never holds up the others; waiting
   checks start in task-priority order across them, and a priority-1 check whose lanes are held only by less urgent
   runs starts beside them in an extra lane while the load is under half the cores, never in a worktree that already
-  runs checks. Unset, `checks.slots` (chat-settable, a whole number; `checks.suite_concurrency` is its chat-settable
+  runs checks. When `checks.test_project_max` is full of less urgent runs, that priority-1 check still starts at once
+  in an extra lane past the cap, one such lane per project at a time; it never stops a running check. Unset, `checks.slots` (chat-settable, a whole number; `checks.suite_concurrency` is its chat-settable
   alias) is the number of runs the host's test-slot pool fits side by side, at least 2 and at most 4, and lower only
   when available memory is under 8 GiB per lane. Runs at once do not collide: each has its own clean checkout,
   TMPDIR, output folder and block of ports (`TTP_PORT_BASE`, `TTP_PORT_COUNT`, for suites that bind fixed ports);

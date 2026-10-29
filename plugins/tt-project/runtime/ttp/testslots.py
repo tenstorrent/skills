@@ -642,7 +642,7 @@ def cap_turn(project_name: str, cap: int, ticket, slots: int, now: float | None 
     ready = []
     for base in suite_bases(project_name):
         key = base[len(pre) + 1:]
-        n = 1 if key.startswith("w") else max(1, int(slots or 1))
+        n = 1 if key == "" or key.startswith("w") else max(1, int(slots or 1))   # "": the old one-slot base
         free = n - len([x for x in locks.slot_paths(checkcap.slot_dir(), base, n) if locks._slot_labels([x])])
         if free > 0:
             ready += suite_order(project_name, repo=key, now=now, age=age)[:free]
@@ -650,6 +650,13 @@ def cap_turn(project_name: str, cap: int, ticket, slots: int, now: float | None 
         ready.append(ticket)   # one taking an overflow lane
     ready.sort(key=lambda t: _order_key(t, now, age))
     return ready.index(ticket) < room
+
+
+def over_cap_room(project_name: str, cap: int) -> bool:
+    """Whether a priority-1 waiter may take an overflow lane past the project's full cap of `cap`: the cap
+    is full and no lane of the project (pending ones too) is already held past it ("over_cap")."""
+    return (cap > 0 and len(project_held(project_name)) >= cap
+            and not any(r.get("over_cap") for r in locks.holder_records(lane_paths(project_name, repo=None))))
 
 
 def _reclaim(path, tell, state) -> bool:
@@ -781,7 +788,8 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     the project's checks that run at once over all its lanes (checklane.project_cap; 0: none), the lane
     going to the most urgent waiter (cap_turn). A priority-1 waiter (`priority` <= 1) whose lanes are held
     only by less urgent runs takes an overflow lane beside them while `headroom()` says the host has room,
-    never beside a holder in the same `worktree` (one suite per worktree). `age`: the aging step
+    never beside a holder in the same `worktree` (one suite per worktree); with the cap full of less urgent
+    runs it takes one past the cap ("over_cap"), one such lane per project at a time (over_cap_room). `age`: the aging step
     (age_s(), checks.priority_age_s; default the account's or SUITE_AGE_S). `pending`: the run takes its
     test slots after the lane, so the lane counts against `cap` only once slots_granted() marks it.
     `name`: the lane's name for status (the repository's directory name, or with `lock` the wrapper
@@ -846,23 +854,37 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
             f = None
             cheaper = (max_wait > 0 and cost and time.time() - arrival >= max_wait and recs
                        and all(checklane.cheaper(cost, r.get("cost") or {}) for r in recs))
-            urgent = (not cheaper and priority is not None and priority <= 1 and recs and headroom is not None
-                      and all((r["priority"] if isinstance(r.get("priority"), (int, float)) else NO_PRIORITY) > 1 for r in recs)
-                      and not (worktree and any(r.get("worktree") == str(worktree) for r in recs)) and headroom())
+            # A priority-1 waiter also weighs the holders of a full project cap: it may start past it.
+            p1 = priority is not None and priority <= 1 and headroom is not None
+            on_cap = project_held(project_name) if p1 and cap > 0 else []
+            pool = recs + (locks.holder_records(on_cap) if len(on_cap) >= cap > 0 else [])
+            urgent = (not cheaper and p1 and pool
+                      and all((r["priority"] if isinstance(r.get("priority"), (int, float)) else NO_PRIORITY) > 1 for r in pool)
+                      and not (worktree and any(r.get("worktree") == str(worktree) for r in pool)) and headroom())
             try:
                 with _cap_guard(project_name, cap):
+                    over = False
                     if free > 0 and pos < free:
                         if cap_turn(project_name, cap, ticket, slots, age=age):
                             f = locks.try_take(lanes, label, what, extra=fields)
-                    elif (cheaper or urgent) and cap_turn(project_name, cap, ticket, slots, age=age):
-                        f = locks.try_take(extra_lanes, label, what, extra={**fields, "overflow": True})
-                        held_by = "; ".join(checklane.holder_text(r, time.time()) for r in recs[:3])
-                        if f is not None and tell and cheaper:
+                        else:
+                            over = urgent and over_cap_room(project_name, cap)
+                    elif cheaper or urgent:
+                        if cap_turn(project_name, cap, ticket, slots, age=age):
+                            f = locks.try_take(extra_lanes, label, what, extra={**fields, "overflow": True})
+                        else:
+                            over = urgent and over_cap_room(project_name, cap)
+                    if over:   # one priority-1 run at a time past the project's full cap
+                        f = locks.try_take(extra_lanes, label, what, extra={**fields, "overflow": True, "over_cap": True})
+                    if f is not None and (cheaper or urgent) and "-x." in os.path.basename(f.name):
+                        held_by = "; ".join(checklane.holder_text(r, time.time()) for r in pool[:3])
+                        if tell and cheaper:
                             tell(f"took an extra checks lane alongside the holders after {_mins(time.time() - arrival)}: "
                                  f"this run is cheaper than {held_by}")
-                        elif f is not None and tell:
-                            tell(f"took an extra checks lane beside less urgent runs ({held_by}): this run's task is "
-                                 f"priority {priority:g} and the host has room")
+                        elif tell:
+                            past = f" past the project cap of {cap}" if over else ""
+                            tell(f"took an extra checks lane beside less urgent runs ({held_by}){past}: this run's "
+                                 f"task is priority {priority:g} and the host has room")
             except OSError:
                 return Grant()
             if f is not None:
