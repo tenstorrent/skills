@@ -35,7 +35,12 @@ run's RUN_FILE, and the daemon files them (only for an obligation that run's tas
 
 Daemon.check_obligations looks every CHECK_EVERY_S, model-free: it files new run records, and for each
 open obligation with an owner past its clock (or no owner at all, past the clock from its creation)
-raises one high observation keyed `obligation:<id>:<episode>` for the coordinator. It is not raised
+raises one high observation keyed `obligation:<id>:<episode>` for the coordinator. First it attaches the
+open tasks that carry an owner's work on (_attach_carriers; a coordinator task_add does the same for its new
+task): the daemon's `Review #<id>`, `Fix review #<id>` and `Re-review #<id>` hops and a task_add `continues`
+naming an owner, noted in the obligation's history, so an owner that finished leaves its chain owning it.
+A "no live owner is left" observation lists the open tasks whose title or spec names a former owner as
+#<id>, the candidates to attach (_candidates). It is not raised
 again on a timer while the same owners stay stalled; an owner not yet covered that stalls (say one
 attached after an earlier owner ended) opens the next episode, and once no owner is late the episode ends.
 Milestones have stable keys, absolute due times and evidence_required. The coordinator adds them on
@@ -336,6 +341,99 @@ def _attach(p, o: dict, tids, now: float) -> list[int]:
                 _append_update(Path(r["dir"]) / "steer.md", note, f"obligation-{oid}-{tid}")
     db.after_commit(tell)
     return new
+
+
+CARRY_LABELS = (("auto_review:", "reviews"), ("review_fix:", "fixes the review"),
+                ("continues:", "continues"), ("follows:", "follows up"))
+HOP_TITLE = re.compile(r"\s*(Review|Fix review|Re-review) #(\d+)\b")
+
+
+def _carried(t) -> dict[str, str]:
+    """Task id -> how open task `t` carries that task's work on: the daemon's review, fix and re-review
+    hops (their labels and `Review #<id>` / `Fix review #<id>` / `Re-review #<id>` titles), a task_add
+    `continues` (its `continues:` or `follows:` label) and a `continue:` follow-up of its parent."""
+    from .chaincap import CONT_TITLE
+    out: dict[str, str] = {}
+    try:
+        labels = json.loads(t["labels"] or "[]")
+    except ValueError:
+        labels = []
+    for lb in labels if isinstance(labels, list) else []:
+        for pre, how in CARRY_LABELS:
+            if isinstance(lb, str) and lb.startswith(pre) and lb[len(pre):].isdigit():
+                out.setdefault(lb[len(pre):], how)
+    title = t["title"] or ""
+    if m := HOP_TITLE.match(title):
+        out.setdefault(m.group(2), m.group(1).lower() + "s")
+    if t["parent"] and CONT_TITLE.match(title):
+        out.setdefault(str(t["parent"]), "continues")
+    return out
+
+
+def _attach_carriers(p, st: dict, now: float, tids=None) -> list[tuple[str, int]]:
+    """Attach the open tasks (or only `tids`) that carry an owner's work on (_carried) to each open
+    obligation it owns, inside the caller's transaction, and note each in the obligation's history. A
+    carrier of a carrier is attached too. Promises and delivered obligations are left as they are: their
+    closing waits on their owners finishing."""
+    obs = [o for o in st["items"].values() if _open(o) and o["owners"] and not o.get("promise")
+           and not o.get("delivered")]
+    if not obs:
+        return []
+    sql = "SELECT id, title, labels, parent FROM tasks WHERE status NOT IN (?,?,?)"
+    args: list = [*CLOSED]
+    if tids is not None:
+        ids = [int(t) for t in tids]
+        if not ids:
+            return []
+        sql += f" AND id IN ({','.join('?' * len(ids))})"
+        args += ids
+    carriers = {str(r["id"]): _carried(r) for r in p.db.q(sql, args)}
+    carriers = {t: c for t, c in carriers.items() if c}
+    out: list[tuple[str, int]] = []
+    for o in obs:
+        grew = True
+        while grew:   # a review of a fix that was just attached is attached in the same pass
+            grew = False
+            for tid in sorted(carriers, key=int):
+                via = sorted((s for s in carriers[tid] if s in o["owners"]), key=int)
+                if tid in o["owners"] or not via:
+                    continue
+                _attach(p, o, [int(tid)], now)
+                o.setdefault("history", []).append({
+                    "at": now, "event": "attached", "task": int(tid),
+                    "why": f"#{tid} {carriers[tid][via[0]]} #{via[0]}, an owner: it carries that work on"})
+                out.append((o["id"], int(tid)))
+                grew = True
+    return out
+
+
+def attach_carriers(p, tids=None, now: float | None = None) -> list[tuple[str, int]]:
+    """_attach_carriers in its own transaction: (obligation id, task id) for each attach made."""
+    now = time.time() if now is None else now
+    with p.db.tx():
+        st = _load(p.db)
+        out = _attach_carriers(p, st, now, tids)
+        if out:
+            p.db.set_kv(KV, st)
+    return out
+
+
+def _candidates(db, o: dict, limit: int = 10) -> list[dict]:
+    """Open tasks, not owners, whose title or spec names a former owner of `o` as #<id>: the ones that may
+    carry its work on, for an obligation with no live owner left."""
+    ids = sorted(o["owners"], key=int)
+    if not ids:
+        return []
+    like = " OR ".join(["title LIKE ? OR spec LIKE ?"] * len(ids))
+    rows = db.q(f"SELECT id, title, spec, status FROM tasks WHERE status NOT IN (?,?,?) AND ({like}) ORDER BY id",
+                [*CLOSED, *(x for t in ids for x in (f"%#{t}%",) * 2)])
+    out = []
+    for r in rows:
+        named = set(TASK_REF.findall(r["title"] or "")) | set(TASK_REF.findall(r["spec"] or ""))
+        if str(r["id"]) not in o["owners"] and named & set(ids):
+            out.append({"id": r["id"], "title": r["title"], "status": r["status"],
+                        "names": sorted(named & set(ids), key=int)})
+    return out[:limit]
 
 
 
@@ -793,13 +891,20 @@ def _quiet_job(o: dict, tid: str, j: dict) -> str:
 
 
 def anomaly_text(o: dict, late: list[tuple[str, float]], status: dict[str, str],
-                 live: dict[str, list[dict]] | None = None) -> str:
+                 live: dict[str, list[dict]] | None = None, candidates: list[dict] | None = None) -> str:
     parts = []
     for tid, age in late:
         if not tid and o["owners"]:
             parts.append("no live owner is left: " + ", ".join(
                 f"#{t} ({status.get(t, 'gone')} without a receipt)" for t in sorted(o["owners"], key=int))
                 + f"; the newest durable progress was {age / 3600:.1f} h ago")
+            if candidates:
+                parts.append("open tasks naming a former owner (attach the one that carries it on: `ttp obligation "
+                             f"attach {o['id']} <task>`): " + "; ".join(
+                                 f"#{c['id']} ({c['status']}, names #{', #'.join(c['names'])}) {c['title'][:100]}"
+                                 for c in candidates))
+            else:
+                parts.append("no open task names a former owner")
             continue
         if not tid:
             parts.append(f"no owner task is attached ({age / 3600:.1f} h since it was recorded)")
@@ -883,9 +988,9 @@ def check(p, now: float | None = None, cfg: dict | None = None) -> list[str]:
     jobs = _job_results(p, st0, now, live)
     with db.tx():
         st = _load(db)
+        changed = bool(_attach_carriers(p, st, now))   # a chain carrying an owner's work on owns it too
         cover = _owner_cover(db, [o for o in st["items"].values() if _open(o) and not o.get("promise")],
                              now, cfg, set(live))
-        changed = False
         for o in st["items"].values():
             if (ev := _delivered(db, o)) is not None:   # a reply delivered it and its last owner finished
                 _close(db, o, now, ev)
@@ -920,9 +1025,9 @@ def check(p, now: float | None = None, cfg: dict | None = None) -> list[str]:
             ids = [int(t) for t, _ in late if t] or [int(t) for t in sorted(o["owners"], key=int)]   # no live owner: all of them
             status = {str(t["id"]): t["status"] for t in
                       db.q(f"SELECT id, status FROM tasks WHERE id IN ({','.join('?' * len(ids))})", ids)} if ids else {}
+            text = anomaly_text(o, late, status, live, _candidates(db, o) if "" in late_ids and o["owners"] else None)
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
-                 (now, "daemon", "obligation_overdue", fp, "high", anomaly_text(o, late, status, live)[:4000], "queued",
-                  ids[0] if ids else None))
+                 (now, "daemon", "obligation_overdue", fp, "high", text[:4000], "queued", ids[0] if ids else None))
             raised.append(fp)
         if changed:
             db.set_kv(KV, st)

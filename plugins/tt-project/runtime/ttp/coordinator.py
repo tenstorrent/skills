@@ -2085,6 +2085,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         obligations.attach(p, oid, [new_id])
                         batch_obls.append(oid)
                         notes.append(f"task_add: #{new_id} attached as an owner of obligation {oid}, which its spec names")
+                    for oid, _ in obligations.attach_carriers(p, [new_id]):   # it carries an owner's work on
+                        batch_obls.append(oid)
+                        notes.append(f"task_add: #{new_id} attached as an owner of obligation {oid}: it carries "
+                                     f"an owner's work on")
                 if followup:
                     notes.append(f"task_add: #{followup['id']} is done; added #{new_id} as its follow-up")
                 notes.extend(_relay_pin_note(p, cfg, a, new_id, messages))
