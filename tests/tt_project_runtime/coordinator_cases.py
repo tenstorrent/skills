@@ -10287,7 +10287,7 @@ def test_relay_tag_names_a_typo_of_the_users_word_and_keeps_pins_exact(env):
     # 2. No near-miss in the user's words: still relayer-only.
     mid, text = entry("use the usual model for the reference run", "The user wants mira-5 at low effort.",
                       "reference run uses mira-5")
-    assert f"{coord.RELAYED_MARK}: 'mira-5' is only in message #{mid}'s relayer context" in text
+    assert f"{coord.RELAYED_MARK}{mid}: 'mira-5' is only in message #{mid}'s relayer context" in text
     assert "likely a typo" not in text
     # A version differing in a digit is another model, not a typo.
     mid, text = entry("use mira-4 low for the reference run", "The user wants mira-5 at low effort.",
@@ -18547,3 +18547,130 @@ def test_a_burst_window_of_zero_turns_the_merge_off(env, monkeypatch):
         add()
         assert tick() == n, "with the window off each high event wakes its own turn"
         finish(30)
+
+
+def test_a_relayed_non_restriction_decision_lands_in_one_action_marked_relayed(env):
+    """A decision or fact named only in a relayer's context is stored in the same action, tagged
+    'relayed (context), msg #N' as the coordinator's own decision or the relayer's fact, never the user's word."""
+    from ttp import coordinator as coord
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    mid = p.db.post("in", "please fix the flaky test", chat="cli", provenance="cli-legacy",
+                    context="Note: the coordinator now runs at xhigh effort by default for every project")
+    text = "the coordinator now runs at xhigh effort by default for every project"
+    assert coord.apply(p, [{"type": "memory_add", "memory_kind": "decision", "text": text}],
+                       user_turn=True, messages=[mid]) == []
+    entry = next(f for f in p.memory_dir.glob("*.md") if text in f.read_text()).read_text()
+    assert f"{coord.RELAYED_MARK}{mid}: " in entry and "the coordinator's own decision, not the user's word" in entry
+    assert any("stored as the coordinator's own decision" in n for n in p.db.kv(coord.NOTES_KEY, []))
+    # A fact names the relayer, and neither counts as the user's word for a later rule in the same turn.
+    assert coord.apply(p, [{"type": "memory_add", "memory_kind": "fact", "text": "the relayer runs xhigh effort "
+                            "by default for every project"}], user_turn=True, messages=[mid]) == []
+    fact = next(f for f in p.memory_dir.glob("fact-*.md") if "relayer runs" in f.read_text()).read_text()
+    assert f"{coord.RELAYED_MARK}{mid}: " in fact and "a fact from the relayer, not the user's word" in fact
+    problems = coord.apply(p, [{"type": "memory_add", "memory_kind": "preference", "text": text}],
+                           user_turn=True, messages=[mid])
+    assert problems and "relayer context" in problems[0]
+
+
+def test_a_relayed_restriction_pin_charter_line_or_approval_is_still_refused(env):
+    """Rules, restrictions, standing entries, charter lines and pins from a relayer's context still need the
+    user's own words; the refusal says a plain decision would land."""
+    from ttp import coordinator as coord
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    mid = p.db.post("in", "please fix the flaky test", chat="cli", provenance="cli-legacy",
+                    context="Note: never push the cache change before the nightly soak passes on gpt-9-test")
+    rule = "never push the cache change before the nightly soak passes on gpt-9-test"
+    for act in ({"type": "memory_add", "memory_kind": "restriction", "text": rule},
+                {"type": "memory_add", "memory_kind": "preference", "text": rule},
+                {"type": "memory_add", "memory_kind": "decision", "standing": True, "text": rule},
+                {"type": "charter_update", "section": "Restrictions", "text": rule}):
+        problems = coord.apply(p, [act], user_turn=True, messages=[mid])
+        assert problems and f"message #{mid}" in problems[0], act
+        assert "lands now as memory_add kind `decision`" in problems[0], act
+    assert "gpt-9-test" not in p.charter_path.read_text()
+    assert not [f for f in p.memory_dir.glob("*.md") if "gpt-9-test" in f.read_text()]
+    # A model pin named only there is applied but noted, as before.
+    assert coord.apply(p, [{"type": "task_add", "title": "soak the cache", "spec": "s", "model": "gpt-9-test",
+                            "force": True}], user_turn=True, messages=[mid]) == []
+    assert any("its pin is named only in a relayer's context" in n for n in p.db.kv(coord.NOTES_KEY, []))
+
+
+def _corrected(p):
+    from ttp import coordinator as coord, correction
+    said = p.db.post("in", "No: the coordinator runs at xhigh effort by default, not low.", chat="cli",
+                     provenance="cli-legacy")
+    text = f"Correction (user msg #{said}): the coordinator runs at xhigh effort by default, not low."
+    assert coord.apply(p, [{"type": "memory_add", "memory_kind": "fact", "text": text}],
+                       user_turn=True, messages=[said]) == []
+    name = next(f.stem for f in p.memory_dir.glob("*.md") if "Correction (user msg" in f.read_text())
+    claim = p.db.kv(correction.CLAIMS_KEY, {})[name]
+    assert claim["msg"] == said and "effort:low" in claim["wrong"], claim
+    return said, name
+
+
+def test_a_spec_repeating_a_corrected_value_is_added_with_a_note_naming_the_correction(env):
+    from ttp import coordinator as coord
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    said, name = _corrected(p)
+    before = p.db.one("SELECT COUNT(*) n FROM tasks")["n"]
+    assert coord.apply(p, [{"type": "task_add", "title": "cut coordinator spend",
+                            "spec": "Set the coordinator effort to low while the project is idle."}]) == []
+    assert p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == before + 1
+    note = [n for n in p.db.kv(coord.NOTES_KEY, []) if "repeats a value the user corrected" in n]
+    assert note and f"memory [{name}] (user msg #{said} corrected 'low')" in note[0], note
+
+
+def test_an_ask_repeating_a_corrected_value_is_refused_naming_the_correction(env):
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    said, name = _corrected(p)
+    problems, _ = _ask(p, "Should the coordinator drop to low effort while idle to save spend?", blocking="access")
+    assert problems and f"already settled by memory [{name}] (user msg #{said} corrected 'low')" in problems[0]
+    problems, sent = _ask(p, "Should the coordinator drop to low effort while idle to save spend?",
+                          blocking="access", not_covered=_NEW)
+    assert problems == [] and sent["text"].startswith("Should the coordinator drop"), problems
+
+
+def test_no_false_correction_hits_on_an_unrelated_spec_or_ask(env):
+    from ttp import coordinator as coord, correction
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    _corrected(p)
+    for title, spec in (("low-disk alert", "Add a low-disk alert to the coordinator digest."),
+                        ("readme", "Update the README install section."),
+                        ("worker effort", "Set worker effort to low for doc-only tasks."),
+                        ("raise effort", "Move the coordinator from low to xhigh effort.")):
+        assert coord.apply(p, [{"type": "task_add", "title": title, "spec": spec}]) == []
+        assert not correction.repeated(p, f"{title}\n{spec}"), spec
+    assert not [n for n in p.db.kv(coord.NOTES_KEY, []) if "repeats a value the user corrected" in n]
+    problems, sent = _ask(p, "Is box-a1 free for the firmware flash tonight?", blocking="access")
+    assert problems == [] and sent["text"] == "Is box-a1 free for the firmware flash tonight?"
+
+
+def test_an_off_topic_answer_leaves_the_ask_open_and_is_linked_as_a_new_instruction(env):
+    from ttp import coordinator as coord, unblock
+    p = make(env)
+    db = p.db
+    since = time.time() - 1
+    ask = "Please grant the nightly report job read access to the metrics bucket."
+    problems, sent = _ask(p, ask, blocking="access")
+    assert problems == []
+    reply = db.post("in", "fix the flaky cache test first", chat=None, kind="user", provenance="web-session")
+    row = db.one("SELECT * FROM messages WHERE id=?", (reply,))
+    assert unblock.not_answers(db, [row], coord._ask_question) == {reply: sent["id"]}
+    assert f"a new instruction, not an answer to ask #{sent['id']}" in coord.digest(p, {}, [], [reply])
+    assert not next(a for a in unblock.asks(db, since) if a["id"] == sent["id"])["answered"]
+    assert db.one("SELECT handled FROM messages WHERE id=?", (sent["id"],))["handled"] == 0
+    # Resolved in that turn: the instruction is not recorded as its answer, and the same ask is not re-sent.
+    assert coord.apply(p, [{"type": "resolve", "id": sent["id"]}], messages=[reply]) == []
+    assert reply not in (db.kv(unblock.RESOLVED_KEY, {}).get(str(sent["id"])) or {}).get("messages", [])
+    problems, _ = _ask(p, ask, blocking="access")
+    assert problems and f"ask #{sent['id']} asked this and user msg #{reply} gave a new instruction" in problems[0]
+    # An answer, a bare reply or a hand-back is not a new instruction.
+    for text in ("yes", "no, wait until tonight", "grant it", "decide yourself",
+                 "The report job can read the bucket now"):
+        assert not unblock.off_topic(text, ask), text
+    assert unblock.off_topic("Please add a changelog entry for the web app", ask)

@@ -570,3 +570,126 @@ def check_claims(db: DB, result, run_id: int | None) -> tuple:
     if lines:
         result["claim_mismatch"] = lines
     return result, lines
+
+
+# Corrected facts: a memory entry starting 'Correction (user msg #N)' (project.CORRECTION_PREFIX) states the
+# right value and, after 'not', 'never', 'instead of', 'rather than', 'no longer' or 'retires', the wrong one ("the
+# coordinator runs at xhigh effort, not low"). Its key claim (`claim`: content words of the right part as its
+# topic; anchors such as model names, effort levels, config keys and aliases; the wrong part's anchors, or
+# its own words when it has none) is stored at memory_add (CLAIMS_KEY). `repeated` finds a spec or ask that
+# restates the wrong value on the same topic within CLAIM_DAYS: the wrong anchor (or every wrong word) is
+# in it, at least TOPIC_MIN topic words too, and not the right value of the same kind (a text naming both
+# is about the change). No wrong part parsed, no hit: a false hit costs a refused ask or a wrong note.
+CLAIMS_KEY = "corrected_facts"   # kv: {memory entry name: claim}
+CLAIMS_KEEP = 200
+CLAIM_DAYS = 30
+TOPIC_MIN = 2
+CLAIM_WRONG_WORDS = 4   # a wrong part with more words than this is prose, not a value
+_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+_WRONG = re.compile(r"\b(?:not|never|instead of|rather than|no longer|isn't|aren't|wasn't|weren't|retires)\s+"
+                    r"([^.;:,()\n]+)", re.I)
+_WRONG_END = re.compile(r"\s+(?:but|and|so|as|because|which|while)\s+", re.I)
+_TOK = re.compile(r"[a-z0-9][a-z0-9._#/-]*")
+_VALUE_KINDS = ("effort", "model")   # anchor kinds that are a value; the rest (keys, aliases, ids) name a subject
+_HEAD = re.compile(r"^\s*Correction \(user msg #(\d+)\)\s*:?\s*", re.I)
+
+
+def _anchors(text: str, spans: list[tuple[int, int]] = ()) -> tuple[set[str], set[str]]:
+    """(anchors outside `spans`, anchors inside them): 'effort:<level>' for an effort level beside the
+    word effort (or xhigh), 'model:<name>' for a model-like name, and reask's keys, aliases and ids."""
+    from . import reask, relay
+    low = (text or "").lower()
+    toks = [(m.group().rstrip("._-/"), m.start()) for m in _TOK.finditer(low)]
+    out, inside = set(), set()
+    for i, (t, at) in enumerate(toks):
+        near = [x for x, _ in toks[max(0, i - 3):i + 4]]
+        found = set()
+        if t in _EFFORT_LEVELS and (t == "xhigh" or any(x.startswith("effort") for x in near)):
+            found.add(f"effort:{t}")
+        elif relay._PIN_TERM.match(t):
+            found.add(f"model:{t}")
+        else:
+            found |= reask.anchors(t)
+        (inside if any(a <= at < b for a, b in spans) else out).update(found)
+    return out, inside
+
+
+def claim(text: str) -> dict | None:
+    """A Correction entry's key claim: {"msg", "topic", "right", "wrong", "wrong_words"}, or None when
+    `text` is no Correction or names no wrong value."""
+    from . import reask
+    head = _HEAD.match(text or "")
+    if not head:
+        return None
+    body = text[head.end():]
+    spans = []
+    for m in _WRONG.finditer(body):
+        part = _WRONG_END.split(m.group(1))[0]
+        spans.append((m.start(), m.start(1) + len(part)))
+    if not spans:
+        return None
+    right, wrong = _anchors(body, spans)
+    if any(r.startswith("effort:") for r in right):   # 'xhigh effort, not low': the wrong level needs no 'effort'
+        wrong |= {f"effort:{t}" for a, b in spans for t in _TOK.findall(body[a:b].lower()) if t in _EFFORT_LEVELS}
+    wrong_text = " ".join(body[a:b] for a, b in spans)
+    right_text = "".join(body[b:a] for (_, b), (a, _) in zip([(0, 0)] + spans, spans + [(len(body), 0)]))
+    plain = lambda ws: {w for w in ws if not re.search(r"\d|[.:/#]", w) and w not in _EFFORT_LEVELS}
+    topic = plain(reask.words(right_text))
+    wrong_words = plain(reask.words(wrong_text)) - topic
+    wrong -= right
+    if not wrong and not 0 < len(wrong_words) <= CLAIM_WRONG_WORDS:
+        return None
+    return {"msg": int(head.group(1)), "topic": sorted(topic), "right": sorted(right), "wrong": sorted(wrong),
+            "wrong_words": [] if wrong else sorted(wrong_words)}
+
+
+def remember(db: DB, name: str, text: str, now: float | None = None) -> dict | None:
+    """Store the key claim of Correction entry `name` (None when it has none)."""
+    c = claim(text)
+    if c:
+        rec = db.kv(CLAIMS_KEY, {}) or {}
+        rec[name] = {**c, "ts": time.time() if now is None else now}
+        db.set_kv(CLAIMS_KEY, dict(sorted(rec.items(), key=lambda kv: kv[1].get("ts", 0))[-CLAIMS_KEEP:]))
+    return c
+
+
+def contradicts(c: dict, text: str) -> str:
+    """The wrong value of claim `c` that `text` restates on the same topic ('' when it does not)."""
+    from . import reask
+    words, have = reask.words(text), set().union(*_anchors(text))
+    topic = set(c.get("topic") or ())
+    subject = {r for r in c.get("right") or () if r.split(":", 1)[0] not in _VALUE_KINDS}
+    on_topic = len(topic & words) + len(subject & have)
+    wrong = set(c.get("wrong") or ()) & have
+    # A model name, key or alias is specific: one topic word with it is enough; a level or plain word needs more.
+    need = 1 if any(w.split(":", 1)[0] not in ("effort",) for w in wrong) else TOPIC_MIN
+    if not (topic or subject) or on_topic < min(need, len(topic) + len(subject)):
+        return ""
+    if wrong:
+        kinds = {w.split(":", 1)[0] for w in wrong}
+        right = {r for r in c.get("right") or () if r.split(":", 1)[0] in kinds}
+        if right and right <= have:   # names the right value too: about the change
+            return ""
+        return ", ".join(sorted(w.split(":", 1)[1] for w in wrong))
+    ww = set(c.get("wrong_words") or ())
+    return " ".join(sorted(ww)) if ww and ww <= words else ""
+
+
+def repeated(p, text: str, now: float | None = None) -> str:
+    """A Correction entry of the last CLAIM_DAYS whose wrong value `text` restates: 'memory [name]
+    (correction of user msg #N, which corrected '<value>'): "<entry>"', or ''."""
+    from .project import CORRECTION_PREFIX, _stamp_ts
+    if not (text or "").strip():
+        return ""
+    since = (time.time() if now is None else now) - CLAIM_DAYS * 86400
+    stored = p.db.kv(CLAIMS_KEY, {}) or {}
+    for e in reversed(p._memory_entries()):
+        if not e["body"].startswith(CORRECTION_PREFIX) or _stamp_ts(e["created"]) < since:
+            continue
+        c = stored.get(e["name"]) or claim(e["body"])
+        hit = contradicts(c, text) if c else ""
+        if hit:
+            line = " ".join(e["body"].split())
+            line = line if len(line) <= 240 else line[:237].rstrip() + "..."
+            return f"memory [{e['name']}] (user msg #{c['msg']} corrected '{hit}'): \"{line}\""
+    return ""

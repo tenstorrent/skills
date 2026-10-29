@@ -13,7 +13,9 @@ with no user's words (`ttp say <project> --finding <text>`) are a message of kin
 `context_only` is the model-free guard: a phrase, or a model or effort name, that the relayer context
 of this turn's messages holds and none of the user's own words do (those messages' verbatim text, the
 charter and the user-rule memory). The coordinator refuses a charter_update or a user-rule memory_add
-carrying one, and marks other entries and pins as such.
+carrying one (restrictions, policies, standing rules, pins and approvals need the user's own words). A
+`decision` or `fact` entry carrying one is stored in the same action, tagged 'relayed (context), msg #N' as
+the coordinator's own decision or the relayer's fact, never the user's word; a pin is noted.
 """
 from __future__ import annotations
 

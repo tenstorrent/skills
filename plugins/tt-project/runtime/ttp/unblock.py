@@ -338,6 +338,51 @@ def about_ask(text: str, ask_id: int, ask_text: str | None) -> bool:
     return bool(_subject(text) & _subject(ask_text))
 
 
+# A reply that gives an order: a sentence opening with an order verb, or an instruction phrase.
+_INSTRUCTION = re.compile(
+    r"(?:^|[.!?;\n]\s*)(?:please\s+|also\s+|now\s+|first\s+|and\s+)?(?:fix|add|run|stop|start|use|make|check|"
+    r"set|remove|delete|keep|move|update|change|build|deploy|test|push|merge|open|close|restart|retry|rerun|"
+    r"switch|try|write|send|install|upgrade|investigate|look|find|create|enable|disable|drop|skip|turn|"
+    r"focus|prioriti[sz]e|clean|split|rename|document|replace|revert|pause|resume|cancel|finish|ship)\b"
+    r"|\b(?:please|from now on|make sure|going forward|you should|we need to|i want you to)\b", re.I)
+NOT_ANSWER_HOLD_S = 3600   # an ask a new instruction came in place of an answer is not asked again this soon
+
+
+def off_topic(text: str, ask_text: str | None) -> bool:
+    """A reply that does not address the ask: no bare answer or hand-back, no content word shared with
+    the ask (reask.words), and a new instruction (_INSTRUCTION)."""
+    from . import reask
+    text = (text or "").strip()
+    if not text or handback(text) or (len(text.split()) <= BARE_MAX_WORDS and _BARE.search(text)):
+        return False
+    return not reask.words(text) & reask.words(ask_text or "") and bool(_INSTRUCTION.search(text))
+
+
+def not_answers(db: DB, msgs: list[dict], question=lambda t: t) -> dict[int, int]:
+    """{user message id: ask id}: each of `msgs` that would answer an ask (a reply in its thread, else
+    the newest ask open when it came, in its chat or broadcast) but is a new instruction instead
+    (off_topic). The ask stays open. A message naming an ask or replying to a message is never one.
+    `question` strips the gate's notes from an ask's text."""
+    from .relay import split
+    resolved = db.kv(RESOLVED_KEY, {}) or {}
+    every = {r["id"] for r in db.q("SELECT id FROM messages WHERE direction='out' AND kind='ask'")}
+    out = {}
+    for m in msgs:
+        if m.get("direction", "in") != "in" or m.get("kind", "user") != "user":
+            continue
+        said = split(m.get("text") or "", m.get("context"))[0]
+        if not said or _ask_mentions(said, every) or replies_to(m.get("text"), m.get("context")):
+            continue
+        live = [a for a in db.q("SELECT id, ts, text, ext_id, handled FROM messages WHERE direction='out' "
+                                "AND kind='ask' AND id<? AND ts>=? AND (chat IS NULL OR chat IS ?) ORDER BY id DESC",
+                                (m["id"], float(m["ts"]) - ANSWER_MAX_AGE_S, m.get("chat")))
+                if not a["handled"] or float((resolved.get(str(a["id"])) or {}).get("ts") or 0) >= float(m["ts"])]
+        ask = next((a for a in live if a["ext_id"] and m.get("ref") == a["ext_id"]), live[0] if live else None)
+        if ask and off_topic(said, question(ask["text"] or "")):
+            out[int(m["id"])] = int(ask["id"])
+    return out
+
+
 def _pct(sorted_vals: list[float], q: float) -> float:
     """Nearest-rank percentile of an ascending list."""
     k = max(0, min(len(sorted_vals) - 1, -(-int(q * 100) * len(sorted_vals) // 100) - 1))
@@ -682,7 +727,8 @@ def asks(db: DB, since: float, now: float | None = None, chat_min: str | None = 
         if len(open_) == 1 and about_ask(m["text"], open_[0]["id"], open_[0]["text"]):
             link(open_[0], m, m["text"], "only_open")
         elif open_ and prev is not None and sum(a["ts"] > prev for a in open_) == 1 and open_[-1]["ts"] > prev \
-                and (delivered(open_[-1], m) or about_ask(m["text"], open_[-1]["id"], open_[-1]["text"])):
+                and (delivered(open_[-1], m) or about_ask(m["text"], open_[-1]["id"], open_[-1]["text"])) \
+                and not off_topic(m["text"], open_[-1]["text"]):
             link(open_[-1], m, m["text"], "newest")
     return [{**{k: v for k, v in rows[a["id"]].items() if k != "first"}, "answered_at": rows[a["id"]]["first"],
              "landed": _landed(resolved, a["id"])} for a in sent if a["ts"] >= since]
