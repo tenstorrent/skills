@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, cells, chaincap, chatset, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, relay, responsibilities, restriction_audit, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, throughmute, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, cells, chaincap, chatset, checkspill, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, relay, responsibilities, restriction_audit, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, throughmute, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -226,6 +226,9 @@ USER_SETTABLE = {
     "delivery.push_checks_by_repo": lambda v: push.checks_by_repo_of(v),
     # The ssh alias the checks run on (remotecheck) when the project may not run them here; "" for here.
     "delivery.checks_host": lambda v: push.checks_host_of(v),
+    # Ordered ssh aliases a run whose slots here stay busy may spill to (checkspill); a list, never a scalar.
+    "delivery.checks_spill_hosts": lambda v: checkspill.hosts_of(v),
+    "delivery.checks_spill_after_s": lambda v: checkspill.after_of(v),
     # The files holding the version that `ttp push` bumps once above the tip, plus a changeset.
     "delivery.version_bump": lambda v: push.bump_of(v),
     # The daemon-owned push queue: reviews approve, the daemon pushes in batches, then runs after_push.

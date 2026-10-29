@@ -244,3 +244,161 @@ def test_check_host_settings_are_validated_and_local_keeps_a_check_here():
     assert argv[argv.index("--host") + 1] == "box1" and argv[-1] == "make b" and push.where(there) == " (on box1)"
     assert push.with_host(push.check_list(["make c"]), "a b") == ["make c"] and not push.remote_host(
         push.with_host(push.check_list(["make c"]), "a b")[0])
+
+
+def _spill_setup(env, tmp_path, monkeypatch, hosts, charter=("check-host-a", "check-host-b", "down")):
+    """A checks repo whose project allows `charter` (charter text and machines list), spills to `hosts`
+    after 0.3 s, has one checks lane, and the fake ssh on PATH."""
+    from ttp import machines
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    p.charter_path.write_text("# Charter\n## Resources\n" + "".join(f"- {h}: a check host\n" for h in charter))
+    for h in charter:
+        machines.add(h)
+    p.set_config("checks.slots", 1)
+    p.set_config("delivery.checks_spill_hosts", list(hosts))
+    p.set_config("delivery.checks_spill_after_s", 0.3)
+    bin_, remote = _rc_fake_ssh(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_REMOTE_TMP", str(remote))
+    return p, repo, run, remote
+
+
+def _spill_lane(p, repo):
+    """Hold the project's only checks lane for `repo`, as another run of the project would."""
+    from ttp import testslots
+    g = testslots.suite_hold(p.name, wait_s=0, slots=1, repo=testslots.repo_key(str(repo)))
+    assert g is not None and g.files
+    return g
+
+
+def test_busy_checks_spill_to_the_first_reachable_allowed_host_and_name_it(env, tmp_path, monkeypatch):
+    """delivery.checks_spill_hosts: with the lane here held past checks_spill_after_s, the run skips an
+    unreachable host (never a failure), runs on the next listed one, and checks.json and checks.log name
+    it; its claim on the host shows in ttp status while held and is freed after."""
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["down", "check-host-b", "check-host-a"])
+    log = tmp_path / "where.log"
+    cmd = f"pwd >> {log}"
+    p.set_config("delivery.push_checks", [cmd])
+    lane = _spill_lane(p, repo)
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        lane.close()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "check-host-b", rec
+    assert rec["hosts"] == {cmd: "check-host-b"}, rec
+    text = (run / "checks.log").read_text()
+    assert "down (ssh cannot reach it" in text and "spilling to check-host-b" in text, text
+    assert f"$ {cmd} (on check-host-b)" in text
+    assert "/ttp-check." in log.read_text() and _rc_left(tmp_path) == []
+    assert checkspill.holders(p.name) == [], "the claim ends with the run"
+    claim = checkspill._claim("check-host-a", 1, {"project": p.name, "task": "7", "pid": os.getpid(),
+                                                  "since": time.time(), "what": "pytest -q", "host": "check-host-a"})
+    try:
+        assert checkspill.status_lines(p.name) == [
+            "checks of task #7 running on spill host check-host-a for 0 min: pytest -q"]
+        assert checkspill._claim("check-host-a", 0, {}) is None, "this machine's claims count against the host"
+    finally:
+        claim.close()
+    assert checkspill.status_lines(p.name) == []
+
+
+def test_spill_skips_hosts_that_are_not_allowed_busy_or_down_and_keeps_waiting_here(env, tmp_path, monkeypatch):
+    """No listed host can take the run (not in the charter, not in the machines list, paused, unreachable,
+    every slot busy): the run says why for each, keeps its place and runs here once the lane frees."""
+    import threading
+    from ttp import checklane, checkspill, cli, db as dbm, machines
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch,
+                                        ["outside", "unlisted", "check-host-c", "down", "check-host-a"],
+                                        charter=("check-host-a", "check-host-c", "down", "unlisted"))
+    machines.add("outside")
+    machines.remove("unlisted")
+    p.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {"check-host-c": {"reason": "user hold", "by": "user", "since": 1}})
+    for i in range(checklane.MAX_LANES):   # remote checks from other machines fill check-host-a
+        (remote / f"ttp-check.busy{i}").mkdir()
+    log = tmp_path / "where.log"
+    cmd = f"pwd >> {log}"
+    p.set_config("delivery.push_checks", [cmd])
+    lane = _spill_lane(p, repo)
+    threading.Timer(1.5, lane.close).start()
+    cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and "spilled_to" not in rec and "hosts" not in rec, rec
+    text = (run / "checks.log").read_text()
+    for why in ("outside (not named in the charter)", "unlisted (not in the machines list",
+                "check-host-c (paused: user hold)", "down (ssh cannot reach it", "check-host-a (its "):
+        assert why in text, (why, text)
+    assert "/ttp-check." not in log.read_text(), "it ran here"
+    assert checkspill.allowed(p, p.config(), "check-host-a") == ""
+
+
+def test_a_run_that_does_not_pass_on_a_spill_host_runs_again_here(env, tmp_path, monkeypatch):
+    """A spill host's own environment never fails a change: a fault there (ssh lost mid-run) or a
+    failure there reruns the checks here, without spilling again, and only that result counts; no
+    envfault is opened for the spill host."""
+    import threading
+    from ttp import cli, envfault
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    log = tmp_path / "where.log"
+    cmd = f'case "$PWD" in */ttp-check.*) pwd >> {log}; exit 1;; esac; pwd >> {log}'
+    p.set_config("delivery.push_checks", [cmd])
+    for fake in ({}, {"FAKE_SSH_FAIL": "mktemp"}):
+        for k, v in fake.items():
+            monkeypatch.setenv(k, v)
+        log.write_text("")
+        lane = _spill_lane(p, repo)
+        threading.Timer(2.0, lane.close).start()
+        cli.main(["checks", "--fresh"])
+        rec = json.loads((run / "checks.json").read_text())
+        assert rec["passed"] is True and "spilled_to" not in rec, (fake, rec)
+        text = (run / "checks.log").read_text()
+        assert "did not pass on spill host check-host-a" in text, text
+        where = log.read_text().splitlines()
+        assert where and "/ttp-check." not in where[-1], where
+        assert not any(k.startswith("env:check-host:") for k in envfault.open_faults(p))
+
+
+def test_no_spill_hosts_keeps_todays_wait_and_unspillable_checks_never_spill(env, tmp_path, monkeypatch):
+    """Unset (the default) or for checks that must run here (own host, authoring tree, wrap_cmd), the
+    wait is the plain foreground wait and no spill host is tried."""
+    from ttp import checkcap, checkspill, cli, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    p.set_config("delivery.push_checks", ["true"])
+    limits = []
+
+    def take(*args):
+        limits.append(args[6])
+        return checkcap.Slot()
+    monkeypatch.setattr(cli, "_checks_slot_take", take)
+    monkeypatch.setattr(checkspill, "pick", lambda *a, **k: pytest.fail("no spill host is tried"))
+    cli.main(["checks", "--fresh"])
+    assert json.loads((run / "checks.json").read_text())["passed"] is True
+    assert limits and limits[0] > 30, limits
+    assert checkspill.hosts(p.config()) == [] and checkspill.after_s(p.config()) == checkspill.SPILL_AFTER_S
+    c = push.check_list(["make test", {"run": "make a", "host": "local"}, {"run": "make b", "cwd": "authoring"}])
+    assert checkspill.spillable(c[:1]) and not checkspill.spillable(c[1:2]) and not checkspill.spillable(c[2:])
+    assert not checkspill.spillable(push.with_host(c[:1], "check-host-a"))
+    assert not checkspill.spillable(push.with_wrap(c[:1], ("flock", "/tmp/x")))
+    assert not checkspill.spillable([])
+
+
+def test_spill_settings_are_validated_and_a_scalar_is_refused():
+    from ttp import coordinator, project
+    ok = {"delivery": {"checks_spill_hosts": ["check-host-a", "check-host-b"], "checks_spill_after_s": 30}}
+    assert not project.config_problems(ok)
+    for bad in ("check-host-a", 3, True, {"check-host-a": 1}, ["a b"], ["local"], [3]):
+        assert any("delivery.checks_spill_hosts" in x
+                   for x in project.config_problems({"delivery": {"checks_spill_hosts": bad}})), bad
+    for bad in (-1, "soon", True):
+        assert any("delivery.checks_spill_after_s" in x
+                   for x in project.config_problems({"delivery": {"checks_spill_after_s": bad}})), bad
+    settable = coordinator.USER_SETTABLE["delivery.checks_spill_hosts"]
+    assert settable(["check-host-a"]) == ["check-host-a"] and settable('["check-host-a"]') == ["check-host-a"]
+    assert settable([]) == []
+    for bad in ("check-host-a", 3, {"a": 1}, ["a;b"]):
+        with pytest.raises(ValueError):
+            settable(bad)
+    assert coordinator.USER_SETTABLE["delivery.checks_spill_after_s"]("45") == 45.0
+    with pytest.raises(ValueError):
+        coordinator.USER_SETTABLE["delivery.checks_spill_after_s"]("-1")

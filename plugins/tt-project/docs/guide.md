@@ -870,6 +870,12 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   else by kind) takes an extra lane beside them. A waiter says who holds the lanes and its place in the queue
   each minute; `ttp status` and the coordinator's digest list waits over 10 min, and the daemon raises one
   `checks_slot_wait` event per wait past `checks.wait_event_s` (default 900, 0 turns it off).
+  `delivery.checks_spill_hosts` (an ordered list of ssh aliases, default empty: checks never leave this machine)
+  lets a run that has waited `delivery.checks_spill_after_s` (default 60 s) here run on the first listed host the
+  charter names, the machines list holds and no pause covers, that ssh reaches and that has a free slot; others
+  are skipped with the reason and the run keeps its place here. Runs with a check host, the authoring tree or
+  `checks.wrap_cmd` never spill; a run that does not pass on a spill host runs again here, and that result
+  counts. `checks.json` (`spilled_to`), `ttp status` and `ttp checks status` name the host.
   `ttp checks status` (also `--slot-status`, `--json`) prints each repository's lane holders (pid, task, run,
   age, alive or dead) and its waiters in queue order, the next one marked; it is read only and never queues. A run's check commands stop at a wall-time cap: on by
   default, 3x the longest of the project's last 20 completed runs within 1-6 h (3 h before 3 runs are known);

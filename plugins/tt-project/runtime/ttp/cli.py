@@ -1388,10 +1388,11 @@ def status_text(p: Project, verbose: bool = False) -> str:
     if host := checkcap.line():
         lines.append(host)
     lines.extend(testslots.use_lines())
-    from . import checklane
+    from . import checklane, checkspill
     if suite := testslots.suite_line(p.name, now, checklane.slots(p.config())):
         lines.append(suite)
     lines.extend(checklane.long_wait_lines(p.name, now))
+    lines.extend(checkspill.status_lines(p.name, now))
     if verbose and (slot_waits := checkcap.wait_line(p.state, now)):
         lines.append(slot_waits)
     for res in sorted(shared.names(p.config())):
@@ -2650,6 +2651,7 @@ def cmd_checks(a) -> None:
     fast_skipped, fast_cmds = [], []
     executed, selected, rerun = [], [], None
     timed_out, deadline, ran_since = None, None, 0.0   # the wall-time cap (checkwall) and its outcome
+    spilled = None   # the spill host's claim when the checks run there (checkspill)
     run_env: dict = {}   # what the checks run in, for the pass's envs (pushpass.check_envs)
     base = _checks_base(p, Path(top), cmds)
     (Path(run_dir) / "check_failure.json").unlink(missing_ok=True)
@@ -2757,7 +2759,9 @@ def cmd_checks(a) -> None:
         if p:
             envfault.recheck(p)   # a runner back: its open fault closes
         arrived = _checks_arrived()
-        from . import checklane
+        from . import checklane, checkspill
+        # A rerun here of checks that did not pass on a spill host never spills again (checkspill).
+        spill_ok = not os.environ.pop(checkspill.OFF_ENV, "") and checkspill.spillable(todo)
         fresh_ok = not a.fresh
         slot = None
         while todo and not hit:
@@ -2765,7 +2769,8 @@ def cmd_checks(a) -> None:
                                 _checks_key(p, tree, todo, purpose) if fresh_ok else "",
                                 (lambda: bool(_recorded_pass(p, tree, todo, purpose))) if fresh_ok else None,
                                 todo, checklane.all_light(todo, cfg, mine if getattr(a, "light", False) else ()),
-                                str(top), checklane.wrap_key(wrap) if any(str(c) in wrapped for c in todo) else "")
+                                str(top), checklane.wrap_key(wrap) if any(str(c) in wrapped for c in todo) else "",
+                                spill_ok)
             # Checks of the same tree may have passed while these waited (the same checks running beside
             # them, a review's pre-started ones): that pass serves, and the slot goes to the next waiter.
             if slot is not None and fresh_ok and (again := _recorded_pass(p, tree, todo, purpose)):
@@ -2781,6 +2786,10 @@ def cmd_checks(a) -> None:
                 break
         # Every host-wide slot stayed busy: a tool call must not block for the whole queue.
         handover = bool(todo) and not hit and slot is None
+        # The slots here stayed busy and a spill host took the run: its checks run there (remotecheck).
+        spilled = getattr(slot, "spill", None) if slot is not None and not hit else None
+        if spilled:
+            todo = push.with_host(todo, spilled.host)
         child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}
         run_env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), **child_env}
         for line in [] if hit or handover else push.sandbox_lines(todo):
@@ -2937,6 +2946,17 @@ def cmd_checks(a) -> None:
                 checkwall.clear_timeout(p.state, os.environ.get("TTP_TASK"))
         if slot and not passed:
             slot.close()
+        # A spill host's own environment never fails a change (a fault there, a missing tool): what did
+        # not pass there runs again here, in its place in the queue, and only that verdict counts.
+        if spilled and not passed and executed and not timed_out and not _CHECK_STOP.get("stopped"):
+            said = (f"the checks did not pass on spill host {spilled.host} (exit {rc}); running them again on "
+                    "this machine, whose result counts")
+            out.write(f"ttp checks: {said}\n")
+            out.flush()
+            print(f"ttp checks: {said}", flush=True)
+            os.environ[checkcap.ARRIVED_ENV] = str(arrived)
+            os.environ[checkspill.OFF_ENV] = "1"
+            return cmd_checks(a)
         # A check host ssh could not reach (or that could not take the tree) is the environment, as a
         # missing runner is: wait for it, counting nothing against the change (envfault).
         if not passed and (fault := push.remote_fault(failed, rc, top)):
@@ -3006,6 +3026,7 @@ def cmd_checks(a) -> None:
                                                      **({"timed_out": timed_out} if timed_out else {}),
                                                      **({"env_problem": env_problem} if env_problem else {}),
                                                      **({"hosts": hosts} if (hosts := push.hosts_of(todo)) else {}),
+                                                     **({"spilled_to": spilled.host} if spilled else {}),
                                                      **({"authoring_tree": in_authoring} if in_authoring else {}),
                                                      **({"added_tests": rerun} if rerun else {})})
     source = ("the default harness plan" if any(str(c) == str(failed) for c in defaults)
@@ -3247,18 +3268,21 @@ def _checks_lane_status(as_json: bool) -> int:
     top = subprocess.run(["git", "-C", str(Path.cwd()), "rev-parse", "--show-toplevel"], capture_output=True,
                          text=True).stdout.strip()
     here_repo = testslots.repo_key(top) if top else ""
+    from . import checkspill
     if as_json:
         print(json.dumps({"project": p.name, "slots": checklane.slots(p.config()),
                           "project_max": checklane.project_cap(p.config()), "this_repo": here_repo,
-                          "repos": checklane.lane_status(p.name)}, indent=2))
+                          "repos": checklane.lane_status(p.name), "spilled": checkspill.holders(p.name)}, indent=2))
     else:
         print(checklane.status_text(p.name, p.config(), here_repo))
+        for line in checkspill.status_lines(p.name):
+            print(f"  {line}")
     return 0
 
 
 def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: bool = False,
                  arrived: float | None = None, same: str = "", done=None, cmds: list | None = None,
-                 light: bool = False, top: str = "", lock: str = ""):
+                 light: bool = False, top: str = "", lock: str = "", spill: bool = False):
     """Wait for a host-wide checks slot (checkcap). The wait is told in the log, the run's notes
     (progress.md) and CHECKS_SLOT_WAIT, which the `--result` probe and `ttp status` read. In the
     foreground it is recorded like a `ttp lock` wait, so it does not count toward the run's wall
@@ -3270,8 +3294,10 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     every slot; full checks queue for one of the lanes of the project's repository at `top` (checklane:
     checks.slots, checks.max_wait_s), or with `lock` (checklane.wrap_key: commands behind checks.wrap_cmd)
     for that wrapper lock's one lane, at most checklane.project_cap of the project's at once, told with
-    the holder and the queue position each minute."""
-    from . import checkcap, checklane, locks as lk
+    the holder and the queue position each minute. With `spill` and delivery.checks_spill_hosts set, a
+    wait past delivery.checks_spill_after_s tries those hosts (checkspill.pick) and keeps its place here
+    when none can take the run: a slot whose `spill` claim names the host the checks then run on."""
+    from . import checkcap, checklane, checkspill, locks as lk
     foreground = not detached and not os.environ.get("TTP_DETACHED")
     key = f"checks:{os.getpid()}:{time.time()}"
 
@@ -3313,18 +3339,43 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     what = " && ".join(str(c) for c in cmds)[:300] or "full checks"
     # One of the repository's checks lanes (testslots.suite_hold; checks.slots of them, checklane), or with
     # `lock` its wrapper lock's one lane, taken before the checks slot so a run never holds one of the
-    # host's slots while it waits.
-    from . import cleantree, push
+    # host's slots while it waits. Its wait is told, recorded and cancellable as the checks slot's is; the
+    # foreground wait for all of them together ends after FOREGROUND_WAIT_S.
+    spill_to = bool(spill and p and checkspill.hosts(cfg))
+    told: set[str] = set()
+    while True:
+        limit = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
+        if spill_to:   # a bounded wait here, then the spill hosts, then wait again in the same place
+            limit = checkspill.after_s(cfg) if limit is None else min(limit, checkspill.after_s(cfg))
+        slot = _checks_slot_take(p, run_dir, out, head, tell, waiting, limit, arrived, same, done, prio, owns,
+                                 cfg, repo, cmds, what, top, lock)
+        if slot is not None or not spill_to:
+            return slot
+        # The same hosts skipped for the same reasons are told once, not after every bound.
+        if (claim := checkspill.pick(p, cfg, lambda line: line in told or (told.add(line), tell(line)),
+                                     what)) is not None:
+            slot = checkcap.Slot()
+            slot.spill = claim
+            return slot
+        if foreground and time.time() - start >= checkcap.FOREGROUND_WAIT_S:
+            return None
+
+
+def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: float | None, arrived, same: str,
+                      done, prio, owns, cfg: dict, repo: str, cmds: list, what: str, top: str = "",
+                      lock: str = ""):
+    """One wait of _checks_slot for the repository's lane (or `lock`'s), a host-wide checks slot and
+    test-worker slots, at most `limit` seconds (None: no limit): the slot, or None once `limit` passed."""
+    from . import checkcap, checklane, cleantree, push, testslots
+    t0 = time.time()
     # Concurrent runs are isolated (own clean checkout, scratch, output folder and port block); what is
     # not keeps a lock: checks run in the authoring worktree also hold its one lane (testslots.tree_key).
     local = [c for c in cmds if not push.remote_host(c)]
     in_tree = bool(p and top and any(cleantree.authoring(c) for c in local))
-    # Its wait is told, recorded and cancellable as the checks slot's is; the foreground wait for all of
-    # them together ends after FOREGROUND_WAIT_S.
     suite = tree = None
 
     def hold(key: str, n: int, **lane):
-        left = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
+        left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
         on_key = f"w{lane['lock']}" if lane.get("lock") else key
         return testslots.suite_hold(p.name if p else None, tell, left,
                                     lambda on: waiting(on, str(testslots.suite_path(p.name, on_key)),
@@ -3346,7 +3397,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         if tree is not None:
             suite.files += tree.files
             tree = None
-        left = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
+        left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
         slot = checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell, waiting,
                                 left, arrived,
                                 p.name if p else None, prio, same, done, lambda: _checks_cancelled(run_dir),
@@ -3356,7 +3407,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             return slot
         # Then the run's share of the host's test-worker slots (testslots), held with the checks slot;
         # in the foreground none free by the end of the same wait hands over to detached checks too.
-        left = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
+        left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
         slot.tests = testslots.acquire(checkcap.label(p.name if p else None), tell, left,
                                        p.config() if p else {}, p.name if p else "")
         if slot.tests is None:

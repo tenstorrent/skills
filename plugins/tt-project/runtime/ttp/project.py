@@ -463,6 +463,7 @@ EXTRA_KEYS = {
                  "allow_protected_push_branch", "own_push", "own_push_remote", "deploy_restart_wait_s", "plugin_version_guard",
                  "checks_fast_globs", "checks_fast_exclude",   # these two: `ttp checks` fast path (push.FAST_GLOBS),
                  "checks_host",   # where checks run (remotecheck)
+                 "checks_spill_hosts", "checks_spill_after_s",   # where busy checks may spill to (checkspill)
                  "check_prestage",   # a short foreground run before `ttp checks --detach` (checkprestage)
                  "pr_body_check",   # a project's own PR body check before gh pr create/edit (prbody)
                  "rebase_replace", "never_force"},   # whether a rebase replaces its branch (rebase_replace)
@@ -800,6 +801,8 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     if delivery.get("checks_host") not in (None, ""):
         from .remotecheck import host_problem
         out += [f"delivery.checks_host: {p}" for p in [host_problem(delivery["checks_host"])] if p]
+    from .checkspill import problems as spill_problems
+    out += spill_problems(delivery)
     out += bump_problems(delivery.get("version_bump"))
     coord = raw.get("coordinator")
     if isinstance(coord, dict) and "cache_ttl" in coord and not str(coord["cache_ttl"] or "").strip():

@@ -301,6 +301,7 @@ class Slot:
         self.f = f
         self.served = served
         self.tests = None   # the run's test slots (testslots.Grant), held and freed with this slot
+        self.spill = None   # a claim on a spill host the checks run on instead (checkspill.Claim)
 
     def env(self) -> dict[str, str]:
         """For the check commands' environment: a `ttp checks` or push nested in them runs at once."""
@@ -313,6 +314,9 @@ class Slot:
         if self.tests is not None:
             self.tests.close()
             self.tests = None
+        if self.spill is not None:
+            self.spill.close()
+            self.spill = None
 
     def __enter__(self):
         return self
