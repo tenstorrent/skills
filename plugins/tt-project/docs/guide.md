@@ -912,6 +912,8 @@ queues behind routine work; nothing running is interrupted:
   waiting task priority first (read from the task's record; a check with no task, or a task with no priority,
   ranks as p3), then arrival; a running holder is never pre-empted, and a waiter gains one priority step per
   `checks.priority_age_s` waited (default 900, 15 min; project, then account), never past p1, so none starves.
+  Among equal ranks a native priority goes first (a native p1 before a p3 aged to p1), until a waiter has waited
+  four aging steps (1 h by default): from then on arrival decides, so a stream of p1s cannot starve it.
   `ttp checks`, `ttp checks status` and `ttp status` show each waiter's priority and its rank now (`p4 ranked p2
   (aged)`). Light checks never wait: a run whose every command is a
   syntax, lint, format or validation check (`python -m py_compile`, `ruff check`, `black --check`,

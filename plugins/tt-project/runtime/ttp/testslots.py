@@ -43,7 +43,8 @@ a running holder is never pre-empted. A waiter without a task priority (no task,
 an older runtime) ranks as NO_PRIORITY (p3). A waiter ages one priority step per `checks.priority_age_s`
 waited (default SUITE_AGE_S; checklane.priority_age_s), never past p1 (AGE_FLOOR; an obligation owner's
 0 stays 0), so a waiter of priority p waits at most (p - 1) aging steps plus the runs of those that
-arrived before it. Wait lines show each waiter's priority and its rank now (rank_text).
+arrived before it. Among equal ranks a native priority goes before an aged one (a native p1 before a p3
+aged to p1), until the aged one has waited FAIR_STEPS steps: then arrival decides (_order_key). Wait lines show each waiter's priority and its rank now (rank_text).
 A run holding it is stopped at the checks wall-time cap (checkwall); suite_line shows the holder's
 time against that cap and the waiting order (`ttp status`).
 
@@ -92,6 +93,7 @@ POLL_S = 5.0
 SUITE_AGE_S = 900.0   # default checks.priority_age_s: a suite waiter gains one priority step per this many seconds waited
 NO_PRIORITY = 3      # a ticket without a priority (no task, a task without one, an older runtime) ranks as p3
 AGE_FLOOR = 1        # aging never ranks a waiter above p1 (an obligation owner's 0 is its own, not aged to)
+FAIR_STEPS = 4       # a waiter past this many aging steps (1 h by default) goes by arrival among its rank
 TELL_S = 300.0
 NICE = 10
 IONICE = ["-c3"]    # idle class: a live service's IO always goes first
@@ -496,7 +498,16 @@ def rank_text(ticket, now: float | None = None, age: float | None = None) -> str
 
 
 def _order_key(t, now: float | None = None, age: float | None = None) -> tuple:
-    return suite_priority(t, now, age), locks._arrival(t), t.name
+    """Rank (suite_priority), then native priority, then arrival: among equal ranks a native p1 goes
+    before a waiter that only aged up to p1. One that has waited FAIR_STEPS aging steps goes by arrival
+    among its rank (0 sorts it first: it arrived before all who have not), so native p1s never starve it."""
+    now = time.time() if now is None else now
+    age = age_s() if age is None else age
+    arrival, prio = locks._arrival(t), locks.ticket_priority(t)
+    native = NO_PRIORITY if prio == float("inf") else prio
+    if age > 0 and now - arrival >= FAIR_STEPS * age:
+        native = 0
+    return suite_priority(t, now, age), native, arrival, t.name
 
 
 def suite_order(project_name: str, q: list | None = None, now: float | None = None, repo: str = "",
