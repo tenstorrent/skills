@@ -16975,7 +16975,7 @@ def test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_ca
     mem_chars = sum(len(e["line"]) + 1 for e in p._memory_entries())
     assert len(charter) > 11_000 and mem_chars > 9_000, (len(charter), mem_chars)
     spec = "SPEC-MARKER: follow up on fact-03 and fact-07"
-    for kind, cap in (("code", 30_065), ("question", 24_000)):   # code: +100 for `ttp detach --lock`, +150 for atomic script writes, +175 for `published`, +35 for the $TTP_TEST_SLOTS cap, +80 for the home-zone date, +400 for paid-model-API job guards, +125 for its spend cap
+    for kind, cap in (("code", 30_080), ("question", 24_000)):   # code: +15 for wait_kind user, +100 for `ttp detach --lock`, +150 for atomic script writes, +175 for `published`, +35 for the $TTP_TEST_SLOTS cap, +80 for the home-zone date, +400 for paid-model-API job guards, +125 for its spend cap
         tid = p.db.add_task(f"{kind} task", spec, kind=kind, tier="light", origin="user")
         prompt = worker_prompt(p, p.db.task(tid), str(p.root), "ttp/t1-x" if kind == "code" else None)
         assert spec in prompt and str(tmp_path) in prompt
@@ -28632,8 +28632,9 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     # 13.9k: +1 clause, pytest -n never above the host's per-run test-slot cap ($TTP_TEST_SLOTS).
     # 14.32k: +1 rule, a detached job calling a paid model API caches, caps units, guards daily limits.
     # 14.44k: +1 clause, `ttp detach --spend-cmd/--spend-cap` has the daemon stop a paid-API job at its cap.
+    # 14.455k: +1 hand-off wait_kind, `user` (only the user's step ends the wait; no stall:probe).
     rules = {k: feature_blocks(src, worker_features(p, t)) for k, t in (("code", code), ("question", question))}
-    assert len(rules["code"]) <= 14_440, len(rules["code"])
+    assert len(rules["code"]) <= 14_455, len(rules["code"])
     assert len(rules["question"]) <= 10_000, len(rules["question"])
     # A question task cannot detach, so it skips the pointer to the long-running script rules.
     assert "references/long-running-scripts.md" in rules["code"]
@@ -28642,7 +28643,7 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     assert "A follow-up implying a device or machine experiment" not in src
     assert "A harness task changes only this project's own harness" not in src
     every = feature_blocks(src, {"harness", "prs", "wait", "device", "devq", "remote", "clusters"})
-    assert len(every) <= 18_740, len(every)  # room for the upstream-note scope, atomic script-write, paid-model-API job and spend-cap rules
+    assert len(every) <= 18_755, len(every)  # room for the upstream-note scope, atomic script-write, paid-model-API job and spend-cap rules, wait_kind user
     for t in (None, code, question):
         system = worker_system(p, t)
         assert "<!-- ttp:" not in system and "<!-- /ttp:" not in system

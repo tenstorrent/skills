@@ -9068,7 +9068,8 @@ def test_a_probe_reading_a_missing_project_relative_file_is_flagged(env, probe, 
     held = _hold_task(p)
     assert coord.apply(p, [{"type": "task_update", "id": held, "status": "blocked", "waits_on": f"when:{probe}"}]) == []
     notes = p.db.kv(coord.NOTES_KEY)
-    assert len(notes) == 1 and f"#{held} flagged: waits_on when" in notes[0], notes
+    assert len(notes) == 2 and f"#{held} flagged: start_when" in notes[0], notes   # a probe-only hold is a deferral
+    assert "was stored as start_when (queued, not blocked)" in notes[1], notes
     cli.set_when(p.db, tid, "", p)
     assert "; flagged: start_when" in cli.set_when(p.db, tid, probe, p)
     waiting = _due_waiting_task(p, "exit 1")
@@ -9700,7 +9701,8 @@ def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are
     # +20: a `reason` passes continue_cap/review_area_cap at once; max_hops/max_usd stay hard
     # +60: a mute of work not moving names its fix task and lasts 12 h (throughmute.py)
     # +240: the urgent-lane rule (time matters: priority 1, an `urgent:` line, check nothing holds it)
-    assert len(role) <= 34_000, len(role)
+    # +30: a hold on only until:/when: is stored as start_after/start_when
+    assert len(role) <= 34_030, len(role)
     assert "<!-- ttp:" not in role and "<!-- /ttp:" not in role
     assert role in coord.prompt_parts(p)[0]
     # Rules for features that are off are left out; turning one on brings its rules in.
