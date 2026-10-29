@@ -21,8 +21,11 @@ AS_USER_REASONS = ("review", "merge", "human")
 # These resolve only to a recommendation that grants nothing only the user holds.
 GATED_REASONS = ("access", "funds", "spend")
 # A recommendation that speaks or acts as the user, whatever the ask's reason.
+# Writing to other people counts too (a message, a reply, a comment, a ping); telling the user does not.
 _AS_USER_RE = re.compile(r"\b(merge|merging|ready for review|out of draft|leave draft|undraft|publish|post|"
-                         r"e-?mail|on (my|your|the user'?s) behalf|in (my|your|the user'?s) name|as (me|you|the user))\b",
+                         r"e-?mail|send|sending|reply|replies|respond|comment|dm|"
+                         r"(message|tell|contact|ping|notify|ask|write to|call)\b(?!\s+(the user|me|for)\b)|"
+                         r"on (my|your|the user'?s) behalf|in (my|your|the user'?s) name|as (me|you|the user))\b",
                          re.I)
 # A gated recommendation that grants something: a yes, more money or quota, a credential, a login.
 _GRANT_RE = re.compile(r"\b(yes|y|ok|okay|approve[ds]?|grant|raise|increase|lift|extend|top[- ]?up|buy|purchase|"
@@ -32,6 +35,22 @@ _GRANT_RE = re.compile(r"\b(yes|y|ok|okay|approve[ds]?|grant|raise|increase|lift
 # it", "wait a day, then raise the cap" and "keep merging" do not decline), so it keeps things as they are.
 _DECLINE_RE = re.compile(r"^\W*(no|don'?t|do not|skip|decline|not now|never)\b", re.I)
 _LATER_RE = re.compile(r"\b(then|but|after(wards?)?|later|until|unless|instead|except)\b", re.I)
+# Every clause after it must decline too: a bare no, a negated action ("don't post the summary") or a
+# plain keep/leave/wait. "No, merge it now" and "No. Delete the branch." are actions, not declines.
+_CLAUSE_RE = re.compile(r"\s+[-\u2013\u2014]+\s+|[,;:.!?\u2013\u2014]+|\b(?:and|or|plus|also)\b|&", re.I)
+_NO_CLAUSE_RE = re.compile(r"^(no|nope|not now|(don'?t|do not|never|skip|decline)\b.*)$", re.I)
+_KEEP_RE = re.compile(r"^(keep|leave|wait|hold|stay|let it)\b", re.I)
+
+
+def _declines(rec: str) -> bool:
+    """True only when the whole recommendation declines; when in doubt, False."""
+    if not _DECLINE_RE.match(rec) or _LATER_RE.search(rec):
+        return False
+    for c in (c.strip() for c in _CLAUSE_RE.split(rec)):
+        if c and not _NO_CLAUSE_RE.match(c) and not (
+                _KEEP_RE.match(c) and not _AS_USER_RE.search(c) and not _GRANT_RE.search(c)):
+            return False
+    return True
 
 
 def hours(cfg: dict | None) -> float:
@@ -45,7 +64,7 @@ def hours(cfg: dict | None) -> float:
 def outcome(blocking: str | None, rec: str | None) -> tuple[str, str]:
     """What the timer does with an ask: ("apply", rec), ("stay", STAY) or ("open", why it waits)."""
     rec = " ".join((rec or "").split())
-    declines = bool(_DECLINE_RE.match(rec)) and not _LATER_RE.search(rec)
+    declines = _declines(rec)
     if not rec:
         return "open", "it has no recommendation"
     if blocking == "restriction":

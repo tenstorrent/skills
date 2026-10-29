@@ -4861,6 +4861,29 @@ def test_an_unanswered_ask_resolves_to_its_recommendation_at_the_deadline(env):
     ("spend", "use the cheaper runner", "apply"),
     ("review", "no", "open"),
     ("access", "", "open"),
+    ("irreversible", "No, merge it now", "open"),               # a leading no then an action is no decline
+    ("irreversible", "No. Delete the branch.", "open"),
+    ("irreversible", "no - delete the branch", "open"),
+    ("funds", "No, raise the cap to $50", "open"),
+    ("access", "No; use the API key from the vault", "open"),
+    ("restriction", "No, lift it", "stay"),
+    ("access", "Don't wait; merge it now", "open"),
+    ("access", "skip the review and merge", "open"),
+    ("spend", "no, keep the cap and spend the rest", "open"),
+    ("restriction", "no, leave it as written and lift the other one", "stay"),
+    ("access", "send the vendor a message asking for a quote", "open"),   # speaks to people as the user
+    ("spend", "reply to the issue reporter with the numbers", "open"),
+    ("access", "comment on their PR with the fix", "open"),
+    ("spend", "tell the other team to retry", "open"),
+    ("access", "contact the other team", "open"),
+    ("access", "ping the box owner", "open"),
+    ("spend", "notify the other team", "open"),
+    ("access", "message the vendor", "open"),
+    ("access", "ask the other team for a slot", "open"),
+    ("access", "no, don't message the vendor", "apply"),
+    ("irreversible", "No, keep it", "apply"),
+    ("irreversible", "no. leave the branch as is.", "apply"),
+    ("funds", "no, wait for the next cycle", "apply"),
 ])
 def test_the_ask_timer_applies_only_a_recommendation_that_grants_nothing_only_the_user_holds(blocking, rec, kind):
     from ttp import askauto
