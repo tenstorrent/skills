@@ -21660,6 +21660,13 @@ def test_a_timed_out_probe_is_broken(env, monkeypatch):
     assert _ready(p, tid) and json.loads(p.db.task(tid)["result"])["woke"] == "probe broken: timeout"
 
 
+def _probe_starts_done(d):
+    """Probes start on probespawn's threads, after probe_waiting returns: wait for every queued start
+    before counting Popen calls or reading a verdict (a loaded host can leave one unstarted)."""
+    for run in list(d._probes.values()):
+        assert run[0].started.wait(60), "a probe start never ran"
+
+
 def test_a_probe_that_cannot_start_is_broken(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dmod
@@ -21670,6 +21677,7 @@ def test_a_probe_that_cannot_start_is_broken(env, monkeypatch):
         raise OSError("no shell")
     monkeypatch.setattr(dmod.subprocess, "Popen", refuse)
     d.probe_waiting()          # asks the probe first; it cannot start
+    _probe_starts_done(d)
     p.db.update_task(tid, not_before=time.time() - 1)
     d.probe_waiting()
     assert _ready(p, tid) and json.loads(p.db.task(tid)["result"])["woke"] == "probe broken: could not start"
@@ -21711,6 +21719,7 @@ def test_waiting_tasks_with_the_same_probe_share_its_runs(env, monkeypatch):
     for tid in (*same, other):
         p.db.update_task(tid, not_before=time.time() + 3600)
     d.probe_waiting()
+    _probe_starts_done(d)
     # Probes run as shell strings; argv lists are other children (macOS: sysctl for the boot time).
     probes = [c for c in calls if isinstance(c, str)]
     assert sorted(probes) == sorted([f"test -f {flag}", "exit 1"]), "one run per distinct command"
@@ -21723,6 +21732,7 @@ def test_waiting_tasks_with_the_same_probe_share_its_runs(env, monkeypatch):
     monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
     calls.clear()
     d.probe_waiting()
+    _probe_starts_done(d)
     assert calls.count(f"test -f {flag}") == 1
     for tid in same:
         d._probes[tid][0].wait(10)
