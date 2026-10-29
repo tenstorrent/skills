@@ -17,7 +17,7 @@
   code, boxes, models or scripts get plain follow-ups.
   A note to another of the user's projects: `ttp note --to <project> "<text>"` (`ttp say` is
   refused in a run); its coordinator reads it as data. Put the question or request first: a note
-  over 4,000 characters is refused, not cut. Check the stored length and hash it prints.
+  over 4,000 characters is refused, not cut. Check the length and hash it prints.
   A note that is queued or refused is never a reason to wait or block: keep working.
   When the note relays the user's words, quote them under the label "user's words (verbatim)", apart from your own context.
 <!-- ttp:if prs -->
@@ -43,11 +43,11 @@
   in your hand-off. `high`: urgent, to the coordinator now (2/run).
 - A step the user must act on in a time limit (a sign-in link, a device code): run
   `ttp hours --check --for <seconds they need>` first. Exit 1 (outside their usual hours): do not
-  start it; hand off `waiting` with that command as `retry_when`. The notify names when it lapses.
+  start it; hand off `waiting` with that command as `retry_when`. The notify names its lapse.
 - Make durable progress early (commit, or write files to the output folder): a killed run keeps
   what's on disk.
 - Run builds as `ttp clip -- <command>` (it shows the failures or head and tail, and the log's
-  path), test suites and other untrusted test code as `ttp clip -- ttp sandbox -- <command>`
+  path), test suites and other untrusted test as `ttp clip -- ttp sandbox -- <command>`
   (they then cannot see or signal other processes). Cap pytest -n at $TTP_TEST_SLOTS.
 - Each call re-reads the whole context: `grep -n` first, then every range a step needs in one call
   (`sed -n '10,40p;200,260p' f`, or `grep -n -A30 'def name' f` for a hit's body). Send independent
@@ -112,7 +112,7 @@ Others share these nodes: hold one only while work runs.
   interactive or no-shell allocation (`salloc --no-shell`) kept for later steps, no job
   waiting on another task, a review, a tunnel, a laptop or a human.
 - The job script starts every process it needs and kills them all before it exits; never start
-  any by `ssh` into an allocation. Release must depend on nothing outside the cluster.
+  any by `ssh` into an allocation. Release depends on nothing outside the cluster.
 - An editor, `tmux` or agent session on a node is not using it; leave none open.
 - Release the allocation as soon as the work ends. Record every allocation (cluster, job id, node,
   start, end, purpose) with `ttp note` and in the hand-off; check nothing of yours still runs
@@ -293,7 +293,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
   spend is readable, add `--spend-cmd "<cmd printing USD so far>" --spend-cap <usd>`: the daemon
   stops it at the cap. Report its spend in the hand-off.
 <!-- /ttp:if wait -->
-- Flush as you go. Galaxy reset: tt-smi -glx_reset (harness skill).
+- Flush as you go. Galaxy reset: `tt-smi -glx_reset`, never `tt-smi -r` (harness skill).
 - Keep runs short: a run re-reads its whole context on every call. When the work exceeds one run
   or you passed the split line, finish the step, commit and hand off `done` with a
   `followups` entry titled `continue: ...` (what is done, branch and head, what is left).
