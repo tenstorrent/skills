@@ -10,14 +10,18 @@ finding, so the daemon queues the review deferred (db.deferral) instead of dispa
 - start_why names the carried task and its open fix, which the review's status line shows;
 - the label `carried_hold:<head>:<id>[,<id>...]` marks it as this hold, for release().
 
-release() (the daemon's model-free pass) also ends the hold when every carried task's fix chain
-ended without landing (its last task failed or was cancelled: the review spec then says so) or at
+release() (the daemon's model-free pass) also ends the hold once every open chain's change is approved
+for the push queue (an approved or batched row) at a head the held head contains: the review then
+covers the base's approved commits with the stacked ones and need not wait for the landing; a base
+whose approved head is not in the held head (it changed since) keeps the hold. It also ends the hold
+when every carried task's fix chain ended without landing (its last task failed or was cancelled: the review spec then says so) or at
 review.carried_hold_max_h hours (0: no cap). On any release the spec's line on inherited commits is
 refreshed: a carried task whose fix landed is no longer named."""
 from __future__ import annotations
 
 import json
 import time
+from typing import Callable
 
 from . import landed
 from .db import TERMINAL_TASK_STATES, deferral, dependency_ids, without_deferral
@@ -79,10 +83,21 @@ def hold_of(task: dict) -> tuple[str, list[int]] | None:
     return None
 
 
-def verdict(db, task: dict, now: float, max_h: float) -> tuple[str, str] | None:
+def approved_row(db, tid: int) -> dict | None:
+    """The newest approved or batched push queue row of task `tid`'s change (it or a task carrying it
+    on, landed.carriers); None while there is none (a held row, missing a token scope, does not count)."""
+    ids = sorted(set(landed.carriers(db, tid)) | {tid})
+    return db.one(f"SELECT id, task, head FROM push_queue WHERE status IN ('approved','batched') AND head IS NOT NULL "
+                  f"AND task IN ({','.join('?' * len(ids))}) ORDER BY id DESC LIMIT 1", tuple(ids))
+
+
+def verdict(db, task: dict, now: float, max_h: float,
+            contains: Callable[[str], bool] | None = None) -> tuple[str, str] | None:
     """None while the held review `task` stays held; else (why, spec line) to release it: "landed"
-    (its start_when passed), "ended" (no carried fix chain is open any more; the line names those
-    that ended failed or cancelled) or "cap" (held max_h hours, a chain still open)."""
+    (its start_when passed), "approved" (every open chain's change is approved for the push queue at a
+    head the held head contains: `contains(head)`, a git ancestry check), "ended" (no carried fix chain
+    is open any more; the line names those that ended failed or cancelled) or "cap" (held max_h hours,
+    a chain still open)."""
     h = hold_of(task)
     d = deferral(task)
     if h is None:
@@ -92,6 +107,13 @@ def verdict(db, task: dict, now: float, max_h: float) -> tuple[str, str] | None:
     skip = {task["id"], *(i for i in dependency_ids(task) if i is not None)}
     states = {t: chain_state(db, t, skip) for t in h[1]}
     open_ = {t: last for t, (s, last) in states.items() if s == "open"}
+    if open_ and contains is not None:
+        rows = {t: approved_row(db, t) for t in open_}
+        if all(r is not None and contains(r["head"]) for r in rows.values()):
+            return "approved", " ".join(
+                f"Carried task #{t}'s fix is approved for the push queue at {r['head'][:12]} (row {r['id']}, #{r['task']}) "
+                f"and this head contains it: review the head whole, those approved commits with this task's "
+                f"own; they are not this task's to deliver." for t, r in sorted(rows.items()))
     if open_:
         since = d.get("since") or task.get("created") or now
         if max_h and now - since >= max_h * 3600:

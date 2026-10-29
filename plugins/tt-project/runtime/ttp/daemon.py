@@ -8627,18 +8627,27 @@ class Daemon:
 
     def release_review_holds(self, now: float) -> None:
         """Model-free: a review held for a carried change's open fix chain (reviewhold) is released
-        once its start_when passed (the fix landed), once no such chain is open (one that ended failed
-        or cancelled gets a spec line saying so) or at review.carried_hold_max_h hours. Its line on
-        inherited commits is refreshed from the head's commits now (pushq.carried)."""
+        once its start_when passed (the fix landed), once every open chain's fix is approved for the
+        push queue at a head this head contains (the stacked review starts on its base's approval),
+        once no such chain is open (one that ended failed or cancelled gets a spec line saying so) or
+        at review.carried_hold_max_h hours. Its line on inherited commits is refreshed from the head's
+        commits now (pushq.carried)."""
         db = self.p.db
         max_h = float((self.cfg.get("review") or {}).get("carried_hold_max_h", reviewhold.MAX_H) or 0)
         for t in db.q("SELECT * FROM tasks WHERE status='queued' AND kind='review' "
                       "AND labels LIKE '%\"" + reviewhold.LABEL + "%'"):
-            got = reviewhold.verdict(db, t, now, max_h)
+            head, _ = reviewhold.hold_of(t) or ("", [])
+
+            def contains(base: str, head: str = head) -> bool:
+                try:
+                    return bool(head) and pushq._contains(self.p, [head], base)
+                except Exception as e:   # git unreadable: the hold stays until the landing
+                    log(self.p, f"task {t['id']}: approved base not checked: {e}")
+                    return False
+            got = reviewhold.verdict(db, t, now, max_h, contains)
             if got is None:
                 continue
             why, line = got
-            head, _ = reviewhold.hold_of(t) or ("", [])
             code = next((c for i in dependency_ids(t) if i is not None and (c := db.task(i))), None)
             try:
                 carried = pushq.carried(self.p, code, head, self.cfg) if code and head else {}

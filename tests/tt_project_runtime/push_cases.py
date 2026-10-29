@@ -5631,6 +5631,32 @@ def test_a_held_review_is_released_once_the_carried_fix_lands(env, monkeypatch):
     assert t["spec"].rstrip().splitlines()[-1].startswith("Return the verdict")
 
 
+def test_a_held_stacked_review_starts_once_its_base_is_approved_at_a_head_it_contains(env, monkeypatch):
+    """user msg #1221: a review of a head stacked on a change whose fix is open waits for the fix's
+    approval, not its landing; a base approved at a head this one does not contain (it changed) keeps it held."""
+    from ttp import pushq, reviewhold
+    s, d, x, fix, rid = _held_review(env, monkeypatch)
+    held = reviewhold.hold_of(s.p.db.task(rid))[0]
+    xbranch = s.p.db.task(x)["branch"]
+    xhead = _git_out(s.repo, "rev-parse", xbranch)
+    assert pushq._contains(s.p, [held], xhead)
+    s.p.db.update_task(fix, status="done")
+    rr = s.p.db.add_task(f"Review #{fix}: fix", "r", kind="review", origin="daemon", depends_on=[x, fix],
+                         labels=[f"auto_review:{fix}"])
+    s.p.db.update_task(rr, status="pushing")
+    moved = _git_out(s.repo, "commit-tree", f"{xhead}^{{tree}}", "-p", xhead, "-m", "the fix")
+    with s.p.db.tx():
+        [row] = pushq.approve(s.p, rr, None, {"entries": [{"branch": xbranch, "head": moved}], "target": "origin/proj"})
+    d.release_review_holds(time.time())
+    assert not _review_ready(s.p.db, rid) and reviewhold.hold_of(s.p.db.task(rid)), "the base changed: still held"
+    s.p.db.x("UPDATE push_queue SET head=? WHERE id=?", (xhead, row))
+    d.release_review_holds(time.time())
+    t = s.p.db.task(rid)
+    assert _review_ready(s.p.db, rid) and not reviewhold.hold_of(t), t["labels"]
+    assert f"Carried task #{x}'s fix is approved for the push queue at {xhead[:12]} (row {row}, #{rr})" in t["spec"]
+    assert "review the head whole" in t["spec"]
+
+
 def test_a_held_review_wakes_at_once_when_the_carried_fix_chain_ends_failed_or_cancelled(env, monkeypatch):
     from ttp import reviewhold
     s = None
