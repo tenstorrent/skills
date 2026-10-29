@@ -70,6 +70,8 @@ Telling a box that is off from our own route: `ping_host` (a host name or addres
 host on the same network), set together and pinged from the daemon's machine. A run that exits 255 (ROUTE_RC,
 ssh's own failure) then pings them: `ping_host` silent while `ping_peer` answers means the box itself is off or
 rebooting: that run is an outage like any other unknown run, so the box is reported down past the window.
+An outage check with a `fix` counts such a run as unhealthy instead: the box is known off, not unreadable, so
+its fix (say, a power-on through the box's management port) runs past its grace like any unhealthy one.
 Everything else keeps the route rule above. Known limits: with no peer answering, a silent box is never called
 down (our own route looks the same); a route failure with another exit code, ping unable to tell, or a network
 that drops ping stays a route problem. Set them only for a box that answers ping when it is up.
@@ -1013,6 +1015,11 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
         st.pop("finding", None)
     pending = st.get("phase") in ("fixing", "settling")   # a fix ran (or a restart cut it short)
     paused = _paused_resource(db, spec)
+    if rc == ROUTE_RC and spec.get("outage") and spec.get("fix"):
+        off_box = box_silent(spec, cwd)
+        if off_box:   # the box itself is off (module doc): unhealthy, so its fix runs past its grace
+            rc, st["last_rc"] = 1, 1
+            st["last_out"] = (out[-800:] + f"\nping: {off_box}").strip()
     if paused:
         st["resource_paused"] = paused
     else:

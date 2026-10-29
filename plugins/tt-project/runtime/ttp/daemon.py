@@ -54,6 +54,7 @@ from . import budget as bud
 from . import budgetkind
 from . import pregrant
 from . import deadwait
+from . import downwait
 from . import cachettl
 from . import chaincap
 from . import chatbridge
@@ -772,6 +773,7 @@ class Daemon:
         self._probe_rc: dict[int, tuple[int | str, float, str]] = {}   # last verdict: exit code or why, when, probe
         self._start_rc: dict[int, tuple[int | str, float, str]] = {}   # a start_when's last not-yet or broken verdict
         self._host_up: dict[str, tuple[bool, float]] = {}   # host a probe's 255 named -> ssh reached it, when
+        self._down_n: dict[int, int] = {}   # task -> its probe's confirmed-down answers in a row (downwait.gap)
         self._probe_files: dict[int, object] = {}   # id(probe proc) -> the file its output goes to
         self._probe_out: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last output, unchanged since, probe
         self._probe_live: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last line, when read, probe
@@ -8086,6 +8088,7 @@ class Daemon:
                 rc = f"its cd target {gone} is gone (a removed task worktree)"
             if rc == netwait.UNREACHABLE_RC:
                 rc = self._own_255(tid, probe, outs[id(proc)], now)
+            self._host_down(tid, probe, outs[id(proc)], rc, now)
             if task and task["status"] == "queued" and deferral(task).get("when"):
                 self._start_verdict(task, "timeout" if rc is None else rc, now)
                 continue
@@ -8124,7 +8127,7 @@ class Daemon:
                     continue
                 if not self._hold_waiting(t, prev, now):
                     continue
-            elif t["id"] in self._probes or now - self._probed.get(t["id"], 0) < PROBE_EVERY_S:
+            elif t["id"] in self._probes or now - self._probed.get(t["id"], 0) < self._probe_gap(t["id"]):
                 continue
             self._start_probe(t["id"], probe, now)
             got = self._probe_rc.get(t["id"])
@@ -8197,7 +8200,10 @@ class Daemon:
             return False
         last = self._probed.get(tid, 0)
         g = gate if gate and gate.get("when") == when else {}
-        if now - last >= startgate.every(when, g.get("rc"), now - float(g.get("since") or now), PROBE_EVERY_S):
+        # A probe on a confirmed-down host keeps downwait's seconds-scale gap, never the backed-off one.
+        every = self._probe_gap(tid) if self._down_n.get(tid) else \
+            startgate.every(when, g.get("rc"), now - float(g.get("since") or now), PROBE_EVERY_S)
+        if now - last >= every:
             return True
         landing = landed.probe_command(when, self.p) != when
         return landing and pushed is not None and pushed > last and now - last >= LANDED_REPROBE_S
@@ -8250,6 +8256,46 @@ class Daemon:
         if why:
             log(self.p, f"task {tid} probe is broken, not waiting on an unreachable host: {why}")
         return why or netwait.UNREACHABLE_RC
+
+    def _probe_gap(self, tid: int) -> float:
+        """How long after its last run a task's probe runs again: PROBE_EVERY_S, or seconds while it
+        waits on a down host (downwait.gap)."""
+        return downwait.gap(self._down_n.get(tid, 0), PROBE_EVERY_S)
+
+    def _host_down(self, tid: int, probe: str, out: str, rc, now: float) -> None:
+        """downwait: a probe whose 255 is ssh's own (rc stays UNREACHABLE_RC after _own_255) shortens its
+        task's probe gap and acts once per down machine; any other answer ends the gap and the episode of
+        the hosts it names (they answered)."""
+        try:
+            if rc != netwait.UNREACHABLE_RC:
+                self._down_n.pop(tid, None)
+                if rc is not None and downwait.episodes(self.p.db):
+                    for h in netwait.hosts(probe)[:netwait.HOSTS_MAX]:
+                        alias = h.rsplit("@", 1)[-1]
+                        if downwait.clear(self.p.db, alias):
+                            log(self.p, f"machine {alias}: answers again (task {tid}'s probe); its down episode ended")
+                return
+            self._down_n[tid] = self._down_n.get(tid, 0) + 1
+            known = machines.load()
+            down = [a for h in netwait.hosts(probe, out)[:netwait.HOSTS_MAX]
+                    if (a := downwait.machine_of(h, known)) and not self._host_up.get(h, (True, 0))[0]]
+            if not down:
+                return
+            checks = heal.checks(self.p.db)
+            for alias in dict.fromkeys(down):
+                got = downwait.act(
+                    self.p.db, alias, tid, self.p.name, known, checks, now,
+                    lock_busy=lambda res: lockprobe.answer(self.p, self.cfg, res)[0] != 0,
+                    send=lambda owner, text: upstream.send(self.p.name, tid, owner, text, "high", now=now,
+                                                           sender="daemon"))
+                if got:
+                    log(self.p, f"machine {alias} down while task {tid} waits: " + {
+                        "fix": f"heal check {got.get('schedule')} runs now",
+                        "owner": f"noted its recovery owner {got.get('owner')}; nothing run here",
+                        "blocked": f"heal check {got.get('schedule')} not run: {got.get('why')}",
+                        "none": "no recovery declared; host_down event raised"}[got["action"]])
+        except Exception:
+            log(self.p, f"task {tid} down host: " + traceback.format_exc().replace("\n", " | ")[:1000])
 
     def _host_answers(self, host: str, now: float) -> bool:
         """ssh reaches `host`, asked at most once a minute for all the probes that name it."""
@@ -8826,7 +8872,7 @@ class Daemon:
                 self._probes[tid] = run
                 return
         for other, got in self._probe_rc.items():
-            if other != tid and got[2] == probe and now - got[1] < PROBE_EVERY_S:
+            if other != tid and got[2] == probe and now - got[1] < self._probe_gap(tid):
                 self._probe_rc[tid] = got
                 return
         # Its output (the blocking gate's last word) goes to a file: a pipe nobody reads could fill. Opening

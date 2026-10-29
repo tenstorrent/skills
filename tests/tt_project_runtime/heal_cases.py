@@ -4179,3 +4179,140 @@ def test_an_auto_undo_retry_whose_probe_says_not_yet_again_is_paged_once_expired
     c = _change_entry(ml, hand)
     assert c["closed"] == t0 + 3602 and c["closed_by"] == "alpha" and c["closed_why"] == "undone by hand"
     assert c["auto_undo_runs"][-1]["outcome"] == "ok" and c["auto_undone"]["try"] == 1
+
+
+def test_downwait_probe_gap_backs_off_from_seconds_and_never_passes_the_normal_interval():
+    from ttp import downwait
+    assert [downwait.gap(n, 180) for n in range(6)] == [180, 15, 30, 60, 120, 120]
+    assert downwait.gap(3, 20) == 20
+
+
+def test_a_task_waiting_on_a_down_machine_runs_its_heal_fix_at_once_and_retries_when_the_host_returns(env):
+    """User report: a wait on a down host polled on a flat timer for hours. The daemon now probes it in
+    seconds, runs the machine's heal check (its fix) at once, once per episode, and wakes the task as soon
+    as the host answers."""
+    from ttp import daemon as dmod
+    from ttp import downwait, heal
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env, machine="box-a")
+    later = time.time() + 7200   # the check backed off while healthy: it would run in 2 h
+    p.db.x("UPDATE schedules SET next_run=? WHERE name='svc'", (later,))
+    _ssh_255(p)
+    probe = "ssh -o BatchMode=yes box-a true"
+    tid = _due_waiting_task(p, probe)
+    p.db.update_task(tid, not_before=time.time() + 3600)
+    _settle_probe(d, tid)
+    assert p.db.one("SELECT next_run FROM schedules WHERE name='svc'")["next_run"] <= time.time(), \
+        "the heal check was not made due at once"
+    assert d._probe_gap(tid) == downwait.BACKOFF_S[0]
+    assert downwait.episodes(p.db)["box-a"]["action"] == "fix"
+    assert "machine box-a down while task" in (p.logs / "daemon.log").read_text()
+    # Still down on the next probe: no second kick within the episode, a longer gap.
+    p.db.x("UPDATE schedules SET next_run=? WHERE name='svc'", (later,))
+    d._probed[tid] -= 20
+    _settle_probe(d, tid)
+    assert p.db.one("SELECT next_run FROM schedules WHERE name='svc'")["next_run"] == later
+    assert d._probe_gap(tid) == downwait.BACKOFF_S[1]
+    # The kicked check runs its fix once.
+    heal.run(d, "svc", _heal_spec(p))
+    assert up.exists() and len(heal.state(p.db, "svc")["fixes"]) == 1
+    # The host answers: the very next probe passes and the task is due, the episode over.
+    _ssh_255(p, up=True)
+    d._probed[tid] -= downwait.BACKOFF_S[1] + 1
+    _settle_probe(d, tid)
+    assert _ready(p, tid) and downwait.episodes(p.db) == {} and d._probe_gap(tid) == dmod.PROBE_EVERY_S
+
+
+def test_a_down_machine_is_not_acted_on_under_a_pause_a_held_lock_or_an_open_machine_change(env):
+    from ttp import downwait, heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.db import PAUSED_RESOURCES_KEY
+    mm.add("box-a", tags="device")
+    p, d, _ = _heal_setup(env, machine="box-a", resource="box-a-device")
+    checks, known = heal.checks(p.db), mm.load()
+    later = time.time() + 7200
+    p.db.x("UPDATE schedules SET next_run=? WHERE name='svc'", (later,))
+
+    def kicked():
+        return p.db.one("SELECT next_run FROM schedules WHERE name='svc'")["next_run"] < later
+
+    # A user pause on the machine (or its device resource): nothing runs, and the pause stays.
+    for res in ("box-a", "box-a-device"):
+        p.db.set_kv(PAUSED_RESOURCES_KEY, {res: {"reason": "user hold", "since": time.time(), "by": "user"}})
+        got = downwait.act(p.db, "box-a", 1, p.name, known, checks)
+        assert got["action"] == "blocked" and "paused by user" in got["why"] and not kicked(), res
+        assert downwait.act(p.db, "box-a", 1, p.name, known, checks) is None   # said once
+        assert res in p.db.paused_resources()
+        downwait.clear(p.db, "box-a")
+    p.db.set_kv(PAUSED_RESOURCES_KEY, {})
+    # Its lock held.
+    got = downwait.act(p.db, "box-a", 1, p.name, known, checks, lock_busy=lambda r: r == "box-a-device")
+    assert got["action"] == "blocked" and got["why"] == "lock box-a-device is held" and not kicked()
+    # A recorded live change on the machine.
+    downwait.clear(p.db, "box-a")
+    ml.add_change("box-a", "service drop-in for a test", "none: test", by="other", expires=time.time() + 3600)
+    got = downwait.act(p.db, "box-a", 1, p.name, known, checks, lock_busy=lambda r: False)
+    assert got["action"] == "blocked" and "machine change #" in got["why"] and not kicked()
+    # The blocker gone: the same episode acts at once.
+    for c in ml.changes(["box-a"]):
+        ml.close_change(c["id"], "test over", "other")
+    got = downwait.act(p.db, "box-a", 1, p.name, known, checks, lock_busy=lambda r: False)
+    assert got["action"] == "fix" and kicked()
+
+
+def test_a_down_machine_owned_by_another_project_gets_one_note_and_no_action(env):
+    from ttp import downwait, heal
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    mm.set_recovery("box-a", owner="other-project")
+    p, d, up = _heal_setup(env, machine="box-a")
+    later = time.time() + 7200
+    p.db.x("UPDATE schedules SET next_run=? WHERE name='svc'", (later,))
+    sent: list = []
+    for _ in range(3):
+        downwait.act(p.db, "box-a", 7, p.name, mm.load(), heal.checks(p.db), send=lambda o, t: sent.append((o, t)))
+    assert len(sent) == 1 and sent[0][0] == "other-project" and "box-a is down" in sent[0][1]
+    assert p.db.one("SELECT next_run FROM schedules WHERE name='svc'")["next_run"] == later and not up.exists()
+
+
+def test_a_down_machine_with_no_recovery_raises_one_event_naming_it_and_its_owner(env):
+    from ttp import downwait
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-b")
+    for _ in range(2):
+        downwait.act(p.db, "box-b", 3, p.name, mm.load(), [])
+    ev = p.db.q("SELECT * FROM events WHERE kind=?", (downwait.EVENT,))
+    assert len(ev) == 1 and "box-b is down" in ev[0]["text"] and "no recovery owner" in ev[0]["text"]
+    mm.set_recovery("box-b", owner=p.name)   # its own project owns it, still with no fix: named as owner
+    downwait.clear(p.db, "box-b")
+    downwait.act(p.db, "box-b", 3, p.name, mm.load(), [])
+    ev = p.db.q("SELECT * FROM events WHERE kind=? ORDER BY id", (downwait.EVENT,))
+    assert len(ev) == 2 and f"its recovery owner {p.name}" in ev[1]["text"]
+
+
+def test_an_outage_check_with_a_fix_runs_it_when_ping_shows_the_box_off(env, monkeypatch):
+    """A box confirmed off (ping_host silent, ping_peer answering) is unhealthy for a check with a fix,
+    so the fix runs past its grace instead of waiting out the unknown outage window to escalate."""
+    from ttp import heal
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, _ = _heal_setup(env)
+    fixed = p.root / "fixed"
+    monkeypatch.setattr(heal, "_pings", lambda h, cwd: h == "box-b")
+    block = {"check": "echo 'ssh: connect to host box-a port 22: No route to host' >&2; exit 255",
+             "fix": f"touch {fixed}", "machine": "box-a", "outage": True, "grace_s": 60, "settle_s": 0,
+             "ping_host": "box-a", "ping_peer": "box-b"}
+    spec, t0 = heal.validate(block), time.time()
+    status, again = heal.run(d, "off", spec, t0)
+    assert "grace" in status and not fixed.exists() and again == t0 + 60
+    heal.run(d, "off", spec, t0 + 61)
+    assert fixed.exists() and len(heal.state(p.db, "off")["fixes"]) == 1
+    # Our own route (the peer silent too) still never runs the fix blind.
+    monkeypatch.setattr(heal, "_pings", lambda h, cwd: False)
+    fixed.unlink()
+    heal.run(d, "route", spec, t0)
+    heal.run(d, "route", spec, t0 + 3700)
+    assert not fixed.exists() and heal.state(p.db, "route")["route_only"]
