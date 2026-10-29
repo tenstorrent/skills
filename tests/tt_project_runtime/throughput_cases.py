@@ -4,32 +4,32 @@
 from __future__ import annotations
 
 
-def _task(p, title, created, prio=3, **kw):
+def _tp_task(p, title, created, prio=3, **kw):
     tid = p.db.add_task(title, "s", priority=prio, origin="user", **{k: v for k, v in kw.items() if k != "labels"})
     p.db.x("UPDATE tasks SET created=?, labels=? WHERE id=?", (created, json.dumps(kw.get("labels") or []), tid))
     return tid
 
 
-def _run(p, task, started, ended=None, role="worker"):
+def _tp_run(p, task, started, ended=None, role="worker"):
     return p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?,?,?,?,?)",
                   (task, role, started, ended, "done" if ended else "running"))
 
 
-def _busy_fixture(p, now, slots=2):
+def _tp_busy_fixture(p, now, slots=2):
     """`slots` runs filling every worker slot from now-3h on, a priority 1 task that waited 40 min behind
     them, two plain tasks queued 2 h ago and still waiting, and one task that started at once."""
     p.set_config("budget.max_parallel_workers", slots)
     for i in range(slots):
-        _run(p, _task(p, f"long {i}", now - 3 * 3600), now - 3 * 3600, None)
-    urgent = _task(p, "urgent fix", now - 2 * 3600, prio=1)
-    _run(p, urgent, now - 2 * 3600 + 2400, now - 3600)
-    waiting = [_task(p, f"queued {i}", now - 2 * 3600) for i in range(2)]
-    quick = _task(p, "quick", now - 7 * 3600)
-    _run(p, quick, now - 7 * 3600 + 5, now - 6 * 3600)
+        _tp_run(p, _tp_task(p, f"long {i}", now - 3 * 3600), now - 3 * 3600, None)
+    urgent = _tp_task(p, "urgent fix", now - 2 * 3600, prio=1)
+    _tp_run(p, urgent, now - 2 * 3600 + 2400, now - 3600)
+    waiting = [_tp_task(p, f"queued {i}", now - 2 * 3600) for i in range(2)]
+    quick = _tp_task(p, "quick", now - 7 * 3600)
+    _tp_run(p, quick, now - 7 * 3600 + 5, now - 6 * 3600)
     return urgent, waiting
 
 
-def _lane(rep, name):
+def _tp_lane(rep, name):
     return next(ln for ln in rep["lanes"] if ln["lane"] == name)
 
 
@@ -37,34 +37,34 @@ def test_throughput_measures_waits_per_lane_from_task_run_and_push_records(env):
     from ttp import throughput
     p = make(env)
     now = time.time()
-    urgent, waiting = _busy_fixture(p, now)
+    urgent, waiting = _tp_busy_fixture(p, now)
     # A landed:# chain, a device task, a review queued 40 min after its task's run ended, a push row
     # whose batch started 50 min after approval.
-    _task(p, "after #5", now - 5 * 3600, labels=["start_when:landed:#5", f"deferred_since:{now - 5 * 3600}"])
+    _tp_task(p, "after #5", now - 5 * 3600, labels=["start_when:landed:#5", f"deferred_since:{now - 5 * 3600}"])
     p.set_config("resources", {"box": 1})
-    dev = _task(p, "device run", now - 3600, labels=["exclusive:box"])
-    code = _task(p, "code change", now - 4 * 3600)
-    _run(p, code, now - 4 * 3600, now - 3 * 3600)
-    rv = _task(p, "Review #x", now - 3 * 3600 + 2400, labels=[f"auto_review:{code}"])
+    dev = _tp_task(p, "device run", now - 3600, labels=["exclusive:box"])
+    code = _tp_task(p, "code change", now - 4 * 3600)
+    _tp_run(p, code, now - 4 * 3600, now - 3 * 3600)
+    rv = _tp_task(p, "Review #x", now - 3 * 3600 + 2400, labels=[f"auto_review:{code}"])
     p.db.x("UPDATE tasks SET kind='review' WHERE id=?", (rv,))
-    _run(p, rv, now - 3 * 3600 + 3000, now - 3 * 3600 + 4000, role="reviewer")
+    _tp_run(p, rv, now - 3 * 3600 + 3000, now - 3 * 3600 + 4000, role="reviewer")
     p.db.x("INSERT INTO push_batches(id, marker, target, started) VALUES('b1','m','br',?)", (now - 3600,))
     p.db.x("INSERT INTO push_queue(task, branch, head, target, batch, created, updated) VALUES(?,?,?,?,?,?,?)",
            (code, "b", "h", "br", "b1", now - 3600 - 3000, now))
     rep = throughput.measure(p.db, p.config(), now=now, gates={})
-    w = _lane(rep, "worker_slots")
+    w = _tp_lane(rep, "worker_slots")
     assert w["limit_key"] == "budget.max_parallel_workers" and w["limit"] == 2
     assert w["waiting_now"] == 2 and w["p1_count"] == 1 and w["p1_p90_s"] == 2400 and w["slow"]
     assert w["at_limit"] == 3 and w["idle"] == 0, "every wait over threshold met all slots busy"
-    assert _lane(rep, "landed_chain")["count"] == 1 and _lane(rep, "landed_chain")["p90_s"] >= 5 * 3600 - 1
-    assert _lane(rep, "resource:box")["waiting_now"] == 1 and dev
-    rs, rt = _lane(rep, "review_sweep"), _lane(rep, "review_stall")
+    assert _tp_lane(rep, "landed_chain")["count"] == 1 and _tp_lane(rep, "landed_chain")["p90_s"] >= 5 * 3600 - 1
+    assert _tp_lane(rep, "resource:box")["waiting_now"] == 1 and dev
+    rs, rt = _tp_lane(rep, "review_sweep"), _tp_lane(rep, "review_stall")
     assert (rs["count"], rs["p90_s"], rt["p90_s"]) == (1, 2400, 3000)
-    assert _lane(rep, "push_batch")["p90_s"] == 3000
-    assert not _lane(rep, "checks_slots")["measured"]
+    assert _tp_lane(rep, "push_batch")["p90_s"] == 3000
+    assert not _tp_lane(rep, "checks_slots")["measured"]
     assert rep["lanes"][0]["slow"], "slow lanes come first"
     # A task that started before the window is outside it; the text names lanes and limits.
-    assert _lane(throughput.measure(p.db, p.config(), since_s=3600, now=now, gates={}), "worker_slots")["count"] == 2
+    assert _tp_lane(throughput.measure(p.db, p.config(), since_s=3600, now=now, gates={}), "worker_slots")["count"] == 2
     txt = throughput.text({**rep, "changes": [], "kept": []})
     assert "worker_slots SLOW" in txt and "limit budget.max_parallel_workers=2" in txt
 
@@ -73,7 +73,7 @@ def test_throughput_apply_raises_only_at_limit_with_headroom_bounded_by_load_and
     from ttp import throughput
     p = make(env)
     now = time.time()
-    _busy_fixture(p, now)
+    _tp_busy_fixture(p, now)
     monkeypatch.setattr(throughput, "cpu_free", lambda: (True, ""))
     monkeypatch.setattr(throughput.os, "cpu_count", lambda: 64)
     # A spend gate below the slot count, a red gate or a busy CPU: nothing changes.
@@ -114,11 +114,11 @@ def test_throughput_idle_slots_are_not_raised_and_resource_lanes_are_only_report
     now = time.time()
     p.set_config("budget.max_parallel_workers", 6)
     p.set_config("resources", {"box": 1})
-    _task(p, "waits idle", now - 2 * 3600)       # nothing ran: slots sat idle
-    _task(p, "box job", now - 2 * 3600, labels=["resource:box"])
+    _tp_task(p, "waits idle", now - 2 * 3600)       # nothing ran: slots sat idle
+    _tp_task(p, "box job", now - 2 * 3600, labels=["resource:box"])
     monkeypatch.setattr(throughput, "cpu_free", lambda: (True, ""))
     rep = throughput.review(p, p.config(), do_apply=True, gates={}, now=now)
-    assert rep["changes"] == [] and _lane(rep, "worker_slots")["idle"] == 1
+    assert rep["changes"] == [] and _tp_lane(rep, "worker_slots")["idle"] == 1
     kept = {k["lane"]: k["why"] for k in rep["kept"]}
     assert "idle" in kept["worker_slots"] and "not measurable" in kept["resource:box"]
     assert p.config()["resources"] == {"box": 1}
@@ -136,7 +136,7 @@ def test_throughput_never_changes_spend_lock_pause_or_restriction_keys(env, monk
     p = make(env)
     # plan() offers only safe keys, whatever the lanes say.
     before = p.config()["budget"].get("daily_usd")
-    _busy_fixture(p, time.time())
+    _tp_busy_fixture(p, time.time())
     monkeypatch.setattr(throughput, "cpu_free", lambda: (True, ""))
     rep = throughput.measure(p.db, p.config(), gates={})
     changes, _ = throughput.plan(p.db, p.config(), rep)
@@ -165,8 +165,8 @@ def test_speed_complaint_on_the_turn_start_runs_the_review_applies_and_queues_p1
     p = make(env)
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
     now = time.time()
-    _busy_fixture(p, now)
-    _task(p, "after #5", now - 5 * 3600, labels=["start_when:landed:#5", f"deferred_since:{now - 5 * 3600}"])
+    _tp_busy_fixture(p, now)
+    _tp_task(p, "after #5", now - 5 * 3600, labels=["start_when:landed:#5", f"deferred_since:{now - 5 * 3600}"])
     monkeypatch.setattr(throughput, "cpu_free", lambda: (True, ""))
     d = Daemon(p.base)
     d.update_gates()
@@ -198,7 +198,7 @@ def test_speed_complaint_on_the_turn_start_runs_the_review_applies_and_queues_p1
 
 def test_ttp_throughput_cli_prints_text_and_json(env):
     p = make(env)
-    _busy_fixture(p, time.time())
+    _tp_busy_fixture(p, time.time())
     r = _ttp_run(p, "throughput")
     assert "Throughput over the last 24h00m" in r.stdout and "worker_slots" in r.stdout
     data = json.loads(_ttp_run(p, "throughput", "--json", "--since", "6h").stdout)
