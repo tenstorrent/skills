@@ -1596,14 +1596,14 @@ def test_suite_slot_order_is_task_priority_then_arrival_and_a_long_waiter_ages_u
     other = _suite_ticket("pb", 1, now - 9000)   # another project's waiters never count
     try:
         assert testslots.suite_order("pa", now=now) == [p1_new, p2_a, p2_b, p3_old, none], \
-            "p1 before an earlier p3; equal priorities by arrival; no priority last"
-        # No starvation: each SUITE_AGE_S waited is one step more urgent, down to 0, so a p5 waiter
-        # waits at most 5 steps plus the runs of those that arrived before it.
+            "p1 before an earlier p3; equal priorities by arrival; no priority ranks as p3, by its arrival"
+        # No starvation: each SUITE_AGE_S waited is one step more urgent, down to p1, so a p5 waiter
+        # waits at most 4 steps plus the runs of those that arrived before it.
         p5_starved = _suite_ticket("pa", 5, now - 5 * age - 1)
         p5_aging = _suite_ticket("pa", 5, now - 2 * age - 1)
-        assert testslots.suite_priority(p5_starved, now) == 0 and testslots.suite_priority(p5_aging, now) == 3
+        assert testslots.suite_priority(p5_starved, now) == 1 and testslots.suite_priority(p5_aging, now) == 3
         order = testslots.suite_order("pa", now=now)
-        assert order[0] == p5_starved, "a waiter aged to 0 goes before any newer p1"
+        assert order[0] == p5_starved, "a waiter aged to p1 goes before any newer p1 (it arrived first)"
         assert order.index(p5_aging) > order.index(p2_b) and order.index(p5_aging) < order.index(p3_old), \
             "aged to p3, it goes after the p2s and, arrived earlier, before the p3 that waits"
         assert other not in order
@@ -1658,11 +1658,92 @@ def test_suite_slot_status_line_shows_the_holder_s_time_against_its_cap_and_the_
         _suite_ticket("pa", 4, now - 2 * testslots.SUITE_AGE_S + 60, "32")
         line = testslots.suite_line("pa", now + 601)
         assert line.startswith("full checks slot: #12 p2 running 10 min of its 2 h 0 min cap"), line
-        assert line.endswith("waiting in order: #32 p4 (aged to p2) waited 39 min, #31 p3 waited 11 min"), line
+        assert line.endswith("waiting in order: #32 p4 ranked p2 (aged) waited 39 min, #31 p3 ranked p3 waited 11 min"), line
     finally:
         for t in list(locks._TICKETS):
             locks.dequeue(t)
         hold.close()
+
+
+def test_suite_slot_aging_step_is_checks_priority_age_s_and_never_ranks_past_p1(env, monkeypatch):
+    # Aging is configurable (checks.priority_age_s: project, then account, else SUITE_AGE_S), judged on a
+    # test clock (`now`), never wall time; it ranks a waiter at most up to p1, and an obligation owner's
+    # 0 stays its own.
+    from ttp import checklane, cli, locks, testslots
+    assert testslots.age_s() == testslots.SUITE_AGE_S == 900.0, "the documented default"
+    for bad in (0, -5, "soon", "", "inf", "nan", None):
+        assert checklane.priority_age_s({"checks": {"priority_age_s": bad}}) == testslots.SUITE_AGE_S, bad
+    assert cli.main(["config", "--account", "checks.priority_age_s", "120"]) in (0, None)
+    assert testslots.age_s() == 120.0, "the account's setting"
+    assert testslots.age_s({"checks": {"priority_age_s": 60}}) == 60.0, "the project's wins over the account's"
+    now = 1_000_000.0
+    p5 = _suite_ticket("pa", 5, now - 600)        # 10 min waited
+    p1 = _suite_ticket("pa", 1, now - 60)
+    p2 = _suite_ticket("pa", 2, now - 30)
+    owner = _suite_ticket("pa", 0, now - 10)      # an obligation owner
+    try:
+        assert testslots.suite_priority(p5, now, 900) == 5, "under one 15 min step: not aged"
+        assert testslots.suite_priority(p5, now, 120) == 1 and testslots.suite_priority(p5, now) == 1, \
+            "5 steps of 2 min would reach 0: aging stops at p1"
+        assert testslots.suite_priority(p5, now, 240) == 3, "two whole steps of 4 min"
+        assert testslots.suite_priority(owner, now + 9000, 60) == 0 and testslots.suite_priority(p1, now + 9000, 60) == 1
+        assert testslots.suite_order("pa", now=now, age=900) == [owner, p1, p2, p5]
+        assert testslots.suite_order("pa", now=now, age=240) == [owner, p1, p2, p5], "aged to p3: still behind p2"
+        assert testslots.suite_order("pa", now=now, age=60) == [owner, p5, p1, p2], \
+            "aged to p1, it goes before the newer p1 by arrival, never before an obligation owner"
+        assert testslots.suite_order("pa", now=now) == [owner, p5, p1, p2], "the account's 120 s step by default"
+        assert testslots.rank_text(p5, now, 900) == "p5 ranked p5" and testslots.rank_text(p5, now, 60) == "p5 ranked p1 (aged)"
+    finally:
+        for t in list(locks._TICKETS):
+            locks.dequeue(t)
+
+
+def test_suite_slot_check_without_a_task_or_priority_ranks_as_p3_and_a_task_s_record_sets_it(env, monkeypatch):
+    from ttp import checkcap, locks, testslots
+    p = make(env)
+    urgent = p.db.add_task("urgent", "s", kind="code", tier="light", origin="coordinator", priority=1)
+    routine = p.db.add_task("routine", "s", kind="code", tier="light", origin="coordinator", priority=4)
+    monkeypatch.delenv("TTP_TASK", raising=False)
+    assert checkcap.task_rank(p) == (None, []), "no task: no priority"
+    monkeypatch.setenv("TTP_TASK", "999999")
+    assert checkcap.task_rank(p) == (None, []), "a task the project has no record of: no priority"
+    monkeypatch.setenv("TTP_TASK", str(urgent))
+    assert checkcap.task_rank(p) == (1, []), "read from the task's record"
+    monkeypatch.setenv("TTP_TASK", str(routine))
+    assert checkcap.task_rank(p) == (4, [])
+    now = 1_000_000.0
+    none_early = _suite_ticket("pa", None, now - 300)
+    p3 = _suite_ticket("pa", 3, now - 200)
+    p2 = _suite_ticket("pa", 2, now - 100)
+    p4 = _suite_ticket("pa", 4, now - 400)
+    none_late = _suite_ticket("pa", None, now - 50)
+    try:
+        assert testslots.suite_priority(none_early, now, 900) == testslots.NO_PRIORITY == 3
+        assert testslots.suite_order("pa", now=now, age=900) == [p2, none_early, p3, none_late, p4], \
+            "no priority ranks as p3: after p2, among the p3s by arrival, before p4"
+        assert testslots.rank_text(none_early, now, 900) == "p3 (no task priority) ranked p3"
+    finally:
+        for t in list(locks._TICKETS):
+            locks.dequeue(t)
+
+
+def test_suite_slot_wait_line_of_ttp_checks_names_this_run_s_priority_and_rank(env, monkeypatch):
+    import threading
+    from ttp import locks, testslots
+    _lane_env(monkeypatch)
+    hold = testslots.suite_hold("pa")
+    told = []
+    try:
+        t = threading.Thread(target=lambda: testslots.suite_hold("pa", tell=told.append, priority=4,
+                                                                 since=time.time() - 130, wait_s=0.3, age=60))
+        t.start()
+        t.join(10)
+        line = next(x for x in told if x.startswith("waiting for this project's other full checks"))
+        assert "most urgent priority first; this run p4 ranked p2 (aged), position 1 of 1" in line, line
+    finally:
+        hold.close()
+        for t in list(locks._TICKETS):
+            locks.dequeue(t)
 
 
 _SUITE_RUNNER = """
@@ -2086,7 +2167,7 @@ def test_checks_status_reads_the_lanes_and_never_queues_or_writes(env, tmp_path,
         assert _ttp("checks", "status") == 0
         out = capsys.readouterr().out
         assert f"pid {holder.pid}, alive" in out and "#12" in out and "(this one)" in out, out
-        assert "waiter 1 (next): #13" in out and "priority 3" in out, out
+        assert "waiter 1 (next): #13" in out and "p3 ranked p3" in out, out
         assert _ttp("checks", "--slot-status", "--json") == 0
         got = json.loads(capsys.readouterr().out)
         assert _ttp("checks", "status", "--json") == 0

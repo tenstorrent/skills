@@ -111,6 +111,14 @@ def wait_event_s(cfg: dict | None) -> float:
     return _seconds(cfg, "wait_event_s", WAIT_EVENT_S)
 
 
+def priority_age_s(cfg: dict | None) -> float:
+    """checks.priority_age_s: seconds a waiter for a lane waits per step it ranks more urgent
+    (testslots.suite_priority), default testslots.SUITE_AGE_S. 0 or below is not allowed (aging is what
+    keeps a low-priority waiter from starving), nor is an infinite step, so either gives the default."""
+    v = _seconds(cfg, "priority_age_s", testslots.SUITE_AGE_S)
+    return v if 0 < v < float("inf") else testslots.SUITE_AGE_S
+
+
 def _mem_gib() -> float | None:
     try:
         for line in Path("/proc/meminfo").read_text().splitlines():
@@ -390,12 +398,14 @@ def _run_of(text: str) -> str:
     return m.group(1) if m else ""
 
 
-def lane_status(project_name: str, now: float | None = None) -> list[dict]:
+def lane_status(project_name: str, now: float | None = None, cfg: dict | None = None) -> list[dict]:
     """`ttp checks status`: per repository with a held lane or a waiter, its lanes' holders (task, run,
-    pid, age, alive, command) and its waiters in the order the lanes go to them (testslots.suite_order),
-    the first one next. Read only: it probes the lock files without holding them and never queues,
-    reclaims a lane, removes a dead ticket or writes a file."""
+    pid, age, alive, command) and its waiters in the order the lanes go to them (testslots.suite_order,
+    the aging step of `cfg`), the first one next, each with its task priority (None without one) and its
+    rank now (testslots.suite_priority). Read only: it probes the lock files without holding them and
+    never queues, reclaims a lane, removes a dead ticket or writes a file."""
     now = time.time() if now is None else now
+    age = priority_age_s(cfg)
     pre = f"{testslots.SUITE}.{locks.group_id(project_name)}"
     out = []
     for base in testslots.suite_bases(project_name):
@@ -408,7 +418,7 @@ def lane_status(project_name: str, now: float | None = None) -> list[dict]:
                           "command": str(r.get("command") or ""), "overflow": bool(r.get("overflow")),
                           "cost": r.get("cost") or {}})
         waiters = []
-        for i, t in enumerate(testslots.suite_order(project_name, _live_tickets(base), now)):
+        for i, t in enumerate(testslots.suite_order(project_name, _live_tickets(base), now, age=age)):
             m = re.match(r"\d+(?:\.\d+)?-(\d+)", t.name)
             prio = locks.ticket_priority(t)
             try:
@@ -418,6 +428,7 @@ def lane_status(project_name: str, now: float | None = None) -> list[dict]:
             waiters.append({"position": i + 1, "task": _ticket_task(t), "run": _run_of(label),
                             "pid": int(m.group(1)) if m else None,
                             "priority": None if prio == float("inf") else prio,
+                            "rank": testslots.suite_priority(t, now, age), "label": testslots.rank_text(t, now, age),
                             "waited_s": round(now - locks._arrival(t), 1), "next": i == 0})
         if lanes or waiters:
             key = base[len(pre) + 1:]
@@ -438,7 +449,7 @@ def status_text(project_name: str, cfg: dict | None, here_repo: str = "", now: f
     lines = [f"checks lanes of {project_name}: {n} per repository (checks.slots), one per wrapper lock "
              f"(checks.wrap_cmd), at most {project_cap(cfg) or 'any number'} at once (checks.test_project_max); "
              f"light checks never wait"]
-    got = lane_status(project_name, now)
+    got = lane_status(project_name, now, cfg)
     if not got:
         lines.append("  no lane held and nobody waiting")
     for r in got:
@@ -452,7 +463,7 @@ def status_text(project_name: str, cfg: dict | None, here_repo: str = "", now: f
             lines.append("    holder: none (a waiter is about to start)")
         for w in r["waiters"]:
             lines.append(f"    waiter {w['position']}{' (next)' if w['next'] else ''}: {_who(w)}"
-                         + (f", priority {w['priority']:g}" if w["priority"] is not None else "")
+                         + f", {w['label']}"
                          + f", waited {mins(w['waited_s'])}")
         if not r["waiters"]:
             lines.append("    waiters: none")

@@ -1389,7 +1389,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(host)
     lines.extend(testslots.use_lines())
     from . import checklane, checkspill
-    if suite := testslots.suite_line(p.name, now, checklane.slots(p.config())):
+    if suite := testslots.suite_line(p.name, now, checklane.slots(p.config()), checklane.priority_age_s(p.config())):
         lines.append(suite)
     lines.extend(checklane.long_wait_lines(p.name, now))
     lines.extend(checkspill.status_lines(p.name, now))
@@ -3284,7 +3284,8 @@ def _checks_lane_status(as_json: bool) -> int:
     if as_json:
         print(json.dumps({"project": p.name, "slots": checklane.slots(p.config()),
                           "project_max": checklane.project_cap(p.config()), "this_repo": here_repo,
-                          "repos": checklane.lane_status(p.name), "spilled": checkspill.holders(p.name)}, indent=2))
+                          "repos": checklane.lane_status(p.name, cfg=p.config()), "spilled": checkspill.holders(p.name)},
+                         indent=2))
     else:
         print(checklane.status_text(p.name, p.config(), here_repo))
         for line in checkspill.status_lines(p.name):
@@ -3396,7 +3397,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                                     slots=n, repo=key,
                                     cost=checklane.cost(p.state if p else None, _commands_hash(cmds), cmds, cfg),
                                     max_wait=checklane.max_wait_s(cfg) if key == repo else 0.0,
-                                    state=p.state if p else None, what=what, **lane)
+                                    state=p.state if p else None, what=what, age=checklane.priority_age_s(cfg), **lane)
     try:
         if in_tree:
             if (tree := hold(testslots.tree_key(top), 1)) is None:
