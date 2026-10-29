@@ -4656,7 +4656,8 @@ def cmd_lock(a) -> None:
     the project's `resources` config (default 1); a running `exclusive:<resource>` task holds one for
     its whole run, and one waiting for a slot reserves the resource: new commands wait until it has
     started, except that task's own commands (its detached driver, same TTP_TASK), which take the slot
-    and clear the reservation as its run would. The lock is held until the command has ended, however it ends. Every name in config
+    and clear the reservation as its run would. The lock is held until the command has ended, however it ends,
+    even if `ttp lock` itself is killed, and while anything the command left running still has it open. Every name in config
     `device.locks` is the one device lock. Waiters are served in arrival order. Each take and release
     goes to the project's activity log (activity.py, `ttp machines activity`); `--disruptive` marks a
     command that may reset, power-cycle or reboot what it holds.
@@ -4693,7 +4694,9 @@ def cmd_lock(a) -> None:
     shares (its lock is machine-wide) and says n/a, exit 3, for any other. `--json` (a probe) prints the
     answer as JSON: free, paused, waiting, reserved_for and each live holder with its pid and whether it
     lives; a slot an exclusive run handed to the keeper of its detached jobs names the keeper (pid, via
-    "keeper") and the run supervisor that took it (taker_pid). `--probe A,B` answers for each and exits
+    "keeper") and the run supervisor that took it (taker_pid); a `ttp lock`'s slot names its command (via
+    "command"), which keeps the lock open even if `ttp lock` is killed, and the `ttp lock` in taker_pid.
+    `--probe A,B` answers for each and exits
     75 when any is busy or paused; with `--json` it prints a list of those answers, each with a state.
     Inside an exclusive task's run, or a detached job of it, a resource held by that run's own lineage
     (hold.covers: the run itself, a later run of the task, or the keeper whose hold lists this job)
@@ -5003,8 +5006,12 @@ def cmd_lock(a) -> None:
 
             for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
                 signal.signal(sig, _forward)
-            proc = subprocess.Popen(cmd, env=child_env)
+            # The command gets the lock's open files too (hold_fds): a SIGKILL or OOM kill of this
+            # process, which no handler sees, leaves the lock held until the command (and anything it
+            # left running with them) ends, and its label names the command (hand_to_command).
+            proc = subprocess.Popen(cmd, env=child_env, pass_fds=lk.hold_fds(fs))
             started.append(proc)
+            lk.hand_to_command(fs, proc.pid)
             while pending:
                 _forward(pending.pop(0), None)
 

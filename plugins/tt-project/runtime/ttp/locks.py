@@ -178,10 +178,10 @@ def _job_note(h: dict) -> str:
     return f" (detached job {h['job']}" + (f", job pid {h['job_pid']}" if h.get("job_pid") else "") + ")"
 
 
-def label_pid(f, pid: int) -> None:
-    """Names `pid` as the holder process of the held slot file `f`: a keeper it was handed to. "pid" stays
-    the live holder's, so whoever judges it sees the keeper, not the taker that exited; the label adds
-    via "keeper" and the taker's pid as taker_pid."""
+def label_pid(f, pid: int, via: str = "keeper") -> None:
+    """Names `pid` as the holder process of the held slot file `f`: a keeper it was handed to (or the
+    command a `ttp lock` runs: via "command"). "pid" stays the live holder's, so whoever judges it sees
+    the keeper, not the taker that exited; the label adds via and the taker's pid as taker_pid."""
     try:
         f.seek(0)
         h = json.loads(f.read() or "{}")
@@ -189,11 +189,45 @@ def label_pid(f, pid: int) -> None:
         h = {k: v for k, v in h.items() if k not in ("ns_pid", "ns_pidns", "owner_fallback")}   # the taker's
         f.seek(0)
         f.truncate()
-        f.write(json.dumps({**h, **_owner(pid), "pgid": _pgid(pid), "via": "keeper",
+        f.write(json.dumps({**h, **_owner(pid), "pgid": _pgid(pid), "via": via,
                             **({"taker_pid": taker} if taker and taker != pid else {})}))
         f.flush()
     except (OSError, ValueError, TypeError):
         pass
+
+
+def hold_fds(held: list) -> list[int]:
+    """The fds of the open files that hold the locks in `held` (try_take's files, SharedHolds), for the
+    command a `ttp lock` runs (Popen pass_fds): a flock lives on the open file, so the lock stays held
+    while the command lives even when `ttp lock` itself is killed (SIGKILL, the OOM killer). The cost:
+    a process the command leaves running keeps it too, and the resource stays taken until that one ends
+    (for a device, right: it is still in use)."""
+    return [g.fileno() for x in held for g in (x.files if isinstance(x, SharedHold) else [x])]
+
+
+def hand_to_command(held: list, pid: int) -> None:
+    """Names the command `pid` a `ttp lock` runs (and hands hold_fds to) as the holder process of each
+    hold in `held` (label_pid, via "command"), so a hold whose `ttp lock` died reads as held by its live
+    command, never as gone. Only a label naming this process: one naming its run's agent (a taker in a
+    sandbox, taker()) keeps it."""
+    for x in held:
+        f = x.files[-1] if isinstance(x, SharedHold) else x
+        try:
+            f.seek(0)
+            h = json.loads(f.read() or "{}")
+        except (OSError, ValueError):
+            continue
+        if isinstance(h, dict) and h.get("pid") == os.getpid() and "ns_pid" not in h:
+            label_pid(f, pid, via="command")
+
+
+LEFT_OPEN = "; its command ended, a process it left running keeps the lock"
+
+
+def _left_open(h: dict) -> str:
+    """LEFT_OPEN for a hold handed to a command (hand_to_command) whose command is gone: what still has
+    the lock taken is a process it left running (hold_fds), else ""."""
+    return LEFT_OPEN if h.get("via") == "command" and pid_alive(h) is False else ""
 
 
 def _pid_note(h: dict) -> str:
@@ -383,7 +417,7 @@ def _holder_note(h: dict, where=None, verdict: dict | None = None) -> str:
     if not isinstance(where, Project) or not lbl or lbl["project"] not in (None, where.name):
         if "alive unknown: " in note:
             note = note.removesuffix(")") + "; no run of this project's to judge it through)"
-        return (note or ", pid unknown") + _job_note(h)
+        return (note or ", pid unknown") + _job_note(h) + _left_open(h)
     try:   # an unreadable database or a run id that is not a number: only what the label says
         run = where.db.one("SELECT pid, status, dir, boot_id, note FROM runs WHERE id=?", (int(lbl["run"]),))
         task = where.db.one("SELECT status FROM tasks WHERE id=?", (lbl["task"],))
@@ -423,7 +457,7 @@ def _holder_note(h: dict, where=None, verdict: dict | None = None) -> str:
                         f"{'running' if runs else 'ended'}")
         if jobs:
             note += "; " + ", ".join(jobs[:3]) + (f" +{len(jobs) - 3} more" if len(jobs) > 3 else "")
-    note += _job_note(h)
+    note += _job_note(h) + _left_open(h)
     if task and task["status"] == "done" and not live and not unknown:
         note += f"; stale: task #{lbl['task']} is done"
     return note
@@ -444,12 +478,15 @@ class SharedHold:
         self.files, self.label = files, label
 
     def close(self) -> None:
-        try:
-            self.label.unlink()
-        except OSError:
-            pass
+        # The label goes only once nobody has it open: a process the command left running (hold_fds)
+        # keeps the hold, and its label stays to name it.
         for f in self.files:
             f.close()
+        if not _ticket_live(self.label):
+            try:
+                self.label.unlink()
+            except OSError:
+                pass
 
 
 def try_take_shared(paths: list[Path], holder: str, what: str = "", extra: dict | None = None) -> SharedHold | None:

@@ -1187,7 +1187,8 @@ def test_ttp_lock_holds_until_its_command_ends_when_signalled_as_the_command_sta
             alive = False
         assert not alive, "ttp lock ended while its command still ran"
         assert "ended" not in marks.read_text(), "the signal was not passed on to the command"
-        assert _lock_probe(run_env, "board").returncode == 0
+        # The `sleep` the killed sh left running has the lock open too (hold_fds): free once it ends.
+        assert _until_true(lambda: _lock_probe(run_env, "board").returncode == 0)
     finally:
         if first.poll() is None:
             first.kill()
@@ -1197,3 +1198,77 @@ def test_ttp_lock_holds_until_its_command_ends_when_signalled_as_the_command_sta
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+def _gone(pid, timeout=30):
+    """Whether process pid ended (or is a zombie no one reaped yet) within timeout."""
+    from ttp import locks
+
+    def _done():
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        return locks.zombie(pid)
+    return _until_true(_done, timeout)
+
+
+@pytest.mark.parametrize("mode", [(), ("--shared",)])
+def test_ttp_lock_stays_held_while_its_command_runs_after_ttp_lock_is_sigkilled(env, mode):
+    # A SIGKILL (or the OOM killer) of `ttp lock` cannot be caught. The lock lives on the open file the
+    # command is handed too, so it stays held, and reads as held by the live command, until it ends.
+    p = make(env)
+    pidf, go = env["tmp"] / "cmd.pid", env["tmp"] / "go"
+    script = (f"echo $$ > {shlex.quote(str(pidf))}.tmp; mv {shlex.quote(str(pidf))}.tmp {shlex.quote(str(pidf))}; "
+              f"while [ ! -e {shlex.quote(str(go))} ]; do sleep 0.05; done")
+    run_env = _lock_env(env, p)
+    first = _lock(run_env, *mode, "board", cmd=("sh", "-c", script))
+    pid = None
+    try:
+        assert _until_true(lambda: pidf.exists()), first.stderr.read()
+        pid = int(pidf.read_text())
+        first.kill()
+        first.wait(timeout=30)
+        os.kill(pid, 0)   # the command outlives its ttp lock
+        r = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "1", "board", "--", "true"],
+                           env=run_env, capture_output=True, text=True, timeout=60)
+        assert r.returncode == 75, (r.returncode, r.stderr)
+        r = _lock_probe(run_env, "board", extra=("--json",))
+        got = json.loads(r.stdout)
+        assert r.returncode == 75 and not got["free"], (r.returncode, r.stdout)
+        hs = got["holders"]
+        assert [(h["pid"], h["alive"], h["stale"], h.get("taker_pid")) for h in hs] \
+            == [(pid, True, False, first.pid)], hs
+        assert f"pid {pid} alive" in _lock_probe(run_env, "board").stdout
+    finally:
+        go.touch()
+    assert pid and _gone(pid)
+    assert _until_true(lambda: _lock_probe(run_env, "board").returncode == 0), _lock_probe(run_env, "board").stdout
+
+
+@pytest.mark.parametrize("mode", [(), ("--shared",)])
+def test_ttp_lock_stays_held_while_a_process_its_command_left_running_keeps_it_open(env, mode):
+    # The trade-off of handing the lock to the command: a process it leaves running in the background
+    # keeps the lock open, so the resource stays taken (and its holder shown) until that process ends.
+    # For a device that is right: it is still in use.
+    p = make(env)
+    pidf, go = env["tmp"] / "bg.pid", env["tmp"] / "go"
+    bg = f"while [ ! -e {shlex.quote(str(go))} ]; do sleep 0.05; done"
+    script = f"sh -c {shlex.quote(bg)} > /dev/null 2>&1 & echo $! > {shlex.quote(str(pidf))}"
+    run_env = _lock_env(env, p)
+    first = _lock(run_env, *mode, "board", cmd=("sh", "-c", script))
+    try:
+        assert first.wait(timeout=60) == 0, first.stderr.read()
+        bg_pid = int(pidf.read_text())
+        r = _lock_probe(run_env, "board", extra=("--json",))
+        got = json.loads(r.stdout)
+        assert r.returncode == 75 and not got["free"], (r.returncode, r.stdout)
+        # The holder stays named, shared or not, and says why its gone command still has it taken.
+        assert [h.get("taker_pid") for h in got["holders"]] == [first.pid], got
+        assert got["holders"] and all("a process it left running keeps the lock" in h["note"]
+                                      for h in got["holders"]), got
+        assert "a process it left running keeps the lock" in _lock_probe(run_env, "board").stdout
+    finally:
+        go.touch()
+    assert _gone(bg_pid)
+    assert _until_true(lambda: _lock_probe(run_env, "board").returncode == 0), _lock_probe(run_env, "board").stdout
