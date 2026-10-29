@@ -16662,14 +16662,29 @@ def test_repeat_matching_stays_bounded_with_two_thousand_stored_sentences(env):
     old = p.db.one("SELECT id, text FROM messages WHERE direction='in' ORDER BY id DESC LIMIT 1 OFFSET 399")
     new = _said(p, "Nothing here matches any stored sentence at all. Another quite unrelated line of words.")
     rows = _rows(p, new)
+    # Bounded by the REPEAT_NEAR/REPEAT_ROWS caps, not by machine speed: count the near-match
+    # comparisons the new message's sentences do, not the wall time (best-of-3 timed runs fail
+    # under load even when the code is bounded).
+    calls = {"near": 0}
+    orig_near = correction._near
+    def counting_near(a, b):
+        calls["near"] += 1
+        return orig_near(a, b)
+    correction._near = counting_near
+    try:
+        assert correction.flag(p.db, p.config(), rows) == {}
+    finally:
+        correction._near = orig_near
+    # The new message has 2 sentences and the oldest stored sentence is scanned too, so the
+    # worst case is REPEAT_NEAR comparisons per sentence plus clause-anchor candidates.
+    assert calls["near"] <= 4 * correction.REPEAT_NEAR, calls["near"]
     best = min(_timed(lambda: correction.flag(p.db, p.config(), rows)) for _ in range(3))
     assert correction.flag(p.db, p.config(), rows) == {}
     # The oldest stored sentence is still found exactly; near matches scan a bounded window.
     again = _said(p, old["text"].split(". ")[2])
     assert correction.flag(p.db, p.config(), _rows(p, again)) == {again: f"repeats #{old['id']}"}
     assert correction.REPEAT_NEAR <= 400 and correction.REPEAT_ROWS <= 1000
-    print(f"\nrepeat flag with 2000 stored sentences: {best * 1000:.1f} ms")
-    assert best < 0.05, best
+    print(f"\nrepeat flag with 2000 stored sentences: {best * 1000:.1f} ms (info only; the bound is the comparison count)")
 
 
 def _timed(fn):
