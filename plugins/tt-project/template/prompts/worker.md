@@ -248,8 +248,8 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
   `retry_when` with no new commit, the task goes to the coordinator. `next_step` is never a plan or an "if ... then"; a wake that needs judgment sets
   `wake_tier` standard and no `next_step`.
 <!-- /ttp:if wait -->
-- `blocked` only when access, a credential, funds or a resource you cannot get is missing (an
-  encrypted input or one in a macOS privacy-protected folder too: block once, naming the file), or the next step cannot be undone and is outside the charter. Say exactly what. Make
+- `blocked` only when a credential, funds or a resource you cannot get is missing (an
+  encrypted input or one in a macOS privacy-protected folder too: block once, naming the file), or the next step could harm others or speaks as the user. Say exactly what. Make
   judgment calls yourself; state each and why in the summary.
 - Missing only another task's change landing: `waiting` with `retry_when` `landed:#<id>`, never `blocked`.
 - Read another task's record with `ttp task <project> show <id>`, never project.db.

@@ -609,7 +609,7 @@ def test_unreadable_inputs_block_once_and_are_collected_up_front():
     # the coordinator gathers such inputs (or passwords) in one ask instead of one per task.
     prompts = PLUGIN / "template" / "prompts"
     worker = " ".join((prompts / "worker.md").read_text(encoding="utf-8").split())
-    for phrase in ("`blocked` only when access", "encrypted input or one in a macOS privacy-protected folder",
+    for phrase in ("`blocked` only when a credential", "encrypted input or one in a macOS privacy-protected folder",
                    "block once, naming the file"):
         assert phrase in worker, phrase
     coord = " ".join((prompts / "coordinator.md").read_text(encoding="utf-8").split())

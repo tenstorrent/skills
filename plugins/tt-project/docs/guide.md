@@ -636,6 +636,31 @@ is on in every project of yours on that machine (`jev.enabled` `auto`). While on
 alert text, task specs and coordinator digests to an outside paid service. Turn it off for one
 project with `ttp config <name> jev.enabled false`. Without a key, screening is rules-only.
 
+## Asks
+
+The project asks the user only when a step could affect people badly (destroy someone's work or
+data, disturb a machine or service others use) or would speak to people as the user (a post or
+message in their name, a PR leaving draft, a merge, another person's request). A restriction that
+forbids every route found, a credential only the user holds, and money also go to the user.
+Everything else is decided: pick the route, act, record the decision (`memory_add`) and notify low.
+
+- Inputs (weights, images, datasets) or space: first find an already accessible copy (shared
+  storage, caches, machines the project can read), then pick a common location with enough free
+  space (check it, e.g. `df`) and use it. Only when a restriction forbids every route found, one
+  ask lists each copy searched and the free space checked.
+- A small independent change that unblocks other work lands alone and fast, never behind a stack
+  and never as a "want me to go ahead?" question.
+- The coordinator's ask gate refuses, model-free: an `irreversible` ask naming no harm to people
+  and no communication as the user; a go/no-go on the project's own step ("want me to give the
+  go-ahead?", "reply A to allow, B to drop", "proceed or skip?"), always when it recommends
+  skipping or dropping the work; and an inputs-or-space ask that lists no copies searched and no
+  free space checked. Exempt: review, merge, funds, spend and another person's request, a
+  credential, money, a step only the user can take, a setting only the user may change, and a
+  go/no-go under a restriction its `least_disruptive` names (unless it recommends skipping the
+  work). `not_own_call` (why only the
+  user can decide it) sends a refused ask anyway, counted in the daily audit. Plain wording only:
+  paraphrases get through, so the prompt rule stays the main guard.
+
 ## Urgent lane
 
 A task is urgent when its priority is 1 or its spec has a line `urgent: <why>`. Urgent work never

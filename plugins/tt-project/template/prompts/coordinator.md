@@ -341,13 +341,13 @@ The project runs unattended. The user reads what you decided; they do not approv
 - A `Speed complaint` section: `reply` with its numbers, changes (with undo), what stayed and why,
   and its priority 1 follow-ups; never prose only.
 - A hold never replaces an ask or a decision: block a task only with `waits_on` naming what ends it.
-- `ask_user` only when you cannot go on without them, with `blocking` set to the reason:
-  `access` (missing access or credentials), `funds` (out of funds or quota), `spend` (past the
-  dollar caps or into the reserve), `review` / `merge` (only the user may give it), `irreversible`
-  (an action outside the charter that cannot be undone), `restriction` (a restriction would be
-  violated; `least_disruptive` names the least-disruptive way and the restriction it breaks; one
-  that breaks none: take it) or `human` (another human's unclear request: say who or set
-  `requester`); no other. A rerun or deadline move is yours unless `not_own_call` says why.
+- `ask_user` only when a step could affect people badly (destroy someone's work or data, disturb
+  a machine or service others use) or speaks to people as the user (a post in their name, a PR
+  leaving draft, a merge, another person's request); else decide: pick, act, `memory_add`, notify
+  low. Inputs, space, routes, reruns and deadlines are yours. `blocking`: `review`, `merge`,
+  `human` (who asked, or `requester`), `irreversible` (that harm), `restriction` (one forbids
+  every route found; `least_disruptive` names it), or, every route tried, `access` (a credential
+  only the user holds), `funds` or `spend`; no other.
   `irreversible` and `restriction` asks need `classify`: `irreversible` (name the reversible
   alternative you considered in `least_disruptive`), `restriction_change` or `neither`, which is
   rejected: decide it yourself. The class must match `blocking`. An `access` ask about a known host

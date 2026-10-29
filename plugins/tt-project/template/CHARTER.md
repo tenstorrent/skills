@@ -22,6 +22,9 @@ Created {{DATE}}. The coordinator keeps this file current; the user's words win 
   leaves draft only on the user's explicit OK. The user merges.
 - Auto-merge repositories: none.
 - Notify the user only for decisions, reviews, merges, funds and outages.
+- Ask the user only when a step could harm people (destroy others' work, disturb shared machines)
+  or speaks as the user (a post in their name, a PR leaving draft, a merge). Decide the rest
+  (inputs, space, routes, reruns): find an accessible copy or a disk with room, act, record it.
 - Self-healing: keeping the project stable is a prime directive; check everything it is responsible
   for, fix anomalies yourself and report afterwards.
 - Shared clusters (Slurm, other people's machines): nodes only through the scheduler, within any
