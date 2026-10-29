@@ -61,7 +61,8 @@ _ASK_FIRST = re.compile(r"\b(?:ask|check with|confirm with|tell|ping) me\b|\bask
 _CHARTER_SECTIONS = ("policies", "goals")
 _LINKED = re.compile(r"^\s*#\d+\s*:")   # '#<id>: ...', the user's answer to ask #id
 DECIDED = re.compile(r"\b(?:do not|does not|don't|dont|never|keep|stop|no(?! (?:rush|hurry))|"
-                     r"not(?! sure)|instead|rather|already (?:said|told|answered|decided)|decide (?:it |that |this )?yourself|your call|yes|approved?|"
+                     r"not(?! sure)|instead|rather|already (?:said|told|answered|decided)|"
+                     r"decide (?:it |that |this )?yourself|your call|yes|approved?|"
                      r"denied|declined?|rejected?|leave it|as is)\b", re.I)
 
 
