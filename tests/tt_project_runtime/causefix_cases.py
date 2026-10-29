@@ -75,3 +75,18 @@ def test_a_cause_reply_saying_why_there_is_no_fix_passes_and_status_words_alone_
             "Runs are slow: the queue serializes them.",   # an old cause not said to be fixed is still a hit
             "There is no fix yet; #12 waits on the suite lock.", "#12 waits on the lock (it won’t fix itself)."]
     assert all(causefix.names_cause(t) for t in hits)
+
+
+def test_a_turn_less_apply_between_turns_keeps_a_pending_cause_flag_for_the_next_course_check(env):
+    """A chain hop (chaincap's auto-continuation) applies a batch with no turn between turn N and the
+    digest of turn N+1: it must not mark turn N's flag shown before that digest carries it."""
+    from ttp import coordinator as coord
+    p = make(env)
+    tid = p.db.add_task("run the checks", "s", origin="user")
+    coord.apply(p, [{"type": "reply", "text": _LOCK_REPLY, "chat": "c1"}], turn=1)
+    coord.apply(p, [{"type": "task_update", "id": tid, "note": "x"}])
+    course_check = dict(coord.digest_parts(p, {}, [], [])[0]).get("course_check", "")
+    assert "named a cause without a fix" in course_check, course_check
+    # The next real turn settles it.
+    coord.apply(p, [{"type": "reply", "text": "Noted.", "chat": "c1"}], turn=2)
+    assert "course_check" not in dict(coord.digest_parts(p, {}, [], [])[0])

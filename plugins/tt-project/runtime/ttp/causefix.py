@@ -70,12 +70,13 @@ def _records(db: DB) -> list[dict]:
 def check(db: DB, sent: list[tuple[int, str, str]], applied: list[dict], turn=None,
           now: float | None = None) -> list[int]:
     """After a batch: flag each sent (message id, kind, text) naming a cause when no `applied` action
-    fixes anything. Records from earlier turns are marked shown (their digest went out). Returns the
-    flagged message ids."""
+    fixes anything. A coordinator turn (`turn` set) marks records from earlier turns shown (its digest
+    carried them); a turn-less apply (a chain hop between turns) marks nothing, so a flag waits for the
+    next turn's Course check. Returns the flagged message ids."""
     now = time.time() if now is None else now
     recs = _records(db)
     for r in recs:
-        if turn is None or r.get("turn") != turn:
+        if turn is not None and r.get("turn") != turn:
             r["shown"] = True
     hits = [] if any(is_fix(a) for a in applied) else \
         [(mid, kind, s) for mid, kind, text in sent if (s := names_cause(text))]
