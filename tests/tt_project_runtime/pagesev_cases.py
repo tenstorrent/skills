@@ -74,6 +74,25 @@ def test_pagesev_a_ride_along_event_joins_the_turn_another_event_starts(env, mon
     assert len(starts) == 1
 
 
+def test_pagesev_a_ride_along_event_does_not_shorten_a_batch_hold(env, monkeypatch):
+    """A young routine (batchable) event is held for coordinator.batch_s even while an older
+    ride-along event is queued; the mutation `_batch_hold(queued, now)` breaks this: the ride-along's
+    old ts would age the batch past batch_s and start a turn early."""
+    from ttp import pagesev
+    p, d, clock, starts = _batch_setup(env, monkeypatch, busy=2)
+    batch = float(p.config()["coordinator"]["batch_s"])
+    p.db.set_kv("last_coordinator_turn", clock[0])
+    _ride(p, clock[0])                       # an old ride-along event, queued long before its turn
+    clock[0] += pagesev.RIDE_ALONG_MAX_S + 600   # past RIDE_ALONG_MAX_S, so it may start a turn itself
+    _event(p, clock, "task_notes")            # a young, batchable routine event
+    assert not _turn_within(d, clock, starts, batch - 120, step=30), \
+        "the turn started before the batchable event's own batch_s window elapsed"
+    # Aged past batch_s (the ride-along is due its turn anyway), both go together.
+    clock[0] += batch + 120
+    d.maybe_coordinate()
+    assert len(starts) == 1, "the turn did not take both queued events"
+
+
 def test_pagesev_raise_blocked_counts_repeats_and_keeps_urgent_blocks_high(env):
     from ttp import pagesev
     p = make(env)
