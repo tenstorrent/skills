@@ -6,13 +6,19 @@
 # delivery.code_tasks_may_push is off. Every other call execs the real git at once.
 # The real git is the first git on PATH that is no tt-project git wrapper: another project's
 # harness bin/ further down PATH holds a copy, and taking it would make the two exec each other.
+# Only a script can be a wrapper: a candidate whose first line is no `#!` line (the real git, a
+# binary) is taken without the marker search, so a git call forks nothing but git itself.
 set -f
 real=
 ifs=$IFS
 IFS=:
 for d in $PATH; do
-    if [ -n "$d" ] && [ -x "$d/git" ] && ! [ "$d/git" -ef "$0" ] &&
-        ! grep -qsF '# tt-project git wrapper' "$d/git"; then
+    if [ -n "$d" ] && [ -x "$d/git" ] && ! [ "$d/git" -ef "$0" ]; then
+        first=
+        IFS= read -r first < "$d/git" 2>/dev/null
+        case $first in
+        '#!'*) ! grep -qsF '# tt-project git wrapper' "$d/git" || continue ;;
+        esac
         real=$d/git
         break
     fi

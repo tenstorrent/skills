@@ -6021,6 +6021,30 @@ def test_one_line_install_links_the_real_git_past_a_tt_project_git_wrapper(git_w
     assert _clone_head(install_env.home) == _head(install_env.repo)
 
 
+def test_the_git_wrapper_searches_only_scripts_for_its_marker(git_wrapper_first, tmp_path):
+    # Every git call in a run goes through the wrapper. It grepped each candidate for its marker, the
+    # real git binary too (megabytes read and one more process per call): a script alone can be a wrapper.
+    import shutil
+    import subprocess
+    real = _real_git()
+    assert real, "no real git on PATH"
+    log, tools, other = tmp_path / "grep.log", tmp_path / "tools", tmp_path / "other-harness" / "bin"
+    tools.mkdir()
+    other.mkdir(parents=True)
+    (tools / "grep").write_text(f'#!/bin/sh\necho "$*" >> {log}\nexec {shutil.which("grep")} "$@"\n')
+    (tools / "grep").chmod(0o755)
+    shutil.copy2(PLUGIN / "template" / "bin" / "git", other / "git")   # another harness's wrapper, a copy
+    real_bin = tmp_path / "real-bin"
+    real_bin.mkdir()
+    (real_bin / "git").symlink_to(real)
+    path = os.pathsep.join([str(tools), str(git_wrapper_first.parent), str(other), str(real_bin)])
+    r = subprocess.run(["git", "--version"], env={**os.environ, "PATH": path}, capture_output=True, text=True,
+                       timeout=60)
+    assert r.returncode == 0 and r.stdout.startswith("git version"), r.stdout + r.stderr
+    assert log.read_text().splitlines() == [f"-qsF # tt-project git wrapper {other / 'git'}"], \
+        "the other wrapper is still skipped by its marker; the real git binary is never searched"
+
+
 def test_one_line_install_without_git_says_so(install_env):
     (install_env.home.parent / "bin" / "git").unlink()
     r = install_env()
