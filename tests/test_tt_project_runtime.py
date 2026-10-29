@@ -21821,7 +21821,10 @@ def test_a_shared_probe_run_is_kept_when_one_task_re_points_its_probe(env):
     d._drop_stale_probe(a, "exit 1")
     assert a not in d._probes and run[0].poll() is None, "b still needs its verdict"
     d._drop_stale_probe(b, "exit 1")
-    assert run[0].poll() is not None, "no one shares it now: killed"
+    # A start still queued when it was stopped never launches (poll stays None): wait for the start
+    # to end, then nothing of it may be running.
+    assert run[0].started.wait(30)
+    assert run[0].proc is None or run[0].proc.poll() is not None, "no one shares it now: killed"
 
 
 def test_a_waiting_task_without_a_probe_keeps_its_timer(env):
