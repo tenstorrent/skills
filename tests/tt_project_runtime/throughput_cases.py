@@ -918,7 +918,8 @@ def test_throughput_judges_a_checks_wait_by_the_cap_its_record_stored_else_the_e
     for s0 in (w1 - 60, w1 - 50, w1 - 40):
         _tp_checks_run(p, monkeypatch, s0, 1200)
     rec = _tp_slot_grant(p, monkeypatch, tmp_path, roomy, w1, w1 + 700)
-    assert (rec["task"], rec["cap"], rec["queued_at"], rec["granted_at"]) == (roomy, 4, round(w1, 3), round(w1 + 700, 3))
+    assert (rec["task"], rec["cap"], rec["queued_at"], rec["granted_at"]) == (roomy, 4, round(w1, 3),
+                                                                             round(w1 + 700, 3))
     w2 = now - 4 * 3600   # the same runs, an older record without the cap: the estimate
     old = _tp_checks_requeue(p, d, monkeypatch, tmp_path, "an old record", w2, 999)
     for s0 in (w2 - 60, w2 - 50, w2 - 40):

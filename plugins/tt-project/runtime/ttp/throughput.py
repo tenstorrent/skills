@@ -418,7 +418,8 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
         force then, the most of them that ran at once for SUSTAIN_S in all while the queue stayed non-empty
         (one busy period; a shorter peak is an urgent run past the cap),
         at most checklane.project_cap (a cap raised since then is not today's); a record that stored the
-        cap in force at its grant ("cap", 0: none) is judged by that, not the estimate; "serialized" when they ran one at a time back to back, each start and the grant within
+        cap in force at its grant ("cap", 0: none) is judged by that, not the estimate; "serialized" when
+        they ran one at a time back to back, each start and the grant within
         SERIAL_S of a run's end (a queue served one run at a time, not the cap); else "idle". No grant
         record, or one granted at once: not at the limit."""
         serial = False
