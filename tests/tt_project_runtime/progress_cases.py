@@ -1097,6 +1097,9 @@ def test_a_wait_on_the_users_step_raises_no_probe_stall_and_self_or_external_wai
     raised = {k for e in got for k in e["keys"]}
     assert raised == {f"probe:#{ids[n]}" for n in ("external", "unowed", "owed-not-user")}, (raised, ids)
     assert int(progress.load(p.db)["probes"][str(ids["user"])]["n"]) == 21   # the probe still counts
+    for said, hit in (("waiting for user input", True), ("the user's sign-in", True), ("USER to approve", True),
+                      ("a user-facing dashboard", False), ("a superuser shell", False), ("the board", False)):
+        assert bool(progress.NAMES_USER_RE.search(said)) is hit, said
     # unblock: a user wait is its own kind, never a self-wait a worker could end.
     assert unblock.classify_wait({"wait_kind": "user"}) == ("user", "hand-off")
     assert unblock.classify_wait({"wait_kind": "user-action", "retry_when": "ttp detach --check x"})[0] == "user"

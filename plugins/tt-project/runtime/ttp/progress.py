@@ -284,8 +284,7 @@ OWN_WAIT_RE = re.compile(r"detach --check|checks --result|push --result|\bttp ci
                          r"upstream --fixed|^\s*test \"\$\(date")
 # A wait only the user ends: the hand-off's wait_kind (unblock.USER_WAIT_KINDS), or a waiting_for or
 # blocked_reason naming the user on a task that owns an open obligation.
-NAMES_USER_RE = re.compile(r"\b(?:the user|user's|user’s|user to|user (?:must|has to|needs to|signs?|confirms?|"
-                           r"approves?|answers?|replies|reply|acts?|does|takes?)|user-action|user action)\b", re.I)
+NAMES_USER_RE = re.compile(r"\buser(?:'s|’s)?\b(?!-(?:facing|space|land|agent))", re.I)
 FIX_RE = re.compile(r"\b(fix\w*|repair\w*|recover\w*|restor\w*|reboot\w*|reset\w*|heal\w*|unstick\w*|revive\w*)\b", re.I)
 REASON_CHARS = 200
 HISTORY_KEEP = 200
