@@ -4666,6 +4666,38 @@ def test_a_users_request_never_refuses_the_follow_up_ask_it_leads_to(env):
         assert reask.settled_by(p, p.config(), ask) == f'user msg #{mid}: "{said}"', said
 
 
+def test_a_new_question_about_a_settled_request_goes_out_while_a_re_ask_is_refused(env):
+    """A question clause bringing words the record lacks is a new question; a verbatim or
+    near-verbatim re-ask, or a restated correction with no new words, is still refused."""
+    p = make(env)
+    from ttp import coordinator as coord, reask
+    db = p.db
+    said = "Switch the dogfood channel to weekly cuts, not daily."
+    weekday = "Switch the dogfood channel to weekly cuts: which weekday should the cut run?"
+    mid = db.post("in", said, chat=None, kind="user", provenance="web-session")
+    for ask in (weekday, "Switch the dogfood channel to weekly cuts, which weekday should the cut run?",
+                "Should I switch the dogfood channel to weekly cuts? Which weekday should the cut run?"):
+        assert not reask.matches(ask, said), ask
+        assert reask.settled_by(p, p.config(), ask) is None, ask
+    problems, sent = _ask(p, weekday, blocking="access")
+    assert problems == [] and sent["text"].startswith(weekday), problems
+    db.x("UPDATE messages SET handled=1 WHERE kind='ask'")
+    # A restated correction: no new words, or one filler word, in the question.
+    for ask in ("Should I switch the dogfood channel to weekly cuts instead of daily?",
+                "Switch the dogfood channel to weekly cuts - not daily?",
+                "Switch the dogfood channel to weekly cuts: confirm?",
+                "Switch the dogfood channel to weekly cuts: OK to stop the daily cut?"):
+        assert reask.settled_by(p, p.config(), ask) == f'user msg #{mid}: "{said}"', ask
+    # The same question again after the user answered it: verbatim or near-verbatim, refused.
+    db.x("DELETE FROM messages WHERE direction='in'")
+    mid = db.post("in", f"#{sent['id']}: Friday.", chat=None, kind="user", provenance="web-session")
+    assert coord.apply(p, [{"type": "resolve", "id": sent["id"]}], messages=[mid]) == []
+    for ask in (weekday, "Switch the dogfood channel to weekly cuts: on which weekday should the cut run?"):
+        assert reask.matches(ask, weekday), ask
+        problems, again = _ask(p, ask, blocking="access")
+        assert problems and f'already settled by ask #{sent["id"]}, answered in user msg #{mid}' in problems[0], ask
+
+
 def test_a_review_or_merge_ask_with_a_pr_approve_record_is_refused_once_naming_it(env):
     p = make(env)
     from ttp import coordinator as coord, prguard, timefmt

@@ -23,7 +23,11 @@ and either their Jaccard is at least JACCARD, or they share a hard anchor (a tas
 resource alias, config key) and the Jaccard is at least ANCHORED_JACCARD with the record covering at
 least CONTAINS of the ask's words and MIN_SHARED shared words besides the anchors. Asks and records
 that both carry anchors but share none are about different things and never match; an anchor alone
-with low word overlap is not enough. When unsure the ask goes out: the thresholds favour a missed
+with low word overlap is not enough. A new question about a settled subject never matches: when one of
+the ask's question clauses (a '?' sentence, from its last ':', ';', dash or ', which/should...'
+lead-in) brings at least MIN_NEW words the record lacks and the record holds less than CONTAINS of
+its words. A question that is the whole ask never passes this way: a Jaccard match already holds
+at least CONTAINS of the ask's words. When unsure the ask goes out: the thresholds favour a missed
 re-ask over a false refusal.
 """
 from __future__ import annotations
@@ -36,6 +40,7 @@ MIN_SHARED = 3
 JACCARD = 0.5
 ANCHORED_JACCARD = 0.35
 CONTAINS = 0.5
+MIN_NEW = 2   # new words a question clause needs to count as a new question
 QUOTE = 160   # chars of the settling answer quoted in a refusal
 MEMORY_KINDS = ("decision", "preference", "restriction", "fact")
 
@@ -50,6 +55,8 @@ message correction""".split())
 
 _TOKEN = re.compile(r"[a-z0-9][a-z0-9_]*(?:[.:/#-][a-z0-9_]+)*")
 _SENT = re.compile(r"(?<=[.!?;])\s+|\n+")
+_LEAD = re.compile(r"[:;]\s|\s[-\u2013\u2014]+\s|,\s+(?=(?:which|what|when|where|who|how|should|shall|can|could|"
+                   r"may|do|does|is|are|will|would)\b)", re.I)   # a lead-in before the question itself
 _PR = re.compile(r"github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)|\b([\w.-]+/[\w.-]+)#(\d+)\b", re.I)
 _TASK = re.compile(r"(?<![\w/])#(\d+)\b")
 _NOT_TASK = re.compile(r"\b(?:msg|message|ask|issue|note)s?\s*#\d+")   # a message, ask or issue id is no task
@@ -102,8 +109,16 @@ def anchors(text: str) -> set[str]:
     return out
 
 
+def _questions(ask: str) -> list[set[str]]:
+    """Content words of each question clause of the ask: a '?' sentence from its last lead-in on."""
+    return [words(_LEAD.split(s)[-1]) for s in re.split(r"(?<=[.!?])\s+|\n+", ask or "")
+            if s.rstrip().endswith("?")]
+
+
 def matches(ask: str, record: str) -> bool:
     a, r = words(ask), words(record)
+    if any(len(q - r) >= MIN_NEW and len(q & r) < CONTAINS * len(q) for q in _questions(ask)):
+        return False   # a new question about the subject, not a re-ask
     shared = a & r
     if len(shared) < MIN_SHARED:
         return False
