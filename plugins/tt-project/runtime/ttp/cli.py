@@ -5073,15 +5073,18 @@ def _detach_reap(what: str) -> int:
 
 
 def _detach_stop(what: str) -> int:
-    """`ttp detach --stop <rc>`: stop a running job as the daemon stops those of ended tasks (jobstop.end):
+    """`ttp detach --stop <rc|name>`: stop a running job as the daemon stops those of ended tasks (jobstop.end):
     0 once stopped or when it no longer runs, 2 when no record names it, 3 when refused (jobstop.may_stop).
-    A sandboxed caller, which cannot signal it, queues the stop for the daemon."""
+    A sandboxed caller, which cannot signal it, queues the stop for the daemon. A bare name is a job of
+    $TTP_RUN_DIR; with no job recorded, a driver a project's own launcher started (_launcher_stop)."""
     from . import detach, jobstop
     from .push import _boxed
     rc = Path(what).expanduser().resolve()
+    run_dir = os.environ.get("TTP_RUN_DIR")
+    if not detach._entry(rc) and "/" not in what and run_dir:
+        rc = (Path(run_dir) / (what if what.endswith(".rc") else f"{what}.rc")).resolve()
     if not detach._entry(rc):
-        print(f"ttp detach --stop: no detached job is recorded at {rc}", file=sys.stderr)
-        return 2
+        return _launcher_stop(what, rc)
     base = rc.parent.parent.parent.parent if rc.parent.parent.name == "runs" else None
     if base is None or not (base / "state").is_dir():
         print(f"ttp detach --stop: {rc} is not a job of a tt-project run", file=sys.stderr)
@@ -5103,6 +5106,42 @@ def _detach_stop(what: str) -> int:
     r = jobstop.end(p, rc, f"stopped by `ttp detach --stop` ({why})", t["id"] if t else None)
     print(r["text"] if r else f"{rc.stem}: not running; nothing to stop")
     return 0
+
+
+def _launcher_stop(what: str, rc: Path) -> int:
+    """`ttp detach --stop` of a driver a project's own launcher started (launcherstop): RESULTS_DIR/NAME.pid
+    found, its STOP file written and its process waited for, then signalled. 0 once stopped or already
+    gone, 1 when it still runs, 2 when no pid file is found (the message says where it looked), 3 when
+    refused (its pid file names no pid, or a process that cannot be told to be the launcher's)."""
+    from . import launcherstop
+    from .push import _boxed
+    env = os.environ
+    name, dirs = launcherstop.results_dirs(what, env.get("TTP_RUN_DIR"), env.get("TTP_PROJECT"), env.get("TTP_TASK"))
+    f = launcherstop.find(name, dirs)
+    if f is None:
+        where = ", ".join(str(d) for d in dirs) or "nowhere (no $TTP_RUN_DIR; give the pid file's path)"
+        print(f"ttp detach --stop: no detached job is recorded at {rc}, and no launcher pid file {name}.pid in "
+              f"{where}; stop a driver another launcher started with that launcher's own stop", file=sys.stderr)
+        return 2
+    if _boxed():
+        print(f"ttp detach --stop: {f} names a launcher's driver, but its process cannot be seen from inside a "
+              "sandbox; run it outside `ttp sandbox`", file=sys.stderr)
+        return 3
+    try:
+        state, pid, detail = launcherstop.identify(f, env.get("TTP_PROJECT"))
+    except (OSError, ValueError) as e:
+        print(f"ttp detach --stop: {e}", file=sys.stderr)
+        return 3
+    if state == "gone":
+        print(f"{name}: already stopped ({f}: {detail}); nothing to stop")
+        return 0
+    if state == "refused":
+        print(f"ttp detach --stop: {f}: {detail}; nothing was stopped", file=sys.stderr)
+        return 3
+    caller = env.get("TTP_TASK")
+    r = launcherstop.stop(f, pid, detail, "stop requested by `ttp detach --stop`" + (f" (task #{caller})" if caller else ""))
+    print(r["text"])
+    return 1 if r["left"] else 0
 
 
 def _lock_job(names: list, cmd: list) -> list:
@@ -9151,10 +9190,12 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--reap", metavar="NAME|RC",
                    help="close the record of a job that is over now, as the daemon does each minute: ended "
                    "with its exit code, or died when gone without one; refuses (exit 1) while it runs; idempotent")
-    s.add_argument("--stop", metavar="RC",
+    s.add_argument("--stop", metavar="RC|NAME",
                    help="stop a running job (its group, its matching broker jobs, its lock slots), logged; allowed "
                    "when its task has ended, or for an open priority-1 task whose resources its locks hold; "
-                   "refused (exit 3) otherwise; idempotent")
+                   "refused (exit 3) otherwise; idempotent. With no job recorded, a driver a launcher of the "
+                   "project's own started: NAME.pid in the path's folder, $TTP_RUN_DIR or the task's t<id> folder "
+                   "gets a STOP file beside it, then SIGTERM and SIGKILL if it does not exit (exit 2: none found)")
     s.add_argument("--resumable", action="store_true",
                    help="the job is safe to rerun from the start: after a host reboot cuts it short, the daemon "
                    "starts it again while the task still waits on it, with no model run (up to "

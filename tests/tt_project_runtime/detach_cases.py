@@ -1240,3 +1240,125 @@ def test_the_spend_check_never_logs_the_commands_output_or_environment(env, tmp_
                 assert secret.encode() not in f.read_bytes(), f
     finally:
         _end_group(pgid)
+
+
+# `ttp detach --stop NAME` of a driver a project's own launcher started (launcherstop): NAME.pid in a
+# results dir, STOP file beside it. Every process signalled is one this test started.
+
+def _launcher(results, name="drive", obey=True):
+    """A launcher stand-in leading its own group: records its pid in results/<name>.pid and, when obey,
+    exits once results/STOP appears; returns its Popen once the pid file is written."""
+    results.mkdir(parents=True, exist_ok=True)
+    pidf, stop = shlex.quote(str(results / f"{name}.pid")), shlex.quote(str(results / "STOP"))
+    loop = f"while [ ! -e {stop} ]; do sleep 0.1; done" if obey else "while :; do sleep 0.1; done"
+    proc = subprocess.Popen(["sh", "-c", f"echo $$ >{pidf}.tmp; mv {pidf}.tmp {pidf}; {loop}"],
+                            start_new_session=True)
+    assert _wait_for_path(results / f"{name}.pid")
+    return proc
+
+
+def _launcher_alive(proc):
+    return proc.poll() is None
+
+
+def _end_launcher(proc):
+    if proc.poll() is None:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=10)
+
+
+def test_detach_stop_stops_a_launcher_driver_by_its_stop_file(env, tmp_path):
+    """No detached job is recorded for the name: its launcher's pid file in $TTP_RUN_DIR, or in the task's
+    t<id> folder in the project root, is found, STOP is written beside it and the launcher exits on it."""
+    p = make(env)
+    run_dir = p.runs / "launch"
+    proc = _launcher(run_dir)
+    try:
+        r = _ttp_run(p, "detach", "--stop", "drive", env={"TTP_RUN_DIR": str(run_dir), "TTP_TASK": "7"})
+        assert r.returncode == 0 and "drive: stopped" in r.stdout and "exited after" in r.stdout, r.stderr
+        assert (run_dir / "STOP").exists() and proc.wait(timeout=10) is not None
+    finally:
+        _end_launcher(proc)
+    folder = p.root / "t7"
+    proc = _launcher(folder, "soak")
+    try:
+        r = _ttp_run(p, "detach", "--stop", "soak", env={"TTP_TASK": "7"})
+        assert r.returncode == 0 and "soak: stopped" in r.stdout, r.stderr
+        assert (folder / "STOP").exists() and proc.wait(timeout=10) is not None
+    finally:
+        _end_launcher(proc)
+
+
+def test_launcher_stop_escalates_to_sigterm_when_the_stop_file_is_ignored(env, tmp_path, monkeypatch):
+    from ttp import launcherstop
+    monkeypatch.setattr(launcherstop, "STOP_WAIT_S", 0.3)
+    proc = _launcher(tmp_path / "res", obey=False)
+    try:
+        f = tmp_path / "res" / "drive.pid"
+        state, pid, token = launcherstop.identify(f, None)
+        assert (state, pid) == ("live", proc.pid)
+        r = launcherstop.stop(f, pid, token, "test")
+        assert r["how"] == "sigterm" and not r["left"] and (tmp_path / "res" / "STOP").exists()
+        assert proc.wait(timeout=10) == -signal.SIGTERM
+    finally:
+        _end_launcher(proc)
+
+
+def test_detach_stop_reports_a_stale_launcher_pid_file_already_stopped(env, tmp_path):
+    p = make(env)
+    res = tmp_path / "res"
+    proc = _launcher(res)
+    (res / "STOP").write_text("")
+    proc.wait(timeout=10)
+    (res / "STOP").unlink()
+    r = _ttp_run(p, "detach", "--stop", str(res / "drive"))
+    assert r.returncode == 0 and "already stopped" in r.stdout and "gone" in r.stdout, r.stderr
+    assert not (res / "STOP").exists()   # a later launch must not stop at once
+
+
+def test_detach_stop_never_signals_a_reused_launcher_pid(env, tmp_path):
+    """The pid file names a live process that started after the file was written, or whose start token
+    differs from the one the file pins: a reused pid, reported already stopped and left alone."""
+    from ttp.runner import proc_start
+    p = make(env)
+    res = tmp_path / "res"
+    proc = _launcher(res, obey=False)
+    try:
+        f = res / "drive.pid"
+        old = time.time() - 3600
+        os.utime(f, (old, old))
+        r = _ttp_run(p, "detach", "--stop", str(f))
+        assert r.returncode == 0 and "already stopped" in r.stdout and "another process" in r.stdout, r.stderr
+        f.write_text(f"{proc.pid} start={int(proc_start(proc.pid)) + 1}\n")
+        r = _ttp_run(p, "detach", "--stop", str(f))
+        assert r.returncode == 0 and "start token" in r.stdout, r.stderr
+        time.sleep(0.3)
+        assert _launcher_alive(proc) and not (res / "STOP").exists()
+    finally:
+        _end_launcher(proc)
+
+
+def test_detach_stop_refuses_a_launcher_pid_of_another_project(env, tmp_path):
+    p = make(env)
+    res = tmp_path / "res"
+    res.mkdir()
+    proc = subprocess.Popen(["sh", "-c", "sleep 30"], start_new_session=True,
+                            env={**os.environ, "TTP_PROJECT": str(tmp_path / "other" / "tt-project")})
+    try:
+        (res / "drive.pid").write_text(f"{proc.pid}\n")
+        r = _ttp_run(p, "detach", "--stop", str(res / "drive.pid"))
+        assert r.returncode == 3 and "another tt-project project" in r.stderr, r.stderr
+        assert _launcher_alive(proc) and not (res / "STOP").exists()
+    finally:
+        _end_launcher(proc)
+
+
+def test_detach_stop_of_an_unknown_name_says_where_it_looked(env, tmp_path):
+    p = make(env)
+    run_dir = p.runs / "none"
+    run_dir.mkdir(parents=True)
+    r = _ttp_run(p, "detach", "--stop", "ghost", env={"TTP_RUN_DIR": str(run_dir), "TTP_TASK": "9"})
+    assert r.returncode == 2 and "ghost.pid" in r.stderr and str(run_dir) in r.stderr, r.stderr
+    assert str(p.root / "t9") in r.stderr and "launcher's own stop" in r.stderr
+    r = _ttp_run(p, "detach", "--stop", str(tmp_path / "x" / "ghost.rc"))
+    assert r.returncode == 2 and str(tmp_path / "x") in r.stderr and "launcher's own stop" in r.stderr

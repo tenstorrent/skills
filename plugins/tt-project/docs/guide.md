@@ -705,7 +705,10 @@ queues behind routine work; nothing running is interrupted:
   code and the .rc's time, or `died` (no exit code, with why) once its job lock is free with no .rc;
   liveness comes from that lock, never a pid another process may reuse. The daemon closes records once
   a minute; `ttp detach --reap <name|.rc>` closes one at once (0 closed or already closed, 1 still
-  running or queued, 2 no record names it). `ttp detach --remote <ssh alias> [--dir <dir>] <name> -- <command>`
+  running or queued, 2 no record names it). `ttp detach --stop <name>` with no job recorded stops a driver
+  the project's own launcher started: NAME.pid in the path's folder, $TTP_RUN_DIR or the task's t<id>
+  folder, once its pid is verified (start time, user, project), gets a STOP file beside it, then SIGTERM and
+  SIGKILL if it does not exit (0 stopped or already gone, 2 none found: it names where it looked). `ttp detach --remote <ssh alias> [--dir <dir>] <name> -- <command>`
   starts the driver on another host with setsid nohup (default folder `~/.ttp-detach/<run>`, with its
   .log, .rc, .pid, .boot and .start); its probe `ttp detach --check --host <alias> <dir>/<name>` exits
   0 once the .rc holds 0, 4 once it holds another exit code or the driver is gone (pid dead, or that
