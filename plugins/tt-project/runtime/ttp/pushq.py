@@ -27,9 +27,10 @@ from .worktree import fix_branches, named_refs
 
 REF_PREFIX = "refs/ttp/push/"   # + row id: pins the approved commit until its row is settled
 KV = "push_queue"               # kv: {"backoff_until", "deaths", "bad_tip": {"tip", "fails", "tried", "at", ...}, "tips_told"}
-DEFAULT_BATCH_S = 900           # delivery.push_batch_s: the oldest approval waits at most this long
+DEFAULT_BATCH_S = 300           # delivery.push_batch_s: the oldest approval waits at most this long for running reviews
 DEFAULT_BATCH_MAX = 8           # delivery.push_batch_max: start at once with this many; also a batch's most
-DEFAULT_MIN_GAP_S = 1800        # delivery.push_min_gap_s: the least time from a batch's end to the next start
+DEFAULT_MIN_GAP_S = 1800        # delivery.push_min_gap_s: after a batch that did not end clean, the least time to the next start
+CLEAN_OUTCOMES = ("pushed", "landed", "nothing")   # the tip passed and the push went: no gap after these
 # delivery.push_solo_paths: git pathspecs; a batch takes at most one approval whose change touches them.
 # Two prompt changes that each fit a size cap may not fit together, which fails the whole batch.
 TRIM_EVENT = "its review runs again as a light trim-to-fit fix"   # counts them per review
@@ -656,9 +657,12 @@ def _gap_left(db, now: float, gap: float) -> float:
 def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[list[dict], str]:
     """The approved rows a batch should take now (at most delivery.push_batch_max, best priority
     first) and why; or ([], why not). Only local state is read: no fetch, no checks (an open runner
-    fault, envfault, is probed again at most once a minute and holds every batch). Unless the batch
-    is full or holds a priority-1 approval or one the last batch requeued untested, it waits for
-    delivery.push_min_gap_s since the last one."""
+    fault, envfault, is probed again at most once a minute and holds every batch). No batch starts
+    while the last one or its after_push (the deploy) still runs. After a clean batch an approval
+    starts one at once unless a review is running or ready, which it waits for at most
+    delivery.push_batch_s. After a batch that did not end clean (a failing tip, a dead batch), unless
+    the batch is full or holds a priority-1 approval or one the last batch requeued untested, it
+    waits for delivery.push_min_gap_s since the last one."""
     now = time.time() if now is None else now
     if not enabled(p, cfg):
         return [], "the push queue is off"
@@ -710,7 +714,7 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
         why = "a priority-1 review"
     elif untested:
         why = f"{len(untested)} approval{'s' if len(untested) != 1 else ''} {last['id']} requeued untested"
-    elif (left := _gap_left(db, now, gap)) > 0:
+    elif last and last["outcome"] not in CLEAN_OUTCOMES and (left := _gap_left(db, now, gap)) > 0:
         return [], f"{left:.0f} s left of the {gap:.0f} s gap since the last batch ended"
     elif now - min(r["created"] for r in rows) >= window:
         why = f"the oldest approval waited {window:.0f} s"

@@ -1077,11 +1077,14 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   deterministic fix gets queued; a test that fails twice never passes. A check that did not exit 1,
   or that pytest stopped early (`-x`, `--maxfail`, an interrupt), is never rerun. When the first change is
   blamed, its failing tests are rerun once on the tip alone: failing there too, the tip is reported
-  broken instead of the change. Keys, all under `delivery`: `push_batch_s` (default 900: a
-  batch starts once the oldest approval waited this long; 0 = at once), `push_batch_max`
+  broken instead of the change. Keys, all under `delivery`: `push_batch_s` (default 300: with
+  no review running or ready an approval starts a batch at once; otherwise the batch starts once the
+  oldest approval waited this long; 0 = at once), `push_batch_max`
   (default 8: start at once with this many; also the most one batch takes), `push_min_gap_s`
-  (default 1800: a batch starts only once the last one ended at least this long ago, measured
-  from its recorded end so a restart or a failed batch never stretches the wait; a full batch, a
+  (default 1800: after a batch that did not end clean, such as a failing tip or a dead batch, the
+  next starts only once it ended at least this long ago, measured
+  from its recorded end so a restart never stretches the wait; none after a clean batch, though a
+  new batch never starts while the last one's after_push still runs; a full batch, a
   priority-1 review's approval, or one the last batch requeued unchecked after a failing change
   starts at once; 0 = off), `push_solo_paths` (default `["plugins/tt-project/template/prompts/*.md"]`:
   git pathspecs a batch takes at most one approved change touching, as two prompt changes that

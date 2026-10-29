@@ -1985,7 +1985,10 @@ def test_rows_a_batch_requeued_untested_skip_the_push_gap(env, monkeypatch):
     assert [r["id"] for r in got] == [rid] and "1 approval b1 requeued untested" in why, why
     s.p.db.x("UPDATE push_queue SET detail=NULL WHERE id=?", (rid,))
     got, why = pushq.due(s.p, now + 1)
-    assert got == [] and "s left of the 1800 s gap" in why, "a row the last batch checked waits for the gap"
+    assert got == [] and "waiting for more approvals" in why, "a row the last batch checked waits as usual"
+    s.p.db.x("UPDATE push_batches SET outcome='tip_failed' WHERE id='b1'")
+    got, why = pushq.due(s.p, now + 1)
+    assert got == [] and "s left of the 1800 s gap" in why, "after a failing tip it waits for the gap"
 
 
 def test_merge3_keeps_lines_both_sides_added_and_leaves_real_conflicts(env):
@@ -2381,6 +2384,78 @@ def test_a_batch_waits_push_min_gap_s_after_the_last_one_ended_unless_full_or_pr
     assert project.push_queue_number("push_min_gap_s", "0") == 0
     with pytest.raises(ValueError, match="push_min_gap_s.*default 1800"):
         project.push_queue_number("push_min_gap_s", -1)
+
+
+def _pq_last_batch(s, outcome, ended, after_done=True):
+    s.p.db.x("INSERT INTO push_batches(id,marker,target,started,ended,finalized,after_finalized,outcome) "
+             "VALUES('b1','m','origin/proj',?,?,?,?,?)",
+             (ended - 600, ended, ended, ended if after_done else None, outcome))
+
+
+@pytest.mark.parametrize("outcome", ["pushed", "landed", "nothing"])
+def test_an_approval_after_a_clean_batch_starts_at_once_with_nothing_running_or_queued(env, monkeypatch, outcome):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    s.p.db.update_task(s.review, status="done")   # no review running or ready
+    now = time.time()
+    _pq_last_batch(s, outcome, now - 60)
+    rid = _pq_review(s)[1]
+    got, why = pushq.due(s.p, now)
+    assert [r["id"] for r in got] == [rid] and "no review" in why, why
+
+
+def test_an_approval_waits_at_most_the_default_batch_s_for_a_running_review(env, monkeypatch):
+    from ttp import project, pushq
+    s = _pq(env, monkeypatch)
+    s.p.db.update_task(s.review, status="running")
+    assert pushq.DEFAULT_BATCH_S == project.PUSH_QUEUE_DEFAULTS["push_batch_s"] == 300
+    now = time.time()
+    _pq_last_batch(s, "pushed", now - 60)   # a clean batch just ended: no gap after it
+    rid = _pq_review(s)[1]
+    got, why = pushq.due(s.p, now + 1)
+    assert got == [] and "waiting for more approvals" in why, why
+    got, why = pushq.due(s.p, now + 301)
+    assert [r["id"] for r in got] == [rid] and "waited 300 s" in why, why
+
+
+def test_the_gap_and_the_bad_tip_hold_still_apply_after_a_failing_tip(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_s=0)
+    s.p.db.update_task(s.review, status="done")
+    now = time.time()
+    _pq_last_batch(s, "tip_failed", now - 600)
+    rid = _pq_review(s)[1]
+    got, why = pushq.due(s.p, now)
+    assert got == [] and "1200 s left of the 1800 s gap" in why, why
+    assert [r["id"] for r in pushq.due(s.p, now + 1200)[0]] == [rid]
+    tip = pushq._tracking_tip(s.p, "origin", "proj")
+    s.p.db.set_kv(pushq.KV, {"bad_tip": {"tip": tip, "fails": 1, "tried": [rid], "at": now}})
+    got, why = pushq.due(s.p, now + 1200)
+    assert got == [] and "held: the tip" in why, "HOLD_S still holds approvals tried on the failing tip"
+    assert pushq.due(s.p, now + pushq.HOLD_S + 1)[0]
+
+
+def test_batch_max_still_caps_a_batch_started_at_once(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_max=2)
+    s.p.db.update_task(s.review, status="done")
+    _pq_last_batch(s, "pushed", time.time() - 60)
+    rows = [_pq_review(s)[1] for _ in range(3)]
+    got, why = pushq.due(s.p)
+    assert [r["id"] for r in got] == rows[:2], why
+
+
+def test_the_next_batch_waits_for_the_last_ones_after_push_deploy(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_s=0)
+    s.p.db.update_task(s.review, status="done")
+    now = time.time()
+    _pq_last_batch(s, "pushed", now - 60, after_done=False)   # pushed; its after_push still runs
+    rid = _pq_review(s)[1]
+    got, why = pushq.due(s.p, now)
+    assert got == [] and "b1 is still going" in why, why
+    s.p.db.x("UPDATE push_batches SET after_push='ok', after_finalized=? WHERE id='b1'", (now,))
+    assert [r["id"] for r in pushq.due(s.p, now)[0]] == [rid], "once it ends no gap follows a clean batch"
 
 
 @pytest.mark.parametrize("blocker", ["paused branch", "paused push", "live batch", "busy branch", "detached push",

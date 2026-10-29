@@ -550,11 +550,12 @@ def code_tasks_may_push(cfg: dict) -> bool:
 
 
 # delivery.push_queue on: reviews approve into the daemon's queue, which pushes approved heads in
-# batches (a batch starts once the oldest approval waited push_batch_s or push_batch_max are waiting,
-# but not before push_min_gap_s passed since the last batch ended unless it is full or priority 1)
+# batches (a batch starts at once when no review is running or ready, else once the oldest approval
+# waited push_batch_s or push_batch_max are waiting; after a batch that did not end clean, not before
+# push_min_gap_s passed since it ended unless it is full or priority 1)
 # and then runs after_push (commands like push_checks), killed after after_push_timeout_s.
 # push_landing_alert_h: approvals waiting this long with nothing landed raise a high alert (0 = off).
-PUSH_QUEUE_DEFAULTS = {"push_queue": False, "push_batch_s": 900, "push_batch_max": 8, "push_min_gap_s": 1800,
+PUSH_QUEUE_DEFAULTS = {"push_queue": False, "push_batch_s": 300, "push_batch_max": 8, "push_min_gap_s": 1800,
                        "push_landing_alert_h": 4,
                        "after_push_timeout_s": 1800, "deploy_restart_wait_s": 900}
 # key: (minimum, whether the minimum itself is allowed, whole numbers only)
