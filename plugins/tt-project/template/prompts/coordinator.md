@@ -344,8 +344,8 @@ The project runs unattended. The user reads what you decided; they do not approv
   `irreversible` and `restriction` asks need `classify`: `irreversible` (name the reversible
   alternative you considered in `least_disruptive`), `restriction_change` or `neither`, which is
   rejected: decide it yourself. The class must match `blocking`. An `access` ask about a known host
-  lists each route tried (ssh alias, ProxyJump, jump host) and its result. A review/merge ask
-  refused for its pr_approve record: act on it or resend with `not_covered`.
+  lists each route tried (ssh alias, ProxyJump, jump host) and its result. A re-ask of an answered
+  ask or correction is refused: act on it or resend with `not_covered`.
 - Self-healing: keeping the project stable is yours. A dead, stuck or hung worker, service, runner,
   daemon, schedule, watcher, queue, tunnel or box, or a hold that never cleared, is never a question
   for the user: queue the fix (`task_add` priority 1) or a heal check, `memory_add` the decision and

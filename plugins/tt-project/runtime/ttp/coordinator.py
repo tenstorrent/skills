@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, cells, chaincap, chainprio, chatset, checkspill, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, relay, responsibilities, restriction_audit, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, throughmute, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, cells, chaincap, chainprio, chatset, checkspill, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, relay, responsibilities, restriction_audit, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, throughmute, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -286,6 +286,8 @@ USER_SETTABLE = {
     "coordinator.charter_approval_days": float,
     # Days a pr_approve record refuses a repeated review or merge ask (_prior_approval).
     "coordinator.approval_lookback_days": float,
+    # Days an answered ask, the user's word or a recorded decision refuses a re-ask of its subject (reask.py; 0 off).
+    "coordinator.reask_window_days": float,
     # Provider failover (failover.py): hours a provider may be unable to start work before its queued
     # and waiting tasks move (0: off), and the providers they move to first.
     "coordinator.provider_failover_after_h": lambda v: failover.after_h_of(v),
@@ -2323,6 +2325,16 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 for o in db.q("SELECT id, text FROM messages WHERE kind='ask' AND handled=0"):
                     if _same_text(_ask_question(o["text"]), text):
                         raise ValueError(f"already asked as open ask #{o['id']}; it waits for the answer")
+                seen, nc = None, str(a.get("not_covered") or "").strip()
+                if a["blocking"] not in ("review", "merge"):   # those have the pr_approve record check below
+                    seen = reask.settled_by(p, cfg, text, change=a.get("classify") == "restriction_change",
+                                            question=_ask_question)
+                    if seen and len(nc) < NOT_COVERED_MIN:
+                        _count_refusal(db, key, "already settled", text)
+                        raise ValueError(f"ask_user rejected: already settled by {seen}. Act on that answer, and "
+                                         "`resolve` or cite it instead of asking. A new question on that subject "
+                                         "(new evidence, changed facts): resend with not_covered saying what is new "
+                                         f"(at least {NOT_COVERED_MIN} characters)")
                 if a["blocking"] in PRIOR_APPROVAL_REASONS and len(str(a.get("not_covered") or "").strip()) < NOT_COVERED_MIN:
                     prior = _prior_approval(p, text)
                     if prior:
@@ -2344,6 +2356,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 turn_asks.append((k, db.post("out", text, chat=None, kind="ask",
                                              severity=_norm_severity(a.get("severity") or "high"),
                                              ref=f"{prguard.BLOCKING_REF}{a['blocking']}")))
+                if seen:   # sent on its not_covered reason: counted for the daily audit
+                    _count_refusal(db, f"{key}:reask" if key else None, "already settled (not_covered)",
+                                   f"{nc} [over {seen}] {a['text'].strip()}", kind=ASK_FLAGGED_KIND)
                 own = _own_call_ask(a, a["text"].strip())
                 if own:   # sent on its not_own_call override: counted for the daily audit
                     _count_refusal(db, key, f"{own[0]} (not_own_call)", a["text"].strip(), kind=ASK_FLAGGED_KIND)

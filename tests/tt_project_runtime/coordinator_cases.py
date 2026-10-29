@@ -4526,27 +4526,116 @@ _NOT_APPROVALS = [f"No, do not {_SUBJECT}. Do not proceed.", f"Not approved: {_S
 
 
 
-def test_no_words_of_the_user_hold_back_a_restriction_or_irreversible_ask(env):
+def test_the_users_words_on_a_subject_refuse_a_re_ask_by_quoting_them_never_as_an_approval(env):
     p = make(env)
-    from ttp import coordinator as coord, relay
+    from ttp import coordinator as coord, relay, unblock
     assert "not_covered" in coord.ACTIONS_SCHEMA["properties"]["actions"]["items"]["properties"]
     asks = [("restriction", _SOAK), ("irreversible", dict(blocking="irreversible", classify="irreversible",
                                                           least_disruptive=_SOAK["least_disruptive"]))]
+    new = {"not_covered": "the bucket now also holds this week's release artifacts, which changes the risk"}
     for said in _NOT_APPROVALS:
         for kind, fields in asks:
+            p.db.x("DELETE FROM messages WHERE direction='in'")
+            p.db.set_kv(unblock.RESOLVED_KEY, {})   # each case starts with nothing settled
             # Relayed in a user message, with the subject.
-            p.db.post("in", f"{said} ({_SUBJECT})\n{relay.MARK}\nrelayed from a laptop", chat=None,
-                      channel="cli", kind="user", provenance="cli-legacy")
+            mid = p.db.post("in", f"{said} ({_SUBJECT})\n{relay.MARK}\nrelayed from a laptop", chat=None,
+                            channel="cli", kind="user", provenance="cli-legacy")
             problems, sent = _ask(p, f"May I {_SUBJECT}?", **fields)
+            # Quoted back as what the user said, to act on; never read as a yes.
+            assert problems and f'already settled by user msg #{mid}: "' in problems[0], (said, kind, problems)
+            assert "relayed from a laptop" not in problems[0]
+            problems, sent = _ask(p, f"May I {_SUBJECT}?", **fields, **new)
             assert problems == [] and sent["text"].startswith(f"May I {_SUBJECT}?"), (said, kind, problems)
             # As the answer to that earlier ask on the same subject.
-            p.db.post("in", f"#{sent['id']}: {said}", chat=None, kind="user", provenance="web-session")
-            assert coord.apply(p, [{"type": "resolve", "id": sent["id"]}]) == []
+            p.db.x("DELETE FROM messages WHERE direction='in'")
+            mid = p.db.post("in", f"#{sent['id']}: {said}", chat=None, kind="user", provenance="web-session")
+            assert coord.apply(p, [{"type": "resolve", "id": sent["id"]}], messages=[mid]) == []
             problems, again = _ask(p, f"Can I {_SUBJECT} now?", **fields)
+            assert problems and f'already settled by ask #{sent["id"]}, answered in user msg #{mid}: "#{sent["id"]}: ' \
+                f'{said}"' in problems[0], (said, kind, problems)
+            problems, again = _ask(p, f"Can I {_SUBJECT} now?", **fields, **new)
             assert problems == [] and again["id"] != sent["id"], (said, kind, problems)
             p.db.x("UPDATE messages SET handled=1 WHERE kind='ask'")
             assert coord._prior_approval(p, f"May I {_SUBJECT}?") is None
 
+
+
+_TIMEOUT = dict(_SOAK, least_disruptive="keep the soak at the default timeout; it breaks no restriction but "
+                                         "tests less")
+_NEW = "the soak now fails on a new firmware at 70 minutes, which the earlier answer did not know"
+
+
+def test_an_ask_the_user_already_settled_is_refused_naming_the_record_and_quoting_it(env):
+    p = make(env)
+    from ttp import coordinator as coord, unblock
+    db = p.db
+    since = time.time() - 1
+    # A: an answered ask, paraphrased.
+    problems, sent = _ask(p, "Please grant the nightly report job read access to the metrics bucket.",
+                          blocking="access")
+    assert problems == []
+    mid = db.post("in", f"#{sent['id']}: granted, the report job can read the metrics bucket now", chat=None,
+                  kind="user", provenance="web-session")
+    assert coord.apply(p, [{"type": "resolve", "id": sent["id"]}], messages=[mid]) == []
+    problems, again = _ask(p, "Can the nightly report job get read access to the metrics bucket?", blocking="access")
+    assert problems and f"already settled by ask #{sent['id']}, answered in user msg #{mid}" in problems[0]
+    assert '"#%d: granted, the report job can read the metrics bucket now"' % sent["id"] in problems[0]
+    assert "`resolve` or cite it" in problems[0] and again["id"] == sent["id"], "the re-ask reached the user"
+    # B: the user's own word, and a Correction fact.
+    mid = db.post("in", "Keep the soak timeout on box-a1 at 60 minutes; do not raise it.", chat=None,
+                  kind="user", provenance="web-session")
+    problems, _ = _ask(p, "May I raise the soak timeout on box-a1 to 90 minutes?", **_TIMEOUT)
+    assert problems and f'already settled by user msg #{mid}: "Keep the soak timeout on box-a1 at 60 minutes;"' \
+        in problems[0], problems
+    fact = p.add_memory("Correction (user msg #7): the weekly cleanup job runs on Sundays, not Mondays.")
+    problems, _ = _ask(p, "Does the weekly cleanup job run on Mondays or on Sundays?", blocking="access")
+    assert problems and f"already settled by memory [{fact.stem}]" in problems[0], problems
+    # D: resent with not_covered naming what is new: sent, and the reason recorded.
+    problems, sent = _ask(p, "May I raise the soak timeout on box-a1 to 90 minutes?", **_TIMEOUT, not_covered=_NEW)
+    assert problems == [] and sent["text"].startswith("May I raise the soak timeout"), problems
+    flag = db.one("SELECT text FROM events WHERE kind=? ORDER BY id DESC LIMIT 1", (coord.ASK_FLAGGED_KIND,))
+    assert flag["text"].startswith(f"already settled (not_covered): {_NEW} [over user msg #{mid}")
+    assert _ask(p, "Does the weekly cleanup job run on Mondays now?", blocking="access", not_covered="too short")[0]
+    # F: counted where the daily review reads them.
+    assert unblock.refused_line(db, since) == "4 refused (already settled 4)"
+    assert unblock.refused_line(db, since, flagged=True) == "1 flagged (already settled (not_covered) 1)"
+
+
+def test_the_re_ask_gate_lets_unrelated_old_and_charter_only_restriction_asks_through(env):
+    p = make(env)
+    from ttp import coordinator as coord, reask
+    db = p.db
+    p.charter_path.write_text(p.charter_path.read_text() + "\n## Policies (added)\n- Nightly report results go to "
+                              "the weekly digest, never a notify.\n\n## Restrictions (added)\n- Never push to the "
+                              "release branch.\n")
+    mid = db.post("in", "Keep the soak timeout on box-a1 at 60 minutes; do not raise it.", chat=None,
+                  kind="user", provenance="web-session")
+    # C: an unrelated ask, and asks on another machine or with only an anchor in common, go out unchanged.
+    for text in ("Please grant the CI account read access to the artifact store.",
+                 "May I raise the soak timeout on box-b2 to 90 minutes?",
+                 "Is box-a1 free for the firmware flash tonight?"):
+        problems, sent = _ask(p, text, blocking="access")
+        assert problems == [] and sent["text"] == text, (text, problems)
+    # A charter Policies item settles a plain ask, never a restriction-change ask, which only names a charter item.
+    problems, _ = _ask(p, "Should nightly report results go out as a notify?", blocking="access")
+    assert problems and "already settled by the charter's Policies item" in problems[0], problems
+    assert reask.settled_by(p, p.config(), "Should nightly report results go out as a notify?", change=True) is None
+    problems, sent = _ask(p, "May I push the hotfix to the release branch once?", **_TIMEOUT)
+    assert problems == [] and sent["text"].startswith("May I push the hotfix"), problems
+    # A question or an 'ask me first' sentence of the user's settles nothing.
+    db.post("in", "Can we raise the nightly fuzz budget? Ask me before you change the fuzz seed list.",
+            chat=None, kind="user", provenance="web-session")
+    for text in ("May I raise the nightly fuzz budget to 3 hours?", "May I change the fuzz seed list?"):
+        assert _ask(p, text, blocking="access")[0] == [], text
+    # E: an answer older than the window, or the gate off, refuses nothing.
+    ask = "May I raise the soak timeout on box-a1 to 90 minutes?"
+    db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 31 * 86400, mid))
+    assert reask.settled_by(p, p.config(), ask) is None
+    db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 29 * 86400, mid))
+    assert reask.settled_by(p, p.config(), ask)
+    assert reask.settled_by(p, {"coordinator": {"reask_window_days": 0}}, ask) is None
+    assert reask.settled_by(p, {"coordinator": {"reask_window_days": 20}}, ask) is None
+    assert "coordinator.reask_window_days" in coord.USER_SETTABLE
 
 
 def test_a_review_or_merge_ask_with_a_pr_approve_record_is_refused_once_naming_it(env):
