@@ -17,6 +17,9 @@ to its first run, or to now for one still queued:
   review.unreviewed_per_pass (against the backlog of tasks in review now).
 - review_stall: the same end to the review's first run. Limit coordinator.review_stall_s, the age at
   which a waiting review is raised at all.
+  Neither limit is lowered for a review wait the checks held (slot-held): checkcap's waits log for the
+  code task (its own checks, or the precheck the daemon starts on its head as it queues the review)
+  and, for the stall, the review's precheck hold (Daemon._precheck_holds) cover half of it.
 - push_batch: a push-queue row's approval to its batch's start. Limit delivery.push_batch_s, judged
   only on the rows the window alone held (no other batch ran while they waited).
 - landed_chain / deferral: `start_when` waits (a `landed:#<id>` chain or another probe); provider_gate:
@@ -24,11 +27,10 @@ to its first run, or to now for one still queued:
 - Re-queue waits: each waiting hand-off (its task_waiting event) to the task's next run, and the current
   wait of a task that has run (queued, blocked or waiting) from its last run's end to now, sorted by
   its reason (the event's "for" or text; the task's blocked_reason for the current wait), or by the
-  checks slot's own records (a checks_slot_wait event in the wait, or checkcap's waits log covering
-  half of it): checks_slots (waiting for this project's other `ttp checks`; limit checks.slots per
-  repository or checks.test_project_max per project, whichever of the two held the wait: both are
-  project settings, reported, never raised), own_job (its own detached job or checks: no
-  limit), the rules above for a deferral, provider or resource, else retry_wait (its own retry
+  checks slot's own records (checkcap's waits log covering half of it): checks_slots (waiting for this
+  project's other `ttp checks`; limit checks.slots per repository or checks.test_project_max per project,
+  whichever of the two held the wait: both are project settings, reported, never raised), own_job (its own
+  detached job or checks: no limit), the rules above for a deferral, provider or resource, else retry_wait (its own retry
   condition, then a slot, not told apart: no limit, never counted against worker slots).
 
 A lane is slow when the 90th percentile of its waits is over the threshold: P1_WAIT_S for priority 1
@@ -157,6 +159,15 @@ def _cfg(cfg: dict, dotted: str, default):
     return node
 
 
+def _covered(spans, w0: float, w1: float) -> float:
+    """Seconds of [w0, w1] that the union of `spans` ((start, end) pairs) covers."""
+    tot, edge = 0.0, w0
+    for a, b in sorted((max(float(a), w0), min(float(b), w1)) for a, b in spans):
+        if b > a and b > edge:
+            tot, edge = tot + b - max(a, edge), b
+    return tot
+
+
 def thresholds(spans: list[tuple[float, float]]) -> tuple[float, float]:
     """(priority 1 threshold, other threshold) in seconds, the latter sized from the median run."""
     durs = [e - s for s, e in spans if e > s]
@@ -262,7 +273,7 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
         return True
 
     # Re-queue waits read what the daemon writes: task_waiting events, each waiting task's last run, and
-    # the checks slot's own records (checks_slot_wait events, checkcap's waits log) for its slot waits.
+    # the checks slot's own records (checkcap's waits log) for its slot waits.
     wait_ids = [t["id"] for t in tasks if t["status"] in ("queued", "blocked", "waiting")]
     last_run = {r["task"]: r for r in db.q(
         "SELECT task, MAX(ended) AS ended, SUM(ended IS NULL) AS live FROM runs WHERE role!='coordinator' "
@@ -272,10 +283,6 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     for e in db.q("SELECT ts, task, text, data FROM events WHERE kind='task_waiting' AND task IS NOT NULL AND ts>? "
                   "ORDER BY ts LIMIT ?", (t0 - DAY, ROWS)):
         ev_waits.setdefault(e["task"], []).append(e)
-    slot_ev: dict[int, list[tuple[float, str]]] = {}
-    for e in db.q("SELECT ts, task, text FROM events WHERE kind='checks_slot_wait' AND task IS NOT NULL AND ts>?",
-                  (t0 - DAY,)):
-        slot_ev.setdefault(e["task"], []).append((float(e["ts"]), slot_limit(e["text"] or "")))
     slot_log: dict[int, list[tuple[float, float]]] = {}
     try:
         from . import checkcap
@@ -285,18 +292,34 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     except Exception:
         pass
 
-    def slot_held(task: int, w0: float, w1: float) -> str | None:
+    def slot_held(task: int, w0: float, w1: float, extra: list | tuple = ()) -> str | None:
         """Which checks limit held `task` in [w0, w1] — "checks.slots" (its repository's lanes) or
-        "checks.test_project_max" (the project's cap) — or None when the checks slot did not hold it:
-        a checks_slot_wait event in the wait (its text names the limit; older events named none:
-        the project cap, the limit those waits were held under), or checkcap's logged slot waits
-        covering at least half of it (no limit recorded: the per-repository limit, the default
-        holder of a queue wait)."""
-        for ts, key in slot_ev.get(task, ()):
-            if w0 <= ts <= w1:
-                return key
-        held = sum(max(0.0, min(g, w1) - max(q, w0)) for q, g in slot_log.get(task, ()))
-        return SLOTS_KEY if w1 > w0 and held * 2 >= w1 - w0 else None
+        "checks.test_project_max" (the project's cap) — or None when the checks did not hold it: its
+        logged slot waits and `extra` spans cover at least half of it (no limit recorded: the
+        per-repository limit, the default holder of a queue wait)."""
+        return SLOTS_KEY if w1 > w0 and _covered([*slot_log.get(task, ()), *extra], w0, w1) * 2 >= w1 - w0 else None
+
+    def precheck_hold(t: dict) -> list[tuple[float, float]]:
+        """The span review `t` was held for the checks the daemon started on its code task's head: from
+        their start to their end, at most PRECHECK_HOLD_S (Daemon._precheck_holds)."""
+        from .cli import CHECKS_RC, _read_checks_pid
+        from .daemon import PRECHECK_HOLD_S, PRECHECK_LABEL, PRECHECKS_DIR
+        name = next((lb[len(PRECHECK_LABEL):] for lb in _labels(t) if isinstance(lb, str)
+                     and lb.startswith(PRECHECK_LABEL)), "")
+        if not name or "/" in name:
+            return []
+        out = Path(db.path).parent / PRECHECKS_DIR / name
+        try:
+            ts = float(_read_checks_pid(out).get("ts") or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        if not ts:
+            return []
+        try:
+            end = (out / CHECKS_RC).stat().st_mtime
+        except OSError:
+            end = now
+        return [(ts, min(end, ts + PRECHECK_HOLD_S))]
 
     slot_tally: dict[str, float] = {SLOTS_KEY: 0.0, CAP_KEY: 0.0}
     for t in tasks:
@@ -344,14 +367,15 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                 lane("retry_wait", None, None)["note"] = ("its own retry condition, then a slot, not told apart: "
                                                          "never counted against worker slots")
                 add(lanes["retry_wait"], w1 - w0, prio, w0, w1, None, queued)
-    # Reviews: a code task's last run ending to its review queued (sweep) and started (stall).
+    # Reviews: a code task's last run ending to its review queued (sweep) and started (stall). A wait the
+    # checks held is measured but judges neither limit (the swept and free lists plan() reads).
     sweep_s = float(_cfg(cfg, "review.sweep_after_s", 1800) or 0)
     per_pass = int(_cfg(cfg, "review.unreviewed_per_pass", 2) or 0)
     stall_s = float(_cfg(cfg, "coordinator.review_stall_s", 14400) or 0)
     rs, rt = lane("review_sweep", "review.sweep_after_s", sweep_s), lane("review_stall", "coordinator.review_stall_s", stall_s)
     swept = {int(m.group(1)) for e in db.q("SELECT text FROM events WHERE kind='review_swept' AND ts>?", (t0,))
              if (m := re.search(r"review #(\d+) queued", e["text"] or ""))}
-    rs["swept"] = []
+    rs["swept"], rs["slot_held"], rt["free"], rt["slot_held"] = [], 0, [], 0
     for t in tasks:
         target = _reviewed(t) if t["kind"] == "review" else None
         if not target or float(t["created"] or 0) < t0:
@@ -361,10 +385,17 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             continue
         done, prio = max(ends), int(t["priority"] or 3)
         add(rs, float(t["created"]) - done, prio, done, float(t["created"]), None, False)
-        if t["id"] in swept:
+        if slot_held(target, done, float(t["created"])):
+            rs["slot_held"] += 1
+        elif t["id"] in swept:
             rs["swept"].append(float(t["created"]) - done)
         start = first.get(t["id"])
-        add(rt, (start if start is not None else now) - done, prio, done, start or now, None, start is None)
+        w1 = start if start is not None else now
+        add(rt, w1 - done, prio, done, w1, None, start is None)
+        if slot_held(target, done, w1, precheck_hold(t)):
+            rt["slot_held"] += 1
+        else:
+            rt["free"].append(w1 - done)
     backlog = db.one("SELECT COUNT(*) n FROM tasks t WHERE t.status='review' AND t.kind!='review' AND NOT EXISTS "
                      "(SELECT 1 FROM tasks r WHERE r.kind='review' AND (r.parent=t.id OR r.labels LIKE '%\"auto_review:'||t.id||'\"%') "
                      "AND r.status IN "
@@ -401,7 +432,7 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     out = []
     for ln in lanes.values():
         w, p1 = ln.pop("waits"), ln.pop("p1")
-        for k in ("swept", "window"):
+        for k in ("swept", "window", "free"):
             if k in ln:
                 v = ln.pop(k)
                 ln.update({f"{k}_count": len(v), f"{k}_p90_s": round(_pct(v, 0.9))})
@@ -488,9 +519,11 @@ def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
                                 "why": f"{n} review(s) the sweep queued, p90 {sp90}s after the work ended, "
                                        f"sweep every {int(cur)}s"})
             else:
-                kept.append({"lane": name, "key": key, "why": f"{ln['count'] - n} of {ln['count']} review(s) were "
-                             f"queued at finish, not by the sweep ({n} swept, p90 {sp90}s): {key} did not hold them"
-                             if cur and cur > FLOORS[key] else f"{key} is at its floor"})
+                held = ln.get("slot_held", 0)
+                kept.append({"lane": name, "key": key, "why": f"{ln['count'] - n - held} of {ln['count']} review(s) "
+                             f"were queued at finish, not by the sweep, and {held} held by the checks ({n} swept, "
+                             f"p90 {sp90}s): {key} did not hold them" if cur and cur > FLOORS[key]
+                             else f"{key} is at its floor"})
         elif name == "push_batch":
             n, wp90 = ln.get("window_count", 0), ln.get("window_p90_s", 0)
             target = max(FLOORS[key], int(cur // 2))
@@ -503,9 +536,14 @@ def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
                              f"(p90 {wp90}s): a shorter window only means more batches, each a full check run"})
         elif name == "review_stall":
             target = max(FLOORS[key], int(cur // 2), int(th["other"]))
-            if cur and int(cur) > target and p90 < cur:
-                changes.append({"key": key, "old": int(cur), "new": target, "why": f"p90 {p90}s over threshold, "
-                                f"under the {int(cur)}s alarm, so no stall was raised"})
+            n, fp90, held = ln.get("free_count", 0), ln.get("free_p90_s", 0), ln.get("slot_held", 0)
+            if cur and int(cur) > target and n and th["other"] < fp90 < cur:
+                changes.append({"key": key, "old": int(cur), "new": target, "why": f"{n} review wait(s) not held by "
+                                f"the checks, p90 {fp90}s over threshold, under the {int(cur)}s alarm, so no stall "
+                                "was raised"})
+            elif held and not (n and fp90 > th["other"]):
+                kept.append({"lane": name, "key": key, "why": f"{held} of {ln['count']} review wait(s) were held by "
+                             "their precheck or a checks slot: a lower alarm only adds coordinator wakes"})
             else:
                 kept.append({"lane": name, "key": key, "why": f"{key} is at its floor or not what held the waits"})
     return [c for c in changes if safe(c["key"])], kept

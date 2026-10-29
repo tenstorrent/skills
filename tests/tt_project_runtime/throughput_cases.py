@@ -198,10 +198,7 @@ def test_throughput_measures_requeue_waits_by_reason_and_a_slow_checks_lane_gets
     requeued("ttp checks lanes", now - 3 * 3600, "done", "", wait_for="CI on the branch", data=False)
     # A task that ran three days ago and waits again: a re-queue wait, not a first start for a slot.
     requeued("ran long ago", None, "queued", "", ended=now - 3 * 86400)
-    # Read as its own checks, but the checks slot's records show the slot held it.
-    ev = requeued("slot event", now - 2 * 3600, "done", "", wait_for="the detached ttp checks to pass")
-    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-           (now - 3 * 3600, "daemon", "checks_slot_wait", "low", f"Checks slot wait: #{ev} has waited 15 min", "handled", ev))
+    # Read as its own checks, but checkcap's waits log shows the slot held it.
     lg = requeued("slot log", now - 2 * 3600, "done", "", wait_for="the detached ttp checks to pass")
     from ttp import checkcap
     (Path(p.db.path).parent / checkcap.WAITS_LOG).write_text(json.dumps(
@@ -211,7 +208,7 @@ def test_throughput_measures_requeue_waits_by_reason_and_a_slow_checks_lane_gets
         fh.write(json.dumps({"task": short, "queued_at": now - 3 * 3600, "granted_at": now - 3 * 3600 + 600}) + "\n")
     rep = throughput.measure(p.db, p.config(), now=now, gates={})
     ck = _tp_lane(rep, "checks_slots")
-    assert (ck["count"], ck["waiting_now"], ck["p1_p90_s"]) == (4, 1, 4 * 3600) and ck["slow"]
+    assert (ck["count"], ck["waiting_now"], ck["p1_p90_s"]) == (3, 1, 4 * 3600) and ck["slow"]
     assert (_tp_lane(rep, "own_job")["count"], _tp_lane(rep, "retry_wait")["count"]) == (2, 3)
     assert _tp_lane(rep, "retry_wait")["waiting_now"] == 2
     assert "worker_slots" not in {ln["lane"] for ln in rep["lanes"] if ln["count"] and ln["lane"] != "dependency"} \
@@ -312,6 +309,56 @@ def test_throughput_keeps_push_window_and_sweep_unless_they_held_the_waits(env):
             "daemon.", "handled", code))
     changes, _ = throughput.plan(p.db, p.config(), throughput.measure(p.db, p.config(), now=now, gates={}))
     assert {(c["key"], c["new"]) for c in changes if c["key"] in levers} == {("delivery.push_batch_s", 1800), ("review.sweep_after_s", 600)}
+
+
+def test_throughput_review_limits_are_not_lowered_for_waits_the_checks_held(env):
+    from ttp import checkcap, throughput
+    p = make(env)
+    now = time.time()
+    state = Path(p.db.path).parent
+    # Swept 1 h after its code task's run ended, then 2.9 h to its first run: the code task's own checks
+    # and the precheck the daemon started on its head waited for a checks slot most of both spans.
+    t0 = now - 6 * 3600
+    code = _tp_task(p, "code change", t0 - 1800)
+    _tp_run(p, code, t0 - 1800, t0)
+    rv = _tp_task(p, "Review", t0 + 3600, labels=[f"auto_review:{code}"])
+    p.db.x("UPDATE tasks SET kind='review' WHERE id=?", (rv,))
+    _tp_run(p, rv, t0 + 14000, t0 + 14600, role="reviewer")
+    p.db.x("INSERT INTO events(ts, source, kind, severity, text, status, task) VALUES(?,?,?,?,?,?,?)",
+           (t0 + 3600, "daemon", "review_swept", "normal", f"#{code} x; review #{rv} queued by the daemon.", "handled", code))
+    (state / checkcap.WAITS_LOG).write_text("".join(json.dumps({"task": code, "queued_at": q, "granted_at": g}) + "\n"
+                                                    for q, g in ((t0 + 60, t0 + 3000), (t0 + 3700, t0 + 13500))))
+    # Queued at finish, held about an hour by its precheck (its checks.pid start to its checks.rc).
+    t1 = now - 3 * 3600
+    code2 = _tp_task(p, "code change 2", t1 - 1800)
+    _tp_run(p, code2, t1 - 1800, t1)
+    name = f"t{code2}-0123456789ab"
+    rv2 = _tp_task(p, "Review 2", t1 + 100, labels=[f"auto_review:{code2}", f"precheck:{name}"])
+    p.db.x("UPDATE tasks SET kind='review' WHERE id=?", (rv2,))
+    _tp_run(p, rv2, t1 + 5000, t1 + 5600, role="reviewer")
+    pc = state / "prechecks" / name
+    pc.mkdir(parents=True)
+    (pc / "checks.pid").write_text(json.dumps({"pid": 1, "ts": t1 + 100}))
+    (pc / "checks.rc").write_text("0")
+    os.utime(pc / "checks.rc", (t1 + 3600, t1 + 3600))
+    levers = ("coordinator.review_stall_s", "review.sweep_after_s")
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    rs, rt = _tp_lane(rep, "review_sweep"), _tp_lane(rep, "review_stall")
+    assert rs["slow"] and rt["slow"] and (rt["count"], rt["slot_held"], rt["free_count"]) == (2, 2, 0)
+    assert (rs["slot_held"], rs["swept_count"]) == (1, 0), "the sweep queued it, but the checks held its wait"
+    changes, kept = throughput.plan(p.db, p.config(), rep)
+    assert not [c for c in changes if c["key"] in levers], changes
+    why = {k["lane"]: k["why"] for k in kept}
+    assert "2 of 2 review wait(s) were held by their precheck or a checks slot" in why["review_stall"]
+    assert "1 held by the checks" in why["review_sweep"]
+    # Without the checks' records the same waits are the limits' own: both are lowered.
+    (state / checkcap.WAITS_LOG).unlink()
+    shutil.rmtree(pc)
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    assert (_tp_lane(rep, "review_stall")["free_count"], _tp_lane(rep, "review_sweep")["swept_count"]) == (2, 1)
+    changes, _ = throughput.plan(p.db, p.config(), rep)
+    assert {(c["key"], c["old"], c["new"]) for c in changes if c["key"] in levers} == {
+        ("coordinator.review_stall_s", 14400, 7200), ("review.sweep_after_s", 1800, 900)}
 
 
 def test_throughput_idle_slots_are_not_raised_and_resource_lanes_are_only_reported(env, monkeypatch):
