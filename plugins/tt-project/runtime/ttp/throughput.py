@@ -41,8 +41,12 @@ to its first run, or to now for one still queued:
   half of it): checks_slots (waiting for this project's other `ttp checks`; limit checks.slots per
   repository or checks.test_project_max per project, whichever of the two held the wait: both are
   project settings, reported, never raised; a wait is at the limit only when checkcap's waits log has it
-  queued, [queued, granted), while the project's recorded checks runs (checkwall) were at
-  checklane.project_cap: no per-repository run record exists), own_job (its own detached job or checks,
+  queued, [queued, granted), while the project's recorded checks runs (checkwall) were at the cap in
+  force then: the most of them that ran at once for SUSTAIN_S in all while the queue stayed non-empty
+  (a shorter peak is an urgent run past the cap), at most
+  checklane.project_cap, as no record keeps the cap's history; no per-repository run record exists;
+  `serialized` when they ran one at a time back to back, each start and the grant within SERIAL_S of a
+  run's end, a queue served one run at a time rather than the cap), own_job (its own detached job or checks,
   or a retry_when on its own driver: no limit), the resource rule above only with a dispatch hold recorded
   in the wait, a deferral or provider hold, else retry_wait (its own retry
   condition, then a slot, not told apart: no limit, never counted against worker slots).
@@ -50,7 +54,8 @@ to its first run, or to now for one still queued:
 A lane is slow when the 90th percentile of its waits is over the threshold: P1_WAIT_S for priority 1
 tasks, else the longer of WAIT_S and the median worker run (a wait shorter than one run is normal
 while every slot is busy). Each slow lane names its limiting setting and whether that limit was
-reached while work waited (`at_limit`) or capacity sat idle (`idle`).
+reached while work waited (`at_limit`) or capacity sat idle (`idle`; for the checks lane also
+`serialized`: runs went one at a time back to back, the queue's own fault, not the limit's).
 
 apply() changes only LEVERS, each a key config_set accepts (coordinator.USER_SETTABLE), and only for a
 slow lane whose limit was reached while work waited and whose resource has headroom: the provider
@@ -78,6 +83,8 @@ P1_WAIT_S = 600       # a priority 1 task waiting minutes is slow
 WAIT_S = 1800         # any other task: tens of minutes, or one median run if runs are longer
 CPU_FREE = 0.75       # headroom: 1-minute load under this share of the host's cores
 ROWS = 5000
+SERIAL_S = 10.0   # a checks grant this close to a run's end, one run at a time: a serialized queue
+SUSTAIN_S = 600.0   # how long in all a count of checks runs at once must hold to count as the cap then
 # The settings apply() may change: each sizes how soon queued work starts and is accepted by config_set.
 # coordinator.review_stall_s stays only so `--undo` can restore an earlier change: plan() never proposes it.
 LEVERS = ("budget.max_parallel_workers", "review.sweep_after_s", "review.unreviewed_per_pass",
@@ -252,7 +259,8 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
 
     def lane(name: str, limit_key: str | None, limit) -> dict:
         return lanes.setdefault(name, {"lane": name, "limit_key": limit_key, "limit": limit, "waits": [],
-                                       "p1": [], "at_limit": 0, "idle": 0, "waiting_now": 0, "measured": True})
+                                       "p1": [], "at_limit": 0, "idle": 0, "serialized": 0, "waiting_now": 0,
+                                       "measured": True})
 
     def add(ln: dict, w: float, prio: int, start: float, end: float, limit: int | None, queued: bool) -> None:
         ln["waits"].append(w)
@@ -375,19 +383,53 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     except Exception:
         ck_runs = []
 
-    def queued_at_cap(task: int, w0: float, w1: float) -> bool:
-        """Whether `task` queued for a checks slot in [w0, w1] (checkcap's waits log: [queued, granted)
-        with granted after queued) while the project's recorded checks runs (checkwall) were at its cap.
-        Only the time before the grant counts: the task's own run starts at its grant. No grant record,
-        or one granted at once: not at the limit."""
+    def ck_peak(a: float, b: float) -> int:
+        """The most recorded checks runs (checkwall) running at once in [a, b)."""
+        pts = [a] + [x for x, _ in ck_runs if a < x < b]
+        return max(sum(1 for x0, x1 in ck_runs if x0 <= x < x1) for x in pts)
+
+    def ck_held(a: float, b: float) -> int:
+        """The most recorded checks runs that ran at once in [a, b) for SUSTAIN_S in all: a shorter peak
+        (an urgent run in a lane past the cap) is not the cap."""
+        cuts = sorted({a, b, *(x for r in ck_runs for x in r if a < x < b)})
+        held: dict[int, float] = {}
+        for x, y in zip(cuts, cuts[1:]):
+            n = sum(1 for x0, x1 in ck_runs if x0 <= x < x1)
+            for k in range(1, n + 1):
+                held[k] = held.get(k, 0.0) + y - x
+        return max((k for k, s in held.items() if s >= SUSTAIN_S), default=0)
+
+    # The checks queue's busy periods: the logged [queued, granted) spans of every task, merged.
+    busy: list[list[float]] = []
+    for q, g in sorted(x for v in slot_log.values() for x in v if x[1] > x[0]):
+        if busy and q <= busy[-1][1]:
+            busy[-1][1] = max(busy[-1][1], g)
+        else:
+            busy.append([q, g])
+
+    def cap_wait(task: int, w0: float, w1: float) -> str:
+        """How `task`'s checks slot wait in [w0, w1] was held (checkcap's waits log: [queued, granted)
+        with granted after queued; only the time before the grant counts, as the task's own run starts
+        at its grant): "at_limit" when the project's recorded checks runs (checkwall) reached the cap in
+        force then, the most of them that ran at once for SUSTAIN_S in all while the queue stayed non-empty
+        (one busy period; a shorter peak is an urgent run past the cap),
+        at most checklane.project_cap (no record keeps the cap's history: a cap raised since then is not
+        today's); "serialized" when they ran one at a time back to back, each start and the grant within
+        SERIAL_S of a run's end (a queue served one run at a time, not the cap); else "idle". No grant
+        record, or one granted at once: not at the limit."""
+        serial = False
         for q, g in slot_log.get(task, ()):
             a, b = max(q, w0), min(g, w1)
             if not cap_n or b <= a:
                 continue
-            pts = [a] + [x for x, _ in ck_runs if a < x < b]
-            if max(sum(1 for x0, x1 in ck_runs if x0 <= x < x1) for x in pts) >= cap_n:
-                return True
-        return False
+            seen = max((ck_held(x0, x1) for x0, x1 in busy if x0 <= q and g <= x1), default=0)
+            k = ck_peak(a, b)
+            if k >= (min(cap_n, seen) if seen >= 2 else cap_n):
+                return "at_limit"
+            ends = [e for _, e in ck_runs]
+            serial = serial or (k <= 1 and all(any(abs(x - e) <= SERIAL_S for e in ends)
+                                               for x in [g, *(x0 for x0, _ in ck_runs if a < x0 < b)]))
+        return "serialized" if serial else "idle"
 
     def slot_held(task: int, w0: float, w1: float, extra: list | tuple = ()) -> str | None:
         """Which checks limit held `task` in [w0, w1] — "checks.slots" (its repository's lanes) or
@@ -466,7 +508,7 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                 ln = lane("checks_slots", CAP_KEY, cap_n)
                 add(ln, w1 - w0, prio, w0, w1, None, queued)
                 if cap_n and w1 - w0 > (p1_s if prio <= 1 else other_s):
-                    ln["at_limit" if queued_at_cap(t["id"], w0, w1) else "idle"] += 1
+                    ln[cap_wait(t["id"], w0, w1)] += 1
             elif selfw or "detach" in reason or "ttp checks" in reason or "own job" in reason:
                 lane("own_job", None, None)["note"] = "the task's own detached job or checks ran: no limit"
                 add(lanes["own_job"], w1 - w0, prio, w0, w1, None, queued)
@@ -543,7 +585,8 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                 "(checks.test_project_max), whichever held more of this lane's wait time; both are "
                 "project settings (config_set checks.slots / checks.test_project_max): raise the one "
                 "that held it, or find what else runs on its lanes; at_limit counts only waits queued for a "
-                "checks slot while the project's recorded checks runs were at its cap")
+                "checks slot while the project's recorded checks runs were at the cap in force then; "
+                "serialized, waits behind runs that went one at a time back to back (the queue, not the cap)")
     peak = _peak(spans, t0, now)
     out = []
     for ln in lanes.values():
@@ -612,6 +655,9 @@ def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
             kept.append({"lane": name, "key": key, "why": ln.get("note") or (
                 f"{name} has no setting this may change: its cause is outside the project's sizing limits"
                 if not key else f"{key} is not a sizing limit this changes: needs a person or a task")})
+            if ln.get("serialized"):
+                kept[-1]["why"] += (f"; {ln['serialized']} wait(s) serialized: runs went one at a time back to "
+                                    "back, so the queue held them, not the cap")
             continue
         if not ok:
             kept.append({"lane": name, "key": key, "why": why_not})
@@ -752,6 +798,7 @@ def text(rep: dict) -> str:
                    + (f"; limit {ln['limit_key']}={ln['limit']}" if ln.get("limit_key") else "; no limit")
                    + (f"; over threshold at limit {ln['at_limit']}, with capacity idle {ln['idle']}"
                       if ln["at_limit"] or ln["idle"] or ln["lane"] == "worker_slots" else "")
+                   + (f", serialized {ln['serialized']}" if ln.get("serialized") else "")
                    + (f", {ln['waiting_now']} waiting now" if ln["waiting_now"] else "") + extra)
     for c in rep.get("changes") or []:
         out.append(f"Changed #{c['id']}: {c['key']} {c['old']} -> {c['new']} ({c['why']}); undo: {c['undo']}")

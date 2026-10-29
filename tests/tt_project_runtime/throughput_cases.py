@@ -831,3 +831,53 @@ def test_slow_information_only_lane_opens_no_followup_on_a_speed_complaint(env, 
     assert [r["id"] for r in rows] == ([made["opened"]] if made["opened"] else []) and made["listed"] is None
     assert not [r for r in rows if "review_stall" in r["title"] or "lane review_stall " in r["spec"]], rows
     assert "review_stall SLOW" in throughput.text({**rep, "kept": kept})
+
+
+def test_throughput_checks_wait_is_judged_at_the_cap_then_and_a_one_at_a_time_queue_is_serialized(
+        env, monkeypatch, tmp_path):
+    """#4461: the cap is 4 today, but a wait queued while 3 checks ran under the then-cap of 3 (the most
+    that ran while the queue stayed non-empty) is at the limit, not idle. A wait behind runs that went one
+    at a time back to back, each start and the grant within SERIAL_S of a run's end, is serialized; one
+    behind fewer runs than ran at once earlier in the same busy period is idle; a peak held for less than
+    SUSTAIN_S (an urgent run past the cap) does not raise the cap then."""
+    from ttp import throughput
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.set_config("checks.test_project_max", 4)
+    d, now = Daemon(p.base), time.time()
+    w1 = now - 6 * 3600   # three runs at the then-cap of 3
+    held = _tp_checks_requeue(p, d, monkeypatch, tmp_path, "at the old cap", w1, 999)
+    for s0 in (w1 - 60, w1 - 50, w1 - 40):
+        _tp_checks_run(p, monkeypatch, s0, 1200)
+    _tp_slot_wait(p, monkeypatch, held, w1, w1 + 700)
+    w2 = now - 3 * 3600   # one run at a time: each starts 3 s after the last one ended, the grant 4 s after
+    serial = _tp_checks_requeue(p, d, monkeypatch, tmp_path, "one at a time", w2, 1300)
+    _tp_checks_run(p, monkeypatch, w2 - 100, 400)
+    _tp_checks_run(p, monkeypatch, w2 + 303, 500)
+    _tp_slot_wait(p, monkeypatch, serial, w2, w2 + 807)
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    ck = _tp_lane(rep, "checks_slots")
+    assert (ck["count"], ck["at_limit"], ck["serialized"], ck["idle"]) == (2, 1, 1, 0), ck
+    assert "serialized 1" in throughput.text({**rep, "kept": [], "changes": []})
+    _, kept = throughput.plan(p.db, p.config(), rep)
+    assert any("1 wait(s) serialized" in k["why"] for k in kept if k["lane"] == "checks_slots"), kept
+    # Two runs at once while another waiter queued, then one run while this one still waits: idle.
+    w3 = now - 2 * 3600
+    other = _tp_task(p, "earlier waiter", w3 - 3600)
+    _tp_slot_wait(p, monkeypatch, other, w3 - 700, w3 + 50)
+    idle = _tp_checks_requeue(p, d, monkeypatch, tmp_path, "fewer than ran", w3, 999)
+    _tp_checks_run(p, monkeypatch, w3 - 800, 820)
+    _tp_checks_run(p, monkeypatch, w3 - 750, 1500)
+    _tp_slot_wait(p, monkeypatch, idle, w3 + 40, w3 + 600)
+    # Two runs at once for long, a third (an urgent run past the cap) for less than SUSTAIN_S: the cap
+    # then was 2, so a wait behind two runs is at the limit.
+    w4 = now - 3600
+    other = _tp_task(p, "earlier waiter at the peak", w4 - 3600)
+    _tp_slot_wait(p, monkeypatch, other, w4 - 800, w4 + 10)
+    peak = _tp_checks_requeue(p, d, monkeypatch, tmp_path, "behind a short peak", w4, 999)
+    _tp_checks_run(p, monkeypatch, w4 - 900, 1500)
+    _tp_checks_run(p, monkeypatch, w4 - 850, 1500)
+    _tp_checks_run(p, monkeypatch, w4 - 300, 200)
+    _tp_slot_wait(p, monkeypatch, peak, w4, w4 + 500)
+    ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
+    assert (ck["count"], ck["at_limit"], ck["serialized"], ck["idle"]) == (4, 2, 1, 1), ck
