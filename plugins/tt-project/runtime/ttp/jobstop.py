@@ -1,11 +1,14 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""End the `ttp detach` jobs of a task that ended without success, and `ttp detach --stop <rc>`.
+"""End the `ttp detach` jobs of a task that ended or handed off, and `ttp detach --stop <rc>`.
 
 A detached job outlives the run that started it, so a task cancelled, failed or out of attempts would
 leave its jobs running: their process group, the device-broker jobs they queued and their `ttp lock`
 slots. Each daemon tick (sweep) ends every still running job of such a task, unless an open task still
-waits on it (its retry_when or on_pass names the job's .rc). end() does it in this order:
+waits on it (its retry_when, on_pass_cmd, on_pass or next_step names the job's .rc or `<run>/<name>`).
+It does the same, across all of the task's runs, for a task that handed off `done` (keeping a job its
+own hand-off names) and for a `blocked` task whose own hand-off names none of its jobs (HANDED_OFF).
+end() does it in this order:
 
 1. SIGSTOP the job's whole process group, so a loop in it cannot resubmit what is ended next.
 2. With the broker CLI (BROKER) on PATH: each `tt-device-mcp run` client process in the group names a
@@ -39,6 +42,7 @@ from __future__ import annotations
 import json
 import os
 import pwd
+import re
 import shutil
 import signal
 import subprocess
@@ -50,6 +54,7 @@ from .db import load_result
 from .project import Project, write_json
 
 ENDED = ("cancelled", "failed", "exhausted")   # task states whose jobs the daemon stops
+HANDED_OFF = ("done", "blocked")                # hand-offs whose jobs the daemon stops unless the hand-off names them
 STOPPABLE = ENDED + ("done",)                   # task states whose jobs `ttp detach --stop` may stop
 OPEN_WAITER_SKIP = ("done", "failed", "cancelled", "exhausted")
 BROKER = "tt-device-mcp"
@@ -405,18 +410,35 @@ def ended_pushes(p: Project) -> list[tuple[Path, int, str]]:
     return out
 
 
-def waited_on(p: Project, rc: Path) -> int | None:
-    """An open task whose retry_when or on_pass names this job's .rc, else None."""
+def names_job(result: dict, rc: Path) -> bool:
+    """Whether this hand-off's retry_when, on_pass_cmd, on_pass or next_step names the job: its .rc, or
+    `<run>/<name>` as `ttp detach --check <dir>/<name>` writes it (a longer name such as <name>2 is not it)."""
     rc = Path(rc)
-    names = (str(rc), f"{rc.parent.name}/{rc.name}")
+    text = " ".join(str(result.get(k) or "") for k in ("retry_when", "on_pass_cmd", "next_step"))
+    text += " " + json.dumps(result.get("on_pass") or "")
+    tail = re.escape(f"{rc.parent.name}/{rc.stem}")
+    return re.search(rf"(?<![\w.-]){tail}(?:\.rc)?(?![\w.-])", text) is not None
+
+
+def waited_on(p: Project, rc: Path) -> int | None:
+    """An open task whose hand-off names this job (names_job), else None."""
+    rc = Path(rc)
     marks = ",".join("?" * len(OPEN_WAITER_SKIP))
     for t in p.db.q(f"SELECT id, result FROM tasks WHERE status NOT IN ({marks}) AND result LIKE ?",
-                    (*OPEN_WAITER_SKIP, f"%{rc.name}%")):
-        r = load_result(t["result"])
-        text = " ".join(str(r.get(k) or "") for k in ("retry_when", "on_pass_cmd")) + json.dumps(r.get("on_pass") or "")
-        if any(n in text for n in names):
+                    (*OPEN_WAITER_SKIP, f"%{rc.parent.name}/{rc.stem}%")):
+        if names_job(load_result(t["result"]), rc):
             return t["id"]
     return None
+
+
+def _live_jobs(run_dir: Path) -> list[Path]:
+    """The .rc of each job in this run's registry that is not closed and still runs."""
+    try:
+        jobs = json.loads((Path(run_dir) / detach.REGISTRY).read_text())
+    except (OSError, ValueError):
+        return []   # a run without detached jobs has no registry
+    return [Path(j["rc"]) for j in (jobs if isinstance(jobs, list) else [])
+            if isinstance(j, dict) and j.get("rc") and j.get("status") not in detach.CLOSED and running(Path(j["rc"]))]
 
 
 def task_of(p: Project, rc: Path) -> dict | None:
@@ -457,10 +479,39 @@ def sweep(p: Project, now: float | None = None) -> list[dict]:
             r = end(p, rc, f"task #{row['id']} is {row['status']}", row["id"])
             if r:
                 out.append(r)
+    out += _sweep_handed_off(p, now)
     for marker, task, state in ended_pushes(p):
         if waited_on(p, marker) is None and (r := end_push(p, marker, f"task #{task} is {state}", task)):
             out.append(r)
     out += serve_requests(p)
+    return out
+
+
+def _sweep_handed_off(p: Project, now: float) -> list[dict]:
+    """Stop the live jobs, across all its runs, of a task that handed off done or blocked: all but those its
+    own hand-off names (a blocked one keeps them all when it names any) or an open task waits on."""
+    out = []
+    marks = ",".join("?" * len(HANDED_OFF))
+    rows = p.db.q(f"SELECT r.dir, t.id, t.status, t.result FROM runs r JOIN tasks t ON t.id=r.task "
+                  f"WHERE t.status IN ({marks}) AND r.dir IS NOT NULL AND COALESCE(r.started, 0)>? ORDER BY t.id",
+                  (*HANDED_OFF, now - SWEEP_DAYS * 86400))
+    tasks: dict[int, tuple[str, dict, list[Path]]] = {}
+    seen = set()
+    for row in rows:
+        if row["dir"] in seen:
+            continue
+        seen.add(row["dir"])
+        if live := _live_jobs(Path(row["dir"])):
+            tasks.setdefault(row["id"], (row["status"], load_result(row["result"]), []))[2].extend(live)
+    for tid, (status, result, jobs) in tasks.items():
+        kept = [rc for rc in jobs if names_job(result, rc)]
+        if status == "blocked" and kept:
+            continue
+        for rc in jobs:
+            if rc in kept or waited_on(p, rc) is not None:
+                continue
+            if r := end(p, rc, f"task #{tid} handed off {status}", tid):
+                out.append(r)
     return out
 
 

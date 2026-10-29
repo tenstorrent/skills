@@ -88,6 +88,10 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    wake carries its log's last 20 lines and first error line. An `on_pass_cmd` is dry-run once when
    its run hands off (`onpassdry.py`, `waiting.on_pass_dry_run`, on by default): a crash hands the
    run back to its own session to fix the command.
+   A task that hands off `done`, or `blocked` with a hand-off naming none of its jobs, has the live
+   `ttp detach` jobs of all its runs stopped by the daemon's jobstop sweep (`jobstop.py`), except a
+   job its retry_when, on_pass_cmd, on_pass or next_step names (its .rc or `<run>/<name>`) or an
+   open task still waits on.
    Before a due wait starts a model turn, the wait-wake gate (`waitgate.py`) decides whether one
    is needed. Must-wake events always wake: an escalation, any wake reason but a timer or "probe
    passed", a changed spec, a probe answer that changed since the last skip, and the cap

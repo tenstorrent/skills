@@ -605,7 +605,7 @@ def _broker_jobs(me):
             {"job_id": 14, "owner": me, "command": "sleep 60", "status": "done", "finished_at": 1}]
 
 
-def _locked_job(p, tid, broker, name="loop", status="running"):
+def _locked_job(p, tid, broker, name="loop", status="running", lock="builddir"):
     """Task tid's run started `ttp detach --lock builddir <name>`, whose loop runs a broker client;
     returns (rc, pgid) once the client runs."""
     run_dir = p.runs / f"stop-{tid}"
@@ -614,7 +614,7 @@ def _locked_job(p, tid, broker, name="loop", status="running"):
            (tid, "worker", "fake", time.time() - 60, "ok", str(run_dir)))
     (broker / "client.pid").unlink(missing_ok=True)
     loop = f"while :; do {shlex.quote(str(broker / 'tt-device-mcp'))} run -- sleep 60; done"
-    r = _ttp_run(p, "detach", "--lock", "builddir", name, "--", "sh", "-c", loop, env={"TTP_RUN_DIR": str(run_dir)})
+    r = _ttp_run(p, "detach", "--lock", lock, name, "--", "sh", "-c", loop, env={"TTP_RUN_DIR": str(run_dir)})
     assert r.returncode == 0, r.stderr
     rc = (run_dir / f"{name}.rc").resolve()
     assert _wait_for_path(broker / "client.pid")
@@ -731,6 +731,112 @@ def test_a_job_an_open_task_still_waits_on_is_not_stopped(env, tmp_path):
         assert len(jobstop.sweep(p)) == 1 and lk.any_free([lk.job_lock(rc)])
     finally:
         _end_group(pgid)
+
+
+def _later_run(p, tid):
+    """A later run of task tid, after the one that started its job."""
+    d = p.runs / f"later-{tid}"
+    d.mkdir(parents=True, exist_ok=True)
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time() - 10, "ok", str(d)))
+
+
+def test_handed_off_1_a_done_tasks_live_job_from_an_earlier_run_is_stopped(env, tmp_path):
+    from ttp import jobstop, locks as lk
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    tid = p.db.add_task("done", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, tid, broker, status="done")
+    try:
+        _later_run(p, tid)
+        p.db.update_task(tid, result=json.dumps({"status": "done", "summary": "finished"}))
+        (r,) = jobstop.sweep(p)
+        assert lk.any_free([lk.job_lock(rc)]) and not jobstop.members(pgid) and r["pgid"] == pgid
+        assert f"task #{tid} handed off done" in rc.with_suffix(".lost").read_text()
+        assert jobstop.sweep(p) == [] and len(_stopped_events(p)) == 1
+    finally:
+        _end_group(pgid)
+
+
+def test_handed_off_2_a_job_the_done_hand_off_names_is_kept(env, tmp_path):
+    from ttp import jobstop, locks as lk
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    tid = p.db.add_task("done", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, tid, broker, status="done")
+    rc2, pgid2 = _locked_job(p, tid, broker, name="loop2", status="done", lock="builddir2")
+    try:
+        # loop2 is unnamed (loop is a prefix of it, never a match): the first pass stops only it.
+        stopped = []
+        for key, val in (("retry_when", f"ttp detach --check {rc.parent}/loop"), ("on_pass_cmd", f"cat {rc}"),
+                         ("next_step", f"tail {rc.parent.name}/loop.rc"), ("on_pass", {"summary": f"{rc.parent.name}/loop"})):
+            p.db.update_task(tid, result=json.dumps({"status": "done", key: val}))
+            stopped += [r["pgid"] for r in jobstop.sweep(p)]
+            assert not lk.any_free([lk.job_lock(rc)]), key
+        assert stopped == [pgid2] and lk.any_free([lk.job_lock(rc2)])
+    finally:
+        _end_group(pgid)
+        _end_group(pgid2)
+
+
+def test_handed_off_3_a_done_tasks_job_an_open_task_waits_on_is_kept(env, tmp_path):
+    from ttp import jobstop, locks as lk
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    tid = p.db.add_task("done", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, tid, broker, status="done")
+    try:
+        p.db.update_task(tid, result=json.dumps({"status": "done", "summary": "finished"}))
+        other = p.db.add_task("waiter", "s", kind="work", tier="light", origin="user")
+        p.db.update_task(other, status="queued", result=json.dumps({"status": "waiting", "retry_when": f"test -e {rc}"}))
+        assert jobstop.sweep(p) == [] and not lk.any_free([lk.job_lock(rc)])
+        p.db.update_task(other, status="cancelled")
+        assert len(jobstop.sweep(p)) == 1 and lk.any_free([lk.job_lock(rc)])
+    finally:
+        _end_group(pgid)
+
+
+def test_handed_off_4_the_run_slash_name_form_counts_as_a_waiter(env, tmp_path):
+    from ttp import jobstop, locks as lk
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    tid = p.db.add_task("cancelled", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, tid, broker, status="cancelled")
+    try:
+        other = p.db.add_task("waiter", "s", kind="work", tier="light", origin="user")
+        p.db.update_task(other, status="queued", result=json.dumps(
+            {"status": "waiting", "retry_when": f"ttp detach --check {rc.parent.name}/{rc.stem}"}))
+        assert jobstop.waited_on(p, rc) == other
+        assert jobstop.sweep(p) == [] and not lk.any_free([lk.job_lock(rc)])
+        # A longer name, another run of the same name or a log file is not this job.
+        for text in (f"{rc.parent.name}/{rc.stem}2", f"x{rc.parent.name}/{rc.stem}", f"{rc.parent.name}/{rc.stem}.log"):
+            p.db.update_task(other, result=json.dumps({"status": "waiting", "retry_when": f"ttp detach --check {text}"}))
+            assert jobstop.waited_on(p, rc) is None, text
+        assert len(jobstop.sweep(p)) == 1 and lk.any_free([lk.job_lock(rc)])
+    finally:
+        _end_group(pgid)
+
+
+def test_handed_off_5_a_blocked_task_keeps_its_jobs_only_when_its_hand_off_names_one(env, tmp_path):
+    from ttp import jobstop, locks as lk
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    tid = p.db.add_task("blocked", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, tid, broker, status="blocked")
+    rc2, pgid2 = _locked_job(p, tid, broker, name="other", status="blocked", lock="builddir2")
+    try:
+        _later_run(p, tid)
+        p.db.update_task(tid, result=json.dumps({"status": "blocked", "question": "which?",
+                                                 "next_step": f"ttp detach --check {rc.parent}/loop"}))
+        assert jobstop.sweep(p) == [], "a blocked hand-off naming one of its jobs keeps them all"
+        assert not lk.any_free([lk.job_lock(rc)]) and not lk.any_free([lk.job_lock(rc2)])
+        p.db.update_task(tid, result=json.dumps({"status": "blocked", "question": "which?"}))
+        assert sorted(r["pgid"] for r in jobstop.sweep(p)) == sorted([pgid, pgid2])
+        assert lk.any_free([lk.job_lock(rc)]) and lk.any_free([lk.job_lock(rc2)])
+        assert f"task #{tid} handed off blocked" in rc.with_suffix(".lost").read_text()
+    finally:
+        _end_group(pgid)
+        _end_group(pgid2)
 
 
 def test_a_restart_mid_stop_finishes_it_on_the_next_pass(env, tmp_path):
