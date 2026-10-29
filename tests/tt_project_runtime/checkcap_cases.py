@@ -1426,15 +1426,17 @@ def test_web_feed_shows_the_host_test_and_build_slot_use_ttp_status_prints(env, 
 
 
 def _fake_proc(root, forks: int, procs: dict):
-    """A /proc with `processes forks` in stat and pid -> (cgroup unit or None, cmdline)."""
+    """A /proc with `processes forks` in stat and pid -> (cgroup unit or None, cmdline[, parent pid])."""
     import shutil
     if root.exists():
         shutil.rmtree(root)
     root.mkdir()
     (root / "stat").write_text(f"cpu  1 2 3\nprocesses {forks}\nprocs_running 1\n")
-    for pid, (unit, cmd) in procs.items():
+    for pid, (unit, cmd, *pp) in procs.items():
         d = root / str(pid)
         d.mkdir()
+        if pp:
+            (d / "stat").write_text(f"{pid} (some (odd) name) S {pp[0]} 1 1 0\n")
         (d / "cgroup").write_text(f"0::/user.slice/app.slice/{unit}.service\n" if unit else "0::/init.scope\n")
         (d / "cmdline").write_bytes(cmd.replace(" ", "\0").encode())
 
@@ -1474,15 +1476,148 @@ def test_churn_watch_names_the_owning_project_only_when_the_fork_rate_stays_high
     # The daemon raises it only in the owning project's daemon; the watch never signals anything.
     seen = []
     for name in ("alpha", "beta"):
-        d = SimpleNamespace(p=SimpleNamespace(name=name), observe=lambda *a, **k: seen.append((a, k)))
+        d = SimpleNamespace(p=SimpleNamespace(name=name, logs=tmp_path / name), observe=lambda *a, **k: seen.append((a, k)))
         d._churn = SimpleNamespace(step=lambda now: obs_alpha)
         obs_alpha = {"unit": service.unit_name(SimpleNamespace(name="alpha")), "text": "x", "severity": "normal",
                      "key": "process-churn:tt-project-alpha"}
         daemon.Daemon.check_churn(d)
     assert len(seen) == 1 and seen[0][1]["key"] == "process-churn:tt-project-alpha"
+    assert (tmp_path / "alpha" / "churn.jsonl").exists() and not (tmp_path / "beta").exists(), "only the owner logs it"
     import pathlib
     src = pathlib.Path(churnwatch.__file__).read_text()
     assert "os.kill(" not in src and "import signal" not in src, "read-only: it signals nothing"
+
+
+def _churn_episode(root, w, parent_cmd="bash run-tests.sh --token s3cr3t"):
+    """Drive w through a churn episode: a baseline, then new processes of alpha and beta under parents
+    50 (parent_cmd), 60 (gone before it is read) and 70 (a make). Returns the observation."""
+    procs = {1: (None, "init"), 50: (None, parent_cmd), 70: (None, "make -j8 all")}
+    _fake_proc(root, 1000, procs)
+    w.step(0)
+    obs, n, pid = None, 1000, 100
+    for t in (30, 60, 90):
+        n += 30 * 900
+        for _ in range(4):
+            pid += 1
+            procs[pid] = ("tt-project-alpha", "python -c pass", 50)
+        procs[pid + 500] = ("tt-project-beta", "sh -c true", 70)
+        procs[pid + 600] = (None, "true", 60)
+        _fake_proc(root, n, procs)
+        obs = w.step(t) or obs
+    return obs
+
+
+def test_churn_event_logs_rate_threshold_units_and_redacted_top_parents(env, tmp_path, monkeypatch):
+    import json
+    from ttp import churnwatch
+    monkeypatch.setenv("TTP_CHURN_FORKS_S", "100")
+    monkeypatch.setenv("TTP_CHURN_WINDOW_S", "60")
+    root = tmp_path / "proc"
+    obs = _churn_episode(root, churnwatch.Watch(root))
+    assert obs and obs["unit"] == "tt-project-alpha"
+    assert obs["units"] == {"tt-project-alpha": 4, "tt-project-beta": 1}, "new processes per unit, not only the owner"
+    assert obs["parents"] == [{"cmd": "bash run-tests.sh --token ***", "count": 4},
+                              {"cmd": "make -j8 all", "count": 1}], "top parents by count; a gone parent is skipped"
+    f, cache = tmp_path / "logs" / churnwatch.FILE, {}
+    assert churnwatch.record(f, obs, 1_800_000_000, cache, print)
+    line = json.loads(f.read_text())
+    assert set(line) >= {"ts", "rate", "threshold", "units", "parents"}
+    assert line["rate"] == 900 and line["threshold"] == 100 and line["units"] == obs["units"]
+    assert line["parents"] == obs["parents"] and "s3cr3t" not in f.read_text()
+    assert re.search(r"T\d\d:\d\d:\d\d[+-]\d\d:\d\d$", line["ts"]), "ISO time with its offset"
+    s = churnwatch.summary(f, days=7, now=1_800_000_000 + 3600)
+    assert s["events"] == 1 and s["units"]["tt-project-alpha"] == 4 and s["parents"][0]["count"] == 4
+    assert churnwatch.summary(f, days=7, now=1_800_000_000 + 8 * 86400)["events"] == 0, "older than 7 days"
+    assert churnwatch.summary(tmp_path / "none.jsonl")["events"] == 0
+    # The top N only, at most TOP_PARENTS.
+    many = {"unit": "u", "parents": [{"cmd": f"p{i}", "count": i} for i in range(9)]}
+    assert len(churnwatch.entry(many)["parents"]) == churnwatch.TOP_PARENTS
+
+
+def test_churn_log_redacts_secret_looking_arguments_and_cuts_long_command_lines():
+    from ttp import churnwatch
+    for raw, gone, kept in (
+            ("tool --token abc1 --api-key=abc2 --keep-going -v", ("abc1", "abc2"), "--keep-going -v"),
+            ("x --password=abc3 --secret abc4 --key abc5", ("abc3", "abc4", "abc5"), "x --password=***"),
+            ("env GITHUB_TOKEN=abc6 my_secret=abc7 DB_PASSWORD=abc8 SSH_KEY=abc9 PATH=/bin run",
+             ("abc6", "abc7", "abc8", "abc9"), "PATH=/bin run"),
+            ("curl -H Authorization: Bearer abcA https://h/x", ("abcA",), "https://h/x"),
+            ("curl -H authorization:token abcB -H bearer abcC", ("abcB", "abcC"), "curl -H"),
+            ("git clone https://me:abcD@h.example/r.git", ("abcD",), "https://me:***@h.example/r.git"),
+            ("python -m pytest -k key_test", (), "python -m pytest -k key_test")):
+        out = churnwatch.clean(raw)
+        assert not any(g in out for g in gone) and kept in out, (raw, out)
+    long = "x " + "a" * 500 + " --token zzzz"
+    assert len(churnwatch.clean(long)) == churnwatch.CMD_MAX and "zzzz" not in churnwatch.clean(long)
+    # Redaction runs before the cut: a secret straddling char 200 leaves no prefix of itself.
+    edge = "y" * 190 + " --token SECRETVALUE"
+    assert "SECR" not in churnwatch.clean(edge)
+    assert churnwatch.entry({"parents": [{"cmd": "a --token q " + "b" * 300, "count": 1}]})["parents"][0]["cmd"] \
+        == churnwatch.clean("a --token q " + "b" * 300)
+
+
+def test_churn_log_rotates_past_its_cap_and_keeps_one_old_file(tmp_path, monkeypatch):
+    from ttp import churnwatch
+    monkeypatch.setattr(churnwatch, "MAX_BYTES", 600)
+    f, obs = tmp_path / "churn.jsonl", {"unit": "u", "rate": 900, "threshold": 800, "units": {"u": 3},
+                                        "parents": [{"cmd": "c" * 150, "count": 3}]}
+    for i in range(12):
+        assert churnwatch.record(f, obs, 1_800_000_000 + i, {}, print)
+        assert f.stat().st_size <= 600
+    assert (tmp_path / "churn.jsonl.1").exists() and sorted(p.name for p in tmp_path.iterdir()) == \
+        ["churn.jsonl", "churn.jsonl.1"], "one old generation only"
+    kept = sum(len(g.read_text().splitlines()) for g in tmp_path.iterdir())
+    assert kept >= 2 and churnwatch.summary(f, now=1_800_000_100)["events"] == kept, "both files count"
+
+
+def test_churn_log_write_failure_never_raises_and_warns_once(tmp_path):
+    from ttp import churnwatch
+    blocker = tmp_path / "logs"
+    blocker.write_text("a file where the folder should be")
+    told, cache, obs = [], {}, {"unit": "u", "rate": 900, "threshold": 800}
+    for _ in range(3):
+        assert churnwatch.record(blocker / churnwatch.FILE, obs, None, cache, told.append) is False
+    assert len(told) == 1 and "churn log" in told[0]
+    # A warn that itself fails does not raise either; a success re-arms the warning.
+    assert churnwatch.record(blocker / churnwatch.FILE, obs, None, {}, lambda m: 1 / 0) is False
+    assert churnwatch.record(tmp_path / "ok" / churnwatch.FILE, obs, None, cache, told.append) and not cache["failed"]
+    assert churnwatch.record(blocker / churnwatch.FILE, {"unit": object()}, None, cache, told.append) is False
+    assert len(told) == 2
+
+
+def test_churn_log_has_no_line_without_churn_and_a_line_when_the_observation_is_muted(env, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from ttp import churnwatch, daemon, service
+    monkeypatch.setenv("TTP_CHURN_FORKS_S", "100")
+    monkeypatch.setenv("TTP_CHURN_WINDOW_S", "60")
+    root, logs = tmp_path / "proc", tmp_path / "logs"
+    raised = []
+
+    def muted_observe(*a, **k):   # a mute or a dedup drops it inside observe
+        raised.append(k["key"])
+        return None
+    d = SimpleNamespace(p=SimpleNamespace(name="alpha", logs=logs), observe=muted_observe)
+    d._churn = churnwatch.Watch(root)
+    clock = [1000.0]
+    monkeypatch.setattr(daemon.time, "time", lambda: clock[0])
+    _fake_proc(root, 1000, {1: (None, "init")})
+    for t in range(6):   # a calm host: a low fork rate
+        clock[0] += 31
+        _fake_proc(root, 1000 + t * 10, {1: (None, "init")})
+        daemon.Daemon.check_churn(d)
+    assert not logs.exists() and not raised, "no churn, no line"
+    # Churn owned by alpha: one line, though the observation is muted.
+    w = churnwatch.Watch(root)
+    obs = _churn_episode(root, w)
+    assert obs and obs["unit"] == service.unit_name(d.p)
+    d._churn, d._churn_checked = SimpleNamespace(step=lambda now: obs), 0.0
+    daemon.Daemon.check_churn(d)
+    lines = (logs / churnwatch.FILE).read_text().splitlines()
+    assert len(lines) == 1 and raised == ["process-churn:tt-project-alpha"]
+    # A churn event owned by another project leaves no line here.
+    d._churn, d._churn_checked = SimpleNamespace(step=lambda now: {**obs, "unit": "tt-project-beta"}), 0.0
+    daemon.Daemon.check_churn(d)
+    assert len((logs / churnwatch.FILE).read_text().splitlines()) == 1
 
 
 def test_a_workers_build_cap_is_no_core_request_of_its_detached_job_but_a_command_s_own_makeflags_is(env, tmp_path):

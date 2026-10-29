@@ -948,7 +948,9 @@ queues behind routine work; nothing running is interrupted:
   -j above k, an unlimited `make -j` or a ninja with no -j is refused. `ttp status` and the web app's feed show both
   pools' use. Each daemon
   watches the host's fork rate (/proc/stat): above `checks.churn_forks_s` (800/s) for `checks.churn_window_s`
-  (120 s), the owning project's daemon raises one `process-churn:<unit>` observation. It never stops a process. A
+  (120 s), the owning project's daemon raises one `process-churn:<unit>` observation and, muted or not, appends the
+  event (rate, threshold, new processes per unit, top 5 parent command lines, secrets redacted) to
+  `state/logs/churn.jsonl`, rotated to `churn.jsonl.1` past 1 MB. It never stops a process. A
   `ttp checks` or push inside a check command does not wait for its parent's slot. Checks that
   gate a push to the push branch (the push queue's batches and `ttp push`) hold the push lock, so
   they never queue behind task checks: each push branch has one priority slot of its own beyond the

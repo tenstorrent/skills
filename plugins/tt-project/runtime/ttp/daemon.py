@@ -5801,6 +5801,9 @@ class Daemon:
         w = self.__dict__.setdefault("_churn", churnwatch.Watch())
         obs = w.step(now)
         if obs and obs["unit"] == service.unit_name(self.p):
+            # Logged before observe, so a muted or deduplicated observation still leaves its line.
+            churnwatch.record(self.p.logs / churnwatch.FILE, obs, now, self.__dict__.setdefault("_churn_log", {}),
+                              lambda m: log(self.p, m))
             self.observe("daemon:process-churn", obs["text"], obs["severity"], whole=True, key=obs["key"])
 
     def check_slot_wait(self, every_s: float = 60) -> None:
