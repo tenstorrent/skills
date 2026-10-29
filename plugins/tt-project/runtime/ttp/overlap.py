@@ -437,9 +437,12 @@ def base_files(p, base: str) -> list[str]:
 
 
 def symbols(spec: str) -> list[str]:
-    """The symbols `spec` names (`name()`, or a backticked identifier with `_` or `.`), by last part."""
+    """The symbols `spec` names (`name()`, or a backticked identifier with `_` or `.`), by last part, in
+    the order the spec names them."""
     text = re.sub(r"\b[a-z]+://\S+", " ", spec or "")
-    names = _CALL.findall(text) + [t for t in _TICK.findall(text) if "_" in t or "." in t]
+    found = [(m.start(), m.group(1)) for m in _CALL.finditer(text)]
+    found += [(m.start(), m.group(1)) for m in _TICK.finditer(text) if "_" in m.group(1) or "." in m.group(1)]
+    names = [n for _, n in sorted(found)]
     out = [n.rsplit(".", 1)[-1] for n in names if not settled.FILE_RE.fullmatch(n)]
     return list(dict.fromkeys(n for n in out if len(n) >= 4))[:MAX_SYMBOLS]
 
