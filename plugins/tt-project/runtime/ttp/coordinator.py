@@ -2604,6 +2604,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         notes.append(f"charter_update: applied on the user's yes in message "
                                      f"#{', #'.join(map(str, ok['messages']))}"
                                      + (" to the exception it names" if ok.get("companion")
+                                        else f" to ask #{ok['ask']}" if ok.get("from_ask")
                                         else ", recorded when it first failed"))
                     msg += extra
                     if (quote and target.lower().startswith("restriction")
@@ -5508,6 +5509,58 @@ def _approved_text_file(p: Project, rec: dict) -> str:
     return str(path.relative_to(p.root))
 
 
+NO_APPROVAL = ("No approval of the user's is on record for this change. Any one fixes it: the user's own yes in "
+               "this turn; a resolved yes ask naming this section, the `quote` or `replaces` heading and any new "
+               "text (within coordinator.charter_approval_days); or `over` naming what ended the restriction and when")
+
+
+_REMOVAL_ASK_RE = re.compile(r"\b(?:remov|retir|drop|delet|lift|strik|end\b|ended)", re.I)   # an ask to remove
+
+
+def _ask_charter_approval(p: Project, section: str, quote: str, replaces: str, text: str, days: float,
+                          heading: str | None) -> dict | None:
+    """An ask the user resolved with a clear yes (unblock.RESOLVED_KEY, prguard.clear_yes) whose question
+    names this change: the section, the `quote` or the heading `replaces` resolves to (`heading`), and
+    any new text, each up to case and whitespace (_loose); a removal (no text) only from an ask to
+    remove (_REMOVAL_ASK_RE), never one to reword the item. Only the user's own verbatim words that
+    resolved it count (_users_own, relay.split: never a relayer's context, a finding or the harness's
+    own message), sent after the ask and within `days`. Recorded once as an approval of that change
+    (`ask` set, `from_ask`), so it is used once like any other; None if no such ask, or it is recorded."""
+    db = p.db
+    if replaces and not heading:
+        return None
+    name = _loose(_DATED.sub("", section))
+    wants = [name[:-1] if name.endswith("s") else name] + [_loose(x) for x in (quote, heading, text) if x]
+    done = {r.get("ask") for r in db.kv(CHARTER_APPROVALS_KEY, []) or [] if r.get("from_ask")}
+    resolved = db.kv(unblock.RESOLVED_KEY, {}) or {}
+    for aid in sorted((int(k) for k in resolved), reverse=True):
+        r = resolved[str(aid)]
+        if aid in done or r.get("auto") or r.get("landed"):
+            continue
+        row = db.one("SELECT text FROM messages WHERE id=? AND kind='ask' AND direction='out'", (aid,))
+        asked = _loose(_ask_question((row or {}).get("text") or ""))
+        if not row or not all(w and w in asked for w in wants) or not (text or _REMOVAL_ASK_RE.search(asked)):
+            continue
+        said = [m for m in _users_own(db, [int(m) for m in r.get("messages") or []]) if m > aid]
+        rows = db.q(f"SELECT ts, text, context FROM messages WHERE id IN ({','.join('?' * len(said))})",
+                    said) if said else []
+        words = " ".join(relay.split(m["text"], m["context"])[0] for m in rows).strip()
+        if not words or not prguard.clear_yes(words) or time.time() - max(m["ts"] for m in rows) > days * 86400:
+            continue
+        rec = {"section": _ws(section).lower(), "quote": _ws(quote), "replaces": _ws(replaces.lstrip("#")),
+               "text": text, "sha": hashlib.sha256(_ws(text).encode()).hexdigest(),
+               "id": hashlib.sha256(f"ask{aid}{said}{text}".encode()).hexdigest()[:12], "messages": said,
+               "ask": aid, "from_ask": True, "candidates": [heading] if heading else [], "failed": "",
+               "ts": max(m["ts"] for m in rows), "used": None, "guard": CHARTER_GUARD_VERSION}
+        with db.tx():
+            have = db.kv(CHARTER_APPROVALS_KEY, []) or []
+            if any(x.get("from_ask") and x.get("ask") == aid for x in have):
+                return None
+            db.set_kv(CHARTER_APPROVALS_KEY, (have + [rec])[-20:])
+        return rec
+    return None
+
+
 def _charter_approval(p: Project, section: str, quote: str, replaces: str, text: str) -> tuple[dict | None, str]:
     """The recorded, unused, unexpired approval (see _record_charter_approval) this change matches
     exactly: same section, same `quote` or the same section `replaces` names (by any of the names
@@ -5516,8 +5569,6 @@ def _charter_approval(p: Project, section: str, quote: str, replaces: str, text:
     temporary exception loosens: that record, with this text and `companion` set (not used up).
     Else (None, why none counts)."""
     have = p.db.kv(CHARTER_APPROVALS_KEY, []) or []
-    if not have:
-        return None, "No approval of the user's is on record for this change"
     try:
         days = float(p.config()["coordinator"].get("charter_approval_days", CHARTER_APPROVAL_DAYS))
     except (KeyError, TypeError, ValueError):
@@ -5526,7 +5577,7 @@ def _charter_approval(p: Project, section: str, quote: str, replaces: str, text:
     sections = charter_sections(p.charter_path.read_text())
     hits = _replaces_hits(sections, replaces) if replaces else []
     now_name = " ".join(sections[hits[0]][0][3:].split()) if len(hits) == 1 else None
-    why, found = "No approval of the user's is on record for this change (same section and quote or replaces)", ""
+    why, found = NO_APPROVAL, ""
     sha = hashlib.sha256(_ws(text).encode()).hexdigest()
     for rec in reversed(have):   # newest first; a refusal says why the newest one for this target fails
         # Adding the very text the user approved removes nothing: it matches in any section (a change
@@ -5550,6 +5601,9 @@ def _charter_approval(p: Project, section: str, quote: str, replaces: str, text:
             found = found or f"The user's yes in message #{ids} expired after {days:g} days; ask again"
         else:
             return rec, ""
+    if (quote or replaces) and (
+            rec := _ask_charter_approval(p, section, quote, replaces, text, days, now_name)):
+        return rec, ""
     companion = (_companion_exception(p.charter_path.read_text(), quote, text, have)
                  if _DATED.sub("", _ws(section)).lower().startswith("restriction") else [])
     changed = _changed_sentences(quote, text)
@@ -5594,12 +5648,12 @@ def _use_charter_approval(p: Project, rid: str, key: str | None) -> None:
 # with it: a test fails when the source of CHARTER_GUARD_FUNCS no longer has CHARTER_GUARD_PIN's
 # sha256. A user's change that failed under an older guard for another reason than the guard
 # (reraise_charter_changes) is then raised at once.
-CHARTER_GUARD_VERSION = 10
+CHARTER_GUARD_VERSION = 11
 CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_overlaps", "_on_object", "_quote_hits",
                        "_item_quote_hits", "_items", "_norm", "_may_lift", "_lifts_item", "_companion_clause",
                        "_ref_ids", "_companion_exception", "_changed_sentences", "_quoted_news",
-                       "_charter_approval")
-CHARTER_GUARD_PIN = (10, "d809223c8f6896a16fec6e32216626ab581b5446a098ea684e8ce6762a448195")
+                       "_charter_approval", "_ask_charter_approval")
+CHARTER_GUARD_PIN = (11, "393d5bb83794c24de8ab530bee63e339b283a6558f62e6397cf678756d1ae678")
 CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
 
 

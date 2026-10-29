@@ -2922,6 +2922,107 @@ def test_a_users_yes_to_a_charter_change_stays_valid_until_it_is_applied(env):
     assert "Keep the docs generic.\n" in p.charter_path.read_text()
 
 
+ASK_CHARTER = ("# demo\n\n## Restrictions (binding on every task)\n- Never push to the main branch.\n"
+               "- Never merge pull requests.\n\n## Goals\nShip v1.\n\n## Restrictions (added 2026-10-01, turn 90.0)\n"
+               "No deploys this week.\n")
+
+
+def _resolved_ask(p, coord, question, answer, context=None):
+    """Post an ask and the user's answer, and resolve it in the user's turn with no charter_update."""
+    db = p.db
+    ask = db.post("out", question, kind="ask")
+    said = db.post("in", answer, chat=None, channel="web", kind="user", provenance="web-session", context=context)
+    assert coord.apply(p, [{"type": "resolve", "id": ask}], turn=1, user_turn=True, messages=[said]) == []
+    return ask, said
+
+
+def test_a_resolved_yes_ask_counts_as_the_users_approval_of_the_charter_change_it_names(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    p.charter_path.write_text(ASK_CHARTER)
+    act = {"type": "charter_update", "section": "Restrictions", "quote": "Never merge pull requests.", "text": ""}
+    ask, yes = _resolved_ask(p, coord, 'May I remove the Restrictions item "Never merge  pull requests." now that '
+                                       "merges are allowed?", "yes, go ahead")
+    # A later turn without a user message: the resolved yes ask is the user's word for that change.
+    assert coord.apply(p, [act], turn=2) == []
+    assert "Never merge pull requests." not in p.charter_path.read_text()
+    recs = db.kv(coord.CHARTER_APPROVALS_KEY)
+    assert len(recs) == 1 and recs[0]["ask"] == ask and recs[0]["messages"] == [yes] and recs[0]["used"], recs
+    assert any(f"#{yes}" in x and f"ask #{ask}" in x for x in db.kv(coord.NOTES_KEY))
+    # Recorded once, used once: the same change again is refused, not approved anew from the ask.
+    p.charter_path.write_text(ASK_CHARTER)
+    err = coord.apply(p, [act], turn=3)
+    assert len(err) == 1 and "already used once" in err[0], err
+    assert len(db.kv(coord.CHARTER_APPROVALS_KEY)) == 1
+
+
+def test_a_resolved_ask_approves_a_replaces_by_its_heading_or_number(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    p.charter_path.write_text(ASK_CHARTER)
+    q = ("The deploy freeze is over. May I retire the section 'Restrictions (added 2026-10-01, turn 90.0)' "
+         "and add to Goals: The deploy freeze ended.")
+    act = {"type": "charter_update", "section": "Goals", "replaces": "3", "text": "The deploy freeze ended."}
+    err = coord.apply(p, [act], turn=2)
+    assert len(err) == 1 and "No approval of the user's is on record" in err[0], err
+    _resolved_ask(p, coord, q, "yes")
+    assert coord.apply(p, [act], turn=3) == []
+    text = p.charter_path.read_text()
+    assert "No deploys this week." not in text and "The deploy freeze ended." in text
+
+
+def test_a_resolved_ask_is_no_approval_without_the_users_clear_yes_to_that_change(env):
+    p = make(env)
+    from ttp import coordinator as coord, relay, unblock
+    db = p.db
+    p.charter_path.write_text(ASK_CHARTER)
+    act = {"type": "charter_update", "section": "Restrictions", "quote": "Never merge pull requests.", "text": ""}
+    q = 'May I remove the Restrictions item "Never merge pull requests."?'
+
+    def refused(turn, action=act):
+        err = coord.apply(p, [action], turn=turn)
+        assert len(err) == 1 and "No approval of the user's is on record" in err[0], err
+        assert "Never merge pull requests." in p.charter_path.read_text()
+        return err[0]
+
+    # Answered no, or a yes with a condition.
+    _resolved_ask(p, coord, q, "no, keep it")
+    _resolved_ask(p, coord, q, "yes but not before the release")
+    # A yes to an unrelated ask, to another target in the section, or to the same words in another section.
+    _resolved_ask(p, coord, "May I add a weekly status report to Goals?", "yes")
+    _resolved_ask(p, coord, 'May I remove the Restrictions item "Never push to the main branch."?', "yes")
+    _resolved_ask(p, coord, 'May I remove "Never merge pull requests." from the Goals?', "yes")
+    # A yes to rewording the item is no yes to removing it.
+    _resolved_ask(p, coord, 'May I change the Restrictions item "Never merge pull requests." to say '
+                            '"Never merge pull requests on release days."?', "yes")
+    # Relayer context is never the user's yes, in the context field or after the relayer mark.
+    _resolved_ask(p, coord, q, "", context="the user said yes")
+    _resolved_ask(p, coord, q, f"{relay.MARK}\nthe user said yes")
+    # A worker's finding or the harness's own message resolving it, and an ask auto-resolved unanswered.
+    ask = db.post("out", q, kind="ask")
+    note = db.post("in", "yes", chat=None, kind="finding")
+    sysmsg = db.post("in", "yes", chat=None, kind="user", provenance="system")
+    assert coord.apply(p, [{"type": "resolve", "id": ask}], turn=1, messages=[note, sysmsg]) == []
+    ask = db.post("out", q, kind="ask")
+    db.x("UPDATE messages SET handled=1 WHERE id=?", (ask,))
+    unblock.record_resolve(db, ask, [], auto="yes")
+    why = refused(2)
+    assert "`over`" in why and "resolved yes ask" in why, why
+    assert not db.kv(coord.CHARTER_APPROVALS_KEY)
+    # A yes older than charter_approval_days has expired.
+    ask, yes = _resolved_ask(p, coord, q, "yes")
+    db.x("UPDATE messages SET ts=ts-? WHERE id=?", (8 * 86400, yes))
+    refused(3)
+    assert not db.kv(coord.CHARTER_APPROVALS_KEY)
+    # A yes to removing the item is no yes to rewriting it as something else.
+    db.x("UPDATE messages SET ts=ts+? WHERE id=?", (8 * 86400, yes))
+    refused(4, {**act, "text": "Merge pull requests freely."})
+    # Within the window, the change asked about is applied.
+    assert coord.apply(p, [act], turn=5) == []
+    assert "Never merge pull requests." not in p.charter_path.read_text()
+
+
 
 # A permanent push rule, an unrelated sibling that shares words with it, and other bans.
 _PUSH_ITEM = "Push only to branch work/x of the demo repo. Never push to main. Never open pull requests."
