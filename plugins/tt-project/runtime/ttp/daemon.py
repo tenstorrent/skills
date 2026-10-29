@@ -1372,6 +1372,7 @@ class Daemon:
         self._run_step(self.update_gates)
         self._run_step(lambda: coord.expire_asks(self.p, hold=any(g.level == "red" for g in self.gates.values())),
                        "expire_asks")
+        self._run_step(self.check_ask_timer)
         self._run_step(lambda: scr.expire_mutes(self.p.db, where=self.p), "expire_mutes")
         self._run_step(lambda: scr.end_task_mutes(self.p.db, where=self.p), "end_task_mutes")
         self._run_step(self.check_mute_ends)
@@ -5236,6 +5237,25 @@ class Daemon:
             named[key] = sorted(set(named.get(key) or ()) | {s["name"] for s, _ in gaps})
             db.set_kv(SCHEDULE_GAP_KEY, named)
             self.observe("daemon:schedule-gap", text, "normal", whole=True, key=key)
+
+    def check_ask_timer(self) -> list[str]:
+        """Model-free check of the ask timer (askauto.check): an open ask with no stored default, or one
+        past its timeout and still open, wakes the coordinator once per change of that set (kv
+        askauto.FLAGS_KEY); an empty set clears it so a new problem is raised again. Returns the set."""
+        from . import askauto
+        db = self.p.db
+        flags = askauto.check(db, self.cfg, time.time())
+        if flags == (db.kv(askauto.FLAGS_KEY) or []):
+            return flags
+        db.set_kv(askauto.FLAGS_KEY, flags)
+        if flags:
+            text = ("Ask timer check: " + "; ".join(flags) + ". Every ask should store its default when "
+                    "filed and resolve to it after coordinator.ask_timeout_h; an exempt one stays open. "
+                    "Resolve each stuck ask yourself (its recommendation), and file an upstream note if the "
+                    "timer is at fault.")
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                 (time.time(), "daemon", "observation", "normal", text[:1500], "queued"))
+        return flags
 
     def sweep_schedule_gaps(self) -> int:
         """Close each open schedule-gap issue once every schedule it names has run since its last sighting

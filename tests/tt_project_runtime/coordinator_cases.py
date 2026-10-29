@@ -4538,18 +4538,18 @@ def _restricted(p, item=_RQ):
 _OWN_ACCESS = {"blocking": "access", "not_own_call": "the user set this themself and only they can change it"}
 
 
-def test_an_ask_needs_a_blocking_reason_and_never_gets_a_default(env):
+def test_an_ask_needs_a_blocking_reason_and_stores_its_default(env):
     p = make(env)
-    from ttp import coordinator as coord
+    from ttp import askauto, coordinator as coord
     for fields in ({}, {"blocking": "preference"}, {"blocking": ""}):
         problems, ask = _ask(p, **fields)
         assert problems and "`blocking` must be one of" in problems[0], fields
         assert ask is None, "a rejected ask reached the user"
     problems, ask = _ask(p, "Option A or B for the account?", blocking="access", recommendation="use option A")
     assert problems == [] and ask["text"].startswith("Option A or B for the account?")
-    assert p.db.kv(coord.ASK_DEFAULTS_KEY, {}) == {}, "a new ask was registered to fall back on a timer"
-    assert coord.expire_asks(p, now=time.time() + 1000 * 3600) == []
-    assert f"ask #{ask['id']} (waits for the user)" in coord.digest(p, {}, [], [])
+    assert p.db.kv(coord.ASK_DEFAULTS_KEY, {}) == {str(ask["id"]): askauto.entry("access", "use option A")}
+    assert "Non-blocking: acts on use option A at " in ask["text"] and ask["text"].endswith("unless answered.")
+    assert f"ask #{ask['id']} (non-blocking; acts on use option A at " in coord.digest(p, {}, [], [])
     least = {"least_disruptive": "a canary on one box breaks the no-shared-machines restriction"}
     for reason in coord.BLOCKING_REASONS:
         extra = {**least, "classify": "irreversible" if reason == "irreversible" else "restriction_change"} \
@@ -4804,21 +4804,138 @@ def test_a_restriction_ask_must_name_the_least_disruptive_way_forward(env):
 
 
 
-def test_a_blocking_ask_shows_its_recommendation_but_never_applies_it(env):
+def test_an_ask_granting_money_shows_its_recommendation_but_never_applies_it(env):
     p = make(env)
     from ttp import coordinator as coord
     from ttp.web import state_payload
     problems, ask = _ask(p, blocking="spend", recommendation="raise the daily cap to $150")
     assert problems == [] and "My recommendation: raise the daily cap to $150" in ask["text"]
+    assert "waits for the user (its recommendation needs spend only the user holds)" in ask["text"]
     assert ask["id"] in [m["id"] for m in p.db.unread_for_chat("c1", 0, "info")], "the relay would not show it"
     shown = [m["text"] for m in state_payload(p, p.db)["attention"] if m["id"] == ask["id"]]
     assert shown and "raise the daily cap to $150" in shown[0], "the web app would not show it"
-    assert p.db.kv(coord.ASK_DEFAULTS_KEY, {}) == {}
+    assert str(ask["id"]) in p.db.kv(coord.ASK_DEFAULTS_KEY, {})
     assert coord.expire_asks(p, now=time.time() + 1000 * 3600) == []
     assert p.db.one("SELECT handled FROM messages WHERE id=?", (ask["id"],))["handled"] == 0
     problems, _ = _ask(p, " option a or b? ", blocking="spend", recommendation="something else")
     assert problems and "already asked" in problems[0]
 
+
+
+def test_an_unanswered_ask_resolves_to_its_recommendation_at_the_deadline(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    q = "Should the nightly benchmark run on the larger runner pool or on the smaller runner pool?"
+    problems, ask = _ask(p, q, blocking="access", recommendation="use option A", severity="normal")
+    assert problems == []
+    assert coord.expire_asks(p, now=ask["ts"] + 0.5 * 3600 - 1) == []
+    assert coord.expire_asks(p, now=ask["ts"] + 0.5 * 3600) == [ask["id"]]
+    assert p.db.one("SELECT handled FROM messages WHERE id=?", (ask["id"],))["handled"] == 1
+    told = p.db.one("SELECT * FROM messages WHERE kind='alert' ORDER BY id DESC LIMIT 1")
+    floor = p.config()["notify"]["chat_min_severity"]
+    assert "went with my recommendation: use option A" in told["text"] and "30 min" in told["text"]
+    assert told["severity"] == max(("low", floor), key=lambda n: coord.SEVERITY_RANK[n]), "told at low"
+    [ev] = p.db.q("SELECT * FROM events WHERE kind='ask_timeout'")
+    assert "auto-resolved to its default: use option A" in ev["text"] and "Act on it now" in ev["text"]
+    mem = p.memory_dir.glob("*.md")
+    assert any("auto-resolved to its default: use option A" in f.read_text() for f in mem), "no decision memory"
+    assert coord.expire_asks(p, now=ask["ts"] + 99 * 3600) == [], "an ask expired twice"
+    problems, again = _ask(p, q, blocking="access", recommendation="use option B")
+    assert problems and "auto-resolved unanswered" in " ".join(problems), "a re-ask of a resolved ask was sent"
+    assert again["id"] == ask["id"]
+
+
+def test_a_restriction_ask_keeps_the_restriction_as_written_at_the_timeout(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    way = "a canary on one box breaks the no-shared-machines restriction"
+    _, loosen = _ask(p, "Lift the shared-machine ban?", blocking="restriction", classify="restriction_change",
+                     least_disruptive=way, recommendation="lift it for one run")
+    assert "acts on keep the restriction as written" in loosen["text"]
+    assert coord.expire_asks(p, now=loosen["ts"] + 3600) == [loosen["id"]]
+    told = p.db.one("SELECT text FROM messages WHERE kind='alert' ORDER BY id DESC LIMIT 1")["text"]
+    assert "the restriction stays as written" in told and "lift it for one run" in told
+    ev = p.db.one("SELECT text FROM events WHERE kind='ask_timeout'")["text"]
+    assert "Do not act on its recommendation" in ev
+    assert "lift it for one run" not in p.charter_path.read_text()
+
+
+def test_the_ask_deadline_shows_in_status_the_web_app_and_the_digest(env):
+    p = make(env)
+    from ttp import coordinator as coord, timefmt
+    from ttp.cli import status_text
+    from ttp.web import state_payload
+    _, ask = _ask(p, blocking="access", recommendation="use option A")
+    at = timefmt.short(ask["ts"] + 0.5 * 3600, p)
+    line = f"acts on use option A at {at} unless answered"
+    assert line in ask["text"]
+    assert line in coord.digest(p, {}, [], [])
+    assert line in status_text(p)
+    [m] = [m for m in state_payload(p, p.db)["attention"] if m["id"] == ask["id"]]
+    assert m["auto"] == line
+
+
+def test_ask_timeout_zero_turns_the_ask_timer_off(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    assert coord.apply(p, [{"type": "config_set", "key": "coordinator.ask_timeout_h", "value": "0"}]) == []
+    _, ask = _ask(p, blocking="access", recommendation="use option A")
+    assert "Non-blocking" not in ask["text"]
+    assert coord.expire_asks(p, now=ask["ts"] + 1000 * 3600) == []
+    assert p.db.one("SELECT handled FROM messages WHERE id=?", (ask["id"],))["handled"] == 0
+
+
+def test_an_open_ask_filed_without_a_default_gets_one_and_resolves(env):
+    p = make(env)
+    from ttp import askauto, coordinator as coord, prguard
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    mid = p.db.post("out", f"Option A or B?{coord._REC_NOTE}use option A", chat=None, kind="ask",
+                    severity="high", ref=f"{prguard.BLOCKING_REF}access")
+    ts = p.db.one("SELECT ts FROM messages WHERE id=?", (mid,))["ts"]
+    assert coord.expire_asks(p, now=ts + 60) == []
+    assert p.db.kv(coord.ASK_DEFAULTS_KEY)[str(mid)] == askauto.entry("access", "use option A")
+    assert coord.expire_asks(p, now=ts + 0.5 * 3600) == [mid]
+
+
+def test_the_ask_timer_check_raises_a_missing_or_overdue_default_once(env):
+    p = make(env)
+    from ttp import askauto, coordinator as coord
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    mid = p.db.post("out", "Option A or B?", chat=None, kind="ask", severity="high")
+
+    def raised():
+        return [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='observation' "
+                                          "AND text LIKE 'Ask timer check%'")]
+    assert d.check_ask_timer() == [f"ask {mid} has no default"]
+    d.check_ask_timer()
+    assert len(raised()) == 1, "the same problem was raised twice"
+    coord.expire_asks(p)   # registers its default: the set clears
+    assert d.check_ask_timer() == [] and p.db.kv(askauto.FLAGS_KEY) == []
+    # Due but held (an unread user message), long past the grace: raised again.
+    p.db.x("UPDATE messages SET ts=ts-7200 WHERE id=?", (mid,))
+    p.db.x("UPDATE messages SET text=? WHERE id=?", (f"Option A or B?{coord._REC_NOTE}use option A", mid))
+    p.db.set_kv(coord.ASK_DEFAULTS_KEY, {str(mid): askauto.entry("access", "use option A")})
+    p.db.post("in", "hello", chat="c1")
+    assert d.check_ask_timer() == [f"ask {mid} is past its timeout and still open"]
+    assert len(raised()) == 2 and "past its timeout" in raised()[-1]
+
+
+def test_a_task_held_on_an_ask_is_released_once_it_auto_resolves(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    _, ask = _ask(p, blocking="access", recommendation="use option A")
+    tid = p.db.add_task("on the ask", "s", origin="user")
+    p.db.update_task(tid, status="blocked", blocked_reason="r", labels=[f"waits:ask:{ask['id']}"])
+    d.sweep_holds()
+    assert p.db.task(tid)["status"] == "blocked"
+    assert coord.expire_asks(p, now=ask["ts"] + 0.5 * 3600) == [ask["id"]]
+    d.sweep_holds()
+    task = p.db.task(tid)
+    assert task["status"] == "queued" and "waits:" not in task["labels"], task
 
 
 def test_a_reversible_ask_is_rejected_and_the_rejection_reaches_the_next_digest(env):
@@ -4839,6 +4956,7 @@ def test_a_reversible_ask_is_rejected_and_the_rejection_reaches_the_next_digest(
 def test_a_legacy_ask_with_a_default_still_drains_after_the_timeout(env):
     p = make(env)
     from ttp import coordinator as coord
+    p.set_config("coordinator.ask_timeout_h", 1)
     ask = _legacy_ask(p)
     assert "reversible; defaults to its recommendation in 1.0h" in coord.digest(p, {}, [], [])
     assert coord.expire_asks(p, now=ask["ts"] + 0.9 * 3600) == []
@@ -5263,18 +5381,31 @@ def test_an_irreversible_or_restriction_ask_must_be_classified(env):
 
 
 
-def test_asks_without_a_registered_default_never_time_out(env):
+def test_exempt_asks_stay_open_past_the_timeout(env):
     p = make(env)
     from ttp import coordinator as coord
     _, firm = _ask(p, "Delete the old data?", blocking="irreversible", reversible=False,
                    recommendation="delete the old data", classify="irreversible",
                    least_disruptive="archive it instead; the disk is full, so archiving does not free the space")
     _, silent = _ask(p, "Option A or C?", blocking="human", recommendation="use option A", requester="a reviewer")
-    assert "within" not in firm["text"]
+    _, review = _ask(p, "Review the draft?", blocking="review", recommendation="approve it")
+    _, merge = _ask(p, "Merge the fix?", blocking="merge", recommendation="merge it")
+    _, as_user = _ask(p, "Tell the team?", blocking="access", recommendation="post the summary to the channel")
+    _, cred = _ask(p, "Which key?", blocking="access", recommendation="grant the API key to the runner")
+    _, money = _ask(p, "More funds?", blocking="funds", recommendation="yes, top up the account")
+    _, bare = _ask(p, "Which box?", blocking="access")
+    held = (firm, silent, review, merge, as_user, cred, money, bare)
+    assert "within" not in firm["text"] and all("waits for the user" in a["text"] for a in held)
     assert coord.expire_asks(p, now=time.time() + 1000 * 3600) == []
-    assert all(p.db.one("SELECT handled FROM messages WHERE id=?", (a["id"],))["handled"] == 0
-               for a in (firm, silent))
-    assert coord.digest(p, {}, [], []).count("(waits for the user)") == 2
+    assert all(p.db.one("SELECT handled FROM messages WHERE id=?", (a["id"],))["handled"] == 0 for a in held)
+    d = coord.digest(p, {}, [], [])
+    assert all(f"ask #{a['id']} (non-blocking; waits for the user (" in d for a in held), d
+    # A declining recommendation grants nothing, so it resolves even for money or an irreversible step.
+    _, no = _ask(p, "Spend $500 on a bigger box?", blocking="funds", recommendation="no, keep the current box")
+    pk, keep = _ask(p, "Wipe the cache?", blocking="irreversible", reversible=False, recommendation="keep the cache",
+                   classify="irreversible", least_disruptive="moving the cache instead; the disk is full, so moving does not free the space")
+    assert pk == [], pk
+    assert sorted(coord.expire_asks(p, now=time.time() + 3600)) == sorted([no["id"], keep["id"]])
 
 
 
@@ -5306,7 +5437,7 @@ def test_a_user_reply_after_an_ask_blocks_its_default_even_once_handled(env):
     assert not p.db.q("SELECT id FROM messages WHERE kind='alert'"), "the user was told a default applied"
     ev = p.db.one("SELECT * FROM events WHERE kind='ask_timeout'")
     assert ev["status"] == "queued" and "NOT applied" in ev["text"] and "Option A or B?" in ev["text"]
-    assert p.db.kv(coord.ASK_DEFAULTS_KEY) == {}
+    assert p.db.kv(coord.ASK_DEFAULTS_KEY) == {str(ask["id"]): None}, "its default was not cleared"
     assert coord.expire_asks(p, now=late + 99 * 3600) == []
     assert len(p.db.q("SELECT id FROM events WHERE kind='ask_timeout'")) == 1, "the coordinator was asked twice"
     assert f"ask #{ask['id']} (waits for the user)" in coord.digest(p, {}, [], [])
