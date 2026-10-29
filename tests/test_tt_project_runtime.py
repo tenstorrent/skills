@@ -46335,6 +46335,31 @@ def test_archiving_a_named_directory_of_many_files_takes_linear_time(tmp_path, m
     assert all(e["archive"] == "files.tar.gz" for e in new if e["stored"] == "tar")
 
 
+class _stack_dumped:
+    """Waits for the watch thread's stack dump on the real condition: the STACKS_FILE changing.
+    A loaded host can take arbitrarily long to write it; polling ends the wait the moment it
+    appears, with HANG_S as a hang bound only."""
+
+    def __init__(self, daemon):
+        import ttp.daemon as dm
+        self._path = daemon.p.state / dm.STACKS_FILE
+        self._before = self._mtime()
+
+    def _mtime(self):
+        try:
+            return self._path.stat().st_mtime_ns
+        except OSError:
+            return 0
+
+    def waited(self):
+        deadline = time.monotonic() + HANG_S
+        while time.monotonic() < deadline:
+            if self._mtime() not in (0, self._before):
+                return True
+            time.sleep(0.05)
+        return False
+
+
 def test_a_tick_step_that_blocks_is_logged_with_every_threads_stack_and_alerted(env, monkeypatch):
     import ttp.daemon as dm
     p = make(env)
@@ -46343,10 +46368,13 @@ def test_a_tick_step_that_blocks_is_logged_with_every_threads_stack_and_alerted(
     monkeypatch.setattr(dm, "TICK_OVERRUN_S", 0.3)
 
     def step_that_blocks():   # a step stuck in a call with no timeout, still telling the watchdogs it moves
-        for _ in range(20):
+        for _ in range(HANG_S):   # ends the moment the watch thread dumps, or at HANG_S (a hang) at the latest
             time.sleep(0.05)
             d._progress()
+            if dump.waited():
+                break
     d.lift_boot_pause = step_that_blocks
+    dump = _stack_dumped(d)
     d._watch_ticks(every_s=0.05)
     try:
         d.tick()
@@ -46379,10 +46407,11 @@ def test_a_tick_step_blocked_without_progress_leaves_its_stacks_before_the_watch
     seen = {}
 
     def step_stuck_silently():   # a subprocess or lock wait with no timeout: never calls _progress
-        time.sleep(1.0)
+        dump.waited()   # ends the moment the watch thread dumps, or at HANG_S (a hang) at the latest
         stacks = p.state / dm.STACKS_FILE
         seen["stacks"] = stacks.read_text() if stacks.exists() else ""
     d.lift_boot_pause = step_stuck_silently
+    dump = _stack_dumped(d)
     d._watch_ticks(every_s=0.05)
     try:
         d.tick()
@@ -46409,7 +46438,15 @@ def test_both_signals_and_the_tick_overrun_dump_write_to_the_one_stacks_file(env
     try:
         for sig in (signal.SIGUSR1, signal.SIGUSR2):
             os.kill(os.getpid(), sig)
-            time.sleep(0.2)
+        # faulthandler writes on the next interpreter check; wait for both signals' dumps to land
+        deadline = time.monotonic() + HANG_S
+        text = ""
+        while time.monotonic() < deadline:
+            f.flush()
+            text = stacks.read_text()
+            if text.count("Current thread") >= 2:
+                break
+            time.sleep(0.05)
         d._tick_began = d._moved = time.monotonic() - dm.TICK_OVERRUN_S - 1
         o = d.check_overrun()
         assert o and o["stacks"] == str(stacks)
