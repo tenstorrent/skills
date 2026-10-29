@@ -9464,7 +9464,8 @@ def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are
     # +140: a spec's `cells:` line, and a `partial:` or `cells unreported` done is not complete
     # +70: a `cells:` line lists short names, never a description
     # +70: a note is answered by `ttp note --reply <fp>`, even to a project `ttp list` lacks
-    assert len(role) <= 33_680, len(role)
+    # +20: a `reason` passes continue_cap/review_area_cap at once; max_hops/max_usd stay hard
+    assert len(role) <= 33_700, len(role)
     assert "<!-- ttp:" not in role and "<!-- /ttp:" not in role
     assert role in coord.prompt_parts(p)[0]
     # Rules for features that are off are left out; turning one on brings its rules in.
