@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 
 from .jobstop import _stat
+from .project import durable_write
 from .runner import proc_start
 
 STOP_FILE = "STOP"
@@ -152,10 +153,8 @@ def _signal(pid: int, token: str, sig: int) -> None:
 def stop(pidfile: Path, pid: int, token: str, why: str) -> dict:
     """Write RESULTS_DIR/STOP and wait for the launcher's process to exit, then SIGTERM, then SIGKILL."""
     stop_file = pidfile.parent / STOP_FILE
-    if not os.path.lexists(stop_file):   # never through a symlink planted as STOP
-        fd = os.open(stop_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-        with os.fdopen(fd, "w") as out:
-            out.write(f"{why} at {time.strftime('%Y-%m-%d %H:%M:%S %Z')}\n")
+    if not os.path.lexists(stop_file):   # one there (even a symlink planted as STOP) is left as it is
+        durable_write(stop_file, f"{why} at {time.strftime('%Y-%m-%d %H:%M:%S %Z')}\n")
     name = pidfile.stem
     if _wait(pid, token, STOP_WAIT_S):
         return {"how": "stop_file", "left": False,
