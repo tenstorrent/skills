@@ -181,7 +181,9 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
 <!-- /ttp:if cells -->
 - `waiting` when a resource is busy (a reservation, a queue, a review). It returns after
   `retry_after_s`, not counted as an attempt. Save what you learned first. Always give a
-  `retry_when`: the harness runs it model-free every few minutes in the project root. Keep it
+  `retry_when`: the harness runs it model-free every few minutes in the project root. A retry_when
+  that finds its ssh host down (exit 255) is re-probed from 15 s up to 2 min and triggers the machine's
+  recovery itself (its heal fix or a host_down event); write no poll loop for a down host. Keep it
   read-only, under a minute, printing a line naming its wait. It must exit 0 once the wait
   is over whatever the outcome, 1 while it is not (75, a busy `ttp lock`, or 255, ssh not reaching the
   host, also keep it asleep); any other exit wakes it as broken. A failing remote command exits
