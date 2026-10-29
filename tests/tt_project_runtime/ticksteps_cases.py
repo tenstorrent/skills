@@ -195,7 +195,7 @@ def _hung_child(tmp_path, name="hung"):
     return exe, pidf
 
 
-def _gone(pidf):
+def _grandchild_gone(pidf):
     pid = int(pidf.read_text().strip())
     for _ in range(50):
         try:
@@ -224,7 +224,7 @@ def test_a_hung_device_runner_start_is_killed_whole_within_its_bound(env, monkey
     rc, out = d._devq_start("r1")
     assert time.monotonic() - t0 < 5, "the tick waited on the hung start"
     assert rc == 1 and "timed out" in out
-    assert _gone(pidf), "the start's grandchild outlived it"
+    assert _grandchild_gone(pidf), "the start's grandchild outlived it"
 
 
 def test_a_hung_checks_start_is_killed_whole_within_its_bound(env, monkeypatch, tmp_path):
@@ -237,7 +237,7 @@ def test_a_hung_checks_start_is_killed_whole_within_its_bound(env, monkeypatch, 
     t0 = time.monotonic()
     assert d._start_checks(p.root, tmp_path / "run", "r1", 1, []) is False
     assert time.monotonic() - t0 < 5, "the tick waited on the hung checks start"
-    assert _gone(pidf), "the checks start's grandchild outlived it"
+    assert _grandchild_gone(pidf), "the checks start's grandchild outlived it"
 
 
 def test_a_hung_harness_head_git_is_killed_whole_within_its_bound(env, monkeypatch, tmp_path):
@@ -253,4 +253,4 @@ def test_a_hung_harness_head_git_is_killed_whole_within_its_bound(env, monkeypat
     d._record_harness_head()
     assert time.monotonic() - t0 < 5, "the tick waited on the hung git"
     assert p.db.kv("harness_good") is None
-    assert _gone(pidf), "git's grandchild outlived it"
+    assert _grandchild_gone(pidf), "git's grandchild outlived it"

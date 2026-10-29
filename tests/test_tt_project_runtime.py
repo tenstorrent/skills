@@ -45739,8 +45739,8 @@ def test_every_launch_path_exports_the_task_id(env, monkeypatch, tmp_path):
     assert e["TTP_TASK"] == e["TTP_TASK_ID"] == ""
     # Checks the daemon relaunches for a task.
     seen = {}
-    monkeypatch.setattr(dmod.subprocess, "run", lambda argv, **kw: seen.update(kw["env"]) or
-                        subprocess.CompletedProcess(argv, 0, "", ""))
+    monkeypatch.setattr(dmod.boundedchild, "run", lambda argv, timeout, **kw: seen.update(kw["env"]) or
+                        dmod.boundedchild.Result(0, "", ""))
     assert d._start_checks(p.root, tmp_path / "checks", "c1", 41, [])
     assert seen["TTP_TASK"] == seen["TTP_TASK_ID"] == "41"
     monkeypatch.undo()
@@ -45792,11 +45792,11 @@ def test_runs_on_a_device_tagged_machine_hide_devices_from_direct_opens(env, mon
     class Done(Exception):
         pass
 
-    def fake_run(argv, **kw):
+    def fake_run(argv, timeout, **kw):
         seen.update(kw["env"])
         raise Done
 
-    monkeypatch.setattr("ttp.daemon.subprocess.run", fake_run)
+    monkeypatch.setattr("ttp.daemon.boundedchild.run", fake_run)
     with pytest.raises(Done):
         d._start_checks(p.root, p.runs / "checks-x", "x", 1, [])
     assert seen["TT_VISIBLE_DEVICES"] == "" and seen[mm.MASK_RECORD] == before
