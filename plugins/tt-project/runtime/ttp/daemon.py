@@ -133,6 +133,7 @@ from . import schedule as sched
 from . import service
 from . import settinghold
 from . import sharedchecks
+from . import startbreaker
 from . import startcheck
 from . import startgate
 from . import sweep
@@ -2511,8 +2512,9 @@ class Daemon:
                 proc = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=runtime_dir,
                                         env={**os.environ, "PYTHONPATH": runtime_dir}, stdout=out, stderr=out,
                                         stdin=subprocess.DEVNULL, start_new_session=True)
-        except BaseException:
-            db.x("UPDATE runs SET status='failed', ended=? WHERE id=?", (time.time(), run_id))
+        except BaseException:   # marked never_started: the coordinator's repeated-failures count tells it apart
+            db.x("UPDATE runs SET status='failed', ended=?, note=? WHERE id=?",
+                 (time.time(), json.dumps({**(note or {}), "never_started": True}), run_id))
             runner.remove_files(private)
             shorttmp.remove(tmp_env.get("TMPDIR"))
             raise
@@ -6902,6 +6904,7 @@ class Daemon:
         gate0 = self.gates.get(core)
         free = max(gate0.max_parallel - busy.get(core, 0), 0) if gate0 and gate0.allow_new_work else 0
         fate: dict[int, str] = {}   # task id -> a schedlog reason, "full" or "picked" (_log_slot_fill)
+        probing, probe_tried = None, False   # the task whose start retries an open run-start breaker this tick
         for task in ready:
             if not self.lease_held():   # lapsed during this tick (a slow start or store): start nothing more
                 break
@@ -6970,6 +6973,23 @@ class Daemon:
                 self._log_resource_wait(task, ctx.get("holds", {}).get(task["id"]))
             if why:
                 continue
+            # An open run-start breaker (startbreaker): one start at a time retries, the rest wait unspent.
+            brk = "held" if probe_tried else ""
+            if not brk:
+                brk, said = startbreaker.gate(db, now, self._breaker_stamp)
+                if said:
+                    log(self.p, said)
+            if brk == "held":
+                held = startbreaker.held_note(startbreaker.state(db))
+                if note != held:
+                    db.update_task(task["id"], blocked_reason=held)
+                fate[task["id"]] = "hold"
+                reached.discard(task["id"])
+                continue
+            if brk == "probe":
+                probing = task["id"]
+            elif note.startswith(startbreaker.HELD_NOTE):
+                db.update_task(task["id"], blocked_reason=None)
             skipped, gated = self._wake_gate(task)
             if skipped:
                 fate[task["id"]] = "start_after"   # it re-deferred the wake
@@ -7013,6 +7033,7 @@ class Daemon:
                 continue
             self._workspace_tries(task["id"], clear=True)
             from .prompts import spec_digest, worker_resume, worker_system, worker_task
+            probe_tried = probe_tried or probing == task["id"]   # this tick's one retry: the rest stay held
             try:
                 system = worker_system(self.p, task)
                 note = {"spec_sha": spec_digest(task)}
@@ -7049,6 +7070,10 @@ class Daemon:
                 self._unreserve(task)
                 continue
             self._start_failures = 0
+            if probing == task["id"]:   # the retry started: the breaker closes and dispatch resumes
+                startbreaker.close(db)
+                log(self.p, f"run-start breaker closed: task {task['id']}'s run started")
+                probing, probe_tried = None, False
             fate[task["id"]] = "picked"
             live[task["id"]] = worktree.claims(self.p, dict(task, branch=branch))   # held from others this tick
             if logged_out[provider] if run_prov == provider else self._logged_out(run_prov):
@@ -10556,19 +10581,33 @@ class Daemon:
         project cannot check a landing (landed.DONE_ENV)."""
         return {**machines.mask_devices(command_env(self.p)), landed.DONE_ENV: "1"}
 
+    def _breaker_stamp(self) -> str:
+        """The config and runtime a run-start breaker opened under: either changing closes it."""
+        from . import __version__
+        blob = json.dumps([self.cfg, __version__, self._loaded.get("runtime_tree")], sort_keys=True, default=str)
+        return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
     def _start_failed(self, task: dict, e: Exception) -> None:
         """Nothing was launched, so no attempt is spent. The task waits a minute before the next try,
         so a lasting cause (a full disk, a broken install) cannot spin; three failures in a row alert."""
         db = self.p.db
-        why = f"{alerts.START_FAILED}{type(e).__name__}: {e}{_raised_at(e)}"[:400]
+        err = f"{type(e).__name__}: {e}{_raised_at(e)}"
+        why = f"{alerts.START_FAILED}{err}"[:400]
         log(self.p, f"task {task['id']} {why}\n" + "".join(traceback.format_exception(e)).rstrip()[-4000:])
+        stamp = self._breaker_stamp()
         with db.tx():
             db.update_task(task["id"], status="queued", not_before=time.time() + 60, blocked_reason=why)
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (time.time(), "daemon", "run_start_failed", "low", f"#{task['id']} {task['title']}: {why}",
                   "handled", task["id"]))
+            opened, said = startbreaker.record(db, f"{type(e).__name__}{_raised_at(e)}", err, task["id"],
+                                               time.time(), stamp)
+        if said:
+            log(self.p, said)
         self._start_failures += 1
-        if self._start_failures >= 3:
+        if opened:   # one cause failing every start: one alert, dispatch held (startbreaker)
+            self.alert("run-start", startbreaker.alert_text(opened), "high")
+        elif self._start_failures >= 3:
             self.alert("run-start", f"Runs cannot start ({why}). Tasks stay queued and retry every minute.", "high")
 
     def _resources_free(self, task: dict, reserve: bool = False) -> bool:

@@ -38,6 +38,7 @@ import time
 from pathlib import Path
 
 from . import prguard
+from . import startbreaker
 from .db import DB, SEVERITY_RANK
 from .schedule import failing
 
@@ -209,6 +210,8 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
     if kind == "pr-ready":   # the pr-watch watcher keeps the flag while the PR is out of draft unapproved
         return arg in (db.kv(prguard.UNAPPROVED_KEY, {}) or {}) and not prguard.approved(db, arg)
     if key == "run-start":
+        if startbreaker.is_open(db):   # one cause fails every start: dispatch holds the queue (startbreaker)
+            return bool(db.one("SELECT id FROM tasks WHERE status='queued' LIMIT 1"))
         # Until every task whose start failed has started, been cancelled or deferred past its one-minute
         # retry (START_FAILED): another task's run starting proves nothing about the cause.
         return bool(db.one("SELECT id FROM tasks WHERE status='queued' AND blocked_reason LIKE ? "

@@ -858,6 +858,129 @@ def test_a_failed_start_names_its_line_logs_the_traceback_and_never_stops_the_ne
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
 
 
+def test_one_cause_failing_three_tasks_starts_opens_the_breaker_holds_dispatch_and_a_good_retry_resumes_it(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """The same error at the same line failing the starts of three tasks within 10 minutes opens the
+    run-start breaker: one alert naming that line, no further starts, no attempts spent, and the
+    coordinator's repeated-failures trigger leaves the never-started runs to that alert. One start
+    retries every few minutes; the first that succeeds closes it and the queue starts."""
+    from ttp import alerts, startbreaker, testslots
+    from ttp import coordinator as coord
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=5)
+    try:
+        ids = [p.db.add_task(f"t{i}", "s", kind="work", tier="light", origin="user", priority=3) for i in range(4)]
+        real = testslots.worker_env
+        monkeypatch.setattr(testslots, "worker_env", lambda cfg: "host_max".get("pool"))   # the str-section crash
+        p.db.set_kv("last_coordinator_turn", time.time() - 3600)
+        d.dispatch()
+        st = startbreaker.state(p.db)
+        assert st.get("open") and re.fullmatch(r"AttributeError at daemon\.py:\d+", st["sig"]), st
+        assert st["tasks"] == ids[:3]
+        assert _slot_tasks(p) == []
+        held = p.db.task(ids[3])
+        assert held["status"] == "queued" and held["blocked_reason"].startswith(startbreaker.HELD_NOTE), held
+        failed = p.db.q("SELECT task, note FROM runs WHERE role!='coordinator' ORDER BY id")
+        assert [r["task"] for r in failed] == ids[:3] and all(json.loads(r["note"])["never_started"] for r in failed)
+        sent = [m["text"] for m in p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='alert'")
+                if "Runs cannot start" in (m["text"] or "")]
+        assert len(sent) == 1 and st["sig"].split(" at ")[1] in sent[0], sent
+        now = time.time()
+        assert alerts.holds(p.db, "run-start", now - 5, now)
+        p.db.x("UPDATE tasks SET status='cancelled' WHERE id IN (%s)" % ",".join(map(str, ids)))
+        assert not alerts.holds(p.db, "run-start", now - 5, now), "nothing queued: the alert has nothing to hold"
+        p.db.x("UPDATE tasks SET status='queued' WHERE id IN (%s)" % ",".join(map(str, ids)))
+        # Every task due again: all held, nothing started, and no retry before RETRY_S.
+        p.db.x("UPDATE tasks SET not_before=NULL")
+        d.dispatch()
+        assert p.db.one("SELECT COUNT(*) n FROM runs WHERE role!='coordinator'")["n"] == 3
+        # The retry: one start only, which fails at the same line; the breaker stays open.
+        p.db.set_kv(startbreaker.KEY, dict(startbreaker.state(p.db), tried=time.time() - startbreaker.RETRY_S - 1))
+        d.dispatch()
+        assert [r["task"] for r in p.db.q("SELECT task FROM runs WHERE role!='coordinator' ORDER BY id")] == \
+            ids[:3] + [ids[0]]
+        assert startbreaker.is_open(p.db)
+        assert all(int(p.db.task(t)["attempts"] or 0) == 0 for t in ids)
+        # Task 0 failed twice, but both runs never started: they fold into the breaker's one alert.
+        trig = coord.effort_triggers(p.db, d.cfg, [], None)[0]
+        assert "repeated failures" not in trig, trig
+        # A good retry closes it, clears the alert's condition and every task starts in the same pass.
+        monkeypatch.setattr(testslots, "worker_env", real)
+        p.db.x("UPDATE tasks SET not_before=NULL")
+        p.db.set_kv(startbreaker.KEY, dict(startbreaker.state(p.db), tried=time.time() - startbreaker.RETRY_S - 1))
+        d.dispatch()
+        assert not startbreaker.is_open(p.db)
+        assert sorted(_slot_tasks(p)) == ids
+        assert all(int(p.db.task(t)["attempts"] or 0) == 0 and not p.db.task(t)["blocked_reason"] for t in ids)
+        now = time.time()
+        assert not alerts.holds(p.db, "run-start", now - 5, now)
+        # Closed, the never-started runs count again.
+        assert "repeated failures" in coord.effort_triggers(p.db, d.cfg, [], None)[0]
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_one_tasks_own_start_failures_never_open_the_run_start_breaker(env, monkeypatch, tmp_path, reap_tmp_processes):
+    """Three failed starts of one task, or the same type on three tasks at different lines, are no
+    systemic cause: the breaker stays shut and the other tasks start."""
+    from ttp import prompts, startbreaker
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=3)
+    try:
+        bad = p.db.add_task("breaks at start", "s", kind="work", tier="light", origin="user", priority=1)
+        real = prompts.worker_system
+
+        def system(proj, task):
+            if task["id"] == bad:
+                raise ValueError("its own spec")
+            return real(proj, task)
+        monkeypatch.setattr(prompts, "worker_system", system)
+        for _ in range(3):
+            p.db.update_task(bad, not_before=None)
+            d.dispatch()
+        assert not startbreaker.is_open(p.db)
+        assert len(startbreaker.state(p.db)["fails"]) == 3
+        good = p.db.add_task("starts fine", "s", kind="work", tier="light", origin="user", priority=3)
+        d.dispatch()
+        assert _slot_tasks(p) == [good]
+        # Same type, different lines on three tasks.
+        now = time.time()
+        for t, line in ((1, 10), (2, 20), (3, 30)):
+            st, _ = startbreaker.record(p.db, f"KeyError at x.py:{line}", "KeyError", 9000 + t, now, "s")
+            assert st is None
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_the_run_start_breaker_closes_on_a_config_or_runtime_change_and_on_a_retry_failing_elsewhere(env):
+    """Opened under one config, a changed config (or runtime) closes it at the next gate; a retry that
+    fails at another line closes it too, and failures older than its window are forgotten."""
+    from ttp import startbreaker
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    now = time.time()
+    stamp = d._breaker_stamp()
+    assert startbreaker.record(p.db, "E at a.py:1", "E", 3, now - startbreaker.WINDOW_S - 1, stamp)[0] is None
+    for t in (1, 2):
+        assert startbreaker.record(p.db, "E at a.py:1", "E", t, now, stamp)[0] is None
+    assert startbreaker.record(p.db, "E at a.py:1", "E", 2, now, stamp)[0] is None   # the same task twice
+    opened, said = startbreaker.record(p.db, "E at a.py:1", "E: boom", 4, now, stamp)
+    assert opened and opened["tasks"] == [1, 2, 4] and "opened" in said
+    assert startbreaker.gate(p.db, now, lambda: stamp) == ("held", "")
+    assert startbreaker.gate(p.db, now + startbreaker.RETRY_S, lambda: stamp) == ("probe", "")
+    d.cfg = {**d.cfg, "checks": {}}
+    assert d._breaker_stamp() != stamp
+    brk, said = startbreaker.gate(p.db, now, d._breaker_stamp)
+    assert brk == "" and "changed" in said and not startbreaker.is_open(p.db)
+    for t in (1, 2, 3):
+        startbreaker.record(p.db, "E at a.py:1", "E", t, now, stamp)
+    assert startbreaker.is_open(p.db)
+    st, said = startbreaker.record(p.db, "F at b.py:9", "F", 1, now, stamp)
+    assert st is None and "elsewhere" in said and not startbreaker.is_open(p.db)
+
+
 def test_a_scalar_config_section_is_refused_never_kept_as_last_good_and_a_missing_snapshot_is_no_error(
         env, capsys, monkeypatch):
     """`ttp config checks host_max` must be refused with the account-level form, as must config_set;

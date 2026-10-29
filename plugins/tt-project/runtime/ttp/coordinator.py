@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, causefix, cells, chaincap, chainprio, chatset, checkspill, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, rejcool, relay, responsibilities, restriction_audit, reviewcap, selfreview, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, throughmute, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, causefix, cells, chaincap, chainprio, chatset, checkspill, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, rejcool, relay, responsibilities, restriction_audit, reviewcap, selfreview, reviewreuse, settinghold, settled, shared, sharedchecks, startbreaker, sweep, throughmute, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -3371,10 +3371,12 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
     fails_at, waits_at = int(c.get("repeat_fails_24h", 2) or 0), int(c.get("repeat_waits_24h", 8) or 0)
     since = now - 86400
     waits_seen = dict(seen_before.get("waits") or {})
+    # While the run-start breaker is open, runs that never started fold into its one alert.
+    never_started = " AND COALESCE(note,'') NOT LIKE '%\"never_started\": true%'" if startbreaker.is_open(db) else ""
     for t in db.q("SELECT DISTINCT task FROM events WHERE task IS NOT NULL AND ts>?", (last,)):
         fails = db.one("SELECT COUNT(*) n FROM runs WHERE task=? AND role!='coordinator' AND ended>? AND status IN "
-                       f"({','.join('?' * len(machines.BAD_RUNS))}) AND COALESCE(note,'') NOT LIKE '%lost_to_reboot%'",
-                       (t["task"], since, *machines.BAD_RUNS))["n"] + \
+                       f"({','.join('?' * len(machines.BAD_RUNS))}) AND COALESCE(note,'') NOT LIKE '%lost_to_reboot%'"
+                       + never_started, (t["task"], since, *machines.BAD_RUNS))["n"] + \
             db.one("SELECT COUNT(*) n FROM events WHERE task=? AND kind='task_failed' AND ts>?", (t["task"], since))["n"]
         if fails_at and fails >= fails_at:
             add("repeated failures")

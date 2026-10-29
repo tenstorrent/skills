@@ -333,6 +333,12 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   is a missing or empty `~/.ssh/known_hosts` while the project uses ssh. Each finding is an
   observation (once a day) and goes into the worker's prompt, the run's note and the stored hand-off
   (`start_checks`).
+- A failed run start leaves its task queued, no attempt spent, to retry in a minute. When one cause
+  (the same exception type at the same runtime file:line) fails the starts of 3 different tasks
+  within 10 minutes, the run-start breaker (`ttp.startbreaker`) opens: one `run-start` alert names
+  that line, no worker starts, and one start retries every 3 minutes. It closes once a start
+  succeeds, the retry fails elsewhere, or the config or runtime changes. While it is open, the
+  coordinator's repeated-failures trigger skips runs that never started.
 - Stopping or restarting the daemon leaves running workers alone; the next daemon adopts them.
   A cancel ends the task's runs; `ttp stop --kill` ends all runs and requeues their tasks.
 - Generic lessons from a project come back as follow-ups titled `upstream: …`.
