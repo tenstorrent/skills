@@ -502,16 +502,23 @@ def sync_file(p: Any, force: bool = False) -> tuple[bool, str | None]:
         entries = parse_file(raw, {r["name"] for r in db.q("SELECT name FROM schedules")})
     except ValueError as e:
         return False, f"{FILE}: {e}"
+    from . import selfreview
     with db.tx():
+        # A file edit that changes daily-review's state is the user's record of the switch: the daemon
+        # cannot tell who committed it, and the coordinator, web app and self-review check record their
+        # own switches and write the file in step, so their re-applies (each daemon start forces one)
+        # change nothing here and leave the record as it was. Accepted gap: a harness worker's own edit
+        # of the file counts as the user's word.
+        row = db.one("SELECT enabled FROM schedules WHERE name=?", (selfreview.NAME,))
         for e in entries:
             upsert(db, e["name"], e["kind"], e["every"], e.get("at") or None, e.get("enabled", True),
                    e.get("budget_usd_day"), e.get("description", ""), e.get("payload", {}), timefmt.home(p))
         names = [e["name"] for e in entries]
-        from . import selfreview   # a harness commit is the user's own record of the switch
-        for e in entries:
-            selfreview.record_off(db, e["name"], bool(e.get("enabled", True)), f"harness/{FILE}", True)
-        if selfreview.NAME not in names and db.one("SELECT name FROM schedules WHERE name=?", (selfreview.NAME,)):
+        mine = [bool(e.get("enabled", True)) for e in entries if e["name"] == selfreview.NAME]
+        if row and not mine:
             selfreview.record_off(db, selfreview.NAME, None, f"harness/{FILE}", True)
+        elif mine and (row is None or mine[0] != bool(row["enabled"])):
+            selfreview.record_off(db, selfreview.NAME, mine[0], f"harness/{FILE}", True)
         _end_mutes(db, [r["name"] for r in db.q("SELECT name FROM schedules") if r["name"] not in names], GONE,
                    timefmt.home(p))
         db.x(f"DELETE FROM schedules WHERE name NOT IN ({','.join('?' * len(names))})", names)

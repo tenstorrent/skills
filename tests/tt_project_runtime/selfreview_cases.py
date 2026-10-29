@@ -159,6 +159,49 @@ def test_a_schedule_turned_off_without_the_users_word_is_turned_back_on(env, rec
     assert [r["priority"] for r in _sr_runs(p, "queued")] == [2]
 
 
+@pytest.mark.parametrize("record", [None, ("the coordinator", False)])
+def test_a_forced_reapply_of_the_schedules_file_does_not_make_a_switch_off_the_users(env, record):
+    from ttp import schedule as sched, selfreview
+    p = make(env)
+    d = _sr_daemon(p)
+    sched.write_file(p, "x", create=True)
+    sched.set_enabled(p.db, "daily-review", False)
+    sched.write_file(p, "y")
+    p.db.x("DELETE FROM kv WHERE key=?", (selfreview.OFF_KEY,))   # legacy: off before the record existed
+    if record:
+        selfreview.record_off(p.db, "daily-review", False, *record)
+    before = p.db.kv(selfreview.OFF_KEY)
+    assert sched.sync_file(p, force=True) == (True, None)          # what every daemon start does
+    assert p.db.kv(selfreview.OFF_KEY) == before
+    _sr_receipt(p, 30)
+    _sr_work(p)
+    _sr_check(d)
+    assert p.db.one("SELECT enabled FROM schedules WHERE name='daily-review'")["enabled"]
+    assert len(_sr_events(p)) == 1
+
+
+def test_a_schedules_file_edit_records_only_a_change_of_the_daily_review(env):
+    from ttp import schedule as sched, selfreview
+    p = make(env)
+    sched.write_file(p, "x", create=True)
+    path = sched.file_path(p)
+    entries = json.loads(path.read_text())
+    off = [{**e, "enabled": False} if e["name"] == "daily-review" else e for e in entries]
+    path.write_text(json.dumps(off))
+    assert sched.sync_file(p) == (True, None)
+    assert p.db.kv(selfreview.OFF_KEY)["user"] is True
+    path.write_text(json.dumps(entries))
+    assert sched.sync_file(p) == (True, None)
+    assert p.db.kv(selfreview.OFF_KEY) is None
+    # Removed, then added back off in one edit: both are the file's own change.
+    path.write_text(json.dumps([e for e in entries if e["name"] != "daily-review"]))
+    assert sched.sync_file(p) == (True, None)
+    assert p.db.kv(selfreview.OFF_KEY)["how"] == "removed"
+    path.write_text(json.dumps(off))
+    assert sched.sync_file(p) == (True, None)
+    assert p.db.kv(selfreview.OFF_KEY)["how"] == "off" and p.db.kv(selfreview.OFF_KEY)["user"] is True
+
+
 def test_coordinator_schedule_set_off_records_whether_it_was_a_user_turn(env):
     from ttp import coordinator as coord, selfreview
     p = make(env)

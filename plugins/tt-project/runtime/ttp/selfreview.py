@@ -6,7 +6,7 @@ looks at the `daily-review` schedule and its last review receipt: its last run t
 - Missing schedule (never created by new, connect or upgrade, or removed with no record of the user
   doing it): restored from the template.
 - Turned off with no record of the user doing it (the coordinator outside a user turn, or no record):
-  turned back on. Off or removed by the user (web app, a user turn, a harness/schedules.json commit)
+  turned back on. Off or removed by the user (web app, a user turn, a harness/schedules.json edit that changes it)
   is left alone: no event, no wake (record_off).
 - Enabled, but no receipt for over OVERDUE_S while work happened since: a run is queued at once at
   priority 2, past the debounce, idle guard and precheck, and one 'daily review overdue: <cause>'
