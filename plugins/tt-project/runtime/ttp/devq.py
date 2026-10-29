@@ -989,6 +989,14 @@ def probe(d: Path, job: str) -> int:
     return 1
 
 
+def _urgent_job(f: Path) -> bool:
+    """Whether a queued job's spec marks it urgent; an unreadable one is not."""
+    try:
+        return json.loads(f.read_text()).get("urgent") is True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def submit(d: Path, cfg: dict, spec: dict) -> int:
     """Validate and queue one job spec, then start the runner if it is not up. Exit 2 on a bad spec."""
     _dirs(d)
@@ -1445,11 +1453,12 @@ class Runner:
             return
 
     def next_job(self) -> str:
-        """The job to run now: one left running (its runner died), else the oldest queued."""
+        """The job to run now: one left running (its runner died), else the oldest queued urgent one (an
+        urgent task's, spec `urgent`), else the oldest queued. A running job is never interrupted."""
         running = _running(self.d)
         if running:
             return running[0]
-        for q in sorted((self.d / "queue").glob("*.json")):
+        for q in sorted((self.d / "queue").glob("*.json"), key=lambda f: (not _urgent_job(f), f.name)):
             job = q.stem.split("-", 1)[1]
             with self.steady():
                 q.replace(self.d / "running" / f"{job}.json")

@@ -1422,6 +1422,11 @@ def status_text(p: Project, verbose: bool = False) -> str:
                   "ORDER BY status, id LIMIT 8"):
         age = f" {since(in_review[t['id']], now)}" if t["id"] in in_review else ""
         lines.append(f"  #{t['id']} {t['status']}{age}: {t['title']}" + (f" — {t['blocked_reason']}" if t["blocked_reason"] else ""))
+    from . import urgent
+    hot = [t for t in db.q("SELECT * FROM tasks WHERE status IN ('queued','review') ORDER BY priority, id")
+           if urgent.is_urgent(t)]
+    for t in hot[:8]:   # the urgent lane: each waiting urgent task, with how long it has waited
+        lines.append(f"  #{t['id']} {t['status']} ({urgent.mark(db, t, now)}): {t['title']} — urgent: {urgent.why(t)}")
     if h.get("schedules_broken"):
         lines.append(h["schedules_broken"])
     if h.get("schedules_waiting"):
@@ -4264,6 +4269,15 @@ def _lock_answers(a, answers: list[tuple[str, int, str | dict]]) -> None:
     sys.exit(75 if 75 in rcs else LOCK_NA if LOCK_NA in rcs else 0)
 
 
+def _urgent_priority(p, task: str) -> int | None:
+    """urgent.PRIORITY when `task` (an id) is urgent, else None: the lock and device queues order only by it."""
+    from . import urgent
+    try:
+        return urgent.PRIORITY if task.strip().isdigit() and urgent.is_urgent(p.db.task(int(task))) else None
+    except Exception:   # an unreadable task only loses the urgent place, never the command
+        return None
+
+
 def cmd_lock(a) -> None:
     """Hold one slot of a shared resource while a command runs: `ttp lock <resource> -- <cmd...>`.
 
@@ -4528,10 +4542,11 @@ def cmd_lock(a) -> None:
     job = lk.job_fields()   # inside a `ttp detach` job (its --lock): the label names the job and its pid
     tickets: list = []
     atexit.register(lambda: [lk.dequeue(t) for t in tickets])   # however this ends; a dead process's ticket is dropped too
+    prio = _urgent_priority(p, own)   # an urgent task's waiter goes ahead of routine ones (urgent.py)
     for L in todo:
         try:   # one arrival time on every lock: no two waiters can be ahead of each other on different ones
             L["ticket"] = lk.enqueue(L["where"], L["res"], L["who"], since=started, shared=a.shared,
-                                     multi=len(todo) > 1)
+                                     multi=len(todo) > 1, priority=prio)
         except OSError as e:
             _unwritable(e, L)
         tickets.append(L["ticket"])
@@ -5398,6 +5413,8 @@ def cmd_devq(a) -> None:
                 "inputs": o.input, "cold_start_s": o.cold_start}
         if o.artifact:
             spec["artifact"] = o.artifact
+        if _urgent_priority(p, spec["task"]) is not None:
+            spec["urgent"] = True   # the runner takes it before routine queued jobs (devq.Runner.next_job)
         if o.wedge_pattern and o.no_wedge_check:
             die("devq submit: --wedge-pattern and --no-wedge-check exclude each other")
         if o.wedge_pattern or o.no_wedge_check:

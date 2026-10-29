@@ -866,7 +866,8 @@ def mark_turn(locks_dir: Path, resource: str, ticket: Path | None) -> None:
 def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool = False,
             urgent_max: int = 0, past_multi: bool = False) -> bool:
     """Whether this ticket may take the resource now. An exclusive one: among the first `slots`
-    waiters, one per free slot, with no shared waiter ahead. A shared one: no exclusive waiter
+    waiters (urgent tickets, task priority URGENT_PRIORITY or better, before the rest), one per free
+    slot, with no shared waiter ahead. A shared one: no exclusive waiter
     ahead, so it never jumps one. `fair`: waiters are counted in fair_order (with `urgent_max`), not
     arrival order. `past_multi` (a waiter that holds locks already): waiters for several resources at
     once ahead are not counted, as one of them may wait for a lock this waiter's holder has: waiting
@@ -876,6 +877,8 @@ def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool
         return True
     if fair:
         q = fair_order(locks_dir, resource, q, urgent_max)
+    else:   # urgent waiters (an urgent task's) first, arrival order within: none, and it is plain arrival
+        q = sorted(q, key=lambda t: not _urgent(t))
     ahead = [t for t in q[:q.index(ticket)] if not (past_multi and is_multi(t))]
     if is_shared(ticket):
         return all(is_shared(t) for t in ahead)

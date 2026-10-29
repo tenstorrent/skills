@@ -932,8 +932,9 @@ END""")
         return counts
 
     def ready_tasks(self, later: bool = False) -> list[dict]:
-        """Queued tasks whose dependencies are all finished, in dispatch's pick order: required owners
-        of an open obligation first (its earliest due milestone first, obligations.owner_due), then best
+        """Queued tasks whose dependencies are all finished, in dispatch's pick order: urgent tasks
+        first (urgent.is_urgent: priority 1 or an `urgent:` spec line), then required owners
+        of an open obligation (its earliest due milestone first, obligations.owner_due), then best
         priority, then oldest. Read afresh on every call: no order outlives a dispatch pass or a daemon
         restart. A task deferred with `start_when` is not ready until its probe passes (see deferral).
         With `later`, also the ones whose retry timer (not_before) has not come yet, in the same order."""
@@ -948,6 +949,8 @@ END""")
                 due = {}
             if due:
                 rows.sort(key=lambda r: (r["id"] not in due, due.get(r["id"], 0.0)))   # stable: priority, id within
+            from . import urgent
+            rows = urgent.first(rows)
         unmet = self.unmet_dependencies(rows)
         return [r for r in rows if not unmet[r["id"]] and "when" not in deferral(r)]
 

@@ -442,10 +442,12 @@ prolonged whole-box outage.
 - Review hop priority: a daemon-queued `Review #N`, `Fix review #N` or `Re-review #N` takes the most urgent
   priority of the task it covers and its chain's root, and follows when task_update changes theirs, unless
   its own priority was set with task_update.
-- Urgent slot wait (model-free): an obligation owner or priority-1 task that dispatch holds only
-  because every worker slot is taken, for `coordinator.urgent_slot_wait_min` (15; 0 turns it off),
-  raises one observation (high for an obligation owner) naming it and the running tasks holding the
-  slots with their priorities. One per task until it runs again.
+- Urgent slot wait (model-free): an obligation owner that dispatch holds only because every worker
+  slot is taken, for `coordinator.urgent_slot_wait_min` (10; 0 turns it off), raises one high
+  observation naming it and the running tasks holding the slots with their priorities. An urgent
+  task (below) raises one once it has waited that long since it was queued and anything holds it
+  (slots, the spend or auth gate, a pause, a lock, a branch), naming the hold. One per task until it
+  runs again.
 - Idle capacity (model-free): a device resource of the project (its device lock, a `*-device` name its
   config or recent tasks use, or a machine tagged `device` that its charter's Resources names) that
   no open task, `ttp lock` slot, reservation or detached-job hold uses for `coordinator.idle_capacity_s`
@@ -602,6 +604,23 @@ coordinator turns. It is optional and off until you save a key (`ttp secret jev`
 is on in every project of yours on that machine (`jev.enabled` `auto`). While on, it sends log and
 alert text, task specs and coordinator digests to an outside paid service. Turn it off for one
 project with `ttp config <name> jev.enabled false`. Without a key, screening is rules-only.
+
+## Urgent lane
+
+A task is urgent when its priority is 1 or its spec has a line `urgent: <why>`. Urgent work never
+queues behind routine work; nothing running is interrupted:
+
+- Workers: urgent tasks start first. With every slot taken, an urgent task may take
+  `budget.urgent_extra_slots` (1; 0 turns it off) more. The spend gate, auth gate, pauses and locks
+  still hold it.
+- Review: its review is queued as soon as it hands off (done or needs_review), at priority 1, and the
+  review sweeps skip `review.sweep_after_s` and `review.unreviewed_per_pass` for it. An urgent task in
+  review for 10 minutes raises `review_stall`.
+- Push queue: an approved head of an urgent task's review starts its batch at once; a running batch
+  or deploy still goes first.
+- Waiting lists: resource reservations, `ttp lock` waiters and device runner queues serve urgent
+  waiters first. Held locks, holds, pauses and recovery owners stay as they are.
+- `ttp status` and the web app mark urgent tasks with how long each has waited.
 
 ## Parallel work
 

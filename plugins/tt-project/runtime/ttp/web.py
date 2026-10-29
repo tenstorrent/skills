@@ -17,7 +17,7 @@ from . import alerts, awake
 from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
-from . import credits, heal, identity, lockprobe, mcpgap, obligations, outagetask, projpause, pushq, release, responsibilities, route, sweep, timefmt, waits
+from . import credits, heal, identity, lockprobe, mcpgap, obligations, outagetask, projpause, pushq, release, responsibilities, route, sweep, timefmt, urgent, waits
 from . import schedule as sched
 from . import pauseends, startgate, sweepskip, timefmt, trend, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
@@ -606,7 +606,7 @@ def state_payload(p: Project, db: DB) -> dict:
     now = time.time()
     tz = timefmt.zone(p)
     tasks = db.q("SELECT id,title,kind,status,priority,tier,provider,budget_usd,spent_usd,attempts,max_attempts,"
-                 "origin,branch,pr_url,blocked_reason,not_before,created,updated,stuck_since,result,labels,depends_on FROM tasks WHERE status NOT IN ('done','failed',"
+                 "origin,branch,pr_url,blocked_reason,not_before,created,updated,stuck_since,result,labels,depends_on,spec FROM tasks WHERE status NOT IN ('done','failed',"
                  "'cancelled') OR updated>? ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'blocked' THEN 1 "
                  "WHEN 'review' THEN 2 WHEN 'pushing' THEN 2 WHEN 'queued' THEN 3 ELSE 4 END, priority, id DESC LIMIT 200",
                  (now - 7 * 86400,))
@@ -622,6 +622,10 @@ def state_payload(p: Project, db: DB) -> dict:
     for t in tasks:
         t["job_use"] = [f"job {j['name']}: {j['line']}" for j in job_use.values() if j.get("task") == t["id"]] or None
         t["review_since"] = in_review.get(t["id"])
+        # The urgent lane (ttp/urgent.py): the spec is read for its `urgent:` line, never sent.
+        t["urgent"] = urgent.why(t) or None
+        t["waited_s"] = round(urgent.waited_s(db, t, now)) if t["urgent"] else None
+        t.pop("spec", None)
         t["outcome"] = task_outcome(t)   # changes_needed for a review that asked for changes
         result = load_result(t["result"])
         t["result"] = str(result.get("summary") or "")[:600]

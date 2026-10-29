@@ -46,6 +46,7 @@ from . import replica
 from . import schedlog
 from . import throughmute
 from . import probespawn
+from . import urgent
 from . import replymsg
 from . import msgparts
 from . import awake
@@ -2875,12 +2876,14 @@ class Daemon:
 
     def _raise_review_stalls(self, now: float) -> None:
         """Only 'done' satisfies a dependency, so a task left in 'review' holds its dependents back
-        without ever looking dead. Past coordinator.review_stall_s it is raised once per review stint."""
+        without ever looking dead. Past coordinator.review_stall_s it is raised once per review stint.
+        An urgent task (urgent.is_urgent) is raised past urgent.WAIT_S, dependents or not."""
         db = self.p.db
         try:
             stall_s = float(self.cfg["coordinator"].get("review_stall_s", REVIEW_STALL_S) or 0)
         except (TypeError, ValueError):
             stall_s = REVIEW_STALL_S
+        self._raise_urgent_review_stalls(min(stall_s, urgent.WAIT_S), now)
         for rev, since, deps in db.stalled_reviews(stall_s, now):
             fp = f"review_stall:{rev['id']}:{since:.0f}"
             if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
@@ -2895,6 +2898,32 @@ class Daemon:
                   f"task_update depends_on, or cancel them.", "queued", rev["id"]))
             log(self.p, f"task {rev['id']} in review {(now - since) / 3600:.1f}h holds {len(deps)} task(s); "
                         f"raised to the coordinator")
+
+    def _raise_urgent_review_stalls(self, stall_s: float, now: float) -> None:
+        """An urgent task in 'review' past `stall_s` (0: off): one review_stall event per review stint,
+        under the fingerprint the dependents' one uses, so one stint raises one event."""
+        if stall_s <= 0:
+            return
+        db = self.p.db
+        since = db.review_since()
+        for t in db.q("SELECT * FROM tasks WHERE status='review' ORDER BY id"):
+            at = float(since.get(t["id"]) or now)
+            if not urgent.is_urgent(t) or now - at < stall_s:
+                continue
+            fp = f"review_stall:{t['id']}:{at:.0f}"
+            if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+                continue
+            rev = next((r for r in db.q("SELECT id, status, depends_on FROM tasks WHERE kind='review' AND status "
+                                        "NOT IN ('done','failed','cancelled') ORDER BY id DESC")
+                        if t["id"] in dependency_ids(r)), None)
+            state = f"its review #{rev['id']} is {rev['status']}" if rev else "no review of it is open"
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                 (now, "daemon", "review_stall", fp, "normal",
+                  f"#{t['id']} {t['title'][:120]} is urgent ({urgent.why(t)}) and has been in review "
+                  f"{(now - at) / 60:.0f} min; {state}. Options: get it reviewed now (queue the review at priority 1, "
+                  f"or end or pause routine work holding the slots), or mark it done once its work is verified.",
+                  "queued", t["id"]))
+            log(self.p, f"task {t['id']} is urgent and in review {(now - at) / 60:.0f} min; raised to the coordinator")
 
     def _raise_unhandled_failed_reviews(self, now: float) -> None:
         """A task left in 'review' whose latest review failed or asked for changes, with no fix or
@@ -4381,8 +4410,10 @@ class Daemon:
         if split:
             text += (f"\nSplit at head {split[:12]}: no review of it; its continue hop builds on this branch, and "
                      f"the chain's last hop gets the one review.")
+        # An urgent one's review is queued at once on a needs_review hand-off too (no sweep_after_s wait).
         review = self._auto_review(dict(task, **upd), summary) \
-            if new == "done" and task["kind"] == "code" and not split else None
+            if (new == "done" or new == "review" and urgent.is_urgent(task)) and task["kind"] == "code" \
+            and not split else None
         # A fix of a failed review that adds no commit to the head that review saw leaves its re-review
         # nothing new to check: the re-review is blocked, never run on the same head, and the coordinator
         # decides.
@@ -5681,30 +5712,55 @@ class Daemon:
         normal for a plain priority 1. One per task per stay in the queue (keyed on its last run); a free
         slot or any other hold restarts its clock. The clock is kept in memory, like check_stall's: after
         a daemon restart, or checks further apart than STALL_GAP_S, it counts from then. Nothing is
-        preempted: dispatch already starts these tasks first when a slot frees (db.ready_tasks)."""
+        preempted: dispatch already starts these tasks first when a slot frees (db.ready_tasks).
+        An urgent task (urgent.is_urgent) is raised once it has waited that long since it was queued
+        (urgent.waited_s) and anything holds it now (_start_hold: slots, the spend or auth gate, a pause,
+        a lock, a branch), the event naming that hold; the same fingerprint, so one event per wait."""
         now = time.time()
         last = getattr(self, "_slot_wait_checked", 0.0)
         if now - last < every_s:
             return
         self._slot_wait_checked = now
-        mins = float(self.cfg["coordinator"].get("urgent_slot_wait_min", 15) or 0)
+        mins = float(self.cfg["coordinator"].get("urgent_slot_wait_min", 10) or 0)
         if mins <= 0 or self.cfg_status == "unavailable" or self.settling() or now - last > STALL_GAP_S:
             self._slot_waits = {}
             return
         db = self.p.db
         due = obligations.owner_due(db)
-        urgent = [t for t in db.ready_tasks() if t["id"] in due or (t["priority"] or 0) == 1]
+        hot = [t for t in db.ready_tasks() if t["id"] in due or urgent.is_urgent(t)]
         core = self.cfg.get("core_provider", "claude")
         ctx = {"now": now, "paused": db.paused_resources(), "committed": None,
                "busy": {r["provider"]: r["n"] for r in db.q(
                    "SELECT provider, COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running' "
                    "GROUP BY provider")},
-               "logged_out": {prov: self._logged_out(prov) for prov in {t["provider"] or core for t in urgent}}}
-        full = {t["id"]: t for t in urgent
-                if self._start_hold(t, t["provider"] or core, ctx) == "gate" and t["id"] in ctx.get("full", {})}
+               "logged_out": {prov: self._logged_out(prov) for prov in {t["provider"] or core for t in hot}}}
+        full, other = {}, {}   # held only by the slots; an urgent task held by anything else (its words)
+        for t in hot:
+            why = self._start_hold(t, t["provider"] or core, ctx)
+            if why == "gate" and t["id"] in ctx.get("full", {}):
+                full[t["id"]] = t
+            elif why and urgent.is_urgent(t):
+                other[t["id"]] = (t, self._hold_words(t, why, ctx))
         seen = getattr(self, "_slot_waits", {})
         self._slot_waits = {tid: seen.get(tid, now) for tid in full}
+        for tid, (t, held) in other.items():
+            waited = urgent.waited_s(db, t, now)
+            if waited < mins * 60:
+                continue
+            ran = db.one("SELECT MAX(id) id FROM runs WHERE task=?", (tid,))
+            fp = f"slot_wait:{tid}:{(ran or {}).get('id') or 0}"
+            if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+                continue
+            text = (f"Urgent wait: #{tid} {t['title'][:80]} (urgent: {urgent.why(t)}) is ready but has waited "
+                    f"{waited / 60:.0f} min; held by {held}. It starts first once that clears: clear the hold "
+                    f"if it is ours to clear, else say why it must wait.")
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                 (now, "daemon", "observation", fp, "normal", text[:4000], "queued", tid))
+            log(self.p, f"urgent wait: task {tid} waited {waited / 60:.0f} min, held by {held[:200]}")
         for tid, t in full.items():
+            # An urgent task's clock runs from when it was queued, whatever held it; any other's from now.
+            start = now - urgent.waited_s(db, t, now) if urgent.is_urgent(t) else self._slot_waits[tid]
+            self._slot_waits[tid] = min(start, self._slot_waits[tid])
             if now - self._slot_waits[tid] < mins * 60:
                 continue
             ran = db.one("SELECT MAX(id) id FROM runs WHERE task=?", (tid,))
@@ -5783,6 +5839,21 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
                  (now, "daemon", loadcaps.CAP_WAIT, fp, "normal", text[:4000], "queued", tid))
             log(self.p, f"cap wait: task {tid} held {waited / 60:.0f} min by device.max_tasks ({cap}) with the device free")
+
+    def _hold_words(self, task: dict, why: str, ctx: dict) -> str:
+        """_start_hold's reason `why` for `task`, in words, from what it recorded in `ctx`."""
+        tid = task["id"]
+        if why == "held" and (b := ctx.get("branch", {}).get(tid)):
+            return f"task #{b[0]}, which is using {b[1]}"
+        if why in ("paused", "resource") and (h := ctx.get("holds", {}).get(tid)):
+            who = ", ".join(f"#{x}" for x in h.get("tasks") or []) or ", ".join(
+                str(x.get("holder")) for x in h.get("holders") or [] if x.get("holder"))
+            return f"{h.get('kind')} on resource {h.get('resource')}" + (f" ({who})" if who else "")
+        return {"held": "a disk guard or its review's pre-checks", "paused": "a paused resource",
+                "logged_out": f"the {task['provider'] or 'core'} provider's login (auth gate)",
+                "net": "its provider's API host not resolving", "gate": "the spend gate (no new work)",
+                "optional": "the spend gate (optional work held)", "device": "every device task slot taken",
+                "budget": "its spent task budget", "caps": "the dollar caps"}.get(why, why)
 
     def _log_resource_wait(self, task: dict, held: dict | None) -> None:
         """Log once per wait that dispatch skips ready `task` because a resource it needs is held, with
@@ -6757,9 +6828,12 @@ class Daemon:
             return "net"
         gate = ctx["gate"] = self.gates.get(provider) or \
             bud.evaluate(self.p.db, self.cfg, provider, bud.plan_windows(self.p.db))
-        if not gate.allow_new_work or ctx["busy"].get(provider, 0) >= gate.max_parallel:
+        # An urgent task may take budget.urgent_extra_slots beyond them, unless the gate allows no slot.
+        slots = gate.max_parallel + (urgent.extra_slots(self.cfg) if gate.max_parallel > 0
+                                     and urgent.is_urgent(task) else 0)
+        if not gate.allow_new_work or ctx["busy"].get(provider, 0) >= slots:
             if gate.allow_new_work:   # held only because every worker slot is taken (check_slot_wait)
-                ctx.setdefault("full", {})[task["id"]] = gate.max_parallel
+                ctx.setdefault("full", {})[task["id"]] = slots
             return "gate"
         if task["origin"] in ("schedule", "harness") and not gate.allow_optional:
             return "optional"
@@ -10206,7 +10280,7 @@ class Daemon:
             due = {}
 
         def rank(t: dict) -> tuple:
-            return t["id"] not in due, int(t["priority"] or 3)
+            return not urgent.is_urgent(t), t["id"] not in due, int(t["priority"] or 3)
         out = {}
         for lock, ts in excl.items():
             top = ts[0]
@@ -10583,7 +10657,7 @@ class Daemon:
             covers: dict[int, set[int]] = {}
             for t in todo:
                 ended = db.one("SELECT MAX(ended) e FROM runs WHERE task=?", (t["id"],))["e"]
-                if ended is None or now - float(ended) < after:
+                if ended is None or now - float(ended) < (0 if urgent.is_urgent(t) else after):
                     continue
                 if t["kind"] == "harness":
                     self._sweep_harness_review(t, reviews, float(since.get(t["id"]) or 0), merged.get(str(t["id"])), now)
@@ -10743,7 +10817,8 @@ class Daemon:
                  "commits and branches as they are.",
                  "Return the verdict and findings."]
         tier = "light" if task.get("tier") == "light" else "standard"
-        rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=chainprio.of(db, task), origin="daemon",
+        rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=min(chainprio.of(db, task), urgent.PRIORITY)
+                          if urgent.is_urgent(task) else chainprio.of(db, task), origin="daemon",
                           budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
                           depends_on=[task["id"]], labels=[f"auto_review:{task['id']}", push.REVIEW_ONLY_LABEL],
                           **pin_of(task))
@@ -10800,11 +10875,13 @@ class Daemon:
         except Exception:
             log(self.p, "unreviewed sweep failed\n" + traceback.format_exc())
             return []
-        for t in todo:
-            if len(done) >= cap or time.time() - now > UNREVIEWED_PASS_S:
+        hot = 0   # urgent tasks' reviews: counted against no cap, and they wait for no sweep_after_s
+        for t in urgent.first(todo):
+            if len(done) - hot >= cap and not urgent.is_urgent(t) or time.time() - now > UNREVIEWED_PASS_S:
                 break
             try:
-                if self._unreviewed_skip(t, reviews, rows, covers, code, live, ref, never, waited, now):
+                if self._unreviewed_skip(t, reviews, rows, covers, code, live, ref, never,
+                                         0 if urgent.is_urgent(t) else waited, now):
                     continue
                 review = self._auto_review(t, str(load_result(t["result"]).get("summary") or ""), add=True)
             except Exception as e:
@@ -10812,6 +10889,7 @@ class Daemon:
                 continue
             if review and review[1]:
                 done.append(t["id"])
+                hot += urgent.is_urgent(t)
                 log(self.p, f"task {t['id']}: {t['status']} with an unlanded head and no review; queued review "
                             f"#{review[0]}")
                 db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
@@ -11122,7 +11200,8 @@ class Daemon:
             + ([PRECHECK_LABEL + checks.name] if checks else []) + ([push.REVIEW_ONLY_LABEL] if elsewhere or off or never or ext else []) + ([push.LAND_LABEL] if lands else []) \
             + ([f"pr_branch:{elsewhere}"] if own_step else []) + reviewhold.labels(full, held) \
             + ([extchange.HEAD_LABEL + ext["head"]] if ext else [])
-        rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=chainprio.of(db, task), origin="daemon",
+        rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=min(chainprio.of(db, task), urgent.PRIORITY)
+                          if urgent.is_urgent(task) else chainprio.of(db, task), origin="daemon",
                           budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
                           depends_on=[task["id"]], labels=labels, **pin_of(task))
         log(self.p, f"task {task['id']}: queued review #{rid} ({tier})" + (

@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import checkdirs, batch, conflictfix, coordinator as coord, cyclenotice, envfault, locks, msgparts, prhead, push, pushclaim, replymsg, runner, scopehold, sharedchecks, timefmt, upstream
+from . import checkdirs, batch, conflictfix, coordinator as coord, cyclenotice, envfault, locks, msgparts, prhead, push, pushclaim, replymsg, runner, scopehold, sharedchecks, timefmt, upstream, urgent
 from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
                  pin_of, review_subject, reviewed_ids)
 from .landed import on_branch
@@ -661,7 +661,8 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     while the last one or its after_push (the deploy) still runs. After a clean batch an approval
     starts one at once unless a review is running or ready, which it waits for at most
     delivery.push_batch_s. After a batch that did not end clean (a failing tip, a dead batch), unless
-    the batch is full or holds a priority-1 approval or one the last batch requeued untested, it
+    the batch is full or holds an urgent approval (urgent.covers_urgent: a priority-1 review, or a
+    review of an urgent task: it starts at once) or one the last batch requeued untested, it
     waits for delivery.push_min_gap_s since the last one."""
     now = time.time() if now is None else now
     if not enabled(p, cfg):
@@ -677,6 +678,8 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     rows = _approved(db, f"{remote}/{branch}")
     if not rows:
         return [], "nothing approved"
+    hot = {r["id"] for r in rows if urgent.covers_urgent(db, db.task(r["task"]))}
+    rows.sort(key=lambda r: r["id"] not in hot)   # urgent approvals first (stable: priority, id within)
     paused = db.paused_resources()
     if push.lock_name(remote, branch) in paused or "push" in paused:
         return [], "the push resource is paused"
@@ -710,8 +713,8 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
         why = f"{len(rows)} approvals"
     elif last and last["outcome"] == "rebooted":
         why = f"a rerun of {last['id']}, cut short by a reboot"
-    elif any(r["priority"] == 1 for r in rows):
-        why = "a priority-1 review"
+    elif hot & {r["id"] for r in rows}:
+        why = "an urgent review"
     elif untested:
         why = f"{len(untested)} approval{'s' if len(untested) != 1 else ''} {last['id']} requeued untested"
     elif last and last["outcome"] not in CLEAN_OUTCOMES and (left := _gap_left(db, now, gap)) > 0:
