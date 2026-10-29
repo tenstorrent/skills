@@ -908,3 +908,103 @@ def test_an_urgent_lock_waiter_goes_ahead_of_routine_ones_and_only_an_urgent_tas
     assert [cli._urgent_priority(p, str(t)) for t in (a, b, c)] == [None, 1, 1]
     assert cli._urgent_priority(p, "") is None and cli._urgent_priority(p, "99999") is None
     assert cli._urgent_priority(p, "#12") is None, "only a plain task id"
+
+
+def _fake_proc(root, procs):
+    """A /proc stand-in under `root` with each (pid here, pid namespace, NSpid, state) of `procs`."""
+    root.mkdir(exist_ok=True)
+    for here, ns, nspid, state in procs:
+        (root / str(here) / "ns").mkdir(parents=True)
+        os.symlink(ns, root / str(here) / "ns" / "pid")
+        (root / str(here) / "status").write_text(f"Name:\tx\nState:\t{state} (x)\nNSpid:\t{nspid}\n")
+    return root
+
+
+def test_lock_probe_judges_a_pid_from_another_pid_namespace_through_that_namespace(env, tmp_path, monkeypatch):
+    """A taker or keeper in a sandbox records its pid in its own PID namespace: the probe says the pid is
+    from another namespace and judges it through /proc (that namespace's process with that innermost pid),
+    alive unknown with why only when nothing of that namespace is visible. A done task's hold is stale
+    only when its holder is gone, never when it lives or cannot be checked. Same-namespace, other-host and
+    cannot-tell-its-own-namespace labels read as before."""
+    from ttp import locks
+    me = os.uname().nodename
+    foreign = {"pid": 2, "node": me, "pidns": "pid:[999]"}
+    monkeypatch.setattr(locks, "_PROC", str(tmp_path / "no-proc"))
+    # Same namespace: judged directly, /proc never scanned.
+    same = {"pid": os.getpid(), "node": me, "pidns": locks._pid_ns()}
+    assert locks._pid_note(same) == f", pid {os.getpid()} alive" and locks.pid_alive(same) is True
+    assert locks._pid_note({"pid": 2, "node": "another-host", "pidns": "pid:[999]"}) == ", pid 2"
+    assert locks.pid_alive({"pid": 2, "node": "another-host", "pidns": "pid:[999]"}) is None
+    cases = [
+        ("live", [(4321, "pid:[999]", "4321 2", "S")], True, ", pid 2 (from another PID namespace; pid 4321 here) alive"),
+        ("dead", [(4321, "pid:[999]", "4321 1", "S"), (4322, "pid:[5]", "4322 2", "S")], False,
+         ", pid 2 (from another PID namespace, which no longer has it) gone"),
+        ("zombie", [(4321, "pid:[999]", "4321 2", "Z")], False,
+         ", pid 2 (from another PID namespace, which no longer has it) gone"),
+        ("unseen", [(4322, "pid:[5]", "4322 2", "S")], None,
+         ", pid 2 (from another PID namespace, not meaningful here; alive unknown: "
+         "no process of its PID namespace is visible from here)"),
+    ]
+    p = make(env)
+    t = p.db.add_task("holder", "s", kind="work", origin="user")
+    p.db.update_task(t, status="done")
+    held = _held_build_lock(p, "build-a", "x")
+    paths = [pathlib.Path(held.name)]
+    try:
+        for name, procs, alive, note in cases:
+            monkeypatch.setattr(locks, "_PROC", str(_fake_proc(tmp_path / name, procs)))
+            assert locks._pid_note(foreign) == note, name
+            assert locks.pid_alive(foreign) is alive, name
+            held.seek(0)
+            held.truncate()
+            held.write(json.dumps({"holder": f"task #{t} (run 99)", "since": time.time(), "command": "x", **foreign}))
+            held.flush()
+            rec = locks.holder_records(paths, p)[0]
+            assert rec["alive"] is alive and rec["stale"] is (alive is False), (name, rec)
+            assert rec["note"].startswith(note.removeprefix(", ")), (name, rec)
+        # A side that cannot tell its own namespace judges nothing, as before.
+        monkeypatch.setattr(locks, "_pid_ns", lambda: None)
+        assert locks._pid_note(foreign) == ", pid 2" and locks.pid_alive(foreign) is None
+    finally:
+        held.close()
+
+
+def test_lock_probe_sees_a_sandboxed_keeper_alive_then_gone(env, tmp_path):
+    """End to end in a real PID namespace: a taker inside one hands its slot to a keeper there; `ttp lock
+    --probe` outside names the keeper's pid as another namespace's, alive with its pid here, then gone once
+    the keeper ends while the taker still holds the slot."""
+    from ttp import locks, shared
+    unshare = shutil.which("unshare")
+    probe_ns = [unshare, "--user", "--map-current-user", "--pid", "--fork", "--mount-proc", "true"] if unshare else []
+    if not unshare or subprocess.run(probe_ns, capture_output=True, timeout=30).returncode:
+        pytest.skip("no unprivileged PID namespaces here")
+    p = make(env)
+    cfg = p.config()
+    path = locks.slot_paths(shared.locks_dir(p, "build-a", cfg), "build-a", shared.slots(p, "build-a", cfg))[0]
+    ready, stop, runtime = tmp_path / "ready", tmp_path / "stop", str(TTP.parents[1] / "runtime")
+    inner = (f"import os, subprocess, sys, time\nsys.path.insert(0, {runtime!r})\nfrom ttp import locks\n"
+             f"f = locks.try_take([__import__('pathlib').Path({str(path)!r})], 'sandboxed taker', 'x')\n"
+             "k = subprocess.Popen(['sleep', '300'])\nlocks.label_pid(f, k.pid)\n"
+             f"open({str(ready)!r}, 'w').write(str(k.pid))\n"
+             f"while not os.path.exists({str(stop)!r}): time.sleep(0.05)\n"
+             "k.kill(); k.wait()\n"
+             f"open({str(ready)!r}, 'w').write('gone')\n"
+             f"while os.path.exists({str(stop)!r}): time.sleep(0.05)\n")
+    proc = subprocess.Popen(probe_ns[:-1] + [sys.executable, "-c", inner])
+    try:
+        assert _wait_for(lambda: ready.exists() and ready.read_text().strip().isdigit(), 30), "taker never took it"
+        out = _ttp_run(p, "lock", "--probe", "build-a").stdout
+        assert "from another PID namespace; pid " in out and ") alive" in out, out
+        rec = json.loads(_ttp_run(p, "lock", "--probe", "--json", "build-a").stdout)["holders"][0]
+        assert rec["alive"] is True and rec["pidns"] != locks._pid_ns() and rec["via"] == "keeper", rec
+        stop.touch()
+        assert _wait_for(lambda: ready.read_text() == "gone", 30)
+        out = _ttp_run(p, "lock", "--probe", "build-a").stdout
+        assert "(from another PID namespace, which no longer has it) gone" in out, out
+    finally:
+        stop.unlink(missing_ok=True)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()

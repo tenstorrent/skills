@@ -198,29 +198,77 @@ def label_pid(f, pid: int) -> None:
 
 def _pid_note(h: dict) -> str:
     """", pid N alive" (or "gone") for a label naming its holder process; only the pid when this
-    process cannot judge it (another host or PID namespace, or a label from before pids)."""
+    process cannot judge it (another host, or a label from before pids). A pid from another PID
+    namespace on this host is not meaningful here: the note says so and judges the process it names
+    through that namespace (_foreign_pid), or says why it cannot."""
     try:
         pid = int(h.get("pid") or 0)
     except (TypeError, ValueError):
         return ""
     if pid <= 0:
         return ""
-    if _judgeable(h) and kthread(pid):
-        return f", pid {pid} {UNVERIFIABLE}"
-    return f", pid {pid}" + ((" alive" if _alive(pid) else " gone") if _judgeable(h) else "")
+    if _judgeable(h):
+        if kthread(pid):
+            return f", pid {pid} {UNVERIFIABLE}"
+        return f", pid {pid}" + (" alive" if _alive(pid) else " gone")
+    if (got := _foreign_pid(h)) is None:
+        return f", pid {pid}"
+    here, why = got
+    return (f", pid {pid} (from another PID namespace; pid {here} here) alive" if here else
+            f", pid {pid} (from another PID namespace, which no longer has it) gone" if here == 0 else
+            f", pid {pid} (from another PID namespace, not meaningful here; alive unknown: {why})")
 
 
 def pid_alive(h: dict) -> bool | None:
     """Whether the process a label or record names (its "pid": a keeper's once handed to one) lives; None
-    when it names none or this process cannot judge it (_judgeable)."""
+    when it names none or this process cannot judge it (_judgeable; one of another PID namespace on this
+    host through _foreign_pid)."""
     try:
         pid = int(h.get("pid") or 0)
     except (TypeError, ValueError):
         return None
-    return _alive(pid) if pid > 0 and _judgeable(h) and not kthread(pid) else None
+    if pid <= 0:
+        return None
+    if _judgeable(h):
+        return None if kthread(pid) else _alive(pid)
+    here = (_foreign_pid(h) or (None, ""))[0]
+    return None if here is None else here > 0
 
 
 UNVERIFIABLE = "is a kernel thread here: holder unverifiable"   # a label from a taker in another PID namespace
+_PROC = "/proc"
+
+
+def _foreign_pid(h: dict) -> tuple[int | None, str] | None:
+    """For a label whose pid was seen in another PID namespace on this host (a taker or keeper in a
+    sandbox): that process as this one sees it, read from /proc: (its pid here, ""), (0, "") when its
+    namespace still has processes but none with that pid, or (None, why) when this cannot tell (its
+    namespace has no process visible from here: one beside or above this one). None for any other label
+    (this host and namespace, another host, or a side that cannot tell its namespace). Only held slots
+    are judged, so a namespace with nothing visible holds the slot from where this cannot see."""
+    ns, mine = h.get("pidns"), _pid_ns()
+    if h.get("node") != os.uname().nodename or not ns or not isinstance(ns, str) or not mine or ns == mine:
+        return None
+    try:
+        pid, names = int(h.get("pid") or 0), os.listdir(_PROC)
+    except (OSError, TypeError, ValueError) as e:
+        return None, f"cannot read {_PROC} ({e})"
+    seen = False
+    for n in names:
+        if not n.isdigit():
+            continue
+        try:
+            if os.readlink(f"{_PROC}/{n}/ns/pid") != ns:
+                continue
+            seen = True
+            status = Path(f"{_PROC}/{n}/status").read_text().splitlines()
+        except OSError:
+            continue
+        nspid = next((x.split()[1:] for x in status if x.startswith("NSpid:")), [])
+        state = next((x.split()[1:2] for x in status if x.startswith("State:")), [])
+        if nspid and nspid[-1] == str(pid) and state != ["Z"]:
+            return int(n), ""
+    return (0, "") if seen else (None, "no process of its PID namespace is visible from here")
 
 
 def _judgeable(h: dict) -> bool:
@@ -267,9 +315,12 @@ def _holder_note(h: dict, where=None) -> str:
     except Exception:
         run = task = None
     live = note.endswith(" alive")
-    if UNVERIFIABLE in note and run and int(run.get("pid") or 0) > 0:   # its run's worker says instead
-        worker, live = _worker_note(run, lbl["run"])
-        note += ";" + worker.removeprefix(",")
+    unknown = "alive unknown: " in note   # another PID namespace's, not judged dead
+    if UNVERIFIABLE in note:   # its run's worker says instead; with none to ask, neither alive nor dead
+        unknown = not (run and int(run.get("pid") or 0) > 0)
+        if not unknown:
+            worker, live = _worker_note(run, lbl["run"])
+            note += ";" + worker.removeprefix(",")
     if not note:
         wp = int(run.get("pid") or 0) if run else 0
         if wp > 0:
@@ -288,7 +339,7 @@ def _holder_note(h: dict, where=None) -> str:
         if jobs:
             note += "; " + ", ".join(jobs[:3]) + (f" +{len(jobs) - 3} more" if len(jobs) > 3 else "")
     note += _job_note(h)
-    if task and task["status"] == "done" and not live:
+    if task and task["status"] == "done" and not live and not unknown:
         note += f"; stale: task #{lbl['task']} is done"
     return note
 
