@@ -22,6 +22,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from . import gitmemo
+
 PLUGIN_DIR = Path(__file__).resolve().parent / "pytest_resume"
 PLUGIN, ENV, OUT = "ttp_pytest_rerun", "TTP_PYTEST_RERUN", "TTP_PYTEST_RERUN_OUT"
 FILE = "added-tests-rerun.jsonl"   # the rerun plugin's record, in the run's directory
@@ -33,7 +35,8 @@ _SHELL = re.compile(r"[;&|\n`]|\$\(")
 
 
 def _git(top: str | Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(top), *args], capture_output=True, text=True)
+    return subprocess.run(["git", "-C", str(top), *args], capture_output=True, text=True,
+                          timeout=gitmemo.timeout(None, args))
 
 
 def _test_file(path: str) -> bool:

@@ -853,12 +853,13 @@ def mirror_check(v: Any, push_branch: str) -> list[dict]:
 
 def _git_net(repo: Path, *args: str, timeout_s: float = MIRROR_TIMEOUT_S) -> subprocess.CompletedProcess:
     """git that talks to a remote: no prompt, no stdin, at most `timeout_s` (exit 124 when it runs past)."""
+    t = gitmemo.timeout(timeout_s, args)
     try:
         return subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True,
-                              stdin=subprocess.DEVNULL, timeout=timeout_s,
+                              stdin=subprocess.DEVNULL, timeout=t,
                               env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
     except subprocess.TimeoutExpired:
-        return subprocess.CompletedProcess(args, 124, "", f"timed out after {timeout_s:.0f} s")
+        return subprocess.CompletedProcess(args, 124, "", f"timed out after {t:.0f} s")
 
 
 def _remote_head(repo: Path, remote: str, branch: str) -> tuple[bool, str]:
@@ -2639,7 +2640,7 @@ def never_published(repo: Path, d: dict, branch: str, timeout: float = 30) -> bo
     def git(*args: str) -> subprocess.CompletedProcess | None:
         try:
             return subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True,
-                                  timeout=timeout, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+                                  timeout=gitmemo.timeout(timeout, args), env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
         except (OSError, subprocess.SubprocessError):
             return None
     if not worktree.valid_branch(branch):

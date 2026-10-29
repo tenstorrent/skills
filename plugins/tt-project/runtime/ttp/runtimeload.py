@@ -34,6 +34,7 @@ import time
 from pathlib import Path
 
 from .project import Project, durable_write
+from . import gitmemo
 
 # When this process imported its code: a runtime file written later is not what it runs. The daemon
 # imports this module first of its own, so the time is taken before the rest of its modules load.
@@ -43,7 +44,7 @@ ROLLBACK_RE = re.compile(r"roll back runtime to ([0-9a-f]{7,40})")   # service.r
 
 
 def _git(h: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(h), *args], capture_output=True, text=True, timeout=60)
+    return subprocess.run(["git", "-C", str(h), *args], capture_output=True, text=True, timeout=gitmemo.timeout(60, args))
 
 
 def head(h: Path) -> str | None:

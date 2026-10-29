@@ -24,6 +24,8 @@ import re
 import subprocess
 import time
 
+from . import gitmemo
+
 KEY = "conflict_fix"
 LIGHT_FAILED = "the light conflict fix ended"
 TRIMS = "trim_fixes"   # a review result's count of trim-to-fit fixes the push queue sent it
@@ -91,7 +93,7 @@ def of(task: dict) -> dict | None:
 
 
 def _git(root: str, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", root, *args], text=True, capture_output=True, timeout=60,
+    return subprocess.run(["git", "-C", root, *args], text=True, capture_output=True, timeout=gitmemo.timeout(60, args),
                           stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
 
 

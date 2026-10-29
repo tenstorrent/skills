@@ -24,6 +24,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from . import gitmemo
+
 GH_TIMEOUT_S = 20
 FIELDS = "headRepository,headRepositoryOwner,isCrossRepository,headRefName,state,url"
 PREFIX = "ttp-head-"       # remotes this module adds for a fork
@@ -39,7 +41,7 @@ _HOST = re.compile(r"^(?:[A-Za-z][A-Za-z0-9+.-]*://)?(?:[^@/]+@)?(?P<host>[^/:]+
 
 def _git(repo, *args: str, timeout: float = 30) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=timeout,
+        return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=gitmemo.timeout(timeout, args),
                               stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(args, 124, "", f"git {args[0]} timed out")

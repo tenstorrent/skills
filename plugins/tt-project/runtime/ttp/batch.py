@@ -51,6 +51,7 @@ from . import (checkcap, checkdirs, conflictfix, cyclenotice, envfault, locks, p
                scriptwatch,
                sharedchecks, slowtests, suitecost, worktree)
 from .project import Project, command_env, durable_write, write_json
+from . import gitmemo
 
 WORKTREE = "push"             # the batch's own checkout under the project's worktrees (never t<id>)
 AFTER_PUSH = "after_push-"    # + batch id: the temporary checkout after_push runs in
@@ -86,7 +87,7 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
     """git with its output captured. No editor opens (a rebase continues with the message it has),
     and no recorded resolution (rerere) settles a conflict behind the resolver's back."""
     return subprocess.run(["git", "-C", str(cwd), "-c", "rerere.enabled=false", *args], text=True,
-                          capture_output=True, env={**os.environ, "GIT_EDITOR": "true"})
+                          capture_output=True, env={**os.environ, "GIT_EDITOR": "true"}, timeout=gitmemo.timeout(None, args))
 
 
 def _last(text: str, n: int = push.LOG_TAIL) -> str:

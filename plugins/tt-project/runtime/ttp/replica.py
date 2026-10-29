@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any
 
 from . import project
+from . import gitmemo
 
 STATE = "replica.json"         # in state/: the last attempt and the last shipped snapshot
 LOCK = "replica.lock"          # in state/: one snapshot in flight per project
@@ -219,7 +220,7 @@ def _answer(out: bytes, err: bytes, rc: int) -> dict:
 
 # building -----------------------------------------------------------------------------------------
 def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    r = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=TIMEOUT_S)
+    r = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=gitmemo.timeout(TIMEOUT_S, args))
     if check and r.returncode:
         raise SnapshotError(f"git {args[0]} in {cwd.name} failed: {r.stderr.strip()[-300:]}")
     return r

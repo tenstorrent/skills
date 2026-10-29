@@ -13,6 +13,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from . import gitmemo
+
 KV = "push_scope_held"       # kv: {scope: {"rows": [push_queue ids], "probe_at", "holds", "probe"}}
 ALERT = "push_scope"         # alert key: "push_scope:<scope>" (alerts.holds: while KV names the scope)
 WORKFLOW_DIR = ".github/workflows/"
@@ -40,7 +42,7 @@ def classify(stderr: str) -> list[dict]:
 
 
 def _git(repo: Path, *args: str) -> list[str]:
-    r = subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True)
+    r = subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True, timeout=gitmemo.timeout(None, args))
     return [x for x in r.stdout.splitlines() if x.strip()] if r.returncode == 0 else []
 
 

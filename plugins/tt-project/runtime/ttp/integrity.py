@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 from .project import Project, bad_sections, durable_write, hostname
+from . import gitmemo
 
 FSCK_TIMEOUT_S = 20
 STATUS_TIMEOUT_S = 10
@@ -29,7 +30,7 @@ _POINTER = re.compile(r"\]\(memory/([^)]+\.md)\)")
 
 def _git(cwd: Path, *args: str, timeout: float) -> subprocess.CompletedProcess:
     # No optional locks: a status must never fight a running worker over its index.
-    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, timeout=timeout,
+    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, timeout=gitmemo.timeout(timeout, args),
                           env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
 
 

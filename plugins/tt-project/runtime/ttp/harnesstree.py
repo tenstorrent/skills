@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 
 from .project import Project, durable_write, git_fsync_args
+from . import gitmemo
 
 DIR = "harness-worktrees"
 IDENT = ["-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost"]
@@ -49,7 +50,7 @@ def branch(tid: int) -> str:
 
 def _git(cwd: Path, *args: str, timeout: float = 60) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", str(cwd), *git_fsync_args(), *IDENT, *args], capture_output=True,
-                          text=True, timeout=timeout)
+                          text=True, timeout=gitmemo.timeout(timeout, args))
 
 
 def _is_repo(p: Project) -> bool:

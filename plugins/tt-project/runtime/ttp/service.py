@@ -29,6 +29,7 @@ from pathlib import Path
 
 from . import poll_s
 from .project import Project, durable_write
+from . import gitmemo
 
 
 def unit_name(p: Project) -> str:
@@ -428,7 +429,7 @@ def restart_service(p: Project) -> str:
 
 def _git(h: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", str(h), "-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost",
-                           *args], capture_output=True, text=True, timeout=120)
+                           *args], capture_output=True, text=True, timeout=gitmemo.timeout(120, args))
 
 
 # A caller that cannot reach the service manager (a sandboxed worker: no user bus, no signals to the

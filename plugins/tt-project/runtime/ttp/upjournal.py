@@ -30,6 +30,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from . import gitmemo
+
 JOURNAL = "upgrade.journal"
 MAX_INTERRUPTS = 3      # an automatic upgrade cut short this often in a row is recorded failed, not retried
 
@@ -102,7 +104,7 @@ def dead(rec: dict) -> bool:
 
 
 def _git(h: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(h), *args], capture_output=True, text=True)
+    return subprocess.run(["git", "-C", str(h), *args], capture_output=True, text=True, timeout=gitmemo.timeout(None, args))
 
 
 def _contains(h: Path, commit: str) -> bool:

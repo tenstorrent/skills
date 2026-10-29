@@ -36,6 +36,7 @@ from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, r
                       durable_append, durable_write, write_json, ACCOUNT_KEYS, DEFAULT_CONFIG, deep_merge,
                       load_account_settings, set_account_setting, zombie, device_timeout_max, command_env,
                       NOTE_RUN_ENV, in_run, replace_copy, sync_all, MEMORY_AUDIENCES)
+from . import gitmemo
 
 RUNTIME = Path(__file__).resolve().parent.parent              # .../runtime (plugin or project copy)
 PLUGIN_ROOT = RUNTIME.parent                                   # plugin root, or a project's harness/
@@ -550,7 +551,8 @@ def _copy_tree(src: Path, dst: Path) -> None:
 
 
 def _git(cwd: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True).stdout.strip()
+    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True,
+                          timeout=gitmemo.timeout(None, args)).stdout.strip()
 
 
 SOURCE_FILE = "SOURCE_COMMIT"      # in runtime/ttp/: the git commit (or content hash) `ttp setup` installed this runtime from

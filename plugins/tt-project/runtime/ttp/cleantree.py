@@ -23,6 +23,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from . import gitmemo
+
 PREFIX = "ttp-checks-"
 AUTHORING = "authoring"   # a check's "cwd" that runs it in the authoring worktree
 CWDS = (AUTHORING, "clean")
@@ -38,7 +40,7 @@ class Error(Exception):
 
 def _git(cwd: str | Path, *args: str, timeout: float = 600) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", str(cwd), "-c", "core.hooksPath=/dev/null", "-c", "submodule.recurse=false",
-                           *args], capture_output=True, text=True, timeout=timeout)
+                           *args], capture_output=True, text=True, timeout=gitmemo.timeout(timeout, args))
 
 
 def _last(text: str) -> str:

@@ -24,6 +24,8 @@ import time
 import uuid
 from pathlib import Path
 
+from . import gitmemo
+
 DEFAULT_TTL_S = 300
 HOLD_FRACTION = 0.8        # the holder stops counting itself the holder this far into a ttl
 TAKE_FRACTION = 1.25       # another host takes a lease seen unchanged this long
@@ -160,7 +162,7 @@ def _git(args: list[str], cwd: Path | str | None = None, *, input: str | None = 
     e = {**os.environ, "GIT_TERMINAL_PROMPT": "0", **(env or {})}
     e.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=10")
     return subprocess.run(["git", *args], cwd=cwd, input=input, capture_output=True, text=True,
-                          timeout=timeout, env=e)
+                          timeout=gitmemo.timeout(timeout, args), env=e)
 
 
 def own_repos() -> set[str]:

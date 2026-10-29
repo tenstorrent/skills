@@ -37,6 +37,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from . import gitmemo
+
 SHARED = "shared"                # a claim on another task's commit
 KEY = "push_verify"              # tasks.result of a task in `pushing` until its claims are verified
 HANDOFF = "push_claim_handoff.json"   # the hand-off waiting on the check, in its run's folder
@@ -69,7 +71,7 @@ _NOT_REFS = {"the", "a", "an", "it", "its", "origin", "remote", "github", "branc
 
 def _git(repo, *args: str, timeout: float = 30) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=timeout,
+        return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=gitmemo.timeout(timeout, args),
                               stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
     except (OSError, subprocess.TimeoutExpired) as e:
         return subprocess.CompletedProcess(args, 124, "", f"{type(e).__name__}: {e}")
