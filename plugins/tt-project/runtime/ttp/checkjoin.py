@@ -58,9 +58,8 @@ def folder(state: Path) -> Path:
 
 
 def _write(path: Path, rec: dict) -> None:
-    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}")
-    tmp.write_text(json.dumps(rec))
-    os.replace(tmp, path)
+    from .project import durable_write
+    durable_write(path, json.dumps(rec))
 
 
 def _pid_ns() -> str:
