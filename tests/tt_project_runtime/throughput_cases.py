@@ -33,11 +33,32 @@ def _tp_busy_fixture(p, now, slots=2):
     return urgent, waiting
 
 
+def _tp_dispatch_hold(p, monkeypatch, task, at, label, kind="busy"):
+    """The dispatcher's own hold record at `at`: running holders of `label` until Daemon._resource_hold
+    names `task` held, then Daemon._log_resource_wait writes the dispatch_hold event measure() reads.
+    The holders are removed after, so only the record stays."""
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    holders, rec = [], None
+    while len(holders) < 4:
+        holders.append(p.db.add_task(f"holder {len(holders)}", "s", origin="user"))
+        p.db.x("UPDATE tasks SET status='running', labels=? WHERE id=?", (json.dumps([label]), holders[-1]))
+        rec = d._resource_hold(p.db.task(task))
+        if rec:
+            break
+    assert rec and rec["kind"] == kind, rec
+    with monkeypatch.context() as m:
+        m.setattr(time, "time", lambda: at)
+        d._log_resource_wait(p.db.task(task), rec)
+    p.db.x(f"DELETE FROM tasks WHERE id IN ({','.join('?' * len(holders))})", holders)
+    return rec
+
+
 def _tp_lane(rep, name):
     return next(ln for ln in rep["lanes"] if ln["lane"] == name)
 
 
-def test_throughput_measures_waits_per_lane_from_task_run_and_push_records(env):
+def test_throughput_measures_waits_per_lane_from_task_run_and_push_records(env, monkeypatch):
     from ttp import throughput
     p = make(env)
     now = time.time()
@@ -47,6 +68,7 @@ def test_throughput_measures_waits_per_lane_from_task_run_and_push_records(env):
     _tp_task(p, "after #5", now - 5 * 3600, labels=["start_when:landed:#5", f"deferred_since:{now - 5 * 3600}"])
     p.set_config("resources", {"box": 1})
     dev = _tp_task(p, "device run", now - 3600, labels=["exclusive:box"])
+    _tp_dispatch_hold(p, monkeypatch, dev, now - 3500, "exclusive:box")
     code = _tp_task(p, "code change", now - 4 * 3600)
     _tp_run(p, code, now - 4 * 3600, now - 3 * 3600)
     rv = _tp_task(p, "Review #x", now - 3 * 3600 + 2400, labels=[f"auto_review:{code}"])
@@ -430,7 +452,8 @@ def test_throughput_idle_slots_are_not_raised_and_resource_lanes_are_only_report
     p.set_config("budget.max_parallel_workers", 6)
     p.set_config("resources", {"box": 1})
     _tp_task(p, "waits idle", now - 2 * 3600)       # nothing ran: slots sat idle
-    _tp_task(p, "box job", now - 2 * 3600, labels=["resource:box"])
+    _tp_dispatch_hold(p, monkeypatch, _tp_task(p, "box job", now - 2 * 3600, labels=["resource:box"]),
+                      now - 2 * 3600 + 60, "resource:box")
     monkeypatch.setattr(throughput, "cpu_free", lambda: (True, ""))
     rep = throughput.review(p, p.config(), do_apply=True, gates={}, now=now)
     assert rep["changes"] == [] and _tp_lane(rep, "worker_slots")["idle"] == 1
@@ -498,9 +521,10 @@ def test_speed_complaint_on_the_turn_start_runs_the_review_applies_and_queues_p1
     assert "landed_chain SLOW" in prompt and "Not changed: landed_chain (no setting)" in prompt
     assert not p.db.q("SELECT * FROM tasks WHERE title LIKE 'throughput: %'")
     # A slow resource lane has a setting a person or task may change: one p1 follow-up.
-    for i in range(2):
-        _tp_task(p, f"needs box {i}", now - 3 * 3600, prio=1, labels=["resource:boxA"])
     p.set_config("resources", {"boxA": 1})
+    for i in range(2):
+        _tp_dispatch_hold(p, monkeypatch, _tp_task(p, f"needs box {i}", now - 3 * 3600, prio=1,
+                                                   labels=["resource:boxA"]), now - 3 * 3600 + 60, "resource:boxA")
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
     p.db.post("in", "Why is this so slow", chat="c1")
     monkeypatch.setattr(time, "time", lambda: later + 300)
@@ -636,7 +660,8 @@ def test_throughput_a_wait_inside_a_pause_is_a_hold_with_no_limit_and_opens_no_t
     b = _tp_task(p, "on resumed box", now - 5 * 3600 + 120, prio=1, labels=["resource:boxB"])
     _tp_run(p, b, now - 3600 + 60, now - 1800)
     p.db.x("UPDATE tasks SET status='done' WHERE id=?", (b,))
-    _tp_task(p, "on busy box", now - 4 * 3600, prio=1, labels=["resource:boxC"])
+    _tp_dispatch_hold(p, monkeypatch, _tp_task(p, "on busy box", now - 4 * 3600, prio=1, labels=["resource:boxC"]),
+                      now - 4 * 3600 + 60, "resource:boxC")
     rep = throughput.measure(p.db, p.config(), now=now, gates={})
     hold = _tp_lane(rep, "hold")
     assert (hold["count"], hold["limit"], hold["limit_key"]) == (2, None, None) and hold["slow"]
@@ -650,9 +675,11 @@ def test_throughput_a_wait_inside_a_pause_is_a_hold_with_no_limit_and_opens_no_t
     assert "hold SLOW" in throughput.text({**rep, "kept": kept})
 
 
-def test_throughput_a_self_wait_or_its_own_job_is_own_job_not_its_resource(env, tmp_path):
-    """Re-queue waits handed off through the daemon (task_waiting data): wait=self, or live work whose
-    key names the task's own detached job, count as own_job; a plain lock wait stays its resource's."""
+def test_throughput_a_self_wait_or_its_own_job_is_own_job_not_its_resource(env, tmp_path, monkeypatch):
+    """Re-queue waits handed off through the daemon (task_waiting data): wait=self, live work whose key
+    names the task's own detached job, or a retry_when on its own results/ marker or .rc file, count as
+    own_job. A lock wait counts in its resource's lane only when the dispatcher recorded a hold naming
+    that resource for the task (Daemon._log_resource_wait); without one it is retry_wait."""
     from ttp import throughput
     from ttp.daemon import Daemon
     from ttp.providers.base import RunUsage
@@ -664,7 +691,10 @@ def test_throughput_a_self_wait_or_its_own_job_is_own_job_not_its_resource(env, 
     hand = {"self": {"wait_kind": "self", "waiting_for": "boxA bench results", "retry_when": "test -e out/done"},
             "job": {"wait_kind": "external", "waiting_for": "boxA bench job",
                     "retry_when": f"ttp detach --check {job} && ttp lock --probe boxA"},
-            "lock": {"waiting_for": "boxA busy", "retry_when": "ttp lock --probe boxA"}}
+            "marker": {"waiting_for": "boxA sweep", "retry_when": "test -e results/sweep.done"},
+            "rc": {"waiting_for": "boxA build", "retry_when": "test -s out/build.rc"},
+            "lock": {"waiting_for": "boxA busy", "retry_when": "ttp lock --probe boxA"},
+            "unheld": {"waiting_for": "boxA busy", "retry_when": "ttp lock --probe boxA"}}
     ids = {}
     for name, res in hand.items():
         tid = _tp_task(p, f"box work {name}", now - 3 * 3600, labels=["resource:boxA"])
@@ -680,10 +710,13 @@ def test_throughput_a_self_wait_or_its_own_job_is_own_job_not_its_resource(env, 
     data = {r["task"]: json.loads(r["data"]) for r in p.db.q("SELECT task, data FROM events WHERE kind='task_waiting'")}
     assert data[ids["self"]]["wait"] == "self" and data[ids["job"]]["live"]["key"].startswith("job:")
     assert data[ids["lock"]]["wait"] == "external"
+    # Only the "lock" wait has the dispatcher's hold record; "unheld" names the same box but has none.
+    _tp_dispatch_hold(p, monkeypatch, ids["lock"], time.time(), "resource:boxA")
     rep = throughput.measure(p.db, p.config(), now=time.time() + 1, gates={})
-    assert _tp_lane(rep, "own_job")["count"] == 2
+    assert _tp_lane(rep, "own_job")["count"] == 4
     box = _tp_lane(rep, "resource:boxA")
-    assert box["waiting_now"] == 1 and box["p90_s"] >= 2 * 3600 + 300
+    assert box["count"] == box["waiting_now"] == 1 and box["p90_s"] >= 2 * 3600 + 300
+    assert _tp_lane(rep, "retry_wait")["count"] == 1
 
 
 def test_throughput_review_sweep_of_a_run_that_ended_long_before_its_hand_off(env, tmp_path):

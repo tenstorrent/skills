@@ -10,8 +10,10 @@ to its first run, or to now for one still queued:
   or the provider gate's lower max_parallel (a spend gate: reported, never changed).
 - dependency: a dependency was not done during the wait (DB.unmet_dependencies' rule). Reported, no
   limit; a task's wait counts from the time its last dependency was done.
-- resource:<name> / device:<name>: a `resource:`/`exclusive:` label. Limit its slot count (a device
-  lock is always 1). Reported only: a box's headroom is not measurable from here.
+- resource:<name> / device:<name>: a `resource:`/`exclusive:` label, counted only when dispatch
+  recorded a hold of kind busy, lock, reserved or pause naming it for the task in the wait (its
+  dispatch_hold events, Daemon._log_resource_wait); else the wait goes on to worker_slots (a first
+  wait) or retry_wait (a re-queue wait). Limit its slot count (a device lock is always 1). Reported only: a box's headroom is not measurable from here.
 - hold: such a wait at least half inside a pause of one of its resources (a deliberate hold: the
   pauses in force, db.paused_resources, with shared ones and machine-wide fleet holds, and the ended
   ones, the resource_resumed events coordinator._wake_pause_waiters writes). No limit; a shorter
@@ -38,8 +40,11 @@ to its first run, or to now for one still queued:
   checks slot's own records (a checks_slot_wait event in the wait, or checkcap's waits log covering
   half of it): checks_slots (waiting for this project's other `ttp checks`; limit checks.slots per
   repository or checks.test_project_max per project, whichever of the two held the wait: both are
-  project settings, reported, never raised), own_job (its own detached job or checks: no
-  limit), the rules above for a deferral, provider or resource, else retry_wait (its own retry
+  project settings, reported, never raised; a wait is at the limit only when checkcap's waits log has it
+  queued, [queued, granted), while the project's recorded checks runs (checkwall) were at
+  checklane.project_cap: no per-repository run record exists), own_job (its own detached job or checks,
+  or a retry_when on its own driver: no limit), the resource rule above only with a dispatch hold recorded
+  in the wait, a deferral or provider hold, else retry_wait (its own retry
   condition, then a slot, not told apart: no limit, never counted against worker slots).
 
 A lane is slow when the 90th percentile of its waits is over the threshold: P1_WAIT_S for priority 1
@@ -160,17 +165,26 @@ def _wait_for(t: dict, e: dict) -> str:
     return (text[len(head):] if text.startswith(head) else text).lower()
 
 
+# A retry_when that probes the task's own driver: `ttp detach --check`, a results/ marker or an .rc file.
+OWN_PROBE = re.compile(r"\bdetach\s+--check\b|(?:^|[\s/'\"=])results/|\.rc\b")
+# The kinds of dispatch hold (Daemon._resource_hold) that keep a ready task off a resource.
+HOLD_KINDS = ("busy", "lock", "reserved", "pause")
+
+
 def _self_wait(e: dict) -> bool:
     """Whether a task_waiting event (Daemon's hand-off writer) is a wait on the task's own work: `wait`
-    self (unblock.classify_wait), or its live work (unblock.live_wait) names one of its own jobs."""
+    self (unblock.classify_wait), its live work (unblock.live_wait) names one of its own jobs, or its
+    retry_when (`probe`) checks its own driver (OWN_PROBE)."""
     from . import unblock
     if unblock.is_self_wait(e["data"]):
         return True
     try:
-        live = json.loads(e["data"] or "{}").get("live")
+        data = json.loads(e["data"] or "{}")
+        live, probe = data.get("live"), data.get("probe")
     except (ValueError, TypeError, AttributeError):
         return False
-    return isinstance(live, dict) and str(live.get("key") or "").startswith("job:")
+    return (isinstance(live, dict) and str(live.get("key") or "").startswith("job:")) \
+        or (isinstance(probe, str) and bool(OWN_PROBE.search(probe)))
 
 
 def _cfg(cfg: dict, dotted: str, default):
@@ -291,6 +305,12 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                 lane("hold", None, None)["note"] = "a deliberate pause or hold of its resource: no limit"
                 add(lanes["hold"], span, prio, w0, end, None, queued)
                 return True
+            # Only a hold dispatch recorded for this task in the wait (its dispatch_hold events) puts it
+            # in a resource's lane; a label alone is no evidence the resource held it.
+            named = {h for ts, h in res_held.get(t["id"], ()) if w0 <= ts <= end}
+            res = [r for r in res if r in named or locks.canonical(cfg, r) in named]
+            if not res:
+                return False
             for r in res:
                 lim = shared.own_slots(cfg, r)
                 ln = lane(("device:" if r in devices else "resource:") + r, None if r in devices else f"resources.{r}", lim)
@@ -308,6 +328,16 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             holds.setdefault(name, []).append((float((v or {}).get("since") or now), now))
     except Exception:   # an unreadable shared or fleet file leaves the ended pauses
         pass
+    res_held: dict[int, list[tuple[float, str]]] = {}
+    for e in db.q("SELECT ts, task, data FROM events WHERE kind='dispatch_hold' AND task IS NOT NULL AND ts>?",
+                  (t0 - DAY,)):
+        try:
+            v = json.loads(e["data"] or "{}")
+        except (ValueError, TypeError):
+            continue
+        if isinstance(v, dict) and v.get("kind") in HOLD_KINDS and v.get("resource"):
+            res_held.setdefault(e["task"], []).append((float(e["ts"]), str(v["resource"])))
+            res_held[e["task"]].append((float(e["ts"]), locks.canonical(cfg, str(v["resource"]))))
     for e in db.q("SELECT ts, data FROM events WHERE kind='resource_resumed' AND ts>?", (t0 - DAY,)):
         try:
             v = json.loads(e["data"] or "{}")
@@ -339,6 +369,25 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                 slot_log.setdefault(r["task"], []).append((r["queued_at"], r["granted_at"]))
     except Exception:
         pass
+    try:
+        from . import checkwall
+        ck_runs = checkwall.run_spans(Path(db.path).parent, now, now - t0 + 2 * DAY)
+    except Exception:
+        ck_runs = []
+
+    def queued_at_cap(task: int, w0: float, w1: float) -> bool:
+        """Whether `task` queued for a checks slot in [w0, w1] (checkcap's waits log: [queued, granted)
+        with granted after queued) while the project's recorded checks runs (checkwall) were at its cap.
+        Only the time before the grant counts: the task's own run starts at its grant. No grant record,
+        or one granted at once: not at the limit."""
+        for q, g in slot_log.get(task, ()):
+            a, b = max(q, w0), min(g, w1)
+            if not cap_n or b <= a:
+                continue
+            pts = [a] + [x for x, _ in ck_runs if a < x < b]
+            if max(sum(1 for x0, x1 in ck_runs if x0 <= x < x1) for x in pts) >= cap_n:
+                return True
+        return False
 
     def slot_held(task: int, w0: float, w1: float, extra: list | tuple = ()) -> str | None:
         """Which checks limit held `task` in [w0, w1] — "checks.slots" (its repository's lanes) or
@@ -414,7 +463,10 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                 # Which of the two checks limits held it: a checks_slot_wait event or checkcap record
                 # names the limit; a reason text alone means the legacy default, the project cap.
                 slot_tally[slot_held(t["id"], w0, w1) or CAP_KEY] += w1 - w0
-                add(lane("checks_slots", CAP_KEY, cap_n), w1 - w0, prio, w0, w1, None, queued)
+                ln = lane("checks_slots", CAP_KEY, cap_n)
+                add(ln, w1 - w0, prio, w0, w1, None, queued)
+                if cap_n and w1 - w0 > (p1_s if prio <= 1 else other_s):
+                    ln["at_limit" if queued_at_cap(t["id"], w0, w1) else "idle"] += 1
             elif selfw or "detach" in reason or "ttp checks" in reason or "own job" in reason:
                 lane("own_job", None, None)["note"] = "the task's own detached job or checks ran: no limit"
                 add(lanes["own_job"], w1 - w0, prio, w0, w1, None, queued)
@@ -490,7 +542,8 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
         "note", "a wait was held by the per-repository lane limit (checks.slots) or the project cap "
                 "(checks.test_project_max), whichever held more of this lane's wait time; both are "
                 "project settings (config_set checks.slots / checks.test_project_max): raise the one "
-                "that held it, or find what else runs on its lanes")
+                "that held it, or find what else runs on its lanes; at_limit counts only waits queued for a "
+                "checks slot while the project's recorded checks runs were at its cap")
     peak = _peak(spans, t0, now)
     out = []
     for ln in lanes.values():
@@ -537,7 +590,8 @@ def headroom(db: DB, cfg: dict, report: dict) -> tuple[bool, str]:
 
 
 def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
-    """(changes [{key, old, new, why}], kept [{lane, key, why}]) for the slow lanes."""
+    """(changes [{key, old, new, why}], kept [{lane, key, why, info?}]) for the slow lanes; `info` marks a
+    kept lane reported as information only (no change is ever proposed from it: it opens no task)."""
     ok, why_not = headroom(db, cfg, report)
     changes, kept = [], []
     th = report["thresholds_s"]
@@ -549,7 +603,8 @@ def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
         if name == "review_stall":
             # Never lowered: a sooner alarm starts no review sooner, it only adds coordinator wakes.
             n, fp90, held = ln.get("free_count", 0), ln.get("free_p90_s", 0), ln.get("slot_held", 0)
-            kept.append({"lane": name, "key": key, "why": f"{n} review wait(s) not held by the checks (p90 {fp90}s), "
+            kept.append({"lane": name, "key": key, "info": True,
+                         "why": f"{n} review wait(s) not held by the checks (p90 {fp90}s), "
                          f"{held} held by their precheck or a checks slot: information only, no {key} change is "
                          "proposed from them (a lower stall alarm only adds coordinator wakes)"})
             continue

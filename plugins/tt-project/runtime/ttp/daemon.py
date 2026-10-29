@@ -6117,13 +6117,22 @@ class Daemon:
 
     def _log_resource_wait(self, task: dict, held: dict | None) -> None:
         """Log once per wait that dispatch skips ready `task` because a resource it needs is held, with
-        the hold it recorded (`held`, _resource_hold's; check_stall forgets the task once nothing holds it)."""
+        the hold it recorded (`held`, _resource_hold's; check_stall forgets the task once nothing holds it),
+        and keep that hold as a dispatch_hold event (`data`: the hold), the record throughput.measure
+        reads to count a wait in its resource's lane."""
         logged = self.__dict__.setdefault("_res_wait_logged", set())
         if task["id"] in logged:
             return
         logged.add(task["id"])
         log(self.p, f"task {task['id']}: ready, not started: "
                     f"{hold_reason(held) if held else 'a resource it needs is busy'}")
+        if held:
+            try:
+                self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                            (time.time(), "daemon", "dispatch_hold", "low", hold_reason(held)[:500],
+                             json.dumps(held, default=str), "handled", task["id"]))
+            except Exception as e:   # the log line above still records it
+                log(self.p, f"could not record the hold of #{task['id']}: {e}")
 
     def check_idle_capacity(self, every_s: float = 60) -> None:
         """Model-free idle-capacity wake (idlecap.py): a device resource of the project idle for

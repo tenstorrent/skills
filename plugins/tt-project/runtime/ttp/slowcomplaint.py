@@ -8,8 +8,8 @@ review the same tick, model-free (throughput.py), instead of a prose answer.
 messages: on an inbound user message that matches it runs `throughput.review(apply=True)`, queues one
 priority 1 task listing the slow lanes it could not change itself (at most one open at a time: later
 lanes are added to it; a lane a closed one listed waits for new evidence or a cooldown, _followups;
-none for a lane with no setting, such as a hold, a deferral or the task's own job: the report still
-shows it), and returns the result as a digest section, so the turn reports numbers and changes. A second
+none for a lane with no setting, such as a hold, a deferral or the task's own job, or one reported as
+information only, such as review_stall: the report still shows it), and returns the result as a digest section, so the turn reports numbers and changes. A second
 complaint the same day runs it again; the result lists the earlier changes (throughput.recent)."""
 from __future__ import annotations
 
@@ -92,8 +92,8 @@ def _followups(db: DB, rep: dict, msg_ids: list[int], now: float | None = None) 
     open_ = min((r["id"] for r in rows if r["status"] not in TERMINAL_TASK_STATES), default=None)
     out, new, cite = {"opened": None, "listed": None, "held": []}, [], ", ".join("#" + str(i) for i in msg_ids)
     for k in rep.get("kept") or []:
-        if not k.get("key"):
-            continue   # no setting (a hold, a deferral, its own job): reported, no task
+        if not k.get("key") or k.get("info"):
+            continue   # no setting (a hold, a deferral, its own job) or information only: reported, no task
         ln = next((x for x in rep["lanes"] if x["lane"] == k["lane"]), {})
         prev = next(((r, m) for r in rows for m in reversed(_LISTED.findall(r["spec"] or "")) if m[0] == k["lane"]),
                     None)

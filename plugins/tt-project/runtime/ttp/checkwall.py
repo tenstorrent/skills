@@ -78,6 +78,27 @@ def recent(state: Path | None, now: float | None = None) -> list[float]:
     return out[-RECENT:]
 
 
+def run_spans(state: Path | None, now: float | None = None, window_s: float = KEEP_S) -> list[tuple[float, float]]:
+    """(start, end) of each completed run record_run kept that ended in the last `window_s`."""
+    if state is None:
+        return []
+    now = time.time() if now is None else now
+    out = []
+    try:
+        lines = (Path(state) / RUNS_LOG).read_text().splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        try:
+            r = json.loads(line)
+            end, s = float(r["ts"]), float(r["s"])
+        except (ValueError, KeyError, TypeError):
+            continue
+        if s > 0 and now - window_s <= end <= now:
+            out.append((end - s, end))
+    return out
+
+
 def cap(p, now: float | None = None) -> tuple[float, str]:
     """(the cap in seconds, 0 for none; how it was set) for project `p` (None: the account's or default)."""
     own = ((p.config() if p else {}).get("checks") or {}) if p else {}
