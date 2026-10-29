@@ -18008,3 +18008,71 @@ def test_chat_settable_query_answers_without_setting_and_the_skill_lists_it(env,
     assert ask("budget.daly_usd")[0] == 1
     ref = (RUNTIME.parent / "skills" / "tt-project-harness" / "references" / "chat-settable-config.md").read_text()
     assert "ttp config --chat-settable" in ref and all(f"`{x}`" in ref for x in chatset.PATTERNS)
+
+
+def _queued_checks_run(p, tmp_path, removed):
+    """A run dir whose detached checks were queued for the daemon; when `removed`, the request was then
+    taken out of the queue by hand, so nothing will ever run them."""
+    from ttp import cli, detach
+    run = p.runs / "4100"   # a worker run's folder, where its detached checks write
+    run.mkdir(parents=True)
+    q = detach.enqueue(p.state, run / cli.CHECKS_RC, run / "checks.log", ["ttp", "checks"], str(tmp_path), {},
+                       checks={"cmd": ["--", "true"], "fresh": False, "worktree": str(tmp_path), "head": "x"})
+    if removed:
+        q.unlink()
+    return run
+
+
+@pytest.mark.parametrize("removed", [True, False])
+def test_a_start_when_on_checks_taken_out_of_the_queue_is_cleared_while_queued_ones_wait(env, monkeypatch, tmp_path,
+                                                                                        removed):
+    p = make(env)
+    from ttp import checksgone, cli, coordinator as coord, daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    monkeypatch.setattr(checksgone, "SETTLE_S", 0)
+    monkeypatch.setattr(checksgone, "GRACE_S", 0)
+    run = _queued_checks_run(p, tmp_path, removed)
+    rc = run / cli.CHECKS_RC
+    probe = f"test -f {rc} && grep -qx 0 {rc}"   # waits for a pass, which a dropped run never gives
+    coord.apply(p, [{"type": "task_add", "title": "after the checks", "spec": "s", "start_when": probe}])
+    tid = _added(p, "after the checks")
+    d = dmod.Daemon(p.base)
+    for _ in range(2):
+        _settle_deferred(d, tid)
+    if removed:
+        assert _ready(p, tid) and "left the checks queue without running" in p.db.task(tid)["spec"]
+        assert (run / cli.CHECKS_RC).read_text().strip() == "1" and cli._checks_dropped(run)
+    else:
+        assert not _ready(p, tid) and not (run / cli.CHECKS_RC).exists(), "a queued request stays 'not yet'"
+        assert checksgone.state(run) == "queued"
+
+
+@pytest.mark.parametrize("removed", [True, False])
+def test_a_retry_when_on_checks_taken_out_of_the_queue_wakes_its_task(env, monkeypatch, tmp_path, removed):
+    p = make(env)
+    from ttp import checksgone, cli, daemon as dmod
+    monkeypatch.setattr(checksgone, "SETTLE_S", 0)
+    monkeypatch.setattr(checksgone, "GRACE_S", 0)
+    run = _queued_checks_run(p, tmp_path, removed)
+    rc = run / cli.CHECKS_RC
+    tid = _due_waiting_task(p, f"test -f {rc} && grep -qx 0 {rc}")
+    d = dmod.Daemon(p.base)
+    for _ in range(2):
+        _settle_probe(d, tid)
+    if removed:
+        assert _ready(p, tid) and "left the checks queue" in json.loads(p.db.task(tid)["result"])["woke"]
+    else:
+        assert not _ready(p, tid) and checksgone.state(run) == "queued"
+
+
+def test_a_stale_wait_on_checks_taken_out_of_the_queue_says_so(env, tmp_path):
+    p = make(env)
+    from ttp import cli, daemon as dmod
+    run = _queued_checks_run(p, tmp_path, removed=True)
+    probe = f"ttp checks --result {run}"
+    tid = _due_waiting_task(p, probe)
+    d = dmod.Daemon(p.base)
+    task = p.db.task(tid)
+    d._stale_wait_event(task, json.loads(task["result"]), time.time() - 7 * 3600, 6 * 3600)
+    text = _events(p, tid, "wait_stale")[0]["text"]
+    assert f"the checks it waits on ({run}) are neither queued nor running" in text, text

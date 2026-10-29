@@ -493,23 +493,41 @@ def _request_id(q: Path) -> str | None:
 
 def pending(rc: Path) -> bool:
     """Whether a queued request of this job waits for the daemon (or is being started). A marker
-    whose queue file is gone is an orphan (its request was consumed or never published): it is
-    removed, so the job's own result answers again."""
+    whose queue file is gone is an orphan: it is removed, so the job's own result answers again. The
+    daemon removes a request it consumed together with its marker (_settle), so an orphan of a job that
+    never started had its request taken out of the queue: it is recorded lost, else nothing would ever
+    answer for it."""
     rc = Path(rc)
     q, _ = _marker(rc)
     if q is None:
         return False
     try:
         with _locked(q.parent):
-            q, _ = _marker(rc)
+            q, rid = _marker(rc)
             if q is None:
                 return False
             if q.exists():
                 return True
+            if not _began(rc, rid):
+                _mark_lost_first(rc, REMOVED)
             queued(rc).unlink(missing_ok=True)
             return False
     except OSError:
         return q.exists()
+
+
+REMOVED = "its queued request was taken out of the daemon's queue before it started"
+
+
+def _began(rc: Path, rid: str | None) -> bool:
+    """Whether the job of request `rid` started or ended: its exit code, its started marker or running
+    lock, or detached checks that recorded that request."""
+    if rc.exists() or started(rc).exists() or lost(rc).exists():
+        return True
+    if locks.job_lock(rc).exists() and not locks.any_free([locks.job_lock(rc)]):
+        return True
+    from .cli import CHECKS_RC, _read_checks_pid
+    return rc.name == CHECKS_RC and bool(rid) and _read_checks_pid(rc.parent).get("req") == rid
 
 
 def withdraw(rc: Path) -> None:

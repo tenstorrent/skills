@@ -34,6 +34,7 @@ from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import ackwait
+from . import checksgone
 from . import lanewait
 from . import chainprio
 from . import churnwatch
@@ -789,6 +790,7 @@ class Daemon:
         self._coverage_at = 0.0
         self._probe_rc: dict[int, tuple[int | str, float, str]] = {}   # last verdict: exit code or why, when, probe
         self._start_rc: dict[int, tuple[int | str, float, str]] = {}   # a start_when's last not-yet or broken verdict
+        self._checks_gone_at: dict[int, tuple[str, float]] = {}   # task -> probe on gone checks, first seen (checksgone)
         self._host_up: dict[str, tuple[bool, float]] = {}   # host a probe's 255 named -> ssh reached it, when
         self._down_n: dict[int, int] = {}   # task -> its probe's confirmed-down answers in a row (downwait.gap)
         self._probe_files: dict[int, object] = {}   # id(probe proc) -> the file its output goes to
@@ -8360,6 +8362,9 @@ class Daemon:
                      else self._push_finished_unpushed)(task, now)
             elif gone and task and task["status"] == "queued" and (task["not_before"] or 0) > now:
                 self._wake_waiting(task, f"probe broken: {rc}", now)   # no timer can make it pass
+            elif rc in NOT_YET_RCS and task and task["status"] == "queued" and (task["not_before"] or 0) > now \
+                    and (dirs := self._checks_gone(tid, probe, now)):
+                self._checks_gone_release(task, dirs, now)   # checks that left the queue: never "not yet" for good
             elif gated == "changed" and rc is not None and rc not in NOT_YET_RCS:
                 # A new answer after a skip that no branch above handles: wake now, not at the backoff.
                 self._wake_waiting(task, f"its probe's answer changed (exit {rc})", now)
@@ -8618,6 +8623,9 @@ class Daemon:
                 progress.note_probe(self.p.db, task["id"], d.get("when") or "", rc,
                                     startgate.reason(self.p.db, d.get("when") or "", rc, out), now)
         if rc in NOT_YET_RCS:
+            if dirs := self._checks_gone(task["id"], d.get("when") or "", now):
+                self._checks_gone_release(task, dirs, now)
+                return
             self._start_resource_stale(task, d, now)
         elif detach.failed_check(d.get("when") or "", rc):
             self._deferral_event(task, d.get("since") or task["created"], "deferral_job_failed",
@@ -9316,6 +9324,8 @@ class Daemon:
             self._push_finished_unpushed(task, now)
         elif fresh and rc not in NOT_YET_RCS:
             self._wake_waiting(task, f"probe broken: {rc if isinstance(rc, str) else f'exit {rc}'}", now)
+        elif fresh and (dirs := self._checks_gone(tid, str(prev.get("retry_when") or ""), now)):
+            self._checks_gone_release(task, dirs, now)
         elif fresh:
             # 75 is EX_TEMPFAIL (e.g. a busy `ttp lock`); 255 is ssh failing to reach the host
             # (a reboot or a network blip). Both mean "not yet". A model run cannot make a "not yet"
@@ -9543,9 +9553,58 @@ class Daemon:
               f"not yet. Blocking gate: {probe[:200]}; last output: {last or '(none seen)'}. "
               f"It keeps sleeping and no worker run is spent. "
               + (f"Note: {end}. " if (end := waitheal.probe_flag(probe)) else "")
+              + (f"Note: the checks it waits on ({', '.join(str(d) for d in gone)}) are neither queued nor running: "
+                 f"their ticket left the checks queue, so the daemon wakes it within {checksgone.GRACE_S / 60:g} min. "
+                 if (gone := self._stuck_checks(probe)) else "")
               + f"Decide: fix its probe (`ttp task set-when {task['id']} \"<cmd>\"`), clear it (\"\") so it wakes "
               f"at its timer, or cancel the task.", "queued", task["id"]))
         log(self.p, f"task {task['id']} probe not yet after {max_hold / 3600:g} h; raised to the coordinator")
+
+    def _stuck_checks(self, probe: str) -> list[Path]:
+        try:
+            return checksgone.stuck(probe)
+        except Exception as e:   # a bad run dir must never break a hand-off or a tick
+            log(self.p, f"checks wait: could not read {probe[:200]!r}: {type(e).__name__}: {e}")
+            return []
+
+    def _checks_gone(self, tid: int, probe: str, now: float) -> list[Path]:
+        """A "not yet" probe on `ttp checks` runs that left the queue without a result (checksgone): once
+        they stayed gone SETTLE_S, record a 'dropped' result for each, so the standard probe passes; the
+        run dirs once the probe still says "not yet" GRACE_S after they were first seen, else []."""
+        dirs = self._stuck_checks(probe) if probe else []
+        if not dirs:
+            self._checks_gone_at.pop(tid, None)
+            return []
+        seen = self._checks_gone_at.get(tid)
+        if not seen or seen[0] != probe:
+            self._checks_gone_at[tid] = seen = (probe, now)
+            log(self.p, f"task {tid}: the checks its probe waits on are neither queued nor running: "
+                        f"{', '.join(str(d) for d in dirs)}")
+        if now - seen[1] >= checksgone.SETTLE_S:
+            for d in dirs:
+                try:
+                    checksgone.settle(d)
+                except OSError as e:
+                    log(self.p, f"task {tid}: could not record dropped checks in {d}: {e}")
+        return dirs if now - seen[1] >= checksgone.GRACE_S else []
+
+    def _checks_gone_release(self, task: dict, dirs: list[Path], now: float) -> None:
+        """Wake a waiting task, or clear a deferred task's start_when, whose probe waits on checks that
+        left the queue without running: no model run could make that probe pass."""
+        tid = task["id"]
+        self._checks_gone_at.pop(tid, None)
+        why = (f"the checks its probe waits on ({', '.join(str(d) for d in dirs)}) left the checks queue "
+               f"without running, so that probe could never pass: run them again or wait on something else")
+        if deferral(task).get("when"):
+            self._probe_rc.pop(tid, None)
+            self._start_rc.pop(tid, None)
+            startgate.forget(self.p.db, tid=tid)
+            progress.forget_probe(self.p.db, tid)
+            self.p.db.update_task(tid, labels=without_deferral(json.loads(task["labels"] or "[]")), not_before=None,
+                                  spec=f"{task['spec'] or ''}\n\nStarted by the daemon: {why}.".lstrip())
+            log(self.p, f"task {tid} start_when cleared: {why}")
+        else:
+            self._wake_waiting(task, why, now)
 
     def _wake_waiting(self, task: dict, why: str, now: float, extra: dict | None = None) -> None:
         """Make a waiting task due now and tell its next run why it woke."""

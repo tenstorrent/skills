@@ -3268,6 +3268,9 @@ CHECKS_SLOT_WAIT = "checks-slot.wait"   # in the run's directory while its check
 # The daemon's request that the run's checks stop waiting for a slot ({pid, started}): their task ended
 # (Daemon.reap_waiting_checks). Only a waiter with that pid and start time honours it, and only while it waits.
 CHECKS_SLOT_CANCEL = "checks-slot.cancel"
+# The run's checks left the checks queue before they ran (a cancel, a removed request, a stop): {why, at}.
+# Written with a non-zero checks.rc, so `--result` answers and the run's owner wakes (_checks_drop).
+CHECKS_DROPPED = "checks.dropped"
 # (not "checks.queued": detach.queued(checks.rc) is the daemon's launch marker)
 
 
@@ -3295,6 +3298,33 @@ def _low_priority(argv: list) -> list:
     """A check command's argv at a lower CPU and IO priority (testslots.low_priority)."""
     from . import testslots
     return testslots.low_priority(argv)
+
+
+def _checks_drop(run_dir: Path, why: str, rc: bool = True) -> None:
+    """Record that the run's checks left the queue without a result of their own: status 'dropped' with
+    `why`, a line in checks.out and checks.log, and exit code 1 in checks.rc. A removed ticket or request
+    otherwise writes nothing, and a probe waiting on that run would say "not yet" for ever. Without `rc`
+    only the status: the caller, the detached checks themselves, writes the rest as it exits."""
+    if rc:
+        line = f"ttp checks: dropped from the checks queue: {why}; run `ttp checks --detach` again\n"
+        for name in (CHECKS_OUT, "checks.log"):
+            try:
+                with open(run_dir / name, "a") as f:
+                    f.write(line)
+            except OSError:
+                pass
+    durable_write(run_dir / CHECKS_DROPPED, json.dumps({"status": "dropped", "why": why[:300], "at": time.time()}))
+    if rc:
+        durable_write(run_dir / CHECKS_RC, "1\n")
+
+
+def _checks_dropped(run_dir: Path) -> str:
+    """Why the run's checks were dropped from the queue (_checks_drop), or ""."""
+    try:
+        d = json.loads((run_dir / CHECKS_DROPPED).read_text())
+    except (OSError, ValueError):
+        return ""
+    return str(d.get("why") or "no reason recorded") if isinstance(d, dict) else ""
 
 
 def _checks_cancelled(run_dir: Path) -> str:
@@ -3635,6 +3665,8 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                 + ("this project's other full checks" if suite is None else "a host-wide checks slot") + f": {e}")
         out.write(f"ttp checks: {said}\n")
         out.flush()
+        if _read_checks_pid(run_dir).get("pid") == os.getpid():   # the run's detached checks: _checks_child writes rc 1
+            _checks_drop(run_dir, str(e) or "cancelled", rc=False)
         die(f"ttp checks: {said}", 1)
     except checkcap.Upgraded as e:
         # Its checks slot and queue places go back before it re-executes; a lane it holds is kept.
@@ -4047,6 +4079,7 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
         (run_dir / CHECKS_RC).unlink(missing_ok=True)
         (run_dir / CHECKS_SLOT_WAIT).unlink(missing_ok=True)
         (run_dir / CHECKS_SLOT_CANCEL).unlink(missing_ok=True)
+        (run_dir / CHECKS_DROPPED).unlink(missing_ok=True)
         with open(run_dir / CHECKS_OUT, "wb") as out:
             child = subprocess.Popen([sys.executable, "-m", "ttp", "checks", "--rc", str(run_dir / CHECKS_RC),
                                       *(["--fresh"] if a.fresh else []), *(["--full"] if getattr(a, "full", False) else []),
@@ -4167,8 +4200,11 @@ def _checks_result(run_dir: Path) -> int:
         print("ttp checks: queued for the daemon, which starts them outside the sandbox")
         return 1
     if detach.lost(rc_file).exists():
-        durable_write(rc_file, "killed\n")
-        print(f"ttp checks: not started: {detach.lost(rc_file).read_text().strip()}")
+        why = detach.lost(rc_file).read_text().strip()
+        if not rc_file.exists():   # they left the queue unrun: a waiting owner reads 'dropped'
+            _checks_drop(run_dir, why or "not started", rc=False)
+            durable_write(rc_file, "killed\n")
+        print(f"ttp checks: not started: {why}")
         return 0
     info = _read_checks_pid(run_dir)
     if info and not rc_file.exists() and _checks_old_boot(info):
@@ -4213,6 +4249,8 @@ def _checks_result(run_dir: Path) -> int:
         print(f"ttp checks: waiting: {envfault.line(fault)}")
         return 1
     if rc_file.exists():
+        if why := _checks_dropped(run_dir):
+            print(f"ttp checks: dropped: {why}; nothing more runs, so run `ttp checks --detach` again")
         print(f"ttp checks: finished with exit code {rc_file.read_text().strip()}")
         print(f"ttp checks: full output ('$ cmd' lines, test results) in {run_dir / 'checks.log'}")
         from . import slowtests

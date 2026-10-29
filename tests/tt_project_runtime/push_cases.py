@@ -13562,3 +13562,60 @@ def test_an_approval_from_the_review_of_an_urgent_task_starts_its_batch_at_once(
     assert [r["id"] for r in rows] == [row, routine] and "an urgent review" in why, why
     s.p.db.update_task(hot, spec="Fix it.")   # no longer urgent: it waits like the rest
     assert pushq.due(s.p, now)[0] == []
+
+
+def test_checks_whose_request_was_taken_out_of_the_queue_answer_dropped_not_queued_for_ever(env, tmp_path, monkeypatch,
+                                                                                           capsys):
+    from ttp import checksgone, cli, detach, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setattr(push, "_boxed", lambda: True)
+    cli.main(["checks", "--detach", "--", "true"])
+    capsys.readouterr()
+    probe = f"ttp checks --result {run}"
+    assert cli._checks_result(run) == 1 and "queued for the daemon" in capsys.readouterr().out
+    assert checksgone.state(run) == "queued" and checksgone.stuck(probe) == [], "a queued request stays 'not yet'"
+    for q in (p.state / detach.QUEUE).glob("*.json"):
+        q.unlink()   # taken out of the queue by hand: the daemon never starts it
+    assert checksgone.state(run) == "gone" and checksgone.state(run) == "gone", "a second look still sees it"
+    assert detach.REMOVED in detach.lost(run / cli.CHECKS_RC).read_text()
+    assert cli._checks_result(run) == 0, "the standard probe answers"
+    assert f"not started: {detach.REMOVED}" in capsys.readouterr().out
+    assert (run / cli.CHECKS_RC).read_text().strip() == "killed" and cli._checks_dropped(run) == detach.REMOVED
+    assert checksgone.state(run) == "finished" and checksgone.stuck(probe) == [run]
+
+
+def test_gone_checks_settle_with_a_dropped_exit_code_and_a_rerun_clears_it(env, tmp_path, monkeypatch, capsys):
+    from ttp import checksgone, cli, detach, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setattr(push, "_boxed", lambda: True)
+    # Checks that started once and ended without an exit code (killed outright): no queue, no process.
+    (run / cli.CHECKS_PID).write_text(json.dumps({"pid": 2 ** 22 + 7, "started": "1"}))
+    probe = f"test -f {run / cli.CHECKS_RC} && ttp checks --result {run}"
+    assert checksgone.run_dirs(probe) == [run] and checksgone.gone(probe) == [run]
+    checksgone.settle(run)
+    assert (run / cli.CHECKS_RC).read_text().strip() == "1" and "neither queued nor running" in cli._checks_dropped(run)
+    assert "dropped from the checks queue" in (run / cli.CHECKS_OUT).read_text()
+    monkeypatch.setattr(push, "_boxed", lambda: False)
+    assert cli._checks_result(run) == 0
+    out = capsys.readouterr().out
+    assert "ttp checks: dropped: they are neither queued nor running" in out and "exit code 1" in out
+    monkeypatch.setattr(push, "_boxed", lambda: True)
+    cli.main(["checks", "--detach", "--", "true"])
+    detach.tend(p)
+    assert _wait_precheck(run) == "0" and cli._checks_dropped(run) == "", "a rerun starts with no dropped record"
+
+
+def test_detached_checks_that_pass_answer_without_a_dropped_line(env, tmp_path, monkeypatch, capsys):
+    from ttp import checksgone, cli, detach, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setattr(push, "_boxed", lambda: True)
+    cli.main(["checks", "--detach", "--", "true"])
+    detach.tend(p)
+    assert _wait_precheck(run) == "0"
+    capsys.readouterr()
+    monkeypatch.setattr(push, "_boxed", lambda: False)
+    assert cli._checks_result(run) == 0
+    out = capsys.readouterr().out
+    assert "finished with exit code 0" in out and "dropped" not in out
+    assert checksgone.state(run) == "finished" and checksgone.stuck(f"ttp checks --result {run}") == []
+    assert not detach.lost(run / cli.CHECKS_RC).exists()
