@@ -30397,6 +30397,7 @@ def _batch_setup(env, monkeypatch, busy):
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
     p.db.x("UPDATE events SET status='handled'")
     p.db.x("UPDATE tasks SET status='done'")
+    p.db.x("DELETE FROM kv WHERE key='burst_hold'")   # a quiet start: no burst window open
     p.set_config("budget.max_parallel_workers", 2)
     d.cfg = p.config()
     d.update_gates()
