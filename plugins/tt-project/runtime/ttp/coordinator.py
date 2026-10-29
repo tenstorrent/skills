@@ -922,7 +922,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                      f"{min(got.values())}")
     section("shared", lines)
     from . import checklane
-    section("checks_wait", checklane.long_wait_lines(p.name, now))
+    section("checks_wait", checklane.long_wait_lines(p.name, p.config(), now))
     ledger = ledger_section(p, db, seen, machine_events(db, event_ids), now)
     if ledger:
         shown.append(("machine_ledger", ledger[0]))

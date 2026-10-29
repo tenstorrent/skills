@@ -321,15 +321,17 @@ def _ticket_task(t: Path) -> str:
     return m.group(1) if m else ""
 
 
-def waits(project_name: str, now: float | None = None, over_s: float = 0.0) -> list[dict]:
-    """The project's waiters for a lane that have waited over `over_s`, in queue order: task, waited_s,
-    since (arrival), position (1-based) and the lane holders' records."""
+def waits(project_name: str, cfg: dict | None, now: float | None = None, over_s: float = 0.0) -> list[dict]:
+    """The project's waiters for a lane that have waited over `over_s`, in queue order (the aging step
+    of `cfg`, checks.priority_age_s — the order the lanes grant): task, waited_s, since (arrival),
+    position (1-based) and the lane holders' records."""
     now = time.time() if now is None else now
+    age = priority_age_s(cfg)
     pre = f"{testslots.SUITE}.{locks.group_id(project_name)}"
     out = []
     try:
         for base in testslots.suite_bases(project_name):
-            q = testslots.suite_order(project_name, now=now, repo=base[len(pre) + 1:])
+            q = testslots.suite_order(project_name, now=now, repo=base[len(pre) + 1:], age=age)
             recs = locks.holder_records(testslots._lanes_of(base)) if q else []
             if q and not recs:   # its lanes are free: it waits for the project's cap (project_cap)
                 recs = locks.holder_records(testslots.project_held(project_name))
@@ -343,11 +345,12 @@ def waits(project_name: str, now: float | None = None, over_s: float = 0.0) -> l
     return out
 
 
-def long_wait_lines(project_name: str, now: float | None = None, over_s: float = LONG_WAIT_S) -> list[str]:
+def long_wait_lines(project_name: str, cfg: dict | None, now: float | None = None,
+                    over_s: float = LONG_WAIT_S) -> list[str]:
     """One line per task waiting for a checks lane longer than `over_s` (ttp status, the digest)."""
     now = time.time() if now is None else now
     out = []
-    for w in waits(project_name, now, over_s):
+    for w in waits(project_name, cfg, now, over_s):
         held = "; ".join(holder_text(h, now) for h in w["holders"][:3]) or "lanes free, about to start"
         out.append(f"checks slot wait: {'#' + w['task'] if w['task'] else 'a run'} has waited {mins(w['waited_s'])} "
                    f"(position {w['position']} of {w['of']}), behind {held}")
@@ -362,7 +365,7 @@ def wait_events(project_name: str, cfg: dict | None, now: float | None = None) -
         return []
     now = time.time() if now is None else now
     out = []
-    for w in waits(project_name, now, limit):
+    for w in waits(project_name, cfg, now, limit):
         held = "; ".join(holder_text(h, now) for h in w["holders"][:3]) or "no holder (lanes free, about to start)"
         who = f"#{w['task']}" if w["task"] else "a run with no task"
         out.append({"fingerprint": f"checks_slot_wait:{w['task'] or 'run'}:{w['since']:.0f}",

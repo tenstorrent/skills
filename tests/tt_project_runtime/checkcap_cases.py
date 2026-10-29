@@ -2096,7 +2096,7 @@ def test_long_lane_waits_show_in_status_and_the_digest_and_raise_one_event_past_
                            time.time() - 800, priority=2)
     try:
         assert checklane.wait_events(p.name, {}) == [], "no event before checks.wait_event_s"
-        lines = checklane.long_wait_lines(p.name)
+        lines = checklane.long_wait_lines(p.name, p.config())
         assert lines and "#13 has waited 13 min" in lines[0] and "#12" in lines[0], lines
         assert lines[0] in cli.status_text(p)
         gates = {"claude": {"level": "green", "reasons": [], "numbers": {}, "max_tier": "deep", "max_parallel": 6,
@@ -2117,6 +2117,36 @@ def test_long_lane_waits_show_in_status_and_the_digest_and_raise_one_event_past_
     finally:
         locks.dequeue(ticket)
         _stop(holder)
+
+
+def test_long_wait_lines_order_by_the_project_s_priority_age_s_not_the_account_s(env, monkeypatch):
+    # waits()/long_wait_lines() order waiters by the project's checks.priority_age_s, so the shown
+    # queue position matches the grant order; a project step that ages a waiter past a newer
+    # higher-priority one inverts the account-default order.
+    from ttp import checkcap, checklane, locks, testslots
+    _lane_env(monkeypatch)
+    p = make(env)
+    p.set_config("checks.priority_age_s", 60)          # the project's aging step: 1 min
+    cfg = p.config()
+    assert checklane.priority_age_s(cfg) == 60
+    now = time.time()
+    # A p3 that waited 3 project steps (180 s) ages to p1+ under the project's step, ahead of a
+    # newer p2 that arrived 30 s ago; under the account default (SUITE_AGE_S = 900) it would
+    # still rank p3, behind it.
+    old = _suite_ticket(p.name, 3, now - 3 * 60, "31")
+    new = _suite_ticket(p.name, 2, now - 30, "32")
+    try:
+        w = checklane.waits(p.name, cfg, now)
+        assert [(x["task"], x["position"]) for x in w] == [("31", 1), ("32", 2)], w
+        # the account/default order (900 s step) keeps the newer p2 first
+        assert [(x["task"], x["position"]) for x in checklane.waits(p.name, {"checks": {}}, now)] == \
+            [("32", 1), ("31", 2)]
+        lines = checklane.long_wait_lines(p.name, cfg, now, over_s=0)
+        assert [l.split("#")[1].split()[0] for l in lines] == ["31", "32"], lines
+        assert [l.split("#")[1].split()[0] for l in checklane.long_wait_lines(p.name, None, now, 0)] == ["32", "31"]
+    finally:
+        for t in (old, new):
+            locks.dequeue(t)
 
 
 def test_two_repositories_check_side_by_side_while_one_repository_takes_turns(env, tmp_path, monkeypatch, capsys):

@@ -1391,7 +1391,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     from . import checklane, checkspill
     if suite := testslots.suite_line(p.name, now, checklane.slots(p.config()), checklane.priority_age_s(p.config())):
         lines.append(suite)
-    lines.extend(checklane.long_wait_lines(p.name, now))
+    lines.extend(checklane.long_wait_lines(p.name, p.config(), now))
     lines.extend(checkspill.status_lines(p.name, now))
     if verbose and (slot_waits := checkcap.wait_line(p.state, now)):
         lines.append(slot_waits)
