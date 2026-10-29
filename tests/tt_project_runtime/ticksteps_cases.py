@@ -692,6 +692,7 @@ GIT_HELPER_OWN_TIMEOUT = {
     ("project.py", "git_version"): "`git --version` once per process, 10 s: it reads no repository",
     ("loopcheck.py", "_git"): "only `ttp doctor --loop` setting up its scratch repositories (loopcheck.setup)",
     ("remotecheck.py", "_git"): "only remotecheck.main, the check process `ttp checks` starts (_BOOT)",
+    ("checktree.py", "_git"): "only `ttp checks` (cli.py) naming the tree it checks, 20 s, its own process",
 }
 
 
