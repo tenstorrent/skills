@@ -160,3 +160,47 @@ def test_an_open_take_whose_pid_is_a_kernel_thread_or_another_namespaces_is_unkn
     got = {s["id"]: s["state"] for s in activity.spans(recs, here="h")}
     assert got == {"old13": "unknown", "ns2": "unknown", "other": "unknown", "none": "unknown",
                    "mine": "running", "legacy": "running"}
+
+
+def test_machines_activity_judges_an_unseen_foreign_holder_through_its_run(env, tmp_path, monkeypatch):
+    """`ttp machines activity`'s holder view judges a holder whose PID namespace it cannot see (activity
+    runs from inside a sandbox) through its run's folder, the route `ttp lock --probe` uses, not
+    'alive None': a keeper alive on its hold.beat, gone once its hold record ends, unknown on a stale
+    beat or lease, a pid the run does not name, and no run record. A visible pid is judged as before."""
+    from ttp import activity, hold, locks
+    from ttp import machines as mm
+    monkeypatch.setattr(locks, "_PROC", str(tmp_path / "no-proc"))   # nothing of its PID namespace is visible
+    me = os.uname().nodename
+    p = make(env)
+    t = p.db.add_task("holder", "s", kind="work", origin="user")
+    mm.add("box-a")
+    rd = _foreign_run(p, t, 77)
+    held = _held_build_lock(p, "box-a-device", f"task #{t} (run 77), detached jobs")
+    try:
+        foreign = {"pid": 4242, "node": me, "pidns": "pid:[999]", "via": "keeper", "taker_pid": 9}
+        holder = f"task #{t} (run 77), detached jobs"
+        _label(held, {"holder": holder, **foreign})
+        hold._write(rd, {"task": str(t), "run": "77", "state": "holding", "keeper": 4242, "jobs": []})
+        (rd / hold.BEAT).touch()   # a fresh beat: the keeper lives
+        view = activity.machine_view("box-a", time.time() - 60)
+        h = next(h for h in view["holders"] if h["resource"] == "box-a-device")
+        assert h["alive"] is True, h   # old code: alive None (its pid is another namespace's, invisible here)
+        hold._write(rd, {"task": str(t), "run": "77", "state": "released", "keeper": 4242, "jobs": []})
+        view = activity.machine_view("box-a", time.time() - 60)
+        h = next(h for h in view["holders"] if h["resource"] == "box-a-device")
+        assert h["alive"] is False, h   # the hold record says it ended: gone
+        hold._write(rd, {"task": str(t), "run": "77", "state": "holding", "keeper": 4242, "jobs": []})
+        os.utime(rd / hold.BEAT, (time.time() - 600, time.time() - 600))
+        view = activity.machine_view("box-a", time.time() - 60)
+        h = next(h for h in view["holders"] if h["resource"] == "box-a-device")
+        assert h["alive"] is None, h   # a stale beat: unknown, never gone
+        _label(held, {**foreign, "holder": "task #99 (run 5)"})   # a hold whose run record does not exist
+        view = activity.machine_view("box-a", time.time() - 60)
+        h = next(h for h in view["holders"] if h["resource"] == "box-a-device")
+        assert h["alive"] is None, h
+        _label(held, {"holder": holder, "pid": os.getpid(), "pidns": locks._pid_ns(), "node": me, "via": "keeper"})
+        view = activity.machine_view("box-a", time.time() - 60)
+        h = next(h for h in view["holders"] if h["resource"] == "box-a-device")
+        assert h["alive"] is True, h   # a visible pid is judged as before
+    finally:
+        held.close()

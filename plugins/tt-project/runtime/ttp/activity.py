@@ -232,12 +232,36 @@ def _lock_dirs(alias: str, projects: list) -> list[tuple[str, Path]]:
     return out + [(name, base / "state" / "locks") for name, base in projects]
 
 
-def _current(alias: str, owner: str, d: Path, view: dict) -> None:
+def _holder_alive(h: dict, owner: str, projects: dict) -> bool | None:
+    """Whether a lock holder lives, for `ttp machines activity`'s holder view: locks.pid_alive when this
+    process sees its pid, else through its run's folder (locks._through_run, the same route as
+    `ttp lock --probe` after #4351) when its label names a run of a project here. Unknown stays
+    unknown; a stale beat or lease never makes a holder gone."""
+    from . import locks
+    alive = locks.pid_alive(h)
+    if alive is not None or "alive unknown" not in locks._pid_note(h):
+        return alive
+    from . import hold
+    lbl = hold.parse(h.get("holder"))
+    if not lbl:
+        return None
+    base = projects.get(lbl["project"] or (owner if owner != "shared" else ""))
+    if not base:
+        return None   # no run of a project here to judge it through
+    from .project import Project
+    try:
+        run = Project(base).db.one("SELECT pid, status, dir, boot_id FROM runs WHERE id=?", (int(lbl["run"]),))
+    except Exception:
+        run = None
+    return locks._through_run(h, lbl, run)[0]
+
+
+def _current(alias: str, owner: str, d: Path, view: dict, projects: dict | None = None) -> None:
     from . import locks
     from .responsibilities import _names
     try:
         names = sorted(os.listdir(d))
-    except OSError:
+    except OSError:   # nothing listed: another machine's or a gone project's lock dir
         return
     for n in names:
         path = d / n
@@ -251,7 +275,7 @@ def _current(alias: str, owner: str, d: Path, view: dict) -> None:
                 h = h if isinstance(h, dict) else {}
                 view["holders"].append({"resource": res, "where": owner, "holder": h.get("holder"),
                                         "since": h.get("since"), "command": head(h.get("command") or ""),
-                                        "pid": h.get("pid"), "alive": locks.pid_alive(h),
+                                        "pid": h.get("pid"), "alive": _holder_alive(h, owner, projects or {}),
                                         **{k: h[k] for k in ("via", "taker_pid") if k in h}})
         elif n.endswith(".reserved") and _names(alias, n[:-len(".reserved")]):
             who = locks.reserved_by(path)
@@ -314,7 +338,7 @@ def machine_view(alias: str, since: float, now: float | None = None) -> dict:
     view = {"alias": alias, "known": alias in known, "since": since, "now": now, "holders": [], "waiters": [],
             "reservations": [], "exclusive": [], "jobs": [], "activity": [], "unread": []}
     for owner, d in _lock_dirs(alias, projects):
-        _current(alias, owner, d, view)
+        _current(alias, owner, d, view, {name: base for name, base in projects})
     for name, base in projects:
         _exclusive(alias, name, base, view)
         for s in spans(entries(base / "state")):
