@@ -162,14 +162,19 @@ def project_cap(cfg: dict | None) -> int:
 
 
 def group_name(key: str) -> str:
-    """What a lane base's key names, for status: a wrapper lock, a repository or the project's own lanes."""
+    """What a lane base's key names, for status (the one naming rule: lane_status, status_text): a wrapper
+    lock, a repository, or an unkeyed group (an older runtime's one lane per project). Never empty."""
     if key.startswith("w"):
-        return f"wrapper lock {key[1:]} (checks.wrap_cmd)"
-    return f"repository {key}" if key else "project (no repository)"
+        return f"wrapper lock {key[1:]} (checks.wrap_cmd, one at a time)"
+    return f"repository {key}" if key else "not keyed (no repository key: an older runtime, one lane per project)"
 
 
 def wrap_key(wrap) -> str:
-    """The id of the wrapper lock a run's commands go behind (checks.wrap_cmd as argv words); "" for none."""
+    """The id of the wrapper lock a run's commands go behind (checks.wrap_cmd as argv words); "" for none.
+    The one wrapper-lock detector: any wrapper, however it locks, gets its own single lane. A wrapper
+    that fails instead of waiting (`flock -n`, `flock -w 60`, a queue that refuses when busy) is never
+    taken to serialize by itself: its runs go one at a time in that lane, never side by side in the
+    repository's lanes, so two runs of one project never fail each other's lock."""
     return hashlib.sha256(shlex.join(map(str, wrap)).encode()).hexdigest()[:12] if wrap else ""
 
 
@@ -437,9 +442,7 @@ def status_text(project_name: str, cfg: dict | None, here_repo: str = "", now: f
     if not got:
         lines.append("  no lane held and nobody waiting")
     for r in got:
-        where = (f"wrapper lock {r['repo'][1:]} (checks.wrap_cmd, one at a time)" if r["repo"].startswith("w")
-                 else f"repository {r['repo'] or '(not keyed: an older runtime, one lane per project)'}")
-        lines.append(f"  {where}" + (" (this one)" if r["repo"] == here_repo else ""))
+        lines.append(f"  {r['group']}" + (" (this one)" if r["repo"] == here_repo else ""))
         for h in r["lanes"]:
             alive = {True: "alive", False: "DEAD (its lane is reclaimed by the next waiter)"}.get(h["alive"], "alive unknown")
             run = f", running {h['command']!r} for {mins(h['running_s'])}" if h["running_s"] is not None else ", not running yet"

@@ -2140,6 +2140,53 @@ def test_runs_behind_one_wrapper_lock_go_one_at_a_time_and_another_lock_does_not
     first.close(), other.close()
 
 
+_FAILING_WRAPS = ("flock -n {f}", "flock --nonblock {f}", "flock -nx {f}", "flock -xn {f}", "flock -x -n {f}",
+                  "flock --conflict-exit-code 3 {f}", "flock -E 3 -n {f}", "flock -w 60 {f}", "flock -w60 {f}",
+                  "flock --wait 60 {f}", "flock --timeout=60 {f}", "flock -x -w 1 {f}")
+
+
+@pytest.mark.parametrize("wrap", _FAILING_WRAPS + ("flock {f}", "flock -x {f}"))
+def test_a_non_blocking_or_wait_bounded_flock_wrapper_never_runs_two_checks_side_by_side(
+        env, tmp_path, monkeypatch, wrap):
+    """checks.wrap_cmd `flock -n` / `-w N` (and their long, combined and `-E` forms) fail when the lock is
+    busy instead of waiting, so the wrapper never counts as serializing by itself: wrap_key still gives
+    it its one lane, and a second run of the project waits there rather than taking a free repository
+    lane, an overflow lane or a priority-1 extra lane beside the first (which would fail its lock)."""
+    from ttp import checklane, push, testslots
+    _lane_env(monkeypatch)
+    argv = push.wrap_of({"checks": {"wrap_cmd": wrap.format(f=tmp_path / "dev.lock")}})
+    key = checklane.wrap_key(argv)
+    assert len(key) == 12, (wrap, argv)
+    first = testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, lock=key, cap=8, wait_s=0)
+    assert first and first.files and ".w" + key + "." in first.files[0].name
+    try:
+        assert testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, lock=key, cap=8, wait_s=0.3, max_wait=0.1,
+                                    cost={"cls": 0}, priority=1, headroom=lambda: True) is None, \
+            "a second run behind the same wrapper waits for the first"
+        free = testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, cap=8, wait_s=0)
+        assert free and free.files, "a lock-free check still runs beside it"
+        free.close()
+    finally:
+        first.close()
+
+
+def test_slot_status_text_names_each_group_by_the_one_naming_rule(env, tmp_path, monkeypatch):
+    from ttp import checklane, testslots
+    _lane_env(monkeypatch)
+    held = [testslots.suite_hold("pa", repo=_LANE_REPO, slots=2, cap=8, wait_s=0),
+            testslots.suite_hold("pa", repo=_LANE_REPO, slots=2, lock=_WRAP_A, cap=8, wait_s=0)]
+    try:
+        groups = [r["group"] for r in checklane.lane_status("pa")]
+        assert sorted(groups) == sorted([checklane.group_name(_LANE_REPO), checklane.group_name("w" + _WRAP_A)])
+        text = checklane.status_text("pa", {})
+        assert all(f"  {g}\n" in text + "\n" or f"  {g} (this one)" in text for g in groups), text
+        assert "one at a time" in checklane.group_name("w" + _WRAP_A)
+        assert checklane.group_name("").strip() and "not keyed" in checklane.group_name("")
+    finally:
+        for g in held:
+            g.close()
+
+
 def test_checks_test_project_max_caps_a_projects_checks_at_once_over_all_its_lanes(env, tmp_path, monkeypatch):
     from ttp import checklane, project, testslots
     _lane_env(monkeypatch)
@@ -2296,7 +2343,7 @@ def test_a_quick_device_query_check_runs_beside_a_long_device_check_in_another_l
         groups = [r["group"] for r in out["repos"]]
         assert len(groups) == 3 and all(g.strip() for g in groups) and all(r["repo"] for r in out["repos"]), out
         assert {"wrapper lock " + _WRAP_A, "wrapper lock " + _WRAP_B, "repository " + key} == \
-            {g.replace(" (checks.wrap_cmd)", "") for g in groups}, groups
+            {g.replace(" (checks.wrap_cmd, one at a time)", "") for g in groups}, groups
     finally:
         for g in (long_run, smi, smi_locked):
             g and g.close()
