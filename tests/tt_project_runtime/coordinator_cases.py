@@ -18646,8 +18646,9 @@ def test_no_false_correction_hits_on_an_unrelated_spec_or_ask(env):
         assert coord.apply(p, [{"type": "task_add", "title": title, "spec": spec}]) == []
         assert not correction.repeated(p, f"{title}\n{spec}"), spec
     assert not [n for n in p.db.kv(coord.NOTES_KEY, []) if "repeats a value the user corrected" in n]
-    problems, sent = _ask(p, "Is box-a1 free for the firmware flash tonight?", blocking="access")
-    assert problems == [] and sent["text"] == "Is box-a1 free for the firmware flash tonight?"
+    ask = "Can you grant the bot account sudo on box-a1 for the firmware flash tonight?"
+    problems, sent = _ask(p, ask, blocking="access")
+    assert problems == [] and sent["text"] == ask, problems
 
 
 def test_an_off_topic_answer_leaves_the_ask_open_and_is_linked_as_a_new_instruction(env):
