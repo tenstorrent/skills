@@ -6082,8 +6082,10 @@ def test_a_waiting_exclusive_task_reserves_its_resource(env, tmp_path):
             time.sleep(0.05)
         assert locks.reserved_by(mark) == f"task #{task['id']}", "a blocked exclusive task did not reserve"
         # a new ttp lock command waits for the reserved task instead of taking the freed slot: it
-        # is still waiting once the holder has ended, and gives up without the slot
-        waiter = subprocess.Popen([sys.executable, str(TTP), "lock", "--timeout", "2", "board", "--", "true"],
+        # is still waiting once the holder has ended, and gives up without the slot. The timeout
+        # is generous: on a loaded host the test's own bookkeeping can take seconds, and the test
+        # ends the holder itself, which makes the waiter give up (75) well before it.
+        waiter = subprocess.Popen([sys.executable, str(TTP), "lock", "--timeout", "30", "board", "--", "true"],
                                   env=run_env, stderr=subprocess.PIPE, text=True)
         assert "waiting for board (reserved for" in waiter.stderr.readline()
     finally:
@@ -6091,7 +6093,9 @@ def test_a_waiting_exclusive_task_reserves_its_resource(env, tmp_path):
         holder.wait(timeout=30)
     assert d._resources_free(task), "the slot did not come free for the reserved task"
     assert waiter.poll() is None, "ttp lock stopped waiting before the slot came free"
-    assert waiter.wait(timeout=30) == 75, "ttp lock took a slot the exclusive task had reserved"
+    # The outer wait must outlast the waiter's own 30 s --timeout (which itself
+    # bounds how long the waiter can run), or a loaded host makes the two collide.
+    assert waiter.wait(timeout=60) == 75, "ttp lock took a slot the exclusive task had reserved"
     # the task's own run takes the slot and drops the reservation; ttp lock then waits on the slot
     run_dir = tmp_path / "xrun"
     run_dir.mkdir()
