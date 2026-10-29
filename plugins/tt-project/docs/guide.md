@@ -434,8 +434,12 @@ prolonged whole-box outage.
   a decision memory, raises one `ask_timeout` event per tick and refuses a re-ask; tasks anchored on
   the ask are released. Asks only the user can answer stay open (review, merge, another human's
   request, a recommendation that acts as the user, a credential or money grant, an irreversible
-  step that does not decline). Nothing resolves at a red gate or after the user wrote since the ask
-  (the coordinator checks instead). A model-free check raises an open ask with no default, or one
+  step). For an irreversible or restriction ask the timer reads no prose for meaning: only a
+  recommendation that is wholly one bare decline (no, decline, skip, keep it, leave it, do nothing,
+  no change) applies; any longer wording, even a decline, keeps a restriction as written and leaves
+  an irreversible ask open for the user. Accepted gap: an as-user action worded outside the timer's
+  word list in another kind is left to the ask gate and the coordinator's classification. Nothing
+  resolves at a red gate or after the user wrote since the ask (the coordinator checks instead). A model-free check raises an open ask with no default, or one
   past its timeout and still open, once per change.
 - Ask rethink: an open `restriction`, `irreversible` or `human` ask that holds a blocked task
   longer than `coordinator.ask_rethink_h` (2; 0 turns it off) raises one `ask_rethink` event, a

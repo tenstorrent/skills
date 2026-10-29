@@ -4853,11 +4853,11 @@ def test_an_unanswered_ask_resolves_to_its_recommendation_at_the_deadline(env):
     ("access", "hold off and post it later", "open"),
     ("access", "Merge it", "open"),
     ("irreversible", "wait an hour, then delete the data", "open"),
-    ("irreversible", "never delete the data", "apply"),
+    ("irreversible", "never delete the data", "open"),      # only a bare decline from askauto.DECLINES
     ("restriction", "wait for Monday, then lift it", "stay"),
     ("restriction", "Yes", "stay"),
-    ("restriction", "no, leave it as written", "apply"),
-    ("access", "don't post the summary", "apply"),
+    ("restriction", "no, leave it as written", "stay"),
+    ("access", "don't post the summary", "open"),
     ("spend", "use the cheaper runner", "apply"),
     ("review", "no", "open"),
     ("access", "", "open"),
@@ -4880,9 +4880,17 @@ def test_an_unanswered_ask_resolves_to_its_recommendation_at_the_deadline(env):
     ("spend", "notify the other team", "open"),
     ("access", "message the vendor", "open"),
     ("access", "ask the other team for a slot", "open"),
-    ("access", "no, don't message the vendor", "apply"),
-    ("irreversible", "No, keep it", "apply"),
-    ("irreversible", "no. leave the branch as is.", "apply"),
+    ("access", "no, don't message the vendor", "open"),
+    ("irreversible", "No, keep it", "open"),
+    ("irreversible", "no. leave the branch as is.", "open"),
+    ("restriction", "no, don't keep it", "stay"),              # a double negative means act (review #4421)
+    ("irreversible", "don't keep the branch", "open"),
+    ("irreversible", "don't wait to merge it", "open"),
+    ("funds", "don't hesitate to raise the cap", "open"),
+    ("funds", "don't skip raising the cap", "open"),
+    ("irreversible", "No.", "apply"),
+    ("restriction", "Keep it", "apply"),
+    ("irreversible", "do nothing", "apply"),
     ("funds", "no, wait for the next cycle", "apply"),
 ])
 def test_the_ask_timer_applies_only_a_recommendation_that_grants_nothing_only_the_user_holds(blocking, rec, kind):
@@ -5445,12 +5453,22 @@ def test_exempt_asks_stay_open_past_the_timeout(env):
     assert all(p.db.one("SELECT handled FROM messages WHERE id=?", (a["id"],))["handled"] == 0 for a in held)
     d = coord.digest(p, {}, [], [])
     assert all(f"ask #{a['id']} (non-blocking; waits for the user (" in d for a in held), d
-    # A declining recommendation grants nothing, so it resolves even for money or an irreversible step.
+    # Only a bare decline from askauto.DECLINES resolves an irreversible or restriction ask: no prose is
+    # read for meaning, so a worded "decline" that means act ("don't keep the branch") stays.
     _, no = _ask(p, "Spend $500 on a bigger box?", blocking="funds", recommendation="no, keep the current box")
-    pk, keep = _ask(p, "Wipe the cache?", blocking="irreversible", reversible=False, recommendation="don't wipe the cache",
-                   classify="irreversible", least_disruptive="moving the cache instead; the disk is full, so moving does not free the space")
+    wipe = dict(blocking="irreversible", reversible=False, classify="irreversible",
+                least_disruptive="moving the cache instead; the disk is full, so moving does not free the space")
+    pk, keep = _ask(p, "Wipe the cache?", recommendation="No.", **wipe)
+    _, worded = _ask(p, "Delete the branch?", recommendation="don't keep the branch", **wipe)
+    _, loosen = _ask(p, "Lift the shared-machine ban?", blocking="restriction", classify="restriction_change",
+                     least_disruptive="a canary on one box breaks the no-shared-machines restriction",
+                     recommendation="no, don't keep it")
     assert pk == [], pk
-    assert sorted(coord.expire_asks(p, now=time.time() + 3600)) == sorted([no["id"], keep["id"]])
+    assert "waits for the user" in worded["text"] and "acts on keep the restriction as written" in loosen["text"]
+    assert sorted(coord.expire_asks(p, now=time.time() + 3600)) == sorted([no["id"], keep["id"], loosen["id"]])
+    assert p.db.one("SELECT handled FROM messages WHERE id=?", (worded["id"],))["handled"] == 0
+    ev = p.db.one("SELECT text FROM events WHERE kind='ask_timeout' ORDER BY id DESC LIMIT 1")["text"]
+    assert f"Ask #{loosen['id']} got no answer in 30 min and auto-resolved to its default: keep the restriction" in ev
 
 
 

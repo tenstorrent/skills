@@ -31,26 +31,15 @@ _AS_USER_RE = re.compile(r"\b(merge|merging|ready for review|out of draft|leave 
 _GRANT_RE = re.compile(r"\b(yes|y|ok|okay|approve[ds]?|grant|raise|increase|lift|extend|top[- ]?up|buy|purchase|"
                        r"pay|spend|credentials?|token|password|secret|api[- ]?key|ssh[- ]?key|log ?in|sign ?in|"
                        r"access|cap|budget|reserve)\b", re.I)
-# A recommendation that declines: it starts with a plain no and adds no later step ("no, then post
-# it", "wait a day, then raise the cap" and "keep merging" do not decline), so it keeps things as they are.
-_DECLINE_RE = re.compile(r"^\W*(no|don'?t|do not|skip|decline|not now|never)\b", re.I)
-_LATER_RE = re.compile(r"\b(then|but|after(wards?)?|later|until|unless|instead|except)\b", re.I)
-# Every clause after it must decline too: a bare no, a negated action ("don't post the summary") or a
-# plain keep/leave/wait. "No, merge it now" and "No. Delete the branch." are actions, not declines.
-_CLAUSE_RE = re.compile(r"\s+[-\u2013\u2014]+\s+|[,;:.!?\u2013\u2014]+|\b(?:and|or|plus|also)\b|&", re.I)
-_NO_CLAUSE_RE = re.compile(r"^(no|nope|not now|(don'?t|do not|never|skip|decline)\b.*)$", re.I)
-_KEEP_RE = re.compile(r"^(keep|leave|wait|hold|stay|let it)\b", re.I)
+# The only recommendations the timer reads as a decline: the whole text, case and end punctuation
+# aside, is one of these. No prose is parsed for meaning ("no, don't keep it" means act), so any other
+# wording stays open, or stays as written for a restriction, until the user answers.
+DECLINES = frozenset(("no", "decline", "skip", "keep it", "leave it", "do nothing", "no change"))
 
 
-def _declines(rec: str) -> bool:
-    """True only when the whole recommendation declines; when in doubt, False."""
-    if not _DECLINE_RE.match(rec) or _LATER_RE.search(rec):
-        return False
-    for c in (c.strip() for c in _CLAUSE_RE.split(rec)):
-        if c and not _NO_CLAUSE_RE.match(c) and not (
-                _KEEP_RE.match(c) and not _AS_USER_RE.search(c) and not _GRANT_RE.search(c)):
-            return False
-    return True
+def declines(rec: str | None) -> bool:
+    """True only when the whole recommendation is one of DECLINES."""
+    return " ".join((rec or "").split()).strip(" .!").lower() in DECLINES
 
 
 def hours(cfg: dict | None) -> float:
@@ -64,18 +53,19 @@ def hours(cfg: dict | None) -> float:
 def outcome(blocking: str | None, rec: str | None) -> tuple[str, str]:
     """What the timer does with an ask: ("apply", rec), ("stay", STAY) or ("open", why it waits)."""
     rec = " ".join((rec or "").split())
-    declines = _declines(rec)
     if not rec:
         return "open", "it has no recommendation"
     if blocking == "restriction":
-        return ("apply", rec) if declines else ("stay", STAY)
+        return ("apply", rec) if declines(rec) else ("stay", STAY)
     if blocking in AS_USER_REASONS:
         return "open", f"only the user gives a {blocking} answer"
-    if _AS_USER_RE.search(rec) and not declines:
+    if declines(rec):
+        return "apply", rec
+    if _AS_USER_RE.search(rec):
         return "open", "its recommendation speaks or acts as the user"
     if blocking == "irreversible":
-        return ("apply", rec) if declines else ("open", "its recommendation cannot be undone")
-    if blocking in GATED_REASONS and not declines and _GRANT_RE.search(rec):
+        return "open", "its recommendation cannot be undone"
+    if blocking in GATED_REASONS and _GRANT_RE.search(rec):
         return "open", f"its recommendation needs {blocking} only the user holds"
     return "apply", rec
 
