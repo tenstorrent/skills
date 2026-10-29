@@ -18676,7 +18676,7 @@ def test_an_off_topic_answer_leaves_the_ask_open_and_is_linked_as_a_new_instruct
     # Short consent, or a reply referring back to the ask's options, is a possible answer (review #4305).
     restart = "Can I restart the daemon on the laptop now?"
     pick = "Which option should the nightly run use: A (faster, 2x cost) or B (slower, cheaper)?"
-    box = "Which box should the soak run on: blx03 or cs04?"
+    box = "Which box should the soak run on: box-a or box-b?"
     for text, asked in (("please do", restart), ("Please wait until I am back", restart),
                         ("Try the first one", pick), ("use the cheaper one", pick),
                         ("Use the galaxy instead", box), ("please", restart), ("use the galaxy", box),
