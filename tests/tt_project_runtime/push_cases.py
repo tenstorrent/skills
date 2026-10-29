@@ -2345,7 +2345,7 @@ def test_a_batch_is_due_after_the_window_at_the_cap_for_priority_one_or_with_no_
     s.p.db.x("DELETE FROM push_queue WHERE id IN (?,?,?)", (*first, later[0]))
     urgent = _pq_review(s, priority=1)[1]
     rows, why = pushq.due(s.p, now)
-    assert [r["id"] for r in rows] == [urgent, later[1]] and "priority-1" in why, "the best priority goes first"
+    assert [r["id"] for r in rows] == [urgent, later[1]] and "an urgent review" in why, "the best priority goes first"
     s.p.db.x("DELETE FROM push_queue WHERE id=?", (urgent,))
     assert pushq.due(s.p, now)[0] == []
     s.p.db.update_task(s.review, status="done")
@@ -2369,7 +2369,7 @@ def test_a_batch_waits_push_min_gap_s_after_the_last_one_ended_unless_full_or_pr
     assert [r["id"] for r in pushq.due(s.p, now + 10 ** 6)[0]] == rows
     rows.append(_pq_review(s, priority=1)[1])
     got, why = pushq.due(s.p, now)
-    assert [r["id"] for r in got] == rows[::-1] and "priority-1" in why, "an urgent approval starts at once"
+    assert [r["id"] for r in got] == rows[::-1] and "an urgent review" in why, "an urgent approval starts at once"
     s.p.db.x("DELETE FROM push_queue WHERE id=?", (rows.pop(),))
     rows += [_pq_review(s)[1], _pq_review(s)[1]]
     got, why = pushq.due(s.p, now)

@@ -47,7 +47,7 @@ def _owe(p, tid, due):
                            milestones=[{"key": "m1", "due": due, "evidence_required": "a result"}])
 
 
-def test_dispatch_starts_obligation_owners_then_priority_1_first_and_never_past_max_parallel(
+def test_dispatch_starts_urgent_then_obligation_owners_first_and_never_past_max_parallel(
         env, monkeypatch, tmp_path, reap_tmp_processes):
     p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
     try:
@@ -61,14 +61,14 @@ def test_dispatch_starts_obligation_owners_then_priority_1_first_and_never_past_
         _owe(p, late_owner, now + 7200)
         _owe(p, early_owner, now + 3600)
         assert "## Obligation o" in p.db.task(early_owner)["spec"], "attached through the real record path"
-        assert [t["id"] for t in p.db.ready_tasks()] == [early_owner, late_owner, plain_p1, old_p3]
+        assert [t["id"] for t in p.db.ready_tasks()] == [plain_p1, early_owner, late_owner, old_p3]
         d.dispatch()
-        assert _slot_tasks(p) == [early_owner, late_owner], "obligation owners first, the earliest due first"
+        assert _slot_tasks(p) == [plain_p1, early_owner], "urgent first, then the earliest due obligation owner"
         d.dispatch()
         assert len(_slot_tasks(p)) == 2, "a second pass started past max_parallel"
         settle(d)
         d.dispatch()
-        assert _slot_tasks(p) == [plain_p1, old_p3], "then priority 1 before the older priority 3"
+        assert _slot_tasks(p) == [late_owner, old_p3], "then the later owner before the older priority 3"
     finally:
         drain(d)
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
@@ -107,6 +107,7 @@ def _slot_wait_events(p):
 def test_slot_wait_fires_once_per_urgent_task_only_while_every_slot_is_taken(env, monkeypatch, tmp_path,
                                                                              reap_tmp_processes):
     p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
+    d.cfg["budget"]["urgent_extra_slots"] = 0   # the urgent task stays held by the one full slot
     try:
         holder = p.db.add_task("routine work holding the slot", "s", kind="work", tier="light", origin="user",
                                priority=3)
@@ -126,8 +127,8 @@ def test_slot_wait_fires_once_per_urgent_task_only_while_every_slot_is_taken(env
             d.check_slot_wait()
             return _slot_wait_events(p)
 
-        assert check(0) == [] and check(5) == [] and check(10) == [] and check(14) == []
-        events = check(15)
+        assert check(0) == [] and check(5) == [] and check(9) == []
+        events = check(10)
         assert sorted(e["task"] for e in events) == [owner, urgent], "only obligation owners and priority 1"
         by_task = {e["task"]: e for e in events}
         assert by_task[owner]["severity"] == "high" and by_task[urgent]["severity"] == "normal"
@@ -734,11 +735,11 @@ def test_a_slot_fill_flags_an_obligation_owner_and_lists_it_where_dispatch_ranks
         owner = p.db.add_task("owes a deliverable", "s", kind="work", tier="light", origin="user", priority=3)
         _owe(p, owner, time.time() + 3600)
         d.dispatch()
-        assert _slot_tasks(p) == [owner]
+        assert _slot_tasks(p) == [plain], "an urgent task ranks before an obligation owner"
         line, = _sched_lines(p)
-        assert line["runnable"] == [{"id": owner, "priority": 3, "owns_obligation": True},
-                                    {"id": plain, "priority": 1, "owns_obligation": False}], line
-        assert line["picked"] == [owner]
+        assert line["runnable"] == [{"id": plain, "priority": 1, "owns_obligation": False},
+                                    {"id": owner, "priority": 3, "owns_obligation": True}], line
+        assert line["picked"] == [plain]
     finally:
         drain(d)
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"

@@ -747,6 +747,7 @@ def _route_slots(p, d, monkeypatch, n, core_max=1, chat_max=1, chat_open=True, c
     monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.root), None))
     d.gates[core] = bud.Gate(core, regime="windows", max_parallel=core_max)
     d.gates["chat"] = bud.Gate("chat", regime="windows", max_parallel=chat_max, allow_new_work=chat_open)
+    d.cfg["budget"]["urgent_extra_slots"] = 0   # slot limits, not the urgent lane (its tasks are priority 1)
     for _ in range(core_running):
         p.db.x("INSERT INTO runs(role,provider,started,status,boot_id) VALUES('worker',?,?,'running',?)",
                (core, time.time(), d.boot))

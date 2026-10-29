@@ -5706,7 +5706,7 @@ class Daemon:
     def check_slot_wait(self, every_s: float = 60) -> None:
         """Model-free urgent slot wait: a ready task that is a required owner of an open obligation, or has
         priority 1, held only because every worker slot of its provider is taken (_start_hold's 'gate' with
-        ctx["full"]) at every check for coordinator.urgent_slot_wait_min (default 15, 0: off) raises one
+        ctx["full"]) at every check for coordinator.urgent_slot_wait_min (default 10, 0: off) raises one
         observation naming it and the running tasks holding the slots with their priorities, so the
         coordinator can free or reorder work before the user notices. High for an obligation owner,
         normal for a plain priority 1. One per task per stay in the queue (keyed on its last run); a free
