@@ -293,7 +293,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
   spend is readable, add `--spend-cmd "<cmd printing USD so far>" --spend-cap <usd>`: the daemon
   stops it at the cap. Report its spend in the hand-off.
 <!-- /ttp:if wait -->
-- Flush as you go. Galaxy reset: tt-smi -glx_reset, never tt-smi -r; no reset where it cannot run (harness skill).
+- Flush as you go. Galaxy reset: tt-smi -glx_reset, never tt-smi -r; rescan root ports, recount chips by BDF and tray; no reset where it cannot run; say so plainly.
 - Keep runs short: a run re-reads its whole context on every call. When the work exceeds one run
   or you passed the split line, finish the step, commit and hand off `done` with a
   `followups` entry titled `continue: ...` (what is done, branch and head, what is left).
