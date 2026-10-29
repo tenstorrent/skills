@@ -35,7 +35,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import settled
+from . import gitmemo, settled
 
 KINDS = ("code", "harness")
 OPEN = ("queued", "running", "review", "pushing", "waiting", "blocked")
@@ -183,7 +183,9 @@ def branches(p, skip=()) -> list[dict]:
     """Code tasks' branches still to land, with commits of their own:
     [{id, branch, head, open, files: [(A|M|D, path)]}]. An open task's branch, or a done task's that
     finished (its last run ended) within `overlap.branch_days`, was not shelved or rejected, is not
-    landed by the records and not merged into the base; a diff per head is read once and cached in state/."""
+    landed by the records and not merged into the base; a diff per head is read once and cached in state/.
+    Within a gitmemo scope the base and the heads are read once: a later call whose branches are among
+    those already read (`skip` is applied after the read) runs no git."""
     from . import worktree
     days = float(settings(p).get("branch_days") or 14)
     since = time.time() - days * 86400
@@ -191,8 +193,7 @@ def branches(p, skip=()) -> list[dict]:
                   "AND branch != '' AND (status IN (%s) OR (status='done' AND updated>?)) ORDER BY id"
                   % (",".join("?" * len(KINDS)), ",".join("?" * len(OPEN))), (*KINDS, *OPEN, since))
     landed = _landed_ids(p.db)
-    rows = [r for r in rows if r["id"] not in landed and r["id"] not in skip
-            and (r["status"] in OPEN or not _shelved(r["result"]))]
+    rows = [r for r in rows if r["id"] not in landed and (r["status"] in OPEN or not _shelved(r["result"]))]
     done = [r["id"] for r in rows if r["status"] not in OPEN]
     if done:   # `updated` moves with any later write: a done task's finish is its last run's end
         ended = {r["task"]: r["e"] for r in p.db.q("SELECT task, MAX(ended) e FROM runs WHERE task IN (%s) "
@@ -201,17 +202,16 @@ def branches(p, skip=()) -> list[dict]:
     if not rows:
         return []
     try:
-        base = worktree.resolve_base(p)
+        base = gitmemo.cached(("overlap.base",), lambda: worktree.resolve_base(p))
     except (RuntimeError, OSError, subprocess.SubprocessError):
         return []
-    refs = [f"refs/heads/{r['branch']}" for r in rows]
-    heads = dict(ln.split(" ", 1)[::-1] for ln in _git(p.root, "for-each-ref", "--no-merged", base,
-                                                       "--format=%(objectname) %(refname:short)", *refs
-                                                       ).stdout.splitlines() if " " in ln)
+    heads = _heads(p, base, [f"refs/heads/{r['branch']}" for r in rows])
     cache = _load_cache(p)
     size = len(cache)
     out = []
     for r in rows:
+        if r["id"] in skip:
+            continue
         head = heads.get(r["branch"])
         if head and (files := diff(p, base, head, cache)):
             out.append({"id": r["id"], "branch": r["branch"], "head": head, "open": r["status"] in OPEN,
@@ -226,6 +226,20 @@ def branches(p, skip=()) -> list[dict]:
     return out
 
 
+def _heads(p, base: str, refs: list[str]) -> dict[str, str]:
+    """{branch: head} of `refs` not merged into `base`; read once per scope for any refs it covers."""
+    memo = gitmemo.current()
+    got = memo.get(("overlap.heads", base)) if memo is not None else None
+    if got and set(refs) <= got[0]:
+        return got[1]
+    heads = dict(ln.split(" ", 1)[::-1] for ln in _git(p.root, "for-each-ref", "--no-merged", base,
+                                                       "--format=%(objectname) %(refname:short)", *refs
+                                                       ).stdout.splitlines() if " " in ln)
+    if memo is not None:
+        memo[("overlap.heads", base)] = (set(refs), heads)
+    return heads
+
+
 def _on_push_branch(p, b: dict, seen: list) -> bool:
     """A done task's branch is on the push branch under other commits (a rebase, a squash, a replay):
     landed.py's patch checks, local refs only. Read only for branches that touch the new task's
@@ -235,11 +249,14 @@ def _on_push_branch(p, b: dict, seen: list) -> bool:
     if b["head"] in seen:
         return True
     from . import landed
-    try:
-        hit = landed.on_push_branch(p, b["branch"]) or landed.equivalent(
-            p, b["branch"], (p.config().get("delivery") or {}).get("version_bump"))
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return False
+
+    def read() -> bool:
+        try:
+            return bool(landed.on_push_branch(p, b["branch"]) or landed.equivalent(
+                p, b["branch"], (p.config().get("delivery") or {}).get("version_bump")))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return False
+    hit = gitmemo.cached(("overlap.on_push_branch", b["branch"], b["head"]), read)
     if hit:
         seen.append(b["head"])
     return bool(hit)

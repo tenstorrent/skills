@@ -69,6 +69,7 @@ from . import conflictfix
 from . import correction
 from . import slowcomplaint
 from . import credits
+from . import gitmemo
 from . import globalcap as gcap
 from . import coordinator as coord
 from . import coordlimits
@@ -794,6 +795,7 @@ class Daemon:
         self._machines_routed = 0.0
         self._coverage_at = 0.0
         self._probe_rc: dict[int, tuple[int | str, float, str]] = {}   # last verdict: exit code or why, when, probe
+        self._git_memo: dict[int, dict] = {}   # task -> git facts its hand-off is judged by, read before the tx (_prefetch_git)
         self._start_rc: dict[int, tuple[int | str, float, str]] = {}   # a start_when's last not-yet or broken verdict
         self._checks_gone_at: dict[int, tuple[str, float]] = {}   # task -> probe on gone checks, first seen (checksgone)
         self._host_up: dict[str, tuple[bool, float]] = {}   # host a probe's 255 named -> ssh reached it, when
@@ -3422,7 +3424,7 @@ class Daemon:
                 self._dry_run_on_pass(r, run_dir, usage.session_id or note.get("session_id") or "")
         # The run's end, its spend and what it did to its task commit together: a daemon stopped
         # half way leaves the run "running", and the next tick processes it again from disk.
-        with db.tx():
+        with self._finish_tx(r["task"] or 0):
             db.x("UPDATE runs SET ended=?, status=?, exit_code=?, cost_usd=?, cost_estimated=?, input_tokens=?, "
                  "output_tokens=?, cache_read_tokens=?, cache_write_tokens=?, note=?, "
                  "session_id=COALESCE(NULLIF(?,''), session_id) WHERE id=?",
@@ -3821,7 +3823,7 @@ class Daemon:
             from .providers.base import RunUsage
             usage = RunUsage(cost_usd=float(pv.get("cost") or 0.0), estimated=bool(pv.get("estimated")))
             self._prefetch_lint(tid, handoff, run_dir)
-            with db.tx():
+            with self._finish_tx(tid):
                 t = db.task(tid)
                 if not t or t["status"] != "pushing" or pushclaim.KEY not in load_result(t["result"]):
                     continue
@@ -3890,7 +3892,34 @@ class Daemon:
                 handoffcheck.prefetch(self.p, self.cfg, task, result, run_dir)
         except Exception as e:   # verdict runs them again inside the transaction
             log(self.p, f"task {task_id}: the hand-off checks failed to run early: {type(e).__name__}: {e}")
+        self._prefetch_git(task, result)
         return task
+
+    def _prefetch_git(self, task: dict | None, result) -> None:
+        """The git facts _finish_worker judges a hand-off by, read before its write transaction: a failed
+        review's area (reviewcap.area) and each follow-up's file overlaps and chain (coordinator
+        _file_overlaps, _overlap_chain). Kept in self._git_memo for the transaction's gitmemo scope
+        (_finish_tx), where those calls read them; one not read here runs its git there, as before."""
+        if not task:
+            return
+        memo = self._git_memo[task["id"]] = {}
+        result = result if isinstance(result, dict) else {}
+        try:
+            with gitmemo.scope(memo):
+                if task["kind"] == "review" and result.get("status") != "done":
+                    self._review_area(dict(task, result=dump_result(result)))
+                for f in result.get("followups") or []:
+                    if isinstance(f, dict) and isinstance(f.get("spec"), str) and f["spec"].strip():
+                        coord._overlap_chain(self.p, coord._file_overlaps(self.p, "code", f["spec"], set()))
+        except Exception as e:
+            log(self.p, f"task {task['id']}: reading git before finishing failed: {type(e).__name__}: {e}")
+
+    def _finish_tx(self, task_id: int):
+        """The write transaction a hand-off is recorded in, within the gitmemo scope _prefetch_git filled."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(gitmemo.scope(self._git_memo.pop(task_id, None)))
+        stack.enter_context(self.p.db.tx())
+        return stack
 
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,
                        rebooted: bool = False, slept: bool = False, handoff: dict | None = None,
@@ -9739,7 +9768,7 @@ class Daemon:
             from .providers.base import RunUsage
             self._probe_rc.pop(task["id"], None)
             self._prefetch_remote(task["id"], on_pass, run_dir)
-            with self.p.db.tx():
+            with self._finish_tx(task["id"]):
                 self._finish_worker(r, RunUsage(), "ok", run_dir, "model-free", handoff=on_pass)
             log(self.p, f"task {task['id']} retry_when probe passed; its checks passed on {head[:12]}: "
                         f"recorded its on_pass ({on_pass['status']}) model-free")
@@ -10145,7 +10174,7 @@ class Daemon:
                 from .providers.base import RunUsage
                 self._probe_rc.pop(tid, None)
                 self._prefetch_remote(tid, result, Path(r["dir"]))
-                with db.tx():
+                with self._finish_tx(tid):
                     self._finish_worker(r, RunUsage(), "ok", Path(r["dir"]), "model-free", handoff=result)
                 log(self.p, f"task {tid} on_pass_cmd recorded {result['status']} model-free")
                 continue

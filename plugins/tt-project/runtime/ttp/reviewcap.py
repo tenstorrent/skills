@@ -31,6 +31,7 @@ import json
 import re
 import time
 
+from . import gitmemo
 from .db import DB, continues_id, dependency_ids, load_result
 
 AREA_WINDOW_S = 48 * 3600
@@ -111,7 +112,12 @@ def lineage(db: DB, task_id: int, now: float | None = None) -> set[int]:
 
 
 def main_file(p, review: dict) -> str | None:
-    """The non-test file with the most changed lines in what `review` reviews, or None."""
+    """The non-test file with the most changed lines in what `review` reviews, or None (kept per
+    review within a gitmemo scope)."""
+    return gitmemo.cached(("reviewcap.main_file", review["id"]), lambda: _main_file(p, review))
+
+
+def _main_file(p, review: dict) -> str | None:
     from . import worktree
     try:
         lines = worktree.diff_lines(p, worktree.reviewed_refs(p, review)) or {}
@@ -144,7 +150,12 @@ def touched(p, review: dict, path: str) -> tuple[list[tuple[int, int]], set[str]
     """What `review` changes in `path`: the base-side line ranges of its hunks, and the functions
     they sit in or the functions and classes they change, as dotted names (`Core.run`). The function
     around a hunk is read from the base file: git's hunk header names the enclosing top-level line,
-    which for a method is its class, and a shared enclosing class alone is no overlap."""
+    which for a method is its class, and a shared enclosing class alone is no overlap. Kept per
+    review and path within a gitmemo scope."""
+    return gitmemo.cached(("reviewcap.touched", review["id"], path), lambda: _touched(p, review, path))
+
+
+def _touched(p, review: dict, path: str) -> tuple[list[tuple[int, int]], set[str]]:
     import subprocess
     from . import worktree
     ranges: list[tuple[int, int]] = []

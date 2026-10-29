@@ -254,3 +254,84 @@ def test_a_hung_harness_head_git_is_killed_whole_within_its_bound(env, monkeypat
     assert time.monotonic() - t0 < 5, "the tick waited on the hung git"
     assert p.db.kv("harness_good") is None
     assert _grandchild_gone(pidf), "git's grandchild outlived it"
+
+
+
+def test_a_failed_reviews_area_and_followup_overlaps_read_no_git_inside_the_finish_transaction(env, monkeypatch):
+    """Finishing a run judged its hand-off inside one write transaction, and a failed review's area
+    (reviewcap.area: main_file, touched) and each follow-up's file overlaps (overlap.find: branches,
+    the push-branch patch check) ran git there: the write lock was held up to ~98 s. Now those git
+    facts are read before the transaction (_prefetch_git) and the same calls inside it read them."""
+    p = make(env)
+    from ttp import coordinator as coord, gitmemo, overlap, reviewcap
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    (p.root / "app").mkdir()
+    (p.root / "app" / "core.py").write_text("".join(f"def f{i}():\n" + "    x = 1\n" * 8 + f"    return {i}\n\n\n"
+                                                    for i in range(10)))
+    _git_out(p.root, "add", "app/core.py")
+    _git_out(p.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "core")
+
+    def review_of(title):
+        def edit(path):
+            src = (path / "app" / "core.py").read_text()
+            (path / "app" / "core.py").write_text(src.replace("    return 0\n", f"    return 0  # {title}\n"))
+        return _finish_code(env, p, title, {}, edit=edit)[3][0]
+    for title in ("one take on f0", "another take on f0"):   # separate lineages, so the third pools them
+        _fail_review(env, p, review_of(title)["id"], [{"title": "fix", "spec": "it breaks"}])
+    rev = review_of("a third take on f0")
+    fups = [{"title": "fix f0", "spec": "Fix f0 in app/core.py so it returns the right value."}]
+    handoff = {"status": "failed", "summary": "blocking findings", "followups": fups}
+    task, cfg, spec = dict(p.db.task(rev["id"]), result=json.dumps(handoff)), p.config(), fups[0]["spec"]
+    want_area, want_hits = reviewcap.area(p, cfg, task), overlap.find(p, spec)
+    assert want_area and want_area["pooled"], "the setup must pool other lineages' reviews (main_file, touched)"
+    assert sum(bool(h.get("head")) for h in want_hits) >= 2, "the setup must find unlanded branches on app/core.py"
+
+    d = Daemon(p.base)   # its own connection: a transaction is open on either
+    in_tx = lambda: p.db.conn.in_transaction or d.p.db.conn.in_transaction   # noqa: E731
+    spawned: list = []
+    strict = [True]
+    real = subprocess.Popen
+
+    def popen(argv, *a, **k):
+        if in_tx():
+            spawned.append(argv)
+            if strict[0]:
+                raise OSError("no subprocess inside the finish transaction")
+        return real(argv, *a, **k)
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    # Without the warm-up the same calls spawn git inside a transaction (what this guards against).
+    with p.db.tx():
+        assert reviewcap.main_file(p, task) is None and spawned
+    spawned.clear()
+    d._prefetch_git(task, handoff)
+    with d._finish_tx(rev["id"]):
+        assert gitmemo.current() is not None
+        assert reviewcap.area(p, cfg, task) == want_area
+        assert overlap.find(p, spec) == want_hits
+        assert overlap.find(p, spec, {want_hits[0]["id"]}) == want_hits[1:]   # skip filters what was read
+        assert coord._overlap_chain(p, coord._file_overlaps(p, "code", spec, set())) \
+            == coord._overlap_chain(p, want_hits)
+    assert not spawned, f"git ran inside the finish transaction: {spawned}"
+    assert rev["id"] not in d._git_memo and gitmemo.current() is None, "the memo outlived its transaction"
+    # Through the hand-off itself (the way finish_run records it): the area is judged inside, git-free.
+    strict[0] = False
+    p.db.update_task(rev["id"], status="running")
+    run_dir = env["tmp"] / "run-third"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps(handoff))
+    real_area, counts = reviewcap.area, []
+
+    def area(*a, **k):
+        before = len(spawned)
+        try:
+            return real_area(*a, **k)
+        finally:
+            counts.append((in_tx(), len(spawned) - before))
+    monkeypatch.setattr(reviewcap, "area", area)
+    d._prefetch_remote(rev["id"], handoff, run_dir)
+    with d._finish_tx(rev["id"]):
+        d._finish_worker({"task": rev["id"]}, Usage(cost_usd=1.0), "ok", run_dir)
+    assert (True, 0) in counts and all(n == 0 for _, n in counts), f"the area read git in the transaction: {spawned}"
+    assert p.db.task(rev["id"])["status"] == "failed"
+    assert p.db.one("SELECT id FROM events WHERE kind=? AND task=?", (reviewcap.REVIEW_AREA_EVENT, rev["id"]))
