@@ -5927,7 +5927,8 @@ def test_an_ask_recommending_yes_to_a_safe_step_is_rejected(env):
                              "yes. Once pushed the tag is permanent, so reversible only by a new release")):
         for blocking in ("irreversible", "restriction"):
             cls = "irreversible" if blocking == "irreversible" else "restriction_change"
-            assert _ask(p, f"Publish package {k} ({blocking})?", blocking=blocking, recommendation=say,
+            n = 2 * k + (blocking == "restriction")   # its own question: the same one twice is a double ask
+            assert _ask(p, f"Publish package {n} ({blocking})?", blocking=blocking, recommendation=say,
                         least_disruptive=least, classify=cls)[0] == [], (blocking, say)
     assert _ask(p, "Publish the package? It isn\u2019t reversible.", blocking="irreversible",
                 recommendation="yes, publish", **ir)[0] == []

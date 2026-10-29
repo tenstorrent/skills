@@ -2440,13 +2440,20 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why and len(str(a.get("not_own_call") or "").strip()) < LEAST_DISRUPTIVE_MIN:
                     _count_refusal(db, key, why[0], text)
                     raise ValueError(f"ask_user rejected: {why[1]}")
+                nc = str(a.get("not_covered") or "").strip()
+                # In other words too (a restriction ask stays open past the timeout), unless not_covered
+                # says what is new; review and merge asks have the pr_approve record check below, and
+                # asks naming other numbers ('option 1', 'option 2') ask about different things.
+                reword = len(nc) < NOT_COVERED_MIN and a["blocking"] not in ("review", "merge")
                 for o in db.q("SELECT id, text FROM messages WHERE kind='ask' AND handled=0"):
-                    if _same_text(_ask_question(o["text"]), text):
+                    old = _ask_question(o["text"])
+                    if _same_text(old, text) or (reword and reask.same_question(text, old)
+                                                 and not _other_numbers(text, old)):
                         raise ValueError(f"already asked as open ask #{o['id']}; it waits for the answer")
                 if why := _asked_before_instruction(db, text):
                     _count_refusal(db, key, "new instruction, not an answer", text)
                     raise ValueError(f"ask_user rejected: {why}")
-                seen, nc = None, str(a.get("not_covered") or "").strip()
+                seen = None
                 if a["blocking"] not in ("review", "merge"):   # those have the pr_approve record check below
                     seen = reask.settled_by(p, cfg, text, change=a.get("classify") == "restriction_change",
                                             question=_ask_question) or correction.repeated(p, text)
@@ -2969,6 +2976,12 @@ def _asked_before_instruction(db, text: str, now: float | None = None) -> str:
             return (f"ask #{aid} asked this and user msg #{mid} gave a new instruction instead of an answer: "
                     f"act on that instruction; ask #{aid} stays open, not asked again within the hour")
     return ""
+
+
+def _other_numbers(text: str, old: str) -> bool:
+    """Both name numbers, and not the same ones."""
+    a, b = (set(re.findall(r"\b\d+\b", t)) for t in (text, old))
+    return bool(a and b and a != b)
 
 
 # An ask the user already answered (_prior_approval) is refused only on a structured record: an

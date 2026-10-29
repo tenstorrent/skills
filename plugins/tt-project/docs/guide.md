@@ -450,7 +450,9 @@ prolonged whole-box outage.
   the ask are released. Asks only the user can answer stay open (review, merge, another human's
   request, a recommendation that acts as the user, a credential or money grant, an irreversible
   step, a restriction ask whose recommendation would loosen it: only the user's own words loosen a
-  restriction). An open ask never blocks other work; it holds only the tasks anchored on it. For an
+  restriction). An open ask never blocks other work; it holds only the tasks anchored on it. The same
+  question while it is open, also in other words, is refused naming it (review and merge asks: same
+  text only), unless `not_covered` says what is new. For an
   irreversible or restriction ask the timer reads no prose for meaning: only a recommendation that
   is wholly one bare decline (no, decline, skip, keep it, leave it, do nothing, no change) applies;
   any longer wording, even a decline, leaves the ask open for the user. A re-ask of an answered

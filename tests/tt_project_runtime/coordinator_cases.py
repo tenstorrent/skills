@@ -5050,6 +5050,28 @@ def test_a_restriction_ask_stays_open_past_the_timeout_and_never_loosens_it(env)
     assert db.one("SELECT handled FROM messages WHERE id=?", (loosen["id"],))["handled"] == 1
 
 
+def test_a_reworded_repeat_of_an_open_restriction_ask_past_the_timeout_is_refused(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    way = "a canary on one box breaks the no-shared-machines restriction"
+    kw = dict(blocking="restriction", classify="restriction_change", least_disruptive=way,
+              recommendation="lift it for one run")
+    _, first = _ask(p, "Lift the shared-machine ban for the nightly benchmark runs?", **kw)
+    assert coord.expire_asks(p, now=first["ts"] + 3600) == []
+    assert db.one("SELECT handled FROM messages WHERE id=?", (first["id"],))["handled"] == 0
+    # The same question in other words while the first still waits: refused, naming the open ask.
+    again = "Should the shared-machine ban be lifted for the nightly benchmark runs?"
+    problems, last = _ask(p, again, **kw)
+    assert problems and f"already asked as open ask #{first['id']}" in problems[0], problems
+    assert last["id"] == first["id"], "the re-ask reached the user"
+    # A resend saying what is new goes out, and so does a question on another subject.
+    problems, sent = _ask(p, again, **kw, not_covered="the benchmark now needs two boxes, not one as before")
+    assert problems == [] and sent["id"] != first["id"], problems
+    problems, other = _ask(p, "Should the release notes name the new fabric check?", **_OWN_ACCESS)
+    assert problems == [] and other["id"] != sent["id"], problems
+
+
 def test_the_ask_deadline_shows_in_status_the_web_app_and_the_digest(env):
     p = make(env)
     from ttp import coordinator as coord, timefmt
