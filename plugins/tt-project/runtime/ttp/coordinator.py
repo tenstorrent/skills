@@ -3810,7 +3810,12 @@ def sync_shared_pauses(p: Project, db=None) -> None:
 
 def _wake_pause_waiters(db, name: str, since: float) -> int:
     """Tasks that handed off `waiting` on `name` while it was paused are due now: their wait was the
-    pause, not their `retry_after_s` timer or `retry_when` probe. Returns how many woke."""
+    pause, not their `retry_after_s` timer or `retry_when` probe. Returns how many woke. Every pause
+    end this project sees (its own, a shared one, a fleet hold) passes here, so it records the pause
+    as a resource_resumed event (`data`: resource, since), the interval throughput.measure reads."""
+    db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+         (time.time(), "daemon", "resource_resumed", "low", f"{name} resumed",
+          json.dumps({"resource": name, "since": since}), "handled"))
     woken = 0
     for t in db.q("SELECT * FROM tasks WHERE status='queued' AND not_before IS NOT NULL"):
         prev = load_result(t["result"])

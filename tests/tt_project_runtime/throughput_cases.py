@@ -174,7 +174,7 @@ def test_throughput_measures_requeue_waits_by_reason_and_a_slow_checks_lane_gets
     now = time.time()
     checks = "waiting for ttp checks: waiting (pid 5, not running) for this project's other full checks to end"
 
-    def requeued(title, gap_end, status, reason, wait_for=None, data=True, ended=now - 4 * 3600):
+    def requeued(title, gap_end, status, reason, wait_for=None, data=True, ended=now - 4 * 3600, kind="external"):
         # As the daemon records it: the run ends 'ok' (finish_run's process outcome), the waiting hand-off
         # is a task_waiting event and the task's status and blocked_reason.
         t = _tp_task(p, title, ended - 3600, prio=1)
@@ -183,7 +183,7 @@ def test_throughput_measures_requeue_waits_by_reason_and_a_slow_checks_lane_gets
         w = reason if wait_for is None else wait_for
         p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
                (ended + 1, f"task:{t}", "task_waiting", "low", f"#{t} {title}: {w}",
-                json.dumps({"wait": "self", "why": "hand-off", "for": w} if data else {}), "handled", t))
+                json.dumps({"wait": kind, "why": "hand-off", "for": w} if data else {}), "handled", t))
         if gap_end:
             _tp_run(p, t, gap_end, gap_end + 600)
         p.db.x("UPDATE tasks SET status=?, blocked_reason=? WHERE id=?", (status, reason, t))
@@ -191,7 +191,7 @@ def test_throughput_measures_requeue_waits_by_reason_and_a_slow_checks_lane_gets
 
     requeued("ran again", now - 2 * 3600, "done", "", wait_for=checks)
     requeued("still queued", None, "queued", checks)
-    requeued("own job", None, "waiting", "own ttp checks --detach running")
+    requeued("own job", None, "waiting", "own ttp checks --detach running", kind="self")
     requeued("retry", None, "waiting", "CI on the branch")
     requeued("old done", None, "done", checks)
     # The title names checks, the wait does not: the "#<id> <title>: " prefix is not the reason.
@@ -494,8 +494,19 @@ def test_speed_complaint_on_the_turn_start_runs_the_review_applies_and_queues_p1
     prompt = calls[-1][0]
     assert f"Speed complaint: measured throughput review (speed complaint #{mid}" in prompt
     assert "worker_slots SLOW" in prompt and "Changed #" in prompt and "budget.max_parallel_workers" in prompt
+    # The slow landed_chain lane has no setting: reported, no follow-up task.
+    assert "landed_chain SLOW" in prompt and "Not changed: landed_chain (no setting)" in prompt
+    assert not p.db.q("SELECT * FROM tasks WHERE title LIKE 'throughput: %'")
+    # A slow resource lane has a setting a person or task may change: one p1 follow-up.
+    for i in range(2):
+        _tp_task(p, f"needs box {i}", now - 3 * 3600, prio=1, labels=["resource:boxA"])
+    p.set_config("resources", {"boxA": 1})
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    p.db.post("in", "Why is this so slow", chat="c1")
+    monkeypatch.setattr(time, "time", lambda: later + 300)
+    d.maybe_coordinate()
     fu = p.db.q("SELECT * FROM tasks WHERE title LIKE 'throughput: %'")
-    assert [t["priority"] for t in fu] == [1] and "landed_chain" in fu[0]["title"] and "urgent:" in fu[0]["spec"]
+    assert [t["priority"] for t in fu] == [1] and "resource:boxA" in fu[0]["title"] and "urgent:" in fu[0]["spec"]
     # A second complaint the same day runs it again, lists the earlier change, queues no second task.
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
     p.db.post("in", "Still waiting for hours again", chat="c1")
@@ -600,3 +611,101 @@ def test_ttp_throughput_cli_prints_text_and_json(env):
     assert {"lane", "limit_key", "limit", "count", "median_s", "p90_s", "p1_p90_s", "at_limit", "idle",
             "waiting_now", "slow"} <= set(data["lanes"][0])
     assert _ttp_run(p, "throughput", "--since", "soon").returncode != 0
+
+
+def test_throughput_a_wait_inside_a_pause_is_a_hold_with_no_limit_and_opens_no_task(env, monkeypatch):
+    """A resource's pause (still on, or ended: coordinator._wake_pause_waiters records it) holds the
+    tasks labelled with it on purpose: the hold lane, no limit, no follow-up; an unpaused one stays
+    its resource's lane."""
+    from ttp import coordinator, slowcomplaint, throughput
+    p = make(env)
+    now = time.time()
+    p.set_config("resources", {"boxA": 1, "boxB": 1, "boxC": 1})
+    real_time = time.time
+    try:
+        monkeypatch.setattr(time, "time", lambda: now - 6 * 3600)
+        coordinator.pause_resource(p, "boxA", True, "maintenance", by="user")
+        coordinator.pause_resource(p, "boxB", True, "firmware update", by="coordinator")
+        monkeypatch.setattr(time, "time", lambda: now - 3600)
+        coordinator.pause_resource(p, "boxB", False, by="coordinator")
+    finally:
+        monkeypatch.setattr(time, "time", real_time)
+    (ev,) = p.db.q("SELECT * FROM events WHERE kind='resource_resumed'")
+    assert json.loads(ev["data"])["resource"] == "boxB" and abs(json.loads(ev["data"])["since"] - (now - 6 * 3600)) < 1
+    _tp_task(p, "on paused box", now - 5 * 3600, prio=1, labels=["resource:boxA"])
+    b = _tp_task(p, "on resumed box", now - 5 * 3600 + 120, prio=1, labels=["resource:boxB"])
+    _tp_run(p, b, now - 3600 + 60, now - 1800)
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (b,))
+    _tp_task(p, "on busy box", now - 4 * 3600, prio=1, labels=["resource:boxC"])
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    hold = _tp_lane(rep, "hold")
+    assert (hold["count"], hold["limit"], hold["limit_key"]) == (2, None, None) and hold["slow"]
+    assert not any(ln["lane"] in ("resource:boxA", "resource:boxB") and ln["count"] for ln in rep["lanes"])
+    assert _tp_lane(rep, "resource:boxC")["count"] == 1
+    _, kept = throughput.plan(p.db, p.config(), rep)
+    assert {k["lane"] for k in kept} >= {"hold", "resource:boxC"}
+    made = slowcomplaint._followups(p.db, {**rep, "kept": kept}, [1])
+    opened = p.db.task(made["opened"])
+    assert "resource:boxC" in opened["title"] and "lane hold " not in opened["spec"] and made["listed"] is None
+    assert "hold SLOW" in throughput.text({**rep, "kept": kept})
+
+
+def test_throughput_a_self_wait_or_its_own_job_is_own_job_not_its_resource(env, tmp_path):
+    """Re-queue waits handed off through the daemon (task_waiting data): wait=self, or live work whose
+    key names the task's own detached job, count as own_job; a plain lock wait stays its resource's."""
+    from ttp import throughput
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage
+    p = make(env)
+    p.set_config("resources", {"boxA": 1})
+    d, now = Daemon(p.base), time.time()
+    job = tmp_path / "jobs" / "bench"
+    job.parent.mkdir()
+    hand = {"self": {"wait_kind": "self", "waiting_for": "boxA bench results", "retry_when": "test -e out/done"},
+            "job": {"wait_kind": "external", "waiting_for": "boxA bench job",
+                    "retry_when": f"ttp detach --check {job} && ttp lock --probe boxA"},
+            "lock": {"waiting_for": "boxA busy", "retry_when": "ttp lock --probe boxA"}}
+    ids = {}
+    for name, res in hand.items():
+        tid = _tp_task(p, f"box work {name}", now - 3 * 3600, labels=["resource:boxA"])
+        _tp_run(p, tid, now - 3 * 3600, now - 2 * 3600 - (300 if name == "lock" else 0))
+        p.db.update_task(tid, status="running")
+        run_dir = tmp_path / f"run-{tid}"
+        run_dir.mkdir()
+        (run_dir / "result.json").write_text(json.dumps({"status": "waiting", "summary": "waits",
+                                                         "retry_after_s": 1800, **res}))
+        d._finish_worker({"task": tid, "note": "{}"}, RunUsage(cost_usd=0.1), "ok", run_dir)
+        assert p.db.task(tid)["status"] == "queued"
+        ids[name] = tid
+    data = {r["task"]: json.loads(r["data"]) for r in p.db.q("SELECT task, data FROM events WHERE kind='task_waiting'")}
+    assert data[ids["self"]]["wait"] == "self" and data[ids["job"]]["live"]["key"].startswith("job:")
+    assert data[ids["lock"]]["wait"] == "external"
+    rep = throughput.measure(p.db, p.config(), now=time.time() + 1, gates={})
+    assert _tp_lane(rep, "own_job")["count"] == 2
+    box = _tp_lane(rep, "resource:boxA")
+    assert box["waiting_now"] == 1 and box["p90_s"] >= 2 * 3600 + 300
+
+
+def test_throughput_review_sweep_of_a_run_that_ended_long_before_its_hand_off(env, tmp_path):
+    """A code task whose run ended hours before its hand-off (a waiting run whose own checks then passed)
+    is swept from the hand-off the daemon records, not from the run's end."""
+    from ttp import throughput
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage
+    p = make(env)
+    p.set_config("review.sweep_after_s", 1200)
+    d, now = Daemon(p.base), time.time()
+    code, path, _ = _code_task(p, "code change", status="running")
+    _commit_file(path, "change")
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 6 * 3600, code))
+    _tp_run(p, code, now - 6 * 3600, now - 5 * 3600)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "change made, checks pass"}))
+    d._finish_worker({"task": code, "note": "{}"}, RunUsage(cost_usd=0.1), "ok", run_dir)
+    (rv,) = [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='review'")]
+    assert p.db.q("SELECT 1 FROM events WHERE task=? AND kind IN ('task_review','task_done')", (code,))
+    _tp_run(p, rv, time.time() + 60, time.time() + 600, role="reviewer")
+    rep = throughput.measure(p.db, p.config(), now=time.time() + 700, gates={})
+    sw = _tp_lane(rep, "review_sweep")
+    assert sw["count"] == 1 and sw["p90_s"] < 60 and not sw["slow"]

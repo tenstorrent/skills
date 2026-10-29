@@ -12,7 +12,12 @@ to its first run, or to now for one still queued:
   limit; a task's wait counts from the time its last dependency was done.
 - resource:<name> / device:<name>: a `resource:`/`exclusive:` label. Limit its slot count (a device
   lock is always 1). Reported only: a box's headroom is not measurable from here.
-- review_sweep: a code task's last run ending to its review task being queued. Limits
+- hold: such a wait at least half inside a pause of one of its resources (a deliberate hold: the
+  pauses in force, db.paused_resources, with shared ones and machine-wide fleet holds, and the ended
+  ones, the resource_resumed events coordinator._wake_pause_waiters writes). No limit; a shorter
+  overlap is taken off the resource lane's wait.
+- review_sweep: a code task's hand-off into review (its task_review or task_done event; else its last
+  run's end, when a model-free on_pass finished it later) to its review task being queued. Limits
   review.sweep_after_s, judged only on the reviews the sweep queued (its review_swept events), and
   review.unreviewed_per_pass (against the backlog of tasks in review now).
 - review_stall: the same end to the review's first run, against coordinator.review_stall_s (the age at
@@ -28,7 +33,8 @@ to its first run, or to now for one still queued:
   a task held because its provider is logged out or paused. Reported with their cause, no limit.
 - Re-queue waits: each waiting hand-off (its task_waiting event) to the task's next run, and the current
   wait of a task that has run (queued, blocked or waiting) from its last run's end to now, sorted by
-  its reason (the event's "for" or text; the task's blocked_reason for the current wait), or by the
+  its reason (the event's "for" or text; the task's blocked_reason for the current wait), its event's
+  data (a self-wait, `wait` self, or a wait on its own `ttp detach` job, a `job:` live key: own_job), or by the
   checks slot's own records (a checks_slot_wait event in the wait, or checkcap's waits log covering
   half of it): checks_slots (waiting for this project's other `ttp checks`; limit checks.slots per
   repository or checks.test_project_max per project, whichever of the two held the wait: both are
@@ -154,6 +160,19 @@ def _wait_for(t: dict, e: dict) -> str:
     return (text[len(head):] if text.startswith(head) else text).lower()
 
 
+def _self_wait(e: dict) -> bool:
+    """Whether a task_waiting event (Daemon's hand-off writer) is a wait on the task's own work: `wait`
+    self (unblock.classify_wait), or its live work (unblock.live_wait) names one of its own jobs."""
+    from . import unblock
+    if unblock.is_self_wait(e["data"]):
+        return True
+    try:
+        live = json.loads(e["data"] or "{}").get("live")
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return isinstance(live, dict) and str(live.get("key") or "").startswith("job:")
+
+
 def _cfg(cfg: dict, dotted: str, default):
     node = cfg
     for k in dotted.split("."):
@@ -266,15 +285,35 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
         elif queued and ("logged out" in why or "provider" in why):
             add(lane("provider_gate", None, None), max(0.0, end - w0), prio, w0, end, None, queued)
         elif res:
+            span = max(0.0, end - w0)
+            held = _covered([h for r in res for h in holds.get(r, ())], w0, end) if span else 0.0
+            if span and held * 2 >= span:
+                lane("hold", None, None)["note"] = "a deliberate pause or hold of its resource: no limit"
+                add(lanes["hold"], span, prio, w0, end, None, queued)
+                return True
             for r in res:
                 lim = shared.own_slots(cfg, r)
                 ln = lane(("device:" if r in devices else "resource:") + r, None if r in devices else f"resources.{r}", lim)
                 ln["note"] = ("a device lock is one slot; its box's headroom is not measurable here" if r in devices
                               else "a resource's slots size a shared machine; its headroom is not measurable here")
-                add(ln, max(0.0, end - w0), prio, w0, end, None, queued)
+                add(ln, span - held, prio, w0, end, None, queued)
         else:
             return False
         return True
+
+    # Deliberate holds per resource: the pauses in force and the ended ones (module doc).
+    holds: dict[str, list[tuple[float, float]]] = {}
+    try:
+        for name, v in db.paused_resources().items():
+            holds.setdefault(name, []).append((float((v or {}).get("since") or now), now))
+    except Exception:   # an unreadable shared or fleet file leaves the ended pauses
+        pass
+    for e in db.q("SELECT ts, data FROM events WHERE kind='resource_resumed' AND ts>?", (t0 - DAY,)):
+        try:
+            v = json.loads(e["data"] or "{}")
+            holds.setdefault(str(v["resource"]), []).append((float(v.get("since") or e["ts"]), float(e["ts"])))
+        except (ValueError, TypeError, KeyError, AttributeError):
+            continue
 
     # Re-queue waits read what the daemon writes: task_waiting events, each waiting task's last run, and
     # the checks slot's own records for its slot waits: the checks_slot_wait events Daemon.check_checks_wait
@@ -362,11 +401,13 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             nxt = next((float(r["started"]) for r in trs if float(r["started"]) > w0), None)
             if nxt is None or (k + 1 < len(evs) and float(evs[k + 1]["ts"]) < nxt):
                 continue   # the current wait below, or a later hand-off before the same run
-            spans_w.append((w0, nxt, _wait_for(t, e), False))
+            spans_w.append((w0, nxt, _wait_for(t, e), False, _self_wait(e)))
         lr = last_run.get(t["id"])
         if lr and not lr["live"] and lr["ended"] and t["status"] in ("queued", "blocked", "waiting"):
-            spans_w.append((float(lr["ended"]), now, why, True))
-        for w0, w1, reason, queued in spans_w:
+            # Its hand-off is the last event after its last run started, when there is one.
+            mine = bool(evs and trs and float(evs[-1]["ts"]) >= float(trs[-1]["started"]) and _self_wait(evs[-1]))
+            spans_w.append((float(lr["ended"]), now, why, True, mine))
+        for w0, w1, reason, queued, selfw in spans_w:
             if w1 <= t0 or w1 < w0:
                 continue
             if "other full checks" in reason or "ttp checks: waiting" in reason or slot_held(t["id"], w0, w1):
@@ -374,7 +415,7 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                 # names the limit; a reason text alone means the legacy default, the project cap.
                 slot_tally[slot_held(t["id"], w0, w1) or CAP_KEY] += w1 - w0
                 add(lane("checks_slots", CAP_KEY, cap_n), w1 - w0, prio, w0, w1, None, queued)
-            elif "detach" in reason or "ttp checks" in reason or "own job" in reason:
+            elif selfw or "detach" in reason or "ttp checks" in reason or "own job" in reason:
                 lane("own_job", None, None)["note"] = "the task's own detached job or checks ran: no limit"
                 add(lanes["own_job"], w1 - w0, prio, w0, w1, None, queued)
             elif not by_rule(t, d if queued else {}, reason, w0, w1, prio, queued):
@@ -390,6 +431,12 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     swept = {int(m.group(1)) for e in db.q("SELECT text FROM events WHERE kind='review_swept' AND ts>?", (t0,))
              if (m := re.search(r"review #(\d+) queued", e["text"] or ""))}
     rs["swept"], rs["slot_held"], rt["free"], rt["slot_held"] = [], 0, [], 0
+    # A code task's hand-off into review: the task_review/task_done event Daemon's finish writes, which
+    # a model-free on_pass may write long after its last run ended (its own checks ran in between).
+    handoff: dict[int, list[float]] = {}
+    for e in db.q("SELECT ts, task FROM events WHERE kind IN ('task_review','task_done') AND task IS NOT NULL "
+                  "AND ts>?", (t0 - DAY,)):
+        handoff.setdefault(e["task"], []).append(float(e["ts"]))
     for t in tasks:
         target = _reviewed(t) if t["kind"] == "review" else None
         if not target or float(t["created"] or 0) < t0:
@@ -397,7 +444,9 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
         ends = [e for e in last_end.get(target, []) if e <= float(t["created"])]
         if not ends:
             continue
-        done, prio = max(ends), int(t["priority"] or 3)
+        # The finish queues the review just before it writes the hand-off event (milliseconds apart).
+        done = min(max(ends + [h for h in handoff.get(target, ()) if h <= float(t["created"]) + 60]), float(t["created"]))
+        prio = int(t["priority"] or 3)
         add(rs, float(t["created"]) - done, prio, done, float(t["created"]), None, False)
         if slot_held(target, done, float(t["created"])):
             rs["slot_held"] += 1
