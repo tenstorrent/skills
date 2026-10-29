@@ -14,11 +14,12 @@ Each coordinator turn it searches, model-free and case-insensitively (whitespace
 - charter sections;
 - schedules: every string in the payload (command, precheck, heal check, prompt) and the description;
 - open tasks: spec and `start_when` probe;
-- config values.
+- config values;
+- the project's own files, up to 400 (256 KB each, binary files skipped): everything under `harness/` except what is searched in its own form or is an archive or the installed runtime (`memory/`, `runtime/`, the charter and its history, `MEMORY.md`, `project.json`, `schedules.json`, `settled_areas.json`), so harness scripts, code guards, tools, hooks and prompts; below the project root `.claude/skills`, `.claude/hooks`, `.claude/commands`, `.claude/agents`, `.agents/skills`, `CLAUDE.md` and `AGENTS.md`; and each file or folder listed in `coordinator.echo_paths` (relative to the project root, never outside it), for recovery code or skill text kept elsewhere in the project's repo. A file hit names its path and line.
 
 It does not search the replacing text (its new entry, or its words wherever they stand) or the archives (`memory/archive`, the charter history). For a Correction, a match right after a negation ("never <phrase>") agrees with it and is no hit.
 
-Hits go into the digest's `Retired-rule echoes` section: the place, the matching line and which retirement it echoes, at most 10 lines including the header, then a count of the rest. A hit still there one turn after it was first shown is marked `[still here, N turns]`. An empty scan gives no section. The section carries its own instruction: fix each hit in that turn with `memory_forget` or `memory_add supersedes`, `charter_update quote`, `schedule_set`, `task_update` or `config_set`.
+Hits go into the digest's `Retired-rule echoes` section: the place, the matching line and which retirement it echoes, at most 10 lines including the header, then a count of the rest. A hit still there one turn after it was first shown is marked `[still here, N turns]`. When a memory entry hits, the last line names every such entry (shown or not) for `memory_forget`, or a `memory_add supersedes` that keeps what is still right, so copies do not pile up. An empty scan gives no section. The section carries its own instruction: fix each hit in that turn with `memory_forget` or `memory_add supersedes`, `charter_update quote`, `schedule_set`, `task_update` or `config_set`.
 
 It is a notice only: it posts no event, wakes nothing, holds nothing and adds no model call.
 

@@ -4,9 +4,11 @@ When a charter_update replaces text (`quote`, `replaces`), a memory_add `superse
 user Correction fact names a wrong value, `record` keeps the retired text's distinctive phrases (its
 quoted spans, config keys and identifiers, its first sentence; for a Correction, the wrong part when
 it is prose). Each coordinator turn `digest_lines` searches, model-free, every project-local place
-the old text can still bind (live memory entries, charter sections, schedules' payloads, open tasks'
-specs and start_when probes, config values) and lists the hits under RETIRED_HEADER, which carries its
-own instruction. It is a notice only: no event, wake, hold or model call. Not searched: the replacing
+the old text can still bind (live memory entries, charter sections, schedules' payloads with their
+prechecks and heal checks, open tasks' specs and start_when probes, config values, and the project's own
+files: harness scripts, tools, hooks and prompts, the project's skills and agent instructions, and the
+paths in coordinator.echo_paths) and lists the hits under RETIRED_HEADER, which carries its own
+instruction; memory entries that hit are also named on one line for memory_forget, so they do not pile up. It is a notice only: no event, wake, hold or model call. Not searched: the replacing
 text itself (its entry, or its words wherever they stand) and the archives (memory/archive, the charter
 history). A phrase the replacing text keeps is no phrase of the retired rule. A hit still there a turn
 after it was first shown is marked. Accepted gap: a task whose spec quotes the retired rule in order
@@ -16,8 +18,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 RETIRED_KEY = "retired_rules"        # kv: [{"id", "at", "source", "old", "new", "phrases", "skip", "negated"}]
@@ -27,6 +31,15 @@ RETIRED_KEEP = 50
 MAX_PHRASES = 8
 SECTION_LINES = 10                   # the whole section, its header included
 LINE_CHARS = 160
+FILE_MAX = 400                       # files read per scan
+FILE_BYTES = 256 * 1024              # a bigger file is read up to here
+# harness/ entries not read as files: searched in their own form (memory entries, charter sections,
+# schedules, config), archives, or the installed runtime and run state.
+HARNESS_SKIP = {"memory", "runtime", "CHARTER.md", "CHARTER.history.md", "MEMORY.md", "project.json",
+                "schedules.json", "settled_areas.json", ".git", "__pycache__", "node_modules"}
+# Below the project root: the project's own skills, hooks and agent instructions.
+ROOT_PATHS = (".claude/skills", ".claude/hooks", ".claude/commands", ".claude/agents", ".agents/skills",
+              "CLAUDE.md", "AGENTS.md")
 RETIRED_HEADER = ("## Retired-rule echoes (text the user retired still binds here; fix each this turn: memory_forget "
                   "or memory_add `supersedes`, charter_update `quote`, schedule_set, task_update, config_set; a "
                   "notice, it never waits)")
@@ -144,6 +157,56 @@ def places(p) -> list[tuple[str, str, str]]:
     except Exception:   # a broken config is reported elsewhere; the notice never fails the turn
         cfg = {}
     walk("config", "config", cfg, "")
+    extra = (cfg.get("coordinator") or {}).get("echo_paths") if isinstance(cfg, dict) else None
+    out += _files(p, [x for x in extra if isinstance(x, str)] if isinstance(extra, list) else [])
+    return out
+
+
+def _files(p, extra: list[str]) -> list[tuple[str, str, str]]:
+    """The project's own text files as places (key "file:<path>"): harness/ less HARNESS_SKIP, ROOT_PATHS
+    and `extra` (relative to the project root, never outside it), at most FILE_MAX files of FILE_BYTES."""
+    root = Path(p.root).resolve()
+    starts = [(Path(p.harness), True)] + [(root / x, False) for x in (*ROOT_PATHS, *extra)]
+    out: list[tuple[str, str, str]] = []
+    seen: set[Path] = set()
+
+    def take(path: Path) -> bool:
+        if len(out) >= FILE_MAX:
+            return False
+        try:
+            real = path.resolve()
+            if real in seen or not real.is_relative_to(root) or not path.is_file():
+                return True
+            seen.add(real)
+            with open(path, "rb") as fh:
+                data = fh.read(FILE_BYTES)
+        except OSError:
+            return True
+        if b"\0" in data[:4096]:
+            return True
+        rel = real.relative_to(root).as_posix()
+        out.append((f"file:{rel}", f"file {rel}", data.decode("utf-8", "replace")))
+        return True
+
+    for start, harness in starts:
+        try:
+            if not start.exists() or not start.resolve().is_relative_to(root):   # never walk outside the root
+                continue
+        except OSError:
+            continue
+        if start.is_file():
+            if not take(start):
+                break
+            continue
+        for d, dirs, names in os.walk(start):
+            top = Path(d) == start
+            dirs[:] = sorted(x for x in dirs if x not in (HARNESS_SKIP if harness and top else {".git", "__pycache__",
+                                                                                                "node_modules"}))
+            for n in sorted(names):
+                if harness and top and n in HARNESS_SKIP:
+                    continue
+                if not take(Path(d) / n):
+                    return out
     return out
 
 
@@ -159,6 +222,14 @@ def _line(text: str, phrase: str) -> str:
     start = max(0, min(at - 40, len(ln) - LINE_CHARS)) if len(ln) > LINE_CHARS else 0
     cut = ln[start:start + LINE_CHARS]
     return ("..." if start else "") + cut + ("..." if start + LINE_CHARS < len(ln) else "")
+
+
+def _lineno(text: str, phrase: str) -> int:
+    """The 1-based line of `text` holding `phrase` (1 when it spans lines)."""
+    for i, ln in enumerate(text.splitlines(), 1):
+        if phrase in _flat(ln):
+            return i
+    return 1
 
 
 def _hit(rec: dict, text: str) -> str:
@@ -191,6 +262,8 @@ def scan(p, now: float | None = None) -> list[dict]:
             ph = _hit(rec, text)
             if ph:
                 seen.add((rec["id"], key))
+                if key.startswith("file:"):
+                    label += f":{_lineno(text, ph)}"
                 out.append({"key": f"{rec['id']}:{key}", "label": label, "line": _line(text, ph), "phrase": ph,
                             "source": rec.get("source") or ""})
     return out
@@ -213,7 +286,8 @@ def digest_lines(p, now: float | None = None) -> list[str]:
         db.set_kv(SEEN_KEY, {"turn": turn, "hits": counts})
     if not hits:
         return []
-    room = SECTION_LINES - 1
+    mem = list(dict.fromkeys(h["key"].split(":", 2)[2] for h in hits if h["key"].split(":", 2)[1] == "memory"))
+    room = SECTION_LINES - 1 - bool(mem)
     shown = hits if len(hits) <= room else hits[:room - 1]
     lines = [RETIRED_HEADER]
     for h in shown:
@@ -222,4 +296,7 @@ def digest_lines(p, now: float | None = None) -> list[str]:
                      + (f" [still here, {n} turns]" if n >= 2 else ""))
     if len(shown) < len(hits):
         lines.append(f"- ... and {len(hits) - len(shown)} more; fix these and the rest show next turn")
+    if mem:   # every memory entry that still holds a retired rule, shown or not
+        names = ", ".join(f"[{n}]" for n in mem[:12]) + (f" and {len(mem) - 12} more" if len(mem) > 12 else "")
+        lines.append(f"- memory to retire (memory_forget, or memory_add `supersedes` to keep what is still right): {names}")
     return lines

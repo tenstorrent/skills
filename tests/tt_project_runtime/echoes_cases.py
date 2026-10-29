@@ -91,3 +91,53 @@ def test_retired_rule_echoes_section_is_capped_marks_persistent_hits_and_never_w
     for t in p.db.q("SELECT id FROM tasks"):
         p.db.x("UPDATE tasks SET status='done' WHERE id=?", (t["id"],))
     assert _echoes(p) == ""
+
+
+def test_a_retired_claim_planted_in_every_binding_place_is_found_and_memory_named_for_retiring(env):
+    import json as _json
+    import time as _time
+    from ttp import echoes, schedule as sched
+    p = make(env)
+    claim = "Retry the stuck card with `legacy-hard-reset` first."
+    echoes.record(p.db, "memory [old] superseded by [new]", claim, "Use the documented reset command.")
+    root = p.root
+    mem = p.add_memory("Recovery: retry the stuck card with LEGACY-HARD-RESET first.", kind="decision")
+    p.charter_path.write_text(p.charter_path.read_text().rstrip() + "\n\n## Recovery\n- Run legacy-hard-reset.\n")
+    sched.upsert(p.db, "cmd", "command", "1h", payload={"command": "legacy-hard-reset --all"})
+    sched.upsert(p.db, "pre", "llm", "1d", payload={"spec": "sum up", "precheck": "test -x legacy-hard-reset"})
+    sched.upsert(p.db, "healer", "command", "1h", payload={"heal": {"check": "true", "fix": "legacy-hard-reset"}})
+    spec = p.db.add_task("t-spec", "Then run legacy-hard-reset on the box.")
+    probe = p.db.add_task("t-probe", "wait", labels=["start_when:legacy-hard-reset --dry", f"deferred_since:{_time.time():.0f}"])
+    p.set_config("coordinator.echo_paths", ["ops", "../outside.sh", str(root.parent), "missing", 7])
+    planted = {
+        p.harness / "tools" / "recover.sh": "#!/bin/sh\n# recovery\nlegacy-hard-reset \"$1\"\n",   # recovery code
+        p.harness / "bin" / "guard": "#!/bin/sh\ncase \"$*\" in *legacy-hard-reset*) exit 0;; esac\n",   # code guard
+        p.harness / "prompts" / "kind-code.md": "Workers: legacy-hard-reset first.\n",
+        root / ".claude" / "skills" / "recover" / "SKILL.md": "# Recover\nStep 1: legacy-hard-reset.\n",
+        root / "ops" / "recovery.md": "Fallback: legacy-hard-reset.\n",
+        root / "CLAUDE.md": "Prefer legacy-hard-reset.\n",
+    }
+    for path, text in planted.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    # Never searched: the archive, the run state, a binary file, a path outside the project root.
+    (p.memory_dir / "archive").mkdir(parents=True, exist_ok=True)
+    (p.memory_dir / "archive" / "old.md").write_text("legacy-hard-reset\n")
+    (p.harness / "tools" / "blob.bin").write_bytes(b"\0legacy-hard-reset")
+    (root.parent / "outside.sh").write_text("legacy-hard-reset\n")
+    labels = {h["label"] for h in echoes.scan(p)}
+    want = {f"memory [{mem.stem}]", "charter section 'Recovery'", "schedule cmd payload.command",
+            "schedule pre payload.precheck", "schedule healer payload.heal.fix", f"task #{spec} spec",
+            f"task #{probe} start_when", "config coordinator.echo_paths" if False else None,
+            "file tt-project/harness/tools/recover.sh:3", "file tt-project/harness/bin/guard:2",
+            "file tt-project/harness/prompts/kind-code.md:1", "file .claude/skills/recover/SKILL.md:2",
+            "file ops/recovery.md:1", "file CLAUDE.md:1"} - {None}
+    assert want <= labels, sorted(want - labels)
+    assert not [x for x in labels if "archive" in x or "blob" in x or "outside" in x or "state/" in x], labels
+    p.set_config("coordinator.echo_paths", [])
+    p.set_config("budget.timezone", "legacy-hard-reset")   # a config value
+    hits = echoes.scan(p)
+    assert "config budget.timezone" in {h["label"] for h in hits}
+    sec = echoes.digest_lines(p)
+    assert len(sec) == echoes.SECTION_LINES and sec[-1].startswith("- memory to retire (memory_forget"), sec
+    assert f"[{mem.stem}]" in sec[-1] and sec[-2].startswith("- ... and "), sec
