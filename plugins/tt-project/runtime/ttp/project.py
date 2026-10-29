@@ -1858,7 +1858,7 @@ class Project:
         if standing and kind not in PINNED_MEMORY_KINDS:
             kind = "preference"
         new = " ".join(text.split())
-        errors, olds, auds = [], [], set()
+        errors, olds, auds, bodies = [], [], set(), {}
         for raw in names:
             try:
                 name, archived = self._resolve_memory_name(Path(raw.strip().strip("[]")).stem)
@@ -1886,6 +1886,7 @@ class Project:
                     errors.append(f"[{name}] holds the user's words; keep them verbatim in the new text: "
                                   + "; ".join(f'"{q}"' for q in lost))
             olds.append(name)
+            bodies[name] = body
         if errors:
             raise ValueError("nothing changed: " + "\n".join(errors))
         # Merged entries that all share one audience keep it.
@@ -1899,6 +1900,10 @@ class Project:
         self.commit_harness([added, self.memory_index, *done],
                             f"memory ({kind}): [{added.stem}] supersedes {', '.join(d.stem for d in done)}",
                             removed=[self.memory_dir / d.name for d in done])
+        from . import echoes
+        for d in done:   # the replaced text, searched for in what still binds
+            echoes.record(self.db, f"memory [{d.stem}] superseded by [{added.stem}]", bodies.get(d.stem, ""), text,
+                          skip=[f"memory:{added.stem}"])
         if errors:
             raise ValueError("\n".join(errors))
         return added, done

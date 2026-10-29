@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import ackwait, anchors, askauto, askrethink, broadcast, budgetkind, cachettl, causefix, cells, chaincap, convgate, chainprio, chatset, checkspill, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, rejcool, relay, responsibilities, restriction_audit, reviewcap, selfreview, reviewreuse, settinghold, settled, shared, sharedchecks, startbreaker, sweep, throughmute, timefmt, tried, unblock, unstarted, upstream, verified, watchdup, worktree
+from . import ackwait, anchors, askauto, askrethink, broadcast, budgetkind, cachettl, causefix, cells, chaincap, convgate, chainprio, chatset, checkspill, correction, course, credits, deploy, echoes, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, rejcool, relay, responsibilities, restriction_audit, reviewcap, selfreview, reviewreuse, settinghold, settled, shared, sharedchecks, startbreaker, sweep, throughmute, timefmt, tried, unblock, unstarted, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -956,6 +956,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("memory_recent", cached)
     section("memory_recent_added", delta)
     section("charter_conflicts", charter_conflict_lines(charter_conflicts(p)))
+    section("retired_echoes", echoes.digest_lines(p, now))
     section("ends", ends.digest_lines(p, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("heal", heal.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("noisy_watchers", watchdup.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
@@ -2556,6 +2557,15 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                                                                                 a["text"].strip()):
                     notes.append(f"memory_add: [{added.stem}] names no corrected value: write it as '<right>, not "
                                  f"<old value>' (memory_forget and re-add) so specs and asks repeating it are caught")
+                if a["text"].lstrip().startswith(CORRECTION_PREFIX):
+                    echoes.record_correction(db, added.stem, a["text"].strip())
+                if old:   # the replaced entries' text, searched for in what still binds (echoes)
+                    live = {e["name"]: e["body"] for e in p._memory_entries()}
+                    for name in old:
+                        stem = Path(str(name).strip().strip("[]")).stem
+                        if stem in live and stem != added.stem:
+                            echoes.record(db, f"memory [{stem}] superseded by [{added.stem}]", live[stem],
+                                          a["text"], skip=[f"memory:{added.stem}"])
                 for name in old:
                     try:
                         # A standing entry superseded by a standing one is shortened, not retired.
@@ -2609,11 +2619,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         if overlap:
                             notes.append(overlap)
                     source = _users_own(db, messages or []) if user_turn else list((ok or {}).get("messages") or [])
-                    gone = ""   # the Restrictions section `replaces` retires, for restriction_audit
+                    gone = replaced = ""   # the Restrictions section `replaces` retires, for restriction_audit
                     if replaces:
                         from .prompts import charter_sections
                         secs = charter_sections(p.charter_path.read_text())
                         i = _charter_replaced(secs, replaces, quiet=True)
+                        replaced = "\n".join(secs[i][1]) if i is not None else ""
                         if i is not None and " ".join(secs[i][0][3:].split()).lower().startswith("restriction"):
                             gone = "\n".join(secs[i][1])
                     try:
@@ -2624,6 +2635,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         if user_turn:
                             _record_charter_approval(p, messages or [], section, quote, replaces, text, end, str(e))
                         raise
+                    if quote or replaced:   # the retired text, searched for in what still binds (echoes)
+                        echoes.record(db, f"charter '{target}' " + ("quote replaced" if quote else "section replaced"),
+                                      quote or replaced, text)
                     if user_turn or ok is not None:   # the user's word: the next turn's prompt shows it
                         db.set_kv(PROMPT_REFRESH_KEY, {"at": time.time(), "section": target})
                     if user_turn and text and not quote and _may_lift(text):
