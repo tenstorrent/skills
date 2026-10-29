@@ -12,6 +12,8 @@ page only adds the queueing and the stamp.
   rebuild after a small change is quick.
 - Commit before queueing when the result should be reproducible: a dirty tree is stamped by the
   hash of its diff only.
+- On a Blackhole Galaxy, reset with `tt-smi -glx_reset` before and after every device run:
+  `recovery.md`.
 
 ## Queue the job
 
@@ -61,7 +63,7 @@ Each submit stamps the job with what it runs, taken on the box (`devq.build_stam
 - `ttp devq status <runner> <id>` prints the whole result, stamp included.
 - Read the log on the box (`ssh <alias> tail -n 50 <log>`), never by copying the state folder.
 - A `wedged` result means the device needs recovery before the next job (tt-buddy
-  `skills/run/recovery.md`).
+  `skills/run/recovery.md`; on a Blackhole Galaxy, `recovery.md`).
 
 ## Copy inputs and results
 

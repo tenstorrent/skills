@@ -70,6 +70,8 @@ and build/run recipes on the box).
   off `waiting` with a `retry_when` that reads the rc file.
 - Device jobs go through the box's queue or broker and carry a build stamp (commit, dirty flag,
   built artifact): `device-runs.md`.
+- A Blackhole Galaxy is reset with `tt-smi -glx_reset` before and after each device run; resets,
+  sudo rules, tray drops and tenants: `recovery.md`.
 - Classifying a chip drop: an empty holder or killed list from the broker when the loss is
   detected does not prove nothing was driving the chip, since short jobs can exit between health
   probes. Decide whether the loss was provoked from the system journal and the run output; use the

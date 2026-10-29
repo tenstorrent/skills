@@ -6192,6 +6192,30 @@ CORRECTED_CLAIMS = {
 }
 CLAIM_SUFFIXES = {".md", ".json", ".toml", ".yaml", ".yml", ".txt", ".py", ".sh", ""}
 
+# The true practice that replaces the claims (user msg #1171), per point: phrases the shipped
+# setup-box page `recovery.md` states.
+TRUE_PRACTICE = {
+    "glx_reset is the reset": ["The reset is `tt-smi -glx_reset`.", "`tt-smi -r` drops chips: use it only as a "
+                               "fallback when glx_reset's own output names it.",
+                               "Run glx_reset before and after every device run."],
+    "privileges": ["glx_reset's IPMI step needs root or a NOPASSWD sudo rule for its exact commands; the "
+                   "root-port rescan needs root.", "the exact glx_reset IPMI commands",
+                   "`dmesg -T`, `journalctl -k -b` and `lspci -d 1e52:`", "also `tt-smi` and `ipmitool`",
+                   "Check with `sudo -n -l`, never `sudo -n true`",
+                   "Where glx_reset cannot run, no reset runs and the output says so."],
+    "rescan and recount": ["After glx_reset, rescan the PCIe root ports and recount the chips by BDF and tray"],
+    "tray drop": ["After a tray power drop, still try glx_reset first, then the single-host BMC power cycle.",
+                  "Resets and single-host power cycles never affect other hosts: no gate, snapshot or "
+                  "serving-down check on neighbouring hosts.",
+                  "Only a quad serving a quad-wide workload goes down and up as a quad."],
+    "BMC op": ["use op 0x3 only: op 0x0 also resets the PCIe retimers carrying NVMe."],
+    "temperatures": ["Tray temperature readings right after a power loss are junk: count only readings "
+                     "taken at least one poll after it."],
+    "tenants": ["Idle Blackhole chips draw about 50-77 W", "A tenant is an open `/dev/tenstorrent` handle or a "
+                "tenant process or container.", "A fabric-manager agent or a DRA driver is plumbing, not a tenant."],
+    "cable and bus bar": ["A cable short keeps a tray off from power-on; a bus bar drops it under load."],
+}
+
 
 def corrected_claims_in(text: str) -> list[tuple[int, str]]:
     """(claim number, matched text) for each corrected claim `text` states, whitespace-normalized."""
@@ -6228,6 +6252,17 @@ def test_corrected_claims_patterns_catch_the_claim_and_spare_the_true_practice()
             f"<!-- {CLAIM_OK} --> The old note said 'BMC op 0x0 is a safe fallback'; it is false."]
     for line in true:
         assert corrected_claims_in(line) == [], line
+
+
+def test_setup_box_states_the_true_galaxy_reset_practice():
+    box = SKILLS / "setup-box"
+    page = " ".join((box / "recovery.md").read_text(encoding="utf-8").split())
+    missing = [(point, part) for point, parts in TRUE_PRACTICE.items() for part in parts if part not in page]
+    assert missing == [], missing
+    assert corrected_claims_in(page) == []
+    for linker in ("SKILL.md", "device-runs.md"):
+        text = " ".join((box / linker).read_text(encoding="utf-8").split())
+        assert "`recovery.md`" in text and "before and after" in text and "tt-smi -glx_reset" in text, linker
 
 
 def test_no_shipped_text_states_a_corrected_claim():
