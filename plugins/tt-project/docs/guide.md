@@ -855,11 +855,11 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   over all its lanes (chat-settable, a whole number of at least 1; unset, the project's test-worker budget); waiting
   checks start in task-priority order across them, and a priority-1 check whose lanes are held only by less urgent
   runs starts beside them in an extra lane while the load is under half the cores, never in a worktree that already
-  runs checks. Unset, `checks.slots` (chat-settable, a whole number) is the number of runs the host's test-slot pool
-  fits side by side, at least 2 and at most 4, and lower only when available memory is under 8 GiB per lane. Runs
-  at once do not collide: each has its own clean checkout, TMPDIR, output folder and block of ports
-  (`TTP_PORT_BASE`, `TTP_PORT_COUNT`, for suites that bind fixed ports); checks that run in the authoring worktree
-  itself also hold that worktree's one lane. A lane goes to the most urgent
+  runs checks. Unset, `checks.slots` (chat-settable, a whole number; `checks.suite_concurrency` is its chat-settable
+  alias) is the number of runs the host's test-slot pool fits side by side, at least 2 and at most 4, and lower only
+  when available memory is under 8 GiB per lane. Runs at once do not collide: each has its own clean checkout,
+  TMPDIR, output folder and block of ports (`TTP_PORT_BASE`, `TTP_PORT_COUNT`, for suites that bind fixed ports);
+  checks that run in the authoring worktree itself also hold that worktree's one lane. A lane goes to the most urgent
   waiting task priority first, then arrival; a running holder is never pre-empted, and a waiter gains one
   priority step per 15 min waited, so none starves. Light checks never wait: a run whose every command is a
   syntax, lint, format or validation check (`python -m py_compile`, `ruff check`, `black --check`,

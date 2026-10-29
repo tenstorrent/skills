@@ -841,12 +841,12 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/notify/test":
                 return self._send(200, notify_test(p, body))
             if url.path == "/api/config":
-                from .coordinator import USER_SETTABLE
+                from .coordinator import ALIASES, USER_SETTABLE
                 key = body.get("key")
-                if key not in USER_SETTABLE:
+                if key not in USER_SETTABLE and key not in ALIASES:
                     return self._send(400, {"error": f"{key} not settable here"})
                 try:
-                    p.set_config(key, USER_SETTABLE[key](body.get("value")))
+                    p.set_config(ALIASES.get(key, key), USER_SETTABLE[ALIASES.get(key, key)](body.get("value")))
                 except ValueError as e:
                     return self._send(400, {"error": str(e)})
                 except RuntimeError as e:   # project.json unreadable with no last good copy

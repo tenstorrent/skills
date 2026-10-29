@@ -1567,6 +1567,8 @@ def test_every_checks_key_the_runtime_reads_is_an_account_key_and_settable(env):
     read -= {"json", "log", "out", "pid", "queued", "rc"}   # file names (checks.json), not keys
     # project-only: the project's own lock or queue wrapper, set by the user per project
     read -= {"wrap_cmd"}
+    # a chat-only alias of checks.slots (coordinator.ALIASES), not a key the runtime reads
+    read -= {"suite_concurrency"}
     assert "wrap_cmd" in project._known_keys(["checks"])
     missing = read - project.ACCOUNT_KEYS["checks"]
     assert not missing, f"checks keys read but not account keys: {sorted(missing)}"
@@ -2365,6 +2367,7 @@ def test_checks_in_the_authoring_worktree_hold_its_one_tree_lane(env, tmp_path, 
     assert a and testslots.suite_hold("pa", repo=key, slots=1, wait_s=0.2) is None, "one run per worktree"
     other = testslots.suite_hold("pa", repo=testslots.tree_key(tmp_path / "x"), slots=1, wait_s=0)
     assert other, "another worktree is not held up"
+    assert testslots.project_held("pa") == [], "a worktree lane never counts against the project cap"
     a.close(), other.close()
 
 
@@ -2398,4 +2401,85 @@ def test_a_lane_wait_and_the_status_line_name_the_limit_and_checks_slots(env, tm
         assert "(1 at a time per repository; checks.slots raises it)" in testslots.suite_line("pa", limit=1)
         waiter.join(10)
     finally:
+        hold.close()
+
+
+
+def test_checks_suite_concurrency_is_a_chat_settable_alias_of_checks_slots(env, capsys):
+    """checks.suite_concurrency (the setting's spec name) validates and stores as checks.slots."""
+    from ttp import coordinator
+    p = make(env)
+    assert coordinator.settable("checks.suite_concurrency") is coordinator.settable("checks.slots")
+    assert coordinator.settable("checks.suite_concurrency")("2") == 2
+    for bad in ("2.5", "abc", "0", "65", True):
+        with pytest.raises(ValueError):
+            coordinator.settable("checks.suite_concurrency")(bad)
+    # The alias is remapped to the canonical key before its value is validated or stored, so one setting
+    # is never read from two places.
+    assert coordinator.ALIASES == {"checks.suite_concurrency": "checks.slots"}
+    # the config_set action (chat) remaps the alias before storing: one setting, one key
+    coordinator.apply(p, [{"type": "config_set", "key": "checks.suite_concurrency", "value": "3"}])
+    assert p.config()["checks"]["slots"] == 3 and "checks.suite_concurrency" not in p.config()["checks"]
+    with pytest.raises(ValueError):
+        coordinator.settable("checks.suite_concurrency")("2.5")   # never a non-integer
+
+
+def test_slot_status_json_names_every_group_and_never_an_empty_repo(env, tmp_path, monkeypatch):
+    """`ttp checks --slot-status --json` names each repository group; an unkeyed (legacy) group is
+    named as not keyed, and a project directory with no git remote still has its repo key."""
+    from ttp import checkcap, checklane, locks, testslots
+    _lane_env(monkeypatch)
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    keyed = testslots.repo_key(repo)
+    assert keyed, "repo_key comes from the git common dir (git rev-parse), not a remote"
+    hold = hold2 = None
+    try:
+        # the project's own group (its repository), a foreign repository's group, and the unkeyed
+        # (legacy, no repository key) group: slot-status names each, never an empty name
+        hold = testslots.suite_hold(p.name, repo=keyed)
+        hold2 = testslots.suite_hold(p.name, repo=_LANE_REPO)
+        ticket = locks.enqueue(checkcap.slot_dir(), testslots._suite_resource(p.name, _LANE_REPO),
+                              "task #77 x", time.time() - 60, priority=2)
+        st = checklane.lane_status(p.name)
+        repos = {r["repo"]: r for r in st}
+        assert keyed in repos and _LANE_REPO in repos and len(st) == 2, st
+        assert all(r["group"].strip() and r["group"] == checklane.group_name(r["repo"]) for r in st), st
+        assert repos[_LANE_REPO]["waiters"][0]["task"] == "77" and repos[_LANE_REPO]["waiters"][0]["next"], st
+    finally:
+        locks.dequeue(ticket)
+        for t in list(locks._TICKETS):
+            locks.dequeue(t)
+        if hold:
+            hold.close()
+        if hold2:
+            hold2.close()
+
+
+def test_two_checks_of_one_project_with_different_or_no_locks_run_together(env, tmp_path, monkeypatch, capsys):
+    """A tt-smi-style check and a long device check of one project, each behind its own wrapper lock
+    (or none), run at the same time: neither waits behind the other or the project's full checks."""
+    from ttp import checkcap, cli, testslots
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _lane_env(monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "4")
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 0.5)
+    monkeypatch.setattr(cli, "_checks_detach", lambda *a, **k: None)
+    from ttp import locks
+    done1, done2 = tmp_path / "done1", tmp_path / "done2"
+    try:
+        # The project's one suite lane in its repository is held, so a run that took it would wait: a run
+        # behind a wrapper lock takes that lock's own lane (checklane.wrap_key) instead.
+        p.set_config("checks.slots", 1)
+        hold = testslots.suite_hold(p.name, repo=testslots.repo_key(repo), slots=1)
+        p.set_config("checks.wrap_cmd", f"flock {tmp_path / 'device.lock'}")
+        cli.main(["checks", "--fresh", "--", "sh", "-c", f"touch {done1}"])
+        out = capsys.readouterr().out
+        assert done1.exists() and "waiting for this project's other full checks" not in out, out
+        p.set_config("checks.wrap_cmd", f"flock {tmp_path / 'smi.lock'}")
+        cli.main(["checks", "--fresh", "--", "sh", "-c", f"touch {done2}"])
+        out = capsys.readouterr().out
+        assert done2.exists() and "waiting for" not in out, "a different lock (or none): never waits behind the other check"
+    finally:
+        for t in list(locks._TICKETS):
+            locks.dequeue(t)
         hold.close()

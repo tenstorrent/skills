@@ -290,11 +290,16 @@ USER_SETTABLE = {
 }
 
 
+ALIASES = {"checks.suite_concurrency": "checks.slots"}
+"""Chat-settable aliases: a key here is stored under its canonical name, so one setting never has two
+places to read. `checks.suite_concurrency` (the setting's spec name) is `checks.slots`."""
+
+
 def settable(key: str):
     """The validator config_set applies to `key` (USER_SETTABLE, else a provider key chatset.py accepts:
     per-tier routing, the saved endpoint's alias); ValueError saying why when chat may not set it."""
-    if key in USER_SETTABLE:
-        return USER_SETTABLE[key]
+    if (canonical := ALIASES.get(key, key)) in USER_SETTABLE:
+        return USER_SETTABLE[canonical]
     if conv := chatset.setter(key):
         return conv
     from .project import unknown_key_hint
@@ -2580,6 +2585,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      f"health coverage counts it for nothing ({hint})")
             elif t == "config_set":
                 key = a.get("key", "")
+                key = ALIASES.get(key, key)
                 value = settable(key)(a.get("value"))
                 chatset.route_ready(cfg, key, value)
                 if key == "delivery.backup_remote" and (why := push.backup_problem({**(cfg.get("delivery") or {}),
