@@ -612,19 +612,24 @@ def test_a_hung_git_in_the_finish_transaction_ends_by_its_cap_and_the_review_is_
     flag = _hung_git(tmp_path, monkeypatch)
     monkeypatch.setattr(gitmemo, "TX_GIT_S", 1.0)
     monkeypatch.setattr(gitmemo, "FLOOR_S", 0.1)
-    monkeypatch.setattr(gitmemo, "TICK_GIT_S", 0.5)   # what runs after the commit (_note_dirty_main)
+    # The per-read cap is far above the transaction's budget: only bounded(TX_GIT_S, TX_GIT_S) in
+    # _finish_tx keeps the lock short (without it each hung read waits TICK_GIT_S).
+    monkeypatch.setattr(gitmemo, "TICK_GIT_S", 10.0)
     flag.touch()
     held: list = []
+
+    def committed():   # first after the commit: git answers again for what follows (_note_dirty_main)
+        held.append(time.monotonic() - t0)
+        flag.unlink()
     t0 = time.monotonic()
     with gitmemo.bounded(gitmemo.TICK_GIT_S):   # as in a tick step (Daemon._run_step)
         with d._finish_tx(tid):
-            d.p.db.after_commit(lambda: held.append(time.monotonic() - t0))   # first after the commit
+            d.p.db.after_commit(committed)
             d._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir)
     took = time.monotonic() - t0
-    flag.unlink()
     hung = (tmp_path / "git-hangs.log").read_text()
     assert held and held[0] < 1.0 + 3, f"the finish transaction held the write lock {held} s on a hung git:\n{hung}"
-    assert took < 15, f"the finish held its tick step {took:.1f} s on a hung git:\n{hung}"
+    assert took < held[0] + 5, f"the finish held its tick step {took:.1f} s after the commit:\n{hung}"
     assert p.db.task(tid)["status"] == "done"
     assert not p.db.q("SELECT id FROM tasks WHERE kind='review'"), "no review read from a hung git"
     p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 3600, tid))
