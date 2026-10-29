@@ -3584,7 +3584,7 @@ def test_a_checks_queue_incident_rewakes_for_a_likely_hung_holder_and_for_an_own
         out.mkdir(parents=True)
         rev = p.db.add_task("review", "r", kind="review", labels=[daemon.PRECHECK_LABEL + out.name])
         p.db.x("UPDATE tasks SET status='done' WHERE id=?", (code,))
-        b, pre = _run_holder(p, tmp_path, {"TTP_RUN_DIR": str(out), "TTP_RUN_ID": f"precheck-t{code}",
+        b, pre = _run_holder(p, tmp_path, {"TTP_RUN_DIR": str(out), "TTP_RUN_ID": daemon.precheck_run_id(out),
                                            **daemon.task_env(code)})   # as Daemon._precheck starts it
         procs.append(b)
         evs[:] = _queue_events(3, holders=[rec, pre])
