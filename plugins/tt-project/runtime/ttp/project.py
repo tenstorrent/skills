@@ -118,6 +118,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 # a landed:#<id> start_when whose producer is done, not landed, with nothing open that
                 # can land it, this long, is raised once per producer (deadwait.py; 0: at once)
                 "landed_wait_dead_s": 900,
+                # a queued code or work task waiting on another task (landed:#, depends_on, waits_end:)
+                # this long raises one lane_wait event (lanewait.py; 0: never)
+                "lane_wait_event_s": 600,
                 "max_stale_wakes": 3,           # max_stale_wakes: 0 = off
                 # the wait-wake gate (waitgate.py): a due wake of a waiting task first checks model-free
                 # rules (job, lock, checks or push still pending; same probe answer) then Jev, and re-defers

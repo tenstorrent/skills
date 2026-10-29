@@ -299,7 +299,7 @@ EFFORT_EVENT_TRIGGERS = {
     "deferral_expired": "stuck", "deferral_probe_broken": "stuck", "deferral_job_failed": "stuck",
     "no_progress": "stuck", "stall": "stuck", "change_probe": "stuck",
     "missing_task_ref": "stuck", obligations.PROMISE_KIND: "stuck", mitigate.OVERDUE: "stuck",
-    "review_stall": "stuck", "review_failed_unhandled": "stuck", "review_nofix": "stuck", "landed_wait_dead": "stuck", askrethink.KIND: "stuck",
+    "review_stall": "stuck", "review_failed_unhandled": "stuck", "review_nofix": "stuck", "landed_wait_dead": "stuck", "lane_wait": "stuck", askrethink.KIND: "stuck",
     "wait_stale": "stuck", "hold_probe_broken": "stuck", "probe_never_passes": "stuck",
     "start_resource_stale": "resource", "job_underuse": "resource",
     "resource_trouble": "resource", "machine_condition": "resource", "machine_change_overdue": "resource", "machine_outage_overdue": "resource", "change_probe_broken": "resource",

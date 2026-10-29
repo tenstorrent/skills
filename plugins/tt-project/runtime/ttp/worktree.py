@@ -460,6 +460,7 @@ def _create(p: Project, task: dict, path: Path, branch: str, carried: str, timeo
     start = carried_head(p, task) if carried or rebase else None
     started = start if rebase else None
     start = start or (None if carried else continued_head(p, task)) or carried_head(p, task)
+    start = start or (None if carried else early_head(p, task))
     try:
         start = start or resolve_base(p)
     except RuntimeError:
@@ -969,6 +970,16 @@ def carried_head(p: Project, task: dict) -> str | None:
         if head:
             return head
     return None
+
+
+def early_head(p: Project, task: dict) -> str | None:
+    """The approved head of the change a task started on before it landed (lanewait.START_FROM), when
+    it resolves here; else None (the base)."""
+    from .lanewait import START_FROM, label_value
+    sha = label_value(task, START_FROM)
+    if not sha or not _HEX.fullmatch(sha):
+        return None
+    return _git(p.root, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}", check=False) or None
 
 
 def resolve_base(p: Project) -> str:

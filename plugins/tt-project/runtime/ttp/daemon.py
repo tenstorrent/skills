@@ -34,6 +34,7 @@ from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import ackwait
+from . import lanewait
 from . import churnwatch
 from . import alerts
 from . import anchors
@@ -8038,10 +8039,22 @@ class Daemon:
                 continue
             if landed.missing_task_refs(db, d["when"]):
                 continue   # it can never pass: _raise_missing_task_refs raised it, once
+            if early := lanewait.batched(db, d["when"]):
+                # Its producer's change is approved or batched: it starts now, on that head (lanewait).
+                self._start_verdict(dict(t, labels=json.dumps(lanewait.early_labels(
+                    json.loads(t["labels"] or "[]"), early))), 0, now)
+                log(self.p, f"task {t['id']} starts on #{early[0]}'s approved head {early[2][:12]} "
+                            f"(push queue row {early[1]})")
+                continue
             self._start_probe(t["id"], d["when"], now, "start_when")
             if t["id"] not in self._probes:
                 self._start_verdict(t, self._probe_rc.pop(t["id"])[0], now)
         self._dead_landed_waits(deferred, now)
+        try:
+            lanewait.rebase_notes(db, now)
+            lanewait.check(db, self.cfg, now)
+        except Exception:
+            log(self.p, "lane waits: " + traceback.format_exc().replace("\n", " | ")[:1000])
         self.release_review_holds(now)
 
     def _dead_landed_waits(self, deferred: list[dict], now: float) -> None:

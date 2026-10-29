@@ -405,6 +405,14 @@ prolonged whole-box outage.
   `landed_wait_dead` event naming the held tasks, judged from saved task rows only, so a restart
   neither clears nor repeats it. A `landed:#<id>` inside a longer probe is not judged; the blocker
   sweep covers it.
+- Task-to-task waits (model-free, lanewait.py): a queued task whose start_when is exactly
+  `landed:#<id>` starts as soon as that change is approved or batched in the push queue, branching
+  from its approved head instead of the base; if the batch later sends it back, the task gets a
+  rebase note (its spec and a running run's steer.md), never a cancel. A queued code or work task
+  that has waited on another task (`landed:#`, depends_on, a lineage hold) longer than
+  `waiting.lane_wait_event_s` (600; 0: never) raises one `lane_wait` event naming both tasks, the
+  holder's status and the hours so far; it clears once the task starts. Waits on anything else (a
+  secret, a sign-in, a cadence) raise none.
 - Provider failover (model-free): a queued, deferred or waiting task whose provider cannot start
   new work (logged out, a limit pause, or a red gate such as a plan window at the line) for longer
   than `coordinator.provider_failover_after_h` (4; 0 turns it off) moves to the first usable
