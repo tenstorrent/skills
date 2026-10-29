@@ -8981,8 +8981,12 @@ class Daemon:
         return "" if self._start_checks(Path(wt), out, run_id, tid, argv) else "they could not be started"
 
     def _start_checks(self, path: Path, out: Path, run_id: str, tid: int, extra: list[str]) -> bool:
-        """`ttp checks --detach [extra]` in worktree `path`, writing to `out` as a run's directory,
-        as a worker's run would: the project's venv, `ttp` first, niced like workers."""
+        """`ttp checks --detach --no-prestage [extra]` in worktree `path`, writing to `out` as a run's
+        directory, as a worker's run would: the project's venv, `ttp` first, niced like workers. No
+        pre-stage (delivery.check_prestage, or the derived one): it runs in the foreground for up to
+        its own limit (90 s by default), longer than this call's inline bound, so the tick would kill
+        the start before the full checks begin; it only saves a foreground caller time, and the full
+        checks run anyway."""
         runtime_dir = str(Path(__file__).resolve().parent.parent)
         bin_path = f"{service_path()}:{os.environ.get('PATH', '')}"
         venv = worktree.project_venv(self.p, path)
@@ -8992,7 +8996,7 @@ class Daemon:
                "PATH": f"{self.p.harness / 'bin'}:{venv_vars.get('PATH', bin_path)}"}
         env = machines.mask_devices(env)   # as in the worker's run: no direct device opens
         level = nice_level(self.cfg.get("runner"))[0]
-        argv = (["nice", "-n", str(level)] if level else []) + [sys.executable, "-m", "ttp", "checks", "--detach", *extra]
+        argv = (["nice", "-n", str(level)] if level else []) + [sys.executable, "-m", "ttp", "checks", "--detach", "--no-prestage", *extra]
         try:
             out.mkdir(parents=True, exist_ok=True)
             r = subprocess.run(argv, cwd=path, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,

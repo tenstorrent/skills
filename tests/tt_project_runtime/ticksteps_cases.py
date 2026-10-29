@@ -155,3 +155,33 @@ def test_a_slow_tick_step_raises_one_tick_step_slow_naming_what_held_it(env, mon
     assert "probe_waiting" in ev["text"] and f"task #{tid}'s retry_when probe" in ev["text"]
     d._run_step(lambda: None, "fast")
     assert len(p.db.q("SELECT * FROM events WHERE kind='tick_step_slow'")) == 1, "a fast step raises none"
+
+
+def test_the_daemons_checks_start_skips_a_pre_stage_longer_than_its_inline_bound(env, monkeypatch):
+    """The daemon starts `ttp checks --detach` inline (its review precheck, a restart after a reboot),
+    bounded well under a pre-stage's own limit: a slow delivery.check_prestage run there in the
+    foreground had the start killed and logged 'checks not started'. The daemon's starts skip it; the
+    full checks run anyway."""
+    from ttp import cli, worktree
+    from ttp import daemon as dmod
+    p = make(env)
+    _with_origin(env, clone=False)
+    mark = env["tmp"] / "prestage-ran"
+    p.set_config("delivery.push_branch", "work")
+    p.set_config("delivery.push_queue", True)
+    p.set_config("delivery.push_checks", ["true"])
+    p.set_config("delivery.check_prestage", {"run": f"touch {mark}; sleep 6", "timeout_s": 30})
+    for name in ("PROBE_TIMEOUT_S", "INLINE_CHILD_S"):   # the start's inline bound, shorter than the pre-stage
+        monkeypatch.setattr(dmod, name, 2, raising=False)
+    tid = p.db.add_task("slow pre-stage", "spec", kind="code", origin="coordinator")
+    path, _ = worktree.ensure(p, p.db.task(tid))
+    head = _git_out(path, "rev-parse", "HEAD").strip()
+    d = dmod.Daemon(p.base)
+    out = d._precheck(p.db.task(tid), head)
+    daemon_log = lambda: (p.logs / "daemon.log").read_text() if (p.logs / "daemon.log").exists() else ""
+    assert out is not None and "checks not started" not in daemon_log(), daemon_log()
+    assert _wait_precheck(out) == "0", (out / cli.CHECKS_OUT).read_text()
+    again = env["tmp"] / "restarted"
+    assert d._restart_checks(tid, again, {"worktree": str(path), "head": head, "cmd": ["true"]}, "r1") == ""
+    assert _wait_precheck(again) == "0", (again / cli.CHECKS_OUT).read_text()
+    assert not mark.exists(), "the daemon's start ran the pre-stage"
