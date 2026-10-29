@@ -7342,7 +7342,8 @@ def test_a_check_prestage_is_stopped_when_ttp_checks_is_killed(tmp_path, sig):
     code = ("from ttp import checkprestage; import os, sys; "
             f"checkprestage.run({{'run': 'echo $$ > {pidf}; exec sleep 60', 'timeout_s': 30}}, "
             f"{str(tmp_path)!r}, dict(os.environ), print); sys.exit(9)")
-    env = {**os.environ, "PYTHONPATH": str(pathlib.Path(ttp.__file__).parent.parent)}
+    # Nested in a run holding test slots: the pre-stage never waits on this host's real slot pool.
+    env = {**os.environ, "PYTHONPATH": str(pathlib.Path(ttp.__file__).parent.parent), "TTP_TEST_SLOTS_HELD": "1"}
     proc = subprocess.Popen([sys.executable, "-c", code], env=env, stdout=subprocess.DEVNULL)
     try:
         deadline = time.monotonic() + 20
@@ -7374,7 +7375,8 @@ def test_a_check_prestage_child_that_ignores_sigterm_dies_with_ttp_checks(tmp_pa
     code = ("from ttp import checkprestage; import os, sys; "
             f"checkprestage.run({{'run': {stay!r}, 'timeout_s': 30}}, {str(tmp_path)!r}, dict(os.environ), print); "
             "sys.exit(9)")
-    env = {**os.environ, "PYTHONPATH": str(pathlib.Path(ttp.__file__).parent.parent)}
+    # Nested in a run holding test slots: the pre-stage never waits on this host's real slot pool.
+    env = {**os.environ, "PYTHONPATH": str(pathlib.Path(ttp.__file__).parent.parent), "TTP_TEST_SLOTS_HELD": "1"}
     proc = subprocess.Popen([sys.executable, "-c", code], env=env, stdout=subprocess.DEVNULL)
     child = None
     try:

@@ -1050,7 +1050,7 @@ def test_ttp_checks_waits_for_its_project_s_other_full_checks(env, tmp_path, mon
     monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 0.3)
     detached = []
     monkeypatch.setattr(cli, "_checks_detach", lambda *a, **k: detached.append(1))
-    hold = testslots.suite_hold(p.name)
+    hold = testslots.suite_hold(p.name, repo=testslots.repo_key(repo))
     assert hold.files
     seen = tmp_path / "seen"
     try:
@@ -1062,8 +1062,7 @@ def test_ttp_checks_waits_for_its_project_s_other_full_checks(env, tmp_path, mon
     assert not seen.exists(), "nothing ran beside the project's other full checks"
     assert "one at a time per project" in (run / "checks.log").read_text() + capsys.readouterr().out
     cli.main(["checks", "--", "sh", "-c", f"echo ran > {seen}"])
-    assert seen.exists() and not locks.held_labels(
-        locks.slot_paths(checkcap.slot_dir(), f"{testslots.SUITE}.{locks.group_id(p.name)}", 1)), \
+    assert seen.exists() and not locks.held_labels(testslots.lane_paths(p.name, 1, testslots.repo_key(repo))), \
         "with the other run gone it runs, and frees the project's suite lock at its end"
 
 
@@ -1076,7 +1075,7 @@ def test_detached_checks_waiting_for_their_project_s_full_checks_are_queued_and_
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
     monkeypatch.setenv("TTP_TASK", "7")
-    hold = testslots.suite_hold(p.name)
+    hold = testslots.suite_hold(p.name, repo=testslots.repo_key(repo))
     assert hold.files
     ran = tmp_path / "ran"
     try:
@@ -1161,7 +1160,7 @@ def test_foreground_checks_waiting_for_the_suite_lock_then_a_slot_hand_over_with
         return acquire(*a, **k)
     monkeypatch.setattr(checkcap, "acquire", spy)
     holder = _cap_holder("other")
-    hold = testslots.suite_hold(p.name)
+    hold = testslots.suite_hold(p.name, repo=testslots.repo_key(repo))
     timer = threading.Timer(1.0, hold.close)   # the other run ends 1 s into the suite wait
     suite_hold = testslots.suite_hold
 
