@@ -943,7 +943,7 @@ queues behind routine work; nothing running is interrupted:
   counts. `checks.json` (`spilled_to`), `ttp status` and `ttp checks status` name the host.
   `ttp checks status` (also `--slot-status`, `--json`) prints each repository's lane holders (pid, task, run,
   age, alive or dead, what it checks and whether its task has finished) and its waiters in queue order, the next
-  one marked; it is read only and never queues. Every lane group has a name (its repository, else the project
+  one marked; it is read only and never queues. Every lane group has a name (its repository or wrapper lock, else the project
   folder). `status` is the only subcommand: an unknown word or flag before `--` (`ttp checks statuz`,
   `ttp checks --foo`, `status --bogus`, `--slot-status` with a command) is refused with exit 2 and queues
   nothing; check commands go after `--`.
