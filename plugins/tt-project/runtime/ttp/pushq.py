@@ -66,6 +66,9 @@ AFTER_PUSH_OK = "after_push_ok_at"  # kv: when an ordinary push's after_push las
 TIPS_TOLD = 20                  # tip_failed shas remembered, so each tip is reported once
 FLAKY_EVENT = "push_flaky_test"   # a batch's failing tests passed on a rerun at the same head (batch._flaky)
 FLAKY_TOLD_S = 86400.0          # a flaky test id is reported once in this long ("flaky_told")
+STACK_ROWS = 12                 # the newest open rows status reads for the stack depth (stack_depth)
+STACK_GIT_S = 5                 # ... each ancestry check bounded, as `ttp status` and the web app wait for it
+RATE_S = 86400                  # status counts the batches that landed approvals in this long
 ROW_RESULTS = ("pushed", "landed", "conflict", "check_failed", "requeued", "refused", "scope_held")
 AFTER_STATES = ("ok", "failed", "timeout", "killed", "skipped")
 STATS_S = 7 * 86400            # the conflict counts `ttp push --queue` and the web app show cover this long
@@ -77,6 +80,7 @@ REBASE_LABEL = "push_rebase:"   # + the conflicting head: a review the daemon qu
 _children: dict[str, subprocess.Popen] = {}   # batch processes this daemon started, reaped by finalize
 _default_branches: dict[tuple[str, str], tuple[float, str | None]] = {}   # (root, remote): (until, branch)
 _files_seen: dict[tuple[str, str], frozenset | None] = {}   # (tip, head): the files the head changes (_changed)
+_anc_seen: dict[tuple[str, str], bool] = {}   # (a, b): a is an ancestor of b (_ancestor); commits never change
 _recover_asked: dict[str, float] = {}         # batch id: when its remote was last asked (_recover)
 _absent_seen: dict[tuple[str, str, str], tuple[float, bool, str]] = {}   # (root, remote, branch): (until, absent, why)
 
@@ -2131,10 +2135,46 @@ def conflict_stats(db, since: float) -> dict:
             "conflict_pct": round(100 * (back + auto) / n) if n else 0, "sent_back_pct": round(100 * back / n) if n else 0}
 
 
+def _ancestor(p: Project, a: str, b: str) -> bool | None:
+    """Whether commit `a` is an ancestor of `b`, cached; None when git cannot tell in STACK_GIT_S."""
+    if (a, b) in _anc_seen:
+        return _anc_seen[(a, b)]
+    try:
+        r = _git(p, "merge-base", "--is-ancestor", a, b, timeout=STACK_GIT_S)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode not in (0, 1):
+        return False   # a commit not here (yet): not counted, asked again next time
+    if len(_anc_seen) > 2048:
+        _anc_seen.clear()
+    _anc_seen[(a, b)] = r.returncode == 0
+    return _anc_seen[(a, b)]
+
+
+def stack_depth(p: Project, rows: list[dict]) -> int:
+    """The longest chain of `rows` (open push queue rows, by id) whose head contains an earlier
+    row's head: 1 when none stacks, 0 for no rows. Only the newest STACK_ROWS rows are read, and a
+    git call that times out ends the count with what it has."""
+    rows = sorted((r for r in rows if r.get("head")), key=lambda r: r["id"])[-STACK_ROWS:]
+    depth: dict[int, int] = {}
+    for i, r in enumerate(rows):
+        depth[r["id"]] = 1
+        for e in rows[:i]:
+            if e["head"] == r["head"] or depth[e["id"]] < depth[r["id"]]:
+                continue
+            got = _ancestor(p, e["head"], r["head"])
+            if got is None:
+                return max(depth.values())
+            if got:
+                depth[r["id"]] = depth[e["id"]] + 1
+    return max(depth.values(), default=0)
+
+
 def summary(p: Project, now: float | None = None, last: int = 5, db=None) -> dict:
     """The queue for status displays: approved rows with their ages, the live batch's phase and
-    age, and the last batches with outcome, sha, version and after_push. `db` is the caller's
-    connection (the web app's threads each have their own); default p.db."""
+    age, and the last batches with outcome, sha, version and after_push; model-free numbers: the oldest
+    row approved and not landed, the stack depth (stack_depth) and the batches that landed in RATE_S.
+    `db` is the caller's connection (the web app's threads each have their own); default p.db."""
     now = time.time() if now is None else now
     db = db or p.db
     approved = [{"id": r["id"], "task": r["task"], "branch": r["branch"], "head": r["head"], "target": r["target"],
@@ -2165,7 +2205,13 @@ def summary(p: Project, now: float | None = None, last: int = 5, db=None) -> dic
     if pushed:
         pushed["reach"] = known[pushed["id"]] if pushed["id"] in known else _reach(db, pushed["id"])
     st = _state(db)
+    open_ = db.q(f"SELECT id, head, created FROM push_queue WHERE status IN ({','.join('?' * len(OPEN_ROWS))}) "
+                 "ORDER BY id", OPEN_ROWS)
+    landed = db.one(f"SELECT COUNT(*) n FROM push_batches WHERE outcome IN ({','.join('?' * len(LANDED_OUTCOMES))}) "
+                    "AND ended>=?", (*LANDED_OUTCOMES, now - RATE_S))["n"]
     return {"on": enabled(p), "approved": approved, "held": held, "live": live, "last": batches, "last_pushed": pushed,
+            "oldest_open_s": round(now - min(r["created"] for r in open_), 1) if open_ else None,
+            "stack_depth": stack_depth(p, open_), "landed_24h": landed, "landings_per_h": round(landed * 3600 / RATE_S, 2),
             "backoff_until": st.get("backoff_until"), "bad_tip": st.get("bad_tip"), "deaths": int(st.get("deaths") or 0),
             "conflicts": conflict_stats(db, now - STATS_S), "conflict_fixes": conflictfix.stats(db, now - 86400)}
 
@@ -2197,7 +2243,8 @@ def shown(p: Project, db=None) -> bool:
 
 def status_line(p: Project, now: float | None = None, sm: dict | None = None, db=None) -> str | None:
     """`ttp status`'s one line about the queue (None when it is not shown): what waits, the live batch,
-    the last push and its deploy. Plain facts; the daemon acts on all of it, so it names no command."""
+    the last push and its deploy, then how old the oldest unlanded approval is (when a batched or held
+    one is older than every approved one), how deep changes stack and how many batches landed in 24 h. Plain facts; the daemon acts on all of it, so it names no command."""
     if not shown(p, db):
         return None
     now = time.time() if now is None else now
@@ -2216,6 +2263,11 @@ def status_line(p: Project, now: float | None = None, sm: dict | None = None, db
         parts.append(f"{len(held)} held for the token scope {scopes}")
     if not n and not live and not held:
         parts.append("empty")
+    oldest = sm.get("oldest_open_s")
+    if oldest is not None and (not n or oldest > max(a["age_s"] for a in sm["approved"])):
+        parts.append(f"oldest not landed {_age(oldest)}")   # a batched or held row older than every approved one
+    if (sm.get("stack_depth") or 0) > 1:
+        parts.append(f"stacked {sm['stack_depth']} deep")
     last = sm["last"][0] if sm["last"] else None
     if last and last["outcome"] != "pushed" and not (live and live["id"] == last["id"]):
         parts.append(f"last batch {OUTCOME_WORDS.get(last['outcome'], last['outcome'])} "
@@ -2232,6 +2284,8 @@ def status_line(p: Project, now: float | None = None, sm: dict | None = None, db
                      + (f" {_age(now - lp['ended'])} ago" if lp["ended"] else "") + push.reach_words(lp.get("reach")))
         if lp["after_push"] in AFTER_WORDS and lp["after_push"] != "skipped":
             parts.append(AFTER_WORDS[lp["after_push"]])   # while it deploys, the live part says so
+    if got := sm.get("landed_24h"):
+        parts.append(f"{got} batch{'es' if got != 1 else ''} landed in 24 h ({sm['landings_per_h']:g}/h)")
     return "push queue" + ("" if sm["on"] else " (off)") + ": " + " · ".join(parts)
 
 

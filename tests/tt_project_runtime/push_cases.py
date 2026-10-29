@@ -2667,15 +2667,17 @@ def test_status_shows_one_push_queue_line_in_each_state_and_never_a_command(env,
         _pq_batch_row(p, "b3", now, age=400, outcome="tip_failed", tip="aa" * 20, ended=now - 300,
                       finalized=now - 290, after_push="skipped", after_finalized=now - 290, check_runs=1, check_s=30)
     line = pushq.status_line(p, now)
+    landed = " · 1 batch landed in 24 h (0.04/h)"   # b1 pushed 12 min ago
     want = {
         "off": None,
         "empty": "push queue: empty",
         "approved": "push queue: 2 approved (oldest 6 min)",
         "running": "push queue: 2 approved (oldest 6 min) · batch checking since 2 min (2 changes)",
-        "deploying": f"push queue: batch deploying since 15 min (1 change) · last pushed {sha[:7]} as 0.2.140 to origin/proj 12 min ago",
-        "finished": f"push queue: empty · last pushed {sha[:7]} as 0.2.140 to origin/proj 12 min ago · deploy ok",
+        "deploying": f"push queue: batch deploying since 15 min (1 change) · last pushed {sha[:7]} as 0.2.140 to origin/proj "
+                     f"12 min ago{landed}",
+        "finished": f"push queue: empty · last pushed {sha[:7]} as 0.2.140 to origin/proj 12 min ago · deploy ok{landed}",
         "failed": f"push queue: 2 approved (oldest 6 min) · last batch the branch tip fails its checks 5 min ago · "
-                  f"last pushed {sha[:7]} as 0.2.140 to origin/proj 12 min ago · deploy ok",
+                  f"last pushed {sha[:7]} as 0.2.140 to origin/proj 12 min ago · deploy ok{landed}",
     }[case]
     assert line == want
     assert [ln for ln in status_text(p).splitlines() if ln.startswith("push queue")] == ([want] if want else [])
@@ -2689,6 +2691,60 @@ def test_the_push_queue_line_stays_once_the_queue_is_off_while_it_has_rows(env):
     now = time.time()
     _pq_row(p, rid, now, age=60)
     assert pushq.status_line(p, now) == "push queue (off): 1 approved (oldest 1 min)"
+
+def test_the_push_queue_line_counts_the_oldest_unlanded_row_the_stack_depth_and_the_landings_of_24_h(env, monkeypatch):
+    """Model-free numbers on the `push queue:` line: the oldest row approved and not landed (a batched
+    or held one older than every approved one), how deep heads stack (a head containing an earlier
+    open row's head) and the batches that landed (pushed or landed) in the last 24 h, per hour."""
+    from ttp import pushq
+    p, rid = _pq_rows(env)
+    root = str(p.root)
+    git = lambda *a: subprocess.run(["git", "-C", root, "-c", "user.name=t", "-c", "user.email=t@e", *a],  # noqa: E731
+                                    capture_output=True, text=True, check=True).stdout.strip()
+    git("init", "-q")
+    shas = []
+    for i in range(3):   # a stack: c0 <- c1 <- c2
+        git("commit", "-q", "--allow-empty", "-m", f"c{i}")
+        shas.append(git("rev-parse", "HEAD"))
+    git("checkout", "-q", "--orphan", "side")
+    git("commit", "-q", "--allow-empty", "-m", "side")   # shares no history with the stack
+    side = git("rev-parse", "HEAD")
+    now = time.time()
+    _pq_row(p, rid, now, status="held", age=7300, head=shas[0])      # the oldest not landed: held
+    _pq_row(p, rid, now, age=600, head=side)
+    _pq_row(p, rid, now, age=500, head=shas[1])
+    _pq_row(p, rid, now, age=400, head=shas[2])
+    _pq_row(p, rid, now, age=300, head="99" * 20)                   # git does not know it: never stacks
+    _pq_row(p, rid, now, status="pushed", age=9000, head="77" * 20)  # landed: not open
+    for bid, outcome, ago in (("b1", "pushed", 3600), ("b2", "landed", 7200), ("b3", "pushed", 90000),
+                              ("b4", "tip_failed", 600), ("b5", "nothing", 600)):
+        _pq_batch_row(p, bid, now, age=ago + 60, outcome=outcome, ended=now - ago, finalized=now - ago,
+                      after_push="skipped", after_finalized=now - ago,
+                      **({"pushed_sha": "cd" * 20, "version": "0.2.1"} if outcome == "pushed" else {}))
+    sm = pushq.summary(p, now)
+    assert (sm["oldest_open_s"], sm["stack_depth"], sm["landed_24h"], sm["landings_per_h"]) == (7300, 3, 2, 0.08)
+    line = pushq.status_line(p, now, sm)
+    assert "push queue: 4 approved (oldest 10 min) · 1 held for the token scope `?` · oldest not landed 2 h · " \
+           "stacked 3 deep · " in line and line.endswith(" · 2 batches landed in 24 h (0.08/h)"), line
+    # Bypasses: a timed-out git call ends the count with what it has; it is not cached as an answer.
+    pushq._anc_seen.clear()
+
+    def slow(*a, **kw):
+        raise subprocess.TimeoutExpired(a, pushq.STACK_GIT_S)
+    monkeypatch.setattr(pushq, "_git", slow)
+    assert pushq.summary(p, now)["stack_depth"] == 1 and pushq._anc_seen == {}
+    monkeypatch.undo()
+    rows = [{"id": 1, "head": shas[0]}, {"id": 2, "head": shas[0]}, {"id": 3, "head": None}]
+    assert pushq.stack_depth(p, rows) == 1, "a second row at the same head is not a stack"
+    assert pushq.stack_depth(p, []) == 0
+    many = [{"id": 0, "head": shas[0]}] + [{"id": i, "head": shas[2]} for i in range(1, pushq.STACK_ROWS)]
+    assert pushq.stack_depth(p, many) == 2 and pushq.stack_depth(p, many + [{"id": 99, "head": shas[2]}]) == 1, \
+        "the base fell out of the newest STACK_ROWS rows"
+    p.db.x("UPDATE push_queue SET status='pushed' WHERE status IN ('approved','held','batched')")
+    sm = pushq.summary(p, now)
+    assert (sm["oldest_open_s"], sm["stack_depth"]) == (None, 0)
+    assert pushq.status_line(p, now, sm).startswith("push queue: empty · ")
+
 
 
 def test_a_push_notice_names_the_branch_and_sha_and_says_when_the_work_is_not_yet_on_its_intended_target(
