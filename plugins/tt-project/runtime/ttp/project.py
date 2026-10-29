@@ -536,6 +536,8 @@ def section_value_problem(dotted: str, value: Any) -> str | None:
 def bad_sections(raw: dict) -> dict[str, Any]:
     """The sections of a project's own settings that hold no object ({dotted key: its value}): read as
     absent (layered), never kept as the last good copy, and named by config_problems and the daemon."""
+    if not isinstance(raw, dict):
+        return {}
     out = {k: v for k, v in raw.items() if v is not None and not isinstance(v, dict) and _is_section([k])}
     prov = raw.get("providers")
     if isinstance(prov, dict):

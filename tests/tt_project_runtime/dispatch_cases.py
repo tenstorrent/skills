@@ -855,3 +855,53 @@ def test_a_failed_start_names_its_line_logs_the_traceback_and_never_stops_the_ne
     finally:
         drain(d)
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_scalar_config_section_is_refused_never_kept_as_last_good_and_a_missing_snapshot_is_no_error(
+        env, capsys, monkeypatch):
+    """`ttp config checks host_max` must be refused with the account-level form, as must config_set;
+    config_problems names such a section, sizes() reads it as absent, no last-good copy keeps it and a
+    restore from an older copy that holds one drops it. A missing last-good file is only "no snapshot
+    yet": a valid config reads "ok" and writes a fresh one."""
+    from ttp import cli, integrity, testslots
+    from ttp.coordinator import apply
+    from ttp.project import Project, config_problems
+    p = make(env)
+    good = p.state / "project.last-good.json"
+    before = p.raw_config()
+    for key, val in (("checks", "host_max"), ("budget", 5), ("providers.fake", "x")):
+        with pytest.raises(ValueError, match=f"{re.escape(key)} is a section of settings"):
+            p.set_config(key, val)
+    with pytest.raises(SystemExit):
+        cli.main(["config", "demo", "checks", "host_max"])
+    assert "ttp config --account checks.host_max N" in capsys.readouterr().err
+    probs = apply(p, [{"type": "config_set", "key": "checks", "value": "host_max"}])
+    assert any(x.startswith("config_set: checks") for x in probs), probs   # refused, never saved
+    assert p.raw_config() == before
+    p.set_config("checks.test_pool", 4)   # a key inside the section is fine
+    assert p.raw_config()["checks"] == {"test_pool": 4}
+
+    good.unlink(missing_ok=True)   # no snapshot yet: not an error, and the valid config becomes one
+    fresh = Project(p.base)
+    assert fresh.config()["checks"]["test_pool"] == 4 and fresh.config_status == "ok"
+    assert json.loads(good.read_text())["checks"] == {"test_pool": 4}
+
+    raw = p.raw_config()
+    raw["checks"] = "host_max"
+    p.config_path.write_text(json.dumps(raw))
+    good.unlink()
+    fresh = Project(p.base)
+    assert "checks" not in fresh.config() or isinstance(fresh.config()["checks"], dict)
+    assert fresh.config_status == "ok" and not good.exists(), "a scalar section became the last good copy"
+    assert any(x.startswith("checks: a section of settings holds") for x in config_problems(raw))
+    assert testslots.sizes(raw, cores=16) == (8, 4), "a scalar checks section crashed sizes()"
+    assert testslots.project_max(raw) >= 1
+
+    # An older copy that kept one: the fallback read drops it, the reboot integrity check never restores it.
+    good.write_text(json.dumps(raw))
+    p.config_path.write_text("{ not json")
+    fresh = Project(p.base)
+    assert "host_max" not in json.dumps(fresh.config().get("checks")) and fresh.config_status == "fallback"
+    monkeypatch.setattr(integrity, "_head", lambda proj, name: b"")
+    out = integrity.check_harness(p)
+    assert p.config_path.read_text() == "{ not json" and "project.json is damaged and has no good copy" in out["bad"]

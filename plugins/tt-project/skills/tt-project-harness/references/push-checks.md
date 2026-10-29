@@ -41,7 +41,7 @@ It only adds an early run: the full checks still run every command, and it never
 
 ## Priority
 
-`ttp checks` and push checks share a host-wide slot cap (`checks.host_max`), waited for by project in turn, then task priority, then arrival; a required owner of an open obligation goes first in its project.
+`ttp checks` and push checks share a host-wide slot cap (`checks.host_max`, account-level: read it with `ttp config --account checks.host_max`, set it with `ttp config --account checks.host_max N`), waited for by project in turn, then task priority, then arrival; a required owner of an open obligation goes first in its project.
 Checks gating a push to the push branch (push-queue batches, `ttp push`) skip that queue: each push branch has one priority slot beyond the cap, host-wide, so approved changes never wait behind task checks.
 Task checks keep their cap and order, except that priority-1 task checks (live-impact work) and obligation owners go ahead of other projects' waiters for at most `checks.priority_turns` (default 3) turns in a row while others wait.
 `ttp push --own` queues like them.

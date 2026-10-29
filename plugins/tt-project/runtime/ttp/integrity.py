@@ -19,7 +19,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from .project import Project, durable_write, hostname
+from .project import Project, bad_sections, durable_write, hostname
 
 FSCK_TIMEOUT_S = 20
 STATUS_TIMEOUT_S = 10
@@ -166,7 +166,8 @@ def check_harness(p: Project) -> dict:
             head = _head(p, "project.json")
             for cand, why in ((good, "from its last good copy"), (head, "from the last commit")):
                 try:
-                    json.loads(cand or b"")
+                    if bad_sections(json.loads(cand or b"")):   # never restore a section saved as one value
+                        continue
                 except ValueError:
                     continue
                 put_back(p.config_path, cand, why)
