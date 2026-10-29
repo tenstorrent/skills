@@ -922,8 +922,15 @@ queues behind routine work; nothing running is interrupted:
   whose holder's process is gone or whose heartbeat stopped is reclaimed and logged. A waiter that has waited
   `checks.max_wait_s` (default 300, 0 turns it off) and is cheaper than every holder (by recorded run time,
   else by kind) takes an extra lane beside them. A waiter says who holds the lanes and its place in the queue
-  each minute; `ttp status` and the coordinator's digest list waits over 10 min, and the daemon raises one
-  `checks_slot_wait` event per wait past `checks.wait_event_s` (default 900, 0 turns it off).
+  each minute; `ttp status` and the coordinator's digest list waits over 10 min, and the daemon records one
+  `checks_slot_wait` event per wait past `checks.wait_event_s` (default 900, 0 turns it off). Only one of them
+  wakes the coordinator per queue incident (from the first waiter past that threshold until none is); the
+  rest are recorded `coalesced` and show in the digest and `ttp status`. The incident wakes it again only when
+  a decision is due: its longest wait passes `checks.wait_escalate_s` (default 7200, then once per as long
+  again; 0 never), a holder has run `checks.wait_hang_factor` (default 3, 0 never) times the recent median
+  checks run (a likely hang), or a holder's task has ended. An `observation_mute` on source
+  `daemon:checks_slot_wait` covers these events too (recorded `muted`); coalescing already keeps a long queue
+  to one wake, so a mute is only for a queue the coordinator has already decided to leave alone.
   `delivery.checks_spill_hosts` (an ordered list of ssh aliases, default empty: checks never leave this machine)
   lets a run that has waited `delivery.checks_spill_after_s` (default 60 s) here run on the first listed host the
   charter names, the machines list holds, no pause covers and whose `ttp lock <alias>` nobody else holds (the run

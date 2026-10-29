@@ -46,8 +46,13 @@ build) takes one of as many overflow lanes alongside them, not after.
 
 Visible. A waiter says who holds the lanes (task, command, running for) and its queue position every
 TELL_S; `ttp status` and the coordinator digest list waits over LONG_WAIT_S (long_wait_lines), and the
-daemon raises one `checks_slot_wait` event per wait episode past `checks.wait_event_s` (default
-WAIT_EVENT_S; 0 turns it off) naming holder and waiter (wait_events).
+daemon records one `checks_slot_wait` event per wait episode past `checks.wait_event_s` (default
+WAIT_EVENT_S; 0 turns it off) naming holder and waiter (wait_events). Only one of them wakes the coordinator
+per queue incident (wait_wake: from the first waiter past the threshold until none is); the incident wakes it
+again only when a decision is due: its longest waiter past `checks.wait_escalate_s` (default WAIT_ESCALATE_S,
+then once per as long again; 0: never), a holder running `checks.wait_hang_factor` (default WAIT_HANG_FACTOR;
+0: never) times the recent median checks run (a likely hang), or a holder whose task has ended (no owner
+to fix it).
 """
 from __future__ import annotations
 
@@ -75,6 +80,9 @@ GIB_PER_LANE = 8
 MAX_LANES = 4
 MAX_WAIT_S = 300.0
 WAIT_EVENT_S = 900.0
+WAIT_ESCALATE_S = 7200.0  # a queue incident wakes the coordinator again once its longest wait passes this
+WAIT_HANG_FACTOR = 3.0    # a holder running this many times the recent median checks run is a likely hang
+INCIDENT_KEY = "checks_wait_incident"   # kv: the open queue incident (wait_wake)
 LONG_WAIT_S = 600.0       # ttp status and the digest list a wait longer than this
 TELL_S = 60.0             # a waiter says who holds the lanes this often
 HEARTBEAT_S = 30.0        # a holder touches its lane file this often
@@ -120,6 +128,14 @@ def priority_age_s(cfg: dict | None) -> float:
     keeps a low-priority waiter from starving), nor is an infinite step, so either gives the default."""
     v = _seconds(cfg, "priority_age_s", testslots.SUITE_AGE_S)
     return v if 0 < v < float("inf") else testslots.SUITE_AGE_S
+
+
+def wait_escalate_s(cfg: dict | None) -> float:
+    return _seconds(cfg, "wait_escalate_s", WAIT_ESCALATE_S)
+
+
+def wait_hang_factor(cfg: dict | None) -> float:
+    return _seconds(cfg, "wait_hang_factor", WAIT_HANG_FACTOR)
 
 
 def _mem_gib() -> float | None:
@@ -370,12 +386,67 @@ def wait_events(project_name: str, cfg: dict | None, now: float | None = None) -
         who = f"#{w['task']}" if w["task"] else "a run with no task"
         out.append({"fingerprint": f"checks_slot_wait:{w['task'] or 'run'}:{w['since']:.0f}",
                     "task": int(w["task"]) if w["task"] else None,
+                    "waited_s": w["waited_s"], "holders": w["holders"],
                     "text": (f"Checks slot wait: {who} has waited {mins(w['waited_s'])} for its project's checks "
                              f"slot (position {w['position']} of {w['of']}), behind {held}. Lanes: checks.slots "
                              f"per repository, one per checks.wrap_cmd lock, checks.test_project_max per project; "
                              f"a waiter cheaper than the holders gets a lane after checks.max_wait_s; light "
                              f"checks (ttp checks --light, checks.light_cmds) never wait.")})
     return out
+
+
+def _holder_key(rec: dict) -> str:
+    return f"{rec.get('task') or rec.get('holder') or 'run'}:{rec.get('pid')}:{rec.get('run_since') or rec.get('since')}"
+
+
+def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: float,
+              median_s: float | None = None, ended=lambda task: False) -> tuple[list[str], dict | None]:
+    """Whether this tick's `checks_slot_wait` events (wait_events) wake the coordinator: (the reasons, none
+    when they do not, and the queue incident to keep). An incident opens with the first waiter past
+    checks.wait_event_s (reason "new") and closes once no waiter is past it (None). Within it, a wake again
+    only for: "escalate" (its longest wait past checks.wait_escalate_s, then once per as long again), "hang"
+    (a holder running checks.wait_hang_factor times `median_s`, the recent median checks run, once per
+    holder) and "ownerless" (a holder whose task has ended (`ended(task)`) or whose hold is stale, once
+    per holder). Every other waiter shows in the digest and ttp status only."""
+    if not events:
+        return [], None
+    inc = dict(incident) if isinstance(incident, dict) else {}
+    why = [] if inc else ["new"]
+    inc.setdefault("start", now)
+    inc["waiters"] = len(events)
+    head = max(float(e.get("waited_s") or 0) for e in events)
+    esc = wait_escalate_s(cfg)
+    if esc > 0 and head >= esc and now - float(inc.get("escalated_at") or 0) >= esc:
+        inc["escalated_at"] = now
+        if "new" not in why:
+            why.append("escalate")
+    holders = {_holder_key(h): h for e in events for h in e.get("holders") or []}
+    factor = wait_hang_factor(cfg)
+    for name, test in (("hang", lambda h: factor > 0 and median_s and median_s > 0 and now - float(
+                            h.get("run_since") or h.get("since") or now) > factor * median_s),
+                       ("ownerless", lambda h: h.get("stale") or (h.get("task") and ended(h.get("task"))))):
+        seen = inc.setdefault(name, [])
+        for k, h in holders.items():
+            if k not in seen and test(h):
+                seen.append(k)
+                if name not in why:
+                    why.append(name)
+        inc[name] = seen[-20:]
+    return why, inc
+
+
+def wake_text(why: list[str], events: list[dict], inc: dict, cfg: dict | None, now: float,
+              median_s: float | None = None) -> str:
+    """The waking `checks_slot_wait` event's text: the reasons, then the longest waiter's own event text."""
+    head = max(events, key=lambda e: float(e.get("waited_s") or 0))
+    say = {"new": f"a checks queue incident started ({len(events)} waiting past {mins(wait_event_s(cfg))})",
+           "escalate": f"its longest wait passed {mins(wait_escalate_s(cfg))}",
+           "hang": (f"a holder has run over {wait_hang_factor(cfg):g}x the recent median checks run "
+                    f"({mins(median_s or 0)}): a likely hang"),
+           "ownerless": "a holder's task has ended: nobody owns its fix"}
+    return (f"Checks queue: {'; '.join(say[w] for w in why)}. {head['text']} Further waiters of this "
+            f"incident (open {mins(now - float(inc['start']))}) show in the digest's `checks slot wait:` "
+            f"lines and ttp status, not as new wakes.")
 
 
 def log_reclaim(state: Path | None, rec: dict, why: str) -> None:

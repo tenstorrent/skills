@@ -5893,19 +5893,46 @@ class Daemon:
         """Model-free checks slot wait: a `ttp checks` run of this project waiting for its repository's
         checks lane longer than checks.wait_event_s (default 900, 0: off) raises one `checks_slot_wait`
         event naming the waiter and the holders (checklane.wait_events); one per wait episode (keyed on the
-        waiter's task and arrival), never for a short wait."""
+        waiter's task and arrival), never for a short wait. Those events are recorded 'coalesced': only
+        checklane.wait_wake's one per queue incident, and its re-wakes (escalation, likely hang, ownerless
+        holder), wake the coordinator. An active `daemon:checks_slot_wait` observation_mute covering one
+        records it 'muted' instead."""
         now = time.time()
         if now - getattr(self, "_checks_wait_checked", 0.0) < every_s:
             return
         self._checks_wait_checked = now
-        from . import checklane
+        import statistics
+        from . import checklane, checkwall
         db = self.p.db
-        for ev in checklane.wait_events(self.p.name, self.cfg, now):
+        events = checklane.wait_events(self.p.name, self.cfg, now)
+        recent = checkwall.recent(self.p.state, now)
+        median = statistics.median(recent) if len(recent) >= checkwall.MIN_RUNS else None
+
+        def ended(task) -> bool:
+            row = db.one("SELECT status FROM tasks WHERE id=?", (int(task),)) if str(task).isdigit() else None
+            return bool(row) and row["status"] in ("done", "failed", "cancelled")
+
+        was = db.kv(checklane.INCIDENT_KEY)
+        why, inc = checklane.wait_wake(events, was, self.cfg, now, median, ended)
+        if inc != was:
+            db.set_kv(checklane.INCIDENT_KEY, inc)
+
+        def record(fp: str, text: str, status: str, task) -> None:
+            if scr.count_muted(db, "daemon:checks_slot_wait", text, "normal", now):
+                status = "muted"
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                 (now, "daemon", "checks_slot_wait", fp, "normal", text[:4000], status, task))
+
+        if why:
+            head = max(events, key=lambda e: float(e.get("waited_s") or 0))
+            text = checklane.wake_text(why, events, inc, self.cfg, now, median)
+            record(f"checks_slot_wait:incident:{inc['start']:.0f}:{'+'.join(why)}:{now:.0f}", text, "queued",
+                   head["task"])
+            log(self.p, f"checks slot wait ({', '.join(why)}): {text[:300]}")
+        for ev in events:
             if db.one("SELECT id FROM events WHERE fingerprint=?", (ev["fingerprint"],)):
                 continue
-            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
-                 (now, "daemon", "checks_slot_wait", ev["fingerprint"], "normal", ev["text"][:4000], "queued",
-                  ev["task"]))
+            record(ev["fingerprint"], ev["text"], "coalesced", ev["task"])
             log(self.p, f"checks slot wait: {ev['text'][:300]}")
 
     def check_cap_wait(self, every_s: float = 60) -> None:

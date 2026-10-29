@@ -2433,8 +2433,9 @@ def test_long_lane_waits_show_in_status_and_the_digest_and_raise_one_event_past_
                                time.time() - 1000, priority=2)
         for _ in range(2):
             d.check_checks_wait(every_s=0)
-        ev = p.db.q("SELECT task, text FROM events WHERE kind='checks_slot_wait'")
-        assert len(ev) == 1 and ev[0]["task"] == 13 and "#12" in ev[0]["text"], ev
+        ev = p.db.q("SELECT task, text, status FROM events WHERE kind='checks_slot_wait' ORDER BY id")
+        assert [e["status"] for e in ev] == ["queued", "coalesced"], ev
+        assert all(e["task"] == 13 and "#12" in e["text"] for e in ev), ev
     finally:
         locks.dequeue(ticket)
         _stop(holder)
@@ -3432,3 +3433,124 @@ def test_a_real_detached_checks_child_reexecutes_in_place_after_an_install_and_s
         held.close()
         if pid and not _gone_pid(pid):
             os.killpg(pid, signal.SIGKILL)
+
+
+def _queue_events(n, waited_s=1000.0, holders=None, start=13):
+    now = time.time()
+    holders = [{"task": "12", "pid": 4242, "run_since": now - 600, "command": "pytest -q"}] if holders is None \
+        else holders
+    return [{"fingerprint": f"checks_slot_wait:{start + i}:{now - waited_s - i:.0f}", "task": start + i,
+             "waited_s": waited_s + (n - i), "holders": holders,
+             "text": f"Checks slot wait: #{start + i} has waited a while (position {i + 1} of {n})."}
+            for i in range(n)]
+
+
+def _queue_wakes(p, status="queued"):
+    return p.db.q("SELECT task, text FROM events WHERE kind='checks_slot_wait' AND status=? ORDER BY id", (status,))
+
+
+def test_a_checks_queue_of_21_waiters_wakes_the_coordinator_once_and_records_every_waiter(env, monkeypatch):
+    from ttp import checklane, coordinator
+    from ttp.daemon import Daemon
+    p = make(env)
+    evs = _queue_events(21)
+    monkeypatch.setattr(checklane, "wait_events", lambda *a, **k: evs)
+    d = Daemon(p.base)
+    for _ in range(3):
+        d.check_checks_wait(every_s=0)
+    wakes = _queue_wakes(p)
+    assert len(wakes) == 1, wakes
+    assert wakes[0]["task"] == 13 and "incident started (21 waiting" in wakes[0]["text"], wakes
+    assert len(_queue_wakes(p, "coalesced")) == 21, "every waiter stays recorded, without a wake"
+    evs.extend(_queue_events(3, start=40))
+    d.check_checks_wait(every_s=0)
+    assert len(_queue_wakes(p)) == 1 and len(_queue_wakes(p, "coalesced")) == 24, "a later waiter: no new wake"
+    assert p.db.kv(checklane.INCIDENT_KEY)["waiters"] == 24
+
+
+def test_a_checks_queue_incident_rewakes_once_per_escalation_interval_of_its_longest_wait(env, monkeypatch):
+    from ttp import checklane
+    from ttp.daemon import Daemon
+    p = make(env)
+    evs = _queue_events(5)
+    monkeypatch.setattr(checklane, "wait_events", lambda *a, **k: evs)
+    d = Daemon(p.base)
+    d.check_checks_wait(every_s=0)
+    assert len(_queue_wakes(p)) == 1
+    evs[:] = _queue_events(5, waited_s=checklane.WAIT_ESCALATE_S + 60)
+    for _ in range(2):
+        d.check_checks_wait(every_s=0)
+    wakes = _queue_wakes(p)
+    assert len(wakes) == 2 and "longest wait passed 2 h" in wakes[1]["text"], wakes
+    inc = p.db.kv(checklane.INCIDENT_KEY)
+    inc["escalated_at"] -= checklane.WAIT_ESCALATE_S   # one escalation interval later
+    p.db.set_kv(checklane.INCIDENT_KEY, inc)
+    d.check_checks_wait(every_s=0)
+    assert len(_queue_wakes(p)) == 3, "once more per escalation interval"
+    d.check_checks_wait(every_s=0)
+    assert len(_queue_wakes(p)) == 3
+    # checks.wait_escalate_s 0: never escalates
+    why, _ = checklane.wait_wake(evs, {"start": 1.0}, {"checks": {"wait_escalate_s": 0}}, time.time())
+    assert why == []
+
+
+def test_a_drained_checks_queue_ends_its_incident_and_a_new_queue_wakes_afresh(env, monkeypatch):
+    from ttp import checklane
+    from ttp.daemon import Daemon
+    p = make(env)
+    evs = _queue_events(4)
+    monkeypatch.setattr(checklane, "wait_events", lambda *a, **k: evs)
+    d = Daemon(p.base)
+    d.check_checks_wait(every_s=0)
+    evs[:] = []   # drained, or no waiter past checks.wait_event_s
+    d.check_checks_wait(every_s=0)
+    assert p.db.kv(checklane.INCIDENT_KEY) is None
+    assert len(_queue_wakes(p)) == 1
+    evs[:] = _queue_events(2, start=60)
+    d.check_checks_wait(every_s=0)
+    wakes = _queue_wakes(p)
+    assert len(wakes) == 2 and wakes[1]["task"] == 60 and "incident started (2 waiting" in wakes[1]["text"], wakes
+
+
+def test_a_checks_queue_incident_rewakes_for_a_likely_hung_holder_and_for_an_ownerless_one(env, monkeypatch):
+    from ttp import checklane, checkwall
+    from ttp.daemon import Daemon
+    p = make(env)
+    for _ in range(checkwall.MIN_RUNS):
+        checkwall.record_run(p.state, 600.0, True)
+    now = time.time()
+    holder = {"task": "12", "pid": 4242, "run_since": now - 600, "command": "pytest -q"}
+    evs = _queue_events(3, holders=[holder])
+    monkeypatch.setattr(checklane, "wait_events", lambda *a, **k: evs)
+    d = Daemon(p.base)
+    d.check_checks_wait(every_s=0)
+    assert len(_queue_wakes(p)) == 1, "a holder at the median: no hang"
+    holder["run_since"] = now - 4 * 600   # over checks.wait_hang_factor (3) x the 10 min median
+    for _ in range(2):
+        d.check_checks_wait(every_s=0)
+    wakes = _queue_wakes(p)
+    assert len(wakes) == 2 and "likely hang" in wakes[1]["text"], wakes
+    assert checklane.wait_wake(evs, {"start": 1.0}, {"checks": {"wait_hang_factor": 0}}, now, 600.0)[0] == [], \
+        "checks.wait_hang_factor 0: never"
+    # the holder set changes to one whose task has ended: nobody owns its fix
+    t = p.db.add_task("finished work", kind="code") if hasattr(p.db, "add_task") else None
+    tid = t if isinstance(t, int) else 12
+    p.db.x("INSERT OR IGNORE INTO tasks(id,title,status,created,updated) VALUES(?,?,?,?,?)",
+           (tid, "finished work", "done", now, now)) if t is None else None
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+    evs[:] = _queue_events(3, holders=[{"task": str(tid), "pid": 5151, "run_since": now - 60, "command": "pytest"}])
+    for _ in range(2):
+        d.check_checks_wait(every_s=0)
+    wakes = _queue_wakes(p)
+    assert len(wakes) == 3 and "nobody owns its fix" in wakes[2]["text"], wakes
+
+
+def test_checks_slot_wait_events_count_against_an_observation_mute_on_daemon_checks_slot_wait(env, monkeypatch):
+    from ttp import checklane, screen
+    from ttp.daemon import Daemon
+    p = make(env)
+    screen.mute(p.db, "daemon:checks_slot_wait", "Checks", 2, why="a known long queue")
+    monkeypatch.setattr(checklane, "wait_events", lambda *a, **k: _queue_events(3))
+    Daemon(p.base).check_checks_wait(every_s=0)
+    assert _queue_wakes(p) == [] and len(_queue_wakes(p, "muted")) == 4, "the wake and the waiters: muted"
+    assert screen.mutes(p.db)[0]["count"] == 4
