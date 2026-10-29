@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import checkdirs, batch, conflictfix, coordinator as coord, cyclenotice, envfault, locks, msgparts, pagesev, prhead, push, pushclaim, replymsg, runner, scopehold, sharedchecks, timefmt, upstream, urgent
+from . import checkdirs, batch, conflictfix, coordinator as coord, cyclenotice, envfault, locks, msgparts, overlap, pagesev, prhead, push, pushclaim, replymsg, runner, scopehold, sharedchecks, timefmt, upstream, urgent
 from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
                  pin_of, review_subject, reviewed_ids)
 from .landed import on_branch
@@ -669,8 +669,8 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     delivery.push_batch_s. After a batch that did not end clean (a failing tip, a dead batch), unless
     the batch is full or holds one the last batch requeued untested, it waits for
     delivery.push_min_gap_s since the last one. Fast approvals (fast_ids: urgent, priority 1-2, or
-    sharing no file with an earlier unlanded approval) wait for neither: they start a batch of
-    their own at once, ahead of the routine ones, which wait for the next batch."""
+    sharing no file with an earlier unlanded approval) wait for neither: while the routine ones wait
+    they start a batch of their own at once; when the routine ones are due too, they lead it."""
     now = time.time() if now is None else now
     if not enabled(p, cfg):
         return [], "the push queue is off"
@@ -716,9 +716,25 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     # spent its checks on the others (batch._close marks them "untested").
     untested = [r for r in rows if last and r["batch"] == last["id"] and _detail(r).get("untested")]
     fast = fast_ids(p, rows, _tracking_tip(p, remote, branch), skip=tried)
+    why = wait = ""
     if last and last["outcome"] == "rebooted":
         why = f"a rerun of {last['id']}, cut short by a reboot"
-    elif fast:
+    elif len(rows) >= cap:
+        why = f"{len(rows)} approvals"
+    elif untested:
+        why = f"{len(untested)} approval{'s' if len(untested) != 1 else ''} {last['id']} requeued untested"
+    elif last and last["outcome"] not in CLEAN_OUTCOMES and (left := _gap_left(db, now, gap)) > 0:
+        wait = f"{left:.0f} s left of the {gap:.0f} s gap since the last batch ended"
+    elif now - min(r["created"] for r in rows) >= window:
+        why = f"the oldest approval waited {window:.0f} s"
+    elif not db.one("SELECT id FROM tasks WHERE kind='review' AND status='running' LIMIT 1") and not any(
+            t["kind"] == "review" for t in db.ready_tasks()):
+        why = "no review is running or ready"
+    else:
+        wait = "waiting for more approvals"
+    if wait and not fast:
+        return [], wait
+    if wait:
         # Independent, urgent or priority 1-2 approvals go now, alone: no window, no gap, and no
         # routine approval in the batch whose failure would cost them a bisect round.
         rows = [r for r in rows if r["id"] in fast]
@@ -726,19 +742,8 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
         why = (f"{len(rows)} approval{'s' if len(rows) != 1 else ''} that "
                f"{'is' if len(rows) == 1 else 'are'} urgent, priority 1-{FAST_PRIORITY} or share no file with an "
                f"earlier unlanded one" + (f" ({hot} an urgent review)" if hot else ""))
-    elif len(rows) >= cap:
-        why = f"{len(rows)} approvals"
-    elif untested:
-        why = f"{len(untested)} approval{'s' if len(untested) != 1 else ''} {last['id']} requeued untested"
-    elif last and last["outcome"] not in CLEAN_OUTCOMES and (left := _gap_left(db, now, gap)) > 0:
-        return [], f"{left:.0f} s left of the {gap:.0f} s gap since the last batch ended"
-    elif now - min(r["created"] for r in rows) >= window:
-        why = f"the oldest approval waited {window:.0f} s"
-    elif not db.one("SELECT id FROM tasks WHERE kind='review' AND status='running' LIMIT 1") and not any(
-            t["kind"] == "review" for t in db.ready_tasks()):
-        why = "no review is running or ready"
     else:
-        return [], "waiting for more approvals"
+        rows = [r for r in rows if r["id"] in fast] + [r for r in rows if r["id"] not in fast]   # they lead
     taken, held = _one_solo(p, rows, cap, _solo_paths(d), _tracking_tip(p, remote, branch))
     if held:
         why += (f"; {len(held)} more approval{'s' if len(held) != 1 else ''} touching delivery.push_solo_paths "
@@ -775,7 +780,6 @@ def fast_ids(p: Project, rows: list[dict], tip: str, skip: set = frozenset()) ->
         int(r["priority"] if r["priority"] is not None else 9) <= FAST_PRIORITY or urgent.covers_urgent(db, db.task(r["task"])))}
     if not tip:
         return out
-    from . import overlap
     globs = overlap.settings(p).get("ignore")
     earlier = db.q(f"SELECT id, head FROM push_queue WHERE status IN ({','.join('?' * len(OPEN_ROWS))}) "
                    f"AND target=? AND id<=? ORDER BY id", (*OPEN_ROWS, rows[0]["target"], max(r["id"] for r in rows)))

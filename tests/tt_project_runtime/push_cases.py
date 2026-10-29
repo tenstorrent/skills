@@ -1974,6 +1974,7 @@ def test_entries_after_a_blamed_one_are_requeued_untested_without_an_extra_round
 def test_rows_a_batch_requeued_untested_skip_the_push_gap(env, monkeypatch):
     from ttp import pushq
     s = _pq(env, monkeypatch, push_batch_s=10 ** 6, push_batch_max=5)
+    _pq_earlier(s)
     rid = _pq_review(s)[1]
     now = time.time()
     s.p.db.x("INSERT INTO push_batches(id, marker, target, started) VALUES('b1', 'm', 'origin/proj', ?)", (now,))
@@ -2298,6 +2299,14 @@ def _pq_review(s, priority=3):
     return rid, row
 
 
+def _pq_earlier(s):
+    """An earlier change of the same head still held in the queue: every later approval shares its files,
+    so none is independent (pushq.fast_ids) and the routine window, gap and cap apply to them."""
+    rid = _pq_review(s)[1]
+    s.p.db.x("UPDATE push_queue SET status='held' WHERE id=?", (rid,))
+    return rid
+
+
 @pytest.mark.parametrize("link", ["pr_branch", "continues"])
 def test_a_re_review_approves_the_head_its_re_plan_left_on_its_own_branch_in_one_run(env, monkeypatch, link):
     """The coordinator queues a re-review with the re-plan; it names only the reviewed branch, and the
@@ -2332,6 +2341,7 @@ def test_a_batch_is_due_after_the_window_at_the_cap_for_priority_one_or_with_no_
     s = _pq(env, monkeypatch, push_batch_s=900, push_batch_max=3)
     s.p.db.update_task(s.review, status="running")   # a review is still at work: approvals may wait for it
     now = time.time()
+    _pq_earlier(s)
     first = [_pq_review(s)[1], _pq_review(s)[1]]
     rows, why = pushq.due(s.p, now)
     assert rows == [] and "waiting" in why
@@ -2345,7 +2355,7 @@ def test_a_batch_is_due_after_the_window_at_the_cap_for_priority_one_or_with_no_
     s.p.db.x("DELETE FROM push_queue WHERE id IN (?,?,?)", (*first, later[0]))
     urgent = _pq_review(s, priority=1)[1]
     rows, why = pushq.due(s.p, now)
-    assert [r["id"] for r in rows] == [urgent, later[1]] and "an urgent review" in why, "the best priority goes first"
+    assert [r["id"] for r in rows] == [urgent] and "priority 1-2" in why, "priority 1 goes alone, ahead of routine ones"
     s.p.db.x("DELETE FROM push_queue WHERE id=?", (urgent,))
     assert pushq.due(s.p, now)[0] == []
     s.p.db.update_task(s.review, status="done")
@@ -2356,6 +2366,7 @@ def test_a_batch_is_due_after_the_window_at_the_cap_for_priority_one_or_with_no_
 def test_a_batch_waits_push_min_gap_s_after_the_last_one_ended_unless_full_or_priority_one(env, monkeypatch):
     from ttp import project, pushq
     s = _pq(env, monkeypatch, push_batch_s=0, push_batch_max=3)
+    _pq_earlier(s)
     rows = [_pq_review(s)[1]]
     now = time.time() + 1   # past every approval's creation: push_batch_s=0 starts at once
     assert pushq.due(s.p, now)[0], "no batch ran before: nothing to wait for"
@@ -2369,7 +2380,7 @@ def test_a_batch_waits_push_min_gap_s_after_the_last_one_ended_unless_full_or_pr
     assert [r["id"] for r in pushq.due(s.p, now + 10 ** 6)[0]] == rows
     rows.append(_pq_review(s, priority=1)[1])
     got, why = pushq.due(s.p, now)
-    assert [r["id"] for r in got] == rows[::-1] and "an urgent review" in why, "an urgent approval starts at once"
+    assert [r["id"] for r in got] == rows[1:] and "1 an urgent review" in why, "an urgent approval starts at once, alone"
     s.p.db.x("DELETE FROM push_queue WHERE id=?", (rows.pop(),))
     rows += [_pq_review(s)[1], _pq_review(s)[1]]
     got, why = pushq.due(s.p, now)
@@ -2399,6 +2410,7 @@ def test_an_approval_after_a_clean_batch_starts_at_once_with_nothing_running_or_
     s.p.db.update_task(s.review, status="done")   # no review running or ready
     now = time.time()
     _pq_last_batch(s, outcome, now - 60)
+    _pq_earlier(s)
     rid = _pq_review(s)[1]
     got, why = pushq.due(s.p, now)
     assert [r["id"] for r in got] == [rid] and "no review" in why, why
@@ -2411,6 +2423,7 @@ def test_an_approval_waits_at_most_the_default_batch_s_for_a_running_review(env,
     assert pushq.DEFAULT_BATCH_S == project.PUSH_QUEUE_DEFAULTS["push_batch_s"] == 300
     now = time.time()
     _pq_last_batch(s, "pushed", now - 60)   # a clean batch just ended: no gap after it
+    _pq_earlier(s)
     rid = _pq_review(s)[1]
     got, why = pushq.due(s.p, now + 1)
     assert got == [] and "waiting for more approvals" in why, why
@@ -2424,6 +2437,7 @@ def test_the_gap_and_the_bad_tip_hold_still_apply_after_a_failing_tip(env, monke
     s.p.db.update_task(s.review, status="done")
     now = time.time()
     _pq_last_batch(s, "tip_failed", now - 600)
+    _pq_earlier(s)
     rid = _pq_review(s)[1]
     got, why = pushq.due(s.p, now)
     assert got == [] and "1200 s left of the 1800 s gap" in why, why
@@ -2435,11 +2449,73 @@ def test_the_gap_and_the_bad_tip_hold_still_apply_after_a_failing_tip(env, monke
     assert pushq.due(s.p, now + pushq.HOLD_S + 1)[0]
 
 
+def _pq_alone(s, name, priority=3, text=None):
+    """Approve a head of its own that changes `name` over the target's tip (not the shared s.head)."""
+    from ttp import pushq
+    tip = pushq._tracking_tip(s.p, "origin", "proj")
+    branch = f"ttp/t0-{name.replace('.', '-')}-{time.monotonic_ns()}"
+    _git_out(s.path, "checkout", "-q", "-b", branch, tip)
+    _commit(s.path, name, text or f"{name}\n")
+    head = _git_out(s.path, "rev-parse", "HEAD")
+    _git_out(s.path, "checkout", "-q", s.branch)
+    rid = s.p.db.add_task(f"review {name}", "r", kind="review", origin="coordinator", priority=priority)
+    s.p.db.update_task(rid, status="pushing")
+    with s.p.db.tx():
+        [row] = pushq.approve(s.p, rid, None, {"entries": [{"branch": branch, "head": head}], "target": "origin/proj"})
+    return row
+
+
+def test_an_independent_approval_goes_alone_at_once_through_the_gap_and_the_window(env, monkeypatch):
+    """user msg #1221: an approval sharing no file with an earlier unlanded one, or of priority 1-2, starts a
+    batch of its own at once; routine ones that overlap still wait the gap (here 1200 s) or the window."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_s=900)
+    s.p.db.update_task(s.review, status="running")   # a review is at work: routine approvals wait for it
+    now = time.time()
+    _pq_last_batch(s, "tip_failed", now - 600)       # and a failed batch: 1200 s left of the gap
+    _pq_earlier(s)
+    routine = _pq_review(s)[1]
+    assert pushq.due(s.p, now) == ([], "1200 s left of the 1800 s gap since the last batch ended")
+    alone = _pq_alone(s, "other.txt")
+    got, why = pushq.due(s.p, now)
+    assert [r["id"] for r in got] == [alone] and "share no file with an earlier unlanded one" in why, why
+    stacked = _pq_alone(s, "feature.txt", text="another feature\n")   # same file as the earlier ones
+    assert pushq.fast_ids(s.p, pushq._approved(s.p.db, "origin/proj"),
+                          pushq._tracking_tip(s.p, "origin", "proj")) == {alone}, "overlap never goes fast"
+    p2 = _pq_alone(s, "feature.txt", priority=2, text="a p2 fix\n")
+    got, why = pushq.due(s.p, now)
+    assert [r["id"] for r in got] == [p2, alone] and "priority 1-2" in why, "priority first; routine ones wait"
+    assert routine not in {r["id"] for r in got} and stacked not in {r["id"] for r in got}
+    tip = pushq._tracking_tip(s.p, "origin", "proj")
+    assert alone not in pushq.fast_ids(s.p, pushq._approved(s.p.db, "origin/proj"), tip, skip={alone}), \
+        "an approval already tried on a failing tip is never fast"
+    s.p.db.x("DELETE FROM push_queue WHERE id IN (?,?)", (alone, p2))
+    assert pushq.due(s.p, now)[0] == [], "the routine ones still wait for the gap"
+
+
+def test_an_independent_approval_still_waiting_after_15_minutes_raises_one_event(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    now = time.time()
+    _pq_earlier(s)
+    _pq_review(s)
+    alone = _pq_alone(s, "other.txt")
+    assert pushq.fast_waits(s.p, "batch b9 is still going", now + 60) == [], "not yet 15 minutes"
+    assert pushq.fast_waits(s.p, "batch b9 is still going", now + pushq.FAST_WAIT_S + 1) == [alone]
+    [e] = s.p.db.q("SELECT * FROM events WHERE kind=?", (pushq.FAST_WAIT_EVENT,))
+    assert e["status"] == "handled" and f"row {alone}" in e["text"] and "batch b9 is still going" in e["text"]
+    assert pushq.fast_waits(s.p, "batch b9 is still going", now + 3 * pushq.FAST_WAIT_S) == [], "once per row"
+    s.p.db.x("UPDATE push_queue SET status='landed' WHERE id=?", (alone,))
+    pushq.fast_waits(s.p, "x", now + 3 * pushq.FAST_WAIT_S)
+    assert s.p.db.kv(pushq.FAST_KV) == [], "rows no longer waiting are pruned"
+
+
 def test_batch_max_still_caps_a_batch_started_at_once(env, monkeypatch):
     from ttp import pushq
     s = _pq(env, monkeypatch, push_batch_max=2)
     s.p.db.update_task(s.review, status="done")
     _pq_last_batch(s, "pushed", time.time() - 60)
+    _pq_earlier(s)
     rows = [_pq_review(s)[1] for _ in range(3)]
     got, why = pushq.due(s.p)
     assert [r["id"] for r in got] == rows[:2], why
@@ -13549,17 +13625,18 @@ def test_an_approval_from_the_review_of_an_urgent_task_starts_its_batch_at_once(
     s = _pq(env, monkeypatch, push_batch_s=900)
     s.p.db.update_task(s.review, status="running")   # a review is still at work: approvals may wait for it
     now = time.time()
+    _pq_earlier(s)
     routine = _pq_review(s)[1]
     assert pushq.due(s.p, now)[0] == []
     hot = s.p.db.add_task("time-sensitive fix", "Fix it.\nurgent: the user is waiting", kind="code",
                           origin="coordinator", priority=3)
-    rid = s.p.db.add_task("Review of the fix", "r", kind="review", origin="daemon", priority=2, depends_on=[hot])
+    rid = s.p.db.add_task("Review of the fix", "r", kind="review", origin="daemon", priority=3, depends_on=[hot])
     s.p.db.update_task(rid, status="pushing")
     with s.p.db.tx():
         [row] = pushq.approve(s.p, rid, None, {"entries": [{"branch": s.branch, "head": s.head}],
                                                "target": "origin/proj"})
     rows, why = pushq.due(s.p, now)
-    assert [r["id"] for r in rows] == [row, routine] and "an urgent review" in why, why
+    assert [r["id"] for r in rows] == [row] and "an urgent review" in why, "alone: the routine one waits " + why
     s.p.db.update_task(hot, spec="Fix it.")   # no longer urgent: it waits like the rest
     assert pushq.due(s.p, now)[0] == []
 
