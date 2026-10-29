@@ -4,8 +4,11 @@ Use the standalone plugin [tenstorrent/vllm-tt-plugin](https://github.com/tensto
 with the upstream [vllm-project/vllm](https://github.com/vllm-project/vllm) version it recommends.
 The old `tenstorrent/vllm` fork and its bundled plugin are not the default serving stack.
 
-For a new run, resolve and pin the pair once, during the `$full-model` serving contract check.
-That check only reads the plugin checkout; install the stack before the first server launch.
+For a new run, resolve and pin the pair once, at startup, through the stack freshness check in
+`$model-bringup` (`check_stack_freshness.py --mode resolve`, which fetches the plugin's default
+branch and refuses a checkout more than seven days behind it). The `$full-model` serving
+contract check re-verifies that pin; it only reads the plugin checkout. Install the stack before
+the first server launch.
 
 1. Resolve the plugin's current default branch from GitHub and pin the selected commit in a
    separate checkout. Read that checkout's README and the installation script it references

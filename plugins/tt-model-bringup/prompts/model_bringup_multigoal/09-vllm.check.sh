@@ -24,4 +24,12 @@ python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_serving_contract.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --require-contract || exit $?
 
 python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_prefill_features.py" \
-  --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --stage vllm
+  --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --stage vllm || exit $?
+
+model_dir="${MODEL_DIR:-}"
+if [ -z "$model_dir" ] && [ -n "${HF_MODEL:-}" ]; then
+  model_dir="models/autoports/$(printf '%s' "$HF_MODEL" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\{1,\}/_/g; s/^_//; s/_$//')"
+fi
+python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_stack_freshness.py" \
+  --mode verify --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" \
+  --serving-contract "${model_dir}/doc/full_model/serving_contract.json"

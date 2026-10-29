@@ -120,7 +120,7 @@ def test_skill_graph_and_package_links_resolve():
             assert target.exists(), (path, ref)
 
 
-@pytest.mark.parametrize('stage', ['06-full-model', '07-optimized-full-model', '09-vllm', '10-optimized-vllm', '11-benchmark'])
+@pytest.mark.parametrize('stage', ['01-functional-decoder', '06-full-model', '07-optimized-full-model', '09-vllm', '10-optimized-vllm', '11-benchmark'])
 def test_installed_gates_fail_critical_for_missing_evidence(installed, stage):
     plugin, target, env = installed
     env['MODEL_DIR'] = 'models/autoports/org_model'
@@ -128,6 +128,45 @@ def test_installed_gates_fail_critical_for_missing_evidence(installed, stage):
                  cwd=target, env=env)
     assert result.returncode == 2, result.stderr
     assert "can't open file" not in result.stderr
+
+
+def git_repo_with_commit(path):
+    env = dict(os.environ, GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@t', GIT_COMMITTER_NAME='t', GIT_COMMITTER_EMAIL='t@t')
+    path.mkdir(parents=True, exist_ok=True)
+    (path / 'marker').write_text('x')
+    for args in (('init', '-q', '-b', 'main'), ('add', 'marker'), ('commit', '-q', '-m', 'marker')):
+        subprocess.run(['git', '-C', str(path), *args], check=True, capture_output=True, env=env)
+    return subprocess.run(['git', '-C', str(path), 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def pin_stack(target, model, env, contract=None):
+    tt_metal_head = git_repo_with_commit(target)
+    plugin_root = target.parent / 'plugin checkout'
+    plugin_head = git_repo_with_commit(plugin_root)
+    env['VLLM_TT_PLUGIN_ROOT'] = str(plugin_root)
+    if contract is not None:
+        contract['plugin']['commit'] = plugin_head
+    (model / 'doc').mkdir(parents=True, exist_ok=True)
+    (model / 'doc/stack_pins.json').write_text(json.dumps({
+        'verdict': 'pass', 'mode': 'resolve',
+        'tt_metal': {'head': tt_metal_head, 'path': str(target), 'verdict': 'fresh'},
+        'vllm_tt_plugin': {'head': plugin_head, 'path': str(plugin_root), 'verdict': 'fresh'},
+        'transformers': {'installed': '5.12.1', 'checkpoint_minimum': '4.51.0', 'verdict': 'ok'},
+        'skills_plugin': {'installed': '0.1.22', 'latest': '0.1.22', 'verdict': 'fresh'},
+    }))
+
+
+def test_stage_one_gate_requires_the_stack_record(installed):
+    plugin, target, env = installed
+    model = target / 'models/autoports/org_model'
+    env['MODEL_DIR'] = str(model)
+    gate = plugin / 'prompts/model_bringup_multigoal/01-functional-decoder.check.sh'
+    result = run('bash', str(gate), cwd=target, env=env)
+    assert result.returncode == 2, result.stderr
+    assert 'stack_pins.json' in result.stderr
+    pin_stack(target, model, env)
+    result = run('bash', str(gate), cwd=target, env=env)
+    assert result.returncode == 0, result.stderr + result.stdout
 
 
 def valid_serving_contract():
@@ -219,6 +258,7 @@ def test_gates_fail_critical_for_malformed_serving_contract(installed, stage, fi
          'serial_reference': {'ttft_ratio_p99': 0.4, 'ttft_ratio_mean': 0.4, 'config_matches': True}}))
     (doc / 'context_contract.json').write_text(json.dumps({'hf_advertised_context': 8192, 'current_supported_context': 8192}))
     contract = valid_serving_contract()
+    pin_stack(target, model, env, contract)
     path = doc / 'full_model/serving_contract.json'
     path.write_text(json.dumps(contract))
     env['MODEL_DIR'] = str(model)

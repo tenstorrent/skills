@@ -152,3 +152,19 @@ plugin and runs last in the stage 9 and stage 10 gates; stage 10 passes `--requi
 Only packaged hashes for three edited stage prompts, two edited check scripts, six edited skills,
 `contract.py` and `run_vllm_server.py` change in `sync-source.json`; the original import
 provenance stays intact.
+
+## Stack freshness at startup (0.1.22)
+
+The skills told agents to resolve current dependency versions for a new run but enforced nothing:
+a bringup could start from a month-old tt-metal branch, a TT vLLM plugin checkout 65 commits
+behind its default branch, a `transformers` release the checkpoint config rejects, or a stale
+installed copy of this plugin, and no gate noticed. `scripts/check_stack_freshness.py` is authored
+in this plugin. In `resolve` mode it fetches the tt-metal and plugin default branches, reads the
+checkpoint's `transformers_version` and the published plugin version, writes `doc/stack_pins.json`,
+and is critical for a new run on any stale part (advisory on `--resume`). In `verify` mode the new
+stage 1 gate and the stage 9 gate confirm the record exists, the checkout still descends from its
+pin, and the serving contract's plugin commit equals the pinned one. The model-bringup skill's
+"Stack freshness" section states the rule; `serving-stack.md` moves the plugin pin to startup.
+
+Only packaged hashes for one edited stage prompt and one edited check script change in
+`sync-source.json`; the original import provenance stays intact.

@@ -57,6 +57,37 @@ versions and recommendation source, then retain them across resumes. Re-resolve 
 explicit restart or migration, preserving prior evidence and revalidating affected checks.
 For serving, follow [vLLM stack setup](../vllm-integration/references/serving-stack.md).
 
+### Stack freshness
+
+A new run starts on the current upstream of every moving part, and records what it started
+on. Before stage 1, from the target checkout, run:
+
+```bash
+python "$TT_MODEL_BRINGUP_ROOT/scripts/check_stack_freshness.py" --mode resolve \
+  --model-dir models/autoports/<model> --hf-model <HF id> \
+  --python "$(command -v python)" --plugin-root "$VLLM_TT_PLUGIN_ROOT"
+```
+
+It fetches each upstream, writes `doc/stack_pins.json`, and is critical for a new run when:
+
+- the tt-metal checkout is more than seven days behind its `origin` default branch: start the
+  bringup from the upstream head (a fresh branch from `main`), not from an old feature branch;
+- the TT vLLM plugin checkout is more than seven days behind its default branch: resolve the
+  pair as [serving stack setup](../vllm-integration/references/serving-stack.md) describes,
+  at startup, so stage 6 only re-verifies it;
+- the installed `transformers` is below the checkpoint's `transformers_version`: upgrade it in
+  the tt-metal environment to the newest release that tt-metal's own requirements allow, and
+  record the version; a checkpoint the pinned release cannot load is a startup blocker, not a
+  model bug to work around later;
+- this skills plugin is older than the published version: stop and tell the operator to update
+  it with the host's plugin manager and restart; an agent cannot update plugins, and a stale
+  plugin silently applies stale stage rules.
+
+Pass `--resume` on a resumed run: the same checks then report stale upstreams as advisory and
+the recorded pins stay. Stage gates run `--mode verify`: stage 1 confirms the record exists and
+the checkout still descends from the pinned commit; stage 9 also confirms the serving
+contract's plugin commit equals the pinned one. Record the output path in the run record.
+
 ## Execution
 
 The eleven [goal templates](../../prompts/model_bringup_multigoal) run in order:
@@ -148,7 +179,7 @@ The [hook API](../../telemetry-hooks.md) contains no endpoint or upload implemen
 
 ## Evidence gates
 
-Stages 6, 7, 9, 10 and 11 have sibling `.check.sh` scripts. Run from the target checkout with
+Stages 1, 6, 7, 9, 10 and 11 have sibling `.check.sh` scripts. Run from the target checkout with
 `MODEL_DIR` set to its exact autoport path. They resolve their own package resources. Exit 0 passes;
 1 is advisory; 2 is critical; other exits mean checker/environment failure. The runner retries
 checker errors once and stops by default; it runs bounded remediation goals for failed checks.
