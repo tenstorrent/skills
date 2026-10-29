@@ -23,7 +23,9 @@ naming `correction #<id>` with its reason. A repeated request (`request`: 'I tol
 change: its tag and Course check line ask for a queued task with a measurable change (any task kind
 but a question or plan counts as its fix) or `correction #<id>: <why not>`; an explanation alone is no
 fix. A second reason ('none') within REFUSE_S for the same class
-(a shared anchor, or a repeat of the same first message) is refused: it stays without a class fix.
+(a repeat of the same first message, or a shared task id or config key: a model family or effort level
+alone is too common to name one) is refused: it stays without a class fix. `correction #<id>: not a
+correction` (a new instruction, say) is recorded as such and is never the prior 'none'.
 One with neither, or refused, gets a Course check line in the next digest (a refused one until a
 harness task comes, for up to a day; `digest_lines`). The daily review's efficiency audit lists each
 correction of the last 24 h and the task that fixed its class, or none, and counts the repeated
@@ -76,7 +78,9 @@ REPEAT_ROWS = 1000
 RESEND_S = 60   # the same words again this soon are one message delivered twice, not a repeat
 # Anchors: what makes a short instruction specific enough that its repeat is one ('yes go ahead' has
 # none). An anchored instruction repeats an earlier one sharing an anchor and at least half its content
-# words (ANCHOR_SHARE), checked against at most REPEAT_NEAR earlier clauses per anchor.
+# words other than the anchors' own (ANCHOR_SHARE), and ANCHOR_MIN anchors or ANCHOR_MIN such words
+# ('Review #4151' after 'Push #4151' shares only the anchor: a new instruction), checked against
+# at most REPEAT_NEAR earlier clauses per anchor.
 EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 _LEVEL = r"(minimal|low|medium|high|xhigh|max|extra[- ]high)"
 _EFFORT = re.compile(rf"\b{_LEVEL}[- ]effort\b|\beffort\s*(?:[=:]|of|at|to|is)?\s*{_LEVEL}\b")
@@ -86,6 +90,7 @@ NOT_KEYS = frozenset("py md json jsonl sh txt yaml yml toml js ts html css log c
                      "ai".split())   # a file name or a domain, not a config key
 _TASK = re.compile(r"(?:#|\btask\s+#?)(\d+)\b")
 ANCHOR_SHARE = 0.5
+ANCHOR_MIN = 2
 STOP = frozenset("a an the to of for on in at and or is are be it its this that these those with by from as "
                  "please pls now just again also do does you we i me my our your all any then than so but if "
                  "can could would should will it's that's".split())
@@ -100,6 +105,8 @@ REJECTS = ("that's wrong", "that is wrong", "is wrong", "was wrong", "not true",
 QUOTE_WORDS = 3
 _QUOTED = re.compile(r'"([^"\n]{8,300})"|“([^”\n]{8,300})”')
 REFUSE_S = 7 * 86400   # a second 'none' for the same class this soon is refused
+CLASS_ANCHORS = ("#", "key:", "msg#")   # the anchors specific enough to name a correction's class
+_NOT = r"\s*:\s*not\s+a\s+correction\b"
 CLAIM_KEYS = ("tried", "cells", "results", "rows")   # hand-off fields whose dict rows may name a run
 
 
@@ -119,7 +126,7 @@ def request(text: str) -> str:
 def sentences(text: str) -> list[tuple[str, ...]]:
     """`text`'s sentences of REPEAT_WORDS+ words, each lowercased to its words only."""
     out = []
-    for part in re.split(r"[.!?;\n]+", str(text or "").lower().replace("’", "'")):
+    for part in re.split(r"[!?;\n]+|\.(?:\s+|$)", str(text or "").lower().replace("’", "'")):
         words = tuple(re.findall(r"[a-z0-9]+(?:'[a-z]+)?", part))
         if len(words) >= REPEAT_WORDS:
             out.append(words)
@@ -130,23 +137,33 @@ def _effort(level: str) -> str:
     return "xhigh" if level.startswith("extra") else level
 
 
+def _anchored(text: str) -> tuple[frozenset, frozenset]:
+    """(the anchors `text` names, the words those anchors are written with)."""
+    low = str(text or "").lower().replace("’", "'")
+    ms = [(f"effort:{_effort(next(g for g in m.groups() if g))}", m) for m in _EFFORT.finditer(low)]
+    ms += [(f"model:{m.group(1)}", m) for m in _MODEL.finditer(low)]
+    ms += [(f"key:{m.group(0)}", m) for m in _KEY.finditer(low) if m.group(0).rsplit(".", 1)[1] not in NOT_KEYS]
+    ms += [(f"#{m.group(1)}", m) for m in _TASK.finditer(low)]
+    return (frozenset(a for a, _ in ms),
+            frozenset(w for _, m in ms for w in re.findall(r"[a-z0-9]+", m.group(0))))
+
+
 def anchors(text: str) -> frozenset:
     """The anchors `text` names: 'model:<family>', 'effort:<level>', 'key:<dotted.key>', '#<task id>'."""
-    low = str(text or "").lower().replace("’", "'")
-    out = {f"effort:{_effort(next(g for g in m.groups() if g))}" for m in _EFFORT.finditer(low)}
-    out |= {f"model:{m.group(1)}" for m in _MODEL.finditer(low)}
-    out |= {f"key:{m.group(0)}" for m in _KEY.finditer(low) if m.group(0).rsplit(".", 1)[1] not in NOT_KEYS}
-    out |= {f"#{m.group(1)}" for m in _TASK.finditer(low)}
-    return frozenset(out)
+    return _anchored(text)[0]
 
 
-def clauses(text: str) -> list[tuple[tuple[str, ...], frozenset, bool]]:
-    """`text`'s clauses of any length: (its words, its anchors, whether it is a question)."""
+def clauses(text: str) -> list[tuple[tuple[str, ...], frozenset, bool, frozenset]]:
+    """`text`'s clauses of any length: (its words, its anchors, whether it is a question, its content
+    words other than the anchors' own, a plural 's' dropped)."""
     out = []
     for part in _CLAUSE.split(str(text or "").replace("’", "'")):
         words = tuple(re.findall(r"[a-z0-9]+(?:'[a-z]+)?", part.lower()))
         if words:
-            out.append((words, anchors(part), part.rstrip().endswith("?")))
+            anc, own = _anchored(part)
+            rest = frozenset(w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w
+                             for w in _content(words) - own)
+            out.append((words, anc, part.rstrip().endswith("?"), rest))
     return out
 
 
@@ -172,7 +189,7 @@ def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tup
     first: dict[tuple, tuple[int, str]] = {}   # normalized sentence: (first id, its words)
     last: dict[tuple, float] = {}              # normalized sentence: when it was last said
     recent: list[tuple[frozenset, tuple]] = []
-    by_anchor: dict[str, list[tuple[int, float, frozenset, str]]] = {}   # anchor: (id, ts, content, clause)
+    by_anchor: dict[str, list[tuple]] = {}   # anchor: (id, ts, non-anchor content, clause, anchors)
     out, i = {}, 0
     for m in new:
         mid = int(m["id"])
@@ -182,10 +199,10 @@ def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tup
                     first[s] = (int(rows[i]["id"]), " ".join(s))
                     recent.append((frozenset(s), s))
                 last[s] = float(rows[i]["ts"] or 0)
-            for words, anc, ask in clauses(rows[i]["text"]):
+            for words, anc, ask, rest in clauses(rows[i]["text"]):
                 for a in anc if not ask else ():
                     got = by_anchor.setdefault(a, [])
-                    got.append((int(rows[i]["id"]), float(rows[i]["ts"] or 0), _content(words), " ".join(words)))
+                    got.append((int(rows[i]["id"]), float(rows[i]["ts"] or 0), rest, " ".join(words), anc))
                     del got[:-REPEAT_NEAR]
             i += 1
         recent = recent[-REPEAT_NEAR:]
@@ -200,13 +217,13 @@ def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tup
                 break
         if mid in out:
             continue
-        for words, anc, ask in clauses(m.get("text") or ""):
-            said = _content(words)
-            if ask or not anc or len(said) < 2:
+        for words, anc, ask, said in clauses(m.get("text") or ""):
+            if ask or not anc or len(_content(words)) < 2:
                 continue
-            cands = sorted({c for a in anc for c in by_anchor.get(a, ())})   # oldest first
-            hit = next((c for c in cands if len(said & c[2]) >= ANCHOR_SHARE * len(said) and ts - c[1] > RESEND_S),
-                       None)
+            cands = sorted({c for a in anc for c in by_anchor.get(a, ())},
+                           key=lambda c: (c[0], c[3]))   # oldest first
+            hit = next((c for c in cands if len(said & c[2]) >= ANCHOR_SHARE * len(said) and ts - c[1] > RESEND_S
+                        and max(len(said & c[2]), len(anc & c[4])) >= ANCHOR_MIN), None)
             if hit:
                 out[mid] = (hit[0], hit[3])
                 break
@@ -352,14 +369,21 @@ def class_fix(db: DB, actions: list, summary: str, mid: int, since: float, why: 
                      "ORDER BY id LIMIT 1", (since, *titles))
         if row:
             return f"#{row['id']}"
+    if re.search(rf"\bcorrection\s*#?{int(mid)}{_NOT}", summary or "", re.I):
+        return "not"
     if re.search(rf"\bcorrection\s*#?{int(mid)}\b", summary or "", re.I):
         return "reason"
     return ""
 
 
+def _specific(cls) -> set:
+    return {a for a in cls or () if a.startswith(CLASS_ANCHORS)}
+
+
 def _class(why: str, text: str) -> list[str]:
-    """A correction's class: its message's anchors, and for a repeat the message it repeats."""
-    out = set(anchors(text))
+    """A correction's class: its message's task ids and config keys, and for a repeat the message it
+    repeats (CLASS_ANCHORS); a model family or effort level alone names no class."""
+    out = _specific(anchors(text))
     if m := re.fullmatch(r"repeats #(\d+)", str(why or "")):
         out.add(f"msg#{m.group(1)}")
     return sorted(out)
@@ -367,13 +391,16 @@ def _class(why: str, text: str) -> list[str]:
 
 def _refuse(recs: list[dict], rec: dict, fix: str, now: float) -> str:
     """`fix` for `rec`, or '' when it is a reason ('none') and another correction of the same class
-    already got one within REFUSE_S: then `rec` is marked refused with that one's id."""
+    already got one within REFUSE_S: then `rec` is marked refused with that one's id. A refused one
+    stays refused on 'not a correction'; a class fix clears it."""
+    if fix == "not" and rec.get("refused"):
+        return ""
     if fix != "reason":
         if fix:
             rec.pop("refused", None)
         return fix
-    cls = set(rec.get("class") or [])
-    prior = next((r for r in recs if r is not rec and r.get("fix") == "reason" and cls & set(r.get("class") or [])
+    cls = _specific(rec.get("class"))   # records from before CLASS_ANCHORS may hold generic anchors
+    prior = next((r for r in recs if r is not rec and r.get("fix") == "reason" and cls & _specific(r.get("class"))
                   and now - float(r.get("ts") or 0) <= REFUSE_S), None) if cls else None
     if not prior:
         return fix
@@ -427,7 +454,8 @@ def digest_lines(db: DB, now: float | None = None) -> list[str]:
         one = plain[0]["msg"] if len(plain) == 1 else "<id>"
         out.append(f"- correction without a class fix: user message{'s' if len(plain) > 1 else ''} {ids} pointed "
                    "out a miss and got no `harness` task or `upstream:` note | add a `harness` task for the detector, "
-                   f"rule or default that would have caught it, or say `correction #{one}: <why not>` in summary")
+                   f"rule or default that would have caught it, or say `correction #{one}: <why not>` in summary "
+                   f"(`correction #{one}: not a correction` for a new instruction)")
     refused = [r for r in got if r.get("refused")]
     if refused:
         out.append("- correction 'none' refused: " + ", ".join(f"#{r['msg']} (same class as {r['refused']})"
@@ -447,7 +475,8 @@ def audit_line(db: DB, since: float) -> str:
         fix = r.get("fix") or ""
         if not fix and r.get("refused"):
             return f"none (refused: same class as {r['refused']})"
-        return f"class fix {fix}" if fix.startswith("#") else "none (reason given)" if fix == "reason" else "none"
+        return f"class fix {fix}" if fix.startswith("#") else "none (reason given)" if fix == "reason" \
+            else "none (not a correction)" if fix == "not" else "none"
     return (f"corrections from the user or a chat: {len(got)}, {sum(str(r.get('fix') or '').startswith('#') for r in got)} "
             "with a class fix: " + "; ".join(f"#{r['msg']} ({r.get('why')}) {fixed(r)}" for r in got[:8])
             + (f"; and {len(got) - 8} more" if len(got) > 8 else "") + _repeat_clause(db, since))

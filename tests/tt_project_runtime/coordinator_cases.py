@@ -16418,12 +16418,12 @@ def test_a_short_instruction_repeating_an_earlier_one_on_shared_anchors_is_flagg
 
 
 def test_a_second_none_for_the_same_class_within_a_week_is_refused_until_a_class_fix(env):
-    """A correction answered with a reason ('none') twice for one class (a shared anchor) is refused:
+    """A correction answered with a reason ('none') twice for one class (a shared task id) is refused:
     it keeps its Course check line until the turn records a class fix or adds a harness task."""
     from ttp import correction
     p = make(env)
     now = time.time() - 1000   # before the harness task below is created
-    first = p.db.post("in", "Why didn't the review run at max effort?", chat="c1")
+    first = p.db.post("in", "Why didn't the review of #4100 run at max effort?", chat="c1")
     correction.settle(p.db, {"corrections": {str(first): "phrase 'why didn't'"}}, [],
                       f"correction #{first}: a one-off pin", now - 1, now)
     other = p.db.post("in", "Nobody noticed the watcher died", chat="c1")   # another class: its reason stands
@@ -16448,6 +16448,56 @@ def test_a_second_none_for_the_same_class_within_a_week_is_refused_until_a_class
                       "handled", now + 4, now + 5)
     rec = {r["msg"]: r for r in p.db.kv(correction.KEY)}[again]
     assert rec["fix"] == f"#{tid}" and "refused" not in rec
+
+
+def test_an_anchored_clause_repeats_only_on_words_beyond_its_anchors_and_a_dotted_version_stays_one_sentence(env):
+    """Review #4241: a new instruction about the same task or model shares only the anchor, so it is no
+    repeat; 'opus 5.5' does not end a sentence, so #1053's exact repeat of a sentence of #1051 is caught."""
+    from ttp import correction
+    p = make(env)
+    for text in ("Review #4151", "Close #4151 now", "Use opus for the docs"):
+        _said(p, text, days=1)
+    plan = _said(p, "Benchmark sonnet 4.5 and haiku at low effort. use osus 5.5 low for ref. Report the cost "
+                    "per cell.", days=1)
+    later = [_said(p, t) for t in ("Push #4151", "Reopen #4151", "Use opus for benchmarks", "also benchmark sonnet")]
+    assert correction.flag(p.db, p.config(), _rows(p, *later)) == {}
+    again = _said(p, "use osus 5.5 low for ref.", days=-0.01)
+    assert correction.repeats(p.db, _rows(p, again), time.time() + 3600) == {
+        again: (plan, "use osus 5 5 low for ref")}
+
+
+def test_a_refused_none_needs_the_same_first_message_task_or_key_and_not_a_correction_never_counts(env):
+    """Review #4241: corrections sharing only a model family or effort level are unrelated and keep their
+    reasons; the same repeated first message, task id or config key refuses the second; a 'not a
+    correction' answer is recorded as such and is never the prior 'none'."""
+    from ttp import correction
+    p = make(env)
+    now = time.time()
+
+    def settle(text, why, line="a one-off", at=0.0):
+        mid = p.db.post("in", text, chat="c1")
+        correction.settle(p.db, {"corrections": {str(mid): why}}, [], f"correction #{mid}: {line}", now + at - 1,
+                          now + at)
+        return mid
+
+    quad = settle("Why didn't Quad keep to its queue limits at low effort on haiku?", "phrase 'why didn't'")
+    bench = settle("Why didn't the benchmark run sonnet at low effort?", "phrase 'why didn't'", at=1)
+    also = settle("Why didn't you also benchmark sonnet?", "phrase 'why didn't'", at=2)
+    first = _said(p, "Use the queue wrapper for checks.", days=2)
+    r1 = settle("Use the queue wrapper for checks!", f"repeats #{first}", at=3)
+    r2 = settle("Use the queue wrapper for every check", f"repeats #{first}", at=4)
+    k1 = settle("You missed checks.wrap_cmd again", "phrase 'you missed'", at=5)
+    k2 = settle("Why didn't checks.wrap_cmd apply?", "phrase 'why didn't'", at=6)
+    n1 = settle("Why didn't #4300 use budget.daily_usd?", "phrase 'why didn't'", "not a correction, a new ask", at=7)
+    n2 = settle("You missed budget.daily_usd on #4300", "phrase 'you missed'", at=8)
+    recs = {r["msg"]: r for r in p.db.kv(correction.KEY)}
+    assert [recs[m]["fix"] for m in (quad, bench, also, r1, k1, n1, n2)] == \
+        ["reason", "reason", "reason", "reason", "reason", "not", "reason"]
+    assert (recs[r2]["fix"], recs[r2]["refused"], recs[k2]["fix"], recs[k2]["refused"]) == ("", f"#{r1}", "", f"#{k1}")
+    assert "none (not a correction)" in correction.audit_line(p.db, now - 60)
+    # A refused one stays refused when it is then called 'not a correction'.
+    correction.settle(p.db, {}, [], f"correction #{k2}: not a correction", now + 9, now + 10)
+    assert {r["msg"]: r for r in p.db.kv(correction.KEY)}[k2]["refused"] == f"#{k1}"
 
 
 def test_result_rows_naming_a_model_or_effort_carry_what_the_run_used_and_a_mismatch_is_flagged(env):
