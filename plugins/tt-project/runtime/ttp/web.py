@@ -19,7 +19,7 @@ from . import globalcap as gcap
 from . import coordinator as coord
 from . import credits, heal, identity, lockprobe, mcpgap, obligations, outagetask, projpause, pushq, release, responsibilities, route, sweep, timefmt, urgent, waits
 from . import schedule as sched
-from . import pauseends, startgate, sweepskip, timefmt, trend, upstream
+from . import pauseends, selfreview, startgate, sweepskip, timefmt, trend, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
                      SLACK_ERROR_KEY, WAIT_KEYS, heartbeat, idle_wake)
 from .alerts import cleared  # noqa: F401  (readers import it from here)
@@ -460,6 +460,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "runtime": runtime_receipt(p, db, alive, now, tz),
         "schedules_broken": sched.broken_line(db),
         "schedules_waiting": sched.waiting_line(db),
+        "self_review": selfreview.line(db, now, cfg.get("created")),
         "health": heal.line(db, now),
         "coverage": responsibilities.line(db),
         "drivers_stalled": drivers_stalled(p, cfg, now, tz),
@@ -807,6 +808,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(409, {"error": str(e)})
                 if "enabled" in body:
                     sched.set_enabled(db, name, bool(body["enabled"]), home=timefmt.home(own))
+                    selfreview.record_off(db, name, bool(body["enabled"]), "the web app", True)
                 if "budget_usd_day" in body:
                     v = body["budget_usd_day"]
                     db.x("UPDATE schedules SET budget_usd_day=? WHERE name=?", (None if v in (None, "") else float(v), name))

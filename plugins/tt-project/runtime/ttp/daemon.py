@@ -50,6 +50,7 @@ from . import urgent
 from . import replymsg
 from . import msgparts
 from . import awake
+from . import selfreview
 from . import cells
 from . import budget as bud
 from . import budgetkind
@@ -1299,7 +1300,7 @@ class Daemon:
         core = self.cfg.get("core_provider") or "claude"
         core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
         cycle = self._run_step(lambda: self.host_cycle_held(now), "host_cycle_held", default=False)
-        for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
+        for step in (self.run_schedules, self.check_self_review, self.poll_slack, self.check_resource_trouble, self.read_upstream,
                      self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_checks_wait, self.check_cap_wait, self.check_progress, self.check_churn, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
@@ -5416,7 +5417,10 @@ class Daemon:
             db.x("UPDATE issues SET status='fixed', closed=?, cleared_why=?, history=? WHERE id=?",
                  (now, SCHEDULE_BUDGET_CLEARED, json.dumps(history), r["id"]))
 
-    def _schedule_llm(self, s: dict, payload: dict) -> str:
+    def _schedule_llm(self, s: dict, payload: dict, force: bool = False) -> str:
+        """Queue one run of llm schedule `s`, or say why not. `force` (an overdue self-review,
+        check_self_review) passes the debounce, idle guard and precheck and queues at priority 2;
+        the budget gates still hold it."""
         db = self.p.db
         core = self.cfg.get("core_provider", "claude")
         gate = self.gates.get(core)
@@ -5431,16 +5435,16 @@ class Daemon:
                   "('done','failed','cancelled')", (json.dumps([s["name"]]),)):
             return f"{held}: previous run still open"
         duplicate, evidence, owed = sched.debounce_gate(db, s["name"], payload)
-        if duplicate:
+        if duplicate and not force:
             return duplicate
         # A review of a period with no work and no user message would report that nothing moved.
         # The built-in daily review opts in by name, so projects created before the flag get it too.
         # A changed outcome (a task outcome moved with no run, e.g. an owner cancelled it) or this
         # schedule's own failed or cancelled run still owes a run: the idle guard sees neither.
-        if (not owed and payload.get("skip_if_idle", s["name"] == "daily-review") and s["last_run"]
+        if (not owed and not force and payload.get("skip_if_idle", s["name"] == "daily-review") and s["last_run"]
                 and not self._active_since(float(s["last_run"]), s["name"])):
             return "skipped: nothing happened since the last run"
-        skip = self._schedule_precheck(s, payload)
+        skip = "" if force else self._schedule_precheck(s, payload)
         if skip:
             return skip
         spec = payload.get("spec") or s["description"]
@@ -5549,12 +5553,49 @@ class Daemon:
         with db.tx():   # the evidence is the state at enqueue: what changes during the run stays new
             tid = db.add_task(f"[{s['name']}] {s['description'][:120] or 'recurring task'}", spec,
                               kind=payload.get("kind", "work"), tier=payload.get("tier", "standard"),
-                              priority=int(payload.get("priority", 4)),
+                              priority=2 if force else int(payload.get("priority", 4)),
                               budget_usd=sched.run_budget(self.cfg, s, payload, spent),
                               origin="schedule", labels=[s["name"]])
             if evidence is not None:
                 sched.record_evidence(db, s["name"], tid, evidence)
         return "queued"
+
+    def check_self_review(self, every_s: float = 60) -> None:
+        """Model-free check that the daily self-review still happens (selfreview.tick): restores a
+        missing or silently disabled schedule, and when no review receipt is newer than 26 h while work
+        happened, queues a run now and raises one 'daily review overdue: <cause>' event."""
+        now = time.time()
+        if now - getattr(self, "_self_review_checked", 0.0) < every_s or selfreview.NAME in self._sched_runs:
+            return
+        self._self_review_checked = now
+        out = selfreview.tick(self.p, now, self.cfg.get("created"), self._self_review_held, self._force_self_review)
+        if out.get("repaired"):
+            log(self.p, f"self-review: {out['repaired']}")
+        if out.get("raised"):
+            log(self.p, f"self-review overdue: {out['cause']}")
+
+    def _self_review_held(self, t: dict) -> str:
+        """What holds queued self-review run `t` from starting, as far as the gates say."""
+        prov = self.cfg.get("core_provider") or "claude"
+        gate = self.gates.get(prov)
+        if t["status"] == "queued":
+            if self._logged_out(prov):
+                return f"{prov} is logged out"
+            if self.net_held(prov):
+                return f"{prov}'s API host does not resolve"
+            if gate and not gate.allow_new_work:
+                return f"the budget gate ({gate.level}) allows no new work"
+            if gate and not gate.allow_optional:
+                return f"the budget gate ({gate.level}) holds scheduled work"
+        return ""
+
+    def _force_self_review(self, row: dict) -> str:
+        try:
+            status = self._schedule_llm(row, json.loads(row["payload"] or "{}"), force=True)
+        except Exception as e:
+            status = f"error: {type(e).__name__}: {e}"[:200]
+        self._schedule_ran(row, status, None)
+        return status
 
     def _schedule_precheck(self, s: dict, payload: dict) -> str:
         """An llm schedule's model-free `precheck` (shell, run from the project root, `precheck_timeout_s`

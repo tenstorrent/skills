@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, cells, chaincap, chainprio, chatset, checkspill, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, relay, responsibilities, restriction_audit, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, throughmute, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, cells, chaincap, chainprio, chatset, checkspill, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, relay, responsibilities, restriction_audit, reviewcap, selfreview, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, throughmute, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -2598,6 +2598,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                              a["budget_usd"] if "budget_usd" in a else (old["budget_usd_day"] if old else None),
                              (a.get("text") or "") if "text" in a else ((old["description"] or "") if old else ""),
                              payload, timefmt.home(p))
+                selfreview.record_off(db, a["name"], enabled, "the coordinator" + (" in a user turn" if user_turn else ""),
+                                      user_turn)
+                if a["name"] == selfreview.NAME and not enabled and not user_turn:
+                    notes.append(f"schedule_set {a['name']!r}: off outside a user turn, so the self-review check turns "
+                                 f"it back on; only the user's own word keeps it off")
                 sched.write_file(p, f"schedule {a['name']}: {'changed' if old else 'added'}")
                 if kind == "command" and enabled and a.get("heal"):
                     try:

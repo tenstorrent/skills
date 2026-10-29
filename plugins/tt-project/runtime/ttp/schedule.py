@@ -507,6 +507,11 @@ def sync_file(p: Any, force: bool = False) -> tuple[bool, str | None]:
             upsert(db, e["name"], e["kind"], e["every"], e.get("at") or None, e.get("enabled", True),
                    e.get("budget_usd_day"), e.get("description", ""), e.get("payload", {}), timefmt.home(p))
         names = [e["name"] for e in entries]
+        from . import selfreview   # a harness commit is the user's own record of the switch
+        for e in entries:
+            selfreview.record_off(db, e["name"], bool(e.get("enabled", True)), f"harness/{FILE}", True)
+        if selfreview.NAME not in names and db.one("SELECT name FROM schedules WHERE name=?", (selfreview.NAME,)):
+            selfreview.record_off(db, selfreview.NAME, None, f"harness/{FILE}", True)
         _end_mutes(db, [r["name"] for r in db.q("SELECT name FROM schedules") if r["name"] not in names], GONE,
                    timefmt.home(p))
         db.x(f"DELETE FROM schedules WHERE name NOT IN ({','.join('?' * len(names))})", names)

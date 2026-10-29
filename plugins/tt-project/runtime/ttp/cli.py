@@ -1431,6 +1431,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(h["schedules_broken"])
     if h.get("schedules_waiting"):
         lines.append(h["schedules_waiting"])
+    if h.get("self_review"):
+        lines.append(h["self_review"])
     if h.get("health"):
         lines.append(h["health"])
     if h.get("coverage"):
