@@ -2549,12 +2549,21 @@ def cmd_checks(a) -> None:
     checks_host = d.get("checks_host")   # where checks without a host run
     # The checks run at the top of the worktree being checked, as `ttp push` runs them, wherever in
     # it this was started: a repo-relative check started in a subdirectory would test the wrong place.
-    top = subprocess.run(["git", "-C", str(Path.cwd()), "rev-parse", "--show-toplevel"], capture_output=True,
+    # Which worktree that is, the line naming it and the stale-tree warning: checktree.
+    from . import checktree
+    where = getattr(a, "worktree", None) or str(Path.cwd())
+    if not Path(where).is_dir():
+        die(f"ttp checks: --worktree {where} is not a directory")
+    top = subprocess.run(["git", "-C", where, "rev-parse", "--show-toplevel"], capture_output=True,
                          text=True).stdout.strip()
-    git = ["git", "-C", top or str(Path.cwd())]
+    git = ["git", "-C", top or where]
     head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     if not top or not head:
-        die("ttp checks: run it in the change's git worktree")
+        die("ttp checks: run it in the change's git worktree (or pass --worktree <path>)")
+    print(checktree.line(head, top), flush=True)
+    if warn := checktree.warning(top, head, root=p.root if p else None, tip_ref=_checks_tip_ref(p, Path(top)),
+                                 callers=checktree.callers(Path.cwd(), run_dir)):
+        print(warn, flush=True)
     # The repo being checked picks its list (push.repo_checks): the harness repo never runs the code repo's.
     configured, source = push.repo_checks(d, Path(top), p)
     own = push.with_host(push.check_list(configured), checks_host)
@@ -2675,6 +2684,8 @@ def cmd_checks(a) -> None:
     with open(log, "a") as out:
         out.write(f"ttp checks: in {top} on {head[:12]}" + (" (purpose harness)" if purpose == "harness" else "")
                   + "\n")
+        if warn:
+            out.write(f"{warn}\n")
         for line in not_run:
             print(f"ttp checks: {line}")
             out.write(f"{line}\n")
@@ -3750,6 +3761,19 @@ def _checks_reexec(new: str, arrived: float | None, prio, spill: bool, tell, out
         tell(f"could not re-execute with runtime {new} ({e.strerror or e}): waiting on with {__version__}")
 
 
+def _checks_tip_ref(p: Project | None, top: Path) -> str:
+    """The push branch's local remote ref (refs/remotes/<remote>/<branch>) of `top`'s repo, or "" with
+    no project or push target."""
+    from . import push
+    if not p:
+        return ""
+    try:
+        remote, branch = push.target(p, top)
+    except ValueError:
+        return ""
+    return f"refs/remotes/{remote}/{branch}"
+
+
 def _checks_base(p: Project | None, top: Path, cmds: list) -> str:
     """What `ttp checks` compares `if_changed` scopes with: the push target as last fetched, or ""
     (no project, no push target or no copy of it here), and then those checks run."""
@@ -4072,7 +4096,7 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
     host-wide slot hand their place in the queue to this launch (_checks_place)."""
     from .push import pid_ns
     from .runner import boot_id, proc_start
-    from . import checkcap, checkdirs
+    from . import checkcap, checkdirs, checktree
     checkdirs.writable(str(run_dir))
     old = _read_checks_pid(run_dir)
     arrived = _checks_place(run_dir, old, env)
@@ -4125,7 +4149,8 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
                                      stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(guard.fileno(),))
         try:
             write_json(run_dir / CHECKS_PID, {"pid": child.pid, "started": proc_start(child.pid), "ts": time.time(),
-                                              "boot": boot_id(), "worktree": top, "head": head, "cmd": list(a.cmd),
+                                              "boot": boot_id(), "worktree": top, "head": head,
+                                              "branch": checktree.branch(top) if top else "", "cmd": list(a.cmd),
                                               "fresh": bool(a.fresh), "full": bool(getattr(a, "full", False)),
                                               "light": bool(getattr(a, "light", False)),
                                               **_harness_purpose(a), "req": req, "pidns": pid_ns(), "arrived": arrived,
@@ -4243,6 +4268,9 @@ def _checks_result(run_dir: Path) -> int:
         print(f"ttp checks: not started: {why}")
         return 0
     info = _read_checks_pid(run_dir)
+    if info.get("head") or info.get("worktree"):
+        from . import checktree
+        print(checktree.line(str(info.get("head") or ""), str(info.get("worktree") or ""), str(info.get("branch") or "")))
     if info and not rc_file.exists() and _checks_old_boot(info):
         # Checked before the namespace fallback: no process of an earlier boot still runs.
         durable_write(rc_file, "killed\n")
@@ -9203,6 +9231,8 @@ def main(argv: list[str] | None = None) -> None:
                    help="harness: qualify a harness-preparation head with the purpose harness (else the default "
                         "harness plan) and untagged checks; "
                         "candidate gates are not run and the pass never counts for a PR or a push")
+    s.add_argument("--worktree", metavar="PATH",
+                   help="check the git worktree containing PATH instead of the one containing the current directory")
     s.add_argument("--detach", action="store_true",
                    help="run them in a process of their own; print a retry_when that exits 0 once they finished or died")
     s.add_argument("--no-prestage", action="store_true",

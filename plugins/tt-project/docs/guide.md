@@ -1130,6 +1130,15 @@ queues behind routine work; nothing running is interrupted:
   (`--purpose harness`: only `push_checks`' purpose harness entries, else that default). Its pass is
   the harness repo's own, never a pass of the code checks; `checks.json` records the list's source in
   `checks_from`. `ttp config` refuses a malformed map.
+- Which tree `ttp checks` checks: the git worktree that contains `--worktree <path>` when given, else the
+  shell's current directory, at its top and on its HEAD. It never picks the task's worktree or the
+  project root by itself, so a shell left in the project root checks the project root. Every start
+  (also `--detach`) and the `--result` probe print `ttp checks: checking <head> (branch <b>) in worktree
+  <path>`. It prints a `WARNING` naming both paths, and does not refuse, in two cases: the checked tree
+  is not the one the caller is in (the shell's directory or the run's working directory) and it is the
+  project root or stale (its HEAD lacks the push branch's tip as last fetched), or the project root
+  itself is checked while stale. Check a candidate built in a separate worktree from that worktree,
+  and confirm the printed head is the candidate commit before you trust the result.
 - `ttp checks` refuses a worktree with uncommitted changes, except unstaged edits to tracked files the
   repository's ignore rules match: a log a running watcher appends to (add it to `.gitignore`) no longer
   forces a fresh worktree. The run lists them; a staged edit to such a file still blocks.
