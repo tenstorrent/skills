@@ -6081,21 +6081,34 @@ def test_a_waiting_exclusive_task_reserves_its_resource(env, tmp_path):
         while time.time() < deadline and d._resources_free(task, reserve=True):
             time.sleep(0.05)
         assert locks.reserved_by(mark) == f"task #{task['id']}", "a blocked exclusive task did not reserve"
-        # a new ttp lock command waits for the reserved task instead of taking the freed slot: it
-        # is still waiting once the holder has ended, and gives up without the slot. The timeout
-        # is generous: on a loaded host the test's own bookkeeping can take seconds, and the test
-        # ends the holder itself, which makes the waiter give up (75) well before it.
-        waiter = subprocess.Popen([sys.executable, str(TTP), "lock", "--timeout", "30", "board", "--", "true"],
-                                  env=run_env, stderr=subprocess.PIPE, text=True)
+        # a new ttp lock command waits for the reserved task instead of taking the freed slot. Its
+        # --timeout is far beyond the test's length (a loaded host's bookkeeping can take seconds);
+        # the test ends it itself, so it never runs that long.
+        ran = tmp_path / "waiter-ran"
+        waiter = subprocess.Popen([sys.executable, str(TTP), "lock", "--timeout", "600", "board", "--",
+                                   "touch", str(ran)], env=run_env, stderr=subprocess.PIPE, text=True)
         assert "waiting for board (reserved for" in waiter.stderr.readline()
     finally:
         release.touch()
         holder.wait(timeout=30)
-    assert d._resources_free(task), "the slot did not come free for the reserved task"
-    assert waiter.poll() is None, "ttp lock stopped waiting before the slot came free"
-    # The outer wait must outlast the waiter's own 30 s --timeout (which itself
-    # bounds how long the waiter can run), or a loaded host makes the two collide.
-    assert waiter.wait(timeout=60) == 75, "ttp lock took a slot the exclusive task had reserved"
+    try:
+        assert d._resources_free(task), "the slot did not come free for the reserved task"
+        assert waiter.poll() is None, "ttp lock stopped waiting before the slot came free"
+        # a second waiter started only now, with the slot free: its short timeout starts after the
+        # readiness steps, so it gives up (75) without the slot, and the first waiter has had that long
+        # to take the freed slot too
+        ran2 = tmp_path / "waiter2-ran"
+        assert subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "1", "board", "--", "touch", str(ran2)],
+                              env=run_env, capture_output=True, timeout=60).returncode == 75, \
+            "ttp lock took a slot the exclusive task had reserved"
+        assert not ran2.exists()
+        assert waiter.poll() is None and not ran.exists(), "ttp lock took a slot the exclusive task had reserved"
+    finally:
+        waiter.terminate()
+        waiter.wait(timeout=30)
+        waiter.stderr.close()
+    assert not ran.exists(), "ttp lock took a slot the exclusive task had reserved"
+    assert locks.reserved_by(mark) == f"task #{task['id']}", "the reservation did not outlive the waiters"
     # the task's own run takes the slot and drops the reservation; ttp lock then waits on the slot
     run_dir = tmp_path / "xrun"
     run_dir.mkdir()
