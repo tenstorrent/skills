@@ -46,6 +46,23 @@ def _submit(job: Callable[[], None]) -> None:
     _jobs.put(job)
 
 
+TIMEOUTS_BROKEN = 3   # a probe killed on its timeout this many runs in a row is broken; fewer are "not yet"
+_timeouts: dict[str, int] = {}   # probe -> its runs in a row killed on their timeout
+
+
+def timed_out(probe: str):
+    """The verdict of a run of `probe` killed on its timeout: 1 ("not yet": a stalled ssh or file
+    system passes) until it has timed out TIMEOUTS_BROKEN runs in a row, then "timeout" (broken: a
+    worker fixes the probe)."""
+    n = _timeouts[probe] = _timeouts.get(probe, 0) + 1
+    return "timeout" if n >= TIMEOUTS_BROKEN else 1
+
+
+def answered(probe: str) -> None:
+    """A run of `probe` ended by itself: its timeouts in a row start over."""
+    _timeouts.pop(probe, None)
+
+
 def kill(proc: Any) -> None:
     """End a probe's whole session (it runs in its own; ssh children too) and reap it, waiting at
     most KILL_WAIT_S: a process stuck in the kernel must not hold the tick either."""

@@ -279,7 +279,8 @@ def check_probe_unmet(p, probe: str, allow_met: bool = False, warn: Callable[[st
              f"(recorded, --allow-met-probe){tail}")
     elif rc == "timeout":
         warn(f"warning: the --until-probe did not finish within {ADD_PROBE_TIMEOUT_S}s (killed): recorded; the "
-             f"daemon gives it {ends.PROBE_TIMEOUT_S}s and reports it broken if it times out there too")
+             f"daemon gives it {ends.PROBE_TIMEOUT_S}s, counts a timeout as not yet and reports it broken if it "
+             f"keeps timing out there")
     elif isinstance(rc, str):
         warn(f"warning: the --until-probe {rc}: recorded; the daemon reports it broken until it runs")
     elif rc == 255:

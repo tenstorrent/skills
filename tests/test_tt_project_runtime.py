@@ -477,6 +477,8 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setenv("TTP_TEST_NO_NOTIFIER", "1")   # setup, upgrade and status never restart or test the account's own notifier
     monkeypatch.setenv("TTP_TEST_NO_JOURNAL", "1")   # a reboot record never reads this host's own journal (initiator.py)
     monkeypatch.setenv("TTP_TEST_CYCLE_NOTICES", str(tmp_path / "no-cycle-notice.json"))   # never the real /run notice (cyclenotice.py)
+    from ttp import probespawn
+    monkeypatch.setattr(probespawn, "_timeouts", {})   # a probe's timeouts in a row never carry over from another test
     # Tests may run inside a live run, detached checks, `ttp detach` (no in-run lock-wait cap) or `ttp lock`.
     # The outer checks' output directory and lifetime descriptor belong to that invocation.
     for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT", "TTP_DETACHED", "TTP_LOCKS_HELD", "TTP_PIDNS",
@@ -21611,13 +21613,19 @@ def test_a_timed_out_probe_is_broken(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dmod
     monkeypatch.setattr(dmod, "PROBE_TIMEOUT_S", 0.2)
+    from ttp import probespawn
     d = dmod.Daemon(p.base)
     tid = _due_waiting_task(p, "sleep 30")
-    d.probe_waiting()
-    time.sleep(0.4)
-    d.probe_waiting()          # kills it: timeout
-    p.db.update_task(tid, not_before=time.time() - 1)
-    d.probe_waiting()
+    for n in range(1, probespawn.TIMEOUTS_BROKEN + 1):   # timeouts in a row: "not yet", then broken
+        d.probe_waiting()
+        time.sleep(0.4)
+        d.probe_waiting()          # kills it: timeout
+        p.db.update_task(tid, not_before=time.time() - 1)
+        d.probe_waiting()
+        if n < probespawn.TIMEOUTS_BROKEN:
+            assert not _ready(p, tid) and d._probe_rc[tid][0] == 1, n
+            assert "counted as not yet" in d._probe_live[tid][0]
+            d._probed.pop(tid, None)
     assert _ready(p, tid) and json.loads(p.db.task(tid)["result"])["woke"] == "probe broken: timeout"
 
 
@@ -48094,7 +48102,7 @@ def test_machine_change_until_probe_timeout_is_broken_and_queued_once(env):
     c = ml.add_change("box-a", "paused", "resume", p.name, until_probe="sleep 30", now=now)
     logs = []
     probes = ml.Probes(p, log=logs.append)
-    for at in (now + ml.PROBE_GRACE_S, now + 1000):   # two rounds: each runs past the timeout and is killed
+    for at in (now + ml.PROBE_GRACE_S, now + 1000, now + 2000):   # each runs past the timeout and is killed: the third is broken
         probes._probed.clear()
         probes.tick(at)
         probes.tick(at + ends.PROBE_TIMEOUT_S + 1)

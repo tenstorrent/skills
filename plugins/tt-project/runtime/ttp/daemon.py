@@ -184,6 +184,12 @@ TICK_OVERRUN_S = 900
 # A tick with no progress this long gets its stacks written too: well before the watchdogs restart it
 # (WATCHDOG_S after the last progress they saw), so a step blocked in a call with no timeout leaves them.
 TICK_STALL_S = HEARTBEAT_STALE_S
+# A tick step's time budget. A step that loops over items (probe_waiting, probe_deferred, retire_ended)
+# stops at the first item past it and resumes there next tick, so message handling and worker starts
+# always run. A step that took longer raises one model-free tick_step_slow event naming the item that
+# held it longest, at most once per STEP_SLOW_EVERY_S per step.
+STEP_BUDGET_S = 60
+STEP_SLOW_EVERY_S = 3600
 WATCHER_MAX_S = HEARTBEAT_STALE_S - 60   # a command watcher's timeout_s is capped here, well below WATCHDOG_S
 # Schedule runs go on off the tick (schedrun); a tick waits this long for them, so quick ones are recorded
 # in the tick that started them and a slow one never holds it.
@@ -700,6 +706,12 @@ class Daemon:
         self._sched_runs: dict[str, schedrun.Run] = {}   # schedule name -> its run going on off the tick
         self._sched_swept = False   # process groups an earlier daemon's schedule runs left are killed
         self._step_name = ""     # the tick step running now
+        self._step_began: float | None = None   # monotonic: when the running tick step began (None: none runs)
+        self._step_mark = 0.0   # and when its current item did
+        self._step_holder, self._step_task = "", None   # the item it works on now (_step_over)
+        self._step_worst: tuple[float, str, int | None] = (0.0, "", None)   # its slowest item so far
+        self._step_cursor: dict[str, object] = {}   # step -> the last item done before its budget ran out
+        self._step_slow_said: dict[str, float] = {}   # step -> when its last tick_step_slow was raised
         self._overrun: dict | None = None   # the running or last tick that passed TICK_OVERRUN_S or stalled
         self._last_prune = 0.0
         self._last_leftovers = 0.0   # when prune_leftovers last ran
@@ -1076,6 +1088,8 @@ class Daemon:
         if not stalled and (same or now - began < TICK_OVERRUN_S):
             return None
         path, step, mins = self.p.state / STACKS_FILE, self._step_name, int((now - began) // 60)
+        if step and self._step_holder:
+            step = f"{step} (on {self._step_holder})"
         what = (f"tick stalled: no progress for {int((now - moved) // 60)} min, running {mins} min" if stalled
                 else f"tick overrun: running {mins} min")
         with self._stacks_file() as fh:
@@ -1129,6 +1143,8 @@ class Daemon:
         Returns the step's result, or `default` when it raised; `name` labels a step that is not a
         method of this daemon (a lambda)."""
         name = self._step_name = name or step.__name__
+        self._step_began = self._step_mark = time.monotonic()
+        self._step_holder, self._step_task, self._step_worst = "", None, (0.0, "", None)
         result = default
         try:
             result = step()
@@ -1147,8 +1163,52 @@ class Daemon:
                     self._clear_step(name)
                 except Exception:
                     log(self.p, "tick step clear error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+        try:
+            self._step_slow(name)
+        except Exception:
+            log(self.p, "tick step slow error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+        self._step_holder, self._step_began = "", None
         self._progress()
         return result
+
+    def _step_over(self, holder: str, task: int | None = None) -> bool:
+        """For a step that loops over items: name the item it starts on now (for tick_step_slow and the
+        overrun dump), and say whether the step has spent its STEP_BUDGET_S. The caller then stops
+        before this item, saves its place (_step_cursor) and resumes there next tick."""
+        t = time.monotonic()
+        self._step_charge(t)
+        self._step_holder, self._step_task, self._step_mark = holder, task, t
+        return self._step_began is not None and t - self._step_began >= STEP_BUDGET_S
+
+    def _step_charge(self, t: float) -> None:
+        if self._step_holder and t - self._step_mark > self._step_worst[0]:
+            self._step_worst = (t - self._step_mark, self._step_holder, self._step_task)
+
+    def _resume_order(self, step: str, rows: list[dict]) -> list[dict]:
+        """`rows` by id, from the first after where `step` stopped on its budget last tick, wrapping round."""
+        at = self._step_cursor.pop(step, 0)
+        rows = sorted(rows, key=lambda r: r["id"])
+        return [r for r in rows if r["id"] > at] + [r for r in rows if r["id"] <= at]
+
+    def _step_slow(self, name: str) -> None:
+        """One handled tick_step_slow event when step `name` ran past STEP_BUDGET_S, naming the item that
+        held it longest (or the one it was on), at most once per STEP_SLOW_EVERY_S per step."""
+        t = time.monotonic()
+        took = t - (t if self._step_began is None else self._step_began)
+        if took < STEP_BUDGET_S:
+            return
+        self._step_charge(t)
+        now = time.time()
+        if now - self._step_slow_said.get(name, 0.0) < STEP_SLOW_EVERY_S:
+            return
+        self._step_slow_said[name] = now
+        spent, holder, task = self._step_worst
+        held = (f"held longest by {holder} ({spent:.0f} s)" if holder
+                else "it names no item it works on")
+        text = f"Daemon tick step {name} took {took:.0f} s (budget {STEP_BUDGET_S} s): {held}."
+        log(self.p, text)
+        self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                    (now, "daemon", "tick_step_slow", "low", text[:500], "handled", task))
 
     def _alert_step(self, name: str, fails: int, since: float, err: Exception) -> None:
         db = self.p.db
@@ -1560,7 +1620,7 @@ class Daemon:
     def retire_ended(self) -> None:
         """Retire memory entries and charter sections whose end condition passed (see ends)."""
         try:
-            self._ends.tick()
+            self._ends.tick(over=lambda what: self._step_over(f"the end probe of {what}"))
         except Exception:
             log(self.p, "retiring ended instructions failed\n" + traceback.format_exc())
 
@@ -7968,6 +8028,7 @@ class Daemon:
         self._sweep_on_pass_notes(now)
         outs: dict[int, str] = {}   # one read of a probe run's output, whichever tasks share it
         lines: dict[int, str] = {}   # and its last line (waitheal.last_line)
+        timed: dict[int, object] = {}   # the verdict of a run killed on its timeout (probespawn.timed_out)
         done = []
         for tid, (proc, started, probe) in list(self._probes.items()):
             rc = proc.poll()
@@ -7978,7 +8039,15 @@ class Daemon:
                 _kill_group(proc)
             if id(proc) not in outs:
                 outs[id(proc)], lines[id(proc)] = self._probe_texts(proc)
-            done.append((tid, proc, probe, rc))
+                if rc is None:   # killed on its timeout: "not yet" unless it keeps timing out
+                    timed[id(proc)] = probespawn.timed_out(probe)
+                    if timed[id(proc)] == 1:
+                        lines[id(proc)] = f"timed out after {PROBE_TIMEOUT_S} s, counted as not yet"
+                        outs[id(proc)] = (outs[id(proc)] + "\n" + lines[id(proc)]).lstrip("\n")
+                        log(self.p, f"task #{tid}'s probe {lines[id(proc)]}: {probe[:200]}")
+                else:
+                    probespawn.answered(probe)
+            done.append((tid, proc, probe, timed.get(id(proc), rc)))
         # Every 255's hosts at once: in an outage the tick waits out one ssh timeout, not one per probe.
         self._check_hosts([h for _, proc, probe, rc in done if rc == netwait.UNREACHABLE_RC
                            for h in netwait.hosts(probe, outs[id(proc)])[:netwait.HOSTS_MAX]], now)
@@ -8016,7 +8085,11 @@ class Daemon:
             elif gated == "changed" and rc is not None and rc not in NOT_YET_RCS:
                 # A new answer after a skip that no branch above handles: wake now, not at the backoff.
                 self._wake_waiting(task, f"its probe's answer changed (exit {rc})", now)
-        for t in db.q("SELECT * FROM tasks WHERE status='queued' AND not_before IS NOT NULL"):
+        rows = self._resume_order("probe_waiting", db.q("SELECT * FROM tasks WHERE status='queued' AND not_before IS NOT NULL"))
+        for i, t in enumerate(rows):
+            if self._step_over(f"task #{t['id']}'s retry_when probe", t["id"]) and i:
+                self._step_cursor["probe_waiting"] = rows[i - 1]["id"]   # the rest go first next tick
+                break
             prev = load_result(t["result"])
             probe = prev.get("retry_when")
             if prev.get("status") != "waiting" or not isinstance(probe, str) or not probe.strip() \
@@ -8056,7 +8129,11 @@ class Daemon:
         for tid in [k for k in self._start_rc if k not in ids]:
             del self._start_rc[tid]   # started, cancelled or no longer deferred
         startgate.forget(db, keep=ids)
-        for t in deferred:
+        order = self._resume_order("probe_deferred", deferred)
+        for i, t in enumerate(order):
+            if self._step_over(f"task #{t['id']}'s start_when probe", t["id"]) and i:
+                self._step_cursor["probe_deferred"] = order[i - 1]["id"]   # the rest go first next tick
+                break
             d = deferral(t)
             if not d.get("when") or (t["not_before"] or 0) > now:
                 continue

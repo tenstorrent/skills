@@ -426,16 +426,28 @@ class Ends:
         self._procs: dict[str, tuple[subprocess.Popen, float, str]] = {}
         self._errs: dict[int, Any] = {}   # id(proc) -> its stderr file
         self._probed: dict[str, float] = {}
+        self._resume: str | None = None   # the last entry done when a pass stopped on its time budget
+        self._carry: dict = {}   # and the verdicts read for the entries after it
 
-    def tick(self, now: float | None = None) -> list[str]:
-        """Returns what was retired this time, as lines."""
+    def tick(self, now: float | None = None, over=None) -> list[str]:
+        """Returns what was retired this time, as lines. `over(what)`, asked before each entry, says
+        the caller's time budget is spent: the pass stops there (after at least one entry) and the
+        next tick resumes after the last one done, with the verdicts already read."""
         now = time.time() if now is None else now
-        verdicts = self._reap(now)
-        if now - self._checked < CHECK_EVERY_S and not verdicts:
+        verdicts, self._carry = {**self._carry, **self._reap(now)}, {}
+        if now - self._checked < CHECK_EVERY_S and not verdicts and self._resume is None:
             return []
         self._checked = now
         retired, broken = [], dict(self.p.db.kv(BROKEN_KEY) or {})
-        for item in temporaries(self.p):
+        items, at = temporaries(self.p), self._resume
+        self._resume = None
+        cut = next((n + 1 for n, x in enumerate(items) if x["key"] == at), 0)
+        items = items[cut:] + items[:cut]
+        for n, item in enumerate(items):
+            if over is not None and over(item["what"]) and n:
+                self._resume = items[n - 1]["key"]
+                self._carry = {x["key"]: verdicts[x["key"]] for x in items[n:] if x["key"] in verdicts}
+                break
             end, key = item["end"], item["key"]
             rc = verdicts.get(key, (None, "", "")) if not always_succeeds(end.get("probe") or "") else (None, "", "")
             why = ""
@@ -460,6 +472,8 @@ class Ends:
             if end.get("probe") and rc[1] == end["probe"] and rc[0] is not None:
                 if rc[0] in NOT_YET_RCS:
                     broken.pop(key, None)
+                    if str(rc[2]).startswith("timed out"):
+                        self.log(f"end probe of {item['what']} {rc[2]}"[:400])
                 else:
                     code = rc[0] if isinstance(rc[0], str) else f"exit {rc[0]}"
                     broken[key] = f"{code}: {rc[2]}" if rc[2] else code   # with its stderr tail
@@ -580,7 +594,8 @@ def _confirm(probe: str, err: str, p: Project | None) -> Future:
 def reap_probes(procs: dict, errs: dict[int, Any], now: float,
                 p: Project | None = None) -> dict[str, tuple[Any, str, str]]:
     """{key: (exit code or "timeout", probe, stderr tail)} of the probes in `procs` that ended or
-    ran past PROBE_TIMEOUT_S (killed); the rest keep running. A 255 is "host unreachable" only once
+    ran past PROBE_TIMEOUT_S (killed: 1, "not yet", until it timed out probespawn.TIMEOUTS_BROKEN runs
+    in a row, then "timeout"); the rest keep running. A 255 is "host unreachable" only once
     netwait.confirm finds every host the probe names silent (the key stays in `procs` meanwhile);
     otherwise its verdict is why it is broken (a string), never "not yet"."""
     out = {}
@@ -601,10 +616,16 @@ def reap_probes(procs: dict, errs: dict[int, Any], now: float,
         if rc is None:
             _kill(proc)
         err = _err_tail(errs, proc)
+        if rc is None:   # killed on its timeout: "not yet" unless it keeps timing out (probespawn.timed_out)
+            rc = probespawn.timed_out(probe)
+            if rc == 1:
+                err = f"timed out after {PROBE_TIMEOUT_S} s, counted as not yet" + (f": {err}" if err else "")
+        else:
+            probespawn.answered(probe)
         if rc == netwait.UNREACHABLE_RC:
             procs[key] = (_Confirming(_confirm(probe, err, p), err), started, probe)
             continue
-        out[key] = ("timeout" if rc is None else rc, probe, err)
+        out[key] = (rc, probe, err)
     return out
 
 

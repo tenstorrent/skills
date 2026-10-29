@@ -1,0 +1,157 @@
+# Tick-step tests of tests/test_tt_project_runtime.py, which runs this file in its own namespace
+# (see _include_cases there): helpers, fixtures and imports come from that file, and pytest collects
+# these tests under its name. Add new tests of a tick step's time budget, its tick_step_slow event and
+# probes started off the tick (probespawn) here.
+from __future__ import annotations
+
+
+def _stalled_tmp(monkeypatch):
+    """Every probe's output file open blocks until the returned event is set (a stalled /tmp)."""
+    from ttp import probespawn
+    gate, real = threading.Event(), probespawn.tempfile.TemporaryFile
+
+    def stall(*a, **k):
+        gate.wait(_load_scaled(30))
+        return real(*a, **k)
+    monkeypatch.setattr(probespawn.tempfile, "TemporaryFile", stall)
+    return gate
+
+
+def _end_probe_entry(p, probe, text="Leave the shared queue alone.", turn=5):
+    from ttp import coordinator as coord
+    act = {"type": "charter_update", "section": "Policies", "text": text,
+           "until": "the shared queue is drained", "until_probe": probe}
+    assert coord.apply(p, [act], turn=turn) == []
+
+
+def test_a_stalled_probe_start_never_holds_probe_waiting(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, "exit 1")
+    gate = _stalled_tmp(monkeypatch)
+    try:
+        t0 = time.monotonic()
+        d.probe_waiting()
+        d.probe_waiting()
+        assert time.monotonic() - t0 < 5, "the tick waited on the stalled open"
+        assert tid in d._probes and d._probes[tid][0].poll() is None
+    finally:
+        gate.set()
+    d._probes[tid][0].wait(_load_scaled(30))
+    d.probe_waiting()
+    assert d._probe_rc[tid][0] == 1 and not _ready(p, tid), "the probe's own answer, once it ran"
+
+
+def test_a_stalled_end_probe_start_never_holds_retire_ended(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp import ends
+    _end_probe_entry(p, "exit 1")
+    d = dmod.Daemon(p.base)
+    gate = _stalled_tmp(monkeypatch)
+    try:
+        t0 = time.monotonic()
+        d._run_step(d.retire_ended)
+        d._run_step(d.retire_ended)
+        assert time.monotonic() - t0 < 5, "the tick waited on the stalled open"
+        [(proc, _, _)] = d._ends._procs.values()
+        assert proc.poll() is None
+    finally:
+        gate.set()
+    proc.wait(_load_scaled(30))
+    assert d._ends.tick(time.time() + 1) == [] and not p.db.kv(ends.BROKEN_KEY)
+    assert "Leave the shared queue alone." in p.charter_path.read_text()
+
+
+def test_a_timed_out_end_probe_is_not_yet_until_it_keeps_timing_out(env, monkeypatch):
+    p = make(env)
+    from ttp import ends, probespawn
+    monkeypatch.setattr(ends, "PROBE_TIMEOUT_S", 0.2)
+    _end_probe_entry(p, "sleep 30")
+    logs = []
+    e, now = ends.Ends(p, log=logs.append), time.time()
+    for n in range(1, probespawn.TIMEOUTS_BROKEN + 1):
+        at = now + n * (ends.PROBE_EVERY_S + 10)
+        e.tick(at)   # starts it
+        [(proc, _, _)] = e._procs.values()
+        assert proc.started.wait(_load_scaled(30))
+        t0 = time.monotonic()
+        assert e.tick(at + 1) == []   # past its timeout: killed
+        assert time.monotonic() - t0 < probespawn.KILL_WAIT_S + 2 and proc.poll() is not None
+        broken = p.db.kv(ends.BROKEN_KEY) or {}
+        if n < probespawn.TIMEOUTS_BROKEN:
+            assert not broken, n
+            assert "counted as not yet" in logs[-1], logs
+        else:
+            [why] = broken.values()
+            assert why.startswith("timeout"), broken
+    assert "Leave the shared queue alone." in p.charter_path.read_text()
+
+
+def test_a_probe_that_answers_starts_its_timeouts_over(env):
+    from ttp import probespawn
+    assert [probespawn.timed_out("x") for _ in range(probespawn.TIMEOUTS_BROKEN - 1)] == [1] * (probespawn.TIMEOUTS_BROKEN - 1)
+    probespawn.answered("x")
+    assert probespawn.timed_out("x") == 1 and probespawn.timed_out("y") == 1
+
+
+def test_probe_waiting_over_its_budget_stops_and_resumes_in_order_next_tick(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    tids = [_due_waiting_task(p, f"exit 1 # {n}") for n in range(3)]
+    d._run_step(d.probe_waiting)   # in budget: every due probe starts, by id
+    assert sorted(d._probes) == tids and "probe_waiting" not in d._step_cursor
+    for proc, _, _ in list(d._probes.values()):
+        proc.wait(_load_scaled(30))
+    d._run_step(d.probe_waiting)
+    assert {d._probe_rc[t][0] for t in tids} == {1}, "normal probe results are unchanged"
+    d._probed.clear()
+    monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0)   # spent at once: one item a tick
+    started = []
+    for _ in range(4):
+        before = set(d._probes)
+        d._run_step(d.probe_waiting)
+        started += sorted(set(d._probes) - before)
+        for proc, _, _ in list(d._probes.values()):
+            proc.wait(_load_scaled(30))
+    assert started[:3] == tids, started
+    assert all(not _ready(p, t) for t in tids)
+
+
+def test_retire_ended_over_its_budget_resumes_after_the_last_entry_done(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp import ends
+    for n in range(3):
+        _end_probe_entry(p, f"exit 1 # {n}", f"Leave shared queue {n} alone.", turn=5 + n)
+    d = dmod.Daemon(p.base)
+    seen = []
+    over = iter([False, False, True, False, False, False, False, False, False])
+    now = time.time()
+    d._ends.tick(now, over=lambda what: seen.append(what) or next(over))
+    assert len(seen) == 3 and d._ends._resume is not None
+    d._ends.tick(now + 1, over=lambda what: seen.append(what) or False)
+    assert seen[3] == seen[2], "it resumes at the entry it stopped before"
+
+
+def test_a_slow_tick_step_raises_one_tick_step_slow_naming_what_held_it(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, "exit 1")
+    monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0.05)
+
+    def step():
+        d._step_over(f"task #{tid}'s retry_when probe", tid)
+        time.sleep(0.1)
+    for _ in range(3):
+        d._run_step(step, "probe_waiting")
+    rows = p.db.q("SELECT * FROM events WHERE kind='tick_step_slow'")
+    assert len(rows) == 1, "once per step per hour"
+    [ev] = rows
+    assert ev["task"] == tid and ev["severity"] == "low" and ev["status"] == "handled"
+    assert "probe_waiting" in ev["text"] and f"task #{tid}'s retry_when probe" in ev["text"]
+    d._run_step(lambda: None, "fast")
+    assert len(p.db.q("SELECT * FROM events WHERE kind='tick_step_slow'")) == 1, "a fast step raises none"
