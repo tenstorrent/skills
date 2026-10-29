@@ -6296,6 +6296,11 @@ def test_worker_prompt_and_harness_skill_state_the_glx_reset_only_practice():
                 end = flat.find(". ", m.end())
                 sentence = flat[flat.rfind(". ", 0, m.start()) + 1:end if end >= 0 else None]
                 assert re.search(r"\bnever\b", sentence), (path, sentence)
+    worker = re.sub(r"\s+", " ", (PLUGIN / "template" / "prompts" / "worker.md").read_text())
+    for m in re.finditer(r"tt-smi -glx_reset", worker):
+        end = worker.find(". ", m.end())
+        sentence = worker[worker.rfind(". ", 0, m.start()) + 1:end if end >= 0 else None]
+        assert "Galaxy" in sentence, sentence
     skill = re.sub(r"\s+", " ", (SKILLS / "tt-project-harness" / "SKILL.md").read_text())
     for part in ("rescan the root ports and recount the chips by BDF and tray", "never `sudo -n true`",
                  "`sudo -n -l`", "never affects other hosts", "op 0x3 only", "are junk",
