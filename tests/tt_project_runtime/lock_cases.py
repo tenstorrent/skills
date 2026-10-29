@@ -884,3 +884,27 @@ def test_a_held_label_naming_a_kernel_thread_is_holder_unverifiable_and_its_run_
     assert "stale" not in note      # its task is not done
     p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
     assert locks._holder_note(bad, where=p).endswith(f"; stale: task #{tid} is done")
+
+
+def test_an_urgent_lock_waiter_goes_ahead_of_routine_ones_and_only_an_urgent_task_gets_the_mark(env, tmp_path):
+    """locks.my_turn (arrival order): a waiter at task priority 1 or better takes the next slot before
+    earlier routine waiters; cli._urgent_priority gives that mark only to an urgent task's waiter."""
+    from ttp import cli, locks
+    q = tmp_path / "q"
+    routine = locks.enqueue(q, "r", "routine", priority=3)
+    plain = locks.enqueue(q, "r", "no task")
+    hot = locks.enqueue(q, "r", "urgent", priority=1)
+    try:
+        assert locks.my_turn(q, "r", hot, 1) and not locks.my_turn(q, "r", routine, 1)
+        assert not locks.my_turn(q, "r", plain, 1)
+        assert locks.my_turn(q, "r", routine, 2) and not locks.my_turn(q, "r", plain, 2), "then arrival order"
+    finally:
+        for t in (routine, plain, hot):
+            locks.dequeue(t)
+    p = make(env)
+    a = p.db.add_task("routine", "s", kind="work", origin="user", priority=2)
+    b = p.db.add_task("urgent", "s\n  Urgent: the user asked twice", kind="work", origin="user", priority=3)
+    c = p.db.add_task("p1", "s", kind="work", origin="user", priority=1)
+    assert [cli._urgent_priority(p, str(t)) for t in (a, b, c)] == [None, 1, 1]
+    assert cli._urgent_priority(p, "") is None and cli._urgent_priority(p, "99999") is None
+    assert cli._urgent_priority(p, "#12") is None, "only a plain task id"

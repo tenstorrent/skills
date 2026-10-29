@@ -13540,3 +13540,25 @@ def test_a_push_claim_on_the_fork_head_is_confirmed_without_reading_its_default_
                                 _git_out(repo, "rev-parse", "HEAD"), {pushclaim.Budget.KEY: pushclaim.Budget(30)})
     assert out and out[0] == pushclaim.CONFIRMED, out
     assert not [a for a in ran if "--symref" in a], ran
+
+
+def test_an_approval_from_the_review_of_an_urgent_task_starts_its_batch_at_once(env, monkeypatch):
+    """The review is routine priority, but the task it reviews is urgent (an `urgent:` spec line): its
+    approval goes first and starts a batch while another review still runs; routine ones wait."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_s=900)
+    s.p.db.update_task(s.review, status="running")   # a review is still at work: approvals may wait for it
+    now = time.time()
+    routine = _pq_review(s)[1]
+    assert pushq.due(s.p, now)[0] == []
+    hot = s.p.db.add_task("time-sensitive fix", "Fix it.\nurgent: the user is waiting", kind="code",
+                          origin="coordinator", priority=3)
+    rid = s.p.db.add_task("Review of the fix", "r", kind="review", origin="daemon", priority=2, depends_on=[hot])
+    s.p.db.update_task(rid, status="pushing")
+    with s.p.db.tx():
+        [row] = pushq.approve(s.p, rid, None, {"entries": [{"branch": s.branch, "head": s.head}],
+                                               "target": "origin/proj"})
+    rows, why = pushq.due(s.p, now)
+    assert [r["id"] for r in rows] == [row, routine] and "an urgent review" in why, why
+    s.p.db.update_task(hot, spec="Fix it.")   # no longer urgent: it waits like the rest
+    assert pushq.due(s.p, now)[0] == []

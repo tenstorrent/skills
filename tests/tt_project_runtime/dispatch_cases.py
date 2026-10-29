@@ -921,3 +921,101 @@ def test_a_scalar_config_section_is_refused_never_kept_as_last_good_and_a_missin
     monkeypatch.setattr(integrity, "_head", lambda proj, name: b"")
     out = integrity.check_harness(p)
     assert p.config_path.read_text() == "{ not json" and "project.json is damaged and has no good copy" in out["bad"]
+
+
+def test_an_urgent_task_starts_first_and_takes_one_extra_slot_past_full_routine_work(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """The urgent lane (ttp/urgent.py): with every slot taken by routine work, one urgent task starts in
+    budget.urgent_extra_slots (default 1) beyond max_parallel_workers; a second waits; 0 turns it off."""
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
+    try:
+        r1 = p.db.add_task("routine one", "s", kind="work", tier="light", origin="user", priority=3)
+        r2 = p.db.add_task("routine two", "s", kind="work", tier="light", origin="user", priority=3)
+        d.dispatch()
+        assert _slot_tasks(p) == [r1, r2]
+        r3 = p.db.add_task("routine three", "s", kind="work", tier="light", origin="user", priority=2)
+        hot = p.db.add_task("time-sensitive fix", "Fix it.\nurgent: the user is waiting on it", kind="work",
+                            tier="light", origin="user", priority=3)
+        hot2 = p.db.add_task("another urgent fix", "s", kind="work", tier="light", origin="user", priority=1)
+        assert [t["id"] for t in p.db.ready_tasks()] == [hot2, hot, r3], "urgent first, by priority within"
+        d.cfg["budget"]["urgent_extra_slots"] = 0
+        d.dispatch()
+        assert _slot_tasks(p) == [r1, r2], "0 turns the extra slot off"
+        d.cfg["budget"]["urgent_extra_slots"] = 1
+        d.dispatch()
+        assert _slot_tasks(p) == [r1, r2, hot2], "one extra slot, for the first urgent task"
+        d.dispatch()
+        assert _slot_tasks(p) == [r1, r2, hot2], "a second urgent task waits past the extra slot"
+        settle(d)
+        d.dispatch()
+        assert _slot_tasks(p) == [hot, r3], "the spec-line urgent task before routine priority 2"
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_the_spend_gate_still_holds_an_urgent_task(env, monkeypatch, tmp_path, reap_tmp_processes):
+    """allow_new_work False, or a gate of no slots, holds an urgent task like any other: no extra slot."""
+    import dataclasses
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
+    try:
+        core = d.cfg.get("core_provider", "claude")
+        hot = p.db.add_task("urgent fix", "s", kind="work", tier="light", origin="user", priority=1)
+        gate = d.gates[core]
+        d.gates[core] = dataclasses.replace(gate, allow_new_work=False)
+        d.dispatch()
+        assert _slot_tasks(p) == [], "the spend gate let an urgent task start"
+        d.gates[core] = dataclasses.replace(gate, max_parallel=0)
+        d.dispatch()
+        assert _slot_tasks(p) == [], "a gate of no slots gave an urgent task the extra one"
+        d.gates[core] = gate
+        d.dispatch()
+        assert _slot_tasks(p) == [hot]
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_an_urgent_task_held_by_anything_raises_one_slot_wait_naming_the_hold_at_ten_minutes(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """coordinator.urgent_slot_wait_min (default 10): an urgent task held by the spend gate (not the
+    slots) raises one event naming that hold, counted from when it was queued; a routine one none."""
+    import dataclasses
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
+    try:
+        assert d.cfg["coordinator"]["urgent_slot_wait_min"] == 10
+        core = d.cfg.get("core_provider", "claude")
+        d.gates[core] = dataclasses.replace(d.gates[core], allow_new_work=False)
+        hot = p.db.add_task("urgent fix", "Fix it.\nurgent: a demo in an hour", kind="work", tier="light",
+                            origin="user", priority=3)
+        p.db.add_task("routine", "s", kind="work", tier="light", origin="user", priority=3)
+        start = time.time()
+
+        def check(minutes):
+            d._slot_wait_checked = start + minutes * 60 - 60
+            monkeypatch.setattr(time, "time", lambda: start + minutes * 60)
+            d.check_slot_wait()
+            return _slot_wait_events(p)
+
+        assert check(1) == [] and check(9) == []
+        (ev,) = check(10)
+        assert ev["task"] == hot and ev["severity"] == "normal"
+        assert "urgent: a demo in an hour" in ev["text"] and "held by the spend gate (no new work)" in ev["text"]
+        assert len(check(11)) == 1 and len(check(30)) == 1, "raised again for the same wait"
+    finally:
+        monkeypatch.undo()
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_an_urgent_task_reserves_an_exclusive_slot_over_an_obligation_owner(env, monkeypatch, tmp_path):
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
+    owner = p.db.add_task("owes a deliverable", "s", kind="work", tier="light", origin="user", priority=2)
+    _owe(p, owner, time.time() + 3600)
+    hot = p.db.add_task("urgent fix", "s\nurgent: the user asked twice", kind="work", tier="light", origin="user",
+                        priority=3)
+    rows = {t["id"]: t for t in p.db.ready_tasks()}
+    monkeypatch.setattr(d, "_slot_contenders", lambda now: ({"board": [rows[hot], rows[owner]]}, {}))
+    assert d._slot_reservers(time.time()) == {"board": hot}
+    monkeypatch.setattr(d, "_slot_contenders", lambda now: ({"board": [rows[owner], rows[hot]]}, {}))
+    assert d._slot_reservers(time.time()) == {}, "an owner first outranks no urgent contender"
