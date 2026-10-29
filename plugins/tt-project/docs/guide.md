@@ -1602,7 +1602,7 @@ is open raises one `cap_wait` event naming the key.
 | `delivery.push_batch_s` | 300 s, none after a clean batch | changes gathered into one push | convenience |
 | `delivery.push_batch_max` | 8 | most changes in one push batch (a full batch starts at once) | convenience |
 | `coordinator.burst_window_s` | 120 s (0: off) | high events after a turn high events woke, until one follow-up turn reads them all; never user messages, critical or safety-class events | convenience |
-| `retry_when` / `start_when` probe (`PROBE_EVERY_S`) | 180 s | a waiting or deferred task before its probe runs again | convenience |
+| `retry_when` / `start_when` probe (`PROBE_EVERY_S`) | 180 s, a `start_when` probe that keeps saying not-yet backs off to at most 600 s (`MAX_EVERY_S`) with the wait's length; `landed:#`, ttp landed, job-result, CI and ack-wait probes, and a `retry_when` probe, keep 180 s | a waiting or deferred task before its probe runs again | convenience |
 | auth re-probe (`AUTH_PROBE_S`) | 900 s | work for a logged-out provider with no login check, before one run checks it | safety (spend) |
 | `ttp lock` on a device | one command at a time | device commands | safety |
 | suite lock | one full suite per worktree | a second run of the same suite | safety |
