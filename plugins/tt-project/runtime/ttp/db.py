@@ -31,6 +31,9 @@ TIER_SOURCES = {
 PAUSED_RESOURCES_KEY = "paused_resources"   # kv: see DB.paused_resources
 PAUSE_BOOT_KEY = "pause_until_boot"   # kv: {"boot", "since"} of a `ttp pause --until-reboot`; see DB.set_paused
 SHARED_SEEN_KEY = "shared_pauses_seen"   # kv: {resource: pause} of the shared pauses this project acted on
+# kv keys that hold one object ({name: ...}): set_kv refuses any other value but None, and kv_dict
+# reads a stored scalar or list as empty. Modules register theirs at import (DICT_KV.add).
+DICT_KV: set[str] = set()
 WATCHER_ISSUES_MIGRATION = "watcher_issues_per_condition"   # meta: set once DB._migrate has run
 PROVENANCE_MIGRATION = "message_provenance"   # meta: set once inbound messages have their provenance
 PUSH_QUEUE_MIGRATION = "push_queue"   # meta: set once the push queue's tables exist (see pushq.py)
@@ -737,7 +740,17 @@ END""")
         r = self.one("SELECT value FROM kv WHERE key=?", (key,))
         return json.loads(r["value"]) if r else default
 
+    def kv_dict(self, key: str) -> tuple[dict, Any]:
+        """The object stored at `key` and, when it holds something else (a string, list or number),
+        that value as the second item (else None); a bad value reads as empty and never raises."""
+        value = self.kv(key)
+        if value is None or isinstance(value, dict):
+            return value or {}, None
+        return {}, value
+
     def set_kv(self, key: str, value: Any) -> None:
+        if key in DICT_KV and value is not None and not isinstance(value, dict):
+            raise ValueError(f"kv {key} holds an object of entries, not {json.dumps(value)[:60]}")
         self.x("INSERT INTO kv(key,value,ts) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET "
                "value=excluded.value, ts=excluded.ts", (key, json.dumps(value), time.time()))
 

@@ -845,6 +845,66 @@ def test_a_stored_over_cap_schedule_runs_at_the_cap_warns_once_and_its_timeout_n
     assert "`timeout_s` 500 is above" in (p.logs / "daemon.log").read_text()
 
 
+def test_the_over_cap_and_80_percent_warnings_keep_their_own_state_and_never_raise_on_each_other(env):
+    """Both warnings once shared one kv key: the over-cap text (a string) then raised AttributeError in
+    _schedule_cap_warn every tick. They now keep separate keys, so neither reads the other's entries."""
+    from ttp import daemon as dm
+    p = make(env)
+    d = dm.Daemon(p.base)
+    assert d.CAP_WARNED_KEY != dm.SCHEDULE_CAP_KEY
+    d._warn_over_cap({"name": "slow", "kind": "command"}, {"command": "x", "timeout_s": 500})
+    d._schedule_cap_warn()
+    assert "`timeout_s` 500" in p.db.kv(d.CAP_WARNED_KEY)["slow"]
+    assert not p.db.kv(dm.SCHEDULE_CAP_KEY) and not p.db.q("SELECT id FROM issues WHERE source=?",
+                                                          (dm.KV_SHAPE_SOURCE,))
+
+
+def test_schedule_cap_state_readers_treat_a_non_object_or_a_bad_entry_as_empty_and_observe_it_once(env):
+    """A str, list, int or null at either warning's kv key, or as one schedule's entry, reads as empty
+    (that entry dropped) and is rewritten as an object; each distinct bad value is logged and observed
+    once (low: an issue record that wakes nobody, keyed by the kv key), never every tick, and never raises."""
+    from ttp import daemon as dm
+    p = make(env)
+    d = dm.Daemon(p.base)
+    over = lambda: d._warn_over_cap({"name": "slow", "kind": "command"}, {"command": "x", "timeout_s": 500})
+    readers = ((dm.SCHEDULE_CAP_KEY, d._schedule_cap_warn, "dict"), (d.CAP_WARNED_KEY, over, "str"))
+    log_file = p.logs / "daemon.log"
+    shapes = lambda: [ln for ln in (log_file.read_text() if log_file.exists() else "").splitlines() if "Daemon state" in ln]
+    seen = lambda: p.db.one("SELECT COALESCE(SUM(count), 0) n FROM issues WHERE source=?", (dm.KV_SHAPE_SOURCE,))["n"]
+    for key, read, entry in readers:
+        bad_entry = 7 if entry == "str" else "`timeout_s` 500 is above its cap"
+        for value in ("a string", ["a", "list"], 5, None, {"other": bad_entry}):
+            p.db.x("INSERT INTO kv(key,value,ts) VALUES(?,?,0) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                   (key, json.dumps(value)))
+            before, issues = len(shapes()), seen()
+            read()
+            stored = p.db.kv(key)
+            assert isinstance(stored or {}, dict) and "other" not in (stored or {}), (key, value, stored)
+            if value is None:
+                assert len(shapes()) == before, "null is no value: nothing to report"
+                continue
+            assert len(shapes()) == before + 1 and key in shapes()[-1] and seen() == issues + 1, (key, value)
+            assert ("not an object" if not isinstance(value, dict) else f"not {entry}") in shapes()[-1]
+            p.db.x("UPDATE kv SET value=? WHERE key=?", (json.dumps(value), key))   # the same bad value again
+            read()
+            assert len(shapes()) == before + 1 and seen() == issues + 1, "a distinct bad value is observed once"
+    assert not p.db.q("SELECT id FROM events WHERE source=?", (dm.KV_SHAPE_SOURCE,)), "low: a record, no wake"
+    log_text = log_file.read_text()
+    assert "Traceback" not in log_text and log_text.count("Daemon state schedule_cap_warned holds \"a string\"") == 1
+
+
+def test_schedule_cap_state_writers_refuse_a_value_that_is_not_an_object_and_name_the_key(env):
+    from ttp import daemon as dm
+    p = make(env)
+    for key in (dm.SCHEDULE_CAP_KEY, dm.OVER_CAP_KEY):
+        for value in ("x", ["x"], 3, True):
+            with pytest.raises(ValueError, match=key):
+                p.db.set_kv(key, value)
+        p.db.set_kv(key, {"a": {"day": None, "at": 1}})
+        p.db.set_kv(key, None)
+    p.db.set_kv("some_other_key", "a string is fine elsewhere")
+
+
 def test_a_schedule_at_or_under_the_cap_times_out_as_before_with_no_warning(env, monkeypatch):
     from ttp import daemon as dm
     p = make(env)

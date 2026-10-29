@@ -148,6 +148,7 @@ from . import screen as scr
 from . import shared
 from . import shorttmp
 from . import worktree
+from . import db as dbmod
 from .db import (CHANGES_NEEDED, HARNESS_MERGED_KEY, NOT_ABANDONED_SQL, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, WORKSPACE_TRIES_KEY, BranchIndex, assigned_tier, continues_id, deferral,
                  dependency_ids, pin_of, dump_result, load_result, review_subject, reviewed_ids, task_outcome, unplanned_abrupt,
                  without_deferral)
@@ -173,6 +174,12 @@ SCHEDULE_BUDGET_SOURCE = "daemon:schedule-budget"
 SCHEDULE_BUDGET_CLEARED = "the schedule ran again or its spend is back under its daily cap"
 SCHEDULE_CAP_KEY = "schedule_cap_warned"   # kv: schedule -> {"day", "at"} of its last 80%-of-own-cap observation
 SCHEDULE_CAP_SOURCE = "daemon:schedule-cap"
+OVER_CAP_KEY = "schedule_over_cap_warned"   # kv: schedule -> the over-cap timeouts its daemon log line named
+# Both warnings once shared "schedule_cap_warned", so a schedule's over-cap text (a string) sat
+# where _schedule_cap_warn reads {"day", "at"} and raised AttributeError every tick.
+dbmod.DICT_KV.update({SCHEDULE_CAP_KEY, OVER_CAP_KEY})
+KV_SHAPE_SOURCE = "daemon:kv-shape"
+STEP_ERROR_LOG_S = 3600   # one tick step's same error is logged with its traceback at most once this often
 SCHEDULE_CAP_CLEARED = "a new budget day started"
 SCHEDULE_GAP_KEY = "schedule_gap_names"   # kv: schedule-gap issue key -> the schedules it names (sweep_schedule_gaps)
 SCHEDULE_GAP_CLEARED = "every schedule named ran again"
@@ -764,6 +771,8 @@ class Daemon:
         self._disk_free: float | None = None
         self._tick_errors = 0
         self._step_fails: dict[str, tuple[int, float]] = {}   # tick step -> (consecutive failures, first failed)
+        self._step_logged: dict[tuple[str, str], float] = {}   # (step, error's first line) -> when last logged
+        self._kv_bad_seen: set[tuple[str, str]] = set()   # (kv key, bad value) already observed (_kv_map)
         self.p.db.set_kv(STEP_FAILING_KEY, {})   # counts start again with this daemon (an episode then clears)
         self._probes: dict[int, tuple[subprocess.Popen, float, str]] = {}   # running: proc, started, probe
         self._probed: dict[int, float] = {}
@@ -1176,7 +1185,7 @@ class Daemon:
         try:
             result = step()
         except Exception as e:  # one bad step must not stop the rest of the tick
-            log(self.p, f"tick step {name} error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+            self._log_step_error(f"tick step {name}", e)
             n, since = self._step_fails.get(name, (0, time.time()))
             self._step_fails[name] = (n + 1, since)
             if n + 1 >= STEP_FAILS_ALERT:
@@ -1236,6 +1245,42 @@ class Daemon:
         log(self.p, text)
         self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                     (now, "daemon", "tick_step_slow", "low", text[:500], "handled", task))
+
+    def _log_step_error(self, label: str, err: Exception, limit: int = 2000) -> None:
+        """Log `label error:` and the traceback of `err` (call it in its except block) once per step and
+        distinct error per STEP_ERROR_LOG_S: a step failing every tick logs it once an hour, not each
+        tick; _step_fails still counts every failure and _alert_step alerts on them."""
+        first = (traceback.format_exception_only(type(err), err) or [type(err).__name__])[0].strip().splitlines()[0]
+        now, sig = time.time(), (label, first[:300])
+        if now - self._step_logged.get(sig, 0.0) < STEP_ERROR_LOG_S:
+            return
+        self._step_logged = {k: t for k, t in self._step_logged.items() if now - t < STEP_ERROR_LOG_S}
+        self._step_logged[sig] = now
+        log(self.p, f"{label} error: " + traceback.format_exc().replace("\n", " | ")[:limit])
+
+    def _kv_map(self, key: str, entry: type | None = None) -> tuple[dict, bool]:
+        """The object at kv `key` with its entries of type `entry` (any when None), and whether the stored
+        value had to be cleaned: a non-object (string, list, number) reads as empty and an entry of
+        another type is dropped, never raising. Each distinct bad value is logged and raised once as a
+        low observation naming the key and the type expected; the caller writes the cleaned object."""
+        value, bad = self.p.db.kv_dict(key)
+        dropped = {k: v for k, v in value.items() if entry is not None and not isinstance(v, entry)}
+        if bad is None and not dropped:
+            return value, False
+        what = (f"holds {json.dumps(bad, default=str)[:80]}, not an object" if bad is not None else
+                f"has entries that are not {entry.__name__}: "
+                + ", ".join(f"{k}={json.dumps(v, default=str)[:40]}" for k, v in list(dropped.items())[:5]))
+        seen = (key, what)
+        if seen not in self._kv_bad_seen:
+            self._kv_bad_seen.add(seen)
+            text = (f"Daemon state {key} {what}; it is read as empty (those entries dropped) and rewritten. "
+                    f"Nothing else is needed unless it comes back.")
+            log(self.p, text)
+            try:
+                self.observe(KV_SHAPE_SOURCE, text, "low", whole=True, key=f"kv-shape:{key}")
+            except Exception as e:
+                self._log_step_error(f"kv shape {key}", e)
+        return {k: v for k, v in value.items() if k not in dropped}, True
 
     def _alert_step(self, name: str, fails: int, since: float, err: Exception) -> None:
         db = self.p.db
@@ -4921,12 +4966,12 @@ class Daemon:
         due = [s for s in sched.due(db) if s["name"] not in runs]   # a running one: never two at once
         try:
             self._schedule_gaps(due)
-        except Exception:
-            log(self.p, "schedule gaps: " + traceback.format_exc().replace("\n", " | ")[:1000])
+        except Exception as e:
+            self._log_step_error("schedule gaps", e, 1000)
         try:
             self._schedule_cap_warn()
-        except Exception:
-            log(self.p, "schedule cap warning: " + traceback.format_exc().replace("\n", " | ")[:1000])
+        except Exception as e:
+            self._log_step_error("schedule cap warning", e, 1000)
         for s in due:
             payload = json.loads(s["payload"] or "{}")
             if s["kind"] in ("command", "watcher") or (s["kind"] == "llm" and _precheck_cmd(payload)):
@@ -4978,9 +5023,9 @@ class Daemon:
         gate = self.gates.get(self.cfg.get("core_provider", "claude"))
         green = gate is None or (gate.allow_optional and gate.level == "green")
         day = gcap.day_bounds(self.cfg.get("budget") or {}, now)
-        raised = db.kv(SCHEDULE_CAP_KEY) or {}
+        raised, cleaned = self._kv_map(SCHEDULE_CAP_KEY, dict)
         kept = {n: v for n, v in raised.items()
-                if (v.get("day") == day[0] if day else v.get("day") is None and now - float(v["at"]) < 86400)}
+                if (v.get("day") == day[0] if day else v.get("day") is None and now - float(v.get("at") or 0) < 86400)}
         for name in set(raised) - set(kept):   # its budget day is over: the warning resets
             for r in db.q("SELECT id, history FROM issues WHERE source=? AND watch_key=? AND status='open'",
                           (SCHEDULE_CAP_SOURCE, f"schedule-cap-80:{name}")):
@@ -5002,7 +5047,7 @@ class Daemon:
                 kept[name] = {"day": day[0] if day else None, "at": now}
                 log(self.p, f"schedule {name}: ${spent:.2f} of ${cap:.2f} daily cap; observation raised")
                 self.observe(SCHEDULE_CAP_SOURCE, text, "normal", whole=True, key=f"schedule-cap-80:{name}")
-        if kept != raised:
+        if kept != raised or cleaned:
             db.set_kv(SCHEDULE_CAP_KEY, kept)
 
     def _schedule_gaps(self, due: list[dict]) -> None:
@@ -5105,15 +5150,15 @@ class Daemon:
         return schedrun.start(schedrun.Run(s, payload, self._schedule_timeout(s, payload)), body,
                               lambda: host.p.db)
 
-    CAP_WARNED_KEY = "schedule_cap_warned"   # kv: schedule -> the over-cap timeouts its daemon log line named
+    CAP_WARNED_KEY = OVER_CAP_KEY
 
     def _warn_over_cap(self, s: dict, payload: dict) -> None:
         """A stored schedule whose timeouts are above their caps (schedule_set refuses those; the file or
         an older row may hold one) runs at the caps: log that once per schedule and values, not per run."""
         over = sched.over_caps(payload) if s["kind"] != "watcher" else []
-        warned = dict(self.p.db.kv(self.CAP_WARNED_KEY) or {})
+        warned, cleaned = self._kv_map(self.CAP_WARNED_KEY, str)
         text = sched.over_cap_text(over)
-        if warned.get(s["name"], "") == text:
+        if warned.get(s["name"], "") == text and not cleaned:
             return
         if text:
             log(self.p, f"schedule {s['name']}: {text}; it runs at the cap")

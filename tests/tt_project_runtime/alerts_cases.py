@@ -3931,6 +3931,47 @@ def test_a_failing_tick_step_does_not_stop_dispatch_or_delivery(env):
     assert not p.db.one("SELECT id FROM messages WHERE ref LIKE 'tick-step:%'"), "one failure is not alerted"
 
 
+def test_a_tick_step_failing_every_tick_logs_its_error_once_an_hour_and_the_tick_goes_on(env):
+    """The same error from one step every tick is logged with its traceback once per STEP_ERROR_LOG_S,
+    still counted each tick; a different error, or the hour passing, logs again; later steps still run."""
+    from ttp import daemon as dm
+    p = make(env)
+    calls: list[str] = ["fail"]
+    d = _failing_step_daemon(p.base, calls)
+    for _ in range(3):
+        d.tick()
+    log_text = lambda: (p.logs / "daemon.log").read_text()
+    assert log_text().count("tick step sweep_alerts error:") == 1, "the same error logs once, not per tick"
+    assert d._step_fails["sweep_alerts"][0] == 3 and calls.count("dispatch") == 3 and calls.count("deliver") == 3
+    real_retry = d.retry_rejected
+
+    def retry_rejected():
+        raise KeyError("other row")
+    d.retry_rejected = retry_rejected
+    d.tick()
+    assert log_text().count("tick step retry_rejected error:") == 2 and "KeyError: 'other row'" in log_text()
+    d.retry_rejected = real_retry
+    d._step_logged = {k: t - dm.STEP_ERROR_LOG_S for k, t in d._step_logged.items()}   # an hour later
+    d.tick()
+    assert log_text().count("tick step sweep_alerts error:") == 2
+
+
+def test_a_raising_schedule_cap_warning_logs_once_and_schedules_and_dispatch_still_run(env):
+    """run_schedules' own guarded steps (schedule gaps, the cap warning) log a repeating error once an
+    hour too, and the rest of run_schedules and of the tick still run."""
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    ran: list[str] = []
+    d.dispatch = lambda: ran.append("dispatch")
+    d._schedule_cap_warn = lambda: {}["boom"]
+    for _ in range(3):
+        d.tick()
+    assert ran == ["dispatch"] * 3
+    assert (p.logs / "daemon.log").read_text().count("schedule cap warning error:") == 1
+    assert "run_schedules" not in d._step_fails
+
+
 def test_a_tick_step_failing_three_ticks_in_a_row_is_alerted_then_cleared_by_a_success(env):
     """STEP_FAILS_ALERT failing ticks raise tick-step:<name> at normal severity naming the step and
     the error's first line; past STEP_FAILS_HIGH_S it rises to high; the next success clears it
