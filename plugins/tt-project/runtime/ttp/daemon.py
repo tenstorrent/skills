@@ -8073,6 +8073,7 @@ class Daemon:
         # Every 255's hosts at once: in an outage the tick waits out one ssh timeout, not one per probe.
         self._check_hosts([h for _, proc, probe, rc in done if rc == netwait.UNREACHABLE_RC
                            for h in netwait.hosts(probe, outs[id(proc)])[:netwait.HOSTS_MAX]], now)
+        self._end_down_episodes()
         for tid, proc, probe, rc in done:
             task = db.task(tid)
             if task and _current_probe(task) != probe:
@@ -8296,6 +8297,21 @@ class Daemon:
                         "none": "no recovery declared; host_down event raised"}[got["action"]])
         except Exception:
             log(self.p, f"task {tid} down host: " + traceback.format_exc().replace("\n", " | ")[:1000])
+
+    def _end_down_episodes(self) -> None:
+        """downwait: a down machine the daemon's ssh check reached since its episode began answers again:
+        the episode ends, so its next outage is acted on afresh."""
+        try:
+            eps = downwait.episodes(self.p.db)
+            for h, (ok, when) in list(self._host_up.items()) if eps else ():
+                alias = h.rsplit("@", 1)[-1]
+                ep = eps.get(alias)
+                if ok and ep and when >= float(ep.get("first") or ep.get("since") or 0) \
+                        and downwait.clear(self.p.db, alias):
+                    eps.pop(alias, None)
+                    log(self.p, f"machine {alias}: answers again (the daemon's ssh check); its down episode ended")
+        except Exception:
+            log(self.p, "down episodes: " + traceback.format_exc().replace("\n", " | ")[:1000])
 
     def _host_answers(self, host: str, now: float) -> bool:
         """ssh reaches `host`, asked at most once a minute for all the probes that name it."""

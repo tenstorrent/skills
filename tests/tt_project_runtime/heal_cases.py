@@ -4293,6 +4293,68 @@ def test_a_down_machine_with_no_recovery_raises_one_event_naming_it_and_its_owne
     assert len(ev) == 2 and f"its recovery owner {p.name}" in ev[1]["text"]
 
 
+def test_a_machine_down_for_hours_gets_one_note_or_event_per_episode_and_a_new_one_after_it_answers(env):
+    """Review #4196: a still-down machine was acted on again every EPISODE_S, a new host_down event (or a
+    high note to its owner) each hour. Now once per episode, until the daemon's ssh check reaches it."""
+    from ttp import daemon as dmod
+    from ttp import downwait
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-b")
+    mm.add("box-c")
+    mm.set_recovery("box-c", owner="other-project")
+    sent: list = []
+    t0 = time.time()
+
+    def events():
+        return p.db.q("SELECT * FROM events WHERE kind=?", (downwait.EVENT,))
+
+    def down_for_hours(start):
+        for h in (0, 2, 5, 20, 30):   # hours: the probe keeps finding both down (seen every few minutes)
+            for m in range(0, 60 if h == 30 else 1, 5):
+                at = start + h * 3600 + m * 60
+                downwait.act(p.db, "box-b", 3, p.name, mm.load(), [], now=at)
+                downwait.act(p.db, "box-c", 3, p.name, mm.load(), [], now=at, send=lambda o, t: sent.append(o))
+
+    down_for_hours(t0)
+    assert len(events()) == 1 and sent == ["other-project"]
+    # The daemon's ssh check (not a probe) reaches them: their episodes end; the next outage is told again.
+    d = dmod.Daemon(p.base)
+    later = t0 + 31 * 3600
+    d._host_up.update({"box-b": (True, t0 - 60), "box-c": (False, later)})   # older than the episode / still down
+    d._end_down_episodes()
+    assert set(downwait.episodes(p.db)) == {"box-b", "box-c"}
+    _ssh_255(p, up=True)
+    d._check_hosts(["box-b", "user@box-c"], later)
+    d._end_down_episodes()
+    assert downwait.episodes(p.db) == {}
+    down_for_hours(later + 60)
+    assert len(events()) == 2 and sent == ["other-project"] * 2
+    # A wait that ended while its host was down leaves a stale episode: a day with no probe naming it ends it.
+    gone = later + 40 * 3600 + downwait.STALE_S
+    downwait.act(p.db, "box-b", 4, p.name, mm.load(), [], now=gone)
+    assert len(events()) == 3
+
+
+def test_a_down_machine_heal_fix_is_kicked_again_after_an_episode_hour(env):
+    from ttp import downwait, heal
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, _ = _heal_setup(env, machine="box-a")
+    checks, known, t0 = heal.checks(p.db), mm.load(), time.time()
+    far = t0 + 10 * 3600
+
+    def kicked_at(at):
+        p.db.x("UPDATE schedules SET next_run=? WHERE name='svc'", (far,))
+        downwait.act(p.db, "box-a", 1, p.name, known, checks, now=at, lock_busy=lambda r: False)
+        return p.db.one("SELECT next_run FROM schedules WHERE name='svc'")["next_run"] == at
+
+    assert kicked_at(t0)
+    assert not kicked_at(t0 + 600) and not kicked_at(t0 + downwait.EPISODE_S - 1)
+    assert kicked_at(t0 + downwait.EPISODE_S)
+    assert not kicked_at(t0 + downwait.EPISODE_S + 600) and kicked_at(t0 + 2 * downwait.EPISODE_S + 1)
+
+
 def test_an_outage_check_with_a_fix_runs_it_when_ping_shows_the_box_off(env, monkeypatch):
     """A box confirmed off (ping_host silent, ping_peer answering) is unhealthy for a check with a fix,
     so the fix runs past its grace instead of waiting out the unknown outage window to escalate."""

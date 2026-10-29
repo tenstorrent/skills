@@ -21,9 +21,11 @@ does not answer (Daemon._own_255) is waiting on a down host, not on a timer:
     grace, `max_fixes` per `window_h`, `suppress`, its lock and pauses, known outages and escalation;
   - none: one `host_down` event names the machine and its recovery owner (or that it has none), so the
     coordinator hears of it at once instead of the wait polling silently.
-  The episode ends when the host answers again (any probe naming it exits other than 255, or the
-  daemon's ssh check reaches it) or after EPISODE_S, when a still-down host is acted on again (the heal
-  check's max_fixes per window still caps its fixes).
+  The note and the event are sent once per episode. A fix is kicked again after EPISODE_S while the host
+  stays down (the heal check's max_fixes per window still caps its fixes), and a blocked one is
+  re-evaluated each probe. The episode ends when the host answers again (any probe naming it exits
+  other than 255, or the daemon's ssh check reaches it, Daemon._end_down_episodes), or once no probe has
+  named it for STALE_S (its waiting task ended while the host was down).
 """
 from __future__ import annotations
 
@@ -32,8 +34,10 @@ import time
 from typing import Any
 
 BACKOFF_S = (15, 30, 60, 120)   # probe gaps after 1, 2, 3, 4+ confirmed-down answers in a row
-EPISODE_S = 3600                 # a down episode acted on is acted on again after this
-KEY = "host_down"                # kv: alias -> {"since", "action", "why"}
+EPISODE_S = 3600                 # a heal fix kicked for a still-down machine is kicked again after this
+STALE_S = 86400                  # an episode no probe has named for this long is over
+SEEN_EVERY_S = 600               # how often a still-down machine's "seen" time is stored
+KEY = "host_down"                # kv: alias -> {"first", "since", "seen", "action", "said", "why"}
 EVENT = "host_down"
 
 
@@ -114,20 +118,31 @@ def clear(db: Any, alias: str) -> bool:
 
 def act(db: Any, alias: str, tid: int, project: str, known: dict, checks: list, now: float | None = None,
         lock_busy=None, send=None) -> dict | None:
-    """Once per episode of down machine `alias` (task `tid` found it): run plan()'s action. The heal
-    schedule is made due now (and its healthy back-off ended); `send(owner, text)` notes another
-    owner; an event is raised for no recovery. Returns the plan acted on, None within an episode."""
+    """Down machine `alias` (task `tid` found it): run plan()'s action. The heal schedule is made due now
+    (and its healthy back-off ended), again after EPISODE_S while still down; `send(owner, text)` notes
+    another owner and an event is raised for no recovery, each once per episode. Returns the plan acted
+    on, None when nothing new is done."""
     from . import heal
     now = time.time() if now is None else now
     eps = episodes(db)
     ep = eps.get(alias)
+    if ep and now - float(ep.get("seen") or ep.get("since") or 0) >= STALE_S:
+        ep = None   # no probe named it for a day: its wait ended while it was down; this is a new outage
+    elif ep and now - float(ep.get("seen") or 0) >= SEEN_EVERY_S:
+        ep["seen"] = now
+        db.set_kv(KEY, {**eps, alias: ep})
     if ep and now - float(ep.get("since") or 0) < EPISODE_S and ep.get("action") != "blocked":
         return None
     got = plan(db, alias, project, known, checks, lock_busy)
     if ep and ep.get("action") == "blocked" and got["action"] == "blocked" \
             and now - float(ep.get("since") or 0) < EPISODE_S:
         return None   # still blocked: said once
-    eps[alias] = {"since": now, "action": got["action"], "task": tid,
+    said = set(ep.get("said") or ()) if ep else set()
+    once = f"{got['action']}:{got.get('owner') or ''}" if got["action"] in ("owner", "none") else ""
+    if once and once in said:
+        return None   # noted or raised once this episode: until the host answers, nothing new to say
+    eps[alias] = {"first": float((ep or {}).get("first") or (ep or {}).get("since") or now), "since": now,
+                  "seen": now, "action": got["action"], "task": tid, "said": sorted(said | ({once} if once else set())),
                   **({"why": got["why"]} if got.get("why") else {})}
     db.set_kv(KEY, eps)
     if got["action"] == "fix":
