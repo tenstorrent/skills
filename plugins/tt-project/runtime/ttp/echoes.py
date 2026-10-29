@@ -10,7 +10,10 @@ files: harness scripts, tools, hooks and prompts, the project's skills and agent
 paths in coordinator.echo_paths) and lists the hits under RETIRED_HEADER, which carries its own
 instruction; memory entries that hit are also named on one line for memory_forget, so they do not pile up. It is a notice only: no event, wake, hold or model call. Not searched: the replacing
 text itself (its entry, or its words wherever they stand) and the archives (memory/archive, the charter
-history). A phrase the replacing text keeps is no phrase of the retired rule. A hit still there a turn
+history), and harness files the project never edited (equal to the harness's `upstream` snapshot or the
+plugin template): only a project-tuned copy can be fixed. A phrase the replacing text keeps is no phrase of the
+retired rule, nor is plugin vocabulary (a phrase of at most GENERIC_WORDS words found in the runtime source or an
+unedited template file, such as `start_when` or `ttp list`): alone it matches unrelated text. A hit still there a turn
 after it was first shown is marked. Accepted gap: a task whose spec quotes the retired rule in order
 to remove it is listed too.
 """
@@ -20,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -40,6 +44,10 @@ HARNESS_SKIP = {"memory", "runtime", "CHARTER.md", "CHARTER.history.md", "MEMORY
 # Below the project root: the project's own skills, hooks and agent instructions.
 ROOT_PATHS = (".claude/skills", ".claude/hooks", ".claude/commands", ".claude/agents", ".agents/skills",
               "CLAUDE.md", "AGENTS.md")
+GENERIC_WORDS = 3                    # a phrase this short found in the plugin's own text is its vocabulary
+_TEMPLATE = Path(__file__).resolve().parents[2] / "template"   # the plugin template, when run from the plugin
+_RUNTIME: dict[str, str] = {}        # "flat": runtime source and plugin template, flattened once
+_GENERIC: dict[str, bool] = {}       # phrase -> found in it
 RETIRED_HEADER = ("## Retired-rule echoes (text the user retired still binds here; fix each this turn: memory_forget "
                   "or memory_add `supersedes`, charter_update `quote`, schedule_set, task_update, config_set; a "
                   "notice, it never waits)")
@@ -113,10 +121,11 @@ def record_correction(db, name: str, text: str, now: float | None = None) -> dic
                   negated=True, found=wrong) if wrong else None
 
 
-def places(p) -> list[tuple[str, str, str]]:
+def places(p, pristine: list[str] | None = None) -> list[tuple[str, str, str]]:
     """Every project-local place retired text can still bind, as (key, label, text): live memory entries
     (the one store both workers' and the coordinator's copies come from), charter sections, schedules'
-    payload strings and descriptions, open tasks' specs and start_when probes, config string values."""
+    payload strings and descriptions, open tasks' specs and start_when probes, config string values, and
+    the project's files. Harness files equal to the template are no place; their text goes to `pristine`."""
     from .db import TERMINAL_TASK_STATES, deferral
     from .prompts import charter_sections
     out: list[tuple[str, str, str]] = []
@@ -158,14 +167,51 @@ def places(p) -> list[tuple[str, str, str]]:
         cfg = {}
     walk("config", "config", cfg, "")
     extra = (cfg.get("coordinator") or {}).get("echo_paths") if isinstance(cfg, dict) else None
-    out += _files(p, [x for x in extra if isinstance(x, str)] if isinstance(extra, list) else [])
+    out += _files(p, [x for x in extra if isinstance(x, str)] if isinstance(extra, list) else [],
+                  pristine if pristine is not None else [])
     return out
 
 
-def _files(p, extra: list[str]) -> list[tuple[str, str, str]]:
+def _upstream(harness: Path) -> dict[str, str]:
+    """The harness's `upstream` snapshot (the pristine template) as {path: blob sha}; {} without one."""
+    from . import gitmemo
+    args = ("ls-tree", "-r", "upstream")
+    try:
+        r = subprocess.run(["git", "-C", str(harness), *args], capture_output=True, text=True,
+                           timeout=gitmemo.timeout(10, args))
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    out = {}
+    for ln in r.stdout.splitlines() if r.returncode == 0 else ():
+        meta, _, path = ln.partition("\t")
+        if meta.split()[1:2] == ["blob"]:
+            out[path] = meta.split()[2]
+    return out
+
+
+def _template_copy(harness: Path, upstream: dict[str, str], real: Path, data: bytes) -> bool:
+    """Whether harness file `real` (all of it in `data`) is the template unedited: its upstream blob or
+    the plugin template's file (prompts/ and bin/ come from template/prompts and template/bin)."""
+    try:
+        rel = real.relative_to(harness.resolve()).as_posix()
+    except ValueError:
+        return False
+    if upstream.get(rel) == hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest():
+        return True
+    try:
+        return (_TEMPLATE / rel).read_bytes() == data
+    except OSError:
+        return False
+
+
+def _files(p, extra: list[str], pristine: list[str]) -> list[tuple[str, str, str]]:
     """The project's own text files as places (key "file:<path>"): harness/ less HARNESS_SKIP, ROOT_PATHS
-    and `extra` (relative to the project root, never outside it), at most FILE_MAX files of FILE_BYTES."""
+    and `extra` (relative to the project root, never outside it), at most FILE_MAX files of FILE_BYTES.
+    A harness file equal to the template is no place (the project cannot fix it): its text goes to
+    `pristine`, as plugin vocabulary."""
     root = Path(p.root).resolve()
+    hroot = Path(p.harness)
+    upstream = _upstream(hroot)
     starts = [(Path(p.harness), True)] + [(root / x, False) for x in (*ROOT_PATHS, *extra)]
     out: list[tuple[str, str, str]] = []
     seen: set[Path] = set()
@@ -183,6 +229,9 @@ def _files(p, extra: list[str]) -> list[tuple[str, str, str]]:
         except OSError:
             return True
         if b"\0" in data[:4096]:
+            return True
+        if len(data) < FILE_BYTES and _template_copy(hroot, upstream, real, data):
+            pristine.append(_flat(data.decode("utf-8", "replace")))
             return True
         rel = real.relative_to(root).as_posix()
         out.append((f"file:{rel}", f"file {rel}", data.decode("utf-8", "replace")))
@@ -232,12 +281,32 @@ def _lineno(text: str, phrase: str) -> int:
     return 1
 
 
-def _hit(rec: dict, text: str) -> str:
-    """The first phrase of `rec` found in `text` outside its replacing text ('' when none)."""
-    flat = _flat(text)
+def _generic(ph: str, pristine: list[str]) -> bool:
+    """Whether phrase `ph` is plugin vocabulary: at most GENERIC_WORDS words, found in the runtime source
+    (its action, config and command names), the plugin template or an unedited template file."""
+    if len(ph.split()) > GENERIC_WORDS:
+        return False
+    if ph not in _GENERIC:
+        if "flat" not in _RUNTIME:   # read once per process
+            src = []
+            for f in [*sorted(Path(__file__).resolve().parent.glob("*.py")),
+                      *(sorted(_TEMPLATE.rglob("*")) if _TEMPLATE.is_dir() else [])]:
+                try:
+                    if f.is_file() and f.stat().st_size < FILE_BYTES * 4:
+                        src.append(f.read_text(errors="replace"))
+                except OSError:
+                    pass
+            _RUNTIME["flat"] = _flat("\n".join(src))
+        _GENERIC[ph] = ph in _RUNTIME["flat"]
+    return _GENERIC[ph] or any(ph in t for t in pristine)
+
+
+def _hit(rec: dict, flat: str, phrases_: list[str] | None = None) -> str:
+    """The first phrase of `rec` (or `phrases_`) found in flattened text `flat` outside its replacing
+    text ('' when none)."""
     if rec.get("new") and len(rec["new"]) >= 6:
         flat = flat.replace(rec["new"], " ")
-    for ph in rec.get("phrases") or []:
+    for ph in rec.get("phrases") or [] if phrases_ is None else phrases_:
         i = flat.find(ph)
         while i >= 0:
             if not (rec.get("negated") and _NEGATION.search(flat[max(0, i - 20):i])):
@@ -252,14 +321,18 @@ def scan(p, now: float | None = None) -> list[dict]:
     recs = [r for r in p.db.kv(RETIRED_KEY, []) or [] if now - r.get("at", 0) < RETIRED_DAYS * 86400]
     if not recs:
         return []
-    where = places(p)
+    pristine: list[str] = []
+    where = [(key, label, text, _flat(text)) for key, label, text in places(p, pristine)]   # flattened once
     out, seen = [], set()
     for rec in sorted(recs, key=lambda r: -r.get("at", 0)):
+        own = [ph for ph in rec.get("phrases") or [] if not _generic(ph, pristine)]
+        if not own:
+            continue
         skip = set(rec.get("skip") or ())
-        for key, label, text in where:
+        for key, label, text, flat in where:
             if key in skip or (rec["id"], key) in seen:
                 continue
-            ph = _hit(rec, text)
+            ph = _hit(rec, flat, own)
             if ph:
                 seen.add((rec["id"], key))
                 if key.startswith("file:"):

@@ -141,3 +141,28 @@ def test_a_retired_claim_planted_in_every_binding_place_is_found_and_memory_name
     sec = echoes.digest_lines(p)
     assert len(sec) == echoes.SECTION_LINES and sec[-1].startswith("- memory to retire (memory_forget"), sec
     assert f"[{mem.stem}]" in sec[-1] and sec[-2].startswith("- ... and "), sec
+
+
+def test_plugin_vocabulary_and_unedited_template_files_are_no_echo_but_a_project_edited_prompt_is(env, monkeypatch):
+    from ttp import coordinator as coord, echoes
+    p = make(env)
+    old = p.add_memory("Review chains: a fix task waits on its review with `start_when` landed:#<id> and "
+                       "`pr_branch` set; never chain more than 3 fixes.", kind="decision")
+    other = p.add_memory("Give each deferred task a start_when probe and keep pr_branch on the task.", kind="fact")
+    edited = p.harness / "prompts" / "kind-review.md"
+    edited.write_text(edited.read_text() + "\nReview chains: a fix task waits on its review with `start_when` "
+                      "landed:#<id> and `pr_branch` set; never chain more than 3 fixes.\n")
+    assert coord.apply(p, [{"type": "memory_add", "memory_kind": "decision", "supersedes": [old.stem],
+                            "text": "Review chains: never chain more than 2 fixes."}], turn=1) == []
+    hits = echoes.scan(p)
+    labels = {h["label"] for h in hits}
+    # The unrelated entry and the unedited template prompts (coordinator.md mentions start_when) are no echo.
+    assert f"memory [{other.stem}]" not in labels and not [x for x in labels if "coordinator.md" in x
+                                                             or "daily-review.md" in x], labels
+    assert {h["phrase"] for h in hits} == {
+        "review chains: a fix task waits on its review with `start_when` landed:#<id>"}, hits
+    assert [x for x in labels if x.startswith("file tt-project/harness/prompts/kind-review.md:")], labels
+    assert not [ln for ln in echoes.digest_lines(p) if ln.startswith("- memory to retire")]
+    # Without the harness's upstream snapshot, a copy equal to the plugin template is still skipped.
+    monkeypatch.setattr(echoes, "_upstream", lambda harness: {})
+    assert {h["label"] for h in echoes.scan(p)} == labels

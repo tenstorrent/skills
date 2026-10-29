@@ -366,14 +366,15 @@ prolonged whole-box outage.
 - Retired-rule echoes: when a `charter_update` replaces text (`quote`, `replaces`), a `memory_add`
   `supersedes` entries (or `ttp memory --supersedes`) or a user Correction names a wrong value in
   prose, the daemon keeps the retired text's distinctive phrases (quoted and backticked spans, config
-  keys and identifiers, its first sentence; a phrase the new text keeps is left out) for 30 days. Each
+  keys and identifiers, its first sentence; a phrase the new text keeps is left out, and so is plugin
+  vocabulary such as `start_when` or `ttp list`) for 30 days. Each
   coordinator turn it searches, model-free and case-insensitively, live memory entries, charter
   sections, schedules (command, precheck, heal check, prompt, description), open tasks' specs and
   `start_when` probes, config values and the project's own files (harness scripts, tools, hooks and
   prompts; `.claude/skills`, `.claude/hooks`, `.agents/skills`, `CLAUDE.md`, `AGENTS.md`; and the files
   or folders in `coordinator.echo_paths`, such as a repo's recovery code), and lists the hits in a `Retired-rule echoes` digest section
   (place, matching line, which retirement; at most 10 lines; a hit still there a turn later is marked
-  `still here`; a last line names every memory entry that hit, for memory_forget). The replacing text and the archives are not searched; a Correction's phrase right
+  `still here`; a last line names every memory entry that hit, for memory_forget). The replacing text, the archives and harness files equal to the template are not searched; a Correction's phrase right
   after a negation ("never ...") is no hit. The coordinator fixes each in that turn (memory_forget or
   `supersedes`, charter_update `quote`, schedule_set, task_update, config_set). It is a notice: no
   event, wake, hold or model call of its own. A task whose spec quotes the old rule to remove it is
