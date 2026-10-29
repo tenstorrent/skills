@@ -786,6 +786,11 @@ class Daemon:
         self.p.db.set_kv(STEP_FAILING_KEY, {})   # counts start again with this daemon (an episode then clears)
         self._probes: dict[int, tuple[subprocess.Popen, float, str]] = {}   # running: proc, started, probe
         self._probed: dict[int, float] = {}
+        # task -> (what its probe runs: command, directory, environment; when its latest run started):
+        # which runs another task may share (_start_probe)
+        self._probe_ctx: dict[int, tuple[str, float]] = {}
+        # task -> its probe's latest raw result before the verdict: {rc, killed, tail, at, probe} (_probe_raw)
+        self._probe_diag: dict[int, dict] = {}
         self._jobs_sampled = 0.0   # sample_jobs' last pass
         self._docker_off_until = 0.0   # sample_jobs skips docker until then after it could not be read
         self._ends = ends.Ends(self.p, log=lambda m: log(self.p, m))   # temporary instructions' end conditions
@@ -8229,11 +8234,13 @@ class Daemon:
                 fp = f"hold_probe_broken:{tid}:{hashlib.sha256(probe.encode()).hexdigest()[:12]}"
                 if not self.p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
                     why = got[0] if isinstance(got[0], str) else f"exit {got[0]}"
+                    raw = self._probe_raw(tid, probe)[:300]   # a signal, a kill or its last output
+                    detail = raw if raw.startswith(why) else f"{why}; its last run: {raw}" if raw else why
                     self.p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) "
                                 "VALUES(?,?,?,?,?,?,?,?)",
                                 (now, "daemon", "hold_probe_broken", fp, "normal",
                                  f"#{tid} {task['title']} is held until its probe passes, but the probe is broken "
-                                 f"({why}; only 0 = over and 1, 75 or 255 = not yet are valid): {probe[:300]}. It "
+                                 f"({detail}; only 0 = over and 1, 75 or 255 = not yet are valid): {probe[:300]}. It "
                                  f"keeps running; decide: task_update waits_on with a fixed probe, requeue the "
                                  f"task, or cancel it.", "queued", tid))
                     log(self.p, f"task {tid} hold_probe_broken ({why}); raised to the coordinator")
@@ -8356,6 +8363,7 @@ class Daemon:
         outs: dict[int, str] = {}   # one read of a probe run's output, whichever tasks share it
         lines: dict[int, str] = {}   # and its last line (waitheal.last_line)
         timed: dict[int, object] = {}   # the verdict of a run killed on its timeout (probespawn.timed_out)
+        tails: dict[int, str] = {}   # its own output's tail, before a timeout note is added
         done = []
         for tid, (proc, started, probe) in list(self._probes.items()):
             rc = proc.poll()
@@ -8366,6 +8374,7 @@ class Daemon:
                 _kill_group(proc)
             if id(proc) not in outs:
                 outs[id(proc)], lines[id(proc)] = self._probe_texts(proc)
+                tails[id(proc)] = outs[id(proc)].strip()[-300:]
                 if rc is None:   # killed on its timeout: "not yet" unless it keeps timing out
                     timed[id(proc)] = probespawn.timed_out(probe)
                     if timed[id(proc)] == 1:
@@ -8375,6 +8384,9 @@ class Daemon:
                 else:
                     probespawn.answered(probe)
             done.append((tid, proc, probe, timed.get(id(proc), rc)))
+            # What the run really did, kept beside the verdict: a kill on the timeout reads as 1 ("not yet").
+            self._probe_diag[tid] = {"rc": rc, "killed": rc is None, "tail": tails[id(proc)],
+                                     "at": now, "probe": probe}
         # Every 255's hosts at once: in an outage the tick waits out one ssh timeout, not one per probe.
         self._check_hosts([h for _, proc, probe, rc in done if rc == netwait.UNREACHABLE_RC
                            for h in netwait.hosts(probe, outs[id(proc)])[:netwait.HOSTS_MAX]], now)
@@ -8410,13 +8422,19 @@ class Daemon:
                     (self._probe_passed if rc == 0 else self._job_failed if detach.failed_check(probe, rc)
                      else self._push_finished_unpushed)(task, now)
             elif gone and task and task["status"] == "queued" and (task["not_before"] or 0) > now:
-                self._wake_waiting(task, f"probe broken: {rc}", now)   # no timer can make it pass
+                raw = self._probe_raw(tid, probe)   # no timer can make it pass
+                self._wake_waiting(task, f"probe broken: {rc}" + (f" ({raw[:300]})" if raw else ""), now,
+                                   {"probe_raw": raw} if raw else None)
             elif rc in NOT_YET_RCS and task and task["status"] == "queued" and (task["not_before"] or 0) > now \
                     and (dirs := self._checks_gone(tid, probe, now)):
                 self._checks_gone_release(task, dirs, now)   # checks that left the queue: never "not yet" for good
             elif gated == "changed" and rc is not None and rc not in NOT_YET_RCS:
                 # A new answer after a skip that no branch above handles: wake now, not at the backoff.
                 self._wake_waiting(task, f"its probe's answer changed (exit {rc})", now)
+        for gone_tid in [t for t in self._probe_ctx.keys() | self._probe_diag.keys()
+                         if t not in self._probes and t not in self._probe_rc]:
+            self._probe_ctx.pop(gone_tid, None)
+            self._probe_diag.pop(gone_tid, None)
         rows = self._resume_order("probe_waiting", db.q("SELECT * FROM tasks WHERE status='queued' AND not_before IS NOT NULL"))
         for i, t in enumerate(rows):
             if self._step_over(f"task #{t['id']}'s retry_when probe", t["id"]) and i:
@@ -9198,21 +9216,62 @@ class Daemon:
         self._probed[tid] = now
         if ends.hides_test(probe):   # stored before it was refused: a broken probe, never a pass
             self._probe_rc[tid] = (ends.TRIVIAL_WHY, now, probe)
+            self._probe_ctx.pop(tid, None)
             return
-        # One run per distinct command per probe cycle: tasks waiting on the same thing share it.
+        cmd, cwd, env = landed.probe_command(probe, self.p), str(self.p.root), self._probe_env()
+        key = hashlib.sha256(json.dumps([cmd, cwd, sorted(env.items())]).encode()).hexdigest()
+        # One run per distinct command, directory and environment per probe cycle: tasks waiting on the
+        # same thing share it, but only a run started once this task's wait began (_probe_since): an
+        # earlier one may have answered for a state before its hand-off. Each task keeps its own probe
+        # text, verdict and output note.
+        since = self._probe_since(tid, what)
         for other, run in self._probes.items():
-            if other != tid and run[2] == probe:
-                self._probes[tid] = run
+            ctx = self._probe_ctx.get(other)
+            if other != tid and ctx and ctx[0] == key and run[1] >= since:
+                self._probes[tid] = run if run[2] == probe else (run[0], run[1], probe)
+                self._probe_ctx[tid] = ctx
                 return
         for other, got in self._probe_rc.items():
-            if other != tid and got[2] == probe and now - got[1] < self._probe_gap(tid):
-                self._probe_rc[tid] = got
+            ctx = self._probe_ctx.get(other)
+            if other != tid and ctx and ctx[0] == key and ctx[1] >= since and now - got[1] < self._probe_gap(tid):
+                self._probe_rc[tid] = got if got[2] == probe else (got[0], got[1], probe)
+                self._probe_ctx[tid] = ctx
+                if other in self._probe_diag:
+                    self._probe_diag[tid] = {**self._probe_diag[other], "probe": probe}
                 return
         # Its output (the blocking gate's last word) goes to a file: a pipe nobody reads could fill. Opening
         # that file and forking run off the tick (probespawn): either can stall when /tmp's file system does.
-        proc = probespawn.Pending(landed.probe_command(probe, self.p), cwd=str(self.p.root), env=self._probe_env())
+        proc = probespawn.Pending(cmd, cwd=cwd, env=env)
         self._probes[tid] = (proc, now, probe)
+        self._probe_ctx[tid] = (key, now)
         self._probe_files[id(proc)] = proc
+
+    def _probe_since(self, tid: int, what: str) -> float:
+        """When the wait task `tid`'s probe answers for began: its hand-off's waiting_since (retry_when),
+        its deferral (start_when), else its last update (a `when:` hold)."""
+        task = self.p.db.task(tid)
+        if not task:
+            return 0.0
+        at = load_result(task["result"]).get("waiting_since") if what == "retry_when" else \
+            deferral(task).get("since") if what == "start_when" else None
+        try:
+            return float(at if at is not None else task["updated"] or 0)
+        except (TypeError, ValueError):
+            return float(task["updated"] or 0)
+
+    def _probe_raw(self, tid: int, probe: str) -> str:
+        """The raw result of task `tid`'s latest run of `probe` (the verdict alone hides a kill on its
+        timeout): '' when none is kept, or when it is a plain exit with no output (the verdict says it all)."""
+        got = self._probe_diag.get(tid)
+        if not got or got["probe"] != probe:
+            return ""
+        rc = got["rc"]
+        if not got["killed"] and not got["tail"] and not (isinstance(rc, int) and rc < 0):
+            return ""
+        what = (f"killed on its {PROBE_TIMEOUT_S} s timeout" if got["killed"]
+                else f"killed by signal {-rc}" if isinstance(rc, int) and rc < 0
+                else rc if isinstance(rc, str) else f"exit {rc}")
+        return what + (f"; last output: {got['tail']}" if got["tail"] else "")
 
     def _probe_text(self, proc) -> str:
         """The end of a finished probe run's output, once (its file is closed after)."""
@@ -9376,7 +9435,9 @@ class Daemon:
         elif fresh and _push_not_landed(prev.get("retry_when"), rc):
             self._push_finished_unpushed(task, now)
         elif fresh and rc not in NOT_YET_RCS:
-            self._wake_waiting(task, f"probe broken: {rc if isinstance(rc, str) else f'exit {rc}'}", now)
+            raw = self._probe_raw(tid, str(prev.get("retry_when") or ""))
+            self._wake_waiting(task, f"probe broken: {rc if isinstance(rc, str) else f'exit {rc}'}"
+                               + (f" ({raw[:300]})" if raw else ""), now, {"probe_raw": raw} if raw else None)
         elif fresh and (dirs := self._checks_gone(tid, str(prev.get("retry_when") or ""), now)):
             self._checks_gone_release(task, dirs, now)
         elif fresh:

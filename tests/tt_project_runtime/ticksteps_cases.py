@@ -335,3 +335,96 @@ def test_a_failed_reviews_area_and_followup_overlaps_read_no_git_inside_the_fini
     assert (True, 0) in counts and all(n == 0 for _, n in counts), f"the area read git in the transaction: {spawned}"
     assert p.db.task(rev["id"])["status"] == "failed"
     assert p.db.one("SELECT id FROM events WHERE kind=? AND task=?", (reviewcap.REVIEW_AREA_EVENT, rev["id"]))
+
+
+def test_a_stalled_hold_probe_start_never_holds_sweep_holds(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    tid = _hold_task(p)
+    p.db.update_task(tid, status="blocked", labels=["waits:when:exit 1"])
+    gate = _stalled_tmp(monkeypatch)
+    try:
+        t0 = time.monotonic()
+        d.sweep_holds()
+        d.sweep_holds()
+        assert time.monotonic() - t0 < 5, "the tick waited on the stalled open"
+        assert tid in d._probes and d._probes[tid][0].poll() is None
+    finally:
+        gate.set()
+    d._probes[tid][0].wait(_load_scaled(30))
+    d.probe_waiting()
+    d.sweep_holds()
+    assert d._probe_rc[tid][0] == 1 and p.db.task(tid)["status"] == "blocked", "not yet: still held"
+
+
+def test_a_probe_run_is_shared_only_for_the_same_command_and_environment_started_since_the_wait_began(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    probe, now = "sleep 1; exit 1", time.time()
+    a, c = _due_waiting_task(p, probe), _due_waiting_task(p, probe)
+    b = _due_waiting_task(p, probe, since_ago=-60)   # its wait began after a's run started
+    d._start_probe(a, probe, now)
+    d._start_probe(b, probe, now)
+    d._start_probe(c, probe, now)
+    assert d._probes[c][0] is d._probes[a][0], "a run started within c's wait answers for it"
+    assert d._probes[b][0] is not d._probes[a][0], "a run older than b's wait does not"
+    real = d._probe_env
+    monkeypatch.setattr(d, "_probe_env", lambda: {**real(), "TTP_OTHER": "1"})
+    e = _due_waiting_task(p, probe)
+    d._start_probe(e, probe, now)
+    assert d._probes[e][0] not in (d._probes[a][0], d._probes[b][0]), "another environment: its own run"
+    monkeypatch.setattr(d, "_probe_env", real)
+    for t in (a, b, e):
+        d._probes[t][0].wait(_load_scaled(30))
+    for t in (a, b, c, e):
+        p.db.update_task(t, not_before=time.time() + 3600)
+    d.probe_waiting()
+    assert all(d._probe_rc[t][0] == 1 for t in (a, b, c, e))
+    # A stored verdict is shared the same way.
+    f, g = _due_waiting_task(p, probe), _due_waiting_task(p, probe, since_ago=-60)
+    d._start_probe(f, probe, time.time())
+    d._start_probe(g, probe, time.time())
+    assert f not in d._probes and d._probe_rc[f][0] == 1
+    assert g in d._probes, "a verdict from before g's wait began is not g's"
+    d._probes[g][0].wait(_load_scaled(30))
+
+
+def test_a_probes_raw_result_is_kept_beside_its_verdict(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    # Killed on its timeout: the verdict is "not yet", the raw result says it was killed.
+    monkeypatch.setattr(dmod, "PROBE_TIMEOUT_S", 0.3)
+    slow = f"echo started-{os.getpid()}; sleep 30"
+    tid = _due_waiting_task(p, slow)
+    p.db.update_task(tid, not_before=time.time() + 3600)
+    d.probe_waiting()
+    proc = d._probes[tid][0]
+    deadline = time.monotonic() + _load_scaled(10)
+    while tid in d._probes and time.monotonic() < deadline:
+        time.sleep(0.2)
+        d.probe_waiting()
+    assert d._probe_rc[tid][0] == 1 and proc.poll() is not None
+    raw = d._probe_raw(tid, slow)
+    assert "killed on its" in raw and f"started-{os.getpid()}" in raw, raw
+    monkeypatch.setattr(dmod, "PROBE_TIMEOUT_S", 60)
+    # Killed by a signal: a broken probe whose wake and hold event name the signal; the hold stays.
+    sig = "kill -9 $$"
+    woke = _due_waiting_task(p, sig)
+    _settle_probe(d, woke)
+    p.db.update_task(woke, not_before=time.time() - 1)   # its timer ran out
+    d.probe_waiting()
+    res = json.loads(p.db.task(woke)["result"])
+    assert _ready(p, woke) and res["woke"] == "probe broken: exit -9 (killed by signal 9)", res
+    assert res["probe_raw"] == "killed by signal 9"
+    held = _hold_task(p)
+    p.db.update_task(held, status="blocked", labels=[f"waits:when:{sig}"])
+    d.sweep_holds()
+    d._probes[held][0].wait(_load_scaled(30))
+    d.probe_waiting()
+    d.sweep_holds()
+    [ev] = p.db.q("SELECT * FROM events WHERE kind='hold_probe_broken' AND task=?", (held,))
+    assert "(exit -9; its last run: killed by signal 9; only 0" in ev["text"], ev["text"]
+    assert p.db.task(held)["status"] == "blocked"

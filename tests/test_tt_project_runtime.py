@@ -21696,7 +21696,8 @@ def test_a_timed_out_probe_is_broken(env, monkeypatch):
             assert not _ready(p, tid) and d._probe_rc[tid][0] == 1, n
             assert "counted as not yet" in d._probe_live[tid][0]
             d._probed.pop(tid, None)
-    assert _ready(p, tid) and json.loads(p.db.task(tid)["result"])["woke"] == "probe broken: timeout"
+    woke = json.loads(p.db.task(tid)["result"])["woke"]
+    assert _ready(p, tid) and woke == "probe broken: timeout (killed on its 0.2 s timeout)", woke
 
 
 def _probe_starts_done(d):
