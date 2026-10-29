@@ -742,3 +742,90 @@ def test_throughput_review_sweep_of_a_run_that_ended_long_before_its_hand_off(en
     rep = throughput.measure(p.db, p.config(), now=time.time() + 700, gates={})
     sw = _tp_lane(rep, "review_sweep")
     assert sw["count"] == 1 and sw["p90_s"] < 60 and not sw["slow"]
+
+
+def _tp_checks_requeue(p, d, monkeypatch, tmp_path, title, w0, wait_s):
+    """A priority 1 task whose run ended at w0 and handed off a wait for the project's other checks,
+    recorded by the daemon's own Daemon._finish_worker at w0; it ran again wait_s later."""
+    from ttp.providers.base import RunUsage
+    t = _tp_task(p, title, w0 - 3600, prio=1)
+    _tp_run(p, t, w0 - 3600, w0)
+    p.db.update_task(t, status="running")
+    run_dir = tmp_path / f"run-{t}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({
+        "status": "waiting", "summary": "checks wait", "retry_after_s": 600, "retry_when": "test -e out/checks.done",
+        "waiting_for": "ttp checks: waiting for this project's other full checks to end"}))
+    with monkeypatch.context() as m:
+        m.setattr(time, "time", lambda: w0)
+        d._finish_worker({"task": t, "note": "{}"}, RunUsage(cost_usd=0.1), "ok", run_dir)
+    _tp_run(p, t, w0 + wait_s, w0 + wait_s + 600)
+    p.db.update_task(t, status="done")
+    return t
+
+
+def _tp_checks_run(p, monkeypatch, start, seconds):
+    """One finished checks run, recorded by checkwall's own writer when it ends."""
+    from ttp import checkwall
+    with monkeypatch.context() as m:
+        m.setattr(time, "time", lambda: start + seconds)
+        checkwall.record_run(Path(p.db.path).parent, seconds, True)
+
+
+def test_throughput_checks_at_limit_counts_only_the_wait_before_the_grant(env, monkeypatch, tmp_path):
+    """#4399's repro: cap 3, a p1 task waits 999 s for the checks, its own checks are granted at once at
+    w0+5 and run 900 s beside two runs started at w0. Its waits-log record has no time before the grant,
+    so the wait is not at the limit and nothing is raised. A task queued 700 s while three runs ran is."""
+    from ttp import throughput
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.set_config("checks.test_project_max", 3)
+    d, now = Daemon(p.base), time.time()
+    w0 = now - 5 * 3600
+    t = _tp_checks_requeue(p, d, monkeypatch, tmp_path, "checks at once", w0, 999)
+    for _ in range(2):
+        _tp_checks_run(p, monkeypatch, w0, 1000)
+    _tp_slot_wait(p, monkeypatch, t, w0 + 5, w0 + 5)
+    _tp_checks_run(p, monkeypatch, w0 + 5, 900)
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    ck = _tp_lane(rep, "checks_slots")
+    assert (ck["limit"], ck["count"], ck["at_limit"], ck["idle"]) == (3, 1, 0, 1), ck
+    changes, _ = throughput.plan(p.db, p.config(), rep)
+    assert not [c for c in changes if c["key"].startswith("checks.")], changes
+    # A wait with no grant record at all is not at the limit either.
+    _tp_checks_requeue(p, d, monkeypatch, tmp_path, "no grant record", w0 + 60, 999)
+    ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
+    assert (ck["count"], ck["at_limit"]) == (2, 0), ck
+    # Queued 700 s while the project's three checks ran at the cap: at the limit.
+    w1 = now - 3 * 3600
+    q = _tp_checks_requeue(p, d, monkeypatch, tmp_path, "queued at the cap", w1, 999)
+    for _ in range(3):
+        _tp_checks_run(p, monkeypatch, w1 - 60, 1200)
+    _tp_slot_wait(p, monkeypatch, q, w1, w1 + 700)
+    ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
+    assert (ck["count"], ck["at_limit"], ck["idle"]) == (3, 1, 2), ck
+    changes, _ = throughput.plan(p.db, p.config(), throughput.measure(p.db, p.config(), now=now, gates={}))
+    assert not [c for c in changes if c["key"].startswith("checks.")], changes
+
+
+def test_slow_information_only_lane_opens_no_followup_on_a_speed_complaint(env, monkeypatch):
+    """review_stall is information only (plan() marks its kept entry `info`): a slow one beside a speed
+    complaint opens no throughput task, and the report still lists the lane."""
+    from ttp import slowcomplaint, throughput
+    p = make(env)
+    now = time.time()
+    p.set_config("coordinator.review_stall_s", 14400)
+    t0 = now - 10 * 3600
+    for i, wait in enumerate((6000, 9000, 11000)):
+        start = t0 + 3600 * i
+        _tp_review(p, start - 600, start, start + 60, start + wait)
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    assert _tp_lane(rep, "review_stall")["slow"]
+    _, kept = throughput.plan(p.db, p.config(), rep)
+    (rs,) = [k for k in kept if k["lane"] == "review_stall"]
+    assert rs.get("info") and rs.get("key"), rs
+    made = slowcomplaint._followups(p.db, {**rep, "kept": kept}, [1])
+    # The fixture's own worker_slots waits may open theirs; none names review_stall.
+    titles = [r["title"] for r in p.db.q("SELECT title FROM tasks WHERE title LIKE 'throughput: %'")]
+    assert len(titles) == len(made) and not [x for x in titles if "review_stall" in x], titles
+    assert "review_stall SLOW" in throughput.text({**rep, "kept": kept})
