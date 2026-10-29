@@ -826,6 +826,7 @@ class Daemon:
         self._machines_routed = 0.0
         self._coverage_at = 0.0
         self._probe_rc: dict[int, tuple[int | str, float, str]] = {}   # last verdict: exit code or why, when, probe
+        self._route_waits: dict[int, float] = {}   # task id -> since when it waits for a routed slot (route.wait_s)
         self._stall_probes: dict[str, list] = {}   # probe -> its stall re-check: [Pending, started, answer or None]
         self._git_memo: dict[int, dict] = {}   # task -> git facts its hand-off is judged by, read before the tx (_prefetch_git)
         self._start_rc: dict[int, tuple[int | str, float, str]] = {}   # a start_when's last not-yet or broken verdict
@@ -3312,6 +3313,8 @@ class Daemon:
         # A run routed to another provider (route.py): booked at its pricing rows, else zero and unpriced.
         routed = route.of(r["note"]) if r["role"] == "worker" else None
         on_route = bool(routed) and r["provider"] == routed.get("to")
+        if on_route and r["task"]:   # its host-wide routed slot frees for the next start, any project's
+            self._route_unlease((r["provider"], self._route_key(r["task"])))
         priced = route.price(self.cfg, r["provider"], r["model"] or "", usage) if on_route else None
         status = "ok" if exit_info.get("rc") == 0 and not usage.error else "failed"
         if stopped in ("timeout", "budget", "stopped", "lost", "stalled", "shutdown", "resource_busy"):
@@ -7135,8 +7138,22 @@ class Daemon:
             tier = bud.clamp_tier(wake or task["tier"], gate)
             # A tier routed to another provider (route.py) runs there unless it is cooling down.
             routed = self._route(task, tier, picked, now)
+            lease = None
             if routed and routed["fallback"] == "none":
-                routed["fallback"] = self._no_room(routed["to"], ctx) or "none"
+                why = self._no_room(routed["to"], ctx)
+                if not why:
+                    lease = self._route_lease(task, routed, tier, now)
+                    why = "" if lease else "slots"
+                if why == "slots":   # its slots are full: it waits for one, then falls back
+                    waited = self._route_wait(task["id"], now)
+                    if waited is not None:
+                        fate[task["id"]] = "full"
+                        reached.discard(task["id"])
+                        continue
+                    why = "busy_wait_expired"
+                if task["id"] in self._route_waits:
+                    routed["waited_s"] = round(now - self._route_waits.pop(task["id"]), 1)
+                routed["fallback"] = why or "none"
             run_prov = routed["to"] if routed and routed["fallback"] == "none" else provider
             if run_prov != provider and (limit := route.timeout_s(self.cfg, tier)):
                 routed["timeout_s"] = limit   # the tier's routed run time limit, in place of its run_timeout_s
@@ -7144,6 +7161,7 @@ class Daemon:
                 # Its tier or the route changed after the slot check: it takes a slot where it runs.
                 why = self._start_hold(task, run_prov, ctx, reserve=True, reroute=False)
                 if why:
+                    self._route_unlease(lease)
                     fate[task["id"]] = "full" if why == "gate" and task["id"] in ctx["full"] \
                         else SLOT_HELD_BY.get(why, "other")
                     if why != "resource":
@@ -7159,6 +7177,7 @@ class Daemon:
             except Exception as e:
                 self._workspace_failed(task, e)
                 self._unreserve(task)
+                self._route_unlease(lease)
                 continue
             self._workspace_tries(task["id"], clear=True)
             from .prompts import spec_digest, worker_resume, worker_system, worker_task
@@ -7189,14 +7208,17 @@ class Daemon:
                                                conflict=note.get(conflictfix.KEY)), None
                 prompt += startcheck.prompt_lines(found)   # a resumed session is told too
                 db.update_task(task["id"], status="running", branch=branch, blocked_reason=None)
-                self.start_run("worker" if task["kind"] != "review" else "reviewer", prompt, run_prov, tier, cwd,
-                               task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] else None,
-                               timeout_s=(routed or {}).get("timeout_s"),
-                               read_only=False, append_system=system, note=note,
-                               resume=lost["session"] if lost else None)
+                run_id = self.start_run("worker" if task["kind"] != "review" else "reviewer", prompt, run_prov, tier, cwd,
+                                        task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] else None,
+                                        timeout_s=(routed or {}).get("timeout_s"),
+                                        read_only=False, append_system=system, note=note,
+                                        resume=lost["session"] if lost else None)
+                if lease:   # the lease now names the run's supervisor in place of the daemon
+                    self._route_lease(task, routed, tier, now, run_id=run_id)
             except Exception as e:
                 self._start_failed(task, e)
                 self._unreserve(task)
+                self._route_unlease(lease)
                 if probing == task["id"] and not startbreaker.is_open(db):   # it failed elsewhere: closed
                     probing, probe_tried = None, False
                 continue
@@ -7340,6 +7362,8 @@ class Daemon:
             if gate.allow_new_work:   # held only because every worker slot is taken (check_slot_wait)
                 ctx.setdefault("full", {})[task["id"]] = slots
             return "gate"
+        if ctx.get("route_wait", {}).get(task["id"]) == provider:   # the host's routed slots are full
+            return "gate"
         if task["origin"] in ("schedule", "harness") and not gate.allow_optional:
             return "optional"
         if needs_device(task, self.cfg) and self._device_tasks_running() >= self._device_max_tasks():
@@ -7400,14 +7424,52 @@ class Daemon:
         if provider != (task["provider"] or self.cfg.get("core_provider", "claude")):
             return provider
         routed = self._route(task, task["tier"], None, ctx["now"])
-        if not routed or routed["fallback"] != "none" or self._no_room(routed["to"], ctx):
+        if not routed or routed["fallback"] != "none":
             return provider
-        return routed["to"]
+        why = self._no_room(routed["to"], ctx)
+        if why == "slots" and self._route_wait(task["id"], ctx["now"]) is not None:
+            ctx.setdefault("route_wait", {})[task["id"]] = routed["to"]   # it waits for a routed slot
+            return routed["to"]
+        return provider if why else routed["to"]
+
+    def _route_wait(self, tid: int, now: float) -> float | None:
+        """Seconds task `tid` has waited for a routed slot (its wait starts now if it was not
+        waiting), or None once route.wait_s has passed."""
+        since = self._route_waits.setdefault(tid, now)
+        return now - since if now - since < route.wait_s(self.cfg) else None
+
+    def _route_key(self, tid) -> str:
+        return f"{self.p.root}#{tid}"
+
+    def _route_lease(self, task: dict, routed: dict, tier: str, now: float, run_id: int | None = None) -> tuple | None:
+        """Take (or, with `run_id`, move to that run's supervisor) the task's host-wide routed slot
+        (route.host_take): (provider, key), or None when the host's slots are all held. A lease file
+        that cannot be written never holds the run back (logged)."""
+        prov, key = routed["to"], self._route_key(task["id"])
+        limit = route.timeout_s(self.cfg, tier) or (self.cfg["budget"].get("run_timeout_s") or {}).get(tier, 3600)
+        until = now + float(limit) + route.LEASE_GRACE_S
+        pid = os.getpid()
+        if run_id is not None:
+            r = self.p.db.one("SELECT pid FROM runs WHERE id=?", (run_id,))
+            pid = int(r["pid"]) if r and r["pid"] else pid
+        try:
+            return (prov, key) if route.host_take(prov, key, pid, until, now) else None
+        except OSError as e:
+            log(self.p, f"task {task['id']}: routed slot lease not written, starting anyway: {e}")
+            return (prov, key)
+
+    def _route_unlease(self, lease: tuple | None) -> None:
+        if lease:
+            try:
+                route.host_release(*lease)
+            except OSError as e:
+                log(self.p, f"routed slot lease {lease[1]} not freed (dropped once stale): {e}")
 
     def _no_room(self, prov: str, ctx: dict) -> str:
-        """Why routed-to `prov` cannot take a run now, as a route fallback reason (route.REASONS), or
-        '': auth (logged out), down (its API host does not resolve), busy (its gate holds new work, a
-        pause, or every one of its worker slots is taken)."""
+        """Why routed-to `prov` cannot take a run now, or '': auth (logged out), down (its API host
+        does not resolve), busy (its gate holds new work or a pause holds it), slots (every one of its
+        worker slots is taken, or every one of the host's for it: route.host_full); all but slots are
+        route fallback reasons (route.REASONS)."""
         now = ctx["now"]
         if self._logged_out(prov) and not self._may_probe(prov, now):
             return "auth"
@@ -7415,9 +7477,10 @@ class Daemon:
             return "down"
         gate = self.gates.get(prov) or bud.evaluate(self.p.db, self.cfg, prov, bud.plan_windows(self.p.db))
         lim = self._provider_pause(prov)
-        if (lim and lim.get("until", 0) > now) or not gate.allow_new_work \
-                or ctx["busy"].get(prov, 0) >= gate.max_parallel:
+        if (lim and lim.get("until", 0) > now) or not gate.allow_new_work:
             return "busy"
+        if ctx["busy"].get(prov, 0) >= gate.max_parallel or route.host_full(prov, now):
+            return "slots"
         return ""
 
     def _resumable(self, task: dict, provider: str) -> dict | None:

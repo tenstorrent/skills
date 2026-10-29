@@ -18,8 +18,19 @@ replaces the tier's budget.run_timeout_s for its routed runs (timeout_s); a fall
 provider keeps the tier default.
 
 Slots: a routed start takes a worker slot under the routed-to provider's gate (its max_parallel,
-allow_new_work, pause and net hold), never the core provider's; when that has no room the run starts
-on the core provider, under the core gate, with fallback `busy` (no fault: no cool-down).
+allow_new_work, pause and net hold), never the core provider's, and one of the host's slots for that
+provider (below). When its gate holds new work or a pause holds the provider, the run starts on the
+core provider, under the core gate, with fallback `busy` (no fault: no cool-down). When only slots are
+full (the project's or the host's), the task waits for one up to `providers.chat.route_wait_s` (WAIT_S;
+0: no wait), as a task waits for a worker slot; a run that got one after waiting says `waited_s`, and
+past the wait it starts on the core provider with fallback `busy_wait_expired` and the `waited_s`.
+
+Host slots: every project of this account on this host shares one limit per routed-to provider, so
+projects using one account key never exceed it together: the account setting `route.host_max`
+(`ttp config --account route.host_max N`) or TTP_ROUTE_HOST_MAX, else HOST_MAX; 0 turns it off. Each
+routed start holds a lease in ~/.tt-project/route-slots/<provider>.json (host_take, under a file lock)
+naming the run's supervisor pid and start, freed when the run ends (host_release); a lease whose
+process is gone (a crash, a reboot) or past its run's time limit is dropped by the next reader.
 
 Fallback: a routed run that ended on an endpoint fault (unreachable or timed out: down; 5xx or a
 missing model: error; 429 or rate-limit wording: rate_limit; a refused key: auth, through the auth
@@ -42,8 +53,12 @@ result.json (valid or not) is left as it is.
 """
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import time
+from contextlib import contextmanager
+from pathlib import Path
 
 TO = "chat"                 # the provider a tier can be routed to
 KEY = "route"               # the run note's entry
@@ -52,8 +67,14 @@ REJECTED = "route_effort_rejected:"   # kv: <model>|<effort> whose effort_fields
 COOLDOWN_S = 900
 FAULTS = ("down", "error", "rate_limit", "auth", "malformed")
 RUN_CAUSES = ("timeout", "failed", "no_handoff")   # a routed run's own end without a hand-off (own_cause)
-# busy: the routed-to provider had no free slot (its gate), no fault; rerun: the task fell back on its own before.
-REASONS = ("none", *FAULTS, *RUN_CAUSES, "busy", "rerun")
+# busy: the routed-to provider's gate or a pause held new work, no fault; busy_wait_expired: its slots
+# (the project's or the host's) stayed full for the whole wait; rerun: the task fell back on its own before.
+REASONS = ("none", *FAULTS, *RUN_CAUSES, "busy", "busy_wait_expired", "rerun")
+WAIT_S = 90.0               # providers.chat.route_wait_s: how long a routed start waits for a slot
+HOST_MAX = 6                # route.host_max unset: the most routed runs seen at once on one key without a 429
+HOST_ENV = "TTP_ROUTE_HOST_MAX"
+HOST_DIR = "route-slots"    # under ~/.tt-project: <provider>.json (the leases) and <provider>.lock
+LEASE_GRACE_S = 900         # a lease outlives its run's time limit by this much at most
 # Run ends a bridge fault turns into a fallback; any other end is the run's own.
 FAULT_ENDS = ("failed", "request_error", "timeout", "stalled")
 
@@ -217,7 +238,7 @@ def _rows(db, since: float, until: float | None = None) -> list[dict]:
         if e:
             out.append({**{k: r[k] for k in ("id", "task", "provider", "model", "status", "cost_usd")},
                         "tier": e.get("tier"), "to": e.get("to"), "fallback": e.get("fallback") or "none",
-                        "priced": e.get("priced"), "salvaged": bool(e.get("salvaged")),
+                        "priced": e.get("priced"), "salvaged": bool(e.get("salvaged")), "waited_s": e.get("waited_s"),
                         "effort": e.get("effort") if isinstance(e.get("effort"), dict) else None,
                         "wall_s": round(float(r["ended"]) - float(r["started"]), 1) if r["ended"] and r["started"] else None})
     return out
@@ -244,6 +265,8 @@ def phrase(db, now: float | None = None) -> str:
         text += f", {len(fell)} fell back ({', '.join(f'{k} {n}' for k, n in sorted(why.items()))})"
     if reruns:
         text += f", {reruns} rerun{'s' if reruns != 1 else ''} on core"
+    if waited := sum(1 for r in on if r.get("waited_s")):   # got a full slot after waiting (route_wait_s)
+        text += f", {waited} after a slot wait"
     if salvaged := sum(1 for r in on if r.get("salvaged")):   # hand-offs kept from a final reply (salvage)
         text += f", {salvaged} hand-off{'s' if salvaged != 1 else ''} salvaged"
     last = {}   # each routed tier's latest effort fields (effort_fields), as the endpoint got them
@@ -331,3 +354,106 @@ def config_problems(raw: dict) -> list[str]:
     if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
         out.append(f"providers.{TO}.route_cooldown_s: give seconds (0 or more); {COOLDOWN_S} is used")
     return out
+
+
+def wait_s(cfg: dict) -> float:
+    """How long a routed start waits for a slot (providers.chat.route_wait_s, else WAIT_S; 0: none)."""
+    v = ((cfg.get("providers") or {}).get(TO) or {}).get("route_wait_s")
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else WAIT_S
+
+
+def host_limit() -> int:
+    """Routed runs per provider at once on this host: TTP_ROUTE_HOST_MAX, else the account's
+    route.host_max, else HOST_MAX; 0 means no limit, an unreadable value the default."""
+    from . import project
+    for v in (os.environ.get(HOST_ENV), (project.load_account_settings().get("route") or {}).get("host_max")):
+        try:
+            n = int(str(v).strip()) if v not in (None, "") else -1
+        except ValueError:
+            n = -1
+        if n >= 0:
+            return n
+    return HOST_MAX
+
+
+def _host_file(prov: str) -> Path:
+    from . import project
+    return project.HOME_DIR / HOST_DIR / f"{prov}.json"
+
+
+def _held(lease, now: float) -> bool:
+    """A lease still stands: its process runs (the same one: its start token matches) and its run's
+    time limit plus LEASE_GRACE_S has not passed."""
+    from . import runner
+    if not isinstance(lease, dict) or float(lease.get("until") or 0) < now:
+        return False
+    try:
+        pid = int(lease.get("pid") or 0)
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    except (TypeError, ValueError):
+        return False
+    start = lease.get("start")
+    return not start or runner.proc_start(pid) == start
+
+
+def _read(path: Path, now: float) -> dict:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if _held(v, now)} if isinstance(data, dict) else {}
+
+
+@contextmanager
+def _locked(prov: str):
+    path = _host_file(prov)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_suffix(".lock"), "a") as fd:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield path
+
+
+def _write(path: Path, leases: dict) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}")
+    tmp.write_text(json.dumps(leases))
+    os.replace(tmp, path)
+
+
+def host_used(prov: str, now: float | None = None) -> int:
+    """Live leases on `prov` on this host (an unreadable file: none)."""
+    return len(_read(_host_file(prov), now or time.time()))
+
+
+def host_full(prov: str, now: float | None = None) -> bool:
+    n = host_limit()
+    return bool(n) and host_used(prov, now) >= n
+
+
+def host_take(prov: str, key: str, pid: int, until: float, now: float | None = None) -> bool:
+    """Take (or keep) the lease `key` on `prov` for process `pid` until `until`: False when the host's
+    slots are all held by others. Stale leases are dropped on the way. A lease file that cannot be
+    written raises OSError (the caller decides)."""
+    from . import runner
+    now = now or time.time()
+    with _locked(prov) as path:
+        leases = _read(path, now)
+        n = host_limit()
+        if key not in leases and n and len(leases) >= n:
+            return False
+        leases[key] = {"pid": pid, "start": runner.proc_start(pid) or "", "until": until, "ts": now}
+        _write(path, leases)
+    return True
+
+
+def host_release(prov: str, key: str) -> None:
+    """Free the lease `key` on `prov` (none: nothing to do)."""
+    with _locked(prov) as path:
+        leases = _read(path, time.time())
+        if leases.pop(key, None) is not None or path.exists():
+            _write(path, leases)

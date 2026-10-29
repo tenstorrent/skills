@@ -503,8 +503,10 @@ PROVIDER_KEYS = {"tiers", "plugin_dirs", "worker_isolation", "mcp_servers", "mcp
                  # the base URL saved with it, a max_tokens cap and the model's context_window (also per tier).
                  # route_cooldown_s: how long a tier routed to it (tiers.<tier>.route, route.py) runs on the
                  # core provider after a fallback. effort_fields: per model, the run's effort to extra request
-                 # fields (chatbridge.effort_fields).
-                 "endpoint", "base_url", "max_tokens", "context_window", "route_cooldown_s", "effort_fields"}
+                 # fields (chatbridge.effort_fields). route_wait_s: how long a routed start waits for a full
+                 # slot before it starts on the core provider (route.wait_s).
+                 "endpoint", "base_url", "max_tokens", "context_window", "route_cooldown_s", "effort_fields",
+                 "route_wait_s"}
 
 
 def _known_keys(path: list[str]) -> set[str] | None:
@@ -2195,6 +2197,7 @@ def unregister(name: str) -> None:
 # Account-level settings: one file per user and machine that every project reads, below the
 # project's own project.json, so the projects on a machine agree unless one overrides a key.
 ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_spend_to"}, "pricing": {"claude"},
+                "route": {"host_max"},   # routed runs per provider at once on this host (route.host_limit)
                 "checks": {"host_max", "load_extra", "nice", "ionice", "priority_turns", "test_pool", "test_run_max",
                            "test_project_max", "test_project_slots", "build_pool", "build_run_max", "build_project_max", "wall_cap_s",
                            "slots", "light_cmds", "max_wait_s", "wait_event_s", "priority_age_s",

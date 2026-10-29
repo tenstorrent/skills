@@ -763,9 +763,130 @@ def test_a_routed_start_takes_its_slot_under_the_chat_gate(env, monkeypatch):
     _route_config(p)
     d = Daemon(p.base)
     core = d.cfg.get("core_provider", "claude")
-    # One slot on each gate, four routed tasks: one runs on chat, the overflow on the core provider.
-    assert sorted(_route_slots(p, d, monkeypatch, 4)) == sorted([("chat", "none"), (core, "busy")])
-    assert len(p.db.q("SELECT id FROM tasks WHERE status='queued'")) == 2
+    # One slot on each gate, four routed tasks: one runs on chat, the overflow waits for a chat slot
+    # (route_wait_s) instead of falling back to the core provider at once.
+    assert _route_slots(p, d, monkeypatch, 4) == [("chat", "none")]
+    assert len(p.db.q("SELECT id FROM tasks WHERE status='queued'")) == 3
+    assert core != "chat" and len(d._route_waits) == 3
+
+
+def _route_ticks(p, d, monkeypatch, n=0, chat_max=1, chat_running=0, tag="w"):
+    """One dispatch tick (n new routed tasks first); returns [(provider, route entry)] of its starts."""
+    from ttp import budget as bud
+    from ttp import coordinator as coord
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda role, prompt, provider, tier, cwd, **k: started.append(
+        (provider, dict((k.get("note") or {}).get("route") or {}))) or 0)
+    monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.root), None))
+    d.gates[d.cfg.get("core_provider", "claude")] = bud.Gate("core", regime="windows", max_parallel=4)
+    d.gates["chat"] = bud.Gate("chat", regime="windows", max_parallel=chat_max)
+    d.cfg["budget"]["urgent_extra_slots"] = 0
+    p.db.x("UPDATE runs SET status='done' WHERE status='running'")
+    for _ in range(chat_running):
+        p.db.x("INSERT INTO runs(role,provider,started,status,boot_id) VALUES('worker','chat',?,'running',?)",
+               (time.time(), d.boot))
+    if n:
+        assert coord.apply(p, [{"type": "task_add", "title": f"{tag}{i}", "spec": f"s {tag}", "tier": "light",
+                                "priority": 1} for i in range(n)]) == []
+    d.dispatch()
+    return started
+
+
+def test_a_routed_start_waits_a_bounded_time_for_a_full_slot_then_falls_back_busy_wait_expired(env, monkeypatch):
+    from ttp import route
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    core = d.cfg.get("core_provider", "claude")
+    assert route.wait_s(d.cfg) == route.WAIT_S == 90.0
+    # Two routed tasks, one chat slot: the second waits; nothing starts on the core provider.
+    first = _route_ticks(p, d, monkeypatch, 2)
+    assert [(prov, e["fallback"]) for prov, e in first] == [("chat", "none")] and "waited_s" not in first[0][1]
+    (waiting,) = d._route_waits
+    # The slot frees within the wait: it starts on chat and says how long it waited.
+    (prov, e), = _route_ticks(p, d, monkeypatch)
+    assert (prov, e["fallback"]) == ("chat", "none") and 0 <= e["waited_s"] < 90 and not d._route_waits
+    # Full for the whole wait: it starts on the core provider, busy_wait_expired with the wait.
+    _route_ticks(p, d, monkeypatch, 1, chat_running=1, tag="x")
+    (tid,) = d._route_waits
+    assert _route_ticks(p, d, monkeypatch, chat_running=1) == []   # still within the wait: held
+    d._route_waits[tid] = time.time() - 91
+    (prov, e), = _route_ticks(p, d, monkeypatch, chat_running=1)
+    assert (prov, e["fallback"]) == (core, "busy_wait_expired") and e["waited_s"] >= 90 and not d._route_waits
+    # route_wait_s 0: no wait at all.
+    _route_config(p, route_wait_s=0)
+    d = Daemon(p.base)
+    (prov, e), = _route_ticks(p, d, monkeypatch, 1, chat_running=1, tag="y")
+    assert (prov, e["fallback"]) == (core, "busy_wait_expired") and e["waited_s"] == 0
+    assert "busy_wait_expired" in route.REASONS and p.config()["providers"]["chat"]["route_wait_s"] == 0
+
+
+def test_two_projects_share_the_hosts_routed_slots_and_a_finished_run_frees_its_own(env, monkeypatch):
+    from ttp import project, route
+    from ttp.daemon import Daemon
+    monkeypatch.setenv(route.HOST_ENV, "1")
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    # Another project's daemon on this host holds the one routed slot (its lease, as host_take writes it).
+    other = f"{env['tmp']}/other-project#7"
+    assert route.host_take("chat", other, os.getpid(), time.time() + 600)
+    # This project has free chat slots of its own, but the host has none: its routed task waits.
+    assert _route_ticks(p, d, monkeypatch, 1, chat_max=4) == [] and len(d._route_waits) == 1
+    assert route.host_used("chat") == 1
+    # The other project's run ends: this one takes the slot, and the other cannot take it back.
+    route.host_release("chat", other)
+    (prov, e), = _route_ticks(p, d, monkeypatch, chat_max=4)
+    assert (prov, e["fallback"]) == ("chat", "none") and "waited_s" in e and route.host_used("chat") == 1
+    assert not route.host_take("chat", other, os.getpid(), time.time() + 600)
+    # This project's run ends: finish_run frees its own lease, and the other project gets the slot.
+    (tid,) = [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE status='running'")]
+    _route_finish(p, d, tid, {"rc": 0})
+    assert route.host_used("chat") == 0 and route.host_take("chat", other, os.getpid(), time.time() + 600)
+    # The limit is account-wide: route.host_max in the account settings, 0 for none.
+    monkeypatch.delenv(route.HOST_ENV)
+    assert route.host_limit() == route.HOST_MAX
+    project.set_account_setting("route.host_max", "0")
+    assert route.host_limit() == 0 and not route.host_full("chat")
+
+
+def test_a_stale_routed_slot_lease_is_dropped_and_a_bad_lease_file_never_holds_runs(env, monkeypatch):
+    import subprocess
+    from ttp import route, runner
+    monkeypatch.setenv(route.HOST_ENV, "1")
+    now = time.time()
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    path = route._host_file("chat")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stale = {"crashed": {"pid": gone.pid, "start": "", "until": now + 600},   # its process is gone
+             "expired": {"pid": os.getpid(), "start": runner.proc_start(os.getpid()), "until": now - 1},
+             "reused": {"pid": os.getpid(), "start": "not-this-process", "until": now + 600},   # pid reused
+             "junk": "x"}
+    for key, lease in stale.items():
+        path.write_text(json.dumps({key: lease}))
+        assert route.host_used("chat", now) == 0, key
+        assert route.host_take("chat", "next", os.getpid(), now + 600, now), key
+        assert set(json.loads(path.read_text())) == {"next"}, key
+        route.host_release("chat", "next")
+    assert route.host_take("chat", "a", os.getpid(), now + 600, now)
+    assert not route.host_take("chat", "b", os.getpid(), now + 600, now)   # a live holder keeps the slot
+    assert route.host_take("chat", "a", os.getpid(), now + 600, now)   # its own lease: kept, not doubled
+    path.write_text("{not json")   # unreadable: no lease stands
+    assert route.host_used("chat", now) == 0 and route.host_take("chat", "b", os.getpid(), now + 600, now)
+
+
+def test_status_counts_routed_slot_waits_and_busy_wait_expired(env):
+    from ttp import route
+    p = make(env)
+    now = time.time()
+    for prov, e in (("chat", {"fallback": "none", "waited_s": 12.0}), ("chat", {"fallback": "none"}),
+                    ("claude", {"fallback": "busy_wait_expired", "waited_s": 90.0})):
+        p.db.x("INSERT INTO runs(role,provider,started,ended,status,note) VALUES('worker',?,?,?,'ok',?)",
+               (prov, now - 60, now - 30, json.dumps({"route": {"tier": "light", "to": "chat", **e}})))
+    assert route.phrase(p.db, now) == "routed 24h: 2 runs to chat, 1 fell back (busy_wait_expired 1), 1 after a slot wait"
 
 
 def test_a_routed_start_is_not_held_by_full_core_slots(env, monkeypatch):
