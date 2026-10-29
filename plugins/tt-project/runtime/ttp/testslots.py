@@ -290,9 +290,9 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
     marks push checks, which take the branch's reserved slot when the pool has none free. `kind` BUILDS
     takes build slots instead; a build nested in a check uses the check's test grant. `priority` (the
     task's) orders its project's waiters, most urgent first, then arrival (suite_priority: a waiter ages
-    one step per SUITE_AGE_S); a priority-1 waiter whose project's budget is held only by less urgent runs
-    takes one extra run's grant beyond it (urgent_paths) from the pool's free slots, so it never waits
-    behind a long, less urgent check and stops none."""
+    one step per age_s(cfg), checks.priority_age_s); a priority-1 waiter whose project's budget is held
+    only by less urgent runs takes one extra run's grant beyond it (urgent_paths) from the pool's free
+    slots, so it never waits behind a long, less urgent check and stops none."""
     tell = tell or (lambda _line: None)
     what = f"{kind.name} slots"
     for env in (kind.held_env, HELD_ENV):   # HELD_ENV: a build in a check builds on the check's slots
@@ -317,7 +317,8 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                     line_of = f"{kind.own}.{locks.group_id(name)}"
                     if mine is None:
                         mine = locks.enqueue(checkcap.slot_dir(), line_of, holder, start, priority=priority)
-                    line = sorted(locks.queued(checkcap.slot_dir(), line_of), key=_order_key)
+                    step = age_s(cfg)
+                    line = sorted(locks.queued(checkcap.slot_dir(), line_of), key=lambda t: _order_key(t, age=step))
                     ahead = line[:line.index(mine)] if mine in line else line
                     if (not ahead and not locks.any_free(own) and priority is not None and priority <= 1
                             and (recs := locks.holder_records(own))
