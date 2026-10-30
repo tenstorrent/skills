@@ -113,8 +113,8 @@ prolonged whole-box outage.
   projects elsewhere, and machines tagged `tt-project` in `ttp machines` (`ttp machines add <alias>
   --tags tt-project`). Other machines are asked over ssh (BatchMode, no prompts) with
   `ttp spend-today`, at most every 10 minutes; their answers are cached in
-  `~/.tt-project/global-spend.json`. A machine not heard from for 30 minutes still counts with its
-  last answer for the same day and is shown as stale. A machine that can reach another but not the
+  `~/.tt-project/global-spend.json`. A machine not heard from for 30 minutes is shown as stale with
+  what its last answer for the same day would add, and is not counted: stale data never trips the cap. A machine that can reach another but not the
   other way round (a laptop that can reach a server, but not the server the laptop) pushes its own
   `spend-today` there instead: with the global cap on, each machine sends it over ssh to
   `ttp spend-today --receive` on every machine it asks, every 10 minutes (every 6 hours to a machine
@@ -122,15 +122,22 @@ prolonged whole-box outage.
   are kept in `~/.tt-project/global-spend-pushed.json` and count like asked ones, stale after 30
   minutes the same way; a machine both asked and pushing counts once, with its newer answer.
   Each answer, asked or pushed, also carries that machine's estimate of its other Claude Code
-  sessions (`other_sessions`: provider, account hash, dollars, `estimated: true`; `null` while its
-  logs are not read yet). It counts with that machine's answer, so once per machine, and the total
-  names it apart from this machine's own sessions. An answer from an older tt-project has no such
-  field: it still counts, its sessions count 0, and the total says they are missing.
+  sessions (`other_sessions`: provider, account hash, dollars, `estimated: true`, and `billing`; `null`
+  while its logs are not read yet). The estimate prices each Claude model call in
+  `~/.claude/projects` at list price once, skips non-Claude models (a provider that runs Claude Code
+  against another vendor's endpoint) and leaves out every tt-project run of any provider, which its
+  project already books. `billing` comes from that machine's Claude Code login, never its name:
+  `usage` (an API key, a key helper, or a usage-billed seat), `plan` (a subscription plan) or
+  `unknown`. Only `usage` sessions count, once per machine with its answer. Plan sessions are shown
+  apart as "subscription plan" and unknown ones as "estimated, not billed"; neither ever counts. An
+  answer from an older tt-project has no such field: its sessions count 0 and are shown as unknown.
+  The budget line, `ttp status` and the web header show what is not counted after the total
+  (`; not counted: $X subscription plan, $Y estimated, not billed, $Z stale`).
   `budget.push_spend_to` (account-level) names the machines to push to instead, or `"none"` turns
   pushing off. If the total cannot be worked out at all, the
   per-project caps stay in charge. Web, desktop and cloud sessions are not seen; another
   source can be added in code with `globalcap.add_other_source(fn)`, where
-  `fn(provider, account, start, end)` returns `(usd, label)`.
+  `fn(provider, account, start, end)` returns `(usd, label)` or `(usd, label, billing)`.
 - Budget day: with `budget.day_start` set (`"HH:MM"`), "today" is a fixed day starting at that time
   in `budget.timezone` (an IANA name such as `Europe/Berlin`; unset, the project's home zone, below;
   the host's own zone plays no part), 23 or 25 hours long across a daylight-saving change. The daily cap and the global

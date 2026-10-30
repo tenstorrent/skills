@@ -3616,3 +3616,145 @@ def test_idle_capacity_still_reported_when_the_only_ready_task_is_branch_held(en
     p.db.add_task("also feat/x", "s", kind="code", tier="light", origin="coordinator", labels=["pr_branch:feat/x"])
     check(now)
     assert len(check(now + 3 * 3600)) == 1, "a branch-held task hid the free slot"
+
+
+# the global cap counts only usage-billed spend -------------------------------------------------------
+@pytest.mark.parametrize("env_key,state,settings,creds,want", [
+    ("sk-x", {}, {}, None, "usage"),                                            # API key in the environment
+    ("", {"primaryApiKey": "k"}, {}, None, "usage"),                             # API key login
+    ("", {}, {"apiKeyHelper": "/bin/key"}, None, "usage"),                       # key helper
+    ("", {}, {"env": {"ANTHROPIC_API_KEY": "k"}}, None, "usage"),                 # key in settings' env
+    ("", {"oauthAccount": {"seatTier": "enterprise_usage_based", "billingType": "x_subscription"}}, {}, None, "usage"),
+    ("", {"oauthAccount": {"organizationType": "claude_max"}}, {}, None, "plan"),
+    ("", {"oauthAccount": {}}, {}, {"claudeAiOauth": {"subscriptionType": "max"}}, "plan"),
+    ("", {"oauthAccount": {"organizationType": "claude_pro"}}, {}, None, "plan"),
+    ("", {"oauthAccount": {"organizationType": "mystery"}}, {}, None, "unknown"),  # a login it cannot tell
+    ("", {}, {}, None, "unknown"),                                               # no login at all
+    ("", "not json", "[]", "{", "unknown"),                                      # unreadable files
+])
+def test_billing_mode_is_read_from_the_claude_code_login(env, tmp_path, monkeypatch, env_key, state, settings, creds, want):
+    from ttp import localspend as ls
+    root = tmp_path / "cfg"
+    root.mkdir()
+    for name, body in ((".claude.json", state), ("settings.json", settings), (".credentials.json", creds)):
+        if body is not None:
+            (root / name).write_text(body if isinstance(body, str) else json.dumps(body))
+    assert ls.billing_mode({"CLAUDE_CONFIG_DIR": str(root), "ANTHROPIC_API_KEY": env_key}) == want
+
+
+def _sessions_day(env, tmp_path, monkeypatch, login):
+    """A project, the global cap on at $100, and one $15 Claude Code session outside tt-project in
+    this machine's logs under `login`; returns (project, budget, start, end, now)."""
+    from ttp import localspend as ls
+    from ttp import project
+    logs = _claude_logs(tmp_path, monkeypatch, login=login)
+    p = make(env)
+    now = time.time()
+    b = _far_day(now)
+    for k in ("day_start", "timezone"):
+        project.set_account_setting(f"budget.{k}", b[k])
+    project.set_account_setting("budget.global_daily_usd", 100)
+    p.db.spend("claude", 1.0, "task:1")
+    _log(logs, "s1", [_call("s1", "m1", now - 60, output_tokens=1_000_000)])
+    ls.scan(ls.account_budget(), now)
+    from ttp import globalcap as gcap
+    start, end = gcap.day_bounds(b, now)
+    return p, b, start, end, now
+
+
+@pytest.mark.parametrize("login,key,line", [
+    ({"oauthAccount": {"organizationType": "claude_max"}}, "plan_usd",
+     "not counted: $15.00 subscription-plan sessions on this machine (list price; metered by the plan's 5h and 7d windows"),
+    ({}, "unbilled_usd", "not counted: $15.00 estimated, not billed: sessions on this machine whose billing is unknown"),
+])
+def test_plan_and_unknown_billing_sessions_are_shown_apart_and_never_counted(env, tmp_path, monkeypatch, login, key, line):
+    from ttp import budget as bud
+    from ttp import globalcap as gcap
+    from ttp.web import usage_line
+    p, b, start, end, now = _sessions_day(env, tmp_path, monkeypatch, login)
+    t = gcap.total(p.db, "claude", start, end, now)
+    assert t["usd"] == 1.0 and t[key] == 15.0 and line in t["includes"], t
+    p.set_config("budget.global_daily_usd", 10)
+    g = bud.evaluate(p.db, p.config(), "claude", [], now)
+    assert g.level == "green" and g.numbers["global_today"] == 1.0 and g.numbers[f"global_{key}"] == 15.0, g.numbers
+    word = "subscription plan" if key == "plan_usd" else "estimated, not billed"
+    assert f"$1.00 of $10 global; not counted: $15.00 {word}" in usage_line(g.numbers, now), usage_line(g.numbers, now)
+
+
+def test_usage_billed_sessions_count_and_trip_the_cap(env, tmp_path, monkeypatch):
+    from ttp import budget as bud
+    from ttp import globalcap as gcap
+    from ttp.web import usage_line
+    p, b, start, end, now = _sessions_day(env, tmp_path, monkeypatch,
+                                          {"oauthAccount": {"seatTier": "enterprise_usage_based"}})
+    t = gcap.total(p.db, "claude", start, end, now)
+    assert t["usd"] == 16.0 and t["plan_usd"] == t["unbilled_usd"] == t["stale_usd"] == 0, t
+    assert "not counted" not in t["includes"], t["includes"]
+    p.set_config("budget.global_daily_usd", 10)
+    g = bud.evaluate(p.db, p.config(), "claude", [], now)
+    assert g.level == "red" and "global daily cap reached" in " ".join(g.reasons), (g.level, g.reasons)
+    assert "not counted" not in usage_line(g.numbers, now)
+
+
+def test_tt_project_runs_of_any_provider_and_other_models_are_not_other_sessions(env, tmp_path, monkeypatch):
+    # A provider that drives Claude Code against another vendor's endpoint writes the same logs: its
+    # runs are tt-project's own (booked by that provider), and a non-Claude model is never Anthropic
+    # spend, so neither shows up as other Claude Code sessions.
+    from ttp import globalcap as gcap
+    from ttp import localspend as ls
+    logs = _claude_logs(tmp_path, monkeypatch)
+    p = make(env)
+    other = _other_project(tmp_path, "other")
+    now = time.time()
+    M = 1_000_000
+    _log(logs, "chat-run", [_call("chat-run", "c1", now - 60, output_tokens=M)])
+    _log(logs, "glm", [_call("glm", "g1", now - 60, model="zai-org/GLM-5.3", output_tokens=M)])
+    _log(logs, "user", [_call("user", "u1", now - 60, output_tokens=M),
+                        _call("user", "u2", now - 59, model="other-vendor-model", output_tokens=M)])
+    other.x("INSERT INTO runs(role,provider,started,ended,status,session_id) VALUES('worker','chat',?,?,'ok','chat-run')",
+            (now - 100, now - 30))
+    b = _far_day(now)
+    ls.scan(b, now)
+    start, end = gcap.day_bounds(b, now)
+    e = ls.estimate(b, start, end, now)
+    assert e["usd"] == 15 and e["sessions"] == 1 and e["unknown"] == [], e
+
+
+def test_remote_sessions_count_only_from_a_usage_billed_login_and_a_stale_machine_never_trips_the_cap(env, monkeypatch):
+    from ttp import budget as bud
+    from ttp import globalcap as gcap
+    p = make(env)
+    now = time.time()
+    start, end = now - 3600, now + 3600
+    monkeypatch.setattr(gcap, "OTHER_SOURCES", [])
+    monkeypatch.setattr(gcap, "targets", lambda: [])
+    key = gcap.account_key("claude", "acct-a")
+
+    def push(host, usd, sessions, billing):
+        o = {"provider": "claude", "key": key, "usd": sessions, "sessions": 1, "estimated": True}
+        if billing:
+            o["billing"] = billing
+        rec = {"v": 1, "host": host, "sent": now, "windows": [{"start": start, "end": end, "projects": ["far"],
+                                                                "rows": [{"provider": "claude", "key": key, "usd": usd}],
+                                                                gcap.SESSIONS: o}]}
+        return gcap.receive((json.dumps(rec) + "\n").encode(), host, now)[1]
+    assert push("api", 2.0, 3.0, "usage") == 0
+    assert push("max", 4.0, 96.0, "plan") == 0
+    assert push("old", 5.0, 7.0, None) == 0          # an older tt-project: billing cannot be told
+    assert push("bad", 1.0, 1.0, "free") == 2         # an unknown billing word is a malformed record
+    t = gcap.total(p.db, "claude", start, end, now + 1, account="acct-a")
+    assert t["usd"] == 2 + 3 + 4 + 5 and t["remote_sessions_usd"] == 3.0, t
+    assert t["plan_usd"] == 96.0 and t["unbilled_usd"] == 7.0 and t["stale_usd"] == 0, t
+    assert "$96.00 subscription-plan sessions on max" in t["includes"] and "$7.00 estimated, not billed: sessions on old" in t["includes"]
+    # Past STALE_S every machine is stale: its billed number is shown with what it adds, not counted.
+    later = now + gcap.STALE_S + 1
+    t = gcap.total(p.db, "claude", start, end, later, account="acct-a")
+    assert t["usd"] == 0 and t["stale_usd"] == 14.0 and sorted(t["stale"]) == ["api", "max", "old"], t
+    assert "$14.00 stale: api $5.00, max $4.00, old $5.00" in t["includes"], t["includes"]
+    p.set_config("budget.global_daily_usd", 10)
+    monkeypatch.setattr(gcap, "window", lambda b, n: (start, end, False))
+    monkeypatch.setattr(gcap, "account_of", lambda prov: "acct-a")
+    g = bud.evaluate(p.db, p.config(), "claude", [], later)
+    assert g.level != "red" and g.numbers["global_stale_usd"] == 14.0, (g.level, g.reasons, g.numbers)
+    g = bud.evaluate(p.db, p.config(), "claude", [], now + 1)
+    assert g.level == "red", (g.level, g.reasons)
