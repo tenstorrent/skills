@@ -845,8 +845,8 @@ def cmd_login(args) -> int:
         fwd = heard or (f"{used}:127.0.0.1:{used}" if used else None)
         fixed = used == port
         local = (f" (local port {used} on their machine: the browser returns to the port the link names, so a "
-                 "forward serves one box; a second box signing in at the same time needs its own "
-                 "`--callback-port` and its own standing forward)") if used else ""
+                 "forward serves one box; each box their machine keeps a standing forward to needs its own "
+                 "`--callback-port` and its own standing forward, whether or not sign-ins overlap in time)") if used else ""
         print((f"Its callback listens on the box at {kv['listen']}. " if heard else "")
               + ("Its callback could not be checked (no `ss` on the box). " if kv.get("listen") == "unknown" else "")
               + (f"It uses this box's fixed sign-in port {port}: one standing forward covers this and every later "

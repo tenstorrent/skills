@@ -3093,9 +3093,9 @@ def test_setup_box_agents_glean_sign_in_runs_in_tmux_and_hands_out_a_link_only_w
         assert (home / "cb.port").read_text().strip() == "41234"
         assert "fixed sign-in port 41234: one standing forward covers this and every later sign-in" in out
         assert "tell them once" in out and "leave it open" in out
-        # The forward names its local port, which is the link's: a second box at once needs its own port and forward.
+        # The forward names its local port, which is the link's: every box with a standing forward needs its own port.
         assert "<their ssh alias for <box-alias>>` (local port 41234 on their machine" in out, out
-        assert "a second box signing in at the same time needs its own `--callback-port` and its own standing forward" in out
+        assert "each box their machine keeps a standing forward to needs its own `--callback-port` and its own standing forward, whether or not sign-ins overlap in time" in out
         rc, out = login(status=True)
         assert rc == 1 and out.strip() == "claude glean on <box-alias>: pending"
         # A second start reuses the waiting sign-in; once its callback dies the link is called dead and replaced.
@@ -3157,12 +3157,12 @@ def test_setup_box_connector_sign_ins_document_one_fixed_callback_port_and_one_s
                  "at most 5 min for Claude Code's", "Claude Code stops its callback listener after 5 min",
                  "The user opens the link inside that window", "Start a new one only while the user is there",
                  f"Its local port (the first {port}) must be the port the link names",
-                 "a second box signing in at the same time from the same machine needs its own `--callback-port` "
-                 "and its own standing forward"):
+                 "each box a user's machine keeps a standing forward to needs its own `--callback-port` "
+                 "and its own standing forward for that port, whether or not sign-ins overlap in time"):
         assert want in agents, want
     connectors = " ".join((SKILLS / "setup-box" / "connectors.md").read_text(encoding="utf-8").split())
     assert "no callback port on the machine and no ssh forward" in connectors
-    assert "a second box signing in at the same time takes its own `--callback-port` and its own forward" in connectors
+    assert "each box a user's machine keeps a standing forward to takes its own `--callback-port` and its own forward, whether or not sign-ins overlap in time" in connectors
     assert "Claude Code's sign-in link works for 5 min: it is started only while the user is there" in connectors
     assert f"`-c mcp_oauth_callback_port={port}`" in connectors
 

@@ -109,9 +109,11 @@ Link to the tt-buddy plugin's recipes and skills; do not copy them here.
 - The user completes it either way: (a) one standing forward for the fixed port from the machine
   their browser runs on, `ssh -N -L 28461:127.0.0.1:28461 <their alias for the box>`, left open;
   with it open the page completes by itself, for this and every later sign-in on that box. Its
-  local port (the first 28461) must be the port the link names, so a forward serves one box: a
-  second box signing in at the same time from the same machine needs its own `--callback-port`
-  and its own standing forward for that port. Where the agent runs on the machine the browser runs
+  local port (the first 28461) must be the port the link names, so a forward serves one box: each
+  box a user's machine keeps a standing forward to needs its own `--callback-port` and its own
+  standing forward for that port, whether or not sign-ins overlap in time (with a standing
+  forward to the first box open, a second box on the same local port cannot bind it, or the
+  callback reaches the wrong box). Where the agent runs on the machine the browser runs
   on, it starts that forward itself in the background; otherwise it tells the user that one step once, not on every sign-in; or (b) the
   user opens the link, copies the `localhost` address the browser ends on, and the agent passes it
   on with `--code-stdin` (on stdin, never on a command line, never stored). `--status` says signed in,

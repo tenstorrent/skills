@@ -42,8 +42,9 @@ box.py connectors check ... --family Notes=Notion,Confluence   # add a family or
 - This step runs in the user's browser on claude.ai: no callback port on the machine and no ssh
   forward. A sign-in that does run on a box (an MCP server added there, such as Glean or Codex's
   Atlassian server) listens on the box's one fixed callback port, so one standing forward covers
-  them all (`agents.md`, MCP endpoints). One forward serves one box: a second box signing in at the
-  same time takes its own `--callback-port` and its own forward. Claude Code's sign-in link works
+  them all (`agents.md`, MCP endpoints). One forward serves one box: each box a user's machine
+  keeps a standing forward to takes its own `--callback-port` and its own forward, whether or not
+  sign-ins overlap in time. Claude Code's sign-in link works
   for 5 min: it is started only while the user is there to open it.
 
 ## 4. Verify
