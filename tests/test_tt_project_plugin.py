@@ -2726,8 +2726,13 @@ def test_setup_box_agents_login_wait_sets_the_window_and_the_message_names_its_e
     from zoneinfo import ZoneInfo
     ba = _agents(monkeypatch)
     import box
-    # The window is the caller's: --wait sets the box's timeout, else each login's default.
-    assert f"timeout {ba.SIGNIN_WAIT}" in ba.login_script("claude", "glean")
+    # The window is the caller's: --wait sets the box's timeout, else each login's default, never past the
+    # CLI's own limit: Claude Code stops its sign-in's callback listener after 5 min.
+    assert f"timeout {ba.SIGNIN_WAIT}" in ba.login_script("codex", "glean")
+    assert ba.SIGNIN_LIMIT["claude"] == 300 and ba.signin_wait("claude") == 300 == ba.signin_wait("claude", 7200)
+    assert 'TL="timeout 300"' in ba.login_script("claude", "glean")
+    assert 'TL="timeout 300"' in ba.login_script("claude", "glean", 7200)
+    assert 'TL="timeout 120"' in ba.login_script("claude", "glean", 120)
     assert "timeout 7200" in ba.login_script("codex", "glean", 7200) and "@ttp_until" in ba.login_script("codex", "glean")
     assert f"timeout {ba.LOGIN_WAIT}" in ba.login_script("claude") and "timeout 1800" in ba.login_script("claude", None, 1800)
     args = box.build_parser().parse_args(["agents", "login", "<box-alias>", "claude", "--mcp", "glean", "--wait", "7200"])
@@ -2750,17 +2755,25 @@ def test_setup_box_agents_login_wait_sets_the_window_and_the_message_names_its_e
     def login(**kw):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            rc = ba.cmd_login(argparse.Namespace(alias="<box-alias>", cli="claude", mcp="glean", status=False,
-                                                 code_stdin=False, **kw))
+            rc = ba.cmd_login(argparse.Namespace(**{"alias": "<box-alias>", "cli": "claude", "mcp": "glean",
+                                                    "status": False, "code_stdin": False, **kw}))
         return rc, buf.getvalue()
-    rc, out = login(wait=7200)
+    rc, out = login(wait=7200, cli="codex")
     assert rc == 0 and "timeout 7200" in sent[-1], out
-    assert f"This link works until {want}." in out and f"up to 120 min (until {want})" in out, out
+    assert f"This link works until {want}: open it before then." in out and f"up to 120 min (until {want})" in out, out
+    assert "Start a new one only while the user is there to open it." in out, out
+    # Claude Code's sign-in waits its own 5 min at most, and the message says so.
+    rc, out = login(wait=7200)
+    assert rc == 0 and 'TL="timeout 300"' in sent[-1] and "timeout 7200" not in sent[-1], out
+    assert f"up to 5 min (until {want})" in out and "inside that window" in out, out
+    assert "only while the user is there to open it (claude stops its sign-in after 5 min)." in out, out
     # A box that keeps no end (no `timeout` there) gets the length only; a too-short wait starts nothing.
     monkeypatch.setattr(ba, "_ssh", lambda alias, script, timeout, input=None: subprocess.CompletedProcess(
         [], 0, "state=pending\nsession=s\nout=Open https://example.invalid/oauth?x=1\n", ""))
     rc, out = login()
-    assert rc == 0 and "works until" not in out and f"up to {ba.SIGNIN_WAIT // 60} min in tmux" in out, out
+    assert rc == 0 and "works until" not in out and "up to 5 min in tmux" in out, out
+    rc, out = login(cli="codex")
+    assert rc == 0 and f"up to {ba.SIGNIN_WAIT // 60} min in tmux" in out, out
     monkeypatch.setattr(ba, "_ssh", ssh)
     n = len(sent)
     rc, out = login(wait=30)
@@ -3075,11 +3088,14 @@ def test_setup_box_agents_glean_sign_in_runs_in_tmux_and_hands_out_a_link_only_w
         rc, out = login()
         assert rc == 0 and "redirect_uri=http%3A%2F%2Flocalhost%3A41234" in out, out
         assert "ssh -N -L 41234:127.0.0.1:41234 <their ssh alias for <box-alias>>" in out and "--code-stdin" in out
-        assert alive() and "60 min" in out
+        assert alive() and "up to 5 min" in out and "60 min" not in out
         # The sign-in asked for the fixed port: one standing forward, told once, covers every later sign-in.
         assert (home / "cb.port").read_text().strip() == "41234"
         assert "fixed sign-in port 41234: one standing forward covers this and every later sign-in" in out
         assert "tell them once" in out and "leave it open" in out
+        # The forward names its local port, which is the link's: a second box at once needs its own port and forward.
+        assert "<their ssh alias for <box-alias>>` (local port 41234 on their machine" in out, out
+        assert "a second box signing in at the same time needs its own `--callback-port` and its own standing forward" in out
         rc, out = login(status=True)
         assert rc == 1 and out.strip() == "claude glean on <box-alias>: pending"
         # A second start reuses the waiting sign-in; once its callback dies the link is called dead and replaced.
@@ -3120,6 +3136,7 @@ def test_setup_box_agents_glean_sign_in_runs_in_tmux_and_hands_out_a_link_only_w
         rc, out = login(callback_port=41299)
         assert rc == 0 and "did not take the fixed port 41299" in out, out
         assert "ssh -N -L 41234:127.0.0.1:41234" in out and "tell them once" not in out
+        assert "(local port 41234 on their machine" in out, out
         # A port outside 1024..65535 is refused before ssh.
         rc, out = login(callback_port=80)
         assert rc == 2 and "1024 to 65535" in out
@@ -3135,10 +3152,18 @@ def test_setup_box_connector_sign_ins_document_one_fixed_callback_port_and_one_s
     agents = " ".join((SKILLS / "setup-box" / "agents.md").read_text(encoding="utf-8").split())
     for want in (f"{port} by default (`--callback-port <port>` overrides it)", "`MCP_OAUTH_CALLBACK_PORT`",
                  "`-c mcp_oauth_callback_port=<port>`", f"`ssh -N -L {port}:127.0.0.1:{port} <their alias for the box>`",
-                 "starts that forward itself", "tells the user that one step once"):
+                 "starts that forward itself", "tells the user that one step once",
+                 # The real window: Claude Code's callback listener stops after 5 min, so no '60 min' for it.
+                 "at most 5 min for Claude Code's", "Claude Code stops its callback listener after 5 min",
+                 "The user opens the link inside that window", "Start a new one only while the user is there",
+                 f"Its local port (the first {port}) must be the port the link names",
+                 "a second box signing in at the same time from the same machine needs its own `--callback-port` "
+                 "and its own standing forward"):
         assert want in agents, want
     connectors = " ".join((SKILLS / "setup-box" / "connectors.md").read_text(encoding="utf-8").split())
     assert "no callback port on the machine and no ssh forward" in connectors
+    assert "a second box signing in at the same time takes its own `--callback-port` and its own forward" in connectors
+    assert "Claude Code's sign-in link works for 5 min: it is started only while the user is there" in connectors
     assert f"`-c mcp_oauth_callback_port={port}`" in connectors
 
 

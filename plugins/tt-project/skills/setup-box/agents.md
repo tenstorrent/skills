@@ -51,7 +51,8 @@ box.py agents editor-defaults --run                  # on the machine the editor
 - `check` reports each missing CLI, PATH gap, login and editor extension with the command that
   fixes it; run that command yourself. A login is the one step that needs the user: its code.
 - A login or sign-in link lapses (`--wait <seconds>`; default 15 min for a CLI login, 60 min for
-  Glean), so send it only while the user is likely there. In a tt-project run, first
+  an MCP sign-in, at most 5 min for Claude Code's: it stops listening for the callback then), so
+  send it only while the user is likely there. In a tt-project run, first
   `ttp hours --check --for 1800`: it reads their usual active hours from the times of their own
   messages (none yet: now). Exit 1: do not start it; hand off `waiting` with that command as
   `retry_when`. The output names when the link works until, in the user's home zone: pass that on.
@@ -92,8 +93,11 @@ Link to the tt-buddy plugin's recipes and skills; do not copy them here.
 - Sign-in: `login <box-alias> <cli> --mcp glean` runs the agent's own headless sign-in
   (`claude mcp login glean --no-browser`, `codex mcp login glean --no-browser`) in a tmux session
   on the box (`tmux -L ttp-login`), started over ssh, so outside any agent sandbox. It waits there
-  up to 60 min (`--wait`). Before it hands out the link it checks with `ss` that the sign-in's callback port
-  listens on the box; if not, it stops the sign-in and says so, and never hands out a dead link.
+  up to 60 min (`--wait`), Claude Code's 5 min at most: Claude Code stops its callback listener
+  after 5 min ('Authentication timeout'). The user opens the link inside that window; after it the
+  link is dead. Start a new one only while the user is there to open it at once. Before it hands
+  out the link it checks with `ss` that the sign-in's callback port listens on the box; if not, it
+  stops the sign-in and says so, and never hands out a dead link.
   A pending sign-in whose port stopped listening is replaced on the next `login`.
 - Fixed callback port: every sign-in `login --mcp` starts asks for one localhost callback port,
   28461 by default (`--callback-port <port>` overrides it): Claude Code through
@@ -104,9 +108,11 @@ Link to the tt-buddy plugin's recipes and skills; do not copy them here.
   prints is for that sign-in only.
 - The user completes it either way: (a) one standing forward for the fixed port from the machine
   their browser runs on, `ssh -N -L 28461:127.0.0.1:28461 <their alias for the box>`, left open;
-  with it open the page completes by itself, for this and every later sign-in on that box. Where
-  the agent runs on the machine the browser runs on, it starts that forward itself in the
-  background; otherwise it tells the user that one step once, not on every sign-in; or (b) the
+  with it open the page completes by itself, for this and every later sign-in on that box. Its
+  local port (the first 28461) must be the port the link names, so a forward serves one box: a
+  second box signing in at the same time from the same machine needs its own `--callback-port`
+  and its own standing forward for that port. Where the agent runs on the machine the browser runs
+  on, it starts that forward itself in the background; otherwise it tells the user that one step once, not on every sign-in; or (b) the
   user opens the link, copies the `localhost` address the browser ends on, and the agent passes it
   on with `--code-stdin` (on stdin, never on a command line, never stored). `--status` says signed in,
   pending, or that the link is dead. A Claude Code too old for `mcp login` gets one step instead:

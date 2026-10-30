@@ -66,6 +66,9 @@ SETTING = "remote.SSH.defaultExtensions"
 MCP = "glean"
 LOGIN_TMUX = "tmux -L ttp-login"
 SIGNIN_WAIT = 3600  # seconds a pending MCP sign-in waits for the user's browser (default; `login --wait`)
+# The most a CLI's own MCP sign-in waits: Claude Code stops its OAuth callback listener after 5 min
+# ('Authentication timeout'), so its link works no longer than that, whatever `--wait` asks.
+SIGNIN_LIMIT = {"claude": 300}
 LOGIN_WAIT = 900  # seconds a CLI's own pending login waits (default; `login --wait`)
 # The one localhost port every MCP sign-in on a box listens on for its OAuth callback (`login --callback-port`
 # overrides it): below the Linux and macOS ephemeral ranges, so random outgoing ports rarely take it. Claude Code
@@ -436,7 +439,7 @@ _LISTEN = ('l=; if [ -n "$p" ] && [ -n "$SS" ]; then l=$($SS -Hltn 2>/dev/null |
 _DEAD = '[ -n "$p" ] && [ -n "$SS" ] && [ -z "$l" ]'
 
 
-def mcp_login_script(cli: str, mcp: str, wait: int = SIGNIN_WAIT, port: int = CALLBACK_PORT) -> str:
+def mcp_login_script(cli: str, mcp: str, wait: Optional[int] = None, port: int = CALLBACK_PORT) -> str:
     """Start the CLI's sign-in to an MCP server on the box in a tmux session, unless it is signed in or one
     is pending whose callback still listens; print its link only once the callback port listens there.
     A new one asks for the fixed callback `port`; when something already listens there it starts nothing
@@ -446,8 +449,10 @@ def mcp_login_script(cli: str, mcp: str, wait: int = SIGNIN_WAIT, port: int = CA
     box: never inside a sandbox, whose own network namespace a browser's localhost callback cannot reach. A
     pending sign-in whose callback no longer listens (it timed out or died) is replaced. The pane is a real
     terminal: the redirect URL the browser ends on can be pasted back (`--code-stdin`). It waits up to
-    `wait` seconds; the session keeps when that ends (`until=`, epoch seconds) for a later call.
+    `wait` seconds (`signin_wait`: never past the CLI's own limit); the session keeps when that ends
+    (`until=`, epoch seconds) for a later call.
     """
+    wait = signin_wait(cli, wait)
     return (_TIMEOUT + 'umask 077; ' + _login_ready(cli, mcp)
             # From the `mcp` listing: Claude Code (Commander) exits 0 for `mcp <unknown> --help`.
             + 'if ! $T "$b" mcp --help </dev/null 2>/dev/null | grep -Eq "^[[:space:]]+login([[:space:]]|$)"; then '
@@ -482,7 +487,7 @@ def login_script(cli: str, mcp: Optional[str] = None, wait: Optional[int] = None
     instead (`mcp_login_script`).
     """
     if mcp:
-        return mcp_login_script(cli, mcp, SIGNIN_WAIT if wait is None else wait, port)
+        return mcp_login_script(cli, mcp, wait, port)
     wait = int(LOGIN_WAIT if wait is None else wait)
     c = _login_key(cli, mcp)
     cmd = f'$TL $b {CLIS[cli]["login"]}'
@@ -498,6 +503,12 @@ def login_script(cli: str, mcp: Optional[str] = None, wait: Optional[int] = None
             f'u=$(cat "$d/{c}.until" 2>/dev/null); [ -n "$u" ] && echo "until=$u"; '
             f'i=0; while [ $i -lt 30 ] && ! grep -q "https://" "$d/{c}.log" 2>/dev/null; do sleep 1; i=$((i+1)); done; '
             f'sed -n "1,40p" "$d/{c}.log" 2>/dev/null | sed "s/^/out=/"; true')
+
+
+def signin_wait(cli: str, wait: Optional[int] = None) -> int:
+    """Seconds a new MCP sign-in by `cli` waits: `wait` (SIGNIN_WAIT by default), never past the CLI's own limit."""
+    wait = SIGNIN_WAIT if wait is None else int(wait)
+    return min(wait, SIGNIN_LIMIT.get(cli, wait))
 
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
@@ -827,12 +838,15 @@ def cmd_login(args) -> int:
     print(f"{what} on {args.alias} is waiting for the user (tell them, word for word):")
     print("\n".join(f"  {ln}" for ln in shown))
     if ends:
-        print(f"  This link works until {ends}.")
+        print(f"  This link works until {ends}" + (": open it before then." if mcp else "."))
     if mcp:
         heard = callback_forward(kv.get("listen", ""))
         used = int(heard.split(":", 1)[0]) if heard else link_port(shown)
         fwd = heard or (f"{used}:127.0.0.1:{used}" if used else None)
         fixed = used == port
+        local = (f" (local port {used} on their machine: the browser returns to the port the link names, so a "
+                 "forward serves one box; a second box signing in at the same time needs its own "
+                 "`--callback-port` and its own standing forward)") if used else ""
         print((f"Its callback listens on the box at {kv['listen']}. " if heard else "")
               + ("Its callback could not be checked (no `ss` on the box). " if kv.get("listen") == "unknown" else "")
               + (f"It uses this box's fixed sign-in port {port}: one standing forward covers this and every later "
@@ -842,17 +856,20 @@ def cmd_login(args) -> int:
               + "Either way completes it: "
               + ((f"(a) if the user has no forward for port {used} to {args.alias} running yet, tell them once to "
                   f"start it on the machine their browser runs on and leave it open: `ssh -N -L {fwd} <their ssh "
-                  f"alias for {args.alias}>`; with it open, the page completes by itself; or (b) " if fixed else
+                  f"alias for {args.alias}>`{local}; with it open, the page completes by itself; or (b) " if fixed else
                   f"(a) before opening the link, the user forwards that port from the machine their browser runs "
-                  f"on: `ssh -N -L {fwd} <their ssh alias for {args.alias}>`, and the page completes by itself; or (b) ")
+                  f"on: `ssh -N -L {fwd} <their ssh alias for {args.alias}>`{local}, and the page completes by itself; or (b) ")
                  if fwd else "")
               + "after signing in, the browser ends on a localhost page that may not load: the user copies that "
               f"page's full address and gives it to you; pass it on with `{again} --code-stdin` (on stdin; it only "
               "completes this pending sign-in and is never stored).")
-        span = f"up to {(wait or SIGNIN_WAIT) // 60} min"   # a pending one keeps the wait it started with
+        span = f"up to {signin_wait(cli, wait) // 60} min"   # a pending one keeps the wait it started with
         span = (f"{span} (until {ends})" if st == "started" else f"until {ends}") if ends else span
         print(f"It waits {span} in tmux session {kv.get('session', _session(cli, mcp))} on the "
               f"box (`ssh -t {args.alias} {LOGIN_TMUX} attach -t {kv.get('session', _session(cli, mcp))}` shows it).")
+        print("The user opens the link inside that window; after it the link no longer works. Start a new one "
+              "only while the user is there to open it" + (f" ({cli} stops its sign-in after "
+                                                            f"{SIGNIN_LIMIT[cli] // 60} min)." if cli in SIGNIN_LIMIT else "."))
     elif cli == "claude":
         print(f"If the page then shows a code to paste back, pass it on with: "
               f"`{again} --code-stdin` (the code on stdin; it only completes "
@@ -1044,8 +1061,8 @@ def register(sub) -> None:
                     help=f"the localhost port an --mcp sign-in's OAuth callback listens on (default {CALLBACK_PORT}, "
                          "the same for every sign-in, so one standing ssh forward covers them)")
     lg.add_argument("--wait", type=int, metavar="SECONDS",
-                    help=f"how long a new sign-in waits for the user (default {SIGNIN_WAIT} for --mcp, "
-                         f"else {LOGIN_WAIT}); a pending one keeps its own")
+                    help=f"how long a new sign-in waits for the user (default {SIGNIN_WAIT} for --mcp, at most "
+                         f"{SIGNIN_LIMIT['claude']} for claude, else {LOGIN_WAIT}); a pending one keeps its own")
     lg.set_defaults(func=cmd_login)
     e = ag.add_parser("editor-defaults", help="add both extensions to remote.SSH.defaultExtensions on this machine "
                                               "(dry run unless --run; only on the user's yes)")
