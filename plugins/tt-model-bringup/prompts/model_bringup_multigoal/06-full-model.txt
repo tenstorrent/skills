@@ -14,15 +14,16 @@ Goal completion requirements:
 - Generate a fresh AIME24 HF-tokenizer chat-template reference, 100 tokens, unless metadata proves an exact match.
 - run_prefill_check and run_teacher_forcing report top-1/top-5/top-100 for prefill and decode. The expected bar is top-5 >= 98% and top-100 = 100%.
 - run_autoregressive produces HF and TT completions, and the outputs are read for coherence, repetition, wrong-language drift, and early divergence.
-- Before token-out sampling, compare both common samplers, choose the best fit, and record the rejected alternative. Write custom sampler code only if neither common path fits.
+- Before token-out sampling, compare both common samplers, pick the best fit, record the rejected one; custom sampler code only if neither fits.
 - Decode satisfies the $full-model/$tt-enable-tracing split-sampling contract. Greedy decode stays on device with no host argmax, full-logits readback, untraced sampling, or Python token-feedback loop.
-- Greedy split-sampling comparison must be semantically greedy. If split greedy fails on shape/layout/tiling, fix that contract or leave the stage incomplete with a minimal repro.
+- Greedy split sampling must be semantically greedy; if it fails on shape/layout/tiling, fix the contract or leave the stage incomplete with a minimal repro.
+- Resumed prefill: `prefill_logits_continuation` passes run_prefill_resume_check with its controls failing; serving_contract.json marks prefix caching supported or names a documented exclusion.
 - Trace evidence proves token feedback, position coherence, and changed/unchanged page-table handling with no per-token host rebuilds.
 - Top of README.md reports full-model TTFT and trace-verified batch-1 decode t/s/u, separating teacher-forcing and token-out decode when they differ.
-- Runtime fallback audit covers model/generator paths, cache ownership, host-logit boundaries, sampling, and reset behavior.
-- models/autoports/<model>/doc/full_model/README.md and work_log.md record commands, top-k accuracy, qualitative verdict, perf, limitations, and exact artifacts.
-- Canonical split sampling is required. If sampler ops dominate token-out decode, fix the LM-head/sampling contract before completing.
-- The generator supports an explicit host-sampling compatibility mode for tests that require host sampling, while the optimized measured token-out path remains on-device traced sampling.
+- Runtime fallback audit: model/generator paths, cache ownership, host-logit boundaries, sampling, reset behavior.
+- doc/full_model/README.md and work_log.md record commands, top-k accuracy, qualitative verdict, perf, limitations, and exact artifacts.
+- Canonical split sampling is required; if sampler ops dominate token-out decode, fix the LM-head/sampling contract first.
+- An explicit host-sampling compatibility mode exists for tests that need it; the measured token-out path stays on-device traced sampling.
 - $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
 
 Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.

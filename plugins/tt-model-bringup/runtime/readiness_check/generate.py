@@ -125,6 +125,14 @@ def _chat_or_plain_prompt_tokens(tokenizer, prompt_text: str, *, chat_template: 
             add_generation_prompt=True,
             tokenize=True,
         )
+        if hasattr(prompt_tokens, "input_ids"):
+            prompt_tokens = prompt_tokens.input_ids
+        elif isinstance(prompt_tokens, dict):
+            prompt_tokens = prompt_tokens["input_ids"]
+        if hasattr(prompt_tokens, "tolist"):
+            prompt_tokens = prompt_tokens.tolist()
+        if prompt_tokens and isinstance(prompt_tokens[0], (list, tuple)):
+            prompt_tokens = prompt_tokens[0]
     else:
         prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=True)
 

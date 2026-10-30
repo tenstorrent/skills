@@ -103,6 +103,20 @@ Return `more-work-needed` when evidence shows one of these:
 - serving evidence lacks the mixed-shape trace reuse check from
   `$vllm-integration`, including supported chunked-prefill paths with changed
   start positions and batch orderings while other requests decode;
+- `supports_prefix_caching` is not `supported` in the serving contract without
+  a documented exclusion (`block_output` or `recurrent_state`), or it is
+  declared `True` without `readiness/prefill_resume_check.json`,
+  `readiness_vllm/prefix_cache_check.json`, and sampling and qualitative
+  verdicts from the caching-enabled server; or a resume negative control did
+  not fail; or a greedy divergence after a
+  cache hit is recorded as drift without the logit-level comparison that
+  separates drift from a cache or position bug;
+- a vLLM stage has no batched-equals-solo prefill evidence (bit-equal per row
+  for last-token logits and K/V pages, not a PCC bar), the watcher battery did
+  not reach every prepared batched shape, or there is no
+  `prefill_burst` comparison against the serial path; in optimized-vLLM the
+  burst TTFT ratio misses its gate or single-user latency regressed with
+  batched prefill on;
 - logs or code show a plausible bug in a stage-critical subsystem, such as
   cache ownership, trace replay, token feedback, sampling, precision policy,
   page-table handling, or model output correctness;
@@ -185,7 +199,10 @@ For generation or serving stages, also inspect:
   repetition, wrong language, truncation, prompt echo, cross-request leakage,
   odd leading text, or degraded coherence;
 - sampling tests and skipped/xfailed cases, separating expected framework limits
-  from correctness failures.
+  from correctness failures; seeded mixed-batch tests can fail from the plugin's
+  per-step host/device sampler routing alone (a seeded request draws on the device
+  in one step and on the host in the next), and the decisive evidence is a comparison
+  of the admission pattern in the server log between a passing and a failing run.
 - context-length evidence: `doc/context_contract.json`, served `max_model_len`,
   eval/benchmark context settings, and any cap or truncation introduced by the
   stage.
@@ -202,6 +219,13 @@ For generation or serving stages, also inspect:
   switches, and advertised input/output limits.
 - serving contract for full-model: `doc/full_model/serving_contract.json` names
   the pinned plugin and vLLM pair and has no missing rows.
+- prefix-cache and batched-prefill evidence for vLLM stages:
+  `readiness_vllm/vllm_run_summary.json` shows the server enabled prefix
+  caching, `prefix_cache_check.json` passed with hit counters and TTFT, the
+  resume check's controls failed, and `vllm_prefill_burst_benchmark.json`
+  carries a `serial_reference`. Check that the evidence covers every layer kind
+  (sliding-window layers need the history snapshot) and that warmup covered the
+  prefill buckets the burst used.
 - serving-plugin and vLLM checkout state: every file changed outside the target
   tt-metal checkout. Each change in the plugin or vLLM checkout needs a complete
   `doc/vllm_integration/plugin_changes.md` entry under
@@ -211,6 +235,15 @@ For generation or serving stages, also inspect:
   When the only remedy for a finding is a plugin change that needs human
   authorization, set its `Required next step` to `human authorization` and name
   the `proposed` record; do not ask the stage owner to implement the change.
+  Treat a served-default change that only an operator can accept (for example a
+  generation-config override that keeps the default recipe on the device
+  sampler) the same way: `Required next step: operator decision`, with the
+  work-log record named. When every remaining finding is of these two kinds,
+  say so in the verdict so the stage can end `blocked` instead of looping.
+  On a re-review, judge the evidence, not the prose written to answer the
+  previous pass: a wording defect in a document that changed only to address
+  earlier findings, with the underlying evidence unchanged, is a note in the
+  verdict, not a reason to return `more-work-needed` again.
 - declared `model_capabilities`: every key in `tt/generator_vllm.py` is
   documented by the pinned plugin, and each declared value has evidence.
 
@@ -405,6 +438,17 @@ Verdict: clean-pass | more-work-needed
 ```
 
 Only `clean-pass` with no required work satisfies this skill.
+
+Required Work is reserved for correctness, contract, or missing-evidence gaps.
+A performance candidate that was not measured is Other Concerns unless the goal
+names it. Record push state from the run plan (the supervisor pushes stage
+commits; the stage agent never does) instead of inferring it from the reflog.
+
+Closure after the allowed rereviews: a P2 raised after the second rereview
+carries to the next optimize stage with a work-log entry naming it, and the
+recorded verdict stays `more-work-needed`; a P2 that the stage then fixes with
+device evidence is recorded as fixed under that unchanged verdict, with the
+evidence path. The next stage's review checks that carried items were closed.
 
 If the main agent could not obtain an independent review, report
 `not-independent` as a fallback status outside the reviewer verdict. Do not use

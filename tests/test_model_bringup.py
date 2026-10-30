@@ -139,7 +139,8 @@ def valid_serving_contract():
             {'item': 'logprobs', 'kind': 'request_feature', 'status': 'supported',
              'evidence': 'doc/full_model/logprobs.log'},
             {'item': 'supports_prefix_caching', 'kind': 'capability', 'status': 'not_supported',
-             'declaration': 'documented default', 'reason': 'prefix caching is not implemented'},
+             'declaration': 'documented default',
+             'reason': 'recurrent_state: the GDN state at start_pos is not recoverable from KV blocks'},
         ],
     }
 
@@ -161,6 +162,10 @@ def test_full_model_gate_accepts_valid_evidence_and_rejects_context_reduction(in
     env['MODEL_DIR'] = str(model)
     gate = plugin / 'prompts/model_bringup_multigoal/06-full-model.check.sh'
     result = run('bash', str(gate), cwd=target, env=env)
+    assert result.returncode == 1, result.stderr + result.stdout
+    assert 'evidence doc/full_model/logprobs.log does not exist' in result.stderr
+    (doc / 'full_model/logprobs.log').write_text('ok')
+    result = run('bash', str(gate), cwd=target, env=env)
     assert result.returncode == 0, result.stderr + result.stdout
     contract.write_text(json.dumps({'hf_advertised_context': 8192, 'current_supported_context': 1024}))
     result = run('bash', str(gate), cwd=target, env=env)
@@ -178,6 +183,7 @@ def test_full_model_gate_accepts_valid_evidence_and_rejects_context_reduction(in
                                  'record': 'doc/vllm_integration/plugin_changes.md'}), 'does not exist'),
     (lambda c: c['rows'][0].update(kind=['request_feature']), 'kind must be one of'),
     (lambda c: c['rows'][0].update(status={'name': 'supported'}), 'status must be one of'),
+    (lambda c: c['rows'][1].update(reason='prefix caching is not implemented'), 'exclusion reason'),
 ])
 def test_serving_contract_checker(tmp_path, mutate, message):
     checker = PLUGIN / 'scripts/check_serving_contract.py'
@@ -189,6 +195,7 @@ def test_serving_contract_checker(tmp_path, mutate, message):
     contract = valid_serving_contract()
     mutate(contract)
     (model / 'doc/full_model').mkdir(parents=True)
+    (model / 'doc/full_model/logprobs.log').write_text('ok')
     (model / 'doc/full_model/serving_contract.json').write_text(json.dumps(contract))
     result = run(*args, cwd=tmp_path)
     if message is None:
@@ -212,8 +219,12 @@ def test_gates_fail_critical_for_malformed_serving_contract(installed, stage, fi
     (doc / 'autoregressive/tt_completion.txt').write_text(completion)
     (model / 'readiness_vllm/vllm_qualitative_outputs.json').write_text(json.dumps(
         [{'prompt': 'p', 'greedy_completion': completion, 'sampled_completion': completion}]))
+    (model / 'readiness_vllm/vllm_prefill_burst_benchmark.json').write_text(json.dumps(
+        {'completed_requests': 32, 'config': {'num_requests': 32}, 'ttft_ms': {'p99': 1000.0},
+         'serial_reference': {'ttft_ratio_p99': 0.4, 'ttft_ratio_mean': 0.4, 'config_matches': True}}))
     (doc / 'context_contract.json').write_text(json.dumps({'hf_advertised_context': 8192, 'current_supported_context': 8192}))
     contract = valid_serving_contract()
+    (doc / 'full_model/logprobs.log').write_text('ok')
     path = doc / 'full_model/serving_contract.json'
     path.write_text(json.dumps(contract))
     env['MODEL_DIR'] = str(model)
@@ -225,6 +236,21 @@ def test_gates_fail_critical_for_malformed_serving_contract(installed, stage, fi
     result = run('bash', str(gate), cwd=target, env=env)
     assert result.returncode == 2, result.stderr
     assert f'{field} must be one of' in result.stderr
+
+
+def test_serving_contract_prose_evidence_is_advisory_not_a_crash(installed):
+    plugin, target, env = installed
+    model = target / 'models/autoports/org_model'
+    (model / 'doc/full_model').mkdir(parents=True)
+    contract = valid_serving_contract()
+    contract['rows'][0]['evidence'] = ' '.join(['verified by the served sampling suite and the logprob comparison'] * 5)
+    assert len(contract['rows'][0]['evidence'].encode()) > 300
+    (model / 'doc/full_model/serving_contract.json').write_text(json.dumps(contract))
+    result = run(sys.executable, str(plugin / 'scripts/check_serving_contract.py'),
+                 '--model-dir', str(model), '--require-contract', cwd=target, env=env)
+    assert result.returncode == 1, result.stderr + result.stdout
+    assert 'evidence is prose, not an artifact path' in result.stderr
+    assert 'Traceback' not in result.stderr
 
 
 def test_standalone_tti_checker_resolves_package_and_rejects_stock_evidence(installed):
@@ -287,6 +313,14 @@ def test_live_inventory_requires_enabled_skills_at_selected_installation(monkeyp
     skills[-1]['path'] = '/unselected/stale/cache/SKILL.md'
     with pytest.raises(RuntimeError, match='missing or disabled'):
         runner.verify_enabled_installations({'data': [{'skills': skills}]})
+
+
+def test_runtime_and_script_modules_compile_under_ci_interpreter():
+    import py_compile
+    for path in list((PLUGIN / 'runtime').rglob('*.py')) + list((PLUGIN / 'scripts').glob('*.py')):
+        if '__pycache__' in path.parts:
+            continue
+        py_compile.compile(str(path), doraise=True)
 
 
 def test_import_provenance_and_publication_boundary():

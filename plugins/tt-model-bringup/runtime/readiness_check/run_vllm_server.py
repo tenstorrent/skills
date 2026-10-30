@@ -24,6 +24,22 @@ Stages:
                 profile as a secondary CI/capacity artifact. Defaults to greedy
                 ``--temperature 0.0``; opt into exact server-generation-config
                 behavior with ``--benchmark-use-server-generation-config``.
+  prefix_cache  Send one 2305-token prompt cold, then warm, reset the prefix
+                cache, and repeat; then append a 256-token new suffix so the
+                resume is a long continuation and compare it with a cold run
+                after another reset (needs VLLM_SERVER_DEV_MODE=1 on the server
+                for /reset_prefix_cache). Records /metrics prefix-cache counter
+                deltas, TTFT, first-token logprobs and greedy output per
+                request, runs the shared-prefix ``vllm bench serve`` workload,
+                and writes ``prefix_cache_check.json`` with a pass/fail verdict.
+  prefill_burst Run 32 x 128-token prompts at concurrency 32 so the scheduler
+                forms multi-row prefill steps; writes
+                ``vllm_prefill_burst_benchmark.json``. Pass
+                ``--prefill-burst-serial-result`` to record TTFT ratios against
+                the same workload measured with batched prefill disabled.
+
+Every run writes ``vllm_run_summary.json`` with the server command, the
+prefix-caching flag, and the prefix-caching state read from the server log.
 
 Default: ``--stages serve,sampling,qualitative,benchmark`` (launch, run all
 checks, shut down). Full launch with the typical tuning flags:
@@ -113,8 +129,46 @@ STAGE_SERVE = "serve"
 STAGE_SAMPLING = "sampling"
 STAGE_QUALITATIVE = "qualitative"
 STAGE_BENCHMARK = "benchmark"
-ALL_STAGES: tuple[str, ...] = (STAGE_SERVE, STAGE_SAMPLING, STAGE_QUALITATIVE, STAGE_BENCHMARK)
-DEFAULT_STAGES: tuple[str, ...] = ALL_STAGES
+STAGE_PREFIX_CACHE = "prefix_cache"
+STAGE_PREFILL_BURST = "prefill_burst"
+DEFAULT_STAGES: tuple[str, ...] = (STAGE_SERVE, STAGE_SAMPLING, STAGE_QUALITATIVE, STAGE_BENCHMARK)
+ALL_STAGES: tuple[str, ...] = (*DEFAULT_STAGES, STAGE_PREFIX_CACHE, STAGE_PREFILL_BURST)
+
+# Prefix-cache check: one shared prompt sent cold, then warm, with counter
+# deltas from /metrics around every request.
+DEFAULT_PREFIX_CACHE_PROMPT_TOKENS = 2305
+DEFAULT_PREFIX_CACHE_OUTPUT_TOKENS = 64
+DEFAULT_PREFIX_CACHE_RESUME_SUFFIX_TOKENS = 256
+PREFIX_CACHE_THRESHOLDS: dict[str, float] = {
+    "warm_hit_rate_min": 0.9,
+    "cold_hit_rate_max": 0.05,
+    "ttft_ratio_max": 0.5,
+    "first_token_logprob_delta_max": 0.25,
+    "greedy_identical_min_tokens": 16,
+    "shared_prefix_hit_rate_min": 0.7,
+}
+APC_ENABLED_LOG_LINE = "Automatic prefix caching is enabled"
+APC_DISABLED_LOG_LINE = "Automatic prefix caching is disabled"
+PREFIX_CACHE_COUNTERS = ("vllm:prefix_cache_queries", "vllm:prefix_cache_hits")
+SHARED_PREFIX_BENCH_ARGS: tuple[str, ...] = (
+    "--dataset-name",
+    "prefix_repetition",
+    "--prefix-repetition-prefix-len",
+    "2048",
+    "--prefix-repetition-suffix-len",
+    "128",
+    "--prefix-repetition-num-prefixes",
+    "4",
+    "--prefix-repetition-output-len",
+    "32",
+)
+
+# Prefill burst: many short prompts at once so the scheduler forms multi-row
+# prefill steps. Compared against a serial-prefill run of the same shape.
+DEFAULT_BURST_PROMPT_LEN = 128
+DEFAULT_BURST_OUTPUT_LEN = 32
+DEFAULT_BURST_NUM_REQUESTS = 32
+DEFAULT_BURST_CONCURRENCY = 32
 
 # Primary benchmark shape: single-user decode, used for headline t/s/u.
 # We force greedy temperature for readiness t/s/u unless the caller explicitly
@@ -231,24 +285,18 @@ def _check_port_available(port: int) -> None:
         sock.close()
 
 
-def _launch_server(
+def _server_command(
     *,
     hf_model: str,
-    mesh_device: str,
     max_num_seqs: int,
     block_size: int,
     port: int,
-    log_file: Path,
     max_model_len: Optional[int],
     tt_config: dict[str, Any],
     additional_args: List[str],
-) -> subprocess.Popen:
-    """
-    Launch vLLM via `python -m vllm.entrypoints.openai.api_server`.
-
-    Mirrors `vllm-tt-plugin/examples/server_example_tt.py` (which is what the
-    nightly CI runs) but inlined — the example is just argv-munging + runpy.
-    """
+    enable_prefix_caching: Optional[bool] = None,
+) -> List[str]:
+    """Build the server argv. `enable_prefix_caching=None` leaves the vLLM default."""
     cmd: List[str] = [
         sys.executable,
         "-m",
@@ -264,11 +312,47 @@ def _launch_server(
     ]
     if max_model_len is not None:
         cmd += ["--max_model_len", str(max_model_len)]
+    if enable_prefix_caching is True:
+        cmd.append("--enable-prefix-caching")
+    elif enable_prefix_caching is False:
+        cmd.append("--no-enable-prefix-caching")
     # Pass TT plugin config as a single JSON dict so JSON quoting can't be
     # mangled by intermediate shells. The dict already has
     # `sample_on_device_mode` enforced; callers extend via `tt_config`.
     cmd += ["--additional-config", json.dumps({"tt": tt_config})]
     cmd += additional_args
+    return cmd
+
+
+def _launch_server(
+    *,
+    hf_model: str,
+    mesh_device: str,
+    max_num_seqs: int,
+    block_size: int,
+    port: int,
+    log_file: Path,
+    max_model_len: Optional[int],
+    tt_config: dict[str, Any],
+    additional_args: List[str],
+    enable_prefix_caching: Optional[bool] = None,
+) -> subprocess.Popen:
+    """
+    Launch vLLM via `python -m vllm.entrypoints.openai.api_server`.
+
+    Mirrors `vllm-tt-plugin/examples/server_example_tt.py` (which is what the
+    nightly CI runs) but inlined — the example is just argv-munging + runpy.
+    """
+    cmd = _server_command(
+        hf_model=hf_model,
+        max_num_seqs=max_num_seqs,
+        block_size=block_size,
+        port=port,
+        max_model_len=max_model_len,
+        tt_config=tt_config,
+        additional_args=additional_args,
+        enable_prefix_caching=enable_prefix_caching,
+    )
 
     env = {
         **os.environ,
@@ -560,6 +644,7 @@ def _write_normalized_vllm_benchmark_summary(
     num_requests: int,
     concurrency: Optional[int],
     temperature: Optional[float],
+    dataset_name: str = "random",
 ) -> dict[str, Any]:
     total_output_tokens = _json_number(raw, "total_output_tokens")
     requested_output_tokens = output_len * num_requests
@@ -581,7 +666,7 @@ def _write_normalized_vllm_benchmark_summary(
             "concurrency": concurrency,
             "temperature": temperature,
             "generation_config_mode": "server_default" if temperature is None else "explicit",
-            "dataset_name": "random",
+            "dataset_name": dataset_name,
             "ignore_eos": True,
         },
         "elapsed_s": _json_number(raw, "duration"),
@@ -638,12 +723,15 @@ def _run_serving_benchmark(
     concurrency: Optional[int],
     temperature: Optional[float],
     additional_args: List[str],
+    dataset_args: Optional[List[str]] = None,
+    dataset_name: str = "random",
 ) -> dict[str, Any]:
     """
     Run one vLLM serving benchmark profile.
 
     The primary caller writes `vllm_result.json` and `vllm_benchmark.json`;
-    secondary profiles use distinct filenames.
+    secondary profiles use distinct filenames. `dataset_args` replaces the
+    default random-dataset arguments when a profile needs another dataset.
     """
     print(f"\n=== Running vLLM serving benchmark: {profile_name} ===")
     print(
@@ -671,12 +759,11 @@ def _run_serving_benchmark(
         server_url.rstrip("/"),
         "--endpoint",
         "/v1/completions",
-        "--dataset-name",
-        "random",
-        "--random-input-len",
-        str(prompt_len),
-        "--random-output-len",
-        str(output_len),
+        *(
+            dataset_args
+            if dataset_args is not None
+            else ["--dataset-name", "random", "--random-input-len", str(prompt_len), "--random-output-len", str(output_len)]
+        ),
         "--num-prompts",
         str(num_requests),
         "--ignore-eos",
@@ -725,6 +812,7 @@ def _run_serving_benchmark(
         num_requests=num_requests,
         concurrency=concurrency,
         temperature=temperature,
+        dataset_name=dataset_name,
     )
 
     def _fmt(v: Optional[float], unit: str) -> str:
@@ -740,6 +828,413 @@ def _run_serving_benchmark(
     print(f"  Raw      : {raw_result_file}")
     print(f"  Summary  : {summary_file}")
     return summary
+
+
+def _parse_prometheus_counters(text: str) -> dict[str, float]:
+    """Sum every sample of each metric; `_total` is folded into the base name."""
+    totals: dict[str, float] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name_part, _, value_part = line.rpartition(" ")
+        if not name_part or not value_part:
+            continue
+        name = name_part.split("{", 1)[0]
+        if name.endswith("_total"):
+            name = name[: -len("_total")]
+        try:
+            value = float(value_part)
+        except ValueError:
+            continue
+        totals[name] = totals.get(name, 0.0) + value
+    return totals
+
+
+def _fetch_prefix_cache_counters(server_url: str) -> dict[str, float]:
+    resp = requests.get(f"{server_url.rstrip('/')}/metrics", timeout=30)
+    resp.raise_for_status()
+    counters = _parse_prometheus_counters(resp.text)
+    return {name: counters.get(name, 0.0) for name in PREFIX_CACHE_COUNTERS}
+
+
+def _counter_delta(before: dict[str, float], after: dict[str, float]) -> dict[str, Any]:
+    queries = after["vllm:prefix_cache_queries"] - before["vllm:prefix_cache_queries"]
+    hits = after["vllm:prefix_cache_hits"] - before["vllm:prefix_cache_hits"]
+    return {
+        "prefix_cache_queries_delta": queries,
+        "prefix_cache_hits_delta": hits,
+        "hit_rate": (hits / queries) if queries > 0 else None,
+    }
+
+
+def _reset_prefix_cache(server_url: str) -> bool:
+    try:
+        resp = requests.post(f"{server_url.rstrip('/')}/reset_prefix_cache", timeout=60)
+    except requests.exceptions.RequestException:
+        return False
+    return resp.status_code == 200
+
+
+def _natural_text(tokenizer: Any, pieces: List[str], target_tokens: int, *, reverse: bool = False) -> str:
+    order = list(reversed(pieces)) if reverse else list(pieces)
+    text = ""
+    index = 0
+    while len(tokenizer.encode(text)) < target_tokens:
+        text = (text + "\n\n" if text else "") + order[index % len(order)]
+        index += 1
+    token_ids = tokenizer.encode(text)[:target_tokens]
+    return tokenizer.decode(token_ids, skip_special_tokens=True)
+
+
+def _build_prefix_cache_prompt(tokenizer: Any, prompts_file: Path, target_tokens: int) -> tuple[str, int]:
+    """Deterministic natural text of about `target_tokens` tokens."""
+    pieces = [p.strip() for p in prompts_file.read_text().split("\n\n") if p.strip()]
+    if not pieces:
+        raise RuntimeError(f"No prompts found in {prompts_file}")
+    prompt = _natural_text(tokenizer, pieces, target_tokens)
+    return prompt, len(tokenizer.encode(prompt))
+
+
+def _build_resume_suffix(tokenizer: Any, prompts_file: Path, suffix_tokens: int) -> str:
+    """Different natural text appended to the shared prefix so the resume is a long continuation."""
+    pieces = [p.strip() for p in prompts_file.read_text().split("\n\n") if p.strip()]
+    return "\n\n" + _natural_text(tokenizer, pieces, suffix_tokens, reverse=True)
+
+
+def _stream_completion(*, server_url: str, hf_model: str, prompt: str, max_tokens: int) -> dict[str, Any]:
+    """Greedy streamed completion with TTFT measured at the first content chunk."""
+    payload = {
+        "model": hf_model,
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "stream": True,
+        "logprobs": 1,
+    }
+    started = time.perf_counter()
+    ttft_ms: Optional[float] = None
+    text_parts: List[str] = []
+    tokens: List[str] = []
+    token_logprobs: List[Optional[float]] = []
+    with requests.post(f"{server_url.rstrip('/')}/v1/completions", json=payload, stream=True, timeout=1800) as resp:
+        resp.raise_for_status()
+        for raw_line in resp.iter_lines():
+            if not raw_line:
+                continue
+            line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
+            if not line.startswith("data:"):
+                continue
+            data = line[len("data:"):].strip()
+            if data == "[DONE]":
+                break
+            chunk = json.loads(data)
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            choice = choices[0]
+            piece = choice.get("text") or ""
+            logprobs = choice.get("logprobs") or {}
+            chunk_tokens = logprobs.get("tokens") or []
+            chunk_logprobs = logprobs.get("token_logprobs") or []
+            if ttft_ms is None and (piece or chunk_tokens):
+                ttft_ms = (time.perf_counter() - started) * 1000.0
+            text_parts.append(piece)
+            tokens.extend(str(t) for t in chunk_tokens)
+            token_logprobs.extend(chunk_logprobs)
+    return {
+        "ttft_ms": ttft_ms,
+        "elapsed_ms": (time.perf_counter() - started) * 1000.0,
+        "text": "".join(text_parts),
+        "tokens": tokens,
+        "token_logprobs": token_logprobs,
+    }
+
+
+def _common_prefix_len(a: List[Any], b: List[Any]) -> int:
+    count = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        count += 1
+    return count
+
+
+def _prefix_cache_verdict(record: dict[str, Any], thresholds: dict[str, float]) -> tuple[str, List[str]]:
+    reasons: List[str] = []
+    requests_log = record.get("requests") or []
+    cold = [r for r in requests_log if r["kind"] == "cold"]
+    warm = [r for r in requests_log if r["kind"] == "warm"]
+    if record.get("apc_log_enabled") is False:
+        reasons.append("server log reports automatic prefix caching disabled")
+    if not cold or not warm:
+        reasons.append("the check needs at least one cold and one warm request")
+        return "fail", reasons
+    for r in cold:
+        if r["hit_rate"] is not None and r["hit_rate"] > thresholds["cold_hit_rate_max"]:
+            reasons.append(f"{r['label']}: cold request hit rate {r['hit_rate']:.2f} > {thresholds['cold_hit_rate_max']}")
+    for r in warm:
+        if r["hit_rate"] is None or r["hit_rate"] < thresholds["warm_hit_rate_min"]:
+            reasons.append(f"{r['label']}: warm request hit rate {r['hit_rate']} < {thresholds['warm_hit_rate_min']}")
+    base = cold[0]
+    warm_ttfts = [r["ttft_ms"] for r in warm if r["ttft_ms"] is not None]
+    if base["ttft_ms"] is None or not warm_ttfts:
+        reasons.append("TTFT was not measured for the cold or warm requests")
+    else:
+        ratio = sorted(warm_ttfts)[len(warm_ttfts) // 2] / base["ttft_ms"]
+        record["ttft_ratio"] = ratio
+        if ratio > thresholds["ttft_ratio_max"]:
+            reasons.append(f"warm/cold TTFT ratio {ratio:.3f} > {thresholds['ttft_ratio_max']}")
+    for r in warm:
+        if not base["tokens"] or not r["tokens"]:
+            reasons.append(f"{r['label']}: no tokens returned")
+            continue
+        if base["tokens"][0] != r["tokens"][0]:
+            reasons.append(f"{r['label']}: first token differs from cold ({base['tokens'][0]!r} vs {r['tokens'][0]!r})")
+        base_lp = base["token_logprobs"][0] if base["token_logprobs"] else None
+        warm_lp = r["token_logprobs"][0] if r["token_logprobs"] else None
+        if base_lp is None or warm_lp is None:
+            reasons.append(f"{r['label']}: first-token logprob missing")
+        elif abs(base_lp - warm_lp) > thresholds["first_token_logprob_delta_max"]:
+            reasons.append(
+                f"{r['label']}: first-token logprob delta {abs(base_lp - warm_lp):.3f} > "
+                f"{thresholds['first_token_logprob_delta_max']}"
+            )
+        identical = _common_prefix_len(base["tokens"], r["tokens"])
+        r["greedy_identical_through"] = identical
+        if identical < min(len(base["tokens"]), int(thresholds["greedy_identical_min_tokens"])):
+            reasons.append(
+                f"{r['label']}: greedy output diverges after {identical} tokens "
+                f"(< {int(thresholds['greedy_identical_min_tokens'])})"
+            )
+    shared = record.get("shared_prefix_bench")
+    if isinstance(shared, dict) and shared.get("hit_rate") is not None:
+        if shared["hit_rate"] < thresholds["shared_prefix_hit_rate_min"]:
+            reasons.append(
+                f"shared-prefix benchmark hit rate {shared['hit_rate']:.2f} < {thresholds['shared_prefix_hit_rate_min']}"
+            )
+    resume_warm = [r for r in requests_log if r["kind"] == "resume_warm"]
+    resume_cold = [r for r in requests_log if r["kind"] == "resume_cold"]
+    if resume_warm and resume_cold:
+        warm_r, cold_r = resume_warm[0], resume_cold[0]
+        if warm_r["hit_rate"] is None or warm_r["hit_rate"] <= 0.5:
+            reasons.append(f"resume_warm: shared prefix was not served from the cache (hit rate {warm_r['hit_rate']})")
+        if cold_r["hit_rate"] is not None and cold_r["hit_rate"] > thresholds["cold_hit_rate_max"]:
+            reasons.append(f"resume_cold: reference still hit the cache (hit rate {cold_r['hit_rate']:.2f})")
+        if not warm_r["tokens"] or not cold_r["tokens"]:
+            reasons.append("long resume: no tokens returned")
+        else:
+            if warm_r["tokens"][0] != cold_r["tokens"][0]:
+                reasons.append("long resume: first token differs between the resumed and the cold request")
+            warm_lp = warm_r["token_logprobs"][0] if warm_r["token_logprobs"] else None
+            cold_lp = cold_r["token_logprobs"][0] if cold_r["token_logprobs"] else None
+            if warm_lp is None or cold_lp is None:
+                reasons.append("long resume: first-token logprob missing")
+            elif abs(warm_lp - cold_lp) > thresholds["first_token_logprob_delta_max"]:
+                reasons.append(
+                    f"long resume: first-token logprob delta {abs(warm_lp - cold_lp):.3f} > "
+                    f"{thresholds['first_token_logprob_delta_max']}"
+                )
+            identical = _common_prefix_len(warm_r["tokens"], cold_r["tokens"])
+            warm_r["greedy_identical_through"] = identical
+            if identical < min(len(cold_r["tokens"]), int(thresholds["greedy_identical_min_tokens"])):
+                reasons.append(
+                    f"long resume: greedy output diverges after {identical} tokens "
+                    f"(< {int(thresholds['greedy_identical_min_tokens'])})"
+                )
+    return ("pass" if not reasons else "fail"), reasons
+
+
+def _server_log_apc_state(server_log: Optional[Path]) -> Optional[bool]:
+    if server_log is None or not server_log.exists():
+        return None
+    text = server_log.read_text(errors="replace")
+    if APC_ENABLED_LOG_LINE in text:
+        return True
+    if APC_DISABLED_LOG_LINE in text:
+        return False
+    return None
+
+
+def _run_prefix_cache_check(
+    *,
+    server_url: str,
+    hf_model: str,
+    output_dir: Path,
+    prompts_file: Path,
+    prompt_tokens: int,
+    output_tokens: int,
+    thresholds: dict[str, float],
+    server_log: Optional[Path],
+    shared_prefix_bench: bool,
+    additional_benchmark_args: List[str],
+    resume_suffix_tokens: int = DEFAULT_PREFIX_CACHE_RESUME_SUFFIX_TOKENS,
+) -> dict[str, Any]:
+    print("\n=== Running prefix-cache check ===")
+    tokenizer = AutoTokenizer.from_pretrained(hf_model)
+    prompt, measured_tokens = _build_prefix_cache_prompt(tokenizer, prompts_file, prompt_tokens)
+    print(f"  prompt tokens: {measured_tokens} (target {prompt_tokens}), output tokens: {output_tokens}")
+
+    requests_log: List[dict[str, Any]] = []
+
+    def one(label: str, kind: str, text: str = prompt) -> None:
+        before = _fetch_prefix_cache_counters(server_url)
+        out = _stream_completion(server_url=server_url, hf_model=hf_model, prompt=text, max_tokens=output_tokens)
+        after = _fetch_prefix_cache_counters(server_url)
+        entry = {
+            "label": label,
+            "kind": kind,
+            "ttft_ms": out["ttft_ms"],
+            "elapsed_ms": out["elapsed_ms"],
+            **_counter_delta(before, after),
+            "tokens": out["tokens"],
+            "token_logprobs": out["token_logprobs"],
+            "text": out["text"],
+        }
+        requests_log.append(entry)
+        ttft = f"{entry['ttft_ms']:.1f} ms" if entry["ttft_ms"] is not None else "n/a"
+        rate = f"{entry['hit_rate']:.2f}" if entry["hit_rate"] is not None else "n/a"
+        print(f"  {label:<6} {kind:<4} ttft={ttft:>12} hit_rate={rate} tokens={len(entry['tokens'])}")
+
+    reset_before = _reset_prefix_cache(server_url)
+    print(f"  reset_prefix_cache before cold1: {'ok' if reset_before else 'unavailable'}")
+    one("cold1", "cold")
+    one("warm1", "warm")
+    one("warm2", "warm")
+    reset_ok = _reset_prefix_cache(server_url)
+    print(f"  reset_prefix_cache: {'ok' if reset_ok else 'unavailable'}")
+    long_resume: Optional[dict[str, Any]] = None
+    if reset_ok:
+        one("cold2", "cold")
+        one("warm3", "warm")
+        suffix = _build_resume_suffix(tokenizer, prompts_file, resume_suffix_tokens)
+        extended = prompt + suffix
+        one("resume_warm", "resume_warm", extended)
+        if _reset_prefix_cache(server_url):
+            one("resume_cold", "resume_cold", extended)
+            long_resume = {
+                "continuation_tokens": len(tokenizer.encode(extended)) - measured_tokens,
+                "checked": True,
+            }
+        else:
+            long_resume = {"checked": False, "reason": "reset_prefix_cache failed before the cold reference"}
+    else:
+        long_resume = {
+            "checked": False,
+            "reason": "reset_prefix_cache unavailable; set VLLM_SERVER_DEV_MODE=1 on the server to enable it",
+        }
+
+    shared: Optional[dict[str, Any]] = None
+    if shared_prefix_bench:
+        before = _fetch_prefix_cache_counters(server_url)
+        summary = _run_serving_benchmark(
+            server_url=server_url,
+            hf_model=hf_model,
+            output_dir=output_dir,
+            profile_name="shared_prefix",
+            comparison_scope=(
+                "Shared-prefix workload (4 prefixes of 2048 tokens, 128-token unique suffixes) for prefix-cache "
+                "hit rate and completion. Not a headline latency number."
+            ),
+            raw_result_filename="vllm_shared_prefix_result.json",
+            summary_filename="vllm_shared_prefix_benchmark.json",
+            log_filename="vllm_shared_prefix_benchmark.log",
+            prompt_len=2048 + 128,
+            output_len=32,
+            num_requests=32,
+            concurrency=8,
+            temperature=0.0,
+            additional_args=additional_benchmark_args,
+            dataset_args=list(SHARED_PREFIX_BENCH_ARGS),
+            dataset_name="prefix_repetition",
+        )
+        after = _fetch_prefix_cache_counters(server_url)
+        shared = {
+            **_counter_delta(before, after),
+            "completed_requests": summary["completed_requests"],
+            "summary_file": str(output_dir / "vllm_shared_prefix_benchmark.json"),
+        }
+        shared["hit_rate"] = shared.pop("hit_rate")
+
+    record: dict[str, Any] = {
+        "prompt_tokens": measured_tokens,
+        "output_tokens": output_tokens,
+        "thresholds": thresholds,
+        "apc_log_enabled": _server_log_apc_state(server_log),
+        "reset_prefix_cache_before_cold1": reset_before,
+        "reset_prefix_cache_available": reset_ok,
+        "long_resume": long_resume,
+        "requests": requests_log,
+        "shared_prefix_bench": shared,
+    }
+    record["status"], record["reasons"] = _prefix_cache_verdict(record, thresholds)
+    output_file = output_dir / "prefix_cache_check.json"
+    output_file.write_text(json.dumps(record, indent=2) + "\n")
+    print(f"  status: {record['status']} -> {output_file}")
+    for reason in record["reasons"]:
+        print(f"    {reason}")
+    return record
+
+
+BURST_CONFIG_KEYS = ("prompt_len", "output_len", "num_requests", "concurrency")
+
+
+def _attach_serial_reference(
+    summary_file: Path,
+    summary: dict[str, Any],
+    serial: Optional[dict[str, Any]],
+    serial_path: Optional[Path],
+) -> dict[str, Any]:
+    """Record burst/serial TTFT ratios. `serial` is read before the burst run so the same path is safe."""
+    if serial is None:
+        return summary
+    serial_ttft = serial.get("ttft_ms") or {}
+    burst_ttft = summary.get("ttft_ms") or {}
+    serial_config = serial.get("config") or {}
+    burst_config = summary.get("config") or {}
+    config_matches = all(serial_config.get(key) == burst_config.get(key) for key in BURST_CONFIG_KEYS)
+
+    def ratio(key: str) -> Optional[float]:
+        s = serial_ttft.get(key)
+        b = burst_ttft.get(key)
+        return (b / s) if isinstance(s, (int, float)) and s > 0 and isinstance(b, (int, float)) else None
+
+    summary["serial_reference"] = {
+        "path": str(serial_path) if serial_path else None,
+        "serial_config": {key: serial_config.get(key) for key in BURST_CONFIG_KEYS},
+        "config_matches": config_matches,
+        "serial_ttft_ms": serial_ttft,
+        "ttft_ratio_p99": ratio("p99"),
+        "ttft_ratio_mean": ratio("mean"),
+        "ttft_ratio_p50": ratio("p50"),
+    }
+    summary_file.write_text(json.dumps(summary, indent=2) + "\n")
+    print(
+        f"  serial reference: p99 ratio={summary['serial_reference']['ttft_ratio_p99']}, "
+        f"mean ratio={summary['serial_reference']['ttft_ratio_mean']}, config_matches={config_matches}"
+    )
+    return summary
+
+
+def _write_run_summary(path: Path, summary: dict[str, Any]) -> None:
+    """Merge into an existing summary so a hold-open server and attached check runs share one file."""
+    existing: dict[str, Any] = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    merged = dict(existing)
+    for key, value in summary.items():
+        if key == "outputs":
+            merged["outputs"] = {**(existing.get("outputs") or {}), **value}
+        elif key == "stages":
+            merged["stages"] = sorted(set(existing.get("stages") or []) | set(value))
+        elif value is None and existing.get(key) is not None:
+            continue
+        else:
+            merged[key] = value
+    path.write_text(json.dumps(merged, indent=2) + "\n")
 
 
 def _shutdown(proc: subprocess.Popen, log_file: Path) -> None:
@@ -802,9 +1297,15 @@ def _parse_stages(raw: str) -> List[str]:
     return deduped
 
 
-def _main() -> None:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the vLLM server readiness check.")
     parser.add_argument("--model-dir", type=Path, required=True)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory for this run's outputs. Default: <model_dir>/readiness_vllm, the root the stage gates read.",
+    )
     parser.add_argument("--hf-model", type=str, required=True)
     parser.add_argument(
         "--stages",
@@ -987,7 +1488,68 @@ def _main() -> None:
             'Quoted, e.g. "--request-rate 0.25 --metric-percentiles 50,90,99".'
         ),
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--enable-prefix-caching",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Pass --enable-prefix-caching or --no-enable-prefix-caching to the launched server. "
+            "Default leaves the vLLM default, which the TT plugin gates on model_capabilities."
+        ),
+    )
+    parser.add_argument(
+        "--server-log",
+        type=Path,
+        default=None,
+        help="Server log to read the prefix-caching state from when attaching with --server-url.",
+    )
+    parser.add_argument(
+        "--prefix-cache-prompt-tokens",
+        type=int,
+        default=DEFAULT_PREFIX_CACHE_PROMPT_TOKENS,
+        help=f"Prompt length for the prefix_cache stage (default {DEFAULT_PREFIX_CACHE_PROMPT_TOKENS}).",
+    )
+    parser.add_argument(
+        "--prefix-cache-output-tokens",
+        type=int,
+        default=DEFAULT_PREFIX_CACHE_OUTPUT_TOKENS,
+        help=f"Greedy output length for the prefix_cache stage (default {DEFAULT_PREFIX_CACHE_OUTPUT_TOKENS}).",
+    )
+    parser.add_argument(
+        "--prefix-cache-resume-suffix-tokens",
+        type=int,
+        default=DEFAULT_PREFIX_CACHE_RESUME_SUFFIX_TOKENS,
+        help=(
+            "New-suffix length appended to the shared prefix for the long-resume comparison "
+            f"(default {DEFAULT_PREFIX_CACHE_RESUME_SUFFIX_TOKENS}). Needs /reset_prefix_cache, which vLLM "
+            "exposes with VLLM_SERVER_DEV_MODE=1."
+        ),
+    )
+    parser.add_argument(
+        "--prefix-cache-shared-bench",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also run the shared-prefix `vllm bench serve` workload in the prefix_cache stage.",
+    )
+    parser.add_argument(
+        "--prefill-burst-serial-result",
+        type=Path,
+        default=None,
+        help=(
+            "Normalized summary JSON of the same prefill_burst workload measured with batched prefill "
+            "disabled. It is read before the burst runs, so the stage's own output path is accepted; "
+            "the stage records burst/serial TTFT ratios and whether the workload configs match."
+        ),
+    )
+    return parser
+
+
+def resolve_output_dir(model_dir: Path, output_dir: Optional[Path]) -> Path:
+    return (output_dir if output_dir is not None else model_dir / "readiness_vllm").resolve()
+
+
+def _main() -> None:
+    args = _build_parser().parse_args()
 
     stages: List[str] = args.stages
     serve_locally = STAGE_SERVE in stages
@@ -1012,7 +1574,7 @@ def _main() -> None:
     benchmark_temperature = None if args.benchmark_use_server_generation_config else args.benchmark_temperature
 
     model_dir = args.model_dir.resolve()
-    output_dir = model_dir / "readiness_vllm"
+    output_dir = resolve_output_dir(model_dir, args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     server_log = output_dir / "server.log"
     sampling_log = output_dir / "sampling_tests.log"
@@ -1024,10 +1586,40 @@ def _main() -> None:
     if STAGE_SAMPLING in stages:
         _find_plugin_tests_dir()
 
+    apc_log_source = server_log if serve_locally else args.server_log
+    if not serve_locally and args.enable_prefix_caching is not None:
+        parser.error("--enable-prefix-caching only applies when `serve` is in --stages; use --server-log to record an external server")
+    run_summary: dict[str, Any] = {
+        "stages": stages,
+        "hf_model": args.hf_model,
+        "server_url": args.server_url,
+        "server_command": None,
+        "mesh_device": args.mesh_device,
+        "max_num_seqs": args.max_num_seqs,
+        "max_model_len": args.max_model_len,
+        "block_size": args.block_size,
+        "tt_config": merged_tt_config,
+        "enable_prefix_caching": args.enable_prefix_caching if serve_locally else None,
+        "apc_log_enabled": None,
+        "apc_log_source": str(apc_log_source) if apc_log_source else None,
+        "outputs": {},
+    }
+    run_summary_file = output_dir / "vllm_run_summary.json"
+
     server_proc: Optional[subprocess.Popen] = None
     try:
         if serve_locally:
             _check_port_available(args.port)
+            run_summary["server_command"] = _server_command(
+                hf_model=args.hf_model,
+                max_num_seqs=args.max_num_seqs,
+                block_size=args.block_size,
+                port=args.port,
+                max_model_len=args.max_model_len,
+                tt_config=merged_tt_config,
+                additional_args=additional_server_args,
+                enable_prefix_caching=args.enable_prefix_caching,
+            )
             server_proc = _launch_server(
                 hf_model=args.hf_model,
                 mesh_device=args.mesh_device,
@@ -1038,6 +1630,7 @@ def _main() -> None:
                 max_model_len=args.max_model_len,
                 tt_config=merged_tt_config,
                 additional_args=additional_server_args,
+                enable_prefix_caching=args.enable_prefix_caching,
             )
             _wait_for_server(
                 proc=server_proc,
@@ -1130,6 +1723,48 @@ def _main() -> None:
                         }
                     }
                     (output_dir / "vllm_benchmark.json").write_text(json.dumps(primary_summary, indent=2) + "\n")
+                run_summary["outputs"]["benchmark"] = str(output_dir / "vllm_benchmark.json")
+            elif stage == STAGE_PREFIX_CACHE:
+                _run_prefix_cache_check(
+                    server_url=server_url,
+                    hf_model=args.hf_model,
+                    output_dir=output_dir,
+                    prompts_file=args.prompts.resolve(),
+                    prompt_tokens=args.prefix_cache_prompt_tokens,
+                    output_tokens=args.prefix_cache_output_tokens,
+                    thresholds=PREFIX_CACHE_THRESHOLDS,
+                    server_log=apc_log_source,
+                    shared_prefix_bench=args.prefix_cache_shared_bench,
+                    additional_benchmark_args=additional_benchmark_args,
+                    resume_suffix_tokens=args.prefix_cache_resume_suffix_tokens,
+                )
+                run_summary["outputs"]["prefix_cache"] = str(output_dir / "prefix_cache_check.json")
+            elif stage == STAGE_PREFILL_BURST:
+                serial_path = args.prefill_burst_serial_result.resolve() if args.prefill_burst_serial_result else None
+                serial = json.loads(serial_path.read_text()) if serial_path else None
+                burst_summary = _run_serving_benchmark(
+                    server_url=server_url,
+                    hf_model=args.hf_model,
+                    output_dir=output_dir,
+                    profile_name="prefill_burst",
+                    comparison_scope=(
+                        "32 short prompts submitted at once so the scheduler forms multi-row prefill steps. "
+                        "Compare TTFT against the same workload with batched prefill disabled; not a decode number."
+                    ),
+                    raw_result_filename="vllm_prefill_burst_result.json",
+                    summary_filename="vllm_prefill_burst_benchmark.json",
+                    log_filename="vllm_prefill_burst_benchmark.log",
+                    prompt_len=DEFAULT_BURST_PROMPT_LEN,
+                    output_len=DEFAULT_BURST_OUTPUT_LEN,
+                    num_requests=DEFAULT_BURST_NUM_REQUESTS,
+                    concurrency=DEFAULT_BURST_CONCURRENCY,
+                    temperature=0.0,
+                    additional_args=additional_benchmark_args,
+                )
+                _attach_serial_reference(
+                    output_dir / "vllm_prefill_burst_benchmark.json", burst_summary, serial, serial_path
+                )
+                run_summary["outputs"]["prefill_burst"] = str(output_dir / "vllm_prefill_burst_benchmark.json")
 
         print("\n" + "=" * 60)
         print(f"vLLM checks complete. Results in {output_dir}")
@@ -1137,6 +1772,9 @@ def _main() -> None:
     finally:
         if server_proc is not None:
             _shutdown(server_proc, server_log)
+        run_summary["apc_log_enabled"] = _server_log_apc_state(apc_log_source)
+        _write_run_summary(run_summary_file, run_summary)
+        print(f"Run summary: {run_summary_file}")
 
 
 if __name__ == "__main__":

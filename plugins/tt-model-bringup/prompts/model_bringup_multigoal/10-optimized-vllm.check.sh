@@ -17,4 +17,8 @@ python "${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/check_degenerate_output
 
 python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_context_contract.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" \
-  --stage optimized-vllm --require-contract
+  --stage optimized-vllm --require-contract || exit $?
+
+python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_prefill_features.py" \
+  --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" \
+  --stage optimized-vllm --require-burst
