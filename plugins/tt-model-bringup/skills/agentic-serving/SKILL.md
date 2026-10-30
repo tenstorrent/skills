@@ -102,9 +102,9 @@ Some settings are not tuning arms. Find the release values before the first run 
 source and values in the preflight:
 
 - Eval names and versions. A stale default in a skill or inputs file does not override the spec.
-- Agent time limit, request time limit and output cap: set so the model can finish, never below
-  the release values. Raise a limit while tasks end at it; a capped answer measures the cap, not
-  the model.
+- Agent time limit, request time limit and output cap: start at the release values and raise them
+  as runs show tasks ending at a limit, so no score is lost to time or tokens. A capped answer
+  measures the cap, not the model.
 - Batch: run the full evals on the largest validated batch, with enough agents to fill it, unless a
   recorded reason says otherwise. Samples and tests use the largest batch that works and suits the
   test. Record the batch each eval used.
