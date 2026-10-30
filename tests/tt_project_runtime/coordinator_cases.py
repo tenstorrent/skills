@@ -1538,6 +1538,21 @@ def test_likely_next_weighs_each_predictor_and_finds_a_quiet_project():
     assert cachettl.likely_next({**quiet, "turns": turns}, now)[0], "four 1 min gaps out of five"
 
 
+def test_likely_next_keeps_1h_for_an_overdue_task_a_probe_wait_and_a_burst_median():
+    """The accepted gap in cachettl: a task overdue for hours, a task whose retry timer is near (asleep
+    on a probe or not) and a median shortened by a burst of turns all still count as a likely next turn.
+    A replay found dropping any of them adds about as many 5m misses as unread 1h writes it saves."""
+    from ttp import cachettl
+    now, hour = 1_000_000.0, 3600.0
+    quiet = {"running": [], "due": [], "chat": None, "turns": [now - k * 2 * hour for k in range(1, 6)]}
+    assert not cachettl.likely_next(quiet, now)[0]
+    for change, reason in (({"due": [("task #9", now - 5 * hour)]}, "task #9 due"),
+                           ({"due": [("task #9", now + 10 * 60)]}, "task #9 due in 10 min")):
+        assert cachettl.likely_next({**quiet, **change}, now) == (True, reason), change
+    burst = [now - 6 * hour - k * 60 for k in range(5)]   # five turns a minute apart, then 6 h of quiet
+    assert cachettl.likely_next({**quiet, "turns": burst}, now) == (True, "median turn gap 1 min")
+
+
 def test_cache_signals_read_running_due_tasks_llm_schedules_chat_and_turns(env):
     from ttp import cachettl
     p = make(env)

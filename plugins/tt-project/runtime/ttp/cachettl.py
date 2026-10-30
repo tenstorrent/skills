@@ -29,6 +29,12 @@ NEXT_MIN = 60            # a task or llm schedule due this soon starts work whos
 CHAT_MIN = 30            # a user message this recent: the chat is open
 GAPS = 5                 # the recent turn gaps whose median is weighed
 QUIET_GAP_MIN = 90       # a median gap over this, with nothing running or due, is a quiet project
+# Accepted gap: some 1h writes on the due and median-gap reasons go unread. A task stays "due" when it
+# is overdue but held, or asleep on a probe that keeps saying "not yet"; a burst of turns a minute apart
+# shortens the median. A replay of live turns found every narrower rule tried (dropping a task overdue
+# over NEXT_MIN, a task asleep on a probe, or gaps under 5 min from the median) adding about one 5m miss
+# per unread write it saved, and a miss costs more (a cold rewrite) than an unread 1h write (0.75x input).
+# So they stay as they are: overall the due reasons were read about 88% of the time, the median one 73%.
 
 
 WORKER_TTLS = ("5m", "1h", "off")
