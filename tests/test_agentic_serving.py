@@ -80,7 +80,7 @@ def goal12(model, **overrides):
         'full/swe/results.json': {'actual_hours': 6.5},
         'survey.json': {'checks': {k: {'value': 1, 'healthy': True} for k in CHECKS},
                         'calculations': {k: 1 for k in CALCULATIONS}, 'shortfalls': []},
-        'preflight.json': {k: {'ok': True} for k in ('release_spec', 'registry', 'disk', 'release_route', 'isolation_smoke')},
+        'preflight.json': {k: {'ok': True} for k in ('release_values', 'registry', 'disk', 'release_route', 'isolation_smoke')},
         'efforts.json': {
             'efforts': [
                 {'problem': 'padded prefill', 'owner': 'prefill', 'status': 'done',

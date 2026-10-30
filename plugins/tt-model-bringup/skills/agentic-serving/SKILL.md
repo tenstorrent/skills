@@ -96,24 +96,26 @@ a CI repository, which needs the implementation pushed where the runners can fet
 loop. Either way, record the grant you actually used in `doc/agentic_evals/compute.json` so a
 reader can tell a thin result from a small grant.
 
-### Settings the release fixes
+### Eval settings
 
-Some settings are not tuning arms. Find the release values before the first run and record their
-source and values in the preflight:
+Find the release values for the time limits and output cap before the first run, and record their
+source and values in the preflight.
 
-- Agent time limit, request time limit and output cap: start at the release values and raise them
-  as runs show tasks ending at a limit, so no score is lost to time or tokens. A capped answer
-  measures the cap, not the model.
+- Agent time limit, request time limit and output cap: never the reason a score is lost. The survey
+  estimates what the model needs; runs correct it. When tasks are cut off while still making
+  progress, raise the limit and run those tasks again. A task that loops or repeats is a model
+  failure, not a limit to raise. Never go below the release values, and report the limits each
+  score used.
 - Batch: run the full evals on the largest validated batch, with enough agents to fill it, unless a
   recorded reason says otherwise. Samples and tests use the largest batch that works and suits the
   test. Record the batch each eval used.
 
-Record them in `serving_config.json` next to `release_limits`, the values the spec sets.
+Record the limits and batches used in `serving_config.json`, with the release values as `release_limits`.
 
 ### Stage order
 
 1. **Survey, about 2 h.** Answer every check and calculation in [the survey](references/survey.md)
-   on the stage-11 data and one smoke run at release limits, and run the preflight: release spec,
+   on the stage-11 data and one smoke run at release limits, and run the preflight: release values,
    registry, disk, the release route the final run will use, and an isolated 2-task smoke with a
    trajectory audit. Write `survey.json` and `preflight.json`.
 2. **Rank, about 0.5 h.** Turn each problem the survey found into an effort in `efforts.json`, as
@@ -181,7 +183,7 @@ multi-turn traffic. A count valid for one is meaningless for another.
 Write these to `doc/agentic_evals/`:
 
 - `survey.json`: `checks`, `calculations` and `shortfalls`, as the survey reference names them
-- `preflight.json`: `release_spec` (with its source and values), `registry`, `disk`, `release_route`
+- `preflight.json`: `release_values` (with their source), `registry`, `disk`, `release_route`
   and `isolation_smoke`, each with `ok`
 - `efforts.json`: `efforts`, each with `problem`, `owner`, `goal`, `plan`, `predicted`
   (`saving_hours` per eval, `device_hours`, `basis`: `measured`, `calculated` or `guess`),

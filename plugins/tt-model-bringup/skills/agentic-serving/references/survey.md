@@ -35,8 +35,8 @@ eval.
 |---|---|---|
 | `batch` | Which batch? | Full evals: the largest validated batch; samples: the largest the test keeps busy |
 | `suite_hours` | Will each suite finish? | tasks × (uncached tokens ÷ prefill tok/s + output tokens × step ÷ busy rows) ÷ agents |
-| `agent_timeout` | What agent time limit? | Start at the release limit; raise while tasks end at it |
-| `output_cap` | What output cap? | Start at the release cap; raise while any answer hits it |
+| `agent_timeout` | What agent time limit? | turns × turn time at the served speed, never below the release limit |
+| `output_cap` | What output cap? | Longest answer so far plus headroom, never below the release cap |
 | `bytes` | Where do the bytes go? | Per cache ID: block × KV bytes per token + state bytes; fill per layer group; duplicate weights |
 | `agents` | How many agents keep the prefix cache? | agents ≤ pool IDs ÷ (live blocks + state IDs per agent) |
 | `block_cost` | What does the block size cost? | Recompute per returning turn ≈ block ÷ 2 |
