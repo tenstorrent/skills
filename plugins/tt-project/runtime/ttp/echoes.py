@@ -15,7 +15,11 @@ plugin template): only a project-tuned copy can be fixed. A phrase the replacing
 retired rule, nor is plugin vocabulary (one identifier or `ttp <command>` name found in the runtime source or an
 unedited template file, such as `start_when` or `ttp list`; never the plugin's prose, nor a Correction's
 wrong part): alone it matches unrelated text. A hit still there a turn
-after it was first shown is marked. Accepted gap: a task whose spec quotes the retired rule in order
+after it was first shown is marked. An audit record that only preserves an old assertion is declared
+historical in HISTORICAL_INDEX (its path, sha256 and the retirement's id): while its bytes still hash
+to that value and the retirement is live, that retirement's hit on it is counted, not listed; any
+mismatch lists it as before. Binding places (prompts, harness tools, skills, agent instructions,
+executables) are never historical. Accepted gap: a task whose spec quotes the retired rule in order
 to remove it is listed too.
 """
 from __future__ import annotations
@@ -30,7 +34,13 @@ from pathlib import Path
 from typing import Any
 
 RETIRED_KEY = "retired_rules"        # kv: [{"id", "at", "source", "old", "new", "phrases", "skip", "negated"}]
-SEEN_KEY = "retired_echo_seen"       # kv: {"turn": last_coordinator_turn, "hits": {hit key: turns shown}}
+SEEN_KEY = "retired_echo_seen"       # kv: {"turn": last_coordinator_turn, "hits": {hit key: turns shown},
+                                     #      "historical": hits declared historical, not listed}
+HISTORICAL_INDEX = "echo_historical.json"   # harness/: {"historical": [{"path", "sha256", "retirement"}]}
+HISTORICAL_MAX = 200                 # index entries read
+_BINDING_DIRS = {"bin", "prompts", "hooks", "tools"}   # harness/ folders of live scripts and prompts
+_INSTRUCTIONS = {"CLAUDE.md", "AGENTS.md", "SKILL.md"}
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 RETIRED_DAYS = 30
 RETIRED_KEEP = 50
 MAX_PHRASES = 8
@@ -320,12 +330,79 @@ def _hit(rec: dict, flat: str, phrases_: list[str] | None = None) -> str:
     return ""
 
 
-def scan(p, now: float | None = None) -> list[dict]:
-    """The retired texts' echoes: [{"key", "label", "line", "phrase", "source"}], newest retirement first."""
+def _binding(real: Path, root: Path, harness: Path) -> bool:
+    """Whether project file `real` can still bind (never historical): an agent instruction or skill file, an
+    executable, a file below ROOT_PATHS, a top-level harness file or one in a harness folder of scripts and
+    prompts."""
+    if real.name in _INSTRUCTIONS or os.access(real, os.X_OK):
+        return True
+    rel = real.relative_to(root).as_posix()
+    if any(rel == x or rel.startswith(x + "/") for x in ROOT_PATHS):
+        return True
+    try:
+        parts = real.relative_to(harness).parts
+    except ValueError:
+        return False
+    return len(parts) == 1 or parts[0] in _BINDING_DIRS
+
+
+def historical_index(p, recs: list[dict]) -> dict[str, dict[str, set[str]]]:
+    """The well-formed entries of harness/HISTORICAL_INDEX as {"file:<path>": {retirement id: {sha256}}}.
+    An entry counts only with `path` the exact project-relative path of a regular, non-binding file (no
+    folder, pattern, `..`, symlink or absolute path), `sha256` 64 lower-case hex digits and `retirement`
+    the id of a live retirement in `recs`; anything else is ignored, so its hits stay listed."""
+    try:
+        data = json.loads((Path(p.harness) / HISTORICAL_INDEX).read_text())
+    except (OSError, ValueError):
+        return {}
+    entries = data.get("historical") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return {}
+    live = {r.get("id") for r in recs}
+    root = Path(p.root).resolve()
+    harness = Path(p.harness).resolve()
+    out: dict[str, dict[str, set[str]]] = {}
+    for e in entries[:HISTORICAL_MAX]:
+        if not isinstance(e, dict):
+            continue
+        rel, sha, rid = e.get("path"), e.get("sha256"), e.get("retirement")
+        if not (isinstance(rel, str) and isinstance(sha, str) and _SHA256.fullmatch(sha) and isinstance(rid, str)
+                and rid in live):
+            continue
+        path = root / rel
+        try:
+            real = path.resolve()
+            if (not real.is_relative_to(root) or real.relative_to(root).as_posix() != rel or path.is_symlink()
+                    or not path.is_file() or _binding(real, root, harness)):
+                continue
+        except (OSError, ValueError):
+            continue
+        out.setdefault(f"file:{rel}", {}).setdefault(rid, set()).add(sha)
+    return out
+
+
+def _sha256(path: Path) -> str:
+    """The sha256 of all of file `path` ('' when unreadable)."""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
+def scan(p, now: float | None = None, historical: list[dict] | None = None) -> list[dict]:
+    """The retired texts' echoes: [{"key", "label", "line", "phrase", "source", "retirement"}], newest
+    retirement first. A hit on a file the historical index declares historical for that retirement, with
+    its bytes still hashing to the recorded value, goes to `historical` instead."""
     now = time.time() if now is None else now
     recs = [r for r in p.db.kv(RETIRED_KEY, []) or [] if now - r.get("at", 0) < RETIRED_DAYS * 86400]
     if not recs:
         return []
+    index = historical_index(p, recs)
+    digests: dict[str, str] = {}
     pristine: list[str] = []
     where = [(key, label, text, _flat(text)) for key, label, text in places(p, pristine)]   # flattened once
     vocab = set().union(*map(_vocab, pristine))
@@ -343,16 +420,26 @@ def scan(p, now: float | None = None) -> list[dict]:
                 seen.add((rec["id"], key))
                 if key.startswith("file:"):
                     label += f":{_lineno(text, ph)}"
-                out.append({"key": f"{rec['id']}:{key}", "label": label, "line": _line(text, ph), "phrase": ph,
-                            "source": rec.get("source") or ""})
+                hit = {"key": f"{rec['id']}:{key}", "label": label, "line": _line(text, ph), "phrase": ph,
+                       "source": rec.get("source") or "", "retirement": rec["id"]}
+                shas = index.get(key, {}).get(rec["id"])
+                if shas:
+                    if key not in digests:
+                        digests[key] = _sha256(Path(p.root).resolve() / key[5:])
+                    if digests[key] in shas:
+                        if historical is not None:
+                            historical.append(hit)
+                        continue
+                out.append(hit)
     return out
 
 
 def digest_lines(p, now: float | None = None) -> list[str]:
     """The digest's Retired-rule echoes section, at most SECTION_LINES lines; [] when nothing echoes. A
     hit already shown in an earlier turn is marked. Never posts, wakes or holds anything."""
+    hist: list[dict] = []
     try:
-        hits = scan(p, now)
+        hits = scan(p, now, hist)
     except (OSError, ValueError, TypeError, KeyError, AttributeError):   # a notice never fails the turn
         return []
     db = p.db
@@ -361,21 +448,28 @@ def digest_lines(p, now: float | None = None) -> list[str]:
     before = old.get("hits") or {}
     fresh = old.get("turn") != turn   # a second digest within one turn counts no turn
     counts = {h["key"]: (before.get(h["key"], 0) + 1 if fresh else before.get(h["key"]) or 1) for h in hits}
-    if counts != before or old.get("turn") != turn:
-        db.set_kv(SEEN_KEY, {"turn": turn, "hits": counts})
+    if counts != before or old.get("turn") != turn or (old.get("historical") or 0) != len(hist):
+        db.set_kv(SEEN_KEY, {"turn": turn, "hits": counts, "historical": len(hist)})
     if not hits:
         return []
     mem = list(dict.fromkeys(h["key"].split(":", 2)[2] for h in hits if h["key"].split(":", 2)[1] == "memory"))
-    room = SECTION_LINES - 1 - bool(mem)
+    room = SECTION_LINES - 1 - bool(mem) - bool(hist)
     shown = hits if len(hits) <= room else hits[:room - 1]
     lines = [RETIRED_HEADER]
     for h in shown:
         n = counts[h["key"]]
-        lines.append(f"- {h['label']}: \"{h['line']}\" (retired: {h['source']}; matches \"{h['phrase'][:60]}\")"
+        rid = f", id {h['retirement']}" if h["key"].split(":", 2)[1] == "file" else ""   # for the historical index
+        lines.append(f"- {h['label']}: \"{h['line']}\" (retired: {h['source']}{rid}; matches \"{h['phrase'][:60]}\")"
                      + (f" [still here, {n} turns]" if n >= 2 else ""))
     if len(shown) < len(hits):
         lines.append(f"- ... and {len(hits) - len(shown)} more; fix these and the rest show next turn")
     if mem:   # every memory entry that still holds a retired rule, shown or not
         names = ", ".join(f"[{n}]" for n in mem[:12]) + (f" and {len(mem) - 12} more" if len(mem) > 12 else "")
         lines.append(f"- memory to retire (memory_forget, or memory_add `supersedes` to keep what is still right): {names}")
+    if hist:   # declared historical: counted, never silently dropped
+        try:
+            where = (Path(p.harness).resolve() / HISTORICAL_INDEX).relative_to(Path(p.root).resolve()).as_posix()
+        except ValueError:
+            where = HISTORICAL_INDEX
+        lines.append(f"- {len(hist)} historical line{'s' if len(hist) != 1 else ''} not shown (declared in {where})")
     return lines

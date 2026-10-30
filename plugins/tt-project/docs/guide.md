@@ -377,7 +377,9 @@ prolonged whole-box outage.
   `still here`; a last line names every memory entry that hit, for memory_forget). The replacing text, the archives and harness files equal to the template are not searched; a Correction's phrase right
   after a negation ("never ...") is no hit. The coordinator fixes each in that turn (memory_forget or
   `supersedes`, charter_update `quote`, schedule_set, task_update, config_set). It is a notice: no
-  event, wake, hold or model call of its own. A task whose spec quotes the old rule to remove it is
+  event, wake, hold or model call of its own. An audit record that only preserves an old assertion is
+  declared historical in `harness/echo_historical.json` (its path, sha256 and the retirement's id): while
+  its bytes still match, that hit is counted, not listed; any mismatch lists it again. A task whose spec quotes the old rule to remove it is
   listed too.
 - Progress and stall check: each minute the daemon checks, without a model, that work keeps yielding
   results (a task done, a worker hand-off, a driver's `result` report). It judges only work that has

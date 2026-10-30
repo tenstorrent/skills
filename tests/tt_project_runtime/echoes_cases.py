@@ -185,3 +185,91 @@ def test_short_retired_claims_the_plugin_prose_also_mentions_are_still_listed(en
     assert all(echoes._generic(ph, []) for ph in ("start_when", "pr_branch", "memory_add", "ttp list"))
     assert not any(echoes._generic(ph, []) for ph in ("tt-smi -r", "sudo -n true", "a loopback address",
                                                       "ttp lock box-7", "start_when probe"))
+
+
+def test_an_indexed_audit_record_is_historical_only_while_its_hash_and_retirement_match(env):
+    import hashlib as _hashlib
+    import json as _json
+    from ttp import echoes
+    p = make(env)
+    rec = echoes.record(p.db, "charter 'Recovery' quote replaced", "Recover a hung card with `legacy-card-kick`.",
+                        "Recover a hung card with the documented reset.")
+    other = echoes.record(p.db, "memory [old-gate] superseded by [new-gate]", "Hold builds for `legacy_build_gate`.",
+                          "Builds ship on green checks.")
+    root = p.root
+    audit = root / "audits" / "2026-10-01.md"
+    audit.parent.mkdir(parents=True)
+    audit.write_text("# Audit 2026-10-01\nAt the time, recovery used `legacy-card-kick` first.\n")
+    twin = root / "audits" / "2026-10-02.md"   # same folder and pattern, no index entry
+    twin.write_text("Recovery uses legacy-card-kick.\n")
+    tool = p.harness / "tools" / "recover.sh"   # an active rule
+    tool.parent.mkdir(parents=True, exist_ok=True)
+    tool.write_text("#!/bin/sh\nlegacy-card-kick \"$1\"\n")
+    p.charter_path.write_text(p.charter_path.read_text().rstrip() + "\n\n## Recovery\n- Run legacy-card-kick.\n")
+    mem = p.add_memory("Recovery: legacy-card-kick first.", kind="decision")
+    p.set_config("coordinator.echo_paths", ["audits"])
+    index = p.harness / echoes.HISTORICAL_INDEX
+    sha = _hashlib.sha256(audit.read_bytes()).hexdigest()
+    entry = {"path": "audits/2026-10-01.md", "sha256": sha, "retirement": rec["id"]}
+
+    def labels():
+        return {h["label"] for h in echoes.scan(p)}
+    active = {"file tt-project/harness/tools/recover.sh:2", "charter section 'Recovery'", f"memory [{mem.stem}]",
+              "file audits/2026-10-02.md:1"}
+    before = labels()
+    assert active | {"file audits/2026-10-01.md:2"} <= before, before
+    # Without an index entry (today) the audit's old assertion is emitted; its digest line names the retirement id.
+    assert any(f"id {rec['id']}" in ln for ln in echoes.digest_lines(p) if "audits/2026-10-01.md" in ln)
+    # Declared historical with a matching hash and a live retirement: no longer a current echo, everything else is.
+    index.write_text(_json.dumps({"historical": [entry]}))
+    assert labels() == before - {"file audits/2026-10-01.md:2"}
+    sec = echoes.digest_lines(p)
+    assert not [ln for ln in sec if "audits/2026-10-01.md" in ln], sec
+    assert sec[-1] == f"- 1 historical line not shown (declared in tt-project/harness/{echoes.HISTORICAL_INDEX})", sec
+    # Fail closed: each bad entry or index leaves the echo emitted exactly as today.
+    bad = [dict(entry, sha256=sha[:-1] + ("0" if sha[-1] != "0" else "1")), dict(entry, sha256="x"),
+           dict(entry, sha256=sha.upper()), dict(entry, retirement="ffffffffff"), dict(entry, retirement=other["id"]),
+           {k: v for k, v in entry.items() if k != "retirement"}, {k: v for k, v in entry.items() if k != "sha256"},
+           dict(entry, path="audits"), dict(entry, path="audits/*.md"), dict(entry, path="audits/"),
+           dict(entry, path="./audits/../audits/2026-10-01.md"), dict(entry, path=str(audit)),
+           dict(entry, sha256=7), dict(entry, retirement=None), "audits/2026-10-01.md"]
+    for b in bad:
+        index.write_text(_json.dumps({"historical": [b]}))
+        assert labels() == before, b
+    for raw in ("not json", "[]", "{}", _json.dumps({"historical": entry}), _json.dumps({"historical": None})):
+        index.write_text(raw)
+        assert labels() == before, raw
+    # A retirement no longer live (expired) is an unknown authority: the scan then has nothing to match anyway.
+    # Edited bytes: emitted again until the entry is re-hashed.
+    index.write_text(_json.dumps({"historical": [entry]}))
+    assert "file audits/2026-10-01.md:2" not in labels()
+    audit.write_text(audit.read_text() + "Still true: legacy-card-kick.\n")
+    assert "file audits/2026-10-01.md:2" in labels()
+    # The other retirement's hits on an indexed file are still emitted.
+    audit.write_text(audit.read_text() + "Hold builds for legacy_build_gate.\n")
+    index.write_text(_json.dumps({"historical": [dict(entry, sha256=_hashlib.sha256(audit.read_bytes()).hexdigest())]}))
+    hits = [h for h in echoes.scan(p) if h["label"].startswith("file audits/2026-10-01.md")]
+    assert [h["phrase"] for h in hits] == ["legacy_build_gate"], hits
+    # Never a binding place, even with a matching hash: prompts, harness tools and top-level files, skills,
+    # agent instructions, an executable.
+    prompt = p.harness / "prompts" / "kind-code.md"
+    prompt.write_text(prompt.read_text() + "\nAt the time: legacy-card-kick.\n")
+    skill = root / ".claude" / "skills" / "recover" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("legacy-card-kick\n")
+    notes = p.harness / "NOTES.md"
+    notes.write_text("legacy-card-kick\n")
+    agents = root / "audits" / "AGENTS.md"
+    agents.write_text("legacy-card-kick\n")
+    script = root / "audits" / "replay.sh"
+    script.write_text("legacy-card-kick\n")
+    script.chmod(0o755)
+    binding = [prompt, skill, tool, notes, agents, script]
+    index.write_text(_json.dumps({"historical": [
+        {"path": f.resolve().relative_to(root.resolve()).as_posix(),
+         "sha256": _hashlib.sha256(f.read_bytes()).hexdigest(), "retirement": rec["id"]} for f in binding]}))
+    got = labels()
+    for f in binding:
+        rel = f.resolve().relative_to(root.resolve()).as_posix()
+        assert [x for x in got if x.startswith(f"file {rel}:")], (rel, got)
+    assert {"charter section 'Recovery'", f"memory [{mem.stem}]", "file audits/2026-10-02.md:1"} <= got

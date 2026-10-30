@@ -23,4 +23,22 @@ Hits go into the digest's `Retired-rule echoes` section: the place, the matching
 
 It is a notice only: it posts no event, wakes nothing, holds nothing and adds no model call.
 
+## Declaring a historical assertion
+
+An audit record or report that only preserves what was true when it was written (an old flag value, a rule then in force) is not a copy that binds, and rewriting it would falsify the record. To stop it from coming back every turn, declare it historical in `harness/echo_historical.json` without touching its bytes:
+
+```json
+{"historical": [
+  {"path": "audits/2026-10-01.md",
+   "sha256": "<sha256sum of the file>",
+   "retirement": "<the retirement id the hit names>"}
+]}
+```
+
+- `path`: the file's exact path relative to the project root, as the hit names it. One file per entry: a folder, a pattern, `..`, a symlink or an absolute path is ignored.
+- `sha256`: the 64 lower-case hex digits `sha256sum <path>` prints for the file as it is now.
+- `retirement`: the id a file hit shows after its source (`retired: <source>, id <id>`). It covers only that retirement: the file's hits for any other retirement are still listed.
+
+That retirement's hit on that file then leaves the section. It fails closed: the hit is listed exactly as before when the file's bytes change, the id names no live retirement, the index is missing or malformed, or an entry lacks a field. Binding places are never historical, whatever the index says: memory, the charter, schedules, tasks and config, and among files the prompts, top-level harness files, `harness/bin`, `harness/hooks` and `harness/tools`, everything under the skill, hook, command and agent folders above, any `CLAUDE.md`, `AGENTS.md` or `SKILL.md`, and executable files. Nothing is skipped by folder or pattern: every other copy in the same folder is still searched. Declared hits are counted, not dropped: when the section shows, its last line says how many historical lines it left out, and the count is kept as `historical` in the `retired_echo_seen` kv entry.
+
 Known gap: a task whose spec quotes the old rule in order to remove it is listed too. Leave it, or finish the task.
