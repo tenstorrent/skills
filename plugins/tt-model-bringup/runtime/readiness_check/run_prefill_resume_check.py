@@ -44,6 +44,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -52,6 +54,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 import torch
 
 from readiness_check.contract import Generator
+from readiness_check.build_kwargs import add_build_kwargs_args, parse_build_kwargs
 from readiness_check.mesh_device import (
     add_mesh_device_args,
     close_readiness_mesh_device,
@@ -343,6 +346,7 @@ def run_prefill_resume_check(
         "window": window,
         "controls": list(controls),
         "thresholds": thresholds,
+        "provenance": provenance(model_dir),
         "cases": [],
     }
     try:
@@ -394,10 +398,32 @@ def _int_list(raw: str) -> List[int]:
     return values
 
 
+def provenance(model_dir: Path) -> Dict[str, Optional[str]]:
+    """Commit of the checkout that holds the model and the visible devices, when known."""
+    commit = None
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(model_dir), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10
+        )
+        commit = result.stdout.strip() or None if result.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        commit = None
+    return {"commit": commit, "visible_devices": os.environ.get("TT_VISIBLE_DEVICES")}
+
+
+def failed_output_path(output: Path) -> Path:
+    return output.with_name(f"{output.stem}.failed{output.suffix}")
+
+
 def _main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Run the resumed-prefill readiness check.")
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=None, help="Default: <model-dir>/readiness/prefill_resume_check.json")
+    parser.add_argument(
+        "--output-on-pass-only",
+        action="store_true",
+        help="Write a non-passing record next to --output as <name>.failed.json instead of overwriting it.",
+    )
     parser.add_argument("--lengths", type=_int_list, default=[2560])
     parser.add_argument("--block-sizes", type=_int_list, default=[32])
     parser.add_argument("--sliding-window", type=int, default=None)
@@ -425,6 +451,7 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     for key, value in DEFAULT_THRESHOLDS.items():
         parser.add_argument(f"--{key.replace('_', '-')}", type=float, default=value)
     add_mesh_device_args(parser)
+    add_build_kwargs_args(parser)
     args = parser.parse_args(argv)
 
     controls = [c.strip() for c in args.controls.split(",") if c.strip()]
@@ -440,6 +467,7 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
         record = run_prefill_resume_check(
             model_dir=model_dir,
             mesh_device=mesh_device,
+            build_kwargs=parse_build_kwargs(args),
             lengths=args.lengths,
             block_sizes=args.block_sizes,
             sliding_window=args.sliding_window,
@@ -456,6 +484,8 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     finally:
         close_readiness_mesh_device(mesh_device, args.fabric_config)
 
+    if args.output_on_pass_only and record["status"] != STATUS_PASS:
+        output = failed_output_path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(record, indent=2) + "\n")
     print(f"\nstatus={record['status']} cases={len(record['cases'])} -> {output}")

@@ -153,6 +153,54 @@ Only packaged hashes for three edited stage prompts, two edited check scripts, s
 `contract.py` and `run_vllm_server.py` change in `sync-source.json`; the original import
 provenance stays intact.
 
+The second trial (Qwen3-8B from stage 1 on one chip, Ornith 1.5 9B stages 9 and 10) folded its
+findings back in. The skills now require short-prefix and per-user cache-dtype evidence, a watcher
+battery over every changed prefill path, a byte budget for a second weight copy and a per-chunk-size
+kernel table, bounded device jobs with no SIGTERM mid-dispatch and operator-only resets, a review
+closure rule for findings raised after the last allowed rereview, a measured memory view behind the
+context contract, and a single-chip rule for skipped multichip stages. The resume gate reports a
+pass under lowered thresholds as advisory, the serving-contract gate reports a missing evidence path
+as advisory, the stage 9 gate runs the prefill-feature check after a serving-contract advisory,
+`generate.py` accepts the transformers 5 chat-template return type, and the readiness mesh open takes
+`READINESS_TRACE_REGION_SIZE`.
+
+The stage 7 pass of that trial added: one stage split for batched prefill across the optimize skill and
+the prefill-features reference (stage 6 proves the multi-row contract, stage 10 implements batching), the
+DRAM-sharded matmul named as decode-only, the TopK routing rule read from the op source before padding,
+the reduced-variant derivation of `decode_ms_per_token_device`, kernel selection by row count as a
+resume-check failure cause, the timeout-first hang rule, HF-control reuse, the short-prefix and batch-32
+cases for a cache-dtype candidate, and `run_prefill_resume_check --output-on-pass-only` with commit and
+visible-device provenance in its record.
+
+The stage 8 pass of that trial added: a teacher-forced natural-text reference and a repeated serial
+baseline in the datatype sweep, the accuracy bar applied per reference with the binomial margin of a
+100-token score, the resumed-prefill check rerun on the selected policy with a per-position HF
+comparison to separate precision loss from a resume bug, the per-group scope of the BFP4 fidelity
+comparison and kernels that ignore a fidelity field, the mid-stage timing-regime split and chain-driver
+stop rule in device usage, the Claude Code form of `TT_AUTODEBUG_ROOT`, the DRAM-sharded reader limit,
+and `--build-kwargs` / `--build-kwargs-file` on the four generator-level readiness runners
+(`readiness_check/build_kwargs.py`, authored in this plugin).
+
+The stage 9 pass of that trial added: the revision-dependent plugin registration mechanisms with
+verification in every engine subprocess, the hand-run sampling suite on a plugin layout the runner
+rejects, warmup over the served KV cache because paged-attention program keys include its shape,
+offset-independent continuation programs and the context-end bound as Stage 9 requirements, the
+`--async-scheduling` flag and the device-mirrored position rule with a served greedy-determinism check,
+the `tt_supported_decode_batch_sizes` key, the bounded kill of an orphaned engine subprocess, a decode
+replay at the end of every tracked workload, the admission-pattern evidence for seeded mixed-batch
+sampling failures, and a same-length generator control for the served qualitative verdict.
+`check_serving_contract.py` reports prose in an `evidence` field as advisory instead of failing on a
+path longer than the filesystem allows.
+
+The stage 10 pass of that trial added: the kernel-family condition on batched-equals-solo bit
+equality (`minimal_matmul` is its own family), the three op facts and the scratch-block contract
+behind the equal-padded-length design, calibration after the kernel-family choice, row pieces
+through the batch dimension for wide batched outputs, one counted sampling pass before a
+penalties-on capture, seeded requests that change sampler mid-request as routing defects, the
+watcher probe over every prepared batched shape, commit hooks before the first device run of a
+commit, and `--output-dir` on the vLLM runner (`run_vllm_server.py`) so a tracked or A/B run does
+not overwrite the gate's `readiness_vllm/` artifacts.
+
 ## Stack freshness at startup (0.1.22)
 
 The skills told agents to resolve current dependency versions for a new run but enforced nothing:

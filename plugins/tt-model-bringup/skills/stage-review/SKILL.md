@@ -111,7 +111,9 @@ Return `more-work-needed` when evidence shows one of these:
   not fail; or a greedy divergence after a
   cache hit is recorded as drift without the logit-level comparison that
   separates drift from a cache or position bug;
-- a vLLM stage has no batched-equals-solo prefill evidence or no
+- a vLLM stage has no batched-equals-solo prefill evidence (bit-equal per row
+  for last-token logits and K/V pages, not a PCC bar), the watcher battery did
+  not reach every prepared batched shape, or there is no
   `prefill_burst` comparison against the serial path; in optimized-vLLM the
   burst TTFT ratio misses its gate or single-user latency regressed with
   batched prefill on;
@@ -197,7 +199,10 @@ For generation or serving stages, also inspect:
   repetition, wrong language, truncation, prompt echo, cross-request leakage,
   odd leading text, or degraded coherence;
 - sampling tests and skipped/xfailed cases, separating expected framework limits
-  from correctness failures.
+  from correctness failures; seeded mixed-batch tests can fail from the plugin's
+  per-step host/device sampler routing alone (a seeded request draws on the device
+  in one step and on the host in the next), and the decisive evidence is a comparison
+  of the admission pattern in the server log between a passing and a failing run.
 - context-length evidence: `doc/context_contract.json`, served `max_model_len`,
   eval/benchmark context settings, and any cap or truncation introduced by the
   stage.
@@ -433,6 +438,17 @@ Verdict: clean-pass | more-work-needed
 ```
 
 Only `clean-pass` with no required work satisfies this skill.
+
+Required Work is reserved for correctness, contract, or missing-evidence gaps.
+A performance candidate that was not measured is Other Concerns unless the goal
+names it. Record push state from the run plan (the supervisor pushes stage
+commits; the stage agent never does) instead of inferring it from the reflog.
+
+Closure after the allowed rereviews: a P2 raised after the second rereview
+carries to the next optimize stage with a work-log entry naming it, and the
+recorded verdict stays `more-work-needed`; a P2 that the stage then fixes with
+device evidence is recorded as fixed under that unchanged verdict, with the
+evidence path. The next stage's review checks that carried items were closed.
 
 If the main agent could not obtain an independent review, report
 `not-independent` as a fallback status outside the reviewer verdict. Do not use

@@ -38,6 +38,8 @@ Load `models/autoports/<model>/doc/context_contract.json` and serve the recorded
 
 Serving requests may have any valid prompt length up to that supported context. The adapter must not require prompt length to be divisible by an internal prefill chunk, tile, block, page, or trace size. If the model path pads or chunks internally, the adapter passes the logical prompt length through to masks, positions, cache fill, and output slicing. Include a direct OpenAI-compatible request or targeted runner check with a valid non-aligned prompt length, not only the default 128-token benchmark.
 
+The plugin also reads the adapter's `tt_supported_decode_batch_sizes` (the captured decode buckets); without it every decode step is padded to `max_num_seqs`. Declare the prepared buckets there and document the key in the serving contract.
+
 Preserve larger-batch serving capability. The headline performance target is still batch-1 single-user latency, but the adapter must not assume `max_num_seqs=1` or batch size 1 in cache allocation, page tables, scheduler inputs, sampling, async decode, or output formatting. Test serving up to 32 concurrent sequences when the target hardware, memory, and harness allow it. If 32 cannot run, record the largest tested value and the hard physical limit.
 
 ## Serving dependency
@@ -73,13 +75,20 @@ Not every cache must be vLLM-owned. vLLM owns the attention KV cache, but recurr
 
 Make prompt lengths, page tables, decode positions, batch dimensions, trace-side state, and on-device sampling explicit. The serving decode pass must drive the generator's traced decode path, not an eager-only fallback. When adding or debugging trace capture/replay, trace-safe inputs, or replay correctness for this adapter, use `$tt-enable-tracing`. Before accepting the adapter, run representative repeated serving replay with `TT_METAL_TRACE_ALLOC_TRACKING=1` set in the server/worker environment before TTNN is imported. Alternate the trace keys and request patterns that share persistent inputs/outputs, and resolve every unsafe allocation under the target tt-metal checkout's `tech_reports/AdvancedPerformanceOptimizationsForModels/TraceCorrectness.md`. The adapter should not duplicate model logic that already lives in `tt/model.py` or `tt/generator.py`.
 
-Use the generator-owned two-phase warmup and trace lifetime rule from `$tt-enable-tracing`. vLLM callbacks must not be the only entrypoint that enforces warmup. Run the [mixed-shape trace reuse check](#mixed-shape-trace-reuse-check) on the same server.
+Use the generator-owned two-phase warmup and trace lifetime rule from `$tt-enable-tracing`. vLLM callbacks must not be the only entrypoint that enforces warmup. Paged-attention program keys include the KV-cache tensor shape, so in vLLM mode warmup and capture run over the served cache allocation, not over a generator-owned or test-sized pool; a generator that warms on its own pool and captures on the vLLM cache compiles inside the first capture. Run the [mixed-shape trace reuse check](#mixed-shape-trace-reuse-check) on the same server.
 
 For decode performance, implement the vLLM async split before advertising it: `decode_forward(..., read_from_device=False)` should return device tensors, `read_decode_output(..., async_read=True)` should perform the minimal deferred read, and `process_decode_output_host(...)` should do host formatting. Only set `supports_async_decode=True` after this path passes the vLLM plugin's expectations with decode trace enabled and stale-token/current-position tests passing.
 When async decode, on-device sampling and tracing are enabled, vLLM may submit step
 N+1 before sampled token N reaches host scheduler state. Reuse the device token and
 position state for steady decode; advance it exactly once per emitted token. Account
-for transitions between the model's traces.
+for transitions between the model's traces. On a steady step the plugin's `start_pos`
+argument can lag the device position by one, so any adapter state derived from position
+(page-table redirects, position-dependent tables) comes from device-owned or
+generator-mirrored positions; treat the argument as advisory. The plugin overlaps decode
+only when vLLM runs with `--async-scheduling`; the packaged runner does not pass it, so
+add it through `--additional-server-args` and record it, or the declared async split is
+never exercised. Prove the overlapped path with a served greedy-determinism check: the
+same prompt repeated under concurrent load returns identical tokens on every run.
 
 `reset_batch=False` does **not** prove the page table is unchanged. Inspect the pinned
 standalone plugin's state updates and decode-reload contract; behavior depends on that
@@ -210,13 +219,15 @@ python -m readiness_check.run_vllm_server \
   --model-dir ... --hf-model ...
 ```
 
+The `sampling` stage, like `serve`, rejects a plugin source layout the runner does not accept (a bundled or nested plugin checkout), even against an external server. On such a layout, run the plugin's sampling suite by hand with the runner's exact pytest command, record that command in the work log, and place the result file where the gate expects it; attach the other stages with `--server-url` and `--server-log`.
+
 The runner enforces on-device sampling (`sample_on_device_mode: all` in the TT plugin config). The full-model stage must already provide traced token-out split sampling. If it does not, return to `$full-model`; this stage should only adapt that contract to vLLM.
 
 If shared tests require host-side sampling, expose it as an explicit compatibility mode and label metrics from that mode separately. The optimized serving path still uses on-device traced sampling and `sample_on_device_mode=all`.
 
 The served default recipe must stay on the device sampler. vLLM applies the checkpoint's `generation_config.json` sampling defaults to every request that does not override them; compare those defaults (`top_k`, `top_p`, `temperature`) against the declared `max_device_top_k` and the device sampler's real candidate width. The shared `ttnn.sampling` path draws from one 32-candidate tile per user whatever `k` says, so a declared ceiling above 32 can emit token ids outside the candidates. If the default recipe would route to the host sampler, either raise the device ceiling with a probe that proves the wider draw or serve with `--override-generation-config` and record that as an operator decision in the work log. During the sampling and burst stages, scan sampled token ids for out-of-vocabulary values and count host-sampled steps. Neither the plugin nor the packaged runner logs those counts, and vLLM kills the engine on shutdown before adapter teardown prints, so log a per-step sampling-mode line from the adapter during the run and summarize the server log afterwards; a measured path that silently fell back to host sampling is not the optimized path.
 
-Runner notes: `--additional-server-args` is split with `shlex`, so a JSON value inside it needs its own quoting; the packaged runner writes to `readiness_vllm/` directly and the gates read only that root.
+Runner notes: `--additional-server-args` is split with `shlex`, so a JSON value inside it needs its own quoting; the packaged runner writes to `readiness_vllm/` by default and the gates read only that root; `--output-dir` sends an attached or tracked run elsewhere so it does not overwrite the gate's artifacts.
 
 ## No Tracy Or Perf-Report In vLLM Stages
 
@@ -245,9 +256,9 @@ For final vLLM-integration evidence, use `--sampling-profile full`. The normal d
 
 When determinism tests fail in vLLM, validate that logits output by the model for a given prompt are reproducible across runs and batch positions. Check both standalone model and running through vllm.
 
-Classify reproducibility-only sampling failures separately when they are the only failures. Typical names include `test_top1_is_greedy`, `test_topk`, `test_uniform_seed_deterministic`, `test_specific_seed_reproducible`, `test_same_seeds_reproduce_across_batches`, `test_*_mixed_batch`, and `test_mixed_params_batch`. They do not require more serving-correctness work only when correctness, logprobs, crash-free serving, and qualitative output all pass. Correctness failures, missing logprobs, crashes, gibberish output, or wrong logprob values remain required work.
+Classify reproducibility-only sampling failures separately when they are the only failures. Typical names include `test_top1_is_greedy`, `test_topk`, `test_uniform_seed_deterministic`, `test_specific_seed_reproducible`, `test_same_seeds_reproduce_across_batches`, `test_*_mixed_batch`, and `test_mixed_params_batch`. They do not require more serving-correctness work only when correctness, logprobs, crash-free serving, and qualitative output all pass. Correctness failures, missing logprobs, crashes, gibberish output, or wrong logprob values remain required work. A seeded request must not change sampler mid-request; the plugin routes per step, so a host-only parameter joining the batch (a `top_k` above `max_device_top_k`) moves every later step of that batch to the host and offsets the seeded streams. Record such failures as routing defects with the admission pattern as evidence, not as model defects.
 
-When a plugin test fails because the device sampler lacks a request feature, such as logprobs, penalties, or a top-k range, fix the generator sampling path that `$full-model` owns. A documented `model_capabilities` declaration that routes such requests to host sampling is acceptable only when it states a real support boundary of this model and `doc/full_model/serving_contract.json` records that boundary. Do not add a routing capability or weaken a plugin test to make the suite pass.
+When a plugin test fails because the device sampler lacks a request feature, such as logprobs, penalties, or a top-k range, fix the generator sampling path that `$full-model` owns. A documented `model_capabilities` declaration that routes such requests to host sampling is acceptable only when it states a real support boundary of this model and `doc/full_model/serving_contract.json` records that boundary. Do not add a routing capability or weaken a plugin test to make the suite pass. The common sampler's `precompile` skips the output-count update, so a warmup through its API leaves the penalty scatter path uncompiled and the first penalties-on capture fails; run one counted sampling pass before capture.
 
 If vLLM crashes mid-run, kill leftover `EngineCore` or `vllm.entrypoints` processes before retrying; they can hold chip locks after `tt-smi -r`.
 

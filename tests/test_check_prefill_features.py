@@ -28,8 +28,10 @@ def contract(status='supported', reason=None):
             'vllm': {'version': 'v0.0.0'}, 'documents_read': ['docs/MODEL_INTERFACE.md'], 'rows': [row]}
 
 
-def resume(status='pass', control_failed=True):
-    return {'status': status, 'reasons': [], 'cases': [
+def resume(status='pass', control_failed=True, thresholds=None):
+    if thresholds is None:
+        thresholds = {'pcc_mean_min': 0.99, 'pcc_min_min': 0.98, 'top1_min': 0.98, 'control_min_window': 64}
+    return {'status': status, 'reasons': [], 'thresholds': thresholds, 'cases': [
         {'length': 2560, 'start': 128, 'kind': 'lcm_aligned', 'pass': status == 'pass',
          'controls': {'no_history': {'top1_agreement': 0.1 if control_failed else 0.99,
                                      'failed_as_expected': control_failed}}}]}
@@ -70,6 +72,22 @@ def test_complete_supported_evidence_passes(tmp_path):
     full_evidence(model)
     result = run(model, '--stage', 'optimized-vllm', '--require-burst')
     assert result.returncode == 0, result.stderr
+
+
+def test_lowered_resume_thresholds_are_advisory_not_silent(tmp_path):
+    model = tmp_path / 'model'
+    lowered = {'pcc_mean_min': 0.99, 'pcc_min_min': 0.90, 'top1_min': 0.93, 'control_min_window': 64}
+    full_evidence(model, resume=resume(thresholds=lowered))
+    result = run(model, '--stage', 'optimized-vllm', '--require-burst')
+    assert result.returncode == 1, result.stderr
+    assert 'below the defaults' in result.stderr
+    assert "'pcc_min_min': 0.9" in result.stderr and "'top1_min': 0.93" in result.stderr
+    record = resume()
+    del record['thresholds']
+    full_evidence(model, resume=record)
+    result = run(model, '--stage', 'optimized-vllm', '--require-burst')
+    assert result.returncode == 1, result.stderr
+    assert 'records no thresholds' in result.stderr
 
 
 @pytest.mark.parametrize('overrides, message', [

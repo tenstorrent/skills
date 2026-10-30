@@ -214,3 +214,47 @@ def test_controls_are_skipped_for_narrow_windows():
     )
     assert case["pass"]
     assert case["controls"] == {}
+
+
+def test_provenance_reports_commit_and_visible_devices(tmp_path, monkeypatch):
+    import subprocess
+
+    from readiness_check import run_prefill_resume_check as module
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    for args in (("init", "-q"), ("commit", "-q", "--allow-empty", "-m", "base")):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, env={**__import__("os").environ, **env})
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    monkeypatch.setenv("TT_VISIBLE_DEVICES", "2")
+    assert module.provenance(repo) == {"commit": head, "visible_devices": "2"}
+    monkeypatch.delenv("TT_VISIBLE_DEVICES")
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert module.provenance(plain) == {"commit": None, "visible_devices": None}
+
+
+@pytest.mark.parametrize("pass_only", [True, False])
+def test_output_on_pass_only_keeps_the_canonical_artifact(tmp_path, monkeypatch, pass_only):
+    import json
+
+    from readiness_check import run_prefill_resume_check as module
+
+    output = tmp_path / "readiness" / "prefill_resume_check.json"
+    output.parent.mkdir()
+    output.write_text('{"status": "pass"}\n')
+    monkeypatch.setattr(module, "open_readiness_mesh_device", lambda *a, **k: object())
+    monkeypatch.setattr(module, "close_readiness_mesh_device", lambda *a, **k: None)
+    monkeypatch.setattr(module, "run_prefill_resume_check", lambda **k: {"status": "fail", "cases": [], "reasons": ["x"]})
+    argv = ["--model-dir", str(tmp_path), "--mesh-device", "N150", "--output", str(output)]
+    if pass_only:
+        argv.append("--output-on-pass-only")
+    assert module._main(argv) == 1
+    failed = module.failed_output_path(output)
+    if pass_only:
+        assert json.loads(output.read_text()) == {"status": "pass"}
+        assert json.loads(failed.read_text())["status"] == "fail"
+    else:
+        assert json.loads(output.read_text())["status"] == "fail"
+        assert not failed.exists()

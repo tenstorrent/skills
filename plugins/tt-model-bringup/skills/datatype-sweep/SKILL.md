@@ -55,7 +55,9 @@ Start from the completed optimized full model. Run and record the current baseli
 - readiness reference provenance, preferably AIME24 with chat template and `--gen-len 100`;
 - `run_prefill_check` and `run_teacher_forcing` top-1/top-5/top-100;
 - prefill TTFT and trace-verified teacher-forcing decode t/s/u from the readiness runner, generator metrics, or the model's benchmark harness;
-- the active dtype policy for weights, norms, residual stream, CCL activations, KV cache, logits, sampling, and MoE routing.
+- the active dtype policy for weights, norms, residual stream, CCL activations, KV cache, logits, sampling, and MoE routing;
+- a teacher-forced natural-text reference beside the readiness reference: real next tokens from long non-repeating text (the readiness book `models/tt_transformers/tests/tale-of-two-cities.txt.bz2`, several hundred positions), scored per position against HF. The readiness reference is an HF-greedy continuation with large margins; a BFP4 MLP policy scored 0.92 to 0.97 top-1 there and 0.82 to 0.85 on 1468 natural-text positions, and the readiness reference alone would have selected it;
+- the baseline measured at least twice, serially, so the run-to-run spread is known before any candidate is ranked.
 
 If an existing reference has fewer than 100 generated tokens, regenerate the main readiness reference with 100 generated tokens unless a concrete model or memory limit prevents it.
 
@@ -66,7 +68,7 @@ Teacher-forcing decode performance is valid only when the measured path uses tra
 Use this coarse search first. It usually finds most of the available win with a small number of full-model runs.
 
 1. Evaluate the closest canonical performance and accuracy policies, if any.
-2. Try BFP8 KV cache as a yes/no switch.
+2. Try BFP8 KV cache as a yes/no switch. Any candidate that changes the KV-cache dtype must also pass the short-prefix case (about 32 cached tokens) and the batch-32 same-input per-user comparison at the full-model bar; a long-prompt layer PCC pass does not cover them (a BFP8 cache passed 1024-token layer PCC and failed 0.995 per user on a short prefix).
 3. Try BFP8 CCL or residual-transfer activations as a yes/no switch.
 4. Try BFP4 for eligible MLP/expert matmul groups, excluding the first and last layer by default unless the canonical policy says otherwise.
 5. If full-model accuracy fails, restore the highest-risk groups first until top-1 and top-5 pass.
@@ -113,12 +115,15 @@ Every kept candidate must be validated with full-model accuracy. For each evalua
 - TTFT, trace-verified decode t/s/u, and the evidence that the teacher-forcing decode path was traced;
 - compute fidelities used by each material matmul group and evidence that the measured runtime used them;
 - direct comparisons for material same-dtype fidelity choices, especially BFP8+LoFi versus BFP8+HiFi2 on decode-bound projection groups;
-- whether this config passed the user-specified accuracy bar;
+- whether this config passed the user-specified accuracy bar on every reference it ran on; the bar applies per reference, and a candidate that ran on fewer references than the baseline is not comparable until it has;
+- the binomial margin of each top-1 score: a 100-token reference at 0.95 carries about plus or minus 0.03, so a one-token difference between candidates is noise, not a ranking; use the natural-text reference or more tokens to separate close candidates;
 - exact command, branch/commit, hardware, mesh, and environment notes.
 
 Use `$qualitative-check` for prompt-based evaluation evidence: prompt-format metadata, rendered prompt artifacts or token ids, HF controls, and classification of raw-completion or chat-template behavior.
 
 Always use trace-verified teacher-forcing decode t/s/u to rank datatype candidates - a non-traced path is not useful. If fully-traced decode is not working, use the $autofix skill until it is.
+
+A precision change can fail the resumed-prefill gate of `prefill-features.md` without a resume bug: the resumed and fresh TT paths agree with each other while both drift from HF at hard positions. Rerun `run_prefill_resume_check` on the selected policy, and classify any failure with a per-position comparison against HF (the margin probe) before treating it as a cache or position defect.
 
 Teacher-forcing is the selection metric, not necessarily the serving headline. After selecting the winning config, run the same warmed token-out no-readback benchmark used by optimized full model, using the selected config through the normal construction path. Record this separately as post-selection token-out performance. If the model cannot run that benchmark, state why instead of presenting teacher-forcing performance as token-out performance.
 
@@ -145,20 +150,22 @@ Before selecting a config:
 
 - prove the model code can construct the requested fidelity policy without hard-coded overrides;
 - include at least one BFP4+LoFi candidate for every selected or seriously considered BFP4 matmul group;
-- compare BFP4+LoFi against BFP4+HiFi2 when both are legal and the group is a meaningful decode cost;
+- compare BFP4+LoFi against BFP4+HiFi2 when both are legal and the group is a meaningful decode cost; the comparison is required for every selected BFP4 group and optional for rejected ones, and the sweep table says which groups ran it;
+- record where a per-group fidelity field is not honored by the measured kernel (prefill matmuls whose fidelity is fixed by the weight dtype, for example) so the table does not claim a fidelity the op never used;
 - record a short table for each material matmul group: weight dtype, compute fidelity, traced decode speed, accuracy result, kept/rejected decision, and reason.
 
-If the runtime does not currently expose fidelity as a policy field, add that plumbing before ranking candidates. Do not satisfy this requirement by writing `compute_fidelities` into JSON that the measured model ignores.
+Pass a candidate's precision config to the readiness runners through `--build-kwargs` or `--build-kwargs-file` (a JSON object forwarded to `build_generator`), not through environment variables or an edited default file. If the runtime does not currently expose fidelity as a policy field, add that plumbing before ranking candidates. Do not satisfy this requirement by writing `compute_fidelities` into JSON that the measured model ignores.
 
 ## Final Selection
 
-Select the fastest config that satisfies the acceptance bar. If two configs are within measurement noise, prefer the simpler and safer one.
+Select the fastest config that satisfies the acceptance bar on every reference. Measurement noise is the spread between the repeated serial baseline runs recorded in the baseline section; a candidate counts as a gain only when it beats the baseline by more than that spread, and two configs inside it are a tie, where the simpler and safer one wins.
 
 Before finishing:
 
 - make the selected config the model's default construction path, or write a required config artifact that `build_generator`, full-model, and vLLM paths actually consume by default;
 - keep a simple config change or override to return to the safe baseline setting;
 - run a post-selection token-out no-readback performance check with the selected config and record the workload shape, trace status, TTFT, decode t/s/u, and runtime counters;
+- rerun the resumed-prefill check on the selected config at the default thresholds and keep its record beside the sweep evidence;
 - use `$qualitative-check` to rerun the shared qualitative prompt suite on the selected config, with HF controls. If visible text quality selects or rejects a dtype/fidelity candidate, the verdict must come from this prompt-correct suite;
 - add a short propagation check proving `build_generator` and the vLLM adapter load the same selected weight/activation/CCL/KV/fidelity policy used by the winning sweep result.
 - update the context contract for the selected KV-cache dtype and prove later construction paths use a matching max context.

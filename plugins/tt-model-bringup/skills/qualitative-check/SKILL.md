@@ -36,7 +36,8 @@ Raw completion output from a chat/instruct model is allowed only as labeled cont
 Every quality verdict needs a control rendered with the same prompt format:
 
 - Prefer HF reference generation from the same model id/revision and tokenizer.
-- For serving regressions, also compare against the most recent full-model or previous-stage TT output on the same prompt suite.
+- HF control outputs from an earlier stage may be reused when the model id/revision, tokenizer, chat template, prompt suite and generation settings are unchanged; record the reuse and the source path in the verdict.
+- For serving regressions, also compare against the most recent full-model or previous-stage TT output on the same prompt suite. The vLLM stage needs a same-code, same-chip generator control at the served token count; an earlier-stage control of a different length covers only the shared prefix.
 - If HF fails the same prompt in the same way, record that as a model/control behavior, not a TT serving bug.
 - If TT output is materially worse than the HF or previous-stage control, treat it as stage work: token feedback, cache/position handling, sampling, trace replay, dtype/fidelity, or adapter state are common causes.
 

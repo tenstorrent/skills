@@ -223,3 +223,14 @@ def test_run_summary_merges_hold_open_and_attached_runs(tmp_path):
 
 def test_module_constants_name_the_counters_the_check_reads():
     assert run_vllm_server.PREFIX_CACHE_COUNTERS == ("vllm:prefix_cache_queries", "vllm:prefix_cache_hits")
+
+
+def test_output_dir_defaults_to_the_gate_root_and_can_be_redirected(tmp_path):
+    parser = run_vllm_server._build_parser()
+    args = parser.parse_args(["--model-dir", str(tmp_path / "model"), "--hf-model", "org/model"])
+    assert args.output_dir is None
+    assert run_vllm_server.resolve_output_dir(args.model_dir, args.output_dir) == (tmp_path / "model/readiness_vllm").resolve()
+    redirected = parser.parse_args(
+        ["--model-dir", str(tmp_path / "model"), "--hf-model", "org/model", "--output-dir", str(tmp_path / "tracked")]
+    )
+    assert run_vllm_server.resolve_output_dir(redirected.model_dir, redirected.output_dir) == (tmp_path / "tracked").resolve()
