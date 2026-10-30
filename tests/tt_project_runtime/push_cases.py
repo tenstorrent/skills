@@ -10140,7 +10140,8 @@ def test_a_push_batch_takes_at_most_one_change_touching_the_prompt_files(env, mo
     approval touching delivery.push_solo_paths (default the plugin's prompt templates); the others
     stay approved for a later batch, and the rest of the batch fills up as before."""
     from ttp import pushq
-    s = _pq(env, monkeypatch, push_batch_max=3)
+    release = env["tmp"] / "release"
+    s = _pq(env, monkeypatch, plan={"release": str(release)}, push_batch_max=3)
     _git_out(s.repo, "fetch", "-q", "origin")
     prompt = "plugins/tt-project/template/prompts/worker.md"
     a = _pq_change(s, "a", [prompt])
@@ -10150,9 +10151,15 @@ def test_a_push_batch_takes_at_most_one_change_touching_the_prompt_files(env, mo
     rows, why = pushq.due(s.p, time.time() + 10 ** 6)
     assert [r["id"] for r in rows] == [a, b, d], why
     assert "1 more approval touching delivery.push_solo_paths waits for a later batch" in why
-    assert pushq.start(s.p, rows, "origin/proj")
+    assert (bid := pushq.start(s.p, rows, "origin/proj"))
     assert s.p.db.one("SELECT status FROM push_queue WHERE id=?", (c,))["status"] == "approved"
     # Another prompt file, the same rule; a text file of the prompt folder that is no .md is not one.
+    # The batch process holds its run lock until it exits, and no batch starts while it does: the
+    # stub waits for `release`, so the next part never races a batch still running.
+    s.p.db.x("DELETE FROM push_batches")
+    assert pushq.due(s.p, time.time() + 10 ** 6) == ([], "another push holds its turn")
+    release.touch()
+    pushq._children[bid].wait(timeout=60)
     s.p.db.x("DELETE FROM push_queue")
     s.p.db.x("DELETE FROM push_batches")
     e = _pq_change(s, "e", ["plugins/tt-project/template/prompts/notes.txt"])
