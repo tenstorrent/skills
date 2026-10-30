@@ -2,8 +2,8 @@
 # test_tt_project_runtime.py in its namespace (see _include_cases there).
 
 _RULES = ("# demo\n\n## Restrictions (binding on every task)\n"
-          "- Never reboot the shared build farm while its nightly queue runs.\n"
-          "- Never push to the release branch.\n\n## Goals\nShip v1.\n")
+          "- Never reboot the shared build farm while its nightly queue runs. (user msg #1)\n"
+          "- Never push to the release branch. (user msg #1)\n\n## Goals\nShip v1.\n")
 _FARM = "Never reboot the shared build farm while its nightly queue runs."
 
 
