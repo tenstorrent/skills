@@ -94,11 +94,21 @@ Link to the tt-buddy plugin's recipes and skills; do not copy them here.
   on the box (`tmux -L ttp-login`), started over ssh, so outside any agent sandbox. It waits there
   up to 60 min (`--wait`). Before it hands out the link it checks with `ss` that the sign-in's callback port
   listens on the box; if not, it stops the sign-in and says so, and never hands out a dead link.
-  A pending sign-in whose port stopped listening is replaced on the next `login`. The user
-  completes it either way: (a) runs the printed `ssh -N -L <port>:<listen address>:<port> <their
-  alias for the box>` before opening the link, and the page completes by itself; or (b) opens the
-  link, copies the `localhost` address the browser ends on, and the agent passes it on with
-  `--code-stdin` (on stdin, never on a command line, never stored). `--status` says signed in,
+  A pending sign-in whose port stopped listening is replaced on the next `login`.
+- Fixed callback port: every sign-in `login --mcp` starts asks for one localhost callback port,
+  28461 by default (`--callback-port <port>` overrides it): Claude Code through
+  `MCP_OAUTH_CALLBACK_PORT`, Codex through `-c mcp_oauth_callback_port=<port>`. A server added with
+  its own `claude mcp add --callback-port` keeps that port. When something already listens on the
+  port on the box, `login` starts nothing and says what holds it (a CLI fails on a taken port).
+  A CLI that ignores the setting picks a random port; `login` then says so and the forward it
+  prints is for that sign-in only.
+- The user completes it either way: (a) one standing forward for the fixed port from the machine
+  their browser runs on, `ssh -N -L 28461:127.0.0.1:28461 <their alias for the box>`, left open;
+  with it open the page completes by itself, for this and every later sign-in on that box. Where
+  the agent runs on the machine the browser runs on, it starts that forward itself in the
+  background; otherwise it tells the user that one step once, not on every sign-in; or (b) the
+  user opens the link, copies the `localhost` address the browser ends on, and the agent passes it
+  on with `--code-stdin` (on stdin, never on a command line, never stored). `--status` says signed in,
   pending, or that the link is dead. A Claude Code too old for `mcp login` gets one step instead:
   update it, or the user runs `claude` on the box, types `/mcp`, picks `glean` and chooses
   Authenticate. Editors sign in from their own MCP view.

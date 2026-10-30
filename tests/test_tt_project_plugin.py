@@ -2782,9 +2782,11 @@ def _glean_fakes(home):
         " [ -f $HOME/no-mcp-login ] || echo '  login [options] <name>  Authenticate'; exit 0; }\n"
         "[ \"$1 $3\" = 'mcp --help' ] && exit 0\n"
         "[ \"$1 $2\" = 'mcp login' ] && [ -f $HOME/no-mcp-login ] && exit 1\n"
-        "if [ \"$1 $2\" = 'mcp login' ]; then echo 'Visit this URL to authorize:';"
-        " echo '  https://g.invalid/oauth/authorize?client_id=c&redirect_uri=http%3A%2F%2Flocalhost%3A41234%2Fcallback&s=1';"
-        " echo 'Or paste the redirect URL here:'; read -r u; case $u in http://localhost:41234/callback?code=*)"
+        # The sign-in takes MCP_OAUTH_CALLBACK_PORT (an old CLI, $HOME/old-cli, ignores it) and records its port and pid.
+        "if [ \"$1 $2\" = 'mcp login' ]; then P=41234; [ -f $HOME/old-cli ] || P=${MCP_OAUTH_CALLBACK_PORT:-41234};"
+        " echo $P > $HOME/cb.port; echo $$ > $HOME/cb.pid; echo 'Visit this URL to authorize:';"
+        " echo \"  https://g.invalid/oauth/authorize?client_id=c&redirect_uri=http%3A%2F%2Flocalhost%3A$P%2Fcallback&s=1\";"
+        " echo 'Or paste the redirect URL here:'; read -r u; case $u in http://localhost:$P/callback?code=*)"
         " echo \"$u\" > $HOME/pasted; echo '\u2713 Connected' > $HOME/claude-glean-status ;; esac; exit 0; fi\n"
         "[ \"$1\" = -p ] && { echo \"$*\" > $HOME/claude-p.args; echo 'Searching.'; echo 'GLEAN_RESULTS=7'; exit 0; }\n"
         "[ \"$1\" = mcp ] && case \"$*\" in *glean*|'mcp list'*) ;; *) exit 0 ;; esac\ncase \"$1 $2\" in\n"
@@ -3036,9 +3038,12 @@ def test_setup_box_agents_glean_sign_in_runs_in_tmux_and_hands_out_a_link_only_w
     _fast_sleep(env)
     _glean_fakes(home)
     (home / "claude-mcp").write_text("https://g.invalid/mcp\n")
-    # A fake ss: the sign-in's callback listens once $HOME/listen exists.
-    (tmp_path / "shim/ss").write_text("#!/bin/sh\n[ -f \"$HOME/listen\" ] && echo 'LISTEN 0 4096 127.0.0.1:41234 0.0.0.0:*'\n"
-                                     "exit 0\n")
+    # A fake ss: a running sign-in's callback listens on its port once $HOME/listen exists; another program
+    # holds the port in $HOME/busy.
+    (tmp_path / "shim/ss").write_text(
+        "#!/bin/sh\n[ -f \"$HOME/busy\" ] && echo \"LISTEN 0 4096 127.0.0.1:$(cat \"$HOME/busy\") 0.0.0.0:*\"\n"
+        "[ -f \"$HOME/listen\" ] && kill -0 \"$(cat \"$HOME/cb.pid\" 2>/dev/null)\" 2>/dev/null"
+        " && echo \"LISTEN 0 4096 127.0.0.1:$(cat \"$HOME/cb.port\") 0.0.0.0:*\"\nexit 0\n")
     (tmp_path / "shim/ss").chmod(0o755)
     env["TMUX_TMPDIR"] = tempfile.mkdtemp(prefix="ttpt", dir="/tmp")
     tmux = shutil.which("tmux")
@@ -3052,7 +3057,8 @@ def test_setup_box_agents_glean_sign_in_runs_in_tmux_and_hands_out_a_link_only_w
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc = ba.cmd_login(argparse.Namespace(alias="<box-alias>", cli="claude", mcp="glean",
-                                                 **{"status": False, "code_stdin": False, **kw}))
+                                                 **{"status": False, "code_stdin": False, "callback_port": 41234,
+                                                    **kw}))
         return rc, buf.getvalue()
 
     monkeypatch.setattr(ba, "_ssh", lambda alias, script, timeout, input=None: run(script, input))
@@ -3070,17 +3076,21 @@ def test_setup_box_agents_glean_sign_in_runs_in_tmux_and_hands_out_a_link_only_w
         assert rc == 0 and "redirect_uri=http%3A%2F%2Flocalhost%3A41234" in out, out
         assert "ssh -N -L 41234:127.0.0.1:41234 <their ssh alias for <box-alias>>" in out and "--code-stdin" in out
         assert alive() and "60 min" in out
+        # The sign-in asked for the fixed port: one standing forward, told once, covers every later sign-in.
+        assert (home / "cb.port").read_text().strip() == "41234"
+        assert "fixed sign-in port 41234: one standing forward covers this and every later sign-in" in out
+        assert "tell them once" in out and "leave it open" in out
         rc, out = login(status=True)
         assert rc == 1 and out.strip() == "claude glean on <box-alias>: pending"
         # A second start reuses the waiting sign-in; once its callback dies the link is called dead and replaced.
-        assert ba._state(run(ba.login_script("claude", "glean")).stdout) == "pending"
+        assert ba._state(run(ba.login_script("claude", "glean", port=41234)).stdout) == "pending"
         (home / "listen").unlink()
         rc, out = login(status=True)
         assert rc == 1 and "the link is dead" in out
-        again = run(ba.login_script("claude", "glean")).stdout
+        again = run(ba.login_script("claude", "glean", port=41234)).stdout
         assert "replaced=41234" in again and ba._state(again) == "no-listener" and not alive()
         (home / "listen").write_text("")
-        assert ba._state(run(ba.login_script("claude", "glean")).stdout) == "started"
+        assert ba._state(run(ba.login_script("claude", "glean", port=41234)).stdout) == "started"
         # The browser's localhost address goes in over stdin, never on a command line, and completes it.
         back = "http://localhost:41234/callback?code=abc&state=s"
         assert back not in ba.code_script("claude", "glean")
@@ -3095,9 +3105,41 @@ def test_setup_box_agents_glean_sign_in_runs_in_tmux_and_hands_out_a_link_only_w
         assert (home / "pasted").read_text().strip() == back
         rc, out = login(status=True)
         assert rc == 0 and out.strip() == "claude glean on <box-alias>: logged-in"
+        # Every new sign-in asks for the one fixed port: Claude Code by its env var, Codex by its setting.
+        assert f"export MCP_OAUTH_CALLBACK_PORT={ba.CALLBACK_PORT}; exec" in ba.login_script("claude", "glean")
+        assert f"--no-browser -c mcp_oauth_callback_port={ba.CALLBACK_PORT}" in ba.login_script("codex", "glean")
+        # Something already holds the fixed port: nothing starts and no link goes out (the CLI would fail on it).
+        (home / "claude-glean-status").unlink()
+        (home / "busy").write_text("41234")
+        rc, out = login()
+        assert rc == 1 and "port 41234 is already in use on the box (127.0.0.1:41234)" in out, out
+        assert "https://" not in out and "--callback-port <port>" in out and not alive()
+        (home / "busy").unlink()
+        # A CLI that ignores the fixed port: the link's own port is forwarded, for this sign-in only.
+        (home / "old-cli").write_text("")
+        rc, out = login(callback_port=41299)
+        assert rc == 0 and "did not take the fixed port 41299" in out, out
+        assert "ssh -N -L 41234:127.0.0.1:41234" in out and "tell them once" not in out
+        # A port outside 1024..65535 is refused before ssh.
+        rc, out = login(callback_port=80)
+        assert rc == 2 and "1024 to 65535" in out
     finally:
         subprocess.run([tmux, "-L", "ttp-login", "kill-server"], env=env, capture_output=True)
         shutil.rmtree(env["TMUX_TMPDIR"], ignore_errors=True)
+
+
+def test_setup_box_connector_sign_ins_document_one_fixed_callback_port_and_one_standing_forward(monkeypatch):
+    ba = _agents(monkeypatch)
+    port = ba.CALLBACK_PORT
+    assert 1024 <= port < 32768   # below the Linux and macOS ephemeral ranges
+    agents = " ".join((SKILLS / "setup-box" / "agents.md").read_text(encoding="utf-8").split())
+    for want in (f"{port} by default (`--callback-port <port>` overrides it)", "`MCP_OAUTH_CALLBACK_PORT`",
+                 "`-c mcp_oauth_callback_port=<port>`", f"`ssh -N -L {port}:127.0.0.1:{port} <their alias for the box>`",
+                 "starts that forward itself", "tells the user that one step once"):
+        assert want in agents, want
+    connectors = " ".join((SKILLS / "setup-box" / "connectors.md").read_text(encoding="utf-8").split())
+    assert "no callback port on the machine and no ssh forward" in connectors
+    assert f"`-c mcp_oauth_callback_port={port}`" in connectors
 
 
 def test_setup_box_agents_editor_defaults_merge_keeps_entries_and_comments(tmp_path, monkeypatch):

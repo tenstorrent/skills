@@ -39,6 +39,10 @@ box.py connectors check ... --family Notes=Notion,Confluence   # add a family or
   account: claude.ai Settings > Connectors > Connect `<name>` (missing: add it there first; an
   organization admin may have to allow it). Tell the user that one step, then rerun the check.
 - A machine on another account lists that account's connectors: its steps say so.
+- This step runs in the user's browser on claude.ai: no callback port on the machine and no ssh
+  forward. A sign-in that does run on a box (an MCP server added there, such as Glean or Codex's
+  Atlassian server) listens on the box's one fixed callback port, so one standing forward covers
+  them all (`agents.md`, MCP endpoints).
 
 ## 4. Verify
 
@@ -72,7 +76,8 @@ is missing or failed (`--no-connectors` skips them). The setup plan (`new-box.md
 - Codex has no claude.ai connectors. Atlassian has a remote MCP server (Rovo MCP); take its current URL
   from Atlassian's own getting-started page, then, only on the user's yes, on that machine:
   `codex mcp add atlassian --url <url>` and `codex mcp login atlassian` (a browser sign-in; for a box, run
-  the sign-in as for Glean in `agents.md`). Check with `codex mcp list`.
+  the sign-in as for Glean in `agents.md`, with `-c mcp_oauth_callback_port=28461` so the standing
+  forward for that port completes it). Check with `codex mcp list`.
 - Google: offer none unless Google documents an MCP server for that service; do not invent one.
 
 ## Related

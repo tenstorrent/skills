@@ -22,7 +22,9 @@
   config of each editor server on the box (Cursor `~/.cursor/mcp.json`, VS Code's remote user `mcp.json`).
   `login <alias> <cli> --mcp glean` runs the CLI's OAuth sign-in on the box in a tmux session of its own
   server (`tmux -L ttp-login`), started over ssh in the user's session, never in a sandbox; it hands out
-  the link only once the sign-in's localhost callback port listens on the box. `check` reports Glean per
+  the link only once the sign-in's localhost callback port listens on the box. Every such sign-in uses one
+  fixed callback port (CALLBACK_PORT, `--callback-port` overrides it), so one standing `ssh -L` forward from
+  the user's machine completes them all. `check` reports Glean per
   agent as missing, configured but signed out, or working; `check --search` proves working with a real
   one-shot Glean search per CLI. Agents load MCP servers when a session starts: one open before the
   server was added (an editor's agent panel too) needs a reload to see it.
@@ -65,6 +67,13 @@ MCP = "glean"
 LOGIN_TMUX = "tmux -L ttp-login"
 SIGNIN_WAIT = 3600  # seconds a pending MCP sign-in waits for the user's browser (default; `login --wait`)
 LOGIN_WAIT = 900  # seconds a CLI's own pending login waits (default; `login --wait`)
+# The one localhost port every MCP sign-in on a box listens on for its OAuth callback (`login --callback-port`
+# overrides it): below the Linux and macOS ephemeral ranges, so random outgoing ports rarely take it. Claude Code
+# reads MCP_OAUTH_CALLBACK_PORT (a server added with its own `--callback-port` keeps that one), Codex
+# `mcp_oauth_callback_port`; a CLI that ignores both picks a random port, and the link's own port is used.
+CALLBACK_PORT = 28461
+CALLBACK_SET = {"claude": "export MCP_OAUTH_CALLBACK_PORT={port}; exec $TL \\\"$b\\\" mcp login {mcp} --no-browser",
+                "codex": "exec $TL \\\"$b\\\" mcp login {mcp} --no-browser -c mcp_oauth_callback_port={port}"}
 # Each editor server's own MCP config on the box: (its server dir, config file, servers key, entry fields).
 EDITOR_MCP = {"cursor": (".cursor-server", ".cursor/mcp.json", "mcpServers", {}),
               "vscode": (".vscode-server", ".vscode-server/data/User/mcp.json", "servers", {"type": "http"})}
@@ -427,9 +436,11 @@ _LISTEN = ('l=; if [ -n "$p" ] && [ -n "$SS" ]; then l=$($SS -Hltn 2>/dev/null |
 _DEAD = '[ -n "$p" ] && [ -n "$SS" ] && [ -z "$l" ]'
 
 
-def mcp_login_script(cli: str, mcp: str, wait: int = SIGNIN_WAIT) -> str:
+def mcp_login_script(cli: str, mcp: str, wait: int = SIGNIN_WAIT, port: int = CALLBACK_PORT) -> str:
     """Start the CLI's sign-in to an MCP server on the box in a tmux session, unless it is signed in or one
     is pending whose callback still listens; print its link only once the callback port listens there.
+    A new one asks for the fixed callback `port`; when something already listens there it starts nothing
+    (`state=port-busy`, `busy=` the address), since the CLI would fail on the taken port.
 
     The session lives in a tmux server of its own, started by this ssh command in the user's session on the
     box: never inside a sandbox, whose own network namespace a browser's localhost callback cannot reach. A
@@ -445,8 +456,9 @@ def mcp_login_script(cli: str, mcp: str, wait: int = SIGNIN_WAIT) -> str:
             + 'if $X has-session -t "=$S" 2>/dev/null; then ' + _CAPTURE + _CALLBACK + _LISTEN
             + f'if {_DEAD}; then $X kill-session -t "=$S" 2>/dev/null; echo "replaced=$p"; fi; fi; '
             'if $X has-session -t "=$S" 2>/dev/null; then st=pending; else '
+            f'p={int(port)}; ' + _LISTEN + 'if [ -n "$l" ]; then echo "busy=$l"; echo state=port-busy; exit 0; fi; '
             f'TL=; command -v timeout >/dev/null 2>&1 && TL="timeout {int(wait)}"; '
-            f'$X new-session -d -s "$S" -x 400 -y 50 -c "$HOME" "exec $TL \\"$b\\" mcp login {mcp} --no-browser" '
+            f'$X new-session -d -s "$S" -x 400 -y 50 -c "$HOME" "{CALLBACK_SET[cli].format(port=int(port), mcp=mcp)}" '
             '</dev/null >/dev/null 2>&1 || { echo state=failed; exit 0; }; st=started; '
             f'[ -n "$TL" ] && $X set-option -t "=$S" @ttp_until "$(( $(date +%s) + {int(wait)} ))" 2>/dev/null; fi; '
             'i=0; while :; do ' + _CAPTURE + 'case "$o" in *https://*) break ;; esac; '
@@ -460,7 +472,8 @@ def mcp_login_script(cli: str, mcp: str, wait: int = SIGNIN_WAIT) -> str:
             'printf "%s\\n" "$o" | sed -n "1,40p" | sed "s/^/out=/"; true')
 
 
-def login_script(cli: str, mcp: Optional[str] = None, wait: Optional[int] = None) -> str:
+def login_script(cli: str, mcp: Optional[str] = None, wait: Optional[int] = None,
+                 port: int = CALLBACK_PORT) -> str:
     """Start the CLI's headless login on the box, detached, unless it is logged in or one is pending.
 
     Its stdin is a fifo held open, so a code the sign-in page shows can be passed back (`--code-stdin`);
@@ -469,7 +482,7 @@ def login_script(cli: str, mcp: Optional[str] = None, wait: Optional[int] = None
     instead (`mcp_login_script`).
     """
     if mcp:
-        return mcp_login_script(cli, mcp, SIGNIN_WAIT if wait is None else wait)
+        return mcp_login_script(cli, mcp, SIGNIN_WAIT if wait is None else wait, port)
     wait = int(LOGIN_WAIT if wait is None else wait)
     c = _login_key(cli, mcp)
     cmd = f'$TL $b {CLIS[cli]["login"]}'
@@ -702,6 +715,15 @@ def callback_forward(listen: str) -> Optional[str]:
     return f"{m.group(2)}:{host}:{m.group(2)}"
 
 
+def link_port(lines: Sequence[str]) -> Optional[int]:
+    """The localhost callback port a sign-in link names (its redirect_uri), or None."""
+    for ln in lines:
+        m = re.search(r"redirect_uri=https?%3A%2F%2F[^&\s]*?%3A(\d+)", ln, re.I)
+        if m:
+            return int(m.group(1))
+    return None
+
+
 def home_zone(env: Optional[dict] = None):
     """The tzinfo times for the user are shown in: the home zone of the project in TTP_PROJECT
     (`home_timezone` in its project.json), else this machine's."""
@@ -753,7 +775,11 @@ def cmd_login(args) -> int:
     if wait is not None and wait < 60:
         print(f"--wait {wait}: give the user at least 60 s to act")
         return 2
-    r = _ssh(args.alias, login_script(cli, mcp, wait), timeout=240)
+    port = getattr(args, "callback_port", None) or CALLBACK_PORT
+    if not 1024 <= port <= 65535:
+        print(f"--callback-port {port}: use a port from 1024 to 65535")
+        return 2
+    r = _ssh(args.alias, login_script(cli, mcp, wait, port), timeout=240)
     bad = _ssh_failed(args.alias, r)
     if bad is not None:
         return bad
@@ -778,6 +804,13 @@ def cmd_login(args) -> int:
         print(f"{what} on {args.alias} needs tmux on the box (the sign-in waits there in a session of its own): "
               "install it with the box's package manager, then rerun")
         return 1
+    if st == "port-busy":
+        print(f"{what} on {args.alias}: its fixed callback port {port} is already in use on the box "
+              f"({kv.get('busy', '?')}), so the sign-in would fail; started nothing. Another sign-in may be waiting "
+              f"there (`{BOX_PY} agents login {args.alias} <cli> --mcp {mcp} --status`): finish it or let it end, then "
+              f"`{again}`; or start this one on another port with `{again} --callback-port <port>` (its forward then "
+              "uses that port)")
+        return 1
     if st == "no-listener":
         print(f"{what} on {args.alias}: its callback port {kv.get('nolisten', '?')} is not listening on the box, so "
               "its link would not work; not handing it out (stopped it). Sign-ins run over ssh in the box's own "
@@ -796,12 +829,22 @@ def cmd_login(args) -> int:
     if ends:
         print(f"  This link works until {ends}.")
     if mcp:
-        fwd = callback_forward(kv.get("listen", ""))
-        print((f"Its callback listens on the box at {kv['listen']}. " if fwd else "")
+        heard = callback_forward(kv.get("listen", ""))
+        used = int(heard.split(":", 1)[0]) if heard else link_port(shown)
+        fwd = heard or (f"{used}:127.0.0.1:{used}" if used else None)
+        fixed = used == port
+        print((f"Its callback listens on the box at {kv['listen']}. " if heard else "")
               + ("Its callback could not be checked (no `ss` on the box). " if kv.get("listen") == "unknown" else "")
+              + (f"It uses this box's fixed sign-in port {port}: one standing forward covers this and every later "
+                 "sign-in on the box. " if fixed else
+                 f"(The CLI did not take the fixed port {port}: an older CLI, or a server added with its own "
+                 "callback port; this forward is for this sign-in only.) " if used else "")
               + "Either way completes it: "
-              + (f"(a) before opening the link, the user forwards that port from the machine their browser runs "
-                 f"on: `ssh -N -L {fwd} <their ssh alias for {args.alias}>`, and the page completes by itself; or (b) "
+              + ((f"(a) if the user has no forward for port {used} to {args.alias} running yet, tell them once to "
+                  f"start it on the machine their browser runs on and leave it open: `ssh -N -L {fwd} <their ssh "
+                  f"alias for {args.alias}>`; with it open, the page completes by itself; or (b) " if fixed else
+                  f"(a) before opening the link, the user forwards that port from the machine their browser runs "
+                  f"on: `ssh -N -L {fwd} <their ssh alias for {args.alias}>`, and the page completes by itself; or (b) ")
                  if fwd else "")
               + "after signing in, the browser ends on a localhost page that may not load: the user copies that "
               f"page's full address and gives it to you; pass it on with `{again} --code-stdin` (on stdin; it only "
@@ -997,6 +1040,9 @@ def register(sub) -> None:
     how = lg.add_mutually_exclusive_group()
     how.add_argument("--status", action="store_true", help="exit 0 logged in, 1 not (or pending)")
     how.add_argument("--code-stdin", action="store_true", help="pass the code from stdin to the pending login")
+    lg.add_argument("--callback-port", type=int, metavar="PORT",
+                    help=f"the localhost port an --mcp sign-in's OAuth callback listens on (default {CALLBACK_PORT}, "
+                         "the same for every sign-in, so one standing ssh forward covers them)")
     lg.add_argument("--wait", type=int, metavar="SECONDS",
                     help=f"how long a new sign-in waits for the user (default {SIGNIN_WAIT} for --mcp, "
                          f"else {LOGIN_WAIT}); a pending one keeps its own")
