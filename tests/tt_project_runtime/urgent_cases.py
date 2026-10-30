@@ -207,6 +207,50 @@ def test_the_tick_sweep_releases_parked_urgent_tasks_once_and_keeps_safety_and_r
     assert len(p.db.q("SELECT id FROM events WHERE fingerprint LIKE 'urgent_gate_released:%'")) == 2, "once"
 
 
+def test_convgate_keeps_user_cited_and_restriction_gates_before_device_words():
+    """A gate citing the user's word or naming a guard, Restriction or charter rule is a safety class,
+    filed under it before any device word; a plain convenience gate and a bare landed wait still drop."""
+    from ttp import convgate
+    p1 = {"priority": 1, "spec": "s\nurgent: soon"}
+    for why, when, cls in (
+            ("the fix is in (user msg #123): no-reset-guard passes", "bin/no-reset-guard", "the user's word"),
+            ("as asked (user, 2026-01-02): not on the device before it lands", None, "the user's word"),
+            ("user's words (verbatim): 'not before the release'", None, "the user's word"),
+            (None, "grep -q ok /tmp/x  # user msgs #5, #6", "the user's word"),
+            ("the Restriction on pushes holds this", None, "charter restriction"),
+            ("a charter rule: no rollout until the box drains", None, "charter restriction"),
+            (None, "bin/no-warm-reset-guard >/dev/null", "charter restriction"),
+            ("needs the device free", "ttp lock --probe dev-x", "shared device or machine")):
+        assert convgate.safety_class(why, when) == cls, (why, when)
+        assert convgate.judge(p1, None, when or "true", why) == (False, cls), (why, when)
+    for why, when in (("later is tidier", "test -e /tmp/ready"), (None, "landed:#7"),
+                      ("the users table is nicer sorted", None), ("message the team after", None)):
+        assert convgate.judge(p1, None, when or "true", why) == (True, None), (why, when)
+
+
+def test_urgent_gates_citing_the_user_or_a_restriction_survive_task_add_and_the_tick_sweep(env):
+    from ttp.daemon import Daemon
+    from ttp.db import deferral
+    p = make(env)
+    _no_events(p)
+    tid, notes = _gate_add(p, "p1 cited", 1, start_when="test -e /tmp/never-y",
+                           why="user msg #123: wait until no-reset-guard passes")
+    assert deferral(p.db.task(tid)) and "start_safety:the user's word" in json.loads(p.db.task(tid)["labels"])
+    assert not any("dropped" in n for n in notes), notes
+    cited = _parked(p, "cited", 1, when="test -e /tmp/never-z", why="per user msg #9, after the guard passes")
+    guard = _parked(p, "guard", 1, when="bin/no-reset-guard")
+    rule = _parked(p, "rule", 1, when="test -e /tmp/never-r", why="a Restriction keeps it off until then")
+    plain = _parked(p, "plain", 1, when="test -e /tmp/never-p", why="after lunch")
+    chained = _parked(p, "chained", 1, when="landed:#1")
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    d.release_urgent_gates(time.time())
+    for t in (cited, guard, rule):
+        assert deferral(p.db.task(t)), t
+    for t in (plain, chained):
+        assert deferral(p.db.task(t)) == {}, t
+
+
 def test_a_ready_urgent_task_held_by_its_kept_gate_with_a_free_slot_raises_one_event(env, monkeypatch):
     from ttp.daemon import Daemon
     p = make(env)

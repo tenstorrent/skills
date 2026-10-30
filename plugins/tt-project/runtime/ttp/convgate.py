@@ -5,10 +5,12 @@
 An urgent task (urgent.is_urgent: priority 1 or better, or an `urgent: <why>` spec line) whose
 dependencies are met starts now. Its start gate (a `start_after` delay, a `start_when` probe, a
 `landed:#<id>` chain) stays only when the gate's `why` (or the probe itself) names a safety class
-(CLASSES): data loss; a spend cap or provider window; a shared device or machine (a lock, hold or
-pause, a lull for a restart, upgrade, reboot or power cycle); a charter Restriction; another
-person's work; the user's own word (a `test -e <dir>/user-<x>` probe); a real dependency on another
-task's new file or symbol. Any other gate is a convenience and is dropped:
+(CLASSES): the user's own word (a cited user message, project.USER_CITE, or a `test -e
+<dir>/user-<x>` probe); a charter Restriction (a guard, Restriction or charter rule); data loss; a
+spend cap or provider window; a shared device or machine (a lock, hold or pause, a lull for a
+restart, upgrade, reboot or power cycle); another person's work; a real dependency on another task's
+new file or symbol. The user's word and a Restriction come first, so a gate citing either is filed
+under it before any device word. Any other gate is a convenience and is dropped:
 
 - task_add and task_update (coordinator._start_args callers, deferral_update) drop it at once, the
   task starts, and the reply note says so (`dropped_note`). A gate kept for a class records it in
@@ -30,19 +32,27 @@ the review's spec names that task's output (a result, log or report it reads).
 
 Other dependencies (depends_on), waiting tasks' retry_when and every hold other than a start gate are
 untouched. Accepted gap: the classes are read from words, so a `why` that names a class keeps its
-gate whether or not it holds; the coordinator owns that word."""
+gate whether or not it holds; the coordinator owns that word, and narrows an over-wide user-cited or
+guard gate itself (a gate standing in for another task's output is a `landed:#<id>` dependency): the
+daemon never narrows one."""
 from __future__ import annotations
 
 import json
 import re
 
 from . import urgent
+from .project import USER_CITE
 
 LABEL = "start_safety"   # a kept gate's safety class (one of CLASSES' names); cleared with the deferral
 DEPENDENCY = "a dependency on another task's new file or symbol"   # the class of task_add's overlap chain
 
 # (class, words in the gate's why or the probe that name it)
-CLASSES = (
+CLASSES = (   # the user's word and a Restriction first: a gate citing either files under it
+    ("the user's word", USER_CITE.pattern
+                        + r"|\buser'?s? (?:own )?(?:word|go|ok|okay|approval|answer|decision|call|sign[- ]?off)\b"
+                        r"|\buntil the user\b|\b(?:waits?|waiting) (?:for|on) the user\b"
+                        r"|\btest -[ef] \S*/user-[\w.-]+"),
+    ("charter restriction", r"\brestrictions?\b|\bcharter\b|\bguard\w*"),
     ("data loss", r"\bdata[ -]?loss\b|\blos(?:e|es|ing|t) (?:data|work|state|results?)\b|\bcorrupt\w*|\bbackups?\b"),
     ("spend cap or provider window", r"\bspend\w*|\bbudget\w*|\bcaps?\b|\bquotas?\b|\brate[ -]?limit\w*|\bcredits?\b"
                                      r"|\b(?:provider|usage|billing|token|rate|5[- ]?h(?:our)?) windows?\b"
@@ -51,18 +61,14 @@ CLASSES = (
                                  r"|\bholds?\b|\bpause[sd]?\b|\blulls?\b|\brestart\w*|\bupgrad\w*|\breboot\w*"
                                  r"|\bpower[ -]?cycl\w*|\breservations?\b|\ballocations?\b|\bmaintenance\b"
                                  r"|\bbroker-released\b|\bdevq\b"),
-    ("charter restriction", r"\brestrictions?\b|\bcharter\b"),
     ("another person's work", r"\b(?:another|other) (?:person|people|user|developer|engineer|team|contributor)s?\b"
                               r"|\bsomeone else\b|\bcolleagues?\b"),
-    ("the user's word", r"\buser'?s? (?:own )?(?:word|go|ok|okay|approval|answer|decision|call|sign[- ]?off)\b"
-                        r"|\buntil the user\b|\b(?:waits?|waiting) (?:for|on) the user\b"
-                        r"|\btest -[ef] \S*/user-[\w.-]+"),
     (DEPENDENCY,
      r"(?:#\d+|another task|its producer)\b.*\b(?:new |its )?(?:files?|symbols?|functions?|modules?|helpers?|api"
      r"|class(?:es)?|commands?|flags?|schema|columns?|tables?)\b"
      r"|\b(?:uses?|needs?|imports?|calls?|reuses?|builds? on) #\d+'?s?\b"),
 )
-_CLASSES = tuple((name, re.compile(rx, re.I)) for name, rx in CLASSES)
+_CLASSES = tuple((name, re.compile(rx, re.I | re.M)) for name, rx in CLASSES)
 
 
 def safety_class(*texts: str | None) -> str | None:

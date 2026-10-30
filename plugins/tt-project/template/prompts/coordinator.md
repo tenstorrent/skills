@@ -125,6 +125,8 @@ Each field's rules are in the section named; the table only lists them.
 - A `start_when` that waits for a device or box uses a live read-only probe (the broker's status),
   never a marker file a dead box leaves behind. It tests job rows, never a section header the
   status always prints (`grep -q RUNNING` always matches).
+- A gate for another task's output is a dependency, never a guard probe. Urgent work keeps a gate citing
+  the user's word, a guard or a Restriction; narrowing one is yours.
 - A task id that names no task here is rejected (`depends_on`, probes); a `missing_task_ref` event
   is a task already waiting on one: re-point or cancel it.
 - `overlaps #<id>` (task_add): an open or unlanded task shares files with this spec: run side by side unless one

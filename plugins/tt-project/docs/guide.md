@@ -708,8 +708,9 @@ queues behind routine work; nothing running is interrupted:
 - Start gates: an urgent task whose dependencies are met never sleeps on a convenience gate. Its
   `start_after`, `start_when` or `landed:#<id>` chain stays only when the gate's `why` (or the probe)
   names a safety class: data loss, a spend cap or provider window, a shared device or machine (lock,
-  hold, pause, a lull for a restart, upgrade, reboot or power cycle), a charter Restriction, another
-  person's work, the user's word (a `test -e <dir>/user-<x>` probe), or a real dependency on another
+  hold, pause, a lull for a restart, upgrade, reboot or power cycle), a charter Restriction (a guard,
+  Restriction or charter rule), another person's work, the user's word (a cited user message or a
+  `test -e <dir>/user-<x>` probe; it and a Restriction are filed before any device word), or a real dependency on another
   task's new file or symbol (task_add's own overlap chain always counts). task_add and task_update drop any other gate at once and say so in their
   reply note; a kept gate records its class in the `start_safety:<class>` label. Each tick, a
   model-free sweep applies the same rule to queued tasks parked earlier (one low observation each, no
