@@ -1148,6 +1148,47 @@ def _test_conftest():
     return mod
 
 
+def test_forked_workers_sharing_a_temp_root_never_give_up_a_numbered_dir_on_lost_races(tmp_path, monkeypatch):
+    """The forked workers share one temp root, so tmp_path's numbered folders race: a worker whose
+    scan is stale loses mkdir with EEXIST. pytest's own make_numbered_dir gives up after 10 lost
+    races ('could not create numbered dir ... after 10 tries'), which failed a test with many short
+    parameters under load. The workers' version keeps retrying a lost race, and raises any other
+    mkdir error at once with its errno."""
+    import _pytest.pathlib as pl
+    import _pytest.tmpdir as td
+    conf = _test_conftest()
+    monkeypatch.setattr(td, "make_numbered_dir", td.make_numbered_dir)   # restored after the test
+    real, stale = pl.find_suffixes, {"left": 0}
+
+    def find_suffixes(root, prefix):   # the other workers keep taking the number this scan picks
+        if stale["left"]:
+            stale["left"] -= 1
+            return []
+        return real(root, prefix)
+    monkeypatch.setattr(pl, "find_suffixes", find_suffixes)
+    factory = pytest.TempPathFactory(tmp_path / "base", retention_count=3, retention_policy="all",
+                                     trace=lambda *a: None, _ispytest=True)
+    factory.getbasetemp()
+    factory.mktemp("racy", numbered=True)   # racy0 exists, so every stale scan loses
+
+    stale["left"] = 15
+    with pytest.raises(OSError, match="after 10 tries"):
+        factory.mktemp("racy", numbered=True)   # pytest's own: the flake
+    stale["left"] = 15
+    conf._share_numbered_dirs()
+    assert td.make_numbered_dir is conf._make_numbered_dir
+    assert factory.mktemp("racy", numbered=True).name == "racy1" and stale["left"] == 0
+
+    stale["left"] = conf.NUMBERED_DIR_TRIES
+    with pytest.raises(OSError, match=f"after {conf.NUMBERED_DIR_TRIES} tries"):
+        factory.mktemp("racy", numbered=True)   # bounded: never loops forever
+    with pytest.raises(FileNotFoundError):   # another error is not retried, and keeps its errno
+        conf._make_numbered_dir(tmp_path / "gone", "racy")
+    (tmp_path / "file").write_text("")
+    with pytest.raises(NotADirectoryError):
+        conf._make_numbered_dir(tmp_path / "file", "racy")
+
+
 @pytest.mark.parametrize("cpus,env,jobs", [
     (1, {}, 1), (2, {}, 1), (3, {}, 1), (6, {}, 3), (8, {}, 4), (14, {}, 4), (64, {}, 4),
     (14, {"CI": "false"}, 4), (14, {"CI": ""}, 4),
