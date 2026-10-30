@@ -103,9 +103,9 @@ source and values in the preflight.
 
 - Agent time limit, request time limit and output cap: never the reason a score is lost. The survey
   estimates what the model needs; runs correct it. When tasks are cut off while still making
-  progress, raise the limit and run those tasks again. A task that loops or repeats is a model
-  failure, not a limit to raise. Never go below the release values, and report the limits each
-  score used.
+  progress, raise the limit and run those tasks again. A task that loops or repeats may end at the
+  output cap or time limit; that is a model failure and counts as one, not a limit to raise. Never
+  go below the release values, and report the limits each score used.
 - Batch: run the full evals on the largest validated batch, with enough agents to fill it, unless a
   recorded reason says otherwise. Samples and tests use the largest batch that works and suits the
   test. Record the batch each eval used.
