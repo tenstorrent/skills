@@ -155,14 +155,19 @@ Release.
 ### Efforts
 
 An effort owns one problem: one owner, one branch, one device or slot set, and a time box of about
-twice its work estimate. The coordinator's brief gives the sub-agent the problem, the evidence, the
-predicted saving, the confirmation, the current best and the time box.
+twice its work estimate.
 
-The sub-agent then writes its own goal (what it will change and the result that confirms it) and a
-plan of tests to get there, and keeps both in `runs/<effort>/plan.md`. The plan changes as data
-arrives; note each change and why. The time box is a deadline for the plan, not a target: plan
-tests that fit inside it, and finish as soon as the confirmation settles the question, either way.
-Time left in the box returns to the queue.
+The coordinator writes the goal, because it knows what the result has to deliver: the result it
+needs and the confirmation that shows it, for example "one live row prefills at batch-1 cost at
+B32, tokens exact". Its brief gives the sub-agent the goal, the problem, the evidence, the
+predicted saving, the current best and the time box. The sub-agent writes the plan: the tests that
+reach the goal, in `runs/<effort>/plan.md`. The plan changes as data arrives; note each change and
+why. When the data shows the goal is wrong or out of reach, the sub-agent reports it, and the
+coordinator changes the goal and records why.
+
+The time box is a deadline for the plan, not a target: plan tests that fit inside it, and finish as
+soon as the confirmation settles the question, either way. Time left in the box returns to the
+queue.
 
 - **Fastest test first.** Look for a test of minutes in the survey's short tests before any scored
   sample. Use a scored sample only when the question is about scores, completion or harness
