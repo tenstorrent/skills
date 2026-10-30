@@ -5268,6 +5268,97 @@ def test_the_self_health_gate_by_reason_and_its_refusal_count(env):
 
 
 
+_RESET_LEAST = "wait for the software reset to recover it; it did not, twice"
+
+
+# (text, extra fields): each names a reset of a machine or resource the project holds, nothing else on it.
+_IDLE_RESET_REFUSED = [
+    ("box-a stayed down after the software reset. May I power-cycle box-a?", {}),
+    ("Cycle the power on box-a? It is idle.", {}),                                       # a paraphrase
+    ("Turn box-a off and back on?", {}),
+    ("Cold boot box-a, or bounce it?", {}),
+    ("box-a is wedged. How should I proceed?", {"least_disruptive": "reboot box-a through its BMC once the software reset fails again"}),
+    ("The chips on box-a are gone.", {"not_covered": "a second machine now: restart box-a too"}),
+    ("dev-a hung. Should I reset dev-a?", {}),                                           # the project's device lock
+    ("Reboot box-b.example.com after the hang?", {}),                                    # by host name
+    ("box-a has no other tenant and nobody else uses it, not serving. Power cycle it, box-a?", {}),
+]
+
+
+@pytest.mark.parametrize("text,fields", _IDLE_RESET_REFUSED)
+def test_an_ask_to_reset_an_idle_machine_the_project_holds_is_refused(env, text, fields):
+    from ttp import machines, unblock
+    p = make(env)
+    p.set_config("device.locks", ["dev-a"])
+    machines.add("box-a", tags="device")
+    machines.add("box-b", tags="device", hostname="box-b.example.com")
+    fields = {"blocking": "irreversible", "classify": "irreversible", "least_disruptive": _RESET_LEAST, **fields}
+    problems, ask = _ask(p, text, **fields)
+    assert problems and "cannot harm people or speak as the user" in problems[0] and ask is None, problems
+    assert "memory_add" in problems[0] and "severity low" in problems[0]
+    line = next(x for x in unblock.lines(p.db) if x.startswith("asks refused by the gate, 24 h"))
+    assert "idle reset 1" in line, line
+
+
+# (text, fields, setup): the gate cannot tell, or something other than the reset needs the user.
+_IDLE_RESET_THROUGH = [
+    ("Power cycle box-z?", {}, None),                                                    # unknown machine
+    ("Power cycle the second machine?", {}, None),                                       # no target named
+    ("Power cycle box-s?", {}, None),                                                    # a serving tag
+    ("Power cycle box-h?", {}, None),                                                    # shared by all projects
+    ("Power cycle box-a?", {}, "lock"),                                                  # a lock held on it
+    ("Power cycle box-a?", {}, "shared-lock"),                                           # another project's lock
+    ("Power cycle box-a?", {}, "pause"),                                                 # a pause on it
+    ("Power cycle box-a? Live traffic still reaches it.", {}, None),
+    ("Reboot box-a? A teammate's benchmark run is on it.", {}, None),                    # a person's work
+    ("Reboot box-a? Other users are logged in.", {}, None),
+    ("Reboot box-a and merge the fix?", {}, None),
+    ("Reboot box-a? Its BMC needs a password.", {}, None),                               # a credential
+    ("Reboot box-a? It costs $40 a cycle.", {}, None),                                   # money
+    ("Press the power button on box-a?", {}, None),                                      # user-only step
+    ("Restart box-a after wiping its disk?", {}, None),                                  # one-way step
+    ("Is box-a idle?", {}, None),                                                        # no reset
+    ("Power cycle box-a?", {"blocking": "review"}, None),
+    ("Power cycle box-a?", {"blocking": "funds"}, None),
+    ("Power cycle box-a?", {"blocking": "restriction",
+                            "least_disruptive": "a power cycle breaks the never-cycle restriction"}, None),
+]
+
+
+@pytest.mark.parametrize("text,fields,setup", _IDLE_RESET_THROUGH)
+def test_an_ask_to_reset_goes_through_when_the_gate_cannot_tell(env, text, fields, setup):
+    from ttp import coordinator as coord, locks, machines, shared
+    p = make(env)
+    machines.add("box-a", tags="device")
+    machines.add("box-s", tags="device,serving")
+    machines.add("box-h", tags="device", shared="")
+    held = None
+    if setup == "lock":
+        held = locks.try_take(locks.slot_paths(p.state / "locks", "box-a-device", 1), "task #9 (run 3)")
+    elif setup == "shared-lock":
+        held = locks.try_take(locks.slot_paths(shared.root() / "box-a-device", "box-a-device", 1), "other task #4")
+    elif setup == "pause":
+        p.db.set_kv(coord.PAUSED_RESOURCES_KEY, {"box-a-device": {"reason": "test", "since": 1, "by": "user"}})
+    a = {"blocking": "human", **fields}
+    try:
+        assert coord._idle_reset_ask(p, p.config(), a, text, str(a.get("least_disruptive") or "")) == ""
+    finally:
+        if held:
+            held.close()
+    if setup is None:
+        assert coord._idle_reset_ask(p, p.config(), {"blocking": "human"}, "Power cycle box-a?", "")   # the control
+
+
+def test_a_reset_ask_naming_a_tenant_is_sent(env):
+    from ttp import machines
+    p = make(env)
+    machines.add("box-s", tags="device,serving")
+    problems, ask = _ask(p, "Power cycle box-s? A cycle drops the requests it serves.", blocking="irreversible",
+                         classify="irreversible", least_disruptive=_RESET_LEAST)
+    assert problems == [] and ask is not None, problems
+
+
+
 _QUO = "leave the config as it is for now; that breaks nothing and nobody waits on it"
 
 

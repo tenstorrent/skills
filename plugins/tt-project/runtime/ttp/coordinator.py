@@ -2410,6 +2410,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why:
                     _count_refusal(db, key, "self-health", text)
                     raise ValueError(f"ask_user rejected: {why}")
+                why = _idle_reset_ask(p, cfg, a, text, least)
+                if why:
+                    _count_refusal(db, key, "idle reset", text)
+                    raise ValueError(f"ask_user rejected: {why}")
                 if (a["blocking"] not in ("restriction", "review", "merge")    # a review or merge ask is never leave to open
                         and prguard.draft_permission_ask(text, not prguard.drafts_during_freeze(p.config()))):
                     raise ValueError("ask_user rejected: draft PRs need no permission: open it. Opening and updating a "
@@ -5240,6 +5244,84 @@ def _self_health_ask(a: dict, text: str, least: str = "") -> str:
             "<project>`. Ask only for a real missing credential, a step only the user can take (physical, on their "
             "machine) or another person's request, or when every fix breaks a restriction: blocking restriction "
             "(or irreversible), with least_disruptive naming the restriction or the irreversible step")
+
+
+# A reset, reboot, power cycle or restart of a machine or resource the project holds, with nothing
+# showing another tenant on it, cannot harm people or speak as the user (user rule): refused, model-free.
+# Through whenever the gate cannot tell: an unnamed or unknown target, a serving, shared or paused one,
+# a live lock or reservation on it, or text naming a tenant, a person's work, money, a credential, a
+# user-only step, another person's request, a post, merge or other one-way step.
+_RESET_RE = re.compile(r"\b(?:re-?boot\w*|(?:hard[- ])?reset\w*|glx_reset|power[- ]?cycl\w*|"
+                       r"cycl\w*\s+(?:the\s+|its\s+)?power|(?:power|turn)\s+(?:[\w.-]+\s+){0,2}?(?:off|down)\s+and\s+(?:back\s+)?on|"
+                       r"(?:cold|warm|hard)[- ]boot\w*|bounc\w*|restart\w*)\b", re.I)
+_NO_TENANT_RE = re.compile(r"(?:\b(?:no|not|nobody|none|without|zero|nothing|never)|n't)(?:\s+[\w'-]+){0,3}\s+"
+                           r"(?:else|other|tenants?|traffic|users?|one|serving|shared|in\s+use|used|using|uses|jobs?|"
+                           r"holders?|handles?|process(?:es)?|load|customers?)\b", re.I)
+_TENANT_RE = re.compile(r"\b(?:serv(?:ing|es)|production|prod|live|traffic|tenants?|customers?|demo|someone|somebody|"
+                        r"(?:other|another)\s+(?:users?|people|persons?|teams?|projects?)|in\s+use|being\s+used|"
+                        r"shared|logged[- ]in|users?\s+(?:on|of)\s+it)\b", re.I)
+_OWN_POSSESSOR = ("project", "task", "worker", "run", "machine", "box", "node", "broker", "daemon", "coordinator",
+                  "harness", "it", "system", "host", "device", "chip", "tray", "board", "service", "scheduler", "queue")
+_PERSON_WORK_RE = re.compile(rf"\b(?!(?:{'|'.join(_OWN_POSSESSOR)})'s\b)[A-Za-z][\w-]*'s\s+(?:[\w-]+\s+)?"
+                             r"(?:work|jobs?|runs?|sessions?|experiments?|data|training|benchmarks?|process(?:es)?|"
+                             r"reservations?|allocations?)\b", re.I)
+_SPEAKS_RE = re.compile(r"\b(?:merg\w*|post(?:s|ed|ing)?(?!-)|announc\w*|e-?mail\w*|reply\s+to|message\s+(?:to|the)|"
+                        r"in\s+(?:your|the\s+user's)\s+name|on\s+(?:your|the\s+user's)\s+behalf|leav\w*\s+draft|"
+                        r"ready\s+for\s+review|disrupt\w*|disturb\w*|outage|evict\w*|preempt\w*)\b", re.I)
+_TENANT_TAGS = {"serving", "shared", "production", "prod", "live", "public", "demo", "customer"}
+
+
+def _idle_reset_ask(p: Project, cfg: dict, a: dict, text: str, least: str) -> str:
+    """Why an ask to reset, reboot, power-cycle or restart a machine or resource this project holds,
+    with no sign of another tenant, is the project's to do, or "". Targets: machine aliases or host
+    names in the machines list, and the project's own (not shared) device locks, named in a sentence
+    of text, least_disruptive or not_covered that also names the reset. Review, merge, funds and spend
+    asks pass; so does a restriction ask whose least_disruptive names the restriction."""
+    blocking = a.get("blocking")
+    if blocking not in ("human", "access", "irreversible", "restriction"):
+        return ""
+    nc = str(a.get("not_covered") or "")
+    said = f"{text} {a.get('recommendation') or ''} {least} {nc}".replace("’", "'")
+    if blocking == "restriction" and _NAMES_LIMIT_RE.search(least) and not _BREAKS_NONE_RE.search(least):
+        return ""
+    if (_names_needs_user(said) or _MONEY_RE.search(said) or _CREDENTIAL_RE.search(said) or _USER_ONLY_RE.search(said)
+            or _OTHERS_ASK_RE.search(said) or _ONE_WAY_RE.search(said) or _SPEAKS_RE.search(said)
+            or _PERSON_WORK_RE.search(said) or _TENANT_RE.search(_NO_TENANT_RE.sub(" ", said))):
+        return ""
+    known = machines.load()
+    hosts = {alias.lower(): alias for alias in known}
+    hosts |= {str(m.get("hostname")).lower(): alias for alias, m in known.items() if (m or {}).get("hostname")}
+    shared_names = shared.names(cfg)
+    own = {r.lower(): r for r in locks.device_locks(cfg) if r not in shared_names}
+    targets: set[str] = set()
+    for sentence in re.split(r"[.;:!?\n]+", f"{text}\n{least}\n{nc}"):
+        if not _RESET_RE.search(sentence):
+            continue
+        words = {w.lower().rstrip(".-") for w in re.findall(r"[A-Za-z0-9][A-Za-z0-9_.+-]*", sentence)}
+        targets |= {hosts[w] for w in words if w in hosts} | {own[w] for w in words if w in own}
+    if not targets:
+        return ""
+    paused = set((p.db.kv(PAUSED_RESOURCES_KEY) or {})) | set(shared.paused(cfg))
+    taken = locks.held(p.state / "locks", p)
+    for t in targets:
+        m = known.get(t) or {}
+        if m.get("shared") or _TENANT_TAGS & set(machines.tag_names(m.get("tags"))) or t in shared_names:
+            return ""
+        near = lambda res: res == t or res.startswith(f"{t}-")   # a machine's resources: <alias>-device
+        try:
+            dirs = [d for d in shared.root().iterdir() if d.is_dir() and near(d.name)]
+        except OSError:
+            dirs = []
+        if (any(near(r) for r in paused) or any(shared.read_pause(d.name) for d in dirs)
+                or any(near(line.split(":", 1)[0]) for line in taken + [x for d in dirs for x in locks.held(d, p)])):
+            return ""
+    owners = sorted({str(known[t]["recovery_owner"]) for t in targets
+                     if t in known and known[t].get("recovery_owner") and known[t]["recovery_owner"] != p.name})
+    to = f" Its recovery owner is {', '.join(owners)}: send it there with `ttp note --to <project>`." if owners else ""
+    return (f"a reset, reboot, power cycle or restart of {', '.join(sorted(targets))}, which this project holds and "
+            "nothing shows anyone else using, cannot harm people or speak as the user: decide it, do it, record it "
+            "with memory_add and report it at severity low." + to + " Ask only when another tenant, a serving or "
+            "shared use, a lock, a pause or a person's work is on it, and name it in the ask")
 
 
 # The status-quo and reversible-step checks only flag: a flagged ask is sent as usual, and the flag is

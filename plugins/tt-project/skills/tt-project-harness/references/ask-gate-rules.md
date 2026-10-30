@@ -6,6 +6,7 @@ The coordinator's ask_user gate (runtime `coordinator.py`, `_project_refused_ask
 A refusal reads `ask_user rejected: <reason>` and counts under `label` in the daily review's refused-asks line, like the built-in checks.
 A malformed entry (a bad regex, no `all_of` or `reason`, a wrong type) is skipped with a warning in `daemon.log` and in `ttp config` problems; it never fails a turn, and the other entries still apply.
 With no entries the gate is unchanged.
+A built-in check (`_idle_reset_ask`) refuses an ask to reset, reboot, power-cycle or restart a machine in the machines list or one of the project's own device locks when nothing shows another tenant (no serving or shared tag or share, no lock, reservation or pause on it, no live traffic, other users or a person's work named, and no post, merge, credential, money or user-only step): the project decides it, does it, records it with memory_add and reports it at severity low; an unknown or unnamed target goes through.
 The rule says what the coordinator should do instead in `reason`, since the refusal is all it sees.
 
 A generic example: the coordinator decides routine benchmark spend itself, unless it is a first-time purchase, and an ask may still go out with a reason why the call is not the project's own.
