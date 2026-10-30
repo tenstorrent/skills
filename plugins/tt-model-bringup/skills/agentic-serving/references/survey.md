@@ -19,7 +19,7 @@ Read these on the stage-11 benchmark and the smoke run, and again on every later
 | `cache_pressure` | Peak pool use, preemptions, evictions | Close to 0 |
 | `cache_bytes` | Bytes per cache block by layer group, and how full each is | Little idle |
 | `memory_headroom` | Minimum free DRAM under load, and weights held twice | Pool sized from the minimum |
-| `cutoffs` | Share of tasks ending at the time limit or the output cap | Near 0 |
+| `cutoffs` | Share of tasks ending at the time limit or the output cap, split into still progressing and looping | Near 0 |
 | `eval_validity` | Network isolation, fetched fixes, infrastructure failures | Isolated, no fetches |
 | `accuracy_drift` | KL against HF on long agent prompts | At the noise floor |
 
