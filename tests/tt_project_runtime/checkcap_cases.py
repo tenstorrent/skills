@@ -4320,3 +4320,57 @@ def test_cap_turn_counts_one_lane_for_the_old_unkeyed_base(env, monkeypatch):
         for t in (aged, mine):
             locks.dequeue(t)
         old.close()
+
+
+def test_checks_run_times_rows_carry_the_scratch_kind_and_old_rows_without_it_still_read(env, monkeypatch):
+    from ttp import checklane, checkwall
+    p = make(env)
+    log = p.state / checkwall.RUNS_LOG
+    # A row written before the scratch key existed.
+    log.write_text(json.dumps({"ts": time.time(), "s": 100.0, "passed": True, "k": "abc"}) + "\n")
+    checkwall.record_run(p.state, 300, True, "abc", scratch="tmpfs")
+    checkwall.record_run(p.state, 500, True, "abc", scratch="disk")
+    checkwall.record_run(p.state, 700, False)
+    rows = [json.loads(x) for x in log.read_text().splitlines()]
+    assert [r.get("scratch") for r in rows] == [None, "tmpfs", "disk", None], rows
+    assert checkwall.recent(p.state) == [100.0, 300.0, 500.0, 700.0]
+    assert len(checkwall.run_spans(p.state)) == 4
+    assert checklane.median_s(p.state, "abc") == 300.0, "old and new rows of one command list both count"
+
+
+def test_ttp_checks_records_its_scratch_kind_in_the_run_times_log(env, tmp_path, monkeypatch, capsys):
+    from ttp import checkwall, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    cli.main(["checks", "--", "true"])
+    row = json.loads((p.state / checkwall.RUNS_LOG).read_text().splitlines()[-1])
+    assert row["scratch"] == "disk" and row["passed"] is True, row
+
+
+def test_suite_wait_line_names_every_holder_past_the_first_three(env):
+    from ttp import testslots
+    now = time.time()
+    recs = [{"task": t, "command": "pytest -q", "ts": now - 60} for t in (11, 12, 13, 14, 15)]
+    text = testslots.holders_text(recs, now)
+    assert all(f"#{t}" in text for t in (11, 12, 13, 14, 15)), text
+    assert text.endswith("; +2 more: #14, #15") and text.count("'pytest -q'") == 3, text
+    four = testslots.holders_text(recs[:4], now)
+    assert four.endswith("; +1 more: #14"), "at cap 4 the 4th holder is named"
+    assert testslots.holders_text(recs[:3], now).count("more") == 0
+    assert testslots.holders_text([], now) == "a run that just ended"
+    assert testslots.holders_text([{"holder": "pb: full checks (pid 9)"}] * 4, now).endswith(
+        "+1 more: pb: full checks (pid 9)"), "a holder without a task is named by its label"
+
+
+def test_a_runs_second_detached_checks_append_to_checks_out_keeping_the_first_runs_lines(
+        env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    out, rc = run / cli.CHECKS_OUT, run / cli.CHECKS_RC
+    cli.main(["checks", "--detach", "--fresh", "--", "true"])
+    assert _wait_for(rc.exists, 60), out.read_text()
+    first = out.read_text()
+    assert first.strip(), "the first run wrote its lines"
+    cli.main(["checks", "--detach", "--fresh", "--", "sh", "-c", "exit 0"])
+    assert _wait_for(rc.exists, 60), out.read_text()
+    both = out.read_text()
+    assert both.startswith(first) and len(both) > len(first), both

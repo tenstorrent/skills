@@ -3013,7 +3013,8 @@ def cmd_checks(a) -> None:
                 checkwall.record_timeout(p.state, os.environ.get("TTP_TASK"), timed_out)
             elif executed:
                 checkwall.record_run(p.state, time.time() - ran_since, passed,
-                                     _commands_hash(todo) if passed and executed == todo else "")
+                                     _commands_hash(todo) if passed and executed == todo else "",
+                                     "" if spilled else "tmpfs" if shorttmp.on_tmpfs(run_env.get("TMPDIR")) else "disk")
                 # A completed run no longer reports the task's old wall-time timeout (TIMEOUTS entry).
                 checkwall.clear_timeout(p.state, os.environ.get("TTP_TASK"))
         if slot and not passed:
@@ -4183,7 +4184,8 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
         (run_dir / CHECKS_SLOT_WAIT).unlink(missing_ok=True)
         (run_dir / CHECKS_SLOT_CANCEL).unlink(missing_ok=True)
         (run_dir / CHECKS_DROPPED).unlink(missing_ok=True)
-        with open(run_dir / CHECKS_OUT, "wb") as out:
+        # Appended: a run's earlier checks (their wait lines) stay above this one's
+        with open(run_dir / CHECKS_OUT, "ab") as out:
             child = subprocess.Popen([sys.executable, "-m", "ttp", "checks", "--rc", str(run_dir / CHECKS_RC),
                                       *(["--fresh"] if a.fresh else []), *(["--full"] if getattr(a, "full", False) else []),
                                       *(["--light"] if getattr(a, "light", False) else []),

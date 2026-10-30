@@ -503,6 +503,15 @@ def suite_priority(ticket, now: float | None = None, age: float | None = None,
     return max(min(prio, AGE_FLOOR), prio - waited // age) if age > 0 else prio
 
 
+def holders_text(recs: list, now: float, full: int = 3) -> str:
+    """Every holder for a waiter's line: the first `full` in full (checklane.holder_text), the rest
+    by name only ("+2 more: #7, #9"), so no holder is hidden past the project's cap."""
+    from . import checklane
+    text = "; ".join(checklane.holder_text(r, now) for r in recs[:full]) or "a run that just ended"
+    rest = [f"#{r['task']}" if r.get("task") else str(r.get("holder") or "a run") for r in recs[full:]]
+    return text + (f"; +{len(rest)} more: {', '.join(rest)}" if rest else "")
+
+
 def rank_text(ticket, now: float | None = None, age: float | None = None) -> str:
     """A waiter's task priority and its rank now (suite_priority) for a wait line, e.g. "p4 ranked p2
     (aged)" or "p3 (no task priority) ranked p3"."""
@@ -904,7 +913,7 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                         f"checks.{SLOTS_KEY} sets it")
                 rule += f"; at most {cap} of the project's checks at once (checks.test_project_max)" if cap > 0 else ""
                 recs = recs or locks.holder_records(project_held(project_name))
-                held_by = "; ".join(checklane.holder_text(r, told) for r in recs[:3]) or "a run that just ended"
+                held_by = holders_text(recs, told)
                 tell and tell(f"waiting for this project's other full checks to end ({rule}, most urgent priority "
                               f"first; this run {rank_text(ticket, told, age)}, position {place} of "
                               f"{max(len(q), place)}, {place - 1} waiter(s) ahead, waited {_mins(told - arrival)}), "
