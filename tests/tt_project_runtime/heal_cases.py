@@ -93,7 +93,7 @@ def test_failed_daemon_run_commands_keep_a_bounded_stderr_tail(env, monkeypatch)
     assert sorted(got) == ["box-a is down", "watcher command exited rc=2: why-it-broke"], got
     # An until_probe that neither passes nor says "not yet" is broken: its stderr tail says why.
     assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "text": "Hands off the rig.",
-                            "until": "the rig is fixed", "until_probe": noisy}]) == []
+                            "until": "the rig is fixed", "until_probe": noisy, "source": {"origin": "gate"}}]) == []
     e, now = ends.Ends(p), time.time()
     e.tick(now)
     e._procs[next(iter(e._procs))][0].wait(30)

@@ -26,6 +26,7 @@ ORIGINS = {"brief": "(origin: Brief)", "gate": "(origin: harness gate)"}
 ORIGIN_RE = re.compile(r"\(origin:\s*(?:brief|harness gate)\)", re.I)
 _CITE_RUN = CITE_RE.pattern + r"(?:\s*(?:,|and|&)\s*#\d+)*"
 _CITES_RE = re.compile(r"\(\s*" + _CITE_RUN + r"\s*\)|" + _CITE_RUN + "|" + ORIGIN_RE.pattern, re.I)
+_BARE_RE = re.compile(r"[ \t]*(?:" + _CITES_RE.pattern + ")", re.I)
 ADVISORY_HEAD = "Unsourced restrictions (advisory): drop them yourself"
 _BULLET_RE = re.compile(r"\s*(?:[-*+]|\d+[.)])\s+")
 NO_SOURCE = ("a Restrictions item needs `source`: {\"msg\": <user message id>, \"quote\": \"<the user's own "
@@ -166,7 +167,7 @@ def cite_items(text: str, cite: str) -> str:
 
 def bare(text: str) -> str:
     """`text` without its source cites, for comparing what rules are about."""
-    return _CITES_RE.sub("", text)
+    return _BARE_RE.sub("", text)
 
 
 def whole_item(body: str, start: int, end: int, items) -> tuple[int, int]:

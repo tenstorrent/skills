@@ -2164,11 +2164,12 @@ def test_a_user_turn_loosening_via_quote_still_replaces_the_ban(env):
     p = make(env)
     from ttp import coordinator as coord
     db = p.db
-    p.charter_path.write_text(_BANS)
+    p.charter_path.write_text(_BANS.replace("paused device.", "paused device. (user msg #1)"))   # sourced: binds
     said = db.post("in", "you may now use the paused device", chat=None, channel="web", kind="user",
                    provenance="web-session")
     act = {"type": "charter_update", "section": "Restrictions", "quote": "Never use a paused device.",
-           "text": "Use the device even when paused, for short jobs."}
+           "text": "Use the device even when paused, for short jobs.",
+           "source": {"msg": said, "quote": "you may now use the paused device"}}
     assert coord.apply(p, [act], turn=1) and "Never use a paused device." in p.charter_path.read_text()
     assert coord.apply(p, [act], turn=2, user_turn=True, messages=[said]) == []
     charter = p.charter_path.read_text()
@@ -2260,18 +2261,21 @@ def test_text_put_into_a_bullet_item_keeps_one_bullet_in_and_out_of_user_turns(e
     for n, quote in enumerate(("- never push to main.", "Never push to main.")):
         for kw in ({"user_turn": True, "messages": [said]}, {}):
             p.charter_path.write_text(before)
-            a = {"type": "charter_update", "section": "Restrictions", "quote": quote, "text": text}
+            a = {"type": "charter_update", "section": "Restrictions", "quote": quote, "text": text,
+                 "source": {"msg": said, "quote": "pushes to main need review"}}
             if not kw:
                 a["over"] = "the user's message #1 changed it on 2026-10-01"
             assert coord.apply(p, [a], turn=20 + 2 * n + bool(kw), **kw) == []
             got = p.charter_path.read_text()
-            assert got == "# demo\n\n## Restrictions\n- Never push to main without review.\n- Keep content generic.\n", got
+            assert got == (f"# demo\n\n## Restrictions\n- Never push to main without review. (user msg #{said})\n"
+                           "- Keep content generic.\n"), got
     # A quote that takes the marker along gets the text's own bullet.
     p.charter_path.write_text(before)
     assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": "- Keep content generic.",
-                            "text": "- Keep content generic and safe."}], turn=30, user_turn=True,
+                            "text": "- Keep content generic and safe.",
+                            "source": {"msg": said, "quote": "pushes to main need review"}}], turn=30, user_turn=True,
                        messages=[said]) == []
-    assert "\n- Keep content generic and safe.\n" in p.charter_path.read_text(), p.charter_path.read_text()
+    assert f"\n- Keep content generic and safe. (user msg #{said})\n" in p.charter_path.read_text(), p.charter_path.read_text()
 
 
 
@@ -2980,7 +2984,28 @@ def test_a_restrictions_item_is_sourced_by_a_user_message_cite_or_an_origin_mark
     assert binding.startswith("- Never merge.") and "### Lab" in binding and "nested part" in binding
     assert rs.unsourced_items("# demo\n\n## Restrictions\n" + body + "\n\n## Goals\nGo, never stop.\n") == [
         "Paragraph rule continued here.", "- Mentions msg #7 only.", "- Says user msg 8.", "1. Numbered and loose"]
-    assert rs.bare("Never merge. (user msg #3) and (origin: Brief), user messages #5, #6") == "Never merge.  and , "
+    assert rs.bare("Never merge. (user msg #3) and (origin: Brief), user messages #5, #6") == "Never merge. and,"
+
+
+def test_an_approval_matches_its_text_with_or_without_the_source_cite(env):
+    """The user's yes recorded in their turn holds the text with the cite charter_update added; a later
+    turn resends the text without it (or with it). Each approval key (recorded, from an ask, an
+    applied lift, a companion's exception) compares the words alone."""
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never merge. (user msg #1)\n")
+    said = db.post("in", "never push on Fridays", chat=None, channel="web", kind="user", provenance="web-session")
+    cited = f"Never push on Fridays. (user msg #{said})"
+    coord._record_charter_approval(p, [said], "Restrictions", "", "", cited, None, "a failure")
+    rec = db.kv(coord.CHARTER_APPROVALS_KEY)[-1]
+    assert rec["text"] == "Never push on Fridays." and rec["sha"] == coord._approval_sha("Never push on Fridays.")
+    for text in ("Never push on Fridays.", cited):
+        ok, why = coord._charter_approval(p, "Restrictions", "", "", text)
+        assert ok and ok["id"] == rec["id"], (text, why)
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "text": "Never push on Fridays."}],
+                       turn=2) == []
+    assert f"\nNever push on Fridays. (user msg #{said})\n" in p.charter_path.read_text()
 
 
 def test_unsourced_restrictions_are_listed_apart_and_bind_no_worker(env):
@@ -3213,7 +3238,7 @@ _PUSH_ITEM = "Push only to branch work/x of the demo repo. Never push to main. N
 
 _EXC_CHARTER = ("# demo\n\n## Restrictions\n- " + _PUSH_ITEM + "\n  (user msg #1)\n"
                 "- Every change keeps the demo repo's test suite green and its validator passing.\n"
-                "- Never modify another project's harness or state.\n"
+                "- Never modify another project's harness or state. (user msg #1)\n"
                 "- User-set device pauses are lifted only on the user's explicit word.\n\n## Policies\nReview first.\n")
 
 
@@ -3246,9 +3271,9 @@ def test_a_companion_edit_naming_an_approved_temporary_exception_is_covered_by_i
     ask = db.post("out", "May stray tmp/* branches be deleted once?", kind="ask")
     yes = db.post("in", "yes", chat=None, channel="web", kind="user", provenance="web-session")
     exc = {"type": "charter_update", "section": "Restrictions", "text": _EXCEPTION.format(ask=ask),
-           "until": "the branch cleanup task is done"}
+           "until": "the branch cleanup task is done", "source": {"msg": yes, "quote": "yes"}}
     comp = {"type": "charter_update", "section": "Restrictions", "quote": _PUSH_ITEM,
-            "text": _COMPANION.format(ask=ask)}
+            "text": _COMPANION.format(ask=ask), "source": {"msg": yes, "quote": "yes"}}
     # The turn of the yes: the guard refuses the exception, naming the exact forms that pass.
     p.charter_path.write_text(_EXC_CHARTER)
     err = coord.apply(p, [exc], turn=1, user_turn=True, messages=[yes])
@@ -3296,7 +3321,7 @@ def test_a_companion_edit_counts_only_for_a_standing_exception_it_names_and_adds
     ask = db.post("out", "May stray tmp/* branches be deleted once?", kind="ask")
     yes = db.post("in", "yes", chat=None, channel="web", kind="user", provenance="web-session")
     exc = {"type": "charter_update", "section": "Restrictions", "text": _EXCEPTION.format(ask=ask),
-           "until": "the branch cleanup task is done", "both_hold": True}
+           "until": "the branch cleanup task is done", "both_hold": True, "source": {"msg": yes, "quote": "yes"}}
     p.charter_path.write_text(_EXC_CHARTER)
     assert coord.apply(p, [exc], turn=1, user_turn=True, messages=[yes]) == []
     harness = "Never modify another project's harness or state."
@@ -3431,7 +3456,8 @@ def test_a_user_goal_with_permit_words_on_another_subject_is_not_taken_for_a_lif
     for turn, section, text in ((1, "Goals", goal),
                                 (2, "Restrictions", "Workers may use the scratch folder for build outputs.")):
         p.charter_path.write_text(_LAND_CHARTER)
-        add = {"type": "charter_update", "section": section, "text": text}
+        add = {"type": "charter_update", "section": section, "text": text,
+               "source": {"msg": said, "quote": "parallel view rendering"}}
         assert coord.apply(p, [add], turn=turn, user_turn=True, messages=[said]) == [], text
         assert text in " ".join(p.charter_path.read_text().split())
     # A sentence that names the item's action or object is still refused on the user's word.
@@ -15426,11 +15452,11 @@ def test_a_quoted_edit_that_drops_a_clause_is_no_contradiction_of_its_siblings(e
     text = item.replace(", except as the temporary exception (ask 12) allows", "")
     for user_turn in (False, True):
         assert coord._reject_contradicting_append(p, "Restrictions", text, user_turn, None, None, item) == ""
-    err = coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": item, "text": text}],
-                      turn=1, user_turn=True)
+    err = coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": item, "text": text,
+                           "source": G}], turn=1, user_turn=True)
     assert err == [], err
     body = p.charter_path.read_text()
-    assert "exception (ask 12)" not in body and "the user opens them).\n" in body and "Never force-push" in body
+    assert "exception (ask 12)" not in body and "the user opens them). (origin: harness gate)\n" in body and "Never force-push" in body
     # A real contradiction is still refused: the edited item now allows what a sibling forbids.
     loose = item.replace("Never push to main.", "Pushing to main is allowed.")
     p.charter_path.write_text(_QUOTED_BANS.replace("## Policies", "- Never push to the main branch.\n\n## Policies"))
@@ -17898,7 +17924,7 @@ def test_a_stored_always_0_until_probe_never_retires_its_entry_and_is_reported_o
     assert coord.apply(p, [{"type": "memory_add", "text": "Stay off box A for now.", "until_probe": good,
                             "expires": "2d"},
                            {"type": "charter_update", "section": "Restrictions", "text": "Leave the queue alone.",
-                            "until_probe": good}], turn=5) == []
+                            "until_probe": good, "source": G}], turn=5) == []
     for f in p.memory_dir.glob("*.md"):
         _store_trivial(f, good, bad)
     _store_trivial(p.charter_path, good, bad)

@@ -4818,7 +4818,8 @@ def _companion_exception(charter: str, quote: str, text: str, approvals: list[di
         if not (acts <= ea and objs <= eo):
             continue
         own = _ref_ids(exc) | _ref_ids(name)
-        recs = [r for r in approvals if _ws(r.get("text") or "") and _ws(r["text"]) in exc]
+        bare = _ws(restriction_source.bare(exc))   # an approval and the charter may differ only in cites
+        recs = [r for r in approvals if _ws(r.get("text") or "") and _ws(restriction_source.bare(r["text"])) in bare]
         for rec in recs:
             ids = own | {str(i) for i in [rec.get("ask"), *(rec.get("messages") or [])] if i is not None}
             if refs <= ids:
@@ -5702,6 +5703,11 @@ def _users_pause(db, a: dict, user_turn: bool, messages: list[int] | None) -> bo
     return any(_PAUSE_ASK_RE.search(w) for w in words if w)
 
 
+def _approval_sha(text: str) -> str:
+    """The key of an approved charter text: its words without source cites (a resend leaves them out)."""
+    return hashlib.sha256(_ws(restriction_source.bare(text)).encode()).hexdigest()
+
+
 def _record_charter_approval(p: Project, messages: list[int], section: str, quote: str, replaces: str,
                              text: str, end: dict | None, failed: str = "") -> None:
     """Record a charter change the user's turn asked for that failed to apply (an ambiguous heading,
@@ -5722,7 +5728,8 @@ def _record_charter_approval(p: Project, messages: list[int], section: str, quot
     cands = [" ".join(sections[i][0][3:].split()) for i in _replaces_hits(sections, replaces)] if replaces else []
     ask = db.one("SELECT id FROM messages WHERE kind='ask' AND direction='out' AND id<? ORDER BY id DESC LIMIT 1",
                  (min(said),))
-    sha = hashlib.sha256(_ws(text).encode()).hexdigest()
+    text = restriction_source.bare(text)   # the user's words; a resend without the cite is the same text
+    sha = _approval_sha(text)
     rec = {"section": _ws(section).lower(), "quote": _ws(quote), "replaces": _ws(replaces.lstrip("#")),
            "text": text, "sha": sha}
     with db.tx():
@@ -5788,7 +5795,7 @@ def _ask_charter_approval(p: Project, section: str, quote: str, replaces: str, t
         if not words or not prguard.clear_yes(words) or time.time() - max(m["ts"] for m in rows) > days * 86400:
             continue
         rec = {"section": _ws(section).lower(), "quote": _ws(quote), "replaces": _ws(replaces.lstrip("#")),
-               "text": text, "sha": hashlib.sha256(_ws(text).encode()).hexdigest(),
+               "text": restriction_source.bare(text), "sha": _approval_sha(text),
                "id": hashlib.sha256(f"ask{aid}{said}{text}".encode()).hexdigest()[:12], "messages": said,
                "ask": aid, "from_ask": True, "candidates": [heading] if heading else [], "failed": "",
                "ts": max(m["ts"] for m in rows), "used": None, "guard": CHARTER_GUARD_VERSION}
@@ -5818,7 +5825,7 @@ def _charter_approval(p: Project, section: str, quote: str, replaces: str, text:
     hits = _replaces_hits(sections, replaces) if replaces else []
     now_name = " ".join(sections[hits[0]][0][3:].split()) if len(hits) == 1 else None
     why, found = NO_APPROVAL, ""
-    sha = hashlib.sha256(_ws(text).encode()).hexdigest()
+    sha = _approval_sha(text)
     for rec in reversed(have):   # newest first; a refusal says why the newest one for this target fails
         # Adding the very text the user approved removes nothing: it matches in any section (a change
         # the guard refused is also recorded under each item it named, see _reject_contradicting_append).
@@ -5865,7 +5872,7 @@ def _record_applied_lift(p: Project, messages: list[int], section: str, text: st
     turn, on record as already used: it never applies that text again, but a companion edit of an
     item it loosens (_charter_approval) still passes on it in a later turn."""
     _record_charter_approval(p, messages, section, "", "", text, None)
-    sha = hashlib.sha256(_ws(text).encode()).hexdigest()
+    sha = _approval_sha(text)
     rec = next((r for r in reversed(p.db.kv(CHARTER_APPROVALS_KEY, []) or []) if r.get("sha") == sha), None)
     if rec and not rec.get("used"):
         _use_charter_approval(p, rec["id"], key)
@@ -5893,7 +5900,7 @@ CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_ov
                        "_item_quote_hits", "_items", "_norm", "_may_lift", "_lifts_item", "_companion_clause",
                        "_ref_ids", "_companion_exception", "_changed_sentences", "_quoted_news",
                        "_charter_approval", "_ask_charter_approval")
-CHARTER_GUARD_PIN = (12, "89f3ddc9ef9560a3c1e62a3e01ee269c307818fd564b4dc44c045f30572a366e")
+CHARTER_GUARD_PIN = (12, "f0e9634362cb60c07730446ccbe24d7190eb74437239f80d94416f5a96cf084b")
 CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
 
 

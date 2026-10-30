@@ -16851,7 +16851,8 @@ def test_a_coordinator_turn_replayed_after_a_crash_writes_its_files_once(env, tm
     (cdir / "output.jsonl").write_text(json.dumps({"actions": [
         {"type": "reply", "text": "noted"},
         {"type": "memory_add", "text": "X holds", "memory_kind": "fact"},
-        {"type": "charter_update", "section": "Restrictions", "text": "Never do Y."},
+        {"type": "charter_update", "section": "Restrictions", "text": "Never do Y.",
+         "source": {"msg": mid, "quote": "never do Y"}},
         {"type": "task_update", "id": tid, "spec": "use any free board"},
         {"type": "task_update", "id": doomed, "status": "cancelled"}]}))
     (cdir / "exit.json").write_text(json.dumps({"rc": 0, "ended": time.time()}))
