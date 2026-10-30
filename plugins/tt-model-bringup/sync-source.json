@@ -197,7 +197,7 @@
       "destination": "skills/optimize/SKILL.md",
       "blob": "280abb027d839f1f076ab8a524fc6f61ed6df587",
       "source_sha256": "c4b4015ed198c305ed19f73c2ef6a539923212457588319767d08489a5331c8b",
-      "packaged_sha256": "56833e086092a25b8170d7dd9b99c705fd47f3f47b9bcc2fca3f4e5c5f37b611"
+      "packaged_sha256": "94cf708cf4a68452c7d4c202f6743e188cd371e5aa06da28cf74b1c3430aed0c"
     },
     {
       "source": ".agents/skills/optimize/agents/openai.yaml",
@@ -225,7 +225,7 @@
       "destination": "skills/stage-review/SKILL.md",
       "blob": "7c89b9d281aa1a853a273d3ff4b1c16ad8ccac0d",
       "source_sha256": "b84c344e6a2c0130569dc7e4147ad748d44aa04afa11f181b0711d00afbe3466",
-      "packaged_sha256": "978835f7872ea336b2c929338a899b6909558062889e7f19b5b99a85e5f0825e"
+      "packaged_sha256": "0cabbe2ef578457289eaf988937ff523290ac7359b13de010aab3d2b2e428393"
     },
     {
       "source": ".agents/skills/stage-review/agents/openai.yaml",
@@ -274,7 +274,7 @@
       "destination": "skills/vllm-integration/SKILL.md",
       "blob": "05d9e19f7cfbb596d209c504cc49e063b9361da1",
       "source_sha256": "a23a516ab0e8afc3a5dd6ddd72a42781997fb454872139e70605ecbd234e114c",
-      "packaged_sha256": "41c15480cdc16883919777574ea9f3a554100931dbf85f900c587abddb6f283e"
+      "packaged_sha256": "0e7fd95bc63326f0ac2d4f49952d7a306b80342b22e8b9ab29c79321f3e6c470"
     },
     {
       "source": ".agents/skills/vllm-integration/agents/openai.yaml",
@@ -365,7 +365,7 @@
       "destination": "runtime/readiness_check/run_vllm_server.py",
       "blob": "854a62c6b4caedd64708da951c89c51af96d10d2",
       "source_sha256": "051d45493d4a822da38395f506188f08d46cba981ef1e1e9d7a0a74efd7c291c",
-      "packaged_sha256": "33f374ba55cfa3a26a69d58cfe99735a0eaa51da3e35855955605902fe4dc8fb"
+      "packaged_sha256": "40726d152f5a4713c32d01760b7941521254a8fc9f4801cf06f827b98bcb93db"
     },
     {
       "source": "models/common/readiness_check/schema.py",

@@ -191,3 +191,13 @@ replay at the end of every tracked workload, the admission-pattern evidence for 
 sampling failures, and a same-length generator control for the served qualitative verdict.
 `check_serving_contract.py` reports prose in an `evidence` field as advisory instead of failing on a
 path longer than the filesystem allows.
+
+The stage 10 pass of that trial added: the kernel-family condition on batched-equals-solo bit
+equality (`minimal_matmul` is its own family), the three op facts and the scratch-block contract
+behind the equal-padded-length design, calibration after the kernel-family choice, row pieces
+through the batch dimension for wide batched outputs, one counted sampling pass before a
+penalties-on capture, seeded requests that change sampler mid-request as routing defects, the
+watcher probe over every prepared batched shape, commit hooks before the first device run of a
+commit, and `--output-dir` on the vLLM runner (`run_vllm_server.py`) so a tracked or A/B run does
+not overwrite the gate's `readiness_vllm/` artifacts.
+

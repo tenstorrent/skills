@@ -111,7 +111,9 @@ Return `more-work-needed` when evidence shows one of these:
   not fail; or a greedy divergence after a
   cache hit is recorded as drift without the logit-level comparison that
   separates drift from a cache or position bug;
-- a vLLM stage has no batched-equals-solo prefill evidence or no
+- a vLLM stage has no batched-equals-solo prefill evidence (bit-equal per row
+  for last-token logits and K/V pages, not a PCC bar), the watcher battery did
+  not reach every prepared batched shape, or there is no
   `prefill_burst` comparison against the serial path; in optimized-vLLM the
   burst TTFT ratio misses its gate or single-user latency regressed with
   batched prefill on;

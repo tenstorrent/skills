@@ -1297,9 +1297,15 @@ def _parse_stages(raw: str) -> List[str]:
     return deduped
 
 
-def _main() -> None:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the vLLM server readiness check.")
     parser.add_argument("--model-dir", type=Path, required=True)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory for this run's outputs. Default: <model_dir>/readiness_vllm, the root the stage gates read.",
+    )
     parser.add_argument("--hf-model", type=str, required=True)
     parser.add_argument(
         "--stages",
@@ -1535,7 +1541,15 @@ def _main() -> None:
             "the stage records burst/serial TTFT ratios and whether the workload configs match."
         ),
     )
-    args = parser.parse_args()
+    return parser
+
+
+def resolve_output_dir(model_dir: Path, output_dir: Optional[Path]) -> Path:
+    return (output_dir if output_dir is not None else model_dir / "readiness_vllm").resolve()
+
+
+def _main() -> None:
+    args = _build_parser().parse_args()
 
     stages: List[str] = args.stages
     serve_locally = STAGE_SERVE in stages
@@ -1560,7 +1574,7 @@ def _main() -> None:
     benchmark_temperature = None if args.benchmark_use_server_generation_config else args.benchmark_temperature
 
     model_dir = args.model_dir.resolve()
-    output_dir = model_dir / "readiness_vllm"
+    output_dir = resolve_output_dir(model_dir, args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     server_log = output_dir / "server.log"
     sampling_log = output_dir / "sampling_tests.log"
