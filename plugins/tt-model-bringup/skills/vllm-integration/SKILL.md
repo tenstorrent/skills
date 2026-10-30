@@ -298,7 +298,8 @@ The README should lead with vLLM sampling status, qualitative verdict, primary s
 Validate and record one serving configuration per configured batch size, from
 `bringup/agentic_evals/inputs.json` when set and otherwise 1, 8, 16 and 32. Each is tuned for its
 own batch: the single-user configuration with a larger `--max-num-seqs` is not a tuned batch-16
-configuration and must not be recorded as one.
+configuration and must not be recorded as one. Tune batch 1 first, then the largest batch, then
+any in between.
 
 Record any batch the device cannot hold, with the reason. Later stages measure every validated
 batch and serve each eval on the smallest one at or above its planned clients, so an unrecorded

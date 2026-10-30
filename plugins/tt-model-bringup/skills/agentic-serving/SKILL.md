@@ -29,8 +29,8 @@ default 1, 8, 16 and 32. Every stage that optimizes or measures decode works aga
 one shape. Layouts, sharding and traces chosen for batch 1 alone are often wrong for the largest
 batch, and by the serving stages they are already fixed.
 
-Weight the effort: batch 1 first, then the largest, then the ones between. Batch 1 stays the
-regression row. Record any batch the device cannot hold and why — active users pad up to the next
+Work through the set in order of importance: batch 1 first, then the largest batch the device
+holds, then any in between. Batch 1 stays the regression row. Record any batch the device cannot hold and why — active users pad up to the next
 supported batch, so an omitted batch is served by the one above it.
 
 ## Memory
