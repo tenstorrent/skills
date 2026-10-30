@@ -20778,7 +20778,8 @@ def test_a_waiting_hand_offs_top_level_followups_survive_its_on_pass(env, monkey
     later = {"title": "tidy the parser", "spec": "later"}
     tid, _ = _checks_wait_task(p, tmp_path, {**DONE_ON_PASS, "followups": [later]}, on_pass_cmd=cmd)
     run_dir = tmp_path / f"run-{tid}"
-    hand = {**json.loads((run_dir / "result.json").read_text()), "followups": [note, later]}
+    hand = {**json.loads((run_dir / "result.json").read_text()), "followups": [note, later],
+            "self_check": "ticked each step"}
     (run_dir / "result.json").write_text(json.dumps(hand))
     p.db.update_task(tid, result=json.dumps({**hand, "waiting_since": time.time() - 60}))
     _settle_on_pass(d, tid)
@@ -20787,6 +20788,7 @@ def test_a_waiting_hand_offs_top_level_followups_survive_its_on_pass(env, monkey
     assert task["status"] == "done", (task["status"], task["blocked_reason"], res)
     want = ["own", note["title"], later["title"]] if cmd == WRITES_OWN else [later["title"], note["title"]]
     assert [f["title"] for f in res["followups"]] == want, res["followups"]
+    assert res["self_check"] == "ticked each step", "the waiting hand-off's self_check line is kept"
     filed = [json.loads(x) for x in upstream.path().read_text().splitlines()] if upstream.path().exists() else []
     assert [n["title"] for n in filed if n["task"] == tid] == [note["title"]]
 

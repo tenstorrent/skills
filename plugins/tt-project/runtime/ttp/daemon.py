@@ -13596,9 +13596,16 @@ def on_pass_problem(on_pass) -> str:
 def with_waiting_followups(final: dict, waited: dict) -> dict:
     """The final hand-off (a waiting hand-off's on_pass, or what its on_pass_cmd wrote) with the
     waiting hand-off's own top-level followups added, so they are filed as a normal hand-off's are.
-    One already in `final` (same title and spec) is not added twice."""
-    extra = waited.get("followups") if isinstance(waited, dict) else None
-    if not isinstance(final, dict) or not isinstance(extra, list) or not extra:
+    One already in `final` (same title and spec) is not added twice. The waiting hand-off's
+    `self_check` line is carried over when `final` has none, so review stats still see it."""
+    if not isinstance(final, dict) or not isinstance(waited, dict):
+        return final
+    check = waited.get("self_check")
+    if isinstance(check, str) and check.strip() and not (isinstance(final.get("self_check"), str)
+                                                         and final["self_check"].strip()):
+        final = {**final, "self_check": check}
+    extra = waited.get("followups")
+    if not isinstance(extra, list) or not extra:
         return final
     own = final.get("followups") if isinstance(final.get("followups"), list) else []
     seen = {(f.get("title"), f.get("spec")) for f in own if isinstance(f, dict)}

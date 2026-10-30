@@ -72,13 +72,14 @@ def is_rereview(db: DB, review: dict) -> bool:
 
 def has_self_check(db: DB, review: dict) -> int | None:
     """1 when the hand-off of the task `review` reviews carries a non-empty `self_check` line (or its
-    `on_pass` does), 0 when it carries none, None when the review names no task that exists."""
+    `on_pass` or `metrics` does), 0 when it carries none, None when the review names no task that exists."""
     subject = review_subject(review)
     t = db.task(subject) if subject is not None else None
     if not t:
         return None
     res = load_result(t.get("result"))
-    for got in (res, res.get("on_pass")):
+    on_pass = res.get("on_pass") if isinstance(res.get("on_pass"), dict) else {}
+    for got in (res, on_pass, res.get("metrics"), on_pass.get("metrics")):
         if isinstance(got, dict) and isinstance(got.get("self_check"), str) and got["self_check"].strip():
             return 1
     return 0

@@ -105,6 +105,36 @@ def test_a_re_review_leads_with_the_fix_delta_and_each_review_is_recorded(env):
     assert rep["n"] == 2 and {r["task"] for r in rep["rows"]} == {rev["id"], re_rev["id"]}
 
 
+def test_a_waiting_hand_offs_self_check_reaches_the_final_hand_off_and_metrics_self_check_counts(env):
+    """#4579: a waiting hand-off's top-level self_check survives its on_pass becoming the final
+    hand-off (never over one the on_pass has), and has_self_check also reads metrics.self_check."""
+    from ttp import reviewstats
+    from ttp.daemon import with_waiting_followups
+    done = {"status": "done", "summary": "works"}
+    waited = {"status": "waiting", "self_check": "steps ticked", "on_pass": done}
+    assert with_waiting_followups(done, waited) == {**done, "self_check": "steps ticked"}
+    own = {**done, "self_check": "its own"}
+    assert with_waiting_followups(own, waited) == own, "never overwritten"
+    assert with_waiting_followups({**done, "self_check": " "}, waited)["self_check"] == "steps ticked"
+    for no in ({"status": "waiting"}, {"self_check": " "}, {"self_check": True}, None):
+        assert with_waiting_followups(done, no) == done, no
+    later = {"title": "later", "spec": "x"}
+    assert with_waiting_followups(done, {**waited, "followups": [later]}) == \
+        {**done, "self_check": "steps ticked", "followups": [later]}, "followups still carried too"
+    p = make(env)
+    cases = [({**done, "metrics": {"self_check": "ticked"}}, 1),
+             ({"status": "waiting", "on_pass": {**done, "metrics": {"self_check": "ticked"}}}, 1),
+             ({**done, "metrics": {"self_check": " "}}, 0),
+             ({**done, "metrics": {"self_check": 1}}, 0),
+             ({**done, "metrics": "self_check"}, 0),
+             ({"status": "waiting", "on_pass": "done"}, 0),
+             (done, 0)]
+    for result, want in cases:
+        tid = p.db.add_task("a change", "s", kind="code", tier="standard", origin="user")
+        p.db.update_task(tid, result=json.dumps(result))
+        assert reviewstats.has_self_check(p.db, {"title": f"Review #{tid}: a change"}) == want, result
+
+
 def test_each_review_row_records_whether_the_reviewed_hand_off_carried_a_self_check(env):
     from ttp import audit, reviewstats
     p = make(env)
