@@ -1079,6 +1079,13 @@ def test_code_and_review_prompts_keep_full_suite_runs_to_ttp_checks():
                  "They run again only when the head differs or no pass is recorded",
                  "never rerun the full suite by hand"):
         assert part in review, part
+    review = " ".join((prompts / "kind-review.md").read_text(encoding="utf-8").split())
+    for part in ("never list one as a required member by its hash",
+                 "Queued locally, recorded by the recipient system, and delivered or acknowledged by it",
+                 "no reconstructed bytes"):
+        assert part in review, part
+    coordinator = " ".join((prompts / "coordinator.md").read_text(encoding="utf-8").split())
+    assert "a mutable queue, outbox or growing log" in coordinator
 
 
 def test_the_coordinator_defers_on_a_landing_with_landed_id_not_a_raw_sha():

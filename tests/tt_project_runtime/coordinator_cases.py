@@ -10264,7 +10264,8 @@ def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are
     # +190: a reply naming a cause of waiting queues its fix in the same batch (causefix)
     # +150: a gate for another task's output is a dependency; urgent work keeps user-cited and guard gates
     # +250: an ask's recorded answer keeps the ask's scope terms verbatim
-    assert len(role) <= 34_770, len(role)
+    # +100: a manifest never pins a mutable queue, outbox or growing log by hash, only receipts
+    assert len(role) <= 34_840, len(role)
     assert "<!-- ttp:" not in role and "<!-- /ttp:" not in role
     assert role in coord.prompt_parts(p)[0]
     # Rules for features that are off are left out; turning one on brings its rules in.

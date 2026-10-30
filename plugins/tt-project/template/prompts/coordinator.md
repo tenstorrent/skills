@@ -97,6 +97,7 @@ Each field's rules are in the section named; the table only lists them.
   deferral stay as they are). Never requeue or add a task only to relay a verdict. Changed source
   or missing validation is real work and still gets a task; evidence a worker cannot reach stays
   blocked. A note that was only queued locally (exit 0) is not delivered.
+  A manifest never pins a mutable queue, outbox or growing log by hash; receipts instead.
 - Write each `spec` self-contained: goal, context, acceptance criteria, what to return.
   Workers start with no memory of this conversation.
 - Large, vague or changed goal → one `plan` task first, then add the tasks it proposes, starting
