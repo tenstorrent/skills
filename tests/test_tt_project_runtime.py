@@ -32808,12 +32808,14 @@ def test_the_global_daily_total_counts_another_machine_fresh_and_then_stale(env,
     assert t["usd"] == 50.0 and t["stale"] == [] and t["remote_projects"] == 1, t
     gcap.refresh(start, end, now + 60)
     assert asked == ["box2"], "asked again before REFRESH_S"
-    # The machine stops answering: its last total still counts, marked stale.
+    # The machine stops answering: its last total is shown with what it adds, marked stale, and
+    # never counted: stale data alone never trips the cap.
     monkeypatch.setattr(gcap, "fetch", lambda *a: (_ for _ in ()).throw(RuntimeError("ssh: timed out")))
     later = now + gcap.REFRESH_S + 1
     gcap.refresh(start, end, later)
     t = gcap.total(p.db, "claude", start, end, later, account="acct-a")
-    assert t["usd"] == 50.0 and t["stale"] == ["box2"] and "(1 stale)" in t["includes"], t
+    assert t["usd"] == 0 and t["stale_usd"] == 50.0 and t["stale"] == ["box2"] and "(1 stale)" in t["includes"], t
+    assert "not counted: $50.00 stale: box2 $50.00" in t["includes"], t
     # An old answer is stale too; one from another budget day does not count.
     monkeypatch.setattr(gcap, "fetch", fetch)
     gcap.refresh(start, end, later, force=True)
@@ -33037,10 +33039,10 @@ def test_a_pushed_number_counts_in_the_global_total_and_goes_stale(env, monkeypa
     gcap.receive(_spend_record("laptop", [(start, end, 40.0)]), "lap", now)
     t = gcap.total(p.db, "claude", start, end, now + 60, account="acct-a")
     assert t["usd"] == 41.0 and t["machines"] == ["lap"] and t["stale"] == [] and t["remote_projects"] == 1, t
-    # Past STALE_S: a budget day keeps counting the last pushed number, shown stale.
+    # Past STALE_S: a budget day keeps the last pushed number, shown stale and never counted.
     later = now + gcap.STALE_S + 1
     t = gcap.total(p.db, "claude", start, end, later, account="acct-a")
-    assert t["usd"] == 41.0 and t["stale"] == ["lap"] and "(1 stale)" in t["includes"], t
+    assert t["usd"] == 1.0 and t["stale_usd"] == 40.0 and t["stale"] == ["lap"] and "(1 stale)" in t["includes"], t
     # The rolling 24 h counts it only while it is fresh, like a pulled answer.
     rs, re_ = now - 86400, now + 86400
     gcap.receive(_spend_record("laptop", [(rs, re_, 7.0)]), "lap", now)
@@ -33087,7 +33089,7 @@ def _with_sessions(record, usd, account="acct-a", unknown=False):
     from ttp import globalcap as gcap
     rec = json.loads(record)
     field = None if unknown else {"provider": "claude", "key": gcap.account_key("claude", account), "usd": usd,
-                                  "sessions": 2, "estimated": True}
+                                  "sessions": 2, "estimated": True, "billing": "usage"}
     for w in rec["windows"]:
         w[gcap.SESSIONS] = field
     return (json.dumps(rec) + "\n").encode()
@@ -33107,7 +33109,8 @@ def test_each_machines_other_sessions_count_once_pulled_pushed_or_both(env, monk
 
     def answer(usd, sessions):
         return {"host": "box2", "projects": ["far"], "rows": [{"provider": "claude", "key": key, "usd": usd}],
-                gcap.SESSIONS: {"provider": "claude", "key": key, "usd": sessions, "sessions": 3, "estimated": True}}
+                gcap.SESSIONS: {"provider": "claude", "key": key, "usd": sessions, "sessions": 3, "estimated": True,
+                                "billing": "usage"}}
     # Pulled only.
     monkeypatch.setattr(gcap, "fetch", lambda t, s, e: answer(50.0, 5.0))
     gcap.refresh(start, end, now)
@@ -33956,10 +33959,14 @@ def test_a_coordinator_turn_lost_to_the_network_is_not_a_failed_turn(env, net, m
 
 
 # other Claude Code sessions on this machine (estimated from the local logs) ----------------------
-def _claude_logs(tmp_path, monkeypatch):
+def _claude_logs(tmp_path, monkeypatch, login=None):
+    """A Claude Code config folder with logs; its login is an API key (billed per use) unless
+    `login` gives the .claude.json to write instead."""
     root = tmp_path / "claude-config"
     (root / "projects").mkdir(parents=True)
+    (root / ".claude.json").write_text(json.dumps({"primaryApiKey": "test-key"} if login is None else login))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(root))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     return root / "projects"
 
 
@@ -34042,7 +34049,7 @@ def test_other_local_sessions_count_each_call_once_and_leave_out_tt_project_runs
     assert cache["ok"], cache
     start, end = gcap.day_bounds(b, now)
     e = ls.estimate(b, start, end, now)
-    assert e == {"usd": 15 + 3, "sessions": 1, "estimated": False, "unknown": []}, e
+    assert e == {"usd": 15 + 3, "sessions": 1, "estimated": False, "unknown": [], "billing": "usage"}, e
     # The cache file holds no prompts or text, only ids, offsets and sums.
     assert "content" not in ls.cache_path().read_text()
 

@@ -22,19 +22,24 @@ The global total for a provider counts, for this day:
   server but not the other way round): they push their own `spend-today` answers over ssh into
   `ttp spend-today --receive` here (push, receive). Pushed answers are kept per machine and window
   in ~/.tt-project/global-spend-pushed.json and count like pulled ones: aged by when they arrived,
-  stale past STALE_S. A machine both pulled and pushed counts once, with its freshest answer;
+  stale past STALE_S. A machine both pulled and pushed counts once, with its freshest answer.
+  A stale machine's number never counts toward the cap: it is shown apart (`stale_usd`) with what
+  it would add, so data that could not be refreshed alone never trips the cap;
 - each other machine's own other Claude Code sessions: every answer, pulled or pushed, carries the
-  sending machine's estimate of them (localspend) as `other_sessions`, beside its projects' rows. It
-  counts once per machine with that machine's answer, so never twice. An answer from an older
-  tt-project has no such field: it counts 0 for them and the total says those machines' sessions are
-  not in it;
+  sending machine's estimate of them (localspend) as `other_sessions`, beside its projects' rows,
+  with how that machine's Claude Code login is billed (`billing`). It counts once per machine with
+  that machine's answer, so never twice. An answer from an older tt-project has no such field: it
+  counts 0 for them and the total says those machines' sessions are not in it;
 - other spend sources registered with `add_other_source` (a hook for spend outside tt-project, e.g.
   the user's own sessions; localspend adds this machine's other Claude Code sessions).
 
 Only spend on the same provider and the same account counts: a Codex project, or a project logged
 in to another account, is not billed with this one. Rows with no account recorded count (fail safe).
 Only billed spend counts (billing.py): spend a plan paid for, e.g. before a switch to usage billing,
-stays out, as it does for the project caps.
+stays out, as it does for the project caps. The same holds for list-price estimates of sessions
+outside tt-project: they count only from a login billed per use (an API key or a usage-based seat).
+A subscription plan login's sessions are metered by its plan windows and shown apart (`plan_usd`);
+a login whose billing cannot be told is shown apart as estimated, not billed (`unbilled_usd`).
 
 The settings live in the account-level file ~/.tt-project/settings.json (`ttp config --account KEY
 VALUE`), which every project on the machine reads; a project's own project.json may override them.
@@ -78,14 +83,16 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@+-]{0,79}$")
 PROVIDER_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 KEY_RE = re.compile(r"^[0-9a-f]{16}$")
 SESSIONS = "other_sessions"   # an answer's field: the machine's other Claude Code sessions, estimated
+BILLING = ("usage", "plan", "unknown")   # how a source is billed: per use, by a plan, cannot be told
 
-# Extra spend sources: fn(provider, account, start, end) -> (usd, label). Each adds its dollars to the
-# global total and its label to what the total says it includes. A source that fails is left out and
-# named in the total's errors.
-OTHER_SOURCES: list[Callable[[str, str, float, float], tuple[float, str]]] = []
+# Extra spend sources: fn(provider, account, start, end) -> (usd, label) or (usd, label, billing). A
+# 'usage' one (the default) adds its dollars to the global total and its label to what the total
+# says it includes; a 'plan' or 'unknown' one is shown apart and never counted. A source that fails
+# is left out and named in the total's errors.
+OTHER_SOURCES: list[Callable[[str, str, float, float], tuple]] = []
 
 
-def add_other_source(fn: Callable[[str, str, float, float], tuple[float, str]]) -> None:
+def add_other_source(fn: Callable[[str, str, float, float], tuple]) -> None:
     if fn not in OTHER_SOURCES:
         OTHER_SOURCES.append(fn)
 
@@ -261,13 +268,15 @@ def _sessions_ok(x) -> bool:
     return x is None or (isinstance(x, dict) and isinstance(x.get("provider"), str) and PROVIDER_RE.match(x["provider"])
                          and isinstance(x.get("key"), str) and KEY_RE.match(x["key"])
                          and _num(x.get("usd")) and 0 <= x["usd"] < 1e6
-                         and (x.get("sessions") is None or _num(x["sessions"]) and 0 <= x["sessions"] < 1e6))
+                         and (x.get("sessions") is None or _num(x["sessions"]) and 0 <= x["sessions"] < 1e6)
+                         and x.get("billing", "unknown") in BILLING)
 
 
 def _sessions(x) -> dict | None:
     """A checked SESSIONS value, as kept."""
     return None if x is None else {"provider": x["provider"], "key": x["key"], "usd": float(x["usd"]),
-                                   "sessions": int(x.get("sessions") or 0), "estimated": True}
+                                   "sessions": int(x.get("sessions") or 0), "estimated": True,
+                                   "billing": x.get("billing") or "unknown"}
 
 
 # other machines ---------------------------------------------------------------------------------
@@ -654,14 +663,17 @@ def total(db, provider: str, start: float, end: float, now: float | None = None,
     machine's other projects, the other machines (cached or pushed here, stale ones counted) and other
     sources.
     For a budget day a machine's answer counts when it is for the same day, however old. For the
-    rolling 24 h (`rolling`) it counts while it was read within STALE_S, even if the last try failed;
+    rolling 24 h (`rolling`) it is used while it was read within STALE_S, even if the last try failed;
     an older one covers another window and is only named stale. A machine is stale when its last try
-    failed or its answer for this window is missing or older than STALE_S.
+    failed or its answer for this window is missing or older than STALE_S; a stale machine's number
+    goes to `stale_usd`, never to `usd`.
     Each other machine's answer also brings its own other Claude Code sessions (SESSIONS), counted
-    with that answer: `remote_sessions_usd` is their sum, `sessions_missing` names the machines whose
-    counted answer says nothing of them (an older tt-project) or has them unknown.
+    with that answer when its login is billed per use: `remote_sessions_usd` is their sum,
+    `sessions_missing` names the machines whose answer says nothing of them (an older tt-project) or
+    has them unknown. Sessions of a plan login go to `plan_usd`, of a login that cannot be told to
+    `unbilled_usd`; neither counts.
     `usd` is the total; `stale` names the machines whose number is stale; `includes` says what it
-    counts, in words."""
+    counts and what it leaves out, in words."""
     now = now or time.time()
     account = account_of(provider) if account is None else account
     own = Path(db.path).resolve()
@@ -671,6 +683,8 @@ def total(db, provider: str, start: float, end: float, now: float | None = None,
     usd += sum(r["usd"] for r in here["rows"] if _matches(r, provider, account))
     stale, errors, hosts, seen = [], list(here["errors"]), [], {project.hostname()}
     remote_projects, remote_sessions, n_sessions, missing = 0, 0.0, 0, []
+    apart = {"plan": [0.0, []], "unknown": [0.0, []]}   # by billing: dollars and where, not counted
+    stale_usd, stale_named = 0.0, []
     cache = load_cache().get("machines") or {}
     pushed = load_pushed(now)
     key = _key(start, end)
@@ -692,30 +706,47 @@ def total(db, provider: str, start: float, end: float, now: float | None = None,
         age = now - float(w.get("ts") or 0)
         if host in seen:
             continue
-        if not (ok and age <= STALE_S):
+        fresh = ok and age <= STALE_S
+        if not fresh:
             stale.append(name)
         if w.get("rows") is not None and (age <= STALE_S or not rolling):   # a failed try keeps it
-            usd += sum(float(r.get("usd") or 0) for r in w["rows"] if isinstance(r, dict) and _matches(r, provider, account))
+            add = sum(float(r.get("usd") or 0) for r in w["rows"] if isinstance(r, dict) and _matches(r, provider, account))
             remote_projects += len(w.get("projects") or [])
-            o = w.get(SESSIONS)
+            o, more = w.get(SESSIONS), 0.0
             if isinstance(o, dict) and _sessions_ok(o):
                 if _matches(o, provider, account):
-                    remote_sessions += o["usd"]
-                    n_sessions += 1
+                    how = o.get("billing") or "unknown"
+                    if how == "usage":
+                        more = o["usd"]
+                        n_sessions += fresh
+                    elif o["usd"] > 0:
+                        apart[how][0] += o["usd"]
+                        apart[how][1].append(name)
             elif provider == "claude":       # an older tt-project there, or its logs not read yet
                 missing.append(name)
+            if fresh:
+                usd += add
+                remote_sessions += more
+            elif add + more > 0:             # shown with what it would add, never counted
+                stale_usd += add + more
+                stale_named.append(f"{name} {money(add + more)}")
         seen.add(host or name)
         hosts.append(name)
     others = []
     for fn in OTHER_SOURCES:
         try:
-            more, label = fn(provider, account, start, end)
+            got = fn(provider, account, start, end)
+            more, label, how = float(got[0] or 0), got[1], (got[2] if len(got) > 2 else "usage")
         except Exception as e:
             errors.append(f"other source: {e}")
             continue
-        usd += float(more or 0)
-        if label:
-            others.append(label)
+        if how == "usage":
+            usd += more
+            if label:
+                others.append(label)
+        elif how in apart and more > 0:
+            apart[how][0] += more
+            apart[how][1].append("this machine")
     n_local = 1 + len(here["projects"])
     includes = (f"{provider} spend on this account by {n_local} tt-project project{'s' if n_local != 1 else ''} "
                 f"on this machine")
@@ -733,9 +764,30 @@ def total(db, provider: str, start: float, end: float, now: float | None = None,
         gap = (f"other Claude Code sessions on {', '.join(missing)} (an older tt-project there, or its logs "
                f"not read yet), " if missing else "")
         includes += f"; not {gap}sessions on machines without tt-project, nor web, desktop or cloud sessions"
+    apart_out = []
+    if apart["plan"][0]:
+        apart_out.append(f"{money(apart['plan'][0])} subscription-plan sessions on {', '.join(apart['plan'][1])} "
+                         f"(list price; metered by the plan's 5h and 7d windows, not billed per use)")
+    if apart["unknown"][0]:
+        apart_out.append(f"{money(apart['unknown'][0])} estimated, not billed: sessions on "
+                         f"{', '.join(apart['unknown'][1])} whose billing is unknown")
+    if stale_named:
+        apart_out.append(f"{money(stale_usd)} stale: {', '.join(stale_named)}")
+    if apart_out:
+        includes += "; not counted: " + "; ".join(apart_out)
     return {"usd": round(usd, 4), "stale": stale, "machines": hosts, "local_projects": n_local,
             "remote_projects": remote_projects, "remote_sessions_usd": round(remote_sessions, 4),
-            "sessions_missing": missing, "errors": errors, "includes": includes}
+            "plan_usd": round(apart["plan"][0], 4), "unbilled_usd": round(apart["unknown"][0], 4),
+            "stale_usd": round(stale_usd, 4), "sessions_missing": missing, "errors": errors, "includes": includes}
+
+
+def uncounted(n: dict) -> str:
+    """The short 'not counted' part of a budget line, from a gate's numbers (budget._global): spend
+    shown beside the global total but never in it. Empty when there is none."""
+    parts = [f"{money(float(n[k]))} {w}" for k, w in (("global_plan_usd", "subscription plan"),
+                                                      ("global_unbilled_usd", "estimated, not billed"),
+                                                      ("global_stale_usd", "stale")) if n.get(k)]
+    return f"; not counted: {', '.join(parts)}" if parts else ""
 
 
 def money(usd: float) -> str:

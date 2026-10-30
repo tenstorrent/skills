@@ -414,7 +414,8 @@ def _global(db: DB, g: Gate, b: dict, provider: str, day: tuple[float, float] | 
         return
     t = {**t, "usd": t["usd"] + extra}   # paid-credit spend past a plan window counts too
     g.numbers.update({"global_today": round(t["usd"], 2), "global_cap": cap, "global_stale": t["stale"],
-                      "global_includes": t["includes"], "global_resets_at": end if day else None})
+                      "global_includes": t["includes"], "global_resets_at": end if day else None,
+                      **{f"global_{k}": round(t.get(k) or 0, 2) for k in ("plan_usd", "unbilled_usd", "stale_usd")}})
     if t["usd"] >= cap:
         when = f"; new work resumes at the reset in {max(end - now, 0) / HOUR:.1f} h" if day else ""
         stale = f" ({len(t['stale'])} machine{'s' if len(t['stale']) != 1 else ''} stale)" if t["stale"] else ""

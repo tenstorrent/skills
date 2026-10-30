@@ -11,9 +11,18 @@ request id), and the '<synthetic>' model (no API call) not at all. Calls are pri
 into the budget day (budget.day_start in budget.timezone; without a day_start, by the hour).
 
 Every local tt-project project's runs are left out by their session id (each project's database,
-opened read-only): the claude provider gives each run its id before it starts, so a run still going
-is never counted as other spend. Nothing else is left out: sessions that workers start themselves
-are real spend no ledger books.
+opened read-only), whatever their provider: a provider that drives Claude Code against another
+model's endpoint writes the same logs, and its spend is booked (or not billed here) by its own
+provider. The claude provider gives each run its id before it starts, so a run still going is never
+counted as other spend. Calls to a model that is not a Claude model are never Anthropic spend and
+are skipped. Nothing else is left out: sessions that workers start themselves are real spend no
+ledger books.
+
+Whether the estimate counts toward the global dollar cap depends on how this machine's Claude Code
+login is billed (billing_mode, read from its login state, never from a machine name): an API key or
+a usage-based seat is billed per use and counts; a subscription plan login is metered by its plan
+windows (5h, 7d), never in dollars, and is only shown; a login that cannot be told is shown as
+estimated, not billed.
 
 The scan is incremental: the daemon lists the folders every SCAN_S, skips files untouched since
 before the days it keeps, and reads each file only from where it stopped, up to the last complete
@@ -73,6 +82,7 @@ SYNTHETIC = "<synthetic>"    # written by Claude Code itself, no API call
 
 SCAN_S = 300                 # the daemon scans this often
 SLACK_S = 3600               # files untouched this long before the kept days are skipped
+PLAN_WORDS = ("max", "pro", "team", "enterprise", "subscription")   # a plan login's subscription words
 KEEP_S = 2 * gcap.DAY        # calls are kept (and deduplicated) this far back from the current day
 MEMO_S = 30                  # one process reads the estimate again after this long
 DRIFT = 0.01                 # the price table is stale once it is this far off Claude Code's own cost
@@ -178,6 +188,38 @@ def _ts(s: str) -> float | None:
         return None
 
 
+def _json_file(path: Path) -> dict:
+    try:
+        got = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def billing_mode(env=None) -> str:
+    """How this machine's Claude Code login is billed, from its login state: 'usage' (an API key, or
+    a usage-based seat: every call billed per use), 'plan' (a subscription plan login: metered by
+    its plan windows, not in dollars) or 'unknown'. Read from <CLAUDE_CONFIG_DIR>/.claude.json (else
+    ~/.claude.json), the config folder's settings.json and .credentials.json; never a secret's value."""
+    env = os.environ if env is None else env
+    folder = Path(env["CLAUDE_CONFIG_DIR"]) if env.get("CLAUDE_CONFIG_DIR") else None
+    state = _json_file(folder / ".claude.json" if folder else Path.home() / ".claude.json")
+    folder = folder or Path.home() / ".claude"
+    settings = _json_file(folder / "settings.json")
+    senv = settings.get("env") if isinstance(settings.get("env"), dict) else {}
+    if (env.get("ANTHROPIC_API_KEY") or senv.get("ANTHROPIC_API_KEY") or settings.get("apiKeyHelper")
+            or state.get("primaryApiKey")):
+        return "usage"
+    acct = state.get("oauthAccount") if isinstance(state.get("oauthAccount"), dict) else {}
+    oauth = _json_file(folder / ".credentials.json").get("claudeAiOauth")
+    oauth = oauth if isinstance(oauth, dict) else {}
+    if "usage" in str(acct.get("seatTier") or "").lower():
+        return "usage"
+    words = " ".join(str(x) for x in (oauth.get("subscriptionType"), acct.get("organizationType"),
+                                      acct.get("billingType")) if x).lower()
+    return "plan" if (acct or oauth) and any(w in words for w in PLAN_WORDS) else "unknown"
+
+
 def calls(lines) -> "list[dict]":
     """The assistant records with usage in `lines` (bytes): {ts, key, session, model, usage}."""
     out = []
@@ -194,8 +236,8 @@ def calls(lines) -> "list[dict]":
         usage = msg.get("usage")
         model = str(msg.get("model") or "")
         ts = _ts(rec.get("timestamp"))
-        if not isinstance(usage, dict) or model == SYNTHETIC or ts is None:
-            continue
+        if not isinstance(usage, dict) or model == SYNTHETIC or "claude" not in model.lower() or ts is None:
+            continue   # no API call ('<synthetic>'), or another vendor's model: not Anthropic spend
         ident = f"{msg.get('id') or ''}\0{rec.get('requestId') or ''}"
         if ident == "\0":
             ident = str(rec.get("uuid") or line)
@@ -255,8 +297,8 @@ def scan(budget: dict, now: float | None = None, root: Path | None = None) -> di
         except OSError:
             return load()
         cache = load()
-        fresh = {"v": 1, "mode": mode(budget), "root": str(root), "files": {}, "buckets": {}}
-        if not (cache.get("v") == 1 and cache.get("mode") == fresh["mode"] and cache.get("root") == str(root)
+        fresh = {"v": 2, "mode": mode(budget), "root": str(root), "files": {}, "buckets": {}}
+        if not (cache.get("v") == 2 and cache.get("mode") == fresh["mode"] and cache.get("root") == str(root)
                 and isinstance(cache.get("files"), dict) and isinstance(cache.get("buckets"), dict)):
             cache = {**fresh, "calibration": cache.get("calibration") or []}
         keep_from = bucket(budget, now) - KEEP_S
@@ -353,8 +395,8 @@ def _init_session(output: Path) -> str:
 
 
 def tt_sessions(since: float) -> tuple[set[str], list[str]]:
-    """Session ids of every local tt-project project's claude runs going or ended since `since`
-    (each database opened read-only), and the projects that could not be read."""
+    """Session ids of every local tt-project project's runs, of any provider, going or ended since
+    `since` (each database opened read-only), and the projects that could not be read."""
     ids, errors = set(), []
     for name, db in gcap.local_projects():
         try:
@@ -366,7 +408,7 @@ def tt_sessions(since: float) -> tuple[set[str], list[str]]:
             cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
             sel = "session_id" if "session_id" in cols else "NULL"
             for rid, sid, note in conn.execute(
-                    f"SELECT id, {sel}, note FROM runs WHERE provider='claude' AND (ended IS NULL OR ended>=?)",
+                    f"SELECT id, {sel}, note FROM runs WHERE ended IS NULL OR ended>=?",
                     (since,)):
                 try:
                     noted = (json.loads(note or "{}") or {}).get("session_id")
@@ -388,8 +430,8 @@ _MEMO: dict[tuple, tuple[float, dict | None]] = {}
 
 
 def estimate(budget: dict, start: float, end: float, now: float | None = None) -> dict | None:
-    """Other Claude Code spend on this machine in [start, end): {usd, sessions, estimated, unknown},
-    or None when it is unknown (no scan yet, or the logs could not be read)."""
+    """Other Claude Code spend on this machine in [start, end): {usd, sessions, estimated, unknown,
+    billing (billing_mode)}, or None when it is unknown (no scan yet, or the logs could not be read)."""
     now = now or time.time()
     key = (str(project.HOME_DIR), start, end, mode(budget))
     hit = _MEMO.get(key)
@@ -397,7 +439,7 @@ def estimate(budget: dict, start: float, end: float, now: float | None = None) -
         return hit[1]
     c = load()
     out = None
-    if c.get("ok") and c.get("mode") == mode(budget) and now - float(c.get("scanned") or 0) < 4 * SCAN_S:
+    if c.get("ok") and c.get("v") == 2 and c.get("mode") == mode(budget) and now - float(c.get("scanned") or 0) < 4 * SCAN_S:
         mine, _ = tt_sessions(start - SLACK_S)
         lo = bucket(budget, start)
         usd, n, est, unknown = 0.0, set(), False, set()
@@ -411,21 +453,23 @@ def estimate(budget: dict, start: float, end: float, now: float | None = None) -
                 n.add(sid)
                 est = est or bool(flag)
             unknown |= set(b.get("unknown") or [])
-        out = {"usd": round(usd, 4), "sessions": len(n), "estimated": est, "unknown": sorted(unknown)}
+        out = {"usd": round(usd, 4), "sessions": len(n), "estimated": est, "unknown": sorted(unknown),
+               "billing": billing_mode()}
     _MEMO[key] = (now, out)
     return out
 
 
-def source(provider: str, account: str, start: float, end: float) -> tuple[float, str]:
-    """globalcap's other-spend source: this machine's other Claude Code sessions."""
+def source(provider: str, account: str, start: float, end: float) -> tuple[float, str, str]:
+    """globalcap's other-spend source: this machine's other Claude Code sessions, with how they are
+    billed (globalcap counts only 'usage' toward the cap)."""
     if provider != "claude":
-        return 0.0, ""
+        return 0.0, "", "usage"
     e = estimate(account_budget(), start, end)
     if e is None:
-        return 0.0, "other Claude Code sessions on this machine (unknown: the local logs are not read yet)"
+        return 0.0, "other Claude Code sessions on this machine (unknown: the local logs are not read yet)", "usage"
     flag = ", some at a guessed price" if e["estimated"] else ""
     return e["usd"], (f"other Claude Code sessions on this machine ({gcap.money(e['usd'])}, estimated from local "
-                      f"logs at list prices{flag})")
+                      f"logs at list prices{flag})"), e.get("billing") or billing_mode()
 
 
 gcap.add_other_source(source)
@@ -434,12 +478,13 @@ gcap.add_other_source(source)
 def field(start: float, end: float, now: float | None = None) -> dict | None:
     """What `ttp spend-today` tells other machines about this machine's other Claude Code sessions in
     [start, end) (globalcap.answer): the estimate with this machine's account key, so a machine on
-    another account leaves it out, or None while it is unknown."""
+    another account leaves it out, and how this machine's login is billed, or None while it is
+    unknown."""
     e = estimate(account_budget(), start, end, now)
     if e is None:
         return None
     return {"provider": "claude", "key": gcap.account_key("claude", gcap.account_of("claude")),
-            "usd": e["usd"], "sessions": e["sessions"], "estimated": True}
+            "usd": e["usd"], "sessions": e["sessions"], "estimated": True, "billing": e.get("billing") or billing_mode()}
 
 
 # calibration ------------------------------------------------------------------------------------

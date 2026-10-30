@@ -251,13 +251,15 @@ def _label(window: str) -> str:
 
 def usage_line(n: dict, now: float) -> str:
     """The one budget line of a usage-billed account, from its gate's numbers:
-    'today $1.20 this project, $85 of $200 global - resets in 6.5 h (1 machine stale)'.
+    'today $1.20 this project, $85 of $200 global; not counted: $96 subscription plan, $3 stale - resets
+    in 6.5 h (1 machine stale)'.
     'Today' is the budget day (budget.day_start in budget.timezone), else the last 24 h; the global
     part is left out when budget.global_daily_usd is 0."""
     mine = n["spent_today"] if "spent_today" in n else n.get("spent_24h", 0)
     line = f"{'today' if 'spent_today' in n else '24h'} {gcap.money(mine)} this project"
     if "global_today" in n:
         line += f", {gcap.money(n['global_today'])} of ${float(n.get('global_cap') or 0):.0f} global"
+        line += gcap.uncounted(n)
     end = n.get("day_end") or n.get("global_resets_at")
     if end:
         line += f" - resets in {max(end - now, 0) / 3600:.1f} h"

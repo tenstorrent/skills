@@ -2322,7 +2322,8 @@ def test_the_rolling_global_window_asks_each_machine_once_per_refresh_and_keeps_
         assert g.numbers["global_today"] == 50.0, (now - t0, g.numbers)
         assert len(gcap._LOCAL) <= 1, len(gcap._LOCAL)
     assert len(asked) == 2 and len({s for _, s in asked}) == 2, asked   # one per REFRESH_S
-    # One failed ssh try keeps the last answer counted while it is within STALE_S, named stale.
+    # One failed ssh try keeps the last answer while it is within STALE_S: named stale, shown with what
+    # it adds, never counted.
     def down(t, s, e):
         raise RuntimeError("ssh timed out")
     monkeypatch.setattr(gcap, "fetch", down)
@@ -2332,8 +2333,9 @@ def test_the_rolling_global_window_asks_each_machine_once_per_refresh_and_keeps_
     assert m["ok"] is False and later - m["ts"] <= gcap.STALE_S, m
     start, end, rolling = gcap.window(b, later)
     t = gcap.total(p.db, "claude", start, end, later, rolling=rolling)
-    assert rolling and t["stale"] == ["box2"] and t["usd"] == 50.0, t
-    assert bud.evaluate(p.db, p.config(), "claude", [], later).numbers["global_today"] == 50.0
+    assert rolling and t["stale"] == ["box2"] and t["usd"] == 0 and t["stale_usd"] == 50.0, t
+    n = bud.evaluate(p.db, p.config(), "claude", [], later).numbers
+    assert n["global_today"] == 0 and n["global_stale_usd"] == 50.0, n
     # A rolling answer older than STALE_S covers another window: named stale, not counted.
     start, end, rolling = gcap.window(b, ticks[-1] + gcap.STALE_S + 60)
     t = gcap.total(p.db, "claude", start, end, ticks[-1] + gcap.STALE_S + 60, rolling=rolling)
@@ -2349,14 +2351,14 @@ def test_spend_today_and_the_push_carry_this_machines_other_sessions(env, tmp_pa
     from ttp import upstream
     from ttp.cli import main
     from ttp.project import register
-    est = {"usd": 4.25, "sessions": 2, "estimated": False, "unknown": []}
+    est = {"usd": 4.25, "sessions": 2, "estimated": False, "unknown": [], "billing": "usage"}
     monkeypatch.setattr(ls, "estimate", lambda b, s, e, now=None: est)
     monkeypatch.setattr(gcap, "account_of", lambda prov: "acct-a")
     now = time.time()
     main(["spend-today", "--since", str(now - 60), "--until", str(now + 60), "--json"])
     out = json.loads(capsys.readouterr().out)
     assert out[gcap.SESSIONS] == {"provider": "claude", "key": gcap.account_key("claude", "acct-a"), "usd": 4.25,
-                                  "sessions": 2, "estimated": True}, out
+                                  "sessions": 2, "estimated": True, "billing": "usage"}, out
     main(["spend-today", "--since", str(now - 60), "--until", str(now + 60)])
     assert "other Claude Code sessions $4.25 (estimated)" in capsys.readouterr().out
     # The push carries it in every window, and the receiver counts and labels it.
@@ -2753,8 +2755,8 @@ def test_no_local_logs_leave_the_estimate_unknown_and_the_gate_alone(env, tmp_pa
     assert ls.scan(b, now)["ok"] is False
     day = __import__("ttp.globalcap", fromlist=["day_bounds"]).day_bounds(b, now) or (now - 86400, now)
     assert ls.estimate(b, day[0], day[1], now) is None
-    assert ls.source("claude", "", now - 60, now) == (0.0, ls.source("claude", "", now - 60, now)[1])
-    assert "unknown" in ls.source("claude", "", now - 60, now)[1] and ls.source("codex", "", 0, now) == (0.0, "")
+    assert ls.source("claude", "", now - 60, now) == (0.0, ls.source("claude", "", now - 60, now)[1], "usage")
+    assert "unknown" in ls.source("claude", "", now - 60, now)[1] and ls.source("codex", "", 0, now)[:2] == (0.0, "")
     g = bud.evaluate(p.db, p.config(), "claude", [], now)
     assert g.level == "green" and g.numbers["global_today"] == 0, (g.level, g.reasons, g.numbers)
     assert "other Claude Code sessions on this machine (unknown" in g.numbers["global_includes"]
