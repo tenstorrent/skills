@@ -4,7 +4,9 @@
 
 A time-limited step for the user (a sign-in link, a device code) lapses unused when it reaches them
 asleep. Before starting one, a task asks `ttp hours --check`: outside the usual hours it hands off
-waiting until the next window instead.
+waiting until the next window instead. A step with a deadline of minutes (an MCP sign-in link) also
+needs the user at the keyboard: `--present M` passes only if they wrote in the chat in the last M
+minutes (`presence`), so the step waits for them to come back instead of going out on a timer.
 
 The hours come only from data, never from fixed defaults: each (day, hour) in the project's home zone
 in which the user sent a message over the last DAYS days counts once, so a burst of messages counts
@@ -40,6 +42,31 @@ def user_times(db_path: Path, since: float) -> list[float]:
         return [r[0] for r in con.execute(USER_SQL, (since,))]
     finally:
         con.close()
+
+
+def last_user_time(db_path: Path) -> float | None:
+    """When the user last wrote in the project's chat (any time back), read-only; None if never."""
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+    try:
+        return con.execute(USER_SQL.replace("SELECT ts", "SELECT MAX(ts)", 1), (0,)).fetchone()[0]
+    finally:
+        con.close()
+
+
+def presence(last: float | None, zone: str, minutes: float, now: float | None = None) -> dict:
+    """Whether the user wrote within the last `minutes` (their last message at `last`), and one line
+    saying when they last wrote, in the home zone with its abbreviation."""
+    now = time.time() if now is None else now
+    ok = last is not None and now - last <= minutes * 60
+    if last is None:
+        text = "the user has not written in the chat yet"
+    else:
+        ago = max(0.0, now - last) / 60
+        ago_s = f"{ago:.0f} min ago" if ago < 120 else f"{ago / 60:.0f} h ago"
+        text = f"the user last wrote in the chat {timefmt.short(last, zone, now)} ({ago_s})"
+    text += (f", within the last {minutes:g} min: present" if ok
+             else f", not within the last {minutes:g} min: wait until they write")
+    return {"minutes": minutes, "last": last, "ok": ok, "text": f"ttp hours: {text}"}
 
 
 def quiet_hours(counts: list[int]) -> list[int]:

@@ -54,8 +54,9 @@ box.py agents editor-defaults --run                  # on the machine the editor
   an MCP sign-in, at most 5 min for Claude Code's: it stops listening for the callback then), so
   send it only while the user is likely there. In a tt-project run, first
   `ttp hours --check --for 1800`: it reads their usual active hours from the times of their own
-  messages (none yet: now). Exit 1: do not start it; hand off `waiting` with that command as
-  `retry_when`. The output names when the link works until, in the user's home zone: pass that on.
+  messages (none yet: now). A link that lapses within 10 min (Claude Code's) also needs
+  `--present 10`: the user wrote in the chat in the last 10 min. Exit 1: do not start it or send
+  it on a timer; hand off `waiting` with that command as `retry_when`. The output names when the link works until, in the user's home zone: pass that on.
 - gh: a distro's packaged gh can be too old for a newer `hosts.yml`; install it from GitHub's own
   apt repository. Its login is the user's (`gh auth login`, a code in their browser).
 

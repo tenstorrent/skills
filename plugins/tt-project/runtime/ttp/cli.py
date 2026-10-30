@@ -4496,7 +4496,8 @@ def cmd_hours(a) -> None:
     """`ttp hours`: the user's usual active hours, from the times of their own messages over the last
     days in the project's home zone (hours.py). Before starting a time-limited step for the user (a
     sign-in link, a device code), `--check` exits 0 when now is a good time (inside them, or no pattern
-    yet), 1 when not: hand off waiting with it as `retry_when`."""
+    yet), 1 when not: hand off waiting with it as `retry_when`. `--present M` also needs the user to have
+    written in the chat within the last M minutes, for a step whose deadline is minutes."""
     import sqlite3
     from . import hours
     p = here()
@@ -4508,14 +4509,26 @@ def cmd_hours(a) -> None:
     except sqlite3.Error as e:
         die(f"ttp hours: cannot read the project's messages ({e})", 75)
     r = hours.assess(times, timefmt.home(p), now=now, need_s=a.need)
+    lines = [hours.describe(r, now)]
+    ok = r["ok"]
+    if a.present is not None:
+        try:
+            last = hours.last_user_time(p.state / "project.db")
+        except sqlite3.Error as e:
+            die(f"ttp hours: cannot read the project's messages ({e})", 75)
+        pr = hours.presence(last, r["zone"], a.present, now)
+        ok = ok and pr["ok"]
+        # Absent: the line that matters is when they last wrote (the window's "start now" would mislead).
+        lines = lines + [pr["text"]] if pr["ok"] else [pr["text"]] + ([] if r["ok"] else lines)
+        r = {**r, "present": {**pr, **({"last_text": timefmt.long(last, r["zone"])} if last else {})}}
     if a.json:
         z = r["zone"]
         print(json.dumps({**r, **{f"{k}_text": timefmt.long(r[k], z) for k in ("until", "next_start") if r[k]},
-                          "summary": hours.describe(r, now)}))
+                          "summary": "; ".join(lines)}))
     else:
-        print(hours.describe(r, now))
+        print("\n".join(lines))
     if a.check:
-        sys.exit(0 if r["ok"] else 1)
+        sys.exit(0 if ok else 1)
 
 
 def cmd_killscan(a) -> None:
@@ -9424,6 +9437,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--check", action="store_true", help="exit 0 inside the hours (or with no pattern yet), 1 outside")
     s.add_argument("--for", dest="need", type=float, default=0, metavar="SECONDS",
                    help="also need this much of the window left (a step's time to act)")
+    s.add_argument("--present", type=float, metavar="MINUTES",
+                   help="also need the user to have written in the chat within this many minutes; use 10 "
+                        "with --check for a step whose deadline is under 10 min (an MCP sign-in link), so "
+                        "it waits for them to come back instead of going out on a timer")
     s.add_argument("--days", type=float, default=14, help="look back this many days (default 14)")
     s.set_defaults(fn=cmd_hours)
 
