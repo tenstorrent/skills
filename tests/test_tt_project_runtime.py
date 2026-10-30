@@ -26854,7 +26854,7 @@ DURABLE_EXEMPT = {
     ("cli.py", "tmp.write_text(str(os.getpid()))"): "names a process, which a reboot ends",
     ("cli.py", "os.replace(tmp, lock)"): "names a process, which a reboot ends",
     ("cli.py", 'open(log, "a")'): "the output log of `ttp checks`; its result is written with write_json",
-    ("cli.py", "CHECKS_OUT, \"wb\")"): "the output of detached `ttp checks`; its exit code goes to checks.rc, durably",
+    ("cli.py", "CHECKS_OUT, \"ab\")"): "the output of detached `ttp checks`, appended per call in a run; its exit code goes to checks.rc, durably",
     ("cli.py", '"checks.log", "a")'): "the output log of `ttp checks`; a stop notice",
     ("cli.py", 'open(run_dir / name, "a")'): "a dropped-from-the-queue notice in checks.out and checks.log; the result goes to checks.dropped and checks.rc, durably",
     ("cli.py", 'open(log, "w")'): "the output of `ttp clip`, for reading; the command's exit code is passed on",
