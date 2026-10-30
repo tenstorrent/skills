@@ -71,8 +71,8 @@ run.
 
 Optional operator inputs come from `bringup/agentic_evals/inputs.json` in the target checkout:
 
-- evals: default GPQA Diamond, SWE-bench Verified and Terminal-Bench, named and versioned as the
-  current release spec names them; the default subset is 10 tasks each;
+- evals: default `r1_gpqa_diamond`, `swe_bench_verified` and `terminal_bench_2_1`; the default
+  subset is 10 tasks each;
 - `batch_sizes`, see [Decode batches](#decode-batches): stage 10 validates a tuned configuration
   per batch and stage 11 measures a profile for each surviving one;
 - `release_spec`, optional: where the release values come from. Without it, find the release
@@ -101,7 +101,6 @@ reader can tell a thin result from a small grant.
 Some settings are not tuning arms. Find the release values before the first run and record their
 source and values in the preflight:
 
-- Eval names and versions. A stale default in a skill or inputs file does not override the spec.
 - Agent time limit, request time limit and output cap: start at the release values and raise them
   as runs show tasks ending at a limit, so no score is lost to time or tokens. A capped answer
   measures the cap, not the model.
