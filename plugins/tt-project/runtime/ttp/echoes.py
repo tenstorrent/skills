@@ -26,12 +26,13 @@ Each retirement has a KIND: WITHDRAWN (the user withdrew or replaced a governing
 charter_update `quote` or `replaces`, a user Correction, a memory change whose `why` cites the user's
 words, or one on the user's turn that cites or quotes their words or whose message names the old rule:
 coordinator._withdrawn; a dedupe on the user's turn is not one), COMPACTED (a factual entry merged or shortened) or SUPERSEDED (one
-coordinator decision superseded by another), or UNVERIFIED (its origin unknown: nothing shows the user
-withdrew that rule). Only a WITHDRAWN retirement's hit on a governing phrase is a directive; a hit of the
-other kinds, or one resting only on a filename, path, version or evidence fragment (_weak, or an
-identifier the retired text holds only inside such a token: _fragment), is advisory: counted on one line,
-never a fix order. A record stored before kinds existed gets one from its source (_kind); an unknown kind
-or source is UNVERIFIED. `export` is the read-only full list behind `ttp echoes`.
+coordinator decision superseded by another). Only a WITHDRAWN retirement's hit on a governing phrase
+is a directive; a hit of the other kinds, or one resting only on a filename, path, version or evidence
+fragment (_weak, or an identifier the retired text holds only inside such a token: _fragment), is
+advisory: counted on one line, never a fix order. A fourth kind, UNVERIFIED (its origin unknown: nothing
+shows the user withdrew that rule), is advisory too: a record stored before kinds existed gets one from
+its source (_kind), and an unknown kind or source is UNVERIFIED. `export` is the read-only full list
+behind `ttp echoes`.
 """
 from __future__ import annotations
 
