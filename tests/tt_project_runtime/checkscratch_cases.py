@@ -15,7 +15,7 @@ def _ram_disk(tmp_path, monkeypatch, *, fstype="tmpfs", free=100 * _GIB, size=12
     real = os.path.realpath(ram)
     (tmp_path / "mounts").write_text(f"proc /proc proc rw 0 0\nnone {real} {fstype} rw 0 0\n")
     (tmp_path / "meminfo").write_text(f"MemTotal: {total // 1024} kB\nMemAvailable: {avail // 1024} kB\n")
-    monkeypatch.setenv("TTP_TEST_TMPFS", str(ram))
+    monkeypatch.setenv("TTP_TEST_RAM_DISK", str(ram))
     monkeypatch.setattr(shorttmp, "MOUNTS", str(tmp_path / "mounts"))
     monkeypatch.setattr(shorttmp, "MEMINFO", str(tmp_path / "meminfo"))
     monkeypatch.setattr(shorttmp, "_space", lambda path: (free, size))
@@ -31,8 +31,8 @@ def test_detached_checks_put_scratch_and_clean_checkout_on_the_ram_disk_and_leav
     from ttp import cli, shorttmp
     p, repo, run, git, tmp = _clean_repo(env, tmp_path, monkeypatch)
     (tmp_path / "ram").mkdir()
-    monkeypatch.setenv("TTP_TEST_TMPFS", str(tmp_path / "ram"))
-    ram = shorttmp.tmpfs_room()
+    monkeypatch.setenv("TTP_TEST_RAM_DISK", str(tmp_path / "ram"))
+    ram = shorttmp.tmpfs_room(shorttmp.need(repo, "HEAD", ["sh"]))
     if ram is None:
         pytest.skip("tmp_path is not on a tmpfs with room for a check's scratch")
     seen = tmp_path / "seen"
@@ -58,17 +58,17 @@ def test_check_scratch_stays_under_tmp_when_the_ram_disk_has_no_room(env, tmp_pa
     ram = _ram_disk(tmp_path, monkeypatch, **kw)
     if why == "others":   # 3 runs' scratch already there: 4 x 4 GiB leaves under a quarter of 40 GiB
         monkeypatch.setattr(shorttmp, "_space", lambda path: (25 * _GIB, 40 * _GIB))
-        assert shorttmp.tmpfs_room() == ram
+        assert shorttmp.tmpfs_room(4 * _GIB) == ram
         for name in ("aaaaaaa1", "aaaaaaa2", "aaaaaaa3"):
             (ram / name).mkdir(parents=True)
     elif why == "unusable":   # room, but its ttp-<uid> is a link: never followed
         (tmp_path / "elsewhere").mkdir()
         ram.symlink_to(tmp_path / "elsewhere", target_is_directory=True)
     elif why == "no-ram-disk":
-        monkeypatch.delenv("TTP_TEST_TMPFS")
+        monkeypatch.delenv("TTP_TEST_RAM_DISK")
         assert shorttmp.tmpfs_root() is None
     p = make(env)
-    output = checkdirs.new(p.state)
+    output = checkdirs.new(p.state, need=4 * _GIB)
     tmp = json.loads((output / checkdirs.OWNER).read_text())["tmp"]
     assert pathlib.Path(tmp).parent == shorttmp.root() and shorttmp.on_tmpfs(tmp) is None
     assert not (tmp_path / "elsewhere").exists() or not list((tmp_path / "elsewhere").iterdir())
@@ -79,7 +79,7 @@ def test_check_scratch_stays_under_tmp_when_the_ram_disk_has_no_room(env, tmp_pa
 @pytest.mark.parametrize("others", [0, 1])
 def test_room_on_the_ram_disk_counts_the_other_runs_scratch_and_both_limits_at_their_edges(env, tmp_path,
                                                                                           monkeypatch, others):
-    """4 GiB per run including this one; a quarter of the disk and a fifth of the RAM kept, exactly."""
+    """This run's need plus 4 GiB per other run; a quarter of the disk and a fifth of the RAM kept, exactly."""
     from ttp import shorttmp
     need = 4 * _GIB * (others + 1)
     ram = _ram_disk(tmp_path, monkeypatch)
@@ -88,13 +88,13 @@ def test_room_on_the_ram_disk_counts_the_other_runs_scratch_and_both_limits_at_t
     (ram / "not-a-run").mkdir(parents=True)   # only the short dirs count
     for free, ok in ((25 * _GIB + need, True), (25 * _GIB + need - 1, False)):
         monkeypatch.setattr(shorttmp, "_space", lambda path, free=free: (free, 100 * _GIB))
-        assert (shorttmp.tmpfs_room() == ram) is ok, free
+        assert (shorttmp.tmpfs_room(4 * _GIB) == ram) is ok, free
     monkeypatch.setattr(shorttmp, "_space", lambda path: (100 * _GIB, 128 * _GIB))
     for avail, ok in ((20 * _GIB + need, True), (20 * _GIB + need - 1024, False)):
         (tmp_path / "meminfo").write_text(f"MemTotal: {100 * _GIB // 1024} kB\nMemAvailable: {avail // 1024} kB\n")
-        assert (shorttmp.tmpfs_room() == ram) is ok, avail
+        assert (shorttmp.tmpfs_room(4 * _GIB) == ram) is ok, avail
     (tmp_path / "meminfo").write_text("garbage\n")   # unreadable RAM figures: no RAM disk
-    assert shorttmp.tmpfs_room() is None
+    assert shorttmp.tmpfs_room(4 * _GIB) is None
 
 
 @pytest.mark.parametrize("end", ["crash", "reboot"])
@@ -102,7 +102,7 @@ def test_a_killed_runs_ram_disk_scratch_and_checkout_go_at_recovery(env, tmp_pat
     from ttp import checkdirs, cleantree, shorttmp
     p, repo, run, git, tmp = _clean_repo(env, tmp_path, monkeypatch)
     ram = _ram_disk(tmp_path, monkeypatch)
-    output = checkdirs.new(p.state)
+    output = checkdirs.new(p.state, need=shorttmp.need(repo, "HEAD", ["pytest -q"]))
     scratch = shorttmp.on_tmpfs(json.loads((output / checkdirs.OWNER).read_text())["tmp"])
     assert scratch is not None and scratch.parent == ram
     clean = cleantree.Checkout(repo, "HEAD", scratch)
@@ -123,7 +123,7 @@ def test_only_ram_disk_check_dirs_count_as_ours(env, tmp_path, monkeypatch):
     its ttp-<uid> with the short name: never a sibling, a nested dir, a /tmp dir, or through a link."""
     from ttp import checkreap, cleantree, shorttmp
     ram = _ram_disk(tmp_path, monkeypatch)
-    good = shorttmp.make(check=True)
+    good = shorttmp.make(4 * _GIB)
     assert good.parent == ram and shorttmp.on_tmpfs(good) == good and shorttmp.owned(good)
     for bad in (ram.parent / "abcdef12", good / "abcdef12", ram / "not-hex!", ram / "ABCDEF12",
                 shorttmp.root() / "abcdef12", "", None, 7):
@@ -154,3 +154,69 @@ def test_a_fenced_worker_may_write_the_ram_disk_check_dirs_and_its_own_temp_stay
     roots, run_env = _codex_worker_launch(env, make(env), env["repo"])
     assert str(ram) in roots and str(shorttmp.root()) in roots, roots
     assert pathlib.Path(run_env["TMPDIR"]).parent == shorttmp.root()
+
+
+def _sized_repo(tmp_path, name, files):
+    """A committed repo holding `files` (relative path -> bytes)."""
+    repo = tmp_path / name
+    repo.mkdir()
+    git = ["git", "-C", str(repo)]
+    subprocess.run([*git, "init", "-q"], check=True)
+    for rel, data in files.items():
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_bytes(data)
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c"], check=True)
+    return repo
+
+
+@pytest.mark.parametrize("case", ["small", "large", "submodule", "cmake", "make", "ninja"])
+def test_ram_disk_scratch_is_sized_by_the_real_tree_and_build_checks_stay_under_tmp(env, tmp_path, monkeypatch,
+                                                                                   case):
+    """A run plans its clean checkout's real size (submodules it clones included) with margin plus temp
+    files, at most a quarter of the RAM disk, and a check that builds keeps its output off it: a small
+    tree goes there, a large one or a cmake/make/ninja check stays under /tmp. A flat per-run estimate
+    put all of these on the RAM disk."""
+    from ttp import checkdirs, shorttmp
+    mib = 1 << 20
+    small = _sized_repo(tmp_path, "small", {"a.py": b"x = 1\n"})
+    tree = {"large": {"big.bin": os.urandom(mib)}}.get(case, {"a.py": b"x = 1\n"})
+    repo = small if case in ("small", "cmake", "make", "ninja") else _sized_repo(tmp_path, "sized", tree)
+    if case == "submodule":   # 1 MiB only in a checked-out submodule: its files and objects count
+        sub = _sized_repo(tmp_path, "sub", {"big.bin": os.urandom(mib)})
+        subprocess.run(["git", "-C", str(repo), "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+                        str(sub), "vendor/sub"], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "s"],
+                       check=True)
+    cmd = {"cmake": "cmake --build build -j 8 && ctest", "make": "make -C tests check",
+           "ninja": "cd build && ninja"}.get(case, "pytest -q tests")
+    need = shorttmp.need(repo, "HEAD", ["ruff check .", cmd])
+    # A RAM disk a quarter of which holds a small tree's run with room to spare, not 1 MiB more.
+    size = 4 * (shorttmp.TEMP_BYTES + mib)
+    ram = _ram_disk(tmp_path, monkeypatch, free=size, size=size)
+    if case in ("cmake", "make", "ninja"):
+        assert need is None
+    elif case == "small":
+        assert shorttmp.TEMP_BYTES < need < shorttmp.TEMP_BYTES + 1024
+    else:
+        assert need >= shorttmp.TEMP_BYTES + 1.5 * mib, need
+    p = make(env)
+    output = checkdirs.new(p.state, need=need)
+    tmp = json.loads((output / checkdirs.OWNER).read_text())["tmp"]
+    where = pathlib.Path(tmp).parent
+    assert where == (ram if case == "small" else shorttmp.root()), (case, need, where)
+    checkdirs.finish(output)
+    assert shorttmp.need(tmp_path / "no-repo", "HEAD", ["pytest"]) is None   # unreadable tree: /tmp
+
+
+def test_the_ram_disk_test_hook_is_not_the_suites_tmpfs_opt_out(env, tmp_path, monkeypatch):
+    """TTP_TEST_TMPFS=0 opts the suite out of tmpfs (conftest.py); it never names a RAM disk folder."""
+    from ttp import shorttmp
+    monkeypatch.delenv("TTP_TEST_RAM_DISK", raising=False)
+    monkeypatch.chdir(tmp_path)
+    for value in ("0", "1", str(tmp_path)):
+        monkeypatch.setenv("TTP_TEST_TMPFS", value)
+        assert shorttmp.tmpfs_root() is None, value
+        tmp = shorttmp.make(4 * _GIB)
+        assert tmp.parent == shorttmp.root() and not (tmp_path / "0").exists()
+        shorttmp.remove(tmp)

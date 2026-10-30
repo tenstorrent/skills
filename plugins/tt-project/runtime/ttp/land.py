@@ -301,7 +301,8 @@ def _attempt(p: Project, repo: Path, branch: str, full: str, tid: int | None, sa
         return LANDED
     if dry:
         return _dry(p, repo, branch, base, full, commits, tid, say)
-    return push.in_check_scratch(p, lambda: _land(p, repo, branch, base, full, commits, tid, say), "ttp land")
+    return push.in_check_scratch(p, lambda: _land(p, repo, branch, base, full, commits, tid, say), "ttp land",
+                                 repo)
 
 
 def _land(p: Project, repo: Path, branch: str, base: str, full: str, commits: list[str], tid: int | None,

@@ -77,10 +77,12 @@ def writable(value, *, create=False) -> str:
     return str(value)
 
 
-def new(state: Path, owner: Path | None = None) -> Path:
+def new(state: Path, owner: Path | None = None, need: int | None = None) -> Path:
+    """A check run's output dir; its scratch goes on the RAM disk when its planned `need`
+    (shorttmp.need) fits there."""
     from . import shorttmp
     folder = state / FOLDER
-    tmp = shorttmp.make(check=True)
+    tmp = shorttmp.make(need)
     try:
         name = _publish(folder, owner, tmp)
     except BaseException:

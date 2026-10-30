@@ -3650,19 +3650,30 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None,
     if os.environ.get("TTP_CHECK_OUTPUT_DIR"):
         return _run(p, repo, own, recorded, after)
     recorded = recorded or recorded_checks(os.environ.get("TTP_RUN_DIR"))
-    return in_check_scratch(p, lambda: _run(p, repo, own, recorded, after))
+    return in_check_scratch(p, lambda: _run(p, repo, own, recorded, after), repo=repo)
 
 
-def in_check_scratch(p: Project, fn: Callable[[], int], what: str = "ttp push") -> int:
+def scratch_need(p: Project, repo: Path) -> int | None:
+    """The scratch the push checks of `repo` plan on the RAM disk (shorttmp.need of its HEAD), None to
+    keep it under /tmp."""
+    from . import shorttmp
+    try:
+        d = p.config().get("delivery") or {}
+        return shorttmp.need(repo, "HEAD", check_list(repo_checks(d, Path(repo), p)[0]))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def in_check_scratch(p: Project, fn: Callable[[], int], what: str = "ttp push", repo: Path | None = None) -> int:
     """fn() with the checks' output going to a scratch directory of the project's own (checkdirs),
-    as `ttp push` and `ttp land` run their checks; CHECKS_FAILED when it cannot be set up."""
+    as `ttp push` and `ttp land` run their checks of `repo`; CHECKS_FAILED when it cannot be set up."""
     if os.environ.get("TTP_CHECK_OUTPUT_DIR"):
         return fn()
     output = None
     guard = None
     previous = dict(os.environ)
     try:
-        output = checkdirs.new(p.state)
+        output = checkdirs.new(p.state, need=scratch_need(p, repo) if repo else None)
         guard = checkdirs.take(output)
         if guard is None:
             raise OSError("check scratch is busy")
@@ -4068,7 +4079,7 @@ def detach(p: Project, repo: Path, own: bool = False) -> int:
          # what the daemon needs to start it again after a reboot, as for a queued push
          "env": {k: os.environ[k] for k in os.environ if k in QUEUE_ENV or k.startswith("GIT_CONFIG_")}}
     try:
-        m["check_run_dir"] = str(checkdirs.new(p.state, marker))
+        m["check_run_dir"] = str(checkdirs.new(p.state, marker, scratch_need(p, top)))
         m["check_report_dir"] = str(checkdirs.reports(Path(m["check_run_dir"])))
     except OSError as e:
         print(f"ttp push: {e}", file=sys.stderr)

@@ -2662,7 +2662,7 @@ def cmd_checks(a) -> None:
                     elif checkprestage.run(pre, top, pre_env, say) if pre is not None else \
                             checkprestage.run_derived(p, ids, own, top, pre_env, say, run_dir):
                         sys.exit(1)
-            _checks_detach(a, Path(run_dir), p, top, head)
+            _checks_detach(a, Path(run_dir), p, top, head, need=shorttmp.need(top, head, cmds))
         except OSError as e:
             die(f"ttp checks: {e}")
         return
@@ -3036,7 +3036,7 @@ def cmd_checks(a) -> None:
             sys.exit(75)
     if handover:
         try:
-            _checks_detach(a, Path(run_dir), p, top, head, arrived, no_spill)
+            _checks_detach(a, Path(run_dir), p, top, head, arrived, no_spill, shorttmp.need(top, head, cmds))
         except OSError as e:
             die(f"ttp checks: {e}")
         # Told only once they were started: a failed start says so, never that they run.
@@ -4028,7 +4028,7 @@ def _checks_owner(run_dir: Path, top: str, purpose) -> str:
 
 
 def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str = "",
-                   arrived: float | None = None, no_spill: bool = False) -> None:
+                   arrived: float | None = None, no_spill: bool = False, need: int | None = None) -> None:
     """Start `ttp checks` in a session of its own. It writes checks.rc however it ends (a stop by
     TERM, HUP or INT included); the printed `--result` probe also wakes the task when it was killed
     outright. This run's earlier detached checks for the same worktree and purpose are stopped
@@ -4037,7 +4037,8 @@ def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str
     A tool sandbox queues the launch and cancellation through the daemon (detach.tend).
     checks.pid also keeps the worktree, head and command, so the daemon can start the same checks
     again, model-free, after a reboot killed them (Daemon._relaunch_checks). `arrived`: a foreground
-    run's place in the host-wide queue, which they keep."""
+    run's place in the host-wide queue, which they keep. `need`: the scratch they plan on the RAM disk
+    (shorttmp.need), None to keep it under /tmp."""
     from . import checkcap, detach, push
     rc = run_dir / CHECKS_RC
     owner = _checks_owner(run_dir, top, getattr(a, "purpose", None))
@@ -4061,11 +4062,11 @@ def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str
             die("ttp checks: sandboxed detached checks need a project daemon; set TTP_PROJECT")
         detach.enqueue(p.state, rc, run_dir / CHECKS_OUT, [], top or os.getcwd(), env,
                        checks={"worktree": top, "head": head, "cmd": list(a.cmd), "fresh": bool(a.fresh),
-                               "full": bool(getattr(a, "full", False)), **_harness_purpose(a)})
+                               "full": bool(getattr(a, "full", False)), "need": need, **_harness_purpose(a)})
         print("ttp checks: queued; the daemon starts them outside this command's sandbox")
     else:
         detach.withdraw(rc)   # a marker left without a request (no daemon to take it)
-        pid = _checks_start(a, run_dir, top, head, env)
+        pid = _checks_start(a, run_dir, top, head, env, need=need)
         print(f"ttp checks: started in the background (pid {pid}); output in {run_dir / CHECKS_OUT}, "
               f"exit code in {rc}")
     print(f"retry_when: {push._own_ttp(p)} checks --result {shlex.quote(str(run_dir))}")
@@ -4097,7 +4098,8 @@ def _checks_place(run_dir: Path, old: dict, env: dict) -> float:
     return min(seen) if seen else now
 
 
-def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "") -> int:
+def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "",
+                  need: int | None = None) -> int:
     """Launch outside the tool sandbox, cancelling the earlier host process before replacing its
     metadata. The child runs the checks only on this launcher's `go`, sent once checks.pid durably
     names it (or, if the launcher died after that write, once it finds itself named there): a
@@ -4137,7 +4139,7 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
         old_guard.close()
         if previous != run_dir:
             checkdirs.finish(previous)
-    output = checkdirs.new(Project(base).state, run_dir / CHECKS_PID)
+    output = checkdirs.new(Project(base).state, run_dir / CHECKS_PID, need)
     guard = checkdirs.take(output)
     launched = False
     try:

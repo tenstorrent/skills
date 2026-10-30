@@ -1007,7 +1007,7 @@ def start(p: Project, rows: list[dict], name: str, now: float | None = None) -> 
                           "ref": f"{REF_PREFIX}{r['id']}"} for r in rows]}
         if bad := _known_bad(db, rows):
             m["bad_tip"] = bad
-        m["check_run_dir"] = str(checkdirs.new(p.state, marker))
+        m["check_run_dir"] = str(checkdirs.new(p.state, marker, push.scratch_need(p, p.root)))
         m["check_report_dir"] = str(checkdirs.reports(Path(m["check_run_dir"])))
         write_json(marker, m)
         ids = [r["id"] for r in rows]
