@@ -340,48 +340,27 @@ def _warning(msg: dict):
     return warnings.WarningMessage(cat(msg["message"]), cat, msg["filename"], msg["lineno"])
 
 
-NUMBERED_DIR_TRIES = 1000
-
-
-def _make_numbered_dir(root: Path, prefix: str, mode: int = 0o700) -> Path:
-    """pytest's make_numbered_dir, for workers sharing one temp root: pytest's gives up after 10 lost
-    races (mkdir EEXIST: another worker took the number its scan picked), which a test with many
-    short parameters lost under load. This retries a lost race up to NUMBERED_DIR_TRIES times and
-    raises any other mkdir error at once, with its errno."""
-    import _pytest.pathlib as pl
-    for _ in range(NUMBERED_DIR_TRIES):
-        path = root.joinpath(f"{prefix}{max(map(pl.parse_num, pl.find_suffixes(root, prefix)), default=-1) + 1}")
-        try:
-            path.mkdir(mode=mode)
-        except FileExistsError:
-            continue
-        pl._force_symlink(root, prefix + "current", path)
-        return path
-    raise OSError(f"could not create numbered dir with prefix {prefix} in {root} after {NUMBERED_DIR_TRIES} tries")
-
-
-def _share_numbered_dirs() -> None:
-    """Makes tmp_path's numbered folders safe for workers sharing one temp root (no-op on a pytest
-    without these internals)."""
-    import _pytest.pathlib as pl
-    import _pytest.tmpdir as td
-    if all(hasattr(pl, n) for n in ("parse_num", "find_suffixes", "_force_symlink")) and hasattr(td, "make_numbered_dir"):
-        td.make_numbered_dir = _make_numbered_dir
+def _own_basetemp(factory, n: int) -> None:
+    """Gives forked worker n its own temp root, a folder in the session's: workers sharing one root
+    raced for tmp_path's numbered folders (mkdir EEXIST), and pytest gives up after 10 lost races
+    ('could not create numbered dir ... after 10 tries'), which failed tests under load."""
+    root = factory.getbasetemp() / f"w{n}"
+    root.mkdir(mode=0o700, exist_ok=True)
+    factory._basetemp = root
 
 
 def _run_forked(session, units, jobs: int) -> None:
     config, hook = session.config, session.config.hook
     factory = getattr(config, "_tmp_path_factory", None)
     if factory is not None:
-        factory.getbasetemp()   # made once here, so every worker shares the session's temp root
-        _share_numbered_dirs()
+        factory.getbasetemp()   # made once here; each worker takes its own folder in it
     work_r, work_w = os.pipe()
     os.write(work_w, b"".join(struct.pack("!I", n) for n in range(len(units))))
     os.close(work_w)
     sys.stdout.flush()
     sys.stderr.flush()
     workers: dict[int, dict] = {}
-    for _ in range(jobs):
+    for n in range(jobs):
         r, w = os.pipe()
         pid = os.fork()
         if pid == 0:
@@ -395,6 +374,8 @@ def _run_forked(session, units, jobs: int) -> None:
                         os.nice(WORKER_NICE)   # the tests and what they start yield to other work
                     except (AttributeError, OSError):
                         pass
+                if factory is not None:
+                    _own_basetemp(factory, n)
                 _worker(session, units, work_r, w)
             except BaseException:   # noqa: BLE001 - the main process reports what this worker left
                 code = 1
