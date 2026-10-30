@@ -1703,7 +1703,7 @@ def test_every_checks_key_the_runtime_reads_is_an_account_key_and_settable(env):
         read |= {kind.setting(s)[1] for s in ("pool", "run_max", "project_max")}
     read -= {"dropped", "json", "log", "out", "pid", "queued", "rc"}   # file names (checks.json), not keys
     # project-only: the project's own lock or queue wrapper, set by the user per project
-    read -= {"wrap_cmd"}
+    read -= {"wrap_cmd", "wrap_lane"}
     # a chat-only alias of checks.slots (coordinator.ALIASES), not a key the runtime reads
     read -= {"suite_concurrency"}
     assert "wrap_cmd" in project._known_keys(["checks"])
@@ -2981,6 +2981,137 @@ def test_two_checks_of_one_project_with_different_or_no_locks_run_together(env, 
             locks.dequeue(t)
         hold.close()
 
+
+
+def _wrap_lane_held(project_name: str, key: str) -> list:
+    from ttp import locks, testslots
+    return locks.holder_records(testslots.lane_paths(project_name, 1, "w" + key))
+
+
+def _run_behind_held_resource(env, tmp_path, monkeypatch, lane: str | None, crash: bool = False) -> dict:
+    """`ttp checks` behind checks.wrap_cmd `flock <resource>` while this test holds the resource: what the
+    wrapper lock's lane looked like while the run queued on the resource, once the command ran, and after."""
+    import fcntl
+    import signal
+    from ttp import checkcap, checklane, cli, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _lane_env(monkeypatch)
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 5)
+    monkeypatch.setattr(cli, "_checks_detach", lambda *a, **k: None)
+    resource, started, go = tmp_path / "resource.lock", tmp_path / "started", tmp_path / "go"
+    p.set_config("checks.wrap_cmd", f"flock {resource}")
+    if lane:
+        p.set_config("checks.wrap_lane", lane)
+    key = checklane.wrap_key(push.wrap_of(p.config()))
+    seen: dict = {}
+    res = open(resource, "a+")
+    fcntl.flock(res, fcntl.LOCK_EX)
+
+    def side():
+        try:
+            time.sleep(1.0)   # the run is queued on the resource, inside its wrapper
+            seen["queued"] = _wrap_lane_held(p.name, key)
+            seen["ran_early"] = started.exists()
+            fcntl.flock(res, fcntl.LOCK_UN)
+            seen["started"] = _wait_for(started.exists, 30)
+            seen["running"] = _wrap_lane_held(p.name, key)
+            if crash and seen["running"] and seen["running"][0]["pid"] != os.getpid():
+                os.kill(seen["running"][0]["pid"], signal.SIGKILL)   # the step holding the lane dies
+                seen["after_crash"] = _wait_for(lambda: not _wrap_lane_held(p.name, key), 10)
+        finally:
+            fcntl.flock(res, fcntl.LOCK_UN)
+            go.touch()
+    t = threading.Thread(target=side)
+    t.start()
+    try:
+        cli.main(["checks", "--fresh", "--", f"sh -c 'touch {started}; while [ ! -e {go} ]; do sleep 0.05; done'"])
+    except SystemExit as e:
+        seen["exit"] = e.code
+    finally:
+        t.join(60)
+        res.close()
+    seen["after"] = _wrap_lane_held(p.name, key)
+    seen["pid"] = os.getpid()
+    return seen
+
+
+def test_checks_wrap_lane_before_holds_the_wrapper_lane_while_the_run_queues_on_the_wrappers_lock(
+        env, tmp_path, monkeypatch):
+    # The default (and the premise of the change): the lane is taken before the wrapper starts, so runs
+    # behind a wrapper that fails instead of waiting never go side by side; it is held during the queue.
+    seen = _run_behind_held_resource(env, tmp_path, monkeypatch, None)
+    assert seen["queued"] and seen["queued"][0]["pid"] == seen["pid"], seen
+    assert seen["started"] and not seen["ran_early"] and not seen["after"], seen
+
+
+def test_checks_wrap_lane_after_takes_the_lane_only_once_the_wrappers_lock_is_held_and_frees_it_at_the_end(
+        env, tmp_path, monkeypatch):
+    seen = _run_behind_held_resource(env, tmp_path, monkeypatch, "after")
+    assert seen["queued"] == [] and not seen["ran_early"], f"a lane held while queued on the wrapper's lock: {seen}"
+    assert seen["started"] and len(seen["running"]) == 1, seen
+    holder = seen["running"][0]
+    assert holder["pid"] != seen["pid"] and holder["alive"], "the step inside the wrapper holds it"
+    assert holder.get("lock") and "full checks" in holder["holder"], holder
+    assert seen["after"] == [] and seen.get("exit") in (None, 0), seen
+
+
+def test_checks_wrap_lane_after_frees_the_lane_when_the_step_holding_it_crashes(env, tmp_path, monkeypatch):
+    seen = _run_behind_held_resource(env, tmp_path, monkeypatch, "after", crash=True)
+    assert seen["queued"] == [] and seen["started"] and len(seen["running"]) == 1, seen
+    assert seen["after_crash"], "a killed step leaves no lane held"
+    assert seen["after"] == [] and seen.get("exit") not in (None, 0), "the crash fails the check, never a pass"
+
+
+def test_checks_wrap_lane_setting_and_where_the_lane_step_goes_in_a_checks_argv(env, tmp_path):
+    from ttp import checklane, project, push
+    assert push.wrap_lane_of({}) == "before" and push.wrap_lane_of({"checks": {"wrap_lane": ""}}) == "before"
+    assert push.wrap_lane_of({"checks": {"wrap_lane": " After "}}) == "after"
+    for bad in ("inside", 1, True, ["after"]):
+        with pytest.raises(ValueError, match="checks.wrap_lane"):
+            push.wrap_lane_of({"checks": {"wrap_lane": bad}})
+    assert "wrap_lane" in project._known_keys(["checks"])
+    assert any("checks.wrap_lane" in x for x in project.config_problems({"checks": {"wrap_lane": "x"}}, tmp_path))
+    lane = checklane.lane_argv("pa", "aaaaaaaaaaaa", "flock dev.lock")
+    assert lane[:2] == (sys.executable, "-I") and lane[-1] == "--" and "aaaaaaaaaaaa" in lane
+    wrapped = push.with_wrap(["pytest -q", push.Check("make test")], ("flock", "/tmp/dev.lock"), lane)
+    argv = push.check_argv(wrapped[0], isolate=False)
+    assert argv[:2] == ["flock", "/tmp/dev.lock"] and tuple(argv[2:2 + len(lane)]) == lane, argv
+    assert argv[2 + len(lane)].endswith(("bash", "sh")), "the command itself runs after the step"
+    plain = push.check_argv(push.with_wrap(["pytest -q"], ())[0], isolate=False)
+    assert not any("wraplane" in w for w in plain), "no wrapper: no lane step"
+    before = push.check_argv(push.with_wrap(["pytest -q"], ("flock", "/tmp/dev.lock"))[0], isolate=False)
+    assert not any("wraplane" in w for w in before), "checks.wrap_lane before: no step inside the wrapper"
+
+
+def test_the_wrap_lane_step_waits_a_bounded_time_ignores_the_runs_nested_grants_and_keeps_the_exit_code(
+        env, tmp_path, monkeypatch):
+    from ttp import checkcap, checklane, testslots
+    _lane_env(monkeypatch)
+    key = "cccccccccccc"
+    run = lambda cmd, wait="0.3", **e: subprocess.run(   # noqa: E731
+        [*checklane.lane_argv("pa", key, "flock x", float(wait)), *cmd], capture_output=True, text=True,
+        env={**os.environ, **e}, timeout=60)
+    seen = tmp_path / "seen"
+    probe = f"import json, sys; sys.path.insert(0, {str(Path(checklane.__file__).parent.parent)!r}); " \
+            f"from ttp import locks, testslots; open({str(seen)!r}, 'w').write(json.dumps(" \
+            f"[r['pid'] for r in locks.holder_records(testslots.lane_paths('pa', 1, 'w{key}'))]))"
+    # Inside a run that holds its slots (the run's grants in its environment) it still takes the lane.
+    r = run([sys.executable, "-c", probe], **{testslots.HELD_ENV: "4", checkcap.HELD_ENV: "1"})
+    assert r.returncode == 0, r.stderr
+    assert len(json.loads(seen.read_text())) == 1, "the step held the wrapper lock's lane while the command ran"
+    assert not _wrap_lane_held("pa", key), "freed once the command ended"
+    assert run(["sh", "-c", "exit 7"]).returncode == 7
+    assert run(["sh", "-c", "kill -TERM $$"]).returncode == 128 + 15
+    held = testslots.suite_hold("pa", lock=key, wait_s=0)
+    assert held and held.files
+    try:
+        t0 = time.time()
+        r = run(["sh", "-c", "echo ran"], wait="0.5")
+        assert r.returncode == 0 and "ran" in r.stdout and time.time() - t0 < 30, r
+        assert "stayed busy" in r.stderr and "running without it" in r.stderr, r.stderr
+    finally:
+        held.close()
+    assert run([]).returncode == 2
 
 def _slot_sizes(monkeypatch, pool: int, run: int, **more):
     from ttp import checkcap, testslots

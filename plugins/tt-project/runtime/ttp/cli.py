@@ -2610,10 +2610,13 @@ def cmd_checks(a) -> None:
     wrapped, wrap = set(), ()
     if mine:   # checks.wrap_cmd: the project's own lock or queue wrapper (never the project checks)
         try:
-            wrap = push.wrap_of(cfg)
+            wrap, after = push.wrap_of(cfg), push.wrap_lane_of(cfg) == "after"
         except ValueError as e:
             die(f"ttp checks: {e}; the commands after `--` were not run", 1)
-        mine = push.with_wrap(mine, wrap)
+        from . import checklane
+        # checks.wrap_lane "after": the wrapper lock's lane is taken inside the wrapper, once it holds its lock.
+        mine = push.with_wrap(mine, wrap, checklane.lane_argv(p.name, checklane.wrap_key(wrap), checklane.wrap_name(wrap))
+                              if wrap and after and p else ())
         wrapped = {str(c) for c in mine if getattr(c, "wrap", None)}   # their run takes the lock's lane
         if wrap and any(not push.remote_host(c) for c in mine):
             if why := push.wrap_problem(wrap, top, {**os.environ, **venv_vars}):
@@ -3622,6 +3625,15 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             return None
 
 
+def _wrap_lane_after(cfg: dict) -> bool:
+    """Whether checks.wrap_lane is "after" (push.wrap_lane_of; an invalid value: before, the safe one)."""
+    from . import push
+    try:
+        return push.wrap_lane_of(cfg) == "after"
+    except ValueError:
+        return False
+
+
 def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: float | None, arrived, same: str,
                       done, prio, owns, cfg: dict, repo: str, cmds: list, what: str, top: str = "",
                       lock: str = "", restart: bool = False, yielder=None):
@@ -3676,6 +3688,8 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         elif in_tree:
             if (tree := hold(testslots.tree_key(top), 1, pending=True)) is None:
                 return None
+        if suite is None and lock and _wrap_lane_after(cfg):
+            suite = testslots.Grant()   # checks.wrap_lane "after": the step inside the wrapper takes the lane
         if suite is None and (suite := hold(repo, checklane.slots(cfg), lock=lock, cap=checklane.project_cap(cfg),
                                             worktree=top, headroom=checklane.headroom, pending=True)) is None:
             if tree is not None:

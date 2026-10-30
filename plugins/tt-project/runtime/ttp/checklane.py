@@ -25,7 +25,13 @@ checks run in the authoring worktree (cwd "authoring") also hold that worktree's
 Wrapper locks. A run whose commands go behind the project's checks.wrap_cmd (a lock or queue command,
 such as a shared device's lock) takes that wrapper lock's own single lane (wrap_key), not a repository
 lane: runs behind one wrapper lock go one at a time, and lock-free runs (lint, other trees' tests,
-harness checks) run in their repository's lanes beside it instead of waiting behind it.
+harness checks) run in their repository's lanes beside it instead of waiting behind it. By default
+(checks.wrap_lane "before") a run takes that lane before it starts the wrapper, so runs behind a wrapper
+that fails instead of waiting never go side by side; one queued on the wrapper's lock then holds the lane
+meanwhile. With checks.wrap_lane "after" (for a wrapper that waits for its lock, such as one that picks
+its lock per run) it holds no lane while the wrapper queues: a step between the wrapper and each command
+(lane_argv, wraplane) takes the lane once the wrapper runs that command, its lock held, and frees it when
+the command ends or the step dies.
 
 Project cap. At most project_cap() of a project's checks run at once over all its repository and
 wrapper-lock lanes: checks.test_project_max (project, then account, then TTP_TEST_PROJECT_MAX), else the
@@ -66,6 +72,7 @@ import os
 import re
 import shlex
 import statistics
+import sys
 import time
 from pathlib import Path
 
@@ -318,6 +325,19 @@ def wrap_key(wrap) -> str:
     taken to serialize by itself: its runs go one at a time in that lane, never side by side in the
     repository's lanes, so two runs of one project never fail each other's lock."""
     return hashlib.sha256(shlex.join(map(str, wrap)).encode()).hexdigest()[:12] if wrap else ""
+
+
+LANE_AFTER_WAIT_S = 300.0   # checks.wrap_lane "after": the longest the step waits for the lane, then runs without it
+
+
+def lane_argv(project_name: str, key: str, name: str = "", wait_s: float = LANE_AFTER_WAIT_S) -> tuple[str, ...]:
+    """The step (wraplane) that runs between checks.wrap_cmd and a command with checks.wrap_lane "after",
+    taking project `project_name`'s lane of wrapper lock `key` (wrap_key) once the wrapper runs it; `name`
+    labels the lane (wrap_name). Isolated python (-I): the checkout's files and PYTHONPATH never load."""
+    runtime = str(Path(__file__).resolve().parent.parent)
+    return (sys.executable, "-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); "
+            "from ttp.wraplane import main; sys.exit(main(sys.argv[2:]))", runtime,
+            "--project", project_name, "--key", key, "--name", name, "--wait-s", f"{wait_s:g}", "--")
 
 
 def headroom() -> bool:

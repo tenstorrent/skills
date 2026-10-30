@@ -522,10 +522,11 @@ def _known_keys(path: list[str]) -> set[str] | None:
     if path == ["checks"]:
         # wrap_cmd: the project's own lock or queue command the commands after `ttp checks --` run
         # behind (push.wrap_of; default "", none); delivery.push_checks never go through it.
+        # wrap_lane: where those runs take its lane, before the wrapper starts or after (push.wrap_lane_of).
         # slots, light_cmds, max_wait_s, wait_event_s, wait_escalate_s, wait_hang_factor, priority_age_s,
         # test_project_max, done_holder_flag_s, done_holder_grace_s: the checks lanes (checklane);
         # test_project_slots: the project's test-worker budget (testslots.project_max).
-        return {"nice", "ionice", "wall_cap_s", "wrap_cmd", "slots", "light_cmds", "max_wait_s", "wait_event_s",
+        return {"nice", "ionice", "wall_cap_s", "wrap_cmd", "wrap_lane", "slots", "light_cmds", "max_wait_s", "wait_event_s",
                 "wait_escalate_s", "wait_hang_factor", "priority_age_s", "test_project_max", "test_project_slots",
                 "done_holder_flag_s", "done_holder_grace_s"}
     if len(path) == 1 and isinstance(DEFAULT_CONFIG.get(path[0]), dict):
@@ -830,11 +831,13 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     walk(raw, [])
     from .push import (allow_protected, applicability_problems, backup_problem, by_repo_problems,   # push imports this module
                        bump_problems, check_problems,
-                       fast_forward_check, lands_locally, mirror_check, push_branch_problem, scalar_problem, wrap_of)
-    try:
-        wrap_of(raw)
-    except ValueError as e:
-        out.append(str(e))
+                       fast_forward_check, lands_locally, mirror_check, push_branch_problem, scalar_problem, wrap_lane_of,
+                       wrap_of)
+    for read in (wrap_of, wrap_lane_of):
+        try:
+            read(raw)
+        except ValueError as e:
+            out.append(str(e))
     delivery = raw.get("delivery") or {}
     out += [why for why in [backup_problem(delivery)] if why]
     if not lands_locally(delivery.get("push_branch"), root, allow_protected(delivery)):

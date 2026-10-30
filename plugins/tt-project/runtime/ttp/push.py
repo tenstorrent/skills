@@ -212,9 +212,30 @@ def wrap_problem(wrap: tuple[str, ...], cwd: str | Path, env: dict | None = None
                           f"after `--` were not run (never unwrapped); fix the path or unset {WRAP_KEY}")
 
 
-def with_wrap(checks: list, wrap: tuple[str, ...]) -> list:
+WRAP_LANE_KEY = "checks.wrap_lane"
+WRAP_LANES = ("before", "after")
+
+
+def wrap_lane_of(cfg: dict | None) -> str:
+    """`checks.wrap_lane`: where a `ttp checks` run behind checks.wrap_cmd takes the wrapper lock's lane
+    (checklane). "before" (the default): before it starts the wrapper, so its runs go one at a time even
+    when the wrapper fails instead of waiting. "after": a ttp step (checklane.lane_argv) between the
+    wrapper and each command takes it once the wrapper runs that command, its own lock held, so a run
+    queued on the wrapper's lock holds no lane. ValueError for another value."""
+    sec = (cfg or {}).get("checks")
+    v = sec.get("wrap_lane") if isinstance(sec, dict) else None
+    if v is None or v == "":
+        return "before"
+    if not isinstance(v, str) or v.strip().lower() not in WRAP_LANES:
+        raise ValueError(f"{WRAP_LANE_KEY} must be one of {', '.join(WRAP_LANES)}, not {v!r}")
+    return v.strip().lower()
+
+
+def with_wrap(checks: list, wrap: tuple[str, ...], lane: tuple[str, ...] = ()) -> list:
     """`checks` with each one that runs on this machine behind `wrap` (check_argv); one with a check
-    host runs there unwrapped, as the wrapper is this machine's. No `wrap`: `checks` unchanged."""
+    host runs there unwrapped, as the wrapper is this machine's. No `wrap`: `checks` unchanged. `lane`
+    (checklane.lane_argv, with checks.wrap_lane "after"): the step that runs between the wrapper and
+    each command, taking the wrapper lock's lane once the wrapper holds its lock."""
     if not wrap:
         return list(checks)
     out = []
@@ -224,6 +245,8 @@ def with_wrap(checks: list, wrap: tuple[str, ...]) -> list:
             c2.__dict__.update(c.__dict__)
         if not remote_host(c2):
             c2.wrap = tuple(wrap)
+            if lane:
+                c2.lane = tuple(lane)
         out.append(c2)
     return out
 
@@ -409,6 +432,7 @@ def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None,
     when one cannot."""
     exports = dict(getattr(cmd, "env", ()) or ())
     wrap = tuple(getattr(cmd, "wrap", ()) or ())
+    lane = tuple(getattr(cmd, "lane", ()) or ()) if wrap else ()
     isolate = isolate and getattr(cmd, "sandbox", True) is not False
     if host := remote_host(cmd):
         return remotecheck.argv(str(cmd), host, exports)
@@ -417,7 +441,8 @@ def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None,
     bash = shutil.which("bash")
     argv = [bash, "-e", "-o", "pipefail", "-c", cmd] if bash else ["sh", "-e", "-c", cmd]
     # checks.wrap_cmd goes outside the sandbox: a lock or queue script sees the host as it does elsewhere.
-    return [*wrap, *sandbox.wrap(argv, isolate, env)]
+    # With checks.wrap_lane "after", the lane step runs inside the wrapper, before the command.
+    return [*wrap, *lane, *sandbox.wrap(argv, isolate, env)]
 
 
 def sandbox_lines(checks: list) -> list[str]:

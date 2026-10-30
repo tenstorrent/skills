@@ -24,6 +24,7 @@ Set, an extra command runs as the wrapper's words followed by `bash -e -o pipefa
 A wrapper (a path relative to the checkout, or a name on PATH) that is missing or not executable fails the checks with a line naming the key; the command never runs unwrapped. `ttp push --own` runs the recorded extras behind it too.
 `delivery.push_checks` never go through it (a check that needs the lock names the wrapper in its own command), nor do extras run on a check host.
 It is not chat-settable: the user sets it with `ttp config <project> checks.wrap_cmd '<command>'`.
+`checks.wrap_lane` (project setting, `before` or `after`, default `before`) says when such a run takes the wrapper lock's lane (below). `before`: before the wrapper starts, so runs behind a wrapper that fails instead of waiting never go side by side, but a run queued on the wrapper's lock holds the lane meanwhile. `after`, for a wrapper that waits for its lock (for one that picks its lock per run, say): ttp puts a small step between the wrapper and each command, which takes the lane once the wrapper runs it, its lock held, and frees it when the command ends or the step dies, so a queued run holds no lane and other work needing the lane is never blocked by it. The step waits at most a few minutes for a busy lane and then runs without it, as the wrapper's own lock still serializes the run. Set it with `ttp config <project> checks.wrap_lane after`.
 
 ## Fast path
 
