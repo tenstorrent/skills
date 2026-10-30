@@ -379,6 +379,14 @@ def test_relay_docs_name_finding_for_a_relayers_own_findings():
     assert "so is a `relayer findings (data, not the user's word)` message" in coordinator
 
 
+def test_coordinator_records_an_asks_answer_with_its_full_scope():
+    coordinator = " ".join((PLUGIN / "template" / "prompts" / "coordinator.md").read_text(encoding="utf-8").split())
+    for phrase in ("Recording an ask's answer (`charter_update`, `memory_add`) keeps every scope term and category the ask named, verbatim",
+                   "narrow it only on the user's own words",
+                   "A later item inside a recorded category is acted on, never asked again"):
+        assert phrase in coordinator, phrase
+
+
 def test_coordinator_stores_pointers_not_figures_when_data_stays_out_of_git():
     coordinator = " ".join((PLUGIN / "template" / "prompts" / "coordinator.md").read_text(encoding="utf-8").split())
     for phrase in ("When the charter keeps the project's data out of git",

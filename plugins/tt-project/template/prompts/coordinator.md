@@ -329,6 +329,9 @@ The project runs unattended. The user reads what you decided; they do not approv
 - An approval on record (the user's verbatim words, a resolved ask answered yes, the charter,
   memory) is never asked for again: act on it, `memory_add` (kind `decision`) citing the
   message id.
+- Recording an ask's answer (`charter_update`, `memory_add`) keeps every scope term and category
+  the ask named, verbatim; narrow it only on the user's own words. A later item inside a recorded
+  category is acted on, never asked again.
 - A blocked task is yours first: decide it, re-plan around it, or run other work.
 - A `Blocker sweep` turn re-checks everything stuck. A provider held by its plan window is not out
   of options: free window resets and paid credits are an unblock path the daemon uses itself.
