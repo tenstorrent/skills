@@ -356,8 +356,8 @@ def test_a_memory_forget_on_the_users_word_is_a_withdrawal_and_a_legacy_record_g
     recs = echoes.records(p)
     assert [(r["source"], r["kind"]) for r in recs] == [(f"memory [{a.stem}] withdrawn", echoes.WITHDRAWN)], recs
     assert [h["class"] for h in echoes.scan(p) if h["label"] == f"task #{copy} spec"] == ["directive"]
-    # A record stored before kinds: a superseded memory entry is SUPERSEDED unless it cites the user's words;
-    # an unknown kind or source fails closed to WITHDRAWN.
+    # A record stored before kinds: a superseded memory entry is SUPERSEDED; one citing the user's words, or an
+    # unknown kind or source, is UNVERIFIED (advisory: nothing shows the user withdrew it).
     legacy = [{"id": "l1", "at": recs[0]["at"], "source": "memory [x] superseded by [y]", "old": "Use `old-tool`.",
                "phrases": ["old-tool"]},
               {"id": "l2", "at": recs[0]["at"], "source": "memory [x] superseded by [y]",
@@ -366,8 +366,8 @@ def test_a_memory_forget_on_the_users_word_is_a_withdrawal_and_a_legacy_record_g
               {"id": "l4", "at": recs[0]["at"], "source": "memory [x] superseded by [y]", "old": "x",
                "phrases": ["old-tool"], "kind": "bogus"}]
     p.db.set_kv(echoes.RETIRED_KEY, legacy)
-    assert {r["id"]: r["kind"] for r in echoes.records(p)} == {"l1": echoes.SUPERSEDED, "l2": echoes.WITHDRAWN,
-                                                                "l3": echoes.WITHDRAWN, "l4": echoes.WITHDRAWN}
+    assert {r["id"]: r["kind"] for r in echoes.records(p)} == {"l1": echoes.SUPERSEDED, "l2": echoes.UNVERIFIED,
+                                                                "l3": echoes.UNVERIFIED, "l4": echoes.UNVERIFIED}
 
 
 def test_a_dedupe_on_the_users_turn_is_no_withdrawal_unless_it_cites_or_quotes_the_users_words(env):
@@ -465,3 +465,72 @@ def test_ttp_echoes_exports_every_retirement_and_match_read_only_including_ones_
         f"{old['id']} [compacted]" in out and "advisory: task #" in out, out
     # Read-only: nothing counted, stored or added.
     assert p.db.kv(echoes.SEEN_KEY) == seen and p.db.one("SELECT COUNT(*) AS n FROM tasks")["n"] == tasks
+
+
+def test_a_retirement_of_unknown_origin_is_advisory_unless_its_source_proves_the_user_withdrew_it(env):
+    from ttp import echoes
+    p = make(env)
+    now = __import__("time").time()
+
+    def rec(i, source, old="Use `old-tool` for loads.", **kw):
+        return dict({"id": i, "at": now, "source": source, "old": old, "phrases": ["old-tool"]}, **kw)
+    p.db.set_kv(echoes.RETIRED_KEY, [
+        rec("unknown", "something new"), rec("blank", ""), rec("bogus", "charter 'Policies' quote replaced",
+                                                               kind="bogus"),
+        # A legacy supersession citing an old user message names where the rule came from, not its withdrawal.
+        rec("cites", "memory [x] superseded by [y]", "User msg #3: use `old-tool` for loads."),
+        rec("names", "memory [x] superseded by [y]", "Use `old-tool`; supersedes [z] (user msg #3)."),
+        rec("forgot", "memory [x] withdrawn"),   # recorded when a user turn alone counted as the user's word
+        rec("plain", "memory [x] superseded by [y]"),
+        # Sources that prove it: a charter text replaced, a user Correction, a kind recorded as withdrawn.
+        rec("charter", "charter 'Policies' quote replaced"), rec("section", "charter 'Recovery' section replaced"),
+        rec("fixed", "memory [c] (user correction)"), rec("kept", "memory [x] withdrawn", kind="withdrawn")])
+    kinds = {r["id"]: r["kind"] for r in echoes.records(p)}
+    assert kinds == {"unknown": echoes.UNVERIFIED, "blank": echoes.UNVERIFIED, "bogus": echoes.UNVERIFIED,
+                     "cites": echoes.UNVERIFIED, "names": echoes.UNVERIFIED, "forgot": echoes.UNVERIFIED,
+                     "plain": echoes.SUPERSEDED, "charter": echoes.WITHDRAWN, "section": echoes.WITHDRAWN,
+                     "fixed": echoes.WITHDRAWN, "kept": echoes.WITHDRAWN}, kinds
+    t = p.db.add_task("t", "Run old-tool on each box.")
+    by = {h["retirement"]: h for h in echoes.scan(p) if h["label"] == f"task #{t} spec"}
+    assert {i for i, h in by.items() if h["class"] == "directive"} == {"charter", "section", "fixed", "kept"}, by
+    for i in ("unknown", "blank", "bogus", "cites", "names", "forgot"):
+        assert by[i]["class"] == "advisory" and "origin" in by[i]["why"], by[i]
+    sec = echoes.digest_lines(p)
+    assert sec[-1].startswith("- 7 advisory matches not shown") and "unknown origin" in sec[-1], sec
+    # A recorded kind outside KINDS is unverified too, never a fix order.
+    assert echoes.record(p.db, "memory [q] withdrawn", "Use `other-tool`.", kind="bogus")["kind"] == echoes.UNVERIFIED
+    data = echoes.export(p)
+    assert {r["id"]: r["kind"] for r in data["retirements"]}["unknown"] == echoes.UNVERIFIED
+
+
+def test_a_fragment_of_a_path_url_or_version_keeps_its_weak_full_token_and_is_never_a_fix_order(env):
+    from ttp import echoes
+    p = make(env)
+    src = "charter 'Policies' quote replaced"   # withdrawn by the user
+    paths = echoes.record(p.db, src, "Load the reference from /srv/models/input.bin before each run.")
+    url = echoes.record(p.db, src, "Read the setup guide at https://docs.example.com/setup first.")
+    ver = echoes.record(p.db, src, "Keep the fleet 'running 0.2.646' until the fix lands.")
+    pin = echoes.record(p.db, src, "Pin each box to `tt_broker-0.2.646` everywhere.")
+    assert "input.bin" in paths["phrases"] and "docs.example.com" in url["phrases"], (paths, url)
+    assert "running 0.2.646" in ver["phrases"] and "tt_broker" in pin["phrases"], (ver, pin)
+    # Controls: the same kind of identifier standing on its own in the retired rule governs.
+    bare = echoes.record(p.db, src, "Route uploads via `mirror.example.org` only.")
+    both = echoes.record(p.db, src, "Call `legacy_loader` (kept at /opt/legacy_loader/bin) for loads.")
+    tasks = {name: p.db.add_task(name, text) for name, text in {
+        "path": "Compare outputs against input.bin.", "url": "Mirror docs.example.com locally.",
+        "ver": "The box is running 0.2.646 now.", "pin": "Start tt_broker on the box.",
+        "rule": "Load the reference from /srv/models/input.bin before each run.",
+        "bare": "Send uploads through mirror.example.org.", "both": "Then call legacy_loader."}.items()}
+    by = {h["label"]: h for h in echoes.scan(p)}
+    cls = {name: by[f"task #{t} spec"]["class"] for name, t in tasks.items()}
+    assert cls == {"path": "advisory", "url": "advisory", "ver": "advisory", "pin": "advisory",
+                   "rule": "directive", "bare": "directive", "both": "directive"}, by
+    assert all("file name" in by[f"task #{tasks[n]} spec"]["why"] for n in ("path", "url", "ver", "pin"))
+    assert by[f"task #{tasks['both']} spec"]["retirement"] == both["id"] and bare["id"]
+    # The fragment test reads the retired text: a fragment, a whole token or a phrase across words.
+    old = "Load /srv/models/input.bin, then `input.bin` again."
+    assert not echoes._fragment("input.bin", old) and echoes._fragment("input.bin", "Load /srv/input.bin.")
+    assert not echoes._fragment("load the reference", "Load the reference.") and not echoes._fragment("x.y", "")
+    assert echoes._weak("tt_broker-0.2.646") and echoes._weak("running 0.2.646") and not echoes._weak("running")
+    assert not any(echoes._weak(x) for x in ("running legacy-card-kick", "docs.example.com", "tt_broker"))
+

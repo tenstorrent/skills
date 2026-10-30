@@ -26,11 +26,12 @@ Each retirement has a KIND: WITHDRAWN (the user withdrew or replaced a governing
 charter_update `quote` or `replaces`, a user Correction, a memory change whose `why` cites the user's
 words, or one on the user's turn that cites or quotes their words or whose message names the old rule:
 coordinator._withdrawn; a dedupe on the user's turn is not one), COMPACTED (a factual entry merged or shortened) or SUPERSEDED (one
-coordinator decision superseded by another). Only a WITHDRAWN retirement's hit on a governing phrase
-is a directive; a hit of the other kinds, or one resting only on a filename, path, version or evidence
-fragment (_weak), is advisory: counted on one line, never a fix order. A record stored before kinds
-existed gets one from its source (_kind); anything unknown is WITHDRAWN (fail closed). `export` is the
-read-only full list behind `ttp echoes`.
+coordinator decision superseded by another), or UNVERIFIED (its origin unknown: nothing shows the user
+withdrew that rule). Only a WITHDRAWN retirement's hit on a governing phrase is a directive; a hit of the
+other kinds, or one resting only on a filename, path, version or evidence fragment (_weak, or an
+identifier the retired text holds only inside such a token: _fragment), is advisory: counted on one line,
+never a fix order. A record stored before kinds existed gets one from its source (_kind); an unknown kind
+or source is UNVERIFIED. `export` is the read-only full list behind `ttp echoes`.
 """
 from __future__ import annotations
 
@@ -48,7 +49,8 @@ SEEN_KEY = "retired_echo_seen"       # kv: {"turn": last_coordinator_turn, "hits
                                      #      "historical": hits declared historical, not listed,
                                      #      "advisory": advisory hits, counted, not listed}
 WITHDRAWN, COMPACTED, SUPERSEDED = "withdrawn", "compacted", "superseded"   # retirement kinds (see the top)
-KINDS = (WITHDRAWN, COMPACTED, SUPERSEDED)
+UNVERIFIED = "unverified"
+KINDS = (WITHDRAWN, COMPACTED, SUPERSEDED, UNVERIFIED)
 HISTORICAL_INDEX = "echo_historical.json"   # harness/: {"historical": [{"path", "sha256", "retirement"}]}
 HISTORICAL_MAX = 200                 # index entries read
 _BINDING_DIRS = {"bin", "prompts", "hooks", "tools"}   # harness/ folders of live scripts and prompts
@@ -83,6 +85,10 @@ _SENTENCE = re.compile(r"(?<=[.!?])\s+")
 _FILEISH = re.compile(r"[\w.-]*\.(?:md|markdown|txt|json|jsonl|ya?ml|toml|py|sh|bash|js|ts|log|csv|tsv|html?|ini"
                       r"|cfg|conf|lock|db|sqlite|patch|diff|out|err|rc|pdf|png|tar|gz|zip)(?::\d+)*")
 _VERSION = re.compile(r"v?\d+(?:\.\d+)+(?:[-+][\w.]+)?")
+_VERSIONED = re.compile(r"[\w.]*[-_@=+]v?\d+(?:\.\d+)+(?:[-+][\w.]+)?")   # a name with a version: tool-1.2.3
+# Words that only say a version or build is in use ('running 0.2.646'): no rule beside a weak token.
+_STATE = {"running", "runs", "using", "uses", "version", "versions", "release", "build", "installed", "deployed",
+          "currently"}
 _EVIDENCE = re.compile(r"(?:#\d+|[0-9a-f]*\d[0-9a-f]*|(?:msgs?|tasks?|runs?|notes?|pr|issue)\s*#?\d+|https?:\S*)")
 _NEGATION = re.compile(r"\b(?:not|never|no longer|instead of|rather than|isn't|aren't|wasn't|weren't|retires)\s*$")
 
@@ -116,33 +122,56 @@ def _weak_token(tok: str) -> bool:
     tok = tok.strip("`'\"()[]{}<>,;:!?")
     tok = tok.rstrip(".")
     return (not tok or "/" in tok or bool(_FILEISH.fullmatch(tok) or _VERSION.fullmatch(tok)
-            or _EVIDENCE.fullmatch(tok) or (len(tok) >= 7 and re.fullmatch(r"[0-9a-f]+", tok)
+            or _VERSIONED.fullmatch(tok) or _EVIDENCE.fullmatch(tok) or (len(tok) >= 7 and re.fullmatch(r"[0-9a-f]+", tok)
                                             and re.search(r"\d", tok))) or not re.search(r"[a-z]", tok))
 
 
 def _weak(ph: str) -> bool:
     """Whether phrase `ph` names no rule alone: each of its words of 4+ characters (all of them when none
-    is) is a file name, path, version, hash, number or evidence reference ('msg #12', a commit)."""
+    is) is a file name, path, version, hash, number or evidence reference ('msg #12', a commit), or, beside
+    at least one such, a word that only says it is in use (_STATE: 'running 0.2.646')."""
     s = ph.strip("`'\" ")
     for pair in re.findall(r"(?:msgs?|tasks?|runs?|notes?|pr|issue)\s+#?\d+", s):   # 'msg #12' is one reference
         s = s.replace(pair, pair.replace(" ", ""))
     words = s.split()
     long = [w for w in words if len(w.strip("`'\"()[]{}<>,;:.!?")) >= 4] or words
-    return bool(long) and all(map(_weak_token, long))
+    weak = [w for w in long if _weak_token(w)]
+    return bool(weak) and all(w in weak or w.strip("`'\"()[]{}<>,;:.!?").lower() in _STATE for w in long)
+
+
+def _fragment(ph: str, old: str) -> bool:
+    """Whether identifier `ph` stands in retired text `old` only inside longer weak tokens (a path, a URL, a
+    versioned name: a file name at the end of a path): it keeps that token's weakness. False when it
+    stands alone there even once, spans words, or is not found (the text kept is cut at 600 characters)."""
+    if not ph or " " in ph:
+        return False
+    flat, found = _flat(old), False
+    i = flat.find(ph)
+    while i >= 0:
+        start, end = flat.rfind(" ", 0, i) + 1, flat.find(" ", i + len(ph))
+        tok = flat[start:end if end >= 0 else len(flat)]
+        if tok.strip("`'\"()[]{}<>,;:!?").rstrip(".") == ph or not _weak_token(tok):
+            return False
+        found, i = True, flat.find(ph, i + 1)
+    return found
 
 
 def _kind(rec: dict) -> str:
-    """Retirement `rec`'s kind: its own when it is one of KINDS; a record without one (stored before kinds)
-    from its source: a memory entry superseded by another is SUPERSEDED unless its text cites the user's
-    words; anything else (a charter change, a user correction, an unknown) is WITHDRAWN."""
+    """Retirement `rec`'s kind: its own when it is one of KINDS, UNVERIFIED for any other. A record without
+    one (stored before kinds) from its source: WITHDRAWN only where the source itself shows the user's
+    withdrawal (a charter text replaced, a user correction); a memory entry superseded by another is
+    SUPERSEDED, or UNVERIFIED when its text cites the user (where the rule came from, not who retired it);
+    anything else (a memory_forget then recorded on a user turn alone, an unknown source) is UNVERIFIED."""
     k = rec.get("kind")
     if k is not None:
-        return k if k in KINDS else WITHDRAWN
+        return k if k in KINDS else UNVERIFIED
     from .project import USER_CITE
-    if re.match(r"memory \[[^\]]+\] superseded by \[", rec.get("source") or "") \
-            and not USER_CITE.search(rec.get("old") or ""):
-        return SUPERSEDED
-    return WITHDRAWN
+    source = rec.get("source") or ""
+    if re.fullmatch(r"charter '.*' (?:quote|section) replaced|memory \[[^\]]+\] \(user correction\)", source):
+        return WITHDRAWN
+    if re.match(r"memory \[[^\]]+\] superseded by \[", source):
+        return UNVERIFIED if USER_CITE.search(rec.get("old") or "") else SUPERSEDED
+    return UNVERIFIED
 
 
 def _store(db, rec: dict, now: float) -> None:
@@ -156,7 +185,7 @@ def record(db, source: str, old: str, new: str = "", skip: list[str] = (), now: 
     """Keep retired text `old` (replaced by `new`) to search for. `skip`: place keys (see places) never
     searched for it, such as the replacing entry. `found`: the phrases, when the caller has them.
     `negated`: a match right after a negation ('never <phrase>') agrees with the change, so is no hit.
-    `kind`: one of KINDS (an unknown one counts as WITHDRAWN). None (nothing kept) when the text has no
+    `kind`: one of KINDS (an unknown one counts as UNVERIFIED). None (nothing kept) when the text has no
     distinctive phrase."""
     now = time.time() if now is None else now
     ps = phrases(old, new) if found is None else [p for p in map(_flat, found) if len(p) >= 6][:MAX_PHRASES]
@@ -165,7 +194,7 @@ def record(db, source: str, old: str, new: str = "", skip: list[str] = (), now: 
     rec = {"id": hashlib.sha256(f"{source}\n{_flat(old)}".encode()).hexdigest()[:10], "at": now,
            "source": " ".join(source.split())[:200], "old": " ".join((old or "").split())[:600],
            "new": _flat(new)[:4000], "phrases": ps, "skip": list(skip), "negated": negated,
-           "kind": kind if kind in KINDS else WITHDRAWN}
+           "kind": kind if kind in KINDS else UNVERIFIED}
     _store(db, rec, now)
     return rec
 
@@ -465,7 +494,8 @@ def records(p, now: float | None = None) -> list[dict]:
 def scan(p, now: float | None = None, historical: list[dict] | None = None) -> list[dict]:
     """The retired texts' echoes: [{"key", "label", "line", "phrase", "source", "retirement", "kind",
     "class", "why"}], newest retirement first. `class` is "directive" (a WITHDRAWN retirement's governing
-    phrase: fix it) or "advisory" (another kind, or only a _weak phrase matched: `why` says which). A hit on
+    phrase: fix it) or "advisory" (another kind, or only a _weak or _fragment phrase matched: `why` says
+    which). A hit on
     a file the historical index declares historical for that retirement, with its bytes still hashing to
     the recorded value, goes to `historical` instead (class "historical")."""
     recs = records(p, now)
@@ -481,7 +511,8 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None) -> l
         own = [ph for ph in rec.get("phrases") or [] if rec.get("negated") or not _generic(ph, vocab)]
         if not own:
             continue
-        own.sort(key=_weak)   # a governing phrase first: a hit rests on it when it can
+        weak = {ph for ph in own if _weak(ph) or _fragment(ph, rec.get("old") or "")}
+        own.sort(key=lambda ph: ph in weak)   # a governing phrase first: a hit rests on it when it can
         skip = set(rec.get("skip") or ())
         for key, label, text, flat in where:
             if key in skip or (rec["id"], key) in seen:
@@ -491,8 +522,9 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None) -> l
                 seen.add((rec["id"], key))
                 if key.startswith("file:"):
                     label += f":{_lineno(text, ph)}"
-                why = ("" if rec["kind"] == WITHDRAWN and not _weak(ph) else
-                       f"retired as {rec['kind']}, not withdrawn by the user" if rec["kind"] != WITHDRAWN
+                why = ("" if rec["kind"] == WITHDRAWN and ph not in weak else
+                       "origin not recorded: nothing shows the user withdrew this rule" if rec["kind"] == UNVERIFIED
+                       else f"retired as {rec['kind']}, not withdrawn by the user" if rec["kind"] != WITHDRAWN
                        else "only a file name, path, version or evidence reference matches")
                 hit = {"key": f"{rec['id']}:{key}", "label": label, "line": _line(text, ph), "phrase": ph,
                        "source": rec.get("source") or "", "retirement": rec["id"], "kind": rec["kind"],
@@ -552,8 +584,9 @@ def digest_lines(p, now: float | None = None) -> list[str]:
         lines.append(f"- {len(hist)} historical line{'s' if len(hist) != 1 else ''} not shown (declared in {where})")
     if advisory:   # counted, never a fix order
         lines.append(f"- {advisory} advisory match{'es' if advisory != 1 else ''} not shown: a compacted fact, a "
-                     f"superseded coordinator decision or only a file name, version or evidence reference, never "
-                     f"a rule the user withdrew; change nothing for them (all: `ttp echoes`)")
+                     f"superseded coordinator decision, a retirement of unknown origin or only a file name, version "
+                     f"or evidence reference, never a rule the user withdrew; change nothing for them (all: "
+                     f"`ttp echoes`)")
     return lines
 
 

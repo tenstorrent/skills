@@ -397,8 +397,8 @@ prolonged whole-box outage.
   their new words or whose message names the old rule, including a `memory_forget`; a dedupe on the
   user's turn is not one)
   gives a fix order, and only where its governing words match as a whole: a compacted fact, a coordinator
-  decision superseded by another, or a match on a file name, path, version or evidence reference alone is
-  advisory, counted on one line. `ttp echoes [--json]` lists, read-only, every retirement (kind, text,
+  decision superseded by another, a retirement of unknown origin, or a match on a file name, path, version or
+  evidence reference alone (or a name the retired text holds only inside one) is advisory, counted on one line. `ttp echoes [--json]` lists, read-only, every retirement (kind, text,
   replacement, source, time) and every match with its class, including those the digest leaves out.
 - Progress and stall check: each minute the daemon checks, without a model, that work keeps yielding
   results (a task done, a worker hand-off, a driver's `result` report). It judges only work that has
