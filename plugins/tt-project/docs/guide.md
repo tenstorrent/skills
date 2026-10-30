@@ -725,7 +725,7 @@ queues behind routine work; nothing running is interrupted:
 - Workers: urgent tasks start first. With every slot taken, an urgent task may take
   `budget.urgent_extra_slots` (1; 0 turns it off) more. The spend gate, auth gate, pauses and locks
   still hold it.
-- Reserve: while a priority 1 task is queued, or waiting with its retry due within the hour, routine
+- Reserve: while a priority 1 task is ready to start, or due within the hour, routine
   work leaves `budget.urgent_reserve_slots` (1; 0 turns it off) of the regular slots free, at least
   one slot staying open to routine work. A ready urgent task never waits behind routine runs that
   started just before it turned ready; running work is never interrupted.

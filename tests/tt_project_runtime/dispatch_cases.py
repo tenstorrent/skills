@@ -1211,6 +1211,61 @@ def test_routine_work_leaves_one_slot_for_queued_or_soon_due_urgent_work_and_dis
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
 
 
+def test_the_urgent_reserve_keeps_no_slot_for_priority_1_work_that_could_not_start(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """The reserve counts only a priority 1 task dispatch could start now or within the hour, for the
+    provider whose slot is decided: one deferred hours away, waiting on a running task, on a paused
+    resource, queued for another provider or a review held by its own pre-review checks keeps none."""
+    from ttp import coordinator as coord, urgent
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=3)
+    core = d.cfg.get("core_provider", "claude")
+    other = "codex" if core != "codex" else "claude"
+    later = time.time() + 6 * 3600
+    blocker = p.db.add_task("long run", "s", kind="work", tier="light", origin="user", priority=3)
+    p.db.update_task(blocker, status="running")
+    coord.pause_resource(p, "board", True, reason="maintenance", by="user")
+    review_of = p.db.add_task("urgent code", "s", kind="code", tier="light", origin="user", priority=1)
+    p.db.update_task(review_of, status="review")
+    cases = {
+        "start_after 6 h": dict(not_before=later, labels=[f"start_after:{later}"]),
+        "depends on a running task": dict(depends_on=[blocker]),
+        "a paused resource": dict(labels=["resource:board"]),
+        "another provider": dict(provider=other),
+        "a review behind its pre-review checks": dict(kind="review", depends_on=[review_of],
+                                                      labels=[f"auto_review:{review_of}"]),
+    }
+    import dataclasses
+    d.gates[other] = dataclasses.replace(d.gates[core], max_parallel=0)   # it stays queued, not started
+    held = set()
+    monkeypatch.setattr(d, "_precheck_holds", lambda t, now: t["id"] in held)
+    monkeypatch.setattr(d, "_precheck_failed", lambda t: False)
+    try:
+        for i, (case, kw) in enumerate(cases.items()):
+            hot = p.db.add_task(f"urgent: {case}", "s", **{"kind": "work", "tier": "light", "origin": "user",
+                                                          "priority": 1, **kw})
+            if kw.get("kind") == "review":
+                assert urgent.reserve_slots(d.cfg, p.db, time.time(), 3, provider=core) == 1, "ready unless held"
+                held.add(hot)
+            else:
+                assert urgent.reserve_slots(d.cfg, p.db, time.time(), 3, provider=core) == 0, case
+            routine = [p.db.add_task(f"routine {i}.{j}", "s", kind="work", tier="light", origin="user", priority=2)
+                       for j in range(3)]
+            d.dispatch()
+            assert _slot_tasks(p) == routine, f"a slot stayed idle for a p1 task that cannot start: {case}"
+            settle(d)
+            p.db.update_task(hot, status="cancelled")
+        ready = p.db.add_task("urgent, ready", "s", kind="work", tier="light", origin="user", priority=1,
+                              provider=other)
+        assert urgent.reserve_slots(d.cfg, p.db, time.time(), 3, provider=other) == 1, "its own provider keeps one"
+        assert urgent.reserve_slots(d.cfg, p.db, time.time(), 3, provider=core) == 0
+        p.db.update_task(ready, status="running")
+        assert urgent.reserve_slots(d.cfg, p.db, time.time(), 3, provider=other,
+                                    due=[p.db.task(ready)]) == 0, "one dispatch started since keeps none"
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
 def test_unstarted_events_ride_with_the_next_turn_and_never_wake_alone():
     from ttp import coordinator, unstarted
     assert coordinator.batchable(unstarted.READY_KIND, "normal")
