@@ -5,12 +5,12 @@ Subagents are authorized when a selected skill requests or recommends them.
 This goal runs agentic evals on the served autoport and tunes its serving configuration for them, following the goal-12 section of $agentic-serving. Read bringup/agentic_evals/inputs.json if it exists; otherwise use that skill's defaults. Use only the hardware the inputs grant, and keep it busy.
 
 Goal completion requirements:
-- The harness is proven end to end before any scored run.
-- Small seeded samples measure the workload and noise and re-check the serving invariants on real traffic; failures are fixed in the owning stage's code.
-- Changes are tested one per arm against the current best on the same tasks, with a prediction first; kept changes beat the noise, have an explained mechanism, and are re-run together.
-- doc/agentic_evals/estimate.json records per eval a go/stop decision and reason. Full suites run only on go and record actual hours next to the prediction. A measured stop is a valid outcome.
+- Eval names and versions, agent and request time limits and the output cap come from the release spec, never below its values; each eval is served on the smallest validated batch at or above its planned clients.
+- Before any scored sample, doc/agentic_evals/survey.json answers every check and calculation in the skill's survey, prices each shortfall carried from earlier stages in suite hours, and doc/agentic_evals/preflight.json shows the registry, disk, release route and an isolated smoke passing.
+- doc/agentic_evals/efforts.json ranks the survey's problems by suite hours saved and gives each an owner and a time cap. Efforts run in parallel inside the effort budget, try the fastest test first, and end kept, dropped or capped with the measured number. Exact changes are accepted on a paired exactness check plus a measured gain; others need a scored pair against the current best. Kept changes are re-checked together.
+- doc/agentic_evals/estimate.json records per eval a go/stop decision and reason, first from the survey and updated after each effort. Full suites run only on go and record actual hours next to the prediction. A measured stop is a valid outcome.
 - doc/agentic_evals/serving_config.json records the measured serving values a release spec needs, and doc/agentic_serving.json `workload` is updated with measured values.
-- doc/agentic_evals/REPORT.md leads with hours per suite and scores against references, then the chosen configuration and remaining limits. Scores are reported, not gated.
+- doc/agentic_evals/REPORT.md leads with hours per suite and scores against references, then hours per effort against its cap, the chosen configuration and remaining limits. Scores are reported, not gated.
 - Only owned processes and containers are stopped. Commit stage-owned changes to the execution checkout locally and log SHAs; never push that checkout or add a remote to it.
 
 Unmet requirements and failed gates: work. Use $autofix for execution or integration failures. Stop only after `$autofix` fails or the stage budget ends, preserving partial results and the reason.

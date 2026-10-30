@@ -301,5 +301,5 @@ own batch: the single-user configuration with a larger `--max-num-seqs` is not a
 configuration and must not be recorded as one.
 
 Record any batch the device cannot hold, with the reason. Later stages measure every validated
-batch and run evals on the largest, so an unrecorded drop silently moves where the scores come
-from.
+batch and serve each eval on the smallest one at or above its planned clients, so an unrecorded
+drop silently moves where the scores come from.

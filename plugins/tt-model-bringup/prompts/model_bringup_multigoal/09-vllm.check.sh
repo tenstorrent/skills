@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 TT_MODEL_BRINGUP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PYTHON="${PYTHON:-$(command -v python3 || command -v python)}"
 # Runner-side gate for the vLLM integration stage: served qualitative outputs
 # (greedy and sampled) must exist and must not be mechanically degenerate. A
 # serving path that doubles tokens or collapses to one token is a serving bug,
@@ -13,16 +14,16 @@ else
   echo "Neither MODEL_DIR nor HF_MODEL is set; cannot scope the check to the target model." >&2
   exit 3
 fi
-python "${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/check_degenerate_output.py" \
+"$PYTHON" "${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/check_degenerate_output.py" \
   "${scope_args[@]}" --missing-artifacts critical --scope vllm || exit $?
 
-python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_context_contract.py" \
+"$PYTHON" "${TT_MODEL_BRINGUP_ROOT}/scripts/check_context_contract.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" \
   --stage vllm --require-contract || rc=$?
 rc=${rc:-0}
 [ "$rc" -ge 2 ] && exit "$rc"
 
-python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_agentic_serving.py" \
+"$PYTHON" "${TT_MODEL_BRINGUP_ROOT}/scripts/check_agentic_serving.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --stage vllm || serving=$?
 [ "${serving:-0}" -gt "$rc" ] && rc=$serving
 exit "$rc"

@@ -76,4 +76,7 @@ suites on task boundaries so parts stay scorable, and give a multi-eval run per-
 summing under the cap.
 
 Infrastructure failures (runner offline, image pull, unrelated timeout) are re-dispatched, not
-scored. Crashes, loops and malformed output are measurements.
+scored. Crashes, loops and malformed output are measurements. This holds for the release run too:
+its coordinator must allow a re-dispatch after an infrastructure failure, and the release route
+(the repository, workflow and token that pull the image) is proven in the survey's preflight, not
+first used at the end.
