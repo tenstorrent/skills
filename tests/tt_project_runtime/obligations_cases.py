@@ -218,3 +218,24 @@ def test_obligation_reown_skips_a_wake_answered_with_an_owner_dropped_or_receive
     check(t0 + 300)
     check(t0 + 600)
     assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 0
+
+
+def test_obligation_wake_settled_without_a_model_turn_is_reowned_once(env, monkeypatch):
+    """A no-live-owner wake that no turn read (a quiet-gate skip marks it handled, the rejection cooldown
+    mutes it) is settled all the same: the daemon starts the one owner itself."""
+    from ttp import obligations as ob, quietgate
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    a = ob.add(p, "the perf table", [tid], now=now)
+    b = ob.add(p, "the CI summary", [tid], now=now)
+    p.db.update_task(tid, status="done")
+    t0 = now + 2 * 3600 + 60
+    evs = {e["fingerprint"]: e for e in check(t0)}
+    assert set(evs) == {f"obligation:{a}:1", f"obligation:{b}:1"}, evs
+    quietgate.skip(p.db, [dict(evs[f"obligation:{a}:1"])], None, t0 + 30)
+    p.db.x("UPDATE events SET status='muted' WHERE id=? AND status='queued'", (evs[f"obligation:{b}:1"]["id"],))
+    check(t0 + 300)
+    check(t0 + 600)
+    for oid in (a, b):
+        new = [t for t in ob.get(p.db, oid)["owners"] if int(t) != tid]
+        assert len(new) == 1 and p.db.task(int(new[0]))["origin"] == "daemon", (oid, new)
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 2
