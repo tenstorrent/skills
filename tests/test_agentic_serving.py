@@ -101,7 +101,7 @@ def goal12(model, **overrides):
                                 'release_limits': {'agent_timeout_s': 6300, 'request_timeout_s': 3600,
                                                    'output_cap_tokens': 81920},
                                 'validated_batches': [1, 8, 16, 32],
-                                'batch_by_eval': {'swe': {'batch': 8, 'planned_clients': 8}}},
+                                'batch_by_eval': {'swe': {'batch': 32}}},
     }
     files.update(overrides)
     for name, body in files.items():
@@ -230,7 +230,7 @@ def test_reordered_ranking_needs_a_reason(tmp_path):
 @pytest.mark.parametrize('mutate, message', [
     (lambda c: c.update(agent_timeout_s=900), 'agent_timeout_s 900 is below'),
     (lambda c: c.update(output_cap_tokens=16384), 'output_cap_tokens 16384 is below'),
-    (lambda c: c['batch_by_eval']['swe'].update(batch=32), 'batch 8 is validated'),
+    (lambda c: c['batch_by_eval']['swe'].update(batch=8), 'batch 32 is validated'),
 ])
 def test_release_limits_and_batch_choice(tmp_path, mutate, message):
     files = goal12(tmp_path)

@@ -75,7 +75,6 @@ Optional operator inputs come from `bringup/agentic_evals/inputs.json` in the ta
   current release spec names them; the default subset is 10 tasks each;
 - `batch_sizes`, see [Decode batches](#decode-batches): stage 10 validates a tuned configuration
   per batch and stage 11 measures a profile for each surviving one;
-- `planned_clients` per eval: how many agents the release runs at once;
 - `stage_budget_hours` (default 24), `effort_budget_hours` (default 16) and `suite_budget_hours`
   (default 8);
 - reference scores;
@@ -101,9 +100,9 @@ Some settings are not tuning arms. Read them from the release spec before the fi
 - Eval names and versions. A stale default in a skill or inputs file does not override the spec.
 - Agent time limit, request time limit and output cap: never below the release values. Raise the
   output cap while any answer hits it; a capped answer measures the cap, not the model.
-- Batch: serve each eval on the smallest validated batch at or above its `planned_clients`. A larger
-  batch pads every step and prefill to its full shape. A server may hold several batches; record
-  the one each eval used.
+- Batch: run the full evals on the largest validated batch, with enough agents to fill it, unless a
+  recorded reason says otherwise. Samples and tests use the largest batch that works and suits the
+  test. Record the batch each eval used.
 
 Record them in `serving_config.json` next to `release_limits`, the values the spec sets.
 

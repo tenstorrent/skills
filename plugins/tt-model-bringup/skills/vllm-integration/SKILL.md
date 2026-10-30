@@ -302,5 +302,5 @@ configuration and must not be recorded as one. Tune batch 1 first, then the larg
 any in between.
 
 Record any batch the device cannot hold, with the reason. Later stages measure every validated
-batch and serve each eval on the smallest one at or above its planned clients, so an unrecorded
+batch and run the full evals on the largest, so an unrecorded
 drop silently moves where the scores come from.

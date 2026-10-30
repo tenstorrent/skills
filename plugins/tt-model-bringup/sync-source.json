@@ -274,7 +274,7 @@
       "destination": "skills/vllm-integration/SKILL.md",
       "blob": "05d9e19f7cfbb596d209c504cc49e063b9361da1",
       "source_sha256": "a23a516ab0e8afc3a5dd6ddd72a42781997fb454872139e70605ecbd234e114c",
-      "packaged_sha256": "ad6b8753e1d718542237bb0e021cfaf1fe2a4b655de80650922dc8a45e862fda"
+      "packaged_sha256": "f31a2fb69a8e4cb27d663babfcd91ab13219c2788f66746c7c7abe038128c934"
     },
     {
       "source": ".agents/skills/vllm-integration/agents/openai.yaml",

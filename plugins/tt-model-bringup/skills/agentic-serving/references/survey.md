@@ -33,7 +33,7 @@ eval.
 
 | Key | Question | Formula |
 |---|---|---|
-| `batch` | Which batch serves the planned clients? | Smallest validated batch ≥ planned clients |
+| `batch` | Which batch? | Full evals: the largest validated batch; samples: the largest the test keeps busy |
 | `suite_hours` | Will each suite finish? | tasks × (uncached tokens ÷ prefill tok/s + output tokens × step ÷ busy rows) ÷ agents |
 | `agent_timeout` | What agent time limit? | turns × turn time × margin, never below the release limit |
 | `output_cap` | What output cap? | Raise it while any answer hits it |

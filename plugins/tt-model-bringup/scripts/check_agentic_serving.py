@@ -196,14 +196,12 @@ def check_serving_config(evals: Path, problems: list) -> None:
         problems.append((2, "serving_config needs validated_batches and batch_by_eval"))
         return
     for name, row in batches.items():
-        batch, clients = (row or {}).get("batch"), (row or {}).get("planned_clients")
-        if not (positive_int(batch) and positive_int(clients)):
-            problems.append((2, f"batch_by_eval.{name} needs batch and planned_clients"))
-            continue
-        fitting = [b for b in validated if b >= clients]
-        if fitting and batch > min(fitting):
+        batch = (row or {}).get("batch")
+        if not positive_int(batch):
+            problems.append((2, f"batch_by_eval.{name} needs batch"))
+        elif batch < max(validated):
             shortfall(problems, (row or {}).get("batch_reason"),
-                      f"{name} serves {clients} clients on batch {batch}; batch {min(fitting)} is validated")
+                      f"{name} ran on batch {batch}; batch {max(validated)} is validated")
 
 
 def check_evals(model_dir: Path, carried: int, problems: list) -> None:
