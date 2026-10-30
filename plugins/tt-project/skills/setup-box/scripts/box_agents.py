@@ -22,7 +22,9 @@
   config of each editor server on the box (Cursor `~/.cursor/mcp.json`, VS Code's remote user `mcp.json`).
   `login <alias> <cli> --mcp glean` runs the CLI's OAuth sign-in on the box in a tmux session of its own
   server (`tmux -L ttp-login`), started over ssh in the user's session, never in a sandbox; it hands out
-  the link only once the sign-in's localhost callback port listens on the box. Every such sign-in uses one
+  the link only once the sign-in's localhost callback port listens on the box, checked again from a new ssh
+  session after the starting one ended (its tmux server starts apart from that session, `systemd-run --user
+  --scope` or `setsid`; a dead one is stopped and started once more). Every such sign-in uses one
   fixed callback port (CALLBACK_PORT, `--callback-port` overrides it), so one standing `ssh -L` forward from
   the user's machine completes them all. `check` reports Glean per
   agent as missing, configured but signed out, or working; `check --search` proves working with a real
@@ -437,6 +439,18 @@ _CALLBACK = ('p=$(printf "%s\\n" "$o" | grep -ioE "redirect_uri=https?%3A%2F%2F[
 _LISTEN = ('l=; if [ -n "$p" ] && [ -n "$SS" ]; then l=$($SS -Hltn 2>/dev/null | awk -v p=":$p" '
            '\'{a=$4; if (substr(a, length(a) - length(p) + 1) == p) {print a; exit}}\'); fi; ')
 _DEAD = '[ -n "$p" ] && [ -n "$SS" ] && [ -z "$l" ]'
+# Shell: $LA the launcher that starts the sign-in's tmux server apart from the ssh session running this, so it
+# outlives that session: `systemd-run --user --scope` where the user's manager lingers (it outlives every
+# session then), else `setsid` (a session of its own), else nothing.
+_DETACH = ('LA=; command -v setsid >/dev/null 2>&1 && LA=setsid; if command -v systemd-run >/dev/null 2>&1 && '
+           '[ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null)" = yes ]; then '
+           'LA="systemd-run --user --scope --quiet --collect"; fi; ')
+LISTEN_WAIT = 30  # seconds a new sign-in's callback port has to start listening before its link is called dead
+
+
+def _signin_log(cli: str, mcp: str) -> str:
+    """The box's owner-only file a sign-in's pane is logged to (kept after it ends, replaced by the next one)."""
+    return f'{LOGIN_DIR}/{_login_key(cli, mcp)}.signin.log'
 
 
 def mcp_login_script(cli: str, mcp: str, wait: Optional[int] = None, port: int = CALLBACK_PORT) -> str:
@@ -451,8 +465,14 @@ def mcp_login_script(cli: str, mcp: str, wait: Optional[int] = None, port: int =
     terminal: the redirect URL the browser ends on can be pasted back (`--code-stdin`). It waits up to
     `wait` seconds (`signin_wait`: never past the CLI's own limit); the session keeps when that ends
     (`until=`, epoch seconds) for a later call.
+    A new tmux server starts detached from this ssh session (`_DETACH`) and the pane is logged to
+    `_signin_log`. A link must show within 30 s and its callback port (the fixed one when the link names
+    none) listen within LISTEN_WAIT s; else the sign-in is stopped (`state=no-link` or `no-listener`).
     """
     wait = signin_wait(cli, wait)
+    # One tmux command: the log is attached before the server reads the pane's first output.
+    new = (f'$X new-session -d -s "$S" -x 400 -y 50 -c "$HOME" "{CALLBACK_SET[cli].format(port=int(port), mcp=mcp)}" '
+           '\\; pipe-pane -t "=$S:" -o "cat >>\'$L\'" </dev/null >/dev/null 2>&1')
     return (_TIMEOUT + 'umask 077; ' + _login_ready(cli, mcp)
             # From the `mcp` listing: Claude Code (Commander) exits 0 for `mcp <unknown> --help`.
             + 'if ! $T "$b" mcp --help </dev/null 2>/dev/null | grep -Eq "^[[:space:]]+login([[:space:]]|$)"; then '
@@ -462,14 +482,19 @@ def mcp_login_script(cli: str, mcp: str, wait: Optional[int] = None, port: int =
             + f'if {_DEAD}; then $X kill-session -t "=$S" 2>/dev/null; echo "replaced=$p"; fi; fi; '
             'if $X has-session -t "=$S" 2>/dev/null; then st=pending; else '
             f'p={int(port)}; ' + _LISTEN + 'if [ -n "$l" ]; then echo "busy=$l"; echo state=port-busy; exit 0; fi; '
-            f'TL=; command -v timeout >/dev/null 2>&1 && TL="timeout {int(wait)}"; '
-            f'$X new-session -d -s "$S" -x 400 -y 50 -c "$HOME" "{CALLBACK_SET[cli].format(port=int(port), mcp=mcp)}" '
-            '</dev/null >/dev/null 2>&1 || { echo state=failed; exit 0; }; st=started; '
+            f'TL=; command -v timeout >/dev/null 2>&1 && TL="timeout {int(wait)}"; ' + _DETACH
+            + f'd={LOGIN_DIR}; mkdir -p "$d"; chmod 700 "$d"; L={_signin_log(cli, mcp)}; : >"$L"; '
+            # A launcher that cannot start it (systemd-run with no user bus over this ssh) falls back to none.
+            f'{{ $LA {new} || {{ [ -n "$LA" ] && {{ $X has-session -t "=$S" 2>/dev/null || {new}; }}; }}; }} '
+            '|| { echo state=failed; exit 0; }; st=started; '
             f'[ -n "$TL" ] && $X set-option -t "=$S" @ttp_until "$(( $(date +%s) + {int(wait)} ))" 2>/dev/null; fi; '
             'i=0; while :; do ' + _CAPTURE + 'case "$o" in *https://*) break ;; esac; '
             '[ $i -ge 30 ] && break; $X has-session -t "=$S" 2>/dev/null || break; sleep 1; i=$((i+1)); done; '
-            + _CALLBACK + 'i=0; while [ -n "$p" ] && [ -n "$SS" ]; do ' + _LISTEN
-            + '[ -n "$l" ] && break; [ $i -ge 10 ] && break; sleep 1; i=$((i+1)); done; '
+            'case "$o" in *https://*) ;; *) $X kill-session -t "=$S" 2>/dev/null; '
+            'printf "%s\\n" "$o" | sed -n "1,40p" | sed "s/^/out=/"; echo state=no-link; exit 0 ;; esac; '
+            + _CALLBACK + f'[ -z "$p" ] && [ "$st" = started ] && p={int(port)}; '
+            'i=0; while [ -n "$p" ] && [ -n "$SS" ]; do ' + _LISTEN
+            + f'[ -n "$l" ] && break; [ $i -ge {LISTEN_WAIT} ] && break; sleep 1; i=$((i+1)); done; '
             f'if {_DEAD}; then $X kill-session -t "=$S" 2>/dev/null; echo "nolisten=$p"; echo state=no-listener; exit 0; fi; '
             'echo "state=$st"; echo "session=$S"; [ -n "$l" ] && echo "listen=$l"; '
             'u=$($X show-options -v -t "=$S" @ttp_until 2>/dev/null); [ -n "$u" ] && echo "until=$u"; '
@@ -559,6 +584,12 @@ def status_script(cli: str, mcp: Optional[str] = None) -> str:
             f'd={LOGIN_DIR}; pid=$(cat "$d/{c}.pid" 2>/dev/null); '
             'if [ "$st" = logged-out ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then st=pending; fi; '
             'echo "state=$st"')
+
+
+def stop_script(cli: str, mcp: str) -> str:
+    """Stop the MCP sign-in's tmux session on the box, if any, and print its log's last lines (`out=`)."""
+    return (_tmux(cli, mcp) + 'command -v tmux >/dev/null 2>&1 && $X kill-session -t "=$S" 2>/dev/null; '
+            f'tail -n 8 {_signin_log(cli, mcp)} 2>/dev/null | sed "s/^/out=/"; true')
 
 
 def _state(out: str) -> str:
@@ -759,6 +790,25 @@ def until_text(epoch, tz=None, now: Optional[float] = None) -> str:
     return datetime.datetime.fromtimestamp(ts, tz or home_zone()).strftime(fmt)
 
 
+def _dead_signin(alias: str, cli: str, mcp: str, out: str):
+    """Why the MCP sign-in `out` (from `login_script`) started gives no working link, "" when it does, or the
+    exit code of a failed ssh. A link it shows is checked again from a new ssh session, once the one that
+    started it has ended: a sign-in that died with that session never reaches the user."""
+    st = _state(out)
+    if st == "no-listener":
+        port = next((ln.split("=", 1)[1] for ln in out.splitlines() if ln.startswith("nolisten=")), "?")
+        return f"its callback port {port} did not start listening on the box within {LISTEN_WAIT} s"
+    if st not in ("started", "pending") or not any("https://" in ln for ln in relay_lines(out)):
+        return ""
+    r = _ssh(alias, status_script(cli, mcp), timeout=150)
+    bad = _ssh_failed(alias, r)
+    if bad is not None:
+        return bad
+    if _state(r.stdout) in ("no-listener", "logged-out"):
+        return "its callback stopped listening once the ssh session that started it ended"
+    return ""
+
+
 def cmd_login(args) -> int:
     cli, mcp = args.cli, args.mcp
     what = f"{cli} {mcp} sign-in" if mcp else f"{cli} login"
@@ -790,10 +840,27 @@ def cmd_login(args) -> int:
     if not 1024 <= port <= 65535:
         print(f"--callback-port {port}: use a port from 1024 to 65535")
         return 2
-    r = _ssh(args.alias, login_script(cli, mcp, wait, port), timeout=240)
-    bad = _ssh_failed(args.alias, r)
-    if bad is not None:
-        return bad
+    for attempt in (1, 2) if mcp else (1,):
+        r = _ssh(args.alias, login_script(cli, mcp, wait, port), timeout=240)
+        bad = _ssh_failed(args.alias, r)
+        if bad is not None:
+            return bad
+        dead = _dead_signin(args.alias, cli, mcp, r.stdout) if mcp else ""
+        if isinstance(dead, int):
+            return dead
+        if not dead:
+            break
+        # Stopped, never handed out: a link is posted (and alerted) only once its callback listens.
+        s = _ssh(args.alias, stop_script(cli, mcp), timeout=60)
+        if attempt == 1:
+            print(f"({what} on {args.alias}: {dead}; stopped it, starting it once more)")
+            continue
+        why = [ln for ln in relay_lines(s.stdout or "") if "https://" not in ln]
+        print(f"{what} on {args.alias}: {dead}, twice; not handing out its link, which would not work (stopped "
+              "it). Sign-ins start over ssh in the box's own tmux server, apart from the ssh session; if this "
+              f"repeats, look for what stops localhost listeners or ends the user's processes on the box, then "
+              f"`{again}` while the user is there" + "".join(f"\n  {ln}" for ln in why))
+        return 1
     st = _state(r.stdout)
     if st == "logged-in":
         print(f"{cli}{f' {mcp}' if mcp else ''} on {args.alias}: already signed in")
@@ -821,11 +888,6 @@ def cmd_login(args) -> int:
               f"there (`{BOX_PY} agents login {args.alias} <cli> --mcp {mcp} --status`): finish it or let it end, then "
               f"`{again}`; or start this one on another port with `{again} --callback-port <port>` (its forward then "
               "uses that port)")
-        return 1
-    if st == "no-listener":
-        print(f"{what} on {args.alias}: its callback port {kv.get('nolisten', '?')} is not listening on the box, so "
-              "its link would not work; not handing it out (stopped it). Sign-ins run over ssh in the box's own "
-              f"tmux server; if this repeats, look for what blocks localhost listeners on the box, then `{again}`")
         return 1
     shown = relay_lines(r.stdout)
     if st not in ("started", "pending") or not any("https://" in ln for ln in shown):

@@ -2759,12 +2759,14 @@ def test_setup_box_agents_login_wait_sets_the_window_and_the_message_names_its_e
                                                     "status": False, "code_stdin": False, **kw}))
         return rc, buf.getvalue()
     rc, out = login(wait=7200, cli="codex")
-    assert rc == 0 and "timeout 7200" in sent[-1], out
+    # The start, then a check from a new ssh session that its callback still listens.
+    assert rc == 0 and "timeout 7200" in sent[-2] and "st=pending" in sent[-1], out
     assert f"This link works until {want}: open it before then." in out and f"up to 120 min (until {want})" in out, out
     assert "Start a new one only while the user is there to open it." in out, out
     # Claude Code's sign-in waits its own 5 min at most, and the message says so.
     rc, out = login(wait=7200)
-    assert rc == 0 and 'TL="timeout 300"' in sent[-1] and "timeout 7200" not in sent[-1], out
+    assert rc == 0 and 'TL="timeout 300"' in sent[-2] and "timeout 7200" not in sent[-2], out
+    assert "st=pending" in sent[-1], out
     assert f"up to 5 min (until {want})" in out and "inside that window" in out, out
     assert "only while the user is there to open it (claude stops its sign-in after 5 min)." in out, out
     # A box that keeps no end (no `timeout` there) gets the length only; a too-short wait starts nothing.
@@ -2796,6 +2798,7 @@ def _glean_fakes(home):
         "[ \"$1 $3\" = 'mcp --help' ] && exit 0\n"
         "[ \"$1 $2\" = 'mcp login' ] && [ -f $HOME/no-mcp-login ] && exit 1\n"
         # The sign-in takes MCP_OAUTH_CALLBACK_PORT (an old CLI, $HOME/old-cli, ignores it) and records its port and pid.
+        "[ \"$1 $2\" = 'mcp login' ] && [ -f $HOME/no-link ] && { echo 'error: server unreachable'; exec sleep 600; }\n"
         "if [ \"$1 $2\" = 'mcp login' ]; then P=41234; [ -f $HOME/old-cli ] || P=${MCP_OAUTH_CALLBACK_PORT:-41234};"
         " echo $P > $HOME/cb.port; echo $$ > $HOME/cb.pid; echo 'Visit this URL to authorize:';"
         " echo \"  https://g.invalid/oauth/authorize?client_id=c&redirect_uri=http%3A%2F%2Flocalhost%3A$P%2Fcallback&s=1\";"
@@ -3081,7 +3084,7 @@ def test_setup_box_agents_glean_sign_in_runs_in_tmux_and_hands_out_a_link_only_w
     try:
         # Nothing listens: no link is handed out, the session is stopped, and the user is told plainly.
         rc, out = login()
-        assert rc == 1 and "https://" not in out and "port 41234 is not listening" in out, out
+        assert rc == 1 and "https://" not in out and "port 41234 did not start listening" in out, out
         assert not alive()
         # It listens: the link goes out with both ways to complete it, the forward aimed at the listen address.
         (home / "listen").write_text("")
@@ -3145,6 +3148,102 @@ def test_setup_box_agents_glean_sign_in_runs_in_tmux_and_hands_out_a_link_only_w
         shutil.rmtree(env["TMUX_TMPDIR"], ignore_errors=True)
 
 
+def test_setup_box_agents_glean_sign_in_starts_detached_and_hands_out_a_link_only_if_it_outlives_the_ssh(
+        tmp_path, monkeypatch):
+    import argparse
+    import contextlib
+    import io
+    import shutil
+    import subprocess
+    import tempfile
+    if not shutil.which("tmux"):
+        pytest.skip("no tmux")
+    ba = _agents(monkeypatch)
+    home, env = _agents_home(tmp_path)
+    _fast_sleep(env)
+    _glean_fakes(home)
+    (home / "claude-mcp").write_text("https://g.invalid/mcp\n")
+    shim = tmp_path / "shim"
+    (shim / "ss").write_text("#!/bin/sh\nkill -0 \"$(cat \"$HOME/cb.pid\" 2>/dev/null)\" 2>/dev/null"
+                             " && echo \"LISTEN 0 4096 127.0.0.1:$(cat \"$HOME/cb.port\") 0.0.0.0:*\"\nexit 0\n")
+    # Launchers: each records how it was called; systemd-run runs the command after its options unless
+    # $HOME/no-bus (no user bus over ssh); loginctl says the user's manager lingers when $HOME/linger exists.
+    (shim / "setsid").write_text("#!/bin/sh\necho \"$*\" >> \"$HOME/setsid.log\"\nexec \"$@\"\n")
+    (shim / "systemd-run").write_text(
+        "#!/bin/sh\necho \"$*\" >> \"$HOME/systemd-run.log\"\n[ -f \"$HOME/no-bus\" ] && exit 1\n"
+        "while [ \"${1#--}\" != \"$1\" ]; do shift; done\nexec \"$@\"\n")
+    (shim / "loginctl").write_text("#!/bin/sh\n[ -f \"$HOME/linger\" ] && echo yes || echo no\n")
+    for f in ("ss", "setsid", "systemd-run", "loginctl"):
+        (shim / f).chmod(0o755)
+    env["TMUX_TMPDIR"] = tempfile.mkdtemp(prefix="ttpt", dir="/tmp")
+    tmux = shutil.which("tmux")
+    (tmp_path / "sysbin/tmux").unlink(missing_ok=True)
+    (tmp_path / "sysbin/tmux").symlink_to(tmux)
+    session = ba._session("claude", "glean")
+    kill = [tmux, "-L", "ttp-login", "kill-session", "-t", f"={session}"]
+    alive = lambda: subprocess.run([tmux, "-L", "ttp-login", "has-session", "-t", f"={session}"], env=env,
+                                   capture_output=True).returncode == 0
+
+    def ssh(alias, script, timeout, input=None):
+        r = subprocess.run(["sh", "-c", script], env=env, input=input, capture_output=True, text=True, timeout=120)
+        # $HOME/dies holds how many more sign-ins end with the ssh session that started them.
+        n = int((home / "dies").read_text() or 0) if (home / "dies").exists() else 0
+        if "new-session" in script and n:
+            subprocess.run(kill, env=env, capture_output=True)
+            (home / "dies").write_text(str(n - 1))
+        return r
+
+    def login():
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = ba.cmd_login(argparse.Namespace(alias="<box-alias>", cli="claude", mcp="glean", status=False,
+                                                 code_stdin=False, callback_port=41234))
+        return rc, buf.getvalue()
+
+    monkeypatch.setattr(ba, "_ssh", ssh)
+    try:
+        # The user's manager lingers: the sign-in's tmux server starts in a user scope, apart from the session.
+        (home / "linger").write_text("")
+        rc, out = login()
+        assert rc == 0 and "https://" in out and alive(), out
+        assert "--user --scope" in (home / "systemd-run.log").read_text()
+        # Its pane goes to an owner-only log on the box.
+        log = home / ".cache/tt-project/agent-login/claude-glean.signin.log"
+        assert "Visit this URL" in log.read_text() and oct(log.parent.stat().st_mode)[-3:] == "700"
+        subprocess.run(kill, env=env, capture_output=True)
+        # No user bus over this ssh: the start falls back to a plain one and still works.
+        (home / "no-bus").write_text("")
+        rc, out = login()
+        assert rc == 0 and "https://" in out and alive(), out
+        subprocess.run(kill, env=env, capture_output=True)
+        # No lingering manager: setsid.
+        (home / "linger").unlink()
+        (home / "no-bus").unlink()
+        rc, out = login()
+        assert rc == 0 and alive() and "new-session" in (home / "setsid.log").read_text(), out
+        subprocess.run(kill, env=env, capture_output=True)
+        # The sign-in dies with the ssh session that started it once: a new session sees it dead, it is stopped,
+        # started once more, and only the second, live link goes out.
+        (home / "dies").write_text("1")
+        rc, out = login()
+        assert rc == 0 and "stopped it, starting it once more" in out and out.count("https://") == 1, out
+        assert alive()
+        subprocess.run(kill, env=env, capture_output=True)
+        # It dies every time: no link at all, the session cleaned up, the log's last lines say why.
+        (home / "dies").write_text("2")
+        rc, out = login()
+        assert rc == 1 and "https://" not in out and "twice; not handing out its link" in out, out
+        assert "ended" in out and "Or paste the redirect URL here:" in out and not alive()
+        # No link shows within its 30 s: stopped, never left pending.
+        (home / "no-link").write_text("")
+        rc, out = login()
+        assert rc == 1 and "did not show a sign-in link (no-link)" in out and "server unreachable" in out, out
+        assert not alive()
+    finally:
+        subprocess.run([tmux, "-L", "ttp-login", "kill-server"], env=env, capture_output=True)
+        shutil.rmtree(env["TMUX_TMPDIR"], ignore_errors=True)
+
+
 def test_setup_box_connector_sign_ins_document_one_fixed_callback_port_and_one_standing_forward(monkeypatch):
     ba = _agents(monkeypatch)
     port = ba.CALLBACK_PORT
@@ -3165,6 +3264,16 @@ def test_setup_box_connector_sign_ins_document_one_fixed_callback_port_and_one_s
     assert "each box a user's machine keeps a standing forward to takes its own `--callback-port` and its own forward, whether or not sign-ins overlap in time" in connectors
     assert "Claude Code's sign-in link works for 5 min: it is started only while the user is there" in connectors
     assert f"`-c mcp_oauth_callback_port={port}`" in connectors
+
+
+def test_setup_box_connector_sign_ins_document_the_detached_start_and_the_listener_check():
+    agents = " ".join((SKILLS / "setup-box" / "agents.md").read_text(encoding="utf-8").split())
+    for want in ("starts apart from the ssh session that launches it", "`systemd-run --user --scope`", "`setsid`",
+                 "only after the callback port listens on the box (`ss -ltn`, polled up to 30 s)",
+                 "a check from a new ssh session", "starts it once more", "hands out no link",
+                 "One message to the user per link handed out", "never re-issued on a timer while the user is away",
+                 "right after their next message"):
+        assert want in agents, want
 
 
 def test_setup_box_agents_editor_defaults_merge_keeps_entries_and_comments(tmp_path, monkeypatch):

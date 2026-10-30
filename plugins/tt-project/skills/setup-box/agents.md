@@ -99,6 +99,16 @@ Link to the tt-buddy plugin's recipes and skills; do not copy them here.
   out the link it checks with `ss` that the sign-in's callback port listens on the box; if not, it
   stops the sign-in and says so, and never hands out a dead link.
   A pending sign-in whose port stopped listening is replaced on the next `login`.
+- Detached start, live link only: the sign-in's tmux server starts apart from the ssh session that
+  launches it (`systemd-run --user --scope` where the user's systemd manager lingers, else `setsid`),
+  and its pane is logged to an owner-only file on the box, so it outlives that session. Its link goes
+  out only after the callback port listens on the box (`ss -ltn`, polled up to 30 s) and a check from a
+  new ssh session, after the starting one ended, still finds it listening. Otherwise `login` stops it,
+  starts it once more, and if that fails too says why (the log's last lines) and hands out no link.
+  The sign-in then runs for its whole window and ends by itself.
+- One message to the user per link handed out; none for a start that never reached a live listener.
+  An expired one-time link is never re-issued on a timer while the user is away: start a new one
+  right after their next message, so they are there to open it.
 - Fixed callback port: every sign-in `login --mcp` starts asks for one localhost callback port,
   28461 by default (`--callback-port <port>` overrides it): Claude Code through
   `MCP_OAUTH_CALLBACK_PORT`, Codex through `-c mcp_oauth_callback_port=<port>`. A server added with
