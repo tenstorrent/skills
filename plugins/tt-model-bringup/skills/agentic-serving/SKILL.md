@@ -75,7 +75,8 @@ Optional operator inputs come from `bringup/agentic_evals/inputs.json` in the ta
   current release spec names them; the default subset is 10 tasks each;
 - `batch_sizes`, see [Decode batches](#decode-batches): stage 10 validates a tuned configuration
   per batch and stage 11 measures a profile for each surviving one;
-- `release_spec`: where the release values come from, a file or the release workflow;
+- `release_spec`, optional: where the release values come from. Without it, find the release
+  configuration for each eval yourself, in the release workflow and the serving harness;
 - `stage_budget_hours` (default 24), `effort_budget_hours` (default 16) and `suite_budget_hours`
   (default 8). The stage budget covers survey to release dispatch; each release suite then runs
   to completion within `suite_budget_hours`;
@@ -97,12 +98,13 @@ reader can tell a thin result from a small grant.
 
 ### Settings the release fixes
 
-Some settings are not tuning arms. Read them from `release_spec` before the first run, and record
-the source and values in the preflight:
+Some settings are not tuning arms. Find the release values before the first run and record their
+source and values in the preflight:
 
 - Eval names and versions. A stale default in a skill or inputs file does not override the spec.
-- Agent time limit, request time limit and output cap: never below the release values. Raise the
-  output cap while any answer hits it; a capped answer measures the cap, not the model.
+- Agent time limit, request time limit and output cap: set so the model can finish, never below
+  the release values. Raise a limit while tasks end at it; a capped answer measures the cap, not
+  the model.
 - Batch: run the full evals on the largest validated batch, with enough agents to fill it, unless a
   recorded reason says otherwise. Samples and tests use the largest batch that works and suits the
   test. Record the batch each eval used.
