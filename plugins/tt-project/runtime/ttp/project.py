@@ -378,9 +378,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "watchdog": {"hang_s": 900, "restarts": 3, "window_s": 21600},
     # A newer tt-project installed with `ttp setup` is merged into this project's own harness by its
     # daemon (`ttp upgrade`, once per release, never during a push), which then restarts keeping workers.
-    # A conflicting merge queues one harness task a day at most (at once when the last one landed its
-    # release); a host-side `ttp upgrade` queues it once the last one ended merge_retry_h ago.
-    "upgrade": {"auto": True, "merge_retry_h": 6},
+    # A clean merge whose runtime compiles and imports lands with no model task. A conflict or a failed
+    # check queues one harness task per task_every_h at most, whatever the last one did; releases meanwhile
+    # wait and the next task merges the newest. A host-side `ttp upgrade` queues it once the last one ended
+    # merge_retry_h ago.
+    "upgrade": {"auto": True, "merge_retry_h": 6, "task_every_h": 6},
     # Upstream notes (hand-off follow-ups titled `upstream: ...`) are filed in the user's inbox
     # ~/.tt-project/upstream.jsonl. With ingest on, this project's coordinator gets them as events.
     "upstream": {"ingest": False},

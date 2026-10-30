@@ -7948,30 +7948,32 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
     if problem:
         holder = release.finish_holder(p)
         tid = holder["task"] if holder else None
+        # One task per batching window (upgrade.task_every_h), whatever it did: a project whose local edits
+        # conflict on every release would otherwise pay one model task per release.
         last = None if tid else release.recent_upgrade_task(p)
-        if last and release.landed(p.db, last["id"], old_v, old_c):
-            last = None     # it landed its release: this conflict is the next release's, queued at once
         sooner = None       # an explicit host-side upgrade may queue the merge task this soon
         if last and explicit:
             ended = release.task_ended(p.db, last["id"])
             sooner = None if ended is None else ended + release.merge_retry_s(p.config())
             if took_over or (sooner is not None and time.time() >= sooner):
                 last = None
-        if last:        # at most one model task a day: each release would otherwise queue its own
-            until = float(last["created"]) + release.TASK_EVERY_S
+        if last:        # the release on hand when the window is up gets the next task: one merge for all
+            window = release.task_every_s(p.config())
+            until = float(last["created"]) + window
             release.note_deferred(p, problem, last["id"])
             release.defer(p, auto, f"{new_v} {new_c}", f"{old_v} ({old_c})", f"{new_v} ({new_c})", until,
                           problem[:300])
             at = timefmt.long(until, p)
             took = (f"upgrade not applied; the running harness is unchanged. {problem}\nHarness task "
-                    f"#{last['id']} took on a template merge less than a day ago, so none is queued now; ")
+                    f"#{last['id']} took on a template merge less than {window / 3600:g} h ago, so none is queued "
+                    f"now; ")
             # Exit 75 (deferred) only when the project takes it on itself: its daemon retries after `until`.
             if sooner is not None and sooner < until:
-                at = timefmt.long(sooner, p)    # a host-side rerun queues it before the daemon's daily retry
+                at = timefmt.long(sooner, p)    # a host-side rerun queues it before the daemon's retry
                 took += f"a host-side `ttp upgrade {p.name}` queues one from {at}; "
             if release.retried({"newer": release.is_newer(new_v, old_v)}, p.config()):
                 print(took + f"upgrade deferred: owner: this project's daemon (upgrade.auto), which tries again "
-                             f"after the day is up; resumes at {timefmt.long(until, p)}.")
+                             f"after the window is up; resumes at {timefmt.long(until, p)}.")
                 sys.exit(75)
             if p.db.kv("paused", False):    # deferred, not failed: a takeover after the resume queues the merge
                 print(took + f"{p.name} paused; upgrades when resumed: a host-side `ttp upgrade {p.name}` after "
@@ -8043,10 +8045,11 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
         release.finish(p, "failed", why="the daemon did not start with it, so the runtime was rolled back")
         return
     release.finish(p, "applied", **({"kept_lost": _cut_list(kept)} if kept else {}))
-    p.db.post("out", f"tt-project harness upgraded from {old_v} ({old_c}) to {new_v} ({new_c}); the daemon "
-              f"restarted and running work was kept."
+    # A feed line, not an alert: a clean merge needs nobody (merged with no model task, checks passed).
+    p.db.post("out", f"tt-project harness upgraded from {old_v} ({old_c}) to {new_v} ({new_c}) with no model task: "
+              f"the merge was clean, the runtime compiles and imports, and the daemon restarted keeping running work."
               + (f" Kept this project's runtime edits that drop names upstream ships: {_cut_list(kept)}." if kept
-                 else ""), chat=None, kind="alert", severity="low")
+                 else ""), chat=None, kind="info", severity="low")
 
 
 def _keep_light_coordinator(p: Project) -> str:
@@ -8478,7 +8481,9 @@ In this harness repo:
 1. `git worktree add --detach <tmp> main`, then in <tmp>: `git merge upstream`.
 2. Resolve each conflict keeping this project's intent and taking upstream's fixes. Put this project's
    own prompt rules between `<!-- ttp:local -->` and `<!-- /ttp:local -->` lines, so later upgrades keep
-   them without a merge.
+   them without a merge. Put this project's own imports in a runtime file in one block at the end of
+   the file, never inside or next to upstream's `from . import ...` lists, and keep upstream's lists
+   as upstream ships them: later upgrades then merge cleanly with no task.
 3. Check in <tmp>: `python3 -m compileall -q runtime` and `PYTHONPATH=runtime python3 -c "import ttp.daemon, ttp.cli"`.
 4. Commit, then in <tmp>: `git merge main` (main may have moved meanwhile; resolve and check again).
 5. `ttp upgrade {name} --apply <commit>`, run on its own (never piped or masked). It fast-forwards main

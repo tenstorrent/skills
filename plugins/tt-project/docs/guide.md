@@ -1756,10 +1756,14 @@ local edit that upstream now makes too (comments and spacing aside: upstream's v
 the project's stays in the merge's first parent; a line the project removed and upstream reworded
 is a real overlap). A project's own rules in a template prompt belong
 between `<!-- ttp:local -->` and `<!-- /ttp:local -->` lines (the prompt leaves those lines out):
-an upgrade takes upstream's text and puts each block back where it stood. When a project only added
+an upgrade takes upstream's text and puts each block back where it stood. A project's own imports
+in a runtime file belong in one block at the end of the file, never inside or next to upstream's
+`from . import ...` lists (leave those as upstream ships them): an import added to such a list
+conflicts with every release that changes it, while a block at the file end merges cleanly. When a project only added
 lines to a template prompt, the upgrade fences them that way itself. Only a real overlap, such as
 the project and upstream rewording the same line, or each adding its own version of one line (the
-same leading key, or most of the text alike), goes to a harness task.
+same leading key, or most of the text alike), goes to a harness task, at most one per
+`upgrade.task_every_h` (6) hours; releases meanwhile wait and the next task merges the newest.
 The same conflict deferred past 48 h, or past two harness tasks that ended without landing it,
 reaches the coordinator once as a normal observation, not once per deploy.
 

@@ -279,11 +279,14 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   version from another commit), `ttp status` and the web app show `tt-project <installed>
   available, harness on <current>`. With `upgrade.auto` on (the default) the daemon runs the
   installed `ttp upgrade <name> --auto` for its own project only, detached, when no push and no
-  other upgrade is in flight. That restarts the daemon (workers are kept) and posts one low
-  notify. Each release is tried once: conflicts that need no judgment (both sides only added at
+  other upgrade is in flight. A clean merge whose runtime compiles and imports is applied with no
+  model task: that restarts the daemon (workers are kept) and logs one feed line, not an alert.
+  Each release is tried once: conflicts that need no judgment (both sides only added at
   one spot, or upstream already ships the project's change) are settled without a model; any
-  other conflict leaves one harness task and no hourly retries. At most one such task is queued
-  a day; a conflict within a day of the last one waits and is tried again after it. `ttp config <name> upgrade.auto false` opts out; `ttp upgrade <name>` then applies it.
+  other conflict, or a merged runtime that fails the check, leaves one harness task and no hourly
+  retries. At most one such task is queued per `upgrade.task_every_h` (6) hours, whatever the last
+  one did; a conflict inside that window waits, later releases only record the wait, and the next
+  task merges the newest release. An open task takes newer releases on instead of a second task. `ttp config <name> upgrade.auto false` opts out; `ttp upgrade <name>` then applies it.
 - Power-cycle notices (cyclenotice.py). A device broker on the same host announces a pending power
   cycle in a notice file, by default `/run/tt-device-broker/power-cycle-pending.json` (JSON with
   `state` "possible" or "requested", `reason`, `earliest_cycle_at` and `updated_at`). While one holds,

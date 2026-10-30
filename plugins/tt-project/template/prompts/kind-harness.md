@@ -15,6 +15,8 @@
 - Rules of this project's own in a template prompt (`prompts/*.md`) go between `<!-- ttp:local -->`
   and `<!-- /ttp:local -->` lines: template upgrades keep those blocks without a merge. Never
   reword upstream's text in place; that is what makes an upgrade need a model.
+- This project's own imports in a runtime file go in one block at the end of the file, never inside
+  or next to upstream's `from . import ...` lists; leave those lists as upstream ships them.
 - Runtime code changes: run `python3 -m pytest -q runtime/tests` if present; keep Python 3.9-compatible.
   Run pytest from the harness root (or your worktree of it): its `pytest.ini` keeps an enclosing
   repository's pytest config and `conftest.py` out and puts `runtime/` on the import path. Add

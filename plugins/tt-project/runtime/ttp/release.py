@@ -22,7 +22,7 @@ from .project import HOME_DIR, Project, durable_write, fsync_dir
 CHECK_S = 3600          # how often the daemon compares the installed release with its harness
 HELD_RECHECK_S = 300    # a release held back by a push or an upgrade in flight is looked at again this soon
 UPGRADE_TASK_TITLE = "Finish the tt-project template upgrade"
-TASK_EVERY_S = 86400    # at most one upgrade task per project this often (unless the last one landed); a conflict meanwhile waits
+TASK_EVERY_H = 6        # upgrade.task_every_h: at most one upgrade task per project this often; a conflict meanwhile waits
 STALE_S = 6 * 3600      # a finish task blocked, or with no run or update this long, no longer holds off a host upgrade
 MERGE_RETRY_H = 6       # upgrade.merge_retry_h: a host-side upgrade queues a merge task once the last ended this long ago
 KV_RELEASE, KV_AUTO = "release", "upgrade_auto"
@@ -298,6 +298,15 @@ def merge_retry_s(cfg: dict) -> float:
         return MERGE_RETRY_H * 3600
 
 
+def task_every_s(cfg: dict) -> float:
+    """The batching window: one upgrade task per project at most this often, whatever each task did. Every
+    release inside it is merged model-free; a conflict waits and the newest release is merged once it is up."""
+    try:
+        return max(0.0, float((cfg.get("upgrade") or {}).get("task_every_h", TASK_EVERY_H))) * 3600
+    except (TypeError, ValueError):
+        return TASK_EVERY_H * 3600
+
+
 def task_ended(db, tid: int) -> float | None:
     """When task `tid` ended (its last update or run end); None while it is open."""
     t, last = task_activity(db, tid)
@@ -336,21 +345,10 @@ def finish_holder(p: Project, db=None, clean: bool = False) -> dict | None:
 
 
 def recent_upgrade_task(p: Project) -> dict | None:
-    """The newest upgrade task queued less than TASK_EVERY_S ago, whatever its status."""
+    """The newest upgrade task queued inside the batching window (task_every_s), whatever its status."""
     t = p.db.one("SELECT id, created FROM tasks WHERE kind='harness' AND title=? AND created > ? "
-                 "ORDER BY id DESC LIMIT 1", (UPGRADE_TASK_TITLE, time.time() - TASK_EVERY_S))
+                 "ORDER BY id DESC LIMIT 1", (UPGRADE_TASK_TITLE, time.time() - task_every_s(p.config())))
     return dict(t) if t else None
-
-
-def landed(db, tid: int, version: str, commit: str) -> bool:
-    """Finish task `tid` ended done with the harness (`version`, `commit`) on its target release or a newer
-    version: it landed its merge, so a conflict with a later release is new work, not a retry of a merge
-    that failed, and the once-a-day limit does not hold it back."""
-    t = db.one("SELECT status, spec FROM tasks WHERE id=?", (int(tid),))
-    m = t and re.search(r"^Target release: tt-project (\S+) \((\S+)\)\s*$", t["spec"] or "", re.M)
-    known = commit not in ("", "unknown", None)     # no git on either side records "unknown": proves nothing
-    return bool(m and t["status"] == "done" and ((known and (version, commit) == m.groups())
-                                                 or is_newer(version, m[1])))
 
 
 def defer(p: Project, auto: bool, key: str, frm: str, to: str, until: float, why: str) -> None:
@@ -474,8 +472,8 @@ def hold_reason(p: Project, d: dict) -> str:
         return ""
     if rec.get("key") == d["key"] and rec.get("outcome") == "deferred":
         if time.time() < float(rec.get("until") or 0):
-            return (f"the merge needs a harness task and one ran less than a day ago (owner: this project's "
-                    f"daemon; resumes at {timefmt.long(float(rec.get('until') or 0), p)})")
+            return (f"the merge needs a harness task and one was queued less than {task_every_s(p.config()) / 3600:g} h "
+                    f"ago (owner: this project's daemon; resumes at {timefmt.long(float(rec.get('until') or 0), p)})")
         return ""
     if rec.get("key") == d["key"] and rec.get("outcome") != "held":
         return "already tried for this release"
@@ -533,7 +531,8 @@ def line(p: Project, db, cfg: dict) -> str:
             return text + " (the automatic upgrade did not finish: see logs/upgrade.log)"
         if rec.get("outcome") == "deferred":
             at = timefmt.long(float(rec.get("until") or 0), p)
-            return text + f" (the merge needs judgment; one harness task a day at most; owner: this project's daemon; resumes at {at})"
+            return text + (f" (the merge needs judgment; one harness task per {task_every_s(cfg) / 3600:g} h at most; "
+                           f"owner: this project's daemon; resumes at {at})")
         if rec.get("outcome") == "failed":
             return text + f" (the automatic upgrade failed: {rec.get('why') or 'see logs/upgrade.log'})"
     return text
