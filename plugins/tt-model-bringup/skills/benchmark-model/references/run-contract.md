@@ -43,8 +43,9 @@ Select only the tasks to run in the configuration. Profile names describe the
 available tasks, not generation settings for a model family. Determine chat
 formatting, thinking mode, sampling and output budgets from the exact model's
 published protocol or intended use. Runtime depends on model speed and generated
-length. When any answer ends at the output budget, raise the budget before reporting accuracy. The full GPQA profile is available for larger evaluations; it is not
-necessary inside the stage budget.
+length. When any answer ends at the output budget, raise the budget before
+reporting accuracy. The full GPQA profile is available for larger evaluations;
+it is not necessary inside the stage budget.
 
 Reuse the same documents on each model. For a new benchmark, freeze a manifest
 before observing scores:
