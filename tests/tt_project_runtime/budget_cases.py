@@ -3630,6 +3630,18 @@ def test_idle_capacity_still_reported_when_the_only_ready_task_is_branch_held(en
     ("", {"oauthAccount": {"organizationType": "claude_pro"}}, {}, None, "plan"),
     ("", {"oauthAccount": {"organizationType": "mystery"}}, {}, None, "unknown"),  # a login it cannot tell
     ("", {}, {}, None, "unknown"),                                               # no login at all
+    # a key exported only in an interactive shell: the login state records it as approved
+    ("", {"customApiKeyResponses": {"approved": ["k" * 20], "rejected": []}}, {}, None, "usage"),
+    ("", {"customApiKeyResponses": {"approved": ["k" * 20]}, "oauthAccount": {"organizationType": "claude_max"}},
+     {}, None, "unknown"),                                                       # beside a plan: cannot be told
+    ("", {"customApiKeyResponses": {"approved": ["k" * 20]}}, {}, {"claudeAiOauth": {"subscriptionType": "pro"}},
+     "unknown"),
+    ("", {"customApiKeyResponses": {"approved": [], "rejected": ["k" * 20]}, "oauthAccount": {"organizationType": "claude_max"}},
+     {}, None, "plan"),                                                          # a declined key is not used
+    ("", {"customApiKeyResponses": {"rejected": ["k" * 20]}}, {}, None, "unknown"),
+    ("", {"customApiKeyResponses": {"approved": "k" * 20}}, {}, None, "unknown"),     # not a list: ignored
+    ("", {"customApiKeyResponses": {"approved": ["", None, 3]}}, {}, None, "unknown"),
+    ("", {"customApiKeyResponses": ["k" * 20]}, {}, None, "unknown"),
     ("", "not json", "[]", "{", "unknown"),                                      # unreadable files
 ])
 def test_billing_mode_is_read_from_the_claude_code_login(env, tmp_path, monkeypatch, env_key, state, settings, creds, want):
@@ -3741,7 +3753,7 @@ def test_remote_sessions_count_only_from_a_usage_billed_login_and_a_stale_machin
     assert push("api", 2.0, 3.0, "usage") == 0
     assert push("max", 4.0, 96.0, "plan") == 0
     assert push("old", 5.0, 7.0, None) == 0          # an older tt-project: billing cannot be told
-    assert push("bad", 1.0, 1.0, "free") == 2         # an unknown billing word is a malformed record
+    assert push("bad", 1.0, -1.0, "usage") == 2       # a malformed sessions value is a malformed record
     t = gcap.total(p.db, "claude", start, end, now + 1, account="acct-a")
     assert t["usd"] == 2 + 3 + 4 + 5 and t["remote_sessions_usd"] == 3.0, t
     assert t["plan_usd"] == 96.0 and t["unbilled_usd"] == 7.0 and t["stale_usd"] == 0, t
@@ -3758,3 +3770,44 @@ def test_remote_sessions_count_only_from_a_usage_billed_login_and_a_stale_machin
     assert g.level != "red" and g.numbers["global_stale_usd"] == 14.0, (g.level, g.reasons, g.numbers)
     g = bud.evaluate(p.db, p.config(), "claude", [], now + 1)
     assert g.level == "red", (g.level, g.reasons)
+
+
+def test_a_new_billing_word_keeps_the_machines_rows_and_its_sessions_are_shown_as_unknown(env, monkeypatch):
+    # A newer tt-project may send a billing word this one does not know. Its record, pushed or
+    # pulled, still counts its billed project rows; its sessions are estimated, not billed.
+    from ttp import globalcap as gcap
+    from ttp.project import register
+    p = make(env)
+    now = time.time()
+    start, end = now - 3600, now + 3600
+    monkeypatch.setattr(gcap, "OTHER_SOURCES", [])
+    monkeypatch.setattr(gcap, "targets", lambda: [])
+    key = gcap.account_key("claude", "acct-a")
+    sess = {"provider": "claude", "key": key, "usd": 7.0, "sessions": 2, "estimated": True}
+    rec = {"v": 1, "host": "new", "sent": now, "windows": [{"start": start, "end": end, "projects": ["far"],
+                                                            "rows": [{"provider": "claude", "key": key, "usd": 3.0}],
+                                                            gcap.SESSIONS: {**sess, "billing": "metered-v2"}}]}
+    assert gcap.receive((json.dumps(rec) + "\n").encode(), "new", now)[1] == 0
+    assert gcap.load_pushed(now)["new"]["windows"][gcap._key(start, end)][gcap.SESSIONS]["billing"] == "unknown"
+    t = gcap.total(p.db, "claude", start, end, now + 1, account="acct-a")
+    assert t["usd"] == 3.0 and t["remote_sessions_usd"] == 0 and t["unbilled_usd"] == 7.0, t
+    assert "$7.00 estimated, not billed: sessions on new whose billing is unknown" in t["includes"], t["includes"]
+    # Pulled over ssh: the same answer is whole, not 'unexpected answer'.
+    register("far", {"host": "box2", "dir": "/srv/far"})
+    monkeypatch.setattr(gcap, "targets", lambda: ["box2"])
+    for word in ("metered-v2", 3, None, ""):
+        ans = {"host": "box2", "projects": ["far"], "rows": [{"provider": "claude", "key": key, "usd": 4.0}],
+               gcap.SESSIONS: {**sess, "billing": word}}
+        monkeypatch.setattr(gcap.subprocess, "run", lambda cmd, **kw: types.SimpleNamespace(
+            returncode=0, stdout=json.dumps(ans), stderr=""))
+        gcap.refresh(start, end, now, force=True)
+        m = gcap.load_cache()["machines"]["box2"]
+        assert m["ok"] is True, (word, m)
+        t = gcap.total(p.db, "claude", start, end, now + 1, account="acct-a")
+        assert t["usd"] == 3.0 + 4.0 and t["remote_sessions_usd"] == 0 and t["unbilled_usd"] == 14.0, (word, t)
+    # A local source naming a word it does not know is shown as unknown, never counted or dropped.
+    monkeypatch.setattr(gcap, "targets", lambda: [])
+    monkeypatch.setattr(gcap, "OTHER_SOURCES", [lambda prov, acct, a, b: (5.0, "x", "metered-v2")])
+    t = gcap.total(p.db, "claude", start, end, now + 1, account="acct-a")
+    assert t["usd"] == 3.0 and t["unbilled_usd"] == 12.0, t
+    assert "this machine" in t["includes"], t["includes"]

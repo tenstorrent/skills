@@ -128,9 +128,14 @@ prolonged whole-box outage.
   against another vendor's endpoint) and leaves out every tt-project run of any provider, which its
   project already books. `billing` comes from that machine's Claude Code login, never its name:
   `usage` (an API key, a key helper, or a usage-billed seat), `plan` (a subscription plan) or
-  `unknown`. Only `usage` sessions count, once per machine with its answer. Plan sessions are shown
+  `unknown`. An API key is seen in the environment, the settings, or, for a key exported only in an
+  interactive shell, the login's approved-key record; such a key beside a plan login reads `unknown`
+  (it overrides the plan only while still exported). The session logs do not say how a call was
+  paid. Only `usage` sessions count, once per machine with its answer. Plan sessions are shown
   apart as "subscription plan" and unknown ones as "estimated, not billed"; neither ever counts. An
-  answer from an older tt-project has no such field: its sessions count 0 and are shown as unknown.
+  answer from an older tt-project has no such field, and one from a newer tt-project may carry a
+  billing word this one does not know: either way its sessions count 0 and are shown as unknown,
+  and its billed project rows still count.
   The budget line, `ttp status` and the web header show what is not counted after the total
   (`; not counted: $X subscription plan, $Y estimated, not billed, $Z stale`).
   `budget.push_spend_to` (account-level) names the machines to push to instead, or `"none"` turns

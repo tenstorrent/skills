@@ -268,15 +268,21 @@ def _sessions_ok(x) -> bool:
     return x is None or (isinstance(x, dict) and isinstance(x.get("provider"), str) and PROVIDER_RE.match(x["provider"])
                          and isinstance(x.get("key"), str) and KEY_RE.match(x["key"])
                          and _num(x.get("usd")) and 0 <= x["usd"] < 1e6
-                         and (x.get("sessions") is None or _num(x["sessions"]) and 0 <= x["sessions"] < 1e6)
-                         and x.get("billing", "unknown") in BILLING)
+                         and (x.get("sessions") is None or _num(x["sessions"]) and 0 <= x["sessions"] < 1e6))
+
+
+def _billing(x: dict) -> str:
+    """A SESSIONS value's billing word; one this version does not know (a newer tt-project's) is
+    'unknown': its sessions are shown, never counted, and the record's billed rows still count."""
+    how = x.get("billing")
+    return how if how in BILLING else "unknown"
 
 
 def _sessions(x) -> dict | None:
     """A checked SESSIONS value, as kept."""
     return None if x is None else {"provider": x["provider"], "key": x["key"], "usd": float(x["usd"]),
                                    "sessions": int(x.get("sessions") or 0), "estimated": True,
-                                   "billing": x.get("billing") or "unknown"}
+                                   "billing": _billing(x)}
 
 
 # other machines ---------------------------------------------------------------------------------
@@ -715,7 +721,7 @@ def total(db, provider: str, start: float, end: float, now: float | None = None,
             o, more = w.get(SESSIONS), 0.0
             if isinstance(o, dict) and _sessions_ok(o):
                 if _matches(o, provider, account):
-                    how = o.get("billing") or "unknown"
+                    how = _billing(o)
                     if how == "usage":
                         more = o["usd"]
                         n_sessions += fresh
@@ -744,7 +750,8 @@ def total(db, provider: str, start: float, end: float, now: float | None = None,
             usd += more
             if label:
                 others.append(label)
-        elif how in apart and more > 0:
+        elif more > 0:                       # a word it does not know is unknown: shown, not counted
+            how = how if how in apart else "unknown"
             apart[how][0] += more
             apart[how][1].append("this machine")
     n_local = 1 + len(here["projects"])

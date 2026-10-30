@@ -22,7 +22,8 @@ Whether the estimate counts toward the global dollar cap depends on how this mac
 login is billed (billing_mode, read from its login state, never from a machine name): an API key or
 a usage-based seat is billed per use and counts; a subscription plan login is metered by its plan
 windows (5h, 7d), never in dollars, and is only shown; a login that cannot be told is shown as
-estimated, not billed.
+estimated, not billed. A key exported only in an interactive shell is seen through the login
+state's approved-key record, not the daemon's environment; beside a plan login it cannot be told.
 
 The scan is incremental: the daemon lists the folders every SCAN_S, skips files untouched since
 before the days it keeps, and reads each file only from where it stopped, up to the last complete
@@ -200,7 +201,14 @@ def billing_mode(env=None) -> str:
     """How this machine's Claude Code login is billed, from its login state: 'usage' (an API key, or
     a usage-based seat: every call billed per use), 'plan' (a subscription plan login: metered by
     its plan windows, not in dollars) or 'unknown'. Read from <CLAUDE_CONFIG_DIR>/.claude.json (else
-    ~/.claude.json), the config folder's settings.json and .credentials.json; never a secret's value."""
+    ~/.claude.json), the config folder's settings.json and .credentials.json; never a secret's value.
+
+    Not only the calling process's environment (the daemon's, or an ssh-run spend-today's) tells of
+    an API key: a key exported only in an interactive shell shows as an approved key in the login
+    state (customApiKeyResponses.approved, which Claude Code fills when the user accepts an
+    ANTHROPIC_API_KEY). With no subscription login beside it that is usage billing; beside a plan
+    login it is 'unknown', since the key overrides the plan only while it is still exported. The
+    session logs carry no sign of how a call was paid, so they are not read for this."""
     env = os.environ if env is None else env
     folder = Path(env["CLAUDE_CONFIG_DIR"]) if env.get("CLAUDE_CONFIG_DIR") else None
     state = _json_file(folder / ".claude.json" if folder else Path.home() / ".claude.json")
@@ -215,6 +223,9 @@ def billing_mode(env=None) -> str:
     oauth = oauth if isinstance(oauth, dict) else {}
     if "usage" in str(acct.get("seatTier") or "").lower():
         return "usage"
+    asked = state.get("customApiKeyResponses") if isinstance(state.get("customApiKeyResponses"), dict) else {}
+    if isinstance(asked.get("approved"), list) and any(isinstance(k, str) and k for k in asked["approved"]):
+        return "unknown" if acct or oauth else "usage"
     words = " ".join(str(x) for x in (oauth.get("subscriptionType"), acct.get("organizationType"),
                                       acct.get("billingType")) if x).lower()
     return "plan" if (acct or oauth) and any(w in words for w in PLAN_WORDS) else "unknown"
