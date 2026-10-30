@@ -7,8 +7,9 @@ non-check commands (including after_push) keep their ordinary temporary environm
 Legacy allocations without owner.json and old run-local scratch are left untouched, with
 no migration. Only owned, unlocked check allocations are reclaimed; nothing else is.
 A check's TMPDIR is a short dir (shorttmp) its owner.json records, so an AF_UNIX socket a test
-binds beneath it stays within the path limit; it goes with the allocation. Without a usable
-short root the check keeps checks-tmp inside the allocation.
+binds beneath it stays within the path limit; it goes with the allocation. It is on the RAM disk
+when that has room (shorttmp.make), and the check's clean checkout then goes inside it. Without a
+usable short root the check keeps checks-tmp inside the allocation.
 
 The folder-wide lock (check-runs/checks-tmp.lock) covers only short steps: publishing a new
 allocation, and claiming an old one by renaming it to a trash name. Removing the tree runs after
@@ -79,7 +80,7 @@ def writable(value, *, create=False) -> str:
 def new(state: Path, owner: Path | None = None) -> Path:
     from . import shorttmp
     folder = state / FOLDER
-    tmp = shorttmp.make()
+    tmp = shorttmp.make(check=True)
     try:
         name = _publish(folder, owner, tmp)
     except BaseException:

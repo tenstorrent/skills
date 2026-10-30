@@ -182,12 +182,12 @@ class Record:
 
 def _remove_tree(tree: str, top: str) -> int:
     """Remove a recorded clean checkout folder (only one of cleantree's, of this user); 1 if removed."""
-    from . import cleantree
+    from . import cleantree, shorttmp
     d = Path(tree) if tree else None
     try:
         if (d is None or not d.name.startswith(cleantree.PREFIX) or d.is_symlink() or not d.is_dir()
-                or d.stat().st_uid != os.getuid() or Path(os.path.realpath(d.parent)) !=
-                Path(os.path.realpath(tempfile.gettempdir()))):
+                or d.stat().st_uid != os.getuid() or (Path(os.path.realpath(d.parent)) !=
+                Path(os.path.realpath(tempfile.gettempdir())) and not shorttmp.on_tmpfs(os.path.realpath(d.parent)))):
             return 0
     except OSError:
         return 0

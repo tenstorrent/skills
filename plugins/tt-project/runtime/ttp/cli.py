@@ -2516,6 +2516,7 @@ def cmd_checks(a) -> None:
     harness-tagged check configured it runs the default harness plan (push.default_harness_checks). Its pass is recorded as such and never counts for a PR,
     an on_pass hand-off or `ttp push --own`; its failures open no check gap."""
     from . import addedtests, checkcap, checkdirs, checkprestage, cleantree, prguard, push, pushpass, slowtests
+    from . import shorttmp
     if getattr(a, "gap", None):
         from . import checkgaps
         p = here()
@@ -2850,7 +2851,8 @@ def cmd_checks(a) -> None:
         try:
             if not (hit or handover) and any(not _in_place(c) for c in todo):
                 try:
-                    clean = cleantree.Checkout(top, head)
+                    # On the RAM disk with the check's scratch when that is there (shorttmp)
+                    clean = cleantree.Checkout(top, head, shorttmp.on_tmpfs(run_env.get("TMPDIR")))
                     if p:
                         worktree.prepare(p, clean.path)   # the .venv a check may run, as the push queue's
                     said = f"running in a clean checkout of {head[:12]}: files only on disk in {top} are not seen"

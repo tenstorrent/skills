@@ -1048,7 +1048,10 @@ queues behind routine work; nothing running is interrupted:
   alias) is the number of runs the host's test-slot pool fits side by side, at least 2 and at most 4, and lower only
   when available memory is under 8 GiB per lane. Runs at once do not collide: each has its own clean checkout,
   TMPDIR, output folder and block of ports (`TTP_PORT_BASE`, `TTP_PORT_COUNT`, for suites that bind fixed ports);
-  checks that run in the authoring worktree itself also hold that worktree's one lane. A lane goes to the most urgent
+  checks that run in the authoring worktree itself also hold that worktree's one lane. On Linux a run's clean checkout
+  and TMPDIR go on the RAM disk (`/dev/shm`) when it has room for one more run's scratch (4 GiB counted per run
+  already there) while keeping a quarter of it free and a fifth of the RAM available, else under `/tmp`: concurrent
+  suites writing their temp git repositories to a disk filesystem wait on its locks. A lane goes to the most urgent
   waiting task priority first (read from the task's record; a check with no task, or a task with no priority,
   ranks as p3), then arrival; a running holder is never pre-empted, and a waiter gains one priority step per
   `checks.priority_age_s` waited (default 900, 15 min; project, then account), never past p1, so none starves.

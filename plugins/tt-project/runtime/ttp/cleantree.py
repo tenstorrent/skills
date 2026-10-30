@@ -55,10 +55,12 @@ def authoring(c) -> bool:
 class Checkout:
     """A clean detached checkout of `head` of the repository at `top`; `close` removes it."""
 
-    def __init__(self, top: str | Path, head: str):
+    def __init__(self, top: str | Path, head: str, base: str | Path | None = None):
+        """`base`: the folder to make it in (a check's RAM-disk scratch, removed with it), else the
+        system temp folder."""
         self.top, self.head = Path(top), head
         prune(self.top)
-        self.dir = Path(tempfile.mkdtemp(prefix=f"{PREFIX}{os.getpid()}-"))
+        self.dir = Path(tempfile.mkdtemp(prefix=f"{PREFIX}{os.getpid()}-", dir=base))
         self.path = self.dir / "tree"
         self._lock = open(self.dir / LOCK, "w")
         fcntl.flock(self._lock, fcntl.LOCK_EX)

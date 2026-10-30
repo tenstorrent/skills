@@ -2349,8 +2349,9 @@ class Daemon:
             roots = [str(self.p.state)] + worktree.git_dirs(Path(cwd))
             # Short temp dirs (shorttmp): the worker's own, and those of the checks and detached
             # jobs it starts. The root must exist for the sandbox to grant it.
-            if shorttmp.ready():
-                roots += list(dict.fromkeys([str(shorttmp.root()), str(shorttmp.root().resolve())]))
+            for top in (shorttmp.root(), shorttmp.tmpfs_root()):   # the RAM disk's: checks' scratch
+                if top is not None and shorttmp.ready(top):
+                    roots += list(dict.fromkeys([str(top), str(top.resolve())]))
             # `ttp lock` on a resource shared across projects takes its slot under the user's shared
             # lock root, outside the project: only that directory, not the rest of the user's
             # tt-project home. It must exist for the sandbox to grant it.
