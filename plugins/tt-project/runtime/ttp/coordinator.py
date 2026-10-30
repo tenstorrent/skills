@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import ackwait, anchors, askauto, askrethink, broadcast, budgetkind, cachettl, causefix, cells, chaincap, convgate, chainprio, chatset, checkspill, correction, course, credits, deploy, echoes, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, rejcool, relay, responsibilities, restriction_audit, reviewcap, selfreview, reviewreuse, settinghold, settled, shared, sharedchecks, startbreaker, sweep, throughmute, timefmt, tried, unblock, unstarted, upstream, verified, watchdup, worktree
+from . import ackwait, anchors, askauto, askrethink, broadcast, budgetkind, cachettl, causefix, cells, chaincap, convgate, chainprio, chatset, checkspill, correction, course, credits, deploy, echoes, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, rejcool, relay, responsibilities, restriction_audit, restriction_source, reviewcap, selfreview, reviewreuse, settinghold, settled, shared, sharedchecks, startbreaker, sweep, throughmute, timefmt, tried, unblock, unstarted, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -495,13 +495,14 @@ PROMPT_MAX_AGE_S = 4 * 3600
 
 def _prompt_head(p: Project) -> tuple[str, str, str]:
     """The system prompt's parts other than memory: restrictions, role, charter."""
-    from .prompts import charter_without_restrictions, coordinator_role, restrictions_block
+    from .prompts import charter_restrictions, charter_without_restrictions, coordinator_role, restrictions_block
     role = coordinator_role(p)
     charter = p.charter_path.read_text() if p.charter_path.exists() else "(no charter yet)"
-    rules = restrictions_block(p)
+    rules = restrictions_block(p, advisory=False)   # the unsourced ones: standing_lines
     if rules:
         rules += ("\nWorkers are shown this block verbatim; when a spec touches anything it covers, "
                   "restate the relevant restriction in the spec itself.\n\n")
+    if charter_restrictions(charter):
         charter = charter_without_restrictions(charter)
     return rules, role, charter
 
@@ -672,6 +673,11 @@ def standing_lines(p: Project) -> list[str]:
     heads = charter_headings(p)
     if heads:
         lines.append(f"## Charter sections (exact headings and numbers, for charter_update `replaces`): {heads}")
+    if loose := restriction_source.unsourced_items(p.charter_path.read_text() if p.charter_path.exists() else ""):
+        lines += [f"## {restriction_source.ADVISORY_HEAD} (they cite no user message, the Brief or a harness gate, so "
+                  f"they bind nothing and are never asked about: remove each with charter_update section Restrictions, "
+                  f"`quote` it, empty `text`; no user word or `over` needed. Keep one only by resending it with "
+                  f"`source` naming the user's message and quoting their own words)"] + [f"- {clip(x, 300)}" for x in loose]
     if code_tasks_may_push(cfg):
         lines.append(f"## Delivery: code tasks may land on {cfg['delivery']['push_branch']} with `ttp push` "
                      f"(delivery.code_tasks_may_push): put the landing in the code task's spec, no separate task")
@@ -2393,6 +2399,15 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      f"coordinator.ask_timeout_h unless only the user can answer it")
                 least = str(a.get("least_disruptive") or "").strip()
                 text = a["text"].strip()
+                if (a["blocking"] == "restriction" or a.get("classify") == "restriction_change") and (
+                        item := restriction_source.cited_unsourced(
+                            p.charter_path.read_text() if p.charter_path.exists() else "",
+                            f"{text} {least} {a.get('recommendation') or ''}")):
+                    _count_refusal(db, key, "unsourced restriction", text)
+                    raise ValueError(f"ask_user rejected: the restriction \"{clip(item, 200)}\" cites no user message, "
+                                     f"the Brief or a harness gate: it is advisory and binds nothing. Drop it with "
+                                     f"charter_update (section Restrictions, `quote` it, empty `text`; no user word "
+                                     f"or `over` needed) and go on")
                 why = _unclassified_ask(a, least)
                 if why:
                     _count_refusal(db, key, why[0], text)
@@ -2628,6 +2643,15 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     replaces = str(a.get("replaces") or "")
                     ok, no_ok = (None, "") if user_turn else _charter_approval(p, section, quote, replaces, text)
                     text = ok["text"].strip() if ok else text   # the words the user said yes to
+                    unsourced = ""   # an added or changed item records its source (restriction_source); the
+                    if text and _DATED.sub("", section).lower().startswith("restriction"):   # user's yes is one
+                        try:
+                            cite = ((f" (user msg #{ok['messages'][0]})" if ok.get("messages") else "")
+                                    if ok is not None and not a.get("source") else
+                                    restriction_source.check(db, p.charter_path.read_text(), text, a.get("source")))
+                            text = restriction_source.cite_items(text, cite)
+                        except ValueError as e:   # raised by _charter_update after its own checks
+                            unsourced = str(e)
                     # a Restrictions item edited without the user's word or `over` is refused below anyway
                     refused = (quote and _DATED.sub("", section).lower().startswith("restriction")
                                and not (user_turn or ok or len(over) >= OVER_MIN))
@@ -2647,9 +2671,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     try:
                         target, extra, retired = _charter_update(p, section, text, quote, replaces, key,
                                                                  user_turn or ok is not None, over, end, no_ok,
-                                                                 source)
+                                                                 source, unsourced)
                     except ValueError as e:
-                        if user_turn:
+                        if user_turn and str(e) != unsourced:   # a missing source is no approval to record
                             _record_charter_approval(p, messages or [], section, quote, replaces, text, end, str(e))
                         raise
                     if quote or replaced:   # the retired text, searched for in what still binds (echoes)
@@ -2672,7 +2696,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             or extra.lower().startswith(" (replaces restriction")):
                         restr_edited = True
                         # the user's word, or `over` retiring the item: its enforcing tools are stale
-                        why = "" if user_turn or ok is not None else over if len(over) >= OVER_MIN else None
+                        why = ("" if user_turn or ok is not None else over if len(over) >= OVER_MIN
+                               else "unsourced" if retired else None)
                         if why is not None and quote and _loosens(quote, text):
                             loosened.append((quote, text, why))
                         if why is not None and gone:
@@ -2681,7 +2706,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     elif text and not quote and not a.get("both_hold"):
                         rules_added.append((target, text))
                     if retired:
-                        db.post("out", f"Retired the charter restriction {retired}: {over}."
+                        db.post("out", f"Retired the charter restriction {retired}: "
+                                       f"{over or 'it cited no user message, the Brief or a harness gate'}."
                                        + (f" Still in force: {clip(text, 300)}" if text else ""),
                                 chat=None, kind="alert", severity="low")
                     if target.lower().startswith("restriction"):
@@ -4570,7 +4596,9 @@ def _overlaps(a: str, b: str, strict: bool = False) -> bool:
     fine" both push to a branch. For the lint
     (`strict`, a pair stays in the digest until settled by key): they name the same action
     (_same_action), and they share an object word the same way, or one names no object (a rule on
-    the action alone, "Pushing is fine once CI passes", covers every object)."""
+    the action alone, "Pushing is fine once CI passes", covers every object). A source cite
+    ("(user msg #N)", restriction_source) names nothing."""
+    a, b = restriction_source.bare(a), restriction_source.bare(b)
     aa, ao = _target(a, conditions=False)
     ba, bo = _target(b, conditions=False)
     on_object = _on_object(ao, bo)
@@ -5860,12 +5888,12 @@ def _use_charter_approval(p: Project, rid: str, key: str | None) -> None:
 # with it: a test fails when the source of CHARTER_GUARD_FUNCS no longer has CHARTER_GUARD_PIN's
 # sha256. A user's change that failed under an older guard for another reason than the guard
 # (reraise_charter_changes) is then raised at once.
-CHARTER_GUARD_VERSION = 11
+CHARTER_GUARD_VERSION = 12
 CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_overlaps", "_on_object", "_quote_hits",
                        "_item_quote_hits", "_items", "_norm", "_may_lift", "_lifts_item", "_companion_clause",
                        "_ref_ids", "_companion_exception", "_changed_sentences", "_quoted_news",
                        "_charter_approval", "_ask_charter_approval")
-CHARTER_GUARD_PIN = (11, "393d5bb83794c24de8ab530bee63e339b283a6558f62e6397cf678756d1ae678")
+CHARTER_GUARD_PIN = (12, "89f3ddc9ef9560a3c1e62a3e01ee269c307818fd564b4dc44c045f30572a366e")
 CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
 
 
@@ -5972,7 +6000,8 @@ _DATED = re.compile(r"\s*\(added [^)]*\)$", re.I)   # legacy "## Policies (added
 
 def _charter_update(p: Project, section: str, text: str, quote: str, replaces: str, key: str | None,
                     user_turn: bool, over: str = "", end: dict | None = None,
-                    no_approval: str = "", source: list[int] | None = None) -> tuple[str, str, str]:
+                    no_approval: str = "", source: list[int] | None = None,
+                    unsourced: str = "") -> tuple[str, str, str]:
     """Apply one charter_update: retire the section `replaces` names, then edit the one section
     `section` names. With `quote`, the single span of that section matching it is replaced by
     `text` (or removed when `text` is empty); otherwise `text` is added at the section's end, and
@@ -5985,7 +6014,8 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
     also merges every permanent Restrictions section into one block (_merge_restrictions).
     Returns the edited section's name, a note for the commit message and, when `over` retired a
     restriction, what it retired (else ""). `source`: the user's messages the change came from,
-    named in CHARTER_HISTORY."""
+    named in CHARTER_HISTORY. `unsourced`: why the new Restrictions text has no valid source
+    (restriction_source.check), raised once every other check passed."""
     from .prompts import charter_sections
     sections = charter_sections(p.charter_path.read_text())
     hist = p.harness / CHARTER_HISTORY
@@ -6011,7 +6041,9 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
         name = " ".join(old_head[3:].split())
         if name.lower().startswith("brief"):
             raise ValueError("charter_update: the Brief is the user's own words and is never replaced")
-        if name.lower().startswith("restriction") and not by_word:
+        loose = not any(restriction_source.sourced(" ".join(x)) for x in restriction_source.split_items(
+            "\n".join(old_body)))   # every item unsourced: advisory, the coordinator's to drop
+        if name.lower().startswith("restriction") and not (by_word or loose):
             raise ValueError(f"charter_update: replacing the restriction section {name!r} {why}")
         if name.lower().startswith("restriction") and not user_turn:
             retired = f"section \"{name}\""
@@ -6029,9 +6061,10 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
             raise ValueError(f"charter_update: no charter section {section!r} to remove or replace an item in; "
                              f"sections: " + "; ".join(n for n in names if n))
         t, hits = _charter_quote_spot(sections, t, section, quote)
-        if names[t].lower().startswith("restriction") and not by_word:
-            raise ValueError(f"charter_update: removing or replacing a restriction {why}")
         body = "\n".join(sections[t][1])
+        loose = len(hits) == 1 and restriction_source.unsourced_span(body, *hits[0], _items(body))
+        if names[t].lower().startswith("restriction") and not (by_word or loose):
+            raise ValueError(f"charter_update: removing or replacing a restriction {why}")
         if len(hits) != 1:
             near = _closest_items(sections, quote) if not hits else []
             raise ValueError(f"charter_update: `quote` matches {len(hits)} times in {names[t]!r}; quote the exact "
@@ -6039,6 +6072,8 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
                              + ("; closest: " + "; ".join(f"\"{clip(i, 800)}\" (section {n!r})" for i, n in near)
                                 + ": resend one of them exactly as `quote`, with its section" if near else ""))
         s, e = hits[0]
+        if names[t].lower().startswith("restriction"):
+            s, e = restriction_source.whole_item(body, s, e, _items(body))
         if names[t].lower().startswith("restriction") and not user_turn:
             retired = f"\"{clip(' '.join(body[s:e].split()), 200)}\""
         lifted = user_turn and names[t].lower().startswith("restriction")
@@ -6068,6 +6103,8 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
         bullets = bool(body) and body[-1].lstrip().startswith("- ") and text.startswith("- ")
         sections[t] = (sections[t][0], body + ([] if bullets or not body else [""]) + text.split("\n"))
         log.append(f"### Added to {names[t]} ({logged})\n{text}")
+    if unsourced:
+        raise ValueError(unsourced)
     if lifted:
         target = sections[t][0] if t is not None else None
         sections = _merge_restrictions(sections, log, stamp)

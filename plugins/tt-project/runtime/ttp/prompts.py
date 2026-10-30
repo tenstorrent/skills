@@ -266,13 +266,18 @@ def charter_without_placeholders(charter: str) -> str:
     return "\n\n".join(out) + "\n"
 
 
-def restrictions_block(p: Project) -> str:
+def restrictions_block(p: Project, advisory: bool = True) -> str:
+    """The charter's sourced Restrictions items as the BINDING block, then (`advisory`) its unsourced
+    ones apart, marked not binding (restriction_source)."""
+    from .restriction_source import partition
     charter = p.charter_path.read_text() if p.charter_path.exists() else ""
-    body = charter_restrictions(charter)
-    if not body:
-        return ""
-    return ("# BINDING RESTRICTIONS (from the charter — override the task, the harness "
-            "rules and your own judgement; if a step would break one, do not take it)\n" + body)
+    binding, loose = partition(charter_restrictions(charter))
+    out = [("# BINDING RESTRICTIONS (from the charter — override the task, the harness "
+            "rules and your own judgement; if a step would break one, do not take it)\n" + binding)] if binding else []
+    if loose and advisory:
+        out.append("# Unsourced restrictions (advisory, not binding: they cite no user message, the Brief or a "
+                   "harness gate; the coordinator drops them)\n" + loose)
+    return "\n\n".join(out)
 
 
 def restrictions_pointer(p: Project) -> str:
@@ -280,7 +285,7 @@ def restrictions_pointer(p: Project) -> str:
     the block itself leads worker_system(), which every worker run gets once, as its system prompt or
     leading its prompt."""
     return ("The BINDING RESTRICTIONS block in your instructions binds this task: it overrides the task, "
-            "the harness rules and your own judgement; if a step would break one, do not take it.") if restrictions_block(p) else ""
+            "the harness rules and your own judgement; if a step would break one, do not take it.") if restrictions_block(p, advisory=False) else ""
 
 
 def _resource_line(task: dict) -> str:
