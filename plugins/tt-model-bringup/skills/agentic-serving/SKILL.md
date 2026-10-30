@@ -140,7 +140,9 @@ calculations the change touched; the full suites run only at release.
 An effort owns one problem, one branch and a time box of about twice its device-hour estimate. The
 coordinator sets the goal and its confirmation; the sub-agent plans how to reach it in
 `runs/<effort>/plan.md` and revises the plan as it learns. The box bounds the runs it chooses; it
-is not a target. Stop once the question is settled.
+is not a target. Stop once the question is settled. At the box, the effort records what it learned
+and re-estimates the device hours left and the saving; the coordinator decides against the current
+ranking whether it continues.
 
 - **Fastest test first.** Prefer a short test to a scored sample; size samples as
   [Sizing a sample](#sizing-a-sample) says.
@@ -180,7 +182,7 @@ Write these to `doc/agentic_evals/`:
 - `preflight.json`: `registry`, `disk`, `release_route` and `isolation_smoke`, each with `ok`
 - `efforts.json`: `efforts`, each with `problem`, `owner`, `goal`, `plan`, `predicted`
   (`saving_hours` per eval, `device_hours`, `basis`: `measured`, `calculated` or `guess`),
-  `confirm` (`method`, `success`), `box_hours`, `status` (`done`, `running`, or `not_run` with a
+  `confirm` (`method`, `success`), `box_hours`, `re_estimate` when it passed the box, `status` (`done`, `running`, or `not_run` with a
   `reason`), and when done `used_device_hours`, `change` (`kept`, `dropped`, `none`),
   `problem_status` (`solved`, `open`), `confirmed` and `evidence`; and `rankings`, each with
   `after`, `order` (`problem`, `saving_hours`, `device_hours`) and a `reason` when it departs from
