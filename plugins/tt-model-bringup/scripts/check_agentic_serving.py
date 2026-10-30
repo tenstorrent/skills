@@ -117,8 +117,8 @@ def check_prediction(row: dict, name, problems: list) -> None:
     predicted, confirm = row.get("predicted") or {}, row.get("confirm") or {}
     savings = predicted.get("saving_hours")
     if not (isinstance(savings, dict) and savings and all(number(v) for v in savings.values())
-            and number(predicted.get("work_hours")) and predicted.get("basis") in BASES):
-        problems.append((2, f"effort {name!r} needs predicted saving_hours per eval, work_hours and basis "
+            and number(predicted.get("device_hours")) and predicted.get("basis") in BASES):
+        problems.append((2, f"effort {name!r} needs predicted saving_hours per eval, device_hours and basis "
                             f"({', '.join(BASES)}); guess when it cannot be calculated"))
     if not (confirm.get("method") and confirm.get("success")):
         problems.append((2, f"effort {name!r} needs confirm.method and confirm.success: how it shows it worked"))
@@ -136,11 +136,11 @@ def check_outcome(row: dict, name, problems: list) -> None:
     if status == "running":
         problems.append((1, f"effort {name!r} is still running at the end of the stage"))
         return
-    if not (number(row.get("used_hours")) and row.get("change") in CHANGES
+    if not (number(row.get("used_device_hours")) and row.get("change") in CHANGES
             and row.get("problem_status") in PROBLEM_STATUS and row.get("confirmed") and row.get("evidence")):
-        problems.append((2, f"effort {name!r} needs used_hours, change, problem_status, confirmed and evidence"))
-    elif row["used_hours"] > row["box_hours"] * 1.1 and not row.get("re_estimate"):
-        problems.append((1, f"effort {name!r} used {row['used_hours']} h against a {row['box_hours']} h box "
+        problems.append((2, f"effort {name!r} needs used_device_hours, change, problem_status, confirmed and evidence"))
+    elif row["used_device_hours"] > row["box_hours"] * 1.1 and not row.get("re_estimate"):
+        problems.append((1, f"effort {name!r} used {row['used_device_hours']} h against a {row['box_hours']} h box "
                             "without a re-estimate"))
 
 
@@ -151,13 +151,13 @@ def check_rankings(rankings, problems: list) -> None:
     for index, ranking in enumerate(rankings):
         order = ranking.get("order") if isinstance(ranking, dict) else None
         if not (isinstance(order, list) and order and all(
-                isinstance(row, dict) and number(row.get("saving_hours")) and number(row.get("work_hours"))
-                and row["work_hours"] > 0 for row in order)):
-            problems.append((2, f"ranking {index} needs order rows with saving_hours and work_hours"))
+                isinstance(row, dict) and number(row.get("saving_hours")) and number(row.get("device_hours"))
+                and row["device_hours"] > 0 for row in order)):
+            problems.append((2, f"ranking {index} needs order rows with saving_hours and device_hours"))
             continue
-        rates = [row["saving_hours"] / row["work_hours"] for row in order]
+        rates = [row["saving_hours"] / row["device_hours"] for row in order]
         if any(a < b for a, b in zip(rates, rates[1:])) and not ranking.get("reason"):
-            problems.append((2, f"ranking {index} is not by saving per hour of work and records no reason"))
+            problems.append((2, f"ranking {index} is not by saving per device hour and records no reason"))
 
 
 def check_efforts(evals: Path, problems: list) -> None:

@@ -114,11 +114,10 @@ Record them in `serving_config.json` next to `release_limits`, the values the sp
    disk, the release route itself, and an isolated 2-task smoke with a trajectory audit. The
    release route is the workflow the final run will use; prove it here, not at the end. Write
    `survey.json` and `preflight.json`.
-2. **Rank, about 0.5 h.** Turn every problem the survey found into an effort in `efforts.json`,
-   as [Ranking](#ranking) describes, even when their estimates add up to more than the budget.
-   Write the first go or stop estimate per eval to `estimate.json`.
+2. **Rank, about 0.5 h.** Turn each problem the survey found into an effort in `efforts.json`, as
+   [Ranking](#ranking) describes. Write the first go or stop estimate per eval to `estimate.json`.
 3. **Efforts, `effort_budget_hours`, hard stop.** Run efforts in parallel, each owned by one
-   sub-agent, as [Efforts](#efforts) describes. Re-estimate and re-rank after each effort.
+   sub-agent, as [Efforts](#efforts) describes.
 4. **Combine, about 2 h.** Re-check the current best, then one scored probe at release limits.
 5. **Release.** Run the suites with a go estimate through the same workflow every earlier run used,
    split on task boundaries so each dispatch finishes inside the grant's per-run timeout. An
@@ -128,70 +127,43 @@ A measured stop is a valid result at any step. Report it with the estimate that 
 
 ### Ranking
 
-Before an effort starts, write down what it should gain and what it should cost:
+For each problem, estimate the suite hours it saves per eval and the device hours it needs, local
+and CI; agent time is not counted. When a number cannot be calculated, guess and mark it. Name how
+the effort will confirm success without the full suites, and the value that counts.
 
-- **Saving:** suite hours saved per eval in the plan, for example SWE-bench and Terminal-Bench,
-  and their sum.
-- **Work:** hours the effort should take.
-- **Confirmation:** how the effort will show it worked without the full suites: a short test, a
-  calculation from the survey, or a small task subset. Name it and the value that counts as success.
-- **Basis** of each number: `measured`, `calculated` or `guess`.
-
-An estimate that cannot be calculated is guessed from the nearest evidence (a similar change, a
-stage-11 measurement, a short test) and marked `guess`; it never blocks the ranking. A guess is
-replaced by a measured value when one exists.
-
-Order by total suite hours saved per hour of work. Then read the order as a whole: a calculation
-can be wrong, and the coordinator may know better. Move any effort it judges misplaced, and record
-the reason with that ranking. Rank every problem, even past the budget: efforts below the line run
-when earlier ones finish early. When nothing worth doing is left, go to Combine early; the time left
-shortens the release.
-
-Re-rank whenever an effort ends: re-run the survey checks and calculations the merged change
-touches, update every open problem's saving against the new current best, and append the new
-order to `rankings` in `efforts.json`. Do not run the full suites to re-estimate; they run in
-Release.
+Order by suite hours saved per device hour, then adjust where judgement says otherwise and record
+why. Rank every problem, even past the budget. Re-rank after each effort from the checks and
+calculations the change touched; the full suites run only at release.
 
 ### Efforts
 
-An effort owns one problem: one owner, one branch, one device or slot set, and a time box of about
-twice its work estimate.
+An effort owns one problem, one branch and a time box of about twice its device-hour estimate. The
+coordinator sets the goal and its confirmation; the sub-agent plans how to reach it in
+`runs/<effort>/plan.md` and revises the plan as it learns. The box bounds the runs it chooses; it
+is not a target. Stop once the question is settled.
 
-The coordinator writes the goal, because it knows what the result has to deliver: the result it
-needs and the confirmation that shows it, for example "one live row prefills at batch-1 cost at
-B32, tokens exact". Its brief gives the sub-agent the goal, the problem, the evidence, the
-predicted saving, the current best and the time box. The sub-agent writes the plan: the tests that
-reach the goal, in `runs/<effort>/plan.md`. The plan changes as data arrives; note each change and
-why. When the data shows the goal is wrong or out of reach, the sub-agent reports it, and the
-coordinator changes the goal and records why.
+- **Fastest test first.** Prefer a short test to a scored sample; size samples as
+  [Sizing a sample](#sizing-a-sample) says.
+- **Accepting a change.** A paired exactness check plus the confirmation accepts an exact change. A
+  change that alters outputs needs a scored pair against the current best.
+- **Change and problem are separate.** A real gain that misses its target is kept; the problem
+  stays open.
+- **Merge as you go.** Later efforts build on the current best. An effort that started from an
+  older best confirms again after rebasing.
+- **Re-ranks do not interrupt running efforts**, unless a merge already solved their problem.
 
-The time box is a deadline for the plan, not a target: plan tests that fit inside it, and finish as
-soon as the confirmation settles the question, either way. Time left in the box returns to the
-queue.
+The coordinator holds the current best, the slot ledger and the budget, chooses which efforts run
+together, and reads wide where efforts read deep, as [Look at the whole run](#look-at-the-whole-run)
+asks. Every dispatched run registers with it at launch. At each effort boundary it re-reads
+`inputs.json` and logs what it applied to `steering.log`. When blocked, it writes the reason to
+`blocked.json` at once.
 
-- **Fastest test first.** Look for a test of minutes in the survey's short tests before any scored
-  sample. Use a scored sample only when the question is about scores, completion or harness
-  behaviour, and size it as [Sizing a sample](#sizing-a-sample) says.
-- **Accepting a change.** A paired exactness check plus the effort's confirmation is enough for a
-  change that keeps tokens exact. A change that alters outputs needs a scored pair against the
-  current best.
-- **Two outcomes.** Record whether the change is `kept`, `dropped` or `none`, and separately whether
-  the problem is `solved` or `open`. A real gain that does not solve the problem is kept, and the
-  problem returns to the ranking with its new numbers.
-- **Merge as you go.** A kept change joins the current best; efforts that start later build on it.
-  An effort that started from an older best rebases and repeats its confirmation before merging.
-- **Running efforts are not interrupted** by a re-rank. The exception is an effort whose problem a
-  merge has already solved: it stops and records what it learned.
-- **At the time box,** the effort re-estimates its remaining work and saving, and the coordinator
-  decides with the current ranking whether it continues.
+### Sharing the local device
 
-The coordinator holds the current best, the slot ledger and the budget, and chooses which efforts
-run together and on which lanes. Efforts that touch the same files or the same memory run in turn
-or share a branch, and each device has one owner. It reads wide where an effort reads deep, as
-[Look at the whole run](#look-at-the-whole-run) asks, and starts the next ranked effort whenever a
-lane frees. Every dispatched run registers with the coordinator at launch. At each effort boundary
-it re-reads `inputs.json`, applies operator changes and records them in `steering.log`. When it is
-blocked, it writes the reason to `blocked.json` at once instead of waiting for the next resume.
+Parallel efforts reach the local device only through one queue in `doc/agentic_evals/device_queue/`,
+which runs one job at a time as [tt-device-usage](../tt-device-usage/SKILL.md) requires and logs
+each job's owner, start, end and exit status. Keep local jobs short and send long runs to CI. After
+a hang or crash, reset and check the device before the next job.
 
 ### Sizing a sample
 
@@ -206,12 +178,13 @@ Write these to `doc/agentic_evals/`:
 
 - `survey.json`: `checks`, `calculations` and `shortfalls`, as the survey reference names them
 - `preflight.json`: `registry`, `disk`, `release_route` and `isolation_smoke`, each with `ok`
-- `efforts.json`: `efforts`, per effort `problem`, `owner`, `goal`, `plan` (path), `predicted` (`saving_hours` per eval,
-  `work_hours`, `basis`), `confirm` (`method`, `success`), `box_hours`, `status` (`done`,
-  `running` or `not_run` with a `reason`), and when done `used_hours`, `change`, `problem_status`,
-  `confirmed` (the measured result) and `evidence`; and `rankings`, one entry per ranking with
-  `after`, `order` (problem, `saving_hours`, `work_hours`) and `reason` when the order is not by
-  saving per hour
+- `efforts.json`: `efforts`, each with `problem`, `owner`, `goal`, `plan`, `predicted`
+  (`saving_hours` per eval, `device_hours`, `basis`: `measured`, `calculated` or `guess`),
+  `confirm` (`method`, `success`), `box_hours`, `status` (`done`, `running`, or `not_run` with a
+  `reason`), and when done `used_device_hours`, `change` (`kept`, `dropped`, `none`),
+  `problem_status` (`solved`, `open`), `confirmed` and `evidence`; and `rankings`, each with
+  `after`, `order` (`problem`, `saving_hours`, `device_hours`) and a `reason` when it departs from
+  saving per device hour
 - `plan.json`
 - `runs/<arm>/` (manifest and collected results)
 - `estimate.json`: per eval `decision` (`go` or `stop`) and `reason`
@@ -220,7 +193,6 @@ Write these to `doc/agentic_evals/`:
   each eval used, the agent and request time limits and output cap, and `release_limits`
 - `compute.json`: the grant as used — `max_parallel`, peak runs in flight, and for a CI grant the
   published refs and every dispatched run id, so each result traces back to a run
-- `REPORT.md`, with each effort's predicted saving and work hours next to its confirmed result and
-  hours used, and how estimates compared with results
+- `REPORT.md`, with each effort's predictions next to its results
 
 Update `workload` with the measured values.

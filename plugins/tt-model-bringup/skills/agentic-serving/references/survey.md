@@ -6,8 +6,7 @@ in `doc/agentic_evals/survey.json`; the gate reads the keys named below.
 
 ## Checks
 
-Read these on the stage-11 benchmark and the smoke run, and again on every later run. Each answered
-a pivotal question on an earlier bringup, and each failed at least once.
+Read these on the stage-11 benchmark and the smoke run, and again on every later run.
 
 | Key | How to measure | Healthy |
 |---|---|---|
@@ -67,10 +66,3 @@ Most problems the checks raise are found and proven by a test of minutes, not a 
 | Memory under stress | Allocator events and minimum free DRAM over a loaded run | Safe pool size |
 | Cache replay | Recorded traffic through the prefix cache, per layout and agent count | Agent count, block size, cache layout |
 
-## Ranking
-
-Each problem becomes one effort in `efforts.json` with the evidence from the checks, the saving
-from the calculations (suite hours per eval), the hours of work, and how the effort will confirm it
-worked, usually one of the short tests above or a calculation. A problem the calculations already
-answer, such as batch size or limits, is confirmed by the setting itself. Rough estimates are
-fine; mark guesses. The goal-12 section of the skill gives the order and when to re-rank.

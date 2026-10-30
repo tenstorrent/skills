@@ -85,17 +85,17 @@ def goal12(model, **overrides):
             'efforts': [
                 {'problem': 'padded prefill', 'owner': 'prefill', 'status': 'done',
                  'goal': 'prefill one live row at batch-1 cost', 'plan': 'runs/prefill/plan.md',
-                 'predicted': {'saving_hours': {'swe': 3.0, 'terminal': 1.5}, 'work_hours': 2, 'basis': 'calculated'},
+                 'predicted': {'saving_hours': {'swe': 3.0, 'terminal': 1.5}, 'device_hours': 2, 'basis': 'calculated'},
                  'confirm': {'method': 'prefill vs batch shape', 'success': 'one live row costs batch-1 time'},
-                 'box_hours': 4, 'used_hours': 3, 'change': 'kept', 'problem_status': 'solved',
+                 'box_hours': 4, 'used_device_hours': 3, 'change': 'kept', 'problem_status': 'solved',
                  'confirmed': 'prefill 0.9 s per live row', 'evidence': 'runs/prefill'},
                 {'problem': 'block size', 'status': 'not_run', 'reason': 'below the budget line',
-                 'predicted': {'saving_hours': {'swe': 0.5}, 'work_hours': 3, 'basis': 'guess'},
+                 'predicted': {'saving_hours': {'swe': 0.5}, 'device_hours': 3, 'basis': 'guess'},
                  'confirm': {'method': 'cache replay', 'success': 'hit rate above 0.9'}},
             ],
             'rankings': [{'after': 'survey', 'order': [
-                {'problem': 'padded prefill', 'saving_hours': 4.5, 'work_hours': 2},
-                {'problem': 'block size', 'saving_hours': 0.5, 'work_hours': 3}]}],
+                {'problem': 'padded prefill', 'saving_hours': 4.5, 'device_hours': 2},
+                {'problem': 'block size', 'saving_hours': 0.5, 'device_hours': 3}]}],
         },
         'serving_config.json': {'agent_timeout_s': 6300, 'request_timeout_s': 3600, 'output_cap_tokens': 81920,
                                 'release_limits': {'agent_timeout_s': 6300, 'request_timeout_s': 3600,
@@ -174,12 +174,12 @@ def efforts_with(tmp_path, change):
 
 
 def test_effort_over_its_box_without_a_re_estimate_is_advisory(tmp_path):
-    code, stderr = efforts_with(tmp_path, lambda e: e['efforts'][0].update(used_hours=9))
+    code, stderr = efforts_with(tmp_path, lambda e: e['efforts'][0].update(used_device_hours=9))
     assert code == 1 and '4 h box' in stderr
 
 
 def test_effort_over_its_box_with_a_re_estimate_passes(tmp_path):
-    code, stderr = efforts_with(tmp_path, lambda e: e['efforts'][0].update(used_hours=9, re_estimate='2 h left'))
+    code, stderr = efforts_with(tmp_path, lambda e: e['efforts'][0].update(used_device_hours=9, re_estimate='2 h left'))
     assert code == 0, stderr
 
 
