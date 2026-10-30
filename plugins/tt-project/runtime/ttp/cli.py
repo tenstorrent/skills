@@ -2615,8 +2615,7 @@ def cmd_checks(a) -> None:
             die(f"ttp checks: {e}; the commands after `--` were not run", 1)
         from . import checklane
         # checks.wrap_lane "after": the wrapper lock's lane is taken inside the wrapper, once it holds its lock.
-        mine = push.with_wrap(mine, wrap, checklane.lane_argv(p.name, checklane.wrap_key(wrap), checklane.wrap_name(wrap))
-                              if wrap and after and p else ())
+        mine = push.with_wrap(mine, wrap, _wrap_lane_step(p, Path(run_dir), wrap) if wrap and after and p else ())
         wrapped = {str(c) for c in mine if getattr(c, "wrap", None)}   # their run takes the lock's lane
         if wrap and any(not push.remote_host(c) for c in mine):
             if why := push.wrap_problem(wrap, top, {**os.environ, **venv_vars}):
@@ -3999,6 +3998,14 @@ def _checks_old_boot(info: dict) -> bool:
     from .runner import boot_id, same_boot
     b = info.get("boot")
     return isinstance(b, str) and b not in ("", "unknown") and boot_id() != "unknown" and not same_boot(b)
+
+
+def _wrap_lane_step(p, run_dir: Path, wrap) -> tuple[str, ...]:
+    """checks.wrap_lane "after": the step between wrapper `wrap` and each command (checklane.lane_argv),
+    labelled as _checks_slot_take labels a lane (who "run <run folder>", the task's priority)."""
+    from . import checkcap, checklane
+    return checklane.lane_argv(p.name, checklane.wrap_key(wrap), checklane.wrap_name(wrap),
+                               who=f"run {run_dir.name}", priority=checkcap.task_rank(p)[0])
 
 
 def _read_checks_pid(run_dir: Path) -> dict:

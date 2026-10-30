@@ -330,14 +330,19 @@ def wrap_key(wrap) -> str:
 LANE_AFTER_WAIT_S = 300.0   # checks.wrap_lane "after": the longest the step waits for the lane, then runs without it
 
 
-def lane_argv(project_name: str, key: str, name: str = "", wait_s: float = LANE_AFTER_WAIT_S) -> tuple[str, ...]:
+def lane_argv(project_name: str, key: str, name: str = "", wait_s: float = LANE_AFTER_WAIT_S, who: str = "",
+              priority: int | None = None) -> tuple[str, ...]:
     """The step (wraplane) that runs between checks.wrap_cmd and a command with checks.wrap_lane "after",
     taking project `project_name`'s lane of wrapper lock `key` (wrap_key) once the wrapper runs it; `name`
-    labels the lane (wrap_name). Isolated python (-I): the checkout's files and PYTHONPATH never load."""
+    labels the lane (wrap_name). `who` and `priority`: the run's label part and task priority, as
+    cli._checks_slot_take gives testslots.suite_hold ("run <run folder>"), so the lane's label is the one
+    the detectors read (_run_of, open_precheck). Isolated python (-I): the checkout's files and PYTHONPATH
+    never load."""
     runtime = str(Path(__file__).resolve().parent.parent)
     return (sys.executable, "-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); "
             "from ttp.wraplane import main; sys.exit(main(sys.argv[2:]))", runtime,
-            "--project", project_name, "--key", key, "--name", name, "--wait-s", f"{wait_s:g}", "--")
+            "--project", project_name, "--key", key, "--name", name, "--wait-s", f"{wait_s:g}",
+            *(("--who", who) if who else ()), *(("--priority", str(priority)) if priority is not None else ()), "--")
 
 
 def headroom() -> bool:
@@ -527,20 +532,30 @@ def open_precheck(db, task: str, holder) -> bool:
 
 def stop_finished(p, h: dict) -> dict | None:
     """Stop finished_holders' entry `h` through jobstop.end_checks, only when its pid is the detached
-    `ttp checks` of its own run (checks.pid in that run's folder) and that run is its task's: never any
-    other process. None when it is not, or it already ended."""
-    from . import jobstop
+    `ttp checks` of its own run (checks.pid in that run's folder), or the wraplane step under it (holding a
+    checks.wrap_lane "after" lane; no other process under it), and that run is its task's: never any other process. None
+    when it is not, or it already ended."""
+    from . import jobstop, jobuse
     from .cli import _read_checks_pid
     if not (h.get("run") and h.get("task") and isinstance(h.get("pid"), int)):
         return None
     row = p.db.one("SELECT dir, task FROM runs WHERE id=?", (int(h["run"]),))
     if not row or not row["dir"] or str(row["task"]) != str(h["task"]):
         return None
-    if _read_checks_pid(Path(row["dir"])).get("pid") != h["pid"]:
+    pid = _read_checks_pid(Path(row["dir"])).get("pid")
+    if not isinstance(pid, int) or (pid != h["pid"] and not (_lane_step(h["pid"]) and h["pid"] in (jobuse._tree(pid) or []))):
         return None
     return jobstop.end_checks(p, Path(row["dir"]),
                               f"task #{h['task']} is {h['status']} and its check held a checks lane "
                               f"{mins(h['ended_s'])} after (grace {mins(h['grace_s'])})", int(h["task"]))
+
+
+def _lane_step(pid: int) -> bool:
+    """Whether process `pid` is a wraplane step (lane_argv), read from its command line."""
+    try:
+        return b"ttp.wraplane" in Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
 
 
 def mins(s: float) -> str:

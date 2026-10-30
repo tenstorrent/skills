@@ -25,6 +25,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--key", required=True)
     ap.add_argument("--name", default="")
     ap.add_argument("--wait-s", type=float, default=300.0)
+    ap.add_argument("--who", default="")
+    ap.add_argument("--priority", type=int, default=None)
     ap.add_argument("cmd", nargs=argparse.REMAINDER)
     a = ap.parse_args(argv)
     cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
@@ -40,8 +42,10 @@ def main(argv: list[str]) -> int:
     nested = {k: os.environ.pop(k) for k in (testslots.HELD_ENV, checkcap.HELD_ENV) if k in os.environ}
     grant = None
     try:
-        grant = testslots.suite_hold(a.project or None, tell, max(0.0, a.wait_s), who="behind its wrapper",
-                                     what="checks behind checks.wrap_cmd", lock=a.key, name=a.name)
+        grant = testslots.suite_hold(a.project or None, tell, max(0.0, a.wait_s),
+                                     who=f"{a.who}, behind its wrapper" if a.who else "behind its wrapper",
+                                     priority=a.priority, what="checks behind checks.wrap_cmd", lock=a.key,
+                                     name=a.name)
     except Exception as e:   # noqa: BLE001 - the lane is a convenience here: the wrapper's lock serializes
         tell(f"could not take the wrapper lock's lane ({type(e).__name__}: {e}); running without it")
     finally:

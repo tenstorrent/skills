@@ -3946,6 +3946,87 @@ def test_a_daemon_review_precheck_of_a_just_finished_task_is_not_a_finished_task
         _stop(proc)
 
 
+def _wrap_lane_step_holding(p, run_dir: Path, tid: int, got: Path, parent: bool = False):
+    """The checks.wrap_lane "after" step as `ttp checks` in run folder `run_dir` builds it
+    (cli._wrap_lane_step), run for task `tid` holding the wrapper lock's lane until stopped; `parent`: under
+    a stand-in for the run's `ttp checks` process, as the wrapper runs it."""
+    from ttp import cli
+    step = cli._wrap_lane_step(p, run_dir, ("flock", str(run_dir / "dev.lock")))
+    argv = [*step, "sh", "-c", f"touch {got}; sleep 600"]
+    if parent:
+        argv = [sys.executable, "-c", "import subprocess, sys; subprocess.run(sys.argv[1:])", *argv]
+    proc = subprocess.Popen(argv, env={**os.environ, "TTP_TASK": str(tid)}, start_new_session=True,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    assert _wait_for(got.exists, 60), "the step took the lane and ran its command"
+    return proc
+
+
+def _kill_group(proc):
+    import signal
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    proc.wait(10)
+
+
+def test_a_wrap_lane_after_review_precheck_is_not_a_finished_task_s_lane_while_its_review_is_open(
+        env, tmp_path, monkeypatch):
+    from ttp import checklane, daemon, worktree
+    p = make(env)
+    _lane_env(monkeypatch)
+    tid = p.db.add_task("t", "s", kind="code")
+    head = worktree._git(p.root, "rev-parse", "HEAD")
+    out = p.state / daemon.PRECHECKS_DIR / f"t{tid}-{head[:12]}"   # Daemon._precheck's run folder
+    out.mkdir(parents=True)
+    rev = p.db.add_task("review", "r", kind="review", labels=[checklane.PRECHECK_LABEL + out.name])
+    proc = _wrap_lane_step_holding(p, out, tid, tmp_path / "got")
+    try:
+        later = time.time() + 400   # past the 5 min flag
+        p.db.x("UPDATE tasks SET status='done', updated=? WHERE id=?", (time.time(), tid))
+        assert checklane.finished_holders(p, {}, later) == [], "the precheck its open review reads is exempt"
+        p.db.x("UPDATE tasks SET status='done' WHERE id=?", (rev,))
+        h = checklane.finished_holders(p, {}, later)
+        assert len(h) == 1 and h[0]["task"] == str(tid) and h[0]["pid"] == proc.pid, h   # the step holds it
+        assert checklane.stop_finished(p, {**h[0], "stop": True}) is None and proc.poll() is None, "no worker run"
+    finally:
+        _kill_group(proc)
+
+
+def test_a_finished_task_s_wrap_lane_after_check_is_found_by_its_run_and_only_it_is_stopped(env, tmp_path, monkeypatch):
+    from ttp import checklane, cli
+    from ttp.runner import proc_start
+    p = make(env)
+    _lane_env(monkeypatch)
+    tid = p.db.add_task("t", "s", kind="code")
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time(), "ok", ""))
+    rid = p.db.one("SELECT max(id) AS id FROM runs")["id"]
+    run_dir = tmp_path / "runs" / str(rid)   # a worker run's folder is named by its run id
+    run_dir.mkdir(parents=True)
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
+    proc = _wrap_lane_step_holding(p, run_dir, tid, tmp_path / "got", parent=True)
+    other = subprocess.Popen(["sleep", "600"], start_new_session=True)
+    try:
+        later = time.time() + 400
+        p.db.x("UPDATE tasks SET status='done', updated=? WHERE id=?", (time.time(), tid))
+        h = checklane.finished_holders(p, {"checks": {"done_holder_grace_s": 0}}, later)
+        assert len(h) == 1 and h[0]["run"] == str(rid) and h[0]["stop"] and h[0]["pid"] != proc.pid, h
+        (run_dir / cli.CHECKS_PID).write_text(json.dumps({"pid": other.pid, "started": proc_start(other.pid)}))
+        assert checklane.stop_finished(p, h[0]) is None, "a holder not under the run's checks is never stopped"
+        assert other.poll() is None and proc.poll() is None
+        (run_dir / cli.CHECKS_PID).write_text(json.dumps({"pid": proc.pid, "started": proc_start(proc.pid)}))
+        from ttp import jobuse
+        under = [x for x in jobuse._tree(proc.pid) if x not in (proc.pid, h[0]["pid"])]
+        assert under and checklane.stop_finished(p, {**h[0], "pid": under[0]}) is None, "only the step under it"
+        r = checklane.stop_finished(p, h[0])
+        assert r and r["pgid"] == proc.pid and proc.wait(30) is not None
+        assert other.poll() is None, "only the run's own checks"
+    finally:
+        _kill_group(proc)
+        _kill_group(other)
+
+
 def test_a_duplicate_and_a_dead_waiter_ahead_of_a_live_one_are_dropped_and_the_live_one_takes_the_lane(
         env, tmp_path, monkeypatch):
     from ttp import checkcap, checklane, locks, testslots

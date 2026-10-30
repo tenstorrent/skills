@@ -1038,7 +1038,8 @@ queues behind routine work; nothing running is interrupted:
   repository share them; other repositories and projects never wait). A run whose commands go behind
   `checks.wrap_cmd` takes that wrapper lock's own single lane instead, so runs behind one wrapper lock go one at
   a time and lock-free checks run beside them; it takes it before the wrapper starts, or with `checks.wrap_lane
-  after` (for a wrapper that waits for its lock) only once the wrapper holds its lock, so a run queued there holds no lane. At most `checks.test_project_max` of a project's checks run at once
+  after` (for a wrapper that waits for its lock) only once the wrapper holds its lock, so a run queued there holds no lane (that lane is not held to
+  `checks.test_project_max`: waiting for the cap inside the wrapper would hold the wrapper's lock meanwhile). At most `checks.test_project_max` of a project's checks run at once
   over all its lanes (chat-settable, a whole number of at least 1; unset, the runs the test-slot pool fits side by side, at least
   `checks.slots`); a run counts against it
   only once its test workers are granted, so one still waiting for them never holds up the others; waiting
