@@ -380,7 +380,12 @@ prolonged whole-box outage.
   event, wake, hold or model call of its own. An audit record that only preserves an old assertion is
   declared historical in `harness/echo_historical.json` (its path, sha256 and the retirement's id): while
   its bytes still match, that hit is counted, not listed; any mismatch lists it again. A task whose spec quotes the old rule to remove it is
-  listed too.
+  listed too. Only a rule the user withdrew (a charter `quote` or `replaces`, a Correction,
+  a memory change on the user's turn or whose `why` cites the user's words, including a `memory_forget`)
+  gives a fix order, and only where its governing words match as a whole: a compacted fact, a coordinator
+  decision superseded by another, or a match on a file name, path, version or evidence reference alone is
+  advisory, counted on one line. `ttp echoes [--json]` lists, read-only, every retirement (kind, text,
+  replacement, source, time) and every match with its class, including those the digest leaves out.
 - Progress and stall check: each minute the daemon checks, without a model, that work keeps yielding
   results (a task done, a worker hand-off, a driver's `result` report). It judges only work that has
   run. A `no_progress` event names a task with a worker run running, a resource running worker runs

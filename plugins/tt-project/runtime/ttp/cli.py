@@ -1706,6 +1706,16 @@ def cmd_audit(a) -> None:
         print("\n".join(f"- {line}" for line in audit.lines(p.db, window_s=a.hours * 3600, blocked_h=hours, p=p)))
 
 
+def cmd_echoes(a) -> None:
+    """Every retirement and every echo match, read-only (echoes.export): what the digest omits too."""
+    from . import echoes
+    p = need(a.name, sys.argv[1:]) if a.name else here()
+    if not p:
+        die("no tt-project project here; name one: `ttp echoes <name>`")
+    data = echoes.export(p)
+    print(json.dumps(data, indent=1, default=str) if a.json else echoes.export_text(data, timefmt.home(p)))
+
+
 def cmd_ttr(a) -> None:
     """Time to recover per machine (ttr.py): incidents, median, p90 and max TTR, open ones, the last one."""
     from . import ttr
@@ -9017,7 +9027,7 @@ COMMAND_GROUPS = (
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
-               "push-audit", "ttr", "spend-today", "throughput", "uninstall")),
+               "push-audit", "ttr", "spend-today", "throughput", "echoes", "uninstall")),
 )
 
 
@@ -9338,6 +9348,12 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--hours", type=float, default=24, help="the window to audit, in hours (default 24)")
     s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_audit)
+
+    s = sub.add_parser("echoes", help="read-only: every retired rule (its kind, text, replacement, source, time) "
+                                      "and every match, directive, advisory or historical, the digest's omitted ones too")
+    s.add_argument("name", nargs="?", help="the project (default: the one here)")
+    s.add_argument("--json", action="store_true", help="print JSON")
+    s.set_defaults(fn=cmd_echoes)
 
     s = sub.add_parser("replicate", help="backup copies of the project's state on a standby machine "
                                          "(failover.standby): status, take one now, verify them, or restore one "

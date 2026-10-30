@@ -5,6 +5,15 @@ A rule the user retired keeps binding while a copy of it survives somewhere else
 - a coordinator `charter_update` with `quote` (the quoted span) or `replaces` (the replaced section's body);
 - a `memory_add` with `supersedes`, or `ttp memory <name> "<merged>" --supersedes <entry>...` (each replaced entry's text);
 - a user Correction fact (`Correction (user msg #N): <right>, not <wrong>`) whose wrong part is prose of at least 3 words. A bare value ("not low") is left to the spec and ask check that catches restated corrected values.
+- a `memory_forget` on the user's turn, or whose `why` cites the user's words (`user msg #N`, "the user's words").
+
+Each retirement records its kind:
+
+- `withdrawn`: the user withdrew or replaced a governing instruction: a charter `quote` or `replaces`, a user Correction, a `memory_forget` as above, or a `memory_add supersedes` on the user's turn or whose `why` cites the user's words.
+- `compacted`: a factual consolidation: `ttp memory --supersedes` (a merge that must keep every user rule), or a `memory_add supersedes` of a fact or a standing entry by the coordinator.
+- `superseded`: one coordinator decision replaced by a newer one.
+
+A record kept before kinds existed gets one from its source: a superseded memory entry is `superseded` unless its text cites the user's words; anything else, or an unknown kind, is `withdrawn` (fail closed).
 
 From the retired text it keeps up to 8 distinctive phrases: quoted and backticked spans, config keys and identifiers (a dot or underscore inside), and the first sentence (its first 12 words). A phrase the replacing text still holds is dropped, since both rules say it. So is plugin vocabulary: a lone identifier or `ttp <command>` name found in the tt-project runtime source, the plugin template or an unedited template file (`start_when`, `memory_add`, `pr_branch`, `ttp list`), since alone it matches unrelated text. The plugin's prose is no vocabulary, and a Correction's wrong part never is. A retirement left with no phrase is not searched. Records are kept 30 days (`retired_rules` in the project's kv store).
 
@@ -19,7 +28,15 @@ Each coordinator turn it searches, model-free and case-insensitively (whitespace
 
 It does not search the replacing text (its new entry, or its words wherever they stand) or the archives (`memory/archive`, the charter history). For a Correction, a match right after a negation ("never <phrase>") agrees with it and is no hit.
 
-Hits go into the digest's `Retired-rule echoes` section: the place, the matching line and which retirement it echoes, at most 10 lines including the header, then a count of the rest. A hit still there one turn after it was first shown is marked `[still here, N turns]`. When a memory entry hits, the last line names every such entry (shown or not) for `memory_forget`, or a `memory_add supersedes` that keeps what is still right, so copies do not pile up. An empty scan gives no section. The section carries its own instruction: fix each hit in that turn with `memory_forget` or `memory_add supersedes`, `charter_update quote`, `schedule_set`, `task_update` or `config_set`.
+A phrase matches only as a whole: a letter, digit or underscore right beside it (`old_verify.py` for `verify.py`) is no match. Each hit is classed:
+
+- directive: a `withdrawn` retirement's governing phrase. Only these are listed as fix orders.
+- advisory: a `compacted` or `superseded` retirement's hit, or a hit resting only on a weak phrase: a file name, a path, a version, a hash, a number or an evidence reference (`msg #12`, a commit). Shared fragments alone never show revoked authority. Advisory hits are counted (`advisory` in the `retired_echo_seen` kv entry) and, when the section shows, named in one line that says to change nothing for them. Alone they give no section.
+- historical: see below.
+
+`ttp echoes` lists, read-only, every live retirement (id, kind, time, source, retired text, replacing text, phrases) and every match (retirement, place, phrase, line, class, action `fix` or `none`, why it is advisory), including the hits the digest leaves out. `--json` prints it as JSON. It stores and counts nothing.
+
+Directive hits go into the digest's `Retired-rule echoes` section: the place, the matching line and which retirement it echoes, at most 10 lines including the header, then a count of the rest. A hit still there one turn after it was first shown is marked `[still here, N turns]`. When a memory entry hits, the last line names every such entry (shown or not) for `memory_forget`, or a `memory_add supersedes` that keeps what is still right, so copies do not pile up. An empty scan gives no section. The section carries its own instruction: fix each hit in that turn with `memory_forget` or `memory_add supersedes`, `charter_update quote`, `schedule_set`, `task_update` or `config_set`.
 
 It is a notice only: it posts no event, wakes nothing, holds nothing and adds no model call.
 

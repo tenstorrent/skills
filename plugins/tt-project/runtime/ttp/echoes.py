@@ -21,6 +21,15 @@ to that value and the retirement is live, that retirement's hit on it is counted
 mismatch lists it as before. Binding places (prompts, harness tools, skills, agent instructions,
 executables) are never historical. Accepted gap: a task whose spec quotes the retired rule in order
 to remove it is listed too.
+
+Each retirement has a KIND: WITHDRAWN (the user withdrew or replaced a governing instruction: a
+charter_update `quote` or `replaces`, a user Correction, a memory change on the user's turn or whose
+`why` cites the user's words), COMPACTED (a factual entry merged or shortened) or SUPERSEDED (one
+coordinator decision superseded by another). Only a WITHDRAWN retirement's hit on a governing phrase
+is a directive; a hit of the other kinds, or one resting only on a filename, path, version or evidence
+fragment (_weak), is advisory: counted on one line, never a fix order. A record stored before kinds
+existed gets one from its source (_kind); anything unknown is WITHDRAWN (fail closed). `export` is the
+read-only full list behind `ttp echoes`.
 """
 from __future__ import annotations
 
@@ -33,9 +42,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-RETIRED_KEY = "retired_rules"        # kv: [{"id", "at", "source", "old", "new", "phrases", "skip", "negated"}]
+RETIRED_KEY = "retired_rules"        # kv: [{"id", "at", "source", "old", "new", "phrases", "skip", "negated", "kind"}]
 SEEN_KEY = "retired_echo_seen"       # kv: {"turn": last_coordinator_turn, "hits": {hit key: turns shown},
-                                     #      "historical": hits declared historical, not listed}
+                                     #      "historical": hits declared historical, not listed,
+                                     #      "advisory": advisory hits, counted, not listed}
+WITHDRAWN, COMPACTED, SUPERSEDED = "withdrawn", "compacted", "superseded"   # retirement kinds (see the top)
+KINDS = (WITHDRAWN, COMPACTED, SUPERSEDED)
 HISTORICAL_INDEX = "echo_historical.json"   # harness/: {"historical": [{"path", "sha256", "retirement"}]}
 HISTORICAL_MAX = 200                 # index entries read
 _BINDING_DIRS = {"bin", "prompts", "hooks", "tools"}   # harness/ folders of live scripts and prompts
@@ -66,6 +78,11 @@ _QUOTED = re.compile(r'"([^"\n]{6,300})"|“([^”\n]{6,300})”|`([^`\n]{4,200}
 _IDENT = re.compile(r"\b[a-z][a-z0-9]*(?:[._][a-z0-9]+)+\b", re.I)
 _TTP_CMD = re.compile(r"\bttp [a-z][a-z-]*[a-z]\b")
 _SENTENCE = re.compile(r"(?<=[.!?])\s+")
+# A phrase that alone names no rule: a file name, a path, a version, a hash or an evidence reference.
+_FILEISH = re.compile(r"[\w.-]*\.(?:md|markdown|txt|json|jsonl|ya?ml|toml|py|sh|bash|js|ts|log|csv|tsv|html?|ini"
+                      r"|cfg|conf|lock|db|sqlite|patch|diff|out|err|rc|pdf|png|tar|gz|zip)(?::\d+)*")
+_VERSION = re.compile(r"v?\d+(?:\.\d+)+(?:[-+][\w.]+)?")
+_EVIDENCE = re.compile(r"(?:#\d+|[0-9a-f]*\d[0-9a-f]*|(?:msgs?|tasks?|runs?|notes?|pr|issue)\s*#?\d+|https?:\S*)")
 _NEGATION = re.compile(r"\b(?:not|never|no longer|instead of|rather than|isn't|aren't|wasn't|weren't|retires)\s*$")
 
 
@@ -94,6 +111,39 @@ def phrases(old: str, new: str = "") -> list[str]:
     return out[:MAX_PHRASES]
 
 
+def _weak_token(tok: str) -> bool:
+    tok = tok.strip("`'\"()[]{}<>,;:!?")
+    tok = tok.rstrip(".")
+    return (not tok or "/" in tok or bool(_FILEISH.fullmatch(tok) or _VERSION.fullmatch(tok)
+            or _EVIDENCE.fullmatch(tok) or (len(tok) >= 7 and re.fullmatch(r"[0-9a-f]+", tok)
+                                            and re.search(r"\d", tok))) or not re.search(r"[a-z]", tok))
+
+
+def _weak(ph: str) -> bool:
+    """Whether phrase `ph` names no rule alone: each of its words of 4+ characters (all of them when none
+    is) is a file name, path, version, hash, number or evidence reference ('msg #12', a commit)."""
+    s = ph.strip("`'\" ")
+    for pair in re.findall(r"(?:msgs?|tasks?|runs?|notes?|pr|issue)\s+#?\d+", s):   # 'msg #12' is one reference
+        s = s.replace(pair, pair.replace(" ", ""))
+    words = s.split()
+    long = [w for w in words if len(w.strip("`'\"()[]{}<>,;:.!?")) >= 4] or words
+    return bool(long) and all(map(_weak_token, long))
+
+
+def _kind(rec: dict) -> str:
+    """Retirement `rec`'s kind: its own when it is one of KINDS; a record without one (stored before kinds)
+    from its source: a memory entry superseded by another is SUPERSEDED unless its text cites the user's
+    words; anything else (a charter change, a user correction, an unknown) is WITHDRAWN."""
+    k = rec.get("kind")
+    if k is not None:
+        return k if k in KINDS else WITHDRAWN
+    from .project import USER_CITE
+    if re.match(r"memory \[[^\]]+\] superseded by \[", rec.get("source") or "") \
+            and not USER_CITE.search(rec.get("old") or ""):
+        return SUPERSEDED
+    return WITHDRAWN
+
+
 def _store(db, rec: dict, now: float) -> None:
     recs = [r for r in db.kv(RETIRED_KEY, []) or [] if now - r.get("at", 0) < RETIRED_DAYS * 86400
             and r.get("id") != rec["id"]]
@@ -101,18 +151,20 @@ def _store(db, rec: dict, now: float) -> None:
 
 
 def record(db, source: str, old: str, new: str = "", skip: list[str] = (), now: float | None = None,
-           negated: bool = False, found: list[str] | None = None) -> dict | None:
+           negated: bool = False, found: list[str] | None = None, kind: str = WITHDRAWN) -> dict | None:
     """Keep retired text `old` (replaced by `new`) to search for. `skip`: place keys (see places) never
     searched for it, such as the replacing entry. `found`: the phrases, when the caller has them.
     `negated`: a match right after a negation ('never <phrase>') agrees with the change, so is no hit.
-    None (nothing kept) when the text has no distinctive phrase."""
+    `kind`: one of KINDS (an unknown one counts as WITHDRAWN). None (nothing kept) when the text has no
+    distinctive phrase."""
     now = time.time() if now is None else now
     ps = phrases(old, new) if found is None else [p for p in map(_flat, found) if len(p) >= 6][:MAX_PHRASES]
     if not ps:
         return None
     rec = {"id": hashlib.sha256(f"{source}\n{_flat(old)}".encode()).hexdigest()[:10], "at": now,
            "source": " ".join(source.split())[:200], "old": " ".join((old or "").split())[:600],
-           "new": _flat(new)[:4000], "phrases": ps, "skip": list(skip), "negated": negated}
+           "new": _flat(new)[:4000], "phrases": ps, "skip": list(skip), "negated": negated,
+           "kind": kind if kind in KINDS else WITHDRAWN}
     _store(db, rec, now)
     return rec
 
@@ -316,15 +368,24 @@ def _generic(ph: str, extra: set[str] | list[str] = ()) -> bool:
     return ph in _RUNTIME["vocab"] or ph in extra
 
 
+def _inside(flat: str, i: int, ph: str) -> bool:
+    """Whether `ph` at `flat[i:]` sits inside a longer word, name or path (a letter, digit or underscore
+    beside a word-character end of it), so it is not the phrase itself."""
+    before = flat[i - 1:i] if i else ""
+    after = flat[i + len(ph):i + len(ph) + 1]
+    return bool((re.match(r"\w", ph[:1]) and re.match(r"\w", before))
+                or (re.match(r"\w", ph[-1:]) and re.match(r"\w", after)))
+
+
 def _hit(rec: dict, flat: str, phrases_: list[str] | None = None) -> str:
-    """The first phrase of `rec` (or `phrases_`) found in flattened text `flat` outside its replacing
-    text ('' when none)."""
+    """The first phrase of `rec` (or `phrases_`) found as a whole in flattened text `flat` outside its
+    replacing text ('' when none)."""
     if rec.get("new") and len(rec["new"]) >= 6:
         flat = flat.replace(rec["new"], " ")
     for ph in rec.get("phrases") or [] if phrases_ is None else phrases_:
         i = flat.find(ph)
         while i >= 0:
-            if not (rec.get("negated") and _NEGATION.search(flat[max(0, i - 20):i])):
+            if not (_inside(flat, i, ph) or rec.get("negated") and _NEGATION.search(flat[max(0, i - 20):i])):
                 return ph
             i = flat.find(ph, i + 1)
     return ""
@@ -393,12 +454,20 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def scan(p, now: float | None = None, historical: list[dict] | None = None) -> list[dict]:
-    """The retired texts' echoes: [{"key", "label", "line", "phrase", "source", "retirement"}], newest
-    retirement first. A hit on a file the historical index declares historical for that retirement, with
-    its bytes still hashing to the recorded value, goes to `historical` instead."""
+def records(p, now: float | None = None) -> list[dict]:
+    """The live retirements (kept RETIRED_DAYS), each with its kind (see _kind)."""
     now = time.time() if now is None else now
-    recs = [r for r in p.db.kv(RETIRED_KEY, []) or [] if now - r.get("at", 0) < RETIRED_DAYS * 86400]
+    return [dict(r, kind=_kind(r)) for r in p.db.kv(RETIRED_KEY, []) or []
+            if isinstance(r, dict) and now - r.get("at", 0) < RETIRED_DAYS * 86400]
+
+
+def scan(p, now: float | None = None, historical: list[dict] | None = None) -> list[dict]:
+    """The retired texts' echoes: [{"key", "label", "line", "phrase", "source", "retirement", "kind",
+    "class", "why"}], newest retirement first. `class` is "directive" (a WITHDRAWN retirement's governing
+    phrase: fix it) or "advisory" (another kind, or only a _weak phrase matched: `why` says which). A hit on
+    a file the historical index declares historical for that retirement, with its bytes still hashing to
+    the recorded value, goes to `historical` instead (class "historical")."""
+    recs = records(p, now)
     if not recs:
         return []
     index = historical_index(p, recs)
@@ -411,6 +480,7 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None) -> l
         own = [ph for ph in rec.get("phrases") or [] if rec.get("negated") or not _generic(ph, vocab)]
         if not own:
             continue
+        own.sort(key=_weak)   # a governing phrase first: a hit rests on it when it can
         skip = set(rec.get("skip") or ())
         for key, label, text, flat in where:
             if key in skip or (rec["id"], key) in seen:
@@ -420,15 +490,19 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None) -> l
                 seen.add((rec["id"], key))
                 if key.startswith("file:"):
                     label += f":{_lineno(text, ph)}"
+                why = ("" if rec["kind"] == WITHDRAWN and not _weak(ph) else
+                       f"retired as {rec['kind']}, not withdrawn by the user" if rec["kind"] != WITHDRAWN
+                       else "only a file name, path, version or evidence reference matches")
                 hit = {"key": f"{rec['id']}:{key}", "label": label, "line": _line(text, ph), "phrase": ph,
-                       "source": rec.get("source") or "", "retirement": rec["id"]}
+                       "source": rec.get("source") or "", "retirement": rec["id"], "kind": rec["kind"],
+                       "class": "advisory" if why else "directive", "why": why}
                 shas = index.get(key, {}).get(rec["id"])
                 if shas:
                     if key not in digests:
                         digests[key] = _sha256(Path(p.root).resolve() / key[5:])
                     if digests[key] in shas:
                         if historical is not None:
-                            historical.append(hit)
+                            historical.append(dict(hit, **{"class": "historical"}))
                         continue
                 out.append(hit)
     return out
@@ -439,21 +513,24 @@ def digest_lines(p, now: float | None = None) -> list[str]:
     hit already shown in an earlier turn is marked. Never posts, wakes or holds anything."""
     hist: list[dict] = []
     try:
-        hits = scan(p, now, hist)
+        found = scan(p, now, hist)
     except (OSError, ValueError, TypeError, KeyError, AttributeError):   # a notice never fails the turn
         return []
+    hits = [h for h in found if h["class"] == "directive"]
+    advisory = len(found) - len(hits)
     db = p.db
     turn = db.kv("last_coordinator_turn", 0) or 0
     old = db.kv(SEEN_KEY, {}) or {}
     before = old.get("hits") or {}
     fresh = old.get("turn") != turn   # a second digest within one turn counts no turn
     counts = {h["key"]: (before.get(h["key"], 0) + 1 if fresh else before.get(h["key"]) or 1) for h in hits}
-    if counts != before or old.get("turn") != turn or (old.get("historical") or 0) != len(hist):
-        db.set_kv(SEEN_KEY, {"turn": turn, "hits": counts, "historical": len(hist)})
-    if not hits:
+    if (counts != before or old.get("turn") != turn or (old.get("historical") or 0) != len(hist)
+            or (old.get("advisory") or 0) != advisory):
+        db.set_kv(SEEN_KEY, {"turn": turn, "hits": counts, "historical": len(hist), "advisory": advisory})
+    if not hits:   # advisory and historical hits alone order nothing: no section
         return []
     mem = list(dict.fromkeys(h["key"].split(":", 2)[2] for h in hits if h["key"].split(":", 2)[1] == "memory"))
-    room = SECTION_LINES - 1 - bool(mem) - bool(hist)
+    room = SECTION_LINES - 1 - bool(mem) - bool(hist) - bool(advisory)
     shown = hits if len(hits) <= room else hits[:room - 1]
     lines = [RETIRED_HEADER]
     for h in shown:
@@ -472,4 +549,47 @@ def digest_lines(p, now: float | None = None) -> list[str]:
         except ValueError:
             where = HISTORICAL_INDEX
         lines.append(f"- {len(hist)} historical line{'s' if len(hist) != 1 else ''} not shown (declared in {where})")
+    if advisory:   # counted, never a fix order
+        lines.append(f"- {advisory} advisory match{'es' if advisory != 1 else ''} not shown: a compacted fact, a "
+                     f"superseded coordinator decision or only a file name, version or evidence reference, never "
+                     f"a rule the user withdrew; change nothing for them (all: `ttp echoes`)")
     return lines
+
+
+def export(p, now: float | None = None) -> dict:
+    """Every live retirement and every hit, read-only (nothing stored, posted or counted):
+    {"retirements": [{"id", "kind", "at", "source", "retired", "replaced_by", "phrases"}],
+    "matches": [{"retirement", "where", "key", "phrase", "line", "class", "action", "why"}], "counts"}.
+    `action` is "fix" for a directive, "none" for an advisory or historical hit."""
+    hist: list[dict] = []
+    found = scan(p, now, hist)
+    recs = sorted(records(p, now), key=lambda r: -r.get("at", 0))
+    matches = [{"retirement": h["retirement"], "where": h["label"], "key": h["key"].split(":", 1)[1],
+                "phrase": h["phrase"], "line": h["line"], "class": h["class"],
+                "action": "fix" if h["class"] == "directive" else "none", "why": h.get("why") or ""}
+               for h in found + hist]
+    counts = {c: sum(m["class"] == c for m in matches) for c in ("directive", "advisory", "historical")}
+    return {"retirements": [{"id": r.get("id"), "kind": r["kind"], "at": r.get("at"), "source": r.get("source") or "",
+                             "retired": r.get("old") or "", "replaced_by": r.get("new") or "",
+                             "phrases": r.get("phrases") or []} for r in recs],
+            "matches": matches, "counts": counts}
+
+
+def export_text(data: dict, tz: str | None = None) -> str:
+    """`ttp echoes` without --json: each retirement, then its matches."""
+    from . import timefmt
+    if not data["retirements"]:
+        return "no live retirements"
+    c = data["counts"]
+    out = [f"{len(data['retirements'])} retirements; matches: {c['directive']} to fix, {c['advisory']} advisory, "
+           f"{c['historical']} historical"]
+    by: dict[str, list[dict]] = {}
+    for m in data["matches"]:
+        by.setdefault(m["retirement"], []).append(m)
+    for r in data["retirements"]:
+        at = timefmt.long(r["at"], tz) if isinstance(r.get("at"), (int, float)) else "?"
+        out.append(f"{r['id']} [{r['kind']}] {at} {r['source']}: \"{r['retired'][:160]}\"")
+        for m in by.get(r["id"], []):
+            out.append(f"  - {m['class']}: {m['where']}: \"{m['line']}\" (matches \"{m['phrase'][:60]}\")"
+                       + (f" ({m['why']})" if m["why"] else ""))
+    return "\n".join(out)

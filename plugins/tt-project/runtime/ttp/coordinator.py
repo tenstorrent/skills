@@ -2567,12 +2567,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if a["text"].lstrip().startswith(CORRECTION_PREFIX):
                     echoes.record_correction(db, added.stem, a["text"].strip())
                 if old:   # the replaced entries' text, searched for in what still binds (echoes)
-                    live = {e["name"]: e["body"] for e in p._memory_entries()}
+                    live = {e["name"]: e for e in p._memory_entries()}
                     for name in old:
                         stem = Path(str(name).strip().strip("[]")).stem
                         if stem in live and stem != added.stem:
-                            echoes.record(db, f"memory [{stem}] superseded by [{added.stem}]", live[stem],
-                                          a["text"], skip=[f"memory:{added.stem}"])
+                            echoes.record(db, f"memory [{stem}] superseded by [{added.stem}]", live[stem]["body"],
+                                          a["text"], skip=[f"memory:{added.stem}"],
+                                          kind=_echo_kind(live[stem], user_turn, a.get("why")))
                 for name in old:
                     try:
                         # A standing entry superseded by a standing one is shortened, not retired.
@@ -2584,7 +2585,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     notes.append(f"memory_add: warning: {room}")
                 memory_budget_check(p)
             elif t == "memory_forget":
+                gone = _users_withdrawal(p, str(a.get("name") or ""), user_turn, a.get("why"))
                 p.forget_memory(str(a.get("name") or ""), why=a.get("why"))
+                if gone:   # the user withdrew it: its text, searched for in what still binds (echoes)
+                    echoes.record(db, f"memory [{gone['name']}] withdrawn", gone["body"])
                 memory_budget_check(p)
             elif t == "charter_update" and a.get("both_hold") and not (a.get("text") or a.get("quote")
                                                                     or a.get("replaces")):
@@ -5482,6 +5486,28 @@ def user_turn(db, messages: list[int]) -> bool:
     ids = [int(i) for i in messages or []]
     return bool(ids) and bool(db.one(f"SELECT 1 FROM messages WHERE id IN ({','.join('?' * len(ids))}) "
                                      "AND kind!='finding'", ids))
+
+
+def _echo_kind(entry: dict, user_turn: bool, why: str | None) -> str:
+    """The echoes kind of memory `entry` superseded by a memory_add: WITHDRAWN on the user's turn or with a
+    `why` citing the user's words, else COMPACTED for a fact or a standing entry (a merge or a shortening
+    that keeps what still holds), else SUPERSEDED (a coordinator decision replaced by a newer one)."""
+    from .project import USER_CITE
+    if user_turn or USER_CITE.search(why or ""):
+        return echoes.WITHDRAWN
+    if entry.get("kind") == "fact" or entry.get("standing"):
+        return echoes.COMPACTED
+    return echoes.SUPERSEDED
+
+
+def _users_withdrawal(p: Project, name: str, user_turn: bool, why: str | None) -> dict | None:
+    """The live memory entry a memory_forget retires on the user's word (the user's turn, or a `why` citing
+    the user's words), whose text echoes then searches for; None otherwise or when no entry is named."""
+    from .project import USER_CITE
+    if not (user_turn or USER_CITE.search(why or "")):
+        return None
+    stem = Path(name.strip().strip("[]")).stem
+    return next((e for e in p._memory_entries() if e["name"] == stem), None) if stem else None
 
 
 def _users_own(db, messages: list[int]) -> list[int]:

@@ -1910,7 +1910,7 @@ class Project:
         from . import echoes
         for d in done:   # the replaced text, searched for in what still binds
             echoes.record(self.db, f"memory [{d.stem}] superseded by [{added.stem}]", bodies.get(d.stem, ""), text,
-                          skip=[f"memory:{added.stem}"])
+                          skip=[f"memory:{added.stem}"], kind=echoes.COMPACTED)   # a merge keeps what holds
         if errors:
             raise ValueError("\n".join(errors))
         return added, done

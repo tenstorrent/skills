@@ -18,8 +18,9 @@ def test_a_superseded_memory_entry_whose_phrase_survives_in_a_schedule_is_listed
     old = p.add_memory("Probe boxes with `probe-legacy --deep` before each job.", kind="decision")
     assert coord.apply(p, [{"type": "schedule_set", "name": "boxprobe", "kind": "command", "every": "1h",
                             "command": "PROBE-LEGACY  --deep all && echo ok", "rewake_after_h": None}]) == []
+    # On the user's turn: the user replaced the rule (a coordinator's own supersession is advisory, below).
     assert coord.apply(p, [{"type": "memory_add", "memory_kind": "decision", "supersedes": [old.stem],
-                            "text": "Probe boxes with `probe-fast` before each job."}], turn=1) == []
+                            "text": "Probe boxes with `probe-fast` before each job."}], user_turn=True, turn=1) == []
     sec = _echoes(p)
     # Case and whitespace do not hide it; the replacing entry and the archived old one are not listed.
     assert sec.startswith("## Retired-rule echoes") and "schedule boxprobe payload.command" in sec, sec
@@ -273,3 +274,131 @@ def test_an_indexed_audit_record_is_historical_only_while_its_hash_and_retiremen
         rel = f.resolve().relative_to(root.resolve()).as_posix()
         assert [x for x in got if x.startswith(f"file {rel}:")], (rel, got)
     assert {"charter section 'Recovery'", f"memory [{mem.stem}]", "file audits/2026-10-02.md:1"} <= got
+
+
+def test_a_compacted_fact_or_superseded_decision_sharing_file_names_is_advisory_and_never_a_fix_order(env):
+    from ttp import coordinator as coord, echoes
+    p = make(env)
+    fact = p.add_memory("Fixture notes: the table is in `supplement.md`, its index in `index.json`, checked by "
+                        "`verify_fixture.py` at `0.4.2` (msg #41, commit 3f9a2c1).", kind="fact")
+    p.supersede_memory("Fixture notes: see the fixture folder's README.", [fact.stem])   # a factual merge
+    dec = p.add_memory("Run the nightly fixture check with `fixture-check --full` at 02:00.", kind="decision")
+    assert coord.apply(p, [{"type": "memory_add", "memory_kind": "decision", "supersedes": [dec.stem],
+                            "text": "Run the nightly fixture check at 03:00."}], turn=1) == []
+    kinds = {r["source"].split("]")[0]: r["kind"] for r in echoes.records(p)}
+    assert kinds == {f"memory [{fact.stem}": echoes.COMPACTED, f"memory [{dec.stem}": echoes.SUPERSEDED}, kinds
+    # Unrelated text sharing file names, a version and evidence, and a still-standing copy of the old decision.
+    t = p.db.add_task("t", "Rebuild /data/v2/supplement.md and index.json for 0.4.2; see msg #41.")
+    u = p.db.add_task("u", "Keep running fixture-check --full at 02:00 for the audit.")
+    hits = echoes.scan(p)
+    assert {h["label"] for h in hits} >= {f"task #{t} spec", f"task #{u} spec"}, hits
+    assert {h["class"] for h in hits} == {"advisory"} and all(h["why"] for h in hits), hits
+    assert echoes.digest_lines(p) == []   # no section, no fix order
+    assert p.db.kv(echoes.SEEN_KEY)["advisory"] == len(hits) and p.db.kv(echoes.SEEN_KEY)["hits"] == {}
+    # The active-policy control: a rule the user withdrew whose governing phrase a harness tool still runs is
+    # listed, with the advisory ones counted on one line.
+    echoes.record(p.db, "charter 'Recovery' quote replaced", "Kick a hung card with `legacy-card-kick`.",
+                  "Reset a hung card with the documented reset.")
+    tool = p.harness / "tools" / "recover.sh"
+    tool.parent.mkdir(parents=True, exist_ok=True)
+    tool.write_text("#!/bin/sh\nlegacy-card-kick \"$1\"\n")
+    sec = echoes.digest_lines(p)
+    assert sec[0] == echoes.RETIRED_HEADER and sec[1].startswith("- file tt-project/harness/tools/recover.sh:2"), sec
+    assert sec[-1].startswith(f"- {len(hits)} advisory matches not shown") and "`ttp echoes`" in sec[-1], sec
+    assert len(sec) == 3, sec
+
+
+def test_a_withdrawal_rests_on_its_governing_phrase_never_on_a_file_name_version_or_evidence_alone(env):
+    from ttp import coordinator as coord, echoes
+    p = make(env)
+    p.charter_path.write_text(p.charter_path.read_text().rstrip() + "\n\n## Policies\n"
+                              "- Gate each release on `verify_fixture.py` from v0.4.2 (msg #41).\n")
+    coord.apply(p, [{"type": "charter_update", "section": "Policies",
+                     "quote": "Gate each release on `verify_fixture.py` from v0.4.2 (msg #41).",
+                     "text": "Releases ship on green checks."}], user_turn=True, turn=1)
+    rec = echoes.records(p)[0]
+    assert rec["kind"] == echoes.WITHDRAWN and "gate each release on `verify_fixture.py` from v0.4.2 (msg #41)" \
+        in rec["phrases"], rec
+    rule = p.db.add_task("rule", "Gate each release on `verify_fixture.py` from v0.4.2 (msg #41).")
+    path = p.db.add_task("path", "Copy /srv/fixtures/verify_fixture.py and pin v0.4.2.")
+    inside = p.db.add_task("inside", "Run old_verify_fixture.py and verify_fixture.pyc.")
+    by = {h["label"]: h for h in echoes.scan(p)}
+    assert by[f"task #{rule} spec"]["class"] == "directive", by
+    assert by[f"task #{path} spec"]["class"] == "advisory" and "file name" in by[f"task #{path} spec"]["why"], by
+    assert f"task #{inside} spec" not in by, by   # inside a longer name: no match at all
+    sec = echoes.digest_lines(p)
+    assert [ln for ln in sec if f"task #{rule} spec" in ln] and not [ln for ln in sec if f"task #{path}" in ln], sec
+    assert sec[-1].startswith("- 1 advisory match not shown"), sec
+    # Weak phrases: file names, paths, versions, hashes, numbers, evidence; a rule's words never are.
+    assert all(echoes._weak(x) for x in ("supplement.md", "verify_fixture.py", "/data/x", "v0.4.2", "0.4.2-rc1",
+                                         "3f9a2c1d", "msg #41", "#41", "task #12", "index.json and supplement.md",
+                                         "https://example.invalid/x", "`supplement.md:12`,", "(run #3)"))
+    assert not any(echoes._weak(x) for x in ("legacy_release_gate", "legacy-card-kick", "tt-smi -r",
+                                             "gate releases on verify_fixture.py", "sudo -n true", "deadbeef"))
+
+
+def test_a_memory_forget_on_the_users_word_is_a_withdrawal_and_a_legacy_record_gets_a_kind(env):
+    from ttp import coordinator as coord, echoes
+    p = make(env)
+    a = p.add_memory("Hold deploys during the `quiet-window` each Friday.", kind="decision")
+    b = p.add_memory("Ping the channel with `legacy-pinger` after deploys.", kind="decision")
+    copy = p.db.add_task("c", "Respect the quiet-window each Friday.")
+    assert coord.apply(p, [{"type": "memory_forget", "name": a.stem, "why": "user msg #7 ended it"}]) == []
+    assert coord.apply(p, [{"type": "memory_forget", "name": b.stem, "why": "done with it"}]) == []
+    recs = echoes.records(p)
+    assert [(r["source"], r["kind"]) for r in recs] == [(f"memory [{a.stem}] withdrawn", echoes.WITHDRAWN)], recs
+    assert [h["class"] for h in echoes.scan(p) if h["label"] == f"task #{copy} spec"] == ["directive"]
+    # A record stored before kinds: a superseded memory entry is SUPERSEDED unless it cites the user's words;
+    # an unknown kind or source fails closed to WITHDRAWN.
+    legacy = [{"id": "l1", "at": recs[0]["at"], "source": "memory [x] superseded by [y]", "old": "Use `old-tool`.",
+               "phrases": ["old-tool"]},
+              {"id": "l2", "at": recs[0]["at"], "source": "memory [x] superseded by [y]",
+               "old": "User msg #3: use `old-tool`.", "phrases": ["old-tool"]},
+              {"id": "l3", "at": recs[0]["at"], "source": "something new", "old": "x", "phrases": ["old-tool"]},
+              {"id": "l4", "at": recs[0]["at"], "source": "memory [x] superseded by [y]", "old": "x",
+               "phrases": ["old-tool"], "kind": "bogus"}]
+    p.db.set_kv(echoes.RETIRED_KEY, legacy)
+    assert {r["id"]: r["kind"] for r in echoes.records(p)} == {"l1": echoes.SUPERSEDED, "l2": echoes.WITHDRAWN,
+                                                                "l3": echoes.WITHDRAWN, "l4": echoes.WITHDRAWN}
+
+
+def test_ttp_echoes_exports_every_retirement_and_match_read_only_including_ones_the_digest_omits(env, capsys):
+    import hashlib as _hashlib
+    import json as _json
+    from ttp import cli, echoes
+    p = make(env)
+    rec = echoes.record(p.db, "charter 'Release' quote replaced", "Hold every release for the `legacy_release_gate`.",
+                        "Releases ship on green checks.")
+    old = echoes.record(p.db, "memory [a] superseded by [b]", "Fixture table in `supplement.md`.", "See README.",
+                        kind=echoes.COMPACTED)
+    for i in range(15):
+        p.db.add_task(f"t{i}", f"Check the legacy_release_gate flag {i} and supplement.md")
+    audit = p.root / "audits" / "a.md"
+    audit.parent.mkdir(parents=True)
+    audit.write_text("Then: legacy_release_gate held releases.\n")
+    p.set_config("coordinator.echo_paths", ["audits"])
+    (p.harness / echoes.HISTORICAL_INDEX).write_text(_json.dumps({"historical": [
+        {"path": "audits/a.md", "sha256": _hashlib.sha256(audit.read_bytes()).hexdigest(), "retirement": rec["id"]}]}))
+    sec = echoes.digest_lines(p)
+    shown = [ln for ln in sec if ln.startswith("- task #")]
+    assert len(shown) < 15 and "more" in "\n".join(sec), sec
+    seen = p.db.kv(echoes.SEEN_KEY)
+    tasks = p.db.one("SELECT COUNT(*) AS n FROM tasks")["n"]
+    data = echoes.export(p)
+    assert data["counts"] == {"directive": 15, "advisory": 15, "historical": 1}, data["counts"]
+    assert {r["id"]: r["kind"] for r in data["retirements"]} == {rec["id"]: echoes.WITHDRAWN,
+                                                                  old["id"]: echoes.COMPACTED}
+    r0 = next(r for r in data["retirements"] if r["id"] == rec["id"])
+    assert r0["retired"].startswith("Hold every release") and r0["replaced_by"] == "releases ship on green checks." \
+        and r0["source"] == "charter 'Release' quote replaced" and r0["at"] == rec["at"]
+    hist = [m for m in data["matches"] if m["class"] == "historical"]
+    assert [(m["where"], m["action"]) for m in hist] == [("file audits/a.md:1", "none")], hist
+    assert {m["action"] for m in data["matches"] if m["class"] == "directive"} == {"fix"}
+    cli.main(["echoes", "demo", "--json"])
+    assert _json.loads(capsys.readouterr().out)["counts"] == data["counts"]
+    cli.main(["echoes", "demo"])
+    out = capsys.readouterr().out
+    assert out.startswith("2 retirements; matches: 15 to fix, 15 advisory, 1 historical") and \
+        f"{old['id']} [compacted]" in out and "advisory: task #" in out, out
+    # Read-only: nothing counted, stored or added.
+    assert p.db.kv(echoes.SEEN_KEY) == seen and p.db.one("SELECT COUNT(*) AS n FROM tasks")["n"] == tasks
