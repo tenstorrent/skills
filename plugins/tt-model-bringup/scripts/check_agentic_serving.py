@@ -107,8 +107,10 @@ def check_survey(evals: Path, carried: int, problems: list) -> None:
 
 def check_preflight(evals: Path, problems: list) -> None:
     preflight = read(evals / "preflight.json", problems)
+    if not preflight:
+        return
     for key in PREFLIGHT:
-        row = preflight.get(key) if preflight else None
+        row = preflight.get(key)
         if not isinstance(row, dict) or row.get("ok") is not True:
             problems.append((2, f"preflight {key!r} did not pass; the release depends on it"))
 
