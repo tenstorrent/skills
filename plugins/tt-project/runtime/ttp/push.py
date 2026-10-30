@@ -36,7 +36,7 @@ from typing import Any, Callable
 from urllib.parse import quote, unquote
 
 from . import (checkcap, checkdirs, cleantree, envfault, gitmemo, landed, locks, machines, prguard, prhead, remotecheck, runner,
-               sandbox, scriptwatch, settinghold, testslots, timefmt, worktree)
+               sandbox, scriptwatch, settinghold, shorttmp, testslots, timefmt, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, code_tasks_may_push, durable_append, durable_write, git_fsync_env, hostname,
@@ -3656,7 +3656,6 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None,
 def scratch_need(p: Project, repo: Path) -> int | None:
     """The scratch the push checks of `repo` plan on the RAM disk (shorttmp.need of its HEAD), None to
     keep it under /tmp."""
-    from . import shorttmp
     try:
         d = p.config().get("delivery") or {}
         return shorttmp.need(repo, "HEAD", check_list(repo_checks(d, Path(repo), p)[0]))
