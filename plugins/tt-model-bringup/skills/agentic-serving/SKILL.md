@@ -75,8 +75,10 @@ Optional operator inputs come from `bringup/agentic_evals/inputs.json` in the ta
   current release spec names them; the default subset is 10 tasks each;
 - `batch_sizes`, see [Decode batches](#decode-batches): stage 10 validates a tuned configuration
   per batch and stage 11 measures a profile for each surviving one;
+- `release_spec`: where the release values come from, a file or the release workflow;
 - `stage_budget_hours` (default 24), `effort_budget_hours` (default 16) and `suite_budget_hours`
-  (default 8);
+  (default 8). The stage budget covers survey to release dispatch; each release suite then runs
+  to completion within `suite_budget_hours`;
 - reference scores;
 - the eval harness: default the tt-inference-server agentic runner;
 - `compute`.
@@ -95,7 +97,8 @@ reader can tell a thin result from a small grant.
 
 ### Settings the release fixes
 
-Some settings are not tuning arms. Read them from the release spec before the first run:
+Some settings are not tuning arms. Read them from `release_spec` before the first run, and record
+the source and values in the preflight:
 
 - Eval names and versions. A stale default in a skill or inputs file does not override the spec.
 - Agent time limit, request time limit and output cap: never below the release values. Raise the
@@ -109,9 +112,9 @@ Record them in `serving_config.json` next to `release_limits`, the values the sp
 ### Stage order
 
 1. **Survey, about 2 h.** Answer every check and calculation in [the survey](references/survey.md)
-   on the stage-11 data and one smoke run at release limits, and run the preflight: registry,
-   disk, the release route the final run will use, and an isolated 2-task smoke with a trajectory
-   audit. Write `survey.json` and `preflight.json`.
+   on the stage-11 data and one smoke run at release limits, and run the preflight: release spec,
+   registry, disk, the release route the final run will use, and an isolated 2-task smoke with a
+   trajectory audit. Write `survey.json` and `preflight.json`.
 2. **Rank, about 0.5 h.** Turn each problem the survey found into an effort in `efforts.json`, as
    [Ranking](#ranking) describes. Write the first go or stop estimate per eval to `estimate.json`.
 3. **Efforts, `effort_budget_hours`, hard stop.** Run efforts in parallel, each owned by one
@@ -177,7 +180,8 @@ multi-turn traffic. A count valid for one is meaningless for another.
 Write these to `doc/agentic_evals/`:
 
 - `survey.json`: `checks`, `calculations` and `shortfalls`, as the survey reference names them
-- `preflight.json`: `registry`, `disk`, `release_route` and `isolation_smoke`, each with `ok`
+- `preflight.json`: `release_spec` (with its source and values), `registry`, `disk`, `release_route`
+  and `isolation_smoke`, each with `ok`
 - `efforts.json`: `efforts`, each with `problem`, `owner`, `goal`, `plan`, `predicted`
   (`saving_hours` per eval, `device_hours`, `basis`: `measured`, `calculated` or `guess`),
   `confirm` (`method`, `success`), `box_hours`, `re_estimate` once past the box, `status`

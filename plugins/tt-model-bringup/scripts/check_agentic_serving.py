@@ -23,7 +23,7 @@ SURVEY_CHECKS = ("time_split", "busy_rows", "live_prefill_rows", "trace_captures
                  "cache_pressure", "cache_bytes", "memory_headroom", "cutoffs", "eval_validity", "accuracy_drift")
 SURVEY_CALCULATIONS = ("batch", "suite_hours", "agent_timeout", "output_cap", "bytes", "agents", "block_cost",
                        "prefill_padding")
-PREFLIGHT = ("registry", "disk", "release_route", "isolation_smoke")
+PREFLIGHT = ("release_spec", "registry", "disk", "release_route", "isolation_smoke")
 EFFORT_STATUS = ("done", "running", "not_run")
 CHANGES = ("kept", "dropped", "none")
 PROBLEM_STATUS = ("solved", "open")
