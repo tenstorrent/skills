@@ -552,3 +552,26 @@ def test_a_config_key_value_setting_is_no_versioned_name_and_a_withdrawn_one_sta
     assert not any(echoes._weak(x) for x in ("jev.threshold=0.8", "budget.daily_usd=2.5", "spend_cap=0.50",
                                              "max_ratio_1.5", "limit+1.5"))
     assert all(echoes._weak(x) for x in ("tt_broker-0.2.646", "pkg@1.2.3", "tool-v1.2.3-rc1"))
+
+
+def test_a_quoted_version_or_running_state_observation_is_advisory_and_a_version_pin_rule_stays_directive(env):
+    # Upstream note 18fae03b1c42b496: a withdrawn record that only observed a running version, echoed by a
+    # prompt's evidence pointer, is no fix order; a withdrawn rule that pins a version floor still is.
+    from ttp import coordinator as coord, echoes
+    p = make(env)
+    p.charter_path.write_text(p.charter_path.read_text().rstrip() + "\n\n## Policies\n"
+                              "- Observed `running 0.2.646`.\n- Require tool version >= 0.2.640 before each run.\n")
+    obs = p.add_memory("Observed `running 0.2.646`.", kind="fact")
+    for quote in ("Observed `running 0.2.646`.", "Require tool version >= 0.2.640 before each run."):
+        coord.apply(p, [{"type": "charter_update", "section": "Policies", "quote": quote,
+                         "text": "Releases ship on green checks."}], user_turn=True, turn=1)
+    assert coord.apply(p, [{"type": "memory_forget", "name": obs.stem, "why": "user msg #9 withdrew it"}]) == []
+    assert {r["kind"] for r in echoes.records(p)} == {echoes.WITHDRAWN} and len(echoes.records(p)) == 3
+    prompt = p.harness / "prompts" / "kind-review.md"
+    prompt.write_text(prompt.read_text() + "\nEvidence pointer: running 0.2.646\n"
+                      "Require tool version >= 0.2.640 before each run.\n")
+    by = {}
+    for h in echoes.scan(p):
+        by.setdefault(h["phrase"], set()).add(h["class"])
+    assert by == {"running 0.2.646": {"advisory"},
+                  "require tool version >= 0.2.640 before each run": {"directive"}}, by
