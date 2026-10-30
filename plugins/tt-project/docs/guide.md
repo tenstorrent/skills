@@ -187,9 +187,9 @@ prolonged whole-box outage.
   `review.light_paths` glob list narrows light further: every non-doc file must match one of its
   globs (unset or empty: any path may go light). The review run's note records the pick and the
   rule behind it (`review_tier`).
-- A code spec expected to change more than about 200 non-test runtime lines is split into
+- A code spec expected to change more than about 100 non-test runtime lines is split into
   independently reviewable tasks, each with its own tests: in measured runs such diffs failed
-  review about twice as often. The daily review's `reviews finished` line counts reviews and
+  review about twice as often as those under 100. The daily review's `reviews finished` line counts reviews and
   failures by all diff lines and by non-test lines (tests, docs and changesets left out).
 - Hand-off checks (`worker.handoff_checks`, unset by default): the project's own model-free commands
   the daemon runs on each worker's hand-off before it accepts it, posts its `reply_chat` reply or

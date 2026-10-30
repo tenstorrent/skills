@@ -23,8 +23,8 @@
 - Keep the diff minimal and on-topic. No drive-by rewrites.
 - Before the hand-off, try to break it (tt-project-harness self-check.md): tick each spec step;
   a guard or parser: test 3+ bypasses; exit codes: an unexpected one, an interrupted run; no
-  unbounded wait or I/O in a db transaction; over ~200 lines: say why not split. Hand off a
-  `self_check` line (also in `on_pass`): what you ticked and tried.
+  unbounded wait or I/O in a db transaction; 100+ non-test lines: say why not split. Hand off
+  a `self_check` line (also in `on_pass`): what you ticked and tried.
 - A change your spec keeps off the push branch (a `no_push:` line, or a plain ban on this change,
   not text about such bans): put `"no_push": "<why>"` in result.json, so its review is review only.
 - A change published in another repo (no diff here): hand off `"published": {"repo":

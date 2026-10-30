@@ -15,8 +15,8 @@ def test_review_stats_areas_split_runtime_prompts_and_tests():
     assert reviewstats.area(".changeset/a.md") == "tests-docs"
     assert reviewstats.areas({"a.py": 3, "README.md": 1, "tests/t.py": 2}) == ["runtime", "tests-docs"]
     assert reviewstats.areas(None) == []
-    assert [reviewstats.size_bucket(n) for n in (None, 49, 50, 200, 201)] == ["unknown", "<50", "50-200",
-                                                                             "50-200", ">200"]
+    assert [reviewstats.size_bucket(n) for n in (None, 49, 50, 100, 101, 200, 201)] == [
+        "unknown", "<50", "50-100", "50-100", "101-200", "101-200", ">200"]
 
 
 def test_review_stats_bucket_reviews_by_non_test_lines_too(env):

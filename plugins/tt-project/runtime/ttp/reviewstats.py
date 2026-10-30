@@ -161,7 +161,9 @@ def rows(db: DB, since: float) -> list[dict]:
 
 
 def size_bucket(lines: int | None) -> str:
-    return "unknown" if lines is None else "<50" if lines < 50 else "50-200" if lines <= 200 else ">200"
+    if lines is None:
+        return "unknown"
+    return "<50" if lines < 50 else "50-100" if lines <= 100 else "101-200" if lines <= 200 else ">200"
 
 
 def summary(db: DB, since: float) -> dict[str, Any]:
