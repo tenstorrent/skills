@@ -141,7 +141,7 @@
       "destination": "skills/full-model/SKILL.md",
       "blob": "de994d5552a74b4f1cdcaf64f6ba364178b8d5a4",
       "source_sha256": "0618a7bd6ee01f995cb98dd73a9b2c46d8fd3daab9fcecdafde67501c529d2f8",
-      "packaged_sha256": "01967ee2f5e0bed482743f58f8fe28aa49eba0b48f4e080dcb9896dcd7903b82"
+      "packaged_sha256": "e24cad99340e3f29c74eb335cbd060679fd1e12eb5df84eff6397998ba910078"
     },
     {
       "source": ".agents/skills/full-model/agents/openai.yaml",
@@ -155,7 +155,7 @@
       "destination": "skills/functional-decoder/SKILL.md",
       "blob": "5ea84505c81347d6773fc8325c3115d31094e5d8",
       "source_sha256": "133caffc050d9bb0343a37509ce09a6b2a4e640294761e7226e52f8f82037b71",
-      "packaged_sha256": "c8782e261ea68f3b8bfed0c2d86386943623afb42baa5c36b41e6b408c517695"
+      "packaged_sha256": "529d333e5f25daebb03119c27cec7407c5b80b72bb1f3805ab9dd5555f52c45e"
     },
     {
       "source": ".agents/skills/functional-decoder/agents/openai.yaml",
@@ -197,7 +197,7 @@
       "destination": "skills/optimize/SKILL.md",
       "blob": "280abb027d839f1f076ab8a524fc6f61ed6df587",
       "source_sha256": "c4b4015ed198c305ed19f73c2ef6a539923212457588319767d08489a5331c8b",
-      "packaged_sha256": "58a1fd028be32186dae13fc7e1f7a12a027ae363a7716be568517be2f7ad0ee3"
+      "packaged_sha256": "cb6a81c26219fca963a25b3607d8cbaead02e3ce400408f84b7cdd3296017128"
     },
     {
       "source": ".agents/skills/optimize/agents/openai.yaml",
@@ -274,7 +274,7 @@
       "destination": "skills/vllm-integration/SKILL.md",
       "blob": "05d9e19f7cfbb596d209c504cc49e063b9361da1",
       "source_sha256": "a23a516ab0e8afc3a5dd6ddd72a42781997fb454872139e70605ecbd234e114c",
-      "packaged_sha256": "2358b8c3b06bb4a8ba36d2973b29836bead28e5810cd351e532e42940ce0b5b0"
+      "packaged_sha256": "4e0b1ce4bee7c71ab6e81f183b6270d39e9e55c2147ccabbfc025d84443fe8a4"
     },
     {
       "source": ".agents/skills/vllm-integration/agents/openai.yaml",
@@ -442,7 +442,7 @@
       "destination": "skills/tti-release/SKILL.md",
       "blob": "af09c19651cadaceb231edab4de3c9707801bc75",
       "source_sha256": "bec4650d82fd95793652014d078125ee9370528c09a3f95cfb381f4ef1447fef",
-      "packaged_sha256": "288f0eab0fdc5225f85609aa375616a79c075db3450469af1d0c12ae6c6df5ec"
+      "packaged_sha256": "be5e772549fbbebc484a933b2cbd2e0470b39bdebae6e59a2ad18bb0d1b310bb"
     },
     {
       "source": ".agents/skills/tti-release/agents/openai.yaml",

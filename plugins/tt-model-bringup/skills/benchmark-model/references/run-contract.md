@@ -143,7 +143,7 @@ Run into a new directory:
 ```
 
 The runner freezes a copy of the configuration and manifest. Accuracy uses fresh
-requests at concurrency 32. A watchdog terminates owned client subprocesses when
+requests at the largest configured batch. A watchdog terminates owned client subprocesses when
 the budget expires and writes a failed summary. Preserve that evidence;
 use a new output directory for a rerun. The servers remain owned by the enclosing bringup; the control hook follows its cleanup policy.
 
@@ -161,7 +161,7 @@ Malformed responses or empty answers with a normal stop fail the run. Preserve
 upstream extraction results, including apparent scorer mistakes; document a
 protocol limitation without hand-correcting scores.
 
-## Single-user and 32-user server profiles
+## Server profiles per batch
 
 The headline rows use different server configurations:
 
@@ -177,13 +177,13 @@ same implementation, checkpoint, precision, hardware and full context capacity
 for every profile. Changing request concurrency alone does not select a smaller
 decode trace or cache configuration.
 
-The runner prepares the largest configured server before accuracy, retains it for the
-32-user performance profile, then switches to the single-user profile. Configure `performance_server_command` as an argument
-array for a server-control script in the model checkout. The runner calls it as:
+The runner prepares the largest configured server before accuracy, retains it for
+that batch's performance profile, then steps down through the smaller batches.
+Configure `performance_server_command` as an argument array for a server-control
+script in the model checkout. The runner calls it once per batch, largest first:
 
 ```text
-<performance_server_command> --max-num-seqs 32 --base-url <url> --output <run>/perf-b32-server.json
-<performance_server_command> --max-num-seqs 1  --base-url <url> --output <run>/perf-b1-server.json
+<performance_server_command> --max-num-seqs <N> --base-url <url> --output <run>/perf-b<N>-server.json
 ```
 
 Adapt the model's existing server launcher. The hook should reuse the running
@@ -217,8 +217,8 @@ server before invoking the runner and record that setup time separately.
 
 Every launch, reload, compilation and warmup performed by the runner counts toward
 the stage limit, including a launch needed by the first server selection. For
-example, if the supplied server has one slot, the initial switch to 32 slots and
-the later switch back to one slot both count. The timer never pauses for server
+example, if the supplied server has one slot, the initial switch to the largest batch
+and every later switch both count. The timer never pauses for server
 selection, collection or reporting. Report the starting server configuration so
 the measured stage runtime can be interpreted.
 
@@ -270,14 +270,12 @@ Prepare an implementation-specific collector before the timed run:
 Follow the serving skill's profiler restrictions: do not use Tracy, the live
 device profiler or `ReadDeviceProfiler` to obtain these host wall times.
 
-Configure `roofline_command` as an argument array. The runner calls it while the
+Configure `roofline_command` as an argument array. The runner calls it for each batch while the
 corresponding server is still running:
 
 ```text
-<roofline_command> --run-dir <run> --concurrency 32 --action check
-<roofline_command> --run-dir <run> --concurrency 32 --action collect
-<roofline_command> --run-dir <run> --concurrency 1  --action check
-<roofline_command> --run-dir <run> --concurrency 1  --action collect
+<roofline_command> --run-dir <run> --concurrency <N> --action check
+<roofline_command> --run-dir <run> --concurrency <N> --action collect
 ```
 
 `check` runs immediately after server selection, before accuracy on the largest
@@ -289,12 +287,12 @@ enable a different precision, layer count or context capacity.
 `collect` runs after that profile's measured requests, before any server switch.
 Read `perf-bN.json`, flush and copy the matching raw timing evidence into `run/`,
 and add the profile to `roofline.json`, preserving any profile already collected.
-All four calls run within the same stage deadline. The runner requires valid
+All calls, for every batch, run within the same stage deadline. The runner requires valid
 accounting for the current profile before it proceeds to the next one.
 
-The collector output maps concurrency (`"1"`, `"32"`) to entries with:
+The collector output maps each configured batch (`"1"`, `"8"`, ...) to entries with:
 
-- `performance_sha256`: SHA-256 of the corresponding `perf-b1.json` or `perf-b32.json` file bytes, binding accounting to this run.
+- `performance_sha256`: SHA-256 of the corresponding `perf-bN.json` file bytes, binding accounting to this run.
 - `server_identity_sha256`: `benchmark_stage.subsets.digest` of the corresponding parsed `perf-bN-server.json` object.
 - `requests`, `input_tokens`, `output_tokens`: the measured request and token counts, matching `completed`, `total_input_tokens` and `total_output_tokens` in `perf-bN.json`.
 - `prefill`: `flops`, `seconds`, `peak_flops_per_second`.

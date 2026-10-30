@@ -91,7 +91,7 @@ def run(*, config_path, output):
     try:
         server_command = config.get('performance_server_command')
         if not isinstance(server_command, list) or not server_command or not all(isinstance(arg, str) for arg in server_command):
-            raise ValueError('performance_server_command is required to select and record 32-slot and one-slot servers')
+            raise ValueError('performance_server_command is required to select and record one server per configured batch')
         roofline_command = config.get('roofline_command')
         if not isinstance(roofline_command, list) or not roofline_command or not all(
                 isinstance(arg, str) and arg.strip() for arg in roofline_command):

@@ -18,7 +18,7 @@ def write_report(output, config, summary):
     manifest = json.loads(Path(config['manifest']).read_text())
     roofline_error = None
     try:
-        measured = sorted(summary.get('concurrencies') or [1, 32], reverse=True)
+        measured = sorted(summary.get('concurrencies') or [1, 8, 16, 32], reverse=True)
         roofline = load_roofline(output, required=tuple(str(c) for c in measured)
                                  if summary['status'] == 'completed' else ())
     except (ValueError, OSError) as exc:
@@ -28,7 +28,7 @@ def write_report(output, config, summary):
         # fails; the run remains incomplete and no invalid percentage is shown.
         roofline, roofline_error = {}, str(exc)
     lines = [f"# Benchmark: {config['model']}", '',
-             f"Status: {summary['status']}. Accuracy concurrency: {summary.get('accuracy_concurrency', 32)}.", '',
+             f"Status: {summary['status']}. Accuracy concurrency: {summary.get('accuracy_concurrency', 'unrecorded')}.", '',
              '| Benchmark | Samples / full | Metric | Subset % | Published full % | Difference pp | Source |',
              '|---|---:|---|---:|---:|---:|---|']
     notes = []
