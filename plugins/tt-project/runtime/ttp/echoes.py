@@ -23,8 +23,9 @@ executables) are never historical. Accepted gap: a task whose spec quotes the re
 to remove it is listed too.
 
 Each retirement has a KIND: WITHDRAWN (the user withdrew or replaced a governing instruction: a
-charter_update `quote` or `replaces`, a user Correction, a memory change on the user's turn or whose
-`why` cites the user's words), COMPACTED (a factual entry merged or shortened) or SUPERSEDED (one
+charter_update `quote` or `replaces`, a user Correction, a memory change whose `why` cites the user's
+words, or one on the user's turn that cites or quotes their words or whose message names the old rule:
+coordinator._withdrawn; a dedupe on the user's turn is not one), COMPACTED (a factual entry merged or shortened) or SUPERSEDED (one
 coordinator decision superseded by another). Only a WITHDRAWN retirement's hit on a governing phrase
 is a directive; a hit of the other kinds, or one resting only on a filename, path, version or evidence
 fragment (_weak), is advisory: counted on one line, never a fix order. A record stored before kinds

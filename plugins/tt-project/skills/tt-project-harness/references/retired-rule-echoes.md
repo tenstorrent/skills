@@ -5,11 +5,11 @@ A rule the user retired keeps binding while a copy of it survives somewhere else
 - a coordinator `charter_update` with `quote` (the quoted span) or `replaces` (the replaced section's body);
 - a `memory_add` with `supersedes`, or `ttp memory <name> "<merged>" --supersedes <entry>...` (each replaced entry's text);
 - a user Correction fact (`Correction (user msg #N): <right>, not <wrong>`) whose wrong part is prose of at least 3 words. A bare value ("not low") is left to the spec and ask check that catches restated corrected values.
-- a `memory_forget` on the user's turn, or whose `why` cites the user's words (`user msg #N`, "the user's words").
+- a `memory_forget` the user asked for: its `why` cites the user's words (`user msg #N`, "the user's words"), or, on the user's turn, its `why` quotes their message or their message names a governing phrase of the entry. A dedupe or housekeeping forget on the user's turn is none of these and records nothing.
 
 Each retirement records its kind:
 
-- `withdrawn`: the user withdrew or replaced a governing instruction: a charter `quote` or `replaces`, a user Correction, a `memory_forget` as above, or a `memory_add supersedes` on the user's turn or whose `why` cites the user's words.
+- `withdrawn`: the user withdrew or replaced a governing instruction: a charter `quote` or `replaces`, a user Correction, a `memory_forget` as above, or a `memory_add supersedes` whose `why` cites the user's words, or, on the user's turn, whose new text cites a user message the old entry did not, whose `why` or text quotes their message, or whose old entry's governing phrase their message names. The turn being the user's is not enough on its own.
 - `compacted`: a factual consolidation: `ttp memory --supersedes` (a merge that must keep every user rule), or a `memory_add supersedes` of a fact or a standing entry by the coordinator.
 - `superseded`: one coordinator decision replaced by a newer one.
 

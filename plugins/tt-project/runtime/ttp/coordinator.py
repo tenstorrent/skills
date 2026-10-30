@@ -2573,7 +2573,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         if stem in live and stem != added.stem:
                             echoes.record(db, f"memory [{stem}] superseded by [{added.stem}]", live[stem]["body"],
                                           a["text"], skip=[f"memory:{added.stem}"],
-                                          kind=_echo_kind(live[stem], user_turn, a.get("why")))
+                                          kind=_echo_kind(live[stem], _withdrawn(
+                                              db, live[stem]["body"], user_turn, a.get("why"), a["text"],
+                                              messages)))
                 for name in old:
                     try:
                         # A standing entry superseded by a standing one is shortened, not retired.
@@ -2585,7 +2587,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     notes.append(f"memory_add: warning: {room}")
                 memory_budget_check(p)
             elif t == "memory_forget":
-                gone = _users_withdrawal(p, str(a.get("name") or ""), user_turn, a.get("why"))
+                gone = _users_withdrawal(p, str(a.get("name") or ""), user_turn, a.get("why"), messages)
                 p.forget_memory(str(a.get("name") or ""), why=a.get("why"))
                 if gone:   # the user withdrew it: its text, searched for in what still binds (echoes)
                     echoes.record(db, f"memory [{gone['name']}] withdrawn", gone["body"])
@@ -5488,26 +5490,53 @@ def user_turn(db, messages: list[int]) -> bool:
                                      "AND kind!='finding'", ids))
 
 
-def _echo_kind(entry: dict, user_turn: bool, why: str | None) -> str:
-    """The echoes kind of memory `entry` superseded by a memory_add: WITHDRAWN on the user's turn or with a
-    `why` citing the user's words, else COMPACTED for a fact or a standing entry (a merge or a shortening
-    that keeps what still holds), else SUPERSEDED (a coordinator decision replaced by a newer one)."""
-    from .project import USER_CITE
-    if user_turn or USER_CITE.search(why or ""):
+def _echo_kind(entry: dict, withdrawn: bool) -> str:
+    """The echoes kind of memory `entry` superseded by a memory_add: WITHDRAWN when the user withdrew it
+    (_withdrawn), else COMPACTED for a fact or a standing entry (a merge or a shortening that keeps what
+    still holds), else SUPERSEDED (a coordinator decision replaced by a newer one)."""
+    if withdrawn:
         return echoes.WITHDRAWN
     if entry.get("kind") == "fact" or entry.get("standing"):
         return echoes.COMPACTED
     return echoes.SUPERSEDED
 
 
-def _users_withdrawal(p: Project, name: str, user_turn: bool, why: str | None) -> dict | None:
-    """The live memory entry a memory_forget retires on the user's word (the user's turn, or a `why` citing
-    the user's words), whose text echoes then searches for; None otherwise or when no entry is named."""
+_USER_MSG_ID = re.compile(r"\buser(?:'s)?\s+(?:msgs?|messages?)\s+#?(\d+)", re.I)
+
+
+def _withdrawn(db, old: str, user_turn: bool, why: str | None, new: str = "",
+               messages: list[int] | None = None) -> bool:
+    """Whether a memory change retiring entry text `old` is the user's withdrawal: its `why` cites the
+    user's words (USER_CITE), on any turn. On the user's turn also: the new text cites a user message
+    `old` does not, a quote in `why` or the new text holds the user's own words of this turn, or those
+    words quote a governing phrase of `old`. A dedupe or housekeeping change on the user's turn is none
+    of these: a turn being the user's alone never makes it theirs."""
     from .project import USER_CITE
-    if not (user_turn or USER_CITE.search(why or "")):
-        return None
+    why, new = why or "", new or ""
+    if USER_CITE.search(why):
+        return True
+    if not user_turn:
+        return False
+    if USER_CITE.search(new) and (set(_USER_MSG_ID.findall(new)) - set(_USER_MSG_ID.findall(old))
+                                  or not USER_CITE.search(old)):
+        return True
+    ids = _users_own(db, messages or [])   # never empty into relay.recent: that reads the last window
+    said = echoes._flat(" ".join(relay.split(m["text"], m["context"])[0] for m in relay.recent(db, ids))) \
+        if ids else ""
+    if not said:
+        return False
+    quoted = [echoes._flat(next(g for g in m.groups() if g)) for m in echoes._QUOTED.finditer(f"{why}\n{new}")]
+    return any(q and q in said for q in quoted) or any(
+        ph in said for ph in echoes.phrases(old) if not echoes._weak(ph))
+
+
+def _users_withdrawal(p: Project, name: str, user_turn: bool, why: str | None,
+                      messages: list[int] | None = None) -> dict | None:
+    """The live memory entry a memory_forget retires on the user's word (_withdrawn), whose text echoes
+    then searches for; None otherwise or when no entry is named."""
     stem = Path(name.strip().strip("[]")).stem
-    return next((e for e in p._memory_entries() if e["name"] == stem), None) if stem else None
+    entry = next((e for e in p._memory_entries() if e["name"] == stem), None) if stem else None
+    return entry if entry and _withdrawn(p.db, entry["body"], user_turn, why, messages=messages) else None
 
 
 def _users_own(db, messages: list[int]) -> list[int]:

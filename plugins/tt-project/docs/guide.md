@@ -393,7 +393,9 @@ prolonged whole-box outage.
   declared historical in `harness/echo_historical.json` (its path, sha256 and the retirement's id): while
   its bytes still match, that hit is counted, not listed; any mismatch lists it again. A task whose spec quotes the old rule to remove it is
   listed too. Only a rule the user withdrew (a charter `quote` or `replaces`, a Correction,
-  a memory change on the user's turn or whose `why` cites the user's words, including a `memory_forget`)
+  a memory change whose `why` cites the user's words, or one on the user's turn that cites or quotes
+  their new words or whose message names the old rule, including a `memory_forget`; a dedupe on the
+  user's turn is not one)
   gives a fix order, and only where its governing words match as a whole: a compacted fact, a coordinator
   decision superseded by another, or a match on a file name, path, version or evidence reference alone is
   advisory, counted on one line. `ttp echoes [--json]` lists, read-only, every retirement (kind, text,
