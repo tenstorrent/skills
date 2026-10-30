@@ -7,7 +7,7 @@ def _echoes(p):
     return dict(coord.digest_parts(p, {}, [], [])[0]).get("retired_echoes", "")
 
 
-def _said(p, text, kind="user"):
+def _echo_said(p, text, kind="user"):
     import time as _time
     return p.db.x("INSERT INTO messages(ts,direction,kind,text) VALUES(?,'in',?,?)", (_time.time(), kind, text))
 
@@ -25,7 +25,7 @@ def test_a_superseded_memory_entry_whose_phrase_survives_in_a_schedule_is_listed
                             "command": "PROBE-LEGACY  --deep all && echo ok", "rewake_after_h": None}]) == []
     # On the user's turn, their message names the old rule: they replaced it (a coordinator's own
     # supersession is advisory, below).
-    said = _said(p, "Stop using probe-legacy --deep, switch to probe-fast.")
+    said = _echo_said(p, "Stop using probe-legacy --deep, switch to probe-fast.")
     assert coord.apply(p, [{"type": "memory_add", "memory_kind": "decision", "supersedes": [old.stem],
                             "text": "Probe boxes with `probe-fast` before each job."}], user_turn=True, turn=1,
                        messages=[said]) == []
@@ -374,7 +374,7 @@ def test_a_dedupe_on_the_users_turn_is_no_withdrawal_unless_it_cites_or_quotes_t
     from ttp import coordinator as coord, echoes
     p = make(env)
     dup = "Hold deploys during the `quiet-window` each Friday."
-    said = _said(p, "What is still queued for this week?")   # the user's turn, about something else
+    said = _echo_said(p, "What is still queued for this week?")   # the user's turn, about something else
 
     def forget(why, messages=(said,), text=dup):
         a, b = p.add_memory(text, kind="decision"), p.add_memory(dup + " ", kind="decision")
@@ -387,12 +387,12 @@ def test_a_dedupe_on_the_users_turn_is_no_withdrawal_unless_it_cites_or_quotes_t
 
     # A dedupe or housekeeping forget on the user's turn: nothing retired, the surviving copy unflagged.
     assert forget("duplicate of the entry kept") == ([], [])
-    assert forget("duplicate", messages=[_said(p, "drop the `quiet-window` rule", kind="finding")]) == ([], [])
+    assert forget("duplicate", messages=[_echo_said(p, "drop the `quiet-window` rule", kind="finding")]) == ([], [])
     assert forget("merged: \"each Friday\" said twice") == ([], [])   # a quote that is not the user's words
     # The user's word: a `why` citing them, a quote of their message, or their message naming the rule.
     assert forget("user msg #7 ended it") == ([echoes.WITHDRAWN], ["directive"])
     assert forget("the user said \"what is still queued\"") == ([echoes.WITHDRAWN], ["directive"])
-    assert forget("done", messages=[_said(p, "Forget the quiet-window each Friday, deploy any day.")]) \
+    assert forget("done", messages=[_echo_said(p, "Forget the quiet-window each Friday, deploy any day.")]) \
         == ([echoes.WITHDRAWN], ["directive"])
     # Off the user's turn only a `why` citing them counts, as before.
     assert coord._withdrawn(p.db, dup, False, "the user's words in msg 3") is True
@@ -402,7 +402,7 @@ def test_a_dedupe_on_the_users_turn_is_no_withdrawal_unless_it_cites_or_quotes_t
 def test_a_supersedes_on_the_users_turn_is_a_withdrawal_only_when_it_cites_new_user_words(env):
     from ttp import coordinator as coord, echoes
     p = make(env)
-    said = _said(p, "Thanks, carry on.")
+    said = _echo_said(p, "Thanks, carry on.")
 
     def supersede(old_text, new_text, why=None, kind="decision"):
         p.db.set_kv(echoes.RETIRED_KEY, [])
