@@ -5239,8 +5239,8 @@ def test_the_self_health_gate_by_reason_and_its_refusal_count(env):
                 classify="restriction_change", least_disruptive=way)[0] == []
     # Review, merge, funds and spend asks always pass; the user-only and other-person exemptions
     # hold only under access or human.
-    for blocking in ("review", "merge", "funds", "spend"):
-        assert _ask(p, f"The worker is dead ({blocking}); approve the fix PR?", blocking=blocking)[0] == [], blocking
+    for n, blocking in enumerate(("review", "merge", "funds", "spend")):   # each its own PR: not a double ask
+        assert _ask(p, f"The worker is dead ({blocking}); approve fix PR {n + 1}?", blocking=blocking)[0] == [], blocking
     assert coord._self_health_ask({"blocking": "restriction"}, "The worker died; restart it by hand?", vague)
     assert coord._self_health_ask({"blocking": "human"}, "Which logo do you prefer?") == ""
     # Refusals are counted in the unblocking metrics, once per turn action.
