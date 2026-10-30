@@ -171,3 +171,12 @@ the reduced-variant derivation of `decode_ms_per_token_device`, kernel selection
 resume-check failure cause, the timeout-first hang rule, HF-control reuse, the short-prefix and batch-32
 cases for a cache-dtype candidate, and `run_prefill_resume_check --output-on-pass-only` with commit and
 visible-device provenance in its record.
+
+The stage 8 pass of that trial added: a teacher-forced natural-text reference and a repeated serial
+baseline in the datatype sweep, the accuracy bar applied per reference with the binomial margin of a
+100-token score, the resumed-prefill check rerun on the selected policy with a per-position HF
+comparison to separate precision loss from a resume bug, the per-group scope of the BFP4 fidelity
+comparison and kernels that ignore a fidelity field, the mid-stage timing-regime split and chain-driver
+stop rule in device usage, the Claude Code form of `TT_AUTODEBUG_ROOT`, the DRAM-sharded reader limit,
+and `--build-kwargs` / `--build-kwargs-file` on the four generator-level readiness runners
+(`readiness_check/build_kwargs.py`, authored in this plugin).

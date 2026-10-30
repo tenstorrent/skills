@@ -54,6 +54,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 import torch
 
 from readiness_check.contract import Generator
+from readiness_check.build_kwargs import add_build_kwargs_args, parse_build_kwargs
 from readiness_check.mesh_device import (
     add_mesh_device_args,
     close_readiness_mesh_device,
@@ -450,6 +451,7 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     for key, value in DEFAULT_THRESHOLDS.items():
         parser.add_argument(f"--{key.replace('_', '-')}", type=float, default=value)
     add_mesh_device_args(parser)
+    add_build_kwargs_args(parser)
     args = parser.parse_args(argv)
 
     controls = [c.strip() for c in args.controls.split(",") if c.strip()]
@@ -465,6 +467,7 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
         record = run_prefill_resume_check(
             model_dir=model_dir,
             mesh_device=mesh_device,
+            build_kwargs=parse_build_kwargs(args),
             lengths=args.lengths,
             block_sizes=args.block_sizes,
             sliding_window=args.sliding_window,

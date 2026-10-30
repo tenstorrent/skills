@@ -28,7 +28,9 @@ or replace acceptance criteria with a review plugin's criteria.
    - Claude Code: `/plugin install tt-autodebug@tenstorrent-skills`
    Never install it automatically or use a stray source checkout in place of an enabled plugin.
 3. Resolve `TT_AUTODEBUG_ROOT` from that installed plugin's skill path (two directories above the
-   `autodebug` skill directory). Validate the package and prepare the shell environment:
+   `autodebug` skill directory). On Codex that path comes from the plugin inventory command; on
+   Claude Code it is the enabled installation's directory recorded in the host's plugin inventory
+   (`claude plugin list` shows it as "Read from"). Validate the package and prepare the shell environment:
 
    ```bash
    # Set these two paths from the host's enabled installation inventory first.
