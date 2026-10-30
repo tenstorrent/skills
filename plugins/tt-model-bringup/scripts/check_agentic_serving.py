@@ -130,8 +130,8 @@ def check_outcome(row: dict, name, problems: list) -> None:
         if not row.get("reason"):
             problems.append((2, f"effort {name!r} did not run and needs a reason"))
         return
-    if not (row.get("owner") and number(row.get("box_hours"))):
-        problems.append((2, f"effort {name!r} needs an owner and box_hours"))
+    if not (row.get("owner") and number(row.get("box_hours")) and row.get("goal") and row.get("plan")):
+        problems.append((2, f"effort {name!r} needs an owner, box_hours, and its own goal and plan"))
         return
     if status == "running":
         problems.append((1, f"effort {name!r} is still running at the end of the stage"))

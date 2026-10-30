@@ -155,7 +155,14 @@ Release.
 ### Efforts
 
 An effort owns one problem: one owner, one branch, one device or slot set, and a time box of about
-twice its work estimate.
+twice its work estimate. The coordinator's brief gives the sub-agent the problem, the evidence, the
+predicted saving, the confirmation, the current best and the time box.
+
+The sub-agent then writes its own goal (what it will change and the result that confirms it) and a
+plan of tests to get there, and keeps both in `runs/<effort>/plan.md`. The plan changes as data
+arrives; note each change and why. The time box is a deadline for the plan, not a target: plan
+tests that fit inside it, and finish as soon as the confirmation settles the question, either way.
+Time left in the box returns to the queue.
 
 - **Fastest test first.** Look for a test of minutes in the survey's short tests before any scored
   sample. Use a scored sample only when the question is about scores, completion or harness
@@ -194,7 +201,7 @@ Write these to `doc/agentic_evals/`:
 
 - `survey.json`: `checks`, `calculations` and `shortfalls`, as the survey reference names them
 - `preflight.json`: `registry`, `disk`, `release_route` and `isolation_smoke`, each with `ok`
-- `efforts.json`: `efforts`, per effort `problem`, `owner`, `predicted` (`saving_hours` per eval,
+- `efforts.json`: `efforts`, per effort `problem`, `owner`, `goal`, `plan` (path), `predicted` (`saving_hours` per eval,
   `work_hours`, `basis`), `confirm` (`method`, `success`), `box_hours`, `status` (`done`,
   `running` or `not_run` with a `reason`), and when done `used_hours`, `change`, `problem_status`,
   `confirmed` (the measured result) and `evidence`; and `rankings`, one entry per ranking with

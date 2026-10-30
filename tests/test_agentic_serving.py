@@ -84,6 +84,7 @@ def goal12(model, **overrides):
         'efforts.json': {
             'efforts': [
                 {'problem': 'padded prefill', 'owner': 'prefill', 'status': 'done',
+                 'goal': 'prefill one live row at batch-1 cost', 'plan': 'runs/prefill/plan.md',
                  'predicted': {'saving_hours': {'swe': 3.0, 'terminal': 1.5}, 'work_hours': 2, 'basis': 'calculated'},
                  'confirm': {'method': 'prefill vs batch shape', 'success': 'one live row costs batch-1 time'},
                  'box_hours': 4, 'used_hours': 3, 'change': 'kept', 'problem_status': 'solved',
@@ -186,6 +187,12 @@ def test_effort_over_its_box_with_a_re_estimate_passes(tmp_path):
 def test_every_effort_needs_a_prediction_and_a_confirmation(tmp_path, field):
     code, stderr = efforts_with(tmp_path, lambda e: e['efforts'][1].pop(field))
     assert code == 2 and 'block size' in stderr
+
+
+@pytest.mark.parametrize('field', ['goal', 'plan'])
+def test_effort_that_ran_needs_its_own_goal_and_plan(tmp_path, field):
+    code, stderr = efforts_with(tmp_path, lambda e: e['efforts'][0].pop(field))
+    assert code == 2 and 'goal and plan' in stderr
 
 
 def test_kept_change_with_open_problem_passes(tmp_path):
