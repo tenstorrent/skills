@@ -12,8 +12,9 @@ instruction; memory entries that hit are also named on one line for memory_forge
 text itself (its entry, or its words wherever they stand) and the archives (memory/archive, the charter
 history), and harness files the project never edited (equal to the harness's `upstream` snapshot or the
 plugin template): only a project-tuned copy can be fixed. A phrase the replacing text keeps is no phrase of the
-retired rule, nor is plugin vocabulary (a phrase of at most GENERIC_WORDS words found in the runtime source or an
-unedited template file, such as `start_when` or `ttp list`): alone it matches unrelated text. A hit still there a turn
+retired rule, nor is plugin vocabulary (one identifier or `ttp <command>` name found in the runtime source or an
+unedited template file, such as `start_when` or `ttp list`; never the plugin's prose, nor a Correction's
+wrong part): alone it matches unrelated text. A hit still there a turn
 after it was first shown is marked. Accepted gap: a task whose spec quotes the retired rule in order
 to remove it is listed too.
 """
@@ -44,10 +45,8 @@ HARNESS_SKIP = {"memory", "runtime", "CHARTER.md", "CHARTER.history.md", "MEMORY
 # Below the project root: the project's own skills, hooks and agent instructions.
 ROOT_PATHS = (".claude/skills", ".claude/hooks", ".claude/commands", ".claude/agents", ".agents/skills",
               "CLAUDE.md", "AGENTS.md")
-GENERIC_WORDS = 3                    # a phrase this short found in the plugin's own text is its vocabulary
 _TEMPLATE = Path(__file__).resolve().parents[2] / "template"   # the plugin template, when run from the plugin
-_RUNTIME: dict[str, str] = {}        # "flat": runtime source and plugin template, flattened once
-_GENERIC: dict[str, bool] = {}       # phrase -> found in it
+_RUNTIME: dict[str, set[str]] = {}   # "vocab": the runtime source's and plugin template's identifiers, read once
 RETIRED_HEADER = ("## Retired-rule echoes (text the user retired still binds here; fix each this turn: memory_forget "
                   "or memory_add `supersedes`, charter_update `quote`, schedule_set, task_update, config_set; a "
                   "notice, it never waits)")
@@ -55,6 +54,7 @@ RETIRED_HEADER = ("## Retired-rule echoes (text the user retired still binds her
 _QUOTED = re.compile(r'"([^"\n]{6,300})"|“([^”\n]{6,300})”|`([^`\n]{4,200})`'
                      r"|(?:(?<=\s)|^)'([^'\n]{12,300})'(?=[\s.,;:)]|$)")
 _IDENT = re.compile(r"\b[a-z][a-z0-9]*(?:[._][a-z0-9]+)+\b", re.I)
+_TTP_CMD = re.compile(r"\bttp [a-z][a-z-]*[a-z]\b")
 _SENTENCE = re.compile(r"(?<=[.!?])\s+")
 _NEGATION = re.compile(r"\b(?:not|never|no longer|instead of|rather than|isn't|aren't|wasn't|weren't|retires)\s*$")
 
@@ -281,24 +281,29 @@ def _lineno(text: str, phrase: str) -> int:
     return 1
 
 
-def _generic(ph: str, pristine: list[str]) -> bool:
-    """Whether phrase `ph` is plugin vocabulary: at most GENERIC_WORDS words, found in the runtime source
-    (its action, config and command names), the plugin template or an unedited template file."""
-    if len(ph.split()) > GENERIC_WORDS:
+def _vocab(text: str) -> set[str]:
+    """The plugin identifiers in flattened `text`: names with a dot or underscore inside (action types,
+    config keys, task and schedule fields) and `ttp <command>` names. Never its prose."""
+    return {m.group() for m in _IDENT.finditer(text)} | {m.group() for m in _TTP_CMD.finditer(text)}
+
+
+def _generic(ph: str, extra: set[str] | list[str] = ()) -> bool:
+    """Whether phrase `ph` is plugin vocabulary: one identifier or `ttp <command>` name found in the
+    runtime source or the plugin template, or in `extra` (the unedited template files' _vocab)."""
+    ph = ph.strip("`'\" ")
+    if len(ph.split()) > 2 or not (_IDENT.fullmatch(ph) or _TTP_CMD.fullmatch(ph)):
         return False
-    if ph not in _GENERIC:
-        if "flat" not in _RUNTIME:   # read once per process
-            src = []
-            for f in [*sorted(Path(__file__).resolve().parent.glob("*.py")),
-                      *(sorted(_TEMPLATE.rglob("*")) if _TEMPLATE.is_dir() else [])]:
-                try:
-                    if f.is_file() and f.stat().st_size < FILE_BYTES * 4:
-                        src.append(f.read_text(errors="replace"))
-                except OSError:
-                    pass
-            _RUNTIME["flat"] = _flat("\n".join(src))
-        _GENERIC[ph] = ph in _RUNTIME["flat"]
-    return _GENERIC[ph] or any(ph in t for t in pristine)
+    if "vocab" not in _RUNTIME:   # read once per process
+        src = []
+        for f in [*sorted(Path(__file__).resolve().parent.glob("*.py")),
+                  *(sorted(_TEMPLATE.rglob("*")) if _TEMPLATE.is_dir() else [])]:
+            try:
+                if f.is_file() and f.stat().st_size < FILE_BYTES * 4:
+                    src.append(f.read_text(errors="replace"))
+            except OSError:
+                pass
+        _RUNTIME["vocab"] = _vocab(_flat("\n".join(src)))
+    return ph in _RUNTIME["vocab"] or ph in extra
 
 
 def _hit(rec: dict, flat: str, phrases_: list[str] | None = None) -> str:
@@ -323,9 +328,10 @@ def scan(p, now: float | None = None) -> list[dict]:
         return []
     pristine: list[str] = []
     where = [(key, label, text, _flat(text)) for key, label, text in places(p, pristine)]   # flattened once
+    vocab = set().union(*map(_vocab, pristine))
     out, seen = [], set()
     for rec in sorted(recs, key=lambda r: -r.get("at", 0)):
-        own = [ph for ph in rec.get("phrases") or [] if not _generic(ph, pristine)]
+        own = [ph for ph in rec.get("phrases") or [] if rec.get("negated") or not _generic(ph, vocab)]
         if not own:
             continue
         skip = set(rec.get("skip") or ())

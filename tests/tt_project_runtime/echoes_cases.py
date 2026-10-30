@@ -166,3 +166,22 @@ def test_plugin_vocabulary_and_unedited_template_files_are_no_echo_but_a_project
     # Without the harness's upstream snapshot, a copy equal to the plugin template is still skipped.
     monkeypatch.setattr(echoes, "_upstream", lambda harness: {})
     assert {h["label"] for h in echoes.scan(p)} == labels
+
+
+def test_short_retired_claims_the_plugin_prose_also_mentions_are_still_listed(env):
+    from ttp import coordinator as coord, echoes
+    p = make(env)
+    # A correction's wrong part ('sudo -n true') is never plugin vocabulary.
+    stale = p.add_memory("Before a reset, check sudo with sudo -n true on the host.", kind="decision")
+    echoes.record_correction(p.db, "c", "Correction (user msg #9): check sudo with sudo -n -l, never sudo -n true.")
+    # A short quoted command the plugin's prompts and code comments mention ('tt-smi -r') is no vocabulary either.
+    old = p.add_memory("Reset with `tt-smi -r` when a chip hangs.", kind="decision")
+    fallback = p.add_memory("If glx_reset fails, fall back to tt-smi -r.", kind="fact")
+    assert coord.apply(p, [{"type": "memory_add", "memory_kind": "decision", "supersedes": [old.stem],
+                            "text": "Reset with `tt-smi -glx_reset` when a chip hangs."}], turn=1) == []
+    labels = {h["label"] for h in echoes.scan(p)}
+    assert {f"memory [{stale.stem}]", f"memory [{fallback.stem}]"} <= labels, labels
+    # Plugin identifiers and `ttp <command>` names alone still are.
+    assert all(echoes._generic(ph, []) for ph in ("start_when", "pr_branch", "memory_add", "ttp list"))
+    assert not any(echoes._generic(ph, []) for ph in ("tt-smi -r", "sudo -n true", "a loopback address",
+                                                      "ttp lock box-7", "start_when probe"))
