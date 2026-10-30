@@ -534,3 +534,21 @@ def test_a_fragment_of_a_path_url_or_version_keeps_its_weak_full_token_and_is_ne
     assert echoes._weak("tt_broker-0.2.646") and echoes._weak("running 0.2.646") and not echoes._weak("running")
     assert not any(echoes._weak(x) for x in ("running legacy-card-kick", "docs.example.com", "tt_broker"))
 
+
+
+def test_a_config_key_value_setting_is_no_versioned_name_and_a_withdrawn_one_stays_a_fix_order(env):
+    from ttp import echoes
+    p = make(env)
+    src = "charter 'Policies' quote replaced"   # withdrawn by the user
+    eq = echoes.record(p.db, src, "Keep `jev.threshold=0.8` for all tasks.")
+    us = echoes.record(p.db, src, "Hold `budget.daily_usd_2.5` on every project.")
+    assert "jev.threshold" in eq["phrases"] and "budget.daily_usd_2.5" in us["phrases"], (eq, us)
+    tasks = {name: p.db.add_task(name, text) for name, text in {
+        "eq": "Set jev.threshold=0.8 in the config.", "us": "Apply budget.daily_usd_2.5 again."}.items()}
+    by = {h["label"]: h for h in echoes.scan(p)}
+    assert {n: by[f"task #{t} spec"]["class"] for n, t in tasks.items()} == {"eq": "directive", "us": "directive"}, by
+    assert not echoes._fragment("jev.threshold", "Keep `jev.threshold=0.8` for all tasks.")
+    # Only '-' or '@' joins a name to a version; '=', '_' and '+' never do (when in doubt, strong).
+    assert not any(echoes._weak(x) for x in ("jev.threshold=0.8", "budget.daily_usd=2.5", "spend_cap=0.50",
+                                             "max_ratio_1.5", "limit+1.5"))
+    assert all(echoes._weak(x) for x in ("tt_broker-0.2.646", "pkg@1.2.3", "tool-v1.2.3-rc1"))

@@ -32,7 +32,8 @@ fragment (_weak, or an identifier the retired text holds only inside such a toke
 advisory: counted on one line, never a fix order. A fourth kind, UNVERIFIED (its origin unknown: nothing
 shows the user withdrew that rule), is advisory too: a record stored before kinds existed gets one from
 its source (_kind), and an unknown kind or source is UNVERIFIED. `export` is the read-only full list
-behind `ttp echoes`.
+behind `ttp echoes`. Accepted gaps (settled weak-token set): a dashed config-style name with a decimal
+suffix ('max-ratio-1.5') counts as weak; a version joined by '_', '=' or '+' counts as strong (over-flag).
 """
 from __future__ import annotations
 
@@ -86,7 +87,8 @@ _SENTENCE = re.compile(r"(?<=[.!?])\s+")
 _FILEISH = re.compile(r"[\w.-]*\.(?:md|markdown|txt|json|jsonl|ya?ml|toml|py|sh|bash|js|ts|log|csv|tsv|html?|ini"
                       r"|cfg|conf|lock|db|sqlite|patch|diff|out|err|rc|pdf|png|tar|gz|zip)(?::\d+)*")
 _VERSION = re.compile(r"v?\d+(?:\.\d+)+(?:[-+][\w.]+)?")
-_VERSIONED = re.compile(r"[\w.]*[-_@=+]v?\d+(?:\.\d+)+(?:[-+][\w.]+)?")   # a name with a version: tool-1.2.3
+# A name joined to a version by '-' or '@' only (tool-1.2.3, pkg@1.2.3); a config key=value or key_1.5 never is.
+_VERSIONED = re.compile(r"[\w.]*[-@]v?\d+(?:\.\d+)+(?:[-+][\w.]+)?")
 # Words that only say a version or build is in use ('running 0.2.646'): no rule beside a weak token.
 _STATE = {"running", "runs", "using", "uses", "version", "versions", "release", "build", "installed", "deployed",
           "currently"}
