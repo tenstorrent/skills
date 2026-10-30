@@ -31,7 +31,9 @@ is a directive; a hit of the other kinds, or one resting only on a filename, pat
 fragment (_weak, or an identifier the retired text holds only inside such a token: _fragment), is
 advisory: counted on one line, never a fix order. A fourth kind, UNVERIFIED (its origin unknown: nothing
 shows the user withdrew that rule), is advisory too: a record stored before kinds existed gets one from
-its source (_kind), and an unknown kind or source is UNVERIFIED. `export` is the read-only full list
+its source (_kind), and an unknown kind or source is UNVERIFIED. A hit of an unsourced Restrictions item the
+coordinator dropped is advisory while the Brief or a sourced item still states it (restriction_audit.still_stated):
+that rule still binds, so its copies are right. `export` is the read-only full list
 behind `ttp echoes`. Accepted gaps (settled weak-token set): a dashed config-style name with a decimal
 suffix ('max-ratio-1.5') counts as weak; a version joined by '_', '=' or '+' counts as strong (over-flag).
 """
@@ -186,12 +188,14 @@ def _store(db, rec: dict, now: float) -> None:
 
 
 def record(db, source: str, old: str, new: str = "", skip: list[str] = (), now: float | None = None,
-           negated: bool = False, found: list[str] | None = None, kind: str = WITHDRAWN) -> dict | None:
+           negated: bool = False, found: list[str] | None = None, kind: str = WITHDRAWN,
+           unsourced: bool = False) -> dict | None:
     """Keep retired text `old` (replaced by `new`) to search for. `skip`: place keys (see places) never
     searched for it, such as the replacing entry. `found`: the phrases, when the caller has them.
     `negated`: a match right after a negation ('never <phrase>') agrees with the change, so is no hit.
-    `kind`: one of KINDS (an unknown one counts as UNVERIFIED). None (nothing kept) when the text has no
-    distinctive phrase."""
+    `kind`: one of KINDS (an unknown one counts as UNVERIFIED). `unsourced`: `old` is an advisory charter
+    Restrictions item the coordinator dropped (scan checks whether a binding section still states it).
+    None (nothing kept) when the text has no distinctive phrase."""
     now = time.time() if now is None else now
     ps = phrases(old, new) if found is None else [p for p in map(_flat, found) if len(p) >= 6][:MAX_PHRASES]
     if not ps:
@@ -200,6 +204,8 @@ def record(db, source: str, old: str, new: str = "", skip: list[str] = (), now: 
            "source": " ".join(source.split())[:200], "old": " ".join((old or "").split())[:600],
            "new": _flat(new)[:4000], "phrases": ps, "skip": list(skip), "negated": negated,
            "kind": kind if kind in KINDS else UNVERIFIED}
+    if unsourced:
+        rec["unsourced"] = True
     _store(db, rec, now)
     return rec
 
@@ -499,8 +505,8 @@ def records(p, now: float | None = None) -> list[dict]:
 def scan(p, now: float | None = None, historical: list[dict] | None = None) -> list[dict]:
     """The retired texts' echoes: [{"key", "label", "line", "phrase", "source", "retirement", "kind",
     "class", "why"}], newest retirement first. `class` is "directive" (a WITHDRAWN retirement's governing
-    phrase: fix it) or "advisory" (another kind, or only a _weak or _fragment phrase matched: `why` says
-    which). A hit on
+    phrase: fix it) or "advisory" (another kind, only a _weak or _fragment phrase matched, or a dropped
+    unsourced Restrictions item the Brief or a sourced item still states: `why` says which). A hit on
     a file the historical index declares historical for that retirement, with its bytes still hashing to
     the recorded value, goes to `historical` instead (class "historical")."""
     recs = records(p, now)
@@ -511,11 +517,19 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None) -> l
     pristine: list[str] = []
     where = [(key, label, text, _flat(text)) for key, label, text in places(p, pristine)]   # flattened once
     vocab = set().union(*map(_vocab, pristine))
+    try:
+        charter = p.charter_path.read_text()
+    except OSError:
+        charter = ""
     out, seen = [], set()
     for rec in sorted(recs, key=lambda r: -r.get("at", 0)):
         own = [ph for ph in rec.get("phrases") or [] if rec.get("negated") or not _generic(ph, vocab)]
         if not own:
             continue
+        stated = ""
+        if rec.get("unsourced"):   # a dropped advisory copy of a rule a binding section still states
+            from .restriction_audit import still_stated
+            stated = still_stated(charter, rec.get("old") or "")
         weak = {ph for ph in own if _weak(ph) or _fragment(ph, rec.get("old") or "")}
         own.sort(key=lambda ph: ph in weak)   # a governing phrase first: a hit rests on it when it can
         skip = set(rec.get("skip") or ())
@@ -527,7 +541,8 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None) -> l
                 seen.add((rec["id"], key))
                 if key.startswith("file:"):
                     label += f":{_lineno(text, ph)}"
-                why = ("" if rec["kind"] == WITHDRAWN and ph not in weak else
+                why = (f"still stated in {stated}: no action" if stated else
+                       "" if rec["kind"] == WITHDRAWN and ph not in weak else
                        "origin not recorded: nothing shows the user withdrew this rule" if rec["kind"] == UNVERIFIED
                        else f"retired as {rec['kind']}, not withdrawn by the user" if rec["kind"] != WITHDRAWN
                        else "only a file name, path, version or evidence reference matches")

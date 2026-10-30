@@ -6,7 +6,9 @@ After the user's word loosens or removes a Restrictions item (a quoted edit, or 
 whole Restrictions section with looser wording), or `over` retires one, the project's own tools
 (bin/, hooks/, schedules) may still carry the old rule. restriction_tools names them in a queued
 `restriction_tools` event for the next digest; it never edits anything. coordinator.apply() calls it
-once per turn, with the turn's tasks, so a tool a task of that batch already names is left out.
+once per turn, with the turn's tasks, so a tool a task of that batch already names is left out. An
+unsourced (advisory) item the coordinator dropped whose words the Brief or a sourced Restrictions item
+still states (still_stated) is left out too: that rule still binds, so its tools are right.
 
 only_blocks_lines gives the daily review, per Restrictions item, the 7-day count of blocked runs and
 asks citing it against refused actions citing it, and lists an item that only blocked work: evidence
@@ -46,6 +48,37 @@ def tool_hit(line: str, ids: set[str], words: set[str]) -> bool:
         return True
     low = line.lower()
     return sum(bool(re.search(rf"\b{re.escape(w)}", low)) for w in words) >= 2
+
+
+def still_stated(charter: str, old: str) -> str:
+    """The binding charter section that still states every item of retired advisory text `old` (one
+    Restrictions item or a replaced section's items): "Brief" when one paragraph or bullet of a `## Brief`
+    section, else "Restrictions" when one sourced Restrictions item (restriction_source.sourced), holds
+    all of the item's identifiers (_TOOL_TERM_RE) and at least two of its rule words, and at least two
+    thirds of them. "" when an item is stated nowhere, or `old` names nothing to compare."""
+    from .coordinator import _rule_words
+    from .prompts import charter_restrictions, charter_sections
+    from .restriction_source import sourced, split_items
+    units: list[tuple[str, str]] = []
+    for head, body in charter_sections(charter):
+        if " ".join(head[3:].split()).lower().startswith("brief"):
+            units += [("Brief", " ".join(" ".join(it).split())) for it in split_items("\n".join(body))]
+    units += [("Restrictions", t) for t in (" ".join(" ".join(it).split())
+                                            for it in split_items(charter_restrictions(charter))) if sourced(t)]
+    found = []
+    for item in (" ".join(" ".join(it).split()) for it in split_items(old)):
+        if item.startswith("#"):
+            continue
+        ids = {next(g for g in m.groups() if g) for m in _TOOL_TERM_RE.finditer(item)}
+        words = _rule_words(item)
+        if len(words) < 2:
+            return ""
+        hit = next((name for name, unit in units if all(t in unit for t in ids)
+                    and 3 * len(words & _rule_words(unit)) >= 2 * len(words)), "")
+        if not hit:
+            return ""
+        found.append(hit)
+    return min(found, default="")   # "Brief" before "Restrictions" when items differ
 
 
 def replaced_items(body: str, text: str) -> list[tuple[str, str]]:
@@ -109,8 +142,14 @@ def restriction_tools(p: Project, loosened: list[tuple[str, str, str]], batch: l
         cmds = [payload.get("command")] + [heal_block.get(k) for k in ("check", "fix", "suppress")]
         files.append((f"schedule {r['name']}", "\n".join(str(c) for c in cmds if c)))
     named = " ".join(f"{t['title']} {t['spec']}" for t in (p.db.task(i) for i in batch) if t)
+    try:
+        charter = p.charter_path.read_text()
+    except OSError:
+        charter = ""
     out = []
     for old, new, over in loosened:
+        if over == "unsourced" and still_stated(charter, old):
+            continue   # a dropped advisory copy of a rule the Brief or a sourced item still binds: tools stay right
         ids, words = tool_terms(old, new)
         hits = []
         for label, text in files:

@@ -3119,6 +3119,75 @@ def test_the_coordinator_drops_an_unsourced_restriction_without_the_users_word(e
     assert len(err) == 1 and "replacing the restriction section" in err[0], err
 
 
+def test_dropping_an_unsourced_copy_of_a_rule_the_brief_or_a_sourced_item_states_raises_no_echo(env):
+    """An advisory Restrictions item the coordinator drops while the Brief, or a sourced item, still states
+    its words: the tools, config and specs carrying them are right, so no restriction_tools event and no
+    digest echo line (`ttp echoes` keeps them as advisory, 'still stated in ...'). A sourced item the user
+    retires, or an unsourced one stated nowhere else, is still reported."""
+    p = make(env)
+    from ttp import coordinator as coord, echoes
+    brief = "## Brief\nEvery change keeps the required `lint-check` suite green before it is published.\n\n"
+    copy = "Keep the required `lint-check` suite green before publishing a change."
+    tool = p.harness / "bin" / "publish-guard.sh"
+    tool.parent.mkdir(parents=True, exist_ok=True)
+    tool.write_text("#!/bin/sh\n# refuse to publish unless the lint-check suite is green\nexit 0\n")
+    p.set_config("delivery.push_checks", ["run the lint-check suite"])
+    spec = p.db.add_task("guard publishing", "Run the required `lint-check` suite before publishing.")
+    drop = {"type": "charter_update", "section": "Restrictions", "text": ""}
+
+    def run(charter: str, act: dict, turn: int, user_turn: bool = False) -> tuple[list[str], list[str], dict]:
+        p.db.x("DELETE FROM events")
+        p.db.set_kv(echoes.RETIRED_KEY, [])
+        p.charter_path.write_text(charter)
+        assert coord.apply(p, [act], turn=turn, user_turn=user_turn) == []
+        tools = [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind='restriction_tools'")]
+        return tools, echoes.digest_lines(p), echoes.export(p)
+    # (1) the Brief states the dropped advisory copy: nothing for the Brief, config, tool or spec.
+    tools, lines, data = run(f"# demo\n\n{brief}## Restrictions\n- Never merge. (user msg #1)\n- {copy}\n",
+                             {**drop, "quote": copy}, 2)
+    assert tools == [] and lines == [], (tools, lines)
+    assert data["matches"] and all(m["action"] == "none" and m["why"] == "still stated in Brief: no action"
+                                   for m in data["matches"]), data["matches"]
+    assert {"charter section 'Brief'", f"task #{spec} spec", "config delivery.push_checks[0]"} <= {
+        m["where"] for m in data["matches"]}
+    # ... and so does a sourced Restrictions item.
+    sourced = "- Every change keeps the required `lint-check` suite green before it is published. (user msg #1)\n"
+    tools, lines, _ = run(f"# demo\n\n## Restrictions\n{sourced}- {copy}\n", {**drop, "quote": copy}, 3)
+    assert tools == [] and lines == [], (tools, lines)
+    # (2) a sourced item the user retires is reported, though the Brief still has its words.
+    item = "Never publish unless the required `lint-check` suite is green (user msg #1)."
+    tools, lines, _ = run(f"# demo\n\n{brief}## Restrictions\n- {item}\n", {**drop, "quote": item,
+                                                                              "source": {"origin": "gate"}},
+                          4, user_turn=True)
+    assert len(tools) == 1 and "publish-guard.sh:2" in tools[0], tools
+    assert lines and any("publish-guard.sh" in ln for ln in lines), lines
+    # An unsourced item no binding section states is still reported.
+    alone = "Keep the `lint-check` suite green before publishing a nightly image."
+    tools, lines, _ = run(f"# demo\n\n## Brief\nShip it.\n\n## Restrictions\n- {alone}\n",
+                          {**drop, "quote": alone}, 5)
+    assert len(tools) == 1 and "publish-guard.sh:2" in tools[0], tools
+    assert any("publish-guard.sh" in ln for ln in lines), lines
+
+
+def test_still_stated_needs_a_binding_unit_with_the_items_identifiers_and_most_of_its_words():
+    from ttp.restriction_audit import still_stated
+    charter = ("# demo\n\n## Brief\nEvery change keeps the required `lint-check` suite green before it is "
+               "published.\n\nShip v1.\n\n## Restrictions\n- Never merge to main. (user msg #1)\n"
+               "- Never reboot the build farm at night.\n")
+    item = "Keep the required `lint-check` suite green before publishing a change."
+    assert still_stated(charter, item) == "Brief"
+    assert still_stated(charter, item.replace("lint-check", "type-check")) == ""   # an identifier it lacks
+    assert still_stated(charter, "Keep the `lint-check` suite green on nightly images and release tags.") == ""
+    assert still_stated(charter, "Never merge to main.") == "Restrictions"
+    # An unsourced item binds nothing, so it states nothing; a Brief paragraph sharing one word is no copy.
+    assert still_stated(charter, "Never reboot the build farm at night.") == ""
+    assert still_stated(charter, "Ship v1 to the staging mirror first.") == ""
+    # A dropped section: every item must be stated; a sub-heading or an empty text names nothing.
+    assert still_stated(charter, f"### Rules\n- {item}\n- Never merge to main.") == "Brief"
+    assert still_stated(charter, f"- {item}\n- Never reboot the build farm at night.") == ""
+    assert still_stated(charter, "") == "" and still_stated("", item) == ""
+
+
 def test_an_ask_about_an_unsourced_restriction_is_refused_and_a_sourced_one_is_sent(env):
     p = make(env)
     farm = "Never reboot the shared build farm while its nightly queue runs."
