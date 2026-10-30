@@ -19116,3 +19116,69 @@ def test_a_review_that_covers_no_commit_is_told_ttp_checks_has_no_target(env):
     review = " ".join((RUNTIME.parent / "template" / "prompts" / "kind-review.md").read_text().split())
     assert "A review that covers no commit" in review and "has no `ttp checks` target" in review
     assert "is a `substantive` failure" in review
+
+
+def test_task_show_and_status_export_the_blocker_sweep_read_only(env, capsys):
+    """`ttp task show` (text and --json) carries the task's latest sweep outcome with every field, or an
+    explicit empty list and why; `ttp status --json` and the web API state carry the open sweep's items
+    and fingerprints, or null. Reading them changes no state."""
+    p = make(env)
+    from ttp import cli, coordinator as coord, sweep
+    from ttp.web import state_payload
+    db, now = p.db, time.time()
+    swept = db.add_task("blocked on a key")
+    db.update_task(swept, status="blocked", blocked_reason="needs the vendor's key")
+    never = db.add_task("blocked, never swept")
+    db.update_task(never, status="blocked", blocked_reason="needs a reply")
+
+    def show(tid):
+        cli.main(["task", p.name, "show", str(tid), "--json"])
+        js = json.loads(capsys.readouterr().out)["blocker_sweep"]
+        cli.main(["task", p.name, "show", str(tid)])
+        return js, capsys.readouterr().out
+
+    def status():
+        cli.main(["status", p.name, "--json"])
+        return json.loads(capsys.readouterr().out)["blocker_sweep"]
+
+    # No sweep ever: explicit markers, never missing keys.
+    js, text = show(never)
+    assert js == {"key": f"task:{never}", "outcomes": [], "current": None,
+                  "none_why": "no blocker sweep recorded an outcome for this task in the last 30 days"}
+    assert "blocker sweep: none (no blocker sweep recorded" in text and "open blocker sweep: none covers it" in text
+    assert status() is None and state_payload(p, db)["blocker_sweep"] is None
+
+    # An open sweep: its items, fingerprints and number, in status, the web state and task show.
+    eid = sweep.start(db, p.config(), "every 6h", now)
+    cur = status()
+    assert cur == state_payload(p, db)["blocker_sweep"]
+    assert cur["sweep"] == 1 and cur["events"] == [eid] and cur["why"] == "every 6h"
+    assert {i["key"] for i in cur["items"]} == {f"task:{swept}", f"task:{never}"}
+    assert all(set(i) == {"key", "fp"} for i in cur["items"])
+    js, text = show(never)
+    assert js["outcomes"] == [] and js["current"] == {"sweep": 1, "queued_at": cur["queued_at"], "fp": None}
+    assert "open blocker sweep 1 covers it" in text
+
+    # The turn records an outcome: every field present, null when unset.
+    assert coord.apply(p, [{"type": "sweep", "id": swept, "outcome": "still_blocked",
+                            "until": "the vendor sends the signed key", "until_probe": "test -e /tmp/key",
+                            "start_after": "6h", "why": "vendor"}]) == []
+    js, text = show(swept)
+    (o,) = js["outcomes"]
+    assert set(o) == set(sweep.OUTCOME_FIELDS) and js["none_why"] is None
+    assert (o["outcome"], o["sweep"], o["until"], o["probe"]) == (
+        "still_blocked", 1, "the vendor sends the signed key", "test -e /tmp/key")
+    assert o["next"] > now + 5 * 3600 and o["item"]["status"] == "blocked" and o["ask"] is None and o["pause"] is None
+    assert "blocker sweep: still_blocked at " in text and "(sweep 1)" in text and "probe: test -e /tmp/key" in text
+    assert "next check: " in text
+
+    # Read-only: reading every export again changes no kv row or event.
+    before = (db.q("SELECT key, value FROM kv ORDER BY key"), db.q("SELECT id, status, data FROM events ORDER BY id"))
+    show(swept), show(never), status(), state_payload(p, db), sweep.task_view(db, swept)
+    assert (db.q("SELECT key, value FROM kv ORDER BY key"), db.q("SELECT id, status, data FROM events ORDER BY id")) == before
+
+    # The turn handles the sweep: none open again, the recorded outcome stays.
+    db.x("UPDATE events SET status='handled' WHERE id=?", (eid,))
+    assert status() is None and state_payload(p, db)["blocker_sweep"] is None
+    js, _ = show(swept)
+    assert js["current"] is None and js["outcomes"][0]["outcome"] == "still_blocked"

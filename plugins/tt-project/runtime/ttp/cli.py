@@ -6083,16 +6083,19 @@ def cmd_task(a) -> None:
         if not t:
             die(f"no task #{int(a.title)} in {p.name}", 1)
         from .landed import abandoned, superseded_rows
+        from . import sweep
         gone = abandoned(p.db, t["id"])
         sup = superseded_rows(p, t["id"])
+        swept = sweep.task_view(p.db, t["id"])
         if a.json:
             print(json.dumps({**t, **({"abandoned": {"why": gone[0], "ts": gone[1]}} if gone else {}),
-                              **({"superseded": sup} if sup else {})}, indent=2, default=str))
+                              **({"superseded": sup} if sup else {}), "blocker_sweep": swept}, indent=2, default=str))
         else:
             lines = [f"superseded by {r['sha'][:10]} ({'on' if r['on_push_branch'] else 'not on' if r['on_push_branch'] is False else 'cannot read'}"
                      f" the push branch), recorded {timefmt.long(r['ts'], p)}" for r in sup]
             if gone:
                 lines.append(f"abandoned {timefmt.long(gone[1], p)}: {gone[0]}")
+            lines += sweep.task_lines(swept, p)
             print(show_task(t) + ("\n\n" + "\n".join(lines) if lines else ""))
     elif a.action == "cancel":
         from .runner import stop_runs
@@ -9701,7 +9704,7 @@ def main(argv: list[str] | None = None) -> None:
                    "local or remote-tracking ref skips the file-overlap check")
     s.add_argument("--repo", help="superseded: a repository path to search first for the branch and the commit "
                    "(then the repository of the current directory, the repositories the task's runs worked in, the project root)")
-    s.add_argument("--json", action="store_true", help="list: JSON rows with start_when/retry_when; show: the task record")
+    s.add_argument("--json", action="store_true", help="list: JSON rows with start_when/retry_when; show: the task record with its blocker_sweep")
     s.add_argument("--status", help="list: only tasks in these statuses, comma-separated (queued,running,waiting,"
                    "blocked,review,done,failed,changes_needed,cancelled, ...); filtered before any cap, so every match "
                    "shows unless --limit is given")

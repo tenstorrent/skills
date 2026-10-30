@@ -683,6 +683,7 @@ def state_payload(p: Project, db: DB) -> dict:
         "coordinator": db.kv("last_coordinator_summary", {}),
         "health": health_now,
         "push_queue": pushq.web(p, db, now),
+        "blocker_sweep": sweep.open_sweep(db),   # the open sweep's items and fingerprints; null when none is open
         "accounts": db.q("SELECT provider, account, MAX(started) last FROM runs WHERE account IS NOT NULL "
                          "GROUP BY provider, account ORDER BY last DESC"),
         "now": now,

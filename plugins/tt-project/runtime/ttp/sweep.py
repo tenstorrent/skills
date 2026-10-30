@@ -78,6 +78,7 @@ SWEEP_KIND = "blocker_sweep"
 STATE_KEY = "blocker_sweep"            # kv: {"last", "n", "items": {key: snapshot}, "flags": {key: why}, "paused": [...],
 #                                         "seen": {key: {"status", "since"}}: when each item was first seen stuck}
 OUTCOMES_KEY = "blocker_sweep_outcomes"  # kv: {key: {"outcome", "ts", "until", "probe", "next", "why", "sweep"}}
+KEPT_DAYS = 30                          # an outcome older than this is dropped from OUTCOMES_KEY
 RELAYED_KEY = "blocker_sweep_user_relayed"  # kv: when the user's words last came relayed in another project's note
 SIGNAL_KEY = "blocker_sweep_signals"   # kv: [{"ts", "why", "rearm"}]: signal() requests not yet swept
 PAUSE_PROBES_KEY = "pause_probes"       # kv: {resource: {"probe", "rc", "at"}}: each end_when's last verdict (pauseends)
@@ -836,8 +837,73 @@ def record(db: DB, a: dict, next_at: float | None, now: float | None = None, whe
     o["why"] = _clip(a.get("why") or a.get("reason") or a.get("text") or "", 300)
     outs = outcomes(db)
     outs[key] = o
-    db.set_kv(OUTCOMES_KEY, {k: v for k, v in outs.items() if now - _num(v.get("ts")) < 30 * 86400})
+    db.set_kv(OUTCOMES_KEY, {k: v for k, v in outs.items() if now - _num(v.get("ts")) < KEPT_DAYS * 86400})
     return key
+
+
+# The read-only exports (`ttp task show`, `ttp status --json`, the web API state): every field always
+# present, null when the outcome did not set it, so an absent value is never a missing key.
+OUTCOME_FIELDS = ("outcome", "ts", "sweep", "until", "probe", "next", "why", "item", "fp", "ask", "ask_pause", "pause")
+
+
+def open_sweep(db: DB) -> dict | None:
+    """The blocker sweep no turn has handled yet, read-only: {"sweep", "queued_at", "why", "events",
+    "items": [{"key", "fp"}]} (fp: the watched hold's fingerprint the sweep saw, else null); None when
+    no sweep is open."""
+    evs = db.q("SELECT id, ts, data FROM events WHERE kind=? AND status='queued' ORDER BY id", (SWEEP_KIND,))
+    if not evs:
+        return None
+    state = db.kv(STATE_KEY, {}) or {}
+    state = state if isinstance(state, dict) else {}
+    n, keys = None, []
+    for e in evs:   # a sweep split into batches (prepare) is one sweep over several events
+        try:
+            data = json.loads(e["data"] or "{}")
+        except ValueError:
+            data = {}
+        data = data if isinstance(data, dict) else {}
+        n = data.get("sweep") if n is None else n
+        keys += [k for k in data.get("items") or [] if isinstance(k, str) and k not in keys]
+    same = n is not None and n == state.get("n")   # fingerprints and why belong to the latest sweep only
+    fps = (state.get("fps") or {}) if same else {}
+    return {"sweep": n, "queued_at": evs[0]["ts"], "why": state.get("why") if same else None,
+            "events": [e["id"] for e in evs], "items": [{"key": k, "fp": fps.get(k)} for k in keys]}
+
+
+def task_view(db: DB, tid: int) -> dict:
+    """What the blocker sweep last decided about task `tid`, read-only: {"key", "outcomes" (the latest
+    recorded outcome, [] when none), "none_why" (why the list is empty, else null), "current" (the open
+    sweep holding it: {"sweep", "queued_at", "fp"}, else null)}. Only the latest outcome per item is kept."""
+    key = f"task:{int(tid)}"
+    o = outcomes(db).get(key)
+    cur = open_sweep(db)
+    mine = next((i for i in cur["items"] if i["key"] == key), None) if cur else None
+    return {"key": key, "outcomes": [{f: o.get(f) for f in OUTCOME_FIELDS}] if o else [],
+            "none_why": None if o else f"no blocker sweep recorded an outcome for this task in the last {KEPT_DAYS} days",
+            "current": {"sweep": cur["sweep"], "queued_at": cur["queued_at"], "fp": mine["fp"]} if mine else None}
+
+
+def task_lines(view: dict, where=None) -> list[str]:
+    """task_view as text for `ttp task show`."""
+    out = []
+    for o in view["outcomes"]:
+        parts = [f"blocker sweep: {o['outcome']} at {timefmt.long(_num(o['ts']), where)} (sweep {o['sweep']})"]
+        parts += [f"{f}: {_clip(o[f], 300)}" for f in ("until", "probe", "why") if o[f]]
+        if o["next"]:
+            parts.append(f"next check: {timefmt.long(_num(o['next']), where)}")
+        if o["fp"]:
+            parts.append(f"fingerprint: {o['fp']}")
+        if o["ask"] is not None:
+            parts.append(f"ask: #{o['ask']}")
+        if o["pause"]:
+            parts.append("pause: " + ", ".join(f"{k} {v}" for k, v in o["pause"].items()))
+        out.append("; ".join(parts))
+    if not view["outcomes"]:
+        out.append(f"blocker sweep: none ({view['none_why']})")
+    cur = view["current"]
+    out.append(f"open blocker sweep {cur['sweep']} covers it" + (f" (fingerprint {cur['fp']})" if cur["fp"] else "")
+               if cur else "open blocker sweep: none covers it")
+    return out
 
 
 def _last_check(o: dict | None, now: float) -> str:
