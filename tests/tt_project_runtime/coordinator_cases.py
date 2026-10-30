@@ -5273,14 +5273,14 @@ _RESET_LEAST = "wait for the software reset to recover it; it did not, twice"
 
 # (text, extra fields): each names a reset of a machine or resource the project holds and states it is idle.
 _IDLE_RESET_REFUSED = [
-    ("box-a stayed down after the software reset. It is idle. May I power-cycle box-a?", {}),
+    ("box-a is idle. May I power-cycle box-a?", {}),
     ("Cycle the power on box-a? It is idle.", {}),                                       # a paraphrase
     ("Turn box-a off and back on? Nobody else uses it.", {}),
     ("Cold boot box-a, or bounce it? box-a is idle.", {}),
     ("box-a is idle.", {"least_disruptive": "reboot box-a through its BMC once the software reset fails again"}),
     ("box-a is idle with no other tenant.", {"not_covered": "restart box-a too"}),
     ("dev-a is idle. Should I reset dev-a?", {}),                                        # the project's device lock
-    ("Reboot box-b.example.com after the hang? It is unused.", {}),                      # by host name
+    ("Reboot box-b.example.com? It is unused.", {}),                                     # by host name
     ("box-a has no other tenant and nobody else uses it, not serving. Power cycle it, box-a?", {}),
 ]
 
@@ -5321,6 +5321,12 @@ _IDLE_RESET_THROUGH = [
     ("Reboot box-a? It is idle with an open /dev/tenstorrent handle from pid 1234.", {}, None),
     ("Reboot box-a? Nobody else uses it, but the user asked us not to touch it.", {}, None),
     ("Reboot box-a, which a teammate uses? It is idle.", {}, None),
+    # a job, a service or a person inside the reset or idle clause itself, with no clause word
+    ("box-a is idle. Reboot box-a a teammate uses?", {}, None),
+    ("box-a is idle. Reboot box-a running the model service?", {}, None),
+    ("box-a is idle. Reset box-a hosting the inference job?", {}, None),
+    ("Power cycle box-a? It is idle now the nightly job finished.", {}, None),
+    ("Reboot box-a after the hang? It is idle.", {}, None),                              # a cause: sent
     ("Reboot box-a? It is idle except for a serving workload.", {}, None),
     ("Reboot box-a? It isn't idle.", {}, None),
     ("Reboot box-a? It is idle (a teammate is on it).", {}, None),

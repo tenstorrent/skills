@@ -5248,12 +5248,11 @@ def _self_health_ask(a: dict, text: str, least: str = "") -> str:
 
 # A reset, reboot, power cycle or restart of a machine or resource the project holds, which the ask itself
 # states is idle with no other tenant, cannot harm people or speak as the user (user rule): refused, model-free.
-# Fail open (settled): sent unless the ask states it is idle, every clause of its text and not_covered is a
-# reset, an idle statement or a target name, and nothing names a tenant, a person's work, money, a credential,
+# Fail open (settled): sent unless the ask states it is idle, its text and not_covered hold only resets, idle
+# statements, target names and plain words, and nothing names a tenant, a person's work, money, a credential,
 # a user-only step, another person's request, a post, merge or other one-way step; sent too for an unnamed or
 # unknown target, a serving, shared or paused one, or a live lock or reservation on it. Accepted gaps:
-# - an idle-reset ask that does not say it is idle, or adds any other clause (a cause, a duration), is sent;
-# - a tenant named inside a reset or idle clause with no clause word ("reboot the idle box a teammate uses") is not seen;
+# - an idle-reset ask that does not say it is idle, or adds any word outside _PLAIN_WORDS (a cause, a duration), is sent;
 # - least_disruptive and recommendation get only the tenant word lists, not the clause check;
 # - an idle statement about a different machine than the reset's target counts for it.
 _RESET_RE = re.compile(r"\b(?:re-?boot\w*|(?:hard[- ])?reset\w*|glx_reset|power[- ]?cycl\w*|"
@@ -5276,6 +5275,11 @@ _PERSON_WORK_RE = re.compile(rf"\b(?!(?:{'|'.join(_OWN_POSSESSOR)})'s\b)[A-Za-z]
 _SPEAKS_RE = re.compile(r"\b(?:merg\w*|post(?:s|ed|ing)?(?!-)|announc\w*|e-?mail\w*|reply\s+to|message\s+(?:to|the)|"
                         r"in\s+(?:your|the\s+user's)\s+name|on\s+(?:your|the\s+user's)\s+behalf|leav\w*\s+draft|"
                         r"ready\s+for\s+review|disrupt\w*|disturb\w*|outage|evict\w*|preempt\w*)\b", re.I)
+# Allow-list, not a tenant list: any other word (a job, a service, a person, a cause) sends the ask.
+_PLAIN_WORDS = {"a", "all", "again", "an", "are", "back", "be", "board", "box", "can", "chip", "chips", "could", "device",
+                "do", "fully", "has", "host", "i", "is", "it", "its", "machine", "may", "me", "my", "node", "now", "ok",
+                "okay", "on", "once", "our", "please", "safe", "server", "shall", "should", "the", "this", "to", "too",
+                "tray", "we", "would"}
 _TENANT_TAGS = {"serving", "shared", "production", "prod", "live", "public", "demo", "customer"}
 
 
@@ -5313,10 +5317,10 @@ def _idle_reset_ask(p: Project, cfg: dict, a: dict, text: str, least: str) -> st
         targets |= {hosts[w] for w in words if w in hosts} | {own[w] for w in words if w in own}
     if not targets:
         return ""
-    names = set(hosts) | set(own) | {"it"}
-    for clause in _CLAUSE_RE.split(_IDLE_RE.sub(" \0 ", _RESET_RE.sub(" \0 ", ask))):
-        if "\0" not in clause and {w.lower().rstrip(".-") for w in re.findall(r"[A-Za-z0-9][\w.+-]*", clause)} - names:
-            return ""                                   # a clause that is not a reset, an idle statement or a target
+    names = set(hosts) | set(own) | _PLAIN_WORDS
+    for clause in _CLAUSE_RE.split(_IDLE_RE.sub(" ", _RESET_RE.sub(" ", ask))):
+        if {w.lower().rstrip(".-") for w in re.findall(r"[A-Za-z0-9][\w.+-]*", clause)} - names:
+            return ""                   # any word besides a reset, an idle statement, a target or a plain word
     paused = set((p.db.kv(PAUSED_RESOURCES_KEY) or {})) | set(shared.paused(cfg))
     taken = locks.held(p.state / "locks", p)
     for t in targets:
