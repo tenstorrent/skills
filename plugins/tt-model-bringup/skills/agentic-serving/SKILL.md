@@ -114,11 +114,11 @@ Record them in `serving_config.json` next to `release_limits`, the values the sp
    disk, the release route itself, and an isolated 2-task smoke with a trajectory audit. The
    release route is the workflow the final run will use; prove it here, not at the end. Write
    `survey.json` and `preflight.json`.
-2. **Rank, about 0.5 h.** Turn each problem the survey found into an effort in `efforts.json`:
-   evidence, estimated suite hours saved, a time cap set by that saving, an owner. Write the first
-   go or stop estimate per eval to `estimate.json`.
+2. **Rank, about 0.5 h.** Turn every problem the survey found into an effort in `efforts.json`,
+   as [Ranking](#ranking) describes, even when their estimates add up to more than the budget.
+   Write the first go or stop estimate per eval to `estimate.json`.
 3. **Efforts, `effort_budget_hours`, hard stop.** Run efforts in parallel, each owned by one
-   sub-agent, as [Efforts](#efforts) describes. Update the estimate after each effort.
+   sub-agent, as [Efforts](#efforts) describes. Re-estimate and re-rank after each effort.
 4. **Combine, about 2 h.** Re-check the current best, then one scored probe at release limits.
 5. **Release.** Run the suites with a go estimate through the same workflow every earlier run used,
    split on task boundaries so each dispatch finishes inside the grant's per-run timeout. An
@@ -126,28 +126,60 @@ Record them in `serving_config.json` next to `release_limits`, the values the sp
 
 A measured stop is a valid result at any step. Report it with the estimate that decided it.
 
+### Ranking
+
+Before an effort starts, write down what it should gain and what it should cost:
+
+- **Saving:** suite hours saved per eval in the plan, for example SWE-bench and Terminal-Bench,
+  and their sum.
+- **Work:** hours the effort should take.
+- **Confirmation:** how the effort will show it worked without the full suites: a short test, a
+  calculation from the survey, or a small task subset. Name it and the value that counts as success.
+- **Basis** of each number: `measured`, `calculated` or `guess`.
+
+An estimate that cannot be calculated is guessed from the nearest evidence (a similar change, a
+stage-11 measurement, a short test) and marked `guess`; it never blocks the ranking. A guess is
+replaced by a measured value when one exists.
+
+Order by total suite hours saved per hour of work. Then read the order as a whole: a calculation
+can be wrong, and the coordinator may know better. Move any effort it judges misplaced, and record
+the reason with that ranking. Rank every problem, even past the budget: efforts below the line run
+when earlier ones finish early. When nothing worth doing is left, go to Combine early; the time left
+shortens the release.
+
+Re-rank whenever an effort ends: re-run the survey checks and calculations the merged change
+touches, update every open problem's saving against the new current best, and append the new
+order to `rankings` in `efforts.json`. Do not run the full suites to re-estimate; they run in
+Release.
+
 ### Efforts
 
-An effort owns one problem: one owner, one branch, one device or slot set, one time cap. It ends
-`kept`, `dropped` or `capped`, with the measured number.
+An effort owns one problem: one owner, one branch, one device or slot set, and a time box of about
+twice its work estimate.
 
 - **Fastest test first.** Look for a test of minutes in the survey's short tests before any scored
   sample. Use a scored sample only when the question is about scores, completion or harness
   behaviour, and size it as [Sizing a sample](#sizing-a-sample) says.
-- **Accepting a change.** A paired exactness check plus a measured gain is enough for a change that
-  keeps tokens exact. A change that alters outputs needs a scored pair against the current best.
+- **Accepting a change.** A paired exactness check plus the effort's confirmation is enough for a
+  change that keeps tokens exact. A change that alters outputs needs a scored pair against the
+  current best.
+- **Two outcomes.** Record whether the change is `kept`, `dropped` or `none`, and separately whether
+  the problem is `solved` or `open`. A real gain that does not solve the problem is kept, and the
+  problem returns to the ranking with its new numbers.
 - **Merge as you go.** A kept change joins the current best; efforts that start later build on it.
-- **No clashes.** Efforts that touch the same files or the same memory run in turn or share a
-  branch. One owner per device.
-- **Caps are not stretched.** An effort that reaches its cap stops and records what it learned. The
-  coordinator may re-rank and give the problem a second effort.
+  An effort that started from an older best rebases and repeats its confirmation before merging.
+- **Running efforts are not interrupted** by a re-rank. The exception is an effort whose problem a
+  merge has already solved: it stops and records what it learned.
+- **At the time box,** the effort re-estimates its remaining work and saving, and the coordinator
+  decides with the current ranking whether it continues.
 
-The coordinator holds the current best, the slot ledger and the budget. It reads wide where an
-effort reads deep, as [Look at the whole run](#look-at-the-whole-run) asks, and starts the next
-ranked effort whenever a lane frees. Every dispatched run registers with the coordinator at launch.
-At each effort boundary it re-reads `inputs.json`, applies operator changes and records them in
-`steering.log`. When it is blocked, it writes the reason to `blocked.json` at once instead of
-waiting for the next resume.
+The coordinator holds the current best, the slot ledger and the budget, and chooses which efforts
+run together and on which lanes. Efforts that touch the same files or the same memory run in turn
+or share a branch, and each device has one owner. It reads wide where an effort reads deep, as
+[Look at the whole run](#look-at-the-whole-run) asks, and starts the next ranked effort whenever a
+lane frees. Every dispatched run registers with the coordinator at launch. At each effort boundary
+it re-reads `inputs.json`, applies operator changes and records them in `steering.log`. When it is
+blocked, it writes the reason to `blocked.json` at once instead of waiting for the next resume.
 
 ### Sizing a sample
 
@@ -162,7 +194,12 @@ Write these to `doc/agentic_evals/`:
 
 - `survey.json`: `checks`, `calculations` and `shortfalls`, as the survey reference names them
 - `preflight.json`: `registry`, `disk`, `release_route` and `isolation_smoke`, each with `ok`
-- `efforts.json`: per effort `problem`, `owner`, `cap_hours`, `used_hours`, `outcome`, `evidence`
+- `efforts.json`: `efforts`, per effort `problem`, `owner`, `predicted` (`saving_hours` per eval,
+  `work_hours`, `basis`), `confirm` (`method`, `success`), `box_hours`, `status` (`done`,
+  `running` or `not_run` with a `reason`), and when done `used_hours`, `change`, `problem_status`,
+  `confirmed` (the measured result) and `evidence`; and `rankings`, one entry per ranking with
+  `after`, `order` (problem, `saving_hours`, `work_hours`) and `reason` when the order is not by
+  saving per hour
 - `plan.json`
 - `runs/<arm>/` (manifest and collected results)
 - `estimate.json`: per eval `decision` (`go` or `stop`) and `reason`
@@ -171,6 +208,7 @@ Write these to `doc/agentic_evals/`:
   each eval used, the agent and request time limits and output cap, and `release_limits`
 - `compute.json`: the grant as used — `max_parallel`, peak runs in flight, and for a CI grant the
   published refs and every dispatched run id, so each result traces back to a run
-- `REPORT.md`, with hours per effort next to its cap
+- `REPORT.md`, with each effort's predicted saving and work hours next to its confirmed result and
+  hours used, and how estimates compared with results
 
 Update `workload` with the measured values.

@@ -81,8 +81,21 @@ def goal12(model, **overrides):
         'survey.json': {'checks': {k: {'value': 1, 'healthy': True} for k in CHECKS},
                         'calculations': {k: 1 for k in CALCULATIONS}, 'shortfalls': []},
         'preflight.json': {k: {'ok': True} for k in ('registry', 'disk', 'release_route', 'isolation_smoke')},
-        'efforts.json': {'efforts': [{'problem': 'padded prefill', 'owner': 'prefill', 'cap_hours': 4,
-                                      'used_hours': 3, 'outcome': 'kept', 'evidence': 'runs/prefill'}]},
+        'efforts.json': {
+            'efforts': [
+                {'problem': 'padded prefill', 'owner': 'prefill', 'status': 'done',
+                 'predicted': {'saving_hours': {'swe': 3.0, 'terminal': 1.5}, 'work_hours': 2, 'basis': 'calculated'},
+                 'confirm': {'method': 'prefill vs batch shape', 'success': 'one live row costs batch-1 time'},
+                 'box_hours': 4, 'used_hours': 3, 'change': 'kept', 'problem_status': 'solved',
+                 'confirmed': 'prefill 0.9 s per live row', 'evidence': 'runs/prefill'},
+                {'problem': 'block size', 'status': 'not_run', 'reason': 'below the budget line',
+                 'predicted': {'saving_hours': {'swe': 0.5}, 'work_hours': 3, 'basis': 'guess'},
+                 'confirm': {'method': 'cache replay', 'success': 'hit rate above 0.9'}},
+            ],
+            'rankings': [{'after': 'survey', 'order': [
+                {'problem': 'padded prefill', 'saving_hours': 4.5, 'work_hours': 2},
+                {'problem': 'block size', 'saving_hours': 0.5, 'work_hours': 3}]}],
+        },
         'serving_config.json': {'agent_timeout_s': 6300, 'request_timeout_s': 3600, 'output_cap_tokens': 81920,
                                 'release_limits': {'agent_timeout_s': 6300, 'request_timeout_s': 3600,
                                                    'output_cap_tokens': 81920},
@@ -151,12 +164,60 @@ def test_failed_release_route_preflight_is_critical(tmp_path):
     assert code == 2 and 'release_route' in stderr
 
 
-def test_effort_over_its_cap_is_advisory(tmp_path):
+def efforts_with(tmp_path, change):
     files = goal12(tmp_path)
-    files['efforts.json']['efforts'][0]['used_hours'] = 9
-    goal12(tmp_path, **{'efforts.json': files['efforts.json']})
-    code, stderr = check(tmp_path, 'agentic-evals', evidence())
-    assert code == 1 and '4 h cap' in stderr
+    ledger = files['efforts.json']
+    change(ledger)
+    goal12(tmp_path, **{'efforts.json': ledger})
+    return check(tmp_path, 'agentic-evals', evidence())
+
+
+def test_effort_over_its_box_without_a_re_estimate_is_advisory(tmp_path):
+    code, stderr = efforts_with(tmp_path, lambda e: e['efforts'][0].update(used_hours=9))
+    assert code == 1 and '4 h box' in stderr
+
+
+def test_effort_over_its_box_with_a_re_estimate_passes(tmp_path):
+    code, stderr = efforts_with(tmp_path, lambda e: e['efforts'][0].update(used_hours=9, re_estimate='2 h left'))
+    assert code == 0, stderr
+
+
+@pytest.mark.parametrize('field', ['predicted', 'confirm'])
+def test_every_effort_needs_a_prediction_and_a_confirmation(tmp_path, field):
+    code, stderr = efforts_with(tmp_path, lambda e: e['efforts'][1].pop(field))
+    assert code == 2 and 'block size' in stderr
+
+
+def test_kept_change_with_open_problem_passes(tmp_path):
+    code, stderr = efforts_with(tmp_path, lambda e: e['efforts'][0].update(problem_status='open'))
+    assert code == 0, stderr
+
+
+def test_done_effort_needs_a_confirmed_result(tmp_path):
+    code, stderr = efforts_with(tmp_path, lambda e: e['efforts'][0].pop('confirmed'))
+    assert code == 2 and 'confirmed' in stderr
+
+
+def test_effort_that_did_not_run_needs_a_reason(tmp_path):
+    code, stderr = efforts_with(tmp_path, lambda e: e['efforts'][1].pop('reason'))
+    assert code == 2 and 'did not run' in stderr
+
+
+def test_rankings_are_required(tmp_path):
+    code, stderr = efforts_with(tmp_path, lambda e: e.pop('rankings'))
+    assert code == 2 and 'rankings' in stderr
+
+
+def test_reordered_ranking_needs_a_reason(tmp_path):
+    code, stderr = efforts_with(tmp_path, lambda e: e['rankings'][0]['order'].reverse())
+    assert code == 2 and 'no reason' in stderr
+
+    def reorder_with_reason(ledger):
+        ledger['rankings'][0]['order'].reverse()
+        ledger['rankings'][0]['reason'] = 'block size unblocks the cache effort'
+
+    code, stderr = efforts_with(tmp_path, reorder_with_reason)
+    assert code == 0, stderr
 
 
 @pytest.mark.parametrize('mutate, message', [

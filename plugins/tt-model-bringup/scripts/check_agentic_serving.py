@@ -24,7 +24,10 @@ SURVEY_CHECKS = ("time_split", "busy_rows", "live_prefill_rows", "trace_captures
 SURVEY_CALCULATIONS = ("batch", "suite_hours", "agent_timeout", "output_cap", "bytes", "agents", "block_cost",
                        "prefill_padding")
 PREFLIGHT = ("registry", "disk", "release_route", "isolation_smoke")
-EFFORT_OUTCOMES = ("kept", "dropped", "capped")
+EFFORT_STATUS = ("done", "running", "not_run")
+CHANGES = ("kept", "dropped", "none")
+PROBLEM_STATUS = ("solved", "open")
+BASES = ("measured", "calculated", "guess")
 RELEASE_LIMITS = ("agent_timeout_s", "request_timeout_s", "output_cap_tokens")
 
 
@@ -110,19 +113,67 @@ def check_preflight(evals: Path, problems: list) -> None:
             problems.append((2, f"preflight {key!r} did not pass; the release depends on it"))
 
 
+def check_prediction(row: dict, name, problems: list) -> None:
+    predicted, confirm = row.get("predicted") or {}, row.get("confirm") or {}
+    savings = predicted.get("saving_hours")
+    if not (isinstance(savings, dict) and savings and all(number(v) for v in savings.values())
+            and number(predicted.get("work_hours")) and predicted.get("basis") in BASES):
+        problems.append((2, f"effort {name!r} needs predicted saving_hours per eval, work_hours and basis "
+                            f"({', '.join(BASES)}); guess when it cannot be calculated"))
+    if not (confirm.get("method") and confirm.get("success")):
+        problems.append((2, f"effort {name!r} needs confirm.method and confirm.success: how it shows it worked"))
+
+
+def check_outcome(row: dict, name, problems: list) -> None:
+    status = row.get("status")
+    if status == "not_run":
+        if not row.get("reason"):
+            problems.append((2, f"effort {name!r} did not run and needs a reason"))
+        return
+    if not (row.get("owner") and number(row.get("box_hours"))):
+        problems.append((2, f"effort {name!r} needs an owner and box_hours"))
+        return
+    if status == "running":
+        problems.append((1, f"effort {name!r} is still running at the end of the stage"))
+        return
+    if not (number(row.get("used_hours")) and row.get("change") in CHANGES
+            and row.get("problem_status") in PROBLEM_STATUS and row.get("confirmed") and row.get("evidence")):
+        problems.append((2, f"effort {name!r} needs used_hours, change, problem_status, confirmed and evidence"))
+    elif row["used_hours"] > row["box_hours"] * 1.1 and not row.get("re_estimate"):
+        problems.append((1, f"effort {name!r} used {row['used_hours']} h against a {row['box_hours']} h box "
+                            "without a re-estimate"))
+
+
+def check_rankings(rankings, problems: list) -> None:
+    if not isinstance(rankings, list) or not rankings:
+        problems.append((2, "efforts.json needs rankings: the first order and one after every effort"))
+        return
+    for index, ranking in enumerate(rankings):
+        order = ranking.get("order") if isinstance(ranking, dict) else None
+        if not (isinstance(order, list) and order and all(
+                isinstance(row, dict) and number(row.get("saving_hours")) and number(row.get("work_hours"))
+                and row["work_hours"] > 0 for row in order)):
+            problems.append((2, f"ranking {index} needs order rows with saving_hours and work_hours"))
+            continue
+        rates = [row["saving_hours"] / row["work_hours"] for row in order]
+        if any(a < b for a, b in zip(rates, rates[1:])) and not ranking.get("reason"):
+            problems.append((2, f"ranking {index} is not by saving per hour of work and records no reason"))
+
+
 def check_efforts(evals: Path, problems: list) -> None:
-    efforts = read(evals / "efforts.json", problems).get("efforts")
+    ledger = read(evals / "efforts.json", problems)
+    efforts = ledger.get("efforts")
     if not isinstance(efforts, list) or not efforts:
         if efforts is not None or (evals / "efforts.json").is_file():
             problems.append((2, "efforts.json lists no efforts; rank the survey's problems"))
         return
     for row in efforts:
-        name = row.get("problem") if isinstance(row, dict) else None
-        if not (name and row.get("owner") and number(row.get("cap_hours")) and number(row.get("used_hours"))
-                and row.get("outcome") in EFFORT_OUTCOMES and row.get("evidence")):
-            problems.append((2, f"effort {name!r} needs owner, cap_hours, used_hours, outcome and evidence"))
-        elif row["used_hours"] > row["cap_hours"] * 1.1:
-            problems.append((1, f"effort {name!r} used {row['used_hours']} h against a {row['cap_hours']} h cap"))
+        if not isinstance(row, dict) or not row.get("problem") or row.get("status") not in EFFORT_STATUS:
+            problems.append((2, f"each effort needs a problem and a status ({', '.join(EFFORT_STATUS)})"))
+            continue
+        check_prediction(row, row["problem"], problems)
+        check_outcome(row, row["problem"], problems)
+    check_rankings(ledger.get("rankings"), problems)
 
 
 def check_serving_config(evals: Path, problems: list) -> None:
