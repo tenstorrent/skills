@@ -214,7 +214,9 @@ def test_a_joined_run_that_times_out_fails_its_follower_too(env, tmp_path, monke
         ran = tmp_path / "ran"
         t, got = _main_in_thread(["checks", "--", "sh", "-c", f"touch {ran}"])
         assert _wait_for(lambda: checkjoin.JOINED in _join_phases(p), 30), _join_phases(p)
-        assert (run / "checks-slot.wait").exists() and "follows" in json.loads((run / "checks-slot.wait").read_text())
+        # the join phase is recorded just before the wait file is written: wait for the file too
+        assert _wait_for((run / "checks-slot.wait").exists, 30)
+        assert "follows" in json.loads((run / "checks-slot.wait").read_text())
         checkjoin.finish(leads[0], passed=False, head=checkjoin.read(leads[0])["head"], rc=1, timed_out=True,
                          summary="stuck in test_x")
         t.join(60)
