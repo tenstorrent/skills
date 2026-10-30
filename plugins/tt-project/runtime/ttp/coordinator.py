@@ -5246,17 +5246,25 @@ def _self_health_ask(a: dict, text: str, least: str = "") -> str:
             "(or irreversible), with least_disruptive naming the restriction or the irreversible step")
 
 
-# A reset, reboot, power cycle or restart of a machine or resource the project holds, with nothing
-# showing another tenant on it, cannot harm people or speak as the user (user rule): refused, model-free.
-# Through whenever the gate cannot tell: an unnamed or unknown target, a serving, shared or paused one,
-# a live lock or reservation on it, or text naming a tenant, a person's work, money, a credential, a
-# user-only step, another person's request, a post, merge or other one-way step.
+# A reset, reboot, power cycle or restart of a machine or resource the project holds, which the ask itself
+# states is idle with no other tenant, cannot harm people or speak as the user (user rule): refused, model-free.
+# Fail open (settled): sent unless the ask states it is idle, every clause of its text and not_covered is a
+# reset, an idle statement or a target name, and nothing names a tenant, a person's work, money, a credential,
+# a user-only step, another person's request, a post, merge or other one-way step; sent too for an unnamed or
+# unknown target, a serving, shared or paused one, or a live lock or reservation on it. Accepted gaps:
+# - an idle-reset ask that does not say it is idle, or adds any other clause (a cause, a duration), is sent;
+# - a tenant named inside a reset or idle clause with no clause word ("reboot the idle box a teammate uses") is not seen;
+# - least_disruptive and recommendation get only the tenant word lists, not the clause check;
+# - an idle statement about a different machine than the reset's target counts for it.
 _RESET_RE = re.compile(r"\b(?:re-?boot\w*|(?:hard[- ])?reset\w*|glx_reset|power[- ]?cycl\w*|"
                        r"cycl\w*\s+(?:the\s+|its\s+)?power|(?:power|turn)\s+(?:[\w.-]+\s+){0,2}?(?:off|down)\s+and\s+(?:back\s+)?on|"
                        r"(?:cold|warm|hard)[- ]boot\w*|bounc\w*|restart\w*)\b", re.I)
-_NO_TENANT_RE = re.compile(r"(?:\b(?:no|not|nobody|none|without|zero|nothing|never)|n't)(?:\s+[\w'-]+){0,3}\s+"
-                           r"(?:else|other|tenants?|traffic|users?|one|serving|shared|in\s+use|used|using|uses|jobs?|"
-                           r"holders?|handles?|process(?:es)?|load|customers?)\b", re.I)
+_IDLE_RE = re.compile(r"\b(?:idle|unused|not\s+(?:in\s+use|serving|shared)|no\s+(?:other\s+)?tenants?|"
+                      r"(?:nobody|no\s+one)\s+(?:else\s+)?(?:uses|is\s+using|is\s+on)\s+it)\b", re.I)
+_NOT_IDLE_RE = re.compile(r"(?:\b(?:not|never|no\s+longer)|n't)\s+(?:\w+\s+)?idle\b", re.I)
+_CLAUSE_RE = re.compile(r"[,;:!?\n()\[\]—–]+|\s-+\s|\.(?=\s|$)|\b(?:and|but|or|nor|yet|so|while|whilst|although|though|because|since|"
+                        r"unless|until|except|apart|besides|than|that|which|who|whom|whose|where|when|as|if|with|"
+                        r"without|for)\b", re.I)
 _TENANT_RE = re.compile(r"\b(?:serv(?:ing|es)|production|prod|live|traffic|tenants?|customers?|demo|someone|somebody|"
                         r"(?:other|another)\s+(?:users?|people|persons?|teams?|projects?)|in\s+use|being\s+used|"
                         r"shared|logged[- ]in|users?\s+(?:on|of)\s+it)\b", re.I)
@@ -5273,7 +5281,7 @@ _TENANT_TAGS = {"serving", "shared", "production", "prod", "live", "public", "de
 
 def _idle_reset_ask(p: Project, cfg: dict, a: dict, text: str, least: str) -> str:
     """Why an ask to reset, reboot, power-cycle or restart a machine or resource this project holds,
-    with no sign of another tenant, is the project's to do, or "". Targets: machine aliases or host
+    which it states is idle with no other tenant, is the project's to do, or "". Targets: machine aliases or host
     names in the machines list, and the project's own (not shared) device locks, named in a sentence
     of text, least_disruptive or not_covered that also names the reset. Review, merge, funds and spend
     asks pass; so does a restriction ask whose least_disruptive names the restriction."""
@@ -5284,9 +5292,13 @@ def _idle_reset_ask(p: Project, cfg: dict, a: dict, text: str, least: str) -> st
     said = f"{text} {a.get('recommendation') or ''} {least} {nc}".replace("’", "'")
     if blocking == "restriction" and _NAMES_LIMIT_RE.search(least) and not _BREAKS_NONE_RE.search(least):
         return ""
+    ask = f"{text}\n{nc}".replace("’", "'")
+    if (not _IDLE_RE.search(ask) or _NOT_IDLE_RE.search(said)
+            or any(_IDLE_RE.search(q) for q in re.findall(r"[^.!?\n]*\?", ask))):   # "is it idle?" asks, not states
+        return ""
     if (_names_needs_user(said) or _MONEY_RE.search(said) or _CREDENTIAL_RE.search(said) or _USER_ONLY_RE.search(said)
             or _OTHERS_ASK_RE.search(said) or _ONE_WAY_RE.search(said) or _SPEAKS_RE.search(said)
-            or _PERSON_WORK_RE.search(said) or _TENANT_RE.search(_NO_TENANT_RE.sub(" ", said))):
+            or _PERSON_WORK_RE.search(said) or _TENANT_RE.search(_IDLE_RE.sub(" ", said))):
         return ""
     known = machines.load()
     hosts = {alias.lower(): alias for alias in known}
@@ -5301,6 +5313,10 @@ def _idle_reset_ask(p: Project, cfg: dict, a: dict, text: str, least: str) -> st
         targets |= {hosts[w] for w in words if w in hosts} | {own[w] for w in words if w in own}
     if not targets:
         return ""
+    names = set(hosts) | set(own) | {"it"}
+    for clause in _CLAUSE_RE.split(_IDLE_RE.sub(" \0 ", _RESET_RE.sub(" \0 ", ask))):
+        if "\0" not in clause and {w.lower().rstrip(".-") for w in re.findall(r"[A-Za-z0-9][\w.+-]*", clause)} - names:
+            return ""                                   # a clause that is not a reset, an idle statement or a target
     paused = set((p.db.kv(PAUSED_RESOURCES_KEY) or {})) | set(shared.paused(cfg))
     taken = locks.held(p.state / "locks", p)
     for t in targets:

@@ -5271,16 +5271,16 @@ def test_the_self_health_gate_by_reason_and_its_refusal_count(env):
 _RESET_LEAST = "wait for the software reset to recover it; it did not, twice"
 
 
-# (text, extra fields): each names a reset of a machine or resource the project holds, nothing else on it.
+# (text, extra fields): each names a reset of a machine or resource the project holds and states it is idle.
 _IDLE_RESET_REFUSED = [
-    ("box-a stayed down after the software reset. May I power-cycle box-a?", {}),
+    ("box-a stayed down after the software reset. It is idle. May I power-cycle box-a?", {}),
     ("Cycle the power on box-a? It is idle.", {}),                                       # a paraphrase
-    ("Turn box-a off and back on?", {}),
-    ("Cold boot box-a, or bounce it?", {}),
-    ("box-a is wedged. How should I proceed?", {"least_disruptive": "reboot box-a through its BMC once the software reset fails again"}),
-    ("The chips on box-a are gone.", {"not_covered": "a second machine now: restart box-a too"}),
-    ("dev-a hung. Should I reset dev-a?", {}),                                           # the project's device lock
-    ("Reboot box-b.example.com after the hang?", {}),                                    # by host name
+    ("Turn box-a off and back on? Nobody else uses it.", {}),
+    ("Cold boot box-a, or bounce it? box-a is idle.", {}),
+    ("box-a is idle.", {"least_disruptive": "reboot box-a through its BMC once the software reset fails again"}),
+    ("box-a is idle with no other tenant.", {"not_covered": "restart box-a too"}),
+    ("dev-a is idle. Should I reset dev-a?", {}),                                        # the project's device lock
+    ("Reboot box-b.example.com after the hang? It is unused.", {}),                      # by host name
     ("box-a has no other tenant and nobody else uses it, not serving. Power cycle it, box-a?", {}),
 ]
 
@@ -5302,25 +5302,51 @@ def test_an_ask_to_reset_an_idle_machine_the_project_holds_is_refused(env, text,
 
 # (text, fields, setup): the gate cannot tell, or something other than the reset needs the user.
 _IDLE_RESET_THROUGH = [
-    ("Power cycle box-z?", {}, None),                                                    # unknown machine
+    # review #4590: no idle statement, and a tenant, a person, a job, a service or a user instruction named
+    ("Reboot box-a? The reset did not recover it and other users are waiting on it.", {}, None),
+    ("Reboot box-a? A teammate is running a benchmark on it.", {}, None),
+    ("Reboot box-a? A colleague has a session open on it.", {}, None),
+    ("Reboot box-a? Another project's jobs are running on it.", {}, None),
+    ("Reboot box-a? There is an open /dev/tenstorrent handle from pid 1234.", {}, None),
+    ("Reboot box-a? The user is using it right now.", {}, None),
+    ("Reboot box-a? It is not idle: a run is in progress.", {}, None),
+    ("Reboot box-a? The model service is up on it.", {}, None),
+    ("Reboot box-a? The user asked us not to touch it.", {}, None),
+    ("Reboot box-a? You said never to reboot it without asking.", {}, None),
+    # the same with an idle statement next to the tenant: contradictory or extra wording is sent
+    ("Reboot box-a? It is idle, but other users are waiting on it.", {}, None),
+    ("Reboot box-a? It is idle. A teammate is running a benchmark on it.", {}, None),
+    ("Reboot box-a? It is idle; a colleague has a session open on it.", {}, None),
+    ("Reboot box-a? It is idle apart from another project's jobs.", {}, None),
+    ("Reboot box-a? It is idle with an open /dev/tenstorrent handle from pid 1234.", {}, None),
+    ("Reboot box-a? Nobody else uses it, but the user asked us not to touch it.", {}, None),
+    ("Reboot box-a, which a teammate uses? It is idle.", {}, None),
+    ("Reboot box-a? It is idle except for a serving workload.", {}, None),
+    ("Reboot box-a? It isn't idle.", {}, None),
+    ("Reboot box-a? It is idle (a teammate is on it).", {}, None),
+    ("Reboot box-a? It is idle - another user is on it.", {}, None),
+    ("Reboot box-a? It is idle.", {"not_covered": "a teammate's request to keep it up"}, None),
+    ("Reboot box-a? It is idle.", {"least_disruptive": "wait until other users finish on it"}, None),
+    ("Is box-a idle? Reboot box-a if so.", {}, None),                                    # asks, not states
+    ("Power cycle box-z? It is idle.", {}, None),                                        # unknown machine
     ("Power cycle the second machine?", {}, None),                                       # no target named
-    ("Power cycle box-s?", {}, None),                                                    # a serving tag
-    ("Power cycle box-h?", {}, None),                                                    # shared by all projects
-    ("Power cycle box-a?", {}, "lock"),                                                  # a lock held on it
-    ("Power cycle box-a?", {}, "shared-lock"),                                           # another project's lock
-    ("Power cycle box-a?", {}, "pause"),                                                 # a pause on it
-    ("Power cycle box-a? Live traffic still reaches it.", {}, None),
-    ("Reboot box-a? A teammate's benchmark run is on it.", {}, None),                    # a person's work
-    ("Reboot box-a? Other users are logged in.", {}, None),
-    ("Reboot box-a and merge the fix?", {}, None),
-    ("Reboot box-a? Its BMC needs a password.", {}, None),                               # a credential
-    ("Reboot box-a? It costs $40 a cycle.", {}, None),                                   # money
-    ("Press the power button on box-a?", {}, None),                                      # user-only step
-    ("Restart box-a after wiping its disk?", {}, None),                                  # one-way step
+    ("Power cycle box-s? It is idle.", {}, None),                                        # a serving tag
+    ("Power cycle box-h? It is idle.", {}, None),                                        # shared by all projects
+    ("Power cycle box-a? It is idle.", {}, "lock"),                                      # a lock held on it
+    ("Power cycle box-a? It is idle.", {}, "shared-lock"),                               # another project's lock
+    ("Power cycle box-a? It is idle.", {}, "pause"),                                     # a pause on it
+    ("Power cycle box-a? Live traffic still reaches it. It is idle.", {}, None),
+    ("Reboot box-a? A teammate's benchmark run is on it. It is idle.", {}, None),        # a person's work
+    ("Reboot box-a? Other users are logged in. It is idle.", {}, None),
+    ("Reboot box-a and merge the fix? It is idle.", {}, None),
+    ("Reboot box-a? Its BMC needs a password. It is idle.", {}, None),                   # a credential
+    ("Reboot box-a? It costs $40 a cycle. It is idle.", {}, None),                       # money
+    ("Press the power button on box-a? It is idle.", {}, None),                          # user-only step
+    ("Restart box-a after wiping its disk? It is idle.", {}, None),                      # one-way step
     ("Is box-a idle?", {}, None),                                                        # no reset
-    ("Power cycle box-a?", {"blocking": "review"}, None),
-    ("Power cycle box-a?", {"blocking": "funds"}, None),
-    ("Power cycle box-a?", {"blocking": "restriction",
+    ("Power cycle box-a? It is idle.", {"blocking": "review"}, None),
+    ("Power cycle box-a? It is idle.", {"blocking": "funds"}, None),
+    ("Power cycle box-a? It is idle.", {"blocking": "restriction",
                             "least_disruptive": "a power cycle breaks the never-cycle restriction"}, None),
 ]
 
@@ -5346,7 +5372,7 @@ def test_an_ask_to_reset_goes_through_when_the_gate_cannot_tell(env, text, field
         if held:
             held.close()
     if setup is None:
-        assert coord._idle_reset_ask(p, p.config(), {"blocking": "human"}, "Power cycle box-a?", "")   # the control
+        assert coord._idle_reset_ask(p, p.config(), {"blocking": "human"}, "Power cycle box-a? It is idle.", "")   # the control
 
 
 def test_a_reset_ask_naming_a_tenant_is_sent(env):
