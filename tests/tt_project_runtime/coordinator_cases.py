@@ -2967,6 +2967,49 @@ def test_a_restrictions_items_source_is_cited_in_its_text(env):
     assert "- Never merge, not even docs. (user msg #1)\n" in p.charter_path.read_text()
 
 
+def test_a_restrictions_source_sent_as_a_json_string_is_read_on_both_paths(env):
+    # The action schema types `source` as a string: its JSON text works like the object, adding an item
+    # or replacing one by `quote`, and each refusal names the check that failed.
+    import json
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    p.charter_path.write_text("# demo\n\n## Brief (verbatim from the user)\nKeep the docs tidy.\n\n"
+                              "## Restrictions\n- Never merge. (user msg #1)\n- Never rename box C.\n")
+    said = db.post("in", "Never push tags before CI passes.", chat=None, kind="user", provenance="web-session",
+                   context="relayer: they also want box B left alone")
+    add = {"type": "charter_update", "section": "Restrictions"}
+    for text, src, cite in (("- Never push tags before CI passes.",
+                             json.dumps({"msg": said, "quote": "never push tags"}), f" (user msg #{said})"),
+                            ("- Keep the docs tidy.", json.dumps({"origin": "brief", "quote": "keep the docs tidy"}),
+                             " (origin: Brief)"),
+                            ("- Stop at the $50 spend cap.", ' {"origin": "gate"} ', " (origin: harness gate)"),
+                            ("- Never delete old logs.", {"msg": said, "quote": "before CI passes"}, f" (user msg #{said})")):
+        assert coord.apply(p, [{**add, "text": text, "source": src}], turn=2) == [], (text, src)
+        assert text + cite + "\n" in p.charter_path.read_text(), (text, p.charter_path.read_text())
+    # The `quote` replacement of an unsourced item (no user word needed) takes the string too.
+    assert coord.apply(p, [{**add, "quote": "Never rename box C.", "text": "- Never rename box C at night.",
+                            "source": json.dumps({"msg": said, "quote": "Never push tags"})}], turn=3) == []
+    charter = p.charter_path.read_text()
+    assert f"- Never rename box C at night. (user msg #{said})\n" in charter and "- Never rename box C.\n" not in charter
+    # Refusals name what failed; only a missing source says it is missing.
+    before = p.charter_path.read_text()
+    for src, why in (("", "needs `source`"), ("   ", "needs `source`"),
+                     ("{msg: 8}", "is not valid JSON"), ('"gate"', "must hold a JSON object, got str"),
+                     ("[1]", "must hold a JSON object, got list"), ("{}", "needs `source`"),
+                     (json.dumps({"msg": said, "quote": "leave box B alone"}), "quote check failed"),
+                     (json.dumps({"origin": "brief", "quote": "never push tags"}), "quote check failed"),
+                     (json.dumps({"msg": "soon", "quote": "x y z"}), "message check failed"),
+                     (json.dumps({"origin": "relayer"}), "origin check failed")):
+        for act in ({**add, "text": "- Never skip CI.", "source": src},
+                    {**add, "quote": "Never push tags before CI passes. (user msg #%d)" % said,
+                     "text": "- Never skip CI.", "source": src}):
+            err = coord.apply(p, [act], turn=4, user_turn=True, messages=[said])
+            assert len(err) == 1 and why in err[0] and "sent as a string" in err[0] and "memory_add" in err[0], (src, err)
+            assert ("needs `source`" in err[0]) == (why == "needs `source`"), (src, err)
+    assert p.charter_path.read_text() == before
+
+
 def test_a_restrictions_item_is_sourced_by_a_user_message_cite_or_an_origin_marker(env):
     from ttp import restriction_source as rs
     body = ("- Never merge. (user msg #3)\n- Loose rule.\n  - nested part (user's msg #4)\n### Lab\n"
