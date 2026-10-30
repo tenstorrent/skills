@@ -2985,6 +2985,16 @@ def test_a_restrictions_item_is_sourced_by_a_user_message_cite_or_an_origin_mark
     assert rs.unsourced_items("# demo\n\n## Restrictions\n" + body + "\n\n## Goals\nGo, never stop.\n") == [
         "Paragraph rule continued here.", "- Mentions msg #7 only.", "- Says user msg 8.", "1. Numbered and loose"]
     assert rs.bare("Never merge. (user msg #3) and (origin: Brief), user messages #5, #6") == "Never merge. and,"
+    # the short form coordinators write, "user #N" with "/#M" or "and #M" runs and a date in the parentheses
+    for item in ("- (user #335, 2026-10-14) Pause the optimisation.", "- Hold per user #394/#395 until told.",
+                 "- Keep it, user's #10 and #11.", "- Ask first (user msgs #12, #13)."):
+        assert rs.sourced(item) and rs.partition(item) == (item, ""), item
+    assert rs.bare("(user #335, 2026-10-14 16:29 PDT) Pause the optimisation.") == " Pause the optimisation."
+    assert rs.bare("Hold per user #394/#395 until told.") == "Hold per until told."
+    assert rs.bare("Keep it, user's #10 and #11.") == "Keep it,."
+    assert rs.bare("Keep (user #2, never merge) here.") == "Keep (, never merge) here."   # only a date goes with it
+    for loose in ("- Mentions msg #7 only.", "- Says user msg 8.", "- Says user 8.", "- See #9."):
+        assert not rs.sourced(loose), loose
 
 
 def test_an_approval_matches_its_text_with_or_without_the_source_cite(env):

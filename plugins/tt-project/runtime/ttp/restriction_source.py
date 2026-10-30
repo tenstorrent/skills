@@ -3,7 +3,7 @@
 """Where a charter Restrictions item came from, and whether it binds.
 
 The rule, one line per item (a bullet with its continuation lines, or a paragraph):
-- sourced: its text cites a user message id ("user msg #12", "user messages #3, #4") or carries an
+- sourced: its text cites a user message id ("user msg #12", "user messages #3, #4", "user #5/#6") or carries an
   origin marker, "(origin: Brief)" or "(origin: harness gate)". The Brief is the user's own words and
   is never a Restrictions section, so everything in it is sourced by definition.
 - unsourced: anything else. It is advisory: workers are not told to obey it, and the coordinator
@@ -21,11 +21,12 @@ import re
 
 from . import relay
 
-CITE_RE = re.compile(r"\buser(?:['’]s)?\s+(?:msgs?|messages?)\s+#\d+", re.I)
+CITE_RE = re.compile(r"\buser(?:['’]s)?\s+(?:(?:msgs?|messages?)\s+)?#\d+", re.I)
 ORIGINS = {"brief": "(origin: Brief)", "gate": "(origin: harness gate)"}
 ORIGIN_RE = re.compile(r"\(origin:\s*(?:brief|harness gate)\)", re.I)
-_CITE_RUN = CITE_RE.pattern + r"(?:\s*(?:,|and|&)\s*#\d+)*"
-_CITES_RE = re.compile(r"\(\s*" + _CITE_RUN + r"\s*\)|" + _CITE_RUN + "|" + ORIGIN_RE.pattern, re.I)
+_CITE_RUN = CITE_RE.pattern + r"(?:\s*(?:,|/|and|&)\s*#\d+)*"
+_CITE_DATE = r"(?:\s*,\s*\d{4}-\d{2}-\d{2}[^()\n]*)?"   # "(user #335, 2026-10-14 16:29 PDT)"
+_CITES_RE = re.compile(r"\(\s*" + _CITE_RUN + _CITE_DATE + r"\s*\)|" + _CITE_RUN + "|" + ORIGIN_RE.pattern, re.I)
 _BARE_RE = re.compile(r"[ \t]*(?:" + _CITES_RE.pattern + ")", re.I)
 ADVISORY_HEAD = "Unsourced restrictions (advisory): drop them yourself"
 _BULLET_RE = re.compile(r"\s*(?:[-*+]|\d+[.)])\s+")
