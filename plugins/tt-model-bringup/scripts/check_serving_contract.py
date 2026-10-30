@@ -91,13 +91,23 @@ def check_contract(data: Any, model_dir: Path) -> list[str]:
     return problems
 
 
+def looks_like_path(value: str) -> bool:
+    return bool(value) and not re.search(r"\s", value) and all(len(part.encode()) < 256 for part in value.split("/"))
+
+
 def missing_evidence(data: Any, model_dir: Path) -> list[str]:
     advisories = []
     for row in data.get("rows") or []:
         if not isinstance(row, dict) or row.get("status") != "supported":
             continue
         evidence = text(row.get("evidence"))
-        if evidence and not (model_dir / evidence).exists():
+        if not evidence:
+            continue
+        if not looks_like_path(evidence):
+            advisories.append(
+                f"rows ({text(row.get('item'))}): evidence is prose, not an artifact path; put the path in evidence and the prose in notes"
+            )
+        elif not (model_dir / evidence).exists():
             advisories.append(f"rows ({text(row.get('item'))}): evidence {evidence} does not exist under {model_dir}")
     return advisories
 

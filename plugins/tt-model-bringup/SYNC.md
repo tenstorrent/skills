@@ -180,3 +180,14 @@ comparison and kernels that ignore a fidelity field, the mid-stage timing-regime
 stop rule in device usage, the Claude Code form of `TT_AUTODEBUG_ROOT`, the DRAM-sharded reader limit,
 and `--build-kwargs` / `--build-kwargs-file` on the four generator-level readiness runners
 (`readiness_check/build_kwargs.py`, authored in this plugin).
+
+The stage 9 pass of that trial added: the revision-dependent plugin registration mechanisms with
+verification in every engine subprocess, the hand-run sampling suite on a plugin layout the runner
+rejects, warmup over the served KV cache because paged-attention program keys include its shape,
+offset-independent continuation programs and the context-end bound as Stage 9 requirements, the
+`--async-scheduling` flag and the device-mirrored position rule with a served greedy-determinism check,
+the `tt_supported_decode_batch_sizes` key, the bounded kill of an orphaned engine subprocess, a decode
+replay at the end of every tracked workload, the admission-pattern evidence for seeded mixed-batch
+sampling failures, and a same-length generator control for the served qualitative verdict.
+`check_serving_contract.py` reports prose in an `evidence` field as advisory instead of failing on a
+path longer than the filesystem allows.

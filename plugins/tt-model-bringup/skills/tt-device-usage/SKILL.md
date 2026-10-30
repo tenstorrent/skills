@@ -80,7 +80,7 @@ Do not mark a model stage blocked because a board briefly became undiscoverable.
 
 ## Hangs And tt-triage
 
-Every device job runs under a `timeout` (Basic Rules), so a hung job is left to that timeout; never SIGTERM it yourself. When the hang is reproducible or its evidence is wanted, attach tt-triage before the timeout fires: triage reads the device without ending the job. After the timeout ends the job, run a trivial op on that chip before the next job; if it does not complete, stop device work on the chip and report it for the operator reset.
+Every device job runs under a `timeout` (Basic Rules), so a hung job is left to that timeout; never SIGTERM it yourself. When the hang is reproducible or its evidence is wanted, attach tt-triage before the timeout fires: triage reads the device without ending the job. After the timeout ends the job, run a trivial op on that chip before the next job; if it does not complete, stop device work on the chip and report it for the operator reset. An engine subprocess of the agent's own server that is orphaned by a crash inside trace capture has no timeout and may spin forever in mesh shutdown; after a bounded wait (20 minutes with no log progress) the agent may kill that process, then verifies the chip with a trivial op.
 
 Prefer the LLM-readable report:
 

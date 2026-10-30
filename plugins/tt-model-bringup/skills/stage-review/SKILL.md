@@ -197,7 +197,10 @@ For generation or serving stages, also inspect:
   repetition, wrong language, truncation, prompt echo, cross-request leakage,
   odd leading text, or degraded coherence;
 - sampling tests and skipped/xfailed cases, separating expected framework limits
-  from correctness failures.
+  from correctness failures; seeded mixed-batch tests can fail from the plugin's
+  per-step host/device sampler routing alone (a seeded request draws on the device
+  in one step and on the host in the next), and the decisive evidence is a comparison
+  of the admission pattern in the server log between a passing and a failing run.
 - context-length evidence: `doc/context_contract.json`, served `max_model_len`,
   eval/benchmark context settings, and any cap or truncation introduced by the
   stage.

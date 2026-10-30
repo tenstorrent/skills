@@ -30,7 +30,8 @@ A model that satisfies these serves prefix-cache hits, chunked continuations, an
 6. Use the current host page-table snapshot on every call. Invalidate it when the device table is swapped or changed in place. Update device tables in place so decode traces stay valid.
 7. Keep cache rows in execution-row order. For a model without recurrent state, `empty_slots` are not cache row ids.
 8. Return one last-token output per row, in row order, taken at `logical_len - 1`. The runner host-samples intermediate chunks.
-9. Accept any start position. Cache hits are block-aligned; chunking and resume are not.
+9. Accept any start position. Cache hits are block-aligned; chunking and resume are not. When the continuation window is rounded to a bucket, keep `physical_start + compute_len <= max_model_len`; shift the window start down rather than overshoot the context end.
+11. Keep continuation programs independent of the start offset. A program keyed on `start_pos` (a `ttnn.slice` at the offset, a chunk-local page-table slice, a per-offset fill view) compiles on the first prefix-cache hit after warmup, releases the decode traces, and fails the Stage 9 allocation gate; the program-key rules under [batched prefill](#batched-prefill) apply to the single-row continuation path from Stage 9 on, not only to batching.
 10. For exact output after preemption, declare `supports_original_prompt_lens` if the pinned plugin documents it and replay already-generated tokens through decode instead of prefill.
 
 Declare `model_capabilities["supports_prefix_caching"] = True` only after the tests below pass. Declare no other capability key for prefix caching unless the pinned plugin documents it.
@@ -144,7 +145,7 @@ Run the stage once with batched prefill disabled through the environment overrid
 
 Single-user unchanged: the primary 128/128/1 TTFT p50 and TPOT mean stay within 5 percent of the pre-change `vllm_benchmark.json`, and the mixed-shape trace reuse check shows zero recaptures after warmup with the batched path active.
 
-Stage split: Stage 6 proves the multi-row contract (one call with mixed rows equals the solo result per row); Stage 7 keeps it and calibrates bucket sizes without implementing the batched path. Stage 9 measures the burst on whatever prefill path exists and records it; when prefill is still one row at a time, that measurement is the serial reference and the ratio gate is advisory. Stage 10 implements batched prefill, produces the batched-equals-solo evidence, and must meet the ratio gate.
+Stage split: Stage 6 proves the multi-row contract (one call with mixed rows equals the solo result per row); Stage 7 keeps it and calibrates bucket sizes without implementing the batched path. Stage 9 measures the burst on whatever prefill path exists and records it; when prefill is still one row at a time, that measurement is the serial reference and the ratio gate is advisory. Offset-independent continuation programs (invariant 11) are a Stage 9 requirement because the allocation gate runs there. Stage 10 implements batched prefill, produces the batched-equals-solo evidence, and must meet the ratio gate.
 
 ## Gate
 

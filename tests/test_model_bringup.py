@@ -238,6 +238,21 @@ def test_gates_fail_critical_for_malformed_serving_contract(installed, stage, fi
     assert f'{field} must be one of' in result.stderr
 
 
+def test_serving_contract_prose_evidence_is_advisory_not_a_crash(installed):
+    plugin, target, env = installed
+    model = target / 'models/autoports/org_model'
+    (model / 'doc/full_model').mkdir(parents=True)
+    contract = valid_serving_contract()
+    contract['rows'][0]['evidence'] = ' '.join(['verified by the served sampling suite and the logprob comparison'] * 5)
+    assert len(contract['rows'][0]['evidence'].encode()) > 300
+    (model / 'doc/full_model/serving_contract.json').write_text(json.dumps(contract))
+    result = run(sys.executable, str(plugin / 'scripts/check_serving_contract.py'),
+                 '--model-dir', str(model), '--require-contract', cwd=target, env=env)
+    assert result.returncode == 1, result.stderr + result.stdout
+    assert 'evidence is prose, not an artifact path' in result.stderr
+    assert 'Traceback' not in result.stderr
+
+
 def test_standalone_tti_checker_resolves_package_and_rejects_stock_evidence(installed):
     plugin, target, env = installed
     assert (plugin / 'skills/tti-release/SKILL.md').is_file()

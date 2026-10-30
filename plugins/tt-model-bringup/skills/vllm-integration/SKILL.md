@@ -38,6 +38,8 @@ Load `models/autoports/<model>/doc/context_contract.json` and serve the recorded
 
 Serving requests may have any valid prompt length up to that supported context. The adapter must not require prompt length to be divisible by an internal prefill chunk, tile, block, page, or trace size. If the model path pads or chunks internally, the adapter passes the logical prompt length through to masks, positions, cache fill, and output slicing. Include a direct OpenAI-compatible request or targeted runner check with a valid non-aligned prompt length, not only the default 128-token benchmark.
 
+The plugin also reads the adapter's `tt_supported_decode_batch_sizes` (the captured decode buckets); without it every decode step is padded to `max_num_seqs`. Declare the prepared buckets there and document the key in the serving contract.
+
 Preserve larger-batch serving capability. The headline performance target is still batch-1 single-user latency, but the adapter must not assume `max_num_seqs=1` or batch size 1 in cache allocation, page tables, scheduler inputs, sampling, async decode, or output formatting. Test serving up to 32 concurrent sequences when the target hardware, memory, and harness allow it. If 32 cannot run, record the largest tested value and the hard physical limit.
 
 ## Serving dependency
@@ -73,13 +75,20 @@ Not every cache must be vLLM-owned. vLLM owns the attention KV cache, but recurr
 
 Make prompt lengths, page tables, decode positions, batch dimensions, trace-side state, and on-device sampling explicit. The serving decode pass must drive the generator's traced decode path, not an eager-only fallback. When adding or debugging trace capture/replay, trace-safe inputs, or replay correctness for this adapter, use `$tt-enable-tracing`. Before accepting the adapter, run representative repeated serving replay with `TT_METAL_TRACE_ALLOC_TRACKING=1` set in the server/worker environment before TTNN is imported. Alternate the trace keys and request patterns that share persistent inputs/outputs, and resolve every unsafe allocation under the target tt-metal checkout's `tech_reports/AdvancedPerformanceOptimizationsForModels/TraceCorrectness.md`. The adapter should not duplicate model logic that already lives in `tt/model.py` or `tt/generator.py`.
 
-Use the generator-owned two-phase warmup and trace lifetime rule from `$tt-enable-tracing`. vLLM callbacks must not be the only entrypoint that enforces warmup. Run the [mixed-shape trace reuse check](#mixed-shape-trace-reuse-check) on the same server.
+Use the generator-owned two-phase warmup and trace lifetime rule from `$tt-enable-tracing`. vLLM callbacks must not be the only entrypoint that enforces warmup. Paged-attention program keys include the KV-cache tensor shape, so in vLLM mode warmup and capture run over the served cache allocation, not over a generator-owned or test-sized pool; a generator that warms on its own pool and captures on the vLLM cache compiles inside the first capture. Run the [mixed-shape trace reuse check](#mixed-shape-trace-reuse-check) on the same server.
 
 For decode performance, implement the vLLM async split before advertising it: `decode_forward(..., read_from_device=False)` should return device tensors, `read_decode_output(..., async_read=True)` should perform the minimal deferred read, and `process_decode_output_host(...)` should do host formatting. Only set `supports_async_decode=True` after this path passes the vLLM plugin's expectations with decode trace enabled and stale-token/current-position tests passing.
 When async decode, on-device sampling and tracing are enabled, vLLM may submit step
 N+1 before sampled token N reaches host scheduler state. Reuse the device token and
 position state for steady decode; advance it exactly once per emitted token. Account
-for transitions between the model's traces.
+for transitions between the model's traces. On a steady step the plugin's `start_pos`
+argument can lag the device position by one, so any adapter state derived from position
+(page-table redirects, position-dependent tables) comes from device-owned or
+generator-mirrored positions; treat the argument as advisory. The plugin overlaps decode
+only when vLLM runs with `--async-scheduling`; the packaged runner does not pass it, so
+add it through `--additional-server-args` and record it, or the declared async split is
+never exercised. Prove the overlapped path with a served greedy-determinism check: the
+same prompt repeated under concurrent load returns identical tokens on every run.
 
 `reset_batch=False` does **not** prove the page table is unchanged. Inspect the pinned
 standalone plugin's state updates and decode-reload contract; behavior depends on that
@@ -209,6 +218,8 @@ python -m readiness_check.run_vllm_server \
   --server-url http://localhost:8000 \
   --model-dir ... --hf-model ...
 ```
+
+The `sampling` stage, like `serve`, rejects a plugin source layout the runner does not accept (a bundled or nested plugin checkout), even against an external server. On such a layout, run the plugin's sampling suite by hand with the runner's exact pytest command, record that command in the work log, and place the result file where the gate expects it; attach the other stages with `--server-url` and `--server-log`.
 
 The runner enforces on-device sampling (`sample_on_device_mode: all` in the TT plugin config). The full-model stage must already provide traced token-out split sampling. If it does not, return to `$full-model`; this stage should only adapt that contract to vLLM.
 

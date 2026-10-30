@@ -93,7 +93,7 @@ Warmup must cover the whole generator, not only the trace about to be captured. 
 
 The generator owns this ordering for standalone and serving entrypoints, during explicit setup or coordinated first use; do not depend solely on vLLM warmup callbacks. Repeated setup calls should reuse prepared state. Restore request/KV state and sampling RNG state modified by warmup; a late decode compile pass with mock inputs must not overwrite a real request's prefilled cache.
 
-- Warm with the same shapes, dtypes, layouts, memory configs, and mode as capture; the warm call must drive the identical op sequence and code path so every op variant is compiled.
+- Warm with the same shapes, dtypes, layouts, memory configs, and mode as capture; the warm call must drive the identical op sequence and code path so every op variant is compiled. Paged-attention and cache-fill program keys include the KV-cache tensor shape, so under vLLM warm over the served cache allocation, not a test-sized pool.
 - The signature can include arguments you would not expect. For example, the integer `begins`/`ends`/`step` passed to `ttnn.slice` are compile-time constants baked into the program hash, so slicing at a different offset, length, or start-tile alignment is a different program that needs its own warm-up. Tensor-valued arguments can avoid this only where the op supports them. When in doubt, warm with the same argument *values*, not just the same tensor shapes.
 - Warm state-update ops too. Autoregressive helpers such as `ttnn.plus_one`, page/position tensor updates, sampler trace setup, and persistent-output buffer allocation are easy to forget because they are not "the model", but they still compile programs and allocate resources.
 - If warm-up mutates persistent trace inputs such as token, position, RoPE index, page table, or KV-cache state, reset those tensors to the exact intended capture state immediately before `begin_trace_capture`.
@@ -185,7 +185,7 @@ Before accepting a new or changed traced path, run its representative repeated-r
 TT_METAL_TRACE_ALLOC_TRACKING=1 TT_METAL_TRACE_ALLOC_SKIP_PROGRAM_CACHE=0 python your_replay_test.py
 ```
 
-The tracker is disabled by default and reads configuration once at startup. It validates live unsafe allocations automatically before `ttnn.execute_trace`; surviving unsafe buffers raise `RuntimeError`. For serving, set the environment in the server/worker processes before startup, not only in the client sending requests.
+The tracker is disabled by default and reads configuration once at startup. It validates live unsafe allocations automatically before `ttnn.execute_trace`; surviving unsafe buffers raise `RuntimeError`. Nothing is checked after the last replay, so end every tracked workload with a decode replay (or read `num_program_cache_entries()` after each prefill); a request that compiles a program after capture and ends without a replay passes silently. For serving, set the environment in the server/worker processes before startup, not only in the client sending requests.
 
 Exercise every trace variant and the real replay ordering, including alternating traces that share persistent inputs or outputs. Keep program-cache allocations in the acceptance check. `TT_METAL_TRACE_ALLOC_SKIP_PROGRAM_CACHE=1` is only a diagnostic noise filter; a run that needs it is not passing evidence because late program compilation remains unsafe. When investigating a failure, add `TT_METAL_TRACE_ALLOC_TRACEBACKS=1` and, if needed, set `TT_METAL_TRACE_ALLOC_REFERRER_DEPTH`.
 
