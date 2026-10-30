@@ -1,6 +1,6 @@
 ---
 name: stage-review
-description: Independently review a TTNN model bringup stage before it is allowed to pass. Use when a stage is complete or near-complete and Codex needs a fresh xhigh subagent to compare the stage output against the original goal contract, skill requirements, logs, generated model outputs, checks, benchmarks, and code artifacts; identify bugs, oddities, contradictions, weak dismissals, or suspicious behavior that hard-edged stage gates missed; and return a clean-pass or more-work-needed verdict.
+description: Independently review a TTNN model bringup stage before it is allowed to pass. Use when a stage is complete or near-complete and Codex needs a fresh subagent to compare the stage output against the original goal contract, skill requirements, logs, generated model outputs, checks, benchmarks, and code artifacts; identify bugs, oddities, contradictions, weak dismissals, or suspicious behavior that hard-edged stage gates missed; and return a clean-pass or more-work-needed verdict.
 ---
 
 # Stage Review
@@ -41,7 +41,7 @@ which stage or goal contract applies from a broad experiment folder.
 ## Invocation Modes
 
 Main-agent mode: when you are the stage owner or orchestrator, spawn a fresh
-xhigh subagent for the review. Do not fork the current context unless the only
+subagent for the review, at your own reasoning effort. Do not fork the current context unless the only
 way to pass essential stage context is through the thread. Prefer passing raw
 paths and a compact stage contract over passing your conclusions.
 

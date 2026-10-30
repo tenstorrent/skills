@@ -225,7 +225,7 @@
       "destination": "skills/stage-review/SKILL.md",
       "blob": "7c89b9d281aa1a853a273d3ff4b1c16ad8ccac0d",
       "source_sha256": "b84c344e6a2c0130569dc7e4147ad748d44aa04afa11f181b0711d00afbe3466",
-      "packaged_sha256": "ee2510e2e726adfe9840614a6e938db3c7e37fb042992064b860454053bc3f35"
+      "packaged_sha256": "f0c171713910774a9091d8ee3abe76ededb1c5e810fc0a7ac93502ccfd276fc9"
     },
     {
       "source": ".agents/skills/stage-review/agents/openai.yaml",
