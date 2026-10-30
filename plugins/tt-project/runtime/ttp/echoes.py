@@ -92,6 +92,8 @@ _VERSIONED = re.compile(r"[\w.]*[-@]v?\d+(?:\.\d+)+(?:[-+][\w.]+)?")
 # Words that only say a version or build is in use ('running 0.2.646'): no rule beside a weak token.
 _STATE = {"running", "runs", "using", "uses", "version", "versions", "release", "build", "installed", "deployed",
           "currently"}
+# A state word glued to its version (no space before it) reads as the spaced form; no other word is split.
+_STATE_GLUED = re.compile(r"\b(" + "|".join(sorted(_STATE, key=len, reverse=True)) + r")(v?\d+(?:\.\d+)+)\b", re.I)
 _EVIDENCE = re.compile(r"(?:#\d+|[0-9a-f]*\d[0-9a-f]*|(?:msgs?|tasks?|runs?|notes?|pr|issue)\s*#?\d+|https?:\S*)")
 _NEGATION = re.compile(r"\b(?:not|never|no longer|instead of|rather than|isn't|aren't|wasn't|weren't|retires)\s*$")
 
@@ -133,7 +135,7 @@ def _weak(ph: str) -> bool:
     """Whether phrase `ph` names no rule alone: each of its words of 4+ characters (all of them when none
     is) is a file name, path, version, hash, number or evidence reference ('msg #12', a commit), or, beside
     at least one such, a word that only says it is in use (_STATE: 'running 0.2.646')."""
-    s = ph.strip("`'\" ")
+    s = _STATE_GLUED.sub(r"\1 \2", ph.strip("`'\" "))
     for pair in re.findall(r"(?:msgs?|tasks?|runs?|notes?|pr|issue)\s+#?\d+", s):   # 'msg #12' is one reference
         s = s.replace(pair, pair.replace(" ", ""))
     words = s.split()

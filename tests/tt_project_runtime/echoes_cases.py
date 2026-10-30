@@ -575,3 +575,23 @@ def test_a_quoted_version_or_running_state_observation_is_advisory_and_a_version
         by.setdefault(h["phrase"], set()).add(h["class"])
     assert by == {"running 0.2.646": {"advisory"},
                   "require tool version >= 0.2.640 before each run": {"directive"}}, by
+
+
+@pytest.mark.parametrize("ver", ["running 0.2.646", "running0.2.646"])
+def test_a_running_version_observation_is_advisory_spaced_or_compact(env, ver):
+    # Upstream note bbe8bc7fb8a8c13f: the same observation with the version glued to the state word
+    # ('running0.2.646') grades like the spaced form; a word that is no state word stays strong.
+    from ttp import coordinator as coord, echoes
+    p = make(env)
+    obs = p.add_memory(f"Observed `{ver}`.", kind="fact")
+    assert coord.apply(p, [{"type": "memory_forget", "name": obs.stem, "why": "user msg #9 withdrew it"}]) == []
+    prompt = p.harness / "prompts" / "kind-review.md"
+    prompt.write_text(prompt.read_text() + f"\nEvidence pointer: {ver}\n")
+    by = {}
+    for h in echoes.scan(p):
+        by.setdefault(h["phrase"], set()).add(h["class"])
+    assert by and set().union(*by.values()) == {"advisory"}, by
+    assert all(m["action"] == "none" for m in echoes.export(p)["matches"])
+    assert echoes._weak("running0.2.646") and echoes._weak("using v1.2")
+    assert not any(echoes._weak(x) for x in ("abc1.2.3", "ratio1.5", "python3.11", "jev.threshold=0.8",
+                                             "max_ratio_1.5", "running"))
