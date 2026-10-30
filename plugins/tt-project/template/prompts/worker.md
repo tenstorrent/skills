@@ -172,6 +172,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`
 ```
 
 - `done` only with evidence: tests run, numbers measured, files produced.
+  A hash-pinned manifest names only immutable artifacts and receipts, never a mutable queue, outbox or log.
 <!-- ttp:if cells -->
   A cell that ran without a valid result is not finished: the daemon marks a done that leaves
   requested cells out `partial:` (or `cells unreported:` without `cells`). `cells` may also be

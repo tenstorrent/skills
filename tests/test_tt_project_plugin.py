@@ -1080,12 +1080,23 @@ def test_code_and_review_prompts_keep_full_suite_runs_to_ttp_checks():
                  "never rerun the full suite by hand"):
         assert part in review, part
     review = " ".join((prompts / "kind-review.md").read_text(encoding="utf-8").split())
-    for part in ("never list one as a required member by its hash",
-                 "Queued locally, recorded by the recipient system, and delivered or acknowledged by it",
-                 "no reconstructed bytes"):
+    for part in ("changed or went missing because it was mutable", "is a manifest defect, not a work failure",
+                 "Queued is not delivered", "references/evidence-manifests.md"):
         assert part in review, part
     coordinator = " ".join((prompts / "coordinator.md").read_text(encoding="utf-8").split())
     assert "a mutable queue, outbox or growing log" in coordinator
+    worker = " ".join((prompts / "worker.md").read_text(encoding="utf-8").split())
+    assert ("A hash-pinned manifest names only immutable artifacts and receipts, "
+            "never a mutable queue, outbox or log.") in worker
+    skill = PLUGIN / "skills" / "tt-project-harness"
+    assert "(references/evidence-manifests.md)" in (skill / "SKILL.md").read_text(encoding="utf-8")
+    ref = " ".join((skill / "references" / "evidence-manifests.md").read_text(encoding="utf-8").split())
+    for part in ("Operational queues, outboxes, acknowledgement queues and growing logs are mutable",
+                 "never lists one as a required member by its hash", "command and its stdout receipts",
+                 "explicitly labelled byte-for-byte snapshot with its provenance",
+                 "Queued locally, recorded by the recipient system, and delivered or acknowledged by it are three distinct facts",
+                 "no transport retry, no new capability owner, no reconstructed bytes and no new acknowledgement action"):
+        assert part in ref, part
 
 
 def test_the_coordinator_defers_on_a_landing_with_landed_id_not_a_raw_sha():

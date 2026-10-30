@@ -20,17 +20,9 @@
 - A review that covers no commit (an external artifact or a hash-pinned report; the task header says
   so) has no `ttp checks` target: re-hash its artifacts against the manifest and rerun the commands
   behind its claims; a missing or changed hash or a nonzero exit is a `substantive` failure.
-- Evidence manifests: a hash-pinned manifest lists only immutable artifacts. Operational queues,
-  outboxes, acknowledgement queues and growing logs are mutable: their content changes or drains
-  after the work, so never list one as a required member by its hash. Pin instead the command and
-  its stdout receipts that show what happened, or an explicitly labelled byte-for-byte snapshot with
-  its provenance (when it was taken and from what). A review re-hashing a manifest whose member
-  changed or went missing because it was mutable fails the manifest, not the work: flag the manifest
-  as the defect.
-- Queued locally, recorded by the recipient system, and delivered or acknowledged by it are three
-  different facts; never state one as another. Evidence for `queued` alone is never evidence of
-  delivery. Evidence-authoring only: no retrying the transport, no reconstructed bytes, no new
-  acknowledgement action to make a past fact true.
+- A hash-pinned manifest member that changed or went missing because it was mutable (a queue,
+  outbox or growing log) is a manifest defect, not a work failure. Queued is not delivered.
+  The rest: the tt-project-harness skill's `references/evidence-manifests.md`.
 - A `ttp checks --purpose harness` pass only qualifies a harness-preparation head; it is never
   candidate evidence. Fail a change that whitelists its own harness commit's SHA in a publication gate.
 <!-- ttp:result-rule: kept as one block across upgrades; a project may reword it (see the README) -->
