@@ -201,3 +201,18 @@ watcher probe over every prepared batched shape, commit hooks before the first d
 commit, and `--output-dir` on the vLLM runner (`run_vllm_server.py`) so a tracked or A/B run does
 not overwrite the gate's `readiness_vllm/` artifacts.
 
+## Stack freshness at startup (0.1.22)
+
+The skills told agents to resolve current dependency versions for a new run but enforced nothing:
+a bringup could start from a month-old tt-metal branch, a TT vLLM plugin checkout 65 commits
+behind its default branch, a `transformers` release the checkpoint config rejects, or a stale
+installed copy of this plugin, and no gate noticed. `scripts/check_stack_freshness.py` is authored
+in this plugin. In `resolve` mode it fetches the tt-metal and plugin default branches, reads the
+checkpoint's `transformers_version` and the published plugin version, writes `doc/stack_pins.json`,
+and is critical for a new run on any stale part (advisory on `--resume`). In `verify` mode the new
+stage 1 gate and the stage 9 gate confirm the record exists, the checkout still descends from its
+pin, and the serving contract's plugin commit equals the pinned one. The model-bringup skill's
+"Stack freshness" section states the rule; `serving-stack.md` moves the plugin pin to startup.
+
+Only packaged hashes for one edited stage prompt and one edited check script change in
+`sync-source.json`; the original import provenance stays intact.

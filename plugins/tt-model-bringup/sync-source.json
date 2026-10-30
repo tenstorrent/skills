@@ -8,7 +8,7 @@
       "destination": "prompts/model_bringup_multigoal/01-functional-decoder.txt",
       "blob": "960d0a474d572dd7f169938da171311438342295",
       "source_sha256": "afe16e47125b9615fca258965d44c52e7844a0c5e99f31183eb53147aa50d7c8",
-      "packaged_sha256": "6b689bd4653658c7a3d5f987460a86cad5a4be1dcc63058a4fbef946834896b9"
+      "packaged_sha256": "833eda58faf71e5ea68d3766c19aae3ab8334c1330b07bfb6e8391f7a1cb0f07"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/02-fused-decoder.txt",
@@ -78,7 +78,7 @@
       "destination": "prompts/model_bringup_multigoal/09-vllm.check.sh",
       "blob": "54873057b0cd77d369de89e8732a5f7bf6810027",
       "source_sha256": "e5860d4f3d9a3f5076062814db09b403ad7de9d0bef6d8aeec02325bccb626ba",
-      "packaged_sha256": "a098cefdfd7fa4dc0d363bbb1f20ba545ea9c95e4a7bed4b0573631abb962c49"
+      "packaged_sha256": "36b41853b1409e34f43012501dd4787a2c027824018e8613250c6c53a0682a8a"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/09-vllm.txt",
