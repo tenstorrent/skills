@@ -127,7 +127,7 @@
       "destination": "skills/datatype-sweep/SKILL.md",
       "blob": "457749253d5a2a220e7545c02f4e433cc984af12",
       "source_sha256": "25b874a7b6cf277e4e11d28c06c84056790b4ff61064defb24216ec1844d5764",
-      "packaged_sha256": "62f74066678959b04bc38e8f61bd4d1dd4515dfaca7b3bb0b54ca44fd410ede5"
+      "packaged_sha256": "2c929b602d850d87cd0236a9717db6f06915ecc58023822a598ddfe262728e39"
     },
     {
       "source": ".agents/skills/datatype-sweep/agents/openai.yaml",
@@ -141,7 +141,7 @@
       "destination": "skills/full-model/SKILL.md",
       "blob": "de994d5552a74b4f1cdcaf64f6ba364178b8d5a4",
       "source_sha256": "0618a7bd6ee01f995cb98dd73a9b2c46d8fd3daab9fcecdafde67501c529d2f8",
-      "packaged_sha256": "98e35f77020ea016ac2c75c5c56cc61d58d3d4f49a4b781de8d650f9a2e38d7e"
+      "packaged_sha256": "76268571ba42b51c5038196ea7045ef5d9d5c4dd129a5b4526252bcd1dfb7698"
     },
     {
       "source": ".agents/skills/full-model/agents/openai.yaml",
@@ -197,7 +197,7 @@
       "destination": "skills/optimize/SKILL.md",
       "blob": "280abb027d839f1f076ab8a524fc6f61ed6df587",
       "source_sha256": "c4b4015ed198c305ed19f73c2ef6a539923212457588319767d08489a5331c8b",
-      "packaged_sha256": "ffb1bced88d425899e739776a81d8274bd46d084758334db8f82988386a47c94"
+      "packaged_sha256": "29c3309c48366f7e409fa9a920e27147ed82a13530f8c0d66cde1f8423c7ca09"
     },
     {
       "source": ".agents/skills/optimize/agents/openai.yaml",
@@ -211,7 +211,7 @@
       "destination": "skills/qualitative-check/SKILL.md",
       "blob": "47623b7658024f8cd40cd47a589dce9572bc74a3",
       "source_sha256": "e4dbff5cff348b0c04b43221a94ea4ca7e88cba2f328b440dc03ea9cc0713788",
-      "packaged_sha256": "6f27a0bd135fb05760f038160f9bee39f68d14d0c22ec0ad8a6add3b531e4fed"
+      "packaged_sha256": "697522473e0774df9647d57a99bc729a6f29c13438e10c1aebb90946bd94e9f5"
     },
     {
       "source": ".agents/skills/qualitative-check/agents/openai.yaml",
@@ -239,7 +239,7 @@
       "destination": "skills/tt-device-usage/SKILL.md",
       "blob": "273f20c58cbd80640677004635e43ce47d759891",
       "source_sha256": "b32b5685e47932e1356762c96f70f2ee5cc226ce23d5e1781f9a6bfe26a66502",
-      "packaged_sha256": "099ea6497f3efd5047c29b7b4346d4cd7b20bd607a563f261522bd6106fe998b"
+      "packaged_sha256": "95d7c8ab0c8ad68eb20fde982c296a40e4f34a11a3e421532a0e6994d0d50ccd"
     },
     {
       "source": ".agents/skills/tt-device-usage/agents/openai.yaml",

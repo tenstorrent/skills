@@ -66,7 +66,7 @@ Teacher-forcing decode performance is valid only when the measured path uses tra
 Use this coarse search first. It usually finds most of the available win with a small number of full-model runs.
 
 1. Evaluate the closest canonical performance and accuracy policies, if any.
-2. Try BFP8 KV cache as a yes/no switch.
+2. Try BFP8 KV cache as a yes/no switch. Any candidate that changes the KV-cache dtype must also pass the short-prefix case (about 32 cached tokens) and the batch-32 same-input per-user comparison at the full-model bar; a long-prompt layer PCC pass does not cover them (a BFP8 cache passed 1024-token layer PCC and failed 0.995 per user on a short prefix).
 3. Try BFP8 CCL or residual-transfer activations as a yes/no switch.
 4. Try BFP4 for eligible MLP/expert matmul groups, excluding the first and last layer by default unless the canonical policy says otherwise.
 5. If full-model accuracy fails, restore the highest-risk groups first until top-1 and top-5 pass.

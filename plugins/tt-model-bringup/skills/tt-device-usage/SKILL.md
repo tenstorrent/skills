@@ -79,7 +79,7 @@ Do not mark a model stage blocked because a board briefly became undiscoverable.
 
 ## Hangs And tt-triage
 
-If a device job appears hung, collect triage evidence before killing it unless the machine is already unreachable or triage itself hangs.
+Every device job runs under a `timeout` (Basic Rules), so a hung job is left to that timeout; never SIGTERM it yourself. When the hang is reproducible or its evidence is wanted, attach tt-triage before the timeout fires: triage reads the device without ending the job. After the timeout ends the job, run a trivial op on that chip before the next job; if it does not complete, stop device work on the chip and report it for the operator reset.
 
 Prefer the LLM-readable report:
 

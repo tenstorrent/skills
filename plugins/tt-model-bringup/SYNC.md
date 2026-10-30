@@ -163,3 +163,11 @@ pass under lowered thresholds as advisory, the serving-contract gate reports a m
 as advisory, the stage 9 gate runs the prefill-feature check after a serving-contract advisory,
 `generate.py` accepts the transformers 5 chat-template return type, and the readiness mesh open takes
 `READINESS_TRACE_REGION_SIZE`.
+
+The stage 7 pass of that trial added: one stage split for batched prefill across the optimize skill and
+the prefill-features reference (stage 6 proves the multi-row contract, stage 10 implements batching), the
+DRAM-sharded matmul named as decode-only, the TopK routing rule read from the op source before padding,
+the reduced-variant derivation of `decode_ms_per_token_device`, kernel selection by row count as a
+resume-check failure cause, the timeout-first hang rule, HF-control reuse, the short-prefix and batch-32
+cases for a cache-dtype candidate, and `run_prefill_resume_check --output-on-pass-only` with commit and
+visible-device provenance in its record.
