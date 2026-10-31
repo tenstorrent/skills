@@ -4754,6 +4754,52 @@ def test_a_dependency_cycle_is_rejected_at_creation_and_an_existing_one_is_flagg
                              4: {"depends_on": "[4]"}, 5: {"depends_on": "[1]"}}) == [[1, 2, 3], [4]]
 
 
+def test_a_planned_start_after_raises_no_time_only_hold_until_it_is_re_armed_or_overdue(env):
+    p = make(env)
+    from ttp import holdloops
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    now = time.time()
+    lim = holdloops.anchors.hold_max_h(p.config()) * 3600
+
+    def defer(title, at):
+        return p.db.add_task(title, "s", origin="user", not_before=at,
+                             labels=[f"start_after:{at:.0f}", f"deferred_since:{now:.0f}"])
+    # Planned once: a reviewed one and one deferred past hold_max_h raise nothing.
+    planned = defer("cut the release tomorrow", now + 20 * 3600)
+    reviewed = defer("measure it next week", now + 7 * 86400)
+    rev = p.db.add_task("review it", "s", kind="review", origin="user", depends_on=[reviewed])
+    p.db.update_task(rev, status="done")
+    rearm = defer("check it later", now + 5 * 3600)
+    late = defer("start at the planned time", now + 600)
+    # A blocked until: hold keeps today's rule (raised once held past hold_max_h).
+    held = p.db.add_task("held on a time", "s", origin="user")
+    p.db.update_task(held, status="blocked", labels=[f"waits:until:{now + 30 * 86400:.0f}"])
+    d._raise_hold_loops(now)
+    d._raise_hold_loops(now + 60)
+    assert not _loop_events(p, "time_only_hold")
+    # Its start_after passed and it still did not start: raised once it is OVERDUE_S late, not before.
+    at = now + 600
+    d._raise_hold_loops(at + holdloops.OVERDUE_S - 60)
+    assert not _loop_events(p, "time_only_hold")
+    for i in range(2):
+        d._raise_hold_loops(at + holdloops.OVERDUE_S + 60 + i)
+    evs = _loop_events(p, "time_only_hold")
+    assert [e["task"] for e in evs] == [late], evs
+    assert "still did not start" in evs[0]["text"] and "passed, still queued" in evs[0]["text"]
+    assert "planned start_after" in evs[0]["text"]
+    # Re-armed: raised.
+    p.db.update_task(rearm, not_before=now + 9 * 3600, labels=[f"start_after:{now + 9 * 3600:.0f}"])
+    d._raise_hold_loops(at + holdloops.OVERDUE_S + 120)
+    evs = _loop_events(p, "time_only_hold")
+    assert [e["task"] for e in evs] == [late, rearm] and "re-armed 1 time" in evs[-1]["text"], evs
+    # Past hold_max_h: the blocked until: hold is raised, the planned ones still are not.
+    d._raise_hold_loops(now + lim + 120)
+    evs = _loop_events(p, "time_only_hold")
+    assert [e["task"] for e in evs] == [late, rearm, held], evs
+    assert planned not in [e["task"] for e in evs] and reviewed not in [e["task"] for e in evs]
+
+
 
 def test_a_dependency_left_in_review_too_long_is_raised_once_and_its_age_shown(env):
     p = make(env)

@@ -8,9 +8,12 @@ is dropped once it is resolved, so it raises again only if it comes back:
 
 - `time_only_hold` (key time-only:<task>): a task held only until a time (a blocked hold on
   `until:`, or a queued `start_after` with no `start_when`) with nothing open that produces what it
-  waits for (no open dependency, ask, resource or probe), once its review passed, its time was
-  re-armed, or it stayed time-only held past coordinator.hold_max_h. Re-arming the time keeps the
-  key: the flag lives until the task closes or gets a real end (TIME_KEY).
+  waits for (no open dependency, ask, resource or probe). A blocked `until:` hold is raised once its
+  review passed, its time was re-armed, or it stayed time-only held past coordinator.hold_max_h. A
+  queued start_after is a planned deferral (task_add/task_update chose that time so the wait costs
+  no turns): it is raised only once its time was re-armed, or OVERDUE_S after its start_after
+  passed while it is still queued. Re-arming the time keeps the key: the flag lives until the task
+  closes or gets a real end (TIME_KEY).
 - `blocked_dependency` (blocked-dependency:<task>:<dep>): a queued or blocked task depends on a
   blocked task whose hold has no end of its own (no ask, resource or probe anchor). Raised once a
   coordinator turn has passed since it was first seen, as dead_dependency is.
@@ -25,13 +28,14 @@ are resolved.
 """
 from __future__ import annotations
 
-from . import anchors
+from . import anchors, timefmt
 from .db import DB, _first_dead, deferral, dependency_ids, load_result
 
 LOOPS_KEY = "hold_loops"        # kv {key: {"since", "raised", "task", "text", "kind"}}
 TIME_KEY = "hold_time_only"     # kv {task id: {"since", "ends": [...], "flag": ts, "why"}}
 REAL_ENDS = ("ask", "resource", "when")
 ENDS_KEPT = 5
+OVERDUE_S = 3600   # a planned start_after that passed this long ago and still did not start
 LIST_MAX = 20
 EVENTS = {"time-only": "time_only_hold", "blocked-dependency": "blocked_dependency",
           "dead-dependency": "dead_dependency", "dependency-cycle": "dependency_cycle"}
@@ -115,6 +119,16 @@ def _time_end(t: dict, now: float) -> float | None:
     return None
 
 
+def _overdue(t: dict, now: float) -> float | None:
+    """Seconds since a queued task's planned start_after (no start_when) passed, once that is at
+    least OVERDUE_S and it still did not start; None otherwise."""
+    if t["status"] != "queued":
+        return None
+    d = deferral(t)
+    late = now - float(d.get("after") or now)
+    return late if not d.get("when") and d.get("after") and late >= OVERDUE_S else None
+
+
 def _real_end(t: dict, states: dict) -> bool:
     """The task waits on something other than a time: an ask, resource or probe anchor, a
     start_when probe, a queued waiting hand-off's retry_when or on_pass_cmd probe (the daemon runs
@@ -141,23 +155,28 @@ def _track_time_only(db: DB, cfg: dict, now: float, tasks: dict[int, dict], stat
         end = _time_end(t, now)
         if _real_end(t, states):
             continue
-        if end is None:
+        late = _overdue(t, now)
+        if end is None and late is None:
             if e:
                 new[str(tid)] = e   # between holds (queued or running): kept
             continue
         e = dict(e or {"since": now, "ends": []})
         ends = [float(x) for x in e.get("ends") or []]
-        if all(abs(end - x) > 60 for x in ends):
+        if end is not None and all(abs(end - x) > 60 for x in ends):
             e["n"] = int(e.get("n") or 0) + (1 if ends else 0)   # a new time on the same hold: re-armed
             ends = (ends + [end])[-ENDS_KEPT:]
         e["ends"] = ends
         if not e.get("flag"):
-            if reviewed is None:
-                reviewed = _reviewed(db)
-            age = now - float(e["since"])
-            why = ("its review passed" if tid in reviewed else
-                   f"its time was re-armed {e['n']} time(s)" if e.get("n") else
-                   f"held only on a time for {age / 3600:.1f}h" if limit and age >= limit else "")
+            rearmed = f"its time was re-armed {e['n']} time(s)" if e.get("n") else ""
+            if t["status"] == "queued":   # a planned start_after deferral: only re-armed or overdue
+                why = rearmed or (f"its start_after passed {late / 3600:.1f}h ago and it still did not start"
+                                  if late is not None else "")
+            else:
+                if reviewed is None:
+                    reviewed = _reviewed(db)
+                age = now - float(e["since"])
+                why = ("its review passed" if tid in reviewed else rearmed or
+                       (f"held only on a time for {age / 3600:.1f}h" if limit and age >= limit else ""))
             if why:
                 e.update(flag=now, why=why)
         new[str(tid)] = e
@@ -176,12 +195,15 @@ def current(db: DB, cfg: dict, now: float) -> dict[str, dict]:
         if not e.get("flag") or not t:
             continue
         end = _time_end(t, now)
+        after = deferral(t).get("after") if t["status"] == "queued" else None
         held = (anchors.describe("until", str(end), cfg) if end is not None else
-                f"between time holds (now {t['status']})")
+                "its start_after " + timefmt.long(float(after), cfg) + " passed, still queued"
+                if after and _overdue(t, now) is not None else f"between time holds (now {t['status']})")
         out[f"time-only:{tid}"] = {
             "kind": "time-only", "task": int(tid),
             "text": f"#{tid} {_title(t)} is held only on a time ({held}) and nothing open produces what it "
-                    f"waits for ({e.get('why')}). Re-arming the time does not clear this. Decide once: close it "
+                    f"waits for ({e.get('why')}). A planned start_after raises this only once re-armed or "
+                    f"overdue; re-arming the time does not clear it. Decide once: close it "
                     f"as done and queue one validation task gated on a start_when probe (task_add start_when); "
                     f"give it a real end (task_update status blocked waits_on when:<probe>, or depends_on the "
                     f"task that produces it); or cancel it."}

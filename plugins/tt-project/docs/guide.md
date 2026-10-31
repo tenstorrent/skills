@@ -489,8 +489,10 @@ prolonged whole-box outage.
   never are. A `still_blocked` on a task such an ask holds is flagged, not carried.
 - Hold loops (model-free, every tick): work nothing will move raises one event while it lasts and
   clears once resolved. `time_only_hold`: held only until a time (`until:` or `start_after`) with
-  no open dependency, ask, resource or probe, once its review passed, its time was re-armed or it
-  stayed so past `coordinator.hold_max_h`; re-arming the time does not clear it.
+  no open dependency, ask, resource or probe. An `until:` hold is raised once its review passed,
+  its time was re-armed or it stayed so past `coordinator.hold_max_h`; a queued `start_after` is a
+  planned deferral, raised only once its time was re-armed or it is still queued an hour after
+  that time passed. Re-arming the time does not clear it.
   `blocked_dependency`: a queued or blocked task depends on a blocked task with no end of its own.
   `dead_dependency`: a blocked task depends on a failed, cancelled or missing one (both after a
   coordinator turn, which a re-hold no longer postpones). `dependency_cycle`: tasks that depend on
