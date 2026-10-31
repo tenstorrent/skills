@@ -30,16 +30,38 @@ TOOL_SCAN_FILES = 2000   # files read per check at most (bin/ and hooks/ trees)
 TOOL_SCAN_BYTES = 262144   # a larger file is not a tool script
 
 
-def tool_terms(old: str, new: str) -> tuple[set[str], set[str]]:
+def tool_terms(old: str, new: str, charter: str = "") -> tuple[set[str], set[str]]:
     """The old item's distinctive terms for restriction_tools: identifiers (_TOOL_TERM_RE) of its
-    changed sentences that the new text no longer has, and its rule words (_rule_words) the new text
-    dropped (all of the changed sentences' when it dropped fewer than two)."""
+    changed sentences that neither the new text nor the current `charter` (any section) still has,
+    and its rule words (_rule_words) the new text dropped (all of the changed sentences' when it
+    dropped fewer than two)."""
     from .coordinator import _changed_sentences, _rule_words
     changed = " ".join(_changed_sentences(old, new)) or old
     ids = {next(g for g in m.groups() if g) for m in _TOOL_TERM_RE.finditer(changed)}
-    ids = {t for t in ids if t not in new and not re.fullmatch(r"[\d./-]+", t)}
+    ids = {t for t in ids if t not in new and t not in charter and not re.fullmatch(r"[\d./-]+", t)}
     words = _rule_words(changed) - _rule_words(new)
     return ids, (words if len(words) >= 2 else _rule_words(changed))
+
+
+def enabled_schedules(text: str) -> str:
+    """harness/schedules.json with each disabled entry (`"enabled": false`) blanked to spaces, so a
+    disabled schedule names nothing and a hit's line number still points into the file. Text that is
+    not a JSON list of entries is returned as it is."""
+    dec, i = json.JSONDecoder(), text.find("[")
+    if i < 0 or text[:i].strip():
+        return text
+    i += 1
+    while True:
+        i = re.compile(r"[\s,]*").match(text, i).end()
+        if i >= len(text) or text[i] == "]":
+            return text
+        try:
+            obj, end = dec.raw_decode(text, i)
+        except ValueError:
+            return text
+        if isinstance(obj, dict) and not obj.get("enabled", True):
+            text = text[:i] + re.sub(r"[^\n]", " ", text[i:end]) + text[end:]
+        i = end
 
 
 def tool_hit(line: str, ids: set[str], words: set[str]) -> bool:
@@ -105,8 +127,9 @@ def replaced_items(body: str, text: str) -> list[tuple[str, str]]:
 def restriction_tools(p: Project, loosened: list[tuple[str, str, str]], batch: list[int]) -> list[str]:
     """After Restrictions items were loosened or removed, name the project's own tools that still carry
     the old wording: files under bin/ and hooks/ (project root and harness), harness/schedules.json,
-    and the command and heal check of each schedule, whose lines name an identifier of the old item
-    or two of its dropped rule words (tool_terms). `loosened`: (old item, new text, over), `over`
+    and the command and heal check of each enabled schedule, whose lines name an identifier of the old item
+    or two of its dropped rule words (tool_terms; an identifier the current charter still states anywhere
+    is not one). A disabled schedule, in the table or its schedules.json entry, is left out. `loosened`: (old item, new text, over), `over`
     empty for the user's word, else the end that retired the item. A file a task of this batch
     names (its title or spec has the file's path or name) is left out. One queued restriction_tools
     event per item with such files, for the next digest: model-free, it edits nothing. Returns the
@@ -135,8 +158,8 @@ def restriction_tools(p: Project, loosened: list[tuple[str, str, str]], batch: l
                     files.append((str(f.relative_to(p.root)), raw.decode("utf-8", "replace")))
     sched = p.harness / "schedules.json"
     if sched.is_file() and sched.stat().st_size <= TOOL_SCAN_BYTES:
-        files.append((str(sched.relative_to(p.root)), sched.read_text(errors="replace")))
-    for r in p.db.q("SELECT name, payload FROM schedules"):
+        files.append((str(sched.relative_to(p.root)), enabled_schedules(sched.read_text(errors="replace"))))
+    for r in p.db.q("SELECT name, payload FROM schedules WHERE enabled=1"):
         payload = json.loads(r["payload"] or "{}")
         heal_block = payload.get("heal") or {}
         cmds = [payload.get("command")] + [heal_block.get(k) for k in ("check", "fix", "suppress")]
@@ -150,7 +173,7 @@ def restriction_tools(p: Project, loosened: list[tuple[str, str, str]], batch: l
     for old, new, over in loosened:
         if over == "unsourced" and still_stated(charter, old):
             continue   # a dropped advisory copy of a rule the Brief or a sourced item still binds: tools stay right
-        ids, words = tool_terms(old, new)
+        ids, words = tool_terms(old, new, charter)
         hits = []
         for label, text in files:
             line = next((n for n, x in enumerate(text.splitlines(), 1) if tool_hit(x, ids, words)), 0)

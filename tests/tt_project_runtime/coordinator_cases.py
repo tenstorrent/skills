@@ -1997,6 +1997,49 @@ def test_a_restrictions_section_replaced_with_looser_words_names_the_tools_of_th
     assert len(out) == 1 and out[0].startswith("`over` retired") and "reset-gate.sh" in out[0], out
 
 
+def _gate_audit(env, charter_extra="", enabled=True):
+    """restriction_tools on a retired item naming `ORBIT_GATE`, with bin/gate.sh and schedule old-watch
+    carrying it (the schedule `enabled` or not) and `charter_extra` added to the current charter."""
+    from ttp import restriction_audit, schedule as sched
+    p = make(env)
+    item = "Keep ORBIT_GATE exported (user msg #1)."
+    p.charter_path.write_text(f"# demo\n\n## Restrictions\n- Never merge.\n{charter_extra}")
+    (p.root / "bin").mkdir(exist_ok=True)
+    (p.root / "bin" / "gate.sh").write_text("#!/bin/sh\nX=ORBIT_GATE\n")
+    sched.upsert(p.db, "old-watch", "command", "1h", enabled=enabled, payload={"command": "env X=ORBIT_GATE true"})
+    sched.upsert(p.db, "new-watch", "command", "1h", payload={"command": "true"})
+    sched.write_file(p, "schedules: test", create=True)
+    return restriction_audit.restriction_tools(p, [(item, "", "the gate's case is gone")], [])
+
+
+def test_restriction_tools_skips_a_disabled_schedule_naming_an_old_identifier(env):
+    """A disabled schedule, in the schedules table and its harness/schedules.json entry, enforces
+    nothing: it is never named, while the enabled tool carrying the same identifier still is."""
+    from ttp import restriction_audit
+    out = _gate_audit(env, enabled=False)
+    assert len(out) == 1 and "bin/gate.sh:2" in out[0], out
+    assert "old-watch" not in out[0] and "schedules.json" not in out[0], out
+    # The file's other entries keep their place: a hit's line number still points into the file.
+    text = '[\n {"name": "a", "enabled": false,\n  "payload": {"command": "X=ORBIT_GATE"}},\n {"name": "b",\n  "x": 1}\n]\n'
+    kept = restriction_audit.enabled_schedules(text)
+    assert "ORBIT_GATE" not in kept and kept.count("\n") == text.count("\n") and '"b"' in kept.splitlines()[3]
+    assert restriction_audit.enabled_schedules("not json [") == "not json ["
+
+
+def test_restriction_tools_skips_an_identifier_another_charter_section_still_states(env):
+    """An identifier of the retired item that the current charter still states anywhere (here a Resources
+    line, not the item's new text) is no sign of the old rule: nothing is named."""
+    out = _gate_audit(env, "\n## Resources\n- The gate flag is `ORBIT_GATE`.\n")
+    assert out == [], out
+
+
+def test_restriction_tools_names_an_enabled_tool_carrying_a_dropped_identifier(env):
+    """An identifier the charter no longer states, in an enabled schedule and a bin/ script, is named."""
+    out = _gate_audit(env)
+    assert len(out) == 1 and "bin/gate.sh:2" in out[0] and "schedule old-watch" in out[0], out
+    assert "schedules.json:" in out[0] and "new-watch" not in out[0], out
+
+
 def test_the_charter_guard_tells_a_users_loosening_to_go_in_as_written(env):
     """A user's loosening the guard refuses is sent back as a quoted resend on their word: no `over`, no
     end they did not give; the temporary-exception route only when their words make it temporary."""
