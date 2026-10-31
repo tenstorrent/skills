@@ -12,8 +12,9 @@ is dropped once it is resolved, so it raises again only if it comes back:
   review passed, its time was re-armed, or it stayed time-only held past coordinator.hold_max_h. A
   queued start_after is a planned deferral (task_add/task_update chose that time so the wait costs
   no turns): it is raised only once its time was re-armed, or OVERDUE_S after its start_after
-  passed while it is still queued. Re-arming the time keeps the key: the flag lives until the task
-  closes or gets a real end (TIME_KEY).
+  passed while it never started since it was deferred and nothing else holds it (_overdue). Re-arming
+  the time keeps the key: the flag lives until the task closes or gets a real end (TIME_KEY); a flag
+  raised only as overdue clears once the task starts.
 - `blocked_dependency` (blocked-dependency:<task>:<dep>): a queued or blocked task depends on a
   blocked task whose hold has no end of its own (no ask, resource or probe anchor). Raised once a
   coordinator turn has passed since it was first seen, as dead_dependency is.
@@ -119,14 +120,26 @@ def _time_end(t: dict, now: float) -> float | None:
     return None
 
 
-def _overdue(t: dict, now: float) -> float | None:
+def _overdue(db: DB, t: dict, now: float, busy: bool) -> float | None:
     """Seconds since a queued task's planned start_after (no start_when) passed, once that is at
-    least OVERDUE_S and it still did not start; None otherwise."""
-    if t["status"] != "queued":
+    least OVERDUE_S, it never started since it was deferred (start_after labels stay on a task that
+    ran) and nothing else holds it: no later not_before (the daemon's retry or lock backoff), no
+    dispatch_hold recorded since start_after (a pause, busy or reserved resource) and no worker
+    running now that may take its slot (check_slot_wait covers capacity). None otherwise."""
+    if t["status"] != "queued" or busy:
         return None
     d = deferral(t)
-    late = now - float(d.get("after") or now)
-    return late if not d.get("when") and d.get("after") and late >= OVERDUE_S else None
+    after = float(d.get("after") or 0)
+    if d.get("when") or not after or now - after < OVERDUE_S or float(t["not_before"] or 0) > after + 60:
+        return None
+    since = d.get("since")
+    if since is None and int(t["attempts"] or 0):
+        return None
+    if db.q("SELECT 1 FROM runs WHERE task=? AND role!='coordinator' AND started>=? LIMIT 1",
+            (t["id"], float(since or 0))) or db.q(
+            "SELECT 1 FROM events WHERE task=? AND kind='dispatch_hold' AND ts>=? LIMIT 1", (t["id"], after)):
+        return None
+    return now - after
 
 
 def _real_end(t: dict, states: dict) -> bool:
@@ -149,21 +162,28 @@ def _track_time_only(db: DB, cfg: dict, now: float, tasks: dict[int, dict], stat
     old = db.kv(TIME_KEY, {}) or {}
     limit = anchors.hold_max_h(cfg) * 3600
     reviewed = None
+    busy = None
     new: dict[str, dict] = {}
     for tid, t in tasks.items():
         e = old.get(str(tid))
         end = _time_end(t, now)
         if _real_end(t, states):
             continue
-        late = _overdue(t, now)
+        late = None
+        if end is None and t["status"] == "queued" and deferral(t).get("after"):
+            if busy is None:
+                busy = bool(db.q("SELECT 1 FROM runs WHERE role!='coordinator' AND status='running' LIMIT 1"))
+            late = _overdue(db, t, now, busy)
         if end is None and late is None:
-            if e:
-                new[str(tid)] = e   # between holds (queued or running): kept
+            if e and not (e.get("overdue") and t["status"] != "queued"):
+                new[str(tid)] = e   # between holds (queued or running): kept; an overdue-only flag clears once it starts
             continue
         e = dict(e or {"since": now, "ends": []})
         ends = [float(x) for x in e.get("ends") or []]
         if end is not None and all(abs(end - x) > 60 for x in ends):
             e["n"] = int(e.get("n") or 0) + (1 if ends else 0)   # a new time on the same hold: re-armed
+            if ends:
+                e.pop("overdue", None)   # re-armed: the flag is sticky again
             ends = (ends + [end])[-ENDS_KEPT:]
         e["ends"] = ends
         if not e.get("flag"):
@@ -171,6 +191,8 @@ def _track_time_only(db: DB, cfg: dict, now: float, tasks: dict[int, dict], stat
             if t["status"] == "queued":   # a planned start_after deferral: only re-armed or overdue
                 why = rearmed or (f"its start_after passed {late / 3600:.1f}h ago and it still did not start"
                                   if late is not None else "")
+                if why and not rearmed:
+                    e["overdue"] = True
             else:
                 if reviewed is None:
                     reviewed = _reviewed(db)
@@ -198,7 +220,7 @@ def current(db: DB, cfg: dict, now: float) -> dict[str, dict]:
         after = deferral(t).get("after") if t["status"] == "queued" else None
         held = (anchors.describe("until", str(end), cfg) if end is not None else
                 "its start_after " + timefmt.long(float(after), cfg) + " passed, still queued"
-                if after and _overdue(t, now) is not None else f"between time holds (now {t['status']})")
+                if after and e.get("overdue") else f"between time holds (now {t['status']})")
         out[f"time-only:{tid}"] = {
             "kind": "time-only", "task": int(tid),
             "text": f"#{tid} {_title(t)} is held only on a time ({held}) and nothing open produces what it "

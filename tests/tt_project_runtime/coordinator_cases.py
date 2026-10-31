@@ -4801,6 +4801,54 @@ def test_a_planned_start_after_raises_no_time_only_hold_until_it_is_re_armed_or_
 
 
 
+def test_an_overdue_start_after_is_raised_only_when_it_never_started_and_nothing_else_holds_it(env):
+    p = make(env)
+    from ttp import holdloops
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    now = time.time()
+    at = now + 600
+    late_t = at + holdloops.OVERDUE_S + 60
+
+    def defer(title):
+        return p.db.add_task(title, "s", origin="user", not_before=at,
+                             labels=[f"start_after:{at:.0f}", f"deferred_since:{now:.0f}"])
+    # Ran once after it was deferred (the start_after label stays) and was requeued.
+    ran = defer("ran and was requeued")
+    p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?,?,?,?,?)",
+           (ran, "worker", at + 5, at + 50, "failed"))
+    p.db.update_task(ran, attempts=1)
+    # Held by the daemon's retry backoff, or by a resource dispatch recorded.
+    backoff = defer("in a lock backoff")
+    p.db.update_task(backoff, not_before=late_t + 600)
+    res = defer("waits for a busy resource")
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+           (at + 30, "daemon", "dispatch_hold", "low", "dev held", "{}", "handled", res))
+    fresh = defer("never started")
+    # Any worker running: its slot may hold it (check_slot_wait's), so nothing is raised.
+    other = p.db.add_task("busy work", "s", origin="user")
+    p.db.update_task(other, status="running")
+    rid = p.db.x("INSERT INTO runs(task, role, started, status) VALUES(?,?,?,?)",
+                 (other, "worker", at, "running"))
+    d._raise_hold_loops(late_t)
+    assert not _loop_events(p, "time_only_hold")
+    p.db.x("UPDATE runs SET status='ok', ended=? WHERE id=?", (late_t, rid))
+    p.db.update_task(other, status="done")
+    d._raise_hold_loops(late_t + 1)
+    evs = _loop_events(p, "time_only_hold")
+    assert [e["task"] for e in evs] == [fresh], evs
+    assert f"time-only:{fresh}" in holdloops.current(p.db, p.config(), late_t + 2)
+    # Once it starts, the overdue-only flag clears (also after a requeue).
+    p.db.update_task(fresh, status="running")
+    assert f"time-only:{fresh}" not in holdloops.current(p.db, p.config(), late_t + 3)
+    assert str(fresh) not in (p.db.kv(holdloops.TIME_KEY, {}) or {})
+    p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?,?,?,?,?)",
+           (fresh, "worker", late_t + 3, late_t + 9, "failed"))
+    p.db.update_task(fresh, status="queued", attempts=1)
+    assert f"time-only:{fresh}" not in holdloops.current(p.db, p.config(), late_t + 10)
+
+
+
 def test_a_dependency_left_in_review_too_long_is_raised_once_and_its_age_shown(env):
     p = make(env)
     from ttp import coordinator as coord

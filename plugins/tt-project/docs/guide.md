@@ -491,8 +491,9 @@ prolonged whole-box outage.
   clears once resolved. `time_only_hold`: held only until a time (`until:` or `start_after`) with
   no open dependency, ask, resource or probe. An `until:` hold is raised once its review passed,
   its time was re-armed or it stayed so past `coordinator.hold_max_h`; a queued `start_after` is a
-  planned deferral, raised only once its time was re-armed or it is still queued an hour after
-  that time passed. Re-arming the time does not clear it.
+  planned deferral, raised only once its time was re-armed or, an hour after that time passed, it
+  never started since it was deferred and nothing else (a retry backoff, a resource hold, running
+  work) holds it; that overdue flag clears once it starts. Re-arming the time does not clear it.
   `blocked_dependency`: a queued or blocked task depends on a blocked task with no end of its own.
   `dead_dependency`: a blocked task depends on a failed, cancelled or missing one (both after a
   coordinator turn, which a re-hold no longer postpones). `dependency_cycle`: tasks that depend on
