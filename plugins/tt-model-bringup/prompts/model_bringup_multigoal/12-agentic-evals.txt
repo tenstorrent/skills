@@ -11,6 +11,6 @@ Goal completion requirements:
 - doc/agentic_evals/estimate.json records per eval a go/stop decision and reason, first from the survey and updated after each effort from the calculations, not from full suites. Full suites run only on go and record actual hours next to the prediction. A measured stop is a valid outcome.
 - doc/agentic_evals/serving_config.json records the measured serving values a release spec needs, and doc/agentic_serving.json `workload` is updated with measured values.
 - doc/agentic_evals/REPORT.md leads with hours per suite and scores against references, then each effort's predictions against its results, the chosen configuration and remaining limits. Scores are reported, not gated.
-- Only owned processes and containers are stopped. Commit stage-owned changes to the execution checkout locally and log SHAs; never push that checkout or add a remote to it.
+- On shared machines only owned processes and containers are stopped; CI jobs use the granted workflow unchanged, with its default cleanup. Commit stage-owned changes to the execution checkout locally and log SHAs; never push that checkout or add a remote to it.
 
 Unmet requirements and failed gates: work. Use $autofix for execution or integration failures. Stop only after `$autofix` fails or the stage budget ends, preserving partial results and the reason.

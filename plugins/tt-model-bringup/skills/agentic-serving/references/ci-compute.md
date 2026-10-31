@@ -65,6 +65,9 @@ gh workflow run "$WORKFLOW" -R "$REPO" \
   -f workflow=agentic
 ```
 
+Use the granted workflow as it is, with its default setup and cleanup. The job owns its runner,
+so do not fork, wrap or patch the workflow, and add no admission checks of your own.
+
 No run id is returned: poll for the new run and register it before dispatching the next. The ledger
 is shared state when several explorers dispatch — register at launch, not at collection. Count
 `queued` + `in_progress` against `max_parallel`. Collect into `doc/agentic_evals/runs/<arm>/` with
