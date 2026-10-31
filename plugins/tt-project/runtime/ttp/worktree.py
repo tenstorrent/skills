@@ -1595,6 +1595,64 @@ def needed_by(task: dict, open_tasks: list[dict]) -> dict | None:
     return None
 
 
+# What needed_by's pattern matches, read once per spec: a task id named as #12, t12 or task 12, and the
+# runs of branch characters a branch name must start (and end at the end of, or before a dot in).
+_NAMED_ID = re.compile(r"(?<![\w.-])(?:#|t|task\s+)(\d+)", re.I)
+_BRANCH_RUN = re.compile(r"[\w/.-]+")
+# Longest branch the index keeps a run's prefixes for; a longer one is matched by needed_by's pattern.
+_BRANCH_INDEX_MAX = 255
+
+
+class NeededIndex:
+    """needed_by for many tasks against one list of unfinished tasks, in time linear in their specs:
+    each spec is scanned once for the ids and branch prefixes it names, and its dependencies and
+    `continues:` label are read once. needed(task) is needed_by(task, open_tasks), the same task.
+    A branch with characters other than ASCII letters, digits, _/.- or longer than _BRANCH_INDEX_MAX, and a spec whose branch-like
+    runs hold other characters (where case-insensitive matching is not plain ASCII), fall back to
+    needed_by's own pattern."""
+
+    def __init__(self, open_tasks: list[dict]):
+        from .db import dependency_ids
+        self.tasks = list(open_tasks)
+        self.ids: dict = {}       # an id (int, from depends_on or continues:) -> indexes of the tasks
+        self.named: dict = {}     # an id as named in a spec (its digits) -> indexes
+        self.branches: dict = {}  # a lower-cased branch prefix -> indexes
+        self.odd: list[int] = []  # indexes whose spec has a non-ASCII branch-like run
+        for i, t in enumerate(self.tasks):
+            spec = t.get("spec") or ""
+            for k in {*dependency_ids(t), continues_id(t)} - {None}:
+                self.ids.setdefault(k, []).append(i)
+            for k in {m.group(1) for m in _NAMED_ID.finditer(spec)}:
+                self.named.setdefault(k, []).append(i)
+            prefixes, odd = set(), False
+            for m in _BRANCH_RUN.finditer(spec):
+                run = m.group(0)
+                if not run.isascii():
+                    odd = True
+                    continue
+                low = run.lower()
+                prefixes.update(low[:j] for j, c in enumerate(low[:_BRANCH_INDEX_MAX + 1]) if c == ".")
+                if len(low) <= _BRANCH_INDEX_MAX:
+                    prefixes.add(low)
+            for k in prefixes:
+                self.branches.setdefault(k, []).append(i)
+            if odd:
+                self.odd.append(i)
+
+    def needed(self, task: dict) -> dict | None:
+        tid, branch = task["id"], task.get("branch")
+        hits = set(self.ids.get(tid, ())) | set(self.named.get(str(tid), ()))
+        if branch:
+            if branch.isascii() and len(branch) <= _BRANCH_INDEX_MAX and _BRANCH_RUN.fullmatch(branch):
+                hits.update(self.branches.get(branch.lower(), ()))
+                scan = self.odd
+            else:
+                scan = range(len(self.tasks))
+            pat = re.compile(rf"(?<![\w/.-]){re.escape(branch)}(?![\w/-])", re.I)
+            hits.update(i for i in scan if i not in hits and pat.search(self.tasks[i].get("spec") or ""))
+        return next((self.tasks[i] for i in sorted(hits) if self.tasks[i]["id"] != tid), None)
+
+
 # A task worktree's path in a probe: <root>/tt-project/worktrees/t<id>, or relative from the project root.
 WORKTREE_REF = re.compile(r"(?<![\w.-])worktrees/t(\d+)(?![\w-])")
 

@@ -13852,3 +13852,47 @@ def test_detached_checks_that_pass_answer_without_a_dropped_line(env, tmp_path, 
     assert "finished with exit code 0" in out and "dropped" not in out
     assert checksgone.state(run) == "finished" and checksgone.stuck(f"ttp checks --result {run}") == []
     assert not detach.lost(run / cli.CHECKS_RC).exists()
+
+
+def test_needed_index_agrees_with_needed_by():
+    """check_local_only asks needed_by for every done branch task against every open task and done
+    review; NeededIndex answers the same from one scan of each spec. Mixed id forms, branch names in
+    and out of context, dependencies, continues labels, self-references and odd characters agree."""
+    import json
+    import random
+    from ttp import worktree
+    rng = random.Random(4622)
+    words = ["#7", "t7", "T7", "task 7", "TASK\n7", "taſk 7", "#70", "x#7", "a-t7", "t7.", "#07", "t#7",
+             "cd tt-project/worktrees/t7 &&", "worktrees/t12", "ttp/t7-fix", "TTP/T7-FIX", "ttp/t7-fix.",
+             "ttp/t7-fix.x", "ttp/t7-fix..", "origin/ttp/t7-fix", "ttp/t7-fix/sub", "ttp/t7-fixes", "ttp/t7-fixé",
+             "(ttp/t7-fix)", "feat+x", "a.b.c", "A.B", "Key", "key", "see", "#12", "task 12", "t3", "#3",
+             "x" * 300 + ".y", "long-" + "z" * 260, "é", "the", "-", ".", "/"]
+    seps = [" ", "", "\n", ", ", ".", "/", "-"]
+    deps = [None, "[]", "[7]", '["7"]', "[3, 12]", "not json", "7", '["x"]', "[true]"]
+    labels = [None, "[]", '["continues:7"]', '["continues:12"]', '["continues:x"]', "{", '["other"]']
+    branches = [None, "", "ttp/t7-fix", "TTP/t7-Fix", "a.b", "a", "A.B", "key", "feat+x", "ttp/t7-fixé",
+                "x" * 300, "long-" + "z" * 260, "t7", "ttp/t7-fix.", "/"]
+    for _ in range(40):
+        open_tasks = [{"id": rng.choice([3, 7, 12, 20 + i]), "status": "queued",
+                       "spec": "".join(rng.choice(words) + rng.choice(seps) for _ in range(rng.randrange(0, 8))),
+                       "depends_on": rng.choice(deps), "labels": rng.choice(labels)} for i in range(12)]
+        if rng.random() < 0.3:
+            del open_tasks[0]["spec"]
+        index = worktree.NeededIndex(open_tasks)
+        for tid in (3, 7, 12, 70):
+            for branch in branches:
+                task = {"id": tid, "branch": branch}
+                assert index.needed(task) is worktree.needed_by(task, open_tasks), (task, open_tasks)
+    # Named cases, so a regression says which form broke.
+    one = lambda spec, **kw: [{"id": 9, "status": "queued", "spec": spec, "depends_on": None, "labels": None, **kw}]
+    for spec, branch, want in [("see #7.", None, True), ("TASK  7", None, True), ("#70", None, False),
+                               ("x#7", None, False), ("ttp/t7-fixes", None, True), ("feat/x.", "feat/x", True),
+                               ("feat/x.y", "feat/x", True), ("feat/xes", "feat/x", False),
+                               ("origin/feat/x", "feat/x", False), ("feat/xé", "feat/x", False),
+                               ("Key", "key", True), ("feat+x!", "feat+x", True), ("", None, False)]:
+        task, tasks = {"id": 7, "branch": branch}, one(spec)
+        assert bool(worktree.NeededIndex(tasks).needed(task)) is want is bool(worktree.needed_by(task, tasks)), spec
+    for extra in ({"depends_on": json.dumps([7])}, {"labels": json.dumps(["continues:7"])}):
+        tasks = one("", **extra)
+        assert worktree.NeededIndex(tasks).needed({"id": 7, "branch": None}) is tasks[0]
+    assert worktree.NeededIndex(one("#9", id=9)).needed({"id": 9, "branch": None}) is None   # never itself

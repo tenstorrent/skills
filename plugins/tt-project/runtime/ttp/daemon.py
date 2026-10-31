@@ -7936,7 +7936,9 @@ class Daemon:
                               % ",".join("?" * len(TERMINAL_TASK_STATES)), TERMINAL_TASK_STATES)
             reviews = db.q("SELECT id, status, spec, depends_on, labels FROM tasks WHERE kind='review' "
                            "AND status='done' AND updated>=?", (now - 2 * LOCAL_ONLY_DAYS * 86400,))
-            tasks = [t for t in tasks if not worktree.needed_by(t, open_tasks) and not worktree.needed_by(t, reviews)]
+            # One scan of each spec, not one per task: per pair it held the tick for minutes.
+            need_open, need_reviews = worktree.NeededIndex(open_tasks), worktree.NeededIndex(reviews)
+            tasks = [t for t in tasks if not need_open.needed(t) and not need_reviews.needed(t)]
             backing = db.kv(KV_BACKUP) or {}   # a backup push still to come decides first
             tasks = [t for t in tasks if str(t["id"]) not in backing]
         if not tasks and not told:
