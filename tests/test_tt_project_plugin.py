@@ -723,15 +723,17 @@ def test_prompts_require_home_zone_times_with_abbreviation_never_utc():
     assert "times in the home zone and its abbreviation, never UTC" in review
 
 
-def test_worker_prompt_asks_for_batched_file_reads():
-    # Reviewers get the same worker prompt. Each call re-reads the whole context, so the rule asks for
-    # few calls (every range a step needs at once, parallel independent reads), not only narrow ones.
+def test_worker_prompt_asks_for_narrow_file_reads():
+    # Reviewers get the same worker prompt. The batched-reads wording (#3423) measured no effect on calls
+    # per run (#3434), so the rule asks for narrow reads and no re-reads instead.
     text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
-    for part in ("Each call re-reads the whole context", "`grep -n` first", "every range a step needs in one call",
-                 "`sed -n '10,40p;200,260p' f`", "`grep -n -A30 'def name' f`",
-                 "independent reads and searches as parallel tool calls in one message", "Never re-read a range"):
+    for part in ("Read files narrowly: `grep -n` first, then only the ranges you need",
+                 "(`sed -n 'a,bp'`, or Read with offset and limit)",
+                 "Do not re-read a range you already read: later calls pay it again."):
         assert part in text, part
-    assert "only the ranges you need" not in text
+    for gone in ("Each call re-reads the whole context", "every range a step needs in one call",
+                 "parallel tool calls in one message", "Never re-read a range"):
+        assert gone not in text, gone
 
 
 def test_worker_prompt_ci_wait_wakes_on_a_hung_job():

@@ -49,9 +49,8 @@
 - Run builds as `ttp clip -- <command>` (it shows the failures or head and tail, and the log's
   path), test suites and other untrusted test code as `ttp clip -- ttp sandbox -- <command>`
   (they then cannot see or signal other processes). Cap pytest -n at $TTP_TEST_SLOTS.
-- Each call re-reads the whole context: `grep -n` first, then every range a step needs in one call
-  (`sed -n '10,40p;200,260p' f`, or `grep -n -A30 'def name' f` for a hit's body). Send independent
-  reads and searches as parallel tool calls in one message. Never re-read a range.
+- Read files narrowly: `grep -n` first, then only the ranges you need (`sed -n 'a,bp'`, or Read with
+  offset and limit). Do not re-read a range you already read: later calls pay it again.
 <!-- ttp:if harness -->
 - Qualify a harness-preparation commit with `ttp checks --purpose harness`, never by adding its own
   SHA to a publication whitelist. That pass never counts for a PR, an `on_pass` or a push.
