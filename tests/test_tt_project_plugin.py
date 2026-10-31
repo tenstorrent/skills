@@ -1119,6 +1119,15 @@ def test_the_coordinator_defers_on_a_landing_with_landed_id_not_a_raw_sha():
     assert "`landed:#<id>`" in review
 
 
+def test_the_daily_review_judges_a_cache_hit_drop_on_the_within_1h_rate():
+    """Sparse turns outlive the 1 h cache and lower the overall rate with a stable prefix."""
+    review = " ".join((PLUGIN / "template" / "prompts" / "daily-review.md").read_text(encoding="utf-8").split())
+    assert "Judge a fall on the within-1h rate (`gap_within_60m`)" in review
+    assert "a fall of only the after->1h rate" in review
+    assert "overall rate while the within-1h rate holds" in review
+    assert "not a regression: no friction task" in review
+
+
 def test_the_forked_test_runner_reports_every_test_once_as_one_process_would(tmp_path):
     """tests/conftest.py runs the tt-project tests in forked workers: every test runs exactly once,
     failures, skips and warnings come back as in one process, other files stay in one worker in

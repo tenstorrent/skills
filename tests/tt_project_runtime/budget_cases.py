@@ -3493,6 +3493,36 @@ def test_cache_gap_cohort_keeps_the_previous_turn_outside_the_window(env):
     assert cohort['turns'] == 1 and cohort['hit_pct'] == 90
 
 
+def test_cache_hit_splits_at_the_1h_cache_lifetime_and_the_line_prints_both(env):
+    """Turns within 1 h of the previous turn's end and turns after a longer gap get their own
+    token-weighted rate; the first turn (no previous one) is in neither; keys already read stay."""
+    from ttp import budget as bud
+    p = make(env)
+    now = time.time()
+    note = json.dumps({'cache_telemetry': {'complete': True, 'requests': None}})
+    # (gap after the previous turn's end, cache read, fresh input)
+    t = now - 20 * 3600
+    for gap, read, fresh in ((None, 0, 100), (60, 90, 10), (3600, 70, 30), (3601, 10, 90), (7200, 30, 70)):
+        t += gap or 0
+        p.db.x("INSERT INTO runs(role,started,ended,status,input_tokens,cache_read_tokens,note) "
+               "VALUES('coordinator',?,?,'ok',?,?,?)", (t, t, fresh, read, note))
+    day = bud.coordinator_cache(p.db, now)['24h']
+    assert (day['turns'], day['hit_pct']) == (5, 40)
+    assert (day['gap_within_60m']['turns'], day['gap_within_60m']['hit_pct']) == (2, 80)
+    assert (day['gap_over_60m']['turns'], day['gap_over_60m']['hit_pct']) == (2, 20)
+    assert day['gap_5_60m']['turns'] == 1 and 'continued' in day
+    assert 'coordinator cache: 40% token hit (within 1h: 80%, after >1h: 20%); zero 1' in bud.coordinator_cache_line(day)
+    # An empty bucket says so instead of 0%; a bucket of turns without telemetry is unknown.
+    p.db.x("DELETE FROM runs WHERE started>?", (now - 20 * 3600 + 3600,))
+    one = bud.coordinator_cache(p.db, now)['24h']
+    assert one['gap_over_60m']['turns'] == 0 and one['gap_over_60m']['hit_pct'] is None
+    assert '(within 1h: 90%, after >1h: no turns)' in bud.coordinator_cache_line(one)
+    p.db.x("UPDATE runs SET note='{}'")
+    assert '(within 1h: unknown, after >1h: no turns)' in bud.coordinator_cache_line(bud.coordinator_cache(p.db, now)['24h'])
+    # A cohort summary (no split of its own) prints no split clause.
+    assert '(within' not in bud.coordinator_cache_line(day['gap_5_60m'])
+
+
 def _claude_overage_gate(p, tmp_path, now, **overage):
     """A Claude run whose rate_limit_event puts five_hour at 92%, with the given overage fields,
     recorded the way the daemon records a finished run; then Claude's gate."""

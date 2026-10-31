@@ -1183,8 +1183,12 @@ def coordinator_cache(db: DB, now: float | None = None, window_s: float | None =
                     "(ORDER BY started,id) previous_end FROM runs WHERE role='coordinator' "
                     "AND status!='running') WHERE started>=?", (now - span,))
         out[label] = _cache_summary(rows)
-        out[label]["gap_5_60m"] = _cache_summary([r for r in rows if r["previous_end"] is not None
-                                               and 300 <= r["started"] - r["previous_end"] <= 3600])
+        gap = lambda r: r["started"] - r["previous_end"] if r["previous_end"] is not None else None
+        out[label]["gap_5_60m"] = _cache_summary([r for r in rows if gap(r) is not None and 300 <= gap(r) <= 3600])
+        # Split at the 1 h cache lifetime: sparse turns lower the overall rate with a stable prefix,
+        # so a drop is judged on the within-1h rate (daily review).
+        out[label]["gap_within_60m"] = _cache_summary([r for r in rows if gap(r) is not None and gap(r) <= 3600])
+        out[label]["gap_over_60m"] = _cache_summary([r for r in rows if gap(r) is not None and gap(r) > 3600])
         # Turns that continued the last turn's agent session (cachettl.pick_thread), against the rest.
         out[label]["continued"] = _cache_summary([r for r in rows if _thread_turn(r) >= 2])
     return out
@@ -1195,7 +1199,12 @@ def coordinator_cache_line(s: dict) -> str:
     states = s["states"]
     hit = f"{s['hit_pct']}%" if s["hit_pct"] is not None else "unknown"
     legacy = f", legacy {states['legacy']} (before telemetry)" if states.get("legacy") else ""
-    line = (f"coordinator cache: {hit} token hit; zero {states['zero']}, partial {states['partial']}, "
+    split = [f"{label}: " + ("no turns" if not b["turns"] else
+                             f"{b['hit_pct']}%" if b["hit_pct"] is not None else "unknown")
+             for label, b in (("within 1h", s.get("gap_within_60m")), ("after >1h", s.get("gap_over_60m")))
+             if b is not None]
+    split = f" ({', '.join(split)})" if split else ""
+    line = (f"coordinator cache: {hit} token hit{split}; zero {states['zero']}, partial {states['partial']}, "
             f"full {states['full']}, missing {states['missing']} (unknown){legacy}; "
             f"{s['miss_turns']} misses (<50% read)")
     # Some providers never report request counts; the clause only says something when one does.

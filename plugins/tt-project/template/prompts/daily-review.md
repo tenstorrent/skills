@@ -8,7 +8,9 @@ Assess the last day of this project, then hand off.
    use's net saving and error rate in one line; the daemon already switches off a use that saves nothing.
    `ttp stats <name> --days 1`: context re-read (cache-read) tokens per run and per $, and the runs
    that re-read most. Coordinator prompt cache (`budget.coordinator_cache`: hit %, turns that missed,
-   $ per turn, 24 h against 7 d): say if the hit rate fell.
+   $ per turn, 24 h against 7 d): say if the hit rate fell. Judge a fall on the within-1h rate
+   (`gap_within_60m`); a fall of only the after->1h rate, or of the overall rate while the
+   within-1h rate holds, is sparse turns outliving the 1 h cache, not a regression: no friction task.
 3. Quality: failures, retries, flaky areas, slop or duplication introduced, architecture drift.
    Count reviews that asked for changes (`changes_needed`) apart from failures: those reviews worked.
 4. Harness friction: where the user was needed, where the coordinator mis-planned, slow loops.

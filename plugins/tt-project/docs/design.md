@@ -379,6 +379,12 @@ These are for people changing tt-project itself, not for running a project.
   miss or savings. Revert the tuning if the comparison shows no improvement while retaining the
   telemetry needed to diagnose it.
 
+  `gap_within_60m` and `gap_over_60m` split each window's turns at the 1 h cache lifetime (gap since
+  the previous coordinator turn ended), and the status line prints both rates. When turns get
+  sparse, more of them follow a gap over 1 h and miss, so the overall rate falls with a stable
+  prompt prefix; a regression shows in the within-1h rate. No keep-warm ping: it pays only with
+  many 60-120 minute gaps (about $0.11 saved per avoided miss against about 24 pings a day).
+
 ## Prior art
 
 The design borrows from agent project managers that already exist:
