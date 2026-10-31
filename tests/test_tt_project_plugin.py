@@ -344,6 +344,14 @@ def test_harness_tasks_stay_in_their_own_harness():
         assert "hand edits to its charter, memory, config, state or code" in text, path.name
 
 
+def test_coordinator_asks_for_a_where_line_only_when_already_known():
+    """A code spec names the files and functions to change on a `Where:` line, but only from what the
+    coordinator already knows: never an extra search to fill it (#4611, #4612)."""
+    coordinator = " ".join((PLUGIN / "template" / "prompts" / "coordinator.md").read_text(encoding="utf-8").split())
+    assert ("A `code` spec gets a `Where:` line (files, functions) only when known from the digest, results, "
+            "reviews or hand-offs; never search to fill it.") in coordinator
+
+
 def test_relays_keep_the_users_verbatim_words_apart_from_the_relayers_context():
     """A relaying chat sends only the user's words as the message and its own text in --context;
     the coordinator takes only the verbatim part as the user's word, and pins nothing on relayer prose."""

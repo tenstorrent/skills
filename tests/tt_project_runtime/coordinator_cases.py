@@ -4597,7 +4597,8 @@ def test_task_add_continues_on_a_done_task_adds_a_follow_up_from_the_base(env):
     old_head = _git_out(path, "rev-parse", "HEAD")
     p.db.update_task(old, status="done", branch=branch)
     dep = p.db.add_task("dep", "s", origin="user", depends_on=[old])
-    problems = coord.apply(p, [{"type": "task_add", "spec": "s", "title": "more", "kind": "code", "continues": old}])
+    problems = coord.apply(p, [{"type": "task_add", "spec": "s\nWhere: a.py f", "title": "more", "kind": "code",
+                               "continues": old}])
     new = p.db.one("SELECT * FROM tasks WHERE title='more'")
     assert problems == [] and p.db.kv(coord.NOTES_KEY) == [f"task_add: #{old} is done; added #{new['id']} as its follow-up"]
     assert new["parent"] == old and f"continues:{old}" not in json.loads(new["labels"])
@@ -11386,6 +11387,34 @@ def test_a_draft_gate_rejection_keeps_the_whole_action_for_the_next_turn(env):
     out = coord.apply(p, [{"type": "task_add", "title": "", "kind": "code", "spec": "x"}])
     assert out and coord.GATE_MARK not in out[0]
 
+
+
+def test_a_code_spec_without_a_where_line_gets_a_hint_never_a_rejection(env):
+    """New code runs read more when the spec does not say where to look (#4611): task_add hints at a
+    `Where:` line on a code spec lacking one. A hint only: the task is added; other kinds get none."""
+    p = make(env)
+    from ttp import coordinator as coord
+
+    def add(title, spec, kind="code"):
+        assert coord.apply(p, [{"type": "task_add", "title": title, "kind": kind, "spec": spec}]) == []
+        task = p.db.one("SELECT * FROM tasks WHERE title=?", (title,))
+        assert task and task["status"] == "queued"
+        return task, " ".join(p.db.kv(coord.NOTES_KEY) or [])   # the last turn's notes
+
+    task, note = add("fix the parser", "Fix the parser.\nAcceptance: tests pass.")
+    assert f"#{task['id']} is `code` with no `Where:` line" in note and "never search" in note, note
+    # Prose mentioning `Where:` mid-line, or a lower-case `where:`, is not the line.
+    for n, spec in enumerate(("Fix it. Where: unknown.", "where: ttp/db.py add_task")):
+        task, note = add(f"no line {n}", spec)
+        assert "no `Where:` line" in note, spec
+    for n, spec in enumerate(("Fix the parser.\nWhere: ttp/parse.py parse_line",
+                              "Fix it.\n  - Where: ttp/db.py:120 add_task", "* Where: a.py f\nGoal: x")):
+        _, note = add(f"has line {n}", spec)
+        assert "Where:" not in note, (spec, note)
+    for kind in ("question", "work", "review", "plan"):
+        _, note = add(f"other kind {kind}", "Look into the parser.", kind)
+        assert "Where:" not in note, kind
+    assert coord.WHERE_LINE.search("Goal\nWhere: x") and not coord.WHERE_LINE.search("Goal\nNowhere: x")
 
 
 def test_a_task_asked_to_deliver_a_pr_runs_as_code(env):

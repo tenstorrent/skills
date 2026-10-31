@@ -2187,6 +2187,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if pr_ask:
                     notes.append(f"task_add: #{new_id} added as `code`, not `{a.get('kind') or 'work'}`: it asks for "
                                  f"PR delivery ({pr_ask!r}) and only code tasks open or update PRs")
+                if kind == "code" and not WHERE_LINE.search(str(a.get("spec") or "")):
+                    notes.append(where_hint(new_id))
             elif t == "task_update":
                 task = db.task(int(a["id"]))
                 if not task:
@@ -2991,6 +2993,16 @@ def _delivery_kind(kind: str, text: str) -> tuple[str, str | None]:
     open, update or publish a PR is a `code` task, the only kind that may (worker prompt)."""
     ask = prguard.delivery_instruction(text) if kind in ("work", "question") else None
     return ("code", ask) if ask else (kind, None)
+
+
+# A code spec's `Where:` line names the files and functions to change (coordinator prompt, Tasks).
+# Lacking one only adds a hint to the add result: never a rejection, a model call or state.
+WHERE_LINE = re.compile(r"^[ \t]*(?:[-*][ \t]+)?Where:", re.M)
+
+
+def where_hint(task_id: int) -> str:
+    return (f"task_add: #{task_id} is `code` with no `Where:` line: add one with task_update `spec` only if "
+            f"you already know the files and functions to change; never search to fill it")
 
 
 def _ask_question(text: str) -> str:

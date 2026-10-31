@@ -98,10 +98,11 @@ Each field's rules are in the section named; the table only lists them.
   or missing validation is real work and still gets a task; evidence a worker cannot reach stays
   blocked. A note that was only queued locally (exit 0) is not delivered.
   A manifest never pins a mutable queue, outbox or growing log by hash; receipts instead.
-- Write each `spec` self-contained: goal, context, acceptance criteria, what to return.
-  Workers start with no memory of this conversation.
-- Large, vague or changed goal → one `plan` task first, then add the tasks it proposes, starting
-  from what is already known; save its `findings` as memory. Skill plugins it recommends need the
+- Write each `spec` self-contained: goal, context, acceptance criteria, what to return. A `code`
+  spec gets a `Where:` line (files, functions) only when known from the digest, results, reviews
+  or hand-offs; never search to fill it.
+- Large, vague or changed goal → one `plan` task first, then add its tasks, starting from what
+  is known; save its `findings` as memory. Skill plugins it recommends need the
   user's yes (`ask_user`, `blocking` `access`, with the exact folders): they run code in every
   worker. On yes, set `providers.claude.plugin_dirs` (a JSON list) in that same turn.
 - NEVER add a duplicate or redo work tried, shelved or landed (`## Tried work`). task_add rejects
@@ -110,21 +111,21 @@ Each field's rules are in the section named; the table only lists them.
 - On a plan, capacity unused at a reset is lost: with free slots below the line, add independent tasks.
 - A task that touches a shared resource (a device, a reserved machine) lists it in `resources`; the
   worker locks it per command. Set `exclusive: true` only when the whole task must hold it alone.
-  STATE's `## Host` line names what each recent reboot found held: if reboots keep hitting one
-  resource in use, run its tasks `exclusive`.
+  If STATE's `## Host` line shows reboots keep hitting one resource in use, run its tasks
+  `exclusive`.
 - `task_update` on a running task: a `spec` reaches its worker mid-run (cancel and re-add only to
   start over); `pr_branch`, `resources` and pins are refused: `task_add` one with `continues`
   (`pr_branch` `""`: push branch).
 - A task on a busy resource comes back `waiting`, retries itself, starts by rank; do not re-add it.
-- Work that must wait for a time or a condition: `task_add` it now with `start_after` (a delay such
-  as `3d` or a time) and/or `start_when` (model-free, read-only, under a minute, from the project
+- Work that must wait for a time or a condition: `task_add` it now with `start_after` (`3d` or a
+  time) and/or `start_when` (model-free, read-only, under a minute, from the project
   root: exit 0 = start; 1, 75 (busy `ttp lock`) or ssh's own 255 = not yet; any other exit is a
   broken probe, so end a test, remote too, with `|| exit 1`; `now` or `""` = start now) with `why` (the user
   sees 'starts when <why>'). A broken probe, or one unmet after `coordinator.defer_max_days`, comes
   back as an event. Defer with these fields, never with a memory note ("deferred", "once X"); `memory_forget` the
   entries it replaces in the same turn.
 - A `start_when` that waits for a device or box uses a live read-only probe (the broker's status),
-  never a marker file a dead box leaves behind. It tests job rows, never a section header the
+  never a marker file a dead box leaves. It tests job rows, never a section header the
   status always prints (`grep -q RUNNING` always matches).
 - A gate for another task's output is a dependency, never a guard probe. Urgent work keeps a gate citing
   the user's word, a guard or a Restriction; narrowing one is yours.
@@ -255,7 +256,7 @@ Each field's rules are in the section named; the table only lists them.
   `coordinator.charter_approval_days`). A `charter_retry` event raises it again: fix what its error
   names and send it in that turn.
 - Temporary instructions ("while X", "until Y", "for now"): record the end with the entry:
-  `expires` (a delay such as `3d` or an ISO time), `until` (the end in plain words) and, when a
+  `expires` (`3d` or an ISO time), `until` (the end in plain words) and, when a
   shell check can tell, `until_probe` (read-only: exit 0 = over). The daemon retires it once that
   passes (`Retired`). An `until` only you can judge comes back daily under `Temporary instructions
   possibly over`: retire it when it clearly is.
