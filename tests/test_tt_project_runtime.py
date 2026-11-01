@@ -2468,6 +2468,56 @@ def test_the_audit_reports_dollars_per_done_task_by_kind_and_tier(env):
         "\n".join(audit.lines(p.db, now))
 
 
+def test_the_audit_labels_unpriced_routed_runs_not_as_free(env):
+    """The per-kind spend line names routed runs whose provider had no price, instead of $0.00 as free."""
+    from ttp import audit, route
+    p = make(env)
+    now = time.time()
+    ids = []
+    for title, kind, tier, usd in (("a", "work", "light", 0.0), ("b", "work", "light", 0.0), ("c", "code", "standard", 1.2)):
+        t = p.db.add_task(title, "s", kind=kind, tier=tier, origin="user")
+        p.db.update_task(t, status="done", spent_usd=usd)
+        ids.append(t)
+    # a: a routed run booked unpriced; b: a routed run with a price; c: a Claude-only task.
+    p.db.x("INSERT INTO runs(role,task,provider,started,ended,status,cost_usd,note) VALUES('worker',?,'chat',?,?,?,?,?)",
+            (ids[0], now - 60, now, "ok", 0.0, json.dumps({route.KEY: {"to": "chat", "priced": False}})))
+    p.db.x("INSERT INTO runs(role,task,provider,started,ended,status,cost_usd,note) VALUES('worker',?,'chat',?,?,?,?,?)",
+            (ids[1], now - 60, now, "ok", 0.01, json.dumps({route.KEY: {"to": "chat", "priced": True}})))
+    p.db.x("INSERT INTO runs(role,task,provider,started,ended,status,cost_usd,note) VALUES('worker',?,'claude',?,?,?,?,?)",
+            (ids[2], now - 60, now, "ok", 1.2, "{}"))
+    done = audit.finished(p.db, now - 86400)
+    unpriced = audit.unpriced_runs(p.db, done)
+    assert unpriced == {ids[0]: 1}, unpriced
+    groups = {(g["kind"], g["tier"]): g for g in audit.per_outcome(done, unpriced)}
+    assert groups[("work", "light")]["unpriced"] == 1 and groups[("code", "standard")]["unpriced"] == 0
+    lines = "\n".join(audit.lines(p.db, now))
+    assert "work/light 2 at $0.00 (1 unpriced, routed)" in lines, lines
+    assert "code/standard 1 at $1.20" in lines
+    assert "code/standard 1 at $1.20" in lines and not "code/standard 1 at $1.20 (" in lines
+    assert "finished tasks: 3 (3 done), workers $1.20" in lines
+    assert "; 1 runs unpriced" in lines, lines
+
+
+def test_the_audit_labels_unpriced_routed_runs_only_with_priced_false(env):
+    """A run with no route entry, or priced: True, is not unpriced; Claude-only tasks stay unchanged."""
+    from ttp import audit, route
+    p = make(env)
+    now = time.time()
+    t1 = p.db.add_task("a", "s", kind="code", tier="light", origin="user")
+    p.db.update_task(t1, status="done", spent_usd=0.0)
+    p.db.x("INSERT INTO runs(role,task,provider,started,ended,status,cost_usd,note) VALUES('worker',?,'chat',?,?,?,?,?)",
+            (t1, now - 60, now, "ok", 0.0, json.dumps({route.KEY: {"to": "chat", "priced": True}})))
+    p.db.x("INSERT INTO runs(role,task,provider,started,ended,status,cost_usd,note) VALUES('worker',?,'claude',?,?,?,?,?)",
+            (t1, now - 60, now, "ok", 0.0, "{}"))
+    t2 = p.db.add_task("b", "s", kind="code", tier="light", origin="user")
+    p.db.update_task(t2, status="done", spent_usd=0.0)
+    p.db.x("INSERT INTO runs(role,task,provider,started,ended,status,cost_usd,note) VALUES('worker',?,'claude',?,?,?,?,?)",
+            (t2, now - 60, now, "ok", 0.0, "{}"))
+    assert audit.unpriced_runs(p.db, audit.finished(p.db, now - 86400)) == {}
+    lines = "\n".join(audit.lines(p.db, now))
+    assert "unpriced" not in lines, lines
+
+
 def test_the_audit_counts_runs_lost_to_reboots_and_continued_tasks_apart(env):
     from ttp import audit
     p = make(env)

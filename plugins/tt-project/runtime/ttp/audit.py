@@ -40,7 +40,7 @@ import json
 import time
 from typing import Any
 
-from . import budget, chaincap, checkprestage, correction, ends, obligations, quietgate, reviewstats, schedule, sharedchecks, suitecost, sweepskip, turngate, unblock, upstream
+from . import budget, chaincap, checkprestage, correction, ends, obligations, quietgate, reviewstats, route, schedule, sharedchecks, suitecost, sweepskip, turngate, unblock, upstream
 from .db import DB, continues_id
 from .project import Project
 
@@ -180,14 +180,33 @@ def finished(db: DB, since: float) -> list[dict]:
                 "AND updated>=? ORDER BY spent_usd DESC", (since,))
 
 
-def per_outcome(done: list[dict]) -> list[dict]:
-    """$ per done task by kind and tier, from `finished` rows, most costly first: {kind, tier, n, usd, each}."""
+def unpriced_runs(db: DB, done: list[dict]) -> dict[int, int]:
+    """Per task id in `done`, how many of its runs were routed to a provider that had no price
+    for them (the run was booked at $0 and its route entry has priced: false)."""
+    ids = [t["id"] for t in done if t["status"] == "done"]
+    if not ids:
+        return {}
+    rows = db.q("SELECT task, note FROM runs WHERE role='worker' AND task IN "
+                f"({','.join('?' * len(ids))})", ids)
+    out: dict[int, int] = {}
+    for r in rows:
+        e = route.of(r["note"])
+        if e is not None and e.get("priced") is False:
+            out[r["task"]] = out.get(r["task"], 0) + 1
+    return out
+
+
+def per_outcome(done: list[dict], unpriced: dict[int, int] | None = None) -> list[dict]:
+    """$ per done task by kind and tier, from `finished` rows, most costly first: {kind, tier, n, usd, each}.
+    `unpriced` (task id -> routed runs with no price) adds per-group counts of unpriced runs, so a
+    $0.00 group is never read as free."""
     groups: dict[tuple, dict] = {}
     for t in done:
         if t["status"] == "done":
-            g = groups.setdefault((t["kind"], t["tier"]), {"kind": t["kind"], "tier": t["tier"], "n": 0, "usd": 0.0})
+            g = groups.setdefault((t["kind"], t["tier"]), {"kind": t["kind"], "tier": t["tier"], "n": 0, "usd": 0.0, "unpriced": 0})
             g["n"] += 1
             g["usd"] += float(t["spent_usd"] or 0)
+            g["unpriced"] += (unpriced or {}).get(t["id"], 0)
     return sorted(({**g, "each": g["usd"] / g["n"]} for g in groups.values()), key=lambda g: -g["usd"])
 
 
@@ -367,17 +386,20 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(f"blocker sweeps: {sweeps['model']} by the model, {sweeps['skipped']} skipped model-free "
                    f"(unchanged, every item ends without a turn), ~${sweeps['usd']:.2f} saved")
     done = finished(db, since)
+    unpriced = unpriced_runs(db, done)
     if done:
         work = sum(float(t["spent_usd"] or 0) for t in done)
         out.append(f"finished tasks: {len(done)} ({sum(t['status'] == 'done' for t in done)} done), workers ${work:.2f} "
                    f"(${work / len(done):.2f} each), coordinator ${turns['usd']:.2f} in the window "
-                   f"(${turns['usd'] / len(done):.2f} per finished task); most costly: " + ", ".join(
+                   f"(${turns['usd'] / len(done):.2f} per finished task)"
+                   + (f"; {sum(unpriced.values())} runs unpriced" if sum(unpriced.values()) else "") + "; most costly: " + ", ".join(
                        f"#{t['id']} {_short(t['title'], 50)} {t['status']} ${float(t['spent_usd'] or 0):.2f}"
                        for t in done[:3]))
-        groups = per_outcome(done)
+        groups = per_outcome(done, unpriced)
         if groups:
             out.append("$ per done task by kind and tier: " + ", ".join(
-                f"{g['kind']}/{g['tier']} {g['n']} at ${g['each']:.2f}" for g in groups))
+                f"{g['kind']}/{g['tier']} {g['n']} at ${g['each']:.2f}"
+                + (f" ({g['unpriced']} unpriced, routed)" if g["unpriced"] else "") for g in groups))
     stuck = stuck_long(db, now, blocked_h)
     if stuck:
         out.append(f"blocked or waiting longer than {blocked_h:g} h now: {len(stuck)}: " + ", ".join(
@@ -429,13 +451,14 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
     now = time.time() if now is None else now
     since = now - window_s
     done = finished(db, since)
+    unpriced = unpriced_runs(db, done)
     return {"window_h": window_s / 3600, "asks": asks(db, since, now, p), "asks_refused": rejected_asks(db, since),
             "failed_runs": failed_runs(db, since), "lost_runs": lost_runs(db, since),
             "retried_tasks": retried_tasks(db, since), "continued_tasks": continued_tasks(db, since),
             "review_fix_tasks": continued_tasks(db, since, fixes=True),
             "coordinator_turns": coordinator_turns(db, since),
             "coordinator_cache": budget.coordinator_cache(db, now, window_s)["window"], "turns_skipped": turngate.skipped(db, since), "turns_quiet": quietgate.skipped(db, since), "sweeps": sweepskip.counts(db, since, now),
-            "finished": done, "per_outcome": per_outcome(done),
+            "finished": done, "per_outcome": per_outcome(done, unpriced),
             "stuck": stuck_long(db, now, blocked_h), "review_loops": review_loops(db, since),
             "reviews": {**reviewstats.summary(db, since), "rows": reviewstats.rows(db, since)},
             "overrides": overrides(p, db, now, blocked_h), "promises": obligations.promise_outcomes(db, since, now),
