@@ -9,8 +9,8 @@ prechecks and heal checks, open tasks' specs and start_when probes, config value
 files: harness scripts, tools, hooks and prompts, the project's skills and agent instructions, and the
 paths in coordinator.echo_paths) and lists the hits under RETIRED_HEADER, which carries its own
 instruction; memory entries that hit are also named on one line for memory_forget, so they do not pile up. It is a notice only: no event, wake, hold or model call. Not searched: the replacing
-text itself (its entry, or its words wherever they stand) and the archives (memory/archive, the charter
-history), and harness files the project never edited (equal to the harness's `upstream` snapshot or the
+text itself (its entry, or its words wherever they stand), the charter's Brief (the user's verbatim words,
+never an echo), the archives (memory/archive, the charter history), and harness files the project never edited (equal to the harness's `upstream` snapshot or the
 plugin template): only a project-tuned copy can be fixed. A phrase the replacing text keeps is no phrase of the
 retired rule, nor is plugin vocabulary (one identifier or `ttp <command>` name found in the runtime source or an
 unedited template file, such as `start_when` or `ttp list`; never the plugin's prose, nor a Correction's
@@ -31,8 +31,8 @@ is a directive; a hit of the other kinds, or one resting only on a filename, pat
 fragment (_weak, or an identifier the retired text holds only inside such a token: _fragment), is
 advisory: counted on one line, never a fix order. A fourth kind, UNVERIFIED (its origin unknown: nothing
 shows the user withdrew that rule), is advisory too: a record stored before kinds existed gets one from
-its source (_kind), and an unknown kind or source is UNVERIFIED. A hit of an unsourced Restrictions item the
-coordinator dropped is advisory while the Brief or a sourced item still states it (restriction_audit.still_stated):
+its source (_kind), and an unknown kind or source is UNVERIFIED. A hit of an unsourced Restrictions item dropped (by the coordinator or
+the user, with `over` or not: restriction_source.drops_unsourced) is advisory while the Brief or a sourced item still states it (restriction_audit.still_stated):
 that rule still binds, so its copies are right. `export` is the read-only full list
 behind `ttp echoes`. Accepted gaps (settled weak-token set): a dashed config-style name with a decimal
 suffix ('max-ratio-1.5') counts as weak; a version joined by '_', '=' or '+' counts as strong (over-flag).
@@ -534,8 +534,8 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None) -> l
         own.sort(key=lambda ph: ph in weak)   # a governing phrase first: a hit rests on it when it can
         skip = set(rec.get("skip") or ())
         for key, label, text, flat in where:
-            if key in skip or (rec["id"], key) in seen:
-                continue
+            if key in skip or (rec["id"], key) in seen or key[:14].lower() == "charter:brief":   # the user's own
+                continue                                                                        # words, never one
             ph = _hit(rec, flat, own)
             if ph:
                 seen.add((rec["id"], key))

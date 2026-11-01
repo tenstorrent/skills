@@ -2670,6 +2670,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         replaced = "\n".join(secs[i][1]) if i is not None else ""
                         if i is not None and " ".join(secs[i][0][3:].split()).lower().startswith("restriction"):
                             gone = "\n".join(secs[i][1])
+                    loose_drop = (restriction_source.drops_unsourced("", body=gone) if gone else
+                                  restriction_source.drops_unsourced(p.charter_path.read_text(), quote=quote)
+                                  if quote and _DATED.sub("", section).lower().startswith("restriction") else False)
                     try:
                         target, extra, retired = _charter_update(p, section, text, quote, replaces, key,
                                                                  user_turn or ok is not None, over, end, no_ok,
@@ -2680,8 +2683,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         raise
                     if quote or replaced:   # the retired text, searched for in what still binds (echoes)
                         echoes.record(db, f"charter '{target}' " + ("quote replaced" if quote else "section replaced"),
-                                      quote or replaced, text,   # an advisory item the coordinator dropped:
-                                      unsourced=bool(retired) and not (user_turn or ok is not None)
+                                      quote or replaced, text,   # an advisory item dropped, `over` or not:
+                                      unsourced=loose_drop or bool(retired) and not (user_turn or ok is not None)
                                       and len(over) < OVER_MIN)
                     if user_turn or ok is not None:   # the user's word: the next turn's prompt shows it
                         db.set_kv(PROMPT_REFRESH_KEY, {"at": time.time(), "section": target})

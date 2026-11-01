@@ -3191,8 +3191,8 @@ def test_dropping_an_unsourced_copy_of_a_rule_the_brief_or_a_sourced_item_states
     assert tools == [] and lines == [], (tools, lines)
     assert data["matches"] and all(m["action"] == "none" and m["why"] == "still stated in Brief: no action"
                                    for m in data["matches"]), data["matches"]
-    assert {"charter section 'Brief'", f"task #{spec} spec", "config delivery.push_checks[0]"} <= {
-        m["where"] for m in data["matches"]}
+    where = {m["where"] for m in data["matches"]}   # the Brief is the user's own words: never searched
+    assert {f"task #{spec} spec", "config delivery.push_checks[0]"} <= where and "charter section 'Brief'" not in where
     # ... and so does a sourced Restrictions item.
     sourced = "- Every change keeps the required `lint-check` suite green before it is published. (user msg #1)\n"
     tools, lines, _ = run(f"# demo\n\n## Restrictions\n{sourced}- {copy}\n", {**drop, "quote": copy}, 3)

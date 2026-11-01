@@ -208,6 +208,17 @@ def whole_item(body: str, start: int, end: int, items) -> tuple[int, int]:
     return start, end
 
 
+def drops_unsourced(charter: str, quote: str = "", body: str = "") -> bool:
+    """Whether a charter_update retires only unsourced Restrictions items: those of the replaced
+    Restrictions section `body`, else the items of `charter`'s Restrictions holding `quote`. Such an item
+    never bound, whoever drops it and with or without `over` (echoes.scan checks what still states it)."""
+    from .prompts import charter_restrictions
+    q = _loose(quote)
+    items = [" ".join(" ".join(x).split()) for x in split_items(body or charter_restrictions(charter))]
+    items = [x for x in items if x and not x.startswith("#") and (body or q and q in _loose(x))]
+    return bool(items) and not any(sourced(x) for x in items)
+
+
 def unsourced_span(body: str, start: int, end: int, items) -> bool:
     """Whether the span [start, end) of a Restrictions body lies only in unsourced items (`items`:
     coordinator._items of `body`)."""

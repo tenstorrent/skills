@@ -595,3 +595,42 @@ def test_a_running_version_observation_is_advisory_spaced_or_compact(env, ver):
     assert echoes._weak("running0.2.646") and echoes._weak("using v1.2")
     assert not any(echoes._weak(x) for x in ("abc1.2.3", "ratio1.5", "python3.11", "jev.threshold=0.8",
                                              "max_ratio_1.5", "running"))
+
+
+def test_an_advisory_item_dropped_as_a_duplicate_of_the_brief_is_no_echo_and_a_withdrawn_cited_one_is(env):
+    """An unsourced Restrictions item the coordinator drops as a duplicate (with `over`) while the Brief
+    still states it: no digest line for the Brief, a config copy or a task spec, and the Brief is never
+    searched. A cited item the user withdraws while a config value still holds it: one echo line."""
+    from ttp import coordinator as coord, echoes
+    p = make(env)
+    brief = "## Brief\nEvery change keeps the required `lint-check` suite green before it is published.\n\n"
+    copy = "Keep the required `lint-check` suite green before publishing a change."
+    p.set_config("delivery.push_checks", ["run the lint-check suite"])
+    spec = p.db.add_task("guard publishing", "Run the required `lint-check` suite before publishing.")
+    p.charter_path.write_text(f"# demo\n\n{brief}## Restrictions\n- Never merge. (user msg #1)\n- {copy}\n")
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": copy, "text": "",
+                            "over": "a duplicate of the Brief's own words, which still state it"}], turn=2) == []
+    assert copy not in p.charter_path.read_text()
+    assert echoes.digest_lines(p) == []
+    matches = echoes.export(p)["matches"]
+    assert {f"task #{spec} spec", "config delivery.push_checks[0]"} <= {m["where"] for m in matches}, matches
+    assert all(m["action"] == "none" and m["why"] == "still stated in Brief: no action" for m in matches), matches
+    assert not any(m["where"].startswith("charter section 'Brief'") for m in matches), matches
+    # A cited item the user withdraws, its text still in a config value: one echo, the config entry.
+    p.db.set_kv(echoes.RETIRED_KEY, [])
+    item = "Hold every release for the `freeze-gate` sign-off (user msg #1)."
+    p.set_config("delivery.release_hold", "wait for the freeze-gate sign-off")
+    p.charter_path.write_text(f"# demo\n\n## Brief\nShip it.\n\n## Restrictions\n- {item}\n")
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": item, "text": ""}],
+                       turn=3, user_turn=True) == []
+    lines = echoes.digest_lines(p)
+    assert lines[0] == echoes.RETIRED_HEADER and len(lines) == 2, lines
+    assert lines[1].startswith("- config delivery.release_hold:"), lines
+    # drops_unsourced judges the whole item a quote sits in, never the quote alone.
+    from ttp.restriction_source import drops_unsourced
+    charter = "# demo\n\n## Restrictions\n- Never merge to main. (user msg #4)\n- Keep the lint-check suite green.\n"
+    assert drops_unsourced(charter, quote="Never merge to main.") is False   # its cite sits outside the quote
+    assert drops_unsourced(charter, quote="lint-check suite") is True
+    assert drops_unsourced(charter, quote="") is False and drops_unsourced(charter, quote="not there") is False
+    assert drops_unsourced("", body="- Keep it green.\n- Never tag.\n") is True
+    assert drops_unsourced("", body="- Keep it green.\n- Never tag. (origin: harness gate)\n") is False
