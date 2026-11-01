@@ -1277,3 +1277,33 @@ def test_ttp_lock_stays_held_while_a_process_its_command_left_running_keeps_it_o
         go.touch()
     assert _cmd_ended(bg_pid)
     assert _until_true(lambda: _lock_probe(run_env, "board").returncode == 0), _lock_probe(run_env, "board").stdout
+
+
+def test_a_waiting_ttp_lock_logs_who_sent_it_sigterm_and_still_exits_143(env, tmp_path):
+    # A detached job waiting on a lock got rc 143 with no sender logged (note e5b657dfd48c4253): the
+    # waiter now names the signal's sender in its stderr, progress.md and the job-signal stream.
+    p = make(env)
+    run_env = _lock_env(env, p)
+    held, go, run_dir = tmp_path / "held", tmp_path / "go", tmp_path / "run"
+    run_dir.mkdir()
+    h = _lock(run_env, "rig-a", cmd=("sh", "-c", f"touch {shlex.quote(str(held))}; {shlex.join(_until(go))}"))
+    w = None
+    try:
+        _wait_for_file(held, h)
+        w = _lock(dict(run_env, TTP_TEST_POLL_S="30", TTP_RUN_DIR=str(run_dir)), "rig-a")
+        assert "waiting for" in _stderr_until(w, "waiting for")
+        time.sleep(0.3)   # into its nap
+        w.send_signal(signal.SIGTERM)
+        assert w.wait(timeout=30) == 143
+        err = w.stderr.read()
+    finally:
+        go.touch()
+        if w and w.poll() is None:
+            w.kill()
+    assert h.wait(timeout=30) == 0
+    assert f"SIGTERM received by pid {w.pid}" in err and f"from pid {os.getpid()}" in err, err
+    prog = (run_dir / "progress.md").read_text()
+    assert f"SIGTERM received by pid {w.pid}" in prog and f"from pid {os.getpid()}" in prog, prog
+    rows = [json.loads(x) for x in (p.state / "job-signals.jsonl").read_text().splitlines()]
+    assert any(r.get("received") and r["signal"] == "SIGTERM" and r["from_pid"] == os.getpid()
+               and r["pid"] == w.pid for r in rows), rows

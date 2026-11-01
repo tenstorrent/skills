@@ -13097,6 +13097,11 @@ def test_a_cancelled_tasks_detached_push_is_stopped_and_its_queued_push_never_st
         assert _wait_for(lambda: not jobstop.members(pid), 10), "the push's check outlived it"
         m = json.loads(marker.read_text())
         assert m["status"] == "failed" and f"task #{tid} is cancelled" in m["reason"]
+        logged = marker.with_suffix(".log").read_text()   # each signal names its code path and sender
+        assert f"SIGTERM to group {pid} of job {marker.stem}" in logged and "(jobstop.end_push)" in logged, logged
+        assert f"from jobstop pid {os.getpid()}" in logged, logged
+        rows = [json.loads(x) for x in (p.state / "job-signals.jsonl").read_text().splitlines()]
+        assert any(x["reason"] == "jobstop.end_push" and x["pid"] == pid and x["task"] == tid for x in rows), rows
         assert _probe(p, probe).returncode == 0
         assert subprocess.run(["git", "-C", str(origin), "rev-parse", "--verify", "-q", f"ttp/t{tid}-soak"],
                               capture_output=True).returncode != 0, "the stopped push went through"
