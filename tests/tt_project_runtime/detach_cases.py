@@ -634,6 +634,106 @@ def _stopped_events(p):
     return p.db.q("SELECT * FROM events WHERE kind='detached_job_stopped'")
 
 
+def _signal_rows(p):
+    f = p.state / "job-signals.jsonl"
+    return [json.loads(x) for x in f.read_text().splitlines()] if f.exists() else []
+
+
+def test_each_signal_a_stop_sends_a_detached_job_is_logged_in_its_log_and_the_signal_stream(env, tmp_path, monkeypatch):
+    """The sweep stops an ended task's job: its SIGSTOP and SIGKILL each add a line to the job's own log
+    and a row to state/job-signals.jsonl naming the job, group, signal, code path, why and sender."""
+    from ttp import jobstop
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    monkeypatch.setenv("PATH", f"{broker}:{os.environ['PATH']}")
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, tid, broker, status="cancelled")
+    try:
+        (r,) = jobstop.sweep(p)
+        log = rc.with_suffix(".log").read_text()
+        for sig in ("SIGSTOP", "SIGKILL"):
+            assert (f"{sig} to group {pgid} of job loop (task #{tid}) from jobstop pid {os.getpid()}" in log
+                    and f"(jobstop.sweep): task #{tid} is cancelled" in log), log
+        rows = _signal_rows(p)
+        assert [(x["signal"], x["job"], x["pid"], x["group"], x["reason"], x["by"], x["by_pid"], x["task"])
+                for x in rows] == [(s, "loop", pgid, True, "jobstop.sweep", "jobstop", os.getpid(), tid)
+                                   for s in ("SIGSTOP", "SIGKILL")], rows
+        assert all(x["why"] == f"task #{tid} is cancelled" and x["ts"] > 0 for x in rows)
+        assert f"SIGSTOP then SIGKILL to group {pgid} from jobstop pid {os.getpid()} (jobstop.sweep)" in r["text"]
+    finally:
+        _end_group(pgid)
+
+
+def test_a_daemon_paths_detach_stop_logs_its_code_path_and_sender(env, tmp_path):
+    """detach.stop, as heal's fix timeout and the reboot relaunch call it, logs its SIGKILL with the code
+    path it names; a job already gone logs nothing."""
+    from ttp import detach
+    p = make(env)
+    run_dir = p.runs / "fix-run"
+    run_dir.mkdir(parents=True)
+    rc = run_dir / "fix.rc"
+    proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    try:
+        detach.stop(rc, proc.pid, "ran past fix_timeout_s (5 s)", reason="heal.fix_timeout", by="daemon")
+        assert proc.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        _end_group(proc.pid)
+    assert "ran past fix_timeout_s" in rc.with_suffix(".lost").read_text()
+    log = rc.with_suffix(".log").read_text()
+    assert f"SIGKILL to group {proc.pid} of job fix from daemon pid {os.getpid()}" in log, log
+    assert "(heal.fix_timeout): ran past fix_timeout_s (5 s)" in log
+    (row,) = _signal_rows(p)
+    assert (row["signal"], row["reason"], row["by"], row["pid"], row["rc"]) == (
+        "SIGKILL", "heal.fix_timeout", "daemon", proc.pid, str(rc))
+    detach.stop(rc, proc.pid, "again", reason="heal.fix_timeout")   # gone: nothing more logged
+    assert len(_signal_rows(p)) == 1
+
+
+def test_a_waiting_tasks_job_outlives_the_run_that_started_it_and_is_never_signalled(env, tmp_path, monkeypatch):
+    """By design: the run that started a job has ended, but its task waits on the job, so the daemon's
+    sweep leaves it running, sends it nothing and logs no signal."""
+    from ttp import jobstop, locks as lk
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    monkeypatch.setenv("PATH", f"{broker}:{os.environ['PATH']}")
+    tid = p.db.add_task("gate", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, tid, broker, status="queued")
+    try:
+        p.db.update_task(tid, result=json.dumps({"status": "waiting", "retry_when": f"ttp detach --check {rc}"}))
+        assert p.db.one("SELECT status FROM runs WHERE task=?", (tid,))["status"] == "ok"   # its run ended
+        assert jobstop.sweep(p) == [] and not lk.any_free([lk.job_lock(rc)])
+        assert jobstop.members(pgid) and not rc.with_suffix(".lost").exists() and not rc.exists()
+        assert _signal_rows(p) == [] and "SIG" not in rc.with_suffix(".log").read_text()
+    finally:
+        _end_group(pgid)
+
+
+def test_newer_detached_checks_log_the_signal_that_replaced_the_older_ones(env, tmp_path, monkeypatch, capsys,
+                                                                        reap_tmp_processes):
+    """A second `ttp checks --detach` in the same run ends the first: the SIGTERM goes into checks.log
+    and the job-signal stream, naming the replacement as the code path."""
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    started = tmp_path / "started"
+    first = _detached_checks(run, capsys, "sh", "-c", f"touch {started}; sleep 60")
+    second = None
+    try:
+        assert _wait_for(started.exists)
+        second = _detached_checks(run, capsys, "true")
+        assert _wait_for(lambda: _gone_pid(first), 20)
+        log = (run / "checks.log").read_text()
+        assert f"SIGTERM to group {first} of job checks from checks pid {os.getpid()}" in log, log
+        assert "(ttp checks --detach (replaced))" in log
+        assert [(r["signal"], r["pid"], r["by"]) for r in _signal_rows(p)][:1] == [("SIGTERM", first, "checks")]
+    finally:
+        for x in (first, second):
+            try:
+                if x:
+                    os.killpg(x, signal.SIGKILL)
+            except OSError:
+                pass
+        reap_tmp_processes(tmp_path)
+
+
 def test_a_cancelled_tasks_job_is_frozen_its_matching_broker_job_ended_and_its_locks_freed(env, tmp_path, monkeypatch):
     import pwd
     from ttp import jobstop, locks as lk
@@ -946,6 +1046,14 @@ def test_a_cancelled_tasks_detached_checks_from_an_earlier_run_are_stopped(env, 
         assert [r["job"] for r in stopped] == ["checks"] and _wait_for(lambda: _gone_pid(pid), 10)
         assert (run / "checks.rc").read_text().strip() == "143"
         assert len(_stopped_events(p)) == 1 and f"task #{tid}" in _stopped_events(p)[0]["text"]
+        # The SIGTERM is named in the checks' own log and the project's job-signal stream, with its sender.
+        log = (run / "checks.log").read_text()
+        assert f"SIGTERM to group {pid} of job checks (task #{tid}) from jobstop pid {os.getpid()}" in log, log
+        assert "(jobstop.end_checks)" in log
+        rows = _signal_rows(p)
+        assert [(r["signal"], r["reason"], r["pid"], r["by_pid"]) for r in rows][:1] == [
+            ("SIGTERM", "jobstop.end_checks", pid, os.getpid())], rows
+        assert f"SIGTERM to group {pid} from jobstop pid {os.getpid()}" in _stopped_events(p)[0]["text"]
         assert jobstop.sweep(p) == [] and len(_stopped_events(p)) == 1
     finally:
         try:
