@@ -3212,6 +3212,47 @@ def test_dropping_an_unsourced_copy_of_a_rule_the_brief_or_a_sourced_item_states
     assert any("publish-guard.sh" in ln for ln in lines), lines
 
 
+def test_an_unsourced_copy_dropped_with_an_over_reason_raises_no_restriction_tools_event(env):
+    """An advisory Restrictions item the Brief or a sourced item still states raises no restriction_tools
+    event whoever drops it and with any `over` or none (restriction_source.drops_unsourced); a cited item
+    the user withdraws while a tool still enforces it raises exactly one."""
+    p = make(env)
+    from ttp import coordinator as coord
+    brief = "## Brief\nEvery change keeps the required `lint-check` suite green before it is published.\n\n"
+    sourced = "- Every change keeps the required `lint-check` suite green before it is published. (user msg #1)\n"
+    copy = "Keep the required `lint-check` suite green before publishing a change."
+    tool = p.harness / "bin" / "publish-guard.sh"
+    tool.parent.mkdir(parents=True, exist_ok=True)
+    tool.write_text("#!/bin/sh\n# refuse to publish unless the lint-check suite is green\nexit 0\n")
+    drop = {"type": "charter_update", "section": "Restrictions", "text": ""}
+    over = "a duplicate of what the Brief already states, so this copy adds nothing"
+
+    def tools(charter: str, act: dict, turn: int, user_turn: bool = False) -> list[str]:
+        p.db.x("DELETE FROM events")
+        p.charter_path.write_text(charter)
+        assert coord.apply(p, [act], turn=turn, user_turn=user_turn) == []
+        return [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind='restriction_tools'")]
+    turn = 10
+    for states in (brief + "## Restrictions\n- Never merge. (user msg #1)\n", "## Restrictions\n" + sourced):
+        for act, user_turn in (({**drop, "quote": copy, "over": over}, False), ({**drop, "quote": copy}, False),
+                               ({**drop, "quote": copy, "over": "dup"}, False),
+                               ({**drop, "quote": copy, "source": {"origin": "gate"}}, True)):
+            turn += 1
+            assert tools(f"# demo\n\n{states}- {copy}\n", act, turn, user_turn) == [], (states, act)
+    # A whole section of advisory items replaced, `over` naming why.
+    said = p.db.post("in", "never merge", chat=None, channel="web", kind="user", provenance="web-session")
+    assert tools(f"# demo\n\n{brief}## Restrictions\n- {copy}\n",
+                 {**drop, "replaces": "Restrictions", "text": "- Never merge.", "over": over,
+                  "source": {"msg": said, "quote": "never merge"}}, 30) == []
+    # A cited item the user withdraws while a tool still enforces it: exactly one event.
+    item = "Never publish unless the required `lint-check` suite is green (user msg #1)."
+    out = tools(f"# demo\n\n{brief}## Restrictions\n- {item}\n",
+                {**drop, "quote": item, "source": {"origin": "gate"}}, 40, user_turn=True)
+    assert len(out) == 1 and "publish-guard.sh:2" in out[0], out
+    # ... and so does a cited item `over` retires, though the Brief states it.
+    out = tools(f"# demo\n\n{brief}## Restrictions\n- {item}\n", {**drop, "quote": item, "over": over}, 41)
+    assert len(out) == 1 and out[0].startswith("`over` retired") and "publish-guard.sh:2" in out[0], out
+
 def test_still_stated_needs_a_binding_unit_with_the_items_identifiers_and_most_of_its_words():
     from ttp.restriction_audit import still_stated
     charter = ("# demo\n\n## Brief\nEvery change keeps the required `lint-check` suite green before it is "

@@ -7,7 +7,7 @@ whole Restrictions section with looser wording), or `over` retires one, the proj
 (bin/, hooks/, schedules) may still carry the old rule. restriction_tools names them in a queued
 `restriction_tools` event for the next digest; it never edits anything. coordinator.apply() calls it
 once per turn, with the turn's tasks, so a tool a task of that batch already names is left out. An
-unsourced (advisory) item the coordinator dropped whose words the Brief or a sourced Restrictions item
+unsourced (advisory) item dropped, by anyone and with any `over` or none, whose words the Brief or a sourced Restrictions item
 still states (still_stated) is left out too: that rule still binds, so its tools are right.
 
 only_blocks_lines gives the daily review, per Restrictions item, the 7-day count of blocked runs and
@@ -124,13 +124,15 @@ def replaced_items(body: str, text: str) -> list[tuple[str, str]]:
     return out
 
 
-def restriction_tools(p: Project, loosened: list[tuple[str, str, str]], batch: list[int]) -> list[str]:
+def restriction_tools(p: Project, loosened: list[tuple], batch: list[int]) -> list[str]:
     """After Restrictions items were loosened or removed, name the project's own tools that still carry
     the old wording: files under bin/ and hooks/ (project root and harness), harness/schedules.json,
     and the command and heal check of each enabled schedule, whose lines name an identifier of the old item
     or two of its dropped rule words (tool_terms; an identifier the current charter still states anywhere
-    is not one). A disabled schedule, in the table or its schedules.json entry, is left out. `loosened`: (old item, new text, over), `over`
-    empty for the user's word, else the end that retired the item. A file a task of this batch
+    is not one). A disabled schedule, in the table or its schedules.json entry, is left out. `loosened`: (old item, new text, over[,
+    advisory]), `over` empty for the user's word, else the end that retired the item; `advisory`: the dropped
+    items were all unsourced (restriction_source.drops_unsourced), so whoever dropped them and with any `over`,
+    one the Brief or a sourced item still states is left out, as is `over` "unsourced". A file a task of this batch
     names (its title or spec has the file's path or name) is left out. One queued restriction_tools
     event per item with such files, for the next digest: model-free, it edits nothing. Returns the
     event texts."""
@@ -170,8 +172,8 @@ def restriction_tools(p: Project, loosened: list[tuple[str, str, str]], batch: l
     except OSError:
         charter = ""
     out = []
-    for old, new, over in loosened:
-        if over == "unsourced" and still_stated(charter, old):
+    for old, new, over, *advisory in loosened:
+        if (over == "unsourced" or any(advisory)) and still_stated(charter, old):
             continue   # a dropped advisory copy of a rule the Brief or a sourced item still binds: tools stay right
         ids, words = tool_terms(old, new, charter)
         hits = []

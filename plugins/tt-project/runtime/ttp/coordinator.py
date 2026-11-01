@@ -1856,7 +1856,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     restr_before: str | None = None
     rules_added: list[tuple[str, str]] = []
     restr_edited = False
-    loosened: list[tuple[str, str, str]] = []   # (old item, new text, over) of Restrictions items loosened or retired
+    # (old item, new text, over, advisory) of Restrictions items loosened or retired; advisory: only unsourced
+    loosened: list[tuple[str, str, str, bool]] = []   # items dropped (restriction_source.drops_unsourced)
     replies: list[int] = []
     # Promises (obligations.record_promises): what this batch sent, the tasks it added or updated with
     # their reply_chat, and the obligations it recorded or attached owners to.
@@ -2706,10 +2707,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         why = ("" if user_turn or ok is not None else over if len(over) >= OVER_MIN
                                else "unsourced" if retired else None)
                         if why is not None and quote and _loosens(quote, text):
-                            loosened.append((quote, text, why))
+                            loosened.append((quote, text, why, loose_drop))
                         if why is not None and gone:
                             into = text if target.lower().startswith("restriction") else ""
-                            loosened += [(o, n, why) for o, n in restriction_audit.replaced_items(gone, into)]
+                            loosened += [(o, n, why, loose_drop) for o, n in restriction_audit.replaced_items(gone, into)]
                     elif text and not quote and not a.get("both_hold"):
                         rules_added.append((target, text))
                     if retired:
