@@ -666,12 +666,18 @@ def test_each_signal_a_stop_sends_a_detached_job_is_logged_in_its_log_and_the_si
 
 def test_a_daemon_paths_detach_stop_logs_its_code_path_and_sender(env, tmp_path):
     """detach.stop, as heal's fix timeout and the reboot relaunch call it, logs its SIGKILL with the code
-    path it names; a job already gone logs nothing."""
-    from ttp import detach
+    path it names, in the project's signal stream wherever under state its .rc sits (heal's fix folder,
+    a subfolder of a run); a job already gone logs nothing."""
+    from ttp import detach, heal
     p = make(env)
-    run_dir = p.runs / "fix-run"
-    run_dir.mkdir(parents=True)
-    rc = run_dir / "fix.rc"
+    fix = heal.fix_dir(p, "disk check")   # as heal.start_fix lays it out
+    fix.mkdir(parents=True)
+    rc = fix / "fix.rc"
+    (fix / "detached.json").write_text(json.dumps([{"rc": str(rc), "pid": 1, "start": time.time()}]))
+    nested = p.runs / "r1" / "sub" / "job.rc"
+    nested.parent.mkdir(parents=True)
+    for other in (nested, p.runs / "r1" / "job.rc"):
+        assert detach.signals_file(other) == p.state / "job-signals.jsonl"
     proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
     try:
         detach.stop(rc, proc.pid, "ran past fix_timeout_s (5 s)", reason="heal.fix_timeout", by="daemon")
@@ -686,7 +692,7 @@ def test_a_daemon_paths_detach_stop_logs_its_code_path_and_sender(env, tmp_path)
     assert (row["signal"], row["reason"], row["by"], row["pid"], row["rc"]) == (
         "SIGKILL", "heal.fix_timeout", "daemon", proc.pid, str(rc))
     detach.stop(rc, proc.pid, "again", reason="heal.fix_timeout")   # gone: nothing more logged
-    assert len(_signal_rows(p)) == 1
+    assert len(_signal_rows(p)) == 1 and not (fix / "job-signals.jsonl").exists()
 
 
 def test_a_waiting_tasks_job_outlives_the_run_that_started_it_and_is_never_signalled(env, tmp_path, monkeypatch):

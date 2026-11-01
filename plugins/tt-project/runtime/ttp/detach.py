@@ -327,11 +327,16 @@ SIGNALS = "job-signals.jsonl"   # under the project's state: one line per signal
 
 
 def signals_file(rc: Path, state: Path | None = None) -> Path:
-    """The project's job-signal audit stream: under `state` when given, else the state a run's job
-    sits in (state/runs/<run>/<name>.rc), else next to the .rc."""
+    """The project's job-signal audit stream: under `state` when given, else the project state the .rc
+    sits in at any depth (state/runs/<run>/, a subfolder of one, state/heal-fix/<check>/), else the
+    state a run's job sits in (<runs>/<run>/<name>.rc), else next to the .rc."""
     rc = Path(rc)
     if state is not None:
         return Path(state) / SIGNALS
+    real = Path(os.path.abspath(rc.expanduser())).parent.resolve()
+    for a in (real, *real.parents):
+        if a.name == "state" and a.parent.name == FOLDER:
+            return a / SIGNALS
     if rc.parent.parent.name == "runs":
         return rc.parent.parent.parent / SIGNALS
     return rc.parent / SIGNALS
@@ -407,17 +412,18 @@ def received(sig: int, pid: int, uid: int, reason: str, *, job: dict | None = No
 
 
 def stop(rc: Path, pid: int, why: str, *, reason: str = "detach.stop", by: str = "",
-         task: int | None = None) -> None:
+         task: int | None = None, state: Path | None = None) -> None:
     """End a job `relaunch` just started (pid, its wrapper, leads a session and process group of its
     own) before it writes an exit code, and record why in <name>.lost: its probe then reads it ended.
     The why goes first: a reader that sees its lock go free before it would record a guess instead.
-    The SIGKILL is then logged (signalled) as sent from `reason`, the calling code path."""
+    The SIGKILL is then logged (signalled) as sent from `reason`, the calling code path, in the
+    signal stream under `state` when given (signals_file)."""
     _mark_lost(Path(rc), why)
     try:
         os.killpg(pid, signal.SIGKILL)
     except OSError:
         return   # already gone: nothing signalled
-    signalled(rc, signal.SIGKILL, pid, reason, why, by=by, task=task)
+    signalled(rc, signal.SIGKILL, pid, reason, why, by=by, task=task, state=state)
 
 
 def running_pid(rc: Path, this_boot) -> int:

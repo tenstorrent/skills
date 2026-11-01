@@ -306,7 +306,7 @@ def end(p: Project, rc: Path, why: str, task: int | None = None, reason: str = "
         pids = members(pgid)
     ids, note = end_broker_jobs(pids)
     if pgid:
-        detach.stop(rc, pgid, why, reason=reason, by=BY, task=task)
+        detach.stop(rc, pgid, why, reason=reason, by=BY, task=task, state=p.state)
     freed, held = _free(slots, pgid, set(pids), lambda pid, s: detach.signalled(
         rc, signal.SIGKILL, pid, reason, f"{why}; it still held {s.name}", by=BY, group=False, state=p.state,
         task=task))
