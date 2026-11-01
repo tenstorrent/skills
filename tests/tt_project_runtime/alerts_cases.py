@@ -2692,7 +2692,7 @@ def test_after_push_deploy_followup_after_takeover(env, tmp_path, caught_up):
         assert rec['closed'] and not pages
     else:
         assert len(pages) == 1 and pages[0][0] == 'deploy-behind:alpha' and pages[0][2] == 'normal'
-        assert 'missed takeover' in pages[0][1] and 'PDT' in pages[0][1]
+        assert 'missed takeover' in pages[0][1] and ('PDT' in pages[0][1] or 'PST' in pages[0][1])
         assert alerts.holds(p.db, pages[0][0], now, due)
         hb = base / 'state' / 'heartbeat'
         data = json.loads(hb.read_text())
@@ -2741,7 +2741,7 @@ def test_after_push_deploy_restart_pending_is_owned_and_rechecked_after_its_wait
         assert rec['closed'] and not pages
     else:
         assert len(pages) == 1 and pages[0][0] == 'deploy-behind:alpha' and pages[0][2] == 'normal'
-        assert 'still behind at its re-check' in pages[0][1] and 'PDT' in pages[0][1]
+        assert 'still behind at its re-check' in pages[0][1] and ('PDT' in pages[0][1] or 'PST' in pages[0][1])
         assert alerts.holds(p.db, 'deploy-behind:alpha', now, now + 700)
 
 

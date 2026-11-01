@@ -44007,7 +44007,7 @@ def test_after_push_deploy_done_and_owned_pending(env, tmp_path):
     assert pending['takeover_at'] > 0
     notes = p.db.q("SELECT severity,text FROM messages WHERE direction='out'")
     assert len(notes) == 1 and notes[0]['severity'] == 'low'
-    assert 'beta' in notes[0]['text'] and 'PDT' in notes[0]['text']
+    assert 'beta' in notes[0]['text'] and ('PDT' in notes[0]['text'] or 'PST' in notes[0]['text'])
     assert not p.db.q('SELECT * FROM alerts')
     deploy.record(p, overview.deployed(names=['alpha', 'beta']))
     assert len(p.db.q("SELECT * FROM messages WHERE direction='out'")) == 1
