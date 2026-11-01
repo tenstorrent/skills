@@ -7,7 +7,9 @@ when ssh cannot reach the host it names: netwait.confirm, else the probe is brok
 retires one whose time passed or whose probe exits 0: memory moves to memory/archive/, a charter
 section to CHARTER.history.md, and the user gets one low-severity alert. A condition only a model
 can judge (`until` alone, or a broken probe) is listed in the digest as possibly over, at most once
-a day, and the coordinator decides. Retirements reach the next digest in one line.
+a day, with the live state of each task it names, and the coordinator decides. An `until` that is just
+one task-state clause ('#N has landed', '#N is done') gets its probe from ttp's own reads (task_probe).
+Retirements reach the next digest in one line.
 
 Memory keeps the end in its front matter (`expires:`, `until:`, `until_probe:`). A charter section
 keeps it in trailing lines of its body (`Expires: `, `Until: `, `Until probe: `), so the user and
