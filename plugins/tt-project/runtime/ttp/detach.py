@@ -55,7 +55,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from . import locks, machines, shorttmp
-from .project import FOLDER, Project, durable_write, nice_level, renice, write_json
+from .project import FOLDER, Project, durable_append, durable_write, nice_level, renice, write_json
 
 QUEUE = "detach-queue"   # under the project's state: <run>-<name>.json per job a sandboxed command queued
 SCRATCH = "detach-tmp"   # under the project's state: <run>-<name>/ is a job's temp dir while it runs
@@ -366,8 +366,7 @@ def signalled(rc: Path, sig: int, pid: int, reason: str, why: str = "", *, by: s
     for path, text in ((Path(log) if log else rc.with_suffix(".log"), line),
                        (signals_file(rc, state), json.dumps(row) + "\n")):
         try:
-            with open(path, "a", encoding="utf-8") as fh:
-                fh.write(text)
+            durable_append(path, text)
         except OSError:
             pass
     return row
@@ -397,8 +396,7 @@ def received(sig: int, pid: int, uid: int, reason: str, *, job: dict | None = No
            "from_pid": pid, "from_uid": uid, "from_cmd": cmd, "job": job.get("job"), "rc": job.get("job_rc")}
     if state is not None or job.get("job_rc"):
         try:
-            with open(signals_file(Path(job.get("job_rc") or "."), state), "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(row) + "\n")
+            durable_append(signals_file(Path(job.get("job_rc") or "."), state), json.dumps(row) + "\n")
         except OSError:
             pass
     return (f"{name} received by pid {os.getpid()} ({reason}) from pid {pid} uid {uid}"
