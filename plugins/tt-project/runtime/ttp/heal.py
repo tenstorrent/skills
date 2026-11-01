@@ -1174,7 +1174,8 @@ def _fix_job(host: Any, name: str, spec: dict, st: dict, now: float) -> tuple[st
                     min(now + FIX_POLL_S, started + limit))
         pid = int(job.get("pid") or 0)
         if pid > 1:
-            detach.stop(rc, pid, f"ran past fix_timeout_s ({limit:.0f} s): killed by the daemon")
+            detach.stop(rc, pid, f"ran past fix_timeout_s ({limit:.0f} s): killed by the daemon",
+                        reason="heal.fix_timeout", by="daemon")
         from .schedule import capped_note
         frc, fout = 124, (f"the detached fix ran past fix_timeout_s ({limit:.0f} s)"
                           f"{capped_note(spec.get('fix_timeout_asked_s'), limit)}: killed")

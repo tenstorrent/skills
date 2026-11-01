@@ -110,7 +110,7 @@ def _cap(p: Project, rc: Path, name: str, usd: float, cap: float) -> str:
     t = jobstop.task_of(p, rc)
     tid = t["id"] if t else None
     why = f"spend cap: read ${usd:.2f} reached the cap ${cap:.2f}"
-    r = jobstop.end(p, rc, why, tid)
+    r = jobstop.end(p, rc, why, tid, "spendcap")
     run = _run_id(p, rc)
     env = {progress.JOB_ENV: str(rc), "TTP_TASK": str(tid or ""), "TTP_RUN_ID": str(run or "")}
     try:

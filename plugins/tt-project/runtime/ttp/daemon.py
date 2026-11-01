@@ -9365,7 +9365,8 @@ class Daemon:
 
         def wake(why: str) -> None:
             for r, k in running():
-                detach.stop(r, k, f"stopped right after its relaunch: the task wakes instead ({why})")
+                detach.stop(r, k, f"stopped right after its relaunch: the task wakes instead ({why})",
+                            reason="daemon.relaunch_resumable", by="daemon")
         for rc in rcs:
             m = detach.read_resume(rc)
             if m is not None and self._this_boot(m.get("boot")) and m.get("relaunches"):
@@ -9416,7 +9417,8 @@ class Daemon:
             if why:
                 for r, k in started:
                     detach.stop(r, k, f"stopped right after its relaunch: detached job {rc.stem}, which the "
-                                      f"task also waits on, could not start ({why}), so the task wakes instead")
+                                      f"task also waits on, could not start ({why}), so the task wakes instead",
+                                reason="daemon.relaunch_resumable", by="daemon")
                 _task_note(rc.parent, f"the reboot cut short detached job {rc.stem}; not relaunched: {why}"
                            + (f"; stopped the jobs relaunched before it ({', '.join(r.stem for r, _ in started)})"
                               if started else ""))

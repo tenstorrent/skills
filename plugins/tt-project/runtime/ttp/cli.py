@@ -4145,8 +4145,10 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
     old = _read_checks_pid(run_dir)
     arrived = _checks_place(run_dir, old, env)
     if _checks_alive(old):
+        sent = []
         try:
             os.killpg(old["pid"], signal.SIGTERM)
+            sent.append(signal.SIGTERM)
         except OSError:
             pass
         deadline = time.time() + 15
@@ -4155,8 +4157,14 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
         if _checks_alive(old):
             try:
                 os.killpg(old["pid"], signal.SIGKILL)
+                sent.append(signal.SIGKILL)
             except OSError:
                 pass
+        from . import detach
+        state = Project(env["TTP_PROJECT"]).state if env.get("TTP_PROJECT") else None
+        for sig in sent:   # logged once they ended, into the checks log and the job-signal stream
+            detach.signalled(run_dir / CHECKS_RC, sig, old["pid"], "ttp checks --detach (replaced)",
+                             "newer detached checks of the same run replace these", by="checks", state=state)
     base = env.get("TTP_PROJECT")
     if not base:
         raise OSError("TTP_RUN_DIR for detached checks requires a project state directory (TTP_PROJECT)")
@@ -4965,6 +4973,33 @@ def cmd_lock(a) -> None:
             lk.record_wait(wait_dir, wait_key, started, time.time())
 
     job = lk.job_fields()   # inside a `ttp detach` job (its --lock): the label names the job and its pid
+
+    def _nap(secs: float) -> None:
+        # Sleep; a SIGTERM, SIGINT or SIGHUP meanwhile is taken with its sender (sigtimedwait, Linux),
+        # logged to stderr (a detached job's log), progress.md and the job-signal stream, then raised
+        # again, so its handler (or its default action) ends the wait as before.
+        sigs = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
+        if not hasattr(signal, "sigtimedwait"):
+            time.sleep(secs)
+            return
+        old = signal.pthread_sigmask(signal.SIG_BLOCK, sigs)
+        try:
+            info = signal.sigtimedwait(sigs, secs)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old)
+        if info is None:
+            return
+        from . import detach
+        line = detach.received(info.si_signo, info.si_pid, info.si_uid, f"ttp lock waiting for {what}",
+                               job=job, state=p.state)
+        print(f"ttp lock: {line}", file=sys.stderr, flush=True)
+        if run_dir:
+            try:
+                with open(run_dir / "progress.md", "a") as pf:
+                    pf.write(f"{timefmt.clock()} {line}\n")
+            except OSError:
+                pass
+        os.kill(os.getpid(), info.si_signo)
     tickets: list = []
     atexit.register(lambda: [lk.dequeue(t) for t in tickets])   # however this ends; a dead process's ticket is dropped too
     prio = _urgent_priority(p, own)   # an urgent task's waiter goes ahead of routine ones (urgent.py)
@@ -5118,7 +5153,7 @@ def cmd_lock(a) -> None:
             die(f"{what} stayed busy for {timeout:.0f} s. Hand the task back now: result.json status "
                 f"`waiting`, waiting_for `{what}`, retry_when "
                 f"`ttp lock --probe{' --shared' if a.shared else ''} {what}`", 75)
-        time.sleep(poll_s(3))
+        _nap(poll_s(3))
 
 def cmd_land(a) -> None:
     """Land a reviewed head on a push branch that is a local branch of a code repo with no git remote
@@ -5477,7 +5512,7 @@ def _detach_stop(what: str) -> int:
         print(f"{rc.stem}: queued; the daemon stops it within seconds ({why})")
         return 0
     t = jobstop.task_of(p, rc)
-    r = jobstop.end(p, rc, f"stopped by `ttp detach --stop` ({why})", t["id"] if t else None)
+    r = jobstop.end(p, rc, f"stopped by `ttp detach --stop` ({why})", t["id"] if t else None, "ttp detach --stop")
     print(r["text"] if r else f"{rc.stem}: not running; nothing to stop")
     return 0
 

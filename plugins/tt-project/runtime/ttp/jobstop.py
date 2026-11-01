@@ -72,6 +72,7 @@ CHECKS_TERM_S = 15.0   # detached checks end their check command on SIGTERM, whi
 PUSH_TERM_S = 15.0     # likewise a detached push: it ends its check and writes its outcome
 QUEUE = "jobstop-queue"
 EVENT = "detached_job_stopped"
+BY = "jobstop"   # the sender component detach.signalled names
 
 
 # Process groups ---------------------------------------------------------------------------------
@@ -251,9 +252,9 @@ def _resource(slot: Path) -> str:
     return slot.name.rsplit(".", 2)[0]
 
 
-def _free(slots: list[Path], pgid: int, pids: set[int]) -> tuple[list[str], list[str]]:
+def _free(slots: list[Path], pgid: int, pids: set[int], note=None) -> tuple[list[str], list[str]]:
     """Wait a moment for each slot to go free; one still held by a process of the stopped group is freed
-    by ending that process. Returns (freed, still held) as slot names."""
+    by ending that process, and note(pid, slot) logs that kill. Returns (freed, still held) as slot names."""
     deadline = time.monotonic() + FREE_WAIT_S
     left = list(slots)
     while left and time.monotonic() < deadline:
@@ -270,7 +271,9 @@ def _free(slots: list[Path], pgid: int, pids: set[int]) -> tuple[list[str], list
             try:
                 os.kill(pid, signal.SIGKILL)
             except OSError:
-                pass
+                continue
+            if note:
+                note(pid, s)
     deadline = time.monotonic() + FREE_WAIT_S
     while left and time.monotonic() < deadline:
         left = [s for s in left if not locks.any_free([s])]
@@ -281,9 +284,10 @@ def _free(slots: list[Path], pgid: int, pids: set[int]) -> tuple[list[str], list
 
 # The stop ---------------------------------------------------------------------------------------
 
-def end(p: Project, rc: Path, why: str, task: int | None = None) -> dict | None:
+def end(p: Project, rc: Path, why: str, task: int | None = None, reason: str = "jobstop.end") -> dict | None:
     """Stop the running job at this .rc (steps 1-5 above). Its summary, also logged as an event, or None
-    when it no longer runs (nothing done, nothing logged)."""
+    when it no longer runs (nothing done, nothing logged). Each signal sent is logged (detach.signalled)
+    in the job's log and the project's job-signal stream, naming `reason`, the calling code path."""
     rc = Path(rc)
     if not running(rc):
         return None
@@ -296,16 +300,20 @@ def end(p: Project, rc: Path, why: str, task: int | None = None) -> dict | None:
     if pgid:
         try:
             os.killpg(pgid, signal.SIGSTOP)
+            detach.signalled(rc, signal.SIGSTOP, pgid, reason, why, by=BY, state=p.state, task=task)
         except OSError:
             pass
         pids = members(pgid)
     ids, note = end_broker_jobs(pids)
     if pgid:
-        detach.stop(rc, pgid, why)
-    freed, held = _free(slots, pgid, set(pids))
+        detach.stop(rc, pgid, why, reason=reason, by=BY, task=task)
+    freed, held = _free(slots, pgid, set(pids), lambda pid, s: detach.signalled(
+        rc, signal.SIGKILL, pid, reason, f"{why}; it still held {s.name}", by=BY, group=False, state=p.state,
+        task=task))
     out = {"task": task, "job": rc.stem, "rc": str(rc), "pgid": pgid, "broker_jobs": ids, "freed": freed,
            "held": held, "note": note if pgid else "no live process group found for it"}
-    text = (f"stopped detached job {rc.stem}" + (f" (task #{task})" if task else "") + f": {why}; group {pgid or '?'}"
+    text = (f"stopped detached job {rc.stem}" + (f" (task #{task})" if task else "") + f": {why}; "
+            + (f"SIGSTOP then SIGKILL to group {pgid} from {BY} pid {os.getpid()} ({reason})" if pgid else "group ?")
             + f"; broker jobs ended: {', '.join(ids) or 'none'}; locks freed: {', '.join(freed) or 'none'}"
             + (f"; still held: {', '.join(held)}" if held else "") + (f"; {out['note']}" if out["note"] else ""))
     out["text"] = text
@@ -324,9 +332,11 @@ def end_checks(p: Project, run_dir: Path, why: str, task: int | None = None) -> 
     if not _checks_alive(info):
         return None
     pid = info["pid"]
+    sent = []
     for sig, wait in ((signal.SIGTERM, CHECKS_TERM_S), (signal.SIGKILL, FREE_WAIT_S)):
         try:
             os.killpg(pid, sig)
+            sent.append(sig)
         except OSError:
             pass
         deadline = time.monotonic() + wait
@@ -335,7 +345,11 @@ def end_checks(p: Project, run_dir: Path, why: str, task: int | None = None) -> 
         if not _checks_alive(info):
             break
     rc = run_dir / CHECKS_RC
-    text = (f"stopped the detached checks of run {run_dir.name} (task #{task}): {why}; group {pid}; "
+    for sig in sent:   # logged once they ended: their own writes to checks.log come first
+        detach.signalled(rc, sig, pid, "jobstop.end_checks", why, by=BY, state=p.state, task=task)
+    text = (f"stopped the detached checks of run {run_dir.name} (task #{task}): {why}; "
+            f"{' then '.join(signal.Signals(x).name for x in sent) or 'no signal'} to group {pid} "
+            f"from {BY} pid {os.getpid()}; "
             f"checks.rc {rc.read_text().strip() if rc.exists() else 'not written'}")
     fp = f"checks_stopped:{run_dir}:{pid}:{info.get('started')}"
     out = {"task": task, "job": "checks", "rc": str(rc), "pgid": pid, "text": text}
@@ -358,6 +372,7 @@ def end_push(p: Project, marker: Path, why: str, task: int | None = None) -> dic
         return None
     run_lock = push._run_lock(marker)
     pid = m.get("pid")
+    sent: list[int] = []
     if m.get("status") == "queued":
         lock = locks.try_take([run_lock], f"detached push {m.get('id')}", "jobstop")
         if lock is None:
@@ -378,6 +393,7 @@ def end_push(p: Project, marker: Path, why: str, task: int | None = None) -> dic
         for sig, wait in ((signal.SIGTERM, PUSH_TERM_S), (signal.SIGKILL, FREE_WAIT_S)):
             try:
                 os.killpg(pid, sig)
+                sent.append(sig)
             except OSError:
                 pass
             deadline = time.monotonic() + wait
@@ -385,12 +401,15 @@ def end_push(p: Project, marker: Path, why: str, task: int | None = None) -> dic
                 time.sleep(0.1)
             if locks.any_free([run_lock]):
                 break
+        for sig in sent:
+            detach.signalled(marker, sig, pid, "jobstop.end_push", why, by=BY, state=p.state, task=task)
         m = push._settle(marker)
         if m.get("status") == "failed":
             m["reason"] = f"stopped: {why}" + (f" ({m['reason']})" if m.get("reason") else "")
             write_json(marker, m)
     text = (f"stopped the detached push {marker.stem}" + (f" (task #{task})" if task else "")
-            + f": {why}; " + (f"group {pid}; marker {m.get('status')}" if pid else "it was queued and never started"))
+            + f": {why}; " + (f"{' then '.join(signal.Signals(x).name for x in sent) or 'no signal'} to group {pid} "
+                                f"from {BY} pid {os.getpid()}; marker {m.get('status')}" if pid else "it was queued and never started"))
     fp = f"push_stopped:{marker}:{pid}"
     out = {"task": task, "job": "push", "rc": str(marker), "pgid": pid, "text": text}
     if not p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
@@ -484,7 +503,7 @@ def sweep(p: Project, now: float | None = None) -> list[dict]:
             rc = Path(j["rc"])
             if not running(rc) or waited_on(p, rc) is not None:
                 continue
-            r = end(p, rc, f"task #{row['id']} is {row['status']}", row["id"])
+            r = end(p, rc, f"task #{row['id']} is {row['status']}", row["id"], "jobstop.sweep")
             if r:
                 out.append(r)
     out += _sweep_handed_off(p, now)
@@ -518,7 +537,7 @@ def _sweep_handed_off(p: Project, now: float) -> list[dict]:
         for rc in jobs:
             if rc in kept or waited_on(p, rc) is not None:
                 continue
-            if r := end(p, rc, f"task #{tid} handed off {status}", tid):
+            if r := end(p, rc, f"task #{tid} handed off {status}", tid, "jobstop.sweep_handed_off"):
                 out.append(r)
     return out
 
@@ -576,7 +595,7 @@ def serve_requests(p: Project) -> list[dict]:
         ok, why = may_stop(p, rc, m.get("caller"))
         if ok:
             t = task_of(p, rc)
-            r = end(p, rc, f"stopped by `ttp detach --stop` ({why})", t["id"] if t else None)
+            r = end(p, rc, f"stopped by `ttp detach --stop` ({why})", t["id"] if t else None, "ttp detach --stop")
             if r:
                 out.append(r)
         q.unlink(missing_ok=True)

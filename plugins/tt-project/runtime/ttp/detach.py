@@ -31,6 +31,11 @@ environment (secrets left out, as for a queued job) and how often the daemon rel
 host reboot cut it short, the daemon starts the same command again on the next boot (relaunch),
 model-free, while its task still waits on it, up to RELAUNCH_CAP times; past that the task wakes as
 before. Only a job that is safe to run again from the start opts in.
+
+Every signal tt-project sends a job (stop, jobstop) is logged by `signalled`: a line in the job's log and a
+row in state/job-signals.jsonl naming the code path and the sender. A job outlives its run while an open
+task waits on it; tt-project ends one only by SIGKILL of its group with <name>.lost, so an .rc of 143
+means its command alone got SIGTERM from elsewhere (a waiting `ttp lock` logs who: `received`).
 """
 from __future__ import annotations
 
@@ -318,15 +323,100 @@ def relaunch_started(rc: Path) -> bool:
     return rc.exists() or started(rc).exists() or not locks.any_free([locks.job_lock(rc)])
 
 
-def stop(rc: Path, pid: int, why: str) -> None:
+SIGNALS = "job-signals.jsonl"   # under the project's state: one line per signal tt-project sent a job
+
+
+def signals_file(rc: Path, state: Path | None = None) -> Path:
+    """The project's job-signal audit stream: under `state` when given, else the state a run's job
+    sits in (state/runs/<run>/<name>.rc), else next to the .rc."""
+    rc = Path(rc)
+    if state is not None:
+        return Path(state) / SIGNALS
+    if rc.parent.parent.name == "runs":
+        return rc.parent.parent.parent / SIGNALS
+    return rc.parent / SIGNALS
+
+
+def _me() -> str:
+    """This process as a short command line (`ttp daemon`, `ttp detach`): which tt-project process sent it."""
+    argv = sys.argv or ["?"]
+    return " ".join([Path(argv[0]).name, *argv[1:2]])[:80]
+
+
+def signalled(rc: Path, sig: int, pid: int, reason: str, why: str = "", *, by: str = "",
+              group: bool = True, log: Path | None = None, state: Path | None = None,
+              task: int | None = None) -> dict:
+    """Record that tt-project sent `sig` to a detached job (its group led by `pid`, or that pid alone):
+    one line in the job's own log (`log`, else <name>.log) and one in the project's audit stream
+    (signals_file), naming the job, pid, signal, the code path (`reason`), why, the sender (component
+    and pid) and the time. Call it after a SIGSTOP or SIGKILL, so the job's own writes cannot land over
+    it. Best effort: a write that fails never stops the stop."""
+    rc = Path(rc)
+    try:
+        name = signal.Signals(sig).name
+    except ValueError:
+        name = str(sig)
+    now = time.time()
+    row = {"ts": now, "job": rc.stem, "rc": str(rc), "pid": pid, "group": group, "signal": name,
+           "reason": reason, "why": why, "by": by or "ttp", "by_pid": os.getpid(), "by_cmd": _me(), "task": task}
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(now))
+    line = (f"[ttp {stamp}] {name} to {'group' if group else 'pid'} {pid} of job {rc.stem}"
+            + (f" (task #{task})" if task else "") + f" from {row['by']} pid {row['by_pid']} [{row['by_cmd']}] ({reason})"
+            + (f": {why}" if why else "") + "\n")
+    for path, text in ((Path(log) if log else rc.with_suffix(".log"), line),
+                       (signals_file(rc, state), json.dumps(row) + "\n")):
+        try:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(text)
+        except OSError:
+            pass
+    return row
+
+
+def sender(pid: int) -> str:
+    """The command line of process `pid` (best effort, cut to 200 chars), else ""."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()[:200]
+
+
+def received(sig: int, pid: int, uid: int, reason: str, *, job: dict | None = None,
+             state: Path | None = None) -> str:
+    """Record a signal a tt-project process received from `pid` (sigtimedwait names it): one row in the
+    project's job-signal stream (under `state`, or that of the detached job `job` names, as
+    locks.job_fields gives it) with the sender's pid, uid and command line. Returns the line to log."""
+    try:
+        name = signal.Signals(sig).name
+    except ValueError:
+        name = str(sig)
+    cmd = sender(pid) if pid > 0 else ""
+    job = job or {}
+    row = {"ts": time.time(), "received": True, "signal": name, "pid": os.getpid(), "reason": reason,
+           "from_pid": pid, "from_uid": uid, "from_cmd": cmd, "job": job.get("job"), "rc": job.get("job_rc")}
+    if state is not None or job.get("job_rc"):
+        try:
+            with open(signals_file(Path(job.get("job_rc") or "."), state), "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row) + "\n")
+        except OSError:
+            pass
+    return (f"{name} received by pid {os.getpid()} ({reason}) from pid {pid} uid {uid}"
+            + (f" [{cmd}]" if cmd else " (sender gone or unreadable)"))
+
+
+def stop(rc: Path, pid: int, why: str, *, reason: str = "detach.stop", by: str = "",
+         task: int | None = None) -> None:
     """End a job `relaunch` just started (pid, its wrapper, leads a session and process group of its
     own) before it writes an exit code, and record why in <name>.lost: its probe then reads it ended.
-    The why goes first: a reader that sees its lock go free before it would record a guess instead."""
+    The why goes first: a reader that sees its lock go free before it would record a guess instead.
+    The SIGKILL is then logged (signalled) as sent from `reason`, the calling code path."""
     _mark_lost(Path(rc), why)
     try:
         os.killpg(pid, signal.SIGKILL)
     except OSError:
-        pass   # already gone
+        return   # already gone: nothing signalled
+    signalled(rc, signal.SIGKILL, pid, reason, why, by=by, task=task)
 
 
 def running_pid(rc: Path, this_boot) -> int:
@@ -860,7 +950,7 @@ def end_remote(rc: Path, why: str) -> None:
         except (OSError, ValueError, IndexError):
             pid = 0
     if pid > 1 and not locks.any_free([locks.job_lock(rc)]):
-        stop(rc, pid, why)
+        stop(rc, pid, why, reason="detach.end_remote", by="daemon")
     else:
         _mark_lost(rc, why)
 
