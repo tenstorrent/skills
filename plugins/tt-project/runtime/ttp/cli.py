@@ -9592,6 +9592,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--hash", required=True, help="the note's id or sha256 prefix, as `ttp note --to` printed it; "
                                                  "the reply names it")
     s.add_argument("--status", choices=["done", "needs_review"], default="done", help="settle: the hand-off's status")
+    s.add_argument("--peer-task", type=int, action="append", metavar="ID",
+                   help="probe: the replying project's task that must act before it can reply, or its declared "
+                        "recovery task (repeatable). While one is 'blocked' there, the wait raises no wait_stale; "
+                        "it re-arms once that task leaves 'blocked'. The probe's answer is unchanged")
     s.set_defaults(fn=cmd_ack_wait)
 
     s = sub.add_parser("detach", help="start a job that outlives the run; writes <name>.rc")

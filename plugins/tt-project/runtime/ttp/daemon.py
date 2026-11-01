@@ -9864,18 +9864,20 @@ class Daemon:
             # 75 is EX_TEMPFAIL (e.g. a busy `ttp lock`); 255 is ssh failing to reach the host
             # (a reboot or a network blip). Both mean "not yet". A model run cannot make a "not yet"
             # probe pass, so past `max_hold_s` the coordinator decides instead of a wake.
-            held = now >= since + max_hold
+            start, peer = self._peer_hold(task, prev, since, max_hold, now)
+            held = now >= start + max_hold
             gate = time_gate(str(prev.get("retry_when") or ""))
             # A pure time gate whose epoch is still ahead is not stuck: no turn could make it pass sooner.
             # Nor is a user pause (userpause): only the user's word lifts it. Nor a reply wait while
             # its peer is recovering (ackwait.peer_recovering): it raises once the peer can act again.
             if held and (gate is None or gate <= now) \
                     and not userpause.is_probe(prev.get("retry_when"), self.cfg) \
-                    and not ackwait.peer_recovering(prev.get("retry_when"), self.cfg, self.p.harness)[0]:
-                self._stale_wait_event(task, prev, since, max_hold)
+                    and not (peer if peer is not None else
+                             ackwait.peer_recovering(prev.get("retry_when"), self.cfg, self.p.harness)[0]):
+                self._stale_wait_event(task, prev, start, max_hold)
                 self._flag_never_passes(task, str(prev.get("retry_when") or ""), rc,
                                         (self._probe_out.get(tid) or ("",))[0], stale=True)
-            nb = now + _retry_s(prev) if held else min(now + _retry_s(prev), since + max_hold)
+            nb = now + _retry_s(prev) if held else min(now + _retry_s(prev), start + max_hold)
             what = self._wait_what(tid, prev)
             says = "host unreachable" if rc == 255 else "not yet"
             db = self.p.db
@@ -10039,6 +10041,33 @@ class Daemon:
             db.update_task(tid, result=dump_result(prev))
         log(self.p, f"task {tid} job use recovered before its pulled-in check: that check follows its probe")
 
+    def _peer_hold(self, task: dict, prev: dict, since: float, max_hold: float, now: float) -> tuple[float, str | None]:
+        """(start, peer) for a "not yet" verdict: the time a wait's staleness counts from, and the peer
+        ackwait.peer_recovering named if it was read here (None when not). The start is waiting_since, or
+        for a reply wait whose probe names a peer task (`--peer-task`) once that task was seen 'blocked'
+        (still_blocked), the last verdict that saw it so (`peer_held_at` in the hand-off): the wait re-arms
+        as soon as the task leaves 'blocked' and raises wait_stale max_hold_s after that. The peer is read
+        past the hold, or while the hold was live at the last verdict; a reply still passes the probe."""
+        at = prev.get("peer_held_at")
+        start = max(since, float(at)) if isinstance(at, (int, float)) else since
+        live = bool(prev.get("peer_hold_live"))
+        probe = prev.get("retry_when")
+        if (now < start + max_hold and not live) or not ackwait.peer_tasks(probe, self.cfg, self.p.harness):
+            return start, None
+        peer, why = ackwait.peer_recovering(probe, self.cfg, self.p.harness)
+        if why.startswith(ackwait.STILL_BLOCKED):
+            upd = {"peer_held_at": now, "peer_hold_live": True}
+            start = now
+            if not live:
+                log(self.p, f"task {task['id']} reply wait {why} in {peer}: wait_stale held until it leaves blocked")
+        elif not peer and live:
+            upd = {"peer_hold_live": False}
+            log(self.p, f"task {task['id']} reply wait: its peer task left blocked; wait_stale re-armed")
+        else:   # a peer that cannot act (its daemon, pause, coordinator) keeps the hold's state as it is
+            return start, peer
+        self.p.db.update_task(task["id"], result=dump_result({**prev, **upd}))
+        return start, peer
+
     def _wait_what(self, tid: int, prev: dict) -> str:
         """What a waiting task waits for, as its note says it. A wait on `ttp lock --probe` commands names
         each lock as that probe answers now (lockprobe.answer: live holders with pid and liveness, a done
@@ -10067,7 +10096,8 @@ class Daemon:
             return said
         peer, why = ackwait.peer_recovering(probe, self.cfg, self.p.harness)
         if peer:
-            said = f"{said} (peer {peer} recovering: {why})"
+            said = f"{said} (peer {peer}: {why})" if why.startswith(ackwait.STILL_BLOCKED) \
+                else f"{said} (peer {peer} recovering: {why})"
         line, read, by = self._probe_live.get(tid) or ("", None, "")
         return waitheal.live_note(said, prev.get("waiting_since"), line if by == probe else "", read, self.p)[:400]
 

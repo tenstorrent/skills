@@ -1141,6 +1141,75 @@ def test_a_reply_wait_stays_quiet_while_its_peer_recovers_and_re_arms_once_it_is
     assert len(stale) == 1 and "recovering" not in why, why
 
 
+
+def test_a_reply_wait_stays_quiet_while_the_peer_task_it_names_is_blocked_and_re_arms_once_it_leaves(env, monkeypatch):
+    """A reply wait whose probe names a peer task (`--peer-task <id>`) raises no wait_stale while that task is
+    'blocked' in the peer's project.db (read-only), and its note says still_blocked. Once the task leaves
+    'blocked' the wait re-arms: it raises max_hold_s after the hold was last seen, not at once. A reply still
+    passes the probe. A missing task, an unreadable peer db or no named task raise wait_stale as before."""
+    from ttp import ackwait, machine_ledger
+    from ttp.daemon import Daemon
+    p, peer = make(env), _second_project(env, "peer-a")
+    monkeypatch.setattr(machine_ledger, "can_act", lambda name, here=None: (True, ""))
+    ptid = peer.db.add_task("recover the checkout", "s", kind="work", tier="light", origin="user")
+    peer.db.update_task(ptid, status="blocked", blocked_reason="needs a credential")
+    flag = p.root / "replied.flag"
+    wrapper = p.harness / "bin" / "ack_wait.py"
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text(f"import os, sys\nsys.exit(0 if os.path.exists({str(flag)!r}) else 1)\n")
+    base = f"python3 {wrapper} probe --from peer-a --hash 0123abcd"
+    probe = f"{base} --peer-task 999999 --peer-task={ptid}"
+    assert ackwait.peer_tasks(probe, p.config(), p.harness) == [999999, ptid]
+    assert ackwait.peer_recovering(probe, p.config(), p.harness) == ("peer-a", f"still_blocked (peer task #{ptid} blocked)")
+    for rw in (base, f"{base} --peer-task 999999", f"ttp lock --probe box-a --peer-task {ptid}"):
+        assert ackwait.peer_recovering(rw, p.config(), p.harness) == ("", ""), rw
+    max_hold = float(p.config()["waiting"]["max_hold_s"])
+    d = Daemon(p.base)
+    tid = _due_waiting_task(p, probe, since_ago=7 * 24 * 3600)
+
+    def verdict(t):
+        _settle_probe(d, t)
+        p.db.update_task(t, not_before=time.time() - 1)
+        d.probe_waiting()
+        return p.db.q("SELECT id FROM events WHERE task=? AND kind='wait_stale'", (t,)), p.db.task(t)["blocked_reason"]
+
+    for _ in range(2):   # held on every verdict while the peer task stays blocked
+        stale, why = verdict(tid)
+        assert stale == [] and f"(peer peer-a: still_blocked (peer task #{ptid} blocked))" in why, why
+    held = json.loads(p.db.task(tid)["result"])
+    assert held["peer_hold_live"] is True and time.time() - held["peer_held_at"] < 120, held
+    peer.db.update_task(ptid, status="queued", blocked_reason="")
+    stale, why = verdict(tid)   # re-armed from the last held verdict: not raised at once
+    assert stale == [] and "still_blocked" not in why, why
+    got = json.loads(p.db.task(tid)["result"])
+    assert got["peer_hold_live"] is False and got["peer_held_at"] == held["peer_held_at"], got
+    p.db.update_task(tid, result=json.dumps({**got, "peer_held_at": time.time() - max_hold - 60}))
+    stale, _ = verdict(tid)     # max_hold_s after it left blocked: raised
+    assert len(stale) == 1
+    assert p.db.one("SELECT 1 FROM events WHERE task=? AND kind='wait_stale' AND fingerprint=?",
+                    (tid, f"wait_stale:{tid}:{json.loads(p.db.task(tid)['result'])['peer_held_at']:.0f}"))
+
+    # A reply passes the probe even while the peer task is blocked.
+    peer.db.update_task(ptid, status="blocked")
+    rid = _due_waiting_task(p, probe, since_ago=7 * 24 * 3600)
+    assert verdict(rid)[0] == []
+    flag.write_text("x")
+    _settle_probe(d, rid)
+    assert json.loads(p.db.task(rid)["result"]).get("woke") or p.db.task(rid)["status"] != "waiting", p.db.task(rid)
+    flag.unlink()
+
+    # No new silence: a missing task, then an unreadable peer db, raise wait_stale as before.
+    mid = _due_waiting_task(p, f"{base} --peer-task 999999", since_ago=7 * 24 * 3600)
+    assert len(verdict(mid)[0]) == 1
+    db = peer.state / "project.db"
+    peer.db.close()
+    for side in (db.with_name(db.name + "-wal"), db.with_name(db.name + "-shm")):
+        side.unlink(missing_ok=True)
+    db.write_bytes(b"not a database" * 100)
+    assert ackwait.peer_recovering(probe, p.config(), p.harness) == ("", "")
+    uid = _due_waiting_task(p, probe, since_ago=7 * 24 * 3600)
+    assert len(verdict(uid)[0]) == 1
+
 # ---- probe stalls the blocker sweep settles model-free (sweep.dispose_probe_stalls) ----
 
 def _stalled(p, d, probe, deps=(), now=None, ago=7200):

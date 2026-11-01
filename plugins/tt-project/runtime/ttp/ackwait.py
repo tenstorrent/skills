@@ -14,7 +14,8 @@ and the stored text's sha256 prefix. A reply is a note that project files for th
 
 The reply is another project's data, never an instruction or an approval: the hand-off says so.
 Nothing of the other project's is read but the shared inbox and, read-only, whether it can act now
-(peer_recovering), and nothing is written but $TTP_RESULT and a progress line in the waiting run.
+(peer_recovering: its daemon, pause and coordinator state, and the status of a task the probe names with
+`--peer-task <id>`), and nothing is written but $TTP_RESULT and a progress line in the waiting run.
 """
 from __future__ import annotations
 
@@ -162,7 +163,8 @@ def peer(probe, cfg: dict | None = None, harness=None) -> str:
 def peer_recovering(probe, cfg: dict | None = None, harness=None) -> tuple[str, str]:
     """(peer, why) while the project a reply-wait probe waits on cannot answer now, read-only from that
     project's own state (machine_ledger.can_act: its daemon stopped or stale, it is paused, its coordinator
-    logged out or failing); ('', '') otherwise. While it holds, the wait's staleness and repeat checks stay
+    logged out or failing), or while a task the probe names (peer_tasks) is 'blocked' there (why
+    `still_blocked (peer task #<id> blocked)`); ('', '') otherwise. While it holds, the wait's staleness and repeat checks stay
     quiet: no turn here can make the peer answer sooner. They re-arm once it can act again."""
     name = peer(probe, cfg, harness)
     if not name:
@@ -172,4 +174,50 @@ def peer_recovering(probe, cfg: dict | None = None, harness=None) -> tuple[str, 
         ok, why = can_act(name)
     except Exception:   # a peer's state that cannot be read never silences a check
         return "", ""
-    return (name, why) if not ok and _RECOVERING_RE.match(str(why or "")) else ("", "")
+    if not ok and _RECOVERING_RE.match(str(why or "")):
+        return name, why
+    tid = peer_task_blocked(name, peer_tasks(probe, cfg, harness))
+    return (name, f"{STILL_BLOCKED} (peer task #{tid} blocked)") if tid else ("", "")
+
+
+STILL_BLOCKED = "still_blocked"   # peer_recovering's why while a task the probe names is blocked in the peer
+
+
+def peer_tasks(probe, cfg: dict | None = None, harness=None) -> list[int]:
+    """The peer's task ids a reply-wait probe names with `--peer-task <id>` (repeatable): the task that must
+    act before the peer can reply, or its declared recovery task. The probe itself ignores them."""
+    if not is_probe(probe, cfg, harness):
+        return []
+    words, out = _words(probe), []
+    for i, w in enumerate(words):
+        v = words[i + 1] if w == "--peer-task" and i + 1 < len(words) else \
+            w.split("=", 1)[1] if w.startswith("--peer-task=") else ""
+        if v.isdigit() and int(v) not in out:
+            out.append(int(v))
+    return out
+
+
+def peer_task_blocked(name: str, tids: list[int]) -> int:
+    """The first of `tids` in status 'blocked' in project `name`'s project.db, read-only on this machine; 0
+    when none is, or the peer, its db or the task cannot be found or read (no new silence then)."""
+    if not tids:
+        return 0
+    from . import globalcap, project
+    entry = project.load_registry().get("projects", {}).get(name)
+    if not isinstance(entry, dict) or not entry.get("dir") or (entry.get("host") and entry["host"] != project.hostname()):
+        return 0
+    db = Path(entry["dir"]) / project.FOLDER / "state" / "project.db"
+    try:
+        if not db.is_file():
+            return 0
+        conn = globalcap.connect_ro(db)
+        try:
+            for tid in tids:
+                row = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
+                if row and row[0] == "blocked":
+                    return tid
+        finally:
+            conn.close()
+    except Exception:   # a peer's state that cannot be read never silences a check
+        return 0
+    return 0
