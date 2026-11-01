@@ -363,8 +363,11 @@ def signalled(rc: Path, sig: int, pid: int, reason: str, why: str = "", *, by: s
     line = (f"[ttp {stamp}] {name} to {'group' if group else 'pid'} {pid} of job {rc.stem}"
             + (f" (task #{task})" if task else "") + f" from {row['by']} pid {row['by_pid']} [{row['by_cmd']}] ({reason})"
             + (f": {why}" if why else "") + "\n")
-    for path, text in ((Path(log) if log else rc.with_suffix(".log"), line),
-                       (signals_file(rc, state), json.dumps(row) + "\n")):
+    home = _markable(rc, quiet=True)   # never a stray log or stream beside an .rc outside state and runs
+    out = [(Path(log), line)] if log else [(home.with_suffix(".log"), line)] if home else []
+    if state is not None or home:
+        out.append((signals_file(home or rc, state), json.dumps(row) + "\n"))
+    for path, text in out:
         try:
             durable_append(path, text)
         except OSError:
@@ -394,7 +397,7 @@ def received(sig: int, pid: int, uid: int, reason: str, *, job: dict | None = No
     job = job or {}
     row = {"ts": time.time(), "received": True, "signal": name, "pid": os.getpid(), "reason": reason,
            "from_pid": pid, "from_uid": uid, "from_cmd": cmd, "job": job.get("job"), "rc": job.get("job_rc")}
-    if state is not None or job.get("job_rc"):
+    if state is not None or (job.get("job_rc") and _markable(job["job_rc"], quiet=True)):
         try:
             durable_append(signals_file(Path(job.get("job_rc") or "."), state), json.dumps(row) + "\n")
         except OSError:
@@ -642,7 +645,7 @@ def _settle(q: Path, rc: Path, rid: str | None, lost_why: str = "") -> None:
             queued(rc).unlink(missing_ok=True)
 
 
-def _markable(rc: Path) -> Path | None:
+def _markable(rc: Path, quiet: bool = False) -> Path | None:
     """The absolute .rc path when a marker may go next to it: inside a project's state (its runs, the
     daemon's own jobs), the calling run's folder ($TTP_RUN_DIR) or a run folder that records detached
     jobs (detached.json). Else None, with a warning: a relative path a probe names resolves against
@@ -654,8 +657,9 @@ def _markable(rc: Path) -> Path | None:
     if (any(a.name == "state" and a.parent.name == FOLDER for a in up) or (real / "detached.json").is_file()
             or (run and Path(run).resolve() in up)):
         return p
-    print(f"ttp detach: not marking {p.with_suffix('.lost')}: outside the project state and run folders",
-          file=sys.stderr)
+    if not quiet:
+        print(f"ttp detach: not marking {p.with_suffix('.lost')}: outside the project state and run folders",
+              file=sys.stderr)
     return None
 
 

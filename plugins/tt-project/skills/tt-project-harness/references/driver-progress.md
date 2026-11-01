@@ -37,7 +37,7 @@ The cap is a backstop, not the budget: still turn on prompt caching, cap each un
 
 A `ttp detach` job outlives the run that started it while an open task still waits on it: the daemon stops a job only once its task has ended (cancelled, failed, done, or blocked without naming the job), or on `ttp detach --stop`, a spend cap, a reboot relaunch the task no longer needs or a fix past its timeout. That stop freezes the job's group (SIGSTOP), then kills it (SIGKILL) and writes `<name>.lost` with why: such a job never gets an `.rc`.
 - Every signal tt-project sends a detached job, its detached checks or its detached push adds one line to that job's own log and one JSON row to `state/job-signals.jsonl`: the job, pid or group, signal, code path, why, sender (component, pid, command) and time.
-- A `ttp lock` that waits for a slot logs the sender (pid, uid, command line) of a SIGTERM, SIGINT or SIGHUP it receives, to stderr (the job's log), `progress.md` and `state/job-signals.jsonl`, then exits 128 plus the signal number as before.
+- A `ttp lock` that waits for a slot logs the sender (pid, uid, command line) of a SIGTERM, SIGINT or SIGHUP it receives, to stderr (the job's log), its run's progress.md and `state/job-signals.jsonl`, then exits 128 plus the signal number as before.
 - So an `.rc` of 143 with none of these lines means a process outside tt-project sent SIGTERM to the job's command alone (the wrapper lived to write the code); a SIGTERM to the whole group leaves no `.rc`.
 
 ## Stopping a driver started without `ttp detach`
