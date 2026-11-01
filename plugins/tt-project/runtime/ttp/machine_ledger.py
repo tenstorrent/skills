@@ -46,7 +46,10 @@ cancelled or gone; a probe-only or task-only entry also expires after PROBE_END_
 re-extends it with `ttp machines change edit <id> --until-task <its own id>`. The daily review lists the
 project's open entries whose task is over (task_lines). An overdue entry pages the project that made it, then the machine's
 owner, then its fallback, each after the one before cannot act for UNAVAILABLE_S or let REPAGE_S pass,
-then the user. Unlike a condition's page, an overdue entry's page is normal: high only on a live serving machine
+then the user. While its machine is in a known outage, held machine-wide or has a resource paused by the user
+or for every project (change_quiet, quiet_reason's cross-project reasons), the project that made it still gets
+its first page, but nothing escalates past it; the page records the reason (`quiet`), and once it ends the
+steps resume from that moment. Unlike a condition's page, an overdue entry's page is normal: high only on a live serving machine
 (tagged serving, live or server) past its end with no passing until-probe (pagesev.change_severity). Each page
 carries one fingerprint per entry and episode (pagesev.change_fingerprint), so a project files its own event
 and copies relayed by other projects' daemons once. Nothing is undone automatically unless asked (Auto-undo): whoever is paged runs the undo and closes the entry
@@ -1111,28 +1114,57 @@ def _demand(alias: str, reporters: list[str]) -> dict[str, list[str]]:
     return out
 
 
+def _outage_why(o: dict) -> str:
+    return (f"known outage until {ends.shown(o['until'])}"
+            + (f", owned by {o['owner']}" if o.get("owner") else "") + f": {o['why']}")
+
+
+def _hold_why(hold: dict) -> str:
+    return (f"held machine-wide (hold {hold.get('id')}) by {hold.get('project')}"
+            + (" for the user" if hold.get("by") == "user" else "")
+            + (f": {hold['reason']}" if hold.get("reason") else ""))
+
+
+def _paused_why(d: dict[str, list[str]]) -> str:
+    """A user pause, or a shared pause for every project, from _demand; "" when neither."""
+    if d["user"]:
+        return f"the user paused {', '.join(d['user'])}"
+    if d["shared"]:
+        return f"paused for every project: {', '.join(d['shared'])}"
+    return ""
+
+
+def change_quiet(alias: str, now: float, doc: dict | None = None) -> str:
+    """Why an overdue change on `alias` escalates past its own project no further ("" when it does): a known
+    outage, a machine-wide hold, or a resource on it paused by the user or for every project (quiet_reason's
+    cross-project reasons; module doc: the change ledger)."""
+    from . import fleethold
+    o = outages(now, doc).get(alias)
+    if o:
+        return _outage_why(o)
+    hold = fleethold.active().get(alias)
+    if hold:
+        return _hold_why(hold)
+    return _paused_why(_demand(alias, []))
+
+
 def quiet_reason(c: dict, now: float, doc: dict | None = None) -> tuple[str, bool]:
     """(why condition `c` escalates no further, whether nobody is paged at all); ("", False) when it pages as
     usual (module doc: Quiet outages)."""
     alias, cond = c["alias"], c["condition"]
     o = outages(now, doc).get(alias)
     if o:
-        return (f"known outage until {ends.shown(o['until'])}"
-                + (f", owned by {o['owner']}" if o.get("owner") else "") + f": {o['why']}"), True
+        return _outage_why(o), True
     for ch in changes({alias}):
         if cond in expects_now(ch, now):
             return f"expected from machine change #{ch['id']} by {ch.get('by')}: {ch['what']}", True
     from . import fleethold
     hold = fleethold.active().get(alias)
     if hold:   # like a user pause: the first target hears of it, nobody past it
-        return (f"held machine-wide (hold {hold.get('id')}) by {hold.get('project')}"
-                + (" for the user" if hold.get("by") == "user" else "")
-                + (f": {hold['reason']}" if hold.get("reason") else "")), False
+        return _hold_why(hold), False
     d = _demand(alias, list(c.get("seen_by") or []))
-    if d["user"]:
-        return f"the user paused {', '.join(d['user'])}", False
-    if d["shared"]:
-        return f"paused for every project: {', '.join(d['shared'])}", False
+    if _paused_why(d):
+        return _paused_why(d), False
     known = c.get("known_by") or {}
     if known:
         return "known fault: " + "; ".join(f"{who}: {why}" for who, why in sorted(known.items())), False
@@ -1413,7 +1445,7 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
         _store_outages(doc, outage_entries(now, doc))
         _write(ROUTES, doc)
         ledger = _read(LEDGER, {"next": 1, "changes": []})
-        changed, shut = False, []
+        changed, shut, hushed = False, [], {}
         for c in ledger.get("changes", []):
             late = overdue(c, now)
             if not late:
@@ -1432,8 +1464,21 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                     changed = True
                 continue
             page = c.setdefault("page", {})
-            target = _step(page, chain(c["alias"], c.get("by")), now, able)
+            if c["alias"] not in hushed:
+                hushed[c["alias"]] = change_quiet(c["alias"], now, doc)
+            why = hushed[c["alias"]]
             changed = True
+            if why and "stage" in page:
+                # paused, held or out: its own project has its page, nobody past it until that ends
+                page["quiet"] = why
+                if int((page.get("pending") or {}).get("stage") or 0) > 0:
+                    page.pop("pending")
+                claim(page)
+                continue
+            if page.pop("quiet", None) is not None and "stage" in page:
+                page.update(at=now)   # the steps resume from now, not from the page before the pause
+                page.pop("unable_since", None)
+            target = _step(page, chain(c["alias"], c.get("by")), now, able)
             gave_up = c.get("auto_undo_failed") or {}
             if target:
                 episode = float(c.get("page_from") or c["added"])

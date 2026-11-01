@@ -415,3 +415,75 @@ def test_zoneless_expires_with_no_project_uses_the_account_zone_else_the_machine
     iso, at, _ = _ahead_at(5, "Europe/Berlin")
     main(["machines", "change", "add", "box-a", "a drop-in", "--undo", "true", "--expires", iso, "--by", "alpha"])
     assert ml.changes()[-1]["expires"] == at
+
+
+def _change_pages(ml, at):
+    """Route once at `at` (everyone can act), every page delivered: [(target, stage)] of overdue changes."""
+    out = []
+    for x in ml.route(at, able=lambda n: (True, ""), healthy=lambda *a: [], quiet=_no_quiet):
+        ml.delivered(x)
+        if x["kind"] == "machine_change_overdue":
+            out.append((x["target"], x["stage"]))
+    return out
+
+
+def _pause_box(kind, p, ml, now):
+    """Pause box-a the `kind` way: a user pause of another project's resource, a machine-wide hold or a known
+    outage. Returns (the reason it records, a callable that ends it)."""
+    from ttp import coordinator as coord
+    from ttp import fleethold
+    if kind == "user":
+        coord.pause_resource(p, "box-a-device", True, reason="weekend", by="user")
+        return "the user paused beta box-a-device", lambda: coord.pause_resource(p, "box-a-device", False, by="user")
+    if kind == "hold":
+        fleethold.set_hold("box-a", "weekend", "user", "beta", now=now)
+        return "held machine-wide", lambda: fleethold.lift("box-a", True, "test")
+    ml.set_outage("box-a", "board repair", "beta", "10d", now=now)
+    return "known outage until", lambda: ml.clear_outage("box-a")
+
+
+@pytest.mark.parametrize("kind", ["user", "hold", "outage"])
+def test_an_overdue_change_on_a_paused_machine_pages_only_its_project_until_the_pause_ends(env, kind):
+    """A user pause (of another project's resource), a machine-wide hold or a known outage: the change's own
+    project hears once, nobody past it however long; once it ends the next step waits REPAGE_S from then."""
+    p, ml = _outage_box(env)
+    t0 = time.time()
+    cid = ml.add_change("box-a", "a scratch dir for a repro", "rm -rf /tmp/scratch", "gamma", expires="1h",
+                        now=t0)["id"]
+    why, end = _pause_box(kind, p, ml, t0)
+    due = t0 + 3601
+    assert _change_pages(ml, due) == [("gamma", 0)]
+    for k in (1, 2, 3):
+        assert _change_pages(ml, due + k * ml.REPAGE_S + 1) == [], k
+    page = next(c for c in ml.changes() if c["id"] == cid)["page"]
+    assert why in page["quiet"] and page["stage"] == 0, page
+    end()
+    lifted = due + 3 * ml.REPAGE_S + 100
+    assert _change_pages(ml, lifted) == [], "not at once"
+    page = next(c for c in ml.changes() if c["id"] == cid)["page"]
+    assert "quiet" not in page and page["at"] == lifted
+    assert _change_pages(ml, lifted + ml.REPAGE_S - 60) == []
+    assert _change_pages(ml, lifted + ml.REPAGE_S) == [("owner", 1)]
+
+
+def test_a_pause_after_the_owner_was_paged_stops_the_next_step_and_its_undelivered_page(env):
+    p, ml = _outage_box(env)
+    t0 = time.time()
+    cid = ml.add_change("box-a", "an ssh config line", "sed -i /scratch/d cfg", "gamma", expires="1h", now=t0)["id"]
+    due = t0 + 3601
+    assert _change_pages(ml, due) == [("gamma", 0)]
+    pages = ml.route(due + ml.REPAGE_S, able=lambda n: (True, ""), healthy=lambda *a: [], quiet=_no_quiet)
+    assert [x["target"] for x in pages] == ["owner"]   # claimed, never delivered
+    _pause_box("user", p, ml, due)
+    later = due + ml.REPAGE_S + ml.CLAIM_S + 60
+    assert _change_pages(ml, later) == [] and _change_pages(ml, later + 3 * ml.REPAGE_S) == []
+    assert "pending" not in next(c for c in ml.changes() if c["id"] == cid)["page"]
+
+
+def test_an_overdue_change_on_an_unpaused_machine_escalates_to_the_user(env):
+    p, ml = _outage_box(env)
+    t0 = time.time()
+    ml.add_change("box-a", "a scratch dir for a repro", "rm -rf /tmp/scratch", "gamma", expires="1h", now=t0)
+    due = t0 + 3601
+    got = [_change_pages(ml, due + k * ml.REPAGE_S) for k in range(4)]
+    assert got == [[("gamma", 0)], [("owner", 1)], [("beta", 2)], [(ml.USER, 3)]]
