@@ -258,8 +258,9 @@ Each field's rules are in the section named; the table only lists them.
 - Temporary instructions ("while X", "until Y", "for now"): record the end with the entry:
   `expires` (`3d` or an ISO time), `until` (the end in plain words) and, when a
   shell check can tell, `until_probe` (read-only: exit 0 = over). The daemon retires it once that
-  passes (`Retired`). An `until` only you can judge comes back daily under `Temporary instructions
-  possibly over`: retire it when it clearly is.
+  passes (`Retired`). An `until` of just `#N has landed` or `#N is done` gets that probe itself.
+  An `until` only you can judge comes back daily under `Temporary instructions possibly over`,
+  with the live state of each task it names: retire it when it clearly is.
 - A restriction that is clearly over (a daily review's `stale restriction:` line, an end that
   passed, newer text that supersedes it): retire it yourself with `charter_update` (`quote` or
   `replaces`, `text` restating what still holds, `over` naming what ended it); memory with

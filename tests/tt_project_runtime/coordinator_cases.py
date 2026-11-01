@@ -3822,6 +3822,92 @@ def test_an_end_only_a_model_can_judge_is_listed_as_possibly_over_once_a_day(env
 
 
 
+def _tick_until_retired(e, now: float) -> list:
+    """Ends.tick until the probes it starts have answered: the retirements of the last tick."""
+    from ttp import ends
+    retired = e.tick(now)
+    for k in range(1, 4):
+        for proc, *_ in list(e._procs.values()):
+            proc.wait(30)
+        retired += e.tick(now + k * (ends.PROBE_EVERY_S + 1))
+    return retired
+
+
+def test_a_task_state_until_gets_its_probe_and_retires_model_free(env):
+    """`until: #N has landed` or `#N is done` (no until_probe) used to sit 'possibly over' for a day
+    after the task landed. It now gets a probe from ttp's own reads and retires once the task lands or
+    is done; its text stays as written, and an explicit until_probe is never replaced."""
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import ends
+    p.set_config("delivery.landed_probe", "test -e landed/{id}")   # no push branch: how a landing is checked
+    lands = p.db.add_task("producer", "s", kind="code", status="running")
+    reports = p.db.add_task("question", "s", kind="question", status="running")
+    assert coord.apply(p, [{"type": "memory_add", "text": "Hold the release.", "memory_kind": "restriction",
+                            "until": f"#{lands} has landed"},
+                           {"type": "memory_add", "text": "Keep the old route.", "memory_kind": "decision",
+                            "until": f"#{reports} is done."}], turn=2) == []
+    ends_by = {e["end"]["until"]: e["end"] for e in p._memory_entries() if e.get("end")}
+    assert ends_by[f"#{lands} has landed"]["probe"] == f"ttp landed --task {lands}"
+    assert f"list --status done | grep -q '^#{reports}[[:space:]]'" in ends_by[f"#{reports} is done."]["probe"]
+    now = time.time()
+    assert _tick_until_retired(ends.Ends(p), now) == [], "retired before its task ended"
+    assert ends.digest_lines(p, now, now + 2 * ends.RECHECK_S) == [], "a probed end listed as possibly over"
+    p.db.update_task(reports, status="done")
+    retired = _tick_until_retired(ends.Ends(p), now + 10)
+    assert len(retired) == 1 and "its until_probe passed" in retired[0] and "Keep the old route." not in p.memory_text()
+    p.db.update_task(lands, status="done")
+    assert _tick_until_retired(ends.Ends(p), now + 20) == [], "done is not landed"
+    (p.root / "landed").mkdir()
+    (p.root / "landed" / str(lands)).write_text("")
+    assert len(_tick_until_retired(ends.Ends(p), now + 30)) == 1 and "Hold the release." not in p.memory_text()
+    # Each clause form; a compound or other text, or an explicit probe, keeps what was given.
+    for until in (f"#{lands} landed", f"task #{lands} has finished", f"#{lands} has reported", f"#{lands} finished"):
+        assert ends.from_action({"until": until}, where=p).get("probe"), until
+    for until in (f"#{lands} has landed and the user confirms", f"#{lands} is done or #{reports} is done",
+                  f"after #{lands} has landed", f"#{lands}x has landed", f"#{lands} is not done"):
+        assert "probe" not in ends.from_action({"until": until}, where=p), until
+    assert ends.from_action({"until": f"#{lands} has landed", "until_probe": "test -e flag"},
+                            where=p)["probe"] == "test -e flag"
+    assert "probe" not in ends.from_action({"until": f"#{lands} has landed"}), "no project: no probe"
+    p.set_config("delivery.landed_probe", "")   # no landing can be checked here: a landed clause waits on done
+    assert "--status done" in ends.from_action({"until": f"#{lands} has landed"}, where=p)["probe"]
+
+
+def test_a_compound_task_end_keeps_model_judgment_and_the_digest_and_audit_show_each_task_state(env):
+    """An `until` naming tasks in other words keeps the coordinator's judgment, but its possibly-over
+    line (digest and daily audit) shows each named task's live state, so it can be retired in one look.
+    A derived probe whose task failed or was cancelled is listed too, never kept silently."""
+    p = make(env)
+    from ttp import audit, coordinator as coord
+    from ttp import ends
+    done = p.db.add_task("question", "s", kind="question", status="done")
+    queued = p.db.add_task("next", "s", kind="code", status="queued")
+    assert coord.apply(p, [{"type": "memory_add", "text": "Route light work elsewhere.", "memory_kind": "decision",
+                            "until": f"the first day is reviewed and #{done} has reported and #{queued} is done"}],
+                       turn=2) == []
+    entry = next(e for e in p._memory_entries() if e.get("end"))
+    assert "probe" not in entry["end"]
+    now = time.time()
+    assert ends.Ends(p).tick(now) == []
+    ends.digest_lines(p, now, now)
+    out = "\n".join(audit.overrides(p, p.db, now + ends.RECHECK_S, 24))
+    assert f"now #{done}: done; #{queued}: queued" in out, out
+    lines = ends.digest_lines(p, now, now + ends.RECHECK_S)
+    assert f"(now #{done}: done; #{queued}: queued)" in lines[1], lines
+    gone = p.db.add_task("dropped", "s", kind="code", status="running")
+    assert coord.apply(p, [{"type": "memory_add", "text": "Keep box B free.", "memory_kind": "restriction",
+                            "until": f"#{gone} has landed"}], turn=3) == []
+    later = now + 2 * ends.RECHECK_S
+    ends.digest_lines(p, later, later)
+    assert "Keep box B" not in "\n".join(ends.digest_lines(p, later, later + ends.RECHECK_S))
+    p.db.update_task(gone, status="cancelled")
+    ends.digest_lines(p, later, later + ends.RECHECK_S + 1)
+    lines = ends.digest_lines(p, later, later + 2 * ends.RECHECK_S + 2)
+    assert any(f"until #{gone} has landed (now #{gone}: cancelled)" in x for x in lines), lines
+
+
+
 def test_a_clearly_over_restriction_is_retired_without_asking(env):
     p = make(env)
     from ttp import coordinator as coord

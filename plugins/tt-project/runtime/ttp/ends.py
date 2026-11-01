@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import signal
 import subprocess
 import tempfile
@@ -27,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from . import detach, netwait, probespawn, timefmt
+from .db import TERMINAL_TASK_STATES
 from .detach import failed_check
 from .project import Project, command_env, durable_append, durable_write, output_tail
 
@@ -298,7 +300,54 @@ def from_action(a: dict, now: float | None = None, where=None) -> dict:
         check_sh(probe.strip(), "until_probe")
         check_not_trivial(probe.strip(), "until_probe")
         out["probe"] = probe.strip()
+    elif until and (derived := task_probe(until, where)):
+        out["probe"] = derived
     return out
+
+
+# An `until` that is one task-state clause: '#N has landed' or '#N landed', '#N is done', '#N has
+# reported' or '#N (has) finished' (optionally 'task #N', a trailing period).
+_TASK_END = re.compile(r"(?:task\s+)?#(\d+)\s+(?:(?P<landed>(?:has\s+)?landed)|is\s+done|has\s+reported|(?:has\s+)?finished)\.?",
+                       re.I)
+_TASK_ID = re.compile(r"(?<![\w#])#(\d+)\b")
+
+
+def task_probe(until: str, where=None) -> str:
+    """The until_probe an `until` that is just one task-state clause (_TASK_END) gets when none is given,
+    so it retires model-free: `ttp landed --task N` for landed (where this project can check a landing),
+    else a read-only check that task N is done (`ttp task <project> list --status done`). "" for any
+    other text, or without the Project `where` (its name goes in the done check)."""
+    m = _TASK_END.fullmatch(until.strip())
+    if not m or not isinstance(where, Project):
+        return ""
+    from . import landed
+    if m["landed"] and landed.can_check(where):
+        return f"ttp landed --task {m[1]}"
+    return f"ttp task {shlex.quote(where.name)} list --status done | grep -q '^#{m[1]}[[:space:]]'"
+
+
+def task_states(p: Project, text: str) -> str:
+    """'#3885: done; #4197: landed' for the task ids `text` names (at most 8): each task's status, or
+    landed / abandoned where its landing or abandonment is recorded; "" when it names none."""
+    from . import landed
+    out = []
+    for tid in list(dict.fromkeys(int(x) for x in _TASK_ID.findall(text or "")))[:8]:
+        t = p.db.task(tid)
+        state = ("no such task" if not t else "abandoned" if landed.abandoned(p.db, tid)
+                 else "landed" if landed.recorded(p.db, tid)[0] else str(t.get("status") or "unknown"))
+        out.append(f"#{tid}: {state}")
+    return "; ".join(out)
+
+
+def derived_waits_on_ended(p: Project, end: dict) -> bool:
+    """Whether `end`'s probe is the one task_probe gave its `until` and the task it waits on ended
+    without it ever passing (failed or cancelled, or done but for a landing a day later): listed as
+    possibly over then, so an end that can no longer come is not kept silently."""
+    m = _TASK_END.fullmatch((end.get("until") or "").strip())
+    if not m or not end.get("probe") or end["probe"] != task_probe(end["until"], p):
+        return False
+    t = p.db.task(int(m[1]))
+    return not t or t.get("status") in TERMINAL_TASK_STATES
 
 
 def describe(end: dict, where=None) -> str:
@@ -659,7 +708,7 @@ def digest_lines(p: Project, since: float, now: float | None = None) -> list[str
     due, live = [], set()
     for item in temporaries(p):
         end, key = item["end"], item["key"]
-        if not (end.get("until") and not end.get("probe") or key in broken):
+        if not (end.get("until") and not end.get("probe") or key in broken or derived_waits_on_ended(p, end)):
             continue
         live.add(key)
         if key not in listed:
@@ -668,7 +717,8 @@ def digest_lines(p: Project, since: float, now: float | None = None) -> list[str
             listed[key] = now
             cond = end.get("until") or "its probe passes"
             note = f"; its until_probe is broken ({broken[key][-500:]}): fix it with a restated entry" if key in broken else ""
-            due.append(f"- {item['what']}: until {cond}{note}")
+            states = task_states(p, end.get("until") or "")
+            due.append(f"- {item['what']}: until {cond}" + (f" (now {states})" if states else "") + note)
     listed = {k: v for k, v in listed.items() if k in live}
     if listed != (db.kv(LISTED_KEY) or {}):
         db.set_kv(LISTED_KEY, listed or None)
