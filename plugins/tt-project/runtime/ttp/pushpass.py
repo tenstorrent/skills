@@ -11,7 +11,8 @@ batch reads only what a batch recorded here, never the passes `ttp checks` recor
 project's state as it trusts its own markers there, which name the heads it pushes. The store keeps
 the newest MAX entries younger than MAX_AGE_S. A pass also keeps the head and tip it was checked on,
 so the same change rebased onto a newer tip can carry it (carriable, verdictcarry) when the rebase
-changed nothing the check covers.
+changed nothing the check covers. `ttp checks` may reuse a pass recorded here (queued)
+for a check that is one plain local pytest run, on the same tree, command and env_id, naming its batch.
 
 A check that is one plain pytest run also resumes (resumable): the ttp_pytest_resume plugin appends
 each test file whose every selected test passed to a file keyed the same way, and the next run of
@@ -253,6 +254,24 @@ def passed(p: Project, tree: str, cmd: str, eid: str) -> dict | None:
     for e in reversed(_fresh(_load(p.state / STORE), now)):
         if e.get("key") == k:
             return e
+    return None
+
+
+def queued(p: Project, wt: Path, tree: str, cmd, env: dict, tips: list[str]) -> dict | None:
+    """For `ttp checks`: the push queue's recorded pass of `cmd` on `tree` whose env_id is the one `cmd`
+    has here in `env`, checked against one of `tips` (the batch's tip is not known here, so each is
+    tried; the key binds it), as the entry plus that "tip"; else None. Only a match of the tree, the
+    exact command and the whole env_id counts."""
+    if not tree:
+        return None
+    entries = [e for e in _fresh(_load(p.state / STORE), time.time()) if e.get("tree") == tree and e.get("cmd") == str(cmd)]
+    if not entries:
+        return None
+    parts = env_parts(wt, cmd, env, "")
+    keys = {key(tree, str(cmd), digest({**parts, "tip": t or ""})): t or "" for t in tips}
+    for e in reversed(entries):
+        if e.get("key") in keys:
+            return {**e, "tip": keys[e["key"]]}
     return None
 
 

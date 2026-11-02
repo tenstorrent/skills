@@ -14202,3 +14202,83 @@ def test_the_coordinator_and_guide_state_the_verdict_carry_rule_without_a_user_s
         for sentence in re.split(r"(?<=[.;])\s", " ".join(text.split())):
             if re.search(r"carr(y|ies|ied)|ignore_paths", sentence) and re.search(r"verdict|pass", sentence):
                 assert "user's word" not in sentence and "user's yes" not in sentence, sentence
+
+
+def _queue_pass(p, repo, cmd, tip, env=None, batch="b7", tree=None):
+    """Record a pass of `cmd` on HEAD's tree as the push queue does (batch._check: env_parts of the
+    target-mode check environment, checked against `tip`)."""
+    from ttp import push, pushpass
+    parts = pushpass.env_parts(repo, cmd, env or push.check_env("target", tip), tip)
+    assert pushpass.record(p, tree or pushpass.tree_of(repo, "HEAD"), cmd, pushpass.digest(parts), batch, parts) == ""
+
+
+def test_ttp_checks_reuses_a_push_queue_pass_only_on_the_same_tree_command_and_environment(env, tmp_path,
+                                                                                         monkeypatch, capsys):
+    """A plain pytest check the push queue passed on exactly HEAD's tree, with the same command and
+    env_id (its tip one of HEAD's first-parent ancestors), is not run again by `ttp checks`: the batch is
+    named in the output and in checks.json. Another tree, command or environment, an unrelated tip,
+    --fresh, or a check that is not one plain pytest run (a validator, a scan) runs it."""
+    from ttp import cli, pushpass
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    tip = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    (repo / "b.txt").write_text("b\n")
+    subprocess.run([*git, "add", "b.txt"], check=True)
+    subprocess.run([*git, "commit", "-qm", "b"], check=True)
+    tree = pushpass.tree_of(repo, "HEAD")
+    count = tmp_path / "count"
+    cmd = f"echo x >> {count} || pytest"   # one plain pytest run (pushpass.resumable)
+    assert pushpass.resumable(cmd)
+    ran = lambda: len(count.read_text().splitlines()) if count.exists() else 0
+
+    def checks(*args, check=cmd):
+        (p.state / cli.CHECK_PASSES).unlink(missing_ok=True)   # only the push queue's pass may serve
+        cli.main(["checks", *args, "--", check])
+        return capsys.readouterr().out
+
+    def reset():
+        (p.state / pushpass.STORE).unlink(missing_ok=True)
+
+    # The same tree, command and environment: reused, the batch named.
+    _queue_pass(p, repo, cmd, tip)
+    out = checks()
+    assert ran() == 0, "the push queue's pass on the same tree ran the check again"
+    assert f"passed on {tree[:12]} in push batch b7 at " in out and "recorded by the push queue" in out, out
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and [(x["command"], x["batch"], x["tip"]) for x in rec["push_queue_passes"]] \
+        == [(cmd, "b7", tip)]
+    assert "b7" in (run / "checks.log").read_text()
+    # --fresh runs it.
+    checks("--fresh")
+    assert ran() == 1
+    # Another command (same tree and environment): runs.
+    reset()
+    _queue_pass(p, repo, cmd + " -q", tip)
+    checks()
+    assert ran() == 2
+    # Another environment: an active venv, or a tip that is not an ancestor of HEAD; runs.
+    reset()
+    from ttp import push
+    _queue_pass(p, repo, cmd, tip, env={**push.check_env("target", tip), "VIRTUAL_ENV": str(tmp_path / "venv")})
+    _queue_pass(p, repo, cmd, "f" * 40)
+    out = checks()
+    assert ran() == 3 and "push batch" not in out
+    # Another tree (recorded on the tip's tree): runs.
+    reset()
+    _queue_pass(p, repo, cmd, tip, tree=pushpass.tree_of(repo, tip))
+    checks()
+    assert ran() == 4
+    # A check that is not one plain pytest run always runs, even with a queue pass of it.
+    reset()
+    other = f"echo y >> {count}"
+    _queue_pass(p, repo, other, tip)
+    checks(check=other)
+    assert ran() == 5
+    # The reused pass is recorded as this run's, so the next `ttp checks` on the tree reuses that.
+    reset()
+    _queue_pass(p, repo, cmd, tip, batch="b8")
+    checks()
+    assert ran() == 5
+    reset()
+    cli.main(["checks", "--", cmd])
+    assert ran() == 5 and "(recorded)" in capsys.readouterr().out

@@ -2436,6 +2436,26 @@ def _env_miss(p: Project | None, tree: str, cmds: list, parts: list[dict], purpo
     return ""
 
 
+QUEUE_TIPS = 200   # how many first-parent ancestors of HEAD _queue_passes tries as the batch's tip
+
+
+def _queue_passes(p: Project | None, top: str | Path, tree: str, todo: list, env: dict) -> list[tuple]:
+    """(check, entry) for each check in `todo` that is one plain local pytest run (pushpass.resumable)
+    and that the push queue recorded passing on exactly `tree` with the same command and env_id as it
+    has here in `env` (pushpass.queued), checked against HEAD or one of its first-parent ancestors.
+    Every other check (a validator, a scan, an install) always runs."""
+    if not p or not tree:
+        return []
+    from . import push, pushpass
+    todo = [c for c in todo if pushpass.resumable(str(c)) and not push.remote_host(c)]
+    if not todo:
+        return []
+    r = subprocess.run(["git", "-C", str(top), "rev-list", "--first-parent", f"--max-count={QUEUE_TIPS}", "HEAD"],
+                       capture_output=True, text=True)
+    tips = (r.stdout.split() if r.returncode == 0 else []) + [""]
+    return [(c, e) for c in todo if (e := pushpass.queued(p, Path(top), tree, c, env, tips))]
+
+
 def _check_envs(top: str | Path, cmds: list, run_env: dict) -> tuple[list[str] | None, list[dict] | None]:
     """(pushpass.check_envs, their pushpass.check_env_parts) of `cmds`, or (None, None) without `run_env`."""
     if not run_env:
@@ -2600,7 +2620,10 @@ def cmd_checks(a) -> None:
     passing itself on the same tree, pushpass): a forged record here can at most skip a local re-run
     or an own-branch push's checks, never let a change onto the push branch. A pass also records the
     environment of each command (pushpass.check_envs); `ttp push --own` runs nothing again that
-    passed here on exactly HEAD's tree with the same commands and environment. Where every project check is skipped on a commit,
+    passed here on exactly HEAD's tree with the same commands and environment. A check that is one plain
+    local pytest run the push queue recorded passing (pushpass) on exactly HEAD's tree, with the same
+    command and env_id, is not run again either; the output and checks.json name its push batch, and
+    `--fresh` runs it. Where every project check is skipped on a commit,
     `ttp push --own` takes the commands given after `--` that this run recorded passing on exactly that
     commit and runs them itself before it pushes.
 
@@ -2851,8 +2874,27 @@ def cmd_checks(a) -> None:
         todo = [c for c in todo if c not in verified_cmds]
         if verified_cmds and todo and not a.fresh:
             hit = _recorded_pass(p, tree, todo, purpose)
+        # A plain pytest check the push queue passed on exactly this tree, with the same command and
+        # env_id (pushpass.queued), is not run again; the batch it came from is named and kept.
+        queue_hits = _queue_passes(p, top, tree, todo, {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)),
+                                                        "PWD": top, **venv_vars}) \
+            if passed and todo and not hit and not a.fresh and not fast_cmds and purpose == "candidate" else []
+        queue_cmds = [c for c, _ in queue_hits]
+        for c, e in queue_hits:
+            said = (f"{c!r} passed on {tree[:12]} in push batch {e.get('batch') or '?'} at "
+                    f"{timefmt.long(float(e.get('ts') or 0), p)} (recorded by the push queue, same tree, command and "
+                    f"environment); --fresh runs it again")
+            out.write(f"ttp checks: {said}\n")
+            print(f"ttp checks: {said}")
+        todo = [c for c in todo if c not in queue_cmds]
+        if queue_cmds and todo:
+            hit = _recorded_pass(p, tree, todo, purpose)
         if not todo and passed and verified_cmds:
             said = f"every applicable check was {mark['line']}"
+            out.write(f"{said}\n")
+            print(f"ttp checks: {said}")
+        elif not todo and passed and queue_cmds:
+            said = f"every applicable check passed in the push queue on {tree[:12]}"
             out.write(f"{said}\n")
             print(f"ttp checks: {said}")
         elif not todo and passed and push.outside_scope(cmds, skipped):
@@ -3163,7 +3205,7 @@ def cmd_checks(a) -> None:
     if not passed:
         # The applicable checks a failure or refusal left unrun stay listed as such, never as passed;
         # those verified through the lineage marker were checked, not left unrun.
-        not_executed = [c for c in selected if c not in executed and c not in verified_cmds]
+        not_executed = [c for c in selected if c not in executed and c not in verified_cmds and c not in queue_cmds]
         with open(log, "rb") as f:   # this call's part of the log
             f.seek(start)
             text = f.read().decode("utf-8", errors="replace")
@@ -3195,6 +3237,10 @@ def cmd_checks(a) -> None:
                                                      "commands": todo, "skipped": skipped, "ts": time.time(),
                                                      **({"verified": verified_cmds, "verified_through": mark["sha"]}
                                                         if verified_cmds else {}),
+                                                     **({"push_queue_passes": [
+                                                         {"command": str(c), "batch": e.get("batch") or "?",
+                                                          "tip": e.get("tip") or "", "ts": e.get("ts")}
+                                                         for c, e in queue_hits]} if queue_hits else {}),
                                                      "purpose": purpose, "checks_from": source,
                                                      **({"fast_path": True, "skipped_project_checks": fast_skipped}
                                                         if fast_cmds else {}),
@@ -3244,12 +3290,14 @@ def cmd_checks(a) -> None:
               f"(full output: {log})")
         return
     if purpose == "candidate":
-        _mark_verified(p, head, tree, list(todo) + list(verified_cmds))
+        _mark_verified(p, head, tree, list(todo) + list(verified_cmds) + list(queue_cmds))
     if hit:
         print(said)
         return
-    if todo:
-        _record_pass(p, tree, todo, purpose, run_dir, *_check_envs(top, todo, run_env))
+    # The push queue's passes count with this run's: recorded together, in the order they apply.
+    rec = [c for c in selected if c in todo or c in queue_cmds] if queue_cmds else todo
+    if rec:
+        _record_pass(p, tree, rec, purpose, run_dir, *_check_envs(top, rec, run_env))
     # Released only once the pass is recorded: a waiter for the same checks finds it the moment it may run.
     if slot:
         slot.close()
