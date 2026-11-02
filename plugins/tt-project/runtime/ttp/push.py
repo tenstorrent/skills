@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, cleantree, envfault, gitcache, gitmemo, landed, locks, machines, prguard, prhead, remotecheck, repoid, runner,
+from . import (checkcap, checkdirs, checklane, cleantree, envfault, gitcache, gitmemo, landed, locks, machines, prguard, prhead, remotecheck, repoid, runner,
                sandbox, scriptwatch, settinghold, shorttmp, testslots, timefmt, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
@@ -3434,7 +3434,6 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
                 except ValueError as e:
                     say(f"{e}; not pushing")
                     return CHECKS_FAILED
-                from . import checklane
                 todo = extras = with_wrap(todo, wrap, skip=lambda c: checklane.no_device(c, cfg))
                 if any(getattr(c, "wrap", None) for c in todo) and (why := wrap_problem(wrap, repo)):
                     say(f"{why}; not pushing")
