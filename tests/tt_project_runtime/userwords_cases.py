@@ -77,6 +77,23 @@ def test_an_open_ask_or_refused_action_gets_the_users_latest_words_at_most_three
     assert sum(x.startswith("- refused action: User's latest") for x in coord.digest(p, {}, [], []).splitlines()) == 3
 
 
+def test_contraction_fragments_match_no_unrelated_user_words(env):
+    # don't, it's, I'll, shouldn't leave fragments (don, s, ll, t) that are no shared topic words.
+    from ttp import coordinator as coord, userwords
+    p = make(env)
+    for text in ("If I don't answer within the hour, it's your call and you'll decide; don't wait for me.",
+                 "A guard meant to catch loops shouldn't hold the queue; it's wrong, and they'd drop it.",
+                 "Then tell ltx-rt's coordinator it isn't done and don't let it's watcher stop."):
+        p.db.post("in", text, chat=None, kind="user", provenance="web-session")
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    ask = ("Cursor sign-in for the live measurement: if you don't use it, tell me and I'll drop it. "
+           "It's the last step, and it isn't something I can do.")
+    p.db.post("out", ask, chat=None, kind="ask")
+    rows = [(r["id"], r["ts"], r["text"], r["context"]) for r in p.db.q(userwords.USER_SQL, (0, userwords.SCAN))]
+    assert len(rows) == 3 and userwords.on_topic(None, ask, rows=rows) == []
+    assert "latest words" not in coord.digest(p, {}, [], [])
+
+
 def test_the_ask_gate_refuses_leave_the_users_newer_request_gave_naming_it(env):
     from ttp import reask
     p = make(env)
@@ -115,7 +132,8 @@ def test_ttp_said_lists_the_newest_matching_user_words_read_only(env, capsys, mo
     assert _ttp_said("nightly", "report", "watcher", "--json") == 0
     got = _json.loads(capsys.readouterr().out)
     assert [m["id"] for m in got] == [new, old], got   # newest first; no context, system row or outbound one
-    assert got[0]["quote"] == _NEW_WORD and got[0]["when"].endswith(("PST", "PDT", "UTC")) or got[0]["when"]
+    assert got[0]["quote"] == _NEW_WORD, got[0]
+    assert str(got[0]["when"]).strip(), got[0]
     assert {relayed, sysrow, reply}.isdisjoint(m["id"] for m in got)
     assert _ttp_said("box-a1", "stale") == 0
     out = capsys.readouterr().out

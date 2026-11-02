@@ -9,13 +9,15 @@ workers. `digest_lines` adds, for each blocked task, open ask and refused action
 at most PER_ITEM lines 'User's latest words on this: #id date "quote"', so a turn sees what the user
 said later before it refuses, blocks or asks again on an older rule. Nothing matches, nothing shown.
 
-Match: content words (reask.words, with GENERIC words dropped) and hard anchors (reask.anchors).
+Match: content words (reask.words, with GENERIC words dropped; for a topic also contraction tails
+and words under 3 characters) and hard anchors (reask.anchors).
 A query (the command) matches a sentence holding every one of its words, or its anchors with half
 of its words. A topic (the digest) matches a sentence sharing an anchor and one more word, or
 MIN_SHARED words that are at least COVER of the topic's or of the sentence's words.
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 import time
 
@@ -34,12 +36,16 @@ QUOTE = 220
 GENERIC = {reask._stem(w) for w in """task tasks code work run runs fix fixes fixed blocked block wait waiting
 waits project projects coordinator worker workers change changes reject rejected refused gate action actions
 turn turns resend sent send""".split()}
+_CONTRACTION = re.compile(r"n't\b|'(?:s|ll|ve|re|d|m)\b")
 HEADER = ("## The user's latest words on blocked items (newest first, from their recorded messages: the newest "
           "word on a topic wins over an older rule or reading; apply it, or say why it does not cover the item)")
 
 
 def _words(text: str) -> set[str]:
-    return reask.words(text) - GENERIC
+    """Topic words: reask.words without contraction tails (don't: don, t; it's: s; I'll: ll), words
+    under 3 characters or GENERIC ones, so a shared 'don't' or 'it's' matches no topic."""
+    text = _CONTRACTION.sub("", (text or "").lower().replace("’", "'"))
+    return {w for w in reask.words(text) if len(w) >= 3} - GENERIC
 
 
 def _quote(text: str) -> str:
