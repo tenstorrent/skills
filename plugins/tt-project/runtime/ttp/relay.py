@@ -20,7 +20,7 @@ the coordinator's own decision or the relayer's fact, never the user's word; a p
 A project whose owner relays through their own chat agent may turn on AGENT_KEY (off by default). Then that
 agent's context and findings count as the owner's word: the digest labels them AGENT and the guard passes.
 Never through it: a PR's approval (the message's provenance decides), the user-only settings
-(coordinator.NEEDS_USER, the merge list), loosening a Restriction, or text from anyone else (events, notes,
+(coordinator.NEEDS_USER, the merge list), changing a Restriction, or text from anyone else (events, notes,
 PR comments, logs: none are messages and none reach this guard).
 """
 from __future__ import annotations
