@@ -7283,10 +7283,20 @@ def _machine_outage(a) -> None:
     from . import machine_ledger as ml
     p = here()
     by = a.by or (p.name if p else "user")
+    queue = p.state if p else None   # a sandbox that keeps the shared ledger read-only: queued for the daemon
     if a.clear:
         if not a.alias:
             die("name the machine whose outage is over")
-        if ml.clear_outage(a.alias, by):
+        try:
+            cleared = ml.clear_outage(a.alias, by, queue=queue)
+        except OSError as e:
+            die(_unwritable(e))
+        except ValueError as e:
+            die(str(e))
+        if isinstance(cleared, dict):
+            print(_queued_line(cleared, p))
+            return
+        if cleared:
             left = ml.outages().get(a.alias)
             print(f"{a.alias}: {by}'s known outage cleared"
                   + (f"; still out: {ml.outage_line(a.alias, left, p)}" if left else ""))
@@ -7307,9 +7317,15 @@ def _machine_outage(a) -> None:
             print("no known outages")
         return
     try:
-        rec = ml.set_outage(a.alias, a.why, by, a.expires, owner=a.owner or "", covers=a.covers, where=p)
+        rec = ml.set_outage(a.alias, a.why, by, a.expires, owner=a.owner or "", covers=a.covers, where=p,
+                            queue=queue)
     except ValueError as e:
         die(str(e))
+    except OSError as e:
+        die(_unwritable(e))
+    if rec.get("queued"):
+        print(_queued_line(rec, p))
+        return
     print(ml.outage_line(a.alias, ml.outages().get(a.alias) or rec, p))
 
 
@@ -7333,7 +7349,8 @@ def _machine_change(a) -> None:
                       f"{r.get('outcome')}" + (f"; output: {tail}" if tail else ""))
         for r in ml.pending(p.state) if p else []:
             print(f"queued for this project's daemon (request {r['queued']}): {r['op']} "
-                  + (f"#{r['fields'].get('id')}" if r["op"] == "close" else
+                  + (f"#{r['fields'].get('id')}" if r["op"] in ("close", "edit", "test") else
+                     f"{r['fields'].get('alias')}" if r["op"] in ("outage", "outage_clear") else
                      f"{r['fields'].get('alias')}: {r['fields'].get('what')}"))
         return
     p = here()
@@ -7344,6 +7361,8 @@ def _machine_change(a) -> None:
             c = ml.close_change(a.id, a.why or "", by or "user", queue=queue)
         except ValueError as e:
             die(str(e))
+        except OSError as e:
+            die(_unwritable(e))
         print(_queued_line(c) if c.get("queued") else f"closed machine change #{c['id']} on {c['alias']}")
         return
     if a.change == "edit":
@@ -7371,17 +7390,12 @@ def _machine_change(a) -> None:
             c = ml.edit_change(a.id, by or "user", a.what, a.undo, a.expires, a.until_probe, until_task=a.until_task,
                                where=p, auto_undo=a.auto_undo, allow_met_probe=a.allow_met_probe,
                                project=(p if p and p.name == owner else local_project(owner) or p)
-                               if a.until_probe else None)
+                               if a.until_probe else None, queue=queue)
         except ValueError as e:
             die(str(e))
         except OSError as e:
-            if e.errno not in ml.UNWRITABLE:
-                raise
-            die(f"the shared machine ledger is read-only here ({e.strerror}), and an edit (except --test or "
-                f"--no-test) is not queued: "
-                f"`ttp machines change close {a.id}` and `ttp machines change add` a new entry (both are queued "
-                f"for this project's daemon)")
-        print(f"edited {ml.change_line(c, where=p)}")
+            die(_unwritable(e))
+        print(_queued_line(c, p) if c.get("queued") else f"edited {ml.change_line(c, where=p)}")
         return
     if not by:
         die("run it inside a project, or say whose change it is: --by <project>")
@@ -7412,17 +7426,35 @@ def _machine_change(a) -> None:
                           project=p if p and p.name == by else local_project(by) or p)
     except ValueError as e:
         die(str(e))
+    except OSError as e:
+        die(_unwritable(e))
     print(_queued_line(c, p) if c.get("queued") else f"recorded {ml.change_line(c, where=p)}")
 
 
+def _unwritable(e: OSError) -> str:
+    """The one-line error for a shared machine-ledger write that failed outside a project (nothing to queue
+    in) or for another cause than a read-only ledger."""
+    from . import machine_ledger as ml
+    if e.errno in ml.UNWRITABLE:
+        return (f"the shared machine ledger is read-only here ({e.strerror}: {e.filename or ml._path(ml.LOCK)}) and "
+                f"no project's state to queue the request in: run it inside the project, or where the ledger is writable")
+    return f"could not write the shared machine ledger: {e.strerror or e}" + (f" ({e.filename})" if e.filename else "")
+
+
 def _queued_line(req: dict, where=None) -> str:
-    """What `ttp machines change add|close` says when it queued the request (machine_ledger: Queued requests);
-    an added change's end is shown in the zone of `where`."""
+    """What `ttp machines change add|close|edit` and `ttp machines outage` say when they queued the request
+    (machine_ledger: Queued requests); an end is shown in the zone of `where`."""
     from . import ends
-    end = req["fields"].get("expires")
-    what = f"close of machine change #{req['fields']['id']}" if req["op"] == "close" else \
-        f"machine change on {req['fields']['alias']}: {req['fields']['what']}" \
-        + (f" (ends {ends.shown(float(end), where)} at the latest)" if isinstance(end, (int, float)) else "")
+    f = req["fields"]
+    end = f.get("expires") if req["op"] != "edit" else (f.get("set") or {}).get("expires")
+    if req["op"] == "outage":
+        end = (f.get("rec") or {}).get("until")
+    shown = f" (ends {ends.shown(float(end), where)} at the latest)" if isinstance(end, (int, float)) else ""
+    what = f"close of machine change #{f['id']}" if req["op"] == "close" else \
+        f"edit of machine change #{f['id']}{shown}" if req["op"] == "edit" else \
+        f"known outage on {f['alias']}: {(f.get('rec') or {}).get('why')}{shown}" if req["op"] == "outage" else \
+        f"clearing of {f.get('by') or 'every project'}'s known outage on {f['alias']}" if req["op"] == "outage_clear" else \
+        f"machine change on {f['alias']}: {f['what']}{shown}"
     return (f"queued {what} (request {req['queued']}): the shared machine ledger is read-only here, so this "
             f"project's daemon records it on its next tick, within a few minutes while it runs; "
             f"`ttp machines change list` shows it. Running the command again adds nothing.")

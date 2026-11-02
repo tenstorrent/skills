@@ -114,8 +114,10 @@ content (request_id), and the project's own daemon records it on its next routin
 model-free. A retry of the same command finds the request already queued, or its open entry (which keeps
 the request's id as `request`), and adds nothing; a daemon killed between the ledger write and the request's
 removal finds that entry and only removes the request. A request the ledger refuses by then (its machine
-gone) is kept as `<id>.failed.json` with the reason, and logged. `ttp machines change edit` is not queued
-(close the entry and add a new one), except its --test or --no-test (op `test`).
+gone) is kept as `<id>.failed.json` with the reason, and logged. `ttp machines change edit` is queued the
+same way (op `edit`, or `test` for its --test or --no-test), checked against the ledger as read first, and
+keeps the entry's id; so are `ttp machines outage` and its --clear (ops `outage`, `outage_clear`). An edit
+records its request id in its `edits`, so a request applied twice edits once.
 
 A page is never lost nor sent twice: `route` records each due page as pending, with a text fixed for its
 step, and hands it to one daemon at a time (a claim that lapses after CLAIM_S); that daemon marks it
@@ -505,6 +507,24 @@ def apply_requests(state: Path, log: Callable[[str], None] = print) -> list[dict
                     log(f"machine change #{c['id']} closed from queued request {rid}")
                 except ValueError:
                     c = {"id": f.get("id")}   # closed already: by an earlier run of this request, or by someone else
+            elif req.get("op") == "edit":
+                try:
+                    c = _edit(f, request=rid)
+                    log(f"machine change #{c['id']} edited from queued request {rid}")
+                except ValueError as e:
+                    if "already says that" not in str(e):
+                        raise
+                    c = {"id": f.get("id")}   # edited so already: by an earlier run of this request, or by someone else
+            elif req.get("op") == "outage":
+                if f.get("alias") not in machines.load():
+                    raise ValueError(f"no machine {f.get('alias')!r} in `ttp machines list`")
+                _set_outage(f["alias"], f["by"], dict(f["rec"]))
+                c = {"alias": f["alias"], "outage": f["rec"]}
+                log(f"known outage on {f['alias']} recorded from queued request {rid}")
+            elif req.get("op") == "outage_clear":
+                _clear_outage(f["alias"], f.get("by"), float(f.get("at") or time.time()))   # cleared already: no-op
+                c = {"alias": f["alias"], "outage": None}
+                log(f"known outage on {f['alias']} cleared from queued request {rid}")
             else:
                 raise ValueError(f"unknown request {req.get('op')!r}")
         except (ValueError, TypeError, KeyError) as e:
@@ -619,7 +639,7 @@ def _set_test(cid: int, by: str, test: bool, now: float) -> dict:
 def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = None, expires: Any = None,
                 until_probe: str | None = None, now: float | None = None, until_task: int | None = None,
                 where=None, auto_undo: bool | None = None, project=None, allow_met_probe: bool = False,
-                warn: Callable[[str], None] | None = None) -> dict:
+                warn: Callable[[str], None] | None = None, queue: Path | None = None) -> dict:
     """Correct open entry #cid in place: its text, undo command or end (--expires, --until-probe or
     --until-task, as add_change takes them, an --until-probe with an --expires too; the same until-task again
     restarts its PROBE_END_S, so a continuation task re-extends the entry, and the same until-probe again keeps
@@ -630,7 +650,8 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
     turn the auto-undo on (True, checked by check_auto_undo against the entry's undo and probe as edited) or
     off (False); refused while one runs. A new undo, end or auto-undo setting starts its tries afresh. `project`
     (a Project): run a given until-probe once first, outside the ledger lock, as add_change does
-    (check_probe_unmet; `allow_met_probe`, `warn`); refused, the entry is left unchanged."""
+    (check_probe_unmet; `allow_met_probe`, `warn`); refused, the entry is left unchanged. `queue`: as
+    add_change's: the checked edit is queued (op `edit`) and the request returned, with `queued`."""
     now = time.time() if now is None else now
     if sum(map(bool, (expires, until_probe, until_task))) > 1 and not (expires and until_probe and not until_task):
         raise ValueError("give one end: --expires, --until-probe (with or without --expires) or --until-task")
@@ -662,11 +683,30 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
         cur = next((c for c in _read(LEDGER, {}).get("changes", []) if isinstance(c, dict) and c.get("id") == cid), None)
         if cur and not cur.get("closed") and cur.get("kind") != POWER_CYCLE:
             check_probe_unmet(project, new["probe"], allow_met_probe, warn)
-    with _locked():
+    fields = {"id": cid, "by": by, "at": now, "set": new, "reprobe": until_probe is not None,
+              "expires_given": bool(expires)}
+    try:
+        return _edit(fields, where)
+    except OSError as e:
+        if queue is None or e.errno not in UNWRITABLE:
+            raise
+    _edit(fields, where, dry=True)   # refuses here what the daemon would refuse (unknown, closed, no change)
+    return _queue(queue, "edit", fields)
+
+
+def _edit(f: dict, where=None, dry: bool = False, request: str | None = None) -> dict:
+    """Apply edit request `f` (edit_change's checked fields) to its entry under the lock; `dry`: only check
+    it against the ledger as read now, unlocked, and write nothing. `request`: a queued request's id, kept in
+    the edit it records, so the same request applied again is a no-op."""
+    cid, by, now, new = int(f["id"]), f.get("by") or "", float(f.get("at") or time.time()), dict(f["set"])
+    auto_undo = new.get("auto_undo")
+    with contextlib.nullcontext() if dry else _locked():
         doc = _read(LEDGER, {"next": 1, "changes": []})
         c = next((c for c in doc.get("changes", []) if isinstance(c, dict) and c.get("id") == cid), None)
         if c is None:
             raise ValueError(f"no machine change #{cid}")
+        if request and any(e.get("request") == request for e in c.get("edits") or [] if isinstance(e, dict)):
+            return c   # applied already (a daemon killed before it removed the request)
         if c.get("closed"):
             raise ValueError(f"machine change #{cid} is closed; record a new one with `ttp machines change add`")
         if c.get("kind") == POWER_CYCLE and set(new) - {"what"}:
@@ -680,16 +720,18 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
         if new.get("auto_undo", c.get("auto_undo")) and ({"undo", "auto_undo", "probe", "until_task"} & set(new)):
             check_auto_undo(new.get("undo", c.get("undo")), new.get("probe", c.get("probe")),
                             new.get("until_task", c.get("until_task")))
-        reprobe = until_probe is not None and new["probe"] == c.get("probe")
+        reprobe = bool(f.get("reprobe")) and new["probe"] == c.get("probe")
         if reprobe:   # the same until-probe again keeps its end (unless --expires gives one) but starts afresh
             del new["probe"]
-            if not expires:
+            if not f.get("expires_given"):
                 del new["expires"]
         was = {k: c.get(k) for k, v in new.items() if (bool(c.get(k)) if k == "auto_undo" else c.get(k)) != v}
         if reprobe:
             was["probe_passed"] = c.get("probe_passed")
         if not was:
             raise ValueError(f"machine change #{cid} already says that: nothing to change")
+        if dry:
+            return c
         for k in set(was) & set(new):
             c[k] = new[k]
         if c.get("auto_undo") is False:
@@ -701,7 +743,7 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
             for k in ("probe_passed", "probe_job_failed", "probe_out", "task_ended", "task_status", "page"):
                 c.pop(k, None)
             c["page_from"] = now   # a new page episode: its pages get ids of their own, not the delivered ones'
-        c.setdefault("edits", []).append({"at": now, "by": by, "was": was})
+        c.setdefault("edits", []).append({"at": now, "by": by, "was": was, **({"request": request} if request else {})})
         _write(LEDGER, doc)
         return c
 
@@ -935,13 +977,14 @@ def conditions() -> dict[str, dict]:
 # known outages ------------------------------------------------------------------------------------
 
 def set_outage(alias: str, why: str, by: str, expires: Any, owner: str = "", now: float | None = None,
-               covers: Any = None, where=None) -> dict:
+               covers: Any = None, where=None, queue: Path | None = None) -> dict:
     """Record that `alias` is out for a known reason (a hardware repair) until `expires`: nobody is paged
     about it meanwhile. `by`: the project recording it; each project keeps its own entry per machine (module
     doc: Known outages), so this replaces only `by`'s. `owner`: who has the repair, often a human or an
     external ticket. `covers`: the parts it explains (OUTAGE_COVERS, or a service by name), stored for
     co-tenant watchers and heal checks; none: the whole machine. `where`: the zone a zone-less `expires` is
-    read in (ends.parse_expires). Returns the entry."""
+    read in (ends.parse_expires). Returns the entry. `queue`: as add_change's (op `outage`; the request is
+    returned, with `queued`)."""
     now = time.time() if now is None else now
     if alias not in machines.load():
         raise ValueError(f"no machine {alias!r} in `ttp machines list`")
@@ -956,9 +999,19 @@ def set_outage(alias: str, why: str, by: str, expires: Any, owner: str = "", now
            "until": ends.parse_expires(expires, now, where=where)}
     if parts:
         rec["covers"] = parts
+    try:
+        return _set_outage(alias, by, rec)
+    except OSError as e:
+        if queue is None or e.errno not in UNWRITABLE:
+            raise
+    return _queue(queue, "outage", {"alias": alias, "by": by, "rec": rec})
+
+
+def _set_outage(alias: str, by: str, rec: dict) -> dict:
+    """Store `by`'s outage entry `rec` on `alias` under the lock (the same entry again changes nothing)."""
     with _locked():
         doc = _read(ROUTES, {"conditions": {}})
-        got = outage_entries(now, doc)
+        got = outage_entries(rec["since"], doc)
         got.setdefault(alias, {})[by] = rec
         _store_outages(doc, got)
         _write(ROUTES, doc)
@@ -977,9 +1030,22 @@ def outage_covers(covers: Any) -> list[str]:
     return [c for c in OUTAGE_COVERS if c in words] + sorted(words - set(OUTAGE_COVERS))
 
 
-def clear_outage(alias: str, by: str | None = None, now: float | None = None) -> bool:
-    """End `by`'s outage entry on `alias` (None: every project's). Whether one was open."""
+def clear_outage(alias: str, by: str | None = None, now: float | None = None, queue: Path | None = None) -> bool | dict:
+    """End `by`'s outage entry on `alias` (None: every project's). Whether one was open. `queue`: as
+    add_change's: an open one is queued to clear (op `outage_clear`) and the request returned, with `queued`."""
     now = time.time() if now is None else now
+    try:
+        return _clear_outage(alias, by, now)
+    except OSError as e:
+        if queue is None or e.errno not in UNWRITABLE:
+            raise
+    mine = outage_entries(now).get(alias) or {}
+    if not mine or (by is not None and by not in mine):
+        return False
+    return _queue(queue, "outage_clear", {"alias": alias, "by": by, "at": now})
+
+
+def _clear_outage(alias: str, by: str | None, now: float) -> bool:
     with _locked():
         doc = _read(ROUTES, {"conditions": {}})
         got = outage_entries(now, doc)

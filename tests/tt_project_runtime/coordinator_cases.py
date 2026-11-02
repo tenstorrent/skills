@@ -17590,7 +17590,7 @@ def test_a_sandboxed_worker_queues_machine_changes_for_its_daemon_when_the_share
     """A worker whose sandbox keeps the user's tt-project home read-only (no ledger lock) queues `ttp machines
     change add|close` in its project's state; the project daemon records each once, with its undo and end,
     at its next tick. A retry, or a daemon killed between the write and the request's removal, adds nothing;
-    a request the ledger refuses later is kept with its reason; an edit says what to do instead."""
+    a request the ledger refuses later is kept with its reason; an edit is queued too."""
     import contextlib
     import errno
     from ttp import cli
@@ -17644,9 +17644,10 @@ def test_a_sandboxed_worker_queues_machine_changes_for_its_daemon_when_the_share
     assert capsys.readouterr().out.startswith(f"recorded #{staged['id']} box-a")
     ml.project.write_json(p.state / ml.REQUESTS / f"{staged['request']}.json",
                           {"op": "add", "fields": {k: v for k, v in staged.items() if k not in ("id", "request")}})
-    with pytest.raises(SystemExit):
-        cli.main(["machines", "change", "edit", str(staged["id"]), "--what", "x"])
-    assert f"`ttp machines change close {staged['id']}`" in capsys.readouterr().err
+    cli.main(["machines", "change", "edit", str(staged["id"]), "--what", "x"])
+    assert capsys.readouterr().out.startswith(f"queued edit of machine change #{staged['id']}")
+    [edit] = [r for r in ml.pending(p.state) if r["op"] == "edit"]
+    (p.state / ml.REQUESTS / f"{edit['queued']}.json").unlink()
     cli.main(["machines", "change", "close", str(drop["id"]), "--why", "undone"])
     assert capsys.readouterr().out.startswith(f"queued close of machine change #{drop['id']}")
     [req] = [r for r in ml.pending(p.state) if r["op"] == "close"]
@@ -17668,6 +17669,101 @@ def test_a_sandboxed_worker_queues_machine_changes_for_its_daemon_when_the_share
     assert ml.apply_requests(p.state, log=logged.append) == []
     [failed] = (p.state / ml.REQUESTS).glob("*.failed.json")
     assert "no machine 'box-a'" in json.loads(failed.read_text())["error"] and "refused" in logged[0]
+
+
+def test_a_sandboxed_worker_queues_machine_change_edits_and_outages_for_its_daemon(env, monkeypatch, capsys):
+    """With the user's tt-project home read-only (a fenced worker), `ttp machines change edit` and `ttp machines
+    outage` set and clear are queued in the project's state, checked first as the direct path checks them,
+    and applied once by the daemon's tick. An extended entry keeps its id and pages nobody; a request applied
+    twice changes nothing more; a bad one is refused at the CLI, or kept with its reason at apply time; no
+    traceback anywhere."""
+    import contextlib
+    import errno
+    from ttp import cli
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-a", tags="device")
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(p.root)
+    real = ml._locked
+    now = time.time()
+    c = ml.add_change("box-a", "drop-in", "rm drop-in", p.name, expires="1h", now=now)
+
+    @contextlib.contextmanager
+    def read_only():
+        raise OSError(errno.EROFS, "Read-only file system", str(ml._path(ml.LOCK)))
+        yield
+
+    monkeypatch.setattr(ml, "_locked", read_only)
+    # An edit that extends the entry is queued, keeps its id and pages nobody once applied.
+    cli.main(["machines", "change", "edit", str(c["id"]), "--expires", "6h"])
+    out = capsys.readouterr().out
+    assert out.startswith(f"queued edit of machine change #{c['id']} (ends ") and "read-only here" in out, out
+    [req] = ml.pending(p.state)
+    assert req["op"] == "edit" and ml.changes()[0]["expires"] == c["expires"]
+    # Refused at the CLI as the direct path refuses them: an unknown id, a bad expiry, no change at all.
+    for argv, err in ((["edit", "99", "--what", "x"], "no machine change #99"),
+                      (["edit", str(c["id"]), "--expires", "whenever"], "expires"),
+                      (["edit", str(c["id"]), "--what", "drop-in"], "already says that")):
+        with pytest.raises(SystemExit):
+            cli.main(["machines", "change", *argv])
+        got = capsys.readouterr().err
+        assert err in got and "Traceback" not in got, got
+    assert len(ml.pending(p.state)) == 1
+    # Outage set and clear are queued too; an unknown alias or a clear with nothing open is refused/said plainly.
+    cli.main(["machines", "outage", "box-a", "fan repair", "--expires", "2d"])
+    out = capsys.readouterr().out
+    assert out.startswith("queued known outage on box-a: fan repair") and "read-only here" in out, out
+    with pytest.raises(SystemExit):
+        cli.main(["machines", "outage", "box-z", "x", "--expires", "1h"])
+    assert "no machine 'box-z'" in capsys.readouterr().err
+    cli.main(["machines", "outage", "box-a", "--clear"])
+    assert "no known outage from" in capsys.readouterr().out
+    assert ml.outages() == {} and [r["op"] for r in ml.pending(p.state)] == ["edit", "outage"]
+    monkeypatch.setattr(ml, "_locked", real)
+    ml.Probes(p, log=lambda m: None).tick(now + 5)
+    assert ml.pending(p.state) == [] and not list((p.state / ml.REQUESTS).glob("*.failed.json"))
+    [edited] = ml.changes()
+    assert edited["id"] == c["id"] and edited["expires"] == pytest.approx(now + 6 * 3600, abs=60)
+    assert edited["edits"][-1]["request"] == req["queued"] and not ml.overdue(edited, now + 7200)
+    route = dict(able=lambda n: (True, ""), healthy=lambda *a: [], task_status=lambda *a: None)
+    assert ml.route(now + 7200, **route) == []   # past its old end: no overdue page to anyone
+    assert ml.outages()["box-a"]["why"] == "fan repair"
+    # The same edit request applied again is a no-op, not a second edit nor a refusal.
+    ml.project.write_json(p.state / ml.REQUESTS / f"{req['queued']}.json", {k: v for k, v in req.items() if k != "queued"})
+    ml.apply_requests(p.state, log=lambda m: None)
+    assert len(ml.changes()[0]["edits"]) == 1 and ml.pending(p.state) == []
+    assert not list((p.state / ml.REQUESTS).glob("*.failed.json"))
+    # Clearing is queued and applied once; applied again it is a no-op.
+    monkeypatch.setattr(ml, "_locked", read_only)
+    cli.main(["machines", "outage", "box-a", "--clear"])
+    assert capsys.readouterr().out.startswith(f"queued clearing of {p.name}'s known outage on box-a")
+    [clear] = ml.pending(p.state)
+    monkeypatch.setattr(ml, "_locked", real)
+    for _ in range(2):
+        ml.project.write_json(p.state / ml.REQUESTS / f"{clear['queued']}.json",
+                              {k: v for k, v in clear.items() if k != "queued"})
+        ml.apply_requests(p.state, log=lambda m: None)
+        assert ml.outages() == {} and ml.pending(p.state) == []
+    assert not list((p.state / ml.REQUESTS).glob("*.failed.json"))
+    # A request the ledger refuses by apply time is kept with its reason and logged.
+    monkeypatch.setattr(ml, "_locked", read_only)
+    ml.edit_change(c["id"], p.name, what="drop-in v2", queue=p.state)
+    monkeypatch.setattr(ml, "_locked", real)
+    ml.close_change(c["id"], "undone", p.name)
+    logged = []
+    ml.apply_requests(p.state, log=logged.append)
+    [failed] = (p.state / ml.REQUESTS).glob("*.failed.json")
+    assert "is closed" in json.loads(failed.read_text())["error"] and "refused" in logged[0]
+    # Outside a project there is nothing to queue in: one clear line, no traceback.
+    monkeypatch.setattr(ml, "_locked", read_only)
+    monkeypatch.delenv("TTP_PROJECT")
+    monkeypatch.setattr(cli, "here", lambda *a, **k: None)
+    with pytest.raises(SystemExit):
+        cli.main(["machines", "outage", "box-a", "x", "--expires", "1h"])
+    err = capsys.readouterr().err
+    assert "read-only here" in err and "Traceback" not in err and len(err.strip().splitlines()) == 1, err
 
 
 def test_archive_never_retires_worker_memory_cut_from_worker_prompts(env):

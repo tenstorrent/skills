@@ -15,7 +15,7 @@ It waits, unpaged, while the machine is under an outage, a fleet hold or a resou
 `add` and `edit` refuse it for a no-op undo, an undo that kills by name or pattern, an until-probe that always exits 0 and an `--until-task` end.
 
 A worker whose sandbox keeps the user's tt-project home read-only still runs `ttp machines change add` and `close` as usual: the CLI then queues the request in the project's own state, and the project's daemon records it within a few minutes (`ttp machines change list` shows it as queued until then).
-Running the command again adds nothing. `ttp machines change edit` is not queued (close the entry and add a new one), except `edit <id> --test` or `--no-test`.
+Running the command again adds nothing. `ttp machines change edit` (its text, undo, end, auto-undo or test flag) and `ttp machines outage` (set or `--clear`) are queued the same way: checked first (an unknown id or machine, a closed entry, a bad expiry or an edit that changes nothing is refused at once), then applied once by the daemon. An edit keeps the entry's id, so extend an entry with `edit <id> --expires <t>` before it goes overdue; never close it and add a new one. A request the ledger refuses by then is kept beside the queue with its reason and logged.
 
 Closing your own machine-change entry (with or without an undo) is routine bookkeeping: it needs no upstream note to tt-project. `ttp upstream --fp` is only for a tt-project harness fault; `ttp note --to` only when another project's work needs a request or an answer.
 
