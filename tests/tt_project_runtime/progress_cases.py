@@ -1448,7 +1448,9 @@ def test_probe_stall_rechecks_start_together_keep_their_answer_and_are_dropped_w
     assert d._probe_now("exit 3") is None and "exit 3" in d._stall_probes
     slow = d._stall_probes["sleep 60"][0]
     d._drop_stall_probes(time.time() + dmod.STALL_PROBE_KEEP_S)
-    assert d._stall_probes == {} and slow.poll() is not None
+    # Dropped before its start ended (a loaded host), it never runs: no process is left to poll.
+    assert d._stall_probes == {} and slow.started.wait(_load_scaled(30))
+    assert slow.proc is None or slow.poll() is not None
 
 def _stalled_waiting(p, d, tmp_path, probe, deps, now, ago=7200):
     """A task that handed off waiting on `probe` through the daemon's hand-off path (status queued,
