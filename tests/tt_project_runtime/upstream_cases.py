@@ -971,8 +971,9 @@ def test_a_high_severity_confirmation_is_filed_as_a_note_and_left_open(env, monk
     (ev,) = _queued_notes(dst)
     assert ev["status"] == "queued" and ev["severity"] == "high", ev
     assert not upstream.wontfixed(high["fp"]) and upstream.confirmations_closed("second") == 0
-    for sev in ("low", "normal"):
-        upstream.send(src.name, 57, "second", f"confirmed at {sev}", severity=sev, confirms=fp)
+    # Each from its own task: one task's repeat confirmation of the same note is dropped (`_repeat`).
+    for task, sev in ((58, "low"), (59, "normal")):
+        upstream.send(src.name, task, "second", f"confirmed at {sev}", severity=sev, confirms=fp)
     assert upstream.ingest(dst, dst.config()) == 2
     assert [e["status"] for e in _queued_notes(dst)] == ["queued", "handled", "handled"]
     assert upstream.confirmations_closed("second") == 2
