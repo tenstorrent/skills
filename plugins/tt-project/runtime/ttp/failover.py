@@ -24,7 +24,8 @@ the nearest it takes), sets the tier that matches the effort (e.g. Codex xhigh t
 budget, and adds a spec note saying what moved, why and when the old provider resets. Running tasks
 are never touched: each is reported once. A task (or one it continues or reviews) marked required
 stays put. Every move is an event in the feed (kind KIND), listed in the daily review, and one low
-alert. coordinator.provider_failover_after_h 0 turns every move off.
+alert. coordinator.provider_failover_after_h 0 turns every move off. No target lies outside the
+project's providers_allowed (provallow.py): a task with none left waits on its provider.
 """
 from __future__ import annotations
 
@@ -33,7 +34,7 @@ import re
 import time
 from typing import Any
 
-from . import headline, timefmt
+from . import headline, provallow, timefmt
 from .db import DB
 
 KIND = "provider_failover"
@@ -82,11 +83,13 @@ def to_of(v: Any, providers: dict | None) -> list[str]:
 
 
 def targets(cfg: dict) -> list[str]:
-    """Providers a task may move to, best first: coordinator.provider_failover_to, then the core one."""
+    """Providers a task may move to, best first: coordinator.provider_failover_to, then the core one;
+    none outside providers_allowed (provallow.py)."""
     raw = (cfg.get("coordinator") or {}).get("provider_failover_to") or []
     names = [raw] if isinstance(raw, str) else list(raw) if isinstance(raw, (list, tuple)) else []
     core = cfg.get("core_provider") or "claude"
-    out = [n for n in (str(n).strip() for n in names) if n in (cfg.get("providers") or {})] + [core]
+    out = [n for n in (str(n).strip() for n in names) if n in (cfg.get("providers") or {})
+           and provallow.allows(cfg, n)] + [core]
     return [n for i, n in enumerate(out) if n not in out[:i]]
 
 
@@ -227,11 +230,13 @@ def strip_notes(spec: str) -> str:
 
 
 def plan(db: DB, cfg: dict, stops: dict[str, tuple[str, float | None]], ok: list[str],
-         now: float, holds: dict[str, tuple[str, float | None]] | None = None) -> tuple[list[dict], list[dict]]:
+         now: float, holds: dict[str, tuple[str, float | None]] | None = None,
+         kept: list[dict] | None = None) -> tuple[list[dict], list[dict]]:
     """The moves to make now and the running tasks to report: ([{task, old, new, tier, effort, why,
     ends, at_once}], [{task, provider, why, ends}]). `stops` maps each provider that cannot start new
     work to (why, end); `holds` (stops when not given) adds those whose end is unknown, which move a
-    preference pin at once; `ok` lists the targets that can, best first."""
+    preference pin at once; `ok` lists the targets that can, best first. `kept` gets each queued
+    task that would move but has no target because providers_allowed is set ({task, provider, why})."""
     holds = stops if holds is None else holds
     limit = after_h(cfg)
     if not limit or not holds:
@@ -258,6 +263,8 @@ def plan(db: DB, cfg: dict, stops: dict[str, tuple[str, float | None]], ok: list
             continue
         order = ([core] if at_once and core in ok else []) + ok
         new = next((p for p in order if p != old), None)
+        if not new and kept is not None and t["status"] == "queued" and provallow.names(cfg) is not None:
+            kept.append({"task": t, "provider": old, "why": why})
         if not new or (not at_once and required(db, t)):
             continue
         moves.append({"task": t, "old": old, "new": new, "tier": mapped_tier(cfg, old, t),

@@ -3,7 +3,8 @@
 """Per-tier provider routing: one tier's worker runs go to the `chat` provider (an OpenAI-compatible
 endpoint, chatbridge.py), with fallback to the core provider and a meter on every run.
 
-Off unless project.json sets `providers.chat.tiers.<tier>.route: true` next to that tier's `model`.
+Off unless project.json sets `providers.chat.tiers.<tier>.route: true` next to that tier's `model`,
+and off whenever the project's providers_allowed leaves chat out (provallow.py).
 A worker run of a routed tier starts on chat when its task pins no provider or model and the start is
 no tier-up retry; reviews and coordinator turns never route. The run's note gets a `route` entry:
 the tier, where it was routed (`to`, `model`), its `fallback` reason (none, down, error, rate_limit,
@@ -83,7 +84,8 @@ FAULT_ENDS = ("failed", "request_error", "timeout", "stalled")
 
 def target(cfg: dict, tier: str) -> tuple[str, str] | None:
     """(provider, model) the tier's worker runs are routed to, or None (unset: nothing changes)."""
-    if (cfg.get("core_provider") or "claude") == TO:
+    from .provallow import allows
+    if (cfg.get("core_provider") or "claude") == TO or not allows(cfg, TO):
         return None
     entry = ((cfg.get("providers") or {}).get(TO) or {})
     t = ((entry.get("tiers") or {}).get(tier) or {}) if isinstance(entry, dict) else {}

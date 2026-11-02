@@ -577,6 +577,8 @@ prolonged whole-box outage.
   provider takes), its tier set from the effort (e.g. Codex `xhigh` to `deep`), and a spec note says
   what moved, why and when the old provider resets. A required pin stays; running tasks are only
   reported. Each move is a feed event, one low alert and a line in the daily review.
+  No task moves to a provider outside `providers_allowed` (unset: every configured provider), and
+  tier routing and task pins stay inside it too (skills/tt-project-harness/references/providers-allowed.md).
 - Stall check (model-free): when no worker run has started for `coordinator.stall_wake_h` (3; 0
   turns it off) while a queued task has been one dispatch would start now for that long, one high
   observation lists those tasks and when the last worker run started. It uses dispatch's own checks,

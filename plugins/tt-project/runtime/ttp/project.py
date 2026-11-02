@@ -29,6 +29,9 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "core_provider": "claude",
+    # The providers this project's tasks may run on, the core one always among them (provallow.py):
+    # tier routing, failover and task pins stay inside it. Empty: every configured provider.
+    "providers_allowed": [],
     "providers": {
         # Tiers name a difficulty class, never a model version: aliases resolve at run time and
         # the project (or the user) pins versions only when it has a reason to. Light runs on the
@@ -979,6 +982,8 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     out += chat_problems(raw)
     from .route import config_problems as route_problems
     out += route_problems(raw)
+    from .provallow import problems as allowed_problems
+    out += allowed_problems(raw)
     if isinstance(raw.get("budget"), dict):
         from .globalcap import setting_problems
         out += setting_problems(raw["budget"])

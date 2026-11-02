@@ -105,6 +105,7 @@ from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
 from . import workernotify
+from . import provallow
 from .db import (
     PAUSED_RESOURCES_KEY,
     SEVERITY_RANK,
@@ -3537,6 +3538,8 @@ def _task_pin(cfg: dict, a: dict, base: dict) -> dict:
         if prov and prov not in (cfg.get("providers") or {}):
             raise ValueError(f"provider {prov!r} is not configured (providers: "
                              f"{', '.join(sorted(cfg.get('providers') or {}))})")
+        if prov:
+            provallow.refuse_pin(cfg, prov)
         if (prov or None) != out["provider"] and a.get("model") is None and a.get("effort") is None:
             out.update(model=None, effort=None)   # another provider's model and effort do not carry over
         out["provider"] = prov or None

@@ -8029,6 +8029,12 @@ def cmd_config(a) -> None:
                    else failover.to_of(val, p.config().get("providers")))
         except ValueError as e:
             die(str(e))
+    if a.key == "providers_allowed":
+        from . import provallow
+        try:
+            val = provallow.of(val, p.config().get("providers"))
+        except ValueError as e:
+            die(str(e))
     if a.key == "coordinator.conclusion_floor":
         from . import tierfloor
         try:

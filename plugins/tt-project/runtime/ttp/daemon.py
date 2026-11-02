@@ -51,6 +51,7 @@ from . import workernotify
 from . import anchors
 from . import pagesev
 from . import askrethink
+from . import provallow
 from . import selfblock
 from . import bursthold
 from . import audit
@@ -7325,8 +7326,14 @@ class Daemon:
                 if gate.level != "red" and gate.allow_new_work and gate.max_parallel > 0 \
                         and not failover.hold(gate, self._provider_pause(prov), False, now):
                     ok.append(prov)
-            moves, running = failover.plan(db, self.cfg, stops, ok, now, holds)
+            kept: list[dict] = []
+            moves, running = failover.plan(db, self.cfg, stops, ok, now, holds, kept)
             where = timefmt.home(self.p)
+            for k in kept:   # providers_allowed leaves it nowhere to go: say so until it starts (_dispatch clears it)
+                note = k["task"]["blocked_reason"] or ""
+                held = provallow.held(self.cfg, k["provider"], k["why"])[:500]
+                if note != held and (not note or note.startswith(provallow.HELD_NOTE)):
+                    db.update_task(k["task"]["id"], blocked_reason=held)
             lines = [failover.apply(db, self.cfg, m, now, where) for m in moves]
             lines += failover.report_running(db, running, now, where)
         except Exception:
@@ -7798,6 +7805,12 @@ class Daemon:
                 fate[task["id"]] = "other"
                 continue
             provider = task["provider"] or core
+            if not provallow.allows(self.cfg, provider):   # an older pin outside providers_allowed waits, unspent
+                held = provallow.held(self.cfg, provider)[:500]
+                if task["blocked_reason"] != held:
+                    db.update_task(task["id"], blocked_reason=held)
+                fate[task["id"]] = "hold"
+                continue
             why = self._start_hold(task, provider, ctx, reserve=True)
             fate[task["id"]] = "full" if why == "gate" and task["id"] in ctx["full"] else SLOT_HELD_BY.get(why, "other")
             if why == "held":
@@ -7847,6 +7860,8 @@ class Daemon:
                 self._log_resource_wait(task, ctx.get("holds", {}).get(task["id"]))
             if why:
                 continue
+            if note.startswith(provallow.HELD_NOTE):
+                db.update_task(task["id"], blocked_reason=None)
             # An open run-start breaker (startbreaker): one start at a time retries, the rest wait unspent.
             brk = "held" if probe_tried else ""
             if not brk:
