@@ -168,3 +168,48 @@ def test_selfblock_reply_raises_at_most_once_per_window_and_never_on_its_own_ans
     t = db.add_task("pacing")
     db.update_task(t, status="blocked", blocked_reason=_SELF_BLOCKING[2])
     assert [(g["source"], g["id"]) for g in selfblock.raise_due(db, now + 120)] == [("task", t)]
+
+
+def test_selfblock_flags_a_throughmute_hold_with_no_gate_and_spares_a_cited_one(env):
+    p = make(env)
+    from ttp import selfblock
+    from ttp import screen
+    db = p.db
+    later = time.time() + 3600   # every mute in force
+    # A throughput-class mute whose owner is 'outside' (its why says only the user or an outside
+    # party can clear it) and names no GATES entry: one finding, naming the mute and its wait.
+    flagged = {"until": later, "source": "watcher:queue", "match": "lane_wait", "throughput": {"owner": {
+        "outside": "the lane is full; only the user or an outside party can clear it, so the mute "
+                   "waits on their word for the pacing"}}}
+    # Its why names a GATES entry (shared machine): quiet.
+    gated = {"until": later, "source": "watcher:box", "match": "queue", "throughput": {"owner": {
+        "outside": "the shared machine is busy; only the user or an outside party can clear it"}}}
+    # It cites the user's own message or ask: a user pause stays until the user's word.
+    user_cited = {"until": later, "source": "watcher:queue", "match": "lane", "throughput": {"owner": {
+        "outside": "only the user can clear it; (user msg #12, 2026-10-01) set the mute"}}}
+    a_user = db.post("out", "Pause the runs?", chat=None, kind="ask", severity="normal", ref="blocking:merge")
+    ask_cited = {"until": later, "source": "watcher:queue", "match": "lane2", "throughput": {"owner": {
+        "outside": f"only the user can clear it; waits for your ok on ask {a_user}"}}}
+    # A task- or probe-owned mute is never a selfblock finding (review_lines flags it).
+    owned = {"source": "watcher:queue", "match": "lane3", "throughput": {"owner": {"task": 7}},
+             "end_when": None, "until": time.time() + 3600}
+    db.set_kv(screen.MUTES_KEY, [flagged, gated, user_cited, ask_cited, owned])
+    found = selfblock.scan(db)
+    mutes = [(f["source"], f["id"]) for f in found if f["source"] == "mute"]
+    assert mutes == [("mute", "watcher:queue 'lane_wait'")], mutes
+    assert "the lane is full" in found[0]["cited"] or "only the user" in found[0]["cited"]
+    # raise_due lists it in its event, once (its fingerprint keeps it raised across checks).
+    (f2,) = selfblock.raise_due(db, time.time() + 1)
+    assert (f2["source"], f2["id"]) == mutes[0]
+    assert selfblock.raise_due(db, time.time() + 120) == []
+    assert db.one("SELECT COUNT(*) n FROM events WHERE kind=?", (selfblock.KIND,))["n"] == 1
+
+
+def test_selfblock_quiet_for_a_wait_on_the_users_pr_review():
+    from ttp import selfblock
+    # 'review of the draft PR' / 'review of PR #N' is a draft review: the user's (PR flow), so a
+    # task held on it must not raise. The old pattern matched only '(draft|pr) review' wording.
+    for s in ("waits for the user's review of the draft PR #12",
+              "waits for the user's review of the pull request",
+              "Held until the user's review of the draft PR"):
+        assert selfblock.finding(s) is None, s

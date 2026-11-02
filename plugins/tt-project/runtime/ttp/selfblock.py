@@ -17,7 +17,9 @@ bare 'your word' or 'your call' is ordinary in replies, so only hold wording cou
 event naming the decide-and-record path. One event per check lists every new finding; each finding
 (source, id and its text) raises once, across restarts (kv RAISED_KEY). Quiet for a task held by a
 user-only setting (settinghold.py) or on an ask only the user can answer (review, merge, human,
-access, funds, spend). It never changes a task or an ask: the turn it wakes decides. Replies raise at
+access, funds, spend), and for a throughput-class observation mute whose owner is 'outside' (its
+`why` names no GATES entry and cites no user message or ask; throughmute.vet). It never changes
+a task or an ask: the turn it wakes decides. Replies raise at
 most one event per REPLY_WINDOW_S, and a reply posted in that window never raises (kv REPLY_RAISED_KEY),
 so the turn's own answer to the event cannot raise the next one.
 """
@@ -72,7 +74,8 @@ GATES = (
         r"\b(?:merg\w*|ready\s+for\s+review|out\s+of\s+draft|leaves?\s+draft|undraft\w*|publish\w*|post(?:s|ed|ing)?|"
         r"e-?mail\w*|slack|send\s+(?:a\s+|the\s+)?(?:message|reply|note)|reply\s+to|comment\s+on|"
         r"on\s+(?:my|your|their|the\s+user'?s)\s+behalf|in\s+(?:my|your|their|the\s+user'?s)\s+name|as\s+(?:me|you|the\s+user)\b|"
-        r"request(?:er|ed\s+by)|asked\s+by|(?:person|people)'?s?\s+request|(?:pr|pull\s+request|draft)\s+review)",
+        r"request(?:er|ed\s+by)|asked\s+by|(?:person|people)'?s?\s+request|(?:pr|pull\s+request|draft)\s+review"
+        r"|review\s+of\s+(?:the\s+)?(?:draft\s+)?(?:pr|pull\s+request)(?:\s*#\s*\d+)?)",
         re.I)),
     ("credential, money or a step only the user holds", re.compile(
         r"\$|\b(?:credentials?|token|password|secret|api[- ]?key|ssh[- ]?key|log\s?-?in|sign\s?-?in|2fa|mfa|"
@@ -170,13 +173,32 @@ def scan(db, now: float | None = None) -> list[dict]:
                   (now - REPLY_WINDOW_S,)):
         if (cited := finding(r["text"], rx=HOLD)):
             out.append({"source": "reply", "id": r["id"], "text": r["text"], "cited": cited, "ts": r["ts"]})
+    # A throughput-class mute whose owner is 'outside' (its `why` says only the user or an outside
+    # party can clear it, per throughmute.vet) is the same self-blocking when its `why` names no
+    # GATES entry and cites no user message or ask: a wait on another's word for what is the
+    # coordinator's own decision. A task- or probe-owned mute is not (review_lines flags it).
+    from .project import USER_CITE
+    from .screen import MUTES_KEY
+    for m in db.kv(MUTES_KEY, []) or []:
+        if float(m.get("until") or 0) <= now:   # expired: not a mute in force any more
+            continue
+        o = (m.get("throughput") or {}).get("owner") or {}
+        if "outside" not in o:
+            continue
+        w = o.get("outside") or ""
+        if not w or USER_CITE.search(w) or any(_cites(w, aid) for aid in user_only):
+            continue   # a cite of the user's own message or ask: a user pause stays until their word
+        if (cited := finding(w, cite=False)) is None:
+            continue   # its why names a GATES entry, or a setting only the user may change
+        out.append({"source": "mute", "id": f"{m.get('source')} {m.get('match')!r}", "text": w, "cited": cited})
     for f in out:
         f["fp"] = _fp(f["source"], f["id"], f["text"])
     return out
 
 
 def text(found: list[dict]) -> str:
-    names = {"task": "task #{}", "ask": "ask {}", "reply": "your reply (message {})"}
+    names = {"task": "task #{}", "ask": "ask {}", "reply": "your reply (message {})",
+             "mute": "observation_mute {} (a hold on the user or an outside party that names no gate)"}
     lines = [f"{names[f['source']].format(f['id'])}: \"{_clip(f['text'])}\" (cites: {f['cited']})"
              for f in found[:MAX_LISTED]]
     more = f" (+{len(found) - MAX_LISTED} more)" if len(found) > MAX_LISTED else ""
