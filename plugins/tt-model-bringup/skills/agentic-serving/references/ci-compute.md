@@ -69,6 +69,8 @@ Use the granted workflow as it is, with its default setup and cleanup; do not fo
 it. Other users share the runner pool: `max_parallel` is a ceiling, not machines waiting idle, so
 jobs may queue. Queueing is not a failure; never cancel a run only because it has no runner yet.
 Dispatch the first CI smoke early so the wait overlaps local work.
+When the stage stops for any reason, its dispatched CI runs keep running; collect their results on
+resume instead of cancelling them.
 
 No run id is returned: poll for the new run and register it before dispatching the next. The ledger
 is shared state when several explorers dispatch — register at launch, not at collection. Count
