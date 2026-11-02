@@ -436,6 +436,8 @@ class Claude(Provider):
                         if name not in used:
                             used.append(name)
             elif t == "system" and ev.get("subtype") == "init":
+                if "model" in u.extra:   # a later init: the CLI started again, on the login it found then
+                    u.extra["reinit"] = True
                 u.session_id = ev.get("session_id", "")
                 u.extra["model"] = ev.get("model", "")
             elif t == "result":

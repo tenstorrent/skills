@@ -4607,8 +4607,9 @@ def test_the_project_caps_line_shows_billed_plan_paid_and_total_once(env):
         bud.caps_spend({"spent_24h": 1.0, "spent_7d": 2.0}, 0, 50, plan_paid=3.0)
 
 
-def _claude_run_with_reading(p, account, tmp_path):
-    """A running Claude worker run started on `account` whose output carries a plan-window reading and $3.54."""
+def _claude_run_with_reading(p, account, tmp_path, util=0.0, resets_at=None, reinit=False):
+    """A running Claude worker run started on `account` whose output carries a plan-window reading and
+    $3.54; `reinit`: its stream initialized a second time before the reading."""
     tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
     p.db.update_task(tid, status="running")
     started = time.time() - 600
@@ -4617,22 +4618,27 @@ def _claude_run_with_reading(p, account, tmp_path):
     run_dir = p.runs / str(rid)
     run_dir.mkdir(parents=True)
     (run_dir / "run.json").write_text(json.dumps({"budget_usd": 8.0, "timeout_s": 3600}))
+    init = {"type": "system", "subtype": "init", "session_id": "s1", "model": "m"}
     (run_dir / "output.jsonl").write_text("\n".join(json.dumps(e) for e in (
+        init, *([init] if reinit else []),
         {"type": "rate_limit_event", "rate_limit_info": {"status": "allowed", "unifiedWindows": {
-            "seven_day": {"utilization": 0.0, "resetsAt": time.time() + 3 * 86400}}}},
+            "seven_day": {"utilization": util, "resetsAt": resets_at or time.time() + 3 * 86400}}}},
         {"type": "result", "total_cost_usd": 3.54, "result": "ok"})) + "\n")
     return rid, started
 
 
-@pytest.mark.parametrize("now_acct,want", [("plan-acct", "plan-acct"), ("", "usage-acct"), (None, "usage-acct"),
-                                           ("usage-acct", "usage-acct")])
-def test_a_plan_reading_after_a_login_switch_is_filed_under_the_account_that_made_it(env, tmp_path, monkeypatch,
-                                                                                      now_acct, want):
-    """A run started on a usage-billed account whose login switched to a plan account before it ended:
-    its reading is the plan account's, so the run's billed dollars stay billed (none counted as plan).
-    Logged out or unreadable at the end: the run's own account, as before."""
+@pytest.mark.parametrize("start,now_acct,reinit,want", [
+    ("plan-a", "plan-b", False, "plan-a"),   # login switched mid-run: the CLI kept the start token
+    ("plan-a", "plan-b", True, "plan-b"),    # the stream re-initialized: it runs on the login now
+    ("", "plan-b", False, "plan-b"),         # no start account recorded: the login now, as before
+    ("plan-a", "", False, "plan-a"), ("plan-a", None, False, "plan-a"), ("plan-a", "plan-a", False, "plan-a")])
+def test_a_plan_reading_is_filed_under_the_account_the_run_started_on(env, tmp_path, monkeypatch,
+                                                                      start, now_acct, reinit, want):
+    """A run that started on one plan account while the login switched to another before it ended:
+    its reading (seven_day at 91%) is the start account's, so the new account's status and gate stay
+    clear of it. A re-initialized stream or a run with no start account: the login at its end."""
     p = make(env)
-    from ttp import billing
+    from ttp import budget as bud
     from ttp.daemon import Daemon
     from ttp.providers.claude import Claude
 
@@ -4642,9 +4648,45 @@ def test_a_plan_reading_after_a_login_switch_is_filed_under_the_account_that_mad
         return now_acct
     monkeypatch.setattr(Claude, "account", account)
     d = Daemon(p.base)
-    rid, started = _claude_run_with_reading(p, "usage-acct", tmp_path)
+    rid, started = _claude_run_with_reading(p, start, tmp_path, util=0.91, reinit=reinit)
     d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), {"rc": 0, "started": started, "ended": time.time()})
     accts = {r["account"] for r in p.db.q("SELECT account FROM snapshots WHERE provider='claude'")}
     assert accts == {want}, accts
+    if now_acct == "plan-b":   # what status and the gate see once the daemon has looked at the login now
+        p.db.set_kv(bud.ACCOUNT_KV + "claude", {"account": "plan-b", "ts": time.time()})
+        wins = [w for w in bud.windows_from_snapshots(p.db) if w.provider == "claude"]
+        held = bud.evaluate(p.db, p.config(), "claude", wins).level == "red"
+        assert held == (want == "plan-b"), wins
+
+
+@pytest.mark.parametrize("now_acct,want", [("plan-acct", "plan-acct"), ("", "usage-acct"), (None, "usage-acct"),
+                                           ("usage-acct", "usage-acct")])
+def test_a_reading_that_matches_the_new_logins_window_is_filed_under_it(env, tmp_path, monkeypatch, now_acct, want):
+    """A run started on a usage-billed account whose login switched to a plan account, and whose reading
+    has the reset time of that plan account's own last reading: the CLI used the new login, so the reading
+    is the plan account's and the run's billed dollars stay billed. Logged out or unreadable at the end:
+    the run's own account. A reset time matching neither account: the run's own account."""
+    p = make(env)
+    from ttp import billing
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    from ttp.providers.claude import Claude
+
+    def account(self):
+        if now_acct is None:
+            raise OSError("unreadable")
+        return now_acct
+    monkeypatch.setattr(Claude, "account", account)
+    resets = time.time() + 3 * 86400
+    bud.record_windows(p.db, [bud.Window("claude", "seven_day", 10.0, resets, "plan-acct")], ts=time.time() - 7200)
+    d = Daemon(p.base)
+    rid, started = _claude_run_with_reading(p, "usage-acct", tmp_path, resets_at=resets)
+    d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), {"rc": 0, "started": started, "ended": time.time()})
+    accts = {r["account"] for r in p.db.q("SELECT account FROM snapshots WHERE provider='claude' AND utilization=0")}
+    assert accts == {want}, accts
     billed = billing.billed_by_account(p.db.conn, started - 3600).get(("claude", "usage-acct"), 0.0)
     assert billed == (3.54 if want == "plan-acct" else 0.0), billed
+    # Another reset time than the plan account's: nothing says the CLI moved, so the start account.
+    rid, started = _claude_run_with_reading(p, "usage-acct", tmp_path, util=0.5, resets_at=resets + 86400)
+    d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), {"rc": 0, "started": started, "ended": time.time()})
+    assert {r["account"] for r in p.db.q("SELECT account FROM snapshots WHERE utilization=50")} == {"usage-acct"}

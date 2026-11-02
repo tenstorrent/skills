@@ -3668,7 +3668,7 @@ class Daemon:
         if not wins or read_at <= self._windows_read.get(key, 0):
             return
         self._windows_read[key] = read_at
-        acct = self._reading_account(r)
+        acct = self._reading_account(r, wins)
         bud.record_windows(self.p.db, [bud.Window(r["provider"], w["window"], w["utilization"], w.get("resets_at"),
                                                   acct) for w in wins], ts=read_at)
 
@@ -3967,7 +3967,8 @@ class Daemon:
             if status == "ok":
                 self._dry_run_on_pass(r, run_dir, usage.session_id or note.get("session_id") or "")
         # Read before the transaction: it may read the provider's login files.
-        read_as = self._reading_account(r) if usage.extra.get("windows") else r["account"] or ""
+        read_as = (self._reading_account(r, usage.extra["windows"], bool(usage.extra.get("reinit")))
+                   if usage.extra.get("windows") else r["account"] or "")
         # The run's end, its spend and what it did to its task commit together: a daemon stopped
         # half way leaves the run "running", and the next tick processes it again from disk.
         for rnd in self._finish_rounds(r["task"] or 0):
@@ -5395,18 +5396,41 @@ class Daemon:
             except Exception:
                 log(self.p, f"meter {name} failed: " + traceback.format_exc().replace("\n", " | ")[:800])
 
-    @staticmethod
-    def _reading_account(r: dict) -> str:
-        """The account a run's plan-window reading belongs to: the one its provider is logged in as
-        when the reading is taken. A login switched while the run went on (its CLI reads the new
-        credentials) makes that another account than the one the run started on and its spend is
-        booked to; filed under the run's account, another plan's reading would mark that account's
-        billed spend around it as plan-paid. Unknown now (logged out, unreadable): the run's own."""
+    def _reading_account(self, r: dict, wins: list | None = None, reinit: bool = False) -> str:
+        """The account a run's plan-window reading belongs to: the one the run started on (its row's
+        account), since the CLI keeps the token it started with. Another account only when the run
+        shows it used the login it ended on: its stream re-initialized (`reinit`), or a reading's
+        reset time matches that login's last reading of the same window and not the start
+        account's. No start account recorded: the provider's login now, as before."""
         try:
             now = get_provider(r["provider"]).account() or ""
         except Exception:
             now = ""
-        return now or r["account"] or ""
+        start = r["account"] or ""
+        if not start or not now or now == start:
+            return start or now
+        if reinit:
+            return now
+
+        def last_resets(acct: str) -> dict:
+            rows = self.p.db.q("SELECT window, resets_at FROM snapshots WHERE provider=? AND account=? "
+                               "AND resets_at IS NOT NULL ORDER BY ts", (r["provider"], acct))
+            return {x["window"]: x["resets_at"] for x in rows}
+        try:
+            theirs, own = last_resets(now), last_resets(start)
+        except Exception:
+            return start
+
+        def same(a, b) -> bool:
+            try:
+                return a is not None and b is not None and abs(float(a) - float(b)) <= 60
+            except (TypeError, ValueError):
+                return False
+        for w in wins or []:
+            at = w.get("resets_at")
+            if same(at, theirs.get(w.get("window"))) and not same(at, own.get(w.get("window"))):
+                return now
+        return start
 
     @staticmethod
     def _record_readings(db, provider: str, account: str, usage, now: float | None = None) -> None:
