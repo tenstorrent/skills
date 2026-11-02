@@ -11488,8 +11488,11 @@ class Daemon:
                                              "it sets (its on_pass folder), so what it writes is never recorded")
             else:
                 got = onpassdry.run(cmd, self.p.root, self._on_pass_env(r["task"]), onpassdry.timeout_s(self.cfg))
-                why = onpassdry.no_result(got, cmd, self.p.root, _checks_result_wait(result.get("retry_when")),
-                                          WAIT_KEYS)
+                # As at probe pass (_checks_wait): on_pass is its fallback only after a `ttp checks --result`
+                # wait, and only an on_pass that on_pass_problem accepts.
+                fallback = _checks_result_wait(result.get("retry_when")) and "on_pass" in result \
+                    and not on_pass_problem(result["on_pass"])
+                why = onpassdry.no_result(got, cmd, self.p.root, fallback, WAIT_KEYS)
                 if why:
                     got.update(verdict=onpassdry.NO_RESULT, why=why)
             if got["verdict"] in ("crash", onpassdry.NO_RESULT) and session:

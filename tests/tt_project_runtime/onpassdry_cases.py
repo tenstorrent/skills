@@ -5,12 +5,16 @@ from __future__ import annotations
 from ttp.db import load_result
 
 
-def _hand_off_waiting(env, p, d, monkeypatch, cmd, title="waits on its job", probe="false"):
-    """A fake worker run of a new task that hands off `waiting` with on_pass_cmd `cmd`; the task's row."""
+_ON_PASS = {"status": "done", "summary": "job passed"}
+
+
+def _hand_off_waiting(env, p, d, monkeypatch, cmd, title="waits on its job", probe="false", on_pass=_ON_PASS):
+    """A fake worker run of a new task that hands off `waiting` with on_pass_cmd `cmd` (and `on_pass`,
+    left out when None); the task's row."""
     monkeypatch.setenv("TTP_FAKE_SESSION", "s1")
     monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({
         "status": "waiting", "summary": "job runs", "waiting_for": "its job", "retry_when": probe,
-        "retry_after_s": 600, "on_pass_cmd": cmd, "on_pass": {"status": "done", "summary": "job passed"}}))
+        "retry_after_s": 600, "on_pass_cmd": cmd, **({"on_pass": on_pass} if on_pass is not None else {})}))
     tid = p.db.add_task(title, "run the job", kind="work", tier="light", origin="user")
     d.dispatch()
     _finish_runs(p, d)
@@ -162,6 +166,28 @@ def test_an_on_pass_cmd_that_exits_0_without_writing_ttp_result_is_handed_back_a
     res = load_result(p.db.task(t["id"])["result"])
     assert res.get("waiting_since") and onpassdry.KEY not in res
     assert res["summary"].startswith("WARNING: on_pass_cmd dry run: it exited 0 without writing"), res["summary"]
+
+
+def test_a_checks_result_wait_counts_its_on_pass_fallback_only_when_that_on_pass_is_valid(env, monkeypatch, tmp_path):
+    # At probe pass (_checks_wait) on_pass is the fallback of an exit 0 without $TTP_RESULT only when the
+    # hand-off carries one on_pass_problem accepts: the dry run must count it on the same terms.
+    p = make(env)
+    from ttp import onpassdry
+    from ttp.daemon import Daemon
+    _sessions(env, monkeypatch, "s1")
+    d = Daemon(p.base)
+    probe = f"ttp checks --result {tmp_path / 'checks'}"
+    cases = [(None, True), ({"status": "waiting", "summary": "x"}, True), ({"status": "done"}, True),
+             ({"status": "done", "summary": "ok", "retry_when": "true"}, True), (_ON_PASS, False)]
+    for i, (on_pass, handed_back) in enumerate(cases):
+        t = _hand_off_waiting(env, p, d, monkeypatch, "echo checked", title=f"case {i}", probe=probe, on_pass=on_pass)
+        res = load_result(t["result"])
+        got = json.loads((pathlib.Path(_last_run(p, t["id"])["dir"]) / onpassdry.FILE).read_text())
+        if handed_back:
+            assert got["verdict"] == onpassdry.NO_RESULT and res[onpassdry.KEY]["no_result"], (on_pass, got)
+            assert "without writing a hand-off to $TTP_RESULT" in res["woke"]
+        else:
+            assert got["verdict"] == "ok" and onpassdry.KEY not in res and res.get("waiting_since"), (on_pass, got)
 
 
 def test_a_valid_on_pass_cmd_passes_its_dry_run_and_still_records_done_model_free(env, monkeypatch):
