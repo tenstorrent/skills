@@ -724,6 +724,7 @@ END""")
         newest first, the file changes made inside it (on_rollback), so files and rows agree."""
         self._after_commit.clear()
         undo, self._on_rollback = self._on_rollback, []
+        self.billing_memo.clear()   # rows read after this transaction's own writes are gone with them
         try:
             if self.conn.in_transaction:   # SQLite may have rolled back already (SQLITE_FULL, IOERR)
                 self.conn.execute("ROLLBACK")

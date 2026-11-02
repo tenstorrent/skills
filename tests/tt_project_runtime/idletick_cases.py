@@ -435,3 +435,18 @@ def test_unmet_dependencies_reads_only_the_tasks_depended_on(tmp_path):
     t = d.add_task(title="t", spec="s", kind="work", depends_on=[ids["done"], ids["open"], ids["failed"], 9999, "x"])
     got = d.unmet_dependencies([d.task(t), d.task(ids["done"])])
     assert got == {t: [ids["open"], ids["failed"], 9999, None], ids["done"]: []}
+
+
+def test_billing_memo_is_dropped_when_the_transaction_that_wrote_rolls_back(tmp_path):
+    """Rows memoized after a transaction's own write must not outlive its rollback (neither
+    total_changes nor data_version moves on ROLLBACK)."""
+    from ttp import billing
+    d, now = _billing_db(tmp_path)
+    since = now - 86400
+    d.conn.execute("BEGIN")
+    d.conn.executemany("INSERT INTO snapshots(ts,provider,account,window) VALUES(?,?,?,?)",
+                       [(now - 80000 + i * 3000, p, "a", "5h") for i in range(25) for p in ("claude", "codex")])
+    billing.plan_spans(d.conn, since, None, d.billing_memo)
+    d._rolled_back()
+    assert not d.conn.in_transaction
+    assert billing.plan_spans(d.conn, since, None, d.billing_memo) == billing.plan_spans(d.conn, since, None)
