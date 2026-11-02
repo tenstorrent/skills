@@ -2336,6 +2336,25 @@ def test_a_push_batch_records_a_commit_it_drops_on_a_landing_that_resolved_a_con
         {"commit": a, "as": landed_as, "files": ["notes.txt"]}], m["results"]
     assert f"left out {a[:10]} as landed by {landed_as[:10]}, which resolved a conflict in its lines of notes.txt" \
         in capsys.readouterr().out
+    from ttp import batch, pushq
+    assert batch.summary(p.state / "pushes" / "b1.json") == 0
+    assert f"    left out {a[:10]} as landed by {landed_as[:10]}, which resolved a conflict in its lines of notes.txt" \
+        in capsys.readouterr().out, "the batch summary shows the drop"
+    for _ in range(2):      # the coordinator hears of it once per batch and commit
+        pushq._dropped_told(p.db, {"id": "b1"}, m)
+    [ev] = p.db.q("SELECT * FROM events WHERE kind=?", (pushq.DROPPED_EVENT,))
+    assert ev["status"] == "queued" and ev["fingerprint"] == f"{pushq.DROPPED_EVENT}:b1:{a}", ev
+    assert f"push batch b1 left out commit {pushq._short(a)}" in ev["text"] and "notes.txt" in ev["text"], ev["text"]
+    pushq._dropped_told(p.db, {"id": "b1"}, {"results": [None, {"detail": None}, {"detail": {
+        "dropped_as_resolved": ["x", {"files": []}]}}]})    # torn or foreign rows are skipped
+    assert len(p.db.q("SELECT * FROM events WHERE kind=?", (pushq.DROPPED_EVENT,))) == 1
+
+
+def test_a_push_batch_without_a_resolved_drop_tells_the_coordinator_nothing(env):
+    from ttp import pushq
+    p = make(env)
+    pushq._dropped_told(p.db, {"id": "b1"}, {"results": [{"id": 1, "detail": {"settled": ["f"]}}]})
+    assert not p.db.q("SELECT * FROM events WHERE kind=?", (pushq.DROPPED_EVENT,))
 
 
 @pytest.mark.parametrize("amend, resolution, dropped", [

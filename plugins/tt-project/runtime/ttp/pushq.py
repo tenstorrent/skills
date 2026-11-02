@@ -105,6 +105,7 @@ AFTER_PUSH_OK = "after_push_ok_at"  # kv: when an ordinary push's after_push las
 TIPS_TOLD = 20                  # tip_failed shas remembered, so each tip is reported once
 FLAKY_EVENT = "push_flaky_test"   # a batch's failing tests passed on a rerun at the same head (batch._flaky)
 FLAKY_TOLD_S = 86400.0          # a flaky test id is reported once in this long ("flaky_told")
+DROPPED_EVENT = "push_dropped_as_resolved"   # a batch left out a commit only on a landing's conflict resolution
 STACK_ROWS = 12                 # the newest open rows status reads for the stack depth (stack_depth)
 STACK_GIT_S = 5                 # ... each ancestry check bounded, as `ttp status` and the web app wait for it
 RATE_S = 86400                  # status counts the batches that landed approvals in this long
@@ -251,6 +252,28 @@ def _flaky_told(db, st: dict, b, m: dict, now: float) -> None:
                f"{'them' if len(new) > 1 else 'it'} pass reliably.", queued=True)
     if told or "flaky_told" in st:
         st["flaky_told"] = told
+
+
+def _dropped_told(db, b, m: dict) -> None:
+    """One queued DROPPED_EVENT per commit a batch left out as landed only because the landing resolved a
+    conflict in its lines (the results' "dropped_as_resolved": batch._rewritten), keyed by batch and
+    commit (its fingerprint) so it is sent once, for the coordinator to check that no work was lost."""
+    for r in m.get("results") or []:
+        d = r.get("detail") if isinstance(r, dict) else None
+        for x in (d.get("dropped_as_resolved") or []) if isinstance(d, dict) else []:
+            if not isinstance(x, dict) or not x.get("commit"):
+                continue
+            fp = f"{DROPPED_EVENT}:{b['id']}:{x['commit']}"
+            if db.one("SELECT 1 FROM events WHERE fingerprint=?", (fp,)):
+                continue
+            files = ", ".join(map(str, x.get("files") or [])) or "its files"
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+                 (time.time(), "daemon", DROPPED_EVENT, fp, "normal",
+                  f"push batch {b['id']} left out commit {_short(str(x['commit']))} of entry #{r.get('id')} "
+                  f"(task {r.get('task')}) as landed by {_short(str(x.get('as') or ''))}, which resolved a conflict "
+                  f"in its lines of {files}; every line it adds there that the landing lacks pairs with a line the "
+                  f"resolution rewrote. Check that the landed copy kept its work; if a line is lost, queue a "
+                  f"task that restores it.", "queued"))
 
 
 def _reply(db, task: dict, new: str, text: str, need: str | None = None) -> None:
@@ -1665,6 +1688,7 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
             _event(db, None, "push_tip_failed", f"the push branch tip {_short(tip)} of {b['target']} fails its checks: "
                                                 f"`{cmd}`\n{_tail_of(m, d or first)}", queued=True, severity="high")
         _flaky_told(db, st, b, m, now)
+        _dropped_told(db, b, m)
         if warn := push.ff_warnings(m.get("fast_forward")):
             _event(db, None, "push_not_ff", f"push batch {b['id']} pushed {_short(sha)} to {b['target']}, but "
                                             f"delivery.fast_forward_also or delivery.mirror_remotes did not move "

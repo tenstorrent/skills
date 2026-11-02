@@ -2182,6 +2182,10 @@ def summary(marker: Path, pushed_only: bool = False) -> int:
         why = (f" in {', '.join(d['files'])}" if d.get("files") else "") + (f": {d['cmd']}" if d.get("cmd") else "") \
             + (f": {d['message']}" if d.get("message") else "")
         print(f"  #{r.get('id')} task {e.get('task')} {e.get('branch')}: {r.get('status')}{why}")
+        for x in d.get("dropped_as_resolved") or []:
+            if isinstance(x, dict):
+                print(f"    left out {str(x.get('commit'))[:10]} as landed by {str(x.get('as'))[:10]}, which resolved "
+                      f"a conflict in its lines of {', '.join(map(str, x.get('files') or []))}")
     a = m.get("after_push") or {}
     if m.get("phase") != "finished":
         print(f"  after_push: did not finish (the process ended in {m.get('phase')})")
