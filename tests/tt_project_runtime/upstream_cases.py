@@ -362,6 +362,43 @@ def test_upstream_fixed_prints_the_note_and_what_it_read(env, monkeypatch, capsy
     assert rc == 2 and out == "" and "not a note fingerprint" in err, (out, err)
 
 
+def test_upstream_fixed_in_a_sandbox_reads_the_running_version_ttp_status_reads(env, monkeypatch):
+    """In a worker's sandbox (its own pid namespace) the daemon's pid probe fails, so `ttp upstream
+    --fixed` said "running daemon version is unknown" while `ttp status` showed it running. It now reads
+    the same answer `ttp status` gives: a fresh heartbeat naming the recorded daemon stands in. A stale
+    heartbeat, one naming another pid, or no daemon record still reads unknown."""
+    from ttp import identity, upstream
+    p = make(env)
+    gone = subprocess.Popen(["true"])
+    gone.wait()                                  # a pid no process holds: what the sandbox sees
+    monkeypatch.setenv("TTP_RUN_DIR", str(p.state / "runs" / "1"))
+    hb = p.state / "heartbeat"
+
+    def daemon(pid, version="0.2.9", hb_pid=None, age=0):
+        p.db.set_kv("daemon", {"pid": pid, "host": "testhost", "started": time.time()})
+        hb.write_text(json.dumps({"pid": hb_pid or pid, "receipt": {"pid": hb_pid or pid, "version": version}}))
+        t = time.time() - age
+        os.utime(hb, (t, t))
+
+    daemon(gone.pid)
+    assert identity.probe(p.state, p.db.kv("daemon", {}), "testhost")["state"] == "running"
+    assert upstream.running_version(p) == "0.2.9"
+    fp = upstream.fingerprint("upstream: x", "s")
+    upstream.resolve(fp, "0.2.9", "", "")
+    rc, line = upstream.fixed_status(p, fp)
+    assert rc == 0 and "daemon runs 0.2.9: it has the fix" in line, line
+    daemon(gone.pid, age=identity.HEARTBEAT_FRESH_S + 60)
+    assert upstream.running_version(p) is None
+    daemon(gone.pid, hb_pid=gone.pid + 1)
+    assert upstream.running_version(p) is None
+    p.db.set_kv("daemon", {})
+    assert upstream.running_version(p) is None
+    assert upstream.fixed_status(p, fp)[0] == 2
+    monkeypatch.delenv("TTP_RUN_DIR")            # outside a sandbox the pid probe decides
+    daemon(os.getpid(), age=identity.HEARTBEAT_FRESH_S + 60)
+    assert upstream.running_version(p) == "0.2.9"
+
+
 def _raw_inbox_line(env, rec):
     with open(env["home"] / "upstream.jsonl", "a") as f:
         f.write(json.dumps(rec) + "\n")

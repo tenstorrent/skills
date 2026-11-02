@@ -1111,12 +1111,11 @@ def state(fp: str, now: float | None = None, recs: list[dict] | None = None) -> 
 
 def running_version(p: project.Project) -> str | None:
     """The version p's running daemon loaded (its identity receipt); None when no daemon runs here or
-    it has no receipt."""
+    it has no receipt. Whether it runs is identity.probe's answer, the one `ttp status` and `ttp deployed`
+    give: a sandboxed worker cannot see the daemon's pid, and a fresh heartbeat naming it stands in."""
     from . import identity
-    from .daemon import _alive
-    d = p.db.kv("daemon", {}) or {}
-    pid = int(d.get("pid") or 0) if isinstance(d, dict) and d.get("host") == project.hostname() else 0
-    r = identity.running(p.state, pid) if pid and _alive(pid) else None
+    s = identity.probe(p.state, p.db.kv("daemon", {}), project.hostname())
+    r = identity.running(p.state, s["pid"]) if s["alive"] and s["pid"] else None
     v = str((r or {}).get("version") or "")
     return v if re.search(r"\d", v) else None
 
