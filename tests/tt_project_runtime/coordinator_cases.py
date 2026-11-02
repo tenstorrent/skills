@@ -10990,7 +10990,8 @@ def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are
     # +410: charter_update `source`, and a Restrictions item binds only with a cite (restriction_source)
     # +540: the self-review rule: fix the cause of a Course check line in the turn (coursecheck.py)
     # +180: coordinator.agent_orders_as_user is set only on the owner's own words (its rules show once on)
-    assert len(role) <= 35_970, len(role)
+    # +80: delivery.channel_tags only to tags the charter or user lets move forward
+    assert len(role) <= 36_050, len(role)
     assert "<!-- ttp:" not in role and "<!-- /ttp:" not in role
     assert role in coord.prompt_parts(p)[0]
     # Rules for features that are off are left out; turning one on brings its rules in.

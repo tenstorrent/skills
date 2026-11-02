@@ -182,10 +182,8 @@ def log(p, facts: dict, event: str) -> None:
     import os
     row = {"ts": time.time(), "event": event, "task": os.environ.get("TTP_TASK", ""),
            **{k: facts.get(k, "") for k in ("tag", "remote", "old", "new")}}
-    with open(p.state / LOG, "a") as f:
-        f.write(json.dumps(row) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
+    from .project import durable_append
+    durable_append(p.state / LOG, json.dumps(row) + "\n")
 
 
 def argv(remote: str, tag: str, old: str, new: str) -> list[str]:
