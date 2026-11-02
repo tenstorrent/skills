@@ -185,7 +185,7 @@ def scan(db, now: float | None = None) -> list[dict]:
         o = (m.get("throughput") or {}).get("owner") or {}
         if "outside" not in o:
             continue
-        w = o.get("outside") or ""
+        w = m.get("why") or o.get("outside") or ""   # the full why: throughmute.vet clips the owner's to 200
         if not w or USER_CITE.search(w) or any(_cites(w, aid) for aid in user_only):
             continue   # a cite of the user's own message or ask: a user pause stays until their word
         if (cited := finding(w, cite=False)) is None:

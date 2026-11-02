@@ -213,3 +213,24 @@ def test_selfblock_quiet_for_a_wait_on_the_users_pr_review():
               "waits for the user's review of the pull request",
               "Held until the user's review of the draft PR"):
         assert selfblock.finding(s) is None, s
+
+
+def test_selfblock_judges_an_outside_mute_on_its_full_why_not_the_clipped_owner(env):
+    p = make(env)
+    from ttp import selfblock
+    from ttp import screen
+    db = p.db
+    later = time.time() + 3600
+    pad = "the lane is full; only the user or an outside party can clear it, so the mute waits on their word. " * 3
+    assert len(pad) > 200
+    # throughmute.vet stores owner['outside'] = why[:200]; the gate or cite past char 200 is only
+    # in the mute's full why, which must keep the mute quiet.
+    mutes = []
+    for i, tail in enumerate(("the shared machine is busy", "(user msg #12) set the mute", "")):
+        why = pad + tail
+        mutes.append({"until": later, "source": "watcher:queue", "match": f"lane{i}", "why": why,
+                      "throughput": {"owner": {"outside": why[:200]}}})
+    db.set_kv(screen.MUTES_KEY, mutes)
+    found = [(f["source"], f["id"]) for f in selfblock.scan(db) if f["source"] == "mute"]
+    # Only the one with no gate and no cite anywhere in its why is flagged.
+    assert found == [("mute", "watcher:queue 'lane2'")], found
