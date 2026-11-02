@@ -109,7 +109,7 @@ def of(task: dict) -> dict | None:
 
 
 def _git(root: str, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", root, *args], text=True, capture_output=True, timeout=gitmemo.timeout(timeout, args),
+    return subprocess.run(["git", "-C", root, *args], text=True, capture_output=True, timeout=gitmemo.timeout(60, args),
                           stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_EDITOR": "true"})
 
 
