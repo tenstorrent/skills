@@ -5,12 +5,16 @@ test script its run started that still holds a checks slot or a `ttp lock` lane.
 
 A process is an ended task's own only when all of these hold (attributed()): it runs as this user; its
 environment carries what the daemon set when it started the task's run, this project's TTP_PROJECT, the
-task's TTP_TASK and a TTP_RUN_DIR that is one of the task's own recorded runs (runs.dir); and no run of
-the task is running now. A command line, a working directory or a name never counts. Never touched,
-even when attributed: the caller and its ancestors, every running worker, a `ttp detach` job's process
-(TTP_DETACHED: jobstop and `ttp detach --stop` own those), and a process with a Tenstorrent device open
-or a device lock's file open (its device's broker and recovery owner end it). Only local processes are
-read or signalled: nothing on a remote machine.
+task's TTP_TASK and a TTP_RUN_DIR that is one of the task's own recorded runs (runs.dir), or the
+check-run folder `ttp checks` gave its commands, whose owner.json names that run's checks.pid; and no
+run of the task is running now. A command line, a working directory or a name never counts. Never
+touched, even when attributed: the caller and its ancestors, every running worker, the project's live
+daemon (its daemon.pid), a `ttp detach` job's process (TTP_DETACHED: jobstop and `ttp detach --stop` own
+those), and a process with a Tenstorrent device open or a device lock's file open (its device's broker
+and recovery owner end it). An attributed process that leads a process group takes the group with it
+(what it started that dropped the task's environment), unless a member is one never touched above or
+another task's, project's or user's process: then only the leader goes and the output says why. Only
+local processes are read or signalled: nothing on a remote machine.
 
 sweep(), each jobstop pass of the daemon: a lock file under the project's lock folders or the host's
 check-slots folder that is held now, and whose every opener this user can see is such a process of a task
@@ -59,6 +63,13 @@ def _start(pid: int) -> str | None:
         return None
 
 
+def _pgrp(pid: int) -> int | None:
+    try:
+        return int((PROC / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[2])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 def _uid(pid: int) -> int | None:
     try:
         return (PROC / str(pid)).stat().st_uid
@@ -93,9 +104,36 @@ def _real(path: str | None) -> str:
     return os.path.realpath(path) if path else ""
 
 
+def _daemon_pid(p: Project) -> int | None:
+    """The project's live daemon, from its pid file (None when missing or stale)."""
+    from .daemon import _is_daemon, _read_pid
+    pid = _read_pid(p.state / "daemon.pid")
+    return pid if pid and _is_daemon(pid) else None
+
+
 def _guarded(p: Project) -> set[int]:
+    """jobstop's (the caller and its ancestors, every running worker) and the live daemon, which may
+    carry a run's environment (daemon._on_pass_env)."""
     from .jobstop import _guarded as guarded
-    return guarded(p)
+    out = guarded(p)
+    if d := _daemon_pid(p):
+        out.add(d)
+    return out
+
+
+def _run_of(p: Project, run_dir: str) -> str:
+    """The run `run_dir` stands for, resolved: itself, or for a `ttp checks` command's check-run folder
+    (checkdirs.environment rewrites its TTP_RUN_DIR) the run whose checks.pid its owner.json names."""
+    from . import checkdirs
+    from .cli import CHECKS_PID
+    real = _real(run_dir)
+    if Path(real).parent != Path(_real(str(p.state / checkdirs.FOLDER))):
+        return real
+    try:
+        marker = json.loads((Path(real) / checkdirs.OWNER).read_text()).get("marker")
+    except (OSError, ValueError, AttributeError):
+        return real
+    return _real(str(Path(marker).parent)) if marker and Path(marker).name == CHECKS_PID else real
 
 
 def lock_dirs(p: Project) -> list[str]:
@@ -143,16 +181,74 @@ def why_not(p: Project, task: int, pid: int, guarded: set[int] | None = None) ->
     dirs, running = _task_runs(p, task)
     if row["status"] not in ENDED or running:
         return f"task #{task} is {row['status'] if row['status'] not in ENDED else 'running a run'}: not ended"
-    if _real(env["TTP_RUN_DIR"]) not in dirs:
+    if _run_of(p, env["TTP_RUN_DIR"]) not in dirs:
         return f"its run dir is none of task #{task}'s recorded runs: not attributable"
     if pid in (guarded if guarded is not None else _guarded(p)):
-        return "the caller, one of its ancestors or a running worker"
+        return GUARDED
+    return _untouchable(p, pid, env)
+
+
+GUARDED = "the caller, one of its ancestors, a running worker or the daemon"
+
+
+def _untouchable(p: Project, pid: int, env: dict) -> str | None:
     if env.get("TTP_DETACHED"):
         return "a `ttp detach` job's process: stop it with `ttp detach --stop`"
     dl = lock_dirs(p)
     if any(f.startswith(DEVICE_PREFIX) or _device_lock(p, f, dl) for f in _fds(pid)):
         return "uses a device or holds a device lock: end it through the device's broker"
     return None
+
+
+def _members(pgid: int) -> list[int]:
+    try:
+        names = [int(n) for n in os.listdir(PROC) if n.isdigit()]
+    except OSError:
+        return []
+    return [n for n in names if _pgrp(n) == pgid]
+
+
+def group_why(p: Project, task: int, pgid: int, protected: set[int]) -> str | None:
+    """None when every live member of process group `pgid` may be signalled with it, else why not: a
+    member is protected (guarded, or declared in the hand-off), another user's, unreadable, another
+    project's or task's, a `ttp detach` job's or a device user's. A member with no task marker may go."""
+    mine = _real(str(p.base))
+    for m in _members(pgid):
+        if _start(m) is None:
+            continue
+        if m in protected:
+            return f"member pid {m} is {GUARDED} or one the task's hand-off keeps"
+        if _uid(m) != os.getuid():
+            return f"member pid {m} is another user's process"
+        env = _read_env(m)
+        if env is None:
+            return f"member pid {m}'s environment cannot be read"
+        if env.get("TTP_PROJECT") and _real(env["TTP_PROJECT"]) != mine:
+            return f"member pid {m} is another project's process"
+        if env.get("TTP_TASK") and env["TTP_TASK"] != str(int(task)):
+            return f"member pid {m} is task #{env['TTP_TASK']}'s process"
+        if why := _untouchable(p, m, env):
+            return f"member pid {m} {why if why.startswith('uses') else 'is ' + why}"
+    return None
+
+
+def with_groups(p: Project, task: int, own: list[dict], protected: set[int]) -> tuple[list[dict], list[dict]]:
+    """(own plus the other live members of each process group an own process leads and that may go
+    whole (group_why), the leader marked with "pgid"; the leaders whose group may not, as {pid, why}:
+    only the leader itself goes)."""
+    targets, kept, seen = [dict(t) for t in own], [], {t["pid"] for t in own}
+    for t in list(targets):
+        if _pgrp(t["pid"]) != t["pid"]:
+            continue
+        if why := group_why(p, task, t["pid"], protected):
+            kept.append({"pid": t["pid"], "why": f"its process group was not signalled ({why}): only pid {t['pid']} itself"})
+            continue
+        t["pgid"] = t["pid"]
+        for m in _members(t["pid"]):
+            if m not in seen and (s := _start(m)):
+                seen.add(m)
+                targets.append({"pid": m, "start": s, "cmd": _cmd(m)[:CMD_CHARS], "group": t["pid"]})
+    return targets, kept
 
 
 def _uid_pids() -> list[int]:
@@ -164,10 +260,10 @@ def _uid_pids() -> list[int]:
     return [n for n in names if _uid(n) == me]
 
 
-def task_procs(p: Project, task: int, pids=None) -> tuple[list[dict], list[dict]]:
+def task_procs(p: Project, task: int, pids=None, guarded: set[int] | None = None) -> tuple[list[dict], list[dict]]:
     """(the task's own live processes, as {pid, start, cmd}; refusals, as {pid, why}). With `pids`, only
     those, each refused unless it is; else every live process of this user whose environment names the task."""
-    guarded = _guarded(p)
+    guarded = _guarded(p) if guarded is None else guarded
     if pids is None:
         want = f"{int(task)}"
         cand = [pid for pid in _uid_pids() if (e := _read_env(pid)) and e.get("TTP_TASK") == want
@@ -201,23 +297,32 @@ def _held(path: str) -> bool:
         return False
 
 
-def _signal(targets: list[dict], sig: int) -> None:
-    for t in targets:
-        if _start(t["pid"]) == t["start"]:   # still the same process: a reused pid is never signalled
+def _signal(targets: list[dict], sig: int, group_ok=None) -> None:
+    alive = [t for t in targets if _start(t["pid"]) == t["start"]]   # a reused pid is never signalled
+    for g in {t["pgid"] for t in targets if t.get("pgid")} if group_ok else ():
+        # Only while one of its listed processes still lives in it (so the group id is not reused) and
+        # it may still go whole: also catches what its members started since it was read.
+        if any(t["pid"] == g or t.get("group") == g for t in alive if _pgrp(t["pid"]) == g) and group_ok(g):
             try:
-                os.kill(t["pid"], sig)
+                os.killpg(g, sig)
             except OSError:
                 pass
+    for t in alive:
+        try:
+            os.kill(t["pid"], sig)
+        except OSError:
+            pass
 
 
-def end(targets: list[dict], term_s: float = TERM_S) -> list[dict]:
-    """SIGTERM, up to term_s for them to exit, then SIGKILL to those left. Returns those signalled."""
+def end(targets: list[dict], term_s: float = TERM_S, group_ok=None) -> list[dict]:
+    """SIGTERM, up to term_s for them to exit, then SIGKILL to those left. Returns those signalled. A
+    leader with "pgid" also gets its whole group signalled while group_ok(pgid) holds."""
     targets = [t for t in targets if _start(t["pid"]) == t["start"]]
-    _signal(targets, signal.SIGTERM)
+    _signal(targets, signal.SIGTERM, group_ok)
     deadline = time.monotonic() + term_s
     while time.monotonic() < deadline and any(_start(t["pid"]) == t["start"] for t in targets):
         time.sleep(0.05)
-    _signal(targets, signal.SIGKILL)
+    _signal(targets, signal.SIGKILL, group_ok)
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline and any(_start(t["pid"]) == t["start"] for t in targets):
         time.sleep(0.05)
@@ -252,13 +357,15 @@ def stop(p: Project, task: int, pids=None, by: str = "ttp leftover-procs --stop"
     if row["status"] not in ENDED or running:
         return {"stopped": [], "refused": [], "error": f"task #{task} is {row['status']}"
                 + (" with a running run" if running else "") + ": a running task's processes are its own to stop"}
-    own, refused = task_procs(p, task, pids)
+    guarded = _guarded(p)
+    own, refused = task_procs(p, task, pids, guarded)
+    own, kept = with_groups(p, task, own, guarded)
     if dry:
-        return {"stopped": own, "refused": refused, "dry": True}
+        return {"stopped": own, "refused": refused, "group_refused": kept, "dry": True}
     held = {x for x in _locks_of([t["pid"] for t in own], lock_dirs(p)) if _held(x)}
-    stopped = end(own)
+    stopped = end(own, group_ok=lambda g: group_why(p, task, g, guarded) is None)
     r = _receipt(p, task, stopped, held, "stopped on request", by)
-    return {**r, "stopped": stopped, "refused": refused}
+    return {**r, "stopped": stopped, "refused": refused, "group_refused": kept}
 
 
 def _declared(p: Project, task: int) -> set[int]:
@@ -300,13 +407,14 @@ def sweep(p: Project, now: float | None = None) -> list[dict]:
     out = []
     guarded = _guarded(p)
     for task, status in sorted(ended.items()):
-        own = {pid for pid in by_task[task] if why_not(p, task, pid, guarded) is None} - _declared(p, task)
+        declared = _declared(p, task)
+        own = {pid for pid in by_task[task] if why_not(p, task, pid, guarded) is None} - declared
         stuck = {f for f, who in openers.items() if who & own and who <= own and _held(f)}
         if not stuck:
             continue
-        targets, _ = task_procs(p, task)
-        targets = [t for t in targets if t["pid"] not in _declared(p, task)]
-        stopped = end(targets)
+        targets, _ = task_procs(p, task, guarded=guarded)
+        targets, _ = with_groups(p, task, [t for t in targets if t["pid"] not in declared], guarded | declared)
+        stopped = end(targets, group_ok=lambda g, task=task, keep=guarded | declared: group_why(p, task, g, keep) is None)
         out.append(_receipt(p, task, stopped, stuck, f"task #{task} is {status} and its leftovers held "
                             f"{', '.join(sorted(Path(x).name for x in stuck))}", "daemon sweep"))
     return out

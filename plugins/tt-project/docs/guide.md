@@ -235,6 +235,10 @@ prolonged whole-box outage.
   coordinator. It refuses a running task's processes, another task's, project's or user's, a
   `ttp detach` job's (use `ttp detach --stop`), one that uses a device, and any it cannot attribute.
   The daemon leaves processes the hand-off lists in `leftover_procs`; the command stops those too.
+  Neither ever stops the project's live daemon. A `ttp checks` command (whose `TTP_RUN_DIR` is its
+  check-run folder) counts as its task's. A stopped process that leads a process group takes the
+  group with it, unless a member is protected or another task's, project's or user's: then only the
+  leader goes and the command says why (exit 2).
 - When delivery has a review step (`delivery.review_before_pr` or a `delivery.push_branch`), the
   daemon queues the review of each finished code task in the same step that records its hand-off
   (`review.auto`, on by default). A review whose head carries commits of another task whose latest

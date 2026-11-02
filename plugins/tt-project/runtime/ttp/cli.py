@@ -4966,10 +4966,12 @@ def _leftover_stop(a) -> int:
         print(f"{'would stop' if a.dry_run else 'stopped'} pid {t['pid']}: {t['cmd'] or '?'}")
     for t in r["refused"]:
         print(f"refused pid {t['pid']}: {t['why']}", file=sys.stderr)
+    for t in r.get("group_refused") or []:
+        print(f"pid {t['pid']}: {t['why']}", file=sys.stderr)
     if not a.dry_run:
         print(f"task #{a.stop}: stopped {len(r['stopped'])}; locks freed: {', '.join(r.get('freed') or []) or 'none'}"
               + (f"; still held: {', '.join(r['held'])}" if r.get("held") else ""))
-    return 2 if r["refused"] else 0
+    return 2 if r["refused"] or r.get("group_refused") else 0
 
 
 def cmd_svcscan(a) -> None:

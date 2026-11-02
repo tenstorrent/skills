@@ -25,12 +25,12 @@ def _ls_task(p, status="done", ended_ago=1000.0, run_status="ok"):
     return tid, run_dir
 
 
-def _ls_spawn(tmp_path, lock, env_extra, name="holder"):
+def _ls_spawn(tmp_path, lock, env_extra, name="holder", args=()):
     """A process that takes the flock on `lock` and sleeps, with `env_extra` in its environment."""
     ready = tmp_path / f"{name}.ready"
     env = {k: v for k, v in os.environ.items() if not k.startswith("TTP_")}
     lock.parent.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.Popen([sys.executable, "-c", _LS_HOLDER, str(lock), str(ready)], env={**env, **env_extra})
+    proc = subprocess.Popen([sys.executable, "-c", _LS_HOLDER, str(lock), str(ready), *args], env={**env, **env_extra})
     deadline = time.monotonic() + 20
     while not ready.exists() and time.monotonic() < deadline:
         time.sleep(0.02)
@@ -165,5 +165,163 @@ def test_a_sandboxed_stop_request_is_served_by_the_daemon_s_pass(env, tmp_path, 
         (r,) = jobstop.serve_requests(p)
         assert r["pids"] == [proc.pid] and proc.wait(timeout=10) is not None
         assert not list((p.state / jobstop.QUEUE).glob("leftovers-*"))
+    finally:
+        _ls_end(proc)
+
+
+def test_the_daemon_carrying_an_ended_task_s_environment_is_never_stopped(env, tmp_path, capsys, monkeypatch):
+    """The live daemon (its daemon.pid) may carry a run's environment (daemon._on_pass_env): neither the
+    route nor the sweep stops it. A missing or stale pid file guards nothing extra and does not fail."""
+    from ttp import cli, leftoverstop, locks
+    p = make(env)
+    monkeypatch.chdir(p.root)
+    tid, run_dir = _ls_task(p, "done")
+    lock = p.state / "locks" / "d.0.lock"
+    base = leftoverstop._guarded(p)   # no pid file
+    daemon = _ls_spawn(tmp_path, lock, _ls_marks(p, tid, run_dir), "daemon", args=("ttp", "daemon"))
+    try:
+        (p.state / "daemon.pid").write_text(f"{daemon.pid}\n")
+        assert leftoverstop._guarded(p) == base | {daemon.pid}
+        assert leftoverstop.sweep(p) == [] and daemon.poll() is None and not locks.any_free([lock])
+        with pytest.raises(SystemExit) as e:
+            cli.main(["leftover-procs", "--stop", str(tid), "--pid", str(daemon.pid)])
+        assert e.value.code == 2 and "or the daemon" in capsys.readouterr().err
+        with pytest.raises(SystemExit) as e:
+            cli.main(["leftover-procs", "--stop", str(tid)])
+        assert f"stopped pid {daemon.pid}" not in capsys.readouterr().out and daemon.poll() is None
+    finally:
+        _ls_end(daemon)
+    (p.state / "daemon.pid").write_text(f"{daemon.pid}\n")   # stale: that pid is gone
+    assert leftoverstop._guarded(p) == base
+    (p.state / "daemon.pid").write_text("not a pid\n")
+    assert leftoverstop._guarded(p) == base
+
+
+_LS_LEADER = """
+import os, subprocess, sys, time
+env = dict(os.environ, **dict(a.split("=", 1) for a in sys.argv[2:]))
+c = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], env=env)
+open(sys.argv[1] + ".tmp", "w").write(str(c.pid))
+os.rename(sys.argv[1] + ".tmp", sys.argv[1])
+time.sleep(120)
+"""
+
+
+def _ls_group(tmp_path, env_extra, child_env, name="leader"):
+    """A process group: an attributed leader in a session of its own, and its child with `child_env`
+    over the leader's environment; (leader Popen, child pid)."""
+    ready = tmp_path / f"{name}.child"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("TTP_")}
+    leader = subprocess.Popen([sys.executable, "-c", _LS_LEADER, str(ready), *(f"{k}={v}" for k, v in child_env.items())],
+                              env={**env, **env_extra}, start_new_session=True)
+    deadline = time.monotonic() + 20
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert ready.exists(), "the leader did not start its child"
+    return leader, int(ready.read_text())
+
+
+def _ls_gone(pid, wait=10.0):
+    from ttp import leftoverstop
+    deadline = time.monotonic() + wait
+    while leftoverstop._start(pid) is not None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return leftoverstop._start(pid) is None
+
+
+def _ls_kill(pid):
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def test_a_stopped_group_leader_takes_its_group_and_a_check_command_counts_as_its_task_s(env, tmp_path, capsys,
+                                                                                        monkeypatch):
+    """An ended task's process that leads a group goes with its group: its child, whose TTP_RUN_DIR was
+    rewritten (as checkdirs.environment does), ends too. A `ttp checks` command, whose TTP_RUN_DIR is a
+    check-run folder whose owner.json names the task's run's checks.pid, is the task's; one whose folder
+    names another task's run is refused."""
+    from ttp import checkdirs, cli
+    p = make(env)
+    monkeypatch.chdir(p.root)
+    tid, run_dir = _ls_task(p, "failed")
+    other, other_dir = _ls_task(p, "done")
+    leader, child = _ls_group(tmp_path, _ls_marks(p, tid, run_dir), {"TTP_RUN_DIR": str(tmp_path / "rewritten")})
+    folders = {}
+    for name, owner in (("own", run_dir), ("other", other_dir)):
+        d = p.state / checkdirs.FOLDER / f"cr-{name}"
+        d.mkdir(parents=True)
+        (d / checkdirs.OWNER).write_text(json.dumps({"marker": str(owner / "checks.pid")}))
+        folders[name] = d
+    check = _ls_spawn(tmp_path, tmp_path / "c.lock", _ls_marks(p, tid, folders["own"]), "check")
+    foreign = _ls_spawn(tmp_path, tmp_path / "f.lock", _ls_marks(p, tid, folders["other"]), "foreign")
+    try:
+        with pytest.raises(SystemExit) as e:
+            cli.main(["leftover-procs", "--stop", str(tid), "--dry-run"])
+        got = capsys.readouterr()
+        assert e.value.code == 2, got
+        for pid in (leader.pid, child, check.pid):
+            assert f"would stop pid {pid}" in got.out, got.out
+        assert f"refused pid {foreign.pid}" in got.err and "not attributable" in got.err
+        with pytest.raises(SystemExit) as e:
+            cli.main(["leftover-procs", "--stop", str(tid)])
+        out = capsys.readouterr().out
+        assert f"stopped pid {child}" in out and f"stopped pid {check.pid}" in out, out
+        assert leader.wait(timeout=10) is not None and _ls_gone(child) and check.wait(timeout=10) is not None
+        assert foreign.poll() is None
+    finally:
+        _ls_kill(child)
+        _ls_end(leader, check, foreign)
+
+
+def test_a_group_with_a_protected_or_foreign_member_is_not_signalled_only_its_leader_goes(env, tmp_path, capsys,
+                                                                                        monkeypatch):
+    """A leader whose group holds another task's process, or a guarded one (here the daemon), is stopped
+    alone: the member stays, and the output says why the group was not signalled (exit 2)."""
+    from ttp import cli, leftoverstop
+    p = make(env)
+    monkeypatch.chdir(p.root)
+    tid, run_dir = _ls_task(p, "cancelled")
+    other, _ = _ls_task(p, "running", run_status="running")
+    for case in ("task", "guarded"):
+        leader, child = _ls_group(tmp_path, _ls_marks(p, tid, run_dir),
+                                  {"TTP_TASK": str(other)} if case == "task" else {}, f"leader-{case}")
+        if case == "guarded":
+            monkeypatch.setattr(leftoverstop, "_daemon_pid", lambda p, child=child: child)
+        try:
+            with pytest.raises(SystemExit) as e:
+                cli.main(["leftover-procs", "--stop", str(tid)])
+            got = capsys.readouterr()
+            assert e.value.code == 2 and f"stopped pid {leader.pid}" in got.out, (case, got)
+            assert f"stopped pid {child}" not in got.out
+            assert f"pid {leader.pid}: its process group was not signalled" in got.err, (case, got.err)
+            assert {"task": f"task #{other}'s process", "guarded": "or the daemon"}[case] in got.err
+            assert leader.wait(timeout=10) is not None
+            time.sleep(0.2)
+            assert leftoverstop._start(child) is not None, case
+        finally:
+            _ls_kill(child)
+            _ls_end(leader)
+
+
+def test_an_ended_task_whose_run_row_still_says_running_is_refused(env, tmp_path, capsys, monkeypatch):
+    """A done task whose run row still says 'running' (a run that never recorded its end) is not ended
+    for this purpose: `--stop` refuses it and stops nothing, and the sweep leaves it."""
+    from ttp import cli, leftoverstop, locks
+    p = make(env)
+    monkeypatch.chdir(p.root)
+    tid, run_dir = _ls_task(p, "done", run_status="running")
+    lock = p.state / "locks" / "r.0.lock"
+    proc = _ls_spawn(tmp_path, lock, _ls_marks(p, tid, run_dir))
+    try:
+        for argv in ([], ["--pid", str(proc.pid)], ["--dry-run"]):
+            with pytest.raises(SystemExit) as e:
+                cli.main(["leftover-procs", "--stop", str(tid), *argv])
+            got = capsys.readouterr()
+            assert e.value.code == 2 and "with a running run" in got.err and "stopped pid" not in got.out, (argv, got)
+        assert leftoverstop.sweep(p) == []
+        assert proc.poll() is None and not locks.any_free([lock])
+        assert not p.db.one("SELECT id FROM events WHERE kind=?", (leftoverstop.EVENT,))
     finally:
         _ls_end(proc)
