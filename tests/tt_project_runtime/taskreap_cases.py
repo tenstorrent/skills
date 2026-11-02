@@ -84,15 +84,15 @@ def test_devq_drop_stops_a_running_job_and_leaves_other_projects_and_unrecorded_
     marker = _devq_marker(devq_dir, "long")
     assert marker["status"] == "cancelled" and "task #7 is cancelled" in marker["reason"], marker
     deadline = time.time() + _load_scaled(10)
-    while time.time() < deadline and _pid_running(pid):
+    while time.time() < deadline and _treap_pid_running(pid):
         time.sleep(0.05)
-    assert not _pid_running(pid)
+    assert not _treap_pid_running(pid)
     for job in ("other", "legacy"):   # another project's job, and one with no project recorded, still run
         assert _devq_marker(devq_dir, job)["status"] == "done"
     assert not list((devq_dir / "running").glob("*.cancel"))
 
 
-def _pid_running(pid):
+def _treap_pid_running(pid):
     try:
         os.kill(pid, 0)
     except OSError:

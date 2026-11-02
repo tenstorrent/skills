@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 
 from . import hold, locks
+from .project import durable_write
 
 ENDED = ("cancelled", "failed", "exhausted", "done")
 GRACE_S = 120          # a task that ended this recently keeps its records (a run still starting)
@@ -45,8 +46,8 @@ def record_job(p, runner: str, spec: dict) -> None:
     try:
         d = p.state / LEDGER / runner
         d.mkdir(parents=True, exist_ok=True)
-        (d / f"{spec['id']}.json").write_text(json.dumps({"runner": runner, "job": spec["id"],
-                                                          "task": int(spec["task"]), "ts": time.time()}))
+        durable_write(d / f"{spec['id']}.json", json.dumps({"runner": runner, "job": spec["id"],
+                                                           "task": int(spec["task"]), "ts": time.time()}))
     except (OSError, KeyError, ValueError):
         pass
 
