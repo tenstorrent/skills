@@ -166,14 +166,56 @@ from . import shared
 from . import shorttmp
 from . import worktree
 from . import db as dbmod
-from .db import (CHANGES_NEEDED, HARNESS_MERGED_KEY, NOT_ABANDONED_SQL, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, WORKSPACE_TRIES_KEY, BranchIndex, assigned_tier, continues_id, deferral,
-                 dependency_ids, pin_of, dump_result, load_result, review_subject, reviewed_ids, task_outcome, unplanned_abrupt,
-                 without_deferral)
+from .db import (
+    CHANGES_NEEDED,
+    HARNESS_MERGED_KEY,
+    NOT_ABANDONED_SQL,
+    PAUSE_BOOT_KEY,
+    SEVERITY_RANK,
+    TERMINAL_TASK_STATES,
+    WORKSPACE_TRIES_KEY,
+    BranchIndex,
+    assigned_tier,
+    continues_id,
+    deferral,
+    dependency_ids,
+    pin_of,
+    dump_result,
+    load_result,
+    review_subject,
+    reviewed_ids,
+    task_outcome,
+    unplanned_abrupt,
+    without_deferral,
+)
 from .project import rebase_replace
-from .project import (Project, bad_sections, command_env, deep_merge, layered, disk_resume_gb, durable_append, durable_write, git_fsync_env,
-                      file_tail, hostname, nice_level, output_tail, own_free, own_push, push_allowed, zombie)
+from .project import (
+    Project,
+    bad_sections,
+    command_env,
+    deep_merge,
+    layered,
+    disk_resume_gb,
+    durable_append,
+    durable_write,
+    git_fsync_env,
+    file_tail,
+    hostname,
+    nice_level,
+    output_tail,
+    own_free,
+    own_push,
+    push_allowed,
+    zombie,
+)
 from .providers import get_provider
-from .providers.base import FUNDS_RE, Provider, last_json_object, scratch_dir, service_path
+from .providers.base import (
+    FUNDS_RE,
+    Provider,
+    last_json_object,
+    scratch_dir,
+    service_path,
+)
 from .providers.claude import as_windows
 from .providers.jev import Jev, JevOutOfFunds, Pause as JevPause
 from .prompts import RUN_DIR_MARK

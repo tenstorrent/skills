@@ -97,15 +97,43 @@ from . import probevars
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
-from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, assigned_tier, continues_id, deferral,
-                 dependency_ids, dump_result, host_line, load_result, names_branch, pin_of, review_subject,
-                 reviewed_ids,
-                 task_outcome, without_deferral)
+from .db import (
+    PAUSED_RESOURCES_KEY,
+    SEVERITY_RANK,
+    SHARED_SEEN_KEY,
+    TERMINAL_TASK_STATES,
+    assigned_tier,
+    continues_id,
+    deferral,
+    dependency_ids,
+    dump_result,
+    host_line,
+    load_result,
+    names_branch,
+    pin_of,
+    review_subject,
+    reviewed_ids,
+    task_outcome,
+    without_deferral,
+)
 from .project import rebase_problems, rebase_replace, rebase_replace_mode
-from .project import (CORRECTION_PREFIX, CORRECTIONS_HEADER, COORDINATOR_MEMORY_CHARS, COORDINATOR_PINNED_WARN_SHARE,
-                      PINNED_MEMORY_KINDS, Project, code_tasks_may_push, coordinator_memory,
-                      durable_append, own_push, own_push_mode,
-                      durable_write, pin_verify_mode, push_queue_number, push_queue_on)
+from .project import (
+    CORRECTION_PREFIX,
+    CORRECTIONS_HEADER,
+    COORDINATOR_MEMORY_CHARS,
+    COORDINATOR_PINNED_WARN_SHARE,
+    PINNED_MEMORY_KINDS,
+    Project,
+    code_tasks_may_push,
+    coordinator_memory,
+    durable_append,
+    own_push,
+    own_push_mode,
+    durable_write,
+    pin_verify_mode,
+    push_queue_number,
+    push_queue_on,
+)
 from .runner import stop_runs
 from .providers.base import NULL_OPERATIONS, normalize_action
 

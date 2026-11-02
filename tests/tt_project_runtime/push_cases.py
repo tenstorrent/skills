@@ -14932,13 +14932,35 @@ def test_an_append_append_push_conflict_is_settled_model_free(tmp_path):
     assert subprocess.run(["git", "-C", root, "status", "--porcelain"], capture_output=True, text=True).stdout == ""
     # try_model_free pins it, and answers the same head and tip again without a second rebase.
     cf = {"head": head, "onto": tip, "target": "origin/none", "files": ["t.py"]}
-    assert conflictfix.try_model_free(root, cf, 42)["sha"] == mf["sha"]
+    tree = lambda sha: subprocess.run(["git", "-C", root, "rev-parse", f"{sha}^{{tree}}"], capture_output=True,
+                                      text=True).stdout.strip()
+    first = conflictfix.try_model_free(root, cf, 42)   # its own rebase: same tree, the sha may differ by date
+    assert first and tree(first["sha"]) == tree(mf["sha"])
+    assert conflictfix.try_model_free(root, cf, 42)["sha"] == first["sha"]
     pin = subprocess.run(["git", "-C", root, "rev-parse", f"{conflictfix.RESOLVED_REF}42"], capture_output=True,
                          text=True).stdout.strip()
-    assert pin == mf["sha"]
+    assert pin == first["sha"]
     # Never for an escalated mark, a trim, or a stop that is no textual conflict.
     for more in ({"escalate": "x"}, {"trim": {"ids": []}}, {"files": ["(the rebase stopped: x)"]}):
         assert conflictfix.try_model_free(root, {**cf, **more}, 42) is None
+
+
+def test_two_names_added_to_a_one_name_per_line_import_list_settle_model_free_and_hot_files_keep_that_layout():
+    import ast
+    from ttp import conflictfix
+    base = "from .db import (\n    a,\n    b,\n)\n"
+    merged = conflictfix.merge_additive("from .db import (\n    a,\n    b,\n    c,\n)\n", base,
+                                        "from .db import (\n    a,\n    b,\n    d,\n)\n")
+    assert merged and merged[0] == "from .db import (\n    a,\n    b,\n    c,\n    d,\n)\n"
+    assert conflictfix._py_ok(merged[0], base, base)
+    # the packed form both sides edit on one line is an edit/edit conflict: never settled model-free
+    assert conflictfix.merge_additive("from .db import (a, b, c)\n", "from .db import (a, b)\n",
+                                      "from .db import (a, b, d)\n") is None
+    for name in ("coordinator.py", "daemon.py", "pushq.py"):
+        src = (RUNTIME / "ttp" / name).read_text()
+        for node in ast.parse(src).body:
+            if isinstance(node, ast.ImportFrom) and node.level and len(node.names) > 4:
+                assert node.end_lineno - node.lineno == len(node.names) + 1, (name, node.lineno)
 
 
 def test_an_edit_edit_or_unparsable_or_shadowing_push_conflict_falls_back(tmp_path):

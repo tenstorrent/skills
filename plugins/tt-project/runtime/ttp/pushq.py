@@ -41,11 +41,27 @@ from . import (   # one name per line: two changes adding names merge without a 
     upstream,
     urgent,
 )
-from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
-                 pin_of, review_subject, reviewed_ids)
+from .db import (
+    TERMINAL_TASK_STATES,
+    BranchIndex,
+    continues_id,
+    dependency_ids,
+    dump_result,
+    load_result,
+    pin_of,
+    review_subject,
+    reviewed_ids,
+)
 from . import gitmemo
 from .landed import on_branch
-from .project import Project, nice_level, push_allowed, push_queue_on, renice, write_json
+from .project import (
+    Project,
+    nice_level,
+    push_allowed,
+    push_queue_on,
+    renice,
+    write_json,
+)
 from .worktree import fix_branches, named_refs
 
 REF_PREFIX = "refs/ttp/push/"   # + row id: pins the approved commit until its row is settled
