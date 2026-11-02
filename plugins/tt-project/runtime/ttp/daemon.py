@@ -7439,6 +7439,19 @@ class Daemon:
                 probing = task["id"]
             elif note.startswith(startbreaker.HELD_NOTE):
                 db.update_task(task["id"], blocked_reason=None)
+            # Before the wake gate and the effort pick, which may each make a paid call: a held run spends nothing.
+            prev = load_result(task["result"])
+            need = self._floor_need(task, bud.wake_tier(task["tier"], prev, self.cfg, self.p.harness), prev)
+            if need and bud.TIER_ORDER.index(gate.max_tier) < bud.TIER_ORDER.index(need["tier"]):
+                # The gate would clamp a conclusion run below its floor: it waits queued, unspent.
+                held = f"{tierfloor.HELD_NOTE} {need['tier']}"
+                if note != held:
+                    db.update_task(task["id"], blocked_reason=held)
+                fate[task["id"]] = "hold"
+                reached.discard(task["id"])
+                continue
+            if note.startswith(tierfloor.HELD_NOTE):
+                db.update_task(task["id"], blocked_reason=None)
             skipped, gated = self._wake_gate(task)
             if skipped:
                 fate[task["id"]] = "start_after"   # it re-deferred the wake
@@ -7458,21 +7471,9 @@ class Daemon:
                 if (picked or {}).get("jev_call") and floor["tier"] != picked["tier"]:
                     # Jev's lower pick never ran: it avoided nothing.
                     db.x("UPDATE jev_calls SET avoided_usd=0 WHERE id=?", (picked["jev_call"],))
-            prev = load_result(task["result"])
             wake = bud.wake_tier(task["tier"], prev, self.cfg, self.p.harness)
-            need = self._floor_need(task, wake, prev)
             if need and wake:   # a wake whose wait is over may write the answer the user reads
                 wake = max(wake, need["tier"], key=bud.TIER_ORDER.index)
-            if need and bud.TIER_ORDER.index(gate.max_tier) < bud.TIER_ORDER.index(need["tier"]):
-                # The gate would clamp a conclusion run below its floor: it waits queued, unspent.
-                held = f"{tierfloor.HELD_NOTE} {need['tier']}"
-                if note != held:
-                    db.update_task(task["id"], blocked_reason=held)
-                fate[task["id"]] = "hold"
-                reached.discard(task["id"])
-                continue
-            if note.startswith(tierfloor.HELD_NOTE):
-                db.update_task(task["id"], blocked_reason=None)
             tier = bud.clamp_tier(wake or task["tier"], gate)
             # A tier routed to another provider (route.py) runs there unless it is cooling down.
             routed = self._route(task, tier, picked, now)

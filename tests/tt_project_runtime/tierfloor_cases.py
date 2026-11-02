@@ -136,6 +136,39 @@ def test_a_budget_gate_below_the_floor_holds_a_conclusion_run_queued_and_clamps_
     assert [(a[3], k["min_effort"]) for a, k in started] == [("light", None)]
 
 
+def test_a_conclusion_run_held_by_the_budget_gate_makes_no_effort_pick_or_wake_gate_call(env, monkeypatch):
+    # A hold placed after a paid step repeats that step every dispatch tick: the hold comes first.
+    from ttp import budget as bud, tierfloor
+    p, d, started = _floor_daemon(env, monkeypatch, jev=_EffortJev(0.1))
+    now = time.time()
+    for model, effort, cost in (("opus", "high", 3.0), ("sonnet", "low", 1.0)):
+        p.db.x("INSERT INTO runs(role,provider,model,effort,status,started,ended,cost_usd) "
+               "VALUES('worker','claude',?,?,'ok',?,?,?)", (model, effort, now - 3600, now - 3500, cost))
+    q = p.db.add_task("Which boxes run the old broker?", "List them.", kind="question", tier="standard",
+                      origin="coordinator", provider="claude", budget_usd=8.0)
+    a = p.db.add_task("Is the suite green?", "x", kind="question", tier="light", origin="coordinator",
+                      provider="claude", budget_usd=2.0)
+    p.db.update_task(a, result=json.dumps({"status": "waiting", "summary": "checks run", "waiting_for": "checks",
+                                           "retry_when": "ttp checks --result /tmp/run/1"}))
+    gated = []
+    real_gate = d._wake_gate
+    monkeypatch.setattr(d, "_wake_gate", lambda t: gated.append(t["id"]) or real_gate(t))
+    d.gates = {"claude": bud.Gate(provider="claude", level="orange", max_tier="light", max_parallel=2)}
+    for _ in range(4):
+        d.dispatch()
+    assert started == [] and d.jev.calls == 0 and gated == []
+    assert p.db.one("SELECT COUNT(*) AS n FROM jev_calls")["n"] == 0
+    for t in (q, a):
+        assert p.db.task(t)["status"] == "queued"
+        assert p.db.task(t)["blocked_reason"] == f"{tierfloor.HELD_NOTE} standard"
+    assert p.db.task(q)["tier"] == "standard"
+    p.db.update_task(a, status="done")
+    d.gates = {"claude": bud.Gate(provider="claude", level="green", max_tier="deep", max_parallel=2)}
+    d.dispatch()
+    assert [(x[3], k["min_effort"]) for x, k in started] == [("standard", "high")] and d.jev.calls == 1
+    assert not p.db.task(q)["blocked_reason"]
+
+
 def test_a_conclusion_tasks_wake_whose_wait_is_over_runs_at_the_floor_and_a_check_stays_light(env, monkeypatch):
     p, d, started = _floor_daemon(env, monkeypatch)
     waits = {"status": "waiting", "summary": "checks run", "retry_when": "ttp checks --result /tmp/run/1",
