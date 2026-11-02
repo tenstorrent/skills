@@ -25,6 +25,14 @@ NOFIX_EVENT = "review_nofix"
 DEAD_EVENT = "landed_wait_dead"
 KEY = "dead_landed_waits"   # kv: producer id -> {"since": first seen dead, "event": event id or None}
 GRACE_S = 900               # default of waiting.landed_wait_dead_s: a review or push row the same step queues
+RECHECK_S = 60              # check re-judges at least this often, even when its stamp of the rows is unchanged
+# The rows check reads, stamped: a write to any of them (update_task sets tasks.updated) changes the stamp.
+STAMP_SQL = ("SELECT (SELECT count(*) || ':' || max(id) || ':' || max(updated) FROM tasks), "
+             "(SELECT count(*) || ':' || max(id) || ':' || max(updated) FROM push_queue), "
+             "(SELECT count(*) || ':' || max(rowid) FROM task_landings), "
+             "(SELECT count(*) || ':' || max(rowid) FROM task_superseded), "
+             "(SELECT count(*) || ':' || total(task) || ':' || max(ts) FROM task_abandoned)")
+_last: dict[str, tuple] = {}   # db path -> (inputs, saved state after, when) of its last full check
 
 
 def waiters(db, ids: set[int], skip: set[int] = frozenset()) -> list[dict]:
@@ -105,6 +113,13 @@ def check(db, cfg: dict, held_by: dict[int, list[dict]], now: float) -> None:
     dropped) once a path appears, the producer lands or nothing waits on it any more."""
     grace = float((cfg.get("waiting") or {}).get("landed_wait_dead_s", GRACE_S) or 0)
     state = db.kv(KEY, {}) or {}
+    try:
+        stamp = tuple(db.one(STAMP_SQL).values())
+    except Exception:
+        stamp = None   # no stamp: judged in full every time
+    inputs = (stamp, grace, tuple((x, tuple(t["id"] for t in ts)) for x, ts in sorted(held_by.items())))
+    if stamp is not None and _unchanged(db, inputs, state, grace, now):
+        return
     new: dict = {}
     rows = Rows(db, held_by) if held_by else None
     for x, tasks in sorted(held_by.items()):
@@ -121,6 +136,26 @@ def check(db, cfg: dict, held_by: dict[int, list[dict]], now: float) -> None:
             db.x("UPDATE events SET status='handled' WHERE id=? AND status='queued'", (v["event"],))
     if new != state:
         db.set_kv(KEY, new)
+    if stamp is not None and getattr(db, "path", None):
+        _last[db.path] = (inputs, json.dumps(new, sort_keys=True), now)
+
+
+def _unchanged(db, inputs: tuple, state: dict, grace: float, now: float) -> bool:
+    """True when a full check now would do nothing: the same rows (stamp), held tasks and grace as
+    the last full check of this database within RECHECK_S, its saved state as that check left it,
+    and no dead wait in it due to be raised. It only skips re-judging: every raise and clear is made
+    by a full check from the saved rows."""
+    last = _last.get(getattr(db, "path", None))
+    if not last or last[0] != inputs or last[1] != json.dumps(state, sort_keys=True):
+        return False
+    if not 0 <= now - last[2] < RECHECK_S:
+        return False
+    for v in state.values():
+        since = v.get("since") if isinstance(v, dict) else None
+        if not isinstance(v, dict) or (v.get("event") is None and (
+                not isinstance(since, (int, float)) or now - since >= grace)):
+            return False   # due to be raised now, or a state only a full check judges
+    return True
 
 
 def _raise_dead(db, x: int, tasks: list[dict], rows: Rows) -> int:
