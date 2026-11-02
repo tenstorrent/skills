@@ -256,21 +256,19 @@ def reconcile_pushes(p, tid: int) -> None:
 _REBASE_TITLE = re.compile(r"\brebas(?:e|ed|es|ing)\s+(?:task\s+)?#(\d+)(?!\d)", re.I)
 
 
-def carriers(db, tid: int) -> dict[int, tuple[str, int | None, str]]:
-    """{task: (branch, the carrier it follows, kind)} of task `tid` and every task that carries its change on: a review of it
-    (review_subject), a task that `continues:` or fixes (`review_fix:`) one of them, rebases or carries
-    one of their branches (`rebases:`/`pr_branch:`) or whose title rebases one ("rebased #<id>"), and
-    so on down the chain (a re-review of a fix of a review of it). When the push queue lands such a
-    successor, `tid`'s work landed, under other patches if a conflict was settled on the way."""
+_CARRIER_SQL = ("SELECT id, kind, branch, labels, title FROM tasks WHERE id>? AND (kind='review' "
+                "OR labels LIKE '%continues:%' OR labels LIKE '%review_fix:%' OR labels LIKE '%rebases:%' "
+                "OR labels LIKE '%pr_branch:%' OR labels LIKE '%auto_review:%' OR title LIKE '%rebas%' "
+                "OR title LIKE '%review%') ORDER BY id")
+
+
+def _links(db, after: int) -> list[tuple[int, str, str, set[int], set[str]]]:
+    """(id, branch, kind, ids it carries on, branches it carries on) of each task after `after` that
+    may carry another's change on, in id order."""
     try:
-        rows = db.q("SELECT id, kind, branch, labels, title FROM tasks WHERE id>? AND (kind='review' "
-                    "OR labels LIKE '%continues:%' OR labels LIKE '%review_fix:%' OR labels LIKE '%rebases:%' "
-                    "OR labels LIKE '%pr_branch:%' OR labels LIKE '%auto_review:%' OR title LIKE '%rebas%' "
-                    "OR title LIKE '%review%') ORDER BY id", (tid,))
+        rows = db.q(_CARRIER_SQL, (after,))
     except Exception:
         rows = []
-    task = db.task(tid)
-    out = {tid: ((task or {}).get("branch") or "", None, (task or {}).get("kind") or "")}
     links = []
     for r in rows:
         try:
@@ -285,6 +283,36 @@ def carriers(db, tid: int) -> dict[int, tuple[str, int | None, str]]:
         ids |= {int(x) for x in _REBASE_TITLE.findall(r["title"] or "")}
         names = {lb.partition(":")[2] for lb in labels if lb.startswith(("rebases:", "pr_branch:"))} - {""}
         links.append((r["id"], r["branch"] or "", r["kind"] or "", ids, names))
+    return links
+
+
+class Rows:
+    """The saved rows carriers and recorded judge from, read once for many tasks: deadwait.check judges
+    every held producer of a tick from one read. A call without one reads its own (`ttp landed --task`);
+    both run the same code on the same rows."""
+
+    def __init__(self, db, tids):
+        tids = sorted({int(t) for t in tids})
+        self.tasks = {t["id"]: t for t in db.q(
+            f"SELECT * FROM tasks WHERE id IN ({','.join('?' * len(tids))})", tids)} if tids else {}
+        self.links = _links(db, min(tids, default=0))
+        self.pushed = _pushed(db)
+        self.landings = db.q("SELECT task, sha FROM task_landings ORDER BY marker")
+        self.superseded = db.q("SELECT task, sha FROM task_superseded ORDER BY ts")
+
+
+def carriers(db, tid: int, rows: Rows | None = None) -> dict[int, tuple[str, int | None, str]]:
+    """{task: (branch, the carrier it follows, kind)} of task `tid` and every task that carries its change on: a review of it
+    (review_subject), a task that `continues:` or fixes (`review_fix:`) one of them, rebases or carries
+    one of their branches (`rebases:`/`pr_branch:`) or whose title rebases one ("rebased #<id>"), and
+    so on down the chain (a re-review of a fix of a review of it). When the push queue lands such a
+    successor, `tid`'s work landed, under other patches if a conflict was settled on the way. `rows`:
+    read once for many tasks (Rows), else read here."""
+    if rows is None or tid not in rows.tasks:
+        links, task = _links(db, tid), db.task(tid)
+    else:
+        links, task = [lk for lk in rows.links if lk[0] > tid], rows.tasks[tid]
+    out = {tid: ((task or {}).get("branch") or "", None, (task or {}).get("kind") or "")}
     grew = True
     while grew:   # a successor always has a later id, but a link may name a branch rather than an id
         grew = False
@@ -296,33 +324,41 @@ def carriers(db, tid: int) -> dict[int, tuple[str, int | None, str]]:
     return out
 
 
-def recorded(db, tid: int, carry: dict | None = None) -> tuple[list[str], str]:
+def _pushed(db) -> list[dict]:
+    try:
+        return db.q("SELECT q.task, q.branch, q.landed_sha, q.pushed_sha FROM push_queue q "
+                    "WHERE q.status IN ('pushed','landed') ORDER BY q.id")
+    except Exception:
+        return []
+
+
+def recorded(db, tid: int, carry: dict | None = None, rows: Rows | None = None) -> tuple[list[str], str]:
     """The landed commits saved for task `tid` or a task that carries it on (`carry`, else
     carriers): a push queue row it or its branch landed in, a successful detached push, a recorded
-    supersession; ([], "") when none. `ttp landed --task` and deadwait both judge from this."""
-    carry = carriers(db, tid) if carry is None else carry
+    supersession; ([], "") when none. `ttp landed --task` and deadwait both judge from this; `rows`:
+    read once for many tasks (Rows), else read here."""
+    carry = carriers(db, tid, rows) if carry is None else carry
     branches = {v[0] for v in carry.values() if v[0]}
 
     def via(src: str, i) -> str:
         """`src`, naming the successor it came through (not `tid` itself or a plain review of it)."""
         direct = i == tid or i not in carry or (carry[i][1] == tid and carry[i][2] == "review")
         return src if direct else f"{src} through #{i}"
-    try:
-        rows = db.q("SELECT q.task, q.branch, q.landed_sha, q.pushed_sha FROM push_queue q "
-                    "WHERE q.status IN ('pushed','landed') ORDER BY q.id")
-    except Exception:
-        rows = []
-    hits = [r for r in rows if (r["landed_sha"] or r["pushed_sha"]) and (r["task"] in carry or r["branch"] in branches)]
+    pushed = _pushed(db) if rows is None else rows.pushed
+    hits = [r for r in pushed if (r["landed_sha"] or r["pushed_sha"]) and (r["task"] in carry or r["branch"] in branches)]
     if hits:
         return [r["landed_sha"] or r["pushed_sha"] for r in hits], via("its push queue landing", hits[-1]["task"])
-    rows = db.q("SELECT task, sha FROM task_landings ORDER BY marker")
-    hits = [r for r in rows if r["task"] in carry]
+    landings = db.q("SELECT task, sha FROM task_landings ORDER BY marker") if rows is None else rows.landings
+    hits = [r for r in landings if r["task"] in carry]
     if hits:
         return list(dict.fromkeys(r["sha"] for r in hits)), via("its detached push landing", hits[-1]["task"])
-    rows = db.q("SELECT task, sha FROM task_superseded WHERE task IN (%s) ORDER BY ts" % ",".join("?" * len(carry)),
-                list(carry))
-    if rows:
-        return [r["sha"] for r in rows], via("the commit recorded as superseding it", rows[-1]["task"])
+    if rows is None:
+        found = db.q("SELECT task, sha FROM task_superseded WHERE task IN (%s) ORDER BY ts"
+                     % ",".join("?" * len(carry)), list(carry))
+    else:
+        found = [r for r in rows.superseded if r["task"] in carry]
+    if found:
+        return [r["sha"] for r in found], via("the commit recorded as superseding it", found[-1]["task"])
     return [], ""
 
 

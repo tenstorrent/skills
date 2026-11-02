@@ -65,25 +65,37 @@ def raise_nofix(db, review: dict, why: str, branch: str) -> int | None:
                  review["id"]))
 
 
-def path(db, x: int, held: set[int]) -> str:
+class Rows(landed.Rows):
+    """What path judges every held producer of one check from, read once: landed.Rows, the open
+    tasks, the push queue rows waiting to push and the abandoned tasks."""
+
+    def __init__(self, db, tids):
+        super().__init__(db, tids)
+        self.open = db.q("SELECT * FROM tasks WHERE status NOT IN (?,?,?) ORDER BY id", TERMINAL_TASK_STATES)
+        self.queued = db.q("SELECT task, status FROM push_queue WHERE status IN ('approved','batched','held') "
+                           "ORDER BY id")
+        self.abandoned = {r["task"] for r in db.q("SELECT task FROM task_abandoned")}
+
+
+def path(db, x: int, held: set[int], rows: Rows | None = None) -> str:
     """What can still land producer `x`'s work, '' when nothing: x itself not done, a landing
     recorded (landed.recorded), an open task carrying its change or on its branch (a held task, or one that depends on
-    a held task, is no path: it waits on x too), or a push queue row."""
-    t = db.task(x)
+    a held task, is no path: it waits on x too), or a push queue row. `rows`: read once for every
+    producer of a check (Rows), else read here."""
+    rows = rows if rows is not None else Rows(db, [x])
+    t = rows.tasks.get(x)
     if not t or t["status"] != "done":
         return f"#{x} is {t['status'] if t else 'missing'}"
-    carried = landed.carriers(db, x)
-    if landed.recorded(db, x, carried)[0]:   # the same saved landings `ttp landed --task` counts
+    carried = landed.carriers(db, x, rows)
+    if landed.recorded(db, x, carried, rows)[0]:   # the same saved landings `ttp landed --task` counts
         return "a landing is recorded"
     branches = {b for b, _, _ in carried.values() if b}
-    for o in db.q("SELECT * FROM tasks WHERE status NOT IN (?,?,?) ORDER BY id", TERMINAL_TASK_STATES):
+    for o in rows.open:
         if o["id"] in held or held & set(dependency_ids(o)):
             continue
         if o["id"] in carried or (o["branch"] and o["branch"] in branches):
             return f"#{o['id']} ({o['status']})"
-    ids = tuple(sorted(carried))
-    row = db.one(f"SELECT task, status FROM push_queue WHERE status IN ('approved','batched','held') "
-                 f"AND task IN ({','.join('?' * len(ids))})", ids)
+    row = next((r for r in rows.queued if r["task"] in carried), None)
     return f"push queue row of #{row['task']} ({row['status']})" if row else ""
 
 
@@ -94,14 +106,15 @@ def check(db, cfg: dict, held_by: dict[int, list[dict]], now: float) -> None:
     grace = float((cfg.get("waiting") or {}).get("landed_wait_dead_s", GRACE_S) or 0)
     state = db.kv(KEY, {}) or {}
     new: dict = {}
+    rows = Rows(db, held_by) if held_by else None
     for x, tasks in sorted(held_by.items()):
         held = {t["id"] for t in tasks}
-        if path(db, x, held) or landed.abandoned(db, x):   # abandoned: its probe is raised as broken
+        if path(db, x, held, rows) or x in rows.abandoned:   # abandoned: its probe is raised as broken
             continue
         prev = state.get(str(x)) or {}
         got = {"since": prev.get("since") or now, "event": prev.get("event")}
         if got["event"] is None and now - got["since"] >= grace:
-            got["event"] = _raise_dead(db, x, tasks)
+            got["event"] = _raise_dead(db, x, tasks, rows)
         new[str(x)] = got
     for k, v in state.items():
         if k not in new and v.get("event"):
@@ -110,11 +123,11 @@ def check(db, cfg: dict, held_by: dict[int, list[dict]], now: float) -> None:
         db.set_kv(KEY, new)
 
 
-def _raise_dead(db, x: int, tasks: list[dict]) -> int:
-    t = db.task(x) or {"title": "?", "branch": ""}
+def _raise_dead(db, x: int, tasks: list[dict], rows: Rows) -> int:
+    t = rows.tasks.get(x) or {"title": "?", "branch": ""}
     failed = db.one("SELECT id FROM tasks WHERE kind='review' AND status='failed' AND id IN "
                     f"({','.join('?' * len(c))}) ORDER BY id DESC", tuple(c)) \
-        if (c := sorted(landed.carriers(db, x))) else None
+        if (c := sorted(landed.carriers(db, x, rows))) else None
     text = (f"#{x} {t['title']} is done but its work has not landed, and nothing open can land it: no open "
             f"review, fix, rebase or push of branch {t.get('branch') or '?'}"
             + (f" (its last review #{failed['id']} failed)" if failed else "")
