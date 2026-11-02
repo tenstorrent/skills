@@ -651,6 +651,8 @@ def test_upstream_resolve_fixed_in_refuses_a_version_without_the_fixing_tasks_la
     p.db.update_task(rebased, status="done", result=json.dumps({"status": "done", "resolves": [fps["rebased"]]}))
     pending = p.db.add_task("fix a third note", "s", kind="code")
     p.db.update_task(pending, status="running", result=json.dumps({"resolves": fps["pending"]}))
+    mention = p.db.add_task("only mentions a note", "s", kind="code")   # named in a summary, not in resolves
+    p.db.update_task(mention, status="running", result=json.dumps({"summary": f"see note {fps['none']}"}))
 
     def resolve(fp, v, *extra):
         rc = _upstream_cli(cli, "--resolve", fp, "--fixed-in", v, *extra)
