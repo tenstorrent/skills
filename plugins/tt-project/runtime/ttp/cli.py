@@ -2453,7 +2453,10 @@ def _queue_passes(p: Project | None, top: str | Path, tree: str, todo: list, env
     r = subprocess.run(["git", "-C", str(top), "rev-list", "--first-parent", f"--max-count={QUEUE_TIPS}", "HEAD"],
                        capture_output=True, text=True)
     tips = (r.stdout.split() if r.returncode == 0 else []) + [""]
-    return [(c, e) for c in todo if (e := pushpass.queued(p, Path(top), tree, c, env, tips))]
+    try:
+        return [(c, e) for c in todo if (e := pushpass.queued(p, Path(top), tree, c, env, tips))]
+    except (TypeError, ValueError):   # a malformed entry in the store: nothing is reused, the checks run
+        return []
 
 
 def _check_envs(top: str | Path, cmds: list, run_env: dict) -> tuple[list[str] | None, list[dict] | None]:

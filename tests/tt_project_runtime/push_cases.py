@@ -14282,3 +14282,18 @@ def test_ttp_checks_reuses_a_push_queue_pass_only_on_the_same_tree_command_and_e
     reset()
     cli.main(["checks", "--", cmd])
     assert ran() == 5 and "(recorded)" in capsys.readouterr().out
+
+
+def test_ttp_checks_runs_its_checks_when_the_push_queue_store_is_malformed(env, tmp_path, monkeypatch, capsys):
+    """A push-queue store `ttp checks` cannot read (not JSON, a junk timestamp) reuses nothing and
+    never fails the checks: they run."""
+    from ttp import cli, pushpass
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    count = tmp_path / "count"
+    cmd = f"echo x >> {count} || pytest"
+    tree = pushpass.tree_of(repo, "HEAD")
+    for n, text in enumerate(["{not json", json.dumps({"passes": [{"tree": tree, "cmd": cmd, "key": "k", "ts": "junk"}]})]):
+        (p.state / cli.CHECK_PASSES).unlink(missing_ok=True)
+        (p.state / pushpass.STORE).write_text(text)
+        cli.main(["checks", "--", cmd])
+        assert len(count.read_text().splitlines()) == n + 1 and "push batch" not in capsys.readouterr().out
