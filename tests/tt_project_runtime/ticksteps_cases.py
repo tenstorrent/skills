@@ -1248,13 +1248,15 @@ def test_b_a_warm_finish_spawns_no_git_under_the_write_lock(env, monkeypatch):
 
 
 def test_c_strict_rounds_write_the_rows_one_transaction_writes(env, monkeypatch):
-    """Rounds rolled back and retried (a 2 s read the body makes, past the 1 s slice, the warm-up off)
+    """Rounds rolled back and retried (a 3 s read the body makes, past the 2.5 s slice, the warm-up off)
     leave the same rows, times masked, as the one-transaction finish of the same project. The other
-    reads are fast, so no read after a round's point of no return is cut by the slice."""
+    reads take about 0.1 s in all per round, so no read after a round's point of no return is cut by
+    the slice; with a 1 s slice a loaded host (suite workers) cut one and degraded a row, as the
+    settled design lets it (sa28)."""
     import sqlite3
     from ttp import daemon as dmod, gitmemo, gitreplay, pushq
     s, runs = _big_finish(env, monkeypatch, 60)
-    _slow_git(env["tmp"], monkeypatch, delay=0.0, slow="*for-each-ref*refs/heads/*", slow_s=2.0)
+    _slow_git(env["tmp"], monkeypatch, delay=0.0, slow="*for-each-ref*refs/heads/*", slow_s=3.0)
     monkeypatch.setattr(gitmemo, "TICK_GIT_S", 30.0)
     before = sqlite3.connect(":memory:")
     s.p.db.conn.backup(before)
@@ -1262,7 +1264,7 @@ def test_c_strict_rounds_write_the_rows_one_transaction_writes(env, monkeypatch)
     rows, rounds = {}, {}
     for strict in (True, False):
         monkeypatch.setattr(dmod, "FINISH_STRICT", strict)
-        monkeypatch.setattr(gitmemo, "HOLD_SLICE_S", 1.0)
+        monkeypatch.setattr(gitmemo, "HOLD_SLICE_S", 2.5)
         before.backup(s.p.db.conn)
         for f, data in files.items():
             f.write_bytes(data)
