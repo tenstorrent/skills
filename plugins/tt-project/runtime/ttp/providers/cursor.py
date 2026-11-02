@@ -32,8 +32,8 @@ import time
 from pathlib import Path
 
 from . import register
-from .base import (AUTH_RE, LIMIT_RE, Provider, RunUsage, cli_output, price_row, request_rejected, status_check,
-                   stderr_tail)
+from .base import (_CLI_OUTPUT, AUTH_RE, LIMIT_RE, Provider, RunUsage, cli_output, price_row, request_rejected,
+                   status_check, stderr_tail)
 
 PRICES = {"default": (3.0, 0.3, 15.0)}
 USAGE_KEYS = ("inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens")
@@ -216,18 +216,22 @@ class Cursor(Provider):
 
     def account(self) -> str:
         """'cursor:<hash>' of the login `agent status` names (never the email, a name or a token), or
-        'cursor' when this CLI names none. While the status cannot be read or says logged out, the
-        last label seen stands, so a logout is not an account switch."""
+        'cursor' when the status reads logged in but names no login. While the status cannot be read,
+        is not offered or says logged out, the last label seen in this process stands, and before
+        any is seen the account is unknown (""), so a logout or a restart is not an account switch."""
         b = self.binary()
         if not b:
-            return "cursor"
+            return ""
         key, now = f"{b}|{self.credentials_stamp()}", time.monotonic()
         hit = _ACCOUNT.get(key)
         if hit and now - hit[0] < ACCOUNT_TTL_S:
             return hit[1]
-        label = _LAST_LABEL.get(b, "cursor")
-        got = status_check([b, "status"], timeout_s=15) if re.search(
-            r"^\s*status\b", cli_output(b, "--help"), re.M) else None
+        label = _LAST_LABEL.get(b, "")
+        helptext = cli_output(b, "--help")
+        if not helptext:
+            # --help could not run: ask it again with the status after the TTL, not never.
+            _CLI_OUTPUT.pop((b, "--help"), None)
+        got = status_check([b, "status"], timeout_s=15) if re.search(r"^\s*status\b", helptext, re.M) else None
         if got is not None and got[0] == 0 and not LOGGED_OUT_RE.search(got[1]):
             label = account_label(status_login(got[1]))
             _LAST_LABEL[b] = label

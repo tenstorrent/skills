@@ -4119,7 +4119,7 @@ def test_auto_billing_keeps_the_budget_fingerprint_and_gate_as_before(env, monke
 
 def test_cursor_account_label_is_a_hash_of_the_login_its_status_names(env, monkeypatch, tmp_path):
     """Cursor's account label comes from `agent status`: 'cursor:' and a hash, never the email; a
-    CLI that names no login keeps 'cursor'; a logged-out or failed status keeps the last label, so a
+    status that names no login keeps 'cursor'; a logged-out or failed status keeps the last label, so a
     logout is no account switch. The status is asked again only after its TTL or a login change."""
     from ttp.providers import cursor as cur
     out = {"text": "\x1b[32m✓\x1b[0m Logged in as Someone@Example.com", "rc": 0}
@@ -4148,8 +4148,124 @@ def test_cursor_account_label_is_a_hash_of_the_login_its_status_names(env, monke
     stamp["v"] = "4"
     assert c.account() == "cursor", "a status that names no login keeps the plain label"
     monkeypatch.setattr(cur, "_LAST_LABEL", {})
-    monkeypatch.setattr(cur, "cli_output", lambda *a: "")
+    monkeypatch.setattr(cur, "cli_output", lambda *a: "Commands:\n  login\n")
     stamp["v"] = "5"
-    assert c.account() == "cursor", "a CLI without `agent status`"
+    assert c.account() == "", "a CLI without `agent status` names no account: unknown, not 'cursor'"
     assert [cur.status_login(t) for t in ("User: a@b.io", "Signed in as `bob`", "unauthenticated", "")] == \
         ["a@b.io", "bob", "", ""]
+
+
+def _cursor_as_fake(monkeypatch, status):
+    """The fake provider reads its account as Cursor's adapter does, from a fresh process (no label
+    seen yet), with `agent status` answering status["got"] (None: it cannot run)."""
+    from ttp.providers import cursor as cur, fake
+    monkeypatch.setattr(cur, "_ACCOUNT", {})
+    monkeypatch.setattr(cur, "_LAST_LABEL", {})
+    monkeypatch.setattr(cur.Cursor, "binary", lambda self: "/bin/agent")
+    monkeypatch.setattr(cur.Cursor, "credentials_stamp", lambda self: status.get("stamp", "1"))
+    monkeypatch.setattr(cur, "cli_output", lambda *a: status.get("help", "Commands:\n  status\n"))
+    monkeypatch.setattr(cur, "status_check", lambda argv, timeout_s=30: status["got"])
+    c = cur.Cursor()
+    monkeypatch.setattr(fake.Fake, "account", lambda self: c.account(), raising=False)
+    return cur
+
+
+def test_cursor_account_unread_in_a_fresh_process_is_unknown_not_an_account_switch(env, monkeypatch):
+    """A daemon restart while Cursor is logged out, its status cannot run or --help cannot be read:
+    no label seen yet in this process, so the account is unknown (""), never 'cursor', and the
+    stored 'cursor:<hash>' raises no account-switched event; the next good read keeps it."""
+    from ttp import budgetkind
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(budgetkind, "DEBOUNCE_S", 0.0)
+    p = make(env)
+    _billed_fake(p, time.time())
+    status = {"got": (0, "Logged in as someone@example.com")}
+    cur = _cursor_as_fake(monkeypatch, status)
+    _bk_tick(Daemon(p.base), monkeypatch)
+    label = cur.account_label("someone@example.com")
+    stored = p.db.kv(budgetkind.KV + "fake")["parts"]["account"]
+    assert stored == budgetkind.account_hash(label), stored
+    for case in ({"got": (0, "Not logged in. Run agent login.")}, {"got": (1, "error")}, {"got": None},
+                 {"got": (0, "Logged in as someone@example.com"), "help": ""},
+                 {"got": (0, "Logged in as someone@example.com"), "help": "Commands:\n  login\n"}):
+        status.clear()
+        status.update(case)
+        _cursor_as_fake(monkeypatch, status)
+        assert cur.Cursor().account() == "", case
+        _bk_tick(Daemon(p.base), monkeypatch, 3)   # restarted
+        assert p.db.kv(budgetkind.KV + "fake")["parts"]["account"] == stored, case
+        assert _bk_events(p) == [], (case, [dict(e) for e in _bk_events(p)])
+    status.clear()
+    status.update(got=(0, "Logged in as someone@example.com"))
+    _bk_tick(Daemon(p.base), monkeypatch, 3)
+    assert _bk_events(p) == [] and p.db.kv(budgetkind.KV + "fake")["parts"]["account"] == stored
+
+
+def test_cursor_help_that_could_not_run_is_asked_again_after_the_account_ttl(monkeypatch):
+    """A --help that timed out is not cached for the rest of the process: the next account read after
+    ACCOUNT_TTL_S asks it again, and then the status."""
+    import subprocess
+    from ttp.providers import base, cursor as cur
+    monkeypatch.setattr(cur, "_ACCOUNT", {})
+    monkeypatch.setattr(cur, "_LAST_LABEL", {})
+    monkeypatch.setattr(base, "_CLI_OUTPUT", {})
+    monkeypatch.setattr(cur, "_CLI_OUTPUT", base._CLI_OUTPUT)
+    monkeypatch.setattr(cur.Cursor, "binary", lambda self: "/bin/agent")
+    monkeypatch.setattr(cur.Cursor, "credentials_stamp", lambda self: "1")
+    calls, clock = [], {"t": 1000.0}
+    monkeypatch.setattr(cur.time, "monotonic", lambda: clock["t"])
+
+    def run(argv, **kw):
+        calls.append(argv[1])
+        if argv[1] == "--help" and calls.count("--help") == 1:
+            raise subprocess.TimeoutExpired(argv, 20)
+        out = "Commands:\n  status\n" if argv[1] == "--help" else "Logged in as someone@example.com"
+        return subprocess.CompletedProcess(argv, 0, out, "")
+    monkeypatch.setattr(base.subprocess, "run", run)
+    c = cur.Cursor()
+    assert c.account() == "" and calls == ["--help"]
+    assert c.account() == "" and calls == ["--help"], "within the TTL nothing is asked again"
+    clock["t"] += cur.ACCOUNT_TTL_S + 1
+    assert c.account() == cur.account_label("someone@example.com"), calls
+    assert calls == ["--help", "--help", "status"], calls
+
+
+def test_cursor_upgrade_from_the_plain_label_is_one_account_switch_with_no_spend_reset(env, monkeypatch):
+    """Upgrading from the plain 'cursor' label to 'cursor:<hash>': one budget_kind_change event saying
+    'account switched', the day's and 24 h spend unchanged, and the gate still holds on the dollar
+    cap without a new hold."""
+    from ttp import budgetkind, coordinator as coord
+    from ttp.daemon import Daemon
+    from ttp.providers import fake
+    monkeypatch.setattr(budgetkind, "DEBOUNCE_S", 0.0)
+    p = make(env)
+    now = time.time()
+    _billed_fake(p, now)
+    p.set_config("budget.daily_usd", 100)
+    held = p.db.add_task("reindex the docs", "x", labels=coord.defer_labels(now + 86400, "true", "until the dollar cap resets"),
+                         not_before=now + 86400)
+    monkeypatch.setattr(fake.Fake, "account", lambda self: "cursor", raising=False)
+    d = Daemon(p.base)
+    _bk_tick(d, monkeypatch)
+    g = d.gates["fake"]
+    assert g.level == "red" and _bk_events(p) == [], g.as_dict()
+    assert p.db.kv(budgetkind.KV + "fake")["parts"]["account"] == budgetkind.account_hash("cursor")
+    before = {k: g.numbers.get(k) for k in ("spent_today", "spent_24h")}
+    tasks_before = {t["id"] for t in p.db.q("SELECT id FROM tasks")}
+    limited_before = p.db.kv("limited:fake")
+
+    cur = _cursor_as_fake(monkeypatch, {"got": (0, "Logged in as someone@example.com")})
+    _bk_tick(d, monkeypatch)
+    ev = _bk_events(p)
+    assert len(ev) == 1 and "account switched" in ev[0]["text"], [dict(e) for e in ev]
+    assert p.db.kv(budgetkind.KV + "fake")["parts"]["account"] == budgetkind.account_hash(
+        cur.account_label("someone@example.com"))
+    g = d.gates["fake"]
+    assert {k: g.numbers.get(k) for k in before} == before and before["spent_24h"], (before, g.numbers)
+    assert g.level == "red" and not g.allow_new_work and any("cap" in r for r in g.reasons), g.reasons
+    assert {t["id"] for t in p.db.q("SELECT id FROM tasks")} == tasks_before, "no new task"
+    assert p.db.kv("limited:fake") == limited_before, "no new limit pause"
+    assert p.db.task(held)["status"] == "queued"
+    for _ in range(3):
+        d.update_gates()
+    assert len(_bk_events(p)) == 1

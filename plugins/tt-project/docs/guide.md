@@ -107,7 +107,10 @@ prolonged whole-box outage.
   caps, the runaway guard counts its runs instead, and its spend shows as plan, not billed. Set
   `usage` to keep the dollar caps on even while plan windows are reported. A change raises one
   budget-kind event and releases holds the old kind set. Cursor's account is a hash of the login
-  its CLI status names (`cursor:<hash>`, never the email); without one it stays `cursor`.
+  its CLI status names (`cursor:<hash>`, never the email), or `cursor` when the status reads logged
+  in but names none. While the status says logged out or cannot be read, the last label seen
+  stands; before any is seen (after a restart) the account is unknown, so neither is an account
+  switch.
 - Global daily cap (usage-billed, $200/day by default): `budget.global_daily_usd` stops new work in
   every usage-billed project on the account once the whole account's tt-project spend today reaches
   it. "Today" is the rolling 24 hours unless `budget.day_start` is set. Change it for every project
