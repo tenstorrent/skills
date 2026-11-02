@@ -17,9 +17,11 @@ def _spec_sleeper(p, probe="exit 1", labels=None, depends_on=None, status="queue
     return tid
 
 
-def _edit_spec(p, tid, text):
+def _edit_spec(p, tid, text, wake_now=True):
+    """A coordinator task_update adding `text` to the spec, by default with `wake_now` (a spec alone sleeps
+    with the task until its wait ends: see the deferred-wake tests below)."""
     from ttp import coordinator as coord
-    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": text}]) == []
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": text, **({"wake_now": True} if wake_now else {})}]) == []
 
 
 def _spec_daemon(p, monkeypatch):
@@ -33,7 +35,7 @@ def _asleep(p, tid):
     return (p.db.task(tid)["not_before"] or 0) > time.time() + 600
 
 
-def test_a_spec_change_wakes_a_task_asleep_on_its_retry_when_once(env, monkeypatch):
+def test_a_wake_now_spec_change_wakes_a_task_asleep_on_its_retry_when_once(env, monkeypatch):
     p = make(env)
     tid = _spec_sleeper(p)
     d = _spec_daemon(p, monkeypatch)
@@ -178,10 +180,12 @@ def test_a_hand_off_from_before_the_spec_digest_takes_its_spec_as_the_baseline(e
     assert not _asleep(p, tid)
 
 
-def test_the_retry_when_docs_say_a_spec_change_wakes_the_task_once():
+def test_the_retry_when_docs_say_a_spec_update_sleeps_with_the_task():
     for rel in ("skills/tt-project-harness/SKILL.md", "docs/design.md"):
         text = " ".join((RUNTIME.parent / rel).read_text().split())
-        assert "spec update wakes it once" in text, rel
+        assert "spec update sleeps with" in text and "wake_now: true" in text, rel
+    prompt = " ".join((RUNTIME.parent / "template/prompts/coordinator.md").read_text().split())
+    assert "`wake_now` (true: wake a task asleep on its `retry_when` now" in prompt
 
 
 def test_a_spec_change_wakes_a_task_waiting_on_its_checks_at_its_own_tier(env, monkeypatch):
@@ -274,3 +278,105 @@ def test_a_waiting_hand_off_that_missed_a_spec_update_keeps_the_spec_it_started_
     assert task["status"] == "queued" and res["spec_seen"] == started != spec_digest(task)
     task, _ = _run_ended_after_a_spec_change(env, p, wait, read=True)
     assert json.loads(task["result"])["spec_seen"] == spec_digest(task)
+
+
+def _deferred_flow(p, monkeypatch, tmp_path, tier="standard", hand_off=None):
+    """A task at `tier` that ran once and handed off waiting on a file (a wake that would run light), with
+    the daemon that ran it; returns (daemon, tid, the file, a count of its runs, whether it sleeps idle)."""
+    from ttp import budget as bud, daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    flag = tmp_path / "job-done"
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps(
+        {"status": "waiting", "summary": "job running", "waiting_for": "the job", "retry_after_s": 3600,
+         "retry_when": f"test -e {flag}", **(hand_off or {})}))
+    tid = p.db.add_task("run the long job", "start the job", kind="work", tier=tier, origin="user")
+    d = dmod.Daemon(p.base)
+    runs = lambda: len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,)))
+    idle = lambda: p.db.task(tid)["status"] == "queued" and (p.db.task(tid)["not_before"] or 0) > time.time() \
+        and not p.db.q("SELECT id FROM runs WHERE status='running'")
+    assert _run_until(d, p, idle) and runs() == 1
+    assert bud.wake_tier(tier, json.loads(p.db.task(tid)["result"])) == "light", "the control: its own wake is light"
+    return d, tid, flag, runs, idle
+
+
+def _last_wake(p, tid):
+    r = p.db.q("SELECT note FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))[0]
+    return json.loads(r["note"] or "{}").get("wake") or {}
+
+
+def test_a_spec_only_update_starts_no_run_until_the_wait_ends_then_runs_at_its_own_tier(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp.prompts import spec_digest
+    d, tid, flag, runs, idle = _deferred_flow(p, monkeypatch, tmp_path)
+    slept_on = json.loads(p.db.task(tid)["result"])["spec_seen"]
+    _edit_spec(p, tid, "also report the peak memory", wake_now=False)
+    for _ in range(6):
+        d.tick()
+        time.sleep(0.05)
+    res = json.loads(p.db.task(tid)["result"])
+    assert runs() == 1 and idle(), "a spec-only update woke the task before its wait ended"
+    assert res["spec_seen"] == slept_on and not res.get("woke") and not res.get("spec_wakes"), res
+    flag.write_text("")   # the wait ends: the run that follows reads the update at the task's own tier
+    assert _run_until(d, p, lambda: runs() == 2), "the probe pass did not run the task"
+    wake = _last_wake(p, tid)
+    assert wake.get("tier") == "standard" and wake.get("escalated") is True, wake
+    assert json.loads(p.db.task(tid)["result"])["spec_seen"] == spec_digest(p.db.task(tid))
+
+
+def test_an_urgent_or_wake_now_spec_update_wakes_a_sleeping_task_at_once(env, monkeypatch, tmp_path):
+    from ttp import coordinator as coord
+    for how in ("wake_now", "urgent line", "priority 1", "wake_now alone"):
+        p = make(env)
+        d, tid, flag, runs, idle = _deferred_flow(p, monkeypatch, tmp_path / how.replace(" ", "-"))
+        act = {"type": "task_update", "id": tid}
+        if how != "wake_now alone":
+            act["spec"] = "urgent: the user is waiting on this" if how == "urgent line" else "also report memory"
+        if how.startswith("wake_now"):
+            act["wake_now"] = True
+        if how == "priority 1":
+            act["priority"] = 1
+        assert coord.apply(p, [act]) == [], how
+        assert _run_until(d, p, lambda: runs() == 2), f"{how}: no run at once"
+        wake = _last_wake(p, tid)
+        assert wake.get("tier") == "standard" and wake.get("escalated") is True, (how, wake)
+        assert "wake_now" not in json.loads(p.db.task(tid)["result"]), f"{how}: the request outlived its wake"
+
+
+def test_wake_now_on_a_task_not_asleep_on_a_retry_when_is_ignored_with_a_note(env):
+    from ttp import coordinator as coord
+    p = make(env)
+    fresh = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+    deferred = _spec_sleeper(p, labels=["start_when:exit 1"])
+    for tid in (fresh, deferred):
+        assert coord.apply(p, [{"type": "task_update", "id": tid, "wake_now": True}]) == []
+        assert any(f"#{tid} wake_now ignored" in n for n in p.db.kv(coord.NOTES_KEY)), p.db.kv(coord.NOTES_KEY)
+        assert "wake_now" not in json.loads(p.db.task(tid)["result"] or "{}")
+
+
+def test_a_deferred_spec_change_rides_on_any_other_wake_at_its_own_tier(env, monkeypatch):
+    # A wake for another reason (a broken probe, a failed job) after a deferred spec change: its run
+    # reads the change at the task's own tier.
+    from ttp import budget as bud
+    from ttp.prompts import spec_digest
+    p = make(env)
+    tid = _spec_sleeper(p)
+    d = _spec_daemon(p, monkeypatch)
+    _edit_spec(p, tid, "also report the peak memory", wake_now=False)
+    d.probe_waiting()
+    assert _asleep(p, tid)
+    d._wake_waiting(p.db.task(tid), "probe broken: exit 127", time.time())
+    t = p.db.task(tid)
+    res = json.loads(t["result"])
+    assert res["woke"].startswith("probe broken") and "its spec changed" in res["woke"]
+    assert res["spec_seen"] == spec_digest(t) and bud.wake_tier("standard", res) == "standard"
+
+
+def test_a_worker_cannot_ask_for_its_own_wake_now(env, monkeypatch, tmp_path):
+    p = make(env)
+    d, tid, flag, runs, idle = _deferred_flow(p, monkeypatch, tmp_path, hand_off={"wake_now": True})
+    assert "wake_now" not in json.loads(p.db.task(tid)["result"])
+    for _ in range(4):
+        d.tick()
+        time.sleep(0.05)
+    assert runs() == 1 and idle(), "a worker's own wake_now woke it"

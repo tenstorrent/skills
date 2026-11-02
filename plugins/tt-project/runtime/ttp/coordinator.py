@@ -209,7 +209,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "start_after": {"type": "string", "pattern": START_AFTER_RE}, "start_when": {"type": "string"},
             "waits_on": {"type": "string"}, "outcome": {"type": "string", "enum": list(sweep.OUTCOMES)},
             "clear_fields": {"type": "array", "items": {"type": "string", "enum": list(NULL_OPERATIONS)}},
-            "heal": HEAL_SCHEMA, "pr_branch": {"type": "string"},
+            "heal": HEAL_SCHEMA, "pr_branch": {"type": "string"}, "wake_now": {"type": "boolean"},
             "owners": {"type": "array", "items": {"type": "integer"}}, "evidence": {"type": "string"},
             "milestone": {"type": "string"}, "promise": {"type": "string"},
             "delivers": {"type": "array", "items": {"type": "string"}},
@@ -2529,6 +2529,17 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if a.get("pr_branch") is None and upd.get("kind", task["kind"]) not in worktree.NEVER_OWN_KINDS \
                             and (named := worktree.spec_line_branch(spec)) is not None:
                         upd["labels"] = _branch_labels(upd.get("labels", json.loads(task["labels"] or "[]")), named)
+                if a.get("wake_now") is True:
+                    # A spec change alone lets a task asleep on its retry_when sleep on (Daemon._spec_wake):
+                    # this asks the daemon to wake it at once, at its own tier.
+                    prev = load_result(upd.get("result") or task["result"])
+                    asleep = (upd.get("not_before", task["not_before"]) or 0) > time.time()
+                    if upd.get("status", task["status"]) == "queued" and asleep and prev.get("status") == "waiting" \
+                            and str(prev.get("retry_when") or "").strip() and not deferral(task).get("when"):
+                        upd["result"] = dump_result({**prev, "wake_now": True})
+                    else:
+                        notes.append(f"task_update: #{task['id']} wake_now ignored: it is not asleep on a retry_when "
+                                     f"(a start_when deferral wakes by `start_when` \"\"; a blocked task by status queued)")
                 if waits or upd.get("status", "blocked") != "blocked":
                     labels = upd.get("labels")
                     labels = json.loads(task["labels"] or "[]") if labels is None else labels
