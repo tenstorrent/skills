@@ -3389,8 +3389,9 @@ def _checks_cancelled(run_dir: Path) -> str:
 
 def _checks_join_register(p: Project | None, top: str, head: str, todo: list, purpose: str, env: dict,
                           run_dir: Path, arrived: float) -> Path | None:
-    """This run's checkjoin record, for a task's full checks; None without a project or task, or when it
-    cannot be written (the checks then queue as before)."""
+    """This run's checkjoin record, for a task's full checks, keyed on `head`'s tree (any task's same checks
+    on it join one run); None without a project, task or tree, or when it cannot be written (the checks
+    then queue as before)."""
     from . import checkjoin, testslots
     task = os.environ.get("TTP_TASK") or ""
     if not p or not task.isdigit() or not head:
@@ -3404,11 +3405,15 @@ def _checks_join_register(p: Project | None, top: str, head: str, todo: list, pu
         commit_ts = float(r.stdout.strip() or 0)
     except ValueError:
         commit_ts = 0.0
-    cmds = _commands_hash(todo)
+    cmds, repo = _commands_hash(todo), testslots.repo_key(top)
+    r = subprocess.run(["git", "-C", top, "rev-parse", "--verify", "-q", f"{head}^{{tree}}"], capture_output=True,
+                       text=True)
+    if not (tree := r.stdout.strip()):
+        return None
     try:
         return checkjoin.register(p.state, task=task, head=head, commit_ts=commit_ts,
-                                  key=checkjoin.key(task, head, cmds, purpose, envs),
-                                  group=checkjoin.group(task, testslots.repo_key(top), cmds, purpose, envs),
+                                  key=checkjoin.key(repo, tree, cmds, purpose, envs),
+                                  group=checkjoin.group(task, repo, cmds, purpose, envs),
                                   run=run_dir.name, arrived=arrived)
     except OSError:
         return None
@@ -3482,11 +3487,13 @@ def _checks_report_joined(me: Path | None, run_dir: Path, out, joined: tuple, he
                           skipped: list, purpose: str) -> None:
     """Report the outcome of the run this one followed (_checks_follow) as this run's: its checks.json
     names the head that ran and how this run joined, its own record passes the outcome on, and a failure
-    or timeout exits 1. Never a pass of this run's own head when another head ran."""
+    or timeout exits 1. A joined run's outcome is its own head's (the same tree, commands and environment
+    ran); a superseded one's never a pass of its own head."""
     from . import checkjoin, prguard
     how, lead = joined
     o = lead.get("outcome") or {}
     passed, ran = bool(o.get("passed")), str(o.get("head") or "")
+    ran = head if how == checkjoin.JOINED else ran
     checkjoin.finish(me, passed=passed, head=ran, rc=int(o.get("rc") or (0 if passed else 1)),
                      failed=str(o.get("failed") or ""), timed_out=bool(o.get("timed_out")),
                      summary=str(o.get("summary") or ""), log=str(o.get("log") or ""))

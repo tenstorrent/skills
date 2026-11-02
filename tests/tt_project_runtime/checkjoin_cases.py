@@ -22,8 +22,10 @@ def test_checkjoin_target_joins_the_same_checks_supersedes_an_older_head_and_not
     assert cj.target(me, [me, _join_rec("ahead"), run])[0]["id"] == "run"
     # A different command, environment or purpose (another key) and group: never a duplicate.
     assert cj.target(me, [me, _join_rec("other", key="k2", group="g2", phase="running")]) is None
-    # Another task's same key never joins either; a dead or finished run is not joined.
-    assert cj.target(me, [me, _join_rec("t", task="8", key="k", phase="running", group="g8")]) is None
+    # Another task's same key (the same checks on the same tree) is joined too; a dead or finished run is not.
+    other_task = _join_rec("t", task="8", key="k", phase="running", group="g8")
+    assert cj.target(me, [me, other_task]) == (other_task, cj.JOINED)
+    assert cj.target(me, [me, _join_rec("t", task="8", key="k8", phase="running", group="g8")]) is None
     assert cj.target(me, [me, _join_rec("dead", phase="running", alive=False)]) is None
     assert cj.target(me, [me, _join_rec("over", phase="running", outcome={"passed": True})]) is None
     # A newer head (later commit time) of the same task's same checks supersedes this waiter while live,
@@ -43,9 +45,10 @@ def test_checkjoin_target_joins_the_same_checks_supersedes_an_older_head_and_not
         for out in ({"passed": True, "ts": 19.0}, {"passed": False, "ts": "19"}, {"passed": True}):
             gone = _join_rec("new", head="b" * 40, commit_ts=200.0, key="k-b", arrived=1.0, alive=alive, outcome=out)
             assert cj.target(me, [me, gone]) is None, (alive, out)
-    # An older head never supersedes a newer one, nor does another group's newer head.
+    # An older head never supersedes a newer one, nor does another group's (another task's) newer head.
     assert cj.target({**newer, "id": "n2"}, [me, {**newer, "id": "n2"}]) is None
     assert cj.target(me, [me, {**newer, "group": "g2"}]) is None
+    assert cj.target(me, [me, {**newer, "task": "8"}]) is None
 
 
 def test_checkjoin_forget_drops_a_waiting_runs_own_record_before_it_re_executes(tmp_path):
@@ -80,18 +83,33 @@ def test_checkjoin_resolve_follows_the_chain_to_the_run_that_ran():
     assert cj.resolve("mid", [mid]) == ("wait", mid)
 
 
-def test_checkjoin_keys_differ_by_command_head_and_environment(env, tmp_path, monkeypatch):
+def test_checkjoin_keys_are_the_tree_commands_purpose_and_environment_whichever_task_or_head(env, tmp_path,
+                                                                                           monkeypatch):
     from ttp import checkjoin as cj, cli
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     monkeypatch.setenv("TTP_TASK", "7")
-    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    rev = lambda x: subprocess.run([*git, "rev-parse", x], capture_output=True, text=True).stdout.strip()
+    head = rev("HEAD")
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "same tree"], check=True)
+    twin = rev("HEAD")   # another commit of the same tree (a rebase or amend that changed nothing)
+    (repo / "a.txt").write_text("b\n")
+    subprocess.run([*git, "commit", "-qam", "b"], check=True)
+    other = rev("HEAD")
 
-    def rec(cmd, h=head, env_=None):
-        return cj.read(cli._checks_join_register(p, str(repo), h, [cmd], "candidate", env_ or {}, run, 1.0))
+    def rec(cmd, h=head, env_=None, purpose="candidate"):
+        return cj.read(cli._checks_join_register(p, str(repo), h, [cmd], purpose, env_ or {}, run, 1.0))
 
     a, b, c = rec("true"), rec("true"), rec("false")
     assert a["key"] == b["key"] and a["group"] == b["group"] and a["commit_ts"] > 0
     assert c["key"] != a["key"] and c["group"] != a["group"], "a different command is not a duplicate"
+    assert rec("true", twin)["key"] == a["key"], "another head of the same tree runs the same checks"
+    assert rec("true", other)["key"] != a["key"], "another tree is not a duplicate"
+    assert rec("true", purpose="harness")["key"] != a["key"], "another purpose is not a duplicate"
+    assert rec("true", env_={"PYTEST_ADDOPTS": "-x"})["key"] != a["key"], "another environment is not either"
+    monkeypatch.setenv("TTP_TASK", "8")
+    t8 = rec("true")
+    assert t8["key"] == a["key"] and t8["group"] != a["group"], "another task joins, never supersedes"
+    assert cli._checks_join_register(p, str(repo), "f" * 40, ["true"], "candidate", {}, run, 1.0) is None, "no tree"
     monkeypatch.delenv("TTP_TASK")
     assert cli._checks_join_register(p, str(repo), head, ["true"], "candidate", {}, run, 1.0) is None, "no task"
 
@@ -138,6 +156,48 @@ def test_two_identical_queued_checks_of_a_task_run_one_suite_and_both_report_its
     res = json.loads((tmp_path / "run-b" / "checks.json").read_text())
     assert res["passed"] is (rc == 0) and res["joined"]["how"] == "joined" and res["joined"]["run"] == "run-a"
     assert checkjoin.status_lines(p.state) == [], "no follower left"
+
+
+@pytest.mark.parametrize("rc", [0, 3])
+def test_another_tasks_checks_on_the_same_tree_join_the_running_suite_and_only_a_pass_is_reused(env, tmp_path,
+                                                                                                monkeypatch, rc):
+    """A worker's checks run; a reviewer (another task) asks for the same checks on another commit of the same
+    tree: it joins, runs nothing and reports that verdict for its own head. A later request on that tree reuses
+    a pass, naming the run that passed; after a failure it runs again."""
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    count, go = tmp_path / "count", tmp_path / "go"
+    cmd = f"echo x >> {count}; while [ ! -e {go} ]; do {_nap()}; done; exit {rc}"
+    first = _checks_proc(p, repo, tmp_path / "run-a", 7, cmd)
+    second = None
+    try:
+        assert _wait_for(count.exists, 60), "the first run's checks started"
+        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "same tree"], check=True)
+        twin = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        second = _checks_proc(p, repo, tmp_path / "run-b", 8, cmd)
+        from ttp import checkjoin
+        assert _wait_for(lambda: checkjoin.JOINED in _join_phases(p), 60), _join_phases(p)
+        assert any("joined: #8 run run-b" in x and "of #7" in x for x in checkjoin.status_lines(p.state))
+        go.touch()
+        out1, out2 = first.communicate(timeout=120)[0], second.communicate(timeout=120)[0]
+    finally:
+        go.touch()
+        for proc in (first, second):
+            if proc and proc.poll() is None:
+                proc.kill()
+                proc.wait()
+    want = 0 if rc == 0 else 1
+    assert count.read_text().splitlines() == ["x"], "one suite ran"
+    assert first.returncode == want and second.returncode == want, (out1, out2)
+    assert "no second suite ran" in out2 and f"the same tree as {twin[:12]}" in out2, out2
+    res = json.loads((tmp_path / "run-b" / "checks.json").read_text())
+    assert res["head"] == twin and res["passed"] is (rc == 0) and res["joined"]["run"] == "run-a", res
+    third = _checks_proc(p, repo, tmp_path / "run-c", 9, cmd)
+    out3 = third.communicate(timeout=120)[0]
+    assert third.returncode == want, out3
+    if rc == 0:
+        assert count.read_text().splitlines() == ["x"] and "in run run-a at" in out3, "the pass is reused"
+    else:
+        assert count.read_text().splitlines() == ["x", "x"], "a failure is never reused: the checks run again"
 
 
 def test_a_newer_head_does_not_stop_a_running_check_and_a_different_head_is_not_joined(env, tmp_path, monkeypatch):

@@ -1,20 +1,24 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""One suite per task, head and commands: `ttp checks` joins its task's same checks already queued.
+"""One suite per tree and commands: `ttp checks` joins the same checks already queued or running.
 
 Each full `ttp checks` run of a task records itself in the project's state (FOLDER/<id>.json): task,
-head, the commit's time, its key (task, head, commands, purpose and environment), its group (the same
-without the head, plus the repository), pid, arrival and phase (waiting, running, joined, superseded).
-A run that is still waiting looks at the others (target) and stops waiting when
+head, the commit's time, its key (repository, the head's tree, commands, purpose and environment), its
+group (the task, repository, commands, purpose and environment, whatever the head), pid, arrival and
+phase (waiting, running, joined, superseded). A run that is still waiting looks at the others (target)
+and stops waiting when
 
-- the same task's same checks on the same head wait ahead of it or run now: it joins them;
+- the same checks on the same tree wait ahead of it or run now, in any task of the project (a worker's
+  own run, its detached rerun, the daemon's review precheck, a reviewer's run): it joins them;
 - the same task queued the same checks on a newer head (a later commit time) that runs, waits or ended
   while this one waited: it is superseded (a newer head that ended before this run queued is not).
 
 Either way it leaves the queue, follows that run (through any run it joined in turn) and reports that
-run's outcome (finish) as its own: passed, failed or timed out, naming the head that ran, never a pass
-of its own head. A run that has started is never stopped: only waiters look. A different command,
-environment, purpose, repository or task is never a duplicate. When the followed run ends without an
+run's outcome (finish) as its own: passed, failed or timed out. A joined run reports it for its own
+head (the same tree ran), a superseded one names the newer head that ran, never a pass of its own head.
+A run that has started is never stopped: only waiters look. A different tree, command, environment,
+purpose or repository is never a duplicate. A failed outcome is only passed to the runs that joined
+while it ran: a later request for the same key runs again (only passes are recorded and reused). When the followed run ends without an
 outcome (killed, handed over, cancelled), the follower queues again. `ttp checks status` and `ttp status`
 list the followers (status_lines), so they are not taken for lost runs."""
 from __future__ import annotations
@@ -46,9 +50,10 @@ def _digest(*parts) -> str:
     return hashlib.sha256(json.dumps([str(x) for x in parts]).encode()).hexdigest()[:24]
 
 
-def key(task: str, head: str, cmds_hash: str, purpose: str, envs) -> str:
-    """What makes two runs the same checks: task, head, commands, purpose and environment."""
-    return _digest("key", task, head, cmds_hash, purpose, json.dumps(envs or []))
+def key(repo: str, tree: str, cmds_hash: str, purpose: str, envs) -> str:
+    """What makes two runs the same checks, whichever task asks: repository, tree, commands, purpose and
+    environment (pushpass.check_envs: interpreter, dependencies, the variables a check reads)."""
+    return _digest("key", repo, tree, cmds_hash, purpose, json.dumps(envs or []))
 
 
 def group(task: str, repo: str, cmds_hash: str, purpose: str, envs) -> str:
@@ -171,16 +176,17 @@ def target(me: dict, recs: list[dict]) -> tuple[dict, str] | None:
     """(the run this waiting run should follow, joined or superseded), or None to keep waiting.
     Superseded: the same task's group on another head with a later commit time, live now or ended
     while this run waited (never one that ended before it queued: that older head runs its own checks).
-    Joined: the same key, waiting ahead of it or running now (a running one first)."""
+    Joined: the same key (any task's), waiting ahead of it or running now (a running one first)."""
     if not me.get("task"):
         return None
-    others = [r for r in recs if r.get("id") != me.get("id") and r.get("task") == me.get("task")]
+    every = [r for r in recs if r.get("id") != me.get("id")]
+    others = [r for r in every if r.get("task") == me.get("task")]
     newer = [r for r in others if r.get("group") == me.get("group")
              and r.get("head") != me.get("head") and float(r.get("commit_ts") or 0) > float(me.get("commit_ts") or 0)
              and _while_waiting(r, me)]
     if newer:
         return max(newer, key=lambda r: (float(r.get("commit_ts") or 0), _order(r))), SUPERSEDED
-    same = [r for r in others if r.get("key") == me.get("key") and r.get("alive") and not r.get("outcome")
+    same = [r for r in every if r.get("key") == me.get("key") and r.get("alive") and not r.get("outcome")
             and r.get("phase") in (WAITING, RUNNING)]
     if running := [r for r in same if r.get("phase") == RUNNING]:
         return min(running, key=_order), JOINED
@@ -219,16 +225,16 @@ def finish(path: Path | None, *, passed: bool, head: str, rc: int, failed: str =
 
 def said(how: str, mine: str, leader: dict) -> str:
     """The line a follower prints when it stops waiting."""
-    who = f"run {leader.get('run') or '?'} (pid {leader.get('pid')})"
+    who = f"run {leader.get('run') or '?'} of #{leader.get('task') or '?'} (pid {leader.get('pid')})"
     if how == SUPERSEDED:
         return (f"superseded: this task queued the same checks on a newer head {str(leader.get('head'))[:12]} in "
                 f"{who}; these on {mine[:12]} leave the queue unrun and report that run's result")
-    return (f"joined: the same checks of this task on {mine[:12]} {'run' if leader.get('phase') == RUNNING else 'wait'} "
+    return (f"joined: the same checks on the tree of {mine[:12]} {'run' if leader.get('phase') == RUNNING else 'wait'} "
             f"in {who}; waiting for their result instead of running a second suite")
 
 
 def result_line(how: str, mine: str, leader: dict) -> str:
-    """The outcome a follower reports: the run it followed, never a pass of its own head."""
+    """The outcome a follower reports: the run it followed; a superseded one's is never a pass of its own head."""
     o = leader.get("outcome") or {}
     ran = str(o.get("head") or leader.get("head") or "")
     what = ("passed" if o.get("passed") else "TIMED OUT" if o.get("timed_out")
@@ -237,7 +243,8 @@ def result_line(how: str, mine: str, leader: dict) -> str:
     if how == SUPERSEDED:
         base += f"; {mine[:12]} itself was not checked (superseded by that newer head)"
     else:
-        base += " (joined: no second suite ran)"
+        base += (f", the same tree as {mine[:12]}" if ran and not ran.startswith(mine[:12]) else "") + \
+            " (joined: no second suite ran)"
     return base + (f" (full output: {o['log']})" if o.get("log") else "")
 
 
@@ -255,7 +262,8 @@ def status_lines(state: Path, now: float | None = None) -> list[str]:
         waited = max(0.0, now - float(r.get("since") or r.get("ts") or now))
         if r.get("phase") == JOINED:
             out.append(f"  joined: {who} on {str(r.get('head'))[:12]} follows run {lead.get('run') or '?'} "
-                       f"(same head and commands, {lead.get('phase') or 'ended'}), {int(waited // 60)} min; "
+                       f"of #{lead.get('task') or '?'} (same tree and commands, {lead.get('phase') or 'ended'}), "
+                       f"{int(waited // 60)} min; "
                        f"no second suite runs")
         else:
             out.append(f"  superseded: {who} on {str(r.get('head'))[:12]} by newer head "
