@@ -112,6 +112,107 @@ def test_a_failed_slack_send_shows_until_the_next_good_one(env, monkeypatch):
     assert web.state_payload(p, p.db)["notify"]["slack"]["state"] == "on"
 
 
+class _CrashySlackDM:
+    """A Slack DM at the urlopen level that keeps what was posted and returns it from
+    conversations.history/replies as Slack does (& < > escaped). `crash_after_post` makes the next
+    chat.postMessage post and then raise SystemExit, as a daemon killed right after posting."""
+
+    def __init__(self):
+        self.posts: list[dict] = []
+        self.crash_after_post = False
+
+    def sent(self, bot="B1"):
+        return [m["text"] for m in self.posts if m["bot_id"] == bot]
+
+    def __call__(self, req, timeout=None):
+        import io
+        import urllib.parse
+        method = req.full_url.rsplit("/", 1)[-1]
+        params = {k: v[0] for k, v in urllib.parse.parse_qs(req.data.decode(), keep_blank_values=True).items()}
+        if method == "chat.postMessage":
+            ts = f"{time.time() + len(self.posts) * 1e-3:.6f}"
+            esc = params["text"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            self.posts.append({"ts": ts, "bot_id": "B1", "text": esc,
+                               **({"thread_ts": params["thread_ts"]} if params.get("thread_ts") else {})})
+            if self.crash_after_post:
+                self.crash_after_post = False
+                raise SystemExit("killed after the post")
+            body = {"ok": True, "ts": ts}
+        elif method in ("conversations.history", "conversations.replies"):
+            thread = params.get("ts") if method == "conversations.replies" else None
+            body = {"ok": True, "messages": [m for m in self.posts if float(m["ts"]) >= float(params["oldest"])
+                                             and m.get("thread_ts") == thread]}
+        else:
+            body = {"auth.test": {"ok": True, "bot_id": "B1"},
+                    "conversations.open": {"ok": True, "channel": {"id": "D1"}}}.get(method, {"ok": True})
+        return io.BytesIO(json.dumps(body).encode())
+
+
+def test_slack_outbound_posts_each_message_once_when_killed_after_the_post(env, monkeypatch):
+    """A daemon killed between a Slack post and recording it finds the post in the DM on restart and
+    records it instead of posting again; killed right after the record's commit, it skips the row; a
+    marker with no post behind it (killed before posting) still posts. Each message reaches Slack once,
+    top-level or in a thread, and another bot's post of the same text does not count."""
+    from ttp.daemon import SLACK_SENDING_KEY, Daemon
+    from ttp.slack import Slack
+    dm = _CrashySlackDM()
+    p, d = slack_daemon(env, monkeypatch, dm)
+
+    def restarted():
+        d = Daemon(p.base)
+        d._slack = Slack("test-bot-token", user_id="U1")
+        d.slack = lambda: d._slack
+        return d
+
+    p.db.post("in", "hi", chat="slack", channel="slack", kind="user", ref="9.0")
+    top = p.db.post("out", "PR <ready> & green", severity="high")
+    reply = p.db.post("out", "a  reply", chat="slack", ref="9.0")
+    dm.posts.append({"ts": f"{time.time() - 1:.6f}", "bot_id": "B2", "text": f"[{p.name}] PR &lt;ready&gt; &amp; green"})
+    for mid in (top, reply):                    # killed after the post, before its bookkeeping
+        dm.crash_after_post = True
+        with pytest.raises(SystemExit):
+            d.deliver_outbound()
+        assert p.db.kv(SLACK_SENDING_KEY)["id"] == mid
+        assert not p.db.one("SELECT ext_id FROM messages WHERE id=?", (mid,))["ext_id"]
+        d = restarted()
+    d.deliver_outbound()
+    assert dm.sent() == [f"[{p.name}] PR &lt;ready&gt; &amp; green", "a  reply"]
+    rows = {r["id"]: r["ext_id"] for r in p.db.q("SELECT id, ext_id FROM messages WHERE id IN (?, ?)", (top, reply))}
+    assert rows == {top: dm.posts[1]["ts"], reply: dm.posts[2]["ts"]} and dm.posts[2]["thread_ts"] == "9.0"
+    assert int(p.db.kv("slack_last_out", 0)) == reply and not p.db.kv(SLACK_SENDING_KEY)
+    assert set(rows.values()) <= set(p.db.kv("slack_threads", []))
+
+    # Killed right after the commit that records the post: the restart moves on without posting.
+    after = p.db.post("out", "after the commit", chat="slack", ref="9.0")
+
+    class KillOnPop(dict):
+        def pop(self, *a):
+            raise SystemExit("killed after the commit")
+    d._slack_rejects = KillOnPop()
+    with pytest.raises(SystemExit):
+        d.deliver_outbound()
+    assert int(p.db.kv("slack_last_out", 0)) == after
+    p.db.set_kv("slack_last_out", reply)       # a cursor left behind a recorded row (an older daemon)
+    d = restarted()
+    d.deliver_outbound()
+    assert dm.sent().count("after the commit") == 1 and int(p.db.kv("slack_last_out", 0)) == after
+
+    # Killed after setting the marker but before posting: the restart finds nothing and posts once, even
+    # with the same text posted and recorded just before (another message's post).
+    last = p.db.post("out", "never posted", chat="slack", ref="9.0")
+    p.db.set_kv(SLACK_SENDING_KEY, {"id": last, "t": time.time()})
+    d = restarted()
+    d.deliver_outbound()
+    d.deliver_outbound()
+    assert dm.sent().count("never posted") == 1 and int(p.db.kv("slack_last_out", 0)) == last
+    again = p.db.post("out", "never posted", chat="slack", ref="9.0")
+    p.db.set_kv(SLACK_SENDING_KEY, {"id": again, "t": time.time()})
+    d = restarted()
+    d.deliver_outbound()
+    assert dm.sent().count("never posted") == 2 and int(p.db.kv("slack_last_out", 0)) == again
+    assert p.db.one("SELECT ext_id FROM messages WHERE id=?", (again,))["ext_id"] == dm.posts[-1]["ts"]
+
+
 @needs_sockets
 def test_web_notify_test_endpoint_returns_the_notification_and_the_slack_outcome(env, monkeypatch):
     p = make(env)

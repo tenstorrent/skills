@@ -3849,6 +3849,8 @@ class FakeSlackHTTP:
         params = urllib.parse.parse_qs(req.data.decode(), keep_blank_values=True)
         if method == "conversations.open":
             body = {"ok": True, "channel": {"id": "D1"}}
+        elif method != "chat.postMessage":     # a read (history before a repost): nothing to find
+            body = {"ok": True, "messages": []}
         else:
             text = params["text"][0]
             why = self.fail(text)

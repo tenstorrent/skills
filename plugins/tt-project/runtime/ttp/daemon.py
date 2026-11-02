@@ -370,6 +370,7 @@ EXEC_SETTLE_S = 2.0
 LEASE_HUNG_S = 600
 BACKSTOP_SLACK_S = 600
 SLACK_ERROR_KEY = "slack_error"   # kv: {ts, error} of the last failed Slack send; None after a good one
+SLACK_SENDING_KEY = "slack_sending"   # kv: {id, t} of the message being posted to Slack; None once recorded
 HUNG_STOPS = ("hung", "overdue", "supervisor_error")   # a broken supervisor's ends: they count as a stall
 HANDOFF_STATES = ("done", "blocked", "failed", "needs_review", "waiting")
 SLEEP_CUT = ("timeout", "stalled", "lost", "failed")   # ends a host sleep can cause
@@ -13212,6 +13213,9 @@ class Daemon:
         # Only an ask that reached Slack can back a PR approval (prguard), so those go whatever their severity.
         approval_asks = {prguard.BLOCKING_REF + r for r in prguard.APPROVING_REASONS}
         for m in rows:
+            if m["ext_id"]:   # posted and recorded already
+                db.set_kv("slack_last_out", m["id"])
+                continue
             wanted = SEVERITY_RANK.get(m["severity"], 1) >= floor or (m["kind"] == "ask" and m["ref"] in approval_asks)
             to_slack = ((m["chat"] is None and wanted and m["kind"] != "info"
                          and m["channel"] != alerts.QUIET and not cleared(db, m, time.time()))
@@ -13219,17 +13223,32 @@ class Daemon:
             if to_slack:
                 try:
                     thread = m["ref"] if m["chat"] == "slack" else None
-                    ts = sl.post(self.p.name, m["text"], thread_ts=thread)
-                    with db.tx():   # the post's ts: pr_approve reads an ask back from Slack by it
+                    sending = db.kv(SLACK_SENDING_KEY) or {}
+                    ts = None
+                    if sending.get("id") == m["id"]:
+                        # An earlier try may have posted it and died before recording it: look first.
+                        ts = sl.find_post(self.p.name, m["text"], thread_ts=thread, since=float(sending["t"]),
+                                          known=set(db.kv("slack_threads", [])))
+                    else:
+                        db.set_kv(SLACK_SENDING_KEY, {"id": m["id"], "t": time.time()})
+                    if not ts:
+                        ts = sl.post(self.p.name, m["text"], thread_ts=thread)
+                    with db.tx():   # the post's ts (pr_approve reads an ask back from Slack by it) and the cursor
                         db.x("UPDATE messages SET ext_id=? WHERE id=?", (ts, m["id"]))
                         threads = set(db.kv("slack_threads", []))
                         threads.add(ts)
                         db.set_kv("slack_threads", sorted(threads)[-500:])
                         if db.kv(SLACK_ERROR_KEY):
                             db.set_kv(SLACK_ERROR_KEY, None)
+                        db.set_kv("slack_last_out", m["id"])
+                        db.set_kv(SLACK_SENDING_KEY, None)
+                    self._slack_rejects.pop(m["id"], None)
+                    continue
                 except Exception as e:
                     log(self.p, f"slack post failed: {e}")
                     db.set_kv(SLACK_ERROR_KEY, {"ts": time.time(), "error": str(e)[:300]})   # shown in the web app
+                    if sl.not_posted(e):
+                        db.set_kv(SLACK_SENDING_KEY, None)
                     if not sl.rejected_message(e):
                         return
                     tries = self._slack_rejects[m["id"]] = self._slack_rejects.get(m["id"], 0) + 1

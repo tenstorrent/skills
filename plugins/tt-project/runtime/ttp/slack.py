@@ -89,16 +89,44 @@ class Slack:
             self._dm = self.call("conversations.open", users=self.resolve_user())["channel"]["id"]
         return self._dm
 
-    def post(self, project: str, text: str, thread_ts: str | None = None) -> str:
+    @staticmethod
+    def _body(project: str, text: str, thread_ts: str | None) -> str:
         from .redact import scrub
-        body = scrub(text if thread_ts else f"[{project}] {text}")
-        return self.call("chat.postMessage", channel=self.dm_channel(), text=body[:39000],
+        return scrub(text if thread_ts else f"[{project}] {text}")[:39000]
+
+    def post(self, project: str, text: str, thread_ts: str | None = None) -> str:
+        return self.call("chat.postMessage", channel=self.dm_channel(), text=self._body(project, text, thread_ts),
                          thread_ts=thread_ts, unfurl_links=False)["ts"]
+
+    def find_post(self, project: str, text: str, thread_ts: str | None = None, since: float = 0.0,
+                  known: Any = ()) -> str | None:
+        """The ts of this bot's post of `text`, as post() sends it, from `since` on (a minute's slack for
+        clock skew) and not in `known` (posts already recorded); None if there is none. A sender that died
+        between a post and recording it looks here before posting again."""
+        from .prguard import _slack_plain
+        want = " ".join(self._body(project, text, thread_ts).split())
+        oldest = f"{since - 60:.6f}"
+        if thread_ts:
+            msgs = self._pages("conversations.replies", channel=self.dm_channel(), ts=thread_ts, oldest=oldest)
+        else:
+            msgs = self._pages("conversations.history", channel=self.dm_channel(), oldest=oldest)
+        bot = self.bot_id()
+        for m in sorted(msgs, key=lambda m: float(m["ts"])):
+            if (m.get("bot_id") and m.get("bot_id") == bot and m["ts"] != thread_ts and m["ts"] not in known
+                    and want in (" ".join(t.split()) for t in _slack_plain(m.get("text") or ""))):
+                return m["ts"]
+        return None
 
     @staticmethod
     def rejected_message(e: Exception) -> bool:
         """Whether Slack refused this particular message, as opposed to being unreachable."""
         return isinstance(e, SlackError) and e.method == "chat.postMessage" and e.code in REJECTED_MESSAGE
+
+    @staticmethod
+    def not_posted(e: Exception) -> bool:
+        """Whether a failed post surely posted nothing: Slack answered it with ok=false. A network or
+        HTTP error leaves that open (the post may have gone through before the answer was lost)."""
+        return isinstance(e, SlackError) and e.method == "chat.postMessage" and e.code is not None
 
     def poll(self, oldest: str) -> tuple[list[dict], list[dict]]:
         """Top-level messages the user wrote in the DM after `oldest`, oldest first, and every post
