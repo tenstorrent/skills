@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import budget as bud, locks
-from . import ackwait, anchors, askauto, askrethink, broadcast, budgetkind, cachettl, causefix, cells, chaincap, convgate, chainprio, chatset, checkspill, correction, course, credits, deploy, echoes, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, rejcool, relay, responsibilities, restriction_audit, restriction_source, reviewcap, selfreview, reviewreuse, settinghold, settled, shared, sharedchecks, startbreaker, sweep, throughmute, timefmt, tried, unblock, unstarted, upstream, verified, watchdup, worktree
+from . import ackwait, anchors, askauto, askrethink, broadcast, budgetkind, cachettl, causefix, cells, chaincap, convgate, chainprio, chatset, checkspill, correction, course, coursecheck, credits, deploy, echoes, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, rejcool, relay, responsibilities, restriction_audit, restriction_source, reviewcap, selfreview, reviewreuse, settinghold, settled, shared, sharedchecks, startbreaker, sweep, throughmute, timefmt, tried, unblock, unstarted, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -970,6 +970,11 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("coverage", responsibilities.digest_lines(db))
     section("blocker_sweep", sweep.digest_lines(db, event_ids, now, p.config()))
     course_lines, course_id = course.digest_lines(db, p.config(), now)
+    from .daemon import log   # daemon imports this module
+    own, own_id = coursecheck.lines(db, p.config(), p.state / push.DETACHED, now, lambda m: log(p, m))
+    if own:
+        course_lines = (course_lines or [course.HEADER]) + own
+        course_id += "\n" + own_id
     if missed := correction.digest_lines(db, now):
         course_lines = (course_lines or [course.HEADER]) + missed
         course_id += "\ncorrection:" + missed[0].split(" pointed out")[0]

@@ -342,6 +342,13 @@ The project runs unattended. The user reads what you decided; they do not approv
   of options: free window resets and paid credits are an unblock path the daemon uses itself.
 - Each `Course check` or `Progress` line: correct course this turn (re-plan, re-point the probe,
   cancel, route around, scope down, a harness task) or say in `summary` why it is fine; pass it to the user only if only they can clear it.
+- Self-review, each turn: on a Course check line, or what your own review finds (a deadline missed
+  twice, the same blocker waited on across turns, a race with the project's own schedules, commits
+  or locks, your reading of a rule blocking a newer user goal, a corrected mistake back again), fix
+  the cause in this turn (`task_add`, `schedule_set`, `config_set`, `task_update`) and name the fix
+  in `summary`; another status line is no answer. A race with the project's own commits is fixed by
+  removing its cause (carry the verdict across commits that cannot affect it, serialize or schedule
+  the self-inflicted writer), never by re-running the gate.
 - A `likely correction` message: fix that case and add a `harness` task for its class, naming the
   detector or default that would have caught it (a tt-project gap: an `upstream:` task), or say
   `correction #<id>: <why not>` in `summary`. A user message correcting a fact we stated (status,
