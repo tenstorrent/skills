@@ -13322,7 +13322,7 @@ class Daemon:
         # A stack kept off the push branch stays review only through its fix and re-review.
         only = push.REVIEW_ONLY_LABEL in push._labels(review) + push._labels(first)
         tier, tsrc = effort.fix_tier(db, code, review, fups)   # db.add_task: a fix never runs light
-        rtier = "deep" if review["tier"] == "deep" else "standard"   # _size_review sizes it by its fix delta
+        rtier = "deep" if review["tier"] == "deep" else "standard"   # a re-review never runs light
         found = "\n".join(f"{n}. {str(f['title'])[:200]}: {coord.clip(f.get('spec'), FOLLOWUP_SPEC_CHARS)}"
                           for n, f in enumerate(fups, 1))
         # An open fix of the PR's findings (pr_findings_owner) on this stack takes these findings too:
