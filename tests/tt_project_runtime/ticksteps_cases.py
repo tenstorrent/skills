@@ -828,6 +828,67 @@ def test_a_stop_during_a_slow_step_skips_the_rest_of_the_tick_and_stops_cleanly(
     assert d._wake is None, "the wake pipe is closed at the stop"
 
 
+def test_outbound_skipped_by_a_stop_during_dispatch_is_delivered_once_after_the_restart(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """A stop that arrives while dispatch starts a task skips relay_when_blocked and deliver_outbound
+    for that tick. The next daemon delivers the skipped message exactly once, and the half-done
+    dispatch leaves no task claimed (running) without a run."""
+    import signal as sig
+    from ttp import daemon as dm
+    fake = FakeSlackHTTP(lambda text: None)
+    p, d = slack_daemon(env, monkeypatch, fake)
+    _no_events(p)
+    p.db.x("UPDATE tasks SET status='done'")
+    gate = tmp_path / "release-runs"
+    monkeypatch.setenv("TTP_FAKE_SHELL", f'while [ ! -e "{gate}" ]; do sleep 0.05; done')
+    tasks = [p.db.add_task(f"work {i}", "s", kind="work", tier="light", origin="user") for i in (1, 2)]
+    msg = p.db.post("out", "the skipped alert", kind="alert", severity="high")
+    real_workdir, starts = d._workdir_for, []
+
+    def workdir_then_stop(task):   # SIGTERM lands as dispatch prepares its first task
+        starts.append(task["id"])
+        if len(starts) == 1:
+            d._on_stop_signal(sig.SIGTERM)
+        return real_workdir(task)
+    monkeypatch.setattr(d, "_workdir_for", workdir_then_stop)
+
+    def claimed_unstarted():
+        return [t["id"] for t in p.db.q(
+            "SELECT id FROM tasks WHERE status='running' AND NOT EXISTS "
+            "(SELECT 1 FROM runs WHERE runs.task=tasks.id AND runs.status='running')")]
+    try:
+        d.tick()
+        assert sorted(starts) == sorted(tasks) and d.stopping   # a running step finishes what it began
+        assert "relay_when_blocked" in d._stop_skipped and "deliver_outbound" in d._stop_skipped
+        assert "dispatch" not in d._stop_skipped
+        assert fake.delivered == [], "a stopped tick posted nothing"
+        assert int(p.db.kv("slack_last_out", 0)) < msg
+        assert claimed_unstarted() == [], "the stop left a task claimed with no run"
+        for tid in tasks:   # each task is queued untouched or started with its run
+            assert p.db.task(tid)["status"] in ("queued", "running")
+        _close_daemon_lock(d)
+        # The restart: a new daemon on the same state, and its first ticks.
+        d2 = dm.Daemon(p.base)
+        d2._slack = d._slack
+        d2.slack = lambda: d2._slack
+        d2.tick()
+        d2.tick()
+        assert fake.delivered.count("[demo] the skipped alert") == 1, fake.delivered
+        assert int(p.db.kv("slack_last_out", 0)) >= msg
+        assert p.db.one("SELECT ext_id FROM messages WHERE id=?", (msg,))["ext_id"]
+        assert claimed_unstarted() == []
+    finally:
+        gate.touch()
+        deadline = time.monotonic() + 30
+        for daemon in (d, locals().get("d2")):
+            while daemon and p.db.q("SELECT id FROM runs WHERE role!='coordinator' AND status='running'") \
+                    and time.monotonic() < deadline:
+                daemon.reap_runs()
+                time.sleep(0.05)
+        if "d2" in locals():
+            _close_daemon_lock(d2)
+
+
 def test_a_stop_during_the_between_tick_wait_ends_it_at_once(env, monkeypatch):
     import signal as sig
     from ttp import daemon as dm, service, web
