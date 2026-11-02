@@ -1740,7 +1740,7 @@ def test_every_checks_key_the_runtime_reads_is_an_account_key_and_settable(env):
     read = set(re.findall(r'["\']checks\.([a-z_]+)["\']', src))
     for kind in (testslots.TESTS, testslots.BUILDS):
         read |= {kind.setting(s)[1] for s in ("pool", "run_max", "project_max")}
-    read -= {"dropped", "json", "log", "out", "pid", "queued", "rc"}   # file names (checks.json), not keys
+    read -= {"dropped", "json", "log", "out", "pid", "queued", "rc", "stalled"}   # file names (checks.json), not keys
     # project-only: the project's own lock or queue wrapper, set by the user per project
     read -= {"wrap_cmd", "wrap_lane"}
     # a chat-only alias of checks.slots (coordinator.ALIASES), not a key the runtime reads
@@ -5106,3 +5106,114 @@ def test_cancelling_a_task_whose_checks_group_already_ended_is_no_error(env, tmp
     r = jobstop.end_cancelled_checks(p, tid, "test")
     assert time.monotonic() - began < jobstop.FREE_WAIT_S + 1
     assert len(r) == 1 and "already ended" in r[0]["text"], r
+
+
+def test_checks_stall_threshold_scales_with_the_checks_median_never_under_15_min_and_reads_cpu_with_slack():
+    from ttp import checkstall
+    assert checkstall.stall_s({}, {}) == 900 == checkstall.STALL_MIN_S
+    assert checkstall.stall_s({}, {"cost": {"est_s": 300}}) == 900, "a short check: the floor"
+    assert checkstall.stall_s({}, {"cost": {"est_s": 1800}}) == 1800, "a long check: one usual run"
+    assert checkstall.stall_s({"checks": {"stall_s": 60}}, {"cost": {"est_s": 1800}}) == 60, "checks.stall_s sets it"
+    assert checkstall.stall_s({"checks": {"stall_s": 0}}, {}) == 0, "0 turns it off"
+    assert checkstall.stall_s({"checks": {"stall_s": "x"}}, {}) == 900
+    mark = {"cpu": 10.0, "at": 1000.0}
+    assert checkstall.read_cpu(mark, 10.4, 1010.0) is mark, "under the slack: still idle since 1000"
+    assert checkstall.read_cpu(mark, 18.0, 1900.0) is mark, "under 1% of one core over 900 s: idle"
+    assert checkstall.read_cpu(mark, 20.0, 1900.0) == {"cpu": 20.0, "at": 1900.0}, "it used CPU: moved"
+    assert checkstall.read_cpu(mark, 5.0, 1900.0) == {"cpu": 5.0, "at": 1900.0}, "a smaller reading: a new tree"
+    assert checkstall.read_cpu(mark, None, 1900.0) == {"cpu": None, "at": 1900.0}, "unreadable: counts as moving"
+    assert checkstall.read_cpu(None, 3.0, 50.0) == {"cpu": 3.0, "at": 50.0}
+
+
+def test_daemon_marks_a_silent_checks_run_stalled_once_and_stops_it_only_when_its_processes_are_idle_too(
+        env, tmp_path, monkeypatch, capsys):
+    # Injected clock and CPU readings; the lane label comes from the real writers (suite_hold, suite_running).
+    from ttp import checklane, checkstall, cli, jobstop, testslots
+    from ttp.daemon import Daemon
+    from ttp.runner import proc_start
+    p = make(env)
+    _lane_env(monkeypatch)
+    run = tmp_path / "run"
+    run.mkdir()
+    log = run / "checks.log"
+    log.write_text("$ pytest -q\n")
+    me = os.getpid()
+    (run / cli.CHECKS_PID).write_text(json.dumps({"pid": me, "started": proc_start(me)}))
+    monkeypatch.setenv("TTP_TASK", "12")
+    g = testslots.suite_hold(p.name, repo=_LANE_REPO, slots=1, priority=2, name="alpha")
+    testslots.suite_running(g, 3600, str(log))
+    monkeypatch.delenv("TTP_TASK")
+    stops, cpu = [], {"v": 10.0}
+    monkeypatch.setattr(jobstop, "end_checks", lambda p, rd, why, task: stops.append((rd, why, task)) or {"text": "stopped"})
+
+    def tick(at, d=None):
+        (d or daemon).check_checks_stall(every_s=0, now=at, cpu=lambda pid: cpu["v"])
+
+    def events():
+        return p.db.q("SELECT status, text FROM events WHERE kind=?", (checkstall.EVENT,))
+
+    try:
+        [rec] = checkstall.holders(p.name)
+        assert rec["log"] == str(log) and rec["pid"] == me
+        t0 = float(rec["run_since"])
+        os.utime(log, (t0, t0))
+        daemon = Daemon(p.base)
+        tick(t0 + 300)
+        with log.open("a") as f:
+            f.write("tests/a.py ....\n")
+        os.utime(log, (t0 + 1000, t0 + 1000))
+        tick(t0 + 1800)   # CPU flat for 1500 s, but the log grew 800 s ago: slow, never touched
+        assert not events() and not stops and "STALLED" not in checklane.holder_text(rec, t0 + 1800, p.config())
+
+        cpu["v"] = 200.0   # its processes still work
+        tick(t0 + 1960)
+        cpu["v"] = 400.0
+        tick(t0 + 2020)
+        [ev] = events()
+        assert ev["status"] == "handled" and "Checks run stalled" in ev["text"] and "#12" in ev["text"], ev
+        assert "has not grown for 16 min (threshold 15 min, checks.stall_s), its processes still use CPU" in ev["text"]
+        assert not stops, "a stalled log with a busy tree is left to the wall-time cap"
+        now = t0 + 2020
+        assert "STALLED: its log has not grown for 18 min" in checklane.holder_text(rec, now + 60, p.config())
+        assert any("STALLED" in ln for ln in checklane.lane_lines(p.name, p.config(), now)), "the lane wait lines"
+        assert "STALLED" in checklane.status_text(p.name, p.config(), now=now), "`ttp checks status`"
+        assert cli._checks_result(run) == 1
+        out = capsys.readouterr().out
+        assert "running (pid" in out and "stalled: the log had not grown" in out and "left running" in out, out
+
+        daemon = Daemon(p.base)   # a restart keeps each run's CPU clock (kv)
+        assert checkstall.key(rec) in p.db.kv_dict(checkstall.KV)[0]
+        tick(t0 + 2020 + 600)
+        assert not stops, "idle 600 s of a 900 s threshold"
+        (run / cli.CHECKS_PID).write_text(json.dumps({"pid": me + 1, "started": "x"}))
+        tick(t0 + 2020 + 900)
+        assert not stops, "checks.pid names another run: never stopped"
+        (run / cli.CHECKS_PID).write_text(json.dumps({"pid": me, "started": proc_start(me)}))
+        tick(t0 + 2020 + 960)
+        [(rd, why, task)] = stops
+        assert rd == run and task == 12 and why.startswith("stalled: its log had not grown"), why
+        assert len(events()) == 1, "one event per stall, not one per tick"
+        assert json.loads((run / checkstall.MARKER).read_text())["stopped"] is True
+        (run / cli.CHECKS_RC).write_text("143\n")
+        assert cli._checks_result(run) == 0
+        out = capsys.readouterr().out
+        assert "finished with exit code 143" in out and "reason stalled, retryable), never a pass" in out, out
+        (run / cli.CHECKS_RC).write_text("0\n")
+        cli._checks_result(run)
+        assert "stalled" not in capsys.readouterr().out, "a pass that beat the stop stays a pass"
+        (run / cli.CHECKS_RC).unlink()
+
+        with log.open("a") as f:   # it moved again: a new episode, a new event
+            f.write("tests/b.py ....\n")
+        os.utime(log, (t0 + 5000, t0 + 5000))
+        cpu["v"] = 900.0
+        tick(t0 + 5950)
+        assert len(events()) == 2 and len(stops) == 1
+
+        p.set_config("checks.stall_s", 0)
+        with log.open("a") as f:
+            f.write("tests/c.py ....\n")
+        tick(t0 + 99999, Daemon(p.base))
+        assert len(events()) == 2 and len(stops) == 1, "checks.stall_s 0 turns it off"
+    finally:
+        g.close()

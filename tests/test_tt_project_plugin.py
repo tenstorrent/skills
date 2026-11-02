@@ -9,6 +9,7 @@ import pathlib
 import re
 import shlex
 import sys
+import types
 
 import pytest
 import yaml
@@ -1294,6 +1295,56 @@ def test_a_run_holding_a_test_slot_grant_starts_one_worker_per_slot_never_more()
     # A worker's shell carries one run's share (testslots.worker_env) but holds no slots: the local default.
     assert c._auto_jobs(64, {"TTP_TEST_SLOTS": "8"}) == 4
     assert c._auto_jobs(64, {"TTP_TEST_SLOTS": "x", "TTP_TEST_SLOTS_HELD": "8"}) == 4
+
+
+class _IniConfig:
+    def __init__(self, timeout=0.0, fd=7):
+        self.timeout, self._ttp_dump_fd = timeout, fd
+
+    def getini(self, name):
+        assert name == "faulthandler_timeout"
+        return self.timeout
+
+
+def test_a_hung_tt_project_test_dumps_its_stacks_after_a_generous_timeout_and_other_plugins_tests_do_not():
+    # Only tt-project test files arm the dump; pytest's own faulthandler_timeout, when set, wins; 0 turns it off.
+    c = _test_conftest()
+    assert c.STACK_DUMP_S >= 300, "far above the slowest test call"
+    silent = float(re.search(r"^SILENT_S\s*=\s*([0-9.]+)", (RUNTIME / "checkwall.py").read_text(), re.M)[1])
+    assert c.STACK_DUMP_S < silent, "dumped before `ttp checks`' silence limit ends the run"
+    cfg = _IniConfig()
+    assert c.stack_dump_s(cfg, "tests/test_tt_project_runtime.py", {}) == c.STACK_DUMP_S
+    assert c.stack_dump_s(cfg, "tests/test_tt_project_plugin.py", {}) == c.STACK_DUMP_S
+    for other in ("tests/test_tt_buddy_plugin.py", "tests/test_plugin_catalogue.py", "tests/test_model_bringup.py"):
+        assert c.stack_dump_s(cfg, other, {}) == 0
+    assert c.stack_dump_s(cfg, "tests/test_tt_project_runtime.py", {"TTP_TEST_STACK_DUMP_S": "0"}) == 0
+    assert c.stack_dump_s(cfg, "tests/test_tt_project_runtime.py", {"TTP_TEST_STACK_DUMP_S": "30"}) == 30
+    assert c.stack_dump_s(cfg, "tests/test_tt_project_runtime.py", {"TTP_TEST_STACK_DUMP_S": "x"}) == c.STACK_DUMP_S
+    assert c.stack_dump_s(_IniConfig(timeout="60"), "tests/test_tt_project_runtime.py", {}) == 0
+
+
+def test_the_stack_dump_is_armed_around_a_tt_project_test_and_cancelled_after_it_never_killing(monkeypatch):
+    import faulthandler
+    c = _test_conftest()
+    calls = []
+    monkeypatch.setattr(faulthandler, "dump_traceback_later", lambda t, **kw: calls.append(("arm", t, kw)))
+    monkeypatch.setattr(faulthandler, "cancel_dump_traceback_later", lambda: calls.append(("cancel",)))
+    monkeypatch.delenv("TTP_TEST_STACK_DUMP_S", raising=False)
+
+    def run(path, fd=7):
+        item = types.SimpleNamespace(config=_IniConfig(fd=fd), path=pathlib.Path(path))
+        gen = c.pytest_runtest_protocol(item, None)
+        next(gen)
+        armed = list(calls)
+        with pytest.raises(StopIteration):
+            next(gen)
+        return armed
+
+    assert run("tests/test_tt_project_runtime.py") == [("arm", c.STACK_DUMP_S, {"exit": False, "file": 7})]
+    assert calls[-1] == ("cancel",)
+    calls.clear()
+    assert run("tests/test_tt_buddy_plugin.py") == [] and calls == [], "another plugin's test is untouched"
+    assert run("tests/test_tt_project_runtime.py", fd=None) == [] and calls == [], "no stderr copy: nothing armed"
 
 
 def _version(text):

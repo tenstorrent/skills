@@ -3258,7 +3258,7 @@ def cmd_checks(a) -> None:
                 wall, wall_how = checkwall.cap(p)
                 ran_since, ran_cpu = time.time(), checkcap.child_cpu_s()
                 deadline = ran_since + wall if wall > 0 else None
-                testslots.suite_running(getattr(slot, "suite", None), wall)
+                testslots.suite_running(getattr(slot, "suite", None), wall, str(log))
                 if p and (last := checkwall.last_timeout(p.state, os.environ.get("TTP_TASK"))):
                     said_last = (f"this task's last checks run (run {last.get('run') or '?'} on "
                                  f"{str(last.get('head') or '')[:12]}) was stopped "
@@ -4845,6 +4845,9 @@ def _checks_result(run_dir: Path) -> int:
                   + (checkcap.line() or "they start once one is free"))
         else:
             print(f"ttp checks: running (pid {info['pid']})")
+        from . import checkstall
+        if stall := checkstall.marker(run_dir, info.get("pid")):
+            print(f"ttp checks: {checkstall.line(stall)}")
         return 1
     if rc_file.exists() and rc_file.read_text().strip() == "75" and (fault := envfault.marker_open(run_dir)):
         # Stopped at a runner the host lacks: asleep until it is back, then the task runs them again.
@@ -4867,6 +4870,10 @@ def _checks_result(run_dir: Path) -> int:
         durable_write(rc_file, "killed\n")
         print(f"ttp checks: the detached checks (pid {info.get('pid')}) ended without an exit code: something "
               "killed them; run `ttp checks --detach` again")
+    from . import checkstall
+    if (stall := checkstall.marker(run_dir, info.get("pid"))) and stall.get("stopped") \
+            and not (rc_file.exists() and rc_file.read_text().strip() == "0"):   # a pass that beat the stop stays one
+        print(f"ttp checks: {checkstall.line(stall)}")
     try:
         tail = (run_dir / CHECKS_OUT).read_text(errors="replace").splitlines()[-20:]
     except OSError:

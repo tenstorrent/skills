@@ -715,7 +715,7 @@ def _kids(n: int | None, running: bool) -> str:
     return f"{n} child process{'es' if n > 1 else ''} alive"
 
 
-def holder_text(rec: dict, now: float) -> str:
+def holder_text(rec: dict, now: float, cfg: dict | None = None) -> str:
     """"#12 'pytest -q' queued 3 h 0 min, running 14 min, 4 child processes alive" for a waiter's line:
     the holder's queue age and its run time from the pytest start shown apart (holder_times), so a holder
     whose check sat queued for hours does not read as a frozen 'running 0 min'."""
@@ -727,7 +727,14 @@ def holder_text(rec: dict, now: float) -> str:
            + (f" (waiting for {rec['waits']})" if rec.get("waits") else ""))
     over = " (priority-1 run in the urgent extra lane over the lane cap)" if rec.get("urgent") else ""
     return (f"{who}{f' {cmd!r}' if cmd else ''}{over} queued {mins(t['queued_s'])}, {run}, "
-            f"{_kids(t['children'], t['running_s'] is not None)}")
+            f"{_kids(t['children'], t['running_s'] is not None)}{_stalled(rec, now, cfg)}")
+
+
+def _stalled(rec: dict, now: float, cfg: dict | None = None) -> str:
+    """", STALLED: its log has not grown for ..." for a running holder whose log stopped growing (checkstall)."""
+    from . import checkstall
+    v = checkstall.view(rec, now, cfg)
+    return f", {checkstall.text(v)}" if v and v["stalled"] else ""
 
 
 def _ticket_task(t: Path) -> str:
@@ -776,7 +783,7 @@ def long_wait_lines(project_name: str, cfg: dict | None, now: float | None = Non
     now = time.time() if now is None else now
     out = []
     for w in waits(project_name, cfg, now, over_s):
-        held = "; ".join(holder_text(h, now) for h in w["holders"][:3]) or "lanes free, about to start"
+        held = "; ".join(holder_text(h, now, cfg) for h in w["holders"][:3]) or "lanes free, about to start"
         out.append(f"checks lane wait: {'#' + w['task'] if w['task'] else 'a run'} has waited {mins(w['waited_s'])} "
                    f"on {w['waits_on']} (position {w['position']} of {w['of']} in {w['lane']}), behind {held}")
     return out
@@ -791,7 +798,7 @@ def wait_events(project_name: str, cfg: dict | None, now: float | None = None) -
     now = time.time() if now is None else now
     out = []
     for w in waits(project_name, cfg, now, limit):
-        held = "; ".join(holder_text(h, now) for h in w["holders"][:3]) or "no holder (lanes free, about to start)"
+        held = "; ".join(holder_text(h, now, cfg) for h in w["holders"][:3]) or "no holder (lanes free, about to start)"
         who = f"#{w['task']}" if w["task"] else "a run with no task"
         out.append({"fingerprint": f"checks_slot_wait:{w['task'] or 'run'}:{w['since']:.0f}",
                     "task": int(w["task"]) if w["task"] else None,
@@ -925,6 +932,7 @@ def lane_status(project_name: str, now: float | None = None, cfg: dict | None = 
                           "running_s": running, "cap_s": float(r.get("cap_s") or 0),
                           "command": str(r.get("command") or ""), "overflow": bool(r.get("overflow")), "urgent": bool(r.get("urgent")),
                           "cost": r.get("cost") or {}, "why": _why(r.get("holder")), **_task_state(db, r),
+                          "stalled": _stalled(r, now, cfg),
                           **({} if running is not None else {"waits_on": _pid_queued(r.get("pid")) or "no host queue (starting, or an older runtime)"})})
         q = testslots.suite_order(project_name, _live_tickets(base), now, age=age)
         on = _lane_waits_on(project_name, base, key, q, cfg, labels[key])
@@ -996,7 +1004,7 @@ def lane_lines(project_name: str, cfg: dict | None = None, now: float | None = N
             kids = _kids(h["children"], h["running_s"] is not None)
             if h["running_s"] is not None:
                 parts.append(f"{who} queued {mins(h['queued_s'])}, running {mins(h['running_s'])}"
-                             + (f" of its {mins(h['cap_s'])} cap" if h["cap_s"] else " (no cap)") + f", {kids}")
+                             + (f" of its {mins(h['cap_s'])} cap" if h["cap_s"] else " (no cap)") + f", {kids}{h['stalled']}")
             else:
                 parts.append(f"{who} queued {mins(h['queued_s'])}, has a lane {mins(h['age_s'])}, not running yet: "
                              f"waits on {h['waits_on']}, {kids}")
@@ -1044,7 +1052,7 @@ def status_text(project_name: str, cfg: dict | None, here_repo: str = "", now: f
             extra = " (urgent extra lane, priority 1)" if h.get("urgent") else " (extra lane)" if h["overflow"] else ""
             lines.append(f"    holder{extra}: {_who(h)}{why}, {alive}, "
                          f"queued {mins(h['queued_s'])}, held {mins(h['age_s'])}{run}, "
-                         f"{_kids(h['children'], h['running_s'] is not None)}{ended}")
+                         f"{_kids(h['children'], h['running_s'] is not None)}{h['stalled']}{ended}")
         if not r["lanes"]:
             lines.append("    holder: none (a waiter is about to start)")
         for w in r["waiters"]:

@@ -28,6 +28,13 @@ process and every child it waited for: workers and the processes the tests start
 full-suite run (MIN_ITEMS or more tt-project tests) also prints its SLOWEST slowest test calls just above
 that line (`ttp-suite: slowest 15 test calls:`, then `ttp-suite:   61.20s <test id>` each), so slow or
 wall-clock-bound tests can be ranked from any run's log.
+
+A tt-project test still running after STACK_DUMP_S has every thread's stack dumped to the session's
+stderr (Python's faulthandler, as pytest's faulthandler_timeout does, scoped to tests/test_tt_project_*.py:
+other plugins' tests are untouched). It only dumps and kills nothing. The default sits far above the
+slowest test call (about 30 s) and below `ttp checks`' silence limit (checkwall.SILENT_S, 10 min), so a
+hung test's stack is in the checks log before that limit ends the run. TTP_TEST_STACK_DUMP_S sets it (0:
+off); a faulthandler_timeout set in pytest's own config wins.
 """
 
 from __future__ import annotations
@@ -54,6 +61,7 @@ MAX_LOCAL_JOBS = 4     # anywhere else: half the CPUs, at most this
 WORKER_NICE = 10
 FD_LOST_EXIT = 97      # a worker's own exit when a test closed or replaced one of its pipe fds
 _SHARDED = "test_tt_project_"
+STACK_DUMP_S = 480.0   # a tt-project test running this long dumps its stacks (faulthandler; kills nothing)
 # tt-project's db.tx() refuses a git network command (ls-remote, fetch, push) started inside a write
 # transaction while this is set: every test, and every process it starts, runs under that guard.
 os.environ.setdefault("TTP_TX_GUARD", "1")
@@ -116,6 +124,40 @@ def _slowest_lines(reports, n: int = SLOWEST) -> list[str]:
 def pytest_configure(config):
     config._ttp_started = time.monotonic()
     _use_tmpfs(config)
+    try:   # the real stderr: capture is suspended here, as for pytest's own faulthandler plugin
+        config._ttp_dump_fd = os.dup(sys.stderr.fileno())
+    except (AttributeError, OSError, ValueError):
+        config._ttp_dump_fd = None
+
+
+def stack_dump_s(config, path, environ=os.environ) -> float:
+    """Seconds after which test file `path`'s running test dumps its stacks: STACK_DUMP_S (or
+    TTP_TEST_STACK_DUMP_S) for a tt-project test file, else 0; 0 also when pytest's own
+    faulthandler_timeout is set (it arms its own)."""
+    if not Path(str(path)).name.startswith(_SHARDED):
+        return 0.0
+    try:
+        if float(config.getini("faulthandler_timeout") or 0) > 0:
+            return 0.0
+    except (TypeError, ValueError):
+        pass
+    try:
+        return max(0.0, float(environ.get("TTP_TEST_STACK_DUMP_S", STACK_DUMP_S)))
+    except ValueError:
+        return STACK_DUMP_S
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    import faulthandler
+    t, fd = stack_dump_s(item.config, item.path), getattr(item.config, "_ttp_dump_fd", None)
+    if t > 0 and fd is not None:
+        faulthandler.dump_traceback_later(t, exit=False, file=fd)
+    try:
+        yield
+    finally:
+        if t > 0 and fd is not None:
+            faulthandler.cancel_dump_traceback_later()
 
 
 @pytest.hookimpl(trylast=True)

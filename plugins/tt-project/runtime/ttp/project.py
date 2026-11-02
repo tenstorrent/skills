@@ -566,10 +566,11 @@ def _known_keys(path: list[str]) -> set[str] | None:
         # no_device_cmds: commands that need no device, run without wrap_cmd (checklane.no_device).
         # slots, light_cmds, max_wait_s, wait_event_s, wait_escalate_s, wait_hang_factor, priority_age_s,
         # test_project_max, done_holder_flag_s, done_holder_grace_s: the checks lanes (checklane);
-        # test_project_slots: the project's test-worker budget (testslots.project_max).
+        # test_project_slots: the project's test-worker budget (testslots.project_max);
+        # stall_s: a running check's log silence that makes it stalled (checkstall.stall_s).
         return {"nice", "ionice", "wall_cap_s", "wrap_cmd", "wrap_lane", "no_device_cmds", "slots", "light_cmds", "max_wait_s", "wait_event_s",
                 "wait_escalate_s", "wait_hang_factor", "priority_age_s", "test_project_max", "test_project_slots",
-                "done_holder_flag_s", "done_holder_grace_s"}
+                "done_holder_flag_s", "done_holder_grace_s", "stall_s"}
     if len(path) == 1 and isinstance(DEFAULT_CONFIG.get(path[0]), dict):
         return set(DEFAULT_CONFIG[path[0]]) | EXTRA_KEYS.get(path[0], set())
     return None
@@ -2343,7 +2344,7 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_sp
                 "checks": {"host_max", "load_extra", "live_cores", "nice", "ionice", "priority_turns", "test_pool", "test_run_max",
                            "test_project_max", "test_project_slots", "build_pool", "build_run_max", "build_project_max", "wall_cap_s",
                            "slots", "light_cmds", "max_wait_s", "wait_event_s", "priority_age_s",
-                           "wait_escalate_s", "wait_hang_factor", "done_holder_flag_s", "done_holder_grace_s"}}
+                           "wait_escalate_s", "wait_hang_factor", "done_holder_flag_s", "done_holder_grace_s", "stall_s"}}
 
 
 def layered(raw: dict) -> dict:

@@ -1037,12 +1037,12 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
             waiting(False)
 
 
-def suite_running(grant, cap_s: float) -> None:
+def suite_running(grant, cap_s: float, log: str = "") -> None:
     """Mark the suite lock `grant` holds as running its commands from now under a wall-time cap of
-    `cap_s` seconds (0: none), for checklane.lane_lines."""
+    `cap_s` seconds (0: none), for checklane.lane_lines, writing to checks log `log` (checkstall reads it)."""
     for f in getattr(grant, "files", None) or []:
         if os.path.basename(getattr(f, "name", "")).startswith(SUITE + "."):
-            locks.relabel(f, {"run_since": time.time(), "cap_s": float(cap_s or 0)})
+            locks.relabel(f, {"run_since": time.time(), "cap_s": float(cap_s or 0), **({"log": str(log)} if log else {})})
 
 
 def _mins(s: float) -> str:
