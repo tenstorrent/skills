@@ -94,12 +94,15 @@ GATES = (
 
 # A reason that says a setting is the user's own: user-set, user-owned, not to be overridden.
 OWNED = re.compile(
-    r"\buser[- ](?:set|owned|only|controlled|chosen|configured|pinned)\b|"
+    r"\buser[- ](?:set|owned|controlled|chosen|configured|pinned)\b|"
     r"\b(?:set|owned|chosen|configured|pinned|controlled|fixed)\s+by\s+(?:the\s+)?user\b|"
     r"\b(?:the\s+)?user'?s\s+(?:own\s+)?(?:setting|config\w*|choice|key|value)\b|"
     r"\b(?:can(?:no|')?t|cannot|must\s+not|mustn't|may\s+not|should\s+not|shouldn't|won't|will\s+not|do\s+not|"
     r"don't|not\s+(?:allowed|permitted)\s+to)\s+(?:be\s+)?overrid\w*|\bnot\s+(?:to\s+be\s+)?overridden\b|"
     r"\bnon-?overrid\w*", re.I)
+# Money or a step only the user holds, said in words GATES[2] does not list.
+_HELD = re.compile(r"\bmoney\b|\bonly\s+(?:the\s+user|they|you)\s+(?:can\s+)?(?:holds?|has|have|do(?:es)?)\b|"
+                   r"\buser-only\s+step\b", re.I)
 _KEY = re.compile(r"(?<![\w./-])([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+)(?![\w/-])", re.I)
 
 
@@ -115,9 +118,17 @@ def owned_keys(text: str) -> list[str]:
 
 def setter_finding(db, text: str) -> str | None:
     """'KEY: set by SETTER' for the first key `text` names as the user's own whose recorded setter
-    is not the user (configwho; no record is unknown); None when every such key is the user's."""
+    is not the user (configwho; no record is unknown); None when every such key is the user's, or when
+    the reason, its key names removed ('budget.' is no spend), names a credential, money or a step only
+    the user holds (GATES[2]): that wait is real whoever set the key."""
     from . import configwho
-    for k in owned_keys(text):
+    keys = owned_keys(text)
+    if not keys:
+        return None
+    said = _KEY.sub(" ", " ".join((text or "").replace("’", "'").split()))
+    if GATES[2][1].search(_NEGATED.sub(" ", said)) or _HELD.search(said):
+        return None
+    for k in keys:
         rec = configwho.get(db, k)
         if configwho.role(rec) != "user":
             return f"{k} named as the user's, but set by {configwho.describe(rec)}"
@@ -239,14 +250,18 @@ def text(found: list[dict]) -> str:
     lines = [f"{names[f['source']].format(f['id'])}: \"{_clip(f['text'])}\" (cites: {f['cited']})"
              for f in found[:MAX_LISTED]]
     more = f" (+{len(found) - MAX_LISTED} more)" if len(found) > MAX_LISTED else ""
-    if any(f["source"] == "setter" for f in found):
+    setter = any(f["source"] == "setter" for f in found)
+    if setter:
         more += (". A setting a task calls the user's whose recorded setter is not the user (`ttp config get "
-                 "--why KEY`) is yours to change or keep; only a setting only the user may change still "
-                 "needs their word, asked for its exact value")
+                 "--why KEY`) is yours to change or keep; such a task's reason names no credential, money or step "
+                 "only the user holds, and any other step it names is judged on its own; only a setting only the "
+                 "user may change still needs their word, asked for its exact value")
+    rest = (". None names a step that could affect people badly, speaks as the user, needs a credential, money or "
+            "a step only the user holds, changes a charter Restriction or lifts a pause the user set"
+            if any(f["source"] != "setter" for f in found) else "")
     return ("Self-blocking: work is held for the user's word on a decision that is yours. "
-            + "; ".join(lines) + more + ". None names a step that could affect people badly, speaks as the user, "
-            "needs a credential, money or a step only the user holds, changes a charter Restriction or lifts a "
-            "pause the user set. Decide it now: pick the least-disruptive option, act (requeue or re-scope the "
+            + "; ".join(lines) + more + (rest.replace(". None names", ". None of the others names", 1)
+                                         if setter and rest else rest) + ". Decide it now: pick the least-disruptive option, act (requeue or re-scope the "
             "task, resolve the ask), memory_add kind decision with the reason, notify low saying what you chose "
             "and that a reply reverses it. If one really is such a gate, say which in summary.")
 

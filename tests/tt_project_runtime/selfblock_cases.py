@@ -324,3 +324,29 @@ def test_config_setter_is_recorded_shown_and_survives_a_restart_and_an_upgrade_m
     # A whole section set replaces the records under it; a key with none takes its section's.
     q.set_config("delivery", {**q.raw_config().get("delivery", {})}, by=configwho.by("user", via="cli"))
     assert configwho.role(configwho.get(q.db, "delivery.channel_tags")) == "user"
+
+
+def test_selfblock_setter_check_quiet_for_a_credential_money_or_sign_in_wait(env):
+    p = make(env)
+    from ttp import coordinator as coord, selfblock
+    coord.apply(p, [{"type": "config_set", "key": "jev.enabled", "value": True}])   # coordinator-set
+    reasons = ("jev.enabled needs the user's key (an API credential only they hold)",
+               "waiting for a user-only step: sign in to the Slack app so notify.slack can post (credential)",
+               "budget.max_usd is user-set and raising it needs money only the user holds")
+    for r in reasons:
+        assert selfblock.setter_finding(p.db, r) is None, r
+    ids = []
+    for r in reasons:
+        t = p.db.add_task("w")
+        p.db.update_task(t, status="waiting", result=json.dumps({"waiting_for": r}))
+        ids.append(t)
+    assert [f for f in selfblock.scan(p.db) if f["id"] in ids and f["source"] == "setter"] == []
+    # 'budget.' in a key name is no spend: the setting-ownership guess still raises.
+    assert "set by unknown" in selfblock.setter_finding(p.db, "budget.max_parallel_workers is user-set")
+    assert "set by coordinator" in selfblock.setter_finding(p.db, "jev.enabled is the user's setting")
+    # The event names the setter rule and does not claim the setter finding names no gate at all.
+    txt = selfblock.text([{"source": "setter", "id": 1, "text": "x", "cited": "k"}])
+    assert "None names" not in txt and "names no credential, money or step" in txt, txt
+    txt = selfblock.text([{"source": "setter", "id": 1, "text": "x", "cited": "k"},
+                          {"source": "task", "id": 2, "text": "y", "cited": "z"}])
+    assert "None of the others names" in txt, txt
