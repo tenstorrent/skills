@@ -2537,6 +2537,8 @@ class Daemon:
                 effort = lifted
                 if "effort" in pin:   # the runner checks the session runs the effort it starts with
                     pin["effort"] = lifted
+        if role != "coordinator" and isinstance((note or {}).get(effortab.KEY), dict):
+            note = {**note, effortab.KEY: effortab.ran(self.p.db, note[effortab.KEY], effort)}
         prices = (self.cfg.get("pricing") or {}).get(provider) or {}
         prov = get_provider(provider).use(model, prices, billing.declared(self.cfg, provider))
         if provider == "chat" and prov.caps_budget and budget_usd is not None:

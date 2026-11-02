@@ -8,7 +8,9 @@ effort pin of its own goes in one of two arms, picked by a hash of its lineage's
 fixes and continuations share the root, so they keep its arm. The arm changes only a standard-tier run
 whose tier effort is high: a light run, or a deep one after a tier-up retry, keeps its tier's effort but
 still records the arm, so the report counts its cost. Each run of an arm task carries the arm in its
-note (`effort_ab`: arm, root, the effort it ran at).
+note (`effort_ab`: arm, root, `effort` the arm or pick gave it, `effective` the effort it started at).
+A conclusion run's tier floor (tierfloor.py) may lift `effective` above `effort` (`lifted`): the report
+leaves out every lineage with such a run, and a lifted Jev pick is settled as no change.
 
 `report` compares the arms per lineage (one change): cost per landed change, output tokens and model
 calls per run, review and checks fail rates, fix-review hops and tier-up retries. End rule (END_*):
@@ -149,13 +151,27 @@ def assign(db: DB, cfg: dict, task: dict, tier: str, provider: str, jev=None) ->
             "effort": _ran_effort(tier, tier_effort, got["pick"])}
 
 
+def ran(db: DB, ab: dict, effective: str) -> dict:
+    """The run note's `effort_ab` entry once start_run settled the effort the run starts at: `effective`,
+    and `lifted` when a conclusion run's tier floor raised it over the arm's or pick's `effort`. A lifted
+    Jev pick never ran: its call settles as no change (it avoided nothing, and is scored neither way)."""
+    out = {**ab, "effective": effective}
+    if str(effective or "") != str(ab.get("effort") or ""):
+        out["lifted"] = True
+        if ab.get("jev_call"):
+            jevuse.resolve(db, int(ab["jev_call"]), jevuse.NO_CHANGE,
+                           f"tier floor ran it at {effective}, not {ab.get('effort')}")
+    return out
+
+
 def _rate(bad: int, n: int) -> float | None:
     return round(100.0 * bad / n, 1) if n else None
 
 
 def report(p, days: float = 30, since: float | None = None, until: float | None = None) -> dict:
     """Per arm: the lineages (changes) whose runs carry it in the window, and what they cost and how
-    they went. `checks fail rate`: runs that ran `ttp checks` whose last recorded result failed."""
+    they went. `checks fail rate`: runs that ran `ttp checks` whose last recorded result failed. A lineage
+    with a run the tier floor lifted (`lifted`) is left out: it did not run at its arm's effort."""
     from . import landed
     from .prguard import CHECKS_FILE
     db = p.db
@@ -166,10 +182,12 @@ def report(p, days: float = 30, since: float | None = None, until: float | None 
                 "AND r.started>=? AND r.started<? AND r.note LIKE ? ORDER BY r.id", (since, until, f'%"{KEY}"%'))
     arms: dict[str, dict] = {a: {"changes": set(), "tasks": set(), "runs": 0, "usd": 0.0, "output": 0, "calls": [],
                                  "checks": 0, "checks_failed": 0, "tier_ups": 0, "fix_hops": set()} for a in ARMS}
-    for r in rows:
-        note = load_result(r["note"])
+    notes = [(r, load_result(r["note"])) for r in rows]
+    lifted = {int((n.get(KEY) or {}).get("root") or r["task"]) for r, n in notes
+              if isinstance(n.get(KEY), dict) and n[KEY].get("lifted")}
+    for r, note in notes:
         ab = note.get(KEY)
-        if not isinstance(ab, dict) or ab.get("arm") not in ARMS:
+        if not isinstance(ab, dict) or ab.get("arm") not in ARMS or int(ab.get("root") or r["task"]) in lifted:
             continue
         a = arms[ab["arm"]]
         a["changes"].add(int(ab.get("root") or r["task"]))

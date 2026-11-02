@@ -93,7 +93,7 @@ def test_effort_ab_arm_goes_in_the_run_note_and_the_run_starts_at_its_effort(env
     ab = {"arm": "medium", "root": med, "effort": "medium"}
     rid = d.start_run("worker", "go", "claude", "standard", str(p.base), task=p.db.task(med), note={effortab.KEY: ab})
     row = p.db.one("SELECT effort, note FROM runs WHERE id=?", (rid,))
-    assert row["effort"] == "medium" and json.loads(row["note"])[effortab.KEY] == ab
+    assert row["effort"] == "medium" and json.loads(row["note"])[effortab.KEY] == {**ab, "effective": "medium"}
     # A task's own effort pin always wins over a note's arm.
     pinned = p.db.add_task("Pinned", "s", kind="code", tier="standard", origin="coordinator", effort="xhigh")
     rid = d.start_run("worker", "go", "claude", "standard", str(p.base), task=p.db.task(pinned), note={effortab.KEY: ab})
@@ -101,6 +101,56 @@ def test_effort_ab_arm_goes_in_the_run_note_and_the_run_starts_at_its_effort(env
     # No arm: the tier's effort.
     rid = d.start_run("worker", "go", "claude", "standard", str(p.base), task=p.db.task(med))
     assert p.db.one("SELECT effort FROM runs WHERE id=?", (rid,))["effort"] == "high"
+
+
+def test_a_conclusion_run_the_tier_floor_lifts_logs_its_effective_effort_and_leaves_the_arm_comparison(
+        env, monkeypatch):
+    """A conclusion run whose arm is medium under a high floor runs at high: its note records the arm's
+    effort and the effective one, the A/B report counts its lineage in neither arm, and a lifted Jev
+    pick settles as no change rather than scored right or wrong."""
+    from ttp import daemon as dmod, effort, effortab, jevuse
+
+    class Proc:   # never a real runner
+        pid = 4242
+    real = subprocess.Popen
+    monkeypatch.setattr(dmod.subprocess, "Popen",
+                        lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
+    p = make(env)
+    d = dmod.Daemon(p.base)
+    med, kept = _ab_task(p, "medium"), _ab_task(p, "medium")
+
+    def start(task, ab, **kw):
+        rid = d.start_run("worker", "go", "claude", "standard", str(p.base), task=p.db.task(task),
+                          note={effortab.KEY: ab}, **kw)
+        p.db.x("UPDATE runs SET status='ok', cost_usd=2 WHERE id=?", (rid,))
+        row = p.db.one("SELECT effort, note FROM runs WHERE id=?", (rid,))
+        return row["effort"], json.loads(row["note"])[effortab.KEY]
+
+    ab = {"arm": "medium", "root": med, "effort": "medium"}
+    assert start(med, ab, min_effort="high") == ("high", {**ab, "effective": "high", "lifted": True})
+    got = start(kept, {**ab, "root": kept})
+    assert got == ("medium", {**ab, "root": kept, "effective": "medium"})
+    m, h = (effortab.report(p, days=30)["arms"][a] for a in ("medium", "high"))
+    assert (m["changes"], m["runs"], m["usd"]) == (1, 1, 2.0), "only the run that ran at medium counts as medium"
+    assert (h["changes"], h["runs"]) == (0, 0), "the lifted run is not counted as high either"
+    # A later unlifted run of the lifted lineage does not bring it back into the comparison.
+    start(med, ab)
+    assert effortab.report(p, days=30)["arms"]["medium"]["runs"] == 1
+    # Jev's medium pick under the floor never ran: no change, not scored right when the task ends.
+    picked = p.db.add_task("Plan it", "conclusion: the plan", kind="code", tier="standard", origin="coordinator")
+    cid = jevuse.record(p.db, "effort", {"effort_level": "medium"}, 0.01, avoided_usd=0.5,
+                        ref=f"task:{picked}", changed=True)
+    pick = {"by": "jev", "pick": "medium", "jev_call": cid, "root": picked, "effort": "medium"}
+    assert start(picked, pick, min_effort="high")[1]["lifted"] is True
+    effort.settle(p.db, picked, "done", 1)
+    assert p.db.one("SELECT outcome FROM jev_calls WHERE id=?", (cid,))["outcome"] == jevuse.NO_CHANGE
+    assert jevuse.stats(p.db, p.config())["effort"]["saved"] == 0.0
+    # An unlifted pick is still scored when the task ends.
+    other = p.db.add_task("Fix it", "s", kind="code", tier="standard", origin="coordinator")
+    cid2 = jevuse.record(p.db, "effort", {"effort_level": "medium"}, 0.01, ref=f"task:{other}", changed=True)
+    start(other, {**pick, "jev_call": cid2, "root": other}, min_effort="low")
+    effort.settle(p.db, other, "done", 1)
+    assert p.db.one("SELECT outcome FROM jev_calls WHERE id=?", (cid2,))["outcome"] == "right"
 
 
 def _ab_run(p, task, arm, root, cost, out, calls=None, pick=None, checks=None, started=None):
