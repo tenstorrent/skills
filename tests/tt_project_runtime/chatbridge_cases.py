@@ -1851,6 +1851,18 @@ def test_only_a_chat_run_counts_its_waits_against_the_stall_limit(env, monkeypat
     ("ttp hours --sleep 600", False),             # an option, not the command
     ("ls; nosleep 600", False),
     ("for f in a b; do cat $f; done", False),     # a loop without a sleep
+    # Blocking waits that never sleep: they hold the call until its timeout.
+    ("tail -f /x/checks.log", True),
+    ("timeout 550 tail -n 50 -F /x/log", True),
+    ("cd /x && tail --follow=name log", True),
+    ("watch -n 30 ttp checks --result /x", True),
+    ("gh run watch 123", True),
+    ("ps; watch ls", True),
+    ("timeout 550 ttp checks --result /x", False),  # returns at once (exit 0 or 1)
+    ("tail -n 50 /x/log", False),
+    ("grep -n watch runner.py; grep -c 'tail -f' a.md", False),   # words in arguments
+    ("tail -n 5 file-f", False),
+    ("npm run build:watch", False),
     (None, False), (42, False),
 ])
 def test_is_wait_tells_waits_from_work(command, wait):
@@ -1877,3 +1889,56 @@ def test_waited_counts_overlapping_and_open_waits_once_within_the_window(tmp_pat
     assert w.waited(500.0, 900) == 400.0
     assert w.waited(1300.0, 900) == 100.0, "only the part inside the window"
     assert w.waited(1500.0, 900) == 0.0 and w.waits == [], "old waits are dropped"
+
+
+# A chat-route run is told to hand off `waiting` instead of waiting in a tool call (hook.idle_wait),
+# so its waits never end it as stalled and rerun it on another provider.
+_HOOK_AGENT = r'''
+import json, sys
+sys.path[:0] = json.loads(sys.argv[1])
+from ttp import hook
+out = {}
+for c in json.loads(sys.argv[2]):
+    got, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": c}, "cwd": "."})
+    out[c] = (got or {}).get("hookSpecificOutput", {}).get("permissionDecisionReason")
+open(sys.argv[3], "w").write(json.dumps(out))
+print(json.dumps({"type": "result", "result": "done"}))
+'''
+_WAITS = ["sleep 590; ttp checks --result run-1", "sleep 30",
+          "timeout 550 bash -c 'while true; do ttp checks --result r && exit 0; sleep 25; done'",
+          "until test -e /x; do sleep 5; done", "tail -f /x/log", "watch -n 30 ls"]
+_WORK = ["sleep 5; ls", "timeout 550 ttp checks --result run-1", "python3 -m pytest -q tests/a.py",
+         "grep -n 'tail -f' a.md"]
+
+
+@pytest.mark.parametrize("waits_idle", [True, False])
+def test_a_chat_run_is_told_to_hand_off_waiting_for_a_wait_call_and_other_runs_may_wait(env, tmp_path, waits_idle):
+    from ttp import runner
+    agent, got = tmp_path / "agent.py", tmp_path / "got.json"
+    agent.write_text(_HOOK_AGENT)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "prompt.md").write_text("x")
+    (run_dir / "run.json").write_text(json.dumps({
+        "argv": [sys.executable, str(agent), json.dumps(sys.path), json.dumps(_WAITS + _WORK), str(got)],
+        "cwd": str(tmp_path), "provider": "fake", "timeout_s": 60, "stall_s": 30,
+        "env": {"TTP_RUN_DIR": str(run_dir)}, **({"waits_idle": True} if waits_idle else {})}))
+    runner.supervise(run_dir)
+    out = json.loads(got.read_text())
+    for c in _WAITS:
+        if waits_idle:
+            assert "hand off `waiting`" in out[c].lower() and "ttp checks --result <run dir>" in out[c], (c, out[c])
+        else:
+            assert out[c] is None, f"a run that is not a chat run may wait: {c!r}: {out[c]}"
+    for c in _WORK:
+        assert out[c] is None, f"no wait: {c!r}: {out[c]}"
+
+
+def test_a_wait_call_is_refused_only_in_a_run(env, monkeypatch):
+    from ttp import hook
+    monkeypatch.setenv("TTP_WAITS_IDLE", "1")
+    monkeypatch.delenv("TTP_RUN_DIR", raising=False)
+    assert hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "sleep 600"}}) == (None, None)
+    for val in ("", "0", "yes"):
+        monkeypatch.setenv("TTP_WAITS_IDLE", val)
+        assert hook.idle_wait("sleep 600") is None, val

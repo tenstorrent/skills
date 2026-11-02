@@ -861,6 +861,8 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if bypass:
         _log_bypass(cmd)
     if not why:
+        why = idle_wait(cmd)
+    if not why:
         why = full_suite(cmd, segments, str(payload.get("cwd") or os.getcwd()))
     if not why:
         why = too_many_workers(cmd)
@@ -877,6 +879,22 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
             out.update(permissionDecision="allow", updatedInput={**payload["tool_input"], "command": rewrite})
         return ({"hookSpecificOutput": out} if len(out) > 1 else None), None
     return _deny(why), None
+
+
+def idle_wait(cmd: str) -> str | None:
+    """In a chat-route run (runner.WAITS_IDLE_ENV), a wait call (runner.is_wait: a sleep of 30 s or
+    more, a sleep-poll loop, `tail -f`, `watch`) is refused: waits filling most of its stall_s end the
+    run as stalled and rerun it on another provider, paying twice for the same result."""
+    if os.environ.get("TTP_WAITS_IDLE") != "1":
+        return None
+    from . import runner
+    if not runner.is_wait(cmd):
+        return None
+    return ("this run must not wait in a tool call (a sleep of 30 s or more, a sleep-poll loop, `tail -f`, "
+            "`watch`): long waits end it as stalled and rerun it elsewhere. Hand off `waiting` with a "
+            "`retry_when` that exits 0 once the wait is over, such as `ttp checks --result <run dir>` for "
+            "detached checks or the one `ttp detach` printed. A commit message naming such a command: "
+            "use `git commit -F <file>`")
 
 
 # A command that prints more than this many lines of one file gets a reminder (never a refusal):

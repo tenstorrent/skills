@@ -364,6 +364,8 @@ def supervise(run_dir: Path) -> int:
     env = {**os.environ, **_env_files(spec), **env_extra}
     # A proxy on `localhost` as 127.0.0.1 (loopproxy): in memory only, the values may carry credentials.
     env.update(loopproxy.fixed(env))
+    if spec.get("waits_idle"):   # its hook turns wait calls back to a waiting hand-off (hook.idle_wait)
+        env[WAITS_IDLE_ENV] = "1"
     lease, out_path = run_dir / "lease", run_dir / "output.jsonl"
     started = time.time()
     if spec.get("pin") and not stop_reason(run_dir):
@@ -646,17 +648,26 @@ def _niceness(pid: int) -> int | None:
 NOISE_TYPES = ("tool_progress", "rate_limit_event", "keep_alive")
 SYSTEM_PROGRESS = ("thinking_tokens",)
 WAIT_MIN_S = 30   # a sleep this long or longer makes a command a wait (is_wait)
+WAITS_IDLE_ENV = "TTP_WAITS_IDLE"   # set to 1 in a waits_idle run's agent: its hook refuses wait calls
 _SLEEP = re.compile(r"(?<![\w.-])sleep\s+(\d+(?:\.\d+)?)([smhd]?)(?![\w.])|time\.sleep\(\s*(\d+(?:\.\d+)?)")
 _LOOP = re.compile(r"(?<![\w.-])(?:while|until|for)\b[^\n]*?(?:;|\n)\s*do\b")
+# A command that blocks without sleeping until its timeout: `tail -f` and `watch` (also `gh run watch`),
+# as a command of its own, not a word in another command's arguments (`grep -n watch`).
+_FOLLOW = re.compile(r"(?:^|[;&|(`\n]|\b(?:do|then)\s|\btimeout(?:\s+-\S+)*\s+\d\S*\s)\s*"
+                     r"(?:tail\b[^;&|\n]*?\s(?:-[A-Za-z0-9]*[fF][A-Za-z0-9]*|--follow\S*)(?!\S)"
+                     r"|(?:gh\s+run\s+)?watch\s)")
 _UNIT = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
 def is_wait(command) -> bool:
-    """Whether a shell command only waits: a sleep of WAIT_MIN_S or more, or a loop that sleeps (a poll)."""
+    """Whether a shell command only waits: a sleep of WAIT_MIN_S or more, a loop that sleeps (a poll),
+    or a command that blocks until its timeout without sleeping (`tail -f`, `watch`). A command that
+    returns at once (`timeout 550 ttp checks --result <dir>`) is no wait."""
     if not isinstance(command, str):
         return False
     sleeps = [float(a or c) * _UNIT[u] for a, u, c in _SLEEP.findall(command)]
-    return bool(sleeps) and (max(sleeps) >= WAIT_MIN_S or bool(_LOOP.search(command)))
+    return bool(sleeps) and (max(sleeps) >= WAIT_MIN_S or bool(_LOOP.search(command))) \
+        or bool(_FOLLOW.search(command))
 
 
 class AwakeClock:
