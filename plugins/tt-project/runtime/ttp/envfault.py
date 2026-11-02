@@ -83,11 +83,11 @@ def _program(words: list[str]) -> tuple[str, list[str]] | None:
         elif w == "env":
             i += 1
             while i < len(words) and (words[i].startswith("-") or _ASSIGN.match(words[i])):
-                i += 1
+                i += 2 if words[i] in ("-u", "-C", "--unset", "--chdir") else 1   # those take a value
         elif w == "timeout":
             i += 1
             while i < len(words) and words[i].startswith("-"):
-                i += 1
+                i += 2 if words[i] in ("-s", "-k", "--signal", "--kill-after") else 1
             i += 1   # the duration
         elif w in _WRAPPERS:
             i += 1
@@ -150,37 +150,78 @@ def runners(cmd: str, top: str | Path, env: dict | None = None) -> list[dict]:
     from . import push
     env = dict(os.environ if env is None else env)
     path = env.get("PATH") or os.defpath
+    got = _first_run(cmd, top, env)
+    if not got:
+        return []
+    prog, args = got
+    if "/" in prog and not os.path.isabs(prog):
+        return []   # a script of the repository's: the change's business
+    python = bool(_PY.search(Path(prog).name))
+    if not python and Path(prog).name not in _TEST_RUNNERS:
+        return []
+    mod = _module(args) if python else None
+    if mod and not push._in_repo(mod.split(".")[0], top):
+        mod = mod.split(".")[0]
+        low = minversion(top) if mod == "pytest" else ""
+        return [{"kind": "module", "python": prog, "module": mod, "path": path, "cmd": cmd,
+                 "cwd": str(top), **({"min": low} if low else {})}]
+    return [{"kind": "program", "name": prog, "path": path, "cmd": cmd, "cwd": str(top)}]
+
+
+def _first_run(cmd: str, top: str | Path | None, env: dict) -> tuple[str, list[str]] | None:
+    """(program, arguments) of the first program `cmd` runs (push.venv_cmd applied in `top`; None:
+    as written), past builtins, assignments and wrappers (_program); None when that is not knowable
+    up front (it does not parse, a step may change PATH, a conditional or loop decides it)."""
+    from . import push
     try:
-        segs = _segments(push.venv_cmd(cmd, top, env))
+        segs = _segments(push.venv_cmd(cmd, top, env) if top is not None else cmd)
     except ValueError:
-        return []   # does not parse: the run says what is wrong
+        return None   # does not parse: the run says what is wrong
     for words in segs:
         if any(w.startswith("PATH=") for w in words[:1]) or words[:1] in (["source"], ["."], ["export"],
                                                                           ["eval"], ["exec"]):
-            return []
+            return None
         if words[0] in _SKIP or words[0] in _KEYWORDS - {"time", "!"}:
-            return []   # a conditional or loop: what runs depends on it
+            return None   # a conditional or loop: what runs depends on it
         got = _program(words)
         if not got:
             continue
-        prog, args = got
         if any(w.startswith("PATH=") for w in words if _ASSIGN.match(w)):
-            return []
-        if "/" not in prog and prog in push.BUILTINS:
+            return None
+        if "/" not in got[0] and got[0] in push.BUILTINS:
             continue
-        if "/" in prog and not os.path.isabs(prog):
-            return []   # a script of the repository's: the change's business
-        python = bool(_PY.search(Path(prog).name))
-        if not python and Path(prog).name not in _TEST_RUNNERS:
-            return []
-        mod = _module(args) if python else None
-        if mod and not push._in_repo(mod.split(".")[0], top):
-            mod = mod.split(".")[0]
-            low = minversion(top) if mod == "pytest" else ""
-            return [{"kind": "module", "python": prog, "module": mod, "path": path, "cmd": cmd,
-                     "cwd": str(top), **({"min": low} if low else {})}]
-        return [{"kind": "program", "name": prog, "path": path, "cmd": cmd, "cwd": str(top)}]
-    return []
+        return got
+    return None
+
+
+def missing_program(cmd: str, top: str | Path, env: dict | None = None, host: str = "",
+                    host_env: dict | None = None) -> str:
+    """The program check command `cmd` runs first, when `command -v` does not find it where the
+    check runs ("" when it does or cannot tell): with `env` in `top` here, or, with a check `host`,
+    there over ssh with the check's `host_env` exported, as remotecheck runs it. Only a program
+    precheck leaves to the command (a python or a test runner is its runner fault, a script of the
+    repository's the change's), and only the first: a later command may run what an earlier one
+    installs. ssh failing is no answer here (precheck probes the host)."""
+    env = dict(os.environ if env is None else env)
+    got = _first_run(cmd, None, env)   # push.venv_cmd changes only pytest runs, which are not looked at here
+    if not got:
+        return ""
+    prog = got[0]
+    if ("/" in prog and not os.path.isabs(prog)) or _PY.search(Path(prog).name) or Path(prog).name in _TEST_RUNNERS:
+        return ""
+    if host:
+        from . import remotecheck
+        argv = remotecheck._ssh(host, remotecheck.exports(host_env or {})
+                                + f"command -v {shlex.quote(prog)} >/dev/null 2>&1 || exit 3")
+        cwd = None
+    else:
+        argv, cwd = ["sh", "-c", 'command -v "$1" >/dev/null 2>&1 || exit 3', "sh", prog], str(top)
+    try:
+        r = subprocess.run(argv, cwd=cwd, env=None if host else env, stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=PROBE_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return prog if r.returncode == 3 else ""
 
 
 def probe(r: dict, env: dict | None = None) -> dict | None:

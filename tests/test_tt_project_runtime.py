@@ -32972,10 +32972,10 @@ def test_ttp_checks_runs_one_quoted_extra_command_through_the_shell(env, tmp_pat
     # Several words still run as argv: the spaces inside one word stay quoted.
     cli.main(["checks", "--fresh", "--", "test", "-n", "a b"])
     assert rec()["passed"] is True and rec()["commands"] == ["test -n 'a b'"]
+    # A program that is not installed is refused before anything runs (envfault.missing_program).
     with pytest.raises(SystemExit) as e:
         cli.main(["checks", "--fresh", "--", "no-such-program-ttp"])
-    assert e.value.code != 0 and rec()["passed"] is False
-    assert "not found" in (run / "checks.log").read_text()
+    assert e.value.code == 1 and rec()["commands"] == ["test -n 'a b'"]
 
 
 def test_ttp_checks_runs_several_quoted_extra_commands_as_one_check_each(env, tmp_path, monkeypatch, capsys):

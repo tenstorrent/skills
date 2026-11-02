@@ -7028,6 +7028,54 @@ def test_ttp_checks_wrap_cmd_passes_its_exit_code_and_fails_when_missing(env, tm
     cli.main(["checks", "--fresh"])
 
 
+def test_ttp_checks_refuses_a_command_after_dashes_whose_program_is_not_installed(env, tmp_path, monkeypatch, capsys):
+    # A missing linter is refused before anything is queued, naming the program, not an exit 127
+    # minutes later; launcher forms (env, timeout, nice, assignments) name the program they run.
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    (tools / "mylint").write_text("#!/bin/sh\nexit 0\n")
+    (tools / "mylint").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tools}{os.pathsep}{os.environ['PATH']}")
+    marker = tmp_path / "ran"
+    touch = f"touch {shlex.quote(str(marker))}"
+    for cmd in ("no-such-linter-for-ttp check .", "timeout 60 env FOO=1 nice -n 5 no-such-linter-for-ttp .",
+                f"FOO=1 no-such-linter-for-ttp && {touch}"):
+        capsys.readouterr()
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--fresh", "--", cmd])
+        err = capsys.readouterr().err
+        assert e.value.code == 1 and "'no-such-linter-for-ttp' is not installed here" in err, (cmd, err)
+        assert not marker.exists() and not (run / "checks.json").exists(), cmd
+    cli.main(["checks", "--fresh", "--", f"timeout 60 mylint . && {touch}"])
+    assert marker.exists() and json.loads((run / "checks.json").read_text())["passed"] is True
+
+
+def test_missing_program_resolves_the_program_a_launcher_runs_in_the_checks_env(tmp_path):
+    from ttp import envfault
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    (tools / "mylint").write_text("#!/bin/sh\nexit 0\n")
+    (tools / "mylint").chmod(0o755)
+    base = "/usr/bin:/bin"
+    on = {**os.environ, "PATH": f"{tools}:{base}"}
+    off = {**os.environ, "PATH": base}
+    for cmd in ("mylint .", "timeout -s KILL 60 mylint .", "env -u X FOO=1 mylint", "nice -n 5 nohup mylint",
+                "cd sub && mylint", "FOO=1 mylint; exit 1"):
+        assert envfault.missing_program(cmd, tmp_path, on) == "", cmd   # the checks' PATH has it
+        assert envfault.missing_program(cmd, tmp_path, off) == "mylint", cmd
+    assert envfault.missing_program(f"{tools}/mylint", tmp_path, off) == ""
+    assert envfault.missing_program(f"{tmp_path}/nope/mylint", tmp_path, off) == f"{tmp_path}/nope/mylint"
+    # Left to others: a python or test runner (precheck's runner fault, behind a launcher too), a
+    # script of the repository's, a builtin, an unparsable or PATH-changing command, a later program.
+    for cmd in ("timeout 600 pytest -q", "env python3 -m ruff check .", "./scripts/lint.sh", "exit 7",
+                "'unclosed", "PATH=/x mylint", "export PATH=/x; mylint", "if mylint; then :; fi",
+                "mkdir -p x && mylint"):
+        assert envfault.missing_program(cmd, tmp_path, off) == "", cmd
+    assert envfault.missing_program("true && mylint", tmp_path, off) == "mylint"   # past a builtin
+
+
 def test_push_own_reruns_recorded_extras_behind_checks_wrap_cmd(env, monkeypatch, capsys, tmp_path):
     log = tmp_path / "wrap.log"
     p, repo, origin, other = _push_setup(env, monkeypatch, [COND])

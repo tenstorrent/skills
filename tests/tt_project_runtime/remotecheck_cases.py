@@ -472,3 +472,31 @@ def test_spill_settings_are_validated_and_a_scalar_is_refused():
     assert coordinator.USER_SETTABLE["delivery.checks_spill_after_s"]("45") == 45.0
     with pytest.raises(ValueError):
         coordinator.USER_SETTABLE["delivery.checks_spill_after_s"]("-1")
+
+
+def test_missing_program_on_a_check_host_runs_command_v_there_with_the_checks_env(env, tmp_path, monkeypatch, capsys):
+    # A command for a check host is resolved there (its PATH and the check's env), never here; ssh
+    # failing is no answer (precheck probes the host). `ttp checks` refuses it naming the host.
+    from ttp import cli, envfault
+    bin_, remote = _rc_fake_ssh(tmp_path)
+    monkeypatch.setenv("PATH", f"{bin_}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_REMOTE_TMP", str(remote))
+    there = tmp_path / "remote-tools"
+    there.mkdir()
+    (there / "remote-only-tool").write_text("#!/bin/sh\nexit 0\n")
+    (there / "remote-only-tool").chmod(0o755)
+    cmd = "timeout 60 remote-only-tool check ."
+    assert envfault.missing_program(cmd, tmp_path, {}, "box1") == "remote-only-tool"
+    assert envfault.missing_program(cmd, tmp_path, {}, "box1", {"PATH": f"{there}:$PATH"}) == ""
+    assert envfault.missing_program(cmd, tmp_path, {}, "down") == ""
+    monkeypatch.setenv("FAKE_SSH_FAIL", "command -v")
+    assert envfault.missing_program(cmd, tmp_path, {}, "box1") == ""
+    monkeypatch.delenv("FAKE_SSH_FAIL")
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    p.set_config("delivery.checks_host", "box1")
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--fresh", "--", cmd])
+    err = capsys.readouterr().err
+    assert e.value.code == 1 and "'remote-only-tool' is not installed on the check host box1" in err, err
+    assert not (run / "checks.json").exists()

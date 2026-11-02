@@ -2901,6 +2901,15 @@ def cmd_checks(a) -> None:
     vpy = str(push.venv_python(top, {**os.environ, **venv_vars}) or "")
     mine, dropped = _extra_checks(a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd, own, vpy, top)
     mine = push.with_host(mine, checks_host)
+    # A program the commands after `--` run that is not installed: refused now, not an exit 127 later.
+    from . import envfault
+    for c in mine:
+        host = push.remote_host(c)
+        if prog := envfault.missing_program(str(c), top, {**os.environ, **venv_vars}, host,
+                                            getattr(c, "env", None)):
+            die(f"ttp checks: {prog!r} is not installed " + (f"on the check host {host}" if host else "here")
+                + f" (`command -v {prog}` finds nothing), so {str(c)!r} after `--` cannot run; nothing was "
+                "started. Install it, or leave that command out", 1)
     wrapped, wrap = set(), ()
     if mine:   # checks.wrap_cmd: the project's own lock or queue wrapper (never the project checks)
         try:
