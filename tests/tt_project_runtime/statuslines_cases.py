@@ -40,7 +40,7 @@ def test_status_lists_only_stuck_tasks_under_stuck_one_landing_line_and_each_tas
     stuck = _section(lines, "stuck, the project is on it:")
     assert len(stuck) == 1 and stuck[0].startswith(f"  #{held} ") and "needs the device free" in stuck[0], out
     landing = [ln for ln in lines if ln.startswith("landing:")]
-    assert landing == [f"landing: 9 pushing, 0 in review, oldest 5 h; stalled: #{pushing[0]} pushing 5 h"], out
+    assert landing == [f"landing: 9 pushing, 0 in review, oldest 5 h; stalled: #{pushing[0]} pushing 5 h: change 0"], out
     waiting = _section(lines, "waiting:")
     assert len(waiting) == 6, out
     for tid in [held, pushing[0], *hot, *deferred]:

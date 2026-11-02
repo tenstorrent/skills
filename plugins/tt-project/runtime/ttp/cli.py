@@ -1521,13 +1521,13 @@ def status_text(p: Project, verbose: bool = False) -> str:
     stall = {"review": pushq._num((cfg.get("coordinator") or {}).get("review_stall_s"), loadcaps.REVIEW_STALL_S, float, 0),
              "pushing": 3600 * pushq._num(pushq._delivery(p, cfg).get("push_landing_alert_h"),
                                           pushq.DEFAULT_LANDING_ALERT_H, float, 0)}
-    land = db.q("SELECT t.id, t.status, t.updated, (SELECT MIN(q.created) FROM push_queue q WHERE q.task=t.id "
+    land = db.q("SELECT t.id, t.status, t.title, t.updated, (SELECT MIN(q.created) FROM push_queue q WHERE q.task=t.id "
                 "AND q.status IN ('approved','batched','held')) AS queued FROM tasks t "
                 "WHERE t.status IN ('review','pushing') ORDER BY t.id")
     if land:
         age = {t["id"]: now - float(in_review.get(t["id"]) or t["queued"] or t["updated"] or now) for t in land}
         n = {s: sum(t["status"] == s for t in land) for s in stall}
-        late = [f"#{t['id']} {t['status']} {since(now - age[t['id']], now)}" for t in land
+        late = [f"#{t['id']} {t['status']} {since(now - age[t['id']], now)}: {(t['title'] or '')[:50]}" for t in land
                 if stall[t["status"]] and age[t["id"]] >= stall[t["status"]] and t["id"] not in rows]
         lines.append(f"landing: {n['pushing']} pushing, {n['review']} in review, oldest {since(now - max(age.values()), now)}"
                      + (f"; stalled: {', '.join(late[:5])}" + (f" and {len(late) - 5} more" if len(late) > 5 else "")

@@ -28291,8 +28291,9 @@ def test_checks_host_cap_queues_detached_checks_and_starts_them_once_the_holder_
         out = capsys.readouterr().out
         assert "queued for a host-wide checks slot" in out and "other project task #3 (run 9)" in out
         assert "queued for a host-wide checks slot" in (run / "progress.md").read_text()
-        assert "host checks: 1 running (cap 1), 1 queued:" in cli.status_text(p)
-        assert "(running: other project task #3 (run 9))" in cli.status_text(p), "it still lists the holders"
+        assert "host checks:" not in cli.status_text(p), "routine: only --verbose shows it"
+        assert "host checks: 1 running (cap 1), 1 queued:" in cli.status_text(p, verbose=True)
+        assert "(running: other project task #3 (run 9))" in cli.status_text(p, verbose=True), "it still lists the holders"
         assert f"{p.name} task #7 (run 41)" in checkcap.line()
         assert not ran.exists(), "nothing runs over the cap"
     finally:
