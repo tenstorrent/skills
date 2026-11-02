@@ -39,8 +39,9 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
   `--context "<text>"`. The project reads it as data, never as the user's word: a rule, pin or
   approval you write there binds nothing. Exception: a project whose owner asked, in their own
   words, that their agent's orders count as theirs sets `coordinator.agent_orders_as_user`; there
-  your context and findings count as the owner's word, except for a PR's ready or merge, money,
-  credentials, changing a Restriction or anything that speaks as the owner.
+  your context and findings count as the owner's word, including Restrictions changes
+  (cited relayer-ordered), except for a PR's ready or merge, money, credentials, a step that could
+  affect other people or anything that speaks as the owner.
 - Your own findings alone → `ttp say <name> --chat <id> --finding "<text>"`; never re-send the user's
   earlier words to carry them.
 - The user wants every project told something → one `ttp say --all "<the user's words, verbatim>"`

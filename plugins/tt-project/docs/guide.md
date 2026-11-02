@@ -9,7 +9,7 @@ Install details, updates and uninstall: [install.md](install.md).
 |---|---|
 | "Start a tt-project called X on box B: <brief>" | the project is created on B and starts working |
 | "Connect to project X" | this chat attaches; replies and alerts arrive here |
-| anything addressed to the project | relayed to the coordinator verbatim (the chat's own context goes apart, in `ttp say --context`, or alone in `ttp say --finding`, and counts as your word only in a project where you turned on `coordinator.agent_orders_as_user`, never for a PR's ready or merge, money, credentials, changing a Restriction or speaking as you); its answer comes back to this chat |
+| anything addressed to the project | relayed to the coordinator verbatim (the chat's own context goes apart, in `ttp say --context`, or alone in `ttp say --finding`, and counts as your word only in a project where you turned on `coordinator.agent_orders_as_user`, never for a PR's ready or merge, money, credentials, a step that could affect other people or speaking as you; a Restrictions change it orders is cited relayer-ordered and listed in the daily review); its answer comes back to this chat |
 | "Tell all projects: <words>" | `ttp say --all`: every project in `ttp list` gets your words once, marked as a broadcast, so none relays them on; a resend within 24 h reaches only the ones that missed it |
 | "What is X doing?" | `ttp status X`: running work, blockers, spend, why idle |
 | "How are all my projects?" | `ttp overview` (or the web app's Projects tab): one line per project on this machine |
