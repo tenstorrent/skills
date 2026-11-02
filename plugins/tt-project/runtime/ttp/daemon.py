@@ -58,6 +58,7 @@ from . import throughmute
 from . import probespawn
 from . import probevars
 from . import urgent
+from . import eventhold
 from . import convgate
 from . import unstarted
 from . import boundedchild
@@ -7332,6 +7333,8 @@ class Daemon:
                 return
             if not msgs and self._batch_hold(own, now):
                 return
+            if not msgs and self._event_hold(own, now):
+                return
         if not msgs:
             try:
                 # Every open task held by what no turn lifts, and nothing new since the last turn: a
@@ -7466,22 +7469,48 @@ class Daemon:
             return False
         if not all(coord.batchable(e["kind"], e["severity"]) for e in evs):
             return False
-        db = self.p.db
-        gate = self.gates.get(self.cfg.get("core_provider", "claude"))
-        busy = db.one("SELECT COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running'")["n"]
-        slots = (gate.max_parallel if gate.allow_new_work else 0) if gate else \
-            int(self.cfg["budget"].get("max_parallel_workers", 6))
+        busy, slots = self._worker_slots()
         if busy >= slots:
             return True   # no slot is free; nothing the turn queues could start before one is
         if all(self._plain_done(e) for e in evs):
             return True   # a plain hand-off leaves the turn nothing to queue: it waits for company
+        return busy + self._runnable_count(now) >= slots
+
+    def _event_hold(self, evs: list[dict], now: float) -> bool:
+        """Routine event-only batches wait until coordinator.event_hold_s after the last turn ended, so
+        one turn reads the events that arrive meanwhile (eventhold.py), unless a worker slot is free with
+        no ready task to fill it."""
+        try:
+            row = self.p.db.one("SELECT MAX(ended) t FROM runs WHERE role='coordinator'")
+            end = eventhold.until(self.cfg, [], evs, row["t"] if row else None, now)
+            if end is None:
+                return False
+            busy, slots = self._worker_slots()
+            if busy < slots and not self._runnable_count(now):
+                return False   # a free slot and nothing ready: the turn may queue work for it now
+        except Exception:   # the hold only saves money: a failure runs the turn
+            log(self.p, "coordinator event hold failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
+            return False
+        return True
+
+    def _worker_slots(self) -> tuple[int, int]:
+        """(running worker runs, worker slots the core provider's gate allows now)."""
+        gate = self.gates.get(self.cfg.get("core_provider", "claude"))
+        busy = self.p.db.one("SELECT COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running'")["n"]
+        slots = (gate.max_parallel if gate.allow_new_work else 0) if gate else \
+            int(self.cfg["budget"].get("max_parallel_workers", 6))
+        return busy, slots
+
+    def _runnable_count(self, now: float) -> int:
+        """Ready tasks dispatch could start now: none held by a paused resource, a pause, a logout,
+        the network or a branch hold, or the checks the daemon started on a review's head."""
+        db = self.p.db
         paused = db.paused_resources()
         # A review held for the checks the daemon started on its head (_precheck_holds) fills no slot yet.
-        runnable = sum(1 for t in db.ready_tasks() if not coord.task_resources(t) & paused.keys()
-                       and not (t["blocked_reason"] or "").startswith((PAUSED_NOTE, LOGGED_OUT_NOTE, NET_HELD_NOTE,
-                                                                         BRANCH_HELD_NOTE))
-                       and not self._precheck_holds(t, now))
-        return busy + runnable >= slots
+        return sum(1 for t in db.ready_tasks() if not coord.task_resources(t) & paused.keys()
+                   and not (t["blocked_reason"] or "").startswith((PAUSED_NOTE, LOGGED_OUT_NOTE, NET_HELD_NOTE,
+                                                                     BRANCH_HELD_NOTE))
+                   and not self._precheck_holds(t, now))
 
     def _plain_done(self, e: dict) -> bool:
         """A normal task_done with no follow-up proposed, no live task depending on it and no waiting

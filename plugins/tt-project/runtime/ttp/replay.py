@@ -7,10 +7,13 @@ before it started a run soon after (the dispatcher starts runnable work within a
 task a held turn would only queue later does not count until the replay has read that turn's events.
 
     python3 -m ttp.replay <project folder or project.db> [--days 2] [--batch-s 300] [--slots N]
+                          [--event-hold-s 300]
 
 Reports the turns each rule starts, the share batching saves, `idle_slot_s` (free slots with nothing
 to run while a batch is held) and `extra_idle_slot_s` (real run seconds the batched replay could not
 run yet, beyond the unbatched one). `--rule always` replays a plain time window for comparison.
+`--event-hold-s` also replays coordinator.event_hold_s (eventhold.py) over the batched rule:
+`held_turns` and `turns_saved_by_hold` count what it saves on top of batching.
 """
 from __future__ import annotations
 
@@ -22,6 +25,7 @@ import sys
 import time
 from pathlib import Path
 
+from . import eventhold
 from .coordinator import batchable
 
 STEP_S = 5.0
@@ -76,7 +80,7 @@ def _creators(data: dict) -> dict:
 
 def simulate(data: dict, batch_s: float, slots: int, debounce_s: float = 15.0, window_s: float = 60.0,
              max_events: int = 40, max_per_hour: int = 30, turn_s: float | None = None,
-             rule: str = "fill") -> dict:
+             rule: str = "fill", event_hold_s: float = 0.0) -> dict:
     """Start turns like maybe_coordinate does. A real worker run counts only once the replayed turns
     have read the events of the real turn that queued its task; the run seconds lost before that are
     `lost_run_s`, the work a later turn would have kept off a free slot."""
@@ -123,6 +127,13 @@ def simulate(data: dict, batch_s: float, slots: int, debounce_s: float = 15.0, w
                     if hold:
                         held_s += STEP_S
                         idle_slot_s += max(0, slots - busy - runnable) * STEP_S
+                # The event hold: routine event-only batches wait until event_hold_s after the last turn
+                # ended, unless a slot is free with nothing ready to fill it.
+                if not hold and event_hold_s > 0 and turns and not pending_m \
+                        and eventhold.routine(pending_e) and t < turns[-1] + turn_s + event_hold_s \
+                        and (busy >= slots or runnable > 0):
+                    hold = True
+                    held_s += STEP_S
                 recent = sum(1 for x in turns if x > t - 3600)
                 if not hold and (recent < max_per_hour or pending_m):
                     turns.append(t)
@@ -135,9 +146,10 @@ def simulate(data: dict, batch_s: float, slots: int, debounce_s: float = 15.0, w
             "lost_run_s": lost_run_s}
 
 
-def report(data: dict, batch_s: float, slots: int, **kw) -> dict:
+def report(data: dict, batch_s: float, slots: int, event_hold_s: float = 0.0, **kw) -> dict:
     base = simulate(data, 0, slots, **kw)
     batched = simulate(data, batch_s, slots, **kw)
+    held = simulate(data, batch_s, slots, event_hold_s=event_hold_s, **kw) if event_hold_s > 0 else None
     ok = [t for t in data["turns"] if t["status"] == "ok"]
     triggered = [t for t in ok if t["events"] or t["messages"]]
     cost = statistics.mean([t["cost_usd"] or 0 for t in triggered]) if triggered else 0.0
@@ -147,7 +159,11 @@ def report(data: dict, batch_s: float, slots: int, **kw) -> dict:
             "saved_pct": round(100.0 * (nb - nn) / nb, 1) if nb else 0.0,
             "est_saved_usd": round((nb - nn) * cost, 2), "held_s": batched["held_s"],
             "idle_slot_s": batched["idle_slot_s"],
-            "extra_idle_slot_s": batched["lost_run_s"] - base["lost_run_s"]}
+            "extra_idle_slot_s": batched["lost_run_s"] - base["lost_run_s"],
+            **({"event_hold_s": event_hold_s, "held_turns": len(held["turns"]),
+                "turns_saved_by_hold": nn - len(held["turns"]),
+                "est_saved_by_hold_usd": round((nn - len(held["turns"])) * cost, 2),
+                "hold_extra_idle_slot_s": held["lost_run_s"] - batched["lost_run_s"]} if held else {})}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -157,6 +173,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--batch-s", type=float, default=300.0)
     ap.add_argument("--slots", type=int, default=None, help="worker slots (default: the project's "
                     "budget.max_parallel_workers, else 6)")
+    ap.add_argument("--event-hold-s", type=float, default=0.0, help="also replay coordinator.event_hold_s")
     ap.add_argument("--debounce-s", type=float, default=15.0)
     ap.add_argument("--window-s", type=float, default=60.0)
     ap.add_argument("--rule", choices=("fill", "slots", "always"), default="fill",
@@ -172,7 +189,7 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError):
             slots = 6
     out = report(load(db, a.days), a.batch_s, slots, debounce_s=a.debounce_s, window_s=a.window_s,
-                 rule=a.rule)
+                 rule=a.rule, event_hold_s=a.event_hold_s)
     print(json.dumps(out, indent=1))
     return 0
 

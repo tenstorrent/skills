@@ -42,7 +42,10 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    Routine events (a task done, its follow-ups and notes, normal observations) wait up to
    `coordinator.batch_s` for company, only while every worker slot is busy or runnable work is
    queued; user messages, failed, blocked or review hand-offs, high events and an idle slot with
-   nothing to run wake it at once. A ride-along event (data flag `ride_along`: a forgotten
+   nothing to run wake it at once. A batch of only task_done, followup_proposed, upstream_note,
+   checks_slot_wait or task_waiting events at routine severity also waits until
+   `coordinator.event_hold_s` (300 s) after the last turn ended, unless a slot is free with nothing
+   ready to fill it (eventhold.py). A ride-along event (data flag `ride_along`: a forgotten
    `continue:` follow-up, a repeat block of a non-urgent task) starts no turn alone: it joins the
    next turn something else starts, or starts one an hour after it was raised. It stays queued
    in the database, so a restart keeps it (pagesev.py).
