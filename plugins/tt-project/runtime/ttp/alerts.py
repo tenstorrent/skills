@@ -49,6 +49,10 @@ CLAIM_TTL = DAY + 3600  # a claim its holder stopped renewing (gone, or no remin
 FEED_DAYS = 7
 START_FAILED = "could not start a run: "   # a queued task's note after a failed run start (Daemon._start_failed)
 START_RETRY_S = 600.0   # a start failure retries within a minute; a task not due this soon was deferred
+# An episode with a clear message closes only once its condition stayed healthy this long (sweep): a fault
+# that fails and recovers every minute is one alert and one clear, not one of each per recovery.
+CLEAR_HOLD_S = 600.0
+HEALTHY = "alerts_healthy"   # kv: open episode id -> when sweep first saw its condition healthy since its last report
 LOGOUT_REMIND_S = (3600.0, 4 * 3600.0, 12 * 3600.0)   # a logout is reminded this long after it began, then daily
 WAITER_TTL = 1800.0     # a project's report into a logout claim counts this long (it renews every few minutes)
 # What the chat hears once an episode clears.
@@ -336,6 +340,9 @@ def _close(db: DB, ep: dict, now: float, why: str, text: str | None = None,
         if acked.get("why") and acked["why"] != why:
             why = f"{why} (acknowledged: {acked['why']})"
     db.x("UPDATE alerts SET cleared=?, cleared_why=? WHERE id=?", (now, why, ep["id"]))
+    healthy = db.kv(HEALTHY, {}) or {}
+    if healthy.pop(str(ep["id"]), None) is not None:
+        db.set_kv(HEALTHY, healthy)
     sent = db.kv("alerts_sent", {}) or {}
     if ep["key"] in sent:
         sent.pop(ep["key"])
@@ -432,14 +439,30 @@ def clear_kind(db: DB, kind: str, why: str, now: float | None = None) -> list[di
                 for ep in db.q("SELECT * FROM alerts WHERE key LIKE ? AND cleared IS NULL ORDER BY id", (f"{kind}:%",))]
 
 
+def _settled(healthy: dict, ep: dict, kind: str, now: float) -> bool:
+    """Whether a cleared condition may close its episode now. One with a clear message waits until it
+    stayed healthy CLEAR_HOLD_S: a repeat report or a failing check in between restarts the wait, and
+    the repeat only updated the open episode (Daemon.alert), so a flapping fault is one alert, one clear."""
+    hold = float(os.environ.get("TTP_TEST_CLEAR_HOLD_S") or CLEAR_HOLD_S)   # tests of other alerts: 0, at once
+    if kind not in CLEARED_TEXT or hold <= 0:
+        return True
+    mark = healthy.get(str(ep["id"]))
+    if mark is None or float(ep["last"] or 0) >= float(mark):
+        healthy[str(ep["id"])] = now
+        return False
+    return now - float(mark) >= hold
+
+
 def sweep(db: DB, now: float | None = None) -> list[dict]:
-    """Close every open episode whose condition cleared: store when and why, let the same condition
-    alert again at once, and tell the chats once. Returns the episodes closed."""
+    """Close every open episode whose condition cleared (and, with a clear message, stayed healthy
+    CLEAR_HOLD_S): store when and why, let the same condition alert again at once, and tell the chats
+    once. Returns the episodes closed."""
     now = now or time.time()
     closed = []
     if not db.one("SELECT id FROM alerts WHERE cleared IS NULL LIMIT 1"):
         return closed   # the usual tick: no write lock taken
     with db.tx():
+        healthy = dict(db.kv(HEALTHY, {}) or {})
         for ep in db.q("SELECT * FROM alerts WHERE cleared IS NULL ORDER BY id"):
             kind, _, arg = ep["key"].partition(":")
             why = "no longer reported" if not _checkable(ep["key"]) else "condition cleared"
@@ -447,9 +470,14 @@ def sweep(db: DB, now: float | None = None) -> list[dict]:
                 from . import heal
                 why = heal.cleared_why(db, arg, now, hold=kind == "heal-hold")
                 if why is None:
+                    healthy.pop(str(ep["id"]), None)
                     continue
             elif holds(db, ep["key"], _since(ep), now):
+                healthy.pop(str(ep["id"]), None)
                 continue
+            if not _settled(healthy, ep, kind, now):
+                continue
+            healthy.pop(str(ep["id"]), None)
             text, sev = None, None
             if kind in CLEARED_TEXT:
                 # A status line clears as quietly as it was raised.
@@ -460,6 +488,10 @@ def sweep(db: DB, now: float | None = None) -> list[dict]:
             if kind in ("heal", "heal-hold") and why != "condition cleared":
                 text, sev = f"Cleared: {ep['key']} user alert: {why}.", "low"
             closed.append(_close(db, ep, now, why, text, sev))
+        open_ids = {str(r["id"]) for r in db.q("SELECT id FROM alerts WHERE cleared IS NULL")}
+        healthy = {k: v for k, v in healthy.items() if k in open_ids}
+        if healthy != (db.kv(HEALTHY, {}) or {}):
+            db.set_kv(HEALTHY, healthy)
     return closed
 
 

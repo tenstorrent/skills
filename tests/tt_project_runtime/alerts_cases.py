@@ -5201,3 +5201,72 @@ def test_a_codex_login_back_on_another_chatgpt_account_is_an_account_switch(env,
     monkeypatch.setenv("CODEX_HOME", str(_codex_auth(tmp / "two", "acct-2222")))
     assert d._account_switched("codex", rec) == {"from": "codex (chatgpt)", "to": "codex (chatgpt)"}
     assert "acct-" not in json.dumps(alerts.breaker(p.db, "codex"))
+
+
+def _run_start_flaps(env, monkeypatch):
+    """A daemon whose run starts fail and succeed in turn, on a clock the test moves."""
+    from ttp import alerts
+    from ttp.daemon import Daemon
+    monkeypatch.delenv("TTP_TEST_CLEAR_HOLD_S")   # the real healthy window
+    p = make(env)
+    d = Daemon(p.base)
+    clock = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    tid = p.db.add_task("queued work")
+
+    def fail():
+        p.db.update_task(tid, status="queued", not_before=clock[0] + 60, blocked_reason=alerts.START_FAILED + "OSError")
+        d.alert("run-start", "Runs cannot start (OSError). Tasks stay queued and retry every minute.", "high")
+        d.sweep_alerts()
+
+    def ok():
+        p.db.update_task(tid, status="queued", not_before=None, blocked_reason=None)
+        d.sweep_alerts()
+
+    def said(kind):
+        return p.db.one("SELECT COUNT(*) n FROM messages WHERE ref='run-start' AND kind=?", (kind,))["n"]
+
+    return p, d, clock, fail, ok, said
+
+
+def test_a_flapping_run_start_fault_sends_one_alert_and_clears_once_after_the_healthy_window(env, monkeypatch):
+    from ttp import alerts
+    p, d, clock, fail, ok, said = _run_start_flaps(env, monkeypatch)
+    start = clock[0]
+    for _ in range(20):   # fail, then a good start, every 14 s: 20 toggles inside 10 minutes
+        fail()
+        clock[0] += 7
+        ok()
+        clock[0] += 7
+    assert said("alert") == 1 and said("resolved") == 0
+    assert clock[0] - start < alerts.CLEAR_HOLD_S
+    ep = p.db.one("SELECT * FROM alerts WHERE key='run-start'")
+    assert ep["cleared"] is None and ep["last"] > ep["raised"]   # repeats only moved its last-seen time
+    last_fail = ep["last"]
+    clock[0] = last_fail + alerts.CLEAR_HOLD_S - 1
+    ok()
+    assert said("resolved") == 0   # healthy, but not yet for the whole window
+    clock[0] = last_fail + alerts.CLEAR_HOLD_S + 60
+    ok()
+    assert said("alert") == 1 and said("resolved") == 1
+    assert p.db.one("SELECT cleared FROM alerts WHERE key='run-start'")["cleared"] >= last_fail + alerts.CLEAR_HOLD_S
+    assert not (p.db.kv(alerts.HEALTHY) or {})
+
+
+def test_a_fault_that_recurs_after_staying_cleared_past_the_window_alerts_again(env, monkeypatch):
+    from ttp import alerts
+    p, d, clock, fail, ok, said = _run_start_flaps(env, monkeypatch)
+    fail()
+    clock[0] += 30
+    ok()
+    clock[0] += alerts.CLEAR_HOLD_S + 30
+    ok()
+    assert said("alert") == 1 and said("resolved") == 1
+    clock[0] += 60
+    fail()
+    assert said("alert") == 2
+    assert len(p.db.q("SELECT id FROM alerts WHERE key='run-start'")) == 2
+    # A status condition without a clear message keeps closing at once.
+    p.db.post("out", "an unchecked report", chat=None, kind="alert", severity="high", ref="unknown-kind")
+    clock[0] += alerts.DAY + 1
+    assert any(ep["key"] == "unknown-kind" for ep in alerts.sweep(p.db, clock[0]))
