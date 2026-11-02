@@ -49,7 +49,7 @@ def test_a_steady_small_drift_is_corrected_without_an_alert(env, tmp_path, monke
     b = _far_day(now)
     ls.scan(b, now)
     start, end = gcap.day_bounds(b, now)
-    assert abs(ls.estimate(b, start, end, now)["usd"] - 15 * 1.03) < 1e-3
+    assert abs(ls.estimate(b, start, end, now)["usd"] - (15 + 4 * _PRICED) * 1.03) < 1e-3   # the runs' logs count too
     # A run's own calibration still prices at the table, so the factor never feeds on itself.
     assert ls.session_cost("r0") == (_PRICED, False)
 
@@ -117,7 +117,7 @@ def test_a_factor_out_of_bounds_is_not_applied_and_alerts_once(env, tmp_path, mo
     b = _far_day(now)
     ls.scan(b, now)
     start, end = gcap.day_bounds(b, now)
-    assert ls.estimate(b, start, end, now)["usd"] == 15
+    assert ls.estimate(b, start, end, now)["usd"] == pytest.approx(15 + 4 * _PRICED)   # at the table
     # A state file edited by hand past the bounds, or measured against other rates, is not applied.
     rates = list(ls.PRICES["claude-sonnet-4-5"])
     for bad in ({"factor": 5.0, "applied": True, "rates": rates}, {"factor": 0.1, "applied": True, "rates": rates},
