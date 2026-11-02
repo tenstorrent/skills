@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from . import budget as bud
-from . import chaincap, conflictfix, overlap, relay, replymsg, settinghold, settled, taskfacts, timefmt
+from . import chaincap, conflictfix, overlap, relay, replymsg, settinghold, settled, taskfacts, tierfloor, timefmt
 from .db import continues_id, load_result
 from .hook import unread_update
 from .project import rebase_replace
@@ -765,6 +765,10 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         history += (f"This run is a {run_tier} wake: check whether the wait is over. If it is and substantial "
                     f"work remains, hand off `waiting` with `retry_after_s: 0` and `wake_tier: \"{task['tier']}\"` "
                     f"at once: the task runs again now at its own tier, without costing an attempt.\n")
+    if wake and run_tier != task["tier"] and not wake.get("escalated") and tierfloor.reasons(task):
+        history += (f"This task ends in a conclusion the user reads, so the hand-off it writes when the wait is over "
+                    f"is the conclusion: never write it at {run_tier}. Once the wait is over, hand off `waiting` with "
+                    f"`retry_after_s: 0` and `wake_tier: \"{task['tier']}\"` instead.\n")
     if wake and not wake.get("escalated"):
         stale = bud.stale_wakes(prev)
         cap = int((cfg.get("waiting") or {}).get("max_stale_wakes", 3) or 0)

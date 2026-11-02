@@ -12,7 +12,11 @@ gets tier max(its own, floor tier) and effort max(its own, floor effort), the ne
 provider takes. The floor is coordinator.conclusion_floor (default DEFAULT: standard, high). A review
 keeps its diff-sized tier; a task whose pin the user's own words require (pin_required) stays as it is.
 A waiting conclusion task's wake whose wait is over may write the answer, so it runs at the floor too;
-only a stale wake (the same wait handed back) stays a light check. A budget gate whose max_tier is
+only a poll stays a light check: a stale wake (the same wait handed back) or a wake whose hand-off asked
+for `wake_tier: light` and was not escalated (poll_wake; the daemon's own light relaunch after a reboot
+too). Such a wake gets neither the floor tier nor its effort; its prompt tells it to hand off `waiting`
+with `retry_after_s: 0` at the task's own tier, not the final hand-off, once the wait is over, so the
+run that writes the conclusion is an escalated wake at the floor. A budget gate whose max_tier is
 below the floor tier does not clamp a conclusion run: the run waits queued (HELD_NOTE) until the gate
 allows the floor, so it spends nothing extra and the gate keeps its cap.
 
@@ -112,6 +116,13 @@ def reasons(task: dict) -> list[str]:
 def _rank(effort: str | None) -> int:
     e = (effort or "").strip().lower()
     return EFFORT_RANK.index(e) if e in EFFORT_RANK else -1   # unset: the provider's own default, below any floor
+
+
+def poll_wake(prev: dict) -> bool:
+    """Whether a waiting hand-off (`prev`) asked for a light wake that only checks its wait: its
+    `wake_tier` is light and no light wake escalated it since. The floor leaves such a wake light."""
+    return (isinstance(prev, dict) and prev.get("status") == "waiting" and prev.get("wake_tier") == "light"
+            and not prev.get("escalated_wake"))
 
 
 def target(db, cfg: dict, task: dict) -> dict | None:

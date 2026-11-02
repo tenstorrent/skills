@@ -730,7 +730,10 @@ to the new tier's default, sets `tier_source` to `conclusion_floor` and adds a s
 `[tier floor] light->standard (conclusion: kind question)`. Reviews keep their diff-sized tier,
 a pin the user's own words require (`pin_required`) stays, and a failed try still retries a tier
 up. A waiting conclusion task's wake whose wait is over runs at the floor too, since it may write
-the answer; a stale wake (the same wait handed back) stays a light check. When the budget gate
+the answer. A poll stays a light check at the light tier's effort: a stale wake (the same wait
+handed back), or a wake whose hand-off asked for `wake_tier: light` and was not escalated. Such a
+wake hands off `waiting` with `retry_after_s: 0` at the task's own tier once the wait is over, so
+the run that writes the conclusion is at the floor. When the budget gate
 allows only a tier below the floor, a conclusion run stays queued (`held: tier floor waits for the
 budget gate to allow standard`) and starts at the floor once the gate eases. Set it per project with
 `ttp config <name> coordinator.conclusion_floor deep/xhigh`, or `off`.

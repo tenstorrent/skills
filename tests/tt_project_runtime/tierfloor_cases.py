@@ -264,3 +264,44 @@ def test_a_conclusion_runs_effort_floor_lifts_a_low_tier_effort_as_the_provider_
     assert launch() == "low" and launch(min_effort="high") == "high"
     # Claude takes no `minimal`: the floor lands on the nearest effort it takes.
     assert tierfloor.kept_effort("claude", "minimal") == "low"
+
+
+def test_a_conclusion_tasks_poll_wake_keeps_the_light_tier_its_hand_off_asked_for(env, monkeypatch):
+    """A hand-off's `wake_tier: light` is a poll: the conclusion floor lifts neither its tier nor its
+    effort, on the probe-pass and the reboot wake, even past a budget gate capped at light. A wake that
+    may write the conclusion (an escalated wake, a spec-change wake, no wake_tier asked) keeps the floor."""
+    from ttp import budget as bud
+    from ttp.daemon import SPEC_SEEN_KEY
+    from ttp.prompts import spec_digest, worker_task
+    p, d, started = _floor_daemon(env, monkeypatch)
+    t = p.db.add_task("Measure the fix", "Run the benchmark.\nconclusion: did the fix help?", kind="work",
+                      tier="standard", origin="coordinator", provider="claude", budget_usd=8.0)
+    waits = {"status": "waiting", "summary": "benchmark runs", "retry_when": "test -e /nonexistent/done",
+             "waiting_for": "the benchmark", "wake_tier": "light", SPEC_SEEN_KEY: spec_digest(p.db.task(t))}
+
+    def wake(result, how="probe"):
+        p.db.update_task(t, status="queued", result=json.dumps(result), not_before=time.time() + 3600)
+        if how == "probe":
+            d._probe_passed(p.db.task(t), time.time())
+        else:
+            p.db.update_task(t, not_before=None)
+        started.clear()
+        d.dispatch()
+        return [(a[3], k["min_effort"], k["note"]["wake"]["tier"]) for a, k in started]
+
+    assert wake(waits) == [("light", None, "light")], "a probe-pass wake of a light hand-off is a poll"
+    kw = started[0][1]
+    assert "the hand-off it writes when the wait is over is the conclusion" in worker_task(
+        p, p.db.task(t), str(p.base), None, wake=kw["note"]["wake"])
+    # A reboot that cut its detached job: the daemon's own light relaunch wake is a poll too.
+    cut = {**waits, "wake_tier": "light", "woke": "the host rebooted and cut short detached job x"}
+    assert wake(cut, how="boot") == [("light", None, "light")]
+    # A budget gate capped at light holds no poll: it runs light.
+    d.gates = {"claude": bud.Gate(provider="claude", level="orange", max_tier="light", max_parallel=2)}
+    assert wake(waits) == [("light", None, "light")] and not p.db.task(t)["blocked_reason"]
+    d.gates = {"claude": bud.Gate(provider="claude", level="green", max_tier="deep", max_parallel=2)}
+    # Wakes that may write the conclusion keep the floor.
+    assert wake({**waits, "escalated_wake": True}) == [("standard", "high", "standard")]
+    assert wake({k: v for k, v in waits.items() if k != "wake_tier"}) == [("standard", "high", "standard")]
+    p.db.update_task(t, spec=p.db.task(t)["spec"] + "\n\n## Update\nAlso compare against the old build.")
+    assert wake(waits) == [("standard", "high", "standard")], "a spec change is new work at the task's own tier"
