@@ -161,3 +161,56 @@ def test_fenced_hook_lets_ssh_on_its_own_and_ssh_as_data_run(env, monkeypatch, c
     monkeypatch.setenv("TTP_FENCE_BY_NAME", "1")
     out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(env["tmp"])})
     assert not out or out["hookSpecificOutput"].get("permissionDecision") != "deny", out
+
+
+def test_fence_frees_git_network_commands_by_name():
+    from ttp.providers import claude
+    excluded = claude.sandbox_settings(["/wt"])["excludedCommands"]
+    for cmd in ("git fetch *", "git pull *", "git push *", "git ls-remote *", "git clone *", "git remote update *"):
+        assert cmd in excluded, cmd
+
+
+def _repo(tmp, name, url):
+    import subprocess
+    d = tmp / name
+    subprocess.run(["git", "init", "-q", str(d)], check=True)
+    subprocess.run(["git", "-C", str(d), "remote", "add", "origin", url], check=True)
+    return d
+
+
+def _decision(hook, cmd, cwd):
+    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(cwd)})
+    return out and out["hookSpecificOutput"].get("permissionDecision") == "deny" and \
+        out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize("cmd", [
+    "git fetch && git rebase origin/x", "git fetch origin 2>&1 | tail -3", "git -C {ssh} fetch",
+    "cd {ssh} && git pull --rebase", "git push origin HEAD:main; echo ok", "git remote update && git status",
+    "timeout 60 git ls-remote origin | head", "git submodule update --init && make",
+    "cd {https} && git clone git@example.com:org/r.git x && ls", "git ls-remote ssh://example.com/r.git | wc -l",
+])
+def test_fenced_hook_refuses_git_over_ssh_beside_other_commands(env, monkeypatch, cmd):
+    from ttp import hook
+    ssh, https = _repo(env["tmp"], "s", "git@example.com:org/r.git"), _repo(env["tmp"], "h", "https://example.com/r.git")
+    cmd = cmd.format(ssh=ssh, https=https)
+    monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"]))
+    monkeypatch.setenv("TTP_FENCE_BY_NAME", "1")
+    why = _decision(hook, cmd, ssh)
+    assert why and "on its own" in why and "git " in why, why
+    monkeypatch.delenv("TTP_FENCE_BY_NAME")
+    assert not _decision(hook, cmd, ssh), "unfenced: git reaches any remote"
+
+
+@pytest.mark.parametrize("cmd,where", [
+    ("git fetch", "ssh"), ("timeout 60 git push origin HEAD:x", "ssh"), ("git fetch && git rebase origin/x", "https"),
+    ("git -C {https} fetch", "ssh"), ("cd {https} && git pull", "ssh"), ("git status && git log -1", "ssh"),
+    ("git commit -m 'git fetch && git push' && echo ok", "ssh"), ("git push origin HEAD:main; echo ok", "https"),
+    ("git clone https://example.com/r.git x && ls x", "ssh"),
+])
+def test_fenced_hook_lets_git_on_its_own_or_over_https_run(env, monkeypatch, cmd, where):
+    from ttp import hook
+    ssh, https = _repo(env["tmp"], "s", "git@example.com:org/r.git"), _repo(env["tmp"], "h", "https://example.com/r.git")
+    monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"]))
+    monkeypatch.setenv("TTP_FENCE_BY_NAME", "1")
+    assert not _decision(hook, cmd.format(ssh=ssh, https=https), ssh if where == "ssh" else https)

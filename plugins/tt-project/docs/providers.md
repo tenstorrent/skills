@@ -23,7 +23,7 @@ Claude Code measured on 2026-11-02, Codex CLI on 2026-10-09:
 | Session id | pass (assigned up front) | pass | not measured |
 | Usage | pass (reported cost) | pass (estimated from tokens) | not measured |
 | Structured output | pass | pass | not measured |
-| Write fence | pass on 2.1.296 (refused: read-only file system): the Bash sandbox where it can start (Linux with bwrap and socat, macOS); `providers.claude.write_fence` false turns it off; ssh, scp, sftp, rsync, `ttp lock`, `ttp machines` and `ttp devq` run outside it by name | pass (refused: read-only file system) | off: the sandbox denies network by default and no CLI flag allows it, so workers run with `--force` alone; on under `no_internet`, built, not measured live |
+| Write fence | pass on 2.1.296 (refused: read-only file system): the Bash sandbox where it can start (Linux with bwrap and socat, macOS); `providers.claude.write_fence` false turns it off; ssh, scp, sftp, rsync, git's network commands (fetch, pull, push, ls-remote, clone, remote and submodule update), `ttp lock`, `ttp machines` and `ttp devq` run outside it by name | pass (refused: read-only file system) | off: the sandbox denies network by default and no CLI flag allows it, so workers run with `--force` alone; on under `no_internet`, built, not measured live |
 | Resume | pass | pass | not measured |
 | Steer mid-run | pass (hook) | unsupported: no hook, the worker reads `steer.md` between steps | not measured |
 | Plan meter | pass (seven-day; the run reported no five-hour window) | pass (seven-day) | not measured |
@@ -85,6 +85,11 @@ passed again for Claude Code with workers in the write fence (38 s, $0.12).
   `timeout N` or `ttp lock <res> --`), never inside `&&`, `;` or a pipe, nor from a script: there
   host names do not resolve. The hook refuses such a compound command and says to run ssh by
   itself, with any pipe inside the quoted remote command; a script that runs ssh still fails.
+  git over an SSH remote (`git@host:...`, `ssh://`) is the same: `git fetch ...` on its own reaches
+  the host (measured, `git ls-remote`), but not inside a compound command or after `git -C`, which
+  the hook refuses. It tells an explicit URL's kind from the URL, else refuses when any remote of
+  the repository uses SSH, even if the command names an HTTPS one. Still failing against an SSH
+  remote: ttp commands and scripts that fetch or push internally, which run in the sandbox.
 - Cursor: outside `no_internet` projects, workers run with `--force` alone and no write fence;
   `ttp doctor` names the reason.
   The sandbox would cut them off the network: in build `2026.10.22-27dcf5f` (read from its bundled

@@ -74,6 +74,7 @@ import os
 import posixpath
 import re
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 from typing import Callable
@@ -747,6 +748,60 @@ def fenced_ssh(segments: list[list[str]]) -> str | None:
                     f"inside the quoted remote command, e.g. `ssh host 'cmd | tail -20'`")
 
 
+# git's network commands the fence frees by name (FENCE_EXCLUDED); git runs ssh for an SSH remote.
+GIT_NET = {"fetch", "pull", "push", "ls-remote", "clone"}
+SSH_URL_RE = re.compile(r"^(?:(?:git\+)?ssh://|[\w.-]+@[\w.-]+:)")   # an argument: `HEAD:main` is a refspec
+SSH_REMOTE_RE = re.compile(r"^(?:(?:git\+)?ssh://|[\w.-]+@[\w.-]+:|[\w.-]+:(?!//))")   # a configured URL
+URL_RE = re.compile(r"^[a-z][\w+.-]*://")
+
+
+def _ssh_remote(gdir: str) -> bool:
+    """`gdir`'s repository has a remote with an SSH URL (True when that cannot be read: the refusal's
+    advice works either way)."""
+    try:
+        r = subprocess.run(["git", "-C", gdir, "config", "--get-regexp", r"^remote\..*\.(push)?url$"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    if r.returncode not in (0, 1):
+        return True
+    return any(SSH_REMOTE_RE.match(line.split(" ", 1)[-1].strip()) for line in r.stdout.splitlines())
+
+
+def fenced_git(segments: list[list[str]], cwd: str) -> str | None:
+    """Why a fenced worker's git network command (fetch, pull, push, ls-remote, clone, remote or
+    submodule update) against an SSH remote would fail: beside other commands, or after git options
+    such as `-C` (the fence's patterns match `git fetch ...` only). None outside such a run, for an
+    explicit non-SSH URL, or where the repository has no SSH remote."""
+    if not os.environ.get("TTP_FENCE_BY_NAME"):
+        return None
+    from . import gitguard
+    gdir = cwd
+    for s in segments:
+        if os.path.basename(s[0]) == "cd" and len(s) > 1:
+            gdir = os.path.join(gdir, os.path.expanduser(s[1]))
+        if os.path.basename(s[0]) != "git":
+            continue
+        opts, sub, rest = gitguard.split(s[1:])
+        if not (sub in GIT_NET or sub in ("remote", "submodule") and rest[:1] == ["update"]):
+            continue
+        if len(segments) < 2 and not opts:
+            continue
+        urls = [a for a in rest if SSH_URL_RE.match(a) or URL_RE.match(a)]
+        if urls:
+            ssh = any(SSH_URL_RE.match(a) for a in urls)
+        else:
+            d = next((opts[i + 1] for i, o in enumerate(opts[:-1]) if o == "-C"), "")
+            ssh = _ssh_remote(os.path.join(gdir, os.path.expanduser(d)))
+        if ssh:
+            name = f"git {sub}" + (" update" if sub in ("remote", "submodule") else "")
+            return (f"`{name}` over SSH reaches the host only when it runs on its own as `{name} ...`: inside "
+                    f"`&&`, `;` or a pipe, or after git options such as `-C`, it stays in the write fence, where "
+                    f"host names do not resolve. `cd` in a separate call, then run `{name} ...` as a command by "
+                    f"itself (under `timeout N` is fine), and the next step in another call")
+    return None
+
+
 def _deny(why: str) -> dict:
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                    "permissionDecisionReason": f"tt-project: {why}."}}
@@ -783,7 +838,7 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if not why:
         why = git_push_bypass(segments)
     if not why:
-        why = fenced_ssh(segments)
+        why = fenced_ssh(segments) or fenced_git(segments, str(payload.get("cwd") or os.getcwd()))
     if not why:
         from . import killguard
         why = killguard.refusal(cmd, str(payload.get("cwd") or os.getcwd()))

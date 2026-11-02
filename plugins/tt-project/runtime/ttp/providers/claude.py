@@ -547,9 +547,12 @@ def hook_settings() -> dict:
 # could not resolve a host name), so whatever reaches another host or a local service directly would
 # fail there. They write as the worker does without a fence. Measured (CLI 2.1.296): a pattern frees a
 # command run on its own (also under `timeout N`, and `ttp lock <res> -- ssh ...` by its own pattern),
-# never one inside `&&`, `;` or a pipe, nor one a script runs.
+# never one inside `&&`, `;` or a pipe, nor one a script runs. git starts ssh for an SSH remote, so its
+# network commands are freed by name too (measured: an excluded `git ls-remote git@host:...` resolved;
+# `X *` also frees a bare `X`; `git -C dir fetch` is not matched). The run's bin/git still runs them.
 FENCE_EXCLUDED = ("ssh *", "scp *", "sftp *", "rsync *", "ttp lock *", "ttp machines *", "ttp devq *",
-                  "ttp detach --remote *")
+                  "ttp detach --remote *", "git fetch *", "git pull *", "git push *", "git ls-remote *",
+                  "git clone *", "git remote update *", "git submodule update *")
 
 
 def fence_missing() -> list[str]:
