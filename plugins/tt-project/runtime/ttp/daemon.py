@@ -3588,8 +3588,9 @@ class Daemon:
         if not wins or read_at <= self._windows_read.get(key, 0):
             return
         self._windows_read[key] = read_at
+        acct = self._reading_account(r)
         bud.record_windows(self.p.db, [bud.Window(r["provider"], w["window"], w["utilization"], w.get("resets_at"),
-                                                  r["account"] or "") for w in wins], ts=read_at)
+                                                  acct) for w in wins], ts=read_at)
 
     def _suggest_split(self, r: dict, reread: int) -> None:
         """Once a worker's run has re-read more context than `budget.split_reread_tokens` allows for
@@ -3883,6 +3884,8 @@ class Daemon:
             self._prefetch_remote(r["task"], _read_result(run_dir / RESULT_FILE), run_dir)
             if status == "ok":
                 self._dry_run_on_pass(r, run_dir, usage.session_id or note.get("session_id") or "")
+        # Read before the transaction: it may read the provider's login files.
+        read_as = self._reading_account(r) if usage.extra.get("windows") else r["account"] or ""
         # The run's end, its spend and what it did to its task commit together: a daemon stopped
         # half way leaves the run "running", and the next tick processes it again from disk.
         with self._finish_tx(r["task"] or 0):
@@ -3898,7 +3901,7 @@ class Daemon:
             if r["task"]:
                 db.x("UPDATE tasks SET spent_usd=COALESCE(spent_usd,0)+? WHERE id=?", (usage.cost_usd, r["task"]))
                 runtimeload.clear(p, r["id"])   # finished once: a restart after this never finishes it again
-            self._record_readings(db, r["provider"], r["account"] or "", usage, ended)
+            self._record_readings(db, r["provider"], read_as, usage, ended)
             if usage.limited:
                 until = time.time() + 3600
                 db.set_kv(f"limited:{r['provider']}", {"until": until, "note": usage.limit_note})
@@ -5252,6 +5255,19 @@ class Daemon:
                     self._meter_one(db, name, prov)
             except Exception:
                 log(self.p, f"meter {name} failed: " + traceback.format_exc().replace("\n", " | ")[:800])
+
+    @staticmethod
+    def _reading_account(r: dict) -> str:
+        """The account a run's plan-window reading belongs to: the one its provider is logged in as
+        when the reading is taken. A login switched while the run went on (its CLI reads the new
+        credentials) makes that another account than the one the run started on and its spend is
+        booked to; filed under the run's account, another plan's reading would mark that account's
+        billed spend around it as plan-paid. Unknown now (logged out, unreadable): the run's own."""
+        try:
+            now = get_provider(r["provider"]).account() or ""
+        except Exception:
+            now = ""
+        return now or r["account"] or ""
 
     @staticmethod
     def _record_readings(db, provider: str, account: str, usage, now: float | None = None) -> None:

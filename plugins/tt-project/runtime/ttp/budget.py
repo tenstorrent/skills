@@ -355,20 +355,52 @@ def dollar_caps(b: dict) -> bool:
     return any(float(b.get(k) or 0) > 0 for k in ("daily_usd", "weekly_usd", "global_daily_usd"))
 
 
-def caps_spend(n: dict, day_cap, week_cap, plan: bool = False, week: str = "per 7 days") -> str:
+def caps_spend(n: dict, day_cap, week_cap, plan: bool = False, week: str = "per 7 days",
+               plan_paid: float | None = None) -> str:
     """A caps-regime gate's spend against the project dollar caps: '$7.76 of $100 today, $89.95 of
     $200 per 7 days'. A cap that is unset (0) shows its spend as a plain figure, never 'of $0', and
     with neither set the line says so: 'no dollar cap (plan windows apply): $7.76 today, ...' (the
     parenthesis only when `plan`, some provider on plan windows). A set cap shows as configured.
-    Display only."""
+    With `plan_paid` (the 7 days' spend plans paid for), the week reads '$89.95 billed by use per 7
+    days (+$34.10 paid by plans, not billed; $124.05 total)'. Display only."""
     def one(spent: float, cap, span: str) -> str:
         return f"${spent:.2f} {span}" if float(cap or 0) <= 0 else f"${spent:.2f} of ${cap} {span}"
     est = f" (${n['estimated_24h']:.2f} of it estimated)" if n.get("estimated_24h") else ""
     day = (one(n["spent_today"], day_cap, "today") if "spent_today" in n
            else one(n.get("spent_24h", 0), day_cap, "per 24h"))
+    if plan_paid is not None:
+        week = (f"billed by use {week} (+${plan_paid:.2f} paid by plans, not billed; "
+                f"${float(n.get('spent_7d', 0)) + plan_paid:.2f} total)")
     out = f"{day}{est}, {one(n.get('spent_7d', 0), week_cap, week)}"
     if float(day_cap or 0) <= 0 and float(week_cap or 0) <= 0:
         out = f"no dollar cap{' (plan windows apply)' if plan else ''}: {out}"
+    return out
+
+
+def plan_paid(db: DB, since: float, until: float | None = None) -> float:
+    """Ledger spend in [since, until) that plans paid for: the rows billing.billed_by_account leaves
+    out, so billed plus this is SUM(ledger.usd) over the window."""
+    from .db import counted_spend
+    where, args = counted_spend(since, until)
+    total = float(db.one(f"SELECT COALESCE(SUM(usd),0) s FROM ledger WHERE {where}", args)["s"])
+    return max(total - sum(billed_by_account(db.conn, since, until, memo=db.billing_memo).values()), 0.0)
+
+
+def caps_line(db: DB, gates: dict, b: dict, now: float) -> str:
+    """The project dollar caps, once for all usage-billed providers together: the numbers of any
+    caps-regime gate in `gates` (dicts; the caps count every provider's billed spend, so they are the
+    same in each), else the billed spend itself; the 7 days' plan-paid spend beside it, so the total
+    is the ledger's; and the global daily cap when one is set."""
+    n = next((g.get("numbers") or {} for g in gates.values() if g.get("regime") not in ("windows", "plan")), None)
+    if n is None:
+        n = {"spent_24h": round(db.spent_since(now - DAY, billed=True), 2),
+             "spent_7d": round(db.spent_since(now - WEEK, billed=True), 2)}
+    plan = any(g.get("regime") == "windows" for g in gates.values())
+    out = caps_spend(n, b.get("daily_usd"), b.get("weekly_usd"), plan, plan_paid=round(plan_paid(db, now - WEEK), 2))
+    if "global_today" in n:
+        stale = f", {len(n['global_stale'])} machine(s) stale" if n.get("global_stale") else ""
+        out += (f" · global daily cap (whole account): ${n['global_today']:.2f} of "
+                f"${float(n.get('global_cap') or 0):.0f} today ({n.get('global_includes') or 'this account'}{stale})")
     return out
 
 

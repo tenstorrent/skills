@@ -478,6 +478,8 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     spend["headline"] = budget_line(db, now, core, g, spend["spent_24h"], gates)
     spend["route_line"] = route.phrase(db, now)   # routing stats: the Budget tab and ttp status --verbose
     spend["detail"] = gate_detail(g, now, tz, gates) if g else ""
+    # The project caps once, with the 7 days' plan-paid spend beside the billed figure (budget.caps_line).
+    spend["caps_line"] = bud.caps_line(db, gates or {}, p.config()["budget"], now)
     return {
         "zone": timefmt.zone_name(p.raw_config()),   # the home zone every time here is shown in
         "spend": spend,

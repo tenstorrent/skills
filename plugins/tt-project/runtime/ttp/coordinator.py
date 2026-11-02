@@ -995,18 +995,13 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
             money = (f"on a plan with no meter (declared in providers.{prov}.billing): no dollar cap; "
                      f"its dollars are estimates, not billed")
         else:
-            plan = any(x.get("regime") == "windows" for x in gates.values())
-            money = ("project caps (usage-billed providers together): "
-                     + bud.caps_spend(n, b.get("daily_usd"), b.get("weekly_usd"), plan))
-            if "global_today" in n:
-                stale = f", {len(n['global_stale'])} machine(s) stale" if n.get("global_stale") else ""
-                money += (f" · global daily cap (whole account): ${n['global_today']:.2f} of "
-                          f"${float(n.get('global_cap') or 0):.0f} today ({n.get('global_includes') or 'this account'}"
-                          f"{stale})")
+            money = "on the dollar caps (their one line is below)"
         path = credits.unblock_path(db, p.config(), prov, now)
         lines.append(f"- {prov}: {g['level']} ({'; '.join(g['reasons']) or 'ok'}) · {money} · max_tier={g['max_tier']} "
                      f"max_parallel={g['max_parallel']} optional_work={'yes' if g['allow_optional'] else 'no'}"
                      + (f" · unblock path: {path}" if path else ""))
+    # Once, not per provider: the caps bound every usage-billed provider's spend together.
+    lines.append("- project caps (usage-billed providers together): " + bud.caps_line(db, gates, b, now))
     lines.append(f"- per-task default budgets: {b.get('task_default_usd')}")
     section("budget", lines)
     lines = []

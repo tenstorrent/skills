@@ -4031,7 +4031,7 @@ def test_the_caps_line_never_reads_of_zero_once_the_dollar_caps_are_unset(env):
 
     def line(gates):
         d = coord.digest(p, gates, [], [])
-        return next(x for x in d.splitlines() if x.startswith("- codex:"))
+        return next(x for x in d.splitlines() if x.startswith("- project caps"))
 
     for day, week in ((100, 2000), (0, 0), (0, 2000)):
         p.set_config("budget.daily_usd", day)
@@ -4043,12 +4043,12 @@ def test_the_caps_line_never_reads_of_zero_once_the_dollar_caps_are_unset(env):
             windows = "claude" in gates
             if day or week:
                 assert "no dollar cap" not in ln and "no dollar cap" not in detail, (ln, detail)
-                assert "$893.95 of $2000 per 7 days" in ln and "$893.95 of $2000 per 7d" in detail, (ln, detail)
+                assert "$893.95 of $2000 billed by use per 7 days" in ln and "$893.95 of $2000 per 7d" in detail, (ln, detail)
                 today = "$7.76 of $100 today" if day else "$7.76 today,"
                 assert today in ln and today in detail, (ln, detail)
             else:
                 want = "no dollar cap (plan windows apply): " if windows else "no dollar cap: "
-                assert f"usage-billed providers together): {want}$7.76 today, $893.95 per 7 days" in ln, ln
+                assert f"usage-billed providers together): {want}$7.76 today, $893.95 billed by use per 7 days" in ln, ln
                 assert detail.startswith(f"{want}$7.76 today, $893.95 per 7d"), detail
                 assert windows or "plan windows apply" not in ln + detail, (ln, detail)
     p.db.set_kv("gates", {"claude": plan, "codex": caps_gate(0.0, 0.0)})
@@ -4448,3 +4448,93 @@ def test_daemon_records_a_running_codex_runs_rollout_windows_for_the_gate(env, t
     p.db.x("UPDATE runs SET status='ok' WHERE task=?", (tid,))
     d.meter_running()
     assert d._window_provs == {}
+
+
+
+def _billed_and_plan_ledger(p, now):
+    """$10 of a usage-billed account (no readings) and $5 of a plan account (a reading at the time)."""
+    from ttp import budget as bud
+    p.db.spend("codex", 10.0, "task:1", account="usage-acct", ts=now - 3600)
+    p.db.spend("claude", 5.0, "task:2", account="plan-acct", ts=now - 3600)
+    bud.record_windows(p.db, [bud.Window("claude", "seven_day", 10.0, now + 86400, "plan-acct")], ts=now - 3600)
+
+
+def test_the_project_caps_line_shows_billed_plan_paid_and_total_once(env):
+    """The caps money is one line of its own, whatever providers are in the caps regime, and it adds
+    the 7 days' plan-paid spend beside the billed figure so the dollars add up to the ledger."""
+    p = make(env)
+    from ttp import budget as bud
+    from ttp import coordinator as coord
+    from ttp.web import health
+    now = time.time()
+    _billed_and_plan_ledger(p, now)
+    p.set_config("budget.daily_usd", 0)
+    p.set_config("budget.weekly_usd", 0)
+    b = p.config()["budget"]
+    total = p.db.one("SELECT SUM(usd) s FROM ledger WHERE ts>=?", (now - bud.WEEK,))["s"]
+    assert p.db.spent_since(now - bud.WEEK, billed=True) + bud.plan_paid(p.db, now - bud.WEEK) == total == 15.0
+    want = "$10.00 billed by use per 7 days (+$5.00 paid by plans, not billed; $15.00 total)"
+    assert want in bud.caps_line(p.db, {}, b, now), bud.caps_line(p.db, {}, b, now)
+
+    def caps(prov):
+        return bud.Gate(provider=prov, level="green", regime="caps", max_parallel=6, max_tier="deep",
+                        allow_optional=True, reasons=[], numbers={"spent_24h": 10.0, "spent_7d": 10.0,
+                                                                  "daily_cap": 0, "weekly_cap": 0}).as_dict()
+    plan = bud.Gate(provider="claude", level="green", regime="windows", max_parallel=6, max_tier="deep",
+                    allow_optional=True, reasons=[], numbers={"limit": 90.0, "running": 0, "starts": True, "plan": [
+                        {"window": "seven_day", "utilization": 10.0, "headroom": 80.0}]}).as_dict()
+    for gates in ({"codex": caps("codex"), "fake": caps("fake")}, {}, {"claude": plan}):
+        d = coord.digest(p, gates, [], [])
+        got = [x for x in d.splitlines() if "project caps" in x or "billed by use" in x]
+        assert len(got) == 1 and got[0].startswith("- project caps (usage-billed providers together): "), got
+        assert want in got[0], got
+        assert ("plan windows apply" in got[0]) == ("claude" in gates), got
+    assert want in health(p, p.db, now=now)["spend"]["caps_line"]
+    # With no caps set the line still says so, and a set cap still shows as configured.
+    assert bud.caps_spend({"spent_24h": 1.0, "spent_7d": 2.0}, 0, 0).startswith("no dollar cap: ")
+    assert bud.caps_spend({"spent_24h": 1.0, "spent_7d": 2.0}, 0, 0, plan_paid=3.0).startswith("no dollar cap: ")
+    assert "$2.00 of $50 billed by use per 7 days (+$3.00 paid by plans, not billed; $5.00 total)" in \
+        bud.caps_spend({"spent_24h": 1.0, "spent_7d": 2.0}, 0, 50, plan_paid=3.0)
+
+
+def _claude_run_with_reading(p, account, tmp_path):
+    """A running Claude worker run started on `account` whose output carries a plan-window reading and $3.54."""
+    tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    started = time.time() - 600
+    rid = p.db.x("INSERT INTO runs(task,role,provider,model,account,started,status) "
+                 "VALUES(?,'worker','claude','',?,?,'running')", (tid, account, started))
+    run_dir = p.runs / str(rid)
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({"budget_usd": 8.0, "timeout_s": 3600}))
+    (run_dir / "output.jsonl").write_text("\n".join(json.dumps(e) for e in (
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "allowed", "unifiedWindows": {
+            "seven_day": {"utilization": 0.0, "resetsAt": time.time() + 3 * 86400}}}},
+        {"type": "result", "total_cost_usd": 3.54, "result": "ok"})) + "\n")
+    return rid, started
+
+
+@pytest.mark.parametrize("now_acct,want", [("plan-acct", "plan-acct"), ("", "usage-acct"), (None, "usage-acct"),
+                                           ("usage-acct", "usage-acct")])
+def test_a_plan_reading_after_a_login_switch_is_filed_under_the_account_that_made_it(env, tmp_path, monkeypatch,
+                                                                                      now_acct, want):
+    """A run started on a usage-billed account whose login switched to a plan account before it ended:
+    its reading is the plan account's, so the run's billed dollars stay billed (none counted as plan).
+    Logged out or unreadable at the end: the run's own account, as before."""
+    p = make(env)
+    from ttp import billing
+    from ttp.daemon import Daemon
+    from ttp.providers.claude import Claude
+
+    def account(self):
+        if now_acct is None:
+            raise OSError("unreadable")
+        return now_acct
+    monkeypatch.setattr(Claude, "account", account)
+    d = Daemon(p.base)
+    rid, started = _claude_run_with_reading(p, "usage-acct", tmp_path)
+    d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), {"rc": 0, "started": started, "ended": time.time()})
+    accts = {r["account"] for r in p.db.q("SELECT account FROM snapshots WHERE provider='claude'")}
+    assert accts == {want}, accts
+    billed = billing.billed_by_account(p.db.conn, started - 3600).get(("claude", "usage-acct"), 0.0)
+    assert billed == (3.54 if want == "plan-acct" else 0.0), billed
