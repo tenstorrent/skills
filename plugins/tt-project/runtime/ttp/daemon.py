@@ -61,6 +61,7 @@ from . import awake
 from . import selfreview
 from . import cells
 from . import budget as bud
+from . import billing
 from . import budgetkind
 from . import pregrant
 from . import deadwait
@@ -5050,6 +5051,11 @@ class Daemon:
         windows = bud.plan_windows(self.p.db)
         gates, news, red_sent, episodes = {}, [], {}, {}
         now = time.time()
+        # A declared billing kind (providers.<name>.billing) counts for spend from when it is recorded.
+        try:
+            billing.declare(self.p.db, self.cfg, provs | set(self.cfg.get("providers") or {}), now)
+        except Exception:
+            log(self.p, "billing declaration record failed: " + traceback.format_exc().replace("\n", " | ")[:800])
         # After a restart the last levels come from disk, so a change while the daemon was down is news.
         saved = {} if self.gates else (self.p.db.kv("gates") or {})
         accounts = bud.current_accounts(self.p.db)

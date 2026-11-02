@@ -110,6 +110,8 @@ def gate_detail(g: dict, now: float | None = None, where=None, gates: dict | Non
         # Plan-billed dollars are bounded by the windows, so the dollar caps do not apply to them.
         return (f"account use: {'; '.join(parts)}. The project stops at {n.get('limit')}% "
                 f"(plan-billed, so the dollar caps do not apply)")
+    if g.get("regime") == "plan":
+        return "on a plan with no meter (declared in providers.<name>.billing), so the dollar caps do not apply"
     est = f" (~${n['estimated_24h']:.2f} estimated)" if n.get("estimated_24h") else ""
     day_cap, week_cap = float(n.get("daily_cap") or 0), float(n.get("weekly_cap") or 0)
 
@@ -220,7 +222,7 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
         if w:
             parts.append(f"{label} {w.utilization:.0f}%" +
                          (f" - resets in {max(w.resets_at - now, 0) / secs:.1f} {unit}" if w.resets_at else ""))
-    plan = gate["regime"] == "windows" if (gate or {}).get("regime") else bool(wins)
+    plan = gate["regime"] in ("windows", "plan") if (gate or {}).get("regime") else bool(wins)
     n = (gate or {}).get("numbers") or {}
     if not plan and ("spent_today" in n or "global_today" in n):
         return ", ".join([usage_line(n, now), *held])

@@ -13,6 +13,9 @@ Two regimes, chosen per provider from what the provider reports:
   last 24 h) and a rolling 7 d cap on what THIS project spends across all its providers not on plan
   windows, with the user's defaults when the charter sets none; and a global daily cap on what the
   whole account spends today across every project tt-project can see (globalcap.py).
+A project may declare a provider's billing kind (providers.<name>.billing, billing.py): `usage` puts
+it under the dollar caps whatever windows it reports; `plan` with no windows to read (a plan with no
+meter) is regime "plan": no dollar cap holds it and its spend is plan spend, not billed.
 A runaway check (a loop: wasted runs, a coordinator spinning, spend far above this project's own
 norm) overrides both. On plan windows its dollars are virtual, so it counts wasted runs and
 coordinator turns there.
@@ -34,7 +37,7 @@ from . import ackwait, credits
 from . import globalcap as gcap
 from . import timefmt
 from . import localspend  # noqa: F401  (adds this machine's other Claude Code spend to the global total)
-from .billing import PLAN_LAPSE_RUNS, billed_by_account
+from .billing import PLAN_LAPSE_RUNS, billed_by_account, declared
 from .db import DB
 
 LEVELS = ("green", "yellow", "orange", "red")
@@ -79,7 +82,7 @@ class Gate:
     provider: str
     level: str = "green"
     reasons: list[str] = field(default_factory=list)
-    regime: str = "caps"        # "windows" or "caps"
+    regime: str = "caps"        # "windows", "caps" or "plan" (declared plan, no windows)
     max_parallel: int = 2
     max_tier: str = "deep"      # deepest reasoning tier allowed right now
     allow_optional: bool = True # recurring improvement work, exploration, nice-to-haves
@@ -191,14 +194,18 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     # left that plan: its spend since the last of them counts toward the dollar caps at once.
     moved = set(last) - {w.provider for w in plan_windows(db, now)}
     lapsed = moved | {p for p, ts in last.items() if now - ts > SNAPSHOT_FRESH_S and plan_lapsed(db, p, ts)}
-    plan = [w for w in windows if w.provider == provider and provider not in lapsed]
-    billed_since = account_billed_since(db, provider, last.get(provider, 0.0)) if provider in moved else None
+    kind = declared(cfg, provider)
+    plan = [w for w in windows if w.provider == provider and provider not in lapsed and kind != "usage"]
+    if kind != "auto":
+        g.numbers["billing_declared"] = kind
+    billed_since = account_billed_since(db, provider, last.get(provider, 0.0)) \
+        if provider in moved and kind != "plan" else None
     if billed_since is not None:
         # The current account is billed by use: the old account's plan readings are history, and
         # the switch was made on purpose. A neutral line, never an alert.
         g.numbers["billed_by_use_since"] = billed_since
         g.reasons.append(f"{provider} billed by use since {timefmt.short(billed_since, cfg, now)}")
-    elif provider in moved:
+    elif provider in moved and kind == "auto":
         # The login has no plan readings of its own yet (its kind is unknown, or a plan account's
         # readings are missing): billed by use is the safe side until its next run reports them. A
         # self-clearing status line (daemon: alert account-mismatch:<provider>), not an instruction.
@@ -206,7 +213,7 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
         g.reasons.append(f"{provider}'s current account has no plan readings of its own yet"
                          + ("; its spend counts toward the dollar caps until a run reports its plan windows"
                             if dollar_caps(b) else ""))
-    elif provider in lapsed and dollar_caps(b):
+    elif provider in lapsed and dollar_caps(b) and kind == "auto":
         # With no dollar cap set (0 = unset) nothing changes for the user: no reason to tell.
         g.reasons.append(f"{provider} stopped reporting plan windows; its spend counts toward the dollar caps")
     reading = credits.latest(db, provider, now) if plan else None
@@ -224,6 +231,9 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
             extra = db.spent_since(since, provider) + in_flight(db, provider)
             g.numbers["paid_credits"] = {"since": since, "usd": round(extra, 2)}
             _caps(db, g, b, provider, windows, last, now, extra=extra)
+    elif kind == "plan":
+        # Declared on a plan with no windows to read: no dollar cap applies and its dollars are virtual.
+        g.regime = "plan"
     else:
         _caps(db, g, b, provider, windows, last, now)
 
@@ -240,7 +250,7 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     # spend, so the waste signal counts wasted runs, the coordinator signal counts self-started turns
     # and turns re-woken on the same evidence instead, and the total signal is off. Billed by use or on paid credits past the line,
     # dollars.
-    virtual = g.regime == "windows" and "paid_credits" not in g.numbers
+    virtual = g.regime in ("windows", "plan") and "paid_credits" not in g.numbers
     g.numbers["billing"] = "plan" if virtual else "usage"
     hour_ago = now - HOUR
     last_h = spent_last_hour(db, provider, now)

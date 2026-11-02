@@ -101,6 +101,13 @@ prolonged whole-box outage.
   runs stop reporting plan windows falls under these caps too (failed or silent runs do not count).
   The caps count only spend made on an account that was billed by use at the time: after a switch
   from a plan account to a usage-billed one, the plan's earlier spend stays out.
+- Declared billing: `providers.<name>.billing` is `auto` (the default: plan or usage is judged
+  from the plan windows each run reports), `plan` or `usage`. Set `plan` for a provider on a flat
+  plan that reports no windows (for example a Cursor subscription): it is not held by the dollar
+  caps, the runaway guard counts its runs instead, and its spend shows as plan, not billed. Set
+  `usage` to keep the dollar caps on even while plan windows are reported. A change raises one
+  budget-kind event and releases holds the old kind set. Cursor's account is a hash of the login
+  its CLI status names (`cursor:<hash>`, never the email); without one it stays `cursor`.
 - Global daily cap (usage-billed, $200/day by default): `budget.global_daily_usd` stops new work in
   every usage-billed project on the account once the whole account's tt-project spend today reaches
   it. "Today" is the rolling 24 hours unless `budget.day_start` is set. Change it for every project

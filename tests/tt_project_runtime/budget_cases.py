@@ -3978,3 +3978,178 @@ def test_the_caps_line_never_reads_of_zero_once_the_dollar_caps_are_unset(env):
     p.db.set_kv("gates", {"claude": plan, "codex": caps_gate(0.0, 0.0)})
     st = state_payload(p, p.db)
     assert st["gates"]["codex"]["detail"].startswith("no dollar cap (plan windows apply): "), st["gates"]["codex"]
+
+
+def _billed_fake(p, now, usd=150.0):
+    """The fake provider billed by use, with no meter: a finished run and `usd` booked two hours ago."""
+    p.db.x("INSERT INTO runs(role,provider,started,ended,status,cost_usd) VALUES('worker','fake',?,?,'ok',?)",
+           (now - 7500, now - 7200, usd))
+    p.db.x("INSERT INTO ledger(ts,provider,source,usd) VALUES(?,?,?,?)", (now - 7200, "fake", "task:1", usd))
+
+
+def test_a_declared_plan_provider_is_not_held_by_the_dollar_caps_and_shows_as_plan(env, monkeypatch):
+    """providers.<name>.billing 'plan' on a provider with no meter: no dollar cap holds it, its gate
+    and budget kind say plan, and its spend from the declaration on is plan spend, not billed. Spend
+    booked before the declaration keeps its kind; 'usage' puts it back under the caps."""
+    from ttp import billing, budget as bud, budgetkind, coordinator as coord
+    from ttp.web import budget_line, gate_detail
+    from ttp.daemon import Daemon
+    p = make(env)
+    now = time.time()
+    _billed_fake(p, now)
+    p.set_config("budget.daily_usd", 100)
+    d = Daemon(p.base)
+    d.update_gates()
+    g = d.gates["fake"]
+    assert g.regime == "caps" and g.level == "red" and any("cap reached" in r for r in g.reasons), g.reasons
+    assert p.db.kv(billing.DECLARED_KV) is None, "auto records nothing"
+
+    p.set_config("providers.fake.billing", "plan")
+    d.cfg = p.config()
+    d.update_gates()
+    g = d.gates["fake"]
+    assert g.regime == "plan" and g.allow_new_work and g.level == "green", g.reasons
+    assert not any("cap" in r for r in g.reasons) and "daily_cap" not in g.numbers, g.as_dict()
+    assert g.numbers["billing"] == "plan" and g.numbers["billing_declared"] == "plan"
+    parts = budgetkind.parts(p.db, d.cfg, "fake", g, "")
+    assert parts["kind"] == "plan" and "caps" not in parts and parts["declared"] == "plan", parts
+    assert "no dollar cap" in budgetkind._kind_text(parts)
+    # spend before the declaration stays billed; after it, plan spend
+    assert p.db.spent_since(now - 86400, billed=True) == 150.0
+    since = billing._history(p.db.conn)["fake"][-1][0]
+    p.db.x("INSERT INTO ledger(ts,provider,source,usd) VALUES(?,?,?,?)", (since, "fake", "task:2", 40.0))
+    assert p.db.spent_since(now - 86400, billed=True) == 150.0
+    assert p.db.spent_since(now - 86400) == 190.0
+    # shown as plan, never as billed against a cap
+    assert "dollar caps do not apply" in gate_detail(g.as_dict(), now)
+    assert "virtual" in budget_line(p.db, time.time() + 2, "fake", g.as_dict())
+    assert "no dollar cap" in coord.digest(p, {"fake": g.as_dict()}, [], [])
+    # usage: under the caps again, its new spend billed
+    p.set_config("providers.fake.billing", "usage")
+    d.cfg = p.config()
+    d.update_gates()
+    g = d.gates["fake"]
+    assert g.regime == "caps" and g.numbers["billing"] == "usage", g.as_dict()
+    p.db.x("INSERT INTO ledger(ts,provider,source,usd) VALUES(?,?,?,?)", (time.time() + 1, "fake", "task:3", 5.0))
+    assert p.db.spent_since(now - 86400, billed=True) == 155.0
+    assert [k for _, k in billing._history(p.db.conn)["fake"]] == ["plan", "usage"]
+
+
+def test_a_declared_usage_provider_on_plan_windows_is_under_the_dollar_caps(env, monkeypatch):
+    """'usage' forces the caps even while the provider reports plan windows, and its spend counts."""
+    from ttp import budget as bud, budgetkind
+    from ttp.daemon import Daemon
+    p = make(env)
+    now = time.time()
+    _fake_plan(p, ACCT_PLAN, now, util=40.0)
+    bud.note_account(p.db, "fake", ACCT_PLAN)
+    d = Daemon(p.base)
+    d.update_gates()
+    assert d.gates["fake"].regime == "windows"
+    p.set_config("providers.fake.billing", "usage")
+    d.cfg = p.config()
+    d.update_gates()
+    g = d.gates["fake"]
+    assert g.regime == "caps" and "daily_cap" in g.numbers and g.numbers["billing"] == "usage", g.as_dict()
+    parts = budgetkind.parts(p.db, d.cfg, "fake", g, ACCT_PLAN)
+    assert parts["kind"] == "billed" and parts["declared"] == "usage" and "caps" in parts, parts
+    p.db.x("INSERT INTO ledger(ts,provider,account,source,usd) VALUES(?,?,?,?,?)",
+           (time.time() + 1, "fake", ACCT_PLAN, "task:2", 7.0))
+    assert p.db.spent_since(now - 86400, billed=True) == 7.0, "a plan account's spend is billed once declared usage"
+
+
+def test_switching_a_provider_from_auto_to_plan_raises_one_event_and_leaves_no_cap_holds(env, monkeypatch):
+    """auto -> plan on a billed provider is a budget-kind change: one event (billed -> plan), the
+    holds its dollar caps made released at once, and the new gate holds nothing on dollars."""
+    from ttp import budgetkind, coordinator as coord
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(budgetkind, "DEBOUNCE_S", 0.0)
+    p = make(env)
+    now = time.time()
+    _billed_fake(p, now)
+    p.set_config("budget.daily_usd", 100)
+    p.db.set_kv("limited:fake", {"until": now + 86400, "note": "usage limit"})
+    held = p.db.add_task("reindex the docs", "x", labels=coord.defer_labels(now + 86400, "true", "until the dollar cap resets"),
+                         not_before=now + 86400)
+    d = Daemon(p.base)
+    _bk_tick(d, monkeypatch)
+    assert d.gates["fake"].level == "red" and _bk_events(p) == [], "the baseline raises nothing"
+    assert p.db.kv(budgetkind.KV + "fake")["parts"]["kind"] == "billed"
+
+    p.set_config("providers.fake.billing", "plan")
+    d.cfg = p.config()
+    _bk_tick(d, monkeypatch)
+    ev = _bk_events(p)
+    assert len(ev) == 1, ev
+    text = ev[0]["text"]
+    assert "budget kind billed -> plan" in text and "declared billing auto -> plan" in text, text
+    assert "now plan (declared" in text and "limit pause" in text, text
+    assert float(p.db.kv("limited:fake")["until"]) == 0
+    assert _bk_deferral(p.db.task(held)) == {} and p.db.task(held)["not_before"] is None
+    new = p.db.kv(budgetkind.KV + "fake")["parts"]
+    assert new["kind"] == "plan" and "caps" not in new, new
+    g = d.gates["fake"]
+    assert g.allow_new_work and not any("cap" in r for r in g.reasons), g.reasons
+    for _ in range(3):
+        d.update_gates()
+    assert len(_bk_events(p)) == 1, "the same declaration wakes nobody again"
+
+
+def test_auto_billing_keeps_the_budget_fingerprint_and_gate_as_before(env, monkeypatch):
+    """The default (auto, or a value that is not plan or usage) adds no fingerprint part, records no
+    declaration and leaves the gate as the reported windows and runs decide."""
+    from ttp import billing, budget as bud, budgetkind
+    from ttp.project import config_problems
+    p = make(env)
+    now = time.time()
+    _billed_fake(p, now)
+    cfg = p.config()
+    assert cfg["providers"]["claude"]["billing"] == "auto"
+    for value in ("auto", "AUTO", "bogus", None):
+        c = {**cfg, "providers": {**cfg["providers"], "fake": {"billing": value}}}
+        g = bud.evaluate(p.db, c, "fake", [], now)
+        assert g.regime == "caps" and "billing_declared" not in g.numbers, (value, g.as_dict())
+        assert set(budgetkind.parts(p.db, c, "fake", g, "")) == {"account", "kind", "windows", "caps"}
+        assert billing.declare(p.db, c, ["fake"], now) == {}
+    assert p.db.kv(billing.DECLARED_KV) is None
+    raw = {"providers": {"fake": {"billing": "seat"}, "cursor": {"billing": "plan"}}}
+    probs = [x for x in config_problems(raw) if "billing" in x]
+    assert probs == ["providers.fake.billing: 'seat' is not auto, plan or usage; auto is used"], probs
+
+
+def test_cursor_account_label_is_a_hash_of_the_login_its_status_names(env, monkeypatch, tmp_path):
+    """Cursor's account label comes from `agent status`: 'cursor:' and a hash, never the email; a
+    CLI that names no login keeps 'cursor'; a logged-out or failed status keeps the last label, so a
+    logout is no account switch. The status is asked again only after its TTL or a login change."""
+    from ttp.providers import cursor as cur
+    out = {"text": "\x1b[32m✓\x1b[0m Logged in as Someone@Example.com", "rc": 0}
+    calls = []
+    monkeypatch.setattr(cur, "_ACCOUNT", {})
+    monkeypatch.setattr(cur, "_LAST_LABEL", {})
+    monkeypatch.setattr(cur.Cursor, "binary", lambda self: "/bin/agent")
+    monkeypatch.setattr(cur, "cli_output", lambda *a: "Commands:\n  status  Show login status\n")
+    monkeypatch.setattr(cur, "status_check", lambda argv, timeout_s=30: calls.append(argv) or (out["rc"], out["text"]))
+    stamp = {"v": "1"}
+    monkeypatch.setattr(cur.Cursor, "credentials_stamp", lambda self: stamp["v"])
+    c = cur.Cursor()
+    label = c.account()
+    assert label.startswith("cursor:") and len(label) == len("cursor:") + 12, label
+    assert "someone" not in label.lower() and "example" not in label.lower()
+    assert label == cur.account_label("someone@example.com")
+    assert c.account() == label and len(calls) == 1, "cached until its TTL or a login change"
+    out["text"] = "Not logged in. Run agent login."
+    stamp["v"] = "2"
+    assert c.account() == label and len(calls) == 2, "a logout keeps the last label"
+    out.update(text="Logged in as other@example.com")
+    stamp["v"] = "3"
+    other = c.account()
+    assert other != label and other.startswith("cursor:"), "another login is another account"
+    out.update(text="ok")
+    stamp["v"] = "4"
+    assert c.account() == "cursor", "a status that names no login keeps the plain label"
+    monkeypatch.setattr(cur, "_LAST_LABEL", {})
+    monkeypatch.setattr(cur, "cli_output", lambda *a: "")
+    stamp["v"] = "5"
+    assert c.account() == "cursor", "a CLI without `agent status`"
+    assert [cur.status_login(t) for t in ("User: a@b.io", "Signed in as `bob`", "unauthenticated", "")] == \
+        ["a@b.io", "bob", "", ""]

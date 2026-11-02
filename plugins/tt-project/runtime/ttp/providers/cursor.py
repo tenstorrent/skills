@@ -24,9 +24,11 @@ folder per run, but Cursor does not document whether the login, MCP servers and 
 it, so it is not used."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 from . import register
@@ -35,6 +37,30 @@ from .base import (AUTH_RE, LIMIT_RE, Provider, RunUsage, cli_output, price_row,
 
 PRICES = {"default": (3.0, 0.3, 15.0)}
 USAGE_KEYS = ("inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens")
+# account(): `agent status` is asked again only this often, or at once when the login files change.
+ACCOUNT_TTL_S = 600.0
+_ACCOUNT: dict[str, tuple[float, str]] = {}   # binary|credentials stamp -> (asked at, label)
+_LAST_LABEL: dict[str, str] = {}              # binary -> the last login label seen
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+LOGIN_RE = re.compile(r"(?:logged in|signed in|authenticated)\s+as\s+[\"'`]?([^\s\"'`]+)|"
+                      r"\b(?:user|email|account)\s*:\s*[\"'`]?([^\s\"'`]+)", re.I)
+EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+LOGGED_OUT_RE = re.compile(r"not (logged|authenticated|signed)|login required|unauthenticated", re.I)
+
+
+def status_login(text: str) -> str:
+    """The login `agent status` names (an email or user name), "" when it names none or says logged out."""
+    text = ANSI_RE.sub("", text or "")
+    if LOGGED_OUT_RE.search(text):
+        return ""
+    m = LOGIN_RE.search(text)
+    who = next((g for g in (m.groups() if m else ()) if g), "") or (EMAIL_RE.search(text) or [""])[0]
+    return who.strip(".,;:()[]").lower()
+
+
+def account_label(who: str) -> str:
+    """The account label for login `who`: 'cursor:' and an opaque hash, never the login itself."""
+    return f"cursor:{hashlib.sha256(who.encode()).hexdigest()[:12]}" if who else "cursor"
 
 
 @register
@@ -57,8 +83,7 @@ class Cursor(Provider):
         got = status_check([b, "status"])
         if got is None:
             return None
-        return got[0] == 0 and not re.search(r"not (logged|authenticated)|login required|unauthenticated",
-                                             got[1], re.I)
+        return got[0] == 0 and not LOGGED_OUT_RE.search(got[1])
 
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions,
               disallowed_tools=(), denied_reads=(), web=True):
@@ -190,4 +215,22 @@ class Cursor(Provider):
         return u
 
     def account(self) -> str:
-        return "cursor"
+        """'cursor:<hash>' of the login `agent status` names (never the email, a name or a token), or
+        'cursor' when this CLI names none. While the status cannot be read or says logged out, the
+        last label seen stands, so a logout is not an account switch."""
+        b = self.binary()
+        if not b:
+            return "cursor"
+        key, now = f"{b}|{self.credentials_stamp()}", time.monotonic()
+        hit = _ACCOUNT.get(key)
+        if hit and now - hit[0] < ACCOUNT_TTL_S:
+            return hit[1]
+        label = _LAST_LABEL.get(b, "cursor")
+        got = status_check([b, "status"], timeout_s=15) if re.search(
+            r"^\s*status\b", cli_output(b, "--help"), re.M) else None
+        if got is not None and got[0] == 0 and not LOGGED_OUT_RE.search(got[1]):
+            label = account_label(status_login(got[1]))
+            _LAST_LABEL[b] = label
+        _ACCOUNT.clear()
+        _ACCOUNT[key] = (now, label)
+        return label

@@ -35,15 +35,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # has no such alias (light keeps the account's default model at low effort) and Cursor's
         # `auto` already picks per request. A task's own model/effort pin wins over its tier, and a
         # failed light try retries a tier up, on the standard model.
+        # billing: how the provider's spend is billed (billing.py). auto: plan windows decide; plan: a
+        # plan seat with no meter (no dollar cap, spend is plan spend); usage: always the dollar caps.
         "claude": {"tiers": {"light": {"model": "sonnet", "effort": "low"},
                              "standard": {"model": "opus", "effort": "high"},
-                             "deep": {"model": "opus", "effort": "max"}}},
+                             "deep": {"model": "opus", "effort": "max"}}, "billing": "auto"},
         "codex": {"tiers": {"light": {"model": "", "effort": "low"},
                             "standard": {"model": "", "effort": "high"},
-                            "deep": {"model": "", "effort": "xhigh"}}},
+                            "deep": {"model": "", "effort": "xhigh"}}, "billing": "auto"},
         "cursor": {"tiers": {"light": {"model": "auto", "effort": ""},
                              "standard": {"model": "auto", "effort": ""},
-                             "deep": {"model": "auto", "effort": ""}}},
+                             "deep": {"model": "auto", "effort": ""}}, "billing": "auto"},
     },
     "budget": {
         "reserve_pct": 10,              # plan windows: never take the account past 100 - reserve
@@ -504,7 +506,7 @@ EXTRA_KEYS = {
     "failover": {"standby", "fleet", "lease_remote", "lease_ttl_s", "allow_delivery_remote"},
 }
 OPEN_SECTIONS = {"resources"}           # any name below is fine
-PROVIDER_KEYS = {"tiers", "plugin_dirs", "worker_isolation", "mcp_servers", "mcp_withheld", "disallowed_tools",
+PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "mcp_servers", "mcp_withheld", "disallowed_tools",
                  # providers.chat only (chatbridge.py): the `ttp secret endpoint` alias holding the key,
                  # the base URL saved with it, a max_tokens cap and the model's context_window (also per tier).
                  # route_cooldown_s: how long a tier routed to it (tiers.<tier>.route, route.py) runs on the
@@ -926,6 +928,9 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     from .coordinator import tool_list   # coordinator imports this module
     for prov, pcfg in (raw.get("providers") or {}).items() if isinstance(raw.get("providers"), dict) else ():
         denied = pcfg.get("disallowed_tools") if isinstance(pcfg, dict) else None
+        kind = pcfg.get("billing") if isinstance(pcfg, dict) else None
+        if kind is not None and str(kind).lower() not in ("auto", "plan", "usage"):
+            out.append(f"providers.{prov}.billing: {kind!r} is not auto, plan or usage; auto is used")
         try:
             tool_list(denied or [], strict=True)
         except ValueError as e:

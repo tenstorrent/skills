@@ -23,13 +23,19 @@ every account's spend. Spend recorded without an account (ledger rows from befor
 recorded, if the runs they came from could not tell) is plan spend when any of the provider's
 accounts was on a plan then, and billed otherwise.
 
+A provider's declared billing kind (providers.<name>.billing: `plan` or `usage`; `auto`, the default,
+is the rule above) overrides it for the provider's spend from the time the daemon recorded the
+declaration on (`declare`, kept in the project's own KV so other projects' totals honour it too):
+`plan` spend is never billed, `usage` spend always is. Spend before a declaration keeps its old kind.
+
 Works on a plain sqlite3 connection, so it can read other projects' databases read-only.
 """
 from __future__ import annotations
 
 import bisect
+import json
 import sqlite3
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
 HOUR, DAY = 3600.0, 86400.0
 # Spend this long before or after a plan reading of its account still counts as plan-billed.
@@ -42,6 +48,55 @@ PLAN_LAPSE_RUNS = 2
 PLAN_MEMORY_S = 7 * DAY
 
 Spans = dict[tuple[str, str], list[tuple[float, float]]]
+# providers.<name>.billing: how its spend is billed. auto: plan windows decide (the rule above).
+KINDS = ("auto", "plan", "usage")
+# KV: provider -> [[since, kind], ...], the declarations in force from `since` on (oldest first).
+DECLARED_KV = "billing_declared"
+DECLARED_KEEP = 20
+
+
+def declared(cfg: Mapping, provider: str) -> str:
+    """The billing kind the project declares for `provider` (providers.<name>.billing); 'auto' unless
+    it is 'plan' or 'usage'."""
+    kind = str((((cfg or {}).get("providers") or {}).get(provider) or {}).get("billing") or "auto").lower()
+    return kind if kind in KINDS else "auto"
+
+
+def _history(conn: sqlite3.Connection) -> dict[str, list[tuple[float, str]]]:
+    """The recorded declarations per provider; {} when there are none or they cannot be read."""
+    try:
+        r = conn.execute("SELECT value FROM kv WHERE key=?", (DECLARED_KV,)).fetchone()
+        raw = json.loads(r[0]) if r else {}
+        return {str(p): sorted((float(e[0]), str(e[1])) for e in rows) for p, rows in raw.items()} \
+            if isinstance(raw, dict) else {}
+    except (sqlite3.Error, ValueError, TypeError, IndexError):
+        return {}
+
+
+def declared_at(hist: Mapping[str, list[tuple[float, str]]], provider: str, ts: float) -> str:
+    """The kind declared for `provider` at `ts` ('auto' before any declaration)."""
+    kind = "auto"
+    for since, k in hist.get(provider) or []:
+        if since > ts:
+            break
+        kind = k
+    return kind
+
+
+def declare(db: Any, cfg: Mapping, providers: Iterable[str], now: float) -> dict[str, tuple[str, str]]:
+    """Record each provider's declared billing kind when it differs from the last one recorded
+    (none recorded is auto, so an all-auto project writes nothing). Returns {provider: (old, new)}."""
+    hist = _history(db.conn)
+    changed = {}
+    for prov in sorted(set(providers)):
+        kind, rows = declared(cfg, prov), hist.get(prov) or []
+        old = rows[-1][1] if rows else "auto"
+        if kind != old:
+            hist[prov] = (rows + [(now, kind)])[-DECLARED_KEEP:]
+            changed[prov] = (old, kind)
+    if changed:
+        db.set_kv(DECLARED_KV, {p: [list(e) for e in rows] for p, rows in hist.items()})
+    return changed
 
 
 def _q(conn: sqlite3.Connection, sql: str, args: Iterable = ()) -> list[tuple]:
@@ -124,8 +179,10 @@ def billed_by_account(conn: sqlite3.Connection, since: float, until: float | Non
             conn, "SELECT provider, COALESCE(account,''), started, cost_usd FROM runs WHERE status='running' "
                   "AND (? IS NULL OR provider=?)", (provider, provider))]
     spans = plan_spans(conn, min([since] + [ts for _, _, ts, _ in rows]), provider)
+    hist = _history(conn)
     out: dict[tuple[str, str], float] = {}
     for p, a, ts, usd in rows:
-        if usd and not is_plan(spans, p, a, ts):
+        kind = declared_at(hist, p, ts)
+        if usd and kind != "plan" and (kind == "usage" or not is_plan(spans, p, a, ts)):
             out[(p, a)] = out.get((p, a), 0.0) + usd
     return out

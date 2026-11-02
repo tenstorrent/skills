@@ -11,7 +11,10 @@ fingerprint of:
 - the budget kind: `plan` (windows) or `billed` (dollar caps); `unknown` before the provider has
   either a window reading or a finished run;
 - the plan's window set (a tier change reports other windows);
-- the dollar caps in force (billed only: on a plan they hold nothing).
+- the dollar caps in force (billed only: on a plan they hold nothing);
+- the billing kind the project declares for it (providers.<name>.billing, billing.py), unless auto:
+  `plan` makes the kind plan with or without windows, `usage` makes it billed. Changing the
+  declaration is a change like any other: one event, and the old limits' holds released.
 An unknown part (no account label yet, kind unknown) is no change, in either direction: a new
 reading's unknown part takes the stored one, and a stored unknown part adopts the first known one
 silently (a new project's provider before its first run).
@@ -49,7 +52,7 @@ import re
 import time
 from typing import Any
 
-from . import failover, headline
+from . import billing, failover, headline
 from .db import DB, deferral, load_result
 
 KIND = "budget_kind_change"
@@ -72,9 +75,10 @@ def account_hash(label: str) -> str:
 
 def parts(db: DB, cfg: dict, provider: str, gate: Any, account: str) -> dict:
     """The fingerprint's parts for `provider`, from its freshly evaluated gate (before any pause)."""
-    if gate.regime == "windows":
+    declared = billing.declared(cfg, provider)
+    if gate.regime in ("windows", "plan"):
         kind = "plan"
-    elif any("plan readings" in r or "stopped reporting plan windows" in r or "billed by use since" in r
+    elif declared == "usage" or any("plan readings" in r or "stopped reporting plan windows" in r or "billed by use since" in r
                                          for r in gate.reasons) or db.one(
             "SELECT 1 FROM runs WHERE provider=? AND status='ok' LIMIT 1", (provider,)):
         kind = "billed"
@@ -82,6 +86,8 @@ def parts(db: DB, cfg: dict, provider: str, gate: Any, account: str) -> dict:
         kind = "unknown"
     out = {"account": account_hash(account), "kind": kind,
            "windows": sorted({str(r.get("window")) for r in gate.numbers.get("plan") or []}) if kind == "plan" else []}
+    if declared != "auto":
+        out["declared"] = declared
     if kind == "billed":
         b = cfg.get("budget") or {}
         out["caps"] = {k: float(b.get(k) or 0) for k in ("daily_usd", "weekly_usd", "global_daily_usd")}
@@ -156,6 +162,8 @@ def observe(db: DB, provider: str, new: dict, now: float | None = None, resets: 
 
 
 def _kind_text(p: dict) -> str:
+    if p.get("kind") == "plan" and p.get("declared") == "plan" and not p.get("windows"):
+        return "plan (declared in providers.<name>.billing; no windows reported, no dollar cap)"
     if p.get("kind") == "plan":
         return f"plan windows ({', '.join(p.get('windows') or []) or 'none reported yet'})"
     if p.get("kind") == "billed":
@@ -177,6 +185,8 @@ def what_changed(old: dict, new: dict) -> list[str]:
                    + (", ".join(new.get("windows") or []) or "none"))
     elif old.get("caps") != new.get("caps"):
         out.append("dollar caps changed")
+    if old.get("declared", "auto") != new.get("declared", "auto"):
+        out.append(f"declared billing {old.get('declared', 'auto')} -> {new.get('declared', 'auto')}")
     return out
 
 

@@ -878,6 +878,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
             if g.get("level") == "green":
                 money += (f" · {n.get('running', 0)} of {g['max_parallel']} worker slots busy: keep enough "
                           f"independent tasks ready to fill the free ones")
+        elif g.get("regime") == "plan":
+            money = (f"on a plan with no meter (declared in providers.{prov}.billing): no dollar cap; "
+                     f"its dollars are estimates, not billed")
         else:
             plan = any(x.get("regime") == "windows" for x in gates.values())
             money = ("project caps (usage-billed providers together): "
