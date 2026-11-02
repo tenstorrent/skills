@@ -223,13 +223,8 @@ def _alive(r: dict) -> bool:
         return False
     if pid <= 1 or not same_boot(r.get("boot")):
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    from .liveness import pid_state, DEAD
+    return pid_state(pid) != DEAD   # another PID namespace's pid may live: never taken for gone
 
 
 def describe(s: dict) -> str:

@@ -565,17 +565,15 @@ def _held(lease, now: float) -> bool:
     from . import runner
     if not isinstance(lease, dict) or float(lease.get("until") or 0) < now:
         return False
+    from .liveness import pid_state, DEAD, UNKNOWN
     try:
         pid = int(lease.get("pid") or 0)
-        if pid <= 0:
-            return False
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        pass
     except (TypeError, ValueError):
         return False
+    if (st := pid_state(pid)) == DEAD:
+        return False
+    if st == UNKNOWN:
+        return True   # another PID namespace: its start token cannot be read here either
     start = lease.get("start")
     return not start or runner.proc_start(pid) == start
 

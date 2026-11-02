@@ -1305,19 +1305,19 @@ def _on_replaced(lock: Path, chat: str) -> None:
 
 
 def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+    """Not known dead (liveness.pid_state): a pid of another PID namespace counts as alive."""
+    from .liveness import pid_state, DEAD
+    return pid_state(pid) != DEAD
 
 
 def _listener_alive(pid: int, chat: str) -> bool:
-    """True if pid is a live `ttp listen` for this chat (not a recycled pid)."""
-    try:
-        os.kill(pid, 0)
-    except OSError:
+    """True if pid is a live `ttp listen` for this chat (not a recycled pid), or may be: one this process
+    cannot see from its PID namespace (liveness.UNKNOWN) is never taken for gone."""
+    from .liveness import pid_state, DEAD, UNKNOWN
+    if (st := pid_state(pid)) == DEAD:
         return False
+    if st == UNKNOWN:
+        return True
     if zombie(pid):
         return False
     try:
@@ -6053,7 +6053,8 @@ def cmd_detach(a) -> None:
                 print(f"{rc.stem}: gone without an exit code ({why})" + ("" if ser else f"; see {rc.with_suffix('.log')}"))
             else:
                 ended = False
-                print(f"{rc.stem}: {'queued for the daemon, which starts it outside the sandbox' if st == 'queued' else 'running'}")
+                print(f"{rc.stem}: {'queued for the daemon, which starts it outside the sandbox' if st == 'queued' else 'running'}"
+                      + (f" ({why})" if why else ""))
             one_ended = one_ended or st in ("ended", "lost")
         if rows is not None:
             sys.exit(_rows_verdict(_count_rows(Path(rows)), rows, after or 0, one_ended))
@@ -8673,13 +8674,9 @@ def _recover_setup() -> str:
     rec = rec if isinstance(rec, dict) else {}
     pid = rec.get("pid")
     if same_boot(rec.get("boot")) and isinstance(pid, int) and pid != os.getpid():
-        try:
-            os.kill(pid, 0)
-            return ""       # it still runs
-        except ProcessLookupError:
-            pass
-        except PermissionError:
-            return ""
+        from .liveness import pid_state, DEAD
+        if pid_state(pid) != DEAD:
+            return ""       # it still runs, or may (another PID namespace): never roll back under it
     lib, src = Path(rec.get("lib") or "/nonexistent"), Path(rec.get("source") or "/nonexistent")
     # The plugin folder updated meanwhile holds another version than the folder setup named: roll back.
     if lib.parent == HOME_DIR / "lib" and (src / "runtime" / "ttp").is_dir() and (src / "template").is_dir() \

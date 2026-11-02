@@ -162,13 +162,9 @@ def _same_boot(boot) -> bool:
 
 
 def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    """Known alive; a pid of another PID namespace (liveness.UNKNOWN) leaves the state "unknown"."""
+    from .liveness import pid_state, ALIVE
+    return pid_state(pid) == ALIVE
 
 
 def on_machine(alias: str, s: dict, hostnames: set[str]) -> bool:

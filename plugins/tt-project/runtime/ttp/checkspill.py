@@ -273,13 +273,9 @@ def pick(p, cfg: dict, tell, what: str = "") -> Claim | None:
 
 
 def _alive(pid: Any) -> bool:
-    try:
-        os.kill(int(pid), 0)
-    except (TypeError, ValueError, ProcessLookupError):
-        return False
-    except PermissionError:
-        return True
-    return True
+    """Not known dead: a claim whose pid this process cannot judge (liveness.UNKNOWN) stays live."""
+    from .liveness import pid_state, DEAD
+    return pid_state(pid) != DEAD
 
 
 def holders(project_name: str | None = None) -> list[dict]:
@@ -298,11 +294,13 @@ def holders(project_name: str | None = None) -> list[dict]:
 
 def status_lines(project_name: str, now: float | None = None) -> list[str]:
     """`ttp status` lines: this project's checks running on a spill host."""
+    from .liveness import pid_state, UNKNOWN, FOREIGN
     now = time.time() if now is None else now
     out = []
     for r in holders(project_name):
         who = f"task #{r['task']}" if r.get("task") else f"pid {r.get('pid')}"
         mins = max(0, int((now - float(r.get("since") or now)) // 60))
         out.append(f"checks of {who} running on spill host {r['host']} for {mins} min"
-                   + (f": {r['what']}" if r.get("what") else ""))
+                   + (f": {r['what']}" if r.get("what") else "")
+                   + (f" (claim's pid {r.get('pid')}: {FOREIGN})" if pid_state(r.get("pid")) == UNKNOWN else ""))
     return out

@@ -81,13 +81,9 @@ def end(p) -> None:
 
 
 def _alive(pid) -> bool:
-    try:
-        os.kill(int(pid), 0)
-    except (ProcessLookupError, ValueError, TypeError):
-        return False
-    except PermissionError:
-        return True
-    return True
+    """Not known dead: a pid of another PID namespace (liveness.UNKNOWN) may live."""
+    from .liveness import pid_state, DEAD
+    return pid_state(pid) != DEAD
 
 
 def _daemon_up(p) -> bool:

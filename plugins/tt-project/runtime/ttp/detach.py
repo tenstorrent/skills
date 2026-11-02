@@ -845,13 +845,10 @@ def series(rc: Path) -> tuple[str, str] | None:
         pid = int((d / "pid").read_text().strip())
     except (OSError, ValueError):
         return None
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+    from .liveness import pid_state, DEAD, UNKNOWN, FOREIGN
+    if (st := pid_state(pid)) == DEAD:
         return "lost", f"series driver pid {pid} is dead with no EXIT; see {d / 'log'}"
-    except PermissionError:
-        pass
-    return "running", ""
+    return "running", (f"series driver pid {pid}: {FOREIGN}" if st == UNKNOWN else "")
 
 
 def state(rc: Path) -> tuple[str, str]:

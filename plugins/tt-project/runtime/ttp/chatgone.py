@@ -9,8 +9,6 @@ The web app is a reader too: each poll from a visible tab moves the 'web' chat's
 """
 from __future__ import annotations
 
-import os
-
 from .db import SEVERITY_RANK, chat_floor
 from .project import zombie
 
@@ -32,13 +30,10 @@ def listener_alive(p, chat: str) -> bool:
         pid = int((p.state / f"listen-{chat}.pid").read_text())
     except (OSError, ValueError):
         return False
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return not zombie(pid)
+    from .liveness import pid_state, DEAD, UNKNOWN
+    if (st := pid_state(pid)) == UNKNOWN:
+        return True   # another PID namespace's view: may live, never taken for gone
+    return st != DEAD and not zombie(pid)
 
 
 def _read_at(db, chat: dict) -> float:
