@@ -4721,6 +4721,10 @@ def test_a_pytest_run_behind_a_launchers_double_dash_is_one_pytest_run():
     for cmd in ("launcher.py -- pytest a && launcher.py -- pytest b", "pytest a; launcher.py -- pytest b",
                 "launcher.py -- PYTHONPATH=x pytest -q", "PYTEST_ADDOPTS=-x launcher.py -- pytest -q"):
         assert not pushpass.resumable(cmd), cmd
+    # A segment that is itself a pytest run named by path is not a launcher: its `--` is pytest's own.
+    for cmd in (".venv/bin/python -m pytest -q -- tests/pytest", ".venv/bin/pytest -q -- tests/pytest",
+                "FOO=1 /x/py.test -- tests/pytest", "python3.11 -m pytest -- tests/python -m pytest"):
+        assert not push._PYTEST_WRAPPED.search(cmd), cmd
 
 
 def test_a_checks_pytest_key_says_whether_it_is_one_pytest_run():
@@ -4763,6 +4767,18 @@ def test_a_wrapped_pytest_run_gets_the_venv_and_worktree_flags_where_it_stands(t
     assert push.venv_cmd("launcher.py --slots 2 -- .venv/bin/python -m pytest -q tests/", wt) == (
         f"launcher.py --slots 2 -- env PYTHONPATH={w}${{PYTHONPATH:+:$PYTHONPATH}} .venv/bin/python -m pytest "
         f"--rootdir={w} --confcutdir={w} -q tests/")
+    for kept in (".venv/bin/python -m pytest -q -- tests/pytest", ".venv/bin/pytest -q -- tests/pytest"):
+        assert push.venv_cmd(kept, wt) == kept
+    # The run's own PYTHONPATH comes after the worktree's in one `env`, so it still wins.
+    pre = f"PYTHONPATH={w}${{PYTHONPATH:+:$PYTHONPATH}}"
+    assert push.venv_cmd("launcher.py -- env PYTHONPATH=x pytest -q", wt) == (
+        f"launcher.py -- env {pre} PYTHONPATH=x pytest --rootdir={w} --confcutdir={w} -q")
+    assert push.venv_cmd("launcher.py -- env pytest -q", wt) == (
+        f"launcher.py -- env {pre} pytest --rootdir={w} --confcutdir={w} -q")
+    # A plain run beside a wrapped one: each rewritten once.
+    assert push.venv_cmd("pytest -q a && launcher.py -- pytest -q b", wt) == (
+        f" {pre} pytest --rootdir={w} --confcutdir={w} -q a && launcher.py -- env {pre} pytest --rootdir={w} "
+        f"--confcutdir={w} -q b")
 
 def _nested_worktree(tmp_path):
     """A project root with a pytest config, a conftest.py and a package `pkg`, and a git worktree nested

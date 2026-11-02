@@ -483,14 +483,16 @@ _BARE = r"(?:pytest|py\.test|python3?\s+-m\s+pytest)(?=\s|$|[;&|)])"
 _PYTEST_RUN = re.compile(_SEG + "(" + _LEAD + ")" + _BARE)
 # A pytest run behind a launcher in one command segment: the first command word after a `--` word,
 # past `env [VAR=value...]`: `[<path>/]pytest`, `[<path>/]py.test` or `[<path>/]python[N[.M]] -m pytest`
-# (`launcher.py -- .venv/bin/python -m pytest -q tests`). Not in a segment that is itself a pytest run
-# (its `--` ends pytest's own options) or starts with a command printing or searching text
-# (`grep -- pytest`, `echo -- pytest`).
+# (`launcher.py -- .venv/bin/python -m pytest -q tests`). Not in a segment that is itself a pytest run,
+# by any of those words (`.venv/bin/pytest -q -- tests/pytest`: its `--` ends pytest's own options), or
+# starts with a command printing or searching text (`grep -- pytest`, `echo -- pytest`).
 _TEXT_TOOLS = r"\s*(?:echo|printf|grep|egrep|fgrep|rg|ag|git|sed|awk|cat|test|\[|\[\[)(?=\s|$)"
+_PYTEST_WORD = (r"(?:[^\s;&|()'\"]*/)?(?:pytest|py\.test|python(?:\d+(?:\.\d+)?)?\s+-m\s+pytest)"
+                r"(?=\s|$|[;&|)])")
 _PYTEST_WRAPPED = re.compile(
-    _SEG + "(?!" + _TEXT_TOOLS + ")(?!" + _LEAD + _BARE + ")"
-    r"([^;&|(\n]*?\s--\s+(?:env(?:\s+[A-Za-z_][A-Za-z0-9_]*=\S*)*\s+)?)"
-    r"((?:[^\s;&|()'\"]*/)?(?:pytest|py\.test|python(?:\d+(?:\.\d+)?)?\s+-m\s+pytest))(?=\s|$|[;&|)])")
+    _SEG + "(?!" + _TEXT_TOOLS + ")(?!" + _LEAD + _PYTEST_WORD + ")"
+    r"([^;&|(\n]*?\s--\s+)((?:env(?:\s+[A-Za-z_][A-Za-z0-9_]*=\S*)*\s+)?)"
+    "(" + _PYTEST_WORD + ")")
 
 
 def pytest_runs(cmd: str) -> int:
@@ -697,11 +699,14 @@ def venv_cmd(cmd: str, top: str | Path, env: dict | None = None) -> str:
         return f"{m.group(1)}{pre}{m.group(2).lstrip() if pre else m.group(2)}{tail}"
 
     def wrapped(m: re.Match) -> str:
-        bare = m.group(3)
+        # One `env` call with the run's own VAR= words after the worktree's, so they win.
+        own, bare = m.group(3), m.group(4)
         tail = (f"{shlex.quote(str(py))} -m pytest" if py and re.fullmatch(_BARE, bare) else bare) + flags
-        return f"{m.group(1)}{m.group(2)}{'env' + pre if pre else ''}{tail}"
+        lead = f"env{pre}{own[3:].lstrip()}" if pre else own
+        return f"{m.group(1)}{m.group(2)}{lead}{tail}"
 
-    out = _PYTEST_WRAPPED.sub(wrapped, _PYTEST_RUN.sub(run, cmd))
+    # Wrapped runs first: a run _PYTEST_RUN rewrote is never scanned again as a launcher's.
+    out = _PYTEST_RUN.sub(run, _PYTEST_WRAPPED.sub(wrapped, cmd))
     return f"printf '%s\\n' {shlex.quote('ttp: ' + why)} >&2\n{out}" if why else out
 
 
