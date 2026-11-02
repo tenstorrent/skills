@@ -42,11 +42,11 @@
   host's, UTC or `Z`: convert times you copy from UTC logs.
 - `ttp notify "<text>"` (`--severity low|normal`) only when your spec says to tell the user; say so
   in your hand-off. `high`: urgent, to the coordinator now (2/run).
-- A step only the user can take (a sign-in, a device code, a credential): `ttp notify --step <kind>
-  --check "<exits 0 once done>" --do "<what they run>"`: one standing item, which later runs update.
-  Hand off `waiting` with that check as `retry_when`, never "the user's next message". With a
-  deadline: `ttp hours --check --for <seconds they need>`, plus `--present 10` if under 10 min. Exit
-  1: never start or send it on a timer; wait on that check instead. The notify names its lapse.
+- A user-only step (a sign-in, a device code, a credential): `ttp notify --step <kind> --check
+  "<exits 0 once done>"`, one item later runs update. Hand off `waiting` with that check as
+  `retry_when`, never "the user's next message". A deadline: `ttp hours --check --for <seconds they
+  need>`, plus `--present 10` if under 10 min; exit 1: never start or send it on a timer, wait on
+  that check. The notify names its lapse.
 - Make durable progress early (commit, or write to the output folder): a killed run keeps
   what's on disk.
 - Run builds as `ttp clip -- <command>` (it shows the failures or head and tail, and the log's
