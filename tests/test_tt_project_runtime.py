@@ -3856,7 +3856,7 @@ def test_task_provider_override_routes_on_the_last_good_config(env, monkeypatch)
         pass
 
     class Prov:
-        def use(self, model, prices):
+        def use(self, model, prices, billing="auto"):
             seen.append(model)
             raise Stop()
     monkeypatch.setattr(dm, "get_provider", lambda name: Prov())
