@@ -75,6 +75,9 @@ AFTER_STATES = ("ok", "failed", "timeout", "killed", "skipped")
 STATS_S = 7 * 86400            # the conflict counts `ttp push --queue` and the web app show cover this long
 INHERIT_WINDOW_S = 30 * 86400  # reviews finished this long ago at most tell which branches were rejected
 INHERIT_GIT_S = 30             # each git call of that check, bounded, as the tick waits for it
+# The tasks a review's earlier valid approval accepted under "inherited" (kept in its result by the
+# daemon): a later approval by the same review (after a push conflict) keeps them for its lineage.
+JUDGED_KEY = "inherited_judged"
 RESOLVES_MAX = 20               # upstream note fingerprints one approval may resolve (a hand-off's `resolves`)
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 REBASE_LABEL = "push_rebase:"   # + the conflicting head: a review the daemon queued to rebase it (auto_rebase)
@@ -427,7 +430,10 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
     may name any commit; the commits it adds over the conflicting head are listed for the event. A
     head that carries commits of another task whose latest review failed (see _inherited) is invalid
     unless its entry lists that task under "inherited": the review judged them; "inherited" then
-    names them per head for the event. A reviewed task whose pr_branch (push.pr_elsewhere) the push
+    names them per head for the event. A task of the review's own lineage (reviewcap.lineage) that an
+    earlier valid approval of this same review accepted (JUDGED_KEY) stays accepted: its reviewer
+    judged it. A task outside the lineage is never accepted unless listed. A reviewed task whose
+    pr_branch (push.pr_elsewhere) the push
     remote has no branch of is a push-branch delivery: "notes" says its label was ignored and why."""
     d = _delivery(p, cfg)
     if d.get("push_queue") is not True:
@@ -492,14 +498,24 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
     except subprocess.TimeoutExpired:
         carried = {}   # git hung: the push checks still run; the tick must not wait on it
     taken: dict[str, list[int]] = {}
+    own: set[int] | None = None
+    judged = {int(i) for i in load_result(task.get("result")).get(JUDGED_KEY) or [] if str(i).isdigit()}
     for head, by_task in carried.items():
         left = {t: c for t, c in by_task.items() if t not in accepted[head]}
+        if left and own is None:
+            from . import reviewcap
+            own = reviewcap.lineage(p.db, task["id"])
+        left = {t: c for t, c in left.items() if not (t in judged and t in own)}
         if left:
             tid, commits = next(iter(left.items()))
             more = f" (and from #{', #'.join(map(str, list(left)[1:]))})" if len(left) > 1 else ""
+            mine = sorted(set(left) & own)
             return {"invalid": f"{_short(head)} carries unreviewed commits from #{tid}{more}, whose latest review "
                                f"failed: {'; '.join(commits[:10])}. Approve a head without them, or judge them in "
-                               f"this review and, if they are sound, add \"inherited\": {sorted(left)} to its entry"}
+                               f"this review and, if they are sound, add \"inherited\": {sorted(left)} to its entry"
+                               + (f". #{', #'.join(map(str, mine))} {'is' if len(mine) == 1 else 'are'} in this "
+                                  f"review's own lineage: if you judged the whole range, listing "
+                                  f"{'it' if len(mine) == 1 else 'them'} is the default step" if mine else "")}
         taken[head] = sorted(by_task)
     return {"entries": out, "target": f"{tgt[0]}/{tgt[1]}", "added": added,
             **({"inherited": taken} if taken else {}), **({"notes": notes} if notes else {})}

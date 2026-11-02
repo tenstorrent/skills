@@ -14471,3 +14471,115 @@ def test_ttp_checks_runs_its_checks_when_the_push_queue_store_is_malformed(env, 
         (p.state / pushpass.STORE).write_text(text)
         cli.main(["checks", "--", cmd])
         assert len(count.read_text().splitlines()) == n + 1 and "push batch" not in capsys.readouterr().out
+
+
+def _approval_refused_twice(env, s, crev, entry):
+    """Review `crev` hands off done twice approving `entry` without "inherited": the first runs again,
+    the second fails (the daemon's one rerun for an invalid approval)."""
+    t = _pq_hand_off(env, s, push=[entry], task=crev)
+    assert t["status"] == "queued" and json.loads(t["result"])["push_invalid"] == 1, t
+    return _pq_hand_off(env, s, push=[entry], task=crev)
+
+
+def test_a_review_failed_only_on_its_push_approval_form_raises_no_review_area_cap_and_queues_no_fix(env, monkeypatch):
+    """A review whose reviewer passed the change but whose approval the queue refused twice (here: a
+    carried commit not listed under "inherited") failed on the approval's form, not on a finding. It
+    is recorded review_failure approval, counts toward no review_area_cap (even at cap 1) and gets no
+    automatic fix, though its hand-off proposed follow-ups."""
+    from ttp import reviewcap
+    s = _pq(env, monkeypatch)
+    s.p.set_config("review.area_fail_cap", 1)
+    x, xbranch, _, _ = _pq_stacked(s, "rejected", review="failed")
+    c, cbranch, chead, crev = _pq_stacked(s, "stacked", on=xbranch, review="running")
+    tasks = s.p.db.one("SELECT COUNT(*) n FROM tasks")["n"]
+    _pq_hand_off(env, s, push=[{"branch": cbranch, "head": chead}], task=crev)
+    t = _pq_hand_off(env, s, push=[{"branch": cbranch, "head": chead}], task=crev,
+                     followups=[{"title": "tidy", "spec": "rename a helper"}])
+    res = json.loads(t["result"])
+    assert t["status"] == "failed" and res["review_failure"] == "approval", res
+    assert reviewcap.unjudged(t) and crev not in reviewcap.failed_reviews(s.p.db, 0)
+    assert reviewcap.area(s.p, {"review": {"area_fail_cap": 1}}, t) is None
+    assert not s.p.db.q("SELECT id FROM events WHERE kind=?", (reviewcap.REVIEW_AREA_EVENT,))
+    assert not s.p.db.q("SELECT id FROM tasks WHERE title LIKE 'Fix review%' OR title LIKE 'Re-review%'")
+    assert s.p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == tasks, "a fix queued for an approval-form failure"
+    (ev,) = s.p.db.q("SELECT text FROM events WHERE task=? AND kind='task_failed'", (crev,))
+    assert "Approval-form failure (review_failure: approval)" in ev["text"]
+
+
+@pytest.mark.parametrize("third", ["approval", "substantive"])
+def test_review_area_cap_counts_only_failures_that_carry_a_finding(env, monkeypatch, third):
+    """Three failed reviews of one lineage within the window raise review_area_cap (default 3) when
+    each carries a finding; when the third failed only on its push approval's form it does not."""
+    from ttp import reviewcap
+    p = make(env)
+    monkeypatch.setattr(reviewcap, "main_file", lambda p, r: None)
+    code = p.db.add_task("feature", "f", kind="code")
+    prev, reviews = code, []
+    for n, kind in enumerate(("substantive", "substantive", third)):
+        rid = p.db.add_task(f"Review #{prev}: feature", "r", kind="review", depends_on=[prev])
+        p.db.update_task(rid, status="failed", result=json.dumps(
+            {"status": "failed" if kind != "approval" else "done", "summary": f"finding {n}", "review_failure": kind}))
+        p.db.x("INSERT INTO events(ts,source,kind,text,status,task) VALUES(?,?,?,?,?,?)",
+               (time.time(), "daemon", "task_failed", "failed", "done", rid))
+        reviews.append(rid)
+        prev = p.db.add_task(f"Fix review #{rid}: feature", "fix", kind="code", labels=[f"review_fix:{rid}"])
+    got = reviewcap.area(p, {}, p.db.task(reviews[-1]))
+    if third == "approval":
+        assert got is None and reviews[-1] not in reviewcap.failed_reviews(p.db, 0)
+    else:
+        assert got and got["reviews"] == reviews, got
+
+
+def test_a_lineage_head_keeps_the_inherited_commits_its_review_judged_and_never_inherits_another_lineage(
+        env, monkeypatch):
+    """A review approves a head carrying commits of a task in its own continues/fix lineage whose latest
+    review failed. The refusal says listing it is the default step; once listed, the daemon records it
+    (pushq.JUDGED_KEY) and a later approval by the same review (a push-conflict re-approval) keeps it
+    without listing it again. A task outside the lineage is never accepted that way, even if a
+    record names it: its commits still need "inherited"."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    x, xbranch, _, xrev = _pq_stacked(s, "rejected", review="failed")
+    c, cbranch, chead, crev = _pq_stacked(s, "stacked", on=xbranch)
+    # The review of the stacked fix continues the failed review of x: x is in its lineage.
+    crev = s.p.db.add_task("Review the stacked fix", "r", kind="review", origin="daemon",
+                           depends_on=[c], labels=[f"continues:{xrev}"])
+    entry = {"branch": cbranch, "head": chead}
+    why = pushq.check_approval(s.p, s.p.db.task(crev), [entry]).get("invalid", "")
+    assert f"from #{x}," in why and f"#{x} is in this review's own lineage" in why and "default step" in why, why
+    # Outside the lineage a record of judged tasks accepts nothing.
+    _, ebranch, ehead, erev = _pq_stacked(s, "unrelated", on=xbranch, review="running")
+    s.p.db.update_task(erev, result=json.dumps({pushq.JUDGED_KEY: [x]}))
+    why = pushq.check_approval(s.p, s.p.db.task(erev), [{"branch": ebranch, "head": ehead}]).get("invalid", "")
+    assert f"from #{x}," in why and "own lineage" not in why, why
+    t = _pq_hand_off(env, s, push=[{**entry, "inherited": [x]}], task=crev)
+    assert t["status"] == "pushing" and json.loads(t["result"])[pushq.JUDGED_KEY] == [x], t
+    # Re-approving (after a conflict) without listing it: still accepted, and recorded as inherited.
+    check = pushq.check_approval(s.p, s.p.db.task(crev), [entry])
+    assert check.get("entries") and check["inherited"] == {chead: [x]}, check
+    # A head that also carries commits of another lineage's rejected task: refused for that one only.
+    y, ybranch, _, _ = _pq_stacked(s, "other", on=cbranch, review="failed")
+    d, dbranch, dhead, _ = _pq_stacked(s, "both", on=ybranch)
+    s.p.db.update_task(crev, depends_on=[c, d])
+    why = pushq.check_approval(s.p, s.p.db.task(crev), [{"branch": dbranch, "head": dhead}]).get("invalid", "")
+    assert f"from #{y}," in why and f"#{x}" not in why and "own lineage" not in why, why
+
+
+def test_a_light_conflict_fixs_refused_approval_tells_the_standard_run_why_and_costs_no_rerun(env, monkeypatch):
+    """A light push-conflict fix whose approval is refused hands over to a standard run. That run is told
+    the refusal (its woke text), and the light run's refusal does not use up the review's one rerun
+    for an invalid approval, so the standard run's first refusal runs it again, never fails it."""
+    from ttp import conflictfix
+    s = _pq(env, monkeypatch)
+    x, xbranch, _, _ = _pq_stacked(s, "rejected", review="failed")
+    c, cbranch, chead, crev = _pq_stacked(s, "stacked", on=xbranch, review="running")
+    s.p.db.update_task(crev, result=json.dumps({"woke": "push conflict on proj", conflictfix.KEY: {"tier": "light"}}))
+    monkeypatch.setattr(conflictfix, "run_note", lambda note: {"tier": "light"})
+    monkeypatch.setattr(conflictfix, "of", lambda task: {"tier": "light"})
+    t = _pq_hand_off(env, s, push=[{"branch": cbranch, "head": chead}], task=crev)
+    res = json.loads(t["result"])
+    assert t["status"] == "queued" and res.get("push_invalid", 0) == 0, res
+    assert "push conflict on proj" in res["woke"] and f"carries unreviewed commits from #{x}" in res["woke"], res
+    monkeypatch.setattr(conflictfix, "run_note", lambda note: None)
+    t = _pq_hand_off(env, s, push=[{"branch": cbranch, "head": chead}], task=crev)
+    assert t["status"] == "queued" and json.loads(t["result"])["push_invalid"] == 1, t

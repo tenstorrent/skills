@@ -290,16 +290,22 @@ def task_env(tid) -> dict[str, str]:
     return {"TTP_TASK": str(tid), "TTP_TASK_ID": str(tid)}
 
 
-def inherited_line(carried: dict[int, list[str]]) -> str:
+def inherited_line(carried: dict[int, list[str]], own: set[int] | frozenset = frozenset()) -> str:
     """The review spec's line on the commits its head carries from tasks whose latest review failed
-    (pushq.carried), with kind-review.md's choice, so the approval is not refused for them later."""
+    (pushq.carried), with kind-review.md's choice, so the approval is not refused for them later.
+    Those of tasks in the review's `own` lineage (reviewcap.lineage): judging the whole range and
+    listing them is the default step."""
     parts = []
     for tid, commits in sorted(carried.items()):
         more = f" (+{len(commits) - INHERITED_COMMITS_MAX} more)" if len(commits) > INHERITED_COMMITS_MAX else ""
         parts.append(f"#{tid}: {'; '.join(commits[:INHERITED_COMMITS_MAX])}{more}")
+    mine = sorted(set(carried) & set(own))
     return (f"Its head carries unreviewed commits from tasks whose latest review failed ({' | '.join(parts)}). "
             f"Approve a head without them, or judge them in this review and, only if they are sound, add "
-            f"\"inherited\": {sorted(carried)} to its push entry.")
+            f"\"inherited\": {sorted(carried)} to its push entry."
+            + (f" #{', #'.join(map(str, mine))} {'is' if len(mine) == 1 else 'are'} in this review's own "
+               f"continues/fix lineage: review the whole range against the push branch and, if it is sound, "
+               f"list {'it' if len(mine) == 1 else 'them'} under \"inherited\" (the default step)." if mine else ""))
 
 
 OWN_STEP = re.compile(r"It (?:delivers onto its pr_branch|rebases \S+ and delivers onto its own branch) "
@@ -309,8 +315,11 @@ OWN_STEP = re.compile(r"It (?:delivers onto its pr_branch|rebases \S+ and delive
 # or both (mixed). A check-only failure gets no fix and re-review: nothing in the change is to fix.
 # Any other value is unknown and handled like substantive. The daemon writes a fourth, precheck, for a
 # review it failed with no reviewer run because the checks it started on the head failed
-# (Daemon._precheck_failed): it gets a fix and re-review like substantive.
-REVIEW_FAILURE_KEY, REVIEW_FAILURE_KINDS = "review_failure", ("check_only", "substantive", "mixed", "precheck")
+# (Daemon._precheck_failed): it gets a fix and re-review like substantive. And a fifth, approval, for a
+# review whose reviewer passed the change but whose push approval stayed invalid after its one rerun
+# (an inherited commit not listed, a stale head): no finding, so no fix, and no review_area_cap count.
+REVIEW_FAILURE_KEY, REVIEW_FAILURE_KINDS = "review_failure", ("check_only", "substantive", "mixed", "precheck",
+                                                              "approval")
 # A precheck failure's verdict: the last lines of checks.out it quotes, and the failing command's exit
 # codes that mean a timeout or a kill (the environment, not the head), which leave the reviewer to run.
 PRECHECK_TAIL_LINES, PRECHECK_KILLED_RCS = 20, (124, 137, 143)
@@ -4520,8 +4529,10 @@ class Daemon:
             log(self.p, f"task {task['id']}: run {r.get('id')} {reason}")
         # A review that passes may hand its approved commits to the push queue instead of pushing
         # (delivery.push_queue): it waits as 'pushing' until a batch pushed them (pushq.py).
-        approval, push_note, push_quiet = None, "", False
+        approval, push_note, push_quiet, push_why = None, "", False, ""
         entries = result.get("push") if isinstance(result, dict) else None
+        if task["kind"] == "review" and (judged := load_result(task["result"]).get(pushq.JUDGED_KEY)):
+            extra[pushq.JUDGED_KEY] = judged   # what its earlier approvals accepted, kept for the next one
         if new == "done" and entries not in (None, "", []):
             try:
                 check = (pushq.check_approval(self.p, task, entries, cfg=self.cfg) if task["kind"] == "review"
@@ -4532,7 +4543,7 @@ class Daemon:
                 log(self.p, f"task {task['id']}: its push list was ignored: {check['ignored']}")
                 push_note = f" Its push list was ignored: {check['ignored']}."
             elif check.get("invalid"):
-                why = check["invalid"]
+                why = push_why = check["invalid"]
                 log(self.p, f"task {task['id']}: push approval invalid: {why}")
                 extra["push_invalid"] = int(load_result(task["result"]).get("push_invalid") or 0) + 1
                 push_note = f" Push approval invalid: {why}."
@@ -4541,10 +4552,13 @@ class Daemon:
                     extra["woke"] = f"push approval invalid: {why}"
                     reason = f"push approval invalid: {why}; its review runs again"
                 else:
-                    new = "failed"
+                    # The reviewer passed the change: only the approval's form failed (reviewcap.NO_FINDING).
+                    new, result = "failed", {**result, REVIEW_FAILURE_KEY: "approval"}
                     summary = f"push approval invalid again: {why}. {summary}"[:1500]
             else:
                 approval, new = check, "pushing"
+                if took := {i for ids in (check.get("inherited") or {}).values() for i in ids}:
+                    extra[pushq.JUDGED_KEY] = sorted(took | set(extra.get(pushq.JUDGED_KEY) or []))
                 for note in check.get("notes") or []:
                     log(self.p, f"task {task['id']}: {note}")
         # A push-conflict fix (conflictfix.py) costs no review attempt when it approves a new head. A
@@ -4564,6 +4578,11 @@ class Daemon:
                 attempts = int(task["attempts"] or 0)
                 extra[conflictfix.KEY] = {**cmark, "escalate": why}
                 extra["woke"] = str(load_result(task["result"]).get("woke") or "push conflict")[:1500]
+                if push_why:
+                    # The light run's refused approval costs no rerun: the standard run gets its own, told why.
+                    extra["push_invalid"] = int(load_result(task["result"]).get("push_invalid") or 0)
+                    extra["woke"] = (extra["woke"][:900] + f"\nThe light run's approval was refused: "
+                                     f"push approval invalid: {push_why}")[:1500]
                 reason = f"{why[:300]}; its review runs again at standard"
             elif new == "pushing":
                 attempts = int(task["attempts"] or 0)
@@ -4841,14 +4860,16 @@ class Daemon:
         # A check-only failure stays failed: the coordinator routes the missing check to its owner,
         # and what waited on the review stays on it.
         check_only = new == "failed" and task["kind"] == "review" and review_failure(result) == "check_only"
+        # A refused approval of a passed change has nothing to fix either: the review re-approves.
+        form_only = new == "failed" and task["kind"] == "review" and review_failure(result) == "approval"
         area = self._review_area(dict(task, **upd)) \
-            if new == "failed" and task["kind"] == "review" and not check_only else None
+            if new == "failed" and task["kind"] == "review" and not check_only and not form_only else None
         fix = self._fix_failed_review(dict(task, **upd), fixes, summary) \
             if new == "failed" and task["kind"] == "review" and fixes and len(fups) <= MAX_FOLLOWUPS \
-            and not area and not check_only else None
+            and not area and not check_only and not form_only else None
         # A failed review left with no fix (a capped round, no fix follow-ups, findings on branches
         # that are not one stack) wakes the coordinator, never silently.
-        nofix = "" if fix or area or check_only or new != "failed" or task["kind"] != "review" else \
+        nofix = "" if fix or area or check_only or form_only or new != "failed" or task["kind"] != "review" else \
             getattr(self, "_nofix", "") if fixes and len(fups) <= MAX_FOLLOWUPS else \
             f"it proposed more than {MAX_FOLLOWUPS} follow-ups" if fixes else "it proposed no fix follow-ups"
         # With no fix follow-ups the task_failed event below is the wake (it is queued): it says why,
@@ -4870,6 +4891,10 @@ class Daemon:
         if check_only:
             text += ("\nCheck-only failure (review_failure: check_only): no automatic fix or re-review. Route the "
                      "missing or inapplicable check to the task that owns it; what waits on this review stays on it.")
+        if form_only:
+            text += ("\nApproval-form failure (review_failure: approval): the reviewer passed the change but its push "
+                     "approval was refused twice, so no automatic fix and no review_area_cap count. Requeue this "
+                     "review with the refusal above to approve again; what waits on it stays on it.")
         if outcome == "done" and task["kind"] == "review":
             text += relay_hint(coord._open_dependents(db, task["id"]))
         if area:
@@ -9217,7 +9242,8 @@ class Daemon:
                 log(self.p, f"task {t['id']}: carried commits not read on release: {e}")
                 carried = {}
             db.update_task(t["id"], labels=reviewhold.released_labels(t), not_before=None,
-                           spec=reviewhold.respec(t["spec"] or "", inherited_line(carried) if carried else "", line))
+                           spec=reviewhold.respec(t["spec"] or "", inherited_line(
+                               carried, reviewcap.lineage(db, t["id"])) if carried else "", line))
             log(self.p, f"task {t['id']} review hold released ({why})")
 
     def _own_255(self, tid: int, probe: str, out: str, now: float) -> int | str:
@@ -12411,7 +12437,7 @@ class Daemon:
                          f"change's worktree (it publishes to {d['push_branch']}).")
             # Named now, so a review that passes need not be woken again by the queue's refusal.
             if carried := pushq.carried(self.p, task, full, cfg):
-                lines.append(inherited_line(carried))
+                lines.append(inherited_line(carried, reviewcap.lineage(db, task["id"])))
                 # A carried change whose fix is still open: its reviewer could only repeat the open
                 # finding, so the review waits for that fix chain (reviewhold).
                 held = reviewhold.blocking(db, carried, skip={task["id"]})
@@ -12551,7 +12577,9 @@ class Daemon:
 
     def _name_new_head(self, task: dict, review: dict) -> None:
         """A queued re-review of a failed review gets the new head its fix ended on, and the size of
-        the fix delta from the failed head (reviewstats): once per head."""
+        the fix delta from the failed head (reviewstats): once per head. With the push queue on, its
+        line on the commits that head carries from tasks whose latest review failed (inherited_line)
+        is set for that head too, as _auto_review writes it, so its first approval can be valid."""
         c, branch = continues_id(review), task.get("branch")
         if review["status"] != "queued" or review["kind"] != "review" or c is None or not branch:
             return
@@ -12562,11 +12590,17 @@ class Daemon:
                     review.get("spec") or ""):
                 return
             line = reviewstats.new_head_line(self.p, failed, branch, full)
+            pushes = push.REVIEW_ONLY_LABEL not in push._labels(review)
+            carried = pushq.carried(self.p, task, full, self.cfg) if pushes else {}
         except Exception as e:
             log(self.p, f"task {task['id']}: review #{review['id']} not told its new head: {e}")
             return
-        self.p.db.update_task(review["id"], spec=f"{review.get('spec') or ''}\n{line}")
-        review["spec"] = f"{review.get('spec') or ''}\n{line}"
+        spec = f"{review.get('spec') or ''}\n{line}"
+        if carried or reviewhold.INHERITED_PREFIX in spec:
+            spec = reviewhold.respec(spec, inherited_line(carried, reviewcap.lineage(self.p.db, review["id"]))
+                                     if carried else "", "")
+        self.p.db.update_task(review["id"], spec=spec)
+        review["spec"] = spec
 
     def _precheck_open(self, task: dict, review: dict) -> None:
         """An open review queued before the code task finished (the re-review _fix_failed_review

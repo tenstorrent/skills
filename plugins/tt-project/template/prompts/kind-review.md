@@ -113,7 +113,10 @@
   them). Checks that failed on the head are a blocking finding.
 - Woken because the head `carries unreviewed commits from #<task>`, or your spec lists such
   commits (its branch was built on a branch whose review failed): approve a head without those commits, or review them as part of
-  this change and, only if they are sound, add `"inherited": [<task>]` to that entry.
+  this change and, only if they are sound, add `"inherited": [<task>]` to that entry. When `<task>`
+  is in this review's own continues/fix lineage (the spec or refusal says so), the default is to
+  review the whole range against the push branch and list it under `"inherited"` in your first
+  approval; never list a task outside the lineage whose commits you did not judge.
 - Woken because `push conflict`: fetch, rebase the change onto the push branch's current tip in
   its worktree and resolve keeping both sides' intents (the one edit you may make). Run focused
   tests of what the resolution touched, commit, and approve the new head.

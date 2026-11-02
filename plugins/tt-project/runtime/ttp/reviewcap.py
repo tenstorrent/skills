@@ -24,6 +24,9 @@ the push queue failed because only its batch checks failed (pushq._settle writes
 nor one the daemon failed with no reviewer run because its pre-review checks failed
 (`review_failure: precheck`, Daemon._precheck_failed): no reviewer judged the design. That one still
 counts toward the per-change round cap (daemon.AUTO_FIX_ROUNDS), since it is a round of the stack.
+Nor does one whose reviewer passed the change but whose push approval the queue kept refusing
+(`review_failure: approval`, written by the daemon): its only fault is the approval's form, such as
+an inherited commit left out of `"inherited"` or a stale head, not a finding on the change.
 """
 from __future__ import annotations
 
@@ -204,10 +207,14 @@ def check_only(task: dict) -> bool:
     return load_result(task.get("result")).get("review_failure") == "check_only"
 
 
+NO_FINDING = ("check_only", "precheck", "approval")   # review_failure values that carry no finding on the change
+
+
 def unjudged(task: dict) -> bool:
-    """Whether review `task` failed with no reviewer judging the code: check-only, or its pre-review
-    checks failed (precheck). Neither counts toward area_fail_cap."""
-    return load_result(task.get("result")).get("review_failure") in ("check_only", "precheck")
+    """Whether review `task` failed with no review finding on the change: check-only, its pre-review
+    checks failed (precheck), or only its push approval was refused (approval). None counts toward
+    area_fail_cap."""
+    return load_result(task.get("result")).get("review_failure") in NO_FINDING
 
 
 def failed_reviews(db: DB, since: float) -> list[int]:
