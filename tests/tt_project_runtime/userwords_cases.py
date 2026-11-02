@@ -112,8 +112,9 @@ def test_a_short_sentence_sharing_only_generic_words_matches_no_topic(env):
                chat=None, kind="user", provenance="web-session")
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
     lines = [x for x in coord.digest(p, {}, [], []).splitlines() if "User's latest words on this" in x]
-    assert lines and "shared note" in lines[0] and "accounts instead" not in lines[0] and \
-        "accounts instead" not in d and lines[0].startswith("- ask #3: "), lines
+    # The matching message's best sentence is quoted; the filler message matches no topic.
+    assert lines and lines[0].startswith("- ask #3: ") and "expired again" in lines[0], lines
+    assert "accounts instead" not in d and "Use the other project" not in d, d
 
 
 def test_the_ask_gate_refuses_leave_the_users_newer_request_gave_naming_it(env):
