@@ -462,7 +462,7 @@ def test_the_hook_gives_one_notice_where_no_sandbox_works(tmp_path, monkeypatch)
     assert call("pytest -q") is None
 
 
-def _fake_python(tmp_path, xdist_rc: int):
+def _fake_xdist_python(tmp_path, xdist_rc: int):
     """A stand-in interpreter: its xdist probe (`-c ...`) exits `xdist_rc` (0 has xdist, 3 lacks it,
     other cannot tell); any other run prints its arguments."""
     py = tmp_path / f"python9.{xdist_rc}"   # a name the pytest detector takes for an interpreter
@@ -473,7 +473,7 @@ def _fake_python(tmp_path, xdist_rc: int):
 
 def test_drop_xdist_takes_out_worker_options_only_where_xdist_is_missing(tmp_path):
     from ttp import testslots
-    py = _fake_python(tmp_path, 3)
+    py = _fake_xdist_python(tmp_path, 3)
     argv = [py, "-m", "pytest", "-q", "-n", "4", "-k", "-n", "-nauto", "--numprocesses=3", "--dist", "load",
             "--dist=loadfile", "t.py", "--", "-n", "2"]
     kept, said = testslots.drop_xdist(argv)
@@ -483,7 +483,7 @@ def test_drop_xdist_takes_out_worker_options_only_where_xdist_is_missing(tmp_pat
         assert testslots.drop_xdist([py, "-m", "pytest", *form, "t.py"])[0] == [py, "-m", "pytest", "t.py"], form
     # With xdist, or where the probe cannot tell, nothing changes and nothing is said.
     for rc in (0, 1):
-        other = _fake_python(tmp_path, rc)
+        other = _fake_xdist_python(tmp_path, rc)
         assert testslots.drop_xdist([other, "-m", "pytest", "-n", "4"]) == ([other, "-m", "pytest", "-n", "4"], "")
     # Not pytest, or pytest with no xdist option: as it is, and no probe needed.
     for cmd in (["head", "-n", "5", "f"], [py, "t.py", "-n", "2"], [py, "-m", "pytest", "-q", "-k", "-n2"]):
@@ -503,7 +503,7 @@ def test_ttp_sandbox_and_clip_run_pytest_without_n_where_xdist_is_missing(tmp_pa
     env = {**os.environ, "PYTHONPATH": str(runtime)}
     env.pop("TTP_RUN_DIR", None)
     for rc, args in ((3, "-m pytest -q t.py"), (0, "-m pytest -q -n 4 t.py")):
-        py = _fake_python(tmp_path, rc)
+        py = _fake_xdist_python(tmp_path, rc)
         r = subprocess.run([sys.executable, "-m", "ttp", tool, "--", py, "-m", "pytest", "-q", "-n", "4", "t.py"],
                            env=env, capture_output=True, text=True, timeout=120)
         assert r.returncode == 0 and f"ARGS: {args}" in r.stdout, (r.stdout, r.stderr)
