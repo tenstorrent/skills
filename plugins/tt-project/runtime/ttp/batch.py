@@ -634,7 +634,8 @@ def _rewritten(repo: Path, onto: str, base: str, rest: list[str]) -> dict[str, s
     conflict resolved in its own review, so neither a trailer nor its patch names it; the landed version
     is the newer one. Every task may commit as one author within one second, so a subject or the files
     alone never match. A commit rewritten after its landing (an amend that adds work) is newer than the
-    landed version, so it is replayed, never dropped."""
+    landed version, so it is replayed, never dropped; one amended before it must still be carried whole by
+    the landed version (_carries)."""
     mine = _idents(repo, "--no-walk=unsorted", *rest)
     theirs: dict[str, list[tuple[str, str, frozenset, int]]] = {}
     for c, (who, subject, files, when) in _idents(repo, "--reverse", f"{base}..{onto}").items():
@@ -644,10 +645,76 @@ def _rewritten(repo: Path, onto: str, base: str, rest: list[str]) -> dict[str, s
         if not (m := mine.get(c)):
             continue
         for landed, subject, files, when in theirs.get(m[0], []):
-            if subject == m[1] and files == m[2] and when >= m[3]:
+            if subject == m[1] and files == m[2] and when >= m[3] and _carries(repo, c, landed, m[2]):
                 found[c] = landed
                 break
     return found
+
+
+_MARK = 40          # conflict marker size: no line of a file is taken for one
+
+
+def _blob(repo: Path, rev: str, path: str) -> bytes | None:
+    """The file `path` at `rev`, or None where it has none."""
+    r = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", f"{rev}:{path}"], capture_output=True,
+                       timeout=gitmemo.timeout(None, ("cat-file",)))
+    return r.stdout if r.returncode == 0 else None
+
+
+def _carries(repo: Path, c: str, landed: str, files: frozenset) -> bool:
+    """Whether `landed` holds all of commit `c`'s work: `c` merged (three-way, base c^) onto landed^
+    gives landed's version of each of its files, outside the regions that conflict there (the
+    landing resolved those). An amend made before the landing adds work its landed copy lacks: that
+    commit is replayed, so the work lands or comes back as a conflict, never dropped."""
+    try:
+        for path in files:
+            mine, got = _blob(repo, c, path), _blob(repo, landed, path)
+            if mine == got:
+                continue
+            if mine is None or got is None:
+                return False
+            with tempfile.TemporaryDirectory() as d:
+                sides = []
+                for name, rev in (("ours", f"{landed}^"), ("base", f"{c}^"), ("theirs", c)):
+                    (Path(d) / name).write_bytes(_blob(repo, rev, path) or b"")
+                    sides.append(str(Path(d) / name))
+                r = subprocess.run(["git", "merge-file", "-p", f"--marker-size={_MARK}", *sides],
+                                   capture_output=True, timeout=gitmemo.timeout(None, ("merge-file",)))
+            if r.returncode < 0 or r.returncode > 127 or not _fits(r.stdout, got):   # 255: an error (binary)
+                return False
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
+
+
+def _fits(merged: bytes, got: bytes) -> bool:
+    """Whether `got` is `merged` with each conflict region replaced by any lines: every hunk outside
+    the conflicts is there, in order, with nothing else between."""
+    segs, cur, inside = [], [], False
+    for ln in merged.splitlines(keepends=True):
+        if not inside and ln.startswith(b"<" * _MARK) and ln[_MARK:_MARK + 1] in (b" ", b"\n", b"\r", b""):
+            segs.append(cur)
+            cur, inside = [], True
+        elif inside:
+            inside = not (ln.startswith(b">" * _MARK) and ln[_MARK:_MARK + 1] in (b" ", b"\n", b"\r", b""))
+        else:
+            cur.append(ln)
+    if inside:
+        return False
+    segs.append(cur)
+    lines = got.splitlines(keepends=True)
+    if len(segs) == 1:
+        return segs[0] == lines
+    first, last = segs[0], segs[-1]
+    if len(first) + len(last) > len(lines) or lines[:len(first)] != first or lines[len(lines) - len(last):] != last:
+        return False
+    at, end = len(first), len(lines) - len(last)
+    for seg in segs[1:-1]:
+        k = next((i for i in range(at, end - len(seg) + 1) if lines[i:i + len(seg)] == seg), None)
+        if k is None:
+            return False
+        at = k + len(seg)
+    return True
 
 
 def _commit_replayed(wt: Path) -> None:

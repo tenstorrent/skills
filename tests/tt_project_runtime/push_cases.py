@@ -2241,6 +2241,8 @@ def test_a_push_batch_drops_an_entry_commit_that_landed_rewritten_and_replays_th
     same author, author date, subject and files, and a newer commit), or reworded (the same patch).
     The entry replays only its own commit: no conflict, so its approval stands."""
     p, repo, origin, other, a = _landed_fixture(env, monkeypatch)
+    if message is None:     # the landing resolved a conflict with the target's own edit of line b
+        _land_as(other, {"notes.txt": "a\nb theirs\nc\n"}, "the target edits line b")
     _git_out(other, "pull", "-q", "--ff-only", "origin", "proj")
     _git_out(other, "fetch", "-q", str(repo), "first")
     landed_as = _rewrite(other, a, {"notes.txt": f"a\n{line}\nc\n"}, message=message)
@@ -2281,7 +2283,24 @@ def test_a_push_batch_sends_back_an_entry_whose_own_commit_edits_what_a_rewritte
     assert m["results"][0]["detail"]["files"] == ["notes.txt"], m["results"]
 
 
-@pytest.mark.parametrize("change", ["author", "date", "subject", "files", "older", "none"])
+def test_a_push_batch_replays_an_entry_commit_amended_before_its_landing(env, monkeypatch):
+    """The entry's commit is an amend (same author date and subject) that adds work, made before the
+    older copy landed through another branch, rewritten later: the landed copy lacks the amend's work,
+    so the entry is replayed and its work lands or it comes back as a conflict, never dropped."""
+    p, repo, origin, other, a = _landed_fixture(env, monkeypatch)
+    _git_out(repo, "checkout", "-q", "-B", "e1", a)
+    head = _rewrite(repo, a, {"notes.txt": "a\nB1\nc\nfix from review\n"}, later=100, args=("--amend",))
+    _land_as(other, {"later.txt": "x\n"}, "another change")
+    _git_out(other, "fetch", "-q", str(repo), "first")
+    _rewrite(other, a, {"notes.txt": "a\nB1\nc\n"}, later=500)
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
+    assert _statuses(m) in (["pushed"], ["conflict"]), m
+    if _statuses(m) == ["pushed"]:
+        assert _git_out(origin, "show", "proj:notes.txt") == "a\nB1\nc\nfix from review", "the amend's work landed"
+
+
+@pytest.mark.parametrize("change", ["author", "date", "subject", "files", "older", "amended", "none"])
 def test_a_rewritten_landing_needs_the_same_author_date_subject_and_files_and_a_newer_commit(
         tmp_path, change):
     from ttp import batch
@@ -2297,17 +2316,46 @@ def test_a_rewritten_landing_needs_the_same_author_date_subject_and_files_and_a_
     (repo / "f.txt").write_text("1\n")
     _git_out(repo, "commit", "-qam", "one")
     mine = _git_out(repo, "rev-parse", "HEAD")
+    landed = mine
+    if change == "amended":     # amended (adding work) before the older copy landed elsewhere
+        mine = _rewrite(repo, landed, {"f.txt": "1\nfix from review\n"}, later=100, args=("--amend",))
     _git_out(repo, "checkout", "-q", "--detach", base)
+    # the target changed line 0 too, so the landing resolved a conflict on it (the amend's landing is clean)
+    (repo / ("g.txt" if change == "amended" else "f.txt")).write_text("0 theirs\n")
+    _git_out(repo, "add", "-A")
+    _git_out(repo, "commit", "-qm", "theirs")
     # every task may commit as one author in one second: another subject on the same file is another commit
-    files = {"g.txt": "x\n"} if change == "files" else {"f.txt": "1 resolved\n"}
-    landed_as = _rewrite(repo, mine, files, message="other" if change == "subject" else None,
-                         later=-60 if change == "older" else 60)
+    files = {"g.txt": "x\n"} if change == "files" else {"f.txt": "1\n" if change == "amended" else "1 resolved\n"}
+    landed_as = _rewrite(repo, landed, files, message="other" if change == "subject" else None,
+                         later={"older": -60, "amended": 500}.get(change, 60))
     if change in ("author", "date"):
         _git_out(repo, "commit", "-q", "--amend", "--no-edit", *(
             ["--author", "U <u@example.com>"] if change == "author" else ["--date", "1000000000 +0000"]))
         landed_as = _git_out(repo, "rev-parse", "HEAD")
     want = {mine: landed_as} if change == "none" else {}
     assert batch._rewritten(repo, landed_as, base, [mine]) == want
+    b = batch.Batch.__new__(batch.Batch)
+    b.repo = repo
+    assert b._on_tip(landed_as, base, mine) == (landed_as if change == "none" else ""), "landing detection agrees"
+
+
+@pytest.mark.parametrize("merged, got, fits", [
+    (b"a\nb\n", b"a\nb\n", True),
+    (b"a\nb\n", b"a\n", False),
+    (b"a\n" + b"<" * 40 + b" o\nx\n" + b"=" * 40 + b"\ny\n" + b">" * 40 + b" t\nc\n", b"a\nz\nw\nc\n", True),
+    (b"a\n" + b"<" * 40 + b" o\nx\n" + b"=" * 40 + b"\ny\n" + b">" * 40 + b" t\nc\n", b"a\nc\n", True),
+    (b"a\n" + b"<" * 40 + b" o\nx\n" + b"=" * 40 + b"\ny\n" + b">" * 40 + b" t\nc\nfix\n", b"a\nz\nc\n", False),
+    (b"a\n" + b"<" * 40 + b"\nx\n" + b">" * 40 + b"\nm\n" + b"<" * 40 + b"\ny\n" + b">" * 40 + b"\nc\n",
+     b"a\n1\nm\n2\nc\n", True),
+    (b"a\n" + b"<" * 40 + b"\nx\n" + b">" * 40 + b"\nm\n" + b"<" * 40 + b"\ny\n" + b">" * 40 + b"\nc\n",
+     b"a\n1\n2\nc\n", False),
+    (b"a\n" + b"<" * 40 + b"\nx\n", b"a\n", False),
+], ids=["same", "short", "resolved", "resolved-empty", "extra-hunk", "two-conflicts", "lost-middle", "unclosed"])
+def test_a_rewritten_landing_carries_every_hunk_outside_the_conflicts_it_resolved(merged, got, fits):
+    from ttp import batch
+    assert batch._fits(merged, got) is fits
+
+
 def test_the_push_queue_counts_conflicts_and_those_its_batches_resolved(env):
     from ttp import pushq
     p, rid = _pq_rows(env)
