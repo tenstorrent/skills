@@ -572,6 +572,19 @@ def test_review_lists_every_blocking_finding_and_fixes_test_each_bug_class():
 
 
 
+def test_code_workers_get_the_exact_checks_commands_and_no_unconditional_pytest_n():
+    """The code prompt names each `ttp checks` form a worker needs (start, detached, result probe, the
+    on_pass that settles a pass), so no run needs `--help`; pytest -n is offered only where xdist is."""
+    code = " ".join((PLUGIN / "template" / "prompts" / "kind-code.md").read_text(encoding="utf-8").split())
+    for part in ("(`-- 'pytest -q tests/a.py' 'ruff check .'`)", "`ttp checks --detach -- <cmds>`",
+                 "`ttp checks --result <run dir>`", '`"on_pass": {"status": "done", "summary": "..."}`',
+                 "No `on_pass`, `next_step`, PR or landing left: a pass records `done`"):
+        assert part in code, part
+    worker = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
+    assert "Cap pytest -n at $TTP_TEST_SLOTS." not in worker
+    assert "Cap pytest -n at $TTP_TEST_SLOTS, only with xdist." in worker
+
+
 def test_code_workers_try_to_break_their_change_before_the_hand_off():
     """The code-kind prompt carries one compact self-check step aimed at the failure classes reviews
     keep finding; its detail lives in a tt-project-harness reference, and the hand-off names it."""

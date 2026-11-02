@@ -27775,6 +27775,7 @@ def _detached_checks(run, capsys, *check):
     out = capsys.readouterr().out
     probe = next(x for x in out.splitlines() if x.startswith("retry_when: "))[len("retry_when: "):]
     assert probe.endswith(f" checks --result {shlex.quote(str(run))}"), out
+    assert '"on_pass": {"status": "done", "summary": "..."}' in out, out   # the settle-on-pass form, so no --help
     return json.loads((run / "checks.pid").read_text())["pid"]
 
 

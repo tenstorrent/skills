@@ -4364,8 +4364,10 @@ def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str
         print(f"ttp checks: started in the background (pid {pid}); output in {run_dir / CHECKS_OUT}, "
               f"exit code in {rc}")
     print(f"retry_when: {push._own_ttp(p)} checks --result {shlex.quote(str(run_dir))}")
-    print("on_pass: if nothing is left after them but recording the result, put that final hand-off "
-          "(done or needs_review) in the waiting hand-off's on_pass; a pass records it without a model run")
+    print("on_pass: if nothing is left after them but recording the result, add the final hand-off to the "
+          "waiting one as \"on_pass\": {\"status\": \"done\", \"summary\": \"...\"} (or needs_review); a pass "
+          "records it without a model run (a code task with no on_pass, next_step, PR or landing left: done with "
+          "its summary)")
 
 
 def _checks_place(run_dir: Path, old: dict, env: dict) -> float:

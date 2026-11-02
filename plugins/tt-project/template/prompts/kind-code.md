@@ -10,12 +10,12 @@
   plus after `--` only the repository's test and lint commands they do not already run, each
   command quoted as one word (`-- 'pytest -q tests/a.py' 'ruff check .'`). It reuses
   a pass for the same tree and commands. If they outlast a tool call,
-  run `ttp checks --detach -- <cmds>`: its output and exit code go to the run's directory, never
-  the worktree. Hand off `waiting` with the `retry_when` it prints and no `wake_tier` (its wake is light;
-  failed checks wake you at your tier);
+  run `ttp checks --detach -- <cmds>`: its output and exit code go to the run dir, never
+  the worktree. Hand off `waiting` with the `retry_when` it prints (`ttp checks --result <run dir>`)
+  and no `wake_tier`; failed checks wake you;
   that probe also wakes the task if the checks were killed. If only recording the result is
-  left after them, put that final hand-off (`done` or `needs_review`) in `on_pass`: a pass on
-  the same head records it without a model run; a failure wakes the task at its tier with the output.
+  left, put it in `on_pass` (`"on_pass": {"status": "done", "summary": "..."}`): a pass on the
+  same head records it model-free. No `on_pass`, `next_step`, PR or landing left: a pass records `done`.
 - While you iterate, run only the tests your change affects (a file, `pytest -k`, `file::test`),
   never the full suite: each fix would cost a full run. Run `ttp checks`
   once at the end, committed, before the hand-off. A direct full-suite run is refused.

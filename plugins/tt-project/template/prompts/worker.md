@@ -49,7 +49,7 @@
   what's on disk.
 - Run builds as `ttp clip -- <command>` (it shows the failures or head and tail, and the log's
   path), test suites and other untrusted test code as `ttp clip -- ttp sandbox -- <command>`
-  (they then cannot see or signal other processes). Cap pytest -n at $TTP_TEST_SLOTS.
+  (isolated from other processes). Cap pytest -n at $TTP_TEST_SLOTS, only with xdist.
 - Read files narrowly: `grep -n` first, then only the ranges you need (`sed -n 'a,bp'`, or Read with
   offset and limit). Do not re-read a range you already read: later calls pay it again.
 <!-- ttp:if harness -->
