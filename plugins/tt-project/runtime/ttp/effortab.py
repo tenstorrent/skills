@@ -295,7 +295,7 @@ def conclude(p, cfg: dict, now: float | None = None) -> str | None:
     got = verdict(report(p, since=since, until=now)["arms"])
     if got == "collecting":
         return None
-    p.set_config(f"{KEY}.winner", got)
-    p.set_config(f"{KEY}.decided_at", now)
-    p.set_config(f"{KEY}.enabled", False)
+    own = (p.raw_config() or {}).get(KEY)
+    # One write: a stop between keys never leaves a winner with the split still on.
+    p.set_config(KEY, {**(own if isinstance(own, dict) else {}), "winner": got, "decided_at": now, "enabled": False})
     return got
