@@ -10,7 +10,11 @@ output, --durations, the summary and the exit status are those of an ordinary ru
 collected tests form one unit that a single worker runs in order, as before.
 
 Every collected test still runs exactly once. A worker that dies fails the tests it took and did not
-finish. TTP_TEST_JOBS=1 (or -x, --maxfail, --pdb, -s, --stepwise, xdist) runs everything in-process.
+finish. A test that closes or replaces one of the worker's own pipe fds (the shared queue or its
+report pipe) is named: the worker checks both fds after each test phase and, on a change, writes the
+test's nodeid to stderr and to the main process and exits with FD_LOST_EXIT, instead of using the
+wrong file and ending with status 0 mid-run. TTP_TEST_JOBS=1 (or -x, --maxfail, --pdb, -s,
+--stepwise, xdist) runs everything in-process.
 
 A session that runs tt-project tests also fails if, at its end, a process whose command line names
 the session's own temp root (basetemp) is still alive: those are processes a test detached and never
@@ -48,6 +52,7 @@ SLOWEST = 15           # the slowest test calls a full-suite run lists
 MAX_AUTO_JOBS = 8      # on CI
 MAX_LOCAL_JOBS = 4     # anywhere else: half the CPUs, at most this
 WORKER_NICE = 10
+FD_LOST_EXIT = 97      # a worker's own exit when a test closed or replaced one of its pipe fds
 _SHARDED = "test_tt_project_"
 # tt-project's db.tx() refuses a git network command (ls-remote, fetch, push) started inside a write
 # transaction while this is set: every test, and every process it starts, runs under that guard.
@@ -277,11 +282,48 @@ def _send(fd: int, kind: str, **kw) -> None:
         data = data[os.write(fd, data):]
 
 
-class _Forward:
-    """In a worker: sends what the main process's reporters need over the worker's pipe."""
+def _fd_id(fd: int):
+    try:
+        st = os.fstat(fd)
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
 
-    def __init__(self, config, fd: int):
-        self.config, self.fd = config, fd
+
+class _PipeGuard:
+    """In a worker: the identity of its two pipe fds at fork. A test that closes one, or closes it and
+    opens something else on the same number, made the worker read or write the wrong file and exit 0
+    mid-run, its open test lost unnamed; check() names that test and exits FD_LOST_EXIT instead."""
+
+    def __init__(self, work_r: int, out_w: int):
+        self.fds = {"work_r": (work_r, _fd_id(work_r)), "out_w": (out_w, _fd_id(out_w))}
+
+    def check(self, nodeid: str) -> None:
+        bad = [f"{name} (fd {fd}) {'closed' if _fd_id(fd) is None else 'replaced'}"
+               for name, (fd, want) in self.fds.items() if _fd_id(fd) != want]
+        if not bad:
+            return
+        why = (f"test {nodeid} closed or replaced the test worker's pipe fds: {', '.join(bad)}; "
+               f"the worker exits with status {FD_LOST_EXIT}")
+        try:
+            os.write(2, f"ttp-worker {os.getpid()}: {why}\n".encode())
+        except OSError:
+            pass
+        out_w, want = self.fds["out_w"]
+        if _fd_id(out_w) == want:
+            try:
+                _send(out_w, "fdlost", nodeid=nodeid, why=why)
+            except OSError:
+                pass
+        os._exit(FD_LOST_EXIT)
+
+
+class _Forward:
+    """In a worker: sends what the main process's reporters need over the worker's pipe, after
+    checking that the test that just ran left the worker's pipe fds alone."""
+
+    def __init__(self, config, fd: int, guard: _PipeGuard | None = None):
+        self.config, self.fd, self.guard = config, fd, guard
 
     @pytest.hookimpl(trylast=True)
     def pytest_runtest_logstart(self, nodeid, location):
@@ -289,11 +331,15 @@ class _Forward:
 
     @pytest.hookimpl(trylast=True)
     def pytest_runtest_logreport(self, report):
+        if self.guard:
+            self.guard.check(report.nodeid)
         data = self.config.hook.pytest_report_to_serializable(config=self.config, report=report)
         _send(self.fd, "report", data=data)
 
     @pytest.hookimpl(trylast=True)
     def pytest_runtest_logfinish(self, nodeid, location):
+        if self.guard:
+            self.guard.check(nodeid)
         _send(self.fd, "finish", nodeid=nodeid, location=list(location))
 
     @pytest.hookimpl(trylast=True)
@@ -310,7 +356,7 @@ def _worker(session, units, work_r: int, out_w: int) -> None:
     if tr is not None:   # the main process prints; a worker's reporter writes nowhere
         from _pytest._io import TerminalWriter
         tr._tw = TerminalWriter(open(os.devnull, "w"))
-    config.pluginmanager.register(_Forward(config, out_w), "ttp-forward")
+    config.pluginmanager.register(_Forward(config, out_w, _PipeGuard(work_r, out_w)), "ttp-forward")
 
     def take():
         raw = os.read(work_r, 4)
@@ -347,6 +393,10 @@ def _own_basetemp(factory, n: int) -> None:
     root = factory.getbasetemp() / f"w{n}"
     root.mkdir(mode=0o700, exist_ok=True)
     factory._basetemp = root
+
+
+def _exit_code(status):
+    return os.WEXITSTATUS(status) if status is not None and os.WIFEXITED(status) else None
 
 
 def _run_forked(session, units, jobs: int) -> None:
@@ -406,6 +456,8 @@ def _run_forked(session, units, jobs: int) -> None:
             wk["open"] = None
             finished.add(msg["nodeid"])
             hook.pytest_runtest_logfinish(nodeid=msg["nodeid"], location=tuple(msg["location"]))
+        elif kind == "fdlost":
+            wk["fdlost"] = msg["why"]
         elif kind == "warning":
             hook.pytest_warning_recorded.call_historic(kwargs=dict(
                 warning_message=_warning(msg), when=msg["when"], nodeid=msg["nodeid"],
@@ -461,6 +513,9 @@ def _run_forked(session, units, jobs: int) -> None:
                     continue
                 why = (f"the test worker process {pid} ended (wait status {wk.get('status')}) before this "
                        "test finished")
+                if wk.get("fdlost") or _exit_code(wk.get("status")) == FD_LOST_EXIT:
+                    why += ": " + (wk.get("fdlost") or f"test {wk['open'] or 'unknown'} closed or replaced "
+                                   f"the worker's pipe fds (exit status {FD_LOST_EXIT})")
                 if wk["open"] != item.nodeid:
                     hook.pytest_runtest_logstart(nodeid=item.nodeid, location=item.location)
                 hook.pytest_runtest_logreport(report=TestReport(

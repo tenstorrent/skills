@@ -1208,6 +1208,45 @@ def test_the_forked_test_runner_reports_every_test_once_as_one_process_would(tmp
     assert single.returncode != 0 and "2 failed" not in single.stdout, single.stdout
 
 
+
+def test_the_forked_test_runner_names_a_test_that_closes_or_replaces_its_workers_pipe_fds(tmp_path):
+    """A test that closed a worker's report pipe, or closed its queue fd and opened another file on that
+    number, made the worker read or write the wrong file and exit 0 mid-run with its test lost. The
+    worker checks both fds after each test phase: the culprit is named on stderr and in its failure,
+    and the worker exits with its own status, while the other workers run the rest."""
+    import shutil
+    import subprocess
+    shutil.copy(pathlib.Path(__file__).with_name("conftest.py"), tmp_path / "conftest.py")
+    (tmp_path / "test_tt_project_fds.py").write_text(
+        "import os, pytest\n"
+        "def _fd(request, name): return request.config.pluginmanager.get_plugin('ttp-forward').guard.fds[name][0]\n"
+        "@pytest.mark.parametrize('i', range(60))\n"
+        "def test_ok(i): pass\n"
+        "def _replace(request, name, flags):\n"
+        "    fd = _fd(request, name)\n"
+        "    os.close(fd)\n"
+        "    assert os.open(os.devnull, flags) == fd\n"
+        "def test_closes_out(request): os.close(_fd(request, 'out_w'))\n"
+        "def test_replaces_out(request): _replace(request, 'out_w', os.O_WRONLY)\n"
+        "def test_replaces_queue(request): _replace(request, 'work_r', os.O_RDONLY)\n")
+    env = {**os.environ, "TTP_TEST_JOBS": "3"}
+    env.pop("CI", None)
+    status = 97
+    for name, fd, how in (("test_closes_out", "out_w", "closed"), ("test_replaces_out", "out_w", "replaced"),
+                          ("test_replaces_queue", "work_r", "replaced")):
+        # One culprit per run, after the others: a worker it ends fails only it, never a test it took.
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-rf", "-p", "no:cacheprovider", "-k",
+                            f"test_ok or {name}", str(tmp_path)], cwd=str(tmp_path), env=env,
+                           capture_output=True, text=True, timeout=120)
+        assert r.returncode == 1 and "1 failed, 60 passed" in r.stdout, r.stdout + r.stderr
+        nodeid = f"test_tt_project_fds.py::{name}"
+        assert re.search(rf"^ttp-worker \d+: test {re.escape(nodeid)} closed or replaced the test worker's pipe "
+                         rf"fds: {fd} \(fd \d+\) {how}; the worker exits with status {status}$", r.stderr, re.M), r.stderr
+        failure = r.stdout.split(f" {name} ", 1)[1]
+        assert re.match(rf"_+\nthe test worker process \d+ ended \(wait status {status << 8}\) before this test "
+                        rf"finished: test {re.escape(nodeid)} closed or replaced the", failure), r.stdout
+
+
 def _test_conftest():
     import importlib.util
     spec = importlib.util.spec_from_file_location("ttp_tests_conftest", pathlib.Path(__file__).with_name("conftest.py"))
