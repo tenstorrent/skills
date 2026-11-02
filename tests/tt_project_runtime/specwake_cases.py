@@ -398,3 +398,28 @@ def test_a_worker_cannot_ask_for_its_own_wake_now(env, monkeypatch, tmp_path):
         d.tick()
         time.sleep(0.05)
     assert runs() == 1 and idle(), "a worker's own wake_now woke it"
+
+
+def test_a_reboot_wake_carries_a_deferred_spec_change_at_the_tasks_own_tier(env, tmp_path):
+    # The boot-time wake writes its own result (Daemon.wake_after_reboot), and a lost detached job would
+    # make it a light relaunch: a spec change that slept with the task still applies, at its own tier.
+    from ttp import budget as bud
+    from ttp.daemon import SPEC_WOKE
+    from ttp.prompts import spec_digest
+    p = make(env)
+    tid = p.db.add_task("soak", "run the soak", kind="work", tier="standard", origin="user")
+    rc, _ = _resumable_job_cut_by_reboot(p, tmp_path, tid, resumable=False)
+    slept_on = spec_digest(p.db.task(tid))
+    p.db.update_task(tid, status="queued", not_before=time.time() + 3600, result=json.dumps(
+        {"status": "waiting", "summary": "job running", "retry_after_s": 3600, "retry_when": f"ttp detach --check {rc}",
+         "waiting_since": time.time() - 900, "spec_seen": slept_on}))
+    _edit_spec(p, tid, "also report the peak memory", wake_now=False)
+    d = _boot_daemon(p)
+    t = p.db.task(tid)
+    res = json.loads(t["result"])
+    assert _woken(p, tid), dict(t)
+    assert res["woke"].startswith("the host rebooted and cut short detached job job "), res["woke"]
+    assert res["woke"].endswith(f"; also {SPEC_WOKE}"), res["woke"]
+    assert res["wake_tier"] == "standard" and res["escalated_wake"] is True, res
+    assert bud.wake_tier(t["tier"], res, d.cfg) == "standard"
+    assert res["spec_seen"] == spec_digest(t) != slept_on

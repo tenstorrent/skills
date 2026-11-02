@@ -9913,6 +9913,10 @@ class Daemon:
                                 "hand off waiting again with the same retry_when (naming the new .rc paths)",
                         "wake_tier": "light"}
                 prev.pop("escalated_wake", None)
+            # A spec change that slept with the task rides on this wake as on any other (_wake_waiting).
+            self._spec_deferred.discard(t["id"])
+            woke, why = _with_pending_spec(t, prev, woke, woke["woke"])
+            woke["woke"] = why
             db.update_task(t["id"], not_before=None, result=dump_result(
                 {**prev, **woke, "reboot": reboot, "reboot_wakes": wakes}))
             log(self.p, f"task {t['id']} waited from before the reboot; due now")
@@ -10872,11 +10876,7 @@ class Daemon:
             self._woke_on[tid] = got
         self._spec_deferred.discard(tid)
         prev = load_result(task["result"])
-        extra = dict(extra or {})
-        if SPEC_SEEN_KEY not in extra and (pending := _spec_pending(task, prev)):
-            # A spec change that slept with the task applies now: its run reads it at the task's own tier.
-            extra.update({SPEC_SEEN_KEY: pending, "wake_tier": _own_tier(task), "escalated_wake": True})
-            why = f"{why}; also {SPEC_WOKE}"
+        extra, why = _with_pending_spec(task, prev, dict(extra or {}), why)
         prev.pop(SPEC_WAKE_NOW_KEY, None)
         self.p.db.update_task(tid, not_before=min(task["not_before"] or now, now),
                               result=dump_result({**prev, **extra, "woke": why}))
@@ -14991,6 +14991,16 @@ def _spec_pending(task: dict, prev: dict) -> str | None:
         return None
     sha = spec_digest(task)
     return sha if sha != seen else None
+
+
+def _with_pending_spec(task: dict, prev: dict, extra: dict, why: str) -> tuple[dict, str]:
+    """A waiting task's wake fields `extra` and reason `why`, with a spec change that slept with it (unless
+    `extra` already settles SPEC_SEEN_KEY): its run reads the change at the task's own tier, not the
+    wake's (a light relaunch after a reboot, say). Every wake of a sleeping waiting task goes through it."""
+    if SPEC_SEEN_KEY in extra or not (pending := _spec_pending(task, prev)):
+        return extra, why
+    return ({**extra, SPEC_SEEN_KEY: pending, "wake_tier": _own_tier(task), "escalated_wake": True},
+            f"{why}; also {SPEC_WOKE}")
 
 
 def _recent_spec_wakes(prev: dict, now: float) -> list[float]:
