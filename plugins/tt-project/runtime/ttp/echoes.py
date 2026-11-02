@@ -281,8 +281,8 @@ def _upstream(harness: Path) -> dict[str, str]:
     from . import gitmemo
     args = ("ls-tree", "-r", "upstream")
     try:
-        r = subprocess.run(["git", "-C", str(harness), *args], capture_output=True, text=True,
-                           timeout=gitmemo.timeout(10, args))
+        r = gitmemo.run(["git", "-C", str(harness), *args], capture_output=True, text=True,
+                        timeout=10)
     except (OSError, subprocess.SubprocessError):
         return {}
     out = {}

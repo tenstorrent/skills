@@ -109,8 +109,8 @@ def of(task: dict) -> dict | None:
 
 
 def _git(root: str, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", root, *args], text=True, capture_output=True, timeout=gitmemo.timeout(60, args),
-                          stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_EDITOR": "true"})
+    return gitmemo.run(["git", "-C", root, *args], text=True, capture_output=True, timeout=60,
+                       stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_EDITOR": "true"})
 
 
 def _functions(src: str) -> list[tuple[str, int, int]]:
@@ -276,9 +276,9 @@ def merge_additive(ours: str, base: str, theirs: str) -> tuple[str, list[dict]] 
             with open(path, "w", encoding="utf-8", newline="") as f:
                 f.write(text)
             paths.append(path)
-        r = subprocess.run(["git", "merge-file", "-p", "--diff3", "-L", f"ours-{tag}", "-L", f"base-{tag}",
+        r = gitmemo.run(["git", "merge-file", "-p", "--diff3", "-L", f"ours-{tag}", "-L", f"base-{tag}",
                             "-L", f"theirs-{tag}", *paths], capture_output=True, text=True,
-                           timeout=gitmemo.timeout(60, ("merge-file",)))
+                        timeout=60)
     if not 0 <= r.returncode < 127:
         return None
     lines, out, hunks, i = r.stdout.splitlines(keepends=True), [], [], 0

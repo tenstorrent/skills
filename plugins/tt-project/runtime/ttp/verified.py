@@ -110,9 +110,9 @@ def scope(db: DB, task: dict, repo: str | Path, head: str, kind: str | None = No
 def changed_since(repo: str | Path, sha: str, head: str) -> list[str] | None:
     """The files the commits after `sha` up to `head` change, or None when git cannot tell."""
     try:
-        r = subprocess.run(["git", "-C", str(repo), "-c", "core.quotePath=false", "diff", "--name-only",
+        r = gitmemo.run(["git", "-C", str(repo), "-c", "core.quotePath=false", "diff", "--name-only",
                             "--no-renames", f"{sha}..{head}"], capture_output=True, text=True,
-                           timeout=gitmemo.timeout(120))
+                        timeout=120, read=True)
     except (OSError, subprocess.SubprocessError):
         return None
     return [f for f in r.stdout.splitlines() if f] if r.returncode == 0 else None

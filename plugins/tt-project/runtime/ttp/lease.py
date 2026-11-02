@@ -161,8 +161,8 @@ def _git(args: list[str], cwd: Path | str | None = None, *, input: str | None = 
          timeout: float = GIT_TIMEOUT_S, env: dict | None = None) -> subprocess.CompletedProcess:
     e = {**os.environ, "GIT_TERMINAL_PROMPT": "0", **(env or {})}
     e.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=10")
-    return subprocess.run(["git", *args], cwd=cwd, input=input, capture_output=True, text=True,
-                          timeout=gitmemo.timeout(timeout, args), env=e)
+    return gitmemo.run(["git", *args], cwd=cwd, input=input, capture_output=True, text=True,
+                       timeout=timeout, env=e)
 
 
 def own_repos() -> set[str]:

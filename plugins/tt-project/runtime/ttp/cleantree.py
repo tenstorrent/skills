@@ -39,9 +39,9 @@ class Error(Exception):
 
 
 def _git(cwd: str | Path, *args: str, timeout: float = 600) -> subprocess.CompletedProcess:
-    run = lambda: subprocess.run(["git", "-C", str(cwd), "-c", "core.hooksPath=/dev/null", "-c",   # noqa: E731
+    run = lambda: gitmemo.run(["git", "-C", str(cwd), "-c", "core.hooksPath=/dev/null", "-c",   # noqa: E731
                                   "submodule.recurse=false", *args], capture_output=True, text=True,
-                                 timeout=gitmemo.timeout(timeout, args))
+                              timeout=timeout)
     return repoid.read(cwd, args, run) if repoid.identity(args) else run()
 
 

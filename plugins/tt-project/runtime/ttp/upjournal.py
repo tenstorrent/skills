@@ -104,7 +104,7 @@ def dead(rec: dict) -> bool:
 
 
 def _git(h: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(h), *args], capture_output=True, text=True, timeout=gitmemo.timeout(None, args))
+    return gitmemo.run(["git", "-C", str(h), *args], capture_output=True, text=True, timeout=None)
 
 
 def _contains(h: Path, commit: str) -> bool:

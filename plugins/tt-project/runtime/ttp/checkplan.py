@@ -29,8 +29,8 @@ class PlanError(Exception):
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
-    run = lambda: subprocess.run(["git", "-C", str(repo), *args], capture_output=True,   # noqa: E731
-                                 timeout=gitmemo.timeout(None, args))
+    run = lambda: gitmemo.run(["git", "-C", str(repo), *args], capture_output=True,   # noqa: E731
+                              timeout=None)
     return repoid.read(repo, args, run) if repoid.identity(args) else run()
 
 

@@ -99,9 +99,9 @@ def say(msg: str) -> None:
 def _git(cwd: Path, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
     """git with its output captured. No editor opens (a rebase continues with the message it has),
     and no recorded resolution (rerere) settles a conflict behind the resolver's back."""
-    return subprocess.run(["git", "-C", str(cwd), "-c", "rerere.enabled=false", *args], text=True,
-                          capture_output=True, env={**os.environ, "GIT_EDITOR": "true", **(env or {})},
-                          timeout=gitmemo.timeout(None, args))
+    return gitmemo.run(["git", "-C", str(cwd), "-c", "rerere.enabled=false", *args], text=True,
+                       capture_output=True, env={**os.environ, "GIT_EDITOR": "true", **(env or {})},
+                       timeout=None)
 
 
 def _last(text: str, n: int = push.LOG_TAIL) -> str:
@@ -749,8 +749,8 @@ def _patch_ids(repo: Path, revs: list[str]) -> dict[str, str]:
     try:
         patches = _git(repo, "log", "-p", "--no-merges", "--no-color", "--no-ext-diff", "--format=commit %H",
                        *revs, "--").stdout
-        out = subprocess.run(["git", "-C", str(repo), "patch-id", "--stable"], input=patches, text=True,
-                             capture_output=True, timeout=gitmemo.timeout(None, ("patch-id",))).stdout
+        out = gitmemo.run(["git", "-C", str(repo), "patch-id", "--stable"], input=patches, text=True,
+                          capture_output=True, timeout=None).stdout
     except (OSError, subprocess.SubprocessError):
         return {}
     return {c: pid for pid, c in (ln.split() for ln in out.splitlines() if len(ln.split()) == 2)}
@@ -804,8 +804,8 @@ _MARK = 40          # conflict marker size: no line of a file is taken for one
 
 def _blob(repo: Path, rev: str, path: str) -> bytes | None:
     """The file `path` at `rev`, or None where it has none."""
-    r = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", f"{rev}:{path}"], capture_output=True,
-                       timeout=gitmemo.timeout(None, ("cat-file",)))
+    r = gitmemo.run(["git", "-C", str(repo), "cat-file", "blob", f"{rev}:{path}"], capture_output=True,
+                    timeout=None)
     return r.stdout if r.returncode == 0 else None
 
 
@@ -829,13 +829,11 @@ def _carries(repo: Path, c: str, landed: str, files: frozenset, resolved: list[s
                     (Path(d) / name).write_bytes(_blob(repo, rev, path) or b"")
                     sides.append(str(Path(d) / name))
                 cmd = ["git", "merge-file", "-p", f"--marker-size={_MARK}"]
-                r = subprocess.run([*cmd, *sides], capture_output=True,
-                                   timeout=gitmemo.timeout(None, ("merge-file",)))
+                r = gitmemo.run([*cmd, *sides], capture_output=True, timeout=None)
                 if r.returncode < 0 or r.returncode > 127 or not _fits(r.stdout, got):   # 255: an error (binary)
                     return False
                 if r.returncode:    # conflicts: their base side tells what c added in each region
-                    r = subprocess.run([*cmd, "--diff3", *sides], capture_output=True,
-                                       timeout=gitmemo.timeout(None, ("merge-file",)))
+                    r = gitmemo.run([*cmd, "--diff3", *sides], capture_output=True, timeout=None)
                     gaps = _gaps(r.stdout, got) if 0 < r.returncode <= 127 else None
                     regions = _regions(r.stdout)
                     if gaps is None or len(gaps) != len(regions) or not all(

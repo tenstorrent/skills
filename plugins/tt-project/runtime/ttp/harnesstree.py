@@ -49,8 +49,8 @@ def branch(tid: int) -> str:
 
 
 def _git(cwd: Path, *args: str, timeout: float = 60) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(cwd), *git_fsync_args(), *IDENT, *args], capture_output=True,
-                          text=True, timeout=gitmemo.timeout(timeout, args))
+    return gitmemo.run(["git", "-C", str(cwd), *git_fsync_args(), *IDENT, *args], capture_output=True,
+                       text=True, timeout=timeout)
 
 
 def _is_repo(p: Project) -> bool:

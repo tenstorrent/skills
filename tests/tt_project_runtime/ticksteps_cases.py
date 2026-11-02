@@ -4,6 +4,8 @@
 # probes started off the tick (probespawn) here.
 from __future__ import annotations
 
+import ast
+
 
 def _stalled_tmp(monkeypatch):
     """Every probe's output file open blocks until the returned event is set (a stalled /tmp)."""
@@ -685,7 +687,7 @@ def test_a_hung_git_in_a_push_approving_reviews_finish_ends_by_the_transaction_c
     assert not s.p.db.q("SELECT id FROM push_queue"), "no approval queued from a hung git"
 
 
-# Git helpers that keep their own timeout, each never run under a daemon tick step or finish transaction.
+# Git helpers that run git themselves (not through gitmemo.run), each never run under a daemon tick step or finish transaction.
 GIT_HELPER_OWN_TIMEOUT = {
     ("devq.py", "_git"): "copied to a device runner's host and run there as a standalone script (devq argv)",
     ("goalchecks.py", "_git_head"): "only `ttp goal` (cli.py), its own process started by a watcher or retry_when",
@@ -696,30 +698,38 @@ GIT_HELPER_OWN_TIMEOUT = {
 }
 
 
+def _git_calls(node, owner: str) -> list:
+    """The calls under `node` that run git with a literal argv: owner.<fn>(["git", ...], ...)."""
+    return [c for c in ast.walk(node) if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+            and getattr(c.func.value, "id", "") == owner and c.args
+            and isinstance(c.args[0], (ast.List, ast.Tuple)) and c.args[0].elts
+            and getattr(c.args[0].elts[0], "value", None) == "git"]
+
+
 def test_every_git_helper_takes_gitmemos_cap():
-    """Every runtime git helper (a function named git, _git or _git_* that runs subprocess with a `git`
-    argv) passes timeout= to each such call and takes it from gitmemo.timeout(), or is allowlisted
-    above with its reason. A new unbounded helper fails here, not in a review."""
-    import ast
+    """Every runtime git helper (a function named git, _git or _git_* that runs git) runs it through
+    gitmemo.run, the one choke point that caps its timeout and serves a finish round from the memo,
+    and never through subprocess itself, or is allowlisted above with its reason. Any other git call
+    that took gitmemo.timeout() goes through gitmemo.run too. A new unbounded helper fails here, not
+    in a review."""
     found, bad = set(), []
     for f in sorted((RUNTIME / "ttp").glob("*.py")):
         src = f.read_text()
-        for fn in ast.walk(ast.parse(src)):
+        tree = ast.parse(src)
+        for c in _git_calls(tree, "subprocess"):
+            if "gitmemo.timeout(" in ast.get_source_segment(src, c):
+                bad.append(f"{f.name}:{c.lineno} subprocess git with gitmemo.timeout() (use gitmemo.run)")
+        for fn in ast.walk(tree):
             if not isinstance(fn, ast.FunctionDef) or not re.fullmatch(r"_?git(_\w+)?", fn.name):
                 continue
-            calls = [c for c in ast.walk(fn) if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
-                     and getattr(c.func.value, "id", "") == "subprocess" and c.args
-                     and isinstance(c.args[0], (ast.List, ast.Tuple)) and c.args[0].elts
-                     and getattr(c.args[0].elts[0], "value", None) == "git"]
-            if not calls:
+            raw, routed = _git_calls(fn, "subprocess"), _git_calls(fn, "gitmemo")
+            if not raw and not routed:
                 continue
             key = (f.name, fn.name)
             found.add(key)
-            capped = "gitmemo.timeout(" in ast.get_source_segment(src, fn)
-            if key not in GIT_HELPER_OWN_TIMEOUT and not (capped and all(
-                    any(k.arg == "timeout" for k in c.keywords) for c in calls)):
+            if key not in GIT_HELPER_OWN_TIMEOUT and (raw or any(c.func.attr != "run" for c in routed)):
                 bad.append(f"{f.name}:{fn.lineno} {fn.name}")
-    assert not bad, f"git helpers that do not take gitmemo.timeout(); route them or allowlist them: {bad}"
+    assert not bad, f"git helpers that do not run git through gitmemo.run; route them or allowlist them: {bad}"
     assert ("pushq.py", "_git") in found and ("push.py", "_git") in found, found   # the scan sees them
     assert set(GIT_HELPER_OWN_TIMEOUT) <= found, set(GIT_HELPER_OWN_TIMEOUT) - found   # no stale entry
 

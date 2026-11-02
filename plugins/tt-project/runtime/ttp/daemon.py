@@ -271,7 +271,7 @@ TICK_STALL_S = HEARTBEAT_STALE_S
 STEP_BUDGET_S = 60
 # Git a step runs is capped by time, not per call site (gitmemo.bounded): each read under
 # gitmemo.TICK_GIT_S, and all git inside a finish transaction within gitmemo.TX_GIT_S. The library reads
-# that had 120-300 s timeouts take the cap through gitmemo.timeout(): worktree._git, inspect, _ignored,
+# that had 120-300 s timeouts take the cap through gitmemo.run(), git's one choke point: worktree._git, inspect, _ignored,
 # _ignores, is_ancestor, _closest_ancestor, is_superseded, queue_pushed, _patch_ids, _delivered,
 # _sweep_stray's patch; archive.tracked_files and tracked_patch; reviewcap._touched; verified.changed_since;
 # reviewreuse._patches; landed._git, overlap._git, pushq._git and _patch_ids (check_approval runs in the

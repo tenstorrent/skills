@@ -51,9 +51,9 @@ STEP = "If it passes, land the head you reviewed with `ttp land"   # the review 
 
 def _git(repo: Path, *args: str, timeout: float = 120) -> subprocess.CompletedProcess:
     # The C locale keeps git's messages in English whatever the user's: _replay reads one.
-    run = lambda: subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True,   # noqa: E731
-                                 timeout=gitmemo.timeout(timeout, args), stdin=subprocess.DEVNULL,
-                                 env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C", "LANGUAGE": ""})
+    run = lambda: gitmemo.run(["git", "-C", str(repo), *args], text=True, capture_output=True,   # noqa: E731
+                              timeout=timeout, stdin=subprocess.DEVNULL,
+                              env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C", "LANGUAGE": ""})
     return repoid.read(repo, args, run) if repoid.identity(args) else run()
 
 

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import subprocess
 import time
 from typing import Any, Callable, Iterator
 
@@ -33,6 +34,8 @@ _cap: contextvars.ContextVar[tuple[float, float | None] | None] = contextvars.Co
 TICK_GIT_S = 45.0   # one git read a daemon tick step makes, at most (Daemon._run_step)
 TX_GIT_S = 20.0     # all git a finish write transaction makes, together (Daemon._finish_tx)
 FLOOR_S = 1.0       # a call made past its scope's deadline still gets this long
+# git's own options that take the next argument (git -C <dir> <verb> ...)
+_OPTS_WITH_VALUE = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"})
 # Verbs that only read the repository (a scratch GIT_INDEX_FILE aside): bounded() caps them anywhere.
 READS = frozenset({"rev-parse", "rev-list", "merge-base", "diff", "log", "show", "ls-files", "check-ignore",
                    "cherry", "patch-id", "symbolic-ref", "cat-file", "for-each-ref", "show-ref", "status",
@@ -98,3 +101,22 @@ def timeout(own: float | None, args: tuple | list = (), read: bool | None = None
         left = max(FLOOR_S, cap[1] - time.monotonic())
         t = left if t is None else min(t, left)
     return t
+
+
+_cap_timeout = timeout
+
+
+def git_args(argv: list | tuple) -> tuple[str, ...]:
+    """`argv`'s git arguments from its subcommand on: git's own options before it (-C, -c ...) skipped."""
+    a = [str(x) for x in argv[1:]]
+    i = 0
+    while i < len(a) and a[i].startswith("-"):
+        i += 2 if a[i] in _OPTS_WITH_VALUE else 1
+    return tuple(a[i:])
+
+
+def run(argv: list | tuple, *, timeout: float | None = None, read: bool | None = None,
+        **kw: Any) -> subprocess.CompletedProcess:
+    """The one way a runtime git helper runs git (subprocess.run's arguments): its own `timeout` is
+    capped by timeout() for the verb argv names (`read` as there)."""
+    return subprocess.run(argv, timeout=_cap_timeout(timeout, git_args(argv), read), **kw)

@@ -35,8 +35,8 @@ _SHELL = re.compile(r"[;&|\n`]|\$\(")
 
 
 def _git(top: str | Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(top), *args], capture_output=True, text=True,
-                          timeout=gitmemo.timeout(None, args))
+    return gitmemo.run(["git", "-C", str(top), *args], capture_output=True, text=True,
+                       timeout=None)
 
 
 def _test_file(path: str) -> bool:

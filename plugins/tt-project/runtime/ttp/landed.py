@@ -124,7 +124,7 @@ def missing_words(missing: list[str]) -> str:
 
 def _git(repo: Path, *args: str, timeout: float = 30) -> subprocess.CompletedProcess:
     t = gitmemo.timeout(timeout, args)
-    run = lambda: gitcache.run(repo, args, lambda: subprocess.run(   # noqa: E731
+    run = lambda: gitcache.run(repo, args, lambda: gitmemo.run(   # noqa: E731
         ["git", "-C", str(repo), *args], text=True, capture_output=True, timeout=t, stdin=subprocess.DEVNULL,
         env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}), t)
     return repoid.read(repo, args, run) if repoid.identity(args) else run()

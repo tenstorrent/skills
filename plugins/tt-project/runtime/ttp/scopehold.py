@@ -42,7 +42,7 @@ def classify(stderr: str) -> list[dict]:
 
 
 def _git(repo: Path, *args: str) -> list[str]:
-    r = subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True, timeout=gitmemo.timeout(None, args))
+    r = gitmemo.run(["git", "-C", str(repo), *args], text=True, capture_output=True, timeout=None)
     return [x for x in r.stdout.splitlines() if x.strip()] if r.returncode == 0 else []
 
 

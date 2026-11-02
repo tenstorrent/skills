@@ -435,8 +435,8 @@ def restart_service(p: Project) -> str:
 
 
 def _git(h: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(h), "-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost",
-                           *args], capture_output=True, text=True, timeout=gitmemo.timeout(120, args))
+    return gitmemo.run(["git", "-C", str(h), "-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost",
+                           *args], capture_output=True, text=True, timeout=120)
 
 
 # A caller that cannot reach the service manager (a sandboxed worker: no user bus, no signals to the

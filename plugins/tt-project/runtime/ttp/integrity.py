@@ -30,8 +30,8 @@ _POINTER = re.compile(r"\]\(memory/([^)]+\.md)\)")
 
 def _git(cwd: Path, *args: str, timeout: float) -> subprocess.CompletedProcess:
     # No optional locks: a status must never fight a running worker over its index.
-    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, timeout=gitmemo.timeout(timeout, args),
-                          env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    return gitmemo.run(["git", "-C", str(cwd), *args], capture_output=True, timeout=timeout,
+                       env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
 
 
 def _head(p: Project, rel: str) -> bytes | None:

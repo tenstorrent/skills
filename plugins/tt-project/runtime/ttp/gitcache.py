@@ -123,8 +123,8 @@ def _system_config() -> list[str] | None:
     /etc/gitconfig); None when git did not answer in time."""
     if not _system:
         try:
-            r = subprocess.run(["git", "var", "GIT_CONFIG_SYSTEM"], capture_output=True, text=True,
-                               timeout=gitmemo.timeout(10, read=True), stdin=subprocess.DEVNULL)
+            r = gitmemo.run(["git", "var", "GIT_CONFIG_SYSTEM"], capture_output=True, text=True,
+                            timeout=10, read=True, stdin=subprocess.DEVNULL)
         except (OSError, subprocess.SubprocessError):
             return None
         finally:
@@ -212,9 +212,9 @@ def _keep(d: dict, key, value) -> None:
 
 def _git(repo: Path | str, *args: str, timeout: float | None) -> subprocess.CompletedProcess:
     calls["git"] += 1
-    return subprocess.run(["git", "-C", os.fspath(repo), *args], capture_output=True, text=True,
-                          timeout=gitmemo.timeout(timeout, args),
-                          stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    return gitmemo.run(["git", "-C", os.fspath(repo), *args], capture_output=True, text=True,
+                       timeout=timeout,
+                       stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
 
 
 def _ancestor_set(repo: Path | str, common: str, tip: str, timeout: float | None) -> tuple[frozenset, bool] | None:

@@ -662,8 +662,8 @@ def _git_out(cwd: str | None, *args: str) -> str:
 
     def run() -> str:
         try:
-            return subprocess.run(["git", *args], capture_output=True, text=True, cwd=cwd,
-                                  timeout=gitmemo.timeout(30, args)).stdout.strip()
+            return gitmemo.run(["git", *args], capture_output=True, text=True, cwd=cwd,
+                               timeout=30).stdout.strip()
         except (OSError, subprocess.SubprocessError):
             return ""
     return repoid.read(cwd or os.getcwd(), args, run) if repoid.identity(args) else run()

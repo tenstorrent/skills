@@ -557,8 +557,8 @@ def _copy_tree(src: Path, dst: Path) -> None:
 
 
 def _git(cwd: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True,
-                          timeout=gitmemo.timeout(None, args)).stdout.strip()
+    return gitmemo.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True,
+                       timeout=None).stdout.strip()
 
 
 SOURCE_FILE = "SOURCE_COMMIT"      # in runtime/ttp/: the git commit (or content hash) `ttp setup` installed this runtime from

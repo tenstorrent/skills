@@ -945,9 +945,9 @@ def _git_net(repo: Path, *args: str, timeout_s: float = MIRROR_TIMEOUT_S) -> sub
     """git that talks to a remote: no prompt, no stdin, at most `timeout_s` (exit 124 when it runs past)."""
     t = gitmemo.timeout(timeout_s, args)
     try:
-        return subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True,
-                              stdin=subprocess.DEVNULL, timeout=t,
-                              env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+        return gitmemo.run(["git", "-C", str(repo), *args], text=True, capture_output=True,
+                           stdin=subprocess.DEVNULL, timeout=t,
+                           env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(args, 124, "", f"timed out after {t:.0f} s")
 
@@ -1517,10 +1517,10 @@ def _git(repo: Path, *args: str, quiet: bool = True) -> subprocess.CompletedProc
     """Run git; when not quiet its output goes to stderr, keeping stdout for the verdict."""
     t = gitmemo.timeout(None, args)   # none of its own; capped within a daemon tick step or finish transaction
     if quiet:
-        run = lambda: gitcache.run(repo, args, lambda: subprocess.run(   # noqa: E731
+        run = lambda: gitcache.run(repo, args, lambda: gitmemo.run(   # noqa: E731
             ["git", "-C", str(repo), *args], text=True, capture_output=True, timeout=t), t)
         return repoid.read(repo, args, run) if repoid.identity(args) else run()
-    return subprocess.run(["git", "-C", str(repo), *args], text=True, stdout=2, timeout=t)
+    return gitmemo.run(["git", "-C", str(repo), *args], text=True, stdout=2, timeout=t)
 
 
 def _fetch(repo: Path, remote: str, branch: str) -> str:
@@ -2739,8 +2739,8 @@ def never_published(repo: Path, d: dict, branch: str, timeout: float = 30) -> bo
     never creates a carried branch). False whenever git cannot tell (not a repo, remote unreachable)."""
     def git(*args: str) -> subprocess.CompletedProcess | None:
         try:
-            return subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True,
-                                  timeout=gitmemo.timeout(timeout, args), env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+            return gitmemo.run(["git", "-C", str(repo), *args], text=True, capture_output=True,
+                               timeout=timeout, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
         except (OSError, subprocess.SubprocessError):
             return None
     if not worktree.valid_branch(branch):

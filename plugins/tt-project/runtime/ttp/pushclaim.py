@@ -78,7 +78,7 @@ def _git(repo, *args: str, timeout: float = 30) -> subprocess.CompletedProcess:
 def _git_run(repo, args: tuple, timeout: float) -> subprocess.CompletedProcess:
     try:
         t = gitmemo.timeout(timeout, args)
-        return gitcache.run(repo, args, lambda: subprocess.run(
+        return gitcache.run(repo, args, lambda: gitmemo.run(
             ["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=t, stdin=subprocess.DEVNULL,
             env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}), t)
     except (OSError, subprocess.TimeoutExpired) as e:

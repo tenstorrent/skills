@@ -44,7 +44,7 @@ ROLLBACK_RE = re.compile(r"roll back runtime to ([0-9a-f]{7,40})")   # service.r
 
 
 def _git(h: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(h), *args], capture_output=True, text=True, timeout=gitmemo.timeout(60, args))
+    return gitmemo.run(["git", "-C", str(h), *args], capture_output=True, text=True, timeout=60)
 
 
 def head(h: Path) -> str | None:

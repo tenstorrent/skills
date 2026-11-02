@@ -159,7 +159,6 @@ def touched(p, review: dict, path: str) -> tuple[list[tuple[int, int]], set[str]
 
 
 def _touched(p, review: dict, path: str) -> tuple[list[tuple[int, int]], set[str]]:
-    import subprocess
     from . import worktree
     ranges: list[tuple[int, int]] = []
     names: set[str] = set()
@@ -169,8 +168,8 @@ def _touched(p, review: dict, path: str) -> tuple[list[tuple[int, int]], set[str
             if not worktree._git(p.root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False):
                 continue
             mb = worktree._git(p.root, "merge-base", base, ref, check=False)
-            old = subprocess.run(["git", "-C", str(p.root), "show", f"{mb}:{path}"], capture_output=True,
-                                 text=True, timeout=gitmemo.timeout(120)) if mb else None
+            old = gitmemo.run(["git", "-C", str(p.root), "show", f"{mb}:{path}"], capture_output=True,
+                              text=True, timeout=120, read=True) if mb else None
             lines = old.stdout.splitlines() if old is not None and old.returncode == 0 else []
             hunks: list[tuple[int, int, list[str]]] = []
             for line in worktree._git(p.root, "diff", "-U0", "--no-renames", "--no-color", f"{base}...{ref}",

@@ -38,9 +38,9 @@ def block() -> str:
 
 def _git(root: Path, *args: str) -> subprocess.CompletedProcess | None:
     try:
-        return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True,
-                              timeout=gitmemo.timeout(GIT_S, args),
-                              stdin=subprocess.DEVNULL)
+        return gitmemo.run(["git", "-C", str(root), *args], capture_output=True, text=True,
+                           timeout=GIT_S,
+                           stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
 
