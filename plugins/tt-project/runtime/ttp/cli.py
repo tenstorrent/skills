@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import datetime as _dt
+import errno
 import getpass
 import hashlib
 import json
@@ -1011,10 +1012,27 @@ def _say_local_or_die(p: Project, a, text: str, context: str, bid: str | None = 
     try:
         return _say_local(p, a, text, context, bid, kind)
     except sqlite3.OperationalError as e:   # db.tx already waited and retried
+        if is_disk_full(e):
+            die(f"disk full at {p.state}; message not saved", 1)
         if not is_busy(e):
             raise
         die(f"the database stayed busy ({e}); the message was not saved. Send it again"
             + (f" with the same --client-id {a.client_id}" if a.client_id else ""), 75)
+    except OSError as e:   # creating the state dir or opening the database
+        if e.errno != errno.ENOSPC:
+            raise
+        die(f"disk full at {p.state}; message not saved", 1)
+
+
+def is_disk_full(e: BaseException) -> bool:
+    """True for SQLite's 'database or disk is full' (SQLITE_FULL): nothing more fits on the disk."""
+    import sqlite3
+    if not isinstance(e, sqlite3.OperationalError):
+        return False
+    code = getattr(e, "sqlite_errorcode", None)
+    if code is not None:
+        return code & 0xFF == 13   # SQLITE_FULL
+    return "database or disk is full" in str(e).lower()
 
 
 SAY_ALL = "*all*"   # the project slot of `ttp say --all <text>` (no project name can be this)

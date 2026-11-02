@@ -29026,6 +29026,53 @@ def _heads_seen(p, *keys, sha=HEAD, seen=0.0):
                                     **{k: {"sha": sha, "seen": seen} for k in keys}})
 
 
+def test_say_on_a_full_disk_prints_one_line_and_exits_1(env, monkeypatch, capsys):
+    import contextlib
+    import errno
+    from ttp import cli
+    from ttp.db import DB
+    p = make(env)
+    state, real_tx = p.state, DB.tx
+
+    def said(text="hello"):
+        capsys.readouterr()
+        with pytest.raises(SystemExit) as ex:
+            cli.main(["say", "demo", "--", text])
+        return ex.value.code, capsys.readouterr().err.splitlines()
+
+    def raising(exc):
+        def tx(self):
+            raise exc
+        return contextlib.contextmanager(lambda self: (yield tx(self)))
+
+    full = [f"ttp: disk full at {state}; message not saved"]
+    monkeypatch.setattr(DB, "tx", raising(sqlite3.OperationalError("database or disk is full")))
+    assert said() == (1, full)
+    # Out of space while creating the state dir or opening the database: the same line.
+    monkeypatch.setattr(DB, "tx", raising(OSError(errno.ENOSPC, "No space left on device")))
+    assert said() == (1, full)
+    # Real SQLite: a database that may not grow by one page fails the insert with SQLITE_FULL.
+
+    @contextlib.contextmanager
+    def capped(self):
+        n = self.conn.execute("PRAGMA page_count").fetchone()[0]
+        self.conn.execute(f"PRAGMA max_page_count={n}")
+        with real_tx(self):
+            yield
+    monkeypatch.setattr(DB, "tx", capped)
+    assert said("hello " + "x" * 20000) == (1, full)
+    monkeypatch.setattr(DB, "tx", real_tx)
+    assert not p.db.one("SELECT id FROM messages WHERE direction='in' AND text LIKE 'hello x%'")
+    # Other errors keep their own handling: busy still exits 75, anything else still raises.
+    monkeypatch.setattr(DB, "tx", raising(sqlite3.OperationalError("database is locked")))
+    rc, err = said()
+    assert rc == 75 and "stayed busy" in err[0], err
+    for exc in (sqlite3.OperationalError("no such table: messages"), OSError(errno.EACCES, "Permission denied")):
+        monkeypatch.setattr(DB, "tx", raising(exc))
+        with pytest.raises(type(exc)):
+            cli.main(["say", "demo", "--", "hello"])
+
+
 def test_inbound_messages_carry_the_channel_they_came_in_on(env, tmp_path, monkeypatch):
     from ttp import cli
     from ttp.db import DB
