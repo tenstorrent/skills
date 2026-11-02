@@ -730,6 +730,23 @@ def harness_gh_edit(payload: dict) -> str | None:
     return None if _harness_task() else HARNESS_GH_WHY
 
 
+# Commands the Claude Code fence frees by name (providers/claude.py FENCE_EXCLUDED): only when run on
+# their own; inside `&&`, `;` or a pipe the whole line stays sandboxed, where they cannot reach a host.
+FENCE_FREED = {"ssh", "scp", "sftp", "rsync"}
+
+
+def fenced_ssh(segments: list[list[str]]) -> str | None:
+    """Why a fenced worker's command that runs ssh (or scp, sftp, rsync) beside other commands would
+    fail; None outside such a run (TTP_FENCE_BY_NAME) or for one command on its own."""
+    if not os.environ.get("TTP_FENCE_BY_NAME") or len(segments) < 2:
+        return None
+    hit = next((os.path.basename(s[0]) for s in segments if os.path.basename(s[0]) in FENCE_FREED), None)
+    return hit and (f"{hit} reaches another host only when it runs on its own: inside `&&`, `;` or a pipe the "
+                    f"whole command stays in the write fence, where host names do not resolve. Run `{hit} ...` as "
+                    f"a command by itself (under `timeout N` or `ttp lock <res> --` is fine) and put any pipe "
+                    f"inside the quoted remote command, e.g. `ssh host 'cmd | tail -20'`")
+
+
 def _deny(why: str) -> dict:
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                    "permissionDecisionReason": f"tt-project: {why}."}}
@@ -765,6 +782,8 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         why = secret_read(cmd, segments, str(payload.get("cwd") or os.getcwd()))
     if not why:
         why = git_push_bypass(segments)
+    if not why:
+        why = fenced_ssh(segments)
     if not why:
         from . import killguard
         why = killguard.refusal(cmd, str(payload.get("cwd") or os.getcwd()))

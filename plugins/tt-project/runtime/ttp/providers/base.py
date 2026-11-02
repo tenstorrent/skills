@@ -382,6 +382,9 @@ class Provider:
         return []
 
     fence_optional = False   # providers.<name>.write_fence can turn the fence off (fence_args)
+    # The fence frees ssh and its kin only when they run on their own, never inside a compound command:
+    # the daemon then sets TTP_FENCE_BY_NAME, and the hook refuses such a command (hook.fenced_ssh).
+    fence_by_name = False
 
     def fence_args(self, argv: list[str], dirs: list[str], cwd: str = "", on: bool = True,
                    restrictions: dict | None = None) -> tuple[list[str], bool]:

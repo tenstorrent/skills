@@ -2710,6 +2710,8 @@ class Daemon:
                     tmp = run_dir / "tmp"
                     tmp.mkdir(exist_ok=True)
                 tmp_env = {var: str(tmp) for var in ("TMPDIR", "TMP", "TEMP")}
+                if prov.fence_by_name:
+                    tmp_env["TTP_FENCE_BY_NAME"] = "1"
             if mcp_servers:
                 # Outside the repo and the run directory, owner-only: server entries can carry tokens.
                 fd, mcp_path = tempfile.mkstemp(prefix=f"ttp-mcp-{run_id}-", suffix=".json")

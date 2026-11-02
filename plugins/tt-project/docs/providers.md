@@ -23,7 +23,7 @@ Claude Code measured on 2026-11-02, Codex CLI on 2026-10-09:
 | Session id | pass (assigned up front) | pass | not measured |
 | Usage | pass (reported cost) | pass (estimated from tokens) | not measured |
 | Structured output | pass | pass | not measured |
-| Write fence | unsupported: `bypassPermissions` runs without the Bash sandbox, which would need bubblewrap | pass (refused: read-only file system) | off: the sandbox denies network by default and no CLI flag allows it, so workers run with `--force` alone; on under `no_internet`, built, not measured live |
+| Write fence | pass on 2.1.296 (refused: read-only file system): the Bash sandbox where it can start (Linux with bwrap and socat, macOS); `providers.claude.write_fence` false turns it off; ssh, scp, sftp, rsync, `ttp lock`, `ttp machines` and `ttp devq` run outside it by name | pass (refused: read-only file system) | off: the sandbox denies network by default and no CLI flag allows it, so workers run with `--force` alone; on under `no_internet`, built, not measured live |
 | Resume | pass | pass | not measured |
 | Steer mid-run | pass (hook) | unsupported: no hook, the worker reads `steer.md` between steps | not measured |
 | Plan meter | pass (seven-day; the run reported no five-hour window) | pass (seven-day) | not measured |
@@ -79,8 +79,11 @@ $0.21). Cursor agent: installed, not measured (no login on the test machine).
   such a landing.
 - A code task's plain `needs_review` hand-off gets its review from the daemon's review sweep,
   `review.sweep_after_s` (default 5 min) after its run ended; a `done` hand-off gets it at once.
-- Claude Code: workers have no write fence. They run with `bypassPermissions`, and the Bash
-  sandbox that would fence them needs bubblewrap.
+- Claude Code: a host without bubblewrap or socat (Linux) runs workers unfenced and raises one
+  low issue. The fence frees ssh and its kin by name only when they run on their own (also under
+  `timeout N` or `ttp lock <res> --`), never inside `&&`, `;` or a pipe, nor from a script: there
+  host names do not resolve. The hook refuses such a compound command and says to run ssh by
+  itself, with any pipe inside the quoted remote command; a script that runs ssh still fails.
 - Cursor: outside `no_internet` projects, workers run with `--force` alone and no write fence;
   `ttp doctor` names the reason.
   The sandbox would cut them off the network: in build `2026.10.22-27dcf5f` (read from its bundled

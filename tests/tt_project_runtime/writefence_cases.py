@@ -96,6 +96,7 @@ def test_daemon_fences_claude_workers_and_observes_a_missing_dependency_once(env
     assert allow[0] == str(wt) and str(p.state) in allow, "the worktree and the state (run dir, notes, queues)"
     assert str((env["repo"] / ".git").resolve()) in allow, "commits in a worktree write the main repo's git dir"
     assert spec["env"].get("TMPDIR"), "a fenced worker gets a temp dir of its own"
+    assert spec["env"].get("TTP_FENCE_BY_NAME") == "1", "the hook refuses ssh inside a compound command"
 
     def observed():
         return p.db.q("SELECT title, count FROM issues WHERE source='daemon:write-fence'")
@@ -111,6 +112,7 @@ def test_daemon_fences_claude_workers_and_observes_a_missing_dependency_once(env
     have.add("bwrap")
     spec = _claude_launch(env, p, wt)
     assert "sandbox" not in _settings(spec["argv"]) and not spec["env"].get("TMPDIR"), "turned off by config"
+    assert not spec["env"].get("TTP_FENCE_BY_NAME"), "an unfenced worker's ssh runs anywhere"
 
 
 def test_doctor_names_a_claude_fence_turned_off(env, monkeypatch, capsys):
@@ -129,3 +131,33 @@ def test_doctor_names_a_claude_fence_turned_off(env, monkeypatch, capsys):
     cli.cmd_doctor(types.SimpleNamespace(name="demo"))
     line = next(l for l in capsys.readouterr().out.splitlines() if l.startswith("unfenced providers"))
     assert "claude (turned off: providers.claude.write_fence is false)" in line
+
+
+@pytest.mark.parametrize("cmd", [
+    "cd /w && ssh host 'make'", "ssh host 'cat log' | tail -5", "ssh host true; echo ok", "ssh host a\nssh host b",
+    "timeout 60 /usr/bin/ssh host x | grep y", "FOO=1 scp a host:b && echo done", "ls | xargs rsync -a h:/x",
+    "ttp lock box -- ssh host x 2>&1 | tail", "echo hi && sftp host",
+])
+def test_fenced_hook_refuses_ssh_beside_other_commands(env, monkeypatch, cmd):
+    from ttp import hook
+    monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"]))
+    monkeypatch.setenv("TTP_FENCE_BY_NAME", "1")
+    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(env["tmp"])})
+    why = out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny" and "on its own" in why, why
+    monkeypatch.delenv("TTP_FENCE_BY_NAME")
+    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(env["tmp"])})
+    assert not out or out["hookSpecificOutput"].get("permissionDecision") != "deny", "unfenced: ssh runs anywhere"
+
+
+@pytest.mark.parametrize("cmd", [
+    "ssh host 'cat log | tail -5'", "timeout 60 ssh host 'a && b'", "ttp lock box -- ssh host 'make 2>&1 | tail'",
+    "ssh host cmd 2>&1", "git log --grep ssh | head -3", "ssh-keygen -l -f k.pub && echo ok",
+    "git commit -m 'ssh && scp; rsync'", "cat > notes.md <<'X'\nssh a && ssh b\nX",
+])
+def test_fenced_hook_lets_ssh_on_its_own_and_ssh_as_data_run(env, monkeypatch, cmd):
+    from ttp import hook
+    monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"]))
+    monkeypatch.setenv("TTP_FENCE_BY_NAME", "1")
+    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(env["tmp"])})
+    assert not out or out["hookSpecificOutput"].get("permissionDecision") != "deny", out

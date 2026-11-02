@@ -267,6 +267,8 @@ class Claude(Provider):
         text = Path(path).read_text()
         return [flag, text] if len(text.encode()) <= MAX_ARG_BYTES else []
 
+    fence_by_name = True   # FENCE_EXCLUDED
+
     def write_fence(self, restrictions=None) -> str:
         missing = fence_missing()
         return f"bypassPermissions without the Bash sandbox, which needs {' and '.join(missing)}" if missing else ""
