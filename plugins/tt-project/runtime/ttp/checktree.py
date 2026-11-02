@@ -24,10 +24,10 @@ GIT_TIMEOUT_S = 20
 
 
 def _git(top: str | Path, *args: str) -> str:
-    return repoid.read(top, args, lambda: _run_git(top, args)) if repoid.identity(args) else _run_git(top, args)
+    return repoid.read(top, args, lambda: _git_run(top, args)) if repoid.identity(args) else _git_run(top, args)
 
 
-def _run_git(top: str | Path, args: tuple) -> str:
+def _git_run(top: str | Path, args: tuple) -> str:
     try:
         r = subprocess.run(["git", "-C", str(top), *args], capture_output=True, text=True, timeout=GIT_TIMEOUT_S)
     except (OSError, subprocess.TimeoutExpired):

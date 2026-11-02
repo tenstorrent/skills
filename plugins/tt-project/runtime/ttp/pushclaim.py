@@ -71,11 +71,11 @@ _NOT_REFS = {"the", "a", "an", "it", "its", "origin", "remote", "github", "branc
 
 def _git(repo, *args: str, timeout: float = 30) -> subprocess.CompletedProcess:
     if repoid.identity(args):
-        return repoid.read(repo, args, lambda: _run_git(repo, args, timeout))
-    return _run_git(repo, args, timeout)
+        return repoid.read(repo, args, lambda: _git_run(repo, args, timeout))
+    return _git_run(repo, args, timeout)
 
 
-def _run_git(repo, args: tuple, timeout: float) -> subprocess.CompletedProcess:
+def _git_run(repo, args: tuple, timeout: float) -> subprocess.CompletedProcess:
     try:
         t = gitmemo.timeout(timeout, args)
         return gitcache.run(repo, args, lambda: subprocess.run(
