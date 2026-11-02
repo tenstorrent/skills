@@ -37,6 +37,7 @@ END_FIELDS = ("until", "end_when", "report_from", "user_end")
 KEPT_S = 30 * 86400   # lifted holds are kept this long, for status and audit
 ALERT_KIND = "fleethold"   # alert `fleethold:<id>:passed`: a user's hold past its expected end (passed_alerts)
 LIFT = "to lift it, say so in chat or use Resume on the web page"
+PASSED = "passed"   # on a hold: {"sig", "at"}, when its end condition passed where it is checked (record_passed)
 
 
 def _path(name: str) -> Path:
@@ -94,7 +95,7 @@ def set_hold(alias: str, reason: str, by: str, setter: str, end: dict | None = N
         was = doc["holds"].get(alias)
         if isinstance(was, dict):
             kept = end if end is not None else {k: was[k] for k in END_FIELDS if k in was}
-            hold = {**{k: v for k, v in was.items() if k not in END_FIELDS}, **kept,
+            hold = {**{k: v for k, v in was.items() if k not in END_FIELDS and k != PASSED}, **kept,
                     "reason": reason or was.get("reason", ""), "generation": uuid.uuid4().hex,
                     "by": "user" if "user" in (by, was.get("by")) else by,
                     "edits": int(was.get("edits") or 0) + 1}
@@ -140,6 +141,38 @@ def lift_at_user_end(alias: str, generation: Any, by: str, now: float | None = N
             return None
         _drop(doc, alias, {"lifted": now, "lifted_by": by, "ended": "the user's own end"}, now)
     return hold
+
+
+def record_passed(alias: str, sig: str, at: float) -> bool:
+    """Keep on the hold of `alias` when its end condition passed, as the project that checks it saw
+    (pauseends), so every project with tasks on the machine reads it (passed_at). Only for the hold of
+    that identity (`sig`, pauseends._sig): a re-set hold never inherits an old pass. Whether it wrote."""
+    from . import pauseends
+    want = {"sig": sig, "at": float(at)}
+    hold = active().get(alias)
+    if not hold or pauseends._sig(entry(hold)) != sig or hold.get(PASSED) == want:
+        return False
+    with _locked():
+        doc = _read()
+        hold = doc["holds"].get(alias)
+        if not isinstance(hold, dict) or pauseends._sig(entry(hold)) != sig or hold.get(PASSED) == want:
+            return False
+        hold[PASSED] = want
+        project.write_json(_path(FILE), doc, 0o600)
+    return True
+
+
+def passed_at(hold: dict, db=None) -> float | None:
+    """When the end condition of the user's hold passed, if it did: kept on the hold (record_passed),
+    else in `db`, the checking project's own record (pauseends.passed_at)."""
+    from . import pauseends
+    v, got = entry(hold), hold.get(PASSED)
+    try:
+        if isinstance(got, dict) and got.get("sig") == pauseends._sig(v):
+            return float(got["at"])
+    except (TypeError, ValueError):
+        pass
+    return pauseends.passed_at(db, f"{pauseends.FLEET_PREFIX}{hold.get('alias')}", v) if db is not None else None
 
 
 def _drop(doc: dict, alias: str, how: dict, now: float) -> None:
@@ -212,13 +245,13 @@ def checker(hold: dict, here: str | None = None) -> str:
 
 
 def line(hold: dict, where=None, now: float | None = None) -> str:
-    """One line for status, the digest and `ttp machines list`; `where` a Project also shows when a
-    user hold's end condition passed (pauseends.passed_at, recorded by the project that checks it)."""
+    """One line for status, the digest and `ttp machines list`, with when a user hold's end condition
+    passed (passed_at; `where` a Project also reads its own record)."""
     from . import ends, pauseends
     who = "for the user" if hold.get("by") == "user" else f"by its {hold.get('by') or 'coordinator'}"
     v = entry(hold)
     db = getattr(where, "db", None)
-    passed = pauseends.passed_at(db, f"{pauseends.FLEET_PREFIX}{hold.get('alias')}", v) if db is not None else None
+    passed = passed_at(hold, db)
     end = pauseends.describe(v, where, passed, now)
     return (f"{hold.get('alias')} held machine-wide (hold {hold.get('id')}) by {hold.get('project') or '?'} {who} "
             f"since {ends.shown(float(hold.get('since') or 0), where)}"
@@ -228,11 +261,10 @@ def line(hold: dict, where=None, now: float | None = None) -> str:
 
 def _passed(hold: dict, db, now: float) -> float | None:
     """When the expected end of a hold the user set passed, if it did: recorded where it is checked
-    (pauseends.passed_at), or its `until`. A `user_end` hold lifts at its end instead: None."""
-    from . import pauseends
+    (passed_at), or its `until`. A `user_end` hold lifts at its end instead: None."""
     if hold.get("by") != "user" or hold.get("user_end"):
         return None
-    at = pauseends.passed_at(db, f"{pauseends.FLEET_PREFIX}{hold.get('alias')}", entry(hold))
+    at = passed_at(hold, db)
     if at is None and hold.get("until") and float(hold["until"]) <= now:
         at = float(hold["until"])
     return at

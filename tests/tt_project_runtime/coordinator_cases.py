@@ -16828,6 +16828,61 @@ def test_a_user_fleet_hold_past_its_expected_end_is_one_needs_you_alert_where_ta
     assert "box1" not in fleethold.active() and not mine(b)
 
 
+def test_a_user_fleet_hold_whose_end_when_passed_alerts_where_tasks_wait_not_only_in_its_setter(env, tmp_path,
+                                                                                               monkeypatch):
+    from ttp import alerts, fleethold, pauseends
+    from ttp import machine_ledger as ml
+    from ttp.daemon import Daemon
+    a, b, _ = _fleet(env, tmp_path)
+    monkeypatch.setattr(ml, "can_act", lambda name, here=None: (True, ""))   # a, the setter, checks its end
+    fleethold.set_hold("box1", "", "user", "demo", {"end_when": "test -d ./no-such-dir"})
+    b.db.x("UPDATE tasks SET status='running' WHERE id IN (SELECT task FROM runs)")
+    _fleet_waits(b)   # only b has a queued task on box1; a has none
+    dbb, now = Daemon(b.base), time.time()
+
+    def mine(p):
+        return [m for m in alerts.needs_you(p.db, time.time()) if m["text"].startswith("box1 is still held")]
+
+    assert _settle_end_probes(pauseends.PauseEnds(a), now) == []
+    dbb.check_pause_ends()
+    assert not mine(b), "not before its probe passed"
+    fleethold.set_hold("box1", "", "user", "demo", {"end_when": "test -d ."})
+    assert _settle_end_probes(pauseends.PauseEnds(a), now + 3 * pauseends.PROBE_EVERY_S) == ["machine:box1"]
+    assert "machine:box1" not in pauseends.owned(b) and not b.db.kv(pauseends.PASSED_KEY), "b never checks it"
+    hold = fleethold.active()["box1"]
+    key = f"fleethold:{hold['id']}:passed"
+    for _ in range(2):
+        dbb.check_pause_ends()
+        dbb.sweep_alerts()
+    got = mine(b)
+    assert len(got) == 1 and "1 of this project's tasks wait on it" in got[0]["text"], got
+    assert b.db.one("SELECT COUNT(*) n FROM alerts WHERE key=?", (key,))["n"] == 1
+    assert fleethold.passed_alerts(a.db, a) == [] and not a.db.q("SELECT id FROM alerts"), "a has no task there"
+    assert "your expected end passed at" in fleethold.line(hold), "also shown with no project"
+    # A re-set hold, same id with another end_when, raises nothing until its own probe passes.
+    old = hold[fleethold.PASSED]["sig"]
+    fleethold.set_hold("box1", "", "user", "demo", {"end_when": "test -d ./no-such-dir"})
+    hold = fleethold.active()["box1"]
+    assert f"fleethold:{hold['id']}:passed" == key and fleethold.PASSED not in hold
+    assert not fleethold.record_passed("box1", old, now), "an old pass never lands on the new hold"
+    dbb.check_pause_ends()
+    dbb.sweep_alerts()
+    assert not mine(b) and b.db.one("SELECT COUNT(*) n FROM alerts WHERE cleared IS NULL")["n"] == 0
+    assert _settle_end_probes(pauseends.PauseEnds(a), now + 6 * pauseends.PROBE_EVERY_S) == []
+    dbb.check_pause_ends()
+    assert not mine(b)
+    fleethold.set_hold("box1", "", "user", "demo", {"end_when": "test -d .."})
+    assert _settle_end_probes(pauseends.PauseEnds(a), now + 9 * pauseends.PROBE_EVERY_S) == ["machine:box1"]
+    dbb.check_pause_ends()
+    assert len(mine(b)) == 1
+    # A torn pass on the hold reads as none, never an error.
+    with fleethold._locked():
+        doc = fleethold._read()
+        doc["holds"]["box1"][fleethold.PASSED] = {"sig": doc["holds"]["box1"][fleethold.PASSED]["sig"], "at": "x"}
+        fleethold.project.write_json(fleethold._path(fleethold.FILE), doc, 0o600)
+    assert fleethold.passed_at(fleethold.active()["box1"]) is None
+
+
 def test_a_fleet_hold_quiets_the_machine_like_a_user_pause(env):
     from ttp import fleethold
     from ttp import machine_ledger as ml

@@ -374,9 +374,24 @@ class PauseEnds:
         passed = db.kv(PASSED_KEY) or {}
         if any(k not in pauses for k in passed):
             db.set_kv(PASSED_KEY, {k: w for k, w in passed.items() if k in pauses} or None)
+        self._share_passes(pauses, passed)
         if due:
             self.log(f"pause end due: {', '.join(due)}")
         return due
+
+    def _share_passes(self, pauses: dict[str, dict], passed: dict) -> None:
+        """Put each recorded pass of a user's fleet hold this project checks onto the hold itself
+        (fleethold.record_passed), outside any transaction, so every project with tasks on the machine
+        raises its alert; redone each tick until it is there."""
+        from . import fleethold
+        for name, w in sorted(passed.items()):
+            v = pauses.get(name) or {}
+            if not (v.get("fleet") and isinstance(w, dict) and w.get("sig") == _sig(v)):
+                continue
+            try:
+                fleethold.record_passed(str(v.get("machine")), w["sig"], float(w["at"]))
+            except (OSError, TypeError, ValueError) as e:
+                self.log(f"fleet hold {v.get('fleet')}: could not share its passed end: {e}")
 
     def _health_ends(self, now: float) -> list[str]:
         from . import heal
