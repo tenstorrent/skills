@@ -11,8 +11,10 @@ batch reads only what a batch recorded here, never the passes `ttp checks` recor
 project's state as it trusts its own markers there, which name the heads it pushes. The store keeps
 the newest MAX entries younger than MAX_AGE_S. A pass also keeps the head and tip it was checked on,
 so the same change rebased onto a newer tip can carry it (carriable, verdictcarry) when the rebase
-changed nothing the check covers. `ttp checks` may reuse a pass recorded here (queued)
-for a check that is one plain local pytest run, on the same tree, command and env_id, naming its batch.
+changed nothing the check covers; such a carried pass is recorded for the new tree marked "carried"
+(verdictcarry's line, naming the head it ran on). `ttp checks` may reuse a pass recorded here (queued)
+for a check that is one plain local pytest run, on the same tree, command and env_id, naming its batch,
+but never a carried one: it never ran on that tree.
 
 A check that is one plain pytest run also resumes (resumable): the ttp_pytest_resume plugin appends
 each test file whose every selected test passed to a file keyed the same way, and the next run of
@@ -261,10 +263,11 @@ def queued(p: Project, wt: Path, tree: str, cmd, env: dict, tips: list[str]) -> 
     """For `ttp checks`: the push queue's recorded pass of `cmd` on `tree` whose env_id is the one `cmd`
     has here in `env`, checked against one of `tips` (the batch's tip is not known here, so each is
     tried; the key binds it), as the entry plus that "tip"; else None. Only a match of the tree, the
-    exact command and the whole env_id counts."""
+    exact command and the whole env_id counts, and only a pass that ran there: a carried one never."""
     if not tree:
         return None
-    entries = [e for e in _fresh(_load(p.state / STORE), time.time()) if e.get("tree") == tree and e.get("cmd") == str(cmd)]
+    entries = [e for e in _fresh(_load(p.state / STORE), time.time())
+               if e.get("tree") == tree and e.get("cmd") == str(cmd) and not e.get("carried")]
     if not entries:
         return None
     parts = env_parts(wt, cmd, env, "")
@@ -302,9 +305,10 @@ def carriable(p: Project, cmd: str, parts: dict) -> list[dict]:
 
 
 def record(p: Project, tree: str, cmd: str, eid: str, batch: str, parts: dict | None = None,
-           head: str = "", tip: str = "") -> str:
+           head: str = "", tip: str = "", carried: str = "") -> str:
     """Record a pass (only ever a pass), with the part_digests of its env_parts and the head and tip
-    it was checked on when given; prune the store. Returns why it could not, or ""."""
+    it was checked on when given, and `carried` (verdictcarry's line) for a pass carried, not run;
+    prune the store. Returns why it could not, or ""."""
     if not tree:
         return "no tree"
     path = p.state / STORE
@@ -315,7 +319,8 @@ def record(p: Project, tree: str, cmd: str, eid: str, batch: str, parts: dict | 
             now = time.time()
             entries = _load(path) + [{"key": key(tree, cmd, eid), "tree": tree, "cmd": cmd, "batch": batch, "ts": now,
                                       **({"parts": part_digests(parts)} if parts else {}),
-                                      **({"head": head, "tip": tip} if head and tip else {})}]
+                                      **({"head": head, "tip": tip} if head and tip else {}),
+                                      **({"carried": carried} if carried else {})}]
             write_json(path, {"passes": _fresh(entries, now)})
     except OSError as e:
         return str(e)

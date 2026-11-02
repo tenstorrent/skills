@@ -1143,7 +1143,7 @@ class Batch:
             elif carried := self._carried(head, cmd, parts):
                 say(f"{carried}: {cmd}")
                 self.checks.setdefault("carried", []).append(f"{carried}: {cmd}")
-                if why := pushpass.record(self.p, tree, str(cmd), eid, self.id, parts, head, self.tip or ""):
+                if why := pushpass.record(self.p, tree, str(cmd), eid, self.id, parts, head, self.tip or "", carried):
                     say(f"could not record the pass of {cmd}: {why}")
             else:
                 if why := pushpass.missed(self.p, tree, str(cmd), parts):

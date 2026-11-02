@@ -14183,6 +14183,9 @@ def test_a_push_batch_carries_a_pass_onto_a_tip_that_moved_only_in_ignored_paths
         assert len(runs) == 1, "the pass carried: the check did not run again"
         line = f"verdict carried from {runs[0][:10]}; upstream delta touched only: docs/late.md: {check['run']}"
         assert m["checks"]["carried"] == [line] and line in out
+        from ttp import pushpass
+        stored = json.loads((p.state / pushpass.STORE).read_text())["passes"]
+        assert [e.get("carried", "") for e in stored] == ["", line.rsplit(": ", 1)[0]], stored
     else:
         assert len(runs) == 2 and "carried" not in m["checks"]
 
@@ -14204,12 +14207,14 @@ def test_the_coordinator_and_guide_state_the_verdict_carry_rule_without_a_user_s
                 assert "user's word" not in sentence and "user's yes" not in sentence, sentence
 
 
-def _queue_pass(p, repo, cmd, tip, env=None, batch="b7", tree=None):
+def _queue_pass(p, repo, cmd, tip, env=None, batch="b7", tree=None, carried=""):
     """Record a pass of `cmd` on HEAD's tree as the push queue does (batch._check: env_parts of the
-    target-mode check environment, checked against `tip`)."""
+    target-mode check environment, checked against `tip`); `carried`: a pass verdictcarry carried there."""
     from ttp import push, pushpass
     parts = pushpass.env_parts(repo, cmd, env or push.check_env("target", tip), tip)
-    assert pushpass.record(p, tree or pushpass.tree_of(repo, "HEAD"), cmd, pushpass.digest(parts), batch, parts) == ""
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    assert pushpass.record(p, tree or pushpass.tree_of(repo, "HEAD"), cmd, pushpass.digest(parts), batch, parts,
+                           head, tip, carried) == ""
 
 
 def test_ttp_checks_reuses_a_push_queue_pass_only_on_the_same_tree_command_and_environment(env, tmp_path,
@@ -14282,6 +14287,40 @@ def test_ttp_checks_reuses_a_push_queue_pass_only_on_the_same_tree_command_and_e
     reset()
     cli.main(["checks", "--", cmd])
     assert ran() == 5 and "(recorded)" in capsys.readouterr().out
+
+
+def test_ttp_checks_never_reuses_a_push_queue_pass_that_was_carried_not_run(env, tmp_path, monkeypatch, capsys):
+    """A pass the push queue carried onto HEAD's tree across a rebase (verdictcarry) never ran there:
+    `ttp checks` runs the check although tree, command and env_id match. A pass that ran there is
+    still reused, its batch named, also when a newer carried entry sits beside it."""
+    from ttp import cli, push, pushpass
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    tip = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    (repo / "b.txt").write_text("b\n")
+    subprocess.run([*git, "add", "b.txt"], check=True)
+    subprocess.run([*git, "commit", "-qm", "b"], check=True)
+    count = tmp_path / "count"
+    cmd = f"echo x >> {count} || pytest"
+    ran = lambda: len(count.read_text().splitlines()) if count.exists() else 0
+    line = f"verdict carried from {'a' * 10}; upstream delta touched only: docs/x.md"
+
+    def checks():
+        (p.state / cli.CHECK_PASSES).unlink(missing_ok=True)
+        cli.main(["checks", "--", cmd])
+        return capsys.readouterr().out
+
+    _queue_pass(p, repo, cmd, tip, batch="b9", carried=line)
+    entry = json.loads((p.state / pushpass.STORE).read_text())["passes"][-1]
+    eid = pushpass.digest(pushpass.env_parts(repo, cmd, push.check_env("target", tip), tip))
+    assert entry["carried"] == line and pushpass.passed(p, entry["tree"], cmd, eid), \
+        "the batch's own reuse of a carried pass is unchanged"
+    out = checks()
+    assert ran() == 1 and "push batch" not in out, out
+    _queue_pass(p, repo, cmd, tip, batch="b7")
+    _queue_pass(p, repo, cmd, tip, batch="b9", carried=line)
+    out = checks()
+    assert ran() == 1 and "in push batch b7 at " in out and "b9" not in out, out
 
 
 def test_ttp_checks_runs_its_checks_when_the_push_queue_store_is_malformed(env, tmp_path, monkeypatch, capsys):
