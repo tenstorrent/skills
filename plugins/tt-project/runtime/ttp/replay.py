@@ -7,13 +7,19 @@ before it started a run soon after (the dispatcher starts runnable work within a
 task a held turn would only queue later does not count until the replay has read that turn's events.
 
     python3 -m ttp.replay <project folder or project.db> [--days 2] [--batch-s 300] [--slots N]
-                          [--event-hold-s 300]
+                          [--event-hold-s 300 [--quiet-hold]]
 
 Reports the turns each rule starts, the share batching saves, `idle_slot_s` (free slots with nothing
 to run while a batch is held) and `extra_idle_slot_s` (real run seconds the batched replay could not
 run yet, beyond the unbatched one). `--rule always` replays a plain time window for comparison.
 `--event-hold-s` also replays coordinator.event_hold_s (eventhold.py) over the batched rule:
-`held_turns` and `turns_saved_by_hold` count what it saves on top of batching.
+`held_turns` and `turns_saved_by_hold` count what it saves on top of batching. `--quiet-hold` adds
+a candidate rule the daemon does not run (quiet: a batch of only plain hand-offs, checks_slot_wait
+and task_waiting waits through a free slot; no event for an urgent task is held) and reports the turns it saves on
+top, the real turns it delays with what each did (tasks queued, replies sent, actions decided) and
+the largest delay it adds before the start of any task a real turn queued. A plain hand-off is read
+conservatively from history: a normal task_done of a task with no followup_proposed event, no parent
+and no task depending on it.
 """
 from __future__ import annotations
 
@@ -25,10 +31,11 @@ import sys
 import time
 from pathlib import Path
 
-from . import eventhold
+from . import eventhold, urgent
 from .coordinator import batchable
 
 STEP_S = 5.0
+QUIET_KINDS = frozenset({"checks_slot_wait", "task_waiting"})   # with a plain task_done: the quiet rule's kinds
 
 
 def load(db_path: Path, days: float, now: float | None = None) -> dict:
@@ -49,8 +56,16 @@ def load(db_path: Path, days: float, now: float | None = None) -> dict:
             for e in t["events"]:
                 handled_by[e] = t
     events = [dict(r) for r in con.execute(
-        f"SELECT id, ts, kind, severity FROM events WHERE id IN ({','.join('?' * len(ev_ids))})", sorted(ev_ids))] \
-        if ev_ids else []
+        f"SELECT id, ts, kind, severity, task FROM events WHERE id IN ({','.join('?' * len(ev_ids))})",
+        sorted(ev_ids))] if ev_ids else []
+    _mark_events(con, events)
+    for t in turns:
+        t["queued"] = con.execute("SELECT COUNT(*) FROM tasks WHERE created BETWEEN ? AND ?",
+                                  (t["started"], (t["ended"] or t["started"]) + 5)).fetchone()[0]
+        t["replies"] = con.execute("SELECT COUNT(*) FROM messages WHERE direction='out' AND kind IN "
+                                   "('reply','ask') AND ts BETWEEN ? AND ?",
+                                   (t["started"], (t["ended"] or t["started"]) + 5)).fetchone()[0]
+        t["decided"] = json.loads(t["note"] or "{}").get("decided")
     msgs = [dict(r) for r in con.execute(
         f"SELECT id, ts FROM messages WHERE id IN ({','.join('?' * len(msg_ids))})", sorted(msg_ids))] \
         if msg_ids else []
@@ -64,6 +79,35 @@ def load(db_path: Path, days: float, now: float | None = None) -> dict:
     con.close()
     return {"turns": turns, "events": events, "messages": msgs, "workers": workers, "tasks": tasks,
             "handled_by": handled_by, "now": now}
+
+
+def _mark_events(con: sqlite3.Connection, events: list[dict]) -> None:
+    """Mark each event `plain` (a hand-off with nothing to queue, read conservatively) and `urgent`
+    (for an urgent task, urgent.is_urgent)."""
+    tids = sorted({e["task"] for e in events if e["task"]})
+    rows = {r["id"]: dict(r) for r in con.execute(
+        f"SELECT id, priority, spec, parent FROM tasks WHERE id IN ({','.join('?' * len(tids))})", tids)} \
+        if tids else {}
+    followed = {r[0] for r in con.execute("SELECT DISTINCT task FROM events WHERE kind='followup_proposed'")}
+    needed = set()
+    for (deps,) in con.execute("SELECT depends_on FROM tasks WHERE depends_on NOT IN ('', '[]')"):
+        try:
+            d = json.loads(deps)
+        except ValueError:
+            continue
+        needed.update(str(x) for x in (d if isinstance(d, list) else [d]))
+    for e in events:
+        task = rows.get(e["task"])
+        e["urgent"] = urgent.is_urgent(task)
+        e["plain"] = bool(e["kind"] == "task_done" and e["severity"] == "normal" and task
+                          and not task.get("parent") and e["task"] not in followed and str(e["task"]) not in needed)
+
+
+def quiet(evs: list[dict]) -> bool:
+    """The candidate quiet rule: every event of `evs` (at least one) is a plain task_done (`plain`, see
+    _mark_events), a checks_slot_wait or a task_waiting, so the batch waits out the hold through a free
+    slot. The daemon does not run it: replayed history shows such turns still queue work."""
+    return bool(evs) and all(e.get("kind") in QUIET_KINDS or e.get("plain") for e in evs)
 
 
 def _creators(data: dict) -> dict:
@@ -80,7 +124,7 @@ def _creators(data: dict) -> dict:
 
 def simulate(data: dict, batch_s: float, slots: int, debounce_s: float = 15.0, window_s: float = 60.0,
              max_events: int = 40, max_per_hour: int = 30, turn_s: float | None = None,
-             rule: str = "fill", event_hold_s: float = 0.0) -> dict:
+             rule: str = "fill", event_hold_s: float = 0.0, quiet_hold: bool = False) -> dict:
     """Start turns like maybe_coordinate does. A real worker run counts only once the replayed turns
     have read the events of the real turn that queued its task; the run seconds lost before that are
     `lost_run_s`, the work a later turn would have kept off a free slot."""
@@ -128,10 +172,13 @@ def simulate(data: dict, batch_s: float, slots: int, debounce_s: float = 15.0, w
                         held_s += STEP_S
                         idle_slot_s += max(0, slots - busy - runnable) * STEP_S
                 # The event hold: routine event-only batches wait until event_hold_s after the last turn
-                # ended, unless a slot is free with nothing ready to fill it.
+                # ended, unless a slot is free with nothing ready to fill it (quiet_hold: and the batch
+                # could queue work) or (quiet_hold) an event is for an urgent task.
                 if not hold and event_hold_s > 0 and turns and not pending_m \
                         and eventhold.routine(pending_e) and t < turns[-1] + turn_s + event_hold_s \
-                        and (busy >= slots or runnable > 0):
+                        and not (quiet_hold and any(e.get("urgent") for e in pending_e)) \
+                        and (busy >= slots or runnable > 0
+                             or quiet_hold and quiet(pending_e)):
                     hold = True
                     held_s += STEP_S
                 recent = sum(1 for x in turns if x > t - 3600)
@@ -146,10 +193,30 @@ def simulate(data: dict, batch_s: float, slots: int, debounce_s: float = 15.0, w
             "lost_run_s": lost_run_s}
 
 
-def report(data: dict, batch_s: float, slots: int, event_hold_s: float = 0.0, **kw) -> dict:
+def _quiet_effects(data: dict, before: dict, after: dict) -> dict:
+    """The real turns whose events `after` handles later than `before`, with what each did, and the
+    largest delay `after` adds before the first run of a task a real turn queued."""
+    late = {e for e, at in after["handled_at"].items() if at > before["handled_at"].get(e, at)}
+    delayed = [{"run": t["id"], "queued": t["queued"], "replies": t["replies"], "decided": t["decided"]}
+               for t in data["turns"] if t["status"] == "ok" and late & set(t["events"])]
+    started = {x["id"] for x in data["tasks"] if x["first"] is not None}
+    delay = 0.0
+    for task, r in _creators(data).items():
+        if task in started and r["events"]:
+            delay = max(delay, max(after["handled_at"].get(e, 0) for e in r["events"])
+                        - max(before["handled_at"].get(e, 0) for e in r["events"]))
+    return {"quiet_delayed_turns": len(delayed),
+            "quiet_delayed_acting": [d for d in delayed if d["queued"] or d["replies"] or d["decided"]],
+            "quiet_max_start_delay_s": delay}
+
+
+def report(data: dict, batch_s: float, slots: int, event_hold_s: float = 0.0, quiet_hold: bool = False,
+           **kw) -> dict:
     base = simulate(data, 0, slots, **kw)
     batched = simulate(data, batch_s, slots, **kw)
     held = simulate(data, batch_s, slots, event_hold_s=event_hold_s, **kw) if event_hold_s > 0 else None
+    qh = simulate(data, batch_s, slots, event_hold_s=event_hold_s, quiet_hold=True, **kw) \
+        if held and quiet_hold else None
     ok = [t for t in data["turns"] if t["status"] == "ok"]
     triggered = [t for t in ok if t["events"] or t["messages"]]
     cost = statistics.mean([t["cost_usd"] or 0 for t in triggered]) if triggered else 0.0
@@ -163,7 +230,11 @@ def report(data: dict, batch_s: float, slots: int, event_hold_s: float = 0.0, **
             **({"event_hold_s": event_hold_s, "held_turns": len(held["turns"]),
                 "turns_saved_by_hold": nn - len(held["turns"]),
                 "est_saved_by_hold_usd": round((nn - len(held["turns"])) * cost, 2),
-                "hold_extra_idle_slot_s": held["lost_run_s"] - batched["lost_run_s"]} if held else {})}
+                "hold_extra_idle_slot_s": held["lost_run_s"] - batched["lost_run_s"]} if held else {}),
+            **({"quiet_held_turns": len(qh["turns"]), "turns_saved_by_quiet": len(held["turns"]) - len(qh["turns"]),
+                "est_saved_by_quiet_usd": round((len(held["turns"]) - len(qh["turns"])) * cost, 2),
+                "quiet_extra_idle_slot_s": qh["lost_run_s"] - held["lost_run_s"],
+                **_quiet_effects(data, held, qh)} if qh else {})}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -174,6 +245,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--slots", type=int, default=None, help="worker slots (default: the project's "
                     "budget.max_parallel_workers, else 6)")
     ap.add_argument("--event-hold-s", type=float, default=0.0, help="also replay coordinator.event_hold_s")
+    ap.add_argument("--quiet-hold", action="store_true", help="with --event-hold-s: also replay the quiet "
+                    "rule (quiet), which holds a batch that cannot queue work through a free slot")
     ap.add_argument("--debounce-s", type=float, default=15.0)
     ap.add_argument("--window-s", type=float, default=60.0)
     ap.add_argument("--rule", choices=("fill", "slots", "always"), default="fill",
@@ -189,7 +262,7 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError):
             slots = 6
     out = report(load(db, a.days), a.batch_s, slots, debounce_s=a.debounce_s, window_s=a.window_s,
-                 rule=a.rule, event_hold_s=a.event_hold_s)
+                 rule=a.rule, event_hold_s=a.event_hold_s, quiet_hold=a.quiet_hold)
     print(json.dumps(out, indent=1))
     return 0
 

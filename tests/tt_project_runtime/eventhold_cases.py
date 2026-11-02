@@ -120,3 +120,51 @@ def test_eventhold_replay_counts_the_turns_the_hold_saves(env):
     assert out["turns_saved_by_hold"] == 0, out
     assert "held_turns" not in replay.report(history(workers=2), 0, 2)
     assert replay.main([str(db.path), "--days", "1", "--slots", "2", "--event-hold-s", "300"]) == 0
+
+
+def test_eventhold_replay_quiet_rule_holds_only_plain_batches_through_a_free_slot(env):
+    """--quiet-hold models a candidate rule the daemon does not run: a batch of only plain hand-offs,
+    checks_slot_wait and task_waiting waits through a free slot; followup_proposed, an urgent task's
+    event and a user message do not. The delayed real turns are listed with what each did."""
+    from ttp import replay
+    p = make(env)
+    db = p.db
+    t0 = time.time() - 7200
+
+    def history(kind="task_done", spec="s", priority=3, msg=False, follow=False):
+        for table in ("runs", "events", "tasks", "messages"):
+            db.x(f"DELETE FROM {table}")
+        db.x("INSERT INTO runs(role, started, ended, status) VALUES('worker', ?, ?, 'ok')", (t0, t0 + 3000))
+        for at in (100, 200, 300):
+            tid = db.add_task(f"t{at}", spec, priority=priority)
+            db.x("UPDATE tasks SET created=? WHERE id=?", (t0 - 1000, tid))
+            eid = db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                       (t0 + at, "x", kind, "normal", "n", "handled", tid))
+            evs = [eid]
+            if follow and at == 200:   # a follow-up no replayed turn read: the hand-off is still not plain
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) "
+                     "VALUES(?,?,'followup_proposed','normal','f','handled',?)", (t0 + at, "x", tid))
+            mids = [db.x("INSERT INTO messages(ts,direction,chat,text,handled) VALUES(?,'in','web','hi',1)",
+                         (t0 + at,))] if msg and at == 200 else []
+            db.x("INSERT INTO runs(role, started, ended, status, cost_usd, note) VALUES('coordinator',?,?,'ok',0.1,?)",
+                 (t0 + at + 15, t0 + at + 25, json.dumps({"events": evs, "messages": mids, "decided": 1})))
+            if at == 300:   # the last real turn queued a task
+                db.x("INSERT INTO tasks(created, updated, title) VALUES(?,?,'q')", (t0 + at + 20, t0 + at + 20))
+        return replay.load(pathlib.Path(db.path), 1, now=t0 + 3600)
+
+    # One of two slots is free with nothing ready: today's hold yields, the quiet rule holds.
+    out = replay.report(history(), 0, 2, event_hold_s=300, quiet_hold=True)
+    assert (out["held_turns"], out["quiet_held_turns"], out["turns_saved_by_quiet"]) == (3, 2, 1), out
+    # The real turns of the 2nd and 3rd events are delayed; the 3rd queued a task.
+    assert out["quiet_delayed_turns"] == 2 and [d["queued"] for d in out["quiet_delayed_acting"]] == [0, 1], out
+    out = replay.report(history(kind="checks_slot_wait"), 0, 2, event_hold_s=300, quiet_hold=True)
+    assert out["turns_saved_by_quiet"] == 1, out
+    # Not quiet: a followup_proposed, a task with a follow-up, an urgent task (p1 or `urgent:`), a user message.
+    for kw in ({"kind": "followup_proposed"}, {"kind": "upstream_note"}, {"follow": True}, {"priority": 1},
+               {"spec": "do it\nurgent: a demo at noon"}, {"msg": True}):
+        out = replay.report(history(**kw), 0, 2, event_hold_s=300, quiet_hold=True)
+        assert out["turns_saved_by_quiet"] == 0, (kw, out)
+    # Off: today's report, with no quiet keys.
+    assert "quiet_held_turns" not in replay.report(history(), 0, 2, event_hold_s=300)
+    assert "quiet_held_turns" not in replay.report(history(), 0, 2, quiet_hold=True)
+    assert replay.main([str(db.path), "--days", "1", "--slots", "2", "--event-hold-s", "300", "--quiet-hold"]) == 0
