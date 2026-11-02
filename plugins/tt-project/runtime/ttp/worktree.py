@@ -21,10 +21,12 @@ def _git(cwd: Path, *args: str, check: bool = True, timeout: float = 120, env: d
     t = gitmemo.timeout(timeout, args)
     run = lambda: subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True,   # noqa: E731
                                  timeout=t, env=env)
-    if env is None:   # identity reads from repoid, remote reads from gitcache
-        out = repoid.read(cwd, args, run) if repoid.identity(args) else gitcache.run(cwd, args, run, t)
-    else:
+    if env is not None:
         out = run()
+    elif repoid.identity(args):
+        out = repoid.read(cwd, args, run)
+    else:   # gitcache keeps `remote` and `remote get-url` answers
+        out = gitcache.run(cwd, args, run, t) if args[:1] == ("remote",) else run()
     if check and out.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {out.stderr.strip()[:300]}")
     return out.stdout.strip()
