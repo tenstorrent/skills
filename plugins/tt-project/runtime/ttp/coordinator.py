@@ -6265,7 +6265,7 @@ CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_ov
                        "_item_quote_hits", "_items", "_norm", "_may_lift", "_lifts_item", "_companion_clause",
                        "_ref_ids", "_companion_exception", "_changed_sentences", "_quoted_news",
                        "_charter_approval", "_ask_charter_approval")
-CHARTER_GUARD_PIN = (13, "b62351060fd71cc207bcb58e1fb25629db13fedc9db39c617e5ad13c50f4608c")
+CHARTER_GUARD_PIN = (13, "61a8471fb7bd3bf5228ac37ce59d2be30d3141073a493e83da9814042f25d7fc")
 CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
 
 
