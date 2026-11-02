@@ -1366,10 +1366,16 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(f"  needs you (#{t['id']}, {t['wait']['age_text']}): {t['title']} — {t['wait']['text']}")
     lines.append("budget: " + h["spend"]["headline"])
     c = h["coordinator"]
-    coord = "coordinator: no turn yet"
-    if c["last_turn"]:
-        coord = f"coordinator: last turn {int((now - c['last_turn']) // 60)} min ago" + (
-            f" ({c['last_status']})" if c["last_status"] else "")
+    from . import budget, coordmodel
+    # One line: the route it runs with, when it last turned, and how that differs from the configured
+    # route when it does. The separate route and coordmodel lines stay for --verbose and the daily review.
+    want = c["route"]
+    ran = coordmodel.last_turn(db)
+    coord = f"coordinator: {c['route_line'].removeprefix('coordinator: ')}, " + (
+        f"last turn {int((now - c['last_turn']) // 60)} min ago ({c['last_status']})" if c["last_turn"] and c["last_status"]
+        else f"last turn {int((now - c['last_turn']) // 60)} min ago" if c["last_turn"] else "no turn yet")
+    if ran and (off := coordmodel.mismatch(want, ran)):
+        coord += f" · configured {coordmodel._route_text(want)}, ran as {', '.join(off)}"
     if c["failures"]:
         coord += f" · {c['failures']} failed in a row"
     if c["backoff_until"]:
@@ -1379,9 +1385,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
     elif c["idle_held"]:
         coord += f" · idle check {c['idle_held']}"
     lines.append(coord)
-    lines.append(c["route_line"])
-    from . import budget, coordmodel
-    lines.append(coordmodel.line(p.config(), db, p))
+    if verbose:
+        lines.append(coordmodel.line(p.config(), db, p))
     cache = budget.coordinator_cache(db, now)["24h"] if verbose else {}
     if cache.get("turns"):
         lines.append(budget.coordinator_cache_line(cache))

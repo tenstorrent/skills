@@ -9562,7 +9562,7 @@ def test_new_status_and_the_web_app_show_the_coordinators_model_and_effort(env, 
     # status and web
     line = coord.route_line(p.config())
     assert line.endswith(" · high")
-    assert line in cli.status_text(p).splitlines()
+    assert f"{line}, no turn yet" in cli.status_text(p).splitlines()   # the merged status line; no separate route line
     h = web.health(p, p.db)["coordinator"]
     assert h["route_line"] == line and h["route"] == coord.coordinator_route(p.config())
     assert "c.route_line" in (web.STATIC / "app.js").read_text()
@@ -20097,7 +20097,7 @@ def test_status_and_the_daily_review_show_configured_and_last_used_coordinator_m
     turn("opus", "xhigh", "claude-opus-9", 1.5, ago=90)
     line = coordmodel.line(p.config(), p.db, p)
     assert "configured claude/opus · xhigh; last turn" in line and "(claude-opus-9)" in line and "MISMATCH" not in line
-    assert line in cli.status_text(p).splitlines()
+    assert line in cli.status_text(p, verbose=True).splitlines() and line not in cli.status_text(p).splitlines()
     turn("opus", "xhigh", "claude-sonnet-9", 1.0, ago=80)   # asked for opus, the session ran another model
     assert "MISMATCH: it ran with model claude-sonnet-9 (the session's)" in coordmodel.line(p.config(), p.db, p)
     turn("sonnet", "high", "", 0.5, ago=70)
@@ -20116,5 +20116,32 @@ def test_status_and_the_daily_review_show_configured_and_last_used_coordinator_m
     spend = next(x for x in review if x.startswith("coordinator spend per day"))
     assert f"{days[0]['day']} $3.00 (3 turns: opus 2, sonnet 1)" in spend, spend
     assert f"{days[1]['day']} $2.00 (1 turns: sonnet 1)" in spend and "$9.00" not in spend
+    # `ttp status` prints exactly one coordinator line: the route with the last turn's age, and
+    # the mismatch against the configured route only when the last turn ran otherwise.
+    p.set_config("core_provider", "claude")
+    p.db.set_kv("last_coordinator_turn", now - 60)
+    status = cli.status_text(p).splitlines()
+    one = [l for l in status if l.startswith("coordinator:")]
+    assert len(one) == 1, status   # the route, coordmodel and status lines are merged into one
+    assert one[0].startswith("coordinator: claude/sonnet · high, last turn 1 min ago (ok)"), one[0]
+    assert "configured" not in one[0]   # a matching turn runs as configured: no "ran as"
+    assert coordmodel.line(p.config(), p.db, p) not in status   # the coordmodel line moved to --verbose
+    assert coordmodel.line(p.config(), p.db, p) in cli.status_text(p, verbose=True).splitlines()
+    p.set_config("coordinator.model", "opus")
+    p.set_config("coordinator.effort", "")
+    one = [l for l in cli.status_text(p).splitlines() if l.startswith("coordinator:")]
+    assert one and one[0].startswith("coordinator: claude/opus · xhigh, last turn 1 min ago (ok)"
+                    " · configured claude/opus · xhigh, ran as model sonnet, effort high"), status
+    p.db.x("DELETE FROM runs")
+    p.db.set_kv("last_coordinator_turn", 0)
+    one = [l for l in cli.status_text(p).splitlines() if l.startswith("coordinator:")]
+    assert one == ["coordinator: claude/opus · xhigh, no turn yet"], status
+    p.db.x("INSERT INTO runs(role,provider,model,effort,started,ended,status) "
+            "VALUES('coordinator','claude','opus','xhigh',?,?,'ok')", (now - 90, now - 60))
+    p.db.set_kv("last_coordinator_turn", now - 60)   # the daemon stamps this at each turn start
+    one = [l for l in cli.status_text(p).splitlines() if l.startswith("coordinator:")]
+    assert one and one[0].startswith("coordinator: claude/opus · xhigh, last turn 1 min ago (ok)"), status
+    assert "configured" not in one[0]   # the run now matches the configured route
+    assert one[0] in cli.status_text(p, verbose=True).splitlines()   # verbose adds, never replaces
     # A day with no coordinator turn adds neither line.
     assert not [x for x in audit.lines(p.db, now=now + 30 * 86400, p=p) if x.startswith("coordinator model")]
