@@ -2097,8 +2097,8 @@ def test_a_push_batch_counts_requeued_conflicts_and_not_rebase_stops(env, monkey
              _entry(repo, "e3", {"notes.txt": "a\nB3\nc\n"})]
     rebase = batch.Batch._rebase
 
-    def stop_e1(self, onto, top):
-        return (onto, ["(the rebase stopped: hook said no)"]) if top == heads[0] else rebase(self, onto, top)
+    def stop_e1(self, onto, top, **kw):
+        return (onto, ["(the rebase stopped: hook said no)"]) if top == heads[0] else rebase(self, onto, top, **kw)
     monkeypatch.setattr(batch.Batch, "_rebase", stop_e1)
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
     assert _statuses(m) == ["conflict", "check_failed", "requeued"], m
@@ -2146,8 +2146,15 @@ def test_a_push_batch_drops_an_entry_commit_a_trailer_names_on_the_target_and_re
     p, repo, origin, other, a = _landed_fixture(env, monkeypatch)
     carrier = _land_as(other, {"notes.txt": "a\nB1 settled\nc\n"}, f"first, settled\n\nTtp-Replayed-From: {a}")
     head = _on_top(repo, a, "e1", {"more.txt": "own\n"})
+    # Whatever the environment and the user's git settings, the replay leaves out only that commit
+    # and moves no other branch.
+    monkeypatch.setenv("GIT_SEQUENCE_EDITOR", "false")
+    for key, val in (("rebase.abbreviateCommands", "true"), ("rebase.missingCommitsCheck", "error"),
+                     ("rebase.updateRefs", "true")):
+        _git_out(repo, "config", key, val)
     rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
     assert rc == 0 and _statuses(m) == ["pushed"], m
+    assert _git_out(repo, "rev-parse", "first", "e1").split() == [a, head], "no branch moved"
     pushed = _git_out(origin, "rev-parse", "proj")
     assert _git_out(origin, "show", f"{pushed}:notes.txt") == "a\nB1 settled\nc", "the landing is kept"
     assert _git_out(origin, "show", f"{pushed}:more.txt") == "own"

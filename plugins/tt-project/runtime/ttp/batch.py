@@ -67,6 +67,9 @@ REPLAYED = "Ttp-Replayed-From"     # trailer of a commit the batch settled: the 
 DROP_TODO = ("import sys\nf, drop = sys.argv[-1], sys.argv[1:-1]\nkeep = [ln for ln in open(f).readlines() "
              "if not (ln.split()[:1] in (['pick'], ['p']) and len(ln.split()) > 1 and len(ln.split()[1]) >= 7 "
              "and any(d.startswith(ln.split()[1]) for d in drop))]\nopen(f, 'w').writelines(keep)\n")
+# that rebase's own settings, whatever the user's: no todo reordering, no check of the dropped lines,
+# and no other branch moved along (rebase.updateRefs would move a task branch the replay passes)
+DROP_CONFIG = ("-c", "rebase.autoSquash=false", "-c", "rebase.missingCommitsCheck=ignore", "-c", "rebase.updateRefs=false")
 RESCUES = 1                        # checks per batch of the entries after a blamed one, replayed without it
 NO_TESTS = 5                       # pytest's exit status when nothing was selected: a cap probe of a check without cap tests
 RERUN_S = 600.0                    # delivery.push_rerun_s: the time limit of one rerun of a failed check's failing tests
@@ -90,11 +93,12 @@ def say(msg: str) -> None:
         pass
 
 
-def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+def _git(cwd: Path, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
     """git with its output captured. No editor opens (a rebase continues with the message it has),
     and no recorded resolution (rerere) settles a conflict behind the resolver's back."""
     return subprocess.run(["git", "-C", str(cwd), "-c", "rerere.enabled=false", *args], text=True,
-                          capture_output=True, env={**os.environ, "GIT_EDITOR": "true"}, timeout=gitmemo.timeout(None, args))
+                          capture_output=True, env={**os.environ, "GIT_EDITOR": "true", **(env or {})},
+                          timeout=gitmemo.timeout(None, args))
 
 
 def _last(text: str, n: int = push.LOG_TAIL) -> str:
@@ -1052,9 +1056,10 @@ class Batch:
             self._checkout(top)
             return top, None
         merges = ["--rebase-merges"] if _git(wt, "rev-list", "--merges", "-1", top, f"^{onto}").stdout.strip() else []
-        todo = ["-c", f"sequence.editor={shlex.quote(sys.executable)} -c {shlex.quote(DROP_TODO)} "
-                + " ".join(sorted(drop))] if drop else []
-        r = _git(wt, *todo, "rebase", *(["--interactive"] if drop else []), "--no-keep-empty", *merges, onto, top)
+        r = _git(wt, "rebase", "--no-keep-empty", *merges, onto, top) if not drop else _git(
+            wt, *DROP_CONFIG, "rebase", "--interactive", "--no-keep-empty", *merges, onto, top,
+            env={"GIT_SEQUENCE_EDITOR": f"{shlex.quote(sys.executable)} -c {shlex.quote(DROP_TODO)} "
+                                        + " ".join(sorted(drop))})
         for _ in range(10000):
             if r.returncode == 0:
                 return _git(wt, "rev-parse", "HEAD").stdout.strip(), None
