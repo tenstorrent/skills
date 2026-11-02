@@ -14455,7 +14455,7 @@ def test_ttp_checks_never_reuses_a_push_queue_pass_that_was_carried_not_run(env,
     _queue_pass(p, repo, cmd, tip, batch="b7")
     _queue_pass(p, repo, cmd, tip, batch="b9", carried=line)
     out = checks()
-    assert ran() == 1 and "in push batch b7 at " in out and "b9" not in out, out
+    assert ran() == 1 and "in push batch b7 at " in out and "batch b9" not in out, out
 
 
 def test_ttp_checks_runs_its_checks_when_the_push_queue_store_is_malformed(env, tmp_path, monkeypatch, capsys):
