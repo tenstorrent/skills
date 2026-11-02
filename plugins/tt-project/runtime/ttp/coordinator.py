@@ -1735,6 +1735,9 @@ HOLD_NEEDS_ANCHOR = ("a hold needs `waits_on`: ask:<id> (an open ask, or ask:new
                      "is queued with start_after or start_when, model-free). A hold never replaces an ask or a "
                      "decision: decide it yourself (requeue or cancel, memory_add the decision), or ask_user with "
                      "a valid blocking category and waits_on ask:new, or set an end with until or when")
+NO_WAITING_STATUS = ("status `waiting` is not one a task_update sets: a task waits on its own hand-off's "
+                     "retry_when. To hold it, set status queued with start_after or start_when, or status "
+                     "blocked with waits_on")
 
 
 def _hold_as_deferral(db, task: dict, a: dict, home: str | None = None) -> tuple[dict, str]:
@@ -1791,7 +1794,7 @@ def _hold_anchor(db, task: dict, a: dict, turn_asks: list[tuple[int, int]], late
     (_hold_as_deferral); its until/when branches keep landing holds and older anchors valid."""
     raw = a.get("waits_on")
     raw = raw.strip() if isinstance(raw, str) else ""
-    status = a.get("status") if a.get("status") in ("queued", "blocked", "cancelled", "done", "waiting") else None
+    status = a.get("status") if a.get("status") in ("queued", "blocked", "cancelled", "done") else None
     if not raw:
         if status == "blocked" and not (task["status"] == "blocked" and anchors.anchor(task)):
             raise ValueError(f"#{task['id']} rejected: {HOLD_NEEDS_ANCHOR}")
@@ -2466,7 +2469,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 a, as_deferral = _hold_as_deferral(db, task, a, timefmt.home(p))
                 upd: dict[str, Any] = {}
                 lull = None
-                if a.get("status") in ("queued", "blocked", "cancelled", "done", "waiting"):
+                if a.get("status") == "waiting":
+                    # No task status 'waiting' exists (db.waiting_handoff): written, nothing would dispatch,
+                    # probe or wake the task again.
+                    raise ValueError(f"#{task['id']} rejected: {NO_WAITING_STATUS}")
+                if a.get("status") in ("queued", "blocked", "cancelled", "done"):
                     if task["status"] == "running" and a["status"] != "cancelled":
                         raise InfoRejection(f"task #{task['id']} is running: send `spec` alone to steer it mid-run, "
                                          f"or set status cancelled")
@@ -2608,7 +2615,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         # A re-plan: the wait it hands back next is not compared with the old plan's.
                         upd["result"] = dump_result(prev)
                     kind, pr_ask = _delivery_kind(task["kind"], spec)
-                    if pr_ask and upd.get("status", task["status"]) in ("queued", "blocked", "waiting"):   # not mid-run
+                    if pr_ask and upd.get("status", task["status"]) in ("queued", "blocked"):   # not mid-run
                         upd["kind"] = kind
                         notes.append(f"task_update: #{task['id']} is now `code`, not `{task['kind']}`: its spec asks "
                                      f"for PR delivery ({pr_ask!r}) and only code tasks open or update PRs")

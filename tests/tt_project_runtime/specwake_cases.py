@@ -423,3 +423,36 @@ def test_a_reboot_wake_carries_a_deferred_spec_change_at_the_tasks_own_tier(env,
     assert res["wake_tier"] == "standard" and res["escalated_wake"] is True, res
     assert bud.wake_tier(t["tier"], res, d.cfg) == "standard"
     assert res["spec_seen"] == spec_digest(t) != slept_on
+
+
+def test_several_spec_only_updates_fold_into_the_one_run_its_probe_starts(env, monkeypatch, tmp_path):
+    p = make(env)
+    d, tid, flag, runs, idle = _deferred_flow(p, monkeypatch, tmp_path)
+    for text in ("also report the peak memory", "and the wall time", "and the commit it ran on"):
+        _edit_spec(p, tid, text, wake_now=False)
+        d.tick()
+    assert runs() == 1 and idle(), "a spec-only update woke the task before its wait ended"
+    flag.write_text("")
+    assert _run_until(d, p, lambda: runs() == 2), "the probe pass did not run the task"
+    for _ in range(4):
+        d.tick()
+        time.sleep(0.05)
+    assert runs() == 2, "the updates gave more than one run"
+    assert p.db.task(tid)["spec"].count("## Update") == 3
+
+
+def test_a_task_update_cannot_set_the_status_waiting_nothing_would_wake(env):
+    # The daemon keeps a waiting task as status queued with its waiting hand-off and not_before
+    # (db.waiting_handoff); a stored status 'waiting' is one no dispatch, probe or wake reads.
+    from ttp import coordinator as coord
+    p = make(env)
+    fresh = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+    sleeper = _spec_sleeper(p)
+    for tid in (fresh, sleeper):
+        before = p.db.task(tid)
+        probs = coord.apply(p, [{"type": "task_update", "id": tid, "status": "waiting"}])
+        assert any(f"#{tid} rejected" in x and "retry_when" in x for x in map(str, probs)), probs
+        after = p.db.task(tid)
+        assert (after["status"], after["result"], after["not_before"]) == \
+            (before["status"], before["result"], before["not_before"])
+    assert [t["id"] for t in p.db.ready_tasks()] == [fresh]
