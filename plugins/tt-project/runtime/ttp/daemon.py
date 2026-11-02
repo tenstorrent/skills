@@ -11107,11 +11107,12 @@ class Daemon:
         if rc != "0":
             return None
         full = _read_result(run_dir / RESULT_FILE) or {}
-        if "on_pass" not in full:
+        on_pass = full["on_pass"] if "on_pass" in full else default_on_pass(task, full)
+        if on_pass is None:
             return None
         if full.get("status") != "waiting" or not _same_probe(full, prev):
             return "unclear", "the run's result.json is not the hand-off the task waits on"
-        problem = on_pass_problem(full["on_pass"])
+        problem = on_pass_problem(on_pass)
         if problem:
             return "unclear", problem
         head = _checked_head(run_dir, task)
@@ -11125,7 +11126,7 @@ class Daemon:
                                    "not run); run `ttp checks --full`")
             return "unclear", ("the checked commit is no longer the head of its worktree and branch, or it is not clean, "
                                "or its checks were a harness qualification (`ttp checks --purpose harness`)")
-        return "pass", r, run_dir, with_waiting_followups(full["on_pass"], full), head
+        return "pass", r, run_dir, with_waiting_followups(on_pass, full), head
 
     def _on_pass_env(self, tid: int) -> dict:
         """The environment a task's on_pass_cmd runs with (and its dry run): the probes' (_probe_env), no
@@ -14153,6 +14154,34 @@ def on_pass_problem(on_pass) -> str:
         if key in on_pass and not isinstance(on_pass[key], kind):
             return f"on_pass {key} must be a {kind.__name__}"
     return ""
+
+
+# A waiting hand-off's fields a default on_pass (default_on_pass) carries into the final hand-off.
+DEFAULT_ON_PASS_KEYS = ("artifacts", "metrics", "self_check", "resolves", "no_push", "published", "outcome", "tried")
+# Spec text that leaves a code worker work after its checks pass: a landing it runs itself.
+LANDS_ITSELF_RE = re.compile(r"\bttp\s+push\b|\bland\s+(?:it|this|the\s+change|on)\b", re.I)
+
+
+def default_on_pass(task: dict, full: dict) -> dict | None:
+    """The final hand-off to record when a code task's waiting hand-off on its own `ttp checks` names no
+    on_pass and nothing but recording the result is left after them: `done` with its summary and the
+    fields it carries (DEFAULT_ON_PASS_KEYS). None (the task wakes as before) for another kind, a
+    hand-off with a next_step, an on_pass_cmd, a wake_tier other than light or a PR, or a spec that
+    asks for a PR or a landing the worker runs itself (LANDS_ITSELF_RE)."""
+    if task.get("kind") != "code" or not isinstance(full, dict) or full.get("status") != "waiting":
+        return None
+    if full.get("next_step") or full.get("on_pass_cmd") is not None or full.get("pr") \
+            or full.get("wake_tier") not in (None, "", "light"):
+        return None
+    spec = str(task.get("spec") or "")
+    if prguard.delivery_instruction(spec) or LANDS_ITSELF_RE.search(spec):
+        return None
+    summary = full.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return None
+    return {"status": "done",
+            "summary": f"{summary.strip()} (Its `ttp checks` passed; recorded model-free, the hand-off named no on_pass.)",
+            **{k: full[k] for k in DEFAULT_ON_PASS_KEYS if k in full}}
 
 
 def with_waiting_followups(final: dict, waited: dict) -> dict:

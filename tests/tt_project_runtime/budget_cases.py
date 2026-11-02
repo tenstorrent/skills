@@ -1574,6 +1574,8 @@ def test_an_unclear_checks_wait_falls_back_to_a_light_wake(env, monkeypatch, tmp
         (path / "fix.txt").write_text("changed after the checks\n")
     elif change == "not_handoff":
         (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "x", "on_pass": DONE_ON_PASS}))
+    elif change == "no_on_pass":   # a step left after the checks: no default on_pass (see below)
+        _set_handoff(p, tid, run_dir, next_step="report the push")
     _settle_probe(d, tid)
     task = p.db.task(tid)
     res = json.loads(task["result"])
@@ -1582,6 +1584,79 @@ def test_an_unclear_checks_wait_falls_back_to_a_light_wake(env, monkeypatch, tmp
     assert res["woke"].startswith("probe passed") and (why is None or why in res["woke"]), res["woke"]
     assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
 
+
+
+def _set_handoff(p, tid, run_dir, **fields):
+    """Add `fields` to a waiting task's hand-off, in its run's result.json and its task record alike."""
+    hand = {**json.loads((run_dir / "result.json").read_text()), **fields}
+    (run_dir / "result.json").write_text(json.dumps(hand))
+    p.db.update_task(tid, result=json.dumps({**json.loads(p.db.task(tid)["result"]), **fields}))
+
+
+def test_passed_checks_settle_a_code_hand_off_without_on_pass_by_default(env, monkeypatch, tmp_path):
+    """A code worker that waits on its own checks with nothing left but the hand-off, and names no
+    on_pass, is recorded done model-free on a pass, keeping its summary and the fields it carries."""
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tid, _ = _checks_wait_task(p, tmp_path)
+    _set_handoff(p, tid, tmp_path / f"run-{tid}", summary="parser fixed", self_check="ticked 3 steps",
+                 artifacts=["fix.txt"], wake_tier="light")
+    _settle_probe(d, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert task["status"] == "done", (task["status"], task["blocked_reason"], res)
+    assert res["summary"].startswith("parser fixed") and "no on_pass" in res["summary"]
+    assert res["run_status"] == "model-free" and res["artifacts"] == ["fix.txt"]
+    assert res["self_check"] == "ticked 3 steps"
+    assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1, "a model run was started"
+    assert "recorded its on_pass (done) model-free" in (p.logs / "daemon.log").read_text()
+
+
+@pytest.mark.parametrize("change", ["next_step", "wake_tier", "pr", "pr_spec", "land_spec", "kind"])
+def test_passed_checks_without_on_pass_still_wake_when_work_is_left(env, monkeypatch, tmp_path, change):
+    """No default on_pass where a step may follow the checks: a next_step, a standard wake, a PR in the
+    hand-off or the spec, a landing the spec asks the worker to run, or a task that is not code."""
+    p = make(env)
+    from ttp import budget as bud, daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tid, _ = _checks_wait_task(p, tmp_path)
+    run_dir = tmp_path / f"run-{tid}"
+    if change == "next_step":
+        _set_handoff(p, tid, run_dir, next_step="report the push")
+    elif change == "wake_tier":
+        _set_handoff(p, tid, run_dir, wake_tier="standard")
+    elif change == "pr":
+        _set_handoff(p, tid, run_dir, pr="https://github.com/o/r/pull/1")
+    elif change == "pr_spec":
+        p.db.update_task(tid, spec="Fix the parser and open a draft PR once tested.")
+    elif change == "land_spec":
+        p.db.update_task(tid, spec="Fix the parser, then land it with `ttp push --detach`.")
+    else:
+        p.db.x("UPDATE tasks SET kind='work' WHERE id=?", (tid,))
+    _settle_probe(d, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert _ready(p, tid) and task["status"] == "queued", (task["status"], res)
+    assert res["woke"].startswith("probe passed"), res["woke"]
+    assert bud.wake_tier(task["tier"], res) == "light", res
+
+
+def test_default_on_pass_needs_a_waiting_code_hand_off_with_a_summary(env):
+    from ttp.daemon import default_on_pass, on_pass_problem
+    task = {"kind": "code", "spec": "Fix the parser."}
+    hand = {"status": "waiting", "summary": "fixed", "retry_when": "ttp checks --result /tmp/r",
+            "metrics": {"tests": "3 passed"}, "waiting_for": "checks"}
+    got = default_on_pass(task, hand)
+    assert got["status"] == "done" and got["metrics"] == {"tests": "3 passed"} and not on_pass_problem(got)
+    assert "waiting_for" not in got and "retry_when" not in got
+    for bad in ({**hand, "summary": " "}, {**hand, "status": "done"}, {**hand, "on_pass_cmd": "true"},
+                {**hand, "wake_tier": "deep"}):
+        assert default_on_pass(task, bad) is None, bad
+    assert default_on_pass({**task, "spec": "Never open a PR; the user does."}, hand) is not None
+    assert default_on_pass({**task, "spec": "Publish it as a draft PR."}, hand) is None
 
 
 def test_result_waits_wake_at_light_whatever_they_ask_unless_escalated(env):
