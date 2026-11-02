@@ -43,7 +43,7 @@ import json
 import time
 from typing import Any
 
-from . import budget, chaincap, checkprestage, coordmodel, correction, ends, obligations, quietgate, relay, reviewstats, route, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
+from . import budget, chaincap, checkprestage, coordmodel, correction, ends, obligations, plainreply, quietgate, relay, reviewstats, route, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
 from .db import DB, continues_id
 from .project import Project
 
@@ -446,6 +446,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(suite)
     if pre := checkprestage.audit_line(db, since):
         out.append(pre)
+    if plain := plainreply.audit_line(db, since):
+        out.append(plain)
     turns = coordinator_turns(db, since)
     if turns["n"]:
         noop = (f"{turns['noop']} decided nothing (${turns['noop_usd']:.2f})" if turns["logged"] else

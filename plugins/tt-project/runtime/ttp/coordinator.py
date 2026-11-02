@@ -64,6 +64,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     obligations,
     outagemsg,
     pauseends,
+    plainreply,
     prguard,
     progress,
     projpause,
@@ -415,6 +416,8 @@ USER_SETTABLE = {
     "coordinator.approval_lookback_days": float,
     # Days an answered ask, the user's word or a recorded decision refuses a re-ask of its subject (reask.py; 0 off).
     "coordinator.reask_window_days": float,
+    "coordinator.reply_soft_chars": lambda v: max(0, int(v)),   # plainreply.py
+    "coordinator.reply_max_terms": lambda v: max(0, int(v)),
     # Provider failover (failover.py): hours a provider may be unable to start work before its queued
     # and waiting tasks move (0: off), and the providers they move to first.
     "coordinator.provider_failover_after_h": lambda v: failover.after_h_of(v),
@@ -1091,6 +1094,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     if unfixed := causefix.digest_lines(db, now):
         course_lines = (course_lines or [course.HEADER]) + unfixed
         course_id += "\ncausefix:" + unfixed[0].split(" | ")[0]
+    if unplain := plainreply.digest_lines(db, now):
+        course_lines = (course_lines or [course.HEADER]) + unplain
+        course_id += "\nplainreply:" + unplain[0].split(" | ")[0]
     section("course_check", course_lines, course_id,
             f"## Course check: {len(course_lines) - 1} lines (as last turn; correct course or say why it is fine)")
     prog_lines, prog_id = progress.digest_lines(db, now)
@@ -3173,6 +3179,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                        [a for i, a in enumerate(actions) if i not in failed and isinstance(a, dict)], turn=turn)
     except Exception as e:
         notes.append(f"cause check not recorded: {type(e).__name__}: {str(e)[:200]}")
+    try:   # flag only: a reply that does not answer first or leans on internal terms (plainreply)
+        plainreply.check(db, [(mid, "reply" if mid in replies else "notify", text) for mid, _, text in sent],
+                         p.config(), turn=turn)
+    except Exception as e:
+        notes.append(f"plain-reply check not recorded: {type(e).__name__}: {str(e)[:200]}")
     db.set_kv(NOTES_KEY, notes)
     # Rejections go back to the coordinator in its next digest, never into the user's chat: a reply
     # already sent is corrected there by the coordinator itself, only when it told the user otherwise.

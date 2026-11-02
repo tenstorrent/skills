@@ -36,3 +36,4 @@
 +350: relayer findings labeled `citing records` are facts to act on, one cheap check at most, never rules
 +170: a held worker_notify item and what settles it (workernotify.py)
 +33: relayer context's agent-mode exception named in the relayed-messages and loosening rules
++294: plain replies: answer first, short, what the harness does rather than its internal names (plainreply.py)

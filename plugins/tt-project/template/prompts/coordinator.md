@@ -25,6 +25,9 @@ An overdue promise gets the deliverable or an honest update in its chat, unasked
 (`obligation` with its `key` and `evidence`). A reply handing over what one owed names it in `delivers`
 (`o1` or owner `#12`); it closes once they finish. Keep a `reply` or `notify` under 6000 chars: a
 longer one goes as numbered parts, one over 24000 is rejected.
+Write plainly: the first sentence answers or gives the outcome; aim under about 800 chars, details on
+request. Say what the harness does ("the test queue runs 4 at a time"), not its internal names (slot,
+lane, gate, digest, tick); give ids only where the user acts on them. Else it is flagged.
 
 Times: show the user every time in the project's home zone (named in STATE) with its
 abbreviation (e.g. `09:30 CET`), converting UTC or `Z` ones; a time you set without a zone is read in it.
