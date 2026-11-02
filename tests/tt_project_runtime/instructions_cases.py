@@ -48,6 +48,12 @@ def test_codex_finds_the_runs_developer_instructions_in_its_rollout_head(tmp_pat
     assert look() == {"state": "no_rollout"}
     roll = _write_rollout(home, sid, _rollout_lines(sid, developer=False, answered=False))
     assert look()["state"] == "pending", "the context may still be written: no verdict before the model answers"
+    with open(roll, "a") as f:   # an item a turn may write before any model reply decides nothing
+        f.write(json.dumps({"type": "response_item", "payload": {"type": "ghost_snapshot"}}) + "\n")
+    assert look()["state"] == "pending"
+    with open(roll, "a") as f:
+        f.write(json.dumps({"type": "response_item", "payload": {"type": "reasoning"}}) + "\n")
+    assert look()["state"] == "missing", "a model reply: the context is complete"
     roll.write_text(_rollout_lines(sid))
     assert look() == {"state": "recorded", "cli_version": "0.160.0"}, "TOML-escaped quotes, backslashes, CR LF"
     roll.write_text(_rollout_lines(sid, developer=False))

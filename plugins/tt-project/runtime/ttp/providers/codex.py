@@ -58,6 +58,8 @@ ROLLOUT_WINDOWS_FRESH_S = 180
 # this long a prefix (characters) of the text the run passed.
 ROLLOUT_HEAD_LINES = 200
 INSTRUCTIONS_PREFIX = 4096
+# Rollout items only a model reply writes: once one is there, the first request's context is complete.
+MODEL_ITEMS = ("reasoning", "function_call", "custom_tool_call", "local_shell_call", "web_search_call")
 # Tools a decision-only turn does without, switched off when this build lists them as features.
 READ_ONLY_OFF = ("shell_tool", "unified_exec", "web_search_request")
 HOOK_TRUST_BYPASS = "--dangerously-bypass-hook-trust"
@@ -195,7 +197,7 @@ class Codex(Provider):
                                and c["text"].replace("\r\n", "\n").startswith(want) for c in parts):
                             return {"state": "recorded", "cli_version": version}
                     elif rec.get("type") == "response_item" and (pay.get("role") == "assistant"
-                                                                  or pay.get("type") not in (None, "message")):
+                                                                  or pay.get("type") in MODEL_ITEMS):
                         answered = True   # the model already answered: the first request's context is all here
                     elif rec.get("type") == "event_msg" and pay.get("type") == "token_count":
                         answered = True
