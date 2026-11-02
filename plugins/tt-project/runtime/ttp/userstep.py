@@ -30,6 +30,7 @@ import re
 import time
 
 from . import alerts
+from .coordinator import START_WHEN_CHARS
 from .db import DB, TERMINAL_TASK_STATES, deferral
 
 STEPS = "user_steps"   # kv: "<task>:<kind>" -> the open step's record
@@ -87,7 +88,7 @@ def relay(db: DB, task: dict, kind: str, n: dict, text: str, now: float | None =
     fields = {"task": task["id"], "kind": kind, "text": text[:2000], "last": now, "content": content,
               **({"source": n["source"]} if n.get("source") else {}),
               "do": str(n.get("do") or "")[:300] or None, "deadline": n.get("deadline"),
-              "check": str(n.get("check") or "")[:500] or (rec or {}).get("check")}
+              "check": str(n.get("check") or "")[:START_WHEN_CHARS] or (rec or {}).get("check")}
     if isinstance(rec, dict) and ep:
         changed = content != rec.get("content")
         steps[sid] = {**rec, **fields, "notifies": int(rec.get("notifies") or 1) + 1,

@@ -234,6 +234,28 @@ def test_a_deferred_user_step_item_clears_when_its_probe_passes_or_the_task_is_c
     assert not alerts.needs_you(p.db, time.time()) and not userstep.for_task(p.db, c)
 
 
+def test_a_deferred_user_step_with_a_long_start_when_writes_nothing_on_later_ticks_and_says_done(env):
+    # A start_when past 500 characters (up to START_WHEN_CHARS) is kept whole as the item's check:
+    # a later sync matches it and writes nothing, and a passing probe posts that the step is done.
+    from ttp import alerts, coordinator, userstep
+    from ttp.daemon import Daemon
+    p = make(env)
+    when = CHECK + " && test -n " + "x" * (600 - len(CHECK) - 12)
+    assert len(when) == 600 < coordinator.START_WHEN_CHARS
+    tid = _add_deferred(p, when=when)
+    assert userstep.for_task(p.db, tid)[0]["check"] == when and len(_open_steps(p)) == 1
+
+    def snap():
+        return (p.db.kv_dict(userstep.STEPS)[0], p.db.q("SELECT * FROM alerts"), p.db.q("SELECT * FROM messages"))
+    before = snap()
+    assert userstep.sync_deferrals(p.db, now=time.time() + 60) == [] and snap() == before
+    Daemon(p.base)._start_verdict(p.db.task(tid), 0, time.time())
+    assert not _open_steps(p) and not userstep.for_task(p.db, tid)
+    done = p.db.q("SELECT text FROM messages WHERE kind='resolved' AND ref=?", (f"user-step:{tid}:sign-in",))
+    assert len(done) == 1 and "sign-in step is done" in done[0]["text"]
+    assert not alerts.needs_you(p.db, time.time())
+
+
 def test_a_deferral_or_wait_on_the_users_next_message_is_refused_with_a_hint(env, capsys):
     from ttp import cli, coordinator, userstep
     p = make(env)
