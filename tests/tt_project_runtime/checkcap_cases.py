@@ -841,6 +841,49 @@ def test_ttp_checks_passes_its_test_slot_grant_runs_without_nice_and_clamps_n(en
     assert not locks_held(testslots), "released once the checks end"
 
 
+def test_test_slots_a_full_run_waits_for_its_minimum_grant_others_start_with_one(env, monkeypatch):
+    """A full `ttp checks` run waits first in line until checks.test_run_min slots are free, then starts
+    with at least that many; a pre-stage or light run and a push check still start with what is free."""
+    import threading
+    from ttp import testslots
+    monkeypatch.setenv("TTP_TEST_POOL", "8")
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", "8")
+    monkeypatch.setattr(testslots, "POLL_S", 0.05)
+    assert testslots.run_min({}, 8) == max(testslots.WORKERS_FLOOR, 4) == 4, "default: half a run's grant"
+    assert testslots.run_min({"checks": {"test_run_min": 3}}, 8) == 3
+    assert testslots.run_min({"checks": {"test_run_min": 20}}, 8) == 8, "never above a run's grant"
+    other = testslots.acquire("other", cfg={"checks": {"test_run_max": 6}})
+    assert other.k == 6
+    told, got = [], []
+    t = threading.Thread(target=lambda: got.append(testslots.acquire("full", told.append, cfg={"checks": {"test_run_min": 4,
+                                                                                     "test_run_max": 7}}, full=True)))
+    t.start()
+    try:
+        assert _wait_for(lambda: any("at least 4 free (checks.test_run_min); 2 free now" in x for x in told)), told
+        assert not got, "no full run on 2 of the pool's slots"
+        push = testslots.acquire("push", push_key="remote main", wait_s=0)
+        assert push is not None and push.k == 8, "a push check never waits for the minimum"
+        push.close()
+    finally:
+        other.close()
+    t.join(10)
+    assert got and got[0].k == 7 and "granted" in told[-1], (got, told)
+    light = testslots.acquire("pre-stage", wait_s=1)   # 1 free, fewer than the minimum
+    assert light is not None and light.k == 1, "a run that is not full starts with 1"
+    for g in (got[0], light):
+        g.close()
+
+
+def test_test_slots_a_full_run_on_a_pool_below_its_minimum_starts_without_deadlock(env, monkeypatch):
+    from ttp import testslots
+    monkeypatch.setenv("TTP_TEST_POOL", "2")
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", "8")
+    monkeypatch.setenv(testslots.RUN_MIN_ENV, "6")
+    g = testslots.acquire("full", cfg={}, full=True, wait_s=2)
+    assert g is not None and g.k == 2, "the pool can never give 6: it starts with what it has"
+    g.close()
+
+
 def locks_held(testslots):
     from ttp import locks
     return locks.held_labels(testslots.paths(testslots.sizes()[0]))
@@ -2314,9 +2357,31 @@ def test_checks_lanes_follow_the_host_small_keeps_the_old_default_idle_large_get
     old = checklane.default_slots(64, 468)
     cap = checklane.capacity({}, n_cores=64, load=0.0, mem_gib=468)
     assert cap["n"] == cap["top"] == 8 > old, "an idle large host gets more lanes than the old default"
-    assert checklane.capacity({}, held=6, n_cores=64, load=50.0, mem_gib=468)["n"] == 7, "load counts the runs"
+    assert checklane.capacity({}, held=6, n_cores=64, load=50.0, mem_gib=468, used=48)["n"] == 7, \
+        "load counts the runs"
     note = checklane.slots_note({}, held=0)
     assert "checks.slots unset" in note and "cores, load" in note and "GiB" in note, note
+
+
+def test_checks_lanes_follow_the_test_pool_run_count_not_the_cores(env, monkeypatch):
+    """A 64-core host whose test pool is busy with other projects' runs opens no lane beyond the runs
+    the pool fills at a full grant, so no lane starts on one or two workers."""
+    from ttp import checklane, testslots
+    monkeypatch.delenv(checklane.SLOTS_ENV)
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "2")
+    pool, run_max = testslots.sizes({}, cores=64)
+    # Other projects on the host hold 24 of the pool's slots and load the host to 40: the pool a run takes
+    # from is 24 + 24 spare = 48, which fills 6 runs at a full grant, though the cores would hold 8.
+    cap = checklane.capacity({}, n_cores=64, load=40.0, mem_gib=468, used=24)
+    assert 64 // checklane.run_cores({}, 64) == 8 and cap["top"] == 48 // run_max == 6, cap
+    assert cap["n"] <= cap["top"] and cap["fit"] <= cap["top"], cap
+    # Busier: the pool falls back to its default half (32 slots), 4 runs, the floor.
+    cap = checklane.capacity({}, held=4, n_cores=64, load=70.0, mem_gib=468, used=32)
+    assert cap["top"] == max(cap["floor"], pool // run_max) == 4 and cap["n"] == 4, cap
+    # A pool set below the floor's runs never takes the lanes below the floor or below 1.
+    monkeypatch.setenv("TTP_TEST_POOL", "2")
+    cap = checklane.capacity({}, n_cores=64, load=0.0, mem_gib=468, used=0)
+    assert cap["top"] >= cap["floor"] >= 1 and cap["n"] >= 1, cap
 
 
 def test_checks_lanes_admit_no_new_run_on_high_load_or_low_memory_and_an_explicit_setting_wins(
@@ -2327,8 +2392,10 @@ def test_checks_lanes_admit_no_new_run_on_high_load_or_low_memory_and_an_explici
     floor = checklane.default_slots(64, 468)
     for held in (floor, floor + 2):
         for load, mem in ((70.0, 468), (63.5, 468), (0.0, 7.0), (float("inf"), 468)):
-            cap = checklane.capacity({}, held=held, n_cores=64, load=load, mem_gib=mem)
-            assert cap["n"] == held and cap["fit"] == 0, (held, load, mem, cap)
+            # The held runs hold their full grants (8 slots each); an unreadable load keeps the pool's default.
+            cap = checklane.capacity({}, held=held, n_cores=64, load=load, mem_gib=mem, used=8 * held)
+            assert cap["n"] <= held and cap["fit"] == 0, (held, load, mem, cap)
+            assert cap["n"] == held or load == float("inf"), (held, load, mem, cap)
     monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
     assert checklane.capacity({}, n_cores=64, load=0.0, mem_gib=468)["n"] == floor, "load_extra 0 keeps the floor"
     monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "2")

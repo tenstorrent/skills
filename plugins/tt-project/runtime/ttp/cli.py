@@ -4194,7 +4194,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         testslots.lane_waits(suite, "host test slots")
         slot.tests = testslots.acquire(checkcap.label(p.name if p else None), tell, left,
                                        p.config() if p else {}, p.name if p else "", priority=prio, stop=stop,
-                                       since=arrived)
+                                       since=arrived, full=True)   # a full run waits for checks.test_run_min
         if slot.tests is None:
             slot.close()
             suite.close()

@@ -25,7 +25,11 @@ host keeps the half, as does checks.load_extra 0. A test grant is also at most t
 each worker granted in the last few seconds, at least WORKERS_FLOOR (live_room; checks.live_cores 0
 turns it off), so a run on a busy host starts fewer workers instead of oversubscribing it. The account settings checks.test_pool and
 checks.test_run_max (or TTP_TEST_POOL / TTP_TEST_RUN_MAX) set them; checks.test_pool 0 turns the pool
-off. A project's own checks.test_pool / checks.test_run_max may only lower them.
+off. A project's own checks.test_pool / checks.test_run_max may only lower them. A full `ttp checks` run
+(`full`) waits in line until at least run_min() slots are free in both the pool and its project's
+budget, then starts with at least that many, so a suite never runs for half an hour on one or two
+workers; with a pool or budget smaller than that it starts with what they can give. Pre-stages, push
+checks and builds keep at least one.
 
 One project holds at most project_max() slots at once over all its runs, as per-project lock files
 beside the pool's, so a burst of one project's checks leaves room for the others. Its default is the
@@ -85,6 +89,7 @@ from . import checkcap, locks, poll_s, project, repoid
 RESOURCE = "test-slots"    # check-slots/test-slots.<i>.lock
 RUN_MAX = 8                # one run's most workers by default: past about 8 a suite's wall time gains little
 WORKERS_FLOOR = 2          # a run's fewest workers when the host's free cores are short (live_room)
+RUN_MIN_KEY, RUN_MIN_ENV = "test_run_min", "TTP_TEST_RUN_MIN"   # a full run's fewest workers (run_min)
 SLOTS_ENV = "TTP_TEST_SLOTS"
 XDIST_ENV = "PYTEST_XDIST_AUTO_NUM_WORKERS"
 HELD_ENV = "TTP_TEST_SLOTS_HELD"   # set for the commands of a run that holds slots: the grant
@@ -180,6 +185,14 @@ def pool_now(cfg: dict | None, pool: int, held: int, cores: int | None = None, l
     if ld != ld or ld == float("inf"):
         return pool
     return max(pool, min(c, held + int(max(0.0, c - ld))))
+
+
+def run_min(cfg: dict | None, run_max: int) -> int:
+    """The fewest test slots a full checks run starts with: checks.test_run_min (the project's, then
+    TTP_TEST_RUN_MIN or the account's), default max(WORKERS_FLOOR, run_max // 2); at most run_max."""
+    n = _number(_section(cfg, "checks").get(RUN_MIN_KEY)) or _setting(RUN_MIN_ENV, RUN_MIN_KEY) \
+        or max(WORKERS_FLOOR, run_max // 2)
+    return max(1, min(n, run_max))
 
 
 def live_room(every: list) -> int | None:
@@ -303,6 +316,11 @@ class Grant:
         self.close()
 
 
+def _free(ps: list) -> int:
+    """How many of the slots `ps` are free right now."""
+    return len(ps) - len(locks._slot_labels(ps))
+
+
 def _take(ps: list, own: list, top: int, holder: str, what: str = "test slots",
           extra: dict | None = None) -> tuple[int, list]:
     """(k, files): up to `top` pool slots, each paired with one of the project's (`own`, when it has a budget)."""
@@ -323,7 +341,7 @@ def _take(ps: list, own: list, top: int, holder: str, what: str = "test slots",
 def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: float | None = None,
             cfg: dict | None = None, project_name: str | None = None, push_key: str = "",
             kind: Kind = TESTS, priority: int | None = None, stop: Callable[[], str] | None = None,
-            since: float | None = None) -> Grant | None:
+            since: float | None = None, full: bool = False) -> Grant | None:
     """Take this run's test slots (above); waits while none is free, first-come, telling why every
     TELL_S. None only once `wait_s` passed with none free (a foreground caller hands over). Nested in a
     run that holds slots, its grant at once; with the pool off, Grant() (no limit, nothing set).
@@ -336,7 +354,8 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
     only by less urgent runs takes one extra run's grant beyond it (urgent_paths) from the pool's free
     slots, so it never waits behind a long, less urgent check and stops none. `stop` as for suite_hold
     (a reason ends the wait with checkcap.Cancelled); `since`: the arrival to queue at (default now),
-    kept by a run that hands over or re-executes itself (checkcap.Upgraded)."""
+    kept by a run that hands over or re-executes itself (checkcap.Upgraded). `full` (a full `ttp checks`
+    run): it starts only once run_min() slots are free (above)."""
     tell = tell or (lambda _line: None)
     what = f"{kind.name} slots"
     for env in (kind.held_env, HELD_ENV):   # HELD_ENV: a build in a check builds on the check's slots
@@ -356,13 +375,16 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
             # Slots in use over every pool file there may be (a pool that shrank leaves holders past its end).
             used = len(locks._slot_labels(paths(max(pool, checkcap.cores()), kind)))
             pool = pool_now(cfg, pool, used, kind=kind)
-            room = max(0, min(top, pool - used))   # never more than the pool has left
+            room = free = max(0, min(top, pool - used))   # never more than the pool has left
             if kind is TESTS and room and (live := live_room(paths(max(pool, checkcap.cores()), kind))) is not None \
                     and live < room:
                 room, sized = live, f", sized to the host's free cores (at least {WORKERS_FLOOR})"
             else:
                 sized = ""
             ps, own = paths(pool, kind), own_paths(name, project_max(cfg, (pool, s[1]), kind), kind)
+            # A full run's fewest slots, at most what the pool and its budget can ever give (no deadlock).
+            want = min(run_min(cfg, top), pool) if full and kind is TESTS and not push_key else 1
+            need = 1
             k, files, why = 0, [], f"all {pool} are held"
             try:
                 ahead, extra = [], ({"priority": priority} if priority is not None else None)
@@ -375,17 +397,24 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                     step = age_s(cfg)
                     line = sorted(locks.queued(checkcap.slot_dir(), line_of), key=lambda t: _order_key(t, age=step))
                     ahead = line[:line.index(mine)] if mine in line else line
-                    if (not ahead and not locks.any_free(own) and priority is not None and priority <= 1
+                    if (not ahead and _free(own) < min(want, len(own)) and priority is not None and priority <= 1
                             and (recs := locks.holder_records(own))
                             and all(_rank(r) > 1 for r in recs) and locks.any_free(urgent := urgent_paths(name, top, kind))):
                         own, what = urgent, f"{kind.name} slots (urgent: its project's budget is held by less urgent runs)"
-                if own and not push_key and not locks.any_free(own):
+                short = False   # its project's budget has fewer free than a full run's fewest slots
+                if want > 1:
+                    need = min(want, len(own)) if own else want
+                    if own:
+                        mine_free = _free(own)
+                        free, short = min(free, mine_free), mine_free < need
+                if own and not push_key and (short or not locks.any_free(own)):
                     # At its project's budget: out of the host's line so others go first, keeping its
                     # place in its project's line.
                     locks.dequeue(ticket)
                     ticket, why = None, (f"its project holds its {len(own)} (checks.{kind.setting(kind.budget)[1]}"
                                          + (", or checks.test_project_max x one run's grant" if kind is TESTS else "")
-                                         + ")")
+                                         + ")" + (f"; a full run starts with at least {need} free (checks.{RUN_MIN_KEY})"
+                                                  if short else ""))
                 elif ahead:
                     # An earlier waiter of its project goes back into the host's line first.
                     locks.dequeue(ticket)
@@ -400,8 +429,16 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                     if ticket is None:
                         ticket = locks.enqueue(checkcap.slot_dir(), kind.resource, holder, arrival, group=name)
                     q = locks.queued(checkcap.slot_dir(), kind.resource)
-                    if q and q[0] == ticket:
-                        k, files = _take(ps, own, room, holder, what, extra)
+                    if q and q[0] == ticket and free < need:
+                        # First in line, it keeps its place until a full run's fewest slots are free.
+                        why = (f"a full run starts with at least {need} free (checks.{RUN_MIN_KEY}); "
+                               f"{free} free now")
+                    elif q and q[0] == ticket:
+                        k, files = _take(ps, own, max(room, need), holder, what, extra)
+                        if k < need:   # another holder took some in the same instant: wait for them again
+                            for f in files:
+                                f.close()
+                            k, files, why = 0, [], f"a full run starts with at least {need} free (checks.{RUN_MIN_KEY})"
                     elif q:
                         why = f"{q.index(ticket) if ticket in q else len(q)} ahead in the host's line"
             except OSError as e:

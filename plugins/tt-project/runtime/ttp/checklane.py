@@ -190,20 +190,27 @@ def run_cores(cfg: dict | None = None, n_cores: int | None = None) -> int:
 
 
 def capacity(cfg: dict | None = None, held: int = 0, n_cores: int | None = None, load: float | None = None,
-             mem_gib: float | None = None) -> dict:
+             mem_gib: float | None = None, used: int | None = None) -> dict:
     """The lanes of one repository the host runs now with checks.slots unset (above): `held` running plus
     the runs its spare cores (cores less the 1-minute load average, which counts the running ones) and
     available memory fit, at one run's cores (`run_cores`: its test grant, testslots.sizes, at least
-    CORES_PER_LANE) and GIB_PER_LANE each; at most `top` (the runs the cores hold), never below `floor`
-    (default_slots()). An unreadable load average fits none, as does checks.load_extra 0 (nothing grows
-    with the load: checkcap.extra_max). Returns n and its inputs."""
+    CORES_PER_LANE) and GIB_PER_LANE each; at most `top` (the runs the cores hold, and the runs the test pool
+    fills at a full grant: testslots.pool_now with `used` of its slots held, over run_max), never below
+    `floor` (default_slots()), so no lane opens to start on a grant of one or two workers. An unreadable
+    load average fits none, as does checks.load_extra 0 (nothing grows with the load: checkcap.extra_max).
+    Returns n and its inputs."""
     c = checkcap.cores() if n_cores is None else n_cores
     m = _mem_gib() if mem_gib is None else mem_gib
     ld = checkcap._load() if load is None else load
     floor = default_slots(c, m, cfg)
     run = run_cores(cfg, c)
-    top = max(floor, c // run)
-    fit = int(max(0.0, c - ld) // run) if ld == ld and checkcap.extra_max() else 0
+    top = c // run
+    if s := testslots.sizes(cfg, cores=c):
+        if used is None:
+            used = len(locks._slot_labels(testslots.paths(max(s[0], c))))
+        top = min(top, max(1, testslots.pool_now(cfg, s[0], used, cores=c, load=ld) // s[1]))
+    top = max(floor, top)
+    fit = min(top, int(max(0.0, c - ld) // run)) if ld == ld and checkcap.extra_max() else 0
     if m is not None:
         fit = min(fit, int(max(0.0, m) // GIB_PER_LANE))
     held = max(0, int(held or 0))

@@ -1201,7 +1201,8 @@ queues behind routine work; nothing running is interrupted:
   0 turns them off); check commands run under `nice -n 10`/`ionice -c3` (idle IO) unless `checks.nice` is false (`checks.nice` N, 0-19, sets the level, else `runner.nice`; `checks.ionice` `idle` or `best-effort[:0-7]`; both per project or account). Each check
   run also takes test-worker slots from a host pool shared by all projects (testslots: default half the cores, at
   least 2; at most min(8, half the pool) per run; `checks.test_pool`, `checks.test_run_max`, 0 pool turns it off;
-  a project may only lower them) and passes its grant as PYTEST_XDIST_AUTO_NUM_WORKERS and TTP_TEST_SLOTS (a
+  a project may only lower them; a full `ttp checks` run waits until `checks.test_run_min` are free, default
+  max(2, half a run's grant), and a repository opens no more checks lanes than the pool fills at a full grant) and passes its grant as PYTEST_XDIST_AUTO_NUM_WORKERS and TTP_TEST_SLOTS (a
   suite's `-n auto` uses the whole grant). A project's test-worker budget is its checks at once
   (`checks.test_project_max`, below) times one run's grant, at most the pool, so every check under that cap gets its
   workers (3 checks at once with a grant of 8 make a budget of 24: each run gets 8, never the whole budget); `checks.test_project_slots` (chat-settable, a whole number of at least 1) sets the budget outright.
