@@ -162,3 +162,46 @@ def test_a_running_run_metered_from_its_stream_carries_its_basis(env):
     Daemon(p.base).meter_running()
     row = p.db.one("SELECT cost_usd, cost_basis FROM runs WHERE id=?", (rid,))
     assert row["cost_usd"] > 0 and row["cost_basis"] == "tokens", row
+
+
+def test_a_cut_off_codex_run_priced_from_its_rollout_tokens_is_booked_as_tokens(env):
+    """A Codex run cut off mid-turn: its cost is priced from its rollout's running token counts
+    (_priced_from_tokens), so its basis is "tokens", never the elapsed-time "elapsed" guess."""
+    from ttp.daemon import Daemon, _priced_from_tokens
+    from ttp.providers import get_provider
+    home = env["tmp"] / "codex-home"
+    (home / "sessions" / "2026" / "11" / "01").mkdir(parents=True)
+    started = time.time() - 60
+    stamp = lambda off: time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(started + off))
+
+    def _count(ts, inp, cached, out):
+        usage = {"input_tokens": inp, "cached_input_tokens": cached, "output_tokens": out}
+        return {"timestamp": ts, "type": "event_msg",
+                "payload": {"type": "token_count", "info": {"total_token_usage": usage}}}
+
+    counts = [_count(stamp(-5), 1000, 0, 200), _count(stamp(30), 6000, 2000, 500)]
+    (home / "sessions" / "2026" / "11" / "01" / "rollout-2026-11-01T10-00-00-0199eeee-ffff.jsonl").write_text(
+        "".join(json.dumps(rec) + "\n" for rec in counts))
+    # no turn.completed: parse leaves the run unpriced (estimated, no cost), so finish_run prices it
+    lines = [{"type": "thread.started", "thread_id": "0199eeee-ffff"},
+             {"type": "item.completed", "item": {"type": "agent_message", "text": "half done"}}]
+    p = make(env)
+    p.set_config("pricing", {"codex": {"opus": [1.0, 0.1, 2.0]}})
+    run = _basis_run(Daemon(p.base), "codex", lines, budget_usd=4.0, timeout_s=1200)
+    assert run["cost_basis"] == "elapsed", dict(run)   # without its rollout it is an elapsed guess
+    run_dir = Path(run["dir"])
+    spec = json.loads((run_dir / "run.json").read_text())
+    spec["env"] = {"CODEX_HOME": str(home)}
+    (run_dir / "run.json").write_text(json.dumps(spec))
+    exit_info = {"rc": 0, "started": started, "ended": time.time(), "stopped": "budget", "slept_s": 0}
+    prov = get_provider("codex").use(run["model"], {"opus": [1.0, 0.1, 2.0]})
+    priced = _priced_from_tokens(run_dir, exit_info, None, prov)
+    assert priced and priced > 0, "the rollout's token counts should price the cut-off run"
+    assert priced == pytest.approx((6000 - 2000 - 2000) * 1.0 / 1e6 + 2000 * 0.1 / 1e6 + 500 * 2.0 / 1e6), priced
+    p.db.x("UPDATE runs SET status='running', cost_usd=0, cost_estimated=0, cost_basis=NULL WHERE id=?",
+            (run["id"],))
+    Daemon(p.base).finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (run["id"],)), exit_info)
+    run = p.db.one("SELECT * FROM runs WHERE id=?", (run["id"],))
+    assert run["cost_estimated"] == 1 and run["cost_basis"] == "tokens", dict(run)
+    assert run["cost_usd"] == pytest.approx(priced), dict(run)
+    assert run["cost_usd"] != pytest.approx(2.0), "priced from its tokens, not the elapsed half of its budget"

@@ -3429,8 +3429,14 @@ class Daemon:
         failed_resume = not stopped and not slept and (exit_info.get("rc") != 0 or usage.error) \
             and not _has_tokens(usage) and _resume_never_started(json.loads(r["note"] or "{}"), usage)
         if usage.estimated and not usage.cost_usd and not failed_resume:
-            usage.cost_usd = _cut_off_cost(run_dir, exit_info, usage, prov)
-            basis = "elapsed" if usage.cost_usd else basis
+            # a run cut off mid-turn is priced from the tokens its rollout still counted (Codex's
+            # running totals); only a real elapsed-time guess is booked as an "elapsed" guess
+            priced_tokens = _priced_from_tokens(run_dir, exit_info, usage, prov)
+            if priced_tokens:
+                usage.cost_usd, basis = priced_tokens, "tokens"
+            else:
+                usage.cost_usd = _cut_off_cost(run_dir, exit_info, usage, prov)
+                basis = "elapsed" if usage.cost_usd else basis
         # A run routed to another provider (route.py): booked at its pricing rows, else zero and unpriced.
         routed = route.of(r["note"]) if r["role"] == "worker" else None
         on_route = bool(routed) and r["provider"] == routed.get("to")
@@ -13603,6 +13609,23 @@ def _shared(task: dict) -> list[str]:
     return [lb.split(":", 1)[1] for lb in json.loads(task["labels"] or "[]") if lb.startswith("resource:")]
 
 
+def _priced_from_tokens(run_dir: Path, exit_info: dict, usage=None, prov=None) -> float | None:
+    """The provider's price of the tokens it can still count for a run that ended mid-turn (Codex:
+    its rollout's running token totals), or None when it cannot price them."""
+    if prov is None or not exit_info.get("started"):
+        return None
+    try:
+        spec = json.loads((run_dir / "run.json").read_text())
+    except (OSError, ValueError):
+        return None
+    env = spec.get("env") if isinstance(spec.get("env"), dict) else {}
+    try:
+        priced = prov.cut_off_cost(run_dir / "output.jsonl", float(exit_info["started"]), env)
+    except Exception:
+        return None
+    return round(priced, 4) if priced else None
+
+
 def _cut_off_cost(run_dir: Path, exit_info: dict, usage=None, prov=None) -> float:
     """A run that ended without any usage to price still spent money: Codex reports usage only when
     a turn completes, and Cursor's result has none at all. Book the tokens the provider can still
@@ -13624,13 +13647,9 @@ def _cut_off_cost(run_dir: Path, exit_info: dict, usage=None, prov=None) -> floa
     if silent and not tokens and (prov is None or prov.streams(spec.get("argv") or [])):
         return 0.0
     if prov is not None and exit_info.get("started"):   # Codex: the tokens its rollout counted
-        env = spec.get("env") if isinstance(spec.get("env"), dict) else {}
-        try:
-            priced = prov.cut_off_cost(run_dir / "output.jsonl", float(exit_info["started"]), env)
-        except Exception:
-            priced = None
+        priced = _priced_from_tokens(run_dir, exit_info, usage, prov)
         if priced:
-            return round(priced, 4)
+            return priced
     budget = float(spec.get("budget_usd") or spec.get("default_budget_usd") or 0)
     timeout = float(spec.get("timeout_s") or 0)
     elapsed = float(exit_info.get("ended") or time.time()) - float(exit_info.get("started") or 0)
@@ -13801,8 +13820,9 @@ def _ids(ids: list) -> str:
 def _cost_basis(usage) -> str:
     """How a run's figure is known, as its provider parsed it: "reported" when the CLI reported it
     (a chat run's fallback figure is Claude Code's own report), else "tokens" (priced from its token
-    counts; Daemon._priced fills a missing one). finish_run makes it "elapsed" when _cut_off_cost
-    books the elapsed share of the budget instead."""
+    counts; Daemon._priced fills a missing one). finish_run makes it "elapsed" only when it books the
+    elapsed share of the budget (_cut_off_cost's fallback); a cut-off run priced from its rollout's
+    token counts is "tokens"."""
     how = usage.extra.get("cost_basis")   # chat runs (providers/chat.py)
     if how == "pricing":
         return "tokens"
