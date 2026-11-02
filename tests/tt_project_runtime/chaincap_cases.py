@@ -444,6 +444,43 @@ def test_a_split_head_with_no_review_whose_hop_stalls_gets_one_now_and_a_hop_sta
     assert d.sweep_unreviewed(force=True) == [tid] and not _daemon_reviews(p, hop)
 
 
+def test_a_done_hop_with_no_commits_past_an_unreviewed_split_head_still_gets_a_review(env):
+    """A done hop with no commits past its split head, whose own finish-time review was never queued (a review
+    cap, a failed diff read, a crash), is reviewed by the sweep: its split task counts it as the carrier, so
+    skipping it too would leave the chain unreviewed. With a split review of that head (queued, running or
+    passed) it is not reviewed twice."""
+    from ttp import chaincap
+    from ttp import daemon as dm
+    p = make(env)
+    d = dm.Daemon(p.base)
+    for same_branch in (True, False):
+        tid, branch, head = _unreviewed(env, p, f"split change {same_branch}")
+        _split_at(p, tid, head)
+        hop, hop_head = _hop_on(env, p, tid, commit=False)
+        if same_branch:
+            p.db.update_task(hop, branch=branch)
+        assert hop_head == head
+        p.db.update_task(hop, status="done", result=json.dumps({"status": "done", "summary": "nothing new"}))
+        when = time.time() - 600
+        p.db.x("UPDATE tasks SET updated=? WHERE id=?", (when, hop))
+        _ran(p, hop, when)
+        assert d.sweep_unreviewed(force=True) == [hop], same_branch
+        assert len(_daemon_reviews(p, hop)) == 1 and not _daemon_reviews(p, tid)
+    for st in ("queued", "running", "done"):
+        tid, _, head = _unreviewed(env, p, f"reviewed split {st}")
+        _split_at(p, tid, head)
+        hop, _ = _hop_on(env, p, tid, commit=False)
+        p.db.update_task(hop, status="done", result=json.dumps({"status": "done", "summary": "nothing new"}))
+        when = time.time() - 600
+        p.db.x("UPDATE tasks SET updated=? WHERE id=?", (when, hop))
+        _ran(p, hop, when)
+        rev = p.db.add_task(f"Review #{tid}", "Review it.", kind="review", origin="daemon", depends_on=[tid],
+                            labels=[f"auto_review:{tid}", f"{chaincap.SPLIT_REVIEW_LABEL}{head}"])
+        p.db.update_task(rev, status=st)
+        assert d.sweep_unreviewed(force=True) == [], st
+        assert not _daemon_reviews(p, hop), st
+
+
 def test_the_hop_delivering_after_its_split_head_review_gets_a_review_of_only_its_new_commits(env):
     """Once the split head's own review ran, the hop's later delivery gets a review of only the commits after
     that head; while that review is still queued, it folds into the hop's review (one review of the chain)."""

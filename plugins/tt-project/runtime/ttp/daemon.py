@@ -12060,7 +12060,12 @@ class Daemon:
         if not tip:
             return "no branch"
         cont = db.task(continues_id(t) or 0)
-        if cont and chaincap.split_head(cont) and tip == chaincap.split_head(cont):
+        # A hop with no commits past its split head adds nothing to review, once that head has a review of its
+        # own (queued, running or passed) or the hop stalls (the split task's own review then covers the head).
+        # A done hop's split task counts the hop as its carrier: with no such review, this hop gets one.
+        if cont and (sh := chaincap.split_head(cont)) and tip == sh and (chaincap.hop_stall(t, now) or db.one(
+                "SELECT 1 FROM tasks WHERE kind='review' AND status IN ('queued','running','done') AND labels LIKE ?",
+                (f'%"{chaincap.SPLIT_REVIEW_LABEL}{sh}"%',))):
             return f"no commits past the split head of #{cont['id']} it continues"
         ended = db.one("SELECT MAX(ended) e FROM runs WHERE task=?", (tid,))["e"]
         start = float(ended or t["updated"] or 0)
