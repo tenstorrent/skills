@@ -440,3 +440,39 @@ def test_gone_after_zero_keeps_every_chat_a_reader(env):
     assert not chatgone.chats(p, p.db, p.config(), time.time())[0]["gone"]
     Daemon(p.base).check_chats()
     assert not p.db.q("SELECT id FROM messages WHERE ref='chat-silent:c1'")
+
+
+def test_web_app_need_you_pill_counts_only_what_needs_the_user():
+    """The header pill matches the 'Needs you now' card: open asks plus blocked tasks that wait on
+    the user, plus gated tasks an open ask does not already count. A project-owned blocked task or
+    an ask naming its gated task is not counted twice."""
+    import shutil, subprocess
+    js = (RUNTIME / "ttp" / "web" / "app.js").read_text()
+    node = shutil.which("node")
+    if not node:
+        return
+    block = js[js.index("const stuck ="):js.index("function board")]
+    run = """
+const out = {};
+const st = (tasks, attention, gate) => ({ attention, tasks: tasks.map((t) => Object.assign(t, gate ? { gate: gate } : {})) });
+const ask = (text, id) => ({ kind: "ask", id, text, ts: 0 });
+const blocked = (kind) => ({ id: 1, status: "blocked", wait: { kind, text: "you" } });
+// 1 ask + 1 project-owned blocked task (waits on the coordinator, not the user) -> 1
+out.one = needsYou(st([blocked("coordinator")], [ask("merge?", 1)]));
+// 1 ask + 1 user-wait task -> 2
+out.two = needsYou(st([blocked("user")], [ask("approve?", 2)]));
+// nothing -> 0 (the pill hides)
+out.none = needsYou({ attention: [], tasks: [] });
+// a gated task with no open ask naming it, with an attention alert (not an ask): alert + gated task
+out.gated = needsYou(st([{ id: 3, status: "queued" }], [{ kind: "alert", id: 5, text: "disk" }], { ask: true }));
+// an open ask naming the gated task as #3: the ask counts once, the task is not double-counted
+out.dedup = needsYou(st([{ id: 3, status: "queued" }], [ask("approve #3?", 4)], { ask: true }));
+console.log(JSON.stringify(out));
+"""
+    r = subprocess.run([node, "-e", block + run], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    # The alert attention (1) plus the gated task (1): the gated task counts when no ask names it.
+    assert out == {"one": 1, "two": 2, "none": 0, "gated": 2, "dedup": 1}
+    # The pill uses needsYou; the old count of every blocked task plus attention is gone.
+    assert "const needs = needsYou(st)" in js and "filter((t) => t.status === \"blocked\").length" not in js

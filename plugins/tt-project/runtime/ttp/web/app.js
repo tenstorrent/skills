@@ -205,6 +205,16 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) unse
 
 // Blocked tasks that wait on the user (kind "user"), or on anything else (no kind).
 const stuck = (st, kind) => st.tasks.filter((t) => t.status === "blocked" && t.wait && (kind ? t.wait.kind === kind : t.wait.kind !== "user"));
+// What needs the user: open asks (problems and alerts wait on the project) plus blocked tasks that
+// wait on the user, plus queued tasks gated on an open ask, minus a gated task its open ask already
+// counts (an ask names it as #<id>, so the ask is counted once, not once per task).
+function needsYou(st) {
+  const ids = new Set();
+  for (const m of st.attention || []) if (m.kind === "ask")
+    for (const hit of String(m.text || "").matchAll(/#(\d+)/g)) ids.add(+hit[1]);
+  return (st.attention || []).length + stuck(st, "user").length +
+    (st.tasks || []).filter((t) => t.status === "queued" && t.gate && t.gate.ask && !ids.has(t.id)).length;
+}
 function board(st) {
   const asks = st.attention.filter((m) => m.kind === "ask");
   // An item is its text, cut to fit, then an optional HTML tail (an age).
@@ -311,7 +321,7 @@ async function refresh() {
   $("#daemon").title = st.pause ? st.pause.text : "";
   text($("#spend"), h.spend.headline || `24h ${money(h.spend.spent_24h)}`);
   $("#spend").title = h.spend.detail || "all providers";
-  const needs = st.tasks.filter((t) => t.status === "blocked").length + (st.attention || []).length;
+  const needs = needsYou(st);
   $("#needs").hidden = !needs; text($("#needs"), `${needs} need${needs === 1 ? "s" : ""} you`);
   $("#hostline").hidden = !h.host; text($("#hostline"), h.host || "");
   $("#sleepline").hidden = !h.idle_sleep; text($("#sleepline"), h.idle_sleep || "");
