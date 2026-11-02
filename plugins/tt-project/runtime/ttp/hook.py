@@ -268,6 +268,10 @@ CAT_SUBST_RE = re.compile(r"\$\(\s*(?:cat\s+|<\s*)[\"']?([^\s\"')]+)|`\s*cat\s+[
 # Commands that copy or rename a file: what runs the new name runs the old one's text
 COPIES = {"mv", "cp", "ln", "install"}
 OPTS_WITH_VALUE = {"-u", "--unset", "-C", "--chdir", "-s", "--signal", "-k", "--kill-after", "-n", "--adjustment"}
+# xargs options whose value is the rest of the word or else the next one (`-a FILE`, `-I {}`), and its long
+# ones that take the next word when they carry no `=` (getopt takes an unambiguous prefix too)
+XARGS_VALUE_LETTERS = "adEILnPs"
+XARGS_LONG_WITH_VALUE = ("--arg-file", "--delimiter", "--max-args", "--max-procs", "--max-chars", "--process-slot-var")
 SCRIPT_MAX_BYTES = 1 << 20
 
 
@@ -580,13 +584,16 @@ def _segments(cmd: str, strip: bool = True) -> list[list[str]]:
 def _strip_prefix(argv: list[str], ttp_wrappers: list[list[str]] | None = None) -> list[str]:
     """`argv` without its wrappers; each `ttp lock|clip|detach|sandbox|secret env ... --` stripped is added to
     `ttp_wrappers` when given."""
-    i = 0
+    i, xargs = 0, False
     while i < len(argv):
         w = argv[i]
-        if w in OPTS_WITH_VALUE:   # env -u NAME, timeout -s KILL, nice -n 5 ...
+        if xargs and w.startswith("-") and w != "-":   # xargs -a FILE, --arg-file FILE, -0I {} ...
+            i += 2 if _xargs_takes_next(w) else 1
+        elif w in OPTS_WITH_VALUE:   # env -u NAME, timeout -s KILL, nice -n 5 ...
             i += 2
         elif re.match(r"^\w+=", w) or w.startswith("-") or re.fullmatch(r"\d+[smhd]?", w) \
                 or os.path.basename(w) in WRAPPERS or w in RESERVED:
+            xargs = os.path.basename(w) == "xargs"
             i += 1
         elif w == "ttp" and (argv[i + 1:i + 2] in (["lock"], ["clip"], ["detach"], ["sandbox"])
                              or argv[i + 1:i + 3] == ["secret", "env"]) and "--" in argv[i:]:
@@ -597,6 +604,18 @@ def _strip_prefix(argv: list[str], ttp_wrappers: list[list[str]] | None = None) 
         else:
             break
     return argv[i:]
+
+
+def _xargs_takes_next(opt: str) -> bool:
+    """Whether xargs option word `opt` takes the next word as its value."""
+    if opt.startswith("--"):
+        return len(opt) > 2 and "=" not in opt and any(o.startswith(opt) for o in XARGS_LONG_WITH_VALUE)
+    for j, c in enumerate(opt[1:], 1):
+        if c in XARGS_VALUE_LETTERS:
+            return j == len(opt) - 1
+        if c in "eil":   # -e[EOF], -i[R], -l[N]: an optional value, only in the same word
+            return False
+    return False
 
 
 def _interpreter_args(argv: list[str]) -> str | None:
@@ -1089,6 +1108,30 @@ def _pytest_args(argv: list[str]) -> list[str] | None:
     return None
 
 
+def _inline_code(argv: list[str]) -> str | None:
+    """The code of `python -c CODE` (also `-Ic CODE`, `-cCODE`), else None."""
+    if not argv or not re.fullmatch(r"python[\d.]*", os.path.basename(argv[0])):
+        return None
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if not a.startswith("-") or a in ("-", "--"):
+            return None   # a script or stdin
+        if a.startswith("--"):   # --check-hash-based-pycs MODE, --version ...
+            i += 2 if a == "--check-hash-based-pycs" else 1
+            continue
+        for j, c in enumerate(a[1:], 1):
+            if c == "c":
+                return a[j + 1:] or (argv[i + 1] if i + 1 < len(argv) else None)
+            if c in "mWXQ":   # -m MOD runs a module; -W/-X/-Q take the rest of the word or the next one
+                if c == "m":
+                    return None
+                i += 0 if a[j + 1:] else 1
+                break
+        i += 1
+    return None
+
+
 def _pytest_parts(args: list[str], rel: str) -> tuple[set[str], set[tuple[str, str]]]:
     """(the paths a pytest run names, relative to the repository's top, "." when it names none;
     its selecting options as (option, value)). An option not known to take a value is a flag: its
@@ -1324,7 +1367,8 @@ def _device_lock(words: list[str]) -> bool:
 
 def _unsandboxed_test(commands: str, kept: bool, depth: int = 0) -> tuple[list[str], int, bool] | None:
     """(the simple command, where its test command starts, whether a ttp wrapper is before it) for
-    the first pytest or ctest run in `commands` (or in a `sh -c` string there) that neither `ttp
+    the first pytest or ctest run in `commands` (or in a `sh -c` string there, or `python -c` code
+    that runs pytest, _runs_pytest) that neither `ttp
     sandbox` (when `kept`: the command keeps TTP_NO_DEVICE, which tells it to hide the devices) nor a
     sanctioned way to a device (a device `ttp lock`, `ttp devq`) wraps; None when there is none."""
     for raw in _segments(commands, strip=False):
@@ -1338,7 +1382,7 @@ def _unsandboxed_test(commands: str, kept: bool, depth: int = 0) -> tuple[list[s
             if not argv:
                 continue
         name = os.path.basename(argv[0])
-        if _pytest_args(argv) is not None or name == "ctest":
+        if _pytest_args(argv) is not None or name == "ctest" or _runs_pytest(_inline_code(argv) or ""):
             return raw, len(raw) - len(argv), bool(wrappers)
         if name in SHELLS and depth < 3:
             inner = next((argv[i + 1] for i, a in enumerate(argv[1:-1], 1) if re.fullmatch(r"-[a-z]*c[a-z]*", a)), None)
@@ -1387,8 +1431,8 @@ def _sandboxed_at(cmd: str, raw: list[str], k: int, wrapped: bool) -> str | None
     REWRITE_BEFORE_RE allows (so never fed by a pipe), with no stdin redirect of its own; else None.
     A pipe after it (the first member of a pipeline), `&`, `)` and loop words keep their meaning. Only those characters
     are added: every other byte, redirections, the pipe's tail and heredoc bodies too, stays as written."""
-    if REWRITE_NOT_AFTER & {os.path.basename(w) for w in raw[:k]}:
-        return None
+    if REWRITE_NOT_AFTER & {os.path.basename(w) for w in raw[:k]} or _inline_code(raw[k:]) is not None:
+        return None   # `python -c` code that runs pytest is refused, as a script on stdin is
     lines, pending, at = [], [], 0     # (offset in cmd, text) of each line the shell reads as commands
     for line in cmd.split("\n"):
         start, at = at, at + len(line) + 1

@@ -419,12 +419,32 @@ def test_the_hook_rewrites_a_trailing_no_device_test_run_into_the_sandbox(cmd, n
     "python3 - <<'EOF'\nimport pytest\npytest.main(['-q', 'tests'])\nEOF",
     "cd x && python3 - <<EOF\nimport subprocess, sys\nsubprocess.run([sys.executable, '-m', 'pytest', '-q'])\nEOF",
     "python3 - <<'EOF'\nimport os\nos.system('pytest -q')\nEOF",
+    "xargs -a list.txt pytest -q", "xargs --arg-file=list.txt pytest", "xargs --arg-file list.txt pytest",
+    "xargs -alist.txt pytest", "xargs -0 -a list.txt -P 4 pytest", "xargs -ra list.txt pytest", "xargs -a l -- pytest",
+    "xargs -I {} pytest {} < list.txt", "cd x && xargs -n 1 -a list.txt timeout 60 python3 -m pytest -q",
+    "python3 -c 'import pytest; pytest.main([\"-q\", \"tests\"])'",
+    "python -c \"import subprocess, sys; subprocess.run([sys.executable, '-m', 'pytest', '-q'])\"",
+    "python3 -Ic 'import os; os.system(\"pytest -q\")'", "python3 -W ignore -Bc'import pytest;pytest.main()'",
+    "cd x && uv run python3 -c 'import pytest; raise SystemExit(pytest.main())' 2>&1 | tail -3",
+    "bash -c \"python3 -c 'import pytest; pytest.main()'\"",
 ])
 def test_the_hook_refuses_a_no_device_test_run_it_cannot_rewrite_alone(cmd, tmp_path, monkeypatch):
     from ttp import hook
     out = _device_hook(monkeypatch, tmp_path, rewrite=True)(cmd)
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny" and "updatedInput" not in out["hookSpecificOutput"]
     assert [json.loads(x)["kind"] for x in (tmp_path / hook.REFUSALS_FILE).read_text().splitlines()] == ["no_device"]
+
+
+@pytest.mark.parametrize("cmd", [
+    "python3 -c 'import json, sys; print(json.load(sys.stdin)[\"pytest\"])' < a.json",
+    "python3 -c 'print(\"pytest.main([])\")'", "python3 -c 'import pytest; print(pytest.__version__)'",
+    "python3 -m json.tool a.json", "xargs -a list.txt grep -l pytest", "xargs -I {} echo pytest {}",
+    "ttp clip -- ttp sandbox -- python3 -c 'import pytest; pytest.main()'",
+])
+def test_the_hook_allows_python_c_and_xargs_runs_that_run_no_test(cmd, tmp_path, monkeypatch):
+    from ttp import hook
+    assert _device_hook(monkeypatch, tmp_path, rewrite=True)(cmd) is None
+    assert not (tmp_path / hook.REFUSALS_FILE).exists()
 
 
 @pytest.mark.parametrize("cmd", ["TTP_NO_DEVICE=0 pytest -q", "env -i PATH=$PATH pytest", "unset TTP_NO_DEVICE; pytest",
