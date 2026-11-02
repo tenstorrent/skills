@@ -1729,6 +1729,72 @@ def test_a_finished_push_result_wakes_at_light_and_a_push_that_did_not_land_at_t
                 else "batch ended without an outcome") in res["woke"], res["woke"]
 
 
+def _push_handoff_task(p, tmp_path, marker_body, kind="code", **hand):
+    """A `kind` task whose last run handed off waiting on its own detached push (`ttp push --result
+    <marker> --pushed`), its marker holding `marker_body`, with the hand-off fields `hand`."""
+    from ttp import push
+    now = time.time()
+    tid = p.db.add_task("land the fix", "s", kind=kind, tier="standard", origin="user")
+    marker = tmp_path / f"push-{tid}.json"
+    marker.write_text(json.dumps({"target": "main", "log": str(tmp_path / "push.log"), **marker_body}))
+    (tmp_path / "push.log").write_text("ttp push: rebasing\nerror: the remote rejected the push\n")
+    run_dir = tmp_path / f"run-{tid}"
+    run_dir.mkdir()
+    p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir) VALUES(?,?,?,?,?,?,?)",
+           (tid, "worker", "fake", now - 120, now - 60, "ok", str(run_dir)))
+    full = {"status": "waiting", "summary": "approved; pushing it", "waiting_for": "my push", "retry_after_s": 900,
+            "retry_when": push.result_probe(marker, p) + " --pushed", **hand}
+    (run_dir / "result.json").write_text(json.dumps(full))
+    p.db.update_task(tid, status="queued", not_before=now + 3600, result=json.dumps({**full, "waiting_since": now - 60}))
+    return tid
+
+
+@pytest.mark.parametrize("kind, hand, summary", [
+    ("code", {"on_pass": {"status": "done", "summary": "landed the fix"}}, "landed the fix"),
+    ("review", {}, "approved; pushing it (Its push landed"),
+    ("code", {"resolves": ["n1"]}, "approved; pushing it (Its push landed")])
+@pytest.mark.parametrize("body", [{"status": "pushed", "sha": "a" * 40},
+                                  {"kind": "batch", "outcome": "landed", "phase": "finished"}])
+def test_a_waiting_hand_off_whose_push_landed_records_its_on_pass_model_free(env, monkeypatch, tmp_path, kind,
+                                                                             hand, summary, body):
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tid = _push_handoff_task(p, tmp_path, body, kind=kind, **hand)
+    _settle_probe(d, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert task["status"] == "done" and res["run_status"] == "model-free", (task["status"], res)
+    assert res["summary"].startswith(summary), res["summary"]
+    assert res.get("resolves") == hand.get("resolves"), res
+    assert "its push landed: recorded its on_pass (done) model-free" in (p.logs / "daemon.log").read_text()
+
+
+@pytest.mark.parametrize("body, hand, woke", [
+    ({"status": "failed", "exit": 4, "reason": "a check failed"}, {"on_pass": {"status": "done", "summary": "x"}},
+     "its push did not land: a check failed"),
+    ({"kind": "batch", "outcome": "refused", "phase": "finished", "message": "not reviewed"},
+     {"on_pass": {"status": "done", "summary": "x"}}, "its push did not land: batch refused (not reviewed)"),
+    ({"kind": "batch", "outcome": "nothing", "phase": "finished"}, {"on_pass": {"status": "done", "summary": "x"}},
+     "its push finished without pushing"),
+    ({"status": "pushed", "sha": "a" * 40}, {"next_step": "report the push"}, "probe passed"),
+    ({"status": "pushed", "sha": "a" * 40}, {"on_pass": {"status": "waiting", "summary": "x"}},
+     "its on_pass was not applied: on_pass status must be done or needs_review")])
+def test_a_push_wait_that_did_not_land_or_leaves_work_still_wakes_the_task(env, monkeypatch, tmp_path, body, hand,
+                                                                          woke):
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tid = _push_handoff_task(p, tmp_path, body, **hand)
+    _settle_probe(d, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert _ready(p, tid) and task["status"] == "queued", (task["status"], res)
+    assert woke in res["woke"], res["woke"]
+
+
 def test_a_running_batch_without_an_outcome_is_not_read_as_a_push_that_did_not_land(tmp_path):
     from ttp import locks, push
     lock, marker = tmp_path / "run.lock", tmp_path / "batch-1.json"

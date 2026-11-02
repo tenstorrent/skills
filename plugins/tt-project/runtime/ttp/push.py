@@ -4649,6 +4649,16 @@ def unpushed(marker: Path) -> str:
     return str(m.get("reason") or f"exit {m.get('exit')}")
 
 
+def pushed(marker: Path) -> bool:
+    """Whether the finished push of `marker` landed its commits: a batch whose outcome is pushed or
+    landed, or a single push with status pushed. Running, queued, nothing to push, failed, refused or
+    an unreadable marker: False."""
+    m = _read(Path(marker))
+    if m.get("kind") == "batch":
+        return m.get("outcome") in ("pushed", "landed")
+    return m.get("status") == "pushed"
+
+
 def _pid_alive(pid: Any) -> bool:
     try:
         os.kill(int(pid), 0)

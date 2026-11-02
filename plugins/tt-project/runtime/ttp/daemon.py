@@ -11118,6 +11118,22 @@ class Daemon:
                                      f"the end of checks.out:\n{tail}", now,
                                extra={"wake_tier": tier, "escalated_wake": True})
             return
+        if not got and load_result(task["result"]).get("on_pass_cmd") is None:
+            try:
+                got = self._push_wait(task)
+            except Exception as e:   # a wake is always safe
+                log(self.p, f"task {task['id']}: could not read its push: {type(e).__name__}: {e}")
+                got = None
+            if got and got[0] == "pushed":
+                _, r, run_dir, on_pass = got
+                from .providers.base import RunUsage
+                self._probe_rc.pop(task["id"], None)
+                self._prefetch_remote(task["id"], on_pass, run_dir)
+                with self._finish_tx(task["id"]):
+                    self._finish_worker(r, RunUsage(), "ok", run_dir, "model-free", handoff=on_pass)
+                log(self.p, f"task {task['id']} retry_when probe passed; its push landed: "
+                            f"recorded its on_pass ({on_pass['status']}) model-free")
+                return
         if got:
             why += f"; its on_pass was not applied: {got[1]}"
         else:
@@ -11131,6 +11147,36 @@ class Daemon:
                 why += f"; its on_pass_cmd was not run: {started}"
         more, extra = self._push_landing(task)
         self._wake_waiting(task, why + more, now, extra=extra)
+
+    def _push_wait(self, task: dict) -> tuple | None:
+        """What a passed `ttp push --result <marker>` probe of this task settles when the marker says
+        pushed: ("pushed", run row, run dir, on_pass) for the hand-off's on_pass, or by default its own
+        summary as done (push_on_pass); ("unclear", why); or None when the wait is not on a push, the
+        push did not land (failed, refused, nothing to push: _push_landing wakes it) or the hand-off
+        names an on_pass_cmd (that command decides)."""
+        prev = load_result(task["result"])
+        if task["status"] != "queued" or prev.get("status") != "waiting" or prev.get("on_pass_cmd") is not None:
+            return None
+        got = bud.result_wait(prev.get("retry_when"))
+        if not got or got[0] != "push":
+            return None
+        marker = Path(got[1]).expanduser()
+        if not push.pushed(marker if marker.is_absolute() else self.p.root / marker):
+            return None
+        r = self.p.db.one("SELECT * FROM runs WHERE task=? AND role!='coordinator' ORDER BY id DESC LIMIT 1",
+                          (task["id"],))
+        if not r or r["status"] == "running" or not r["dir"]:
+            return None
+        run_dir = Path(r["dir"])
+        full = _read_result(run_dir / RESULT_FILE) or {}
+        on_pass = full["on_pass"] if "on_pass" in full else push_on_pass(task, full)
+        if on_pass is None:
+            return None
+        if full.get("status") != "waiting" or not _same_probe(full, prev):
+            return "unclear", "the run's result.json is not the hand-off the task waits on"
+        if problem := on_pass_problem(on_pass):
+            return "unclear", problem
+        return "pushed", r, run_dir, with_waiting_followups(on_pass, full)
 
     def _push_finished_unpushed(self, task: dict, now: float) -> None:
         """Its `ttp push --result <marker> --pushed` probe exited 3: the push finished without landing,
@@ -14787,6 +14833,24 @@ def default_on_pass(task: dict, full: dict) -> dict | None:
         return None
     return {"status": "done",
             "summary": f"{summary.strip()} (Its `ttp checks` passed; recorded model-free, the hand-off named no on_pass.)",
+            **{k: full[k] for k in DEFAULT_ON_PASS_KEYS if k in full}}
+
+
+def push_on_pass(task: dict, full: dict) -> dict | None:
+    """The final hand-off to record when a code or review task's waiting hand-off on its own push
+    (`ttp push --result`) names no on_pass and that push landed: `done` with its summary (a review's
+    verdict) and the fields default_on_pass carries. None (the task wakes as before) for another kind,
+    a hand-off with a next_step, an on_pass_cmd, a PR or a wake_tier other than light."""
+    if task.get("kind") not in ("code", "review") or not isinstance(full, dict) or full.get("status") != "waiting":
+        return None
+    if full.get("next_step") or full.get("on_pass_cmd") is not None or full.get("pr") \
+            or full.get("wake_tier") not in (None, "", "light"):
+        return None
+    summary = full.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return None
+    return {"status": "done",
+            "summary": f"{summary.strip()} (Its push landed; recorded model-free, the hand-off named no on_pass.)",
             **{k: full[k] for k in DEFAULT_ON_PASS_KEYS if k in full}}
 
 
