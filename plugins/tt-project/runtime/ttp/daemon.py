@@ -3870,7 +3870,7 @@ class Daemon:
             # The API rejected the request itself (a 400 or a bad schema): a retry, at any tier, fails
             # the same way. The task fails at once (_finish_worker); a resume still starts fresh.
             status = "request_error"
-        fell = route.fell_back(status, exit_info) if on_route and not handed_off else ""
+        fell = route.fell_back(status, exit_info, usage.error) if on_route and not handed_off else ""
         # A routed run that ended without a hand-off on its own (timed out, failed, no valid result.json)
         # also falls back, unless a host sleep cut it (lost to the sleep, as any run).
         own = route.own_cause(status) if on_route and not handed_off and not fell and not slept else ""

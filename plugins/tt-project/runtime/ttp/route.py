@@ -40,7 +40,7 @@ naming the run's supervisor pid and start, freed when the run ends (host_release
 process is gone (a crash, a reboot) or past its run's time limit is dropped by the next reader.
 
 Fallback: a routed run that ended on an endpoint fault (unreachable or timed out: down; 5xx or a
-404: error; a 404 for a model the endpoint does not serve: model_missing; 429 or rate-limit wording: rate_limit; a refused key: auth, through the auth
+404: error; a 404 for a model the endpoint does not serve, or the run's own unrecognized_model error: model_missing; 429 or rate-limit wording: rate_limit; a refused key: auth, through the auth
 gate; an answer that is not JSON: malformed) ends as `fallback` (or `limit`/`auth`), costs no attempt
 and requeues at the same tier; the endpoint then cools down for `providers.chat.route_cooldown_s`
 (COOLDOWN_S), during which the tier's runs start on the core provider. A routed run that ended without
@@ -71,6 +71,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -251,8 +252,14 @@ def of(note) -> dict | None:
     return e if isinstance(e, dict) else None
 
 
-def fell_back(status: str, exit_info: dict) -> str:
-    """Why a routed run on the endpoint fell back, or '' when it ended on its own merits."""
+# The run's own error naming its model as refused (Claude Code's '[claude-code:unrecognized_model]
+# {"model": ...}', an OpenAI-style model_not_found): the endpoint does not serve it.
+MODEL_REFUSED = re.compile(r"\bunrecognized_model\b|\bmodel_not_found\b")
+
+
+def fell_back(status: str, exit_info: dict, error: str = "") -> str:
+    """Why a routed run on the endpoint fell back, or '' when it ended on its own merits; `error` is
+    the run's own error text (a refused model there makes a bridge `error` or no fault model_missing)."""
     if status == "auth":
         return "auth"
     if status == "limit":
@@ -260,6 +267,8 @@ def fell_back(status: str, exit_info: dict) -> str:
     if status not in FAULT_ENDS:
         return ""
     fault = str((exit_info.get("bridge") or {}).get("last_fault") or "")
+    if fault in ("", "error") and MODEL_REFUSED.search(error or ""):
+        return "model_missing"
     if fault in FAULTS:
         return fault
     if str(exit_info.get("launch_error") or "").find("chat bridge:") >= 0:

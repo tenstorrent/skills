@@ -1237,6 +1237,46 @@ def test_a_routed_tier_whose_model_is_gone_falls_back_once_then_holds(env, monke
     assert any(l.startswith("routing: light held since now: chat does not serve " + _RT_MODEL) for l in lines), lines
 
 
+def test_a_routed_run_refused_its_model_by_claude_code_holds_the_tier_with_one_notice(env, monkeypatch):
+    """Note 6f381cadcd4517c0: '[claude-code:unrecognized_model] {"model": ...}' with bridge fault `error`
+    only cooled the endpoint 900 s, so every light run re-hit it; it is model_missing, held, one notice."""
+    from ttp import route
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p, route_cooldown_s=600)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    alerts = []
+    monkeypatch.setattr(d, "alert", lambda key, text, severity="high", **k: alerts.append((key, severity)))
+    refused = '[claude-code:unrecognized_model] {"model":"%s"}' % _RT_MODEL
+    for n, last_fault in enumerate(("error", "", "error")):
+        tid = p.db.add_task(f"build{n}", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+        p.db.update_task(tid, status="running")
+        rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) "
+                     "VALUES(?,'worker','chat',?,?,'running',?,?)", (tid, _RT_MODEL, time.time() - 30, d.boot,
+                     json.dumps({"route": {"tier": "light", "to": "chat", "model": _RT_MODEL, "fallback": "none"}})))
+        rd = p.runs / str(rid)
+        rd.mkdir(parents=True)
+        (rd / "output.jsonl").write_text(json.dumps({"type": "result", "subtype": "error_during_execution",
+                                                     "is_error": True, "total_cost_usd": 0.0, "usage": {},
+                                                     "result": refused, "session_id": "s-1"}) + "\n")
+        p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(rd), rid))
+        d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                     {"rc": 1, "started": time.time() - 30, "ended": time.time(), "bridge": {"last_fault": last_fault}})
+        run = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+        assert run["status"] == "fallback" and route.of(run["note"])["fallback"] == "model_missing", (n, run["note"])
+        p.db.update_task(tid, status="done")
+    assert route.held(p.db, d.cfg, "light") == _RT_MODEL and route.cooling(p.db, "chat", time.time()) == ""
+    assert alerts == [("route-model-missing:light", "normal")]
+    prov, _, note = _route_dispatch(p, d, monkeypatch, title="next")
+    assert prov == d.cfg.get("core_provider", "claude") and note[route.KEY]["fallback"] == "model_missing"
+    # Other run errors stay as they were: a bridge error cools, a clean bridge leaves no endpoint fault.
+    assert route.fell_back("failed", {"bridge": {"last_fault": "error"}}, "error_during_execution: boom") == "error"
+    assert route.fell_back("failed", {"bridge": {"last_fault": "down"}}, refused) == "down"
+    assert route.fell_back("ok", {"bridge": {"last_fault": "error"}}, refused) == ""
+    assert route.fell_back("failed", {}, "the worker read about unrecognized models") == ""
+
+
 def test_a_model_missing_hold_ends_when_the_endpoint_lists_it_or_the_config_changes(env, monkeypatch, mock_chat):
     from ttp import endpoint, project, route
     from ttp.daemon import Daemon
