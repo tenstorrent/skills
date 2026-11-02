@@ -546,7 +546,7 @@ def worker_features(p: Project, task: dict | None = None) -> set[str]:
     # A job on another machine: the project or the task names one, or a runner is remote.
     if used or any((r or {}).get("host") for r in runners.values() if isinstance(r, dict)):
         on.add("remote")
-    if re.search(r"\b(slurm|cluster)", resources + " " + task_text, re.I) or any(
+    if re.search(r"\b(slurm|cluster)", scope + " " + task_text, re.I) or any(
             {"slurm", "cluster"} & set(t) for t in tags.values()):
         on.add("clusters")
     from .hostmap import table

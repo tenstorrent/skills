@@ -122,3 +122,88 @@ def test_ttp_stats_counts_worker_and_reviewer_cold_starts(env, capsys):
     assert "Cold starts: 2 of 4 worker and reviewer runs (50%)" in bud.reread_text(s)
     assert bud.cold_starts([]) == {"runs": 0, "cold": 0, "share": None}
     assert "Cold starts: no worker or reviewer run" in bud.reread_text(bud.reread_stats(p.db, 7, now=now + 30 * 86400))
+
+
+def test_worker_system_states_every_restriction_and_user_correction_verbatim(env, monkeypatch):
+    """Trimming the charter digest never touches the binding block or the corrections: each
+    Restriction item and each correction's text is in the system prompt as written."""
+    from ttp.prompts import worker_system
+    p = _rules_project(env, monkeypatch)
+    fixes = ["Correction (user msg #7): the nightly job passed; retires 'it failed'.",
+             "Correction (user msg #9): box resets never touch other hosts."]
+    for text in fixes:
+        p.add_memory(text, kind="fact")
+    system = worker_system(p)
+    restrictions = _BIG_CHARTER.split("## Restrictions\n")[1].split("\n\n## ")[0].splitlines()
+    assert len(restrictions) == 3
+    for line in restrictions:
+        assert line in system, line
+    assert "USER CORRECTIONS" in system
+    for text in fixes:
+        assert text in system, text
+
+
+def test_charter_goals_drop_only_untagged_coordinator_blocks_and_count_them():
+    """A whole section's block that names the coordinator or the daily review and no worker is
+    the coordinator's; a [workers] tag or a mention of workers keeps it, in any case; a
+    [coordinator] tag drops even a block naming workers."""
+    from ttp.prompts import goal_for_workers
+    assert not goal_for_workers("Coordinator effort: the coordinator runs at high effort.")
+    assert not goal_for_workers("Daily audit: each project audits itself in its Daily Review.")
+    assert goal_for_workers("Ship a faster widget: halve the p50 latency.")
+    assert goal_for_workers("The coordinator splits the work; Workers run each step.")
+    assert goal_for_workers("The COORDINATOR picks the box. [workers]")
+    assert not goal_for_workers("Workers and the coordinator share this. [coordinator]")
+    assert not goal_for_workers("Box history kept for the coordinator. [Coordinator]")
+
+
+def test_worker_charter_digest_drops_coordinator_goal_blocks_and_says_how_many(env, monkeypatch):
+    from ttp.prompts import worker_system
+    p = _rules_project(env, monkeypatch)
+    keep_tagged = "Box notes for the coordinator, kept for everyone. [workers]"
+    keep_named = "Workers run the benchmark; the coordinator files the result."
+    drop = "Coordinator effort: the coordinator runs every turn at high effort."
+    review = "Daily audit: the daily review grades every ask."
+    goals = f"## Goals\nShip a faster widget.\n\n{drop}\n\n{keep_tagged}\n\n{keep_named}\n\n{review}\n"
+    p.charter_path.write_text(_BIG_CHARTER.replace(
+        "## Goals\nShip a faster widget: halve the p50 latency without losing accuracy.\n", goals))
+    system = worker_system(p)
+    assert "Ship a faster widget." in system
+    assert keep_tagged in system and keep_named in system
+    assert drop not in system and review not in system
+    head = next(line for line in system.splitlines() if line.startswith("# CHARTER"))
+    before = next(line for line in worker_system(_reset_charter(p)).splitlines() if line.startswith("# CHARTER"))
+    count = lambda h: int(re.search(r"(\d+) more items for the coordinator", h)[1])
+    assert count(head) == count(before) + 2, (head, before)
+
+
+def _reset_charter(p):
+    p.charter_path.write_text(_BIG_CHARTER)
+    return p
+
+
+def test_a_cluster_named_only_in_goals_turns_on_no_cluster_rules_but_a_slurm_task_gets_them(env, monkeypatch):
+    """Cluster rules follow the machines a project may use (Resources, Restrictions) and the task's
+    own words; a goal that mentions a cluster or a slurm machine turns on nothing for every task."""
+    from ttp import machines
+    from ttp.prompts import worker_rules, worker_system
+    p = _rules_project(env, monkeypatch)
+    monkeypatch.setattr(machines, "load", lambda: {"hpc-a": {"tags": ["slurm"]}})
+    head = "## Shared clusters"
+    charter = _BIG_CHARTER.replace("Success: the widget's", "Later: try hpc-a and the exabox cluster.\n\nSuccess: the widget's")
+    p.charter_path.write_text(charter)
+    plain = p.db.task(p.db.add_task("fix the parser", "Fix it.", kind="code", tier="standard", origin="user"))
+    slurm = p.db.task(p.db.add_task("run on the cluster", "Submit the benchmark with sbatch on Slurm.",
+                                    kind="work", tier="standard", origin="user"))
+    on_hpc = p.db.task(p.db.add_task("bench", "Run the benchmark on hpc-a.", kind="work", tier="standard",
+                                     origin="user"))
+    assert head not in worker_system(p)
+    assert head not in worker_rules(p, plain)
+    assert head in worker_rules(p, slurm)
+    assert head in worker_rules(p, on_hpc)
+    for where in ("## Resources\n- Box A (alias box-a): the only machine for benchmark jobs.\n- hpc-a: Slurm.\n",
+                  "## Resources\n- Box A (alias box-a): the only machine for benchmark jobs.\n- the lab cluster.\n"):
+        p.charter_path.write_text(charter.split("## Resources")[0] + where)
+        assert head in worker_system(p), where
+    p.charter_path.write_text(charter.replace("(user msg #2)", "Use only partition p1 of the Slurm cluster. (user msg #2)"))
+    assert head in worker_system(p)
