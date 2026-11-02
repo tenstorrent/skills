@@ -3271,6 +3271,47 @@ def test_a_plan_to_billed_switch_releases_old_holds_and_wakes_the_coordinator_on
 
 
 
+def test_an_account_switch_releases_only_deferrals_tied_to_the_old_limits(env, monkeypatch):
+    """The dogfooding case: an account switch on the same plan released a question deferred until a
+    change landed and about a day of coordinator turns had run, because its start_after fell within
+    an hour of the old 7d reset. A deferral with a start_when probe waits on that probe: it stays.
+    A time-only deferral to the old reset and one whose why names the old window are released, the
+    event's released list names only those, and it words the change as an account switch."""
+    from ttp import budget as bud, budgetkind, coordinator as coord
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(budgetkind, "DEBOUNCE_S", 0.0)
+    p = make(env)
+    now = time.time()
+    resets = _fake_plan(p, ACCT_PLAN, now, util=40.0)
+    bud.note_account(p.db, "fake", ACCT_PLAN)
+    why = "#9999 has landed and about a day of coordinator turns has run since"
+    landing = p.db.add_task("did #9999 cut cache writes", "x", kind="question",
+                            labels=coord.defer_labels(resets - 600, "ttp landed --task 9999 || exit 1", why),
+                            not_before=resets - 600)
+    by_time = p.db.add_task("weekly sweep", "x", labels=coord.defer_labels(resets, None), not_before=resets)
+    by_why = p.db.add_task("reindex the docs", "x", labels=coord.defer_labels(now + 86400, "true", "until the 7d window resets"),
+                           not_before=now + 86400)
+    d = Daemon(p.base)
+    _bk_tick(d, monkeypatch)
+    assert _bk_events(p) == []
+
+    bud.note_account(p.db, "fake", ACCT_PLAN2)   # another plan account, the same windows
+    _fake_plan(p, ACCT_PLAN2, time.time(), util=20.0)
+    _bk_tick(d, monkeypatch)
+    ev = _bk_events(p)
+    assert len(ev) == 1, [e["text"] for e in ev]
+    text, released = ev[0]["text"], json.loads(ev[0]["data"])["released"]
+    assert "(account switched): still plan windows (five_hour, seven_day)." in text and "was plan" not in text, text
+    kept = _bk_deferral(p.db.task(landing))
+    assert kept["when"] == "ttp landed --task 9999 || exit 1" and kept["why"] == why, kept
+    assert abs(kept["after"] - (resets - 600)) < 1, kept
+    assert p.db.task(landing)["not_before"] == resets - 600
+    assert _bk_deferral(p.db.task(by_time)) == {} and _bk_deferral(p.db.task(by_why)) == {}
+    assert [r.split(" ", 1)[0] for r in released] == [f"#{by_time}", f"#{by_why}"], released
+    assert f"#{landing}" not in text, text
+
+
+
 def test_the_budget_fingerprint_survives_a_restart(env, monkeypatch):
     """A restart with the same budget is no change; a change made while the daemon was down is
     caught on its first updates, and raises one event across further restarts."""

@@ -29,7 +29,8 @@ On a change (`apply`, in the gate update's transaction):
 - every hold the old limits made is released at once (`release`): a usage or rate-limit pause of
   the provider (`limited:<p>`, not a logged-out one) when the account or the kind changed, its
   plan-window red-alert markers, the schedules its gate held ('waiting for budget', core provider
-  only) and task deferrals on it whose reason is a window, reset, limit, cap or budget. Each is
+  only) and task deferrals on it whose reason is a window, reset, limit, cap or budget, or that
+  wait only for a time at an old plan window's reset (never one with a start_when probe). Each is
   evaluated against the new gate on the same tick and held again only if that gate holds it;
 - one KIND event (queued, normal) for the coordinator's next turn, a tricky one
   (coordinator.EFFORT_EVENT_TRIGGERS); it batches (coordinator.BATCH_KINDS), so it never wakes a
@@ -192,7 +193,7 @@ def what_changed(old: dict, new: dict) -> list[str]:
 
 def tied_tasks(db: DB, cfg: dict, provider: str, resets: list[float] | None = None) -> list[dict]:
     """Open tasks still tied to the provider's old limits: deferrals, waits and blocks whose reason
-    names a window, reset, limit, cap or budget, deferrals to an old plan window's reset (`resets`),
+    names a window, reset, limit, cap or budget, time-only deferrals to an old plan window's reset (`resets`),
     and tasks failed over off this provider. Each is {"task", "what", "line"}; `what` is deferred,
     waiting, blocked or moved."""
     core = cfg.get("core_provider") or "claude"
@@ -209,7 +210,9 @@ def tied_tasks(db: DB, cfg: dict, provider: str, resets: list[float] | None = No
         why = " ".join(str(x) for x in (d.get("why"), t["blocked_reason"], load_result(t["result"]).get("waiting_for"))
                        if x)
         what = "deferred" if d and t["status"] == "queued" else t["status"]
-        at_reset = what == "deferred" and d.get("after") and any(
+        # Only a time-only deferral waits for the reset it is timed to: one with a start_when probe
+        # waits on that probe (a landing, a run), its start_after only a floor that may fall near a reset.
+        at_reset = what == "deferred" and d.get("after") and not d.get("when") and any(
             abs(float(d["after"]) - r) <= RESET_MATCH_S for r in resets or [])
         if at_reset and not why:
             why = "until the old plan window's reset"
@@ -271,7 +274,9 @@ def apply(db: DB, cfg: dict, provider: str, change: dict, now: float | None = No
     rel = (f"Released at once ({len(released)}; each starts or runs as the new gate allows): "
            + " | ".join(released[:MAX_LISTED]) + (f" | +{len(released) - MAX_LISTED} more" if len(released) > MAX_LISTED else "")
            + ". ") if released else "No hold needed releasing. "
-    text = (f"{provider} budget changed ({changed}): was {_kind_text(old)}, now {_kind_text(new)}. {rel}"
+    was, now_kind = _kind_text(old), _kind_text(new)
+    kinds = f"still {now_kind}" if was == now_kind else f"was {was}, now {now_kind}"
+    text = (f"{provider} budget changed ({changed}): {kinds}. {rel}"
             "Re-plan against the new limits; drop any plan that waits for the old limits to reset. "
             + (f"Still tied to the old limits ({len(tasks)}), yours to re-point: " + " | ".join(tasks[:MAX_LISTED])
                + (f" | +{len(tasks) - MAX_LISTED} more" if len(tasks) > MAX_LISTED else "")
