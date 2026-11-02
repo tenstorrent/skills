@@ -1152,6 +1152,8 @@ def test_a_routine_digest_collapses_unchanged_background_and_keeps_what_decides_
     shelf = db.add_task("tile size lever", "s", origin="user")
     db.update_task(shelf, status="done", result=json.dumps({"status": "done", "summary": "Shelved: no gain."}))
     ask = db.post("out", "Which board should the soak use?", kind="ask")
+    db.post("in", "The soak should use the spare board from now on.", chat=None, kind="user",
+            provenance="web-session")   # the user's latest words on the open ask (user_words)
     ev = db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
               (time.time(), "daemon", "observation", "normal", "a new thing happened", "queued"))
     db.set_kv("progress_state", {"raised": {"stall:probe:#1": {"kind": "stall", "what": "task #1", "since": time.time(),

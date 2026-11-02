@@ -9,8 +9,9 @@ coordinator.reask_window_days (default WINDOW_DAYS; 0 turns the gate off):
   dropped): a message linked to an ask (a '#<id>:' prefix, or recorded as an ask's answer) counts
   whole; any other message only by its sentences that carry a decision or correction marker
   (DECIDED: do not, never, keep, stop, instead, yes, decide yourself...). A plain request ('Set up
-  X') answers nothing, so it never refuses the follow-up ask it leads to; a question, or an 'ask me
-  first' sentence, settles nothing,
+  X') answers nothing, so it never refuses the follow-up ask it leads to, except an ask for leave to
+  do that very thing (PERMISSION: 'Should I set up X?'): the request already gave it; the newest
+  matching message is the one named. A question, or an 'ask me first' sentence, settles nothing,
 - memory entries of kind decision, preference, restriction or fact that cite a user message or are a
   `Correction (user msg #id)` fact,
 - the charter's Policies and Goals items (no age: the charter is current).
@@ -73,6 +74,12 @@ DECIDED = re.compile(r"\b(?:do not|does not|don't|dont|never|keep|stop|no(?! (?:
                      r"not(?! sure)|instead|rather|already (?:said|told|answered|decided)|"
                      r"decide (?:it |that |this )?yourself|your call|yes|approved?|"
                      r"denied|declined?|rejected?|leave it|as is)\b", re.I)
+
+# An ask for leave to act ('Should I fix X?', 'OK to restart Y?'): the user's plain request for that
+# act ('Fix X') already decided it, so their request sentences count as well as decided ones.
+PERMISSION = re.compile(r"\b(?:should|shall|may|can|could) (?:i|we)\b|\bdo you want (?:me|us) to\b|"
+                        r"\b(?:ok|okay|fine|alright) (?:to|if (?:i|we))\b|\bpermission to\b|\bgo ahead\b|"
+                        r"\bproceed with\b", re.I)
 
 
 def window_days(cfg: dict | None) -> float:
@@ -158,6 +165,20 @@ def _hit(ask: str, text: str, settling: bool = True, decided: bool = False) -> s
     return None
 
 
+def _leave(ask: str, text: str) -> str | None:
+    """The first sentence of the user's `text` asking for what the ask for leave (PERMISSION) asks
+    to do: it matches, and each question clause of the ask (the whole ask when it has none) brings
+    fewer than MIN_NEW words the sentence lacks ('Should I fix X?' after 'Fix X', never 'Should I
+    fix X with the old or the new syntax?')."""
+    qs = _questions(ask) or [words(ask)]
+    for s in _sentences(text):
+        if s.endswith("?") or _ASK_FIRST.search(s) or not matches(ask, s):
+            continue
+        if all(len(q - words(s)) < MIN_NEW for q in qs):
+            return s
+    return None
+
+
 def _same_clause(ask: str, old: str) -> bool:
     """A question clause of `ask` is one of `old`'s in other words ('Make X permanent?', 'Should X
     become permanent?'), where the context around them differs too much for matches(). A clause that
@@ -219,12 +240,14 @@ def settled_by(p, cfg: dict | None, ask: str, change: bool = False, now: float |
         return found
     from .relay import split
     from .unblock import RESOLVED_KEY
+    permission = bool(PERMISSION.search(ask))
     answers = {int(m) for r in (db.kv(RESOLVED_KEY, {}) or {}).values() if isinstance(r, dict)
                for m in r.get("messages") or [] if str(m).isdigit()}
     for m in db.q("SELECT id, text, context FROM messages WHERE direction='in' AND kind='user' "
                   "AND COALESCE(provenance,'')!='system' AND ts>=? ORDER BY id DESC", (since,)):
         said = split(m["text"] or "", m["context"])[0]
-        s = _hit(ask, said, decided=not (m["id"] in answers or _LINKED.match(said)))
+        s = _hit(ask, said, decided=not (m["id"] in answers or _LINKED.match(said))) \
+            or (permission and _leave(ask, said))
         if s:
             return f'user msg #{m["id"]}: "{_line(s)}"'
     from .project import CORRECTION_PREFIX, _stamp_ts

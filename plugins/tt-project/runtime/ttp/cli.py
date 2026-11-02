@@ -4854,6 +4854,33 @@ def cmd_hours(a) -> None:
         sys.exit(0 if ok else 1)
 
 
+def cmd_said(a) -> None:
+    """`ttp said <words>`: the newest of the user's own recorded messages on a topic (every word, or
+    its ids, aliases and keys with half the words), read-only, with id, date and the verbatim quote
+    (userwords.py). Run it before refusing, blocking or asking on a rule: the newest word wins."""
+    import sqlite3
+    from . import userwords
+    p = here()
+    if p is None:
+        die("ttp said: no project here (run it in a project or its run)")
+    now = time.time()
+    try:
+        con = userwords.open_ro(p.state / "project.db")
+        try:
+            found = userwords.search(con, " ".join(a.words), limit=a.limit,
+                                     since=now - a.days * 86400 if a.days else 0.0)
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        die(f"ttp said: cannot read the project's messages ({e})", 75)
+    if a.json:
+        print(json.dumps([{**m, "when": timefmt.long(m["ts"], p)} for m in found]))
+        return
+    for m in found:
+        print(f'#{m["id"]} {timefmt.long(m["ts"], p)} "{m["quote"]}"')
+    print(f"{len(found)} message{'' if len(found) == 1 else 's'} found (newest first; the newest word on a topic wins)")
+
+
 def cmd_killscan(a) -> None:
     """Check scripts for kills by name or pattern (`pkill`, `killall`, `pgrep`/`pidof`, `ps | grep`) before
     running them: such a kill can match the worker's own tool shell. Exits 1 when one is found.
@@ -9518,7 +9545,7 @@ COMMAND_GROUPS = (
                   "memory", "obligation", "config", "pause", "resume", "drain", "alerts", "issues", "mute",
                   "machines", "logs", "doctor")),
     ("inside a run", ("note", "notify", "progress", "checks", "lock", "detach", "devq", "push", "land", "clip", "sandbox",
-                      "skill", "killscan", "svcscan", "leftover-procs")),
+                      "skill", "killscan", "svcscan", "leftover-procs", "said")),
     ("probes (retry_when, start_when)", ("landed", "ci", "ack-wait", "ssh-preflight", "broker-released",
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
@@ -9940,6 +9967,15 @@ def main(argv: list[str] | None = None) -> None:
                         "it waits for them to come back instead of going out on a timer")
     s.add_argument("--days", type=float, default=14, help="look back this many days (default 14)")
     s.set_defaults(fn=cmd_hours)
+
+    s = sub.add_parser("said", help="the newest of the user's recorded messages on a topic, with id, date and "
+                                    "the verbatim quote (read-only): check it before refusing, blocking or asking")
+    s.add_argument("words", nargs="+", help="the topic: every content word must appear (or its ids, aliases "
+                                            "and config keys with half the words)")
+    s.add_argument("-n", "--limit", type=int, default=5, help="at most this many messages (default 5)")
+    s.add_argument("--days", type=float, default=0, help="look back only this many days (default: all)")
+    s.add_argument("--json", action="store_true", help="print the matches as JSON")
+    s.set_defaults(fn=cmd_said)
 
     s = sub.add_parser("throughput", help="waits per lane (worker, resource, checks, review, push, chains, deferrals, "
                                           "provider) against their limits; --apply raises the limits that held work "

@@ -239,6 +239,12 @@ Each field's rules are in the section named; the table only lists them.
 - A standing instruction ("whenever", "keep doing", or a duty with no single target): `memory_add`
   with `standing` true, then act on the case at hand. Finishing one instance never retires it.
   Retire it only with `memory_forget` `why` naming its end or the user's words ending it.
+- Before refusing, blocking or asking on a rule, run `ttp said <topic words>` (the digest shows the
+  user's latest words on blocked items). Two user rules seem to conflict: the newest user word on
+  the topic wins; apply it, `memory_add` it citing the message and say so. A rule reading that
+  blocks a goal the user later asked for is such a conflict, never a reason to refuse. Ask only if
+  both cannot hold and the action could affect people badly or speak as the user; Restrictions
+  loosen only as below.
 - Restrictions bind every task; in doubt, the stricter reading wins (how tasks obey a restriction,
   never how you read the user's own words changing one).
 - The user changes, narrows, widens or lifts a restriction: rewrite it in Restrictions in that
@@ -387,7 +393,8 @@ The project runs unattended. The user reads what you decided; they do not approv
   alternative you considered in `least_disruptive`), `restriction_change` or `neither`, which is
   rejected: decide it yourself. The class must match `blocking`. An `access` ask about a known host
   lists each route tried (ssh alias, ProxyJump, jump host) and its result. A re-ask of an answered
-  ask or correction is refused: act on it or resend with `not_covered`.
+  ask, a correction or a user message's decision (a request gives leave to do it) is refused: act
+  on it or resend with `not_covered`.
 - Self-healing: keeping the project stable is yours. A dead, stuck or hung worker, service, runner,
   daemon, schedule, watcher, queue, tunnel or box, or a hold that never cleared, is never a question
   for the user: queue the fix (`task_add` priority 1) or a heal check, `memory_add` the decision and

@@ -91,6 +91,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     unblock,
     unstarted,
     upstream,
+    userwords,
     verified,
     watchdup,
     worktree,
@@ -529,7 +530,7 @@ MUTE_CHARS = 200
 # (LEDGER_SEEN_KEY).
 DIGEST_SEEN_KEY = "digest_seen"   # kv: {section: hash of what the previous turn's digest showed}
 COLLAPSIBLE = ("recurring", "muted", "memory_budget", "memory_pinned", "tried", "settled_areas", "course_check",
-               "progress")
+               "progress", "user_words")
 # The shared machine ledger collapses per line: co-tenants reword its lines often ('seen by', 'page
 # held', outage ends), so a turn with no machine_* event shows only the new or reworded ones, and the
 # whole ledger again after a machine event (ledger_section). The seen lines are keyed on the ledger
@@ -1197,6 +1198,10 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                 when = "waits for the user"
             lines.append(f"- ask #{b['id']} ({when}): {b['text'][:300]}")
     section("asks", lines)
+    lines = userwords.digest_lines(p, [str(x) for x in db.kv(REJECTED_KEY, []) or [] if not informational_rejection(str(x))],
+                              msg_ids, now)
+    section("user_words", lines, "\n".join(lines[1:]),
+            f"## The user's latest words on blocked items: {len(lines) - 1} lines (as last turn; apply them)")
     section("promises", obligations.promise_lines(db, now, home))
     lines = []
     sent = db.q("SELECT * FROM messages WHERE direction='out' AND kind IN ('reply','ask','alert') "
