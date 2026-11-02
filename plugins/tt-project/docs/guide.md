@@ -136,7 +136,12 @@ prolonged whole-box outage.
   while its logs are not read yet). The estimate prices each Claude model call in
   `~/.claude/projects` at list price once, skips non-Claude models (a provider that runs Claude Code
   against another vendor's endpoint) and leaves out every tt-project run of any provider, which its
-  project already books. `billing` comes from that machine's Claude Code login, never its name:
+  project already books. Finished tt-project Claude runs calibrate it: once at least 3 runs mostly
+  on one model agree within 5% on the ratio of Claude Code's reported cost to the list price, later
+  calls on that model are scaled by that ratio (recorded in `~/.tt-project/price-calibration.json`,
+  dropped when the model's list price changes). A ratio outside 0.5-2.0 is never applied. A low
+  alert says what was done, once per model and tt-project release: a drift past 20%, a ratio out of
+  bounds, or a model the table does not list (priced at its most expensive row). `billing` comes from that machine's Claude Code login, never its name:
   `usage` (an API key, a key helper, or a usage-billed seat), `plan` (a subscription plan) or
   `unknown`. An API key is seen in the environment, the settings, or, for a key exported only in an
   interactive shell, the login's approved-key record; such a key beside a plan login reads `unknown`

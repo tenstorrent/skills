@@ -34339,13 +34339,15 @@ def test_the_price_table_is_checked_against_reported_run_costs(env, tmp_path, mo
         _log(logs, f"r{i}", [_call(f"r{i}", "m", now, output_tokens=M, cache_read_input_tokens=M)])
         _log(logs, f"r{i}", [_call(f"r{i}", "s", now, input_tokens=M)], sub="agent-x")
     assert ls.session_cost("r0") == (15 + 0.3 + 3, False)
-    assert ls.calibrate("r0", 18.3) is None and ls.calibrate("r1", 18.3) is None, "fewer than DRIFT_RUNS runs"
-    assert abs(ls.calibrate("r2", 18.3)) < 0.001, "the table disagrees with the reported cost"
+    assert ls.calibrate("r0", 18.3)["samples"] == 0 and ls.calibrate("r1", 18.3)["samples"] == 0, "fewer than DRIFT_RUNS"
+    got = ls.calibrate("r2", 18.3)
+    assert abs(got["drift"]) < 0.001 and not got["applied"] and got["alert"] is None, "the table disagrees"
     assert ls.calibrate("r0", 0.01) is None and ls.calibrate("no-such", 5) is None
-    # Prices went down 2% and the table did not follow: drift.
+    # Prices went down 2% and the table did not follow: drift, corrected by itself.
     for i in range(6):   # the median of the last CALIBRATION_KEEP runs moves once most of them drift
-        drift = ls.calibrate(f"r{i % 3}", 18.3 / 1.02)
-    assert drift is not None and abs(drift - 0.02) < 0.001 and drift > ls.DRIFT, drift
+        got = ls.calibrate(f"r{i % 3}", 18.3 / 1.02)
+    assert abs(got["drift"] - 0.02) < 0.001 and got["drift"] > ls.DRIFT and got["applied"], got
+    assert got["alert"] is None and abs(got["factor"] - 1 / 1.02) < 1e-3
     # A long scan holds the cache lock: the check gives up after a short wait instead of stalling.
     import fcntl
     monkeypatch.setattr(ls, "CALIBRATION_WAIT_S", 0.1)
@@ -34383,7 +34385,9 @@ def test_a_drifting_price_table_raises_a_low_alert(env, monkeypatch):
     d = Daemon(p.base)
     sent, asked = [], []
     monkeypatch.setattr(d, "alert", lambda key, text, severity="high", every_s=0: sent.append((key, severity)))
-    monkeypatch.setattr(ls, "calibrate", lambda sid, usd: asked.append(sid) or 0.02)
+    big = {"alert": "drift", "model": "claude-x", "release": "1.0", "drift": 0.3, "factor": 0.77, "samples": 3,
+           "unpriced": [], "applied": True}
+    monkeypatch.setattr(ls, "calibrate", lambda sid, usd: asked.append(sid) or big)
     usage = types.SimpleNamespace(estimated=False, cost_usd=1.0, session_id="s1")
     d.cfg["budget"]["global_daily_usd"] = 0
     d._check_price_table({"provider": "claude"}, usage)
@@ -34393,14 +34397,14 @@ def test_a_drifting_price_table_raises_a_low_alert(env, monkeypatch):
     d._check_price_table({"provider": "claude"}, types.SimpleNamespace(estimated=True, cost_usd=1.0, session_id="s1"))
     assert asked == []
     d._check_price_table({"provider": "claude"}, usage)
-    assert asked == ["s1"] and sent == [("claude_price_table", "low")]
-    monkeypatch.setattr(ls, "calibrate", lambda sid, usd: 0.005)
+    assert asked == ["s1"] and sent == [("claude_price_table:drift:claude-x:1.0", "low")]
+    monkeypatch.setattr(ls, "calibrate", lambda sid, usd: {**big, "alert": None})   # told already, or small
     d._check_price_table({"provider": "claude"}, usage)
     assert len(sent) == 1
     asked.clear()
     d._check_price_table({"provider": "claude", "note": json.dumps({"resumes": {"run": 1, "session": "s1"}})}, usage)
     assert asked == [], "a resumed run's log also holds the run it resumed"
-    monkeypatch.setattr(ls, "calibrate", lambda sid, usd: asked.append(sid) or 0.005)
+    monkeypatch.setattr(ls, "calibrate", lambda sid, usd: asked.append(sid) or None)
     d.gates = {"claude": types.SimpleNamespace(regime="windows")}
     d._check_price_table({"provider": "claude"}, usage)
     assert asked == [], "a plan run never counts toward the global cap"

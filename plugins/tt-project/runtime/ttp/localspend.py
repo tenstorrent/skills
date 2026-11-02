@@ -7,7 +7,8 @@ Claude Code writes every session to <CLAUDE_CONFIG_DIR or ~/.claude>/projects/<f
 and a session's subagents to <folder>/<id>/subagents/*.jsonl. Each assistant record carries the API
 call's usage; one call is written once per content block, so a call counts once per (message id,
 request id), and the '<synthetic>' model (no API call) not at all. Calls are priced at list prices
-(PRICES, published per model; account-level `pricing.claude` overrides) and booked by their time
+(PRICES, published per model; account-level `pricing.claude` overrides), scaled per model by the
+factor finished runs measured against Claude Code's reported cost (calibrate), and booked by their time
 into the budget day (budget.day_start in budget.timezone; without a day_start, by the hour).
 
 Every local tt-project project's runs are left out by their session id (each project's database,
@@ -86,8 +87,13 @@ SLACK_S = 3600               # files untouched this long before the kept days ar
 PLAN_WORDS = ("max", "pro", "team", "enterprise", "subscription")   # a plan login's subscription words
 KEEP_S = 2 * gcap.DAY        # calls are kept (and deduplicated) this far back from the current day
 MEMO_S = 30                  # one process reads the estimate again after this long
-DRIFT = 0.01                 # the price table is stale once it is this far off Claude Code's own cost
-DRIFT_RUNS = 3               # over at least this many runs
+DRIFT = 0.01                 # a measured drift up to this is noise: the table's prices stand
+DRIFT_RUNS = 3               # a model's factor needs at least this many runs
+CONSISTENT = 0.05            # ... each within this share of their median factor
+DOMINANT = 0.9               # a run calibrates the model that priced at least this share of it
+ALERT_DRIFT = 0.20           # a drift past this is told (low, once per model and release)
+FACTOR_MIN, FACTOR_MAX = 0.5, 2.0   # a factor outside these is never applied (told once)
+ALERTED_KEEP = 50
 CALIBRATION_KEEP = 10
 CALIBRATION_WAIT_S = 2.0     # calibrate() waits at most this long for the cache lock
 _SUFFIX = re.compile(r"^(-\d{8})?(\[[^\]]*\])?$")
@@ -109,15 +115,23 @@ def table(overrides: dict | None = None) -> tuple[dict, float]:
     return rows, fee
 
 
-def row_for(model: str, rows: dict) -> tuple[tuple, bool]:
-    """(rates, estimated) of `model`: the row whose id it is (a date or '[1m]' suffix and a cloud
-    prefix ignored); a model not in the table gets the most expensive row and is estimated."""
+def row_key(model: str, rows: dict) -> str | None:
+    """The id of `model`'s row (a date or '[1m]' suffix and a cloud prefix ignored), or None."""
     m = (model or "").lower()
     m = m[m.find("claude-"):] if "claude-" in m else m
     m = m.split("@", 1)[0]
     for k in sorted(rows, key=len, reverse=True):
         if m.startswith(k) and _SUFFIX.match(m[len(k):]):
-            return rows[k], False
+            return k
+    return None
+
+
+def row_for(model: str, rows: dict) -> tuple[tuple, bool]:
+    """(rates, estimated) of `model`: its row; a model not in the table gets the most expensive row
+    and is estimated."""
+    k = row_key(model, rows)
+    if k is not None:
+        return rows[k], False
     return max(rows.values(), key=lambda r: (r[1], r[0])), True
 
 
@@ -323,6 +337,7 @@ def scan(budget: dict, now: float | None = None, root: Path | None = None) -> di
             return cache
         files = {}
         rows = table(overrides())
+        scale, keys = factors(rows[0]), {}
         for path, st in found:
             was = cache["files"].get(path) or {}
             off = int(was.get("off") or 0)
@@ -338,6 +353,9 @@ def scan(budget: dict, now: float | None = None, root: Path | None = None) -> di
                         continue
                     seen.add(c["key"])
                     usd, est = price(c["model"], c["usage"], rows=rows)
+                    if c["model"] not in keys:
+                        keys[c["model"]] = row_key(c["model"], rows[0])
+                    usd *= scale.get(keys[c["model"]], 1.0)
                     b = buckets.setdefault(f"{bucket(budget, c['ts']):.0f}", {"s": {}, "k": [], "unknown": []})
                     b["k"].append(c["key"])
                     s = b["s"].setdefault(c["session"], [0.0, 0])
@@ -499,8 +517,9 @@ def field(start: float, end: float, now: float | None = None) -> dict | None:
 
 
 # calibration ------------------------------------------------------------------------------------
-def session_cost(session_id: str, root: Path | None = None) -> tuple[float, bool] | None:
-    """The list price of one session's log (its subagents too), or None when there is no log."""
+def _session_priced(session_id: str, root: Path | None = None) -> tuple[float, dict, set] | None:
+    """The list price of one session's log (its subagents too), its price per table row, and the
+    models the table has no row for; None when there is no log."""
     root = Path(root or logs_root())
     if not session_id or "/" in session_id:
         return None
@@ -519,7 +538,7 @@ def session_cost(session_id: str, root: Path | None = None) -> tuple[float, bool
         return None
     if not paths:
         return None
-    rows, seen, usd, est = table(overrides()), set(), 0.0, False
+    rows, seen, usd, by_key, unknown = table(overrides()), set(), 0.0, {}, set()
     for p in paths:
         try:
             lines, _ = _read_from(p, 0)
@@ -530,21 +549,73 @@ def session_cost(session_id: str, root: Path | None = None) -> tuple[float, bool
                 continue
             seen.add(c["key"])
             u, e = price(c["model"], c["usage"], rows=rows)
-            usd, est = usd + u, est or e
-    return usd, est
+            usd += u
+            k = row_key(c["model"], rows[0])
+            if k is None:
+                unknown.add(c["model"])
+            else:
+                by_key[k] = by_key.get(k, 0.0) + u
+    return usd, by_key, unknown
+
+
+def session_cost(session_id: str, root: Path | None = None) -> tuple[float, bool] | None:
+    """The list price of one session's log (its subagents too), or None when there is no log."""
+    got = _session_priced(session_id, root)
+    return None if got is None else (got[0], bool(got[2]))
+
+
+def calibration_path() -> Path:
+    return project.HOME_DIR / "price-calibration.json"
+
+
+def load_calibration() -> dict:
+    try:
+        data = json.loads(calibration_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def factors(rows: dict) -> dict[str, float]:
+    """The applied factor per table row: one measured against the row's current rates, so a release or
+    a pricing.claude override that changes a row drops its factor until runs measure it again."""
+    out, models = {}, load_calibration().get("models")
+    for k, m in (models.items() if isinstance(models, dict) else ()):
+        try:   # a hand-edited or torn file applies nothing, never breaks a scan
+            f = float(m["factor"])
+            same = m.get("applied") is True and k in rows and list(m["rates"]) == list(rows[k])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if same and FACTOR_MIN <= f <= FACTOR_MAX:
+            out[k] = f
+    return out
 
 
 def calibrate(session_id: str, reported_usd: float, now: float | None = None,
-              root: Path | None = None) -> float | None:
+              root: Path | None = None) -> dict | None:
     """Price a finished run's session log, compare it with the cost Claude Code reported, and keep
-    the last CALIBRATION_KEEP pairs. Returns the median drift (priced / reported - 1) once there are
-    DRIFT_RUNS of them, else None. Runs with an unknown model, or too cheap to compare, are skipped,
-    and so is a run whose cache lock stays busy (a scan) for CALIBRATION_WAIT_S."""
+    the last CALIBRATION_KEEP pairs. A run is a pair of the model that priced at least DOMINANT of it,
+    measured against that model's current rates. Once DRIFT_RUNS of a model's pairs agree within
+    CONSISTENT of their median factor (reported / priced), that factor is recorded in
+    price-calibration.json and applied to scan()'s estimate of other sessions, when it lies within
+    FACTOR_MIN..FACTOR_MAX and the drift (priced / reported - 1) is past DRIFT. It only moves the
+    estimate toward the cost Claude Code measured, never past it, and it is bounded, so a bad
+    measurement can at most halve or double the estimate the global daily cap counts.
+    Returns {model, drift, factor, samples, applied, release, unpriced, alert}, with `alert` the one
+    thing worth telling this time ('unpriced', 'bound' or 'drift' past ALERT_DRIFT; each at most once
+    per model and release, across this machine's projects), or None: a run too cheap to compare, no
+    log, or a cache lock still busy (a scan) after CALIBRATION_WAIT_S."""
     if reported_usd < 0.05:
         return None
-    got = session_cost(session_id, root)
-    if not got or got[1]:
+    got = _session_priced(session_id, root)
+    if not got:
         return None
+    usd, by_key, unknown = got
+    rows = table(overrides())[0]
+    model = max(by_key, key=by_key.get) if by_key else ""
+    pair = (None if unknown or not model or by_key[model] < DOMINANT * usd
+            else [now or time.time(), round(reported_usd, 6), round(usd, 6), model, list(rows[model])])
+    from . import __version__ as release
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
     with open(project.HOME_DIR / "session-spend.lock", "a") as lk:
         give_up = time.monotonic() + CALIBRATION_WAIT_S
@@ -557,10 +628,54 @@ def calibrate(session_id: str, reported_usd: float, now: float | None = None,
                     return None
                 time.sleep(0.05)
         cache = load()
-        pairs = [x for x in (cache.get("calibration") or []) if isinstance(x, list) and len(x) == 3]
-        pairs = (pairs + [[now or time.time(), round(reported_usd, 6), round(got[0], 6)]])[-CALIBRATION_KEEP:]
-        cache["calibration"] = pairs
-        project.write_json(cache_path(), cache, mode=0o600)
-    if len(pairs) < DRIFT_RUNS:
-        return None
-    return statistics.median(p / r - 1 for _, r, p in pairs)
+        pairs = [x for x in (cache.get("calibration") or []) if isinstance(x, list) and len(x) == 5]
+        if pair:
+            pairs = (pairs + [pair])[-CALIBRATION_KEEP:]
+            cache["calibration"] = pairs
+            project.write_json(cache_path(), cache, mode=0o600)
+        state = load_calibration()
+        models = state.get("models") if isinstance(state.get("models"), dict) else {}
+        alerted = [str(a) for a in state.get("alerted") or []] if isinstance(state.get("alerted"), list) else []
+        out = {"model": model, "drift": None, "factor": None, "samples": 0, "applied": False,
+               "release": release, "unpriced": sorted(unknown), "alert": None}
+        mine = [x for x in pairs if pair and x[3] == model and x[4] == pair[4] and x[2] > 0]
+        fs = [r / p for _, r, p, _, _ in mine]
+        med = statistics.median(fs) if fs else 0.0
+        if med > 0 and sum(abs(f / med - 1) <= CONSISTENT for f in fs) >= DRIFT_RUNS:
+            drift = 1 / med - 1
+            within = FACTOR_MIN <= med <= FACTOR_MAX
+            out.update(drift=drift, factor=round(med, 4), samples=len(fs), applied=within and abs(drift) > DRIFT)
+            models[model] = {"factor": out["factor"], "samples": len(fs), "drift": round(drift, 4),
+                             "applied": out["applied"], "rates": pair[4], "release": release,
+                             "ts": now or time.time()}
+            kind = "drift" if out["applied"] and abs(drift) > ALERT_DRIFT else "" if within else "bound"
+        else:
+            kind = ""
+        if unknown:
+            kind, model = "unpriced", ", ".join(sorted(unknown))
+        tag = f"{kind}:{model}:{release}"
+        if kind and tag not in alerted:
+            out["alert"] = kind
+            alerted = (alerted + [tag])[-ALERTED_KEEP:]
+        if out["alert"] or out["samples"]:
+            project.write_json(calibration_path(), {"v": 1, "models": models, "alerted": alerted}, mode=0o600)
+    return out
+
+
+def alert_text(got: dict | None) -> str:
+    """What a calibrate() result with an alert tells the user: what the project did, never a chore."""
+    kind = (got or {}).get("alert")
+    if kind == "unpriced":
+        return (f"Claude Code used {', '.join(got['unpriced'])}, which tt-project's price table does not list. "
+                f"tt-project prices it at the table's most expensive row, an over-estimate on the safe side of the "
+                f"global daily cap, and leaves it out of calibration. A tt-project release that lists it ends this.")
+    if kind not in ("drift", "bound"):
+        return ""
+    off = (f"The price table prices {got['model']} {abs(got['drift']) * 100:.0f}% "
+           f"{'above' if got['drift'] > 0 else 'below'} what Claude Code reported over {got['samples']} recent runs.")
+    if kind == "drift":
+        return (f"{off} tt-project now scales its estimate of this machine's other Claude Code sessions on that "
+                f"model by {got['factor']:.2f} to match, so the global daily cap counts the measured cost.")
+    return (f"{off} That is outside the {FACTOR_MIN}x-{FACTOR_MAX}x range tt-project corrects by itself, so it "
+            f"keeps the table's prices for that model and its estimate of other sessions may be off by that much. "
+            f"A tt-project release with an updated table ends this.")

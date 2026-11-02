@@ -3777,25 +3777,24 @@ class Daemon:
 
     def _check_price_table(self, r: dict, usage) -> None:
         """Price a finished Claude run's session log with the table that estimates other local
-        sessions, and raise a low alert when it drifts from the cost Claude Code reported. A resumed
-        run is skipped: its session log also holds the calls of the run it resumed, and so is a run on
-        plan windows, where the global cap that table serves never applies."""
+        sessions and let localspend.calibrate correct that estimate by itself toward the cost Claude
+        Code reported. A low alert says what it did, once per model and release: a drift past
+        localspend.ALERT_DRIFT, a factor out of bounds (not applied) or a model with no price. A
+        resumed run is skipped: its session log also holds the calls of the run it resumed, and so is
+        a run on plan windows, where the global cap that table serves never applies."""
         if (r["provider"] != "claude" or usage.estimated or not usage.cost_usd or not usage.session_id
                 or float((self.cfg.get("budget") or {}).get("global_daily_usd") or 0) <= 0
                 or getattr(self.gates.get("claude"), "regime", "caps") != "caps"   # plan runs never count
                 or json.loads(r.get("note") or "{}").get("resumes")):
             return
         try:
-            drift = localspend.calibrate(usage.session_id, usage.cost_usd)
+            got = localspend.calibrate(usage.session_id, usage.cost_usd)
         except Exception as e:  # noqa: BLE001 - a price check never breaks finishing a run
             log(self.p, f"price table check failed: {e}")
             return
-        if drift is not None and abs(drift) > localspend.DRIFT:
-            self.alert("claude_price_table",
-                       f"The Claude price table that estimates this machine's other Claude Code sessions is "
-                       f"{drift * 100:+.1f}% off the costs Claude Code reported for recent runs, so that "
-                       f"estimate is off too. Update the table in tt-project or the account-level pricing.claude setting.",
-                       "low", every_s=86400)
+        text = localspend.alert_text(got)
+        if text:
+            self.alert(f"claude_price_table:{got['alert']}:{got['model']}:{got['release']}", text, "low", every_s=0)
 
     def _slept_during(self, r: dict, exit_info: dict) -> bool:
         """Whether the host slept while the run was going: its supervisor saw the wall clock run
