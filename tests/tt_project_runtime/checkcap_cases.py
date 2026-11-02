@@ -2338,6 +2338,43 @@ def test_suite_hold_rereads_its_lane_count_at_each_admission(env, monkeypatch):
     a.close(), b.close()
 
 
+def test_a_stale_free_lane_count_never_admits_past_the_lane_bound(env, monkeypatch):
+    # Eight lane files from a larger count, three held past a count of 4 (files 5-7). A waiter reads one
+    # free lane, then stalls while a more urgent run takes it and leaves the queue: the waiter's stale
+    # count must not give it a fifth lane.
+    from ttp import checkcap, locks, testslots
+    _lane_env(monkeypatch)
+    every = testslots.lane_paths("pa", 8, _LANE_REPO)
+    for x in every:
+        x.parent.mkdir(parents=True, exist_ok=True)
+        x.touch()
+    past = [locks.try_take([x], "pa: full checks (other run)", "pytest") for x in every[5:]]
+    assert all(past)
+    counted, go, got = threading.Event(), threading.Event(), []
+
+    def count(held):
+        if not counted.is_set():
+            counted.set()
+            go.wait(10)
+        return 4
+
+    def waiter():
+        got.append(testslots.suite_hold("pa", repo=_LANE_REPO, slots=count, wait_s=0.5))
+    w = threading.Thread(target=waiter, name="stale")
+    w.start()
+    assert counted.wait(10)
+    urgent = testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, priority=1, wait_s=0)
+    assert urgent and urgent.files, "the urgent run takes the one free lane"
+    go.set()
+    w.join(30)
+    held = [x for x in testslots.lane_paths("pa", repo=_LANE_REPO) if locks._slot_labels([x])]
+    assert len(held) == 4 and got == [None], f"a stale count admitted past 4 lanes: {[x.name for x in held]}"
+    urgent.close()
+    for f in past:
+        f.close()
+    assert checkcap.slot_dir()
+
+
 def test_two_lanes_let_two_runs_proceed_and_one_lane_keeps_priority_order(env, tmp_path, monkeypatch):
     from ttp import checklane, testslots
     _lane_env(monkeypatch)

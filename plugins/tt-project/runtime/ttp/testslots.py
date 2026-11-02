@@ -708,6 +708,19 @@ def _cap_guard(project_name: str, cap: int):
         yield
 
 
+@contextlib.contextmanager
+def _lane_guard(base: str):
+    """Serialize the recount-and-take of lane resource `base`'s numbered lanes (suite_hold)."""
+    with open(checkcap.slot_dir() / f"{base}.lane.guard", "a+") as g:
+        fcntl.flock(g, fcntl.LOCK_EX)
+        yield
+
+
+def _numbered_held(base: str) -> int:
+    """How many of `base`'s numbered lane files are held now, past any count too."""
+    return sum(1 for x in _lanes_of(base) if not x.name.startswith(base + "-x") and locks._slot_labels([x]))
+
+
 def cap_turn(project_name: str, cap: int, ticket, slots: int, now: float | None = None,
              age: float | None = None) -> bool:
     """Whether waiter `ticket` may take a lane under the project's cap of `cap` checks at once (0: none):
@@ -918,8 +931,10 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
             # queue that decides holds every waiter that arrived before it was freed.
             n_held = len([x for x in mine if locks._slot_labels([x])])
             slots = max(1, int(count(n_held) or 1))
-            lanes = lane_paths(project_name, max(slots, len(mine)), repo)
-            recs = locks.holder_records(lanes + extra_lanes)
+            # Take only from the first `slots` files: with fewer holders, one of them is free. Holders past a
+            # shrunk count still count, here and for the cheaper and urgent checks below.
+            lanes = lane_paths(project_name, slots, repo)
+            recs = locks.holder_records(lane_paths(project_name, max(slots, len(mine)), repo) + extra_lanes)
             free = slots - n_held
             every = locks.queued(checkcap.slot_dir(), resource)
             if ticket not in every:   # removed under it: queue again at its place, never past the line
@@ -955,8 +970,11 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                       and not (worktree and any(r.get("worktree") == str(worktree) for r in pool)) and headroom()
                       and (startable is None or startable()))
             try:
-                with _cap_guard(project_name, cap):
+                with _cap_guard(project_name, cap), _lane_guard(base):
                     over = False
+                    # Recount under the guard: a run that took a lane since the count above (and left the
+                    # queue) is not free room, so a stale count never admits past the bound.
+                    free = min(free, slots - _numbered_held(base)) if free > 0 else free
                     if free > 0 and pos < free:
                         if cap_turn(project_name, cap, ticket, slots, age=age):
                             f = locks.try_take(lanes, label, what, extra=fields)
