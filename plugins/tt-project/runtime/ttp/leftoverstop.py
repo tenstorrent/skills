@@ -122,15 +122,20 @@ def _guarded(p: Project) -> set[int]:
 
 
 def _run_of(p: Project, run_dir: str) -> str:
-    """The run `run_dir` stands for, resolved: itself, or for a `ttp checks` command's check-run folder
-    (checkdirs.environment rewrites its TTP_RUN_DIR) the run whose checks.pid its owner.json names."""
+    """The run `run_dir` stands for, resolved: itself, or for a `ttp checks` command (its TTP_RUN_DIR is
+    the report folder check-reports/<name>, checkdirs.environment; or the allocation check-runs/<name>)
+    the run whose checks.pid the allocation's owner.json names. The allocation lasts while a command
+    holding its inherited lifetime lock lives; once it is removed (every holder gone, checkdirs.cleanup),
+    a command left behind is not attributable and is refused, never guessed."""
     from . import checkdirs
     from .cli import CHECKS_PID
     real = _real(run_dir)
-    if Path(real).parent != Path(_real(str(p.state / checkdirs.FOLDER))):
+    runs = Path(_real(str(p.state / checkdirs.FOLDER)))
+    folder = runs / Path(real).name
+    if Path(real).parent != runs and _real(str(checkdirs.reports(folder))) != real:
         return real
     try:
-        marker = json.loads((Path(real) / checkdirs.OWNER).read_text()).get("marker")
+        marker = json.loads((folder / checkdirs.OWNER).read_text()).get("marker")
     except (OSError, ValueError, AttributeError):
         return real
     return _real(str(Path(marker).parent)) if marker and Path(marker).name == CHECKS_PID else real

@@ -239,10 +239,11 @@ def _ls_kill(pid):
 def test_a_stopped_group_leader_takes_its_group_and_a_check_command_counts_as_its_task_s(env, tmp_path, capsys,
                                                                                         monkeypatch):
     """An ended task's process that leads a group goes with its group: its child, whose TTP_RUN_DIR was
-    rewritten (as checkdirs.environment does), ends too. A `ttp checks` command, whose TTP_RUN_DIR is a
-    check-run folder whose owner.json names the task's run's checks.pid, is the task's; one whose folder
-    names another task's run is refused."""
-    from ttp import checkdirs, cli
+    rewritten (as checkdirs.environment does), ends too. A `ttp checks` command, whose TTP_RUN_DIR is its
+    allocation's report folder (checkdirs.new + environment + push.check_env, as `ttp checks` builds it)
+    and whose owner.json names the task's run's checks.pid, is the task's; one whose allocation names
+    another task's run is refused."""
+    from ttp import checkdirs, cli, push
     p = make(env)
     monkeypatch.chdir(p.root)
     tid, run_dir = _ls_task(p, "failed")
@@ -250,10 +251,10 @@ def test_a_stopped_group_leader_takes_its_group_and_a_check_command_counts_as_it
     leader, child = _ls_group(tmp_path, _ls_marks(p, tid, run_dir), {"TTP_RUN_DIR": str(tmp_path / "rewritten")})
     folders = {}
     for name, owner in (("own", run_dir), ("other", other_dir)):
-        d = p.state / checkdirs.FOLDER / f"cr-{name}"
-        d.mkdir(parents=True)
-        (d / checkdirs.OWNER).write_text(json.dumps({"marker": str(owner / "checks.pid")}))
-        folders[name] = d
+        alloc = checkdirs.new(p.state, owner / "checks.pid")
+        output = checkdirs.environment(alloc, {})["TTP_CHECK_OUTPUT_DIR"]
+        folders[name] = push.check_env("checks", run_dir=output)["TTP_RUN_DIR"]
+        assert Path(folders[name]).parent.name == "check-reports", folders[name]
     check = _ls_spawn(tmp_path, tmp_path / "c.lock", _ls_marks(p, tid, folders["own"]), "check")
     foreign = _ls_spawn(tmp_path, tmp_path / "f.lock", _ls_marks(p, tid, folders["other"]), "foreign")
     try:
