@@ -158,6 +158,11 @@ class Codex(Provider):
         # and commits in a worktree (whose git metadata lives in the main repository) are elsewhere.
         return ["-c", "sandbox_workspace_write.writable_roots=" + json.dumps([str(d) for d in dirs])] if dirs else []
 
+    def plugin_dirs_why(self, isolated: bool) -> str:
+        return ("Codex loads plugins only from those installed in its home (`codex plugin add`)"
+                + ("; worker_isolation also keeps out the plugins installed in your config.toml." if isolated
+                   else "."))
+
     def isolation_args(self) -> list[str]:
         # The user's config.toml holds their MCP servers, plugins, hooks and profiles.
         out = self._ignore_user_config()

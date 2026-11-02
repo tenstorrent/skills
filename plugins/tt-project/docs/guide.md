@@ -1915,7 +1915,9 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   A build without hooks or the trust flag keeps that older behaviour. Tested live on codex-cli 0.160.
 - Not on Codex: worker plugins (`plugin_dirs`). Codex loads plugins only from those installed in
   its home (`codex plugin add` copies them there), so a run cannot add one for itself without
-  changing your Codex setup; plugins you install yourself load as usual.
+  changing your Codex setup; plugins you install yourself load as usual. A `plugin_dirs` set for
+  Codex (or for a Cursor build without `--plugin-dir`) raises one low alert per value and a
+  `ttp doctor` line saying workers run without them.
 - Not yet on Cursor: worker plugins, worker isolation, coordinator updates reaching a running
   worker, and isolation of coordinator turns from your own CLI config and MCP servers. Cursor
   enforces no `no_internet` restriction and has no plan-window meter; without ask mode it has no

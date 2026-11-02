@@ -418,6 +418,7 @@ PRE_GRANT_REUSE_S = 30                # dispatch reuses a pre-grant check's answ
 PRE_GRANT_TICK_S = 5                  # a tick starts no new pre-grant check once its checks took this long
 PRE_GRANT_RERAISE_S = 6 * 3600        # a broken pre-grant check is raised again at most this often
 STALE_HOLDS_KEY = "holds_stale"   # kv: run -> its hold alerted as kept for a closed task (Daemon.alert_stale_holds)
+PLUGINS_DROPPED_KEY = "plugin_dirs_dropped"   # kv: provider -> [dirs, isolated] alerted as not loaded (Daemon._alert_plugins_dropped)
 WORKSPACE_RETRY_NOTE = "workspace retry"   # a queued task's note while its workspace is retried
 SLEPT_MIN_S = 60        # a run whose wall clock ran this much ahead of its monotonic clock overlapped a host sleep
 SLEEPS_KEPT_S = 7 * 86400
@@ -2258,6 +2259,26 @@ class Daemon:
     def _mcp_dirs(self, cwd: str) -> list[str]:
         return list(dict.fromkeys(str(d) for d in (cwd, Path(cwd).resolve(), self.p.root, self.p.root.resolve())))
 
+    def _alert_plugins_dropped(self, prov, provider: str, dirs: list[str], loaded: list[str]) -> None:
+        """One low alert per provider and plugin_dirs value (and worker_isolation) when the agent
+        loads none of them (Codex never does; Cursor only where its --help lists --plugin-dir), never
+        repeated on later launches. The record clears once the dirs load or are unset."""
+        db = self.p.db
+        isolated = bool(self.cfg["providers"].get(provider, {}).get("worker_isolation"))
+        seen = db.kv(PLUGINS_DROPPED_KEY, {}) or {}
+        want = [dirs, isolated] if dirs and not loaded else None
+        if seen.get(provider) == want:
+            return
+        if want is None:
+            seen.pop(provider, None)
+        else:
+            seen[provider] = want
+            self.alert(f"plugin_dirs_dropped:{provider}",
+                       prov.plugin_dirs_gap(dirs, isolated) + f" Unset providers.{provider}.plugin_dirs in "
+                       "project.json to silence this, or run those workers on a provider that loads plugins.",
+                       severity="low", every_s=0)
+        db.set_kv(PLUGINS_DROPPED_KEY, seen)
+
     def _connector_deny(self, prov, provider: str, cwd: str, plugin_dirs: list[str]) -> list[str] | None:
         """The MCP servers an isolated run keeps out by name so that it can keep the account connectors
         the project lists in `providers.<p>.mcp_servers` (mcpgap.plan); None: the run stays strict, as
@@ -2405,7 +2426,9 @@ class Daemon:
                 pass   # `ttp checks` then says plainly that it cannot write the slots
             fence = prov.writable_args(roots)
             sandboxed = bool(fence)
-            extra = fence + prov.plugin_args([d for d in dirs if d not in missing])
+            loaded = prov.plugin_args([d for d in dirs if d not in missing])
+            self._alert_plugins_dropped(prov, provider, [d for d in dirs if d not in missing], loaded)
+            extra = fence + loaded
             if self.cfg["providers"].get(provider, {}).get("worker_isolation"):
                 deny = self._connector_deny(prov, provider, cwd, [d for d in dirs if d not in missing])
                 kept = prov.keep_connectors(argv, deny) if deny is not None else None

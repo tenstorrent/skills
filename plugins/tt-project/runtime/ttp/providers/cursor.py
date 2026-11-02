@@ -92,6 +92,9 @@ class Cursor(Provider):
             out += ["--plugin-dir", d]
         return out
 
+    def plugin_dirs_why(self, isolated: bool) -> str:
+        return "this Cursor build's `--help` lists no --plugin-dir."
+
     def streams(self, argv: list[str]) -> bool:
         return "stream-json" in argv   # older builds print their one JSON result at the end
 

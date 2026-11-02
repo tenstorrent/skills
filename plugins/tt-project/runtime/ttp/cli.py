@@ -9000,6 +9000,13 @@ def cmd_doctor(a) -> None:
             if prov.name != "fake" and prov.available() and prov.write_fence()]
     if gaps:
         print("unfenced providers (their workers can write anywhere, project.db included): " + ", ".join(gaps))
+    from .coordinator import dir_list
+    for prov in all_providers():
+        pcfg = p.config()["providers"].get(prov.name, {})
+        plugs = [d for d in (str(Path(os.path.expanduser(d))) for d in dir_list(pcfg.get("plugin_dirs") or []))
+                 if Path(d).is_dir()]   # a missing one has its own alert
+        if prov.name != "fake" and plugs and not prov.plugin_args(plugs):
+            print("plugins: " + prov.plugin_dirs_gap(plugs, bool(pcfg.get("worker_isolation"))))
     claude_cfg = p.config()["providers"].get("claude", {})
     from .coordinator import name_list
     from . import mcpgap   # a gap is already a status line above

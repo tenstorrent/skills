@@ -15195,6 +15195,49 @@ def _codex_worker_launch(env, p, cwd):
     return json.loads(roots.split("=", 1)[1]), {**os.environ, **spec["env"]}
 
 
+def test_plugin_dirs_a_provider_cannot_load_alert_once_per_value_and_show_in_doctor(env, monkeypatch, tmp_path,
+                                                                                   capsys):
+    # Codex has no per-run plugin flag, so its plugin_dirs were dropped without a word.
+    from ttp import cli
+    from ttp.daemon import PLUGINS_DROPPED_KEY
+    p = make(env)
+    plug = tmp_path / "plugin"
+    plug.mkdir()
+
+    def dropped(provider):
+        return [m for m in p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref=?",
+                                  (f"plugin_dirs_dropped:{provider}",))]
+
+    p.set_config("providers.codex.plugin_dirs", [str(plug)])
+    p.set_config("providers.codex.worker_isolation", False)
+    _codex_worker_launch(env, p, env["repo"])
+    [first] = dropped("codex")
+    assert first["severity"] == "low" and "codex workers run without" in first["text"] and str(plug) in first["text"]
+    assert "config.toml" not in first["text"]
+    _codex_worker_launch(env, p, env["repo"])
+    assert len(dropped("codex")) == 1, "never repeated on the next launch"
+    p.set_config("providers.codex.worker_isolation", True)   # another config value: one more alert
+    _codex_worker_launch(env, p, env["repo"])
+    assert len(dropped("codex")) == 2 and "config.toml" in dropped("codex")[-1]["text"]
+    _codex_worker_launch(env, p, env["repo"])
+    assert len(dropped("codex")) == 2
+
+    p.set_config("providers.claude.plugin_dirs", [str(plug)])
+    argv, _, _ = _dispatch_claude_worker(p, monkeypatch, {})
+    assert "--plugin-dir" in argv and dropped("claude") == [], "Claude loads them: no alert"
+
+    monkeypatch.setattr(cli, "need", lambda *a: p)
+    cli.cmd_doctor(types.SimpleNamespace(name="demo"))
+    lines = [l for l in capsys.readouterr().out.splitlines() if l.startswith("plugins: ")]
+    assert len(lines) == 1 and lines[0].startswith("plugins: codex workers run without") and str(plug) in lines[0]
+    assert "worker_isolation also keeps out the plugins installed in your config.toml" in lines[0]
+
+    p.set_config("providers.codex.plugin_dirs", [])
+    _codex_worker_launch(env, p, env["repo"])
+    assert "codex" not in (p.db.kv(PLUGINS_DROPPED_KEY) or {}), "unset: the record clears"
+    assert len(dropped("codex")) == 2
+
+
 def test_sandboxed_workers_get_a_private_writable_temp_dir(env):
     # On macOS git is an xcrun shim; in Codex's sandbox xcrun could not write its cache under /tmp
     # (`couldn't create cache file /tmp/xcrun_db-...`), so git failed. A fenced worker gets its own

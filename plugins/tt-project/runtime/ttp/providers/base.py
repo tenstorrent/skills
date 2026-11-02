@@ -280,6 +280,15 @@ class Provider:
         """Arguments that load extra skill plugins for one run; [] when the agent cannot."""
         return []
 
+    def plugin_dirs_gap(self, dirs: list[str], isolated: bool) -> str:
+        """The line saying this agent's workers run without the plugins in `dirs`, for when
+        plugin_args loaded none of them (the daemon's one alert and `ttp doctor`)."""
+        return (f"{self.name} workers run without the plugins in providers.{self.name}.plugin_dirs "
+                f"({', '.join(dirs)}): {self.plugin_dirs_why(isolated)}")
+
+    def plugin_dirs_why(self, isolated: bool) -> str:
+        return f"{self.name} cannot load plugins for one run."
+
     def session_args(self, session_id: str) -> list[str]:
         """Arguments that make a new run's agent session use `session_id`, so the session is known
         before the agent writes anything; [] when the agent cannot."""
