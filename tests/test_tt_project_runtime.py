@@ -2130,7 +2130,8 @@ def test_unblock_reports_state_intervals_whole_episodes_and_what_is_stuck_now_ap
     ({"waiting_for": "the user's review"}, ("external", "other")),
     ({"waiting_for": "task #12", "retry_when": "test -e /tmp/x"}, ("external", "other")),
     ({"waiting_for": "my measurement window", "retry_when": "ttp lock --probe m"}, ("external", "lock")),
-    ({"retry_when": "ttp checks --result /r", "wait_kind": "external"}, ("external", "hand-off")),
+    ({"retry_when": "ttp checks --result /r", "wait_kind": "external"}, ("self", "checks")),   # own checks lane
+    ({"retry_when": "ttp checks --result /r; ttp lock --probe b", "wait_kind": "external"}, ("external", "hand-off")),
     ({"waiting_for": "a lull at night", "wait_kind": "Self"}, ("self", "hand-off")),
     ({}, ("external", "other")), (None, ("external", "other")),
 ])

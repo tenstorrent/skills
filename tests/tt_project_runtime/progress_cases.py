@@ -1108,6 +1108,45 @@ def test_a_wait_on_the_users_step_raises_no_probe_stall_and_self_or_external_wai
         and not unblock.is_self_wait(json.dumps({"wait": "user"}))
 
 
+def test_a_wait_on_the_projects_own_checks_lane_is_self_even_when_the_hand_off_says_external(env, monkeypatch):
+    """A wait whose probe or waiting_for names the project's own `ttp checks` result, slot or lane is
+    recorded as a self-wait (why `checks`) whatever wait_kind the worker wrote; a probe that also waits on
+    other work (a lock, another task, an outside service) and plain external waits stay external."""
+    from ttp import unblock
+    for r in ({"wait_kind": "external", "waiting_for": "external", "retry_when": "ttp checks --probe 12"},
+              {"wait_kind": "external", "retry_when": "/x/bin/ttp checks --result /s/runs/9077"},
+              {"wait_kind": "external", "retry_when": "test -f /s/runs/8706/checks.rc && exit 0 || exit 1"},
+              {"wait_kind": "external", "waiting_for": "Checks slot for this task's full checks",
+               "retry_when": "bash /tmp/rt.sh"},
+              {"waiting_for": "detached ttp checks to finish in the shared checks lane", "retry_when": "test -e /m"},
+              {"wait_kind": "EXTERNAL", "waiting_for": "the project's checks queue"},
+              {"wait_kind": "external", "retry_when": "ttp checks status"}):
+        assert unblock.classify_wait(r) == ("self", "checks"), r
+    for r in ({"wait_kind": "external", "waiting_for": "the status page",
+               "retry_when": "curl -fsS https://status.example.com/api | grep -q ok"},
+              {"wait_kind": "external", "waiting_for": "ttp checks slot", "retry_when": "ssh box test -e /done"},
+              {"wait_kind": "external", "waiting_for": "the board, then ttp checks", "retry_when": "ttp lock --probe b"},
+              {"waiting_for": "#7's checks run to land", "retry_when": "landed:#7"},
+              {"wait_kind": "external", "waiting_for": "a free board", "retry_when": "test -e /m"},
+              {"waiting_for": "another task's review", "retry_when": "ttp ack-wait probe --from q --hash h"},
+              {"wait_kind": "external", "waiting_for": "the checkout to finish", "retry_when": "test -e /m"}):
+        assert unblock.classify_wait(r)[0] == "external", r
+    assert unblock.classify_wait({"wait_kind": "self", "retry_when": "ttp checks --result /r"}) == ("self", "hand-off")
+    assert unblock.classify_wait({"wait_kind": "user", "retry_when": "ttp checks --result /r"})[0] == "user"
+    # The daemon records it so: the stuck, selfblock and audit views read task_waiting data.wait.
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    for result, want in (({"waiting_for": "external", "retry_when": "ttp checks --probe 12"}, "self"),
+                         ({"waiting_for": "the status page", "retry_when": "curl -fsS https://status.example.com"},
+                          "external")):
+        monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({"status": "waiting", "summary": "later", "retry_after_s": 600,
+                                                          "wait_kind": "external", **result}))
+        tid = p.db.add_task(f"waits {want}", "s", kind="work", tier="light", origin="user")
+        assert _run_until(d, p, lambda: p.db.one("SELECT id FROM events WHERE kind='task_waiting' AND task=?", (tid,)))
+        ev = json.loads(p.db.one("SELECT data FROM events WHERE kind='task_waiting' AND task=?", (tid,))["data"])
+        assert ev["wait"] == want and unblock.is_self_wait(json.dumps(ev)) is (want == "self"), ev
+
 def test_a_reply_wait_stays_quiet_while_its_peer_recovers_and_re_arms_once_it_is_ready(env, monkeypatch):
     """While the project a reply wait waits on cannot act (read-only from its own state through
     machine_ledger.can_act), the wait raises no wait_stale and its note says the peer is recovering. Once

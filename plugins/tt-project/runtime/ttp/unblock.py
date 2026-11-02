@@ -65,6 +65,13 @@ SELF_PROBES = (("checks", re.compile(r"\bchecks\s+--result\b")),
                ("detached jobs", re.compile(r"\bdetach\s+--check\b")),
                ("push queue", re.compile(r"\bpush\s+--(result|free)\b")))
 EXTERNAL_PROBE = re.compile(r"\block\s+--probe\b")   # a shared resource: someone else holds it
+# The project's own checks lane (its `ttp checks` result, slot or lane), in a probe or a `waiting_for`:
+# a self-wait even when the hand-off says external. A probe that also waits on other work (a lock,
+# another task or project, an upstream fix, the network, another host) keeps the hand-off's word.
+OWN_CHECKS_PROBE = re.compile(r"\bchecks\s+(--(result|probe|slot-status)\b|status\b)|/checks\.rc\b")
+OWN_CHECKS_FOR = re.compile(r"\bttp\s+checks\b|\bchecks?\s+(slot|lane|holder|queue|run|result)s?\b", re.I)
+OTHER_WORK_PROBE = re.compile(r"\block\s+--probe\b|\blanded:|\b(ack-wait|upstream|curl|wget|ssh|nc|gh)\b|\w+://",
+                              re.I)
 # A time window the task planned itself (a measurement or soak period), in its `waiting_for`.
 PLANNED_WINDOW = re.compile(
     r"\b(planned|scheduled|own|measurement|measuring|observation|observing|monitoring|soak|burn-in|bake|"
@@ -129,14 +136,18 @@ def classify_wait(result: dict | None) -> tuple[str, str]:
     detached checks or jobs, the push queue, a time window or start_after/start_when it set), else
     'external' (a busy resource or lock, another task, a human, a review), or 'user' when the hand-off
     says only the user's step ends it (`user` or `user-action`; never a self-wait, counted as external).
-    The hand-off's own `wait_kind` wins; an unknown wait counts as external, so a real one still raises effort."""
+    The hand-off's own `wait_kind` wins, except that a wait on the project's own checks lane is always
+    'self'; an unknown wait counts as external, so a real one still raises effort."""
     r = result if isinstance(result, dict) else {}
     own = str(r.get("wait_kind") or "").strip().lower()
     if own in USER_WAIT_KINDS:
         return "user", "hand-off"
+    probe = str(r.get("retry_when") or "")
+    if own != "self" and not OTHER_WORK_PROBE.search(probe) and (
+            OWN_CHECKS_PROBE.search(probe) or OWN_CHECKS_FOR.search(str(r.get("waiting_for") or ""))):
+        return "self", "checks"
     if own in WAIT_KINDS:
         return own, "hand-off"
-    probe = str(r.get("retry_when") or "")
     if EXTERNAL_PROBE.search(probe):
         return "external", "lock"
     for why, rx in SELF_PROBES:
