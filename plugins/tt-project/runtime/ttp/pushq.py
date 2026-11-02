@@ -2092,7 +2092,8 @@ def finalize(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, *
 def prune_refs(p: Project) -> int:
     """Delete the pin of each row that is pushed, landed, cancelled or otherwise settled once its
     task is finished, and pins without a row (an approval that rolled back). A conflict, check
-    failure or refusal keeps its pin while its task is open."""
+    failure or refusal keeps its pin while its task is open. Model-free resolutions' pins go with
+    their finished reviews."""
     db = p.db
     if not db.one("SELECT id FROM push_queue LIMIT 1"):
         return 0
@@ -2103,6 +2104,16 @@ def prune_refs(p: Project) -> int:
         row = db.one("SELECT q.status, t.status AS task_status FROM push_queue q LEFT JOIN tasks t ON t.id=q.task "
                      "WHERE q.id=?", (int(tail),)) if tail.isdigit() else None
         if row and (row["status"] in ("approved", "batched") or row["task_status"] not in (*TERMINAL_TASK_STATES, None)):
+            continue
+        if _git(p, "update-ref", "-d", ref).returncode == 0:
+            gone += 1
+    # A model-free conflict resolution's pin (conflictfix.RESOLVED_REF) goes once its review is finished:
+    # a head it approved is pinned by its row by then.
+    refs = _git(p, "for-each-ref", "--format=%(refname)", conflictfix.RESOLVED_REF)
+    for ref in refs.stdout.split() if refs.returncode == 0 else []:
+        tail = ref[len(conflictfix.RESOLVED_REF):]
+        task = db.task(int(tail)) if tail.isdigit() else None
+        if task and task["status"] not in TERMINAL_TASK_STATES:
             continue
         if _git(p, "update-ref", "-d", ref).returncode == 0:
             gone += 1

@@ -14870,3 +14870,136 @@ def test_a_light_conflict_fixs_refused_approval_tells_the_standard_run_why_and_c
     monkeypatch.setattr(conflictfix, "run_note", lambda note: None)
     t = _pq_hand_off(env, s, push=[{"branch": cbranch, "head": chead}], task=crev)
     assert t["status"] == "queued" and json.loads(t["result"])["push_invalid"] == 1, t
+
+
+def _mf_repo(tmp_path, base: dict, ours: dict, theirs: dict):
+    """A repo with a base commit, the tip (`ours`) and a change (`theirs`) on it: (root, tip, head)."""
+    repo = tmp_path / "mf"
+    repo.mkdir(parents=True)
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True,  # noqa: E731
+                                  text=True).stdout.strip()
+    g("init", "-q", "-b", "main")
+    g("config", "user.email", "t@example.com")
+    g("config", "user.name", "t")
+
+    def commit(files, msg):
+        for name, text in files.items():
+            (repo / name).write_text(text)
+        g("add", ".")
+        g("commit", "-qm", msg)
+        return g("rev-parse", "HEAD")
+    root = commit(base, "base")
+    tip = commit(ours, "tip")
+    g("checkout", "-q", "--detach", root)
+    head = commit(theirs, "change")
+    g("checkout", "-q", "main")
+    return str(repo), tip, head
+
+
+def test_conflict_fix_additive_keeps_both_sides_additions_ours_first_and_refuses_any_edit():
+    from ttp import conflictfix
+    assert conflictfix.additive(["a\n"], [], ["b\n"]) == ["a\n", "b\n"]
+    # Both kept the base lines and inserted at one spot, or at different spots.
+    assert conflictfix.additive(["x\n", "a\n", "y\n"], ["x\n", "y\n"], ["x\n", "b\n", "y\n"]) == \
+        ["x\n", "a\n", "b\n", "y\n"]
+    assert conflictfix.additive(["a\n", "x\n", "y\n"], ["x\n", "y\n"], ["x\n", "y\n", "b\n"]) == \
+        ["a\n", "x\n", "y\n", "b\n"]
+    # A changed or removed base line is an edit.
+    assert conflictfix.additive(["x2\n", "y\n"], ["x\n", "y\n"], ["x\n", "b\n", "y\n"]) is None
+    assert conflictfix.additive(["y\n"], ["x\n", "y\n"], ["x\n", "y\n", "b\n"]) is None
+    assert conflictfix.merge_additive("a\nb\n", "a\n", "a\nc\n") == ("a\nb\nc\n", [{"ours": ["b\n"], "theirs": ["c\n"]}])
+    assert conflictfix.merge_additive("a\nB\n", "a\nb\n", "a\nb2\n") is None
+    assert conflictfix.merge_additive("a\nb", "a\n", "a\nc\n") is None     # no final newline: not read
+
+
+def test_an_append_append_push_conflict_is_settled_model_free(tmp_path):
+    """Both sides append a test at the end of one file: the rebase keeps both, the tip's first, and
+    the result parses. The scratch worktree is gone afterwards and the root's checkout is untouched."""
+    from ttp import conflictfix
+    base = "def test_a():\n    assert 1\n"
+    root, tip, head = _mf_repo(tmp_path, {"t.py": base, "n.md": "one\n"},
+                               {"t.py": base + "\n\ndef test_b():\n    assert 2\n"},
+                               {"t.py": base + "\n\ndef test_c():\n    assert 3\n"})
+    mf = conflictfix.model_free(root, head, tip)
+    assert mf and mf["files"] == ["t.py"] and mf["hunks"] == 1 and mf["onto"] == tip, mf
+    got = subprocess.run(["git", "-C", root, "show", f"{mf['sha']}:t.py"], capture_output=True, text=True).stdout
+    assert got.index("test_b") < got.index("test_c") and "test_a" in got
+    __import__("ast").parse(got)
+    parent = subprocess.run(["git", "-C", root, "rev-parse", f"{mf['sha']}^"], capture_output=True, text=True).stdout
+    assert parent.strip() == tip and "+> " in mf["delta"] and "+< " in mf["delta"]
+    wts = subprocess.run(["git", "-C", root, "worktree", "list"], capture_output=True, text=True).stdout
+    assert len(wts.splitlines()) == 1, wts
+    assert subprocess.run(["git", "-C", root, "status", "--porcelain"], capture_output=True, text=True).stdout == ""
+    # try_model_free pins it, and answers the same head and tip again without a second rebase.
+    cf = {"head": head, "onto": tip, "target": "origin/none", "files": ["t.py"]}
+    assert conflictfix.try_model_free(root, cf, 42)["sha"] == mf["sha"]
+    pin = subprocess.run(["git", "-C", root, "rev-parse", f"{conflictfix.RESOLVED_REF}42"], capture_output=True,
+                         text=True).stdout.strip()
+    assert pin == mf["sha"]
+    # Never for an escalated mark, a trim, or a stop that is no textual conflict.
+    for more in ({"escalate": "x"}, {"trim": {"ids": []}}, {"files": ["(the rebase stopped: x)"]}):
+        assert conflictfix.try_model_free(root, {**cf, **more}, 42) is None
+
+
+def test_an_edit_edit_or_unparsable_or_shadowing_push_conflict_falls_back(tmp_path):
+    from ttp import conflictfix
+    base = "def f():\n    return 1\n"
+    root, tip, head = _mf_repo(tmp_path, {"m.py": base}, {"m.py": base.replace("1", "2")},
+                               {"m.py": base.replace("1", "3")})
+    assert conflictfix.model_free(root, head, tip) is None                       # edit/edit
+    base = "if a:\n    b = 1\n"
+    root, tip, head = _mf_repo(tmp_path / "p", {"m.py": base}, {"m.py": base + "c = 3\n"},
+                               {"m.py": base + "else:\n    b = 2\n"})
+    assert conflictfix.model_free(root, head, tip) is None                       # both added, no longer parses
+    base = "X = 1\n"
+    root, tip, head = _mf_repo(tmp_path / "d", {"m.py": base}, {"m.py": base + "\n\ndef test_x():\n    return 1\n"},
+                               {"m.py": base + "\n\ndef test_x():\n    return 2\n"})
+    assert conflictfix.model_free(root, head, tip) is None                       # one test would shadow the other
+    root, tip, head = _mf_repo(tmp_path / "n", {"a.txt": "a\n"}, {"b.txt": "tip\n"}, {"b.txt": "change\n"})
+    assert conflictfix.model_free(root, head, tip) is None                       # both created one file
+    for d in ("", "p", "d", "n"):
+        wts = subprocess.run(["git", "-C", str(tmp_path / d / "mf"), "worktree", "list"], capture_output=True,
+                             text=True).stdout
+        assert len(wts.splitlines()) == 1, wts
+
+
+def test_a_model_free_resolution_queues_a_light_review_of_its_delta_and_records_the_resolution(env, monkeypatch):
+    """Dispatch of a textual conflict fix settles it model-free when it can: the run is a light review
+    of the delta that approves the resolved head (accepted as the conflict's re-approval), and the
+    conflict row records model_free. Once that review fails, the fix runs as before: review_rerun."""
+    from ttp import conflictfix, pushq
+    from ttp.daemon import Daemon
+    from ttp.prompts import worker_task
+    s = _pq(env, monkeypatch)
+    _git_out(s.path, "checkout", "-q", "-b", "mf-side")
+    _commit(s.path, "list.py", "A = [\n    1,\n]\n")
+    _git_out(s.path, "checkout", "-q", "-b", "mf-tip")
+    _commit(s.path, "list.py", "A = [\n    1,\n    2,\n]\n")
+    tip = _git_out(s.path, "rev-parse", "HEAD")
+    _git_out(s.path, "checkout", "-q", "mf-side")
+    _commit(s.path, "list.py", "A = [\n    1,\n    3,\n]\n")
+    head = _git_out(s.path, "rev-parse", "HEAD")
+    now = time.time()
+    _pq_row(s.p, s.review, now, status="conflict", head=head)
+    cf = {"head": head, "branch": s.branch, "target": "origin/none", "onto": tip, "files": ["list.py"], "n": 1}
+    s.p.db.update_task(s.review, status="queued", result=json.dumps({"status": "queued", "conflict_fix": cf}))
+    d = Daemon(s.p.base)
+    task, pick = d._size_review(s.p.db.task(s.review))
+    mf = pick["conflict_fix"].get("model_free")
+    assert task["tier"] == "light" and mf and mf["onto"] == tip and "model-free" in pick["rule"], pick
+    assert _git_out(s.repo, "show", f"{mf['sha']}:list.py") == "A = [\n    1,\n    2,\n    3,\n]"
+    assert [r["resolution"] for r in s.p.db.q("SELECT resolution FROM push_queue WHERE task=?", (s.review,))] == \
+        ["model_free"]
+    prompt = worker_task(s.p, s.p.db.task(s.review), str(s.p.root), None, conflict=pick["conflict_fix"])
+    assert "light delta review" in prompt and mf["sha"] in prompt and "range-diff" in prompt
+    assert f'"push": [{{"branch": "{s.branch}", "head": "{mf["sha"]}"}}]' in prompt and "+>     3," in prompt
+    assert "review the feature" not in prompt
+    ok = pushq.check_approval(s.p, s.p.db.task(s.review), [{"branch": s.branch, "head": mf["sha"]}])
+    assert ok.get("entries"), ok
+    # The light review failed: escalated, the fix runs as before and the row says so.
+    s.p.db.update_task(s.review, result=json.dumps({"status": "queued", "conflict_fix": {**cf, "escalate": "no"}}))
+    task, pick = d._size_review(s.p.db.task(s.review))
+    assert "model_free" not in pick["conflict_fix"] and task["tier"] == "standard"
+    assert s.p.db.one("SELECT resolution FROM push_queue WHERE task=?", (s.review,))["resolution"] == "review_rerun"
+    st = conflictfix.stats(s.p.db, now - 60)
+    assert st["review_rerun"] == 1 and st["model_free"] == 0, st

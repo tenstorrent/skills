@@ -11551,12 +11551,19 @@ class Daemon:
         runs at conflictfix.tier_for's tier for this run only, deep reviews too."""
         cf = conflictfix.of(task)
         if cf is not None:
-            tier, why = conflictfix.tier_for(str(self.p.root), cf)
+            # A model-free resolution first (conflictfix.model_free): then only its delta is reviewed, at light.
+            mf = conflictfix.try_model_free(str(self.p.root), cf, task["id"])
+            if mf:
+                tier, why = "light", f"model-free resolution {mf['sha'][:10]} of {mf['hunks']} added hunk(s): review its delta"
+            else:
+                tier, why = conflictfix.tier_for(str(self.p.root), cf)
             if tier == "standard" and task["tier"] == "deep":
                 tier = "deep"
+            conflictfix.record(self.p.db, task["id"], conflictfix.RESOLUTIONS[0 if mf else 1])
             log(self.p, f"task {task['id']}: push-conflict fix at {tier} ({why})")
             return dict(task, tier=tier), {"tier": tier, "from": task["tier"], "rule": why,
-                                           conflictfix.KEY: {"tier": tier, "why": why, "head": cf.get("head")}}
+                                           conflictfix.KEY: {"tier": tier, "why": why, "head": cf.get("head"),
+                                                             **({"model_free": mf} if mf else {})}}
         if task["tier"] == "deep":
             return task, None
         prior = self._failed_review_before(task)

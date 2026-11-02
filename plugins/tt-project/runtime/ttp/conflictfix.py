@@ -14,14 +14,26 @@ A trim-to-fit fix is the same run for a change whose merged push checks failed o
 caps (cap_failure): each change fit alone, but together with what landed before it the prompt text
 is over a cap. Its mark carries `trim` (the failing tests and each measured overshoot); the run
 rebases, trims the change's own prompt text by at least the overshoot, and approves again. A review
-gets at most TRIM_MAX of them per change before a cap failure fails it as any other check."""
+gets at most TRIM_MAX of them per change before a cap failure fails it as any other check.
+
+Before a textual conflict costs a fix run, dispatch tries a model-free resolution (model_free): it
+rebases the head onto the tip in a scratch worktree and settles each conflicted hunk in which both
+sides only added lines (additive), ours then theirs. Only when every hunk qualifies and each Python
+file it wrote still parses (with no top-level name defined twice) does it keep the result; the run
+is then a light review of that resolution's delta alone (prompts.delta_review_task), and the push
+checks run on the head it approves, as on any other. Any doubt falls back to the fix run above.
+`record` notes on the conflict rows which way each was settled (RESOLUTIONS)."""
 from __future__ import annotations
 
 import ast
+import difflib
 import json
 import os
 import re
+import secrets
+import shutil
 import subprocess
+import tempfile
 import time
 
 from . import gitmemo
@@ -33,6 +45,10 @@ TRIM_MAX = 2           # ... after which a cap failure fails the review as any o
 CAP_TESTS = r"(?i)prompt\w*_(?:stays_small|under_its_cap|size)$"   # delivery.push_cap_tests: a prompt size cap test's name
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
 # An overshoot line batch._stream keeps from a check's whole output: pytest's `assert <size> <= <cap>`.
+RESOLUTIONS = ("model_free", "review_rerun")   # push_queue.resolution of a conflict row (record)
+RESOLVED_REF = "refs/ttp/resolved/"   # + task id: pins a model-free resolution until its task ends
+_TRIED: dict[tuple, dict | None] = {}   # (root, head, onto) -> model_free's answer, this process
+DELTA_CHARS = 4000     # the settled hunks a delta review's prompt shows
 _OVER = re.compile(r"^E\s+assert (\d[\d_]*) <= (\d[\d_]*)(?:\s+\(in (\S+)\))?\s*$", re.M)
 
 
@@ -94,7 +110,7 @@ def of(task: dict) -> dict | None:
 
 def _git(root: str, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", root, *args], text=True, capture_output=True, timeout=gitmemo.timeout(60, args),
-                          stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+                          stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_EDITOR": "true"})
 
 
 def _functions(src: str) -> list[tuple[str, int, int]]:
@@ -193,11 +209,15 @@ def run_note(note: str | None) -> dict | None:
 def stats(db, since: float) -> dict:
     """Cost of the runs that fixed push conflicts since `since`: each conflict the queue sent back
     and its task's next run. `light` counts runs dispatched as light conflict fixes, `other` the
-    rest (before this rule, or escalated)."""
-    out = {"fixes": 0, "usd": 0.0, "light": 0, "light_usd": 0.0, "other": 0, "other_usd": 0.0}
+    rest (before this rule, or escalated). `model_free` and `review_rerun` (and their `_usd`) count
+    the conflicts by the resolution dispatch recorded (record), the cost of each one's run included."""
+    out = {"fixes": 0, "usd": 0.0, "light": 0, "light_usd": 0.0, "other": 0, "other_usd": 0.0,
+           **{k: 0 for k in RESOLUTIONS}, **{f"{k}_usd": 0.0 for k in RESOLUTIONS}}
     seen: set[int] = set()
-    for row in db.q("SELECT task, MAX(updated) t FROM push_queue WHERE status='conflict' AND updated>=? "
-                    "GROUP BY task, created", (since,)):
+    for row in db.q("SELECT task, MAX(updated) t, MAX(resolution) how FROM push_queue WHERE status='conflict' "
+                    "AND updated>=? GROUP BY task, created", (since,)):
+        if row["how"] in RESOLUTIONS:
+            out[row["how"]] += 1
         r = db.one("SELECT id, cost_usd, note FROM runs WHERE task=? AND role!='coordinator' AND started>=? "
                    "ORDER BY id LIMIT 1", (row["task"], row["t"]))
         if not r or r["id"] in seen:
@@ -210,7 +230,190 @@ def stats(db, since: float) -> dict:
         out[f"{k}_usd"] += cost
         out["fixes"] += 1
         out["usd"] += cost
-    for k in ("usd", "light_usd", "other_usd"):
+        if row["how"] in RESOLUTIONS:
+            out[f"{row['how']}_usd"] += cost
+    for k in ("usd", "light_usd", "other_usd", *(f"{k}_usd" for k in RESOLUTIONS)):
         out[k] = round(out[k], 2)
     out["usd_per_fix"] = round(out["usd"] / out["fixes"], 2) if out["fixes"] else None
     return out
+
+
+def additive(ours: list[str], base: list[str], theirs: list[str]) -> list[str] | None:
+    """One conflict hunk's lines settled without judgment, or None: when each side only added lines
+    to the base section (empty, or kept whole by both), the lines both added at one spot go ours
+    first, then theirs. Any changed or removed base line is an edit: None."""
+    at: list[dict[int, list[str]]] = []
+    for side in (ours, theirs):
+        ins: dict[int, list[str]] = {}
+        for tag, i1, _i2, j1, j2 in difflib.SequenceMatcher(None, base, side, autojunk=False).get_opcodes():
+            if tag == "insert":
+                ins.setdefault(i1, []).extend(side[j1:j2])
+            elif tag != "equal":
+                return None
+        at.append(ins)
+    out: list[str] = []
+    for k in range(len(base) + 1):
+        out += at[0].get(k, []) + at[1].get(k, [])
+        if k < len(base):
+            out.append(base[k])
+    return out
+
+
+def merge_additive(ours: str, base: str, theirs: str) -> tuple[str, list[dict]] | None:
+    """git's three-way merge of the texts with each conflict hunk settled by `additive`: (merged
+    text, the hunks settled as {"ours", "theirs"} line lists), or None when a hunk is no pure
+    addition, a side does not end with a newline, or the markers cannot be read. The markers carry a
+    random tag, so file content never passes for one."""
+    if any(t and not t.endswith("\n") for t in (ours, base, theirs)):
+        return None
+    tag = secrets.token_hex(8)
+    # built, not spelled out: a literal marker line would make this file read as a conflicted one
+    start, mid, end = (f"{c * 7} {side}-{tag}" for c, side in (("<", "ours"), ("|", "base"), (">", "theirs")))
+    with tempfile.TemporaryDirectory() as d:
+        paths = []
+        for name, text in (("ours", ours), ("base", base), ("theirs", theirs)):
+            path = os.path.join(d, name)
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+            paths.append(path)
+        r = subprocess.run(["git", "merge-file", "-p", "--diff3", "-L", f"ours-{tag}", "-L", f"base-{tag}",
+                            "-L", f"theirs-{tag}", *paths], capture_output=True, text=True,
+                           timeout=gitmemo.timeout(60, ("merge-file",)))
+    if not 0 <= r.returncode < 127:
+        return None
+    lines, out, hunks, i = r.stdout.splitlines(keepends=True), [], [], 0
+    while i < len(lines):
+        if lines[i].rstrip("\r\n") != start:
+            out.append(lines[i])
+            i += 1
+            continue
+        parts: list[list[str]] = [[], [], []]
+        k, i = 0, i + 1
+        while i < len(lines) and lines[i].rstrip("\r\n") != end:
+            line = lines[i].rstrip("\r\n")
+            if line == mid and k == 0:
+                k = 1
+            elif line == "=" * 7 and k == 1:
+                k = 2
+            else:
+                parts[k].append(lines[i])
+            i += 1
+        if i >= len(lines) or k != 2:
+            return None
+        both = additive(parts[0], parts[1], parts[2])
+        if both is None:
+            return None
+        out += both
+        hunks.append({"ours": parts[0], "theirs": parts[2]})
+        i += 1
+    return "".join(out), hunks
+
+
+def _py_ok(text: str, ours: str, theirs: str) -> bool:
+    """A settled Python file parses and defines no top-level name twice that neither side did."""
+    from .batch import _duplicates
+    try:
+        ast.parse(text)
+    except (SyntaxError, ValueError):
+        return False
+    return not _duplicates(text) - _duplicates(ours) - _duplicates(theirs)
+
+
+def model_free(root: str, head: str, onto: str, steps: int = 200) -> dict | None:
+    """Rebase `head` onto `onto` in a scratch worktree of `root`, settling every conflict by
+    merge_additive: {"sha", "onto", "files", "hunks", "delta"} (the new head, the files it settled,
+    their hunk count and a bounded text of the settled hunks), or None when any conflict needs
+    judgment, a stop is no content conflict, the head carries merges, or git fails. Ours (stage 2)
+    is the tip, theirs (stage 3) the change. Nothing outside the scratch worktree changes."""
+    if _git(root, "rev-list", "--merges", "-1", head, f"^{onto}").stdout.strip():
+        return None
+    wt = tempfile.mkdtemp(prefix="ttp-resolve-")
+    files: list[str] = []
+    settled: list[tuple[str, dict]] = []
+    try:
+        if _git(root, "worktree", "add", "--detach", "--quiet", wt, onto).returncode != 0:
+            return None
+        r = _git(wt, "rebase", "--no-keep-empty", onto, head)
+        for _ in range(steps):
+            if r.returncode == 0:
+                sha = _git(wt, "rev-parse", "HEAD").stdout.strip()
+                if not sha or not settled:
+                    return None   # nothing conflicted here: the batch's own conflict is not this one
+                return {"sha": sha, "onto": onto, "files": sorted(set(files)), "hunks": len(settled),
+                        "delta": _delta(settled)}
+            unmerged = [f for f in _git(wt, "diff", "--name-only", "-z", "--diff-filter=U").stdout.split("\0") if f]
+            if not unmerged:
+                return None       # the rebase stopped for another reason
+            for f in unmerged:
+                stages = [_git(wt, "show", f":{n}:{f}") for n in (2, 1, 3)]
+                if any(x.returncode != 0 for x in stages):
+                    return None   # deleted on one side, or created on both
+                o, b, t = (x.stdout for x in stages)
+                if "\0" in o + b + t:
+                    return None
+                got = merge_additive(o, b, t)
+                if got is None or (f.endswith(".py") and not _py_ok(got[0], o, t)):
+                    return None
+                with open(os.path.join(wt, f), "w", encoding="utf-8", newline="") as fh:
+                    fh.write(got[0])
+                files.append(f)
+                settled += [(f, h) for h in got[1]]
+            if _git(wt, "add", "--", *unmerged).returncode != 0:
+                return None
+            r = _git(wt, "rebase", "--continue")
+        return None
+    except (OSError, UnicodeDecodeError, subprocess.SubprocessError):
+        return None
+    finally:
+        try:
+            _git(root, "worktree", "remove", "--force", wt)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        shutil.rmtree(wt, ignore_errors=True)
+
+
+def _delta(settled: list[tuple[str, dict]]) -> str:
+    """The settled hunks as text for a delta review: per hunk, the tip's lines then the change's."""
+    out = []
+    for f, h in settled:
+        out.append(f"--- {f}: kept both, the tip's lines first\n" + "".join(f"+< {x}" for x in h["ours"])
+                   + "".join(f"+> {x}" for x in h["theirs"]))
+    text = "\n".join(out)
+    return text if len(text) <= DELTA_CHARS else text[:DELTA_CHARS] + "\n... (cut: see the range-diff)"
+
+
+def try_model_free(root: str, cf: dict, task_id: int) -> dict | None:
+    """The model-free resolution of a queued conflict fix's head (model_free), pinned under
+    RESOLVED_REF, or None: then the fix runs as before. Only a plain textual conflict qualifies: no
+    escalation, no trim, conflicting files named. It rebases onto the target's current tip where
+    git knows it, else onto the tip the batch saw."""
+    head = str(cf.get("head") or "")
+    files = [str(f) for f in cf.get("files") or []]
+    if cf.get("escalate") or cf.get("trim") or not head or not files or files[0].startswith("(the rebase"):
+        return None
+    try:
+        onto = ""
+        for ref in (str(cf.get("target") or ""), str(cf.get("onto") or "")):
+            if ref and (r := _git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")).returncode == 0:
+                onto = r.stdout.strip()
+                break
+        if not onto or _git(root, "cat-file", "-e", f"{head}^{{commit}}").returncode != 0:
+            return None
+        key = (root, head, onto)
+        if key not in _TRIED:   # a dispatch that did not start tries again next tick: no second rebase
+            while len(_TRIED) >= 64:
+                _TRIED.pop(next(iter(_TRIED)))
+            _TRIED[key] = model_free(root, head, onto)
+        mf = _TRIED[key]
+        if mf and _git(root, "update-ref", f"{RESOLVED_REF}{int(task_id)}", mf["sha"]).returncode != 0:
+            return None
+        return mf
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def record(db, task_id: int, kind: str) -> None:
+    """Note on the review's latest conflict rows how dispatch settles them (RESOLUTIONS); a later
+    run of the same fix (an escalation) overwrites it."""
+    db.x("UPDATE push_queue SET resolution=? WHERE task=? AND status='conflict' AND "
+         "created=(SELECT MAX(created) FROM push_queue WHERE task=?)", (kind, task_id, task_id))

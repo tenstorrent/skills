@@ -614,6 +614,8 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
     prev = load_result(task["result"])
     cmark = prev.get(conflictfix.KEY) if isinstance(prev.get(conflictfix.KEY), dict) else None
     if conflict and cmark and conflict.get("tier") == "light":
+        if isinstance(conflict.get("model_free"), dict):
+            return delta_review_task(p, task, cwd, branch, cmark, conflict["model_free"])
         return conflict_fix_task(p, task, cwd, branch, cmark)
     if prev:
         history = f"\nPrevious attempt ended '{prev.get('status')}': {str(prev.get('summary') or '')[:1500]}\n"
@@ -774,6 +776,40 @@ def conflict_fix_task(p: Project, task: dict, cwd: str, branch: str | None, cf: 
         "change's intent, or the tests fail for a reason you cannot settle in the resolution: stop and hand off "
         "`failed` saying what it is. The task then runs again at once at standard, at no attempt.\n"
         "Never run `ttp push` or `git push`, never bump versions or write a changeset.",
+        restrictions_pointer(p)])
+
+
+def delta_review_task(p: Project, task: dict, cwd: str, branch: str | None, cf: dict, mf: dict) -> str:
+    """The short prompt of a light review of a model-free conflict resolution (conflictfix.model_free):
+    the daemon rebased the approved head and kept both sides of each added hunk; the run judges only
+    that resolution's delta and approves the resolved head, or fails it back to a standard fix."""
+    head, onto, target = str(cf.get("head") or "?"), str(mf.get("onto") or "?"), str(cf.get("target") or "?")
+    cb, sha = str(cf.get("branch") or ""), str(mf.get("sha") or "?")
+    files = ", ".join(str(f) for f in mf.get("files") or []) or "?"
+    return "\n\n".join([
+        f"# YOUR TASK #{task['id']}: review a model-free push-conflict resolution for {task['title']}\n"
+        f"kind: review · this run: light delta review (no review attempt) · budget ${task['budget_usd'] or 0:.2f} "
+        f"(spent ${task['spent_usd'] or 0:.2f})\n"
+        f"working directory: {cwd}" + (f" · branch: {branch}" if branch else "") + "\n"
+        f"run dir: {RUN_DIR_MARK} ($TTP_RUN_DIR): the hand-off goes only to its result.json\n"
+        f"project root: {p.root}\n" + _zone_line(p),
+        f"This review already approved branch {cb or '(none)'} at {head}, but it conflicted with {target}. The "
+        f"daemon rebased it onto {onto} without a model as {sha}, keeping both sides of each of the "
+        f"{mf.get('hunks') or '?'} conflicting hunks where both only added lines (the tip's first), in {files}. "
+        "The change itself was reviewed: judge only this resolution.\n\n"
+        "Do only this:\n"
+        f"1. Read the resolution's delta: `git range-diff $(git merge-base {head} {onto})..{head} {onto}..{sha}` "
+        "(each commit against its rebased self) and the settled hunks below.\n"
+        "2. Check each settled hunk keeps both sides' intents: no line or entry twice, nothing ordered so one "
+        "side's lines land inside the other's block, no two versions of one setting.\n"
+        f"3. Check out {sha} (detached) and run only the focused tests of the files above (a file, `-k` or "
+        "`file::test`; never the full suite). The push queue runs the full push checks on the head you approve.\n"
+        "4. Sound: hand off `done` with "
+        f'"push": [{{"branch": "{cb}", "head": "{sha}"}}]. Edit nothing.\n\n'
+        "Not sound, or the tests fail because of the resolution: hand off `failed` saying what it is. The "
+        "conflict is then settled by a standard run at once, at no attempt.\n"
+        "Never run `ttp push` or `git push`, never bump versions or write a changeset.\n\n"
+        f"Settled hunks (`+<` the tip's lines, `+>` the change's):\n```\n{str(mf.get('delta') or '')}\n```",
         restrictions_pointer(p)])
 
 

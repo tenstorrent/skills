@@ -204,7 +204,7 @@ CREATE TABLE IF NOT EXISTS push_queue(
   status TEXT NOT NULL DEFAULT 'approved',
   batch TEXT, tries INTEGER NOT NULL DEFAULT 0,
   created REAL NOT NULL, updated REAL NOT NULL,
-  pushed_sha TEXT, version TEXT, detail TEXT, landed_sha TEXT);
+  pushed_sha TEXT, version TEXT, detail TEXT, landed_sha TEXT, resolution TEXT);
 CREATE INDEX IF NOT EXISTS push_queue_status ON push_queue(status, id);
 CREATE TABLE IF NOT EXISTS push_batches(
   id TEXT PRIMARY KEY, marker TEXT NOT NULL, target TEXT NOT NULL,
@@ -353,6 +353,7 @@ class DB:
         self._migrate_jev_changed()
         self._migrate_issue_lifecycle()
         self._migrate_push_landed()
+        self._migrate_push_resolution()
         self._migrate_landing_ts()
         self._migrate_issue_opened()
         self._migrate_issue_episode()
@@ -583,6 +584,15 @@ END""")
         with self.tx():
             if "landed_sha" not in {r["name"] for r in self.q("PRAGMA table_info(push_queue)")}:
                 self.x("ALTER TABLE push_queue ADD COLUMN landed_sha TEXT")
+
+    def _migrate_push_resolution(self) -> None:
+        # How a conflict row was settled (conflictfix.RESOLUTIONS: model_free or review_rerun). Older
+        # rows keep NULL.
+        if "resolution" in {r["name"] for r in self.q("PRAGMA table_info(push_queue)")}:
+            return
+        with self.tx():
+            if "resolution" not in {r["name"] for r in self.q("PRAGMA table_info(push_queue)")}:
+                self.x("ALTER TABLE push_queue ADD COLUMN resolution TEXT")
 
     def _migrate_landing_ts(self) -> None:
         # When each landing was pushed (tried.landing_times). Older rows keep NULL: the ledger shows
