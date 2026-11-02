@@ -334,8 +334,7 @@ def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str
         if len(waiting) >= OUTBOX_MAX:
             return "full", 0
         box = Path(state) / OUTBOX_FILE
-        torn = box.exists() and box.stat().st_size and not box.read_bytes().endswith(b"\n")
-        durable_append(box, ("\n" if torn else "") + json.dumps(
+        durable_append(box, json.dumps(
             {"ts": now, "task": task, "to": to, "text": text, "fp": fp, **({"at": at} if at else {}),
              **({"back": back} if back and not at else {}), "severity": severity if severity in NOTE_SEVERITIES else "normal"}, sort_keys=True) + "\n")
         return "queued", len(waiting) + 1

@@ -47,18 +47,27 @@ def locked(name: str) -> Iterator[None]:
         os.close(fd)
 
 
-def entries(name: str) -> list[dict]:
+def _read(name: str) -> tuple[list[dict], list[str]]:
+    """The outbox's entries, and the lines that do not parse (a line cut short by a crash)."""
     try:
-        lines = path(name).read_text().splitlines()
+        lines = path(name).read_text(errors="replace").splitlines()
     except OSError:
-        return []
-    out = []
+        return [], []
+    out, bad = [], []
     for line in lines:
         try:
-            out.append(json.loads(line))
+            e = json.loads(line)
         except ValueError:
-            continue    # a line cut short by a crash mid-append: the rest still go out
-    return out
+            e = None
+        if isinstance(e, dict):
+            out.append(e)
+        elif line.strip():
+            bad.append(line)
+    return out, bad
+
+
+def entries(name: str) -> list[dict]:
+    return _read(name)[0]    # a line cut short by a crash mid-append: the rest still go out
 
 
 def count(name: str) -> int:
@@ -66,10 +75,17 @@ def count(name: str) -> int:
 
 
 def _append(p: Path, entry: dict) -> None:
+    _append_text(p, json.dumps(entry, sort_keys=True) + "\n")
+
+
+def _append_text(p: Path, text: str) -> None:
     p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    fd = os.open(str(p), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        os.write(fd, (json.dumps(entry, sort_keys=True) + "\n").encode())
+        size = os.fstat(fd).st_size
+        if size and os.pread(fd, 1, size - 1) != b"\n":
+            text = "\n" + text    # a last line a crash cut short stays apart from this one
+        os.write(fd, text.encode())
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -99,8 +115,11 @@ def _unlink(p: Path) -> None:
 
 
 def drop(name: str, client_id: str, rejected: str = "") -> None:
-    """Remove a delivered entry (caller holds the lock). With `rejected`, keep it aside instead."""
-    rest = entries(name)
+    """Remove a delivered entry (caller holds the lock). With `rejected`, keep it aside instead.
+    Lines that do not parse move to <project>.jsonl.corrupt rather than vanish with the rewrite."""
+    rest, bad = _read(name)
+    if bad:
+        _append_text(folder() / f"{name}.jsonl.corrupt", "".join(line + "\n" for line in bad))
     if rejected:
         for e in rest:
             if e.get("id") == client_id:

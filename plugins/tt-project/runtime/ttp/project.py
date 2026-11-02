@@ -2101,11 +2101,16 @@ def replace_copy(src: str | Path, dst: str | Path, *, follow_symlinks: bool = Tr
 
 def durable_append(path: Path, text: str) -> None:
     """Append `text` and sync it, so an appended line that was reported written survives a power
-    cut. A file this creates gets its directory synced as well."""
+    cut. A file this creates gets its directory synced as well. A last line a crash cut short (no
+    newline at the end) gets one first, so it never swallows this entry."""
     path = Path(path)
     new = not path.exists()
-    with open(path, "a") as f:
-        f.write(text)
+    with open(path, "ab+") as f:
+        if f.seek(0, os.SEEK_END):
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) != b"\n":
+                text = "\n" + text
+        f.write(text.encode())
         f.flush()
         os.fsync(f.fileno())
     if new:
