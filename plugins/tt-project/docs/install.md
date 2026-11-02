@@ -131,7 +131,7 @@ history. If you ran `ttp notifier install`, run `ttp notifier uninstall` first t
 
 ## Known issues
 
-- Cursor install is verified by clone and `ttp setup` only, not end to end.
+- Cursor install is verified by clone and `ttp setup` only, not end to end. The Cursor agent CLI installs in user space with its documented installer; it has not run live here yet (see [providers.md](providers.md#open-gaps)).
 - The setup-box IRD route is tested against a fake `ird`; a live run needs a network that reaches the IRD service.
 - The setup-box new-box flow (`new-box.md`) is tested with fakes only; its install steps have not yet run on a live box.
 - Codex and Cursor spend is estimated from a price table (see [Limits](guide.md#limits)).

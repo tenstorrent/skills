@@ -48,7 +48,7 @@ them keeps the older behaviour.
 | Effort | Yes: `--effort` [cc-cli]. | Yes: `-c model_reasoning_effort=<level>` [cx-config]. | No flag [cu-params]. Reasoning depth is part of the model name, so tiers pick models. |
 | Auto-compact | Yes: `CLAUDE_CODE_AUTO_COMPACT_WINDOW`. It accepts 100000 to 1000000 tokens and raises smaller values to 100000 [cc-env], so the adapter clamps to that range too. | Yes: `-c model_auto_compact_token_limit=<tokens>` [cx-config]. | Not used. Only the interactive `/summarize` command is documented [cu-using]. |
 | Session id capture | Yes: `session_id` on the `system`/`init` event and the result [cc-headless]. | Yes: `thread_id` on the `thread.started` event [cx-exec]. | Yes: `session_id` on every stream event and on the result [cu-output]. |
-| Resume | Yes: `--resume <id>` [cc-cli]. Transcripts are found under the run's own or the daemon's `CLAUDE_CONFIG_DIR` [cc-sessions]. | Yes: `codex exec [options] resume <SESSION_ID> -`, with the prompt on stdin [cx-cli]. Rollouts are saved by default [cx-exec]. They are found under `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*-<id>.jsonl`, a layout the docs do not state. | The argv is ready: `--resume <chatId>` [cu-params]. Runs are not resumed yet: the docs name no chat store, so a lost run starts fresh. |
+| Resume | Yes: `--resume <id>` [cc-cli]. Transcripts are found under the run's own or the daemon's `CLAUDE_CONFIG_DIR` [cc-sessions]. | Yes: `codex exec [options] resume <SESSION_ID> -`, with the prompt on stdin [cx-cli]. Rollouts are saved by default [cx-exec]. They are found under `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*-<id>.jsonl`, a layout the docs do not state. | The argv is ready: `--resume <chatId>` [cu-params]. Runs are not resumed yet: the CLI keeps chats, but `ls` needs a terminal and the docs name no chat store, so a lost run starts fresh. |
 | Usage and cost | Reported: the result carries `total_cost_usd` and usage [cc-cost]. | Tokens are on `turn.completed`, with no cost [cx-exec]. The cost is estimated from `pricing.codex`. | The documented events carry no usage or cost [cu-output]. Usage is read when a build reports it. Otherwise the run is booked at the elapsed share of its budget. |
 | Read-only coordinator | `--restricted`, `--permission-mode dontAsk` and `--disallowedTools Edit Write NotebookEdit` [cc-cli]. | `-s read-only` [cx-cli]. The shell and web tools are off where `codex features list` names them. Runs start in a scratch directory. | `--mode ask`, where `--help` lists it, and no `--force` [cu-params]. Runs start in a scratch directory, away from the project rules. |
 | Plugin loading | `--plugin-dir`, repeated [cc-cli]. | No per-run flag in the CLI reference [cx-cli]. Plugins load only from Codex's home, where `codex plugin add` copies them; a marketplace and `enabled` given by `-c` alone load nothing (measured on 0.160). So `plugin_dirs` is not used. Installed plugins load as usual. | `--plugin-dir`, repeated, where `--help` lists it [cu-params]. |
@@ -83,15 +83,29 @@ $0.21). Cursor agent: installed, not measured (no login on the test machine).
 - Codex: hook-source detection reads `config.toml` with simple patterns, so it errs towards
   seeing a source and leaving the hook off.
 - Cursor: installed in user space on 2026-11-01 (PST) with the documented installer
-  (`curl https://cursor.com/install`, which writes only under `~/.local`), build
-  `2026.10.22-27dcf5f`; not run live yet, because the test machine has no Cursor login
-  (`ttp doctor --live cursor` reports "not available: logged out"). That build's `--help` lists
-  `--resume [chatId]`, `--continue`, `resume` (the latest chat), `create-chat` (prints a new chat's
-  id) and `ls`, but `ls` is an interactive picker that fails without a terminal ("Raw mode is not
-  supported"), so a script cannot list chats with it. Until a live run shows where chats are kept,
-  `session_saved` stays false and a Cursor run cut short by a reboot is not resumed (the daemon
-  starts it fresh; resuming blind could open an empty chat). No budget, effort, auto-compact or
-  system-prompt switch.
+  (`curl https://cursor.com/install`, reviewed before it ran; it needs no sudo and writes only
+  under `~/.local`: the build in `~/.local/share/cursor-agent/versions/` and the `agent` and
+  `cursor-agent` links in `~/.local/bin`), build `2026.10.22-27dcf5f`. Not run live yet: the test
+  machine has no Cursor login.
+  - Version: `agent --version` prints the build alone; `ttp doctor --live` reads its last line.
+  - Sign-in: `agent status` (also `agent whoami`) prints "Not logged in" and still exits 0 when
+    logged out, so `login_check` reads the text as well as the exit code. A read-only shell check
+    that exits 0 only when signed in:
+    `out=$(timeout 30 agent status 2>&1) && test -n "$out" && ! printf '%s\n' "$out" | grep -qiE 'not (logged|authenticated)|login required|unauthenticated' || exit 1`.
+  - Logged out: `ttp doctor --live cursor` and `ttp doctor --loop cursor` report "not available:
+    logged out (run `agent login` there)" and start no run. A run that fails with Cursor's
+    "Authentication required" error ends as `auth`: the task goes back to the queue without
+    using an attempt, the provider's auth breaker stops new Cursor runs, one alert names
+    `agent login`, and the daemon's model-free login check (`agent status`, backing off) lets
+    runs start again once it passes.
+  - Resume: the CLI keeps chats; its `--help` and docs list `--resume [chatId]`, `--continue`,
+    `resume` (the latest chat), `create-chat` (prints a new chat's id) and `ls`. But `ls` is an
+    interactive picker that fails without a terminal ("Raw mode is not supported"), no command
+    lists chats for a script, and the docs name no place chats are kept. The harness cannot check
+    that a chat still exists, so `session_saved` stays false and a Cursor run cut short by a reboot
+    starts fresh (resuming blind could open an empty chat); `resume_args` builds `--resume <id>`
+    for when a check exists. Revisit after a live run shows where chats are kept.
+  - No budget, effort, auto-compact or system-prompt switch.
 
 [cc-cli]: https://code.claude.com/docs/en/cli-reference
 [cc-env]: https://code.claude.com/docs/en/env-vars
