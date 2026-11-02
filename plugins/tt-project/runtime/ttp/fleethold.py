@@ -13,7 +13,8 @@ its waiters when a hold starts or ends (coordinator.sync_shared_pauses).
 A hold set by the user (`ttp pause --machine` outside a run, or the coordinator acting on the user's
 own words in its turn) is lifted only on their word: `ttp resume --machine` outside a run, or a
 `resource_pause` with `machine` and paused false in a turn of any project that carries the user's
-own message. Its end only reports. Any project's coordinator may lift a coordinator's hold; the
+own message. Its end only reports: once it passed, each project with queued tasks on the machine
+shows one 'needs you' alert (passed_alerts) until the hold is lifted or extended. Any project's coordinator may lift a coordinator's hold; the
 setter is told. The setter's daemon checks the hold's end (pauseends); when the setter cannot act,
 the machine's recovery owner does. A pause asked for a resource a hold already covers is a no-op.
 """
@@ -34,6 +35,8 @@ FILE = "fleet-holds.json"
 LOCK = "fleet-holds.lock"
 END_FIELDS = ("until", "end_when", "report_from", "user_end")
 KEPT_S = 30 * 86400   # lifted holds are kept this long, for status and audit
+ALERT_KIND = "fleethold"   # alert `fleethold:<id>:passed`: a user's hold past its expected end (passed_alerts)
+LIFT = "to lift it, say so in chat or use Resume on the web page"
 
 
 def _path(name: str) -> Path:
@@ -220,4 +223,49 @@ def line(hold: dict, where=None, now: float | None = None) -> str:
     return (f"{hold.get('alias')} held machine-wide (hold {hold.get('id')}) by {hold.get('project') or '?'} {who} "
             f"since {ends.shown(float(hold.get('since') or 0), where)}"
             + (f": {hold['reason']}" if hold.get("reason") else "") + (f"; {end}" if end else "")
-            + f" — every project's tasks on it wait; lift: ttp resume <project> --machine {hold.get('alias')}")
+            + f" — every project's tasks on it wait; {LIFT}")
+
+
+def _passed(hold: dict, db, now: float) -> float | None:
+    """When the expected end of a hold the user set passed, if it did: recorded where it is checked
+    (pauseends.passed_at), or its `until`. A `user_end` hold lifts at its end instead: None."""
+    from . import pauseends
+    if hold.get("by") != "user" or hold.get("user_end"):
+        return None
+    at = pauseends.passed_at(db, f"{pauseends.FLEET_PREFIX}{hold.get('alias')}", entry(hold))
+    if at is None and hold.get("until") and float(hold["until"]) <= now:
+        at = float(hold["until"])
+    return at
+
+
+def waiting(db, alias: str) -> int:
+    """How many of a project's queued tasks use a resource on machine `alias` (they wait on its hold)."""
+    from . import machine_ledger as ml
+    from .coordinator import task_resources
+    on = ml.on_machine(alias)
+    return sum(1 for t in db.q("SELECT labels FROM tasks WHERE status='queued'")
+               if any(on(r) for r in task_resources({"labels": t["labels"]})))
+
+
+def passed_alerts(db, where=None, now: float | None = None) -> list[tuple[str, str]]:
+    """(alert key, text) for each hold the user set whose expected end passed while this project's
+    tasks wait on it: a 'needs you' item (alerts.USER_BLOCKERS), cleared by alert_holds."""
+    from . import ends
+    now = time.time() if now is None else now
+    out = []
+    for alias, hold in sorted(active().items()):
+        if (at := _passed(hold, db, now)) is None or not (n := waiting(db, alias)):
+            continue
+        out.append((f"{ALERT_KIND}:{hold.get('id')}:passed",
+                    f"{alias} is still held for you since {ends.shown(float(hold.get('since') or 0), where)}; your "
+                    f"expected end {ends.shown(at, where)} has passed; {n} of this project's tasks wait on it. "
+                    f"{LIFT[0].upper()}{LIFT[1:]}."))
+    return out
+
+
+def alert_holds(db, arg: str, now: float) -> bool:
+    """The alert `fleethold:<id>:passed` holds while that hold is in force with its end still passed
+    (lifting or extending it ends it) and tasks here wait on it; never ended by age."""
+    hid = arg.partition(":")[0]
+    return any(str(h.get("id")) == hid and _passed(h, db, now) is not None and waiting(db, alias)
+               for alias, h in active().items())

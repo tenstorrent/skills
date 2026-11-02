@@ -16725,7 +16725,7 @@ def test_a_fleet_user_hold_shows_when_its_end_when_passed_and_a_broken_probe_nev
     assert _settle_end_probes(pe, now) == ["machine:box1"]
     ev = a.db.q("SELECT text FROM events ORDER BY id DESC LIMIT 1")[0]["text"]
     assert "can no longer be checked" in ev and "Tell the user once that it passed" not in ev
-    assert "end condition passed" not in status_text(a) and "ends only on the user's word" in status_text(a)
+    assert "expected end passed" not in status_text(a) and "held until you lift it (you expected to" in status_text(a)
     fleethold.lift("box1", True, "test")
     fleethold.set_hold("box1", "", "user", "demo", {"end_when": "test -d ."})
     pe = pauseends.PauseEnds(a)
@@ -16733,12 +16733,75 @@ def test_a_fleet_user_hold_shows_when_its_end_when_passed_and_a_broken_probe_nev
     hold = fleethold.active()["box1"]
     at = pauseends.passed_at(a.db, "machine:box1", fleethold.entry(hold))
     assert at is not None
-    shown = f"end condition passed at {ends.shown(at, a)}; lifting needs the user's word"
+    shown = f"held until you lift it; your expected end passed at {ends.shown(at, a)}"
     assert shown in fleethold.line(hold, a) and shown in status_text(a)
     # A new hold (another identity) does not show the old pass.
     fleethold.lift("box1", True, "test")
     fleethold.set_hold("box1", "", "user", "demo", {"end_when": "test -d ."})
-    assert "end condition passed" not in fleethold.line(fleethold.active()["box1"], a)
+    assert "expected end passed" not in fleethold.line(fleethold.active()["box1"], a)
+
+
+def test_a_user_fleet_hold_line_names_how_to_lift_it_and_its_expected_end(env, tmp_path):
+    from ttp import ends, fleethold
+    a, _, _ = _fleet(env, tmp_path)
+    until = time.time() + 3600
+    fleethold.set_hold("box1", "firmware", "user", "demo", {"until": until})
+    text = fleethold.line(fleethold.active()["box1"], a)
+    assert "<project>" not in text and "ttp resume" not in text, text
+    assert f"held until you lift it (you expected to by {ends.shown(until, a)})" in text, text
+    assert text.endswith("to lift it, say so in chat or use Resume on the web page"), text
+    assert "ends only on the user's word" not in text and "end condition" not in text, text
+    # A coordinator's hold keeps its plain end.
+    fleethold.lift("box1", True, "test")
+    fleethold.set_hold("box1", "", "coordinator", "demo", {"until": until})
+    assert f"ends {ends.shown(until, a)}" in fleethold.line(fleethold.active()["box1"], a)
+
+
+def test_a_user_fleet_hold_past_its_expected_end_is_one_needs_you_alert_where_tasks_wait(env, tmp_path, monkeypatch):
+    from ttp import alerts, fleethold
+    from ttp import machine_ledger as ml
+    from ttp.daemon import Daemon
+    a, b, _ = _fleet(env, tmp_path)
+    monkeypatch.setattr(ml, "can_act", lambda name, here=None: (True, ""))
+    fleethold.set_hold("box1", "", "user", "demo", {"until": time.time() + 3600})
+    b.db.x("UPDATE tasks SET status='running' WHERE id IN (SELECT task FROM runs)")   # its worker runs: not waiting
+    _fleet_waits(b)   # only b has a queued task on box1; a has none
+    da, dbb = Daemon(a.base), Daemon(b.base)
+
+    def mine(p):
+        return [m for m in alerts.needs_you(p.db, time.time()) if m["text"].startswith("box1 is still held")]
+
+    for d in (da, dbb):
+        d.check_pause_ends()
+    assert not mine(a) and not mine(b), "not before its expected end"
+    hold = fleethold.active()["box1"]
+    key = f"fleethold:{hold['id']}:passed"
+    fleethold.set_hold("box1", "", "user", "demo", {"until": time.time() - 60})   # its end passed
+    for _ in range(2):
+        for d in (da, dbb):
+            d.check_pause_ends()
+            d.sweep_alerts()
+    got = mine(b)
+    assert len(got) == 1 and "1 of this project's tasks wait on it" in got[0]["text"], got
+    assert "your expected end" in got[0]["text"] and "Resume on the web page" in got[0]["text"]
+    assert b.db.one("SELECT COUNT(*) n FROM alerts WHERE key=?", (key,))["n"] == 1
+    assert not mine(a) and not a.db.q("SELECT id FROM alerts"), "a project with no task on the machine gets none"
+    assert alerts.holds(b.db, key, time.time() - 3 * 86400, time.time() + 3 * 86400), "never cleared by age"
+    # Extending it clears it; once passed again, lifting it clears it.
+    fleethold.set_hold("box1", "", "user", "demo", {"until": time.time() + 3600})
+    dbb.sweep_alerts()
+    assert not mine(b)
+    fleethold.set_hold("box1", "", "user", "demo", {"until": time.time() - 60})
+    dbb.check_pause_ends()
+    assert len(mine(b)) == 1
+    fleethold.lift("box1", True, "test")
+    dbb.sweep_alerts()
+    assert not mine(b) and b.db.one("SELECT COUNT(*) n FROM alerts WHERE cleared IS NULL")["n"] == 0
+    # A hold that ends at the user's own end lifts by itself (as before) and raises nothing.
+    fleethold.set_hold("box1", "", "user", "demo", {"until": time.time() - 1, "user_end": True})
+    assert fleethold.passed_alerts(b.db, b) == []
+    Daemon(a.base).check_pause_ends()   # its setter checks its end
+    assert "box1" not in fleethold.active() and not mine(b)
 
 
 def test_a_fleet_hold_quiets_the_machine_like_a_user_pause(env):

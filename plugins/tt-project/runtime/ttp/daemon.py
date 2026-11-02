@@ -1965,11 +1965,18 @@ class Daemon:
 
     def check_pause_ends(self) -> None:
         """Lift coordinator pauses on fenced health evidence; report other ends once. User pauses
-        only get the existing low line. Model-free, also while paused."""
+        only get the existing low line, and a 'needs you' alert once a user's machine hold is past its
+        expected end while tasks here wait on it (fleethold.passed_alerts). Model-free, also while paused."""
+        from . import fleethold
         try:
             self._pause_ends.tick()
         except Exception:
             log(self.p, "checking resource pause ends failed\n" + traceback.format_exc())
+        try:
+            for key, text in fleethold.passed_alerts(self.p.db, self.p):
+                self.alert(key, text, severity="normal")
+        except Exception:
+            log(self.p, "alerting machine holds past their expected end failed\n" + traceback.format_exc())
 
     def check_mute_ends(self) -> None:
         """Observation mutes with an end_when probe: a pass ends the mute (pauseends.MuteEnds). Model-free."""

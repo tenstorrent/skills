@@ -113,8 +113,9 @@ def health_end(p: Project, resource: str) -> dict | None:
 def describe(v: dict, where=None, passed: float | None = None, now: float | None = None) -> str:
     """'ends 2026-10-06 05:00 UTC, or when `probe` passes; waits on project x's report' (or ''). A
     pause the user set never ends by itself: its end is shown as a condition, and once it passed
-    (`passed`, see passed_at, or an `until` before `now`) as passed, needing the user's word. Its
-    `user_end` time is the exception: shown as the user's end, the time it lifts."""
+    (`passed`, see passed_at, or an `until` before `now`) as passed, needing the user's word; a
+    machine-wide hold (`fleet`) is told to the user: 'held until you lift it (you expected to by <time>)'.
+    Its `user_end` time is the exception: shown as the user's end, the time it lifts."""
     end = v.get("end_when")
     when = (f"when heal `{end['heal']}` has {end['healthy_n']} healthy results over {end['clean_s']:g} s"
             if isinstance(end, dict) else f"when `{end}` passes")
@@ -127,10 +128,15 @@ def describe(v: dict, where=None, passed: float | None = None, now: float | None
         now = time.time() if now is None else now
         if passed is None and v.get("until") and float(v["until"]) <= now:
             passed = float(v["until"])
-        out = ("set by the user; " + (f"end condition passed at {ends.shown(passed, where)}; lifting needs the "
-                                      f"user's word" if passed is not None else
-                                      "ends only on the user's word" + (f"; end condition: {', or '.join(parts)}"
-                                                                        if parts else "")))
+        if v.get("fleet"):   # a machine-wide hold, told to the user (fleethold.line, the web app)
+            exp = " or ".join(([f"by {parts[0]}"] if v.get("until") else []) + ([when] if end else []))
+            out = ("held until you lift it" + (f"; your expected end passed at {ends.shown(passed, where)}"
+                                              if passed is not None else f" (you expected to {exp})" if exp else ""))
+        else:
+            out = ("set by the user; " + (f"end condition passed at {ends.shown(passed, where)}; lifting needs the "
+                                          f"user's word" if passed is not None else
+                                          "ends only on the user's word" + (f"; end condition: {', or '.join(parts)}"
+                                                                            if parts else "")))
     if v.get("end_default"):
         out += " (a default: it was set without an end)"
     if v.get("report_from"):

@@ -79,6 +79,7 @@ CLEARED_TEXT = {
     "network": "The hosts the queued work waits on answer again; it resumes by itself.",
     "daemon-hang": "The daemon completes its ticks again after its watchdog restart.",
     "paused": "The project is no longer paused; new runs start again.",
+    "fleethold": "A machine hold past its expected end was lifted or extended, or no task here waits on it.",
     "coord-budget": "No coordinator item is parked over its per-turn budget any more.",
     "linger-off": "Linger is on again: the daemon starts at boot without a login.",
     "notifier": "Desktop notifications deliver again.",
@@ -89,8 +90,9 @@ CLEARED_TEXT = {
 # high alert; their clearing is a low feed line, not a new notification (netwait.py).
 # linger-off: the systemd service would not start at boot without a login (downtime.py).
 # notifier: this machine's desktop notifications fail (notifier.py; a system setting or a missing tool).
-USER_BLOCKERS = ("network", "paused", "coord-budget", "linger-off", "notifier")   # paused: a long project pause (projpause)
-CLEARED_SEVERITY = {"network": "low", "paused": "low", "coord-budget": "low", "account-mismatch": "low",
+# fleethold: a hold the user set is past its expected end while tasks here wait on it (fleethold.passed_alerts).
+USER_BLOCKERS = ("network", "paused", "coord-budget", "linger-off", "notifier", "fleethold")   # paused: a long project pause (projpause)
+CLEARED_SEVERITY = {"network": "low", "paused": "low", "fleethold": "low", "coord-budget": "low", "account-mismatch": "low",
                     "linger-off": "low", "notifier": "low"}
 # Conditions that lift by themselves: below high they are a self-clearing feed line, never "needs you".
 # account-mismatch: the provider's login has no plan readings of its own yet (budget.evaluate); its next
@@ -255,6 +257,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
     if kind == "paused":   # the same project pause still lasts (projpause)
         from . import projpause
         return projpause.holds(db, arg)
+    if kind == "fleethold":   # the same user hold is still past its expected end, and tasks here wait on it
+        from . import fleethold
+        return fleethold.alert_holds(db, arg, now)
     if key == "coord-budget":   # an item it named is still parked over its per-turn budget (turnsize.py)
         from . import turnsize
         return turnsize.holds(db)
@@ -298,7 +303,7 @@ def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
                                          "schedule", "release-older", "integrity", "integrity-host", "pr-ready", "config",
                                          "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_tip_failing", "push_scope", "heal",
-                                         "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "daemon-hang", "paused",
+                                         "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "daemon-hang", "paused", "fleethold",
                                          "coord-budget", "account-mismatch", "linger-off", "tick-step", "notifier", "chat-silent")
 
 
