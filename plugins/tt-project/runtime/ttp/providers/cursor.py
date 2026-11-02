@@ -143,7 +143,7 @@ class Cursor(Provider):
         pin, pcached, pout = price_row(PRICES, self.prices, self.model)
         return (usage["inputTokens"] * pin + usage["cacheReadTokens"] * pcached + usage["outputTokens"] * pout) / 1e6
 
-    def cost_so_far(self, output_path):
+    def cost_so_far(self, output_path, since=None, env=None):
         seen = self._scan(output_path)
         if seen["reported"]:
             return self._price(seen["usage"])

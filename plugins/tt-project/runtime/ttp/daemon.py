@@ -13463,8 +13463,9 @@ def _shared(task: dict) -> list[str]:
 
 def _cut_off_cost(run_dir: Path, exit_info: dict, usage=None, prov=None) -> float:
     """A run that ended without any usage to price still spent money: Codex reports usage only when
-    a turn completes, and Cursor's result has none at all. Book the elapsed share of its dollar
-    budget rather than $0, so the caps keep counting it. A run whose agent never started (it gave
+    a turn completes, and Cursor's result has none at all. Book the tokens the provider can still
+    count (Codex: its rollout's running totals), else the elapsed share of its dollar budget rather
+    than $0, so the caps keep counting it. A run whose agent never started (it gave
     up waiting for a resource) spent nothing, and so did one that wrote no output and reported no
     tokens, when its CLI streams (a CLI that hung, or a host that slept, before its first event)."""
     if exit_info.get("launched") is False:
@@ -13480,6 +13481,14 @@ def _cut_off_cost(run_dir: Path, exit_info: dict, usage=None, prov=None) -> floa
         silent = True
     if silent and not tokens and (prov is None or prov.streams(spec.get("argv") or [])):
         return 0.0
+    if prov is not None and exit_info.get("started"):   # Codex: the tokens its rollout counted
+        env = spec.get("env") if isinstance(spec.get("env"), dict) else {}
+        try:
+            priced = prov.cut_off_cost(run_dir / "output.jsonl", float(exit_info["started"]), env)
+        except Exception:
+            priced = None
+        if priced:
+            return round(priced, 4)
     budget = float(spec.get("budget_usd") or spec.get("default_budget_usd") or 0)
     timeout = float(spec.get("timeout_s") or 0)
     elapsed = float(exit_info.get("ended") or time.time()) - float(exit_info.get("started") or 0)

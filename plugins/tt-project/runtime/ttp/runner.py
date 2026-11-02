@@ -427,7 +427,7 @@ def supervise(run_dir: Path) -> int:
             if budget is not None and now - st["budget"] >= BUDGET_EVERY_S:
                 st["budget"] = now
                 try:
-                    so_far = prov.cost_so_far(out_path)
+                    so_far = prov.cost_so_far(out_path, since=started, env=env)
                 except Exception:
                     so_far = None
                 if so_far is not None and so_far > float(budget):

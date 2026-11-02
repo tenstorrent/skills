@@ -3841,3 +3841,94 @@ def test_a_new_billing_word_keeps_the_machines_rows_and_its_sessions_are_shown_a
     t = gcap.total(p.db, "claude", start, end, now + 1, account="acct-a")
     assert t["usd"] == 3.0 and t["unbilled_usd"] == 12.0, t
     assert "this machine" in t["includes"], t["includes"]
+
+
+def _codex_rollout(home, sid, *totals):
+    """A Codex rollout under `home` with one token_count event per (epoch, input, cached, output)."""
+    from datetime import datetime, timezone
+    f = home / "sessions" / "2026" / "11" / "01" / f"rollout-2026-11-01T10-00-00-{sid}.jsonl"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    with open(f, "a") as out:
+        for at, inp, cached, outp in totals:
+            stamp = datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+            out.write(json.dumps({"timestamp": stamp, "type": "event_msg", "payload": {
+                "type": "token_count", "info": {"total_token_usage": {
+                    "input_tokens": inp, "cached_input_tokens": cached, "output_tokens": outp,
+                    "reasoning_output_tokens": 0, "total_tokens": inp + outp}}, "rate_limits": None}}) + "\n")
+    return f
+
+
+def test_codex_prices_a_run_mid_turn_from_its_rollout_token_counts(tmp_path):
+    from ttp.providers import get_provider
+    home, sid, now = tmp_path / "codex", "0199aaaa-bbbb-cccc", time.time()
+    env = {"CODEX_HOME": str(home)}
+    out = tmp_path / "output.jsonl"
+    out.write_text(json.dumps({"type": "thread.started", "thread_id": sid}) + "\n")
+    codex = lambda: get_provider("codex").use("m1", {"m1": [1.0, 0.1, 2.0]})
+    assert codex().cost_so_far(out, since=now, env=env) == 0, "no rollout yet: nothing spent"
+    roll = _codex_rollout(home, sid, (now + 1, 1_000_000, 0, 0), (now + 2, 2_000_000, 1_000_000, 500_000))
+    # No turn.completed yet: the newest running total counts, not the sum of every event.
+    assert codex().cost_so_far(out, since=now, env=env) == pytest.approx(1.0 + 0.1 + 1.0)
+    assert codex().cut_off_cost(out, now, env) == pytest.approx(2.1)
+    # A resumed session: totals written before this run started belong to earlier runs.
+    assert codex().cost_so_far(out, since=now + 1.5, env=env) == pytest.approx(0.1 + 1.0)
+    # Read incrementally; a line still being written waits for its newline.
+    prov = codex()
+    assert prov.cost_so_far(out, since=now, env=env) == pytest.approx(2.1)
+    with open(roll, "a") as f:
+        f.write('{"timestamp": "x", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_')
+    assert prov.cost_so_far(out, since=now, env=env) == pytest.approx(2.1)
+    with open(roll, "a") as f:
+        f.write('token_usage": {"input_tokens": 3000000, "cached_input_tokens": 1000000, "output_tokens": 500000}}}}\n'
+                '{"type": "event_msg", "payload": {"type": "token_count", "info": null}}\nnot json token_count\n')
+    assert prov.cost_so_far(out, since=now, env=env) == pytest.approx(2.0 + 0.1 + 1.0), \
+        "an unreadable timestamp books to this run; malformed events are skipped"
+    # A completed turn that reports more wins over the rollout.
+    with open(out, "a") as f:
+        f.write(json.dumps({"type": "turn.completed", "usage": {
+            "input_tokens": 10_000_000, "cached_input_tokens": 0, "output_tokens": 0}}) + "\n")
+    assert codex().cost_so_far(out, since=now, env=env) == pytest.approx(10.0)
+    # Another session's rollout, or none named, prices nothing from rollouts.
+    other = tmp_path / "other.jsonl"
+    other.write_text(json.dumps({"type": "thread.started", "thread_id": "0199dddd"}) + "\n")
+    assert codex().cost_so_far(other, since=now, env=env) == 0 and codex().cut_off_cost(other, now, env) is None
+    assert get_provider("cursor").cut_off_cost(out, now, env) is None
+
+
+def test_runner_stops_a_codex_run_mid_turn_on_budget(env, tmp_path, monkeypatch):
+    from ttp import runner
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.1")
+    monkeypatch.setattr(runner, "BUDGET_EVERY_S", 0.1)
+    home, sid = tmp_path / "codex", "0199eeee-ffff"
+    roll = home / "sessions" / "2026" / "11" / "01" / f"rollout-2026-11-01T10-00-00-{sid}.jsonl"
+    roll.parent.mkdir(parents=True)
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import json, sys, time\n"
+        f"print(json.dumps({{'type': 'thread.started', 'thread_id': {sid!r}}}), flush=True)\n"
+        "for n in range(1, 300):\n"
+        f"    with open({str(roll)!r}, 'a') as f:\n"
+        "        stamp = time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime(time.time() + 1))\n"
+        "        f.write(json.dumps({'timestamp': stamp, 'type': 'event_msg', 'payload': {'type': 'token_count',\n"
+        "            'info': {'total_token_usage': {'input_tokens': n * 100000, 'cached_input_tokens': 0,\n"
+        "                                           'output_tokens': 0}}}}) + '\\n')\n"
+        "    time.sleep(0.05)\n")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "prompt.md").write_text("x")
+    (run_dir / "run.json").write_text(json.dumps({
+        "argv": [sys.executable, str(child)], "cwd": str(tmp_path), "provider": "codex", "model": "m1",
+        "prices": {"m1": [1.0, 0.1, 2.0]}, "env": {"CODEX_HOME": str(home)}, "timeout_s": 60,
+        "budget_usd": 0.5}))
+    runner.supervise(run_dir)
+    info = json.loads((run_dir / "exit.json").read_text())
+    assert info["stopped"] == "budget", info
+    assert info["ended"] - info["started"] < 10
+    # The daemon books the cut-off run at its rollout's token price, not the elapsed share.
+    from ttp.daemon import _cut_off_cost
+    from ttp.providers import get_provider
+    prov = get_provider("codex").use("m1", {"m1": [1.0, 0.1, 2.0]})
+    spent = prov.cut_off_cost(run_dir / "output.jsonl", info["started"], {"CODEX_HOME": str(home)})
+    assert 0.5 < spent < 3
+    assert _cut_off_cost(run_dir, info, None, prov) == pytest.approx(round(spent, 4))
+    assert _cut_off_cost(run_dir, info, None, None) != pytest.approx(round(spent, 4)), "elapsed share without a provider"

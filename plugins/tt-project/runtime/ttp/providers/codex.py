@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """OpenAI Codex CLI (`codex exec --json`). Codex reports tokens but no cost, has no budget flag,
 and exposes plan windows through `codex app-server` (`account/rateLimits/read`, no model tokens).
-Cost is therefore an estimate from a price table the project can edit. Tokens arrive only when a
-turn completes, so the runner's mid-run budget check sees completed turns only.
+Cost is therefore an estimate from a price table the project can edit. `codex exec --json` prints
+tokens only when a turn completes (one turn per run), so the runner's mid-run budget check and a
+cut-off run's price read the running totals in the session's rollout (token_count events).
 
 Write fence (from the docs; Codex was not installed where this was probed). Workers run in
 `workspace-write`, so they are fenced: they write their cwd, temp dirs and `writable_args` roots.
@@ -38,6 +39,7 @@ import re
 import shlex
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from . import register
@@ -222,9 +224,56 @@ class Codex(Provider):
         pin, pcached, pout = price_row(PRICES, self.prices, self.model)
         return ((inp - cached) * pin + cached * pcached + out * pout) / 1e6
 
-    def cost_so_far(self, output_path):
+    def _rollout_tokens(self, output_path: Path, since: float | None = None,
+                        env: dict | None = None) -> tuple[int, int, int] | None:
+        """(input, cached, output) tokens this run spent so far, from the newest
+        event_msg/token_count `total_token_usage` in its session's rollout. That total covers the
+        whole session, so a resumed run subtracts the last total written before `since` (its start).
+        Read incrementally: the runner asks every few seconds while the rollout grows."""
+        sid = next((str(ev.get("thread_id") or "") for ev in self._events(output_path)
+                    if ev.get("type") == "thread.started"), "")
+        paths = self.session_paths(sid, "", env)
+        if not paths:
+            return None
+        seen = self.__dict__.setdefault("_rollouts", {})
+        try:
+            path = max(paths, key=lambda f: f.stat().st_mtime)
+            offset, base, last = seen.get((str(path), since), (0, None, None))
+            with open(path, "rb") as f:
+                f.seek(offset)
+                for raw in f:
+                    if not raw.endswith(b"\n"):
+                        break   # a line still being written: read it on the next call
+                    offset += len(raw)
+                    if b"token_count" not in raw:
+                        continue
+                    try:
+                        rec = json.loads(raw)
+                        total = rec["payload"]["info"]["total_token_usage"]
+                        tok = tuple(int(total.get(k) or 0)
+                                    for k in ("input_tokens", "cached_input_tokens", "output_tokens"))
+                    except (ValueError, TypeError, KeyError, AttributeError):
+                        continue
+                    if since is not None and _stamp(rec.get("timestamp")) < since:
+                        base = tok
+                    else:
+                        last = tok
+        except OSError:
+            return None
+        seen[(str(path), since)] = (offset, base, last)
+        if last is None:
+            return None
+        return tuple(max(a - b, 0) for a, b in zip(last, base)) if base else last
+
+    def cut_off_cost(self, output_path, since=None, env=None):
+        # Codex prints usage only on turn.completed, and `codex exec` is one turn; its rollout has
+        # running token totals, so a run stopped mid-turn is priced at the tokens it spent.
+        got = self._rollout_tokens(Path(output_path), since, env)
+        return self._price(*got) if got else None
+
+    def cost_so_far(self, output_path, since=None, env=None):
         inp, cached, out, _ = self._tokens(output_path)
-        return self._price(inp, cached, out)
+        return max(self._price(inp, cached, out), self.cut_off_cost(output_path, since, env) or 0.0)
 
     def parse(self, output_path, stderr_path=None) -> RunUsage:
         inp, cached, out, last = self._tokens(output_path)
@@ -372,6 +421,14 @@ def _account_id(auth: dict) -> str:
         except (ValueError, AttributeError):
             pass
     return str(auth.get("OPENAI_API_KEY") or "")
+
+
+def _stamp(text) -> float:
+    """A rollout line's ISO timestamp as epoch seconds; unreadable counts as now (booked to the run)."""
+    try:
+        return datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return float("inf")
 
 
 def _read(path: Path) -> str:

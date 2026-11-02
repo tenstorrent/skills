@@ -386,8 +386,14 @@ class Provider:
         the agent did nothing (rather than that it had not finished)."""
         return True
 
-    def cost_so_far(self, output_path: Path) -> float | None:
-        """Mid-run spend, when the provider streams it and does not enforce a budget itself."""
+    def cost_so_far(self, output_path: Path, since: float | None = None, env: dict | None = None) -> float | None:
+        """Mid-run spend, when the provider streams it and does not enforce a budget itself. `since`
+        (the run's start) and `env` (its environment) help find spend kept outside the output."""
+        return None
+
+    def cut_off_cost(self, output_path: Path, since: float | None = None, env: dict | None = None) -> float | None:
+        """The price of the tokens a run spent before it was cut off without reporting usage, when
+        the provider can tell (None: the daemon books the elapsed share of the budget instead)."""
         return None
 
     def resolved_session(self, argv: list[str], cwd: str, env: dict | None = None) -> dict | None:

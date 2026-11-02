@@ -49,7 +49,7 @@ class Chat(Claude):
             u.estimated, u.extra["cost_basis"] = True, "fallback"
         return u
 
-    def cost_so_far(self, output_path):
+    def cost_so_far(self, output_path, since=None, env=None):
         return self.parse(output_path).cost_usd if self.price() else None
 
     def credential_files(self) -> list[str]:
