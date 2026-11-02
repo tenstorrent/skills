@@ -3,7 +3,7 @@
 What the runtime needs from each agent CLI, and what each one offers. Each cell says what the
 adapter in `runtime/ttp/providers/` does and links the official doc it relies on.
 
-Claude Code and the Codex CLI have been run live; Cursor has not. `ttp doctor --live <provider>
+Claude Code and the Codex CLI have been run live; Cursor is installed but has not run live (no login). `ttp doctor --live <provider>
 [--json]` measures one provider's row: in a scratch project it starts a small worker run the way
 the daemon does, resumes its session, and runs one read-only coordinator turn with the
 coordinator's structured-output schema. It costs a few tens of cents per provider. Each check is
@@ -19,7 +19,7 @@ Measured on 2026-10-09:
 
 | Check | Claude Code 2.1.285 | Codex CLI 0.160.0 | Cursor agent |
 | :- | :- | :- | :- |
-| Launch and login | pass | pass | not measured: CLI not installed |
+| Launch and login | pass | pass | not measured: installed, logged out |
 | Session id | pass (assigned up front) | pass | not measured |
 | Usage | pass (reported cost) | pass (estimated from tokens) | not measured |
 | Structured output | pass | pass | not measured |
@@ -64,7 +64,7 @@ The project chooses which plugin directories load, per provider, in
 Measured on 2026-10-09 with Claude Code 2.1.285 and Codex CLI 0.160.0; rerun
 `ttp doctor --live <provider>` after a CLI upgrade. On 2026-10-21 `ttp doctor --loop` passed
 with Claude Code 2.1.296 (landed after review in 31 s, $0.09) and Codex CLI 0.160.0 (66 s,
-$0.21). Cursor agent: not measured, CLI not installed.
+$0.21). Cursor agent: installed, not measured (no login on the test machine).
 
 - Any provider: only the prompt keeps a worker's raw `git push` off the push branch. On
   2026-10-21 a Claude Code worker whose task said to land its change pushed it straight to the
@@ -82,11 +82,16 @@ $0.21). Cursor agent: not measured, CLI not installed.
 - Codex: where rollouts are kept is not documented. If it changes, lost runs start fresh.
 - Codex: hook-source detection reads `config.toml` with simple patterns, so it errs towards
   seeing a source and leaving the hook off.
-- Cursor: not measured, because the CLI is not installed on the test machine. From its docs: no
-  documented chat store or chat listing, so `session_saved` stays false and a Cursor run cut short
-  by a reboot is not resumed (the daemon starts it fresh; resuming blind could open an empty chat).
-  Revisit when the CLI docs name a store location or a `ls` command; no budget, effort,
-  auto-compact or system-prompt switch; and no usage in the documented output.
+- Cursor: installed in user space on 2026-11-01 (PST) with the documented installer
+  (`curl https://cursor.com/install`, which writes only under `~/.local`), build
+  `2026.10.22-27dcf5f`; not run live yet, because the test machine has no Cursor login
+  (`ttp doctor --live cursor` reports "not available: logged out"). That build's `--help` lists
+  `--resume [chatId]`, `--continue`, `resume` (the latest chat), `create-chat` (prints a new chat's
+  id) and `ls`, but `ls` is an interactive picker that fails without a terminal ("Raw mode is not
+  supported"), so a script cannot list chats with it. Until a live run shows where chats are kept,
+  `session_saved` stays false and a Cursor run cut short by a reboot is not resumed (the daemon
+  starts it fresh; resuming blind could open an empty chat). No budget, effort, auto-compact or
+  system-prompt switch.
 
 [cc-cli]: https://code.claude.com/docs/en/cli-reference
 [cc-env]: https://code.claude.com/docs/en/env-vars
