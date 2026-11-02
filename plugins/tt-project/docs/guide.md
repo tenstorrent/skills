@@ -1600,7 +1600,7 @@ queues behind routine work; nothing running is interrupted:
   moving an existing tag, except a release-channel tag moved forward as below.
 - `delivery.channel_tags` (empty when unset) lists release-channel tags: tags a release cut moves
   forward. `ttp push --move-tag <tag> <commit>` moves one, also under `never_force`: it pushes
-  `<commit>:refs/tags/<tag>` with `--no-follow-tags` and `--force-with-lease=refs/tags/<tag>:<old>`,
+  `<sha>:refs/tags/<tag>` (`<sha>` the commit's full sha) with `--no-follow-tags` and `--force-with-lease=refs/tags/<tag>:<old>`,
   `<old>` the tag's value on the push remote read fresh. The run's git lets that one push through
   only when the tag is listed, the push updates only that tag on the remote of
   `delivery.push_branch`, the lease matches, the commit descends from the tagged one, and the

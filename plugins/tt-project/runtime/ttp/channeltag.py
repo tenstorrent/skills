@@ -70,7 +70,9 @@ def plain_globals(globals_: list[str]) -> bool:
 
 def parse(rest: list[str]) -> dict | None:
     """The move form's parts of `git push <rest>`: {remote, src, tag, lease}, or None when `rest` is
-    anything else (another option, no or several leases, a `+`, a delete, several refspecs)."""
+    anything else (another option, no or several leases, a `+`, a delete, several refspecs, a source
+    that is not a full sha: a name such as HEAD resolves when the hook checks it, in the hook's cwd,
+    not when and where the command later pushes it)."""
     lease, follow, positional, words = None, False, False, []
     for a in rest:
         if positional or not a.startswith("-"):
@@ -90,7 +92,7 @@ def parse(rest: list[str]) -> dict | None:
     remote, spec = words
     src, sep, dst = spec.partition(":")
     ref, sep2, old = lease.partition(":")
-    if not (sep and src and dst.startswith("refs/tags/") and sep2 and ref == dst) or src.startswith("+"):
+    if not (sep and SHA_RE.fullmatch(src) and dst.startswith("refs/tags/") and sep2 and ref == dst):
         return None
     return {"remote": remote, "src": src, "tag": dst.removeprefix("refs/tags/"), "lease": old}
 

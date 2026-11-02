@@ -10,10 +10,10 @@ A release cut task moves the tag, after its candidate checks passed at the new c
 ttp push --move-tag <tag> <commit>
 ```
 
-It reads the tag's current value on the push remote, then pushes `git push --no-follow-tags --force-with-lease=refs/tags/<tag>:<old> <remote> <commit>:refs/tags/<tag>`. Under `never_force`, the run's git lets that push through only when all of these hold:
+It reads the tag's current value on the push remote, then pushes `git push --no-follow-tags --force-with-lease=refs/tags/<tag>:<old> <remote> <new>:refs/tags/<tag>`, `<new>` the commit's full sha. Under `never_force`, the run's git lets that push through only when all of these hold:
 
 1. the tag is in `delivery.channel_tags`;
-2. the push updates only `refs/tags/<tag>`, on the remote of `delivery.push_branch`;
+2. the push updates only `refs/tags/<tag>`, on the remote of `delivery.push_branch`, from a full sha (a name such as `HEAD` or a branch is refused: it could point elsewhere by the time the push runs);
 3. the lease is the tag's full current value on that remote, read fresh (a stale lease is refused, and git refuses one that went stale meanwhile);
 4. the new commit descends from the commit the tag is at now (forward only);
 5. the new commit is on the remote push branch.

@@ -12753,6 +12753,14 @@ def test_channel_tag_move_refusals_under_never_force(env, monkeypatch, capsys):
     assert out.returncode != 0 and "not on origin/proj" in out.stderr, out.stderr
     real = shutil.which("git", path=os.environ["PATH"].split(":", 1)[1])
     assert "moves only forward" in hook.git_push_bypass([[real, *channeltag.argv("origin", "chan", a, c["B"])]])
+    # (6) the new commit only by full sha: a name (HEAD, a branch, a short sha) resolves when the hook
+    # checks it, in its own cwd, not where and when the command later runs.
+    _git_out(repo, "checkout", "-q", "--detach", m)
+    for src in ("HEAD", "proj", "origin/proj", m[:12], m.upper(), f"{m}^0"):
+        args = channeltag.argv("origin", "chan", a, src)[1:]
+        refused(args, "never force-pushes")
+        assert "never force-pushes" in (hook.git_push_bypass([[real, "push", *args]]) or ""), src
+    _git_out(repo, "checkout", "-q", "work")
     assert _git_out(origin, "rev-parse", "chan") == a and _git_out(origin, "rev-parse", "other") == a
     assert not (p.state / channeltag.LOG).exists()
     # A check that fails (a git call timing out) refuses rather than letting the forced push run.
