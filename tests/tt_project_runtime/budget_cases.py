@@ -3932,3 +3932,49 @@ def test_runner_stops_a_codex_run_mid_turn_on_budget(env, tmp_path, monkeypatch)
     assert 0.5 < spent < 3
     assert _cut_off_cost(run_dir, info, None, prov) == pytest.approx(round(spent, 4))
     assert _cut_off_cost(run_dir, info, None, None) != pytest.approx(round(spent, 4)), "elapsed share without a provider"
+
+
+def test_the_caps_line_never_reads_of_zero_once_the_dollar_caps_are_unset(env):
+    """A dollar cap of 0 is unset: the digest and the web detail show the spend as a plain figure and
+    say there is no dollar cap (plan windows apply, when a provider is on them), never '$X of $0'.
+    A positive cap keeps '$X of $Y'. Display only: the gate itself is unchanged."""
+    p = make(env)
+    from ttp import budget as bud
+    from ttp import coordinator as coord
+    from ttp.web import gate_detail, state_payload
+    now = time.time()
+    plan = bud.Gate(provider="claude", level="green", regime="windows", max_parallel=6, max_tier="deep",
+                    allow_optional=True, reasons=[], numbers={"limit": 90.0, "running": 0, "starts": True, "plan": [
+                        {"window": "seven_day", "utilization": 40.0, "headroom": 50.0}]}).as_dict()
+
+    def caps_gate(day, week):
+        return bud.Gate(provider="codex", level="green", regime="caps", max_parallel=6, max_tier="deep",
+                        allow_optional=True, reasons=[], numbers={
+                            "spent_today": 7.76, "spent_24h": 7.76, "spent_7d": 893.95,
+                            "daily_cap": day, "weekly_cap": week}).as_dict()
+
+    def line(gates):
+        d = coord.digest(p, gates, [], [])
+        return next(x for x in d.splitlines() if x.startswith("- codex:"))
+
+    for day, week in ((100.0, 2000.0), (0.0, 0.0), (0.0, 2000.0)):
+        p.set_config("budget.daily_usd", day)
+        p.set_config("budget.weekly_usd", week)
+        g = caps_gate(day, week)
+        for gates in ({"codex": g}, {"claude": plan, "codex": g}):
+            ln, detail = line(gates), gate_detail(g, now, gates=gates)
+            assert "of $0" not in ln and "of $0 " not in detail, (ln, detail)
+            windows = "claude" in gates
+            if day or week:
+                assert "no dollar cap" not in ln and "no dollar cap" not in detail, (ln, detail)
+                assert "$893.95 of $2000 per 7 days" in ln and "$893.95 of $2000 per 7d" in detail, (ln, detail)
+                today = "$7.76 of $100 today" if day else "$7.76 today,"
+                assert today in ln and today in detail, (ln, detail)
+            else:
+                want = "no dollar cap (plan windows apply): " if windows else "no dollar cap: "
+                assert f"usage-billed providers together): {want}$7.76 today, $893.95 per 7 days" in ln, ln
+                assert detail.startswith(f"{want}$7.76 today, $893.95 per 7d"), detail
+                assert windows or "plan windows apply" not in ln + detail, (ln, detail)
+    p.db.set_kv("gates", {"claude": plan, "codex": caps_gate(0.0, 0.0)})
+    st = state_payload(p, p.db)
+    assert st["gates"]["codex"]["detail"].startswith("no dollar cap (plan windows apply): "), st["gates"]["codex"]

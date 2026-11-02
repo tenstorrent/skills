@@ -74,7 +74,7 @@ function gateHtml(gates) {
   if (!ks.length) return `<p class="muted">No readings yet.</p>`;
   return ks.map((k) => { const g = gates[k], n = g.numbers || {};
     const detail = g.detail || (g.regime === "windows" ? `${n.window}: ${n.utilization}% of account used · project stops at ${n.limit}%`
-      : `project ${money(n.spent_24h)} / ${money(n.daily_cap)} per 24h${n.estimated_24h ? ` (~${money(n.estimated_24h)} estimated)` : ""} · ${money(n.spent_7d)} / ${money(n.weekly_cap)} per 7d`);
+      : `project ${n.daily_cap > 0 || n.weekly_cap > 0 ? "" : "no dollar cap: "}${money(n.spent_24h)}${n.daily_cap > 0 ? ` / ${money(n.daily_cap)}` : ""} per 24h${n.estimated_24h ? ` (~${money(n.estimated_24h)} estimated)` : ""} · ${money(n.spent_7d)}${n.weekly_cap > 0 ? ` / ${money(n.weekly_cap)}` : ""} per 7d`);
     return `<div class="row"><b>${esc(k)}</b><span class="pill lv-${g.level}">${g.level}</span><span class="meta">${esc(detail)}</span>
       <span class="meta">${esc((g.reasons || []).join("; "))}</span></div>`; }).join("");
 }

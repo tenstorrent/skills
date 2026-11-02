@@ -94,7 +94,10 @@ def since(ts: float, now: float | None = None) -> str:
     return f"{int(s // 60)} min" if s < 7200 else f"{s / 3600:.0f} h" if s < 2 * DAY else f"{s / DAY:.0f} days"
 
 
-def gate_detail(g: dict, now: float | None = None, where=None) -> str:
+def gate_detail(g: dict, now: float | None = None, where=None, gates: dict | None = None) -> str:
+    """One gate's detail line. On the dollar caps, an unset (0) cap shows its spend as a plain figure,
+    never 'of $0', and with neither cap set the line opens 'no dollar cap' ('(plan windows apply)' when
+    a gate in `gates` is on plan windows)."""
     n = g.get("numbers") or {}
     if g.get("regime") == "windows":
         wins = n.get("plan") or [n]
@@ -108,9 +111,16 @@ def gate_detail(g: dict, now: float | None = None, where=None) -> str:
         return (f"account use: {'; '.join(parts)}. The project stops at {n.get('limit')}% "
                 f"(plan-billed, so the dollar caps do not apply)")
     est = f" (~${n['estimated_24h']:.2f} estimated)" if n.get("estimated_24h") else ""
-    day = (f"${n['spent_today']:.2f} of ${n.get('daily_cap', 0):.0f} today" if "spent_today" in n
-           else f"${n.get('spent_24h', 0):.2f} of ${n.get('daily_cap', 0):.0f} per 24h")
-    out = f"{day}{est}, ${n.get('spent_7d', 0):.2f} of ${n.get('weekly_cap', 0):.0f} per 7d"
+    day_cap, week_cap = float(n.get("daily_cap") or 0), float(n.get("weekly_cap") or 0)
+
+    def one(spent: float, cap: float, span: str) -> str:
+        return f"${spent:.2f} of ${cap:.0f} {span}" if cap > 0 else f"${spent:.2f} {span}"
+    day = (one(n["spent_today"], day_cap, "today") if "spent_today" in n
+           else one(n.get("spent_24h", 0), day_cap, "per 24h"))
+    out = f"{day}{est}, {one(n.get('spent_7d', 0), week_cap, 'per 7d')}"
+    if day_cap <= 0 and week_cap <= 0:
+        plan = any(x.get("regime") == "windows" for x in (gates or {}).values())
+        out = f"no dollar cap{' (plan windows apply)' if plan else ''}: {out}"
     if "global_today" in n:
         out += (f"; global {gcap.money(n['global_today'])} of ${float(n.get('global_cap') or 0):.0f} today: "
                 f"{n.get('global_includes') or 'this account'}")
@@ -436,7 +446,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     spend = {"spent_24h": round(db.spent_since(now - DAY), 2), "spent_7d": round(db.spent_since(now - WEEK), 2),
              "top_7d": top if top and top["usd"] else None, "in_flight": round(bud.in_flight(db), 2)}
     spend["headline"] = budget_line(db, now, core, g, spend["spent_24h"], gates)
-    spend["detail"] = gate_detail(g, now, tz) if g else ""
+    spend["detail"] = gate_detail(g, now, tz, gates) if g else ""
     return {
         "zone": timefmt.zone_name(p.raw_config()),   # the home zone every time here is shown in
         "spend": spend,
@@ -663,12 +673,13 @@ def state_payload(p: Project, db: DB) -> dict:
     runs = db.q("SELECT id,task,role,provider,model,effort,status,started,ended,cost_usd FROM runs "
                 "ORDER BY id DESC LIMIT 40")
     health_now = health(p, db, now=now)
+    gates = db.kv("gates", {})
     return {
         "project": {"name": p.name, "root": str(p.root), "config": p.config(),
                     "zone": timefmt.zone_name(p.raw_config())},   # the web app shows every time in it
         "daemon": db.kv("daemon", {}), "paused": db.kv("paused", False),
         "pause": {**pause, "text": projpause.describe(pause, tz, now)} if (pause := projpause.current(db, now)) else None,
-        "gates": {k: {**g, "detail": gate_detail(g, now, tz)} for k, g in db.kv("gates", {}).items()},
+        "gates": {k: {**g, "detail": gate_detail(g, now, tz, gates)} for k, g in gates.items()},
         "heartbeat": heartbeat(p), "runtime": health_now["runtime"], "heartbeat_stale_s": HEARTBEAT_STALE_S, "watchdog_s": int(watchdog_settings(p)["hang_s"]),
         "service": installed(p), "disk_low": db.kv("disk_low"),
         "disk": db.kv("disk"), "worktrees_kept": db.kv("worktrees_kept"),

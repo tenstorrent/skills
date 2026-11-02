@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from . import locks
+from . import budget as bud, locks
 from . import ackwait, anchors, askauto, askrethink, broadcast, budgetkind, cachettl, causefix, cells, chaincap, convgate, chainprio, chatset, checkspill, correction, course, credits, deploy, echoes, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, rejcool, relay, responsibilities, restriction_audit, restriction_source, reviewcap, selfreview, reviewreuse, settinghold, settled, shared, sharedchecks, startbreaker, sweep, throughmute, timefmt, tried, unblock, unstarted, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
@@ -879,11 +879,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                 money += (f" · {n.get('running', 0)} of {g['max_parallel']} worker slots busy: keep enough "
                           f"independent tasks ready to fill the free ones")
         else:
-            est = f" (${n['estimated_24h']:.2f} of it estimated)" if n.get("estimated_24h") else ""
-            day = (f"${n['spent_today']:.2f} of ${b.get('daily_usd')} today" if "spent_today" in n
-                   else f"${n.get('spent_24h', 0):.2f} of ${b.get('daily_usd')} per 24h")
-            money = (f"project caps (usage-billed providers together): {day}"
-                     f"{est}, ${n.get('spent_7d', 0):.2f} of ${b.get('weekly_usd')} per 7 days")
+            plan = any(x.get("regime") == "windows" for x in gates.values())
+            money = ("project caps (usage-billed providers together): "
+                     + bud.caps_spend(n, float(b.get("daily_usd") or 0), float(b.get("weekly_usd") or 0), plan))
             if "global_today" in n:
                 stale = f", {len(n['global_stale'])} machine(s) stale" if n.get("global_stale") else ""
                 money += (f" · global daily cap (whole account): ${n['global_today']:.2f} of "
