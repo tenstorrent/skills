@@ -86,10 +86,11 @@ def _loose(text: str) -> str:
     return " ".join(text.translate(str.maketrans("‘’“”", "''\"\"")).split()).casefold()
 
 
-def check(db, charter: str, text: str, src) -> str:
+def check(db, charter: str, text: str, src, agent: bool = False) -> str:
     """The cite to add to each item of a new or changed Restrictions `text` that has none (cite_items),
     or ValueError (NO_SOURCE) when `src` is missing or does not hold: an unknown message, one that is
-    not the user's own, or a quote that is not in its verbatim part (or in the Brief)."""
+    not the user's own, or a quote that is not in its verbatim part (or in the Brief). With `agent`
+    (relay.agent_orders) the owner's own agent's context and findings in that message count too."""
     src = _parse(src)
     origin = str(src.get("origin") or "").strip().lower()
     quote = str(src.get("quote") or "").strip()
@@ -113,10 +114,11 @@ def check(db, charter: str, text: str, src) -> str:
     rows = relay.recent(db, [mid])
     row = next((r for r in rows if r["id"] == mid), None)
     kind = db.one("SELECT kind FROM messages WHERE id=?", (mid,))
-    if row is None or (kind and kind["kind"] != "user"):
+    if row is None or (kind and kind["kind"] not in (("user", "finding") if agent else ("user",))):
         raise ValueError(f"charter_update rejected: message check failed: message #{mid} is not a message from the "
                          f"user. {SOURCE_FORMS}")
-    own = relay.split(row["text"] or "", row["context"])[0]
+    own, ctx = relay.split(row["text"] or "", row["context"])
+    own = f"{own}\n{ctx}" if agent else own
     if len(quote) < 3 or _loose(quote) not in _loose(own):
         raise ValueError(f"charter_update rejected: quote check failed: `source.quote` is not in the user's own words "
                          f"of message #{mid} (the source itself was read; a relayer's context does not count); quote "

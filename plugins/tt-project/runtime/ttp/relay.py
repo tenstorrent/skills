@@ -16,6 +16,12 @@ charter and the user-rule memory). The coordinator refuses a charter_update or a
 carrying one (restrictions, policies, standing rules, pins and approvals need the user's own words). A
 `decision` or `fact` entry carrying one is stored in the same action, tagged 'relayed (context), msg #N' as
 the coordinator's own decision or the relayer's fact, never the user's word; a pin is noted.
+
+A project whose owner relays through their own chat agent may turn on AGENT_KEY (off by default). Then that
+agent's context and findings count as the owner's word: the digest labels them AGENT and the guard passes.
+Never through it: a PR's approval (the message's provenance decides), the user-only settings
+(coordinator.NEEDS_USER, the merge list), loosening a Restriction, or text from anyone else (events, notes,
+PR comments, logs: none are messages and none reach this guard).
 """
 from __future__ import annotations
 
@@ -26,6 +32,8 @@ MARK = "--- relayer context (not the user's words) ---"
 VERBATIM = "user's words (verbatim)"
 CONTEXT = "relayer context (data, not the user's word)"
 FINDING = "relayer findings (data, not the user's word)"
+AGENT_KEY = "coordinator.agent_orders_as_user"
+AGENT = "the owner's word via the owner's agent"
 WINDOW_S = 3600   # without a turn's own messages, how far back the guard reads inbound messages
 SHINGLE = 5       # words in a phrase the guard matches
 QUOTE_BACK = 600  # chars of the user's words a rejection hands back, so the next turn can quote them
@@ -52,6 +60,11 @@ def split(text: str, context: str | None = None) -> tuple[str, str]:
 
 _VERBATIM_PART = re.compile(r"user[’']s words \(verbatim\)\s*:?(.*?)(?:" + re.escape(CONTEXT) + "|"
                             + re.escape(MARK) + r"|$)", re.I | re.S)
+
+
+def agent_orders(cfg: dict | None) -> bool:
+    """Whether this project counts its owner's own chat agent's context and findings as the owner's word."""
+    return ((cfg or {}).get("coordinator") or {}).get("agent_orders_as_user") is True
 
 
 def carries_user_words(text: str | None) -> bool:

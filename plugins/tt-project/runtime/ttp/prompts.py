@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from . import budget as bud
-from . import chaincap, conflictfix, overlap, replymsg, settinghold, settled, taskfacts, timefmt
+from . import chaincap, conflictfix, overlap, relay, replymsg, settinghold, settled, taskfacts, timefmt
 from .db import continues_id, load_result
 from .hook import unread_update
 from .project import rebase_replace
@@ -79,6 +79,8 @@ def coordinator_features(p: Project) -> set[str]:
     on |= {"own_push_limited"} if mode != "on" and d.get("own_push") is not None else set()
     if d.get("draft_prs", True) is not False:
         on.add("draft_prs")
+    if relay.agent_orders(cfg):
+        on.add("agent_orders")
     if d.get("drafts_during_freeze", True) is not False:
         on.add("drafts_during_freeze")
     if (cfg.get("notify") or {}).get("slack"):

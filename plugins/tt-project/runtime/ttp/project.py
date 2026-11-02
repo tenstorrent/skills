@@ -455,7 +455,9 @@ EXTRA_KEYS = {
     # probe_stall_dispose_h: when the blocker sweep settles a probe stall model-free (sweep.py; default 1, 0 off).
     # echo_paths: more files or folders (relative to the project root) the retired-rule echo scan reads,
     # such as a repo's recovery scripts (echoes.py; default none).
-    "coordinator": {"max_review_tasks_per_day", "charter_approval_days", "approval_lookback_days", "reask_window_days", "blocker_sweep_h", "blocker_sweep_min_gap_h",
+    # agent_orders_as_user: the owner's own chat agent's relayed context and findings count as the owner's
+    # word (relay.agent_orders; default off, set only on the owner's own message).
+    "coordinator": {"agent_orders_as_user", "max_review_tasks_per_day", "charter_approval_days", "approval_lookback_days", "reask_window_days", "blocker_sweep_h", "blocker_sweep_min_gap_h",
                     "review_backlog_h", "user_pause_marker", "promise_default_h", "mitigation_due_h", "course_check",
                     "progress_check", "probe_stall_dispose_h", "echo_paths"},
     "notify": {"slack_poll_s"},
