@@ -1364,9 +1364,9 @@ def test_a_whole_machine_ledger_view_is_capped_to_open_changes_and_a_count(env):
 
 
 
-def _coordinator_turns(env, monkeypatch, provider):
-    """(project, turn): turn(text) queues one event, runs a coordinator turn on `provider` ten
-    minutes later and returns its (prompt, start_run kwargs)."""
+def _coordinator_turns(env, monkeypatch, provider, step=600):
+    """(project, turn): turn(text) queues one event, runs a coordinator turn on `provider` `step`
+    seconds (ten minutes) later and returns its (prompt, start_run kwargs)."""
     p = make(env)
     from ttp.daemon import Daemon
     p.add_memory("Picked the cheaper runner.", kind="decision")
@@ -1382,7 +1382,7 @@ def _coordinator_turns(env, monkeypatch, provider):
     def turn(text):
         p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                (clock[0], "daemon", "task_failed", "normal", text, "queued"))
-        clock[0] += 600
+        clock[0] += step
         d.maybe_coordinate()
         p.db.x("UPDATE events SET status='handled'")
         prompt, prov, k = calls[-1]
@@ -1449,14 +1449,66 @@ def test_a_snapshot_from_before_recent_memory_was_cached_shows_it_all_in_the_dig
 
 
 
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_user_corrections_are_read_from_the_cached_prompt_and_new_ones_show_in_the_digest(env, monkeypatch, provider):
+    # Claude Code's cache reads only the system prompt, never a shared start of the user prompt (measured,
+    # task #5172): the corrections (6 changes in 1,000 turns) were rewritten with every digest.
+    from ttp import coordinator as coord
+    from ttp.project import CORRECTIONS_HEADER
+    p, turn = _coordinator_turns(env, monkeypatch, provider, step=60)
+    fix = p.add_memory("Correction (user msg #12): box-a is up; retires 'box-a is down'.", kind="fact")
+    first, k1 = turn("one")
+    second, k2 = turn("two")   # a minute later, no state change: the cached part is byte-identical
+    assert (k1["system"], k1["context"]) == (k2["system"], k2["context"])
+    assert f"## {CORRECTIONS_HEADER}\n[{fix.stem}] Correction (user msg #12)" in k1["context"]
+    for prompt in (first, second):
+        assert "Correction (user msg #12)" not in prompt and CORRECTIONS_HEADER not in prompt
+    assert "user_corrections" not in k2["note"]["digest"]["sections"]
+    # A new or edited correction waits in the digest; the cached block keeps its bytes.
+    new = p.add_memory("Correction (user msg #20): job 7 passed.", kind="fact")
+    fix.write_text(fix.read_text().replace("box-a is up", "box-a is up again"))
+    third, k3 = turn("three")
+    assert k3["context"] == k1["context"]
+    added = third.split(coord.CORRECTIONS_ADDED_HEADER, 1)[1]
+    assert "Correction (user msg #20): job 7 passed." in added and "box-a is up again" in added
+    assert third.count("Correction (user msg #20)") == 1, "not also among the recent facts"
+    # A deleted one is retired in the digest until the refresh renders the block anew.
+    p.forget_memory(fix.stem)
+    fourth, k4 = turn("four")
+    assert k4["context"] == k1["context"] and f"[{fix.stem}] retired, ignore" in fourth
+    p.db.set_kv(coord.PROMPT_REFRESH_KEY, 1)
+    fifth, k5 = turn("five")
+    assert f"[{new.stem}]" in k5["context"] and "box-a is up" not in k5["context"]
+    assert coord.CORRECTIONS_ADDED_HEADER not in fifth and CORRECTIONS_HEADER not in fifth
+
+
+def test_a_snapshot_from_before_corrections_were_cached_shows_them_in_the_digest(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    fix = p.add_memory("Correction (user msg #12): box-a is up.", kind="fact")
+    coord.system_prompt(p)
+    snap = p.db.kv(coord.PROMPT_SNAPSHOT_KEY)
+    p.db.set_kv(coord.PROMPT_SNAPSHOT_KEY, {k: v for k, v in snap.items() if k not in ("corrections", "correction_lines")})
+    cached, delta = coord.correction_lines(p)
+    assert cached == [] and delta[0] == coord.CORRECTIONS_ADDED_HEADER and f"[{fix.stem}]" in delta[1]
+    assert "corrections" not in p.db.kv(coord.PROMPT_SNAPSHOT_KEY), "an old snapshot is kept, not re-rendered"
+    # One that ages out of the list after the snapshot took it stays in the cached list, not also a new fact.
+    p.db.set_kv(coord.PROMPT_REFRESH_KEY, 1)
+    coord.system_prompt(p)
+    _aged(fix, 31)
+    cached, delta = coord.correction_lines(p)
+    assert f"[{fix.stem}]" in cached[1] and delta == []
+    assert not any(fix.stem in x for x in sum(coord.recent_memory(p), []))
+
+
 def test_split_cached_keeps_a_fixed_order_and_the_rest_of_the_digest():
     from ttp import coordinator as coord
-    assert coord.CACHED_SECTIONS == ("memory_recent",)
-    parts = [("budget", "B"), ("memory_recent", "R"), ("tasks", "T"), ("prompt_delta", "P"), ("memory_added", "A"),
+    assert coord.CACHED_SECTIONS == ("user_corrections", "memory_recent")
+    parts = [("budget", "B"), ("memory_recent", "R"), ("user_corrections", "C"), ("user_corrections_added", "N"), ("tasks", "T"), ("prompt_delta", "P"), ("memory_added", "A"),
              ("memory_recent_added", "D")]
     cached, rest = coord.split_cached(parts)
-    assert cached == "R" and rest == [("budget", "B"), ("tasks", "T"), ("prompt_delta", "P"), ("memory_added", "A"),
-                                      ("memory_recent_added", "D")]
+    assert cached == "C\nR" and rest == [("budget", "B"), ("user_corrections_added", "N"), ("tasks", "T"),
+                                         ("prompt_delta", "P"), ("memory_added", "A"), ("memory_recent_added", "D")]
     assert coord.split_cached([("tasks", "T")]) == ("", [("tasks", "T")])
     assert coord.with_cached("CTX\n", "") == "CTX\n" and coord.with_cached("CTX\n", "R") == "CTX\n\nR\n"
 
@@ -18121,8 +18173,10 @@ def test_a_user_correction_leads_worker_prompts_and_the_digest_and_outlives_memo
     assert block in system and system.count("Correction (user msg #12)") == 1, system
     assert system.index(block) < system.index("# PROJECT MEMORY")
     assert "PLAIN-FACT" not in system.split(block)[1].split("\n# ")[0]
-    # Without a correction there is no heading anywhere.
+    # Without a correction there is no heading anywhere (the coordinator's after its prompt's next refresh).
     p.forget_memory(fix.stem)
+    assert f"[{fix.stem}] retired, ignore" in coord.digest(p, {}, [], [])
+    p.db.set_kv(coord.PROMPT_REFRESH_KEY, 1)
     assert CORRECTIONS_HEADER not in coord.digest(p, {}, [], []) and CORRECTIONS_HEADER.upper() not in worker_system(p)
 
 

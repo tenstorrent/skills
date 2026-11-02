@@ -237,9 +237,10 @@ coordinator records it that turn as a `fact` starting `Correction (user msg #<id
 the entries that stated the old claim, and queues a task to fix any project file that states it.
 For 30 days `Project.user_corrections` lists the newest 10 such entries (2000 characters at most,
 oldest dropped first) under "User corrections (outrank project notes and older output)": first in
-every worker's prompt, ahead of the rest of memory and outside its budget, and as a live section of
-the coordinator's digest, where they are pinned past the memory budget and left out of the other
-recent facts. After that a correction is an ordinary fact again. Workers check that list before
+every worker's prompt, ahead of the rest of memory and outside its budget, and for the coordinator
+pinned past the memory budget and left out of the other recent facts. The coordinator reads them from
+the cached end of its system prompt as the prompt snapshot took them (they rarely change); one
+recorded, changed or deleted since shows in the digest until the next refresh. After that a correction is an ordinary fact again. Workers check that list before
 restating a status from a note, and fix their own project's notes that contradict it.
 
 ## Adding a provider

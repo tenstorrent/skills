@@ -550,9 +550,10 @@ LEDGER_HEAD = "## Shared machines in your Resources"
 # Sections rendered from the prompt snapshot alone: they end the cached context block (with_cached)
 # instead of the digest, which a timestamp leads and so misses the cache whole every turn. They change
 # only when the snapshot does, so the block is byte-identical between refreshes on every provider.
-# What changes between refreshes (prompt_delta, memory_added, memory_recent_added) stays in the digest:
-# where the cache matches only at a breakpoint, one such line in the block rewrote all of it.
-CACHED_SECTIONS = ("memory_recent",)
+# What changes between refreshes (prompt_delta, memory_added, user_corrections_added, memory_recent_added)
+# stays in the digest: where the cache matches only at a breakpoint, one such line in the block rewrote
+# all of it. The user's corrections changed 6 times in 1,000 turns, so they are read from the cache.
+CACHED_SECTIONS = ("user_corrections", "memory_recent")
 EVENT_CHARS = 1500
 # A plan's product arrives as these events; the daemon sizes them to fit, so they show whole.
 EVENT_CHARS_BY_KIND = {"followup_proposed": 4300, "task_notes": 6000, "upstream_note": 4300,
@@ -609,6 +610,8 @@ MEMORY_SNAPSHOT_KEY = PROMPT_SNAPSHOT_KEY
 PROMPT_REFRESH_KEY = "prompt_refresh"     # kv: a charter edit on the user's word: the next turn re-renders
 MEMORY_DIGEST_HEADER = "## Memory added since the snapshot"
 RECENT_MEMORY_HEADER = "## Recent decisions and facts (newest last; older ones stay in memory/)"
+CORRECTIONS_ADDED_HEADER = (f"## {CORRECTIONS_HEADER}: recorded or changed since the cached prompt (a changed "
+                            "one replaces its line in the cached list)")
 RECENT_ADDED_HEADER = ("## Decisions and facts recorded or changed since the cached prompt (newest last; "
                        "a changed one replaces its line in the recent list)")
 PROMPT_MAX_AGE_S = 4 * 3600
@@ -690,7 +693,9 @@ def prompt_state(p: Project, now: float | None = None) -> tuple[dict, dict]:
                 "rules": live["rules"], "restrictions": restrictions, "role": live["role"],
                 "version": runtime_version(p.harness / "runtime"), "charter": charter,
                 "standing": live["standing"], "entries": live["shas"],
-                "recent": {"lines": [e["line"] for e in recent], "entries": {e["name"]: _sha(e["line"]) for e in recent}}}
+                "recent": {"lines": [e["line"] for e in recent], "entries": {e["name"]: _sha(e["line"]) for e in recent}},
+                "corrections": {e["name"]: _sha(e["line"]) for e in p.user_corrections(now)},
+                "correction_lines": [e["line"] for e in p.user_corrections(now)]}
         p.db.set_kv(PROMPT_SNAPSHOT_KEY, snap)
         p.db.x("DELETE FROM kv WHERE key IN (?, 'memory_snapshot')", (PROMPT_REFRESH_KEY,))
     return snap, live
@@ -717,7 +722,7 @@ def recent_memory(p: Project, now: float | None = None) -> tuple[list[str], list
     taken = took.get("entries") or {}
     live = {e["name"]: e for e in p._memory_entries()}
     shown = p.memory_select(COORDINATOR_MEMORY_CHARS)[0]
-    fixed = {e["name"] for e in p.user_corrections(now)}   # correction_lines lists them
+    fixed = {e["name"] for e in p.user_corrections(now)} | set(snap.get("corrections") or {})   # correction_lines lists them
     new = [e for e in shown if not _standing_entry(e) and e["name"] not in taken and e["name"] not in fixed]
     changed = [live[n] for n in taken if n in live and _sha(live[n]["line"]) != taken[n]]
     retired = [n for n in taken if n not in live]
@@ -727,11 +732,17 @@ def recent_memory(p: Project, now: float | None = None) -> tuple[list[str], list
     return cached, [RECENT_ADDED_HEADER, *delta] if delta else []
 
 
-def correction_lines(p: Project, now: float | None = None) -> list[str]:
-    """The user's corrections (Project.user_corrections), live every turn ahead of the other recent
-    facts, which leave them out."""
-    fixed = p.user_corrections(now)
-    return [f"## {CORRECTIONS_HEADER}", *(e["line"] for e in fixed)] if fixed else []
+def correction_lines(p: Project, now: float | None = None) -> tuple[list[str], list[str]]:
+    """(cached, delta): the user's corrections (Project.user_corrections) as the snapshot holds them
+    (CACHED_SECTIONS), and the ones recorded, changed or deleted since, for the digest. The other recent
+    facts leave them out. One that only aged out of the list stays shown until the next refresh."""
+    snap = prompt_state(p, now)[0]
+    taken = snap.get("corrections") or {}
+    live = {e["name"]: e for e in p._memory_entries()}
+    delta = [e["line"] for e in p.user_corrections(now) if taken.get(e["name"]) != _sha(e["line"])]
+    delta += [f"[{n}] retired, ignore" for n in taken if n not in live]
+    lines = snap.get("correction_lines") or []
+    return ([f"## {CORRECTIONS_HEADER}", *lines] if lines else []), ([CORRECTIONS_ADDED_HEADER, *delta] if delta else [])
 
 
 def _charter_delta(old: str, new: str) -> list[str]:
@@ -1071,7 +1082,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         shown.append(("machine_ledger", ledger[0]))
         shas[LEDGER_SEEN_KEY] = ledger[1]
     section("prompt_delta", prompt_delta_lines(p, now))
-    section("user_corrections", correction_lines(p, now))
+    cached, delta = correction_lines(p, now)
+    section("user_corrections", cached)
+    section("user_corrections_added", delta)
     section("memory_added", memory_digest_lines(memory_view(p, now)))
     area = settled.digest_line(p, now)
     section("settled_areas", [area] if area else [], area, area.split(":")[0] + " (as last turn)")
