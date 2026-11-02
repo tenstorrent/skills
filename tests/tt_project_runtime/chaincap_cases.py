@@ -510,6 +510,87 @@ def test_the_hop_delivering_after_its_split_head_review_gets_a_review_of_only_it
             assert f"#{hop} delivered the rest of its split chain" in r["spec"]
 
 
+def _two_hop_split(env, p, title):
+    """Split task S1 -> its hop H1 (done, itself a split, one commit) -> H2, H1's hop with no commit yet.
+    (S1, H1, H1's head, H2)."""
+    tid, _, head = _unreviewed(env, p, title)
+    _split_at(p, tid, head)
+    h1, h1_head = _hop_on(env, p, tid)
+    when = time.time() - 600
+    p.db.update_task(h1, status="done", labels=[f"continues:{tid}", f"split:{h1_head}"],
+                     result=json.dumps({"status": "done", "summary": "Split here: half done"}))
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (when, h1))
+    _ran(p, h1, when)
+    h2, _ = _hop_on(env, p, h1, commit=False)
+    return tid, h1, h1_head, h2
+
+
+def test_a_chain_review_of_an_earlier_split_task_is_released_when_a_later_hop_stalls(env):
+    """S1 -> H1 (done split) -> H2 waiting on the user: the chain's review, titled or keyed for S1 and moved
+    onto H2 by each hop in turn, waits on H1 again and reviews H1's head now; the sweep queues no second
+    review of that head beside it."""
+    from ttp import chaincap
+    from ttp import daemon as dm
+    p = make(env)
+    d = dm.Daemon(p.base)
+    for keyed in (True, False):
+        s1, h1, h1_head, h2 = _two_hop_split(env, p, f"split change {keyed}")
+        rev = p.db.add_task(f"Review #{s1}: split change", "Review it.", kind="review", origin="daemon",
+                            depends_on=[h2], labels=[f"auto_review:{s1}"] if keyed else [])
+        own = p.db.add_task(f"Review #{h2}: continue: live step", "Review it.", kind="review",
+                            origin="coordinator", depends_on=[h2], labels=[f"auto_review:{h2}"])
+        assert d.sweep_unreviewed(force=True) == [], keyed   # a running hop carries the chain
+        assert json.loads(p.db.task(rev)["depends_on"]) == [h2]
+        p.db.update_task(h2, result=json.dumps({"status": "waiting", "wait_kind": "user", "waiting_for": "sign-in",
+                                                "retry_when": "tool status"}))
+        for _ in range(2):
+            assert d.sweep_unreviewed(force=True) == [], keyed
+            r = p.db.task(rev)
+            assert json.loads(r["depends_on"]) == [h1] and f"{chaincap.SPLIT_REVIEW_LABEL}{h1_head}" in r["labels"]
+            assert f"#{h2} waits on the user (sign-in)" in r["spec"]
+            assert f"head {h1_head[:12]} (the split chain #{s1} to #{h1}) only" in r["spec"]
+            assert [x["id"] for x in p.db.q("SELECT id FROM tasks WHERE kind='review' AND id>?", (rev,))] == [own]
+            assert json.loads(p.db.task(own)["depends_on"]) == [h2]   # H2's own review stays on H2
+        assert not p.db.unmet_dependencies([p.db.task(rev)]).get(rev)
+        p.db.update_task(rev, status="done")   # passed: the next round sees only its own chain
+        p.db.update_task(own, status="cancelled")
+
+
+def test_the_last_hop_of_a_three_hop_chain_delivering_after_the_released_review_reviews_only_its_commits(env):
+    """After the S1 chain review was released to H1's head: once it ran, H2's delivery is reviewed for
+    H1-head..H2-tip only; while it is still queued, it folds into H2's review (one review of the chain)."""
+    from ttp import chaincap
+    from ttp import daemon as dm
+    from ttp import worktree
+    p = make(env)
+    d = dm.Daemon(p.base)
+    for ran in (True, False):
+        s1, h1, h1_head, h2 = _two_hop_split(env, p, f"split change {ran}")
+        rev = p.db.add_task(f"Review #{s1}: split change", "Review it.", kind="review", origin="daemon",
+                            depends_on=[h2], labels=[f"auto_review:{s1}"])
+        p.db.update_task(h2, result=json.dumps({"status": "waiting", "wait_kind": "user", "retry_when": "x"}))
+        assert d.sweep_unreviewed(force=True) == [] and json.loads(p.db.task(rev)["depends_on"]) == [h1]
+        if ran:
+            p.db.update_task(rev, status="done")
+        path, _ = worktree.ensure(p, p.db.task(h2))
+        (path / f"{h2}.py").write_text("rest\n")
+        _git_out(path, "add", ".")
+        _git_out(path, *_IDENT, "commit", "-qm", "rest")
+        h2_head = _git_out(path, "rev-parse", "HEAD").strip()
+        p.db.update_task(h2, status="done", result=json.dumps({"status": "done", "summary": "measured"}))
+        got, added = d._auto_review(p.db.task(h2), "measured")
+        if ran:
+            assert added and got != rev
+            spec = p.db.task(got)["spec"]
+            assert f"git log -p {h1_head}..{h2_head}" in spec and f"#{rev}" in spec
+            assert "review the chain's whole change as one" not in spec
+        else:
+            assert (got, added) == (rev, False)
+            r = p.db.task(rev)
+            assert json.loads(r["depends_on"]) == [h2] and chaincap.SPLIT_REVIEW_LABEL not in r["labels"]
+            assert f"#{h2} delivered the rest of its split chain" in r["spec"]
+
+
 def _failed_parent(p, d, raised, title="Port the parser"):
     """A coordinator code task queued at standard that failed; `raised`: its retry ran a tier up first."""
     import json

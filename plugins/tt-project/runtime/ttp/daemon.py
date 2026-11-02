@@ -12139,8 +12139,10 @@ class Daemon:
         """A queued review of a done split task that waits on its hop instead (task_add moved the split
         task's dependents to the hop it added: coordinator._take_over_dependents) while that hop stalls
         (chaincap.hop_stall: blocked, waiting on the user, a start_when or a long deferral) waits on the
-        split task again, labelled chaincap.SPLIT_REVIEW_LABEL: it reviews the delivered head now. The hop's
-        later commits get their own review when it delivers (_auto_review). Returns the reviews released."""
+        split task again, labelled chaincap.SPLIT_REVIEW_LABEL: it reviews the delivered head now. A review of
+        an earlier split task of the hop's chain (chaincap.split_hops: each hop before took it over in turn) is
+        released the same way, to the latest split head. The hop's later commits get their own review when it
+        delivers (_auto_review). Returns the reviews released."""
         db, out = self.p.db, []
         hops = db.q("SELECT * FROM tasks WHERE kind='code' AND status IN ('queued','blocked') AND labels LIKE ?",
                     ('%"continues:%',))
@@ -12152,14 +12154,17 @@ class Daemon:
             why = chaincap.hop_stall(x, now) if head else ""
             if not why:
                 continue
+            ids = {s["id"]} | {h["id"] for h in chaincap.split_hops(db, x)}
             for r in reviews:
                 labels = push._labels(r)
-                if x["id"] not in dependency_ids(r) or not (f"auto_review:{s['id']}" in labels
-                                                            or r["title"].startswith(f"Review #{s['id']}:")):
+                named = [i for i in sorted(ids) if f"auto_review:{i}" in labels
+                         or r["title"].startswith(f"Review #{i}:")]
+                if x["id"] not in dependency_ids(r) or not named:
                     continue
                 deps = list(dict.fromkeys(s["id"] if d == x["id"] else d for d in dependency_ids(r)))
+                upto = f" (the split chain #{named[0]} to #{s['id']})" if named[0] != s["id"] else ""
                 spec = (f"{r['spec'] or ''}\nIts continuation #{x['id']} {why}: this review covers #{s['id']}'s "
-                        f"delivered head {head[:12]} only. #{x['id']}'s own later commits get their own review "
+                        f"delivered head {head[:12]}{upto} only. #{x['id']}'s own later commits get their own review "
                         f"when it delivers.")
                 with db.tx():
                     db.update_task(r["id"], depends_on=deps, spec=spec,
