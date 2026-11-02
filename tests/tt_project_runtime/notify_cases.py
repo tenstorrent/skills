@@ -476,3 +476,76 @@ console.log(JSON.stringify(out));
     assert out == {"one": 1, "two": 2, "none": 0, "gated": 2, "dedup": 1}
     # The pill uses needsYou; the old count of every blocked task plus attention is gone.
     assert "const needs = needsYou(st)" in js and "filter((t) => t.status === \"blocked\").length" not in js
+
+
+def test_a_say_without_a_chat_replies_to_one_chat_per_caller_that_counts_as_a_reader(env, monkeypatch, capsys):
+    from ttp import cli
+    from ttp import coordinator as coord
+    from ttp.web import health
+    p = make(env)
+    monkeypatch.setattr(cli, "here", lambda: None)
+    monkeypatch.setenv("TTP_CLIENT_HOST", "relay-host")
+
+    def said(*argv):
+        capsys.readouterr()
+        cli.main(["say", "demo", *argv])
+        return (p.db.one("SELECT id, chat FROM messages WHERE direction='in' ORDER BY id DESC LIMIT 1"),
+                capsys.readouterr().out)
+
+    m1, out = said("--", "first")
+    m2, _ = said("--context", "relayed", "--", "second")
+    chat = m1["chat"]
+    assert chat and chat.startswith(cli.SAY_CHAT_PREFIX) and m2["chat"] == chat, "one chat per caller, not per call"
+    assert f"ttp listen demo --chat {chat} --once" in out
+    row = p.db.one("SELECT label, last_read FROM chats WHERE id=?", (chat,))
+    assert row["label"] == "ttp say from relay-host" and row["last_read"] < m1["id"], "the first message's reply is unread"
+    assert p.db.one("SELECT COUNT(*) n FROM chats WHERE id LIKE 'say-%'")["n"] == 1
+    # Another caller (an explicit --caller, or another project) gets its own chat.
+    m3, _ = said("--caller", "project other", "--", "third")
+    assert m3["chat"] not in (None, chat)
+    monkeypatch.setattr(cli, "here", lambda: type("P", (), {"name": "other"})())
+    m4, _ = said("--", "fourth")
+    assert m4["chat"] == m3["chat"], "a calling project names its chat"
+    # --chat behaves as before: no new chat, the given one, the old confirmation.
+    m5, out = said("--chat", "c9", "--", "fifth")
+    assert m5["chat"] == "c9" and "ttp listen" not in out and "answers in this chat" in out
+    assert p.db.one("SELECT COUNT(*) n FROM chats")["n"] == 2
+    # The coordinator's reply to the message goes to that chat (the turn's default chat is the message's).
+    monkeypatch.setattr(cli, "here", lambda: None)
+    m6, _ = said("--", "sixth")
+    assert coord.apply(p, [{"type": "reply", "text": "done: the fix landed"}], default_chat=m6["chat"]) == []
+    reply = p.db.one("SELECT id, chat FROM messages WHERE kind='reply' ORDER BY id DESC LIMIT 1")
+    assert reply["chat"] == chat
+    # Unread for an hour, the reply reached nobody; once the chat reads past it, it did.
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 3600, reply["id"]))
+    u = health(p, p.db)["undelivered"]
+    assert (u["asks"], u["alerts"]) == (0, 1), u
+    p.db.x("UPDATE chats SET last_read=? WHERE id=?", (reply["id"], chat))
+    assert health(p, p.db)["undelivered"] is None
+    # A reply to an ordinary chat is still not counted, and the say chat reads broadcasts too.
+    p.db.post("out", "for c9", chat="c9", kind="reply")
+    alert = p.db.post("out", "a service restarted twice", kind="alert", severity="normal")
+    p.db.x("UPDATE messages SET ts=? WHERE id>?", (time.time() - 3600, reply["id"]))
+    assert health(p, p.db)["undelivered"]["alerts"] == 1
+    p.db.x("UPDATE chats SET last_read=? WHERE id=?", (alert, chat))
+    assert health(p, p.db)["undelivered"] is None
+
+
+def test_a_remote_say_sends_the_callers_label_and_drops_it_for_an_older_runtime(env, monkeypatch):
+    from ttp import cli
+    sent = []
+
+    def fake(entry, argv, capture=False):
+        sent.append(list(argv))
+        unknown = any(x.startswith("--caller") for x in argv) and len(sent) == 1
+        return subprocess.CompletedProcess(argv, 2 if unknown else 0, "", "unrecognized arguments: --caller x"
+                                           if unknown else "")
+    monkeypatch.setattr(cli, "_ssh", fake)
+    monkeypatch.setattr(cli, "flush_outbox", lambda name, entry: None)
+    monkeypatch.setattr(cli.outbox, "entries", lambda name: [])
+    rc, _ = cli._say_remote("demo", {"host": "far", "dir": "/x"}, "hi", None, caller="project other")
+    assert rc == 0 and "--caller" in sent[0] and sent[-1] == ["say", "--client-id=" + sent[-1][1][12:], "demo",
+                                                              "--", "hi"]
+    sent.clear()
+    cli._say_remote("demo", {"host": "far", "dir": "/x"}, "hi", "c1", caller="project other")
+    assert "--caller" not in sent[0], "a chat given: no caller label"

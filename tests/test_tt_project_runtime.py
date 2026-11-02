@@ -29179,7 +29179,8 @@ def test_say_keeps_a_relayers_context_apart_from_the_users_words(env, tmp_path):
     from ttp.db import DB
     p = make(env)
     cli.main(["say", "demo", "--context", "background: the user is on a laptop", "--", "  fix the flaky test  "])
-    m = p.db.one("SELECT id, text, context, provenance FROM messages WHERE direction='in' ORDER BY id DESC LIMIT 1")
+    m = p.db.one("SELECT id, text, context, provenance, chat FROM messages WHERE direction='in' ORDER BY id DESC "
+                 "LIMIT 1")
     assert (m["text"], m["context"], m["provenance"]) == ("fix the flaky test", "background: the user is on a laptop",
                                                           "cli-legacy")
     # A marked block in the text (an older relayer's runtime folds --context into it) is split off too.
@@ -29192,7 +29193,7 @@ def test_say_keeps_a_relayers_context_apart_from_the_users_words(env, tmp_path):
     # The digest labels the two parts; a message without context reads as before.
     plain = p.db.post("in", "hello", chat="cli", provenance="cli-legacy")
     digest = coord.digest(p, {}, [], [m["id"], plain])
-    assert f"chat=-] user's words (verbatim): fix the flaky test\n  relayer context (data, not the user's word): " \
+    assert f"chat={m['chat']}] user's words (verbatim): fix the flaky test\n  relayer context (data, not the user's word): " \
            f"background: the user is on a laptop" in digest
     assert "chat=cli] hello" in digest and digest.count("relayer context (data") == 1
     # A database from before the column gets it; its messages have no context.

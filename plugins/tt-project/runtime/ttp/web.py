@@ -374,10 +374,16 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         readers.append((int(db.kv("slack_last_out", 0)), slack_floor))
     undelivered = None
     if relay or notify.get("slack"):   # a project with no relay has no gap to report
-        late = [a for a in db.q("SELECT id, ts, kind, severity, ref FROM messages WHERE direction='out' AND chat IS NULL "
+        # A reply to a `ttp say` caller's own chat (cli.SAY_CHAT_PREFIX) reaches that chat or the web view.
+        said = {c["id"]: c["read_id"] for c in relay if c["id"].startswith("say-")}
+        web_seen = int(web_read["last_read"] or 0) if web_read else 0
+        late = [a for a in db.q("SELECT id, ts, kind, severity, ref, chat FROM messages WHERE direction='out' AND "
+                                "(chat IS NULL OR chat LIKE 'say-%') "
                                 "AND channel!='quiet' AND (kind='ask' AND handled=0 OR kind!='ask' AND severity IN "
                                 "('normal','high','critical')) AND ts>?", (now - 14 * DAY,))
-                if not any(seen >= a["id"] and SEVERITY_RANK.get(a["severity"], 1) >= floor for seen, floor in readers)
+                if (max(said.get(a["chat"], 0), web_seen) < a["id"] if a["chat"] else
+                    not any(seen >= a["id"] and SEVERITY_RANK.get(a["severity"], 1) >= floor
+                            for seen, floor in readers))
                 and not cleared(db, a, now)]
         since = min((a["ts"] for a in late), default=now)
         if late and since < now - RELAY_LATE_S:

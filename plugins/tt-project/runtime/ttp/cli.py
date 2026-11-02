@@ -275,6 +275,9 @@ def _send_say(entry: dict, argv: list[str], client_id: str, capture: bool = Fals
         return _send_say(entry, _fold_broadcast(argv), client_id, capture)
     if r.returncode == 2 and "--context" in (r.stderr or "") and "--context" in argv:
         return _send_say(entry, _fold_context(argv), client_id, capture)
+    if r.returncode == 2 and "--caller" in (r.stderr or "") and "--caller" in argv:   # no reply chats there
+        i = argv.index("--caller")
+        return _send_say(entry, argv[:i] + argv[i + 2:], client_id, capture)
     return r
 
 
@@ -339,12 +342,14 @@ def say_remote(name: str, entry: dict, text: str, chat: str | None, context: str
 
 
 def _say_remote(name: str, entry: dict, text: str, chat: str | None, context: str = "",
-                broadcast: str | None = None, finding: bool = False) -> tuple[int, str]:
+                broadcast: str | None = None, finding: bool = False, caller: str = "") -> tuple[int, str]:
     """say_remote's exit code and where the message went: `client:<id>` (delivered) or
     `queued:<host>`. A broadcast's client id is its broadcast id: a resend is a no-op there.
     `finding`: `context` is a relayer's own findings, sent with no user's words."""
-    argv = (["say", name, *(["--chat", chat] if chat else []), "--finding", context, "--", ""] if finding else
-            ["say", name, *(["--chat", chat] if chat else []), *(["--context", context] if context else []),
+    # No chat: the caller's label goes along, so the reply chat there is named for this side.
+    who = ["--caller", caller] if caller and not chat else []
+    argv = (["say", name, *(["--chat", chat] if chat else []), *who, "--finding", context, "--", ""] if finding else
+            ["say", name, *(["--chat", chat] if chat else []), *who, *(["--context", context] if context else []),
              *(["--broadcast", broadcast] if broadcast else []), "--", text])
     cid = broadcast or outbox.new_id()
     if flush_outbox(name, entry) is None and not outbox.entries(name):
@@ -986,14 +991,21 @@ def cmd_say(a) -> None:
         die("empty message" if not context else NO_WORDS)
     bid = getattr(a, "broadcast", None)
     if entry:
-        rc, ref = _say_remote(a.name, entry, text, a.chat, context, bid, finding=bool(finding))
+        rc, ref = _say_remote(a.name, entry, text, a.chat, context, bid, finding=bool(finding),
+                              caller="" if bid else say_caller(a, a.name))
         if rc == 0 and not finding:
             broadcast.note_delivery(text, a.name, ref, bid)
         sys.exit(rc)
     p = p or need(a.name, sys.argv[1:])
+    label = None
+    if not a.chat and not bid:   # replies go to this caller's own chat, which `ttp listen` reads
+        caller = say_caller(a, p.name)
+        a.chat, label = say_chat(caller)
+        a.new_chat = (label, caller)
     seen, mid = _say_local_or_die(p, a, text, context, bid, kind="finding" if finding else "user")
     if finding:
         print(f"{'already received' if seen else 'sent'} (#{mid}) as {relay.FINDING}")
+        _print_reply_chat(p, a, label)
         return
     # A plain say is recorded too: telling the projects one at a time builds the same record.
     broadcast.note_delivery(text, a.name, f"#{mid}", bid)
@@ -1001,6 +1013,34 @@ def cmd_say(a) -> None:
         print(f"already received (#{mid})")
     else:
         print(f"sent (#{mid}); the coordinator answers in this chat when it has decided")
+    _print_reply_chat(p, a, label)
+
+
+SAY_CHAT_PREFIX = "say-"   # a chat `ttp say` without --chat registered for its caller
+
+
+def say_caller(a, target: str) -> str:
+    """Who sends a `ttp say`: --caller, else the project it runs in (not the one it talks to), else
+    the host a forwarding client named, else this host."""
+    if c := (getattr(a, "caller", "") or "").strip():
+        return c[:80]
+    try:
+        p = here()
+    except OSError:
+        p = None
+    if p and p.name != target:
+        return f"project {p.name}"
+    return os.environ.get("TTP_CLIENT_HOST", "").strip()[:80] or hostname()
+
+
+def say_chat(caller: str) -> tuple[str, str]:
+    """The reply chat's id and label for a caller: one chat per caller, the same on every call."""
+    return SAY_CHAT_PREFIX + hashlib.sha256(caller.encode()).hexdigest()[:8], f"ttp say from {caller}"
+
+
+def _print_reply_chat(p: Project, a, label: str | None) -> None:
+    if label:
+        print(f"replies go to chat {a.chat} ({label}); read them with: ttp listen {p.name} --chat {a.chat} --once")
 
 
 NO_WORDS = ("no user's words: --context alone is not a message; send a relayer's own findings alone with "
@@ -1173,12 +1213,21 @@ def _say_local(p: Project, a, text: str, context: str, bid: str | None = None,
     with p.db.tx():   # a client id makes a resent message (its confirmation was lost) a no-op
         if a.client_id:
             seen = p.db.one("SELECT id FROM messages WHERE direction='in' AND ref=?", (f"client:{a.client_id}",))
+        if getattr(a, "new_chat", None):
+            _register_say_chat(p.db, a.chat, *a.new_chat)
         mid = seen["id"] if seen else p.db.post("in", text.strip(), chat=a.chat or None, channel="chat",
                                                  kind=kind, ref=f"client:{a.client_id}" if a.client_id else None,
                                                  provenance="cli-legacy", context=context, broadcast=bid)
         if a.chat:
             p.db.x("UPDATE chats SET last_active=? WHERE id=?", (time.time(), a.chat))
     return seen, mid
+
+
+def _register_say_chat(db, chat: str, label: str, caller: str) -> None:
+    """Create the caller's reply chat, unread from the message about to be posted; reuse it after."""
+    db.x("INSERT INTO chats(id,created,label,host,last_active,last_read) VALUES(?,?,?,?,?,"
+         "(SELECT COALESCE(MAX(id),0) FROM messages)) ON CONFLICT(id) DO NOTHING",
+         (chat, time.time(), label, caller, time.time()))
 
 
 def cmd_listen(a) -> None:
@@ -9739,7 +9788,10 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("say", help="send a message to the coordinator")
     s.add_argument("name", help="the project (none with --all)")
     s.add_argument("text", help="the user's words, verbatim, or '-' for stdin")
-    s.add_argument("--chat", help="the chat it comes from (replies go there)")
+    s.add_argument("--chat", help="the chat it comes from (replies go there); without it, replies go to one "
+                   "chat kept for the caller, and its `ttp listen` line is printed")
+    s.add_argument("--caller", default="", help="who sends it, naming the caller's reply chat when there is "
+                   "no --chat (default: the calling project, else this host)")
     s.add_argument("--context", default="", help="a relayer's own context (data, never the user's word); "
                    "kept apart from the user's words")
     s.add_argument("--finding", default="", help="a relayer's own findings, sent with no user's words; shown to "
