@@ -85,7 +85,8 @@ TOP_DEF = re.compile(r"^(?:async[ \t]+def|def|class)[ \t]+([A-Za-z_]\w*)", re.M)
 LEAD_KEY = re.compile(r"""["']?([A-Za-z_][\w.-]*)["']?[ \t]*[:=](?![=/])""")   # `"key":`, `key =`, `key:`
 TOP_START = re.compile(r"(?:@|(?:async[ \t]+)?def[ \t]|class[ \t])")
 EXIT = {"pushed": 0, "landed": 0, "nothing": 0, "busy": push.BUSY, "env_fault": push.BUSY, "moved": push.KEPT_MOVING,
-        "worker_loss": push.BUSY, "rejected": push.REJECTED, "refused": push.REFUSED, "tip_failed": push.CHECKS_FAILED}
+        "worker_loss": push.BUSY, "rejected": push.REJECTED, "refused": push.REFUSED, "tip_failed": push.CHECKS_FAILED,
+        "yielded": 0}
 
 
 def say(msg: str) -> None:
@@ -1024,6 +1025,7 @@ class Batch:
         self.flaky: list[dict] = []            # failures whose tests passed on that rerun: {ids, head, cmd}
         self.pre_existing: list[dict] = []     # failures whose tests failed on the tip alone too: {ids, tip, cmd, entry, runs}
         self.fail_rc: dict[str, int] = {}      # a failed check's output tail -> its exit code (_tip_ids)
+        self.yielded_to: list[int] = []        # queue ids of urgent approvals the search stopped for (_yield_now)
 
     # results
 
@@ -1181,7 +1183,8 @@ class Batch:
         if failed is not None and (more := self._rescue(tip, carried, k, checks)):
             head = more
         if head is None:
-            return self._close(0, "tip_failed" if failed is None else "nothing", carried, failed)
+            return self._close(0, "yielded" if self.yielded_to else "tip_failed" if failed is None else "nothing",
+                               carried, failed)
         if push._fetch(self.repo, self.remote, self.branch) != tip:
             return "moved"
         self._mark_pushing(tip, head, k, carried, failed)
@@ -1269,6 +1272,8 @@ class Batch:
             elif i in self.rescued and outcome == "pushed":
                 self._set(i, "pushed")
                 self.landed_at[i] = self.rescued[i]
+            elif self.yielded_to:
+                self._set(i, "requeued", yielded=True)     # the search stopped for an urgent approval
             elif failed and not self.retried:
                 self._set(i, "requeued", untested=True)    # after the blamed entry, never checked without it
             else:
@@ -1881,6 +1886,8 @@ class Batch:
                 else:
                     hi, fails[fresh] = fresh, f
         while hi - lo > 1:
+            if self._yield_now():
+                return lo, heads[lo] if lo else None, None
             mid = (lo + hi) // 2
             heads[mid] = self._head(tip, carried, mid)
             f = self._check(heads[mid], checks)
@@ -1906,6 +1913,8 @@ class Batch:
             say(self.message)
             self.detail_tip = {"cmd": tf[0], "tail": tf[1]}
             return 0, None, None
+        if hi == 1 and self._yield_now():
+            return 0, None, None
         if hi == 1:
             say(f"checking the tip {tip[:10]} alone")
             if (tf := self._check(tip, checks)) is not None:
@@ -1915,6 +1924,8 @@ class Batch:
                 return 0, None, None
             self.tip_passed = True
             return 0, None, fails[1]
+        if hi == m and fails[m][0] != STALE and self._yield_now():
+            return lo, heads[lo] if lo else None, None
         if hi == m and fails[m][0] != STALE:
             say(f"every prefix passed; checking {heads[m][:10]} again")
             f = self._check(heads[m], checks)
@@ -1972,6 +1983,8 @@ class Batch:
             head = self._head(tip, carried[:k] + replayed, k + len(replayed))
         except Refused:
             return None
+        if self._yield_now():
+            return None
         self.rescues += 1
         self.retried = True
         if len(carried[:k] + replayed) > 1 and isinstance(self._caps(head, checks, replayed[-1][1]), tuple):
@@ -1982,6 +1995,25 @@ class Batch:
             return None
         self.rescued = dict(replayed)
         return head
+
+    def _yield_now(self) -> bool:
+        """Before each further full check of the search for the entry that broke the checks: whether an
+        urgent approval (pushq.yields_to: priority 1 or urgent) now waits for this target outside the
+        batch. Then the search stops: the prefix known to pass goes, a blamed entry stays blamed, the
+        rest is requeued "yielded", and the queue runs the urgent ones alone next (pushq.due), so they
+        never wait out the rest of a bisect. The requeued ones are searched anew on the new tip: no entry
+        is blamed on a tip it was not checked on, and the urgent ones are never in that search."""
+        if not self.yielded_to:
+            try:
+                from . import pushq
+                self.yielded_to = pushq.yields_to(self.p, self.target)
+            except Exception as e:      # a queue it cannot read: the search goes on as before
+                say(f"cannot read the push queue for urgent approvals: {type(e).__name__}: {e}")
+            if self.yielded_to:
+                n = len(self.yielded_to)
+                say(f"urgent approval{'s' if n > 1 else ''} {', '.join(map(str, self.yielded_to))} "
+                    f"wait{'s' if n == 1 else ''}: the search stops here and {'they go' if n > 1 else 'it goes'} next")
+        return bool(self.yielded_to)
 
     def _tip_red(self, tip: str, known: dict) -> tuple[int, None, None]:
         """tip_failed for a tip known to fail on its own, without checking it alone again."""
@@ -2258,7 +2290,7 @@ def run_batch(p: Project, marker: Path) -> int:
     m.update(outcome=outcome, tip=b.tip, pushed_sha=b.pushed_sha, version=b.version, results=b.results(),
              checks=b.checks, rounds=b.rounds, message=b.message or None, conflicts=conflicts,
              reach=b.reach or None, scope_held=b.scopes or None, flaky_tests=b.flaky or None,
-             pre_existing=b.pre_existing or None)
+             pre_existing=b.pre_existing or None, yielded_to=b.yielded_to or None)
     if ff:
         m["fast_forward"] = ff
     if conflicts["conflicted"]:

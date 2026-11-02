@@ -781,6 +781,19 @@ def retarget(p: Project, name: str) -> int:
 
 
 # scheduling ---------------------------------------------------------------------------------------
+def _yields(db, r: dict) -> bool:
+    return urgent.covers_urgent(db, db.task(r["task"]))
+
+
+def yields_to(p: Project, name: str) -> list[int]:
+    """The approved rows for target `name` (none of them in a running batch) that a batch searching for
+    the entry that broke its checks stops for (batch.Batch._yield_now): urgent ones (urgent.covers_urgent:
+    priority 1 or better, an `urgent:` line, or a review of such a task). The next batch takes them
+    alone (due)."""
+    db = p.db
+    return [r["id"] for r in _approved(db, name) if _yields(db, r)]
+
+
 def _approved(db, name: str) -> list[dict]:
     return db.q("SELECT q.*, t.priority FROM push_queue q JOIN tasks t ON t.id=q.task WHERE q.status='approved' "
                 "AND t.status='pushing' AND q.target=? ORDER BY t.priority, q.id", (name,))
@@ -861,6 +874,13 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     # Approvals the last batch requeued after a blamed entry without checking them: no gap, as it
     # spent its checks on the others (batch._close marks them "untested").
     untested = [r for r in rows if last and r["batch"] == last["id"] and _detail(r).get("untested")]
+    yielded = [r for r in rows if last and r["batch"] == last["id"] and _detail(r).get("yielded")]
+    if yielded and (hot := [r for r in rows if r["id"] not in tried and _yields(db, r)]):
+        # The last batch stopped its search for these (batch.Batch._yield_now): they go alone, before
+        # the approvals it requeued, so no routine one's failure costs them a bisect again.
+        return hot[:cap], (f"{len(hot)} urgent or priority-1 approval{'s' if len(hot) != 1 else ''} that "
+                           f"{last['id']} stopped its search for; its {len(yielded)} requeued approval"
+                           f"{'s' if len(yielded) != 1 else ''} go next")
     fast = fast_ids(p, rows, _tracking_tip(p, remote, branch), skip=tried)
     why = wait = ""
     if last and last["outcome"] == "rebooted":
@@ -869,6 +889,8 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
         why = f"{len(rows)} approvals"
     elif untested:
         why = f"{len(untested)} approval{'s' if len(untested) != 1 else ''} {last['id']} requeued untested"
+    elif yielded:   # the urgent ones it stopped for were withdrawn: the search goes on at once
+        why = f"{len(yielded)} approval{'s' if len(yielded) != 1 else ''} {last['id']} requeued for an urgent one"
     elif not clean and (left := _gap_left(db, now, gap)) > 0:
         wait = f"{left:.0f} s left of the {gap:.0f} s gap since the last batch ended"
     elif last and (n := sum(1 for r in rows if r["batch"] != last["id"]
@@ -1727,7 +1749,7 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
         # In the transaction that finalizes the batch: a crash before it commits records them again.
         _resolve_upstream(p, shipped, version)
         if outcome in ("moved", "busy", "env_fault", "worker_loss", "rejected", "nothing", "landed", "pushed",
-                       "tip_failed") and back:
+                       "tip_failed", "yielded") and back:
             _event(db, None, "push_requeued", f"push batch {b['id']} ended {outcome}: {len(back)} approval"
                                               f"{'s' if len(back) != 1 else ''} back in the queue", queued=False)
     for key, text, sev in later:
@@ -2355,7 +2377,8 @@ PHASE_WORDS = {"push": "checking", "after_push": "deploying", "finished": "finis
 OUTCOME_WORDS = {"pushed": "pushed", "landed": "already on the branch", "nothing": "nothing to push",
                  "conflict": "conflicted", "tip_failed": "the branch tip fails its checks", "moved": "the branch kept moving",
                  "busy": "another push held the branch", "rejected": "rejected by the remote", "refused": "refused",
-                 "died": "ended before finishing", "rebooted": "cut short by a reboot", "error": "failed"}
+                 "died": "ended before finishing", "rebooted": "cut short by a reboot", "error": "failed",
+                 "yielded": "stopped for an urgent approval"}
 AFTER_WORDS = {"ok": "deploy ok", "failed": "deploy failed", "timeout": "deploy timed out",
                "killed": "deploy cut short", "skipped": "no deploy"}
 

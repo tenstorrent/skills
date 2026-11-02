@@ -1971,6 +1971,99 @@ def test_entries_after_a_blamed_one_are_requeued_untested_without_an_extra_round
     assert m["results"][0]["detail"] == {}
 
 
+def _approved_mid_search(p, monkeypatch, after, priority):
+    """Approve another change for the batch's target (a review of `priority`, queue row 99) right after
+    the batch's `after`-th full check: an approval that arrives while the batch searches for the entry
+    that broke its checks. Returns the list of full checks run, by head."""
+    from ttp import batch
+    real, ran = batch.Batch._check, []
+
+    def check(self, head, checks):
+        got = real(self, head, checks)
+        ran.append(head)
+        if len(ran) == after:
+            tid = p.db.add_task("another fix", "s", kind="review", origin="coordinator", priority=priority)
+            p.db.update_task(tid, status="pushing")
+            now = time.time()
+            p.db.x("INSERT INTO push_queue(id, task, branch, head, target, status, created, updated) "
+                   "VALUES(99, ?, 'u', ?, 'origin/proj', 'approved', ?, ?)", (tid, "0" * 40, now, now))
+        return got
+    monkeypatch.setattr(batch.Batch, "_check", check)
+    return ran
+
+
+def _bad_sixth(env, monkeypatch):
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["test ! -e plugins/p/bad.txt"])
+    heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n == 6 else f'f{n}'}.txt": f"{n}\n"}) for n in range(1, 9)]
+    return p, repo, origin, heads
+
+
+@pytest.mark.parametrize("after,priority", [(2, 1), (4, 1), (2, 3)])
+def test_an_urgent_approval_arriving_mid_bisect_stops_the_search_after_the_check_it_is_on(env, monkeypatch, after,
+                                                                                         priority):
+    """Eight entries, the sixth breaks the checks. An urgent (priority 1) approval arrives right after
+    the full head failed and the first probe (prefix 4) passed: the batch runs no further check, pushes
+    the 4 entries that passed and requeues the rest "yielded" (none blamed), so the urgent one waits
+    for the one check in flight, not the whole bisect. Arriving after the blame (the full head and
+    prefixes 4, 6 and 5 ran), entry 6 stays blamed and only the check of 7-8 without it is skipped. A
+    routine (priority 3) approval changes nothing: the search runs to the end and blames entry 6."""
+    p, repo, origin, heads = _bad_sixth(env, monkeypatch)
+    ran = _approved_mid_search(p, monkeypatch, after, priority)
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    pushed = [_git_out(origin, "show", f"proj:plugins/p/f{n}.txt") for n in range(1, 5)]
+    assert rc == 0 and m["outcome"] == "pushed" and pushed == ["1", "2", "3", "4"], m
+    if priority == 1 and after == 2:
+        assert len(ran) == m["checks"]["runs"] == 2, "the full head and prefix 4: nothing after the approval"
+        assert _statuses(m) == ["pushed"] * 4 + ["requeued"] * 4 and m["yielded_to"] == [99], m
+        assert all(r["detail"] == {"yielded": True} for r in m["results"][4:]), "requeued, never blamed"
+    elif priority == 1:
+        assert len(ran) == m["checks"]["runs"] == 4, "no check of entries 7-8 without entry 6"
+        assert _statuses(m) == ["pushed"] * 5 + ["check_failed", "requeued", "requeued"], m
+        assert [r["detail"] for r in m["results"][6:]] == [{"yielded": True}] * 2 and m["yielded_to"] == [99], m
+    else:
+        # full head, prefixes 4, 6 and 5, then entries 7-8 checked without entry 6 (the rescue)
+        assert len(ran) == m["checks"]["runs"] == 5 and not m.get("yielded_to"), m
+        assert _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"], m
+
+
+def test_the_entries_an_urgent_approval_stopped_a_search_for_are_searched_again_and_the_culprit_blamed(env, monkeypatch):
+    """Blame stays right: the entries a search stopped for an urgent approval go in a later batch of
+    their own (the urgent one is never among them), whose search blames the entry that broke the checks."""
+    from ttp import batch
+    p, repo, origin, heads = _bad_sixth(env, monkeypatch)
+    _approved_mid_search(p, monkeypatch, 2, 1)
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert _statuses(m) == ["pushed"] * 4 + ["requeued"] * 4, m
+    p.db.x("DELETE FROM push_queue WHERE id=99")   # the urgent one went in its own batch
+    rc, m = _run_batch(p, _batch_marker(p, heads[4:], bid="b2"), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed", "check_failed", "pushed", "pushed"], m
+    assert m["results"][1]["id"] == 2 and not m.get("yielded_to"), "entry 6, and only it, is blamed"
+    assert batch.EXIT["yielded"] == 0
+
+
+def test_after_a_batch_stopped_its_search_the_urgent_approval_goes_alone_then_the_requeued_ones(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_s=10 ** 6, push_batch_max=5)
+    _pq_earlier(s)
+    rows = [_pq_review(s)[1], _pq_review(s)[1]]
+    now = time.time()
+    s.p.db.x("INSERT INTO push_batches(id, marker, target, started) VALUES('b1', 'm', 'origin/proj', ?)", (now,))
+    s.p.db.x("UPDATE push_queue SET status='batched', batch='b1' WHERE id IN (?,?)", tuple(rows))
+    hot = _pq_review(s, priority=1)[1]
+    calm = _pq_review(s, priority=3)[1]
+    assert pushq.yields_to(s.p, "origin/proj") == [hot], "only the urgent approval stops a search"
+    m = {"outcome": "yielded", "ended": now, "yielded_to": [hot],
+         "results": [{"id": r, "status": "requeued", "detail": {"yielded": True}} for r in rows]}
+    pushq._apply(s.p, {"id": "b1", "target": "origin/proj"}, m, lambda *a, **k: None, now)
+    s.p.db.x("UPDATE push_batches SET after_finalized=? WHERE id='b1'", (now,))
+    got, why = pushq.due(s.p, now + 1)
+    assert [r["id"] for r in got] == [hot] and "b1 stopped its search for" in why, why
+    s.p.db.x("UPDATE push_queue SET status='pushed' WHERE id=?", (hot,))
+    got, why = pushq.due(s.p, now + 1)
+    assert [r["id"] for r in got] == rows + [calm] and "requeued for an urgent one" in why, \
+        "no gap after a stopped search: the requeued ones go on at once"
+
+
 def test_rows_a_batch_requeued_untested_skip_the_push_gap(env, monkeypatch):
     from ttp import pushq
     s = _pq(env, monkeypatch, push_batch_s=10 ** 6, push_batch_max=5)
