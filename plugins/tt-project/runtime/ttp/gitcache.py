@@ -276,9 +276,10 @@ def ancestors(repo: Path | str, shas, tip: str, timeout: float | None = None) ->
     return {s: is_ancestor(repo, s, tip, timeout) for s in shas}
 
 
-def fixed(repo: Path | str, what: str, sha: str, tip: str, fn: Callable[[], bool]) -> bool:
+def fixed(repo: Path | str, what: str, sha: str, tip: str, fn: Callable[[], bool | None]) -> bool | None:
     """fn()'s answer about two full commit ids (`what` names the question), kept like an ancestry one:
-    a yes for good, a no while the pack directory is unchanged. Just fn() for anything else."""
+    a yes for good, a no while the pack directory is unchanged. fn() answers None when a git read it
+    made failed: that is returned and kept nowhere. Just fn() for anything else."""
     dirs = _dirs(repo) if FULL.fullmatch(sha or "") and FULL.fullmatch(tip or "") else None
     if not dirs or not _history_fixed(dirs[1]):
         return fn()
@@ -286,7 +287,10 @@ def fixed(repo: Path | str, what: str, sha: str, tip: str, fn: Callable[[], bool
     hit = _pairs.get(key)
     if hit is not None and (hit[0] or hit[1] == packs):
         return hit[0]
-    got = bool(fn())
+    got = fn()
+    if got is None:
+        return None
+    got = bool(got)
     _keep(_pairs, key, (got, packs))
     return got
 

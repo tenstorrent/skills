@@ -147,3 +147,191 @@ def test_gitcache_git_takes_the_scope_cap_and_a_failed_system_config_lookup_is_n
     assert gitcache._system == []
     hang[0] = False
     assert gitcache._system_config() and gitcache._system      # asked again, and kept once git answers
+
+
+def _it_picked(tmp_path):
+    """A repo whose main has a cherry-pick of side's commit, plus one more: on_branch(side, main) is
+    True only through git cherry. Returns (repo, side commit, main tip, an unpicked side commit)."""
+    repo, shas = _ancestry_line(tmp_path, 2)
+    _git_out(repo, "checkout", "-q", "-b", "side", shas[0])
+    side = _commit_file_in(repo, "s.txt", "s")
+    _git_out(repo, "checkout", "-q", "-b", "other", shas[0])
+    other = _commit_file_in(repo, "o.txt", "o")
+    _git_out(repo, "checkout", "-q", "main")
+    _git_out(repo, "cherry-pick", side)
+    tip = _commit_file_in(repo, "m.txt", "m")
+    return repo, side, tip, other
+
+
+def _it_failing(monkeypatch, landed, fails):
+    """landed._git with the calls `fails(args)` picks exiting 128, as a read error or signal would."""
+    real = landed._git
+
+    def fake(repo, *args, **k):
+        if fails(args):
+            return subprocess.CompletedProcess(["git", *args], 128, "", "fatal: read error")
+        return real(repo, *args, **k)
+    monkeypatch.setattr(landed, "_git", fake)
+    return real
+
+
+def test_on_branch_a_failed_git_cherry_answers_false_and_is_not_kept(env, tmp_path, monkeypatch):
+    from ttp import landed
+    repo, side, tip, other = _it_picked(tmp_path)
+    real = _it_failing(monkeypatch, landed, lambda a: a[0] == "cherry")
+    assert landed.on_branch(repo, other, tip) is False     # was True: an empty cherry read as "all on tip"
+    assert landed.on_branch(repo, side, tip) is False      # cannot tell
+    monkeypatch.setattr(landed, "_git", real)
+    assert landed.on_branch(repo, side, tip) is True       # asked again once git answers
+    assert landed.on_branch(repo, other, tip) is False
+
+
+def test_on_branch_a_failed_merge_base_or_log_is_asked_again_on_the_next_call(env, tmp_path, monkeypatch):
+    from ttp import gitcache, landed
+    repo, side, _, _ = _it_picked(tmp_path)
+    # A side commit on main only through a replay trailer: its answer needs every log read.
+    _git_out(repo, "checkout", "-q", "side")
+    rep = _commit_file_in(repo, "r.txt", "r")
+    _git_out(repo, "checkout", "-q", "main")
+    (repo / "r2.txt").write_text("other")
+    _git_out(repo, "add", "r2.txt")
+    _git_out(repo, "commit", "-q", "-m", f"replay\n\n{landed.REPLAYED}: {rep}")
+    tip = _git_out(repo, "rev-parse", "HEAD")
+    for sha, fails in ((side, lambda a: a[0] == "merge-base" and a[1] != "--is-ancestor"),
+                       (side, lambda a: a[:2] == ("merge-base", "--is-ancestor")),
+                       (side, lambda a: a[:2] == ("log", "-1")),
+                       (rep, lambda a: a[:2] == ("log", "--no-merges")),
+                       (rep, lambda a: a[:2] == ("log", "--format=%B"))):
+        gitcache.clear()                      # the last round's (good) answer is kept
+        real = _it_failing(monkeypatch, landed, fails)
+        assert landed.on_branch(repo, sha, tip) is False
+        monkeypatch.setattr(landed, "_git", real)
+        assert landed.on_branch(repo, sha, tip) is True
+
+
+def test_gitcache_keeps_nothing_where_history_can_change_under_the_same_ids(env, tmp_path, monkeypatch):
+    from ttp import gitcache, landed
+    repo, shas = _ancestry_line(tmp_path, 3)
+    _git_out(repo, "checkout", "-q", "-b", "side", shas[0])
+    side = _commit_file_in(repo, "side.txt")
+    _git_out(repo, "checkout", "-q", "main")
+    shallow = tmp_path / "shallow"
+    _git_out(tmp_path, "clone", "-q", "--depth", "1", f"file://{repo}", str(shallow))
+    grafts = tmp_path / "grafts"
+    _git_out(tmp_path, "clone", "-q", str(repo), str(grafts))
+    (grafts / ".git" / "info").mkdir(exist_ok=True)
+    (grafts / ".git" / "info" / "grafts").write_text(f"{shas[1]}\n")
+
+    def uncached(r, sha, tip):
+        assert gitcache.is_ancestor(r, sha, tip) is None
+        n = []
+        assert gitcache.fixed(r, "q", sha, tip, lambda: n.append(1) or True) is True
+        assert gitcache.fixed(r, "q", sha, tip, lambda: n.append(1) or True) is True
+        assert len(n) == 2
+        seen = _git_spy(monkeypatch)
+        for _ in range(2):
+            landed._git(r, "rev-parse", "--verify", "--quiet", f"{tip}^{{commit}}")
+            landed._git(r, "merge-base", "--is-ancestor", sha, tip)
+        assert seen["rev-parse --verify"] == 2 and seen["merge-base --is-ancestor"] == 2, seen
+    uncached(shallow, shas[-1], shas[-1])
+    uncached(grafts, shas[0], shas[-1])
+    # Answers kept before a replace ref appears are not served after it, loose or packed.
+    seen = []
+    assert gitcache.is_ancestor(repo, shas[0], shas[-1]) is True
+    assert gitcache.fixed(repo, "q", shas[0], shas[-1], lambda: seen.append(1) or True) is True
+    _git_out(repo, "replace", shas[1], side)
+    uncached(repo, shas[0], shas[-1])
+    _git_out(repo, "pack-refs", "--all")
+    assert not any((repo / ".git" / "refs" / "replace").iterdir())
+    assert "refs/replace/" in (repo / ".git" / "packed-refs").read_text()
+    uncached(repo, shas[0], shas[-1])
+
+
+def test_gitcache_a_negative_ancestry_answer_is_asked_again_once_the_packs_change(env, tmp_path, monkeypatch):
+    from ttp import gitcache, landed
+    repo, shas = _ancestry_line(tmp_path, 3)
+    _git_out(repo, "checkout", "-q", "-b", "side", shas[0])
+    side = _commit_file_in(repo, "side.txt")
+    _git_out(repo, "checkout", "-q", "main")
+    tip = shas[-1]
+    assert landed._commit(repo, side) == side
+    seen = _git_spy(monkeypatch)
+    n = []
+    for _ in range(2):
+        assert landed._git(repo, "merge-base", "--is-ancestor", side, tip).returncode == 1
+        assert gitcache.fixed(repo, "q", side, tip, lambda: n.append(1) or False) is False
+    assert seen["merge-base --is-ancestor"] == 0 and len(n) == 1, seen
+    _git_out(repo, "repack", "-q", "-a", "-d")
+    assert landed._git(repo, "merge-base", "--is-ancestor", side, tip).returncode == 1
+    assert gitcache.fixed(repo, "q", side, tip, lambda: n.append(1) or False) is False
+    assert seen["merge-base --is-ancestor"] == 1 and len(n) == 2, seen
+
+
+def test_gitcache_a_rewound_or_force_moved_tip_reads_its_ancestors_in_full(env, tmp_path, monkeypatch):
+    from ttp import gitcache, landed
+    repo, shas = _ancestry_line(tmp_path, 4)
+    _git_out(repo, "checkout", "-q", "--orphan", "lone")
+    lone = [_commit_file_in(repo, f"l{i}.txt") for i in range(2)]
+    every = [*shas, *lone]
+    for s in every:                           # a "no" is given only for a commit rev-parse found
+        assert landed._commit(repo, s) == s
+
+    def truth(sha, tip):
+        return subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", sha, tip]).returncode == 0
+    assert gitcache.ancestors(repo, every, shas[-1]) == {s: truth(s, shas[-1]) for s in every}
+    for tip in (shas[1], lone[-1]):           # rewound to an ancestor, then moved to unrelated history
+        seen = _git_spy(monkeypatch)
+        assert gitcache.ancestors(repo, every, tip) == {s: truth(s, tip) for s in every}
+        assert seen["rev-list --boundary"] == 1 and seen["rev-list --max-count=100000"] == 1, seen
+
+
+def test_files_and_git_config_changed_within_the_racy_window_are_read_every_time(env, tmp_path, monkeypatch):
+    import types
+    from ttp import gitcache, push, statcache
+    assert statcache.RACY_S == gitcache.RACY_S == 2.0
+    f = tmp_path / "a.json"
+    f.write_text('{"a": 1}')
+    reads = []
+    real_read = pathlib.Path.read_text
+    monkeypatch.setattr(pathlib.Path, "read_text", lambda self, *a, **k: reads.append(self.name) or real_read(self, *a, **k))
+    for _ in range(3):
+        assert statcache.load_json(f) == {"a": 1}
+    assert reads.count("a.json") == 3
+    monkeypatch.setattr(pathlib.Path, "read_text", real_read)
+    (tmp_path / "global").write_text("[gc]\n\tauto = 0\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "global"))
+    repo, _ = _ancestry_line(tmp_path, 1)
+    _git_out(repo, "remote", "add", "origin", str(tmp_path / "a.git"))
+    seen = _git_spy(monkeypatch)
+    for _ in range(3):
+        assert push._git(repo, "remote").stdout.split() == ["origin"]
+        assert push._git(repo, "remote", "get-url", "origin").stdout.strip() == str(tmp_path / "a.git")
+    assert seen["remote"] == 3 and seen["remote get-url"] == 3, seen
+    # Once the window has passed, both are kept.
+    later = time.time() + 10
+    monkeypatch.setattr(gitcache, "time", types.SimpleNamespace(time_ns=lambda: int(later * 1e9)))
+    monkeypatch.setattr(statcache, "time", types.SimpleNamespace(time=lambda: later))
+    for _ in range(3):
+        push._git(repo, "remote")
+        statcache.load_json(f)
+    assert seen["remote"] == 4, seen
+    assert statcache._kept
+
+
+def test_gitcache_and_statcache_never_keep_more_than_their_bounds(env, tmp_path, monkeypatch):
+    from ttp import gitcache, landed, statcache
+    monkeypatch.setattr(gitcache, "MAX_TIPS", 2)
+    monkeypatch.setattr(gitcache, "MAX_ENTRIES", 3)
+    monkeypatch.setattr(statcache, "MAX_FILES", 2)
+    monkeypatch.setattr(statcache, "RACY_S", -1.0)
+    repo, shas = _ancestry_line(tmp_path, 6)
+    for tip in shas:
+        for s in shas:
+            landed._commit(repo, s)
+            gitcache.is_ancestor(repo, s, tip)
+            gitcache.fixed(repo, "q", s, tip, lambda: True)
+            assert len(gitcache._sets) <= 2 and len(gitcache._pairs) <= 3 and len(gitcache._answers) <= 3
+    for i in range(5):
+        (tmp_path / f"{i}.json").write_text(str(i))
+        assert statcache.load_json(tmp_path / f"{i}.json") == i
+        assert len(statcache._kept) <= 2

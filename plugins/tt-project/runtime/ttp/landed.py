@@ -143,35 +143,57 @@ def on_branch(repo: Path, sha: str, tip: str) -> bool:
     """Every commit of `sha` is on `tip`: `sha` is an ancestor, or each of its commits not on `tip`
     has an equivalent there (git cherry's patch-id, the same author, date and subject, or a replay
     trailer naming it). Version-bump commits on its top are left out, as the push queue drops them.
-    Commits never change under their ids, so the answer for two full ids is read once (gitcache.fixed)."""
-    return gitcache.fixed(repo, "on_branch", sha, tip, lambda: _on_branch(repo, sha, tip))
+    Commits never change under their ids, so the answer for two full ids is read once (gitcache.fixed).
+    A git read that failed answers False and keeps nothing: the next call asks again."""
+    return bool(gitcache.fixed(repo, "on_branch", sha, tip, lambda: _on_branch(repo, sha, tip)))
 
 
-def _on_branch(repo: Path, sha: str, tip: str) -> bool:
-    if _git(repo, "merge-base", "--is-ancestor", sha, tip).returncode == 0:
+def _on_branch(repo: Path, sha: str, tip: str) -> bool | None:
+    """on_branch's answer; None when a git read failed (cannot tell)."""
+    def out(*args: str, ok: tuple[int, ...] = (0,)) -> str | None:
+        r = _git(repo, *args)
+        return r.stdout if r.returncode in ok else None
+
+    anc = _git(repo, "merge-base", "--is-ancestor", sha, tip).returncode
+    if anc == 0:
         return True
-    base = _git(repo, "merge-base", tip, sha).stdout.strip()
+    if anc != 1:
+        return None
+    base = out("merge-base", tip, sha, ok=(0, 1))     # 1: no common ancestor
+    if base is None:
+        return None
+    base = base.strip()
     if not base:
         return False
     top = sha
-    while top != base and re.search(rf"^{push.BUMP_TRAILER}: ", _git(repo, "log", "-1", "--format=%B", top).stdout,
-                                    re.M):
-        top = _commit(repo, f"{top}^")
+    while top != base:
+        body = out("log", "-1", "--format=%B", top)
+        if body is None:
+            return None
+        if not re.search(rf"^{push.BUMP_TRAILER}: ", body, re.M):
+            break
+        parent = out("rev-parse", "--verify", "--quiet", f"{top}^^{{commit}}", ok=(0, 1))
+        if parent is None:
+            return None
+        top = parent.strip()
         if not top:
             return False
     if top == base:
         return True
-    left = {ln.split()[1] for ln in _git(repo, "cherry", tip, top, base).stdout.splitlines()
-            if ln.startswith("+ ") and len(ln.split()) == 2}
+    cherry = out("cherry", tip, top, base)
+    if cherry is None:
+        return None
+    left = {ln.split()[1] for ln in cherry.splitlines() if ln.startswith("+ ") and len(ln.split()) == 2}
     if not left:
         return True
     fmt = "--format=%H%x00%an%x00%ae%x00%at%x00%s"
-    mine = {k[0]: k[1] for ln in _git(repo, "log", "--no-merges", fmt, f"{base}..{top}").stdout.splitlines()
-            if (k := _key(ln))}
-    theirs = {k[1] for ln in _git(repo, "log", "--no-merges", fmt, f"{base}..{tip}").stdout.splitlines()
-              if (k := _key(ln))}
-    replayed = set(re.findall(rf"^{REPLAYED}: ([0-9a-f]{{40,64}})[ \t]*$",
-                              _git(repo, "log", "--format=%B", f"{base}..{tip}").stdout, re.M))
+    logs = [out("log", "--no-merges", fmt, f"{base}..{top}"), out("log", "--no-merges", fmt, f"{base}..{tip}"),
+            out("log", "--format=%B", f"{base}..{tip}")]
+    if None in logs:
+        return None
+    mine = {k[0]: k[1] for ln in logs[0].splitlines() if (k := _key(ln))}
+    theirs = {k[1] for ln in logs[1].splitlines() if (k := _key(ln))}
+    replayed = set(re.findall(rf"^{REPLAYED}: ([0-9a-f]{{40,64}})[ \t]*$", logs[2], re.M))
     return all(c in replayed or mine.get(c) in theirs for c in left)
 
 
