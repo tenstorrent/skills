@@ -207,10 +207,10 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
     (billing.py), not an earlier plan account's. Free window resets and paid credits follow
     ('2 free resets', 'paid credits'; another provider's with its fullest window: 'codex 7d 93%, 2 free
     resets'). Every provider holding ready work, core or not, is named at the end (holding):
-    '..., codex 7d 93% holding 1 task'. An item without data is left out. Pacing, targets and caps
-    are in the Budget tab."""
+    '..., codex 7d 93% holding 1 task'. An item without data is left out. Pacing, targets, caps
+    and routing (the last 24 h of it, health()['spend']['route_line']) are in the Budget tab."""
     now = now or time.time()
-    held = holding(db, now, core, gates) + [x for x in [route.phrase(db, now)] if x]
+    held = holding(db, now, core, gates)
     provs = [r["provider"] for r in db.q("SELECT DISTINCT provider FROM snapshots WHERE ts>=? ORDER BY provider",
                                          (now - 3 * WEEK,))]
     prov = core if core in provs else provs[0] if provs else ""
@@ -462,6 +462,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     spend["bases_7d"] = audit.cost_bases(db, since=now - WEEK)
     spend["bases_line"] = audit.bases_text(spend["bases_7d"]) if spend["bases_7d"] else ""
     spend["headline"] = budget_line(db, now, core, g, spend["spent_24h"], gates)
+    spend["route_line"] = route.phrase(db, now)   # routing stats: the Budget tab and ttp status --verbose
     spend["detail"] = gate_detail(g, now, tz, gates) if g else ""
     return {
         "zone": timefmt.zone_name(p.raw_config()),   # the home zone every time here is shown in

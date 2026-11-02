@@ -1273,7 +1273,9 @@ def test_routed_runs_show_in_status_web_and_stats_runs(env, monkeypatch, capsys)
     _route_finish(p, d, tid, {"bridge": {"last_fault": "rate_limit"}})
     want = "routed 24h: 2 runs to chat, 1 fell back (rate_limit 1)"
     assert route.phrase(p.db) == want
-    assert want in web.budget_line(p.db, time.time(), d.cfg.get("core_provider", "claude"), None, 0.0, {})
+    # routing left the one-line budget for the Budget tab and ttp status --verbose
+    assert "routed" not in web.budget_line(p.db, time.time(), d.cfg.get("core_provider", "claude"), None, 0.0, {})
+    assert want == web.health(p, p.db)["spend"]["route_line"]
     rows = route.runs(p.db, "light", time.time() - 3600)
     assert [(r["provider"], r["model"], r["fallback"], r["priced"]) for r in rows] == \
         [("chat", _RT_MODEL, "none", False), ("chat", _RT_MODEL, "rate_limit", False)]
@@ -1281,6 +1283,10 @@ def test_routed_runs_show_in_status_web_and_stats_runs(env, monkeypatch, capsys)
     cli.main(["stats", "demo", "--runs", "--tier", "light"])
     out = capsys.readouterr().out
     assert "fallback (rate_limit)" in out and _RT_MODEL in out and "unpriced" in out
+    # ttp status --verbose prints the routing line; plain ttp status does not
+    text = cli.status_text(p, verbose=True)
+    assert f"routing: {want}" in text and any(ln == f"routing: {want}" for ln in text.splitlines())
+    assert "routed 24h" not in cli.status_text(p)
 
 
 def test_route_config_problems():
@@ -1505,8 +1511,8 @@ def test_a_routed_run_records_its_effort_fields_logs_a_rejection_once_and_shows_
     assert logged == 1, "logged once per model and effort"
     want = "light high: reasoning_effort=xhigh"
     assert route.phrase(p.db).endswith("; " + want)
-    assert want in web.budget_line(p.db, time.time(), d.cfg.get("core_provider", "claude"), None, 0.0, {})
-    # The latest run's rejection shows; a run without fields records none.
+    assert "routed" not in web.budget_line(p.db, time.time(), d.cfg.get("core_provider", "claude"), None, 0.0, {})
+    assert web.health(p, p.db)["spend"]["route_line"].endswith("; " + want)
     _route_finish(p, d, tid, {"rc": 0, "bridge": {**stats, "rejected": True}})
     assert route.phrase(p.db).endswith(want + " (rejected)")
     plain = _route_finish(p, d, tid, {"rc": 0, "bridge": {"last_fault": "", "faults": {}}})[0]

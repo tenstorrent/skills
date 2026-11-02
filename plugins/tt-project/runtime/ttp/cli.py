@@ -1383,6 +1383,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
     cache = budget.coordinator_cache(db, now)["24h"] if verbose else {}
     if cache.get("turns"):
         lines.append(budget.coordinator_cache_line(cache))
+    if verbose and (route_line := h["spend"].get("route_line")):
+        lines.append("routing: " + route_line)
     from . import pushq
     pq = pushq.status_line(p, now)
     if pq:
