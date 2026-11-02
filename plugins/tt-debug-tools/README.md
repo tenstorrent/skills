@@ -26,11 +26,28 @@ of these skills change device state.
 | What does the host runtime think is running? | `tt-inspector` |
 | Where is device time going? | `tt-profiler` |
 | Which op hangs, and which op loses precision? | `tt-ttnn-flags` |
+| Why did this op crash or run out of L1, and what does my report say? | `tt-ttnn-visualizer` |
 | Read or poke one address, register or RISC | `tt-exalens` |
 
 Several of these are mutually exclusive — watcher, kernel prints and the device
 profiler share on-chip SRAM, and enabling a second one corrupts the first one's
 data rather than failing. Each skill names its conflicts.
+
+## Optional: TT-NN Visualizer MCP server
+
+`tt-ttnn-visualizer` reads reports through the read-only MCP server that ships
+with the `ttnn-visualizer` Python package. This plugin does not register it.
+Install the current release per the ttnn-visualizer docs, then:
+
+```bash
+claude mcp add ttnn-visualizer -- ttnn-visualizer-mcp     # Claude Code
+codex mcp add ttnn-visualizer -- ttnn-visualizer-mcp      # Codex
+```
+
+Start a new session afterwards. Without it, the skill falls back to
+`tt-perf-report` and to opening the report in the visualizer app. The server
+records tool names and outcomes to a local usage log; the visualizer docs
+describe the opt-out.
 
 ## Evals
 

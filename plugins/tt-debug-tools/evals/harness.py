@@ -249,17 +249,10 @@ class AgentResult:
         # cannot distinguish "agent used a tool I did not name" from "agent
         # made nothing up but did nothing at all".
         seen = []
-        for ev in self.events:
-            if ev.get("type") != "assistant":
-                continue
-            for block in ev.get("message", {}).get("content", []):
-                if block.get("type") != "tool_use":
-                    continue
-                name = block.get("name") or ""
-                inp = block.get("input") or {}
-                cmd = inp.get("command") or (inp.get("params") or {}).get("command") or ""
-                summary = cmd[:120] if cmd else json.dumps(inp)[:120]
-                seen.append(f"{name}({summary})")
+        for name, inp in self.tool_uses():
+            cmd = inp.get("command") or (inp.get("params") or {}).get("command") or ""
+            summary = cmd[:120] if cmd else json.dumps(inp)[:120]
+            seen.append(f"{name}({summary})")
         raise AssertionError(
             f"no invocation matched {pattern!r} and actually ran.\n"
             f"Attempted-then-denied: {denied}.\n"
@@ -268,6 +261,32 @@ class AgentResult:
 
     def env(self) -> dict[str, str]:
         return {e["name"]: e["value"] for e in self.answer["env"]}
+
+    def text(self, *, include_env: bool = False) -> str:
+        """The answer's free-text fields joined, for "mentioned anywhere"
+        checks."""
+        a = self.answer
+        parts = [a["primary_signal"], a["location"], a["command"],
+                 *a["quoted_evidence"], *a["output_literals"], *a["prereqs"]]
+        if include_env:
+            parts += [f'{e["name"]}={e["value"]}' for e in a["env"]]
+        return " ".join(parts)
+
+    def tool_uses(self) -> list[tuple[str, dict]]:
+        """Every tool call the agent attempted, in order, as (name, input)."""
+        calls = []
+        for ev in self.events:
+            if ev.get("type") != "assistant":
+                continue
+            for block in ev.get("message", {}).get("content", []):
+                if block.get("type") == "tool_use":
+                    calls.append((block.get("name") or "", block.get("input") or {}))
+        return calls
+
+    def offered_tools(self) -> list[str]:
+        """Tool names the host offered the agent, from the init event; MCP
+        tools appear here only once their server connected."""
+        return _init_event(self.events).get("tools", [])
 
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
@@ -350,14 +369,28 @@ class Agent:
             )
         return output.read_text(), json.loads(expected.read_text())
 
-    def ask(self, prompt: str) -> AgentResult:
+    def ask(self, prompt: str, allowed_tools: list[str] | None = None,
+            mcp_servers: dict | None = None) -> AgentResult:
+        """MCP servers reach the agent only through `mcp_servers`, a
+        `{"<name>": {"type": "stdio", "command": ...}}` mapping: --restricted
+        ignores the user's settings, registered MCP servers included, and
+        --strict-mcp-config makes that explicit. `allowed_tools` pre-approves
+        their tools (`mcp__<server>` or `mcp__<server>__<tool>`) that dontAsk
+        mode would otherwise deny; built-in tools are refused so this never
+        widens beyond MCP. Claude only."""
+        for tool in allowed_tools or []:
+            if not tool.startswith("mcp__"):
+                raise ValueError(f"allowed_tools takes MCP tools only, got {tool!r}")
         if shutil.which(self.host) is None:
             raise SkipEval(f"{self.host} CLI not on PATH")
         if self.host == "codex":
+            if allowed_tools or mcp_servers:
+                raise SkipEval("allowed_tools and mcp_servers are claude-only")
             return self._codex_ask(prompt)
-        return self._claude_ask(prompt)
+        return self._claude_ask(prompt, allowed_tools, mcp_servers)
 
-    def _claude_ask(self, prompt: str) -> AgentResult:
+    def _claude_ask(self, prompt: str, allowed_tools: list[str] | None = None,
+                    mcp_servers: dict | None = None) -> AgentResult:
         # --restricted confines file tools to the CWD by default, which
         # blocks Read of the plugin's own references — the exact thing a
         # SKILL.md points a reader at on demand. Add just the current
@@ -377,6 +410,13 @@ class Agent:
         ]
         if self.model:
             cmd += ["--model", self.model]
+        cmd += ["--strict-mcp-config"]
+        if mcp_servers:
+            config = Path(self.cwd) / "eval-mcp.json"
+            config.write_text(json.dumps({"mcpServers": mcp_servers}))
+            cmd += ["--mcp-config", str(config)]
+        if allowed_tools:
+            cmd += ["--allowedTools", *allowed_tools]
         proc = subprocess.run(cmd, cwd=str(self.cwd), capture_output=True, text=True)
         if proc.returncode != 0:
             raise AssertionError(f"claude exited {proc.returncode}: {proc.stderr[:400]}")

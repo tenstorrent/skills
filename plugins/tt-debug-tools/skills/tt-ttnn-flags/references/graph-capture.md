@@ -31,7 +31,7 @@ The point of a structure over a log: ask questions rather than grep.
 | `extract_levelized_graph` | The graph by level, for the shape of the model |
 | `extract_operation_durations` | Per-op durations |
 | `extract_total_duration_from_graph` | The whole capture |
-| `extract_peak_L1_memory_usage` | Peak L1 — the number an L1-OOM investigation wants |
+| `extract_peak_L1_memory_usage` | Peak L1 — the number an L1-OOM investigation wants. From a saved report, `tt-ttnn-visualizer` reads it too — split into circular buffers and persistent, intra-op and stale tensors where its release has `l1_peak` |
 | `extract_resource_usage_per_core` | Per-core resource use |
 | `extract_output_info` / `extract_output_tensors` | What came out |
 | `count_intermediate_and_output_tensors` | How many tensors the graph produced |
