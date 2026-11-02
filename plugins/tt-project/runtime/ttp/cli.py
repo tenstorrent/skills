@@ -2287,26 +2287,94 @@ def _command_key(c) -> str:
     return c
 
 
-def _same_run_key(c, py: str = "") -> str:
+_PWD_PYTHONPATH = re.compile(r'[ \t]*PYTHONPATH=(?:\$PWD|"\$PWD"|\$\{PWD\}|"\$\{PWD\}")[ \t]+(?=\S)')
+_PYTEST_QUIET = re.compile(r"-q+|--quiet")
+_TOP_FLAGS = ("--rootdir=.", "--confcutdir=.")
+
+
+def _top_flags_noop(top: str, paths: list[str]) -> bool:
+    """`--rootdir=.` and `--confcutdir=.` change nothing in a pytest run of `paths` from the worktree
+    `top`: push.venv_cmd sets both to `top` itself in a nested worktree, or else pytest takes `top`'s
+    pytest.ini as its config (no other pytest file between the paths and `top`), so its rootdir and
+    default confcutdir are `top` already. Not when PYTEST_ADDOPTS or that pytest.ini names either."""
+    from . import push
+    if not top or os.environ.get("PYTEST_ADDOPTS"):
+        return False
+    t = Path(top)
+    try:
+        if push.nested_pytest(t):
+            return True
+        ini = next((t / n for n in ("pytest.ini", ".pytest.ini") if (t / n).is_file()), None)
+        if ini is None or re.search(r"rootdir|confcutdir", ini.read_text(errors="replace")):
+            return False
+        for w in paths:
+            if Path(w).is_absolute() or ".." in Path(w).parts:
+                return False
+            d = (t / w).parent if (t / w).suffix == ".py" or not (t / w).is_dir() else t / w
+            while d != t:
+                if any((d / f).is_file() for f in push.PYTEST_FILES if f != "conftest.py"):
+                    return False
+                d = d.parent
+    except OSError:
+        return False
+    return True
+
+
+def _plain_check(c) -> bool:
+    """A check that is only its command line: no env, cwd or other host."""
+    from . import push
+    return isinstance(c, str) and not (getattr(c, "env", ()) or getattr(c, "cwd", "") or push.remote_host(c))
+
+
+def _same_run_key(c, py: str = "", top: str = "") -> str:
     """_command_key, with a pytest run's program made one word where push.venv_cmd runs them alike:
     bare `pytest`, `py.test` and `python[3] -m pytest`, and `<py> -m pytest` for `py` the venv python
     venv_cmd puts in their place (venv_python). Any other interpreter (`/usr/bin/python3 -m pytest`,
-    `.venv/bin/pytest`) runs as written, so stays distinct. Only for telling an extra command already run."""
-    key = _command_key(c)
+    `.venv/bin/pytest`) runs as written, so stays distinct. Only for telling an extra command already run.
+    Of such a run's own words, only what runs the same tests is made alike: `-q` (output only), the order
+    of its file and directory arguments (when it has no other option), a leading `PYTHONPATH=$PWD` where
+    `-m pytest` already puts the worktree first on sys.path and no outer PYTHONPATH the checks get
+    (push.check_pythonpath: not the harness runtime's) is lost, and
+    `--rootdir=.`/`--confcutdir=.` where they are the run's own (_top_flags_noop, for the worktree `top`).
+    Anything else (`-k`, `-m`, node ids, other files, env or options) stays as written."""
+    pwd = _PWD_PYTHONPATH.match(c) if _plain_check(c) else None
+    key = _command_key(c[pwd.end():] if pwd else c)
     if not isinstance(c, str):
         return key
+    as_written = _command_key(c) if pwd else key
     try:
         words = shlex.split(key)
     except ValueError:
-        return key
+        return as_written
     if not words or not all(_PLAIN_WORD.fullmatch(w) for w in words):
-        return key   # shell syntax: compared as written
+        return as_written   # shell syntax: compared as written
     if words[0] in ("pytest", "py.test"):
-        return shlex.join(["pytest", *words[1:]])
-    if len(words) > 2 and (words[0] in ("python", "python3") or (py and words[0] == py)) \
+        dash_m, args = False, words[1:]
+    elif len(words) > 2 and (words[0] in ("python", "python3") or (py and words[0] == py)) \
             and words[1:3] == ["-m", "pytest"]:
-        return shlex.join(["pytest", *words[3:]])
-    return key
+        dash_m, args = True, words[3:]
+    else:
+        return as_written
+    from . import push
+    if pwd and (not (dash_m or py) or push.check_pythonpath(os.environ)):
+        return as_written   # PYTHONPATH=$PWD puts the worktree on a path it was not on, or drops one
+    if "--" in args:
+        return shlex.join(["pytest", *args])
+    args = [w for w in args if not _PYTEST_QUIET.fullmatch(w)]
+    paths = [w for w in args if w not in _TOP_FLAGS]
+    if any(w.startswith("-") or "::" in w for w in paths):
+        return shlex.join(["pytest", *args])   # options or node ids: their order and words as written
+    flags = sorted(w for w in set(args) if w in _TOP_FLAGS)
+    if flags and _top_flags_noop(top, paths):
+        flags = []
+    return shlex.join(["pytest", *sorted(paths), *flags])
+
+
+def _covered_by(c, checks: list, py: str = "", top: str = ""):
+    """The first of `checks` (unscoped) that is the same run as `c` (_same_run_key), or None."""
+    key = _same_run_key(c, py, top)
+    return next((o for o in checks if not (getattr(o, "if_exists", "") or getattr(o, "if_changed", ()))
+                 and _same_run_key(o, py, top) == key), None)
 
 
 def _commands_hash(cmds: list) -> str:
@@ -2438,14 +2506,14 @@ def checks_env_line(p: Project) -> str | None:
             f"{e.get('run') or '?'} at {when} ({what}): {e['problem']}")
 
 
-def _extra_checks(extra: list[str], own: list, py: str = "") -> tuple[list[str], list[str]]:
+def _extra_checks(extra: list[str], own: list, py: str = "", top: str = "") -> tuple[list[str], list[str]]:
     """(the commands given after `--`, the ones dropped). One word is a shell command line as
     written (`ttp checks -- 'FOO=1 pytest -q'`). Several words that each hold whitespace are one
     command each (`-- 'pytest -q tests/a.py' 'ruff check .'`); any other several words are argv,
     quoted so each stays one word (`-- pytest -k 'a and b'`). A command the same as one of the
     project's checks that runs on every head (no `if_exists`/`if_changed`), or as an earlier one
-    here, is dropped: it would run twice (a pytest run in any spelling the venv `py` runs alike,
-    _same_run_key). One that
+    here, is dropped: it would run twice (a pytest run in any spelling the venv `py` runs alike in
+    the worktree `top`, _same_run_key). One that
     only a scoped check matches stays, as that check may be skipped on this head (_ran_again drops
     it once that check applies)."""
     if not extra:
@@ -2454,22 +2522,22 @@ def _extra_checks(extra: list[str], own: list, py: str = "") -> tuple[list[str],
         given = [w for w in extra if w.strip()]
     else:
         given = [shlex.join(extra)]
-    seen = {_same_run_key(c, py) for c in own if not (getattr(c, "if_exists", "") or getattr(c, "if_changed", ()))}
+    seen = {_same_run_key(c, py, top) for c in own if not (getattr(c, "if_exists", "") or getattr(c, "if_changed", ()))}
     mine, dropped = [], []
     for c in given:
-        key = _same_run_key(c, py)
+        key = _same_run_key(c, py, top)
         (dropped if key in seen else mine).append(c)
         seen.add(key)
     return mine, dropped
 
 
-def _ran_again(todo: list, own: list, py: str = "") -> tuple[list, list]:
+def _ran_again(todo: list, own: list, py: str = "", top: str = "") -> tuple[list, list]:
     """(the applicable checks to run, the extras dropped): an extra command that a scoped project
     check applicable on this head (in `todo`) also runs is dropped, so it runs once."""
-    keys = {_same_run_key(c, py) for c in todo if any(c is o for o in own)}
+    keys = {_same_run_key(c, py, top) for c in todo if any(c is o for o in own)}
     keep, dropped = [], []
     for c in todo:
-        (dropped if not any(c is o for o in own) and _same_run_key(c, py) in keys else keep).append(c)
+        (dropped if not any(c is o for o in own) and _same_run_key(c, py, top) in keys else keep).append(c)
     return keep, dropped
 
 
@@ -2498,7 +2566,7 @@ def _prestage_skip(a, p: Project | None, top: str, head: str, tree: str, cmds: l
         todo, _ = push.applicable(Path(top), head, cmds, lambda m: None, base, candidate=purpose == "candidate")
     except push.ScopeError:
         return ""
-    todo, _ = _ran_again(todo, own, vpy)
+    todo, _ = _ran_again(todo, own, vpy, top)
     if not todo:
         return "no check applies on this head"
     if _recorded_pass(p, tree, todo, purpose):
@@ -2634,7 +2702,7 @@ def cmd_checks(a) -> None:
         venv_vars = worktree.venv_env(pv, os.environ.get("PATH", ""))
     # The python a bare pytest runs with (push.venv_cmd): an extra spelled with it runs the same tests.
     vpy = str(push.venv_python(top, {**os.environ, **venv_vars}) or "")
-    mine, dropped = _extra_checks(a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd, own, vpy)
+    mine, dropped = _extra_checks(a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd, own, vpy, top)
     mine = push.with_host(mine, checks_host)
     wrapped, wrap = set(), ()
     if mine:   # checks.wrap_cmd: the project's own lock or queue wrapper (never the project checks)
@@ -2653,9 +2721,11 @@ def cmd_checks(a) -> None:
         if wrap and (remote := [c for c in mine if push.remote_host(c)]):
             print(f"ttp checks: {', '.join(map(repr, map(str, remote)))} run on their check host without "
                   f"{push.WRAP_KEY}, which wraps only commands run on this machine")
-    if dropped:
-        print(f"ttp checks: not running {', '.join(map(repr, dropped))} after `--` again: "
-              f"{source} already runs it")
+    for c in dropped:   # each names the project check that runs it, when another spelling
+        cover = _covered_by(c, own, vpy, top)
+        by = ("an earlier command after `--` is the same run" if cover is None else f"{source} already runs it"
+              + (f" as {str(cover)!r}" if str(cover) != c else ""))
+        print(f"ttp checks: not running {c!r} after `--` again: {by}")
     cmds = own + mine
     if not cmds:
         die(f"ttp checks: the project sets no {source} for this repo; give the repository's test commands after "
@@ -2728,7 +2798,7 @@ def cmd_checks(a) -> None:
             todo, skipped = push.applicable(Path(top), head, cmds, lambda m: (print(f"ttp checks: {m}"),
                                                                                out.write(f"{m}\n")),
                                             base, candidate=purpose == "candidate")
-            todo, again = _ran_again(todo, own, vpy)
+            todo, again = _ran_again(todo, own, vpy, top)
             if again:
                 said = (f"not running {', '.join(map(repr, again))} after `--` again: a scoped "
                         f"{source} entry runs it on this head")

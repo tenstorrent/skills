@@ -771,7 +771,20 @@ def check_env(mode: str, tip: str = "", run_dir: str | None = None) -> dict[str,
     `checks` (`ttp checks`, which pushes nothing). TTP_PUSH_TIP is the tip of the branch pushed to,
     as fetched before the checks; empty when there is none (a new branch, or `ttp checks`)."""
     output = checkdirs.writable(run_dir if run_dir is not None else os.environ.get("TTP_RUN_DIR"))
-    return checkdirs.for_check({**os.environ, "TTP_RUN_DIR": output, "TTP_PUSH_MODE": mode, "TTP_PUSH_TIP": tip or ""})
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    if pp := check_pythonpath(os.environ):
+        env["PYTHONPATH"] = pp
+    return checkdirs.for_check({**env, "TTP_RUN_DIR": output, "TTP_PUSH_MODE": mode, "TTP_PUSH_TIP": tip or ""})
+
+
+def check_pythonpath(env) -> str:
+    """`env`'s PYTHONPATH as the checks get it (check_env): without this runtime's folder, which
+    tt-project puts there for its own `ttp` (a worker run, the daemon), not for a project's tests,
+    which would import the harness's package. The user's own entries stay, in order; "" when none is left."""
+    runtime = Path(__file__).resolve().parent.parent
+    keep = [e for e in env.get("PYTHONPATH", "").split(os.pathsep)
+            if not (e and Path(os.path.realpath(e)) == runtime)]
+    return os.pathsep.join(keep) if any(keep) else ""
 
 
 def exclude_list(v: Any) -> list[str]:

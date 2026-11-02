@@ -6507,7 +6507,7 @@ def test_ttp_checks_runs_an_extra_pytest_once_and_in_the_projects_venv(env, tmp_
     # Spellings of one pytest run; shell syntax stays as written.
     keys = {cli._same_run_key(c, "/x/.venv/bin/python") for c in (
         "pytest -q", "py.test -q", "python -m pytest -q", "python3 -m pytest -q", "/x/.venv/bin/python -m pytest -q")}
-    assert keys == {"pytest -q"}
+    assert keys == {"pytest"}
     # Only those: another explicit interpreter runs as written, so it is not the same run.
     for c in ("/usr/bin/python3 -m pytest -q", "python3.11 -m pytest -q", ".venv/bin/pytest -q",
               "/x/.venv/bin/python -m pytest -q"):
@@ -6518,6 +6518,145 @@ def test_ttp_checks_runs_an_extra_pytest_once_and_in_the_projects_venv(env, tmp_
                              "/x/.venv/bin/python") == ([], ["/x/.venv/bin/python -m pytest -q"])
     assert cli._same_run_key("pytest -q; true") == "pytest -q; true"
     assert cli._same_run_key("python3 tools/pytest.py") == "python3 tools/pytest.py"
+
+
+def test_ttp_checks_drops_an_extra_that_is_a_project_pytest_run_in_another_spelling(env, tmp_path, monkeypatch, capsys):
+    """An extra after `--` that differs from a project pytest check only in -q, the order of its files, a
+    leading PYTHONPATH=$PWD or --rootdir=./--confcutdir=. at the worktree top runs the same tests: it is
+    dropped, naming that check. Anything that selects or changes tests stays."""
+    from ttp import cli, push
+    top = tmp_path / "wt"
+    (top / "tests" / "sub").mkdir(parents=True)
+    (top / "pytest.ini").write_text("[pytest]\n")
+    for f in ("a.py", "b.py", "sub/c.py"):
+        (top / "tests" / f).write_text("")
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    monkeypatch.setattr(push, "nested_pytest", lambda t: False)
+    own = push.check_list(["python3 -m pytest -q tests/a.py tests/b.py tests/sub/c.py", "ruff check ."])
+    seen = "PYTHONPATH=$PWD python3 -m pytest --rootdir=. --confcutdir=. tests/sub/c.py tests/b.py tests/a.py -q"
+    same = [seen, "pytest tests/b.py tests/a.py tests/sub/c.py", 'PYTHONPATH="$PWD" python -m pytest -qq '
+            "tests/a.py tests/b.py tests/sub/c.py", "python3 -m pytest --quiet --rootdir=. tests/sub/c.py tests/a.py tests/b.py",
+            "PYTHONPATH=${PWD} python3 -m pytest tests/a.py tests/b.py tests/sub/c.py --confcutdir=."]
+    for c in same:
+        assert cli._extra_checks([c], own, "", str(top)) == ([], [c]), c
+        assert cli._covered_by(c, own, "", str(top)) is own[0]
+    kept = ["python3 -m pytest -q tests/a.py tests/b.py",                     # other files
+            "python3 -m pytest -q tests/a.py tests/b.py tests/sub/c.py -k x",  # selects tests
+            "python3 -m pytest -q -m slow tests/a.py tests/b.py tests/sub/c.py",
+            "python3 -m pytest -q tests/a.py::t tests/b.py tests/sub/c.py",   # a node id
+            "python3 -m pytest -v tests/a.py tests/b.py tests/sub/c.py",     # another option
+            "python3 -m pytest -q -x tests/b.py tests/a.py tests/sub/c.py",   # an option: order as written
+            "FOO=1 python3 -m pytest -q tests/a.py tests/b.py tests/sub/c.py",  # other env
+            "PYTHONPATH=src python3 -m pytest -q tests/a.py tests/b.py tests/sub/c.py",
+            "PYTHONPATH='$PWD' python3 -m pytest -q tests/a.py tests/b.py tests/sub/c.py",  # the literal word
+            "PYTHONPATH=$PWD pytest -q tests/a.py tests/b.py tests/sub/c.py",  # no venv: not on sys.path otherwise
+            "PYTHONPATH=$PWD python3 -m pytest -q tests/a.py tests/b.py tests/sub/c.py; true",
+            "PYTHONPATH=$PWD\npython3 -m pytest -q tests/a.py tests/b.py tests/sub/c.py",  # two statements
+            "PYTHONPATH=$PWD:src python3 -m pytest -q tests/a.py tests/b.py tests/sub/c.py",
+            "PYTHONPATH=$PWD FOO=1 python3 -m pytest -q tests/a.py tests/b.py tests/sub/c.py",
+            "python3 -m pytest -q --rootdir=tests tests/a.py tests/b.py tests/sub/c.py",
+            "/usr/bin/python3 -m pytest -q tests/a.py tests/b.py tests/sub/c.py",
+            "python3 -m pytest -q -- tests/b.py tests/a.py tests/sub/c.py"]
+    for c in kept:
+        assert cli._extra_checks([c], own, "", str(top)) == ([c], []), c
+    # A venv rewrites a bare pytest to `<py> -m pytest`, so PYTHONPATH=$PWD adds nothing there.
+    c = "PYTHONPATH=$PWD pytest -q tests/a.py tests/b.py tests/sub/c.py"
+    assert cli._extra_checks([c], own, "/x/.venv/bin/python", str(top)) == ([], [c])
+    # An outer PYTHONPATH that PYTHONPATH=$PWD would replace: kept.
+    monkeypatch.setenv("PYTHONPATH", "/opt/lib")
+    assert cli._extra_checks([seen], own, "", str(top)) == ([seen], [])
+    monkeypatch.delenv("PYTHONPATH")
+    # --rootdir=./--confcutdir=. are kept where they may change the rootdir or the conftest files read:
+    # no worktree known, a pytest file between the tests and the top, no pytest.ini at the top, one that
+    # names them, or PYTEST_ADDOPTS.
+    assert cli._extra_checks([seen], own) == ([seen], [])
+    (top / "tests" / "sub" / "tox.ini").write_text("")
+    assert cli._extra_checks([seen], own, "", str(top)) == ([seen], [])
+    (top / "tests" / "sub" / "tox.ini").unlink()
+    (top / "pytest.ini").write_text("[pytest]\naddopts = --confcutdir=tests\n")
+    assert cli._extra_checks([seen], own, "", str(top)) == ([seen], [])
+    (top / "pytest.ini").unlink()
+    assert cli._extra_checks([seen], own, "", str(top)) == ([seen], [])
+    # In a nested worktree venv_cmd sets both to the top itself, whatever its pytest files.
+    monkeypatch.setattr(push, "nested_pytest", lambda t: True)
+    assert cli._extra_checks([seen], own, "", str(top)) == ([], [seen])
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-p no:cacheprovider")
+    assert cli._extra_checks([seen], own, "", str(top)) == ([seen], [])
+    # Without those flags the order and -q still do not matter there.
+    assert cli._extra_checks(["pytest tests/b.py tests/a.py tests/sub/c.py"], own, "", str(top))[1]
+    # A scoped project check is not one that covers it.
+    scoped = push.check_list([{"run": "python3 -m pytest -q tests/a.py", "if_changed": "src/**"}])
+    assert cli._covered_by("pytest tests/a.py", scoped) is None
+
+
+def test_check_env_drops_only_the_harness_runtime_from_pythonpath(env, tmp_path, monkeypatch):
+    """A worker run has the harness runtime on PYTHONPATH for its own `ttp`: the checks run without it
+    (no PYTHONPATH when it was the only entry), keeping the user's own entries in order."""
+    from ttp import push
+    runtime = Path(push.__file__).resolve().parent.parent
+    link = tmp_path / "rt-link"
+    link.symlink_to(runtime)
+    monkeypatch.delenv("TTP_CHECKS_TMP_FD", raising=False)
+    (tmp_path / "run").mkdir()
+    run = str(tmp_path / "run")
+    for pp in (str(runtime), f"{runtime}/", str(link), f"{runtime}{os.pathsep}{link}", f"{runtime}{os.pathsep}"):
+        monkeypatch.setenv("PYTHONPATH", pp)
+        assert "PYTHONPATH" not in push.check_env("checks", run_dir=run), pp
+    for pp, want in ((f"/opt/lib{os.pathsep}{runtime}", "/opt/lib"), (f"{runtime}{os.pathsep}/opt/lib", "/opt/lib"),
+                     (f"/a{os.pathsep}{runtime}{os.pathsep}/b", f"/a{os.pathsep}/b"), ("/opt/lib", "/opt/lib"),
+                     (str(runtime.parent), str(runtime.parent)), (f"{runtime}x", f"{runtime}x")):
+        monkeypatch.setenv("PYTHONPATH", pp)
+        assert push.check_env("checks", run_dir=run)["PYTHONPATH"] == want, pp
+    monkeypatch.delenv("PYTHONPATH")
+    assert "PYTHONPATH" not in push.check_env("checks", run_dir=run)
+
+
+def test_ttp_checks_drops_a_pythonpath_pwd_extra_when_only_the_harness_runtime_is_on_pythonpath(env, tmp_path,
+                                                                                                 monkeypatch):
+    """In a worker run (PYTHONPATH the harness runtime only) a `PYTHONPATH=$PWD python3 -m pytest` extra in a
+    nested worktree is the project check: the checks get no PYTHONPATH it would replace. A user's own
+    PYTHONPATH still keeps it."""
+    from ttp import cli, push
+    top = tmp_path / "wt"
+    (top / "tests").mkdir(parents=True)
+    for f in ("a.py", "b.py"):
+        (top / "tests" / f).write_text("")
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    monkeypatch.setattr(push, "nested_pytest", lambda t: True)
+    runtime = str(Path(push.__file__).resolve().parent.parent)
+    own = push.check_list(["python3 -m pytest -q tests/a.py tests/b.py"])
+    extra = "PYTHONPATH=$PWD python3 -m pytest --rootdir=. --confcutdir=. tests/b.py tests/a.py -q"
+    monkeypatch.setenv("PYTHONPATH", runtime)
+    assert cli._extra_checks([extra], own, "", str(top)) == ([], [extra])
+    for pp in ("/opt/lib", f"/opt/lib{os.pathsep}{runtime}", f"{runtime}{os.pathsep}/opt/lib"):
+        monkeypatch.setenv("PYTHONPATH", pp)
+        assert cli._extra_checks([extra], own, "", str(top)) == ([extra], []), pp
+
+
+def test_ttp_checks_names_the_project_check_an_extra_in_another_spelling_repeats(env, tmp_path, monkeypatch, capsys):
+    """`ttp checks` runs such an extra once and says which project check covers it."""
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)   # the stub pytest below runs, not a venv's
+    count = tmp_path / "count"
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    (stub / "pytest").write_text(f"#!/bin/sh\necho \"$*\" >> {count}\n")
+    (stub / "pytest").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{stub}:{os.environ['PATH']}")
+    check = "pytest -q a.txt"
+    p.set_config("delivery.push_checks", [check])
+    (Path(repo) / "pytest.ini").write_text("[pytest]\n")
+    subprocess.run([*git, "add", "pytest.ini"], check=True)
+    subprocess.run([*git, "commit", "-qm", "ini"], check=True)
+    extra = "pytest --rootdir=. a.txt"
+    cli.main(["checks", "--fresh", "--", extra])
+    out = capsys.readouterr().out
+    assert len(count.read_text().splitlines()) == 1, "the suite ran once"
+    assert f"not running {extra!r} after `--` again: delivery.push_checks already runs it as {check!r}" in out
 
 
 def test_ttp_checks_warns_of_a_broken_venv_with_the_command_that_makes_it_again(env, tmp_path, monkeypatch, capsys):
