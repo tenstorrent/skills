@@ -15445,3 +15445,59 @@ def test_a_detached_push_process_keeps_its_run_lock_to_itself(tmp_path, monkeypa
         c.wait()
     monkeypatch.setenv(push.RUN_LOCK_FD_ENV, "not-an-fd")
     push.keep_run_lock_here()   # a bad value is ignored, never an error
+
+
+@pytest.mark.parametrize("site", ["push", "batch"])
+def test_the_stale_lock_reaper_never_reaps_a_live_detached_push(tmp_path, monkeypatch, site):
+    """A detached push's (or push batch's) run lock is taken by a launcher that exits right after it
+    starts the push process in a session of its own (an unsandboxed `ttp push --detach`, a daemon that
+    restarts): the start labels the lock with the push process (push._start, pushq._spawn), so two
+    stale-lock sweeps GRACE_S apart, once the taker is gone, release nothing and signal nothing."""
+    import types
+    from ttp import checkdirs, lockreap, locks, push, pushq
+    monkeypatch.setenv("TTP_RUN_ID", "70")
+    monkeypatch.setenv("TTP_TASK", "7")
+    monkeypatch.delenv("TTP_PIDNS", raising=False)   # the taker's label names the taker, sandboxed or not
+    state = tmp_path / "state"
+    marker = state / "push" / "detached-1.json"
+    marker.parent.mkdir(parents=True)
+    m = {"id": "1", "log": str(tmp_path / "push.log"), "repo": str(tmp_path)}
+    marker.write_text(json.dumps(m))
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    for name, fn in {"restore": lambda *a: scratch, "take": lambda out: open(out / "guard", "a+"),
+                     "environment": lambda out, env: dict(env), "reports": lambda out: out,
+                     "finish": lambda *a, **k: None, "cleanup": lambda *a, **k: None}.items():
+        monkeypatch.setattr(checkdirs, name, fn)
+    real = subprocess.Popen
+    monkeypatch.setattr(subprocess, "Popen", lambda argv, **kw: real(["sleep", "60"] if "ttp" in argv else argv, **kw))
+    p = types.SimpleNamespace(base=tmp_path, state=state, root=tmp_path, config=lambda: {})
+    path = push._run_lock(marker)
+    pid_file = tmp_path / "holder.pid"
+    taker = os.fork()
+    if taker == 0:   # the launcher: takes the lock, starts the push process, exits
+        code = 1
+        try:
+            lock = locks.try_take([path], "detached push 1", "ttp push --detach")
+            if site == "push":
+                pid = push._start(p, marker, m, lock, dict(os.environ))
+            else:
+                child = pushq._spawn(p, "b1", marker, lock)
+                child.stdin.close()
+                pid = child.pid
+            pid_file.write_text(str(pid))
+            code = 0
+        finally:
+            os._exit(code)
+    assert os.waitpid(taker, 0)[1] == 0
+    holder = int(pid_file.read_text())
+    try:
+        assert not locks.any_free([path]), "the live push process holds its run lock"
+        assert lockreap.environ(holder).get("TTP_RUN_ID") == "70" or site == "batch"
+        r = lockreap.Reaper()
+        for t in (1000.0, 1000.0 + lockreap.GRACE_S + 1):
+            assert r.sweep([path], t) == {"released": [], "kept": {}}
+        assert locks.start_time(holder), "never signalled"
+        assert json.loads(path.read_text())["pid"] == holder
+    finally:
+        os.kill(holder, signal.SIGKILL)   # the launcher's child: reaped by whoever adopted it

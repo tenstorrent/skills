@@ -4169,6 +4169,9 @@ def _start(p: Project, marker: Path, m: dict, lock, env: dict, nice: int = 0) ->
                                      cwd=m["repo"], env=env, stdin=subprocess.PIPE, stdout=out,
                                      stderr=subprocess.STDOUT, start_new_session=True,
                                      pass_fds=(lock.fileno(), guard.fileno()))
+        # The label names the push process, not this launcher, which exits (or the daemon, which restarts):
+        # the stale-lock reaper (lockreap) never takes a live push for a left-running process of its run.
+        locks.label_pid(lock, child.pid, via="push")
         renice(child.pid, nice)
         m.update(status="running", pid=child.pid, started=time.time(), boot=runner.boot_id(),
                  check_report_dir=str(checkdirs.reports(output)))
