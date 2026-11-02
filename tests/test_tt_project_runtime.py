@@ -36794,6 +36794,34 @@ def test_devq_restart_requeues_a_job_a_reboot_killed_and_adopts_one_still_runnin
     assert (m["status"], m["rc"], m["attempts"], m["drops"]) == ("failed", 7, 1, [])
 
 
+def test_devq_a_process_a_job_left_running_never_keeps_its_lock(devq_dir, tmp_path):
+    """A keeper holds a job's lock while its wrapper lives (devq.keep_lock), never the job: a process it
+    left running in a session of its own does not keep it once the job is gone, so a successor runner
+    takes it as interrupted and runs it again instead of waiting on it."""
+    from ttp import devq
+    d, flag, left = devq_dir, tmp_path / "flag", tmp_path / "left.pid"
+    stray = (f"{shlex.quote(sys.executable)} -c 'import os, sys, time; os.setsid(); "
+             f"open(sys.argv[1], \"w\").write(str(os.getpid())); time.sleep(120)' {left} >/dev/null 2>&1 &")
+    _devq_submit(d, {}, "left-1", f"[ -e {flag} ] && exit 0; {stray} touch {tmp_path / 'started'}; sleep 60")
+    assert _wait_for_path(tmp_path / "started") and _until_true(lambda: left.exists() and left.read_text())
+    pid = _devq_job_pid(d, "left-1")
+    lockf = pathlib.Path(_devq_state(d, "left-1")["cur"]["lock"])
+    child = int(left.read_text())
+    try:
+        assert not devq._free(lockf), "held while the job runs"
+        os.kill(int((d / "runner.pid").read_text()), signal.SIGKILL)
+        assert not devq._free(lockf), "held while the job runs, its runner gone"
+        os.killpg(pid, signal.SIGKILL)
+        assert _until_true(lambda: devq._free(lockf), 10), "the process it left running keeps its lock"
+        flag.touch()
+        assert _devq("start", d, json.dumps(DEVQ_FAST)).returncode == 0
+        m = _devq_marker(d, "left-1")
+        assert m["status"] == "done" and m["attempts"] == 2 and "interrupted" in m["drops"][0], m
+        os.kill(child, 0)   # still alive: only the lock was let go
+    finally:
+        os.kill(child, signal.SIGKILL)
+
+
 def test_devq_reservation_cap_refuses_at_submit_and_fails_older_over_cap_jobs_unstarted(env, devq_dir, tmp_path):
     d, ran = devq_dir, tmp_path / "ran"
     cap = {"reservation_cap_s": 600}

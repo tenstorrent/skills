@@ -4157,8 +4157,11 @@ def _start(p: Project, marker: Path, m: dict, lock, env: dict, nice: int = 0) ->
         raise OSError("check scratch is busy")
     try:
         env = checkdirs.environment(output, env)
+        # The guard is the check scratch's lifetime lock: the checks inherit it on purpose (checkdirs), so
+        # their scratch outlives no process that uses it. The run lock is the push process's alone
+        # (keep_run_lock_here).
         env.update(PYTHONPATH=str(Path(__file__).resolve().parents[1]), TTP_PROJECT=str(p.base),
-                   TTP_CHECKS_TMP_FD=str(guard.fileno()))
+                   TTP_CHECKS_TMP_FD=str(guard.fileno()), **{RUN_LOCK_FD_ENV: str(lock.fileno())})
         _log_line(log, f"starting the push process for marker {marker}")
         with open(log, "ab") as out:
             child = subprocess.Popen([sys.executable, "-m", "ttp", "push", "--marker", str(marker),
@@ -4266,8 +4269,24 @@ def _stop(sig, _frame) -> None:
     raise _Stopped(f"stopped by {signal.Signals(sig).name}")
 
 
+RUN_LOCK_FD_ENV = "TTP_PUSH_RUN_LOCK_FD"   # the fd of its run lock, which a detached push process inherits
+
+
+def keep_run_lock_here() -> None:
+    """Make the run lock the push process inherited (RUN_LOCK_FD_ENV) close-on-exec, so it is held by this
+    process alone: nothing it starts (git, a check, a hook, a shell) gets it, and a process one of those
+    leaves running never makes a push that died look alive."""
+    fd = os.environ.pop(RUN_LOCK_FD_ENV, "")
+    if fd.isdigit():
+        try:
+            os.set_inheritable(int(fd), False)
+        except OSError:
+            pass
+
+
 def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int:
     """The detached process: wait for the launcher's go, push, and write the outcome into `marker`."""
+    keep_run_lock_here()
     print(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} detached push process {os.getpid()} up, "
           f"waiting for the go", flush=True)
     try:

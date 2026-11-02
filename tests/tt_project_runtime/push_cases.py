@@ -15403,3 +15403,45 @@ def test_a_conflict_fix_reviews_marker_refusal_still_runs_it_again_and_queues_no
     assert t["status"] == "queued" and res["push_invalid"] == 1 and res.get("review_failure") is None, res
     assert "a commit adds a git conflict marker line" in res["woke"] and res[conflictfix.KEY] == mark, res
     assert not _marker_fixes(s)
+
+
+def test_a_detached_push_process_keeps_its_run_lock_to_itself(tmp_path, monkeypatch):
+    """The run lock a detached push process inherits (push._start) is made close-on-exec in it
+    (keep_run_lock_here): held while the push process lives, never by a process it started and left
+    running, even one started with every inheritable fd (a shell, os.system)."""
+    import fcntl
+    from ttp import locks, push
+    path = tmp_path / "run.lock"
+
+    def hold():
+        f = open(path, "a+")
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.set_inheritable(f.fileno(), True)   # as pass_fds leaves it in the push process
+        return f
+
+    def left_running():
+        return subprocess.Popen(["sleep", "60"], close_fds=False)
+
+    f, c = hold(), None
+    try:   # what it guards against: such a process keeps an inheritable lock after its holder let go
+        c = left_running()
+        f.close()
+        assert not locks.any_free([path])
+    finally:
+        c.kill()
+        c.wait()
+    assert locks.any_free([path])
+    f = hold()
+    monkeypatch.setenv(push.RUN_LOCK_FD_ENV, str(f.fileno()))
+    push.keep_run_lock_here()
+    assert push.RUN_LOCK_FD_ENV not in os.environ, "the processes it starts are not told a stale fd"
+    c = left_running()
+    try:
+        assert not locks.any_free([path]), "held while the push process lives"
+        f.close()
+        assert locks.any_free([path]), "a process it left running never keeps it"
+    finally:
+        c.kill()
+        c.wait()
+    monkeypatch.setenv(push.RUN_LOCK_FD_ENV, "not-an-fd")
+    push.keep_run_lock_here()   # a bad value is ignored, never an error

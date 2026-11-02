@@ -224,6 +224,11 @@ def start(rc: Path, log: Path, cmd: list, cwd: str, env: dict, lock) -> int:
                             cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
                             pass_fds=(lock.fileno(),))
+    # Inherited on purpose, unlike a `ttp lock` command's locks: the job lock means "a process of this job
+    # lives", even one that left its group, and jobstop finds and ends those through it (jobstop._free).
+    # Every reader takes the .rc first, so a leftover never makes an ended job look running; the kernel
+    # frees the lock once the last of them ends, and lockreap leaves a lock labelled via "job" alone.
+    locks.label_pid(lock, proc.pid, via="job")
     _children.append(proc)
     return proc.pid
 

@@ -256,3 +256,20 @@ def test_lock_wait_alert_fires_once_after_the_threshold_names_the_holder_and_cle
     f.close()
     assert lockreap.wait_alert_s({"locks": {"wait_alert_min": 0}}) == 0
     assert lockreap.wait_alert_s({}) == 30 * 60
+
+
+def test_lockreap_never_reaps_a_detached_jobs_lock(env, monkeypatch, tmp_path):
+    """A detached job's lock (label via "job") is held by every process of the job by design: a process
+    of the same run that left the job's group keeps it, dead wrapper or not, and nothing is signalled."""
+    from ttp import lockreap
+    path = tmp_path / "run" / "job.lock"
+    f = _reap_slot(path, pid=4100, pid_start="11", pgid=4100, run_id="70", task_id="7", via="job")
+    try:
+        fake = _ReapProcs(monkeypatch, {5200: {"start": "90", "pgid": 5200, "env": {"TTP_RUN_ID": "70", "TTP_TASK": "7"},
+                                           "cmd": "build-server --daemon"}}, [5200])
+        r = lockreap.Reaper()
+        for t in (1000.0, 1000.0 + lockreap.GRACE_S + 1, 1000.0 + 2 * lockreap.GRACE_S):
+            assert r.sweep([path], t) == {"released": [], "kept": {}}
+        assert fake.sent == []
+    finally:
+        f.close()

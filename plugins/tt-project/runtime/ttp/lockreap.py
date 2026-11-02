@@ -13,7 +13,8 @@ running). The sweep (Reaper.sweep: every daemon tick, and each try of a waiting 
 - reaps the process(es) keeping it when every one is the harness's own from the holder's same run
   (TTP_RUN_ID in its environment matches the label's run_id, and TTP_PROJECT its project when it names one): SIGTERM, then SIGKILL on a later sweep;
 - leaves it otherwise: the processes are named in the wait alert (long_waits).
-A label with no pid_start (an older release) counts as dead only when its pid is gone. A holder is
+A detached job's lock (label via "job", detach.start) is never reaped: every process of the job holds
+it by design, and the kernel frees it once the last one ends. A label with no pid_start (an older release) counts as dead only when its pid is gone. A holder is
 judged dead on two sweeps GRACE_S apart before anything is reaped.
 
 long_waits finds each lock whose oldest live waiter (its queue ticket) has waited past the config
@@ -208,6 +209,9 @@ class Reaper:
                 self.dead_since.pop(key, None)
                 continue
             h = label(path)
+            if h.get("via") == "job":   # a detached job's lock: every process of the job holds it by design
+                self.dead_since.pop(key, None)
+                continue
             state, why = verdict(h)
             taker = int(h.get("taker_pid") or 0) if str(h.get("taker_pid") or "").isdigit() else 0
             if state != "dead" or (taker > 0 and locks._alive(taker) and locks._judgeable(h)):

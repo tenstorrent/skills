@@ -1164,6 +1164,7 @@ class Runner:
         self.d = d
         self.cfg = settings(_load(d / "config.json"))
         self._child = None
+        self._keeper = None     # the keeper of the current attempt's lock (keep_lock)
         self._helper = None     # the health or drop check under way: ended with the runner
 
     def stop(self, signum, frame) -> None:
@@ -1281,10 +1282,12 @@ class Runner:
             self._launch(job, spec, st)
 
     def _launch(self, job: str, spec: dict, st: dict) -> None:
-        """Start one attempt in a session of its own. It inherits a lock it holds while it lives, so a
+        """Start one attempt in a session of its own. A keeper holds its lock while its wrapper lives, so a
         runner started after this one died can tell a job still running from one a reboot killed. The
-        attempt is recorded before the job starts, so a runner that dies at any point leaves its
-        successor a job to adopt, never one it cannot see; the job writes its pid into the lock file."""
+        job never gets the lock: a process it left running (a server, a `setsid ... &`) would keep it
+        after the job, and the next runner would wait on a job long gone. The attempt is recorded before
+        the job starts, so a runner that dies at any point leaves its successor a job to adopt, never one
+        it cannot see; the job writes its pid into the lock file."""
         n = st.get("attempts", 0) + 1
         logf, rcf, lockf = (self.d / "logs" / f"{job}.{n}.log", self.d / "running" / f"{job}.{n}.rc",
                             self.d / "running" / f"{job}.{n}.lock")
@@ -1301,8 +1304,12 @@ class Runner:
                                  cwd=spec.get("workdir") or str(Path.home()), stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
                                  env=_env(TTP_DEVQ_JOB=job, TTP_DEVQ_CONFIG=str(spec["config"]),
-                                           TTP_DEVQ_TIMEOUT_S=str(int(self.limit(spec)))),
-                                 pass_fds=(lock.fileno(),))
+                                           TTP_DEVQ_TIMEOUT_S=str(int(self.limit(spec)))))
+            self._keeper = keep_lock(lock, p.pid)
+            if self._keeper is None:
+                _kill_group(p.pid)
+                p.wait()
+                raise OSError("could not start the keeper of its lock")
         except OSError:
             for k in ("attempts", "log", "cur"):
                 st.pop(k, None)
@@ -1338,7 +1345,9 @@ class Runner:
                 self.log(f"{job}: wedge pattern {x!r} ignored: {e}")
         while True:
             if child is not None:
-                child.poll()      # reap it, so its lock is released once it ends
+                child.poll()      # reap it (its keeper releases the lock once it ends)
+            if self._keeper is not None:
+                self._keeper.poll()
             if rcf.exists():
                 try:
                     return int(rcf.read_text().strip()), ""
@@ -1418,6 +1427,10 @@ class Runner:
                     return
             rc, how = self.wait(job, spec, st)
             self._child = None
+            if self._keeper is not None:   # it ends with the wrapper: reaped, never left a zombie
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    self._keeper.wait(timeout=10)
+                self._keeper = None
             evidence = ""
             if how == "interrupted":
                 evidence = "the job is gone without an exit code (killed, or the host restarted)"
@@ -1495,6 +1508,43 @@ class Runner:
                 self.log(f"idle {self.cfg['idle_exit_s']:.0f} s, exiting")
                 return 0
             time.sleep(self.cfg["poll_s"])
+
+
+_KEEPER = (
+    "import os, select, signal, sys, time\n"
+    "for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):\n"
+    "    signal.signal(s, signal.SIG_IGN)\n"
+    "pid, pfd = int(sys.argv[1]), int(sys.argv[2])\n"
+    "if pfd >= 0:\n"
+    "    select.select([pfd], [], [])\n"
+    "else:\n"
+    "    while True:\n"
+    "        try:\n"
+    "            os.kill(pid, 0)\n"
+    "        except ProcessLookupError:\n"
+    "            break\n"
+    "        except OSError:\n"
+    "            pass\n"
+    "        time.sleep(0.5)\n")
+
+
+def keep_lock(lock, pid: int):
+    """A process of its own session that holds the open file `lock` until process `pid` ends (a pidfd,
+    else a 0.5 s poll), ignoring SIGINT, SIGTERM and SIGHUP, so the lock outlives the runner but never
+    `pid`: the runner's job lock (as locks.keep_open does for `ttp lock`). None if it cannot start."""
+    try:
+        pfd = os.pidfd_open(pid)
+    except (AttributeError, OSError):
+        pfd = -1
+    try:
+        return subprocess.Popen([sys.executable, "-I", "-S", "-c", _KEEPER, str(pid), str(pfd)],
+                                pass_fds=(lock.fileno(), *([pfd] if pfd >= 0 else [])), stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return None
+    finally:
+        if pfd >= 0:
+            os.close(pfd)
 
 
 def _lock_pid(lock: Path) -> int | None:

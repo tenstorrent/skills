@@ -1669,3 +1669,33 @@ def test_a_sandboxed_stop_pids_is_queued_and_the_daemon_checks_and_stops(env, tm
         for x in (proc, theirs):
             x.kill()
             x.wait()
+
+
+def test_a_detached_jobs_lock_is_kept_by_a_process_it_left_running_until_that_ends(tmp_path, monkeypatch):
+    """detach.start passes the job lock on by design: it means "a process of this job lives", even one
+    that left its group (jobstop ends those through it). The .rc still says the job ended, the label names
+    the wrapper (via "job", which lockreap leaves alone), and the lock is free once the last process ends."""
+    from ttp import detach, locks
+    monkeypatch.setenv("TTP_RUN_ID", "70")
+    rc, left = tmp_path / "run" / "job.rc", tmp_path / "left.pid"
+    rc.parent.mkdir()
+    stray = (f"{shlex.quote(sys.executable)} -c 'import os, sys, time; os.setsid(); "
+             f"open(sys.argv[1], \"w\").write(str(os.getpid())); time.sleep(60)' {left}")
+    lock = locks.try_take([locks.job_lock(rc)], "detached job job", "leave one running")
+    try:
+        pid = detach.start(rc, rc.with_suffix(".log"), ["sh", "-c", f"{stray} & exit 0"],
+                           str(tmp_path), dict(os.environ), lock)
+    finally:
+        lock.close()
+    assert _wait_for_path(rc) and rc.read_text().strip() == "0"
+    assert _until_true(lambda: left.exists() and left.read_text())
+    child = int(left.read_text())
+    try:
+        label = json.loads(locks.job_lock(rc).read_text())
+        assert label["via"] == "job" and label["pid"] == pid and label["pgid"] == pid, label
+        assert not locks.any_free([locks.job_lock(rc)]), "a process the job left running keeps its job lock"
+        assert detach.state(rc)[0] != "running", "the .rc says it ended"
+    finally:
+        os.kill(child, signal.SIGKILL)
+    assert _until_true(lambda: locks.any_free([locks.job_lock(rc)])), "free once its last process ended"
+    detach.reap_children()
