@@ -22,7 +22,8 @@ def test_index_ignore_lists_the_bulky_folders_anchored_at_the_root(tmp_path):
     p = _ii_project(tmp_path)
     assert indexignore.ensure(p).startswith("wrote ")
     lines = (p.root / ".ignore").read_text().splitlines()
-    for d in ("/tt-project/state/", "/tt-project/worktrees/", "/results/", "/tmp/", "/runs/", "/worktrees/"):
+    for d in ("/tt-project/state/", "/tt-project/worktrees/", "/results/", "/tmp/", "/runs/", "/worktrees/",
+              "/.venv/", "/venv/"):
         assert d in lines
     # Never the harness checkout (charter, memory, prompts) nor the folder as a whole.
     assert not [ln for ln in lines if ln.startswith("/") and ln.rstrip("/") in ("/tt-project", "/tt-project/harness")]
@@ -111,6 +112,31 @@ def test_index_ignore_stops_the_start_up_walk_but_not_searches_below_or_by_path(
     assert files(p.base / "worktrees" / "t1") == ["src/w.txt"]
     assert files(p.root, "results") == ["results/a/r.txt"]
     assert "results/a/r.txt" in files(p.root, "--no-ignore")
+
+
+@pytest.mark.skipif(not shutil.which("rg"), reason="needs ripgrep")
+def test_index_ignore_cuts_the_start_up_walk_of_a_root_outside_git(tmp_path):
+    """A project root that is no git repository reads no .gitignore: before the block the start-up walk
+    lists every result, run folder and virtualenv file; after it, only the project's own files."""
+    from ttp import indexignore
+    p = _ii_project(tmp_path)
+    assert subprocess.run(["git", "-C", str(p.root), "rev-parse", "--git-dir"], capture_output=True,
+                          env={**os.environ, "GIT_CEILING_DIRECTORIES": str(tmp_path)}).returncode != 0
+    for d, n in (("results/run", 1500), ("tt-project/state/runs/7", 1500), (".venv/lib", 500), ("tmp", 200)):
+        (p.root / d).mkdir(parents=True, exist_ok=True)
+        for i in range(n):
+            (p.root / d / f"f{i}.txt").write_text("x")
+    for rel in ("scripts/run.sh", "tt-project/harness/CHARTER.md", "tt-project/harness/MEMORY.md"):
+        (p.root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (p.root / rel).write_text("x")
+
+    def walk():
+        out = subprocess.run([_ii_rg(), "--no-config", "--files", "--hidden"], cwd=p.root,
+                             capture_output=True, text=True).stdout
+        return sorted(ln for ln in out.splitlines() if not ln.endswith(".ignore"))
+    assert len(walk()) == 3703
+    indexignore.ensure(p)
+    assert walk() == ["scripts/run.sh", "tt-project/harness/CHARTER.md", "tt-project/harness/MEMORY.md"]
 
 
 def test_index_ignore_is_written_at_daemon_start(env, monkeypatch):
