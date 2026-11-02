@@ -26,6 +26,8 @@ import time
 import uuid
 from pathlib import Path
 
+from .project import ps_snapshot
+
 FOLDER = "checks-joins"
 KEEP_S = 6 * 3600.0     # a record with an outcome stays this long for its followers
 DEPTH = 8               # the longest chain of followers resolved
@@ -112,6 +114,7 @@ def alive(rec: dict) -> bool:
     return rec.get("started") is not None and proc_start(pid) == rec.get("started")
 
 
+@ps_snapshot()   # one `ps` for every record's pid where there is no /proc
 def records(state: Path, now: float | None = None, prune: bool = True) -> list[dict]:
     """Every record, each with "alive". With `prune`, records of dead runs without an outcome and
     outcomes older than KEEP_S are removed."""

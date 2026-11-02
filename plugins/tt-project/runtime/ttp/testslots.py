@@ -90,7 +90,7 @@ PORTS = "check-ports"          # check-slots/check-ports.<i>.lock: one running c
 PORT_FIRST, PORT_SPAN, PORT_BLOCKS = 20000, 100, 120
 PORT_BASE_ENV, PORT_COUNT_ENV = "TTP_PORT_BASE", "TTP_PORT_COUNT"
 POLL_S = 5.0
-HEAD_POLL_S = 0.5     # a suite waiter next in line checks this often, so a freed lane goes to it at once
+HEAD_POLL_S = 1.0     # a suite waiter next in line checks this often, so a freed lane goes to it soon
 SUITE_AGE_S = 900.0   # default checks.priority_age_s: a suite waiter gains one priority step per this many seconds waited
 NO_PRIORITY = 3      # a ticket without a priority (no task, a task without one, an older runtime) ranks as p3
 AGE_FLOOR = 1        # aging never ranks a waiter above p1 (an obligation owner's 0 is its own, not aged to)
@@ -283,6 +283,7 @@ def _take(ps: list, own: list, top: int, holder: str, what: str = "test slots",
     return k, files
 
 
+@project.ps_snapshot()
 def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: float | None = None,
             cfg: dict | None = None, project_name: str | None = None, push_key: str = "",
             kind: Kind = TESTS, priority: int | None = None, stop: Callable[[], str] | None = None,
@@ -310,6 +311,7 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
     arrival = start if since is None else since
     try:
         while True:
+            project.ps_cycle()
             s = sizes(cfg, kind=kind)
             if s is None:
                 return Grant(kind=kind)
@@ -766,6 +768,7 @@ def _lane_beat() -> float:
     return checklane.HEARTBEAT_S
 
 
+@project.ps_snapshot()
 def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = None,
                wait_s: float | None = None, waiting: Callable[[bool], None] | None = None,
                stop: Callable[[], str] | None = None, who: str = "", priority: int | None = None,
@@ -832,6 +835,7 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     start, told = time.time(), 0.0
     try:
         while True:
+            project.ps_cycle()   # pids are read once per poll cycle, never one `ps` each (ps_snapshot)
             held = [x for x in lanes + extra_lanes if locks._slot_labels([x])]
             for x in held:
                 _reclaim(x, tell, state)

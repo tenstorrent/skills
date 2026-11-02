@@ -979,17 +979,61 @@ def _copy_tree(v: Any) -> Any:
 
 
 _PROC = Path("/proc/self/stat").exists()
+_PS = threading.local()   # this thread's open ps_snapshot: .on, and .rows once taken
+
+
+@contextmanager
+def ps_snapshot() -> Iterator[None]:
+    """Where there is no /proc (macOS), zombie and runner.proc_start answer inside this block from one
+    `ps` of every process, taken at the first question, never one `ps` per pid: a wait loop opens it once
+    per poll cycle. With /proc both read it without forking, and this does nothing. Nested: the outer one."""
+    if _PROC or getattr(_PS, "on", False):
+        yield
+        return
+    _PS.on, _PS.rows = True, None
+    try:
+        yield
+    finally:
+        _PS.on, _PS.rows = False, None
+
+
+def ps_rows() -> dict[int, tuple[str, str]] | None:
+    """The open ps_snapshot's processes, {pid: (state, start as `ps -o lstart=` prints it)}; None outside
+    one, or when `ps` failed (the caller then asks per pid, as without a snapshot)."""
+    if _PROC or not getattr(_PS, "on", False):
+        return None
+    if _PS.rows is None:
+        rows: dict[int, tuple[str, str]] = {}
+        try:
+            out = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "stat=", "-o", "lstart="], capture_output=True,
+                                 text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            out = ""
+        for line in out.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) == 3 and parts[0].isdigit():
+                rows[int(parts[0])] = (parts[1], parts[2].strip())
+        _PS.rows = rows or False   # ps lists itself: no rows at all means it failed
+    return _PS.rows or None
+
+
+def ps_cycle() -> None:
+    """A new poll cycle in this thread's open ps_snapshot: its next question takes a fresh `ps`."""
+    if getattr(_PS, "on", False):
+        _PS.rows = None
 
 
 def zombie(pid: int) -> bool:
     """True if pid has ended but is not reaped yet: kill(pid, 0) still finds it, yet nothing runs.
     It is read, never reaped, so whoever owns the process still gets its exit code. Linux reads
-    /proc; elsewhere (macOS) `ps` reports the state."""
+    /proc; elsewhere (macOS) `ps` reports the state (ps_snapshot's, inside one)."""
     if _PROC:
         try:
             return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
         except (OSError, IndexError):
             return False
+    if (rows := ps_rows()) is not None:   # one started since the snapshot is not one yet
+        return rows.get(pid, ("",))[0].startswith("Z")
     try:
         out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True,
                              timeout=5).stdout.strip()

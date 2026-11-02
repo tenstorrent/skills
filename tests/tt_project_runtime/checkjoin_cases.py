@@ -308,3 +308,140 @@ def test_a_follower_whose_lead_ends_without_a_result_queues_again_and_runs(env, 
         lead_proc.wait()
     t.join(60)
     assert got == [0] and ran.exists(), "it ran its own checks once the run it joined died"
+
+
+def _counting_ps(monkeypatch):
+    """Count every `ps` the runtime runs (subprocess.run), running it for real."""
+    calls, real = [], subprocess.run
+
+    def run(argv, *a, **k):
+        if argv and argv[0] == "ps":
+            calls.append(list(argv))
+        return real(argv, *a, **k)
+    monkeypatch.setattr(subprocess, "run", run)
+    return calls
+
+
+def _dead_pids(n):
+    out = []
+    for _ in range(n):
+        p = subprocess.Popen(["true"])
+        p.wait()
+        out.append(p.pid)
+    return out
+
+
+def _join_records(state, pids, started):
+    from ttp import checkjoin as cj
+    d = cj.folder(state)
+    d.mkdir(parents=True, exist_ok=True)
+    for i, (pid, st) in enumerate(zip(pids, started)):
+        cj._write(d / f"r{i}.json", {**_join_rec(f"r{i}", task=str(100 + i)), "pid": pid, "started": st,
+                                    "pidns": cj._pid_ns(), "outcome": {"passed": True, "ts": time.time()}})
+
+
+def test_pid_starts_are_read_from_proc_without_forking_and_still_tell_a_reused_pid(tmp_path, monkeypatch):
+    """A waiting `ttp checks` run re-reads every checks-join record each poll: each finished run's pid
+    is gone, and a gone pid ran `ps -o lstart=` once each, about 60 a second on a busy host."""
+    from ttp import checkjoin as cj, project
+    from ttp.runner import proc_start
+    if not project._PROC:
+        pytest.skip("no /proc here")
+    dead = _dead_pids(5)
+    me = proc_start(os.getpid())
+    calls = _counting_ps(monkeypatch)
+    _join_records(tmp_path, dead + [os.getpid(), os.getpid()], ["1"] * 5 + [me, str(int(me) + 1)])
+    recs = {r["id"]: r for r in cj.records(tmp_path, prune=False)}
+    assert [recs[f"r{i}"]["alive"] for i in range(7)] == [False] * 5 + [True, False], \
+        "dead pids are gone; the same pid with another start is another process"
+    assert all(proc_start(p) is None for p in dead) and proc_start(os.getpid()) == me
+    assert calls == [], "pid liveness and start times never fork where there is /proc"
+
+
+@pytest.mark.parametrize("ps_ok", [True, False], ids=["snapshot", "ps-failed"])
+def test_without_proc_one_ps_answers_every_pid_of_a_poll_cycle(tmp_path, monkeypatch, ps_ok):
+    """macOS has no /proc: inside project.ps_snapshot one `ps` of every process answers proc_start and
+    zombie for all pids, never one `ps` per pid; a pid started after it is asked alone; a failed `ps -A`
+    falls back to one per pid as before."""
+    from ttp import checkjoin as cj, project, runner
+    monkeypatch.setattr(project, "_PROC", False)      # the path a host without /proc takes
+    me = runner.proc_start(os.getpid())                # outside a snapshot: one `ps -o lstart= -p`
+    assert me and not me.isdigit(), "the token is ps's start time, as on macOS"
+    dead = _dead_pids(4)
+    calls = _counting_ps(monkeypatch)
+    if not ps_ok:
+        real = subprocess.run
+        monkeypatch.setattr(subprocess, "run", lambda argv, *a, **k: (_ for _ in ()).throw(OSError("no ps"))
+                            if "-A" in argv else real(argv, *a, **k))
+        calls = _counting_ps(monkeypatch)
+    _join_records(tmp_path, dead + [os.getpid(), os.getpid()], ["x"] * 4 + [me, me + "0"])
+    recs = {r["id"]: r for r in cj.records(tmp_path, prune=False)}
+    assert [recs[f"r{i}"]["alive"] for i in range(6)] == [False] * 4 + [True, False], \
+        "the start time is still compared: the same pid with another start is another process"
+    if ps_ok:
+        assert len(calls) == 1 and "-A" in calls[0], f"one `ps` for every pid, got {calls}"
+    else:
+        assert len(calls) == 7 and "-A" in calls[0], "ps -A failed: then each pid asked alone, as before"
+    calls.clear()
+    with project.ps_snapshot():
+        assert runner.proc_start(os.getpid()) == me
+        child = subprocess.Popen(["sleep", "30"])        # started after the snapshot was taken
+        try:
+            assert runner.proc_start(child.pid), "a pid started since the snapshot is asked alone, never gone"
+            assert runner.proc_start(dead[0]) is None and not project.zombie(os.getpid())
+            child.kill()
+            child.wait()
+            project.ps_cycle()                            # the next poll cycle sees it gone
+            assert runner.proc_start(child.pid) is None
+        finally:
+            child.kill()
+            child.wait()
+    if ps_ok:
+        assert sum("-A" in c for c in calls) == 2, f"one `ps -A` per cycle, got {calls}"
+
+
+def test_ps_snapshot_reads_macos_ps_output_and_does_nothing_with_proc(monkeypatch):
+    from ttp import project, runner
+    out = "    1 Ss   Mon Nov  2 07:00:00 2026\n   42 Z    Tue Nov  3 08:01:02 2026\n  777 R+   Sun Nov  1 23:59:59 2026\n"
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda argv, *a, **k: calls.append(argv) or
+                        subprocess.CompletedProcess(argv, 0, out, ""))
+    monkeypatch.setattr(project, "_PROC", False)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError()))
+    with project.ps_snapshot(), project.ps_snapshot():   # nested: the outer one's snapshot
+        assert runner.proc_start(777) == "Sun Nov  1 23:59:59 2026"
+        assert project.zombie(42) and not project.zombie(1) and not project.zombie(5)
+        assert runner.proc_start(5) is None, "not listed and kill(pid, 0) finds none: gone"
+    assert calls == [["ps", "-A", "-o", "pid=", "-o", "stat=", "-o", "lstart="]]
+    assert project.ps_rows() is None, "no snapshot outside the block"
+    monkeypatch.setattr(project, "_PROC", True)
+    with project.ps_snapshot():
+        assert project.ps_rows() is None, "with /proc nothing is snapshotted"
+
+
+def test_a_waiting_full_checks_run_reads_pids_once_per_poll_cycle(env, tmp_path, monkeypatch):
+    """The lane wait (suite_hold) opens one ps_snapshot per poll cycle, around its own reads and its
+    stop callback's (the checks-join records), and polls at least HEAD_POLL_S apart."""
+    from ttp import checkcap, checkjoin as cj, project, testslots
+    assert testslots.HEAD_POLL_S >= 1.0 and testslots.POLL_S >= 1.0
+    monkeypatch.delenv(testslots.HELD_ENV, raising=False)
+    monkeypatch.delenv(checkcap.HELD_ENV, raising=False)
+    got = tmp_path / "held"
+    holder = subprocess.Popen([sys.executable, "-c", "import sys, time\nfrom pathlib import Path\nfrom ttp import testslots\n"
+                               "g = testslots.suite_hold(sys.argv[1])\nPath(sys.argv[2]).write_text('held')\n"
+                               "time.sleep(60)\n", "pa", str(got)], env={**os.environ, "PYTHONPATH": str(RUNTIME)})
+    try:
+        assert _wait_for(got.exists)
+        monkeypatch.setattr(project, "_PROC", False)
+        _join_records(tmp_path / "state", _dead_pids(4), ["x"] * 4)
+        calls, cycles = _counting_ps(monkeypatch), []
+
+        def stop():
+            cycles.append(1)
+            cj.records(tmp_path / "state", prune=False)
+            return ""
+        assert testslots.suite_hold("pa", wait_s=0.5, stop=stop) is None
+        assert cycles and len(calls) <= len(cycles) + 1, f"{len(calls)} ps for {len(cycles)} poll cycles"
+    finally:
+        holder.kill()
+        holder.wait()

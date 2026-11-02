@@ -51,7 +51,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import poll_s
+from . import poll_s, project
 from .project import Project, durable_write, lower_priority
 
 LEASE_EVERY_S = 30
@@ -147,11 +147,22 @@ def boot_time() -> float | None:
 
 def proc_start(pid: int) -> str | None:
     """When process pid started, as a token that stays the same for its whole life and differs for
-    a later process given the same pid. None if it is gone."""
-    try:   # Linux: clock ticks from boot to its start (field 22)
-        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
-    except (OSError, IndexError):
-        pass
+    a later process given the same pid. None if it is gone. Never forks where there is /proc (a pid
+    missing there is gone: ps reads the same /proc); without it, project.ps_snapshot's one `ps` inside one."""
+    if project._PROC:
+        try:   # Linux: clock ticks from boot to its start (field 22)
+            return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+        except (OSError, IndexError):
+            return None
+    if (rows := project.ps_rows()) is not None:
+        if pid in rows:
+            return rows[pid][1]
+        try:   # not in the snapshot: gone, or started since it was taken (then asked alone)
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return None
+        except OSError:
+            pass
     try:
         out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
                              timeout=5).stdout.strip()
