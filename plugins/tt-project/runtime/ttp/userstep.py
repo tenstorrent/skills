@@ -14,7 +14,8 @@ item, never sends a second alert.
 The task's waiting hand-off must wait on that check, never on "the user's next message" (handoff):
 the daemon puts the step's check in as its retry_when where the hand-off gave none or only such prose,
 else tells the coordinator. Once the task's retry_when passes the step is done (probe_passed): the
-item clears, told once, and the task wakes as any passed probe wakes it. A task that ends clears its
+item clears, told once, an open ask for a step only the user takes that is for the task closes
+(unblock.close_step_done), and the task wakes as any passed probe wakes it. A task that ends clears its
 items on the next sweep (alerts.holds).
 
 A queued task deferred on such a step (its start_why, blocked_reason or start_when names one, with the
@@ -230,4 +231,6 @@ def probe_passed(db: DB, task: dict, probes: set, now: float | None = None) -> l
                 alerts._close(db, ep, now, "its check passed",
                               f"Cleared: #{task['id']} {task['title'][:80]}: the {sid.partition(':')[2]} step is done; "
                               f"the task goes on.", "low")
+        from .unblock import close_step_done
+        close_step_done(db, task["id"])   # an ask for that step is answered by it
     return done

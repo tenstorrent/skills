@@ -9877,7 +9877,7 @@ def test_the_hourly_push_audit_closes_an_ask_only_once_every_task_it_names_lande
 
     def ask(text, ago=3600):
         return p.db.x("INSERT INTO messages(ts,direction,kind,text,ref) VALUES(?,?,?,?,?)",
-                      (now - ago, "out", "ask", text, "blocking:access"))
+                      (now - ago, "out", "ask", text, "blocking:review"))
     asks = {}
     asks["landed"] = ask("The token needs the workflow scope before #{landed}'s CI job can be pushed.")
     asks["missing"] = ask("Grant the scope so #{missing} can push?")
@@ -9906,10 +9906,10 @@ def test_the_hourly_push_audit_closes_an_ask_only_once_every_task_it_names_lande
     assert rows[asks["landed"]]["landed"]["tasks"] == [ids["landed"]] and not rows[asks["landed"]]["answered"]
     assert rows[asks["missing"]]["landed"] is None
     out = "\n".join(audit.lines(p.db))
-    assert f"ask {asks['landed']} (access): " in out
+    assert f"ask {asks['landed']} (review): " in out
     assert f"resolved: its work landed (#{ids['landed']}), after 1.0 h with no answer" in out
-    assert f"ask {asks['unlinked']} (access): \"Grant the gh token the workflow scope?\"; no answer yet" in out
-    assert f"ask {asks['missing']} (access): \"Grant the scope so #{ids['missing']} can push?\"; no answer yet" in out
+    assert f"ask {asks['unlinked']} (review): \"Grant the gh token the workflow scope?\"; no answer yet" in out
+    assert f"ask {asks['missing']} (review): \"Grant the scope so #{ids['missing']} can push?\"; no answer yet" in out
     assert "asks: 6 sent, 0 answered, 0 handed back, 1 resolved as their work landed" in out
     assert unblock.close_landed(p.db, [ids["landed"], ids["old"]]) == [], "closed once"
 
@@ -9918,8 +9918,8 @@ def test_close_landed_never_closes_an_ask_without_a_confirmed_landed_task(env):
     from ttp import unblock
     p, now, msg = _ask_db(env)
     tid = p.db.add_task("work", "s", origin="user")
-    a = msg("out", f"May #{tid} go ahead?", 600, "ask", ref="blocking:access")
-    b = msg("out", "Anything else?", 600, "ask", ref="blocking:access")
+    a = msg("out", f"May #{tid} go ahead?", 600, "ask", ref="blocking:review")
+    b = msg("out", "Anything else?", 600, "ask", ref="blocking:review")
     p.db.update_task(tid, status="done")
     assert unblock.close_landed(p.db, []) == [], "no confirmed landing: nothing closes"
     held = p.db.add_task("held", "s", origin="user")
@@ -9955,7 +9955,7 @@ def test_an_ask_closes_when_the_push_queue_lands_the_named_task_through_its_revi
 
     def ask(text, ago=3600):
         return p.db.x("INSERT INTO messages(ts,direction,kind,text,ref) VALUES(?,?,?,?,?)",
-                      (now - ago, "out", "ask", text, "blocking:access"))
+                      (now - ago, "out", "ask", text, "blocking:review"))
     ci, ci_rev = code("ci", 7200, 600)
     early, early_rev = code("early", 9000, 7200)
     queued, _ = code("queued", 7200, 600, status="approved")

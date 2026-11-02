@@ -295,3 +295,60 @@ def test_a_stale_urgent_line_shows_its_age_not_that_the_user_is_present_now(env)
     t2 = {**t, "labels": json.dumps(labels)}
     assert urgent.shown_why(p.db, t2, later) == "the user is present now, one try only"
     assert urgent.new_line("plain", "plain\nurgent: now") and not urgent.new_line("urgent: a", "urgent: a\nmore")
+
+
+def _step_ask(p, text, ref="blocking:access", ago=600):
+    return p.db.x("INSERT INTO messages(ts,direction,kind,text,ref) VALUES(?,?,?,?,?)",
+                  (time.time() - ago, "out", "ask", text, ref))
+
+
+def _step_open_asks(p):
+    return {r["id"] for r in p.db.q("SELECT id FROM messages WHERE kind='ask' AND handled=0")}
+
+
+def test_an_access_ask_stays_open_when_only_a_task_it_names_lands_and_closes_once_the_step_is_done(env, monkeypatch):
+    """A sign-in ask names the install (X, context) and the measurement waiting on the sign-in (Y). X
+    landing leaves it open and in 'Needs you'; Y's sign-in check passing closes it."""
+    from ttp import alerts, unblock
+    from ttp.daemon import Daemon
+    p = make(env)
+    x = p.db.add_task("install the example tool", "s", kind="code", origin="coordinator")
+    y = _add_deferred(p)
+    a = _step_ask(p, f"Please sign in to the example tool: #{x} installed it and #{y} waits on the sign-in.")
+    p.db.update_task(x, status="done")
+    assert unblock.close_landed(p.db, [x]) == [] and a in _step_open_asks(p)
+    assert a in {m["id"] for m in alerts.needs_you(p.db, time.time())}
+    Daemon(p.base)._start_verdict(p.db.task(y), 0, time.time())   # its sign-in check passed
+    assert a not in _step_open_asks(p) and not _open_steps(p)
+    assert (p.db.kv(unblock.RESOLVED_KEY, {}) or {})[str(a)]["step"] == y
+
+
+def test_a_user_only_ask_naming_only_the_landed_task_stays_open_until_its_continuation_signs_in(env, monkeypatch):
+    """The ask names only X; Y continues X and waits on the sign-in (its standing item). X landing closes
+    none of the user-only asks: access, funds, and one whose text names a credential. Y's check passing
+    closes each."""
+    from ttp import alerts, unblock
+    from ttp.daemon import Daemon
+    p = make(env)
+    x = p.db.add_task("install the example tool", "s", kind="code", origin="coordinator")
+    y = _add_deferred(p)
+    p.db.update_task(y, labels=[*json.loads(p.db.task(y)["labels"] or "[]"), f"continues:{x}"])
+    a = _step_ask(p, f"Sign in to the example tool so the measurement after #{x} can run?")
+    funds = _step_ask(p, f"Raise the budget for #{x}?", ref="blocking:funds")
+    cred = _step_ask(p, f"Paste the API key for #{x}?", ref="blocking:review")
+    p.db.update_task(x, status="done")
+    assert unblock.close_landed(p.db, [x]) == []
+    assert {a, funds, cred} <= _step_open_asks(p)
+    top = {m["id"] for m in alerts.needs_you(p.db, time.time())}
+    assert a in top and len(_open_steps(p)) == 1, "the ask and the task's standing item both show"
+    Daemon(p.base)._start_verdict(p.db.task(y), 0, time.time())
+    assert not {a, funds, cred} & _step_open_asks(p), "Y carries X on: its step done answers each"
+
+
+def test_a_non_access_ask_still_closes_when_the_task_it_names_lands(env):
+    from ttp import unblock
+    p = make(env)
+    x = p.db.add_task("ship it", "s", kind="code", origin="coordinator")
+    a = _step_ask(p, f"May #{x} ship to the branch?", ref="blocking:review")
+    p.db.update_task(x, status="done")
+    assert unblock.close_landed(p.db, [x]) == [a] and a not in _step_open_asks(p)

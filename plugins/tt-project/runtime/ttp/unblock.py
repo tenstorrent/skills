@@ -560,15 +560,18 @@ def stuck_line(eps: list[dict]) -> str:
 
 
 def record_resolve(db: DB, ask_id: int, messages: list[int], landed: list[int] | None = None,
-                   auto: str | None = None) -> None:
+                   auto: str | None = None, step: int | None = None) -> None:
     """Remember that the coordinator resolved `ask_id` now, in a turn started for `messages` (the
     user messages it answered; none for a turn of its own). asks() links those messages to it.
     `landed`: the tasks whose landing closed it instead (close_landed). `auto`: the recommendation
-    it auto-resolved to, unanswered (coordinator.expire_asks)."""
+    it auto-resolved to, unanswered (coordinator.expire_asks). `step`: the task whose user step was
+    done (close_step_done)."""
     rec = db.kv(RESOLVED_KEY, {}) or {}
     rec[str(ask_id)] = {"ts": time.time(), "messages": [int(m) for m in messages]}
     if landed:
         rec[str(ask_id)]["landed"] = [int(t) for t in landed]
+    if step:
+        rec[str(ask_id)]["step"] = int(step)
     if auto:
         rec[str(ask_id)]["auto"] = str(auto)[:500]
     db.set_kv(RESOLVED_KEY, dict(sorted(rec.items(), key=lambda kv: int(kv[0]))[-RESOLVED_KEEP:]))
@@ -576,6 +579,17 @@ def record_resolve(db: DB, ask_id: int, messages: list[int], landed: list[int] |
 
 # `#<id>` in an ask's text names a task, unless it names an ask, a PR or an issue.
 _NAMED_TASK = re.compile(r"(\b(?:ask|asks|pr|prs|pull|issue|issues)\s*)?#(\d+)(?!\d)", re.I)
+
+
+# An ask's ref for a step only the user can take (user_only): a task it names landing never closes it.
+USER_ONLY_REFS = ("blocking:access", "blocking:funds")
+
+
+def user_only(ask: dict) -> bool:
+    """An ask for a step only the user can take: its ref is access or funds, or its text names a sign-in,
+    a device code or a credential (userstep.kind_of)."""
+    from . import userstep
+    return (ask.get("ref") or "") in USER_ONLY_REFS or userstep.kind_of({"text": ask.get("text")}) is not None
 
 
 def ask_tasks(db: DB, ask: dict) -> list[int]:
@@ -595,8 +609,11 @@ def close_landed(db: DB, landed, now: float | None = None) -> list[int]:
     re-reviews, continuations), is done and in `landed` (the done tasks whose every claimed push the
     push audit confirmed on its remote, pushclaim.audit), with that landing after the ask (landed_at).
     An ask for no task, for a task not confirmed landed, or for one that landed before it (named only
-    as context) stays open. Each is recorded resolved with its tasks (record_resolve), which asks()
-    and the daily audit report as "resolved: its work landed". Returns the asks closed."""
+    as context) stays open. So does an ask for a step only the user can take (user_only): a task it
+    names may be only context (the install a sign-in is for) and a task held on it is never done, so it
+    closes when that step is done (close_step_done) or the user answers it. Each is recorded resolved with its
+    tasks (record_resolve), which asks() and the daily audit report as "resolved: its work landed".
+    Returns the asks closed."""
     from .landed import carriers
     landed = {int(t) for t in landed or ()}
     if not landed:
@@ -610,7 +627,9 @@ def close_landed(db: DB, landed, now: float | None = None) -> list[int]:
             when[tid] = max((landed_at(db, r["id"]) for r in rows), default=None)
         return when[tid]
     closed = []
-    for a in db.q("SELECT id, ts, text FROM messages WHERE direction='out' AND kind='ask' AND handled=0 ORDER BY id"):
+    for a in db.q("SELECT id, ts, ref, text FROM messages WHERE direction='out' AND kind='ask' AND handled=0 ORDER BY id"):
+        if user_only(a):
+            continue
         tasks = ask_tasks(db, a)
         # A task whose work landed before the ask was sent is named only as context, not the work it was for.
         if not tasks or any((landed_when(t) or 0) <= float(a["ts"]) for t in tasks):
@@ -620,6 +639,25 @@ def close_landed(db: DB, landed, now: float | None = None) -> list[int]:
                 db.x("UPDATE messages SET handled=1 WHERE id=?", (a["id"],))
                 record_resolve(db, a["id"], [], landed=tasks)
                 closed.append(a["id"])
+    return closed
+
+
+def close_step_done(db: DB, tid: int) -> list[int]:
+    """Task `tid`'s user step is done (userstep.probe_passed): close each open ask for a step only the
+    user can take (user_only) that is for `tid` (ask_tasks) or for a task `tid` carries on (landed.carriers:
+    a continuation waiting on the step). Recorded resolved with `tid` as the step done. Returns the asks."""
+    from .landed import carriers
+    closed = []
+    for a in db.q("SELECT id, ref, text FROM messages WHERE direction='out' AND kind='ask' AND handled=0 ORDER BY id"):
+        if not user_only(a):
+            continue
+        tasks = ask_tasks(db, a)
+        if tid in tasks or any(tid in carriers(db, t) for t in tasks):
+            with db.tx():
+                if db.one("SELECT id FROM messages WHERE id=? AND kind='ask' AND handled=0", (a["id"],)):
+                    db.x("UPDATE messages SET handled=1 WHERE id=?", (a["id"],))
+                    record_resolve(db, a["id"], [], step=tid)
+                    closed.append(a["id"])
     return closed
 
 
