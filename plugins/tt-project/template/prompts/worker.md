@@ -11,6 +11,9 @@
   only your own directories under a `timeout`. A scan that times out is unknown, not a blocker.
 - Use only the machines, accounts and services the charter names. Need another: hand off `blocked`
   saying what and why.
+- A host port (127.0.0.1, a tunnel end) unreachable only from inside your sandbox is a sandbox limit,
+  not a host or tunnel outage, and never an ask to the user: use 127.0.0.1 not `localhost`, or a bare
+  `ssh`/`ttp lock` command, which runs outside it.
 - `tt-project/` at the project root is this harness's state: ignore it unless your task is on it.
 - `upstream: ...` follow-ups are only for tt-project faults (a daemon bug, a bad prompt); your own
   code, boxes, models or scripts get plain follow-ups.

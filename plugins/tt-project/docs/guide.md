@@ -827,7 +827,8 @@ counts, with budget caps checked on that figure. Without it, chat spend is booke
 Isolation: chat workers are Claude Code workers, so `providers.chat.worker_isolation` and
 `providers.chat.mcp_withheld` work as the `providers.claude` keys do (below). Unset, each takes
 the claude value: a routed model gets none of your MCP servers, plugins or withheld connectors
-that claude workers are kept from. Set either for chat to differ; `ttp doctor` prints isolation
+that claude workers are kept from. `providers.chat.loopback_ports` likewise takes
+claude's value while unset. Set any for chat to differ; `ttp doctor` prints isolation
 per provider, marking chat's when it comes from claude.
 
 ## Jev (optional add-on)
@@ -1862,6 +1863,18 @@ queues behind routine work; nothing running is interrupted:
   servers (your own, or the project's `mcp_servers`) stay usable. Claude Code's bundled skills are
   listed by name only and stay callable; plugin skills stay fully listed. A Claude Code without
   `--tools` gets a denylist instead. Coordinator turns, Codex and Cursor are not changed by this.
+- Host loopback is reachable from Claude workers by default. On Linux the Bash sandbox (the write
+  fence) runs each command in a network namespace of its own, so the host's 127.0.0.1 ports (an ssh
+  `HostName 127.0.0.1` with a `Port`, a `LocalForward` end, a reverse tunnel's listening port, a
+  local web server) would refuse connections. Each fenced command therefore gets forwarders on its
+  own 127.0.0.1, through the sandbox's proxy, for the host's loopback listeners at run start and the
+  loopback ports in `~/.ssh/config` (up to 32 ports), for the command's whole life, compound
+  commands and scripts included. `providers.claude.loopback_ports: [<port>, ...]` adds ports opened
+  after the run starts; `false` keeps the sandbox's own namespace with no forwarders. Limits: ports
+  below 1024 are not forwarded, the name `localhost` does not resolve inside the sandbox (use
+  127.0.0.1), and macOS gets no forwarders. For anything still blocked, a bare `ssh` or `ttp lock`
+  command runs outside the sandbox, and so do daemon-run command schedules. Codex workers are
+  unchanged: their workspace-write sandbox runs with network access on.
 - `providers.claude.disallowed_tools: ["mcp__<server>__<tool>", "mcp__<server>__*", ...]` lists tools
   Claude workers and reviewers may not call, on top of the tools the harness always denies them; a
   trailing `*` covers every tool whose name starts so, e.g. every tool of one server. Use it to keep
