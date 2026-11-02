@@ -4269,3 +4269,106 @@ def test_cursor_upgrade_from_the_plain_label_is_one_account_switch_with_no_spend
     for _ in range(3):
         d.update_gates()
     assert len(_bk_events(p)) == 1
+
+
+def _codex_limits(home, sid, *events):
+    """Append token_count events to a Codex rollout: (epoch or stamp text, rate_limits, info)."""
+    from datetime import datetime, timezone
+    f = home / "sessions" / "2026" / "11" / "01" / f"rollout-2026-11-01T10-00-00-{sid}.jsonl"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    with open(f, "a") as out:
+        for at, limits, info in events:
+            stamp = at if isinstance(at, str) else \
+                datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+            out.write(json.dumps({"timestamp": stamp, "type": "event_msg", "payload": {
+                "type": "token_count", "info": info, "rate_limits": limits}}) + "\n")
+    return f
+
+
+def _limits(five=None, week=None, **extra):
+    win = lambda used, mins, resets: {"used_percent": used, "window_minutes": mins, "resets_at": resets}  # noqa: E731
+    return {"limit_id": "codex", "limit_name": None, "primary": five and win(*five), "secondary": week and win(*week),
+            "credits": {"has_credits": False, "unlimited": False, "balance": "0"}, "plan_type": "plus",
+            "rate_limit_reached_type": None, **extra}
+
+
+def test_codex_reads_plan_windows_from_its_rollout_rate_limits(tmp_path):
+    from ttp.providers import get_provider
+    home, sid, now = tmp_path / "codex", "0199abab-cdcd", time.time()
+    env = {"CODEX_HOME": str(home)}
+    out = tmp_path / "output.jsonl"
+    out.write_text(json.dumps({"type": "thread.started", "thread_id": sid}) + "\n")
+    tokens = {"total_token_usage": {"input_tokens": 1000, "cached_input_tokens": 0, "output_tokens": 10}}
+    prov = get_provider("codex").use("m1", {"m1": [1.0, 0.1, 2.0]})
+    assert prov.windows_so_far(out, now - 60, env, now=now) == [], "no rollout yet: the meter's reading stands"
+    roll = _codex_limits(home, sid, (now - 30, _limits((10.0, 300, now + 3600), (35, 10080, now + 86400)), tokens))
+    assert prov.windows_so_far(out, now - 60, env, now=now) == [
+        {"window": "5h", "utilization": 10.0, "resets_at": now + 3600, "read_at": pytest.approx(now - 30, abs=0.01)},
+        {"window": "7d", "utilization": 35.0, "resets_at": now + 86400, "read_at": pytest.approx(now - 30, abs=0.01)}]
+    assert prov.cost_so_far(out, since=now - 60, env=env) == pytest.approx(0.001 + 0.00002), "tokens in the same pass"
+    # Read incrementally: the newest event wins, also one with no token info; one without rate_limits keeps it.
+    _codex_limits(home, sid, (now - 20, _limits(week=(36.0, 10080, now + 86400)), None), (now - 10, None, tokens))
+    assert [(w["window"], w["utilization"]) for w in prov.windows_so_far(out, now - 60, env, now=now)] == [("7d", 36.0)]
+    # A reached limit reads full, as the meter reads a refused account.
+    _codex_limits(home, sid, (now - 5, _limits(week=(99.0, 10080, now + 86400), rate_limit_reached_type="primary"),
+                              tokens))
+    assert [w["utilization"] for w in prov.windows_so_far(out, now - 60, env, now=now)] == [100.0]
+    # Stale: older than a few minutes, the gate keeps the meter's reading.
+    assert prov.windows_so_far(out, now - 60, env, now=now + 600) == []
+    assert get_provider("codex").windows_so_far(out, now - 60, env, now=now + 600) == []
+    # The newest reading is unreadable: never fresh, and never an older one instead.
+    for bad, why in ((_limits((10.0, 300, None), ("x", 10080, None)), "a non-numeric used_percent"),
+                     (_limits((10.0, 0, None)), "a zero-length window"),
+                     (_limits((150.0, 300, None)), "a share over 100"),
+                     (_limits((10.0, 300, "soon")), "a non-numeric reset"),
+                     (_limits((True, 300, None)), "a boolean share"),
+                     (dict(_limits((10.0, 300, None)), primary="5h"), "a window that is not an object"),
+                     (_limits((10.0, 300, None), limit_id="codex_other_model"), "another limit's windows")):
+        _codex_limits(home, sid, (now - 2, bad, tokens))
+        assert get_provider("codex").windows_so_far(out, now - 60, env, now=now) == [], why
+    with open(roll, "a") as f:
+        f.write('{"type": "event_msg", "payload": {"type": "token_count", "rate_limits": [1]}}\nnot json token_count\n')
+    assert get_provider("codex").windows_so_far(out, now - 60, env, now=now) == [], "malformed lines are skipped"
+    _codex_limits(home, sid, ("not a time", _limits((10.0, 300, None)), tokens))
+    assert get_provider("codex").windows_so_far(out, now - 60, env, now=now) == [], "an unreadable stamp is never fresh"
+    assert get_provider("claude").windows_so_far(out, now - 60, env) == []
+
+
+def test_daemon_records_a_running_codex_runs_rollout_windows_for_the_gate(env, tmp_path):
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    home, sid, now = tmp_path / "codex", "0199efef-1212", time.time()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text(json.dumps({"type": "thread.started", "thread_id": sid}) + "\n")
+    (run_dir / "run.json").write_text(json.dumps({"env": {"CODEX_HOME": str(home)}}))
+    tid = p.db.add_task("codex one", "spec", kind="code", tier="standard", origin="user")
+    p.db.x("INSERT INTO runs(task,role,provider,model,started,status,dir,boot_id,account) VALUES(?,?,?,?,?,?,?,?,?)",
+           (tid, "worker", "codex", "m1", now - 120, "running", str(run_dir), "x", "codex (chatgpt)"))
+    # The meter read the account 5 minutes ago; the run's rollout has nothing yet.
+    bud.record_windows(p.db, [bud.Window("codex", "7d", 20.0, now + 86400, "codex (chatgpt)")], ts=now - 300)
+    d = Daemon(p.base)
+    d.meter_running()
+    assert [(w.window, w.utilization) for w in bud.plan_windows(p.db) if w.provider == "codex"] == [("7d", 20.0)]
+    # A model call wrote a fresh reading: the gate sees it without waiting for the meter.
+    tokens = {"total_token_usage": {"input_tokens": 1000, "cached_input_tokens": 0, "output_tokens": 10}}
+    _codex_limits(home, sid, (now - 30, _limits(week=(42.0, 10080, now + 86400)), tokens))
+    with open(run_dir / "output.jsonl", "a") as f:
+        f.write(json.dumps({"type": "item.completed", "item": {}}) + "\n")
+    d._metered.clear()
+    d.meter_running()
+    wins = [w for w in bud.plan_windows(p.db) if w.provider == "codex"]
+    assert [(w.window, w.utilization, w.account) for w in wins] == [("7d", 42.0, "codex (chatgpt)")]
+    row = p.db.one("SELECT MAX(ts) ts, COUNT(*) n FROM snapshots WHERE provider='codex'")
+    assert row["ts"] == pytest.approx(now - 30, abs=0.01) and row["n"] == 2, "recorded at the time it was read"
+    # The same reading is recorded once; a newer meter reading than it still wins.
+    d._metered.clear()
+    d.meter_running()
+    assert p.db.one("SELECT COUNT(*) n FROM snapshots WHERE provider='codex'")["n"] == 2
+    bud.record_windows(p.db, [bud.Window("codex", "7d", 43.0, now + 86400, "codex (chatgpt)")])
+    assert [w.utilization for w in bud.plan_windows(p.db) if w.provider == "codex"] == [43.0]
+    # The run ended: its rollout reader is let go.
+    p.db.x("UPDATE runs SET status='ok' WHERE task=?", (tid,))
+    d.meter_running()
+    assert d._window_provs == {}

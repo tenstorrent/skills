@@ -405,6 +405,12 @@ class Provider:
         the provider can tell (None: the daemon books the elapsed share of the budget instead)."""
         return None
 
+    def windows_so_far(self, output_path: Path, since: float | None = None, env: dict | None = None,
+                       now: float | None = None) -> list[dict]:
+        """Plan windows a running run has seen so far ({"window", "utilization", "resets_at",
+        "read_at"}), only while fresh: [] leaves the gate on its other readings (the meter's)."""
+        return []
+
     def resolved_session(self, argv: list[str], cwd: str, env: dict | None = None) -> dict | None:
         """The model and reasoning effort a run started with `argv` in `cwd` would actually use, asked
         from the agent without starting a model turn: {"model", "effort"}, or {"error"} when the

@@ -170,7 +170,7 @@ from .project import rebase_replace
 from .project import (Project, bad_sections, command_env, deep_merge, layered, disk_resume_gb, durable_append, durable_write, git_fsync_env,
                       file_tail, hostname, nice_level, output_tail, own_free, own_push, push_allowed, zombie)
 from .providers import get_provider
-from .providers.base import FUNDS_RE, last_json_object, scratch_dir, service_path
+from .providers.base import FUNDS_RE, Provider, last_json_object, scratch_dir, service_path
 from .providers.claude import as_windows
 from .providers.jev import Jev, JevOutOfFunds, Pause as JevPause
 from .prompts import RUN_DIR_MARK
@@ -784,6 +784,8 @@ class Daemon:
         self._slack_rejects: dict[int, int] = {}   # outbound message id -> times Slack refused it
         self._reap_errors: dict[int, int] = {}
         self._metered: dict[int, tuple[int, float]] = {}   # run id -> (output size, when) last priced
+        self._window_provs: dict[int, tuple] = {}            # run id -> (provider, env) reading its windows
+        self._windows_read: dict[tuple[str, str], float] = {}   # (provider, account) -> newest reading recorded
         self._escalated: dict[int, tuple[int, int]] = {}   # run id -> (size, mtime_ns) of its ESCALATE_FILE relayed
         self._start_failures = 0
         self._pre_grant_seen: dict[tuple[str, int], tuple[float, pregrant.Answer]] = {}
@@ -3246,7 +3248,9 @@ class Daemon:
         before it ends. `finish_run` replaces the figures with the final ones."""
         now = time.time()
         running = self.p.db.q("SELECT * FROM runs WHERE status='running'")
-        self._metered = {k: v for k, v in self._metered.items() if k in {r["id"] for r in running}}
+        ids = {r["id"] for r in running}
+        self._metered = {k: v for k, v in self._metered.items() if k in ids}
+        self._window_provs = {k: v for k, v in self._window_provs.items() if k in ids}
         for r in running:
             out = self._run_dir(r) / "output.jsonl"
             try:
@@ -3271,6 +3275,34 @@ class Daemon:
                         (cost, basis, usage.input_tokens or 0, usage.output_tokens or 0, usage.cache_read_tokens or 0,
                          r["id"]))
             self._suggest_split(r, usage.cache_read_tokens or 0)
+            self._record_running_windows(r, out)
+
+    def _record_running_windows(self, r: dict, out: Path) -> None:
+        """A provider whose running runs report the account's plan windows (Codex: with each model
+        call, in its rollout) gives the gate a fresh reading between meter reads. One provider per
+        run reads its rollout incrementally; a reading is recorded once, at the time it was taken."""
+        held = self._window_provs.get(r["id"])
+        if held is None:
+            prov = get_provider(r["provider"])
+            if type(prov).windows_so_far is Provider.windows_so_far:
+                return
+            try:
+                env = json.loads((self._run_dir(r) / "run.json").read_text()).get("env")
+            except (OSError, ValueError, AttributeError):
+                env = None
+            held = self._window_provs[r["id"]] = (prov, env if isinstance(env, dict) else {})
+        prov, env = held
+        try:
+            wins = prov.windows_so_far(out, r["started"], env)
+        except Exception:
+            return
+        key = (r["provider"], r["account"] or "")
+        read_at = max((w["read_at"] for w in wins), default=0)
+        if not wins or read_at <= self._windows_read.get(key, 0):
+            return
+        self._windows_read[key] = read_at
+        bud.record_windows(self.p.db, [bud.Window(r["provider"], w["window"], w["utilization"], w.get("resets_at"),
+                                                  r["account"] or "") for w in wins], ts=read_at)
 
     def _suggest_split(self, r: dict, reread: int) -> None:
         """Once a worker's run has re-read more context than `budget.split_reread_tokens` allows for

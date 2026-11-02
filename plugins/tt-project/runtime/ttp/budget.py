@@ -860,8 +860,9 @@ def plan_lapsed(db: DB, provider: str, last_reading: float) -> bool:
                   (provider, last_reading))["n"] >= PLAN_LAPSE_RUNS
 
 
-def record_windows(db: DB, windows: list[Window]) -> None:
-    now = time.time()
+def record_windows(db: DB, windows: list[Window], ts: float | None = None) -> None:
+    """Record readings, taken at `ts` (default now): a newer reading of the same window wins."""
+    now = time.time() if ts is None else ts
     for w in windows:
         db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
              (now, w.provider, w.account, w.window, w.utilization, w.resets_at))

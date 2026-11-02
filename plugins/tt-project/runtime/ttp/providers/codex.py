@@ -5,6 +5,8 @@ and exposes plan windows through `codex app-server` (`account/rateLimits/read`, 
 Cost is therefore an estimate from a price table the project can edit. `codex exec --json` prints
 tokens only when a turn completes (one turn per run), so the runner's mid-run budget check and a
 cut-off run's price read the running totals in the session's rollout (token_count events).
+The same events carry the account's plan windows (`rate_limits`), so a running run reports them
+with each model call; the app-server meter, read every few minutes, covers the time between.
 
 Write fence (from the docs; Codex was not installed where this was probed). Workers run in
 `workspace-write`, so they are fenced: they write their cwd, temp dirs and `writable_args` roots.
@@ -39,6 +41,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -49,6 +52,8 @@ from .base import (AUTH_RE, LIMIT_RE, MAX_ARG_BYTES, Provider, RunUsage, cli_out
 # $ per million tokens: (input, cached input, output). Estimates only; the project may override
 # them in project.json under pricing.codex.<model>. Unknown models use the "default" row.
 PRICES = {"default": (4.0, 0.4, 20.0)}
+# A rollout's plan-window reading stands in for the meter's only this fresh (seconds).
+ROLLOUT_WINDOWS_FRESH_S = 180
 # Tools a decision-only turn does without, switched off when this build lists them as features.
 READ_ONLY_OFF = ("shell_tool", "unified_exec", "web_search_request")
 HOOK_TRUST_BYPASS = "--dangerously-bypass-hook-trust"
@@ -235,15 +240,20 @@ class Codex(Provider):
         event_msg/token_count `total_token_usage` in its session's rollout. That total covers the
         whole session, so a resumed run subtracts the last total written before `since` (its start).
         Read incrementally: the runner asks every few seconds while the rollout grows."""
+        return self._read_rollout(output_path, since, env)[0]
+
+    def _read_rollout(self, output_path: Path, since: float | None = None, env: dict | None = None):
+        """(`_rollout_tokens`, (stamp, rate_limits) of the newest token_count event carrying them),
+        read in one incremental pass."""
         sid = next((str(ev.get("thread_id") or "") for ev in self._events(output_path)
                     if ev.get("type") == "thread.started"), "")
         paths = self.session_paths(sid, "", env)
         if not paths:
-            return None
+            return None, None
         seen = self.__dict__.setdefault("_rollouts", {})
         try:
             path = max(paths, key=lambda f: f.stat().st_mtime)
-            offset, base, last = seen.get((str(path), since), (0, None, None))
+            offset, base, last, limits = seen.get((str(path), since), (0, None, None, None))
             with open(path, "rb") as f:
                 f.seek(offset)
                 for raw in f:
@@ -254,6 +264,8 @@ class Codex(Provider):
                         continue
                     try:
                         rec = json.loads(raw)
+                        if isinstance(rec["payload"].get("rate_limits"), dict):   # also on an event with no info
+                            limits = (_stamp(rec.get("timestamp")), rec["payload"]["rate_limits"])
                         total = rec["payload"]["info"]["total_token_usage"]
                         tok = tuple(int(total.get(k) or 0)
                                     for k in ("input_tokens", "cached_input_tokens", "output_tokens"))
@@ -264,11 +276,20 @@ class Codex(Provider):
                     else:
                         last = tok
         except OSError:
-            return None
-        seen[(str(path), since)] = (offset, base, last)
+            return None, None
+        seen[(str(path), since)] = (offset, base, last, limits)
         if last is None:
-            return None
-        return tuple(max(a - b, 0) for a, b in zip(last, base)) if base else last
+            return None, limits
+        return (tuple(max(a - b, 0) for a, b in zip(last, base)) if base else last), limits
+
+    def windows_so_far(self, output_path, since=None, env=None, now=None):
+        # The newest reading a model call wrote to the rollout, while fresh; else none, and the
+        # gate keeps the meter's (an unreadable stamp is never fresh).
+        limits = self._read_rollout(Path(output_path), since, env)[1]
+        now = time.time() if now is None else now
+        if not limits or not abs(now - limits[0]) <= ROLLOUT_WINDOWS_FRESH_S:
+            return []
+        return [dict(w, read_at=min(limits[0], now)) for w in _rollout_windows(limits[1])]
 
     def cut_off_cost(self, output_path, since=None, env=None):
         # Codex prints usage only on turn.completed, and `codex exec` is one turn; its rollout has
@@ -353,10 +374,10 @@ class Codex(Provider):
             if not w:
                 continue
             mins = int(w.get("windowDurationMins") or 0)
-            name = "5h" if mins == 300 else "7d" if mins == 10080 else f"{mins}m"
             util = float(w.get("usedPercent") or 0)
             # Keyed like the readings its runs report, so the gate matches them to the account.
-            wins.append(Window("codex", name, 100.0 if not allowed else util, w.get("resetsAt"), self.account()))
+            wins.append(Window("codex", _window_name(mins), 100.0 if not allowed else util, w.get("resetsAt"),
+                               self.account()))
         return wins
 
     def consume_reset(self, credit_id: str, key: str) -> dict | None:
@@ -426,6 +447,32 @@ def _account_id(auth: dict) -> str:
         except (ValueError, AttributeError):
             pass
     return str(auth.get("OPENAI_API_KEY") or "")
+
+
+def _window_name(mins: int) -> str:
+    return "5h" if mins == 300 else "7d" if mins == 10080 else f"{mins}m"
+
+
+def _rollout_windows(limits) -> list[dict]:
+    """A token_count event's `rate_limits` as plan windows, shaped like the meter's: the account's
+    own limit only (a `limit_id` naming another limit is skipped), and nothing if any window is
+    malformed. A reached limit reads full, as the meter reads a refused account."""
+    if not isinstance(limits, dict) or limits.get("limit_id") not in (None, "", "codex"):
+        return []
+    num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)  # noqa: E731
+    full, wins = bool(limits.get("rate_limit_reached_type")), []
+    for key in ("primary", "secondary"):
+        w = limits.get(key)
+        if w is None:
+            continue
+        if not isinstance(w, dict):
+            return []
+        mins, util, resets = w.get("window_minutes"), w.get("used_percent"), w.get("resets_at")
+        if not (num(mins) and mins > 0 and num(util) and 0 <= util <= 100 and (resets is None or num(resets))):
+            return []
+        wins.append({"window": _window_name(int(mins)), "utilization": 100.0 if full else float(util),
+                     "resets_at": resets})
+    return wins
 
 
 def _stamp(text) -> float:
