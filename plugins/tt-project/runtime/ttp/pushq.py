@@ -504,7 +504,9 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
     earlier valid approval of this same review accepted (JUDGED_KEY) stays accepted: its reviewer
     judged it. A task outside the lineage is never accepted unless listed. A reviewed task whose
     pr_branch (push.pr_elsewhere) the push
-    remote has no branch of is a push-branch delivery: "notes" says its label was ignored and why."""
+    remote has no branch of is a push-branch delivery: "notes" says its label was ignored and why. A
+    head with a commit that adds a conflict marker is invalid with its hits under "markers"
+    (conflictfix.stray_markers)."""
     d = _delivery(p, cfg)
     if d.get("push_queue") is not True:
         if isinstance(entries, list) and entries and all(isinstance(e, dict) and e.get("head") for e in entries):
@@ -569,7 +571,7 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
         except subprocess.TimeoutExpired:
             hits = []   # git hung: the batch scans the commits again before it carries them
         if hits:
-            return {"invalid": f"{_short(e['head'])}: {conflictfix.marker_refusal(hits)}"}
+            return {"invalid": f"{_short(e['head'])}: {conflictfix.marker_refusal(hits)}", "markers": hits}
     try:
         carried = _inherited(p, task, out, tip, time.time()) if tip else {}
     except subprocess.TimeoutExpired:

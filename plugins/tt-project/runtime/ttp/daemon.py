@@ -396,8 +396,11 @@ OWN_STEP = re.compile(r"It (?:delivers onto its pr_branch|rebases \S+ and delive
 # (Daemon._precheck_failed): it gets a fix and re-review like substantive. And a fifth, approval, for a
 # review whose reviewer passed the change but whose push approval stayed invalid after its one rerun
 # (an inherited commit not listed, a stale head): no finding, so no fix, and no review_area_cap count.
+# And a sixth, marker, for a plain review (no conflict fix) whose approval was refused because a commit
+# adds a conflict marker: its reviewer may not edit, so a fix rewrites the commits (conflictfix.marker_fix)
+# and a re-review follows, with no rerun first and no review_area_cap count.
 REVIEW_FAILURE_KEY, REVIEW_FAILURE_KINDS = "review_failure", ("check_only", "substantive", "mixed", "precheck",
-                                                              "approval")
+                                                              "approval", "marker")
 # A precheck failure's verdict: the last lines of checks.out it quotes, and the failing command's exit
 # codes that mean a timeout or a kill (the environment, not the head), which leave the reviewer to run.
 PRECHECK_TAIL_LINES, PRECHECK_KILLED_RCS = 20, (124, 137, 143)
@@ -4791,7 +4794,7 @@ class Daemon:
             log(self.p, f"task {task['id']}: run {r.get('id')} {reason}")
         # A review that passes may hand its approved commits to the push queue instead of pushing
         # (delivery.push_queue): it waits as 'pushing' until a batch pushed them (pushq.py).
-        approval, push_note, push_quiet, push_why = None, "", False, ""
+        approval, push_note, push_quiet, push_why, marker_fix = None, "", False, "", None
         entries = result.get("push") if isinstance(result, dict) else None
         if task["kind"] == "review" and (judged := load_result(task["result"]).get(pushq.JUDGED_KEY)):
             extra[pushq.JUDGED_KEY] = judged   # what its earlier approvals accepted, kept for the next one
@@ -4809,7 +4812,14 @@ class Daemon:
                 log(self.p, f"task {task['id']}: push approval invalid: {why}")
                 extra["push_invalid"] = int(load_result(task["result"]).get("push_invalid") or 0) + 1
                 push_note = f" Push approval invalid: {why}."
-                if extra["push_invalid"] < 2:
+                if check.get("markers") and not conflictfix.of(task):
+                    # A plain reviewer may not edit, so a rerun cannot rewrite the commits: one fix task
+                    # does, and a re-review follows (_fix_failed_review). A conflict fix runs again below.
+                    marker_fix = conflictfix.marker_fix(task["id"], why, check["markers"])
+                    own = result.get("followups") if isinstance(result.get("followups"), list) else []
+                    new, result = "failed", {**result, REVIEW_FAILURE_KEY: "marker", "followups": [marker_fix, *own]}
+                    summary = f"push approval refused: {why}. {summary}"[:1500]
+                elif extra["push_invalid"] < 2:
                     new, not_before, push_quiet = "queued", time.time(), True
                     extra["woke"] = f"push approval invalid: {why}"
                     reason = f"push approval invalid: {why}; its review runs again"
@@ -5118,6 +5128,8 @@ class Daemon:
         # they stay with the coordinator.
         fixes = [f for f in fups if not upstream.is_note(f) and id(f) not in rerouted
                  and not f.get("start_after") and not f.get("start_when")]
+        if marker_fix:
+            fixes = [f for f in fixes if f is marker_fix]   # the reviewer's own proposals stay proposals
         # Across stacks, an area whose reviews keep failing gets no more automatic fixes: the
         # coordinator re-plans it (reviewcap).
         # A check-only failure stays failed: the coordinator routes the missing check to its owner,
@@ -5125,15 +5137,15 @@ class Daemon:
         check_only = new == "failed" and task["kind"] == "review" and review_failure(result) == "check_only"
         # A refused approval of a passed change has nothing to fix either: the review re-approves.
         form_only = new == "failed" and task["kind"] == "review" and review_failure(result) == "approval"
-        area = self._review_area(dict(task, **upd)) \
-            if new == "failed" and task["kind"] == "review" and not check_only and not form_only else None
-        fix = self._fix_failed_review(dict(task, **upd), fixes, summary) \
-            if new == "failed" and task["kind"] == "review" and fixes and len(fups) <= MAX_FOLLOWUPS \
+        area = self._review_area(dict(task, **upd)) if new == "failed" and task["kind"] == "review" \
+            and not check_only and not form_only and not marker_fix else None
+        fix = self._fix_failed_review(dict(task, **upd), fixes, summary, reuse_fix=bool(marker_fix)) \
+            if new == "failed" and task["kind"] == "review" and fixes and (len(fups) <= MAX_FOLLOWUPS or marker_fix) \
             and not area and not check_only and not form_only else None
         # A failed review left with no fix (a capped round, no fix follow-ups, findings on branches
         # that are not one stack) wakes the coordinator, never silently.
         nofix = "" if fix or area or check_only or form_only or new != "failed" or task["kind"] != "review" else \
-            getattr(self, "_nofix", "") if fixes and len(fups) <= MAX_FOLLOWUPS else \
+            getattr(self, "_nofix", "") if fixes and (len(fups) <= MAX_FOLLOWUPS or marker_fix) else \
             f"it proposed more than {MAX_FOLLOWUPS} follow-ups" if fixes else "it proposed no fix follow-ups"
         # With no fix follow-ups the task_failed event below is the wake (it is queued): it says why,
         # the branch and what waits. Fixes the daemon could not queue get their own review_nofix event.
@@ -13319,7 +13331,8 @@ class Daemon:
             log(self.p, f"review {review['id']}: its area's failures were not counted: {e}")
             return None
 
-    def _fix_failed_review(self, review: dict, fups: list[dict], summary: str) -> tuple[int, int, list[int]] | None:
+    def _fix_failed_review(self, review: dict, fups: list[dict], summary: str,
+                           reuse_fix: bool = False) -> tuple[int, int, list[int]] | None:
         """A review that failed with fix specs, handled the way the coordinator would: one code task
         fixes them all on top of the reviewed branch, and a re-review that waits on it takes over the
         failed review's dependents: (fix id, re-review id, the dependents moved). None when auto
@@ -13330,7 +13343,9 @@ class Daemon:
         or its change already landed, which has its own notice), for deadwait.raise_nofix.
         The covered code tasks are those it depends on and those its spec names; when they are not
         one stack (a coordinator note naming another change's branch), those it depends on decide.
-        A review of a change published in another repository goes to _fix_external_review."""
+        A review of a change published in another repository goes to _fix_external_review.
+        `reuse_fix` (a conflict-marker refusal): an open fix of another review on the same branch
+        (_open_fix) takes these findings too, as an open hop does, instead of a second fix."""
         cfg, db = self.cfg, self.p.db
         d = cfg.get("delivery") or {}
         self._nofix = ""
@@ -13406,7 +13421,7 @@ class Daemon:
         # An open continue hop that builds on the reviewed branch (a split's hop) finishes that branch:
         # it takes these findings, and the re-review waits on it. A separate fix would be a second
         # task continuing the same work.
-        hop = None if prfix else self._open_hop(code)
+        hop = None if prfix else self._open_hop(code) or (self._open_fix(code) if reuse_fix else None)
         with db.tx():
             if prfix or hop:
                 fid = (prfix or hop)["id"]
@@ -13587,6 +13602,13 @@ class Daemon:
             if new == "0":
                 out.append(dict(r, base=base))
         return out
+
+    def _open_fix(self, code: dict) -> dict | None:
+        """The oldest open fix of a failed review (`review_fix:`) that continues code task `code`'s
+        branch directly; None when there is none."""
+        return next(iter(self.p.db.q("SELECT * FROM tasks WHERE kind='code' AND status NOT IN (?,?,?) "
+                                     "AND labels LIKE ? AND labels LIKE '%\"review_fix:%' ORDER BY id LIMIT 1",
+                                     (*TERMINAL_TASK_STATES, f'%"continues:{code["id"]}"%'))), None)
 
     def _open_hop(self, code: dict) -> dict | None:
         """The open code task, oldest first, that continues code task `code`'s branch (`continues:`, directly

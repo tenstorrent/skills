@@ -207,12 +207,13 @@ def check_only(task: dict) -> bool:
     return load_result(task.get("result")).get("review_failure") == "check_only"
 
 
-NO_FINDING = ("check_only", "precheck", "approval")   # review_failure values that carry no finding on the change
+NO_FINDING = ("check_only", "precheck", "approval", "marker")   # review_failure values that carry no finding on the change
 
 
 def unjudged(task: dict) -> bool:
     """Whether review `task` failed with no review finding on the change: check-only, its pre-review
-    checks failed (precheck), or only its push approval was refused (approval). None counts toward
+    checks failed (precheck), or only its push approval was refused (approval, or marker: a commit adds
+    a conflict marker, which a fix rewrites). None counts toward
     area_fail_cap."""
     return load_result(task.get("result")).get("review_failure") in NO_FINDING
 

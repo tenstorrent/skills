@@ -477,3 +477,20 @@ def marker_refusal(hits: list[str]) -> str:
             + (f"; +{len(hits) - 3} more" if len(hits) > 3 else "") + "). No commit, intermediate ones "
             "included, may carry one: rewrite the commits so none adds it (squash the fix's own commits), "
             "then approve the new head")
+
+
+MARKER_FIX = "rewrite the commits that add a git conflict marker"   # the follow-up title marker_fix starts with
+
+
+def marker_fix(review_id: int, why: str, hits: list[str]) -> dict:
+    """The fix follow-up for a plain review whose approval was refused for stray_markers' `hits`
+    (`why`): its reviewer may not edit, so a fix task rewrites the commits (Daemon._finish_tx)."""
+    shas = sorted({h.split(" ", 1)[0] for h in hits})
+    return {"title": f"{MARKER_FIX} ({', '.join(shas[:5])})",
+            "spec": (f"Review #{review_id} passed the change, but the push queue refused its approval: {why}\n"
+                     f"Commits carrying a marker: {', '.join(shas)}. Lines: {'; '.join(hits)}.\n"
+                     "Rewrite this branch's own commits so that no commit in the range it adds over the push "
+                     "branch adds a conflict marker line: squash each commit that adds one into the commit that "
+                     "removes it, or fix it in place, and replay the commits after it. Keep the final tree as "
+                     "reviewed and change nothing else. Then check `git log -p` over that range: no added line "
+                     "may be a marker. The re-review approves the rewritten head.")}

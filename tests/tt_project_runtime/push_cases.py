@@ -15246,3 +15246,75 @@ def test_an_approval_whose_commits_add_a_conflict_marker_is_refused(env, monkeyp
     check = pushq.check_approval(s.p, s.p.db.task(s.review), [{"branch": s.branch, "head": head}])
     assert "a commit adds a git conflict marker line" in check.get("invalid", ""), check
     assert f"code.py:2: {_CM_SEP}" in check["invalid"]
+    assert check["markers"] == [f"{_git_out(s.path, 'rev-parse', 'HEAD~1')[:10]} code.py:2: {_CM_SEP}"], check
+
+
+def _marker_head(s):
+    """A commit on the code branch adds a conflict marker and the next removes it: (marker sha, head)."""
+    _commit(s.path, "code.py", f"x = 1\n{_CM_SEP}\n")
+    bad = _git_out(s.path, "rev-parse", "HEAD")
+    _commit(s.path, "code.py", "x = 1\n")
+    return bad, _git_out(s.path, "rev-parse", "HEAD")
+
+
+def _marker_fixes(s):
+    return s.p.db.q("SELECT * FROM tasks WHERE kind='code' AND title LIKE 'Fix review #%' ORDER BY id")
+
+
+def test_a_plain_reviews_marker_refusal_queues_one_fix_on_the_code_branch_and_a_re_review(env, monkeypatch):
+    """A plain review cannot edit, so a marker refusal never reruns it: it fails at once (review_failure
+    marker, no review_area_cap count) and one fix task builds on the code branch, naming the commit
+    that carries the marker and asking to squash or fix it. A re-review waits on the fix; the
+    reviewer's own follow-up stays a proposal."""
+    from ttp import reviewcap
+    s = _pq(env, monkeypatch)
+    s.p.set_config("review.area_fail_cap", 1)
+    bad, head = _marker_head(s)
+    t = _pq_hand_off(env, s, push=[{"branch": s.branch, "head": head}],
+                     followups=[{"title": "tidy", "spec": "rename a helper"}])
+    res = json.loads(t["result"])
+    assert t["status"] == "failed" and res["review_failure"] == "marker", res
+    assert reviewcap.unjudged(t) and not s.p.db.q("SELECT id FROM events WHERE kind=?", (reviewcap.REVIEW_AREA_EVENT,))
+    (fix,) = _marker_fixes(s)
+    assert fix["title"].startswith(f"Fix review #{s.review}:") and f'"continues:{s.code}"' in fix["labels"]
+    assert f"branch {s.branch} (head {head[:12]})" in fix["spec"], fix["spec"]
+    assert bad[:10] in fix["spec"] and "squash" in fix["spec"] and "tidy" not in fix["spec"], fix["spec"]
+    (rr,) = s.p.db.q("SELECT * FROM tasks WHERE title LIKE 'Re-review #%'")
+    assert json.loads(rr["depends_on"]) == [fix["id"]] and rr["status"] == "queued", rr
+    (prop,) = s.p.db.q("SELECT status FROM events WHERE task=? AND kind='followup_proposed' AND text LIKE "
+                       "'%tidy%'", (s.review,))
+    assert prop["status"] == "queued", "the reviewer's own follow-up was folded into the fix"
+
+
+def test_a_second_marker_refusal_with_a_fix_open_on_the_branch_reuses_that_fix(env, monkeypatch):
+    """Another review of the same change refused for the same marker while the first fix is still open:
+    no second fix task. The open fix takes the finding (spec and review_fix label) and the second
+    review gets its own re-review waiting on that fix."""
+    s = _pq(env, monkeypatch)
+    _, head = _marker_head(s)
+    _pq_hand_off(env, s, push=[{"branch": s.branch, "head": head}])
+    (fix,) = _marker_fixes(s)
+    again = s.p.db.add_task("review feature again", "r", kind="review", origin="coordinator", depends_on=[s.code])
+    t = _pq_hand_off(env, s, push=[{"branch": s.branch, "head": head}], task=again)
+    assert t["status"] == "failed" and json.loads(t["result"])["review_failure"] == "marker", t
+    (same,) = _marker_fixes(s)
+    assert same["id"] == fix["id"] and f'"review_fix:{again}"' in same["labels"], same
+    assert f"Review #{again} (" in same["spec"], same["spec"]
+    rrs = s.p.db.q("SELECT depends_on FROM tasks WHERE title LIKE 'Re-review #%' ORDER BY id")
+    assert [json.loads(r["depends_on"]) for r in rrs] == [[fix["id"]], [fix["id"]]], rrs
+
+
+def test_a_conflict_fix_reviews_marker_refusal_still_runs_it_again_and_queues_no_fix(env, monkeypatch):
+    """A conflict-fix review may rewrite the commits itself: its marker refusal keeps the one rerun (with
+    the refusal as its woke text) and queues no fix task."""
+    from ttp import conflictfix
+    s = _pq(env, monkeypatch)
+    _, head = _marker_head(s)
+    mark = {"tier": "standard", "head": head}
+    s.p.db.update_task(s.review, result=json.dumps({"woke": "push conflict on proj", conflictfix.KEY: mark}))
+    monkeypatch.setattr(conflictfix, "run_note", lambda note: {"tier": "standard"})
+    t = _pq_hand_off(env, s, push=[{"branch": s.branch, "head": head}])
+    res = json.loads(t["result"])
+    assert t["status"] == "queued" and res["push_invalid"] == 1 and res.get("review_failure") is None, res
+    assert "a commit adds a git conflict marker line" in res["woke"] and res[conflictfix.KEY] == mark, res
+    assert not _marker_fixes(s)
