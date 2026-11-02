@@ -15124,3 +15124,51 @@ def test_a_model_free_resolution_queues_a_light_review_of_its_delta_and_records_
     assert s.p.db.one("SELECT resolution FROM push_queue WHERE task=?", (s.review,))["resolution"] == "review_rerun"
     st = conflictfix.stats(s.p.db, now - 60)
     assert st["review_rerun"] == 1 and st["model_free"] == 0, st
+
+
+def test_a_conflict_of_only_import_names_settles_model_free_in_the_tips_layout():
+    """Two heads that each import a new name on one packed `from . import` line conflicted and voided
+    an approval; so did a head that added a name to the packed line the tip had just split one name
+    per line. The imports rule keeps every name each side imports, in the tip's layout, and refuses
+    anything that is not only import statements or whose spot is ambiguous."""
+    import ast
+    from ttp.batch import merge3
+    base = "from . import a, b, d\nfrom .db import x\n\n\ndef f():\n    return 1\n"
+    ours = base.replace("a, b, d", "a, b, c, d")                         # the tip
+    theirs = base.replace("a, b, d", "a, b, d, e")                       # the replayed head
+    assert merge3(ours, base, theirs, py=True, hunks=True) is None       # before: a voided approval
+    kinds: set = set()
+    both = merge3(ours, base, theirs, py=True, hunks=True, imports=True, kinds=kinds)
+    assert both == base.replace("a, b, d", "a, b, c, d, e") and kinds == {"imports"}
+    ast.parse(both)
+    # the tip split the list one name per line (a comment on its opening line); the head added a name
+    # to the packed line it had: the name goes on its own line after its predecessor
+    split = "from . import (   # one name per line\n    a,\n    b,\n    d,\n)\n\n\ndef f():\n    return 1\n"
+    packed = "from . import a, b, d\n\n\ndef f():\n    return 1\n"
+    got = merge3(split, packed, packed.replace("b, d", "b, c, d"), py=True, hunks=True, imports=True)
+    assert got == split.replace("    b,\n", "    b,\n    c,\n")
+    # a name the head drops is dropped; the tip's own new name stays
+    got = merge3(ours, base, base.replace("a, b, d", "a, d, e"), py=True, hunks=True, imports=True)
+    assert got == base.replace("a, b, d", "a, c, d, e")
+    # never settled: code in the conflict, a star import, a `;` line, an ambiguous spot, not Python
+    cb = "from . import a, b\nY = 0\n"
+    assert merge3("from . import a, b, c\nY = 1\n", cb, "from . import a, b, e\nY = 2\n", py=True, hunks=True,
+                  imports=True) is None
+    assert merge3(ours, base, base.replace("a, b, d", "*"), py=True, imports=True) is None
+    assert merge3(ours, base, base.replace("a, b, d", "a, b, d; import os"), py=True, imports=True) is None
+    amb = "from . import (\n    a,  # b,\n    b,\n)\n"
+    assert merge3(amb.replace("    b,\n", "    b,\n    c,\n"), amb, "from . import a, b, e\n", py=True,
+                  imports=True) is None
+    assert merge3(ours, base, theirs, hunks=True, imports=True) is None
+    # both sides re-aliased one name: an edit, not two imports
+    assert merge3("from . import a, b as x\n", "from . import a, b\n", "from . import a, b as y\n", py=True,
+                  imports=True) is None
+
+
+def test_the_batch_rebase_settles_import_only_conflicts_and_keeps_the_verdict_only_after_the_checks():
+    """_rebase asks settle for the imports rule, and an imports settlement counts as a merge whose
+    verdict holds only when the push checks pass (MERGED_KINDS), like the added and hunks rules."""
+    import inspect
+    from ttp import batch
+    assert "imports" in batch.MERGED_KINDS and "imports" in batch.SETTLED_WORDS
+    assert "imports=True" in inspect.getsource(batch.Batch._rebase)

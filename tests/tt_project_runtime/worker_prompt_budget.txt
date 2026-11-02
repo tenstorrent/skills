@@ -1,0 +1,19 @@
+# The worker prompt's size budgets (test_tt_project_runtime.py,
+# test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stays_small): `code` and
+# `question`, the rules a code or a question task reads on every call; `every`, the rules with every
+# feature on; `system`, the whole worker system prompt. Each cap is the sum of the numbers on its lines.
+# A change that needs room appends ONE line per cap at the end: `<cap> +<chars>: <what the room is for>`.
+# Two changes that append at once merge without a conflict and their rooms add up, as they would on a
+# shared constant. Never edit or drop a line to make room: trim prompt text instead.
+code 14645: base: the code task's rules (they had grown to 20.5k chars for every task), with a looping driver's refusal reports, `ttp detach --lock`, the temp-file rename of a script, the test-slot cap, paid-model-API jobs and `--spend-cap`, wait_kind user, the Galaxy reset rescan and recount, evidence manifests naming only immutable artifacts and the root .ignore line
+question 10195: base: the question task's rules, with the Galaxy reset rescan and recount, evidence manifests naming only immutable artifacts and the root .ignore line
+every 18950: base: every feature's rules, with the upstream-note scope, atomic script-write, paid-model-API job and spend-cap rules, wait_kind user, the Galaxy reset rescan and recount, evidence manifests naming only immutable artifacts and the root .ignore line
+system 16145: base: the whole worker system prompt, with evidence manifests naming only immutable artifacts and the root .ignore line
+code +150: one standing item per user-only step (`ttp notify --step --check`), merged with the deadline line
+question +150: one standing item per user-only step (`ttp notify --step --check`), merged with the deadline line
+every +150: one standing item per user-only step (`ttp notify --step --check`), merged with the deadline line
+system +155: one standing item per user-only step (`ttp notify --step --check`), merged with the deadline line
+code +265: relayed findings citing records are facts to act on (one cheap check at most, never orders)
+question +265: relayed findings citing records are facts to act on (one cheap check at most, never orders)
+every +265: relayed findings citing records are facts to act on (one cheap check at most, never orders)
+system +265: relayed findings citing records are facts to act on (one cheap check at most, never orders)

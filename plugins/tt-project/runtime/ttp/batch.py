@@ -31,6 +31,7 @@ is gone, spending no resume. An ordinary push's after_push that a reboot cut sho
 the boot, like a batch's (pushq.tend_receipts)."""
 from __future__ import annotations
 
+import ast
 import difflib
 import fcntl
 import os
@@ -59,8 +60,9 @@ AFTER_PUSH = "after_push-"    # + batch id: the temporary checkout after_push ru
 DEFAULT_AFTER_PUSH_TIMEOUT_S = 1800
 STALE = "(stale plugin version)"   # the `cmd` of a check failure that is push.stale_versions
 SETTLED_WORDS = {"version": "version lines", "added": "lines both sides added",
-                 "hunks": "changes of different lines", "taken_in": "a change the other side holds"}
-MERGED_KINDS = {"added", "hunks"}   # settlements that keep both sides' changes: kept only when the checks pass
+                 "hunks": "changes of different lines", "taken_in": "a change the other side holds",
+                 "imports": "names both sides import"}
+MERGED_KINDS = {"added", "hunks", "imports"}   # settlements that keep both sides' changes: kept only when the checks pass
 REPLAYED = "Ttp-Replayed-From"     # trailer of a commit the batch settled: the entry commit it replays
 # sequence.editor of a rebase that leaves out an entry's commits already on the target (Batch._landed):
 # drops each todo `pick` whose commit one of the shas before the todo file's path starts with
@@ -269,7 +271,7 @@ def _sweep_after_push(p: Project, repo: Path) -> None:
 
 def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool = False,
            hunks: bool = False, kinds: set | None = None, superseded: bool = False,
-           near: bool = False) -> str | None:
+           near: bool = False, imports: bool = False) -> str | None:
     """git's three-way merge of the texts, where each conflict in which both sides only added lines
     at one spot (an empty base section) keeps both: ours first, then theirs (in Python, see _seam).
     With `taken_in`, a conflict whose change on our side theirs already holds (_taken_in) takes
@@ -277,7 +279,8 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
     (git calls adjacent changes a conflict) takes both changes (_hunks). With `superseded`, a conflict
     whose change on our side theirs already makes, comments and spacing aside, takes theirs
     (_superseded). With `near`, both sides' added lines are not kept (by the added or hunks rule)
-    when one nearly repeats the other (_near). None when any other conflict
+    when one nearly repeats the other (_near). With `imports`, a Python conflict made only of import
+    statements keeps every name each side imports (_imports). None when any other conflict
     remains, or when keeping both could be wrong (_clash). `kinds` collects how each conflict was
     settled ("added", "taken_in", "hunks"). The conflict markers carry a random tag, so file content
     never passes for one; a hunk whose base-to-end part holds more than one separator line is not read.
@@ -315,7 +318,7 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
         while j < len(lines) and lines[j].rstrip("\r\n") != sep:
             old.append(lines[j])
             j += 1
-        if old and not (taken_in or hunks or superseded):
+        if old and not (taken_in or hunks or superseded or imports):
             return None                 # the base section is not empty: a real conflict
         j, theirs_lines = j + 1, []
         while j < len(lines) and lines[j].rstrip("\r\n") != end:
@@ -339,6 +342,9 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
         elif old and hunks and (both := _hunks(mine, old, theirs_lines, py, near)) is not None:
             res += both
             how = "hunks"
+        elif old and imports and py and (both := _imports(mine, old, theirs_lines)) is not None:
+            res += both
+            how = "imports"
         else:                           # a real conflict
             return None
         if kinds is not None:
@@ -378,6 +384,130 @@ def _hunks(mine: list[str], old: list[str], theirs: list[str], py: bool, near: b
         out += old[pos:i1] + new
         pos = i2
     return out + old[pos:]
+
+
+def _import_stmts(lines: list[str]) -> list[tuple[tuple, list[str], int, int]] | None:
+    """The import statements that make up `lines`, each as (key, names as written, first line, last
+    line): key ("from", level, module) or ("import",), a name `a` or `a as b`. None when the lines
+    hold anything else (other code, `;`, a line continuation, a star import, a name twice) or do
+    not parse on their own. Comments may sit among them: names are placed only where the name
+    before them reads once in the statement."""
+    text = "".join(lines)
+    if not text.strip() or any(c in text for c in ";\\"):
+        return None
+    try:
+        body = ast.parse(text).body
+    except (SyntaxError, ValueError):
+        return None
+    out = []
+    for node in body:
+        if not isinstance(node, (ast.Import, ast.ImportFrom)) or node.end_lineno is None:
+            return None
+        names = [a.name + (f" as {a.asname}" if a.asname else "") for a in node.names]
+        if "*" in names or len(set(names)) != len(names):
+            return None
+        key = ("from", node.level, node.module or "") if isinstance(node, ast.ImportFrom) else ("import",)
+        out.append((key, names, node.lineno - 1, node.end_lineno - 1))
+    return out
+
+
+def _imports(mine: list[str], old: list[str], theirs: list[str]) -> list[str] | None:
+    """One Python conflict made only of import statements, settled by name: the result imports what
+    ours does, less the names theirs removed, plus the names theirs added (each statement keyed by
+    its module), written in our layout (a name per line where ours lists them so, else inline after
+    the name theirs puts before it). Every name each side added stays as it wrote it. None when a
+    side holds anything but import statements, a statement theirs extends is gone from ours, or a
+    name cannot be placed in one way only."""
+    o, b, t = (_import_stmts(x) for x in (mine, old, theirs))
+    if o is None or b is None or t is None:
+        return None
+
+    def names(stmts: list) -> dict[tuple, list[str]]:
+        out: dict[tuple, list[str]] = {}
+        for key, ns, _, _ in stmts:
+            out.setdefault(key, []).extend(ns)
+        return out
+    on, bn, tn = names(o), names(b), names(t)
+    segs = [["".join(mine[i:j + 1]), key] for key, _, i, j in o]   # each statement of ours, edited in place
+    before = mine[:o[0][2]]
+    between = [mine[o[k][3] + 1:o[k + 1][2]] for k in range(len(o) - 1)] + [mine[o[-1][3] + 1:]]
+    tail: list[str] = []
+
+    def token(name: str) -> str:
+        parts = name.split(" as ")
+        return r"(?<![\w.])" + r"\s+as\s+".join(re.escape(x) for x in parts) + r"(?![\w.])"
+
+    def inline(seg: str) -> tuple[str, str]:
+        cut = re.search(r"\bimport\b", seg)
+        return (seg[:cut.end()], seg[cut.end():]) if cut else ("", seg)
+
+    def per_line(seg: str, ns: list[str]) -> list[str] | None:
+        rows = seg.splitlines(keepends=True)
+        return rows if len(rows) > 1 and all(sum(r.strip() == f"{n}," for r in rows) == 1 for n in ns) else None
+
+    def stmt_names(seg: str) -> list[str]:
+        got = _import_stmts([seg])
+        return got[0][1] if got and len(got) == 1 else []
+
+    for key in tn.keys() | bn.keys():
+        T, B, O = tn.get(key, []), bn.get(key, []), on.get(key, [])
+        for r in [n for n in B if n not in T and n in O]:          # theirs removed it
+            k = next(k for k, (seg, sk) in enumerate(segs) if sk == key and r in stmt_names(seg))
+            seg = segs[k][0]
+            if len(stmt_names(seg)) == 1:
+                return None
+            if rows := per_line(seg, stmt_names(seg)):
+                segs[k][0] = "".join(x for x in rows if x.strip() != f"{r},")
+                continue
+            head, rest = inline(seg)
+            hits = list(re.finditer(token(r) + r"\s*,[ \t]*", rest)) or list(re.finditer(r",\s*" + token(r), rest))
+            if len(hits) != 1:
+                return None
+            segs[k][0] = head + rest[:hits[0].start()] + rest[hits[0].end():]
+        added = [n for n in T if n not in B and n not in O]
+        if added and not O:
+            if B or any(n not in added for n in T):
+                return None                 # a statement theirs extends is gone from ours
+            for tk, _, i, j in t:
+                if tk == key:
+                    tail += theirs[i:j + 1]
+            continue
+        for n in added:
+            pos = T.index(n)
+            prev = next((T[x] for x in range(pos - 1, -1, -1)
+                         if any(sk == key and T[x] in stmt_names(seg) for seg, sk in segs)), None)
+            k = next(k for k, (seg, sk) in enumerate(segs) if sk == key and (prev is None or prev in stmt_names(seg)))
+            seg = segs[k][0]
+            anchor = prev or stmt_names(seg)[0]
+            if rows := per_line(seg, stmt_names(seg)):
+                at = next(x for x, row in enumerate(rows) if row.strip() == f"{anchor},")
+                row = rows[at]
+                line = row[:len(row) - len(row.lstrip())] + f"{n}," + row[len(row.rstrip("\r\n")):]
+                rows.insert(at + 1 if prev else at, line)
+                segs[k][0] = "".join(rows)
+                continue
+            head, rest = inline(seg)
+            hits = list(re.finditer(token(anchor), rest))
+            if len(hits) != 1:
+                return None
+            at = hits[0].end() if prev else hits[0].start()
+            segs[k][0] = head + rest[:at] + (f", {n}" if prev else f"{n}, ") + rest[at:]
+    out = list(before)
+    for (seg, _), gap in zip(segs, between):
+        out += seg.splitlines(keepends=True) + gap
+    out += tail
+    got = _import_stmts(out)
+    if got is None:
+        return None
+    want = {key: {n for n in on.get(key, []) if not (n in bn.get(key, []) and n not in tn.get(key, []))}
+            | {n for n in tn.get(key, []) if n not in bn.get(key, [])} for key in on.keys() | tn.keys()}
+    have = {key: set(ns) for key, ns in names(got).items()}
+    # a name bound twice (both sides re-aliased one import, or imported it from two places) is an edit
+    bound = [n.split(" as ")[-1].split(".")[0] for _, ns, _, _ in got for n in ns]
+    source = [(key, n.split(" as ")[0]) for key, ns, _, _ in got for n in ns]
+    if len(set(bound)) != len(bound) or len(set(source)) != len(source):
+        return None
+    return out if have == {k: v for k, v in want.items() if v} else None
 
 
 def _taken_in(mine: list[str], old: list[str], theirs: list[str]) -> bool:
@@ -568,13 +698,13 @@ def _show(wt: Path, stage: int, path: str) -> bytes | None:
 
 
 def settle(wt: Path, path: str, version_files: list[str], taken_in: bool = False, hunks: bool = False,
-           kinds: set | None = None, superseded: bool = False, near: bool = False) -> bool:
+           kinds: set | None = None, superseded: bool = False, near: bool = False, imports: bool = False) -> bool:
     """Settle the conflicted `path` of a stopped rebase in `wt`, if it needs no judgment, and write
     the result: True when settled. Ours (stage 2) is the batch head, theirs (stage 3) the entry.
     In a version file every stage first takes the batch head's version, so a version line alone
     never conflicts. A pure addition keeps both sides (merge3), unless in a .py file that leaves a
     top-level def or class name twice where neither side had it twice (it would silently shadow a
-    test). `taken_in`, `hunks`, `superseded`, `near` and `kinds` are merge3's; a version line taken adds "version" to
+    test). `taken_in`, `hunks`, `superseded`, `near`, `imports` and `kinds` are merge3's; a version line taken adds "version" to
     `kinds`. A file both sides created is never settled."""
     ours, base, theirs = _show(wt, 2, path), _show(wt, 1, path), _show(wt, 3, path)
     if ours is None or theirs is None or base is None:
@@ -593,7 +723,7 @@ def settle(wt: Path, path: str, version_files: list[str], taken_in: bool = False
             how.add("version")
         b, t = vb, vt
     merged = merge3(o, b, t, py=path.endswith(".py"), taken_in=taken_in, hunks=hunks, kinds=how,
-                    superseded=superseded, near=near)
+                    superseded=superseded, near=near, imports=imports)
     if merged is None:
         return False
     if path.endswith(".py") and _duplicates(merged) - _duplicates(o) - _duplicates(t):
@@ -1296,7 +1426,7 @@ class Batch:
             files = [f for f in _git(wt, "diff", "--name-only", "-z", "--diff-filter=U").stdout.split("\0")
                      if f] if stopped else []
             kinds: set = set()
-            real = [f for f in files if not settle(wt, f, version_files, hunks=True, kinds=kinds)]
+            real = [f for f in files if not settle(wt, f, version_files, hunks=True, imports=True, kinds=kinds)]
             if real or not files:       # a real conflict, or a stop that is no conflict at all
                 if stopped:
                     _git(wt, "rebase", "--abort")

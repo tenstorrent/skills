@@ -28843,6 +28843,30 @@ def test_the_code_prompt_lands_only_through_the_guarded_push_and_only_when_asked
     assert "instead of adding a\n  separate landing, cherry-pick or fast-forward task" in coordinator
 
 
+def _worker_budget(cap: str) -> int:
+    """One worker prompt cap: the sum of the numbers on worker_prompt_budget.txt's lines for `cap`
+    (`<cap> <chars>: base ...`, then `<cap> +<chars>: <why>` per change), skipping comments and blank lines."""
+    import re as _re
+    total, base = 0, 0
+    for n, line in enumerate((_CASES / "worker_prompt_budget.txt").read_text().splitlines(), 1):
+        if not line.strip() or line.startswith("#"):
+            continue
+        m = _re.match(r"(code|question|every|system) (\+?)(\d[\d_]*): \S", line)
+        assert m, f"worker_prompt_budget.txt:{n}: not `<cap> +<chars>: <why>`: {line!r}"
+        if m.group(1) == cap:
+            total += int(m.group(3).replace("_", ""))
+            base += not m.group(2)
+    assert base == 1, f"worker_prompt_budget.txt: {base} base lines for {cap}"
+    return total
+
+
+def test_the_worker_prompt_budget_file_sums_to_the_caps_it_replaced():
+    # Replacing the shared constants kept each cap exactly as strict: its lines sum to the old cap,
+    # and appended lines only add room.
+    assert _worker_budget("code") >= 14_645 and _worker_budget("question") >= 10_195
+    assert _worker_budget("every") >= 18_950 and _worker_budget("system") >= 16_145
+
+
 def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stays_small(env, monkeypatch, tmp_path):
     import inspect, json as _json, re as _re
     from ttp import machines, prompts
@@ -28851,23 +28875,12 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     monkeypatch.setattr(machines, "load", lambda: {})
     src = (p.harness / "prompts" / "worker.md").read_text()
     code, question = {"kind": "code", "title": "t"}, {"kind": "question", "title": "t"}
-    # The rules a code or a question task reads on every call stay under their budgets (they had
-    # grown to 20.5k chars for every task, shared clusters, device runners and remote drivers included).
-    # 13.6k: +1 rule, the one line a looping driver reports its refusals with (`ttp progress report`).
-    # 13.7k: +1 clause, `ttp detach --lock` holding a job's locks for its life.
-    # 13.86k: +1 rule, change a script by renaming a temp file over it (a running shell may read it).
-    # 13.9k: +1 clause, pytest -n never above the host's per-run test-slot cap ($TTP_TEST_SLOTS).
-    # 14.32k: +1 rule, a detached job calling a paid model API caches, caps units, guards daily limits.
-    # 14.44k: +1 clause, `ttp detach --spend-cmd/--spend-cap` has the daemon stop a paid-API job at its cap.
-    # 14.455k: +1 hand-off wait_kind, `user` (only the user's step ends the wait; no stall:probe).
-    # 14.5k and 10.05k: +50, the Galaxy reset line's root-port rescan, BDF and tray recount and plain report.
+    # The rules a code or a question task reads on every call stay under their budgets: the sums of
+    # worker_prompt_budget.txt's lines. A change that needs room appends its own line there (no shared
+    # constant to conflict on).
     rules = {k: feature_blocks(src, worker_features(p, t)) for k, t in (("code", code), ("question", question))}
-    # 14.61k and 10.16k: +110, a hash-pinned manifest names only immutable artifacts and receipts (upstream note 89e39b4c).
-    # 14.645k and 10.195k: +35 net, rg/Grep from the project root skip what its .ignore lists (start-up file index).
-    # 14.795k and 10.345k: +150, one standing item per user-only step (`ttp notify --step --check`), merged with the deadline line.
-    # 15.06k and 10.61k: +265, relayed findings citing records are facts to act on (one cheap check at most, never orders).
-    assert len(rules["code"]) <= 15_060, len(rules["code"])
-    assert len(rules["question"]) <= 10_610, len(rules["question"])
+    assert len(rules["code"]) <= _worker_budget("code"), len(rules["code"])
+    assert len(rules["question"]) <= _worker_budget("question"), len(rules["question"])
     # A question task cannot detach, so it skips the pointer to the long-running script rules.
     assert "references/long-running-scripts.md" in rules["code"]
     assert "references/long-running-scripts.md" not in rules["question"]
@@ -28875,14 +28888,14 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     assert "A follow-up implying a device or machine experiment" not in src
     assert "A harness task changes only this project's own harness" not in src
     every = feature_blocks(src, {"harness", "prs", "wait", "device", "devq", "remote", "clusters"})
-    assert len(every) <= 19_365, len(every)  # room for the upstream-note scope, atomic script-write, paid-model-API job and spend-cap rules, wait_kind user, the Galaxy reset rescan and recount, +110 evidence manifests naming only immutable artifacts, +35 the root .ignore line, +150 one standing item per user-only step
+    assert len(every) <= _worker_budget("every"), len(every)
     for t in (None, code, question):
         system = worker_system(p, t)
         assert "<!-- ttp:" not in system and "<!-- /ttp:" not in system
         # The prompt names charter and memory files under the temp folder: measure it with a fixed
         # 64-char stand-in so the size does not depend on the temp path's length.
         size = len(system.replace(str(tmp_path), "T" * 64))
-        assert size <= 16_565, size  # +110: evidence manifests name only immutable artifacts; +35: the root .ignore line; +150: one standing item per user-only step; +265: relayed findings citing records
+        assert size <= _worker_budget("system"), size
     # Every fence names a feature worker_features can turn on, and each opens and closes once.
     known = set(_re.findall(r'on\.add\("(\w+)"\)', inspect.getsource(worker_features))) | {"harness"}
     opens = _re.findall(r"<!-- ttp:if (!?)(\w+) -->", src)
