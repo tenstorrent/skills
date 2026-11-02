@@ -26969,6 +26969,8 @@ DURABLE_EXEMPT = {
     ("project.py", "os.replace(a, b)"): "rolled-back memory retirement moves the file back: a rename, both directories synced after",
     ("gitlocks.py", "os.replace(path, to)"): "moves a stale git lock aside, never its content; a rename lost to a crash leaves the lock for the next sweep",
     ("cleantree.py", 'open(self.dir / LOCK, "w")'): "an empty flock file in a temp checkout folder; only the lock is used, never its content",
+    ("cleantree.py", '(gitdir / "objects" / "info" / "alternates").write_text('): "a scratch clone's alternates, made before its checkout; a crash leaves a scratch folder the next run removes, never state",
+    ("cleantree.py", '(gitdir / "packed-refs").write_text('): "a scratch clone's copy of the repository's refs, made before its checkout; a crash leaves a scratch folder the next run removes, never state",
     ("project.py", 'os.fdopen(fd, "wb")'): "inside durable_write",
     ("project.py", "os.replace(tmp, path)"): "inside durable_write",
     ("project.py", 'open(path, "ab+")'): "inside durable_append",
