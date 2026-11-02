@@ -1529,7 +1529,8 @@ def test_jev_picks_effort_once_logs_it_with_the_run_and_deep_comes_only_on_a_ret
     monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.base), None))
     started = []
     monkeypatch.setattr(d, "start_run", lambda *a, **k: started.append((a, k)) or 0)
-    q = p.db.add_task("Which boxes run the old broker?", "List them.", kind="question", tier="standard",
+    # A lookup (work, not a conclusion run: a question would be lifted by the tier floor, tierfloor.py).
+    q = p.db.add_task("Which boxes run the old broker?", "List them.", kind="work", tier="standard",
                       origin="coordinator", provider="claude", budget_usd=8.0)
     d.dispatch()
     (args, kw), = started

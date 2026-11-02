@@ -270,7 +270,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # Provider failover (failover.py): a queued or waiting task whose provider cannot
                     # start new work for longer than provider_failover_after_h hours (0: off) moves to
                     # the first usable of provider_failover_to (provider names), then the core provider.
-                    "provider_failover_after_h": 4, "provider_failover_to": []},
+                    "provider_failover_after_h": 4, "provider_failover_to": [],
+                    # Tier floor for conclusion runs (tierfloor.py): a question or plan task, a chat
+                    # answer, a spec with a `conclusion:` line or a report schedule's run starts at least
+                    # at this tier and effort ('standard/high'; 'off' turns the floor off).
+                    "conclusion_floor": {"tier": "standard", "effort": "high"}},
     "notify": {"slack": False, "slack_min_severity": "high", "chat_min_severity": "normal"},
     # gone_after_s: a relay chat with no `ttp listen` running that left a message unread this long
     # stops counting as a reader of asks and alerts until it reads again (chatgone.py).

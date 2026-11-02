@@ -91,6 +91,7 @@ from . import effort
 from . import effortab
 from . import extchange
 from . import failover
+from . import tierfloor
 from . import outagetask
 from . import grants
 from . import ends
@@ -2426,7 +2427,7 @@ class Daemon:
                   budget_usd: float | None = None, timeout_s: float | None = None, read_only: bool = False,
                   schema: dict | None = None, system: str | None = None, append_system: str | None = None,
                   note: dict | None = None, resume: str | None = None,
-                  context: str | None = None, cache_ttl: str = "") -> int:
+                  context: str | None = None, cache_ttl: str = "", min_effort: str | None = None) -> int:
         """`context` (with `system`): stable text that follows the system prompt, sent as a block of
         its own with a cache breakpoint after it where the provider can mark one (else it ends the
         system prompt). `cache_ttl` (`5m`, `1h`) sets the provider's prompt cache lifetime; `auto`
@@ -2464,6 +2465,11 @@ class Daemon:
             ab = (note or {}).get(effortab.KEY)
             if not pin.get("effort") and isinstance(ab, dict) and ab.get("effort"):
                 effort = str(ab["effort"])   # the task's effort A/B arm or Jev's pick (effortab.assign)
+        if min_effort and role != "coordinator":
+            # A conclusion run's effort floor (tierfloor.py), as this provider takes it.
+            lifted = failover.kept_effort(provider, min_effort)
+            if lifted and tierfloor._rank(effort) < tierfloor._rank(lifted):
+                effort = lifted
         prices = (self.cfg.get("pricing") or {}).get(provider) or {}
         prov = get_provider(provider).use(model, prices)
         restrictions = self.cfg.get("restrictions", {})
@@ -7443,6 +7449,13 @@ class Daemon:
             picked = self._pick_effort(task, provider)
             if picked:
                 task = dict(task, tier=picked["tier"])
+            floor = self._tier_floor(task, provider)   # after the pick: a conclusion run never starts light
+            if floor:
+                task = floor.pop("task")
+                remaining, cost = self._start_cost(task)
+                if (picked or {}).get("jev_call") and floor["tier"] != picked["tier"]:
+                    # Jev's lower pick never ran: it avoided nothing.
+                    db.x("UPDATE jev_calls SET avoided_usd=0 WHERE id=?", (picked["jev_call"],))
             wake = bud.wake_tier(task["tier"], load_result(task["result"]), self.cfg, self.p.harness)
             tier = bud.clamp_tier(wake or task["tier"], gate)
             # A tier routed to another provider (route.py) runs there unless it is cooling down.
@@ -7502,6 +7515,8 @@ class Daemon:
                     note[waitgate.USE] = gated
                 if picked:
                     note["pick"] = picked
+                if floor:
+                    note[tierfloor.KEY] = floor
                 if routed:
                     note[route.KEY] = routed
                 try:
@@ -7528,7 +7543,8 @@ class Daemon:
                                         task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] else None,
                                         timeout_s=(routed or {}).get("timeout_s"),
                                         read_only=False, append_system=system, note=note,
-                                        resume=lost["session"] if lost else None)
+                                        resume=lost["session"] if lost else None,
+                                        min_effort=(floor or {}).get("effort") if not wake else None)
                 if lease:   # the lease now names the run's supervisor in place of the daemon
                     self._route_lease(task, routed, tier, now, run_id=run_id)
             except Exception as e:
@@ -7717,6 +7733,20 @@ class Daemon:
             self.p.db.update_task(task["id"], tier=picked["tier"], **({"result": marked} if marked else {}),
                                   tier_source="retry_tier_up" if picked["by"] == "retry" else "effort_pick")
         return picked
+
+    def _tier_floor(self, task: dict, provider: str) -> dict | None:
+        """The conclusion floor for this start (tierfloor.py), stored on the task, with the task as it
+        now starts under `task`; None when none applies."""
+        try:
+            got = tierfloor.lift(self.p.db, self.cfg, task, provider)
+            if not got:
+                return None
+            task = tierfloor.apply(self.p.db, self.cfg, task, got)
+        except Exception as e:   # the floor must never hold a task back
+            log(self.p, f"task {task['id']}: tier floor not applied: {e}")
+            return None
+        log(self.p, f"task {task['id']}: {tierfloor.note(got)}")
+        return {**got, "task": task}
 
     def _route(self, task: dict, tier: str, picked: dict | None, now: float) -> dict | None:
         """The run note's `route` entry for a worker run of a tier routed to another provider

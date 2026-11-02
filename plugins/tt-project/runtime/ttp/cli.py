@@ -7654,6 +7654,12 @@ def cmd_config(a) -> None:
                    else failover.to_of(val, p.config().get("providers")))
         except ValueError as e:
             die(str(e))
+    if a.key == "coordinator.conclusion_floor":
+        from . import tierfloor
+        try:
+            val = tierfloor.floor_of(val)
+        except ValueError as e:
+            die(str(e))
     if a.key.startswith("heal.outage_") and a.key.endswith("_min"):
         from .outagetask import minutes
         try:

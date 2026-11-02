@@ -686,6 +686,20 @@ spec instead (once per lineage; the tier's effort when Jev is off or does not an
 in the run note and in Jev's call log, which records the task's outcome. It is off by default and
 yields to the A/B while that is on.
 
+Light is for mechanical work only: file reads and copies, small scripted edits, polling, test
+reruns. A conclusion run, whose output is a conclusion the user reads, never starts below the
+conclusion floor, `coordinator.conclusion_floor` (default `standard/high`: the standard tier at
+high effort or more, the nearest effort its provider takes). A conclusion run is a `question` or
+`plan` task, a task that answers a chat, a task whose spec has a line starting `conclusion:`, or a
+run of an llm schedule that reports to the user (the daily review, or a schedule named for a
+review, summary, digest, report or brief). The daemon lifts it at each start, after the effort
+pick, so tasks already queued are lifted too; a lift that changes the tier moves a default budget
+to the new tier's default, sets `tier_source` to `conclusion_floor` and adds a spec line such as
+`[tier floor] light->standard (conclusion: kind question)`. Reviews keep their diff-sized tier,
+a pin the user's own words require (`pin_required`) stays, a light wake of a waiting task stays a
+check, and a failed try still retries a tier up. Set it per project with
+`ttp config <name> coordinator.conclusion_floor deep/xhigh`, or `off`.
+
 ### OpenAI-compatible endpoints (the `chat` provider)
 
 The `chat` provider runs Claude Code workers against any endpoint that speaks the OpenAI Chat

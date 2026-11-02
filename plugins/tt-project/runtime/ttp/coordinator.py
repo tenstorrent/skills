@@ -84,6 +84,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     startbreaker,
     sweep,
     throughmute,
+    tierfloor,
     timefmt,
     tried,
     unblock,
@@ -413,6 +414,8 @@ USER_SETTABLE = {
     # Orders the owner's own chat agent relays (`ttp say` context and findings) count as the owner's word
     # (relay.agent_orders). Turned on only in a turn carrying the owner's own message (NEEDS_USER).
     relay.AGENT_KEY: lambda v: v is True or str(v).strip().lower() in ("1", "true", "yes", "on"),
+    # The tier and effort every conclusion run starts at, at least (tierfloor.py): 'standard/high', 'off'.
+    "coordinator.conclusion_floor": lambda v: tierfloor.floor_of(v),
 }
 
 

@@ -67,8 +67,13 @@ Each field's rules are in the section named; the table only lists them.
   that opens or updates a PR, so a task asking for one is `code`, or task_add makes it so), `review`
   (independent check), `plan` (break a goal into tasks), `harness` (improve this project's harness),
   `work` (anything else, incl. non-code deliverables).
-- `tier`: `light` for lookups, triage, small edits; `standard` (default) otherwise; `deep` (max
-  effort) only when the user asks (`user_deep`). The daemon retries a failed run a tier up itself.
+- `tier`: `light` only for mechanical work (file reads and copies, small scripted edits, polling,
+  test reruns); `standard` (default) otherwise. Anything whose output is a conclusion the user reads
+  (diagnosis, root cause, verdict, status claim, k/N table, a draft for other people, dashboard or
+  status prose) is `standard` or above, and a `work`, `code` or `harness` spec that produces one
+  carries a `conclusion:` line; the daemon lifts such runs, questions, plans and chat answers to
+  `coordinator.conclusion_floor` (standard, high effort). `deep` (max effort) only when the user
+  asks (`user_deep`). The daemon retries a failed run a tier up itself.
   Respect the budget's `max_tier`. A `review` gets its tier from the diff it names (branch or commit
   in the spec, or `depends_on` the code task); set `deep` only to force it. A re-review `continues`
   the failed one or depends on its fix, and its spec lists the earlier findings.
