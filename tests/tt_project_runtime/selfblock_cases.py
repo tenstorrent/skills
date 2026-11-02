@@ -124,3 +124,47 @@ def test_daemon_self_blocking_check_raises_and_survives_a_failure(env, monkeypat
     d._selfblock_checked = 0.0
     monkeypatch.setattr(selfblock, "raise_due", lambda *a, **k: 1 / 0)
     d.check_self_blocking()   # logged, never raised
+
+
+def test_selfblock_reply_counts_only_hold_wording_not_a_bare_possessive():
+    from ttp import selfblock
+    for s in ("Decided: narrowed the test gate. Your word reverses it.",
+              "Decided: narrowed the test gate to the changed files. Your word reverses it.",
+              "Which laptop to use is your call.",
+              "your decision.",
+              "I can keep the hold scope at all boxes if you prefer; your decision."):
+        assert selfblock.finding(s, rx=selfblock.HOLD) is None, s
+    for s in ("I left the hold scope as it is: that changes only on your word.",
+              "The landing order stays as is until your ok.",
+              "Pacing is held for the user's word.",
+              "Only you can widen the hold scope.",
+              "This needs you to approve the new pacing."):
+        assert selfblock.finding(s, rx=selfblock.HOLD), s
+    # A PR or draft review ask is the user's (the PR flow): quiet.
+    assert selfblock.finding("Waiting for your draft review of the change") is None
+    assert selfblock.finding("Held for the user's PR review") is None
+
+
+def test_selfblock_reply_raises_at_most_once_per_window_and_never_on_its_own_answer(env):
+    p = make(env)
+    from ttp import selfblock
+    db = p.db
+    db.post("out", "Decided: narrowed the test gate. Your word reverses it.", chat=None, kind="reply",
+            severity="low")
+    db.post("out", "Which laptop to use is your call.", chat=None, kind="reply", severity="low")
+    now = time.time()
+    assert selfblock.raise_due(db, now) == []
+    r1 = db.post("out", "I left the hold scope as it is: that changes only on your word.", chat=None,
+                 kind="reply", severity="low")
+    (f,) = selfblock.raise_due(db, now + 1)
+    assert (f["source"], f["id"]) == ("reply", r1)
+    # The turn's answer, and any other holding reply, posted inside the window raise nothing,
+    # neither now nor once the window has passed.
+    db.post("out", "Kept the landing order: it changes only on your word.", chat=None, kind="reply", severity="low")
+    assert selfblock.raise_due(db, now + 60) == []
+    assert selfblock.raise_due(db, now + selfblock.REPLY_WINDOW_S + 120) == []
+    assert db.one("SELECT COUNT(*) n FROM events WHERE kind=?", (selfblock.KIND,))["n"] == 1
+    # A task finding is not limited by the reply window.
+    t = db.add_task("pacing")
+    db.update_task(t, status="blocked", blocked_reason=_SELF_BLOCKING[2])
+    assert [(g["source"], g["id"]) for g in selfblock.raise_due(db, now + 120)] == [("task", t)]
