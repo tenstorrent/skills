@@ -5398,7 +5398,8 @@ def test_a_users_request_never_refuses_the_follow_up_ask_it_leads_to(env):
                       ("No rush, not sure when: switch the dogfood channel to weekly cuts.",
                        "Switch the dogfood channel to weekly cuts: which weekday should the cut run?"),
                       ("Set up the Atlassian connector on box-a1.",
-                       "The Atlassian connector on box-a1 needs an API token; please create one.")):
+                       "The Atlassian connector on box-a1 needs an API token; I checked the stored secrets: "
+                       "none is saved. Please create one.")):
         db.x("DELETE FROM messages WHERE direction='in'")
         db.post("in", said, chat=None, kind="user", provenance="web-session")
         problems, sent = _ask(p, ask, **_OWN_ACCESS)
@@ -5800,6 +5801,83 @@ def test_the_untried_host_gate_only_checks_access_asks_and_counts_refusals(env):
 
 
 
+def _gateway_cfg():
+    """A config holding a gateway (the chat provider's endpoint) that serves one model."""
+    return {"core_provider": "claude",
+            "providers": {"claude": {"tiers": {"standard": {"model": "opus"}, "light": {"model": "auto"}}},
+                          "chat": {"endpoint": "gw-a", "tiers": {"standard": {"model": "vendor/model-x"}}}}}
+
+
+def test_a_model_key_ask_is_refused_while_a_held_gateway_serves_the_model(env):
+    from ttp import coordinator as coord, unblock
+    cfg, access = _gateway_cfg(), {"blocking": "access"}
+    for text in ("Please provide an API key for model-x so the eval tasks can run.",
+                 "The eval needs vendor/model-x; please paste an API token for it.",
+                 "Need an API key for model-x; the gateway is probably down."):   # no checked route named
+        why = coord._held_route_ask(cfg, access, text)
+        assert "already holds a route" in why and "endpoint gw-a" in why and "model-x" in why, (text, why)
+    why = coord._held_route_ask(cfg, access, "Need an API key for opus to run the light tier.")
+    assert "the claude provider, tier standard serves opus" in why, why
+    # Placeholder models name no route; review, merge, funds and spend asks are never checked.
+    assert "already holds a route" not in coord._held_route_ask(cfg, access, "The auto API token expired.")
+    for blocking in ("review", "merge", "funds", "spend"):
+        assert coord._held_route_ask(cfg, {"blocking": blocking}, "API key for model-x?") == "", blocking
+    # Through the gate: refused, the route named, the refusal counted.
+    p = make(env)
+    p.set_config("providers.chat.tiers.standard.model", "vendor/model-x")
+    raw = p.raw_config()
+    raw.setdefault("providers", {}).setdefault("chat", {})["endpoint"] = "gw-a"
+    p.config_path.write_text(json.dumps(raw))
+    problems, ask = _ask(p, "Please provide an API key for model-x so the eval tasks can run.", blocking="access")
+    assert problems and "endpoint gw-a" in problems[0] and ask is None, problems
+    line = next(x for x in unblock.lines(p.db) if x.startswith("asks refused by the gate, 24 h"))
+    assert "held route 1" in line, line
+
+
+def test_a_model_key_ask_naming_its_checked_routes_and_results_is_sent(env):
+    from ttp import coordinator as coord
+    cfg, access = _gateway_cfg(), {"blocking": "access"}
+    # No held route serves the model: the routes checked and how each went must be named.
+    bare = "Please provide an API key for model-y."
+    assert "check the routes the project already holds" in coord._held_route_ask(cfg, access, bare)
+    for text in ("Please provide an API key for model-y. I checked the configured providers, the gateway gw-a "
+                 "and the stored secrets: none serves model-y.",
+                 "Need an API token for model-y: tried gateway gw-a (404, not served) and the other held "
+                 "machines (no key saved)."):
+        assert coord._held_route_ask(cfg, access, text) == "", text
+    # The held route itself failed, named with its result: a real ask.
+    failed = ("Need a new API key for model-x: tried endpoint gw-a, it returned 401 unauthorized; checked the "
+              "stored secrets: no other key is saved.")
+    assert coord._held_route_ask(cfg, access, failed) == ""
+    # The host and self-health gates no longer pass a model key ask on its credential words alone.
+    assert not coord._credential_checked("The API key for the inference endpoint is missing; add one?")
+    assert coord._credential_checked("Checked the stored secrets and the gateway: no API key for model-y is saved.")
+    assert coord._credential_checked("The ssh key for host-a is missing; please add one.")   # not a model's
+    assert coord._self_health_ask({"blocking": "human"}, "The worker died: its API token for the model "
+                                  "endpoint is missing. Restart it with a new one?")
+    p = make(env)
+    assert _ask(p, bare, blocking="access")[0]
+    problems, ask = _ask(p, "Please provide an API key for model-y. I checked the configured providers and "
+                            "the stored secrets: none serves model-y.", blocking="access")
+    assert problems == [] and ask is not None, problems
+
+
+def test_a_leaked_key_rotation_ask_is_sent_without_a_route_list(env):
+    from ttp import coordinator as coord
+    cfg = _gateway_cfg()
+    for text in ("The API key for model-x leaked in a public CI log; please rotate it.",
+                 "Please revoke the exposed gateway token for model-x and issue a new one.",
+                 "The model-x API key was compromised; regenerate it in the provider console."):
+        assert coord._held_route_ask(cfg, {"blocking": "access"}, text) == "", text
+        assert coord._credential_checked(text), text
+    # Another person's request is theirs to make.
+    assert coord._held_route_ask(cfg, {"blocking": "human"},
+                                 "Another team asked for an API key for model-y; create one?") == ""
+    p = make(env)
+    problems, ask = _ask(p, "The API key for model-x leaked in a public CI log; please rotate it.", blocking="access")
+    assert problems == [] and ask is not None, problems
+
+
 _OWNED_FIX_NOTIFIES = [
     ("I set an override on the queue limit after the outage. Keep or remove?", True),
     ("The watcher hung; I restarted it and it recovered. Should I keep the workaround?", True),
@@ -6013,7 +6091,7 @@ _REVERSIBLE_CASES = [
     ({"text": "Turn on the code_tasks_may_push setting?", **_I, "least_disruptive": _QUO}, None),
     ({"text": "Raise the daily limit to $40?", **_I, "least_disruptive": "stay at the current limit; the runs stop early each day"},
      None),
-    ({"text": "Extend the API token's expiry?", **_I, "least_disruptive": "use a fresh token instead; none is issued to this project"},
+    ({"text": "Extend the API token's expiry?", **_I, "least_disruptive": "use a fresh token instead; checked the stored secrets: none is issued to this project"},
      None),
     ({"text": "Raise the quota on your laptop's disk by hand?", **_I,
       "least_disruptive": "use the shared disk instead; it is too small for the cache"}, None),
@@ -6206,7 +6284,8 @@ _RESOLVE_FIRST_CASES = [
     # Sent: access naming a missing permission or credential, or a physical step.
     ({"text": "I need write permission on the shared results folder; can you grant it?", "blocking": "access"},
      None),
-    ({"text": "The API token expired; the nightly upload stops until a new one is set.", "blocking": "access"},
+    ({"text": "The API token expired; the nightly upload stops until a new one is set. Checked the stored "
+              "secrets and the gateway config: no other is saved.", "blocking": "access"},
      None),
     ({"text": "The card in the second slot needs reseating by hand before the sweep.", "blocking": "access"}, None),
     # Sent: a sign-in, key, device code, membership or reservation only the user holds.
@@ -6228,7 +6307,8 @@ _RESOLVE_FIRST_CASES = [
       "least_disruptive": "archive it first; the archive is too small for it"}, None),
     ({"text": "Post the release notes in the user's name on the public tracker?", **_RF_I,
       "least_disruptive": "keep them as a draft file; nobody sees them then"}, None),
-    ({"text": "The API token expired. Want me to give the go-ahead to use a new one?", "blocking": "access"}, None),
+    ({"text": "The API token expired and I checked the stored secrets: none is saved. Want me to give "
+              "the go-ahead to use a new one?", "blocking": "access"}, None),
     ({"text": "Copy the weights to the paid bucket for $40 a month?", "blocking": "access"}, None),
     ({"text": "Another team asked us to copy their dataset to our disk; shall I proceed?", "blocking": "access"},
      None),

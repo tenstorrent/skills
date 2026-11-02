@@ -2550,6 +2550,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why:
                     _count_refusal(db, key, why[0], text)
                     raise ValueError(f"ask_user rejected: {why[1]}")
+                why = _held_route_ask(cfg, a, text)
+                if why:
+                    _count_refusal(db, key, "held route", text)
+                    raise ValueError(f"ask_user rejected: {why}")
                 why = _self_health_ask(a, text, least)
                 if why:
                     _count_refusal(db, key, "self-health", text)
@@ -5145,12 +5149,12 @@ def _known_hosts(p: Project) -> dict[str, list[str]]:
 
 def _untried_host_ask(p: Project, a: dict, text: str) -> str:
     """Why an access ask about reaching a known host is the project's to try first, or "": it names
-    the host and says nothing about the routes tried and how each went. Exempt: a real credential,
-    another person's request."""
+    the host and says nothing about the routes tried and how each went. Exempt: a credential ask that
+    names the held routes it checked (_credential_checked), another person's request."""
     if a.get("blocking") != "access":
         return ""
     said = f"{text} {a.get('recommendation') or ''}".replace("’", "'")
-    if not _REACH_RE.search(said) or _CREDENTIAL_RE.search(said) or _OTHERS_ASK_RE.search(said):
+    if not _REACH_RE.search(said) or _credential_checked(said) or _OTHERS_ASK_RE.search(said):
         return ""
     if _TRIED_RE.search(said) and _RESULT_RE.search(said):
         return ""
@@ -5335,6 +5339,20 @@ _USER_ONLY_RE = re.compile(r"\b(?:physical(?:ly)?|on[- ]site|by hand|power butto
                            r"the user's (?:laptop|machine)|reverse tunnel)\b", re.I)
 _OTHERS_ASK_RE = re.compile(r"\b(?:another|other|a|an|the|their)\s+(?:team|person|people|reviewer|reporter|"
                             r"maintainer)s?\b(?:\s+\w+){0,2}?\s+(?:asked|requested)\b", re.I)
+# A credential ask passes only once it names the held routes it checked (providers, gateways or
+# endpoints, stored secrets, held machines) and how each went. Exempt: rotating or revoking a leaked key.
+_LEAKED_KEY_RE = re.compile(r"\b(?:rotat\w*|revok\w*|regenerat\w*|replac\w*|reissu\w*)\b(?:\W+\w+){0,12}?\W+"
+                            r"(?:leak\w*|expos\w*|compromis\w*)\b|\b(?:leak\w*|expos\w*|compromis\w*)\b"
+                            r"(?:\W+\w+){0,12}?\W+(?:rotat\w*|revok\w*|regenerat\w*|reissu\w*)\b", re.I)
+# What makes a credential ask one for a model or API service, which a held route may already serve.
+_MODEL_ASK_RE = re.compile(r"\b(?:api|apis|models?|llms?|inference|endpoints?|gateways?)\b", re.I)
+_CHECKED_RE = re.compile(r"\b(?:checked|tried|tested|probed|searched|looked)\b", re.I)
+_ROUTE_WORD_RE = re.compile(r"\b(?:providers?|gateways?|endpoints?|routes?|secrets?|vault|keychain|keyring|"
+                            r"machines?|hosts?|box(?:es)?|config)\b", re.I)
+_CRED_RESULT_RE = re.compile(r"\b(?:none|no (?:[\w-]+ ){0,2}?(?:key|token|route|access|such|endpoint|gateway|provider|"
+                             r"secret)s?|"
+                             r"not (?:found|listed|configured|saved|set|served)|missing|expired|revoked|"
+                             r"40[13]|unauthori[sz]ed|forbidden)\b", re.I)
 # The restriction or the irreversible step a self-health ask names in least_disruptive.
 _NAMES_LIMIT_RE = re.compile(
     r"\b(restrict\w*|rules?|charter|forbid\w*|bans?|banned|not allowed|never|breaks?|irreversibl\w*|"
@@ -5429,7 +5447,8 @@ def _project_refused_ask(p: Project, cfg: dict, a: dict, text: str, least: str) 
 
 def _self_health_ask(a: dict, text: str, least: str = "") -> str:
     """Why an ask about the project's own health (a dead worker, a disabled schedule, an auto power
-    cycle that is off) is the project's to fix, or "". Exempt: a real credential; under access or
+    cycle that is off) is the project's to fix, or "". Exempt: a credential ask that names the held
+    routes it checked (_credential_checked); under access or
     human, a step only the user can take or another person's request; under irreversible or
     restriction, least_disruptive naming the restriction or the irreversible step. Review, merge,
     funds and spend asks pass."""
@@ -5437,7 +5456,7 @@ def _self_health_ask(a: dict, text: str, least: str = "") -> str:
     if blocking not in ("human", "access", "irreversible", "restriction"):
         return ""
     said = f"{text} {a.get('recommendation') or ''}"
-    if _CREDENTIAL_RE.search(said):
+    if _credential_checked(said):
         return ""
     if blocking in ("human", "access") and (_USER_ONLY_RE.search(said) or _OTHERS_ASK_RE.search(said)):
         return ""
@@ -5451,6 +5470,80 @@ def _self_health_ask(a: dict, text: str, least: str = "") -> str:
             "<project>`. Ask only for a real missing credential, a step only the user can take (physical, on their "
             "machine) or another person's request, or when every fix breaks a restriction: blocking restriction "
             "(or irreversible), with least_disruptive naming the restriction or the irreversible step")
+
+
+def _credential_checked(said: str, cfg: dict | None = None) -> bool:
+    """True for a credential or sign-in ask the user alone can answer as worded: one for another credential
+    than a model or API service's (an ssh key, a tool's login), a leaked key to rotate or revoke, or one
+    that names the held routes it checked with a result ("checked the gateway and the stored secrets:
+    none serves it")."""
+    if not _CREDENTIAL_RE.search(said):
+        return False
+    return bool(not _model_ask(said, cfg) or _LEAKED_KEY_RE.search(said) or (
+        _CHECKED_RE.search(said) and _ROUTE_WORD_RE.search(said)
+        and (_RESULT_RE.search(said) or _CRED_RESULT_RE.search(said))))
+
+
+def _ask_words(said: str) -> set[str]:
+    return {w.lower().rstrip(".:-") for w in re.findall(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]*", said)}
+
+
+def _model_ask(said: str, cfg: dict | None = None) -> bool:
+    """True when the text is about a model or API service: it says so, or names a model a held route serves."""
+    words = _ask_words(said)
+    return bool(_MODEL_ASK_RE.search(said) or any({m.lower(), m.lower().rsplit("/", 1)[-1]} & words
+                                                  for _, m, _ in _held_model_routes(cfg or {})))
+
+
+def _held_model_routes(cfg: dict) -> list[tuple[str, str, set[str]]]:
+    """The routes the project's config holds to models: (route, model, names an ask can call the route
+    by) for each tier of the core provider and, when its endpoint is set, of the chat provider (a
+    gateway). Placeholder models ("", "auto", "default") name no model."""
+    provs = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
+    chat = provs.get("chat") if isinstance(provs.get("chat"), dict) else {}
+    held = [str(cfg.get("core_provider") or "")] + (["chat"] if str(chat.get("endpoint") or "") else [])
+    out = []
+    for name in held:
+        pc = provs.get(name) if isinstance(provs.get(name), dict) else {}
+        alias = str(pc.get("endpoint") or "") if name == "chat" else ""
+        models = {str((tc or {}).get("model") or ""): tier for tier, tc in sorted((pc.get("tiers") or {}).items())
+                  if isinstance(tc, dict)}
+        if name == "chat" and isinstance(pc.get("effort_fields"), dict):
+            models.update({str(m): "" for m in pc["effort_fields"] if str(m) not in models})
+        for model, tier in models.items():
+            if len(model) < 3 or model.lower() in ("auto", "default"):
+                continue
+            where = f"endpoint {alias} (providers.chat.endpoint)" if alias else f"the {name} provider"
+            route = f"{where}" + (f", tier {tier}" if tier else "")
+            out.append((route, model, {name.lower(), alias.lower()} - {""}))
+    return out
+
+
+def _held_route_ask(cfg: dict, a: dict, text: str) -> str:
+    """Why a credential or sign-in ask is the project's to answer from routes it holds, or "". Model-free:
+    refused when a held route (_held_model_routes) serves a model the ask names and the ask does not
+    name that route with a result; else, for a model or API service (_model_ask), refused unless it
+    names the held routes it checked and how each went. Exempt: rotating or revoking a leaked key,
+    another person's request, and review, merge, funds and spend asks."""
+    if a.get("blocking") not in ("human", "access", "irreversible", "restriction"):
+        return ""
+    said = f"{text} {a.get('recommendation') or ''} {a.get('least_disruptive') or ''}".replace("\u2019", "'")
+    if not _CREDENTIAL_RE.search(said) or _LEAKED_KEY_RE.search(said) or _OTHERS_ASK_RE.search(said):
+        return ""
+    words = _ask_words(said)
+    tried = bool(_RESULT_RE.search(said) or _CRED_RESULT_RE.search(said))
+    serving = [(route, model) for route, model, names in _held_model_routes(cfg)
+               if {model.lower(), model.lower().rsplit("/", 1)[-1]} & words and not (tried and names & words)]
+    if serving:
+        where = "; ".join(f"{route} serves {model}" for route, model in serving)
+        return (f"the project already holds a route to that model: {where}. Run the work through it from a "
+                "task. Ask only if that route fails, naming it and its result")
+    if _credential_checked(said, cfg):
+        return ""
+    return ("check the routes the project already holds before asking for a credential or sign-in: the "
+            "configured providers and gateways (`ttp config`), the stored secrets (`ttp secret show`) and the "
+            "other machines it holds. Ask only if none serves it, naming each route checked and its result; "
+            "rotating a leaked key needs no such list")
 
 
 # A reset, reboot, power cycle or restart of a machine or resource the project holds, which the ask itself
