@@ -20,6 +20,7 @@ owner-only file, never run.json. `command`, `args` and `url` go in as written, s
 `command`, `args` or `url` names a variable is not given (its value would be on the command line). Codex runs stdio and streamable HTTP servers only (no `sse`)."""
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import re
@@ -79,9 +80,10 @@ def project_servers(dirs: list[str]) -> dict:
 
 def user_server_names(config_toml: str) -> list[str]:
     """The MCP servers a Codex config.toml defines: its `[mcp_servers.<name>]` tables and the keys
-    of a `[mcp_servers]` table (tomllib where Python has it, 3.11+)."""
+    of a `[mcp_servers]` table (tomllib where Python has it, 3.11+; loaded by name, since the runtime
+    supports 3.9)."""
     try:
-        import tomllib
+        tomllib = importlib.import_module("tomllib")
         got = tomllib.loads(config_toml).get("mcp_servers")
         return [n for n, v in got.items() if isinstance(v, dict)] if isinstance(got, dict) else []
     except ImportError:
