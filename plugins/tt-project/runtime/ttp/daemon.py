@@ -6218,7 +6218,9 @@ class Daemon:
         provider is free, and that has not started unstarted.READY_S after it became ready (READY_P1_S
         for priority 1 or urgent), raises one event naming what holds it (_hold_words; with no hold
         recorded, its blocked_reason). Ready since its records say (unstarted.ready_since) the first time
-        it is seen, from the check that saw it free of those holds again after one. One per stay in the
+        it is seen, from the check that saw it free of those holds again after one, and never before the
+        previous check when that check did not find it ready (it re-entered the queue since: a review the
+        push queue sent back, a wait whose probe passed, a requeue). One per stay in the
         queue (keyed on its last run), retired once it starts or such a hold takes it. A task with a
         queued announced_not_started or slot_wait event for the same wait is left to that one; a review
         held for its own pre-review checks is a checks wait. Observation only: dispatch never reads it."""
@@ -6228,7 +6230,7 @@ class Daemon:
             return
         self._unstarted_checked = now
         if self.cfg_status == "unavailable" or self.settling() or now - last > STALL_GAP_S:
-            self._unstarted_seen, self._unstarted_held = {}, set()
+            self._unstarted_seen, self._unstarted_held, self._unstarted_ready = {}, set(), None
             return
         db = self.p.db
         paused = db.paused_resources()
@@ -6243,7 +6245,8 @@ class Daemon:
         ctx = {"now": now, "paused": paused, "busy": busy, "committed": None,
                "logged_out": {prov: self._logged_out(prov) for prov in {t["provider"] or core for t in ready}}}
         seen, held_before = getattr(self, "_unstarted_seen", {}), getattr(self, "_unstarted_held", set())
-        self._unstarted_seen, self._unstarted_held = {}, set()
+        was_ready = getattr(self, "_unstarted_ready", None)   # the previous check's ready ids; None: no such check
+        self._unstarted_seen, self._unstarted_held, self._unstarted_ready = {}, set(), {t["id"] for t in ready}
         for t in ready:
             tid, prov = t["id"], t["provider"] or core
             why = self._start_hold(t, prov, ctx)
@@ -6257,6 +6260,8 @@ class Daemon:
                 obligations._retire(db, now, f"held: {why or 'no free slot'}", fp)
                 continue
             since = seen.get(tid) or (now if tid in held_before else unstarted.ready_since(db, t))
+            if was_ready is not None and tid not in was_ready:
+                since = max(since, last)
             self._unstarted_seen[tid] = since
             prio = 1 if urgent.is_urgent(t) else t["priority"]
             if now - since < unstarted.threshold(prio, unstarted.READY_P1_S, unstarted.READY_S) \

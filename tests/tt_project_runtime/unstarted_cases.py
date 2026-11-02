@@ -65,6 +65,62 @@ def test_ready_not_started_leaves_out_paused_resources_and_full_slots(env, monke
     assert check(start + 1800) == [], "every slot taken: worker_slots' lane, not this check"
 
 
+def _sent_back_review(p, start):
+    """A p1 review whose run ended at `start` and whose approved head then waited in the push queue."""
+    tid = p.db.add_task("review a change", "s", kind="review", tier="standard", origin="coordinator", priority=1)
+    p.db.x("UPDATE tasks SET created=?, status='pushing' WHERE id=?", (start - 600, tid))
+    p.db.x("INSERT INTO runs(task, role, provider, started, ended, status) VALUES(?,?,?,?,?,?)",
+           (tid, "reviewer", "claude", start - 300, start, "ok"))
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated) VALUES(?,?,?,?,?,?,?)",
+           (tid, "work-branch", "abc123", "push-branch", "approved", start, start))
+    return tid
+
+
+def _send_back(p, tid, at, monkeypatch):
+    """The push queue sends the head back with a conflict at `at` (pushq._requeue, as _settle does)."""
+    from ttp import pushq
+    monkeypatch.setattr(time, "time", lambda: at)
+    p.db.x("UPDATE push_queue SET status='conflict', updated=? WHERE task=?", (at, tid))
+    pushq._requeue(p.db, p.db.task(tid), "push conflict: work-branch conflicts with push-branch")
+
+
+def test_ready_not_started_counts_a_review_the_push_queue_sent_back_from_its_requeue(env, monkeypatch):
+    """Hours in 'pushing' are no wait for a worker: a review sent back by the push queue is ready from
+    then, not from its last run's end, while the daemon runs and after a restart alike."""
+    p, d, check = _ready_setup(env, monkeypatch)
+    start = time.time()
+    tid = _sent_back_review(p, start)
+    assert check(start + 60) == []
+    assert check(start + 10200) == [], "it waits in the push queue: not ready"
+    _send_back(p, tid, start + 10230, monkeypatch)
+    assert p.db.task(tid)["status"] == "queued"
+    assert check(start + 10240) == [], "sent back 10 s ago: its next tick starts it"
+    got = check(start + 10380)
+    assert [e["task"] for e in got] == [tid] and "ready 2 min" in got[0]["text"]
+
+    p.db.x("DELETE FROM events")   # a daemon restart: no earlier check, only the records
+    other = _sent_back_review(p, start)
+    _send_back(p, other, start + 10230, monkeypatch)
+    d._unstarted_seen, d._unstarted_held, d._unstarted_ready = {}, set(), None
+    assert check(start + 10240) == [], "the push queue's record says both came back 10 s ago"
+    assert [e["task"] for e in check(start + 10380)] == [tid, other]
+
+
+def test_ready_not_started_counts_a_task_back_in_the_queue_from_the_check_that_missed_it(env, monkeypatch):
+    """A task back in the queue with no record of when (a wait whose probe passed, a requeue) counts from
+    the previous check that did not find it ready, not from its last run's end."""
+    p, d, check = _ready_setup(env, monkeypatch)
+    start = time.time()
+    tid = p.db.add_task("waits on a probe", "s", kind="work", tier="light", origin="coordinator", priority=1)
+    p.db.x("UPDATE tasks SET created=?, status='waiting' WHERE id=?", (start - 600, tid))
+    p.db.x("INSERT INTO runs(task, role, provider, started, ended, status) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "claude", start - 300, start, "ok"))
+    assert check(start + 7200) == []
+    p.db.x("UPDATE tasks SET status='queued' WHERE id=?", (tid,))
+    assert check(start + 7260) == [], "back for at most a minute"
+    assert [e["task"] for e in check(start + 7380)] == [tid]
+
+
 def test_check_slot_wait_skips_a_task_the_ready_check_already_raised(env, monkeypatch):
     """Both checks watch an urgent task with a free slot: one event, whichever raised first."""
     p, d, check = _ready_setup(env, monkeypatch)

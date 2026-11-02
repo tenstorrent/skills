@@ -202,10 +202,13 @@ def announced(p, now: float | None = None, paused: dict | None = None) -> list[s
 
 
 def ready_since(db, task: dict) -> float:
-    """When a queued task became ready by its records: made, its last run ended, its start_after came, or
-    its last dependency was done, whichever is latest."""
+    """When a queued task became ready by its records: made, its last run ended, its start_after came, its
+    last dependency was done, or the push queue last moved its approved head (a review sent back to
+    the queue: its time in 'pushing' was no wait for a worker), whichever is latest."""
     ended = db.one("SELECT MAX(ended) e FROM runs WHERE task=?", (task["id"],))
-    at = max(float(task["created"] or 0), float((ended or {}).get("e") or 0), float(task["not_before"] or 0))
+    pushed = db.one("SELECT MAX(updated) u FROM push_queue WHERE task=?", (task["id"],))
+    at = max(float(task["created"] or 0), float((ended or {}).get("e") or 0), float(task["not_before"] or 0),
+             float((pushed or {}).get("u") or 0))
     deps = dependency_ids(task)
     if deps:
         row = db.one(f"SELECT MAX(updated) u FROM tasks WHERE id IN ({','.join('?' * len(deps))})", deps)
