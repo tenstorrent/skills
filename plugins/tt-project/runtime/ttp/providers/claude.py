@@ -442,6 +442,9 @@ class Claude(Provider):
                 u.output_tokens = int(usage.get("output_tokens") or 0)
                 u.cache_read_tokens = int(usage.get("cache_read_input_tokens") or 0)
                 u.cache_write_tokens = int(usage.get("cache_creation_input_tokens") or 0)
+                thinking = (usage.get("output_tokens_details") or {}).get("thinking_tokens")
+                if isinstance(thinking, int) and not isinstance(thinking, bool):
+                    u.extra["thinking_tokens"] = thinking   # part of output_tokens (effortab.report)
                 u.final_text = ev.get("result") if isinstance(ev.get("result"), str) else json.dumps(ev.get("result"))
                 u.structured = drop_nulls(ev.get("structured_output"))
                 if ev.get("is_error"):

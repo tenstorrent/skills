@@ -321,8 +321,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # (see jevuse.py).
     "jev": {"enabled": "auto", "window_days": 7, "min_calls": 30, "idle_calls": 20, "uses": {}},
     # Effort A/B (effortab.py): enabled puts each standard-tier code task in a high or medium effort arm
-    # by its lineage's root id; jev_pick lets Jev choose medium or high from the spec. Both off by default.
-    "effort_ab": {"enabled": False, "jev_pick": False},
+    # by its lineage's root id (on by default; the end rule turns it off once it records a winner);
+    # jev_pick lets Jev choose medium or high from the spec (off by default).
+    "effort_ab": {"enabled": True, "jev_pick": False},
     "web": {"bind": "127.0.0.1", "port": 0},
     "power": {},                        # keep_awake: replaced by runner.prevent_idle_sleep; "off" still turns it off
     # Disk guard: with free space under the project folder below the smaller of min_free_pct of the

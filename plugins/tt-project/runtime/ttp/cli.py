@@ -1675,6 +1675,7 @@ def cmd_stats(a) -> None:
         from . import effortab
         tz = timefmt.home(p)
         s = effortab.report(p, a.days, _stats_time(a.since, tz, "--since"), _stats_time(a.until, tz, "--until"))
+        s["winner"] = effortab.winner(p.config())
         print(json.dumps(s, indent=1) if a.json else effortab.report_text(s))
         return
     if a.tools:

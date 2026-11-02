@@ -19,15 +19,18 @@ def _ab_task(p, arm, **kw):
             return tid
 
 
-def test_effort_ab_is_off_by_default_stable_per_lineage_and_skips_pinned_or_other_tasks(env):
+def test_effort_ab_is_on_by_default_stable_per_lineage_and_skips_pinned_or_other_tasks(env):
     from ttp import coordinator as coord, effortab
     from ttp.project import DEFAULT_CONFIG
     p = make(env)
-    assert DEFAULT_CONFIG["effort_ab"] == {"enabled": False, "jev_pick": False}
+    assert DEFAULT_CONFIG["effort_ab"] == {"enabled": True, "jev_pick": False}
     assert coord.settable("effort_ab.enabled")("on") is True and coord.settable("effort_ab.enabled")("off") is False
     assert coord.settable("effort_ab.jev_pick")("true") is True
     med, hi = _ab_task(p, "medium"), _ab_task(p, "high")
-    assert effortab.assign(p.db, p.config(), p.db.task(med), "standard", "claude") is None   # off by default
+    # A fresh project puts its standard code tasks in arms with no opt-in.
+    assert effortab.enabled(p.config())
+    assert effortab.assign(p.db, p.config(), p.db.task(med), "standard", "claude") == \
+        {"arm": "medium", "root": med, "effort": "medium"}
     cfg = _ab_on(p)
     # Stable: a hash of the root id, never Python's salted hash(), so every process agrees.
     assert [effortab.arm_of(i) for i in range(1, 9)] == [effortab.arm_of(i) for i in range(1, 9)]
@@ -220,7 +223,8 @@ def test_jev_effort_pick_is_off_by_default_picks_once_per_lineage_and_logs_the_p
     t = p.db.add_task("Rename a flag", "Rename --foo to --bar.", kind="code", tier="standard",
                       origin="coordinator", provider="claude")
     jev = _EffortJev(0.2)
-    assert effortab.assign(p.db, cfg, p.db.task(t), "standard", "claude", jev) is None and jev.calls == 0
+    # Off by default: the A/B (on by default) gives the arm, and Jev is never asked.
+    assert "arm" in effortab.assign(p.db, cfg, p.db.task(t), "standard", "claude", jev) and jev.calls == 0
     cfg["effort_ab"] = {"enabled": False, "jev_pick": True}
     got = effortab.assign(p.db, cfg, p.db.task(t), "standard", "claude", jev)
     assert got == {"by": "jev", "pick": "medium", "score": 0.2, "jev_call": got["jev_call"], "root": t,
@@ -249,3 +253,130 @@ def test_jev_effort_pick_is_off_by_default_picks_once_per_lineage_and_logs_the_p
     cfg["effort_ab"]["enabled"] = True
     jev.calls = 0
     assert "arm" in effortab.assign(p.db, cfg, p.db.task(other), "standard", "claude", jev) and jev.calls == 0
+
+
+def test_an_explicit_effort_ab_false_is_kept_over_the_on_default(env):
+    from ttp import effortab
+    p = make(env)
+    p.set_config("effort_ab.enabled", False)
+    cfg = p.config()
+    assert cfg["effort_ab"]["enabled"] is False and not effortab.enabled(cfg)
+    t = _ab_task(p, "medium")
+    assert effortab.assign(p.db, cfg, p.db.task(t), "standard", "claude") is None
+    # Off also for the strings chat and hand edits save; the end rule never runs on it.
+    for off in ("false", "off", "0", "no"):
+        p.set_config("effort_ab.enabled", off)
+        assert not effortab.enabled(p.config())
+        assert effortab.conclude(p, p.config()) is None
+    assert "winner" not in p.raw_config()["effort_ab"]
+
+
+def _landed_lineages(p, arm, n, checks_ok):
+    """`n` landed lineages in `arm`, each with one run whose checks passed (checks_ok of them) or failed."""
+    now = time.time()
+    for i in range(n):
+        t = _ab_task(p, arm)
+        _ab_run(p, t, arm, t, 1.0 if arm == "medium" else 2.0, 1000, checks=i < checks_ok)
+        p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated,pushed_sha) "
+               "VALUES(?,'b','h','t','pushed',?,?,'abc')", (t, now, now))
+
+
+def test_effort_ab_end_rule_stops_the_split_and_records_the_winner(env, capsys):
+    from ttp import cli, effortab
+    p = make(env)
+    _landed_lineages(p, "high", effortab.END_MIN_LANDED, effortab.END_MIN_LANDED)
+    _landed_lineages(p, "medium", effortab.END_MIN_LANDED - 1, effortab.END_MIN_LANDED - 1)
+    assert effortab.conclude(p, p.config()) is None   # one landed change short: still collecting
+    assert effortab.enabled(p.config()) and effortab.winner(p.config()) is None
+    _landed_lineages(p, "medium", 1, 1)
+    now = time.time()
+    assert effortab.conclude(p, p.config(), now) == "medium"
+    cfg = p.config()
+    assert (cfg["effort_ab"]["enabled"], cfg["effort_ab"]["winner"], cfg["effort_ab"]["decided_at"]) == \
+        (False, "medium", now)
+    assert effortab.conclude(p, cfg) is None   # the split is off: nothing more to decide
+    # The winner runs every task the A/B covered at medium, whatever its hash; a deep retry keeps max,
+    # a pinned task its pin, and the report leaves it out of the arms.
+    hi = _ab_task(p, "high")
+    got = effortab.assign(p.db, cfg, p.db.task(hi), "standard", "claude")
+    assert got == {"by": "winner", "root": hi, "effort": "medium"}
+    assert effortab.assign(p.db, cfg, p.db.task(hi), "deep", "claude")["effort"] == "max"
+    assert effortab.assign(p.db, cfg, p.db.task(_ab_task(p, "high", effort="high")), "standard", "claude") is None
+    # Jev's pick, switched on after the A/B, wins over the recorded winner.
+    assert effortab.assign(p.db, {**cfg, "effort_ab": {**cfg["effort_ab"], "jev_pick": True}},
+                           p.db.task(hi), "standard", "claude", None)["by"] == "tier"
+    cli.main(["stats", "demo", "--effort-ab", "--days", "30"])
+    assert "decided: medium is this project's standard effort" in capsys.readouterr().out
+    # Switched on again, the A/B counts only runs after the decision: no instant re-decision.
+    p.set_config("effort_ab.enabled", True)
+    assert effortab.conclude(p, p.config()) is None and effortab.enabled(p.config())
+
+
+def test_effort_ab_end_rule_keeps_high_when_medium_fails_checks_more(env):
+    from ttp import effortab
+    p = make(env)
+    n = effortab.END_MIN_LANDED
+    _landed_lineages(p, "high", n, n)
+    _landed_lineages(p, "medium", n, n - 3)   # 5 points worse on checks
+    assert effortab.conclude(p, p.config()) == "high"
+    cfg = p.config()
+    assert (cfg["effort_ab"]["enabled"], effortab.winner(cfg)) == (False, "high")
+    # A high winner keeps the tier's effort: no entry, no change.
+    assert effortab.assign(p.db, cfg, p.db.task(_ab_task(p, "medium")), "standard", "claude") is None
+
+
+def test_the_daemon_applies_the_effort_ab_end_rule_once_and_says_so(env, monkeypatch):
+    from ttp import effortab
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    alerts = []
+    monkeypatch.setattr(d, "alert", lambda key, text, **k: alerts.append((key, text)))
+    monkeypatch.setattr(effortab, "verdict", lambda arms: "medium")
+    d.end_effort_ab()
+    assert d.cfg["effort_ab"]["winner"] == "medium" and d.cfg["effort_ab"]["enabled"] is False
+    assert [k for k, _ in alerts] == ["effort-ab-decided"] and "medium effort" in alerts[0][1]
+    d._effort_ab_checked = 0.0
+    d.end_effort_ab()   # already decided: no second alert
+    assert len(alerts) == 1
+
+
+def test_effort_ab_report_shows_thinking_tokens_per_arm_or_na(env, capsys):
+    from ttp import cli, effortab
+    p = make(env)
+    med, hi = _ab_task(p, "medium"), _ab_task(p, "high")
+    for task, arm, thinking in ((med, "medium", 4000), (med, "medium", None), (med, "medium", 1500)):
+        rid = _ab_run(p, task, arm, task, 1.0, 9000)
+        if thinking is not None:
+            note = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])
+            p.db.x("UPDATE runs SET note=? WHERE id=?", (json.dumps({**note, "thinking_tokens": thinking}), rid))
+    _ab_run(p, hi, "high", hi, 2.0, 9000)   # its provider gives no thinking tokens
+    r = effortab.report(p, days=30)
+    assert (r["arms"]["medium"]["thinking_tokens"], r["arms"]["medium"]["thinking_runs"]) == (5500, 2)
+    assert (r["arms"]["high"]["thinking_tokens"], r["arms"]["high"]["thinking_runs"]) == (None, 0)
+    cli.main(["stats", "demo", "--effort-ab", "--days", "30"])
+    out = capsys.readouterr().out
+    med_line = next(ln for ln in out.splitlines() if ln.strip().startswith("medium"))
+    hi_line = next(ln for ln in out.splitlines() if ln.strip().startswith("high"))
+    assert "5500 thinking tokens (2 of 3 runs report them)" in med_line and "/landed change" in med_line
+    assert "thinking tokens n/a" in hi_line
+
+
+def test_providers_put_the_result_usage_thinking_tokens_in_the_run_note(env, tmp_path):
+    from ttp.providers import get_provider
+    out = tmp_path / "claude.jsonl"
+    result = {"type": "result", "subtype": "success", "total_cost_usd": 1.0, "result": "ok",
+              "usage": {"input_tokens": 10, "output_tokens": 900, "output_tokens_details": {"thinking_tokens": 700}}}
+    out.write_text(json.dumps(result) + "\n")
+    assert get_provider("claude").parse(out).extra["thinking_tokens"] == 700
+    del result["usage"]["output_tokens_details"]
+    out.write_text(json.dumps(result) + "\n")
+    assert "thinking_tokens" not in get_provider("claude").parse(out).extra   # none given: n/a, never 0
+    cx = tmp_path / "codex.jsonl"
+    turn = {"type": "turn.completed", "usage": {"input_tokens": 50, "cached_input_tokens": 0, "output_tokens": 300,
+                                                "reasoning_output_tokens": 200}}
+    cx.write_text(json.dumps(turn) + "\n" + json.dumps(turn) + "\n")
+    assert get_provider("codex").parse(cx).extra["thinking_tokens"] == 400
+    del turn["usage"]["reasoning_output_tokens"]
+    cx.write_text(json.dumps(turn) + "\n")
+    assert "thinking_tokens" not in get_provider("codex").parse(cx).extra

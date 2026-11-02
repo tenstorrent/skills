@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Effort A/B for standard-tier code tasks, and Jev's pick of a code task's effort level.
 
-With `effort_ab.enabled` on (off by default; chat-settable), each code task queued at standard with no
+With `effort_ab.enabled` on (on by default; an explicit false keeps it off; chat-settable), each code task queued at standard with no
 effort pin of its own goes in one of two arms, picked by a hash of its lineage's root task id
 (chaincap.chain): `high` keeps the tier's effort, `medium` runs at medium effort. Its retries, review
 fixes and continuations share the root, so they keep its arm. The arm changes only a standard-tier run
@@ -15,7 +15,11 @@ leaves out every lineage with such a run, and a lifted Jev pick is settled as no
 `report` compares the arms per lineage (one change): cost per landed change, output tokens and model
 calls per run, review and checks fail rates, fix-review hops and tier-up retries. End rule (END_*):
 make medium the default only once each arm has at least END_MIN_LANDED landed changes and medium's
-review and checks fail rates are each no more than END_MAX_WORSE_PTS points above high's.
+review and checks fail rates are each no more than END_MAX_WORSE_PTS points above high's. `conclude`
+applies it: once the rule decides, it records the winner (`effort_ab.winner`, `decided_at`) and turns
+the split off; a `medium` winner then runs every task the A/B would have covered at medium effort
+(`{"by": "winner"}` in the run note). Thinking tokens per arm come from the run note's
+`thinking_tokens`, which the providers fill from the result usage when it breaks them out.
 
 With `effort_ab.jev_pick` on (off until the A/B result is in), a standard-tier code task outside the
 A/B has Jev score its spec once (its lineage keeps the pick): medium or high, else the tier's effort
@@ -52,6 +56,12 @@ def enabled(cfg: dict) -> bool:
 
 def jev_pick_on(cfg: dict) -> bool:
     return _on(cfg, "jev_pick")
+
+
+def winner(cfg: dict) -> str | None:
+    """The effort the end rule picked for this project (conclude), or None while none was picked."""
+    w = (cfg.get(KEY) or {}).get("winner")
+    return w if w in ARMS else None
 
 
 def _root(db: DB, task: dict) -> dict:
@@ -128,7 +138,7 @@ def assign(db: DB, cfg: dict, task: dict, tier: str, provider: str, jev=None) ->
     """The run note's `effort_ab` entry for this start of `task` at `tier` on `provider`, or None:
     {"arm", "root", "effort"} in the A/B, {"by": "jev", "pick", "effort", ...} from Jev's pick.
     `effort` is what the run takes (start_run applies it; never over a task's own pin)."""
-    if not (enabled(cfg) or jev_pick_on(cfg)):
+    if not (enabled(cfg) or jev_pick_on(cfg) or winner(cfg) == TEST):
         return None
     root = eligible(db, task)
     if root is None:
@@ -138,6 +148,8 @@ def assign(db: DB, cfg: dict, task: dict, tier: str, provider: str, jev=None) ->
     if enabled(cfg):
         arm = arm_of(root["id"])
         return {"arm": arm, "root": root["id"], "effort": _ran_effort(tier, tier_effort, arm)}
+    if not jev_pick_on(cfg):   # the A/B's winner: medium (a high winner keeps the tier's effort)
+        return {"by": "winner", "root": root["id"], "effort": _ran_effort(tier, tier_effort, TEST)}
     ids = [x["id"] for x in chaincap.chain(db, task["id"])] if task.get("id") else []
     got = _earlier_pick(db, ids)
     if got is None:
@@ -180,7 +192,8 @@ def report(p, days: float = 30, since: float | None = None, until: float | None 
     rows = db.q("SELECT r.id, r.task, r.cost_usd, r.output_tokens, r.note, t.labels, t.title, t.tier_source "
                 "FROM runs r JOIN tasks t ON t.id=r.task WHERE r.role='worker' AND r.status!='running' "
                 "AND r.started>=? AND r.started<? AND r.note LIKE ? ORDER BY r.id", (since, until, f'%"{KEY}"%'))
-    arms: dict[str, dict] = {a: {"changes": set(), "tasks": set(), "runs": 0, "usd": 0.0, "output": 0, "calls": [],
+    arms: dict[str, dict] = {a: {"changes": set(), "tasks": set(), "runs": 0, "usd": 0.0, "output": 0, "thinking": 0,
+                                 "thinking_runs": 0, "calls": [],
                                  "checks": 0, "checks_failed": 0, "tier_ups": 0, "fix_hops": set()} for a in ARMS}
     notes = [(r, load_result(r["note"])) for r in rows]
     lifted = {int((n.get(KEY) or {}).get("root") or r["task"]) for r, n in notes
@@ -195,6 +208,10 @@ def report(p, days: float = 30, since: float | None = None, until: float | None 
         a["runs"] += 1
         a["usd"] += float(r["cost_usd"] or 0)
         a["output"] += int(r["output_tokens"] or 0)
+        thinking = note.get("thinking_tokens")
+        if isinstance(thinking, int) and not isinstance(thinking, bool) and thinking >= 0:
+            a["thinking"] += thinking
+            a["thinking_runs"] += 1
         calls = (note.get("cache_telemetry") or {}).get("calls")
         if isinstance(calls, int) and calls > 0:
             a["calls"].append(calls)
@@ -221,6 +238,8 @@ def report(p, days: float = 30, since: float | None = None, until: float | None 
             "changes": len(a["changes"]), "landed": landed_n, "runs": n, "usd": round(a["usd"], 2),
             "usd_per_landed": round(a["usd"] / landed_n, 2) if landed_n else None,
             "output_per_run": round(a["output"] / n) if n else None,
+            # None: no run of the arm had a provider that breaks thinking tokens out of its output
+            "thinking_tokens": a["thinking"] if a["thinking_runs"] else None, "thinking_runs": a["thinking_runs"],
             "calls_per_run": round(sum(a["calls"]) / len(a["calls"]), 1) if a["calls"] else None,
             "reviews": len(rv), "review_fail_pct": _rate(sum(o in FAILED_REVIEWS for o in rv), len(rv)),
             "checks": a["checks"], "checks_fail_pct": _rate(a["checks_failed"], a["checks"]),
@@ -249,7 +268,10 @@ def report_text(r: dict) -> str:
         a = r["arms"][name]
         lines.append(f"  {name:<6} {a['changes']} changes, {a['landed']} landed, {a['runs']} runs, ${a['usd']:.2f}; "
                      f"${f(a['usd_per_landed'])}/landed change, {f(a['output_per_run'])} output tokens/run, "
-                     f"{f(a['calls_per_run'])} calls/run; review fail {f(a['review_fail_pct'], '%')} of {a['reviews']}, "
+                     f"{f(a['calls_per_run'])} calls/run, " + (
+                         f"{a['thinking_tokens']} thinking tokens ({a['thinking_runs']} of {a['runs']} runs report them)"
+                         if a["thinking_tokens"] is not None else "thinking tokens n/a") + "; " +
+                     f"review fail {f(a['review_fail_pct'], '%')} of {a['reviews']}, "
                      f"checks fail {f(a['checks_fail_pct'], '%')} of {a['checks']}; {a['fix_hops']} fix-review hops "
                      f"({f(a['fix_hops_per_change'])}/change), {a['tier_ups']} tier-up retries")
     v = r["verdict"]
@@ -257,4 +279,23 @@ def report_text(r: dict) -> str:
                  f"within {END_MAX_WORSE_PTS:g} points): " +
                  {"collecting": "still collecting", TEST: "medium holds: make medium the standard effort",
                   CONTROL: "medium fails more: keep high"}[v])
+    if r.get("winner"):
+        lines.append(f"  decided: {r['winner']} is this project's standard effort for code tasks; the split is off")
     return "\n".join(lines)
+
+
+def conclude(p, cfg: dict, now: float | None = None) -> str | None:
+    """Apply the end rule while the A/B runs: once it decides, record the winner (effort_ab.winner,
+    decided_at) and turn the split off. Returns the winner it recorded, else None. Counts runs since an
+    earlier decision only, so an A/B switched on again starts from nothing."""
+    if not enabled(cfg):
+        return None
+    now = time.time() if now is None else now
+    since = float((cfg.get(KEY) or {}).get("decided_at") or 0)
+    got = verdict(report(p, since=since, until=now)["arms"])
+    if got == "collecting":
+        return None
+    p.set_config(f"{KEY}.winner", got)
+    p.set_config(f"{KEY}.decided_at", now)
+    p.set_config(f"{KEY}.enabled", False)
+    return got
