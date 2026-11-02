@@ -143,3 +143,90 @@ def test_task_every_h_reads_the_setting_with_a_6h_default():
     assert release.task_every_s({}) == 6 * 3600
     assert release.task_every_s({"upgrade": {"task_every_h": 2}}) == 2 * 3600
     assert release.task_every_s({"upgrade": {"task_every_h": "x"}}) == 6 * 3600
+
+
+_PUSH_LAST = "from . import batch, cli, pushpass, verdictcarry  # noqa: E402\n"
+_PUSH_LOCAL = "\n# this project's own imports\nfrom . import release as _local_release  # noqa: E402\n"
+
+
+def _push_py_upgrade(env, monkeypatch, marked):
+    """A harness whose push.py ends with upstream's import list, followed by the marker line (`marked`)
+    or, as releases before it shipped, by nothing; the project then adds its own import block at the
+    file end; the next release changes upstream's last import line (and, unmarked before, adds the
+    marker). Returns the project, cli and the restarts list."""
+    from ttp import cli, service
+    p = make(env)
+    restarts = []
+    monkeypatch.setattr(service, "restart", lambda p: restarts.append(1) or "restarted")
+    lib = env["home"] / "lib" / "current" / "runtime" / "ttp" / "push.py"
+    _install_template(env)
+    shipped = lib.read_text()
+    assert shipped.endswith(_PUSH_LAST + "\n" + cli.LOCAL_IMPORTS + "\n")
+    if not marked:
+        lib.write_text(shipped[:-len("\n" + cli.LOCAL_IMPORTS + "\n")])
+        cli.main(["upgrade", "demo"])
+    f = p.harness / "runtime" / "ttp" / "push.py"
+    assert f.read_text() == lib.read_text()
+    f.write_text(f.read_text() + _PUSH_LOCAL)
+    _git_out(p.harness, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "local import")
+    _install_template(env)
+    lib.write_text(shipped.replace(_PUSH_LAST, _PUSH_LAST.replace("verdictcarry", "verdictcarry, timefmt")))
+    _next_release(env)
+    restarts.clear()
+    return p, cli, restarts
+
+
+@pytest.mark.parametrize("marked", [True, False])
+def test_a_project_import_block_at_the_end_survives_upstream_changing_its_last_import_line(
+        env, monkeypatch, capsys, marked):
+    """Upstream's push.py ends with its `from . import ...` list; a project's block of its own imports at
+    the file end conflicted with every release that changed that list. After the marker line the merge
+    is clean; a block still right after the list (before the marker shipped) is moved after the marker
+    by the upgrade itself. Either way both import lists stay, with no model task."""
+    p, cli, restarts = _push_py_upgrade(env, monkeypatch, marked)
+    capsys.readouterr()
+    cli.main(["upgrade", "demo", "--auto"])
+    out = capsys.readouterr().out
+    text = (p.harness / "runtime" / "ttp" / "push.py").read_text()
+    new = _PUSH_LAST.replace("verdictcarry", "verdictcarry, timefmt")
+    assert text.endswith(new + "\n" + cli.LOCAL_IMPORTS + "\n" + (_PUSH_LOCAL if marked else _PUSH_LOCAL.lstrip("\n"))), text[-400:]
+    assert "<<<<<<<" not in text and text.count("from . import release as _local_release") == 1
+    assert ("kept this project's own imports" in out) is not marked, out
+    assert restarts == [1] and _harness_tasks(p) == [] and not _git_out(p.harness, "status", "--porcelain")
+
+
+@pytest.mark.parametrize("tail, settles", [
+    ("\nfrom . import release  # noqa\nimport os\n", True),
+    ("\n# comment only\n", False),
+    ("\nfrom . import release  # noqa\nX = 1\n", False),
+    ("\nif True:\n    from . import release\n", False),
+    ("\nfrom . import (\n    release,\n)\n", True),
+])
+def test_keep_local_imports_takes_only_a_tail_of_imports(tail, settles):
+    """The upgrade moves a project's trailing block only when it holds nothing but imports and comments,
+    and never when the project also changed a line upstream changed (that needs judgment)."""
+    from ttp import cli
+    base = "x = 1\nfrom . import a, b  # noqa\n"
+    theirs = "x = 1\nfrom . import a, b, c  # noqa\n\n" + cli.LOCAL_IMPORTS + "\n"
+    got = cli._keep_local_imports(base + tail, base, theirs)
+    assert (got is not None) is settles
+    if settles:
+        assert got == theirs + tail.lstrip("\n")
+    assert cli._keep_local_imports(base.replace("x = 1", "x = 2") + tail, base, theirs.replace("x = 1", "x = 3")) is None
+    assert cli._keep_local_imports(base.replace("a, b", "a, b, d") + tail, base, theirs) is None
+
+
+def test_every_runtime_module_ending_in_an_import_ends_with_the_project_imports_marker():
+    """A project's own import block goes after the marker line, one unchanged line away from upstream's
+    import list, so a release that changes the list never conflicts with it."""
+    import ast
+    from ttp import cli
+    ending = []
+    for f in sorted((RUNTIME / "ttp").rglob("*.py")):
+        text = f.read_text()
+        tree = ast.parse(text)
+        if tree.body and isinstance(tree.body[-1], (ast.Import, ast.ImportFrom)):
+            ending.append(f.name)
+            lines = text.splitlines()
+            assert lines[-1] == cli.LOCAL_IMPORTS and not lines[-2].strip(), f
+    assert "push.py" in ending

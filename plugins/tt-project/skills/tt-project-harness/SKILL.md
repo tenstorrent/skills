@@ -289,8 +289,8 @@ The boot is told by the kernel's boot id (on macOS, kern.bootsessionuuid, else k
   judgment itself (both sides only added at one spot, or upstream already ships the change).
   Otherwise the harness is left as it was and a harness task is queued to finish the merge, at
   most one per `upgrade.task_every_h` (6) hours. Keep this project's own imports in a runtime file
-  in one block at the end of the file, outside upstream's `from . import ...` lists, so upgrades
-  merge cleanly with no task. It then exits 75 (deferred, not failed) while that task or the daemon's retry under
+  in one block at the end of the file, after its `# --- project-local imports below ---` line where it
+  ends with one, outside upstream's `from . import ...` lists, so upgrades merge cleanly with no task. It then exits 75 (deferred, not failed) while that task or the daemon's retry under
   `upgrade.auto` takes it on (the daemon retries only a newer version); when nothing does, it exits 1.
   The same conflict deferred past 48 h, or after two harness tasks that did not land it, is
   reported once as a normal observation.

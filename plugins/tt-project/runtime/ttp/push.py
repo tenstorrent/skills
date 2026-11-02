@@ -4582,3 +4582,5 @@ def status_lines(p: Project) -> list[str]:
 # that calls into this older push (after_push would fail on a missing attribute). cli and pushpass
 # (for `ttp push --own` reusing a `ttp checks` pass) likewise: pushpass imports push at import time.
 from . import batch, cli, pushpass, verdictcarry  # noqa: E402
+
+# --- project-local imports below ---

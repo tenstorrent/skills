@@ -8804,8 +8804,9 @@ In this harness repo:
 2. Resolve each conflict keeping this project's intent and taking upstream's fixes. Put this project's
    own prompt rules between `<!-- ttp:local -->` and `<!-- /ttp:local -->` lines, so later upgrades keep
    them without a merge. Put this project's own imports in a runtime file in one block at the end of
-   the file, never inside or next to upstream's `from . import ...` lists, and keep upstream's lists
-   as upstream ships them: later upgrades then merge cleanly with no task.
+   the file, after its `# --- project-local imports below ---` line where it ends with one, never inside
+   or next to upstream's `from . import ...` lists, and keep upstream's lists as upstream ships them:
+   later upgrades then merge cleanly with no task.
 3. Check in <tmp>: `python3 -m compileall -q runtime` and `PYTHONPATH=runtime python3 -c "import ttp.daemon, ttp.cli"`.
 4. Commit, then in <tmp>: `git merge main` (main may have moved meanwhile; resolve and check again).
 5. `ttp upgrade {name} --apply <commit>`, run on its own (never piped or masked). It fast-forwards main
@@ -8968,6 +8969,9 @@ def _restore_from_upstream(tmp: Path, ident: list[str], cut: dict[str, str]) -> 
 
 
 LOCAL_OPEN, LOCAL_CLOSE = "<!-- ttp:local -->", "<!-- /ttp:local -->"
+# The last line of each runtime module that ends in an import: a project's own imports go after it, so
+# its block sits a line away from upstream's import list and an upgrade that changes the list merges clean.
+LOCAL_IMPORTS = "# --- project-local imports below ---"
 
 
 def _settle_merge(tmp: Path, ident: list[str], files: list[str]) -> str:
@@ -8976,24 +8980,31 @@ def _settle_merge(tmp: Path, ident: list[str], files: list[str]) -> str:
     or upstream already makes the project's change (comments and spacing aside); never when a line
     one side added nearly repeats one the other added (batch._near). A template prompt
     the project only added to takes upstream's text with the project's blocks put back
-    (_keep_local_blocks). Commits it and returns ""; else names the files left (nothing is committed)."""
+    (_keep_local_blocks); a runtime module the project only added a block of imports to at its end
+    takes upstream's text with the block after it (_keep_local_imports). Commits it and returns "";
+    else names the files left (nothing is committed)."""
     from .batch import _show, settle
-    left, kinds, blocks = [], set(), []
+    left, kinds, blocks, imports = [], set(), [], []
     for f in files:
         if settle(tmp, f, [], taken_in=True, hunks=True, superseded=True, near=True, kinds=kinds):
             continue
         sides = [_show(tmp, n, f) for n in (2, 1, 3)]
         merged = None
-        if f.startswith("prompts/") and f.endswith(".md") and None not in sides:
-            try:
+        try:
+            if f.startswith("prompts/") and f.endswith(".md") and None not in sides:
                 merged = _keep_local_blocks(*(s.decode() for s in sides))
-            except UnicodeDecodeError:
-                pass
+            elif f.startswith("runtime/") and f.endswith(".py") and None not in sides:
+                merged = _keep_local_imports(*(s.decode() for s in sides))
+                if merged is not None:
+                    imports.append(f)
+        except UnicodeDecodeError:
+            pass
         if merged is None:
             left.append(f)
         else:
             durable_write(tmp / f, merged)
-            blocks.append(f)
+            if f not in imports:
+                blocks.append(f)
     if left or not files:
         return "the merge conflicts in " + ", ".join(left)
     _git(tmp, "add", "--", *files)
@@ -9004,7 +9015,48 @@ def _settle_merge(tmp: Path, ident: list[str], files: list[str]) -> str:
               "wording stays in the merge's first parent")
     if blocks:
         print(f"kept this project's own blocks in upstream's text, fenced as {LOCAL_OPEN}: " + ", ".join(blocks))
+    if imports:
+        print(f"kept this project's own imports at the end of upstream's text, after {LOCAL_IMPORTS!r}: "
+              + ", ".join(imports))
     return ""
+
+
+def _keep_local_imports(ours: str, base: str, theirs: str) -> str | None:
+    """A runtime module merged as upstream's text (`theirs`) plus the block of imports the project
+    added at its end. git calls that a conflict when upstream changed its own last line (the import
+    list the block sat next to, before upstream ended the file with LOCAL_IMPORTS). The project's
+    text up to base's last line merges with upstream's as batch.settle merges it; the block then
+    goes after upstream's LOCAL_IMPORTS line when upstream ends with it, else after upstream's last
+    line. None when base's last line is not in the project's text, the lines after it hold anything
+    but imports and comments, or the rest does not merge without judgment."""
+    import ast
+
+    from .batch import _duplicates, merge3
+    end = next((x for x in reversed(base.splitlines()) if x.strip()), None)
+    mine = ours.splitlines(keepends=True)
+    k = next((i for i in range(len(mine) - 1, -1, -1) if mine[i].rstrip("\r\n") == end), None)
+    if end is None or k is None:
+        return None
+    tail = mine[k + 1:]
+    while tail and not tail[0].strip():
+        tail.pop(0)
+    try:
+        tree = ast.parse("".join(tail))
+    except (SyntaxError, ValueError):
+        return None
+    if not tree.body or not all(isinstance(n, (ast.Import, ast.ImportFrom)) for n in tree.body):
+        return None
+    body = "".join(mine[:k + 1])
+    if not body.endswith("\n") and base.endswith("\n"):
+        body += "\n"
+    out = merge3(body, base, theirs, py=True, taken_in=True, hunks=True, superseded=True, near=True)
+    if out is None or _duplicates(out) - _duplicates(body) - _duplicates(theirs):
+        return None
+    if out and not out.endswith("\n"):
+        out += "\n"
+    if next((x.strip() for x in reversed(out.splitlines()) if x.strip()), "") != LOCAL_IMPORTS:
+        out += "\n"
+    return out + "".join(tail) + ("" if tail[-1].endswith("\n") else "\n")
 
 
 def _keep_local_blocks(ours: str, base: str, theirs: str) -> str | None:

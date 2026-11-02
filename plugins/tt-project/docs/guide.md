@@ -1830,9 +1830,12 @@ the project's stays in the merge's first parent; a line the project removed and 
 is a real overlap). A project's own rules in a template prompt belong
 between `<!-- ttp:local -->` and `<!-- /ttp:local -->` lines (the prompt leaves those lines out):
 an upgrade takes upstream's text and puts each block back where it stood. A project's own imports
-in a runtime file belong in one block at the end of the file, never inside or next to upstream's
-`from . import ...` lists (leave those as upstream ships them): an import added to such a list
-conflicts with every release that changes it, while a block at the file end merges cleanly. When a project only added
+in a runtime file belong in one block at the end of the file, after the
+`# --- project-local imports below ---` line that ends each runtime module whose last statement is an
+import, never inside or next to upstream's `from . import ...` lists (leave those as upstream ships
+them): an import added to such a list conflicts with every release that changes it, while a block
+after that line merges cleanly. A block that already sits right after upstream's last import line
+is moved after that line by the upgrade itself, keeping both import lists. When a project only added
 lines to a template prompt, the upgrade fences them that way itself. Only a real overlap, such as
 the project and upstream rewording the same line, or each adding its own version of one line (the
 same leading key, or most of the text alike), goes to a harness task, at most one per
