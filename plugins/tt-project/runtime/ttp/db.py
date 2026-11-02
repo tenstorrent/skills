@@ -282,7 +282,11 @@ def git_network(argv: Any) -> str:
 
 def _audit(event: str, args: tuple) -> None:
     """Records each subprocess started inside an open write transaction (for the slow-tx log) and,
-    with TTP_TX_GUARD=1 (the tests), refuses a git network command there."""
+    with TTP_TX_GUARD=1 (the tests), refuses a git network command there. A strict finish round
+    (gitmemo.on_audit) counts a raw git spawn against its slice and ends its abortable part at a
+    non-git spawn or a socket connect."""
+    from . import gitmemo
+    gitmemo.on_audit(event, args)
     if event != "subprocess.Popen":
         return
     spawns = getattr(_tx_local, "spawns", None)
@@ -306,7 +310,7 @@ def _hook() -> None:
         shared = _shared
 
         def hook(event: str, args: tuple) -> None:
-            if event == "subprocess.Popen":
+            if event == "subprocess.Popen" or event == "socket.connect":
                 shared.audit(event, args)
         sys.addaudithook(hook)
 
@@ -715,7 +719,8 @@ END""")
         ended = time.monotonic()
         held = ended - began
         if held > SLOW_TX_S:
-            self._log_slow_tx(held, _slowest(spawns, ended))
+            from . import gitmemo
+            self._log_slow_tx(held, _slowest(spawns, ended) + gitmemo.tx_note())
         pending, self._after_commit = self._after_commit, []
         failed = None
         for fn in pending:   # each runs: one that raises never drops the commits queued after it

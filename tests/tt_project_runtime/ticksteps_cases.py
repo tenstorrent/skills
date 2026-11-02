@@ -507,9 +507,10 @@ def test_gitmemo_bounded_caps_reads_and_a_deadline_caps_every_call(monkeypatch):
     monkeypatch.setattr(gitmemo.time, "monotonic", lambda: clock[0])
     with gitmemo.bounded(45, 20):
         clock[0] += 19.5
-        assert gitmemo.timeout(120, ("rev-parse",)) == gitmemo.FLOOR_S, "past the deadline but its floor"
+        assert gitmemo.timeout(120, ("rev-parse",)) == pytest.approx(0.5), "what is left before the deadline"
         clock[0] += 100
-        assert gitmemo.timeout(120, ("merge-base",)) == gitmemo.FLOOR_S
+        with pytest.raises(subprocess.TimeoutExpired):   # past the deadline: no new spawn, not a 1 s floor
+            gitmemo.timeout(120, ("merge-base",))
 
 
 def _git_timeouts(monkeypatch):
@@ -618,7 +619,6 @@ def test_a_hung_git_in_the_finish_transaction_ends_by_its_cap_and_the_review_is_
     d = dmod.Daemon(p.base)
     flag = _hung_git(tmp_path, monkeypatch)
     monkeypatch.setattr(gitmemo, "TX_GIT_S", 1.0)
-    monkeypatch.setattr(gitmemo, "FLOOR_S", 0.1)
     # The per-read cap is far above the transaction's budget: only bounded(TX_GIT_S, TX_GIT_S) in
     # _finish_tx keeps the lock short (without it each hung read waits TICK_GIT_S).
     monkeypatch.setattr(gitmemo, "TICK_GIT_S", 10.0)
@@ -649,7 +649,7 @@ def test_a_hung_git_in_the_finish_transaction_ends_by_its_cap_and_the_review_is_
 def test_a_hung_git_in_a_push_approving_reviews_finish_ends_by_the_transaction_cap(env, monkeypatch, tmp_path, only):
     """pushq.check_approval runs its local git (push._git's remote list, pushq._commit, _contains, the
     conflicted log) inside the finish transaction unwarmed. A hung one (any, or only pushq._commit's)
-    ends within gitmemo.TX_GIT_S (+ FLOOR_S per late call), the review's finish completes, and the
+    ends within gitmemo.TX_GIT_S (no call starts past it), the review's finish completes, and the
     approval is judged invalid so the review runs again, never lost."""
     from ttp import gitmemo
     from ttp.daemon import Daemon
@@ -663,7 +663,6 @@ def test_a_hung_git_in_a_push_approving_reviews_finish_ends_by_the_transaction_c
     d = Daemon(s.p.base)
     flag = _hung_git(tmp_path, monkeypatch, only)
     monkeypatch.setattr(gitmemo, "TX_GIT_S", 1.0)
-    monkeypatch.setattr(gitmemo, "FLOOR_S", 0.1)
     monkeypatch.setattr(gitmemo, "TICK_GIT_S", 10.0)   # above the budget: only the transaction's cap holds
     held: list = []
 
@@ -963,3 +962,38 @@ def test_the_unit_gives_the_daemon_an_explicit_stop_timeout_and_keeps_workers(en
     unit = service._unit_text(make(env))
     assert f"TimeoutStopSec={service.STOP_TIMEOUT_S}\n" in unit and service.STOP_TIMEOUT_S >= 60
     assert "KillMode=process\n" in unit, "workers must outlive a daemon restart"
+
+
+def test_gitreplay_answers_a_kept_read_without_git_and_drops_it_when_its_branch_moves(tmp_path, monkeypatch):
+    """Within an attempt a git read's answer is kept: the same read again spawns nothing. A read naming
+    a branch depends on the branch's value (read from the ref files, not git): once the branch moves the
+    entry is dropped and the new tip is read; a full-id read stays. Outside an attempt nothing is kept."""
+    from ttp import gitmemo, gitreplay
+    repo = tmp_path / "r"
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t"}
+    sh = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True,   # noqa: E731
+                                   text=True, env=env).stdout.strip()
+    repo.mkdir()
+    sh("init", "-q", "-b", "main")
+    sh("commit", "-q", "--allow-empty", "-m", "one")
+    first = sh("rev-parse", "HEAD")
+    gitreplay.clear()
+    spawns = []
+    real = gitmemo._spawn
+    monkeypatch.setattr(gitmemo, "_spawn", lambda argv, t, kw: spawns.append(argv) or real(argv, t, kw))
+    rp = lambda rev: gitmemo.run(["git", "-C", str(repo), "rev-parse", rev], capture_output=True,   # noqa: E731
+                                 text=True).stdout.strip()
+    assert rp("main") == first and rp("main") == first and len(spawns) == 2, "outside an attempt: no memo"
+    with gitmemo.attempt():
+        assert rp("main") == first and rp(first) == first
+        n = len(spawns)
+        assert rp("main") == first and rp(first) == first and len(spawns) == n, "hits spawn nothing"
+        sh("commit", "-q", "--allow-empty", "-m", "two")
+        second = sh("rev-parse", "HEAD")
+        assert rp("main") == second and len(spawns) == n + 1, "the branch moved: read again"
+        assert rp(first) == first and len(spawns) == n + 1, "a full id's answer stays"
+        st = gitmemo.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True)
+    with gitmemo.attempt():
+        gitmemo.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True)
+    assert st.returncode == 0 and len(spawns) == n + 3, "a worktree read is kept only within its attempt"
