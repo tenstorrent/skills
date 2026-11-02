@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -762,7 +763,9 @@ def disk_guard_bytes(disk: dict, path: Path) -> float:
 class Daemon:
     def __init__(self, base: str | Path):
         self.p = Project(base)
-        self.stopping = False
+        self._stopping = False
+        self._wake: tuple[int, int] | None = None   # run(): the pipe a stop writes to, ending _nap at once
+        self._stop_skipped: list[str] = []   # the tick steps a stop skipped this tick (_run_step)
         self.boot, old = runner.boot_ids()
         self._boot_old = old if old != self.boot else None
         self.boot_at = runner.boot_time()
@@ -914,6 +917,40 @@ class Daemon:
         self._idle = awake.IdleHold(record=lambda state: self.p.db.set_kv(awake.KV, state))
         self._note_boot()
 
+    @property
+    def stopping(self) -> bool:
+        return self._stopping
+
+    @stopping.setter
+    def stopping(self, value: bool) -> None:
+        # A flag and one byte down a pipe, never a lock: a signal handler runs this between any two
+        # bytecodes of the main thread, so a threading.Event (its own lock) could deadlock on itself.
+        self._stopping = bool(value)
+        if value and self._wake:
+            try:
+                os.write(self._wake[1], b"s")
+            except OSError:   # full (a byte already waits) or closed: the wait ends or is over anyway
+                pass
+
+    def _nap(self, seconds: float) -> None:
+        """Wait between ticks, ending at once when a stop is asked for."""
+        if self._stopping:
+            return
+        if not self._wake:
+            time.sleep(seconds)
+            return
+        select.select([self._wake[0]], [], [], seconds)
+
+    def _on_stop_signal(self, signum, _frame=None) -> None:
+        """SIGTERM/SIGINT: stop at the end of the running tick step (_run_step skips the rest), and
+        end the between-tick wait now, well inside the unit's TimeoutStopSec."""
+        first = not self.stopping
+        self.stopping = True
+        if first:
+            step = self._step_name if self._step_began is not None else ""
+            log(self.p, f"daemon stop requested ({signal.Signals(signum).name}"
+                        + (f", during tick step {step})" if step else ", between tick steps)"))
+
     # lifecycle ------------------------------------------------------------------------------------
     def run(self) -> int:
         self.p.state.mkdir(parents=True, exist_ok=True)
@@ -954,8 +991,11 @@ class Daemon:
                 log(self.p, did)
         except Exception:
             log(self.p, "index ignore file error: " + traceback.format_exc().replace("\n", " | ")[:2000])
-        signal.signal(signal.SIGTERM, lambda *_: setattr(self, "stopping", True))
-        signal.signal(signal.SIGINT, lambda *_: setattr(self, "stopping", True))
+        self._wake = os.pipe()   # not inherited by children (PEP 446)
+        for fd in self._wake:
+            os.set_blocking(fd, False)
+        signal.signal(signal.SIGTERM, self._on_stop_signal)
+        signal.signal(signal.SIGINT, self._on_stop_signal)
         r = self.identity
         log(self.p, f"daemon start pid={os.getpid()} host={hostname()} boot={self.boot} version={r['version']} "
                     f"commit={r['commit'] or 'none'} instance={r['instance']} provenance={r['provenance']} "
@@ -984,8 +1024,11 @@ class Daemon:
                 if not self._healthy:
                     self._tick_errors += 1
                     self._mark_start()
-                time.sleep(10)
-            time.sleep(TICK_S)
+                self._nap(10)
+            if self._stop_skipped:
+                log(self.p, f"stop: skipped steps {', '.join(self._stop_skipped)}")
+                self._stop_skipped = []
+            self._nap(TICK_S)   # a stop signal ends the wait at once
         log(self.p, "daemon stop")
         try:   # an orderly shutdown stops the daemon first: the next boot tells it from a crash
             self.p.db.set_kv(CLEAN_STOP_KEY, {"boot": self.boot, "ts": time.time(), "clean_stop": True})
@@ -1001,6 +1044,9 @@ class Daemon:
         self._machine_probes.stop()
         if _read_pid(pidfile) == os.getpid():
             pidfile.unlink(missing_ok=True)
+        wake, self._wake = self._wake, None
+        for fd in wake or ():
+            os.close(fd)
         # Running workers are left alone: they write their results to disk and the next start
         # adopts them. `ttp stop --kill` and cancels end them explicitly.
         return 0
@@ -1275,8 +1321,13 @@ class Daemon:
         in a row is alerted, normal at first and high once it has failed STEP_FAILS_HIGH_S; its next
         success clears the count and the alert. The watchdogs still hear of progress either way.
         Returns the step's result, or `default` when it raised; `name` labels a step that is not a
-        method of this daemon (a lambda)."""
-        name = self._step_name = name or step.__name__
+        method of this daemon (a lambda). Once a stop is requested the steps not yet started are
+        skipped (returning `default`): a running step always finishes what it began."""
+        name = name or step.__name__
+        if self.stopping:   # a stop skips the tick's remaining steps; each is its own transaction
+            self._stop_skipped.append(name)
+            return default
+        self._step_name = name
         self._step_began = self._step_mark = time.monotonic()
         self._step_holder, self._step_task, self._step_worst = "", None, (0.0, "", None)
         result = default

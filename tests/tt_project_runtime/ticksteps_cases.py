@@ -765,3 +765,108 @@ def test_a_full_disk_never_lets_daemon_log_raise_and_the_failing_step_is_counted
     assert "3 line(s) dropped" in lines[-2] and lines[-1].endswith(" space is back"), lines[-3:]
     dmod.log(p, "and on")   # the count is reset once a line is written
     assert "dropped" not in (p.logs / "daemon.log").read_text().splitlines()[-1]
+
+
+def _close_daemon_lock(d):
+    if isinstance(getattr(d, "_lock_fd", None), int):
+        os.close(d._lock_fd)   # the process ended: its lock with it
+
+
+def test_a_stop_during_a_slow_step_skips_the_rest_of_the_tick_and_stops_cleanly(env, monkeypatch):
+    """A SIGTERM that arrives while a tick step is stuck (a DB write lock) ends the daemon as soon as
+    that step returns: no later step starts, and the clean stop is recorded, well inside the unit's
+    TimeoutStopSec."""
+    import signal as sig
+    from ttp import daemon as dm, service, web
+    p = make(env)
+    d = dm.Daemon(p.base)
+    began, release, ran, returned = threading.Event(), threading.Event(), [], []
+
+    def lift_boot_pause():   # the tick's first step, stuck until released
+        began.set()
+        release.wait(_load_scaled(30))
+        returned.append(time.monotonic())
+
+    def recorder(name):
+        def step():
+            ran.append(name)
+        step.__name__ = name
+        return step
+    monkeypatch.setattr(d, "lift_boot_pause", lift_boot_pause)
+    for name in ("reap_runs", "check_pause_ends", "dispatch", "deliver_outbound"):
+        monkeypatch.setattr(d, name, recorder(name))
+    monkeypatch.setattr(web, "serve", lambda daemon: None)
+    monkeypatch.setattr(service, "take_restart_request", lambda p, started: False)
+
+    def stop_then_release():
+        began.wait(_load_scaled(30))
+        os.kill(os.getpid(), sig.SIGTERM)   # through the handler run() installs
+        time.sleep(0.3)
+        release.set()
+    old = {s: sig.getsignal(s) for s in (sig.SIGTERM, sig.SIGINT)}
+    t = threading.Thread(target=stop_then_release, daemon=True)
+    t.start()
+    try:
+        assert d.run() == 0
+        ended = time.monotonic()
+    finally:
+        release.set()
+        for s, h in old.items():
+            sig.signal(s, h)
+        _close_daemon_lock(d)
+    t.join(5)
+    assert began.is_set() and returned, "the slow step ran and returned"
+    assert ran == [], f"steps after the stop ran: {ran}"
+    assert ended - returned[0] < 5, "the daemon kept going after the slow step returned"
+    assert (p.db.kv(dm.CLEAN_STOP_KEY) or {}).get("clean_stop") is True
+    text = (p.logs / "daemon.log").read_text()
+    assert "daemon stop requested (SIGTERM, during tick step lift_boot_pause)" in text
+    skipped = next(line for line in text.splitlines() if "stop: skipped steps " in line)
+    assert "reap_runs" in skipped and "deliver_outbound" in skipped and "lift_boot_pause" not in skipped
+    assert text.count("stop: skipped steps ") == 1
+    assert "daemon stop\n" in text
+    assert d._wake is None, "the wake pipe is closed at the stop"
+
+
+def test_a_stop_during_the_between_tick_wait_ends_it_at_once(env, monkeypatch):
+    import signal as sig
+    from ttp import daemon as dm, service, web
+    p = make(env)
+    d = dm.Daemon(p.base)
+    ticks, stopped = [], []
+
+    def tick():
+        ticks.append(1)
+        if len(ticks) == 1:
+            def stop():
+                time.sleep(0.3)   # well into the between-tick wait
+                stopped.append(time.monotonic())
+                getattr(d, "_on_stop_signal", lambda s: setattr(d, "stopping", True))(sig.SIGTERM)
+            threading.Thread(target=stop, daemon=True).start()
+    monkeypatch.setattr(d, "tick", tick)
+    monkeypatch.setattr(dm, "TICK_S", 60.0)
+    monkeypatch.setattr(web, "serve", lambda daemon: None)
+    monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
+    monkeypatch.setattr(service, "take_restart_request", lambda p, started: False)
+    try:
+        t0 = time.monotonic()
+        assert d.run() == 0
+        ended = time.monotonic()
+    finally:
+        d.stopping = True
+        _close_daemon_lock(d)
+    assert len(ticks) == 1 and stopped
+    assert ended - stopped[0] < 1, f"the wait ran on {ended - stopped[0]:.1f} s after the stop"
+    assert ended - t0 < 10
+    assert "daemon stop requested (SIGTERM, between tick steps)" in (p.logs / "daemon.log").read_text()
+    # A stop set before the wait (or with no wake pipe at all) never waits.
+    t0 = time.monotonic()
+    d._nap(60)
+    assert time.monotonic() - t0 < 1
+
+
+def test_the_unit_gives_the_daemon_an_explicit_stop_timeout_and_keeps_workers(env):
+    from ttp import service
+    unit = service._unit_text(make(env))
+    assert f"TimeoutStopSec={service.STOP_TIMEOUT_S}\n" in unit and service.STOP_TIMEOUT_S >= 60
+    assert "KillMode=process\n" in unit, "workers must outlive a daemon restart"

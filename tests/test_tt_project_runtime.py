@@ -11545,6 +11545,7 @@ def test_the_daemon_announces_and_takes_restart_requests_each_tick(env, monkeypa
     monkeypatch.setattr(web, "serve", lambda daemon: None)
     monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
     monkeypatch.setattr(dm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(d, "_nap", lambda s: None)
     assert d.run() == 0
     assert taken and set(taken) == {d._started}
     assert "restart_requests" in json.loads((p.state / "heartbeat").read_text())["takes"]
@@ -11671,6 +11672,7 @@ def test_a_failing_restart_reap_never_stops_a_new_restart_request(env, monkeypat
     monkeypatch.setattr(web, "serve", lambda daemon: None)
     monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
     monkeypatch.setattr(dm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(d, "_nap", lambda s: None)
     assert d.run() == 0
     assert taken == [d._started], "the restart request is still taken"
     text = (p.logs / "daemon.log").read_text()
@@ -11687,6 +11689,7 @@ def test_a_daemon_started_after_the_request_was_taken_clears_the_leftover_claim(
     monkeypatch.setattr(web, "serve", lambda daemon: None)
     monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
     monkeypatch.setattr(dm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(d, "_nap", lambda s: None)
     assert d.run() == 0
     res = service._restart_result(p, at)
     assert res and res["outcome"] == "running" and res["reaped"], res
@@ -11977,6 +11980,7 @@ def test_systemd_restarts_a_stuck_daemon_through_its_watchdog(env, monkeypatch):
     monkeypatch.setattr(web, "serve", lambda daemon: None)
     monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
     monkeypatch.setattr(dm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(d, "_nap", lambda s: None)
     try:
         assert d.run() == 0
         assert [sock.recv(64), sock.recv(64)] == [b"WATCHDOG=1"] * 2, "each completed tick pings systemd"
@@ -12220,6 +12224,7 @@ def test_the_daemon_records_its_start_and_first_tick_failures(env, monkeypatch):
     monkeypatch.setattr(web, "serve", lambda daemon: None)
     monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
     monkeypatch.setattr(dm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(d, "_nap", lambda s: None)
     assert d.run() == 0
     marker = dm.start_marker(p)
     assert marker["pid"] == os.getpid() and marker["tick_errors"] == 2
@@ -22634,6 +22639,7 @@ def _run_once(d, monkeypatch, crash=False):
     monkeypatch.setattr(web, "serve", lambda daemon: None)
     monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
     monkeypatch.setattr(dm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(d, "_nap", lambda s: None)
     try:
         if crash:
             with pytest.raises(SystemExit):
@@ -37475,6 +37481,7 @@ def test_idle_sleep_released_on_daemon_shutdown_and_shown_in_status(env, monkeyp
     monkeypatch.setattr(web, "serve", lambda daemon: None)
     monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
     monkeypatch.setattr(dm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(d, "_nap", lambda s: None)
     assert d.run() == 0
     [c] = _FakeCaffeinate.started
     assert f"idle sleep: held while there is work (caffeinate pid {c.pid})" in seen[0]

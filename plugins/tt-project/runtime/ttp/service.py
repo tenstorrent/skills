@@ -189,6 +189,12 @@ def _write_watchdog_units(p: Project) -> bool:
     return changed
 
 
+# How long systemd waits after SIGTERM before it force-kills the daemon. A stop ends the running tick
+# step and skips the rest (Daemon._run_step), so this only needs to outlast one slow step. KillMode
+# stays `process`: workers must outlive a daemon restart.
+STOP_TIMEOUT_S = 120
+
+
 def _unit_text(p: Project) -> str:
     env = "\n".join(f"Environment={k}={v}" for k, v in _env(p).items())
     return f"""[Unit]
@@ -203,6 +209,7 @@ ExecStart={' '.join(shlex.quote(a) for a in daemon_argv(p))}
 Restart=always
 RestartSec=10
 KillMode=process
+TimeoutStopSec={STOP_TIMEOUT_S}
 WatchdogSec={backstop_s(p)}
 WatchdogSignal=SIGUSR1
 NotifyAccess=main
