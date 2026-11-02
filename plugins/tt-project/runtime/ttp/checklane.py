@@ -181,6 +181,13 @@ def default_slots(n_cores: int | None = None, mem_gib: float | None = None, cfg:
     return max(1, n)
 
 
+def run_cores(cfg: dict | None = None, n_cores: int | None = None) -> int:
+    """One checks run's cores: its test grant (testslots.sizes' run_max), at least CORES_PER_LANE (a
+    full required-suite run measured at about that many cores at its peak)."""
+    s = testslots.sizes(cfg, cores=n_cores)
+    return max(CORES_PER_LANE, s[1] if s else 0)
+
+
 def capacity(cfg: dict | None = None, held: int = 0, n_cores: int | None = None, load: float | None = None,
              mem_gib: float | None = None) -> dict:
     """The lanes of one repository the host runs now with checks.slots unset (above): `held` running plus
@@ -193,8 +200,7 @@ def capacity(cfg: dict | None = None, held: int = 0, n_cores: int | None = None,
     m = _mem_gib() if mem_gib is None else mem_gib
     ld = checkcap._load() if load is None else load
     floor = default_slots(c, m, cfg)
-    s = testslots.sizes(cfg, cores=c)
-    run = max(CORES_PER_LANE, s[1] if s else 0)
+    run = run_cores(cfg, c)
     top = max(floor, c // run)
     fit = int(max(0.0, c - ld) // run) if ld == ld and checkcap.extra_max() else 0
     if m is not None:
@@ -661,7 +667,8 @@ def holder_text(rec: dict, now: float) -> str:
     cmd = str(rec.get("command") or "").strip()
     t = holder_times(rec, now)
     run = (f"running {mins(t['running_s'])}" if t["running_s"] is not None
-           else f"has the lane {mins(t['held_s'])}, not running yet")
+           else f"has the lane {mins(t['held_s'])}, not running yet"
+           + (f" (waiting for {rec['waits']})" if rec.get("waits") else ""))
     return (f"{who}{f' {cmd!r}' if cmd else ''} queued {mins(t['queued_s'])}, {run}, "
             f"{_kids(t['children'], t['running_s'] is not None)}")
 
@@ -769,8 +776,11 @@ def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: 
             why.append("escalate")
     holders = {_holder_key(h): h for e in events for h in e.get("holders") or []}
     factor = wait_hang_factor(cfg)
-    for name, test in (("hang", lambda h: factor > 0 and median_s and median_s > 0 and now - float(
-                            h.get("run_since") or h.get("since") or now) > factor * median_s),
+    # A holder still waiting for a later gate (testslots.lane_waits) is not hung: its clock starts once
+    # it has its test slots (granted_at), or with its commands (run_since).
+    for name, test in (("hang", lambda h: factor > 0 and median_s and median_s > 0 and not h.get("waits")
+                        and now - float(h.get("run_since") or h.get("granted_at") or h.get("since") or now)
+                        > factor * median_s),
                        ("ownerless", lambda h: h.get("stale") or (h.get("task") and ended(h)))):
         seen = list(inc.get(name) or [])
         for k, h in holders.items():

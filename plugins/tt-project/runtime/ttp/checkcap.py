@@ -17,7 +17,7 @@ fix. Workers get the directory as a writable root (daemon.start_run).
 
 The cap is the account setting `checks.host_max` (`ttp config --account checks.host_max N`), or the
 environment's TTP_CHECKS_HOST_MAX; 0 turns it off. Unset, it follows the load (default_limit()):
-as many checks as the cores left over the 1-minute load average hold at CHECK_LOAD each, at least one
+as many checks as the cores left over the 1-minute load average hold at check_load() each, at least one
 slot per CORES_PER_SLOT cores (and at least one), at most one per CORES_PER_SLOT_MAX cores. Our own
 running checks count in that load, so the cap shrinks as they load the host; a check keeps its slot
 until it ends, and a waiter reads the cap again on every try. Check commands run with HELD_ENV
@@ -77,7 +77,7 @@ OBLIGATION_MARK = " [owns an open obligation: first in its project]"   # on its 
 PRIORITY = "checks-push"   # check-slots/checks-push.<key>.lock: one priority slot per push branch
 CORES_PER_SLOT = 16       # the default cap's floor: one slot per this many cores, at least one
 CORES_PER_SLOT_MAX = 8    # its ceiling: one slot per this many cores
-CHECK_LOAD = 4.0          # the 1-minute load one running check is assumed to add (default_limit())
+CHECK_LOAD = 4.0          # the 1-minute load one running check adds with the test pool off (check_load())
 HELD_ENV = "TTP_CHECKS_SLOT"
 POLL_S = 5.0
 TELL_S = 300.0
@@ -122,11 +122,19 @@ def default_range() -> tuple[int, int]:
     return floor, max(floor, c // CORES_PER_SLOT_MAX)
 
 
+def check_load() -> float:
+    """The 1-minute load one running check adds: one run's cores as the repository lanes count it
+    (checklane.run_cores: its test grant, at least the measured cores of a full suite run), else, with
+    the test pool off, CHECK_LOAD."""
+    from . import checklane, testslots
+    return float(checklane.run_cores()) if testslots.sizes() else CHECK_LOAD
+
+
 def default_limit() -> int:
     """The cap with no checks.host_max: the checks the cores left over the 1-minute load average hold
-    at CHECK_LOAD each, within default_range(). An unreadable load average gives the floor."""
+    at check_load() each, within default_range(). An unreadable load average gives the floor."""
     floor, top = default_range()
-    fit = int(max(0.0, cores() - _load()) // CHECK_LOAD)
+    fit = int(max(0.0, cores() - _load()) // check_load())
     return min(top, max(floor, fit))
 
 

@@ -644,11 +644,37 @@ def project_held(project_name: str) -> list:
     return [x for x in lane_paths(project_name, repo=None) if locks._slot_labels([x]) and not _pending(x)]
 
 
-def slots_granted(grant) -> None:
-    """Mark the lanes `grant` (suite_hold's, taken `pending`) holds as running with their test slots."""
+def _relabel_lanes(grant, fields: dict) -> None:
     for f in getattr(grant, "files", None) or []:
         if os.path.basename(getattr(f, "name", "")).startswith(SUITE + "."):
-            locks.relabel(f, {"granted": True})
+            locks.relabel(f, fields)
+
+
+def slots_granted(grant) -> None:
+    """Mark the lanes `grant` (suite_hold's, taken `pending`) holds as running with their test slots,
+    since now ("granted_at") and no longer waiting for anything (lane_waits)."""
+    _relabel_lanes(grant, {"granted": True, "granted_at": time.time(), "waits": ""})
+
+
+def lane_waits(grant, what: str) -> None:
+    """Mark the lanes `grant` holds as waiting for `what` (a host-wide checks slot, host test slots)
+    before they run: status says so (checklane.holder_text) and such a holder is no likely hang."""
+    _relabel_lanes(grant, {"waits": what})
+
+
+def pool_room(cfg: dict | None, project_name: str | None) -> bool:
+    """Whether a run could take its test slots now: the pool is off, or it has a slot free (pool_now)
+    with nobody queued for one, and the project's budget (project_max) has one free. suite_hold's
+    overflow lanes ask it, so a run takes one only once it can start beside the holders."""
+    s = sizes(cfg)
+    if s is None:
+        return True
+    used = len(locks._slot_labels(paths(max(s[0], checkcap.cores()))))
+    pool = pool_now(cfg, s[0], used)
+    if used >= pool or locks.queued(checkcap.slot_dir(), TESTS.resource):
+        return False
+    own = own_paths(project_name, project_max(cfg, (pool, s[1])))
+    return not own or locks.any_free(own)
 
 
 @contextlib.contextmanager
@@ -800,7 +826,7 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                max_wait: float = 0.0, state=None, what: str = "full checks", lock: str = "", cap: int = 0,
                worktree: str = "", headroom: Callable[[], bool] | None = None,
                age: float | None = None, pending: bool = False, check: str = "",
-               repo_name: str = "", name: str = "") -> Grant | None:
+               repo_name: str = "", name: str = "", startable: Callable[[], bool] | None = None) -> Grant | None:
     """Hold one of project `project_name`'s `slots` checks lanes in repository `repo` (repo_key) for its
     full checks (above), waiting while its other runs there hold them all or a more urgent waiter is ahead
     (suite_order); Grant(0) holding one, Grant() with no project or nested in a check, None once `wait_s`
@@ -831,7 +857,9 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     `name`: the lane's name for status (the repository's directory name, or with `lock` the wrapper
     command's: checklane.lane_labels). `slots` may be a function of the lanes held now (checklane.slots):
     it is read again at every try, and a lane is free only while fewer than that many lane files of the
-    repository are held, so a count that fell under a holder's lane number admits nobody past it."""
+    repository are held, so a count that fell under a holder's lane number admits nobody past it.
+    `startable()` (pool_room): an overflow lane (cheaper, urgent, past the cap) is taken only while it
+    says the run can start now, so no extra lane is held by a run that waits for test slots."""
     from . import checklane
     age = age_s() if age is None else age
     if not project_name or os.environ.get(HELD_ENV) or os.environ.get(checkcap.HELD_ENV):
@@ -896,14 +924,16 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
             pos = q.index(ticket) if ticket in q else len(q)
             f = None
             cheaper = (max_wait > 0 and cost and time.time() - arrival >= max_wait and recs
-                       and all(checklane.cheaper(cost, r.get("cost") or {}) for r in recs))
+                       and all(checklane.cheaper(cost, r.get("cost") or {}) for r in recs)
+                       and (startable is None or startable()))
             # A priority-1 waiter also weighs the holders of a full project cap: it may start past it.
             p1 = priority is not None and priority <= 1 and headroom is not None
             on_cap = project_held(project_name) if p1 and cap > 0 else []
             pool = recs + (locks.holder_records(on_cap) if len(on_cap) >= cap > 0 else [])
             urgent = (not cheaper and p1 and pool
                       and all((r["priority"] if isinstance(r.get("priority"), (int, float)) else NO_PRIORITY) > 1 for r in pool)
-                      and not (worktree and any(r.get("worktree") == str(worktree) for r in pool)) and headroom())
+                      and not (worktree and any(r.get("worktree") == str(worktree) for r in pool)) and headroom()
+                      and (startable is None or startable()))
             try:
                 with _cap_guard(project_name, cap):
                     over = False

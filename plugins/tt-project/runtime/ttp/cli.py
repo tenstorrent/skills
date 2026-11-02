@@ -3738,7 +3738,8 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         # The repository's lanes are read again at every try: unset, they follow the host's load (checklane.capacity).
         if suite is None and (suite := hold(repo, lambda held: checklane.slots(cfg, held), lock=lock,
                                             cap=checklane.project_cap(cfg),
-                                            worktree=top, headroom=checklane.headroom, pending=True)) is None:
+                                            worktree=top, headroom=checklane.headroom, pending=True,
+                                            startable=lambda: testslots.pool_room(cfg, p.name if p else None))) is None:
             if tree is not None:
                 tree.close()
             return None
@@ -3746,6 +3747,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
             suite.files += tree.files
             tree = None
         left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
+        testslots.lane_waits(suite, "a host-wide checks slot")   # held, not running yet: status says why
         slot = checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell, waiting,
                                 left, arrived,
                                 p.name if p else None, prio, same, done, stop,
@@ -3756,6 +3758,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         # Then the run's share of the host's test-worker slots (testslots), held with the checks slot;
         # in the foreground none free by the end of the same wait hands over to detached checks too.
         left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
+        testslots.lane_waits(suite, "host test slots")
         slot.tests = testslots.acquire(checkcap.label(p.name if p else None), tell, left,
                                        p.config() if p else {}, p.name if p else "", priority=prio, stop=stop,
                                        since=arrived)

@@ -282,15 +282,21 @@ def test_checks_default_cap_scales_with_load_headroom_between_floor_and_ceiling(
     load = [0.0]
     monkeypatch.setattr(checkcap.os, "getloadavg", lambda: (load[0], 0.0, 0.0))
     assert checkcap.default_range() == (4, 8)
+    assert checkcap.check_load() == 8.0, "one run's cores: its test grant on 64 cores"
     assert checkcap.limit() == 8, "an idle host gets the ceiling"
     load[0] = 14.0
-    assert checkcap.limit() == 8, "headroom for more than the ceiling still stops at it"
+    assert checkcap.limit() == 6, "(64 - 14) / 8 rounds down"
+    load[0] = 24.0
+    assert checkcap.limit() == 5, "(64 - 24) / 8 checks fit"
     load[0] = 36.0
-    assert checkcap.limit() == 7, "(64 - 36) / 4 checks fit"
-    load[0] = 43.0
-    assert checkcap.limit() == 5, "(64 - 43) / 4 rounds down"
-    load[0] = 50.0
     assert checkcap.limit() == 4, "never below the floor of one slot per 16 cores"
+    from ttp import testslots
+    with monkeypatch.context() as m:   # the test pool off: CHECK_LOAD a check
+        m.setattr(testslots, "sizes", lambda *a, **k: None)
+        load[0] = 14.0
+        assert checkcap.limit() == 8, "headroom for more than the ceiling still stops at it"
+        load[0] = 43.0
+        assert checkcap.limit() == 5, "(64 - 43) / 4 rounds down"
     load[0] = 200.0
     assert checkcap.limit() == 4
     monkeypatch.setattr(checkcap.os, "getloadavg", lambda: (_ for _ in ()).throw(OSError()))
@@ -4467,3 +4473,78 @@ def test_a_runs_second_detached_checks_append_to_checks_out_keeping_the_first_ru
     assert _wait_for(rc.exists, 60), out.read_text()
     both = out.read_text()
     assert both.startswith(first) and len(both) > len(first), both
+
+
+def test_an_overflow_lane_is_taken_only_while_the_test_pool_lets_the_run_start(env, tmp_path, monkeypatch):
+    """A run that took an extra lane and then waited ~12 min for host test slots held it with no check
+    running: an overflow lane goes only to a run the pool lets start now (testslots.pool_room)."""
+    from ttp import checkcap, checklane, locks, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.setattr(testslots, "sizes", lambda *a, **k: (2, 1))
+    monkeypatch.setattr(testslots, "pool_now", lambda cfg, pool, held, *a, **k: pool)
+    assert testslots.pool_room({}, "pa")
+    taken = [locks.try_take(testslots.paths(2), "other run", "test slots") for _ in range(2)]
+    assert all(taken) and not testslots.pool_room({}, "pa"), "a full pool: no room"
+    taken.pop().close()
+    assert testslots.pool_room({}, "pa")
+    t = locks.enqueue(checkcap.slot_dir(), testslots.TESTS.resource, "a waiter", time.time())
+    assert not testslots.pool_room({}, "pa"), "a free slot a queued waiter takes next is no room"
+    locks.dequeue(t)
+    holder = _lane_holder(tmp_path, "pa", _LANE_REPO, cost={"cls": checklane.SUITE, "est_s": 600})
+    try:
+        room = {"now": False}
+        cheap = {"cls": checklane.OTHER}
+        assert testslots.suite_hold("pa", repo=_LANE_REPO, cost=cheap, max_wait=0.1, wait_s=0.6,
+                                    startable=lambda: room["now"]) is None, "an extra lane with no test slots"
+        room["now"] = True
+        g = testslots.suite_hold("pa", repo=_LANE_REPO, cost=cheap, max_wait=0.1, wait_s=5,
+                                 startable=lambda: room["now"])
+        assert g and g.files and "-x." in g.files[0].name
+        g.close()
+    finally:
+        _stop(holder)
+        for f in taken:
+            f.close()
+
+
+def test_a_holder_waiting_for_test_slots_says_so_and_is_no_likely_hang(env, tmp_path, monkeypatch):
+    """The lane label says what a held, not yet running lane waits for (testslots.lane_waits), and the
+    queue's hang wake times a holder from its grant, never across that wait."""
+    from ttp import checklane, locks, testslots
+    _lane_env(monkeypatch)
+    g = testslots.suite_hold("pa", repo=_LANE_REPO, wait_s=5, pending=True)
+    try:
+        testslots.lane_waits(g, "host test slots")
+        rec = locks.holder_records([Path(f.name) for f in g.files])[0]
+        now = float(rec["since"]) + 1200
+        assert "not running yet (waiting for host test slots)" in checklane.holder_text(rec, now)
+        evs = _queue_events(1, holders=[rec])
+        cfg = {"checks": {"wait_hang_factor": 3}}
+        assert checklane.wait_wake(evs, {"start": 1.0}, cfg, now, 300.0)[0] == [], "waiting is no hang"
+        testslots.slots_granted(g)
+        rec = locks.holder_records([Path(f.name) for f in g.files])[0]
+        assert not rec.get("waits") and rec.get("granted") is True
+        assert "waiting for" not in checklane.holder_text(rec, now)
+        evs = _queue_events(1, holders=[rec])
+        assert checklane.wait_wake(evs, {"start": 1.0}, cfg, float(rec["granted_at"]) + 60, 300.0)[0] == [], \
+            "its clock starts at its grant, not when it took the lane"
+        assert checklane.wait_wake(evs, {"start": 1.0}, cfg, float(rec["granted_at"]) + 1000, 300.0)[0] == ["hang"]
+    finally:
+        g.close()
+
+
+def test_the_host_checks_cap_prices_a_check_at_one_runs_measured_cores(monkeypatch):
+    """checkcap.default_limit fits the spare cores at one run's cores (checklane.run_cores, as the lanes
+    count them), not at a fixed 4; with the test pool off it keeps CHECK_LOAD."""
+    from ttp import checkcap, checklane, testslots
+    monkeypatch.delenv("TTP_CHECKS_HOST_MAX", raising=False)
+    monkeypatch.setattr(checkcap, "cores", lambda: 64)
+    monkeypatch.setattr(checkcap, "_load", lambda: 16.0)
+    monkeypatch.setattr(testslots, "sizes", lambda *a, **k: (32, 8))
+    assert checklane.run_cores() == 8 and checkcap.check_load() == 8.0
+    assert checkcap.default_limit() == 6, "48 spare cores hold 6 runs of 8 cores"
+    monkeypatch.setattr(testslots, "sizes", lambda *a, **k: (32, 16))
+    assert checkcap.check_load() == 16.0 and checkcap.default_limit() == 4, "the floor: 64 // 16"
+    monkeypatch.setattr(testslots, "sizes", lambda *a, **k: None)
+    assert checkcap.check_load() == checkcap.CHECK_LOAD == 4.0
+    assert checkcap.default_limit() == 8, "the pool off: 48 // 4, at most the ceiling of 8"
