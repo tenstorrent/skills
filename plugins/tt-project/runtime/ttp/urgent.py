@@ -176,6 +176,15 @@ def covers_urgent(db, task: dict | None) -> bool:
     return any(is_urgent(db.task(d)) for d in dependency_ids(task) if isinstance(d, int))
 
 
+def approvals_waiting(db, target: str) -> list[int]:
+    """Queue ids of the approved urgent rows (covers_urgent) for push target `target`, best priority
+    first: what a push batch searching for the entry that broke its checks stops for (pushq.yields_to).
+    Here, not in pushq, so batch can import it at module level without an import cycle."""
+    rows = db.q("SELECT q.id, q.task FROM push_queue q JOIN tasks t ON t.id=q.task WHERE q.status='approved' "
+                "AND t.status='pushing' AND q.target=? ORDER BY t.priority, q.id", (target,))
+    return [r["id"] for r in rows if covers_urgent(db, db.task(r["task"]))]
+
+
 def waited_s(db, task: dict, now: float) -> float:
     """How long `task` has waited in its present state: a queued task since it was made or its last
     run ended (whichever is later), one in review since it entered review; 0 for other states."""

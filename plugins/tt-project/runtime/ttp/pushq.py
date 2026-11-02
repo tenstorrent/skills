@@ -790,8 +790,7 @@ def yields_to(p: Project, name: str) -> list[int]:
     the entry that broke its checks stops for (batch.Batch._yield_now): urgent ones (urgent.covers_urgent:
     priority 1 or better, an `urgent:` line, or a review of such a task). The next batch takes them
     alone (due)."""
-    db = p.db
-    return [r["id"] for r in _approved(db, name) if _yields(db, r)]
+    return urgent.approvals_waiting(p.db, name)
 
 
 def _approved(db, name: str) -> list[dict]:

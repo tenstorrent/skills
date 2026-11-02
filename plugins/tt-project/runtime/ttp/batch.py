@@ -50,7 +50,7 @@ from collections import Counter, deque
 from pathlib import Path
 
 from . import (checkcap, checkdirs, cleantree, conflictfix, cyclenotice, envfault, locks, push, pushpass, runner, scopehold,
-               scriptwatch, workerloss,
+               scriptwatch, workerloss, urgent,
                sharedchecks, slowtests, suitecost, verdictcarry, worktree)
 from .project import Project, command_env, durable_write, write_json
 from . import gitmemo
@@ -1998,15 +1998,14 @@ class Batch:
 
     def _yield_now(self) -> bool:
         """Before each further full check of the search for the entry that broke the checks: whether an
-        urgent approval (pushq.yields_to: priority 1 or urgent) now waits for this target outside the
+        urgent approval (urgent.approvals_waiting: priority 1 or urgent) now waits for this target outside the
         batch. Then the search stops: the prefix known to pass goes, a blamed entry stays blamed, the
         rest is requeued "yielded", and the queue runs the urgent ones alone next (pushq.due), so they
         never wait out the rest of a bisect. The requeued ones are searched anew on the new tip: no entry
         is blamed on a tip it was not checked on, and the urgent ones are never in that search."""
         if not self.yielded_to:
             try:
-                from . import pushq
-                self.yielded_to = pushq.yields_to(self.p, self.target)
+                self.yielded_to = urgent.approvals_waiting(self.p.db, self.target)
             except Exception as e:      # a queue it cannot read: the search goes on as before
                 say(f"cannot read the push queue for urgent approvals: {type(e).__name__}: {e}")
             if self.yielded_to:
