@@ -137,8 +137,10 @@ and CI; agent time is not counted. When a number cannot be calculated, guess and
 the effort will confirm success without the full suites, and the value that counts.
 
 Order by suite hours saved, summed over the evals, per device hour, then adjust where judgement says
-otherwise and record why. Rank every problem, even past the budget. Re-rank after each effort from
-the checks and calculations the change touched; the full suites run only at release.
+otherwise and record why. Rank every problem, even past the budget; problems found later, by
+efforts, samples or the coordinator's own look at the run, join the ranking the same way. Re-rank
+after each effort from the checks and calculations the change touched; the full suites run only at
+release.
 
 ### Efforts
 
@@ -176,6 +178,10 @@ a hang or crash, reset and check the device before the next job.
 
 Estimate a sample's CI time before dispatching, and size it to what it has to separate. Too small
 to beat the noise decides nothing; a full suite to settle what a sample answers costs more.
+
+Grow test size step by step before the full suites, so that each problem a full run could hit shows
+on the smallest set that reveals it. One run may test several changes when its results separate
+what each contributed.
 
 Shape follows the claim: concurrency needs enough simultaneous conversations to load the pool and
 scheduler, precision and long context need long free-running replies, caching needs repeated
