@@ -362,14 +362,16 @@ def _blocks(body: list[str]) -> list[str]:
     return [x.strip("\n") for x in re.split(r"\n\s*\n", "\n".join(body)) if x.strip()]
 
 
-def goal_for_workers(item: str) -> bool:
+def goal_for_workers(item: str, resource: bool = False) -> bool:
     """Whether an item of a section workers get whole (Goals, Resources, the Brief) is in a worker's
     prompt: its audience tag wins; untagged, all but an item that names the coordinator or the daily
-    review (the coordinator's) and never a worker: its own duties, which the full charter keeps."""
+    review (the coordinator's) and never a worker: its own duties, which the full charter keeps.
+    `resource`: an item of Resources, kept whole unless tagged: a list there is one block, and one
+    bullet naming the coordinator must not drop the machines and repos the others name."""
     tag = _AUDIENCE_TAG.search(item)
     if tag:
         return tag[1].lower().startswith("worker")
-    return (not re.search(r"\bcoordinator|\bdaily review", item, re.I)
+    return resource or (not re.search(r"\bcoordinator|\bdaily review", item, re.I)
             or bool(re.search(r"\bworkers?\b", item, re.I)))
 
 
@@ -441,14 +443,15 @@ def worker_context(p: Project, task: dict | None = None,
     goals = any(name(h).startswith("goal") for h, _ in secs)
     whole = lambda h: name(h).startswith(("goal", "resource")) or (not goals and name(h).startswith("brief"))
     heads = sum(len(x) + 2 for x in _worker_heads(p, 999, 99999))   # their longest
-    used = heads + sum(len(h) + len("\n\n".join(x for x in _blocks(b) if goal_for_workers(x))) + 3
+    keep = lambda h, x: goal_for_workers(x, name(h).startswith("resource"))
+    used = heads + sum(len(h) + len("\n\n".join(x for x in _blocks(b) if keep(h, x))) + 3
                        for h, b in secs if whole(h))
     out, dropped = [], 0
     cap = max(WORKER_MEMORY_CHARS, used + WORKER_POLICY_MIN_CHARS)   # long Goals never squeeze the policies out
     for h, b in secs:
         if whole(h):
             blocks = _blocks(b)
-            kept = [x for x in blocks if goal_for_workers(x)]
+            kept = [x for x in blocks if keep(h, x)]
             dropped += len(blocks) - len(kept)
             if kept:
                 out.append(h + "\n" + "\n\n".join(kept))

@@ -177,6 +177,21 @@ def test_worker_charter_digest_drops_coordinator_goal_blocks_and_says_how_many(e
     assert count(head) == count(before) + 2, (head, before)
 
 
+def test_a_resources_list_with_one_coordinator_bullet_keeps_its_other_bullets(env, monkeypatch):
+    """Resources are kept whole: a bulleted list is one block, so judging it as a Goals block would drop
+    every machine and repo it names for one bullet about the coordinator. A [coordinator] tag still drops."""
+    from ttp.prompts import worker_system
+    p = _rules_project(env, monkeypatch)
+    res = ("## Resources\n- Repo: acme/widget, branch dev.\n- Box A (alias box-a): the only machine for "
+           "benchmark jobs.\n- Slack channel: the coordinator posts the daily summary there.\n\n"
+           "Old box notes, kept for the coordinator. [coordinator]\n")
+    p.charter_path.write_text(_BIG_CHARTER.split("## Resources")[0] + res)
+    system = worker_system(p)
+    for line in ("- Repo: acme/widget, branch dev.", "(alias box-a)", "the coordinator posts the daily summary"):
+        assert line in system, line
+    assert "Old box notes" not in system
+
+
 def _reset_charter(p):
     p.charter_path.write_text(_BIG_CHARTER)
     return p
