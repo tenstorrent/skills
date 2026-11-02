@@ -2732,6 +2732,10 @@ class Daemon:
                 self.observe("daemon:write-fence", f"{provider} workers run unfenced: {prov.write_fence(restrictions)}; install "
                              f"it or set providers.{provider}.write_fence false", "low", whole=True,
                              key=f"write-fence:{provider}")
+            if sandboxed and prov.loopback_forward:
+                # Host loopback ports stay reachable from the sandbox's own network namespace (loopproxy).
+                from .loopproxy import ports_env
+                env = {**env, **ports_env(self.cfg["providers"].get(provider, {}).get("loopback_ports"))}
             loaded = prov.plugin_args([d for d in dirs if d not in missing])
             self._alert_plugins_dropped(prov, provider, [d for d in dirs if d not in missing], loaded)
             extra = loaded

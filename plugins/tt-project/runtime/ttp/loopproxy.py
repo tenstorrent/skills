@@ -16,6 +16,7 @@ only: the values may carry the proxy's credentials, so they never go into run.js
 The scheme, credentials, port and path are kept; other hosts, NO_PROXY and no_proxy are left alone."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 PROXY_VARS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
@@ -58,3 +59,94 @@ def env_file(environ: dict) -> dict[str, str]:
     if prev and prev != str(SCRIPT):
         out[PREV_ENV] = prev
     return out
+
+
+# Host loopback ports. The Linux Bash sandbox runs each command in its own network namespace (bwrap
+# --unshare-net) whose only listeners are the proxy bridges, so a direct connect to a port on the host's
+# loopback is refused there (measured, CLI 2.1.296), while the proxy itself reaches the host's
+# loopback (a CONNECT to localhost:<port> answered 200). The CLI has no Linux setting that keeps the
+# host's network. So the runner lists the host ports here (PORTS_ENV) and loopproxy.sh starts, inside
+# each sandboxed command, a socat listener on 127.0.0.1:<port> per port that reaches the host's port
+# through the proxy. NETNS_ENV names the worker's own namespace: the script forwards only from another
+# one, so a command run outside the sandbox never binds a host port. macOS (Seatbelt, one namespace)
+# gets no forwarders.
+PORTS_ENV = "TTP_LOOPBACK_PORTS"
+NETNS_ENV = "TTP_HOST_NETNS"
+MAX_PORTS = 32   # each is one socat per sandboxed command
+LOOPBACK_NAMES = {"localhost", "127.0.0.1", "::1", "ip6-localhost"}
+# /proc/net/tcp{,6} local addresses a connect to localhost reaches: loopback first, then every address.
+_V4_LOOP, _V4_ANY = "0100007F", "00000000"
+_V6_LOOP, _V6_ANY = "0" * 24 + "01000000", "0" * 32
+_V6_MAPPED_LOOP, _V6_MAPPED_ANY = "0" * 16 + "FFFF0000" + _V4_LOOP, "0" * 16 + "FFFF0000" + _V4_ANY
+
+
+def listening(net: Path = Path("/proc/net")) -> list[int]:
+    """TCP ports listening on this host's 127.0.0.1 or ::1, then those listening on every address
+    (also reachable at localhost); [] where /proc/net is missing."""
+    loop, wild = [], []
+    for name in ("tcp", "tcp6"):
+        try:
+            lines = (net / name).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            f = line.split()
+            if len(f) < 4 or f[3] != "0A":   # 0A: LISTEN
+                continue
+            addr, _, port = f[1].partition(":")
+            addr = addr.upper()
+            if addr in (_V4_LOOP, _V6_LOOP, _V6_MAPPED_LOOP):
+                loop.append(int(port, 16))
+            elif addr in (_V4_ANY, _V6_ANY, _V6_MAPPED_ANY):
+                wild.append(int(port, 16))
+    return list(dict.fromkeys(loop + wild))
+
+
+def ssh_ports(path: Path | None = None) -> list[int]:
+    """Ports of the host's ssh tunnel ends named in the user's ssh config: `Port` of a Host block whose
+    HostName is a loopback name, and each LocalForward's listening port bound on loopback (or on no
+    address). Include files are not read."""
+    path = path or Path.home() / ".ssh" / "config"
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    out: list[int] = []
+    block: dict[str, str] = {}
+
+    def flush():
+        if block.get("hostname", "").lower() in LOOPBACK_NAMES and block.get("port", "").isdigit():
+            out.append(int(block["port"]))
+        block.clear()
+    for line in lines:
+        parts = line.strip().replace("=", " ", 1).split(None, 1)
+        if not parts or parts[0].startswith("#"):
+            continue
+        key, value = parts[0].lower(), (parts[1].strip() if len(parts) > 1 else "")
+        if key in ("host", "match"):
+            flush()
+        elif key == "localforward":
+            bind = value.split()[0] if value else ""
+            host, _, port = bind.strip("[]").rpartition(":") if ":" in bind else ("", "", bind)
+            if port.isdigit() and host.strip("[]").lower() in LOOPBACK_NAMES | {"", "*", "0.0.0.0"}:
+                out.append(int(port))
+        else:
+            block.setdefault(key, value.split()[0] if value else "")
+    flush()
+    return out
+
+
+def ports_env(setting=None, net: Path = Path("/proc/net"), ssh_config: Path | None = None) -> dict[str, str]:
+    """The worker's PORTS_ENV and NETNS_ENV. `setting` is providers.<name>.loopback_ports: unset or a list
+    of extra ports (forwarded first) adds the host's loopback listeners and its ssh tunnel ends; False
+    forwards none, so sandboxed commands keep their own namespace with only the proxy."""
+    if setting is False:
+        return {}
+    extra = [int(p) for p in (setting if isinstance(setting, list) else [])
+             if isinstance(p, int) and not isinstance(p, bool)]
+    ports = [p for p in dict.fromkeys([*extra, *ssh_ports(ssh_config), *listening(net)]) if 0 < p < 65536]
+    try:
+        netns = os.readlink("/proc/self/ns/net")
+    except OSError:
+        return {}   # no network namespaces here (macOS): nothing to forward from
+    return {PORTS_ENV: " ".join(map(str, ports[:MAX_PORTS])), NETNS_ENV: netns} if ports else {}

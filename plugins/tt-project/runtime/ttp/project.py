@@ -538,8 +538,9 @@ EXTRA_KEYS = {
 OPEN_SECTIONS = {"resources"}           # any name below is fine
 # write_fence: false runs the provider's workers without its optional write fence (Claude's Bash
 # sandbox, Provider.fence_args); default on where the host can run it.
+# loopback_ports: extra host loopback ports fenced workers reach (loopproxy.ports_env), or false for none.
 PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "write_fence", "mcp_servers", "mcp_withheld",
-                 "disallowed_tools",
+                 "disallowed_tools", "loopback_ports",
                  # providers.chat only (chatbridge.py): the `ttp secret endpoint` alias holding the key,
                  # the base URL saved with it, a max_tokens cap and the model's context_window (also per tier).
                  # route_cooldown_s: how long a tier routed to it (tiers.<tier>.route, route.py) runs on the
@@ -2358,7 +2359,7 @@ def layered(raw: dict) -> dict:
 
 # A chat worker is Claude Code too: unset, these keys take claude's value, so a routed model never
 # gets the user's plugins, MCP servers or withheld connectors that claude workers are kept from.
-CHAT_INHERITS = ("worker_isolation", "mcp_withheld")
+CHAT_INHERITS = ("worker_isolation", "mcp_withheld", "loopback_ports")
 
 
 def _chat_inherits(cfg: dict) -> None:

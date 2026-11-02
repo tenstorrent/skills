@@ -386,6 +386,10 @@ class Provider:
     # the daemon then sets TTP_FENCE_BY_NAME, and the hook refuses such a command (hook.fenced_ssh, fenced_git).
     fence_by_name = False
 
+    # Whether a fenced worker's commands forward the host's loopback ports into their own network
+    # namespace (loopproxy.ports_env, sourced per command): Claude Code's Bash sandbox only.
+    loopback_forward = False
+
     def fence_args(self, argv: list[str], dirs: list[str], cwd: str = "", on: bool = True,
                    restrictions: dict | None = None) -> tuple[list[str], bool]:
         """`argv` with the write fence that also lets the worker write `dirs`, and whether the run is

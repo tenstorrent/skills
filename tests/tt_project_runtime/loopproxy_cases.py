@@ -109,3 +109,242 @@ def test_loopproxy_runner_starts_the_agent_with_loopback_proxies(env, tmp_path, 
     assert runner.supervise(run_dir) == 0
     assert dump.read_text() == "http://user:pw@127.0.0.1:3128|socks5h://127.0.0.1:1080|localhost"
     assert "pw@" not in (run_dir / "run.json").read_text()
+
+
+# Host loopback ports (loopproxy.ports_env and the forwarders loopproxy.sh starts in the Bash sandbox).
+def _proc_net(tmp_path, tcp: list[str], tcp6: list[str]):
+    head = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+    net = tmp_path / "net"
+    net.mkdir()
+    for name, rows in (("tcp", tcp), ("tcp6", tcp6)):
+        (net / name).write_text(head + "".join(f"   {i}: {local} {'0' * (len(local) - 5)}:0000 {st} 0 0 0\n"
+                                               for i, (local, st) in enumerate(rows)))
+    return net
+
+
+def test_loopback_listening_reads_loopback_then_wildcard_listeners(tmp_path):
+    from ttp.loopproxy import listening
+    net = _proc_net(tmp_path,
+                    [("00000000:0016", "0A"), ("0100007F:1F90", "0A"), ("0100007F:2328", "01"),   # 01: established
+                     ("3500007F:0035", "0A"), ("0A00000A:1388", "0A")],                        # 127.0.0.53, 10.0.0.10
+                    [("00000000000000000000000001000000:1389", "0A"), ("0" * 32 + ":1F90", "0A"),
+                     ("0000000000000000FFFF00000100007F:138A", "0A")])
+    assert listening(net) == [8080, 5001, 5002, 22]
+    assert listening(tmp_path / "missing") == []
+
+
+def test_loopback_ssh_ports_reads_tunnel_ends_from_ssh_config(tmp_path):
+    from ttp.loopproxy import ssh_ports
+    cfg = tmp_path / "config"
+    cfg.write_text("""# a comment
+Host tunnel
+    HostName localhost
+    Port 2222
+Host tunnel6
+  hostname=::1
+  port=2223
+Host far
+    HostName box.example.com
+    Port 2224
+    LocalForward 9001 127.0.0.1:80
+    LocalForward 127.0.0.1:9002 other:80
+    LocalForward [::1]:9003 other:80
+    LocalForward *:9004 other:80
+    LocalForward 10.1.2.3:9005 other:80
+    LocalForward /tmp/sock other:80
+Host noport
+    HostName 127.0.0.1
+Host
+""")
+    assert ssh_ports(cfg) == [2222, 2223, 9001, 9002, 9003, 9004]
+    assert ssh_ports(tmp_path / "missing") == []
+
+
+def test_loopback_ports_env_by_default_with_extras_first_capped_and_off(tmp_path, monkeypatch):
+    from ttp import loopproxy
+    net = _proc_net(tmp_path, [("0100007F:1F90", "0A"), ("00000000:2710", "0A")], [])
+    cfg = tmp_path / "config"
+    cfg.write_text("Host t\n  HostName localhost\n  Port 2222\n")
+    got = loopproxy.ports_env(None, net, cfg)
+    assert got[loopproxy.PORTS_ENV] == "2222 8080 10000", "on by default: ssh tunnel ends, then listeners"
+    assert got[loopproxy.NETNS_ENV] == os.readlink("/proc/self/ns/net")
+    assert loopproxy.ports_env([7000, 8080, True, "x"], net, cfg)[loopproxy.PORTS_ENV] == "7000 8080 2222 10000"
+    assert loopproxy.ports_env(False, net, cfg) == {}, "false keeps the sandbox's own namespace"
+    assert loopproxy.ports_env(None, tmp_path / "none", tmp_path / "none") == {}
+    many = list(range(20000, 20000 + loopproxy.MAX_PORTS + 5))
+    assert len(loopproxy.ports_env(many, net, cfg)[loopproxy.PORTS_ENV].split()) == loopproxy.MAX_PORTS
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("8080,9000", [8080, 9000]), ("8080 9000 8080", [8080, 9000]), ([5000], [5000]), ("false", False),
+    ("off", False), (False, False), ("0", False)])
+def test_loopback_ports_setter_accepts(value, expected):
+    from ttp.coordinator import _loopback_ports
+    assert _loopback_ports("k", value) == expected
+
+
+@pytest.mark.parametrize("value", ["", "x", "70000", "8080,abc", "-1", True, [True], ["a"]])
+def test_loopback_ports_setter_refuses(value):
+    from ttp.coordinator import _loopback_ports
+    with pytest.raises(ValueError):
+        _loopback_ports("k", value)
+
+
+def test_daemon_gives_fenced_claude_workers_the_host_loopback_ports(env, monkeypatch):
+    from ttp import loopproxy
+    from ttp.daemon import Daemon
+    from ttp.providers import claude
+    monkeypatch.setattr(claude.Claude, "binary", lambda self: "/usr/bin/true")   # never a real agent
+    monkeypatch.setattr(claude.sys, "platform", "linux")
+    have = {"bwrap", "socat"}
+    monkeypatch.setattr(claude, "find_binary", lambda b: f"/usr/bin/{b}" if b in have else None)
+    monkeypatch.setattr(loopproxy, "listening", lambda net=None: [8080])
+    monkeypatch.setattr(loopproxy, "ssh_ports", lambda path=None: [2222])
+    p = make(env)
+
+    def launch():
+        tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+        rid = Daemon(p.base).start_run("worker", "go", "claude", "light", str(env["repo"]), task=p.db.task(tid))
+        (p.runs / str(rid) / "STOP").touch()
+        return json.loads((p.runs / str(rid) / "run.json").read_text())["env"]
+
+    def set_ports(value):
+        provs = p.config()["providers"]
+        p.set_config("providers", {**provs, "claude": {**provs.get("claude", {}), "loopback_ports": value}})
+    got = launch()
+    assert got[loopproxy.PORTS_ENV] == "2222 8080" and got[loopproxy.NETNS_ENV].startswith("net:"), "on by default"
+    set_ports([5000])
+    assert launch()[loopproxy.PORTS_ENV] == "5000 2222 8080"
+    set_ports(False)
+    assert loopproxy.PORTS_ENV not in launch(), "false: the sandbox keeps its own namespace"
+    set_ports(None)
+    have.discard("bwrap")
+    assert loopproxy.PORTS_ENV not in launch(), "an unfenced worker shares the host's network already"
+
+
+def _fake_socat(tmp_path):
+    """A socat on PATH that records its arguments and listens on nothing."""
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    log = tmp_path / "socat.log"
+    (bin_ / "socat").write_text(f'#!/bin/sh\necho "$@" >> {shlex.quote(str(log))}\n')
+    (bin_ / "socat").chmod(0o755)
+    return bin_, log
+
+
+def test_loopback_script_forwards_only_from_another_namespace(tmp_path):
+    """The worker's own namespace (a command outside the sandbox) binds nothing; another one gets one
+    listener per unprivileged port, through the proxy with its credentials."""
+    from ttp.loopproxy import NETNS_ENV, PORTS_ENV, SCRIPT
+    if not Path("/proc/self/ns/net").exists():
+        pytest.skip("no network namespaces")
+    bin_, log = _fake_socat(tmp_path)
+    base = {"PATH": f"{bin_}:{os.environ['PATH']}", "HTTPS_PROXY": "http://user:pw@localhost:3128",
+            PORTS_ENV: "40001 22 x 40002"}
+    for netns, want in ((os.readlink("/proc/self/ns/net"), False), ("net:[1]", True), ("", False)):
+        log.unlink(missing_ok=True)
+        out = subprocess.run(["bash", "-c", 'set -u; . "$1"; echo "rc=$?"', "sh", str(SCRIPT)], capture_output=True,
+                             text=True, env={**base, NETNS_ENV: netns}, timeout=60)
+        assert out.stdout.strip() == "rc=0", out
+        calls = log.read_text().splitlines() if log.exists() else []
+        if not want:
+            assert calls == [], netns
+            continue
+        assert calls == [f"TCP-LISTEN:{p},bind=127.0.0.1,fork,reuseaddr "
+                         f"PROXY:127.0.0.1:localhost:{p},proxyport=3128,proxyauth=user:pw" for p in (40001, 40002)]
+    log.unlink(missing_ok=True)
+    out = subprocess.run(["bash", "-c", '. "$1"', "sh", str(SCRIPT)], capture_output=True, text=True, timeout=60,
+                         env={**base, NETNS_ENV: "net:[1]", "HTTPS_PROXY": "http://proxy.example.com:3128"})
+    assert out.returncode == 0 and not log.exists(), "only the sandbox's own loopback proxy carries them"
+
+
+def test_loopback_live_connect_from_a_namespace_without_the_host_network(tmp_path):
+    """A host listener on 127.0.0.1 is refused from a fresh network namespace (bwrap --unshare-net, as
+    the Bash sandbox runs each command) and answers once loopproxy.sh forwards it through a CONNECT
+    proxy bridged in on a Unix socket, as the sandbox bridges its own."""
+    import socket
+    import threading
+    from ttp.loopproxy import NETNS_ENV, PORTS_ENV, SCRIPT
+    bwrap, socat = shutil.which("bwrap"), shutil.which("socat")
+    if not (bwrap and socat):
+        pytest.skip("needs bwrap and socat")
+    if subprocess.run([bwrap, "--unshare-net", "--dev-bind", "/", "/", "true"], capture_output=True).returncode:
+        pytest.skip("bwrap cannot start a network namespace here")
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(8)
+    port = server.getsockname()[1]
+    sock = tmp_path / "proxy.sock"
+    proxy = socket.socket(socket.AF_UNIX)
+    proxy.bind(str(sock))
+    proxy.listen(8)
+
+    def serve():
+        while True:
+            try:
+                c, _ = server.accept()
+            except OSError:
+                return
+            c.sendall(b"pong\n")
+            c.close()
+
+    def pipe(a, b):
+        try:
+            while data := a.recv(65536):
+                b.sendall(data)
+        except OSError:
+            pass
+        finally:
+            for s in (a, b):
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def connect_proxy():
+        while True:
+            try:
+                c, _ = proxy.accept()
+            except OSError:
+                return
+            head = b""
+            while b"\r\n\r\n" not in head and (chunk := c.recv(4096)):
+                head += chunk
+            target = head.split()[1].decode()
+            host, _, tport = target.rpartition(":")
+            try:
+                # As the sandbox's proxy, which resolves localhost on the host (no resolver needed here).
+                host = "127.0.0.1" if host == "localhost" else host.strip("[]")
+                up = socket.create_connection((host, int(tport)), timeout=5)
+            except OSError:
+                c.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                c.close()
+                continue
+            c.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            threading.Thread(target=pipe, args=(c, up), daemon=True).start()
+            threading.Thread(target=pipe, args=(up, c), daemon=True).start()
+
+    for fn in (serve, connect_proxy):
+        threading.Thread(target=fn, daemon=True).start()
+    # The connect runs from a script started inside a compound command: the forwarders serve every
+    # process of the sandboxed command, not only a bare top-level one.
+    probe = tmp_path / "probe.py"
+    probe.write_text(f"import socket\ns = socket.create_connection(('127.0.0.1', {port}), timeout=5)\n"
+                     "print(s.makefile().readline().strip())\n")
+    script = tmp_path / "connect.sh"
+    script.write_text(f"python3 {shlex.quote(str(probe))} 2>/dev/null || echo refused\n")
+    connect = f"true && sh {shlex.quote(str(script))} | cat"
+    inner = (f'{shlex.quote(socat)} TCP-LISTEN:3128,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:{shlex.quote(str(sock))} '
+             f'</dev/null >/dev/null 2>&1 & i=0; while [ $i -lt 100 ] && ! grep -q ":0C38 00000000:0000 0A" /proc/net/tcp; '
+             f'do sleep 0.02; i=$((i+1)); done; echo "before=$({connect})"; . {shlex.quote(str(SCRIPT))}; '
+             f'echo "after=$({connect})"')
+    try:
+        out = subprocess.run([bwrap, "--unshare-net", "--unshare-pid", "--die-with-parent", "--dev-bind", "/", "/",
+                              "--proc", "/proc", "bash", "-c", inner],
+                             capture_output=True, text=True, timeout=60,
+                             env={"PATH": os.environ["PATH"], "HTTPS_PROXY": "http://localhost:3128",
+                                  PORTS_ENV: str(port), NETNS_ENV: os.readlink("/proc/self/ns/net")})
+    finally:
+        server.close()
+        proxy.close()
+    assert "before=refused" in out.stdout and "after=pong" in out.stdout, (out.stdout, out.stderr)

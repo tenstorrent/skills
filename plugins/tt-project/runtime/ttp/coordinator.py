@@ -305,6 +305,27 @@ def _checks_slots(v):
     return n
 
 
+def _loopback_ports(key: str, v) -> list[int] | bool:
+    """False for "false", "off", "no" or "0"; else ports from 1 to 65535, comma or space separated."""
+    if isinstance(v, bool):
+        if v:
+            raise ValueError(f"{key}: give ports (e.g. 8080,9000) or false")
+        return False
+    if isinstance(v, list):
+        items = v
+    elif str(v).strip().lower() in ("false", "off", "no", "0"):
+        return False
+    else:
+        items = str(v).replace(",", " ").split()
+    try:
+        ports = [int(p) for p in items if not isinstance(p, bool)]
+    except (TypeError, ValueError):
+        ports = []
+    if not ports or len(ports) != len(items) or any(not 0 < p < 65536 for p in ports):
+        raise ValueError(f"{key}: give ports from 1 to 65535 (e.g. 8080,9000) or false")
+    return list(dict.fromkeys(ports))
+
+
 def _count(key: str, v, top: int) -> int:
     """A whole number from 0 to `top` (seconds or a count)."""
     try:
@@ -409,6 +430,10 @@ USER_SETTABLE = {
     "providers.claude.mcp_servers": lambda v: name_list(v, strict=True),
     # Connected MCP servers kept from workers on purpose: ttp status no longer names them (mcpgap.py).
     "providers.claude.mcp_withheld": lambda v: name_list(v, strict=True),
+    # Host loopback ports fenced workers reach besides the host's listeners and ssh tunnel ends, or
+    # false to forward none (loopproxy.ports_env). Unset, chat takes the claude value.
+    "providers.claude.loopback_ports": lambda v: _loopback_ports("providers.claude.loopback_ports", v),
+    "providers.chat.loopback_ports": lambda v: _loopback_ports("providers.chat.loopback_ports", v),
     # Tools workers and reviewers may not call, on top of the built-in denylist (mcp__<server>__*).
     "providers.claude.disallowed_tools": lambda v: tool_list(v, strict=True),
     # Hours before an unanswered ask resolves to its default (askauto.py, expire_asks); 0 turns it off.

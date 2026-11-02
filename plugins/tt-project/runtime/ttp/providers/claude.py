@@ -272,6 +272,7 @@ class Claude(Provider):
         return [flag, text] if len(text.encode()) <= MAX_ARG_BYTES else []
 
     fence_by_name = True   # FENCE_EXCLUDED
+    loopback_forward = True   # loopproxy.sh forwards the host's loopback ports into each command
 
     def write_fence(self, restrictions=None) -> str:
         missing = fence_missing()
