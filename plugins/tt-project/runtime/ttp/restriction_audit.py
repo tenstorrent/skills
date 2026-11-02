@@ -26,8 +26,29 @@ from .project import Project
 # A term a tool would carry word for word: `code`, a path or dotted name, an UPPER_CASE name.
 _TOOL_TERM_RE = re.compile(r"`([^`\n]{3,60})`|(?<![\w/.-])([A-Za-z0-9-]*[A-Za-z0-9][_/.][A-Za-z0-9_/.-]*[A-Za-z0-9])"
                            r"|\b([A-Z][A-Z0-9]*_[A-Z0-9_]+|[A-Z]{4,})\b")
+_CODE_SPAN = re.compile(r"`([^`\n]*)`")
 TOOL_SCAN_FILES = 2000   # files read per check at most (bin/ and hooks/ trees)
 TOOL_SCAN_BYTES = 262144   # a larger file is not a tool script
+
+
+def tool_term_ids(text: str) -> set[str]:
+    """The identifiers (_TOOL_TERM_RE) of `text`. Backticks pair in order: a code span too long to be
+    one term gives the terms inside it, and its closing backtick never opens a span with the next one
+    (the text between two spans is prose, not a term)."""
+    out: set[str] = set()
+
+    def bare(seg: str) -> None:   # text with no paired backticks: paths, dotted and UPPER_CASE names only
+        out.update(next(g for g in m.groups() if g) for m in _TOOL_TERM_RE.finditer(seg.replace("`", " ")))
+    pos = 0
+    for m in _CODE_SPAN.finditer(text):
+        bare(text[pos:m.start()])
+        if 3 <= len(m.group(1)) <= 60:
+            out.add(m.group(1))
+        else:
+            bare(m.group(1))
+        pos = m.end()
+    bare(text[pos:])
+    return out
 
 
 def tool_terms(old: str, new: str, charter: str = "") -> tuple[set[str], set[str]]:
@@ -37,7 +58,7 @@ def tool_terms(old: str, new: str, charter: str = "") -> tuple[set[str], set[str
     dropped fewer than two)."""
     from .coordinator import _changed_sentences, _rule_words
     changed = " ".join(_changed_sentences(old, new)) or old
-    ids = {next(g for g in m.groups() if g) for m in _TOOL_TERM_RE.finditer(changed)}
+    ids = tool_term_ids(changed)
     ids = {t for t in ids if t not in new and t not in charter and not re.fullmatch(r"[\d./-]+", t)}
     words = _rule_words(changed) - _rule_words(new)
     return ids, (words if len(words) >= 2 else _rule_words(changed))
@@ -91,7 +112,7 @@ def still_stated(charter: str, old: str) -> str:
     for item in (" ".join(" ".join(it).split()) for it in split_items(old)):
         if item.startswith("#"):
             continue
-        ids = {next(g for g in m.groups() if g) for m in _TOOL_TERM_RE.finditer(item)}
+        ids = tool_term_ids(item)
         words = _rule_words(item)
         if len(words) < 2:
             return ""

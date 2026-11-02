@@ -3166,7 +3166,8 @@ def test_dropping_an_unsourced_copy_of_a_rule_the_brief_or_a_sourced_item_states
     """An advisory Restrictions item the coordinator drops while the Brief, or a sourced item, still states
     its words: the tools, config and specs carrying them are right, so no restriction_tools event and no
     digest echo line (`ttp echoes` keeps them as advisory, 'still stated in ...'). A sourced item the user
-    retires, or an unsourced one stated nowhere else, is still reported."""
+    retires is still reported; an unsourced one stated nowhere else raises its restriction_tools event, and
+    its echoes are advisory: the coordinator dropped it, the user retired nothing."""
     p = make(env)
     from ttp import coordinator as coord, echoes
     brief = "## Brief\nEvery change keeps the required `lint-check` suite green before it is published.\n\n"
@@ -3204,12 +3205,13 @@ def test_dropping_an_unsourced_copy_of_a_rule_the_brief_or_a_sourced_item_states
                           4, user_turn=True)
     assert len(tools) == 1 and "publish-guard.sh:2" in tools[0], tools
     assert lines and any("publish-guard.sh" in ln for ln in lines), lines
-    # An unsourced item no binding section states is still reported.
+    # An unsourced item no binding section states: its tool is reported, its echoes are advisory.
     alone = "Keep the `lint-check` suite green before publishing a nightly image."
-    tools, lines, _ = run(f"# demo\n\n## Brief\nShip it.\n\n## Restrictions\n- {alone}\n",
-                          {**drop, "quote": alone}, 5)
+    tools, lines, data = run(f"# demo\n\n## Brief\nShip it.\n\n## Restrictions\n- {alone}\n",
+                             {**drop, "quote": alone}, 5)
     assert len(tools) == 1 and "publish-guard.sh:2" in tools[0], tools
-    assert any("publish-guard.sh" in ln for ln in lines), lines
+    assert lines == [] and any("publish-guard.sh" in m["where"] and m["action"] == "none"
+                               for m in data["matches"]), (lines, data["matches"])
 
 
 def test_an_unsourced_copy_dropped_with_an_over_reason_raises_no_restriction_tools_event(env):

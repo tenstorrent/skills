@@ -33,7 +33,8 @@ advisory: counted on one line, never a fix order. A fourth kind, UNVERIFIED (its
 shows the user withdrew that rule), is advisory too: a record stored before kinds existed gets one from
 its source (_kind), and an unknown kind or source is UNVERIFIED. A hit of an unsourced Restrictions item dropped (by the coordinator or
 the user, with `over` or not: restriction_source.drops_unsourced) is advisory while the Brief or a sourced item still states it (restriction_audit.still_stated):
-that rule still binds, so its copies are right. `export` is the read-only full list
+that rule still binds, so its copies are right. One the coordinator dropped on its own is SUPERSEDED, never
+WITHDRAWN, and one a record stored before the flag holds is UNVERIFIED (_unsourced). `export` is the read-only full list
 behind `ttp echoes`. Accepted gaps (settled weak-token set): a dashed config-style name with a decimal
 suffix ('max-ratio-1.5') counts as weak; a version joined by '_', '=' or '+' counts as strong (over-flag).
 """
@@ -60,6 +61,7 @@ HISTORICAL_MAX = 200                 # index entries read
 _BINDING_DIRS = {"bin", "prompts", "hooks", "tools"}   # harness/ folders of live scripts and prompts
 _INSTRUCTIONS = {"CLAUDE.md", "AGENTS.md", "SKILL.md"}
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_BRIEF = re.compile(r"charter:brief\b", re.I)   # the Brief, whatever its heading adds
 RETIRED_DAYS = 30
 RETIRED_KEEP = 50
 MAX_PHRASES = 8
@@ -204,8 +206,7 @@ def record(db, source: str, old: str, new: str = "", skip: list[str] = (), now: 
            "source": " ".join(source.split())[:200], "old": " ".join((old or "").split())[:600],
            "new": _flat(new)[:4000], "phrases": ps, "skip": list(skip), "negated": negated,
            "kind": kind if kind in KINDS else UNVERIFIED}
-    if unsourced:
-        rec["unsourced"] = True
+    rec["unsourced"] = bool(unsourced)   # stored either way: a record without it predates the flag (_unsourced)
     _store(db, rec, now)
     return rec
 
@@ -495,10 +496,25 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _unsourced(rec: dict) -> bool:
+    """Whether retirement `rec` dropped only unsourced Restrictions items. A record stored before the flag
+    existed gets it from its source (a charter Restrictions quote or section replaced) and its retired
+    text (no item of it cites a source), and is UNVERIFIED (records): nothing shows the user dropped it."""
+    if "unsourced" in rec:
+        return bool(rec["unsourced"])
+    if not re.fullmatch(r"charter 'restriction[^']*' (?:quote|section) replaced", (rec.get("source") or "").lower()):
+        return False
+    from .restriction_source import sourced, split_items
+    items = [" ".join(" ".join(x).split()) for x in split_items(rec.get("old") or "")]
+    items = [x for x in items if x and not x.startswith("#")]
+    return bool(items) and not any(sourced(x) for x in items)
+
+
 def records(p, now: float | None = None) -> list[dict]:
-    """The live retirements (kept RETIRED_DAYS), each with its kind (see _kind)."""
+    """The live retirements (kept RETIRED_DAYS), each with its kind (see _kind; _unsourced)."""
     now = time.time() if now is None else now
-    return [dict(r, kind=_kind(r)) for r in p.db.kv(RETIRED_KEY, []) or []
+    return [dict(r, kind=UNVERIFIED if "unsourced" not in r and _unsourced(r) else _kind(r))
+            for r in p.db.kv(RETIRED_KEY, []) or []
             if isinstance(r, dict) and now - r.get("at", 0) < RETIRED_DAYS * 86400]
 
 
@@ -527,15 +543,15 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None) -> l
         if not own:
             continue
         stated = ""
-        if rec.get("unsourced"):   # a dropped advisory copy of a rule a binding section still states
+        if _unsourced(rec):   # a dropped advisory copy of a rule a binding section still states
             from .restriction_audit import still_stated
             stated = still_stated(charter, rec.get("old") or "")
         weak = {ph for ph in own if _weak(ph) or _fragment(ph, rec.get("old") or "")}
         own.sort(key=lambda ph: ph in weak)   # a governing phrase first: a hit rests on it when it can
         skip = set(rec.get("skip") or ())
         for key, label, text, flat in where:
-            if key in skip or (rec["id"], key) in seen or key[:14].lower() == "charter:brief":   # the user's own
-                continue                                                                        # words, never one
+            if key in skip or (rec["id"], key) in seen or _BRIEF.match(key):   # the user's own words, never one
+                continue
             ph = _hit(rec, flat, own)
             if ph:
                 seen.add((rec["id"], key))

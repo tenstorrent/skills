@@ -634,3 +634,66 @@ def test_an_advisory_item_dropped_as_a_duplicate_of_the_brief_is_no_echo_and_a_w
     assert drops_unsourced(charter, quote="") is False and drops_unsourced(charter, quote="not there") is False
     assert drops_unsourced("", body="- Keep it green.\n- Never tag.\n") is True
     assert drops_unsourced("", body="- Keep it green.\n- Never tag. (origin: harness gate)\n") is False
+
+
+def test_a_dropped_duplicate_of_a_headed_brief_is_no_echo_and_a_user_replacement_still_echoes(env):
+    """An unsourced Restrictions item dropped with an empty-text quote while a Brief under a longer heading
+    states it (its long code span then prose between two spans, comma aside): no echo against the Brief,
+    the Goals or a task spec, whether the record is new or predates the `unsourced` flag. The coordinator
+    dropping one nothing states is advisory, the user dropping it a fix order. A cited item the user
+    replaces still echoes its stale copies in the Goals, memory and an open task spec."""
+    from ttp import coordinator as coord, echoes
+    from ttp.restriction_audit import still_stated, tool_term_ids
+    p = make(env)
+    run = "`python3 -m pytest -q tests/test_alpha_plugin.py tests/test_alpha_runtime.py tests/test_catalogue.py`"
+    brief = f"- Every change keeps {run} green, and `alpha validate plugins/alpha --strict` passing.\n"
+    item = f"Every change keeps {run} green and `alpha validate plugins/alpha --strict` passing."
+    assert " green and " not in tool_term_ids(item) and "tests/test_catalogue.py" in tool_term_ids(item)
+    assert tool_term_ids("run `make lint` and `make test` first") == {"make lint", "make test"}
+    goals = "## Goals\nShip safely: every change keeps `alpha validate plugins/alpha --strict` passing.\n\n"
+    spec = p.db.add_task("guard", f"Required checks before hand-off: {run} green.")
+    charter = (f"# demo\n\n## Brief (verbatim from the user)\n{brief}\n{goals}"
+               f"## Restrictions\n- Never merge. (user msg #1)\n- {item}\n")
+    p.charter_path.write_text(charter)
+    assert still_stated(charter, item) == "Brief"
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": item, "text": "",
+                            "over": "a duplicate of the Brief's own words, which still state it"}], turn=2) == []
+    assert item not in p.charter_path.read_text()
+    assert echoes.digest_lines(p) == []
+    matches = echoes.export(p)["matches"]
+    assert {"charter section 'Goals'", f"task #{spec} spec"} <= {m["where"] for m in matches}, matches
+    assert all(m["action"] == "none" for m in matches), matches
+    assert not any("Brief" in m["where"] for m in matches), matches
+    # The same drop recorded before the flag existed (kind withdrawn, no `unsourced`): no echo either.
+    rec = dict(p.db.kv(echoes.RETIRED_KEY)[0], kind=echoes.WITHDRAWN)
+    rec.pop("unsourced")
+    p.db.set_kv(echoes.RETIRED_KEY, [rec])
+    assert echoes.digest_lines(p) == [] and echoes.records(p)[0]["kind"] == echoes.UNVERIFIED
+    # An unsourced item nothing else states: the coordinator's own drop is advisory, the user's a fix order.
+    for user, n in ((False, 0), (True, 2)):
+        p.db.set_kv(echoes.RETIRED_KEY, [])
+        own = "Pause the `gamma-queue` drain on weekends."
+        p.charter_path.write_text(f"# demo\n\n## Brief\nShip it.\n\n## Restrictions\n- Never merge. (user msg #1)\n"
+                                  f"- {own}\n")
+        p.set_config("delivery.drain_note", "pause the gamma-queue drain on weekends")
+        act = {"type": "charter_update", "section": "Restrictions", "quote": own, "text": ""}
+        if not user:
+            act["over"] = "no user message states it; the drain is not ours to pause"
+        assert coord.apply(p, [act], turn=3, user_turn=user) == []
+        assert len(echoes.digest_lines(p)) == n, (user, echoes.digest_lines(p))
+    # A cited item the user replaces: its stale copies in the Goals, memory and an open task still echo.
+    p.db.set_kv(echoes.RETIRED_KEY, [])
+    cited = "Release only after the `freeze-gate` sign-off (user msg #2)."
+    mem = p.add_memory("Releases wait for the freeze-gate sign-off.", kind="fact")
+    task = p.db.add_task("release", "Hold the build until the freeze-gate sign-off.")
+    p.charter_path.write_text(f"# demo\n\n## Brief\nShip it.\n\n## Goals\nRelease after the freeze-gate sign-off.\n\n"
+                              f"## Restrictions\n- {cited}\n")
+    said = _echo_said(p, "Release once checks pass.")
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": cited,
+                            "text": "Release once checks pass.",
+                            "source": {"msg": said, "quote": "release once checks pass"}}],
+                       turn=4, user_turn=True) == []
+    lines = echoes.digest_lines(p)
+    assert lines and lines[0] == echoes.RETIRED_HEADER, lines
+    for where in ("charter section 'Goals'", f"memory [{mem.stem}]", f"task #{task} spec"):
+        assert any(x.startswith(f"- {where}:") for x in lines), (where, lines)
