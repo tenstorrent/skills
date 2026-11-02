@@ -131,3 +131,96 @@ def test_ttp_checks_a_lost_worker_beside_a_real_failure_or_a_crash_twice_is_a_fa
     assert "infra_fault" not in json.loads((run / "checks.json").read_text())
     assert not (run / workerloss.MARKER).exists()
     capsys.readouterr()
+
+
+def test_push_run_one_reruns_a_lost_worker_once_holds_a_second_clean_loss_and_fails_the_rest(tmp_path):
+    """`ttp push` and `ttp land` (push._run_one): a lost worker alone runs the check once more; lost
+    again, every worker exiting 0, it is the host (BUSY with a retry_when), never CHECKS_FAILED. A
+    crash twice, or a loss beside real failures, still fails."""
+    import os
+    from ttp import push, workerloss
+    cases = {"pass": ([_lost_log([0], left=3), ""], 0, 2),
+             "infra": ([_lost_log([0, 0], left=3)], push.BUSY, 1 + workerloss.RERUNS),
+             "crash": ([_lost_log([0, 9])], push.CHECKS_FAILED, 2),
+             "real": ([_lost_log([0], left=3, failed=6)], push.CHECKS_FAILED, 1)}
+    for name, (runs, want, n) in cases.items():
+        d = tmp_path / name
+        d.mkdir()
+        argv, ran = _lost_check(d, runs)
+        said = []
+        assert push._run_one(" ".join(argv), d, dict(os.environ), said.append) == want, (name, said)
+        assert ran() == n, (name, said)
+        reran = [s for s in said if s.startswith("a test worker was lost mid-run")]
+        assert len(reran) == (n - 1), (name, said)
+        infra = [s for s in said if s.startswith("infrastructure fault: test workers were lost")]
+        assert bool(infra) == (name == "infra"), (name, said)
+
+
+def test_push_run_one_infra_hold_names_a_time_retry_when(tmp_path):
+    import os
+    from ttp import push
+    argv, ran = _lost_check(tmp_path, [_lost_log([0], left=1)])
+    said = []
+    assert push._run_one(" ".join(argv), tmp_path, dict(os.environ), said.append) == push.BUSY
+    assert said[-1].startswith("infrastructure fault: test workers were lost mid-run again") and \
+        "; not pushing. Hand off `waiting`; retry_when: test \"$(date +%s)\" -ge " in said[-1], said
+
+
+def _loss_batch(env, monkeypatch, name, runs):
+    """A push queue batch of one entry whose push check prints `runs` (see _lost_check): (exit code,
+    marker, how many times the check ran)."""
+    d = env["tmp"] / name
+    d.mkdir()
+    argv, ran = _lost_check(d, runs)
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [" ".join(argv)])
+    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})]), monkeypatch)
+    return rc, m, ran()
+
+
+def test_push_batch_reruns_a_check_whose_only_failures_are_a_lost_worker_and_pushes(env, monkeypatch, capsys):
+    from ttp import push
+    rc, m, ran = _loss_batch(env, monkeypatch, "pass", [_lost_log([0], left=3), ""])
+    assert rc == 0 and m["outcome"] == "pushed" and ran == 2, m
+    assert m["checks"]["worker_loss_reruns"] == 1
+    assert capsys.readouterr().out.count("a test worker was lost mid-run (4 tests not run") == 1
+
+
+def test_push_batch_holds_on_lost_workers_again_and_requeues_its_entries_not_failed(env, monkeypatch, capsys):
+    from ttp import push, workerloss
+    rc, m, ran = _loss_batch(env, monkeypatch, "infra", [_lost_log([0], left=3)])
+    assert rc == push.BUSY and m["outcome"] == "worker_loss" and ran == 1 + workerloss.RERUNS, m
+    assert _statuses(m) == ["requeued"], m
+    assert m["checks"]["worker_loss"] == {"check": m["checks"]["worker_loss"]["check"], "tests": 4,
+                                          "workers": {"100": 0}}
+    out = capsys.readouterr().out
+    assert "infrastructure fault: test workers were lost mid-run again" in out and "the batch is held, not failed" in out
+    assert "check failed on" not in out
+
+
+def test_push_batch_a_crash_twice_or_a_loss_beside_real_failures_still_fails(env, monkeypatch, capsys):
+    rc, m, ran = _loss_batch(env, monkeypatch, "crash", [_lost_log([0, 9])])
+    assert m["outcome"] != "worker_loss" and _statuses(m) == ["check_failed"] and ran >= 2, m
+    capsys.readouterr()
+
+
+def test_push_batch_a_loss_beside_real_failures_fails_without_a_rerun(env, monkeypatch, capsys):
+    rc, m, ran = _loss_batch(env, monkeypatch, "real", [_lost_log([0], left=3, failed=6)])
+    assert m["outcome"] != "worker_loss" and _statuses(m) == ["check_failed"] and ran >= 1, m
+    assert "a test worker was lost mid-run" not in capsys.readouterr().out
+
+
+def test_a_worker_loss_batch_keeps_its_approvals_counts_no_try_and_backs_the_queue_off(env, monkeypatch):
+    """(the queue) A batch that ended worker_loss puts its approvals back as approved, no try counted,
+    and the queue waits push.WORKER_LOSS_S before the next batch (a quieter host), then resumes."""
+    from ttp import push, pushq
+    s = _pq(env, monkeypatch)
+    _pq_plan(s, outcome="worker_loss", row="requeued")
+    _pq_hand_off(env, s)
+    _pq_batch(s)
+    _pq_tend(s)
+    assert s.p.db.one("SELECT status, tries FROM push_queue") == {"status": "approved", "tries": 0}
+    assert s.p.db.task(s.review)["status"] != "failed"
+    now = time.time()
+    rows, why = pushq.due(s.p, now)
+    assert rows == [] and why.startswith("backing off until"), why
+    assert pushq.due(s.p, now + push.WORKER_LOSS_S + 10 ** 6)[0], "resumes"

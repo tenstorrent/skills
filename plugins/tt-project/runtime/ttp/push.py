@@ -30,13 +30,14 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
 from . import (checkcap, checkdirs, cleantree, envfault, gitcache, gitmemo, landed, locks, machines, prguard, prhead, remotecheck, repoid, runner,
-               sandbox, scriptwatch, settinghold, shorttmp, testslots, timefmt, worktree)
+               sandbox, scriptwatch, settinghold, shorttmp, testslots, timefmt, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, code_tasks_may_push, durable_append, durable_write, git_fsync_env, hostname,
@@ -3684,28 +3685,62 @@ def _kill_tree(pid: int) -> None:
             pass
 
 
+def _copy_out(stream, collect: workerloss.Collector) -> None:
+    """A check's output into this process's output (the push log), each line also to `collect`."""
+    for raw in iter(stream.readline, b""):
+        line = raw.decode(errors="replace")
+        collect.feed(line)
+        try:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            pass
+
+
 def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int:
     """Run one push check: 0 when it passes, CHECKS_FAILED when it fails, BUSY when its check host
-    could not run it (an environment fault, recorded as runner_wait records a missing runner)."""
+    could not run it (an environment fault, recorded as runner_wait records a missing runner) or its
+    test workers were lost again on its one rerun, each exiting cleanly (workerloss): the host too."""
     if remote_host(cmd):
         say(f"running {cmd}{where(cmd)}")
+    collect = workerloss.Collector()
+
     def once() -> int:
-        with subprocess.Popen(testslots.low_priority(check_argv(cmd, repo, env)), cwd=repo, env=env,
-                              pass_fds=checkdirs.inherited()) as proc:
-            try:
-                return proc.wait(timeout=check_limit_s)
-            except subprocess.TimeoutExpired:
-                _kill_tree(proc.pid)
-                proc.wait()
-                say(f"check timed out after {check_limit_s:.0f} s and was ended: {cmd}{where(cmd)} "
-                    "(delivery.push_checks_timeout_s; unset: 4x the last measured check run, at least 4 h)")
-                return 124
-            except BaseException:   # stopped (run_detached's SIGTERM): the check ends with it, as run() did
-                proc.kill()
-                raise
-    rc = scriptwatch.rerun(once, bool, None if remote_host(cmd) else str(cmd), repo, env, say, on_pass=True)
-    if rc == 0:
-        return 0
+        collect.reset()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        proc = subprocess.Popen(testslots.low_priority(check_argv(cmd, repo, env)), cwd=repo, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, pass_fds=checkdirs.inherited())
+        reader = threading.Thread(target=_copy_out, args=(proc.stdout, collect), daemon=True)
+        reader.start()
+        try:
+            return proc.wait(timeout=check_limit_s)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc.pid)
+            proc.wait()
+            say(f"check timed out after {check_limit_s:.0f} s and was ended: {cmd}{where(cmd)} "
+                "(delivery.push_checks_timeout_s; unset: 4x the last measured check run, at least 4 h)")
+            return 124
+        except BaseException:   # stopped (run_detached's SIGTERM): the check ends with it, as run() did
+            proc.kill()
+            proc.wait()
+            raise
+        finally:
+            reader.join(timeout=10)   # a child that left the group may keep the pipe open; do not wait on it
+    reruns = 0
+    while True:
+        rc = scriptwatch.rerun(once, bool, None if remote_host(cmd) else str(cmd), repo, env, say, on_pass=True)
+        if rc == 0:
+            return 0
+        # A test worker lost mid-run is the host, not the change: once more (workerloss).
+        if remote_host(cmd) or reruns >= workerloss.RERUNS or not workerloss.only(loss := workerloss.lost(collect.text())):
+            break
+        reruns += 1
+        say(workerloss.rerun_line(loss, str(cmd)))
+    if reruns and workerloss.infra(loss := workerloss.lost(collect.text())):
+        say(f"{workerloss.line(loss, str(cmd))}; not pushing. Hand off `waiting`; retry_when: "
+            f"test \"$(date +%s)\" -ge {int(time.time()) + WORKER_LOSS_S}")
+        return BUSY
     if fault := remote_fault(cmd, rc, repo):
         p = None
         if base := os.environ.get("TTP_PROJECT"):
@@ -3922,6 +3957,7 @@ def free(p: Project, repo: Path) -> int:
 # itself in another one queues the push and the daemon starts it outside the sandbox.
 DETACHED = "pushes"        # under the project's state: <id>.json (marker) and <id>.log per push
 LOG_TAIL = 20
+WORKER_LOSS_S = 900   # a check whose test workers were lost twice (workerloss) runs again after this
 KEEP_S = 30 * 86400        # finished markers and logs older than this go when the next push starts
 QUEUED_S = 900             # a queued push the daemon has not started by then is recorded as failed
 # The environment a queued push takes from the run that queued it; the rest is the daemon's.

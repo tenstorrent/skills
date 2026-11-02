@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections import deque
 from pathlib import Path
 
 RERUNS = 1
@@ -24,6 +25,42 @@ _ENDED = re.compile(r"^_+ (.+?) _+\nthe test worker process (\d+) ended \(wait s
 _LEFT = re.compile(r"^_+ (.+?) _+\nno test worker was left to run this test$", re.M)
 _SUMMARY = re.compile(r"^(?:=+ )?((?:\d+ \w+, )*\d+ (?:failed|passed|errors?)\b.*?) in [0-9.]+s", re.M)
 _COUNT = re.compile(r"(\d+) (failed|errors?)\b")
+_MESSAGE = re.compile(r"(?:the test worker process \d+ ended \(wait status (?:-?\d+|None)\) before this test finished"
+                      r"|no test worker was left to run this test)$")
+KEPT = 20000   # a Collector keeps at most this many lost tests' sections
+
+
+class Collector:
+    """What lost() reads from a check's output as it streams, for a runner that keeps only its last
+    lines: each lost test's failure section (its header and the runner's line) and the last lines
+    (the pytest summary). reset() before each run of the check."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.sections: list[str] = []
+        self.prev = ""
+        self.tail: deque[str] = deque(maxlen=5)
+
+    def feed(self, line: str) -> None:
+        line = line.rstrip("\r\n")
+        if _MESSAGE.match(line) and len(self.sections) < KEPT:
+            self.sections.append(f"{self.prev}\n{line}")
+        self.prev = line
+        self.tail.append(line)
+
+    def text(self) -> str:
+        return "\n".join([*self.sections, *self.tail])
+
+
+class Infra(Exception):
+    """Test workers lost again on the rerun of `check`, every one exiting cleanly (infra): raised by the
+    push queue's check runner, whose batch then goes back to the queue, held, never failed."""
+
+    def __init__(self, loss: dict, check: str):
+        super().__init__(line(loss, check))
+        self.loss, self.check = loss, check
 
 
 def lost(output: str) -> dict | None:

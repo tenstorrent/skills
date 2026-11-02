@@ -49,7 +49,7 @@ from collections import Counter, deque
 from pathlib import Path
 
 from . import (checkcap, checkdirs, conflictfix, cyclenotice, envfault, locks, push, pushpass, runner, scopehold,
-               scriptwatch,
+               scriptwatch, workerloss,
                sharedchecks, slowtests, suitecost, verdictcarry, worktree)
 from .project import Project, command_env, durable_write, write_json
 from . import gitmemo
@@ -83,7 +83,7 @@ TOP_DEF = re.compile(r"^(?:async[ \t]+def|def|class)[ \t]+([A-Za-z_]\w*)", re.M)
 LEAD_KEY = re.compile(r"""["']?([A-Za-z_][\w.-]*)["']?[ \t]*[:=](?![=/])""")   # `"key":`, `key =`, `key:`
 TOP_START = re.compile(r"(?:@|(?:async[ \t]+)?def[ \t]|class[ \t])")
 EXIT = {"pushed": 0, "landed": 0, "nothing": 0, "busy": push.BUSY, "env_fault": push.BUSY, "moved": push.KEPT_MOVING,
-        "rejected": push.REJECTED, "refused": push.REFUSED, "tip_failed": push.CHECKS_FAILED}
+        "worker_loss": push.BUSY, "rejected": push.REJECTED, "refused": push.REFUSED, "tip_failed": push.CHECKS_FAILED}
 
 
 def say(msg: str) -> None:
@@ -190,12 +190,13 @@ def _kill(proc: subprocess.Popen) -> None:
 
 
 def _stream(cmd: str | list[str], cwd: Path, env: dict | None = None, timeout: float | None = None,
-            group: bool = False, pass_fds: tuple = ()) -> tuple[int | None, str, bool]:
+            group: bool = False, pass_fds: tuple = (), collect: workerloss.Collector | None = None) -> tuple[int | None, str, bool]:
     """Run `cmd` (a shell string, or an argv run without a shell), copying its output into this
     process's output (the batch log): (exit code, the last lines of its output, whether it ran out of time and was killed). `group` starts it in a
     process group of its own, which a timeout kills whole. The tail starts with up to OVER_KEPT
     pytest `assert <size> <= <cap>` lines where the size is over, each naming its test, from
-    anywhere in the output: a prompt size cap's measured overshoot (conflictfix.cap_failure)."""
+    anywhere in the output: a prompt size cap's measured overshoot (conflictfix.cap_failure). `collect`
+    gets every line (workerloss.Collector)."""
     sys.stdout.flush()
     sys.stderr.flush()
     proc = subprocess.Popen(cmd, shell=isinstance(cmd, str), cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
@@ -208,6 +209,8 @@ def _stream(cmd: str | list[str], cwd: Path, env: dict | None = None, timeout: f
         for raw in iter(proc.stdout.readline, b""):
             line = raw.decode(errors="replace")
             tail.append(line.rstrip("\n"))
+            if collect is not None:
+                collect.feed(line)
             if (sm := SECTION.match(line.strip())):
                 section[0] = sm.group(1).split()[0]
             elif (om := OVER.match(line.rstrip())) and len(over) < OVER_KEPT \
@@ -979,6 +982,13 @@ class Batch:
                 envfault.record(self.p, e.fault, queue=True)
                 return self._all("requeued", "env_fault", f"{e}; the batch is held, not failed",
                                  keep=("landed", "refused"))
+            except workerloss.Infra as e:
+                # The host again (test workers lost twice, each exiting cleanly): every entry goes back
+                # to the queue with its approval, retried after a pause (push.WORKER_LOSS_S).
+                self.checks["worker_loss"] = {"check": e.check, "tests": e.loss["tests"],
+                                              "workers": {str(k): v for k, v in e.loss["workers"].items()}}
+                return self._all("requeued", "worker_loss", f"{e}; the batch is held, not failed, and retried later",
+                                 keep=("landed", "refused"))
             if outcome == "held":   # a round of its own: each one holds at least one more entry
                 rnd -= 1
                 say("the rest of the batch goes again without the held entries")
@@ -1443,10 +1453,7 @@ class Batch:
                     say(f"resuming {cmd}: {len(done)} test file(s) passed in an earlier run on tree {tree[:10]}; running the rest")
                 if push.remote_host(cmd):
                     say(f"running {cmd}{push.where(cmd)}")
-                rc, tail, _ = scriptwatch.rerun(
-                    lambda: _stream(push.check_argv(cmd, self.wt), self.wt,
-                                    env={**env, **extra, **slot.env()}, pass_fds=checkdirs.inherited()),
-                    lambda r: r[0] != 0, None if push.remote_host(cmd) else str(cmd), self.wt, env, say, on_pass=True)
+                rc, tail = self._run_check(cmd, {**env, **extra, **slot.env()}, env)
                 suite_out.append(tail)
                 if fault := push.remote_fault(cmd, rc, self.wt):
                     raise envfault.Fault(fault)   # the check host, not this head: push_phase holds the batch
@@ -1473,6 +1480,33 @@ class Batch:
         except Exception as e:   # a cost note never fails a batch
             say(f"suite cost not recorded: {e}")
         return None
+
+    def _run_check(self, cmd, run_env: dict, env: dict) -> tuple[int | None, str]:
+        """Run one check in the worktree: (exit code, output tail). A failure whose only failures are lost
+        test workers runs once more (workerloss); lost again, every worker exiting cleanly, it raises
+        workerloss.Infra: the host, never a failure of the batch's entries."""
+        collect = workerloss.Collector()
+
+        def once():
+            collect.reset()
+            return _stream(push.check_argv(cmd, self.wt), self.wt, env=run_env, pass_fds=checkdirs.inherited(),
+                           collect=collect)
+        reruns = 0
+        while True:
+            rc, tail, _ = scriptwatch.rerun(once, lambda r: r[0] != 0, None if push.remote_host(cmd) else str(cmd),
+                                            self.wt, env, say, on_pass=True)
+            if rc == 0 or push.remote_host(cmd):
+                return rc, tail
+            loss = workerloss.lost(collect.text())
+            if reruns >= workerloss.RERUNS:
+                if workerloss.infra(loss):
+                    raise workerloss.Infra(loss, str(cmd))
+                return rc, tail
+            if not workerloss.only(loss):
+                return rc, tail
+            reruns += 1
+            self.checks["worker_loss_reruns"] = self.checks.get("worker_loss_reruns", 0) + 1
+            say(workerloss.rerun_line(loss, str(cmd)))
 
     def _carried(self, head: str, cmd, parts: dict) -> str:
         """The record line (verdictcarry.line) of a pass of `cmd` a batch recorded on another tip that
