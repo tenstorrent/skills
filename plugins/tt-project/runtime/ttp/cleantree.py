@@ -152,8 +152,8 @@ def clone(top: str | Path, path: str | Path, head: str, hooks: bool = True) -> N
     its .git/worktrees: a sandbox that starts while a worktree there is added or removed fails to mount
     it (docs/providers.md). Like `git clone --shared` it borrows `top`'s objects (alternates) and
     copies none; it holds `top`'s refs as they are (heads, origin/*, tags) and reads `top`'s config
-    (an include, so origin and its fetches work), hooks, info/exclude, info/attributes and LFS store,
-    as a worktree of `top` would. It needs `top`'s objects: remove the folder as soon as its step
+    (an include, so origin and its fetches work), hooks, info/exclude, info/attributes, info/grafts, shallow
+    file and LFS store, as a worktree of `top` would. It needs `top`'s objects: remove the folder as soon as its step
     ends; nothing of it is left in `top`. `hooks`: whether the checkout runs a post-checkout hook, as
     `git worktree add` does. Raises Error."""
     top, path = Path(top), Path(path)
@@ -177,9 +177,9 @@ def clone(top: str | Path, path: str | Path, head: str, hooks: bool = True) -> N
         if (r := _plain(path, "config", "--add", key, val)).returncode:
             raise fail("git config", r)
     (gitdir / "info").mkdir(exist_ok=True)
-    for name in ("exclude", "attributes"):
-        if (common / "info" / name).is_file():
-            shutil.copyfile(common / "info" / name, gitdir / "info" / name)
+    for name in ("info/exclude", "info/attributes", "info/grafts", "shallow"):
+        if (common / name).is_file():
+            shutil.copyfile(common / name, gitdir / name)
     r = _plain(top, "for-each-ref", "--format=%(objectname) %(refname)")
     if r.returncode:
         raise fail("git for-each-ref", r)

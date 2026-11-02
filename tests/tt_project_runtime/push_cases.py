@@ -15642,3 +15642,38 @@ def test_a_scratch_clone_finds_its_source_repositorys_venv_and_a_plain_shared_cl
     assert push.venv_python(scratch, {}) == repo.resolve() / ".venv" / "bin" / "python"
     assert push.venv_cmd("pytest -q", scratch, {}).endswith("/.venv/bin/python -m pytest -q")
     assert push._checkouts(shared) == [shared]
+
+
+def test_a_scratch_clone_of_a_shallow_or_grafted_repository_has_a_whole_history(tmp_path):
+    """A worktree of a shallow clone reads its shallow file, and one of a repository with info/grafts
+    its grafts: a scratch clone copies both, so `git log` (git describe, setuptools-scm, merge-base)
+    and `git fsck` work in ttp checks' clean checkout and after_push."""
+    from ttp import cleantree
+    src = tmp_path / "src"
+    subprocess.run(["git", "init", "-q", str(src)], check=True)
+    git = ["git", "-C", str(src), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    for n in range(4):
+        (src / "f").write_text(f"{n}\n")
+        subprocess.run([*git, "add", "."], check=True)
+        subprocess.run([*git, "commit", "-qm", f"c{n}"], check=True)
+    shallow = tmp_path / "shallow"
+    subprocess.run(["git", "clone", "-q", "--depth", "2", f"file://{src}", str(shallow)], check=True)
+    assert (shallow / ".git" / "shallow").is_file()
+    scratch = tmp_path / "scratch"
+    cleantree.clone(shallow, scratch, "HEAD", hooks=False)
+    for cmd in (["log", "--oneline"], ["fsck", "--connectivity-only"]):
+        r = subprocess.run(["git", "-C", str(scratch), *cmd], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+    assert len(subprocess.run(["git", "-C", str(scratch), "log", "--oneline"], capture_output=True,
+                              text=True).stdout.splitlines()) == 2
+    # info/grafts: a graft that cuts history at HEAD~1 is honoured in the scratch as in its source.
+    parent = subprocess.run([*git, "rev-parse", "HEAD~1"], capture_output=True, text=True).stdout.strip()
+    (src / ".git" / "info").mkdir(exist_ok=True)
+    (src / ".git" / "info" / "grafts").write_text(f"{parent}\n")
+    want = subprocess.run([*git, "-c", "advice.graftFileDeprecated=false", "log", "--oneline"],
+                          capture_output=True, text=True).stdout
+    grafted = tmp_path / "grafted"
+    cleantree.clone(src, grafted, "HEAD", hooks=False)
+    r = subprocess.run(["git", "-C", str(grafted), "-c", "advice.graftFileDeprecated=false", "log", "--oneline"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0 and r.stdout == want and len(want.splitlines()) == 2
