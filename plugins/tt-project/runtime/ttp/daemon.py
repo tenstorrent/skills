@@ -8385,7 +8385,9 @@ class Daemon:
         """Every tick, model-free (ttp.lockreap): reap what keeps a harness lock whose holder is dead
         (the project's slot locks, its shared resources' and the check slots), log each release as an
         event, and raise one lock-wait:<name> alert per lock a waiter has waited on past
-        locks.wait_alert_min, naming its holder; it clears once nobody waits that long."""
+        locks.wait_alert_min, naming its holder; it clears once nobody waits that long. The checks-slot
+        queue counts only while a holder is not judged alive; a waiting task's device-queue job counts
+        as lock devq:<runner> (lockreap.devq_waits)."""
         from . import checkcap, lockreap
         now, db = time.time(), self.p.db
         own = [self.p.state / "locks"]
@@ -8398,8 +8400,12 @@ class Daemon:
             for r in got["released"]:
                 log(self.p, lockreap.release_text(r))
         limit = lockreap.wait_alert_s(self.cfg)
-        mine = (lambda t: t.startswith(f"{self.p.name} "))
+        mine = (lambda t: t == self.p.name or t.startswith(f"{self.p.name} "))
         waits = lockreap.long_waits(own, limit, now) + lockreap.long_waits(shared_dirs, limit, now, mine=mine)
+        # A wait behind running checks is normal queueing: only a holder not judged alive raises it.
+        waits += lockreap.long_waits([checkcap.slot_dir()], limit, now, mine=mine, only={checkcap.RESOURCE},
+                                     stuck_only=True)
+        waits += lockreap.devq_waits(db, limit, now, current=_current_probe)
         keys = set()
         for w in waits:
             key = f"lock-wait:{w['lock']}"
@@ -9471,6 +9477,13 @@ class Daemon:
             if task and _current_probe(task) != probe:
                 continue   # re-pointed (`set-when`) while it ran: its verdict is not the new probe's
             self._note_probe_out(tid, probe, outs[id(proc)], now, lines[id(proc)])
+            if devq_runner := waitheal.devq_runner(probe):   # how long its job queues (the lock-wait alert)
+                try:
+                    from . import lockreap
+                    lockreap.note_devq_wait(db, tid, devq_runner, probe, outs[id(proc)],
+                                            None if (self._probe_diag.get(tid) or {}).get("killed") else rc, now)
+                except Exception as e:   # never stops the wait
+                    log(self.p, f"task {tid}: devq wait not noted: {type(e).__name__}: {e}")
             runner = waitheal.devq_runner(probe) if rc == waitheal.DEVQ_RUNNER_DOWN_RC else None
             if runner:
                 # Its device runner is down: the daemon brings it back, and the task sleeps on.

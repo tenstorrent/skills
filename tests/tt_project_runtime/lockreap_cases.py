@@ -273,3 +273,160 @@ def test_lockreap_never_reaps_a_detached_jobs_lock(env, monkeypatch, tmp_path):
         assert fake.sent == []
     finally:
         f.close()
+
+
+def test_a_checks_slot_wait_alerts_only_behind_a_holder_not_alive_once_and_clears(env, monkeypatch, tmp_path):
+    from ttp import checkcap, daemon as dm, locks
+    p = make(env)
+    sd = tmp_path / "check-slots"
+    monkeypatch.setattr(checkcap, "slot_dir", lambda: sd)
+    f = _reap_slot(sd / "checks.0.lock", pid=4100, pid_start="11", pgid=4100, run_id="70", task_id="7",
+                   project="other", command="ttp checks -- pytest")
+    procs = {4100: {"start": "11", "pgid": 4100}, 5200: {"start": "1", "cmd": "sleep 999"}}
+    _ReapProcs(monkeypatch, procs, [5200])
+    t0 = time.time()
+    theirs = locks.enqueue(sd, "checks", "other task #3 (run 30) ttp checks", since=t0 - 90 * 60)
+    tickets = [theirs, locks.enqueue(sd, "checks", f"{p.name} task #8 (run 80) ttp checks", since=t0 - 31 * 60)]
+
+    def sent():
+        return [m for m in p.db.q("SELECT text FROM messages WHERE direction='out' AND ref='lock-wait:checks'")
+                if not m["text"].startswith("Cleared:")]
+    try:
+        dm.Daemon(p.base).reap_locks()
+        assert not sent(), "a wait behind live, running checks is normal queueing"
+        del procs[4100]                            # the holder died; another process keeps the slot
+        dmn = dm.Daemon(p.base)
+        dmn.reap_locks()
+        dmn.reap_locks()
+        dm.Daemon(p.base).reap_locks()
+        msgs = sent()
+        assert len(msgs) == 1, msgs
+        text = msgs[0]["text"]
+        for want in ("Lock checks", "31 min", "1 waiting", "pid 4100", "task #7", "dead: its pid 4100 is gone",
+                     "within about 2 min"):
+            assert want in text, (want, text)
+        locks.dequeue(tickets.pop())               # only the other project's waiter is left
+        dm.Daemon(p.base).reap_locks()
+        assert not p.db.one("SELECT id FROM alerts WHERE key='lock-wait:checks' AND cleared IS NULL")
+        assert len(sent()) == 1
+    finally:
+        for t in tickets:
+            locks.dequeue(t)
+        f.close()
+
+
+def test_long_waits_only_and_stuck_only_filter_queues(tmp_path, monkeypatch):
+    from ttp import lockreap, locks
+    f = _reap_slot(tmp_path / "checks.0.lock", pid=4100, pid_start="11", pgid=4100)
+    g = _reap_slot(tmp_path / "gate.0.lock", pid=4100, pid_start="11", pgid=4100)
+    procs = {4100: {"start": "11", "pgid": 4100}}
+    _ReapProcs(monkeypatch, procs, [4100])
+    t0 = time.time()
+    ts = [locks.enqueue(tmp_path, r, "x", since=t0 - 3600) for r in ("checks", "gate")]
+    try:
+        assert {w["lock"] for w in lockreap.long_waits([tmp_path], 1800, t0)} == {"checks", "gate"}
+        assert [w["lock"] for w in lockreap.long_waits([tmp_path], 1800, t0, only={"checks"})] == ["checks"]
+        assert not lockreap.long_waits([tmp_path], 1800, t0, stuck_only=True)
+        procs[4100]["start"] = "12"                # a reused pid counts as not alive
+        assert {w["lock"] for w in lockreap.long_waits([tmp_path], 1800, t0, stuck_only=True)} == {"checks", "gate"}
+        monkeypatch.setattr(locks, "_judgeable", lambda h: False)   # one this process cannot judge, too
+        assert len(lockreap.long_waits([tmp_path], 1800, t0, only={"checks"}, stuck_only=True)) == 1
+    finally:
+        for t in ts:
+            locks.dequeue(t)
+        f.close()
+        g.close()
+
+
+def _devq_dir(tmp_path, waiting="jb", arrived_ago=31 * 60, running="ja", task="12", pid=None, ran_ago=600):
+    d = tmp_path / "devq"
+    for sub in ("queue", "running", "done"):
+        (d / sub).mkdir(parents=True, exist_ok=True)
+    (d / "queue" / f"{int((time.time() - arrived_ago) * 1e9):020d}-{waiting}.json").write_text("{}")
+    if running:
+        (d / "running" / f"{running}.json").write_text(json.dumps({"task": task}))
+        cur = {"started": time.time() - ran_ago, **({"pid": pid} if pid else {})}
+        (d / "running" / f"{running}.state.json").write_text(json.dumps({"cur": cur}))
+    return d
+
+
+def test_the_devq_probe_says_how_long_a_queued_job_waited_and_behind_which_job(tmp_path, monkeypatch, capsys):
+    from ttp import devq
+    monkeypatch.setattr(devq, "runner_alive", lambda d: True)
+    d = _devq_dir(tmp_path, pid=os.getpid())
+    assert devq.probe(d, "jb") == 1
+    out = capsys.readouterr().out
+    got = devq.parse_wait("build: x\n" + out)
+    assert got["job"] == "jb" and 31 * 60 - 5 <= got["waited_s"] <= 31 * 60 + 5 and got["ahead"] == 1, out
+    h = got["holder"]
+    assert h["job"] == "ja" and h["task"] == "12" and h["pid"] == os.getpid() and h["alive"] is True
+    assert 595 <= h["run_s"] <= 605
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    (d / "running" / "ja.state.json").write_text(json.dumps({"cur": {"pid": gone.pid}}))
+    devq.probe(d, "jb")
+    h = devq.parse_wait(capsys.readouterr().out)["holder"]
+    assert h["alive"] is False and h["run_s"] is None
+    for f in (d / "running").iterdir():
+        f.unlink()
+    devq.probe(d, "jb")
+    got = devq.parse_wait(capsys.readouterr().out)
+    assert got["holder"] is None and got["ahead"] == 0
+    for text in ("jb: running", "jb: queued, but no runner is alive (runner down)", "", "jb: queued 5 s"):
+        assert devq.parse_wait(text) is None, text
+
+
+def test_a_devq_queue_wait_raises_one_lock_wait_alert_names_the_running_job_and_clears(env, tmp_path):
+    from ttp import daemon as dm, lockreap
+    p = make(env)
+    d = dm.Daemon(p.base)
+    fake = Path(_fake_ttp(tmp_path, 1, "r1-2: queued 600 s, 1 ahead; running: r1-1 task #12 for 900 s, pid 4242 alive"))
+    probe = f"{fake} devq probe r1 r1-2"
+    tid = _due_waiting_task(p, probe)
+
+    def sent():
+        return [m for m in p.db.q("SELECT text FROM messages WHERE direction='out' AND ref='lock-wait:devq:r1'")
+                if not m["text"].startswith("Cleared:")]
+
+    def answer(rc, out):
+        fake.write_text(f"#!/bin/sh\necho '{out}'\nexit {rc}\n")
+        _reprobe(d, tid)
+        d.reap_locks()
+    _settle_probe(d, tid)
+    d.reap_locks()
+    assert p.db.kv(lockreap.DEVQ_WAITS_KEY)[str(tid)]["holder"]["job"] == "r1-1"
+    assert not sent(), "10 min: under the threshold"
+    answer(1, "r1-2: queued 1900 s, 1 ahead; running: r1-1 task #12 for 2200 s, pid 4242 alive")
+    assert not sent(), "the wait started 10 min ago, as first seen: a later answer does not move it"
+    w = p.db.kv(lockreap.DEVQ_WAITS_KEY)
+    p.db.set_kv(lockreap.DEVQ_WAITS_KEY, {k: {**v, "since": time.time() - 31 * 60} for k, v in w.items()})
+    d.reap_locks()
+    answer(1, "r1-2: queued 1960 s, 1 ahead; running: r1-1 task #12 for 2260 s, pid 4242 alive")
+    dm.Daemon(p.base).reap_locks()
+    msgs = sent()
+    assert len(msgs) == 1, msgs
+    for want in ("Lock devq:r1", "31 min", "device job r1-1", "task #12", "pid 4242", "holder alive"):
+        assert want in msgs[0]["text"], (want, msgs[0]["text"])
+    before = p.db.kv(lockreap.DEVQ_WAITS_KEY)
+    for rc in (None, 255):                       # a timeout or an unreachable host keeps the wait as it was
+        lockreap.note_devq_wait(p.db, tid, "r1", probe, "", rc)
+    assert p.db.kv(lockreap.DEVQ_WAITS_KEY) == before
+    answer(1, "r1-2: running")
+    assert not p.db.one("SELECT id FROM alerts WHERE key='lock-wait:devq:r1' AND cleared IS NULL")
+    assert not p.db.kv(lockreap.DEVQ_WAITS_KEY) and len(sent()) == 1
+
+
+def test_a_devq_wait_ends_when_its_task_stops_waiting_on_that_probe(env):
+    from ttp import daemon as dm, lockreap
+    p = make(env)
+    tid = _due_waiting_task(p, "ttp devq probe r1 r1-2")
+    line = "r1-2: queued 2000 s, 0 ahead; running: r1-1 for 50 s, pid 77 gone"
+    lockreap.note_devq_wait(p.db, tid, "r1", "ttp devq probe r1 r1-2", line, 1)
+    d = dm.Daemon(p.base)
+    d.reap_locks()
+    text = p.db.one("SELECT text FROM alerts WHERE key='lock-wait:devq:r1' AND cleared IS NULL")["text"]
+    assert "dead: its pid 77 is gone" in text, text
+    p.db.update_task(tid, status="done")
+    d.reap_locks()
+    assert not p.db.one("SELECT id FROM alerts WHERE key='lock-wait:devq:r1' AND cleared IS NULL")
+    assert not p.db.kv(lockreap.DEVQ_WAITS_KEY)

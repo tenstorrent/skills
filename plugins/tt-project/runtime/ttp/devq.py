@@ -985,8 +985,63 @@ def probe(d: Path, job: str) -> int:
             return 1
         print(f"{job}: {at}, but no runner is alive (runner down): `ttp devq start` brings it back")
         return RUNNER_DOWN_RC
-    print(f"{job}: {at}")
+    print(wait_line(d, job) if at == "queued" else f"{job}: {at}")
     return 1
+
+
+WAIT_RE = re.compile(r"^(?P<job>\S+): queued (?P<waited>\d+) s, (?P<ahead>\d+) ahead; running: (?:none|(?P<rid>\S+)"
+                     r"(?: task #(?P<task>\d+))?(?: for (?P<run>\d+) s)?(?:, pid (?P<pid>\d+) (?P<alive>alive|gone))?)$")
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:   # another user's: it exists
+        return True
+    return True
+
+
+def wait_line(d: Path, job: str) -> str:
+    """The probe's line for a queued job (parse_wait reads it back): how long it has queued, how many jobs
+    are ahead of it, and the job the runner runs now with its task, run time and whether its pid lives."""
+    q, now = _queued(d, job), _now()
+    try:
+        arrived = int(q[0].name.split("-", 1)[0]) / 1e9 if q else now
+    except ValueError:
+        arrived = now
+    ahead = sum(1 for f in (d / "queue").glob("*.json") if q and f.name < q[0].name)
+    running = _running(d)
+    out = f"{job}: queued {max(0, int(now - arrived))} s, {ahead + len(running)} ahead; running: "
+    if not running:
+        return out + "none"
+    rid = running[0]
+    spec, st = _load(d / "running" / f"{rid}.json"), _load(d / "running" / f"{rid}.state.json")
+    cur = st.get("cur") or {}
+    out += rid + (f" task #{spec['task']}" if str(spec.get("task") or "").isdigit() else "")
+    started = cur.get("started") or st.get("started")
+    if isinstance(started, (int, float)):
+        out += f" for {max(0, int(now - started))} s"
+    if isinstance(cur.get("pid"), int) and cur["pid"] > 0:
+        out += f", pid {cur['pid']} {'alive' if _pid_alive(cur['pid']) else 'gone'}"
+    return out
+
+
+def parse_wait(text: str):
+    """What a probe's wait_line says, else None: {"job", "waited_s", "ahead", "holder": None or {"job",
+    "task", "run_s", "pid", "alive"}}. The last such line counts."""
+    for line in reversed(str(text or "").splitlines()):
+        m = WAIT_RE.match(line.strip())
+        if not m:
+            continue
+        holder = None
+        if m["rid"]:
+            holder = {"job": m["rid"], "task": m["task"], "run_s": int(m["run"]) if m["run"] else None,
+                      "pid": int(m["pid"]) if m["pid"] else None,
+                      "alive": None if not m["alive"] else m["alive"] == "alive"}
+        return {"job": m["job"], "waited_s": int(m["waited"]), "ahead": int(m["ahead"]), "holder": holder}
+    return None
 
 
 def _urgent_job(f: Path) -> bool:

@@ -19,7 +19,14 @@ judged dead on two sweeps GRACE_S apart before anything is reaped.
 
 long_waits finds each lock whose oldest live waiter (its queue ticket) has waited past the config
 `locks.wait_alert_min` (default WAIT_ALERT_MIN): the daemon raises one keyed alert per lock
-(`lock-wait:<name>`), naming the holder, and clears it when the wait ends.
+(`lock-wait:<name>`), naming the holder, and clears it when the wait ends. The checks-slot queue
+(checkcap) counts only while a holder is not judged alive (stuck_only): a wait behind running checks is
+normal queueing. A device-queue job queued behind another (devq, read from its waiting task's probe)
+raises `lock-wait:devq:<runner>` the same way (devq_waits).
+
+The release guarantee is the daemon's tick (RELEASE_WITHIN_S): a waiter's own try (a `ttp lock` in a
+sandboxed worker, whose PID namespace hides the holder) may judge nothing, and checks-slot and devq
+waiters do not sweep at all.
 """
 from __future__ import annotations
 
@@ -36,6 +43,9 @@ WAIT_ALERT_MIN = 30   # config locks.wait_alert_min: a lock wait longer than thi
 GRACE_S = 60.0        # a holder seen dead this long (two sweeps) before what keeps its lock is reaped
 KILL_AFTER_S = 10.0   # a reaped process still there this long after SIGTERM gets SIGKILL
 EVENT_KIND = "lock_released"
+# While the daemon runs, a dead holder's lock that only its own run keeps is released this soon: the first
+# tick that sees it dead, GRACE_S later the SIGTERM, KILL_AFTER_S after that the SIGKILL, plus tick slack.
+RELEASE_WITHIN_S = GRACE_S + KILL_AFTER_S + 30.0
 
 
 def _pgid(pid: int) -> int | None:
@@ -302,10 +312,13 @@ def wait_alert_s(cfg: dict) -> float:
     return max(v, 0.0) * 60
 
 
-def long_waits(dirs, threshold_s: float, now: float | None = None, mine=None) -> list[dict]:
+def long_waits(dirs, threshold_s: float, now: float | None = None, mine=None, only=None,
+               stuck_only: bool = False) -> list[dict]:
     """Each lock (by resource name) in `dirs` that a live waiter has waited on for threshold_s or more,
     with its waiters, oldest wait and the holder(s) of its taken slots. `mine`, when given, is a
-    predicate on a ticket's text (its waiter's label): only locks with such a waiter count."""
+    predicate on a ticket's text (its waiter's label): only locks with such a waiter count. `only`: these
+    resource names alone. `stuck_only`: only a lock with a holder not judged alive (dead, a reused pid, or
+    one that cannot be judged) counts."""
     now = time.time() if now is None else now
     out = []
     if threshold_s <= 0:
@@ -317,6 +330,8 @@ def long_waits(dirs, threshold_s: float, now: float | None = None, mine=None) ->
             continue
         for q in queues:
             res = q.name[:-len(".queue")]
+            if only is not None and res not in only:
+                continue
             tickets = locks.queued(Path(d), res)
             if mine is not None:
                 tickets = [t for t in tickets if mine(_ticket_text(t))]
@@ -331,8 +346,77 @@ def long_waits(dirs, threshold_s: float, now: float | None = None, mine=None) ->
                 h = label(s)
                 state, why = verdict(h)
                 holders.append({**holder_info(s, h), "state": state, "why": why})
+            if stuck_only and all(h["state"] == "alive" for h in holders):
+                continue
             out.append({"lock": res, "dir": str(d), "waiters": len(tickets), "waited_s": now - oldest,
                         "holders": holders})
+    return out
+
+
+DEVQ_WAITS_KEY = "devq_waits"   # kv: task id -> what its plain `ttp devq probe` last said of its job's queue wait
+
+
+def note_devq_wait(db, tid: int, runner: str, probe: str, text: str, rc, now: float | None = None) -> None:
+    """Keep what waiting task `tid`'s `ttp devq probe <runner> <job>` answered (devq.wait_line): its job
+    queued since when, behind which job. Another answer (running, done, unknown) ends the wait; a timeout
+    or an unreachable host (rc None or 255) changes nothing. Written only when the holder changes."""
+    from . import devq
+    if rc is None or rc == 255:
+        return
+    now = time.time() if now is None else now
+    got = devq.parse_wait(text) if rc == 1 else None
+    waits = db.kv(DEVQ_WAITS_KEY, {}) or {}
+    k, prev = str(tid), waits.get(str(tid))
+    if not got:
+        if prev is None:
+            return
+        waits.pop(k)
+    else:
+        h = got["holder"]
+        holder = h and {**h, "since": round(now - h["run_s"]) if h.get("run_s") is not None else None}
+        same = bool(prev) and prev.get("probe") == probe and prev.get("job") == got["job"]
+        if same and _steady(prev.get("holder")) == _steady(holder):
+            return
+        waits[k] = {"runner": runner, "probe": probe, "job": got["job"], "ahead": got["ahead"],
+                    "since": prev["since"] if same else round(now - got["waited_s"]), "holder": holder}
+    db.set_kv(DEVQ_WAITS_KEY, waits)
+
+
+def _steady(h):
+    """A devq holder without what each probe answer moves on (its run time)."""
+    return {k: v for k, v in h.items() if k not in ("run_s", "since")} if h else None
+
+
+def devq_waits(db, threshold_s: float, now: float | None = None, current=None) -> list[dict]:
+    """Each device runner a waiting task's job has been queued on for threshold_s or more (note_devq_wait),
+    shaped like long_waits' answers (lock `devq:<runner>`). `current(task)`: the probe the task waits on
+    now; an entry whose task no longer waits on its probe is dropped."""
+    now = time.time() if now is None else now
+    waits = db.kv(DEVQ_WAITS_KEY, {}) or {}
+    keep, by = {}, {}
+    for k, w in waits.items():
+        t = db.task(int(k)) if str(k).isdigit() else None
+        if not t or t["status"] != "queued" or (current is not None and current(t) != w.get("probe")):
+            continue
+        keep[k] = w
+        by.setdefault(w["runner"], []).append(w)
+    if keep != waits:
+        db.set_kv(DEVQ_WAITS_KEY, keep)
+    out = []
+    for runner, ws in sorted(by.items()) if threshold_s > 0 else ():
+        oldest = min(float(w["since"]) for w in ws)
+        if now - oldest < threshold_s:
+            continue
+        holders = []
+        for h in {(w.get("holder") or {}).get("job"): w.get("holder") for w in ws if w.get("holder")}.values():
+            state, why = ("alive", f"pid {h['pid']} alive") if h.get("alive") else \
+                ("dead", f"its pid {h['pid']} is gone") if h.get("alive") is False else ("unknown", "no pid recorded yet")
+            holders.append({"lock": f"devq:{runner}", "path": "", "holder": f"device job {h['job']}",
+                            "pid": h.get("pid"), "command": "", "task": h.get("task"), "run": None,
+                            "project": None, "since": float(h["since"]) if h.get("since") else 0.0,
+                            "state": state, "why": why})
+        out.append({"lock": f"devq:{runner}", "dir": "", "waiters": len(ws), "waited_s": now - oldest,
+                    "holders": holders})
     return out
 
 
@@ -370,4 +454,9 @@ def wait_text(w: dict, now: float | None = None, kept: dict | None = None) -> st
             line += f" ({k['left']})"
         parts.append(line)
     return (f"Lock {w['lock']} has a waiter for {_dur(w['waited_s'])} ({w['waiters']} waiting). "
-            f"Holder: " + "; ".join(parts) + ".")[:1500]
+            f"Holder: " + "; ".join(parts) + ".")[:1300] + " " + BOUND_TEXT
+
+
+# The release guarantee, in every lock-wait alert: waiters do not sweep (or cannot judge from a sandbox).
+BOUND_TEXT = (f"The daemon's tick releases a dead holder's lock that only its own run keeps within about "
+              f"{int(RELEASE_WITHIN_S // 60) + 1} min; one it does not release stays named here.")

@@ -963,7 +963,12 @@ queues behind routine work; nothing running is interrupted:
   or reused per its recorded start time) and that no live process of the holder's group keeps; a
   leftover process of the holder's own run is stopped, any other one is left and named. A waiter queued
   past `locks.wait_alert_min` (30 min; 0 off) raises one `lock-wait:<lock>` alert per lock naming the
-  holder; it clears when the wait ends. Config `device.locks` (opt-in) names one device by several names: all share the first name's lock and pause, tasks that use one
+  holder; it clears when the wait ends. A `ttp checks` slot waiter alerts only while a holder is not
+  judged alive (dead, reused pid, or one the daemon cannot judge): a queue behind live checks is normal.
+  A task waiting on `ttp devq probe <runner> <job>` alerts as `lock-wait:devq:<runner>`, naming the
+  running job, its task and pid. The daemon's tick is what releases a dead holder's lock: waiters in a
+  sandbox may not judge holders, and check-slot and devq waiters do not sweep, so a lock only its dead
+  holder's run keeps is freed within about 2 min. Config `device.locks` (opt-in) names one device by several names: all share the first name's lock and pause, tasks that use one
   get the `needs_device` label, and at most `device.max_tasks` of them run at once (default: one per device resource the
   project has, at most `budget.max_parallel_workers`, at least 2; a set value is kept). A worker starts
   a long job with `ttp detach <name> -- <command>`; a run that ends without a hand-off, or waiting
