@@ -4600,19 +4600,55 @@ def test_the_host_checks_cap_prices_a_check_at_its_measured_cpu_with_process_chu
     checkcap.record_cost(30.0, 30.0)   # too short a run: no sample
     checkcap.record_cost(0.0, 300.0)   # no CPU read: no sample
     assert checkcap.measured_cores() is None
-    checkcap.record_cost(4500.0, 300.0)   # 15 cores, about 40% of it system CPU from process churn
-    checkcap.record_cost(600.0, 300.0)    # a light run after it does not lower the price
+    for _ in range(checkcap.COST_MIN_SAMPLES - 1):
+        checkcap.record_cost(4500.0, 300.0)   # 15 cores, about 40% of it system CPU from process churn
+    assert checkcap.measured_cores() is None and checkcap.check_load() == 8.0, "too few runs: the default price"
+    checkcap.record_cost(4500.0, 300.0)
+    checkcap.record_cost(600.0, 300.0)    # a light run after them does not lower the price
     assert checkcap.measured_cores() == 15.0 and checkcap.check_load() == 15.0
     assert checkcap.default_limit() == 4, "64 // 15 is 4, the floor"
-    checkcap.record_cost(300.0 * 500, 300.0)
-    assert checkcap.measured_cores() == 64.0, "never above the host's cores"
+    monkeypatch.setattr(checkcap, "cores", lambda: 12)
+    assert checkcap.measured_cores() == 12.0, "never above the host's cores"
+    monkeypatch.setattr(checkcap, "cores", lambda: 64)
     assert checkcap.measured_cores(now=time.time() + checkcap.COST_KEEP_S + 1) is None, "old samples expire"
-    (checkcap.slot_dir() / checkcap.COST_LOG).write_text("{torn\n" + json.dumps({"ts": time.time(), "cores": 9}) + "\n")
+    (checkcap.slot_dir() / checkcap.COST_LOG).write_text(
+        "{torn\n" + "".join(json.dumps({"ts": time.time(), "cores": 9}) + "\n" for _ in range(5)))
     assert checkcap.measured_cores() == 9.0, "a torn row is skipped"
     monkeypatch.setattr(testslots, "sizes", lambda *a, **k: None)
     assert checkcap.check_load() == 9.0, "measured beats CHECK_LOAD with the test pool off"
     (checkcap.slot_dir() / checkcap.COST_LOG).unlink()
     assert checkcap.check_load() == checkcap.CHECK_LOAD
+
+
+def test_one_heavy_checks_run_among_normal_ones_never_sets_the_check_price(env, monkeypatch):
+    """measured_cores prices a check at a high percentile of recent runs, not the costliest, so one
+    outlier run (here 40 cores among 6-core runs) neither raises the price nor makes the live-cores gate
+    hold every project's checks for 40 free cores; heavy runs that are the norm still raise it."""
+    from ttp import checkcap, hostcpu, testslots
+    monkeypatch.delenv("TTP_CHECKS_HOST_MAX", raising=False)
+    monkeypatch.delenv(checkcap.LIVE_ENV, raising=False)
+    monkeypatch.setattr(checkcap, "cores", lambda: 64)
+    monkeypatch.setattr(testslots, "sizes", lambda *a, **k: None)
+
+    def runs(*cores):
+        (checkcap.slot_dir() / checkcap.COST_LOG).unlink(missing_ok=True)
+        for c in cores:
+            checkcap.record_cost(c * 300.0, 300.0)
+    for normal in (4, 10, 19):   # the fewest runs that price, a half window, a full one
+        for at in (0, normal // 2, normal):   # the outlier first, in the middle, last
+            got = [6.0] * normal
+            got.insert(at, 40.0)
+            runs(*got)
+            assert checkcap.measured_cores() == 6.0 and checkcap.check_load() == 6.0, (normal, at)
+    runs(6, 6, 6, 40)
+    assert checkcap.measured_cores() is None and checkcap.check_load() == checkcap.CHECK_LOAD, "too few runs"
+    runs(*[6] * 15, *[40] * 5)
+    assert checkcap.measured_cores() == 40.0, "a fifth of recent runs heavy: heavy is this host's norm"
+    runs(*[6] * 19, 40)
+    every = checkcap.all_paths(4)
+    monkeypatch.setattr(checkcap, "held_since", lambda paths: [0.0])   # one check running, granted long ago
+    monkeypatch.setattr(hostcpu, "busy_cores", lambda: 50.0)
+    assert checkcap.cores_short(every) == "", "14 free cores hold one 6-core check"
 
 
 def test_ttp_checks_records_its_cost_with_its_childrens_system_cpu(env, tmp_path, monkeypatch, capsys):
@@ -4625,6 +4661,7 @@ def test_ttp_checks_records_its_cost_with_its_childrens_system_cpu(env, tmp_path
     cli.main(["checks", "--", churn])
     rows = [json.loads(x) for x in (checkcap.slot_dir() / checkcap.COST_LOG).read_text().splitlines()]
     assert len(rows) == 1 and rows[0]["cores"] > 0 and rows[0]["s"] >= 0, rows
+    monkeypatch.setattr(checkcap, "COST_MIN_SAMPLES", 1)
     assert checkcap.measured_cores() == rows[0]["cores"]
 
 
@@ -4661,6 +4698,28 @@ def test_a_review_precheck_waiting_for_test_slots_keeps_its_lane_while_its_revie
         assert len(h) == 1 and h[0]["task"] == str(tid), h
     finally:
         g.close()
+
+
+def test_hostcpu_busy_cores_and_checkcap_cores_count_the_same_cores_under_a_restricted_affinity(monkeypatch):
+    # busy cores scale by the cores checkcap counts (the CPU affinity, else os.cpu_count()), so a
+    # process pinned to 4 of 64 cores never reads 32 busy cores out of 4.
+    import os
+    from ttp import checkcap, hostcpu
+    monkeypatch.setattr(os, "cpu_count", lambda: 64)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {0, 1, 2, 3}, raising=False)
+    monkeypatch.setattr(hostcpu, "_LAST", {})
+    stats = ["cpu  1000 0 0 1000 0 0 0 0 0 0\n", "cpu  1050 0 0 1050 0 0 0 0 0 0\n"]
+    clock = [100.0]
+
+    def sleep(s):
+        clock[0] += s
+        stats.pop(0)
+    assert checkcap.cores() == hostcpu.cores() == 4
+    assert hostcpu.busy_cores(lambda: stats[0], sleep, lambda: clock[0]) == 2.0, "half of the 4 cores"
+    monkeypatch.setattr(hostcpu, "busy_cores", lambda: 2.0)
+    assert checkcap.free_cores() == 2.0
+    monkeypatch.delattr(os, "sched_getaffinity", raising=False)   # macOS: no affinity
+    assert checkcap.cores() == hostcpu.cores() == 64
 
 
 def test_hostcpu_busy_cores_reads_proc_stat_deltas_and_spawns_nothing(monkeypatch):

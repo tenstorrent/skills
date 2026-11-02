@@ -21,6 +21,15 @@ FRESH_S = 30.0    # a previous reading older than this starts a fresh window
 _LAST: dict = {}   # "at": (monotonic time, busy jiffies, total jiffies); "busy": (monotonic time, cores)
 
 
+def cores() -> int:
+    """The cores this process may run on: its CPU affinity where the OS has one, else os.cpu_count().
+    busy_cores scales by it and checkcap.cores() returns it, so busy and free cores count the same set."""
+    try:
+        return len(os.sched_getaffinity(0)) or 1
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
 def jiffies(text: str) -> tuple[int, int] | None:
     """(busy, total) jiffies from /proc/stat's aggregate `cpu` line; idle and iowait are not busy, and
     guest time is already counted in user and nice."""
@@ -59,6 +68,6 @@ def busy_cores(read=None, sleep=time.sleep, clock=time.monotonic, cpus: int | No
     dt = cur[1] - prev[2]
     if dt <= 0:
         return None
-    busy = max(0.0, min(1.0, (cur[0] - prev[1]) / dt)) * (cpus or os.cpu_count() or 1)
+    busy = max(0.0, min(1.0, (cur[0] - prev[1]) / dt)) * (cpus or cores())
     _LAST["busy"] = (now, busy)
     return busy

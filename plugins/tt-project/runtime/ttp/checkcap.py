@@ -69,6 +69,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -90,6 +91,9 @@ COST_RECENT = 20
 COST_KEEP_S = 7 * 86400.0
 COST_MIN_WALL_S = 60.0    # a shorter run is no sample (its ratio is noise)
 COST_MAX_BYTES = 16 * 1024
+COST_PERCENTILE = 0.8     # measured_cores: the price is this percentile of the recent runs (nearest rank)
+COST_MIN_SAMPLES = 5      # fewer recent runs price nothing (check_load's default); at 5 or more the p80 rank
+                          # is below the costliest, so no single heavy run sets the price
 POLL_S = 5.0
 TELL_S = 300.0
 # A `ttp checks` in a tool call waits this long for a slot at most, then hands over to detached checks
@@ -120,10 +124,8 @@ def _unavailable(e: OSError) -> Unavailable:
 
 
 def cores() -> int:
-    try:
-        return len(os.sched_getaffinity(0))
-    except AttributeError:
-        return os.cpu_count() or 1
+    """This host's cores as checks count them: hostcpu.cores() (the CPU affinity, else os.cpu_count())."""
+    return hostcpu.cores()
 
 
 def default_range() -> tuple[int, int]:
@@ -137,7 +139,7 @@ def check_load() -> float:
     """The 1-minute load one running check adds: one run's cores as the repository lanes count it
     (checklane.run_cores: its test grant, at least the measured cores of a full suite run), else, with
     the test pool off, CHECK_LOAD; never below what recent runs on this host measured (measured_cores:
-    their user and system CPU, process churn included)."""
+    the 80th percentile of their user and system CPU, process churn included, once 5 runs measured)."""
     from . import checklane, testslots
     base = float(checklane.run_cores()) if testslots.sizes() else CHECK_LOAD
     return max(base, measured_cores() or 0.0)
@@ -171,8 +173,10 @@ def record_cost(cpu_s: float, wall_s: float) -> None:
 
 
 def measured_cores(now: float | None = None) -> float | None:
-    """The costliest of the last COST_RECENT checks runs on this host (record_cost) within
-    COST_KEEP_S, in cores (CPU seconds per wall second), at most this host's cores; None before any."""
+    """The COST_PERCENTILE (nearest rank) of the last COST_RECENT checks runs on this host (record_cost)
+    within COST_KEEP_S, in cores (CPU seconds per wall second), at most this host's cores; None with
+    fewer than COST_MIN_SAMPLES of them. A percentile, not the costliest, so one unusually heavy run
+    does not price every project's checks (and hold them for that many free cores) for COST_KEEP_S."""
     now = time.time() if now is None else now
     try:
         lines = (slot_dir() / COST_LOG).read_text().splitlines()
@@ -186,7 +190,10 @@ def measured_cores(now: float | None = None) -> float | None:
                 got.append(float(r["cores"]))
         except (ValueError, KeyError, TypeError, AttributeError):
             continue
-    return min(float(cores()), max(got[-COST_RECENT:])) if got else None
+    got = sorted(got[-COST_RECENT:])
+    if len(got) < COST_MIN_SAMPLES:
+        return None
+    return min(float(cores()), got[max(0, math.ceil(COST_PERCENTILE * len(got)) - 1)])
 
 
 def default_limit() -> int:
