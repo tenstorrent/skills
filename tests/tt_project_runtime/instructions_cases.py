@@ -144,6 +144,27 @@ def test_a_codex_run_whose_rollout_never_appears_is_reported_not_stopped(tmp_pat
     assert "instructions" not in info and info["stopped"] is None
 
 
+def test_a_codex_run_whose_rollout_stays_pending_is_reported_unchecked_once(tmp_path, monkeypatch):
+    # No model reply and a short head: after ROLLOUT_WAIT_S the run gets a verdict and the rollout
+    # is not parsed again for the rest of the run.
+    from ttp import runner
+    from ttp.providers import codex as cx
+    monkeypatch.setattr(runner, "ROLLOUT_WAIT_S", 0.5)
+    looks = []
+    real = cx.Codex.instructions_recorded
+    monkeypatch.setattr(cx.Codex, "instructions_recorded",
+                        lambda self, *a, **k: looks.append(time.time()) or real(self, *a, **k))
+    info = _runner_run(tmp_path, monkeypatch, _rollout_lines("0199abcd-0002", developer=False, answered=False),
+                       run_s=3)
+    assert info["rc"] == 0 and info["stopped"] is None and "refused" not in info, info
+    assert info["instructions"] == {"state": "unchecked", "cli_version": "0.160.0"}
+    assert looks and max(looks) - min(looks) < 2, f"polled on after the verdict: {len(looks)} looks"
+    # Before the wait is up a pending rollout gets no verdict, and the end-of-run look gives none either.
+    assert runner.check_instructions(cx.Codex(), tmp_path / "run", tmp_path / "run" / "output.jsonl",
+                                     json.loads((tmp_path / "run" / "run.json").read_text())["argv"],
+                                     {"CODEX_HOME": str(tmp_path / "codex")}, 0.4) is None
+
+
 def test_the_daemon_blocks_a_task_whose_codex_run_lacked_its_instructions_without_an_attempt(env, monkeypatch):
     home = env["tmp"] / "codexhome"
     monkeypatch.setenv("CODEX_HOME", str(home))
@@ -158,8 +179,10 @@ def test_the_daemon_blocks_a_task_whose_codex_run_lacked_its_instructions_withou
     assert "system prompt not taken" in task["blocked_reason"] and "0.999.0" in task["blocked_reason"]
     note = json.loads(run["note"])
     assert note["refused"] == "instructions_missing" and note["instructions"] == "missing"
+    from ttp import budget
+    assert "not_waste" not in note and budget.wasted(run), "it ran and spent: waste the runaway guard counts"
     obs = p.db.q("SELECT * FROM events WHERE kind='observation' AND source='daemon:instructions'")
-    assert len(obs) == 1 and "0.999.0" in obs[0]["text"], obs
+    assert len(obs) == 1 and "0.999.0" in obs[0]["text"] and "task blocked" in obs[0]["text"], obs
     # The same rollout with the run's instructions: the run's hand-off stands, nothing is raised.
     _write_rollout(home, "th-1", _rollout_lines("th-1", version="0.999.0"))
     p, run, task, argv, _ = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn("all done")), result=done,
@@ -175,5 +198,11 @@ def test_the_daemon_observation_for_a_missing_instructions_check_is_keyed_once_p
     assert a and b and a[1] == b[1] == "instructions:codex:missing:0.170.0" and "0.170.0" in a[0]
     gone = instructions_observation("codex", "worker", 3, {"state": "no_rollout", "seen": "no_session"})
     assert gone and gone[1] == "instructions:codex:no_rollout:unknown" and "went on" in gone[0]
+    stopped = instructions_observation("codex", "worker", 5, {"state": "missing", "cli_version": "1"}, stopped=True)
+    assert "stopped and its task blocked" in stopped[0], stopped
+    coord = instructions_observation("codex", "coordinator", 6, {"state": "missing", "cli_version": "1"})
+    assert "only reported" in coord[0] and "blocked" not in coord[0] and "was stopped" not in coord[0], coord
+    late = instructions_observation("codex", "worker", 7, {"state": "unchecked", "cli_version": "0.170.0"})
+    assert late and late[1] == "instructions:codex:unchecked:0.170.0" and "no model reply" in late[0]
     for quiet in ({"state": "recorded", "cli_version": "1"}, {"state": "pending"}, None, "missing", {}):
         assert instructions_observation("codex", "worker", 4, quiet) is None

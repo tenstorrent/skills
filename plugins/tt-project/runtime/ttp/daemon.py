@@ -336,19 +336,27 @@ def task_env(tid) -> dict[str, str]:
     return {"TTP_TASK": str(tid), "TTP_TASK_ID": str(tid)}
 
 
-def instructions_observation(provider: str, role: str, run_id, inst) -> tuple[str, str] | None:
+def instructions_observation(provider: str, role: str, run_id, inst, stopped: bool = False) -> tuple[str, str] | None:
     """The observation for a run whose agent did not record the system prompt it was passed, or
-    whose transcript the check never found (runner.check_instructions): (text, key), keyed by agent,
-    outcome and CLI version so it is raised once, not once per run. None when there is nothing to say."""
-    if not isinstance(inst, dict) or inst.get("state") not in ("missing", "no_rollout"):
+    whose transcript the check never found or never saw complete (runner.check_instructions): (text,
+    key), keyed by agent, outcome and CLI version so it is raised once, not once per run. `stopped`:
+    the run had a task, so it was stopped and its task blocked; a run without one is only reported.
+    None when there is nothing to say."""
+    if not isinstance(inst, dict) or inst.get("state") not in ("missing", "no_rollout", "unchecked"):
         return None
     ver = str(inst.get("cli_version") or "")[:40]
     if inst["state"] == "missing":
         text = (f"{role} run {run_id} on {provider} {ver or '(unknown version)'}: the agent's transcript has no "
                 f"developer message with the run's system prompt, so it ran without the charter's binding "
-                f"restrictions. The run was stopped and its task blocked without an attempt; the agent CLI "
-                f"may have stopped taking developer_instructions. Run such tasks on another provider until "
-                f"it does.")
+                f"restrictions. "
+                + ("The run was stopped and its task blocked without an attempt" if stopped else
+                   "The run had no task to block, so it was only reported")
+                + "; the agent CLI may have stopped taking developer_instructions. Run such tasks on another "
+                  "provider until it does.")
+    elif inst["state"] == "unchecked":
+        text = (f"{role} run {run_id} on {provider} {ver or '(unknown version)'}: its transcript (rollout) showed "
+                f"no model reply within {int(runner.ROLLOUT_WAIT_S)} s, so whether the agent took the run's "
+                f"system prompt is unchecked. The agent CLI may have changed its transcript's items; the run went on.")
     else:
         text = (f"{role} run {run_id} on {provider}: its transcript (rollout) was not found within "
                 f"{int(runner.ROLLOUT_WAIT_S)} s, so whether the agent took the run's system prompt is "
@@ -3689,7 +3697,8 @@ class Daemon:
             except OSError as e:   # not written: the run falls back as it would have
                 salvaged = False
                 log(p, f"run {r['id']}: salvaging its hand-off failed: {e}")
-        handed_off = r["role"] != "coordinator" and \
+        # A run without its system prompt never stands on its hand-off: it is held and the task blocked.
+        handed_off = r["role"] != "coordinator" and refused != "instructions_missing" and \
             (_read_result(run_dir / RESULT_FILE) or {}).get("status") in HANDOFF_STATES
         if status == "timeout" and handed_off:
             cut_off, status = status, "ok"   # it handed off before the clock ran out: the work is done, not wasted
@@ -3738,7 +3747,9 @@ class Daemon:
             note["stopped"] = stopped
         if usage.session_id:
             note["session_id"] = usage.session_id   # a run the host takes away resumes it (_resumable)
-        if refused:
+        if refused == "instructions_missing":
+            note["refused"] = refused   # it ran and spent: normal waste, which the runaway guard counts
+        elif refused:
             note.update(refused=refused, not_waste="refused")   # never started a model turn: spent nothing
         launch_error = str(exit_info.get("launch_error") or "")
         if launch_error and exit_info.get("launch_auth"):
@@ -3752,7 +3763,8 @@ class Daemon:
             self.observe("daemon:launch", f"{r['role']} run {r['id']} on {r['provider']} never started, a harness "
                          f"launch failure: {launch_error}", "normal", whole=True,
                          key=f"launch:{r['provider']}:{r['role']}")
-        said = instructions_observation(r["provider"], r["role"], r["id"], exit_info.get("instructions"))
+        said = instructions_observation(r["provider"], r["role"], r["id"], exit_info.get("instructions"),
+                                        stopped=refused == "instructions_missing")
         if said:
             note["instructions"] = exit_info["instructions"]["state"]
             self.observe("daemon:instructions", said[0], "normal", whole=True, key=said[1])

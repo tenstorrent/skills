@@ -303,7 +303,8 @@ def remove_private(run_dir: Path) -> None:
 
 def check_instructions(prov, run_dir: Path, out_path: Path, argv: list[str], env: dict, waited_s: float) -> dict | None:
     """One look at whether the agent took the system prompt the run passed it (system.md, by
-    append_system_args): a verdict to record ({"state": "recorded" | "missing" | "no_rollout", ...}),
+    append_system_args): a verdict to record ({"state": "recorded" | "missing" | "no_rollout" |
+    "unchecked" (the transcript still pending after ROLLOUT_WAIT_S), ...}),
     {} when there is nothing to check, None to look again. A transcript that is missing or unreadable
     is only reported, as its format or path may change."""
     try:
@@ -320,6 +321,8 @@ def check_instructions(prov, run_dir: Path, out_path: Path, argv: list[str], env
         return got
     if got.get("state") in ("no_session", "no_rollout", "unreadable") and waited_s >= ROLLOUT_WAIT_S:
         return {**got, "state": "no_rollout", "seen": got.get("state")}
+    if got.get("state") == "pending" and waited_s >= ROLLOUT_WAIT_S:
+        return {**got, "state": "unchecked"}   # no model reply yet: reported once, not re-parsed all run
     return None
 
 
