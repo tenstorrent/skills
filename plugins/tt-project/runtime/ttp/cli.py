@@ -8202,6 +8202,8 @@ def _migrate_load_caps(p: Project) -> str:
         new, done = loadcaps.migrate(raw)
         if not done:
             return ""
+        if p.config_status == "fallback":
+            p.keep_broken_config()
         write_json(p.config_path, new)
     except Exception:
         return ""

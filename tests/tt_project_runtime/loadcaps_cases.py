@@ -90,6 +90,22 @@ def test_upgrade_migrates_only_old_defaults_and_a_rerun_changes_nothing(env):
     assert cli._migrate_load_caps(p) == "" and p.config_path.read_text() == text, "a rerun is a no-op"
 
 
+def test_upgrade_migration_over_a_broken_project_json_keeps_the_broken_bytes(env):
+    """The load-caps migration that writes the last good copy over a project.json that does not read
+    keeps the broken hand edit in project.json.broken-<stamp> first (as set_config does)."""
+    from ttp import cli
+    from ttp.project import Project
+    p = make(env)
+    p.set_config("device.max_tasks", 2)
+    p.config()
+    p.config_path.write_text("{ broken")
+    assert "device.max_tasks 2" in cli._migrate_load_caps(Project(p.base))
+    kept = list(p.harness.glob("project.json.broken-*"))
+    assert [k.read_text() for k in kept] == ["{ broken"]
+    assert "max_tasks" not in json.loads(p.config_path.read_text()).get("device", {})
+    assert str(kept[0]) in (p.logs / "daemon.log").read_text()
+
+
 def test_a_device_task_held_by_the_device_cap_with_the_device_idle_raises_one_cap_wait(env, monkeypatch):
     from ttp import loadcaps
     from ttp.daemon import Daemon

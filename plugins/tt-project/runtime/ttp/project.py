@@ -13,6 +13,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -1262,7 +1263,35 @@ class Project:
                 node[p] = {}
             node = node[p]
         node[parts[-1]] = value
+        if self.config_status == "fallback":
+            self.keep_broken_config()
         write_json(self.config_path, raw)
+
+    def keep_broken_config(self) -> None:
+        """Before set_config writes the last good copy over a project.json that did not read (a hand
+        edit that broke the JSON), keep its bytes in project.json.broken-<stamp> and say so: the
+        edit is never lost without a word. A missing project.json has nothing to keep."""
+        src = self.config_path
+        if not src.exists():
+            return
+        stamp = time.strftime("%Y%m%dT%H%M%S")
+        kept = src.with_name(f"{src.name}.broken-{stamp}")
+        n = 1
+        while kept.exists():
+            kept = src.with_name(f"{src.name}.broken-{stamp}-{n}")
+            n += 1
+        try:
+            os.link(src, kept)   # the same bytes under a second name; write_json then replaces src
+        except OSError:
+            shutil.copy2(src, kept)
+        msg = f"config: {src.name} did not read as JSON; kept it as {kept} before writing the last good copy"
+        print(f"ttp: {msg}", file=sys.stderr)
+        try:
+            self.logs.mkdir(parents=True, exist_ok=True)
+            with open(self.logs / "daemon.log", "a") as f:
+                f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}\n")
+        except OSError:
+            pass
 
     @property
     def name(self) -> str:

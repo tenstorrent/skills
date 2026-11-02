@@ -3754,6 +3754,37 @@ def test_malformed_config_uses_the_last_good_copy(env):
         assert fresh.config()["core_provider"] == "fake" and fresh.config_status == "fallback", broken
 
 
+def test_set_config_keeps_a_broken_hand_edit_aside(env, capsys):
+    """A config write over a project.json that does not read keeps the broken bytes in
+    project.json.broken-<stamp>, says so once on stderr and in the daemon log, and writes the last
+    good copy plus the new key. A project.json that reads, or one that is missing, keeps nothing."""
+    from ttp.project import Project
+    p = make(env)
+    p.set_config("core_provider", "fake")
+    p.config()
+    assert not list(p.harness.glob("project.json.broken-*"))
+    log = p.logs / "daemon.log"
+    for n, broken in enumerate(("{ not json", "[]"), 1):
+        p.config_path.write_text(broken)
+        fresh = Project(p.base)
+        capsys.readouterr()
+        fresh.set_config("budget.daily_usd", 7 + n)
+        kept = sorted(p.harness.glob("project.json.broken-*"))
+        assert len(kept) == n and broken in [k.read_text() for k in kept]
+        data = json.loads(p.config_path.read_text())
+        assert data["core_provider"] == "fake" and data["budget"]["daily_usd"] == 7 + n
+        new = [k for k in kept if k.read_text() == broken][0]
+        assert [ln for ln in log.read_text().splitlines() if str(new) in ln and "did not read" in ln], n
+        assert str(new) in capsys.readouterr().err
+    lines = log.read_text().count("did not read")
+    p.set_config("budget.daily_usd", 20)   # project.json reads: nothing kept
+    p.config_path.unlink()
+    Project(p.base).set_config("budget.daily_usd", 21)   # missing: last good copy, nothing to keep
+    assert len(list(p.harness.glob("project.json.broken-*"))) == 2
+    assert log.read_text().count("did not read") == lines
+    assert json.loads(p.config_path.read_text())["budget"]["daily_usd"] == 21
+
+
 def test_config_defaults_to_the_runs_project_and_prints_effective_sections(env, capsys, monkeypatch):
     """Inside a run `ttp config KEY` reads the run's project (as `ttp stats` does), and a section or no
     key prints the effective config, defaults included."""
