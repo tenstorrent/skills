@@ -357,6 +357,22 @@ def for_workers(item: str) -> bool:
     return bool(_WORK_TERMS.search(item)) and not re.search(r"\bcoordinator\b", item, re.I)
 
 
+def _blocks(body: list[str]) -> list[str]:
+    """A section's body as its blank-line-separated blocks (a paragraph with the list under it is one)."""
+    return [x.strip("\n") for x in re.split(r"\n\s*\n", "\n".join(body)) if x.strip()]
+
+
+def goal_for_workers(item: str) -> bool:
+    """Whether an item of a section workers get whole (Goals, Resources, the Brief) is in a worker's
+    prompt: its audience tag wins; untagged, all but an item that names the coordinator or the daily
+    review (the coordinator's) and never a worker: its own duties, which the full charter keeps."""
+    tag = _AUDIENCE_TAG.search(item)
+    if tag:
+        return tag[1].lower().startswith("worker")
+    return (not re.search(r"\bcoordinator|\bdaily review", item, re.I)
+            or bool(re.search(r"\bworkers?\b", item, re.I)))
+
+
 _CHARTER_HEAD = ("# CHARTER (for workers: goals, resources and the policies for workers; its restrictions are "
                  "the binding block above. Full charter{more}: {path})\n")
 _MEMORY_HEAD = "# PROJECT MEMORY (entries for workers; all {n} entries: {path})\n"
@@ -425,12 +441,17 @@ def worker_context(p: Project, task: dict | None = None,
     goals = any(name(h).startswith("goal") for h, _ in secs)
     whole = lambda h: name(h).startswith(("goal", "resource")) or (not goals and name(h).startswith("brief"))
     heads = sum(len(x) + 2 for x in _worker_heads(p, 999, 99999))   # their longest
-    used = heads + sum(len(h) + len("\n".join(b).strip()) + 3 for h, b in secs if whole(h))
+    used = heads + sum(len(h) + len("\n\n".join(x for x in _blocks(b) if goal_for_workers(x))) + 3
+                       for h, b in secs if whole(h))
     out, dropped = [], 0
     cap = max(WORKER_MEMORY_CHARS, used + WORKER_POLICY_MIN_CHARS)   # long Goals never squeeze the policies out
     for h, b in secs:
         if whole(h):
-            out.append(h + "\n" + "\n".join(b).strip())
+            blocks = _blocks(b)
+            kept = [x for x in blocks if goal_for_workers(x)]
+            dropped += len(blocks) - len(kept)
+            if kept:
+                out.append(h + "\n" + "\n\n".join(kept))
             continue
         if name(h).startswith("brief"):
             continue
@@ -497,8 +518,10 @@ def worker_features(p: Project, task: dict | None = None) -> set[str]:
     charter = p.charter_path.read_text() if p.charter_path.exists() else ""
     resources = " ".join(re.findall(r"(?ms)^## Resources\b.*?(?=^## |\Z)", charter))
     task_text = " ".join(str((task or {}).get(k) or "") for k in ("title", "spec", "labels"))
-    # Machines this project may use (the charter names them) and the ones this task names.
-    used = {a: m for a, m in known.items() if _named(a, charter) or _named(a, task_text)}
+    # Machines this project may use (its Resources or Restrictions name them) and the ones this task
+    # names: a machine a goal or a policy only mentions turns on no rules for every task.
+    scope = resources + " " + charter_restrictions(charter)
+    used = {a: m for a, m in known.items() if _named(a, scope) or _named(a, task_text)}
     tags = {}
     for a, m in used.items():
         try:
@@ -523,7 +546,7 @@ def worker_features(p: Project, task: dict | None = None) -> set[str]:
     # A job on another machine: the project or the task names one, or a runner is remote.
     if used or any((r or {}).get("host") for r in runners.values() if isinstance(r, dict)):
         on.add("remote")
-    if re.search(r"\b(slurm|cluster)", resources, re.I) or any(
+    if re.search(r"\b(slurm|cluster)", resources + " " + task_text, re.I) or any(
             {"slurm", "cluster"} & set(t) for t in tags.values()):
         on.add("clusters")
     from .hostmap import table
