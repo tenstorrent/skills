@@ -15,9 +15,9 @@ process of its own ticking until the task is dispatched, handed off, reviewed an
 the push queue. It prints one line per step with the spend so far and stops at $1 or 15 minutes.
 The coordinator does not run. A missing or logged-out CLI is reported with exit 0.
 
-Measured on 2026-10-09:
+Claude Code measured on 2026-11-02, Codex CLI on 2026-10-09:
 
-| Check | Claude Code 2.1.285 | Codex CLI 0.160.0 | Cursor agent |
+| Check | Claude Code 2.1.296 | Codex CLI 0.160.0 | Cursor agent |
 | :- | :- | :- | :- |
 | Launch and login | pass | pass | not measured: installed, logged out |
 | Session id | pass (assigned up front) | pass | not measured |
@@ -26,7 +26,7 @@ Measured on 2026-10-09:
 | Write fence | unsupported: `bypassPermissions` runs without the Bash sandbox, which would need bubblewrap | pass (refused: read-only file system) | off: the sandbox denies network by default and no CLI flag allows it, so workers run with `--force` alone |
 | Resume | pass | pass | not measured |
 | Steer mid-run | pass (hook) | unsupported: no hook, the worker reads `steer.md` between steps | not measured |
-| Plan meter | pass (five-hour and seven-day) | pass (seven-day) | not measured |
+| Plan meter | pass (seven-day; the run reported no five-hour window) | pass (seven-day) | not measured |
 
 The steer row was measured before Codex workers got the harness hook. Codex was also run live on
 codex-cli 0.160 for the hook and isolation rows (one worker run: an update handed over once, a
@@ -61,14 +61,22 @@ The project chooses which plugin directories load, per provider, in
 
 ## Open gaps
 
-Measured on 2026-10-09 with Claude Code 2.1.285 and Codex CLI 0.160.0; rerun
-`ttp doctor --live <provider>` after a CLI upgrade. On 2026-10-21 `ttp doctor --loop` passed
+Claude Code 2.1.296 was measured live on 2026-11-02 ($0.07; 2.1.285 on 2026-10-09 gave the same
+checks, with a five-hour window as well), Codex CLI 0.160.0 on 2026-10-09. A flag probe cannot see
+a CLI that changed what it does, so the daemon reads each installed, logged-in provider's
+`--version` at most hourly, model-free. When it differs from the last measured one, it runs
+`ttp doctor --live <provider> --json --max-usd 0.50` once, detached, at most once per provider a
+day for the host (a second change that day is measured the next day). The row is kept under
+`cli_watch/` in the tt-project home, and a failing check or a missing row is one low observation.
+On 2026-10-21 `ttp doctor --loop` passed
 with Claude Code 2.1.296 (landed after review in 31 s, $0.09) and Codex CLI 0.160.0 (66 s,
 $0.21). Cursor agent: installed, not measured (no login on the test machine).
 
-- Any provider: only the prompt keeps a worker's raw `git push` off the push branch. On
-  2026-10-21 a Claude Code worker whose task said to land its change pushed it straight to the
-  remote, before any review; `ttp doctor --loop` fails such a landing.
+- Any provider: a code task's raw `git push` to the push branch is refused by the harness's
+  pre-push hook (`runtime/ttp/gitguard.py`) while `delivery.code_tasks_may_push` is off, and
+  `ttp push` refuses the same landing. Before that guard, on 2026-10-21, a Claude Code worker whose
+  task said to land its change pushed it straight to the remote; `ttp doctor --loop` still fails
+  such a landing.
 - A code task's plain `needs_review` hand-off gets its review from the daemon's review sweep,
   `review.sweep_after_s` (default 5 min) after its run ended; a `done` hand-off gets it at once.
 - Claude Code: workers have no write fence. They run with `bypassPermissions`, and the Bash

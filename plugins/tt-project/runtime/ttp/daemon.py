@@ -898,6 +898,8 @@ class Daemon:
         self._replica_job: threading.Thread | None = None   # the state snapshot being taken (replicate_state)
         self._mcp_probe: threading.Thread | None = None   # `claude mcp list` in flight (probe_mcp)
         self._mcp_tried = 0.0   # when it last started: an unwritable answer is not retried every tick
+        self._cli_watch: threading.Thread | None = None   # CLI versions being read (watch_cli_versions)
+        self._cli_watched = 0.0   # when that last started
         self._replica_checked = 0.0
         self._replica_stale: bool | None = None   # None: not looked since start
         self._replica_held_from = 0.0   # when this host took the project lease back (0: held since start)
@@ -1549,6 +1551,7 @@ class Daemon:
         self._run_step(self.sweep_watcher_issues)
         self._run_step(self.sweep_schedule_gaps)
         self._run_step(self.review_jev)
+        self._run_step(self.watch_cli_versions)
         settling = self._run_step(self.settling, default=False)
         core = self.cfg.get("core_provider") or "claude"
         core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
@@ -3022,6 +3025,34 @@ class Daemon:
                 log(self.p, f"claude mcp list: unknown ({e.get('error')})")
         self._mcp_probe = threading.Thread(target=work, daemon=True, name="mcp-probe")
         self._mcp_probe.start()
+
+    def watch_cli_versions(self, every_s: float = 600) -> None:
+        """Model-free: report each finished live row this project's daemon started (one observation per row
+        with a failing check or no row), then, in a thread at most every `every_s`, read the agent CLIs'
+        versions and start one capped live row for a provider whose version changed (live.check_versions:
+        host-wide, at most hourly per provider and one row per provider a day). No new row while a budget
+        gate is red."""
+        from . import live
+        owner = str(self.p.base)
+        for key, text in live.harvest(owner):
+            self.observe("cli-watch", text, hint="low", key=key, pin=True)
+        if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("TTP_TEST_CLI_WATCH"):
+            return   # daemons under test never run a real CLI or a live row, unless a test asks
+        now = time.time()
+        if now - self._cli_watched < every_s or self._cli_watch is not None and self._cli_watch.is_alive() \
+                or any(g.level == "red" for g in self.gates.values()):
+            return
+        self._cli_watched = now
+        provs = [get_provider(n) for n in live.WATCHED]
+
+        def work() -> None:
+            try:
+                for name in live.check_versions(owner, provs):
+                    log(self.p, f"cli watch: {name} CLI version changed; started its live row ({live.watch_dir()})")
+            except Exception:
+                log(self.p, "cli watch: failed\n" + traceback.format_exc())
+        self._cli_watch = threading.Thread(target=work, daemon=True, name="cli-watch")
+        self._cli_watch.start()
 
     def check_notifier(self) -> None:
         """Alert once while this machine's desktop notifier fails to deliver (notifier.DELIVERY: a refused

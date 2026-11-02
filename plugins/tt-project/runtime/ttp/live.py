@@ -20,15 +20,17 @@ says why). A provider that is not installed or is logged out is "not available",
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
 from pathlib import Path
 
-from .project import durable_write
-from .providers.base import Provider, cli_output
+from .project import durable_write, write_json
+from .providers.base import Provider, cli_output, status_check
 
 CHECKS = ("launch", "login", "session", "usage", "structured", "fence", "resume", "steer", "meter")
 PASS, FAIL, UNSUPPORTED = "pass", "fail", "unsupported"
@@ -143,8 +145,9 @@ def _finish(d, prov: Provider, provider: str, run_id: int, timeout_s: float) -> 
 
 
 def measure(provider: str, *, tier: str = "light", timeout_s: float = RUN_TIMEOUT_S,
-            base: Path | None = None) -> dict:
-    """Run the scratch project's three runs on `provider` and return what judge() reads."""
+            base: Path | None = None, max_usd: float | None = None) -> dict:
+    """Run the scratch project's three runs on `provider` and return what judge() reads. `max_usd` caps
+    the three together: each run's cap is the rest of it, and a run with under a cent left is skipped."""
     from . import project
     from .cli import bootstrap
     from .coordinator import ACTIONS_SCHEMA
@@ -155,6 +158,9 @@ def measure(provider: str, *, tier: str = "light", timeout_s: float = RUN_TIMEOU
     from .providers.base import last_json_object
     prov = get_provider(provider)
     ev: dict = {"login": prov.login_check(), "spend_usd": 0.0}
+
+    def cap(usd: float) -> float:
+        return usd if max_usd is None else round(min(usd, max_usd - ev["spend_usd"]), 4)
     home = Path(base or project.HOME_DIR)
     home.mkdir(parents=True, exist_ok=True)
     tmp = Path(tempfile.mkdtemp(prefix="live-check-", dir=home))
@@ -181,7 +187,7 @@ def measure(provider: str, *, tier: str = "light", timeout_s: float = RUN_TIMEOU
             '"steer_word": "<code word from the update, or empty>"}\n'
             "Then reply with one short line.")
         rid = d.start_run("worker", prompt, provider, tier, str(repo), task=p.db.task(tid),
-                          budget_usd=WORKER_USD, timeout_s=timeout_s)
+                          budget_usd=cap(WORKER_USD), timeout_s=timeout_s)
         run_dir = p.runs / str(rid)
         durable_write(run_dir / STEER_FILE, f"Update for your task: the update's code word is {steer_word}.\n")
         assigned = (p.db.q("SELECT session_id FROM runs WHERE id=?", (rid,))[0] or {}).get("session_id") or ""
@@ -216,18 +222,23 @@ def measure(provider: str, *, tier: str = "light", timeout_s: float = RUN_TIMEOU
             ev["resume"] = {"skipped": "the worker run reported no session to resume"}
         elif not prov.session_saved(u.session_id, str(repo), env):
             ev["resume"] = {"skipped": "the worker's session was not found on disk"}
+        elif cap(RESUME_USD) < 0.01:
+            ev["resume"] = {"skipped": f"the ${max_usd:.2f} cap was spent before the resume"}
         else:
             rid2 = d.start_run("worker", "What code word did I ask you to remember? Reply with only that word.",
-                               provider, tier, str(repo), task=p.db.task(tid), budget_usd=RESUME_USD,
+                               provider, tier, str(repo), task=p.db.task(tid), budget_usd=cap(RESUME_USD),
                                timeout_s=timeout_s, resume=u.session_id)
             exit2, u2 = _finish(d, prov, provider, rid2, timeout_s)
             ev["spend_usd"] += u2.cost_usd or 0
             ev["resume"] = {"recalled": word in (u2.final_text or ""),
                             "error": u2.error or exit2.get("error") or ""}
+        if cap(COORD_USD) < 0.01:
+            ev["coordinator"] = {"skipped": f"the ${max_usd:.2f} cap was spent before the coordinator turn"}
+            return ev
         crid = d.start_run("coordinator", 'Reply with exactly this JSON and nothing else: {"actions": [{"type": "noop"}]}',
                            provider, tier, str(p.base), read_only=True, schema=ACTIONS_SCHEMA,
                            system="You are a test coordinator. You only return the requested JSON.",
-                           budget_usd=COORD_USD, timeout_s=timeout_s)
+                           budget_usd=cap(COORD_USD), timeout_s=timeout_s)
         exit3, u3 = _finish(d, prov, provider, crid, timeout_s)
         ev["spend_usd"] += u3.cost_usd or 0
         ev["coordinator"] = {"structured": u3.structured if isinstance(u3.structured, dict) else None,
@@ -264,3 +275,153 @@ def format_row(r: dict) -> str:
              + f" · spent ${r['spend_usd']:.2f}"]
     lines += [f"  {k}: {v['note']}" for k, v in r["checks"].items() if v["note"]]
     return "\n".join(lines)
+
+
+# The CLI-upgrade watch (Daemon.watch_cli_versions). A flag probe (Provider.supports) cannot see a CLI
+# that changed what it does, so once a day at most, a provider whose CLI version changed gets one live
+# row. Its state is host-wide under the tt-project home, so one row per upgrade serves every project on
+# the host: versions.json keeps each provider's {version, checked_at, measured}, and each run has a
+# folder <provider>-<local date> (its mkdir is the day's claim, atomic across daemons) with claim.json,
+# out.json (the row), log and rc. Only the daemon that claimed a run reports it.
+WATCH_DIR, VERSIONS = "cli_watch", "versions.json"
+WATCHED = ("claude", "codex", "cursor")   # the providers `ttp doctor --live` measures
+WATCH_EVERY_S = 3600   # each provider's `--version` is read at most this often, host-wide
+WATCH_USD = 0.50       # the spend cap of the live run a version change starts
+WATCH_TIMEOUT_S = 3 * RUN_TIMEOUT_S + 300   # the whole detached run: its three runs and the scratch setup
+# argv: run dir, timeout, command...; writes out.json (stdout), log (stderr), then rc (124 once timed out)
+WATCH_RUNNER = r'''
+import os, signal, subprocess, sys
+d, limit, argv = sys.argv[1], float(sys.argv[2]), sys.argv[3:]
+with open(os.path.join(d, "out.json"), "wb") as out, open(os.path.join(d, "log"), "wb") as err:
+    try:
+        child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+        try:
+            rc = child.wait(timeout=limit)
+        except subprocess.TimeoutExpired:
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+            rc = 124
+    except OSError:
+        rc = 127
+    out.flush()
+    os.fsync(out.fileno())
+with open(os.path.join(d, "rc.tmp"), "w") as f:
+    f.write(f"{rc}\n")
+    f.flush()
+    os.fsync(f.fileno())
+os.replace(os.path.join(d, "rc.tmp"), os.path.join(d, "rc"))
+'''
+
+
+def watch_dir(home: Path | None = None) -> Path:
+    from . import project
+    return Path(home or project.HOME_DIR) / WATCH_DIR
+
+
+def _read(path: Path) -> dict:
+    try:
+        v = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+def read_version(prov: Provider) -> str:
+    """The CLI's `--version`, read now: cli_version's answer is cached for the process, and a daemon
+    outlives an upgrade. "" when it cannot be read."""
+    b = prov.binary()
+    r = status_check([b, "--version"], 20) if b else None
+    out = r[1].strip() if r and r[0] == 0 else ""
+    return out.splitlines()[-1].strip()[:80] if out else ""
+
+
+def live_argv(provider: str) -> list[str]:
+    return [sys.executable, "-m", "ttp", "doctor", "--live", provider, "--json", "--max-usd", f"{WATCH_USD:.2f}"]
+
+
+def check_versions(owner: str, providers: list[Provider], *, home: Path | None = None,
+                   now: float | None = None, argv=live_argv) -> list[str]:
+    """Read each installed, not logged-out provider's CLI version (at most every WATCH_EVERY_S) and start
+    one detached live row for each whose version is not the one last measured, at most one per provider
+    per local day: a change on a day that already had its run is measured the next day. A provider seen
+    for the first time is only recorded. Returns the providers a run was started for."""
+    now = time.time() if now is None else now
+    d = watch_dir(home)
+    d.mkdir(parents=True, exist_ok=True)
+    seen, started = _read(d / VERSIONS), []
+    for prov in providers:
+        rec = seen.get(prov.name) if isinstance(seen.get(prov.name), dict) else {}
+        if now - float(rec.get("checked_at") or 0) < WATCH_EVERY_S:
+            continue
+        if not prov.available() or prov.login_check() is False:
+            continue   # not recorded: a later install or login is still compared with the last measured version
+        version = read_version(prov)
+        if not version:
+            continue
+        rec = {**rec, "version": version, "checked_at": now}
+        rec.setdefault("measured", version)
+        if rec["measured"] != version and start(prov.name, version, owner, home=home, now=now, argv=argv):
+            rec["measured"] = version
+            started.append(prov.name)
+        seen[prov.name] = rec
+    write_json(d / VERSIONS, seen)
+    return started
+
+
+def start(provider: str, version: str, owner: str, *, home: Path | None = None, now: float | None = None,
+          argv=live_argv) -> bool:
+    """Claim today's live run for `provider` and start it detached; False when today's is taken."""
+    now = time.time() if now is None else now
+    run = watch_dir(home) / f"{provider}-{time.strftime('%Y-%m-%d', time.localtime(now))}"
+    try:
+        run.mkdir(parents=True)
+    except FileExistsError:
+        return False
+    write_json(run / "claim.json", {"provider": provider, "version": version, "owner": owner, "at": now})
+    runtime = str(Path(__file__).resolve().parents[1])
+    env = {**os.environ, "PYTHONPATH": runtime + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    try:
+        subprocess.Popen([sys.executable, "-c", WATCH_RUNNER, str(run), str(WATCH_TIMEOUT_S), *argv(provider)],
+                         cwd=runtime, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        durable_write(run / "log", f"did not start: {e}\n")
+        write_json(run / "rc", 127)
+    return True
+
+
+def harvest(owner: str, *, home: Path | None = None, now: float | None = None) -> list[tuple[str, str]]:
+    """Each finished live run `owner` claimed and has not reported, once: its row is kept as
+    <provider>.last.json, and the run is marked reported. A run with no rc WATCH_TIMEOUT_S plus ten
+    minutes after its claim was killed (a reboot) and counts as finished without a row. Returns
+    (key, text) of an observation for each run with a failing check or no row."""
+    now = time.time() if now is None else now
+    d, out = watch_dir(home), []
+    for run in sorted(d.glob("*-*-*-*")) if d.is_dir() else []:
+        claim = _read(run / "claim.json")
+        if claim.get("owner") != owner or (run / "reported").exists():
+            continue
+        if not (run / "rc").exists() and now - float(claim.get("at") or 0) < WATCH_TIMEOUT_S + 600:
+            continue
+        try:
+            rc = int((run / "rc").read_text().strip())
+        except (OSError, ValueError):
+            rc = -1   # killed before it wrote one
+        r = _read(run / "out.json")
+        provider, version = str(claim.get("provider")), str(claim.get("version"))
+        head = f"{provider} CLI changed to {version}: its live check (`ttp doctor --live {provider}`)"
+        if r.get("checks") is not None:
+            write_json(d / f"{provider}.last.json", r)
+        failing = {k: v for k, v in (r.get("checks") or {}).items() if v.get("status") == FAIL}
+        if failing:
+            out.append((f"cli-live:{provider}:{version}", f"{head} failed " + "; ".join(
+                f"{k}: {v.get('note') or 'fail'}"[:200] for k, v in failing.items()) + f". Row: {run / 'out.json'}"))
+        elif rc not in (0, 1) or r.get("checks") is None:
+            try:
+                tail = " | ".join((run / "log").read_text(errors="replace").strip().splitlines()[-3:])[-300:]
+            except OSError:
+                tail = ""
+            out.append((f"cli-live:{provider}:{version}", f"{head} gave no row (exit {rc}): {tail or 'no log'}. "
+                        f"Folder: {run}"))
+        durable_write(run / "reported", f"{rc}\n")
+    return out

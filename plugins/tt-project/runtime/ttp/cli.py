@@ -9379,7 +9379,7 @@ def cmd_doctor(a) -> None:
     if getattr(a, "live", None):
         # Measures the agent CLI itself, in a scratch project: no project needed, and real spend.
         from . import live
-        r = live.row(a.live)
+        r = live.row(a.live, **({"max_usd": a.max_usd} if a.max_usd is not None else {}))
         print(json.dumps(r, indent=1) if a.json else live.format_row(r))
         sys.exit(1 if any(c["status"] == live.FAIL for c in r["checks"].values()) else 0)
     if getattr(a, "loop", None):
@@ -9620,6 +9620,8 @@ def main(argv: list[str] | None = None) -> None:
                            "bare remote) in a scratch project, ticking one daemon of its own (spends up to "
                            "about $1, at most 15 minutes; a missing or logged-out CLI is reported, exit 0)")
             s.add_argument("--json", action="store_true", help="with --live or --loop: the result as JSON")
+            s.add_argument("--max-usd", type=float, metavar="USD",
+                           help="with --live: cap the three runs' spend together (a run with under a cent left is skipped)")
             s.add_argument("--scheduler", action="store_true",
                            help="check the command-watcher scheduler's lifecycle in a scratch project, each tick in "
                            "a fresh process (no model, $0; exit 1 on a failed step)")
