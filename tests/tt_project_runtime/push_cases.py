@@ -2465,7 +2465,7 @@ def test_a_batch_is_due_after_the_window_at_the_cap_for_priority_one_or_with_no_
     assert [r["id"] for r in rows] == first and "waited" in why
     later = [_pq_review(s)[1], _pq_review(s)[1]]
     rows, why = pushq.due(s.p, now)
-    assert [r["id"] for r in rows] == first + later[:1] and "approvals" in why, "push_batch_max starts and caps a batch"
+    assert [r["id"] for r in rows] == first + later and "approvals" in why, "push_batch_max starts a batch; a backlog grows it"
     s.p.db.x("DELETE FROM push_queue WHERE id IN (?,?,?)", (*first, later[0]))
     urgent = _pq_review(s, priority=1)[1]
     rows, why = pushq.due(s.p, now)
@@ -2607,21 +2607,42 @@ def test_an_independent_approval_goes_alone_at_once_through_the_gap_and_the_wind
     assert pushq.due(s.p, now)[0] == [], "the routine ones still wait for the gap"
 
 
-def test_an_independent_approval_still_waiting_after_15_minutes_raises_one_event(env, monkeypatch):
+def test_a_priority_one_approval_in_a_backlog_of_twenty_goes_in_the_next_batch_and_leads_it(env, monkeypatch):
+    """A backlog bigger than push_batch_max grows the batch after a clean one (up to BATCH_GROW times it),
+    and a priority 1-2 approval leads it whatever its age; after a batch that did not end clean the cap
+    stays push_batch_max, and the priority 1 one still leads."""
     from ttp import pushq
-    s = _pq(env, monkeypatch)
-    now = time.time()
+    s = _pq(env, monkeypatch, push_batch_s=0, push_batch_max=4)
+    s.p.db.update_task(s.review, status="done")
+    now = time.time() + 1
+    _pq_last_batch(s, "pushed", now - 60)
     _pq_earlier(s)
-    _pq_review(s)
-    alone = _pq_alone(s, "other.txt")
-    assert pushq.fast_waits(s.p, "batch b9 is still going", now + 60) == [], "not yet 15 minutes"
-    assert pushq.fast_waits(s.p, "batch b9 is still going", now + pushq.FAST_WAIT_S + 1) == [alone]
-    [e] = s.p.db.q("SELECT * FROM events WHERE kind=?", (pushq.FAST_WAIT_EVENT,))
-    assert e["status"] == "handled" and f"row {alone}" in e["text"] and "batch b9 is still going" in e["text"]
-    assert pushq.fast_waits(s.p, "batch b9 is still going", now + 3 * pushq.FAST_WAIT_S) == [], "once per row"
-    s.p.db.x("UPDATE push_queue SET status='landed' WHERE id=?", (alone,))
-    pushq.fast_waits(s.p, "x", now + 3 * pushq.FAST_WAIT_S)
-    assert s.p.db.kv(pushq.FAST_KV) == [], "rows no longer waiting are pruned"
+    routine = [_pq_review(s)[1] for _ in range(19)]
+    hot = _pq_review(s, priority=1)[1]
+    got, why = pushq.due(s.p, now)
+    assert [r["id"] for r in got] == [hot] + routine[:4 * pushq.BATCH_GROW - 1], why
+    s.p.db.x("UPDATE push_batches SET outcome='died', ended=?, finalized=?, after_finalized=?",
+             (now - 4000, now - 4000, now - 4000))
+    got, why = pushq.due(s.p, now)
+    assert [r["id"] for r in got] == [hot] + routine[:3], "no growth after a batch that did not end clean"
+
+
+def test_approvals_that_waited_out_the_last_batch_start_the_next_at_once(env, monkeypatch):
+    """No idle gap between batches while approvals wait: one approved before the last clean batch
+    (and its after_push) ended starts the next at once, even with a review still running; one approved
+    after it waits the window as before."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_s=900)
+    s.p.db.update_task(s.review, status="running")
+    now = time.time()
+    _pq_last_batch(s, "pushed", now + 5)   # freed in 5 s: every approval below waited it out
+    _pq_earlier(s)
+    rid = _pq_review(s)[1]
+    got, why = pushq.due(s.p, now + 10)
+    assert [r["id"] for r in got] == [rid] and "1 approval waited out b1" in why, why
+    s.p.db.x("UPDATE push_batches SET ended=?, finalized=?, after_finalized=?", (now - 60, now - 60, now - 60))
+    got, why = pushq.due(s.p, now + 10)
+    assert got == [] and "waiting for more approvals" in why, "approved after the batch: the window applies"
 
 
 def test_batch_max_still_caps_a_batch_started_at_once(env, monkeypatch):
@@ -10388,42 +10409,42 @@ def _pq_change(s, name, files):
     return row
 
 
-def test_a_push_batch_takes_at_most_one_change_touching_the_prompt_files(env, monkeypatch):
-    """Two prompt changes that each fit a size cap may not fit together: a batch takes at most one
-    approval touching delivery.push_solo_paths (default the plugin's prompt templates); the others
-    stay approved for a later batch, and the rest of the batch fills up as before."""
+def test_push_solo_paths_is_off_by_default_and_when_set_holds_a_routine_change_one_batch_per_older_one(env, monkeypatch):
+    """Prompt changes that fit a size cap alone but not together are found by the batch's cap probes, so
+    by default a batch takes every prompt change. Set, delivery.push_solo_paths lets a batch take at most
+    one routine approval touching it: the oldest leads the next batch, newer ones of a better priority
+    never pass it, and priority 1-2 ones are never held."""
     from ttp import pushq
-    release = env["tmp"] / "release"
-    s = _pq(env, monkeypatch, plan={"release": str(release)}, push_batch_max=3)
+    s = _pq(env, monkeypatch, push_batch_max=3)
     _git_out(s.repo, "fetch", "-q", "origin")
+    _pq_earlier(s)   # every change below shares its files: none is fast by independence
     prompt = "plugins/tt-project/template/prompts/worker.md"
     a = _pq_change(s, "a", [prompt])
     b = _pq_change(s, "b", ["plain.txt"])
     c = _pq_change(s, "c", ["x.txt", "plugins/tt-project/template/prompts/coordinator.md"])
-    d = _pq_change(s, "d", ["other.txt"])
+    rows, why = pushq.due(s.p, time.time() + 10 ** 6)
+    assert [r["id"] for r in rows] == [a, b, c] and "push_solo_paths" not in why, why
+    s.p.set_config("delivery.push_solo_paths", ["plugins/tt-project/template/prompts/*.md"])
+    d = _pq_change(s, "d", ["plugins/tt-project/template/prompts/notes.txt"])   # no .md: not a solo path
+    s.p.db.x("UPDATE tasks SET priority=2 WHERE id=(SELECT task FROM push_queue WHERE id=?)", (c,))
+    rows, why = pushq.due(s.p, time.time() + 10 ** 6)
+    assert [r["id"] for r in rows] == [c, a, b, d] and "push_solo_paths" not in why, "priority 1-2 is never held"
+    s.p.db.x("UPDATE tasks SET priority=3 WHERE id=(SELECT task FROM push_queue WHERE id=?)", (c,))
     rows, why = pushq.due(s.p, time.time() + 10 ** 6)
     assert [r["id"] for r in rows] == [a, b, d], why
     assert "1 more approval touching delivery.push_solo_paths waits for a later batch" in why
-    assert (bid := pushq.start(s.p, rows, "origin/proj"))
-    assert s.p.db.one("SELECT status FROM push_queue WHERE id=?", (c,))["status"] == "approved"
-    # Another prompt file, the same rule; a text file of the prompt folder that is no .md is not one.
-    # The batch process holds its run lock until it exits, and no batch starts while it does: the
-    # stub waits for `release`, so the next part never races a batch still running.
-    s.p.db.x("DELETE FROM push_batches")
-    assert pushq.due(s.p, time.time() + 10 ** 6) == ([], "another push holds its turn")
-    release.touch()
-    pushq._children[bid].wait(timeout=60)
-    s.p.db.x("DELETE FROM push_queue")
-    s.p.db.x("DELETE FROM push_batches")
-    e = _pq_change(s, "e", ["plugins/tt-project/template/prompts/notes.txt"])
+    s.p.db.x("DELETE FROM push_queue WHERE id IN (?,?,?)", (a, b, d))   # that batch landed them
+    e = _pq_change(s, "e", [prompt])
+    s.p.db.x("UPDATE tasks SET priority=1 WHERE id=(SELECT task FROM push_queue WHERE id=?)", (e,))
     f = _pq_change(s, "f", [prompt])
-    g = _pq_change(s, "g", ["plugins/tt-project/template/prompts/kind-code.md"])
-    assert [r["id"] for r in pushq.due(s.p, time.time() + 10 ** 6)[0]] == [e, f]
-    # Configurable: other paths, or off.
-    s.p.set_config("delivery.push_solo_paths", ["*/notes.txt", "*/worker.md"])
-    assert [r["id"] for r in pushq.due(s.p, time.time() + 10 ** 6)[0]] == [e, g]
+    s.p.db.x("UPDATE tasks SET priority=0 WHERE id=(SELECT task FROM push_queue WHERE id=?)", (f,))
+    s.p.db.x("UPDATE tasks SET priority=2 WHERE id=(SELECT task FROM push_queue WHERE id=?)", (f,))
+    g = _pq_change(s, "g", [prompt])
+    rows, why = pushq.due(s.p, time.time() + 10 ** 6)
+    assert [r["id"] for r in rows][:3] == [e, f, c] and g not in [r["id"] for r in rows], \
+        "the held one leads the routine part of the next batch, after the fast ones; newer routine ones wait"
     s.p.set_config("delivery.push_solo_paths", [])
-    assert [r["id"] for r in pushq.due(s.p, time.time() + 10 ** 6)[0]] == [e, f, g]
+    assert [r["id"] for r in pushq.due(s.p, time.time() + 10 ** 6)[0]] == [e, f, c, g]
 
 
 def test_cap_failure_reads_only_a_complete_list_of_prompt_cap_test_failures_and_their_overshoots():

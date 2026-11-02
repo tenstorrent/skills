@@ -1450,15 +1450,18 @@ queues behind routine work; nothing running is interrupted:
   broken instead of the change. Keys, all under `delivery`: `push_batch_s` (default 300: with
   no review running or ready an approval starts a batch at once; otherwise the batch starts once the
   oldest approval waited this long; 0 = at once), `push_batch_max`
-  (default 8: start at once with this many; also the most one batch takes), `push_min_gap_s`
+  (default 8: start at once with this many; also the most one batch takes, except that after a
+  clean batch a bigger backlog grows the batch up to three times this), `push_min_gap_s`
   (default 1800: after a batch that did not end clean, such as a failing tip or a dead batch, the
   next starts only once it ended at least this long ago, measured
   from its recorded end so a restart never stretches the wait; none after a clean batch, though a
   new batch never starts while the last one's after_push still runs; a full batch, a
-  priority-1 review's approval, or one the last batch requeued unchecked after a failing change
-  starts at once; 0 = off), `push_solo_paths` (default `["plugins/tt-project/template/prompts/*.md"]`:
-  git pathspecs a batch takes at most one approved change touching, as two prompt changes that
-  each fit a size cap may not fit together; the others wait for a later batch; `[]` = off),
+  priority 1-2 review's approval, or one the last batch requeued unchecked after a failing change
+  starts at once; 0 = off). Approvals that waited while the last clean batch ran start the next one
+  at once, and priority 1-2 approvals always lead it. `push_solo_paths` (default `[]`, off:
+  git pathspecs a batch takes at most one routine approved change touching; the oldest such change
+  leads the next batch and priority 1-2 ones are never held. Two prompt changes that fit a size cap
+  alone but not together need no such rule: the batch's cap probes find the one that breaks it),
   `push_cap_tests` (a regex of prompt size cap test names, default `(?i)prompt\w*_(?:stays_small|under_its_cap|size)$`; the `$` anchor means a
   parametrized cap test id (`name[param]`) needs a custom `push_cap_tests`:
   when only such tests fail on a change merged in a batch, its review runs again as a light
@@ -1758,7 +1761,7 @@ is open raises one `cap_wait` event naming the key.
 | `coordinator.review_stall_s` | 1800 s (old: 14400) | a dependency in review before the coordinator hears of it | convenience |
 | `checks.test_project_max` | from cores and memory, at least 2 | a project's suites at once | convenience |
 | `delivery.push_batch_s` | 300 s, none after a clean batch | changes gathered into one push | convenience |
-| `delivery.push_batch_max` | 8 | most changes in one push batch (a full batch starts at once) | convenience |
+| `delivery.push_batch_max` | 8 | most changes in one push batch (a full batch starts at once; a backlog after a clean batch grows it up to 3x) | convenience |
 | `coordinator.burst_window_s` | 120 s (0: off) | high events after a turn high events woke, until one follow-up turn reads them all; never user messages, critical or safety-class events | convenience |
 | `retry_when` / `start_when` probe (`PROBE_EVERY_S`) | 180 s; only a `start_when` probe of an arbitrary command that keeps saying not-yet backs off, to at most 600 s (`MAX_EVERY_S`) with the wait's length; landing (`landed:#`, ttp landed), job (detach --check), checks --result, push --result, CI, ack-wait, upstream --fixed and date (`test "$(date ...`) probes, and every `retry_when` probe, keep 180 s | a waiting or deferred task before its probe runs again | convenience |
 | auth re-probe (`AUTH_PROBE_S`) | 900 s | work for a logged-out provider with no login check, before one run checks it | safety (spend) |

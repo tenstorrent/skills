@@ -29,18 +29,18 @@ from .worktree import fix_branches, named_refs
 REF_PREFIX = "refs/ttp/push/"   # + row id: pins the approved commit until its row is settled
 KV = "push_queue"               # kv: {"backoff_until", "deaths", "bad_tip": {"tip", "fails", "tried", "at", ...}, "tips_told"}
 DEFAULT_BATCH_S = 300           # delivery.push_batch_s: the oldest approval waits at most this long for running reviews
-DEFAULT_BATCH_MAX = 8           # delivery.push_batch_max: start at once with this many; also a batch's most
+DEFAULT_BATCH_MAX = 8           # delivery.push_batch_max: start at once with this many; a batch's most unless the backlog is bigger
+BATCH_GROW = 3                  # after a clean batch a backlog grows a batch up to this many times push_batch_max
 DEFAULT_MIN_GAP_S = 1800        # delivery.push_min_gap_s: after a batch that did not end clean, the least time to the next start
 CLEAN_OUTCOMES = ("pushed", "landed", "nothing")   # the tip passed and the push went: no gap after these
-FAST_PRIORITY = 2               # an approval of this priority or better goes in a batch of its own at once (fast_ids)
-FAST_WAIT_S = 900               # a fast approval still waiting this long raises one FAST_WAIT_EVENT
-FAST_WAIT_EVENT = "push_fast_waiting"
-FAST_KV = "push_fast_told"      # kv: [row ids] FAST_WAIT_EVENT was raised for (pruned to the approved rows)
+FAST_PRIORITY = 2               # an approval of this priority or better goes in the next batch, ahead of routine ones (fast_ids)
 OPEN_ROWS = ("approved", "batched", "held")   # rows approved but not landed nor sent back
-# delivery.push_solo_paths: git pathspecs; a batch takes at most one approval whose change touches them.
-# Two prompt changes that each fit a size cap may not fit together, which fails the whole batch.
+# delivery.push_solo_paths: git pathspecs; a batch takes at most one routine approval whose change touches
+# them (fast ones are never held). Off by default: two prompt changes that fit a size cap alone but not
+# together are found by the batch's cap probes (batch._caps) and the breaking one goes back to be trimmed,
+# so serialising them only made every prompt change wait one batch per earlier one.
 TRIM_EVENT = "its review runs again as a light trim-to-fit fix"   # counts them per review
-SOLO_PATHS = ("plugins/tt-project/template/prompts/*.md",)
+SOLO_PATHS: tuple[str, ...] = ()
 HOLD_S = 1800                   # after tip_failed, approvals already tried on that tip wait this long unless it changes
 TIP_FAILS = 2                   # tip_failed batches in a row on one tip before it is known bad: alerted, never checked alone
 BAD_TIP_RETRY_S = 6 * 3600      # a known-bad tip with nothing new to try: the tried approvals run again after this
@@ -716,9 +716,11 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     starts one at once unless a review is running or ready, which it waits for at most
     delivery.push_batch_s. After a batch that did not end clean (a failing tip, a dead batch), unless
     the batch is full or holds one the last batch requeued untested, it waits for
-    delivery.push_min_gap_s since the last one. Fast approvals (fast_ids: urgent, priority 1-2, or
-    sharing no file with an earlier unlanded approval) wait for neither: while the routine ones wait
-    they start a batch of their own at once; when the routine ones are due too, they lead it."""
+    delivery.push_min_gap_s since the last one. Approvals that waited while the last clean batch ran
+    start the next one at once. Fast approvals (fast_ids: urgent, priority 1-2, or sharing no file
+    with an earlier unlanded approval) wait for neither: while the routine ones wait they start a
+    batch of their own at once; when the routine ones are due too, they lead it. After a clean batch
+    a backlog bigger than push_batch_max grows the batch up to BATCH_GROW times it."""
     now = time.time() if now is None else now
     if not enabled(p, cfg):
         return [], "the push queue is off"
@@ -759,7 +761,9 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     window = _num(d.get("push_batch_s"), DEFAULT_BATCH_S, float, 0)
     cap = int(_num(d.get("push_batch_max"), DEFAULT_BATCH_MAX, int, 1))
     gap = _num(d.get("push_min_gap_s"), DEFAULT_MIN_GAP_S, float, 0)
-    last = db.one("SELECT id, outcome FROM push_batches ORDER BY started DESC LIMIT 1")
+    last = db.one("SELECT id, outcome, COALESCE(after_finalized, finalized, ended, started) AS freed "
+                  "FROM push_batches ORDER BY started DESC LIMIT 1")
+    clean = not last or last["outcome"] in CLEAN_OUTCOMES
     # Approvals the last batch requeued after a blamed entry without checking them: no gap, as it
     # spent its checks on the others (batch._close marks them "untested").
     untested = [r for r in rows if last and r["batch"] == last["id"] and _detail(r).get("untested")]
@@ -771,8 +775,10 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
         why = f"{len(rows)} approvals"
     elif untested:
         why = f"{len(untested)} approval{'s' if len(untested) != 1 else ''} {last['id']} requeued untested"
-    elif last and last["outcome"] not in CLEAN_OUTCOMES and (left := _gap_left(db, now, gap)) > 0:
+    elif not clean and (left := _gap_left(db, now, gap)) > 0:
         wait = f"{left:.0f} s left of the {gap:.0f} s gap since the last batch ended"
+    elif last and (n := sum(1 for r in rows if float(r["created"]) <= float(last["freed"] or 0))):
+        why = f"{n} approval{'s' if n != 1 else ''} waited out {last['id']}"
     elif now - min(r["created"] for r in rows) >= window:
         why = f"the oldest approval waited {window:.0f} s"
     elif not db.one("SELECT id FROM tasks WHERE kind='review' AND status='running' LIMIT 1") and not any(
@@ -792,7 +798,9 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
                f"earlier unlanded one" + (f" ({hot} an urgent review)" if hot else ""))
     else:
         rows = [r for r in rows if r["id"] in fast] + [r for r in rows if r["id"] not in fast]   # they lead
-    taken, held = _one_solo(p, rows, cap, _solo_paths(d), _tracking_tip(p, remote, branch))
+    if clean and len(rows) > cap:
+        cap = min(len(rows), cap * BATCH_GROW)   # one merged-result check run covers the backlog
+    taken, held = _one_solo(p, rows, cap, _solo_paths(d), _tracking_tip(p, remote, branch), fast)
     if held:
         why += (f"; {len(held)} more approval{'s' if len(held) != 1 else ''} touching delivery.push_solo_paths "
                 f"wait{'s' if len(held) == 1 else ''} for a later batch (one per batch)")
@@ -844,57 +852,29 @@ def fast_ids(p: Project, rows: list[dict], tip: str, skip: set = frozenset()) ->
     return out
 
 
-def fast_waits(p: Project, why: str, now: float | None = None, cfg: dict | None = None) -> list[int]:
-    """Model-free: one FAST_WAIT_EVENT per fast approval (fast_ids) still approved FAST_WAIT_S after
-    it was queued, naming `why` (due's answer: what holds the queue). Returns the row ids it raised for."""
-    now = time.time() if now is None else now
-    db = p.db
-    tgt = target(p) if enabled(p, cfg) else None
-    if not tgt:
-        return []
-    rows = _approved(db, f"{tgt[0]}/{tgt[1]}")
-    told = [i for i in (db.kv(FAST_KV) or []) if isinstance(i, int)]
-    live = {r["id"] for r in rows}
-    old = [r for r in rows if now - float(r["created"]) >= FAST_WAIT_S and r["id"] not in told]
-    out = []
-    if old:
-        fast = fast_ids(p, rows, _tracking_tip(p, *tgt))
-        for r in old:
-            if r["id"] in fast:
-                _event(db, db.task(r["task"]), FAST_WAIT_EVENT,
-                       f"push queue row {r['id']} (#{r['task']}, head {_short(r['head'])}) is independent or "
-                       f"priority 1-{FAST_PRIORITY} and still waits after {_age(now - float(r['created']))}: {why}",
-                       queued=False)
-                out.append(r["id"])
-    keep = [i for i in told if i in live] + out
-    if keep != told:
-        db.set_kv(FAST_KV, keep)
-    return out
-
-
 def _solo_paths(d: dict) -> list[str]:
     v = d.get("push_solo_paths", SOLO_PATHS)
     v = [v] if isinstance(v, str) else v if isinstance(v, (list, tuple)) else []
     return [str(x) for x in v if str(x).strip()]
 
 
-def _one_solo(p: Project, rows: list[dict], cap: int, paths: list[str], tip: str) -> tuple[list[dict], list[dict]]:
-    """Up to `cap` of `rows` in order, at most one of them a change touching `paths` since it left
-    `tip`: (taken, the touching ones left for a later batch). A row git cannot tell about counts as
-    touching (one per batch is the safe side)."""
+def _one_solo(p: Project, rows: list[dict], cap: int, paths: list[str], tip: str,
+              fast: set = frozenset()) -> tuple[list[dict], list[dict]]:
+    """Up to `cap` of `rows` in order, at most one routine one (not in `fast`) a change touching `paths`
+    since it left `tip`: (taken, the touching ones left for a later batch). The oldest touching one
+    leads the routine part, so each waits at most one batch per older one, never behind newer ones of
+    a better priority. Fast rows are never held. A row git cannot tell about counts as touching (one
+    per batch is the safe side)."""
     if not paths or len(rows) < 2:
         return rows[:cap], []
-    taken, held, solo = [], [], False
-    for r in rows:
-        if len(taken) >= cap:
-            break
-        if _touches_paths(p, tip, f"{REF_PREFIX}{r['id']}", paths):
-            if solo:
-                held.append(r)
-                continue
-            solo = True
-        taken.append(r)
-    return taken, held
+    touching = [r for r in rows if r["id"] not in fast and _touches_paths(p, tip, f"{REF_PREFIX}{r['id']}", paths)]
+    if not touching:
+        return rows[:cap], []
+    lead = min(touching, key=lambda r: r["id"])
+    held = [r for r in touching if r is not lead]
+    first = [r for r in rows if r["id"] in fast]
+    order = first + [lead] + [r for r in rows if r["id"] not in fast and r is not lead and r not in held]
+    return order[:cap], held
 
 
 def _touches_paths(p: Project, tip: str, ref: str, paths: list[str]) -> bool:
@@ -1068,7 +1048,6 @@ def schedule(p: Project, cfg: dict | None = None, log: Callable[[str], None] = l
         log(f"push queue: approvals for an old target sent back to their reviews (target now {name})")
     rows, why = due(p, cfg=cfg)
     if not rows:
-        fast_waits(p, why, cfg=cfg)
         return None
     bid = start(p, rows, name)
     if bid:

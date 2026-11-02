@@ -474,7 +474,7 @@ EXTRA_KEYS = {
     # keyed by repo path or folder name); unset: the push branch's remote, else origin (push.own_push_remote).
     # deploy_restart_wait_s: how long `ttp deployed --after-push` lets a daemon restart onto new files (deploy.py).
     # plugin_version_guard: refuse a change that edits plugins/<name>/ but keeps the tip's manifest version (off).
-    # push_solo_paths: pathspecs a batch takes at most one change touching (pushq.SOLO_PATHS); push_cap_tests:
+    # push_solo_paths: pathspecs a batch takes at most one routine change touching (pushq.SOLO_PATHS, off); push_cap_tests:
     # the name regex of prompt size cap tests, whose lone failure sends a trim-to-fit fix (conflictfix.CAP_TESTS).
     # push_rerun_s: the time limit of one rerun of a failed push check's failing tests (batch.RERUN_S).
     # landed_probe: with no push_branch, the read-only command (`{id}`: the task id) that answers
@@ -632,8 +632,9 @@ def code_tasks_may_push(cfg: dict) -> bool:
 
 # delivery.push_queue on: reviews approve into the daemon's queue, which pushes approved heads in
 # batches (a batch starts at once when no review is running or ready, else once the oldest approval
-# waited push_batch_s or push_batch_max are waiting; after a batch that did not end clean, not before
-# push_min_gap_s passed since it ended unless it is full or priority 1)
+# waited push_batch_s, push_batch_max are waiting or approvals waited out the last batch; after a batch
+# that did not end clean, not before push_min_gap_s passed since it ended unless it is full or priority
+# 1-2; after a clean one a backlog grows a batch up to pushq.BATCH_GROW times push_batch_max)
 # and then runs after_push (commands like push_checks), killed after after_push_timeout_s.
 # push_landing_alert_h: approvals waiting this long with nothing landed raise a high alert (0 = off).
 PUSH_QUEUE_DEFAULTS = {"push_queue": False, "push_batch_s": 300, "push_batch_max": 8, "push_min_gap_s": 1800,
