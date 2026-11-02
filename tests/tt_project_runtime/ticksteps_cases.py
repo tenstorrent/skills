@@ -262,8 +262,9 @@ def test_a_hung_harness_head_git_is_killed_whole_within_its_bound(env, monkeypat
 def test_a_failed_reviews_area_and_followup_overlaps_read_no_git_inside_the_finish_transaction(env, monkeypatch):
     """Finishing a run judged its hand-off inside one write transaction, and a failed review's area
     (reviewcap.area: main_file, touched) and each follow-up's file overlaps (overlap.find: branches,
-    the push-branch patch check) ran git there: the write lock was held up to ~98 s. Now those git
-    facts are read before the transaction (_prefetch_git) and the same calls inside it read them."""
+    the push-branch patch check) ran git there: the write lock was held up to ~98 s. Now the area is
+    read before the transaction (_prefetch_git) and the same calls inside it read it; a plain
+    follow-up's overlaps are neither warmed nor read by the finish (the coordinator's task_add reads them)."""
     p = make(env)
     from ttp import coordinator as coord, gitmemo, overlap, reviewcap
     from ttp.daemon import Daemon
@@ -315,10 +316,8 @@ def test_a_failed_reviews_area_and_followup_overlaps_read_no_git_inside_the_fini
     with d._finish_tx(rev["id"]):
         assert gitmemo.current() is not None
         assert reviewcap.area(p, cfg, task) == want_area
-        assert overlap.find(p, spec) == want_hits
-        assert overlap.find(p, spec, {want_hits[0]["id"]}) == want_hits[1:]   # skip filters what was read
-        assert [coord._overlap_chain(p, "code", spec, coord._file_overlaps(p, "code", spec, skip), roots, skip)
-                for skip in (set(), roots)] == want_ties   # a plain follow-up's own spec, done or split (a hop's: test below)
+        warmed = [k for k in gitmemo.current() if isinstance(k, tuple) and str(k[0]).startswith("overlap.")]
+        assert not warmed, f"the warm-up read a plain follow-up's overlaps, which no finish reads: {warmed}"
     assert not spawned, f"git ran inside the finish transaction: {spawned}"
     assert rev["id"] not in d._git_memo and gitmemo.current() is None, "the memo outlived its transaction"
     # Through the hand-off itself (the way finish_run records it): the area is judged inside, git-free.
@@ -340,6 +339,8 @@ def test_a_failed_reviews_area_and_followup_overlaps_read_no_git_inside_the_fini
     with d._finish_tx(rev["id"]):
         d._finish_worker({"task": rev["id"]}, Usage(cost_usd=1.0), "ok", run_dir)
     assert (True, 0) in counts and all(n == 0 for _, n in counts), f"the area read git in the transaction: {spawned}"
+    live = [a for a in spawned if {"--no-merged", "grep", "ls-tree"} & set(a)]   # overlap.find/chain's reads
+    assert not live, f"the finish read the follow-up's overlaps in the transaction: {live}"
     assert p.db.task(rev["id"])["status"] == "failed"
     assert p.db.one("SELECT id FROM events WHERE kind=? AND task=?", (reviewcap.REVIEW_AREA_EVENT, rev["id"]))
 
@@ -1377,3 +1378,25 @@ def _masked_rows(db) -> dict:
                            stamp.sub("T", v) if isinstance(v, str) else v for v in row)
                      for row in db.conn.execute(f"SELECT * FROM {name} ORDER BY rowid")]
     return out
+
+
+
+def test_h_the_warm_up_reads_what_the_finish_reads_not_every_follow_ups_overlaps(env, monkeypatch):
+    """_prefetch_git warmed each follow-up's file overlaps (overlap.find, overlap.chain: a diff, merge-base
+    and remote reads per unlanded branch), 1,727 git calls on this 200-branch project (15 s at git's
+    own speed), though the finish only queues a lone `continue:` hop itself. The warm-up of both finishes
+    stays under 60 calls, and the code finish still commits in its first round with no live git."""
+    from ttp import daemon as dmod
+    counts, real = [], dmod.Daemon._prefetch_git
+    calls = env["tmp"] / "git-calls.log"
+
+    def prefetch(self, task, result):
+        n0 = len(calls.read_text().splitlines()) if calls.exists() else 0
+        real(self, task, result)
+        counts.append(len(calls.read_text().splitlines()) - n0)
+    monkeypatch.setattr(dmod.Daemon, "_prefetch_git", prefetch)
+    s, holds, lines, walls = _finish_holds(env, monkeypatch, True, n=200, delay=0.0)
+    assert len(counts) == 2 and sum(counts) <= 60, counts
+    assert s.p.db.task(s.code)["status"] == "done" and s.p.db.task(s.review)["status"] == "pushing"
+    assert len(holds) == 2 and all(ok for _, ok in holds), holds
+    assert "rounds 1, live git 0 " in lines[0], lines[0][-400:]

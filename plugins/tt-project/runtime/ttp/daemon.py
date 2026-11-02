@@ -4445,13 +4445,15 @@ class Daemon:
     def _prefetch_git(self, task: dict | None, result) -> None:
         """The git facts _finish_worker judges a hand-off by, read before its write transaction: a failed
         review's area (reviewcap.area); for a done code task its split (_split: the branch tip, its
-        changes, landed.equivalent) and a lone `continue:` hop's progress (chaincap.hop_ready); and each
-        follow-up's file overlaps and chain (coordinator _file_overlaps, _overlap_chain) as the hop the
-        daemon may queue reads them (chaincap.auto_hop: a task_add of chaincap.hop_spec, the follow-up's
-        spec plus the parent's branch brief, continuing this task, so its lineage roots, and its skip when
-        it is a split's hop); and the commits a review's approval or a finished code task's head carries
-        from rejected work (pushq.prefetch_git). Kept in self._git_memo for the transaction's gitmemo
-        scope (_finish_tx), where those calls read them; one not read here runs its git there, as before."""
+        changes, landed.equivalent) and a lone `continue:` hop's progress (chaincap.hop_ready), and that
+        hop's file overlaps and chain (coordinator _file_overlaps, _overlap_chain) as the daemon queuing it
+        reads them (chaincap.auto_hop: a task_add of chaincap.hop_spec, the follow-up's spec plus the
+        parent's branch brief, continuing this task, so its lineage roots, and its skip when it is a
+        split's hop); and the commits a review's approval or a finished code task's head carries from
+        rejected work (pushq.prefetch_git). Other follow-ups go to the coordinator, whose task_add reads
+        their overlaps outside any finish, so none are read here (on a 200-branch project they were
+        ~1,700 of its ~1,720 git calls). Kept in self._git_memo for the transaction's gitmemo scope
+        (_finish_tx), where those calls read them; one not read here runs its git there, as before."""
         if not task:
             return
         memo = self._git_memo[task["id"]] = {}
@@ -4464,14 +4466,13 @@ class Daemon:
                 fups = [f for f in result.get("followups") or [] if isinstance(f, dict)]
                 if result.get("status") == "done":
                     self._prefetch_hop(task, fups)
-                for f in fups:
-                    if isinstance(f.get("spec"), str) and f["spec"].strip():
-                        spec = chaincap.hop_spec(self.p, task, f) \
-                            if chaincap.CONT_TITLE.match(str(f.get("title") or "")) else f["spec"]
-                        for skip in (set(), {task["id"]}):   # a done task's follow-up, a split's hop
-                            clash = coord._file_overlaps(self.p, "code", spec, skip)
-                            coord._overlap_chain(self.p, "code", spec, clash, {task["id"]}, skip,
-                                                 [f"continues:{task['id']}"])
+                if result.get("status") == "done" and self._lone_continue(task, fups) \
+                        and isinstance(fups[0].get("spec"), str) and fups[0]["spec"].strip():
+                    spec = chaincap.hop_spec(self.p, task, fups[0])   # the one hop the body may queue
+                    for skip in (set(), {task["id"]}):   # a done task's hop, a split's hop
+                        clash = coord._file_overlaps(self.p, "code", spec, skip)
+                        coord._overlap_chain(self.p, "code", spec, clash, {task["id"]}, skip,
+                                             [f"continues:{task['id']}"])
                 pushq.prefetch_git(self.p, task, result, self.cfg)
         except Exception as e:
             log(self.p, f"task {task['id']}: reading git before finishing failed: {type(e).__name__}: {e}")
