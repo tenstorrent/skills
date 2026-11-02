@@ -4410,11 +4410,14 @@ def test_codex_reads_plan_windows_from_its_rollout_rate_limits(tmp_path):
     assert get_provider("claude").windows_so_far(out, now - 60, env) == []
 
 
-def test_daemon_records_a_running_codex_runs_rollout_windows_for_the_gate(env, tmp_path):
+def test_daemon_records_a_running_codex_runs_rollout_windows_for_the_gate(env, tmp_path, monkeypatch):
     p = make(env)
     from ttp import budget as bud
     from ttp.daemon import Daemon
     home, sid, now = tmp_path / "codex", "0199efef-1212", time.time()
+    # The daemon's own Codex home is the run's (no login file): never this host's real login, which
+    # would file the reading under that account.
+    monkeypatch.setenv("CODEX_HOME", str(home))
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     (run_dir / "output.jsonl").write_text(json.dumps({"type": "thread.started", "thread_id": sid}) + "\n")
