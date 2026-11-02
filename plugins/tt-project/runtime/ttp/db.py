@@ -100,7 +100,8 @@ CREATE TABLE IF NOT EXISTS runs (
   status TEXT NOT NULL DEFAULT 'running', exit_code INTEGER, progress_ts REAL,
   cost_usd REAL DEFAULT 0, cost_estimated INTEGER DEFAULT 0,
   input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
-  cache_read_tokens INTEGER DEFAULT 0, cache_write_tokens INTEGER DEFAULT 0, note TEXT, session_id TEXT);
+  cache_read_tokens INTEGER DEFAULT 0, cache_write_tokens INTEGER DEFAULT 0, note TEXT, session_id TEXT,
+  cost_basis TEXT);
 CREATE INDEX IF NOT EXISTS runs_status ON runs(status);
 
 CREATE TABLE IF NOT EXISTS events (
@@ -367,6 +368,7 @@ class DB:
         self._migrate_review_self_check()
         self._migrate_review_code_lines()
         self._migrate_tier_source()
+        self._migrate_run_cost_basis()
 
     def _migrate_tier_source(self) -> None:
         # The tier a task was queued at and why its current tier is what it is (TIER_SOURCES). Older
@@ -378,6 +380,15 @@ class DB:
             for col in ("assigned_tier", "tier_source"):
                 if col not in have:
                     self.x(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
+
+    def _migrate_run_cost_basis(self) -> None:
+        # How a run's cost_usd was known (daemon._cost_basis: reported, tokens or elapsed). Older runs
+        # keep NULL, shown as unknown.
+        if "cost_basis" in {r["name"] for r in self.q("PRAGMA table_info(runs)")}:
+            return
+        with self.tx():
+            if "cost_basis" not in {r["name"] for r in self.q("PRAGMA table_info(runs)")}:
+                self.x("ALTER TABLE runs ADD COLUMN cost_basis TEXT")
 
     def _migrate_review_self_check(self) -> None:
         # Whether the reviewed hand-off carried a `self_check` line. Older rows have none (NULL).

@@ -3240,14 +3240,16 @@ class Daemon:
             self._metered[r["id"]] = (size, now)
             try:
                 usage = get_provider(r["provider"]).parse(out)
+                basis = _cost_basis(usage)
                 self._priced(r, usage)
                 cost = self._net_of_session(r, usage)
             except Exception:
                 continue
             # The tokens also show a run on a logged-out provider got past the login (alerts.holds).
-            self.p.db.x("UPDATE runs SET cost_usd=?, cost_estimated=1, input_tokens=?, output_tokens=?, "
+            # Its basis stays if a failed reap books this figure; finish_run replaces both.
+            self.p.db.x("UPDATE runs SET cost_usd=?, cost_estimated=1, cost_basis=?, input_tokens=?, output_tokens=?, "
                         "cache_read_tokens=? WHERE id=? AND status='running'",
-                        (cost, usage.input_tokens or 0, usage.output_tokens or 0, usage.cache_read_tokens or 0,
+                        (cost, basis, usage.input_tokens or 0, usage.output_tokens or 0, usage.cache_read_tokens or 0,
                          r["id"]))
             self._suggest_split(r, usage.cache_read_tokens or 0)
 
@@ -3355,6 +3357,7 @@ class Daemon:
             key = f"connectors_used:{r['provider']}"
             seen = db.kv(key) or {"since": time.time()}
             db.set_kv(key, {**seen, "used": sorted(set(seen.get("used") or []) | set(usage.extra["connectors_used"]))})
+        basis = _cost_basis(usage)
         self._priced(r, usage)
         self._net_of_session(r, usage)
         stopped = exit_info.get("stopped")
@@ -3372,12 +3375,14 @@ class Daemon:
             and not _has_tokens(usage) and _resume_never_started(json.loads(r["note"] or "{}"), usage)
         if usage.estimated and not usage.cost_usd and not failed_resume:
             usage.cost_usd = _cut_off_cost(run_dir, exit_info, usage, prov)
+            basis = "elapsed" if usage.cost_usd else basis
         # A run routed to another provider (route.py): booked at its pricing rows, else zero and unpriced.
         routed = route.of(r["note"]) if r["role"] == "worker" else None
         on_route = bool(routed) and r["provider"] == routed.get("to")
         if on_route and r["task"]:   # its host-wide routed slot frees for the next start, any project's
             self._route_unlease((r["provider"], self._route_key(r["task"])))
         priced = route.price(self.cfg, r["provider"], r["model"] or "", usage) if on_route else None
+        basis = "tokens" if on_route else basis   # its pricing rows, or $0 and unpriced (audit.unpriced_runs)
         status = "ok" if exit_info.get("rc") == 0 and not usage.error else "failed"
         if stopped in ("timeout", "budget", "stopped", "lost", "stalled", "shutdown", "resource_busy"):
             status = stopped if stopped != "stopped" else "killed"
@@ -3527,11 +3532,11 @@ class Daemon:
         # The run's end, its spend and what it did to its task commit together: a daemon stopped
         # half way leaves the run "running", and the next tick processes it again from disk.
         with self._finish_tx(r["task"] or 0):
-            db.x("UPDATE runs SET ended=?, status=?, exit_code=?, cost_usd=?, cost_estimated=?, input_tokens=?, "
-                 "output_tokens=?, cache_read_tokens=?, cache_write_tokens=?, note=?, "
+            db.x("UPDATE runs SET ended=?, status=?, exit_code=?, cost_usd=?, cost_estimated=?, cost_basis=?, "
+                 "input_tokens=?, output_tokens=?, cache_read_tokens=?, cache_write_tokens=?, note=?, "
                  "session_id=COALESCE(NULLIF(?,''), session_id) WHERE id=?",
                  (ended, status, exit_info.get("rc"), usage.cost_usd,
-                  int(usage.estimated), usage.input_tokens, usage.output_tokens, usage.cache_read_tokens,
+                  int(usage.estimated), basis, usage.input_tokens, usage.output_tokens, usage.cache_read_tokens,
                   usage.cache_write_tokens, json.dumps(note), usage.session_id or "", r["id"]))
             db.spend(r["provider"], usage.cost_usd, source, account=r["account"] or "", estimated=usage.estimated,
                      tokens_in=usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens,
@@ -13704,6 +13709,17 @@ def _sleep_text(d: dict) -> str:
 
 def _ids(ids: list) -> str:
     return ", ".join(str(i) for i in ids)
+
+
+def _cost_basis(usage) -> str:
+    """How a run's figure is known, as its provider parsed it: "reported" when the CLI reported it
+    (a chat run's fallback figure is Claude Code's own report), else "tokens" (priced from its token
+    counts; Daemon._priced fills a missing one). finish_run makes it "elapsed" when _cut_off_cost
+    books the elapsed share of the budget instead."""
+    how = usage.extra.get("cost_basis")   # chat runs (providers/chat.py)
+    if how == "pricing":
+        return "tokens"
+    return "reported" if not usage.estimated or (how == "fallback" and usage.cost_usd) else "tokens"
 
 
 def _has_tokens(usage) -> bool:

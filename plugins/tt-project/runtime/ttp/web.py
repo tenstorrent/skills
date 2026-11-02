@@ -447,6 +447,9 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         w["wake"] = run_wake(w.pop("run_note"))
     spend = {"spent_24h": round(db.spent_since(now - DAY), 2), "spent_7d": round(db.spent_since(now - WEEK), 2),
              "top_7d": top if top and top["usd"] else None, "in_flight": round(bud.in_flight(db), 2)}
+    from . import audit   # runs by provider and how their cost was known: measured apart from guessed $
+    spend["bases_7d"] = audit.cost_bases(db, since=now - WEEK)
+    spend["bases_line"] = audit.bases_text(spend["bases_7d"]) if spend["bases_7d"] else ""
     spend["headline"] = budget_line(db, now, core, g, spend["spent_24h"], gates)
     spend["detail"] = gate_detail(g, now, tz, gates) if g else ""
     return {

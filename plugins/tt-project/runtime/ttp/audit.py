@@ -211,6 +211,50 @@ def per_outcome(done: list[dict], unpriced: dict[int, int] | None = None) -> lis
     return sorted(({**g, "each": g["usd"] / g["n"]} for g in groups.values()), key=lambda g: -g["usd"])
 
 
+def cost_bases(db: DB, done: list[dict] | None = None, since: float | None = None) -> list[dict]:
+    """$ and run counts by provider and cost basis, most costly first: {provider, basis, n, usd}.
+    The runs of the done tasks in `done` (what per_outcome sums), or, with `since`, the runs that
+    ended since then. Basis is how the figure was known (daemon._cost_basis): reported, tokens or
+    elapsed (a guess from the budget and the time it ran); runs from before it was recorded are
+    "unknown"."""
+    if done is not None:
+        ids = [t["id"] for t in done if t["status"] == "done"]
+        if not ids:
+            return []
+        rows = db.q("SELECT provider, cost_basis, cost_usd FROM runs WHERE role!='coordinator' AND status!='running' "
+                    f"AND task IN ({','.join('?' * len(ids))})", ids)
+    else:
+        rows = db.q("SELECT provider, cost_basis, cost_usd FROM runs WHERE status!='running' AND ended>=?",
+                    (since or 0,))
+    groups: dict[tuple, dict] = {}
+    for r in rows:
+        key = (r["provider"] or "?", r["cost_basis"] or "unknown")
+        g = groups.setdefault(key, {"provider": key[0], "basis": key[1], "n": 0, "usd": 0.0})
+        g["n"] += 1
+        g["usd"] += float(r["cost_usd"] or 0)
+    return sorted(groups.values(), key=lambda g: (-g["usd"], g["provider"], g["basis"]))
+
+
+def elapsed_share(bases: list[dict]) -> list[dict]:
+    """Per provider with elapsed-guess dollars in `bases` (cost_bases rows): {provider, usd, total, share}."""
+    out = []
+    for prov in sorted({g["provider"] for g in bases}):
+        mine = [g for g in bases if g["provider"] == prov]
+        guess, total = sum(g["usd"] for g in mine if g["basis"] == "elapsed"), sum(g["usd"] for g in mine)
+        if guess > 0:
+            out.append({"provider": prov, "usd": guess, "total": total, "share": guess / total})
+    return out
+
+
+def bases_text(bases: list[dict]) -> str:
+    """'claude reported 3 runs $1.20, cursor elapsed 1 run $0.40; elapsed guess: cursor 100% of $0.40'."""
+    parts = ", ".join(f"{g['provider']} {g['basis']} {g['n']} run{'s' if g['n'] != 1 else ''} ${g['usd']:.2f}"
+                      for g in bases)
+    guesses = elapsed_share(bases)
+    return parts + "; elapsed guess: " + (", ".join(
+        f"{e['provider']} {e['share']:.0%} of ${e['total']:.2f}" for e in guesses) if guesses else "none")
+
+
 def stuck_long(db: DB, now: float, hours: float) -> list[dict]:
     """Tasks blocked or waiting now (not on their own work) for more than `hours`, longest first."""
     rows = [r for r in unblock.inventory(db, now) if r["kind"] in ("blocked", "waiting")
@@ -409,6 +453,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
             out.append("$ per done task by kind and tier: " + ", ".join(
                 f"{g['kind']}/{g['tier']} {g['n']} at ${g['each']:.2f}"
                 + (f" ({g['unpriced']} unpriced, routed)" if g["unpriced"] else "") for g in groups))
+        if bases := cost_bases(db, done):
+            out.append("$ per done task by provider and cost basis: " + bases_text(bases))
     stuck = stuck_long(db, now, blocked_h)
     if stuck:
         out.append(f"blocked or waiting longer than {blocked_h:g} h now: {len(stuck)}: " + ", ".join(
@@ -467,7 +513,7 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
             "review_fix_tasks": continued_tasks(db, since, fixes=True),
             "coordinator_turns": coordinator_turns(db, since),
             "coordinator_cache": budget.coordinator_cache(db, now, window_s)["window"], "turns_skipped": turngate.skipped(db, since), "turns_quiet": quietgate.skipped(db, since), "sweeps": sweepskip.counts(db, since, now),
-            "finished": done, "per_outcome": per_outcome(done, unpriced),
+            "finished": done, "per_outcome": per_outcome(done, unpriced), "cost_bases": cost_bases(db, done),
             "stuck": stuck_long(db, now, blocked_h), "review_loops": review_loops(db, since),
             "reviews": {**reviewstats.summary(db, since), "rows": reviewstats.rows(db, since)},
             "overrides": overrides(p, db, now, blocked_h), "promises": obligations.promise_outcomes(db, since, now),
