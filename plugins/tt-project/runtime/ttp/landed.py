@@ -27,7 +27,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import gitcache, gitmemo, push
+from . import gitcache, gitmemo, push, repoid
 from .db import TERMINAL_TASK_STATES, dependency_ids, review_subject
 
 LANDED_PROBE = re.compile(r"\s*landed:\s*#?(\d+)\s*")
@@ -124,9 +124,10 @@ def missing_words(missing: list[str]) -> str:
 
 def _git(repo: Path, *args: str, timeout: float = 30) -> subprocess.CompletedProcess:
     t = gitmemo.timeout(timeout, args)
-    return gitcache.run(repo, args, lambda: subprocess.run(
+    run = lambda: gitcache.run(repo, args, lambda: subprocess.run(   # noqa: E731
         ["git", "-C", str(repo), *args], text=True, capture_output=True, timeout=t, stdin=subprocess.DEVNULL,
         env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}), t)
+    return repoid.read(repo, args, run) if repoid.identity(args) else run()
 
 
 def _commit(repo: Path, rev: str) -> str:

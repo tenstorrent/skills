@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, cleantree, envfault, gitcache, gitmemo, landed, locks, machines, prguard, prhead, remotecheck, runner,
+from . import (checkcap, checkdirs, cleantree, envfault, gitcache, gitmemo, landed, locks, machines, prguard, prhead, remotecheck, repoid, runner,
                sandbox, scriptwatch, settinghold, shorttmp, testslots, timefmt, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
@@ -482,8 +482,8 @@ def venv_python(top: str | Path, env: dict | None = None) -> Path | None:
 def _checkouts(top: str | Path) -> list[Path]:
     """The worktree `top`, then its main checkout when it is a linked worktree."""
     bases = [Path(top)]
-    r = subprocess.run(["git", "-C", str(top), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                       capture_output=True, text=True)
+    args = ("rev-parse", "--path-format=absolute", "--git-common-dir")
+    r = repoid.read(top, args, lambda: subprocess.run(["git", "-C", str(top), *args], capture_output=True, text=True))
     common = Path(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
     if common and common.name == ".git" and common.parent not in bases:
         bases.append(common.parent)
@@ -1473,8 +1473,9 @@ def _git(repo: Path, *args: str, quiet: bool = True) -> subprocess.CompletedProc
     """Run git; when not quiet its output goes to stderr, keeping stdout for the verdict."""
     t = gitmemo.timeout(None, args)   # none of its own; capped within a daemon tick step or finish transaction
     if quiet:
-        return gitcache.run(repo, args, lambda: subprocess.run(["git", "-C", str(repo), *args], text=True,
-                                                               capture_output=True, timeout=t), t)
+        run = lambda: gitcache.run(repo, args, lambda: subprocess.run(   # noqa: E731
+            ["git", "-C", str(repo), *args], text=True, capture_output=True, timeout=t), t)
+        return repoid.read(repo, args, run) if repoid.identity(args) else run()
     return subprocess.run(["git", "-C", str(repo), *args], text=True, stdout=2, timeout=t)
 
 

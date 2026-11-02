@@ -41,7 +41,7 @@ from typing import Callable
 
 from . import push, reviewreuse
 from .project import Project, push_allowed
-from . import gitmemo
+from . import gitmemo, repoid
 
 LANDED, FAILED, REFUSED, CONFLICT, CHECKS_FAILED, MOVED, DIRTY, BUSY = 0, 1, push.REFUSED, push.CONFLICT, \
     push.CHECKS_FAILED, push.KEPT_MOVING, push.REJECTED, push.BUSY
@@ -51,9 +51,10 @@ STEP = "If it passes, land the head you reviewed with `ttp land"   # the review 
 
 def _git(repo: Path, *args: str, timeout: float = 120) -> subprocess.CompletedProcess:
     # The C locale keeps git's messages in English whatever the user's: _replay reads one.
-    return subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True, timeout=gitmemo.timeout(timeout, args),
-                          stdin=subprocess.DEVNULL,
-                          env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C", "LANGUAGE": ""})
+    run = lambda: subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True,   # noqa: E731
+                                 timeout=gitmemo.timeout(timeout, args), stdin=subprocess.DEVNULL,
+                                 env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C", "LANGUAGE": ""})
+    return repoid.read(repo, args, run) if repoid.identity(args) else run()
 
 
 def local_branch(p: Project, repo: Path, scratch: bool = False) -> str:

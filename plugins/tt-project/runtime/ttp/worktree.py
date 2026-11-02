@@ -12,14 +12,15 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import gitmemo
+from . import gitmemo, repoid
 from .db import continues_id
 from .project import Project, durable_write
 
 
 def _git(cwd: Path, *args: str, check: bool = True, timeout: float = 120, env: dict | None = None) -> str:
-    out = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True,
-                         timeout=gitmemo.timeout(timeout, args), env=env)
+    run = lambda: subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True,   # noqa: E731
+                                 timeout=gitmemo.timeout(timeout, args), env=env)
+    out = repoid.read(cwd, args, run) if env is None and repoid.identity(args) else run()
     if check and out.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {out.stderr.strip()[:300]}")
     return out.stdout.strip()

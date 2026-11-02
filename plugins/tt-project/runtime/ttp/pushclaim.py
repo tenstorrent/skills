@@ -37,7 +37,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import gitcache, gitmemo
+from . import gitcache, gitmemo, repoid
 
 SHARED = "shared"                # a claim on another task's commit
 KEY = "push_verify"              # tasks.result of a task in `pushing` until its claims are verified
@@ -70,6 +70,12 @@ _NOT_REFS = {"the", "a", "an", "it", "its", "origin", "remote", "github", "branc
 
 
 def _git(repo, *args: str, timeout: float = 30) -> subprocess.CompletedProcess:
+    if repoid.identity(args):
+        return repoid.read(repo, args, lambda: _run_git(repo, args, timeout))
+    return _run_git(repo, args, timeout)
+
+
+def _run_git(repo, args: tuple, timeout: float) -> subprocess.CompletedProcess:
     try:
         t = gitmemo.timeout(timeout, args)
         return gitcache.run(repo, args, lambda: subprocess.run(
