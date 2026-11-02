@@ -1537,6 +1537,7 @@ def keep_lock(lock, pid: int):
     except (AttributeError, OSError):
         pfd = -1
     try:
+        # own session: the keeper must outlive the runner it guards and ignores its signals; it ends with `pid`
         return subprocess.Popen([sys.executable, "-I", "-S", "-c", _KEEPER, str(pid), str(pfd)],
                                 pass_fds=(lock.fileno(), *([pfd] if pfd >= 0 else [])), stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
