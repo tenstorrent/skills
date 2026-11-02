@@ -494,7 +494,7 @@ def auto_hop(p, cfg: dict, task: dict, fup: dict, why: str | None = None,
               "tier": hop_tier(task, fup), "priority": task["priority"], "budget_usd": task["budget_usd"],
               "continues": task["id"]}
     try:   # a hop that publishes a code task's branch: task_add makes it kind code; no copied tier
-        pub = publishkind.resolve(db, task["kind"], spec, task)
+        pub = publishkind.resolve(db, task["kind"], spec)
     except ValueError:
         pub = None   # task_add refuses it with the same message
     if pub:

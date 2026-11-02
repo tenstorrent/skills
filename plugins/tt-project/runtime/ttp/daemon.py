@@ -12601,8 +12601,7 @@ class Daemon:
         mismatch; else `task` as it is."""
         db = self.p.db
         try:
-            prev = chaincap.prev_of(task)
-            pub = publishkind.resolve(db, task["kind"], task["spec"] or "", db.task(prev) if prev else None)
+            pub = publishkind.resolve(db, task["kind"], task["spec"] or "")
         except ValueError as e:
             why = str(e)[:500]
             db.update_task(task["id"], status="blocked", blocked_reason=why)

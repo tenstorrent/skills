@@ -2028,7 +2028,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 # and the coordinator is told how to carry it on purpose.
                 spec_text = a.get("spec") or ""
                 # One that publishes a code task's branch runs as kind code onto it (publishkind).
-                pub = None if review else publishkind.resolve(db, a.get("kind") or "work", spec_text, old or followup)
+                pub = None if review else publishkind.resolve(db, a.get("kind") or "work", spec_text)
                 was_kind = a.get("kind") or "work"
                 if pub:
                     a = dict(a, kind="code")

@@ -615,3 +615,47 @@ def test_a_queued_non_code_task_with_a_pr_branch_line_is_corrected_or_blocked_be
     assert row["status"] == "blocked" and "kind work cannot publish branch ttp/t9999-lost" in row["blocked_reason"]
     assert not row["attempts"]
     assert p.db.one("SELECT status FROM events WHERE task=? AND kind='task_blocked'", (bad,))["status"] == "queued"
+
+
+def test_a_publish_task_that_takes_over_failed_work_may_still_push_onto_the_branch(env, monkeypatch):
+    """A task that continues failed harness work and publishes a code task's branch through a
+    `ttp push --own` step is made kind code with continues:<owner> after continues:<failed>: own_target
+    accepts it, though the owner is not the first continues: link."""
+    from ttp import coordinator as coord, push
+    from ttp.db import continues_id
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    owner = p.db.add_task("Lever feature", "s", kind="code", origin="coordinator")
+    branch = f"ttp/t{owner}-lever-feature"
+    p.db.update_task(owner, status="done", branch=branch)
+    _git_out(repo, "branch", branch)
+    failed = p.db.add_task("Publish the lever head", "s", kind="harness", origin="coordinator")
+    p.db.update_task(failed, status="failed")
+    coord.apply(p, [{"type": "task_add", "title": "Publish the lever head again", "kind": "harness",
+                     "continues": failed, "spec": f"Run `ttp push --own --detach` from {branch}."}])
+    (new,) = p.db.q("SELECT * FROM tasks WHERE title='Publish the lever head again'")
+    labels = json.loads(new["labels"])
+    assert new["kind"] == "code" and f"pr_branch:{branch}" in labels and f"continues:{owner}" in labels
+    assert continues_id(new) == failed
+    _git_out(repo, "checkout", "-q", branch)
+    monkeypatch.setenv("TTP_TASK", str(new["id"]))
+    assert push.own_target(p, repo) == ("origin", branch)
+    # Only the pr_branch: label the conversion wrote with it counts: a bare second continues: does not.
+    stray = p.db.add_task("Stray", "s", kind="code", origin="coordinator",
+                          labels=[f"continues:{failed}", f"continues:{owner}"])
+    assert push.foreign_owner(p, p.db.task(stray), branch) == owner
+
+
+def test_a_follow_up_that_only_mentions_ttp_push_own_keeps_its_kind(env):
+    """A non-code follow-up of a code task whose spec mentions `ttp push --own` but names no branch to
+    publish keeps its kind: no branch is inferred from the task it continues or follows."""
+    from ttp import coordinator as coord, publishkind
+    p = make(env)
+    owner = p.db.add_task("Dial feature", "s", kind="code", origin="coordinator")
+    p.db.update_task(owner, status="done", branch=f"ttp/t{owner}-dial-feature")
+    for i, spec in enumerate(("Read the run log. Do not run `ttp push --own` or edit anything.",
+                              "Find why `ttp push --own` was refused in the last run.")):
+        coord.apply(p, [{"type": "task_add", "title": f"Look at the dial run {i}", "kind": "harness",
+                         "continues": owner, "spec": spec}])
+        (t,) = p.db.q("SELECT * FROM tasks WHERE title=?", (f"Look at the dial run {i}",))
+        assert t["kind"] == "harness" and "pr_branch" not in (t["labels"] or ""), (spec, t["labels"])
+        assert publishkind.resolve(p.db, "harness", spec) is None

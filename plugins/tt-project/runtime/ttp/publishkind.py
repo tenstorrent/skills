@@ -1,8 +1,8 @@
 """A task that publishes a code task's branch runs as kind `code`, whatever kind it was added as.
 
 Only a code task may publish a branch (`ttp push --own`) or update a PR, so a harness, work, plan or
-question task whose spec has a `pr_branch: <branch>` line, or a `ttp push --own` step onto the branch
-of the code task it names or continues, is corrected when it is added (coordinator task_add, the
+question task whose spec has a `pr_branch: <branch>` line, or a `ttp push --own` step and the branch
+of a code task by name (never one inferred from the task it continues), is corrected when it is added (coordinator task_add, the
 daemon's continue hops) and again before dispatch (a spec changed later): kind code, a
 `pr_branch:<branch>` label and a `continues:<owner>` link to the code task whose branch it is, so the
 own-push target check accepts it. An owner that cannot be worked out unambiguously is refused
@@ -66,10 +66,9 @@ def _owner(db, kind: str, branch: str, how: str) -> dict | None:
     return found[0] if found else None
 
 
-def resolve(db, kind: str, spec: str, linked: dict | None = None) -> dict | None:
+def resolve(db, kind: str, spec: str) -> dict | None:
     """What a task of `kind` whose spec is `spec` publishes: {"branch", "owner" (a code task row or None),
-    "how"}, or None when it publishes no branch or its kind may publish (SKIP). `linked` is the task it
-    continues or follows. Raises ValueError (MISMATCH) when the owner is not unambiguous."""
+    "how"}, or None when it publishes no branch or its kind may publish (SKIP). Raises ValueError (MISMATCH) when the owner is not unambiguous."""
     if kind in SKIP or not spec:
         return None
     spec = FENCED.sub("", spec)
@@ -80,14 +79,13 @@ def resolve(db, kind: str, spec: str, linked: dict | None = None) -> dict | None
         return {"branch": lines[0], "owner": _owner(db, kind, lines[0], "pr_branch:"), "how": "pr_branch:"}
     if not OWN_PUSH.search(spec):
         return None
-    # A `ttp push --own` step onto a code task's branch: the one its spec names, else the linked task's.
+    # A `ttp push --own` step onto a code task's branch its spec names; a spec naming none publishes
+    # nothing (it may only mention the command, e.g. 'do not run it').
     named = {}
     for m in NAMED.finditer(spec):
         t = db.task(int(m.group(1)))
         if t and t["kind"] == "code" and m.group(0) == _own_name(t):
             named[t["id"]] = (t, m.group(0))
-    if not named and linked and linked.get("kind") == "code" and linked.get("branch"):
-        named[linked["id"]] = (linked, str(linked["branch"]))
     if not named:
         return None
     if len(named) > 1:

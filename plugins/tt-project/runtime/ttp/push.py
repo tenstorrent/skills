@@ -1977,7 +1977,9 @@ def foreign_owner(p: Project, row: dict | None, branch: str) -> int | None:
     be added) only inherits it, else None. It does not when it, or a task it continues (failed,
     cancelled or blocked work it took over), owns the branch or has a `pr_branch:` line naming it in
     its spec (worktree.SPEC_PR_BRANCH), or is the daemon's fix of open findings on a PR the project
-    opened from that branch (`pr_fix:` with `pr_branch:<branch>`). A branch of no known task is
+    opened from that branch (`pr_fix:` with `pr_branch:<branch>`), or carries both `pr_branch:<branch>` and
+    a continues:<owner> link, wherever it stands (publishkind's conversion of a task that also took
+    over failed work keeps that work as its first link). A branch of no known task is
     nobody's here: None."""
     m = OWN_BRANCH.fullmatch(branch or "")
     if not m or not row:
@@ -1987,7 +1989,8 @@ def foreign_owner(p: Project, row: dict | None, branch: str) -> int | None:
         seen.add(t.get("id"))
         labels = _labels(t)
         if t.get("id") == owner or worktree.spec_names_pr_branch(str(t.get("spec") or ""), branch) \
-                or (f"pr_branch:{branch}" in labels and any(x.startswith("pr_fix:") for x in labels)):
+                or (f"pr_branch:{branch}" in labels and any(x.startswith("pr_fix:") for x in labels)) \
+                or {f"pr_branch:{branch}", f"continues:{owner}"} <= set(labels):
             return None
         c = continues_id(t)
         t = p.db.task(c) if c is not None else None
