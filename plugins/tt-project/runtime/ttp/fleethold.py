@@ -246,17 +246,18 @@ def checker(hold: dict, here: str | None = None) -> str:
 
 def line(hold: dict, where=None, now: float | None = None) -> str:
     """One line for status, the digest and `ttp machines list`, with when a user hold's end condition
-    passed (passed_at; `where` a Project also reads its own record)."""
+    passed (passed_at; `where` a Project also reads its own record): who holds it, its end, how to lift
+    it, then why, so a line cut to the screen's width loses reason text, never the action."""
     from . import ends, pauseends
     who = "for the user" if hold.get("by") == "user" else f"by its {hold.get('by') or 'coordinator'}"
     v = entry(hold)
     db = getattr(where, "db", None)
     passed = passed_at(hold, db)
     end = pauseends.describe(v, where, passed, now)
-    return (f"{hold.get('alias')} held machine-wide (hold {hold.get('id')}) by {hold.get('project') or '?'} {who} "
-            f"since {ends.shown(float(hold.get('since') or 0), where)}"
-            + (f": {hold['reason']}" if hold.get("reason") else "") + (f"; {end}" if end else "")
-            + f" — every project's tasks on it wait; {LIFT}")
+    return (f"{hold.get('alias')} held machine-wide by {hold.get('project') or '?'} {who}" + (f"; {end}" if end else "")
+            + f"; {LIFT}" + (f"; why: {hold['reason']}" if hold.get("reason") else "")
+            + f" (hold {hold.get('id')} since {ends.shown(float(hold.get('since') or 0), where)}; every project's "
+            f"tasks on it wait)")
 
 
 def _passed(hold: dict, db, now: float) -> float | None:

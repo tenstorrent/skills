@@ -430,13 +430,15 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     if ready:
         why.append(f"{ready} task(s) ready to start")
     for pr in paused_resources:
-        why.append(f"{pr['resource']} is paused" + (f" ({pr['reason']})" if pr.get("reason") else "")
+        # The action before the reason: a line cut short loses reason text, never how to lift it.
+        why.append(f"{pr['resource']} is paused"
                    + (f": held machine-wide by {pr.get('project')} (hold {pr['fleet']}); its tasks wait; {fleethold.LIFT}"
                       if pr.get("fleet") and pr.get("by") == "user" else
                       f": held machine-wide by {pr.get('project')} (hold {pr['fleet']}); its tasks wait "
                       f"(`ttp resume {p.name} --machine {pr.get('machine')}`)"
                       if pr.get("fleet") else
-                      f": its tasks wait (`ttp resume {p.name} --resource {pr['resource']}`)"))
+                      f": its tasks wait (`ttp resume {p.name} --resource {pr['resource']}`)")
+                   + (f"; why: {pr['reason']}" if pr.get("reason") else ""))
     if logged_out:
         provs = sorted({t["provider"] or core for t in logged_out})
         why.append(f"{len(logged_out)} task(s) held: logged out ({', '.join(provs)}); they start once a login "

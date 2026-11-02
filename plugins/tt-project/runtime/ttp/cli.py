@@ -1382,7 +1382,8 @@ def clip(text: str, width: int = STATUS_WIDTH) -> str:
 
 def status_text(p: Project, verbose: bool = False) -> str:
     """One screen: what needs the user now first, then the budget and the work, then information.
-    Sections: needs you, budget, coordinator, running, stuck, landing, waiting, recent; each task once.
+    Sections: needs you, what stops work (holds, pauses), undelivered alerts, budget, coordinator, running,
+    stuck, landing, waiting, recent; each task once.
     `verbose` adds the routine diagnostics (coordinator cache, checks lanes and slots, free shared locks,
     self-review, health and coverage when fine, host reboots, unacked upstream fixes)."""
     from .alerts import feed
@@ -1399,14 +1400,6 @@ def status_text(p: Project, verbose: bool = False) -> str:
     head += " · tasks: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) if counts else "none yet")
     head += " · " + timefmt.long(now, p)
     lines = [head]
-    if h["runtime"]["line"]:
-        lines.append(h["runtime"]["line"])
-    from . import hostcycle
-    if cyc := hostcycle.hold(p, now):
-        lines.append(hostcycle.hold_line(cyc, p, now))
-    from . import lease
-    if lease_line := lease.status_line(p, p.config(), now):
-        lines.append(lease_line)
     for m in attention(db, now, p)[:6]:
         text = " ".join(m["text"].split())
         what = (f"ask {m['id']}" + (f"; {m['auto']}" if m.get("auto") else "")) if m["kind"] == "ask" else "alert"
@@ -1419,6 +1412,39 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(f"  needs you (#{t['id']}, gated on an open ask): {t['title']}")
     for t in you[:6]:
         lines.append(f"  needs you (#{t['id']}, {t['wait']['age_text']}): {t['title']} — {t['wait']['text']}")
+    # Then what stops work (holds, pauses, breakers, a full disk), then alerts no chat or web view read.
+    from . import hostcycle
+    if cyc := hostcycle.hold(p, now):
+        lines.append(hostcycle.hold_line(cyc, p, now))
+    for b in h.get("breakers") or []:
+        lines.append(b["line"])
+    for pp in h["providers_paused"]:
+        lines.append(f"{pp['provider']} paused until {at(pp['until'], now, tz)}: {pp['note']} — fix: {pp['fix']}")
+    from . import fleethold
+    for hold in sorted(fleethold.active().values(), key=lambda x: x.get("id") or 0):
+        lines.append(fleethold.line(hold, p))
+    for pr in h["resources_paused"]:
+        if pr.get("fleet"):
+            continue   # one line per hold above
+        lines.append(f"resource {pr['resource']} paused since {at(pr['since'], now, tz)} by {pr.get('by') or 'user'}"
+                     + (f" in {pr['project']} (shared: holds in every project)" if pr.get("shared") else "")
+                     + (f": {pr['reason']}" if pr.get("reason") else "") + (f"; {pr['end']}" if pr.get("end") else "")
+                     + f" — resume: ttp resume {p.name} --resource {pr['resource']}")
+    disk = db.kv("disk_low")
+    if disk:
+        lines.append(f"disk: only {disk['free_gb']} GB free under {disk['path']} (guard {disk.get('threshold_gb', '?')} GB); "
+                     f"only questions and plans start")
+    if h["undelivered"]:
+        u = h["undelivered"]
+        lines.append(f"chat relay: {u['line']}")
+        if u["below_floor"]:
+            lines.append(f"  {u['below_floor']} of the questions are below every chat's severity floor; lower "
+                         f"notify.chat_min_severity or the chat's own floor to see them")
+    if h["runtime"]["line"]:
+        lines.append(h["runtime"]["line"])
+    from . import lease
+    if lease_line := lease.status_line(p, p.config(), now):
+        lines.append(lease_line)
     lines.append("budget: " + h["spend"]["headline"])
     c = h["coordinator"]
     from . import budget, coordmodel
@@ -1452,20 +1478,6 @@ def status_text(p: Project, verbose: bool = False) -> str:
     rl = replica.status_line(p, p.config(), now)
     if rl:
         lines.append(rl)
-    for b in h.get("breakers") or []:
-        lines.append(b["line"])
-    for pp in h["providers_paused"]:
-        lines.append(f"{pp['provider']} paused until {at(pp['until'], now, tz)}: {pp['note']} — fix: {pp['fix']}")
-    from . import fleethold
-    for hold in sorted(fleethold.active().values(), key=lambda x: x.get("id") or 0):
-        lines.append(fleethold.line(hold, p))
-    for pr in h["resources_paused"]:
-        if pr.get("fleet"):
-            continue   # one line per hold above
-        lines.append(f"resource {pr['resource']} paused since {at(pr['since'], now, tz)} by {pr.get('by') or 'user'}"
-                     + (f" in {pr['project']} (shared: holds in every project)" if pr.get("shared") else "")
-                     + (f": {pr['reason']}" if pr.get("reason") else "") + (f"; {pr['end']}" if pr.get("end") else "")
-                     + f" — resume: ttp resume {p.name} --resource {pr['resource']}")
     # Routine diagnostics print only with --verbose; a line that reports an anomaly always prints.
     from . import checkcap, checkjoin, checklane, checkspill, heal, locks, shared, testslots
     if verbose:
@@ -1524,10 +1536,6 @@ def status_text(p: Project, verbose: bool = False) -> str:
                                 upstream.forward_line(now)) if x)
     if ups:
         lines.append(ups)
-    disk = db.kv("disk_low")
-    if disk:
-        lines.append(f"disk: only {disk['free_gb']} GB free under {disk['path']} (guard {disk.get('threshold_gb', '?')} GB); "
-                     f"only questions and plans start")
     if h["why_idle"]:
         lines.append(f"idle: {h['why_idle']}")
     elif h["held"]:
@@ -1594,12 +1602,6 @@ def status_text(p: Project, verbose: bool = False) -> str:
     for tid, r in rows.items():
         lines.append(f"  #{tid} {'; '.join(r['what'])}: {r['title']}" + (f" — {'; '.join(r['why'])}" if r["why"] else ""))
         lines += r["extra"]
-    if h["undelivered"]:
-        u = h["undelivered"]
-        lines.append(f"chat relay: {u['line']}")
-        if u["below_floor"]:
-            lines.append(f"  {u['below_floor']} of the questions are below every chat's severity floor; lower "
-                         f"notify.chat_min_severity or the chat's own floor to see them")
     recent = feed(db, now, limit=3)
     if recent:
         lines.append("recent:")

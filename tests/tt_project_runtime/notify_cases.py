@@ -578,3 +578,34 @@ def test_a_remote_say_sends_the_callers_label_and_drops_it_for_an_older_runtime(
     sent.clear()
     cli._say_remote("demo", {"host": "far", "dir": "/x"}, "hi", "c1", caller="project other")
     assert "--caller" not in sent[0], "a chat given: no caller label"
+
+
+def test_status_puts_holds_then_the_relay_backlog_above_waiting_and_a_cut_hold_line_keeps_how_to_lift(env):
+    """`ttp status`: what stops work (a machine-wide hold) comes right after the needs-you lines, then
+    alerts no chat read, and only then the waiting list; a hold line cut short loses its reason, not
+    the action."""
+    from ttp import fleethold
+    from ttp import machines as mm
+    from ttp.cli import clip, status_text
+    p = make(env)
+    _relay_chat(p)
+    top = p.db.one("SELECT COALESCE(MAX(id),0) m FROM messages")["m"]
+    p.db.x("UPDATE chats SET last_read=? WHERE id='c1'", (top,))
+    p.db.post("out", "a service restarted twice", kind="alert", severity="normal")
+    p.db.x("UPDATE messages SET ts=? WHERE id>?", (time.time() - 3600, top))
+    mm.add("box-a", tags="device")
+    reason = "rack move and cabling check " * 12
+    fleethold.set_hold("box-a", reason.strip(), "user", p.name, {"until": time.time() + 7200})
+    t = p.db.add_task("waits", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(t, status="queued", not_before=time.time() + 7200, blocked_reason="waiting for a build")
+    out = status_text(p).splitlines()
+    hold = next(i for i, ln in enumerate(out) if "box-a held machine-wide" in ln)
+    relay = next(i for i, ln in enumerate(out) if ln.startswith("chat relay:"))
+    waiting = out.index("waiting:")
+    budget = next(i for i, ln in enumerate(out) if ln.startswith("budget:"))
+    assert hold < relay < budget < waiting, out
+    assert all(ln.startswith("  needs you") for ln in out[1:hold]), out[:hold]
+    assert "to lift" in out[hold] and "why: rack move" in out[hold], out[hold]
+    line = fleethold.line(fleethold.active()["box-a"], p)
+    assert line.index("to lift") < line.index("why:"), line
+    assert "to lift it, say so in chat" in clip(line, 160), clip(line, 160)

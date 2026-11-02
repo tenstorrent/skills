@@ -17048,7 +17048,7 @@ def test_a_fleet_hold_set_in_one_project_holds_every_project_until_the_user_lift
                            env=env_b, capture_output=True, text=True)
         assert r.returncode == 75 and "vendor maintenance" in r.stderr, r
     st = status_text(b)
-    assert st.count("box1 held machine-wide (hold 1) by demo for the user") == 1, st
+    assert st.count("box1 held machine-wide by demo for the user") == 1, st
     assert "resource box1-device paused" not in st, st
     # A pause asked for a covered resource is a no-op, not a second record.
     assert coord.apply(b, [{"type": "resource_pause", "resource": "box1-device", "paused": True,
@@ -17166,7 +17166,7 @@ def test_ttp_pause_machine_from_the_shell_is_the_users_hold(env, tmp_path):
     assert r.returncode == 0 and "held machine-wide" in r.stdout, r
     assert fleethold.active()["box1"]["by"] == "user"
     r = subprocess.run([sys.executable, str(TTP), "machines", "list"], env=e, capture_output=True, text=True)
-    assert "held machine-wide (hold 1) by demo for the user" in r.stdout, r
+    assert "held machine-wide by demo for the user" in r.stdout, r
     r = subprocess.run([sys.executable, str(TTP), "resume", "other", "--machine", "box1"], env=e,
                        capture_output=True, text=True)
     assert r.returncode == 0 and "lifted for every project" in r.stdout, r
@@ -17232,7 +17232,7 @@ def test_a_user_fleet_hold_line_names_how_to_lift_it_and_its_expected_end(env, t
     text = fleethold.line(fleethold.active()["box1"], a)
     assert "<project>" not in text and "ttp resume" not in text, text
     assert f"held until you lift it (you expected to by {ends.shown(until, a)})" in text, text
-    assert text.endswith("to lift it, say so in chat or use Resume on the web page"), text
+    assert "; to lift it, say so in chat or use Resume on the web page" in text, text
     assert "ends only on the user's word" not in text and "end condition" not in text, text
     # A coordinator's hold keeps its plain end.
     fleethold.lift("box1", True, "test")
