@@ -10,7 +10,7 @@ transaction opens, and the same calls inside it read the memo. A key not warmed 
 did not foresee) runs its git as before; a call that raised is not kept. Outside a scope cached()
 only runs the call.
 
-bounded() caps, by time, the git a scope runs: each git read (a READS verb) gets at most `per_call_s`,
+bounded() caps, by time, the git a scope runs: each git read (is_read) gets at most `per_call_s`,
 and a scope with `total_s` also ends every git call it makes, reads and writes, by its deadline: past
 it, timeout() starts no new call (it raises subprocess.TimeoutExpired at once). The daemon's tick steps run in bounded(TICK_GIT_S) and a finish transaction in
 bounded(TX_GIT_S, TX_GIT_S), so one slow or hung git call holds neither past that, whatever its call
@@ -54,6 +54,17 @@ _OPTS_WITH_VALUE = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespa
 READS = frozenset({"rev-parse", "rev-list", "merge-base", "diff", "log", "show", "ls-files", "check-ignore",
                    "cherry", "patch-id", "symbolic-ref", "cat-file", "for-each-ref", "show-ref", "status",
                    "grep", "name-rev", "describe", "ls-tree", "diff-tree", "merge-tree"})
+# `git reflog` reads (show, its default, and the rest) but for these subcommands
+_REFLOG_WRITES = frozenset({"expire", "delete"})
+
+
+def is_read(args: tuple | list) -> bool:
+    """Whether git `args` (from the verb on) only read the repository: a READS verb, or a reflog read."""
+    if not args:
+        return False
+    if args[0] == "reflog":
+        return len(args) == 1 or args[1] not in _REFLOG_WRITES
+    return args[0] in READS
 
 
 @contextlib.contextmanager
@@ -101,13 +112,13 @@ def bounded(per_call_s: float, total_s: float | None = None) -> Iterator[None]:
 
 def timeout(own: float | None, args: tuple | list = (), read: bool | None = None) -> float | None:
     """A git call's timeout within the bounded() scope: `own` (its own), capped for a read (`read`; by
-    default a call that names no `args`, or whose verb args[0] is in READS) and, in a scope with a
+    default a call that names no `args`, or whose verb is_read()) and, in a scope with a
     deadline, for any call."""
     cap = _cap.get()
     if cap is None:
         return own
     if read is None:
-        read = not args or args[0] in READS
+        read = not args or is_read(args)
     t = own
     if read:
         t = cap[0] if t is None else min(t, cap[0])
@@ -278,7 +289,7 @@ keeps its own cap and makes the round's point of no return)."""
     rd = a.strict
     if rd:
         rd.raw_close()
-    k = gitreplay.key(argv, kw, READS, _OPTS_WITH_VALUE)
+    k = gitreplay.key(argv, kw, is_read, _OPTS_WITH_VALUE)
     if k is not None:
         e = gitreplay.get(k, a.id, a.round)
         if e is not None:
@@ -287,7 +298,7 @@ keeps its own cap and makes the round's point of no return)."""
             return gitreplay.replay(e, argv, kw, timeout)
     t = _cap_timeout(timeout, args, read)
     check = bool(kw.pop("check", False))
-    write = not (args[:1] and args[0] in READS) and not _pure(args)
+    write = not is_read(args) and not _pure(args)
     slice_binds = False
     if rd and write:
         rd.pnr = True   # a write keeps its own cap: the slice never refuses, binds or kills it
@@ -306,6 +317,8 @@ keeps its own cap and makes the round's point of no return)."""
     try:
         r = _spawn(argv, t, kw)
     except subprocess.TimeoutExpired:
+        if write:
+            gitreplay.end(a.id)
         if rd:
             rd.live_s += time.monotonic() - t0
             rd.live_n += 1
@@ -315,6 +328,8 @@ keeps its own cap and makes the round's point of no return)."""
         if k is not None and not (rd and slice_binds):
             gitreplay.put(k, None, a.id, a.round)   # its own timeout: the next round degrades the same
         raise
+    if write:
+        gitreplay.end(a.id)     # its own volatile and once answers may predate the write
     if rd:
         rd.live_s += time.monotonic() - t0
         rd.live_n += 1

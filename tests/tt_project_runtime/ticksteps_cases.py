@@ -1380,6 +1380,75 @@ def test_e_a_git_write_in_a_strict_round_keeps_its_own_cap(env, monkeypatch, tmp
     assert _git_out(repo, "rev-parse", "refs/ttp/push/2") == _git_out(repo, "rev-parse", "HEAD")
 
 
+def test_a_git_write_in_an_attempt_drops_its_volatile_and_once_answers(tmp_path, monkeypatch):
+    """A git write inside an attempt drops that attempt's volatile and once answers: the same read after
+    it runs git again, never replaying what it read before the write (an absent ref, a ref list, a
+    once answer). Another attempt's volatile answers and ref-dependent answers stay."""
+    from ttp import gitmemo, gitreplay
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git_out(repo, "init", "-q")
+    _git_out(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "c")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    gitreplay.clear()
+    spawns = []
+    real = gitmemo._spawn
+    monkeypatch.setattr(gitmemo, "_spawn", lambda argv, t, kw: spawns.append(argv) or real(argv, t, kw))
+    git = lambda *a: gitmemo.run(["git", "-C", str(repo), *a], capture_output=True, text=True)   # noqa: E731
+    with gitmemo.attempt() as other:
+        assert git("status", "--porcelain").returncode == 0
+    with gitmemo.attempt(), gitmemo.strict(60.0):
+        assert git("rev-parse", "--verify", "-q", "refs/ttp/x").returncode == 1
+        assert git("rev-parse", "--verify", "-q", "refs/ttp/x").returncode == 1, "kept as volatile"
+        assert git("for-each-ref", "--format=%(refname)", "refs/ttp").stdout == ""
+        assert git("rev-parse", "HEAD").stdout.strip() == head
+        assert git("cat-file", "-t", "0" * 40).returncode == 128     # once: a code other than 0 and 1
+        assert git("update-ref", "refs/ttp/x", "HEAD").returncode == 0
+        n = len(spawns)
+        r = git("rev-parse", "--verify", "-q", "refs/ttp/x")
+        assert (r.returncode, r.stdout.strip()) == (0, head), "replayed the answer from before the write"
+        assert git("for-each-ref", "--format=%(refname)", "refs/ttp").stdout.split() == ["refs/ttp/x"]
+        assert git("update-ref", "refs/ttp/y", "HEAD").returncode == 0
+        assert git("for-each-ref", "--format=%(refname)", "refs/ttp").stdout.split() == ["refs/ttp/x", "refs/ttp/y"]
+        m = len(spawns)
+        assert git("rev-parse", "HEAD").stdout.strip() == head and len(spawns) == m, "a ref read stays"
+        assert git("cat-file", "-t", "0" * 40).returncode == 128 and len(spawns) == m + 1, "once: dropped"
+        assert m == n + 4, spawns[n:]
+    with gitmemo.attempt(other):
+        assert git("status", "--porcelain").returncode == 0 and len(spawns) == m + 1, "another attempt's stays"
+
+
+def test_git_reflog_show_is_a_volatile_read_and_reflog_expire_or_delete_a_write(tmp_path, monkeypatch):
+    """`git reflog` and `git reflog show` only read: in a strict round they never make its point of no
+    return, are capped as reads and kept as volatile answers. `reflog expire` and `reflog delete` write."""
+    from ttp import gitmemo, gitreplay
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git_out(repo, "init", "-q", "-b", "main")
+    _git_out(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "c")
+    gitreplay.clear()
+    spawns = []
+    real = gitmemo._spawn
+    monkeypatch.setattr(gitmemo, "_spawn", lambda argv, t, kw: spawns.append(argv) or real(argv, t, kw))
+    assert gitmemo.is_read(("reflog",)) and gitmemo.is_read(("reflog", "show", "main"))
+    assert gitmemo.is_read(("reflog", "--format=%H", "main")) and gitmemo.is_read(("reflog", "exists", "main"))
+    assert not gitmemo.is_read(("reflog", "expire", "--all")) and not gitmemo.is_read(("reflog", "delete", "x@{0}"))
+    with gitmemo.bounded(5.0):
+        assert gitmemo.timeout(60, ("reflog", "show")) == 5.0 and gitmemo.timeout(60, ("reflog", "expire")) == 60
+    show = ["git", "-C", str(repo), "reflog", "show", "--format=%H", "refs/heads/main"]
+    with gitmemo.attempt() as a, gitmemo.strict(60.0) as rd:
+        r = gitmemo.run(show, capture_output=True, text=True)
+        assert r.returncode == 0 and r.stdout.strip() and not rd.pnr
+        assert gitmemo.run(show, capture_output=True, text=True).stdout == r.stdout and len(spawns) == 1
+        k = gitreplay.key(show, {"capture_output": True, "text": True}, gitmemo.is_read, gitmemo._OPTS_WITH_VALUE)
+        assert gitreplay._memo[k.k].kind == gitreplay.VOL and gitreplay._memo[k.k].att == a.id
+        assert not rd.pnr
+    for sub in (["expire", "--expire=now", "--all"], ["delete", "refs/heads/main@{0}"]):
+        with gitmemo.attempt(), gitmemo.strict(60.0) as rd:
+            assert gitmemo.run(["git", "-C", str(repo), "reflog", *sub], capture_output=True).returncode == 0
+            assert rd.pnr, sub
+
+
 def test_g_a_read_that_never_settles_degrades_as_a_git_failure_in_the_final_round(env, monkeypatch):
     """A read whose answer is never kept (the memo misses it every round) ends the rounds at MAX_ROUNDS;
     the final round may not abort, so the read fails fast as a timed-out git does: the finish commits,

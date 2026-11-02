@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The git read memo a finish attempt replays (gitmemo.run, gitmemo.attempt).
 
-Within a finish attempt every git read gitmemo.run makes (a READS verb whose output is captured) is
+Within a finish attempt every git read gitmemo.run makes (a gitmemo.is_read call whose output is captured) is
 kept here, process-wide, in a size-capped LRU (MAX_BYTES in all, MAX_ENTRY_BYTES each), and the
 same read later is answered from it without spawning git. Key: the repository's dirs, the cwd, argv,
 the stdin digest, the GIT_*/locale env and how output is captured. Each entry is classified from its
@@ -45,7 +45,7 @@ _KW = frozenset({"capture_output", "stdout", "stderr", "stdin", "input", "text",
 _ENV = ("LANG", "LANGUAGE", "HOME", "XDG_CONFIG_HOME", "TZ")
 _NO_REPLAY_OPTS = ("--git-dir", "--work-tree", "--namespace", "--bare", "--literal-pathspecs", "--glob-pathspecs")
 VOLATILE_VERBS = frozenset({"status", "ls-files", "check-ignore", "grep", "for-each-ref", "show-ref", "name-rev",
-                            "describe"})
+                            "describe", "reflog"})
 # options that read every ref, a reflog, the index or the clock
 VOLATILE_OPTS = ("--all", "--branches", "--tags", "--remotes", "--glob", "--exclude", "--since", "--until",
                  "--after", "--before", "--max-age", "--min-age", "--reflog", "--walk-reflogs", "-g", "--stdin",
@@ -94,7 +94,7 @@ def clear() -> None:
         stats.clear()
 
 
-def key(argv, kw: dict, reads: frozenset, opts_with_value: frozenset) -> Key | None:
+def key(argv, kw: dict, is_read, opts_with_value: frozenset) -> Key | None:
     """The memo key of subprocess.run(argv, **kw) when its answer can be kept, else None."""
     if set(kw) - _KW or not argv:
         return None
@@ -124,7 +124,7 @@ def key(argv, kw: dict, reads: frozenset, opts_with_value: frozenset) -> Key | N
             d = os.path.join(d, argv[i + 1])
         i += 2 if o in opts_with_value else 1
     args = argv[i:]
-    if not args or args[0] not in reads:
+    if not is_read(args):
         return None
     dirs = gitcache._dirs(d)
     if not dirs:
