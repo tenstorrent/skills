@@ -34,3 +34,4 @@
 +350: the tier floor: conclusion runs start at standard/high or above (tierfloor.py)
 +580: before refusing, blocking or asking on a rule, `ttp said`; the newest user word on a topic wins
 +350: relayer findings labeled `citing records` are facts to act on, one cheap check at most, never rules
++170: a held worker_notify item and what settles it (workernotify.py)
