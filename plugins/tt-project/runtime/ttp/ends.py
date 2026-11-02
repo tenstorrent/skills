@@ -537,7 +537,8 @@ class Ends:
         if retired:
             text = "Retired, its end condition passed: " + "; ".join(retired)
             self.log(text)
-            self.p.db.post("out", text, chat=None, kind="alert", severity="low")
+            # A feed line, never an alert: nobody needs to act (the digest lists it too, digest_lines).
+            self.p.db.post("out", text, chat=None, kind="info", severity="low")
         return retired
 
     def _start(self, key: str, probe: str, now: float) -> None:

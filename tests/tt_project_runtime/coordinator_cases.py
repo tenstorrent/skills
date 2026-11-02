@@ -3829,8 +3829,8 @@ def test_temporary_memory_retires_itself_at_expiry_and_the_digest_says_so(env):
     assert len(retired) == 1 and name in retired[0] and "expired" in retired[0]
     assert not (p.memory_dir / f"{name}.md").exists()
     assert (p.memory_dir / "archive" / f"{name}.md").exists() and name not in p.memory_index.read_text()
-    told = p.db.one("SELECT * FROM messages WHERE kind='alert' ORDER BY id DESC LIMIT 1")
-    assert told["severity"] == "low" and name in told["text"]
+    told = p.db.one("SELECT * FROM messages WHERE direction='out' ORDER BY id DESC LIMIT 1")
+    assert (told["kind"], told["severity"]) == ("info", "low") and name in told["text"], "a feed line, not an alert"
     lines = ends.digest_lines(p, now, now + 3 * 3600 + 1)
     assert len(lines) == 1 and lines[0].startswith("## Retired (end condition passed") and f"[{name}]" in lines[0]
     assert ends.digest_lines(p, now + 4 * 3600, now + 4 * 3600) == [], "shown again after the turn that saw it"

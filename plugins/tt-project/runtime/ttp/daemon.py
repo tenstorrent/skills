@@ -3056,7 +3056,10 @@ class Daemon:
             if not rec:
                 return
             fmt = lambda ts: timefmt.short(float(ts), self.p)
-            db.post("out", downtime.text(rec, fmt, downtime.cut_short(db, rec)), kind="info", severity="normal",
+            cut = downtime.cut_short(db, rec)
+            # Over and nothing lost (no run cut short, no schedule run missed): a feed line, not news for the chats.
+            lost = cut or int(rec.get("missed") or 0)
+            db.post("out", downtime.text(rec, fmt, cut), kind="info", severity="normal" if lost else "low",
                     ref=f"down:{int(float(rec['last']))}")
 
     def check_linger(self) -> None:
