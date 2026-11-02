@@ -220,6 +220,9 @@ USER_SETTABLE = {
     "notify.slack_min_severity": str, "notify.chat_min_severity": str, "core_provider": str,
     "coordinator.tier": str, "coordinator.model": str, "coordinator.model_tier": str, "coordinator.effort": str,
     "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    # The effort A/B of standard-tier code tasks and Jev's effort pick (effortab.py).
+    "effort_ab.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    "effort_ab.jev_pick": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "runner.pin_verify": pin_verify_mode,
     # Check commands' CPU and IO priority (testslots.nice_level, ionice_args): nice 0-19; ionice idle or best-effort[:0-7].
     "checks.nice": lambda v: _checks_nice(v),

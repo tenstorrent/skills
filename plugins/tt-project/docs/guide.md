@@ -666,6 +666,26 @@ project overrides any entry, for example `ttp config <name> providers.claude.tie
 A task's own model or effort pin wins over its tier. A failed light try is retried at standard,
 on the standard model.
 
+### Effort A/B for standard-tier code tasks
+
+Standard code runs default to high effort. To measure whether medium effort holds quality, turn on
+the A/B: `ttp config <name> effort_ab.enabled true` (off by default; a coordinator may set it from
+chat). Each code task queued at standard with no effort pin of its own then goes in the `high` or
+`medium` arm, by a hash of its lineage's first task id. Its retries, review fixes and continuations
+keep that arm. The arm changes only standard-tier runs whose tier effort is high; a deep retry still
+runs at max. Each run's note records the arm (`effort_ab`).
+
+`ttp stats <name> --effort-ab --days 30` compares the arms: cost per landed change, output tokens
+and model calls per run, review and checks fail rates, fix-review hops and tier-up retries.
+End rule: make medium the standard effort (`providers.<p>.tiers.standard.effort medium`) only once
+each arm has at least 60 landed changes and medium's review and checks fail rates are each no more
+than 3 points worse than high's; otherwise keep high. The report prints which applies.
+
+After the A/B, `effort_ab.jev_pick true` lets Jev choose medium or high per code task from its
+spec instead (once per lineage; the tier's effort when Jev is off or does not answer). Its pick goes
+in the run note and in Jev's call log, which records the task's outcome. It is off by default and
+yields to the A/B while that is on.
+
 ### OpenAI-compatible endpoints (the `chat` provider)
 
 The `chat` provider runs Claude Code workers against any endpoint that speaks the OpenAI Chat

@@ -87,6 +87,7 @@ from . import detach
 from . import progress
 from . import downtime
 from . import effort
+from . import effortab
 from . import extchange
 from . import failover
 from . import outagetask
@@ -2417,6 +2418,9 @@ class Daemon:
             pin = {k: str(task.get(k)) for k in ("model", "effort") if str(task.get(k) or "")}
             model = pin.get("model") or model
             effort = pin.get("effort") or effort
+            ab = (note or {}).get(effortab.KEY)
+            if not pin.get("effort") and isinstance(ab, dict) and ab.get("effort"):
+                effort = str(ab["effort"])   # the task's effort A/B arm or Jev's pick (effortab.assign)
         prices = (self.cfg.get("pricing") or {}).get(provider) or {}
         prov = get_provider(provider).use(model, prices)
         restrictions = self.cfg.get("restrictions", {})
@@ -7446,6 +7450,13 @@ class Daemon:
                     note["pick"] = picked
                 if routed:
                     note[route.KEY] = routed
+                try:
+                    ab = effortab.assign(db, self.cfg, task, tier, run_prov, jev=self.jev)
+                except Exception as e:   # the A/B must never hold a task back
+                    ab = None
+                    log(self.p, f"task {task['id']}: effort A/B not assigned: {e}")
+                if ab:
+                    note[effortab.KEY] = ab
                 if review_pick:
                     note["review_tier"] = review_pick
                     if review_pick.get(conflictfix.KEY):

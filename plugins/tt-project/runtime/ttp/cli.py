@@ -1671,6 +1671,12 @@ def cmd_stats(a) -> None:
     p = need(a.name, sys.argv[1:]) if a.name else here()
     if not p:
         die("no tt-project project here; name one: `ttp stats <name>`")
+    if a.effort_ab:
+        from . import effortab
+        tz = timefmt.home(p)
+        s = effortab.report(p, a.days, _stats_time(a.since, tz, "--since"), _stats_time(a.until, tz, "--until"))
+        print(json.dumps(s, indent=1) if a.json else effortab.report_text(s))
+        return
     if a.tools:
         s = bud.tool_output_stats(p.db, p.runs, a.days)
         print(json.dumps(s, indent=1) if a.json else bud.tool_output_text(s))
@@ -9708,6 +9714,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--split-at", help="compare runs before and after this time (a change landing)")
     s.add_argument("--top", type=int, default=10, help="how many of the costliest runs to list (default 10)")
     s.add_argument("--tools", action="store_true", help="tool output by category instead: the file-read share")
+    s.add_argument("--effort-ab", action="store_true",
+                   help="the effort A/B instead (effort_ab.enabled): per arm, $ per landed change, output tokens and "
+                        "calls per run, review and checks fail rates, fix-review hops, tier-up retries, end rule")
     s.add_argument("--runs", action="store_true",
                    help="worker runs instead: provider, model, tier, outcome (with any route fallback), wall time, cost")
     s.add_argument("--tier", help="with --runs: only this tier's runs (implies --runs)")
