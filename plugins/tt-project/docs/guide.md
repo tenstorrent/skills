@@ -800,6 +800,17 @@ data, disturb a machine or service others use) or would speak to people as the u
 message in their name, a PR leaving draft, a merge, another person's request). A restriction that
 forbids every route found, a credential only the user holds, and money also go to the user.
 Everything else is decided: pick the route, act, record the decision (`memory_add`) and notify low.
+A charter Restriction (changed through its own machinery) and a pause or hold the user set also wait
+for the user's word. Nothing else does: a project's own gates (test-gate scope, hold scope, pacing,
+landing order, which settings the coordinator changes) are the coordinator's to decide and record,
+never held for "the user's word".
+
+- Self-blocking check, model-free, once a minute (`selfblock.py`): a blocked or waiting task whose
+  reason cites the user's word or waits for the user, a coordinator reply from the last hour that
+  does so, or an open `irreversible` or `restriction` ask, none of whose text names one of the gates
+  above, raises one `self_blocking` event naming the decide-and-record path. Each finding raises
+  once. Quiet for a task held by a user-only setting or on a review, merge, human, access, funds or
+  spend ask. It changes nothing itself; the turn it wakes decides.
 
 - Inputs (weights, images, datasets) or space: first find an already accessible copy (shared
   storage, caches, machines the project can read), then pick a common location with enough free

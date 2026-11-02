@@ -226,6 +226,11 @@ def test_convgate_keeps_user_cited_and_restriction_gates_before_device_words():
     for why, when in (("later is tidier", "test -e /tmp/ready"), (None, "landed:#7"),
                       ("the users table is nicer sorted", None), ("message the team after", None)):
         assert convgate.judge(p1, None, when or "true", why) == (True, None), (why, when)
+    # A bare claim of the user's word cites no message of theirs: it drops, or files under a class it names.
+    for why in ("waits for the user's ok on the pacing", "until the user decides the landing order",
+                "the user's approval is needed to narrow the test gate"):
+        assert convgate.judge(p1, None, "true", why) == (True, None), why
+    assert convgate.safety_class("until the user says the device is free", None) == "shared device or machine"
 
 
 def test_urgent_gates_citing_the_user_or_a_restriction_survive_task_add_and_the_tick_sweep(env):

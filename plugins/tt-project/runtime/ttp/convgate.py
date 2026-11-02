@@ -6,7 +6,7 @@ An urgent task (urgent.is_urgent: priority 1 or better, or an `urgent: <why>` sp
 dependencies are met starts now. Its start gate (a `start_after` delay, a `start_when` probe, a
 `landed:#<id>` chain) stays only when the gate's `why` (or the probe itself) names a safety class
 (CLASSES): the user's own word (a cited user message, project.USER_CITE, or a `test -e
-<dir>/user-<x>` probe); a charter Restriction (a guard, Restriction or charter rule); data loss; a
+<dir>/user-<x>` probe; a bare "until the user's ok" cites none); a charter Restriction (a guard, Restriction or charter rule); data loss; a
 spend cap or provider window; a shared device or machine (a lock, hold or pause, a lull for a
 restart, upgrade, reboot or power cycle); another person's work; a real dependency on another task's
 new file or symbol. The user's word and a Restriction come first, so a gate citing either is filed
@@ -48,10 +48,9 @@ DEPENDENCY = "a dependency on another task's new file or symbol"   # the class o
 
 # (class, words in the gate's why or the probe that name it)
 CLASSES = (   # the user's word and a Restriction first: a gate citing either files under it
-    ("the user's word", USER_CITE.pattern
-                        + r"|\buser'?s? (?:own )?(?:word|go|ok|okay|approval|answer|decision|call|sign[- ]?off)\b"
-                        r"|\buntil the user\b|\b(?:waits?|waiting) (?:for|on) the user\b"
-                        r"|\btest -[ef] \S*/user-[\w.-]+"),
+    # Only a cited user message or a user marker probe: a bare "until the user's ok" cites no word of
+    # theirs, so it files under another class it names or drops (selfblock.py raises the same wording).
+    ("the user's word", USER_CITE.pattern + r"|\btest -[ef] \S*/user-[\w.-]+"),
     ("charter restriction", r"\brestrictions?\b|\bcharter\b|\bguard\w*"),
     ("data loss", r"\bdata[ -]?loss\b|\blos(?:e|es|ing|t) (?:data|work|state|results?)\b|\bcorrupt\w*|\bbackups?\b"),
     ("spend cap or provider window", r"\bspend\w*|\bbudget\w*|\bcaps?\b|\bquotas?\b|\brate[ -]?limit\w*|\bcredits?\b"
