@@ -372,6 +372,24 @@ def test_a_deferred_spec_change_rides_on_any_other_wake_at_its_own_tier(env, mon
     assert res["spec_seen"] == spec_digest(t) and bud.wake_tier("standard", res) == "standard"
 
 
+def test_the_daemons_own_spec_note_is_no_spec_change_but_keeps_a_pending_one(env, monkeypatch):
+    # A probe-stall release appends the daemon's note to the spec: alone it reports no spec change;
+    # after a deferred coordinator update the wake still carries that change.
+    from ttp.prompts import spec_digest
+    p = make(env)
+    d = _spec_daemon(p, monkeypatch)
+    quiet, busy = _spec_sleeper(p), _spec_sleeper(p)
+    _edit_spec(p, busy, "also report the peak memory", wake_now=False)
+    d.probe_waiting()
+    assert _asleep(p, quiet) and _asleep(p, busy)
+    for tid in (quiet, busy):
+        d._probe_stall_act(p.db.task(tid), "release", "[probe stall] your probe has said not yet")
+    q, b = p.db.task(quiet), p.db.task(busy)
+    rq, rb = json.loads(q["result"]), json.loads(b["result"])
+    assert rq["woke"] == "probe stale: released once by the blocker sweep" and rq["spec_seen"] == spec_digest(q)
+    assert "its spec changed" in rb["woke"] and rb["spec_seen"] == spec_digest(b)
+    assert "your probe has said not yet" in q["spec"] and "your probe has said not yet" in b["spec"]
+
 def test_a_worker_cannot_ask_for_its_own_wake_now(env, monkeypatch, tmp_path):
     p = make(env)
     d, tid, flag, runs, idle = _deferred_flow(p, monkeypatch, tmp_path, hand_off={"wake_now": True})

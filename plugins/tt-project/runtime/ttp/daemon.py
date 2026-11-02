@@ -7294,11 +7294,16 @@ class Daemon:
             else:
                 self._start_verdict(task, 0, now)
             return
+        # The daemon's own note is no spec change: unless one was already pending, the wake records the
+        # noted spec as seen, so it does not report a change (_spec_pending).
+        pending = _spec_pending(task, load_result(task["result"]))
         self.p.db.update_task(tid, spec=f"{task['spec'] or ''}\n\n{note}".lstrip())
         task = self.p.db.task(tid)
         progress.forget_probe(self.p.db, tid)
         if waiting:
-            self._wake_waiting(task, "probe stale: released once by the blocker sweep", now)
+            from .prompts import spec_digest
+            self._wake_waiting(task, "probe stale: released once by the blocker sweep", now,
+                               extra=None if pending else {SPEC_SEEN_KEY: spec_digest(task)})
             return
         self._probe_rc.pop(tid, None)
         self._start_rc.pop(tid, None)
