@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import checkdirs, batch, conflictfix, coordinator as coord, cyclenotice, envfault, locks, msgparts, overlap, pagesev, prhead, push, pushclaim, replymsg, runner, scopehold, sharedchecks, timefmt, upstream, urgent
+from . import checkdirs, batch, conflictfix, coordinator as coord, cyclenotice, envfault, locks, msgparts, overlap, pagesev, prhead, push, pushclaim, replymsg, reviewcap, runner, scopehold, sharedchecks, timefmt, upstream, urgent
 from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
                  pin_of, review_subject, reviewed_ids)
 from . import gitmemo
@@ -503,7 +503,6 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
     for head, by_task in carried.items():
         left = {t: c for t, c in by_task.items() if t not in accepted[head]}
         if left and own is None:
-            from . import reviewcap
             own = reviewcap.lineage(p.db, task["id"])
         left = {t: c for t, c in left.items() if not (t in judged and t in own)}
         if left:
