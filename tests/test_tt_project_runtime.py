@@ -15306,9 +15306,11 @@ def test_sandboxed_workers_get_a_private_writable_temp_dir(env):
                    if json.loads((d / "run.json").read_text()).get("tmp_dir") == str(tmp))
     runner.remove_private(run_dir)   # also what the daemon does for a runner that died
     assert not tmp.exists()
-    # An unfenced provider (no writable roots) keeps the caller's temp dir.
+    # An unfenced provider (no writable roots) keeps the caller's temp dir. Claude is fenced where
+    # bwrap and socat exist (Provider.fence_args), so turn its fence off here.
     from ttp.providers import claude as claude_provider
     from ttp.daemon import Daemon
+    p.set_config("providers", {**p.config()["providers"], "claude": {"write_fence": False}})
     real = claude_provider.Claude.binary
     claude_provider.Claude.binary = lambda self: "/usr/bin/true"   # never a real agent
     try:
