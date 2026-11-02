@@ -717,7 +717,7 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     delivery.push_batch_s. After a batch that did not end clean (a failing tip, a dead batch), unless
     the batch is full or holds one the last batch requeued untested, it waits for
     delivery.push_min_gap_s since the last one. Approvals that waited while the last clean batch ran
-    start the next one at once. Fast approvals (fast_ids: urgent, priority 1-2, or sharing no file
+    start the next one at once (not the ones it held itself). Fast approvals (fast_ids: urgent, priority 1-2, or sharing no file
     with an earlier unlanded approval) wait for neither: while the routine ones wait they start a
     batch of their own at once; when the routine ones are due too, they lead it. After a clean batch
     a backlog bigger than push_batch_max grows the batch up to BATCH_GROW times it."""
@@ -777,7 +777,8 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
         why = f"{len(untested)} approval{'s' if len(untested) != 1 else ''} {last['id']} requeued untested"
     elif not clean and (left := _gap_left(db, now, gap)) > 0:
         wait = f"{left:.0f} s left of the {gap:.0f} s gap since the last batch ended"
-    elif last and (n := sum(1 for r in rows if float(r["created"]) <= float(last["freed"] or 0))):
+    elif last and (n := sum(1 for r in rows if r["batch"] != last["id"]
+                            and float(r["created"]) <= float(last["freed"] or 0))):
         why = f"{n} approval{'s' if n != 1 else ''} waited out {last['id']}"
     elif now - min(r["created"] for r in rows) >= window:
         why = f"the oldest approval waited {window:.0f} s"

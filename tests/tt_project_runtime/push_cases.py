@@ -2651,9 +2651,9 @@ def test_batch_max_still_caps_a_batch_started_at_once(env, monkeypatch):
     s.p.db.update_task(s.review, status="done")
     _pq_last_batch(s, "pushed", time.time() - 60)
     _pq_earlier(s)
-    rows = [_pq_review(s)[1] for _ in range(3)]
+    rows = [_pq_review(s)[1] for _ in range(2 * pushq.BATCH_GROW + 1)]
     got, why = pushq.due(s.p)
-    assert [r["id"] for r in got] == rows[:2], why
+    assert [r["id"] for r in got] == rows[:2 * pushq.BATCH_GROW], "a backlog grows it up to BATCH_GROW times the max"
 
 
 def test_the_next_batch_waits_for_the_last_ones_after_push_deploy(env, monkeypatch):
