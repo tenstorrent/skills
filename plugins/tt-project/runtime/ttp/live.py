@@ -289,6 +289,7 @@ WATCH_EVERY_S = 3600   # each provider's `--version` is read at most this often,
 WATCH_USD = 0.50       # the spend cap of the live run a version change starts
 WATCH_TIMEOUT_S = 3 * RUN_TIMEOUT_S + 300   # the whole detached run: its three runs and the scratch setup
 # argv: run dir, timeout, command...; writes out.json (stdout), log (stderr), then rc (124 once timed out)
+# own session: the live run is killed whole (its group) once past the timeout
 WATCH_RUNNER = r'''
 import os, signal, subprocess, sys
 d, limit, argv = sys.argv[1], float(sys.argv[2]), sys.argv[3:]
@@ -380,7 +381,7 @@ def start(provider: str, version: str, owner: str, *, home: Path | None = None, 
     write_json(run / "claim.json", {"provider": provider, "version": version, "owner": owner, "at": now})
     runtime = str(Path(__file__).resolve().parents[1])
     env = {**os.environ, "PYTHONPATH": runtime + os.pathsep + os.environ.get("PYTHONPATH", "")}
-    try:
+    try:   # own session: the detached watch runner outlives this daemon tick
         subprocess.Popen([sys.executable, "-c", WATCH_RUNNER, str(run), str(WATCH_TIMEOUT_S), *argv(provider)],
                          cwd=runtime, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True)
