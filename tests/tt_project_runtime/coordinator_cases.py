@@ -16636,6 +16636,30 @@ def test_a_coordinators_fleet_hold_is_lifted_by_any_coordinator_and_needs_a_know
     assert not fleethold.active()
 
 
+def test_a_user_set_fleet_holds_web_why_line_names_how_to_lift_it_without_a_cli(env, tmp_path):
+    """#4814: the web blocker 'why' line for a user-set fleet hold says how to lift it in
+    chat or on the web page, never `ttp resume`."""
+    from ttp import coordinator as coord
+    from ttp import fleethold, pauseends
+    from ttp.web import state_payload
+    a, b, _ = _fleet(env, tmp_path)
+    coord.pause_machine(a, "box1", True, reason="rack move", by="user",
+                        end=pauseends.from_action({"until": "1d"}))
+    coord.sync_shared_pauses(b)
+    b.db.x("UPDATE runs SET status='failed' WHERE status='running'")   # idle: why_idle shows when nothing runs
+    why = state_payload(b, b.db)["health"]["why_idle"]
+    line = [seg for seg in why.split("; ") if seg.startswith("box1-device is paused")][0]
+    assert "held machine-wide by demo (hold 1)" in line, line
+    assert f"its tasks wait; {fleethold.LIFT}" in why and "ttp resume" not in why, why
+    # A hold the project set itself (not the user's) keeps its ttp resume line.
+    fleethold.lift("box1", True, "test")
+    coord.pause_machine(a, "box1", True, reason="fabric errors", by="coordinator",
+                        end=pauseends.from_action({"until": "1d"}))
+    coord.sync_shared_pauses(b)
+    why = state_payload(b, b.db)["health"]["why_idle"]
+    assert "held machine-wide by demo (hold 2)" in why and "ttp resume" in why, why   # unchanged for a coordinator's hold
+
+
 def test_a_users_pause_under_a_coordinators_fleet_hold_outlives_the_holds_lift(env, tmp_path):
     from ttp import coordinator as coord
     from ttp import fleethold, pauseends

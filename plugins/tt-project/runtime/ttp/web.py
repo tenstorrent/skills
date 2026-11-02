@@ -18,7 +18,7 @@ from . import alerts, awake, chatgone
 from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
-from . import credits, heal, identity, lockprobe, mcpgap, obligations, outagetask, projpause, pushq, release, responsibilities, route, sweep, timefmt, urgent, waits
+from . import credits, fleethold, heal, identity, lockprobe, mcpgap, obligations, outagetask, projpause, pushq, release, responsibilities, route, sweep, timefmt, urgent, waits
 from . import schedule as sched
 from . import pauseends, selfreview, startgate, sweepskip, timefmt, trend, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
@@ -414,8 +414,11 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         why.append(f"{ready} task(s) ready to start")
     for pr in paused_resources:
         why.append(f"{pr['resource']} is paused" + (f" ({pr['reason']})" if pr.get("reason") else "")
-                   + (f": held machine-wide by {pr.get('project')} (hold {pr['fleet']}); its tasks wait "
-                      f"(`ttp resume {p.name} --machine {pr.get('machine')}`)" if pr.get("fleet") else
+                   + (f": held machine-wide by {pr.get('project')} (hold {pr['fleet']}); its tasks wait; {fleethold.LIFT}"
+                      if pr.get("fleet") and pr.get("by") == "user" else
+                      f": held machine-wide by {pr.get('project')} (hold {pr['fleet']}); its tasks wait "
+                      f"(`ttp resume {p.name} --machine {pr.get('machine')}`)"
+                      if pr.get("fleet") else
                       f": its tasks wait (`ttp resume {p.name} --resource {pr['resource']}`)"))
     if logged_out:
         provs = sorted({t["provider"] or core for t in logged_out})
