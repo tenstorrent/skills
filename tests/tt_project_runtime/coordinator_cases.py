@@ -1162,7 +1162,8 @@ def test_a_routine_digest_collapses_unchanged_background_and_keeps_what_decides_
                         "allow_optional": True, "allow_new_work": True, "regime": "dollars"}}
     full, seen = coord.digest_parts(p, gates, [ev], [])
     keys = [k for k, _ in full]
-    assert set(coord.COLLAPSIBLE) <= set(keys) and set(seen) == set(coord.COLLAPSIBLE) | {coord.LEDGER_SEEN_KEY}
+    assert set(coord.COLLAPSIBLE) <= set(keys) and set(seen) == set(coord.COLLAPSIBLE) | {coord.LEDGER_SEEN_KEY,
+                                                                                         coord.TASK_ROWS_SEEN_KEY}
     full_text = "\n".join(t for _, t in full)
     # The next routine turn, nothing changed: each background section is one line, with no reasons.
     short, again = coord.digest_parts(p, gates, [ev], [], seen)
@@ -1195,6 +1196,87 @@ def test_a_routine_digest_collapses_unchanged_background_and_keeps_what_decides_
     assert size["chars"] == len(body) and size["tokens"] == (len(body) + 3) // 4
     assert set(size["sections"]) == set(keys)
 
+
+
+def _rows_fixture(p):
+    """Two pushing rows (approved 3 h and 1 h ago), two deferred queued rows (on a time and on a probe),
+    one plain queued row and one in review."""
+    db, now = p.db, time.time()
+    push = [db.add_task(f"pushing change {i} " + "t" * 80, "s", origin="user") for i in range(2)]
+    for k, tid in enumerate(push):
+        db.update_task(tid, status="pushing", result=json.dumps({"status": "done", "summary": f"approved {k}"}))
+        db.x("INSERT INTO push_queue(task, branch, head, target, created, updated) VALUES(?,?,?,?,?,?)",
+             (tid, f"b{k}", "abc", "origin/x", now - 3 * 3600 + k * 7200, now))
+    later = db.add_task("later on a time", "s", origin="user", not_before=now + 3600,
+                        labels=[f"start_after:{now + 3600:.0f}"])
+    probe = db.add_task("later on a probe", "s", origin="user", labels=["start_when:test -e /nonexistent"])
+    db.x("UPDATE tasks SET created=? WHERE id=?", (now - 5 * 3600, probe))
+    plain = db.add_task("plain queued", "s", origin="user")
+    review = db.add_task("in review", "s", origin="user")
+    db.update_task(review, status="review")
+    return push, [later, probe], plain, review
+
+
+def test_unchanged_pushing_and_deferred_rows_collapse_to_one_group_line_each(env):
+    """An unchanged 'pushing' row and an unchanged deferred 'queued' row are '#id title' entries on
+    their group's line, which names its oldest start; other rows, and changed, new or event-named
+    ones, stay whole."""
+    from ttp import coordinator as coord
+    p = make(env)
+    db = p.db
+    push, later, plain, review = _rows_fixture(p)
+    full, seen = coord.digest_parts(p, {}, [], [])
+    whole = dict(full)["tasks"]
+    for tid in (*push, *later, plain, review):
+        assert f"- #{tid} | " in whole, tid
+    tasks = dict(coord.digest_parts(p, {}, [], [], seen)[0])["tasks"]
+    for tid in (*push, *later):
+        assert f"- #{tid} | " not in tasks and f"#{tid} " in tasks, tasks
+    for tid in (plain, review):
+        assert f"- #{tid} | " in tasks, tasks
+    group = [ln for ln in tasks.split("\n") if ln.startswith("- pushing, 2 as last turn")]
+    assert len(group) == 1 and f"#{push[0]} pushing change 0 " + "t" * 42 + "…" in group[0], tasks
+    # The oldest start: the earliest approval still in the push queue, the earliest created deferred task.
+    first = db.one("SELECT MIN(created) c FROM push_queue")["c"]
+    assert f"oldest in the push queue since {coord._clock(first, p)}" in group[0], group
+    oldest = db.one("SELECT created FROM tasks WHERE id=?", (later[1],))["created"]
+    assert f"- queued to start later, 2 as last turn (oldest created {coord._clock(oldest, p)};" in tasks, tasks
+    assert len(tasks) < len(whole)
+    # Ages ticking on alone change nothing.
+    db.x("UPDATE tasks SET created=created-7200 WHERE id IN (?, ?)", (push[0], later[0]))
+    assert f"- #{push[0]} | " not in dict(coord.digest_parts(p, {}, [], [], seen)[0])["tasks"]
+    # A changed row (its note), a new one and one a new event names are whole again.
+    db.update_task(push[1], result=json.dumps({"status": "done", "summary": "approved, then rebased"}))
+    new = db.add_task("new deferred", "s", origin="user", labels=["start_when:test -e /nonexistent"])
+    ev = db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+              (time.time(), "daemon", "observation", "normal", f"the probe of #{later[1]} is slow", "queued"))
+    tasks = dict(coord.digest_parts(p, {}, [ev], [], seen)[0])["tasks"]
+    for tid in (push[1], new, later[1]):
+        assert f"- #{tid} | " in tasks, (tid, tasks)
+    assert "- pushing, 1 as last turn" in tasks and "- queued to start later, 1 as last turn" in tasks, tasks
+    # A task event (source task:<id>) names its row too.
+    ev = db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+              (time.time(), f"task:{push[0]}", "task_notes", "normal", "a note", "queued"))
+    assert f"- #{push[0]} | " in dict(coord.digest_parts(p, {}, [ev], [], seen)[0])["tasks"]
+    # No `seen` (a raised turn) or an older `seen` without the rows: every row whole.
+    old = {k: v for k, v in seen.items() if k != coord.TASK_ROWS_SEEN_KEY}
+    for s in (None, old):
+        assert "as last turn (" not in dict(coord.digest_parts(p, {}, [], [], s)[0])["tasks"]
+
+
+def test_every_open_task_row_is_whole_on_the_first_turn_after_a_prompt_snapshot_refresh(env):
+    from ttp import coordinator as coord
+    p = make(env)
+    push, later, plain, review = _rows_fixture(p)
+    seen = coord.digest_parts(p, {}, [], [])[1]
+    assert "- pushing, 2 as last turn" in dict(coord.digest_parts(p, {}, [], [], seen)[0])["tasks"]
+    p.db.set_kv(coord.PROMPT_REFRESH_KEY, 1)   # the next turn re-renders the snapshot
+    parts, after = coord.digest_parts(p, {}, [], [], seen)
+    tasks = dict(parts)["tasks"]
+    assert "as last turn (" not in tasks and all(f"- #{t} | " in tasks for t in (*push, *later)), tasks
+    assert after[coord.TASK_ROWS_SEEN_KEY]["snap"] != seen[coord.TASK_ROWS_SEEN_KEY]["snap"]
+    # The turn after it collapses again.
+    assert "- pushing, 2 as last turn" in dict(coord.digest_parts(p, {}, [], [], after)[0])["tasks"]
 
 
 def test_a_coordinator_turn_records_its_digest_size_and_routine_turns_collapse(env, monkeypatch):

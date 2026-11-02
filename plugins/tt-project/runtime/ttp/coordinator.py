@@ -545,6 +545,14 @@ COLLAPSIBLE = ("recurring", "muted", "memory_budget", "memory_pinned", "tried", 
 # whole ledger again after a machine event (ledger_section). The seen lines are keyed on the ledger
 # alone: a prompt-snapshot refresh changes nothing in it, so it still shows only the diff.
 LEDGER_SEEN_KEY = "machine_ledger_lines"   # in digest_seen: {"lines": {key: hash}}
+# Open-task rows collapse per row too: a 'pushing' row, or a 'queued' one deferred to a later start,
+# whose line (ages and read times aside) is as the previous turn saw it is one '#id title' entry on
+# its group's line. A row stays whole when it is new, changed or named by this turn's new events or
+# messages, and every row is whole on the first turn after a prompt-snapshot refresh (so each last
+# note is read at least once per refresh cycle).
+TASK_ROWS_SEEN_KEY = "task_rows"   # in digest_seen: {"snap": snapshot time, "rows": {task id: hash}}
+ROW_TITLE_CHARS = 60
+_TICKS_RE = re.compile(r"\b\d+(?:\.\d+)?\s?(?:h|min|m|s)\b")   # ages and read times, normalised away
 LEDGER_WHOLE_CHANGES = 10   # change lines in a whole view (overdue, then the project's own); the rest counted
 LEDGER_HEAD = "## Shared machines in your Resources"
 # Sections rendered from the prompt snapshot alone: they end the cached context block (with_cached)
@@ -950,6 +958,52 @@ def ledger_whole(p: Project, items: list[tuple[str, str]], now: float) -> list[s
                if rest > 0 else []))
 
 
+def collapse_rows(p: Project, db, lines: list[str], rows: list[dict], seen: dict | None, event_ids: list[int],
+                  msg_ids: list[int], now: float) -> tuple[list[str], dict]:
+    """The open-tasks lines with unchanged 'pushing' and deferred 'queued' rows (TASK_ROWS_SEEN_KEY) as
+    one group line each, and what to store for the next turn. Each group line names its oldest start:
+    the earliest approval still in the push queue, or the earliest created deferred task."""
+    snap = prompt_state(p, now)[0].get("at")
+    byid = {t["id"]: t for t in rows}
+    mine = {}   # task id: its line's index, for the rows shown one per line
+    for i, ln in enumerate(lines):
+        if m := re.match(r"- #(\d+) \| ", ln):
+            mine[int(m[1])] = i
+    store = {"snap": snap, "rows": {str(k): _sha(_TICKS_RE.sub("", lines[i])) for k, i in mine.items()}}
+    before = (seen or {}).get(TASK_ROWS_SEEN_KEY)
+    if not isinstance(before, dict) or before.get("snap") != snap or not isinstance(before.get("rows"), dict):
+        return lines, store
+    said = " ".join(f"{e['source']} {e['text'] or ''}" for e in db.q(
+        f"SELECT source, text FROM events WHERE id IN ({','.join('?' * len(event_ids))})", list(event_ids))) \
+        if event_ids else ""
+    if msg_ids:
+        said += " " + " ".join(str(m["text"] or "") for m in db.q(
+            f"SELECT text FROM messages WHERE id IN ({','.join('?' * len(msg_ids))})", list(msg_ids)))
+    named = {int(n) for n in re.findall(r"(?:#|\btask:)(\d+)\b", said)}
+    groups: dict[str, list[int]] = {"pushing": [], "deferred": []}
+    for k, i in mine.items():
+        t, ln = byid[k], lines[i]
+        kind = ("pushing" if t["status"] == "pushing" else "deferred"
+                if t["status"] == "queued" and re.match(r"- #\d+ \| queued \((?:[^|]*; )?starts ", ln) else None)
+        if kind and k not in named and before["rows"].get(str(k)) == store["rows"][str(k)]:
+            groups[kind].append(k)
+    if not groups["pushing"] and not groups["deferred"]:
+        return lines, store
+    gone = {mine[k] for ks in groups.values() for k in ks}
+    out = [ln for i, ln in enumerate(lines) if i not in gone]
+    entries = {k: ", ".join(f"#{t} {clip(byid[t]['title'], ROW_TITLE_CHARS)}" for t in ks) for k, ks in groups.items()}
+    if ks := groups["pushing"]:
+        got = db.q(f"SELECT MIN(created) c FROM push_queue WHERE status IN ('approved','held') AND task IN "
+                   f"({','.join('?' * len(ks))})", ks)
+        oldest = (got[0]["c"] if got else None) or min(byid[k]["updated"] for k in ks)
+        out.append(f"- pushing, {len(ks)} as last turn (oldest in the push queue since {_clock(oldest, p)}; rows "
+                   f"and notes unchanged, whole again when one changes): {entries['pushing']}")
+    if ks := groups["deferred"]:
+        out.append(f"- queued to start later, {len(ks)} as last turn (oldest created {_clock(min(byid[k]['created'] for k in ks), p)}; "
+                   f"rows and notes unchanged, whole again when one changes): {entries['deferred']}")
+    return out, store
+
+
 def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int], seen: dict | None = None) -> str:
     return "\n".join(text for _, text in digest_parts(p, gates, event_ids, msg_ids, seen)[0])
 
@@ -1157,6 +1211,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     lines += setting_held
     if not rows:
         lines.append("- (none)")
+    lines, shas[TASK_ROWS_SEEN_KEY] = collapse_rows(p, db, lines, rows, seen, event_ids, msg_ids, now)
     section("tasks", lines)
     events = (db.q(f"SELECT * FROM events WHERE id IN ({','.join('?' * len(event_ids))}) ORDER BY id", event_ids)
               if event_ids else [])
