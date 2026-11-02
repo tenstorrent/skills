@@ -20,6 +20,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from . import gitmemo
 from .project import FOLDER, Project, durable_write
 
 NAME = ".ignore"
@@ -37,7 +38,8 @@ def block() -> str:
 
 def _git(root: Path, *args: str) -> subprocess.CompletedProcess | None:
     try:
-        return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=GIT_S,
+        return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True,
+                              timeout=gitmemo.timeout(GIT_S, args),
                               stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
