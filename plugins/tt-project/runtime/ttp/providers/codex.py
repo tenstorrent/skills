@@ -54,6 +54,10 @@ from .base import (AUTH_RE, LIMIT_RE, MAX_ARG_BYTES, Provider, RunUsage, cli_out
 PRICES = {"default": (4.0, 0.4, 20.0)}
 # A rollout's plan-window reading stands in for the meter's only this fresh (seconds).
 ROLLOUT_WINDOWS_FRESH_S = 180
+# The run's developer instructions are looked for in this many of its rollout's first lines, by
+# this long a prefix (characters) of the text the run passed.
+ROLLOUT_HEAD_LINES = 200
+INSTRUCTIONS_PREFIX = 4096
 # Tools a decision-only turn does without, switched off when this build lists them as features.
 READ_ONLY_OFF = ("shell_tool", "unified_exec", "web_search_request")
 HOOK_TRUST_BYPASS = "--dangerously-bypass-hook-trust"
@@ -153,6 +157,52 @@ class Codex(Provider):
         # https://developers.openai.com/codex/config-reference
         arg = "developer_instructions=" + toml_string(Path(path).read_text())
         return ["-c", arg] if len(arg.encode()) <= MAX_ARG_BYTES else []
+
+    def instructions_recorded(self, output_path, argv, expected, env=None):
+        # Codex records the developer_instructions it took (append_system_args) near the top of the
+        # session's rollout, as a developer message starting with the text. A CLI that ignored the
+        # -c key would run without the harness's system prompt; Codex reads `-c` values as TOML, so
+        # the message holds the unescaped text, as system.md has it.
+        if not expected or "resume" in argv or not any(str(a).startswith("developer_instructions=") for a in argv):
+            return None   # the text led the prompt, or a resumed session's rollout holds the first run's
+        sid = next((str(ev.get("thread_id") or "") for ev in self._events(Path(output_path))
+                    if ev.get("type") == "thread.started"), "")
+        if not sid:
+            return {"state": "no_session"}
+        paths = self.session_paths(sid, "", env)
+        if not paths:
+            return {"state": "no_rollout"}
+        want = expected.replace("\r\n", "\n")[:INSTRUCTIONS_PREFIX]
+        version, answered, lines = "", False, 0
+        try:
+            with open(max(paths, key=lambda f: f.stat().st_mtime), "rb") as f:
+                for raw in f:
+                    if lines >= ROLLOUT_HEAD_LINES or not raw.endswith(b"\n"):
+                        break   # past the head, or a line still being written
+                    lines += 1
+                    try:
+                        rec = json.loads(raw)
+                    except ValueError:
+                        continue
+                    pay = rec.get("payload") if isinstance(rec, dict) else None
+                    if not isinstance(pay, dict):
+                        continue
+                    if rec.get("type") == "session_meta":
+                        version = str(pay.get("cli_version") or "")[:40]
+                    elif rec.get("type") == "response_item" and pay.get("role") == "developer":
+                        parts = pay.get("content") if isinstance(pay.get("content"), list) else []
+                        if any(isinstance(c, dict) and isinstance(c.get("text"), str)
+                               and c["text"].replace("\r\n", "\n").startswith(want) for c in parts):
+                            return {"state": "recorded", "cli_version": version}
+                    elif rec.get("type") == "response_item" and (pay.get("role") == "assistant"
+                                                                  or pay.get("type") not in (None, "message")):
+                        answered = True   # the model already answered: the first request's context is all here
+                    elif rec.get("type") == "event_msg" and pay.get("type") == "token_count":
+                        answered = True
+        except OSError:
+            return {"state": "unreadable"}
+        done = answered or lines >= ROLLOUT_HEAD_LINES
+        return {"state": "missing" if done else "pending", "cli_version": version}
 
     def compact_args(self, tokens: int) -> list[str]:
         # `model_auto_compact_token_limit`: history is compacted once it reaches this many tokens.

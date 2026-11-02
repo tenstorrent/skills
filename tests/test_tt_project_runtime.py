@@ -15512,7 +15512,7 @@ sys.exit(int(os.environ.get("FAKE_CLI_RC", "0")))
 
 def _cli_run(env, monkeypatch, provider, stdout, *, stderr="", rc=0, result=None, role="worker",
              read_only=False, schema=None, note=None, before=None, budget_usd=2.0, help_text="", pace=0,
-             resume=None, pin=None, session=None):
+             resume=None, pin=None, session=None, append_system=None):
     """Launch one run of `provider` through the daemon and its detached runner against a fake CLI,
     reap it, and return the project, run row, task row, argv and the stdin the CLI received."""
     bin_dir = env["tmp"] / "fakebin"
@@ -15542,7 +15542,7 @@ def _cli_run(env, monkeypatch, provider, stdout, *, stderr="", rc=0, result=None
         p.db.update_task(tid, status="running")
     rid = d.start_run(role, "PROMPT-MARKER", provider, "light", str(env["repo"]),
                       task=p.db.task(tid) if tid else None, budget_usd=budget_usd, timeout_s=100,
-                      read_only=read_only, schema=schema, note=note, resume=resume)
+                      read_only=read_only, schema=schema, note=note, resume=resume, append_system=append_system)
     exit_file = p.runs / str(rid) / "exit.json"
     deadline = time.time() + 60
     while not exit_file.exists() and time.time() < deadline:

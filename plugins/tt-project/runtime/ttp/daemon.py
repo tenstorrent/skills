@@ -336,6 +336,26 @@ def task_env(tid) -> dict[str, str]:
     return {"TTP_TASK": str(tid), "TTP_TASK_ID": str(tid)}
 
 
+def instructions_observation(provider: str, role: str, run_id, inst) -> tuple[str, str] | None:
+    """The observation for a run whose agent did not record the system prompt it was passed, or
+    whose transcript the check never found (runner.check_instructions): (text, key), keyed by agent,
+    outcome and CLI version so it is raised once, not once per run. None when there is nothing to say."""
+    if not isinstance(inst, dict) or inst.get("state") not in ("missing", "no_rollout"):
+        return None
+    ver = str(inst.get("cli_version") or "")[:40]
+    if inst["state"] == "missing":
+        text = (f"{role} run {run_id} on {provider} {ver or '(unknown version)'}: the agent's transcript has no "
+                f"developer message with the run's system prompt, so it ran without the charter's binding "
+                f"restrictions. The run was stopped and its task blocked without an attempt; the agent CLI "
+                f"may have stopped taking developer_instructions. Run such tasks on another provider until "
+                f"it does.")
+    else:
+        text = (f"{role} run {run_id} on {provider}: its transcript (rollout) was not found within "
+                f"{int(runner.ROLLOUT_WAIT_S)} s, so whether the agent took the run's system prompt is "
+                f"unchecked. The agent CLI may have moved or renamed its session files; the run went on.")
+    return text, f"instructions:{provider}:{inst['state']}:{ver or 'unknown'}"
+
+
 def inherited_line(carried: dict[int, list[str]], own: set[int] | frozenset = frozenset()) -> str:
     """The review spec's line on the commits its head carries from tasks whose latest review failed
     (pushq.carried), with kind-review.md's choice, so the approval is not refused for them later.
@@ -3711,6 +3731,10 @@ class Daemon:
             self.observe("daemon:launch", f"{r['role']} run {r['id']} on {r['provider']} never started, a harness "
                          f"launch failure: {launch_error}", "normal", whole=True,
                          key=f"launch:{r['provider']}:{r['role']}")
+        said = instructions_observation(r["provider"], r["role"], r["id"], exit_info.get("instructions"))
+        if said:
+            note["instructions"] = exit_info["instructions"]["state"]
+            self.observe("daemon:instructions", said[0], "normal", whole=True, key=said[1])
         try:   # the model and effort the agent's session resolved for a pinned task (runner.check_pin)
             session = exit_info.get("session") or json.loads((run_dir / "run.json").read_text()).get("session")
         except (OSError, ValueError, AttributeError):
@@ -4387,15 +4411,18 @@ class Daemon:
             # The project was stopped, not the task: it resumes on the next start, on its own branch.
             db.update_task(task["id"], status="queued", blocked_reason="interrupted by `ttp stop --kill`; resumes")
             return
-        if refused in ("model_mismatch", "pin_unverified"):
+        if refused in ("model_mismatch", "pin_unverified", "instructions_missing"):
             # A mismatch or strict unverifiable pin: nothing ran or was spent. Retrying the same
             # configuration would loop, so block without spending an attempt. Before the resume
-            # fallback: a refused resume must not start fresh under the same pin.
-            prefix = "model pin not honoured" if refused == "model_mismatch" else "model pin could not be verified"
+            # fallback: a refused resume must not start fresh under the same pin. So for an agent that
+            # did not take the run's system prompt (runner.check_instructions): the next run would not either.
+            prefix = {"model_mismatch": "model pin not honoured", "pin_unverified": "model pin could not be verified",
+                      "instructions_missing": "system prompt not taken"}[refused]
             why = f"{prefix}: {usage.error}"[:500]
-            remedy = ("Change or clear its model/effort pin (task_update) and requeue it."
-                      if refused == "model_mismatch" else
-                      "Restore session verification or explicitly change pin_verify, then requeue it.")
+            remedy = {"model_mismatch": "Change or clear its model/effort pin (task_update) and requeue it.",
+                      "pin_unverified": "Restore session verification or explicitly change pin_verify, then requeue it.",
+                      "instructions_missing": "Run it on another provider, or requeue it once the agent CLI takes "
+                                              "developer_instructions again."}[refused]
             with db.tx():
                 db.update_task(task["id"], status="blocked", blocked_reason=why,
                                result=dump_result({"status": "blocked", "summary": why}))

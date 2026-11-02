@@ -316,6 +316,14 @@ class Provider:
         caches it across runs; [] when the agent cannot, and the text then leads the prompt."""
         return []
 
+    def instructions_recorded(self, output_path: Path, argv: list[str], expected: str,
+                              env: dict | None = None) -> dict | None:
+        """Whether the agent's own transcript shows it took the text `expected` that `argv` passed
+        by append_system_args, read cheaply while the run goes on: {"state": "recorded" | "missing"
+        (its transcript is far enough along and lacks it) | "pending" | "no_session" | "no_rollout" |
+        "unreadable", "cli_version"}. None when this run or agent cannot be checked."""
+        return None
+
     def system_prompt_args(self, path: Path) -> list[str]:
         """Arguments that make the text in `path` the agent's whole system prompt; [] when the agent
         cannot (or not for text that long), and the text then leads the prompt."""

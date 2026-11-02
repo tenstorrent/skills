@@ -61,6 +61,10 @@ PRE_GRANT_FRESH_S = 3    # a pre-grant answer older than this is asked again onc
 POLL_S = 5
 WATCH_ERRORS_LOGGED = 20   # a watch error that repeats every poll is logged this many times
 BUDGET_EVERY_S = 10
+# A run's transcript is read for the system prompt it passed this often until there is a verdict
+# (check_instructions); one not found this long into the run is reported, never stopped on.
+INSTRUCTIONS_EVERY_S = 5
+ROLLOUT_WAIT_S = 120
 TOOL_GRACE_S = 60     # past a pending tool call's own timeout before its silence counts as a stall
 SLEEP_GAP_S = 600     # polls are POLL_S apart: a gap this long between two can only be a host sleep
 PDEATHSIG = sys.platform.startswith("linux")   # the kernel also signals the agent itself if the runner dies
@@ -297,6 +301,28 @@ def remove_private(run_dir: Path) -> None:
         pass
 
 
+def check_instructions(prov, run_dir: Path, out_path: Path, argv: list[str], env: dict, waited_s: float) -> dict | None:
+    """One look at whether the agent took the system prompt the run passed it (system.md, by
+    append_system_args): a verdict to record ({"state": "recorded" | "missing" | "no_rollout", ...}),
+    {} when there is nothing to check, None to look again. A transcript that is missing or unreadable
+    is only reported, as its format or path may change."""
+    try:
+        text = (run_dir / "system.md").read_text()
+    except (OSError, ValueError):
+        return {}   # no system prompt passed (or none readable to compare)
+    try:
+        got = prov.instructions_recorded(out_path, argv, text, env)
+    except Exception as e:   # also after the run ended, where nothing else would catch it
+        got = {"state": "unreadable", "error": f"{type(e).__name__}: {e}"[:200]}
+    if not isinstance(got, dict):
+        return {}
+    if got.get("state") in ("recorded", "missing"):
+        return got
+    if got.get("state") in ("no_session", "no_rollout", "unreadable") and waited_s >= ROLLOUT_WAIT_S:
+        return {**got, "state": "no_rollout", "seen": got.get("state")}
+    return None
+
+
 def supervise(run_dir: Path) -> int:
     try:
         spec = json.loads((run_dir / "run.json").read_text())
@@ -393,6 +419,8 @@ def supervise(run_dir: Path) -> int:
     if nice and niceness is not None and niceness < min(os.nice(0) + nice, 19):
         print(f"runner: could not lower the agent's priority by {nice} (it runs at nice {niceness})", flush=True)
     reason: list[str] = []
+    # The system prompt check (check_instructions): open until it has a verdict.
+    inst: dict = {"open": True, "at": 0.0, "got": None, "prov": None}
 
     def stop(why: str) -> None:
         if reason:
@@ -415,6 +443,7 @@ def supervise(run_dir: Path) -> int:
         from . import locks
         from .providers import get_provider  # local import: keeps startup cheap
         prov = get_provider(spec["provider"]).use(spec.get("model", ""), spec.get("prices"))
+        inst["prov"] = prov
         st = {"lease": 0.0, "budget": 0.0, "active": 0.0}
         progress = ProgressWatch(out_path, run_dir)
 
@@ -443,6 +472,14 @@ def supervise(run_dir: Path) -> int:
                     so_far = None
                 if so_far is not None and so_far > float(budget):
                     threading.Thread(target=stop, args=("budget",), daemon=True).start()
+            if inst["open"] and now - inst["at"] >= INSTRUCTIONS_EVERY_S:
+                inst["at"] = now
+                got = check_instructions(prov, run_dir, out_path, argv, env, up)
+                if got is not None:
+                    inst.update(open=False, got=got or None)
+                    if got.get("state") == "missing" and env_extra.get("TTP_TASK"):
+                        # Running without the charter's restrictions: ended now, its task blocked (daemon).
+                        threading.Thread(target=stop, args=("instructions_missing",), daemon=True).start()
             why = stop_reason(run_dir)
             if why:
                 threading.Thread(target=stop, args=(why,), daemon=True).start()
@@ -474,6 +511,10 @@ def supervise(run_dir: Path) -> int:
             rc = child.wait()
             break
     ended, mono_end, up = time.time(), time.monotonic(), awake.tick()
+    if inst["open"] and inst["prov"] is not None:
+        # A run that ended before a verdict: one last look, which never reports a missing transcript.
+        got = check_instructions(inst["prov"], run_dir, out_path, argv, env, 0.0)
+        inst["got"] = got or None
     if bridge is not None:
         bridge.stop()
     if guard is not None:   # a normal end: the watchdog leaves the group alone
@@ -499,6 +540,15 @@ def supervise(run_dir: Path) -> int:
         f.close()
     exit_info = {"rc": rc, "started": started, "ended": ended, "stopped": reason[0] if reason else None,
                  "slept_s": round(max((ended - started) - min(mono_end - mono_start, up), 0.0), 1), "nice": niceness}
+    if inst["got"]:
+        exit_info["instructions"] = {k: v for k, v in inst["got"].items() if k in ("state", "cli_version", "seen")}
+        if inst["got"].get("state") == "missing" and env_extra.get("TTP_TASK"):
+            ver = inst["got"].get("cli_version") or "unknown version"
+            exit_info.update(refused="instructions_missing", error=(
+                f"{spec['provider']} ({ver}) did not record the run's system prompt in its transcript, so the "
+                f"run went without its binding restrictions; "
+                + ("it was stopped" if reason and reason[0] == "instructions_missing" else "its result is held")))
+            print(f"runner: {exit_info['error']}", flush=True)
     if bridge is not None:
         exit_info["bridge"] = bridge.stats()   # endpoint fault kinds for routing's fallback (route.py)
     try:   # before exit.json: the daemon reads the run's output and hand-off only after it
