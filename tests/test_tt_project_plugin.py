@@ -2238,12 +2238,19 @@ def _agents_home(tmp_path):
     return home, env
 
 
+# Shell: r <name> sets $v to the first line of $HOME/<name> (empty when it is missing) without a command
+# substitution or cat: a fake polled every second then starts no process beyond its own shell.
+_READ_FILE = "r() { v=; { read -r v || :; } 2>/dev/null <\"$HOME/$1\"; return 0; }\n"
+
+
 def _fast_sleep(env):
     """A `sleep` first on the fake PATH that pauses a fifth as long: the box scripts' polls and pauses keep
-    their loops and counts, at less wall time."""
+    their loops and counts, at less wall time. A whole number of seconds is divided by the shell itself, so
+    each pause starts one process, as a real sleep does."""
     shim = pathlib.Path(env["PATH"].split(":")[0]) / "sleep"
-    shim.write_text("#!/bin/sh\ncase $1 in ''|*[!0-9.]*) exec /bin/sleep \"$@\" ;; esac\n"
-                    "exec /bin/sleep \"$(awk -v s=\"$1\" 'BEGIN { print s / 5 }')\"\n")
+    shim.write_text("#!/bin/sh\ncase $1 in ''|*[!0-9.]*) exec /bin/sleep \"$@\" ;;\n"
+                    "0?*|*.*) exec /bin/sleep \"$(awk -v s=\"$1\" 'BEGIN { print s / 5 }')\" ;; esac\n"
+                    "exec /bin/sleep \"$(($1 / 5)).$(($1 % 5 * 2))\"\n")
     shim.chmod(0o755)
 
 
@@ -3087,6 +3094,9 @@ def test_setup_box_agents_glean_sign_in_runs_in_tmux_and_hands_out_a_link_only_w
     if not shutil.which("tmux"):
         pytest.skip("no tmux")
     ba = _agents(monkeypatch)
+    # A callback that never listens is called dead after LISTEN_WAIT polls: a few keep the loop and its
+    # verdict, without 30 rounds of processes for each of the three dead sign-ins below.
+    monkeypatch.setattr(ba, "LISTEN_WAIT", 3)
     home, env = _agents_home(tmp_path)
     _fast_sleep(env)
     _glean_fakes(home)
@@ -3094,9 +3104,9 @@ def test_setup_box_agents_glean_sign_in_runs_in_tmux_and_hands_out_a_link_only_w
     # A fake ss: a running sign-in's callback listens on its port once $HOME/listen exists; another program
     # holds the port in $HOME/busy.
     (tmp_path / "shim/ss").write_text(
-        "#!/bin/sh\n[ -f \"$HOME/busy\" ] && echo \"LISTEN 0 4096 127.0.0.1:$(cat \"$HOME/busy\") 0.0.0.0:*\"\n"
-        "[ -f \"$HOME/listen\" ] && kill -0 \"$(cat \"$HOME/cb.pid\" 2>/dev/null)\" 2>/dev/null"
-        " && echo \"LISTEN 0 4096 127.0.0.1:$(cat \"$HOME/cb.port\") 0.0.0.0:*\"\nexit 0\n")
+        "#!/bin/sh\n" + _READ_FILE + "[ -f \"$HOME/busy\" ] && r busy && echo \"LISTEN 0 4096 127.0.0.1:$v 0.0.0.0:*\"\n"
+        "[ -f \"$HOME/listen\" ] && r cb.pid && kill -0 \"$v\" 2>/dev/null"
+        " && r cb.port && echo \"LISTEN 0 4096 127.0.0.1:$v 0.0.0.0:*\"\nexit 0\n")
     (tmp_path / "shim/ss").chmod(0o755)
     env["TMUX_TMPDIR"] = tempfile.mkdtemp(prefix="ttpt", dir="/tmp")
     tmux = shutil.which("tmux")
@@ -3201,8 +3211,8 @@ def test_setup_box_agents_glean_sign_in_starts_detached_and_hands_out_a_link_onl
     _glean_fakes(home)
     (home / "claude-mcp").write_text("https://g.invalid/mcp\n")
     shim = tmp_path / "shim"
-    (shim / "ss").write_text("#!/bin/sh\nkill -0 \"$(cat \"$HOME/cb.pid\" 2>/dev/null)\" 2>/dev/null"
-                             " && echo \"LISTEN 0 4096 127.0.0.1:$(cat \"$HOME/cb.port\") 0.0.0.0:*\"\nexit 0\n")
+    (shim / "ss").write_text("#!/bin/sh\n" + _READ_FILE + "r cb.pid; kill -0 \"$v\" 2>/dev/null"
+                             " && r cb.port && echo \"LISTEN 0 4096 127.0.0.1:$v 0.0.0.0:*\"\nexit 0\n")
     # Launchers: each records how it was called; systemd-run runs the command after its options unless
     # $HOME/no-bus (no user bus over ssh); loginctl says the user's manager lingers when $HOME/linger exists.
     (shim / "setsid").write_text("#!/bin/sh\necho \"$*\" >> \"$HOME/setsid.log\"\nexec \"$@\"\n")
