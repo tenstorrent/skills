@@ -30,3 +30,4 @@
 +80: delivery.channel_tags only to tags the charter or user lets move forward
 +350: light is for mechanical work only; conclusion runs carry a `conclusion:` line (tier floor)
 +590: a project's own gates and settings are the coordinator's to decide and record (selfblock)
++20: a cited restriction removed in a user turn carries that turn's words in `source`
