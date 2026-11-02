@@ -40,7 +40,7 @@ below half. A check on one keeps it until it ends, but no new one takes one once
 They open beyond a default cap's ceiling too. checks.load_extra 0 also keeps a project's checks lanes
 per repository and the test pool at their floors (checklane.capacity, testslots.pool_now).
 
-Whatever the cap, a slot (of the cap or beyond it) is taken only while the host's live free cores cover
+Whatever the cap (unless it is off), a slot of the cap or beyond it is taken only while the host's live free cores cover
 one check's price (cores_short: busy cores from /proc/stat over the last few seconds, less the price of
 each check granted within RAMP_S), so a saturated host starts no more suites; with no check running one
 always starts. The run's test grant then follows the same free cores (testslots.live_room).
