@@ -13,6 +13,11 @@ about a task it does not own, and would be marked seen before the worker itself 
 hook stays silent inside a subagent (its payload carries `agent_id`) and leaves the update for the
 worker's next own tool call.
 
+After a failed tool call (Claude Code's PostToolUseFailure, which replaces PostToolUse there) it hands
+over the same update and hand-off problems, and, when the error is the Bash sandbox's mount race
+(MOUNT_RACE: bwrap could not bind a path that vanished while it started), the hint to re-run the
+command unchanged; `ttp audit` counts the runs that hit it.
+
 The hand-off guard: after a tool call that changed `$TTP_RUN_DIR/result.json` (any tool: it compares
 the file's size and mtime with the last one checked), the hook parses it as the daemon does and, if
 it is no hand-off (not JSON, not an object, or no hand-off status), hands the worker the error with
@@ -1541,7 +1546,30 @@ def device_test_run(commands: str, cmd: str = "") -> tuple[str | None, str | Non
                   f"through the device broker, `ttp lock <device> --` or `ttp devq`"), None
 
 
-HANDLERS = {"PostToolUse": post_tool_use, "PreToolUse": pre_tool_use, "Stop": stop}
+# Claude Code's Bash sandbox (bwrap) binds each fenced path that exists when the command starts; one
+# that another command or a worktree removal deletes before bwrap mounts it fails the whole command
+# (measured: config.lock placeholders of concurrent sandboxes, removed `.git/worktrees/<name>` entries).
+MOUNT_RACE = re.compile(r"bwrap: Can't (?:get type of source path|find source path|bind mount) "
+                        r"[^\n]{0,600}?: No such file or directory")
+MOUNT_RACE_HINT = ("tt-project: transient sandbox mount race (a path the sandbox binds vanished while it "
+                   "started), not a fault of your command: re-run the same command unchanged.")
+
+
+def post_tool_use_failure(payload: dict) -> tuple[dict | None, Callable[[], None] | None]:
+    """A failed tool call: the hint for a sandbox mount race, and any coordinator update or hand-off
+    problem PostToolUse would have delivered (Claude Code sends no PostToolUse for a failed call)."""
+    out, delivered = post_tool_use(payload)
+    parts = [out["hookSpecificOutput"]["additionalContext"]] if out else []
+    if MOUNT_RACE.search(str(payload.get("error") or "")):
+        parts.insert(0, MOUNT_RACE_HINT)
+    if not parts:
+        return None, delivered
+    return {"hookSpecificOutput": {"hookEventName": "PostToolUseFailure",
+                                   "additionalContext": "\n\n".join(parts)}}, delivered
+
+
+HANDLERS = {"PostToolUse": post_tool_use, "PostToolUseFailure": post_tool_use_failure,
+            "PreToolUse": pre_tool_use, "Stop": stop}
 
 
 def main(argv: list[str]) -> int:

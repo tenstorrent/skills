@@ -214,3 +214,74 @@ def test_fenced_hook_lets_git_on_its_own_or_over_https_run(env, monkeypatch, cmd
     monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"]))
     monkeypatch.setenv("TTP_FENCE_BY_NAME", "1")
     assert not _decision(hook, cmd.format(ssh=ssh, https=https), ssh if where == "ssh" else https)
+
+
+RACE = ("bwrap: Can't get type of source path /r/.git/worktrees/tree/commondir: No such file or directory")
+
+
+@pytest.mark.parametrize("error,hinted", [
+    (RACE, True), ("bwrap: Can't get type of source path /r/.git/config.lock: No such file or directory", True),
+    ("bwrap: Can't bind mount /oldroot/r/.git/worktrees/t1 on /newroot/r/.git/worktrees/t1: No such file or "
+     "directory", True),
+    ("Exit code 1\nls: cannot access 'x': No such file or directory", False),
+    ("bwrap: Can't get type of source path /r/x: Permission denied", False), ("", False)])
+def test_failed_tool_call_gets_the_mount_race_hint_only_on_that_error(monkeypatch, tmp_path, error, hinted):
+    from ttp import hook
+    monkeypatch.delenv("TTP_RUN_DIR", raising=False)
+    out, _ = hook.post_tool_use_failure({"hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
+                                         "error": error})
+    if not hinted:
+        assert out is None
+        return
+    assert out["hookSpecificOutput"]["hookEventName"] == "PostToolUseFailure"
+    assert "re-run the same command unchanged" in out["hookSpecificOutput"]["additionalContext"]
+
+
+def test_failed_tool_call_still_hands_over_the_coordinator_update(monkeypatch, tmp_path):
+    from ttp import hook
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    (tmp_path / "steer.md").write_text("push to the other branch\n")
+    out, delivered = hook.post_tool_use_failure({"tool_name": "Bash", "error": RACE})
+    text = out["hookSpecificOutput"]["additionalContext"]
+    assert text.startswith("tt-project: transient sandbox mount race") and "push to the other branch" in text
+    delivered()
+    out, _ = hook.post_tool_use_failure({"tool_name": "Bash", "error": "Exit code 2"})
+    assert out is None, "the update is handed over once"
+    assert hook.HANDLERS["PostToolUseFailure"] is hook.post_tool_use_failure
+
+
+def test_claude_hooks_register_the_failure_event():
+    from ttp.providers import claude
+    hooks = claude.hook_settings()["hooks"]
+    assert hooks["PostToolUseFailure"][0]["hooks"][0]["command"].endswith("ttp.hook PostToolUseFailure")
+    assert hooks["PostToolUse"][0]["hooks"][0]["command"].endswith("ttp.hook PostToolUse")
+
+
+def test_fence_grants_only_the_roots_it_is_given(monkeypatch, tmp_path):
+    """The mount race fix opened no write: the sandbox still writes only the given roots and the tool
+    caches, never runs a command outside it, and has no rule that would lift a deny of Claude Code's."""
+    from ttp.providers import claude
+    monkeypatch.setattr(claude, "tool_caches", lambda: ["/c"])
+    s = claude.sandbox_settings(["/wt", "/repo/.git"])
+    assert s["filesystem"] == {"allowWrite": ["/wt", "/repo/.git", "/c"]}
+    assert s["enabled"] is True and s["allowUnsandboxedCommands"] is False
+    assert set(s) == {"enabled", "autoAllowBashIfSandboxed", "allowUnsandboxedCommands", "excludedCommands",
+                      "filesystem", "network"}
+
+
+def test_audit_counts_claude_runs_that_hit_the_mount_race(env, tmp_path):
+    from ttp import audit
+    p = make(env)
+    now = time.time()
+    for i, (prov, text) in enumerate([("claude", '{"content":"' + RACE + '"}'), ("claude", '{"ok":1}'),
+                                      ("codex", RACE), ("claude", None)]):
+        d = tmp_path / f"r{i}"
+        d.mkdir()
+        if text is not None:
+            (d / "output.jsonl").write_text(text + "\n")
+        p.db.x("INSERT INTO runs(role,provider,started,ended,status,dir) VALUES(?,?,?,?,?,?)",
+               ("worker", prov, now - 60, now - 30, "ok", str(d)))
+    got = audit.mount_races(p.db, now - 3600)
+    assert (got["runs"], got["hit"]) == (3, 1)
+    assert any(ln.startswith("sandbox mount races: 1 of 3 Claude runs (33%)") for ln in audit.lines(p.db, now, p=p))
+    assert audit.report(p.db, now, p=p)["mount_races"]["hit"] == 1

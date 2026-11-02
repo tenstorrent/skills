@@ -543,6 +543,10 @@ def hook_settings() -> dict:
     cmd = f"{shlex.quote(sys.executable)} -m ttp.hook"
     return {"hooks": {"PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": f"{cmd} PostToolUse",
                                                                   "timeout": 20}]}],
+                      # A failed call gets no PostToolUse: the same updates, plus the sandbox mount race hint.
+                      "PostToolUseFailure": [{"matcher": "*", "hooks": [{"type": "command",
+                                                                         "command": f"{cmd} PostToolUseFailure",
+                                                                         "timeout": 20}]}],
                       # Denies Bash calls that would get around the harness's PR draft guard, and edits
                       # to the harness's gh wrapper and gh.d pre-hooks outside a harness task.
                       "PreToolUse": [{"matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit",
