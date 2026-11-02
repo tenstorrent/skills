@@ -5786,6 +5786,10 @@ class Daemon:
             self._schedule_cap_warn()
         except Exception as e:
             self._log_step_error("schedule cap warning", e, 1000)
+        try:
+            self._schedule_now(due)
+        except Exception as e:
+            self._log_step_error("schedule run-now requests", e, 1000)
         for s in due:
             payload = json.loads(s["payload"] or "{}")
             if s["kind"] in ("command", "watcher") or (s["kind"] == "llm" and _precheck_cmd(payload)):
@@ -5808,8 +5812,10 @@ class Daemon:
                                 f"{time.monotonic() - run.started:.0f} s; its result is dropped")
                 elif run.stopped:
                     log(self.p, f"schedule {name}: its run was stopped with the daemon; nothing recorded")
+                    self._schedule_answer(run, "stopped with the daemon; nothing recorded")
                 else:
                     self._schedule_ran(run.s, *run.result)
+                    self._schedule_answer(run, run.result[0])
             elif run.timed_out:
                 if not run.stuck and time.monotonic() >= run.killed_at + schedrun.STUCK_FACTOR * run.timeout:
                     run.stuck = True
@@ -5827,6 +5833,39 @@ class Daemon:
                              f"stopped ({killed} process group(s) killed) and counts as failed", "normal",
                              lifecycle=scr.ERROR)
                 self._schedule_ran(run.s, why, None)
+                self._schedule_answer(run, why)
+
+    def _schedule_now(self, due: list[dict]) -> None:
+        """Serve `ttp schedules <p> run <schedule>` requests (schednow): each named command schedule starts
+        now, as if due (taken out of `due`, so it starts once), or the request joins its run going on. A
+        name not in the config, or not a command schedule, is answered with the refusal and runs nothing."""
+        from . import schednow
+        runs = self._sched_runs
+        for rid, name in schednow.pending(self.p):
+            row = self.p.db.one("SELECT * FROM schedules WHERE name=?", (name,)) if name else None
+            if why := schednow.refusal(row, name):
+                schednow.answer(self.p, rid, {"rc": None, "stdout": "", "status": "refused: " + why})
+                continue
+            run = runs.get(name)
+            if run is None or run.timed_out:
+                if run is not None:   # killed at its timeout and still going: never two at once
+                    schednow.answer(self.p, rid, {"rc": None, "stdout": "", "status": "refused: its last run, "
+                                                  "killed at its timeout, is still going"})
+                    continue
+                due[:] = [s for s in due if s["name"] != name]
+                run = runs[name] = self._start_schedule(row, json.loads(row["payload"] or "{}"))
+                log(self.p, f"schedule {name}: run now on request {rid}")
+            run.requests.append(rid)
+            schednow.started(self.p, rid, max(0.0, run.deadline - time.monotonic()))
+
+    def _schedule_answer(self, run: schedrun.Run, status: str) -> None:
+        """Answer the run-now requests waiting on `run` (schednow)."""
+        if not run.requests:
+            return
+        from . import schednow
+        for rid in run.requests:
+            schednow.answer(self.p, rid, {"rc": run.rc, "stdout": run.stdout, "status": status})
+        run.requests = []
 
     def _schedule_cap_warn(self) -> None:
         """An llm schedule whose last-24-h spend passes sched.CAP_WARN of its own daily cap while the
@@ -6154,6 +6193,8 @@ class Daemon:
                          "normal", rewake_after_s=rewake, lifecycle=scr.ERROR)
             return f"error: timed out after {timeout} s{note}"
         text = (out.stdout or "").strip()
+        if run := schedrun.current():   # what `ttp schedules <p> run` prints (schednow)
+            run.rc, run.stdout = out.returncode, text
         ok = out.returncode in (0, 1)
         failed = not ok and not text   # the daemon reports the failure itself
         if failed:

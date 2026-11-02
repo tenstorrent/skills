@@ -960,3 +960,154 @@ def test_schedule_and_heal_commands_read_eof_not_the_daemons_open_stdin_pipe(tmp
         os.dup2(saved, 0)
         for fd in (saved, rd, wr):
             os.close(fd)
+
+
+def _run_now(p, args, serve=True, monkeypatch=None):
+    """`ttp schedules <p> run ...` in a thread, the daemon's schedule step serving it (or not) meanwhile:
+    (exit code, stdout, stderr)."""
+    import contextlib
+    import io
+    import threading
+    from ttp import cli
+    from ttp.daemon import Daemon
+    out, err, code = io.StringIO(), io.StringIO(), []
+
+    def call():
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                cli.main(["schedules", p.name, "run", *args])
+                code.append(0)
+            except SystemExit as e:
+                code.append(e.code)
+    t = threading.Thread(target=call)
+    t.start()
+    d = Daemon(p.base)
+    d.gates = {}
+    end = time.time() + 30
+    while t.is_alive() and time.time() < end:
+        if serve:
+            d.run_schedules()
+        time.sleep(0.1)
+    t.join(5)
+    return code[0], out.getvalue(), err.getvalue()
+
+
+def test_ttp_schedules_run_runs_a_command_schedule_in_the_daemon_as_a_timed_run(env, tmp_path, monkeypatch):
+    """The daemon runs it with the usual runner: its observation lines come back on stdout, its exit
+    code is the command's, last_run is recorded and the observations are filed as from a timed run."""
+    from ttp import schedule as sched
+    p = make(env)
+    mark = tmp_path / "ran"
+    sched.upsert(p.db, "probe", "command", "1d", payload={
+        "command": f"echo $$ > {mark}; printf 'disk low on scratch\\nfan stalled on tray 2\\n'; exit 1",
+        "timeout_s": 30})
+    p.db.x("UPDATE schedules SET next_run=? WHERE name='probe'", (time.time() + 86400,))   # not due
+    monkeypatch.setenv("TTP_TASK", "4242")
+    code, out, err = _run_now(p, ["probe"])
+    assert code == 1 and out.splitlines() == ["disk low on scratch", "fan stalled on tray 2"], (out, err)
+    assert err.strip() == "exit 1", err
+    assert int(mark.read_text()) != os.getpid()   # run by the daemon's runner, never in this process
+    row = p.db.one("SELECT last_run, last_status, next_run FROM schedules WHERE name='probe'")
+    assert row["last_run"] and row["last_status"].startswith("ok (1 observation"), dict(row)
+    assert row["next_run"] > time.time() + 86000   # timed again from this run
+    assert p.db.q("SELECT id FROM issues WHERE source='watcher:probe'") or \
+        p.db.q("SELECT id FROM events WHERE source='watcher:probe'")
+    assert not list((p.state / "schedule-now").iterdir())   # its request files are gone
+
+
+def test_ttp_schedules_run_refuses_unknown_and_llm_schedules_with_one_line_and_runs_nothing(env):
+    from ttp import schedule as sched
+    p = make(env)
+    sched.upsert(p.db, "think", "llm", "1d", payload={"prompt": "look around"})
+    for name, why in (("nope", "no schedule 'nope'"), ("think", "is a llm schedule; only command schedules")):
+        code, out, err = _run_now(p, [name], serve=False)
+        assert code == 2 and out == "" and len(err.strip().splitlines()) == 1 and why in err, (name, out, err)
+    assert not (p.state / "schedule-now").exists() or not list((p.state / "schedule-now").iterdir())
+    code, out, err = _run_now(p, [], serve=False)
+    assert code and "usage: ttp schedules <name> run <schedule>" in err
+
+
+def test_a_forged_run_now_request_runs_only_a_command_schedule_from_the_config(env, tmp_path):
+    """The daemon checks the request itself: a name not in the config or an llm schedule is answered with
+    the refusal; a command in the request is never read."""
+    from ttp import schednow
+    from ttp import schedule as sched
+    from ttp.daemon import Daemon
+    p = make(env)
+    sched.upsert(p.db, "think", "llm", "1d", payload={"prompt": "look around"})
+    evil = tmp_path / "evil"
+    d = schednow.folder(p)
+    d.mkdir(parents=True)
+    ids = {}
+    for name in ("nope", "think", "../x"):
+        rid = ids[name] = f"1-{len(ids)}"
+        (d / f"{rid}.json").write_text(json.dumps({"schedule": name, "command": f"touch {evil}"}))
+        (d / f"{rid}.run").write_text("{}")   # what a claim leaves; pending() renames over it
+    dm = Daemon(p.base)
+    dm.gates = {}
+    dm.run_schedules()
+    for name, rid in ids.items():
+        res = json.loads((d / f"{rid}.out").read_text())
+        assert res["status"].startswith("refused: ") and res["rc"] is None, (name, res)
+    assert not evil.exists() and not dm._sched_runs
+    assert p.db.one("SELECT last_run FROM schedules WHERE name='think'")["last_run"] is None
+
+
+def test_ttp_schedules_run_from_a_sandbox_queues_for_the_daemon_and_says_so_when_none_serves(env, tmp_path,
+                                                                                              monkeypatch):
+    """The caller only queues a request; with no daemon taking it, it is withdrawn after the pickup wait
+    and the command never ran."""
+    from ttp import schednow
+    from ttp import schedule as sched
+    p = make(env)
+    mark = tmp_path / "ran"
+    sched.upsert(p.db, "probe", "command", "1h", payload={"command": f"touch {mark}", "timeout_s": 30})
+    monkeypatch.setattr(schednow, "PICKUP_S", 0.5)
+    code, out, err = _run_now(p, ["probe"], serve=False)
+    assert code == 75 and out == "" and "did not take the request" in err, err
+    assert not mark.exists() and not list(schednow.folder(p).iterdir())
+
+
+def test_a_run_now_request_joins_a_run_already_going_and_never_starts_a_second(env, tmp_path):
+    from ttp import schednow
+    from ttp import schedule as sched
+    from ttp.daemon import Daemon
+    p = make(env)
+    count = tmp_path / "count"
+    sched.upsert(p.db, "slow", "command", "1h", payload={"command": f"echo x >> {count}; sleep 4; echo done",
+                                                          "timeout_s": 30})
+    d = Daemon(p.base)
+    d.gates = {}
+    d.run_schedules()   # due now (never ran): started
+    assert "slow" in d._sched_runs
+    rid = schednow.request(p, "slow", None)
+    end = time.time() + 20
+    while not (schednow.folder(p) / f"{rid}.out").exists() and time.time() < end:
+        d.run_schedules()
+        time.sleep(0.1)
+    res = schednow.wait(p, rid, pickup_s=1, slack_s=1)
+    assert res == {"rc": 0, "stdout": "done", "status": res["status"]} and res["status"].startswith("ok"), res
+    assert count.read_text() == "x\n"
+
+
+def test_a_new_or_re_enabled_command_schedule_that_never_ran_runs_at_the_next_pass(env):
+    """Not a whole `every` (or a distant `at`) later; an llm schedule, or one that ran before, keeps its slot."""
+    from ttp import schedule as sched
+    p = make(env)
+    now = time.time()
+    sched.upsert(p.db, "cmd", "command", "1d", payload={"command": "true"})
+    sched.upsert(p.db, "cmdat", "command", "1d", at="03:00", payload={"command": "true"})
+    sched.upsert(p.db, "think", "llm", "1d", payload={"prompt": "x"})
+    nxt = {r["name"]: r["next_run"] for r in p.db.q("SELECT name, next_run FROM schedules")}
+    assert nxt["cmd"] <= time.time() and nxt["cmdat"] <= time.time() and nxt["think"] > now + 86000, nxt
+    assert {r["name"] for r in sched.due(p.db)} >= {"cmd", "cmdat"}
+    for how in ("web", "file"):
+        p.db.x("UPDATE schedules SET enabled=0, last_run=NULL, next_run=? WHERE name='cmd'", (now + 86400,))
+        if how == "web":
+            sched.set_enabled(p.db, "cmd", True)
+        else:
+            sched.upsert(p.db, "cmd", "command", "1d", payload={"command": "true"})
+        assert p.db.one("SELECT next_run FROM schedules WHERE name='cmd'")["next_run"] <= time.time(), how
+    p.db.x("UPDATE schedules SET enabled=0, last_run=?, next_run=? WHERE name='cmd'", (now - 3600, now + 86400))
+    sched.set_enabled(p.db, "cmd", True)   # it ran before: its slot stays
+    assert p.db.one("SELECT next_run FROM schedules WHERE name='cmd'")["next_run"] == now + 86400

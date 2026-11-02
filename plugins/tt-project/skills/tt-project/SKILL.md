@@ -93,6 +93,7 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 | record their machines (shared by all projects) | `ttp machines add <alias> --tags device,...` / `ttp machines list`; say in the charter which ones the project may use. Projects on other machines (`--host`) get a merged copy on add/remove, `ttp upgrade` and `ttp machines push` |
 | change caps | tell the coordinator, or `ttp config <name> budget.daily_usd 150` |
 | read a schedule | `ttp schedules <name> show <schedule>` (or `list`): read-only, writes nothing |
+| run a command schedule now | `ttp schedules <name> run <schedule>`: the daemon runs it as a timed run (records last_run), also for a sandboxed worker; prints its output, exits with its code |
 | keep schedules in git | `ttp schedules <name> --export --yes` once (it moves them into the harness and commits): `harness/schedules.json` then holds them, the daemon applies edits to it, and every change is a harness commit |
 | restart after trouble | `ttp restart <name>`, then `ttp doctor <name>` |
 | stop for good | `ttp stop <name>` (removes the service; data stays; running workers finish) |

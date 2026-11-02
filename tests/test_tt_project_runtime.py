@@ -40426,7 +40426,8 @@ def test_a_schedule_at_fires_at_the_same_home_time_across_dst_and_shows_its_abbr
     assert sched.next_run(86400, "09:00", _utc(2026, 10, 31, 17, 0), la) == _utc(2026, 11, 1, 17, 0)  # 09:00 PST
     p = make(env)
     p.set_config("home_timezone", la)
-    sched.upsert(p.db, "morning", "command", "1d", "09:00", payload={"command": "true"}, home=la)
+    # An llm schedule: a command schedule that never ran runs at the next pass instead (first_run).
+    sched.upsert(p.db, "morning", "llm", "1d", "09:00", payload={"prompt": "x"}, home=la)
     row = p.db.one("SELECT * FROM schedules WHERE name='morning'")
     assert row["tz"] is None   # follows the home zone
     from datetime import datetime

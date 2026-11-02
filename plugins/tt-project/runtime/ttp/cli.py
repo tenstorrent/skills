@@ -7182,6 +7182,35 @@ def cmd_memory(a) -> None:
         sys.exit("\n".join(errors))
 
 
+def _schedule_run(p, name: str | None) -> int:
+    """`ttp schedules <p> run <schedule>`: the daemon runs that command schedule now (schednow), never this
+    process, so it works from a worker sandbox. Prints the command's output (its observation lines) and
+    exits with its exit code; a run with no exit code (a timeout, a heal check only) prints its status on
+    stderr and exits 1. Refusals and a daemon that does not answer: one line on stderr, exit 2 or 75."""
+    from . import schednow
+    if not name:
+        die("usage: ttp schedules <name> run <schedule>")
+    if why := schednow.refusal(p.db.one("SELECT * FROM schedules WHERE name=?", (name,)), name):
+        print(f"ttp schedules run: {why}", file=sys.stderr)
+        return 2
+    res = schednow.wait(p, schednow.request(p, name, os.environ.get("TTP_TASK")))
+    if res.get("error"):
+        print(f"ttp schedules run: {res['error']}", file=sys.stderr)
+        return 75
+    status = str(res.get("status") or "")
+    if status.startswith("refused: "):
+        print(f"ttp schedules run: {status[9:]}", file=sys.stderr)
+        return 2
+    if res.get("stdout"):
+        print(res["stdout"])
+    rc = res.get("rc")
+    if not isinstance(rc, int) or sched.failing(status):
+        print(f"exit {rc if isinstance(rc, int) else 'none'}: {status}", file=sys.stderr)
+    else:
+        print(f"exit {rc}", file=sys.stderr)
+    return rc if isinstance(rc, int) else 1
+
+
 def cmd_schedules(a) -> None:
     """Read-only by default (list, show). Only --export writes: it moves the schedules into
     harness/schedules.json and commits it, so it is confirmed first."""
@@ -7204,6 +7233,8 @@ def cmd_schedules(a) -> None:
         print(f"moved the schedules into {path} and committed it; from now on it holds them "
               "and every change to them is a harness commit")
         return
+    if a.action == "run":
+        sys.exit(_schedule_run(p, a.schedule))
     if a.action == "show":
         if not a.schedule:
             die("usage: ttp schedules <name> show <schedule>")
@@ -10857,11 +10888,13 @@ def main(argv: list[str] | None = None) -> None:
                    help="show what would be added, retired or moved (--settle); write and commit nothing")
     s.set_defaults(fn=cmd_memory)
 
-    s = sub.add_parser("schedules", help="list or show schedules (read-only); --export moves them into the harness")
+    s = sub.add_parser("schedules", help="list or show schedules (read-only), or run a command schedule now; "
+                                         "--export moves them into the harness")
     s.add_argument("name", help="the project")
-    s.add_argument("action", nargs="?", choices=["list", "show"], default="list",
-                   help="list (default) or show <schedule>: read-only, writes nothing")
-    s.add_argument("schedule", nargs="?", help="the schedule to show")
+    s.add_argument("action", nargs="?", choices=["list", "show", "run"], default="list",
+                   help="list (default) or show <schedule>: read-only, writes nothing. run <schedule>: the daemon "
+                        "runs that command schedule now, as a timed run, and this prints its output and exit code")
+    s.add_argument("schedule", nargs="?", help="the schedule to show or run")
     s.add_argument("--export", action="store_true",
                    help="MOVES the schedules into harness/schedules.json and COMMITS it; that file then holds "
                         "them. Asks first; needs --yes when not interactive. To only read, use show")

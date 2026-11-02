@@ -58,6 +58,9 @@ class Run:
         self.stopped = False   # it unwound on Stopped: nothing to record
         self.groups: dict[int, str | None] = {}   # pgid -> its leader's start token
         self.db: Any = None
+        self.requests: list[str] = []   # `ttp schedules <p> run` requests waiting on this run (schednow)
+        self.rc: int | None = None   # its command's exit code and stdout, once it ran (for those requests)
+        self.stdout = ""
 
 
 def current() -> Run | None:

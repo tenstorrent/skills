@@ -121,7 +121,7 @@ def upsert(db: DB, name: str, kind: str, every: str | int, at: str | None = None
     same_at = bool(existing) and (existing["at"] or None) == at
     tz = existing.get("tz") if same_at else None
     keep = existing and existing["next_run"] and same_at and not reenabled(existing, enabled)
-    nxt = existing["next_run"] if keep else next_run(every_s, at, time.time(), zone_of({"tz": tz}, home))
+    nxt = existing["next_run"] if keep else first_run(kind, existing, every_s, at, zone_of({"tz": tz}, home))
     db.x("INSERT INTO schedules(name,kind,every_s,at,enabled,budget_usd_day,description,payload,next_run,tz) "
          "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET kind=excluded.kind, every_s=excluded.every_s, "
          "at=excluded.at, enabled=excluded.enabled, budget_usd_day=excluded.budget_usd_day, "
@@ -142,8 +142,22 @@ def _end_mutes(db: DB, names: list[str], why: str, home: str | None) -> None:
 
 def reenabled(row: dict, enabled: bool, now: float | None = None) -> bool:
     """A disabled schedule turned on again with its next run in the past: it starts from its next
-    slot from now, so the time it was off is no missed runs (missed) and no burst of catch-up."""
-    return bool(enabled) and not row["enabled"] and float(row["next_run"] or 0) <= (now or time.time())
+    slot from now, so the time it was off is no missed runs (missed) and no burst of catch-up. A
+    command schedule that never ran is re-timed too, whenever its next run is (first_run)."""
+    if not enabled or row["enabled"]:
+        return False
+    return float(row["next_run"] or 0) <= (now or time.time()) or (row["kind"] == "command" and not row["last_run"])
+
+
+def first_run(kind: str, row: dict | None, every_s: int, at: str | None, tz: str | None,
+              now: float | None = None) -> float:
+    """When a new, changed or re-enabled schedule runs next: a command schedule that never ran (no
+    last_run) at the next daemon pass, not a whole `every` (or a distant `at`) later; others at their
+    next slot from now."""
+    now = time.time() if now is None else now
+    if kind == "command" and not (row and row.get("last_run")):
+        return now
+    return next_run(every_s, at, now, tz)
 
 
 def set_enabled(db: DB, name: str, enabled: bool, home: str | None = None) -> None:
@@ -151,7 +165,7 @@ def set_enabled(db: DB, name: str, enabled: bool, home: str | None = None) -> No
     row = db.one("SELECT * FROM schedules WHERE name=?", (name,))
     if row is None:
         return
-    nxt = next_run(int(row["every_s"]), row["at"], time.time(), zone_of(row, home)) \
+    nxt = first_run(row["kind"], row, int(row["every_s"]), row["at"], zone_of(row, home)) \
         if reenabled(row, enabled) else row["next_run"]
     db.x("UPDATE schedules SET enabled=?, next_run=? WHERE name=?", (int(bool(enabled)), nxt, name))
     if not enabled:
