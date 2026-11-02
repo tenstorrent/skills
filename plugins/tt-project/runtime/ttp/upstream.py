@@ -267,14 +267,15 @@ def note_id(to: str, text: str) -> str:
 
 def send(source: str, task: int | None, to: str, text: str, severity: str = "normal",
          now: float | None = None, sender: str = "worker", at: str | None = None,
-         extra: dict | None = None, back: str | None = None) -> str:
+         extra: dict | None = None, back: str | None = None, confirms: str | None = None) -> str:
     """File a worker's note for project `to` in this machine's inbox. Returns "sent", "duplicate" (the
     same text to the same project is already there) or "limited" (`source` filed NOTES_PER_HOUR
     addressed notes in the last hour). `at`: the forward target that runs `to` when this machine's
     registry does not know it (`find_peer`); the forwarder sends the note there. `back`: the machine a
     reply goes back to on its own next call here (`reply_route`), never sent from here. `sender` "daemon": the source project's daemon routed it, model-free
     (machine_ledger.py); such a page is not limited and does not count against the workers' notes, and
-    `extra` (a daemon's only) adds fields such as an `outage` record (outagetask.py) the target files."""
+    `extra` (a daemon's only) adds fields such as an `outage` record (outagetask.py) the target files.
+    `confirms`: the fingerprint of a note `to` resolved, which this note only confirms (`confirmation`)."""
     now = now or time.time()
     # A daemon's page is cut, saying so; a worker's note past the limit raises (`note_text`).
     text = note_text(cut(" ".join(str(text).split()), "the source daemon's log") if sender == "daemon" else text)
@@ -297,6 +298,7 @@ def send(source: str, task: int | None, to: str, text: str, severity: str = "nor
                              "from": "daemon" if sender == "daemon" else "worker", "to": to, "severity": severity if severity in NOTE_SEVERITIES
                              else "normal", "title": title, "spec": text, "fp": fp, **({"at": at} if at else {}),
                              **({"back": back} if back and not at else {}),
+                             **({"confirms": _confirms(confirms)} if _confirms(confirms) and sender != "daemon" else {}),
                              **({k: v for k, v in extra.items() if k in ("outage", "page_fp")}
                                 if extra and sender == "daemon" else {})},
                             sort_keys=True) + "\n").encode())
@@ -339,7 +341,8 @@ def outbox_pending(state: Path) -> int:
 
 
 def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str, severity: str = "normal",
-                  now: float | None = None, at: str | None = None, back: str | None = None) -> tuple[str, int]:
+                  now: float | None = None, at: str | None = None, back: str | None = None,
+                  confirms: str | None = None) -> tuple[str, int]:
     """`send`, except that a note past the hourly limit, or behind notes already waiting, is appended to
     the project's outbox (state/OUTBOX_FILE) for its daemon to file in order as the limit allows
     (`drain_outbox`): the limit caps how fast notes reach the inbox, never the worker that wrote one.
@@ -354,7 +357,7 @@ def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str
             if n["fp"] == fp:
                 return "queued", i
         if not waiting:
-            got = send(source, task, to, text, severity, now, at=at, back=back)
+            got = send(source, task, to, text, severity, now, at=at, back=back, confirms=confirms)
             if got != "limited":
                 return got, 0
         elif _filed(fp):
@@ -364,7 +367,8 @@ def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str
         box = Path(state) / OUTBOX_FILE
         durable_append(box, json.dumps(
             {"ts": now, "task": task, "to": to, "text": text, "fp": fp, **({"at": at} if at else {}),
-             **({"back": back} if back and not at else {}), "severity": severity if severity in NOTE_SEVERITIES else "normal"}, sort_keys=True) + "\n")
+             **({"back": back} if back and not at else {}), **({"confirms": _confirms(confirms)} if _confirms(confirms) else {}),
+             "severity": severity if severity in NOTE_SEVERITIES else "normal"}, sort_keys=True) + "\n")
         return "queued", len(waiting) + 1
 
 
@@ -392,7 +396,7 @@ def drain_outbox(state: Path, source: str, now: float | None = None) -> tuple[in
         while waiting:
             n = waiting[0]
             if send(source, n.get("task"), n["to"], n["text"], str(n.get("severity") or "normal"), now,
-                    at=_at(n), back=_at(n, "back")) == "limited":
+                    at=_at(n), back=_at(n, "back"), confirms=_confirms(n.get("confirms"))) == "limited":
                 break
             waiting.pop(0)
             filed += 1
@@ -423,13 +427,19 @@ def _at(n: dict, key: str = "at") -> str | None:
     return at if isinstance(at, str) and at else None
 
 
+def _confirms(fp) -> str | None:
+    """A note's `confirms` marker (`ttp note --confirms`): a note fingerprint, or None."""
+    return fp if isinstance(fp, str) and re.fullmatch(r"[0-9a-f]{16}", fp) else None
+
+
 def queue(run_dir: Path, to: str, text: str, severity: str = "normal", at: str | None = None,
-          back: str | None = None) -> None:
+          back: str | None = None, confirms: str | None = None) -> None:
     """Keep a worker's note for project `to` in its run's directory, for a worker whose sandbox cannot
     write the inbox: its daemon files it with `send_queued` when the run ends."""
     check_placeholder(text)
     line = json.dumps({"to": to, "text": note_text(text), "severity": severity, **({"at": at} if at else {}),
-                       **({"back": back} if back and not at else {})}, sort_keys=True) + "\n"
+                       **({"back": back} if back and not at else {}),
+                       **({"confirms": _confirms(confirms)} if _confirms(confirms) else {})}, sort_keys=True) + "\n"
     fd = os.open(Path(run_dir) / QUEUED_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         os.write(fd, line.encode())
@@ -463,9 +473,11 @@ def send_queued(run_dir: Path, source: str, task: int | None, state: Path | None
         sev = str(n.get("severity") or "normal")
         try:
             if state is None:
-                got[send(source, task, to, text, sev, at=_at(n), back=_at(n, "back"))] += 1
+                got[send(source, task, to, text, sev, at=_at(n), back=_at(n, "back"),
+                         confirms=_confirms(n.get("confirms")))] += 1
             else:
-                r = send_or_queue(state, source, task, to, text, sev, at=_at(n), back=_at(n, "back"))[0]
+                r = send_or_queue(state, source, task, to, text, sev, at=_at(n), back=_at(n, "back"),
+                                  confirms=_confirms(n.get("confirms")))[0]
                 got["limited" if r == "full" else r] += 1
         except (NoteTooLong, NotePlaceholder):
             got["invalid"] += 1   # `queue` refuses these: only a line written past it holds one
@@ -615,6 +627,9 @@ def _file(p: project.Project, sources, offsets: dict, known: set, seen: list, no
             seen.append(n["fp"])
             if not to and (n.get("project"), n.get("host")) == me:
                 continue      # this project's own notes reached its coordinator with the hand-off
+            if to and n.get("from") == "worker" and _close_confirmation(p, n, now):
+                added += 1
+                continue
             sev, text = _event(n, cap)
             if n.get("project") and (n["project"], n.get("host")) != me:
                 routes[n["fp"]] = _route(n, src, now)
@@ -658,6 +673,47 @@ REPLY_BACK_MAX = 50             # replies one answer carries (the latest)
 REPLY_WATCH_S = 7 * 86400       # how long after its last addressed note a sender asks a target for replies
 BACK_FILE = "upstream-back.json"   # in the user's tt-project home: {"carried": {fp: when an answer first carried it}}
 CARRIED_KEPT = 1000
+
+
+CONFIRMATION = "confirmation, not a bug"
+
+
+def confirmation(n: dict, name: str, recs: list[dict] | None = None) -> str | None:
+    """The note a received note only confirms, when it is marked so (`ttp note --confirms <fp>`) and
+    that note has a release fix here that project `name` (or a hand run) recorded, with no later
+    wontfix or regression; else None. Only the marker counts, never the note's words."""
+    fp = _confirms(n.get("confirms"))
+    if not fp:
+        return None
+    recs = _records() if recs is None else recs
+    res = resolution(fp, recs)
+    if not res or res.get("by") not in (None, "", name) or wontfixed(fp, recs) or regression(fp, recs):
+        return None
+    return fp
+
+
+def _close_confirmation(p: project.Project, n: dict, now: float) -> bool:
+    """A marked confirmation of a fix `p` shipped: closed model-free as CONFIRMATION (the sender's ack
+    is the receipt) and kept as a handled event, which wakes no coordinator. False to file it as usual."""
+    try:
+        fp = confirmation(n, p.name)
+        if not fp:
+            return False
+        wontfix(n["fp"], f"{CONFIRMATION}: confirms the fix of note {fp}", p.name, now)
+    except (OSError, ValueError):
+        return False   # not recorded: the coordinator gets it as any other note
+    from .coordinator import EVENT_CHARS_BY_KIND
+    cap = EVENT_CHARS_BY_KIND["upstream_note"]
+    text = f"closed model-free as {CONFIRMATION}: " + _event(n, cap)[1]
+    p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+           (now, "upstream", "upstream_note", None, "low", text[:cap], "handled"))
+    return True
+
+
+def confirmations_closed(name: str, since: float = 0.0) -> int:
+    """How many received notes project `name` closed model-free as CONFIRMATION at or after `since`."""
+    return sum(1 for r in _records() if r.get("kind") == "wontfix" and r.get("by") == name
+               and str(r.get("note") or "").startswith(CONFIRMATION) and float(r.get("ts") or 0) >= since)
 
 
 def _route(n: dict, src: str, now: float) -> dict:
@@ -1604,7 +1660,8 @@ def _valid(n) -> dict | None:
     out = {"ts": ts, "project": n["project"], "host": n["host"], "task": task, "title": title, "spec": spec, "fp": fp}
     if to is not None:
         sev = n.get("severity")
-        out.update({"to": to, "from": "worker", "severity": sev if sev in NOTE_SEVERITIES else "normal"})
+        out.update({"to": to, "from": "worker", "severity": sev if sev in NOTE_SEVERITIES else "normal",
+                    **({"confirms": n["confirms"]} if _confirms(n.get("confirms")) else {})})
     return out
 
 

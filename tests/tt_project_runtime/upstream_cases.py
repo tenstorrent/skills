@@ -784,3 +784,98 @@ def test_ordinary_note_text_is_not_taken_for_a_placeholder(env, monkeypatch, cap
     upstream.set_forward_to(["farbox"])
     assert _note(cli, "--to", "alpha@farbox", text) == 0, capsys.readouterr().err
     assert _upstream_inbox(env)[-1]["spec"].startswith(" ".join(text.split()))
+
+
+def _confirm_pair(env):
+    """A sending project and a second project on this machine that fixed note `fp` in release 0.2.1."""
+    from ttp import upstream
+    from ttp.cli import bootstrap
+    from ttp.project import register
+    src = make(env)
+    repo2 = env["tmp"] / "repo2"
+    subprocess.run(["git", "clone", "-q", str(env["repo"]), str(repo2)], check=True)
+    dst = bootstrap(repo2, "second", "Another project.", "fake")
+    register("second", {"host": "testhost", "dir": str(dst.root)})
+    fp = upstream.fingerprint("upstream: gh fails in the sandbox", "the proxy host does not resolve")
+    upstream.resolve(fp, "0.2.1", "proxy host rewritten", "second")
+    return src, dst, fp
+
+
+def _queued_notes(p):
+    return [dict(r) for r in p.db.q("SELECT severity, text, status FROM events WHERE kind='upstream_note'")]
+
+
+def test_a_confirmation_is_the_senders_ack_and_closes_on_the_fixing_project_with_no_coordinator_wake(
+        env, monkeypatch, capsys):
+    """`ttp note --confirms <fp>` records the sender's ack (the fixing project's receipt) and sends no note.
+    With --to the note goes marked; the fixing project closes it model-free as 'confirmation, not a bug',
+    as a handled event that wakes no coordinator, and its daily review counts it."""
+    from ttp import audit, cli, upstream
+    src, dst, fp = _confirm_pair(env)
+    _note_run(env, monkeypatch, src)
+    assert _note(cli, "--confirms", fp, "gh works from a worker on 0.2.1") == 0
+    assert "no note to it is needed" in capsys.readouterr().out
+    assert upstream.state(fp) == "closed" and upstream.acked(fp)["project"] == src.name
+    assert not (env["home"] / "upstream.jsonl").exists(), "the ack alone is the receipt"
+    # tt-project's maintainers: also only the ack.
+    assert _note(cli, "--to", "tt-project", "--confirms", fp, "still works") == 0
+    assert not (env["home"] / "upstream.jsonl").exists()
+    assert _note(cli, "--to", "second", "--confirms", fp, "confirmed on 0.2.1: gh works") == 0
+    (n,) = _upstream_inbox(env)
+    assert n["confirms"] == fp
+    assert upstream.ingest(dst, dst.config()) == 1
+    (ev,) = _queued_notes(dst)
+    assert ev["status"] == "handled" and ev["severity"] == "low" and upstream.CONFIRMATION in ev["text"], ev
+    assert upstream.wontfixed(n["fp"])["note"].startswith(upstream.CONFIRMATION)
+    assert upstream.confirmations_closed("second", time.time() - 60) == 1
+    assert any("confirmation notes closed model-free" in x and x.endswith(": 1")
+               for x in audit.lines(dst.db, p=dst)), audit.lines(dst.db, p=dst)
+    # An fp that has no fix here is refused whole: nothing recorded, nothing sent.
+    other = "0123456789abcdef"
+    assert _note(cli, "--to", "second", "--confirms", other, "works") == 2
+    assert len(_upstream_inbox(env)) == 1 and not upstream.acked(other)
+
+
+def test_a_confirmation_marker_survives_the_outbox_the_run_queue_and_forwarding(env, monkeypatch):
+    """The marker travels every path an addressed note takes: the run's queue, the outbox past the hourly
+    limit, and a forwarded line checked by `_valid`; a malformed marker is dropped, never filed."""
+    from ttp import upstream
+    src, dst, fp = _confirm_pair(env)
+    run_dir = _note_run(env, monkeypatch, src)
+    upstream.queue(run_dir, "second", "works via the run queue", confirms=fp)
+    upstream.send_queued(run_dir, src.name, 57, src.state)
+    for i in range(upstream.NOTES_PER_HOUR + 1):
+        upstream.send_or_queue(src.state, src.name, 57, "second", f"works {i}", confirms=fp)
+    assert all(n.get("confirms") == fp for n in upstream._outbox(src.state))
+    upstream.drain_outbox(src.state, src.name, time.time() + 7200)
+    notes = _upstream_inbox(env)
+    assert len(notes) == upstream.NOTES_PER_HOUR + 2 and all(n.get("confirms") == fp for n in notes)
+    assert upstream._valid(notes[0])["confirms"] == fp
+    assert "confirms" not in upstream._valid({**notes[0], "confirms": "not-a-fingerprint"})
+    assert upstream.send(src.name, 57, "second", "bad marker", now=time.time() + 4 * 3600, confirms="../x") == "sent"
+    assert "confirms" not in _upstream_inbox(env)[-1]
+
+
+def test_a_confirmation_that_also_reports_a_problem_still_wakes_the_coordinator(env, monkeypatch):
+    """Only the marker of a clean fix here closes a note: words alone never do, nor a marker of a note
+    with no release fix, one resolved by another project, one closed as wontfix, or one the sender
+    reports regressed. Each of those still raises its event as before."""
+    from ttp import upstream
+    src, dst, fp = _confirm_pair(env)
+    unfixed = upstream.fingerprint("upstream: x", "not fixed")
+    theirs = upstream.fingerprint("upstream: y", "fixed elsewhere")
+    upstream.resolve(theirs, "0.2.1", "", "third")
+    dropped = upstream.fingerprint("upstream: z", "won't fix")
+    upstream.resolve(dropped, "0.2.1", "", "second")
+    upstream.wontfix(dropped, "not a bug", "second")
+    upstream.send(src.name, 57, "second", f"Confirmed on 0.2.1, note {fp} acked. New problem: gh times out.")
+    for i, c in enumerate((unfixed, theirs, dropped)):
+        upstream.send(src.name, 57, "second", f"confirms {i}", confirms=c)
+    assert upstream.ingest(dst, dst.config()) == 4
+    assert [e["status"] for e in _queued_notes(dst)] == ["queued"] * 4
+    # The sender confirms, then finds the fix does not hold: its regression keeps the note an event.
+    upstream.regress(fp, "gh fails again after a restart", src.name)
+    upstream.send(src.name, 57, "second", "it held at first", confirms=fp)
+    assert upstream.ingest(dst, dst.config()) == 1
+    assert _queued_notes(dst)[-1]["status"] == "queued"
+    assert upstream.confirmations_closed("second") == 0

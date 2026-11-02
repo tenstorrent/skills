@@ -592,6 +592,12 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
             q = 0
         if q:
             out.append(f"upstream fixes confirmed by quiet: {q}")
+        try:
+            c = upstream.confirmations_closed(p.name, since)
+        except OSError:
+            c = 0
+        if c:
+            out.append(f"confirmation notes closed model-free ({upstream.CONFIRMATION}): {c}")
         from . import restriction_audit
         least = int((p.config().get("review") or {}).get("rule_blocks_min", restriction_audit.BLOCKS_MIN))
         out += restriction_audit.only_blocks_lines(p, now, least)

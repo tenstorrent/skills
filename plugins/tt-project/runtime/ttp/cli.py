@@ -1982,7 +1982,10 @@ def cmd_note(a) -> None:
         die("ttp note only works inside a tt-project run")
     if getattr(a, "reply", None) and a.to:
         die("ttp note: --reply answers the note's sender by its own route; leave out --to", 2)
-    if a.to or getattr(a, "reply", None):
+    if getattr(a, "confirms", None):
+        if _note_confirms(a, run_dir):   # the ack is the receipt; a note goes only when --to or --reply asks
+            _note_to(a, run_dir)
+    elif a.to or getattr(a, "reply", None):
         _note_to(a, run_dir)
     durable_append(Path(run_dir) / "progress.md", f"{timefmt.clock()} {a.text}\n")
     from . import upstream
@@ -2041,6 +2044,32 @@ def cmd_notify(a) -> None:
     print("queued for the user: it is sent when this run ends; say so in the hand-off")
 
 
+def _note_confirms(a, run_dir: str) -> bool:
+    """`ttp note --confirms <fp> "<evidence>"`: the fix of note FP works here. Records this project's ack
+    of it (upstream.ack, queued in the run when the sandbox cannot write it), which the fixing project
+    reads model-free: that is its receipt. True only with --to or --reply, whose note then goes marked as a
+    confirmation, which the receiving project closes without a coordinator turn (upstream.confirmation)."""
+    from . import upstream
+    base = os.environ.get("TTP_PROJECT")
+    me = Project(base) if base else None
+    if not me or not me.exists():
+        die("ttp note --confirms: this run has no project (TTP_PROJECT)")
+    try:
+        a.confirms = upstream._check_fp(a.confirms)
+        try:
+            upstream.ack(a.confirms, me.name, a.text)
+            how = "recorded"
+        except OSError as e:
+            upstream.queue_ack(Path(run_dir), a.confirms, a.text)
+            how = f"queued in this run's directory ({e.strerror or e}); this project's daemon records it when the run ends"
+    except ValueError as e:
+        die(f"ttp note --confirms: {e}. Nothing was recorded or sent", 2)
+    print(f"ack of note {a.confirms} {how}: the fixing project reads it as its receipt, model-free"
+          + ("" if a.to or getattr(a, "reply", None) else "; no note to it is needed")
+          + ". A new problem goes in its own note, without --confirms")
+    return bool(a.to or getattr(a, "reply", None))
+
+
 def _note_to(a, run_dir: str) -> None:
     """`ttp note --to <project>`: a worker's note for another project, filed in the user's upstream
     inbox with this run's project and task (upstream.send); one on another machine is sent on there by
@@ -2072,6 +2101,8 @@ def _note_to(a, run_dir: str) -> None:
         die(f"project {a.to} runs on another machine, and upstream.forward_to does not send notes there. "
             f"Put the note in the hand-off as a follow-up titled `upstream: ...` instead")
     if not routed and not far and not local_project(a.to) and a.to == upstream.MAINTAINERS:
+        if getattr(a, "confirms", None):
+            return   # the ack recorded is the maintainers' receipt
         return _note_upstream(a, me)
     if not a.text.strip():
         die("empty note")
@@ -2103,11 +2134,12 @@ def _note_to(a, run_dir: str) -> None:
     task = os.environ.get("TTP_TASK") or ""
     try:
         got, place = upstream.send_or_queue(me.state, me.name, int(task) if task.isdigit() else None, a.to,
-                                            text, a.severity, at=at, back=back)
+                                            text, a.severity, at=at, back=back,
+                                            confirms=getattr(a, "confirms", None))
     except OSError as e:
         # A sandbox that cannot write the inbox (read-only home): the run's directory keeps the note,
         # and this project's daemon files it when the run ends (upstream.send_queued).
-        upstream.queue(Path(run_dir), a.to, text, a.severity, at=at, back=back)
+        upstream.queue(Path(run_dir), a.to, text, a.severity, at=at, back=back, confirms=getattr(a, "confirms", None))
         print(f"note for {a.to} queued in this run's directory ({e.strerror or e}); this project's daemon files "
               f"it in its inbox as {upstream.note_id(a.to, text)} when the run ends{sent}")
         return
@@ -2291,7 +2323,8 @@ def cmd_upstream(a) -> None:
                     print(f"ack of note {fp.strip().lower()} queued in this run's directory ({e.strerror or e}); this "
                           f"project's daemon records it when the run ends")
                     return
-                print(f"note {fp.strip().lower()} closed for {p.name}")
+                print(f"note {fp.strip().lower()} closed for {p.name}; the fixing project reads this ack as its "
+                      f"receipt: send it no separate note to confirm")
                 return
             for line in upstream.listing(p.name) or [f"{p.name} filed no upstream note on this machine"]:
                 print(line)
@@ -10018,6 +10051,10 @@ def main(argv: list[str] | None = None) -> None:
                         "even when that project is not in `ttp list`")
     s.add_argument("--severity", choices=["low", "normal", "high"], default="normal",
                    help="with --to: the severity of the event the other project's coordinator gets")
+    s.add_argument("--confirms", metavar="FP",
+                   help="the fix of upstream note FP works here; the text is the evidence. Records this project's "
+                        "ack, the fixing project's model-free receipt, and sends no note; with --to or --reply the "
+                        "note goes marked as only a confirmation, closed there without a coordinator turn")
     s.add_argument("--status", metavar="ID",
                    help="where note ID (printed by --to) stands: queued, filed-local, forwarded (in the inbox of the "
                         "machine that runs the project) or delivered (the project read it); exit 0 once delivered, "
