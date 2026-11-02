@@ -357,11 +357,13 @@ class Provider:
         """`argv` that also loads the MCP servers in the config file `path`; unchanged if unsupported."""
         return argv
 
-    def mcp_args(self, names: list[str], dirs: list[str], argv: list[str]) -> tuple[list[str], dict, list[str]] | None:
+    def mcp_args(self, names: list[str], dirs: list[str], argv: list[str],
+                 environ: dict | None = None) -> tuple[list[str], dict, list[str]] | None:
         """For an agent that takes a worker's MCP servers as arguments, not a config file: the arguments
         that give the worker launched with `argv` exactly the servers `names` (looked up for `dirs`),
         the environment holding their secrets (never logged) and the names it cannot give, each with
-        why. Called only when mcp_by_args is set."""
+        why (a server whose secrets would change `environ`, the worker's environment, among them).
+        Called only when mcp_by_args is set."""
         return None
 
     def connector_env(self, keep: bool) -> dict[str, str]:

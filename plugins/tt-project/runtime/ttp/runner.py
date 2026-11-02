@@ -352,7 +352,9 @@ def supervise(run_dir: Path) -> int:
     argv, env_extra, cwd = spec["argv"], spec.get("env", {}), spec["cwd"]
     timeout_s, budget = float(spec.get("timeout_s", 3600)), spec.get("budget_usd")
     stall_s = float(spec.get("stall_s") or 0)
-    env = {**os.environ, **env_extra, **_env_files(spec)}
+    # The secret files go under the daemon's environment: a server's env never changes the worker's
+    # PATH, PYTHONPATH, TTP_* or device mask.
+    env = {**os.environ, **_env_files(spec), **env_extra}
     lease, out_path = run_dir / "lease", run_dir / "output.jsonl"
     started = time.time()
     if spec.get("pin") and not stop_reason(run_dir):

@@ -228,13 +228,13 @@ class Codex(Provider):
             out += self._hook_for(self._hook_held_by_user_config, user_config=False)
         return out
 
-    def mcp_args(self, names, dirs, argv):
+    def mcp_args(self, names, dirs, argv, environ=None):
         # The servers go in as `-c` (codexmcp.py); a worker still reading config.toml gets the user's
         # other servers turned off.
         from . import codexmcp
         isolated = IGNORE_USER_CONFIG in argv
         users = [] if isolated else codexmcp.user_server_names(_read(codex_home() / "config.toml"))
-        return codexmcp.run_args(names, dirs, users, isolated)
+        return codexmcp.run_args(names, dirs, users, isolated, inherited=environ)
 
     def mcp_check(self, names: list[str], dirs: list[str], isolated: bool) -> tuple[dict[str, bool] | None, list[str]]:
         """The servers a worker would get, as `codex mcp list --json` reads its arguments ({name:

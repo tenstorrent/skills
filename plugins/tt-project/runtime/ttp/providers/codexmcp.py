@@ -31,6 +31,26 @@ HTTP_TYPES = ("http", "streamable-http", "streamable_http")
 BEARER_RE = re.compile(r"\s*Bearer\s+(.*\S)\s*$", re.I)
 
 
+# Variables the daemon sets in every worker's environment once its servers are chosen (start_run).
+HARNESS_VARS = ("PATH", "PYTHONPATH", "TMPDIR", "TMP", "TEMP", "VIRTUAL_ENV")
+HARNESS_PREFIXES = ("TTP_", "GIT_CONFIG_")
+
+
+def overridden(env: dict[str, str], inherited) -> str | None:
+    """The first variable of a server's environment `env` that would change the worker's own: one
+    `inherited` (the worker's environment) holds with another value, or one the harness sets (the
+    device mask included) to a value `inherited` does not already hold. A stdio server's env is the
+    whole worker's, as Codex starts the server from it."""
+    from ..devq import DEVICE_MASK, MASK_RECORD
+    for k, v in env.items():
+        ours = k.startswith("TTP_MCP_")   # a name translate made for a header's value
+        harness = not ours and (k in HARNESS_VARS or k.startswith(HARNESS_PREFIXES)
+                                or k in DEVICE_MASK or k == MASK_RECORD)
+        if inherited.get(k, v) != v or (harness and inherited.get(k) != v):
+            return k
+    return None
+
+
 class Unset(ValueError):
     """A `${VAR}` with no default names a variable that is not set."""
 
@@ -165,13 +185,15 @@ def translate(name: str, entry: dict, environ) -> tuple[dict, dict[str, str]]:
 
 
 def run_args(names: list[str], dirs: list[str], user_names: list[str], isolated: bool,
-             environ=None) -> tuple[list[str], dict[str, str], list[str]]:
+             environ=None, inherited=None) -> tuple[list[str], dict[str, str], list[str]]:
     """(`-c` arguments, secret environment, names Codex will not run, each with why) for a worker
     that gets exactly the servers `names`. `user_names`: the servers the user's config.toml
-    defines, which load unless `isolated`."""
+    defines, which load unless `isolated`. `environ` expands `${VAR}`; `inherited` is the worker's
+    environment (default `environ`), which no server may change."""
     if not names:
         return [], {}, []
     environ = os.environ if environ is None else environ
+    inherited = environ if inherited is None else inherited
     project = project_servers(dirs)
     tables: dict = {}
     secrets: dict[str, str] = {}
@@ -187,6 +209,9 @@ def run_args(names: list[str], dirs: list[str], user_names: list[str], isolated:
                 continue
             except ValueError as e:
                 unknown.append(f"{name} ({e})")
+                continue
+            if key := overridden(env, inherited):
+                unknown.append(f"{name} (its env {key} would change the worker's own)")
                 continue
             if clash := [k for k in env if secrets.get(k, env[k]) != env[k]]:
                 unknown.append(f"{name} (its {clash[0]} differs from another listed server's)")

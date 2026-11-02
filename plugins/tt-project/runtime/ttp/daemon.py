@@ -2634,7 +2634,8 @@ class Daemon:
             elif prov.connector_env(False):
                 env = {**env, **prov.connector_env(self._connectors_needed(prov, provider))}
             if prov.mcp_by_args:
-                got, mcp_env, unknown = prov.mcp_args(self._mcp_names(provider), self._mcp_dirs(cwd), argv + extra)
+                got, mcp_env, unknown = prov.mcp_args(self._mcp_names(provider), self._mcp_dirs(cwd), argv + extra,
+                                                      {**os.environ, **env})
                 extra += got
                 if unknown:
                     self.alert(f"mcp_servers_unknown:{provider}",

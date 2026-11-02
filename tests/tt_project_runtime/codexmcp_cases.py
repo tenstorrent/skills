@@ -233,3 +233,58 @@ def test_providers_doc_names_codex_per_run_mcp_servers():
     row = next(line for line in doc.splitlines() if line.startswith("| Isolation from user config"))
     codex = row.split("|")[3]
     assert "No per-run MCP list" not in codex and "mcp_servers" in codex and "enabled=false" in codex
+
+
+def test_codex_mcp_server_env_never_changes_the_workers_environment(env, monkeypatch, tmp_path):
+    """A listed server whose env would change a variable the worker already has (PATH, the device
+    mask, TTP_*) is not given, and the runner's secret files never override the daemon's env."""
+    from ttp.providers import codexmcp
+    from ttp import machines
+    mask = next(iter(machines.DEVICE_MASK))
+    servers = {"path": {"command": "x", "env": {"PATH": "/x"}},
+               "mask": {"command": "x", "env": {mask: "0"}},
+               "nodev": {"command": "x", "env": {"TTP_NO_DEVICE": "0"}},
+               "pypath": {"command": "x", "env": {"PYTHONPATH": "/evil"}},
+               "same": {"command": "x", "env": {"PATH": "/bin", "OWN": "v"}},
+               "fine": {"command": "x", "env": {"OWN": "v"}}}
+    (tmp_path / ".mcp.json").write_text(json.dumps({"mcpServers": servers}))
+    _, secrets, unknown = codexmcp.run_args(list(servers), [str(tmp_path)], [], True,
+                                            {"PATH": "/bin"}, {"PATH": "/bin", "TTP_NO_DEVICE": "1"})
+    assert sorted(u.split(" ")[0] for u in unknown) == ["mask", "nodev", "path", "pypath"], unknown
+    assert "its env PATH would change the worker's own" in unknown[0]
+    assert secrets == {"PATH": "/bin", "OWN": "v"}, "an identical value is fine"
+    # The daemon: the server is not given, and the alert names it.
+    p = make(env)
+    (p.root / ".mcp.json").write_text(json.dumps({"mcpServers": servers}))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codexhome"))
+    (tmp_path / "codexhome").mkdir()
+    p.set_config("providers.codex.mcp_servers", ["path", "fine"])
+    from ttp.providers import codex as codex_provider
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(codex_provider.Codex, "binary", lambda self: "/usr/bin/true")
+    tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+    rid = Daemon(p.base).start_run("worker", "go", "codex", "light", str(p.root), task=p.db.task(tid))
+    run_dir = p.runs / str(rid)
+    (run_dir / "STOP").touch()
+    spec = json.loads((run_dir / "run.json").read_text())
+    from ttp import runner
+    assert runner._env_files(spec) == {"OWN": "v"}
+    arg = next(a for a in spec["argv"] if a.startswith("mcp_servers="))
+    assert '"path"' not in arg and "fine" in arg
+    alert = p.db.one("SELECT text FROM messages WHERE ref='mcp_servers_unknown:codex'")
+    assert alert and "path (its env PATH would change" in alert["text"]
+    runner.remove_private(run_dir)
+    # The runner: an env file's value never overrides the daemon's environment.
+    out, secret = tmp_path / "env.json", tmp_path / "secret.json"
+    secret.write_text(json.dumps({"PATH": "/evil", "TTP_NO_DEVICE": "0", "OWN": "v"}))
+    child = tmp_path / "child.py"
+    child.write_text(f"import json, os; open({str(out)!r}, 'w').write(json.dumps(dict(os.environ)))\n")
+    rd = tmp_path / "run"
+    rd.mkdir()
+    (rd / "prompt.md").write_text("x")
+    (rd / "run.json").write_text(json.dumps({
+        "argv": [sys.executable, str(child)], "cwd": str(tmp_path), "provider": "codex", "timeout_s": 60,
+        "env": {"PATH": os.environ["PATH"], "TTP_NO_DEVICE": "1"}, "env_files": [str(secret)]}))
+    runner.supervise(rd)
+    got = json.loads(out.read_text())
+    assert (got["PATH"], got["TTP_NO_DEVICE"], got["OWN"]) == (os.environ["PATH"], "1", "v")
