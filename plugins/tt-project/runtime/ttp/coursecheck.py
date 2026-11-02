@@ -20,6 +20,8 @@ so an idle project's digest does not grow. Each reuses a signal the harness alre
   blocking what the user asked more recently. Other cases of it are left to the prompt step.
 - recurring: a correction (correction.py) of the same class as an earlier one that got a class-fix task:
   the mistake the project recorded a fix for happened again.
+  A cancelled fix task whose class's later fix is recorded (`ttp task superseded <id> <task|sha>`) and
+  still done counts as fixed.
 
 `coordinator.course_check` keys of the same names set the thresholds (0 turns one off)."""
 from __future__ import annotations
@@ -222,11 +224,22 @@ def recurring(db: DB, at: float) -> list[dict]:
         for prior in recs[:i]:
             fix = str(prior.get("fix") or "")
             same = cls & correction._specific(prior.get("class")) or f"msg#{prior['msg']}" in cls
-            if fix.startswith("#") and same and later["msg"] not in seen:
+            if fix.startswith("#") and same and later["msg"] not in seen and not _relinked(db, fix):
                 seen.add(later["msg"])
                 out.append({"msg": later["msg"], "prior": prior["msg"], "fix": fix,
                             "cls": sorted(same)[0] if isinstance(same, set) else f"msg#{prior['msg']}"})
     return out
+
+
+def _relinked(db: DB, fix: str) -> bool:
+    """Fix task `fix` ('#<id>') was cancelled and its class's later fix is recorded and holds
+    (`ttp task superseded`, correction.link_fix)."""
+    from . import correction
+    tid = fix[1:]
+    if not tid.isdigit():
+        return False
+    task = db.task(int(tid))
+    return bool(task and task.get("status") == "cancelled" and correction.fixed_by(db, int(tid)))
 
 
 def lines(db: DB, cfg: dict | None, pushes: Path | None = None, now: float | None = None,

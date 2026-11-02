@@ -279,6 +279,62 @@ def _later_fix(db: DB, since: float) -> str:
     return f"#{row['id']}" if row else ""
 
 
+def link_fix(p, tid: int, target: str, repo: str | None = None) -> str:
+    """Record the later fix of the correction class whose fix task `tid` was cancelled: `target` is a
+    done task of this project ('#<id>', '<id>' or '<project>#<id>') or a commit in `repo`, the harness or
+    the project root. `recurring` then treats the class as fixed while that task stays done. ValueError
+    for a task that is not cancelled, an unknown, open, failed or cancelled fix task, one of another
+    project, or a commit found nowhere."""
+    from pathlib import Path
+    from .landed import _commit
+    task = p.db.task(tid)
+    if not task:
+        raise ValueError(f"no task #{tid}")
+    if task.get("status") != "cancelled":
+        raise ValueError(f"not recorded: task #{tid} is {task.get('status')}, not cancelled")
+    t = target.strip()
+    m = re.fullmatch(r"(?:([\w.-]+)?#|task:)?(\d{1,6})", t)
+    if m and (t[0] == "#" or "#" in t or t.startswith("task:") or len(t) < 7):
+        if m.group(1) and m.group(1) != p.name:
+            raise ValueError(f"not recorded: {t} is a task of project {m.group(1)}, not {p.name}")
+        fid = int(m.group(2))
+        fix = p.db.task(fid)
+        if not fix or fid == tid:
+            raise ValueError(f"not recorded: no task #{fid} in project {p.name}" if not fix
+                             else "not recorded: a task cannot be its own fix")
+        if fix.get("status") != "done":
+            raise ValueError(f"not recorded: fix task #{fid} is {fix.get('status')}, not done")
+        p.db.x("INSERT OR REPLACE INTO task_class_fix(task, fix_task, sha, repo, ts) VALUES(?,?,?,?,?)",
+               (tid, fid, "", "", time.time()))
+        return f"task #{tid}: its correction class is recorded as fixed by task #{fid}"
+    if not re.fullmatch(r"[0-9a-fA-F]{7,64}", t):
+        raise ValueError(f"not recorded: {t!r} is neither a task id ('#<id>') nor a commit sha")
+    roots = [Path(repo).expanduser()] if repo else []
+    roots += [p.harness, p.root]
+    for r in roots:
+        full = _commit(r, t) if r.exists() else ""
+        if full:
+            p.db.x("INSERT OR REPLACE INTO task_class_fix(task, fix_task, sha, repo, ts) VALUES(?,?,?,?,?)",
+                   (tid, None, full, str(r), time.time()))
+            return f"task #{tid}: its correction class is recorded as fixed by {full[:10]} in {r}"
+    raise ValueError(f"not recorded: no commit {t} in {', '.join(str(r) for r in roots)}")
+
+
+def fixed_by(db: DB, tid: int) -> str:
+    """The recorded later fix of cancelled fix task `tid` while it holds ('#<id>' of a task still done,
+    or a commit sha), else ''."""
+    try:
+        r = db.one("SELECT fix_task, sha FROM task_class_fix WHERE task=?", (int(tid),))
+    except Exception:   # an older database without the table
+        return ""
+    if not r:
+        return ""
+    if r["sha"]:
+        return r["sha"]
+    fix = db.task(int(r["fix_task"])) if r["fix_task"] is not None else None
+    return f"#{r['fix_task']}" if fix and fix.get("status") == "done" else ""
+
+
 def open_stall(db: DB, cfg: dict | None, now: float | None = None) -> str:
     """What says the project is stuck right now, or ''. Cheapest first."""
     now = time.time() if now is None else now

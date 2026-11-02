@@ -220,3 +220,73 @@ def test_course_self_review_skips_a_detector_on_bad_state_and_keeps_the_rest(env
     lines, _ = coursecheck.lines(p.db, p.config(), p.state / "pushes", now, said.append)
     assert len(lines) == 1 and "recurring mistake" in lines[0]
     assert len(said) == 1 and "missed skipped" in said[0]
+
+
+def _cc_task(p, *args):
+    """`ttp task <p> <args>`: its exit code (0 when it returned)."""
+    from ttp import cli
+    try:
+        cli.main(["task", p.name, *args])
+    except SystemExit as e:
+        return e.code
+    return 0
+
+
+def _cc_cancelled_fix(p, now):
+    """A correction class whose fix task was cancelled, and a later correction of that class."""
+    from ttp import correction
+    first = p.db.add_task("harness: catch the missed case", "s", kind="harness", origin="coordinator")
+    p.db.x("UPDATE tasks SET status='cancelled' WHERE id=?", (first,))
+    p.db.set_kv(correction.KEY, [
+        {"msg": 10, "ts": now - 7200, "why": "phrase", "class": ["#42"], "fix": f"#{first}", "shown": True},
+        {"msg": 20, "ts": now - 60, "why": "phrase", "class": ["#42"], "fix": "", "shown": False}])
+    return first
+
+
+def test_a_cancelled_class_fix_linked_to_a_later_done_fix_stops_the_recurring_mistake_line(env, capsys):
+    """`ttp task superseded <cancelled> <task|sha>` records the class's later fix: (a) a done fix task or
+    a harness commit ends the recurring-mistake line; (b) a linked fix no longer done brings it back."""
+    p = make(env)
+    now = time.time()
+    first = _cc_cancelled_fix(p, now)
+    assert "recurring mistake" in _cc(p, now)[0][0]   # no link: unchanged
+    fix = p.db.add_task("harness: the class fix, done in another task", "s", kind="harness", origin="coordinator")
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (fix,))
+    assert _cc_task(p, "superseded", str(first), f"#{fix}") == 0
+    assert f"fixed by task #{fix}" in capsys.readouterr().out
+    assert _cc(p, now)[0] == []   # (a)
+    p.db.x("UPDATE tasks SET status='queued' WHERE id=?", (fix,))   # (b) requeued: not done any more
+    assert "recurring mistake" in _cc(p, now)[0][0]
+    # A commit of the harness counts too.
+    sha = subprocess.run(["git", "-C", str(p.harness), "rev-parse", "HEAD"], capture_output=True,
+                         text=True, check=True).stdout.strip()
+    assert _cc_task(p, "superseded", str(first), sha[:12]) == 0
+    assert _cc(p, now)[0] == []
+
+
+def test_superseded_on_a_cancelled_class_fix_refuses_open_failed_foreign_unknown_or_missing_fixes(env, capsys):
+    """(b) an open fix task is refused and the line stays; (d) unknown ids, another project's task, a failed
+    or cancelled fix, a missing sha or a non-cancelled original with a task link exit non-zero, recording
+    nothing; (c) a done task's superseded keeps its own checks."""
+    p = make(env)
+    now = time.time()
+    first = _cc_cancelled_fix(p, now)
+    open_fix = p.db.add_task("harness: still running", "s", kind="harness", origin="coordinator")
+    failed = p.db.add_task("harness: failed", "s", kind="harness", origin="coordinator")
+    p.db.x("UPDATE tasks SET status='failed' WHERE id=?", (failed,))
+    for args in ([str(first), f"#{open_fix}"], [str(first), str(open_fix)], [str(first), f"#{failed}"],
+                 [str(first), f"#{first}"], [str(first), "#9999"], [str(first), f"other#{open_fix}"],
+                 [str(first), "deadbeefcafe1234"], [str(first), "not-a-sha"], ["9999", f"#{open_fix}"],
+                 [str(first), f"#{open_fix}", "--ref", "main"]):
+        assert _cc_task(p, "superseded", *args) not in (0, None), args
+    assert p.db.q("SELECT * FROM task_class_fix") == []
+    assert "recurring mistake" in _cc(p, now)[0][0]
+    out = capsys.readouterr()
+    assert "not done" in out.err + out.out and "of project other" in out.err + out.out
+    # (c) a done task: the landing checks as before, never a class-fix link.
+    done = p.db.add_task("code: shipped", "s", kind="code", origin="coordinator")
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (done,))
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (open_fix,))
+    assert _cc_task(p, "superseded", str(done), f"#{open_fix}") not in (0, None)
+    assert p.db.q("SELECT * FROM task_class_fix") == []
+    assert "class is recorded" not in capsys.readouterr().out

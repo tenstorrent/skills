@@ -6672,8 +6672,15 @@ def cmd_task(a) -> None:
         from .landed import record_superseded
         if not a.title.strip().isdigit() or not a.probe:
             die("superseded needs a task id and the commit that carries its work (on the push branch, or --ref)")
+        cancelled = (p.db.task(int(a.title)) or {}).get("status") == "cancelled"
+        if cancelled and a.ref:
+            die("--ref does not go with a cancelled task: name its correction class's fix task or commit")
         try:
-            print(record_superseded(p, int(a.title), a.probe.strip(), a.ref, a.repo))
+            if cancelled:   # the cancelled fix task of a correction class: link its later fix
+                from .correction import link_fix
+                print(link_fix(p, int(a.title), a.probe.strip(), a.repo))
+            else:
+                print(record_superseded(p, int(a.title), a.probe.strip(), a.ref, a.repo))
         except ValueError as e:
             die(str(e))
     elif a.action == "abandon":
@@ -10527,7 +10534,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("title", nargs="?", default="", help="add: the title; show/cancel/requeue/set-when/superseded/abandon/rejudge: the task id")
     s.add_argument("probe", nargs="?", help="set-when: the new retry_when/start_when command (\"\" clears it); "
                    "superseded: the commit on the push branch that carries the task's work (for a harness task: "
-                   "the commit merged into the harness); abandon: why its work will never land")
+                   "the commit merged into the harness; for a cancelled correction-class fix task: the done task '#<id>' "
+                   "or commit that fixed the class instead); abandon: why its work will never land")
     s.add_argument("--ref", help="superseded: the ref that holds the commit (default: the push branch; in a "
                    "second repository the task worked in, any of its branches); for a task with no branch on record, "
                    "required: the branch of a second repository that holds its work, or a ref the commit is on; a commit already on that "

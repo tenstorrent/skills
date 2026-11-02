@@ -154,6 +154,11 @@ CREATE INDEX IF NOT EXISTS task_landings_task ON task_landings(task);
 CREATE TABLE IF NOT EXISTS task_superseded (
   task INTEGER NOT NULL, head TEXT NOT NULL, sha TEXT NOT NULL, ts REAL NOT NULL, PRIMARY KEY(task, head, sha));
 
+-- The later fix of a correction class whose first fix task was cancelled: a done task of this project
+-- or a commit (`ttp task superseded <cancelled> <task|sha>`, correction.link_fix).
+CREATE TABLE IF NOT EXISTS task_class_fix (task INTEGER PRIMARY KEY, fix_task INTEGER, sha TEXT NOT NULL DEFAULT '',
+  repo TEXT NOT NULL DEFAULT '', ts REAL NOT NULL);
+
 -- A done code or harness task whose work will never land, with why and when (`ttp task abandon`, landed.py).
 CREATE TABLE IF NOT EXISTS task_abandoned (task INTEGER PRIMARY KEY, why TEXT NOT NULL, ts REAL NOT NULL);
 
