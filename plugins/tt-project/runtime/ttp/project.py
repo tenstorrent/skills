@@ -563,10 +563,11 @@ def _known_keys(path: list[str]) -> set[str] | None:
         # wrap_cmd: the project's own lock or queue command the commands after `ttp checks --` run
         # behind (push.wrap_of; default "", none); delivery.push_checks never go through it.
         # wrap_lane: where those runs take its lane, before the wrapper starts or after (push.wrap_lane_of).
+        # no_device_cmds: commands that need no device, run without wrap_cmd (checklane.no_device).
         # slots, light_cmds, max_wait_s, wait_event_s, wait_escalate_s, wait_hang_factor, priority_age_s,
         # test_project_max, done_holder_flag_s, done_holder_grace_s: the checks lanes (checklane);
         # test_project_slots: the project's test-worker budget (testslots.project_max).
-        return {"nice", "ionice", "wall_cap_s", "wrap_cmd", "wrap_lane", "slots", "light_cmds", "max_wait_s", "wait_event_s",
+        return {"nice", "ionice", "wall_cap_s", "wrap_cmd", "wrap_lane", "no_device_cmds", "slots", "light_cmds", "max_wait_s", "wait_event_s",
                 "wait_escalate_s", "wait_hang_factor", "priority_age_s", "test_project_max", "test_project_slots",
                 "done_holder_flag_s", "done_holder_grace_s"}
     if len(path) == 1 and isinstance(DEFAULT_CONFIG.get(path[0]), dict):

@@ -2956,9 +2956,15 @@ def cmd_checks(a) -> None:
             die(f"ttp checks: {e}; the commands after `--` were not run", 1)
         from . import checklane
         # checks.wrap_lane "after": the wrapper lock's lane is taken inside the wrapper, once it holds its lock.
-        mine = push.with_wrap(mine, wrap, _wrap_lane_step(p, Path(run_dir), wrap) if wrap and after and p else ())
+        # A command that needs no device (--no-device, checks.no_device_cmds) runs without the wrapper.
+        nodev = lambda c: checklane.no_device(c, cfg, bool(getattr(a, "no_device", False)))
+        mine = push.with_wrap(mine, wrap, _wrap_lane_step(p, Path(run_dir), wrap) if wrap and after and p else (),
+                              nodev)
         wrapped = {str(c) for c in mine if getattr(c, "wrap", None)}   # their run takes the lock's lane
-        if wrap and any(not push.remote_host(c) for c in mine):
+        if wrap and (bare := [c for c in mine if not push.remote_host(c) and nodev(c)]):
+            print(f"ttp checks: {', '.join(map(repr, map(str, bare)))} need no device: run without "
+                  f"{push.WRAP_KEY} and its lane")
+        if wrap and any(str(c) in wrapped for c in mine):
             if why := push.wrap_problem(wrap, top, {**os.environ, **venv_vars}):
                 die(f"ttp checks: {why}", 1)
             print(f"ttp checks: the commands after `--` run behind {push.WRAP_KEY}: {shlex.join(wrap)}")
@@ -3441,6 +3447,17 @@ def cmd_checks(a) -> None:
                                                              "commands": todo, "skipped": skipped, "ts": time.time(),
                                                              "purpose": purpose, "env_fault": fault["sig"],
                                                              "hosts": push.hosts_of(todo)})
+            print(f"ttp checks: {said}", file=sys.stderr)
+            sys.exit(75)
+        # The wrapper's lock refused it as paused (`ttp lock`: "held by pause on <resource>"): the pause, never
+        # a failure of the change nor a busy lock; it says so and what to wait on.
+        if not passed and rc == 75 and str(failed) in wrapped and (held := _pause_hold(_log_since(out, log, check_start))):
+            said = (f"held by pause on {held}: {failed!r} ran behind {push.WRAP_KEY}, whose lock is paused; the "
+                    f"change is neither passed nor failed. Hand off `waiting`; retry_when: ttp lock --probe {shlex.quote(held)}")
+            out.write(f"ttp checks: {said}\n")
+            write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": False,
+                                                             "commands": todo, "skipped": skipped, "ts": time.time(),
+                                                             "purpose": purpose, "held_by_pause": held})
             print(f"ttp checks: {said}", file=sys.stderr)
             sys.exit(75)
     if handover:
@@ -4663,6 +4680,7 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
             child = subprocess.Popen([sys.executable, "-m", "ttp", "checks", "--rc", str(run_dir / CHECKS_RC),
                                       *(["--fresh"] if a.fresh else []), *(["--full"] if getattr(a, "full", False) else []),
                                       *(["--light"] if getattr(a, "light", False) else []),
+                                      *(["--no-device"] if getattr(a, "no_device", False) else []),
                                       *(["--purpose", a.purpose] if getattr(a, "purpose", None) else []), *a.cmd],
                                      cwd=top or Path.cwd(), env=env, stdin=subprocess.PIPE, stdout=out,
                                      stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(guard.fileno(),))
@@ -4672,6 +4690,7 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
                                               "branch": checktree.branch(top) if top else "", "cmd": list(a.cmd),
                                               "fresh": bool(a.fresh), "full": bool(getattr(a, "full", False)),
                                               "light": bool(getattr(a, "light", False)),
+                                              "no_device": bool(getattr(a, "no_device", False)),
                                               **_harness_purpose(a), "req": req, "pidns": pid_ns(), "arrived": arrived,
                                               "check_run_dir": str(output), "check_report_dir": str(checkdirs.reports(output))})
         except BaseException:
@@ -5246,6 +5265,36 @@ def _urgent_priority(p, task: str) -> int | None:
 LOCK_TELL_S = 120.0   # a waiting `ttp lock` says so this often, under checkwall.SILENT_S: a check waiting on it is not silent
 
 
+_PAUSE_HOLD = re.compile(r"held by pause on ([^\s:;,]+(?:, [^\s:;,]+)*)")
+
+
+def _pause_hold(text: str) -> str:
+    """The resource `ttp lock` named in its last "held by pause on <resource>" in `text` (paused
+    alternatives as A|B, the form their probe takes), else ""."""
+    found = _PAUSE_HOLD.findall(text or "")
+    return found[-1].replace(", ", "|") if found else ""
+
+
+def _lock_alternative(p, cfg: dict, names: list[str], a) -> str:
+    """The one of `ttp lock A|B|C`'s alternatives to take: never a paused one (lockprobe.pause), the first
+    free one, else the first unpaused one (it waits for that). All paused: exit 75, "held by pause on"
+    each, so the caller tells a pause from a busy lock. Alternatives mix with no other names (exit 2)."""
+    from . import lockprobe
+    if len(names) != 1:
+        die("ttp lock: alternatives (A|B) are one word of their own, never mixed with A,B", 2)
+    alts = list(dict.fromkeys(x for x in names[0].split("|") if x))
+    paused = {x: h for x in alts if (h := lockprobe.pause(p, cfg, x)) is not None}
+    live = [x for x in alts if x not in paused]
+    if not live:
+        said = "; ".join(f"{x}" + (f" ({h['reason']})" if h.get("reason") else "") for x, h in paused.items())
+        die(f"held by pause on {', '.join(paused)}: every alternative is paused ({said}); hand the task back as "
+            f"waiting until one is resumed (retry_when: ttp lock --probe {shlex.quote(names[0])})", 75)
+    pick = next((x for x in live if lockprobe.answer(p, cfg, x, bool(getattr(a, "shared", False)))[0] == 0), live[0])
+    if paused:
+        print(f"ttp lock: {', '.join(paused)} paused; taking {pick}", file=sys.stderr, flush=True)
+    return pick
+
+
 def cmd_lock(a) -> None:
     """Hold one slot of a shared resource while a command runs: `ttp lock <resource> -- <cmd...>`.
 
@@ -5267,6 +5316,9 @@ def cmd_lock(a) -> None:
     command ends. Each lock keeps its own rules (shared, device, nested, paused, reserved). A `ttp lock` run
     under a hold already (an enclosing one, or an exclusive task's run) does not wait behind such a
     waiter: it may be waiting for that very hold.
+
+    `ttp lock 'A|B' -- <cmd...>` takes one of alternatives (_lock_alternative): never a paused one, the
+    first free one, else it waits for the first unpaused one; all paused exits 75 "held by pause on" them.
 
     `ttp lock --shared <resource> -- <cmd...>` is for read-only work: shared holders run together,
     while an exclusive holder (a plain `ttp lock`, or an exclusive task's whole-run hold) and shared
@@ -5334,10 +5386,13 @@ def cmd_lock(a) -> None:
                 if waiting:
                     _end_wait()
                 why = f" ({held['reason']})" if held.get("reason") else ""
-                die(f"{L['name']} is paused{why}; hand the task back as waiting until it is resumed", 75)
+                die(f"held by pause on {L['name']}: {L['name']} is paused{why}; hand the task back as waiting "
+                    "until it is resumed", 75)
 
     from . import shared
     cfg = p.config()
+    if any("|" in n for n in names):
+        names = [_lock_alternative(p, cfg, names, a)]
     todo: list[dict] = []   # the locks to take, one per canonical lock, in name order (see the docstring)
     for n in names:
         res = lk.canonical(cfg, n)
@@ -10213,6 +10268,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--light", action="store_true",
                    help="the commands after -- are light checks (syntax, lint, format, validation): with only "
                         "light checks to run they run at once, without waiting for a checks slot (checklane)")
+    s.add_argument("--no-device", action="store_true",
+                   help="the commands after -- need no device: they run without checks.wrap_cmd (the project's "
+                        "lock or queue wrapper) and its lane, as commands checks.no_device_cmds names do")
     s.add_argument("--purpose", choices=["candidate", "harness"], default="candidate",
                    help="harness: qualify a harness-preparation head with the purpose harness (else the default "
                         "harness plan) and untagged checks; "

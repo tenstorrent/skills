@@ -504,6 +504,19 @@ def is_light(cmd: str, patterns: list[list[str]]) -> bool:
     return True
 
 
+def no_device(cmd, cfg: dict | None, declared: bool = False) -> bool:
+    """Whether `cmd` needs no device, so it runs without checks.wrap_cmd (the project's lock or queue
+    wrapper) and its lane: `declared` (ttp checks --no-device), or each of its simple commands starts with
+    a pattern of checks.no_device_cmds (a list, or one string split at commas and newlines), as is_light."""
+    if declared:
+        return True
+    pats = setting(cfg, "no_device_cmds")
+    if isinstance(pats, str):
+        pats = re.split(r"[,\n]", pats)
+    pats = [w for w in (str(x).split() for x in (pats if isinstance(pats, list) else [])) if w]
+    return bool(pats) and is_light(str(cmd), pats)
+
+
 def all_light(cmds: list, cfg: dict | None, declared=()) -> bool:
     """Whether a run of `cmds` is light: each is light or among `declared` (ttp checks --light)."""
     pats, declared = light_patterns(cfg), {str(c) for c in declared}

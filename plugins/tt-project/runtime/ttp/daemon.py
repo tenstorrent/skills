@@ -10324,6 +10324,7 @@ class Daemon:
             return why
         argv = (["--fresh"] if info.get("fresh") else []) + (["--full"] if info.get("full") else []) \
             + (["--light"] if info.get("light") else []) \
+            + (["--no-device"] if info.get("no_device") else []) \
             + (["--purpose", "harness"] if info.get("purpose") == "harness" else []) + [str(c) for c in cmd]
         return "" if self._start_checks(Path(wt), out, run_id, tid, argv) else "they could not be started"
 

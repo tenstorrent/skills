@@ -1341,3 +1341,50 @@ def test_a_waiting_ttp_lock_logs_who_sent_it_sigterm_and_still_exits_143(env, tm
     rows = [json.loads(x) for x in (p.state / "job-signals.jsonl").read_text().splitlines()]
     assert any(r.get("received") and r["signal"] == "SIGTERM" and r["from_pid"] == os.getpid()
                and r["pid"] == w.pid for r in rows), rows
+
+
+def test_lock_alternatives_take_an_unpaused_one_and_a_pause_of_all_says_held_by_pause(env, tmp_path):
+    # `ttp lock 'A|B'`: a paused alternative is never taken or waited on; the free one is taken first;
+    # every one paused exits 75 at once naming "held by pause on", which a busy lock never says.
+    p = make(env)
+    from ttp import coordinator as coord
+    run_env, ran = _lock_env(env, p), tmp_path / "ran"
+    touch = ("touch", str(ran))
+    coord.pause_resource(p, "box-a", True, reason="maintenance", by="user")
+    r = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "2", "box-a|box-b", "--", *touch],
+                       env=run_env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and ran.exists() and "box-a paused; taking box-b" in r.stderr, r
+    assert _queue_len(p, "box-a") == 0
+    ran.unlink()
+    # Unpaused: the free alternative goes first, not a busy one ahead of it.
+    coord.pause_resource(p, "box-a", False)
+    release = tmp_path / "release"
+    busy = _lock(run_env, "box-a", cmd=_until(release))
+    try:
+        assert _until_true(lambda: _lock_probe(run_env, "box-a").returncode == 75)
+        r = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "2", "box-a|box-b", "--", *touch],
+                           env=run_env, capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0 and ran.exists(), r
+        ran.unlink()
+        # A busy lock that gives up is 75 too, but never says it is held by a pause.
+        r = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "1", "box-a", "--", *touch],
+                           env=run_env, capture_output=True, text=True, timeout=60)
+        assert r.returncode == 75 and "held by pause" not in r.stderr and not ran.exists(), r
+    finally:
+        release.touch()
+    assert busy.wait(timeout=30) == 0
+    # All paused: 75 at once, naming each, queued on none; the probe of the alternatives says 75 as well.
+    coord.pause_resource(p, "box-a", True, by="user")
+    coord.pause_resource(p, "box-b", True, reason="bench work", by="user")
+    r = subprocess.run([sys.executable, str(TTP), "lock", "box-a|box-b", "--", *touch],
+                       env=run_env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 75 and "held by pause on box-a, box-b" in r.stderr and not ran.exists(), r
+    assert _queue_len(p, "box-a") == 0 and _queue_len(p, "box-b") == 0
+    assert _lock_probe(run_env, "box-a|box-b").returncode == 75
+    # A single paused lock says it too, and alternatives never mix with a set of locks.
+    r = subprocess.run([sys.executable, str(TTP), "lock", "box-b", "--", *touch], env=run_env,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 75 and "held by pause on box-b" in r.stderr and "box-b is paused" in r.stderr, r
+    r = subprocess.run([sys.executable, str(TTP), "lock", "box-a|box-b,box-c", "--", *touch], env=run_env,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2 and not ran.exists(), r

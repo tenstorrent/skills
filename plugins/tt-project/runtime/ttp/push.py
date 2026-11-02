@@ -246,9 +246,10 @@ def wrap_lane_of(cfg: dict | None) -> str:
     return v.strip().lower()
 
 
-def with_wrap(checks: list, wrap: tuple[str, ...], lane: tuple[str, ...] = ()) -> list:
+def with_wrap(checks: list, wrap: tuple[str, ...], lane: tuple[str, ...] = (), skip=lambda c: False) -> list:
     """`checks` with each one that runs on this machine behind `wrap` (check_argv); one with a check
-    host runs there unwrapped, as the wrapper is this machine's. No `wrap`: `checks` unchanged. `lane`
+    host runs there unwrapped, as the wrapper is this machine's, and so does one `skip` names (a check
+    that needs no device: checklane.no_device). No `wrap`: `checks` unchanged. `lane`
     (checklane.lane_argv, with checks.wrap_lane "after"): the step that runs between the wrapper and
     each command, taking the wrapper lock's lane once the wrapper holds its lock."""
     if not wrap:
@@ -258,7 +259,7 @@ def with_wrap(checks: list, wrap: tuple[str, ...], lane: tuple[str, ...] = ()) -
         c2 = Check(str(c))
         if isinstance(c, Check):
             c2.__dict__.update(c.__dict__)
-        if not remote_host(c2):
+        if not remote_host(c2) and not skip(c):
             c2.wrap = tuple(wrap)
             if lane:
                 c2.lane = tuple(lane)
@@ -3433,8 +3434,9 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
                 except ValueError as e:
                     say(f"{e}; not pushing")
                     return CHECKS_FAILED
-                todo = extras = with_wrap(todo, wrap)
-                if any(not remote_host(c) for c in todo) and (why := wrap_problem(wrap, repo)):
+                from . import checklane
+                todo = extras = with_wrap(todo, wrap, skip=lambda c: checklane.no_device(c, cfg))
+                if any(getattr(c, "wrap", None) for c in todo) and (why := wrap_problem(wrap, repo)):
                     say(f"{why}; not pushing")
                     return CHECKS_FAILED
             if not todo and outside_scope(checks, skipped):

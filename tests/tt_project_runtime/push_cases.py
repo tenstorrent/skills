@@ -7028,6 +7028,57 @@ def test_ttp_checks_wrap_cmd_passes_its_exit_code_and_fails_when_missing(env, tm
     cli.main(["checks", "--fresh"])
 
 
+def test_ttp_checks_runs_a_no_device_command_without_the_wrapper_and_reports_a_pause_hold(
+        env, tmp_path, monkeypatch, capsys):
+    # A CPU-only test needs no device: `--no-device` or checks.no_device_cmds runs it without checks.wrap_cmd
+    # (never waiting on the wrapper's lock or lane); a wrapped one the wrapper's lock refuses as paused ends
+    # "held by pause on <resource>" (exit 75, held_by_pause), never as a failure or a busy lock.
+    from ttp import checklane, cli, project, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    log, marker = tmp_path / "wrap.log", tmp_path / "ran"
+    touch = f"touch {shlex.quote(str(marker))}"
+    held = tmp_path / "held.sh"
+    held.write_text(f"#!/bin/sh\necho CALL >> {shlex.quote(str(log))}\n"
+                    "echo 'ttp lock: held by pause on box-a: box-a is paused (maintenance)' >&2; exit 75\n")
+    held.chmod(0o755)
+    p.set_config("checks.wrap_cmd", str(held))
+    capsys.readouterr()
+    cli.main(["checks", "--fresh", "--no-device", "--", touch])
+    assert marker.exists() and not log.exists(), "a no-device command ran behind the wrapper"
+    assert "need no device" in capsys.readouterr().out
+    assert json.loads((run / "checks.json").read_text())["passed"] is True
+    marker.unlink()
+    # The config patterns (a list or one comma string) work as light_cmds do; a heavier line is not covered.
+    p.set_config("checks.no_device_cmds", ["touch", "bash tests/cpu.sh"])
+    cli.main(["checks", "--fresh", "--", touch])
+    assert marker.exists() and not log.exists()
+    cfg = p.config()
+    assert checklane.no_device("bash tests/cpu.sh -x", cfg) and checklane.no_device("touch a && touch b", cfg)
+    assert not checklane.no_device("touch a && pytest", cfg) and not checklane.no_device("bash tests/dev.sh", cfg)
+    assert not checklane.no_device("touch a", {"checks": {}}) and checklane.no_device("pytest", {}, declared=True)
+    assert checklane.no_device("make cpu", {"checks": {"no_device_cmds": "ruff, make cpu"}})
+    assert not [x for x in project.config_problems({"checks": {"no_device_cmds": ["touch"]}}) if "no_device" in x]
+    assert push.with_wrap(["a", "b"], ("w",), skip=lambda c: c == "a")[0].wrap == ()
+    # A wrapped command the wrapper's lock refuses as paused: held by the pause, not a failure.
+    marker.unlink()
+    p.set_config("checks.no_device_cmds", [])
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--fresh", "--", touch])
+    err = capsys.readouterr().err
+    rec = json.loads((run / "checks.json").read_text())
+    assert e.value.code == 75 and "held by pause on box-a" in err and "ttp lock --probe box-a" in err, err
+    assert rec["passed"] is False and rec["held_by_pause"] == "box-a" and not marker.exists()
+    # The same exit without a pause line (a busy lock, the command's own 75) stays an ordinary failure.
+    held.write_text("#!/bin/sh\necho 'ttp lock: box-a busy' >&2; exit 75\n")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--fresh", "--", touch])
+    assert "held_by_pause" not in json.loads((run / "checks.json").read_text())
+    assert "held by pause" not in capsys.readouterr().err
+    assert cli._pause_hold("x\nheld by pause on a, b: every alternative is paused") == "a|b"
+    assert cli._pause_hold("box-a is paused") == ""
+
+
 def test_ttp_checks_refuses_a_command_after_dashes_whose_program_is_not_installed(env, tmp_path, monkeypatch, capsys):
     # A missing linter is refused before anything is queued, naming the program, not an exit 127
     # minutes later; launcher forms (env, timeout, nice, assignments) name the program they run.
