@@ -31,3 +31,4 @@
 +350: light is for mechanical work only; conclusion runs carry a `conclusion:` line (tier floor)
 +590: a project's own gates and settings are the coordinator's to decide and record (selfblock)
 +20: a cited restriction removed in a user turn carries that turn's words in `source`
++350: the tier floor: conclusion runs start at standard/high or above (tierfloor.py)
