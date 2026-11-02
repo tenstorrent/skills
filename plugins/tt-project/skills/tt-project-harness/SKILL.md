@@ -189,7 +189,9 @@ read the one for the lever you change.
 - `TT_VISIBLE_DEVICES` only asks: a raw open or reset code still reaches the device. Under
   `TTP_NO_DEVICE=1`, `ttp sandbox` also hides the device nodes (an empty tmpfs over
   `/dev/tenstorrent`), and on a host tagged `device` the worker hook refuses pytest and ctest runs
-  outside it. A power command sent over the network to a board management controller is not stopped.
+  outside it. On a Claude Code that applies a hook's rewritten input, a test run that is the
+  command's last part (after `;`, `&&`, `||` or a new line) is run as `ttp clip -- ttp sandbox -- <cmd>`
+  instead, with a one-line note. A power command sent over the network to a board management controller is not stopped.
 
 ## Test runs never reach other processes
 

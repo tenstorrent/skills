@@ -309,9 +309,13 @@ def test_sudo_fails_inside_the_sandbox(monkeypatch):
     assert r.returncode != 0, r.stderr
 
 
-def _device_hook(monkeypatch, tmp_path, device_host=True, works=True, no_device="1"):
+def _device_hook(monkeypatch, tmp_path, device_host=True, works=True, no_device="1", rewrite=False):
     from ttp import hook, machines, sandbox
     monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    if rewrite:
+        monkeypatch.setenv(hook.HOOK_REWRITE, "1")
+    else:
+        monkeypatch.delenv(hook.HOOK_REWRITE, raising=False)
     monkeypatch.delenv("TTP_PROJECT", raising=False)
     if no_device is None:
         monkeypatch.delenv("TTP_NO_DEVICE", raising=False)
@@ -370,6 +374,77 @@ def test_the_hook_allows_sandboxed_device_and_non_test_runs(cmd, tmp_path, monke
 @pytest.mark.parametrize("kw", [{"no_device": "0"}, {"no_device": None}, {"device_host": False}])
 def test_the_hook_allows_test_runs_of_device_runs_and_on_other_hosts(kw, tmp_path, monkeypatch):
     assert _device_hook(monkeypatch, tmp_path, **kw)("pytest -q") is None
+
+
+@pytest.mark.parametrize("cmd, new", [
+    ("pytest -q tests/x.py", "ttp clip -- ttp sandbox -- pytest -q tests/x.py"),
+    ("cd x && python3 - <<'EOF'\nopen('a', 'w').write('b; pytest')\nEOF\npytest -q tests/a.py",
+     "cd x && python3 - <<'EOF'\nopen('a', 'w').write('b; pytest')\nEOF\nttp clip -- ttp sandbox -- pytest -q tests/a.py"),
+    ("cd x && python3 - <<EOF && python3 -m pytest -q -k 'a or b'\nimport a; a.b()\nEOF",
+     "cd x && python3 - <<EOF && ttp clip -- ttp sandbox -- python3 -m pytest -q -k 'a or b'\nimport a; a.b()\nEOF"),
+    ('PYTHONPATH="$PWD" timeout 600 ctest --test-dir "$B"', 'PYTHONPATH="$PWD" timeout 600 ttp clip -- ttp sandbox -- ctest --test-dir "$B"'),
+    ("ttp clip -- python -m pytest", "ttp clip -- ttp sandbox -- python -m pytest"),
+    ("git add -A; uv run pytest -q  # focused", "git add -A; uv run ttp clip -- ttp sandbox -- pytest -q  # focused"),
+    ("make ||\n  pytest -q;\n", "make ||\n  ttp clip -- ttp sandbox -- pytest -q;\n"),
+    ("ttp sandbox -- true; pytest", "ttp sandbox -- true; ttp clip -- ttp sandbox -- pytest"),
+])
+def test_the_hook_rewrites_a_trailing_no_device_test_run_into_the_sandbox(cmd, new, tmp_path, monkeypatch):
+    from ttp import hook
+    call = _device_hook(monkeypatch, tmp_path, rewrite=True)
+    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd, "description": "d", "timeout": 9},
+                                "cwd": str(tmp_path)})
+    o = out["hookSpecificOutput"]
+    assert o["permissionDecision"] == "allow" and o["updatedInput"] == {"command": new, "description": "d", "timeout": 9}
+    assert "ran in `ttp sandbox`" in o["additionalContext"] and "\n" not in o["additionalContext"]
+    rows = [json.loads(x) for x in (tmp_path / hook.REFUSALS_FILE).read_text().splitlines()]
+    assert [(r["kind"], r["command"], r["rewritten"]) for r in rows] == [("rewrite", cmd, new)]
+    assert call(new) is None   # the rewritten command passes as it is
+
+
+@pytest.mark.parametrize("cmd", [
+    "pytest -q 2>&1 | tail -5", "pytest -q > out.txt", "pytest -q && git status", "(cd x && pytest)",
+    "for f in a b; do pytest $f; done", "bash -lc 'pytest -q'", "sudo pytest", "pytest a; pytest b",
+    "a |\npytest", "pytest -q &", "case a in a) pytest;; esac", "echo $(\npytest)", "pytest - <<EOF\nx\nEOF",
+    "pytest -q \\\n  tests/x.py", "'pytest' -q", "cat <<EOF; pytest -q\nx\n",
+])
+def test_the_hook_refuses_a_no_device_test_run_it_cannot_rewrite_alone(cmd, tmp_path, monkeypatch):
+    from ttp import hook
+    out = _device_hook(monkeypatch, tmp_path, rewrite=True)(cmd)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny" and "updatedInput" not in out["hookSpecificOutput"]
+    assert [json.loads(x)["kind"] for x in (tmp_path / hook.REFUSALS_FILE).read_text().splitlines()] == ["no_device"]
+
+
+@pytest.mark.parametrize("cmd", ["TTP_NO_DEVICE=0 pytest -q", "env -i PATH=$PATH pytest", "unset TTP_NO_DEVICE; pytest",
+                                 "env -u TTP_NO_DEVICE ctest", "TTP_NO_DEVICE= ttp sandbox -- pytest"])
+def test_the_hook_never_rewrites_a_test_run_that_changes_ttp_no_device(cmd, tmp_path, monkeypatch):
+    out = _device_hook(monkeypatch, tmp_path, rewrite=True)(cmd)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "leave TTP_NO_DEVICE" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_the_hook_refuses_instead_of_rewriting_without_a_cli_that_applies_updated_input(tmp_path, monkeypatch):
+    for value in (None, "0"):
+        call = _device_hook(monkeypatch, tmp_path)
+        if value:
+            monkeypatch.setenv("TTP_HOOK_REWRITE", value)
+        out = call("cd x && pytest -q")
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert "cd x && ttp clip -- ttp sandbox -- pytest -q" not in out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert _device_hook(monkeypatch, tmp_path, rewrite=True)("ttp clip -- ttp sandbox -- pytest -q") is None
+
+
+@pytest.mark.parametrize("version, on", [("2.1.296 (Claude Code)", True), ("2.0.10 (Claude Code)", True),
+                                         ("2.0.9 (Claude Code)", False), ("1.9.99", False), ("", False)])
+def test_claude_workers_get_hook_rewrites_only_from_a_cli_that_applies_updated_input(version, on, monkeypatch):
+    from ttp.hook import HOOK_REWRITE
+    from ttp.providers import base, get_provider
+    prov = get_provider("claude")
+    monkeypatch.setattr(type(prov), "binary", lambda self: "/x/claude")
+    monkeypatch.setattr(type(prov), "supports", lambda self, flag: False)
+    monkeypatch.setitem(base._CLI_OUTPUT, ("/x/claude", "--version"), version)
+    kw = dict(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, schema=None, restrictions={})
+    assert (prov.build(read_only=False, **kw)[1].get(HOOK_REWRITE) == "1") is on
+    assert HOOK_REWRITE not in prov.build(read_only=True, **kw)[1]
 
 
 def test_the_hook_gives_one_notice_where_no_sandbox_works(tmp_path, monkeypatch):

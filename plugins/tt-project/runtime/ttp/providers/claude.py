@@ -49,6 +49,9 @@ INPUT_FORMAT = "--input-format"
 # plan within its limits and 5 min otherwise (API key, or a plan past its limits).
 CACHE_TTLS = ("5m", "1h")
 _FLAGS: dict[str, bool] = {}   # CLI flag support, probed once per daemon from `claude --help`
+# The first CLI whose PreToolUse hooks can change a tool's input (`updatedInput`, its changelog):
+# from it on, the worker hook may rewrite a Bash call instead of refusing it (ttp.hook HOOK_REWRITE).
+UPDATED_INPUT_VERSION = (2, 0, 10)
 USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 # Claude Code's bundled skills, which workers have never used: listed by name only (still callable),
 # which saves ~2.1k tokens a call. "off" and disableBundledSkills both add tokens instead. Then the
@@ -159,7 +162,15 @@ class Claude(Provider):
         # A headless run kills its background tasks when it exits, so a job started that way dies
         # with the worker and the run ends with no hand-off. Without them, long jobs are detached.
         env = {"CLAUDE_CODE_ENABLE_CFC": "0", "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
+        if not read_only and self.hook_rewrites():
+            from ..hook import HOOK_REWRITE
+            env[HOOK_REWRITE] = "1"
         return argv, env
+
+    def hook_rewrites(self) -> bool:
+        """Whether the installed CLI applies a PreToolUse hook's `updatedInput` (an unknown version: no)."""
+        m = re.search(r"(\d+)\.(\d+)\.(\d+)", cli_output(self.binary() or "claude", "--version"))
+        return bool(m) and tuple(map(int, m.groups())) >= UPDATED_INPUT_VERSION
 
     def compact_env(self, tokens: int) -> dict[str, str]:
         # Honoured by headless stream-json runs (checked live: a `compact_boundary` event follows).
