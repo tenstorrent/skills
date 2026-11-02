@@ -2268,7 +2268,8 @@ def cmd_push(a) -> None:
     it carries a pr_branch. Inside a run, a plain push of the task's own branch onto the push branch is
     refused unless its spec asks it to land or `--land` says so. Inside a run, a worktree on another task's branch is
     refused (push.resolve), and so is publishing onto another task's branch the task only inherited. `--queue` lists the push queue
-    (`delivery.push_queue`). Exit codes are in `push.py`."""
+    (`delivery.push_queue`). `--move-tag <tag> <commit>` moves a delivery.channel_tags tag forward
+    (channeltag.move). Exit codes are in `push.py`."""
     from . import push
     if a.result:
         sys.exit(push.result(Path(a.result), pushed_only=a.pushed))
@@ -2288,6 +2289,9 @@ def cmd_push(a) -> None:
         from . import pushq
         print(pushq.queue_text(p))
         return
+    if a.move_tag:
+        from . import channeltag
+        sys.exit(channeltag.move(p, Path.cwd(), *a.move_tag, say=lambda s: print(s, file=sys.stderr)))
     if a.free:
         sys.exit(push.free(p, Path.cwd()))
     from . import worktree
@@ -9651,6 +9655,9 @@ def main(argv: list[str] | None = None) -> None:
                         "though its spec has no landing step (without it such a push is refused)")
     s.add_argument("--queue", action="store_true",
                    help="push nothing: list the push queue's entries and its last 10 batches")
+    s.add_argument("--move-tag", nargs=2, metavar=("TAG", "COMMIT"),
+                   help="move a delivery.channel_tags tag forward to COMMIT (on the push branch) under a lease "
+                        "on its current remote value; the one forced push delivery.never_force lets through")
     s.add_argument("--marker", help=argparse.SUPPRESS)   # the detached process itself
     s.add_argument("--batch", metavar="MARKER", help=argparse.SUPPRESS)   # the push queue's batch process (batch.py)
     s.set_defaults(fn=cmd_push)

@@ -444,7 +444,7 @@ def git_push_bypass(segments: list[list[str]]) -> str | None:
     if not pushes:
         return None
     try:
-        if forced := next((w for s in pushes if (w := gitguard.never_force_refusal(s[1:], dict(os.environ)))), ""):
+        if forced := next((w for s in pushes if (w := gitguard.never_force_refusal(s[1:], dict(os.environ), s[0]))), ""):
             return forced
         branch, why = gitguard.guarded_branch(dict(os.environ))
     except Exception:

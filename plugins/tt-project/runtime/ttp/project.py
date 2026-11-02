@@ -496,7 +496,8 @@ EXTRA_KEYS = {
                  "checks_spill_hosts", "checks_spill_after_s",   # where busy checks may spill to (checkspill)
                  "check_prestage",   # a short foreground run before `ttp checks --detach` (checkprestage)
                  "pr_body_check",   # a project's own PR body check before gh pr create/edit (prbody)
-                 "rebase_replace", "never_force"},   # whether a rebase replaces its branch (rebase_replace)
+                 "rebase_replace", "never_force",   # whether a rebase replaces its branch (rebase_replace)
+                 "channel_tags"},   # release-channel tags a forward move may update under never_force (channeltag)
     "jev": {"via", "url", "model"},
     "power": {"keep_awake"},
     # device_timeout_max_s: a ceiling on device-job timeouts (off: unset); see device_timeout_max.
@@ -915,6 +916,8 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
             str(own).strip().lower().replace("-", "_") not in OWN_PUSH_MODES + ("existing", "true", "false", "yes", "no"):
         out.append(f"delivery.own_push: {own!r} is not one of {', '.join(OWN_PUSH_MODES)}; `ttp push --own` is off")
     out += rebase_problems(delivery)
+    from .channeltag import problems as channel_tag_problems
+    out += channel_tag_problems(delivery)
     if not isinstance(delivery.get("plugin_version_guard", False), bool):
         out.append(f"delivery.plugin_version_guard: {delivery['plugin_version_guard']!r} is not true or false; "
                    "the plugin version guard is off")

@@ -14,7 +14,8 @@ a delete). The repository's own pre-push hook still runs after it. `--no-verify`
 Anything else, or any fault reading the project, runs the real git unchanged.
 
 With delivery.never_force on, a run's push that forces in any form (--force, -f, --force-with-lease,
---force-if-includes, a `+refspec`) is refused before git runs (forced, never_force_refusal).
+--force-if-includes, a `+refspec`) is refused before git runs (forced, never_force_refusal), except a
+forward move of a delivery.channel_tags tag under a fresh lease (channeltag.py, `ttp push --move-tag`).
 """
 from __future__ import annotations
 
@@ -87,20 +88,31 @@ def forced(rest: list[str]) -> str:
     return ""
 
 
-def never_force_refusal(args: list[str], env: dict) -> str:
-    """Why `git <args>` must not run in this run (a forced push while delivery.never_force is on), or ""."""
-    _, sub, rest = split(args)
+def never_force_refusal(args: list[str], env: dict, git: str = "git") -> str:
+    """Why `git <args>` must not run in this run (a forced push while delivery.never_force is on), or "".
+    The one forced push let through is a forward move of a delivery.channel_tags tag under a fresh lease
+    (channeltag.refusal; `git` runs its checks), logged when allowed."""
+    globals_, sub, rest = split(args)
     if sub != "push" or not (word := forced(rest)):
         return ""
     task, base = env.get("TTP_TASK", ""), env.get("TTP_PROJECT", "")
     if not task.isdigit() or not base:
         return ""
+    from . import channeltag
     from .project import Project, never_force
     p = Project(base)
-    if not (p.state / "project.db").is_file() or not never_force(p.config()):
+    if not (p.state / "project.db").is_file() or not never_force(cfg := p.config()):
         return ""
+    if (move := channeltag.parse(rest)) is not None:
+        why, facts = channeltag.refusal([git, *globals_], move, cfg)
+        if not why:
+            channeltag.log(p, facts, "allowed")
+            return ""
+        return f"delivery.never_force is true: not moving tag {move['tag']}: {why}"
+    hint = (" To move a delivery.channel_tags tag forward, run `ttp push --move-tag <tag> <commit>`."
+            if channeltag.channel_tags(cfg) else "")
     return (f"delivery.never_force is true: this run never force-pushes ({word}); push a fast-forward, "
-            f"or deliver a rewritten history on a new branch")
+            f"or deliver a rewritten history on a new branch.{hint}")
 
 
 def guarded_branch(env: dict) -> tuple[str, str]:
@@ -180,7 +192,7 @@ def main(argv: list[str]) -> int:
     """argv: the real git, then the arguments `git` was called with."""
     real, args = argv[0], argv[1:]
     try:
-        why = never_force_refusal(args, dict(os.environ))
+        why = never_force_refusal(args, dict(os.environ), real)
     except Exception:   # a fault reading the project never stops git
         why = ""
     if why:

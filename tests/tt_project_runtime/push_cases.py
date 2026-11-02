@@ -12621,6 +12621,133 @@ def test_rebase_replace_lease_with_never_force_is_rejected_at_config_validation(
     assert out == [] or any("needs the user's approval" in x for x in out)
 
 
+def _channel_setup(env, monkeypatch):
+    """A work task's run under delivery.never_force with the channel tag `chan` on origin at A. The
+    push branch proj: B, then A and a sibling S of A (both children of B) merged as M. `feature` on
+    origin holds N, a child of A that is not on proj. The wrapper git comes first on PATH."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    monkeypatch.setenv("TTP_TASK", str(p.db.add_task("Release cut", "s", kind="work")))
+    monkeypatch.setenv("TTP_PYTHON", sys.executable)
+    monkeypatch.setenv("PATH", f"{RUNTIME.parent / 'template' / 'bin'}:{os.environ['PATH']}")
+    _commit(repo, "b.txt", "b\n")
+    b = _git_out(repo, "rev-parse", "HEAD")
+    _commit(repo, "a.txt", "a\n")
+    a = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "checkout", "-q", "-b", "side", b)
+    _commit(repo, "s.txt", "s\n")
+    s = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "checkout", "-q", "-B", "work", a)
+    _git_out(repo, "merge", "-q", "--no-edit", "side")
+    m = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    _git_out(repo, "checkout", "-q", "-b", "feature", a)
+    _commit(repo, "n.txt", "n\n")
+    n = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/feature")
+    _git_out(repo, "checkout", "-q", "work")
+    p.set_config("delivery.never_force", True)
+    # Creating a tag needs no force: unchanged under never_force, through the run's git.
+    for tag in ("chan", "other"):
+        out = subprocess.run(["git", "push", "-q", "origin", f"{a}:refs/tags/{tag}"], cwd=repo,
+                             capture_output=True, text=True, timeout=60)
+        assert out.returncode == 0, out.stderr
+    return p, repo, origin, {"A": a, "B": b, "S": s, "M": m, "N": n}
+
+
+def _wrapper_push(repo, *args):
+    return subprocess.run(["git", "push", *args], cwd=repo, capture_output=True, text=True, timeout=60)
+
+
+def test_channel_tag_moves_forward_under_never_force_with_a_fresh_lease(env, monkeypatch, capsys):
+    """delivery.channel_tags lists `chan`: `ttp push --move-tag chan <commit>` moves it forward to a
+    commit on the push branch under never_force, through the run's git wrapper (its gitguard allows the
+    lease push), and both are logged with the tag, the old and new shas and the time. The raw move form
+    goes through the wrapper too; a repeat is a no-op."""
+    from ttp import channeltag, coordinator as coord, gitguard, project
+    p, repo, origin, c = _channel_setup(env, monkeypatch)
+    assert channeltag.channel_tags(p.config()) == []   # default: none, so nothing changes
+    assert _ttp("push", "--move-tag", "chan", c["M"]) == 2
+    assert "not in delivery.channel_tags" in capsys.readouterr().err
+    assert coord.apply(p, [{"type": "config_set", "key": "delivery.channel_tags", "value": ["chan"]}]) == []
+    assert project.config_problems(p.raw_config(), p.root) == [] or not any(
+        "channel_tags" in x for x in project.config_problems(p.raw_config(), p.root))
+    assert any("channel_tags" in x for x in project.config_problems(
+        {**p.raw_config(), "delivery": {"channel_tags": ["bad..name"]}}, p.root))
+    t0 = time.time()
+    assert _ttp("push", "--move-tag", "chan", c["M"]) == 0, capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", "chan") == c["M"]
+    assert f"moved chan on origin from {c['A'][:12]} to {c['M'][:12]}" in capsys.readouterr().err
+    rows = [json.loads(ln) for ln in (p.state / channeltag.LOG).read_text().splitlines()]
+    assert [r["event"] for r in rows] == ["allowed", "moved"], rows
+    assert all(r["tag"] == "chan" and r["old"] == c["A"] and r["new"] == c["M"] and r["ts"] >= t0 for r in rows)
+    assert _ttp("push", "--move-tag", "chan", c["M"]) == 0 and "already at" in capsys.readouterr().err
+    # The raw move form through the wrapper, onto a newer commit of the push branch.
+    _commit(repo, "c.txt", "c\n")
+    new = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    out = _wrapper_push(repo, *channeltag.argv("origin", "chan", c["M"], new)[1:])
+    assert out.returncode == 0, out.stderr
+    assert _git_out(origin, "rev-parse", "chan") == new
+    # git by its path: the PreToolUse hook's check lets the same form through.
+    assert gitguard.never_force_refusal(["push", *channeltag.argv("origin", "chan", new, new)[1:]],
+                                        dict(os.environ)) == ""
+
+
+def test_channel_tag_move_refusals_under_never_force(env, monkeypatch, capsys):
+    """Every rule of the move: an unlisted tag, another ref or remote or several refs, a missing, short
+    or stale lease, a backward or sideways move, a commit off the push branch, and a delete or a branch
+    force push are refused, by `ttp push --move-tag` and by the run's git; the tag stays put."""
+    from ttp import channeltag, gitguard, hook
+    p, repo, origin, c = _channel_setup(env, monkeypatch)
+    p.set_config("delivery.channel_tags", ["chan"])
+    a, m = c["A"], c["M"]
+    good = channeltag.argv("origin", "chan", a, m)[1:]
+
+    def refused(args, why):
+        r = gitguard.never_force_refusal(["push", *args], dict(os.environ))
+        assert "delivery.never_force" in r and why in r, (args, r)
+
+    lease = f"--force-with-lease=refs/tags/chan:{a}"
+    # (1) a tag not in delivery.channel_tags
+    refused(channeltag.argv("origin", "other", a, m)[1:], "not in delivery.channel_tags")
+    assert _ttp("push", "--move-tag", "other", m) == 2 and "not in delivery.channel_tags" in capsys.readouterr().err
+    # (2) exactly refs/tags/chan on the push remote: several refs, another ref name, another remote,
+    # another force word, a `+`, follow-tags left on
+    _git_out(repo, "remote", "add", "mirror", str(origin))
+    for args in ([*good, f"{m}:refs/heads/x"], ["--no-follow-tags", lease, "origin", f"{m}:chan"],
+                 ["--no-follow-tags", lease, "--force", "origin", f"{m}:refs/tags/chan"],
+                 ["--no-follow-tags", lease, "origin", f"+{m}:refs/tags/chan"],
+                 [lease, "origin", f"{m}:refs/tags/chan"], ["--all", *good]):
+        refused(args, "never force-pushes")
+    refused(channeltag.argv("mirror", "chan", a, m)[1:], "only on the push remote origin")
+    # (3) the lease: none, no value, a short sha, a stale value
+    for args in (["--no-follow-tags", "--force", "origin", f"{m}:refs/tags/chan"],
+                 ["--no-follow-tags", "--force-with-lease", "origin", f"{m}:refs/tags/chan"],
+                 ["--no-follow-tags", "--force-with-lease=refs/tags/chan", "origin", f"{m}:refs/tags/chan"]):
+        refused(args, "never force-pushes")
+    refused(channeltag.argv("origin", "chan", a[:12], m)[1:], "full current value")
+    refused(channeltag.argv("origin", "chan", c["S"], m)[1:], "stale lease")
+    # (4) forward only: backward to B, sideways to S (both on the push branch)
+    for to in (c["B"], c["S"]):
+        refused(channeltag.argv("origin", "chan", a, to)[1:], "moves only forward")
+        assert _ttp("push", "--move-tag", "chan", to) == 2 and "moves only forward" in capsys.readouterr().err
+    # (5) a forward commit that is not on origin/proj
+    refused(channeltag.argv("origin", "chan", a, c["N"])[1:], "not on origin/proj")
+    assert _ttp("push", "--move-tag", "chan", c["N"]) == 2 and "not on origin/proj" in capsys.readouterr().err
+    # A tag delete and a branch force push stay refused, also with a lease.
+    for args in (["--no-follow-tags", lease, "origin", ":refs/tags/chan"],
+                 ["--no-follow-tags", lease, "--delete", "origin", "refs/tags/chan"],
+                 ["--no-follow-tags", f"--force-with-lease=refs/heads/proj:{m}", "origin", f"{a}:refs/heads/proj"]):
+        refused(args, "never force-pushes")
+    # Through the wrapper and by git's path (the hook): refused, and the tag stays at A.
+    out = _wrapper_push(repo, *channeltag.argv("origin", "chan", a, c["N"])[1:])
+    assert out.returncode != 0 and "not on origin/proj" in out.stderr, out.stderr
+    real = shutil.which("git", path=os.environ["PATH"].split(":", 1)[1])
+    assert "moves only forward" in hook.git_push_bypass([[real, *channeltag.argv("origin", "chan", a, c["B"])]])
+    assert _git_out(origin, "rev-parse", "chan") == a and _git_out(origin, "rev-parse", "other") == a
+    assert not (p.state / channeltag.LOG).exists()
+
+
 def test_an_upgraded_project_without_the_setting_rebases_onto_a_new_branch(env, monkeypatch):
     """(f) A project.json from before delivery.rebase_replace (no key at all) reads as new_branch: no
     migration, no config problem, and a rebase task delivers on its own branch, never under a lease."""
