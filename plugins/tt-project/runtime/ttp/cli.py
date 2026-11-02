@@ -4661,6 +4661,10 @@ def cmd_clip(a) -> None:
     cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
     if not cmd:
         die("usage: ttp clip -- <command>")
+    if len(cmd) > 1:   # a pytest run's xdist options, where xdist is not installed, are dropped
+        cmd, dropped = testslots.drop_xdist(cmd)
+        if dropped:
+            print(f"ttp clip: {dropped}", flush=True)
     line, env, grant, argv = shlex.join(cmd) if len(cmd) > 1 else cmd[0], None, None, None
     if testslots.builds(line):
         def tell(msg: str) -> None:

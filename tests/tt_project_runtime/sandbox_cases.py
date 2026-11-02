@@ -460,3 +460,51 @@ def test_the_hook_gives_one_notice_where_no_sandbox_works(tmp_path, monkeypatch)
     assert "permissionDecision" not in out["hookSpecificOutput"]
     assert "no process sandbox works here (no unshare)" in out["hookSpecificOutput"]["additionalContext"]
     assert call("pytest -q") is None
+
+
+def _fake_python(tmp_path, xdist_rc: int):
+    """A stand-in interpreter: its xdist probe (`-c ...`) exits `xdist_rc` (0 has xdist, 3 lacks it,
+    other cannot tell); any other run prints its arguments."""
+    py = tmp_path / f"python9.{xdist_rc}"   # a name the pytest detector takes for an interpreter
+    py.write_text(f'#!/bin/sh\n[ "$1" = -c ] && exit {xdist_rc}\necho "ARGS: $*"\n')
+    py.chmod(0o755)
+    return str(py)
+
+
+def test_drop_xdist_takes_out_worker_options_only_where_xdist_is_missing(tmp_path):
+    from ttp import testslots
+    py = _fake_python(tmp_path, 3)
+    argv = [py, "-m", "pytest", "-q", "-n", "4", "-k", "-n", "-nauto", "--numprocesses=3", "--dist", "load",
+            "--dist=loadfile", "t.py", "--", "-n", "2"]
+    kept, said = testslots.drop_xdist(argv)
+    assert kept == [py, "-m", "pytest", "-q", "-k", "-n", "t.py", "--", "-n", "2"], kept
+    assert said.startswith(f"pytest-xdist is not installed for {py}: dropped -n 4 -nauto") and "one process" in said
+    for form in (["-n4"], ["-n", "auto"], ["-n", "logical"], ["--numprocesses", "2"], ["--maxprocesses=2"]):
+        assert testslots.drop_xdist([py, "-m", "pytest", *form, "t.py"])[0] == [py, "-m", "pytest", "t.py"], form
+    # With xdist, or where the probe cannot tell, nothing changes and nothing is said.
+    for rc in (0, 1):
+        other = _fake_python(tmp_path, rc)
+        assert testslots.drop_xdist([other, "-m", "pytest", "-n", "4"]) == ([other, "-m", "pytest", "-n", "4"], "")
+    # Not pytest, or pytest with no xdist option: as it is, and no probe needed.
+    for cmd in (["head", "-n", "5", "f"], [py, "t.py", "-n", "2"], [py, "-m", "pytest", "-q", "-k", "-n2"]):
+        assert testslots.drop_xdist(cmd) == (cmd, ""), cmd
+    # A pytest script's interpreter is read from its shebang, also through env.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "pytest").write_text(f"#!/usr/bin/env {py}\n")
+    (bindir / "pytest").chmod(0o755)
+    script = str(bindir / "pytest")
+    assert testslots.drop_xdist([script, "-n", "2", "t.py"])[0] == [script, "t.py"]
+
+
+@pytest.mark.parametrize("tool", ["sandbox", "clip"])
+def test_ttp_sandbox_and_clip_run_pytest_without_n_where_xdist_is_missing(tmp_path, tool):
+    runtime = pathlib.Path(__import__("ttp").__file__).resolve().parent.parent
+    env = {**os.environ, "PYTHONPATH": str(runtime)}
+    env.pop("TTP_RUN_DIR", None)
+    for rc, args in ((3, "-m pytest -q t.py"), (0, "-m pytest -q -n 4 t.py")):
+        py = _fake_python(tmp_path, rc)
+        r = subprocess.run([sys.executable, "-m", "ttp", tool, "--", py, "-m", "pytest", "-q", "-n", "4", "t.py"],
+                           env=env, capture_output=True, text=True, timeout=120)
+        assert r.returncode == 0 and f"ARGS: {args}" in r.stdout, (r.stdout, r.stderr)
+        assert ("dropped -n 4" in r.stdout + r.stderr) is (rc == 3), (r.stdout, r.stderr)

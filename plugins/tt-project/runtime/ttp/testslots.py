@@ -1238,6 +1238,72 @@ def clamp(cmd: str, k: int) -> str:
     return _apply(cmd, _edits(cmd, k, False))
 
 
+# pytest-xdist's options: without xdist pytest refuses each as an unrecognized argument.
+XDIST_OPTS = ("-n", "--numprocesses", "--dist", "--maxprocesses")
+XDIST_PROBE = "import importlib.util as u, sys; sys.exit(0 if u.find_spec('xdist') else 3)"
+
+
+def _python_of(argv: list[str]) -> str | None:
+    """The interpreter a direct pytest run `argv` starts: its python word, or a pytest script's
+    shebang (through `env`); None when it cannot tell."""
+    name = os.path.basename(argv[0])
+    if name not in ("pytest", "py.test"):
+        return argv[0]
+    script = shutil.which(argv[0]) or argv[0]
+    try:
+        with open(script, "rb") as fh:
+            line = fh.readline(512).decode(errors="replace")
+    except OSError:
+        return None
+    words = line[2:].split() if line.startswith("#!") else []
+    if words and os.path.basename(words[0]) == "env":
+        words = [w for w in words[1:] if not w.startswith("-") and "=" not in w]
+    return words[0] if words else None
+
+
+def _has_xdist(python: str) -> bool | None:
+    """Whether `python` can import xdist; None when the probe cannot tell (no such interpreter, a hang)."""
+    try:
+        rc = subprocess.run([python, "-c", XDIST_PROBE], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, timeout=30).returncode
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return True if rc == 0 else False if rc == 3 else None
+
+
+def drop_xdist(argv: list[str]) -> tuple[list[str], str]:
+    """A direct pytest run `argv` (`pytest ...`, `python3 -m pytest ...`) with pytest-xdist's options
+    (XDIST_OPTS: -n N, -n auto, -nN, --numprocesses=N, --dist ...) taken out when the interpreter that
+    runs it cannot import xdist, and a one-line notice saying so; else `argv` as it is and "". Another
+    option's value (`-k "-n"`) and anything after `--` stay."""
+    from .hook import PYTEST_VALUE_OPTS, _pytest_args
+    args = _pytest_args(list(argv))
+    if not args:
+        return list(argv), ""
+    keep, dropped, i = list(argv[:len(argv) - len(args)]), [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            keep += args[i:]
+            break
+        if a in XDIST_OPTS:
+            dropped += args[i:i + 2]
+            i += 2
+            continue
+        if any(a.startswith(o + "=") for o in XDIST_OPTS) or re.fullmatch(r"-n(?:\d+|auto|logical)", a):
+            dropped.append(a)
+        else:
+            keep.append(a)
+            if a in PYTEST_VALUE_OPTS and i + 1 < len(args):
+                keep.append(args[i + 1])
+                i += 1
+        i += 1
+    if not dropped or (python := _python_of(list(argv))) is None or _has_xdist(python) is not False:
+        return list(argv), ""
+    return keep, (f"pytest-xdist is not installed for {python}: dropped {shlex.join(dropped)}; "
+                  f"the tests run in one process")
+
+
 def builds(cmd: str) -> bool:
     """Whether `cmd` runs a build tool: make, gmake, ninja or `cmake --build`."""
     return any(_is_tool(words, i, True) and _runs(words, i) for seg in _segments(cmd)

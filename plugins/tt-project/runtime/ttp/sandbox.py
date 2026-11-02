@@ -158,7 +158,12 @@ def notice(on: bool = True) -> str:
 
 def run(argv: list[str]) -> int:
     """`ttp sandbox -- <cmd...>`: run `argv` sandboxed and return its exit code. A SIGTERM or SIGHUP
-    to this process (a `timeout`, a closed terminal) ends the whole namespace."""
+    to this process (a `timeout`, a closed terminal) ends the whole namespace. A pytest run's xdist
+    options are dropped where xdist is not installed (testslots.drop_xdist)."""
+    from . import testslots
+    argv, dropped = testslots.drop_xdist(argv)
+    if dropped:
+        print(f"ttp sandbox: {dropped}", file=sys.stderr, flush=True)
     wrapped = wrap(argv)
     if wrapped == list(argv):
         if line := notice():
