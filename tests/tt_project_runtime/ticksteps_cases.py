@@ -722,3 +722,46 @@ def test_every_git_helper_takes_gitmemos_cap():
     assert not bad, f"git helpers that do not take gitmemo.timeout(); route them or allowlist them: {bad}"
     assert ("pushq.py", "_git") in found and ("push.py", "_git") in found, found   # the scan sees them
     assert set(GIT_HELPER_OWN_TIMEOUT) <= found, set(GIT_HELPER_OWN_TIMEOUT) - found   # no stale entry
+
+
+def _full_daemon_log(monkeypatch):
+    """While the returned flag is set, every open of a path ending in daemon.log raises ENOSPC (a full
+    state filesystem); clear it and space has returned."""
+    import builtins
+    import errno
+    real, full = builtins.open, threading.Event()
+    full.set()
+
+    def fake(file, *a, **k):
+        if full.is_set() and str(file).endswith("daemon.log"):
+            raise OSError(errno.ENOSPC, "No space left on device", str(file))
+        return real(file, *a, **k)
+    monkeypatch.setattr(builtins, "open", fake)
+    return full
+
+
+def test_a_full_disk_never_lets_daemon_log_raise_and_the_failing_step_is_counted(env, monkeypatch, capsys):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    monkeypatch.setattr(dmod, "_LOG_FAIL", {"t": float("-inf"), "n": 0})
+    full = _full_daemon_log(monkeypatch)
+
+    def boom():
+        raise RuntimeError("step broke")
+    for _ in range(3):   # each tick: no exception out of the step, its failure still counted (logged once)
+        assert d._run_step(boom, "boom", default="x") == "x"
+    assert d._step_fails["boom"][0] == 3
+    dmod.log(p, "another line")
+    dmod.log(p, "and another")
+    err = capsys.readouterr().err
+    assert err.count("daemon.log") == 1, err   # one stderr line, not one per failed write
+    full.clear()   # space returns: the next line is written, after a count of the lines dropped
+    with open(p.logs / "daemon.log", "a") as f:
+        f.write("2026-01-01T00:00:00 a line cut sh")   # what a flush that hit the full disk left
+    dmod.log(p, "space is back")
+    lines = (p.logs / "daemon.log").read_text().splitlines()
+    assert lines[-3].endswith("a line cut sh"), lines[-3:]
+    assert "3 line(s) dropped" in lines[-2] and lines[-1].endswith(" space is back"), lines[-3:]
+    dmod.log(p, "and on")   # the count is reset once a line is written
+    assert "dropped" not in (p.logs / "daemon.log").read_text().splitlines()[-1]

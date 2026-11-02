@@ -482,11 +482,46 @@ def _raised_at(e: BaseException) -> str:
     return at
 
 
+LOG_FAIL_S = 300   # a daemon.log that cannot be written says so on stderr at most this often
+_LOG_FAIL = {"t": float("-inf"), "n": 0}   # when stderr last said so; lines dropped since the last one written
+
+
+def _log_torn(path: Path) -> bool:
+    """Whether the file at `path` ends inside a line (a write cut short by a full disk)."""
+    with open(path, "rb") as f:
+        if not f.seek(0, os.SEEK_END):
+            return False
+        f.seek(-1, os.SEEK_END)
+        return f.read(1) != b"\n"
+
+
 def log(p: Project, msg: str) -> None:
-    p.logs.mkdir(parents=True, exist_ok=True)
-    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {redact.scrub(msg)}\n"
-    with open(p.logs / "daemon.log", "a") as f:
-        f.write(line)
+    """Append a line to daemon.log. Never raises on a write failure (a full or read-only state
+    filesystem): the line is dropped, stderr says so once per LOG_FAIL_S, and the next line written
+    says how many were dropped. The daemon rides it out; the failed tick step retries next tick."""
+    stamp = time.strftime('%Y-%m-%dT%H:%M:%S')
+    line = f"{stamp} {redact.scrub(msg)}\n"
+    path = p.logs / "daemon.log"
+    try:
+        p.logs.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            if _LOG_FAIL["n"]:   # a failed flush may have left part of a line: end it first
+                f.write(("\n" if _log_torn(path) else "") + f"{stamp} daemon.log: {_LOG_FAIL['n']} line(s) "
+                        "dropped or cut short while it could not be written\n")
+            f.write(line)
+    except OSError as e:
+        _LOG_FAIL["n"] += 1
+        now = time.monotonic()
+        if now - _LOG_FAIL["t"] >= LOG_FAIL_S:
+            _LOG_FAIL["t"] = now
+            try:
+                sys.stderr.write(f"{stamp} ttp daemon: cannot write {path} ({e.strerror or e}); "
+                                 f"{_LOG_FAIL['n']} line(s) dropped, carrying on\n")
+                sys.stderr.flush()
+            except Exception:   # stderr on the same full filesystem
+                pass
+        return
+    _LOG_FAIL["n"] = 0
 
 
 NETWORK_FS = {"nfs", "nfs4", "cifs", "smb3", "smbfs", "sshfs", "9p", "afs", "ceph", "glusterfs", "lustre",
