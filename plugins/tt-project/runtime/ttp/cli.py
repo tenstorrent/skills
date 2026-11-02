@@ -647,6 +647,8 @@ def bootstrap(root: Path, name: str, brief: str, provider: str, home_tz: str | N
     p.base.mkdir(parents=True, exist_ok=True)
     # The folder ignores itself, so no enclosing repository can ever commit project state.
     durable_write(p.base / ".gitignore", "*\n")
+    from . import indexignore
+    indexignore.ensure(p)
     for d in (p.state, p.runs, p.logs, p.worktrees, p.memory_dir):
         d.mkdir(parents=True, exist_ok=True)
     template = PLUGIN_ROOT / "template"

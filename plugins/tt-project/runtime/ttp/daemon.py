@@ -37,6 +37,7 @@ from . import ackwait
 from . import checksgone
 from . import rejcool
 from . import stalegate
+from . import indexignore
 from . import lanewait
 from . import chainprio
 from . import churnwatch
@@ -945,6 +946,11 @@ class Daemon:
                 log(self.p, f"closed {len(closed)} stray push batch file(s)")
         except Exception:
             log(self.p, "stray batch file close error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+        try:   # workers' start-up file index skips the project's bulky folders (indexignore)
+            if did := indexignore.ensure(self.p):
+                log(self.p, did)
+        except Exception:
+            log(self.p, "index ignore file error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "stopping", True))
         signal.signal(signal.SIGINT, lambda *_: setattr(self, "stopping", True))
         r = self.identity
