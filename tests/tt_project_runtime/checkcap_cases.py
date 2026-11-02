@@ -4761,3 +4761,36 @@ def test_test_slots_grant_follows_the_hosts_live_free_cores(env, monkeypatch):
     monkeypatch.setenv("TTP_CHECKS_LIVE_CORES", "0")
     with testslots.acquire("off") as g:
         assert g.k == 8, "checks.live_cores 0: the share alone"
+
+
+def test_a_wait_for_a_checks_slot_reads_pids_once_per_cycle_without_proc(env, tmp_path, monkeypatch):
+    """Without /proc, checkcap.acquire's wait reads its held locks' pids from one `ps` per poll cycle,
+    however many slots are held (ps_snapshot), never one `ps` per held lock each cycle."""
+    import subprocess
+    from ttp import checkcap, project
+
+    monkeypatch.delenv(checkcap.HELD_ENV, raising=False)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "3")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")   # no slots beyond the cap: the waiter waits
+    monkeypatch.setattr(project, "_PROC", False)
+    monkeypatch.setattr(checkcap, "POLL_S", 0.01)
+    held = [checkcap.acquire(f"h{i}") for i in range(3)]   # the cap is full: a waiter polls, not takes
+    calls, cycles = _counting_ps(monkeypatch), []
+
+    def stop_():
+        cycles.append(1)
+        return "stop" if len(cycles) > 2 else ""
+
+    try:
+        t = threading.Thread(target=lambda: checkcap.acquire("w", stop=stop_, max_wait_s=30))
+        t.start()
+        assert _wait_for(lambda: len(checkcap.state()["queued"]) == 1), checkcap.state()
+        t.join(30)
+    finally:
+        for s in held:
+            s.close()
+    assert len(cycles) >= 3, "the waiter polled at least 3 cycles"
+    # One `ps` per poll cycle, whatever the number of held locks: its holder liveness reads one
+    # snapshot (ps_snapshot); a per-pid `ps` per held lock (no snapshot) is the failure this catches.
+    assert len(calls) <= len(cycles) + 1, \
+        f"{len(calls)} ps calls for {len(cycles)} poll cycles and 3 held locks"

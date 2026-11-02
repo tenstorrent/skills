@@ -478,6 +478,7 @@ class Slot:
         self.close()
 
 
+@project.ps_snapshot()
 def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = None,
             waiting: Callable[[bool], None] | None = None, max_wait_s: float | None = None,
             since: float | None = None, project_name: str | None = None,
@@ -571,6 +572,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             if max_wait_s is not None and time.time() - started >= max_wait_s:
                 return None
             time.sleep(poll_s(POLL_S))
+            project.ps_cycle()   # pids are read once per poll cycle, never one `ps` each (ps_snapshot)
     finally:
         locks.dequeue(ticket)
         if told and waiting:
