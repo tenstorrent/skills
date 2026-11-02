@@ -30,6 +30,7 @@ TIER_SOURCES = {
 }
 PAUSED_RESOURCES_KEY = "paused_resources"   # kv: see DB.paused_resources
 PAUSE_BOOT_KEY = "pause_until_boot"   # kv: {"boot", "since"} of a `ttp pause --until-reboot`; see DB.set_paused
+KV_CORRUPT = "corrupt:"   # kv: corrupt:<key>:<ts> holds a value of <key> that was not JSON (DB._quarantine_kv)
 SHARED_SEEN_KEY = "shared_pauses_seen"   # kv: {resource: pause} of the shared pauses this project acted on
 # kv keys that hold one object ({name: ...}): set_kv refuses any other value but None, and kv_dict
 # reads a stored scalar or list as empty. Modules register theirs at import (DICT_KV.add).
@@ -749,7 +750,42 @@ END""")
 
     def kv(self, key: str, default: Any = None) -> Any:
         r = self.one("SELECT value FROM kv WHERE key=?", (key,))
-        return json.loads(r["value"]) if r else default
+        if not r:
+            return default
+        try:
+            return json.loads(r["value"])
+        except (TypeError, ValueError):   # a torn or hand-edited row must not stop the daemon or a turn
+            self._quarantine_kv(key, r["value"])
+            return default
+
+    def _quarantine_kv(self, key: str, raw: Any) -> None:
+        """Move a kv value that is not JSON aside to `corrupt:<key>:<ts>`, so readers get their default
+        and the next write starts fresh, with one line in the daemon's log and one low alert per key.
+        Inside a transaction that rolls back the row stays and the next read moves it again; a database
+        that cannot be written (read-only, locked past its retries) only logs. Never raises."""
+        ts = time.time()
+        moved = False
+        try:
+            with self.tx():
+                self.x("INSERT OR REPLACE INTO kv(key,value,ts) VALUES(?,?,?)",
+                       (f"{KV_CORRUPT}{key}:{ts:.6f}", raw if isinstance(raw, str) else repr(raw), ts))
+                self.x("DELETE FROM kv WHERE key=?", (key,))
+                if not self.one("SELECT 1 FROM messages WHERE ref=? LIMIT 1", (f"kv_corrupt:{key}",)):
+                    self.post("out", f"The stored state `{key}` was not readable and was reset to its default; "
+                                     f"the raw value is kept as kv `{KV_CORRUPT}{key}:{ts:.6f}`.",
+                              chat=None, kind="alert", severity="low", ref=f"kv_corrupt:{key}")
+            moved = True
+        except Exception:
+            pass
+        try:
+            log = Path(self.path).parent / "logs" / "daemon.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with log.open("a") as fh:
+                fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} kv {key} corrupt ({len(str(raw))} chars, not JSON): "
+                         + (f"moved to {KV_CORRUPT}{key}:{ts:.6f}, read as default\n" if moved
+                            else "not moved (database not writable), read as default\n"))
+        except Exception:
+            pass
 
     def kv_dict(self, key: str) -> tuple[dict, Any]:
         """The object stored at `key` and, when it holds something else (a string, list or number),
