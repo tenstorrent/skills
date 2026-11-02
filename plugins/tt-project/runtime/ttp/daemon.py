@@ -2127,6 +2127,13 @@ class Daemon:
                 log(self.p, r["text"])
         except Exception:
             log(self.p, "stopping the detached jobs of ended tasks failed\n" + traceback.format_exc())
+        try:   # an ended task's own leftover processes that alone hold a lock slot or lane (leftoverstop)
+            if due:
+                from . import leftoverstop
+                for r in leftoverstop.sweep(self.p):
+                    log(self.p, r["text"])
+        except Exception:
+            log(self.p, "stopping the leftover processes of ended tasks failed\n" + traceback.format_exc())
         try:
             self.stop_cancelled_checks()
         except Exception:

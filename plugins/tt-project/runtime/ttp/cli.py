@@ -4886,6 +4886,8 @@ def cmd_leftover_procs(a) -> None:
     """A hand-off check (worker.handoff_checks): exit 1 while a done hand-off's task still has live
     processes in its own worktree (leftoverprocs.py), 0 when it has none, 2 when it cannot tell."""
     from . import leftoverprocs
+    if a.stop is not None:
+        sys.exit(_leftover_stop(a))
     path = a.result or os.environ.get("TTP_RESULT_JSON") or ""
     tid = a.task if a.task is not None else os.environ.get("TTP_TASK_ID", "")
     if not path or not str(tid).isdigit():
@@ -4901,6 +4903,38 @@ def cmd_leftover_procs(a) -> None:
     if msg:
         print(msg)
     sys.exit(rc)
+
+
+def _leftover_stop(a) -> int:
+    """`ttp leftover-procs --stop <task> [--pid N ...] [--dry-run]`: stop an ended task's own leftover
+    processes (leftoverstop.stop). 0 when stopped or none ran, 2 when the task is refused or a process is
+    (the others are still stopped). A sandboxed caller queues the stop for the daemon, which checks again."""
+    from . import leftoverstop
+    from .push import _boxed
+    p = Project(os.environ["TTP_PROJECT"]) if os.environ.get("TTP_PROJECT") else here()
+    if p is None:
+        die("ttp leftover-procs --stop: no project here; run it from the project root")
+    if not leftoverstop.PROC.is_dir():
+        print("ttp leftover-procs --stop: no /proc on this host: no process can be attributed; nothing stopped",
+              file=sys.stderr)
+        return 2
+    if _boxed() and not a.dry_run:
+        leftoverstop.request(p, a.stop, a.pid, os.environ.get("TTP_TASK") or "")
+        print(f"task #{a.stop}: queued; the daemon checks again and stops them within seconds; its receipt "
+              f"goes to the feed ({leftoverstop.EVENT})")
+        return 0
+    r = leftoverstop.stop(p, a.stop, a.pid, dry=a.dry_run)
+    if r.get("error"):
+        print(f"ttp leftover-procs --stop: refused: {r['error']}", file=sys.stderr)
+        return 2
+    for t in r["stopped"]:
+        print(f"{'would stop' if a.dry_run else 'stopped'} pid {t['pid']}: {t['cmd'] or '?'}")
+    for t in r["refused"]:
+        print(f"refused pid {t['pid']}: {t['why']}", file=sys.stderr)
+    if not a.dry_run:
+        print(f"task #{a.stop}: stopped {len(r['stopped'])}; locks freed: {', '.join(r.get('freed') or []) or 'none'}"
+              + (f"; still held: {', '.join(r['held'])}" if r.get("held") else ""))
+    return 2 if r["refused"] else 0
 
 
 def cmd_svcscan(a) -> None:
@@ -9925,9 +9959,18 @@ def main(argv: list[str] | None = None) -> None:
         "resolved working directory is the task's own worktree (<project>/tt-project/worktrees/t<id>) or below "
         "it, by whole path components: t39 never claims t390, and another project's t<id> is never this "
         "one's. A pid the hand-off lists in leftover_procs [{pid, stop, ends}] is not reported. Read-only; "
-        "Linux /proc (none found elsewhere). Exit codes: 0 none, 1 some found, 2 usage or an unreadable hand-off."))
+        "Linux /proc (none found elsewhere). Exit codes: 0 none, 1 some found, 2 usage or an unreadable hand-off. "
+        "--stop TASK ends an ended (done, failed, cancelled, exhausted) task's own leftover processes: those of "
+        "this user whose environment carries this project's TTP_PROJECT, the task's TTP_TASK and a TTP_RUN_DIR of "
+        "one of its recorded runs. SIGTERM, then SIGKILL after 5 s; it prints each pid stopped and the locks "
+        "freed, and writes a receipt to the feed. A running task's, another task's, project's or user's "
+        "process, a `ttp detach` job's, one using a device, and any it cannot attribute are refused (exit 2)."))
     s.add_argument("result", nargs="?", help="the hand-off's result.json (default: TTP_RESULT_JSON)")
     s.add_argument("--task", type=int, help="the task id (default: TTP_TASK_ID)")
+    s.add_argument("--stop", type=int, metavar="TASK", help="stop this ended task's own leftover processes")
+    s.add_argument("--pid", type=int, action="append", help="with --stop: only this pid (repeatable); "
+                                                            "refused unless it is the task's own")
+    s.add_argument("--dry-run", action="store_true", help="with --stop: list what it would stop and refuse")
     s.set_defaults(fn=cmd_leftover_procs)
 
     s = sub.add_parser("goal", help="stock goal checks, one JSON line per observation; exit 0 met, 1 not, "

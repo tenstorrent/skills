@@ -226,6 +226,15 @@ prolonged whole-box outage.
   number, or t390 for t39, never counts); a pid the hand-off lists in `leftover_procs`
   `[{pid, stop, ends}]` is left out. A project check that matches processes itself should compare
   the full resolved worktree path the same way, never a bare `t<id>`.
+- A task that has ended (done, failed, cancelled, exhausted) can still leave processes behind. Its own
+  ones are those of your user whose environment carries this project's `TTP_PROJECT`, the task's
+  `TTP_TASK` and a `TTP_RUN_DIR` of one of its recorded runs. When such processes are the only ones with a
+  held lock slot or lane open, the daemon ends them (SIGTERM, then SIGKILL after 5 s) two minutes after the
+  task ended, so the slot is free again, and writes a `leftover_procs_stopped` receipt to the feed.
+  `ttp leftover-procs --stop <task> [--pid N ...] [--dry-run]` does the same on request, for a worker or the
+  coordinator. It refuses a running task's processes, another task's, project's or user's, a
+  `ttp detach` job's (use `ttp detach --stop`), one that uses a device, and any it cannot attribute.
+  The daemon leaves processes the hand-off lists in `leftover_procs`; the command stops those too.
 - When delivery has a review step (`delivery.review_before_pr` or a `delivery.push_branch`), the
   daemon queues the review of each finished code task in the same step that records its hand-off
   (`review.auto`, on by default). A review whose head carries commits of another task whose latest

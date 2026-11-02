@@ -719,6 +719,11 @@ def serve_requests(p: Project) -> list[dict]:
                 out += _serve_pids(p, m)
                 q.unlink(missing_ok=True)
                 continue
+            if m.get("leftovers") is not None:   # `ttp leftover-procs --stop` from a sandboxed caller
+                from . import leftoverstop
+                out += leftoverstop.serve(p, m)
+                q.unlink(missing_ok=True)
+                continue
             rc = Path(m["rc"])
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             q.unlink(missing_ok=True)
