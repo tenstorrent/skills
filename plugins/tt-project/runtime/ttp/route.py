@@ -40,7 +40,7 @@ naming the run's supervisor pid and start, freed when the run ends (host_release
 process is gone (a crash, a reboot) or past its run's time limit is dropped by the next reader.
 
 Fallback: a routed run that ended on an endpoint fault (unreachable or timed out: down; 5xx or a
-missing model: error; 429 or rate-limit wording: rate_limit; a refused key: auth, through the auth
+404: error; a 404 for a model the endpoint does not serve: model_missing; 429 or rate-limit wording: rate_limit; a refused key: auth, through the auth
 gate; an answer that is not JSON: malformed) ends as `fallback` (or `limit`/`auth`), costs no attempt
 and requeues at the same tier; the endpoint then cools down for `providers.chat.route_cooldown_s`
 (COOLDOWN_S), during which the tier's runs start on the core provider. A routed run that ended without
@@ -49,6 +49,14 @@ failed; a clean exit without a valid result.json: no_handoff) falls back the sam
 cool-down: the endpoint is fine, the run was not. Its task's later runs start on the core provider
 (`rerun`), so a task falls back on its own at most once. A run that handed off (even `failed`) ended
 on its merits: no fallback; a failed light try is retried a tier up as usual.
+
+Missing model: a model_missing fallback cools nothing; it holds that tier's route alone (MISSING kv,
+hold), so its runs start on the core provider with fallback `model_missing` and one normal notice
+names the provider, tier and model. The hold ends (release, each daemon tick) once the tier's
+configured model changes or the daemon's model-free /models check (at most hourly while a tier routes:
+MODELS_EVERY_S) lists the model again. That check writes the served ids, its time and HTTP status to
+the project state dir's MODELS_FILE, never the key or URL; `ttp status` and doctor show holds and ids
+(model_lines), so a worker can pick a replacement without the key.
 
 Salvage: a routed run on the endpoint that exited cleanly without a result.json but printed its
 hand-off in its final reply keeps it (salvage): exactly one top-level JSON object in that reply,
@@ -72,7 +80,10 @@ KEY = "route"               # the run note's entry
 COOL = "route_cooldown:"    # kv: {"until", "reason", "run"} per routed-to provider
 REJECTED = "route_effort_rejected:"   # kv: <model>|<effort> whose effort_fields an endpoint rejected (logged once)
 COOLDOWN_S = 900
-FAULTS = ("down", "error", "rate_limit", "auth", "malformed")
+MISSING = "route_model_missing:"   # kv per routed tier: {"model", "since", "run"} while its model is not served
+MODELS_FILE = "endpoint-models.json"   # under the project state dir: {provider: {"ids", "checked", "ok", "check"}}
+MODELS_EVERY_S = 3600       # the daemon's model-free /models check runs at most this often per provider
+FAULTS = ("down", "error", "rate_limit", "auth", "malformed", "model_missing")
 RUN_CAUSES = ("timeout", "failed", "no_handoff")   # a routed run's own end without a hand-off (own_cause)
 OWN_CAUSE_WORDS = ("timed out", "stalled", "exited without", "result.json", "exit ")   # fallback_line shows these
 # busy: the routed-to provider's gate or a pause held new work, no fault; busy_wait_expired: its slots
@@ -126,6 +137,109 @@ def cooling(db, prov: str, now: float) -> str:
 
 def cool(db, cfg: dict, prov: str, reason: str, run_id: int | None, now: float) -> None:
     db.set_kv(COOL + prov, {"until": now + cooldown_s(cfg), "reason": reason, "run": run_id})
+
+
+def held(db, cfg: dict, tier: str) -> str:
+    """The model a routed tier's hold is for while that model is still the configured one, else ''."""
+    h = db.kv(MISSING + tier) or {}
+    to = target(cfg, tier)
+    return str(h.get("model") or "") if h and to and to[1] == h.get("model") else ""
+
+
+def hold(db, tier: str, model: str, run_id: int | None, now: float) -> bool:
+    """Hold the tier's route: its endpoint does not serve `model`. True when the hold is new."""
+    if (db.kv(MISSING + tier) or {}).get("model") == model:
+        return False
+    db.set_kv(MISSING + tier, {"model": model, "since": now, "run": run_id})
+    return True
+
+
+def holds(db) -> dict[str, dict]:
+    """Every tier's model_missing hold record, by tier (a stale one included: release drops those)."""
+    rows = db.q("SELECT key FROM kv WHERE substr(key, 1, ?) = ?", (len(MISSING), MISSING))
+    return {r["key"][len(MISSING):]: h for r in rows if isinstance(h := db.kv(r["key"]), dict)}
+
+
+def release(db, cfg: dict, served: dict, now: float) -> list[tuple[str, str, str]]:
+    """End each hold whose tier's configured model changed (or is no longer routed) or that the last
+    /models check (`served`, read_served) lists again after the hold began: [(tier, model, why)]."""
+    out = []
+    for tier, h in holds(db).items():
+        model = str(h.get("model") or "")
+        to = target(cfg, tier)
+        rec = (served or {}).get(to[0] if to else TO) or {}
+        if not to or to[1] != model:
+            why = f"the configured model is now {to[1]}" if to else "the tier is no longer routed"
+        elif rec.get("ok") and model in (rec.get("ids") or []) and float(rec.get("checked") or 0) > float(h.get("since") or 0):
+            why = "the endpoint lists it again"
+        else:
+            continue
+        db.x("DELETE FROM kv WHERE key=?", (MISSING + tier,))
+        out.append((tier, model, why))
+    return out
+
+
+def read_served(state: Path) -> dict:
+    """The last model-free /models check per provider ({"ids", "checked", "ok", "check"}), or {}."""
+    try:
+        v = json.loads((Path(state) / MODELS_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+def write_served(state: Path, prov: str, ok: bool, check: str, ids: list[str] | None, now: float) -> None:
+    """Record one /models check: ids only, the check time and its HTTP status line, never the key or URL.
+    A failed check keeps the last ids it had (marked by `ok` false)."""
+    data = read_served(state)
+    last = data.get(prov) if isinstance(data.get(prov), dict) else {}
+    data[prov] = {"ids": list(ids or []) if ok else list(last.get("ids") or []), "checked": now, "ok": bool(ok),
+                  "check": check, **({"listed": last.get("checked")} if not ok and last.get("checked") else {})}
+    path = Path(state) / MODELS_FILE
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=1))
+    os.replace(tmp, path)
+
+
+def refresh_served(state: Path, alias: str) -> bool:
+    """Run one /models check with the key saved for `alias` and record it (write_served); False when no
+    key is saved (the auth gate tells the user). Nothing it writes holds the key or the URL."""
+    from . import endpoint
+    got = endpoint.credentials(alias)
+    if got is None:
+        return False
+    ok, msg, ids = endpoint.list_models(got.url, got.key)
+    write_served(state, TO, ok, msg, ids, time.time())
+    return True
+
+
+def models_due(cfg: dict, state: Path, now: float) -> str:
+    """The endpoint alias whose /models check is due (a tier routes to it and the last check is
+    MODELS_EVERY_S old), else ''."""
+    entry = (cfg.get("providers") or {}).get(TO) or {}
+    alias = str(entry.get("endpoint") or "") if isinstance(entry, dict) else ""
+    if not alias or not any(target(cfg, t) for t in (entry.get("tiers") or {})):
+        return ""
+    last = read_served(state).get(TO) or {}
+    return alias if now - float(last.get("checked") or 0) >= MODELS_EVERY_S else ""
+
+
+def model_lines(db, cfg: dict, state: Path, now: float, at) -> list[str]:
+    """`ttp status` and doctor lines: each tier held for a missing model, then what the endpoint served
+    at its last /models check (`at(ts)`: a time in the home zone)."""
+    rec = read_served(state).get(TO) or {}
+    out = []
+    for tier, h in sorted(holds(db).items()):
+        if held(db, cfg, tier):
+            out.append(f"routing: {tier} held since {at(float(h.get('since') or now))}: {TO} does not serve "
+                       f"{h.get('model')}; runs start on the core provider until providers.{TO}.tiers.{tier}.model "
+                       f"changes or the endpoint lists it (checked hourly)")
+    if rec:
+        ids = rec.get("ids") or []
+        state_txt = "" if rec.get("ok") else f" (failed: {rec.get('check') or '?'}; ids from the last good check)"
+        out.append(f"routing: {TO} served {len(ids)} model{'s' * (len(ids) != 1)} at {at(float(rec.get('checked') or now))}"
+                   f"{state_txt}: {', '.join(ids) or '-'}")
+    return out
 
 
 def of(note) -> dict | None:

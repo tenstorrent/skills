@@ -778,7 +778,12 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    same tier with no attempt spent: `down` (unreachable or timed out), `error` (5xx), `rate_limit`
    (429 or rate-limit wording) or `auth` (a refused key, through the usual logged-out gate). The
    endpoint then cools down for `providers.chat.route_cooldown_s` seconds (default 900), while the
-   tier's runs start on the core provider. Routed runs take worker slots under the `chat` gate (its
+   tier's runs start on the core provider. A 404 for a model the endpoint does not serve (its wording
+   names the model, or the endpoint's /models list leaves it out) is `model_missing` instead: no
+   cool-down, but that tier's route holds, with one normal notice naming the provider, tier and model,
+   until `providers.chat.tiers.<tier>.model` changes or the daemon's model-free /models check (at
+   most hourly while a tier routes) lists the model again. That check stores only the served ids and
+   its time in the project state folder; `ttp status` and `ttp doctor` show them and any hold. Routed runs take worker slots under the `chat` gate (its
    `max_parallel`), not the core provider's; when `chat` has no free slot the run starts on the core
    provider instead, under its gate, with the reason `busy`. An answer that is not JSON is an
    endpoint fault too (`malformed`). A routed run that ends without a hand-off on its own (it timed
@@ -2064,7 +2069,8 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `ttp secret env --secret <name>[:<key>]=<VAR> -- <command>` (repeatable) runs a command with one in
   `VAR`, its output masked and its exit code passed on; the command line carries only names.
 - No `ttp` command prints a saved key. `ttp secret check [alias]` tests one (reachable, auth ok or
-  auth failed) and `ttp secret env <alias> -- <command>` gives it to a command in `OPENAI_API_KEY`
+  auth failed), lists the model ids it serves and marks each `providers.<p>.tiers.*.model` of the
+  current project it does not serve, with no key, URL or host in its output, and `ttp secret env <alias> -- <command>` gives it to a command in `OPENAI_API_KEY`
   (URL in `OPENAI_BASE_URL`). A worker's Bash calls that read the secrets store are refused.
 - The harness masks every saved secret as `[secret:<name>]` in what it keeps or sends on: the
   database (events, notes, notify text, hand-offs), the daemon log, each run's folder and its agent's

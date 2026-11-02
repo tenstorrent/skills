@@ -195,6 +195,44 @@ def test_secret_check_reports_auth_state_and_never_the_key(env, monkeypatch, cap
     assert e.value.code == 0 and "reachable, auth ok" in out.out and _EP_KEY not in out.out + out.err
 
 
+def test_secret_check_lists_served_models_and_flags_a_missing_tier_model(env, monkeypatch, capsys):
+    """#5194: no tool showed which models an endpoint serves; a withdrawn tier model went unseen."""
+    import urllib.error
+    from ttp import cli, endpoint
+    _stored(monkeypatch, env["tmp"] / "secrets-home")
+    p = make(env)
+    p.set_config("providers.chat", {"endpoint": "tt-cloud", "tiers": {"light": {"model": "example-org/model-a", "route": True},
+                                                                       "standard": {"model": "example-org/model-gone"}}})
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    body = json.dumps({"object": "list", "data": [{"id": "example-org/model-b"}, {"id": "example-org/model-a"}]}).encode()
+    class Ok:
+        def open(self, req, timeout=0):
+            assert req.full_url == f"{_EP_URL}/models"
+            return contextlib.nullcontext(types.SimpleNamespace(status=200, read=lambda n=-1: body))
+    monkeypatch.setattr(endpoint.urllib.request, "build_opener", lambda *a: Ok())
+    with pytest.raises(SystemExit) as e:
+        cli.main(["secret", "check", "tt-cloud"])
+    out = capsys.readouterr()
+    assert e.value.code == 0, out
+    assert "serves 2 models: example-org/model-a, example-org/model-b" in out.out
+    assert "providers.chat.tiers.standard.model example-org/model-gone: NOT SERVED" in out.out
+    assert "tiers.light.model" not in out.out
+    text = out.out + out.err
+    assert _EP_KEY not in text and _EP_URL not in text and "api.example.com" not in text
+    # A failed check names neither the key nor the URL or host either.
+    for err in (urllib.error.HTTPError(_EP_URL, 404, "gone", {}, None),
+                urllib.error.URLError(f"cannot connect to {_EP_URL} with {_EP_KEY}")):
+        class Bad:
+            def open(self, req, timeout=0, _e=err):
+                raise _e
+        monkeypatch.setattr(endpoint.urllib.request, "build_opener", lambda *a, _o=Bad(): _o)
+        ok, msg = endpoint.check("tt-cloud")
+        assert not ok and _EP_KEY not in msg and _EP_URL not in msg and "api.example.com" not in msg, msg
+    # Ids only: an answer that is not a list of models gives none, never its text.
+    assert endpoint.model_ids({"data": [{"id": "a"}, {"name": "x"}, 3, "b"]}) == ["a", "b"]
+    assert endpoint.model_ids({"error": "nope"}) == [] and endpoint.model_ids(None) == []
+
+
 def test_secret_env_hands_the_key_by_environment_and_masks_the_output(env, monkeypatch, capfd):
     from ttp import cli
     _stored(monkeypatch, env["tmp"] / "secrets-home")

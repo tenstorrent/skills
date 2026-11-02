@@ -6,6 +6,7 @@ key back, to code that calls the endpoint; nothing here prints, logs or records 
 """
 from __future__ import annotations
 
+import json
 import re
 import urllib.error
 import urllib.parse
@@ -45,18 +46,39 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def verify(url: str, key: str, timeout: float = VERIFY_TIMEOUT_S) -> tuple[bool, str]:
     """GET <url>/models with the key as a bearer token. Returns (ok, message); the message never holds the key."""
+    ok, msg, _ = list_models(url, key, timeout)
+    return ok, msg
+
+
+def model_ids(body) -> list[str]:
+    """The model ids an OpenAI-compatible /models answer lists ({"data": [{"id": ...}]}, or a bare list)."""
+    rows = body.get("data") if isinstance(body, dict) else body
+    if not isinstance(rows, list):
+        return []
+    ids = (r.get("id") if isinstance(r, dict) else r for r in rows)
+    return sorted({i for i in ids if isinstance(i, str) and i and len(i) <= 200})
+
+
+def list_models(url: str, key: str, timeout: float = VERIFY_TIMEOUT_S) -> tuple[bool, str, list[str] | None]:
+    """GET <url>/models with the key: (ok, message, the served model ids, or None when the answer lists
+    none it can read). The message never holds the key or the URL."""
     req = urllib.request.Request(f"{url}/models", headers={"Authorization": f"Bearer {key}",
                                                            "Accept": "application/json"})
     try:
         with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as r:
-            return (True, f"HTTP {r.status}")
+            try:
+                ids = model_ids(json.loads(r.read(4_000_000) or b"null"))
+            except Exception:   # not JSON, or no body: reachable all the same
+                ids = []
+            return (True, f"HTTP {r.status}", ids or None)
     except urllib.error.HTTPError as e:
         msg = f"HTTP {e.code}" + (f" {e.reason}" if e.reason else "")
     except urllib.error.URLError as e:
-        msg = str(e.reason) if "redirect to" in str(e.reason) else f"cannot reach {url}: {e.reason}"
+        msg = str(e.reason) if "redirect to" in str(e.reason) else f"cannot reach the endpoint: {e.reason}"
     except Exception as e:   # timeouts, bad responses
         msg = f"{type(e).__name__}: {e}"
-    return (False, redact.scrub(msg.replace(key, "<key>") if key else msg))
+    msg = msg.replace(key, "<key>") if key else msg
+    return (False, redact.scrub(msg.replace(url, "<url>") if url else msg), None)
 
 
 def save(alias: str, url: str, key: str, verified: bool, check: str) -> None:
@@ -98,17 +120,36 @@ def credentials(alias: str) -> Credentials | None:
     return Credentials(v["key"], v["url"])
 
 
-def check(alias: str) -> tuple[bool, str]:
-    """`ttp secret check <alias>`: whether the saved key still works at its URL, as one line that never
-    holds the key (reachable, auth ok, auth failed)."""
+def tier_models(cfg: dict | None, alias: str) -> list[tuple[str, str]]:
+    """(config path, model) of every providers.<p>.tiers.<tier>.model whose provider uses `alias`."""
+    out = []
+    for prov, entry in sorted(((cfg or {}).get("providers") or {}).items()):
+        if not isinstance(entry, dict) or entry.get("endpoint") != alias:
+            continue
+        for tier, row in sorted((entry.get("tiers") or {}).items()):
+            if isinstance(row, dict) and str(row.get("model") or ""):
+                out.append((f"providers.{prov}.tiers.{tier}.model", str(row["model"])))
+    return out
+
+
+def check(alias: str, cfg: dict | None = None) -> tuple[bool, str]:
+    """`ttp secret check <alias>`: whether the saved key still works, as lines that never hold the key,
+    the base URL or its host (reachable, auth ok, auth failed), then the model ids GET /models lists and
+    each configured tier model (tier_models, from `cfg`) the list leaves out."""
     got = credentials(alias)
     if got is None:
         return False, f"no key saved for endpoint {alias!r}: `ttp secret endpoint {alias} --url <base url>`"
-    ok, msg = verify(got.url, got.key)
-    if ok:
-        return True, f"{PREFIX}{alias} {got.url}: reachable, auth ok ({msg})"
-    state = "auth failed" if re.match(r"HTTP (401|403)\b", msg) else "not ok"
-    return False, f"{PREFIX}{alias} {got.url}: {state} ({msg})"
+    ok, msg, ids = list_models(got.url, got.key)
+    if not ok:
+        state = "auth failed" if re.match(r"HTTP (401|403)\b", msg) else "not ok"
+        return False, f"{PREFIX}{alias}: {state} ({msg})"
+    lines = [f"{PREFIX}{alias}: reachable, auth ok ({msg})"]
+    if ids is None:
+        return True, "\n".join(lines + ["  models: its /models answer lists none"])
+    lines.append(f"  serves {len(ids)} model{'s' * (len(ids) != 1)}: {', '.join(ids)}")
+    lines += [f"  {path} {model}: NOT SERVED by this endpoint"
+              for path, model in tier_models(cfg, alias) if model not in ids]
+    return True, "\n".join(lines)
 
 
 def env_for(alias: str) -> dict[str, str]:

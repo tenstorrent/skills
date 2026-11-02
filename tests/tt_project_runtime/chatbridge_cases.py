@@ -15,11 +15,21 @@ class _MockChat:
 
     def __init__(self, replies):
         self.replies, self.seen = list(replies), []
+        self.models = None   # the ids GET /models lists; None: it answers 404
         mock = self
 
         class H(http.server.BaseHTTPRequestHandler):
             def log_message(self, *a):
                 pass
+
+            def do_GET(self):
+                mock.seen.append({"path": self.path, "auth": self.headers.get("Authorization")})
+                data = json.dumps({"data": [{"id": i} for i in mock.models or []]}).encode()
+                self.send_response(404 if mock.models is None else 200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
 
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -1152,6 +1162,137 @@ def test_a_routed_run_that_fell_back_is_one_route_line_in_the_feed_not_a_failed_
     p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(rd), rid))
     d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), {"rc": 0, "started": time.time() - 10, "ended": time.time()})
     assert json.loads(p.db.task(tid)["result"])["summary"] == "the build broke"
+
+
+def test_chatbridge_a_404_for_a_missing_model_is_model_missing(mock_chat):
+    """#5194: a withdrawn model's 404 was a plain `error`; its wording, or /models leaving it out, names it."""
+    from ttp.chatbridge import Bridge, fault_of
+    for detail in ("The model `example-org/model-a` does not exist.", '{"error": {"code": "model_not_found"}}',
+                   "Unknown model: example-org/model-a", "model example-org/model-a is not available"):
+        assert fault_of(404, detail) == "model_missing", detail
+    for status, detail in ((404, "Not Found"), (404, ""), (500, "model does not exist"), (400, "unknown model")):
+        assert fault_of(status, detail) != "model_missing", (status, detail)
+    hi = {"max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}
+    # A bare 404: the bridge asks /models once; a list without the model makes it model_missing.
+    up = mock_chat((404, {"error": {"message": "Not Found"}}), (404, {"error": {"message": "Not Found"}}))
+    up.models = ["example-org/model-b"]
+    with Bridge(up.url, _CB_KEY, "example-org/model-a") as b:
+        _post(b, hi)
+        _post(b, hi)
+        assert b.stats()["last_fault"] == "model_missing" and b.stats()["faults"] == {"model_missing": 2}
+    assert [s["path"] for s in up.seen].count("/v1/models") == 1
+    # Listed, or no list to read: it stays a plain error (the endpoint may be misrouted, not the model gone).
+    for models in (["example-org/model-a"], None):
+        up = mock_chat((404, {"error": {"message": "Not Found"}}))
+        up.models = models
+        with Bridge(up.url, _CB_KEY, "example-org/model-a") as b:
+            _post(b, hi)
+            assert b.stats()["last_fault"] == "error", models
+
+
+def _model_missing_run(p, d, monkeypatch, mock_chat):
+    """One routed light run against a fake endpoint that 404s the configured model: its bridge stats."""
+    from ttp.chatbridge import Bridge
+    up = mock_chat((404, {"error": {"message": f"The model `{_RT_MODEL}` does not exist."}}))
+    with Bridge(up.url, _CB_KEY, _RT_MODEL) as b:
+        _post(b, {"max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]})
+        return b.stats()
+
+
+def test_a_routed_tier_whose_model_is_gone_falls_back_once_then_holds(env, monkeypatch, mock_chat):
+    """#5194: every routed start re-hit the withdrawn model after each 900 s cool-down, with no alert."""
+    from ttp import route
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.set_config("providers.chat", {"endpoint": "placeholder", "base_url": _RT_URL, "route_cooldown_s": 600, "tiers": {
+        "light": {"model": _RT_MODEL, "route": True}, "standard": {"model": "example-org/model-b", "route": True}}})
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    alerts = []
+    monkeypatch.setattr(d, "alert", lambda key, text, severity="high", **k: alerts.append((key, text, severity)))
+    stats = _model_missing_run(p, d, monkeypatch, mock_chat)
+    assert stats["last_fault"] == "model_missing"
+    tid = p.db.add_task("build", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    run, task = _route_finish(p, d, tid, {"bridge": stats})
+    assert run["status"] == "fallback" and route.of(run["note"])["fallback"] == "model_missing"
+    assert task["status"] == "queued" and int(task["attempts"] or 0) == 0
+    assert route.cooling(p.db, "chat", time.time()) == ""   # the endpoint is fine: no provider-wide cool-down
+    assert route.held(p.db, d.cfg, "light") == _RT_MODEL and route.held(p.db, d.cfg, "standard") == ""
+    assert len(alerts) == 1 and alerts[0][2] == "normal"
+    key, text, _ = alerts[0]
+    assert "light" in text and _RT_MODEL in text and "chat" in text and _RT_URL not in text and "http" not in text
+    # A second run already in flight hits it too: no second notice.
+    tid2 = p.db.add_task("build2", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    _route_finish(p, d, tid2, {"bridge": stats})
+    assert len(alerts) == 1
+    # No further routed starts for the held tier, past any cool-down; the other routed tier is untouched.
+    p.db.update_task(tid, status="done")
+    p.db.update_task(tid2, status="done")
+    for title in ("next", "later"):
+        prov, tier, note = _route_dispatch(p, d, monkeypatch, title=title)
+        assert (prov, tier) == (d.cfg.get("core_provider", "claude"), "light") and note[route.KEY]["fallback"] == "model_missing"
+    assert d._route({"id": None, "kind": "work"}, "standard", None, time.time())["fallback"] == "none"
+    # ttp status shows the hold.
+    lines = route.model_lines(p.db, d.cfg, p.state, time.time(), lambda ts: "now")
+    assert any(l.startswith("routing: light held since now: chat does not serve " + _RT_MODEL) for l in lines), lines
+
+
+def test_a_model_missing_hold_ends_when_the_endpoint_lists_it_or_the_config_changes(env, monkeypatch, mock_chat):
+    from ttp import endpoint, project, route
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "models-home")
+    up = mock_chat()
+    up.models = ["example-org/model-b"]
+    endpoint.save("placeholder", up.url, _CB_KEY, True, "HTTP 200")
+    p = make(env)
+    p.set_config("providers.chat", {"endpoint": "placeholder", "base_url": up.url,
+                                    "tiers": {"light": {"model": _RT_MODEL, "route": True}}})
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "alert", lambda *a, **k: None)
+    monkeypatch.delenv("TTP_TEST_NO_MODELS_PROBE", raising=False)
+    t0 = time.time()
+    assert route.hold(p.db, "light", _RT_MODEL, 1, t0 - 10) and not route.hold(p.db, "light", _RT_MODEL, 2, t0)
+
+    def check():
+        d._models_tried = 0.0
+        d.check_route_models()
+        if d._models_probe:
+            d._models_probe.join(10)
+        d.check_route_models()   # the next tick reads what the probe wrote
+
+    # The model-free check records ids only, and the hold stays while the model is not listed.
+    check()
+    rec = route.read_served(p.state)["chat"]
+    assert rec["ok"] and rec["ids"] == ["example-org/model-b"] and rec["checked"] >= t0
+    raw = (p.state / route.MODELS_FILE).read_text()
+    assert _CB_KEY not in raw and up.url not in raw and "127.0.0.1" not in raw
+    assert route.held(p.db, d.cfg, "light") == _RT_MODEL
+    assert route.models_due(d.cfg, p.state, time.time()) == ""   # at most hourly
+    assert route.models_due(d.cfg, p.state, time.time() + route.MODELS_EVERY_S) == "placeholder"
+    lines = route.model_lines(p.db, d.cfg, p.state, time.time(), lambda ts: "now")
+    assert "routing: chat served 1 model at now: example-org/model-b" in lines, lines
+    # Listed again at the next hourly check: the hold ends and the tier routes again.
+    up.models = ["example-org/model-b", _RT_MODEL]
+    (p.state / route.MODELS_FILE).write_text(json.dumps({"chat": {**rec, "checked": time.time() - route.MODELS_EVERY_S}}))
+    assert route.held(p.db, d.cfg, "light")
+    check()
+    assert route.held(p.db, d.cfg, "light") == "" and route.holds(p.db) == {}
+    assert d._route({"id": None, "kind": "work"}, "light", None, time.time())["fallback"] == "none"
+    # A config change ends a hold too, with no check at all.
+    monkeypatch.setenv("TTP_TEST_NO_MODELS_PROBE", "1")
+    route.hold(p.db, "light", _RT_MODEL, 3, time.time() + 5)   # after the last listing: that does not end it
+    d.check_route_models()
+    assert route.held(p.db, d.cfg, "light") == _RT_MODEL
+    p.set_config("providers.chat.tiers.light.model", "example-org/model-b")
+    d._load_config()
+    assert route.held(p.db, d.cfg, "light") == ""   # read as no hold at once
+    d.check_route_models()
+    assert route.holds(p.db) == {}
+    # A failed check keeps the last ids, marked failed, and names no URL.
+    up.models = None
+    route.refresh_served(p.state, "placeholder")
+    rec = route.read_served(p.state)["chat"]
+    assert not rec["ok"] and rec["ids"] == ["example-org/model-b", _RT_MODEL] and up.url not in json.dumps(rec)
 
 
 def test_a_routed_run_with_a_refused_key_goes_through_the_auth_gate_then_falls_back(env, monkeypatch):

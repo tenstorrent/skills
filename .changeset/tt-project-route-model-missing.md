@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: when an OpenAI-compatible chat endpoint stops serving a routed tier's model, routing now stops trying it. A 404 that names the model, or a bare 404 for a model the endpoint's `/models` list leaves out, is a new fault, `model_missing`. It falls back once and then holds only that tier's route, so its runs start on the core provider with no 900 s retry loop, and it sends one normal notice naming the provider, tier and model. The hold ends by itself when the tier's model is changed or when the daemon's model-free `/models` check (at most hourly while a tier routes) lists the model again. That check stores only the served ids and its time in the project state folder, and `ttp status` and `ttp doctor` show them and any hold, so a worker can pick a replacement without the key. `ttp secret check` now also lists the served model ids and marks each configured tier model the endpoint does not serve. Its output no longer contains the base URL.

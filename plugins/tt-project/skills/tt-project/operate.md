@@ -101,7 +101,10 @@
 - A run cut off before it reports its cost counts at an estimate, labelled as such.
 - Tier routing (off by default): `providers.chat.tiers.<tier>.route: true` sends that tier's unpinned
   worker runs to the OpenAI-compatible `chat` provider; endpoint faults fall back to the core provider
-  with no attempt spent and a cool-down (`route_cooldown_s`, default 900). A routed run that times out,
+  with no attempt spent and a cool-down (`route_cooldown_s`, default 900). A 404 for a model the
+  endpoint no longer serves (`model_missing`) holds only that tier's route, with one notice, until its
+  model changes or the hourly model-free /models check lists it again; `ttp status` shows the hold
+  and the served ids. A routed run that times out,
   fails or ends without a valid hand-off also falls back, once per task, recorded with its cause. Per
   tier: `effort` with `effort_fields` sets the reasoning effort sent; `route_timeout_s` the time limit. Spend uses `pricing.chat`
   (unpriced: $0, labelled). `ttp status` shows a `routed 24h:` phrase; `ttp stats --runs --tier <t>` lists runs.

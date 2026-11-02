@@ -46,6 +46,7 @@ import uuid
 from . import endpoint, redact
 
 UPSTREAM_TIMEOUT_S = 600
+MODEL_CHECK_TIMEOUT_S = 10   # the /models check a bare 404 gets (_model_listed)
 STOP_REASONS = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use",
                 "function_call": "tool_use", "content_filter": "end_turn"}
 # An upstream's prompt-too-long answers: OpenAI's code and the wordings of common servers (OpenAI,
@@ -406,18 +407,26 @@ def error_for(status: int, detail: str = "") -> tuple[int, dict]:
 
 
 RATE_WORDS = re.compile(r"rate.?limit|too many requests", re.I)
+# A 404's wording that names the model as the missing thing (OpenAI, vLLM, LiteLLM, TGI and the like).
+MODEL_GONE_WORDS = re.compile(
+    r"model\b[^.\n]{0,200}?\b(?:not found|does ?n[o']t exist|not exist|is not (?:available|served|supported)"
+    r"|not available|unavailable|no longer|deprecated|retired|decommissioned)"
+    r"|\b(?:unknown|invalid|no such|unsupported) model|model_not_found", re.I)
 
 
 def fault_of(status: int, detail: str = "") -> str:
     """The endpoint fault an upstream answer is, for per-tier routing's fallback (route.py): down (no
-    answer or timed out), error (5xx, a missing model), rate_limit (429, 402 or rate-limit wording) or
-    auth (401/403); '' for an answer about the request itself."""
+    answer or timed out), model_missing (a 404 whose wording names the model), error (5xx, any other
+    404), rate_limit (429, 402 or rate-limit wording) or auth (401/403); '' for an answer about the
+    request itself."""
     if status in (401, 403):
         return "auth"
     if status in (402, 429) or RATE_WORDS.search(detail or ""):
         return "rate_limit"
     if status == 0:
         return "down"
+    if status == 404 and MODEL_GONE_WORDS.search(detail or ""):
+        return "model_missing"
     return "error" if status >= 500 or status == 404 else ""
 
 
@@ -512,6 +521,7 @@ class Bridge:
         self.token = secrets.token_urlsafe(24)
         self.last_fault, self.faults = "", {}   # the last call's endpoint fault kind (fault_of), counts
         self.upstream: dict = {}   # the last failed answer's HTTP status and error code (upstream_of)
+        self._listed: bool | None | str = ""    # _model_listed's answer, "" until asked
         self.server: http.server.ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
 
@@ -578,10 +588,20 @@ class Bridge:
 
     def _fault(self, status: int, detail: str = "") -> None:
         kind = fault_of(status, detail)
+        if kind == "error" and status == 404 and self._model_listed() is False:
+            kind = "model_missing"   # a bare 404, and the endpoint's /models leaves the model out
         self.last_fault = kind
         self.upstream = upstream_of(status, detail, self._key)
         if kind:
             self.faults[kind] = self.faults.get(kind, 0) + 1
+
+    def _model_listed(self) -> bool | None:
+        """Whether GET <base>/models lists this run's model (asked once per bridge), or None when the
+        answer lists none or the check failed."""
+        if self._listed == "":
+            ok, _, ids = endpoint.list_models(self.base_url, self._key, timeout=MODEL_CHECK_TIMEOUT_S)
+            self._listed = (self.model in ids) if ok and ids else None
+        return self._listed
 
     def _fault_reply(self, reply: tuple[int, dict], body: dict | None = None) -> tuple[int, dict]:
         code, err = reply

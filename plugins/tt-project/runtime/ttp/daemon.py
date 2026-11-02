@@ -998,6 +998,8 @@ class Daemon:
         self._replica_job: threading.Thread | None = None   # the state snapshot being taken (replicate_state)
         self._mcp_probe: threading.Thread | None = None   # `claude mcp list` in flight (probe_mcp)
         self._mcp_tried = 0.0   # when it last started: an unwritable answer is not retried every tick
+        self._models_probe: threading.Thread | None = None   # the routed endpoint's /models check (check_route_models)
+        self._models_tried = 0.0
         self._cli_watch: threading.Thread | None = None   # CLI versions being read (watch_cli_versions)
         self._cli_watched = 0.0   # when that last started
         self._replica_checked = 0.0
@@ -1667,7 +1669,7 @@ class Daemon:
         core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
         cycle = self._run_step(lambda: self.host_cycle_held(now), "host_cycle_held", default=False)
         for step in (self.run_schedules, self.check_self_review, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_unstarted, self.check_checks_wait, self.check_checks_owner, self.check_checks_stall, self.check_cap_wait, self.check_progress, self.check_churn, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.check_self_blocking, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_unstarted, self.check_checks_wait, self.check_checks_owner, self.check_checks_stall, self.check_cap_wait, self.check_progress, self.check_churn, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.check_route_models, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.check_self_blocking, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -3165,6 +3167,29 @@ class Daemon:
         elif db.kv(downtime.LINGER_KV):
             db.x("DELETE FROM kv WHERE key=?", (downtime.LINGER_KV,))
 
+    def check_route_models(self) -> None:
+        """The routed endpoint's model-free /models check (route.py): at most hourly while a tier routes
+        to it, in a thread, its served ids written to the state dir's route.MODELS_FILE for workers,
+        `ttp status` and doctor; then each tier hold its answer or a config change ends is released."""
+        now = time.time()
+        for tier, model, why in route.release(self.p.db, self.cfg, route.read_served(self.p.state), now):
+            log(self.p, f"route: tier {tier} routes again ({model}: {why})")
+        if os.environ.get("TTP_TEST_NO_MODELS_PROBE") or (self._models_probe and self._models_probe.is_alive()):
+            return
+        if now - self._models_tried < 300 or not (alias := route.models_due(self.cfg, self.p.state, now)):
+            return
+        self._models_tried = now
+        state, where = self.p.state, self.p
+
+        def work() -> None:
+            try:
+                route.refresh_served(state, alias)
+            except Exception as e:   # a local fault (an unwritable state dir): the type only, never text
+                log(where, f"route: /models check failed: {type(e).__name__}")
+
+        self._models_probe = threading.Thread(target=work, name="route-models", daemon=True)
+        self._models_probe.start()
+
     def probe_mcp(self) -> None:
         """Refresh this host's connected MCP servers for the status feed (mcpgap.py): `claude mcp list` in
         a thread, bounded and at most every few hours, only while Claude workers run isolated. A server or
@@ -3872,7 +3897,17 @@ class Daemon:
                     db.set_kv(seen, {"run": r["id"], "ts": time.time()})   # logged once per model and effort
                     log(self.p, f"route: {r['model']} rejected its effort_fields at effort "
                                 f"{sent['effort'] or '-'} ({', '.join(sent['fields'])}); run {r['id']} went on without them")
-            if fell and not own:   # an endpoint fault cools the endpoint; a run's own end only its task
+            if fell == "model_missing":   # only this tier's route holds, until its model is served or changed
+                model = r["model"] or routed["model"]
+                if route.hold(db, routed["tier"], model, r["id"], time.time()):
+                    log(self.p, f"route: {routed['to']} does not serve {model}; tier {routed['tier']} held (run {r['id']})")
+                    self.alert(f"route-model-missing:{routed['tier']}",
+                               f"The {routed['to']} provider no longer serves model {model} "
+                               f"(providers.{routed['to']}.tiers.{routed['tier']}.model). {routed['tier'].capitalize()} "
+                               f"runs now start on the core provider; routing resumes on its own once the model is "
+                               f"served again (checked hourly) or the tier's model is changed. Served models: "
+                               f"`ttp status`.", severity="normal", every_s=0)
+            elif fell and not own:   # an endpoint fault cools the endpoint; a run's own end only its task
                 route.cool(db, self.cfg, routed["to"], fell, r["id"], time.time())
         if "split" not in note:   # the split steer may have fired after `r` was read
             split = json.loads((db.one("SELECT note FROM runs WHERE id=?", (r["id"],)) or {}).get("note") or "{}")
@@ -8302,7 +8337,7 @@ class Daemon:
         after = route.fell_back_before(self.p.db, task["id"]) if task.get("id") else None
         if after:   # the task fell back on its own once: the rest of its runs stay on the core provider
             return {"tier": tier, "to": name, "model": model, "fallback": "rerun", "after": after}
-        why = route.cooling(self.p.db, name, now)
+        why = "model_missing" if route.held(self.p.db, self.cfg, tier) else route.cooling(self.p.db, name, now)
         if not why and self._logged_out(name) and not self._may_probe(name, now):
             why = "auth"   # the auth gate holds it; its one login check may be a routed run
         return {"tier": tier, "to": name, "model": model, "fallback": why or "none"}

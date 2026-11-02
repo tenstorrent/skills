@@ -1478,6 +1478,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(budget.coordinator_cache_line(cache))
     if verbose and (route_line := h["spend"].get("route_line")):
         lines.append("routing: " + route_line)
+    from . import route
+    lines += route.model_lines(db, p.config(), p.state, now, lambda ts: at(ts, now, tz))   # holds, served ids
     from . import loadcaps, pushq
     from . import replica
     rl = replica.status_line(p, p.config(), now)
@@ -8223,15 +8225,20 @@ def cmd_secret(a) -> None:
             die("--host is required")
         print(push_secrets(a.host))
     elif a.kind == "check":
-        # Tests a saved key without ever showing it: reachable / auth ok / auth failed.
+        # Tests a saved key without ever showing it, its URL or host: reachable / auth ok / auth failed,
+        # the model ids it serves, and the project's tier models (the one here()) it does not.
         from . import endpoint
         aliases = [a.alias] if a.alias else sorted(endpoint.saved())
         if not aliases:
             die("no endpoint key saved: `ttp secret endpoint <alias> --url <base url>`")
+        try:
+            cfg = here_p.config() if (here_p := here()) else None
+        except Exception:   # an unreadable project.json: the key check still runs
+            cfg = None
         bad = 0
         for alias in aliases:
             try:
-                ok, msg = endpoint.check(alias)
+                ok, msg = endpoint.check(alias, cfg)
             except ValueError as e:
                 die(str(e))
             print(msg)

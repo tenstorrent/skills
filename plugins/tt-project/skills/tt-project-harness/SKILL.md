@@ -178,7 +178,9 @@ read the one for the lever you change.
 - Never print, echo or read back a value saved with `ttp secret` (no `credentials()` or secrets-store
   read in an ad-hoc command): the output stays in the run's log and transcript. The Bash hook refuses
   such reads.
-- Test an endpoint's key with `ttp secret check <alias>` (reachable, auth ok or auth failed). Give
+- Test an endpoint's key with `ttp secret check <alias>` (reachable, auth ok or auth failed, the
+  model ids it serves and any configured tier model it does not; never the key or URL). To pick a
+  replacement model without the key, read the served ids `ttp status` shows. Give
   it to a command with `ttp secret env <alias> -- <command>` (`OPENAI_API_KEY`, `OPENAI_BASE_URL`).
 - Store a value of your own with `ttp secret set <name> < file` (stdin only), or a set of fresh random
   tokens with `ttp secret generate <name> --keys a,b,c`; neither prints a value.
