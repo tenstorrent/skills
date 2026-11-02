@@ -51,7 +51,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import poll_s, project
+from . import loopproxy, poll_s, project
 from .project import Project, durable_write, lower_priority
 
 LEASE_EVERY_S = 30
@@ -358,6 +358,8 @@ def supervise(run_dir: Path) -> int:
     # The secret files go under the daemon's environment: a server's env never changes the worker's
     # PATH, PYTHONPATH, TTP_* or device mask.
     env = {**os.environ, **_env_files(spec), **env_extra}
+    # A proxy on `localhost` as 127.0.0.1 (loopproxy): in memory only, the values may carry credentials.
+    env.update(loopproxy.fixed(env))
     lease, out_path = run_dir / "lease", run_dir / "output.jsonl"
     started = time.time()
     if spec.get("pin") and not stop_reason(run_dir):

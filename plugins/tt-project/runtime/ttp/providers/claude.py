@@ -173,6 +173,10 @@ class Claude(Provider):
         # A headless run kills its background tasks when it exits, so a job started that way dies
         # with the worker and the run ends with no hand-off. Without them, long jobs are detached.
         env = {"CLAUDE_CODE_ENABLE_CFC": "0", "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
+        # The Bash sandbox's proxy host `localhost` does not resolve inside it: each command first
+        # makes it 127.0.0.1 (loopproxy).
+        from ..loopproxy import env_file
+        env.update(env_file(os.environ))
         if not read_only and self.hook_rewrites():
             from ..hook import HOOK_REWRITE
             env[HOOK_REWRITE] = "1"
