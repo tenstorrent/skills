@@ -1019,7 +1019,7 @@ def collapse_rows(p: Project, db, lines: list[str], rows: list[dict], seen: dict
     out = [ln for i, ln in enumerate(lines) if i not in gone]
     entries = {k: ", ".join(f"#{t} {clip(byid[t]['title'], ROW_TITLE_CHARS)}" for t in ks) for k, ks in groups.items()}
     if ks := groups["pushing"]:
-        got = db.q(f"SELECT MIN(created) c FROM push_queue WHERE status IN ('approved','held') AND task IN "
+        got = db.q(f"SELECT MIN(created) c FROM push_queue WHERE status IN ('approved','batched','held') AND task IN "
                    f"({','.join('?' * len(ks))})", ks)
         oldest = (got[0]["c"] if got else None) or min(byid[k]["updated"] for k in ks)
         out.append(f"- pushing, {len(ks)} as last turn (oldest in the push queue since {_clock(oldest, p)}; rows "

@@ -1270,6 +1270,18 @@ def test_unchanged_pushing_and_deferred_rows_collapse_to_one_group_line_each(env
         assert "as last turn (" not in dict(coord.digest_parts(p, {}, [], [], s)[0])["tasks"]
 
 
+def test_the_collapsed_pushing_group_counts_a_batched_entry_in_its_oldest_time(env):
+    from ttp import coordinator as coord
+    p = make(env)
+    push, _later, _plain, _review = _rows_fixture(p)
+    p.db.x("UPDATE push_queue SET status='batched', batch='b1', created=created-5000 WHERE task=?", (push[0],))
+    p.db.x("UPDATE push_queue SET status='approved' WHERE task=?", (push[1],))
+    old = p.db.one("SELECT created c FROM push_queue WHERE task=?", (push[0],))["c"]
+    seen = coord.digest_parts(p, {}, [], [])[1]
+    tasks = dict(coord.digest_parts(p, {}, [], [], seen)[0])["tasks"]
+    assert f"oldest in the push queue since {coord._clock(old, p)}" in tasks, tasks
+
+
 def test_every_open_task_row_is_whole_on_the_first_turn_after_a_prompt_snapshot_refresh(env):
     from ttp import coordinator as coord
     p = make(env)
