@@ -206,3 +206,91 @@ def test_a_chat_log_hit_still_registers_through_the_capped_search(env, monkeypat
     assert cli.resolve("demo") == (None, {"host": "host-a", "dir": "/srv/demo"})
     assert load_registry()["projects"]["demo"].items() >= {"host": "host-a", "dir": "/srv/demo"}.items()
     assert not cli._miss_cache_path().exists()
+
+
+_FAKE_SSH_G = """#!/bin/sh
+# Stands in for ssh in tests: only `ssh -G <alias>`, from the made-up config below; never connects.
+[ "$1" = -G ] || { echo "fake ssh: only -G" >&2; exit 2; }
+case "$2" in
+  box-a) printf 'host box-a\\nhostname box-a.example.test\\nproxyjump none\\nproxycommand none\\n' ;;
+  box-j) printf 'host box-j\\nhostname box-j\\nproxyjump gw-a\\n' ;;
+  box-bad) echo "/fake/config line 3: Bad configuration option: hostnme" >&2; exit 255 ;;
+  *) printf 'host %s\\nhostname %s\\nproxyjump none\\n' "$2" "$2" ;;
+esac
+"""
+
+
+def _fake_ssh_g(tmp_path, monkeypatch):
+    bin_ = tmp_path / "fake-ssh-bin"
+    bin_.mkdir()
+    (bin_ / "ssh").write_text(_FAKE_SSH_G)
+    (bin_ / "ssh").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.delenv("TTP_TEST_NO_SSH_CHECK", raising=False)
+
+
+def test_machines_add_refuses_an_ssh_alias_that_resolves_nowhere_and_saves_a_defined_one(env, tmp_path, monkeypatch, capsys):
+    """`ttp machines add|set` asks `ssh -G` (read-only, a fake ssh here) and refuses an alias with no
+    Host entry that is no host name either, naming the fix; a Host entry, a jump host, a bare name
+    that resolves, this machine's own name and --no-ssh-check are saved; ssh it cannot run says nothing."""
+    import socket
+    from ttp import cli
+    from ttp import machines as mm
+    _fake_ssh_g(tmp_path, monkeypatch)
+    real = socket.getaddrinfo
+    looked: list[str] = []
+
+    def lookup(name, *a, **kw):   # no network: only box-dns exists
+        looked.append(name)
+        if name == "box-dns":
+            return real("127.0.0.1", None)
+        raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+    monkeypatch.setattr(socket, "getaddrinfo", lookup)
+    with pytest.raises(SystemExit):
+        cli.main(["machines", "add", "box-b", "--tags", "device"])
+    err = capsys.readouterr().err
+    assert "ssh alias 'box-b' does not resolve" in err and "Host box-b" in err and "--no-ssh-check" in err, err
+    assert "box-b" not in mm.load(), "a refused alias is not saved"
+    with pytest.raises(SystemExit):
+        cli.main(["machines", "set", "box-bad"])
+    assert "Bad configuration option" in capsys.readouterr().err
+    for alias in ("box-a", "box-j", "box-dns", "testhost"):
+        cli.main(["machines", "add", alias, "--tags", "device"])
+        assert alias in mm.load(), alias
+    assert "box-a" not in looked and "box-j" not in looked, "a Host entry is enough: no lookup"
+    cli.main(["machines", "add", "box-b", "--no-ssh-check"])
+    assert "box-b" in mm.load()
+    # A known machine: only a new host name asks again (its own name here is no ssh route needed).
+    cli.main(["machines", "set", "box-b", "--note", "edited"])
+    with pytest.raises(SystemExit):
+        cli.main(["machines", "set", "box-b", "--hostname", "box-b-01"])
+    capsys.readouterr()
+    cli.main(["machines", "set", "box-b", "--hostname", "testhost"])
+    assert mm.load()["box-b"]["hostname"] == "testhost"
+    # ssh missing or slow, or a resolver that does not answer: cannot say, so saved.
+    assert mm.route_problem("box-c") and mm.route_problem("box-c", timeout=0.0) == ""
+    monkeypatch.setattr(socket, "getaddrinfo",
+                        lambda *a, **kw: (_ for _ in ()).throw(socket.gaierror(socket.EAI_AGAIN, "Temporary failure")))
+    assert mm.route_problem("box-c") == ""
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+    assert mm.route_problem("box-b") == ""
+
+
+@pytest.mark.parametrize("err, gone", [
+    ("ssh: Could not resolve hostname box-a: Name or service not known", "box-a"),
+    ("ssh: Could not resolve hostname box-a.example.test: No address associated with hostname", "box-a.example.test"),
+    ("ssh: Could not resolve hostname box-a: Temporary failure in name resolution", ""),
+    ("ssh: Could not resolve hostname box-a: nodename nor servname provided, or not known", ""),
+    ("ssh: connect to host box-a port 22: Connection refused", ""),
+])
+def test_an_ssh_name_that_does_not_exist_is_a_broken_route_never_an_unreachable_wait(err, gone):
+    """sshfail.unresolved picks out the resolver's 'no such name' answer; netwait.confirm then reads the
+    probe's 255 as broken (it wakes its task for a fix) without asking any host, never as unreachable."""
+    from ttp import netwait, sshfail
+    assert sshfail.unresolved(err) == gone
+    asked: list[str] = []
+    why = netwait.confirm("ssh box-a true", err, answered=lambda h: asked.append(h) or False)
+    if gone:
+        assert f"ssh cannot resolve {gone}" in why and "not an outage" in why and not asked, why
+    else:
+        assert why == "" and asked == ["box-a"], "still confirmed against the host"

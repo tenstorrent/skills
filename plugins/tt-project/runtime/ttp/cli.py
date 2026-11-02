@@ -7439,6 +7439,10 @@ def cmd_machines(a) -> None:
             args = {"tags": a.tags, "note": a.note, "hostname": a.hostname,
                     "shared": False if a.unshared else a.shared, "until": a.until,
                     **({} if a.min_free_gb is None else {"min_free_gb": a.min_free_gb})}
+            new = a.alias.strip() not in mm.load() or bool(a.hostname)
+            why = mm.route_problem(a.alias.strip(), a.hostname) if new and not a.no_ssh_check else ""
+            if why:
+                die(why)
         from . import machine_ledger as ml
         p = here()
         try:   # a sandbox that keeps the user's tt-project home read-only: queued for the daemon
@@ -10917,6 +10921,8 @@ def main(argv: list[str] | None = None) -> None:
     m.add_argument("--unshared", action="store_true", help="its resources are per project again")
     m.add_argument("--owner", help="the project that recovers it when it stays down or held (\"\" = none)")
     m.add_argument("--fallback", help="the project that takes over when the owner cannot act (\"\" = none)")
+    m.add_argument("--no-ssh-check", dest="no_ssh_check", action="store_true",
+                   help="save a new alias even when `ssh -G` finds no route to it (a machine never reached by ssh)")
     m = ms.add_parser("list", help="list your machines")
     m.add_argument("--json", action="store_true", help="print JSON")
     m = ms.add_parser("status", help="per machine: the projects using it, its recovery owner, pauses, open changes, "

@@ -63,7 +63,10 @@ says. Its check staying unknown (75, 255 or a broken check: an unreachable box l
 long escalates the same way, without running the fix; the next healthy result clears it. When every
 unknown run of that stretch was only its route failing (ssh exit 255, or output saying the connection
 was refused or timed out, or the host or network unreachable: ROUTE_RE), the box may well be up: it
-escalates as this project's own route problem, not an outage, and reports nothing to the machine ledger. Observation
+escalates as this project's own route problem, not an outage, and reports nothing to the machine ledger. An
+unknown run whose ssh error says a name does not exist (sshfail.unresolved: an alias with no ssh Host entry)
+escalates that way at once, outage check or not, past any known outage or paused resource: a broken route
+never ends by itself, so it is never read as one. Observation
 mutes never reach these checks: their escalation does not go through the observation screen.
 
 Telling a box that is off from our own route: `ping_host` (a host name or address) and `ping_peer` (another
@@ -190,7 +193,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-from . import outagemsg, pageto, schedrun, screen, scriptwatch, timefmt
+from . import outagemsg, pageto, schedrun, screen, scriptwatch, sshfail, timefmt
 from .db import DB
 from .project import command_env, durable_write
 
@@ -1048,6 +1051,15 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
             st["last_out"] = (out[-800:] + f"\nping: {silent}").strip()
         st["route_only"] = route and not silent and bool(st.get("route_only", "unknown_since" not in st))
         st["unknown_since"] = st.get("unknown_since") or now
+        gone = sshfail.unresolved(out)
+        if gone:   # a name that does not exist: this project's broken route, never a pause or outage (module doc)
+            st["route_only"], st["status"] = True, "unhealthy"
+            st.setdefault("since", st["unknown_since"])
+            if st.get("task") or st.get("escalated"):
+                return _escalated(host, name, spec, st, now)
+            return _escalate(host, name, spec, st, now, f"ssh cannot resolve {gone}: no ssh Host entry or DNS name "
+                             f"defines it, a broken route this project fixes (add the Host entry or correct the "
+                             f"name, then confirm it with `ssh -G`), not an outage or a pause")
         again = None
         if spec.get("outage"):
             # A whole box whose check cannot even tell (ssh fails: it looks like this when it is down)

@@ -4473,3 +4473,29 @@ def test_an_outage_check_with_a_fix_runs_it_when_ping_shows_the_box_off(env, mon
     heal.run(d, "route", spec, t0)
     heal.run(d, "route", spec, t0 + 3700)
     assert not fixed.exists() and heal.state(p.db, "route")["route_only"]
+
+
+def test_a_check_whose_ssh_name_does_not_exist_escalates_at_once_as_a_route_fix_never_a_pause(env):
+    """An ssh error saying the name does not exist (an alias with no Host entry) is a broken route the
+    project fixes: a self-fix task on the first run, past a paused resource and outside the outage window;
+    a resolver that is only unreachable keeps the usual unknown handling."""
+    from ttp import coordinator as coord
+    from ttp import heal
+    from ttp import schedule as sched
+    p, d, _ = _heal_setup(env)
+    gone = "echo 'ssh: Could not resolve hostname box-a: Name or service not known' >&2; exit 255"
+    block = {"check": gone, "machine": "box-a", "resource": "box-a-device", "outage": True}
+    coord.pause_resource(p, "box-a-device", True, reason="maintenance", by="user")
+    sched.upsert(p.db, "svc", "command", "5m", payload={"heal": block})
+    said, _ = heal.run(d, "svc", _heal_spec(p), time.time())
+    st = heal.state(p.db, "svc")
+    assert said.startswith("unhealthy (self-fix task #") and "ssh cannot resolve box-a" in said, said
+    assert "paused" not in said and st["route_only"] and not heal.is_outage(p.db, "svc"), st
+    t = p.db.task(int(st["task"]))
+    assert "repair this project's route" in t["spec"] and "ssh -G" in st["why"], t["spec"]
+    # A non-outage check too; a resolver that does not answer stays an unknown run.
+    plain = heal.validate({"check": gone, "machine": "box-a"})
+    assert heal.run(d, "svc2", plain, time.time())[0].startswith("unhealthy (self-fix task #")
+    dns = heal.validate({"check": "echo 'ssh: Could not resolve hostname box-a: Temporary failure in name "
+                                  "resolution' >&2; exit 255", "machine": "box-a"})
+    assert heal.run(d, "svc3", dns, time.time())[0].startswith("ok (unknown"), "no resolver: not a broken name"

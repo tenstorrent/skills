@@ -21,6 +21,12 @@ first try, nothing says otherwise). A listener whose outage began with the host 
 connection keeps the `host` wording through later timeouts (a host down while it reboots times out);
 only `offline` (no name lookup, network unreachable) switches it to `network`. An address ssh puts in its own text is replaced by the ssh alias
 the user configured: user-facing text never names an IP.
+
+`unresolved` tells one case apart: the resolver answered that the name does not exist (glibc's "name
+or service not known", "no address associated with hostname"), so the route itself is broken (an ssh
+alias with no Host entry, a mistyped name): a config error the project fixes, never a pause or a wait
+for the network. "Temporary failure in name resolution" (no resolver reachable) stays an outage, and
+so does macOS's "nodename nor servname provided", which an offline Mac also prints.
 """
 from __future__ import annotations
 
@@ -35,6 +41,10 @@ _NO_ROUTE = re.compile(r"no route to host", re.I)
 # This machine lost its own path: no name lookup, no network. A timeout may just be the host down.
 _OFFLINE = re.compile(r"could not resolve hostname|name or service not known|temporary failure in name resolution"
                       r"|nodename nor servname|no address associated|network is unreachable", re.I)
+
+# The resolver's answer that the name does not exist (module doc): group 1 is the name.
+_NO_SUCH_NAME = re.compile(r"could not resolve hostname ([^\s:]+): (?:name or service not known"
+                           r"|no address associated with hostname)", re.I)
 
 _IPV4 = r"\d{1,3}(?:\.\d{1,3}){3}"
 _V4 = re.compile(rf"(?<![\w.]){_IPV4}(?![\w.])")
@@ -57,6 +67,12 @@ def kind(stderr: str | None, connected: bool = False) -> str:
     if _NO_ROUTE.search(text):
         return "host" if connected else "network"
     return "other" if connected else "network"
+
+
+def unresolved(stderr: str | None) -> str:
+    """The name ssh's error says does not exist (a broken route, module doc), else ""."""
+    m = _NO_SUCH_NAME.search(stderr or "")
+    return m.group(1) if m else ""
 
 
 def offline(stderr: str | None) -> bool:

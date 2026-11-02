@@ -22,6 +22,12 @@ A project created with --host runs its daemon on that machine, which reads its o
 removal included, so a list edited on that machine is never overwritten by an older one. A change
 (`ttp machines add|set|remove`) copies it in the background, never waiting for a host that is down;
 hosts whose machine has an open known outage or the `decommissioned` tag are skipped.
+
+An alias is also the machine's ssh route. `ttp machines add` (a new alias, or a changed host name)
+first asks `ssh -G <alias>`, which only reads the ssh config and never connects (route_problem): an
+alias that no Host entry maps to a HostName, ProxyJump or ProxyCommand, and that does not resolve as a
+host name here either, is refused, unless it names this machine or --no-ssh-check says it is never
+reached by ssh. When ssh or the name lookup cannot say (no ssh, a timeout, no resolver), it is saved.
 """
 from __future__ import annotations
 
@@ -47,6 +53,7 @@ WAITS_AT = 6                # or this many waits on it (it may be down, not busy
 BAD_RUNS = ("failed", "lost", "timeout", "stalled")
 # The device driver's nodes: `ttp sandbox` hides them from a run that holds no device (sandbox.py).
 DEVICE_NODES = ("/dev/tenstorrent",)
+SSH_CHECK_S = 5             # route_problem's ssh -G and name lookup, each
 
 
 def path() -> Path:
@@ -500,6 +507,57 @@ def ssh_hostname(alias: str) -> str:
     """The host `ssh -G` resolves `alias` to (no connection; `alias` itself when it cannot say)."""
     from .lease import ssh_hostname as resolve
     return resolve(alias)
+
+
+def _resolves(name: str, timeout: float) -> bool | None:
+    """Whether `name` resolves as a host here: None when it cannot say (no resolver answered in time)."""
+    import socket
+    import threading
+    got: list = []
+
+    def look() -> None:
+        try:
+            socket.getaddrinfo(name, None)
+            got.append(True)
+        except socket.gaierror as e:
+            gone = {getattr(socket, k) for k in ("EAI_NONAME", "EAI_NODATA") if hasattr(socket, k)}
+            got.append(False if e.errno in gone else None)
+        except (OSError, UnicodeError):
+            got.append(None)
+    t = threading.Thread(target=look, name="ttp-resolve", daemon=True)
+    t.start()
+    t.join(timeout)
+    return got[0] if got else None
+
+
+def route_problem(alias: str, hostname: str | None = None, timeout: float = SSH_CHECK_S) -> str:
+    """Why ssh has no route to `alias` as this machine is set up (module doc), else "" (also when it
+    cannot say, or `alias` or its `hostname` names this machine). Read-only: `ssh -G` prints the config
+    ssh would use and never connects. TTP_TEST_NO_SSH_CHECK=1 (the test suite) skips it."""
+    here = local_names()
+    if os.environ.get("TTP_TEST_NO_SSH_CHECK") == "1" or not ALIAS_RE.fullmatch(alias or "") \
+            or alias.lower() in here or str(hostname or "").strip().lower() in here:
+        return ""
+    try:
+        r = subprocess.run(["ssh", "-G", alias], capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if r.returncode != 0:
+        first = next((ln.strip() for ln in (r.stderr or "").splitlines() if ln.strip()), f"exit {r.returncode}")
+        return f"`ssh -G {alias}` fails ({first[:200]}): fix the ssh config, or pass --no-ssh-check"
+    cfg: dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        k, _, v = line.strip().partition(" ")
+        cfg.setdefault(k.lower(), v.strip())
+    if cfg.get("hostname", alias).lower() != alias.lower() or \
+            any(cfg.get(k, "none").lower() != "none" for k in ("proxyjump", "proxycommand")):
+        return ""   # a Host entry routes it (a jump host resolves the name on its side)
+    if _resolves(alias, timeout) is not False:
+        return ""
+    return (f"ssh alias {alias!r} does not resolve: no Host entry in the ssh config defines it (`ssh -G {alias}` "
+            f"gives no HostName) and it is no host name here; add a `Host {alias}` entry with its HostName, or "
+            f"pass --no-ssh-check if this machine is never reached by ssh")
 
 
 def names_here(value: str, known: dict[str, dict] | None = None) -> bool:

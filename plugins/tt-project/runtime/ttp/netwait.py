@@ -32,7 +32,9 @@ the same key, so it stays one issue that clears the same way.
 A probe's 255 counts as unreachable only when it is ssh's own: every host the probe names is checked
 with `ssh -o BatchMode=yes -o ConnectTimeout=10 <alias> true` (confirm). A probe that names no host, or
 whose host answers, failed its own remote command (e.g. lost quotes and `|| exit 255`): the daemon
-treats it as a broken probe against its task, never as an outage.
+treats it as a broken probe against its task, never as an outage. So is one whose ssh error says the
+name does not exist (sshfail.unresolved: an alias with no ssh Host entry): a broken route the project
+fixes, never a wait that ends by itself.
 The daemon checks the hosts of every probe that exited 255 in one tick together (reach), so an
 outage holds its tick for one ConnectTimeout, not one per probe; each host is asked once a minute.
 
@@ -57,7 +59,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import outagemsg, timefmt
+from . import outagemsg, sshfail, timefmt
 
 KEY = "network:unreachable"
 STATE_KEY = "network_outage"   # kv: {since, last, alerted, tasks, hosts, tunnel, raised} of the open outage
@@ -156,7 +158,12 @@ def reach(aliases: list[str], env: dict | None = None) -> dict[str, bool]:
 
 def confirm(probe: str, output: str = "", answered=None) -> str:
     """Why a probe's exit 255 is not ssh's own ("" when every host it names is unreachable): it names
-    no ssh host, or one answers, so its own remote command failed. `answered(alias)` checks one host."""
+    no ssh host, or one answers, so its own remote command failed, or ssh says a name it needs does not
+    exist (sshfail.unresolved). `answered(alias)` checks one host."""
+    gone = sshfail.unresolved(output)
+    if gone:   # no host was ever asked: the route itself is broken, and asking again changes nothing
+        return (f"exit 255: ssh cannot resolve {gone}: no ssh Host entry or DNS name defines it here, a broken "
+                f"route to fix (check it with `ssh -G <alias>`), not an outage")
     names = hosts(probe, output)[:HOSTS_MAX]
     if not names:
         return "exit 255 from a probe that names no ssh host"
