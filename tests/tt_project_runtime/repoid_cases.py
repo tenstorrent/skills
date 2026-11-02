@@ -172,6 +172,9 @@ def test_repoid_takes_identity_reads_only_and_the_git_helpers_use_it(env, tmp_pa
         assert push._git(repo, "rev-parse", "HEAD").returncode == 0
     assert seen.count(("rev-parse", "HEAD")) == 3   # HEAD is read every time
     assert len(seen) == 5 + 3, seen
+    # helpers answering in another shape keep their own answers for the same read
+    assert push._git(wt, "rev-parse", "--git-common-dir").stdout.strip() == str((repo / ".git").resolve())
+    assert worktree._git(wt, "rev-parse", "--git-common-dir") == str((repo / ".git").resolve())
     # the push queue's view after a remote is added: read again
     _git_out(repo, "remote", "add", "fork", str(tmp_path / "fork.git"))
     assert push._git(repo, "remote").stdout.split() == ["fork", "origin"]

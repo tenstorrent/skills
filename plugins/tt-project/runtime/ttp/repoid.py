@@ -142,9 +142,10 @@ def _ok(value: Any) -> bool:
 
 def read(path: str | Path, args: tuple | list, fn: Callable[[], Any]) -> Any:
     """fn()'s result for the identity read `args` (git's arguments after `-C path`) in `path`: the
-    kept one while its stamp holds, else fn() run again (and kept when it succeeded: a call that
+    one kept for the same fn (by module and qualified name) while its stamp holds, else fn() run again (and kept when it succeeded: a call that
     raised, a CompletedProcess that exited non-zero, "" or None, is not)."""
-    key = (os.path.abspath(path), tuple(args))
+    # Helpers answer in their own shape (a CompletedProcess, stripped text): each keeps its own answers.
+    key = (getattr(fn, "__module__", None), getattr(fn, "__qualname__", None), os.path.abspath(path), tuple(args))
     s = stamp(path)
     if s is None:
         return fn()
