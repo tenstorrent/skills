@@ -1513,6 +1513,9 @@ def status_text(p: Project, verbose: bool = False) -> str:
         broken = t["starts"].startswith(BROKEN_START + ":")
         lines.append(f"  #{t['id']} {t['starts'] if broken else 'deferred, ' + t['starts']}: {t['title']}"
                      + (f" — {t['gate']['text']}" if t.get("gate") else ""))
+    for t in h.get("dep_held", [])[:5]:
+        on = ", ".join(f"#{d['id']} ({d['status']})" for d in t["on"][:3])
+        lines.append(f"  #{t['id']} queued, waits on {on}: {t['title']}")
     if h["undelivered"]:
         u = h["undelivered"]
         lines.append(f"chat relay: {u['line']}")

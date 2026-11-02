@@ -327,11 +327,22 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     probed: dict = {}   # a wait on locks names their holders now, not the ones its stored note saw
     for t in waiting:
         t["blocked_reason"] = lockprobe.live_note(p, cfg, load_result(t.pop("result")), t["blocked_reason"], probed)
-    queued = [t for t in db.q("SELECT id, depends_on FROM tasks WHERE status='queued' AND (not_before IS NULL OR "
+    queued = [t for t in db.q("SELECT * FROM tasks WHERE status='queued' AND (not_before IS NULL OR "
                               "not_before<=?)", (now,)) if t["id"] not in later]
     # A task on a paused resource is held, not ready: it is listed under its resource instead.
     from .coordinator import task_resources
     due = db.ready_tasks()
+    # A queued task held by a dependency names it and its state: the hold dispatch keeps it for.
+    due_ids = {t["id"] for t in due}
+    unmet = db.unmet_dependencies([t for t in queued if t["id"] not in due_ids])
+    dep_held = []
+    for t in queued:
+        on = [d for d in unmet.get(t["id"]) or [] if d is not None]
+        if on:
+            deps = [db.task(d) for d in on]
+            dep_held.append({"id": t["id"], "title": t["title"], "on": [
+                {"id": d, "status": (x or {}).get("status") or "missing", "title": (x or {}).get("title") or ""}
+                for d, x in zip(on, deps)]})
     # A task on a logged-out provider is held too, until its breaker closes.
     breakers = breaker_lines(db, now, tz)
     out = {b["provider"] for b in breakers}
@@ -477,7 +488,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                         "idle_wake": next_wake, "idle_held": wake["held"],
                         "route": coord.coordinator_route(cfg), "route_line": coord.route_line(cfg)},
         "providers_paused": paused_providers, "resources_paused": paused_resources, "waiting": waiting,
-        "deferred": deferred,
+        "deferred": deferred, "dep_held": dep_held,
         "logged_out": [{k: t[k] for k in ("id", "title", "provider")} for t in logged_out],
         "net_held": [{k: t[k] for k in ("id", "title", "provider")} for t in net_held],
         "breakers": breakers,

@@ -304,3 +304,32 @@ def test_ready_followup_of_a_hand_off_is_announced_work_owned_by_the_task_that_t
     unstarted.announced(p, t0 + 720)
     assert p.db.one("SELECT status FROM events WHERE fingerprint=?",
                     (f"announced_not_started:f{src2}.0",))["status"] == "handled", "its owner started"
+
+
+def test_status_and_web_name_the_dependency_a_queued_task_waits_on(env):
+    """A queued task held by an unfinished dependency is not ready, so no ready check names it: ttp status
+    and the web app's task row say what it waits on and that task's state."""
+    import shutil
+    import subprocess
+    from ttp.cli import status_text
+    from ttp.web import health
+    p = make(env)
+    p.db.x("UPDATE tasks SET status='done'")
+    first = p.db.add_task("continue the measurement", "s", kind="code", origin="coordinator")
+    p.db.update_task(first, status="waiting")
+    then = p.db.add_task("review the change", "s", kind="review", origin="coordinator", depends_on=[first])
+    free = p.db.add_task("ready work", "s", origin="coordinator")
+    h = health(p, p.db, now=time.time())
+    assert [(t["id"], [(d["id"], d["status"]) for d in t["on"]]) for t in h["dep_held"]] == [(then, [(first, "waiting")])]
+    line = next(ln for ln in status_text(p).splitlines() if ln.startswith(f"  #{then} "))
+    assert line == f"  #{then} queued, waits on #{first} (waiting): review the change", line
+    assert not [ln for ln in status_text(p).splitlines() if ln.startswith(f"  #{free} queued, waits")]
+    js = (RUNTIME / "ttp" / "web" / "app.js").read_text()
+    assert "depWait(t) ? esc(depWait(t))" in js[js.index("function taskRow"):]
+    node = shutil.which("node")
+    if node:
+        fn = js[js.index("const depWait ="):js.index("// A chain's metric")]
+        out = subprocess.run([node, "-e", fn + "console.log(JSON.stringify([depWait({status: 'queued', waits_on: [7, null]}),"
+                              "depWait({status: 'queued', waits_on: []}), depWait({status: 'running', waits_on: [7]})]))"],
+                             capture_output=True, text=True, timeout=30)
+        assert json.loads(out.stdout) == ["waits on #7", "", ""], out.stderr

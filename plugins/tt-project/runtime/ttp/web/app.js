@@ -90,6 +90,9 @@ const waiting = (t) => t.status === "queued" && !deferred(t) && t.not_before && 
 const heldAs = (t) => t.status !== "queued" ? "" : (t.blocked_reason || "").startsWith("held: logged out") ? "held: logged out"
   : (t.blocked_reason || "").startsWith("held: network,") ? "held: network" : "";
 const held = (t) => !!heldAs(t);
+// A queued task whose dependencies have not finished waits on them, not on a worker slot.
+const depWait = (t) => { const on = t.status === "queued" ? (t.waits_on || []).filter((i) => i != null) : [];
+  return on.length ? "waits on " + on.map((i) => "#" + i).join(", ") : ""; };
 
 // A chain's metric across its runs (continues, fixes, re-reviews): run, time, value and delta.
 const num = (v) => Math.abs(v) >= 1000 || Number.isInteger(v) ? String(Math.round(v * 100) / 100) : String(+v.toPrecision(4));
@@ -106,7 +109,7 @@ function trendHtml(series) {
 }
 
 function taskRow(t) {
-  const label = deferred(t) ? esc(t.starts) : waiting(t) ? "waiting" : held(t) ? heldAs(t) : t.review_since ? `review ${agoH(t.review_since)}` : t.status === "pushing" ? "approved, pushing" : t.outcome === "changes_needed" ? "changes needed" : esc(t.status);
+  const label = deferred(t) ? esc(t.starts) : waiting(t) ? "waiting" : held(t) ? heldAs(t) : depWait(t) ? esc(depWait(t)) : t.review_since ? `review ${agoH(t.review_since)}` : t.status === "pushing" ? "approved, pushing" : t.outcome === "changes_needed" ? "changes needed" : esc(t.status);
   const noteLabel = t.status === "blocked" ? "Blocked" : waiting(t) ? "Waiting" : held(t) ? "Held" : "Note";
   return `<details class="row"><summary><span class="id">#${t.id}</span> <span class="st st-${t.outcome || t.status}">${label}</span>
     <span class="title">${esc(t.title)}</span> <span class="meta">${esc(t.tier)} · ${money(t.spent_usd)}${t.budget_usd ? " / " + money(t.budget_usd) : ""} · ${agoH(t.updated)} ago${t.pr_url ? ` · ${isHttp(t.pr_url) ? link(t.pr_url, "PR") : "PR " + esc(t.pr_url)}` : ""}</span></summary>
