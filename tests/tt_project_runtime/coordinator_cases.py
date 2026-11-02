@@ -5849,6 +5849,8 @@ def test_a_model_key_ask_naming_its_checked_routes_and_results_is_sent(env):
     failed = ("Need a new API key for model-x: tried endpoint gw-a, it returned 401 unauthorized; checked the "
               "stored secrets: no other key is saved.")
     assert coord._held_route_ask(cfg, access, failed) == ""
+    assert coord._held_route_ask(cfg, access, "The claude CLI is logged out; please log in again so the opus "
+                                 "runs go on.") == ""   # the held route itself is what failed
     # The host and self-health gates no longer pass a model key ask on its credential words alone.
     assert not coord._credential_checked("The API key for the inference endpoint is missing; add one?")
     assert coord._credential_checked("Checked the stored secrets and the gateway: no API key for model-y is saved.")

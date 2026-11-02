@@ -5351,7 +5351,7 @@ _ROUTE_WORD_RE = re.compile(r"\b(?:providers?|gateways?|endpoints?|routes?|secre
                             r"machines?|hosts?|box(?:es)?|config)\b", re.I)
 _CRED_RESULT_RE = re.compile(r"\b(?:none|no (?:[\w-]+ ){0,2}?(?:key|token|route|access|such|endpoint|gateway|provider|"
                              r"secret)s?|"
-                             r"not (?:found|listed|configured|saved|set|served)|missing|expired|revoked|"
+                             r"not (?:found|listed|configured|saved|set|served)|missing|expired|revoked|logged out|"
                              r"40[13]|unauthori[sz]ed|forbidden)\b", re.I)
 # The restriction or the irreversible step a self-health ask names in least_disruptive.
 _NAMES_LIMIT_RE = re.compile(
@@ -5523,7 +5523,8 @@ def _held_route_ask(cfg: dict, a: dict, text: str) -> str:
     """Why a credential or sign-in ask is the project's to answer from routes it holds, or "". Model-free:
     refused when a held route (_held_model_routes) serves a model the ask names and the ask does not
     name that route with a result; else, for a model or API service (_model_ask), refused unless it
-    names the held routes it checked and how each went. Exempt: rotating or revoking a leaked key,
+    names the held routes it checked and how each went (every held route to its model named with a result
+    counts). Exempt: rotating or revoking a leaked key,
     another person's request, and review, merge, funds and spend asks."""
     if a.get("blocking") not in ("human", "access", "irreversible", "restriction"):
         return ""
@@ -5532,13 +5533,13 @@ def _held_route_ask(cfg: dict, a: dict, text: str) -> str:
         return ""
     words = _ask_words(said)
     tried = bool(_RESULT_RE.search(said) or _CRED_RESULT_RE.search(said))
-    serving = [(route, model) for route, model, names in _held_model_routes(cfg)
-               if {model.lower(), model.lower().rsplit("/", 1)[-1]} & words and not (tried and names & words)]
-    if serving:
+    held = [(route, model, tried and bool(names & words)) for route, model, names in _held_model_routes(cfg)
+            if {model.lower(), model.lower().rsplit("/", 1)[-1]} & words]
+    if serving := [(route, model) for route, model, reported in held if not reported]:
         where = "; ".join(f"{route} serves {model}" for route, model in serving)
         return (f"the project already holds a route to that model: {where}. Run the work through it from a "
                 "task. Ask only if that route fails, naming it and its result")
-    if _credential_checked(said, cfg):
+    if held or _credential_checked(said, cfg):   # every held route to the model named with its result
         return ""
     return ("check the routes the project already holds before asking for a credential or sign-in: the "
             "configured providers and gateways (`ttp config`), the stored secrets (`ttp secret show`) and the "
