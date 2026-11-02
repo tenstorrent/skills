@@ -34386,7 +34386,7 @@ def test_a_drifting_price_table_raises_a_low_alert(env, monkeypatch):
     sent, asked = [], []
     monkeypatch.setattr(d, "alert", lambda key, text, severity="high", every_s=0: sent.append((key, severity)))
     big = {"alert": "drift", "model": "claude-x", "release": "1.0", "drift": 0.3, "factor": 0.77, "samples": 3,
-           "unpriced": [], "applied": True}
+           "unpriced": [], "applied": True, "key": "drift:claude-x:0a1b2c3d4e"}
     monkeypatch.setattr(ls, "calibrate", lambda sid, usd: asked.append(sid) or big)
     usage = types.SimpleNamespace(estimated=False, cost_usd=1.0, session_id="s1")
     d.cfg["budget"]["global_daily_usd"] = 0
@@ -34397,7 +34397,7 @@ def test_a_drifting_price_table_raises_a_low_alert(env, monkeypatch):
     d._check_price_table({"provider": "claude"}, types.SimpleNamespace(estimated=True, cost_usd=1.0, session_id="s1"))
     assert asked == []
     d._check_price_table({"provider": "claude"}, usage)
-    assert asked == ["s1"] and sent == [("claude_price_table:drift:claude-x:1.0", "low")]
+    assert asked == ["s1"] and sent == [("claude_price_table:drift:claude-x:0a1b2c3d4e", "low")]
     monkeypatch.setattr(ls, "calibrate", lambda sid, usd: {**big, "alert": None})   # told already, or small
     d._check_price_table({"provider": "claude"}, usage)
     assert len(sent) == 1

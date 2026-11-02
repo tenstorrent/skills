@@ -91,7 +91,7 @@ DRIFT = 0.01                 # a measured drift up to this is noise: the table's
 DRIFT_RUNS = 3               # a model's factor needs at least this many runs
 CONSISTENT = 0.05            # ... each within this share of their median factor
 DOMINANT = 0.9               # a run calibrates the model that priced at least this share of it
-ALERT_DRIFT = 0.20           # a drift past this is told (low, once per model and release)
+ALERT_DRIFT = 0.20           # a drift past this is told (low, once per model and price-table row)
 FACTOR_MIN, FACTOR_MAX = 0.5, 2.0   # a factor outside these is never applied (told once)
 ALERTED_KEEP = 50
 CALIBRATION_KEEP = 10
@@ -601,10 +601,12 @@ def calibrate(session_id: str, reported_usd: float, now: float | None = None,
     FACTOR_MIN..FACTOR_MAX and the drift (priced / reported - 1) is past DRIFT. It only moves the
     estimate toward the cost Claude Code measured, never past it, and it is bounded, so a bad
     measurement can at most halve or double the estimate the global daily cap counts.
-    Returns {model, drift, factor, samples, applied, release, unpriced, alert}, with `alert` the one
-    thing worth telling this time ('unpriced', 'bound' or 'drift' past ALERT_DRIFT; each at most once
-    per model and release, across this machine's projects), or None: a run too cheap to compare, no
-    log, or a cache lock still busy (a scan) after CALIBRATION_WAIT_S."""
+    Returns {model, drift, factor, samples, applied, release, unpriced, alert, key}, with `alert` the
+    one thing worth telling this time ('unpriced', 'bound' or 'drift' past ALERT_DRIFT), or None: a run
+    too cheap to compare, no log, or a cache lock still busy (a scan) after CALIBRATION_WAIT_S. Each is
+    told at most once across this machine's projects per `key`: what a release must change to end it
+    (the model's rates for 'drift' and 'bound', the model's name for 'unpriced'), never the release
+    itself, which moves many times a day."""
     if reported_usd < 0.05:
         return None
     got = _session_priced(session_id, root)
@@ -637,7 +639,7 @@ def calibrate(session_id: str, reported_usd: float, now: float | None = None,
         models = state.get("models") if isinstance(state.get("models"), dict) else {}
         alerted = [str(a) for a in state.get("alerted") or []] if isinstance(state.get("alerted"), list) else []
         out = {"model": model, "drift": None, "factor": None, "samples": 0, "applied": False,
-               "release": release, "unpriced": sorted(unknown), "alert": None}
+               "release": release, "unpriced": sorted(unknown), "alert": None, "key": None}
         mine = [x for x in pairs if pair and x[3] == model and x[4] == pair[4] and x[2] > 0]
         fs = [r / p for _, r, p, _, _ in mine]
         med = statistics.median(fs) if fs else 0.0
@@ -651,12 +653,17 @@ def calibrate(session_id: str, reported_usd: float, now: float | None = None,
             kind = "drift" if out["applied"] and abs(drift) > ALERT_DRIFT else "" if within else "bound"
         else:
             kind = ""
-        if unknown:
-            kind, model = "unpriced", ", ".join(sorted(unknown))
-        tag = f"{kind}:{model}:{release}"
-        if kind and tag not in alerted:
-            out["alert"] = kind
-            alerted = (alerted + [tag])[-ALERTED_KEEP:]
+        if unknown:   # only a table that lists the model ends it
+            kind, tags = "unpriced", [f"unpriced:{m}" for m in sorted(unknown)]
+        elif not kind:
+            tags = []
+        else:    # only new rates for the model end it
+            rates = hashlib.sha256(json.dumps(pair[4]).encode()).hexdigest()[:10]
+            tags = [f"{kind}:{model}:{rates}"]
+        new = [t for t in tags if t not in alerted]
+        if new:
+            out.update(alert=kind, key=f"unpriced:{', '.join(sorted(unknown))}" if unknown else tags[0])
+            alerted = (alerted + new)[-ALERTED_KEEP:]
         if out["alert"] or out["samples"]:
             project.write_json(calibration_path(), {"v": 1, "models": models, "alerted": alerted}, mode=0o600)
     return out

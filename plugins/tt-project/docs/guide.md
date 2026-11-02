@@ -140,7 +140,7 @@ prolonged whole-box outage.
   on one model agree within 5% on the ratio of Claude Code's reported cost to the list price, later
   calls on that model are scaled by that ratio (recorded in `~/.tt-project/price-calibration.json`,
   dropped when the model's list price changes). A ratio outside 0.5-2.0 is never applied. A low
-  alert says what was done, once per model and tt-project release: a drift past 20%, a ratio out of
+  alert says what was done, once per model and price-table row: a drift past 20%, a ratio out of
   bounds, or a model the table does not list (priced at its most expensive row). `billing` comes from that machine's Claude Code login, never its name:
   `usage` (an API key, a key helper, or a usage-billed seat), `plan` (a subscription plan) or
   `unknown`. An API key is seen in the environment, the settings, or, for a key exported only in an

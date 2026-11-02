@@ -3778,7 +3778,7 @@ class Daemon:
     def _check_price_table(self, r: dict, usage) -> None:
         """Price a finished Claude run's session log with the table that estimates other local
         sessions and let localspend.calibrate correct that estimate by itself toward the cost Claude
-        Code reported. A low alert says what it did, once per model and release: a drift past
+        Code reported. A low alert says what it did, once per model and price-table row: a drift past
         localspend.ALERT_DRIFT, a factor out of bounds (not applied) or a model with no price. A
         resumed run is skipped: its session log also holds the calls of the run it resumed, and so is
         a run on plan windows, where the global cap that table serves never applies."""
@@ -3794,7 +3794,7 @@ class Daemon:
             return
         text = localspend.alert_text(got)
         if text:
-            self.alert(f"claude_price_table:{got['alert']}:{got['model']}:{got['release']}", text, "low", every_s=0)
+            self.alert(f"claude_price_table:{got['key']}", text, "low", every_s=0)
 
     def _slept_during(self, r: dict, exit_info: dict) -> bool:
         """Whether the host slept while the run was going: its supervisor saw the wall clock run
