@@ -2999,7 +2999,7 @@ def _held_notify_run(env, monkeypatch, p, title="sign in", status="blocked", sev
     tid = p.db.add_task(title, "spec", kind=kind, tier="standard", origin="coordinator")
     p.db.update_task(tid, status="running", priority=priority)
     run_dir = _note_run(env, monkeypatch, p, task=str(tid))
-    cli.main(["notify", "--severity", sev, "please sign in again"])
+    cli.main(["notify", "--severity", sev, "need the tag moved or the guard lifted"])
     (run_dir / "result.json").write_text(json.dumps({"status": status, "summary": "needs a sign-in",
                                                      "question": "sign in?", "retry_when": "true", **extra}))
     d = Daemon(p.base)
@@ -3020,7 +3020,7 @@ def test_a_blocked_runs_normal_notify_goes_to_the_coordinator_first(env, monkeyp
     assert len(evs) == 1 and evs[0]["status"] == "queued" and evs[0]["task"] == tid
     assert pagesev.rides_along(dict(evs[0])), "it rides on the hand-off's turn, never one of its own"
     data = json.loads(evs[0]["data"])
-    assert data["task"] == tid and data["text"] == f"#{tid} sign in: please sign in again"
+    assert data["task"] == tid and data["text"] == f"#{tid} sign in: need the tag moved or the guard lifted"
     assert (run_dir / (daemon.NOTIFY_FILE + ".sent")).exists()
     assert daemon.relay_worker_notifies(p, p.db.task(tid), run_dir) == 0, "a second finish holds nothing new"
     assert coord.apply(p, [{"type": "ask_user", "text": f"#{tid} needs a sign-in: sign in now?",
@@ -3045,7 +3045,7 @@ def test_a_worker_notify_from_a_hand_off_that_starts_no_turn_is_posted_at_once(e
     code, _ = _held_notify_run(env, monkeypatch, p, title="code one", status="needs_review", kind="code", priority=1)
     assert p.db.one("SELECT status FROM events WHERE kind='task_review' AND task=?", (code,))["status"] == "handled"
     got = sorted(m["text"] for m in p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='alert'"))
-    assert got == [f"#{tid} sign in: please sign in again", f"#{code} code one: please sign in again"]
+    assert got == [f"#{tid} sign in: need the tag moved or the guard lifted", f"#{code} code one: need the tag moved or the guard lifted"]
     assert p.db.kv(workernotify.KV) == []
     assert not p.db.one("SELECT id FROM events WHERE kind=? AND status='queued'", (workernotify.KIND,))
     assert workernotify.post_due(p.db, time.time() + 10 * workernotify.HOLD_S) == 0
@@ -3068,7 +3068,7 @@ def test_a_held_worker_notify_is_posted_once_after_the_hold_across_a_restart(env
     assert workernotify.post_due(Daemon(p.base).p.db, later) == 1
     assert workernotify.post_due(Daemon(p.base).p.db, later + 60) == 0
     got = p.db.q("SELECT text, severity FROM messages WHERE kind='alert'")
-    assert [(m["text"], m["severity"]) for m in got] == [(f"#{tid} sign in: please sign in again", "normal")]
+    assert [(m["text"], m["severity"]) for m in got] == [(f"#{tid} sign in: need the tag moved or the guard lifted", "normal")]
     assert not p.db.one("SELECT id FROM events WHERE kind=? AND status='queued'", (workernotify.KIND,))
     # A damaged hold list never stops the tick step: a bad entry is posted, junk is skipped.
     p.db.set_kv(workernotify.KV, [{"task": tid, "text": f"#{tid} damaged", "due": "soon"}, "junk"])
@@ -3091,7 +3091,7 @@ def test_a_held_worker_notify_dropped_by_task_update_keeps_the_tasks_reason(env,
     done, _ = _held_notify_run(env, monkeypatch, p, title="done one", status="done")
     low, _ = _held_notify_run(env, monkeypatch, p, title="low one", status="blocked", sev="low")
     assert sorted(m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind='alert'")) == [
-        f"#{done} done one: please sign in again", f"#{low} low one: please sign in again"]
+        f"#{done} done one: need the tag moved or the guard lifted", f"#{low} low one: need the tag moved or the guard lifted"]
     assert len(p.db.q("SELECT id FROM events WHERE kind=?", (workernotify.KIND,))) == 1
 
 
