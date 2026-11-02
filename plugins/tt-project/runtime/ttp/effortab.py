@@ -297,5 +297,6 @@ def conclude(p, cfg: dict, now: float | None = None) -> str | None:
         return None
     own = (p.raw_config() or {}).get(KEY)
     # One write: a stop between keys never leaves a winner with the split still on.
-    p.set_config(KEY, {**(own if isinstance(own, dict) else {}), "winner": got, "decided_at": now, "enabled": False})
+    p.set_config(KEY, {**(own if isinstance(own, dict) else {}), "winner": got, "decided_at": now, "enabled": False},
+                 by={"by": "harness", "via": "effort A/B"})
     return got

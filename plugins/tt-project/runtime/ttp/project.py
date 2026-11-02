@@ -1273,7 +1273,8 @@ class Project:
     def config(self) -> dict:
         return layered(self.raw_config())
 
-    def set_config(self, dotted: str, value: Any) -> None:
+    def set_config(self, dotted: str, value: Any, by: dict | None = None) -> None:
+        """Write one key into project.json and record who set it (`by`, configwho.by; none: unknown)."""
         raw = self.raw_config()
         if self.config_status == "unavailable":
             # Writing the one key would make a project.json of defaults and that key alone.
@@ -1297,6 +1298,12 @@ class Project:
         if self.config_status == "fallback":
             self.keep_broken_config()
         write_json(self.config_path, raw)
+        if self.established():   # a project still being made has no database to record it in yet
+            try:
+                from . import configwho
+                configwho.record(self.db, dotted, by)
+            except Exception:   # the setting is written; a busy or broken database only loses its setter
+                pass
 
     def keep_broken_config(self) -> None:
         """Before set_config writes the last good copy over a project.json that did not read (a hand

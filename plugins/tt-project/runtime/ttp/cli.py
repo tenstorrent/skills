@@ -750,7 +750,7 @@ def cmd_new(a) -> None:
     register(a.name, {"host": hostname(), "dir": str(p.root)})
     from . import coordinator as coord
     if a.coordinator_effort != coord.DEFAULT_EFFORT:   # before the daemon starts, so its first turn has it
-        p.set_config("coordinator.effort", a.coordinator_effort)
+        p.set_config("coordinator.effort", a.coordinator_effort, by={"by": "user", "via": "ttp new"})
     ident = subprocess.run(["git", "-C", str(p.root), "config", "user.email"], capture_output=True, text=True)
     if ident.returncode != 0 or not ident.stdout.strip():
         print("warning: git has no user.email here, so workers cannot commit. Set one "
@@ -7850,6 +7850,8 @@ def cmd_config(a) -> None:
             # A run can be steered by text it reads; spend caps change only on the user's word.
             _refuse_user_only_in_run(a.name)
         return cmd_account_config(a.name, a.key)
+    if a.why:
+        return cmd_config_why([w for w in (a.name, a.key, a.value) if w is not None], a.why)
     from .project import DEFAULT_CONFIG
     if a.name.split(".")[0] in DEFAULT_CONFIG and a.value is None and not local_project(a.name) and here():
         # `ttp config KEY [VALUE]` in a run or project folder: the project is the one it runs in, as for `ttp stats`
@@ -7906,10 +7908,21 @@ def cmd_config(a) -> None:
         # the user's yes (coordinator.NEEDS_USER), as `ttp say` is refused inside a run.
         _refuse_user_only_in_run(k)
     try:
-        p.set_config(a.key, val)
+        from . import configwho
+        p.set_config(a.key, val, by=configwho.from_env())
     except (RuntimeError, ValueError) as e:   # project.json unreadable with no last good copy; a section given one value
         die(str(e))
     print(f"{a.key} = {json.dumps(val)}")
+
+
+def cmd_config_why(words: list[str], key: str) -> None:
+    """`ttp config [NAME] get --why KEY`: who set KEY (configwho.py), read only."""
+    from . import configwho
+    words = [w for w in words if w != "get"]
+    if len(words) > 1:
+        die("usage: ttp config [NAME] get --why KEY")
+    p = need(words[0], sys.argv[1:]) if words else (here() or die("no project here: ttp config NAME get --why KEY"))
+    print(f"{key}: set by {configwho.describe(configwho.get(p.db, key) if p.established() else None, p)}")
 
 
 SECRET_KINDS = ("jev", "slack", "endpoint", "show", "check", "env", "push", "set", "generate")
@@ -8646,7 +8659,7 @@ def _strongest_coordinator(p: Project) -> str:
             return ""
         verdict, why = coordmodel.migrate(raw)
         if verdict == "set":
-            p.set_config("coordinator.model_tier", coordmodel.STRONGEST)
+            p.set_config("coordinator.model_tier", coordmodel.STRONGEST, by={"by": "default", "via": "upgrade"})
         route = coord.route_line(p.config()).removeprefix("coordinator: ")
         p.db.set_kv(STRONGEST_COORD_KEY, {"ts": time.time(), "verdict": verdict or "already", "why": why})
     except Exception:
@@ -8671,7 +8684,7 @@ def _auto_cache_ttl(p: Project) -> str:
         coord = p.raw_config().get("coordinator")
         if not (isinstance(coord, dict) and "cache_ttl" in coord and not str(coord["cache_ttl"] or "").strip()):
             return ""
-        p.set_config("coordinator.cache_ttl", "auto")
+        p.set_config("coordinator.cache_ttl", "auto", by={"by": "default", "via": "upgrade"})
     except Exception:
         return ""
     return 'upgrade note: coordinator.cache_ttl was "" (from an older template) and is now "auto"'
@@ -10860,6 +10873,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--chat-settable", action="store_true",
                    help="check, without setting it, whether a coordinator config_set accepts KEY (and VALUE): "
                         "ttp config --chat-settable KEY [VALUE]; KEY `list` prints every accepted key")
+    s.add_argument("--why", metavar="KEY",
+                   help="who set KEY (user with the message id, coordinator, worker task, harness or default) and "
+                        "when; keys set before this was recorded show unknown: ttp config [NAME] get --why KEY")
     s.set_defaults(fn=cmd_config)
 
     s = sub.add_parser("secret", help="store per-user credentials (read from stdin)")

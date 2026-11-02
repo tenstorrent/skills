@@ -234,7 +234,7 @@ def host_change(p: Project) -> dict | None:
         return {"was": was, "now": now}
     if p.config_status == "ok":
         try:
-            p.set_config("host", now)
+            p.set_config("host", now, by={"by": "harness", "via": "host check"})
         except Exception:
             pass
     return None

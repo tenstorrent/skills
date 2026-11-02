@@ -234,3 +234,93 @@ def test_selfblock_judges_an_outside_mute_on_its_full_why_not_the_clipped_owner(
     found = [(f["source"], f["id"]) for f in selfblock.scan(db) if f["source"] == "mute"]
     # Only the one with no gate and no cite anywhere in its why is flagged.
     assert found == [("mute", "watcher:queue 'lane2'")], found
+
+
+def test_selfblock_raises_a_block_on_a_coordinator_set_key_named_as_the_users_within_one_tick(env):
+    p = make(env)
+    from ttp import coordinator as coord, daemon as dmod, selfblock
+    assert coord.apply(p, [{"type": "config_set", "key": "delivery.channel_tags", "value": ["chan"]}]) == []
+    t = p.db.add_task("dogfood cut")
+    # Also names a real gate ('force-push'): the recorded setter wins over the guess.
+    p.db.update_task(t, status="blocked", blocked_reason="delivery.channel_tags is user-set and must not be "
+                                                         "overridden, so I cannot move the tag without a force-push")
+    dmod.Daemon(p.base).check_self_blocking()
+    (ev,) = p.db.q("SELECT * FROM events WHERE kind=?", (selfblock.KIND,))
+    assert f"task #{t}" in ev["text"] and "set by coordinator" in ev["text"] and "--why" in ev["text"], ev["text"]
+    assert [(f["source"], f["id"]) for f in json.loads(ev["data"])["findings"]] == [("setter", t)]
+    # A key with no record (set by hand, or before setters were recorded) is unknown: raised too.
+    w = p.db.add_task("waits")
+    p.db.update_task(w, status="waiting", result=json.dumps({"waiting_for": "budget.max_parallel_workers is the "
+                                                                            "user's setting; not overriding it"}))
+    found = {f["id"]: f for f in selfblock.scan(p.db)}
+    assert found[w]["source"] == "setter" and "set by unknown" in found[w]["cited"], found
+
+
+def test_selfblock_quiet_for_a_key_the_user_set(env, monkeypatch):
+    p = make(env)
+    from ttp import cli, coordinator as coord, selfblock
+    for k in ("TTP_RUN_ID", "TTP_RUN_DIR", "TTP_TASK_ID", "TTP_TASK"):
+        monkeypatch.delenv(k, raising=False)
+    cli.main(["config", p.name, "delivery.channel_tags", '["chan"]'])   # typed at a terminal: the user
+    m = p.db.post("in", "two workers at a time", chat=None, kind="user")
+    coord.apply(p, [{"type": "config_set", "key": "budget.max_parallel_workers", "value": 3}],
+                user_turn=True, messages=[m])
+    t = p.db.add_task("cut")
+    p.db.update_task(t, status="blocked", blocked_reason="delivery.channel_tags and budget.max_parallel_workers are "
+                                                         "user-set; I will not override them")
+    assert selfblock.scan(p.db) == []
+    assert selfblock.owned_keys("delivery.channel_tags is user-set") == ["delivery.channel_tags"]
+    # No claim of ownership, or no config key: not this check.
+    assert selfblock.owned_keys("waits for delivery.channel_tags to settle") == []
+    assert selfblock.owned_keys("the user's setting in foo.bar") == []
+    assert selfblock.owned_keys("set by the user in project.json") == []
+
+
+def test_config_setter_is_recorded_shown_and_survives_a_restart_and_an_upgrade_migration(env, monkeypatch, capsys):
+    p = make(env)
+    from ttp import cli, configwho, coordinator as coord, db as dbmod
+    from ttp.project import Project
+    for k in ("TTP_RUN_ID", "TTP_RUN_DIR", "TTP_TASK_ID", "TTP_TASK"):
+        monkeypatch.delenv(k, raising=False)
+    old = p.raw_config()
+    p.set_config("delivery.never_force", True)   # a caller naming no setter
+    assert configwho.role(configwho.get(p.db, "delivery.never_force")) == "unknown"
+    coord.apply(p, [{"type": "config_set", "key": "delivery.channel_tags", "value": ["chan"]}])
+    m = p.db.post("in", "two at a time", chat=None, kind="user")
+    coord.apply(p, [{"type": "config_set", "key": "budget.max_parallel_workers", "value": 2}],
+                user_turn=True, messages=[m])
+    monkeypatch.setenv("TTP_RUN_ID", "77")
+    monkeypatch.setenv("TTP_TASK_ID", "42")
+    cli.main(["config", p.name, "heal.outage_owner_budget_min", "45"])
+    monkeypatch.delenv("TTP_TASK_ID")
+    cli.main(["config", p.name, "heal.outage_task_due_min", "30"])
+    assert configwho.get(p.db, "budget.max_parallel_workers")["msgs"] == [m]
+    rec = configwho.get(p.db, "heal.outage_owner_budget_min")
+    assert (rec["by"], rec["task"]) == ("worker", 42)
+    assert configwho.role(configwho.get(p.db, "heal.outage_task_due_min")) == "coordinator"
+    # No name of a person anywhere in a record: roles, ids and the path only.
+    assert set().union(*[r.keys() for r in p.db.kv(configwho.KEY).values()]) <= {"by", "msgs", "task", "run", "via", "ts"}
+    # Restart: a new process opens the database afresh. Upgrade: the migrations run again on it.
+    p.db.conn.close()
+    c = sqlite3.connect(p.state / "project.db")
+    for key in (dbmod.PROVENANCE_MIGRATION, dbmod.PUSH_QUEUE_MIGRATION, dbmod.LEDGER_ACCOUNT_MIGRATION):
+        c.execute("DELETE FROM meta WHERE key=?", (key,))
+    c.commit()
+    c.close()
+    q = Project(p.root)
+    assert configwho.role(configwho.get(q.db, "delivery.channel_tags")) == "coordinator"
+    assert configwho.get(q.db, "budget.max_parallel_workers")["msgs"] == [m]
+    monkeypatch.delenv("TTP_RUN_ID")
+    capsys.readouterr()
+    cli.main(["config", p.name, "get", "--why", "budget.max_parallel_workers"])
+    cli.main(["config", p.name, "get", "--why", "delivery.channel_tags"])
+    cli.main(["config", p.name, "--why", "coordinator.effort"])   # never set: unknown
+    out = capsys.readouterr().out.splitlines()
+    assert out[0].startswith(f"budget.max_parallel_workers: set by user (message #{m}) via chat, 20"), out
+    assert out[1].startswith("delivery.channel_tags: set by coordinator via config_set"), out
+    assert out[2].startswith("coordinator.effort: set by unknown"), out
+    # --why only reads: nothing named 'get' was set.
+    assert "get" not in q.raw_config() and q.raw_config().get("coordinator") == old.get("coordinator")
+    # A whole section set replaces the records under it; a key with none takes its section's.
+    q.set_config("delivery", {**q.raw_config().get("delivery", {})}, by=configwho.by("user", via="cli"))
+    assert configwho.role(configwho.get(q.db, "delivery.channel_tags")) == "user"

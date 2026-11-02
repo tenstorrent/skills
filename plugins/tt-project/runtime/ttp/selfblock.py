@@ -18,7 +18,10 @@ event naming the decide-and-record path. One event per check lists every new fin
 (source, id and its text) raises once, across restarts (kv RAISED_KEY). Quiet for a task held by a
 user-only setting (settinghold.py) or on an ask only the user can answer (review, merge, human,
 access, funds, spend), and for a throughput-class observation mute whose owner is 'outside' (its
-`why` names no GATES entry and cites no user message or ask; throughmute.vet). It never changes
+`why` names no GATES entry and cites no user message or ask; throughmute.vet). A task whose reason
+names a config key as the user's (user-set, user-owned, not to be overridden: OWNED) is checked
+against who set it (configwho.py): any setter but the user, unknown included, raises it with that
+setter, whatever else the reason names. It never changes
 a task or an ask: the turn it wakes decides. Replies raise at
 most one event per REPLY_WINDOW_S, and a reply posted in that window never raises (kv REPLY_RAISED_KEY),
 so the turn's own answer to the event cannot raise the next one.
@@ -87,6 +90,38 @@ GATES = (
         rf"\b(?:paused|held|stopped|frozen)\s+by\s+{_U}\b|\b{_U}\s+(?:paused|froze|asked\s+(?:me\s+|us\s+)?to\s+"
         r"(?:pause|hold|stop|wait|freeze))\b|\b(?:user'?s|your)\s+(?:own\s+)?(?:pause|hold|freeze)\b|\bcode\s+freeze\b", re.I)),
 )
+
+
+# A reason that says a setting is the user's own: user-set, user-owned, not to be overridden.
+OWNED = re.compile(
+    r"\buser[- ](?:set|owned|only|controlled|chosen|configured|pinned)\b|"
+    r"\b(?:set|owned|chosen|configured|pinned|controlled|fixed)\s+by\s+(?:the\s+)?user\b|"
+    r"\b(?:the\s+)?user'?s\s+(?:own\s+)?(?:setting|config\w*|choice|key|value)\b|"
+    r"\b(?:can(?:no|')?t|cannot|must\s+not|mustn't|may\s+not|should\s+not|shouldn't|won't|will\s+not|do\s+not|"
+    r"don't|not\s+(?:allowed|permitted)\s+to)\s+(?:be\s+)?overrid\w*|\bnot\s+(?:to\s+be\s+)?overridden\b|"
+    r"\bnon-?overrid\w*", re.I)
+_KEY = re.compile(r"(?<![\w./-])([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+)(?![\w/-])", re.I)
+
+
+def owned_keys(text: str) -> list[str]:
+    """The config keys `text` names as the user's own (OWNED), in order; [] when it claims none."""
+    said = " ".join((text or "").replace("’", "'").split())
+    if not OWNED.search(said):
+        return []
+    from .project import DEFAULT_CONFIG
+    keys = [k.rstrip(".").lower() for k in _KEY.findall(said)]
+    return list(dict.fromkeys(k for k in keys if k.split(".")[0] in DEFAULT_CONFIG))
+
+
+def setter_finding(db, text: str) -> str | None:
+    """'KEY: set by SETTER' for the first key `text` names as the user's own whose recorded setter
+    is not the user (configwho; no record is unknown); None when every such key is the user's."""
+    from . import configwho
+    for k in owned_keys(text):
+        rec = configwho.get(db, k)
+        if configwho.role(rec) != "user":
+            return f"{k} named as the user's, but set by {configwho.describe(rec)}"
+    return None
 
 
 # A people cue said in the negative ("no other tenant", "not in use") names no one it could affect.
@@ -164,7 +199,9 @@ def scan(db, now: float | None = None) -> list[dict]:
         why = " ".join(x for x in (t["blocked_reason"] or "", _waiting_for(t)) if x)
         if not why or held_key(t) or _held_ask(t) in user_only or any(_cites(why, aid) for aid in user_only):
             continue
-        if (cited := finding(why)):
+        if (cited := setter_finding(db, why)):
+            out.append({"source": "setter", "id": t["id"], "text": why, "cited": cited})
+        elif (cited := finding(why)):
             out.append({"source": "task", "id": t["id"], "text": why, "cited": cited})
     for aid, a in asks.items():
         if blocking(a) in CHECKED_ASKS and (cited := finding(a["text"], cite=False)):
@@ -197,11 +234,15 @@ def scan(db, now: float | None = None) -> list[dict]:
 
 
 def text(found: list[dict]) -> str:
-    names = {"task": "task #{}", "ask": "ask {}", "reply": "your reply (message {})",
+    names = {"task": "task #{}", "setter": "task #{}", "ask": "ask {}", "reply": "your reply (message {})",
              "mute": "observation_mute {} (a hold on the user or an outside party that names no gate)"}
     lines = [f"{names[f['source']].format(f['id'])}: \"{_clip(f['text'])}\" (cites: {f['cited']})"
              for f in found[:MAX_LISTED]]
     more = f" (+{len(found) - MAX_LISTED} more)" if len(found) > MAX_LISTED else ""
+    if any(f["source"] == "setter" for f in found):
+        more += (". A setting a task calls the user's whose recorded setter is not the user (`ttp config get "
+                 "--why KEY`) is yours to change or keep; only a setting only the user may change still "
+                 "needs their word, asked for its exact value")
     return ("Self-blocking: work is held for the user's word on a decision that is yours. "
             + "; ".join(lines) + more + ". None names a step that could affect people badly, speaks as the user, "
             "needs a credential, money or a step only the user holds, changes a charter Restriction or lifts a "

@@ -34,7 +34,7 @@ import hashlib
 import re
 from pathlib import Path
 
-from . import settinghold
+from . import configwho, settinghold
 
 EVENT = "grant_mismatch"
 APPLIED = "grant_applied"
@@ -245,7 +245,7 @@ def reconcile(p, db, cfg: dict, now: float, repo: Path | None = None) -> list[st
                                "CHARTER.history.md logs the Policies line without a user message)", now)
             continue
         try:
-            p.set_config(c["key"], c["want"])
+            p.set_config(c["key"], c["want"], by=configwho.by("user", msgs=configwho.msg_ids(who), via=f"grant: {who}"[:80]))
         except Exception as e:   # a config it cannot write is a defect, never a crash of the tick
             _defect(db, c, f"writing the config failed: {e}", now)
             continue

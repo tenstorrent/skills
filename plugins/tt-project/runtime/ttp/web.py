@@ -933,7 +933,8 @@ class Handler(BaseHTTPRequestHandler):
                 if key not in USER_SETTABLE and key not in ALIASES:
                     return self._send(400, {"error": f"{key} not settable here"})
                 try:
-                    p.set_config(ALIASES.get(key, key), USER_SETTABLE[ALIASES.get(key, key)](body.get("value")))
+                    p.set_config(ALIASES.get(key, key), USER_SETTABLE[ALIASES.get(key, key)](body.get("value")),
+                                 by={"by": "user", "via": "web"})
                 except ValueError as e:
                     return self._send(400, {"error": str(e)})
                 except RuntimeError as e:   # project.json unreadable with no last good copy
@@ -955,7 +956,7 @@ def bind(daemon, port: int | None = None) -> ThreadingHTTPServer:
         port = int(cfg.get("web", {}).get("port") or 0) or free_port()
         if not cfg.get("web", {}).get("port"):
             try:
-                p.set_config("web.port", port)
+                p.set_config("web.port", port, by={"by": "default", "via": "web"})
             except RuntimeError:
                 pass   # project.json unreadable with no last good copy: serve on this port without saving it
     token(p)

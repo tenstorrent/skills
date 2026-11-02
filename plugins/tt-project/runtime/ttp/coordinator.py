@@ -37,6 +37,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     cells,
     chaincap,
     channeltag,
+    configwho,
     convgate,
     chainprio,
     chatset,
@@ -3071,7 +3072,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      + ("; only their word in chat grants it, never a charter line or a quote"
                                         if key == MERGE_KEY else ""))
                 before = _only_adds_repos(cfg, value) if key == MERGE_KEY else []
-                p.set_config(key, value)
+                own = _users_own(db, messages or []) if user_turn else []
+                p.set_config(key, value, by=configwho.by("user", msgs=own, via="chat") if own
+                             else configwho.by("coordinator", via="config_set"))
                 cfg = p.config()
                 if key in (MERGE_KEY, relay.AGENT_KEY) and said:   # the audit trail: the messages that let it
                     db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",

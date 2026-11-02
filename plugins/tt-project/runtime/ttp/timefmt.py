@@ -245,7 +245,7 @@ def migrate(p, log=None) -> str | None:
     if p.config_status != "ok" or not raw or valid(raw.get(KEY)):
         return None
     tz, acct = fallback()
-    p.set_config(KEY, tz)
+    p.set_config(KEY, tz, by={"by": "default", "via": "home zone"})
     if log:
         log(f"home time zone set to {tz} ({'the account budget.timezone' if acct else 'this machine'}); "
             f"the workstation's next ttp connect corrects it")

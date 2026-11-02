@@ -729,7 +729,7 @@ def apply(p, cfg: dict, report: dict, trigger: str = "", now: float | None = Non
     for c in changes:
         try:
             val = settable(c["key"])(c["new"])
-            p.set_config(c["key"], val)
+            p.set_config(c["key"], val, by={"by": "harness", "via": "throughput"})
         except Exception as e:
             kept.append({"lane": c["key"], "key": c["key"], "why": f"could not set: {e}"[:200]})
             continue
