@@ -126,6 +126,38 @@ def check(db, charter: str, text: str, src, agent: bool = False) -> str:
     return _own_cite(text, f" (user msg #{mid})", charter)
 
 
+TURN_SOURCE = ("in a user turn, removing or replacing a cited Restrictions item (one with a \"(user msg #N)\", "
+               "\"(origin: Brief)\" or \"(origin: harness gate)\" cite) needs `source`: the JSON text of "
+               "{\"msg\": <a user message of this turn>, \"quote\": \"<their own words in it that change or lift "
+               "the item, in any wording>\"}, from the 'user's words (verbatim)' part only (a relayer's context "
+               "never counts). Cite the user's words in `source` and resend, or, for an item that has clearly "
+               "ended, resend with `over` (what ended it and when)")
+
+
+def turn_quote(db, src, turn: list[int] | None, agent: bool = False) -> str:
+    """Why `src` does not back removing or replacing a cited Restrictions item in a user turn, else "":
+    it must name, as `msg`, one of the user's own messages of this turn (`turn`) and quote words of its
+    verbatim part (with `agent`, relay.agent_orders, also the owner's own agent's words in it, as
+    check() reads them). No origin counts: the Brief and a gate do not retire their own items."""
+    try:
+        got = _parse(src)
+        mid = int(str(got.get("msg") or "").lstrip("#"))
+    except ValueError:
+        return f"charter_update rejected: {TURN_SOURCE}"
+    if got.get("origin"):
+        return f"charter_update rejected: origin check failed: `source.origin` does not count here; {TURN_SOURCE}"
+    own = db.one("SELECT provenance FROM messages WHERE id=? AND direction='in'", (mid,))
+    if mid not in (turn or []) or own is None or (own["provenance"] or "") == "system":
+        return (f"charter_update rejected: message check failed: `source.msg` #{mid} is not a user message of "
+                f"this turn; {TURN_SOURCE}")
+    try:
+        check(db, "", "", got, agent)
+    except ValueError:
+        return (f"charter_update rejected: quote check failed: `source.quote` is not in the user's own words of "
+                f"message #{mid} (the source itself was read); {TURN_SOURCE}")
+    return ""
+
+
 def _parse(src) -> dict:
     """`source` as the object check() reads: an object as is, a string as its JSON text (the action schema
     types `source` as a string); ValueError naming what is wrong with it."""
@@ -219,6 +251,12 @@ def drops_unsourced(charter: str, quote: str = "", body: str = "") -> bool:
     items = [" ".join(" ".join(x).split()) for x in split_items(body or charter_restrictions(charter))]
     items = [x for x in items if x and not x.startswith("#") and (body or q and q in _loose(x))]
     return bool(items) and not any(sourced(x) for x in items)
+
+
+def cited_span(body: str, start: int, end: int, items) -> bool:
+    """Whether the span [start, end) of a Restrictions body touches a sourced (cited) item (`items`:
+    coordinator._items of `body`)."""
+    return any(sourced(body[a:e]) for a, e, _ in items if a < end and start <= e)
 
 
 def unsourced_span(body: str, start: int, end: int, items) -> bool:

@@ -1640,6 +1640,13 @@ def test_cache_ttl_replay_of_recorded_gaps_cuts_unread_1h_writes_without_new_mis
 
 
 
+def _turn_said(p, words: str) -> tuple[list[int], dict]:
+    """A user message of this turn saying `words`, and a `source` quoting it: what a user turn that removes
+    or replaces a cited Restrictions item carries (restriction_source.turn_quote)."""
+    mid = p.db.post("in", words, chat=None, channel="web", kind="user", provenance="web-session")
+    return [mid], {"msg": mid, "quote": words}
+
+
 def test_charter_update_replaces_moves_the_old_section_to_history(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -1666,7 +1673,8 @@ def test_charter_update_replaces_moves_the_old_section_to_history(env):
               "replaces": "Restrictions (added 2026-09-02)"}
     assert "needs the user's word" in coord.apply(p, [retire], turn=8)[0]
     assert "Never touch box A (user msg #1)." in p.charter_path.read_text()
-    assert coord.apply(p, [retire], turn=9, user_turn=True) == []
+    msgs, src = _turn_said(p, "box A is free to use now")
+    assert coord.apply(p, [{**retire, "source": src}], turn=9, user_turn=True, messages=msgs) == []
     assert "Never touch box A (user msg #1)." not in p.charter_path.read_text() and "Never touch box A (user msg #1)." in hist.read_text()
     assert "never replaced" in coord.apply(p, [{**retire, "replaces": "Brief"}], turn=10)[0]
     assert "matches 0" in coord.apply(p, [{**retire, "replaces": "Resources"}], turn=11)[0]
@@ -1812,7 +1820,8 @@ def test_charter_update_quote_finds_its_item_in_a_legacy_dated_section(env):
     # The restriction check applies to the section edited.
     drop = {"type": "charter_update", "section": "Restrictions", "quote": "Never touch box A (user msg #1)."}
     assert "needs the user's word" in coord.apply(p, [drop], turn=3)[0]
-    assert coord.apply(p, [drop], turn=5, user_turn=True) == []
+    msgs, src = _turn_said(p, "you may touch box A again")
+    assert coord.apply(p, [{**drop, "source": src}], turn=5, user_turn=True, messages=msgs) == []
     charter = p.charter_path.read_text()
     assert "Never touch box A (user msg #1)." not in charter and "Never merge." in charter
     assert "### Removed from Restrictions (added 2026-09-03) (" in hist.read_text()
@@ -1852,7 +1861,8 @@ def test_charter_update_restriction_items_change_only_on_the_users_word(env, tmp
     # Adding one needs no such word ("touch" covers restarting: the guard asks, both hold).
     assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "text": "Never restart the service (origin: harness gate).",
                             "source": {"origin": "gate"}, "both_hold": True}], turn=2) == []
-    assert coord.apply(p, [drop], turn=3, user_turn=True) == []
+    msgs, src = _turn_said(p, "you may touch box A again")
+    assert coord.apply(p, [{**drop, "source": src}], turn=3, user_turn=True, messages=msgs) == []
     charter = p.charter_path.read_text()
     assert "Never touch box A (user msg #1)." not in charter and "Never merge.\n\nNever restart the service (origin: harness gate)." in charter
     assert "### Removed from Restrictions (binding on every task) (" in hist.read_text()
@@ -1902,13 +1912,13 @@ def test_a_users_loosening_of_a_restriction_names_the_tools_still_enforcing_the_
 
     def tools():
         return [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind='restriction_tools'")]
+    msgs, src = _turn_said(p, "a chip reset may run even when it can reach a host serving live traffic")
     loosen = {"type": "charter_update", "section": "Restrictions", "quote": item,
-              "text": "A chip reset may run even when it can reach a host serving live traffic.",
-              "source": {"origin": "gate"}}
+              "text": "A chip reset may run even when it can reach a host serving live traffic.", "source": src}
     for k, act in enumerate((loosen, {**loosen, "text": ""})):   # a loosening and a removal alike
         p.db.x("DELETE FROM events")
         p.charter_path.write_text(base)
-        assert coord.apply(p, [act], turn=20 + k, user_turn=True) == []
+        assert coord.apply(p, [act], turn=20 + k, user_turn=True, messages=msgs) == []
         out = tools()
         assert len(out) == 1 and "bin/reset-gate.sh:2" in out[0] and "schedule gate-watch" in out[0], out
         assert "pre.sh" not in out[0] and "priority-1 task" in out[0]
@@ -1919,14 +1929,14 @@ def test_a_users_loosening_of_a_restriction_names_the_tools_still_enforcing_the_
     p.charter_path.write_text(base)
     assert coord.apply(p, [{"type": "task_add", "kind": "code", "priority": 1, "title": "update reset-gate.sh",
                             "spec": "drop the serving check from bin/reset-gate.sh"}, loosen],
-                       turn=30, user_turn=True) == []
+                       turn=30, user_turn=True, messages=msgs) == []
     out = tools()
     assert len(out) == 1 and "reset-gate.sh" not in out[0] and "schedule gate-watch" in out[0], out
     # A narrowing (only adds a limit) and an edit outside the user's word name nothing.
     p.db.x("DELETE FROM events")
     p.charter_path.write_text(base)
     assert coord.apply(p, [{**loosen, "text": item.rstrip(".") + ", and never on a weekend."}],
-                       turn=31, user_turn=True) == []
+                       turn=31, user_turn=True, messages=msgs) == []
     assert tools() == []
     p.charter_path.write_text(base)
     assert coord.apply(p, [loosen], turn=32, user_turn=False), "outside the user's word and with no `over`: refused"
@@ -1959,32 +1969,34 @@ def test_a_restrictions_section_replaced_with_looser_words_names_the_tools_of_th
 
     def tools():
         return [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind='restriction_tools'")]
+    msgs, src = _turn_said(p, "a chip reset may run even when it can reach a host serving live traffic")
     looser = {"type": "charter_update", "section": "Restrictions", "replaces": head,
-              "text": f"- A chip reset may run even when it can reach a host serving live traffic (origin: harness "
-                      f"gate).\n- {keep}", "source": {"origin": "gate"}}
+              "text": f"- A chip reset may run even when it can reach a host serving live traffic.\n- {keep}",
+              "source": src}
     # (a) one item loosened, the other kept word for word: only the loosened item's tool is named.
     p.charter_path.write_text(base)
-    assert coord.apply(p, [looser], turn=40, user_turn=True) == []
+    assert coord.apply(p, [looser], turn=40, user_turn=True, messages=msgs) == []
     assert "A chip reset may run" in p.charter_path.read_text()
     out = tools()
     assert len(out) == 1 and "bin/reset-gate.sh:2" in out[0] and "fleet-guard" not in out[0], out
     # A dropped item counts as loosened too.
     p.db.x("DELETE FROM events")
     p.charter_path.write_text(base)
-    assert coord.apply(p, [{**looser, "text": f"- {item}"}], turn=41, user_turn=True) == []
+    assert coord.apply(p, [{**looser, "text": f"- {item}"}], turn=41, user_turn=True, messages=msgs) == []
     out = tools()
     assert len(out) == 1 and "bin/fleet-guard.sh:2" in out[0] and "reset-gate" not in out[0], out
     # An item kept but extended with an exception is loosened, though its old words still appear.
     p.db.x("DELETE FROM events")
     p.charter_path.write_text(base)
     extended = f"- {item}\n- {keep[:-1]}, except on weekends."
-    assert coord.apply(p, [{**looser, "text": extended}], turn=41, user_turn=True) == []
+    assert coord.apply(p, [{**looser, "text": extended}], turn=41, user_turn=True, messages=msgs) == []
     out = tools()
     assert len(out) == 1 and "bin/fleet-guard.sh:2" in out[0] and "reset-gate" not in out[0], out
     # (b) a replace that only restates its items names nothing.
     p.db.x("DELETE FROM events")
     p.charter_path.write_text(base)
-    assert coord.apply(p, [{**looser, "text": f"* {item}\n* {keep}"}], turn=42, user_turn=True) == []
+    assert coord.apply(p, [{**looser, "text": f"* {item}\n* {keep}"}], turn=42, user_turn=True,
+                       messages=msgs) == []
     assert tools() == []
     # (c) outside the user's word, with no `over`: refused, the charter as it was, nothing named.
     p.charter_path.write_text(base)
@@ -3004,9 +3016,10 @@ def test_a_restrictions_items_source_is_cited_in_its_text(env):
         assert len(err) == 1 and "which `source` does not name" in err[0], (text, err)
     assert "changelog" not in p.charter_path.read_text()
     # A cite the charter's Restrictions already carry may stay (an edited item keeps its own).
+    msgs, src = _turn_said(p, "never merge, not even docs")
     assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": "Never merge.",
-                            "text": "- Never merge, not even docs. (user msg #1)", "source": G}],
-                       turn=5, user_turn=True) == []
+                            "text": "- Never merge, not even docs. (user msg #1)", "source": src}],
+                       turn=5, user_turn=True, messages=msgs) == []
     assert "- Never merge, not even docs. (user msg #1)\n" in p.charter_path.read_text()
 
 
@@ -3178,12 +3191,13 @@ def test_dropping_an_unsourced_copy_of_a_rule_the_brief_or_a_sourced_item_states
     p.set_config("delivery.push_checks", ["run the lint-check suite"])
     spec = p.db.add_task("guard publishing", "Run the required `lint-check` suite before publishing.")
     drop = {"type": "charter_update", "section": "Restrictions", "text": ""}
+    msgs, src = _turn_said(p, "we no longer need the lint-check rule")
 
     def run(charter: str, act: dict, turn: int, user_turn: bool = False) -> tuple[list[str], list[str], dict]:
         p.db.x("DELETE FROM events")
         p.db.set_kv(echoes.RETIRED_KEY, [])
         p.charter_path.write_text(charter)
-        assert coord.apply(p, [act], turn=turn, user_turn=user_turn) == []
+        assert coord.apply(p, [act], turn=turn, user_turn=user_turn, messages=msgs) == []
         tools = [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind='restriction_tools'")]
         return tools, echoes.digest_lines(p), echoes.export(p)
     # (1) the Brief states the dropped advisory copy: nothing for the Brief, config, tool or spec.
@@ -3200,8 +3214,7 @@ def test_dropping_an_unsourced_copy_of_a_rule_the_brief_or_a_sourced_item_states
     assert tools == [] and lines == [], (tools, lines)
     # (2) a sourced item the user retires is reported, though the Brief still has its words.
     item = "Never publish unless the required `lint-check` suite is green (user msg #1)."
-    tools, lines, _ = run(f"# demo\n\n{brief}## Restrictions\n- {item}\n", {**drop, "quote": item,
-                                                                              "source": {"origin": "gate"}},
+    tools, lines, _ = run(f"# demo\n\n{brief}## Restrictions\n- {item}\n", {**drop, "quote": item, "source": src},
                           4, user_turn=True)
     assert len(tools) == 1 and "publish-guard.sh:2" in tools[0], tools
     assert lines and any("publish-guard.sh" in ln for ln in lines), lines
@@ -3229,10 +3242,12 @@ def test_an_unsourced_copy_dropped_with_an_over_reason_raises_no_restriction_too
     drop = {"type": "charter_update", "section": "Restrictions", "text": ""}
     over = "a duplicate of what the Brief already states, so this copy adds nothing"
 
+    msgs, src = _turn_said(p, "we no longer need the lint-check rule")
+
     def tools(charter: str, act: dict, turn: int, user_turn: bool = False) -> list[str]:
         p.db.x("DELETE FROM events")
         p.charter_path.write_text(charter)
-        assert coord.apply(p, [act], turn=turn, user_turn=user_turn) == []
+        assert coord.apply(p, [act], turn=turn, user_turn=user_turn, messages=msgs) == []
         return [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind='restriction_tools'")]
     turn = 10
     for states in (brief + "## Restrictions\n- Never merge. (user msg #1)\n", "## Restrictions\n" + sourced):
@@ -3249,7 +3264,7 @@ def test_an_unsourced_copy_dropped_with_an_over_reason_raises_no_restriction_too
     # A cited item the user withdraws while a tool still enforces it: exactly one event.
     item = "Never publish unless the required `lint-check` suite is green (user msg #1)."
     out = tools(f"# demo\n\n{brief}## Restrictions\n- {item}\n",
-                {**drop, "quote": item, "source": {"origin": "gate"}}, 40, user_turn=True)
+                {**drop, "quote": item, "source": src}, 40, user_turn=True)
     assert len(out) == 1 and "publish-guard.sh:2" in out[0], out
     # ... and so does a cited item `over` retires, though the Brief states it.
     out = tools(f"# demo\n\n{brief}## Restrictions\n- {item}\n", {**drop, "quote": item, "over": over}, 41)
@@ -3299,7 +3314,8 @@ def test_a_users_yes_to_a_charter_change_stays_valid_until_it_is_applied(env):
     ask = db.post("out", "May I drop the docs rule?", kind="ask")
     yes = db.post("in", "yes, drop it", chat=None, channel="web", kind="user", provenance="web-session")
     new = "Keep the docs generic, except for the setup guide."
-    act = {"type": "charter_update", "section": "Restrictions", "replaces": "Restrictions (added", "text": new}
+    act = {"type": "charter_update", "section": "Restrictions", "replaces": "Restrictions (added", "text": new,
+           "source": {"msg": yes, "quote": "yes, drop it"}}
     # The user's turn: an ambiguous prefix is rejected with the candidates only, and the yes is recorded.
     err = coord.apply(p, [act], turn=10, user_turn=True, messages=[yes])
     assert len(err) == 1 and "matches 2" in err[0], err
@@ -3709,9 +3725,9 @@ def test_only_the_users_own_turn_records_a_charter_approval(env):
     from ttp import coordinator as coord
     db = p.db
     p.charter_path.write_text(RESTR_CHARTER)
-    act = {"type": "charter_update", "section": "Restrictions", "replaces": "Restrictions (added", "text": "x y z",
-           "approval": "yes", "messages": [1]}
     yes = db.post("in", "yes", chat=None, channel="web", kind="user", provenance="web")
+    act = {"type": "charter_update", "section": "Restrictions", "replaces": "Restrictions (added", "text": "x y z",
+           "approval": "yes", "messages": [1], "source": {"msg": yes, "quote": "yes"}}
     system = db.post("in", "Project created.", chat=None, channel="system", kind="user", provenance="system")
     note = db.post("out", "yes", kind="reply")
     # A turn without user messages (whatever the action claims), the harness's own message, or an
@@ -3741,8 +3757,10 @@ def test_charter_update_replaces_takes_full_headings_and_the_digest_lists_them(e
     for k, name in enumerate(("## Restrictions (added 2026-10-02, turn 5.0)", "`restrictions (added 2026-10-02, "
                               "turn 5.0)`", "4.", "4", "4. Restrictions (added 2026-10-02, turn 5.0)")):
         p.charter_path.write_text(RESTR_CHARTER)
+        msgs, src = _turn_said(p, "never delete tags")
         assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "replaces": name,
-                                "text": "Never delete tags.", "source": G}], turn=30 + k, user_turn=True) == [], name
+                                "text": "Never delete tags.", "source": src}], turn=30 + k, user_turn=True,
+                           messages=msgs) == [], name
         charter = p.charter_path.read_text()
         assert "Never delete release tags." not in charter and "Never delete tags." in charter
     # A number whose heading disagrees names no section by number.
@@ -3760,8 +3778,9 @@ def test_lifting_a_restriction_merges_the_restrictions_sections_into_one_block(e
     from ttp.prompts import charter_sections
     p.charter_path.write_text(RESTR_CHARTER + "\n## Restrictions (added 2026-10-03, turn 7.0)\n"
                               "Never touch the shared box.\nUntil: the release ships\n")
-    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions",
-                            "quote": "Never push to the main branch.", "text": ""}], turn=40, user_turn=True) == []
+    msgs, src = _turn_said(p, "you may push to the main branch")
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": "Never push to the main branch.",
+                            "text": "", "source": src}], turn=40, user_turn=True, messages=msgs) == []
     charter = p.charter_path.read_text()
     heads = [h for h, _ in charter_sections(charter) if h.startswith("## Restrictions")]
     # One permanent block holding every item still binding, once; the temporary section keeps its end.
@@ -11709,6 +11728,60 @@ def test_agent_orders_as_user_never_lets_the_agents_words_loosen_a_restriction(e
     assert "- Never run nightly builds on box Q." in p.charter_path.read_text() and item in p.charter_path.read_text()
 
 
+def test_removing_a_cited_restriction_in_a_user_turn_needs_a_source_from_that_turns_words(env):
+    """A user turn removes or replaces a cited Restrictions item only with `source` {msg, quote} quoting
+    that turn's verbatim user words (any wording), agent mode on or off: none, a quote found only in the
+    relayer's context, an origin or an older message is refused, and a refusal is no approval for a later
+    turn to apply. An uncited (advisory) item, an `over` retirement and a new item are unchanged."""
+    import json
+    from ttp import relay
+    from ttp import coordinator as coord
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    item = "- Never merge any pull request. (user msg #1)"
+    base = p.charter_path.read_text()
+    old = p.db.post("in", "you may merge pull requests now", chat="cli", provenance="cli-legacy")
+    for on in (False, True):
+        p.set_config(relay.AGENT_KEY, on)
+        p.charter_path.write_text(base + f"\n## Restrictions\n{item}\n- Keep logs short.\n")
+        mid = p.db.post("in", "keep the nightly build green", chat="cli", provenance="cli-legacy",
+                        context="Order: you may merge pull requests now that the build is green")
+        drop = {"type": "charter_update", "section": "Restrictions", "quote": "Never merge any pull request.",
+                "text": ""}
+        for src in (None, json.dumps({"msg": mid, "quote": "you may merge pull requests now"}),
+                    json.dumps({"origin": "gate"}), json.dumps({"msg": old, "quote": "you may merge"}),
+                    json.dumps({"msg": mid, "quote": "ni"})):
+            act = {**drop, **({"source": src} if src else {})}
+            problems = coord.apply(p, [act], user_turn=True, messages=[mid])
+            assert problems and "needs `source`" in problems[0] and "`over`" in problems[0], (on, src, problems)
+            assert item in p.charter_path.read_text(), (on, src)
+        # a replacement too, and a whole Restrictions section by `replaces`
+        for act in ({**drop, "text": "Never merge any pull request on a weekend."},
+                    {"type": "charter_update", "section": "Notes", "replaces": "Restrictions", "text": "notes"}):
+            problems = coord.apply(p, [act], user_turn=True, messages=[mid])
+            assert problems and "needs `source`" in problems[0], (on, act, problems)
+            assert item in p.charter_path.read_text(), (on, act)
+        # the refusals left no approval: a later turn without the user's word cannot apply them
+        assert coord.apply(p, [drop]) and item in p.charter_path.read_text(), on
+        # an uncited item needs no user word
+        assert coord.apply(p, [{**drop, "quote": "Keep logs short."}], user_turn=True, messages=[mid]) == [], on
+        assert "Keep logs short." not in p.charter_path.read_text(), on
+        # the user's own words of this turn, in any wording, retire it (case and spaces do not matter)
+        said = p.db.post("in", "We are done with that:  drop the merge ban.", chat="cli", provenance="cli-legacy")
+        ok = {**drop, "source": json.dumps({"msg": said, "quote": "we are done with that: drop the MERGE ban"})}
+        assert coord.apply(p, [ok], user_turn=True, messages=[mid, said]) == [], on
+        assert "Never merge any pull request." not in p.charter_path.read_text(), on
+        # `over` retires a clearly ended item, and an addition still takes restriction_source as before
+        p.charter_path.write_text(base + f"\n## Restrictions\n{item}\n")
+        over = {**drop, "over": "the repository was archived on 2026-10-30 and takes no merges"}
+        assert coord.apply(p, [over], user_turn=True, messages=[mid]) == [], on
+        assert "Never merge any pull request." not in p.charter_path.read_text(), on
+        add = {"type": "charter_update", "section": "Restrictions", "text": "- Keep the nightly build green.",
+               "source": json.dumps({"msg": mid, "quote": "keep the nightly build green"})}
+        assert coord.apply(p, [add], user_turn=True, messages=[mid]) == [], on
+        assert "Keep the nightly build green. (user msg #" in p.charter_path.read_text(), on
+
+
 def test_relay_guard_reads_only_this_turns_context_and_counts_what_the_user_backs(env):
     """The guard must not refuse real user rules: older relayer context is out of scope, the charter and
     user-rule memory count as the user's words, and a bare provider name or a common phrase is no quote."""
@@ -15533,7 +15606,8 @@ def test_a_refused_resend_carries_the_whole_approved_charter_text_to_the_next_tu
     said = db.post("in", "goals: as below", chat=None, channel="web", kind="user", provenance="web-session")
     approved = " ".join(f"Keep docs page {i} generic, with no setup details." for i in range(45))
     assert len(approved) > 2000
-    act = {"type": "charter_update", "section": "Restrictions", "replaces": "Restrictions (added", "text": approved}
+    act = {"type": "charter_update", "section": "Restrictions", "replaces": "Restrictions (added", "text": approved,
+           "source": {"msg": said, "quote": "goals: as below"}}
     assert "matches 2" in coord.apply(p, [act], turn=1, user_turn=True, messages=[said])[0]
     # A later turn rewords it: refused, with the approved text whole and the file that holds it.
     err = coord.apply(p, [{**act, "replaces": "Restrictions (added 2026-10-01, turn 3.0)", "text": approved[:-1] + "!"}], turn=2)

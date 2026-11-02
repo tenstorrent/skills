@@ -621,8 +621,10 @@ def test_an_advisory_item_dropped_as_a_duplicate_of_the_brief_is_no_echo_and_a_w
     item = "Hold every release for the `freeze-gate` sign-off (user msg #1)."
     p.set_config("delivery.release_hold", "wait for the freeze-gate sign-off")
     p.charter_path.write_text(f"# demo\n\n## Brief\nShip it.\n\n## Restrictions\n- {item}\n")
-    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": item, "text": ""}],
-                       turn=3, user_turn=True) == []
+    said = p.db.post("in", "drop the freeze-gate hold", chat=None, channel="web", kind="user", provenance="web-session")
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": item, "text": "",
+                            "source": {"msg": said, "quote": "drop the freeze-gate hold"}}],
+                       turn=3, user_turn=True, messages=[said]) == []
     lines = echoes.digest_lines(p)
     assert lines[0] == echoes.RETIRED_HEADER and len(lines) == 2, lines
     assert lines[1].startswith("- config delivery.release_hold:"), lines

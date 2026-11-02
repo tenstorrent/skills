@@ -2801,6 +2801,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         if overlap:
                             notes.append(overlap)
                     source = _users_own(db, messages or []) if user_turn else list((ok or {}).get("messages") or [])
+                    # a cited Restrictions item removed or replaced in a user turn: this turn's words in `source`
+                    turn_src = (restriction_source.turn_quote(db, a.get("source"), messages, agent)
+                                if user_turn and (quote or replaces) and len(over) < OVER_MIN else "")
                     gone = replaced = ""   # the Restrictions section `replaces` retires, for restriction_audit
                     if replaces:
                         from .prompts import charter_sections
@@ -2815,9 +2818,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     try:
                         target, extra, retired = _charter_update(p, section, text, quote, replaces, key,
                                                                  user_turn or ok is not None, over, end, no_ok,
-                                                                 source, unsourced)
+                                                                 source, unsourced, turn_src)
                     except ValueError as e:
-                        if user_turn and str(e) != unsourced:   # a missing source is no approval to record
+                        # a missing source is no approval to record, nor is a Restrictions edit without
+                        # this turn's words in `source` (a later retry would apply it on that approval)
+                        if user_turn and str(e) != unsourced and not (
+                                turn_src and _restriction_edit(p, section, quote, replaces)):
                             _record_charter_approval(p, messages or [], section, quote, replaces, text, end, str(e))
                         raise
                     if quote or replaced:   # the retired text, searched for in what still binds (echoes)
@@ -4565,6 +4571,27 @@ def _loosens_restriction(p: Project, section: str, quote: str, replaces: str, te
     return restr(i) and bool(restriction_audit.replaced_items("\n".join(secs[i][1]), text if restr(t) else ""))
 
 
+def _restriction_edit(p: Project, section: str, quote: str, replaces: str) -> bool:
+    """Whether a `quote` or `replaces` charter_update may edit a Restrictions section: the section the
+    quote lands in as _charter_update finds it, or any section `replaces` names (one or several)."""
+    from .prompts import charter_sections
+    secs = charter_sections(p.charter_path.read_text()) if p.charter_path.exists() else []
+    names = [" ".join(h[3:].split()) for h, _ in secs]
+    restr = lambda n: _DATED.sub("", n).lower().startswith("restriction")
+    if replaces and any(restr(names[i]) for i in _replaces_hits(secs, replaces)):
+        return True
+    if not quote:
+        return False
+    t = _charter_target(names, section, [ends.charter_end(b) for _, b in secs], True) if secs else None
+    if t is None:
+        return restr(" ".join(section.lstrip("#").split()))
+    try:
+        t = _charter_quote_spot(secs, t, section, quote)[0]
+    except ValueError:
+        pass
+    return restr(names[t])
+
+
 def _loosens(quote: str, text: str) -> bool:
     """Whether a quoted Restrictions edit loosens the item: it removes it, drops words of a sentence of
     the item that bans (_BAN_RE), or adds a sentence that may lift something (_may_lift). A sentence
@@ -6284,7 +6311,7 @@ _DATED = re.compile(r"\s*\(added [^)]*\)$", re.I)   # legacy "## Policies (added
 def _charter_update(p: Project, section: str, text: str, quote: str, replaces: str, key: str | None,
                     user_turn: bool, over: str = "", end: dict | None = None,
                     no_approval: str = "", source: list[int] | None = None,
-                    unsourced: str = "") -> tuple[str, str, str]:
+                    unsourced: str = "", turn_source: str = "") -> tuple[str, str, str]:
     """Apply one charter_update: retire the section `replaces` names, then edit the one section
     `section` names. With `quote`, the single span of that section matching it is replaced by
     `text` (or removed when `text` is empty); otherwise `text` is added at the section's end, and
@@ -6298,7 +6325,9 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
     Returns the edited section's name, a note for the commit message and, when `over` retired a
     restriction, what it retired (else ""). `source`: the user's messages the change came from,
     named in CHARTER_HISTORY. `unsourced`: why the new Restrictions text has no valid source
-    (restriction_source.check), raised once every other check passed."""
+    (restriction_source.check), raised once every other check passed. `turn_source`: why the user
+    turn's `source` does not back removing or replacing a cited Restrictions item
+    (restriction_source.turn_quote), raised when the edit touches one; an uncited item needs none."""
     from .prompts import charter_sections
     sections = charter_sections(p.charter_path.read_text())
     hist = p.harness / CHARTER_HISTORY
@@ -6318,6 +6347,7 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
            "If it is truly unclear whether it is over, ask_user (blocking restriction)"
            + (f". {no_approval}" if no_approval else ""))
     lifted = False   # the user's word changed or lifted a restriction
+    cited = False   # the edit removes or replaces a cited Restrictions item
     if replaces:
         i = _charter_replaced(sections, replaces)
         old_head, old_body = sections[i]
@@ -6328,6 +6358,7 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
             "\n".join(old_body)))   # every item unsourced: advisory, the coordinator's to drop
         if name.lower().startswith("restriction") and not (by_word or loose):
             raise ValueError(f"charter_update: replacing the restriction section {name!r} {why}")
+        cited = name.lower().startswith("restriction") and not loose
         if name.lower().startswith("restriction") and not user_turn:
             retired = f"section \"{name}\""
         lifted = user_turn and name.lower().startswith("restriction")
@@ -6348,6 +6379,8 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
         loose = len(hits) == 1 and restriction_source.unsourced_span(body, *hits[0], _items(body))
         if names[t].lower().startswith("restriction") and not (by_word or loose):
             raise ValueError(f"charter_update: removing or replacing a restriction {why}")
+        cited = cited or names[t].lower().startswith("restriction") and any(
+            restriction_source.cited_span(body, *h, _items(body)) for h in hits)
         if len(hits) != 1:
             near = _closest_items(sections, quote) if not hits else []
             raise ValueError(f"charter_update: `quote` matches {len(hits)} times in {names[t]!r}; quote the exact "
@@ -6388,6 +6421,8 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
         log.append(f"### Added to {names[t]} ({logged})\n{text}")
     if unsourced:
         raise ValueError(unsourced)
+    if cited and user_turn and turn_source:
+        raise ValueError(turn_source)
     if lifted:
         target = sections[t][0] if t is not None else None
         sections = _merge_restrictions(sections, log, stamp)
