@@ -754,7 +754,7 @@ def undo(p, cid: int) -> str:
     cur = _cfg(p.config(), c["key"], None)
     if cur != c["new"]:
         return f"#{cid}: {c['key']} is {cur!r} now, not {c['new']!r}: left as it is"
-    p.set_config(c["key"], c["old"])
+    p.set_config(c["key"], c["old"], by={"by": "harness", "via": f"throughput undo #{cid}"})
     c["undone"] = time.time()
     p.db.set_kv(KV, rec)
     return f"#{cid}: {c['key']} back to {c['old']!r}"

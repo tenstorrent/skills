@@ -248,12 +248,12 @@ def test_selfblock_raises_a_block_on_a_coordinator_set_key_named_as_the_users_wi
     (ev,) = p.db.q("SELECT * FROM events WHERE kind=?", (selfblock.KIND,))
     assert f"task #{t}" in ev["text"] and "set by coordinator" in ev["text"] and "--why" in ev["text"], ev["text"]
     assert [(f["source"], f["id"]) for f in json.loads(ev["data"])["findings"]] == [("setter", t)]
-    # A key with no record (set by hand, or before setters were recorded) is unknown: raised too.
+    # A key never set reads as the default, not the user's: raised too.
     w = p.db.add_task("waits")
     p.db.update_task(w, status="waiting", result=json.dumps({"waiting_for": "budget.max_parallel_workers is the "
                                                                             "user's setting; not overriding it"}))
     found = {f["id"]: f for f in selfblock.scan(p.db)}
-    assert found[w]["source"] == "setter" and "set by unknown" in found[w]["cited"], found
+    assert found[w]["source"] == "setter" and "set by default (never set)" in found[w]["cited"], found
 
 
 def test_selfblock_quiet_for_a_key_the_user_set(env, monkeypatch):
@@ -299,7 +299,7 @@ def test_config_setter_is_recorded_shown_and_survives_a_restart_and_an_upgrade_m
     assert (rec["by"], rec["task"]) == ("worker", 42)
     assert configwho.role(configwho.get(p.db, "heal.outage_task_due_min")) == "coordinator"
     # No name of a person anywhere in a record: roles, ids and the path only.
-    assert set().union(*[r.keys() for r in p.db.kv(configwho.KEY).values()]) <= {"by", "msgs", "task", "run", "via", "ts"}
+    assert set().union(*[r.keys() for r in p.db.kv(configwho.KEY).values()]) <= {"by", "msgs", "task", "run", "via", "ts", "h"}
     # Restart: a new process opens the database afresh. Upgrade: the migrations run again on it.
     p.db.conn.close()
     c = sqlite3.connect(p.state / "project.db")
@@ -314,11 +314,11 @@ def test_config_setter_is_recorded_shown_and_survives_a_restart_and_an_upgrade_m
     capsys.readouterr()
     cli.main(["config", p.name, "get", "--why", "budget.max_parallel_workers"])
     cli.main(["config", p.name, "get", "--why", "delivery.channel_tags"])
-    cli.main(["config", p.name, "--why", "coordinator.effort"])   # never set: unknown
+    cli.main(["config", p.name, "--why", "coordinator.effort"])   # never set: the default
     out = capsys.readouterr().out.splitlines()
     assert out[0].startswith(f"budget.max_parallel_workers: set by user (message #{m}) via chat, 20"), out
     assert out[1].startswith("delivery.channel_tags: set by coordinator via config_set"), out
-    assert out[2].startswith("coordinator.effort: set by unknown"), out
+    assert out[2] == "coordinator.effort: set by default (never set)", out
     # --why only reads: nothing named 'get' was set.
     assert "get" not in q.raw_config() and q.raw_config().get("coordinator") == old.get("coordinator")
     # A whole section set replaces the records under it; a key with none takes its section's.
@@ -342,7 +342,7 @@ def test_selfblock_setter_check_quiet_for_a_credential_money_or_sign_in_wait(env
         ids.append(t)
     assert [f for f in selfblock.scan(p.db) if f["id"] in ids and f["source"] == "setter"] == []
     # 'budget.' in a key name is no spend: the setting-ownership guess still raises.
-    assert "set by unknown" in selfblock.setter_finding(p.db, "budget.max_parallel_workers is user-set")
+    assert "set by default" in selfblock.setter_finding(p.db, "budget.max_parallel_workers is user-set")
     assert "set by coordinator" in selfblock.setter_finding(p.db, "jev.enabled is the user's setting")
     # The event names the setter rule and does not claim the setter finding names no gate at all.
     txt = selfblock.text([{"source": "setter", "id": 1, "text": "x", "cited": "k"}])
@@ -350,3 +350,109 @@ def test_selfblock_setter_check_quiet_for_a_credential_money_or_sign_in_wait(env
     txt = selfblock.text([{"source": "setter", "id": 1, "text": "x", "cited": "k"},
                           {"source": "task", "id": 2, "text": "y", "cited": "z"}])
     assert "None of the others names" in txt, txt
+
+
+def test_config_key_never_set_reads_default_not_unknown(env, monkeypatch, capsys):
+    p = make(env)
+    from ttp import cli, configwho, selfblock
+    from ttp.project import account_settings_path, write_json
+    for k in ("TTP_RUN_ID", "TTP_RUN_DIR", "TTP_TASK_ID", "TTP_TASK"):
+        monkeypatch.delenv(k, raising=False)
+    raw = p.raw_config()
+    assert "effort" not in raw.get("coordinator", {})
+    assert configwho.lookup(p.db, "coordinator.effort", raw) == {"by": "default", "why": "never set"}
+    capsys.readouterr()
+    cli.main(["config", p.name, "get", "--why", "coordinator.effort"])
+    assert capsys.readouterr().out.strip() == "coordinator.effort: set by default (never set)"
+    # Never set, also under a section someone set: that setter did not set this key.
+    p.set_config("review", {"sweep_after_s": 60}, by=configwho.by("user", via="cli"))
+    assert configwho.describe(configwho.lookup(p.db, "review.unreviewed_per_pass", p.raw_config())) \
+        == "default (never set)"
+    assert configwho.role(configwho.lookup(p.db, "review.sweep_after_s", p.raw_config())) == "user"
+    # In project.json with no record (by hand, or before setters were recorded): still unknown.
+    write_json(p.config_path, {**p.raw_config(), "jev": {"enabled": False}})
+    assert configwho.lookup(p.db, "jev.enabled", p.raw_config()) is None
+    assert "set by unknown (set before setters" in selfblock.setter_finding(p.db, "jev.enabled is user-set")
+    # Set only in the account settings: not this project's default, and not the user's word here.
+    write_json(account_settings_path(), {"budget": {"global_daily_usd": 50}})
+    assert configwho.role(configwho.lookup(p.db, "budget.global_daily_usd", p.raw_config())) == "unknown"
+    # The never-set default is raised as a self-block like any setter but the user.
+    assert "set by default (never set)" in selfblock.setter_finding(p.db, "coordinator.effort is the user's setting")
+
+
+def test_config_writers_outside_the_cli_record_a_harness_setter_never_the_user(env, monkeypatch):
+    p = make(env)
+    from ttp import cli, configwho, throughput, timefmt
+    for k in ("TTP_RUN_ID", "TTP_RUN_DIR", "TTP_TASK_ID", "TTP_TASK"):
+        monkeypatch.delenv(k, raising=False)
+
+    def who(key):
+        return configwho.lookup(p.db, key, p.raw_config())
+
+    # Upgrade: the load-caps migration removes an old fixed default; the load-sized default applies.
+    p.set_config("device.max_tasks", 2, by=configwho.by("user", via="cli"))
+    assert "device.max_tasks 2" in cli._migrate_load_caps(p)
+    rec = who("device.max_tasks")
+    assert (rec["by"], rec["via"]) == ("default", "upgrade: load-sized default"), rec
+    # The home zone follows a machine's clock (ttp connect, a spend push): the harness, both keys.
+    assert timefmt.set_home(p, "Asia/Tokyo", "box-a", "ttp connect from box-a")
+    for key in (timefmt.KEY, timefmt.FROM_KEY):
+        rec = who(key)
+        assert rec["by"] == "harness" and rec["via"].startswith("home zone"), (key, rec)
+    # The throughput undo puts back the old value: the harness, naming the change it undid.
+    p.set_config("budget.max_parallel_workers", 4, by={"by": "harness", "via": "throughput"})
+    p.db.set_kv(throughput.KV, [{"id": 7, "ts": time.time(), "key": "budget.max_parallel_workers",
+                                 "old": 2, "new": 4, "undone": False}])
+    assert throughput.undo(p, 7).endswith("back to 2")
+    rec = who("budget.max_parallel_workers")
+    assert (rec["by"], rec["via"]) == ("harness", "throughput undo #7"), rec
+    for key in ("device.max_tasks", timefmt.KEY, timefmt.FROM_KEY, "budget.max_parallel_workers"):
+        assert configwho.role(who(key)) not in ("user", "unknown"), key
+
+
+def test_config_hand_edit_after_a_recorded_set_reads_unknown_not_the_old_setter(env, monkeypatch):
+    p = make(env)
+    from ttp import configwho, selfblock
+    from ttp.project import write_json
+
+    def who(key):
+        return configwho.lookup(p.db, key, p.raw_config())
+
+    def hand(edit):
+        raw = p.raw_config()
+        edit(raw)
+        write_json(p.config_path, raw)
+
+    p.set_config("budget.max_parallel_workers", 2, by=configwho.by("user", msgs=[5], via="chat"))
+    assert configwho.role(who("budget.max_parallel_workers")) == "user"
+    assert selfblock.setter_finding(p.db, "budget.max_parallel_workers is user-set") is None
+    # Same value saved again by hand (other keys moved, file re-written): still the user's.
+    hand(lambda r: r.setdefault("jev", {}).update(enabled=False))
+    assert configwho.role(who("budget.max_parallel_workers")) == "user"
+    # A changed value: unknown, never the old setter.
+    hand(lambda r: r["budget"].update(max_parallel_workers=6))
+    rec = who("budget.max_parallel_workers")
+    assert configwho.describe(rec) == "unknown (changed in project.json after its last recorded set)", rec
+    assert "set by unknown (changed" in selfblock.setter_finding(p.db, "budget.max_parallel_workers is user-set")
+    # The next recorded set owns it again; a removal by hand is unknown too.
+    p.set_config("budget.max_parallel_workers", 3, by=configwho.by("user", via="cli"))
+    assert configwho.role(who("budget.max_parallel_workers")) == "user"
+    hand(lambda r: r["budget"].pop("max_parallel_workers"))
+    assert configwho.describe(who("budget.max_parallel_workers")) \
+        == "unknown (removed from project.json after its last recorded set)"
+    # A section: a recorded set under it keeps the section's other keys; a hand edit of one of them
+    # makes the section unknown, and a later recorded set does not launder it.
+    p.set_config("delivery", {"channel_tags": ["a"], "never_force": True}, by=configwho.by("user", via="cli"))
+    p.set_config("delivery.push_batch_s", 60, by=configwho.by("coordinator", via="config_set"))
+    assert configwho.role(who("delivery.channel_tags")) == "user"
+    assert configwho.role(who("delivery.push_batch_s")) == "coordinator"
+    hand(lambda r: r["delivery"].update(never_force=False))
+    p.set_config("delivery.push_min_gap_s", 5, by=configwho.by("coordinator", via="config_set"))
+    assert configwho.role(who("delivery.never_force")) == "unknown"
+    assert configwho.role(who("delivery.channel_tags")) == "unknown"   # same section: cannot tell which key
+    assert configwho.role(who("delivery.push_min_gap_s")) == "coordinator"
+    # A record kept before digests existed has none to compare: read as kept.
+    allrec = p.db.kv(configwho.KEY)
+    allrec["jev.enabled"] = {"by": "user", "ts": 1.0}
+    p.db.set_kv(configwho.KEY, allrec)
+    assert configwho.role(who("jev.enabled")) == "user"

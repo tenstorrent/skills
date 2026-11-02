@@ -7922,7 +7922,9 @@ def cmd_config_why(words: list[str], key: str) -> None:
     if len(words) > 1:
         die("usage: ttp config [NAME] get --why KEY")
     p = need(words[0], sys.argv[1:]) if words else (here() or die("no project here: ttp config NAME get --why KEY"))
-    print(f"{key}: set by {configwho.describe(configwho.get(p.db, key) if p.established() else None, p)}")
+    raw = p.raw_config()
+    rec = configwho.lookup(p.db if p.established() else None, key, None if p.config_status == "unavailable" else raw)
+    print(f"{key}: set by {configwho.describe(rec, p)}")
 
 
 SECRET_KINDS = ("jev", "slack", "endpoint", "show", "check", "env", "push", "set", "generate")
@@ -8705,6 +8707,12 @@ def _migrate_load_caps(p: Project) -> str:
         if p.config_status == "fallback":
             p.keep_broken_config()
         write_json(p.config_path, new)
+        if p.established():
+            from . import configwho
+            for key in loadcaps.OLD_DEFAULTS:
+                if configwho.digest(configwho.at(raw, key)) != configwho.digest(configwho.at(new, key)):
+                    configwho.record(p.db, key, {"by": "default", "via": "upgrade: load-sized default"},
+                                     before=raw, after=new)
     except Exception:
         return ""
     return "upgrade note: defaults now sized to the project's load: " + "; ".join(done)

@@ -32,6 +32,7 @@ import hashlib
 import json
 import re
 import time
+from pathlib import Path
 
 KIND = "self_blocking"
 RAISED_KEY = "self_blocking_raised"   # kv: {fingerprint: ts raised}
@@ -118,7 +119,8 @@ def owned_keys(text: str) -> list[str]:
 
 def setter_finding(db, text: str) -> str | None:
     """'KEY: set by SETTER' for the first key `text` names as the user's own whose recorded setter
-    is not the user (configwho; no record is unknown); None when every such key is the user's, or when
+    is not the user (configwho.lookup against project.json now: no record is unknown, never set is
+    default, a hand edit after the recorded set is unknown); None when every such key is the user's, or when
     the reason, its key names removed ('budget.' is no spend), names a credential, money or a step only
     the user holds (GATES[2]): that wait is real whoever set the key."""
     from . import configwho
@@ -128,11 +130,24 @@ def setter_finding(db, text: str) -> str | None:
     said = _KEY.sub(" ", " ".join((text or "").replace("’", "'").split()))
     if GATES[2][1].search(_NEGATED.sub(" ", said)) or _HELD.search(said):
         return None
+    raw = _raw_config(db)
     for k in keys:
-        rec = configwho.get(db, k)
+        rec = configwho.lookup(db, k, raw)
         if configwho.role(rec) != "user":
             return f"{k} named as the user's, but set by {configwho.describe(rec)}"
     return None
+
+
+def _raw_config(db) -> dict | None:
+    """The project.json of the project `db` belongs to (<base>/state/project.db), so a setter is read
+    against the value in force; None when it cannot be read (the records are taken as kept)."""
+    from .project import Project
+    try:
+        p = Project(Path(db.path).parent.parent)
+        raw = p.raw_config()
+        return None if p.config_status == "unavailable" else raw
+    except Exception:
+        return None
 
 
 # A people cue said in the negative ("no other tenant", "not in use") names no one it could affect.

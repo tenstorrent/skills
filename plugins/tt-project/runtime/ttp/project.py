@@ -1285,6 +1285,7 @@ class Project:
                                f"restore it before changing settings")
         if why := section_value_problem(dotted, value):
             raise ValueError(why)
+        before = copy.deepcopy(raw)
         node = raw
         parts = dotted.split(".")
         for i, p in enumerate(parts[:-1]):
@@ -1304,7 +1305,7 @@ class Project:
         if self.established():   # a project still being made has no database to record it in yet
             try:
                 from . import configwho
-                configwho.record(self.db, dotted, by)
+                configwho.record(self.db, dotted, by, before=before, after=raw)
             except Exception:   # the setting is written; a busy or broken database only loses its setter
                 pass
 
