@@ -29,3 +29,4 @@
 +1410: earlier rooms the old single constant took without a line of their own (the cap stood at 35_970)
 +80: delivery.channel_tags only to tags the charter or user lets move forward
 +350: light is for mechanical work only; conclusion runs carry a `conclusion:` line (tier floor)
++590: a project's own gates and settings are the coordinator's to decide and record (selfblock)
