@@ -130,8 +130,8 @@ _PER_WORKTREE = ("refs/bisect/", "refs/worktree/", "refs/rewritten/")
 
 def _plain(cwd: Path, *args: str) -> subprocess.CompletedProcess:
     """git as a check run in the checkout would call it (no hook or submodule override)."""
-    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True,
-                          timeout=gitmemo.timeout(600, args))
+    return gitmemo.run(["git", "-C", str(cwd), *args], capture_output=True, text=True,
+                       timeout=gitmemo.timeout(600, args))
 
 
 SCRATCH_KEY = "ttp.scratchof"   # in a scratch clone's own config: the git dir whose objects it borrows

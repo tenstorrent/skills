@@ -446,8 +446,8 @@ def stray_markers(root: str, *revs: str, timeout: float | None = 60) -> list[str
     the next batch replays it and the replay conflicts. Raises subprocess.TimeoutExpired."""
     args = ("log", "-p", "-U0", "--no-merges", "--no-color", "--no-ext-diff", "--no-renames",
             "--format=%x00%H", *revs)
-    r = subprocess.run(["git", "-C", root, *args], capture_output=True, timeout=gitmemo.timeout(timeout, args),
-                       stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    r = gitmemo.run(["git", "-C", root, *args], capture_output=True, timeout=gitmemo.timeout(timeout, args),
+                    stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
     if r.returncode != 0:
         return []
     out: list[str] = []

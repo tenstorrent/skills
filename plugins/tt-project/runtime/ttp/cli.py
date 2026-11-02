@@ -8897,9 +8897,9 @@ def _untrack_placeholders(p: Project, ident: list[str]) -> str:
     from .providers.claude import SANDBOX_PLACEHOLDERS
     h = p.harness
     tree: dict[str, list[tuple[str, str]]] = {}
-    out = subprocess.run(["git", "-C", str(h), "ls-tree", "-r", "-l", "-z", "HEAD", "--", *SANDBOX_PLACEHOLDERS],
-                         capture_output=True, text=True, check=True,
-                         timeout=gitmemo.timeout(None, ("ls-tree",))).stdout
+    out = gitmemo.run(["git", "-C", str(h), "ls-tree", "-r", "-l", "-z", "HEAD", "--", *SANDBOX_PLACEHOLDERS],
+                      capture_output=True, text=True, check=True,
+                      timeout=gitmemo.timeout(None, ("ls-tree",))).stdout
     for entry in out.split("\0"):
         meta, _, path = entry.partition("\t")
         top = next((s for s in SANDBOX_PLACEHOLDERS if path == s or path.startswith(s + "/")), None) if path else None
@@ -8916,8 +8916,8 @@ def _untrack_placeholders(p: Project, ident: list[str]) -> str:
     env = {**os.environ, "GIT_INDEX_FILE": str(idx)}
 
     def git(*args: str) -> str:
-        return subprocess.run(["git", "-C", str(h), *args], capture_output=True, text=True, check=True,
-                              env=env, timeout=gitmemo.timeout(None, args)).stdout.strip()
+        return gitmemo.run(["git", "-C", str(h), *args], capture_output=True, text=True, check=True,
+                           env=env, timeout=gitmemo.timeout(None, args)).stdout.strip()
     head = _git(h, "rev-parse", "HEAD")
     try:
         git("read-tree", head)
@@ -8931,8 +8931,8 @@ def _untrack_placeholders(p: Project, ident: list[str]) -> str:
     _git(h, "update-ref", "-m", "ttp upgrade: untrack sandbox placeholder files", "HEAD", sha, head)
     # The live index still holds them, which a worker's next commit would put back: dropped there too
     # (-f: whatever the file on disk is, a device node in a sandboxed run, it stays).
-    subprocess.run(["git", "-C", str(h), "--literal-pathspecs", "rm", "-r", "-q", "-f", "--cached",
-                    "--ignore-unmatch", "--", *drop], capture_output=True, timeout=gitmemo.timeout(None, ("rm",)))
+    gitmemo.run(["git", "-C", str(h), "--literal-pathspecs", "rm", "-r", "-q", "-f", "--cached",
+                 "--ignore-unmatch", "--", *drop], capture_output=True, timeout=gitmemo.timeout(None, ("rm",)))
     print(f"untracked {len(drop)} empty sandbox placeholder path(s) the harness had committed, as {sha[:12]}: "
           f"{', '.join(drop)}")
     return sha

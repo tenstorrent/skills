@@ -31,8 +31,8 @@ def _git(h: Path, *args: str, env: dict | None = None) -> subprocess.CompletedPr
     """git with its output captured, within gitmemo's cap; a timeout comes back as exit 124, so a
     fast-forward cut short is put back like any other failure."""
     try:
-        return subprocess.run(["git", "-C", str(h), *args], capture_output=True, text=True, env=env,
-                              timeout=gitmemo.timeout(None, args))
+        return gitmemo.run(["git", "-C", str(h), *args], capture_output=True, text=True, env=env,
+                           timeout=gitmemo.timeout(None, args))
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(args, 124, "", f"git {args[0]} timed out")
 
