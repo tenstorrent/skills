@@ -87,7 +87,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import ackwait, startgate, userpause
-from .db import DB, TERMINAL_TASK_STATES, deferral, load_result
+from .db import DB, TERMINAL_TASK_STATES, deferral, load_result, waiting_handoff
 from .project import durable_append
 
 LOG, OLD, LOCK = "progress.jsonl", "progress.1.jsonl", "progress.lock"
@@ -588,7 +588,7 @@ def probe_stalls(db: DB, s: dict, st: dict, now: float, current_probe: Callable[
                 gone.add(f"stall:probe:#{k}")
             continue
         res = load_result(t["result"])
-        if t["status"] == "waiting" and res.get("wait_kind") == "self":
+        if waiting_handoff(t).get("wait_kind") == "self":
             continue   # its own job or window: the wait checks cover a job that hangs
         if _user_wait(db, t, res):
             continue   # only the user's step ends it: no worker can speed it up (the probe keeps counting)

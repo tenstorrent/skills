@@ -1147,6 +1147,47 @@ def test_a_wait_on_the_projects_own_checks_lane_is_self_even_when_the_hand_off_s
         ev = json.loads(p.db.one("SELECT data FROM events WHERE kind='task_waiting' AND task=?", (tid,))["data"])
         assert ev["wait"] == want and unblock.is_self_wait(json.dumps(ev)) is (want == "self"), ev
 
+
+def _handed_off_waiting(p, probe, **res):
+    """A task that handed off waiting on `probe` through the daemon's hand-off path (Daemon._finish_worker):
+    status queued, last result waiting. The daemon never writes a task status 'waiting'."""
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage
+    tid = p.db.add_task("Run the sweep", "run it", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    run_dir = p.base / f"wait-run-{tid}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "waiting", "summary": "waits on its sweep",
+                                                     "retry_after_s": 1800, "retry_when": probe, **res}))
+    Daemon(p.base)._finish_worker({"task": tid, "note": "{}"}, RunUsage(cost_usd=0.1), "ok", run_dir)
+    t = p.db.task(tid)
+    assert t["status"] == "queued" and json.loads(t["result"])["status"] == "waiting", (t["status"], t["result"])
+    return tid
+
+
+def test_a_self_wait_handed_off_through_the_daemon_raises_no_probe_stall_and_others_still_do(env):
+    """A waiting hand-off (db.waiting_handoff) with wait_kind self is its own job or window: no probe stall.
+    An external wait is still judged, and so is a self wait under a start_when deferral, which is no
+    waiting hand-off (the deferral's probe is what it waits on)."""
+    from ttp import db as dbm, progress
+    p = make(env)
+    now, probe = time.time(), "test -e out/sweep.done"   # not an own-job probe (OWN_WAIT_RE)
+    assert not progress.OWN_WAIT_RE.search(probe)
+    ids = {"self": _handed_off_waiting(p, probe, wait_kind="self"),
+           "external": _handed_off_waiting(p, probe, wait_kind="external"),
+           "deferred": _handed_off_waiting(p, probe, wait_kind="self")}
+    p.db.update_task(ids["deferred"], labels=json.dumps([f"start_when:{probe}",
+                                                         f"deferred_since:{now - 5000:.0f}"]))
+    assert dbm.waiting_handoff(p.db.task(ids["self"])).get("wait_kind") == "self"
+    assert dbm.waiting_handoff(p.db.task(ids["deferred"])) == {}
+    for tid in ids.values():
+        for i in range(21):
+            progress.note_probe(p.db, tid, probe, 1, "not yet", now - 4000 + i * 180)
+    got = progress.check(p.db, p.config(), p.state, now, where=p, current_probe=lambda t: probe)
+    raised = {k for e in got for k in e["keys"]}
+    assert raised == {f"probe:#{ids['external']}", f"probe:#{ids['deferred']}"}, (raised, ids)
+
+
 def test_a_reply_wait_stays_quiet_while_its_peer_recovers_and_re_arms_once_it_is_ready(env, monkeypatch):
     """While the project a reply wait waits on cannot act (read-only from its own state through
     machine_ledger.can_act), the wait raises no wait_stale and its note says the peer is recovering. Once
