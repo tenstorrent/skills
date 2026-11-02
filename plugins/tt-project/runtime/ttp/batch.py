@@ -1330,6 +1330,13 @@ class Batch:
             self._settling = ([], set())
             resolved: dict[str, list[str]] = {}
             own, gone = self._landed(h, base, top, resolved)
+            if hits := self._markers([c for c in own if c not in gone]):
+                # A commit with a conflict marker never lands: sent back as a non-textual conflict, its
+                # fix runs at standard (conflictfix.tier_for) and rewrites the commits.
+                say(f"entry {e.get('id')} ({e.get('branch')}): {hits[0]}: a commit adds a conflict marker")
+                self._set(i, "conflict", files=[f"(the rebase stopped: {conflictfix.marker_refusal(hits)})"],
+                          onto=h, _after=len(carried))
+                continue
             if gone:
                 left = len(own) - len(gone)
                 say(f"entry {e.get('id')} ({e.get('branch')}): {len(gone)} of its {len(own)} commits are on "
@@ -1364,6 +1371,10 @@ class Batch:
                 self._set(i, "carried")
                 h = new
         return carried
+
+    def _markers(self, commits: list[str]) -> list[str]:
+        """conflictfix.stray_markers of the entry `commits` this batch would replay."""
+        return conflictfix.stray_markers(str(self.repo), "--no-walk=unsorted", *commits, timeout=None) if commits else []
 
     def _on_tip(self, tip: str, base: str, top: str) -> str:
         """The commit on `tip` that carries the last of base..top's commits when every one is there

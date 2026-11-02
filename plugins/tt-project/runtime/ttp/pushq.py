@@ -473,9 +473,18 @@ def prefetch_git(p: Project, task: dict, result: dict, cfg: dict | None = None) 
     if not tip or len(out) != len(entries) or not all(_HEX40.fullmatch(e["head"]) for e in out):
         return   # check_approval refuses it before reading _inherited
     try:
+        for e in out:
+            _markers(p, e["head"], tip)
         _inherited(p, task, out, tip, time.time())
     except subprocess.TimeoutExpired:
         pass   # not kept: check_approval reads it again, bounded, as before
+
+
+def _markers(p: Project, head: str, tip: str) -> list[str]:
+    """The conflict markers (conflictfix.stray_markers) a commit adds that `head` carries over `tip`, its
+    copies already on `tip` aside. Kept within a gitmemo scope, as _inherited."""
+    return gitmemo.cached(("pushq.markers", head, tip), lambda: conflictfix.stray_markers(
+        str(p.root), "--cherry-pick", "--right-only", f"{tip}...{head}"))
 
 
 def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None) -> dict:
@@ -554,6 +563,13 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
         ids = e.get("inherited") if isinstance(e.get("inherited"), list) else []
         accepted[head] = {int(str(i).lstrip("#")) for i in ids if str(i).lstrip("#").isdigit()}
     tip = _tracking_tip(p, *tgt)
+    for e in out if tip else []:
+        try:
+            hits = _markers(p, e["head"], tip)
+        except subprocess.TimeoutExpired:
+            hits = []   # git hung: the batch scans the commits again before it carries them
+        if hits:
+            return {"invalid": f"{_short(e['head'])}: {conflictfix.marker_refusal(hits)}"}
     try:
         carried = _inherited(p, task, out, tip, time.time()) if tip else {}
     except subprocess.TimeoutExpired:

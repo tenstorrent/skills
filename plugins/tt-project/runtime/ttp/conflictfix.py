@@ -109,7 +109,7 @@ def of(task: dict) -> dict | None:
 
 
 def _git(root: str, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", root, *args], text=True, capture_output=True, timeout=gitmemo.timeout(60, args),
+    return subprocess.run(["git", "-C", root, *args], text=True, capture_output=True, timeout=gitmemo.timeout(timeout, args),
                           stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_EDITOR": "true"})
 
 
@@ -417,3 +417,63 @@ def record(db, task_id: int, kind: str) -> None:
     run of the same fix (an escalation) overwrites it."""
     db.x("UPDATE push_queue SET resolution=? WHERE task=? AND status='conflict' AND "
          "created=(SELECT MAX(created) FROM push_queue WHERE task=?)", (kind, task_id, task_id))
+
+
+# Conflict markers a commit must never add (stray_markers). Narrow on purpose: only a line that starts
+# at column 0 with seven '<', '|' or '>' followed by a space or the line's end (git's own form), or
+# that is exactly seven '=' (git's separator). An indented or quoted marker, as tests spell them in
+# string literals, never matches. Skipped: paths with a fixture directory (FIXTURE_DIRS), and '='
+# lines in docs (DOC_SUFFIXES), where seven '=' underline a heading. Built, not spelled out: a literal
+# marker line would make this file read as a conflicted one.
+_MARKER = re.compile("^(?:(?:" + "|".join(re.escape(c * 7) for c in "<|>") + ")(?: |$)|" + "=" * 7 + "$)")
+_HUNK_NEW = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+FIXTURE_DIRS = frozenset({"fixtures", "fixture", "testdata", "__snapshots__"})
+DOC_SUFFIXES = (".md", ".rst", ".txt", ".adoc")
+MARKER_LIMIT = 10   # the hits stray_markers reports
+
+
+def _marker_ok(path: str, line: str) -> bool:
+    """Whether an added marker-like `line` of `path` is allowed (see _MARKER)."""
+    if FIXTURE_DIRS & set(path.split("/")[:-1]):
+        return True
+    return line.startswith("=") and path.lower().endswith(DOC_SUFFIXES)
+
+
+def stray_markers(root: str, *revs: str, timeout: float | None = 60) -> list[str]:
+    """Each conflict marker line (_MARKER) that a commit of `revs` (git log arguments, merges aside)
+    adds, as "<short sha> <path>:<line>: <marker>", at most MARKER_LIMIT. Every commit counts, not only
+    the tip: an intermediate commit that a later one cleans up still differs from its landed copy, so
+    the next batch replays it and the replay conflicts. Raises subprocess.TimeoutExpired."""
+    args = ("log", "-p", "-U0", "--no-merges", "--no-color", "--no-ext-diff", "--no-renames",
+            "--format=%x00%H", *revs)
+    r = subprocess.run(["git", "-C", root, *args], capture_output=True, timeout=gitmemo.timeout(timeout, args),
+                       stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    if r.returncode != 0:
+        return []
+    out: list[str] = []
+    for chunk in r.stdout.decode("utf-8", "replace").split("\0")[1:]:
+        sha, _, diff = chunk.partition("\n")
+        path, line_no, header = "", 0, True
+        for ln in diff.splitlines():
+            if ln.startswith("diff --git "):
+                path, header = "", True
+            elif header and ln.startswith("+++ "):
+                name = ln[4:].strip('"')   # a quoted path: "b/..."
+                path = name[2:] if name.startswith("b/") else ""
+            elif (m := _HUNK_NEW.match(ln)):
+                header, line_no = False, int(m.group(1))
+            elif not header and ln.startswith("+"):
+                if path and _MARKER.match(ln[1:]) and not _marker_ok(path, ln[1:]):
+                    out.append(f"{sha[:10]} {path}:{line_no}: {ln[1:][:40]}")
+                    if len(out) >= MARKER_LIMIT:
+                        return out
+                line_no += 1
+    return out
+
+
+def marker_refusal(hits: list[str]) -> str:
+    """Why a head with stray_markers' `hits` is refused."""
+    return (f"a commit adds a git conflict marker line ({'; '.join(hits[:3])}"
+            + (f"; +{len(hits) - 3} more" if len(hits) > 3 else "") + "). No commit, intermediate ones "
+            "included, may carry one: rewrite the commits so none adds it (squash the fix's own commits), "
+            "then approve the new head")

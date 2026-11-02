@@ -15172,3 +15172,77 @@ def test_the_batch_rebase_settles_import_only_conflicts_and_keeps_the_verdict_on
     from ttp import batch
     assert "imports" in batch.MERGED_KINDS and "imports" in batch.SETTLED_WORDS
     assert "imports=True" in inspect.getsource(batch.Batch._rebase)
+
+
+# Conflict marker lines, built so this file never reads as a conflicted one.
+_CM_OPEN, _CM_BASE, _CM_SEP, _CM_CLOSE = "<" * 7 + " HEAD", "|" * 7, "=" * 7, ">" * 7 + " theirs"
+
+
+def test_stray_markers_flags_every_commit_that_adds_one_and_skips_fixtures_docs_and_quoted_markers(tmp_path):
+    """Every commit of the range counts, an intermediate one cleaned up later too; a marker must start
+    the line; fixture directories, '=' heading underlines in docs and quoted markers are not flagged."""
+    from ttp import conflictfix
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git_out(repo, "init", "-q")
+    _commit(repo, "code.py", "x = 1\n")
+    base = _git_out(repo, "rev-parse", "HEAD")
+    _commit(repo, "code.py", f"x = 1\n{_CM_BASE}\n")                      # the stray diff3 line
+    bad = _git_out(repo, "rev-parse", "HEAD")
+    _commit(repo, "other.py", "y = 2\n")
+    _commit(repo, "code.py", "x = 1\n")                                   # cleaned up two commits later
+    head = _git_out(repo, "rev-parse", "HEAD")
+    hits = conflictfix.stray_markers(str(repo), f"{base}..{head}")
+    assert hits == [f"{bad[:10]} code.py:2: {_CM_BASE}"], hits
+    assert conflictfix.stray_markers(str(repo), f"{bad}..{head}") == [], "a clean range"
+    assert "squash the fix's own commits" in conflictfix.marker_refusal(hits)
+    clean = _git_out(repo, "rev-parse", "HEAD")
+    (repo / "tests" / "fixtures").mkdir(parents=True)
+    _commit(repo, "tests/fixtures/conflicted.txt", f"{_CM_OPEN}\na\n{_CM_SEP}\nb\n{_CM_CLOSE}\n")
+    _commit(repo, "README.md", f"Title\n{_CM_SEP}\n")
+    _commit(repo, "test_x.py", f'TEXT = (\n    "{_CM_OPEN}\\n"\n    "{_CM_SEP}\\n"\n)\nWIDE = "{"<" * 8}"\n')
+    _commit(repo, "notes.txt", f"{'<' * 8} not one\n{'=' * 8}\n{_CM_SEP} trailing text\n")
+    assert conflictfix.stray_markers(str(repo), f"{clean}..HEAD") == []
+    for line in (_CM_OPEN, "<" * 7, _CM_CLOSE, _CM_SEP):
+        _commit(repo, "code.py", f"x = 1\n{line}\n")
+        assert conflictfix.stray_markers(str(repo), "-1", "HEAD") == [
+            f"{_git_out(repo, 'rev-parse', 'HEAD')[:10]} code.py:2: {line}"], line
+        _commit(repo, "code.py", "x = 1\n")
+    _commit(repo, "guide.md", f"{_CM_OPEN}\n")                           # only '=' lines are docs' own
+    assert len(conflictfix.stray_markers(str(repo), "-1", "HEAD")) == 1
+
+
+def test_a_push_batch_sends_back_an_entry_whose_intermediate_commit_adds_a_conflict_marker(env, monkeypatch):
+    """A conflict marker added by one commit and removed by a later one passes checks on the tip, but
+    the batch never carries it: the entry goes back as a non-textual conflict, so its fix runs at
+    standard and rewrites the commits. A clean entry beside it lands."""
+    p, repo, origin, other, a = _landed_fixture(env, monkeypatch)
+    _git_out(repo, "checkout", "-q", "-B", "e1", "origin/proj")
+    _commit(repo, "code.py", f"x = 1\n{_CM_BASE}\n")
+    _commit(repo, "code.py", "x = 1\n")
+    bad = _git_out(repo, "rev-parse", "HEAD")
+    clean = _on_top(repo, "origin/proj", "e2", {"more.txt": "own\n"})
+    before = _git_out(origin, "rev-parse", "proj")
+    rc, m = _run_batch(p, _batch_marker(p, [bad, clean]), monkeypatch)
+    assert _statuses(m) == ["conflict", "pushed"], m
+    files = m["results"][0]["detail"]["files"]
+    assert files[0].startswith("(the rebase stopped: a commit adds a git conflict marker line") and "code.py:2" in files[0]
+    pushed = _git_out(origin, "rev-parse", "proj")
+    assert _git_out(origin, "log", "--format=%s", f"{before}..{pushed}").count("e2: edit") == 1
+    assert "code.py" not in _git_out(origin, "ls-tree", "--name-only", pushed)
+
+
+def test_an_approval_whose_commits_add_a_conflict_marker_is_refused(env, monkeypatch):
+    """check_approval scans every commit the head adds over the target, not only the tip: an
+    intermediate marker refuses the approval (a light conflict fix then runs again at standard); a
+    clean head passes."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    entries = [{"branch": s.branch, "head": s.head}]
+    assert pushq.check_approval(s.p, s.p.db.task(s.review), entries).get("entries"), "clean: approved"
+    _commit(s.path, "code.py", f"x = 1\n{_CM_SEP}\n")
+    _commit(s.path, "code.py", "x = 1\n")
+    head = _git_out(s.path, "rev-parse", "HEAD")
+    check = pushq.check_approval(s.p, s.p.db.task(s.review), [{"branch": s.branch, "head": head}])
+    assert "a commit adds a git conflict marker line" in check.get("invalid", ""), check
+    assert f"code.py:2: {_CM_SEP}" in check["invalid"]
