@@ -543,8 +543,10 @@ def hook_settings() -> dict:
 
 # Commands that run outside the Bash sandbox: inside it only its HTTP proxy is reachable (measured: ssh
 # could not resolve a host name), so whatever reaches another host or a local service directly would
-# fail there. They write as the worker does without a fence.
-FENCE_EXCLUDED = ("ssh *", "scp *", "sftp *", "rsync *", "ttp machines *", "ttp devq *",
+# fail there. They write as the worker does without a fence. Measured (CLI 2.1.296): a pattern frees a
+# command run on its own (also under `timeout N`, and `ttp lock <res> -- ssh ...` by its own pattern),
+# never one inside `&&`, `;` or a pipe, nor one a script runs.
+FENCE_EXCLUDED = ("ssh *", "scp *", "sftp *", "rsync *", "ttp lock *", "ttp machines *", "ttp devq *",
                   "ttp detach --remote *")
 
 

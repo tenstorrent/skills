@@ -44,7 +44,7 @@ def test_claude_worker_settings_carry_the_sandbox_where_it_can_start(monkeypatch
     assert box["allowUnsandboxedCommands"] is False, "no dangerouslyDisableSandbox retry"
     assert box["filesystem"]["allowWrite"] == ["/wt", "/state", "/repo/.git", str(tmp_path / "cache")]
     assert box["network"] == {"allowAllUnixSockets": True}, "the network is left open; the harness's sockets too"
-    assert "ssh *" in box["excludedCommands"] and "ttp devq *" in box["excludedCommands"]
+    assert {"ssh *", "ttp lock *", "ttp devq *"} <= set(box["excludedCommands"]), "commands that need the network"
     assert "failIfUnavailable" not in box, "a sandbox that cannot start runs the worker as before, never fails it"
 
 
