@@ -365,7 +365,7 @@ def test_billing_memo_matches_the_uncached_reads_and_ends_at_any_write(tmp_path)
 
     for since in (now - 3600, now - 86400, now - 7 * 86400, now - 3 * 86400):
         both(since)
-    assert len(d.billing_memo) == 2   # one entry per query, sliced for every later window
+    assert len(d.billing_memo) == 4   # per query one entry of rows and one of their parsed form, sliced for every later window
     before = both(now - 7 * 86400)
     other = sq.connect(str(tmp_path / "b.db"))   # another connection's commit: PRAGMA data_version
     other.execute("DELETE FROM snapshots WHERE ts > ?", (now - 86400 * 5,))
@@ -377,6 +377,36 @@ def test_billing_memo_matches_the_uncached_reads_and_ends_at_any_write(tmp_path)
     d.conn.executemany("INSERT INTO snapshots(ts,provider,account,window) VALUES(?,?,?,?)",
                        [(now - 86400 * 5 + i * 600, "claude", "a", "5h") for i in range(700)])
     assert both(now - 7 * 86400) != after
+
+
+def test_plan_spans_parsed_once_per_memo_entry_match_the_uncached_path(tmp_path):
+    """plan_spans parses the memo's plan readings and runs once and slices them per window: spans equal
+    the uncached path's for every window and provider, mixed and missing providers too, until a write."""
+    from ttp import billing
+    d, now = _billing_db(tmp_path)
+    d.conn.executemany("INSERT INTO runs(task,role,provider,account,started,ended,status,cost_usd,dir) VALUES(?,?,?,?,?,?,?,?,?)",
+                       [(1, "worker", p, a, now - 86400 * 6 + i * 900, now - 86400 * 6 + i * 900 + 300, st, c, "")
+                        for i, (p, a, st, c) in enumerate([(None, "", "ok", 2.0), ("", "a", "ok", 1.0), ("codex", "b", "failed", 3.0),
+                                                           ("codex", "b", "ok", 0.0), ("claude", None, "ok", 1.0)] * 40)])
+    d.conn.executemany("INSERT INTO snapshots(ts,provider,account,window) VALUES(?,?,?,?)",
+                       [(now - 86400 * 6 + i * 3000, p, a, "5h") for i in range(120) for p, a in ((None, "a"), ("", None), ("codex", "b"))])
+    sinces = [now - 3600, now - 86400, now - 7 * 86400, now - 3 * 86400, now - 40 * 86400, now + 3600]
+    for provider in (None, "claude", "codex", ""):
+        for since in sinces:
+            assert billing.plan_spans(d.conn, since, provider, d.billing_memo) == billing.plan_spans(d.conn, since, provider)
+    parsed = {k: v for k, v in d.billing_memo.items() if k[0] == "parsed"}
+    assert len(parsed) == 8   # readings and runs per provider asked for, each parsed once
+    billing.plan_spans(d.conn, now - 86400, None, d.billing_memo)
+    assert all(d.billing_memo[k] is v for k, v in parsed.items())
+    d.conn.execute("DELETE FROM snapshots WHERE ts > ?", (now - 86400 * 2,))   # a write ends the reuse
+    for since in sinces:
+        assert billing.plan_spans(d.conn, since, None, d.billing_memo) == billing.plan_spans(d.conn, since, None)
+    assert d.billing_memo[("parsed",) + next(k for k in parsed if k[2] is None)[1:]] is not parsed[next(k for k in parsed if k[2] is None)]
+    d.conn.execute("INSERT INTO snapshots(ts,provider,account,window) VALUES(?,?,?,?)", ("soon", "claude", "a", "5h"))
+    with pytest.raises(ValueError):   # a text time fails both paths alike, as before the memo
+        billing.plan_spans(d.conn, now - 86400, "claude", d.billing_memo)
+    with pytest.raises(ValueError):
+        billing.plan_spans(d.conn, now - 86400, "claude")
 
 
 def test_idle_reads_use_their_indexes(tmp_path):

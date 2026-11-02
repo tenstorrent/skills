@@ -107,25 +107,79 @@ def _q(conn: sqlite3.Connection, sql: str, args: Iterable = ()) -> list[tuple]:
 
 
 def _since(conn: sqlite3.Connection, memo: dict | None, sql: str, at: int, lookback: float,
-           provider: str | None) -> list[tuple]:
+           provider: str | None, parse: Any = None) -> Any:
     """_q(conn, sql, (lookback, provider, provider)) for a query of the rows whose column `at` is at or
     after `lookback`, ordered by it. With `memo` (a dict its caller keeps for this connection), rows
     read once are reused for any later lookback they cover until the database is written: by this
-    connection (total_changes) or by another one (PRAGMA data_version)."""
+    connection (total_changes) or by another one (PRAGMA data_version). With `parse` (rows -> a
+    structure of lists sorted by column `at`, and `parse.cut(structure, lookback)` -> its part at or
+    after lookback), returns that part instead of the rows; it is parsed once per memo entry."""
+    def done(rows: list[tuple], start: float | None) -> Any:
+        if parse is None:
+            return rows
+        if memo is None or start is None:
+            return parse(rows)
+        hit = memo.get(("parsed", sql, provider))
+        if not (hit and hit[0] is rows):   # `is`: parsed from this very entry, which the memo still holds
+            hit = (rows, parse(rows))
+            memo[("parsed", sql, provider)] = hit
+        return parse.cut(hit[1], lookback)
+
     if memo is None:
-        return _q(conn, sql, (lookback, provider, provider))
+        return done(_q(conn, sql, (lookback, provider, provider)), None)
     stamp = (conn.total_changes, conn.execute("PRAGMA data_version").fetchone()[0])
     hit = memo.get((sql, provider))
     if hit and hit[0] == stamp and hit[1] <= lookback:
-        return hit[2][bisect.bisect_left(hit[3], lookback):]
+        return done(hit[2], hit[1]) if parse else hit[2][bisect.bisect_left(hit[3], lookback):]
     start = lookback - MEMO_EXTRA_S
     rows = _q(conn, sql, (start, provider, provider))
     keys = [r[at] for r in rows]
     if any(type(k) not in (int, float) for k in keys):
         memo.pop((sql, provider), None)   # sorted as SQL sorts mixed types, which bisect cannot slice
-        return _q(conn, sql, (lookback, provider, provider))
+        return done(_q(conn, sql, (lookback, provider, provider)), None)
     memo[(sql, provider)] = (stamp, start, rows, keys)
-    return rows[bisect.bisect_left(keys, lookback):]
+    return done(rows, start) if parse else rows[bisect.bisect_left(keys, lookback):]
+
+
+class _Parse:
+    """A `parse` for _since: `fn` builds {key: (items, sort keys)}; `cut` keeps the items at or after a lookback."""
+
+    def __init__(self, fn: Any) -> None:
+        self.fn = fn
+
+    def __call__(self, rows: list[tuple]) -> Any:
+        return self.fn(rows)
+
+    @staticmethod
+    def cut(parsed: Any, lookback: float) -> Any:
+        return tuple({k: (v[0][i:], v[1][i:]) for k, v in d.items() if (i := bisect.bisect_left(v[1], lookback)) < len(v[1])}
+                     for d in parsed)
+
+
+def _parse_readings(rows: list[tuple]) -> tuple[dict]:
+    readings: dict[tuple[str, str], list[float]] = {}
+    for prov, acct, ts in rows:
+        readings.setdefault((prov or "", acct), []).append(float(ts))
+    return ({k: (ts, ts) for k, ts in readings.items()},)   # the times are their own sort keys
+
+
+def _parse_runs(rows: list[tuple]) -> tuple[dict, dict]:
+    paid: dict[str, tuple[list[tuple[float, str, float]], list[float]]] = {}
+    started: dict[tuple[str, str], tuple[list[tuple[float, float]], list[float]]] = {}
+    for prov, acct, start, end, status, cost in rows:
+        end = float(end)
+        if status == "ok" and float(cost or 0) > 0:
+            p = paid.setdefault(prov or "", ([], []))
+            p[0].append((end, acct, float(start or end)))
+            p[1].append(end)
+        s = started.setdefault((prov or "", acct), ([], []))
+        s[0].append((float(start or end), end))
+        s[1].append(end)
+    return paid, started
+
+
+_READINGS = _Parse(_parse_readings)
+_RUNS = _Parse(_parse_runs)
 
 
 def _count(ends: list[tuple[float, str, float]], keys: list[float], a: float, b: float | None,
@@ -141,24 +195,16 @@ def plan_spans(conn: sqlite3.Connection, since: float, provider: str | None = No
     """(provider, account) -> the times its spend was plan-billed, for spend from `since` on.
     Account '' holds the spans of readings recorded without an account. `memo`: see _since."""
     lookback = since - PLAN_MEMORY_S
-    readings: dict[tuple[str, str], list[float]] = {}
-    for prov, acct, ts in _since(conn, memo, "SELECT DISTINCT provider, COALESCE(account,''), ts FROM snapshots "
-                                             "WHERE ts>=? AND (? IS NULL OR provider=?) ORDER BY ts", 2, lookback, provider):
-        readings.setdefault((prov or "", acct), []).append(float(ts))
+    readings, = _since(conn, memo, "SELECT DISTINCT provider, COALESCE(account,''), ts FROM snapshots "
+                                   "WHERE ts>=? AND (? IS NULL OR provider=?) ORDER BY ts", 2, lookback, provider, _READINGS)
     if not readings:
         return {}   # spans come only from readings: the runs read below would go unused
-    paid: dict[str, list[tuple[float, str, float]]] = {}
-    started: dict[tuple[str, str], list[tuple[float, float]]] = {}
-    for prov, acct, start, end, status, cost in _since(
-            conn, memo, "SELECT provider, COALESCE(account,''), started, ended, status, cost_usd FROM runs "
-                        "WHERE ended>=? AND (? IS NULL OR provider=?) ORDER BY ended", 3, lookback, provider):
-        if status == "ok" and float(cost or 0) > 0:
-            paid.setdefault(prov or "", []).append((float(end), acct, float(start or end)))
-        started.setdefault((prov or "", acct), []).append((float(start or end), float(end)))
+    paid, started = _since(
+        conn, memo, "SELECT provider, COALESCE(account,''), started, ended, status, cost_usd FROM runs "
+                    "WHERE ended>=? AND (? IS NULL OR provider=?) ORDER BY ended", 3, lookback, provider, _RUNS)
     out: Spans = {}
-    for (prov, acct), ts in readings.items():
-        ends = paid.get(prov, [])
-        keys = [e for e, _, _ in ends]
+    for (prov, acct), (ts, _) in readings.items():
+        ends, keys = paid.get(prov, ([], []))
         # Before its first reading an account was on its plan, unless paid runs ended then without
         # one (it was not in use, or billed by use): then only since the last of them.
         before = _count(ends, keys, ts[0] - PLAN_MEMORY_S, ts[0] - PLAN_GRACE_S)
@@ -172,7 +218,7 @@ def plan_spans(conn: sqlite3.Connection, since: float, provider: str | None = No
             spans.append([start, prev + (0.0 if lapsed else PLAN_GRACE_S)])
             start = (nxt or 0.0) - PLAN_GRACE_S
         # A run started while its account was on a plan runs on it to its end, after a switch too.
-        runs = [r for (p, a), rs in started.items() if p == prov and (a == acct or not acct) for r in rs]
+        runs = [r for (p, a), (rs, _) in started.items() if p == prov and (a == acct or not acct) for r in rs]
         for span in spans:
             span[1] = max([span[1]] + [e for s0, e in runs if span[0] <= s0 <= span[1]])
         out[(prov, acct)] = [(a, b) for a, b in spans]
