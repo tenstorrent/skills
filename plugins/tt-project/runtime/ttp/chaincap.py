@@ -31,7 +31,9 @@ whose hand-off marks its head unfinished (marked_split), ended as a split (SPLIT
 a `continue:` follow-up that runs only once the task has landed (post_landing: a deploy, live install or
 check, or any follow-up that names `landed:#<the task>`) carries nothing forward, makes no split and
 is never queued here; one that names a live step (live_step) reaches the coordinator NOT queued, with
-deploy_proposal's words (one deploy task per target, start_when `landed:#<the task>`). A split's
+deploy_proposal's words (one deploy task per target, start_when `landed:#<the task>`). Nor does one that
+asks or measures, is of another kind or waits in its words on the task landing (code_hop): the task is
+reviewed now and the coordinator decides on the follow-up. A split's
 head is work in progress. It gets no review, and its hop takes the branch over (`continues:`, so
 it starts from that head) and starts at once: a start_when `landed:` on a task of its own chain could
 never pass, as those commits land only with the hop's own work (own_wait refuses it). The open tasks
@@ -340,6 +342,35 @@ def post_landing(fup: dict, task_id: int) -> bool:
         if LIVE_STEP.search(title) or LIVE_STEP.search(text[start:end.start() if end else len(text)]):
             return True
     return False
+
+
+# A `continue:` follow-up that asks or measures rather than carrying the change (code_hop): its title's first
+# words after the prefix.
+QUESTION_TITLE = re.compile(r"(?i)^\s*(?:continue|mechanical)\s*:\s*(?:then\s+)?(?:measure\w*|ask\w*|question\w*"
+                            r"|find\s+out|(?:check|confirm|see)\s+(?:whether|if)|how\s+(?:much|many|often)"
+                            r"|does|did|is|are|why)\b")
+# 'after' or 'once' this task lands (AFTER_LANDING's own-task forms, any step).
+OWN_LANDING = re.compile(r"(?i)\b(?:after|once|when)\s+(?:it|this\s+(?:task|change)|the\s+change|#(\d+))\s+"
+                         r"(?:lands|has\s+landed|is\s+landed|is\s+pushed|reaches\s+the\s+push\s+branch)\b")
+
+
+def code_hop(fup: dict, task_id: int) -> bool:
+    """Whether a `continue:` follow-up of code task `task_id` carries its change on its branch, so the task
+    is a split with no review of its own: no note, no post-landing step (post_landing), no other kind than
+    code, no question or measurement (QUESTION_TITLE), and no wait in its words on this task landing
+    (OWN_LANDING), unless its title lands, pushes or fixes the change (CARRIES). Any other one could never
+    bring the review: the task is reviewed now."""
+    fup = fup if isinstance(fup, dict) else {}
+    title = str(fup.get("title") or "")
+    if not CONT_TITLE.match(title) or post_landing(fup, task_id) \
+            or str(fup.get("kind") or "code").strip().lower() != "code":
+        return False
+    if CARRIES.search(title):
+        return True
+    if QUESTION_TITLE.match(title):
+        return False
+    return not any((m.group(1) or str(task_id)) == str(task_id)
+                   for m in OWN_LANDING.finditer(f"{title}\n{fup.get('spec') or ''}"))
 
 
 def live_step(fup: dict) -> bool:

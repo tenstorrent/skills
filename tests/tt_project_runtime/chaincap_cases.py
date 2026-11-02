@@ -304,6 +304,48 @@ def test_a_same_branch_continuation_is_still_a_split_beside_a_post_landing_one(e
                                       "spec": "Add the tests on this branch, then hand off."}, tid)
 
 
+def test_a_continue_that_asks_measures_or_waits_on_its_landing_is_no_split_and_gets_its_review_now(env):
+    """A done code task whose only `continue:` follow-up is no code hop (a question or measurement, another
+    kind, or one that says it runs after this task lands without a live step) is no split: one review now,
+    no daemon hop. A review the coordinator queued ahead stays the one review."""
+    from ttp import chaincap
+    p = make(env)
+    cases = [
+        ("digest cache", lambda tid: [{"title": f"continue: measure coordinator write_per_turn after #{tid} lands",
+                                       "spec": "Read the turn stats a day later."}]),
+        ("stats line", lambda tid: [{"title": "continue: stats line, part 2", "kind": "question",
+                                     "spec": "Which tasks read the line?"}]),
+        ("readme pass", lambda tid: [{"title": "continue: docs", "spec": "After it lands, update the README."}]),
+        ("cache hit", lambda tid: [{"title": "continue: check whether the cache hit rate rose", "spec": "Read it."}]),
+    ]
+    for title, fups in cases:
+        tid, branch, done, reviews = _finish_with_followups(env, p, title, fups)
+        assert not chaincap.split_head(p.db.task(tid)), title
+        assert [r["title"] for r in reviews] == [f"Review #{tid}: {title}"], title
+        assert "Split at head" not in done["text"] and not _hops_of(p, tid), title
+    # A real code hop is still a split, with no review until its chain's last hop.
+    tid, branch, done, reviews = _finish_with_followups(env, p, "lexer two", lambda tid: [
+        {"title": "continue: lexer two, part 2", "kind": "code", "spec": "Add the tests on this branch."}])
+    assert chaincap.split_head(p.db.task(tid)) and not reviews and "Split at head" in done["text"]
+    # Another task's landing, or a title that lands the change, keeps it a code hop.
+    assert chaincap.code_hop({"title": "continue: rest", "spec": "After #99999 lands, add the tests."}, 7)
+    assert chaincap.code_hop({"title": "continue: push it after it lands", "spec": "x"}, 7)
+    assert not chaincap.code_hop({"title": "continue: rest", "spec": "Once #7 has landed, add the tests."}, 7)
+    assert not chaincap.code_hop({"title": "follow up: rest", "spec": "x"}, 7)
+    assert not chaincap.code_hop({"title": "continue: why did it slow down", "spec": "x"}, 7)
+
+    # The coordinator queued the review ahead: still exactly that one.
+    def ahead(tid, head):
+        p.db.add_task(f"Review #{tid}: planner", "spec", kind="review", origin="coordinator",
+                      depends_on=[tid], labels=[f"auto_review:{tid}"])
+        (env["tmp"] / f"run-{tid}" / "result.json").write_text(json.dumps(
+            {"status": "done", "summary": "planner works",
+             "followups": [{"title": "continue: measure the planner", "spec": "Time it."}]}))
+    tid, _, _, reviews = _finish_code(env, p, "planner", {"planner.py": 5}, before=ahead)
+    assert not chaincap.split_head(p.db.task(tid))
+    assert [r["origin"] for r in reviews] == ["coordinator"]
+
+
 def _split_at(p, tid, head):
     """Label an _unreviewed task a split at `head`, keeping its age (the sweep skips fresh tasks)."""
     when = p.db.task(tid)["updated"]

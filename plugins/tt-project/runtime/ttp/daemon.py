@@ -13394,10 +13394,12 @@ class Daemon:
 
     @staticmethod
     def _lone_continue(task: dict, fups: list[dict]) -> bool:
-        """`fups` is one `continue:` follow-up the daemon may queue itself (_continue_ready)."""
+        """`fups` is one `continue:` follow-up the daemon may queue itself (_continue_ready); a code task's
+        only when it carries the change (chaincap.code_hop), else the coordinator decides on it."""
         return len(fups) == 1 and not upstream.is_note(fups[0]) and not fups[0].get("start_after") \
             and not fups[0].get("start_when") and bool(chaincap.CONT_TITLE.match(str(fups[0].get("title") or ""))) \
-            and not chaincap.post_landing(fups[0], task["id"])
+            and not chaincap.post_landing(fups[0], task["id"]) \
+            and (task.get("kind") != "code" or chaincap.code_hop(fups[0], task["id"]))
 
     def _publish_kind(self, task: dict) -> dict | None:
         """A queued task of a kind that may not publish whose spec publishes a code task's branch
@@ -13444,13 +13446,13 @@ class Daemon:
 
     def _split(self, task: dict, result: dict, fups: list[dict]) -> str:
         """The head a done code task left unfinished, labelled chaincap.SPLIT_LABEL on it, or '': a
-        branch with changes not yet landed under other commits, and a `continue:` follow-up that is no
-        post-landing step (chaincap.post_landing: it would wait on this head landing, which only its
-        review brings) or a hand-off that marks the head WIP or split (chaincap.marked_split)."""
+        branch with changes not yet landed under other commits, and a `continue:` follow-up that carries
+        the change (chaincap.code_hop: no question, measurement or other kind, and no wait on this head
+        landing, which only its review brings) or a hand-off that marks the head WIP or split
+        (chaincap.marked_split)."""
         if chaincap.split_head(task):
             return chaincap.split_head(task)
-        cont = any(chaincap.CONT_TITLE.match(str(f.get("title") or "")) and not upstream.is_note(f)
-                   and not chaincap.post_landing(f, task["id"]) for f in fups)
+        cont = any(not upstream.is_note(f) and chaincap.code_hop(f, task["id"]) for f in fups)
         branch = task.get("branch")
         if not branch:
             return ""
