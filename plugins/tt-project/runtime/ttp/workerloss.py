@@ -17,8 +17,11 @@ from pathlib import Path
 
 RERUNS = 1
 MARKER = "worker_loss.json"   # in a run's directory: its checks stopped at a lost test worker
-_ENDED = re.compile(r"the test worker process (\d+) ended \(wait status (-?\d+|None)\) before this test finished")
-_LEFT = "no test worker was left to run this test"
+# Only a lost test's own report counts: its failure section, a '_ name _' header line followed by
+# just the runner's message. A test's assertion diff or a short-summary line quoting it never does.
+_ENDED = re.compile(r"^_+ (.+?) _+\nthe test worker process (\d+) ended \(wait status (-?\d+|None)\) before this "
+                    r"test finished$", re.M)
+_LEFT = re.compile(r"^_+ (.+?) _+\nno test worker was left to run this test$", re.M)
 _SUMMARY = re.compile(r"^(?:=+ )?((?:\d+ \w+, )*\d+ (?:failed|passed|errors?)\b.*?) in [0-9.]+s", re.M)
 _COUNT = re.compile(r"(\d+) (failed|errors?)\b")
 
@@ -27,11 +30,11 @@ def lost(output: str) -> dict | None:
     """What a check's output says of lost test workers, or None when it names none: `workers` maps
     each lost worker's pid to its wait status, `tests` counts the tests lost, and `other` the
     failures and errors besides them (None when no pytest summary line counts them)."""
-    ended = _ENDED.findall(output)
-    left = output.count(_LEFT)
+    ended = {test: (int(pid), status) for test, pid, status in _ENDED.findall(output)}
+    left = len(set(_LEFT.findall(output)) - set(ended))
     if not ended and not left:
         return None
-    workers = {int(pid): (None if status == "None" else int(status)) for pid, status in ended}
+    workers = {pid: (None if status == "None" else int(status)) for pid, status in ended.values()}
     summary = _SUMMARY.findall(output)
     other = None
     if summary:
