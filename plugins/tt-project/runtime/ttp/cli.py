@@ -1329,7 +1329,9 @@ def clip(text: str, width: int = STATUS_WIDTH) -> str:
 
 def status_text(p: Project, verbose: bool = False) -> str:
     """One screen: what needs the user now first, then the budget and the work, then information.
-    `verbose` adds the diagnostic lines (coordinator cache, checks slot waits, unacked upstream fixes)."""
+    Sections: needs you, budget, coordinator, running, stuck, landing, waiting, recent; each task once.
+    `verbose` adds the routine diagnostics (coordinator cache, checks lanes and slots, free shared locks,
+    self-review, health and coverage when fine, host reboots, unacked upstream fixes)."""
     from .alerts import feed
     from .web import at, attention, health, since
     db = p.db
@@ -1392,10 +1394,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(budget.coordinator_cache_line(cache))
     if verbose and (route_line := h["spend"].get("route_line")):
         lines.append("routing: " + route_line)
-    from . import pushq
-    pq = pushq.status_line(p, now)
-    if pq:
-        lines.append(pq)
+    from . import loadcaps, pushq
     from . import replica
     rl = replica.status_line(p, p.config(), now)
     if rl:
@@ -1414,59 +1413,35 @@ def status_text(p: Project, verbose: bool = False) -> str:
                      + (f" in {pr['project']} (shared: holds in every project)" if pr.get("shared") else "")
                      + (f": {pr['reason']}" if pr.get("reason") else "") + (f"; {pr['end']}" if pr.get("end") else "")
                      + f" — resume: ttp resume {p.name} --resource {pr['resource']}")
-    from . import checkcap, locks, shared, testslots
-    if host := checkcap.line():
-        lines.append(host)
-    lines.extend(testslots.use_lines())
-    from . import checklane, checkspill
-    lines.extend(checklane.lane_lines(p.name, p.config(), now))
+    # Routine diagnostics print only with --verbose; a line that reports an anomaly always prints.
+    from . import checkcap, checkjoin, checklane, checkspill, heal, locks, shared, testslots
+    if verbose:
+        if host := checkcap.line():
+            lines.append(host)
+        lines.extend(testslots.use_lines())
+        lines.extend(checklane.lane_lines(p.name, p.config(), now))
     lines.extend(checklane.long_wait_lines(p.name, p.config(), now))
-    lines.extend(checkspill.status_lines(p.name, now))
-    from . import checkjoin
-    lines.extend(f"checks {x.strip()}" for x in checkjoin.status_lines(p.state, now))
-    if verbose and (slot_waits := checkcap.wait_line(p.state, now)):
-        lines.append(slot_waits)
+    if verbose:
+        lines.extend(checkspill.status_lines(p.name, now))
+        lines.extend(f"checks {x.strip()}" for x in checkjoin.status_lines(p.state, now))
+        if slot_waits := checkcap.wait_line(p.state, now):
+            lines.append(slot_waits)
     for res in sorted(shared.names(p.config())):
         who = locks.held(shared.root() / res, p)
-        lines.append(f"shared {res}: " + ("; ".join(w.split(": ", 1)[-1] for w in who) if who else "free"))
+        if who or verbose:
+            lines.append(f"shared {res}: " + ("; ".join(w.split(": ", 1)[-1] for w in who) if who else "free"))
     for res, got in shared.mismatches(p).items():
         lines.append(f"shared {res}: projects give different slot counts ("
                      + ", ".join(f"{k} {n}" for k, n in sorted(got.items())) + f"); all use {min(got.values())}")
-    if h["why_idle"]:
-        lines.append(f"idle: {h['why_idle']}")
-    elif h["held"]:
-        lines.append(f"held: {h['held']}")
-    for w in h["working"][:8]:
-        what = f"#{w['task']} {w['title']}" if w["task"] else w["role"]
-        lines.append(f"  running {since(w['started'], now)}: {what}" + (f" ({w['wake']} wake)" if w.get("wake") else "")
-                     + (f" — {w['note']}" if w["note"] else ""))
-    from . import push
-    lines.extend(push.status_lines(p))
-    in_review = db.review_since()
-    if stuck:
-        lines.append("stuck, the project is on it:")
-    for t in stuck[:8]:
-        lines.append(f"  #{t['id']} {t['wait']['age_text']}: {t['title']} — {t['wait']['text']}")
-    for d in h.get("drivers_stalled") or []:
-        lines.append(f"  {d}")
-    for t in db.q("SELECT id,title,status,blocked_reason FROM tasks WHERE status IN ('review','pushing') "
-                  "ORDER BY status, id LIMIT 8"):
-        age = f" {since(in_review[t['id']], now)}" if t["id"] in in_review else ""
-        lines.append(f"  #{t['id']} {t['status']}{age}: {t['title']}" + (f" — {t['blocked_reason']}" if t["blocked_reason"] else ""))
-    from . import urgent
-    hot = [t for t in db.q("SELECT * FROM tasks WHERE status IN ('queued','review') ORDER BY priority, id")
-           if urgent.is_urgent(t)]
-    for t in hot[:8]:   # the urgent lane: each waiting urgent task, with how long it has waited
-        lines.append(f"  #{t['id']} {t['status']} ({urgent.mark(db, t, now)}): {t['title']} — urgent: {urgent.why(t)}")
     if h.get("schedules_broken"):
         lines.append(h["schedules_broken"])
     if h.get("schedules_waiting"):
         lines.append(h["schedules_waiting"])
-    if h.get("self_review"):
+    if h.get("self_review") and (verbose or h["self_review"].startswith("self-review: overdue")):
         lines.append(h["self_review"])
-    if h.get("health"):
+    if h.get("health") and (verbose or heal.summary(db, now)["failing"]):
         lines.append(h["health"])
-    if h.get("coverage"):
+    if h.get("coverage") and (verbose or "missing:" in h["coverage"]):
         lines.append(h["coverage"])
     lines.extend(h.get("obligations") or [])
     from . import mitigate
@@ -1477,7 +1452,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     from . import screen as scr
     for m in scr.mutes(db, now):
         lines.append(f"muted: {scr.mute_line(m, now, p)}")
-    if h.get("host"):
+    if h.get("host") and (verbose or re.search(r": [1-9]\d* lost", h["host"])):   # runs a reboot lost: always
         lines.append(h["host"])
     if h.get("idle_sleep"):
         lines.append(h["idle_sleep"])
@@ -1500,22 +1475,72 @@ def status_text(p: Project, verbose: bool = False) -> str:
     if disk:
         lines.append(f"disk: only {disk['free_gb']} GB free under {disk['path']} (guard {disk.get('threshold_gb', '?')} GB); "
                      f"only questions and plans start")
-    for t in h["logged_out"][:5]:
-        lines.append(f"  #{t['id']} held: logged out: {t['title']}")
-    for t in h.get("net_held", [])[:5]:
-        lines.append(f"  #{t['id']} held: network: {t['title']}")
+    if h["why_idle"]:
+        lines.append(f"idle: {h['why_idle']}")
+    elif h["held"]:
+        lines.append(f"held: {h['held']}")
+    for w in h["working"][:8]:
+        what = f"#{w['task']} {w['title']}" if w["task"] else w["role"]
+        lines.append(f"  running {since(w['started'], now)}: {what}" + (f" ({w['wake']} wake)" if w.get("wake") else "")
+                     + (f" — {w['note']}" if w["note"] else ""))
+    if stuck or h.get("drivers_stalled"):
+        lines.append("stuck, the project is on it:")
+    for t in stuck[:8]:
+        lines.append(f"  #{t['id']} {t['wait']['age_text']}: {t['title']} — {t['wait']['text']}")
+    for d in h.get("drivers_stalled") or []:
+        lines.append(f"  {d}")
+    # Waiting: each task once, in lane order (urgent, waiting, deferred, logged out, network-held).
+    from . import urgent
+    from .coordinator import BROKEN_START
+    rows: dict[int, dict] = {}
+
+    def row(t: dict, what: str, why: str = "", extra: list | None = None) -> None:
+        r = rows.setdefault(t["id"], {"what": [], "title": t["title"], "why": [], "extra": []})
+        r["what"].append(what)
+        r["why"] += [why] if why else []
+        r["extra"] += extra or []
+    hot = [t for t in db.q("SELECT * FROM tasks WHERE status IN ('queued','review') ORDER BY priority, id")
+           if urgent.is_urgent(t)]
+    for t in hot[:8]:   # the urgent lane: each waiting urgent task, with how long it has waited
+        row(t, f"{t['status']} ({urgent.mark(db, t, now)})", f"urgent: {urgent.why(t)}")
     for t in h["waiting"][:5]:
         why = re.sub(r";? *next try \S+$", "", t["blocked_reason"] or "").strip()
-        lines.append(f"  #{t['id']} waiting, next try {at(t['not_before'], now, tz)}: {t['title']}" + (f" — {why}" if why else ""))
-        lines += [f"    job {j['name']}: {j['line']}" for j in (db.kv("job_use", {}) or {}).values() if j.get("task") == t["id"]]
-    from .coordinator import BROKEN_START
+        row(t, f"waiting, next try {at(t['not_before'], now, tz)}", why,
+            [f"    job {j['name']}: {j['line']}" for j in (db.kv("job_use", {}) or {}).values() if j.get("task") == t["id"]])
     for t in h["deferred"][:5]:
         broken = t["starts"].startswith(BROKEN_START + ":")
-        lines.append(f"  #{t['id']} {t['starts'] if broken else 'deferred, ' + t['starts']}: {t['title']}"
-                     + (f" — {t['gate']['text']}" if t.get("gate") else ""))
+        row(t, t["starts"] if broken else "deferred, " + t["starts"], t["gate"]["text"] if t.get("gate") else "")
     for t in h.get("dep_held", [])[:5]:
-        on = ", ".join(f"#{d['id']} ({d['status']})" for d in t["on"][:3])
-        lines.append(f"  #{t['id']} queued, waits on {on}: {t['title']}")
+        row(t, "queued, waits on " + ", ".join(f"#{d['id']} ({d['status']})" for d in t["on"][:3]))
+    for t in h["logged_out"][:5]:
+        row(t, "held: logged out")
+    for t in h.get("net_held", [])[:5]:
+        row(t, "held: network")
+    # Landing: one line for the review and push stages, naming only a task stalled past its stage's bound.
+    in_review = db.review_since()
+    stall = {"review": pushq._num((cfg.get("coordinator") or {}).get("review_stall_s"), loadcaps.REVIEW_STALL_S, float, 0),
+             "pushing": 3600 * pushq._num(pushq._delivery(p, cfg).get("push_landing_alert_h"),
+                                          pushq.DEFAULT_LANDING_ALERT_H, float, 0)}
+    land = db.q("SELECT t.id, t.status, t.updated, (SELECT MIN(q.created) FROM push_queue q WHERE q.task=t.id "
+                "AND q.status IN ('approved','batched','held')) AS queued FROM tasks t "
+                "WHERE t.status IN ('review','pushing') ORDER BY t.id")
+    if land:
+        age = {t["id"]: now - float(in_review.get(t["id"]) or t["queued"] or t["updated"] or now) for t in land}
+        n = {s: sum(t["status"] == s for t in land) for s in stall}
+        late = [f"#{t['id']} {t['status']} {since(now - age[t['id']], now)}" for t in land
+                if stall[t["status"]] and age[t["id"]] >= stall[t["status"]] and t["id"] not in rows]
+        lines.append(f"landing: {n['pushing']} pushing, {n['review']} in review, oldest {since(now - max(age.values()), now)}"
+                     + (f"; stalled: {', '.join(late[:5])}" + (f" and {len(late) - 5} more" if len(late) > 5 else "")
+                        if late else ""))
+    if pq := pushq.status_line(p, now):
+        lines.append(pq)
+    from . import push
+    lines.extend(push.status_lines(p))
+    if rows:
+        lines.append("waiting:")
+    for tid, r in rows.items():
+        lines.append(f"  #{tid} {'; '.join(r['what'])}: {r['title']}" + (f" — {'; '.join(r['why'])}" if r["why"] else ""))
+        lines += r["extra"]
     if h["undelivered"]:
         u = h["undelivered"]
         lines.append(f"chat relay: {u['line']}")

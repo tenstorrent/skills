@@ -4387,8 +4387,9 @@ def test_status_and_the_web_feed_show_the_lane_lines(env, monkeypatch):
     p = make(env)
     g = testslots.suite_hold(p.name, repo=_LANE_REPO, slots=1, priority=3, name="alpha")
     try:
-        text = cli.status_text(p)
+        text = cli.status_text(p, verbose=True)
         assert "checks lane repository alpha (" in text and "full checks slot" not in text, text
+        assert "checks lane" not in cli.status_text(p), "a routine lane line shows with --verbose only"
         rows = [r["text"] for r in web.slots_feed(time.time(), p)]
         assert rows == checklane.lane_lines(p.name, p.config()) or any("repository alpha" in r for r in rows), rows
         assert any("checks lane repository alpha" in r for r in rows), rows

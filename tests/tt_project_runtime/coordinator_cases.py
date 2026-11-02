@@ -9268,7 +9268,7 @@ def test_two_projects_take_turns_on_a_shared_resource(env, tmp_path):
     assert Daemon(b.base)._resources_free(task)
     assert subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "5", "board", "--", "true"],
                           env=env_b).returncode == 0
-    assert "shared board: free" in status_text(a)
+    assert "shared board: free" in status_text(a, verbose=True) and "shared board" not in status_text(a)
 
 
 

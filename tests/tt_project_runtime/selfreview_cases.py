@@ -302,4 +302,6 @@ def test_status_and_the_web_header_show_the_self_review_line(env):
     _sr_receipt(p, 3)
     h = web.health(p, p.db)
     assert h["self_review"] == "self-review: last ran 3 h ago"
-    assert "self-review: last ran 3 h ago" in __import__("ttp.cli", fromlist=["x"]).status_text(p)
+    status_text = __import__("ttp.cli", fromlist=["x"]).status_text
+    assert "self-review: last ran 3 h ago" in status_text(p, verbose=True), "a routine line: --verbose only"
+    assert "self-review:" not in status_text(p)
