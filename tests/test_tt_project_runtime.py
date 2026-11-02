@@ -28854,14 +28854,14 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     assert "A follow-up implying a device or machine experiment" not in src
     assert "A harness task changes only this project's own harness" not in src
     every = feature_blocks(src, {"harness", "prs", "wait", "device", "devq", "remote", "clusters"})
-    assert len(every) <= 18_915, len(every)  # room for the upstream-note scope, atomic script-write, paid-model-API job and spend-cap rules, wait_kind user, the Galaxy reset rescan and recount, +110 evidence manifests naming only immutable artifacts
+    assert len(every) <= 18_950, len(every)  # room for the upstream-note scope, atomic script-write, paid-model-API job and spend-cap rules, wait_kind user, the Galaxy reset rescan and recount, +110 evidence manifests naming only immutable artifacts, +35 the root .ignore line
     for t in (None, code, question):
         system = worker_system(p, t)
         assert "<!-- ttp:" not in system and "<!-- /ttp:" not in system
         # The prompt names charter and memory files under the temp folder: measure it with a fixed
         # 64-char stand-in so the size does not depend on the temp path's length.
         size = len(system.replace(str(tmp_path), "T" * 64))
-        assert size <= 16_110, size  # +110: evidence manifests name only immutable artifacts
+        assert size <= 16_145, size  # +110: evidence manifests name only immutable artifacts; +35: the root .ignore line
     # Every fence names a feature worker_features can turn on, and each opens and closes once.
     known = set(_re.findall(r'on\.add\("(\w+)"\)', inspect.getsource(worker_features))) | {"harness"}
     opens = _re.findall(r"<!-- ttp:if (!?)(\w+) -->", src)
