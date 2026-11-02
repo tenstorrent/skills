@@ -5715,10 +5715,12 @@ def cmd_lock(a) -> None:
             # kill of this process, which no handler sees, leaves the lock held until the command ends,
             # and its label names the command (hand_to_command). The command never gets them: a process
             # it leaves running (a daemon, a `setsid ... &`) would keep the lock for as long as it lives.
-            proc = subprocess.Popen(cmd, env=child_env)
+            # The command runs only once both are in place (start_gated): a kill in between never runs it.
+            proc, gate = lk.start_gated(cmd, child_env)
             started.append(proc)
             keeper = lk.keep_open(fs, proc.pid)
             lk.hand_to_command(fs, proc.pid)
+            lk.let_go(gate)
             while pending:
                 _forward(pending.pop(0), None)
 

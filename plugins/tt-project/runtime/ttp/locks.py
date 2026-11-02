@@ -281,6 +281,51 @@ def keep_open(held: list, pid: int) -> subprocess.Popen | None:
             os.close(pfd)
 
 
+_GATE = (
+    "import os, signal, sys\n"
+    "if signal.getsignal(signal.SIGINT) is signal.default_int_handler:\n"
+    "    signal.signal(signal.SIGINT, signal.SIG_DFL)\n"
+    "fd = int(sys.argv[1])\n"
+    "go = os.read(fd, 1)\n"
+    "os.close(fd)\n"
+    "if not go:\n"
+    "    sys.exit(125)\n"
+    "for s in ('SIGPIPE', 'SIGXFSZ'):\n"
+    "    if hasattr(signal, s):\n"
+    "        signal.signal(getattr(signal, s), signal.SIG_DFL)\n"
+    "try:\n"
+    "    os.execvp(sys.argv[2], sys.argv[2:])\n"
+    "except OSError as e:\n"
+    "    print(f'ttp lock: cannot run {sys.argv[2]}: {e.strerror}', file=sys.stderr)\n"
+    "    sys.exit(126 if isinstance(e, PermissionError) else 127)\n")
+
+
+def start_gated(cmd: list, env: dict) -> tuple[subprocess.Popen, int]:
+    """Starts `cmd` behind a gate that execs it (same pid) only once let_go writes to the returned fd, so
+    the keeper (keep_open) and the label (hand_to_command) are in place before the command runs: a
+    SIGKILL of `ttp lock` in between never leaves the command running with the lock free or named for the
+    dead `ttp lock`. The gate reads EOF then and exits 125 without running the command."""
+    r, w = os.pipe()
+    try:
+        proc = subprocess.Popen([sys.executable, "-I", "-S", "-c", _GATE, str(r), *cmd], env=env, pass_fds=[r])
+    except BaseException:
+        os.close(w)
+        raise
+    finally:
+        os.close(r)
+    return proc, w
+
+
+def let_go(fd: int) -> None:
+    """Lets the command start_gated holds back run."""
+    try:
+        os.write(fd, b"1")
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def hand_to_command(held: list, pid: int) -> None:
     """Names the command `pid` a `ttp lock` runs (and hands hold_fds to) as the holder process of each
     hold in `held` (label_pid, via "command"), so a hold whose `ttp lock` died reads as held by its live

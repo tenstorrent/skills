@@ -1286,6 +1286,81 @@ def test_ttp_lock_stays_held_while_its_command_runs_after_ttp_lock_is_sigkilled(
     assert _until_true(lambda: _lock_probe(run_env, "board").returncode == 0), _lock_probe(run_env, "board").stdout
 
 
+def _stretched_start(env, p, stretch):
+    """A lock env whose `ttp lock` sleeps 3 s right after it starts its command (stretch "command") or the
+    keeper (stretch "keeper"), touching tmp/stretched as the sleep begins; and that command's script."""
+    sc, pidf, go = env["tmp"] / "sc", env["tmp"] / "cmd.pid", env["tmp"] / "go"
+    sc.mkdir()
+    (sc / "sitecustomize.py").write_text(
+        "import os, subprocess, time\n"
+        "_real = subprocess.Popen.__init__\n"
+        "_mark = {'command': 'cmd.pid', 'keeper': 'select.select'}[os.environ['LOCK_TEST_STRETCH']]\n"
+        "def _slow(self, *a, **k):\n"
+        "    _real(self, *a, **k)\n"
+        "    if _mark in str(a[:1]):\n"
+        f"        open({str(env['tmp'] / 'stretched')!r}, 'w').close()\n"
+        "        time.sleep(3)\n"
+        "subprocess.Popen.__init__ = _slow\n")
+    run_env = _lock_env(env, p, LOCK_TEST_STRETCH=stretch,
+                        PYTHONPATH=os.pathsep.join(filter(None, [str(sc), os.environ.get("PYTHONPATH")])))
+    script = (f"echo $$ > {shlex.quote(str(pidf))}.tmp; mv {shlex.quote(str(pidf))}.tmp {shlex.quote(str(pidf))}; "
+              f"while [ ! -e {shlex.quote(str(go))} ]; do sleep 0.05; done")
+    return run_env, ("sh", "-c", script), pidf, go
+
+
+@pytest.mark.parametrize("stretch", ["command", "keeper"])
+def test_ttp_lock_sigkilled_once_its_command_runs_leaves_the_lock_held_and_named_for_the_command(env, stretch):
+    # The command used to run before the keeper had the lock's files (a SIGKILL of `ttp lock` then freed
+    # the lock while the command ran) and before the label named it (it read as held by the dead `ttp
+    # lock`: a flake of the sigkilled test above). The command now runs only once both are in place.
+    p = make(env)
+    run_env, cmd, pidf, go = _stretched_start(env, p, stretch)
+    first = _lock(run_env, "board", cmd=cmd)
+    pid = None
+    try:
+        assert _until_true(lambda: pidf.exists()), first.stderr.read()
+        pid = int(pidf.read_text())
+        first.kill()
+        first.wait(timeout=30)
+        os.kill(pid, 0)   # the command outlives its ttp lock
+        r = _lock_probe(run_env, "board", extra=("--json",))
+        got = json.loads(r.stdout)
+        assert r.returncode == 75 and not got["free"], (r.returncode, r.stdout)
+        assert [(h["pid"], h["alive"], h.get("taker_pid")) for h in got["holders"]] == [(pid, True, first.pid)], got
+    finally:
+        go.touch()
+    assert pid and _cmd_ended(pid)
+    assert _until_true(lambda: _lock_probe(run_env, "board").returncode == 0), _lock_probe(run_env, "board").stdout
+
+
+@pytest.mark.parametrize("stretch", ["command", "keeper"])
+def test_ttp_lock_sigkilled_before_its_command_runs_never_runs_it(env, stretch):
+    # A SIGKILL of `ttp lock` while it sets up the hold (the keeper, the label) leaves no command running
+    # unlocked: the command never starts, and the lock is free once the keeper sees that.
+    p = make(env)
+    run_env, cmd, pidf, go = _stretched_start(env, p, stretch)
+    first = _lock(run_env, "board", cmd=cmd)
+    try:
+        assert _until_true(lambda: (env["tmp"] / "stretched").exists()), first.stderr.read()
+        first.kill()
+        first.wait(timeout=30)
+        assert _until_true(lambda: _lock_probe(run_env, "board").returncode == 0), _lock_probe(run_env, "board").stdout
+        assert not pidf.exists(), "the command ran though ttp lock never handed it the lock"
+    finally:
+        go.touch()
+        if pidf.exists():
+            _cmd_ended(int(pidf.read_text()))
+
+
+@pytest.mark.parametrize("missing", ["no-such-command-here", "./no-such-file"])
+def test_ttp_lock_names_a_command_it_cannot_run_and_exits_127(env, missing):
+    p = make(env)
+    r = subprocess.run([sys.executable, str(TTP), "lock", "board", "--", missing], env=_lock_env(env, p),
+                       capture_output=True, text=True, timeout=60, cwd=env["tmp"])
+    assert r.returncode == 127 and f"ttp lock: cannot run {missing}: No such file or directory" in r.stderr, r
+    assert _lock_probe(_lock_env(env, p), "board").returncode == 0
+
+
 @pytest.mark.parametrize("mode", [(), ("--shared",)])
 def test_ttp_lock_is_free_once_its_command_ends_though_a_process_it_left_running_lives_on(env, mode):
     # A process the command leaves running in the background (its own session: setsid, a daemon) used to
