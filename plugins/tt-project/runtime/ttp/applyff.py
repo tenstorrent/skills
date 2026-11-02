@@ -19,7 +19,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import poll_s
+from . import gitmemo, poll_s
 
 APPLY_REQUEST, APPLY_RESULT = "apply.request", "apply.result"
 APPLY_WAIT_S = 120      # how long --apply waits for the daemon to take the request, then for its result
@@ -28,7 +28,13 @@ _NO_WRITE_TEXT = ("read-only file system", "permission denied", "operation not p
 
 
 def _git(h: Path, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(h), *args], capture_output=True, text=True, env=env)
+    """git with its output captured, within gitmemo's cap; a timeout comes back as exit 124, so a
+    fast-forward cut short is put back like any other failure."""
+    try:
+        return subprocess.run(["git", "-C", str(h), *args], capture_output=True, text=True, env=env,
+                              timeout=gitmemo.timeout(None, args))
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", f"git {args[0]} timed out")
 
 
 def unwritable(h: Path, base: str, merged: str) -> str:
@@ -62,6 +68,8 @@ def fast_forward(h: Path, merged: str, guard_env: str) -> str:
     touched is put back to main's version, so the tree is as it was."""
     from .upjournal import _put_back, _touched
     base = _git(h, "rev-parse", "HEAD").stdout.strip()
+    if not base:
+        return "could not read main's commit"
     r = _git(h, "merge", "--ff-only", merged, env={**os.environ, guard_env: "1"})
     if r.returncode == 0:
         return ""
