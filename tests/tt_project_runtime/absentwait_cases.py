@@ -7,8 +7,19 @@ _AW_PROBE = "curl -fsS https://models.example.com/v1/models | grep -q example-mo
 
 
 def _aw_waiting(p, probe=_AW_PROBE, kind="work", **res):
-    tid = p.db.add_task("use example-model", "run the eval on example-model", kind=kind)
-    p.db.update_task(tid, status="waiting", result=json.dumps({"status": "waiting", "retry_when": probe, **res}))
+    """A task that handed off waiting on `probe` through the daemon's hand-off path: status queued, last
+    result waiting (the daemon never writes a task status 'waiting')."""
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage
+    tid = p.db.add_task("use example-model", "run the eval on example-model", kind=kind, tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    run_dir = p.base / f"aw-run-{tid}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "waiting", "summary": "waits on the listing",
+                                                     "retry_after_s": 1800, "retry_when": probe, **res}))
+    Daemon(p.base)._finish_worker({"task": tid, "note": "{}"}, RunUsage(cost_usd=0.1), "ok", run_dir)
+    t = p.db.task(tid)
+    assert t["status"] == "queued" and json.loads(t["result"])["status"] == "waiting", (t["status"], t["result"])
     return tid
 
 
@@ -28,7 +39,7 @@ def test_absent_wait_closes_after_n_identical_answers_with_one_reopen_watch(env)
     now = _aw_answers(p, tid, _AW_PROBE, ["HTTP 404: model example-model not found"] * 2, t0)
     d = Daemon(p.base)
     d.close_absent_waits(now)
-    assert p.db.task(tid)["status"] == "waiting"   # two identical answers: not yet settled
+    assert p.db.task(tid)["status"] == "queued"   # two identical answers: not yet settled
     now = _aw_answers(p, tid, _AW_PROBE, ["HTTP 404: model example-model not found"], now)
     d.close_absent_waits(now)
     t = p.db.task(tid)
@@ -121,15 +132,43 @@ def test_absent_wait_leaves_reset_credential_pending_and_local_waits_to_their_de
     pending = _aw_waiting(p)
     local = _aw_waiting(p, "test -f out/example-model.bin")
     code = _aw_waiting(p, kind="code")
+    own = _aw_waiting(p)   # a work task on its own branch: a close would skip its commits
+    p.db.update_task(own, branch=f"ttp/t{own}-example-eval")
+    mine = _aw_waiting(p, wait_kind="self")
     busy = _aw_waiting(p)
     t0 = time.time()
     for tid, reason in ((budget, "HTTP 404 not found"), (quota, "HTTP 429: quota exceeded, not found"),
                         (login, "HTTP 404 not found"), (pending, "not found yet: listing pending"),
-                        (local, "No such file: not found"), (code, "HTTP 404 not found")):
+                        (local, "No such file: not found"), (code, "HTTP 404 not found"), (own, "HTTP 404 not found"),
+                        (mine, "HTTP 404 not found")):
         now = _aw_answers(p, tid, _current_probe(p.db.task(tid)), [reason] * 5, t0)
     _aw_answers(p, busy, _AW_PROBE, ["HTTP 404 not found"] * 5, t0, rc=75)
     assert absentwait.due(p.db, {}, now, _current_probe) == []
     Daemon(p.base).close_absent_waits(now)
-    for tid in (budget, quota, login, pending, local, code, busy):
-        assert p.db.task(tid)["status"] == "waiting", tid
+    for tid in (budget, quota, login, pending, local, code, own, mine, busy):
+        assert p.db.task(tid)["status"] == "queued", tid
     assert absentwait.load(p.db)["watches"] == {}
+
+
+def test_absent_wait_reads_only_the_handoff_state_the_daemon_writes(env):
+    from ttp import absentwait
+    from ttp.daemon import _current_probe
+    from ttp.db import waiting_handoff
+    p = make(env)
+    tid = _aw_waiting(p, waiting_for="example-model on the provider's listing")
+    assert waiting_handoff(p.db.task(tid))["retry_when"] == _AW_PROBE
+    now = _aw_answers(p, tid, _AW_PROBE, ["HTTP 404 not found"] * 3, time.time())
+    assert [c["task"] for c in absentwait.due(p.db, {}, now, _current_probe)] == [tid]
+    # A queued task whose stored result is no waiting hand-off is no wait, whatever its old retry_when says.
+    p.db.update_task(tid, result=json.dumps({"status": "done", "retry_when": _AW_PROBE}))
+    assert waiting_handoff(p.db.task(tid)) == {} and absentwait.due(p.db, {}, now, _current_probe) == []
+    # Nor is a running task, though its last result was a waiting hand-off.
+    p.db.update_task(tid, status="running", result=json.dumps({"status": "waiting", "retry_when": _AW_PROBE}))
+    assert waiting_handoff(p.db.task(tid)) == {} and absentwait.due(p.db, {}, now, _current_probe) == []
+    # A start_when deferral is judged on its own probe and start_why, never as a waiting hand-off.
+    labels = json.dumps([f"start_when:{_AW_PROBE}", "start_why:example-model gives 404s, not listed"])
+    p.db.update_task(tid, status="queued", labels=labels, result=json.dumps({"status": "waiting", "wait_kind": "self",
+                                                                             "retry_when": "test -f x"}))
+    assert waiting_handoff(p.db.task(tid)) == {}
+    (c,) = absentwait.due(p.db, {}, now, _current_probe)
+    assert c["task"] == tid and c["probe"] == _AW_PROBE   # its stale wait_kind self is no wait of its own

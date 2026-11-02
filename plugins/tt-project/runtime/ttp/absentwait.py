@@ -14,7 +14,9 @@ Exempt, left to the deadline and the normal stall path: a credential, funds or q
 spend, quota, rate limit, a daily reset, login, 401/403/429; such a wait ends by time), a time-only probe,
 the task's own job or reply waits (progress.OWN_WAIT_RE, ack-wait, a user pause), a user step, a busy lock
 or unreachable host (exit 75, 255), a 'not yet'/'pending' answer that expects arrival, and code and review
-tasks, whose branch holds work a close would drop.
+tasks and any task with its own worktree (worktree.own_worktree), whose branch holds work a close would
+drop. A wait is a waiting hand-off (db.waiting_handoff: status queued, last result waiting) or a start_when
+deferral; the daemon never writes a task status 'waiting'.
 
 Each close registers one reopen watch: the same probe, re-run model-free every REOPEN_EVERY_S off the tick
 (Daemon._probe_now, the probe re-check runner) for REOPEN_FOR_S. The first pass queues one follow-up task
@@ -27,7 +29,7 @@ import re
 import time
 from typing import Any, Callable
 
-from .db import TERMINAL_TASK_STATES, deferral, dump_result, load_result, without_deferral
+from .db import deferral, dump_result, load_result, waiting_handoff, without_deferral
 
 KEY = "absent_waits"     # kv: {"closed": {tid: rec}, "watches": {tid: watch}, "reopened": {tid: follow-up id}}
 CLOSE_N = 3              # default of waiting.absent_close_n
@@ -91,14 +93,14 @@ def _clip(text: Any, n: int = 200) -> str:
 
 def _exempt(db, cfg: dict, t: dict, probe: str, res: dict, rec: dict) -> str:
     """Why the wait is left to its deadline, or ''."""
-    from . import ackwait, progress, userpause
-    if t["kind"] in SKIP_KINDS:
-        return f"a {t['kind']} task"
+    from . import ackwait, progress, userpause, worktree
+    if t["kind"] in SKIP_KINDS or worktree.own_worktree(t):
+        return f"a {t['kind']} task whose branch may hold work"
     if not OUTSIDE_RE.search(probe):
         return "its probe queries nothing outside"
     if progress.OWN_WAIT_RE.search(probe) or ackwait.is_probe(probe, cfg) or userpause.is_probe(probe, cfg):
         return "its own job, a reply or a user pause"
-    if t["status"] == "waiting" and str(res.get("wait_kind") or "").strip().lower() in ("self", "user", "user-action"):
+    if str(res.get("wait_kind") or "").strip().lower() in ("self", "user", "user-action"):
         return f"wait_kind {res.get('wait_kind')}"
     if rec.get("rc") in (75, 255) or isinstance(rec.get("rc"), str):
         return "a busy lock, an unreachable host or a timeout"
@@ -122,12 +124,12 @@ def due(db, cfg: dict, now: float, current_probe: Callable[[dict], str | None]) 
             t = db.task(int(k))
         except ValueError:
             continue
-        if not t or t["status"] not in ("waiting", "queued") or t["status"] in TERMINAL_TASK_STATES:
-            continue
+        res = waiting_handoff(t) if t else {}
+        if not t or not (res or t["status"] == "queued" and deferral(t).get("when")):
+            continue   # neither a waiting hand-off nor a start_when deferral
         probe = current_probe(t)
         if not probe or probe != rec.get("probe"):
             continue
-        res = load_result(t["result"]) if t["status"] == "waiting" else {}
         if _exempt(db, cfg, t, probe, res, rec):
             continue
         same, reason = int(rec.get("same") or 0), str(rec.get("reason") or "")
@@ -150,7 +152,7 @@ def close(db, c: dict, now: float, where=None, every_s: float = REOPEN_EVERY_S, 
     tid, key = int(c["task"]), str(c["task"])
     with db.tx():
         st, t = load(db), db.task(tid)
-        if key in st["watches"] or key in st["closed"] or not t or t["status"] not in ("waiting", "queued"):
+        if key in st["watches"] or key in st["closed"] or not t or t["status"] != "queued":
             return False
         at = timefmt.short(now, where) if where is not None else time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
         summary = (f"Closed as {OUTCOME} by the daemon at {at}, without waiting for its deadline: {c['why']} "

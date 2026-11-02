@@ -1370,6 +1370,16 @@ def deferral(task: dict) -> dict:
     return out
 
 
+def waiting_handoff(task) -> dict:
+    """A task's waiting hand-off as the daemon records it, or {}: status queued, its last result status
+    waiting, and no start_when deferral (the daemon never writes a task status 'waiting')."""
+    t = dict(task)
+    if t.get("status") != "queued" or deferral(t).get("when"):
+        return {}
+    res = load_result(t.get("result"))
+    return res if res.get("status") == "waiting" else {}
+
+
 def without_deferral(labels: list) -> list:
     return [lb for lb in labels if not (isinstance(lb, str) and lb.partition(":")[0] in DEFER_LABELS)]
 
