@@ -27,6 +27,7 @@ ALERT_SITES = {
     ("db.py", "DB._quarantine_kv"): [("outages", "stored state was unreadable and reset: state was lost")],
     ("deploy.py", "_alert"): [("outages", "a project is still behind the newest release after its takeover time")],
     ("grants.py", "reconcile"): [("decisions", "a setting changed on the user's word in the charter")],
+    ("relay.py", "ordered"): [("decisions", "a charter change applied on the owner's agent's order, with its old text")],
     ("service.py", "reap_restart_request"): [("outages", "a requested daemon restart failed")],
     ("service.py", "restart"): [("outages", "the daemon did not start on a runtime change; rolled back")],
     ("userstep.py", "relay"): [("user-blocker", "a user-only step (a sign-in, a device code, a credential) opened")],
