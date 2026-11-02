@@ -17152,7 +17152,7 @@ def test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_ca
     mem_chars = sum(len(e["line"]) + 1 for e in p._memory_entries())
     assert len(charter) > 11_000 and mem_chars > 9_000, (len(charter), mem_chars)
     spec = "SPEC-MARKER: follow up on fact-03 and fact-07"
-    for kind, cap in (("code", 30_700), ("question", 24_280)):   # +250 both: relayed findings citing records; +30 both: the charter's source cites; code: +50 for the Galaxy reset rescan and recount, +15 for wait_kind user, +100 for `ttp detach --lock`, +150 for atomic script writes, +175 for `published`, +35 for the $TTP_TEST_SLOTS cap, +80 for the home-zone date, +400 for paid-model-API job guards, +125 for its spend cap, +110 for evidence manifests naming only immutable artifacts, +30 for the root .ignore line, +150 for one standing item per user step (`ttp notify --step`)
+    for kind, cap in (("code", 30_715), ("question", 24_295)):   # +265 both: relayed findings citing records; +30 both: the charter's source cites; code: +50 for the Galaxy reset rescan and recount, +15 for wait_kind user, +100 for `ttp detach --lock`, +150 for atomic script writes, +175 for `published`, +35 for the $TTP_TEST_SLOTS cap, +80 for the home-zone date, +400 for paid-model-API job guards, +125 for its spend cap, +110 for evidence manifests naming only immutable artifacts, +30 for the root .ignore line, +150 for one standing item per user step (`ttp notify --step`)
         tid = p.db.add_task(f"{kind} task", spec, kind=kind, tier="light", origin="user")
         prompt = worker_prompt(p, p.db.task(tid), str(p.root), "ttp/t1-x" if kind == "code" else None)
         assert spec in prompt and str(tmp_path) in prompt
@@ -28859,8 +28859,9 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     # 14.61k and 10.16k: +110, a hash-pinned manifest names only immutable artifacts and receipts (upstream note 89e39b4c).
     # 14.645k and 10.195k: +35 net, rg/Grep from the project root skip what its .ignore lists (start-up file index).
     # 14.795k and 10.345k: +150, one standing item per user-only step (`ttp notify --step --check`), merged with the deadline line.
-    assert len(rules["code"]) <= 14_795, len(rules["code"])
-    assert len(rules["question"]) <= 10_345, len(rules["question"])
+    # 15.06k and 10.61k: +265, relayed findings citing records are facts to act on (one cheap check at most, never orders).
+    assert len(rules["code"]) <= 15_060, len(rules["code"])
+    assert len(rules["question"]) <= 10_610, len(rules["question"])
     # A question task cannot detach, so it skips the pointer to the long-running script rules.
     assert "references/long-running-scripts.md" in rules["code"]
     assert "references/long-running-scripts.md" not in rules["question"]
@@ -28868,14 +28869,14 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     assert "A follow-up implying a device or machine experiment" not in src
     assert "A harness task changes only this project's own harness" not in src
     every = feature_blocks(src, {"harness", "prs", "wait", "device", "devq", "remote", "clusters"})
-    assert len(every) <= 19_100, len(every)  # room for the upstream-note scope, atomic script-write, paid-model-API job and spend-cap rules, wait_kind user, the Galaxy reset rescan and recount, +110 evidence manifests naming only immutable artifacts, +35 the root .ignore line, +150 one standing item per user-only step
+    assert len(every) <= 19_365, len(every)  # room for the upstream-note scope, atomic script-write, paid-model-API job and spend-cap rules, wait_kind user, the Galaxy reset rescan and recount, +110 evidence manifests naming only immutable artifacts, +35 the root .ignore line, +150 one standing item per user-only step
     for t in (None, code, question):
         system = worker_system(p, t)
         assert "<!-- ttp:" not in system and "<!-- /ttp:" not in system
         # The prompt names charter and memory files under the temp folder: measure it with a fixed
         # 64-char stand-in so the size does not depend on the temp path's length.
         size = len(system.replace(str(tmp_path), "T" * 64))
-        assert size <= 16_300, size  # +110: evidence manifests name only immutable artifacts; +35: the root .ignore line; +150: one standing item per user-only step
+        assert size <= 16_565, size  # +110: evidence manifests name only immutable artifacts; +35: the root .ignore line; +150: one standing item per user-only step; +265: relayed findings citing records
     # Every fence names a feature worker_features can turn on, and each opens and closes once.
     known = set(_re.findall(r'on\.add\("(\w+)"\)', inspect.getsource(worker_features))) | {"harness"}
     opens = _re.findall(r"<!-- ttp:if (!?)(\w+) -->", src)
