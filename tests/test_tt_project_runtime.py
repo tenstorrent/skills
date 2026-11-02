@@ -17146,7 +17146,7 @@ def test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_ca
     mem_chars = sum(len(e["line"]) + 1 for e in p._memory_entries())
     assert len(charter) > 11_000 and mem_chars > 9_000, (len(charter), mem_chars)
     spec = "SPEC-MARKER: follow up on fact-03 and fact-07"
-    for kind, cap in (("code", 30_270), ("question", 24_030)):   # +30 both: the charter's source cites; code: +50 for the Galaxy reset rescan and recount, +15 for wait_kind user, +100 for `ttp detach --lock`, +150 for atomic script writes, +175 for `published`, +35 for the $TTP_TEST_SLOTS cap, +80 for the home-zone date, +400 for paid-model-API job guards, +125 for its spend cap, +110 for evidence manifests naming only immutable artifacts
+    for kind, cap in (("code", 30_300), ("question", 24_030)):   # +30 both: the charter's source cites; code: +50 for the Galaxy reset rescan and recount, +15 for wait_kind user, +100 for `ttp detach --lock`, +150 for atomic script writes, +175 for `published`, +35 for the $TTP_TEST_SLOTS cap, +80 for the home-zone date, +400 for paid-model-API job guards, +125 for its spend cap, +110 for evidence manifests naming only immutable artifacts, +30 for the root .ignore line
         tid = p.db.add_task(f"{kind} task", spec, kind=kind, tier="light", origin="user")
         prompt = worker_prompt(p, p.db.task(tid), str(p.root), "ttp/t1-x" if kind == "code" else None)
         assert spec in prompt and str(tmp_path) in prompt
@@ -28844,8 +28844,9 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     # 14.5k and 10.05k: +50, the Galaxy reset line's root-port rescan, BDF and tray recount and plain report.
     rules = {k: feature_blocks(src, worker_features(p, t)) for k, t in (("code", code), ("question", question))}
     # 14.61k and 10.16k: +110, a hash-pinned manifest names only immutable artifacts and receipts (upstream note 89e39b4c).
-    assert len(rules["code"]) <= 14_610, len(rules["code"])
-    assert len(rules["question"]) <= 10_160, len(rules["question"])
+    # 14.645k and 10.195k: +35 net, rg/Grep from the project root skip what its .ignore lists (start-up file index).
+    assert len(rules["code"]) <= 14_645, len(rules["code"])
+    assert len(rules["question"]) <= 10_195, len(rules["question"])
     # A question task cannot detach, so it skips the pointer to the long-running script rules.
     assert "references/long-running-scripts.md" in rules["code"]
     assert "references/long-running-scripts.md" not in rules["question"]

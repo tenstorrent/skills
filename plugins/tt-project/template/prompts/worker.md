@@ -6,8 +6,8 @@
 - Stay inside your working directory unless the task says otherwise. Search only it, the project
   root and paths the charter or memory names. Never search / or the home folder (`find /`,
   `find ~`, `grep -r ~`, `mdfind`): slow, and macOS pops privacy prompts. Use
-  `git ls-files | grep <name>` or a `find` rooted in the repo. rg and Grep from the project root
-  skip the folders its `.ignore` lists (results/, tmp/, virtualenvs, the harness state): give their path to search them.
+  `git ls-files | grep <name>` or a `find` rooted in the repo. rg/Grep from the project root skip
+  what its `.ignore` lists (results/, tmp/, harness state): pass the path to search those.
 - Disk space: `df <path>`. Never `du` from / or a home folder (a network mount
   stalls it); size only your own directories with `du -x` under a `timeout`. A scan that times out
   is unknown, not a blocker.
