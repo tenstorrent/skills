@@ -45,7 +45,7 @@ import tempfile
 import threading
 import time
 import tokenize
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 
 from . import (checkcap, checkdirs, conflictfix, cyclenotice, envfault, locks, push, pushpass, runner, scopehold,
@@ -627,7 +627,8 @@ def _idents(repo: Path, *revs: str) -> dict[str, tuple[str, str, frozenset, int]
     return res
 
 
-def _rewritten(repo: Path, onto: str, base: str, rest: list[str]) -> dict[str, str]:
+def _rewritten(repo: Path, onto: str, base: str, rest: list[str],
+               resolved: dict[str, list[str]] | None = None) -> dict[str, str]:
     """{commit: its landed version} for the commits of `rest` that landed rewritten: a commit of
     base..onto with the same author and author date (a rebase or amend keeps both), the same subject and
     the same files, and a committer date no older than the commit's own. Such a commit landed with a
@@ -635,7 +636,8 @@ def _rewritten(repo: Path, onto: str, base: str, rest: list[str]) -> dict[str, s
     is the newer one. Every task may commit as one author within one second, so a subject or the files
     alone never match. A commit rewritten after its landing (an amend that adds work) is newer than the
     landed version, so it is replayed, never dropped; one amended before it must still be carried whole by
-    the landed version (_carries)."""
+    the landed version (_carries). `resolved` gets {commit: files} for each one found whose drop relies
+    on the landing's resolution of a conflict region, so the batch records it."""
     mine = _idents(repo, "--no-walk=unsorted", *rest)
     theirs: dict[str, list[tuple[str, str, frozenset, int]]] = {}
     for c, (who, subject, files, when) in _idents(repo, "--reverse", f"{base}..{onto}").items():
@@ -645,8 +647,11 @@ def _rewritten(repo: Path, onto: str, base: str, rest: list[str]) -> dict[str, s
         if not (m := mine.get(c)):
             continue
         for landed, subject, files, when in theirs.get(m[0], []):
-            if subject == m[1] and files == m[2] and when >= m[3] and _carries(repo, c, landed, m[2]):
+            took: list[str] = []
+            if subject == m[1] and files == m[2] and when >= m[3] and _carries(repo, c, landed, m[2], took):
                 found[c] = landed
+                if took and resolved is not None:
+                    resolved[c] = sorted(took)
                 break
     return found
 
@@ -661,11 +666,13 @@ def _blob(repo: Path, rev: str, path: str) -> bytes | None:
     return r.stdout if r.returncode == 0 else None
 
 
-def _carries(repo: Path, c: str, landed: str, files: frozenset) -> bool:
+def _carries(repo: Path, c: str, landed: str, files: frozenset, resolved: list[str] | None = None) -> bool:
     """Whether `landed` holds all of commit `c`'s work: `c` merged (three-way, base c^) onto landed^
     gives landed's version of each of its files, outside the regions that conflict there (the
-    landing resolved those). An amend made before the landing adds work its landed copy lacks: that
-    commit is replayed, so the work lands or comes back as a conflict, never dropped."""
+    landing resolved those), and inside each such region the landing's lines account for every line
+    `c` adds there (_explained). An amend made before the landing adds work its landed copy lacks, also
+    inside a region the landing resolved: that commit is replayed, so the work lands or comes back as a
+    conflict, never dropped. The files whose answer relied on a resolved region go to `resolved`."""
     try:
         for path in files:
             mine, got = _blob(repo, c, path), _blob(repo, landed, path)
@@ -678,18 +685,70 @@ def _carries(repo: Path, c: str, landed: str, files: frozenset) -> bool:
                 for name, rev in (("ours", f"{landed}^"), ("base", f"{c}^"), ("theirs", c)):
                     (Path(d) / name).write_bytes(_blob(repo, rev, path) or b"")
                     sides.append(str(Path(d) / name))
-                r = subprocess.run(["git", "merge-file", "-p", f"--marker-size={_MARK}", *sides],
-                                   capture_output=True, timeout=gitmemo.timeout(None, ("merge-file",)))
-            if r.returncode < 0 or r.returncode > 127 or not _fits(r.stdout, got):   # 255: an error (binary)
-                return False
+                cmd = ["git", "merge-file", "-p", f"--marker-size={_MARK}"]
+                r = subprocess.run([*cmd, *sides], capture_output=True,
+                                   timeout=gitmemo.timeout(None, ("merge-file",)))
+                if r.returncode < 0 or r.returncode > 127 or not _fits(r.stdout, got):   # 255: an error (binary)
+                    return False
+                if r.returncode:    # conflicts: their base side tells what c added in each region
+                    r = subprocess.run([*cmd, "--diff3", *sides], capture_output=True,
+                                       timeout=gitmemo.timeout(None, ("merge-file",)))
+                    gaps = _gaps(r.stdout, got) if 0 < r.returncode <= 127 else None
+                    regions = _regions(r.stdout)
+                    if gaps is None or len(gaps) != len(regions) or not all(
+                            _explained(*side, gap) for side, gap in zip(regions, gaps)):
+                        return False
+                    if resolved is not None:
+                        resolved.append(path)
     except (OSError, subprocess.SubprocessError):
         return False
     return True
 
 
+def _marked(ln: bytes, ch: bytes) -> bool:
+    """Whether `ln` is a conflict marker line of `ch` (marker size _MARK)."""
+    return ln.startswith(ch * _MARK) and ln[_MARK:_MARK + 1] in (b" ", b"\n", b"\r", b"")
+
+
+def _regions(merged: bytes) -> list[tuple[list[bytes], list[bytes], list[bytes]]]:
+    """(ours, base, theirs) lines of each conflict region of a diff3-style `merged`."""
+    out, sides, at = [], [[], [], []], -1
+    for ln in merged.splitlines(keepends=True):
+        if at < 0:
+            if _marked(ln, b"<"):
+                sides, at = [[], [], []], 0
+        elif _marked(ln, b">"):
+            out.append(tuple(sides))
+            at = -1
+        elif at == 0 and _marked(ln, b"|"):
+            at = 1
+        elif at < 2 and _marked(ln, b"="):
+            at = 2
+        else:
+            sides[at].append(ln)
+    return out
+
+
+def _explained(ours: list[bytes], base: list[bytes], theirs: list[bytes], got: list[bytes]) -> bool:
+    """Whether the landing's lines `got` for a conflict region account for every line commit c's side
+    (`theirs`) adds over `base` there: those not in `got` verbatim are at most the lines `got` adds
+    over `ours` that are not c's (a line rewritten while resolving). More of c's lines than that is
+    work the landed copy lacks, such as an amend's added lines."""
+    new = Counter(theirs) - Counter(base)
+    missing = new - Counter(got)
+    rewrites = (Counter(got) - Counter(ours)) - Counter(theirs)
+    return sum(missing.values()) <= sum(rewrites.values())
+
+
 def _fits(merged: bytes, got: bytes) -> bool:
     """Whether `got` is `merged` with each conflict region replaced by any lines: every hunk outside
     the conflicts is there, in order, with nothing else between."""
+    return _gaps(merged, got) is not None
+
+
+def _gaps(merged: bytes, got: bytes) -> list[list[bytes]] | None:
+    """The lines of `got` that stand for each conflict region of `merged`, in order, when `got` is
+    `merged` with each region replaced by any lines (_fits), else None."""
     segs, cur, inside = [], [], False
     for ln in merged.splitlines(keepends=True):
         if not inside and ln.startswith(b"<" * _MARK) and ln[_MARK:_MARK + 1] in (b" ", b"\n", b"\r", b""):
@@ -700,21 +759,22 @@ def _fits(merged: bytes, got: bytes) -> bool:
         else:
             cur.append(ln)
     if inside:
-        return False
+        return None
     segs.append(cur)
     lines = got.splitlines(keepends=True)
     if len(segs) == 1:
-        return segs[0] == lines
+        return [] if segs[0] == lines else None
     first, last = segs[0], segs[-1]
     if len(first) + len(last) > len(lines) or lines[:len(first)] != first or lines[len(lines) - len(last):] != last:
-        return False
-    at, end = len(first), len(lines) - len(last)
+        return None
+    at, end, gaps = len(first), len(lines) - len(last), []
     for seg in segs[1:-1]:
         k = next((i for i in range(at, end - len(seg) + 1) if lines[i:i + len(seg)] == seg), None)
         if k is None:
-            return False
+            return None
+        gaps.append(lines[at:k])
         at = k + len(seg)
-    return True
+    return [*gaps, lines[at:end]]
 
 
 def _commit_replayed(wt: Path) -> None:
@@ -770,6 +830,7 @@ class Batch:
         self.tip_runs = 0                       # the rerun on the tip (of TIP_RERUNS) that failed last (_tip_ids)
         self.info: dict[int, dict] = {}
         self.settled: dict[int, dict] = {}     # entry index -> the conflicts its replay settled
+        self.dropped: dict[int, list] = {}     # entry index -> its commits left out on a landing's conflict resolution
         self.conflicted: set[int] = set()      # entries whose replay hit a conflict it did not settle
         self._settling: tuple[list[str], set] = ([], set())   # files and kinds of the replay running
         self.rescued: dict[int, str] = {}      # entry index -> its head, replayed again without a blamed entry
@@ -789,14 +850,17 @@ class Batch:
 
     def results(self) -> list[dict]:
         """Each entry's outcome; the detail of one whose replay settled conflicts names them
-        ("settled": files, "settled_by": kinds), so a check failure after it can be traced to it. A
+        ("settled": files, "settled_by": kinds), so a check failure after it can be traced to it, and
+        that of one whose commits were left out as landed only by a landing that resolved a conflict in
+        their lines names them ("dropped_as_resolved": [{commit, as, files}]: _rewritten). A
         pushed or landed entry names its own commit on the branch ("sha": the replayed head that ends
         with it, or the tip it was found on), which a rebase made different from its reviewed head."""
         out = []
         for i, e in enumerate(self.entries):
             st = "scope_held" if i in self.held else self.status.get(i, "requeued")
             r = {"id": e.get("id"), "task": e.get("task"), "status": st,
-                 "detail": {**self.detail.get(i, {}), **self.settled.get(i, {})}}
+                 "detail": {**self.detail.get(i, {}), **self.settled.get(i, {}),
+                            **({"dropped_as_resolved": self.dropped[i]} if i in self.dropped else {})}}
             if st in ("pushed", "landed") and i in self.landed_at:
                 r["sha"] = self.landed_at[i]
             out.append(r)
@@ -1037,7 +1101,7 @@ class Batch:
         carried entries as (index, batch head after it); the others get their status here."""
         carried: list[tuple[int, str]] = []
         h = tip
-        self.info, self.settled, self.conflicted = {}, {}, set()
+        self.info, self.settled, self.conflicted, self.dropped = {}, {}, set(), {}
         csdir = self.cfg["changeset_dir"] if self.cfg else ""
         for i, e in enumerate(self.entries):
             sha = str(e.get("head") or "")
@@ -1084,13 +1148,19 @@ class Batch:
                 self._set(i, "refused", message=push.excluded_refusal(bad, self.target))
                 continue
             self._settling = ([], set())
-            own, gone = self._landed(h, base, top)
+            resolved: dict[str, list[str]] = {}
+            own, gone = self._landed(h, base, top, resolved)
             if gone:
                 left = len(own) - len(gone)
                 say(f"entry {e.get('id')} ({e.get('branch')}): {len(gone)} of its {len(own)} commits are on "
                     f"{h[:10]} already (" + ", ".join(f"{c[:10]} as {v[:10]}" for c, v in list(gone.items())[:5])
                     + (f", +{len(gone) - 5} more" if len(gone) > 5 else "")
                     + (f"); replaying the other {left}" if left else ")"))
+            if resolved := {c: v for c, v in resolved.items() if c in gone}:
+                self.dropped[i] = [{"commit": c, "as": gone[c], "files": v} for c, v in resolved.items()]
+                for c, v in resolved.items():
+                    say(f"entry {e.get('id')}: left out {c[:10]} as landed by {gone[c][:10]}, which resolved a "
+                        f"conflict in its lines of {', '.join(v)} and accounts for every line it adds there")
             new, files = (h, None) if gone and len(gone) == len(own) else self._rebase(h, top, drop=set(gone))
             if files is None and self._settling[0]:
                 self.settled[i] = {"settled": sorted(set(self._settling[0])), "settled_by": sorted(self._settling[1])}
@@ -1124,13 +1194,15 @@ class Batch:
         order = _git(self.repo, "rev-list", f"{base}..{tip}").stdout.split()   # newest first
         return min(gone.values(), key=lambda c: order.index(c) if c in order else len(order))
 
-    def _landed(self, onto: str, base: str, top: str) -> tuple[list[str], dict[str, str]]:
+    def _landed(self, onto: str, base: str, top: str,
+                resolved: dict[str, list[str]] | None = None) -> tuple[list[str], dict[str, str]]:
         """The commits of base..top (merges aside), and those of them already on `onto`, each with
         the commit there that carries it: one naming it in a REPLAYED trailer (a batch that settled
         its replay, or a squash that carries several), else one with the same patch (`git patch-id
         --stable`, as git cherry), else a newer rewrite of it (_rewritten: it landed
-        conflict-resolved). Replaying such a commit again could only conflict with its own landing.
-        Oldest first; the first carrier found wins."""
+        conflict-resolved; `resolved` gets those found only through a conflict the landing resolved).
+        Replaying such a commit again could only conflict with its own landing. Oldest first; the first
+        carrier found wins."""
         own = _git(self.repo, "rev-list", "--reverse", "--no-merges", f"{base}..{top}").stdout.split()
         if not own or base == onto:
             return own, {}
@@ -1147,7 +1219,7 @@ class Batch:
                 if mine.get(c) in theirs:
                     gone[c] = theirs[mine[c]]
         if rest := [c for c in own if c not in gone]:
-            gone.update(_rewritten(self.repo, onto, base, rest))
+            gone.update(_rewritten(self.repo, onto, base, rest, resolved))
         return own, {c: gone[c] for c in own if c in gone}
 
     def _rebase(self, onto: str, top: str, drop: set | frozenset = frozenset()) -> tuple[str, list[str] | None]:

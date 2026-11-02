@@ -2300,6 +2300,79 @@ def test_a_push_batch_replays_an_entry_commit_amended_before_its_landing(env, mo
         assert _git_out(origin, "show", "proj:notes.txt") == "a\nB1\nc\nfix from review", "the amend's work landed"
 
 
+def test_a_push_batch_replays_an_amend_whose_added_lines_sit_in_a_conflict_its_older_copys_landing_resolved(
+        env, monkeypatch, capsys):
+    """The entry's commit is an amend made before its older copy landed, and the amend's added line sits
+    in the region where the landing resolved a conflict with the target's edit of the same line. The
+    resolution cannot account for that line, so the commit is replayed (a real conflict here) and the
+    reviewed line is never silently dropped."""
+    p, repo, origin, other, a = _landed_fixture(env, monkeypatch)
+    _git_out(repo, "checkout", "-q", "-B", "e1", a)
+    head = _rewrite(repo, a, {"notes.txt": "a\nB1\nfix from review\nc\n"}, later=100, args=("--amend",))
+    _land_as(other, {"notes.txt": "a\nb theirs\nc\n"}, "the target edits line b")
+    _git_out(other, "fetch", "-q", str(repo), "first")
+    _rewrite(other, a, {"notes.txt": "a\nB1 resolved\nc\n"}, later=500)
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
+    assert _statuses(m) == ["conflict"], m
+    assert "dropped_as_resolved" not in m["results"][0]["detail"], m["results"]
+    assert "left out" not in capsys.readouterr().out
+
+
+def test_a_push_batch_records_a_commit_it_drops_on_a_landing_that_resolved_a_conflict_in_its_lines(
+        env, monkeypatch, capsys):
+    """The entry's commit landed rewritten with a conflict in its lines resolved, and the resolution
+    accounts for every line it adds: the commit is still left out, and the drop is recorded in the
+    entry's result detail (in the marker) and in the log, never silent."""
+    p, repo, origin, other, a = _landed_fixture(env, monkeypatch)
+    _land_as(other, {"notes.txt": "a\nb theirs\nc\n"}, "the target edits line b")
+    _git_out(other, "fetch", "-q", str(repo), "first")
+    landed_as = _rewrite(other, a, {"notes.txt": "a\nB1 resolved\nc\n"})
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    head = _on_top(repo, a, "e1", {"more.txt": "own\n"})
+    rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed"], m
+    assert m["results"][0]["detail"]["dropped_as_resolved"] == [
+        {"commit": a, "as": landed_as, "files": ["notes.txt"]}], m["results"]
+    assert f"left out {a[:10]} as landed by {landed_as[:10]}, which resolved a conflict in its lines of notes.txt" \
+        in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("amend, resolution, dropped", [
+    ("1\nfix from review\n", "1 resolved\n", False),       # the amend's line is lost in the resolution
+    ("1\nfix from review\n", "b theirs\n1\n", False),     # both sides taken, but not the amend's line
+    ("1\nfix from review\n", "b theirs\n1\nfix from review\n", True),  # the resolution holds it
+    (None, "1 resolved\n", True),                           # not amended: the resolution rewrote its line
+    (None, "b theirs\n1\n", True),                         # not amended: both sides taken
+], ids=["amend-rewritten", "amend-both-sides", "amend-kept", "rewritten", "both-sides"])
+def test_a_rewritten_landing_carries_a_commit_only_when_its_resolution_accounts_for_every_added_line(
+        tmp_path, amend, resolution, dropped):
+    """The repro: an amend made before its older copy landed adds a line inside the region where the
+    landing resolved a conflict. It is dropped (and named) only when the resolution accounts for it."""
+    from ttp import batch
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git_out(repo, "init", "-q")
+    _git_out(repo, "config", "user.name", "T")
+    _git_out(repo, "config", "user.email", "t@example.com")
+    (repo / "f.txt").write_text("a\nb\nc\n")
+    _git_out(repo, "add", "f.txt")
+    _git_out(repo, "commit", "-qm", "base")
+    base = _git_out(repo, "rev-parse", "HEAD")
+    (repo / "f.txt").write_text("a\n1\nc\n")
+    _git_out(repo, "commit", "-qam", "one")
+    x = mine = _git_out(repo, "rev-parse", "HEAD")
+    if amend:       # amended (--no-edit -a) before the older copy landed
+        mine = _rewrite(repo, x, {"f.txt": f"a\n{amend}c\n"}, later=100, args=("--amend", "--no-edit"))
+    _git_out(repo, "checkout", "-q", "--detach", base)
+    (repo / "f.txt").write_text("a\nb theirs\nc\n")
+    _git_out(repo, "commit", "-qam", "theirs")
+    landed_as = _rewrite(repo, x, {"f.txt": f"a\n{resolution}c\n"}, later=500)
+    resolved: dict = {}
+    assert batch._rewritten(repo, landed_as, base, [mine], resolved) == ({mine: landed_as} if dropped else {})
+    assert resolved == ({mine: ["f.txt"]} if dropped else {}), "a drop on a resolved conflict is named"
+
+
 @pytest.mark.parametrize("change", ["author", "date", "subject", "files", "older", "amended", "none"])
 def test_a_rewritten_landing_needs_the_same_author_date_subject_and_files_and_a_newer_commit(
         tmp_path, change):
