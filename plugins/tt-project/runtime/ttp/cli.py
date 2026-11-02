@@ -3974,7 +3974,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
             suite = testslots.Grant()   # checks.wrap_lane "after": the step inside the wrapper takes the lane
         # The repository's lanes are read again at every try: unset, they follow the host's load (checklane.capacity).
         if suite is None and (suite := hold(repo, lambda held: checklane.slots(cfg, held), lock=lock,
-                                            cap=checklane.project_cap(cfg),
+                                            cap=checklane.project_cap(cfg), cap_note=checklane.cap_note(cfg),
                                             worktree=top, headroom=checklane.headroom, pending=True,
                                             startable=lambda: testslots.pool_room(cfg, p.name if p else None))) is None:
             if tree is not None:

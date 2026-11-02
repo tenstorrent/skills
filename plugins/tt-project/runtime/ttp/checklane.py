@@ -39,8 +39,8 @@ its lock per run) it holds no lane while the wrapper queues: a step between the 
 the command ends or the step dies.
 
 Project cap. At most project_cap() of a project's checks run at once over all its repository and
-wrapper-lock lanes: checks.test_project_max (project, then account, then TTP_TEST_PROJECT_MAX), else the
-runs the host's test pool fits side by side, at least its lanes per repository (slots()). It counts checks, never test workers: the project's test-worker budget is
+wrapper-lock lanes: checks.test_project_max (project, then account, then TTP_TEST_PROJECT_MAX; "auto" in
+one skips the later ones, fixed_cap), else the runs the host's test pool fits side by side, at least its lanes per repository (slots()). It counts checks, never test workers: the project's test-worker budget is
 this cap times one run's grant (testslots.project_max), so every check under the cap gets its slots, and
 a run counts against the cap only once its test slots are granted (testslots.project_held), so a run
 still waiting for them never keeps another from its turn. A lane under the cap goes to
@@ -251,21 +251,53 @@ def slots_note(cfg: dict | None, held: int = 0) -> str:
             f"at least {k['floor']}, at most {k['top']}")
 
 
-def project_cap(cfg: dict | None) -> int:
-    """The most of a project's checks that run at once (above): checks.test_project_max (project, then
-    account), TTP_TEST_PROJECT_MAX, else the runs the host's test pool fits side by side, at least its lanes
-    per repository (slots()) and, with checks.slots unset, the runs the host's cores hold (capacity()'s top,
-    whose lanes admit only what the load and memory fit); 0 (unset with the test pool off): no cap."""
+CAP_AUTO = "auto"   # checks.test_project_max "auto": sized from the host, whatever a later source fixes
+
+
+def fixed_cap(cfg: dict | None) -> tuple[int, str] | None:
+    """The fixed checks.test_project_max and where it comes from ("project", "account" or "environment"):
+    the first source, in that order, that sets a whole number of at least 1. None when none does, or when
+    an earlier one says "auto" (CAP_AUTO): a project's "auto" keeps an account's fixed number off it. A
+    layered config (project.layered) carries the account's value as its own: one equal to it reads "account"."""
     own = ((cfg or {}).get("checks") or {}) if isinstance((cfg or {}).get("checks"), dict) else {}
-    for v in (own.get("test_project_max"), setting({}, "test_project_max"), os.environ.get("TTP_TEST_PROJECT_MAX")):
+    acct = setting({}, "test_project_max")
+    mine = own.get("test_project_max")
+    for v, src in ((mine, "account" if acct is not None and str(mine).strip() == str(acct).strip() else "project"),
+                   (acct, "account"), (os.environ.get("TTP_TEST_PROJECT_MAX"), "environment")):
+        if str(v).strip().lower() == CAP_AUTO:
+            return None
         try:
             n = int(str(v).strip())
         except (TypeError, ValueError):
             continue
         if n >= 1:
-            return n
+            return n, src
+    return None
+
+
+def project_cap(cfg: dict | None, fixed: bool = True) -> int:
+    """The most of a project's checks that run at once (above): checks.test_project_max (fixed_cap: project,
+    then account, then TTP_TEST_PROJECT_MAX; "auto" in one skips the later ones), else the runs the host's
+    test pool fits side by side, at least its lanes per repository (slots()) and, with checks.slots unset, the
+    runs the host's cores hold (capacity()'s top, whose lanes admit only what the load and memory fit); 0
+    (unset with the test pool off): no cap. `fixed` False: that host-sized cap, whatever is set."""
+    if fixed and (f := fixed_cap(cfg)):
+        return f[0]
     s = testslots.sizes(cfg)
     return max(slots(cfg), s[0] // s[1], capacity(cfg)["top"] if _explicit_slots(cfg) is None else 0) if s else 0
+
+
+CAP_FROM = {"project": "the project's config", "account": "the account settings", "environment": "TTP_TEST_PROJECT_MAX"}
+
+
+def cap_note(cfg: dict | None) -> str:
+    """For a fixed checks.test_project_max under the host-sized cap (project_cap(fixed=False)): where it is
+    set and what the host sizes now, so a stale fixed number holding checks back shows where they wait; ""
+    when nothing is fixed or the fixed number is not the lower."""
+    f = fixed_cap(cfg)
+    if not f or (host := project_cap(cfg, fixed=False)) <= f[0]:
+        return ""
+    return f" {f[0]}, set in {CAP_FROM[f[1]]}; the host fits {host} now, {CAP_AUTO!r} follows the host"
 
 
 NAME_SUFFIX = ".name"   # beside a lane's files: its repository's or wrapper command's name (remember_name)
@@ -964,7 +996,8 @@ def status_text(project_name: str, cfg: dict | None, here_repo: str = "", now: f
              + (f"{n} per repository (checks.slots)" if n is not None else "per repository as many as the host "
                 "fits now (checks.slots unset; each repository's line says how many)")
              + ", one per wrapper lock "
-             f"(checks.wrap_cmd), at most {project_cap(cfg) or 'any number'} at once (checks.test_project_max); "
+             f"(checks.wrap_cmd), at most {project_cap(cfg) or 'any number'} at once (checks.test_project_max"
+             f"{cap_note(cfg)}); "
              f"light checks never wait"]
     got = lane_status(project_name, now, cfg, names, db)
     if not got:

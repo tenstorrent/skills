@@ -858,7 +858,7 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                stop: Callable[[], str] | None = None, who: str = "", priority: int | None = None,
                since: float | None = None, slots: int | Callable[[int], int] = 1, repo: str = "", cost: dict | None = None,
                max_wait: float = 0.0, state=None, what: str = "full checks", lock: str = "", cap: int = 0,
-               worktree: str = "", headroom: Callable[[], bool] | None = None,
+               cap_note: str = "", worktree: str = "", headroom: Callable[[], bool] | None = None,
                age: float | None = None, pending: bool = False, check: str = "",
                repo_name: str = "", name: str = "", startable: Callable[[], bool] | None = None) -> Grant | None:
     """Hold one of project `project_name`'s `slots` checks lanes in repository `repo` (repo_key) for its
@@ -882,7 +882,8 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     that lock's one lane, whatever its repository, and never a repository lane or an overflow lane: runs
     behind one wrapper lock go one at a time, and lock-free runs never wait behind them. `cap`: the most of
     the project's checks that run at once over all its lanes (checklane.project_cap; 0: none), the lane
-    going to the most urgent waiter (cap_turn). A priority-1 waiter (`priority` <= 1) whose lanes are held
+    going to the most urgent waiter (cap_turn); `cap_note` (checklane.cap_note) follows the cap's name in
+    the wait line. A priority-1 waiter (`priority` <= 1) whose lanes are held
     only by less urgent runs takes an overflow lane beside them while `headroom()` says the host has room,
     never beside a holder in the same `worktree` (one suite per worktree); with the cap full of less urgent
     runs it takes one past the cap ("over_cap"), one such lane per project at a time (over_cap_room). `age`: the aging step
@@ -1014,7 +1015,8 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                 rule = ("one at a time behind this wrapper lock (checks.wrap_cmd)" if lock else
                         f"{'one' if slots == 1 else slots} at a time per project and repository, "
                         f"checks.{SLOTS_KEY} sets it")
-                rule += f"; at most {cap} of the project's checks at once (checks.test_project_max)" if cap > 0 else ""
+                rule += (f"; at most {cap} of the project's checks at once (checks.test_project_max{cap_note})"
+                         if cap > 0 else "")
                 recs = recs or locks.holder_records(project_held(project_name))
                 held_by = holders_text(recs, told)
                 tell and tell(f"waiting for this project's other full checks to end ({rule}, most urgent priority "

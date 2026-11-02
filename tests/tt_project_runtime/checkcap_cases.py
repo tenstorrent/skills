@@ -2793,6 +2793,54 @@ def test_checks_test_project_max_caps_a_projects_checks_at_once_over_all_its_lan
     assert checklane.project_cap({"checks": {"test_project_max": "x"}}) == 3, "an invalid one falls back"
 
 
+def test_checks_test_project_max_auto_sizes_from_the_host_over_a_fixed_account_number(env, capsys, monkeypatch):
+    """A fixed account checks.test_project_max (set when the default was one check at a time) held a project's
+    checks under what the host fits, and a project had no way back to the host-sized cap: "auto" is that."""
+    from ttp import checklane, cli, coordinator, project, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.delenv("TTP_TEST_PROJECT_MAX", raising=False)
+    monkeypatch.setenv("TTP_TEST_POOL", "32")
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", "8")
+    host = checklane.project_cap({})
+    assert host == 4 and checklane.cap_note({}) == "", "unset: host-sized, nothing to note"
+    project.set_account_setting("checks.test_project_max", 3)
+    assert checklane.project_cap({}) == 3 and checklane.fixed_cap({}) == (3, "account")
+    for auto in ("auto", " AUTO "):
+        assert checklane.project_cap({"checks": {"test_project_max": auto}}) == host, auto
+        assert checklane.fixed_cap({"checks": {"test_project_max": auto}}) is None
+    assert checklane.project_cap({}, fixed=False) == host, "fixed False: the host's size whatever is set"
+    layered = project.layered({})
+    assert layered["checks"]["test_project_max"] == 3, "a layered config carries the account's value"
+    assert checklane.fixed_cap(layered) == (3, "account"), "and it is named as the account's"
+    assert checklane.project_cap(project.layered({"checks": {"test_project_max": "auto"}})) == host, \
+        "the project's auto wins over the account's number in a layered config"
+    note = checklane.cap_note(layered)
+    assert "set in the account settings" in note and f"the host fits {host} now" in note and "'auto'" in note, note
+    assert checklane.cap_note({"checks": {"test_project_max": 5}}) == "", "a fixed number above the host's: no note"
+    project.set_account_setting("checks.test_project_max", "auto")
+    monkeypatch.setenv("TTP_TEST_PROJECT_MAX", "2")
+    assert checklane.project_cap({}) == host, "the account's auto keeps the environment's number off"
+    project.set_account_setting("checks.test_project_max", None)
+    assert checklane.fixed_cap({}) == (2, "environment")
+    assert "TTP_TEST_PROJECT_MAX" in checklane.cap_note({})
+    # The waiter at the cap says where the fixed number comes from and what the host fits.
+    a = testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, cap=1, wait_s=0)
+    told = []
+    assert testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, cap=1, wait_s=0.3, tell=told.append,
+                                cap_note=note) is None
+    assert "(checks.test_project_max 3, set in the account settings; the host fits" in told[0], told
+    a.close()
+    # config_set takes auto for the cap, not for the test-worker budget, which is a number of slots.
+    conv = coordinator.settable("checks.test_project_max")
+    assert conv("auto") == "auto" and conv(" Auto ") == "auto" and conv(3) == 3
+    cli.main(["config", "--chat-settable", "checks.test_project_max", "auto"])
+    assert 'accepted as "auto"' in capsys.readouterr().out
+    with pytest.raises(ValueError, match="whole number of at least 1$"):
+        coordinator.settable("checks.test_project_slots")("auto")
+    with pytest.raises(ValueError, match='or "auto"'):
+        conv("automatic")
+
+
 @pytest.mark.parametrize("key", ["checks.test_project_max", "checks.test_project_slots"])
 def test_checks_test_project_max_is_chat_settable_as_a_whole_number_of_at_least_one(env, capsys, key):
     from ttp import cli, coordinator, project

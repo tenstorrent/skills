@@ -1166,8 +1166,9 @@ queues behind routine work; nothing running is interrupted:
   a time and lock-free checks run beside them; it takes it before the wrapper starts, or with `checks.wrap_lane
   after` (for a wrapper that waits for its lock) only once the wrapper holds its lock, so a run queued there holds no lane (that lane is not held to
   `checks.test_project_max`: waiting for the cap inside the wrapper would hold the wrapper's lock meanwhile). A change of `checks.wrap_lane` reaches `ttp checks` runs that start after it; a run already queued for the wrapper lane or holding it keeps the mode it started with until it ends (a waiting run that re-executes for a runtime upgrade uses the new setting). At most `checks.test_project_max` of a project's checks run at once
-  over all its lanes (chat-settable, a whole number of at least 1; unset, the runs the test-slot pool fits side by side, at least
-  `checks.slots`); a run counts against it
+  over all its lanes (chat-settable, a whole number of at least 1 or `auto`; unset or `auto`, the runs the test-slot pool fits
+  side by side, at least `checks.slots`; a project's `auto` keeps an account-level number off it, and a waiter held by a
+  fixed number under the host's size says where it is set and what the host fits); a run counts against it
   only once its test workers are granted, so one still waiting for them never holds up the others; waiting
   checks start in task-priority order across them, and a priority-1 check whose lanes are held only by less urgent
   runs starts beside them in an extra lane while the load is under half the cores, never in a worktree that already
@@ -1824,7 +1825,7 @@ is open raises one `cap_wait` event naming the key.
 | review sweep cadence (`REVIEW_SWEEP_EVERY_S`) | 300 s | how often both review sweeps look | convenience |
 | review settle grace (`UNREVIEWED_GRACE_S`) | 120 s | a task updated this recently before the backstop sweep looks at it | convenience |
 | `coordinator.review_stall_s` | 1800 s (old: 14400) | a dependency in review before the coordinator hears of it | convenience |
-| `checks.test_project_max` | from cores and memory, at least 2 | a project's suites at once | convenience |
+| `checks.test_project_max` | from cores and memory, at least 2 (`auto`) | a project's suites at once | convenience |
 | `delivery.push_batch_s` | 300 s, none after a clean batch | changes gathered into one push | convenience |
 | `delivery.push_batch_max` | 8 | most changes in one push batch (a full batch starts at once; a backlog after a clean batch grows it up to 3x) | convenience |
 | `coordinator.burst_window_s` | 120 s (0: off) | high events after a turn high events woke, until one follow-up turn reads them all; never user messages, critical or safety-class events | convenience |

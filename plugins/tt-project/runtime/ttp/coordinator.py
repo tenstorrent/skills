@@ -274,13 +274,16 @@ def _checks_ionice(v):
     return t
 
 
-def _checks_project_max(v, key: str = "checks.test_project_max"):
-    """checks.test_project_max (or `key`) as config_set takes it: a whole number, at least 1."""
+def _checks_project_max(v, key: str = "checks.test_project_max", auto: bool = False):
+    """checks.test_project_max (or `key`) as config_set takes it: a whole number, at least 1; with `auto`
+    also "auto" (checklane.CAP_AUTO: sized from the host, whatever the account fixes)."""
+    if auto and isinstance(v, str) and v.strip().lower() == "auto":
+        return "auto"
     n = v if isinstance(v, int) and not isinstance(v, bool) else None
     if isinstance(v, str) and v.strip().isdigit():
         n = int(v.strip())
     if n is None or n < 1:
-        raise ValueError(f"{key}: {v!r} is not a whole number of at least 1")
+        raise ValueError(f"{key}: {v!r} is not a whole number of at least 1" + (' or "auto"' if auto else ""))
     return n
 
 
@@ -325,7 +328,7 @@ USER_SETTABLE = {
     "checks.nice": lambda v: _checks_nice(v),
     "checks.ionice": lambda v: _checks_ionice(v),
     # How many of the project's checks run at once over all its lanes (checklane.project_cap).
-    "checks.test_project_max": lambda v: _checks_project_max(v),
+    "checks.test_project_max": lambda v: _checks_project_max(v, auto=True),
     # The project's test-worker budget (testslots.project_max; unset: test_project_max x one run's grant).
     "checks.test_project_slots": lambda v: _checks_project_max(v, "checks.test_project_slots"),
     # How many full checks of one project and repository run at once (checklane.slots; unset: sized to the host).
