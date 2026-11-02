@@ -95,6 +95,7 @@ from . import effortab
 from . import extchange
 from . import failover
 from . import tierfloor
+from . import premise
 from . import outagetask
 from . import grants
 from . import ends
@@ -3323,6 +3324,7 @@ class Daemon:
                     log(self.p, f"run {r['id']} of a cancelled task asked to stop")
                 except OSError as e:
                     log(self.p, f"run {r['id']} of a cancelled task could not be asked to stop: {e}")
+        self._tend_premises()   # before dead_dependencies: a failed premise check never blocks its code task
         for t, dep, why in db.dead_dependencies():
             reason = f"dependency #{dep} {why}" if dep is not None else "a dependency is not a task id"
             with db.tx():
@@ -3335,6 +3337,14 @@ class Daemon:
         self._raise_missing_task_refs(now)
         self._raise_review_stalls(now)
         self._raise_unhandled_failed_reviews(now)
+
+    def _tend_premises(self) -> None:
+        """premise.tend: split, settle and clean up code tasks' premise checks; never stops the caller."""
+        try:
+            for tid, what in premise.tend(self.p.db):
+                log(self.p, f"task {tid}: {what}")
+        except Exception:
+            log(self.p, "premise checks not tended: " + traceback.format_exc().replace("\n", " | ")[:1500])
 
     def _raise_review_stalls(self, now: float) -> None:
         """Only 'done' satisfies a dependency, so a task left in 'review' holds its dependents back
@@ -5048,7 +5058,8 @@ class Daemon:
         # ended without a verdict, leaves nothing to decide: the final attempt's outcome starts the turn.
         # A timeout still does, since the task may need splitting before it times out again.
         quiet = new == "queued" and status in (*FREE_ENDS, "failed", "lost", "stalled", "no_handoff",
-                                               "refused_wait") or push_quiet
+                                               "refused_wait") or push_quiet \
+            or new == "done" and premise.is_check(task) and not fups and not notes   # premise.tend acts on it
         # A finished code task's next step is its review, queued here in the same step whatever else the
         # hand-off holds: its follow-ups go into the review's spec and stay the coordinator's to queue.
         # A hand-off with nothing else to decide (no follow-ups or notes, normal severity) starts no turn.
@@ -7546,6 +7557,7 @@ class Daemon:
 
     def _dispatch(self, busy: dict) -> None:
         db = self.p.db
+        self._tend_premises()   # a code task queued this tick with a `premise:` line waits on its check
         ready = db.ready_tasks()   # read after _slot_reservations, which may have woken a reserving task
         reached = set()     # tasks that got past the gates to the resource check
         paused = db.paused_resources()

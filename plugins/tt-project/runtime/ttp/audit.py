@@ -16,6 +16,8 @@ the project could have saved. Model-free; the review grades it.
   every open task was held (quietgate.py), with the saving, and per wait the wait_stale
   turns skipped as unchanged since a turn that decided nothing on it (stalegate.py); blocker sweeps the model ran and those
   skipped model-free (sweepskip.py), with the saving;
+- code runs with no code change: code tasks done after a worker run with no review, PR or published
+  change, with their spend, and the code tasks a premise check (premise.py) closed before any run;
 - spend per finished task: the workers' own, and the coordinator's day spread over them; $ per
   done task by kind and tier;
 - tasks blocked or waiting longer than `blocked_h` hours now, longest first;
@@ -179,6 +181,40 @@ def finished(db: DB, since: float) -> list[dict]:
     """Tasks that ended (done or failed) since `since`, most costly first."""
     return db.q("SELECT id, title, status, kind, tier, spent_usd FROM tasks WHERE status IN ('done','failed') "
                 "AND updated>=? ORDER BY spent_usd DESC", (since,))
+
+
+def no_change_code(db: DB, since: float) -> dict:
+    """Code tasks done since `since` after a worker run that left nothing to review: no review covers
+    them (an `auto_review:<id>` label or a dependency) and their result names no PR or published
+    change. Most were premise checks run at the code tier. With the code tasks a premise check
+    (premise.py) closed before any code run: {n, usd, rows, premise_closed}."""
+    rows = db.q("SELECT id, title, spent_usd, result, labels FROM tasks t WHERE kind='code' AND status='done' "
+                "AND updated>=? AND EXISTS (SELECT 1 FROM runs r WHERE r.task=t.id AND r.role!='coordinator') "
+                "ORDER BY spent_usd DESC", (since,))
+    closed = db.one("SELECT COUNT(*) n FROM tasks t WHERE kind='code' AND status='done' AND updated>=? "
+                    "AND labels LIKE '%\"premise:%:fails\"%' AND NOT EXISTS "
+                    "(SELECT 1 FROM runs r WHERE r.task=t.id AND r.role!='coordinator')", (since,))
+    covered: set[int] = set()
+    if rows:
+        for r in db.q("SELECT labels, depends_on FROM tasks WHERE kind='review' AND id>?", (min(t["id"] for t in rows),)):
+            for raw in (r["labels"], r["depends_on"]):
+                try:
+                    vals = json.loads(raw or "[]")
+                except ValueError:
+                    continue
+                for v in vals if isinstance(vals, list) else []:
+                    v = str(v)
+                    v = v[len("auto_review:"):] if v.startswith("auto_review:") else v
+                    if v.isdigit():
+                        covered.add(int(v))
+    out = []
+    for t in rows:
+        res = _note(t["result"])
+        if t["id"] in covered or res.get("pr") or res.get("published"):
+            continue
+        out.append({"id": t["id"], "title": t["title"], "usd": float(t["spent_usd"] or 0)})
+    return {"n": len(out), "usd": sum(t["usd"] for t in out), "rows": out,
+            "premise_closed": int((closed or {}).get("n") or 0)}
 
 
 def unpriced_runs(db: DB, done: list[dict]) -> dict[int, int]:
@@ -457,6 +493,13 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
                 + (f" ({g['unpriced']} unpriced, routed)" if g["unpriced"] else "") for g in groups))
         if bases := cost_bases(db, done):
             out.append("$ per done task by provider and cost basis: " + bases_text(bases))
+    idle = no_change_code(db, since)
+    if idle["n"] or idle["premise_closed"]:
+        out.append(f"code runs with no code change: {idle['n']}, ${idle['usd']:.2f}"
+                   + (f"; {idle['premise_closed']} closed by a premise check before any code run"
+                      if idle["premise_closed"] else "")
+                   + "".join(f"{', ' if i else ': '}#{t['id']} {_short(t['title'], 50)} ${t['usd']:.2f}"
+                             for i, t in enumerate(idle["rows"][:TOP])) + _more(idle["rows"]))
     stuck = stuck_long(db, now, blocked_h)
     if stuck:
         out.append(f"blocked or waiting longer than {blocked_h:g} h now: {len(stuck)}: " + ", ".join(
@@ -516,7 +559,7 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
             "coordinator_turns": coordinator_turns(db, since),
             "coordinator_cache": budget.coordinator_cache(db, now, window_s)["window"], "turns_skipped": turngate.skipped(db, since), "turns_quiet": quietgate.skipped(db, since), "sweeps": sweepskip.counts(db, since, now),
             "finished": done, "per_outcome": per_outcome(done, unpriced), "cost_bases": cost_bases(db, done),
-            "stuck": stuck_long(db, now, blocked_h), "review_loops": review_loops(db, since),
+            "no_change_code": no_change_code(db, since), "stuck": stuck_long(db, now, blocked_h), "review_loops": review_loops(db, since),
             "reviews": {**reviewstats.summary(db, since), "rows": reviewstats.rows(db, since)},
             "overrides": overrides(p, db, now, blocked_h), "promises": obligations.promise_outcomes(db, since, now),
             "repeated_instructions": correction.repeat_summary(db, since)}

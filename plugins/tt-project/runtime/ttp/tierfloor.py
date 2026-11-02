@@ -5,7 +5,7 @@ the light tier or below high effort.
 
 Model-free, applied at each start after the effort pick (effort.py: Jev's or the rules' pick, a retry's
 tier-up) and the coordinator's tier, so tasks already queued are lifted too. A task is a conclusion run
-when any of these holds: its kind is `question` or `plan`; it answers a user chat (`reply_chat`); its
+when any of these holds (a code task's premise check, premise.py, never is: the daemon reads it): its kind is `question` or `plan`; it answers a user chat (`reply_chat`); its
 spec has a line starting `conclusion:`; or it is a run of an llm schedule whose output is posted to the
 user (the daily review, or a schedule named for a review, summary, digest, report or brief). Such a run
 gets tier max(its own, floor tier) and effort max(its own, floor effort), the nearest effort its
@@ -92,6 +92,9 @@ def _labels(task: dict) -> list[str]:
 
 def reasons(task: dict) -> list[str]:
     """Why `task` is a conclusion run (empty: it is not)."""
+    from . import premise
+    if premise.is_check(task):
+        return []   # the daemon reads its answer, not the user (premise.py)
     out = []
     if task.get("kind") in KINDS:
         out.append(f"kind {task['kind']}")

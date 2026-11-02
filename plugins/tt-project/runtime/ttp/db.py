@@ -27,6 +27,7 @@ TIER_SOURCES = {
     "review_needs_deep": "the failed review marked the fix as needing deep",
     "retry_tier_up": "raised one tier after a failed try", "effort_pick": "picked from its spec at its first start",
     "review_diff": "sized by the reviewed diff", "failover": "moved to another provider",
+    "premise_check": "a code task's premise check (premise.py): light",
 }
 PAUSED_RESOURCES_KEY = "paused_resources"   # kv: see DB.paused_resources
 PAUSE_BOOT_KEY = "pause_until_boot"   # kv: {"boot", "since"} of a `ttp pause --until-reboot`; see DB.set_paused

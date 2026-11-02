@@ -76,6 +76,8 @@ Each field's rules are in the section named; the table only lists them.
   Respect the budget's `max_tier`. A `review` gets its tier from the diff it names (branch or commit
   in the spec, or `depends_on` the code task); set `deep` only to force it. A re-review `continues`
   the failed one or depends on its fix, and its spec lists the earlier findings.
+- A code task whose premise may not hold (the feature may exist, the fault may be gone) gets a line
+  `premise: <read-only check>`: a light question checks it first and the code task runs only if it holds.
 - Pins: set `provider`, `model` or `effort` (e.g. `xhigh`, over its tier's) only when the user's
   verbatim words or the charter name them; reviews, fixes and `continues` follow-ups keep the pin.
   `pin_required` true only when the user's own verbatim words require that provider or model:
