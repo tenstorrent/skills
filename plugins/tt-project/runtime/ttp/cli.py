@@ -2141,8 +2141,8 @@ def cmd_upstream(a) -> None:
             if a.wontfix is not None and not a.resolve:
                 die("ttp upstream --wontfix needs --resolve <fp>", 2)
             if a.resolve and a.wontfix is not None:
-                if a.fixed_in:
-                    die("ttp upstream --wontfix closes a note without a release: drop --fixed-in", 2)
+                if a.fixed_in or a.task is not None:
+                    die("ttp upstream --wontfix closes a note without a release: drop --fixed-in and --task", 2)
                 me = here()
                 try:
                     r = upstream.wontfix(a.resolve, a.wontfix, me.name if me else "")
@@ -2162,6 +2162,10 @@ def cmd_upstream(a) -> None:
                 if not a.fixed_in:
                     die("ttp upstream --resolve needs --fixed-in <version> or --wontfix \"<reason>\"")
                 me = here()
+                ok, why = upstream.check_fixed_in(me, a.resolve, a.fixed_in, a.task)
+                if not ok:
+                    die(f"refused: note {a.resolve.strip().lower()} is not fixed in {a.fixed_in.strip().lstrip('v')}: {why}", 2)
+                print(why)
                 try:
                     r = upstream.resolve(a.resolve, a.fixed_in, a.note or "", me.name if me else "")
                 except OSError as e:
@@ -9779,6 +9783,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--wontfix", metavar="REASON", help="with --resolve: close note FP without a release (not a "
                                                        "plugin bug); the reason is required and recorded")
     s.add_argument("--note", help="with --resolve: what changed, for the project that filed it")
+    s.add_argument("--task", type=int, help="with --resolve --fixed-in: the task that fixed the note (default: the "
+                                            "one whose hand-off lists it in resolves); its landed commit must be "
+                                            "in that version")
     s.add_argument("--fixed", metavar="FP", help="probe: print the note, its state and the running version; exit 0 once "
                                                   "this project's running daemon has note FP's fix, 1 before, 2 when "
                                                   "unknown, 3 when closed as not a bug (wontfix)")

@@ -135,7 +135,8 @@ read the one for the lever you change.
   `[facts at send time from <project>'s records: ...]` (status, landed or superseded commit, machine
   changes). A worker's prompt gets the same for the tasks its spec names, read at dispatch (`## Facts
   at send time`): where the text states their status, the records win.
-- Closing a note: the maintainers record `ttp upstream --resolve <fp> --fixed-in <version>` (or `--wontfix "<reason>"` for a note that is not a
+- Closing a note: the maintainers record `ttp upstream --resolve <fp> --fixed-in <version>` (refused when the
+  task whose hand-off lists the note in `resolves`, or `--task <id>`, has no landed commit in that version) (or `--wontfix "<reason>"` for a note that is not a
   plugin bug: closed, no release), or a
   code task's hand-off lists the note in `resolves` and the push queue records it with the version
   its batch pushed. A sandboxed `--resolve`, `--ack` or `--regress` is queued in the run's directory and

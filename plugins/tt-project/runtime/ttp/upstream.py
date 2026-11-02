@@ -862,6 +862,89 @@ def resolve(fp: str, fixed_in: str, note: str = "", by: str = "", now: float | N
                     "by": by, "ts": now or time.time()})
 
 
+FIXING_MAX = 200   # task rows read when looking for the hand-off that lists a note in `resolves`
+
+
+def fixing_task(db, fp: str) -> int | None:
+    """The task whose hand-off lists note `fp` in `resolves`, as the push queue picks it (resolves_of):
+    the earliest done code task, a review only when no other lists it. None when no hand-off does."""
+    from .db import load_result
+    fp = _check_fp(fp)
+    rows = db.q("SELECT id, kind, status, result FROM tasks WHERE result LIKE ? ORDER BY id LIMIT ?",
+                (f"%{fp}%", FIXING_MAX))
+    hits = []
+    for r in rows:
+        got = load_result(r["result"]).get("resolves")
+        if fp in [str(x).strip().lower() for x in (got if isinstance(got, list) else [got] if got else [])]:
+            hits.append(r)
+    hits.sort(key=lambda r: (r["kind"] == "review", r["status"] != "done", r["id"]))
+    return hits[0]["id"] if hits else None
+
+
+def version_commit(p: project.Project, repo: Path, ref: str, version: str) -> str:
+    """The first commit on `ref` whose `delivery.version_bump` file (its first, as pushed_version reads)
+    carries `version`; "" when none does or it cannot be read."""
+    from . import push
+    files = _bump_files(p)
+    if not files or not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        return ""
+    pat = "[\"']" + version.replace(".", "\\.") + "[\"']"   # the same in basic and extended regex
+    try:
+        log = subprocess.run(["git", "-C", str(repo), "log", "--reverse", "--format=%H", "-G", pat, ref, "--",
+                              files[0]], text=True, capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    for sha in log.stdout.split()[:20] if log.returncode == 0 else []:
+        if push.pushed_version(p, repo, sha) == version:   # -G also lists the bump that moves past it
+            return sha
+    return ""
+
+
+def check_fixed_in(p: project.Project | None, fp: str, fixed_in: str, tid: int | None = None) -> tuple[bool, str]:
+    """Whether recording note `fp` as fixed in `fixed_in` is true: (ok, one line). With a known fixing
+    task (`tid`, else fixing_task) its landed commits must be in the first commit on the push branch
+    whose manifests carry that version, read locally and then after one fetch. With no fixing task, no
+    project, push branch or version_bump, it is not checked: ok, saying so. Reads git only, writes nothing."""
+    from . import landed
+    v = str(fixed_in or "").strip().lstrip("v")
+    if p is None:
+        return True, f"version {v} not checked: no project here"
+    if tid is None:
+        tid = fixing_task(p.db, fp)
+        if tid is None:
+            return True, f"version {v} not checked: no task's hand-off lists note {_check_fp(fp)} in resolves"
+    elif not p.db.task(tid):
+        return False, f"no task #{tid} in this project"
+    try:
+        ref = landed._push_ref(p, p.root)
+    except ValueError as e:
+        return True, f"version {v} not checked: {e}"
+    if not _bump_files(p):
+        return True, f"version {v} not checked: delivery.version_bump is not set"
+    shas, src = landed.task_shas(p, tid)
+    if not shas:
+        return False, (f"#{tid} fixes note {_check_fp(fp)} but is not landed ({src}): it cannot be fixed in {v}. "
+                       f"Resolve once it lands, with the version that carries it")
+    vsha = ""
+    for fetching in (False, True):
+        tip, _ = landed._tip(p.root, ref, fetching)
+        vsha = version_commit(p, p.root, ref, v) if tip else ""
+        if vsha and any(landed._commit(p.root, s) and landed.on_branch(p.root, s, vsha) for s in shas):
+            return True, f"version {v} checked: #{tid} ({shas[-1][:10]}) is in {vsha[:10]}"
+    where = f"its first commit {vsha[:10]}" if vsha else f"no commit on {ref} carries it yet"
+    return False, (f"#{tid} fixes note {_check_fp(fp)} but its landed commit {shas[-1][:10]} ({src}) is not in "
+                   f"version {v} ({where}). Give the version that first carries it")
+
+
+def _bump_files(p: project.Project) -> list[str]:
+    """The files `delivery.version_bump` keeps the version in; [] when it is unset or malformed."""
+    from . import push
+    try:
+        return (push.bump_of((p.config().get("delivery") or {}).get("version_bump")) or {}).get("files") or []
+    except ValueError:
+        return []
+
+
 def wontfix(fp: str, reason: str, by: str = "", now: float | None = None) -> dict:
     """Close note `fp` without a release: it is not a plugin bug. A reason is required. No push batch
     marks it fixed (see `wontfixed`), and it leaves the open list."""

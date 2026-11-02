@@ -602,3 +602,89 @@ def test_a_long_note_event_keeps_its_id_and_reply_hint(env):
     n = _pushed_note("demo", "x" * upstream.SPEC_CHARS)
     sev, text = upstream._event({**n, "via": "laptop" * 10}, cap)
     assert len(text) <= cap and text.endswith(f"[note {n['fp']}] Reply: `ttp note --reply {n['fp']} \"<text>\"`.")
+
+
+def test_upstream_resolve_fixed_in_refuses_a_version_without_the_fixing_tasks_landed_commit(env, monkeypatch, capsys):
+    """`ttp upstream --resolve <fp> --fixed-in <V>`: when a task's hand-off lists the note in `resolves`
+    (or `--task` names one), its landed commit must be in the first commit on the push branch whose
+    version_bump file carries V, also as a rebased copy. A version before the fix, one no commit carries
+    yet, a task that has not landed or does not exist is refused, naming the task, its commit and V, and
+    nothing is recorded. With no fixing task the version is not checked and one line says so."""
+    from ttp import cli, upstream
+    p = make(env)
+    repo = p.root
+    monkeypatch.chdir(p.base)
+    for r in _git_out(repo, "remote").split():
+        _git_out(repo, "remote", "remove", r)
+    man = repo / "plugins/p/.claude-plugin/plugin.json"
+    man.parent.mkdir(parents=True)
+
+    def commit(msg, version=None, path=None):
+        if version:
+            man.write_text(json.dumps({"name": "p", "version": version}, indent=2) + "\n")
+        if path:
+            (repo / path).write_text(msg + "\n")
+        _git_out(repo, "add", "-A")
+        _git_out(repo, "commit", "-qm", msg)
+        return _git_out(repo, "rev-parse", "HEAD")
+
+    start = _git_out(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    commit("p 0.1.0", "0.1.0")
+    _git_out(repo, "checkout", "-qb", "proj")
+    commit("p 0.1.1", "0.1.1")
+    fix = commit("the fix", path="fix.txt")
+    commit("p 0.1.2", "0.1.2")
+    _git_out(repo, "checkout", "-qb", "ttp/t-side", "HEAD~3")   # a done task's own commit, landed rebased
+    side = commit("the side fix", path="side.txt")
+    _git_out(repo, "checkout", "-q", "proj")
+    _git_out(repo, "cherry-pick", side)
+    commit("p 0.1.3", "0.1.3")
+    _git_out(repo, "checkout", "-q", start)
+    p.set_config("delivery.push_branch", "proj")
+    p.set_config("delivery.version_bump", {"files": ["plugins/p/.claude-plugin/plugin.json"]})
+    fps = {k: upstream.fingerprint(f"upstream: {k}", "s") for k in ("landed", "rebased", "pending", "none")}
+    landed = p.db.add_task("fix the note", "s", kind="code")
+    p.db.update_task(landed, status="done", result=json.dumps({"status": "done", "resolves": [fps["landed"]]}))
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated,landed_sha) "
+           "VALUES(?,'b',?,'proj','landed',?,?,?)", (landed, fix, time.time(), time.time(), fix))
+    rebased = p.db.add_task("fix another note", "s", kind="code", branch="ttp/t-side")
+    p.db.update_task(rebased, status="done", result=json.dumps({"status": "done", "resolves": [fps["rebased"]]}))
+    pending = p.db.add_task("fix a third note", "s", kind="code")
+    p.db.update_task(pending, status="running", result=json.dumps({"resolves": fps["pending"]}))
+
+    def resolve(fp, v, *extra):
+        rc = _upstream_cli(cli, "--resolve", fp, "--fixed-in", v, *extra)
+        out = capsys.readouterr()
+        return rc, out.out + out.err
+
+    # Refused: a version before the fix, a version no commit carries, a task that has not landed.
+    rc, out = resolve(fps["landed"], "0.1.1")
+    assert rc == 2 and upstream.resolution(fps["landed"]) is None
+    assert (f"refused: note {fps['landed']} is not fixed in 0.1.1: #{landed} fixes note {fps['landed']} but its "
+            f"landed commit {fix[:10]} (its push queue landing) is not in version 0.1.1 (its first commit ") in out
+    rc, out = resolve(fps["landed"], "v0.1.9")
+    assert rc == 2 and "is not in version 0.1.9 (no commit on refs/heads/proj carries it yet)" in out
+    rc, out = resolve(fps["pending"], "0.1.3")
+    assert rc == 2 and f"#{pending} fixes note {fps['pending']} but is not landed" in out
+    assert upstream.resolution(fps["pending"]) is None
+    rc, out = resolve(fps["rebased"], "0.1.2")
+    assert rc == 2 and f"landed commit {side[:10]} (its branch ttp/t-side) is not in version 0.1.2" in out
+    rc, out = resolve(fps["none"], "0.1.3", "--task", "99999")
+    assert rc == 2 and "no task #99999 in this project" in out and upstream.resolution(fps["none"]) is None
+    # Accepted: the version that carries it, a later one, a rebased copy of the task's commit.
+    for fp, v, tid in ((fps["landed"], "0.1.2", landed), (fps["landed"], "0.1.3", landed),
+                       (fps["rebased"], "0.1.3", rebased)):
+        rc, out = resolve(fp, v)
+        assert rc == 0 and f"version {v} checked: #{tid} (" in out and upstream.resolution(fp)["fixed_in"] == v
+    # Unchecked: no task lists the note; an explicit --task is checked like a listed one.
+    rc, out = resolve(fps["none"], "0.1.0")
+    assert rc == 0 and f"version 0.1.0 not checked: no task's hand-off lists note {fps['none']} in resolves" in out
+    rc, out = resolve(fps["none"], "0.1.1", "--task", str(landed))
+    assert rc == 2 and f"#{landed} fixes note" in out and upstream.resolution(fps["none"])["fixed_in"] == "0.1.0"
+    rc, out = resolve(fps["none"], "0.1.2", "--task", str(landed))
+    assert rc == 0 and upstream.resolution(fps["none"])["fixed_in"] == "0.1.2"
+    assert _upstream_cli(cli, "--resolve", fps["none"], "--wontfix", "r", "--task", str(landed)) == 2
+    # No version_bump: not checked, recorded as before.
+    p.set_config("delivery.version_bump", None)
+    rc, out = resolve(fps["pending"], "0.1.3")
+    assert rc == 0 and "version 0.1.3 not checked: delivery.version_bump is not set" in out
