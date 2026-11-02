@@ -2966,6 +2966,46 @@ def test_a_priority_1_check_starts_beside_routine_holders_only_with_headroom_and
         hold.close()
 
 
+def test_a_p1_check_takes_the_urgent_extra_lane_at_a_busy_load_while_checks_host_max_has_room(env, monkeypatch):
+    # #5201: three routine suites filled the lane and kept the load over the cores; the host-wide cap had
+    # room, yet the p1 waited 12 min because headroom() asked for a load under half the cores.
+    from ttp import checkcap, checklane, locks, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "3")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv(checkcap.LIVE_ENV, "0")
+    monkeypatch.setattr(checkcap, "_load", lambda: 90.0)
+    monkeypatch.setattr(checkcap, "cores", lambda: 64)
+    monkeypatch.setattr(checklane, "_mem_gib", lambda: 64.0)
+    kw = dict(repo=_LANE_REPO, slots=2, wait_s=0.3, headroom=checklane.headroom)
+    lanes = [testslots.suite_hold("pa", repo=_LANE_REPO, slots=2, priority=p, worktree=f"/w/r{p}") for p in (2, 3)]
+    host = [checkcap.acquire("pa routine", project_name="pa") for _ in range(2)]
+    try:
+        assert all(lanes) and all(host)
+        assert checklane.headroom(), "a free host-wide slot is room, whatever the load average"
+        assert testslots.suite_hold("pa", priority=2, worktree="/w/p2", **kw) is None, "a routine check waits"
+        told = []
+        g = testslots.suite_hold("pa", priority=1, worktree="/w/p1", tell=told.append, **kw)
+        assert g and "-x." in g.files[0].name and any("priority 1" in x for x in told), told
+        rec = locks.holder_records([Path(g.files[0].name)])[0]
+        assert rec.get("urgent") and "urgent extra lane" in checklane.holder_text(rec, time.time())
+        assert testslots.suite_hold("pa", priority=1, worktree="/w/p1b", **kw) is None, "one overflow per lane"
+        g.close()
+        host.append(checkcap.acquire("pa routine", project_name="pa"))   # checks.host_max reached
+        assert host[-1] and not checklane.headroom()
+        assert testslots.suite_hold("pa", priority=1, worktree="/w/p1", **kw) is None, "host_max full: p1 waits too"
+        monkeypatch.setenv(checkcap.LIVE_ENV, "1")
+        host.pop().close()
+        monkeypatch.setattr(checkcap, "free_cores", lambda: 0.0)
+        assert not checklane.headroom(), "no live cores for one more check"
+        monkeypatch.setenv(checkcap.LIVE_ENV, "0")
+        monkeypatch.setattr(checklane, "_mem_gib", lambda: 1.0)
+        assert not checklane.headroom(), "no memory for one more lane"
+    finally:
+        for x in lanes + host:
+            x and x.close()
+
+
 def test_ttp_checks_behind_checks_wrap_cmd_take_the_wrapper_lane_not_the_repository_lane(
         env, tmp_path, monkeypatch, capsys):
     from ttp import checkcap, cli, testslots

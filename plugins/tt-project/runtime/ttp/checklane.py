@@ -45,8 +45,9 @@ this cap times one run's grant (testslots.project_max), so every check under the
 a run counts against the cap only once its test slots are granted (testslots.project_held), so a run
 still waiting for them never keeps another from its turn. A lane under the cap goes to
 the most urgent waiter of the project (task priority, 1 first, then age: testslots.cap_turn). A
-priority-1 waiter whose lanes are held only by less urgent runs takes an overflow lane beside them while
-the host has room (headroom()), never beside a run in its own worktree (one suite per worktree).
+priority-1 waiter whose lanes are held only by less urgent runs takes the one overflow lane beside them while
+the host has room (headroom(): a free host-wide checks slot, live cores and memory for one run), never beside
+a run in its own worktree (one suite per worktree); lane lines and wait events mark that holder.
 
 Bounded wait (testslots.suite_hold). A lane whose holder process is gone, or whose heartbeat (the lane
 file's mtime, touched every HEARTBEAT_S by the holder) is older than HEARTBEAT_DEAD_S, is reclaimed and
@@ -442,9 +443,19 @@ def lane_argv(project_name: str, key: str, name: str = "", wait_s: float = LANE_
 
 
 def headroom() -> bool:
-    """Whether the host has room for a priority-1 run beside the lanes' holders: its 1-minute load
-    average is under half its cores."""
-    return checkcap._load() < checkcap.cores() / 2
+    """Whether the host has room for a priority-1 run beside the lanes' holders: the host-wide checks cap
+    (checks.host_max, with the slots load opens beyond it) has a free slot, the live free cores cover one
+    check (checkcap.cores_short) and the available memory one lane (GIB_PER_LANE). Never the load average
+    alone: the routine suites the run would start beside keep it high (#5201 waited 12 min first in line
+    at a load over the cores with host slots free)."""
+    n = checkcap.limit()
+    every = checkcap.all_paths(n)
+    if n and checkcap._room(n, every) <= 0:
+        return False
+    if checkcap.cores_short(every):
+        return False
+    m = _mem_gib()
+    return m is None or m >= GIB_PER_LANE
 
 
 def light_patterns(cfg: dict | None) -> list[list[str]]:
@@ -701,7 +712,8 @@ def holder_text(rec: dict, now: float) -> str:
     run = (f"running {mins(t['running_s'])}" if t["running_s"] is not None
            else f"has the lane {mins(t['held_s'])}, not running yet"
            + (f" (waiting for {rec['waits']})" if rec.get("waits") else ""))
-    return (f"{who}{f' {cmd!r}' if cmd else ''} queued {mins(t['queued_s'])}, {run}, "
+    over = " (priority-1 run in the urgent extra lane over the lane cap)" if rec.get("urgent") else ""
+    return (f"{who}{f' {cmd!r}' if cmd else ''}{over} queued {mins(t['queued_s'])}, {run}, "
             f"{_kids(t['children'], t['running_s'] is not None)}")
 
 
@@ -898,7 +910,7 @@ def lane_status(project_name: str, now: float | None = None, cfg: dict | None = 
                           "priority": r.get("priority"), "age_s": t["held_s"], "queued_s": t["queued_s"],
                           "alive": r.get("alive"), "children": t["children"],
                           "running_s": running, "cap_s": float(r.get("cap_s") or 0),
-                          "command": str(r.get("command") or ""), "overflow": bool(r.get("overflow")),
+                          "command": str(r.get("command") or ""), "overflow": bool(r.get("overflow")), "urgent": bool(r.get("urgent")),
                           "cost": r.get("cost") or {}, "why": _why(r.get("holder")), **_task_state(db, r),
                           **({} if running is not None else {"waits_on": _pid_queued(r.get("pid")) or "no host queue (starting, or an older runtime)"})})
         q = testslots.suite_order(project_name, _live_tickets(base), now, age=age)
@@ -1016,7 +1028,8 @@ def status_text(project_name: str, cfg: dict | None, here_repo: str = "", now: f
             why = f" for {h['why']}" if h.get("why") else ""
             ended = (f", its task is {h['task_status'].upper()} (the lane is reported, and its own detached checks "
                      f"stopped after checks.done_holder_grace_s)") if h.get("finished") else ""
-            lines.append(f"    holder{' (extra lane)' if h['overflow'] else ''}: {_who(h)}{why}, {alive}, "
+            extra = " (urgent extra lane, priority 1)" if h.get("urgent") else " (extra lane)" if h["overflow"] else ""
+            lines.append(f"    holder{extra}: {_who(h)}{why}, {alive}, "
                          f"queued {mins(h['queued_s'])}, held {mins(h['age_s'])}{run}, "
                          f"{_kids(h['children'], h['running_s'] is not None)}{ended}")
         if not r["lanes"]:

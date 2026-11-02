@@ -989,11 +989,13 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                             over = urgent and over_cap_room(project_name, cap)
                     elif cheaper or urgent:
                         if cap_turn(project_name, cap, ticket, slots, age=age):
-                            f = locks.try_take(extra_lanes, label, what, extra={**fields, "overflow": True})
+                            f = locks.try_take(extra_lanes, label, what,
+                                               extra={**fields, "overflow": True, **({"urgent": True} if urgent else {})})
                         else:
                             over = urgent and over_cap_room(project_name, cap)
                     if over:   # one priority-1 run at a time past the project's full cap
-                        f = locks.try_take(extra_lanes, label, what, extra={**fields, "overflow": True, "over_cap": True})
+                        f = locks.try_take(extra_lanes, label, what,
+                                           extra={**fields, "overflow": True, "over_cap": True, "urgent": True})
                     if f is not None and (cheaper or urgent) and "-x." in os.path.basename(f.name):
                         held_by = "; ".join(checklane.holder_text(r, time.time()) for r in pool[:3])
                         if tell and cheaper:
