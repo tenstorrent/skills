@@ -2836,6 +2836,9 @@ class Daemon:
                     # The chat provider's loopback bridge (chatbridge.py): where its key is, never the key.
                     # Its effort_fields follow the effort the run launches at, whatever Claude Code asks for.
                     **({"bridge": chatbridge.settings(self.cfg, tier, model, effort)} if provider == "chat" else {}),
+                    # A chat run that mostly sleep-polls is stalled too (runner.is_wait), so it falls back
+                    # within stall_s instead of running to its route timeout.
+                    **({"waits_idle": True} if provider == "chat" else {}),
                     # What a run without its own budget is priced at when it reports no usage.
                     "default_budget_usd": self.cfg["budget"].get("task_default_usd", {}).get(tier, 8.0),
                     "exclusive": [{"resource": res, "lock": locks.canonical(self.cfg, res),

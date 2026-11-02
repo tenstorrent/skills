@@ -1732,3 +1732,148 @@ def test_doctor_prints_worker_isolation_per_provider_and_the_coordinator_may_set
     assert coord.apply(p, [{"type": "config_set", "key": "providers.chat.worker_isolation", "value": "off"}]) == []
     assert p.raw_config()["providers"]["chat"]["worker_isolation"] is False
     assert "chat off" in line() and "(from claude)" not in line()
+
+
+# The stall limit on chat-route runs: a run that goes silent, or only sleep-polls between quick checks,
+# ends at stall_s and falls back once; the route timeout stays the hard cap.
+_WAIT_AGENT = r'''
+import json, sys, time
+mode, length = sys.argv[1], float(sys.argv[2])
+def w(**kw):
+    sys.stdout.write(json.dumps(kw) + "\n"); sys.stdout.flush()
+def call(i, command):
+    w(type="assistant", message={"content": [{"type": "tool_use", "id": i, "name": "Bash",
+                                              "input": {"command": command, "timeout": 600000}}]})
+def done(i):
+    w(type="user", message={"content": [{"type": "tool_result", "tool_use_id": i, "content": "ok"}]})
+w(type="system", subtype="init")
+end, n = time.time() + length, 0
+while time.time() < end:
+    n += 1
+    if mode == "silent":
+        time.sleep(length)
+    elif mode == "poll":      # a long sleep, then a quick look: what runs 8861, 9369 and 10130 did
+        call(f"w{n}", "sleep 590; ttp checks --result run-1")
+        time.sleep(0.4)
+        done(f"w{n}")
+        call(f"q{n}", "ps -p 1")
+        done(f"q{n}")
+    else:                     # real work that reports regularly
+        call(f"b{n}", "python3 -m pytest -q tests/a.py")
+        time.sleep(0.2)
+        done(f"b{n}")
+w(type="result", result="done")
+'''
+
+
+def _wait_run(tmp_path, mode, length, waits_idle=True, stall_s=2, timeout_s=60):
+    from ttp import runner
+    agent = tmp_path / "agent.py"
+    agent.write_text(_WAIT_AGENT)
+    run_dir = tmp_path / f"run-{mode}-{waits_idle}"
+    run_dir.mkdir()
+    (run_dir / "prompt.md").write_text("x")
+    (run_dir / "run.json").write_text(json.dumps({
+        "argv": [sys.executable, str(agent), mode, str(length)], "cwd": str(tmp_path), "provider": "fake",
+        "timeout_s": timeout_s, "stall_s": stall_s, **({"waits_idle": True} if waits_idle else {})}))
+    runner.supervise(run_dir)
+    return json.loads((run_dir / "exit.json").read_text())
+
+
+@pytest.mark.parametrize("mode", ["silent", "poll"])
+def test_a_chat_run_that_goes_silent_or_only_sleep_polls_ends_at_stall_s_and_falls_back_once(env, tmp_path, monkeypatch, mode):
+    from ttp import route
+    from ttp.daemon import Daemon
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.1")
+    info = _wait_run(tmp_path, mode, 120)
+    assert info["stopped"] == "stalled", info
+    assert info["ended"] - info["started"] < 20, "ended near stall_s (2 s), not at timeout_s (60 s)"
+    # The daemon books it as a fault of the route: one fallback to the core provider, same task, spec,
+    # tier and budget, then no more fallbacks for that task.
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    core = d.cfg.get("core_provider", "claude")
+    tid = p.db.add_task("build", "the spec", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    run, task = _route_finish(p, d, tid, {"rc": info["rc"], "stopped": info["stopped"],
+                                          "bridge": {"last_fault": "", "faults": {}}})
+    assert run["status"] == "fallback" and route.of(run["note"])["fallback"] == "timeout"
+    assert task["status"] == "queued" and int(task["attempts"] or 0) == 0
+    assert (task["title"], task["spec"], task["budget_usd"]) == ("build", "the spec", 8.0)
+    prov, tier, k = _dispatch_task(p, d, monkeypatch, tid)
+    assert (prov, tier) == (core, "light") and k["note"][route.KEY]["fallback"] == "rerun"
+    assert route.fell_back_before(p.db, tid) == run["id"]
+
+
+@pytest.mark.parametrize("mode,waits_idle", [("busy", True), ("poll", False)])
+def test_a_run_that_reports_regularly_or_is_not_a_chat_run_is_not_stalled_by_its_waits(env, tmp_path, monkeypatch,
+                                                                                      mode, waits_idle):
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.1")
+    info = _wait_run(tmp_path, mode, 5, waits_idle=waits_idle)
+    assert info["rc"] == 0 and not info.get("stopped"), info
+
+
+def test_only_a_chat_run_counts_its_waits_against_the_stall_limit(env, monkeypatch):
+    import subprocess as sp
+    from ttp.daemon import Daemon
+    real, started = sp.Popen, []
+
+    def popen(argv, *a, **k):   # the runner itself is not started: only its run.json is read
+        if list(argv[1:3]) == ["-m", "ttp.runner"]:
+            argv = [sys.executable, "-c", "pass"]
+        started.append(real(argv, *a, **k))
+        return started[-1]
+    monkeypatch.setattr(sp, "Popen", popen)
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    for prov, want in (("chat", True), ("fake", None)):
+        rid = d.start_run("worker", "go", prov, "light", str(p.root))
+        spec = json.loads((p.runs / str(rid) / "run.json").read_text())
+        assert spec.get("waits_idle") is want and spec["stall_s"] == d.cfg["budget"]["stall_s"]["light"], spec
+    for proc in started:
+        proc.wait(timeout=30)
+
+
+@pytest.mark.parametrize("command,wait", [
+    ("sleep 590; ttp checks --result /x", True),
+    ("sleep 30", True),
+    ("sleep 5m && ps", True),
+    ("x=1; sleep 1.5h", True),
+    ("timeout 550 bash -c 'while true; do ttp checks --result /x && exit 0; sleep 25; done'", True),
+    ("for i in 1 2 3; do ps -e | wc -l; sleep 20; done", True),
+    ("until test -e /x; do sleep 5; done", True),
+    ("python3 -c 'import time; time.sleep(600)'", True),
+    ("sleep 5; ls", False),                       # a short pause is no wait
+    ("python3 -m pytest -q -k sleep tests/a.py", False),
+    ("grep -n sleep_s runner.py; echo sleep", False),
+    ("ttp hours --sleep 600", False),             # an option, not the command
+    ("ls; nosleep 600", False),
+    ("for f in a b; do cat $f; done", False),     # a loop without a sleep
+    (None, False), (42, False),
+])
+def test_is_wait_tells_waits_from_work(command, wait):
+    from ttp import runner
+    assert runner.is_wait(command) is wait
+
+
+def test_waited_counts_overlapping_and_open_waits_once_within_the_window(tmp_path):
+    from ttp import runner
+    out = tmp_path / "output.jsonl"
+    ev = lambda **kw: json.dumps(kw) + "\n"
+    use = lambda i, c: ev(type="assistant", message={"content": [{"type": "tool_use", "id": i, "input": {"command": c}}]})
+    res = lambda i: ev(type="user", message={"content": [{"type": "tool_result", "tool_use_id": i}]})
+    out.write_text(use("a", "sleep 300") + use("b", "sleep 400"))   # two waits side by side
+    w = runner.ProgressWatch(out, tmp_path)
+    w.poll(100.0)
+    assert w.waited(150.0, 900) == 50.0, "open waits run until now, counted once"
+    with open(out, "a") as f:
+        f.write(res("a"))
+    w.poll(400.0)
+    with open(out, "a") as f:
+        f.write(res("b") + use("c", "ls") + res("c"))
+    w.poll(500.0)
+    assert w.waited(500.0, 900) == 400.0
+    assert w.waited(1300.0, 900) == 100.0, "only the part inside the window"
+    assert w.waited(1500.0, 900) == 0.0 and w.waits == [], "old waits are dropped"

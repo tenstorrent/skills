@@ -14,7 +14,9 @@
 - ends a run whose agent has produced no progress (assistant message, tool result, streamed
   thinking or progress note) for stall_s, or longer while a tool call that set its own timeout is
   pending: the tool_progress heartbeats and retry notices Claude Code writes while a call hangs on a
-  network stall are not progress;
+  network stall are not progress; in a run whose spec sets `waits_idle` (a chat-route run), wait calls
+  (a long sleep or a polling loop, is_wait) filling WAIT_SHARE of the last stall_s also end it, so a run
+  that only sleep-polls between quick checks stalls too;
 - enforces the run's dollar budget mid-flight when the provider streams usage;
 - ends the child when <run_dir>/STOP appears (a cancel, or `ttp stop --kill` writing "shutdown") or
   the run dir is deleted, and never starts it when the STOP came first;
@@ -42,6 +44,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -66,6 +69,7 @@ BUDGET_EVERY_S = 10
 INSTRUCTIONS_EVERY_S = 5
 ROLLOUT_WAIT_S = 120
 TOOL_GRACE_S = 60     # past a pending tool call's own timeout before its silence counts as a stall
+WAIT_SHARE = 0.9      # waits_idle: this share of stall_s spent in wait calls is a stall
 SLEEP_GAP_S = 600     # polls are POLL_S apart: a gap this long between two can only be a host sleep
 PDEATHSIG = sys.platform.startswith("linux")   # the kernel also signals the agent itself if the runner dies
 PR_SET_PDEATHSIG = 1
@@ -467,6 +471,7 @@ def supervise(run_dir: Path) -> int:
         inst["prov"] = prov
         st = {"lease": 0.0, "budget": 0.0, "active": 0.0}
         progress = ProgressWatch(out_path, run_dir)
+        waits_idle = bool(spec.get("waits_idle"))
 
         def look() -> None:
             now, up = time.time(), awake.tick()
@@ -481,9 +486,10 @@ def supervise(run_dir: Path) -> int:
             if stall_s:
                 # Stalled = no assistant message, tool result or progress note for stall_s of awake
                 # time, or for a pending tool call's own timeout (plus grace) when that is longer.
-                if progress.poll():
+                if progress.poll(up):
                     st["active"] = up
-                elif up - st["active"] > progress.limit(stall_s):
+                if up - st["active"] > progress.limit(stall_s) or (
+                        waits_idle and progress.waited(up, stall_s) >= WAIT_SHARE * stall_s):
                     threading.Thread(target=stop, args=("stalled",), daemon=True).start()
             if budget is not None and now - st["budget"] >= BUDGET_EVERY_S:
                 st["budget"] = now
@@ -639,6 +645,18 @@ def _niceness(pid: int) -> int | None:
 # rate limit notices. Of system events only streamed thinking is model output (not retries, hooks).
 NOISE_TYPES = ("tool_progress", "rate_limit_event", "keep_alive")
 SYSTEM_PROGRESS = ("thinking_tokens",)
+WAIT_MIN_S = 30   # a sleep this long or longer makes a command a wait (is_wait)
+_SLEEP = re.compile(r"(?<![\w.-])sleep\s+(\d+(?:\.\d+)?)([smhd]?)(?![\w.])|time\.sleep\(\s*(\d+(?:\.\d+)?)")
+_LOOP = re.compile(r"(?<![\w.-])(?:while|until|for)\b[^\n]*?(?:;|\n)\s*do\b")
+_UNIT = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def is_wait(command) -> bool:
+    """Whether a shell command only waits: a sleep of WAIT_MIN_S or more, or a loop that sleeps (a poll)."""
+    if not isinstance(command, str):
+        return False
+    sleeps = [float(a or c) * _UNIT[u] for a, u, c in _SLEEP.findall(command)]
+    return bool(sleeps) and (max(sleeps) >= WAIT_MIN_S or bool(_LOOP.search(command)))
 
 
 class AwakeClock:
@@ -666,13 +684,17 @@ class ProgressWatch:
     """Reads the agent's stream as it grows and tells whether it made progress since the last look:
     an assistant message, a tool result, streamed thinking or a new progress note. Lines that are not
     JSON, and event types it does not know (other providers), count as progress. It also tracks the
-    tool calls still waiting for their result and the timeouts they set themselves."""
+    tool calls still waiting for their result and the timeouts they set themselves, and, given the
+    awake time of each poll, when its wait calls (is_wait) ran."""
 
     def __init__(self, out_path: Path, run_dir: Path):
         self.out_path, self.note_path = out_path, run_dir / "progress.md"
         self.offset, self.partial = 0, b""
         self.note = self._note_mark()
         self.pending: dict[str, float] = {}   # tool_use id -> its own timeout in seconds (0 = none)
+        self.up: float | None = None          # the awake time of this poll
+        self.open_waits: dict[str, float] = {}   # wait call id -> when it started
+        self.waits: list[tuple[float, float]] = []   # (start, end) of finished wait calls
 
     def _note_mark(self):
         try:
@@ -681,7 +703,8 @@ class ProgressWatch:
         except OSError:
             return None
 
-    def poll(self) -> bool:
+    def poll(self, up: float | None = None) -> bool:
+        self.up = up
         moved = False
         note = self._note_mark()
         if note != self.note:
@@ -699,6 +722,18 @@ class ProgressWatch:
             if line.strip() and self._event(line):
                 moved = True
         return moved
+
+    def waited(self, up: float, window: float) -> float:
+        """Seconds of the last `window` of awake time that wait calls ran (overlaps count once)."""
+        since = up - window
+        self.waits = [w for w in self.waits if w[1] > since]
+        spans = sorted([*self.waits, *((s, up) for s in self.open_waits.values())])
+        total, reach = 0.0, since
+        for s, e in spans:
+            s = max(s, reach)
+            if e > s:
+                total, reach = total + e - s, e
+        return total
 
     def limit(self, stall_s: float) -> float:
         """How long silence may last now: stall_s, or a pending call's own timeout plus grace."""
@@ -729,8 +764,13 @@ class ProgressWatch:
                 except (TypeError, ValueError):
                     own = 0.0
                 self.pending[block["id"]] = own
+                if self.up is not None and is_wait(inp.get("command")):
+                    self.open_waits[block["id"]] = self.up
             elif block.get("type") == "tool_result":
                 self.pending.pop(block.get("tool_use_id"), None)
+                start = self.open_waits.pop(block.get("tool_use_id"), None)
+                if start is not None:
+                    self.waits.append((start, self.up))
         return True
 
 

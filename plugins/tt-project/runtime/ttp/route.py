@@ -15,7 +15,9 @@ Effort: a routed run runs at its tier's `providers.chat.tiers.<tier>.effort`, an
 the fields `providers.chat.effort_fields` gives its model at that effort; config_problems names a
 routed tier whose requests would carry none. Time limit: `providers.chat.tiers.<tier>.route_timeout_s`
 replaces the tier's budget.run_timeout_s for its routed runs (timeout_s); a fallback start on the core
-provider keeps the tier default.
+provider keeps the tier default. Within it, the tier's budget.stall_s ends a chat run that goes silent or
+spends most of its last stall_s in wait calls (runner.is_wait: long sleeps, polling loops), and it falls
+back like a timeout.
 
 Slots: a routed start takes a worker slot under the routed-to provider's gate (its max_parallel,
 allow_new_work, pause and net hold), never the core provider's, and one of the host's slots for that
