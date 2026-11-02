@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""The tier floor for conclusion runs: a run whose output is a conclusion the user reads never runs on
+r"""The tier floor for conclusion runs: a run whose output is a conclusion the user reads never runs on
 the light tier or below high effort.
 
 Model-free, applied at each start after the effort pick (effort.py: Jev's or the rules' pick, a retry's
