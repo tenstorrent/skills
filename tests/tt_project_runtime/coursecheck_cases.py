@@ -290,3 +290,52 @@ def test_superseded_on_a_cancelled_class_fix_refuses_open_failed_foreign_unknown
     assert _cc_task(p, "superseded", str(done), f"#{open_fix}") not in (0, None)
     assert p.db.q("SELECT * FROM task_class_fix") == []
     assert "class is recorded" not in capsys.readouterr().out
+
+
+def test_a_correction_followed_only_by_a_report_only_llm_schedule_keeps_its_line_open(env):
+    """A correction whose only follow-up is an llm schedule citing it (or its fix task) keeps a line naming
+    the missing model-free gate; a command schedule, a done harness or code task citing it (not the fix task
+    or a schedule run), or a recorded later fix closes it; an uncited llm schedule is no follow-up."""
+    from ttp import correction, schedule as sched
+    p = make(env)
+    now = time.time()
+    fix = p.db.add_task("harness: watch for the missed case", "s", kind="harness", origin="coordinator")
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (fix,))
+    p.db.set_kv(correction.KEY, [{"msg": 10, "ts": now - 7200, "why": "phrase", "class": ["#42"],
+                                  "fix": f"#{fix}", "shown": True}])
+    sched.upsert(p.db, "daily-audit", "llm", "1d", None, True, None, "audits the project", {"spec": "report"})
+    assert _cc(p, now)[0] == []   # cites neither: no follow-up of this correction
+    sched.upsert(p.db, "missed-case-watch", "llm", "1h", None, True, None, f"watch for #{fix}'s case",
+                 {"spec": "report what you see"})
+    lines, ident = _cc(p, now)
+    assert len(lines) == 1 and "report-only follow-up: correction #10 (fix #" in lines[0], lines
+    assert "missed-case-watch" in lines[0] and "model-free gate" in lines[0] and "command schedule" in lines[0]
+    assert "detector with a test" in lines[0] and ident == "report_only:10"
+    sched.upsert(p.db, "missed-case-watch", "llm", "1h", None, True, None, "w",
+                 {"spec": "check what correction #10 asked for"})
+    assert "report-only follow-up" in _cc(p, now)[0][0]   # cited by the correction id too
+    # Not gates: a schedule's own run, the fix task itself, an open task, a task of another kind.
+    run = p.db.add_task("[missed-case-watch] w", "correction #10", kind="harness", origin="schedule")
+    other = p.db.add_task("look into correction #10", "s", kind="work", origin="coordinator")
+    open_ = p.db.add_task("harness: detector for correction #10", "s", kind="harness", origin="coordinator")
+    p.db.x(f"UPDATE tasks SET status='done' WHERE id IN ({run},{other})")
+    p.db.x("UPDATE tasks SET spec='correction #10' WHERE id=?", (fix,))
+    assert "report-only follow-up" in _cc(p, now)[0][0]
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (open_,))   # a done detector task closes it
+    assert _cc(p, now)[0] == []
+    p.db.x("UPDATE tasks SET status='queued' WHERE id=?", (open_,))
+    sched.upsert(p.db, "missed-case-check", "command", "1h", None, True, None, "gate for correction #10",
+                 {"command": "true"})
+    assert _cc(p, now)[0] == []   # a command schedule closes it
+    sched.set_enabled(p.db, "missed-case-check", False)
+    assert "report-only follow-up" in _cc(p, now)[0][0]   # an off gate checks nothing
+    p.db.x("UPDATE tasks SET status='cancelled' WHERE id=?", (fix,))
+    later = p.db.add_task("harness: the detector", "s", kind="harness", origin="coordinator")
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (later,))
+    assert _cc_task(p, "superseded", str(fix), f"#{later}") == 0
+    assert _cc(p, now)[0] == []   # a recorded later fix closes it
+    cfg = p.config()
+    cfg.setdefault("coordinator", {}).setdefault("course_check", {})["recurring"] = 0
+    p.db.x("DELETE FROM task_class_fix")
+    from ttp import coursecheck, push
+    assert coursecheck.lines(p.db, cfg, p.state / push.DETACHED, now)[0] == []   # 0 turns it off

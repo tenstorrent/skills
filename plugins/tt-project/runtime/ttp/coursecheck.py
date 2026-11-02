@@ -22,6 +22,11 @@ so an idle project's digest does not grow. Each reuses a signal the harness alre
   the mistake the project recorded a fix for happened again.
   A cancelled fix task whose class's later fix is recorded (`ttp task superseded <id> <task|sha>`) and
   still done counts as fixed.
+- report_only: a correction whose only follow-up is report-only: every enabled schedule citing it
+  (`correction #<msg>`) or its fix task (`#<id>`) in its description or payload is an llm schedule, and no
+  model-free gate checks that the reported action followed: no command or watcher schedule citing it, no
+  done `harness` or `code` task citing it (not the fix task, not a schedule's own run), no recorded later
+  fix. Its line stays open until one of those exists. Under the `recurring` key.
 
 `coordinator.course_check` keys of the same names set the thresholds (0 turns one off)."""
 from __future__ import annotations
@@ -231,6 +236,34 @@ def recurring(db: DB, at: float) -> list[dict]:
     return out
 
 
+GATE_KINDS = ("harness", "code")   # a done task of these kinds citing the correction is its model-free gate
+
+
+def report_only(db: DB, at: float) -> list[dict]:
+    if not at:
+        return []
+    from . import correction
+    scheds = db.q("SELECT name, kind, description, payload FROM schedules WHERE enabled=1")
+    if not scheds:
+        return []
+    out = []
+    for r in correction._records(db):
+        msg, fix = int(r["msg"]), str(r.get("fix") or "")
+        tid = int(fix[1:]) if fix[:1] == "#" and fix[1:].isdigit() else None
+        if tid is not None and correction.fixed_by(db, tid):
+            continue
+        cite = re.compile(rf"\bcorrection\s*#?{msg}\b" + (rf"|(?<![\w#])#{tid}\b" if tid is not None else ""), re.I)
+        linked = [s for s in scheds if cite.search(f"{s['description'] or ''} {s['payload'] or ''}")]
+        if not linked or any(s["kind"] != "llm" for s in linked):
+            continue
+        gates = db.q(f"SELECT id, title, spec FROM tasks WHERE status='done' AND origin<>'schedule' AND created>=? "
+                     f"AND kind IN ({','.join('?' * len(GATE_KINDS))})", (float(r.get("ts") or 0), *GATE_KINDS))
+        if any(g["id"] != tid and cite.search(f"{g['title']} {g['spec']}") for g in gates):
+            continue
+        out.append({"msg": msg, "fix": fix if tid is not None else "", "scheds": sorted(s["name"] for s in linked)})
+    return out
+
+
 def _relinked(db: DB, fix: str) -> bool:
     """Fix task `fix` ('#<id>') was cancelled and its class's later fix is recorded and holds
     (`ttp task superseded`, correction.link_fix)."""
@@ -295,4 +328,11 @@ def lines(db: DB, cfg: dict | None, pushes: Path | None = None, now: float | Non
                    f"#{r['prior']}, whose fix {r['fix']} did not hold | find why the fix missed this case and fix "
                    "that in a task this turn")
         ident.append(f"recurring:{r['msg']}")
+    for r in safe(report_only, db, s["recurring"]):
+        out.append(f"- report-only follow-up: correction #{r['msg']}{' (fix ' + r['fix'] + ')' if r['fix'] else ''} is "
+                   f"followed only by llm schedule{'s' if len(r['scheds']) > 1 else ''} {', '.join(r['scheds'][:3])}, "
+                   "whose reports queue nothing and alert no one | missing a model-free gate that checks the action "
+                   f"followed: a command schedule, or a `harness` task citing correction #{r['msg']} that adds a "
+                   "detector with a test")
+        ident.append(f"report_only:{r['msg']}")
     return out[:MAX_LINES], "\n".join(ident)
