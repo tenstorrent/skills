@@ -51,6 +51,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     ends,
     failover,
     forbidden,
+    gitmemo,
     heal,
     hostcycle,
     jevuse,
@@ -1791,15 +1792,24 @@ def _file_overlaps(p: Project, kind: str, spec: str, skip: set) -> list[dict]:
 
 
 def _overlap_chain(p: Project, kind: str, spec: str, clash: list[dict], roots: set[int] = frozenset(),
-                   skip: set = frozenset()) -> tuple[int, str] | None:
+                   skip: set = frozenset(), labels: list[str] = ()) -> tuple[int, str] | None:
     """The open or unlanded task a new code task needs the new file or symbol of (overlap.chain), never
     one in or waiting on the lineage of `roots` (the tasks it continues, follows or carries) or in
-    `skip`; a shared file alone never chains, and a fault reading the base leaves the warning only."""
+    `skip`, nor one whose file, symbol or head the commit it starts from has (worktree.start_head of its
+    spec and `labels`: continues:, pr_branch:, rebases:); a shared file alone never chains, and a fault
+    reading the base leaves the warning only."""
     try:
         if kind not in file_overlap.KINDS or not file_overlap.settings(p).get("enabled", True):
             return None
         lineage = set(roots) | {t["id"] for r in roots for t in chaincap.chain(p.db, r)}
-        return file_overlap.chain(p, clash, spec, lineage=lineage, skip=skip)
+        t = {"id": None, "kind": kind, "spec": spec, "labels": json.dumps(list(labels))}
+        from .lanewait import START_FROM, label_value
+        key = (continues_id(t), worktree.delivery_branch(t), label_value(t, START_FROM))
+        try:   # unreadable: judged against the base alone, as for a fresh task
+            start = gitmemo.cached(("overlap.start", *key), lambda: worktree.start_head(p, t)) if any(key) else None
+        except Exception:
+            start = None
+        return file_overlap.chain(p, clash, spec, lineage=lineage, skip=skip, start=start)
     except Exception:
         return None
 
@@ -2230,7 +2240,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 why_after = start_why(a, {}, when)
                 roots = {int(a["continues"])} if a.get("continues") is not None else set()
                 roots |= {t["id"] for t in (old, followup, carried and carried[0]) if t}
-                tie = _overlap_chain(p, kind, a.get("spec") or "", clash, roots, {old["id"]} if old else set())
+                tie = _overlap_chain(p, kind, a.get("spec") or "", clash, roots, {old["id"]} if old else set(), labels)
                 landing = landed.can_check(p)
                 if parallel := file_overlap.PARALLEL.search(a.get("spec") or ""):   # a no-op kept for old specs
                     labels.append(file_overlap.PARALLEL_LABEL + clip(parallel.group(1), START_WHY_CHARS))

@@ -483,15 +483,23 @@ def _has(p, ref: str, sym: str) -> bool | None:
     return gitmemo.cached(("overlap.has", ref, sym), read)
 
 
+def _contains(p, head: str, ref: str) -> bool:
+    """Whether `ref` has commit `head` (git merge-base --is-ancestor); read once per pair within a gitmemo scope."""
+    return gitmemo.cached(("overlap.contains", head, ref), lambda: _git(
+        p.root, "merge-base", "--is-ancestor", head, ref).returncode == 0)
+
+
 def chain(p, hits: list[dict], spec: str = "", now: float | None = None, lineage: set[int] | None = None,
-          skip=()) -> tuple[int, str] | None:
+          skip=(), start: str | None = None) -> tuple[int, str] | None:
     """(id, why) of the newest open or unlanded task the new one needs the work of: a path the new
     spec shares with it (`hits`, find) that is not on the base branch yet and that task adds (its
     branch adds it; with no branch, its folder or top folder is on the base), or a
     symbol the spec names (symbols) that the base lacks and that task's branch has. None otherwise: a
     shared file alone never chains. A task in the new one's `lineage`, or waiting on it (waits_on),
     is passed over: its work lands only with the new task's. An exempt one (exempt) is passed over too,
-    and so is everything when the base cannot be read."""
+    and so is everything when the base cannot be read. `start` is the commit the new task starts from
+    when it is not the base (worktree.start_head: the branch it carries or rebases, or the head of the
+    task it continues): a file or symbol it has, or a task whose head it contains, needs no wait."""
     from . import worktree
     landed = _landed_ids(p.db)
 
@@ -519,13 +527,20 @@ def chain(p, hits: list[dict], spec: str = "", now: float | None = None, lineage
         if h.get("head"):
             return new
         return f.rsplit("/", 1)[0] in dirs or f.split("/", 1)[0] in tops
+    mine = base_files(p, start) if start else []
+
+    def built_on(head: str | None) -> bool:
+        return bool(start and head and _contains(p, head, start))
     for h in shown:   # the most recent first
-        if f := next((f for f, new in h["paths"] if adds(h, f, new)), None):
+        if built_on(h.get("head")):
+            continue
+        if f := next((f for f, new in h["paths"] if adds(h, f, new) and not any(same(f, x) for x in mine)), None):
             return h["id"], f"it needs {f}, which #{h['id']} adds (not on the base branch yet)"
-    syms = [s for s in syms if _has(p, base, s) is False]
+    syms = [s for s in syms if _has(p, base, s) is False and not (start and _has(p, start, s))]
     if syms:
         for b in sorted(branches(p, skip), key=lambda b: -b["id"]):
-            if ok(b["id"], b["open"]) and (s := next((s for s in syms if _has(p, b["head"], s)), None)) \
+            if ok(b["id"], b["open"]) and not built_on(b["head"]) \
+                    and (s := next((s for s in syms if _has(p, b["head"], s)), None)) \
                     and not _on_push_branch(p, b, []):
                 return b["id"], f"it needs {s}, which only #{b['id']}'s branch has"
     return None

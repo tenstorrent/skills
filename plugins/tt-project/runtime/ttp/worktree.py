@@ -984,6 +984,15 @@ def carried_head(p: Project, task: dict) -> str | None:
     return None
 
 
+def start_head(p: Project, task: dict) -> str | None:
+    """The commit a new worktree of `task` starts from (_create's order), None for the base: the branch
+    it rebases, or carries when no other task shares it (_shared_branches), else the head of the task it
+    continues, else its carried branch, else its early start. Local refs only: no fetch, no worktree list."""
+    named, rebase = delivery_branch(task) or ("", False)
+    first = carried_head(p, task) if rebase or (named and named not in _shared_branches(p)) else None
+    return first or continued_head(p, task) or carried_head(p, task) or early_head(p, task)
+
+
 def early_head(p: Project, task: dict) -> str | None:
     """The approved head of the change a task started on before it landed (lanewait.START_FROM), when
     it resolves here; else None (the base)."""

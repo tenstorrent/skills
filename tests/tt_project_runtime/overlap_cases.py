@@ -351,6 +351,53 @@ def test_task_add_chains_only_on_a_new_file_or_symbol_of_another_task(env):
         "bc_d", "retry_twice", "foo_bar"]
 
 
+def test_task_add_checks_the_branch_a_task_starts_from_before_chaining_on_a_new_file_or_symbol(env):
+    """A continue hop was chained on landed:#X for a file the base lacked, though the branch it starts
+    from (its predecessor's, built on X's head) had it. The chain looks at the commit the task starts
+    from: a continue of a task whose branch has the file or symbol, or a pr_branch task whose branch
+    contains X's head, gets no chain; a fresh task off the base still waits for X."""
+    from ttp import coordinator as coord
+    from ttp.db import deferral
+
+    def git(*args):
+        return subprocess.run(["git", "-C", str(p.root), *args], check=True, capture_output=True,
+                              text=True).stdout.strip()
+    p = make(env)
+    p.set_config("delivery.landed_probe", "test -e landed/{id}")
+    _on_base(p, "runtime/ttp/relay.py")
+    maker = p.db.add_task("maker", "Add a stall detector.", kind="code", status="running")
+    mk_branch = f"ttp/t{maker}-stall"
+    mk_head = _branch_adding(p, mk_branch, {"runtime/ttp/stall.py": "def stall_check(x):\n    return x\n"})
+    p.db.update_task(maker, branch=mk_branch)
+    spec = "Call `stall_check()` from runtime/ttp/stall.py in the sweep."
+
+    def add(title, spec, **kw):
+        assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec, **kw}]) == []
+        return p.db.one("SELECT * FROM tasks WHERE title=?", (title,))
+    # (b) A fresh task off the base still waits for the maker.
+    t = add("fresh user", spec)
+    assert deferral(t)["when"] == f"landed:#{maker}", deferral(t)
+    p.db.update_task(t["id"], status="cancelled")
+    # (a) A continue of a split task whose own branch has the file and the symbol (added on its own).
+    prev = p.db.add_task("prev", "Wire the sweep.", kind="code", status="running")
+    pv_branch = f"ttp/t{prev}-sweep"
+    pv_head = _branch_adding(p, pv_branch, {"runtime/ttp/stall.py": "def stall_check(x):\n    return 0\n"})
+    p.db.update_task(prev, status="done", branch=pv_branch, labels=json.dumps([f"split:{pv_head}"]))
+    t = add("continue: wire the sweep", spec, continues=prev)
+    assert f"continues:{prev}" in json.loads(t["labels"]) and not deferral(t), (t["labels"], deferral(t))
+    for tid in (t["id"], prev):   # prev's branch adds the file too, and the carried branch below lacks it
+        p.db.update_task(tid, status="cancelled")
+    # (c) A pr_branch task whose branch is built on the maker's head (and has since moved the file).
+    git("checkout", "-q", "-b", "feature/carry", mk_head)
+    git("mv", "runtime/ttp/stall.py", "runtime/ttp/stalls.py")
+    git("commit", "-q", "-m", "move")
+    git("checkout", "-q", "-")
+    t = add("carried user", "Call the detector in runtime/ttp/stall.py from the sweep.\npr_branch: feature/carry")
+    assert "pr_branch:feature/carry" in json.loads(t["labels"]) and not deferral(t), (t["labels"], deferral(t))
+    t = add("carried symbol user", "Wrap the sweep in `stall_check()`.\npr_branch: feature/carry")
+    assert not deferral(t), deferral(t)
+
+
 def test_task_add_never_chains_on_a_shared_path_outside_the_repo(env):
     """Paths two specs share that are no repo file (a run dir, harness state, another repo's file)
     are missing from the base but no task adds them: no chain."""

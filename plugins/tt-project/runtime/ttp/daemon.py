@@ -4400,7 +4400,8 @@ class Daemon:
                             if chaincap.CONT_TITLE.match(str(f.get("title") or "")) else f["spec"]
                         for skip in (set(), {task["id"]}):   # a done task's follow-up, a split's hop
                             clash = coord._file_overlaps(self.p, "code", spec, skip)
-                            coord._overlap_chain(self.p, "code", spec, clash, {task["id"]}, skip)
+                            coord._overlap_chain(self.p, "code", spec, clash, {task["id"]}, skip,
+                                                 [f"continues:{task['id']}"])
                 pushq.prefetch_git(self.p, task, result, self.cfg)
         except Exception as e:
             log(self.p, f"task {task['id']}: reading git before finishing failed: {type(e).__name__}: {e}")
