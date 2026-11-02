@@ -1069,7 +1069,11 @@ queues behind routine work; nothing running is interrupted:
   `[ "$TTP_PUSH_MODE" != target ] || ...`. `ttp push --own` may instead reuse a
   `ttp checks` pass recorded on exactly HEAD's tree (run with mode `checks` and an empty tip), so
   logic that only runs in mode `own`, or that depends on `TTP_PUSH_TIP`, cannot count on running
-  there; the push queue (`target`) always runs its checks.
+  there; the push queue (`target`) always runs its checks. In the other direction, `ttp checks` may
+  reuse a push-queue pass of a plain pytest check for the same tree, command and environment:
+  that pass ran in mode `target` with that batch's tip, not `checks` with an empty tip.
+  `env_id` does not cover CHECK_ENV_VARS (`PYTEST_ADDOPTS` and similar), so a reused
+  push-queue pass ran under the daemon's values of those variables.
 - `ttp checks` runs, and the checks of `ttp push` and the push queue, share a host-wide cap, across
   every project on the machine: each takes one of
   a few slots under `~/.tt-project/check-slots` before its commands run, and a run over the cap
