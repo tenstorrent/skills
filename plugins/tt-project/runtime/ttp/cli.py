@@ -2421,8 +2421,8 @@ def _recorded_pass(p: Project | None, tree: str, cmds: list, purpose: str = "can
 
 def _suite_pass(p: Project | None, tree: str, cmd, purpose: str, env: str | None) -> dict | None:
     """The suite pass of the one command `cmd` on `tree` for `purpose` under its environment `env`
-    (pushpass.check_envs), or None: recorded the moment it passed in a call cut off later (in the rerun
-    of the added tests, or at a later command), so the next call runs it no more. Only cmd_checks reads
+    (pushpass.check_envs), or None: recorded once every check of a call passed, before its rerun of the
+    added tests, so a call cut off in that rerun leaves it and the next call runs the check no more. Only cmd_checks reads
     it, per command; it is never a pass of a call (_recorded_pass). A suite pass without an
     environment never counts."""
     if not p or not tree or not env:
@@ -2666,10 +2666,10 @@ def cmd_checks(a) -> None:
     Once they passed, the tests the head adds compared with the push target (addedtests) run again,
     ROUNDS times each, through the first check that is one plain local pytest run: one that fails a
     round fails the checks, named with its pass count; past a cap the rerun is reported skipped,
-    never passed. With no added tests nothing more runs. Each check's own pass is recorded the moment it
-    passes, as a suite pass (_suite_pass): a call cut off later (in that rerun, at a later check) is no
-    pass, but the next call on the same tree runs no check again that passed there under the same
-    environment, only the rest and the rerun. The call's pass is recorded only once all of it passed.
+    never passed. With no added tests nothing more runs. Before that rerun starts, each check's pass is
+    recorded as a suite pass (_suite_pass): a call cut off or failed in the rerun is no pass, but the next
+    call on the same tree runs no check again that passed there under the same environment, only the
+    rerun. The call's pass is recorded only once all of it passed.
 
     `--detach` runs them in a session of their own that writes checks.rc in the run's directory
     however it ends, and prints a `--result` probe for `retry_when` that also answers once they were
@@ -3084,8 +3084,8 @@ def cmd_checks(a) -> None:
                                     if last.get("silent_s") else "at the wall-time cap") + ": a timeout, not a pass")
                     print(f"ttp checks: {said_last}", flush=True)
                     out.write(f"ttp checks: {said_last}\n")
-            # Each check's pass is recorded as it passes (a suite pass): a call cut off later, in the rerun
-            # of the added tests or at a later check, leaves it, and the next call runs it no more.
+            # Once they all passed, each check's pass is recorded before the rerun of the added tests (a
+            # suite pass): a call cut off in that rerun leaves them, and the next call runs only the rerun.
             if todo and passed and not (hit or handover):
                 run_envs, run_parts = _check_envs(top, todo, run_env)
             for c in [] if hit or handover or not passed else todo:
@@ -3094,7 +3094,7 @@ def cmd_checks(a) -> None:
                 if not a.fresh and (prior := _suite_pass(p, tree, c, purpose, run_envs[n] if run_envs else None)):
                     reused.append(c)
                     line = (f"{c} passed on {tree[:12]} in run {prior.get('run') or '?'} at "
-                            f"{timefmt.long(float(prior.get('ts') or 0), p)} in a call cut off after it (recorded); "
+                            f"{timefmt.long(float(prior.get('ts') or 0), p)} before the rerun of the added tests (recorded); "
                             "not run again, --fresh runs it")
                     print(f"ttp checks: {line}", flush=True)
                     out.write(f"ttp checks: {line}\n")
@@ -3154,11 +3154,12 @@ def cmd_checks(a) -> None:
                     out.write(_check_took(c, rc, began))
                     break
                 out.write(_check_took(c, rc, began))
-                if run_envs and run_parts:
-                    _record_pass(p, tree, [c], purpose, run_dir, [run_envs[n]], [run_parts[n]], suite=True)
             # The tests the diff adds, once more several times each: a timing-flaky one fails here.
             py_check = next((c for c in executed if not push.remote_host(c) and addedtests.eligible(str(c))), None)
             if passed and py_check is not None and (new_tests := addedtests.added(top, base, head)):
+                for n, c in enumerate(todo if run_envs and run_parts else []):
+                    if c not in reused:
+                        _record_pass(p, tree, [c], purpose, run_dir, [run_envs[n]], [run_parts[n]], suite=True)
                 cwd = top if _in_place(py_check) else str(clean.path)
                 tmp_fd = bool(getattr(a, "own_group", False)) and getattr(a, "tmp_fd", None) is not None
                 env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), **child_env,

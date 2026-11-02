@@ -139,7 +139,7 @@ def test_ttp_checks_cut_off_in_the_added_tests_rerun_keeps_the_suite_pass_and_re
                         lambda *a, **k: {"status": "failed", "why": "x", "rc": 1, "tests": [], "rounds": 5})
     with pytest.raises(SystemExit):
         cli.main(["checks", "--", _ADDED_CHECK])
-    assert runs() == 1 and "in a call cut off after it (recorded); not run again" in capsys.readouterr().out
+    assert runs() == 1 and "before the rerun of the added tests (recorded); not run again" in capsys.readouterr().out
     assert cli._recorded_pass(p, tree, [_ADDED_CHECK]) is None
     assert json.loads((run / "checks.json").read_text())["passed"] is False
     monkeypatch.setattr(addedtests, "run", real)
@@ -178,6 +178,21 @@ def test_ttp_checks_suite_pass_serves_only_the_same_command_environment_and_purp
     monkeypatch.delenv("PYTEST_ADDOPTS")
     kill(["checks", "--fresh", "--", _ADDED_CHECK])
     assert runs() == 3
+
+
+def test_ttp_checks_keeps_no_suite_pass_of_a_call_whose_later_check_failed(env, tmp_path, monkeypatch, capsys):
+    # Only a suite that passed whole reaches the rerun and leaves suite passes; a failing check after the
+    # pytest run leaves none, so the next call runs the pytest run again.
+    from ttp import cli
+    run, runs = _added_repo(env, tmp_path, monkeypatch, "\n\ndef test_new():\n    _bump()\n")
+    p = cli.Project(os.environ["TTP_PROJECT"])
+    p.set_config("delivery.push_checks", [_ADDED_CHECK, "false"])
+    for n in (1, 2):
+        with pytest.raises(SystemExit):
+            cli.main(["checks"])
+        assert runs() == n, "the suite ran again, the rerun never"
+    path = p.state / cli.CHECK_PASSES
+    assert not path.exists() or not json.loads(path.read_text())["passes"]
 
 
 def test_added_tests_rerun_past_its_time_cap_is_skipped_unless_a_round_already_failed(tmp_path):
