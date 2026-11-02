@@ -509,11 +509,13 @@ def venv_python(top: str | Path, env: dict | None = None) -> Path | None:
 
 
 def _checkouts(top: str | Path) -> list[Path]:
-    """The worktree `top`, then its main checkout when it is a linked worktree."""
+    """The worktree `top`, then its main checkout when it is a linked worktree or a scratch clone."""
     bases = [Path(top)]
     args = ("rev-parse", "--path-format=absolute", "--git-common-dir")
     r = repoid.read(top, args, lambda: subprocess.run(["git", "-C", str(top), *args], capture_output=True, text=True))
     common = Path(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+    if common and common.resolve() == Path(top).resolve() / ".git":
+        common = cleantree.scratch_of(top) or common   # a scratch clone's is its source's
     if common and common.name == ".git" and common.parent not in bases:
         bases.append(common.parent)
     return bases

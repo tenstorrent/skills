@@ -15616,3 +15616,29 @@ def test_after_push_runs_in_a_scratch_clone_with_the_repos_refs_hooks_and_links_
     batch._sweep_after_push(p, repo)
     assert not old.exists() and "after_push-b7" not in _git_out(repo, "worktree", "list")
     assert not [x for x in os.listdir(common / "worktrees") if x.startswith("after_push")]
+
+
+def test_a_scratch_clone_finds_its_source_repositorys_venv_and_a_plain_shared_clone_does_not(tmp_path):
+    """A bare `pytest` in ttp checks' clean checkout runs with the repository's venv (push.venv_cmd), found
+    through a linked worktree's main checkout before: a scratch clone names its source the same way. A
+    clone the user made with `git clone --shared` is its own checkout and keeps its own lookup."""
+    from ttp import cleantree, push
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    (repo / ".gitignore").write_text(".venv/\n")
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-qm", "a"], check=True)
+    for exe in ("python", "pytest"):
+        (repo / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
+        (repo / ".venv" / "bin" / exe).write_text("#!/bin/sh\n")
+        (repo / ".venv" / "bin" / exe).chmod(0o755)
+    scratch, shared = tmp_path / "scratch", tmp_path / "shared"
+    cleantree.clone(repo, scratch, "HEAD", hooks=False)
+    subprocess.run(["git", "clone", "-q", "--shared", str(repo), str(shared)], check=True)
+    assert cleantree.scratch_of(scratch) == (repo / ".git").resolve()
+    assert cleantree.scratch_of(shared) is None and cleantree.scratch_of(repo) is None
+    assert push._checkouts(scratch) == [scratch, repo.resolve()]
+    assert push.venv_python(scratch, {}) == repo.resolve() / ".venv" / "bin" / "python"
+    assert push.venv_cmd("pytest -q", scratch, {}).endswith("/.venv/bin/python -m pytest -q")
+    assert push._checkouts(shared) == [shared]

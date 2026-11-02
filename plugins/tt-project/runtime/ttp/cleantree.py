@@ -134,6 +134,19 @@ def _plain(cwd: Path, *args: str) -> subprocess.CompletedProcess:
                           timeout=gitmemo.timeout(600, args))
 
 
+SCRATCH_KEY = "ttp.scratchof"   # in a scratch clone's own config: the git dir whose objects it borrows
+
+
+def scratch_of(top: str | Path) -> Path | None:
+    """The git dir a scratch clone (clone) at `top` borrows its objects from, else None: what a linked
+    worktree's --git-common-dir names, so its main checkout's ignored files (a venv) are found."""
+    gitdir = Path(top) / ".git"
+    if not (gitdir / "objects" / "info" / "alternates").is_file():
+        return None
+    r = _plain(Path(top), "config", "--local", "--get", SCRATCH_KEY)
+    return Path(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+
+
 def clone(top: str | Path, path: str | Path, head: str, hooks: bool = True) -> None:
     """Make `path` a detached checkout of `head` of the repository at `top` that adds nothing under
     its .git/worktrees: a sandbox that starts while a worktree there is added or removed fails to mount
@@ -156,7 +169,7 @@ def clone(top: str | Path, path: str | Path, head: str, hooks: bool = True) -> N
         raise fail("git init", r)
     gitdir = path / ".git"
     (gitdir / "objects" / "info" / "alternates").write_text(f"{common / 'objects'}\n")
-    sets = [("include.path", str(common / "config"))]
+    sets = [("include.path", str(common / "config")), (SCRATCH_KEY, str(common))]
     for key, val in (("core.hooksPath", common / "hooks"), ("lfs.storage", common / "lfs")):
         if not _plain(top, "config", "--get", key).stdout.strip():
             sets.append((key, str(val)))
