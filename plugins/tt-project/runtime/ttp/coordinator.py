@@ -967,7 +967,7 @@ def collapse_rows(p: Project, db, lines: list[str], rows: list[dict], seen: dict
     byid = {t["id"]: t for t in rows}
     mine = {}   # task id: its line's index, for the rows shown one per line
     for i, ln in enumerate(lines):
-        if m := re.match(r"- #(\d+) \| ", ln):
+        if (m := re.match(r"- #(\d+) \| ", ln)) and int(m[1]) in byid:
             mine[int(m[1])] = i
     store = {"snap": snap, "rows": {str(k): _sha(_TICKS_RE.sub("", lines[i])) for k, i in mine.items()}}
     before = (seen or {}).get(TASK_ROWS_SEEN_KEY)

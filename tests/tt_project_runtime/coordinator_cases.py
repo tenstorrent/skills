@@ -1258,6 +1258,12 @@ def test_unchanged_pushing_and_deferred_rows_collapse_to_one_group_line_each(env
     ev = db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
               (time.time(), f"task:{push[0]}", "task_notes", "normal", "a note", "queued"))
     assert f"- #{push[0]} | " in dict(coord.digest_parts(p, {}, [ev], [], seen)[0])["tasks"]
+    # So does a new user message; a longer id that starts with its digits does not.
+    msg = db.post("in", f"what holds #{later[0]}?", chat=None, kind="user")
+    assert f"- #{later[0]} | " in dict(coord.digest_parts(p, {}, [], [msg], seen)[0])["tasks"]
+    ev = db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+              (time.time(), "daemon", "observation", "normal", f"task #{push[0]}0 started", "queued"))
+    assert f"- #{push[0]} | " not in dict(coord.digest_parts(p, {}, [ev], [], seen)[0])["tasks"]
     # No `seen` (a raised turn) or an older `seen` without the rows: every row whole.
     old = {k: v for k, v in seen.items() if k != coord.TASK_ROWS_SEEN_KEY}
     for s in (None, old):
