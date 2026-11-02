@@ -20552,7 +20552,7 @@ def test_a_review_runs_at_the_tier_its_diff_needs(env, monkeypatch):
     assert started[risky][1] == "standard"
 
 
-def test_a_re_review_after_a_failed_review_runs_standard(env):
+def test_a_re_review_whose_fix_delta_is_unmeasured_runs_standard(env):
     p = make(env)
     from ttp import worktree
     from ttp.daemon import Daemon
@@ -20580,7 +20580,7 @@ def test_a_re_review_after_a_failed_review_runs_standard(env):
     blocked = review()
     for via_fix in (True, False):
         task, pick = d._size_review(p.db.task(review(blocked, "queued", via_fix)))
-        assert task["tier"] == "standard" and pick["rule"] == f"re-review after failed review #{blocked}", via_fix
+        assert task["tier"] == "standard" and pick["rule"].startswith(f"re-review after failed review #{blocked} ("), via_fix
     # A review after one that passed is no re-review: its diff decides.
     passed = review(status="done")
     assert d._size_review(p.db.task(review(passed, "queued", False)))[0]["tier"] == "light"

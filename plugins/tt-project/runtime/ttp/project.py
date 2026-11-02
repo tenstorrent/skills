@@ -291,8 +291,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                  "push_allowed": True, "code_tasks_may_push": False, "drafts_during_freeze": True},
     # Review tasks run light when the diff under review touches no risky_paths glob and no code file
     # with a risky name (risky_names, default budget.RISKY_NAMES) and is docs and tests only or at
-    # most light_max_lines non-doc lines; otherwise standard, as is every re-review after a failed
-    # review. Only the coordinator picks deep. A non-empty light_paths (globs) also requires every
+    # most light_max_lines non-doc lines; otherwise standard. A re-review after a failed review applies
+    # the same rule to its fix delta (failed head..new head), and runs standard when that delta spans a
+    # rebase onto new upstream code. Only the coordinator picks deep. A non-empty light_paths (globs) also requires every
     # non-doc file to match one of them.
     # With `auto`, the daemon queues the review of each finished code task with a routine hand-off
     # whenever delivery has a review step (review_before_pr or a push_branch); auto_notes ends each

@@ -2155,6 +2155,25 @@ def diff_lines(p: Project, refs: list[str]) -> dict[str, int | None] | None:
     return out or None
 
 
+def delta_lines(p: Project, failed: str, new: str) -> tuple[dict[str, int | None] | None, str]:
+    """Lines changed per file by a re-review's fix delta `failed..new` (None for a binary file), and
+    why it is None: a head that does not resolve, or a delta that spans a rebase onto new upstream
+    code (`new` does not contain `failed`, or the two leave the base branch at different commits:
+    a rebase or an upstream merge), whose upstream part the delta does not show."""
+    for sha in (failed, new):
+        if not sha or not _git(p.root, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}", check=False):
+            return None, f"head {sha[:12] or '(none recorded)'} not found"
+    base = resolve_base(p)
+    if not is_ancestor(p, failed, new) or (_git(p.root, "merge-base", base, failed, check=False)
+                                           != _git(p.root, "merge-base", base, new, check=False)):
+        return None, f"fix delta {failed[:12]}..{new[:12]} spans a rebase onto new upstream code"
+    out: dict[str, int | None] = {}
+    for line in _git(p.root, "diff", "--numstat", "--no-renames", f"{failed}..{new}").splitlines():
+        added, deleted, path = line.split("\t", 2)
+        out[path] = None if added == "-" else int(added) + int(deleted)
+    return out, ""
+
+
 def _closest_ancestor(p: Project, heads: list[str], ref: str) -> str | None:
     """The head in `heads` that is an ancestor of `ref` with the fewest commits between them."""
     best: tuple[int, str] | None = None

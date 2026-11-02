@@ -340,3 +340,100 @@ def test_a_review_spec_naming_only_a_hash_still_reviews_it(env):
     review = p.db.task(_quoting_review(p, f"Review commit {head[:10]}."))
     assert worktree.named_refs(p, review) == [head[:10]]
     assert set(worktree.diff_lines(p, worktree.reviewed_refs(p, review))) == {"daemon.py"}
+
+
+def _rereview_setup(env):
+    """A code task's branch whose review failed at its head (recorded in review_stats), and a done
+    fix on the same branch that the re-review depends on."""
+    import json
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    p = make(env)
+    first = p.db.add_task("stack", "s", kind="code", tier="standard", origin="user")
+    path, branch = worktree.ensure(p, p.db.task(first))
+
+    def commit(name, n, msg="c"):
+        (path / name).write_text("".join(f"x{i} = {i}\n" for i in range(n)))
+        _git_out(path, "add", ".")
+        _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", msg)
+        return _git_out(path, "rev-parse", "HEAD")
+
+    failed_head = commit("app.py", 30)
+    p.db.update_task(first, status="done", branch=branch)
+    old = p.db.add_task("review", f"Review branch {branch}.", kind="review", tier="light", origin="coordinator",
+                        depends_on=[first])
+    p.db.update_task(old, status="failed")
+    p.db.x("INSERT INTO review_stats(task,ts,head,tier,rereview,outcome,cost_usd) VALUES(?,?,?,?,?,?,?)",
+           (old, 0, failed_head, "light", 0, "failed", 0.1))
+    fix = p.db.add_task(f"fix {old}", "s", kind="code", origin="coordinator", labels=[f"continues:{old}"])
+    p.db.update_task(fix, status="done", branch=branch)
+
+    def rereview(tier="standard"):
+        rid = p.db.add_task("review", f"Review branch {branch}.", kind="review", tier=tier, origin="daemon",
+                            depends_on=[fix])
+        return p.db.task(rid)
+
+    return p, Daemon(p.base), path, commit, rereview, old
+
+
+def test_a_re_review_of_a_small_fix_delta_runs_light(env):
+    p, d, _, commit, rereview, old = _rereview_setup(env)
+    commit("app2.py", 5)
+    task, pick = d._size_review(rereview())
+    assert task["tier"] == "light", pick
+    assert pick["rule"] == f"re-review after failed review #{old}: fix delta 5 lines <= 80", pick
+    assert pick["lines"] == 5 and pick["files"] == 1
+    # A retry of it does not run light.
+    t = rereview()
+    p.db.update_task(t["id"], attempts=1)
+    assert d._size_review(p.db.task(t["id"]))[0]["tier"] == "standard"
+
+
+def test_a_re_review_of_a_large_fix_delta_runs_standard(env):
+    _, d, _, commit, rereview, _ = _rereview_setup(env)
+    commit("app2.py", 200)
+    task, pick = d._size_review(rereview())
+    assert task["tier"] == "standard" and pick["rule"].endswith("fix delta 200 lines > 80"), pick
+
+
+def test_a_re_review_whose_fix_delta_touches_a_risky_name_runs_standard(env):
+    _, d, _, commit, rereview, _ = _rereview_setup(env)
+    commit("push_queue.py", 3)
+    task, pick = d._size_review(rereview())
+    assert task["tier"] == "standard" and "risky name push_queue.py" in pick["rule"], pick
+
+
+def test_a_re_review_whose_fix_delta_spans_a_rebase_runs_standard(env):
+    from ttp import worktree
+    p, d, path, commit, rereview, _ = _rereview_setup(env)
+    base = worktree.resolve_base(p)
+    # New upstream code lands on the base; the branch takes it in by a merge, then by a rebase.
+    up = worktree.ensure(p, p.db.task(p.db.add_task("up", "s", kind="code", origin="user")))[0]
+    (up / "upstream.py").write_text("u = 1\n")
+    _git_out(up, "add", ".")
+    _git_out(up, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "upstream")
+    upstream = _git_out(up, "rev-parse", "HEAD")
+    _git_out(p.root, "update-ref", f"refs/heads/{base}" if not base.startswith("origin/") else f"refs/remotes/{base}",
+             upstream)
+    _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "--no-edit", upstream)
+    task, pick = d._size_review(rereview())
+    assert task["tier"] == "standard" and "spans a rebase onto new upstream code" in pick["rule"], pick
+    _git_out(path, "reset", "-q", "--hard", "HEAD~1")
+    commit("app2.py", 2)
+    _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "rebase", "-q", upstream)
+    task, pick = d._size_review(rereview())
+    assert task["tier"] == "standard" and "spans a rebase onto new upstream code" in pick["rule"], pick
+
+
+def test_a_deep_re_review_stays_deep_and_an_unrecorded_failed_head_stays_standard(env):
+    p, d, _, commit, rereview, old = _rereview_setup(env)
+    commit("app2.py", 5)
+    deep = rereview("deep")
+    assert d._size_review(deep) == (deep, None)
+    p.db.x("UPDATE review_stats SET head=NULL WHERE task=?", (old,))
+    task, pick = d._size_review(rereview())
+    assert task["tier"] == "standard" and "(head (none recorded) not found)" in pick["rule"], pick
+    # No fix delta at all: the failed head is reviewed again at standard.
+    p, d, _, _, rereview, _ = _rereview_setup(env)
+    task, pick = d._size_review(rereview())
+    assert task["tier"] == "standard" and "no fix delta" in pick["rule"], pick

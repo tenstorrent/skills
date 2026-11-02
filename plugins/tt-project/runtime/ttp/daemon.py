@@ -11891,9 +11891,8 @@ class Daemon:
     def _size_review(self, task: dict) -> tuple[dict, dict | None]:
         """A review runs at the tier its diff needs, not the one it was queued with: the task at that
         tier, and the rule's pick for the run's note (None when it was not measured). Deep stays the
-        coordinator's call. A re-review after a failed review and a retry never run light: the
-        failed review shows the change needs the closer look, and the light try may be why it
-        failed. A diff that cannot be measured keeps the tier the task was given. A push-conflict fix
+        coordinator's call. A re-review after a failed review is sized by its fix delta
+        (_rereview_pick). A retry never runs light: the light try may be why it failed. A diff that cannot be measured keeps the tier the task was given. A push-conflict fix
         runs at conflictfix.tier_for's tier for this run only, deep reviews too."""
         cf = conflictfix.of(task)
         if cf is not None:
@@ -11914,7 +11913,7 @@ class Daemon:
             return task, None
         prior = self._failed_review_before(task)
         if prior is not None:
-            tier, why, changes = "standard", f"re-review after failed review #{prior}", {}
+            tier, why, changes = self._rereview_pick(task, prior)
         else:
             try:
                 changes = worktree.diff_lines(self.p, worktree.reviewed_refs(self.p, task))
@@ -13323,7 +13322,7 @@ class Daemon:
         # A stack kept off the push branch stays review only through its fix and re-review.
         only = push.REVIEW_ONLY_LABEL in push._labels(review) + push._labels(first)
         tier, tsrc = effort.fix_tier(db, code, review, fups)   # db.add_task: a fix never runs light
-        rtier = "deep" if review["tier"] == "deep" else "standard"   # a re-review never runs light
+        rtier = "deep" if review["tier"] == "deep" else "standard"   # _size_review sizes it by its fix delta
         found = "\n".join(f"{n}. {str(f['title'])[:200]}: {coord.clip(f.get('spec'), FOLLOWUP_SPEC_CHARS)}"
                           for n, f in enumerate(fups, 1))
         # An open fix of the PR's findings (pr_findings_owner) on this stack takes these findings too:
@@ -13618,6 +13617,26 @@ class Daemon:
             seen.add(c)
             t = n
         return t["id"]
+
+    def _rereview_pick(self, task: dict, prior: int) -> tuple[str, str, dict]:
+        """A re-review's tier, the rule and the changes it measured: light when its fix delta (the head
+        failed review #prior reviewed .. the new head) passes the light rule (budget.review_pick:
+        light_max_lines non-doc lines, no risky path or name) and spans no rebase onto new upstream
+        code; standard otherwise, on a retry, and when the delta cannot be measured."""
+        lead = f"re-review after failed review #{prior}"
+        try:
+            changes, why = worktree.delta_lines(self.p, reviewstats.failed_head(self.p.db, prior),
+                                                worktree.reviewed_head(self.p, task) or "")
+        except Exception as e:
+            changes, why = None, f"fix delta not measured: {e}"
+        if changes is None:
+            return "standard", f"{lead} ({why})", {}
+        if not changes:
+            return "standard", f"{lead} (no fix delta: the failed head is reviewed again)", {}
+        tier, why = bud.review_pick(changes, self.cfg)
+        if tier == "light" and task["attempts"]:
+            tier, why = "standard", f"retry ({why})"
+        return tier, f"{lead}: fix delta {why}", changes
 
     def _failed_review_before(self, task: dict) -> int | None:
         """The id of a failed review this task continues, directly or through the fix it depends on
