@@ -731,13 +731,53 @@ def _regions(merged: bytes) -> list[tuple[list[bytes], list[bytes], list[bytes]]
 
 def _explained(ours: list[bytes], base: list[bytes], theirs: list[bytes], got: list[bytes]) -> bool:
     """Whether the landing's lines `got` for a conflict region account for every line commit c's side
-    (`theirs`) adds over `base` there: those not in `got` verbatim are at most the lines `got` adds
-    over `ours` that are not c's (a line rewritten while resolving). More of c's lines than that is
-    work the landed copy lacks, such as an amend's added lines."""
+    (`theirs`) adds over `base` there: each one not in `got` verbatim pairs, one to one, with a similar
+    line `got` adds over `ours` that is not c's (a line rewritten while resolving: _paired). A line left
+    unpaired is work the landed copy lacks, such as an amend's added line, even when the resolution adds
+    as many lines of its own."""
     new = Counter(theirs) - Counter(base)
-    missing = new - Counter(got)
-    rewrites = (Counter(got) - Counter(ours)) - Counter(theirs)
-    return sum(missing.values()) <= sum(rewrites.values())
+    missing = list((new - Counter(got)).elements())
+    rewrites = list(((Counter(got) - Counter(ours)) - Counter(theirs)).elements())
+    return _paired(missing, rewrites)
+
+
+_PAIRS_MAX = 40000      # missing x rewritten lines compared at most; more keeps the commit in the replay
+_SIMILAR = 0.6          # difflib ratio from which two lines count as one rewritten
+
+
+def _words(ln: bytes) -> Counter:
+    """The words and punctuation marks of line `ln`."""
+    return Counter(re.findall(rb"\w+|[^\w\s]", ln))
+
+
+def _similar(a: bytes, b: bytes) -> bool:
+    """Whether line `b` reads as line `a` rewritten: one holds every word and mark of the other, or
+    difflib rates them at least _SIMILAR alike. A blank line is like none."""
+    wa, wb = _words(a), _words(b)
+    if not wa or not wb:
+        return False
+    return wa <= wb or wb <= wa or difflib.SequenceMatcher(None, a.strip(), b.strip(), autojunk=False).ratio() >= _SIMILAR
+
+
+def _paired(missing: list[bytes], rewrites: list[bytes]) -> bool:
+    """Whether each line of `missing` pairs with its own similar line of `rewrites` (_similar), one to
+    one (a bipartite matching by augmenting paths). Too many lines to compare is no pairing."""
+    if not missing:
+        return True
+    if len(missing) > len(rewrites) or len(missing) * len(rewrites) > _PAIRS_MAX:
+        return False
+    like = [[j for j, r in enumerate(rewrites) if _similar(m, r)] for m in missing]
+    owner: dict[int, int] = {}
+
+    def take(i: int, seen: set) -> bool:
+        for j in like[i]:
+            if j not in seen:
+                seen.add(j)
+                if j not in owner or take(owner[j], seen):
+                    owner[j] = i
+                    return True
+        return False
+    return all(take(i, set()) for i in range(len(missing)))
 
 
 def _fits(merged: bytes, got: bytes) -> bool:

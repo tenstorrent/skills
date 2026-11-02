@@ -2344,7 +2344,14 @@ def test_a_push_batch_records_a_commit_it_drops_on_a_landing_that_resolved_a_con
     ("1\nfix from review\n", "b theirs\n1\nfix from review\n", True),  # the resolution holds it
     (None, "1 resolved\n", True),                           # not amended: the resolution rewrote its line
     (None, "b theirs\n1\n", True),                         # not amended: both sides taken
-], ids=["amend-rewritten", "amend-both-sides", "amend-kept", "rewritten", "both-sides"])
+    # the resolution adds a line of its own as well: as many new lines, but "fix" pairs with none
+    ("1\nfix\n", "merged 1\nextra\n", False),
+    # every line the amend adds that the landing lacks pairs with one the resolution rewrote
+    ("1\nfix from review\n", "merged 1\nfix from review, merged\n", True),
+    ("1\nfix\n", "merged 1\n", False),                    # two missing lines, one rewritten: no pairing
+    ("1\n2\n", "merged 1 and 2\n", False),               # one rewritten line pairs with one line only
+], ids=["amend-rewritten", "amend-both-sides", "amend-kept", "rewritten", "both-sides", "amend-unpaired",
+        "amend-all-paired", "amend-short", "amend-one-to-one"])
 def test_a_rewritten_landing_carries_a_commit_only_when_its_resolution_accounts_for_every_added_line(
         tmp_path, amend, resolution, dropped):
     """The repro: an amend made before its older copy landed adds a line inside the region where the
