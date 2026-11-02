@@ -694,7 +694,10 @@ def confirmation(n: dict, name: str, recs: list[dict] | None = None) -> str | No
 
 def _close_confirmation(p: project.Project, n: dict, now: float) -> bool:
     """A marked confirmation of a fix `p` shipped: closed model-free as CONFIRMATION (the sender's ack
-    is the receipt) and kept as a handled event, which wakes no coordinator. False to file it as usual."""
+    is the receipt) and kept as a handled event, which wakes no coordinator. False to file it as usual,
+    also for one its sender marked high: that asks for attention, from any sender version."""
+    if n.get("severity") == "high":
+        return False
     try:
         fp = confirmation(n, p.name)
         if not fp:

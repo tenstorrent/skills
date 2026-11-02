@@ -884,3 +884,21 @@ def test_a_confirmation_that_also_reports_a_problem_still_wakes_the_coordinator(
     assert upstream.ingest(dst, dst.config()) == 1
     assert _queued_notes(dst)[-1]["status"] == "queued"
     assert upstream.confirmations_closed("second") == 0
+
+
+def test_a_high_severity_confirmation_is_filed_as_a_note_and_left_open(env, monkeypatch):
+    """A sender that marks a confirmation high asks for attention: the receiver files it as a queued
+    event and leaves it open, whatever sent it; a low or normal one still closes model-free."""
+    from ttp import upstream
+    src, dst, fp = _confirm_pair(env)
+    upstream.send(src.name, 57, "second", "confirmed, but look at this", severity="high", confirms=fp)
+    assert upstream.ingest(dst, dst.config()) == 1
+    (high,) = _upstream_inbox(env)
+    (ev,) = _queued_notes(dst)
+    assert ev["status"] == "queued" and ev["severity"] == "high", ev
+    assert not upstream.wontfixed(high["fp"]) and upstream.confirmations_closed("second") == 0
+    for sev in ("low", "normal"):
+        upstream.send(src.name, 57, "second", f"confirmed at {sev}", severity=sev, confirms=fp)
+    assert upstream.ingest(dst, dst.config()) == 2
+    assert [e["status"] for e in _queued_notes(dst)] == ["queued", "handled", "handled"]
+    assert upstream.confirmations_closed("second") == 2
