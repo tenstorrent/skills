@@ -3862,6 +3862,8 @@ class Daemon:
                                **({"cause": _route_cause(stopped or status, exit_info, usage, run_dir)} if own else {}),
                                **({"priced": priced} if priced is not None else {}),
                                "wall_s": round(float(exit_info.get("ended") or time.time()) - float(r["started"] or 0), 1)}
+            if fell and not own and (got := route.upstream_entry(exit_info.get("bridge") or {})):
+                note[route.KEY]["upstream"] = got   # e.g. 404 model_not_found, apart from a 5xx
             sent = route.effort_entry(exit_info.get("bridge") or {}) if on_route else None
             if sent:
                 note[route.KEY]["effort"] = sent
@@ -4666,6 +4668,12 @@ class Daemon:
             rstatus, result = "failed", dict(result, status=CHANGES_NEEDED)
         summary = str((result.get("summary") if isinstance(result, dict) else None)
                       or (usage.final_text or usage.error or "")[:1500])
+        if status in FREE_ENDS and not rstatus and r.get("id"):
+            # A routed run that fell back is one route line in the feed, never a failed run with the
+            # endpoint's error text: the core provider's run that follows is the outcome that counts.
+            fb = route.of((db.one("SELECT note FROM runs WHERE id=?", (r["id"],)) or {}).get("note"))
+            if fb and fb.get("fallback") in (*route.FAULTS, *route.RUN_CAUSES) and r.get("provider") == fb.get("to"):
+                summary = route.fallback_line(r["id"], fb)
         if rstatus == "waiting" and result.get("retry_when") is not None and not isinstance(result["retry_when"], str):
             # No shell command (JSON true, a number, a list): never run, nor read as passed through its
             # truthiness. It is dropped, said loudly, and the task wakes at its timer (or on its jobs' probe).

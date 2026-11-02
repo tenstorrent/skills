@@ -10,7 +10,11 @@ no tier-up retry; reviews and coordinator turns never route. The run's note gets
 the tier, where it was routed (`to`, `model`), its `fallback` reason (none, down, error, rate_limit,
 auth, malformed, timeout, failed, no_handoff, busy or rerun, with a short `cause` for a run's own end),
 whether its spend is `priced`, its wall time and, when the model has effort_fields (chatbridge.py), the
-`effort` it ran at with the fields sent and whether the endpoint `rejected` them.
+`effort` it ran at with the fields sent and whether the endpoint `rejected` them. An endpoint fault also
+keeps the failed answer's `upstream` HTTP status and error code (404 model_not_found apart from a 5xx;
+chatbridge.upstream_of: never its text, a key, a URL or a host). The run's hand-off summary, which the
+coordinator feed shows, is then one route line (fallback_line) naming the reason, never the run's error
+text: the core provider's run that follows is the outcome that counts.
 
 Effort: a routed run runs at its tier's `providers.chat.tiers.<tier>.effort`, and every request carries
 the fields `providers.chat.effort_fields` gives its model at that effort; config_problems names a
@@ -70,6 +74,7 @@ REJECTED = "route_effort_rejected:"   # kv: <model>|<effort> whose effort_fields
 COOLDOWN_S = 900
 FAULTS = ("down", "error", "rate_limit", "auth", "malformed")
 RUN_CAUSES = ("timeout", "failed", "no_handoff")   # a routed run's own end without a hand-off (own_cause)
+OWN_CAUSE_WORDS = ("timed out", "stalled", "exited without", "result.json", "exit ")   # fallback_line shows these
 # busy: the routed-to provider's gate or a pause held new work, no fault; busy_wait_expired: its slots
 # (the project's or the host's) stayed full for the whole wait; rerun: the task fell back on its own before.
 REASONS = ("none", *FAULTS, *RUN_CAUSES, "busy", "busy_wait_expired", "rerun")
@@ -225,6 +230,33 @@ def effort_entry(stats: dict) -> dict | None:
     if not isinstance(fields, dict) or not fields:
         return None
     return {"effort": str(stats.get("effort") or ""), "fields": fields, "rejected": bool(stats.get("rejected"))}
+
+
+def upstream_entry(stats: dict) -> dict | None:
+    """The route entry's `upstream` record from a bridge's stats: the last failed answer's HTTP status
+    and error code (chatbridge.upstream_of), each re-checked; None without one."""
+    from .chatbridge import CODE_RE
+    u = stats.get("upstream") if isinstance(stats, dict) else None
+    status = u.get("status") if isinstance(u, dict) else None
+    if not isinstance(status, int) or isinstance(status, bool) or not 100 <= status < 600:
+        return None
+    code = u.get("code")
+    return {"status": status, **({"code": code} if isinstance(code, str) and CODE_RE.fullmatch(code) else {})}
+
+
+def fallback_line(run_id, e: dict) -> str:
+    """A routed run's fallback for the coordinator feed, in place of its error text: 'routed run 12 on
+    chat (model) fell back: error (HTTP 404 model_not_found); requeued at light on the core provider,
+    no attempt spent'. The run that follows is the one whose outcome counts."""
+    why = str(e.get("fallback") or "")
+    u = e.get("upstream") if isinstance(e.get("upstream"), dict) else {}
+    detail = " ".join(str(x) for x in (f"HTTP {u['status']}" if u.get("status") else "", u.get("code") or "") if x)
+    cause = str(e.get("cause") or "")   # the daemon's own words only (_route_cause), never the run's error text
+    detail = detail or (cause[:120] if why in RUN_CAUSES and cause.startswith(OWN_CAUSE_WORDS) else "")
+    model = f" ({e['model']})" if e.get("model") else ""
+    return (f"routed run {run_id} on {e.get('to') or TO}{model} fell back: {why}"
+            + (f" ({detail})" if detail else "")
+            + f"; requeued at {e.get('tier') or 'its tier'} on the core provider, no attempt spent")
 
 
 def _fields_text(e: dict) -> str:

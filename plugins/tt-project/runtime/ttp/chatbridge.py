@@ -421,6 +421,30 @@ def fault_of(status: int, detail: str = "") -> str:
     return "error" if status >= 500 or status == 404 else ""
 
 
+CODE_RE = re.compile(r"[A-Za-z][A-Za-z_-]{1,47}")   # an error code word: no digits, dots, slashes or colons
+
+
+def upstream_of(status: int, body, key: str = "") -> dict:
+    """What a failed upstream answer was, safe for the run's files: {"status": its HTTP status, "code":
+    its error code (model_not_found), else its error type} when it gave one. The code is kept only as a
+    plain word (CODE_RE: no digits, so no key or token; no dots, slashes or colons, so no URL or host)
+    that no stored secret or the key is in; never the message. {} for no answer (status 0)."""
+    if not status:
+        return {}
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except ValueError:
+            body = None
+    err = body.get("error") if isinstance(body, dict) else None
+    code = ""
+    for c in ((err.get("code"), err.get("type")) if isinstance(err, dict) else ()):
+        if isinstance(c, str) and CODE_RE.fullmatch(c) and (not key or key not in c) and redact.scrub(c) == c:
+            code = c
+            break
+    return {"status": int(status), **({"code": code} if code else {})}
+
+
 def estimate_tokens(body: dict) -> int:
     """count_tokens: about 4 characters a token over the whole request (the endpoint has no counter)."""
     return max(1, len(json.dumps({k: body.get(k) for k in ("system", "messages", "tools")})) // 4)
@@ -487,6 +511,7 @@ class Bridge:
         self.effort, self.fields, self.rejected = effort, dict(fields or {}), False   # effort_fields
         self.token = secrets.token_urlsafe(24)
         self.last_fault, self.faults = "", {}   # the last call's endpoint fault kind (fault_of), counts
+        self.upstream: dict = {}   # the last failed answer's HTTP status and error code (upstream_of)
         self.server: http.server.ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
 
@@ -554,23 +579,34 @@ class Bridge:
     def _fault(self, status: int, detail: str = "") -> None:
         kind = fault_of(status, detail)
         self.last_fault = kind
+        self.upstream = upstream_of(status, detail, self._key)
         if kind:
             self.faults[kind] = self.faults.get(kind, 0) + 1
 
-    def _fault_reply(self, reply: tuple[int, dict]) -> tuple[int, dict]:
+    def _fault_reply(self, reply: tuple[int, dict], body: dict | None = None) -> tuple[int, dict]:
         code, err = reply
         self._fault(code, str((err.get("error") or {}).get("message") or ""))
+        if body is not None:   # an error in a 200 answer or a stream chunk: its own status when it gives one
+            e = body.get("error") if isinstance(body.get("error"), dict) else {}
+            given = str(e.get("status") or e.get("code") or "")
+            self.upstream = upstream_of(int(given) if given.isdigit() and 400 <= int(given) < 600 else 200,
+                                        body, self._key)
         return code, err
 
     def _malformed(self, detail: str) -> tuple[int, dict]:
-        self.last_fault = "malformed"   # an endpoint fault for routing (route.py), not the run's
+        self.last_fault, self.upstream = "malformed", {}   # an endpoint fault for routing (route.py), not the run's
         self.faults["malformed"] = self.faults.get("malformed", 0) + 1
         return error_for(502, detail)
 
+    def _ok(self) -> None:
+        self.last_fault, self.upstream = "", {}
+
     def stats(self) -> dict:
-        """For the run's exit record: fault kinds only, never upstream text (it may echo a key); the
-        effort fields sent and whether the endpoint rejected them, when the run had any."""
+        """For the run's exit record: fault kinds, and the last failed answer's HTTP status and error
+        code (`upstream`, upstream_of), never upstream text (it may echo a key); the effort fields sent
+        and whether the endpoint rejected them, when the run had any."""
         return {"last_fault": self.last_fault, "faults": dict(self.faults),
+                **({"upstream": dict(self.upstream)} if self.upstream else {}),
                 **({"effort": self.effort, "fields": dict(self.fields), "rejected": self.rejected}
                    if self.fields else {})}
 
@@ -616,8 +652,8 @@ class Bridge:
                 except ValueError:
                     return h._reply(*self._malformed("the upstream answer is not JSON"))
                 if data.get("error"):
-                    return h._reply(*self._fault_reply(_chunk_error(data, self._scrub)))
-                self.last_fault = ""
+                    return h._reply(*self._fault_reply(_chunk_error(data, self._scrub), data))
+                self._ok()
                 return h._reply(200, from_chat(data, body.get("model") or self.model))
             self._stream(h, resp, Stream(body.get("model") or self.model))
 
@@ -655,13 +691,13 @@ class Bridge:
                     errored = True
                     break
                 if chunk.get("error"):
-                    code, err = self._fault_reply(_chunk_error(chunk, self._scrub))
+                    code, err = self._fault_reply(_chunk_error(chunk, self._scrub), chunk)
                     send(_sse("error", err))
                     errored = True
                     break
                 send(st.feed(chunk))
             if not errored:
-                self.last_fault = ""
+                self._ok()
                 send(st.end())
             h.wfile.write(b"0\r\n\r\n")
             h.wfile.flush()

@@ -1009,8 +1009,9 @@ def test_a_start_whose_tier_leaves_the_route_rechecks_the_core_slots(env, monkey
     assert _route_slots(p, d, monkeypatch, 2, chat_max=2, tag="free") == [(core, None)]
 
 
-def _route_finish(p, d, tid, exit_info, provider="chat", result=None, reply=None, earlier=None):
-    """`reply`: the run's final reply text (its output.jsonl result line); `earlier`: an earlier turn's text."""
+def _route_finish(p, d, tid, exit_info, provider="chat", result=None, reply=None, earlier=None, is_error=False):
+    """`reply`: the run's final reply text (its output.jsonl result line, an error one with `is_error`);
+    `earlier`: an earlier turn's text."""
     p.db.update_task(tid, status="running")
     note = {"route": {"tier": "light", "to": "chat", "model": _RT_MODEL, "fallback": "none"}}
     rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) "
@@ -1023,7 +1024,7 @@ def _route_finish(p, d, tid, exit_info, provider="chat", result=None, reply=None
     if reply is not None:
         turn = lambda text: {"type": "assistant", "message": {"id": f"m{len(text)}", "content": [{"type": "text", "text": text}]}}
         lines = [turn(earlier)] if earlier is not None else []
-        lines += [turn(reply), {"type": "result", "subtype": "success", "is_error": False, "total_cost_usd": 0.0,
+        lines += [turn(reply), {"type": "result", "subtype": "success", "is_error": is_error, "total_cost_usd": 0.0,
                                 "usage": {}, "result": reply, "session_id": "s-1"}]
         (rd / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
     p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(rd), rid))
@@ -1057,6 +1058,100 @@ def test_a_routed_run_on_an_endpoint_fault_falls_back_to_the_core_provider(env, 
     prov, _, note = _route_dispatch(p, d, monkeypatch, title="after")
     assert prov == "chat" and note[route.KEY]["fallback"] == "none"
     assert route.phrase(p.db) == f"routed 24h: 1 run to chat, 1 fell back ({fault} 1)"
+
+
+def test_chatbridge_stats_keep_the_scrubbed_upstream_status_and_error_code(mock_chat):
+    from ttp.chatbridge import Bridge, upstream_of
+    hi = {"max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}
+    gone = {"error": {"message": f"The model 'old-model' does not exist at https://example.invalid/v1 ({_CB_KEY})",
+                      "type": "invalid_request_error", "code": "model_not_found"}}
+    up = mock_chat((404, gone), (500, {"error": {"message": "boom"}}),
+                   (200, {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}))
+    with Bridge(up.url, _CB_KEY, "m") as b:
+        _post(b, hi)
+        st404 = b.stats()
+        _post(b, hi)
+        st500 = b.stats()
+        _post(b, hi)
+        ok = b.stats()
+    # A missing model and a 5xx are the same fault kind, told apart by the upstream status and code.
+    assert st404["last_fault"] == st500["last_fault"] == "error"
+    assert st404["upstream"] == {"status": 404, "code": "model_not_found"}
+    assert st500["upstream"] == {"status": 500}
+    assert "upstream" not in ok and ok["last_fault"] == ""   # a good answer clears it
+    for st in (st404, st500):
+        assert _CB_KEY not in json.dumps(st) and "example.invalid" not in json.dumps(st) and "old-model" not in json.dumps(st)
+    # Only a plain code word is kept: a key, a token, a URL, a host or free text in the code is dropped
+    # (the type stands in when it is one), and no answer has no upstream record.
+    for bad in (_CB_KEY, "tok_9f8e7d6c5b4a3921", "https://example.invalid/v1", "api.example.invalid",
+                "host:8443", "model not found here", "a" * 60, 404, None, ["model_not_found"]):
+        got = upstream_of(404, {"error": {"code": bad, "type": "not_found_error"}}, _CB_KEY)
+        assert got == {"status": 404, "code": "not_found_error"}, (bad, got)
+        assert upstream_of(404, json.dumps({"error": {"code": bad}}), _CB_KEY) == {"status": 404}, bad
+    assert upstream_of(404, "<html>not found</html>") == {"status": 404}
+    assert upstream_of(0, json.dumps(gone)) == {}
+    assert upstream_of(404, {"error": {"code": "secretword"}}, "secretword") == {"status": 404}
+    # An error in a stream chunk keeps its own code; a dead endpoint keeps none.
+    up = mock_chat((200, [{"choices": [{"delta": {"content": "par"}}]},
+                          {"error": {"message": "slow down", "code": 429, "type": "rate_limit_exceeded"}}]))
+    with Bridge(up.url, _CB_KEY, "m") as b:
+        _post(b, {**hi, "stream": True})
+        assert b.stats()["upstream"] == {"status": 429, "code": "rate_limit_exceeded"}
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        dead = f"http://127.0.0.1:{s.getsockname()[1]}/v1"
+    with Bridge(dead, _CB_KEY, "m") as b:
+        _post(b, hi)
+        assert b.stats()["last_fault"] == "down" and "upstream" not in b.stats()
+
+
+def test_a_routed_run_that_fell_back_is_one_route_line_in_the_feed_not_a_failed_run(env, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import route
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    tid = p.db.add_task("build", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    said = "There's an issue with the selected model (placeholder-model). It may not exist or you may not have access to it."
+    bridge = {"last_fault": "error", "faults": {"error": 1}, "upstream": {"status": 404, "code": "model_not_found"}}
+    run, task = _route_finish(p, d, tid, {"bridge": bridge}, reply=said, is_error=True)
+    assert run["status"] == "fallback" and task["status"] == "queued" and int(task["attempts"] or 0) == 0
+    e = route.of(run["note"])
+    assert e["fallback"] == "error" and e["upstream"] == {"status": 404, "code": "model_not_found"}
+    summary = json.loads(task["result"])["summary"]
+    assert summary == (f"routed run {run['id']} on chat ({_RT_MODEL}) fell back: error (HTTP 404 model_not_found); "
+                       "requeued at light on the core provider, no attempt spent"), summary
+    ev = p.db.q("SELECT kind, text FROM events WHERE task=?", (tid,))
+    assert ev and all("issue with the selected model" not in x["text"] for x in ev), ev
+    assert any("fell back: error (HTTP 404 model_not_found)" in x["text"] for x in ev), ev
+    digest = coord.digest(p, {}, [x["id"] for x in p.db.q("SELECT id FROM events")], [])
+    assert "issue with the selected model" not in digest
+    assert sum(1 for line in digest.splitlines() if f"routed run {run['id']} on chat" in line) >= 1
+    # A bad upstream record in the exit info is dropped, not copied; a run's own fallback shows the
+    # daemon's cause, never its error text; the core provider's run then is the outcome that counts.
+    tid2 = p.db.add_task("build2", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    bad = {"last_fault": "error", "upstream": {"status": "404", "code": f"https://example.invalid/{_CB_KEY}"}}
+    run2, _ = _route_finish(p, d, tid2, {"bridge": bad})
+    assert "upstream" not in route.of(run2["note"])
+    assert route.upstream_entry({"upstream": {"status": 404, "code": "a/b"}}) == {"status": 404}
+    tid3 = p.db.add_task("build3", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    run3, task3 = _route_finish(p, d, tid3, {"bridge": {"last_fault": "", "faults": {}}}, reply=said, is_error=True)
+    e3 = route.of(run3["note"])
+    assert run3["status"] == "fallback" and e3["fallback"] == "failed", e3
+    s3 = json.loads(task3["result"])["summary"]
+    assert s3.startswith(f"routed run {run3['id']} on chat ({_RT_MODEL}) fell back: failed;") and "issue" not in s3, s3
+    p.db.update_task(tid, status="running")
+    rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) VALUES(?,'worker',?,?,?,'running',?,?)",
+                 (tid, d.cfg.get("core_provider", "claude"), "core", time.time() - 10, d.boot,
+                  json.dumps({"route": {"tier": "light", "to": "chat", "model": _RT_MODEL, "fallback": "error"}})))
+    rd = p.runs / str(rid)
+    rd.mkdir(parents=True)
+    (rd / "result.json").write_text(json.dumps({"status": "failed", "summary": "the build broke"}))
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(rd), rid))
+    d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), {"rc": 0, "started": time.time() - 10, "ended": time.time()})
+    assert json.loads(p.db.task(tid)["result"])["summary"] == "the build broke"
 
 
 def test_a_routed_run_with_a_refused_key_goes_through_the_auth_gate_then_falls_back(env, monkeypatch):
