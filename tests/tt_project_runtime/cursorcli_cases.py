@@ -153,6 +153,7 @@ def test_cursor_workers_get_the_sandbox_only_when_the_build_and_host_allow_it(en
     monkeypatch.setattr(Cursor, "binary", lambda self: "/x/agent")
     monkeypatch.setitem(base._CLI_OUTPUT, ("/x/agent", "--help"), CURSOR_REAL_HELP)
     monkeypatch.setattr(cursor, "sandbox_host_gap", lambda: "")
+    monkeypatch.setattr(cursor, "sandbox_network_gap", lambda help_text: "")   # a build that can open it
     roots = ["/s/state", "/r/.git"]
     assert Cursor().writable_args(roots) == ["--sandbox", "enabled", "--add-dir", "/s/state", "--add-dir", "/r/.git"]
     assert Cursor().write_fence() == "" and Cursor().writable_args([]) == []
@@ -174,6 +175,7 @@ def test_cursor_workers_get_the_sandbox_only_when_the_build_and_host_allow_it(en
 def test_dispatched_cursor_worker_is_fenced_with_its_run_dir_writable(env, monkeypatch):
     from ttp.providers import cursor
     monkeypatch.setattr(cursor, "sandbox_host_gap", lambda: "")
+    monkeypatch.setattr(cursor, "sandbox_network_gap", lambda help_text: "")
     p, run, task, argv, _ = _cli_run(env, monkeypatch, "cursor", _codex_events(*CURSOR_STREAM_OK),
                                      result={"status": "done", "summary": "ok"}, help_text=CURSOR_REAL_HELP)
     assert argv[argv.index("--sandbox") + 1] == "enabled" and "--force" in argv
@@ -186,3 +188,27 @@ def test_dispatched_cursor_worker_is_fenced_with_its_run_dir_writable(env, monke
     _, _, _, argv, _ = _cli_run(env, monkeypatch, "cursor", _codex_events(*CURSOR_STREAM_OK),
                                 role="coordinator", read_only=True, help_text=CURSOR_REAL_HELP)
     assert "--sandbox" not in argv and "--add-dir" not in argv
+
+
+def test_cursor_workers_keep_the_network_when_the_sandbox_would_block_it(env, monkeypatch):
+    # The real build: its sandbox denies network by default and no flag opens it, so on a host that
+    # can run the sandbox, workers still get no sandbox flags and doctor names the network.
+    from ttp.providers import base, cursor
+    from ttp.providers.cursor import Cursor
+    with monkeypatch.context() as m:
+        m.setattr(Cursor, "binary", lambda self: "/x/agent")
+        m.setitem(base._CLI_OUTPUT, ("/x/agent", "--help"), CURSOR_REAL_HELP)
+        m.setattr(cursor, "sandbox_host_gap", lambda: "")
+        assert Cursor().writable_args(["/s/state", "/r/.git"]) == []
+        fence = Cursor().write_fence()
+        assert fence.startswith("--force without --sandbox enabled: ") and "network" in fence, fence
+        # A host that cannot run it either: the network reason comes first, it holds on any host.
+        m.setattr(cursor, "sandbox_host_gap", lambda: "kernel 5.15 is older than the 6.2 the Cursor sandbox needs")
+        assert "network" in Cursor().write_fence() and Cursor().writable_args(["/s/state"]) == []
+    # A dispatched worker runs with --force, no sandbox flags, and its result.json still lands.
+    monkeypatch.setattr(cursor, "sandbox_host_gap", lambda: "")
+    _, _, task, argv, _ = _cli_run(env, monkeypatch, "cursor", _codex_events(*CURSOR_STREAM_OK),
+                                   result={"status": "done", "summary": "ok"}, help_text=CURSOR_REAL_HELP)
+    assert "--force" in argv and "--sandbox" not in argv and "--add-dir" not in argv, argv
+    assert task["status"] == "done"
+    assert not (env["repo"] / ".cursor").exists(), "the harness writes no Cursor config file"

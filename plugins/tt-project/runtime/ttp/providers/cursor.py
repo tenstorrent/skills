@@ -9,10 +9,12 @@ result object `json` prints alone. Streaming keeps the output file growing while
 so the runner's stall guard sees progress and its budget check sees spend before the run ends.
 
 Write fence (from the docs and `agent --help`; built, not measured live). Workers run with `--force`.
-When `--help` lists `--sandbox` and `--add-dir` and the host passes `sandbox_host_gap()`, they also
-get `--sandbox enabled` and one `--add-dir` per writable root (`writable_args`: the project state
-with the run dir, git metadata, temp and lock dirs), so result.json stays writable without the
-harness writing `.cursor/sandbox.json`. Otherwise they are unfenced and `write_fence()` says why.
+When `--help` lists `--sandbox` and `--add-dir`, a flag can open the sandbox's network
+(`sandbox_network_gap()`; none does yet, so workers are unfenced today) and the host passes
+`sandbox_host_gap()`, they also get `--sandbox enabled` and one `--add-dir` per writable root
+(`writable_args`: the project state with the run dir, git metadata, temp and lock dirs), so
+result.json stays writable without the harness writing `.cursor/sandbox.json`. Otherwise they are
+unfenced and `write_fence()` says why.
 
 | Question | Linux | macOS |
 | :- | :- | :- |
@@ -84,6 +86,15 @@ def sandbox_host_gap(system: str = "", release: str = "", proc: str = "/proc/sys
     return ""
 
 
+def sandbox_network_gap(help_text: str) -> str:
+    """Why `--sandbox enabled` would cut workers off the network; "" once a flag can open it. Build
+    2026.10.22-27dcf5f (read from its bundled code, not run live): the sandbox's network policy is
+    deny by default, plus a server-sent allowlist; only `sandbox.networkAccess` in the CLI config or
+    an allow list in `.cursor/sandbox.json` opens it, and no flag in `--help` does. git fetch, gh and
+    ssh must work in a worker, and the harness writes neither file."""
+    return "Cursor's sandbox denies network by default and no CLI flag allows it (git, gh and ssh would fail)"
+
+
 def account_label(who: str) -> str:
     """The account label for login `who`: 'cursor:' and an opaque hash, never the login itself."""
     return f"cursor:{hashlib.sha256(who.encode()).hexdigest()[:12]}" if who else "cursor"
@@ -131,7 +142,7 @@ class Cursor(Provider):
         missing = [f for f in ("--sandbox", "--add-dir") if not re.search(rf"(?<![\w-]){f}\b", help_text)]
         if missing:
             return f"--force without --sandbox enabled: this build's `--help` lists no {' or '.join(missing)}"
-        gap = sandbox_host_gap()
+        gap = sandbox_network_gap(help_text) or sandbox_host_gap()
         return f"--force without --sandbox enabled: {gap}" if gap else ""
 
     def writable_args(self, dirs):
