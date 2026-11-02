@@ -196,7 +196,15 @@ def argv(remote: str, tag: str, old: str, new: str) -> list[str]:
 def move(p, repo, tag: str, commit: str, say) -> int:
     """`ttp push --move-tag <tag> <commit>`: move the channel tag forward to `commit` under a lease on
     its current remote value. 0 moved (or already there), 2 refused, 1 the push failed (a lease that
-    went stale meanwhile, the remote refused)."""
+    went stale meanwhile, the remote refused, a git call that timed out)."""
+    try:
+        return _move(p, repo, tag, commit, say)
+    except (OSError, subprocess.SubprocessError) as e:
+        say(f"ttp push: moving {tag} failed: {type(e).__name__}: {e}")
+        return 1
+
+
+def _move(p, repo, tag: str, commit: str, say) -> int:
     cfg = p.config()
     prefix = ["git", "-C", str(repo)]
     tag = tag.removeprefix("refs/tags/")

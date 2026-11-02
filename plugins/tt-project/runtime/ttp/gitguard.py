@@ -104,10 +104,13 @@ def never_force_refusal(args: list[str], env: dict, git: str = "git") -> str:
     if not (p.state / "project.db").is_file() or not never_force(cfg := p.config()):
         return ""
     if channeltag.plain_globals(globals_) and (move := channeltag.parse(rest)) is not None:
-        why, facts = channeltag.refusal([git, *globals_], move, cfg)
-        if not why:
-            channeltag.log(p, facts, "allowed")
-            return ""
+        try:   # a fault here refuses: main() runs git when this raises
+            why, facts = channeltag.refusal([git, *globals_], move, cfg)
+            if not why:
+                channeltag.log(p, facts, "allowed")
+                return ""
+        except Exception as e:
+            why = f"its checks failed ({type(e).__name__}: {e})"
         return f"delivery.never_force is true: not moving tag {move['tag']}: {why}"
     hint = (" To move a delivery.channel_tags tag forward, run `ttp push --move-tag <tag> <commit>`."
             if channeltag.channel_tags(cfg) else "")

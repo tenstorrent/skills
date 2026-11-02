@@ -12697,7 +12697,8 @@ def test_channel_tag_move_refusals_under_never_force(env, monkeypatch, capsys):
     """Every rule of the move: an unlisted tag, another ref or remote or several refs (also through a
     `-c` global or several push URLs), a missing, short
     or stale lease, a backward or sideways move, a commit off the push branch, and a delete or a branch
-    force push are refused, by `ttp push --move-tag` and by the run's git; the tag stays put."""
+    force push are refused, by `ttp push --move-tag` and by the run's git; the tag stays put. A check
+    that raises refuses too."""
     from ttp import channeltag, gitguard, hook
     p, repo, origin, c = _channel_setup(env, monkeypatch)
     p.set_config("delivery.channel_tags", ["chan"])
@@ -12754,6 +12755,12 @@ def test_channel_tag_move_refusals_under_never_force(env, monkeypatch, capsys):
     assert "moves only forward" in hook.git_push_bypass([[real, *channeltag.argv("origin", "chan", a, c["B"])]])
     assert _git_out(origin, "rev-parse", "chan") == a and _git_out(origin, "rev-parse", "other") == a
     assert not (p.state / channeltag.LOG).exists()
+    # A check that fails (a git call timing out) refuses rather than letting the forced push run.
+    def stall(*a, **k):
+        raise subprocess.TimeoutExpired("git", 1)
+    monkeypatch.setattr(channeltag, "_git", stall)
+    refused(good, "TimeoutExpired")
+    assert _ttp("push", "--move-tag", "chan", m) == 1 and "TimeoutExpired" in capsys.readouterr().err
 
 
 def test_an_upgraded_project_without_the_setting_rebases_onto_a_new_branch(env, monkeypatch):
