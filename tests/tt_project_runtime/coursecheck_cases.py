@@ -87,6 +87,60 @@ def test_course_self_review_flags_push_checks_invalidated_by_the_projects_own_pu
     assert _cc(p)[0] == []
 
 
+def _cc_batch(folder, name, outcome, started, ended, tasks, target="origin/main"):
+    # A push-queue batch marker as pushq/batch write it: finished, an outcome, entries, no task.
+    (folder / f"{name}.json").write_text(json.dumps({
+        "id": name, "kind": "batch", "status": "finished", "phase": "finished", "outcome": outcome,
+        "started": started, "ended": ended, "target": target, "rounds": 1,
+        "entries": [{"id": i, "task": t, "branch": f"ttp/t{t}", "head": "a" * 40} for i, t in enumerate(tasks, 1)]}))
+
+
+def test_course_self_review_flags_push_queue_batches_sent_back_moved_by_own_batches(env):
+    from ttp import push
+    p = make(env)
+    folder = p.state / push.DETACHED
+    folder.mkdir(parents=True, exist_ok=True)
+    t0 = time.time() - 7200
+    # Task 5's approval: its batch ended 'moved' twice while another of this project's batches pushed.
+    _cc_batch(folder, "batch-a", "moved", t0, t0 + 600, [5])
+    _cc_batch(folder, "batch-b", "pushed", t0 + 100, t0 + 400, [6, 8])
+    _cc_batch(folder, "batch-c", "moved", t0 + 1000, t0 + 1600, [5])
+    _cc_batch(folder, "batch-x", "pushed", t0 + 1100, t0 + 1200, [9], target="origin/other")   # another branch
+    assert _cc(p)[0] == []   # only one move had an own push to the same branch in its span
+    _cc_batch(folder, "batch-d", "tip_failed", t0 + 1100, t0 + 1300, [7])   # not a push: no landing
+    assert _cc(p)[0] == []
+    _cc_batch(folder, "batch-e", "pushed", t0 + 1100, t0 + 1300, [7])
+    lines, ident = _cc(p)
+    assert len(lines) == 1 and "self race: task #5's passed push checks were" in lines[0], lines
+    assert "2 times" in lines[0] and "#6" in lines[0] and "#7" in lines[0] and "#9" not in lines[0]
+    assert ident == "self_race:5"
+
+
+def test_course_self_review_flags_review_approvals_sent_back_as_push_conflicts_by_own_pushes(env):
+    from ttp import push
+    p = make(env)
+    folder = p.state / push.DETACHED
+    folder.mkdir(parents=True, exist_ok=True)
+    t0 = time.time() - 7200
+
+    def conflict(created, updated, batch):
+        p.db.x("INSERT INTO push_queue(task,branch,head,target,status,batch,created,updated) VALUES(?,?,?,?,?,?,?,?)",
+               (12, "ttp/t11", "b" * 40, "origin/main", "conflict", batch, created, updated))
+
+    # Review #12's approval is sent back as a push conflict twice; the batch it was in also pushed others.
+    conflict(t0, t0 + 900, "batch-r1")
+    _cc_batch(folder, "batch-r1", "pushed", t0 + 800, t0 + 900, [13])   # its own batch is not the cause
+    _cc_batch(folder, "batch-p1", "pushed", t0 + 200, t0 + 500, [14])
+    conflict(t0 + 1000, t0 + 1900, "batch-r2")
+    conflict(t0 - 4 * 86400, t0 - 4 * 86400 + 900, "batch-old")   # outside the 48 h window
+    assert _cc(p)[0] == []
+    _cc_batch(folder, "batch-p2", "pushed", t0 + 1200, t0 + 1500, [15])
+    lines, ident = _cc(p)
+    assert len(lines) == 1 and "self race: task #12's passed review approval was (push conflict)" in lines[0], lines
+    assert "2 times" in lines[0] and "#14" in lines[0] and "#15" in lines[0] and "#13" not in lines[0]
+    assert ident == "self_race:12"
+
+
 def test_course_self_review_flags_a_rule_cited_against_a_newer_user_message(env):
     p = make(env)
     now = time.time()

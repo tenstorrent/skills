@@ -9,9 +9,11 @@ so an idle project's digest does not grow. Each reuses a signal the harness alre
 - same_wait: an open task whose wait_stale events (daemon._stale_wait_event) carried the same probe
   `same_wait` (2) or more times, counting raises the stale gate skipped (stalegate.py): the same blocker
   met across several turns with no change of probe, owner or answer.
-- self_race: a task's push checks invalidated `self_races` (2) or more times in 48 h because the branch
-  moved during them (a non_fast_forward retry or a kept-moving exit in its push marker) while another of
-  this project's own pushes landed: a race with its own writers. A lane waiting on its own lock leaves no
+- self_race: a task's passed gate invalidated `self_races` (2) or more times in 48 h because the branch
+  moved while another of this project's own pushes (a detached push or a push-queue batch that pushed)
+  landed: its push checks (a non_fast_forward retry or kept-moving exit in its push marker, or a push-queue
+  batch that ended 'moved') or its review's approval (sent back as a push conflict, its push_queue row):
+  a race with its own writers. A lane waiting on its own lock leaves no
   model-free signal and is left to the prompt.
 - rule_clash: an open ask or a blocked task citing a rule (charter, restriction, policy) that a later
   user message touches (RULE_WORDS+ shared content words): the coordinator's reading of the rule may be
@@ -106,30 +108,74 @@ def _markers(folder: Path, since: float) -> list[dict]:
     return out
 
 
-def self_race(folder: Path | None, at: float, now: float) -> list[dict]:
-    """Per task: the times its push checks passed and the branch moved under them while another of this
-    project's pushes landed in that span."""
-    if not at or folder is None:
-        return []
-    from .push import KEPT_MOVING, NON_FF
-    ms = _markers(folder, now - RACE_S)
-    pushed = [m for m in ms if m.get("status") == "pushed" and m.get("ended")]
-    by_task: dict[str, dict] = {}
+def _own_pushes(ms: list[dict]) -> list[dict]:
+    """This project's own landings in the markers: a detached push that pushed, or a push-queue batch
+    whose outcome is 'pushed' (labelled by the tasks of its entries)."""
+    out = []
     for m in ms:
+        if not m.get("ended"):
+            continue
+        if m.get("kind") == "batch":
+            if m.get("outcome") != "pushed":
+                continue
+            tasks = [f"#{e['task']}" for e in m.get("entries") or [] if isinstance(e, dict) and e.get("task")]
+            label = ", ".join(tasks) or str(m.get("id"))
+        elif m.get("status") == "pushed":
+            label = f"#{m['task']}" if m.get("task") else str(m.get("id"))
+        else:
+            continue
+        out.append({"id": m.get("id"), "ended": float(m["ended"]), "label": label, "target": m.get("target")})
+    return out
+
+
+def _gate_losses(db: DB | None, ms: list[dict], since: float) -> list[tuple]:
+    """(task, start, at, kind, own id, target) for each passed gate the moving branch invalidated:
+    a detached push's non_fast_forward retry or kept-moving exit, a push-queue batch that ended 'moved'
+    (its approvals sent back), and a review's approval sent back as a push conflict (its push_queue row)."""
+    from .push import KEPT_MOVING, NON_FF
+    out = []
+    for m in ms:
+        if m.get("kind") == "batch":
+            if m.get("outcome") == "moved" and m.get("ended"):
+                for e in m.get("entries") or []:
+                    if isinstance(e, dict) and e.get("task"):
+                        out.append((str(e["task"]), float(m.get("started") or 0), float(m["ended"]), "checks",
+                                    m.get("id"), m.get("target")))
+            continue
         moves = [float(r.get("at") or 0) for r in m.get("retries") or [] if isinstance(r, dict) and r.get("cause") == NON_FF]
         if m.get("exit") == KEPT_MOVING and m.get("ended"):
             moves.append(float(m["ended"]))
         start = float(m.get("started") or m.get("queued") or 0)
         for t in sorted(moves):   # each round checks again from the previous move: only its own span counts
-            by = [q for q in pushed if q.get("id") != m.get("id") and start <= float(q["ended"]) <= t]
+            out.append((str(m.get("task") or "?"), start, t, "checks", m.get("id"), m.get("target")))
             start = t
-            if not by:
-                continue
-            row = by_task.setdefault(str(m.get("task") or "?"), {"n": 0, "by": set(), "last": 0.0})
-            row["n"] += 1
-            row["last"] = max(row["last"], t)
-            row["by"] |= {f"#{q['task']}" if q.get("task") else str(q.get("id")) for q in by}
-    return [{"task": k, "n": v["n"], "by": sorted(v["by"]), "last": v["last"]}
+    if db is not None:
+        for r in db.q("SELECT task, batch, target, created, updated FROM push_queue WHERE status='conflict' "
+                      "AND updated>=?", (since,)):
+            out.append((str(r["task"]), float(r["created"]), float(r["updated"]), "review", r["batch"], r["target"]))
+    return out
+
+
+def self_race(db: DB | None, folder: Path | None, at: float, now: float) -> list[dict]:
+    """Per task: the times a passed gate (its push checks, or its review's approval in the push queue) was
+    invalidated because the branch moved while another of this project's own pushes landed in that span."""
+    if not at or folder is None:
+        return []
+    since = now - RACE_S
+    ms = _markers(folder, since)
+    own = _own_pushes(ms)
+    by_task: dict[str, dict] = {}
+    for task, start, t, kind, me, target in _gate_losses(db, ms, since):
+        by = [q for q in own if q["id"] != me and start <= q["ended"] <= t
+              and (not target or not q["target"] or q["target"] == target)]
+        if not by:
+            continue
+        row = by_task.setdefault(task, {"n": 0, "by": set(), "last": 0.0, "kinds": set()})
+        row["n"] += 1
+        row["last"] = max(row["last"], t)
+        row["kinds"].add(kind)
+        row["by"] |= {q["label"] for q in by}
+    return [{"task": k, "n": v["n"], "by": sorted(v["by"]), "last": v["last"], "kinds": sorted(v["kinds"])}
             for k, v in sorted(by_task.items()) if v["n"] >= at]
 
 
@@ -218,8 +264,10 @@ def lines(db: DB, cfg: dict | None, pushes: Path | None = None, now: float | Non
                    f"{at(w['first'])} to {at(w['last'])}) on probe `{w['probe'] or '(none)'}` with no change | "
                    "change the owner, the probe or the route, or cancel; do not wait on it again as is")
         ident.append(f"same_wait:{w['id']}")
-    for r in safe(self_race, pushes, s["self_races"], now):
-        out.append(f"- self race: task #{r['task']}'s passed push checks were invalidated {r['n']} times in 48 h by "
+    gates = {("checks",): "push checks were", ("review",): "review approval was (push conflict)",
+             ("checks", "review"): "push checks and review approval were"}
+    for r in safe(self_race, db, pushes, s["self_races"], now):
+        out.append(f"- self race: task #{r['task']}'s passed {gates[tuple(r['kinds'])]} invalidated {r['n']} times in 48 h by "
                    f"this project's own pushes ({', '.join(r['by'][:4])}), last {at(r['last'])} | remove the cause: "
                    "serialize or schedule the self-inflicted writer, or carry the verdict across commits that cannot "
                    "affect it; never only re-run the gate")
