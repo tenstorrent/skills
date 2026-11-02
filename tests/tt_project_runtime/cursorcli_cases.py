@@ -212,3 +212,38 @@ def test_cursor_workers_keep_the_network_when_the_sandbox_would_block_it(env, mo
     assert "--force" in argv and "--sandbox" not in argv and "--add-dir" not in argv, argv
     assert task["status"] == "done"
     assert not (env["repo"] / ".cursor").exists(), "the harness writes no Cursor config file"
+
+
+def test_cursor_workers_under_no_internet_keep_the_sandbox(env, monkeypatch):
+    # The real build's sandbox blocks the network; under no_internet that is wanted, so workers there
+    # still get --sandbox enabled and an --add-dir per root, and doctor's reason names the case.
+    from ttp.providers import base, cursor
+    from ttp.providers.cursor import Cursor
+    rules = {"no_internet": True}
+    with monkeypatch.context() as m:
+        m.setattr(Cursor, "binary", lambda self: "/x/agent")
+        m.setitem(base._CLI_OUTPUT, ("/x/agent", "--help"), CURSOR_REAL_HELP)
+        m.setattr(cursor, "sandbox_host_gap", lambda: "")
+        assert Cursor().writable_args(["/s/state", "/r/.git"], rules) == [
+            "--sandbox", "enabled", "--add-dir", "/s/state", "--add-dir", "/r/.git"]
+        assert Cursor().write_fence(rules) == ""
+        assert "only projects under no_internet get it" in Cursor().write_fence()
+        assert Cursor().writable_args(["/s/state"], {"no_internet": False}) == []
+        # Under no_internet the host and the flags still count, and the reason says which case.
+        m.setattr(cursor, "sandbox_host_gap", lambda: "kernel 5.15 is older than the 6.2 the Cursor sandbox needs")
+        assert Cursor().writable_args(["/s/state"], rules) == []
+        assert Cursor().write_fence(rules) == ("--force without --sandbox enabled under no_internet: "
+                                               "kernel 5.15 is older than the 6.2 the Cursor sandbox needs")
+        m.setattr(cursor, "sandbox_host_gap", lambda: "")
+        m.setitem(base._CLI_OUTPUT, ("/x/agent", "--help"), CURSOR_REAL_HELP.replace("  --sandbox <", "  <"))
+        assert Cursor().writable_args(["/s/state"], rules) == [] and "lists no --sandbox" in Cursor().write_fence(rules)
+    # A dispatched worker in a no_internet project: fenced, its run dir writable, result.json lands.
+    monkeypatch.setattr(cursor, "sandbox_host_gap", lambda: "")
+    p, run, task, argv, _ = _cli_run(env, monkeypatch, "cursor", _codex_events(*CURSOR_STREAM_OK),
+                                     result={"status": "done", "summary": "ok"}, help_text=CURSOR_REAL_HELP,
+                                     before=lambda p: p.set_config("restrictions.no_internet", True))
+    assert argv[argv.index("--sandbox") + 1] == "enabled" and "--force" in argv, argv
+    added = [Path(argv[i + 1]) for i, a in enumerate(argv) if a == "--add-dir"]
+    assert any((p.runs / str(run["id"])).resolve().is_relative_to(d.resolve()) for d in added), added
+    assert task["status"] == "done"
+    assert not (env["repo"] / ".cursor").exists(), "the harness writes no Cursor config file"

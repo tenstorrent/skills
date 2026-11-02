@@ -2036,7 +2036,9 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `ttp doctor` line saying workers run without them.
 - Not yet on Cursor: worker plugins, worker isolation, coordinator updates reaching a running
   worker, and isolation of coordinator turns from your own CLI config and MCP servers. Cursor
-  enforces no `no_internet` restriction and has no plan-window meter; without ask mode it has no
+  enforces the `no_internet` restriction only through its sandbox (when the build lists
+  `--sandbox` and `--add-dir` and the host can run it; `ttp doctor` says when not) and has no
+  plan-window meter; without ask mode it has no
   read-only mode either.
 - Cursor has no reasoning-effort flag; tiers map to model names.
 - Context compaction per tier (`budget.compact_window_tokens`) works on Claude Code and Codex.

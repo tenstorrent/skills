@@ -211,7 +211,7 @@ class Codex(Provider):
         # `model_auto_compact_token_limit`: history is compacted once it reaches this many tokens.
         return ["-c", f"model_auto_compact_token_limit={int(tokens)}"] if tokens and tokens > 0 else []
 
-    def writable_args(self, dirs):
+    def writable_args(self, dirs, restrictions=None):
         # workspace-write only lets the worker write its cwd; result.json, `ttp note`, `ttp lock`
         # and commits in a worktree (whose git metadata lives in the main repository) are elsewhere.
         return ["-c", "sandbox_workspace_write.writable_roots=" + json.dumps([str(d) for d in dirs])] if dirs else []
@@ -280,7 +280,7 @@ class Codex(Provider):
             return []
         return [HOOK_TRUST_BYPASS, *hook_config_args()]
 
-    def write_fence(self) -> str:
+    def write_fence(self, restrictions=None) -> str:
         return ""   # workspace-write: Seatbelt on macOS, bubblewrap or the bundled helper on Linux
 
     def _events(self, output_path: Path):

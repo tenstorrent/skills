@@ -10,8 +10,8 @@ so the runner's stall guard sees progress and its budget check sees spend before
 
 Write fence (from the docs and `agent --help`; built, not measured live). Workers run with `--force`.
 When `--help` lists `--sandbox` and `--add-dir`, a flag can open the sandbox's network
-(`sandbox_network_gap()`; none does yet, so workers are unfenced today) and the host passes
-`sandbox_host_gap()`, they also get `--sandbox enabled` and one `--add-dir` per writable root
+(`sandbox_network_gap()`; none does yet, so only projects under the no_internet restriction, which
+want the network blocked, pass this) and the host passes `sandbox_host_gap()`, they also get `--sandbox enabled` and one `--add-dir` per writable root
 (`writable_args`: the project state with the run dir, git metadata, temp and lock dirs), so
 result.json stays writable without the harness writing `.cursor/sandbox.json`. Otherwise they are
 unfenced and `write_fence()` says why.
@@ -136,27 +136,32 @@ class Cursor(Provider):
             argv += ["--mode", "ask"]   # answers only: no edits and no commands
         return argv, {}
 
-    def _sandbox_gap(self) -> str:
-        """Why workers run without `--sandbox enabled`; "" when they get it."""
+    def _sandbox_gap(self, restrictions: dict | None = None) -> str:
+        """Why workers run without `--sandbox enabled`; "" when they get it. Under the no_internet
+        restriction the sandbox's blocked network is wanted, so only the flags and host count."""
         help_text = cli_output(self.binary() or "agent", "--help")
         missing = [f for f in ("--sandbox", "--add-dir") if not re.search(rf"(?<![\w-]){f}\b", help_text)]
         if missing:
             return f"--force without --sandbox enabled: this build's `--help` lists no {' or '.join(missing)}"
-        gap = sandbox_network_gap(help_text) or sandbox_host_gap()
-        return f"--force without --sandbox enabled: {gap}" if gap else ""
+        no_internet = bool((restrictions or {}).get("no_internet"))
+        net = "" if no_internet else sandbox_network_gap(help_text)
+        if net:
+            return f"--force without --sandbox enabled: {net}; only projects under no_internet get it"
+        gap = sandbox_host_gap()
+        return f"--force without --sandbox enabled{' under no_internet' if no_internet else ''}: {gap}" if gap else ""
 
-    def writable_args(self, dirs):
+    def writable_args(self, dirs, restrictions=None):
         # `--add-dir` makes each root a workspace root, writable inside the sandbox; the harness never
         # writes `.cursor/sandbox.json` (`additionalReadwritePaths`) for this.
-        if not dirs or self._sandbox_gap():
+        if not dirs or self._sandbox_gap(restrictions):
             return []
         out = ["--sandbox", "enabled"]
         for d in dirs:
             out += ["--add-dir", str(d)]
         return out
 
-    def write_fence(self) -> str:
-        return self._sandbox_gap()
+    def write_fence(self, restrictions=None) -> str:
+        return self._sandbox_gap(restrictions)
 
     def resume_args(self, session_id: str) -> list[str]:
         # `--resume [chatId]` continues a chat; the id is the session_id every stream event carries.

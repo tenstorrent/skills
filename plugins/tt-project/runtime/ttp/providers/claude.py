@@ -256,7 +256,7 @@ class Claude(Provider):
         text = Path(path).read_text()
         return [flag, text] if len(text.encode()) <= MAX_ARG_BYTES else []
 
-    def write_fence(self) -> str:
+    def write_fence(self, restrictions=None) -> str:
         gap = "bypassPermissions without the Bash sandbox"
         if sys.platform.startswith("linux"):
             missing = [b for b in ("bwrap", "socat") if not find_binary(b)]

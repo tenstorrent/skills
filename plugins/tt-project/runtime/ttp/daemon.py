@@ -2626,7 +2626,7 @@ class Daemon:
                 roots += list(dict.fromkeys([str(checkcap.slot_dir()), str(checkcap.slot_dir().resolve())]))
             except OSError:
                 pass   # `ttp checks` then says plainly that it cannot write the slots
-            fence = prov.writable_args(roots)
+            fence = prov.writable_args(roots, restrictions)
             sandboxed = bool(fence)
             loaded = prov.plugin_args([d for d in dirs if d not in missing])
             self._alert_plugins_dropped(prov, provider, [d for d in dirs if d not in missing], loaded)

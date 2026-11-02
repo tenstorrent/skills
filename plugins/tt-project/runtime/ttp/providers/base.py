@@ -376,12 +376,12 @@ class Provider:
         """Whether `name` (an MCP server or tool name) is one of the account's connectors."""
         return False
 
-    def writable_args(self, dirs: list[str]) -> list[str]:
+    def writable_args(self, dirs: list[str], restrictions: dict | None = None) -> list[str]:
         """Arguments that let a sandboxed worker also write `dirs` (run dir, project state, git
-        metadata); [] when the agent has no write sandbox."""
+        metadata); [] when the agent has no write sandbox. `restrictions`: the project's."""
         return []
 
-    def write_fence(self) -> str:
+    def write_fence(self, restrictions: dict | None = None) -> str:
         """Why this provider's workers can write outside their writable dirs, as built today; ""
         when an OS sandbox fences them. Shown by `ttp doctor`; changes nothing."""
         return "no write sandbox"

@@ -23,7 +23,7 @@ Claude Code measured on 2026-11-02, Codex CLI on 2026-10-09:
 | Session id | pass (assigned up front) | pass | not measured |
 | Usage | pass (reported cost) | pass (estimated from tokens) | not measured |
 | Structured output | pass | pass | not measured |
-| Write fence | unsupported: `bypassPermissions` runs without the Bash sandbox, which would need bubblewrap | pass (refused: read-only file system) | off: the sandbox denies network by default and no CLI flag allows it, so workers run with `--force` alone |
+| Write fence | unsupported: `bypassPermissions` runs without the Bash sandbox, which would need bubblewrap | pass (refused: read-only file system) | off: the sandbox denies network by default and no CLI flag allows it, so workers run with `--force` alone; on under `no_internet`, built, not measured live |
 | Resume | pass | pass | not measured |
 | Steer mid-run | pass (hook) | unsupported: no hook, the worker reads `steer.md` between steps | not measured |
 | Plan meter | pass (seven-day; the run reported no five-hour window) | pass (seven-day) | not measured |
@@ -81,14 +81,19 @@ $0.21). Cursor agent: installed, not measured (no login on the test machine).
   `review.sweep_after_s` (default 5 min) after its run ended; a `done` hand-off gets it at once.
 - Claude Code: workers have no write fence. They run with `bypassPermissions`, and the Bash
   sandbox that would fence them needs bubblewrap.
-- Cursor: workers run with `--force` alone and no write fence; `ttp doctor` names the reason.
+- Cursor: outside `no_internet` projects, workers run with `--force` alone and no write fence;
+  `ttp doctor` names the reason.
   The sandbox would cut them off the network: in build `2026.10.22-27dcf5f` (read from its bundled
   code, not run live) its network policy denies by default, plus an allowlist the server sends.
   Only `sandbox.networkAccess` in the CLI config or an allow list in `.cursor/sandbox.json` opens
   it, and no CLI flag does, so git fetch, gh and ssh would fail. The harness writes neither file.
   `writable_args` keeps the built path (`--sandbox enabled` and one `--add-dir` per writable root,
   when `agent --help` lists both flags and the host can run the sandbox: macOS; Linux 6.2+ with
-  unprivileged user namespaces allowed) for when a build adds a network flag and the adapter passes it.
+  unprivileged user namespaces allowed). It is used today only in projects with the `no_internet`
+  restriction, where the blocked network is wanted (Codex likewise leaves its network off there).
+  On Linux the sandbox helper (read from the same build) runs the worker in a network namespace of
+  its own with a private loopback, so the host's loopback services are out of reach. Workers do not need them: `ttp` commands and the hand-off write files under the
+  project state, which `--add-dir` keeps writable.
 - Codex: the harness hook runs only where hooks are on and no other hook source exists.
   Otherwise a worker sees an update only when it reads `steer.md` between steps.
 - Codex: the docs give no version for `developer_instructions` or
