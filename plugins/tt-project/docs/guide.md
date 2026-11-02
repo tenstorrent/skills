@@ -1911,8 +1911,8 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   builds that offer `--output-format stream-json` stream their progress: the stall guard sees it,
   and until usage arrives the budget check uses a floor from the text written so far. Older
   Cursor builds print nothing until the end, so set `stall_s` above their longest run. A cut-off
-  Cursor run that reported no usage is booked at the elapsed share of its budget (flagged
-  estimated).
+  run with no usage to price (Cursor, or Codex without a readable rollout) is booked at the
+  elapsed share of its budget (flagged estimated).
   A run that wrote no output and reported no tokens is booked at $0 (except on an older Cursor
   build, which prints nothing until it ends).
 - Codex workers run in Codex's workspace-write sandbox, with the project's state folder, the
