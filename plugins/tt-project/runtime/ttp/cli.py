@@ -1944,6 +1944,16 @@ def cmd_notify(a) -> None:
     text = a.text.strip()
     if not text:
         die("empty notify")
+    step = {}
+    if getattr(a, "step", None):
+        # A step only the user can take: one standing item per task and step (userstep.py).
+        if a.severity == "high":
+            die("ttp notify --step is for the user (low or normal); a high notify goes to the coordinator")
+        step = {"step": a.step, **({"check": a.check.strip()} if (a.check or "").strip() else {}),
+                **({"do": a.do.strip()} if (a.do or "").strip() else {}),
+                **({"deadline": time.time() + 60 * a.expires_in} if a.expires_in and a.expires_in > 0 else {})}
+    elif getattr(a, "check", None) or getattr(a, "do", None) or getattr(a, "expires_in", None):
+        die("ttp notify: --check, --do and --expires-in describe a user step: give its --step too")
     if a.severity == "high":
         durable_append(Path(run_dir) / ESCALATE_FILE, json.dumps({"ts": time.time(), "severity": "high",
                                                                  "text": text}) + "\n")
@@ -1952,8 +1962,13 @@ def cmd_notify(a) -> None:
               f"distinct texts per run); the user is not paged directly. Keep working")
         return
     durable_append(Path(run_dir) / NOTIFY_FILE, json.dumps({"ts": time.time(), "severity": a.severity,
-                                                           "text": text}) + "\n")
+                                                           "text": text, **step}) + "\n")
     durable_append(Path(run_dir) / "progress.md", f"{timefmt.clock()} notify: {text[:200]}\n")
+    if step:
+        print("queued for the user as this task's one standing item for this step: sent when this run ends, "
+              "then later notifies of it only update it. Hand off waiting with its check as retry_when"
+              + ("" if step.get("check") else " (give one: --check, a login or status command)"))
+        return
     print("queued for the user: it is sent when this run ends; say so in the hand-off")
 
 
@@ -9589,6 +9604,13 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--severity", choices=["low", "normal", "high", "critical"], default="normal",
                    help="high: an urgent report for the coordinator, relayed while the run lives; "
                         "critical is refused")
+    s.add_argument("--step", choices=["sign-in", "device-code", "credential"],
+                   help="a step only the user can take: one standing item per task and step, which later "
+                        "notifies of it update instead of alerting again")
+    s.add_argument("--check", help="with --step: a model-free command that exits 0 once the step is done "
+                                   "(a login or status check); the hand-off's retry_when")
+    s.add_argument("--do", help="with --step: what the user runs or opens to take it")
+    s.add_argument("--expires-in", type=float, metavar="MIN", help="with --step: minutes until the link or code lapses")
     s.set_defaults(fn=cmd_notify)
 
     s = sub.add_parser("progress", help="report a detached or looping driver's results, refusals, stalls and "

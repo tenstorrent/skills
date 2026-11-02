@@ -43,6 +43,7 @@ from . import lanewait
 from . import chainprio
 from . import churnwatch
 from . import alerts
+from . import userstep
 from . import anchors
 from . import pagesev
 from . import askrethink
@@ -4369,6 +4370,17 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "handoff_probe_refused", "normal", text, "queued", task["id"]))
             log(self.p, f"task {task['id']} hand-off: retry_when {bad} refused: no shell command")
+        if rstatus == "waiting":
+            # A wait on a user-only step wakes on the step's model-free check, never on the user's next message.
+            result, how = userstep.handoff(db, task, result)
+            if how == "set":
+                log(self.p, f"task {task['id']} hand-off: waits on its user step's check: {result['retry_when'][:300]}")
+            elif how == "missing":
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                     (time.time(), f"task:{task['id']}", "handoff_probe_refused", "normal",
+                      f"#{task['id']} {task['title']}: waits on a step only the user can take with no model-free "
+                      f"check that it is done (retry_when {str(result.get('retry_when') or 'none')[:200]}); give it "
+                      f"one (a login or status check), or the task wakes only at its retry timer", "queued", task["id"]))
         if rstatus == "waiting" and isinstance(result.get("retry_when"), str):
             result = self._pin_handoff_probe(task, r, run_dir, result)
         jobs = _detached_jobs(run_dir)
@@ -10638,7 +10650,15 @@ class Daemon:
         runs that command first (_start_on_pass): its on_pass counts only once the command exits 0.
         `why` is what passed (a freed exclusive slot, for _slot_reservations). An explicit start_after
         still ahead wins: the task sleeps until then, and the pass is acted on once it is over
-        (_hold_waiting, with a fresh answer)."""
+        (_hold_waiting, with a fresh answer). A passed retry_when also clears the task's user steps it
+        checks (userstep.probe_passed)."""
+        if why.startswith("probe passed"):
+            prev = load_result(task["result"])
+            try:
+                if done := userstep.probe_passed(self.p.db, task, {prev.get("retry_when"), prev.get("retry_when_orig")}, now):
+                    log(self.p, f"task {task['id']}: user step(s) {', '.join(done)} done: its retry_when passed")
+            except Exception as e:   # a wake is always safe
+                log(self.p, f"task {task['id']}: could not clear its user steps: {type(e).__name__}: {e}")
         after = deferral(task).get("after")
         if after and after > now:
             if (task["not_before"] or 0) < after:
@@ -14445,13 +14465,16 @@ def _reboot_wakes(task: dict) -> int:
 def relay_worker_notifies(p: Project, task: dict, run_dir: Path) -> int:
     """Post the `ttp notify` lines a worker run left as alerts, the way the coordinator's `notify`
     action does: at most low or normal severity, the first NOTIFIES_PER_RUN, a text already sent in
-    the last day not again. The file is renamed once the posts commit, so a second finish does not repost."""
+    the last day not again. A notify of a step only the user can take (its --step, or in a run that
+    hands off waiting or blocked, a text naming one) is the task's one standing item for that step
+    (userstep.relay): posted once, then updated in place by every later run of the task.
+    The file is renamed once the posts commit, so a second finish does not repost."""
     db, f = p.db, run_dir / NOTIFY_FILE
     try:
         lines = f.read_text(errors="replace").splitlines()
     except OSError:
         return 0
-    sent = 0
+    sent, ending = 0, None
     for line in lines:
         try:
             n = json.loads(line)
@@ -14464,6 +14487,14 @@ def relay_worker_notifies(p: Project, task: dict, run_dir: Path) -> int:
             log(p, f"task #{task['id']}: dropped `ttp notify` lines past {NOTIFIES_PER_RUN} in run {run_dir.name}")
             break
         text = headline.join(task['title'], body, 80, f"#{task['id']} ")
+        step = n.get("step") if n.get("step") in userstep.KINDS else None
+        if step is None and userstep.kind_of(n):
+            if ending is None:
+                ending = (_read_result(run_dir / RESULT_FILE) or {}).get("status")
+            step = userstep.kind_of(n) if ending in ("waiting", "blocked") else None
+        if step:
+            sent += userstep.relay(db, task, step, n, userstep.item_text(text, n, timefmt.zone(p)))
+            continue
         if db.one("SELECT id FROM messages WHERE direction='out' AND kind='alert' AND text=? AND ts>?",
                   (text, time.time() - 86400)):
             continue
