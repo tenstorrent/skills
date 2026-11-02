@@ -1544,18 +1544,22 @@ def test_stop_pids_stops_only_the_listed_processes_of_the_tasks_own_driver(env, 
 
 def test_stop_pids_escalates_to_sigkill_when_sigterm_is_ignored(env, tmp_path, monkeypatch):
     """A listed process that ignores SIGTERM is stopped by the SIGKILL step, and the outcome names its pid
-    under the SIGKILL step (PIDS_TERM_S monkeypatched short so the test stays fast)."""
+    under the SIGKILL step (PIDS_TERM_S monkeypatched short so the test stays fast). The child says it is
+    ready only once SIGTERM is ignored, so a slow start on a busy host cannot let SIGTERM end it."""
     from ttp import jobstop
     p = make(env)
     tid = p.db.add_task("driver", "s", kind="work", tier="light", origin="user")
-    # sleep 60 with SIGTERM ignored: only the SIGKILL step can stop it.
+    ready = tmp_path / "ignoring-sigterm"
+    # SIGTERM ignored, then a long sleep: only the SIGKILL step can stop it.
     stub = _task_proc(p, tid, argv=(sys.executable, "-c",
-                                    "import signal, time\n"
+                                    "import pathlib, signal, sys, time\n"
                                     "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-                                    "time.sleep(60)"))
+                                    "pathlib.Path(sys.argv[1]).touch()\n"
+                                    "time.sleep(600)", str(ready)))
     try:
-        time.sleep(0.2)
+        _wait_for_file(ready, stub, timeout=120)
         monkeypatch.setattr(jobstop, "PIDS_TERM_S", 0.3)
+        monkeypatch.setattr(jobstop, "FREE_WAIT_S", 60.0)   # ends as soon as the pid is gone; room for a busy host
         f = _pidfile(p.root / "results" / f"t{tid}" / "driver.pids", stub.pid)
         targets, gone, why = jobstop.plan_pids(p, f, str(tid))
         assert why is None and [t[0] for t in targets] == [stub.pid], why
