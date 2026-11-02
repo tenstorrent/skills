@@ -26857,7 +26857,7 @@ def test_durable_write_syncs_renames_and_keeps_the_mode(env, monkeypatch):
     assert f.read_text() == "two" and stat.S_IMODE(f.stat().st_mode) == 0o600
     assert [x.name for x in f.parent.iterdir()] == ["x.json"], "no temporary file left behind"
     project.durable_append(f, "+three\n")
-    assert f.read_text() == "two+three\n"
+    assert f.read_text() == "two\n+three\n", "a last line with no newline (cut short) gets one first"
 
 
 # Every place the runtime writes a file directly, and why it need not survive a power cut. Anything
@@ -26875,7 +26875,7 @@ DURABLE_EXEMPT = {
     ("cleantree.py", 'open(self.dir / LOCK, "w")'): "an empty flock file in a temp checkout folder; only the lock is used, never its content",
     ("project.py", 'os.fdopen(fd, "wb")'): "inside durable_write",
     ("project.py", "os.replace(tmp, path)"): "inside durable_write",
-    ("project.py", 'open(path, "a")'): "inside durable_append",
+    ("project.py", 'open(path, "ab+")'): "inside durable_append",
     ("ttp_pytest_rerun.py", 'open(path, "a")'): "runs inside the checked repo's pytest, not the runtime: appends one rerun result per test phase for this check run only; a cut last line is skipped on read, and a lost round shows as not run, never as passed",
     ("ttp_pytest_resume.py", 'open(self.path, "a")'): "runs inside the checked repo's pytest, not the runtime: appends one passed file per line, flushed and fsynced; a cut last line is ignored on read",
     ("release.py", "os.replace(tmp, cur)"): "a symlink swap; the directory is synced after",
@@ -26970,7 +26970,7 @@ DURABLE_EXEMPT = {
 def test_every_state_write_is_durable_or_exempt_with_a_reason():
     import re
     pat = re.compile(r"\.write_text\(|\.write_bytes\(|os\.replace\(|os\.fdopen\([^)]*[\"'][wa]|"
-                     r"open\([^)]*[\"'][wa]b?[\"']")
+                     r"open\([^)]*[\"'][wa](b\+?)?[\"']")
     ttp_dir = RUNTIME / "ttp"
     used, loose = set(), []
     for f in sorted(ttp_dir.rglob("*.py")):
