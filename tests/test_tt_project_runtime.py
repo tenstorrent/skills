@@ -26972,6 +26972,7 @@ DURABLE_EXEMPT = {
     ("upstream.py", 'os.replace(src, src.with_name(ACKS_QUEUED + ".filed"))'): "marks a run's queued acks filed; a rename lost to a crash only records the same ack again, which still closes the item",
     ("push.py", 'open(log, "ab")'): "a detached push's log; its outcome goes to the marker, durably",
     ("batch.py", "path.write_bytes(text.encode())"): "git merge-file's inputs, in a temporary directory removed after",
+    ("batch.py", "open(f, 'w').writelines(keep)"): "the sequence editor of a batch's rebase rewrites git's own todo file of that rebase in the push worktree, which git reads right after; a crash aborts the rebase and the next batch makes the worktree anew",
     ("daemon.py", "daemon.log"): "a log",
     ("daemon.py", "runner.log"): "a log",
     ("daemon.py", "ON_PASS_LOG"): "a log (an on_pass command's output, read only for its tail)",
