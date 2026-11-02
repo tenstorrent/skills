@@ -57,6 +57,19 @@ def _ended(procs, timeout=60):
     return out
 
 
+def _until_or_ended(cond, procs, guard=180):
+    """Wait for cond() or for one of procs to end, whichever comes first: an event, not a time window, so
+    a slow start on a loaded host (seconds before a `ttp lock` takes a free lock) never fails it. One
+    ended first fails with its exit code and stderr; `guard` only stops a hang."""
+    deadline = time.time() + guard
+    while not cond():
+        if ended := [x for x in procs if x.poll() is not None]:
+            raise AssertionError(f"ended first: {[(x.pid, x.returncode, x.stderr.read()) for x in ended]}")
+        if time.time() > deadline:
+            raise AssertionError(f"none of pids {[x.pid for x in procs]} got there in {guard} s (a hang?)")
+        time.sleep(0.05)
+
+
 def test_ttp_lock_takes_two_free_resources_and_shows_both_held_by_the_same_holder(env, tmp_path):
     from ttp import shared
     p = make(env)
@@ -205,10 +218,12 @@ def test_one_resource_lock_runs_its_whole_command_and_probe_parsing_is_unchanged
     assert locks.probe_resources("ttp lock --probe a b") == [], "a probe with a stray word is no lock probe, as before"
 
 
-def _nested_lock(flag, res):
-    """A command that waits for `flag`, then runs a `ttp lock <res> -- true` inside it."""
+def _nested_lock(flag, res, started):
+    """A command that creates `started` (it runs, so its lock is held), waits for `flag`, then runs a
+    `ttp lock <res> -- true` inside it."""
     inner = shlex.join([sys.executable, str(TTP), "lock", res, "--", "true"])
-    return ("bash", "-c", f"while [ ! -e {shlex.quote(str(flag))} ]; do {_nap()}; done; {inner}")
+    return ("bash", "-c", f": > {shlex.quote(str(started))}; "
+                          f"while [ ! -e {shlex.quote(str(flag))} ]; do {_nap()}; done; {inner}")
 
 
 def test_a_lock_holders_nested_lock_never_waits_behind_a_multi_waiter_for_its_own_lock(env, tmp_path):
@@ -217,14 +232,15 @@ def test_a_lock_holders_nested_lock_never_waits_behind_a_multi_waiter_for_its_ow
     from ttp import shared
     p = make(env)
     run_env = _lock_env(env, p)
-    flag = tmp_path / "flag"
-    h = _lock(run_env, "--timeout", "0", "rig-a", cmd=_nested_lock(flag, "rig-b"))
+    flag, started = tmp_path / "flag", tmp_path / "started"
+    h = _lock(run_env, "--timeout", "0", "rig-a", cmd=_nested_lock(flag, "rig-b", started))
     procs = [h]
     try:
-        assert _until_true(lambda: any(x.startswith("rig-a: ") for x in shared.held(p)))
+        _until_or_ended(started.exists, procs)   # the holder's command runs: rig-a is held
+        assert any(x.startswith("rig-a: ") for x in shared.held(p)), shared.held(p)
         w = _lock(run_env, "rig-a,rig-b")
         procs.append(w)
-        assert _until_true(lambda: _queue_len(p, "rig-b") == 1 and _queue_len(p, "rig-a") == 1)
+        _until_or_ended(lambda: _queue_len(p, "rig-b") == 1 and _queue_len(p, "rig-a") == 1, procs)
     finally:
         flag.touch()
     assert _ended(procs, timeout=20) == [0, 0], [x.stderr.read() for x in procs]
@@ -245,14 +261,16 @@ def test_a_whole_run_holders_nested_lock_never_waits_behind_a_multi_waiter_for_i
     from ttp import shared
     p = make(env)
     run_env = _lock_env(env, p)
-    go = tmp_path / "go"
-    run_hold = _lock(run_env, "rig-a", cmd=_until(go))   # stands for the exclusive task's whole-run hold of rig-a
+    go, started = tmp_path / "go", tmp_path / "started"
+    # stands for the exclusive task's whole-run hold of rig-a; its command marks that it runs under it
+    run_hold = _lock(run_env, "rig-a", cmd=("bash", "-c", f": > {shlex.quote(str(started))}; {_until(go)[-1]}"))
     procs = [run_hold]
     try:
-        assert _until_true(lambda: any(x.startswith("rig-a: ") for x in shared.held(p)))
+        _until_or_ended(started.exists, procs)
+        assert any(x.startswith("rig-a: ") for x in shared.held(p)), shared.held(p)
         w = _lock(run_env, "rig-a,rig-b")
         procs.append(w)
-        assert _until_true(lambda: _queue_len(p, "rig-b") == 1 and _queue_len(p, "rig-a") == 1)
+        _until_or_ended(lambda: _queue_len(p, "rig-b") == 1 and _queue_len(p, "rig-a") == 1, procs)
         run_dir = tmp_path / "run"
         run_dir.mkdir()
         (run_dir / "run.json").write_text(json.dumps({"exclusive": [{"resource": "rig-a"}]}))
