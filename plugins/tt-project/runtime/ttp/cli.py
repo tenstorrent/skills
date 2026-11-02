@@ -9124,11 +9124,21 @@ def _apply_upgrade(p: Project, commit: str) -> None:
     if subprocess.run(["git", "-C", str(h), "merge-base", "--is-ancestor", "HEAD", merged]).returncode != 0:
         die(f"--apply refused: main moved and {commit} does not contain it; nothing was changed. In the "
             f"worktree: `git merge main`, check again, commit, then rerun with the new commit.", 1)
-    upjournal.step(p, "merging", base=_git(h, "rev-parse", "HEAD"), merged=merged)
-    r = subprocess.run(["git", "-C", str(h), "merge", "--ff-only", merged], capture_output=True, text=True,
-                       env={**os.environ, release.GUARD_ENV: "1"})
-    if r.returncode != 0:
-        die(f"--apply: could not fast-forward main to {commit}: {(r.stderr or r.stdout).strip()[-400:]}", 1)
+    from . import applyff
+    base = _git(h, "rev-parse", "HEAD")
+    upjournal.step(p, "merging", base=base, merged=merged)
+    # A worker sandbox writes the harness's .git but not its working tree: the daemon moves main instead.
+    blocked = applyff.unwritable(h, base, merged)
+    why = "" if blocked else applyff.fast_forward(h, merged, release.GUARD_ENV)
+    if blocked or applyff.no_write(why):
+        print(f"--apply cannot write the harness working tree ({blocked or why}); asking the daemon to "
+              f"fast-forward main")
+        outcome, why = applyff.request(p, merged, os.environ.get("TTP_TASK") or "")
+        why = "" if outcome == "done" or _git(h, "rev-parse", "HEAD") == merged else why
+    if why:
+        die(f"--apply: could not fast-forward main to {commit}: {why}. Main is still "
+            f"{_git(h, 'rev-parse', 'HEAD')[:12]} and nothing was restarted; rerun "
+            f"`ttp upgrade {p.name} --apply {commit}`", 1)
     sync_all()
     upjournal.step(p, "merged")
     release.clear_stuck(p)

@@ -278,7 +278,11 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   (state/locks/harness-upgrade.task; stale once the task is done, failed, cancelled or gone): a
   later `ttp upgrade` commits the newer template on `upstream`, retargets that task (its spec and
   its running worker's steer.md) and exits 75, never merging into `main`. The task applies its resolution with
-  `ttp upgrade <name> --apply <commit>` (fast-forward only). A reference-transaction hook in the
+  `ttp upgrade <name> --apply <commit>` (fast-forward only). A worker sandbox that cannot write the
+  harness working tree hands the fast-forward to the daemon (state/apply.request, checked again
+  there against the upgrade lock, the journal and both ancestries; withdrawn if not taken within
+  `applyff.APPLY_WAIT_S`), then restarts it as usual. A fast-forward that fails part-way puts every
+  file it touched back to main's version. A reference-transaction hook in the
   harness repo refuses every other update of `main` that newly takes in `upstream`.
   Runtime files `main` deleted, emptied or cut short are restored from `upstream`. A file that only
   lacks top-level names `upstream` ships is kept (a deliberate local edit) unless the merged runtime
