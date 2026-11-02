@@ -456,3 +456,37 @@ def test_config_hand_edit_after_a_recorded_set_reads_unknown_not_the_old_setter(
     allrec["jev.enabled"] = {"by": "user", "ts": 1.0}
     p.db.set_kv(configwho.KEY, allrec)
     assert configwho.role(who("jev.enabled")) == "user"
+
+
+def test_load_caps_migration_removing_two_keys_of_one_section_keeps_the_sections_setter(env, monkeypatch):
+    # Each removal's record compares against the state the previous removal left (not the file before
+    # the whole migration), so a second removal under the same section does not read it as hand-edited.
+    p = make(env)
+    from ttp import cli, configwho
+    for k in ("TTP_RUN_ID", "TTP_RUN_DIR", "TTP_TASK_ID", "TTP_TASK"):
+        monkeypatch.delenv(k, raising=False)
+
+    def who(key):
+        return configwho.lookup(p.db, key, p.raw_config())
+
+    p.set_config("review", {"sweep_after_s": 1800, "unreviewed_per_pass": 2, "max_rounds": 5},
+                 by=configwho.by("user", msgs=[9], via="cli"))
+    note = cli._migrate_load_caps(p)
+    assert "review.sweep_after_s 1800" in note and "review.unreviewed_per_pass 2" in note, note
+    review = p.raw_config()["review"]
+    assert "sweep_after_s" not in review and "unreviewed_per_pass" not in review, review
+    rec = who("review.max_rounds")
+    assert (rec["by"], rec.get("msgs")) == ("user", [9]), rec
+    assert configwho.role(who("review")) == "user"
+    for key in ("review.sweep_after_s", "review.unreviewed_per_pass"):
+        rec = who(key)
+        assert (rec["by"], rec["via"]) == ("default", "upgrade: load-sized default"), (key, rec)
+    # A section edited by hand before the migration stays unknown: the stepwise records never launder it.
+    p.set_config("review", {"sweep_after_s": 1800, "unreviewed_per_pass": 2, "max_rounds": 5},
+                 by=configwho.by("user", msgs=[9], via="cli"))
+    raw = p.raw_config()
+    raw["review"]["max_rounds"] = 6
+    from ttp.project import write_json
+    write_json(p.config_path, raw)
+    assert "review.sweep_after_s 1800" in cli._migrate_load_caps(p)
+    assert configwho.role(who("review.max_rounds")) == "unknown"

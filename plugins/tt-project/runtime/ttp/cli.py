@@ -8718,10 +8718,17 @@ def _migrate_load_caps(p: Project) -> str:
         write_json(p.config_path, new)
         if p.established():
             from . import configwho
+            # One removal at a time: each record's `before` is the state the previous removal left, so a
+            # section holding two removed keys follows both (never reads as edited by hand).
+            state = raw
             for key in loadcaps.OLD_DEFAULTS:
-                if configwho.digest(configwho.at(raw, key)) != configwho.digest(configwho.at(new, key)):
-                    configwho.record(p.db, key, {"by": "default", "via": "upgrade: load-sized default"},
-                                     before=raw, after=new)
+                if configwho.digest(configwho.at(raw, key)) == configwho.digest(configwho.at(new, key)):
+                    continue
+                section, leaf = key.split(".", 1)
+                step = {**state, section: {k: v for k, v in state[section].items() if k != leaf}}
+                configwho.record(p.db, key, {"by": "default", "via": "upgrade: load-sized default"},
+                                 before=state, after=step)
+                state = step
     except Exception:
         return ""
     return "upgrade note: defaults now sized to the project's load: " + "; ".join(done)
