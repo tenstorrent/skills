@@ -899,6 +899,22 @@ def no_work(r) -> bool:
             or not ((r["input_tokens"] or 0) + (r["cache_read_tokens"] or 0) + (r["cache_write_tokens"] or 0)))
 
 
+# A worker or reviewer run whose first call read fewer cached tokens than this started cold: it wrote
+# the shared prompt prefix to the cache again (prompts.worker_system is the same for every task so
+# concurrent runs share it).
+COLD_START_TOKENS = 6000
+
+
+def cold_starts(rows) -> dict:
+    """Of the worker and reviewer runs in `rows` that recorded their first call's cache read
+    (cache_telemetry.first_cache_read), how many started cold (under COLD_START_TOKENS) and their share."""
+    first = [t.get("first_cache_read") for t in (_note(r["note"]).get("cache_telemetry") for r in rows
+                                                 if r["role"] in ("worker", "reviewer"))
+             if isinstance(t, dict) and isinstance(t.get("first_cache_read"), int)]
+    cold = sum(1 for x in first if x < COLD_START_TOKENS)
+    return {"runs": len(first), "cold": cold, "share": round(cold / len(first), 3) if first else None}
+
+
 def reread_stats(db: DB, days: float = 7, now: float | None = None, top: int = 10,
                  since: float | None = None, until: float | None = None) -> dict:
     """Context re-read (cache-read) tokens of the runs started in the last `days` (or between `since`
@@ -957,7 +973,7 @@ def reread_stats(db: DB, days: float = 7, now: float | None = None, top: int = 1
     steered = {"runs": len(after), "after_avg": round(sum(after) / len(after)) if after else 0,
                "after_max": max(after, default=0), "handoffs": dict(sorted(handoffs.items(), key=lambda kv: -kv[1]))}
     return {"days": round((until - since) / 86400, 2), "since": since, "until": until, **summary(rows), "groups": by,
-            "steered": steered,
+            "steered": steered, "cold_starts": cold_starts(rows),
             "top": [{"run": r["id"], "task": r["task"], "role": r["role"], "kind": r["kind"], "tier": r["tier"],
                      "effort": r["effort"], "usd": round(r["cost_usd"] or 0, 2), "cache_read": r["cache_read_tokens"] or 0,
                      "minutes": round(((r["ended"] or now) - (r["started"] or now)) / 60),
@@ -1008,6 +1024,10 @@ def reread_text(s: dict, tz=None) -> str:
                      + ", ".join(f"{k} {v}" for k, v in st["handoffs"].items()))
     else:
         lines.append("Split steer: no run steered")
+    cs = s.get("cold_starts") or {}
+    lines.append(f"Cold starts: {cs['cold']} of {cs['runs']} worker and reviewer runs ({cs['share']:.0%}) read under "
+                 f"{COLD_START_TOKENS / 1e3:g} k cached tokens on their first call" if cs.get("runs") else
+                 "Cold starts: no worker or reviewer run recorded its first call's cache read")
     lines.append("Top runs:")
     lines += [f"  run {t['run']} (#{t['task'] or '-'} {t['kind'] or t['role']}/{t['tier'] or '-'}/{t['effort'] or '-'}, "
               f"{t['minutes']} min, ${t['usd']:.2f}): {m(t['cache_read'])} {t['title']}".rstrip() for t in s["top"]]

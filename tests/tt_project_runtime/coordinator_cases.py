@@ -8098,12 +8098,12 @@ def test_the_review_prompt_approves_into_the_push_queue_only_when_it_is_on(env):
     assert "A `pushing` task is in the queue: leave it." in coord_md
     p = make(env)
     from ttp import coordinator as coord
-    from ttp.prompts import worker_task
+    from ttp.prompts import worker_rules, worker_task
     review = p.db.add_task("review it", "s", kind="review", tier="light", origin="user")
     code = p.db.add_task("fix it", "s", kind="code", tier="light", origin="user")
 
-    def prompt(tid=review):
-        return worker_task(p, p.db.task(tid), str(p.root), None)
+    def prompt(tid=review):   # its kind's rules, without worker.md's rules for its kind (worker_rules)
+        return worker_task(p, p.db.task(tid), str(p.root), None).replace(worker_rules(p, p.db.task(tid)), "")
 
     def policy(tid=review):
         return next(x for x in prompt(tid).splitlines() if x.startswith("delivery policy:"))
@@ -17417,7 +17417,7 @@ def test_pinned_worker_memory_past_its_room_shows_the_task_s_entries_and_a_plain
     those its task names before the oldest, never shows an unpinned one in their place, and points to
     the rest in one short line that does not read as a fault."""
     p = make(env)
-    from ttp.prompts import worker_context, worker_system
+    from ttp.prompts import worker_context, worker_rules, worker_system
     pinned = [p.add_memory(f"WORKER-{i:02} uses rack-{i:02} " + "w" * 600, kind="decision", audience="workers")
               for i in range(20)]
     for i, f in enumerate(pinned):
@@ -17431,7 +17431,9 @@ def test_pinned_worker_memory_past_its_room_shows_the_task_s_entries_and_a_plain
     assert pinned[17].stem in shown and pinned[0].stem in shown and pinned[19].stem not in shown, shown
     assert not any("FACT-NEWEST" in e["line"] for e in mem)
     system = worker_system(p, task)
-    assert "WORKER-17 uses rack-17 " + "w" * 600 in system and "WORKER-19 uses rack-19 " + "w" * 600 not in system
+    # The task's own entry comes whole in its own prompt; the shared system prompt keeps the oldest.
+    whole = system + worker_rules(p, task)
+    assert "WORKER-17 uses rack-17 " + "w" * 600 in whole and "WORKER-19 uses rack-19 " + "w" * 600 not in whole
     assert system.rstrip().endswith("…") and f"\n[{pinned[19].stem}] WORKER-19 uses rack-19 www" in system
     assert f"Shortened for room, each in full in {p.memory_dir}/<name>.md" in system
     assert "did not fit" not in system
@@ -17892,7 +17894,7 @@ def test_worker_memory_gives_task_ranked_entries_a_floor_past_a_long_charter(env
     stay whole, and the memory never passes the pinned chars plus that floor."""
     p = make(env)
     from ttp.project import WORKER_RANKED_MIN_CHARS
-    from ttp.prompts import WORKER_MEMORY_CHARS, worker_context, worker_system
+    from ttp.prompts import WORKER_MEMORY_CHARS, worker_context, worker_rules, worker_system
     p.charter_path.write_text(_LONG_GOALS_CHARTER)
     _memories(p, [("resource", "Box B (alias box-b): spare runner. " + "p" * 400),
                   ("restriction", "Never reboot box B mid-job. " + "q" * 400),
@@ -17906,7 +17908,7 @@ def test_worker_memory_gives_task_ranked_entries_a_floor_past_a_long_charter(env
     assert use["pinned_dropped"] == 0 and sum("p" * 400 in x or "q" * 400 in x for x in lines) == 2
     assert any("OLD-PATH" in x for x in lines), lines
     assert sum(len(x) + 1 for x in lines) <= use["pinned_chars"] + WORKER_RANKED_MIN_CHARS
-    assert "OLD-PATH" in worker_system(p, task)
+    assert "OLD-PATH" in worker_rules(p, task) and "OLD-PATH" not in worker_system(p, task)
     assert not any("OLD-PATH" in e["line"] for e in worker_context(p)[1]), "no task: newest facts, as before"
 
 

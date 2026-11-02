@@ -17055,7 +17055,7 @@ def test_worker_memory_puts_entries_naming_the_tasks_paths_and_resources_first(e
     whatever the task, whole entries only, within the limit, oldest first. No task, or a task naming
     nothing in memory: the newest, as before."""
     p = make(env)
-    from ttp.prompts import worker_system
+    from ttp.prompts import worker_rules, worker_system
     _memories(p, [("resource", "Box A is ours."), ("restriction", "Never reboot box A mid-job.")]
               + [("fact", "OLD-PATH: src/widget/cache.py holds the warm-up switch; " + "a" * 300),
                  ("fact", "OLD-BOX: bench-box-7 needs its fan profile reset after each run; " + "b" * 300),
@@ -17077,7 +17077,7 @@ def test_worker_memory_puts_entries_naming_the_tasks_paths_and_resources_first(e
         assert sel[1]["shown"] == len(got) == 4 and sel[1]["pinned"] == 2
         assert sum(len(e["line"]) + 1 for e in sel[0]) <= limit
         assert [e["name"] for e in sel[0]] == [e["name"] for e in p._memory_entries() if e in sel[0]]
-        assert want in worker_system(p, task)
+        assert want in worker_system(p, task) + worker_rules(p, task)
     unrelated = {"title": "code: docs", "spec": "Fix a typo in the readme.", "kind": "code"}
     assert names(p.worker_memory_select(limit, unrelated)) == names(plain)
     # Plain words tie nothing; a name counts less the more entries share it, so a path every new
@@ -28870,7 +28870,7 @@ def test_the_worker_prompt_budget_file_sums_to_the_caps_it_replaced():
 def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stays_small(env, monkeypatch, tmp_path):
     import inspect, json as _json, re as _re
     from ttp import machines, prompts
-    from ttp.prompts import feature_blocks, worker_features, worker_system
+    from ttp.prompts import feature_blocks, worker_features, worker_rules, worker_system
     p = make(env)
     monkeypatch.setattr(machines, "load", lambda: {})
     src = (p.harness / "prompts" / "worker.md").read_text()
@@ -28908,8 +28908,8 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
         assert "change ledger" in text and "`ttp lock <resource> -- <command>`" in text
         assert "No `result.json`, no credit" in text and "NEVER poll, sleep-wait" in text
 
-    def rendered(task):
-        return worker_system(p, task)
+    def rendered(task):   # what a worker reads: the shared system prompt and its task's own rules
+        return worker_system(p) + "\n\n" + worker_rules(p, task or {})
     # PR rules: only kinds that may deliver; every other task is told it never touches a PR.
     for kind in ("code", "review"):
         assert "NEVER mark a PR ready for review" in rendered({"kind": kind})
@@ -29002,12 +29002,9 @@ def test_the_worker_system_prompt_carries_only_the_rules_its_task_needs_and_stay
     assert all(m in s for m in safe), [m for m in safe if m not in s]
     p.set_config("device", {})
     p.charter_path.write_text(charter)
-    # worker_prompt renders the rules of the task it is given, as the daemon does.
-    monkeypatch.setattr(prompts, "worker_task", lambda *a: "")
-    assert "NEVER mark a PR ready for review" not in prompts.worker_prompt(p, question, ".", None)
-    assert "NEVER mark a PR ready for review" in prompts.worker_prompt(p, code, ".", None)
-    # The daemon renders the prompt for the task it starts.
-    assert "task" in inspect.signature(worker_system).parameters
+    # The system prompt is the same for every task; the task's prompt carries its own rules.
+    assert worker_system(p, code) == worker_system(p, question) == worker_system(p)
+    assert "worker_rules(p, task)" in inspect.getsource(prompts.worker_task)
     assert prompts.worker_system is worker_system
 
 
@@ -40701,12 +40698,14 @@ def test_own_push_off_keeps_own_out_of_the_code_prompt_and_pr_fix_specs(env):
     section's publishing bullet is dropped and the based-on-another-branch refusal says hand off
     blocked. The daemon's PR-fix spec asks for no own push either, free branch or held."""
     from ttp.daemon import Daemon
-    from ttp.prompts import own_off, worker_task
+    from ttp.prompts import own_off, worker_rules, worker_task
     p = make(env)
     t = p.db.task(p.db.add_task("Speed up the loader", "Make it faster.", kind="code"))
     assert "--own" in worker_task(p, t, str(p.root), "ttp/t1-x")
     p.set_config("delivery.own_push", "off")
-    prompt = worker_task(p, t, str(p.root), "ttp/t1-x")
+    # Its kind's rules, without worker.md's for its kind (worker_rules, as in the system prompt before).
+    kind_part = lambda task, branch: worker_task(p, task, str(p.root), branch).replace(worker_rules(p, task), "")
+    prompt = kind_part(t, "ttp/t1-x")
     assert "--own" not in prompt and "## Pull requests" in prompt, prompt
     assert "else hand off `blocked` with its message (own pushes are off" in prompt
     # A warning against it stays; another sentence of the same item asking for one is cut.
@@ -40722,7 +40721,7 @@ def test_own_push_off_keeps_own_out_of_the_code_prompt_and_pr_fix_specs(env):
     rec = {"task": src, "branch": pr_branch, "url": url}
     fix, made = d.pr_findings_owner("acme/widgets#7", rec, "CI failing: tests")
     assert made and "--own" not in fix["spec"] and "do not push anywhere yourself" in fix["spec"], fix["spec"]
-    assert "--own" not in worker_task(p, fix, str(p.root), pr_branch)
+    assert "--own" not in kind_part(fix, pr_branch)
     p.db.update_task(fix["id"], status="done")
     held = env["tmp"] / "held"
     subprocess.run(["git", "-C", str(p.root), "worktree", "add", "-q", str(held), pr_branch], check=True)

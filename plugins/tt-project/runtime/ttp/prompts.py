@@ -405,7 +405,7 @@ def restated_in(block: str):
 
 
 def worker_context(p: Project, task: dict | None = None,
-                   entries: list[dict] | None = None) -> tuple[str, list[dict], dict]:
+                   entries: list[dict] | None = None, reserve: int = 0) -> tuple[str, list[dict], dict]:
     """A worker's digest of the charter and memory: the Goals and Resources whole (the Brief only when
     no Goals are stated) and the policies and other charter items meant for workers (see
     for_workers) within what those leave of WORKER_MEMORY_CHARS, never less than
@@ -416,7 +416,8 @@ def worker_context(p: Project, task: dict | None = None,
     Memory never pushes out a policy. Memory entries that restate the charter's restrictions are left
     out: the prompt states those whole in their own block. Pinned entries past their budget are
     shown as pointers (`pointers`, counted in `pinned_dropped`; worker_system says where to read them). `entries`: memory entries in
-    place of memory/'s (see Project.worker_memory_select). Returns (charter text, memory entries, usage)."""
+    place of memory/'s (see Project.worker_memory_select). `reserve`: chars of the entries that are not
+    pinned left for the task's own prompt (worker_rules). Returns (charter text, memory entries, usage)."""
     raw = p.charter_path.read_text() if p.charter_path.exists() else ""
     secs = [(h, b) for h, b in charter_sections(charter_without_placeholders(raw))
             if h and not h[3:].strip().lower().startswith("restriction")]
@@ -450,12 +451,13 @@ def worker_context(p: Project, task: dict | None = None,
     rest = max(0, WORKER_MEMORY_CHARS - heads - len(text))
     room = max(rest, WORKER_PINNED_MIN_CHARS)   # for pinned entries
     restated = restated_in(charter_restrictions(raw))
-    mem, use = p.worker_memory_select(rest, task, room, restated, entries)
+    mem, use = p.worker_memory_select(max(0, rest - reserve), task, room, restated, entries)
     if use["pinned_dropped"]:   # make room for the line heading the pointers
         room -= len(_PINNED_MORE.format(path=p.memory_dir)) + 1
-        mem, use = p.worker_memory_select(min(rest, room), task, room, restated, entries)
+        mem, use = p.worker_memory_select(max(0, min(rest, room) - reserve), task, room, restated, entries)
     elif use["pinned_chars"] + WORKER_RANKED_MIN_CHARS > rest:   # every pinned one shown: the others' floor
-        mem, use = p.worker_memory_select(use["pinned_chars"] + WORKER_RANKED_MIN_CHARS, task, room, restated, entries)
+        mem, use = p.worker_memory_select(use["pinned_chars"] + WORKER_RANKED_MIN_CHARS - reserve, task, room,
+                                          restated, entries)
     return text, mem, dict(use, charter_chars=heads + len(text), charter_dropped=dropped, limit=WORKER_MEMORY_CHARS,
                            memory_limit=room)
 
@@ -535,22 +537,112 @@ def worker_features(p: Project, task: dict | None = None) -> set[str]:
     return on | unsure
 
 
+# Features a task's kind or spec turns on, never the project alone. Their blocks of worker.md go in the
+# task prompt (worker_rules), never in worker_system, which is then the same for every worker and
+# reviewer of a project: concurrent runs share its cache.
+TASK_FEATURES = ("harness", "prs", "wait", "cells")
+
+
+def project_features(p: Project) -> set[str]:
+    """The features of worker_features that no task changes: those worker_system renders."""
+    return worker_features(p) - set(TASK_FEATURES)
+
+
+def split_rules(text: str, base: set[str], on: set[str]) -> tuple[str, list[tuple[str, str]]]:
+    """`text` (worker.md) as feature_blocks renders it for `base` (project_features), but without the
+    blocks of TASK_FEATURES nor those of a feature `base` leaves off: the same for every task. Then each
+    left-out block that `on` (worker_features of a task) turns on, rendered for `on`, as (where, text):
+    `where` names its section, the item it continues when it starts mid-item outside a code fence, and the fence. A `!X` block of a
+    feature outside TASK_FEATURES follows `base` alone."""
+    shared, extras, stack, cap = [], [], [], None
+    section = item = fence = ""
+    for line in text.splitlines(keepends=True):
+        m = _IF_RE.match(line)
+        if cap is not None:   # inside a left-out block: kept whole, nested blocks too
+            cap[1].append(line)
+            cap[0] += (-1 if m.group(1) else 1) if m else 0
+            if not cap[0]:
+                _, raw, x, neg, (sec, cont, fen) = cap
+                body = feature_blocks("".join(raw), on) if (x in on) != neg else ""
+                if body.strip():   # a block that starts mid-item names the item it continues
+                    extras.append(((sec, cont if body.lstrip("\n")[:1].isspace() else "", fen), body))
+                cap = None
+            continue
+        if m and not m.group(1):
+            neg, x = bool(m.group(2)), m.group(3)
+            if not any(stack) and (x in TASK_FEATURES or (x not in base and not neg)):
+                cont = f'(continues "{item.strip()[:16]}…")' if item and not fence else ""
+                cap = [1, [line], x, neg, (section, cont, fence)]
+            else:
+                stack.append(any(stack) or (x in base) == neg)
+            continue
+        if m:
+            if stack:
+                stack.pop()
+            continue
+        if any(stack):
+            continue
+        shared.append(line)
+        if line.startswith("```"):
+            fence = "" if fence else line.strip()
+        elif line.startswith("#") and not fence:
+            section, item = line.strip().lstrip("#").strip(), ""
+        elif line.strip() and not line[0].isspace():
+            item = line
+    return strip_markers("".join(shared)), extras
+
+
+def worker_rules(p: Project, task: dict) -> str:
+    """What worker_system leaves out for `task` and its own prompt carries: the worker.md blocks of
+    the features it alone turns on (split_rules), and the memory entries its words pick
+    (worker_memory_select) that worker_system's task-free choice does not show whole, while they fit
+    WORKER_RANKED_MIN_CHARS."""
+    f = p.harness / "prompts" / "worker.md"
+    rules = split_rules(f.read_text(), project_features(p), worker_features(p, task))[1] if f.exists() else []
+    out, last = [], None
+    for (section, cont, fence), body in rules:   # one heading per section, one line per item continued
+        body = body.strip("\n")
+        if out and last[:2] == (section, cont) and last[2] == fence:
+            out[-1] = out[-1][:-4] + "\n" + body + "\n```" if fence else out[-1] + "\n" + body
+        else:
+            out.append(("" if last and last[0] == section else f"## {section or 'Worker rules'}\n")
+                       + (cont + "\n" if cont else "") + (f"{fence}\n{body}\n```" if fence else body))
+        last = (section, cont, fence)
+    shown = {e["name"] for e in worker_context(p, reserve=WORKER_RANKED_MIN_CHARS)[1]}
+    mem, used = [], 0
+    for e in worker_context(p, task)[1]:
+        if e["name"] not in shown and used + len(e["line"]) + 1 <= WORKER_RANKED_MIN_CHARS:
+            mem.append(e)
+            used += len(e["line"]) + 1
+    parts = []
+    if out:
+        parts.append(f"# {TASK_RULES_HEADER}\n" + "\n\n".join(out))
+    if mem:
+        p.note_memory_shown([e["name"] for e in mem])
+        parts.append(f"# {TASK_MEMORY_HEADER}\n" + "\n".join(e["line"] for e in mem))
+    return "\n\n".join(parts)
+
+
+TASK_RULES_HEADER = "TASK RULES (binding, as in the system prompt's section named)"
+TASK_MEMORY_HEADER = "MORE MEMORY FOR THIS TASK"
+
+
 def worker_corrections(p: Project) -> list[dict]:
     """The user's corrections a worker's prompt lists ahead of its memory (Project.user_corrections)."""
     return [e for e in p.user_corrections() if worker_memory(e)]
 
 
 def worker_system(p: Project, task: dict | None = None) -> str:
-    """The part of a worker's prompt shared by every task of the same shape (kind, devices, machines
-    it names) until the charter or memory changes: sent as the system prompt where the agent allows
-    it, so the provider caches it across the project's workers. Only worker_features() and the memory
-    entries' choice may read the task; the memory comes last, so on a project whose memory does not fit
-    whole only it differs between tasks and everything before it still caches."""
-    parts = [restrictions_block(p), _read(p, "worker.md", worker_features(p, task))]
+    """The part of a worker's prompt shared by every worker and reviewer of the project until the
+    charter, memory or its machines change: sent as the system prompt where the agent allows it, so
+    the provider caches it across concurrent runs. It never reads `task` (kept for callers): the rules
+    and memory a task alone needs go in its own prompt (worker_rules)."""
+    f = p.harness / "prompts" / "worker.md"
+    parts = [restrictions_block(p), split_rules(f.read_text(), project_features(p), set())[0] if f.exists() else ""]
     # The one copy of the restrictions (the task prompt only points back at it); a second inside the
     # charter only costs tokens.
     # The rest of the charter and memory is mostly the coordinator's: workers get their digest of it.
-    charter, mem, use = worker_context(p, task)
+    charter, mem, use = worker_context(p, reserve=WORKER_RANKED_MIN_CHARS)   # the task's own: worker_rules
     # The user's corrections come before the rest of memory, outside its budget (Project.user_corrections).
     fixed = worker_corrections(p)
     p.note_memory_shown([e["name"] for e in fixed + mem + use["pointers"]])
@@ -614,9 +706,9 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
     prev = load_result(task["result"])
     cmark = prev.get(conflictfix.KEY) if isinstance(prev.get(conflictfix.KEY), dict) else None
     if conflict and cmark and conflict.get("tier") == "light":
-        if isinstance(conflict.get("model_free"), dict):
-            return delta_review_task(p, task, cwd, branch, cmark, conflict["model_free"])
-        return conflict_fix_task(p, task, cwd, branch, cmark)
+        short = (delta_review_task(p, task, cwd, branch, cmark, conflict["model_free"])
+                 if isinstance(conflict.get("model_free"), dict) else conflict_fix_task(p, task, cwd, branch, cmark))
+        return "\n\n".join(x for x in (worker_rules(p, task), short) if x.strip())
     if prev:
         history = f"\nPrevious attempt ended '{prev.get('status')}': {str(prev.get('summary') or '')[:1500]}\n"
         if prev.get("woke"):
@@ -709,6 +801,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                  "yours; need other packages? make a venv of your own in the working directory)\n") if venv else ""
     parts = [
         _sections(_read(p, f"kind-{kind}.md"), cfg),
+        worker_rules(p, task),
         f"# YOUR TASK #{task['id']}: {task['title']}\n"
         f"kind: {kind} · tier: {task['tier']}" + (f" · this run: {run_tier} wake" if wake else "")
         + f" · attempt {int(task['attempts'] or 0) + 1} of "
@@ -976,4 +1069,4 @@ def worker_resume(p: Project, task: dict, lost: dict) -> str:
 
 def worker_prompt(p: Project, task: dict, cwd: str, branch: str | None) -> str:
     """The whole prompt in one piece, as a worker reads it."""
-    return worker_system(p, task) + "\n\n" + worker_task(p, task, cwd, branch)
+    return worker_system(p) + "\n\n" + worker_task(p, task, cwd, branch)

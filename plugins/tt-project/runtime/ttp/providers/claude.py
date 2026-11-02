@@ -467,8 +467,10 @@ class Claude(Provider):
         u.extra["cache_telemetry"] = {"complete": cache_complete, "requests": None,
                                       "source": "result" if saw_result else "messages"}
         # API messages and the first one's prompt (the prefix every later call re-reads): `ttp stats`
-        prompts = [t for t in (sum(m.get(k, 0) for k in cache_keys) for m in per_msg.values()) if t]
-        u.extra["cache_telemetry"].update(calls=len(prompts), first_context=prompts[0] if prompts else 0)
+        prompts = [(m, t) for m, t in ((m, sum(m.get(k, 0) for k in cache_keys)) for m in per_msg.values()) if t]
+        u.extra["cache_telemetry"].update(calls=len(prompts), first_context=prompts[0][1] if prompts else 0)
+        if prompts:   # what the first call found cached: a cold start reads little (bud.cold_starts)
+            u.extra["cache_telemetry"]["first_cache_read"] = prompts[0][0].get("cache_read_input_tokens", 0)
         for ev in self._events(output_path):
             if ev.get("type") == "assistant" and ev.get("error") == "authentication_failed":
                 u.auth_failed = True
