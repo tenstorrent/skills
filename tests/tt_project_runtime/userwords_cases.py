@@ -94,6 +94,28 @@ def test_contraction_fragments_match_no_unrelated_user_words(env):
     assert "latest words" not in coord.digest(p, {}, [], [])
 
 
+def test_a_short_sentence_sharing_only_generic_words_matches_no_topic(env):
+    # Like the live case: a short sentence about alternative machines and accounts must not
+    # match a provider-sign-in ask on the stems {account, machin, other} alone. Synthetic
+    # text; never real user messages.
+    from ttp import coordinator as coord
+    p = make(env)
+    p.db.post("in", "Use the other project and its accounts instead; wait for the worker there.",
+              chat=None, kind="user", provenance="web-session")
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    ask = "The provider sign-in expired: should I use the account and the machine credentials again?"
+    p.db.post("out", ask, chat=None, kind="ask")
+    d = coord.digest(p, {}, [], [])
+    assert "latest words" not in d, d
+    # A sentence that truly shares the topic's words still matches.
+    p.db.post("in", "The provider sign-in expired again; use the account credentials from the shared note.",
+               chat=None, kind="user", provenance="web-session")
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    lines = [x for x in coord.digest(p, {}, [], []).splitlines() if x.startswith(f"- ask #") ]
+    assert lines and "shared note" not in lines[0] and "accounts instead" not in lines[0] and \
+        "provider sign-in expired again" in lines[0], lines
+
+
 def test_the_ask_gate_refuses_leave_the_users_newer_request_gave_naming_it(env):
     from ttp import reask
     p = make(env)

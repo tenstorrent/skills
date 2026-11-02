@@ -13,7 +13,8 @@ Match: content words (reask.words, with GENERIC words dropped; for a topic also 
 and words under 3 characters) and hard anchors (reask.anchors).
 A query (the command) matches a sentence holding every one of its words, or its anchors with half
 of its words. A topic (the digest) matches a sentence sharing an anchor and one more word, or
-MIN_SHARED words that are at least COVER of the topic's or of the sentence's words.
+MIN_SHARED words that are at least COVER of the topic's words (never the sentence's: a short
+sentence of filler words must not match a topic on generic words alone).
 """
 from __future__ import annotations
 
@@ -35,7 +36,7 @@ QUOTE = 220
 # Words every task, ask or refusal carries: they tell no topic apart.
 GENERIC = {reask._stem(w) for w in """task tasks code work run runs fix fixes fixed blocked block wait waiting
 waits project projects coordinator worker workers change changes reject rejected refused gate action actions
-turn turns resend sent send""".split()}
+turn turns resend sent send other others""".split()}
 _CONTRACTION = re.compile(r"n't\b|'(?:s|ll|ve|re|d|m)\b")
 HEADER = ("## The user's latest words on blocked items (newest first, from their recorded messages: the newest "
           "word on a topic wins over an older rule or reading; apply it, or say why it does not cover the item)")
@@ -62,7 +63,9 @@ def _topic_hit(tw: set[str], ta: set[str], s: str) -> int:
     shared = tw & sw
     if ta & sa and len(shared - {a.split(":", 1)[1] for a in ta}) >= 1:
         return 10 + len(shared)
-    if len(shared) >= MIN_SHARED and (len(shared) >= COVER * len(tw) or len(shared) >= COVER * len(sw)):
+    # COVER is measured against the topic's words only: measuring it against a short
+    # sentence's words let a sentence share three generic-leaning stems and pass on them alone.
+    if len(shared) >= MIN_SHARED and len(shared) >= COVER * len(tw):
         return len(shared)
     return 0
 
