@@ -36,6 +36,7 @@ from . import runtimeload   # first of its own: its LOADED_AT is when the daemon
 from . import ackwait
 from . import checksgone
 from . import rejcool
+from . import stalegate
 from . import lanewait
 from . import chainprio
 from . import churnwatch
@@ -3604,6 +3605,10 @@ class Daemon:
             correction.settle(db, note, actions, str((out or {}).get("summary") or ""), float(r.get("started") or 0))
         except Exception:   # bookkeeping: the turn is settled either way
             log(self.p, "correction record failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
+        try:
+            self._stale_turn_done(evs, r.get("id"))
+        except Exception:   # bookkeeping: without it the next wait_stale raises a turn as before
+            log(self.p, "wait_stale turn record failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         decided = len(_decisions(actions))
         self._log_decided(r, note, decided)
         if not decided:
@@ -6788,6 +6793,10 @@ class Daemon:
             queued = rejcool.screen_queued(db, self.cfg, queued, now, user_spoke=bool(msgs))
         except Exception:   # the cooldown only saves turns: a failure wakes as before
             log(self.p, "rejection cooldown failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
+        try:
+            queued = self._stale_queued(queued, now)
+        except Exception:   # the gate only saves turns: a failure runs them as before
+            log(self.p, "wait_stale queued gate failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         max_evs = int(c.get("max_events_per_turn", 40))
         budget = float(c.get("turn_budget_usd", 1.0))
         # Items whose turn went over its cap are split, raised once or parked, never retried as is (turnsize.py).
@@ -10109,11 +10118,19 @@ class Daemon:
         fp = f"wait_stale:{task['id']}:{since:.0f}"
         if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
             return
+        wait, cur, fresh = self._stale_snap(task, prev, time.time())
+        try:   # the same wait a turn decided nothing on, unchanged since: no turn (stalegate.py)
+            if why := stalegate.skip_reason(db, wait, cur, fresh):
+                if n := stalegate.note_skip(db, wait, fp, why):
+                    log(self.p, f"task {task['id']} wait_stale not raised ({n} for this wait): {why}")
+                return
+        except Exception:   # the gate only saves turns: a failure raises the event
+            log(self.p, "wait_stale gate failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         what = self._wait_what(task["id"], prev)
         probe = str(prev.get("retry_when") or "")
         got = self._probe_out.get(task["id"])
         last = got[0] if got and got[2] == probe else ""
-        db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+        db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task,data) VALUES(?,?,?,?,?,?,?,?,?)",
              (time.time(), "daemon", "wait_stale", fp, "normal",
               f"#{task['id']} {task['title']} has waited {max_hold / 3600:g} h for {what}; its probe still says "
               f"not yet. Blocking gate: {probe[:200]}; last output: {last or '(none seen)'}. "
@@ -10123,8 +10140,54 @@ class Daemon:
                  f"their ticket left the checks queue, so the daemon wakes it within {checksgone.GRACE_S / 60:g} min. "
                  if (gone := self._stuck_checks(probe)) else "")
               + f"Decide: fix its probe (`ttp task set-when {task['id']} \"<cmd>\"`), clear it (\"\") so it wakes "
-              f"at its timer, or cancel the task.", "queued", task["id"]))
+              f"at its timer, or cancel the task.", "queued", task["id"],
+              json.dumps({"wait_stale": {"wait": wait, "snap": cur}})))
         log(self.p, f"task {task['id']} probe not yet after {max_hold / 3600:g} h; raised to the coordinator")
+
+    def _stale_snap(self, task: dict, prev: dict, now: float) -> tuple[str, dict, bool]:
+        """(wait key, stalegate.snap, fresh) for a waiting task: fresh when its probe answered since the
+        wait began, within two probe periods, for the probe it has now."""
+        tid, probe = task["id"], str(prev.get("retry_when") or "")
+        since = float(prev.get("waiting_since") or 0)
+        rc, at, by = self._probe_rc.get(tid, (None, 0.0, ""))
+        got = self._probe_out.get(tid)
+        max_hold = float((self.cfg.get("waiting") or {}).get("max_hold_s") or 6 * 3600)
+        fresh = bool(since) and by == probe and at >= since and now - at <= 2 * PROBE_EVERY_S
+        return (stalegate.wait_key(tid, since),
+                stalegate.snap(task, prev, max_hold, rc, got[0] if got and got[2] == probe else ""), fresh)
+
+    def _stale_turn_done(self, evs: list[int], run: int | None) -> None:
+        """After a turn: record per wait whether it changed what its wait_stale events asked about."""
+        db = self.p.db
+        rows = db.q(f"SELECT task, data FROM events WHERE kind='wait_stale' AND id IN ({','.join('?' * len(evs))})",
+                    list(evs)) if evs else []
+        for r in rows:
+            if not (d := stalegate.event_data(r["data"]).get("wait_stale")):
+                continue
+            task = db.task(r["task"]) or {"id": r["task"], "status": "gone"}
+            wait, cur, _ = self._stale_snap(task, load_result(task.get("result")), time.time())
+            seen = d.get("snap") or {}
+            if wait != d.get("wait"):
+                cur = {**cur, "since": None}   # the wait ended or started over: decided
+            stalegate.record(db, str(d.get("wait")), seen, cur, run)
+
+    def _stale_queued(self, queued: list[dict], now: float) -> list[dict]:
+        """Queued wait_stale events the gate settles without a turn (stalegate.py) are handled here."""
+        db, keep = self.p.db, []
+        for e in queued:
+            d = stalegate.event_data(e.get("data")).get("wait_stale") if e["kind"] == "wait_stale" else None
+            task = db.task(e["task"]) if d and e["task"] else None
+            if task and task["status"] == "queued":
+                prev = load_result(task["result"])
+                wait, cur, fresh = self._stale_snap(task, prev, now)
+                why = stalegate.skip_reason(db, wait, cur, fresh) if wait == d.get("wait") else None
+                if why:
+                    db.x("UPDATE events SET status='handled' WHERE id=? AND status='queued'", (e["id"],))
+                    stalegate.note_skip(db, wait, f"event:{e['id']}", why, now)
+                    log(self.p, f"wait_stale event {e['id']} settled without a turn: {why}")
+                    continue
+            keep.append(e)
+        return keep
 
     def _stuck_checks(self, probe: str) -> list[Path]:
         try:

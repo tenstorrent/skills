@@ -1517,3 +1517,124 @@ def test_stall_check_stays_quiet_for_a_task_held_by_a_live_task_s_branch_or_its_
     p.db.update_task(holder, status="done")
     assert check(now + 10 * 3600) == []
     assert len(check(now + 14 * 3600)) == 1, "the hold outlived its holder"
+
+
+def _stale_wait_setup(env, rc=1, out="not ready: 3 of 5"):
+    """A task waiting on a live probe past max_hold_s, its probe's fresh answer `rc`/`out`, one wait_stale
+    raised; `d.turn(events)` ends a coordinator turn on them that decided nothing (noop)."""
+    from types import SimpleNamespace
+    from ttp.daemon import Daemon
+    p = make(env)
+    probe = "test -e state/out-ready || exit 1"
+    d = Daemon(p.base)
+    tid = _due_waiting_task(p, probe, since_ago=7 * 3600)
+    since = json.loads(p.db.task(tid)["result"])["waiting_since"]
+
+    def answer(rc=rc, out=out, at=None):
+        at = time.time() if at is None else at
+        cur = str(json.loads(p.db.task(tid)["result"]).get("retry_when") or "")
+        d._probe_rc[tid], d._probe_out[tid] = (rc, at, cur), (out, at, cur)
+
+    def raise_at(start):
+        t = p.db.task(tid)
+        d._stale_wait_event(t, json.loads(t["result"]), start, float(d.cfg["waiting"]["max_hold_s"]))
+        return [e["id"] for e in p.db.q("SELECT id FROM events WHERE task=? AND kind='wait_stale' ORDER BY id", (tid,))]
+
+    answer()
+    first = raise_at(since)
+    assert len(first) == 1
+    d.answer = answer
+    usage = SimpleNamespace(structured={"actions": [{"type": "noop"}], "summary": ""}, error="", final_text="",
+                            cost_usd=0.2)
+    d.turn = lambda evs: d._finish_coordinator({"id": 7, "dir": "x", "started": time.time()}, usage, "ok",
+                                               {"messages": [], "events": evs})
+    return p, d, tid, since, raise_at, first
+
+
+def test_a_wait_stale_for_the_same_wait_a_no_op_turn_met_unchanged_is_not_raised_and_counts_one_audit_line(env):
+    """After a wait_stale turn that changed nothing about the task (stalegate.py), a re-armed wait_stale for the
+    same wait (same waiting_since) whose probe, max_hold_s, status and dependencies are as that turn left them,
+    and whose fresh answer is the same 'not yet' (numbers aside), raises no event and changes nothing about the
+    task; each skipped raise counts once, and the daily audit names the task, the wait, the reason and the count."""
+    from ttp import audit, stalegate
+    p, d, tid, since, raise_at, first = _stale_wait_setup(env)
+    d.turn(first)
+    rec = p.db.kv(stalegate.TURNS_KEY)[stalegate.wait_key(tid, since)]
+    assert rec["outcome"] == "no-change" and rec["run"] == 7, rec
+    before = p.db.task(tid)
+    d.answer(out="not ready: 4 of 5")      # only a number moved: the same answer
+    assert raise_at(since + 100) == first
+    assert raise_at(since + 100) == first  # the next tick: counted once
+    assert dict(p.db.task(tid)) == dict(before)
+    skips = stalegate.skipped(p.db, 0)
+    assert [(s["task"], s["n"]) for s in skips] == [(tid, 1)], skips
+    assert raise_at(since + 200) == first  # a second re-arm: a second skip for the same wait
+    got = [ln for ln in audit.lines(p.db, p=p) if ln.startswith("wait_stale turn skipped")]
+    assert len(got) == 1 and f"#{tid}," in got[0] and "decided nothing" in got[0] \
+        and got[0].endswith("2 skipped for this wait"), got
+
+
+@pytest.mark.parametrize("case", ["broken", "unreachable", "stale", "other_rc", "other_output", "probe", "max_hold",
+                                  "status", "deps", "new_since", "decided", "no_turn"])
+def test_a_wait_stale_is_raised_whenever_the_wait_its_probe_or_the_task_changed_or_the_last_turn_decided(env, case):
+    """Never skipped: a broken (exit 2), unreachable (255) or stale probe answer, a different answer, a changed
+    retry_when, max_hold_s, status or dependencies, a new wait (waiting_since), a last turn that decided (here it
+    rewrote the probe), or no recorded turn at all."""
+    from ttp import stalegate
+    p, d, tid, since, raise_at, first = _stale_wait_setup(env)
+    res = json.loads(p.db.task(tid)["result"])
+    if case == "decided":
+        p.db.update_task(tid, result=json.dumps({**res, "retry_when": "test -e state/other || exit 1"}))
+    if case != "no_turn":
+        d.turn(first)
+    want = "decided" if case == "decided" else "no-change"
+    assert case == "no_turn" or p.db.kv(stalegate.TURNS_KEY)[stalegate.wait_key(tid, since)]["outcome"] == want
+    start = since + 100
+    if case == "broken":
+        d.answer(rc=2)
+    elif case == "unreachable":
+        d.answer(rc=255)
+    elif case == "stale":
+        d.answer(at=time.time() - 3 * 3600)
+    elif case == "other_rc":
+        d.answer(rc=75)
+    elif case == "other_output":
+        d.answer(out="queue position changed: lock held by another job")
+    elif case == "probe":
+        p.db.update_task(tid, result=json.dumps({**res, "retry_when": "test -e state/new || exit 1"}))
+        d.answer()
+    elif case == "max_hold":
+        d.cfg["waiting"]["max_hold_s"] = float(d.cfg["waiting"]["max_hold_s"]) * 2
+    elif case == "status":
+        p.db.update_task(tid, status="blocked")
+    elif case == "deps":
+        p.db.update_task(tid, depends_on=json.dumps([1]))
+    elif case == "new_since":
+        start = since + 3600
+        p.db.update_task(tid, result=json.dumps({**res, "waiting_since": start}))
+        d.answer()
+    else:
+        d.answer()
+    assert len(raise_at(start)) == 2, case
+    assert stalegate.skipped(p.db, 0) == []
+
+
+def test_a_queued_wait_stale_for_a_wait_a_no_op_turn_met_is_settled_without_a_turn_unless_it_changed(env):
+    """The same check on a wait_stale already queued when a turn for the same wait ended (it decided nothing):
+    the next turn's batch leaves it out and marks it handled, a skip for the audit. A changed answer keeps it."""
+    from ttp import stalegate
+    p, d, tid, since, raise_at, first = _stale_wait_setup(env)
+    second = raise_at(since + 100)[-1]     # raised before the first turn recorded anything
+    assert second != first[0]
+    d.turn(first)
+    row = lambda: p.db.q("SELECT id, ts, kind, severity, task, source, data, status FROM events WHERE id=?", (second,))
+    d.answer(rc=75)                        # a different answer: it stays for the turn
+    assert [e["id"] for e in d._stale_queued(row(), time.time())] == [second]
+    d.answer()
+    assert d._stale_queued(row(), time.time()) == []
+    assert row()[0]["status"] == "handled"
+    assert [(s["task"], s["n"]) for s in stalegate.skipped(p.db, 0)] == [(tid, 1)]
+    other = p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                   (time.time(), "daemon", "wait_stale", "normal", "old style, no data", "queued", tid))
+    rows = p.db.q("SELECT id, ts, kind, severity, task, source, data FROM events WHERE id=?", (other,))
+    assert [e["id"] for e in d._stale_queued(rows, time.time())] == [other]   # no snapshot: kept

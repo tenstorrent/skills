@@ -13,7 +13,8 @@ the project could have saved. Model-free; the review grades it.
 - coordinator turns that decided nothing (no action but `noop`), and idle and
   starve wakes (woken by the idle or idle-slot timer alone, with no message or event), with their cost,
   and turns the daemon skipped as repeats of one that decided nothing (turngate.py) or as quiet while
-  every open task was held (quietgate.py), with the saving; blocker sweeps the model ran and those
+  every open task was held (quietgate.py), with the saving, and per wait the wait_stale
+  turns skipped as unchanged since a turn that decided nothing on it (stalegate.py); blocker sweeps the model ran and those
   skipped model-free (sweepskip.py), with the saving;
 - spend per finished task: the workers' own, and the coordinator's day spread over them; $ per
   done task by kind and tier;
@@ -40,7 +41,7 @@ import json
 import time
 from typing import Any
 
-from . import budget, chaincap, checkprestage, correction, ends, obligations, quietgate, reviewstats, route, schedule, sharedchecks, suitecost, sweepskip, turngate, unblock, upstream
+from . import budget, chaincap, checkprestage, correction, ends, obligations, quietgate, reviewstats, route, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
 from .db import DB, continues_id
 from .project import Project
 
@@ -378,6 +379,9 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
     if skips["n"]:
         out.append(f"coordinator turns skipped as repeats of a turn that decided nothing: {skips['n']}, "
                    f"~${skips['usd']:.2f} saved")
+    for w in stalegate.skipped(db, since):
+        out.append(f"wait_stale turn skipped: #{w['task']}, waiting since {timefmt.long(float(w['since']), p)}: "
+                   f"{w.get('reason', '')}; {w.get('n', 0)} skipped for this wait")
     quiet = quietgate.skipped(db, since)
     if quiet["n"]:
         out.append(f"coordinator turns skipped ({quietgate.QUIET}): {quiet['n']}, ~${quiet['usd']:.2f} saved")
