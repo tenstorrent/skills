@@ -987,12 +987,12 @@ def test_push_checks_take_a_reserved_test_slot_when_task_checks_fill_the_pool(en
     assert [g.k for g in tasks] == [2, 2]
     t0 = time.time()
     push = testslots.acquire("push", project_name="pa", push_key="remote main", wait_s=0)
-    assert push is not None and push.k == 1 and time.time() - t0 < 2, "(a) granted at once on the reserved slot"
+    assert push is not None and push.k == 2 and time.time() - t0 < 2, "(a) one run's grant at once on the reserved lane"
     assert locks.held_labels([testslots.reserved_path("remote main")]) == ["push"]
     # (b) the reserved slot never goes to a task check: with the pool full, one waits for the pool.
     assert testslots.acquire("t3", project_name="pc", wait_s=0.3) is None
     other = testslots.acquire("push 2", project_name="pc", push_key="remote other", wait_s=0)
-    assert other is not None and other.k == 1, "each push branch has its own reserved slot"
+    assert other is not None and other.k == 2, "each push branch has its own reserved lane"
     push.close()
     other.close()
     tasks.pop().close()
@@ -1002,12 +1002,45 @@ def test_push_checks_take_a_reserved_test_slot_when_task_checks_fill_the_pool(en
     assert push.k == 2 and not locks.held_labels([testslots.reserved_path("remote main")])
     push.close()
     push = testslots.acquire("push", project_name="pa", push_key="remote main", wait_s=0)
-    assert push.k == 1 and locks.held_labels([testslots.reserved_path("remote main")]) == ["push"], \
-        "its project at budget: the reserved slot, never a pool slot past the budget"
+    assert push.k == 2 and locks.held_labels([testslots.reserved_path("remote main")]) == ["push"], \
+        "its project at budget: the reserved lane, never a pool slot past the budget"
     over = testslots.acquire("t4", project_name="pa", wait_s=0.3)
     assert over is None, "a task check of a project at its budget waits though the pool has room"
     push.close()
     tasks.pop().close()
+
+
+def test_push_checks_get_a_full_runs_grant_when_task_checks_hold_the_project_budget(env, monkeypatch):
+    from ttp import locks, testslots
+    monkeypatch.setenv("TTP_TEST_POOL", "16")
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", "8")
+    monkeypatch.setenv("TTP_TEST_PROJECT_SLOTS", "8")
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    task = testslots.acquire("t1", project_name="pa", priority=2)
+    assert task.k == 8 and testslots.acquire("t2", project_name="pa", wait_s=0.2) is None, "pa's budget is full"
+    # (a) a push check of that project gets one run's grant (was 1: the single reserved slot).
+    push = testslots.acquire("push", project_name="pa", push_key="remote main", wait_s=0)
+    assert push is not None and push.k == 8 and push.env()["PYTEST_XDIST_AUTO_NUM_WORKERS"] == "8"
+    # (b) a second push check of the same branch gets no second lane: it waits for slots.
+    assert testslots.acquire("push 2", project_name="pa", push_key="remote main", wait_s=0.2) is None
+    # (c) task checks are unchanged: another project's check gets its usual grant, never the lane.
+    other = testslots.acquire("t3", project_name="pb", wait_s=0)
+    assert other.k == 8 and testslots.acquire("t4", project_name="pc", wait_s=0.2) is None, "pool full"
+    push.close()
+    assert testslots.acquire("t4", project_name="pc", wait_s=0.2) is None, "a freed lane never goes to a task check"
+    # A pool with only part of a run's grant free: the push takes those and the lane makes up the rest.
+    other.close()
+    monkeypatch.setenv("TTP_TEST_POOL", "10")
+    other = testslots.acquire("t3", project_name="pb", wait_s=0)
+    assert other.k == 2
+    push = testslots.acquire("push", project_name="pb", push_key="remote main", wait_s=0)
+    assert push.k == 8 and len(locks.held_labels(testslots.paths(10))) == 10, "its 2 pool slots count in the pool"
+    for g in (push, other, task):
+        g.close()
+    # No push check waiting and slots free: a push takes pool slots only, the lane stays free.
+    push = testslots.acquire("push", project_name="pa", push_key="remote main", wait_s=0)
+    assert push.k == 8 and not locks.held_labels([testslots.reserved_path("remote main")])
+    push.close()
 
 
 _SUITE_HOLDER = """

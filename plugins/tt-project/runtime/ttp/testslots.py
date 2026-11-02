@@ -37,8 +37,10 @@ of the host's line, so it never holds up other projects, but keeps its ticket in
 (the "<own>.<project id>" queue): it re-enters the host's line at its first arrival, and a later
 arrival of the same project waits until every earlier one is back in the host's line, so a freed slot
 goes to the project's earliest waiter, never to whichever polls first. Checks gating
-a push to the push branch (`push_key`) never wait behind task checks: with no pool slot free they take
-that branch's one reserved slot beyond the pool (RESERVED), which task checks never use.
+a push to the push branch (`push_key`) never wait behind task checks or run short: with fewer than one
+run's grant free in the pool or their project's budget, they take that branch's reserved lane beyond
+both (RESERVED), which makes up one run's grant, holds for one push check of the branch at a time and
+which task checks never use.
 
 A project's full checks (`ttp checks`) also hold its suite lock (suite_hold()): a second full run of
 the same project waits for the first, other projects never do. It is a file lock, so an exit, a crash
@@ -87,7 +89,7 @@ SLOTS_ENV = "TTP_TEST_SLOTS"
 XDIST_ENV = "PYTEST_XDIST_AUTO_NUM_WORKERS"
 HELD_ENV = "TTP_TEST_SLOTS_HELD"   # set for the commands of a run that holds slots: the grant
 OWN = "test-slots-project"     # check-slots/test-slots-project.<project id>.<i>.lock: one project's budget
-RESERVED = "test-slots-push"   # check-slots/test-slots-push.<branch id>.lock: a push branch's reserved slot
+RESERVED = "test-slots-push"   # check-slots/test-slots-push.<branch id>.lock: a push branch's reserved lane
 SUITE = "test-suite"           # check-slots/test-suite.<project id>.lock: one project's full checks
 SLOTS_KEY = "slots"            # checks.slots: how many full checks of one project and repository run at once
 PORTS = "check-ports"          # check-slots/check-ports.<i>.lock: one running check run's port block
@@ -326,7 +328,8 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
     TELL_S. None only once `wait_s` passed with none free (a foreground caller hands over). Nested in a
     run that holds slots, its grant at once; with the pool off, Grant() (no limit, nothing set).
     `project_name` (default TTP_PROJECT's) is whose budget it counts against; `push_key` (push.priority_key)
-    marks push checks, which take the branch's reserved slot when the pool has none free. `kind` BUILDS
+    marks push checks, which get one run's grant with the branch's reserved lane when the pool or the
+    project's budget has less free. `kind` BUILDS
     takes build slots instead; a build nested in a check uses the check's test grant. `priority` (the
     task's) orders its project's waiters, most urgent first, then arrival (suite_priority: a waiter ages
     one step per age_s(cfg), checks.priority_age_s); a priority-1 waiter whose project's budget is held
@@ -389,8 +392,10 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                     ticket, why = None, f"{len(ahead)} earlier waiter(s) of its project go first"
                 elif push_key:
                     k, files = _take(ps, own, room, holder, what, extra)
-                    if not k and (f := locks.try_take([reserved_path(push_key)], holder, "push test slot")):
-                        k, files = 1, [f]
+                    if k < top and (f := locks.try_take([reserved_path(push_key)], holder, "push test slots", extra=extra)):
+                        # Short of one run's grant (the pool or its project's budget held by task checks):
+                        # the branch's reserved lane makes up the rest, one push check per branch at a time.
+                        k, files, what = top, files + [f], f"{what} (with its push branch's reserved lane)"
                 else:
                     if ticket is None:
                         ticket = locks.enqueue(checkcap.slot_dir(), kind.resource, holder, arrival, group=name)
