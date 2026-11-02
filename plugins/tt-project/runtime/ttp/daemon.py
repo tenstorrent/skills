@@ -14151,8 +14151,11 @@ def _same_probe(full: dict, prev: dict, key: str = "retry_when") -> bool:
 
 def _wait_key(result: dict) -> str:
     """What a waiting hand-off waits for, as compared between wakes: its waiting_for and retry_when,
-    whitespace and case aside, as a short hash a clipped hand-off keeps whole."""
-    text = "\x00".join(" ".join(str(result.get(k) or "").split()).lower() for k in ("waiting_for", "retry_when"))
+    whitespace and case aside, as a short hash a clipped hand-off keeps whole. The retry_when is the
+    run's own text (retry_when_orig, kept when its run variables were written in), so the same
+    `$TTP_RUN_DIR` probe from another run is the same wait."""
+    fields = {**result, "retry_when": result.get("retry_when_orig", result.get("retry_when"))}
+    text = "\x00".join(" ".join(str(fields.get(k) or "").split()).lower() for k in ("waiting_for", "retry_when"))
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 

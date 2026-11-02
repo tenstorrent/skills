@@ -107,3 +107,36 @@ def test_a_probe_running_a_missing_file_is_broken_never_not_yet(env, monkeypatch
     ev = _events(p, tid, "deferral_probe_broken")
     assert len(ev) == 1 and "broken (exit 127" in ev[0]["text"], ev
     assert not _ready(p, tid)
+
+
+def test_wakes_handing_back_the_same_run_variable_probe_count_as_stale(env, monkeypatch):
+    """Each run writes its own folder into `test -e $TTP_RUN_DIR/x`, but the wait it hands back is the
+    same: the stale-wake count compares the run's own text, so the third such wake still blocks."""
+    from pathlib import Path
+    from ttp import daemon as dmod
+    from ttp.daemon import _wait_key
+    p = make(env)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    probe = "test -e $TTP_RUN_DIR/x"
+    same = {"status": "waiting", "summary": "still busy", "waiting_for": "the job", "retry_after_s": 300,
+            "retry_when": probe}
+    assert _wait_key({**same, "retry_when": "test -e /s/runs/1/x", "retry_when_orig": probe}) == \
+        _wait_key({**same, "retry_when": "test -e /s/runs/2/x", "retry_when_orig": probe}) == _wait_key(same)
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps(same))
+    tid = p.db.add_task("waits on its job", "s", kind="work", tier="standard", origin="user")
+    d = dmod.Daemon(p.base)
+
+    def runs():
+        return p.db.q("SELECT status, dir FROM runs WHERE task=? AND role='worker' ORDER BY id", (tid,))
+
+    for n in (1, 2, 3, 4):
+        assert _run_until(d, p, lambda: len(runs()) == n and runs()[-1]["status"] != "running"
+                          and p.db.task(tid)["status"] in ("queued", "blocked"))
+        res = json.loads(p.db.task(tid)["result"])
+        assert res["retry_when"] == f"test -e {runs()[-1]['dir']}/x" and res["retry_when_orig"] == probe, res
+        assert res["stale_wakes"] == (0 if n in (1, 4) else n - 1), res
+        if n < 4:
+            Path(runs()[-1]["dir"], "x").touch()
+            p.db.update_task(tid, not_before=None)
+    t = p.db.task(tid)
+    assert t["status"] == "blocked" and "no progress after 3 wakes" in t["blocked_reason"], t["blocked_reason"]
