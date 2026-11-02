@@ -27,7 +27,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import gitmemo, push
+from . import gitcache, gitmemo, push
 from .db import TERMINAL_TASK_STATES, dependency_ids, review_subject
 
 LANDED_PROBE = re.compile(r"\s*landed:\s*#?(\d+)\s*")
@@ -123,8 +123,10 @@ def missing_words(missing: list[str]) -> str:
 
 
 def _git(repo: Path, *args: str, timeout: float = 30) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True,
-                          timeout=gitmemo.timeout(timeout, args), stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    t = gitmemo.timeout(timeout, args)
+    return gitcache.run(repo, args, lambda: subprocess.run(
+        ["git", "-C", str(repo), *args], text=True, capture_output=True, timeout=t, stdin=subprocess.DEVNULL,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}), t)
 
 
 def _commit(repo: Path, rev: str) -> str:
@@ -140,7 +142,12 @@ def _key(line: str) -> tuple[str, str] | None:
 def on_branch(repo: Path, sha: str, tip: str) -> bool:
     """Every commit of `sha` is on `tip`: `sha` is an ancestor, or each of its commits not on `tip`
     has an equivalent there (git cherry's patch-id, the same author, date and subject, or a replay
-    trailer naming it). Version-bump commits on its top are left out, as the push queue drops them."""
+    trailer naming it). Version-bump commits on its top are left out, as the push queue drops them.
+    Commits never change under their ids, so the answer for two full ids is read once (gitcache.fixed)."""
+    return gitcache.fixed(repo, "on_branch", sha, tip, lambda: _on_branch(repo, sha, tip))
+
+
+def _on_branch(repo: Path, sha: str, tip: str) -> bool:
     if _git(repo, "merge-base", "--is-ancestor", sha, tip).returncode == 0:
         return True
     base = _git(repo, "merge-base", tip, sha).stdout.strip()

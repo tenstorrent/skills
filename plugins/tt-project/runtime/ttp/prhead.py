@@ -24,7 +24,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import gitmemo
+from . import gitcache, gitmemo
 
 GH_TIMEOUT_S = 20
 FIELDS = "headRepository,headRepositoryOwner,isCrossRepository,headRefName,state,url"
@@ -41,8 +41,10 @@ _HOST = re.compile(r"^(?:[A-Za-z][A-Za-z0-9+.-]*://)?(?:[^@/]+@)?(?P<host>[^/:]+
 
 def _git(repo, *args: str, timeout: float = 30) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=gitmemo.timeout(timeout, args),
-                              stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+        t = gitmemo.timeout(timeout, args)
+        return gitcache.run(repo, args, lambda: subprocess.run(
+            ["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=t, stdin=subprocess.DEVNULL,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}), t)
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(args, 124, "", f"git {args[0]} timed out")
 

@@ -485,6 +485,9 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setenv("TTP_TEST_CYCLE_NOTICES", str(tmp_path / "no-cycle-notice.json"))   # never the real /run notice (cyclenotice.py)
     from ttp import probespawn
     monkeypatch.setattr(probespawn, "_timeouts", {})   # a probe's timeouts in a row never carry over from another test
+    from ttp import gitcache, statcache
+    gitcache.clear()   # git and file answers kept by one test never answer another's (fakes, reused paths)
+    statcache.clear()
     # Tests may run inside a live run, detached checks, `ttp detach` (no in-run lock-wait cap) or `ttp lock`.
     # The outer checks' output directory and lifetime descriptor belong to that invocation.
     for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT", "TTP_DETACHED", "TTP_LOCKS_HELD", "TTP_PIDNS",

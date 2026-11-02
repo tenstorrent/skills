@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, cleantree, envfault, gitmemo, landed, locks, machines, prguard, prhead, remotecheck, runner,
+from . import (checkcap, checkdirs, cleantree, envfault, gitcache, gitmemo, landed, locks, machines, prguard, prhead, remotecheck, runner,
                sandbox, scriptwatch, settinghold, shorttmp, testslots, timefmt, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
@@ -1460,7 +1460,8 @@ def _git(repo: Path, *args: str, quiet: bool = True) -> subprocess.CompletedProc
     """Run git; when not quiet its output goes to stderr, keeping stdout for the verdict."""
     t = gitmemo.timeout(None, args)   # none of its own; capped within a daemon tick step or finish transaction
     if quiet:
-        return subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True, timeout=t)
+        return gitcache.run(repo, args, lambda: subprocess.run(["git", "-C", str(repo), *args], text=True,
+                                                               capture_output=True, timeout=t), t)
     return subprocess.run(["git", "-C", str(repo), *args], text=True, stdout=2, timeout=t)
 
 

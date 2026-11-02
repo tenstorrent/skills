@@ -35,7 +35,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import project
+from . import project, statcache
 from .devq import DEVICE_MASK, MASK_RECORD, unmask_devices  # noqa: F401  (re-exported)
 
 ALIAS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@+-]{0,79}")   # an alias is also a resource name
@@ -55,7 +55,7 @@ def path() -> Path:
 
 def _doc() -> dict:
     try:
-        data = json.loads(path().read_text())
+        data = statcache.load_json(path())
     except (FileNotFoundError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}

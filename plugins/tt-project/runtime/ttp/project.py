@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from . import gitlocks
+from . import gitlocks, statcache
 from .db import DB
 
 FOLDER = "tt-project"                     # lives at the root of the user's project, ignored by it
@@ -1212,7 +1212,7 @@ class Project:
         again; a project still being made has an empty config, "ok"."""
         good = self.state / "project.last-good.json"
         try:
-            data = json.loads(self.config_path.read_text())
+            data = statcache.load_json(self.config_path)
             if not isinstance(data, dict):
                 raise ValueError("project.json is not a JSON object")
         except (OSError, ValueError):
@@ -1339,7 +1339,7 @@ class Project:
         # Read project.json directly: read_config would keep this process's last good copy, which a
         # later set_config on a missing project.json would write back.
         try:
-            v = float((json.loads(self.config_path.read_text()).get("harness_git") or {}).get(key) or 0)
+            v = float((statcache.load_json(self.config_path).get("harness_git") or {}).get(key) or 0)
         except (OSError, TypeError, ValueError, AttributeError):
             v = 0
         return v if v > 0 else DEFAULT_CONFIG["harness_git"][key]
@@ -1358,7 +1358,7 @@ class Project:
         harness_git.stale_lock_s and no process holds them (ttp.gitlocks). Each is kept under
         .git/ttp-stale-locks/<stamp>/, never deleted. Returns the moved paths (relative to .git)."""
         try:
-            cfg = json.loads(self.config_path.read_text())   # directly, as _harness_git_cfg does
+            cfg = statcache.load_json(self.config_path)   # directly, as _harness_git_cfg does
         except (OSError, ValueError):
             cfg = {}
         gdir = gitlocks.git_dir(self.harness)
@@ -2320,7 +2320,7 @@ def account_settings_path() -> Path:
 def load_account_settings() -> dict:
     """The account-level settings, only the keys ACCOUNT_KEYS allows; {} when unreadable."""
     try:
-        data = json.loads(account_settings_path().read_text())
+        data = statcache.load_json(account_settings_path())
     except (OSError, ValueError):
         return {}
     if not isinstance(data, dict):
