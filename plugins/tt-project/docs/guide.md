@@ -1590,7 +1590,10 @@ queues behind routine work; nothing running is interrupted:
   --commit "$TTP_PUSHED_SHA" --after-push` as the final verification (after allowing new
   daemons to complete their first tick). This mode returns 0 for done or pending, and 1 for
   failed. A pending merge needs a live daemon, a harness task owner and a known takeover
-  time; it emits one low note and records a model-free check in the deploying project's
+  time; it keeps one low status line per project (`deploy-pending:<name>`: '<name> will
+  switch to <version> by <time>'), which a newer release updates in place and which clears
+  with a short line once the project runs the release (quietly when its check fails: the
+  deploy-behind alert tells that), and records a model-free check in the deploying project's
   state, due five minutes after takeover. The original deadline survives retries and
   restarts; a new commit of the same version is a new merge with its own, except that a
   harness task already holding an earlier release's merge keeps that earlier deadline. Once

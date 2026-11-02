@@ -47,6 +47,12 @@ def behind_key(name: str) -> str:
     return f"deploy-behind:{name}"
 
 
+def pending_key(name: str) -> str:
+    """The one live status line of a project waiting on a release: a newer release updates it in place,
+    and it clears once the project runs the release (or its check fails, which alerts on its own)."""
+    return f"deploy-pending:{name}"
+
+
 def restart_wait(p) -> float:
     """delivery.deploy_restart_wait_s of the reporting project: how long a daemon may take to restart onto
     files already at the release before that counts as failed."""
@@ -115,6 +121,32 @@ def holds_behind(db, name: str, now: float) -> bool:
     """The alert `deploy-behind:<name>` holds while a check of that project still fails: it clears once its
     own daemon reports the release (or its upgrade is owned and pending again)."""
     return _failing(db, [r for r in (db.kv(CHECKS) or {}).values() if r.get("name") == name], now)
+
+
+def holds_pending(db, name: str) -> bool:
+    """The status line `deploy-pending:<name>` holds while an open check of that project is pending."""
+    return any(r.get("name") == name and not r.get("closed") and r.get("outcome") == "pending"
+               for r in (db.kv(CHECKS) or {}).values())
+
+
+def pending_cleared(db, name: str) -> str | None:
+    """The short line that clears `deploy-pending:<name>` once the project runs the release; None (a quiet
+    close) when its check failed instead: the deploy-behind alert tells that."""
+    recs = [r for r in (db.kv(CHECKS) or {}).values() if r.get("name") == name]
+    rec = max(recs, key=lambda r: _vnum(r.get("target") or ""), default={})
+    return f"{name} runs tt-project {rec['target']} now." if rec.get("outcome") == "done" else None
+
+
+def _post_pending(p, name: str, text: str, now: float) -> None:
+    """Post or update in place the project's one pending-deploy status line."""
+    key = pending_key(name)
+    ep = p.db.one("SELECT id, message FROM alerts WHERE key=? AND cleared IS NULL ORDER BY id DESC LIMIT 1", (key,))
+    if not ep:
+        p.db.post("out", text, kind="alert", severity="low", ref=key)
+        return
+    p.db.x("UPDATE alerts SET text=?, last=? WHERE id=?", (text[:2000], now, ep["id"]))
+    if ep["message"]:
+        p.db.x("UPDATE messages SET text=? WHERE id=?", (text, ep["message"]))
 
 
 def _supersede(checks: dict, now: float) -> None:
@@ -383,12 +415,13 @@ def record(p, report: dict, now: float | None = None) -> dict:
                 rec.pop("closed", None)
                 failed.append((rec, kind, reason, _mark(rec, kind, now)))
             elif outcome == "pending" and not was_pending and kind != "paused":
-                at = timefmt.long(max(rec["takeover_at"], now), p)
-                pending.append(f"{row['name']}: restart onto the new files pending, owner {rec['owner']}, "
-                               f"re-checked {at}" if rec.get("restart") else
-                               f"{row['name']}: paused (stays paused), owner {rec['owner']}, host-side takeover "
-                               f"{at}" if row.get("paused") else
-                               f"{row['name']}: owner {rec['owner']}, takeover {at}")
+                name, v, owner = row["name"], report["target"], rec["owner"]
+                at = timefmt.long(max(float(rec.get("due") or 0), now), p)
+                pending.append((name, f"{name} will switch to tt-project {v} by {at} (its daemon restarts onto "
+                                      f"the new files)." if rec.get("restart") else
+                                f"{name} is paused and stays paused; it will switch to tt-project {v} by {at} "
+                                f"(a host-side takeover if {owner} has not finished)." if row.get("paused") else
+                                f"{name} will switch to tt-project {v} by {at} (it waits for {owner} to finish)."))
             checks[key] = rec
             rows.append(row)
         _supersede(checks, now)
@@ -399,10 +432,8 @@ def record(p, report: dict, now: float | None = None) -> dict:
                     for rec, kind, reason, new in failed]
             p.db.set_kv(ALERTED, {"key": keys[0], "keys": keys, "target": report["target"],
                                   "commit": report.get("commit"), "at": now})
-        if pending:
-            p.db.post("out", f"tt-project {report['target']} deploy pending: " + "; ".join(pending)
-                      + ". Follow-up checks run after takeover with a 5 min grace, and after a pending "
-                        "restart's wait.", kind="info", severity="low")
+        for name, text in pending:   # one live line per project, updated in place by a newer release
+            _post_pending(p, name, text, now)
     failed = any(r["outcome"] == "failed" for r in rows) or (not rows and report["rc"] != 0)
     return {**report, "projects": rows, "rc": int(failed)}
 

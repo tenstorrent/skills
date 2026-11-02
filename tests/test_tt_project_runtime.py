@@ -44301,7 +44301,7 @@ def test_after_push_deploy_done_and_owned_pending(env, tmp_path):
     notes = p.db.q("SELECT severity,text FROM messages WHERE direction='out'")
     assert len(notes) == 1 and notes[0]['severity'] == 'low'
     assert 'beta' in notes[0]['text'] and ('PDT' in notes[0]['text'] or 'PST' in notes[0]['text'])
-    assert not p.db.q('SELECT * FROM alerts')
+    assert not p.db.q("SELECT * FROM alerts WHERE key NOT LIKE 'deploy-pending:%'")
     deploy.record(p, overview.deployed(names=['alpha', 'beta']))
     assert len(p.db.q("SELECT * FROM messages WHERE direction='out'")) == 1
 
@@ -44391,7 +44391,7 @@ def test_after_push_deploy_daemon_owned_upgrade_is_pending_until_its_check_then_
     result = deploy.record(p, overview.deployed(names=['alpha']))
     assert result['rc'] == 0 and result['projects'][0]['outcome'] == 'pending', result
     notes = p.db.q("SELECT severity FROM messages WHERE direction='out'")
-    assert [n['severity'] for n in notes] == ['low'] and not p.db.q('SELECT * FROM alerts')
+    assert [n['severity'] for n in notes] == ['low'] and not p.db.q("SELECT * FROM alerts WHERE key NOT LIKE 'deploy-pending:%'")
     rec = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']
     assert rec['owner'] == "this project's daemon" and rec['due'] > now
     assert deploy.assess(rec, row, rec['due'] - 1)[0] == 'pending'
@@ -44592,7 +44592,7 @@ def test_a_stuck_project_alert_pages_again_only_when_it_gets_worse(env, tmp_path
     deploy.record(p, overview.deployed(names=['alpha']), now + 30)
     deploy.tick(p, page, now + 31)
     assert len(pages) == 1
-    ep = p.db.one("SELECT * FROM alerts WHERE cleared IS NULL")
+    ep = p.db.one("SELECT * FROM alerts WHERE cleared IS NULL AND key='deploy-behind:alpha'")
     assert ep['severity'] == 'high' and 'tt-project 0.5.2 ' in ep['text']
     assert 'tt-project 0.5.2 ' in p.db.one("SELECT text FROM messages WHERE id=?", (ep['message'],))['text']
 
@@ -44638,7 +44638,7 @@ def test_a_paused_projects_deferred_takeover_is_one_low_note_and_upgrades_when_r
     assert 'takeover ended: exit 75 (deferred' in text and 'gamma paused; upgrades when resumed' in text
     notes = p.db.q("SELECT severity, text FROM messages WHERE direction='out' AND text LIKE '%upgrades when resumed%'")
     assert len(notes) == 1 and notes[0]['severity'] == 'low'
-    assert not pages and not p.db.q('SELECT * FROM alerts') and not deploy.holds(p.db, '0.5.0', t)
+    assert not pages and not p.db.q("SELECT * FROM alerts WHERE key NOT LIKE 'deploy-pending:%'") and not deploy.holds(p.db, '0.5.0', t)
     assert p.db.kv(deploy.CHECKS)['deploy:gamma:0.5.0']['outcome'] == 'pending'
     assert not (p.logs / 'takeover.log').exists()
     db.set_paused(False)                                 # resumed: its own merge task takes the upgrade on
@@ -44697,8 +44697,8 @@ def test_the_after_push_deploy_takes_a_paused_projects_stuck_merge_over_and_name
     now = time.time()
     report = deploy.record(p, overview.deployed(names=["demo"]), now)
     assert report["rc"] == 0 and report["projects"][0]["outcome"] == "pending"
-    note = p.db.one("SELECT text FROM messages WHERE text LIKE '%deploy pending%' ORDER BY id DESC LIMIT 1")
-    assert "demo: paused (stays paused)" in note["text"]
+    note = p.db.one("SELECT text FROM messages WHERE ref='deploy-pending:demo' ORDER BY id DESC LIMIT 1")
+    assert "demo is paused and stays paused" in note["text"]
     due = p.db.kv(deploy.CHECKS)[deploy.condition_key("demo", report["target"])]["due"]
     pages, page = _deploy_pager(p)
     t = due + 1
@@ -44716,7 +44716,7 @@ def test_the_after_push_deploy_takes_a_paused_projects_stuck_merge_over_and_name
     new = release.finish_holder(p)["task"]
     assert new != tid and p.db.task(new)["status"] == "queued" and p.db.kv("paused") is True and not restarts
     rec = p.db.kv(deploy.CHECKS)[deploy.condition_key("demo", report["target"])]
-    assert rec["outcome"] == "pending" and not pages and not p.db.q("SELECT * FROM alerts")
+    assert rec["outcome"] == "pending" and not pages and not p.db.q("SELECT * FROM alerts WHERE key NOT LIKE 'deploy-pending:%'")
     notes = p.db.q("SELECT severity FROM messages WHERE direction='out' AND text LIKE '%upgrades when resumed%'")
     assert [n["severity"] for n in notes] == ["low"]
     row = overview.deployed(names=["demo"])["projects"][0]
@@ -44782,7 +44782,7 @@ def test_after_push_deploy_upgrade_error_counts_only_for_this_release(env, tmp_p
     result = deploy.record(p, overview.deployed(names=['alpha']))
     assert result['rc'] == int(current)
     assert result['projects'][0]['outcome'] == ('failed' if current else 'pending')
-    assert bool(p.db.q("SELECT * FROM messages WHERE kind='alert'")) == current
+    assert bool(p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref NOT LIKE 'deploy-pending:%'")) == current
     if not current:
         assert p.db.one("SELECT severity FROM messages WHERE direction='out'")['severity'] == 'low'
 

@@ -78,6 +78,7 @@ CLEARED_TEXT = {
     "push_tip_failing": "The push branch tip passes its checks again, or it moved: push batches go on as usual.",
     "heal": "Heal check {arg} passes again.",
     "heal-hold": "The device hold heal check {arg} reported has a tenant again or ended.",
+    "deploy-pending": "{arg} runs the newest release now.",
     "deploy-behind": "The deploy to {arg} no longer fails: it runs the release, or its upgrade is owned and pending again.",
     "machine": "Machine condition {arg} is over: no longer reported.",
     "machine-change": "Machine change #{arg} is closed or no longer overdue.",
@@ -106,8 +107,8 @@ CLEARED_SEVERITY = {"network": "low", "paused": "low", "fleethold": "low", "coor
 # tick-step: a daemon tick step that keeps failing (Daemon._run_step); its next success clears it.
 # chat-silent: a relay chat with no listener that stopped reading (chatgone.py); its next read clears it.
 # lock-wait: a lock a waiter has waited on past locks.wait_alert_min (lockreap.py); the wait's end clears it.
-STATUS_CONDITIONS = ("budget", "limit", "deploy", "deploy-behind", "daemon-hang", "account-mismatch", "tick-step",
-                     "chat-silent", "lock-wait")
+STATUS_CONDITIONS = ("budget", "limit", "deploy", "deploy-behind", "deploy-pending", "daemon-hang", "account-mismatch",
+                     "tick-step", "chat-silent", "lock-wait")
 
 
 def _urgent(severity: str | None) -> bool:
@@ -236,6 +237,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
     if kind == "deploy-behind":
         from . import deploy
         return deploy.holds_behind(db, arg, now)
+    if kind == "deploy-pending":
+        from . import deploy
+        return deploy.holds_pending(db, arg)
     if kind == "heal":   # healthy, coordinator-owned and known-fault checks no longer need the user
         from . import heal
         return heal.holds(db, arg, now)
@@ -313,7 +317,7 @@ def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
                                          "schedule", "release-older", "integrity", "integrity-host", "pr-ready", "config",
                                          "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_tip_failing", "push_scope", "heal",
-                                         "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "daemon-hang", "paused", "fleethold",
+                                         "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "deploy-pending", "daemon-hang", "paused", "fleethold",
                                          "coord-budget", "account-mismatch", "linger-off", "tick-step", "notifier", "chat-silent", "user-step")
 
 
@@ -483,6 +487,10 @@ def sweep(db: DB, now: float | None = None) -> list[dict]:
                 # A status line clears as quietly as it was raised.
                 sev = CLEARED_SEVERITY.get(kind) or ("normal" if _urgent(ep["severity"]) else "low")
                 text = "Cleared: " + CLEARED_TEXT[kind].format(arg=arg)
+                if kind == "deploy-pending":
+                    from . import deploy
+                    done = deploy.pending_cleared(db, arg)
+                    text = "Cleared: " + done if done else None
                 if kind == "auth" and (sw := (db.kv(BREAKER + arg) or {}).get("switched")):
                     text += f" It is on another account than before the logout ({switch_text(sw)})."
             if kind in ("heal", "heal-hold") and why != "condition cleared":

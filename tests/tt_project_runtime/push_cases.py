@@ -8031,10 +8031,11 @@ def test_after_push_with_every_lagging_project_owned_pending_exits_0_with_one_lo
     assert e.value.code == 0
     assert {r['name']: r['outcome'] for r in data['projects']} == {
         'self': 'done', 'alpha': 'pending', 'beta': 'pending', 'gamma': 'pending', 'delta': 'pending'}
-    out = p.db.q("SELECT kind,severity,text FROM messages WHERE direction='out'")
-    assert [(m['kind'], m['severity']) for m in out] == [('info', 'low')]
-    assert all(n in out[0]['text'] for n in ('alpha', 'beta', 'gamma', 'delta'))
-    assert not p.db.q('SELECT * FROM alerts')
+    out = p.db.q("SELECT kind,severity,ref,text FROM messages WHERE direction='out' ORDER BY ref")
+    assert [(m['kind'], m['severity'], m['ref']) for m in out] == [
+        ('alert', 'low', f'deploy-pending:{n}') for n in ('alpha', 'beta', 'delta', 'gamma')]
+    assert all(m['text'].startswith(n) and '0.5.0' in m['text'] for n, m in zip(('alpha', 'beta', 'delta', 'gamma'), out))
+    assert [a['severity'] for a in p.db.q('SELECT severity FROM alerts')] == ['low'] * 4
     p.db.x("INSERT INTO push_batches(id,marker,target,started) VALUES(?,?,?,?)",
            ('batch-test', 'marker', 'origin/topic', started))
     pages = []
@@ -8060,10 +8061,11 @@ def test_after_push_deploy_real_failure_sends_exactly_one_alert(env, tmp_path, m
         main(['deployed', '0.5.0', '--commit', DEPLOY_C, '--projects', ','.join(names), '--after-push', '--json'])
     capsys.readouterr()
     assert e.value.code == 1
-    alerts_out = p.db.q("SELECT severity,ref,text FROM messages WHERE kind='alert' ORDER BY id")
+    alerts_out = p.db.q("SELECT severity,ref,text FROM messages WHERE kind='alert' AND ref NOT LIKE 'deploy-pending:%' ORDER BY id")
     assert [(a['severity'], a['ref']) for a in alerts_out] == [('high', f'deploy-behind:{n}') for n in down]
     assert all(n in a['text'] for n, a in zip(down, alerts_out))
-    assert [a['key'] for a in p.db.q('SELECT key FROM alerts ORDER BY id')] == [f'deploy-behind:{n}' for n in down]
+    assert [a['key'] for a in p.db.q("SELECT key FROM alerts WHERE key NOT LIKE 'deploy-pending:%' ORDER BY id")] == [
+        f'deploy-behind:{n}' for n in down]
     p.db.x("INSERT INTO push_batches(id,marker,target,started) VALUES(?,?,?,?)",
            ('batch-test', 'marker', 'origin/topic', started))
     pages = []

@@ -2699,7 +2699,7 @@ def test_after_push_deploy_followup_after_takeover(env, tmp_path, caught_up):
         data['receipt']['version'] = '0.5.0'
         hb.write_text(json.dumps(data))
         os.utime(base / 'state' / 'tick_done', (due, due))
-        assert [e['key'] for e in alerts.sweep(p.db, now=due)] == ['deploy-behind:alpha']
+        assert sorted(e['key'] for e in alerts.sweep(p.db, now=due)) == ['deploy-behind:alpha', 'deploy-pending:alpha']
         assert not alerts.active(p.db, pages[0][0], now, due)
 
 
@@ -2723,8 +2723,9 @@ def test_after_push_deploy_restart_pending_is_owned_and_rechecked_after_its_wait
     rec = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']
     assert rec['owner'] == "this project's daemon" and rec['due'] == now + 600
     notes = p.db.q("SELECT severity,text FROM messages WHERE direction='out'")
-    assert [n['severity'] for n in notes] == ['low'] and 'alpha: restart onto the new files pending' in notes[0]['text']
-    assert not p.db.q('SELECT * FROM alerts')
+    assert [n['severity'] for n in notes] == ['low'] and 'alpha will switch to tt-project 0.5.0 by' in notes[0]['text']
+    assert 'its daemon restarts onto the new files' in notes[0]['text']
+    assert not p.db.q("SELECT * FROM alerts WHERE key NOT LIKE 'deploy-pending:%'")
     pages, page = _deploy_pager(p)
     deploy.tick(p, page, now + 599)
     assert not pages
@@ -2744,6 +2745,46 @@ def test_after_push_deploy_restart_pending_is_owned_and_rechecked_after_its_wait
         assert 'still behind at its re-check' in pages[0][1] and ('PDT' in pages[0][1] or 'PST' in pages[0][1])
         assert alerts.holds(p.db, 'deploy-behind:alpha', now, now + 700)
 
+
+
+def test_deploy_pending_is_one_live_line_per_project_that_a_newer_release_updates_and_catching_up_clears(env, tmp_path):
+    """Three releases in a row while a project waits on its merge: one live status line, naming the
+    newest release in plain words, never one feed line per release. It clears with a short line once
+    the project runs that release."""
+    from ttp import alerts, deploy, overview, release
+    p = make(env)
+    p.set_config('home_timezone', 'America/Los_Angeles')
+    _deploy_lib('0.5.0')
+    base, db = _deploy_project(tmp_path, 'alpha', '0.4.9')
+    tid = db.add_task(release.UPGRADE_TASK_TITLE, 'merge', kind='harness')
+    now = time.time()
+    for i, v in enumerate(('0.5.0', '0.5.1', '0.5.2')):
+        _deploy_lib(v)
+        result = deploy.record(p, overview.deployed(names=['alpha']), now + i)
+        assert result['rc'] == 0 and result['projects'][0]['outcome'] == 'pending', result
+    out = p.db.q("SELECT kind,severity,ref,text FROM messages WHERE direction='out'")
+    assert [(m['kind'], m['severity'], m['ref']) for m in out] == [('alert', 'low', 'deploy-pending:alpha')]
+    assert out[0]['text'].startswith('alpha will switch to tt-project 0.5.2 by ')
+    assert f'(it waits for harness task #{tid} to finish).' in out[0]['text'] and '0.5.1' not in out[0]['text']
+    eps = p.db.q('SELECT key,severity,cleared FROM alerts')
+    assert [(e['key'], e['severity'], e['cleared']) for e in eps] == [('deploy-pending:alpha', 'low', None)]
+    assert alerts.active(p.db, 'deploy-pending:alpha', now, now + 5) and not alerts.sweep(p.db, now=now + 5)
+    (base / 'harness' / 'runtime' / 'ttp' / '__init__.py').write_text('__version__ = "0.5.2"\n')
+    hb = base / 'state' / 'heartbeat'
+    data = json.loads(hb.read_text())
+    data['receipt']['version'] = '0.5.2'
+    hb.write_text(json.dumps(data))
+    ticked = time.time() + 1      # its daemon ticked on the new files
+    os.utime(base / 'state' / 'tick_done', (ticked, ticked))
+    pages, page = _deploy_pager(p)
+    t = now + deploy.PROBE_S + 10
+    deploy.tick(p, page, t)
+    rec = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.2']
+    assert not pages and rec.get('closed'), (rec, overview.deployed(names=['alpha'])['projects'])
+    assert [e['key'] for e in alerts.sweep(p.db, now=t + 1)] == ['deploy-pending:alpha']
+    done = p.db.q("SELECT kind,severity,text FROM messages WHERE direction='out' ORDER BY id")[-1]
+    assert (done['kind'], done['severity'], done['text']) == ('resolved', 'low', 'Cleared: alpha runs tt-project 0.5.2 now.')
+    assert not alerts.active(p.db, 'deploy-pending:alpha', now, t + 2)
 
 
 @pytest.mark.parametrize('fault', ['stopped', 'upgrade_error'])
@@ -2866,7 +2907,7 @@ def test_after_push_deploy_recovered_daemon_returns_to_owned_pending(env, tmp_pa
     for t in (now + 60, now + 120):         # the coordinator's retry, after a restart
         result = deploy.record(again, overview.deployed(names=['alpha']), t)
         assert result['rc'] == 0 and result['projects'][0]['outcome'] == 'pending'
-    assert len(p.db.q("SELECT * FROM messages WHERE kind='alert'")) == 1
+    assert len(p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref NOT LIKE 'deploy-pending:%'")) == 1
     assert [e['key'] for e in alerts.sweep(p.db, now=now + 120)] == ['deploy-behind:alpha']
     rec = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']
     assert rec['due'] == due and len(rec['history']) == 1 and not rec.get('alerted')
