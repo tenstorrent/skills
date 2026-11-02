@@ -31,7 +31,7 @@ from . import __version__, poll_s
 from .db import CHANGES_NEEDED, chat_floor, task_outcome
 from . import outbox
 from .devq import unmask_devices
-from . import scriptwatch, sshcmd, timefmt, workerloss
+from . import chatgone, scriptwatch, sshcmd, timefmt, workerloss
 from . import schedule as sched
 from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
                       durable_append, durable_write, write_json, ACCOUNT_KEYS, DEFAULT_CONFIG, deep_merge,
@@ -1016,7 +1016,7 @@ def cmd_say(a) -> None:
     _print_reply_chat(p, a, label)
 
 
-SAY_CHAT_PREFIX = "say-"   # a chat `ttp say` without --chat registered for its caller
+SAY_CHAT_PREFIX = chatgone.SAY_CHAT_PREFIX   # a chat `ttp say` without --chat registered for its caller
 
 
 def say_caller(a, target: str) -> str:
@@ -1224,10 +1224,14 @@ def _say_local(p: Project, a, text: str, context: str, bid: str | None = None,
 
 
 def _register_say_chat(db, chat: str, label: str, caller: str) -> None:
-    """Create the caller's reply chat, unread from the message about to be posted; reuse it after."""
-    db.x("INSERT INTO chats(id,created,label,host,last_active,last_read) VALUES(?,?,?,?,?,"
-         "(SELECT COALESCE(MAX(id),0) FROM messages)) ON CONFLICT(id) DO NOTHING",
-         (chat, time.time(), label, caller, time.time()))
+    """Create the caller's reply chat, unread from the message about to be posted; reuse it after.
+    Its creation cursor is kept (chatgone.read_from): older broadcasts are not read by making it."""
+    if db.one("SELECT 1 FROM chats WHERE id=?", (chat,)):
+        return
+    top = int(db.one("SELECT COALESCE(MAX(id),0) n FROM messages")["n"])
+    db.x("INSERT INTO chats(id,created,label,host,last_active,last_read) VALUES(?,?,?,?,?,?)",
+         (chat, time.time(), label, caller, time.time(), top))
+    db.set_kv(chatgone.SAY_FROM + chat, top)
 
 
 def cmd_listen(a) -> None:

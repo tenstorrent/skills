@@ -17,6 +17,14 @@ from .project import zombie
 KEY = "chat-silent"        # alert key prefix: chat-silent:<chat id>
 KV = "chats_silent"        # kv: chat id -> its last_read when it was reported gone
 GONE_AFTER_S = 86400.0     # relay.gone_after_s default (0: a chat never counts as gone)
+SAY_CHAT_PREFIX = "say-"   # a chat `ttp say` without --chat registered for its caller (cli.say_chat)
+SAY_FROM = "say_chat_from:"   # kv: a say chat's read cursor at creation (cli._register_say_chat)
+
+
+def read_from(db, chat: str) -> int:
+    """The newest message a chat had not read when it was made: a say chat starts with its cursor at
+    the newest message, which is no read, so only a later `ttp listen` read past an older one counts."""
+    return int(db.kv(SAY_FROM + chat, 0) or 0) if chat.startswith(SAY_CHAT_PREFIX) else 0
 
 
 def listener_alive(p, chat: str) -> bool:
@@ -53,6 +61,7 @@ def chats(p, db, cfg: dict, now: float) -> list[dict]:
             f"channel!='quiet' AND severity IN ({','.join('?' * len(sevs))}))) LIMIT 1",
             (int(c["last_read"] or 0), now - after, c["id"], *sevs))
         out.append({"id": c["id"], "label": c["label"] or c["id"], "read_id": int(c["last_read"] or 0),
+                    "from": read_from(db, c["id"]),
                     "read_at": _read_at(db, c), "floor": floor, "listener": alive, "gone": bool(old)})
     return out
 

@@ -46,7 +46,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import anchors, reviewcap
+from . import anchors, chatgone, reviewcap
 from .db import DB, SEVERITY_RANK, chat_floor
 
 WINDOWS = (("24 h", 86400), ("7 d", 7 * 86400))
@@ -682,8 +682,9 @@ def asks(db: DB, since: float, now: float | None = None, chat_min: str | None = 
     resolved = db.kv(RESOLVED_KEY, {}) or {}
     # Relay chats: what each has read and its severity floor (a broadcast below it was skipped, not read).
     # The web app's visible tab reads every message (web.web_seen).
+    # A say chat reads only broadcasts after it was made (chatgone.read_from): making it is no read.
     readers = {r["id"]: (int(r["last_read"] or 0), 0 if r["id"] == "web" else
-                         SEVERITY_RANK.get(chat_floor(r["min_severity"], chat_min), 1))
+                         SEVERITY_RANK.get(chat_floor(r["min_severity"], chat_min), 1), chatgone.read_from(db, r["id"]))
                for r in db.q("SELECT id, last_read, min_severity FROM chats")}
     rows = {a["id"]: {"id": a["id"], "blocking": (a["ref"] or "").split(":", 1)[1]
                       if (a["ref"] or "").startswith("blocking:") else "unset",
@@ -714,8 +715,8 @@ def asks(db: DB, since: float, now: float | None = None, chat_min: str | None = 
             return False
         if m["chat"] == "slack":
             return bool(a["ext_id"])
-        seen, floor = readers.get(m["chat"], (0, 99))
-        return seen >= a["id"] and SEVERITY_RANK.get(a["severity"], 1) >= floor and a["channel"] != "quiet"
+        seen, floor, start = readers.get(m["chat"], (0, 99, 0))
+        return start < a["id"] <= seen and SEVERITY_RANK.get(a["severity"], 1) >= floor and a["channel"] != "quiet"
 
     def closed_before(a: dict, m: dict) -> bool:
         return float((resolved.get(str(a["id"])) or {}).get("ts") or m["ts"]) < m["ts"]

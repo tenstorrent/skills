@@ -365,29 +365,29 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     # Asks and alerts no reader got: relay chats still reading (a gone one, chatgone, no longer counts),
     # the web app's visible tab, Slack. A chat that read past one below its severity floor skipped it.
     relay = chatgone.chats(p, db, cfg, now)
-    readers = [(c["read_id"], c["floor"]) for c in relay if not c["gone"]]
+    # (read up to, floor, from): a say chat reads only what came after it was made (chatgone.read_from).
+    readers = [(c["read_id"], c["floor"], c["from"]) for c in relay if not c["gone"]]
     web_read = db.one("SELECT last_read FROM chats WHERE id='web'")
     if web_read:
-        readers.append((int(web_read["last_read"] or 0), 0))
+        readers.append((int(web_read["last_read"] or 0), 0, 0))
     if notify.get("slack"):
         slack_floor = SEVERITY_RANK.get(notify.get("slack_min_severity", "high"), 2)
-        readers.append((int(db.kv("slack_last_out", 0)), slack_floor))
+        readers.append((int(db.kv("slack_last_out", 0)), slack_floor, 0))
     undelivered = None
     if relay or notify.get("slack"):   # a project with no relay has no gap to report
         # A reply to a `ttp say` caller's own chat (cli.SAY_CHAT_PREFIX) reaches that chat or the web view.
-        said = {c["id"]: c["read_id"] for c in relay if c["id"].startswith("say-")}
+        said = {c["id"]: c["read_id"] for c in relay if c["id"].startswith(chatgone.SAY_CHAT_PREFIX)}
         web_seen = int(web_read["last_read"] or 0) if web_read else 0
         late = [a for a in db.q("SELECT id, ts, kind, severity, ref, chat FROM messages WHERE direction='out' AND "
-                                "(chat IS NULL OR chat LIKE 'say-%') "
-                                "AND channel!='quiet' AND (kind='ask' AND handled=0 OR kind!='ask' AND severity IN "
-                                "('normal','high','critical')) AND ts>?", (now - 14 * DAY,))
+                                "(chat IS NULL OR chat LIKE ?) AND channel!='quiet' AND (kind='ask' AND handled=0 OR kind!='ask' AND severity IN "
+                                "('normal','high','critical')) AND ts>?", (chatgone.SAY_CHAT_PREFIX + "%", now - 14 * DAY))
                 if (max(said.get(a["chat"], 0), web_seen) < a["id"] if a["chat"] else
-                    not any(seen >= a["id"] and SEVERITY_RANK.get(a["severity"], 1) >= floor
-                            for seen, floor in readers))
+                    not any(start < a["id"] <= seen and SEVERITY_RANK.get(a["severity"], 1) >= floor
+                            for seen, floor, start in readers))
                 and not cleared(db, a, now)]
         since = min((a["ts"] for a in late), default=now)
         if late and since < now - RELAY_LATE_S:
-            lowest = min((floor for _, floor in readers), default=0)
+            lowest = min((floor for _, floor, _ in readers), default=0)
             asks = [a for a in late if a["kind"] == "ask"]
             silent = [c for c in relay if c["read_id"] < min(a["id"] for a in late)]
             line = (f"{len(asks)} question(s) and {len(late) - len(asks)} alert(s) reached no chat or web view since "

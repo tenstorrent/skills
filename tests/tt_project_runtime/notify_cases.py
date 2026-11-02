@@ -531,6 +531,35 @@ def test_a_say_without_a_chat_replies_to_one_chat_per_caller_that_counts_as_a_re
     assert health(p, p.db)["undelivered"] is None
 
 
+def test_a_new_say_chat_has_not_read_older_broadcasts_until_its_listen_reads_past_them(env, monkeypatch, capsys):
+    """Making a say chat puts its cursor at the newest message: that is no read. An older unread
+    broadcast alert stays counted until that chat's `ttp listen` reads past it."""
+    from ttp import chatgone, cli
+    from ttp.web import health
+    p = make(env)
+    _relay_chat(p)
+    alert = p.db.post("out", "a service restarted twice", kind="alert", severity="normal")
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 3600, alert))
+    assert health(p, p.db)["undelivered"]["alerts"] == 1
+    monkeypatch.setattr(cli, "here", lambda: None)
+    cli.main(["say", "demo", "--", "hello"])
+    chat = p.db.one("SELECT chat FROM messages WHERE direction='in' ORDER BY id DESC LIMIT 1")["chat"]
+    assert chat.startswith(cli.SAY_CHAT_PREFIX) and chatgone.read_from(p.db, chat) >= alert
+    assert health(p, p.db)["undelivered"]["alerts"] == 1, "making the chat read nothing"
+    cli.main(["say", "demo", "--", "again"])   # reusing it keeps its creation cursor
+    assert health(p, p.db)["undelivered"]["alerts"] == 1
+    # An alert after the chat was made counts as read once its listen reads past it.
+    later = p.db.post("out", "a disk filled up", kind="alert", severity="normal")
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 3600, later))
+    assert health(p, p.db)["undelivered"]["alerts"] == 2
+    capsys.readouterr()
+    cli.main(["listen", "demo", "--chat", chat, "--once"])
+    assert p.db.one("SELECT last_read FROM chats WHERE id=?", (chat,))["last_read"] >= later
+    assert health(p, p.db)["undelivered"]["alerts"] == 1, "only the alert from before the chat stays counted"
+    p.db.x("UPDATE chats SET last_read=? WHERE id='c1'", (alert,))
+    assert health(p, p.db)["undelivered"] is None
+
+
 def test_a_remote_say_sends_the_callers_label_and_drops_it_for_an_older_runtime(env, monkeypatch):
     from ttp import cli
     sent = []
