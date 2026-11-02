@@ -31,7 +31,7 @@ DEFAULT = {"tier": "standard", "effort": "high"}
 NOTE_PREFIX = "[tier floor]"
 SOURCE = "conclusion_floor"   # tasks.tier_source
 KINDS = ("question", "plan")
-LINE = re.compile(r"(?im)^[ \t>*-]*conclusion:")
+LINE = re.compile(r"(?im)^[ \t>*#\d.)-]*conclusion\s*:")
 REPORT = re.compile(r"(?i)\b(review|summar(?:y|ies|ise|ize)|digest|reports?|brief(?:ing)?)\b")
 DAILY_REVIEW = "daily-review"
 

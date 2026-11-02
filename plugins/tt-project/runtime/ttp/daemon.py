@@ -2470,6 +2470,8 @@ class Daemon:
             lifted = failover.kept_effort(provider, min_effort)
             if lifted and tierfloor._rank(effort) < tierfloor._rank(lifted):
                 effort = lifted
+                if "effort" in pin:   # the runner checks the session runs the effort it starts with
+                    pin["effort"] = lifted
         prices = (self.cfg.get("pricing") or {}).get(provider) or {}
         prov = get_provider(provider).use(model, prices)
         restrictions = self.cfg.get("restrictions", {})

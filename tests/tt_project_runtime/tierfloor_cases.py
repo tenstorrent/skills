@@ -23,7 +23,8 @@ def test_tier_floor_classifies_each_conclusion_case_and_leaves_mechanical_work_a
     assert tierfloor.reasons({"kind": "question", "spec": "x"}) == ["kind question"]   # (a)
     assert tierfloor.reasons({"kind": "plan", "spec": "x"}) == ["kind plan"]
     assert tierfloor.reasons({"kind": "work", "spec": "x", "reply_chat": "c1"}) == ["answers a chat"]   # (b)
-    for spec in ("Goal: find it.\nconclusion: the root cause of the stall", "- Conclusion: a k/N table"):
+    for spec in ("Goal: find it.\nconclusion: the root cause of the stall", "- Conclusion: a k/N table",
+                 "1. conclusion : a verdict", "**Conclusion:** the status claim"):
         assert tierfloor.reasons({"kind": "code", "spec": spec}) == ["conclusion: line"]   # (c)
     for name in ("daily-review", "weekly-summary", "spend_digest", "status-report"):   # (d)
         assert tierfloor.reasons({"kind": "work", "spec": "x", "origin": "schedule",
@@ -170,5 +171,8 @@ def test_a_conclusion_runs_effort_floor_lifts_a_low_tier_effort_as_the_provider_
     assert launch() == "medium"
     assert launch(min_effort="high") == "high"
     assert launch(min_effort="low") == "medium", "a floor never lowers an effort"
+    # A low effort pin (not one the user required) rises too, and the runner's pin check sees the new one.
+    p.db.update_task(q, effort="low")
+    assert launch() == "low" and launch(min_effort="high") == "high"
     # Claude takes no `minimal`: the floor lands on the nearest effort it takes.
     assert tierfloor.kept_effort("claude", "minimal") == "low"
