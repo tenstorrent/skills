@@ -1606,6 +1606,10 @@ queues behind routine work; nothing running is interrupted:
   check recorded there as passed and logs `reused pass from <batch> (tree <short>)`. Only passes
   are recorded: a failed check, and one skipped as not applicable, always run again. A check that
   is one plain pytest run (no second pytest, and no `PYTHONPATH` or `PYTEST_ADDOPTS` of its own)
+  also resumes and records its slowest tests. That includes pytest run behind a launcher after a `--`
+  word (`launcher.py -- .venv/bin/python -m pytest -q tests`); the launcher keeps its own words. A check
+  object's `"pytest": true` marks a check the command does not show as one (a wrapper with no `--`),
+  `false` turns the detection off, and leaving it out detects it from the command. Such a check
   also resumes: a bundled pytest plugin records each test file whose every selected test passed,
   and the next run of that check under the same key skips those files and runs the rest; files
   are skipped whole, never single tests, and pytest-xdist runs never resume. The batch never reads

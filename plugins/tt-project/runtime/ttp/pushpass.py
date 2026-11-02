@@ -365,8 +365,11 @@ def select_env(pattern: str, env: dict) -> dict:
 
 
 def resumable(cmd: str) -> bool:
-    """`cmd` runs pytest exactly once and sets none of what loads the resume plugin."""
-    return len(push._PYTEST_RUN.findall(cmd)) == 1 and not any(w in cmd for w in _OWN_ENV)
+    """`cmd` runs pytest exactly once (push.pytest_runs; a check's `"pytest"` key, when set, says so
+    instead) and sets none of what loads the resume plugin."""
+    said = getattr(cmd, "pytest", None)
+    once = push.pytest_runs(cmd) == 1 if said is None else said
+    return once and not any(w in cmd for w in _OWN_ENV)
 
 
 def resume_file(p: Project, tree: str, cmd: str, eid: str) -> Path:

@@ -1586,9 +1586,9 @@ class Batch:
             for line in push.sandbox_lines([cmd for cmd, _, _ in run]):
                 say(line)
             for cmd, eid, parts in run:
-                resume = pushpass.resume_file(self.p, tree, str(cmd), eid) if tree and pushpass.resumable(str(cmd)) else None
+                resume = pushpass.resume_file(self.p, tree, str(cmd), eid) if tree and pushpass.resumable(cmd) else None
                 extra = pushpass.resume_env(resume, env) if resume else {}
-                if slow and pushpass.resumable(str(cmd)) and not push.remote_host(cmd):
+                if slow and pushpass.resumable(cmd) and not push.remote_host(cmd):
                     extra |= slowtests.env(slow, {**env, **extra})
                 if done := pushpass.resumed(resume) if resume else []:
                     say(f"resuming {cmd}: {len(done)} test file(s) passed in an earlier run on tree {tree[:10]}; running the rest")
@@ -1668,7 +1668,7 @@ class Batch:
         sharedchecks.stopped_early, so later tests never ran), its list of failing ids is incomplete
         (sharedchecks.failing_ids), it names more than RERUN_IDS, or one of them was rerun there in this
         batch already."""
-        if cmd == STALE or push.remote_host(cmd) or not pushpass.resumable(str(cmd)):
+        if cmd == STALE or push.remote_host(cmd) or not pushpass.resumable(cmd):
             return []
         if rc not in (1, None) or sharedchecks.stopped_early(tail):
             return []
@@ -1767,7 +1767,7 @@ class Batch:
             todo, _ = push.applicable(self.wt, head, checks, lambda _m: None, self.tip or "")
         except push.ScopeError:
             return False
-        todo = [c for c in todo if pushpass.resumable(str(c))]
+        todo = [c for c in todo if pushpass.resumable(c)]
         if not todo:
             return False
         env = push.check_env("target", self.tip, self.check_run_dir)

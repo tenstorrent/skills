@@ -82,7 +82,10 @@ class Check(str):
     runs it in the worktree being checked instead, for a check that needs build outputs or a venv made
     there, and `ttp checks` labels its pass as not run from a clean tree. `"silent_s": <seconds>` is how long
     `ttp checks` lets it run with no new output before stopping it as hung (checkwall.SILENT_S by default; 0
-    turns it off), for a check that is silent longer by design. `"ignore_paths": "<glob or list>"` names
+    turns it off), for a check that is silent longer by design. `"pytest": true` marks a check as one pytest run
+    (pytest_runs) the matcher cannot see, such as one behind a wrapper with no `--` before the pytest
+    command, so it resumes and records its test times; `false` turns that detection off; left out, it is
+    detected from the command. `"ignore_paths": "<glob or list>"` names
     paths the check cannot be affected by: it decides only whether a pass carries across a rebase
     (verdictcarry), never what the check covers or whether it runs on a fresh head. `wrap` (with_wrap,
     never part of the config form) is the argv a local check runs behind: `checks.wrap_cmd` for the commands after `--`."""
@@ -97,11 +100,12 @@ class Check(str):
     sandbox = True
     cwd = ""
     silent_s: float | None = None
+    pytest: bool | None = None
 
     def config(self) -> str | dict:
         """The form project.json keeps."""
         if not (self.if_exists or self.if_changed or self.purpose or self.host or self.env or not self.sandbox
-                or self.cwd or self.silent_s is not None or self.ignore_paths):
+                or self.cwd or self.silent_s is not None or self.ignore_paths or self.pytest is not None):
             return str(self)
         out: dict = {"run": str(self)}
         if self.if_exists:
@@ -122,10 +126,13 @@ class Check(str):
             out["silent_s"] = self.silent_s
         if self.ignore_paths:
             out["ignore_paths"] = list(self.ignore_paths)
+        if self.pytest is not None:
+            out["pytest"] = self.pytest
         return out
 
 
-CHECK_KEYS = {"run", "if_exists", "if_changed", "purpose", "host", "env", "sandbox", "cwd", "silent_s", "ignore_paths"}
+CHECK_KEYS = {"run", "if_exists", "if_changed", "purpose", "host", "env", "sandbox", "cwd", "silent_s", "ignore_paths",
+              "pytest"}
 PURPOSES = ("candidate", "harness")   # `ttp checks --purpose`; candidate is the default and publication evidence
 
 
@@ -162,6 +169,7 @@ def _check(c: Any) -> Check | None:
         out.cwd = "" if c.get("cwd") in (None, "clean") else c["cwd"]
         out.silent_s = c.get("silent_s")
         out.ignore_paths = _globs(c.get("ignore_paths"))
+        out.pytest = c.get("pytest")
     return out
 
 
@@ -468,9 +476,27 @@ def sandbox_lines(checks: list) -> list[str]:
 VENV_DIRS = (".venv", "venv")
 # A pytest run at a command's start: after the line's start or a separator, and VAR=value words,
 # `env [VAR=value...]` and `timeout [options] <duration>` wrappers.
-_PYTEST_RUN = re.compile(r"(^|&&|\|\||[;|(\n])(\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|env|"
-                         r"timeout(?:\s+-[A-Za-z-]+(?:[= ]\S+)?)*\s+\d+(?:\.\d+)?[smhd]?)\s+)*)"
-                         r"(?:pytest|py\.test|python3?\s+-m\s+pytest)(?=\s|$|[;&|)])")
+_SEG = r"(^|&&|\|\||[;|(\n])"
+_LEAD = (r"\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|env|"
+         r"timeout(?:\s+-[A-Za-z-]+(?:[= ]\S+)?)*\s+\d+(?:\.\d+)?[smhd]?)\s+)*")
+_BARE = r"(?:pytest|py\.test|python3?\s+-m\s+pytest)(?=\s|$|[;&|)])"
+_PYTEST_RUN = re.compile(_SEG + "(" + _LEAD + ")" + _BARE)
+# A pytest run behind a launcher in one command segment: the first command word after a `--` word,
+# past `env [VAR=value...]`: `[<path>/]pytest`, `[<path>/]py.test` or `[<path>/]python[N[.M]] -m pytest`
+# (`launcher.py -- .venv/bin/python -m pytest -q tests`). Not in a segment that is itself a pytest run
+# (its `--` ends pytest's own options) or starts with a command printing or searching text
+# (`grep -- pytest`, `echo -- pytest`).
+_TEXT_TOOLS = r"\s*(?:echo|printf|grep|egrep|fgrep|rg|ag|git|sed|awk|cat|test|\[|\[\[)(?=\s|$)"
+_PYTEST_WRAPPED = re.compile(
+    _SEG + "(?!" + _TEXT_TOOLS + ")(?!" + _LEAD + _BARE + ")"
+    r"([^;&|(\n]*?\s--\s+(?:env(?:\s+[A-Za-z_][A-Za-z0-9_]*=\S*)*\s+)?)"
+    r"((?:[^\s;&|()'\"]*/)?(?:pytest|py\.test|python(?:\d+(?:\.\d+)?)?\s+-m\s+pytest))(?=\s|$|[;&|)])")
+
+
+def pytest_runs(cmd: str) -> int:
+    """How many pytest runs `cmd` starts: at a segment's start (_PYTEST_RUN) or behind a launcher's
+    `--` (_PYTEST_WRAPPED)."""
+    return len(_PYTEST_RUN.findall(cmd)) + len(_PYTEST_WRAPPED.findall(cmd))
 
 
 def venv_python(top: str | Path, env: dict | None = None) -> Path | None:
@@ -651,8 +677,11 @@ def venv_cmd(cmd: str, top: str | Path, env: dict | None = None) -> str:
     command stays as written and first prints why to the checks output.
     In a worktree nested below pytest files (nested_pytest), each such run is also kept to the worktree:
     `--rootdir` and `--confcutdir` set to it (unless the command sets them) and it first on PYTHONPATH
-    (a PYTHONPATH the run itself sets still wins), so it tests the worktree's code, not the outer one's."""
-    if not _PYTEST_RUN.search(cmd):
+    (a PYTHONPATH the run itself sets still wins), so it tests the worktree's code, not the outer one's.
+    A run behind a launcher's `--` (_PYTEST_WRAPPED) is changed the same way where it stands, so the launcher
+    keeps its own words: a bare one gets the venv python, one naming its own python keeps it, and
+    PYTHONPATH goes in as `env PYTHONPATH=...` before it."""
+    if not pytest_runs(cmd):
         return cmd
     py, why = _venv(top, env)
     nested = nested_pytest(top)
@@ -667,7 +696,12 @@ def venv_cmd(cmd: str, top: str | Path, env: dict | None = None) -> str:
         tail = (f"{shlex.quote(str(py))} -m pytest" if py else bare) + flags
         return f"{m.group(1)}{pre}{m.group(2).lstrip() if pre else m.group(2)}{tail}"
 
-    out = _PYTEST_RUN.sub(run, cmd)
+    def wrapped(m: re.Match) -> str:
+        bare = m.group(3)
+        tail = (f"{shlex.quote(str(py))} -m pytest" if py and re.fullmatch(_BARE, bare) else bare) + flags
+        return f"{m.group(1)}{m.group(2)}{'env' + pre if pre else ''}{tail}"
+
+    out = _PYTEST_WRAPPED.sub(wrapped, _PYTEST_RUN.sub(run, cmd))
     return f"printf '%s\\n' {shlex.quote('ttp: ' + why)} >&2\n{out}" if why else out
 
 
@@ -1152,7 +1186,7 @@ def _form_problem(c: dict) -> str | None:
     extra = sorted(set(map(str, c)) - CHECK_KEYS)
     if extra:
         return (f"{c!r}: unknown key(s) {', '.join(extra)}; a check object takes only run, if_exists, if_changed, "
-                "purpose, host, env, sandbox, cwd, silent_s and ignore_paths")
+                "purpose, host, env, sandbox, cwd, silent_s, ignore_paths and pytest")
     cond = c.get("if_exists")
     if cond is not None and not _inside(cond):
         return f"{c!r}: if_exists must be a path or glob inside the repository"
@@ -1171,6 +1205,8 @@ def _form_problem(c: dict) -> str | None:
         return f"{c!r}: {why}"
     if "sandbox" in c and not isinstance(c["sandbox"], bool):
         return f"{c!r}: sandbox must be true or false"
+    if "pytest" in c and not isinstance(c["pytest"], bool):
+        return f"{c!r}: pytest must be true or false (leave it out to detect a pytest run from the command)"
     if "silent_s" in c and (isinstance(c["silent_s"], bool) or not isinstance(c["silent_s"], (int, float))
                             or not 0 <= c["silent_s"] < float("inf")):
         return f"{c!r}: silent_s must be a number of seconds, 0 or more (0 turns the no-output stop off)"

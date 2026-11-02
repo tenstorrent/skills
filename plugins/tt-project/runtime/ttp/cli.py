@@ -2601,7 +2601,7 @@ def _queue_passes(p: Project | None, top: str | Path, tree: str, todo: list, env
     if not p or not tree:
         return []
     from . import push, pushpass
-    todo = [c for c in todo if pushpass.resumable(str(c)) and not push.remote_host(c)]
+    todo = [c for c in todo if pushpass.resumable(c) and not push.remote_host(c)]
     if not todo:
         return []
     r = subprocess.run(["git", "-C", str(top), "rev-list", "--first-parent", f"--max-count={QUEUE_TIPS}", "HEAD"],
@@ -3238,7 +3238,7 @@ def cmd_checks(a) -> None:
                 group = bool(getattr(a, "own_group", False))
                 env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), **child_env,
                        "PWD": cwd, **({checkreap.MARKER: reap_tok} if reap_tok else {})}
-                if pushpass.resumable(str(c)) and not push.remote_host(c):   # one plain local pytest run
+                if pushpass.resumable(c) and not push.remote_host(c):   # one plain local pytest run
                     env |= slowtests.env(Path(run_dir) / slowtests.FILE, env)
                 def said(line: str) -> None:   # a script it runs was rewritten as it ran: once more
                     nonlocal check_start
@@ -3291,7 +3291,7 @@ def cmd_checks(a) -> None:
                     break
                 out.write(_check_took(c, rc, began))
             # The tests the diff adds, once more several times each: a timing-flaky one fails here.
-            py_check = next((c for c in executed if not push.remote_host(c) and addedtests.eligible(str(c))), None)
+            py_check = next((c for c in executed if not push.remote_host(c) and addedtests.eligible(c)), None)
             if passed and py_check is not None and (new_tests := addedtests.added(top, base, head)):
                 for n, c in enumerate(todo if run_envs and run_parts else []):
                     if c not in reused:

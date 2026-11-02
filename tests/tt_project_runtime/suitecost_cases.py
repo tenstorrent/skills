@@ -156,3 +156,28 @@ def test_ttp_checks_saves_a_pytest_checks_slowest_tests_and_its_result_shows_the
     out = capsys.readouterr().out
     assert "ttp checks: slowest 5 tests" in out and "29.0s t.py::t29" in out and "25.0s t.py::t25" in out
     assert "t.py::t24" not in out and "stale" not in out
+
+
+def test_ttp_checks_saves_the_slowest_tests_of_a_pytest_check_behind_a_launcher(env, tmp_path, monkeypatch, capsys):
+    """A check that runs pytest behind a launcher's `--` loads the durations plugin like a plain one: the
+    launcher gets its own words unchanged and runs the venv's pytest, whose test times are saved."""
+    from ttp import cli, slowtests
+    p = make(env)
+    repo, py = _venv_repo(tmp_path)
+    rows = [{"id": f"t.py::t{i}", "s": float(i)} for i in range(3)]
+    py.write_text(f"#!/bin/sh\necho \"$PYTEST_ADDOPTS\" >> {tmp_path / 'opts'}\n"
+                  f"[ -n \"$TTP_PYTEST_DURATIONS\" ] && echo '{json.dumps({'tests': rows, 'count': 3})}' "
+                  "> \"$TTP_PYTEST_DURATIONS\"\nexit 0\n")
+    launcher = tmp_path / "launcher.sh"   # records its own words, then runs what follows `--`
+    launcher.write_text(f"#!/bin/sh\nwhile [ \"$1\" != -- ]; do echo \"$1\" >> {tmp_path / 'own'}; shift; done\n"
+                        "shift\nexec \"$@\"\n")
+    launcher.chmod(0o755)
+    run = tmp_path / "run"
+    run.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(repo)
+    cli.main(["checks", "--", f"{launcher} --slots 2 -- pytest -q"])
+    assert (tmp_path / "own").read_text().split() == ["--slots", "2"]
+    assert "-p ttp_pytest_durations" in (tmp_path / "opts").read_text()
+    assert slowtests.load(run / slowtests.FILE)[0] == ("t.py::t2", 2.0)

@@ -4695,6 +4695,75 @@ def test_check_commands_run_bare_pytest_with_the_repositorys_venv(tmp_path):
     assert push.check_argv("pytest -q")[-1] == "pytest -q"   # without a worktree: as written
 
 
+
+WRAPPED_PYTEST = ("launcher.py -- .venv/bin/python -m pytest -q tests/",
+                  "python3 launcher.py --slots 2 -- /opt/venv/bin/python3.11 -m pytest -q tests/",
+                  "launcher.py -- python -m pytest -q", "launcher.py -- pytest -q", "launcher.py -- tools/pytest -q",
+                  "launcher.py -- env A=1 py.test -q", "cd sub && launcher.py -- pytest -q")
+NOT_PYTEST = ("echo pytest", "grep pytest tests", "grep -r -- pytest tests", "echo -- pytest", "git grep -- pytest",
+              "launcher.py -- tools/mypytest -q", "launcher.py -- tools/pytest_helper", "launcher.py -- x/pytest/run.sh",
+              "launcher.py pytest -q", "launcher.py --pytest", "a --x=-- pytest", "make test", "pytest-benchmark run")
+
+
+def test_a_pytest_run_behind_a_launchers_double_dash_is_one_pytest_run():
+    """A check that runs pytest behind a launcher (`launcher.py -- <path>/python -m pytest ...`) counts
+    as one pytest run, so it resumes and records its test times; text tools, substrings and other
+    commands do not, and pytest after a `;`/`&&` boundary is its own segment as before."""
+    from ttp import push, pushpass
+    for cmd in WRAPPED_PYTEST:
+        assert push.pytest_runs(cmd) == 1 and pushpass.resumable(cmd), cmd
+    for cmd in NOT_PYTEST:
+        assert push.pytest_runs(cmd) == 0 and not pushpass.resumable(cmd), cmd
+    # Unwrapped checks as before, and a segment that is itself pytest keeps counting once.
+    for cmd in ("pytest -q", "python3 -m pytest -q tests", "make lint; pytest -q", "launcher.py -- make && pytest -q",
+                "pytest -q -- tests/pytest", "FOO=1 timeout 600 pytest -x"):
+        assert push.pytest_runs(cmd) == 1 and pushpass.resumable(cmd), cmd
+    for cmd in ("launcher.py -- pytest a && launcher.py -- pytest b", "pytest a; launcher.py -- pytest b",
+                "launcher.py -- PYTHONPATH=x pytest -q", "PYTEST_ADDOPTS=-x launcher.py -- pytest -q"):
+        assert not pushpass.resumable(cmd), cmd
+
+
+def test_a_checks_pytest_key_says_whether_it_is_one_pytest_run():
+    """`"pytest": true` makes a check the matcher cannot see (a wrapper with no `--`) one pytest run;
+    `false` turns detection off; left out, it is detected. It survives the config round trip and the
+    copies with_host and with_wrap make; a non-boolean is a form problem."""
+    from ttp import push, pushpass
+    yes, no, auto, plain = push.check_list([{"run": "launcher.py pytest -q", "pytest": True},
+                                            {"run": "launcher.py -- pytest -q", "pytest": False},
+                                            {"run": "launcher.py -- pytest -q"}, "launcher.py pytest -q"])
+    assert pushpass.resumable(yes) and not pushpass.resumable(no)
+    assert pushpass.resumable(auto) and not pushpass.resumable(plain)
+    assert yes.config() == {"run": "launcher.py pytest -q", "pytest": True}
+    assert no.config() == {"run": "launcher.py -- pytest -q", "pytest": False}
+    assert auto.config() == "launcher.py -- pytest -q"
+    for c in push.with_host([yes, no], "box") + push.with_wrap([yes, no], ("lock", "--")):
+        assert pushpass.resumable(c) is (c.pytest is True), c
+    # What loads the resume plugin of its own still wins over the key.
+    own, = push.check_list([{"run": "PYTEST_ADDOPTS=-x launcher.py pytest -q", "pytest": True}])
+    assert not pushpass.resumable(own)
+    assert "pytest must be true or false" in push._form_problem({"run": "pytest", "pytest": "yes"})
+    bad, = push.check_list([{"run": "launcher.py pytest -q", "pytest": "yes"}])
+    assert bad.pytest is None and not pushpass.resumable(bad)
+
+
+def test_a_wrapped_pytest_run_gets_the_venv_and_worktree_flags_where_it_stands(tmp_path):
+    """venv_cmd changes a pytest run behind a launcher's `--` where it stands: the launcher's own words
+    are unchanged, a bare run gets the venv python, one naming its python keeps it, and in a nested
+    worktree the flags go after `-m pytest` and PYTHONPATH in as `env PYTHONPATH=...`."""
+    from ttp import push
+    repo, py = _venv_repo(tmp_path)
+    q = shlex.quote(str(py))
+    assert push.venv_cmd("launcher.py --slots 2 -- pytest -q tests", repo) == f"launcher.py --slots 2 -- {q} -m pytest -q tests"
+    assert push.venv_cmd("launcher.py -- python3 -m pytest -q", repo) == f"launcher.py -- {q} -m pytest -q"
+    for kept in ("launcher.py -- .venv/bin/python -m pytest -q", "launcher.py -- python3.11 -m pytest -q",
+                 *NOT_PYTEST):
+        assert push.venv_cmd(kept, repo) == kept
+    root, wt, _ = _nested_worktree(tmp_path)
+    w = shlex.quote(str(wt))
+    assert push.venv_cmd("launcher.py --slots 2 -- .venv/bin/python -m pytest -q tests/", wt) == (
+        f"launcher.py --slots 2 -- env PYTHONPATH={w}${{PYTHONPATH:+:$PYTHONPATH}} .venv/bin/python -m pytest "
+        f"--rootdir={w} --confcutdir={w} -q tests/")
+
 def _nested_worktree(tmp_path):
     """A project root with a pytest config, a conftest.py and a package `pkg`, and a git worktree nested
     below it whose `pkg` differs (it alone has `pkg.only_here`), with a test that imports it."""
