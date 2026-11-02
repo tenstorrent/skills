@@ -179,11 +179,11 @@ def _matches(row: dict, provider: str, account: str) -> bool:
 
 
 # this machine -----------------------------------------------------------------------------------
-def _rows(conn: sqlite3.Connection, start: float, end: float) -> list[dict]:
+def _rows(conn: sqlite3.Connection, start: float, end: float, memo: dict | None = None) -> list[dict]:
     """Billed spend per (provider, account key) in [start, end), with running work as last priced:
     the same rule as the project caps (billing.billed_by_account), so plan spend never counts."""
     out: dict[tuple, float] = {}
-    for (prov, acct), usd in billing.billed_by_account(conn, start, end, running_at=time.time()).items():
+    for (prov, acct), usd in billing.billed_by_account(conn, start, end, running_at=time.time(), memo=memo).items():
         k = (prov, account_key(prov, acct))
         out[k] = out.get(k, 0.0) + usd
     return [{"provider": p, "key": k, "usd": round(u, 4)} for (p, k), u in out.items()]
@@ -684,7 +684,7 @@ def total(db, provider: str, start: float, end: float, now: float | None = None,
     account = account_of(provider) if account is None else account
     own = Path(db.path).resolve()
     conn = db.conn
-    usd = sum(r["usd"] for r in _rows(conn, start, end) if _matches(r, provider, account))
+    usd = sum(r["usd"] for r in _rows(conn, start, end, getattr(db, "billing_memo", None)) if _matches(r, provider, account))
     here = machine_totals(start, end, skip=str(own), now=now, cached=True)
     usd += sum(r["usd"] for r in here["rows"] if _matches(r, provider, account))
     stale, errors, hosts, seen = [], list(here["errors"]), [], {project.hostname()}

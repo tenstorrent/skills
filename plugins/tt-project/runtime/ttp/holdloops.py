@@ -29,8 +29,10 @@ are resolved.
 """
 from __future__ import annotations
 
+import json
+
 from . import anchors, timefmt
-from .db import DB, _first_dead, deferral, dependency_ids, load_result
+from .db import DB, OPEN_TASKS, _first_dead, deferral, dependency_ids, load_result
 
 LOOPS_KEY = "hold_loops"        # kv {key: {"since", "raised", "task", "text", "kind"}}
 TIME_KEY = "hold_time_only"     # kv {task id: {"since", "ends": [...], "flag": ts, "why"}}
@@ -209,8 +211,11 @@ def _track_time_only(db: DB, cfg: dict, now: float, tasks: dict[int, dict], stat
 
 def current(db: DB, cfg: dict, now: float) -> dict[str, dict]:
     """Every loop condition true now: {key: {"kind", "task", "text"}}."""
-    states = {r["id"]: r["status"] for r in db.q("SELECT id, status FROM tasks")}
-    tasks = {r["id"]: r for r in db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled')")}
+    tasks = {r["id"]: r for r in db.q(f"SELECT * FROM tasks WHERE {OPEN_TASKS} ORDER BY id")}
+    # Only the tasks depended on: every use below looks up a dependency of an open task.
+    want = sorted({d for t in tasks.values() for d in dependency_ids(t) if d is not None})
+    states = {r["id"]: r["status"] for r in db.q("SELECT id, status FROM tasks WHERE id IN (SELECT value FROM json_each(?))",
+                                                 (json.dumps(want),))} if want else {}
     out: dict[str, dict] = {}
     for tid, e in _track_time_only(db, cfg, now, tasks, states).items():
         t = tasks.get(int(tid))

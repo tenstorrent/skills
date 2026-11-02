@@ -53,6 +53,9 @@ KINDS = ("auto", "plan", "usage")
 # KV: provider -> [[since, kind], ...], the declarations in force from `since` on (oldest first).
 DECLARED_KV = "billing_declared"
 DECLARED_KEEP = 20
+# A plan_spans memo that misses reads this much further back, so the wider windows asked for next
+# in the same tick (the hour, the day, the week, each PLAN_MEMORY_S further back) slice the same rows.
+MEMO_EXTRA_S = 8 * DAY
 
 
 def declared(cfg: Mapping, provider: str) -> str:
@@ -103,6 +106,28 @@ def _q(conn: sqlite3.Connection, sql: str, args: Iterable = ()) -> list[tuple]:
     return [tuple(r) for r in conn.execute(sql, tuple(args)).fetchall()]
 
 
+def _since(conn: sqlite3.Connection, memo: dict | None, sql: str, at: int, lookback: float,
+           provider: str | None) -> list[tuple]:
+    """_q(conn, sql, (lookback, provider, provider)) for a query of the rows whose column `at` is at or
+    after `lookback`, ordered by it. With `memo` (a dict its caller keeps for this connection), rows
+    read once are reused for any later lookback they cover until the database is written: by this
+    connection (total_changes) or by another one (PRAGMA data_version)."""
+    if memo is None:
+        return _q(conn, sql, (lookback, provider, provider))
+    stamp = (conn.total_changes, conn.execute("PRAGMA data_version").fetchone()[0])
+    hit = memo.get((sql, provider))
+    if hit and hit[0] == stamp and hit[1] <= lookback:
+        return hit[2][bisect.bisect_left(hit[3], lookback):]
+    start = lookback - MEMO_EXTRA_S
+    rows = _q(conn, sql, (start, provider, provider))
+    keys = [r[at] for r in rows]
+    if any(type(k) not in (int, float) for k in keys):
+        memo.pop((sql, provider), None)   # sorted as SQL sorts mixed types, which bisect cannot slice
+        return _q(conn, sql, (lookback, provider, provider))
+    memo[(sql, provider)] = (stamp, start, rows, keys)
+    return rows[bisect.bisect_left(keys, lookback):]
+
+
 def _count(ends: list[tuple[float, str, float]], keys: list[float], a: float, b: float | None,
            acct: str | None = None) -> list[float]:
     """End times of the runs in `ends` that ended after `a` and before `b` (None: no bound), only
@@ -112,20 +137,21 @@ def _count(ends: list[tuple[float, str, float]], keys: list[float], a: float, b:
     return [e for e, ac, _ in ends[lo:hi] if acct is None or not acct or not ac or ac == acct]
 
 
-def plan_spans(conn: sqlite3.Connection, since: float, provider: str | None = None) -> Spans:
+def plan_spans(conn: sqlite3.Connection, since: float, provider: str | None = None, memo: dict | None = None) -> Spans:
     """(provider, account) -> the times its spend was plan-billed, for spend from `since` on.
-    Account '' holds the spans of readings recorded without an account."""
+    Account '' holds the spans of readings recorded without an account. `memo`: see _since."""
     lookback = since - PLAN_MEMORY_S
     readings: dict[tuple[str, str], list[float]] = {}
-    for prov, acct, ts in _q(conn, "SELECT DISTINCT provider, COALESCE(account,''), ts FROM snapshots "
-                                   "WHERE ts>=? AND (? IS NULL OR provider=?) ORDER BY ts",
-                             (lookback, provider, provider)):
+    for prov, acct, ts in _since(conn, memo, "SELECT DISTINCT provider, COALESCE(account,''), ts FROM snapshots "
+                                             "WHERE ts>=? AND (? IS NULL OR provider=?) ORDER BY ts", 2, lookback, provider):
         readings.setdefault((prov or "", acct), []).append(float(ts))
+    if not readings:
+        return {}   # spans come only from readings: the runs read below would go unused
     paid: dict[str, list[tuple[float, str, float]]] = {}
     started: dict[tuple[str, str], list[tuple[float, float]]] = {}
-    for prov, acct, start, end, status, cost in _q(
-            conn, "SELECT provider, COALESCE(account,''), started, ended, status, cost_usd FROM runs "
-                  "WHERE ended>=? AND (? IS NULL OR provider=?) ORDER BY ended", (lookback, provider, provider)):
+    for prov, acct, start, end, status, cost in _since(
+            conn, memo, "SELECT provider, COALESCE(account,''), started, ended, status, cost_usd FROM runs "
+                        "WHERE ended>=? AND (? IS NULL OR provider=?) ORDER BY ended", 3, lookback, provider):
         if status == "ok" and float(cost or 0) > 0:
             paid.setdefault(prov or "", []).append((float(end), acct, float(start or end)))
         started.setdefault((prov or "", acct), []).append((float(start or end), float(end)))
@@ -166,10 +192,11 @@ def is_plan(spans: Spans, provider: str, account: str, ts: float) -> bool:
 
 def billed_by_account(conn: sqlite3.Connection, since: float, until: float | None = None,
                       provider: str | None = None, exclude: Mapping[str, float] | None = None,
-                      estimated_only: bool = False, running_at: float | None = None) -> dict[tuple[str, str], float]:
+                      estimated_only: bool = False, running_at: float | None = None,
+                      memo: dict | None = None) -> dict[tuple[str, str], float]:
     """Billed spend in [since, until) per (provider, account). `exclude` maps provider -> time up to
     which its rows are left out. With `running_at`, runs still going add what they were priced at
-    so far, when their account was billed by use when they started."""
+    so far, when their account was billed by use when they started. `memo`: see _since."""
     from .db import counted_spend     # db imports this module; which ledger rows count is decided there
     where, args = counted_spend(since, until, provider, exclude, estimated_only)
     rows = [(p or "", a, float(ts), float(usd or 0)) for p, a, ts, usd in _q(
@@ -178,7 +205,7 @@ def billed_by_account(conn: sqlite3.Connection, since: float, until: float | Non
         rows += [(p or "", a, float(st or running_at), float(usd or 0)) for p, a, st, usd in _q(
             conn, "SELECT provider, COALESCE(account,''), started, cost_usd FROM runs WHERE status='running' "
                   "AND (? IS NULL OR provider=?)", (provider, provider))]
-    spans = plan_spans(conn, min([since] + [ts for _, _, ts, _ in rows]), provider)
+    spans = plan_spans(conn, min([since] + [ts for _, _, ts, _ in rows]), provider, memo)
     hist = _history(conn)
     out: dict[tuple[str, str], float] = {}
     for p, a, ts, usd in rows:

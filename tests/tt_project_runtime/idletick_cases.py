@@ -335,3 +335,73 @@ def test_gitcache_and_statcache_never_keep_more_than_their_bounds(env, tmp_path,
         (tmp_path / f"{i}.json").write_text(str(i))
         assert statcache.load_json(tmp_path / f"{i}.json") == i
         assert len(statcache._kept) <= 2
+
+
+def _billing_db(tmp_path):
+    from ttp.db import DB
+    d = DB(tmp_path / "b.db")
+    now = time.time()
+    d.conn.executemany("INSERT INTO runs(task,role,provider,account,started,ended,status,cost_usd,dir) VALUES(?,?,?,?,?,?,?,?,?)",
+                       [(1, "worker", "claude", "a" if i % 3 else "", now - 86400 * 20 + i * 1800, now - 86400 * 20 + i * 1800 + 600,
+                         "ok", 1.0, "") for i in range(900)])
+    d.conn.executemany("INSERT INTO snapshots(ts,provider,account,window) VALUES(?,?,?,?)",
+                       [(now - 86400 * 9 + i * 600, "claude", "a", "5h") for i in range(0, 1300) if not 400 < i < 700])
+    for i in range(300):
+        d.spend("claude", 0.5, "worker", account="a" if i % 2 else "", ts=now - 86400 * 8 + i * 2400)
+    return d, now
+
+
+def test_billing_memo_matches_the_uncached_reads_and_ends_at_any_write(tmp_path):
+    """The plan readings and runs billed_by_account reads are reused within a tick (DB.billing_memo)
+    only while nothing wrote the database: totals always equal the uncached path's."""
+    import sqlite3 as sq
+    from ttp import billing
+    d, now = _billing_db(tmp_path)
+
+    def both(since):
+        cached = billing.billed_by_account(d.conn, since, running_at=now, memo=d.billing_memo)
+        assert cached == billing.billed_by_account(d.conn, since, running_at=now)
+        return cached
+
+    for since in (now - 3600, now - 86400, now - 7 * 86400, now - 3 * 86400):
+        both(since)
+    assert len(d.billing_memo) == 2   # one entry per query, sliced for every later window
+    before = both(now - 7 * 86400)
+    other = sq.connect(str(tmp_path / "b.db"))   # another connection's commit: PRAGMA data_version
+    other.execute("DELETE FROM snapshots WHERE ts > ?", (now - 86400 * 5,))
+    other.commit()
+    other.close()
+    after = both(now - 7 * 86400)
+    assert after != before
+    # this connection's own write: total_changes
+    d.conn.executemany("INSERT INTO snapshots(ts,provider,account,window) VALUES(?,?,?,?)",
+                       [(now - 86400 * 5 + i * 600, "claude", "a", "5h") for i in range(700)])
+    assert both(now - 7 * 86400) != after
+
+
+def test_idle_reads_use_their_indexes(tmp_path):
+    """The reads an idle tick makes on a long history use an index, never a scan of every row."""
+    from ttp.db import DB, OPEN_TASKS
+    d = DB(tmp_path / "i.db")
+
+    def plan(sql, args=()):
+        return " ".join(r[-1] for r in d.conn.execute("EXPLAIN QUERY PLAN " + sql, args).fetchall())
+
+    assert "tasks_open" in plan(f"SELECT * FROM tasks WHERE {OPEN_TASKS} ORDER BY id")
+    assert "SCAN" not in plan("SELECT MAX(updated) m FROM tasks WHERE status IN (?,?,?)", ("done", "failed", "cancelled"))
+    assert "SCAN" not in plan("SELECT MAX(ts) m FROM messages WHERE direction='in'")
+    assert "SCAN" not in plan("SELECT * FROM messages WHERE kind='ask' AND handled=0")
+    assert "runs_ended" in plan("SELECT provider FROM runs WHERE ended>=? ORDER BY ended", (0,))
+
+
+def test_unmet_dependencies_reads_only_the_tasks_depended_on(tmp_path):
+    """Done dependencies are met, open, failed and missing ones are not, the same as reading all tasks."""
+    from ttp.db import DB
+    d = DB(tmp_path / "u.db")
+    ids = {}
+    for name, status in (("done", "done"), ("open", "queued"), ("failed", "failed")):
+        ids[name] = d.add_task(title=name, spec="s", kind="work")
+        d.x("UPDATE tasks SET status=? WHERE id=?", (status, ids[name]))
+    t = d.add_task(title="t", spec="s", kind="work", depends_on=[ids["done"], ids["open"], ids["failed"], 9999, "x"])
+    got = d.unmet_dependencies([d.task(t), d.task(ids["done"])])
+    assert got == {t: [ids["open"], ids["failed"], 9999, None], ids["done"]: []}

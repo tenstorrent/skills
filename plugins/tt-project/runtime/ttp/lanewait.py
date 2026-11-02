@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 
 from . import landed
-from .db import TERMINAL_TASK_STATES, deferral, without_deferral
+from .db import OPEN_TASKS, deferral, without_deferral
 
 START_FROM = "start_from:"   # + sha: a new worktree branches from it (worktree.early_head)
 EARLY = "early_start:"       # + "<X>:<push_queue row>": started on X's approved head
@@ -71,8 +71,7 @@ def rebase_notes(db, now: float | None = None) -> list[int]:
     """Gives each open task started early (EARLY) whose push queue row was sent back a rebase note,
     once, and drops EARLY from it then or once the row shipped. Returns the tasks noted."""
     noted = []
-    for t in db.q(f"SELECT * FROM tasks WHERE status NOT IN (?,?,?) AND labels LIKE '%\"{EARLY}%'",
-                  TERMINAL_TASK_STATES):
+    for t in db.q(f"SELECT * FROM tasks WHERE {OPEN_TASKS} AND labels LIKE '%\"{EARLY}%'"):
         x, _, row = (label_value(t, EARLY) or "").partition(":")
         r = db.one("SELECT status, head FROM push_queue WHERE id=?", (int(row),)) if row.isdigit() else None
         if r and r["status"] not in SENT_BACK + ("pushed", "landed"):

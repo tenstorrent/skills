@@ -126,7 +126,8 @@ def in_flight(db: DB, provider: str | None = None, exclude: set[str] | None = No
     """Spend so far of runs still going, as the daemon last priced it; the ledger has it only
     once they end. With `billed_at`, only runs whose account is billed by use at that time."""
     if billed_at is not None:
-        got = billed_by_account(db.conn, billed_at, billed_at, provider=provider, running_at=billed_at)
+        got = billed_by_account(db.conn, billed_at, billed_at, provider=provider, running_at=billed_at,
+                                memo=getattr(db, "billing_memo", None))
         return sum(usd for (p, _), usd in got.items() if p not in (exclude or set()))
     rows = db.q("SELECT provider, cost_usd FROM runs WHERE status='running' AND (? IS NULL OR provider=?)",
                 (provider, provider))

@@ -62,6 +62,9 @@ CREATE TABLE IF NOT EXISTS messages (
                                    -- data, never the user's word; `text` keeps only the user's verbatim words
   broadcast TEXT);                 -- inbound: the broadcast id when the user sent it to every project (broadcast.py)
 CREATE INDEX IF NOT EXISTS messages_unhandled ON messages(direction, handled);
+-- The idle tick's reads of a long-lived project (thousands of rows each): the last message in, the open asks.
+CREATE INDEX IF NOT EXISTS messages_dir_ts ON messages(direction, ts);
+CREATE INDEX IF NOT EXISTS messages_open ON messages(kind) WHERE handled=0;
 
 CREATE TABLE IF NOT EXISTS tasks (
   id INTEGER PRIMARY KEY AUTOINCREMENT, created REAL, updated REAL,
@@ -75,6 +78,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   model TEXT, effort TEXT, pin_verify TEXT, -- NULL pins follow the tier; NULL verification follows the project
   assigned_tier TEXT, tier_source TEXT); -- the tier it was queued at, and why its tier is what it is (TIER_SOURCES)
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status, priority);
+CREATE INDEX IF NOT EXISTS tasks_status_updated ON tasks(status, updated);
+-- The open tasks, without reading the rows of the closed ones. SQLite uses it only for a WHERE term
+-- written exactly as OPEN_TASKS below (literal values in this order), never with bound parameters.
+CREATE INDEX IF NOT EXISTS tasks_open ON tasks(id) WHERE status NOT IN ('done','failed','cancelled');
 -- A hold's anchor (anchors.py, the label `waits:<kind>:<value>`) lives only while the task is blocked.
 -- Every write that leaves it on a task not blocked, raw SQL included, drops it: else a later block
 -- for another reason (a budget, a dead dependency, a worker) would be released by the old anchor.
@@ -103,6 +110,7 @@ CREATE TABLE IF NOT EXISTS runs (
   cache_read_tokens INTEGER DEFAULT 0, cache_write_tokens INTEGER DEFAULT 0, note TEXT, session_id TEXT,
   cost_basis TEXT);
 CREATE INDEX IF NOT EXISTS runs_status ON runs(status);
+CREATE INDEX IF NOT EXISTS runs_ended ON runs(ended);
 
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, source TEXT NOT NULL,
@@ -190,6 +198,9 @@ CREATE INDEX IF NOT EXISTS review_stats_ts ON review_stats(ts);
 """
 
 TERMINAL_TASK_STATES = ("done", "failed", "cancelled")
+# The WHERE term the partial index tasks_open serves (see SCHEMA): use it, not bound parameters, in reads
+# of the open tasks that run every tick.
+OPEN_TASKS = "status NOT IN ('done','failed','cancelled')"
 NOT_ABANDONED_SQL = "id NOT IN (SELECT task FROM task_abandoned)"   # landed.abandon: left out of landing checks
 WORKSPACE_TRIES_KEY = "workspace_tries"   # kv: task id -> failed workspace attempts in a row (Daemon._workspace_failed)
 # A review that asked for changes is a review that worked. It is stored 'failed', so the change it
@@ -334,6 +345,7 @@ class DB:
         self.conn = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT_S, isolation_level=None)
         self._after_commit: list[Callable[[], Any]] = []
         self._on_rollback: list[Callable[[], Any]] = []
+        self.billing_memo: dict = {}   # billing._since: plan readings and runs, reused until a write
         self.conn.row_factory = sqlite3.Row
         self.conn.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT_S * 1000)}")
         retry_busy(lambda: self.conn.execute("PRAGMA journal_mode=WAL"))
@@ -1041,8 +1053,12 @@ END""")
         'review' (only the review can move it on, so waiting for 'done' would stall both; any other
         prerequisite of the review still has to finish), and a harness task in 'review' whose commit
         the daemon found merged into the harness (HARNESS_MERGED_KEY): its work is live already."""
-        states = {r["id"]: r for r in self.q("SELECT id, status, kind, branch FROM tasks "
-                                             "WHERE status IN ('done','review')")}
+        # Only the tasks depended on are read: an idle daemon asks this several times a tick, mostly
+        # for tasks that depend on nothing, and the done tasks of a long-lived project are thousands.
+        want = sorted({d for t in tasks for d in dependency_ids(t) if d is not None})
+        states = {r["id"]: r for r in self.q(
+            "SELECT id, status, kind, branch FROM tasks WHERE status IN ('done','review') "
+            "AND id IN (SELECT value FROM json_each(?))", (json.dumps(want),))} if want else {}
         merged = (self.kv(HARNESS_MERGED_KEY, {}) or {}) if any(
             r["status"] == "review" and r["kind"] == "harness" for r in states.values()) else {}
         out: dict[int, list] = {}
@@ -1119,7 +1135,7 @@ END""")
         was spent (billing.py): what the dollar caps, the global cap and 'actual' count."""
         if billed:
             return sum(billing.billed_by_account(self.conn, since_ts, provider=provider, exclude=exclude,
-                                                 estimated_only=estimated_only).values())
+                                                 estimated_only=estimated_only, memo=self.billing_memo).values())
         where, args = counted_spend(since_ts, provider=provider, exclude=exclude, estimated_only=estimated_only)
         r = self.one(f"SELECT COALESCE(SUM(usd),0) s FROM ledger WHERE {where}", args)
         return float(r["s"]) if r else 0.0
