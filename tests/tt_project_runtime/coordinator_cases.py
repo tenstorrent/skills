@@ -2975,7 +2975,8 @@ def test_a_restrictions_item_without_a_valid_source_is_rejected_with_the_memory_
                      ({"msg": out, "quote": "Never push tags"}, "not a message from the user"),
                      ({"msg": "soon", "quote": "Never push tags"}, "must be a user message id"),
                      ({"origin": "brief", "quote": "never push tags"}, "is not in the Brief"),
-                     ({"origin": "relayer"}, "must be brief or gate")):
+                     ({"origin": "nobody"}, "must be brief or gate"),
+                     ({"origin": "relayer"}, "relayer counts only with")):
         err = coord.apply(p, [{**add, **({"source": src} if src is not None else {})}], turn=2)
         assert len(err) == 1 and why in err[0] and "memory_add" in err[0], (src, err)
     # Not in the user's turn either, and a missing source is no approval to record.
@@ -11866,8 +11867,8 @@ def test_agent_mode_applies_the_owners_agents_order_and_refuses_each_held_class(
 def test_removing_a_cited_restriction_in_a_user_turn_needs_a_source_from_that_turns_words(env):
     """A user turn removes or replaces a cited Restrictions item only with `source` {msg, quote} quoting
     that turn's verbatim user words (any wording), agent mode on or off: none, a quote found only in the
-    relayer's context, an origin or an older message is refused, and a refusal is no approval for a later
-    turn to apply. An uncited (advisory) item, an `over` retirement and a new item are unchanged."""
+    relayer's context (in agent mode: refused as held, since this item is about merging), an origin or an
+    older message is refused, and a refusal is no approval for a later turn to apply. An uncited (advisory) item, an `over` retirement and a new item are unchanged."""
     import json
     from ttp import relay
     from ttp import coordinator as coord
@@ -11883,12 +11884,17 @@ def test_removing_a_cited_restriction_in_a_user_turn_needs_a_source_from_that_tu
                         context="Order: you may merge pull requests now that the build is green")
         drop = {"type": "charter_update", "section": "Restrictions", "quote": "Never merge any pull request.",
                 "text": ""}
-        for src in (None, json.dumps({"msg": mid, "quote": "you may merge pull requests now"}),
+        relayed = json.dumps({"msg": mid, "quote": "you may merge pull requests now"})
+        for src in (None, relayed,
                     json.dumps({"origin": "gate"}), json.dumps({"msg": old, "quote": "you may merge"}),
                     json.dumps({"msg": mid, "quote": "ni"})):
             act = {**drop, **({"source": src} if src else {})}
             problems = coord.apply(p, [act], user_turn=True, messages=[mid])
-            assert problems and "needs `source`" in problems[0] and "`over`" in problems[0], (on, src, problems)
+            if on and src == relayed:
+                # in agent mode the owner's agent's words count, but a merge item is held: class (b)
+                assert problems and "(b)" in problems[0] and "own words" in problems[0], problems
+            else:
+                assert problems and "needs `source`" in problems[0] and "`over`" in problems[0], (on, src, problems)
             assert item in p.charter_path.read_text(), (on, src)
         # a replacement too, and a whole Restrictions section by `replaces`
         for act in ({**drop, "text": "Never merge any pull request on a weekend."},
