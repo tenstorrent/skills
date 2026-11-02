@@ -100,21 +100,21 @@ def test_a_short_sentence_sharing_only_generic_words_matches_no_topic(env):
     # text; never real user messages.
     from ttp import coordinator as coord
     p = make(env)
-    p.db.post("in", "Use the other project and its accounts instead; wait for the worker there.",
-              chat=None, kind="user", provenance="web-session")
+    p.db.post("in", "Try other machines and other accounts.", chat=None, kind="user", provenance="web-session")
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
-    ask = "The provider sign-in expired: should I use the account and the machine credentials again?"
+    ask = "Provider sign-in expired: should the evaluation move to other machines or other accounts?"
     p.db.post("out", ask, chat=None, kind="ask")
     d = coord.digest(p, {}, [], [])
     assert "latest words" not in d, d
     # A sentence that truly shares the topic's words still matches.
-    p.db.post("in", "The provider sign-in expired again; use the account credentials from the shared note.",
-               chat=None, kind="user", provenance="web-session")
+    p.db.post("in", "The provider sign-in expired again; keep the evaluation on its accounts after sign-in.",
+              chat=None, kind="user", provenance="web-session")
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
-    lines = [x for x in coord.digest(p, {}, [], []).splitlines() if "User's latest words on this" in x]
+    d2 = coord.digest(p, {}, [], [])
+    lines = [x for x in d2.splitlines() if "User's latest words on this" in x]
     # The matching message's best sentence is quoted; the filler message matches no topic.
     assert lines and lines[0].startswith("- ask #3: ") and "expired again" in lines[0], lines
-    assert "accounts instead" not in d and "Use the other project" not in d, d
+    assert "Try other machines" not in d2, d2
 
 
 def test_the_ask_gate_refuses_leave_the_users_newer_request_gave_naming_it(env):
