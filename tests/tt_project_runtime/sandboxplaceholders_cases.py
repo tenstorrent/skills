@@ -57,6 +57,10 @@ def test_pre_upgrade_commit_stages_no_sandbox_placeholder(env, monkeypatch, caps
     (h / "tools").mkdir(exist_ok=True)
     (h / "tools" / "new_check.py").write_text("print('new')\n")
     _git_out(h, "add", "--", ".gitconfig")       # a worker's `git add -A` staged one
+    (h / ".claude" / ".cc-writes").mkdir()       # an ignored one: excluding it by name would fail the add
+    (h / ".claude" / ".cc-writes" / "w").write_bytes(b"")
+    with open(h / _git_out(h, "rev-parse", "--git-path", "info/exclude"), "a") as fh:
+        fh.write("/.claude/.cc-writes\n")
     mark.write_text("bbbb2222\n")
     cli.main(["upgrade", "demo"])
     out = capsys.readouterr().out

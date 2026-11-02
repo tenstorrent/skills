@@ -8703,12 +8703,18 @@ def _commit_local_changes(p: Project, ident: list[str]) -> list[str]:
     running = _running_harness_start(p)
     kept_out = _keep_out_runtime_data(h, running[0] if running else None)
     if not running:
-        _git(h, "add", "-A")
+        # Excluded by name, never added: in a sandboxed run they are device nodes `git add` fails on. An
+        # exclude naming an ignored path fails the add too, so only changed, unignored ones are named.
+        from .providers.claude import SANDBOX_PLACEHOLDERS
+        fenced = names("--literal-pathspecs", "ls-files", "-z", "--others", "--modified", "--deleted",
+                       "--exclude-standard", "--", *SANDBOX_PLACEHOLDERS)
+        _git(h, "add", "-A", "--", ".", *(f":(top,literal,exclude){n}" for n in sorted(fenced)))
         files = sorted(names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD"))
-        if fenced := [n for n in files if _sandbox_path(n)]:
-            _git(h, "--literal-pathspecs", "reset", "-q", "--", *fenced)
-            _note_fenced(h, fenced)
+        if staged := [n for n in files if _sandbox_path(n)]:      # a worker's `git add -A` staged them
+            _git(h, "--literal-pathspecs", "reset", "-q", "--", *staged)
             files = sorted(names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD"))
+        if fenced := sorted(fenced | set(staged)):
+            _note_fenced(h, fenced)
         if plans := _refresh_plan_digests(p, files):
             _git(h, "--literal-pathspecs", "add", "--", *plans)
             files = sorted(names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD"))
@@ -8823,9 +8829,10 @@ def _untrack_placeholders(p: Project, ident: list[str]) -> str:
     finally:
         idx.unlink(missing_ok=True)
     _git(h, "update-ref", "-m", "ttp upgrade: untrack sandbox placeholder files", "HEAD", sha, head)
-    # The live index still holds them as HEAD had them; a stage that differs is left for the next upgrade.
-    subprocess.run(["git", "-C", str(h), "--literal-pathspecs", "rm", "-r", "-q", "--cached", "--ignore-unmatch",
-                    "--", *drop], capture_output=True)
+    # The live index still holds them, which a worker's next commit would put back: dropped there too
+    # (-f: whatever the file on disk is, a device node in a sandboxed run, it stays).
+    subprocess.run(["git", "-C", str(h), "--literal-pathspecs", "rm", "-r", "-q", "-f", "--cached",
+                    "--ignore-unmatch", "--", *drop], capture_output=True)
     print(f"untracked {len(drop)} empty sandbox placeholder path(s) the harness had committed, as {sha[:12]}: "
           f"{', '.join(drop)}")
     return sha
