@@ -70,7 +70,8 @@ day for the host (a second change that day is measured the next day). The row is
 `cli_watch/` in the tt-project home, and a failing check or a missing row is one low observation.
 On 2026-10-21 `ttp doctor --loop` passed
 with Claude Code 2.1.296 (landed after review in 31 s, $0.09) and Codex CLI 0.160.0 (66 s,
-$0.21). Cursor agent: installed, not measured (no login on the test machine).
+$0.21). Cursor agent: installed, not measured (no login on the test machine). On 2026-11-02 it
+passed again for Claude Code with workers in the write fence (38 s, $0.12).
 
 - Any provider: a code task's raw `git push` to the push branch is refused by the harness's
   pre-push hook (`runtime/ttp/gitguard.py`) while `delivery.code_tasks_may_push` is off, and
