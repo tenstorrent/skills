@@ -2844,9 +2844,13 @@ class Daemon:
 
     def probe_mcp(self) -> None:
         """Refresh this host's connected MCP servers for the status feed (mcpgap.py): `claude mcp list` in
-        a thread, bounded and at most every few hours, only while Claude workers run isolated."""
+        a thread, bounded and at most every few hours, only while Claude workers run isolated. A server or
+        connector the last answer names that is in neither list gets one mcp_gap coordinator event."""
         from . import mcpgap
-        if not (self.cfg["providers"].get("claude") or {}).get("worker_isolation") or os.environ.get("TTP_TEST_NO_MCP_PROBE"):
+        if not (self.cfg["providers"].get("claude") or {}).get("worker_isolation"):
+            return
+        mcpgap.raise_undecided(self.p.db, self.p.state, self.cfg, time.time())   # from the last answer
+        if os.environ.get("TTP_TEST_NO_MCP_PROBE"):
             return   # the test switch: daemons under test never start the real `claude mcp list`
         if self._mcp_probe is not None and self._mcp_probe.is_alive():
             return

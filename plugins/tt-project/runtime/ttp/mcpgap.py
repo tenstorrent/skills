@@ -187,27 +187,30 @@ def plan(claude_cfg: dict, entry: dict | None, scope: list[str] = (), plugin_dir
 
 
 def gap(claude_cfg: dict, entry: dict | None) -> dict:
-    """{"state": "off" | "unknown" | "none" | "missing", "missing": [...], "connectors": [...], "line": str};
-    only "missing" has a line (one per kind: servers, then connectors)."""
+    """{"state": "off" | "unknown" | "none" | "missing", "missing": [...], "connectors": [...], "undecided": [...],
+    "line": str, "detail": str}. "undecided" names each connected server or connector in neither mcp_servers nor
+    mcp_withheld (the coordinator decides them, mcp_gap events); "line" names them in one short line, ""
+    once every one is decided; "detail" is the full text for `ttp status --verbose`."""
     if not claude_cfg.get("worker_isolation"):
-        return {"state": "off", "missing": [], "connectors": [], "line": ""}
+        return {"state": "off", "missing": [], "connectors": [], "undecided": [], "line": "", "detail": ""}
     if not entry or not entry.get("ok"):
-        return {"state": "unknown", "missing": [], "connectors": [], "line": "",
+        return {"state": "unknown", "missing": [], "connectors": [], "undecided": [], "line": "", "detail": "",
                 "error": (entry or {}).get("error") or "not probed yet"}
     listed, withheld = set(_names(claude_cfg.get("mcp_servers"))), set(_names(claude_cfg.get("mcp_withheld")))
-    servers, connectors = split(entry.get("connected") or [])
+    servers, found = split(entry.get("connected") or [])
     missing = [n for n in servers if n not in listed | withheld]
     # A listed connector reaches isolated workers while plan() trusts the list; withheld ones are not named.
     keys = {_key(n) for n in listed}
     why = plan(claude_cfg, entry)["why"]
-    connectors = [n for n in connectors if n not in withheld and (why or _key(n) not in keys)]
-    if not missing and not connectors:
-        return {"state": "none", "missing": [], "connectors": [], "line": ""}
+    connectors = [n for n in found if n not in withheld and (why or _key(n) not in keys)]
+    unlisted = [n for n in connectors if _key(n) not in keys]
+    undecided = missing + unlisted
+    given = [n for n in servers + found if n not in withheld and n not in undecided]
+    kept = [n for n in servers + found if n in withheld]
     lines = []
     if missing:
         lines.append(f"MCP servers connected on this host but not given to workers: {', '.join(missing)} "
                      "(add to providers.claude.mcp_servers, or to providers.claude.mcp_withheld to keep them out)")
-    unlisted = [n for n in connectors if _key(n) not in keys]
     if unlisted:
         lines.append(f"Connected claude.ai connectors ({', '.join(unlisted)}) are not given to isolated workers. "
                      "List one in providers.claude.mcp_servers to give it to them (every other server stays out), "
@@ -216,9 +219,44 @@ def gap(claude_cfg: dict, entry: dict | None) -> dict:
     if stuck:
         lines.append(f"claude.ai connectors listed in providers.claude.mcp_servers ({', '.join(stuck)}) do not "
                      f"reach isolated workers: {why}; they run with --strict-mcp-config until that clears")
-    return {"state": "missing", "missing": missing, "connectors": connectors, "line": "\n".join(lines)}
+    lines.append(f"MCP servers connected on this host: for workers {', '.join(given) or 'none'}; "
+                 f"withheld {', '.join(kept) or 'none'}")
+    short = (f"MCP servers not yet decided for workers: {', '.join(undecided)} (the coordinator decides)"
+             if undecided else "")
+    return {"state": "missing" if missing or connectors else "none", "missing": missing, "connectors": connectors,
+            "undecided": undecided, "line": short, "detail": "\n".join(lines)}
 
 
-def line(state: Path, cfg: dict) -> str:
-    """The feed line from the cached probe; "" when nothing is missing, isolation is off or unknown."""
-    return gap((cfg.get("providers") or {}).get("claude") or {}, read(state))["line"]
+def line(state: Path, cfg: dict, verbose: bool = False) -> str:
+    """The feed line from the cached probe: the undecided names, "" once each is decided, isolation is off or
+    the probe unknown; verbose: the full text, decided names too."""
+    return gap((cfg.get("providers") or {}).get("claude") or {}, read(state))["detail" if verbose else "line"]
+
+
+DECIDED_KV = "mcp_gap_raised"   # every name an mcp_gap event already named
+
+
+def raise_undecided(db, state: Path, cfg: dict, now: float) -> list[str]:
+    """Queue one mcp_gap coordinator event naming the undecided servers and connectors no event named yet.
+    A name connected and decided leaves the record, so one undecided again later is raised again."""
+    entry = read(state)
+    names = gap((cfg.get("providers") or {}).get("claude") or {}, entry)["undecided"]
+    raised = db.kv(DECIDED_KV)
+    raised = [str(n) for n in raised] if isinstance(raised, list) else []   # a broken row: raise again, once
+    connected = set((entry or {}).get("connected") or []) if (entry or {}).get("ok") else set()
+    keep = [n for n in raised if n in names or n not in connected]
+    new = [n for n in names if n not in raised]
+    if not new:
+        if keep != raised:
+            db.set_kv(DECIDED_KV, keep)
+        return []
+    with db.tx():   # the event and the record of its names commit together
+        db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+             (now, "harness", "mcp_gap", f"mcp_gap:{'|'.join(sorted(new))}", "normal",
+              f"MCP servers or claude.ai connectors connected on this host that isolated workers have no decision "
+              f"for: {', '.join(new)}. Decide each one yourself, not an ask: config_set providers.claude.mcp_servers "
+              "(gives it to workers) or providers.claude.mcp_withheld (keeps it out), each the whole list with the names "
+              "already there. Withhold when unsure; listing a connector in mcp_servers keeps every other server out.",
+              "queued"))
+        db.set_kv(DECIDED_KV, [*keep, *new])
+    return new

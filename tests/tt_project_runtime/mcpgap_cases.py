@@ -51,9 +51,12 @@ def test_mcp_gap_none_missing_shows_no_line(env, tmp_path):
     e = mcpgap.refresh(p.state, _listing(tmp_path), str(p.root))
     assert e["ok"] and e["connected"]
     g = mcpgap.gap(p.config()["providers"]["claude"], mcpgap.read(p.state))
-    assert g == {"state": "none", "missing": [], "connectors": [], "line": ""}
-    assert "MCP servers connected" not in status_text(p)
+    assert g == {"state": "none", "missing": [], "connectors": [], "undecided": [], "line": "",
+                 "detail": "MCP servers connected on this host: for workers search, tickets; "
+                           "withheld claude.ai Gmail, claude.ai Example Notes"}
+    assert "MCP servers" not in status_text(p)
     assert health(p, p.db, alive=False)["mcp_gap"] == ""
+    assert g["detail"] in status_text(p, verbose=True)   # every name decided: only --verbose says how
 
 
 def test_mcp_gap_some_missing_is_one_status_and_feed_line_never_the_top(env, tmp_path):
@@ -64,9 +67,13 @@ def test_mcp_gap_some_missing_is_one_status_and_feed_line_never_the_top(env, tmp
     mcpgap.refresh(p.state, _listing(tmp_path), str(p.root))
     want = ("MCP servers connected on this host but not given to workers: tickets (add to "
             "providers.claude.mcp_servers, or to providers.claude.mcp_withheld to keep them out)")
-    # Connectors, plugin servers and servers that are not connected are never named.
-    assert [ln for ln in status_text(p).splitlines() if "MCP servers connected" in ln] == [want]
-    assert health(p, p.db, alive=False)["mcp_gap"] == want
+    short = "MCP servers not yet decided for workers: tickets (the coordinator decides)"
+    # Connectors, plugin servers and servers that are not connected are never named; by default one short
+    # line with no config instructions, the full text only with --verbose.
+    assert [ln for ln in status_text(p).splitlines() if "MCP servers" in ln] == [short]
+    assert health(p, p.db, alive=False)["mcp_gap"] == short
+    assert [ln for ln in status_text(p, verbose=True).splitlines() if "MCP servers" in ln] == [
+        want, "MCP servers connected on this host: for workers search; withheld claude.ai Gmail, claude.ai Example Notes"]
     assert attention(p.db, time.time()) == []   # information, not something the user must act on
     # With isolation off workers load every server: nothing is missing, whatever the cache holds.
     p.set_config("providers.claude.worker_isolation", False)
@@ -78,14 +85,17 @@ def test_mcp_gap_withheld_servers_are_not_named(env, tmp_path):
     from ttp.cli import status_text
     p = _isolated(env)
     mcpgap.refresh(p.state, _listing(tmp_path), str(p.root))
-    assert "search, tickets (add to" in mcpgap.line(p.state, p.config())
+    assert "search, tickets (add to" in mcpgap.line(p.state, p.config(), verbose=True)
     p.set_config("providers.claude.mcp_withheld", "tickets")
-    assert ": search (add to" in mcpgap.line(p.state, p.config())
+    assert ": search (add to" in mcpgap.line(p.state, p.config(), verbose=True)
     p.set_config("providers.claude.mcp_withheld", ["search", "tickets", "claude.ai Gmail"])
-    assert mcpgap.line(p.state, p.config()).startswith("Connected claude.ai connectors (claude.ai Example Notes)")
+    assert mcpgap.line(p.state, p.config(), verbose=True).startswith(
+        "Connected claude.ai connectors (claude.ai Example Notes)")
+    assert mcpgap.line(p.state, p.config()) == ("MCP servers not yet decided for workers: claude.ai Example Notes "
+                                                "(the coordinator decides)")
     p.set_config("providers.claude.mcp_withheld", ["search", "tickets", "claude.ai Gmail", "claude.ai Example Notes"])
     assert mcpgap.line(p.state, p.config()) == ""
-    assert "MCP servers connected" not in status_text(p)
+    assert "MCP servers" not in status_text(p)
 
 
 def test_mcp_gap_probe_timeout_or_failure_is_unknown_never_a_warning(env, tmp_path, capsys, monkeypatch):
@@ -163,14 +173,18 @@ def test_mcp_gap_connected_connectors_get_their_own_line_only_with_isolation(env
             "workers. List one in providers.claude.mcp_servers to give it to them (every other server stays out), "
             "or add them to providers.claude.mcp_withheld to keep them out")
     g = mcpgap.gap(p.config()["providers"]["claude"], mcpgap.read(p.state))
-    assert g["state"] == "missing" and g["missing"] == [] and g["line"] == want
-    assert g["connectors"] == ["claude.ai Gmail", "claude.ai Example Notes"]
-    assert "Example Calendar" not in g["line"] and "Example Drive" not in g["line"] and "plugin:" not in g["line"]
-    assert [ln for ln in status_text(p).splitlines() if "claude.ai connectors" in ln] == [want]
-    assert health(p, p.db, alive=False)["mcp_gap"] == want
+    assert g["state"] == "missing" and g["missing"] == [] and g["detail"].split("\n")[0] == want
+    assert g["connectors"] == g["undecided"] == ["claude.ai Gmail", "claude.ai Example Notes"]
+    for shown in (g["line"], g["detail"]):
+        assert "Example Calendar" not in shown and "Example Drive" not in shown and "plugin:" not in shown
+    # The connector names stay in the short default line.
+    short = "MCP servers not yet decided for workers: claude.ai Gmail, claude.ai Example Notes (the coordinator decides)"
+    assert g["line"] == short and health(p, p.db, alive=False)["mcp_gap"] == short
+    assert [ln for ln in status_text(p).splitlines() if "MCP servers" in ln or "connectors" in ln] == [short]
+    assert [ln for ln in status_text(p, verbose=True).splitlines() if "claude.ai connectors" in ln] == [want]
     # A server gap and a connector gap: two lines, servers first.
     p.set_config("providers.claude.mcp_servers", ["search"])
-    assert mcpgap.line(p.state, p.config()).split("\n") == [
+    assert mcpgap.line(p.state, p.config(), verbose=True).split("\n")[:2] == [
         "MCP servers connected on this host but not given to workers: tickets (add to "
         "providers.claude.mcp_servers, or to providers.claude.mcp_withheld to keep them out)", want]
     # Isolation off: connectors load in workers, no line.
@@ -206,16 +220,19 @@ def test_mcp_gap_connector_listed_in_mcp_servers_stays_named_only_withheld_drops
     g = mcpgap.gap({"worker_isolation": True, "mcp_servers": ["claude.ai Gmail", "search"]}, probe)
     assert g["state"] == "missing" and g["missing"] == []
     assert g["connectors"] == ["claude.ai Gmail", "claude.ai Example Notes"]
-    assert g["line"].split("\n")[0].startswith("Connected claude.ai connectors (claude.ai Example Notes) are not given")
-    assert g["line"].split("\n")[1] == (
+    assert g["undecided"] == ["claude.ai Example Notes"] and "Gmail" not in g["line"]   # listed is decided
+    assert g["detail"].split("\n")[0].startswith("Connected claude.ai connectors (claude.ai Example Notes) are not given")
+    assert g["detail"].split("\n")[1] == (
         "claude.ai connectors listed in providers.claude.mcp_servers (claude.ai Gmail) do not reach isolated "
         "workers: no list of this host's MCP servers yet; they run with --strict-mcp-config until that clears")
     trusted = {**probe, "at": time.time(), "names": probe["connected"]}
     g = mcpgap.gap({"worker_isolation": True, "mcp_servers": ["claude.ai Gmail", "search"]}, trusted)
-    assert g["connectors"] == ["claude.ai Example Notes"] and "Gmail" not in g["line"]
+    assert g["connectors"] == ["claude.ai Example Notes"] and "Gmail" not in g["detail"].split("\n")[0]
+    assert len(g["detail"].split("\n")) == 2   # the trusted list: no line says Gmail is stuck
     g = mcpgap.gap({"worker_isolation": True, "mcp_servers": ["claude.ai Gmail"]},
                    {"ok": True, "connected": ["claude.ai Gmail"]})
-    assert g["state"] == "missing" and g["connectors"] == ["claude.ai Gmail"] and "claude.ai Gmail" in g["line"]
+    assert g["state"] == "missing" and g["connectors"] == ["claude.ai Gmail"] and g["undecided"] == []
+    assert g["line"] == "" and "claude.ai Gmail" in g["detail"]   # decided, stuck: its own alert and --verbose
     # Only mcp_withheld drops a connector, listed in mcp_servers or not.
     for cfg in ({"mcp_servers": ["claude.ai Gmail"], "mcp_withheld": ["claude.ai Gmail"]},
                 {"mcp_withheld": ["claude.ai Gmail"]}):
@@ -416,3 +433,56 @@ def test_only_claude_keeps_connectors_codex_and_cursor_are_unchanged(env, monkey
     assert claude.keep_connectors(["claude", "--settings", "/tmp/s.json"], ["a"]) is None
     assert claude.keep_connectors(["claude"], []) == ["claude", "--settings", "{}", "--setting-sources",
                                                       "project,local"]
+
+
+def test_mcp_gap_undecided_names_queue_one_coordinator_event_and_a_new_server_another(env, tmp_path):
+    import ttp.daemon as dm
+    from ttp import coordinator, mcpgap
+    from ttp.cli import status_text
+    p = _isolated(env)
+    d = dm.Daemon(p.base)
+
+    def events():
+        return [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='mcp_gap' ORDER BY id")]
+    d.probe_mcp()
+    assert events() == []   # no probe answer yet: nothing to decide
+    mcpgap.refresh(p.state, _listing(tmp_path), str(p.root))
+    for _ in range(3):   # every tick: still exactly one event while the names stay undecided
+        d.probe_mcp()
+    texts = events()
+    assert len(texts) == 1
+    for n in ("search", "tickets", "claude.ai Gmail", "claude.ai Example Notes"):
+        assert n in texts[0]
+    assert "plugin:" not in texts[0] and "Example Calendar" not in texts[0] and "docs" not in texts[0]
+    assert "MCP servers not yet decided for workers: search, tickets, claude.ai Gmail" in status_text(p)
+    # The coordinator decides each name itself through config_set (no user approval needed).
+    assert coordinator.apply(p, [
+        {"type": "config_set", "key": "providers.claude.mcp_servers", "value": ["search"]},
+        {"type": "config_set", "key": "providers.claude.mcp_withheld",
+         "value": ["tickets", "claude.ai Gmail", "claude.ai Example Notes"]}]) == []
+    d.cfg = p.config()
+    d.probe_mcp()
+    assert len(events()) == 1
+    assert "MCP servers" not in status_text(p)   # every name decided: nothing by default
+    assert ("MCP servers connected on this host: for workers search; withheld tickets, claude.ai Gmail, "
+            "claude.ai Example Notes") in status_text(p, verbose=True)
+    # A newly connected server raises a new event naming only it.
+    (tmp_path / "mcp_list.txt").write_text(MCP_LIST + "issues: npx issues-mcp - ✔ Connected\n")
+    mcpgap.refresh(p.state, _fake_claude(tmp_path, f'cat "{tmp_path / "mcp_list.txt"}"'), str(p.root))
+    d.probe_mcp()
+    d.probe_mcp()
+    texts = events()
+    assert len(texts) == 2 and "issues" in texts[1] and "tickets" not in texts[1]
+    assert "MCP servers not yet decided for workers: issues (the coordinator decides)" in status_text(p)
+    # A broken record of raised names never stops the tick: the names are raised again, once.
+    p.db.set_kv(mcpgap.DECIDED_KV, "not a list")
+    d.probe_mcp()
+    d.probe_mcp()
+    assert len(events()) == 3 and p.db.kv(mcpgap.DECIDED_KV) == ["issues"]
+    # A decided name that is undecided again (dropped from both lists) is raised again, once.
+    p.set_config("providers.claude.mcp_withheld", ["claude.ai Gmail", "claude.ai Example Notes", "issues"])
+    d.cfg = p.config()
+    d.probe_mcp()
+    assert len(events()) == 4 and "tickets" in events()[3] and "issues" not in events()[3]
+    d.probe_mcp()
+    assert len(events()) == 4

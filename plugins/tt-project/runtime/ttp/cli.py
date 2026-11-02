@@ -1483,8 +1483,9 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(h["idle_sleep"])
     if h.get("release"):
         lines.append(h["release"])
-    if h.get("mcp_gap"):
-        lines.append(h["mcp_gap"])
+    from . import mcpgap   # the undecided names; verbose: the whole state, decided names too
+    if mcp := (mcpgap.line(p.state, p.config(), True) if verbose else h.get("mcp_gap")):
+        lines.append(mcp)
     if h.get("local_only"):
         lines.append(h["local_only"])
     if h.get("uncommitted"):

@@ -1699,14 +1699,15 @@ queues behind routine work; nothing running is interrupted:
   stays strict without the connector, and `ttp doctor`, the feed and a low alert say why.
 - While `worker_isolation` is on, the daemon runs `claude mcp list` from the project root in the
   background (at most every 6 hours, bounded to 90 s) and keeps the answer in the project's state.
-  A server it reports connected that `mcp_servers` does not list gets one line in `ttp status` and
-  the web app's feed: `MCP servers connected on this host but not given to workers: ...`. List a
-  server you keep from workers on purpose in `providers.claude.mcp_withheld: ["name", ...]` and the
-  line drops it. Plugin servers are left out (`mcp_servers` cannot list them). Connected claude.ai
-  connectors get a line of their own, `Connected claude.ai connectors (...) are not given to isolated
-  workers`: list one in `mcp_servers` to give it to them, or list them in `mcp_withheld` to drop the
-  line. A listed connector that cannot be kept (see above) is named with the reason. A probe that
-  fails or times out shows as unknown in `ttp doctor`, never as either line; the last good list
+  A connected server or claude.ai connector in neither `mcp_servers` nor
+  `providers.claude.mcp_withheld` is undecided: the daemon queues one coordinator event naming the
+  new ones, and the coordinator lists each in `mcp_servers` (workers get it) or `mcp_withheld`
+  (kept out; its pick when unsure). Until then `ttp status` and the web app's feed show one short
+  line, `MCP servers not yet decided for workers: ...`; once each is decided nothing shows, and
+  `ttp status --verbose` shows the full state: which servers workers get, which are withheld, and
+  any listed connector that cannot be kept (see above) with the reason. A newly connected server
+  raises a new event. Plugin servers are left out (`mcp_servers` cannot list them). A probe that
+  fails or times out shows as unknown in `ttp doctor`, never as a status line; the last good list
   still counts while it is no older than 12 hours.
 - With `worker_isolation` off, Claude workers and reviewers still load your own, the project's and
   plugins' MCP servers, but not your claude.ai connectors (about 2k tokens on every call), unless
