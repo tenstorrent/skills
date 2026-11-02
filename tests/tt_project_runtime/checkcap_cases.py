@@ -4548,3 +4548,79 @@ def test_the_host_checks_cap_prices_a_check_at_one_runs_measured_cores(monkeypat
     monkeypatch.setattr(testslots, "sizes", lambda *a, **k: None)
     assert checkcap.check_load() == checkcap.CHECK_LOAD == 4.0
     assert checkcap.default_limit() == 8, "the pool off: 48 // 4, at most the ceiling of 8"
+
+
+def test_the_host_checks_cap_prices_a_check_at_its_measured_cpu_with_process_churn(env, monkeypatch):
+    """A run's measured cost (its children's user and system CPU per wall second: checkcap.record_cost)
+    raises the price of a check over one run's granted cores, so a churning suite admits fewer checks."""
+    from ttp import checkcap, testslots
+    monkeypatch.delenv("TTP_CHECKS_HOST_MAX", raising=False)
+    monkeypatch.setattr(checkcap, "cores", lambda: 64)
+    monkeypatch.setattr(checkcap, "_load", lambda: 0.0)
+    monkeypatch.setattr(testslots, "sizes", lambda *a, **k: (32, 8))
+    assert checkcap.measured_cores() is None and checkcap.check_load() == 8.0
+    assert checkcap.default_limit() == 8, "unmeasured: 64 // 8"
+    checkcap.record_cost(30.0, 30.0)   # too short a run: no sample
+    checkcap.record_cost(0.0, 300.0)   # no CPU read: no sample
+    assert checkcap.measured_cores() is None
+    checkcap.record_cost(4500.0, 300.0)   # 15 cores, about 40% of it system CPU from process churn
+    checkcap.record_cost(600.0, 300.0)    # a light run after it does not lower the price
+    assert checkcap.measured_cores() == 15.0 and checkcap.check_load() == 15.0
+    assert checkcap.default_limit() == 4, "64 // 15 is 4, the floor"
+    checkcap.record_cost(300.0 * 500, 300.0)
+    assert checkcap.measured_cores() == 64.0, "never above the host's cores"
+    assert checkcap.measured_cores(now=time.time() + checkcap.COST_KEEP_S + 1) is None, "old samples expire"
+    (checkcap.slot_dir() / checkcap.COST_LOG).write_text("{torn\n" + json.dumps({"ts": time.time(), "cores": 9}) + "\n")
+    assert checkcap.measured_cores() == 9.0, "a torn row is skipped"
+    monkeypatch.setattr(testslots, "sizes", lambda *a, **k: None)
+    assert checkcap.check_load() == 9.0, "measured beats CHECK_LOAD with the test pool off"
+    (checkcap.slot_dir() / checkcap.COST_LOG).unlink()
+    assert checkcap.check_load() == checkcap.CHECK_LOAD
+
+
+def test_ttp_checks_records_its_cost_with_its_childrens_system_cpu(env, tmp_path, monkeypatch, capsys):
+    """`ttp checks` keeps its commands' user and system CPU (forks and execs included) as the host's
+    measured cost of a check."""
+    from ttp import checkcap, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setattr(checkcap, "COST_MIN_WALL_S", 0.0)
+    churn = "sh -c 'i=0; while [ $i -lt 300 ]; do /bin/true; i=$((i+1)); done'"
+    cli.main(["checks", "--", churn])
+    rows = [json.loads(x) for x in (checkcap.slot_dir() / checkcap.COST_LOG).read_text().splitlines()]
+    assert len(rows) == 1 and rows[0]["cores"] > 0 and rows[0]["s"] >= 0, rows
+    assert checkcap.measured_cores() == rows[0]["cores"]
+
+
+def test_a_review_precheck_waiting_for_test_slots_keeps_its_lane_while_its_review_is_open(env, monkeypatch):
+    """A review precheck that holds its lane while it waits for host test slots (no command running yet)
+    is never a finished task's holder nor a likely hang while a review of its head is open (sa24); once
+    none is, it is a finished task's lane again."""
+    from ttp import checklane, daemon, locks, testslots, worktree
+    p = make(env)
+    _lane_env(monkeypatch)
+    tid = p.db.add_task("t", "s", kind="code")
+    head = worktree._git(p.root, "rev-parse", "HEAD")
+    out = p.state / daemon.PRECHECKS_DIR / f"t{tid}-{head[:12]}"   # Daemon._precheck's run folder
+    out.mkdir(parents=True)
+    rev = p.db.add_task("review", "r", kind="review", labels=[checklane.PRECHECK_LABEL + out.name])
+    for k, v in {"TTP_RUN_DIR": str(out), "TTP_PROJECT": str(p.base), "TTP_RUN_ID": daemon.precheck_run_id(out),
+                 **daemon.task_env(tid)}.items():   # as Daemon._start_checks sets them
+        monkeypatch.setenv(k, v)
+    monkeypatch.chdir(p.root)
+    g = testslots.suite_hold(p.name, wait_s=5, pending=True, who=f"run {out.name}")   # as cli._checks_slot's hold
+    try:
+        assert g and g.files
+        testslots.lane_waits(g, "host test slots")
+        rec = locks.holder_records([Path(f.name) for f in g.files])[0]
+        assert rec.get("waits") == "host test slots" and str(rec.get("task")) == str(tid), rec
+        later = time.time() + 400   # past the 5 min flag
+        p.db.x("UPDATE tasks SET status='done', updated=? WHERE id=?", (time.time(), tid))
+        assert checklane.finished_holders(p, {}, later) == [], "the precheck its open review reads keeps its lane"
+        cfg = {"checks": {"wait_hang_factor": 3}}
+        assert checklane.wait_wake(_queue_events(1, holders=[rec]), {"start": 1.0}, cfg, later + 1200, 300.0,
+                                   ended=lambda h: bool(checklane.finished_holders(p, {}, later)))[0] == []
+        p.db.x("UPDATE tasks SET status='done' WHERE id=?", (rev,))
+        h = checklane.finished_holders(p, {}, later)
+        assert len(h) == 1 and h[0]["task"] == str(tid), h
+    finally:
+        g.close()

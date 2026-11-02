@@ -79,6 +79,11 @@ CORES_PER_SLOT = 16       # the default cap's floor: one slot per this many core
 CORES_PER_SLOT_MAX = 8    # its ceiling: one slot per this many cores
 CHECK_LOAD = 4.0          # the 1-minute load one running check adds with the test pool off (check_load())
 HELD_ENV = "TTP_CHECKS_SLOT"
+COST_LOG = "check-costs.jsonl"   # in slot_dir(): recent runs' measured cores (record_cost, measured_cores)
+COST_RECENT = 20
+COST_KEEP_S = 7 * 86400.0
+COST_MIN_WALL_S = 60.0    # a shorter run is no sample (its ratio is noise)
+COST_MAX_BYTES = 16 * 1024
 POLL_S = 5.0
 TELL_S = 300.0
 # A `ttp checks` in a tool call waits this long for a slot at most, then hands over to detached checks
@@ -125,9 +130,57 @@ def default_range() -> tuple[int, int]:
 def check_load() -> float:
     """The 1-minute load one running check adds: one run's cores as the repository lanes count it
     (checklane.run_cores: its test grant, at least the measured cores of a full suite run), else, with
-    the test pool off, CHECK_LOAD."""
+    the test pool off, CHECK_LOAD; never below what recent runs on this host measured (measured_cores:
+    their user and system CPU, process churn included)."""
     from . import checklane, testslots
-    return float(checklane.run_cores()) if testslots.sizes() else CHECK_LOAD
+    base = float(checklane.run_cores()) if testslots.sizes() else CHECK_LOAD
+    return max(base, measured_cores() or 0.0)
+
+
+def child_cpu_s() -> float:
+    """The user and system CPU seconds of this process's children it (or they) waited for so far."""
+    try:
+        import resource
+        r = resource.getrusage(resource.RUSAGE_CHILDREN)
+    except (ImportError, OSError):
+        return 0.0
+    return r.ru_utime + r.ru_stime
+
+
+def record_cost(cpu_s: float, wall_s: float) -> None:
+    """Keep one finished checks run's cost on this host for measured_cores: the user and system CPU
+    seconds of its commands and everything they waited for (cli: RUSAGE_CHILDREN) over its `wall_s`.
+    Runs under COST_MIN_WALL_S are no sample; a failed write only loses one."""
+    if wall_s < COST_MIN_WALL_S or cpu_s <= 0:
+        return
+    path = slot_dir() / COST_LOG
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > COST_MAX_BYTES:
+            project.durable_write(path, "".join(f"{x}\n" for x in path.read_text().splitlines()[-COST_RECENT:]))
+        project.durable_append(path, json.dumps({"ts": time.time(), "cores": round(cpu_s / wall_s, 2),
+                                                 "s": round(wall_s, 1)}) + "\n")
+    except OSError:
+        pass
+
+
+def measured_cores(now: float | None = None) -> float | None:
+    """The costliest of the last COST_RECENT checks runs on this host (record_cost) within
+    COST_KEEP_S, in cores (CPU seconds per wall second), at most this host's cores; None before any."""
+    now = time.time() if now is None else now
+    try:
+        lines = (slot_dir() / COST_LOG).read_text().splitlines()
+    except OSError:
+        return None
+    got = []
+    for line in lines:
+        try:
+            r = json.loads(line)
+            if now - float(r["ts"]) <= COST_KEEP_S and float(r["cores"]) > 0:
+                got.append(float(r["cores"]))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return min(float(cores()), max(got[-COST_RECENT:])) if got else None
 
 
 def default_limit() -> int:

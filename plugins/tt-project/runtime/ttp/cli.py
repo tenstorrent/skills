@@ -2707,6 +2707,7 @@ def cmd_checks(a) -> None:
     fast_skipped, fast_cmds = [], []
     executed, selected, rerun = [], [], None
     timed_out, deadline, ran_since = None, None, 0.0   # the wall-time cap (checkwall) and its outcome
+    ran_cpu = 0.0   # the CPU its children had used when its commands started (checkcap.record_cost)
     spilled = None   # the spill host's claim when the checks run there (checkspill)
     run_env: dict = {}   # what the checks run in, for the pass's envs (pushpass.check_envs)
     join_rec, joined = None, None   # this run's checkjoin record; the run it followed and how
@@ -2913,7 +2914,7 @@ def cmd_checks(a) -> None:
                 # The run's wall-time cap from its first command on (checkwall); the status line shows it.
                 from . import checkwall, testslots
                 wall, wall_how = checkwall.cap(p)
-                ran_since = time.time()
+                ran_since, ran_cpu = time.time(), checkcap.child_cpu_s()
                 deadline = ran_since + wall if wall > 0 else None
                 testslots.suite_running(getattr(slot, "suite", None), wall)
                 if p and (last := checkwall.last_timeout(p.state, os.environ.get("TTP_TASK"))):
@@ -3031,6 +3032,8 @@ def cmd_checks(a) -> None:
             elif timed_out:
                 checkwall.record_timeout(p.state, os.environ.get("TTP_TASK"), timed_out)
             elif executed:
+                if not spilled:   # its cost on this host, process churn included, prices a check (checkcap.check_load)
+                    checkcap.record_cost(checkcap.child_cpu_s() - ran_cpu, time.time() - ran_since)
                 checkwall.record_run(p.state, time.time() - ran_since, passed,
                                      _commands_hash(todo) if passed and executed == todo else "",
                                      "" if spilled else "tmpfs" if shorttmp.on_tmpfs(run_env.get("TMPDIR")) else "disk")
