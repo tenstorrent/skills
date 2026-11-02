@@ -613,6 +613,42 @@ def _patch_ids(repo: Path, revs: list[str]) -> dict[str, str]:
     return {c: pid for pid, c in (ln.split() for ln in out.splitlines() if len(ln.split()) == 2)}
 
 
+def _idents(repo: Path, *revs: str) -> dict[str, tuple[str, str, frozenset, int]]:
+    """{commit: (author and author date, subject, files, committer date)} for the non-merge commits
+    `revs` names, in their order."""
+    out = _git(repo, "log", "--no-merges", "--name-only", "--date=raw",
+               "--format=%x00%H%x00%an <%ae> %ad%x00%ct %s", *revs, "--").stdout
+    res, parts = {}, out.split("\0")[1:]
+    for k in range(0, len(parts) - 2, 3):
+        head, _, files = parts[k + 2].partition("\n")
+        when, _, subject = head.partition(" ")
+        if when.isdigit():
+            res[parts[k]] = (parts[k + 1], subject, frozenset(f for f in files.split("\n") if f), int(when))
+    return res
+
+
+def _rewritten(repo: Path, onto: str, base: str, rest: list[str]) -> dict[str, str]:
+    """{commit: its landed version} for the commits of `rest` that landed rewritten: a commit of
+    base..onto with the same author and author date (a rebase or amend keeps both), the same subject or
+    the same files, and a committer date no older than the commit's own. Such a commit landed reworded,
+    or with a conflict resolved in its own review, so neither a trailer nor its patch names it; the
+    landed version is the newer one. A commit rewritten after its landing (an amend that adds work) is
+    newer than the landed version, so it is replayed, never dropped."""
+    mine = _idents(repo, "--no-walk=unsorted", *rest)
+    theirs: dict[str, list[tuple[str, str, frozenset, int]]] = {}
+    for c, (who, subject, files, when) in _idents(repo, "--reverse", f"{base}..{onto}").items():
+        theirs.setdefault(who, []).append((c, subject, files, when))   # oldest first wins
+    found = {}
+    for c in rest:
+        if not (m := mine.get(c)):
+            continue
+        for landed, subject, files, when in theirs.get(m[0], []):
+            if (subject == m[1] or (files and files == m[2])) and when >= m[3]:
+                found[c] = landed
+                break
+    return found
+
+
 def _commit_replayed(wt: Path) -> None:
     """Commit the settled step of a stopped rebase in `wt` as the commit it replays, plus a trailer
     naming that commit. Settling changed its patch, so a later batch that gets the commit again (one
@@ -1024,8 +1060,9 @@ class Batch:
         """The commits of base..top (merges aside), and those of them already on `onto`, each with
         the commit there that carries it: one naming it in a REPLAYED trailer (a batch that settled
         its replay, or a squash that carries several), else one with the same patch (`git patch-id
-        --stable`, as git cherry). Replaying such a commit again could only conflict with its own
-        landing. Oldest first; the first carrier found wins."""
+        --stable`, as git cherry), else a newer rewrite of it (_rewritten: it landed reworded or
+        conflict-resolved). Replaying such a commit again could only conflict with its own landing.
+        Oldest first; the first carrier found wins."""
         own = _git(self.repo, "rev-list", "--reverse", "--no-merges", f"{base}..{top}").stdout.split()
         if not own or base == onto:
             return own, {}
@@ -1041,6 +1078,8 @@ class Batch:
             for c in rest:
                 if mine.get(c) in theirs:
                     gone[c] = theirs[mine[c]]
+        if rest := [c for c in own if c not in gone]:
+            gone.update(_rewritten(self.repo, onto, base, rest))
         return own, {c: gone[c] for c in own if c in gone}
 
     def _rebase(self, onto: str, top: str, drop: set | frozenset = frozenset()) -> tuple[str, list[str] | None]:
