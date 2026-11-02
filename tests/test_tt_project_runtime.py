@@ -5192,7 +5192,8 @@ def test_a_wake_runs_at_light_or_its_wake_tier_never_above_the_task_and_other_ru
     assert "retry_after_s: 0" not in started[says_nothing][2], "a wake at the task's tier has nothing to escalate"
     for tid, tier in ((never_waited, "standard"), (failed_before, "deep")):
         assert started[tid][:2] == (tier, None)
-        assert " wake" not in started[tid][2].split("## Spec")[0]
+        # the run header; the task's own rules above it may quote the hand-off fields (a light wake ...)
+        assert " wake" not in started[tid][2].split("## Spec")[0].split("# YOUR TASK")[1]
 
 
 def test_a_wait_key_survives_a_clipped_hand_off(env):

@@ -914,7 +914,8 @@ def test_runs_without_a_result_line_count_their_estimated_cost(env, tmp_path, mo
     assert first["cache_read_tokens"] == 4 * 800_000, "one message's usage was counted more than once"
     # four API messages; the first one's prompt is the prefix every later call re-reads (`ttp stats`)
     assert json.loads(first["note"])["cache_telemetry"] == {"complete": True, "requests": None, "source": "messages",
-                                                            "calls": 4, "first_context": 802_010}
+                                                            "calls": 4, "first_context": 802_010,
+                                                            "first_cache_read": 800_000}
     assert p.db.one("SELECT estimated FROM ledger")["estimated"] == 1
     assert p.db.task(tid)["spent_usd"] == pytest.approx(first["cost_usd"])
     started = {}
