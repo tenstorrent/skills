@@ -61,8 +61,8 @@ never denied (wide_read). `ttp stats --tools` shows how much of the runs' tool o
 A run that holds no device (TTP_NO_DEVICE=1) on a machine tagged `device` is refused pytest and ctest
 runs outside `ttp sandbox`, which hides the device nodes; a device `ttp lock` or `ttp devq` passes,
 and where no sandbox works it gets one notice instead (device_test_run). Where the CLI applies a hook's
-`updatedInput` (HOOK_REWRITE) and the test run is the command's last simple command, the call is
-rewritten into the sandbox instead, with one line of added context, and logged to refusals.jsonl.
+`updatedInput` (HOOK_REWRITE) and each test run stands as a top-level simple command (after `cd x;` or
+`&&`, under assignments and wrappers, or first in a pipeline), the call is rewritten into the sandbox instead, with one line of added context, and logged to refusals.jsonl.
 
 Otherwise it fails open: any error prints nothing, and the run goes on unchanged.
 """
@@ -1324,11 +1324,46 @@ def _unsandboxed_test(commands: str, kept: bool, depth: int = 0) -> tuple[list[s
     return None
 
 
-def _sandboxed_tail(cmd: str, raw: list[str], k: int, wrapped: bool) -> str | None:
+# What may stand before a simple command the rewrite wraps (spaces taken out): the start, `;`, `&&`, `||`,
+# `&` or new lines, then at most one `(` (a subshell or `$(`). Not a pipe (the test would read its stdin
+# through the wrappers), `;;` or `)` (a case pattern), nor `((` (arithmetic).
+REWRITE_BEFORE_RE = re.compile(r"(?:;|&&|\|\||&)?\n*(?:\(\n*)?")
+# A python script on stdin that runs pytest itself: pytest.main, or pytest through subprocess or os
+STDIN_PYTEST_RE = re.compile(r"\bpytest\.(?:main|console_main)\s*\(|\b(?:subprocess\.(?:run|call|check_call|check_output"
+                             r"|Popen)|os\.(?:system|popen|exec\w*|spawn\w*))\s*\([^)]*?\bpytest\b")
+
+
+def _top_pieces(text: str, flags: list[tuple[bool, int]]) -> list[tuple[int, int, str, str]]:
+    """(start, end, what stands before, what stands after) of each piece of `text` between unquoted
+    `;`, `&`, `|`, `(`, `)` and new lines; the `&` of a redirect (`2>&1`, `&>f`) and the `|` of `>|`
+    are not separators. Spaces and tabs are taken out of the separators."""
+    seps, i = [], 0
+    while i < len(text):
+        j = i
+        while j < len(text) and (not flags[j][0] and text[j] in ";&|()\n" and not (
+                text[j] == "&" and (text[j - 1:j] in ("<", ">") or text[j + 1:j + 2] == ">")
+                or text[j] == "|" and text[j - 1:j] == ">") or j > i and text[j] in " \t"):
+            j += 1
+        if j > i:
+            seps.append((i, j))
+            i = j
+        else:
+            i += 1
+    out, at, before = [], 0, ""
+    for s, e in seps + [(len(text), len(text))]:
+        sep = re.sub(r"[ \t]", "", text[s:e])
+        if s > at:
+            out.append((at, s, before, sep))
+        at, before = e, sep
+    return out
+
+
+def _sandboxed_at(cmd: str, raw: list[str], k: int, wrapped: bool) -> str | None:
     """`cmd` with `ttp clip -- ttp sandbox --` (`ttp sandbox --` when a ttp wrapper is there) put just
-    before the test command `raw[k:]`, when `raw` is the last simple command of `cmd` and stands alone
-    after `;`, `&&`, `||` or a new line at the top level, so all else keeps its meaning; else None.
-    Only those characters are added: every other byte, heredoc bodies too, stays as written."""
+    before the test command `raw[k:]`, when `raw` stands as a simple command after what
+    REWRITE_BEFORE_RE allows (so never fed by a pipe), with no stdin redirect of its own; else None.
+    A pipe after it (the first member of a pipeline), `&`, `)` and loop words keep their meaning. Only those characters
+    are added: every other byte, redirections, the pipe's tail and heredoc bodies too, stays as written."""
     if REWRITE_NOT_AFTER & {os.path.basename(w) for w in raw[:k]}:
         return None
     lines, pending, at = [], [], 0     # (offset in cmd, text) of each line the shell reads as commands
@@ -1346,46 +1381,94 @@ def _sandboxed_tail(cmd: str, raw: list[str], k: int, wrapped: bool) -> str | No
         return None
     text = "\n".join(line for _, line in lines)
     flags = _quoting(text)
-    ops = [i for i, c in enumerate(text) if not flags[i][0] and c in ";&|()\n"]
-    end = len(text)
-    try:
-        # Past what only ends the last command: `;`, new lines, a comment
-        while ops and text[ops[-1]] in ";\n" and text[ops[-1] - 1:ops[-1] + 1] != ";;" \
-                and not shlex.split(text[ops[-1] + 1:end], comments=True):
-            end = ops.pop()
-        cut = ops[-1] + 1 if ops else 0
+    for cut, end, before, after in _top_pieces(text, flags):
         seg = text[cut:end]
-        if shlex.split(seg, comments=True) != raw:
-            return None
-    except ValueError:
-        return None
-    before = text[:cut].rstrip()   # a new line after `|` or `&&` continues that list
-    if ops and (text[cut - 2:cut] not in ("&&", "||") and text[cut - 1] in "&|()" or text[cut - 2:cut] == ";;"
-                or text[cut - 1] == "\n" and before.endswith("|") and not before.endswith("||")) \
-            or any(d for _, d in flags[cut:end]):
-        return None
-    sflags, pos = _quoting(seg), None
-    for i in range(len(seg)):   # where the test command's first word starts
-        if seg[i].isspace() or sflags[i][0] or i and not (seg[i - 1].isspace() and not sflags[i - 1][0]):
+        if _segments(seg, strip=False) != [raw]:
             continue
-        try:
-            if shlex.split(seg[:i]) == raw[:k]:
+        if not REWRITE_BEFORE_RE.fullmatch(before) or ";;" in after \
+                or any(c == "<" and not q for c, (q, _) in zip(seg, flags[cut:end])):
+            return None
+        pos = None
+        for i in range(len(seg)):   # where the test command's first word starts
+            if seg[i].isspace() or flags[cut + i][0] or i and not (seg[i - 1].isspace() and not flags[cut + i - 1][0]):
+                continue
+            if _segments(seg[:i], strip=False) == ([raw[:k]] if k else []):
                 pos = cut + i
                 break
-        except ValueError:
+        if pos is None:
+            return None
+        base = 0
+        for start, line in lines:   # back from `text` to `cmd`, past the heredoc bodies
+            if pos <= base + len(line):
+                off = start + pos - base
+                return cmd[:off] + ("" if wrapped else "ttp clip -- ") + "ttp sandbox -- " + cmd[off:]
+            base += len(line) + 1
+        return None
+    return None
+
+
+def _sandboxed(cmd: str) -> str | None:
+    """`cmd` with each pytest or ctest run outside `ttp sandbox` wrapped into it (_sandboxed_at), or
+    None when one of them cannot be."""
+    for _ in range(16):
+        hit = _unsandboxed_test(_split(cmd)[0], True)
+        if not hit:
+            return cmd
+        cmd = _sandboxed_at(cmd, *hit)
+        if cmd is None:
+            return None
+    return None
+
+
+def _runs_pytest(code: str) -> bool:
+    """Whether python `code` calls pytest (STDIN_PYTEST_RE) outside its string literals: an edit script
+    that writes such a call into a test file does not run it. Code that does not tokenize is matched whole."""
+    import io
+    import tokenize
+    hits = [m.start() for m in STDIN_PYTEST_RE.finditer(code)]
+    if not hits:
+        return False
+    starts = [0]
+    for line in code.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+    strings = []
+    try:
+        for t in tokenize.generate_tokens(io.StringIO(code).readline):
+            if tokenize.tok_name[t.type] in ("STRING", "FSTRING_MIDDLE", "COMMENT"):
+                strings.append((starts[t.start[0] - 1] + t.start[1], starts[t.end[0] - 1] + t.end[1]))
+    except (tokenize.TokenError, SyntaxError, IndexError):
+        return True
+    return any(not any(a <= h < b for a, b in strings) for h in hits)
+
+
+def _stdin_pytest(cmd: str) -> bool:
+    """Whether a python reading its script from a heredoc outside `ttp sandbox` runs pytest in it
+    (STDIN_PYTEST_RE); other heredoc bodies, edit scripts too, are data here."""
+    lines, bodies, pending = [], [], []
+    for line in cmd.replace("\\\n", " ").split("\n"):
+        if pending:
+            delim, dash, n = pending[0]
+            if (line.lstrip("\t") if dash else line) == delim:
+                pending.pop(0)
+            else:
+                bodies[n][2].append(line)
             continue
-    if pos is None:
-        return None
-    off, base = None, 0
-    for start, line in lines:   # back from `text` to `cmd`, past the heredoc bodies
-        if pos <= base + len(line):
-            off = start + pos - base
-            break
-        base += len(line) + 1
-    if off is None:
-        return None
-    new = cmd[:off] + ("" if wrapped else "ttp clip -- ") + "ttp sandbox -- " + cmd[off:]
-    return None if _unsandboxed_test(_split(new)[0], True) else new
+        lines.append(line)
+        flags = _quoting(line) if "<<" in line else []
+        for m in HEREDOC_RE.finditer(line):
+            if not flags[m.start()][0]:
+                pending.append((m[3], m[1] == "-", len(bodies)))
+                bodies.append((line, m.start(), []))
+    for line, pos, body in bodies:
+        if not _runs_pytest("\n".join(body)):
+            continue
+        wrappers: list[list[str]] = []
+        for raw in _segments(_piece_at(line, pos)[0], strip=False):
+            argv = _strip_prefix(raw, wrappers)
+            if argv and os.path.basename(argv[0]).startswith("python") and _interpreter_args(argv) == "-" \
+                    and not any(w[:1] == ["sandbox"] or (w[:1] == ["lock"] and _device_lock(w)) for w in wrappers):
+                return True
+    return False
 
 
 # A command that changes or drops TTP_NO_DEVICE (`TTP_NO_DEVICE=0`, `unset`, `env -u`, `env -i`):
@@ -1398,15 +1481,17 @@ def device_test_run(commands: str, cmd: str = "") -> tuple[str | None, str | Non
     """(why the call is refused, a notice, the command to run instead) for a test run outside `ttp
     sandbox` by a run that holds no device (TTP_NO_DEVICE=1) on a machine tagged `device`.
     TT_VISIBLE_DEVICES only asks: a raw open or reset code still reaches the devices, while `ttp
-    sandbox` hides their nodes. Where the provider set HOOK_REWRITE and the test run is the last
-    simple command of `cmd`, it is rewritten into the sandbox (_sandboxed_tail); a command that
-    changes TTP_NO_DEVICE is still refused. Where no sandbox works the call goes on with one notice
+    sandbox` hides their nodes, and so is a python script on stdin that runs pytest (_stdin_pytest).
+    Where the provider set HOOK_REWRITE and each test run stands as a top-level simple command of
+    `cmd` (or first in a pipeline), they are rewritten into the sandbox (_sandboxed); a command
+    that changes TTP_NO_DEVICE is still refused. Where no sandbox works the call goes on with one notice
     per run. It guards against accidents, not a determined bypass, and only refuses new calls; it
     never signals a running process."""
     if os.environ.get("TTP_NO_DEVICE", "").strip() != "1":
         return None, None, None
     hit = _unsandboxed_test(commands, not NO_DEVICE_CHANGE_RE.search(commands))
-    if not hit:
+    stdin = bool(cmd) and _stdin_pytest(cmd)
+    if not hit and not stdin:
         return None, None, None
     from . import machines, sandbox
     try:
@@ -1416,16 +1501,21 @@ def device_test_run(commands: str, cmd: str = "") -> tuple[str | None, str | Non
         return None, None, None
     pre, why = sandbox.status()
     if pre:
-        raw, k, wrapped = hit
         lead = "this run holds no device (TTP_NO_DEVICE=1) on a device host"
         tail = "Tests that need a device go through the device broker, `ttp lock <device> --` or `ttp devq`"
+        if stdin:
+            _log_refusal(cmd, kind="no_device")
+            return (f"{lead}, and a python script read from stdin runs pytest outside `ttp sandbox`. Write the "
+                    f"script to a file and run it as `ttp clip -- ttp sandbox -- python3 <file>`: the sandbox "
+                    f"hides the device nodes. {tail}"), None, None
+        raw, k, wrapped = hit
         if "sandbox" in raw[:k] or NO_DEVICE_CHANGE_RE.search(commands):
             _log_refusal(cmd or commands, kind="no_device")
             return (f"{lead}, and `ttp sandbox` hides the device nodes only while TTP_NO_DEVICE=1 reaches it: "
                     f"leave TTP_NO_DEVICE and the environment as they are (no `TTP_NO_DEVICE=`, `unset`, "
                     f"`env -u` or `env -i`). {tail}"), None, None
         try:   # a fault here refuses the call, as before: the hook fails open
-            new = _sandboxed_tail(cmd, raw, k, wrapped) if os.environ.get(HOOK_REWRITE) == "1" else None
+            new = _sandboxed(cmd) if os.environ.get(HOOK_REWRITE) == "1" else None
         except Exception:
             new = None
         if new:

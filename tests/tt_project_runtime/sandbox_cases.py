@@ -387,6 +387,16 @@ def test_the_hook_allows_test_runs_of_device_runs_and_on_other_hosts(kw, tmp_pat
     ("git add -A; uv run pytest -q  # focused", "git add -A; uv run ttp clip -- ttp sandbox -- pytest -q  # focused"),
     ("make ||\n  pytest -q;\n", "make ||\n  ttp clip -- ttp sandbox -- pytest -q;\n"),
     ("ttp sandbox -- true; pytest", "ttp sandbox -- true; ttp clip -- ttp sandbox -- pytest"),
+    ("pytest -q 2>&1 | tail -5", "ttp clip -- ttp sandbox -- pytest -q 2>&1 | tail -5"),
+    ("pytest -q > out.txt", "ttp clip -- ttp sandbox -- pytest -q > out.txt"),
+    ("pytest -q && git status", "ttp clip -- ttp sandbox -- pytest -q && git status"),
+    ("pytest a; pytest b", "ttp clip -- ttp sandbox -- pytest a; ttp clip -- ttp sandbox -- pytest b"),
+    ("(cd x && pytest)", "(cd x && ttp clip -- ttp sandbox -- pytest)"),
+    ("echo $(\npytest)", "echo $(\nttp clip -- ttp sandbox -- pytest)"),
+    ("for f in a b; do pytest $f; done", "for f in a b; do ttp clip -- ttp sandbox -- pytest $f; done"),
+    ("pytest -q &", "ttp clip -- ttp sandbox -- pytest -q &"),
+    ("pytest -q |& tee log", "ttp clip -- ttp sandbox -- pytest -q |& tee log"),
+    ("ttp clip -- pytest -q 2>&1 | grep -E 'passed|failed'", "ttp clip -- ttp sandbox -- pytest -q 2>&1 | grep -E 'passed|failed'"),
 ])
 def test_the_hook_rewrites_a_trailing_no_device_test_run_into_the_sandbox(cmd, new, tmp_path, monkeypatch):
     from ttp import hook
@@ -402,10 +412,13 @@ def test_the_hook_rewrites_a_trailing_no_device_test_run_into_the_sandbox(cmd, n
 
 
 @pytest.mark.parametrize("cmd", [
-    "pytest -q 2>&1 | tail -5", "pytest -q > out.txt", "pytest -q && git status", "(cd x && pytest)",
-    "for f in a b; do pytest $f; done", "bash -lc 'pytest -q'", "sudo pytest", "pytest a; pytest b",
-    "a |\npytest", "pytest -q &", "case a in a) pytest;; esac", "echo $(\npytest)", "pytest - <<EOF\nx\nEOF",
-    "pytest -q \\\n  tests/x.py", "'pytest' -q", "cat <<EOF; pytest -q\nx\n", "bash <<EOF\npytest -q\nEOF",
+    "bash -lc 'pytest -q'", "sh -c 'cd x && pytest'", "ls tests | xargs pytest", "sudo pytest", "a | pytest",
+    "a |\npytest", "case a in a) pytest;; esac", "f() { pytest; }", "$((pytest))", "pytest - <<EOF\nx\nEOF",
+    "pytest -q < args.txt", "pytest -q \\\n  tests/x.py", "'pytest' -q", "cat <<EOF; pytest -q\nx\n",
+    "bash <<EOF\npytest -q\nEOF", "pytest a; bash -c 'pytest b'",
+    "python3 - <<'EOF'\nimport pytest\npytest.main(['-q', 'tests'])\nEOF",
+    "cd x && python3 - <<EOF\nimport subprocess, sys\nsubprocess.run([sys.executable, '-m', 'pytest', '-q'])\nEOF",
+    "python3 - <<'EOF'\nimport os\nos.system('pytest -q')\nEOF",
 ])
 def test_the_hook_refuses_a_no_device_test_run_it_cannot_rewrite_alone(cmd, tmp_path, monkeypatch):
     from ttp import hook
@@ -422,10 +435,62 @@ def test_the_hook_never_rewrites_a_test_run_that_changes_ttp_no_device(cmd, tmp_
     assert "leave TTP_NO_DEVICE" in out["hookSpecificOutput"]["permissionDecisionReason"]
 
 
+# The shapes of logged no-device refusals, with placeholders: edit scripts fed to python or cat on stdin
+EDIT_SCRIPTS = [
+    "cd w/t1; sed -i 's/a/b/' tests/a_cases.py; python3 - <<'EOF'\nimport pathlib\nf = pathlib.Path('tests/b_cases.py')\n"
+    "s = f.read_text().replace('pytest.main', 'pytest.main()')\nf.write_text(s)\nEOF",
+    "cp tests/test_a.py $TMPDIR/a.bak && python3 - <<'EOF'\np = 'tests/test_a.py'; s = open(p).read()\n"
+    "s = s.replace('a', 'run pytest -q')\nopen(p, 'w').write(s)\nEOF",
+    "python3 - <<'EOF'\np = 'tests/a_cases.py'\ns = open(p).read()\nold = '''    x = 1\n'''\n"
+    "new = '''    r = subprocess.run([sys.executable, \"-m\", \"pytest\", \"-q\", str(f)])\n'''\n"
+    "assert old in s; s = s.replace(old, new)\nopen(p, 'w').write(s)\nEOF",
+    "cat >> tests/a_cases.py <<'EOF'\n\ndef test_x():\n    subprocess.run(['pytest', '-q'])\n    pytest.main(['x'])\nEOF",
+    "python3 - <<EOF\nimport pytest  # pytest.main(['-q']) only in a comment\nprint('ok')\nEOF",
+]
+TEST_RUNS = [
+    "cd w/t2; PYTHONPATH=$PWD timeout 300 python3 -m pytest --rootdir=. -q tests/test_a.py -k \"a or b\" -p no:randomly 2>&1 | tail -5",
+    "cd w/t3; cat x.rc; tail -3 x.log; python3 -m pytest -q tests -k name 2>&1 | tail -3",
+    "PYTHONPATH=$PWD/r:. python3 -m pytest -q tests/a_cases.py -k \"b\" 2>&1 | tail -3",
+    "cd w/t4 && PYTHONPATH=$PWD timeout 600 python3 -m pytest -q -x tests/test_a.py -k \"a\" 2>&1 | tail -20",
+    "python3 - <<'EOF'\np = 'tests/a_cases.py'\nopen(p, 'a').write('x')\nEOF\nmv a.tmp tests/a_cases.py\n"
+    "PYTHONPATH=$PWD timeout 600 python3 -m pytest -q tests/test_a.py -k \"a or b\" 2>&1 | tail -15",
+    "git status --short | head; for i in 1 2 3; do PYTHONPATH=$PWD timeout 200 python3 -m pytest -q tests/test_a.py -k t 2>&1 | tail -1; done",
+    "ls tests | head; (ttp clip -- python3 -m pytest -q -x tests/test_a.py -k \"a or b\" 2>&1 | tail -8); claude plugin validate p --strict",
+    "export OUT=$TMPDIR/m.txt && time (PYTHONPATH=$PWD timeout 600 python3 -m pytest -q tests/test_a.py 2>&1 | tail -5) && cat $OUT",
+    "cd w/t5; python3 -m pytest -q tests/test_a.py -k 'a or b' 2>&1 | tail -3; git rev-parse HEAD",
+    "ctest --test-dir build -R unit 2>&1 | tail -20 && echo done",
+    "measure() { pytest -q tests/test_a.py 2>&1 | grep -E 'passed|failed'; }\nmeasure",
+]
+
+
+@pytest.mark.parametrize("cmd", EDIT_SCRIPTS)
+def test_the_hook_allows_heredoc_edit_scripts_that_run_no_test(cmd, tmp_path, monkeypatch):
+    from ttp import hook
+    assert _device_hook(monkeypatch, tmp_path, rewrite=True)(cmd) is None
+    assert not (tmp_path / hook.REFUSALS_FILE).exists()
+
+
+def test_the_hook_rewrites_most_logged_test_run_shapes_and_none_runs_outside_the_sandbox(tmp_path, monkeypatch):
+    from ttp import hook
+    call = _device_hook(monkeypatch, tmp_path, rewrite=True)
+    kinds = []
+    for cmd in TEST_RUNS:
+        o = call(cmd)["hookSpecificOutput"]
+        if "updatedInput" in o:
+            new = o["updatedInput"]["command"]
+            assert not hook._unsandboxed_test(hook._split(new)[0], True) and call(new) is None, new
+            kinds.append("rewrite")
+        else:
+            assert o["permissionDecision"] == "deny", cmd
+            kinds.append("deny")
+    assert kinds.count("rewrite") >= 0.9 * len(TEST_RUNS), list(zip(kinds, TEST_RUNS))
+    assert kinds[-1] == "deny"   # a test run inside a function body is not rewritten
+
+
 def test_a_fault_in_the_rewrite_refuses_the_call(tmp_path, monkeypatch):
     from ttp import hook
     call = _device_hook(monkeypatch, tmp_path, rewrite=True)
-    monkeypatch.setattr(hook, "_sandboxed_tail", lambda *a: 1 / 0)
+    monkeypatch.setattr(hook, "_sandboxed", lambda *a: 1 / 0)
     assert call("pytest -q")["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
