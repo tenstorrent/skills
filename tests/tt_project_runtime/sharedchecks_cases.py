@@ -648,6 +648,71 @@ def test_a_shared_failure_passing_on_the_tip_adds_no_fix_task_and_wakes_its_task
         assert res["wake_tier"] == "standard" and task["not_before"] <= now + 120
 
 
+def _tip_commit(path, name, text):
+    """A commit on the parent of `path`'s HEAD setting file `name` to `text`, made without moving the
+    worktree (a push-branch tip another change landed): its sha."""
+    def run(*a, **k):
+        return subprocess.run(["git", "-C", str(path), *a], check=True, capture_output=True, text=True,
+                              **k).stdout.strip()
+    base = run("rev-parse", "HEAD~1")
+    blob = run("hash-object", "-w", "--stdin", input=text)
+    idx = {**os.environ, "GIT_INDEX_FILE": str(path.parent / f"{path.name}.tip-index")}
+    run("read-tree", base, env=idx)
+    run("update-index", "--add", "--cacheinfo", f"100644,{blob},{name}", env=idx)
+    tree = run("write-tree", env=idx)
+    return run("-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", tree, "-p", base, "-m", "tip")
+
+
+@pytest.mark.parametrize("case", ["rebased", "dirty", "remote", "conflict"])
+def test_a_shared_failure_passing_on_the_tip_rebases_a_clean_unpublished_worktree_and_reruns_its_checks(
+        env, monkeypatch, tmp_path, case):
+    # The daemon rebases the task's clean worktree onto the tip its failing ids pass on and starts its
+    # checks again on the new head, without a model run. A dirty worktree, a head on a remote ref (a
+    # force push to republish) or a rebase conflict (aborted) leave the worktree as it was and wake the
+    # task as before.
+    p = make(env)
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "t")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "t@t")
+    _seed_other_failures(p, _IDS)
+    tid, run_dir = _shared_fail_task(p, tmp_path, _pytest_out(_IDS))
+    path = Path(json.loads((run_dir / "checks.pid").read_text())["worktree"])
+    git = ["git", "-C", str(path)]
+
+    def rev(ref="HEAD"):
+        return subprocess.run([*git, "rev-parse", ref], capture_output=True, text=True).stdout.strip()
+
+    head = rev()
+    tip = _tip_commit(path, "fix.txt" if case == "conflict" else "other.txt", "theirs\n")
+    d, started, tips = _tip_daemon(p, monkeypatch, tip=tip)
+    if case == "dirty":
+        (path / "fix.txt").write_text("edited\n")
+    if case == "remote":
+        subprocess.run([*git, "update-ref", "refs/remotes/origin/published", head], check=True)
+    now = time.time()
+    _tip_ran(p, d, tip, _IDS, "0", now)
+    d._probe_passed(p.db.task(tid), now)
+    res, new = json.loads(p.db.task(tid)["result"]), rev()
+    status = subprocess.run([*git, "status", "--porcelain", "--untracked-files=no"], capture_output=True,
+                            text=True).stdout
+    assert not _fixes(p) and not tips
+    if case == "rebased":
+        assert new != head and subprocess.run([*git, "merge-base", "--is-ancestor", tip, new]).returncode == 0
+        assert (path / "other.txt").read_text() == "theirs\n" and not status
+        assert started == [(tid, ["pytest -q"])] and "woke" not in res and "shared_hold" not in res
+        assert not _ready(p, tid)
+        return
+    assert new == head and not started, (new, head, started)
+    assert "rebase" in res["woke"] and "the daemon did not rebase it" in res["woke"], res
+    want = {"dirty": "uncommitted changes", "remote": "refs/remotes/origin/published",
+            "conflict": "stopped and was aborted"}[case]
+    assert want in res["woke"], res["woke"]
+    assert bool(status) == (case == "dirty")
+    if case == "conflict":   # aborted: no rebase left in progress, the worktree's file as it was
+        gd = Path(rev("--absolute-git-dir"))
+        assert not (gd / "rebase-merge").exists() and not (gd / "rebase-apply").exists()
+        assert (path / "fix.txt").read_text() == "fixed\n"
+
+
 @pytest.mark.parametrize("rc", ["1", "124", None])
 def test_a_shared_failure_not_passing_on_the_tip_adds_exactly_one_fix_task(env, monkeypatch, tmp_path, rc):
     # Failing there (1), timing out (124) or the rerun never ending (None, past its bound) all leave the

@@ -11199,7 +11199,8 @@ class Daemon:
                     db.update_task(tid, not_before=now + 2 * PROBE_EVERY_S)
                 return True
             if v == "pass":
-                return self._tip_passed(task, ids, str(hold.get("tip") or ""), now, bool(hold.get("holds_tip")))
+                return self._tip_passed(task, ids, str(hold.get("tip") or ""), now, bool(hold.get("holds_tip")),
+                                        run_dir=Path(hold["run_dir"]) if hold.get("run_dir") else None)
             tipped, hold = True, {k: v for k, v in hold.items() if k != "tip_check"}
         elif hold and hold.get("started") == started:   # the failure it was held on: release or sleep on
             moved = bool(tip and hold.get("tip") and tip != hold["tip"]
@@ -11270,7 +11271,8 @@ class Daemon:
                     worktree._git(self.p.root, "worktree", "prune", check=False)
             v = "pending"
         if v == "pass":
-            return self._tip_passed(task, ids, tip, now, bool(holds))
+            return self._tip_passed(task, ids, tip, now, bool(holds),
+                                    run_dir=Path(hold["run_dir"]) if hold.get("run_dir") else None)
         if v != "pending":
             return None
         until = now + sharedchecks.settings(self.cfg)["tip_timeout_s"]
@@ -11280,9 +11282,29 @@ class Daemon:
                     f"owns them; held while they rerun on the push-branch tip {tip[:12]}")
         return True
 
-    def _tip_passed(self, task: dict, ids: list[str], tip: str, now: float, holds_tip: bool = False) -> bool:
-        """Its failing ids pass on the push-branch tip: no fix task; wake it to rebase and rerun its checks,
-        or, when its head already holds that tip, to fix what its own change broke."""
+    def _tip_passed(self, task: dict, ids: list[str], tip: str, now: float, holds_tip: bool = False,
+                    run_dir: Path | None = None) -> bool:
+        """Its failing ids pass on the push-branch tip: no fix task. The daemon rebases its clean, unpublished
+        worktree onto that tip and reruns its checks there, model-free (_tip_rebase); where it cannot, it
+        wakes the task to rebase and rerun its checks, or, when its head already holds that tip, to fix
+        what its own change broke."""
+        tid, why = task["id"], ""
+        if not holds_tip and run_dir is not None and tip:
+            info, why = self._tip_rebase(tid, run_dir, tip)
+            if info:
+                why = self._restart_checks(tid, run_dir, info, f"rebase-t{tid}")
+                if not why:
+                    self._probe_rc.pop(tid, None)
+                    prev = load_result(task["result"])
+                    self.p.db.update_task(tid, not_before=now + max(_retry_s(prev), 3600.0), result=dump_result(
+                        {k: v for k, v in prev.items() if k != "shared_hold"}))
+                    log(self.p, f"task {tid}: its {len(ids)} failing test(s) pass on the push-branch tip {tip[:12]}; "
+                                f"rebased its worktree onto it ({info['old'][:12]} -> {info['head'][:12]}) and "
+                                "started its checks again, no model run")
+                    return True
+                why = (f"its worktree was rebased onto the tip ({info['old'][:12]} -> {info['head'][:12]}), "
+                       f"but its checks did not start again: {why}")
+            log(self.p, f"task {tid}: not rebased onto the push-branch tip {tip[:12]} by the daemon: {why}")
         log(self.p, f"task {task['id']}: its {len(ids)} failing test(s) pass on the push-branch tip {tip[:12]}; "
                     + ("its head holds that tip, so its own change fails them; no fix task, woken to fix it"
                        if holds_tip else "no fix task, woken to rebase onto it and rerun its checks"))
@@ -11290,10 +11312,48 @@ class Daemon:
                 if holds_tip else "rebase onto the tip and run your checks again")
         self._wake_waiting(task, f"its checks failed on {len(ids)} test(s) ({', '.join(ids[:3])}"
                                  f"{', ...' if len(ids) > 3 else ''}) that pass on the push-branch tip {tip[:12]}"
-                                 f"{', ' if holds_tip else ': '}{todo}; no fix task was added", now,
+                                 f"{', ' if holds_tip else ': '}{todo}; no fix task was added"
+                                 + (f" (the daemon did not rebase it: {why})" if why else ""), now,
                            extra={"wake_tier": task["tier"] if task["tier"] in bud.TIER_ORDER else "standard",
                                   "shared_hold": {}})
         return True
+
+    def _tip_rebase(self, tid: int, run_dir: Path, tip: str) -> tuple[dict, str]:
+        """Rebase the worktree that run dir `run_dir`'s checks.pid names onto the push-branch tip `tip`,
+        locally only (no fetch is needed: the tip's own rerun checked it out from this repository; nothing
+        is pushed). Returns (its checks.pid fields with the new `head` and the `old` one, '') once rebased,
+        else ({}, why not) with the worktree as it was: gone or moved, uncommitted changes to tracked
+        files, its head on a remote ref (republishing it would need a force push), the tip not here, or
+        a rebase that stopped (a conflict), which is aborted."""
+        from .cli import _read_checks_pid
+        info = _read_checks_pid(run_dir)
+        wt, head = info.get("worktree"), info.get("head")
+        if not all(isinstance(x, str) and x for x in (wt, head)) or not isinstance(info.get("cmd"), list):
+            return {}, "its checks.pid does not name a worktree, head and command"
+        path = Path(wt)
+        try:
+            if not worktree.is_git(path):
+                return {}, f"its worktree {wt} is gone"
+            if (now := worktree._git(path, "rev-parse", "HEAD")) != head:
+                return {}, f"its worktree moved from {head[:12]} to {now[:12]}"
+            if worktree._git(path, "status", "--porcelain", "--untracked-files=no"):
+                return {}, f"its worktree {wt} has uncommitted changes"
+            if ref := worktree._git(path, "for-each-ref", "--contains", head, "--count=1", "--format=%(refname)",
+                                    "refs/remotes"):
+                return {}, f"its head {head[:12]} is on the remote ref {ref}; republishing it would need a force push"
+            if not worktree._git(path, "rev-parse", "--verify", "--quiet", f"{tip}^{{commit}}", check=False):
+                return {}, f"the tip {tip[:12]} is not in its repository"
+        except Exception as e:
+            return {}, f"its worktree could not be read: {e}"
+        env = {**os.environ, "GIT_EDITOR": "true", "GIT_SEQUENCE_EDITOR": "true"}
+        try:
+            worktree._git(path, "rebase", "--no-autostash", tip, timeout=120, env=env)
+            new = worktree._git(path, "rev-parse", "HEAD")
+        except Exception as e:
+            with contextlib.suppress(Exception):
+                worktree._git(path, "rebase", "--abort", check=False, timeout=60, env=env)
+            return {}, f"its rebase onto the tip {tip[:12]} stopped and was aborted: {str(e)[:200]}"
+        return {**info, "head": new, "old": head}, ""
 
     def _tip_dir(self, key: str) -> Path:
         return self.p.state / "shared-tip" / key
