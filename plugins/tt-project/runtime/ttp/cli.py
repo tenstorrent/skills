@@ -8496,6 +8496,7 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
         print("restored files a crash left empty: " + ", ".join(emptied))
     _restore_cut_runtime(h)
     left = _commit_local_changes(p, ident)
+    _untrack_placeholders(p, ident)
     base = _git(h, "rev-parse", "HEAD")     # the merge is checked against this; main must not move meanwhile
     upjournal.step(p, "committed", base=base)
     _snapshot_upstream(p, src, new_v, new_c, ident)
@@ -8704,6 +8705,10 @@ def _commit_local_changes(p: Project, ident: list[str]) -> list[str]:
     if not running:
         _git(h, "add", "-A")
         files = sorted(names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD"))
+        if fenced := [n for n in files if _sandbox_path(n)]:
+            _git(h, "--literal-pathspecs", "reset", "-q", "--", *fenced)
+            _note_fenced(h, fenced)
+            files = sorted(names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD"))
         if plans := _refresh_plan_digests(p, files):
             _git(h, "--literal-pathspecs", "add", "--", *plans)
             files = sorted(names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD"))
@@ -8714,6 +8719,11 @@ def _commit_local_changes(p: Project, ident: list[str]) -> list[str]:
 
     changed = (names("ls-files", "-z", "--modified", "--others", "--deleted", "--exclude-standard")
                | names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD"))
+    if fenced := sorted(n for n in changed if _sandbox_path(n)):
+        _note_fenced(h, fenced)
+        if staged := sorted(set(fenced) & names("diff", "--cached", "--name-only", "--no-renames", "-z", "HEAD")):
+            _git(h, "--literal-pathspecs", "reset", "-q", "--", *staged)     # else the worker's commit takes them
+        changed -= set(fenced)
     old, left = [], []
     for n in sorted(changed):
         try:
@@ -8738,6 +8748,87 @@ def _commit_local_changes(p: Project, ident: list[str]) -> list[str]:
         print(f"left {len(left)} file(s) changed since harness task #{tid}'s run started for it to commit: "
               f"{', '.join(left[:10])}" + (f" and {len(left) - 10} more" if len(left) > 10 else ""))
     return left
+
+
+def _sandbox_path(n: str) -> bool:
+    """Whether repo path `n` is one the worker sandbox mounts over (providers.claude.SANDBOX_PLACEHOLDERS),
+    or lies under one."""
+    from .providers.claude import SANDBOX_PLACEHOLDERS
+    return any(n == s or n.startswith(s + "/") for s in SANDBOX_PLACEHOLDERS)
+
+
+def _placeholder_file(path: Path) -> bool:
+    """An empty regular file, or a directory holding only such files (and empty directories): what the
+    sandbox leaves behind as a mount point. A missing path counts too (a deletion carries no content)."""
+    try:
+        if path.is_symlink():
+            return False
+        if path.is_dir():
+            return all(_placeholder_file(c) for c in path.iterdir())
+        return path.stat().st_size == 0
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
+def _note_fenced(h: Path, fenced: list[str]) -> None:
+    """Changes to sandbox placeholder paths stay out of the pre-upgrade commit: committed, they break every
+    checkout and rebase in a sandboxed task worktree. Ones with real content are named, for their owner."""
+    real = [n for n in fenced if not _placeholder_file(h / n)]
+    if real:
+        print(f"left out of the pre-upgrade commit: {len(real)} change(s) to paths the worker sandbox mounts "
+              f"over, which hold content: {', '.join(real[:10])}" + (f" and {len(real) - 10} more" if len(real) > 10
+                                                                     else "") + "; commit them yourself if wanted")
+
+
+def _untrack_placeholders(p: Project, ident: list[str]) -> str:
+    """A harness whose pre-upgrade commit once swept in the sandbox's placeholder files (empty files at
+    the paths it mounts over) fails every checkout and rebase of a sandboxed task worktree on them. Each
+    such tracked path that is empty (an empty blob, or a tree of only empty blobs) is untracked in one
+    commit, built in a scratch index so nothing else staged goes in; the files stay on disk, untracked
+    (one may be a running worker's mount point). A path with content is kept and named. Nothing to do
+    when none matches. Returns the commit's sha, or ""."""
+    from .providers.claude import SANDBOX_PLACEHOLDERS
+    h = p.harness
+    tree: dict[str, list[tuple[str, str]]] = {}
+    out = subprocess.run(["git", "-C", str(h), "ls-tree", "-r", "-l", "-z", "HEAD", "--", *SANDBOX_PLACEHOLDERS],
+                         capture_output=True, text=True, check=True).stdout
+    for entry in out.split("\0"):
+        meta, _, path = entry.partition("\t")
+        top = next((s for s in SANDBOX_PLACEHOLDERS if path == s or path.startswith(s + "/")), None) if path else None
+        if top:
+            mode, size = meta.split()[0], meta.split()[-1]
+            tree.setdefault(top, []).append((mode, size))
+    drop = sorted(s for s, ents in tree.items() if all(m in ("100644", "100755") and z == "0" for m, z in ents))
+    if kept := sorted(set(tree) - set(drop)):
+        print(f"kept {len(kept)} tracked path(s) the worker sandbox mounts over, which hold content: "
+              f"{', '.join(kept)}")
+    if not drop:
+        return ""
+    idx = p.state / "upgrade-placeholder-index"
+    env = {**os.environ, "GIT_INDEX_FILE": str(idx)}
+
+    def git(*args: str) -> str:
+        return subprocess.run(["git", "-C", str(h), *args], capture_output=True, text=True, check=True,
+                              env=env).stdout.strip()
+    head = _git(h, "rev-parse", "HEAD")
+    try:
+        git("read-tree", head)
+        git("--literal-pathspecs", "rm", "-r", "-q", "--cached", "--", *drop)
+        body = (f"Empty files the worker sandbox leaves at paths it mounts over; tracked, they fail checkouts and "
+                f"rebases in task worktrees. Untracked ({len(drop)}):\n{_listed(drop)}")
+        sha = git(*ident, "commit-tree", git("write-tree"), "-p", head,
+                  "-m", "untrack sandbox placeholder files", "-m", body)
+    finally:
+        idx.unlink(missing_ok=True)
+    _git(h, "update-ref", "-m", "ttp upgrade: untrack sandbox placeholder files", "HEAD", sha, head)
+    # The live index still holds them as HEAD had them; a stage that differs is left for the next upgrade.
+    subprocess.run(["git", "-C", str(h), "--literal-pathspecs", "rm", "-r", "-q", "--cached", "--ignore-unmatch",
+                    "--", *drop], capture_output=True)
+    print(f"untracked {len(drop)} empty sandbox placeholder path(s) the harness had committed, as {sha[:12]}: "
+          f"{', '.join(drop)}")
+    return sha
 
 
 def _refresh_plan_digests(p: Project, files: list[str], busy: set[str] = frozenset()) -> list[str]:

@@ -563,6 +563,18 @@ FENCE_EXCLUDED = ("ssh *", "scp *", "sftp *", "rsync *", "ttp lock *", "ttp mach
                   "ttp detach --remote *", "git fetch *", "git pull *", "git push *", "git ls-remote *",
                   "git clone *", "git remote update *", "git submodule update *")
 
+# Paths the Bash sandbox mounts over in its cwd so that no command writes them (shell and git start-up
+# files, editor and agent config), relative to the cwd. Where one does not exist, bubblewrap first
+# creates an empty file as the mount point, and it stays after the command ends: an untracked empty file
+# that `git add -A` commits, after which a checkout or rebase in a sandboxed worktree fails on it.
+# Measured on CLI 2.1.296 (Linux) from a worker's mounts. The plugin's one list of them: the pre-upgrade
+# commit stages none, and an upgrade untracks the empty ones a harness committed (cli._upgrade).
+SANDBOX_PLACEHOLDERS = (".bash_profile", ".bashrc", ".profile", ".zprofile", ".zshrc", ".gitconfig", ".gitmodules",
+                        ".idea", ".mcp.json", ".ripgreprc", ".vscode", ".claude/agents", ".claude/.cc-writes",
+                        ".claude/commands", ".claude/hooks", ".claude/launch.json", ".claude/loop.md",
+                        ".claude/output-styles", ".claude/routines", ".claude/scheduled_tasks.json",
+                        ".claude/settings.json", ".claude/settings.local.json", ".claude/skills", ".claude/workflows")
+
 
 def fence_missing() -> list[str]:
     """What this host lacks for the Bash sandbox ([] when it can start): bubblewrap and socat on Linux,
