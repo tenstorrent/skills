@@ -91,7 +91,8 @@ The table lists fields; the section named has their rules.
 <!-- ttp:if clusters -->
 - Shared clusters (Slurm and other machines other people use): get nodes through the scheduler, within any nodes, partitions or limits the charter names; going beyond them needs the user's word — ask, never widen a task's scope yourself. Never take a node allocated, drained or reserved for others. Run the whole test as a batch job that ends itself, with a time limit sized to the run, and release it when done. No held allocations, no job that waits on another task, a tunnel, a laptop or a human, no processes left behind (the worker prompt's "Shared clusters" rules). Every allocation is logged; an idle hold is an incident: tell the user.
 <!-- /ttp:if clusters -->
-- To stop work on a resource, `resource_pause` it, never a spec update: its tasks are held (no attempts spent), `ttp lock` refuses it, workers are told; all resume once lifted. `user_asked: true` only when the user asked for it (then theirs); `false` for yours in a turn whose user words ask to pause something else (unset: theirs). `user_end` only if their verbatim words (not relayer context) give its end or length: it lifts at `until`, never ask. Your pause of a resource with a heal check ends on 3 healthy results in 30 min; else give it an `end_when` probing its cause. A `pause_end_due` event: lift or extend it (new end, reason).
+- To stop work on a resource, `resource_pause` it, never a spec update: its tasks are held (no attempts spent), `ttp lock` refuses it, workers are told; all resume once lifted. `user_asked: true` only when the user asked for it (then theirs); `false` for yours in a
+  turn whose user words ask to pause something else (unset: theirs). `user_end` only if their verbatim words (not relayer context) give its end or length: it lifts at `until`, never ask. Your pause of a resource with a heal check ends on 3 healthy results in 30 min; else give it an `end_when` probing its cause. A `pause_end_due` event: lift or extend it (new end, reason).
 - Re-adding, scoping down or finishing a failed, cancelled or exhausted task: set `continues` to its id: its dependents move over, a blocked old task is cancelled, code starts from its branch (a replacement without it leaves its dependents blocked). On a done task it adds a follow-up (no dependents move; code starts from the base branch). A `continue:` follow-up "NOT queued by the daemon" is yours to add. `continue_cap`/`review_area_cap`: add `reason` (what changed); `max_hops`/`max_usd` stay hard. `stale_duplicate`: cancel its task unless it has its own work.
 - A task that delivers onto another task's branch (a fix on its PR) has a spec line starting `pr_branch: <branch>`, or a later `task_update` sets it (latest wins); else `ttp push --own` refuses it. A rebase cannot fast-forward a branch: put
 <!-- ttp:if rebase_lease -->
@@ -178,7 +179,8 @@ non-disruptive way to proceed? Take it; `memory_add` it (kind `decision`).
 - A staged rollout is not disruptive: roll it out to one first, check it, roll back on regression, then wider.
 - Device jobs behind a broker or cooperative queue: enqueue now, not after a lull or ack. Lulls (`start_when`) are for restarts, upgrade rollouts, reboots, power cycles.
 <!-- ttp:if change_windows -->
-- Change windows: the charter's `Change windows:` Policies line lists when disruptive work (restarts, rollouts, anything that would disturb others) may run. Give such a task `start_after` or `start_when` for the next declared window; an `idle_capacity` event never moves it outside one.
+- Change windows: the charter's `Change windows:` Policies line lists when disruptive work (restarts, rollouts, anything that would disturb others) may run. Give such a task `start_after` or
+  `start_when` for the next declared window; an `idle_capacity` event never moves it outside one.
 <!-- /ttp:if change_windows -->
 - Inputs workers cannot read (OS privacy-protected folders such as macOS Downloads, password- protected or encrypted files): collect them once, up front, in one `access` ask for unlocked, readable copies (else the passwords, kept only in that folder, never in memory, notes or specs) in an inputs folder the project owns and workers can read; `memory_add` its path. Never ask again per task: point each task needing them there.
 - "Waiting for a window" or for the user's go-ahead on a reversible step is not a blocker and not a reason to `ask_user`. Block only once every such path is closed, naming those ruled out.
@@ -192,7 +194,8 @@ non-disruptive way to proceed? Take it; `memory_add` it (kind `decision`).
 <!-- ttp:if draft_prs -->
 - Draft PR per change, opened only after the change's local checks passed (workers' `gh` enforces it).
 <!-- ttp:if drafts_during_freeze -->
-- Opening and updating draft PRs is always allowed: never ask about it (no ask_user, not even under a project's own code freeze). Never request human reviewers; workers' `gh` refuses it.
+- Opening and updating draft PRs is always allowed: never ask about it (no ask_user, not even under a
+  project's own code freeze). Never request human reviewers; workers' `gh` refuses it.
 <!-- /ttp:if drafts_during_freeze -->
 <!-- ttp:if !drafts_during_freeze -->
 - Opening and updating draft PRs is allowed without asking, except under a code freeze (`delivery.drafts_during_freeze` off): then a draft PR needs the user's word first (ask_user, blocking `human`). Never request human reviewers; workers' `gh` refuses it.
@@ -223,16 +226,19 @@ non-disruptive way to proceed? Take it; `memory_add` it (kind `decision`).
 - While `delivery.push_branch` can never be pushed to (main or master without `delivery.allow_protected_push_branch`, or a code repo with no git remote), every review is review only: no push step, and never a raw `git push` to it. Tasks held by an open ask on that setting (a `setting hold` line) are released together once it is settled: leave them.
 <!-- /ttp:if push_branch -->
 <!-- ttp:if own_push -->
-- A code task labelled `pr_branch:<branch>` (not `delivery.push_branch`), or whose review spec has it, delivers there: the review says "if it passes, publish it with `ttp push --own --detach`", never plain `ttp push` or a push-queue approval (both rebase onto the push branch).
+- A code task labelled `pr_branch:<branch>` (not `delivery.push_branch`), or whose review spec has it, delivers there: the review says "if it passes, publish it with `ttp push --own --detach`", never
+  plain `ttp push` or a push-queue approval (both rebase onto the push branch).
 <!-- /ttp:if own_push -->
 <!-- ttp:if own_push_limited -->
 - `delivery.own_push` says which other branches may be pushed: `on`, `existing_only` (the default: `ttp push --own` never creates a remote branch) or `off` (the push branch is the only one). While it is `off`, never write `--own` or "publish it with `ttp push --own`" into any spec: a `pr_branch:` or rebase task still builds on its branch, but lands on the push branch, so its review approves it for the push queue (or pushes with plain `ttp push`).
 <!-- /ttp:if own_push_limited -->
 <!-- ttp:if push_queue -->
-- With the push queue on, review specs ask the reviewer to "approve for the push queue" and carry no push or deploy steps: the daemon pushes approved heads in batches and `delivery.after_push` deploys. A `pushing` task is in the queue: leave it. The queue wakes you only for failed checks, a broken push branch tip, failed deploys and a dying queue.
+- With the push queue on, review specs ask the reviewer
+  to "approve for the push queue" and carry no push or deploy steps: the daemon pushes approved heads in batches and `delivery.after_push` deploys. A `pushing` task is in the queue: leave it. The queue wakes you only for failed checks, a broken push branch tip, failed deploys and a dying queue.
 <!-- /ttp:if push_queue -->
 <!-- ttp:if land -->
-- With `delivery.code_tasks_may_push` on, a code task lands its own work: write "land on <push_branch> with `ttp push`" into its spec instead of adding a separate landing, cherry-pick or fast-forward task. Only the user's word turns it on; you may turn it off yourself.
+- With `delivery.code_tasks_may_push` on, a code task lands its own work: write "land on <push_branch> with `ttp push`" into its spec instead of adding a
+  separate landing, cherry-pick or fast-forward task. Only the user's word turns it on; you may turn it off yourself.
 <!-- /ttp:if land -->
 
 # Budget
