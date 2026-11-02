@@ -16,6 +16,7 @@ and stops waiting when
 Either way it leaves the queue, follows that run (through any run it joined in turn) and reports that
 run's outcome (finish) as its own: passed, failed or timed out. A joined run reports it for its own
 head (the same tree ran), a superseded one names the newer head that ran, never a pass of its own head.
+A joined run whose outcome is of another tree (the run it joined was superseded; ran_key) queues again.
 A run that has started is never stopped: only waiters look. A different tree, command, environment,
 purpose or repository is never a duplicate. A failed outcome is only passed to the runs that joined
 while it ran: a later request for the same key runs again (only passes are recorded and reused). When the followed run ends without an
@@ -217,10 +218,21 @@ def resolve(rid: str, recs: list[dict]) -> tuple[str, dict | None]:
 
 
 def finish(path: Path | None, *, passed: bool, head: str, rc: int, failed: str = "", timed_out: bool = False,
-           summary: str = "", log: str = "") -> None:
-    """Record this run's outcome for its followers (a run that ran its checks, or followed another)."""
+           summary: str = "", log: str = "", ran_key: str = "") -> None:
+    """Record this run's outcome for its followers (a run that ran its checks, or followed another;
+    `ran_key`: the key of the run that ran them, when not this run's own)."""
     update(path, outcome={"passed": bool(passed), "head": head, "rc": int(rc), "failed": failed,
-                          "timed_out": bool(timed_out), "summary": summary[-4000:], "log": log, "ts": time.time()})
+                          "timed_out": bool(timed_out), "summary": summary[-4000:], "log": log, "ts": time.time(),
+                          **({"key": ran_key} if ran_key else {})})
+
+
+def ran_key(rec: dict) -> str:
+    """The key of the checks whose outcome `rec` holds: the one recorded with it, else its own key (a
+    superseded run's without one is another tree's, never its own: "")."""
+    o = rec.get("outcome") or {}
+    if o.get("key"):
+        return str(o["key"])
+    return "" if rec.get("phase") == SUPERSEDED else str(rec.get("key") or "")
 
 
 def said(how: str, mine: str, leader: dict) -> str:

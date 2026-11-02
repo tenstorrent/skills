@@ -3449,6 +3449,7 @@ def _checks_follow(p: Project, run_dir: Path, out, head: str, me: Path | None, y
             pass
 
     line = checkjoin.said(how, head, lead)
+    mine = str((checkjoin.read(me) or {}).get("key") or "")
     checkjoin.update(me, phase=how, follows=lead.get("id"), since=start)
     tell(line)
     if foreground:
@@ -3466,6 +3467,12 @@ def _checks_follow(p: Project, run_dir: Path, out, head: str, me: Path | None, y
                 out.flush()
                 die(f"ttp checks: {said}", 1)
             got, rec = checkjoin.resolve(str(lead.get("id")), checkjoin.records(p.state))
+            if got == "done" and how == checkjoin.JOINED and checkjoin.ran_key(rec) != mine:
+                # The run joined was superseded on its own task's newer head: another tree ran, so these
+                # never take its verdict; they queue again and run (or join) their own.
+                tell(f"run {lead.get('run') or '?'} was superseded: its result is of another tree; queueing "
+                     f"again at the same place")
+                return None
             if got == "done":
                 return how, rec
             if got == "lost":
@@ -3493,12 +3500,11 @@ def _checks_report_joined(me: Path | None, run_dir: Path, out, joined: tuple, he
     how, lead = joined
     o = lead.get("outcome") or {}
     passed, ran = bool(o.get("passed")), str(o.get("head") or "")
-    if how == checkjoin.JOINED and lead.get("key") != (checkjoin.read(me) or {}).get("key"):
-        how = checkjoin.SUPERSEDED   # the run joined was itself superseded: another tree ran
     ran = head if how == checkjoin.JOINED else ran
     checkjoin.finish(me, passed=passed, head=ran, rc=int(o.get("rc") or (0 if passed else 1)),
                      failed=str(o.get("failed") or ""), timed_out=bool(o.get("timed_out")),
-                     summary=str(o.get("summary") or ""), log=str(o.get("log") or ""))
+                     summary=str(o.get("summary") or ""), log=str(o.get("log") or ""),
+                     ran_key=checkjoin.ran_key(lead))
     line = checkjoin.result_line(how, head, lead)
     write_json(run_dir / prguard.CHECKS_FILE, {"head": ran, "worktree": top, "passed": passed, "commands": todo,
                                                "skipped": skipped, "ts": time.time(), "purpose": purpose,

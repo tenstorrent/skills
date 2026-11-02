@@ -507,30 +507,39 @@ def test_a_waiting_full_checks_run_reads_pids_once_per_poll_cycle(env, tmp_path,
         holder.wait()
 
 
+@pytest.mark.parametrize("lead_first", [True, False])
 def test_a_run_that_joined_one_later_superseded_never_reports_the_newer_trees_pass_as_its_own(env, tmp_path,
-                                                                                            monkeypatch, capsys):
+                                                                                            monkeypatch, lead_first):
+    # The run joined (another task's waiter on the same tree) is superseded by its task's newer head and
+    # reports that head's pass (as its own _checks_report_joined does). Whichever the follower sees first,
+    # the intermediate's outcome or the newer head's, only another tree ran: it queues again and runs its own.
     from ttp import checkjoin
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     monkeypatch.setenv("TTP_TASK", "7")
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.02")
     newer = "b" * 40
     lead_proc = subprocess.Popen(["sleep", "300"])
+    ran = tmp_path / "ran"
     try:
         leads = _fake_lead(monkeypatch, tmp_path, lead_proc.pid, phase=checkjoin.WAITING)
-        ran = tmp_path / "ran"
         t, got = _main_in_thread(["checks", "--", "sh", "-c", f"touch {ran}"])
         assert _wait_for(lambda: checkjoin.JOINED in _join_phases(p), 30), _join_phases(p)
         lead = checkjoin.read(leads[0])
         top = checkjoin.register(p.state, task="8", head=newer, commit_ts=lead["commit_ts"] + 60, key="newer-key",
                                  group="g8", run="run-new", arrived=lead["arrived"], pid=lead_proc.pid)
         checkjoin.update(leads[0], phase=checkjoin.SUPERSEDED, follows=checkjoin.read(top)["id"])
-        checkjoin.finish(top, passed=True, head=newer, rc=0)
+        if lead_first:
+            checkjoin.finish(leads[0], passed=True, head=newer, rc=0)
+            checkjoin.finish(top, passed=True, head=newer, rc=0)
+        else:
+            checkjoin.finish(top, passed=True, head=newer, rc=0)
+            assert _wait_for(lambda: ran.exists() or not t.is_alive(), 30)
+            checkjoin.finish(leads[0], passed=True, head=newer, rc=0)
         t.join(60)
     finally:
         lead_proc.kill()
         lead_proc.wait()
     own = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-    assert got == [0] and not ran.exists()
+    assert got == [0] and ran.exists(), got
     res = json.loads((run / "checks.json").read_text())
-    assert res["head"] == newer != own and res["joined"]["how"] == "superseded", res
-    assert f"{own[:12]} itself was not checked" in capsys.readouterr().out
+    assert res["head"] == own and "joined" not in res, res   # its own checks ran: no other tree's verdict
