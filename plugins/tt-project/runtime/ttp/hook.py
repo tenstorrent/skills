@@ -1549,7 +1549,7 @@ def device_test_run(commands: str, cmd: str = "") -> tuple[str | None, str | Non
 # Claude Code's Bash sandbox (bwrap) binds each fenced path that exists when the command starts; one
 # that another command or a worktree removal deletes before bwrap mounts it fails the whole command
 # (measured: config.lock placeholders of concurrent sandboxes, removed `.git/worktrees/<name>` entries).
-MOUNT_RACE = re.compile(r"bwrap: Can't (?:get type of source path|find source path|bind mount) "
+MOUNT_RACE = re.compile(r"bwrap: Can't (?:get type of source(?: path)?|find source path|bind mount) "
                         r"[^\n]{0,600}?: No such file or directory")
 MOUNT_RACE_HINT = ("tt-project: transient sandbox mount race (a path the sandbox binds vanished while it "
                    "started), not a fault of your command: re-run the same command unchanged.")

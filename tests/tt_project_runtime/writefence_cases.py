@@ -221,6 +221,7 @@ RACE = ("bwrap: Can't get type of source path /r/.git/worktrees/tree/commondir: 
 
 @pytest.mark.parametrize("error,hinted", [
     (RACE, True), ("bwrap: Can't get type of source path /r/.git/config.lock: No such file or directory", True),
+    ("Exit code 1\nbwrap: Can't get type of source /r/.git/config.lock: No such file or directory", True),
     ("bwrap: Can't bind mount /oldroot/r/.git/worktrees/t1 on /newroot/r/.git/worktrees/t1: No such file or "
      "directory", True),
     ("Exit code 1\nls: cannot access 'x': No such file or directory", False),
@@ -270,18 +271,35 @@ def test_fence_grants_only_the_roots_it_is_given(monkeypatch, tmp_path):
 
 
 def test_audit_counts_claude_runs_that_hit_the_mount_race(env, tmp_path):
+    """Only a failing tool_result counts: a run that quotes the message (assistant text, a cat of a file,
+    the prompt) did not hit the race."""
     from ttp import audit
     p = make(env)
     now = time.time()
-    for i, (prov, text) in enumerate([("claude", '{"content":"' + RACE + '"}'), ("claude", '{"ok":1}'),
-                                      ("codex", RACE), ("claude", None)]):
+
+    def result(content, is_error):
+        return json.dumps({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t", "content": content, "is_error": is_error}]},
+            "tool_use_result": "Error: " + RACE})
+
+    real = "Exit code 1\nbwrap: Can't get type of source /r/.git/config.lock: No such file or directory"
+    outputs = [
+        ("claude", result(real, True)),
+        ("claude", "not json " + RACE + "\n" + result([{"type": "text", "text": RACE}], True)),
+        ("claude", json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": RACE}]}})),
+        ("claude", result("1  RACE = (\"" + RACE + "\")", False)),
+        ("claude", json.dumps({"type": "user", "message": {"content": "fix the metric: " + RACE}})),
+        ("claude", result("Exit code 1\nls: x: No such file or directory", True)),
+        ("codex", result(RACE, True)), ("claude", None)]
+    for i, (prov, text) in enumerate(outputs):
         d = tmp_path / f"r{i}"
         d.mkdir()
         if text is not None:
             (d / "output.jsonl").write_text(text + "\n")
         p.db.x("INSERT INTO runs(role,provider,started,ended,status,dir) VALUES(?,?,?,?,?,?)",
                ("worker", prov, now - 60, now - 30, "ok", str(d)))
+    ids = [r["id"] for r in p.db.q("SELECT id FROM runs ORDER BY id")]
     got = audit.mount_races(p.db, now - 3600)
-    assert (got["runs"], got["hit"]) == (3, 1)
-    assert any(ln.startswith("sandbox mount races: 1 of 3 Claude runs (33%)") for ln in audit.lines(p.db, now, p=p))
-    assert audit.report(p.db, now, p=p)["mount_races"]["hit"] == 1
+    assert (got["runs"], got["hit"], got["ids"]) == (7, 2, ids[:2])
+    assert any(ln.startswith("sandbox mount races: 2 of 7 Claude runs (29%)") for ln in audit.lines(p.db, now, p=p))
+    assert audit.report(p.db, now, p=p)["mount_races"]["hit"] == 2

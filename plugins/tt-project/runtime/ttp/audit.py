@@ -32,7 +32,8 @@ the project could have saved. Model-free; the review grades it.
   as 'confirmed by quiet' in the window;
 - over 7 days, each Restrictions item that only blocked work: blocked runs and asks citing it reached
   `review.rule_blocks_min` while no refused action cited it (restriction_audit.only_blocks_lines).
-- Claude runs whose output shows a Bash call failing on the sandbox's mount race (hook.MOUNT_RACE),
+- Claude runs in which a tool call failed on the sandbox's mount race (hook.MOUNT_RACE in an is_error
+  tool_result; text that only quotes it does not count),
   of all Claude runs ended in the window;
 - the check pre-stage derived from frequent detached checks failures (checkprestage): its last list
   and the failures it caught before detaching (each a worker wake saved).
@@ -113,20 +114,37 @@ def failed_runs(db: DB, since: float) -> list[dict]:
     return sorted([r for r in rows if budget.wasted(r)], key=lambda r: -float(r["cost_usd"] or 0))
 
 
+def _failed_tool_results(line: str):
+    """The text of each failing tool_result (is_error true) in one stream-json line of output.jsonl;
+    a line that is not such JSON yields nothing."""
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        return
+    content = (ev.get("message") or {}).get("content") if isinstance(ev, dict) else None
+    for b in content if isinstance(content, list) else ():
+        if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error") is True:
+            c = b.get("content")
+            if isinstance(c, list):
+                c = " ".join(str(x.get("text") or "") for x in c if isinstance(x, dict))
+            yield c if isinstance(c, str) else ""
+
+
 def mount_races(db: DB, since: float) -> dict:
-    """Claude runs ended since `since` whose output shows the Bash sandbox's mount race (hook.MOUNT_RACE):
-    how many runs, how many hit it and the share. A run folder gone or unreadable counts as no hit."""
+    """Claude runs ended since `since` in which a tool call failed on the Bash sandbox's mount race
+    (hook.MOUNT_RACE in an is_error tool_result, not text that only quotes it): how many runs, how many hit
+    it and the share. A run folder gone or unreadable counts as no hit."""
     from pathlib import Path
     from .hook import MOUNT_RACE
     rows = db.q("SELECT id, dir FROM runs WHERE provider='claude' AND ended>=? AND dir IS NOT NULL", (since,))
     hit = []
     for r in rows:
         try:
-            text = (Path(r["dir"]) / "output.jsonl").read_text(errors="replace")
+            with open(Path(r["dir"]) / "output.jsonl", errors="replace") as f:
+                if any(MOUNT_RACE.search(t) for ln in f if "is_error" in ln for t in _failed_tool_results(ln)):
+                    hit.append(int(r["id"]))
         except OSError:
             continue
-        if MOUNT_RACE.search(text):
-            hit.append(int(r["id"]))
     return {"runs": len(rows), "hit": len(hit), "share": len(hit) / len(rows) if rows else 0.0, "ids": hit}
 
 
