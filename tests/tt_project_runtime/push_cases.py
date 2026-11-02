@@ -2105,6 +2105,113 @@ def test_a_push_batch_counts_requeued_conflicts_and_not_rebase_stops(env, monkey
     assert m["conflicts"] == {"entries": 3, "conflicted": 1, "auto_resolved": 0, "by_hunks": 0, "sent_back": 0}
 
 
+def _landed_fixture(env, monkeypatch):
+    """The target has notes.txt; a first change A edits its line b and lands on the target in a
+    different form (as a batch settles it, or squashed): a branch that still carries A conflicts
+    with that landing if A is replayed again."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _commit(other, "notes.txt", "a\nb\nc\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    _git_out(repo, "checkout", "-q", "-B", "first", "origin/proj")
+    _commit(repo, "notes.txt", "a\nB1\nc\n")
+    a = _git_out(repo, "rev-parse", "HEAD")
+    return p, repo, origin, other, a
+
+
+def _land_as(other, files, message):
+    """Commit `files` on the target from the second clone with `message` and push it: its sha."""
+    _git_out(other, "pull", "-q", "--ff-only", "origin", "proj")
+    for path, text in files.items():
+        (other / path).write_text(text)
+        _git_out(other, "add", path)
+    _git_out(other, "commit", "-qm", message)
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    return _git_out(other, "rev-parse", "HEAD")
+
+
+def _on_top(repo, base, name, files):
+    """Branch `name` from `base` plus one commit writing `files`: its head."""
+    _git_out(repo, "checkout", "-q", "-B", name, base)
+    for path, text in files.items():
+        (repo / path).write_text(text)
+        _git_out(repo, "add", path)
+    _git_out(repo, "commit", "-qm", f"{name}: edit {', '.join(files)}")
+    return _git_out(repo, "rev-parse", "HEAD")
+
+
+def test_a_push_batch_drops_an_entry_commit_a_trailer_names_on_the_target_and_replays_the_rest(env, monkeypatch, capsys):
+    """An entry branch built on a change that has since landed in another form (named by a
+    Ttp-Replayed-From trailer) replays only its own commit: no conflict, so its approval stands."""
+    p, repo, origin, other, a = _landed_fixture(env, monkeypatch)
+    carrier = _land_as(other, {"notes.txt": "a\nB1 settled\nc\n"}, f"first, settled\n\nTtp-Replayed-From: {a}")
+    head = _on_top(repo, a, "e1", {"more.txt": "own\n"})
+    rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed"], m
+    pushed = _git_out(origin, "rev-parse", "proj")
+    assert _git_out(origin, "show", f"{pushed}:notes.txt") == "a\nB1 settled\nc", "the landing is kept"
+    assert _git_out(origin, "show", f"{pushed}:more.txt") == "own"
+    assert _git_out(origin, "rev-list", "--count", f"{carrier}..{pushed}") == "1", "only its own commit"
+    assert f"1 of its 2 commits are on {carrier[:10]} already ({a[:10]} as {carrier[:10]}); replaying the other 1" \
+        in capsys.readouterr().out
+
+
+
+def test_a_push_batch_drops_an_entry_commit_an_earlier_entry_of_the_batch_carries(env, monkeypatch):
+    """The landing that names the change is an earlier entry of the same batch (a follow-up that
+    carries it): the later entry replays only its own commit onto the batch head and both go."""
+    p, repo, origin, other, a = _landed_fixture(env, monkeypatch)
+    _git_out(repo, "checkout", "-q", "-B", "follow", "origin/proj")
+    (repo / "notes.txt").write_text("a\nB1 newer\nc\n")
+    _git_out(repo, "commit", "-qam", f"a follow-up carrying the first change\n\nTtp-Replayed-From: {a}")
+    follow = _git_out(repo, "rev-parse", "HEAD")
+    head = _on_top(repo, a, "e2", {"more.txt": "own\n"})
+    rc, m = _run_batch(p, _batch_marker(p, [follow, head]), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed", "pushed"], m
+    pushed = _git_out(origin, "rev-parse", "proj")
+    assert _git_out(origin, "show", f"{pushed}:notes.txt") == "a\nB1 newer\nc"
+    assert _git_out(origin, "show", f"{pushed}:more.txt") == "own"
+
+def test_a_push_batch_finds_an_entry_landed_by_patch_id_and_records_the_commit_that_carried_it(env, monkeypatch):
+    """Every commit of the entry is on the target as the same patch, under another message and with
+    no trailer, and the target moved on since: landed, naming the commit that carried it."""
+    p, repo, origin, other, a = _landed_fixture(env, monkeypatch)
+    carrier = _land_as(other, {"notes.txt": "a\nB1\nc\n"}, "the same change, landed elsewhere")
+    _land_as(other, {"later.txt": "x\n"}, "a later change")
+    rc, m = _run_batch(p, _batch_marker(p, [a]), monkeypatch)
+    assert rc == 0 and m["outcome"] == "landed" and _statuses(m) == ["landed"], m
+    assert m["results"][0]["sha"] == carrier, m["results"]
+
+
+def test_a_push_batch_records_an_entry_a_squash_carries_as_landed_by_that_squash(env, monkeypatch):
+    """All of an entry's commits ride in one squashed commit on the target that names each in a
+    trailer: the entry is landed by that commit, never a conflict, and ttp landed finds it."""
+    from ttp import landed
+    p, repo, origin, other, a = _landed_fixture(env, monkeypatch)
+    _git_out(repo, "checkout", "-q", "first")
+    _commit(repo, "more.txt", "own\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    squash = _land_as(other, {"notes.txt": "a\nB1 newer\nc\n", "more.txt": "own, newer\n"},
+                      f"a follow-up squashed\n\nTtp-Replayed-From: {a}\nTtp-Replayed-From: {head}")
+    _land_as(other, {"later.txt": "x\n"}, "a later change")
+    rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["landed"], m
+    assert m["results"][0]["sha"] == squash and not m["conflicts"]["conflicted"], m
+    _git_out(repo, "fetch", "-q", "origin")
+    assert landed.on_branch(repo, head, "origin/proj"), "ttp landed finds it by the trailers"
+
+
+def test_a_push_batch_still_sends_back_a_real_conflict_in_the_entry_own_commit(env, monkeypatch):
+    """Dropping the commit that landed elsewhere leaves the entry's own commit, which conflicts
+    with the target's own change: that is a real conflict, and the entry goes back."""
+    p, repo, origin, other, a = _landed_fixture(env, monkeypatch)
+    _land_as(other, {"notes.txt": "a\nB1 settled\nc\n"}, f"first, settled\n\nTtp-Replayed-From: {a}")
+    _land_as(other, {"notes.txt": "a\nB1 settled\nC theirs\n"}, "the target edits line c")
+    head = _on_top(repo, a, "e1", {"notes.txt": "a\nB1\nC mine\n"})
+    rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
+    assert _statuses(m) == ["conflict"], m
+    assert m["results"][0]["detail"]["files"] == ["notes.txt"], m["results"]
+
 def test_the_push_queue_counts_conflicts_and_those_its_batches_resolved(env):
     from ttp import pushq
     p, rid = _pq_rows(env)

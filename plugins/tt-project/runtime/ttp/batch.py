@@ -36,6 +36,7 @@ import fcntl
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -61,6 +62,11 @@ SETTLED_WORDS = {"version": "version lines", "added": "lines both sides added",
                  "hunks": "changes of different lines", "taken_in": "a change the other side holds"}
 MERGED_KINDS = {"added", "hunks"}   # settlements that keep both sides' changes: kept only when the checks pass
 REPLAYED = "Ttp-Replayed-From"     # trailer of a commit the batch settled: the entry commit it replays
+# sequence.editor of a rebase that leaves out an entry's commits already on the target (Batch._landed):
+# drops each todo `pick` whose commit one of the shas before the todo file's path starts with
+DROP_TODO = ("import sys\nf, drop = sys.argv[-1], sys.argv[1:-1]\nkeep = [ln for ln in open(f).readlines() "
+             "if not (ln.split()[:1] in (['pick'], ['p']) and len(ln.split()) > 1 and len(ln.split()[1]) >= 7 "
+             "and any(d.startswith(ln.split()[1]) for d in drop))]\nopen(f, 'w').writelines(keep)\n")
 RESCUES = 1                        # checks per batch of the entries after a blamed one, replayed without it
 NO_TESTS = 5                       # pytest's exit status when nothing was selected: a cap probe of a check without cap tests
 RERUN_S = 600.0                    # delivery.push_rerun_s: the time limit of one rerun of a failed check's failing tests
@@ -591,6 +597,18 @@ def settle(wt: Path, path: str, version_files: list[str], taken_in: bool = False
     return True
 
 
+def _patch_ids(repo: Path, revs: list[str]) -> dict[str, str]:
+    """{commit: its `git patch-id --stable`} for the non-merge commits `revs` names, in their order."""
+    try:
+        patches = _git(repo, "log", "-p", "--no-merges", "--no-color", "--no-ext-diff", "--format=commit %H",
+                       *revs, "--").stdout
+        out = subprocess.run(["git", "-C", str(repo), "patch-id", "--stable"], input=patches, text=True,
+                             capture_output=True, timeout=gitmemo.timeout(None, ("patch-id",))).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    return {c: pid for pid, c in (ln.split() for ln in out.splitlines() if len(ln.split()) == 2)}
+
+
 def _commit_replayed(wt: Path) -> None:
     """Commit the settled step of a stopped rebase in `wt` as the commit it replays, plus a trailer
     naming that commit. Settling changed its patch, so a later batch that gets the commit again (one
@@ -932,10 +950,11 @@ class Batch:
                 top = parent
             if i in self.held:   # its push needs a token scope the credential lacks (_hold_scoped)
                 continue
-            if top == base or self._on_tip(tip, base, top):
-                say(f"entry {e.get('id')} ({e.get('branch')}): already on {self.target}")
+            if top == base or (on := self._on_tip(tip, base, top)):
+                say(f"entry {e.get('id')} ({e.get('branch')}): already on {self.target}"
+                    + (f" (carried by {on[:10]})" if top != base and on != tip else ""))
                 self._set(i, "landed")
-                self.landed_at[i] = tip
+                self.landed_at[i] = tip if top == base else on
                 continue
             subjects = [s for s in _git(self.repo, "log", "--no-merges", "--reverse", "--format=%s",
                                         f"{base}..{top}").stdout.splitlines() if s.strip()]
@@ -957,7 +976,14 @@ class Batch:
                 self._set(i, "refused", message=push.excluded_refusal(bad, self.target))
                 continue
             self._settling = ([], set())
-            new, files = self._rebase(h, top)
+            own, gone = self._landed(h, base, top)
+            if gone:
+                left = len(own) - len(gone)
+                say(f"entry {e.get('id')} ({e.get('branch')}): {len(gone)} of its {len(own)} commits are on "
+                    f"{h[:10]} already (" + ", ".join(f"{c[:10]} as {v[:10]}" for c, v in list(gone.items())[:5])
+                    + (f", +{len(gone) - 5} more" if len(gone) > 5 else "")
+                    + (f"); replaying the other {left}" if left else ")"))
+            new, files = (h, None) if gone and len(gone) == len(own) else self._rebase(h, top, drop=set(gone))
             if files is None and self._settling[0]:
                 self.settled[i] = {"settled": sorted(set(self._settling[0])), "settled_by": sorted(self._settling[1])}
             if files is not None:
@@ -981,32 +1007,54 @@ class Batch:
                 h = new
         return carried
 
-    def _on_tip(self, tip: str, base: str, top: str) -> bool:
-        """Every commit of base..top is on `tip` already: as the same patch (git cherry), or replayed
-        there by a batch that settled its conflict (its REPLAYED trailer)."""
-        marks = [line.split() for line in _git(self.repo, "cherry", tip, top, base).stdout.splitlines()]
-        left = {m[1] for m in marks if len(m) == 2 and m[0] == "+"}
-        if not marks:
-            return False
-        if left:
-            log = _git(self.repo, "log", "--format=%B", f"{base}..{tip}").stdout
-            left -= set(re.findall(rf"^{REPLAYED}: ([0-9a-f]{{40,64}})[ \t]*$", log, re.M))
-        return not left
+    def _on_tip(self, tip: str, base: str, top: str) -> str:
+        """The commit on `tip` that carries the last of base..top's commits when every one is there
+        already (_landed), else ""."""
+        own, gone = self._landed(tip, base, top)
+        if not own or len(gone) < len(own):
+            return ""
+        order = _git(self.repo, "rev-list", f"{base}..{tip}").stdout.split()   # newest first
+        return min(gone.values(), key=lambda c: order.index(c) if c in order else len(order))
 
-    def _rebase(self, onto: str, top: str) -> tuple[str, list[str] | None]:
+    def _landed(self, onto: str, base: str, top: str) -> tuple[list[str], dict[str, str]]:
+        """The commits of base..top (merges aside), and those of them already on `onto`, each with
+        the commit there that carries it: one naming it in a REPLAYED trailer (a batch that settled
+        its replay, or a squash that carries several), else one with the same patch (`git patch-id
+        --stable`, as git cherry). Replaying such a commit again could only conflict with its own
+        landing. Oldest first; the first carrier found wins."""
+        own = _git(self.repo, "rev-list", "--reverse", "--no-merges", f"{base}..{top}").stdout.split()
+        if not own or base == onto:
+            return own, {}
+        gone: dict[str, str] = {}
+        log = _git(self.repo, "log", "--reverse", "--no-merges", "--format=%x00%H%n%B", f"{base}..{onto}").stdout
+        for chunk in log.split("\0")[1:]:
+            sha, _, body = chunk.partition("\n")
+            for c in re.findall(rf"^{REPLAYED}: ([0-9a-f]{{40,64}})[ \t]*$", body, re.M):
+                gone.setdefault(c, sha)
+        if rest := [c for c in own if c not in gone]:
+            mine = _patch_ids(self.repo, ["--no-walk=unsorted", *rest])
+            theirs = {pid: c for c, pid in reversed(_patch_ids(self.repo, ["--reverse", f"{base}..{onto}"]).items())}
+            for c in rest:
+                if mine.get(c) in theirs:
+                    gone[c] = theirs[mine[c]]
+        return own, {c: gone[c] for c in own if c in gone}
+
+    def _rebase(self, onto: str, top: str, drop: set | frozenset = frozenset()) -> tuple[str, list[str] | None]:
         """Rebase the entry's commits up to `top` onto `onto` in the worktree, settling conflicts that
         need no judgment (the push checks then run on the result, as on any other): (new head, None),
         or (onto, conflicted files) after aborting a real one. The files and kinds settled go to
         self._settling. An entry already on `onto` goes as it is, and one with merges keeps them
         (--rebase-merges): a plain rebase flattens a merge landing and rewrites its commits, so their
-        tags drop out."""
+        tags drop out. The commits in `drop` (on `onto` already: _landed) are left out of the replay."""
         wt = self.wt
         version_files = self.cfg["files"] if self.cfg else []
         if push.descends(wt, onto, top):
             self._checkout(top)
             return top, None
         merges = ["--rebase-merges"] if _git(wt, "rev-list", "--merges", "-1", top, f"^{onto}").stdout.strip() else []
-        r = _git(wt, "rebase", "--no-keep-empty", *merges, onto, top)
+        todo = ["-c", f"sequence.editor={shlex.quote(sys.executable)} -c {shlex.quote(DROP_TODO)} "
+                + " ".join(sorted(drop))] if drop else []
+        r = _git(wt, *todo, "rebase", *(["--interactive"] if drop else []), "--no-keep-empty", *merges, onto, top)
         for _ in range(10000):
             if r.returncode == 0:
                 return _git(wt, "rev-parse", "HEAD").stdout.strip(), None
