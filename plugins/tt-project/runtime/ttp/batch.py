@@ -49,7 +49,7 @@ import tokenize
 from collections import Counter, deque
 from pathlib import Path
 
-from . import (checkcap, checkdirs, conflictfix, cyclenotice, envfault, locks, push, pushpass, runner, scopehold,
+from . import (checkcap, checkdirs, cleantree, conflictfix, cyclenotice, envfault, locks, push, pushpass, runner, scopehold,
                scriptwatch, workerloss,
                sharedchecks, slowtests, suitecost, verdictcarry, worktree)
 from .project import Project, command_env, durable_write, write_json
@@ -248,6 +248,15 @@ def _remove_worktree(repo: Path, wt: Path) -> None:
     _git(repo, "worktree", "prune")
 
 
+def _remove_scratch(repo: Path, wt: Path) -> None:
+    """Remove an after_push checkout: a scratch clone (cleantree.clone), or a worktree an older version
+    registered in `repo`."""
+    if (wt / ".git").is_file():
+        _remove_worktree(repo, wt)
+    else:
+        shutil.rmtree(wt, ignore_errors=True)
+
+
 def _rebasing(wt: Path) -> bool:
     for name in ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD"):
         path = _git(wt, "rev-parse", "--git-path", name).stdout.strip()
@@ -264,7 +273,7 @@ def _sweep_after_push(p: Project, repo: Path) -> None:
         return
     for wt in dirs:
         if locks.any_free([_after_lock(p, wt.name[len(AFTER_PUSH):])]):
-            _remove_worktree(repo, wt)
+            _remove_scratch(repo, wt)
 
 
 # Conflicts that need no judgment ---------------------------------------------------------------------
@@ -2004,8 +2013,9 @@ def _seconds(v, default: float) -> float:
 
 
 def after_push(p: Project, marker: Path, m: dict) -> dict:
-    """Step 12: run `delivery.after_push` at the pushed commit, in a fresh detached worktree, under
-    `delivery.after_push_timeout_s`. Its output goes to the batch log."""
+    """Step 12: run `delivery.after_push` at the pushed commit, in a fresh detached scratch clone
+    (cleantree.clone: never a worktree in the shared .git, whose churn breaks sandboxes starting
+    meanwhile), under `delivery.after_push_timeout_s`. Its output goes to the batch log."""
     d = p.config().get("delivery") or {}
     sha = m.get("pushed_sha")
     if m.get("outcome") != "pushed" or not sha:
@@ -2023,27 +2033,28 @@ def after_push(p: Project, marker: Path, m: dict) -> dict:
     bid = str(m.get("id") or marker.stem)
     wt = p.worktrees / f"{AFTER_PUSH}{_safe(bid)}"
     started = time.time()
-    _remove_worktree(repo, wt)
-    wt.parent.mkdir(parents=True, exist_ok=True)
-    r = _git(repo, "worktree", "add", "-q", "--detach", str(wt), sha)
-    if r.returncode != 0:
-        say(f"after_push: cannot check out {sha[:10]}: {_last(r.stderr, 3)}")
-        return {"status": "failed", "exit": None, "cmd": "git worktree add", "started": started,
-                "ended": time.time(), "tail": _last(r.stderr)}
-    worktree.prepare(p, wt, repo)
-    tasks = []
-    for res in m.get("results") or []:
-        t = res.get("task")
-        if res.get("status") == "pushed" and t is not None and str(t) not in tasks:
-            tasks.append(str(t))
-    env = {**command_env(p), "TTP_PUSHED_SHA": sha, "TTP_PUSHED_VERSION": str(m.get("version") or ""),
-           "TTP_PUSH_TARGET": str(m.get("target") or ""), "TTP_PUSH_TASKS": ",".join(tasks),
-           "TTP_PUSH_BATCH" if m.get("kind") == "batch" else "TTP_PUSH_RECEIPT": str(marker)}
-    # Deploy commands have no check lifetime guard and use the supervisor's ordinary temp dir.
-    for key in ("TTP_CHECKS_TMP_FD", "TTP_CHECK_OUTPUT_DIR"):
-        env.pop(key, None)
+    _remove_scratch(repo, wt)
     out = {"status": "ok", "exit": 0, "started": started, "tail": ""}
-    try:
+    try:   # the scratch borrows the repository's objects: it goes as soon as this step ends
+        try:
+            wt.parent.mkdir(parents=True, exist_ok=True)
+            cleantree.clone(repo, wt, sha)
+        except (cleantree.Error, OSError, subprocess.SubprocessError) as e:
+            say(f"after_push: cannot check out {sha[:10]}: {_last(str(e), 3)}")
+            return {"status": "failed", "exit": None, "cmd": "git clone --shared", "started": started,
+                    "ended": time.time(), "tail": _last(str(e))}
+        worktree.prepare(p, wt, repo)
+        tasks = []
+        for res in m.get("results") or []:
+            t = res.get("task")
+            if res.get("status") == "pushed" and t is not None and str(t) not in tasks:
+                tasks.append(str(t))
+        env = {**command_env(p), "TTP_PUSHED_SHA": sha, "TTP_PUSHED_VERSION": str(m.get("version") or ""),
+               "TTP_PUSH_TARGET": str(m.get("target") or ""), "TTP_PUSH_TASKS": ",".join(tasks),
+               "TTP_PUSH_BATCH" if m.get("kind") == "batch" else "TTP_PUSH_RECEIPT": str(marker)}
+        # Deploy commands have no check lifetime guard and use the supervisor's ordinary temp dir.
+        for key in ("TTP_CHECKS_TMP_FD", "TTP_CHECK_OUTPUT_DIR"):
+            env.pop(key, None)
         for cmd in cmds:
             try:
                 why = push.skip_reason(wt, sha, cmd, str(m.get("tip") or ""))
@@ -2070,7 +2081,7 @@ def after_push(p: Project, marker: Path, m: dict) -> dict:
                 out.update(status="failed", exit=rc, cmd=cmd)
                 break
     finally:
-        _remove_worktree(repo, wt)
+        _remove_scratch(repo, wt)
     out["ended"] = time.time()
     if out["status"] == "ok":
         say("after_push: done")

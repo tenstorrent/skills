@@ -191,8 +191,9 @@ def _remove_tree(tree: str, top: str) -> int:
             return 0
     except OSError:
         return 0
+    worktrees = cleantree.legacy(d)
     shutil.rmtree(d, ignore_errors=True)
-    if top:
+    if top and worktrees:
         try:
             subprocess.run(["git", "-C", top, "worktree", "prune"], capture_output=True, timeout=120)
         except (OSError, subprocess.SubprocessError):

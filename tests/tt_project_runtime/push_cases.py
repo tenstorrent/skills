@@ -15501,3 +15501,118 @@ def test_the_stale_lock_reaper_never_reaps_a_live_detached_push(tmp_path, monkey
         assert json.loads(path.read_text())["pid"] == holder
     finally:
         os.kill(holder, signal.SIGKILL)   # the launcher's child: reaped by whoever adopted it
+
+
+def _scratch_git(path):
+    return lambda *a: subprocess.run(["git", "-C", str(path), *a], capture_output=True, text=True).stdout.strip()
+
+
+def test_a_clean_checkout_is_a_scratch_clone_that_adds_nothing_under_git_worktrees(env, tmp_path, monkeypatch):
+    """A worktree added or removed in the shared .git/worktrees while a sandbox starts makes it fail to
+    mount (docs/providers.md), so the clean checkout is a scratch clone that borrows the repository's
+    objects. It still has its refs (heads, origin/*, tags), config, hooks and info/exclude, fetches
+    from origin, and leaves nothing behind in the repository: on success, a failed step or an interrupt."""
+    import shutil
+    from ttp import cleantree
+    p, repo, run, git, tmp = _clean_repo(env, tmp_path, monkeypatch)
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    for args in (("remote", "add", "origin", str(origin)), ("push", "-q", "origin", "HEAD:refs/heads/main"),
+                 ("fetch", "-q", "origin"), ("tag", "v1"), ("config", "ttp.probe", "yes")):
+        subprocess.run([*git, *args], check=True)
+    dotgit = repo / ".git"
+    (dotgit / "info" / "exclude").write_text("scratch-only/\n")
+    hook = dotgit / "hooks" / "post-checkout"
+    hook.write_text("#!/bin/sh\ntouch ran-hook\n")
+    hook.chmod(0o755)
+    snapshot = lambda: sorted((str(x.relative_to(dotgit)), x.stat().st_mtime_ns) for x in dotgit.rglob("*"))  # noqa: E731
+    before = snapshot()
+    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    with cleantree.Checkout(repo, head) as c:
+        g = _scratch_git(c.path)
+        assert not (dotgit / "worktrees").exists() and not str(c.path).startswith(str(dotgit))
+        assert g("rev-parse", "--git-common-dir") == ".git" and (c.path / ".git").is_dir()
+        assert (c.path / ".git" / "objects" / "info" / "alternates").read_text().strip() == str((dotgit / "objects").resolve())
+        assert g("rev-parse", "HEAD") == g("rev-parse", "origin/main") == g("rev-parse", "v1^{commit}") == head
+        assert g("rev-parse", "--abbrev-ref", "HEAD") == "HEAD", "detached, as `git worktree add --detach`"
+        assert g("config", "ttp.probe") == "yes" and g("config", "remote.origin.url") == str(origin)
+        assert g("config", "core.hooksPath") == str((dotgit / "hooks").resolve())
+        assert not (c.path / "ran-hook").exists(), "ttp checks' checkout runs no hook"
+        assert g("check-ignore", "scratch-only/x") == "scratch-only/x" and g("status", "--porcelain") == ""
+        assert subprocess.run(["git", "-C", str(c.path), "fetch", "-q", "origin"]).returncode == 0
+        assert g("count-objects").startswith("0 objects"), "it copies no object"
+    assert not c.dir.exists() and snapshot() == before, "the repository's .git is untouched"
+    _no_checkouts(repo, tmp)
+    dest = tmp / "scratch"   # after_push's: its post-checkout hook runs, as `git worktree add` runs it
+    cleantree.clone(repo, dest, head)
+    assert (dest / "ran-hook").exists() and _scratch_git(dest)("status", "--porcelain") == "?? ran-hook"
+    shutil.rmtree(dest)
+    with pytest.raises(cleantree.Error, match="cannot make a clean checkout of nosuch"):
+        cleantree.Checkout(repo, "nosuch")
+    _no_checkouts(repo, tmp)
+    real = cleantree._plain
+    for fault in (KeyboardInterrupt, OSError):   # a Ctrl-C or a full disk mid-checkout
+        def cut(cwd, *a, fault=fault):
+            if "checkout" in a:
+                raise fault
+            return real(cwd, *a)
+        monkeypatch.setattr(cleantree, "_plain", cut)
+        with pytest.raises(fault):
+            cleantree.Checkout(repo, head)
+        _no_checkouts(repo, tmp)
+    monkeypatch.setattr(cleantree, "_plain", real)
+    # A checkout an older version made (a registered worktree) is still swept, with its record.
+    old = tmp / "ttp-checks-1-legacy"
+    old.mkdir()
+    subprocess.run([*git, "worktree", "add", "-q", "--detach", str(old / "tree"), head], check=True)
+    (old / cleantree.LOCK).write_text("")
+    assert cleantree.prune(repo) == [old] and not old.exists()
+    _no_checkouts(repo, tmp)
+
+
+def test_after_push_runs_in_a_scratch_clone_with_the_repos_refs_hooks_and_links_and_always_removes_it(env, monkeypatch):
+    """after_push's checkout of the pushed commit is a scratch clone, never a worktree in the shared
+    .git: its commands see the repository's refs and origin, its hook ran and the .venv is linked;
+    it is gone when the step ends, fails or is interrupted, and an older version's worktree is swept."""
+    from ttp import batch, cleantree
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    common = Path(_git_out(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    seen, hooked = env["tmp"] / "seen.txt", env["tmp"] / "hook.txt"
+    hook = common / "hooks" / "post-checkout"
+    hook.write_text(f"#!/bin/sh\npwd >> {hooked}\n")
+    hook.chmod(0o755)
+    (repo / ".venv").mkdir()
+    with open(common / "info" / "exclude", "a") as f:
+        f.write(".venv/\n")
+    p.set_config("delivery.after_push", [
+        f"(echo common $(git rev-parse --git-common-dir); echo origin $(git rev-parse origin/proj);"
+        f" echo repo $(git -C {repo} rev-parse origin/proj); ls {common}/worktrees 2>/dev/null | sed 's/^/wt /';"
+        f" git fetch -q origin && echo fetched; test -L .venv && echo venv;"
+        f" echo dirty $(git status --porcelain | wc -l)) > {seen}"])
+    marker = _batch_marker(p, [_entry(repo, "e1", {"f1.txt": "1\n"})])
+    rc, m = _run_batch(p, marker, monkeypatch)
+    assert rc == 0 and m["after_push"]["status"] == "ok", m
+    lines, sha = seen.read_text().splitlines(), m["pushed_sha"]
+    for want in ("common .git", f"origin {sha}", f"repo {sha}", "fetched", "venv", "dirty 0"):
+        assert want in lines, (want, lines)
+    assert not [x for x in lines if x.startswith("wt after_push")], lines
+    assert str(p.worktrees / "after_push-b1") in hooked.read_text().split(), "its post-checkout hook ran"
+    assert not (p.worktrees / "after_push-b1").exists()
+
+    def boom(*a, **k):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(batch, "_stream", boom)
+    with pytest.raises(KeyboardInterrupt):
+        batch.after_push(p, marker, {**m, "id": "b9"})
+    assert not (p.worktrees / "after_push-b9").exists()
+    real = cleantree._plain
+    monkeypatch.setattr(cleantree, "_plain", lambda cwd, *a: subprocess.CompletedProcess(a, 1, "", "no room")
+                        if "checkout" in a else real(cwd, *a))
+    r = batch.after_push(p, marker, {**m, "id": "b8"})
+    assert (r["status"], r["cmd"]) == ("failed", "git clone --shared") and "no room" in r["tail"], r
+    assert not (p.worktrees / "after_push-b8").exists()
+    old = p.worktrees / "after_push-b7"
+    _git_out(repo, "worktree", "add", "-q", "--detach", str(old), sha)
+    batch._sweep_after_push(p, repo)
+    assert not old.exists() and "after_push-b7" not in _git_out(repo, "worktree", "list")
+    assert not [x for x in os.listdir(common / "worktrees") if x.startswith("after_push")]

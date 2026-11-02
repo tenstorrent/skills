@@ -1,5 +1,5 @@
-"""Clean checkouts for `ttp checks`: its local checks run in a fresh detached worktree of the commit
-whose tree the pass is recorded for (`git worktree add --detach`, in the system's temporary folder),
+"""Clean checkouts for `ttp checks`: its local checks run in a fresh detached checkout of the commit
+whose tree the pass is recorded for (a scratch clone, `clone`, in the system's temporary folder),
 never in the authoring worktree, so a file that exists only on disk there (ignored, untracked, or an
 uncommitted edit) cannot make a check pass. `ttp push`, `ttp land` and the push queue already run
 their checks in scratch worktrees of the exact commit they push; remote checks copy that commit with
@@ -67,27 +67,17 @@ class Checkout:
         self._lock = open(self.dir / LOCK, "w")
         fcntl.flock(self._lock, fcntl.LOCK_EX)
         try:
-            r = _git(self.top, "worktree", "add", "-q", "--detach", str(self.path), head)
-            if r.returncode:
-                raise Error(f"cannot make a clean checkout of {head[:12]}: {_last(r.stderr)}")
+            clone(self.top, self.path, head, hooks=False)
             submodules(self.top, self.path)
         except BaseException:
             self.close()
             raise
 
     def close(self) -> None:
-        """Remove the checkout and its worktree record; safe to call twice."""
+        """Remove the checkout; safe to call twice."""
         if self._lock is None:
             return
-        try:
-            _git(self.top, "worktree", "remove", "--force", "--force", str(self.path), timeout=120)
-        except (OSError, subprocess.SubprocessError):
-            pass
         shutil.rmtree(self.dir, ignore_errors=True)
-        try:
-            _git(self.top, "worktree", "prune", timeout=120)
-        except (OSError, subprocess.SubprocessError):
-            pass
         self._lock.close()
         self._lock = None
 
@@ -100,9 +90,9 @@ class Checkout:
 
 def prune(top: str | Path | None = None, base: str | Path | None = None, grace_s: float = 600) -> list[Path]:
     """Remove the clean checkouts a dead run left (their lock is free; one with no lock file only once
-    older than `grace_s`, as a run may be just making it), then git's records of worktrees whose folder
-    is gone in `top`. Returns the folders removed."""
-    gone = []
+    older than `grace_s`, as a run may be just making it), then, when one was a worktree an older
+    version made, git's records of worktrees whose folder is gone in `top`. Returns the folders removed."""
+    gone, worktrees = [], False
     for d in Path(base or tempfile.gettempdir()).glob(PREFIX + "*"):
         try:
             if not d.is_dir() or d.is_symlink() or d.stat().st_uid != os.getuid():
@@ -117,16 +107,74 @@ def prune(top: str | Path | None = None, base: str | Path | None = None, grace_s
                         fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     except OSError:
                         continue   # in use
+            worktrees |= legacy(d)
             shutil.rmtree(d, ignore_errors=True)
             gone.append(d)
         except OSError:
             continue
-    if top and gone:
+    if top and worktrees:
         try:
             _git(top, "worktree", "prune", timeout=120)
         except (OSError, subprocess.SubprocessError):
             pass
     return gone
+
+
+def legacy(d: Path) -> bool:
+    """Whether checkout folder `d` holds a registered worktree (made before checkouts were clones)."""
+    return (Path(d) / "tree" / ".git").is_file()
+
+
+_PER_WORKTREE = ("refs/bisect/", "refs/worktree/", "refs/rewritten/")
+
+
+def _plain(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+    """git as a check run in the checkout would call it (no hook or submodule override)."""
+    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True,
+                          timeout=gitmemo.timeout(600, args))
+
+
+def clone(top: str | Path, path: str | Path, head: str, hooks: bool = True) -> None:
+    """Make `path` a detached checkout of `head` of the repository at `top` that adds nothing under
+    its .git/worktrees: a sandbox that starts while a worktree there is added or removed fails to mount
+    it (docs/providers.md). Like `git clone --shared` it borrows `top`'s objects (alternates) and
+    copies none; it holds `top`'s refs as they are (heads, origin/*, tags) and reads `top`'s config
+    (an include, so origin and its fetches work), hooks, info/exclude, info/attributes and LFS store,
+    as a worktree of `top` would. It needs `top`'s objects: remove the folder as soon as its step
+    ends; nothing of it is left in `top`. `hooks`: whether the checkout runs a post-checkout hook, as
+    `git worktree add` does. Raises Error."""
+    top, path = Path(top), Path(path)
+    fail = lambda what, r: Error(f"cannot make a clean checkout of {head[:12]}: {what}: {_last(r.stderr)}")  # noqa: E731
+    r = _plain(top, "rev-parse", "--git-common-dir")
+    sha = _plain(top, "rev-parse", "--verify", "-q", f"{head}^{{commit}}")
+    if r.returncode or sha.returncode:
+        raise fail("git rev-parse", r if r.returncode else sha)
+    common, sha = (top / r.stdout.strip()).resolve(), sha.stdout.strip()
+    fmt = _plain(top, "rev-parse", "--show-object-format").stdout.strip()
+    r = _plain(top, "init", "-q", *([f"--object-format={fmt}"] if fmt and fmt != "sha1" else []), str(path))
+    if r.returncode:
+        raise fail("git init", r)
+    gitdir = path / ".git"
+    (gitdir / "objects" / "info" / "alternates").write_text(f"{common / 'objects'}\n")
+    sets = [("include.path", str(common / "config"))]
+    for key, val in (("core.hooksPath", common / "hooks"), ("lfs.storage", common / "lfs")):
+        if not _plain(top, "config", "--get", key).stdout.strip():
+            sets.append((key, str(val)))
+    for key, val in sets:
+        if (r := _plain(path, "config", "--add", key, val)).returncode:
+            raise fail("git config", r)
+    (gitdir / "info").mkdir(exist_ok=True)
+    for name in ("exclude", "attributes"):
+        if (common / "info" / name).is_file():
+            shutil.copyfile(common / "info" / name, gitdir / "info" / name)
+    r = _plain(top, "for-each-ref", "--format=%(objectname) %(refname)")
+    if r.returncode:
+        raise fail("git for-each-ref", r)
+    refs = [ln for ln in r.stdout.splitlines() if ln and not ln.partition(" ")[2].startswith(_PER_WORKTREE)]
+    (gitdir / "packed-refs").write_text("".join(f"{ln}\n" for ln in refs))
+    r = _plain(path, *([] if hooks else ["-c", "core.hooksPath=/dev/null"]), "checkout", "-q", "--detach", sha)
+    if r.returncode:
+        raise fail("git checkout", r)
 
 
 def submodules(src: Path, dst: Path) -> None:

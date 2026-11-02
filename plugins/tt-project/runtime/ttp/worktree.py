@@ -756,8 +756,9 @@ def _ignores(repo: Path, rel: str) -> bool:
 def prepare(p: Project, path: str | Path, root: str | Path | None = None) -> list[str]:
     """Set up a worktree of the project's repository the same way whatever made it: a code or fix
     task's (ensure), one a reviewer works in or made itself, the push queue's and after_push's
-    checkouts. Today that is link_paths from the main checkout `root` (the project root by default).
-    Nothing happens for the main checkout itself or a worktree of another repository. Returns the
+    checkouts, and a scratch clone that borrows its objects (`ttp checks`' and after_push's). Today
+    that is link_paths from the main checkout `root` (the project root by default). Nothing happens
+    for the main checkout itself or a worktree of another repository. Returns the
     entries linked; failures are skipped."""
     root = Path(root or p.root)
     try:
@@ -766,11 +767,24 @@ def prepare(p: Project, path: str | Path, root: str | Path | None = None) -> lis
         if top.resolve() == root.resolve():
             return []
         common = lambda d: (Path(d) / _git(d, "rev-parse", "--git-common-dir")).resolve()   # noqa: E731
-        if common(top) != common(root):
+        mine, theirs = common(top), common(root)
+        if mine != theirs and not borrows(mine, theirs):
             return []
     except (OSError, RuntimeError, subprocess.SubprocessError):
         return []
     return link_paths(p, top, root)
+
+
+def borrows(gitdir: Path, common: Path) -> bool:
+    """Whether the repository at `gitdir` borrows the objects of the one at `common` (a scratch clone,
+    cleantree.clone, made in place of a worktree)."""
+    objects = Path(gitdir) / "objects"
+    try:
+        lines = (objects / "info" / "alternates").read_text().splitlines()
+    except OSError:
+        return False
+    want = (Path(common) / "objects").resolve()
+    return any(ln.strip() and not ln.startswith("#") and (objects / ln.strip()).resolve() == want for ln in lines)
 
 
 def link_paths(p: Project, path: Path, root: str | Path | None = None) -> list[str]:
