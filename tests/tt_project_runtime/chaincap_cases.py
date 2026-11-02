@@ -505,3 +505,113 @@ def test_a_continue_over_a_soft_cap_with_a_reason_passes_in_the_same_action_and_
     ids = _chain(p, 2)
     (hops,) = coord.apply(p, [dict(act, title="continue: linker", continues=ids[-1], reason=why)])
     assert "chains.max_hops is hard" in hops, hops
+
+
+def _harness_done(env, p, title, fup, metrics=None):
+    """A harness task that handed off done with the one follow-up `fup` (and `metrics`: its progress)."""
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    tid = p.db.add_task(title, f"spec of {title}", kind="harness", tier="deep", origin="coordinator")
+    p.db.update_task(tid, status="running")
+    run_dir = env["tmp"] / f"run-{tid}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": f"{title}: checked",
+                                                     "metrics": metrics or {"checked": 3}, "followups": [fup]}))
+    Daemon(p.base)._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir)
+    return tid
+
+
+def test_a_harness_parents_continue_hop_that_publishes_a_code_branch_runs_as_code_onto_it(env, monkeypatch):
+    """A `continue:` follow-up of a harness task whose spec publishes a code task's branch (`pr_branch:`)
+    is queued as kind code with that pr_branch and continues:<the branch's owner>, not the parent's kind
+    and tier, and `ttp push --own` accepts it; its lineage stays the harness parent's."""
+    from ttp import chaincap, push
+    from ttp.db import continues_id
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    owner = p.db.add_task("Widget feature", "s", kind="code", origin="coordinator")
+    branch = f"ttp/t{owner}-widget-feature"
+    p.db.update_task(owner, status="done", branch=branch)
+    _git_out(repo, "branch", branch)
+    spec = f"Publish the reviewed head onto the PR.\npr_branch: {branch}\nThen update the PR description."
+    parent = _harness_done(env, p, "Check the widget PR", {"title": "continue: publish the widget PR head",
+                                                            "spec": spec})
+    (hop,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (parent,))
+    labels = json.loads(hop["labels"])
+    assert hop["kind"] == "code" and hop["status"] == "queued" and f"pr_branch:{branch}" in labels
+    assert continues_id(hop) == owner and f"{chaincap.FOLLOWS}{parent}" in labels
+    assert (hop["tier"], hop["tier_source"]) == ("standard", "default"), "the harness parent's deep tier was copied"
+    assert [t["id"] for t in chaincap.chain(p.db, hop["id"])] == [parent, hop["id"]]
+    _git_out(repo, "checkout", "-q", branch)
+    monkeypatch.setenv("TTP_TASK", str(hop["id"]))
+    assert push.own_target(p, repo) == ("origin", branch)
+    assert push._carries(p, str(hop["id"]), str(owner), branch)
+    # A `ttp push --own` step onto the code task's branch it names (no pr_branch: line) is the same.
+    fup = {"title": "continue: push the widget head", "spec": f"Run `ttp push --own --detach` from {branch}."}
+    parent2 = _harness_done(env, p, "Recheck the widget PR", fup)
+    (hop2,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (parent2,))
+    assert hop2["kind"] == "code" and f"pr_branch:{branch}" in json.loads(hop2["labels"]) and continues_id(hop2) == owner
+
+
+def test_a_publish_hop_whose_branch_owner_is_ambiguous_is_refused_and_stays_pending(env):
+    """Two code lineages carry the branch: the hop is not queued; the coordinator's done event names the
+    kind mismatch and keeps the follow-up pending. task_add (coordinator or CLI) refuses it the same way."""
+    from ttp import coordinator as coord
+    p = make(env)
+    for title in ("Shared feature, part a", "Shared feature, part b"):
+        t = p.db.add_task(title, "s", kind="code", origin="coordinator", labels=["pr_branch:feature/shared"])
+        p.db.update_task(t, status="done")
+    spec = "Publish the reviewed head.\npr_branch: feature/shared"
+    parent = _harness_done(env, p, "Check the shared PR", {"title": "continue: publish the shared head", "spec": spec})
+    assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (parent,))
+    done = p.db.one("SELECT * FROM events WHERE task=? AND kind='task_done'", (parent,))
+    want = "kind harness cannot publish branch feature/shared (pr_branch:): code tasks"
+    assert done["status"] == "queued" and want in done["text"] and "add it as kind code with continues:" in done["text"]
+    fp = p.db.one("SELECT * FROM events WHERE task=? AND kind='followup_proposed'", (parent,))
+    assert fp and fp["status"] == "queued" and "continue: publish the shared head" in fp["text"]
+    (problem,) = coord.apply(p, [{"type": "task_add", "title": "Publish the shared head", "spec": spec,
+                                  "kind": "harness"}])
+    assert want in problem
+    # A ttp/t<id> branch of no code task is refused too: nothing is guessed.
+    (problem,) = coord.apply(p, [{"type": "task_add", "title": "Publish a lost head", "kind": "plan",
+                                  "spec": "pr_branch: ttp/t9999-lost-head"}])
+    assert "kind plan cannot publish branch ttp/t9999-lost-head (pr_branch:): no task #9999 owns it" in problem
+
+
+def test_follow_ups_without_branch_delivery_keep_their_kind_and_a_code_parents_hop_is_unchanged(env):
+    """A harness follow-up with no pr_branch: line or publish step stays harness at its parent's tier; a
+    code parent's hop is queued as before (kind code, its tier, continues the parent)."""
+    from ttp.db import continues_id
+    p = make(env)
+    parent = _harness_done(env, p, "Audit the queue", {"title": "continue: audit the queue",
+                                                       "spec": "Read the next 50 events and fix what is wrong."})
+    (hop,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (parent,))
+    assert (hop["kind"], hop["tier"], hop["tier_source"]) == ("harness", "deep", "parent_copy")
+    assert "pr_branch" not in hop["labels"] and continues_id(hop) is None
+    root, branch, done, reviews = _finish_code(env, p, "feature", {"a.py": 10}, result=_cont("feature"))
+    (hop,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
+    assert (hop["kind"], hop["tier"], hop["tier_source"]) == ("code", "standard", "parent_copy")
+    assert continues_id(hop) == root and "pr_branch" not in hop["labels"]
+
+
+def test_a_queued_non_code_task_with_a_pr_branch_line_is_corrected_or_blocked_before_dispatch(env):
+    """The model-free check before dispatch: a harness task whose spec gained a pr_branch: line runs as
+    kind code with continues:<owner>; one whose owner is ambiguous is blocked with the mismatch, unstarted."""
+    from ttp.daemon import Daemon
+    from ttp.db import continues_id
+    p = make(env)
+    owner = p.db.add_task("Gadget feature", "s", kind="code", origin="coordinator")
+    p.db.update_task(owner, status="done", branch=f"ttp/t{owner}-gadget-feature")
+    ok = p.db.add_task("Publish gadget", f"pr_branch: ttp/t{owner}-gadget-feature", kind="harness",
+                       tier="deep", tier_source="parent_copy", origin="coordinator")
+    bad = p.db.add_task("Publish lost", "pr_branch: ttp/t9999-lost", kind="work", origin="coordinator")
+    plain = p.db.add_task("Plain harness", "Fix the digest.", kind="harness", origin="coordinator")
+    d = Daemon(p.base)
+    assert d._publish_kind(p.db.task(plain))["kind"] == "harness"
+    t = d._publish_kind(p.db.task(ok))
+    assert t["kind"] == "code" and continues_id(t) == owner and (t["tier"], t["tier_source"]) == ("standard", "default")
+    assert f"pr_branch:ttp/t{owner}-gadget-feature" in json.loads(t["labels"])
+    assert d._publish_kind(p.db.task(bad)) is None
+    row = p.db.task(bad)
+    assert row["status"] == "blocked" and "kind work cannot publish branch ttp/t9999-lost" in row["blocked_reason"]
+    assert not row["attempts"]
+    assert p.db.one("SELECT status FROM events WHERE task=? AND kind='task_blocked'", (bad,))["status"] == "queued"

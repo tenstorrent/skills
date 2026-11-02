@@ -70,6 +70,7 @@ from . import deadwait
 from . import downwait
 from . import cachettl
 from . import chaincap
+from . import publishkind
 from . import chatbridge
 from . import route
 from . import checkcap
@@ -4825,7 +4826,8 @@ class Daemon:
         # coordinator, or its commits would never be reviewed or delivered.
         changes = bool(ready) and not fix and not split and task["kind"] == "code" and self._has_changes(task)
         landed_now = changes and bool(db.one("SELECT 1 FROM task_superseded WHERE task=?", (task["id"],)))
-        hop = self._auto_continue(db.task(task["id"]) or dict(task, **upd), fups, ready) \
+        refused: list[str] = []
+        hop = self._auto_continue(db.task(task["id"]) or dict(task, **upd), fups, ready, refused) \
             if ready and not fix and (review or split or not changes or landed_now) else None
         if hop:
             folded.add(id(fups[0]))
@@ -4835,8 +4837,10 @@ class Daemon:
             # A post-landing live step (a deploy, install or rollout) is no hop: it is proposed as deploy tasks.
             deploys = [d for f in fups if chaincap.CONT_TITLE.match(str(f["title"]))
                        and (d := chaincap.deploy_proposal(f, task["id"]))]
+            mismatch = next((x for x in refused if publishkind.MISMATCH in x), "")
             text += f"\nContinue follow-up {UNQUEUED_TAG}: " + (
-                deploys[0] + "." if deploys else f"add it with continues #{task['id']} or drop it.")
+                deploys[0] + "." if deploys else f"{mismatch}." if mismatch else
+                f"add it with continues #{task['id']} or drop it.")
         elif split:
             text += (f"\nNo continue hop finishes its split head: add one with continues #{task['id']} (it builds "
                      f"on this branch), or a review of it if the work is complete.")
@@ -7194,6 +7198,8 @@ class Daemon:
             if holds and self._setting_hold(task, holds, now):
                 fate[task["id"]] = "hold"
                 continue
+            if task["kind"] not in publishkind.SKIP and not (task := self._publish_kind(task)):
+                continue   # refused: no run is spent finding out it may not publish
             # No run starts without a dollar cap: an unbudgeted run would get no --max-budget-usd and
             # commit nothing toward the dollar caps, so one tick could start several past them. The
             # cap counts from what the task already spent, so an older unbudgeted task is not stopped.
@@ -12588,10 +12594,46 @@ class Daemon:
             and not fups[0].get("start_when") and bool(chaincap.CONT_TITLE.match(str(fups[0].get("title") or ""))) \
             and not chaincap.post_landing(fups[0], task["id"])
 
-    def _auto_continue(self, task: dict, fups: list[dict], why: str) -> tuple[int, str] | None:
-        """chaincap.auto_hop for a task _continue_ready passed; None when it cannot be queued."""
+    def _publish_kind(self, task: dict) -> dict | None:
+        """A queued task of a kind that may not publish whose spec publishes a code task's branch
+        (publishkind.resolve, e.g. after a task_update changed its spec): the row corrected to kind code
+        with that pr_branch and its owner's continues: link, or None once it was blocked with the
+        mismatch; else `task` as it is."""
+        db = self.p.db
         try:
-            return chaincap.auto_hop(self.p, self.cfg, task, fups[0], why)
+            prev = chaincap.prev_of(task)
+            pub = publishkind.resolve(db, task["kind"], task["spec"] or "", db.task(prev) if prev else None)
+        except ValueError as e:
+            why = str(e)[:500]
+            db.update_task(task["id"], status="blocked", blocked_reason=why)
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (time.time(), f"task:{task['id']}", "task_blocked", "normal", f"#{task['id']} {task['title']}: {why}",
+                  "queued", task["id"]))
+            log(self.p, f"task {task['id']}: not started: {why}")
+            return None
+        except Exception:
+            log(self.p, f"task {task['id']}: publish kind check: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            return task
+        if not pub:
+            return task
+        try:
+            labels = json.loads(task["labels"] or "[]")
+        except ValueError:
+            labels = []
+        # A tier copied from a parent of another kind is no code task's: the default, as task_add gives it.
+        tier = {"tier": "standard", "assigned_tier": "standard", "tier_source": "default"} \
+            if task["tier_source"] == "parent_copy" else {}
+        db.update_task(task["id"], kind="code", **tier,
+                       labels=publishkind.labels(labels if isinstance(labels, list) else [], pub))
+        log(self.p, f"task {task['id']}: {publishkind.note(task['id'], task['kind'], pub)}")
+        return db.task(task["id"])
+
+    def _auto_continue(self, task: dict, fups: list[dict], why: str,
+                       refused: list | None = None) -> tuple[int, str] | None:
+        """chaincap.auto_hop for a task _continue_ready passed; None when it cannot be queued (task_add's
+        refusals then go into `refused`)."""
+        try:
+            return chaincap.auto_hop(self.p, self.cfg, task, fups[0], why, refused)
         except Exception:
             log(self.p, f"continue hop after #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
             return None

@@ -126,8 +126,10 @@ def follows_id(task: dict) -> int | None:
 
 
 def prev_of(task: dict) -> int | None:
-    """The task `task` continues: its `continues:` or FOLLOWS label, or the parent of a `continue:` follow-up."""
-    if (c := continues_id(task)) is not None or (c := follows_id(task)) is not None:
+    """The task `task` continues: its FOLLOWS or `continues:` label, or the parent of a `continue:` follow-up.
+    FOLLOWS first: a follow-up that publishes another code task's branch also continues that task
+    (publishkind), but its lineage is the task it follows."""
+    if (c := follows_id(task)) is not None or (c := continues_id(task)) is not None:
         return c
     if task.get("parent") and CONT_TITLE.match(task.get("title") or ""):
         return int(task["parent"])
@@ -475,11 +477,12 @@ def hop_spec(p, task: dict, fup: dict) -> str:
     return spec
 
 
-def auto_hop(p, cfg: dict, task: dict, fup: dict, why: str | None = None) -> tuple[int, str] | None:
+def auto_hop(p, cfg: dict, task: dict, fup: dict, why: str | None = None,
+             refused: list | None = None) -> tuple[int, str] | None:
     """Queue `fup` when hop_ready (`why`, when the caller checked it already): (new task id, why it
-    progressed), else None. The hop of a split task (split_head) takes its branch over and starts at
+    progressed), else None (task_add's refusals then go into `refused`). The hop of a split task (split_head) takes its branch over and starts at
     once; it never waits on that task's landing, which comes only with the hop's own work."""
-    from . import coordinator as coord
+    from . import coordinator as coord, publishkind
     db = p.db
     why = hop_ready(p, cfg, task, fup) if why is None else why
     if not why:
@@ -490,6 +493,14 @@ def auto_hop(p, cfg: dict, task: dict, fup: dict, why: str | None = None) -> tup
     action = {"type": "task_add", "title": title, "spec": spec, "kind": task["kind"],
               "tier": hop_tier(task, fup), "priority": task["priority"], "budget_usd": task["budget_usd"],
               "continues": task["id"]}
+    try:   # a hop that publishes a code task's branch: task_add makes it kind code; no copied tier
+        pub = publishkind.resolve(db, task["kind"], spec, task)
+    except ValueError:
+        pub = None   # task_add refuses it with the same message
+    if pub:
+        want = str(fup.get("tier") or "").strip().lower()
+        del action["budget_usd"], action["tier"]
+        action.update({"tier": want} if want in TIERS else {})
     saved = db.kv(coord.NOTES_KEY)   # the coordinator's own notes for its next digest stay as they were
     try:
         problems = coord.apply(p, [action])
@@ -497,9 +508,12 @@ def auto_hop(p, cfg: dict, task: dict, fup: dict, why: str | None = None) -> tup
         db.set_kv(coord.NOTES_KEY, saved)
     new = db.one("SELECT id FROM tasks WHERE parent=? AND title=? ORDER BY id DESC", (task["id"], title))
     if problems or not new:
+        if refused is not None:
+            refused.extend(problems)
         return None
-    copied = action["tier"] == (assigned_tier(task) if assigned_tier(task) in TIERS else "standard")
-    db.update_task(new["id"], tier_source="parent_copy" if copied else "hop_followup")
+    if not pub:
+        copied = action["tier"] == (assigned_tier(task) if assigned_tier(task) in TIERS else "standard")
+        db.update_task(new["id"], tier_source="parent_copy" if copied else "hop_followup")
     db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
          (time.time(), f"task:{task['id']}", AUTO_EVENT, "low", f"#{new['id']} {title} queued by the daemon ({why})",
           json.dumps({"root": ch[0]["id"], "next": new["id"], "hops": len(ch), "why": why}), "handled", task["id"]))

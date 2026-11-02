@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import budget as bud, locks
-from . import ackwait, anchors, askauto, askrethink, broadcast, budgetkind, cachettl, causefix, cells, chaincap, convgate, chainprio, chatset, checkspill, correction, course, coursecheck, credits, deploy, echoes, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, rejcool, relay, responsibilities, restriction_audit, restriction_source, reviewcap, selfreview, reviewreuse, settinghold, settled, shared, sharedchecks, startbreaker, sweep, throughmute, timefmt, tried, unblock, unstarted, upstream, verified, watchdup, worktree
+from . import ackwait, anchors, askauto, askrethink, broadcast, budgetkind, cachettl, causefix, cells, chaincap, convgate, chainprio, chatset, checkspill, correction, course, coursecheck, credits, deploy, echoes, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, publishkind, push, reask, rejcool, relay, responsibilities, restriction_audit, restriction_source, reviewcap, selfreview, reviewreuse, settinghold, settled, shared, sharedchecks, startbreaker, sweep, throughmute, timefmt, tried, unblock, unstarted, upstream, verified, watchdup, worktree
 from . import probevars
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
@@ -2027,8 +2027,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 # branch): failed or cancelled work is continued then (taken over); done work is not,
                 # and the coordinator is told how to carry it on purpose.
                 spec_text = a.get("spec") or ""
+                # One that publishes a code task's branch runs as kind code onto it (publishkind).
+                pub = None if review else publishkind.resolve(db, a.get("kind") or "work", spec_text, old or followup)
+                was_kind = a.get("kind") or "work"
+                if pub:
+                    a = dict(a, kind="code")
                 given = None if review else SPEC_PR_BRANCH.search(spec_text)
-                carried = None if review or given or followup else _named_branch(db, spec_text)
+                carried = None if review or given or followup or pub else _named_branch(db, spec_text)
                 if carried and old and old["id"] == carried[0]["id"]:
                     carried = None   # it continues that branch's task already
                 elif carried and a.get("continues") is None and carried[0]["status"] in ("failed", "cancelled"):
@@ -2037,7 +2042,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     except ValueError:
                         old = None
                 taken = bool(carried and old and old["id"] == carried[0]["id"])
-                onto = given.group("branch") if given else ""
+                onto = pub["branch"] if pub else given.group("branch") if given else ""
                 # A rebase of that branch cannot fast-forward it: it works on its own branch and delivers
                 # there (delivery.rebase_replace new_branch), or `ttp push --own` replaces that branch
                 # under a lease (lease; push.own_lease).
@@ -2046,13 +2051,16 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     labels.append(f"{'rebases' if rebase else 'pr_branch'}:{onto}")
                 if old:
                     labels.append(f"continues:{old['id']}")
-                    if tier_source == "default" and assigned_tier(old) in ("light", "standard", "deep"):
+                    if tier_source == "default" and assigned_tier(old) in ("light", "standard", "deep") \
+                            and not (pub and old["kind"] != "code"):   # another kind's tier is no code task's
                         # Without a tier of its own it keeps the one its predecessor was queued at, never
                         # a tier the daemon raised that one to for a retry.
                         tier, tier_source = assigned_tier(old), "parent_copy"
                         budget = a.get("budget_usd") or cfg["budget"]["task_default_usd"].get(tier, 8.0)
                 elif followup and followup["kind"] != "review":   # a hop of its lineage, whatever its title (chaincap)
                     labels.append(f"{chaincap.FOLLOWS}{followup['id']}")
+                if pub and pub["owner"] and not (old and old["id"] == pub["owner"]["id"]):
+                    labels.append(f"continues:{pub['owner']['id']}")   # so `ttp push --own` may publish its branch
                 # A continuation carries the branch its predecessors carry (push.pr_branch_of) unless
                 # it says it carries none (`pr_branch: ""`), names only the push branch to land on, or
                 # that branch was never published (`ttp push --own` cannot create it) and it does not
@@ -2145,6 +2153,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      f"an owner's work on")
                 if followup:
                     notes.append(f"task_add: #{followup['id']} is done; added #{new_id} as its follow-up")
+                if pub:
+                    notes.append(f"task_add: {publishkind.note(new_id, was_kind, pub)}")
                 notes.extend(_relay_pin_note(p, cfg, a, new_id, messages))
                 if onto and own_push(cfg) == "off":
                     notes.append(f"task_add: #{new_id} {'rebases' if rebase else 'builds on'} {onto}, but own "
