@@ -9441,7 +9441,8 @@ def main(argv: list[str] | None = None) -> None:
         if name == "status":
             s.add_argument("--json", action="store_true", help="print the status as JSON")
             s.add_argument("--verbose", action="store_true",
-                           help="also the coordinator cache, checks slot waits and unacked upstream fix lines")
+                           help="also the routine diagnostics: coordinator cache, checks lanes and slots, free shared locks, "
+                                "self-review, health and coverage when fine, host reboots, unacked upstream fixes")
         if name == "prune":
             s.add_argument("--dry-run", action="store_true", help="change nothing; list what a sweep would do")
             s.add_argument("--archived", type=int, metavar="TASK",
