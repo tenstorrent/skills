@@ -2989,6 +2989,86 @@ def test_worker_low_and_normal_notify_are_unchanged_by_the_escalation_path(env, 
     assert not p.db.one("SELECT id FROM events WHERE fingerprint LIKE 'escalate:%'")
 
 
+def _held_notify_run(env, monkeypatch, p, title="sign in", status="blocked", sev="normal"):
+    """A task whose run left one `ttp notify` and then handed off with `status`; the run ended (_finish_worker)."""
+    from ttp import cli
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    tid = p.db.add_task(title, "spec", kind="work", tier="standard", origin="coordinator")
+    p.db.update_task(tid, status="running")
+    run_dir = _note_run(env, monkeypatch, p, task=str(tid))
+    cli.main(["notify", "--severity", sev, "please sign in again"])
+    (run_dir / "result.json").write_text(json.dumps({"status": status, "summary": "needs a sign-in",
+                                                     "question": "sign in?", "retry_when": "true"}))
+    Daemon(p.base)._finish_worker({"task": tid}, Usage(cost_usd=0.1), "ok", run_dir)
+    return tid, run_dir
+
+
+def test_a_blocked_runs_normal_notify_goes_to_the_coordinator_first(env, monkeypatch, capsys):
+    """A normal notify from a blocked run makes one ride-along coordinator item and no user message; an
+    ask naming its task within the hold leaves only the ask; the notify is never posted after."""
+    from ttp import coordinator as coord, daemon, pagesev, workernotify
+    p = make(env)
+    tid, run_dir = _held_notify_run(env, monkeypatch, p)
+    assert "goes to the coordinator first" in capsys.readouterr().out
+    assert not p.db.one("SELECT id FROM messages WHERE direction='out'")
+    evs = p.db.q("SELECT * FROM events WHERE kind=?", (workernotify.KIND,))
+    assert len(evs) == 1 and evs[0]["status"] == "queued" and evs[0]["task"] == tid
+    assert pagesev.rides_along(dict(evs[0])), "it rides on the hand-off's turn, never one of its own"
+    data = json.loads(evs[0]["data"])
+    assert data["task"] == tid and data["text"] == f"#{tid} sign in: please sign in again"
+    assert (run_dir / (daemon.NOTIFY_FILE + ".sent")).exists()
+    assert daemon.relay_worker_notifies(p, p.db.task(tid), run_dir) == 0, "a second finish holds nothing new"
+    assert coord.apply(p, [{"type": "ask_user", "text": f"#{tid} needs a sign-in: sign in now?",
+                            "blocking": "access", "recommendation": "yes"}]) == []
+    assert workernotify.post_due(p.db, time.time() + 10 * workernotify.HOLD_S) == 0
+    assert [m["kind"] for m in p.db.q("SELECT kind FROM messages WHERE direction='out'")] == ["ask"]
+    assert p.db.one("SELECT status FROM events WHERE id=?", (evs[0]["id"],))["status"] == "handled"
+
+
+def test_a_held_worker_notify_is_posted_once_after_the_hold_across_a_restart(env, monkeypatch):
+    """No coordinator action: posted unchanged exactly once after notify.hold_s, even when the daemon
+    restarts during the hold (the hold is in kv); an ask on another task does not count."""
+    from ttp import coordinator as coord, workernotify
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid, _ = _held_notify_run(env, monkeypatch, p, status="failed")
+    other = p.db.add_task("other", "spec", kind="work", tier="standard", origin="coordinator")
+    coord.apply(p, [{"type": "reply", "text": f"#{other} is done"}])
+    Daemon(p.base).post_held_notifies()   # a restarted daemon, inside the hold: nothing yet, nothing lost
+    assert not p.db.one("SELECT id FROM messages WHERE kind='alert'")
+    assert len(p.db.kv(workernotify.KV)) == 1
+    later = time.time() + workernotify.HOLD_S + 1
+    assert workernotify.post_due(Daemon(p.base).p.db, later) == 1
+    assert workernotify.post_due(Daemon(p.base).p.db, later + 60) == 0
+    got = p.db.q("SELECT text, severity FROM messages WHERE kind='alert'")
+    assert [(m["text"], m["severity"]) for m in got] == [(f"#{tid} sign in: please sign in again", "normal")]
+    assert not p.db.one("SELECT id FROM events WHERE kind=? AND status='queued'", (workernotify.KIND,))
+    # A damaged hold list never stops the tick step: a bad entry is posted, junk is skipped.
+    p.db.set_kv(workernotify.KV, [{"task": tid, "text": f"#{tid} damaged", "due": "soon"}, "junk"])
+    assert workernotify.post_due(p.db) == 1 and p.db.kv(workernotify.KV) == []
+
+
+def test_a_held_worker_notify_dropped_by_task_update_keeps_the_tasks_reason(env, monkeypatch):
+    """`task_update` text 'notify dropped: ...' drops the held notify and touches neither the blocked
+    reason nor the spec; a done run's and a low notify keep the run-end post."""
+    from ttp import coordinator as coord, workernotify
+    p = make(env)
+    tid, _ = _held_notify_run(env, monkeypatch, p, status="needs_review")
+    before = p.db.task(tid)
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "text": "Notify dropped: the review settles it"}]) == []
+    after = p.db.task(tid)
+    assert (after["spec"], after["blocked_reason"]) == (before["spec"], before["blocked_reason"])
+    assert p.db.kv(workernotify.KV) == []
+    assert workernotify.post_due(p.db, time.time() + 10 * workernotify.HOLD_S) == 0
+    assert not p.db.one("SELECT id FROM messages WHERE kind='alert'")
+    done, _ = _held_notify_run(env, monkeypatch, p, title="done one", status="done")
+    low, _ = _held_notify_run(env, monkeypatch, p, title="low one", status="blocked", sev="low")
+    assert sorted(m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind='alert'")) == [
+        f"#{done} done one: please sign in again", f"#{low} low one: please sign in again"]
+    assert len(p.db.q("SELECT id FROM events WHERE kind=?", (workernotify.KIND,))) == 1
+
+
 def _blocked_on(env, p, question, *, target_status="queued", extra="", target=None):
     """A running task hands off `blocked` with `question`; a second task (`target`, made in
     `target_status` unless given) is the one it names as {t}; {me} is the task itself."""

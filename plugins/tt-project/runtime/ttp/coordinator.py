@@ -100,6 +100,7 @@ from . import probevars
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
+from . import workernotify
 from .db import (
     PAUSED_RESOURCES_KEY,
     SEVERITY_RANK,
@@ -2022,6 +2023,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 replies.append(msgparts.post(db, a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
                                              severity=_norm_severity(a.get("severity") or "normal"))[0])
                 sent.append((replies[-1], chat, a["text"]))
+                workernotify.handled(db, workernotify.named(a["text"]))
                 if a.get("delivers"):
                     delivered.append((replies[-1], chat, list(a["delivers"])))
                 if a.get("delivers") or a.get("owners"):
@@ -2334,6 +2336,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if not task:
                     raise ValueError(f"no task #{a.get('id')}")
                 batch_tasks[task["id"]] = task["reply_chat"]
+                if str(a.get("text") or "").strip().lower().startswith(workernotify.DROPPED):
+                    # Its held worker notify is not posted; the text steers nothing else.
+                    workernotify.handled(db, [task["id"]])
+                    a = {k: v for k, v in a.items() if k != "text"}
+                    if not set(a) - {"type", "id"}:
+                        continue
                 a, as_deps = _landed_as_deps(p, a, dependency_ids(task))
                 a, as_deferral = _hold_as_deferral(db, task, a, timefmt.home(p))
                 upd: dict[str, Any] = {}
@@ -2652,6 +2660,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 turn_asks.append((k, db.post("out", text, chat=None, kind="ask",
                                              severity=_norm_severity(a.get("severity") or "high"),
                                              ref=f"{prguard.BLOCKING_REF}{a['blocking']}")))
+                workernotify.handled(db, workernotify.named(text))
                 db.set_kv(ASK_DEFAULTS_KEY, {**db.kv(ASK_DEFAULTS_KEY, {}), str(turn_asks[-1][1]): default})
                 if seen:   # sent on its not_covered reason: counted for the daily audit
                     _count_refusal(db, f"{key}:reask" if key else None, "already settled (not_covered)",
@@ -2685,6 +2694,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError(why)
                 sent.append((msgparts.post(db, a["text"], chat=None, kind="alert",
                                            severity=_norm_severity(a.get("severity")))[0], None, a["text"]))
+                workernotify.handled(db, workernotify.named(a["text"]))
             elif t == "memory_add" and a.get("memory_kind") == settled.KIND:
                 rec = settled.from_action(p, a, key)
                 notes.append(f"memory_add: settled area {rec['id']} added to {settled.FILE} "

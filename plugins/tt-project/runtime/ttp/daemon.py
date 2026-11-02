@@ -44,6 +44,7 @@ from . import chainprio
 from . import churnwatch
 from . import alerts
 from . import userstep
+from . import workernotify
 from . import anchors
 from . import pagesev
 from . import askrethink
@@ -492,7 +493,7 @@ LEASE_STATE_KEY = "lease_state"   # kv: the lease state last announced (lease.py
 # Steps a host that does not hold the project lease skips: they start model work, push, or answer
 # people, which only the one live coordinator may do. Maintenance steps go on.
 LEASE_STEPS = ("dispatch", "maybe_coordinate", "run_schedules", "start_pushes", "poll_slack", "deliver_outbound",
-               "route_machines", "backup_branches", "retry_rejected")
+               "route_machines", "backup_branches", "retry_rejected", "post_held_notifies")
 HOST_CYCLE_SEEN_KEY = "host_cycle_seen"   # kv: power-cycle intent id -> held or lapsed, each logged or posted once
 ROOT_RECHECK_S = 300   # an open root-checkout alert's condition is looked at again this often
 PAGED_KEY = "watch_paged:"   # kv per command schedule: {"<project>\t<line key>": {at, first, n}} (pageto)
@@ -1553,7 +1554,7 @@ class Daemon:
         self.tend_lease()
         # Compared as callables, not by name, so a step replaced on the instance is gated the same way.
         lease_off = [] if self.lease_held() else [getattr(self, n) for n in LEASE_STEPS]
-        for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.relay_escalations, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
+        for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.verify_pushes,
                      self.prune_worktrees, self.prune_leftovers, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
@@ -3459,6 +3460,10 @@ class Daemon:
         for key, _ in due:
             log(self.p, f"hold loop {key} raised to the coordinator")
 
+    def post_held_notifies(self) -> None:
+        """Held worker notifies the coordinator did not take up within notify.hold_s, posted unchanged (workernotify)."""
+        workernotify.post_due(self.p.db)
+
     def relay_escalations(self) -> None:
         """Each live worker run's new `ttp notify --severity high` lines become high coordinator events
         now, not when the run ends (relay_worker_escalations); a file is read again only once it changed."""
@@ -4384,7 +4389,7 @@ class Daemon:
         if not task:
             return
         landed.reconcile_pushes(self.p, task["id"])
-        relay_worker_notifies(self.p, task, run_dir)
+        relay_worker_notifies(self.p, task, run_dir, handoff)
         _, past_cap = relay_worker_escalations(self.p, task, r.get("id"), run_dir)
         self._file_queued_notes(r.get("id"), task["id"], run_dir)
         if held:
@@ -14654,19 +14659,25 @@ def _reboot_wakes(task: dict) -> int:
         return 0
 
 
-def relay_worker_notifies(p: Project, task: dict, run_dir: Path) -> int:
+def relay_worker_notifies(p: Project, task: dict, run_dir: Path, handoff: dict | None = None) -> int:
     """Post the `ttp notify` lines a worker run left as alerts, the way the coordinator's `notify`
     action does: at most low or normal severity, the first NOTIFIES_PER_RUN, a text already sent in
     the last day not again. A notify of a step only the user can take (its --step, or in a run that
     hands off waiting or blocked, a text naming one) is the task's one standing item for that step
     (userstep.relay): posted once, then updated in place by every later run of the task.
-    The file is renamed once the posts commit, so a second finish does not repost."""
+    The file is renamed once the posts commit, so a second finish does not repost.
+    Any other normal one from a run whose hand-off (`handoff`, else its result.json) ended blocked, waiting,
+    failed or needs_review goes to the coordinator first and is posted only if it does not take it up
+    (workernotify)."""
     db, f = p.db, run_dir / NOTIFY_FILE
     try:
         lines = f.read_text(errors="replace").splitlines()
     except OSError:
         return 0
-    sent, ending = 0, None
+    res = handoff if handoff is not None else _read_result(run_dir / RESULT_FILE)
+    end = res.get("status") if isinstance(res, dict) else None
+    hold_for = workernotify.hold_s(p.config()) if end in workernotify.HELD_ENDS else 0.0
+    sent = 0
     for line in lines:
         try:
             n = json.loads(line)
@@ -14681,9 +14692,7 @@ def relay_worker_notifies(p: Project, task: dict, run_dir: Path) -> int:
         text = headline.join(task['title'], body, 80, f"#{task['id']} ")
         step = n.get("step") if n.get("step") in userstep.KINDS else None
         if step is None and userstep.kind_of(n):
-            if ending is None:
-                ending = (_read_result(run_dir / RESULT_FILE) or {}).get("status")
-            step = userstep.kind_of(n) if ending in ("waiting", "blocked") else None
+            step = userstep.kind_of(n) if end in ("waiting", "blocked") else None
         if step:
             sent += userstep.relay(db, task, step, n, userstep.item_text(text, n, timefmt.zone(p)))
             continue
@@ -14691,6 +14700,9 @@ def relay_worker_notifies(p: Project, task: dict, run_dir: Path) -> int:
                   (text, time.time() - 86400)):
             continue
         sev = n.get("severity") if n.get("severity") in ("low", "normal") else "normal"
+        if hold_for and sev == "normal":
+            sent += workernotify.hold(db, task, text, run_dir.name, end, hold_for)
+            continue
         db.post("out", text, chat=None, kind="alert", severity=sev)
         sent += 1
     def mark_sent() -> None:

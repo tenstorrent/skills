@@ -467,7 +467,9 @@ EXTRA_KEYS = {
     "coordinator": {"agent_orders_as_user", "max_review_tasks_per_day", "charter_approval_days", "approval_lookback_days", "reask_window_days", "blocker_sweep_h", "blocker_sweep_min_gap_h",
                     "review_backlog_h", "user_pause_marker", "promise_default_h", "mitigation_due_h", "course_check",
                     "progress_check", "probe_stall_dispose_h", "echo_paths"},
-    "notify": {"slack_poll_s"},
+    # hold_s: how long a worker's normal notify from a blocked, waiting, failed or needs_review run waits
+    # for the coordinator before it is posted unchanged (workernotify.py; default 900, 0 posts at run end).
+    "notify": {"slack_poll_s", "hold_s"},
     # stale_lock_s: see "harness_git" in DEFAULT_CONFIG; unset so that the old watchdog key below still counts.
     "harness_git": {"stale_lock_s"},
     "watchdog": {"stale_git_lock_s"},   # deprecated alias of harness_git.stale_lock_s, read only when that is unset
