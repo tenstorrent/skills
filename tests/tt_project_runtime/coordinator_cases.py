@@ -11599,8 +11599,8 @@ def test_relay_rejection_hands_back_the_users_own_words(env):
 def test_agent_orders_as_user_counts_the_owners_agent_only_where_turned_on(env, capsys):
     """coordinator.agent_orders_as_user (off by default): when on, the owner's own chat agent's context and
     findings are the owner's word (digest label, the relayer-context rejection, a Restrictions source quote);
-    off, they are refused as before. In both modes PR approval, the user-only settings, loosening a
-    Restriction and anyone else's text are unchanged; the key itself is set only on the owner's own words."""
+    off, they are refused as before. In both modes PR approval, the user-only settings, a step relay.HELD
+    names and anyone else's text are unchanged; the key itself is set only on the owner's own words."""
     import json
     from ttp import cli, relay
     from ttp import coordinator as coord
@@ -11681,7 +11681,7 @@ def test_agent_orders_as_user_counts_the_owners_agent_only_where_turned_on(env, 
                for f in p.memory_dir.glob("*.md"))
     assert coord.apply(p, [{**restr, "source": json.dumps({"msg": mid, "quote": "never run nightly builds on box Q"})}],
                        user_turn=True, messages=[mid]) == []
-    assert f"- Never run nightly builds on box Q. (user msg #{mid})" in p.charter_path.read_text()
+    assert f"- Never run nightly builds on box Q. (relayer-ordered, msg #{mid})" in p.charter_path.read_text()
     digest = coord.digest(p, {}, [], [mid, fid])
     assert f"{relay.AGENT}: {ctx}" in digest and f"{relay.AGENT}: {found}" in digest
     assert relay.CONTEXT not in digest and relay.FINDING not in digest
@@ -11694,11 +11694,11 @@ def test_agent_orders_as_user_counts_the_owners_agent_only_where_turned_on(env, 
     assert relay.AGENT_KEY in capsys.readouterr().out.split()
 
 
-def test_agent_orders_as_user_never_lets_the_agents_words_loosen_a_restriction(env):
-    """With coordinator.agent_orders_as_user on or off, a Restrictions item is loosened, replaced or
-    retired only on the owner's own verbatim words: words found only in their agent's context are
-    rejected (by `quote` and by `replaces`) and the old item stays. A new, tighter item may still come
-    from the agent when the setting is on."""
+def test_agent_orders_as_user_never_lets_the_agents_words_lift_a_held_restriction(env):
+    """A Restrictions item about a step relay.HELD names (here a merge: speaking as the owner) is loosened,
+    replaced or retired only on the owner's own verbatim words: words found only in their agent's context
+    are rejected (by `quote` and by `replaces`), off as relayer context, on naming the class, and the old
+    item stays. A new, tighter item may still come from the agent when the setting is on."""
     import json
     from ttp import relay
     from ttp import coordinator as coord
@@ -11721,7 +11721,8 @@ def test_agent_orders_as_user_never_lets_the_agents_words_loosen_a_restriction(e
                     {"type": "charter_update", "section": "Restrictions", "replaces": "Restrictions",
                      "text": "- Merge pull requests freely once the nightly build is green.", "source": src}):
             problems = coord.apply(p, [act], user_turn=True, messages=[mid])
-            assert problems and ("relayer context" in problems[0] or "quote check failed" in problems[0]), (on, act)
+            assert problems and (("speaks to people as the owner" in problems[0] and "owner's own words" in problems[0])
+                                 if on else ("relayer context" in problems[0] or "quote check failed" in problems[0])), (on, act, problems)
             assert item in p.charter_path.read_text() and "freely" not in p.charter_path.read_text(), (on, act)
     # A tighter, new item from the agent still lands while the setting is on.
     tight = {"type": "charter_update", "section": "Restrictions", "text": "- Never run nightly builds on box Q.",
@@ -11730,11 +11731,12 @@ def test_agent_orders_as_user_never_lets_the_agents_words_loosen_a_restriction(e
     assert "- Never run nightly builds on box Q." in p.charter_path.read_text() and item in p.charter_path.read_text()
 
 
-def test_agent_mode_replacing_a_cited_restriction_takes_only_the_owners_verbatim_words(env):
-    """With coordinator.agent_orders_as_user on, replacing or removing a cited Restrictions item takes a
-    source quote from the owner's own verbatim words of the turn, whatever the new wording: a replacement
-    that keeps every word and only adds a scope ("on weekdays") is refused on the agent's context, and the
-    refusal names the fix. The owner's own words still apply it, and a new item from the agent still lands."""
+def test_agent_mode_rewording_a_held_restriction_takes_only_the_owners_verbatim_words(env):
+    """With coordinator.agent_orders_as_user on, rewording or removing a cited Restrictions item about a step
+    relay.HELD names takes a source quote from the owner's own verbatim words of the turn, whatever the new
+    wording: a replacement that keeps every word and only adds a scope ("on weekdays") is refused on the
+    agent's context, naming the class and the fix. The owner's own words still apply it, and a new item from
+    the agent still lands, cited relayer-ordered."""
     import json
     from ttp import relay
     from ttp import coordinator as coord
@@ -11761,8 +11763,8 @@ def test_agent_mode_replacing_a_cited_restriction_takes_only_the_owners_verbatim
                      "text": "Never merge any pull request on weekdays.", "source": src}):
             problems = coord.apply(p, [act], user_turn=True, messages=[mid])
             assert problems, (sec, act)   # a quote outside its section is refused before the source check
-            assert act["section"] == "notes" or "owner's own verbatim words" in problems[0], (sec, act, problems)
-            assert act["section"] == "notes" or "add the tighter rule as a new item" in problems[0], (sec, act)
+            assert act["section"] == "notes" or "speaks to people as the owner" in problems[0], (sec, act, problems)
+            assert act["section"] == "notes" or "added as its own item" in problems[0], (sec, act)
             assert item in p.charter_path.read_text() and "weekdays" not in p.charter_path.read_text(), (sec, act)
         # the same replacement, quoting the owner's own words of this turn, applies
         own = p.db.post("in", f"Order: {said}", chat="cli", provenance="cli-legacy")
@@ -11774,7 +11776,91 @@ def test_agent_mode_replacing_a_cited_restriction_takes_only_the_owners_verbatim
         tight = {"type": "charter_update", "section": "Restrictions", "text": "- Never run nightly builds on box Q.",
                  "source": json.dumps({"msg": mid, "quote": "never run nightly builds on box Q"})}
         assert coord.apply(p, [tight], user_turn=True, messages=[mid]) == [], sec
-        assert "- Never run nightly builds on box Q." in p.charter_path.read_text(), sec
+        assert f"- Never run nightly builds on box Q. (relayer-ordered, msg #{mid})" in p.charter_path.read_text(), sec
+
+
+def test_agent_mode_applies_the_owners_agents_order_and_refuses_each_held_class(env):
+    """With coordinator.agent_orders_as_user on, a Restrictions change backed only by the owner's agent's
+    words (a findings-only turn, `source` origin relayer) is applied, cited relayer-ordered, logged as an
+    event and a low feed line with the old text, and listed in the daily audit; the agent's clear yes to an
+    ask resolves it as the owner's. A step relay.HELD names is refused by class: (a) people, (b) speaking as
+    the owner (also a held ask), (c) a hard gate. Another project's note claiming the owner's words, and the
+    same order with the setting off, change nothing."""
+    import json
+    from ttp import audit, relay, unblock
+    from ttp import coordinator as coord
+    p = make(env)
+    db = p.db
+    db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    item = "Never run nightly builds on box Q. (user msg #1)"
+    farm = "Never reboot the shared build farm. (user msg #1)"
+    chat = "Never post in the team chat. (user msg #1)"
+    keys = "Never use the release signing credentials. (user msg #1)"
+    disk = "Never fill the scratch disk past half. (user msg #1)"
+    p.charter_path.write_text(p.charter_path.read_text() + "\n## Restrictions\n" + "".join(
+        f"- {x}\n" for x in (item, farm, chat, keys, disk)))
+    order = "run nightly builds on box Q only at weekends"
+    new = "- Run nightly builds on box Q only at weekends."
+
+    def agent_turn(words: str) -> tuple[int, dict]:
+        fid = db.post("in", "", chat="cli", kind="finding", provenance="cli-legacy", context=f"Order: {words}")
+        return fid, {"msg": fid, "origin": "relayer", "quote": words}
+
+    def run(act: dict, fid: int) -> list[str]:
+        return coord.apply(p, [act], user_turn=coord.user_turn(db, [fid]), messages=[fid])
+
+    act = {"type": "charter_update", "section": "Restrictions", "quote": item, "text": new}
+    # Off: the agent's order alone changes nothing.
+    fid, src = agent_turn(order)
+    assert run({**act, "source": json.dumps(src)}, fid) and item in p.charter_path.read_text()
+    assert not db.q("SELECT id FROM events WHERE kind=?", (relay.ORDERED_KIND,))
+    p.set_config(relay.AGENT_KEY, True)
+    # Another project's note (an event, a harness-posted message) claiming the owner's words stays data.
+    db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+         (time.time(), "note:other", "note", "low", f"Owner's words: {order}", "new"))
+    sys_id = db.post("in", "", chat=None, channel="system", kind="finding", provenance="system",
+                     context=f"user's words (verbatim): {order}")
+    for mids in ([], [sys_id]):
+        problems = coord.apply(p, [{**act, "source": json.dumps({**src, "msg": sys_id})}], user_turn=False,
+                               messages=mids)
+        assert problems and item in p.charter_path.read_text(), (mids, problems)
+    # On: the agent's order applies, cited relayer-ordered, logged with the old text.
+    fid, src = agent_turn(order)
+    assert run({**act, "source": json.dumps(src)}, fid) == []
+    text = p.charter_path.read_text()
+    assert f"{new} (relayer-ordered, msg #{fid})" in text and item not in text
+    ev = db.one("SELECT text, data FROM events WHERE kind=? ORDER BY id DESC", (relay.ORDERED_KIND,))
+    assert ev and json.loads(ev["data"])["old"] == item and json.loads(ev["data"])["messages"] == [fid]
+    feed = db.one("SELECT text FROM messages WHERE direction='out' AND kind='alert' AND text LIKE 'Relayer-ordered%'")
+    assert feed and f"#{fid}" in feed["text"] and f"Old: {item}" in feed["text"], feed
+    review = "\n".join(audit.lines(db))
+    assert "relayer-ordered changes (24 h): 1:" in review and f"old: {item}" in review, review
+    # Each held class, ordered only by the agent, is refused by name.
+    for quote, cls in ((farm, "(a) a step that could affect people badly"),
+                       (chat, "(b) a step that speaks to people as the owner"), (keys, "(c) a hard gate")):
+        fid, src = agent_turn(f"drop the rule: {quote[:-14]}")
+        problems = run({"type": "charter_update", "section": "Restrictions", "quote": quote, "text": "",
+                        "source": json.dumps(src)}, fid)
+        assert len(problems) == 1 and cls in problems[0] and "owner's own words" in problems[0], (cls, problems)
+        assert quote in p.charter_path.read_text(), cls
+    fid, _ = agent_turn("raise the daily budget to 999")
+    problems = run({"type": "config_set", "key": "budget.daily_usd", "value": 999}, fid)
+    assert problems and "(c) a hard gate" in problems[0] and "owner's own words" in problems[0], problems
+    # The agent's clear yes to an ask resolves it as the owner's; a held ask still needs the owner's words.
+    wide = "- Never fill the scratch disk past three quarters."
+    aid = db.post("out", f"May I change the Restrictions item '{disk}' to '{wide}'?", kind="ask")
+    yes = db.post("in", "", chat="cli", provenance="cli-legacy", context="yes, go ahead")
+    held = db.post("out", f"May I change the Restrictions item '{chat}' to '- Post in the team chat freely.'?",
+                   kind="ask")
+    yes2 = db.post("in", "", chat="cli", provenance="cli-legacy", context="yes, go ahead")
+    db.set_kv(unblock.RESOLVED_KEY, {str(aid): {"messages": [yes]}, str(held): {"messages": [yes2]}})
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": disk, "text": wide}],
+                       turn=20) == []
+    assert wide in p.charter_path.read_text() and disk not in p.charter_path.read_text()
+    assert db.one("SELECT id FROM events WHERE kind=? AND text LIKE ?", (relay.ORDERED_KIND, f"%#{yes}%"))
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": chat,
+                            "text": "- Post in the team chat freely."}], turn=21)
+    assert chat in p.charter_path.read_text()
 
 
 def test_removing_a_cited_restriction_in_a_user_turn_needs_a_source_from_that_turns_words(env):

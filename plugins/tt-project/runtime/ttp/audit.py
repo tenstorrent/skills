@@ -41,7 +41,7 @@ import json
 import time
 from typing import Any
 
-from . import budget, chaincap, checkprestage, coordmodel, correction, ends, obligations, quietgate, reviewstats, route, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
+from . import budget, chaincap, checkprestage, coordmodel, correction, ends, obligations, quietgate, relay, reviewstats, route, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
 from .db import DB, continues_id
 from .project import Project
 
@@ -368,6 +368,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         landed = sum(bool(a.get("landed")) and not a["answered"] for a in sent)
         out.append(f"asks: {len(sent)} sent, {sum(a['answered'] for a in sent)} answered, {len(back)} handed back"
                    + (f", {landed} resolved as their work landed" if landed else ""))
+    if ordered := relay.ordered_line(db, since):   # changes made on the owner's agent's words alone
+        out.append(ordered)
     fails = failed_runs(db, since)
     if fails:
         usd = sum(float(r["cost_usd"] or 0) for r in fails)

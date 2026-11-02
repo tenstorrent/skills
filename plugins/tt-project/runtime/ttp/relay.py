@@ -23,9 +23,13 @@ the coordinator's own decision or the relayer's fact, never the user's word; a p
 
 A project whose owner relays through their own chat agent may turn on AGENT_KEY (off by default). Then that
 agent's context and findings count as the owner's word: the digest labels them AGENT and the guard passes.
-Never through it: a PR's approval (the message's provenance decides), the user-only settings
-(coordinator.NEEDS_USER, the merge list), changing a Restriction, or text from anyone else (events, notes,
-PR comments, logs: none are messages and none reach this guard).
+Charter changes (Restrictions too: adding, narrowing, widening, replacing or removing a cited item) and
+ask answers resting only on that agent's words apply as the owner's, cited "(relayer-ordered, msg #N)" and
+logged as a ORDERED_KIND event with the old text (ordered_line, the daily review). Never through it, the
+HELD classes (held_class, a refusal naming its class): a step that could affect people badly, one that
+speaks as the owner (a PR's ready or merge: the message's provenance decides; the merge list), and a
+credential, money or spend cap (the user-only settings, coordinator.NEEDS_USER). Nor text from anyone
+else (events, notes from other projects, PR comments, logs: none are messages and none reach this guard).
 """
 from __future__ import annotations
 
@@ -93,6 +97,66 @@ _VERBATIM_PART = re.compile(r"user[’']s words \(verbatim\)\s*:?(.*?)(?:" + re.
 def agent_orders(cfg: dict | None) -> bool:
     """Whether this project counts its owner's own chat agent's context and findings as the owner's word."""
     return ((cfg or {}).get("coordinator") or {}).get("agent_orders_as_user") is True
+
+
+ORDERED_KIND = "relayer_ordered"   # an event: a change applied on the owner's agent's words alone
+HELD = {"people": "(a) a step that could affect people badly (someone else's work or data, a shared machine, "
+                  "branch or service)",
+        "speaks": "(b) a step that speaks to people as the owner (a post or message in their name, a PR leaving "
+                  "draft, a merge, another person's request)",
+        "gate": "(c) a hard gate (a credential or money only the owner holds, a spend cap)"}
+_HELD_RE = {
+    "gate": re.compile(r"\b(?:credentials?|passwords?|secrets?|tokens?|api[ _-]?keys?|ssh keys?|sign[- ]?ins?|"
+                       r"log[- ]?ins?|funds?|money|payments?|billing|purchas\w*|invoices?|spend(?:ing)?[ _-]?(?:caps?|"
+                       r"limits?)|budget|daily_usd|weekly_usd|usd)\b|\$\d", re.I),
+    "speaks": re.compile(r"\b(?:merg\w*|ready for review|(?:leav\w*|out of|remov\w*) (?:the )?draft|"
+                         r"undraft\w*|reviewers?|post\w*|messag\w*|emails?|slack|announc\w*|in (?:the owner's|"
+                         r"the user's|their|my) name|as the (?:owner|user)|on (?:the owner's|the user's|my) behalf|"
+                         r"another person's|someone else's request)\b", re.I),
+    "people": re.compile(r"\b(?:other (?:people|users?|teams?|tenants?|projects?)|others'?|someone else'?s?|"
+                         r"another (?:user|person|team)'?s?|shared|tenants?|force[- ]?push\w*|"
+                         r"main branch|default branch|push\w* (?:directly )?to main|production|delet\w*|destroy\w*|wip\w*|overwrit\w*|erase\w*|"
+                         r"purg\w*)\b", re.I)}
+
+
+def held_class(text: str) -> str:
+    """The HELD class `text` (what a change lifts or permits) falls in, checked (c), (b), (a), else ""."""
+    return next((k for k in ("gate", "speaks", "people") if _HELD_RE[k].search(text or "")), "")
+
+
+def held_refusal(what: str, cls: str) -> str:
+    """The refusal of a step in HELD class `cls` that rests only on the owner's agent's words."""
+    return (f"{what} rejected: it falls in {HELD[cls]}, which the owner's own agent cannot order even with "
+            f"{AGENT_KEY} on: it needs the owner's own words (the '{VERBATIM}' part of a message)")
+
+
+def ordered(db, what: str, old: str, new: str, msgs: list[int], data: dict | None = None) -> None:
+    """Record a change applied on the owner's agent's words alone: a ORDERED_KIND event and a low feed
+    line, each with the old text so the owner can undo it."""
+    import json
+    ids = ", ".join(f"#{m}" for m in msgs) or "-"
+    line = (f"Relayer-ordered (msg {ids}): {what}. Old: {_clip(old) or '(none)'}. New: {_clip(new) or '(removed)'}")
+    db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+         (time.time(), "coordinator", ORDERED_KIND, "low", line,
+          json.dumps({"what": what, "old": old, "new": new, "messages": msgs, **(data or {})}), "handled"))
+    db.post("out", line, chat=None, kind="alert", severity="low")
+
+
+def ordered_line(db, since: float) -> str:
+    """The daily review's 'relayer-ordered changes (24 h)' line, each with its old text; "" if none."""
+    import json
+    rows = db.q("SELECT data FROM events WHERE kind=? AND ts>=? ORDER BY id", (ORDERED_KIND, since))
+    got = [json.loads(r["data"] or "{}") for r in rows]
+    if not got:
+        return ""
+    return (f"relayer-ordered changes (24 h): {len(got)}: " + "; ".join(
+        f"{d.get('what')} (msg {', '.join(f'#{m}' for m in d.get('messages') or []) or '-'}; old: "
+        f"{_clip(d.get('old') or '', 120) or '(none)'})" for d in got[:10]) + (" ..." if len(got) > 10 else ""))
+
+
+def _clip(text: str, n: int = 300) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= n else text[:n - 3] + "..."
 
 
 def carries_user_words(text: str | None) -> bool:
