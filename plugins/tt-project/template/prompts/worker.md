@@ -256,6 +256,7 @@ valid one: No `result.json`, no credit.
   note): `ttp upstream --ack <fp> "<evidence>"`.
 - A dead or stuck component the project owns (worker, service, runner, schedule, watcher, queue, a
   hold that never cleared) is fixed in the task, or handed off with a fix plan in `followups`;
+  never handed off `blocked` as a question about what to do.
 - `failed` when the approach does not work; say what you learned. A clean exit is not the task
   done: judge the outcome.
 - A failed job's exit code alone never names its cause: quote its last 20 log lines and its first
