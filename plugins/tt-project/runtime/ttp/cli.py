@@ -4708,6 +4708,9 @@ def _urgent_priority(p, task: str) -> int | None:
         return None
 
 
+LOCK_TELL_S = 120.0   # a waiting `ttp lock` says so this often, under checkwall.SILENT_S: a check waiting on it is not silent
+
+
 def cmd_lock(a) -> None:
     """Hold one slot of a shared resource while a command runs: `ttp lock <resource> -- <cmd...>`.
 
@@ -5131,7 +5134,7 @@ def cmd_lock(a) -> None:
             print(f"ttp lock: not under the run's agent; waiting for {what} without the run's cap",
                   file=sys.stderr, flush=True)
         # Noted before any give-up: a wait that ends at once under load still shows as a wait, not a stall.
-        if time.time() - told >= 120:
+        if time.time() - told >= LOCK_TELL_S:
             def _why(L: dict, by) -> str:
                 if by:
                     return f"{L['name']} (reserved for {by})"

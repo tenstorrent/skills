@@ -18,6 +18,9 @@ settings, else TTP_CHECKS_WALL_CAP_S) sets it; 0 turns it off.
 A hang need not wait for the cap: a command whose output has not grown for its silence limit (SILENT_S,
 10 min; a check object's `"silent_s"` sets it, 0 turns it off) is stopped the same way and recorded as a
 timeout with "silent_s" (wait, said_silent). A check that is silent longer by design raises its silent_s.
+Any line counts as output: a check that waits for a lane, lock or slot is not hung as long as it says so
+(a line at least every few minutes). The plugin's own waits do (`ttp lock`, the checks lanes and slots,
+the test-worker pool: each tells at least every 5 min); a project's own wrapper that queues must too.
 """
 from __future__ import annotations
 
@@ -199,7 +202,8 @@ def said(check: str, cap_s: float, how: str, head: str) -> str:
 def said_silent(check: str, silent_s: float, head: str) -> str:
     return (f"{check!r} was stopped on {head[:12]} after no output for {span(silent_s)} (its silence limit, "
             f"silent_s): a hang, a timeout, not a pass; its process group was ended and the checks slot released "
-            f"(find what hangs; a check that is silent longer by design: raise its \"silent_s\", 0 turns it off)")
+            f"(find what hangs; a wrapper that waits for a lane, lock or slot: print a line while it waits, at "
+            f"least every few minutes; a check that is silent longer by design: raise its \"silent_s\", 0 turns it off)")
 
 
 def said_for(rec: dict) -> str:

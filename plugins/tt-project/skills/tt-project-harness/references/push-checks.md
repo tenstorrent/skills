@@ -8,7 +8,7 @@ Uncommitted changes and untracked files are named as not checked, with the commi
 Submodules come from the authoring worktree's checked-out copies, never the network; a gitlink commit that copy lacks fails the checks with a clear message, never a run in the authoring tree.
 A failure lists up to five files that exist only in the authoring worktree and the check may have needed ("present only in the authoring worktree, not committed: ...").
 `{"run": "...", "cwd": "authoring"}` runs one check in the authoring worktree (it needs build outputs made there); its pass is labelled as not from a clean tree in the output and in `checks.json` (`authoring_tree`). The default is `"clean"`.
-`ttp checks` stops a command whose output has not grown for 10 min as hung: a timeout, never a pass, reported as "no output for 10 min". `{"run": "...", "silent_s": 3600}` raises that limit for a check that is silent longer by design; 0 turns it off.
+`ttp checks` stops a command whose output has not grown for 10 min as hung: a timeout, never a pass, reported as "no output for 10 min". `{"run": "...", "silent_s": 3600}` raises that limit for a check that is silent longer by design; 0 turns it off. Any line resets that clock, so a wrapper of yours that queues for a lane, lock or slot must print a line while it waits (for example `waiting for <what>`, at least every few minutes); the plugin's own waits (`ttp lock`, checks lanes and slots) already do.
 `ttp push`, `ttp land` and the push queue already run their checks in scratch worktrees of the exact commit they push, and remote checks copy it with `git archive` (below).
 
 ## Which list runs

@@ -2130,6 +2130,32 @@ def test_ttp_checks_stops_a_check_with_no_output_as_a_timeout_and_spares_one_tha
     assert json.loads((run / "checks.json").read_text())["passed"], "silent_s 0: a silent check runs to its end"
     assert "no output for 10 min" in checkwall.said_silent("pytest", 600, "abc")
 
+
+def test_a_check_waiting_for_a_slot_survives_its_silence_limit_while_it_says_so_and_a_silent_one_is_stopped(
+        env, tmp_path, monkeypatch, capsys):
+    from ttp import checkcap, checklane, checkwall, cli, testslots
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_TASK", "7")
+    p.set_config("checks.wall_cap_s", 0)
+    monkeypatch.setattr(checkwall, "SILENT_S", 1.0)
+    monkeypatch.setattr(checkwall, "POLL_S", 0.05)
+    # A wrapper that queues 3 s (three silence limits) for its slot, saying so, then runs a quick command.
+    wait = "for i in 1 2 3 4 5 6 7 8; do echo waiting for the suite slot >&2; sleep 0.4; done"
+    cli.main(["checks", "--", "sh", "-c", f"{wait}; true"])
+    assert json.loads((run / "checks.json").read_text())["passed"], "a wait that says so is not a hang"
+    capsys.readouterr()
+    # The same wait, then a command that hangs with no output: still stopped at the silence limit.
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", "sh", "-c", f"{wait}; sleep 300"])
+    assert e.value.code == 1
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is False and rec["timed_out"]["silent_s"] == 1.0, rec
+    assert "print a line while it waits" in capsys.readouterr().err, "the stop names what a waiting wrapper prints"
+    # The plugin's own waits a check can sit in say so more often than the default silence limit.
+    for name, every in (("ttp lock", cli.LOCK_TELL_S), ("checks lanes", checklane.TELL_S),
+                        ("checks slots", checkcap.TELL_S), ("test-worker slots", testslots.TELL_S)):
+        assert 0 < every < 600, (name, every)
+
 # Checks lanes (checklane): light checks never queue, N lanes per project and repository, dead holders
 # reclaimed, a cheaper waiter's overflow lane, visible waits, and `ttp checks status`.
 
