@@ -4764,8 +4764,10 @@ def test_test_slots_grant_follows_the_hosts_live_free_cores(env, monkeypatch):
 
 
 def test_a_wait_for_a_checks_slot_reads_pids_once_per_cycle_without_proc(env, tmp_path, monkeypatch):
-    """Without /proc, checkcap.acquire's wait reads its held locks' pids from one `ps` per poll cycle,
-    however many slots are held (ps_snapshot), never one `ps` per held lock each cycle."""
+    """Without /proc, the pids checkcap.acquire's wait reads each poll cycle (its stop()/done() callbacks,
+    as cli's stop -> yielder -> checkjoin does) come from one `ps` per cycle (ps_snapshot), never one
+    `ps` per pid read."""
+    import os
     import subprocess
     from ttp import checkcap, project
 
@@ -4775,14 +4777,22 @@ def test_a_wait_for_a_checks_slot_reads_pids_once_per_cycle_without_proc(env, tm
     monkeypatch.setattr(project, "_PROC", False)
     monkeypatch.setattr(checkcap, "POLL_S", 0.01)
     held = [checkcap.acquire(f"h{i}") for i in range(3)]   # the cap is full: a waiter polls, not takes
-    calls, cycles = _counting_ps(monkeypatch), []
+    calls, cycles, pids = _counting_ps(monkeypatch), [], [os.getpid(), os.getppid(), 1]
 
     def stop_():
         cycles.append(1)
+        for pid in pids:   # the callbacks' per-cycle pid reads (checkjoin's holders)
+            project.zombie(pid)
         return "stop" if len(cycles) > 2 else ""
 
+    def wait():
+        try:
+            checkcap.acquire("w", stop=stop_, max_wait_s=30)
+        except checkcap.Cancelled:
+            pass
+
     try:
-        t = threading.Thread(target=lambda: checkcap.acquire("w", stop=stop_, max_wait_s=30))
+        t = threading.Thread(target=wait)
         t.start()
         assert _wait_for(lambda: len(checkcap.state()["queued"]) == 1), checkcap.state()
         t.join(30)
@@ -4790,7 +4800,8 @@ def test_a_wait_for_a_checks_slot_reads_pids_once_per_cycle_without_proc(env, tm
         for s in held:
             s.close()
     assert len(cycles) >= 3, "the waiter polled at least 3 cycles"
-    # One `ps` per poll cycle, whatever the number of held locks: its holder liveness reads one
-    # snapshot (ps_snapshot); a per-pid `ps` per held lock (no snapshot) is the failure this catches.
+    # One `ps` per poll cycle, however many pids the callbacks read: they answer from one snapshot
+    # (ps_snapshot, renewed by ps_cycle); without it each pid read is its own `ps` (3 per cycle).
+    assert calls, "the callbacks' pid reads ran `ps`"
     assert len(calls) <= len(cycles) + 1, \
-        f"{len(calls)} ps calls for {len(cycles)} poll cycles and 3 held locks"
+        f"{len(calls)} ps calls for {len(cycles)} poll cycles of {len(pids)} pid reads"
