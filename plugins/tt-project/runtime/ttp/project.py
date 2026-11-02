@@ -506,6 +506,7 @@ EXTRA_KEYS = {
                  "rebase_replace", "never_force",   # whether a rebase replaces its branch (rebase_replace)
                  "channel_tags"},   # release-channel tags a forward move may update under never_force (channeltag)
     "jev": {"via", "url", "model"},
+    "effort_ab": {"winner", "decided_at"},   # the end rule's result, written by effortab.conclude
     "power": {"keep_awake"},
     # device_timeout_max_s: a ceiling on device-job timeouts (off: unset); see device_timeout_max.
     "runner": {"device_timeout_max_s"},

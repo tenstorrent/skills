@@ -294,6 +294,8 @@ def test_effort_ab_end_rule_stops_the_split_and_records_the_winner(env, capsys):
     cfg = p.config()
     assert (cfg["effort_ab"]["enabled"], cfg["effort_ab"]["winner"], cfg["effort_ab"]["decided_at"]) == \
         (False, "medium", now)
+    from ttp import project
+    assert project.config_problems(p.raw_config()) == []   # the recorded keys raise no config alarm
     assert effortab.conclude(p, cfg) is None   # the split is off: nothing more to decide
     # The winner runs every task the A/B covered at medium, whatever its hash; a deep retry keeps max,
     # a pinned task its pin, and the report leaves it out of the arms.
