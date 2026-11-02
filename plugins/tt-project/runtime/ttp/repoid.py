@@ -3,7 +3,7 @@
 """A repository's identity, read with git once per process and reused while it cannot have changed.
 
 A `ttp push` or a daemon tick asks the same repository the same questions from many call sites:
-its toplevel, its common directory, whether it is bare, its remotes and their URLs. Each answer
+its toplevel, its common directory, whether it is bare, whether it is inside a work tree. Each answer
 depends only on where git finds the repository from that path and on its configuration, so read()
 keeps a call's successful result under (path, args) with a stamp of both, taken with a few stat()
 calls and no git:
@@ -12,15 +12,16 @@ calls and no git:
   with that `.git`'s identity (device and inode; a gitfile's content too), the gitdir and the common
   directory it points to (a `worktree add` or `remove`, a re-init, a moved repository);
 - the repository's config, the worktree's config.worktree, the global and system config files
-  (device, inode, mtime and size: git rewrites a config file through a lock and a rename, so
-  `remote add`, `remote set-url`, `remote rename` and any `git config` write show);
+  (device, inode, mtime and size: git rewrites a config file through a lock and a rename, so any
+  `git config` write shows);
 - the environment variables git reads its location and configuration from.
 
 A lookup whose stamp differs, or older than MAX_AGE_S (a config file pulled in by [include] is not
 stamped), runs git again. Nothing is kept for a call that failed or raised, nor where discovery
 cannot be followed without git: GIT_DIR and the like set, a walk up to a GIT_CEILING_DIRECTORIES
 entry, a bare repository or a path inside a git directory. Never use it for HEAD, branches, the index or status: they move without any of this
-changing."""
+changing, nor for `remote` and `remote get-url`: gitcache.run owns those (it also follows [include]
+and config files changed within its racy window)."""
 
 from __future__ import annotations
 
@@ -119,19 +120,16 @@ def stamp(path: str | Path) -> tuple | None:
             tuple(sorted((k, v) for k, v in env.items() if k.startswith("GIT_") or k in ("HOME", "XDG_CONFIG_HOME"))))
 
 
-# The reads read() may keep (git's arguments after `-C path`); `remote get-url` takes a remote's name last.
+# The reads read() may keep (git's arguments after `-C path`).
 _EXACT = frozenset({("rev-parse", "--show-toplevel"), ("rev-parse", "--git-common-dir"),
                     ("rev-parse", "--path-format=absolute", "--git-common-dir"),
                     ("rev-parse", "--git-dir", "--git-common-dir"), ("rev-parse", "--is-bare-repository"),
-                    ("rev-parse", "--is-inside-work-tree"), ("remote",)})
-_URL = frozenset({("remote", "get-url"), ("remote", "get-url", "--push"), ("remote", "get-url", "--all"),
-                  ("remote", "get-url", "--push", "--all")})
+                    ("rev-parse", "--is-inside-work-tree")})
 
 
 def identity(args: tuple | list) -> bool:
     """Whether `args` is one of the identity reads read() may keep."""
-    args = tuple(args)
-    return args in _EXACT or (len(args) >= 3 and args[:-1] in _URL and not args[-1].startswith("-"))
+    return tuple(args) in _EXACT
 
 
 def _ok(value: Any) -> bool:
