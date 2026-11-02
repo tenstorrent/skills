@@ -11919,6 +11919,7 @@ def test_ttp_land_replays_a_reviewed_head_onto_a_moved_local_branch_and_records_
     # The probe asks this project, never the one at the folder pytest runs in.
     monkeypatch.setenv("TTP_PROJECT", str(p.base))
     monkeypatch.chdir(p.root)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))   # the probe runs in this project, whatever the cwd
     with pytest.raises(SystemExit) as e:
         cli.main(["landed", "--task", str(cid)])
     assert e.value.code == 0
