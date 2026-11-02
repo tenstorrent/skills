@@ -124,6 +124,23 @@ def test_a_codex_run_whose_rollout_lacks_its_developer_instructions_is_stopped(t
     assert info["instructions"] == {"state": "missing", "cli_version": "9.9.9"}
 
 
+def test_a_quick_codex_run_gets_its_instructions_verdict_before_the_watch_thread_starts(tmp_path, monkeypatch):
+    # The child ends before the watch thread has built its provider: the end-of-run look builds its own.
+    import threading
+    from ttp import providers
+    real = providers.get_provider
+
+    def slow(name):
+        if threading.current_thread() is not threading.main_thread():
+            time.sleep(1.5)
+        return real(name)
+    monkeypatch.setattr(providers, "get_provider", slow)
+    info = _runner_run(tmp_path, monkeypatch, _rollout_lines("0199abcd-0002", developer=False, version="9.9.9"),
+                       run_s=0)
+    assert info["instructions"] == {"state": "missing", "cli_version": "9.9.9"}, info
+    assert info["refused"] == "instructions_missing" and "held" in info["error"], info
+
+
 def test_a_coordinator_codex_run_lacking_its_instructions_is_only_reported(tmp_path, monkeypatch):
     info = _runner_run(tmp_path, monkeypatch, _rollout_lines("0199abcd-0002", developer=False), task="", run_s=1)
     assert info["stopped"] is None and "refused" not in info, info

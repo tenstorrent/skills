@@ -530,10 +530,17 @@ def supervise(run_dir: Path) -> int:
             rc = child.wait()
             break
     ended, mono_end, up = time.time(), time.monotonic(), awake.tick()
-    if inst["open"] and inst["prov"] is not None:
+    if inst["open"]:
         # A run that ended before a verdict: one last look, which never reports a missing transcript.
-        got = check_instructions(inst["prov"], run_dir, out_path, argv, env, 0.0)
-        inst["got"] = got or None
+        # A quick run can end before the watch thread built its provider: build it here then.
+        try:
+            if inst["prov"] is None:
+                from .providers import get_provider
+                inst["prov"] = get_provider(spec["provider"]).use(spec.get("model", ""), spec.get("prices"))
+            got = check_instructions(inst["prov"], run_dir, out_path, argv, env, 0.0)
+            inst["got"] = got or None
+        except Exception as e:
+            print(f"runner: could not check the run's system prompt: {e}", flush=True)
     if bridge is not None:
         bridge.stop()
     if guard is not None:   # a normal end: the watchdog leaves the group alone
