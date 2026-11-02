@@ -1234,3 +1234,146 @@ def test_f_a_read_longer_than_the_slice_runs_outside_the_write_lock(env, monkeyp
              and "refs/heads/" in ln]
     assert calls, "the body made no for-each-ref read"
     assert any(not ok for _, ok in holds), holds
+
+
+def test_b_a_warm_finish_spawns_no_git_under_the_write_lock(env, monkeypatch):
+    """With the warm-up's answers (_prefetch_git), each finish commits in its first round and holds the
+    lock at most 1 s; the code finish spawns no git while it holds it. The review-approval finish keeps
+    pushq.check_approval's local ref reads (an accepted gap, sa28) and its update-ref write."""
+    s, holds, lines, walls = _finish_holds(env, monkeypatch, True, n=40, delay=0.0)
+    assert len(holds) == 2 and all(ok and h <= 1.0 for h, ok in holds), (holds, [ln[-400:] for ln in lines])
+    assert len(lines) == 2 and all("rounds 1, " in ln for ln in lines), lines
+    assert "rounds 1, live git 0 " in lines[0], lines[0][-400:]
+
+
+def test_c_strict_rounds_write_the_rows_one_transaction_writes(env, monkeypatch):
+    """Rounds rolled back and retried (a 2 s read the body makes, past the 1 s slice, the warm-up off)
+    leave the same rows, times masked, as the one-transaction finish of the same project. The other
+    reads are fast, so no read after a round's point of no return is cut by the slice."""
+    import sqlite3
+    from ttp import daemon as dmod, gitmemo, gitreplay, pushq
+    s, runs = _big_finish(env, monkeypatch, 60)
+    _slow_git(env["tmp"], monkeypatch, delay=0.0, slow="*for-each-ref*refs/heads/*", slow_s=2.0)
+    monkeypatch.setattr(gitmemo, "TICK_GIT_S", 30.0)
+    before = sqlite3.connect(":memory:")
+    s.p.db.conn.backup(before)
+    files = {f: f.read_bytes() for rid in runs for f in (s.p.runs / str(rid)).iterdir()}
+    rows, rounds = {}, {}
+    for strict in (True, False):
+        monkeypatch.setattr(dmod, "FINISH_STRICT", strict)
+        monkeypatch.setattr(gitmemo, "HOLD_SLICE_S", 1.0)
+        before.backup(s.p.db.conn)
+        for f, data in files.items():
+            f.write_bytes(data)
+        gitreplay.clear()
+        monkeypatch.setattr(pushq, "_default_branches", {})   # its process cache: each finish starts cold
+        d = dmod.Daemon(s.p.base)
+        monkeypatch.setattr(d, "_prefetch_git", lambda task, result: None)
+        tx = _timed_tx(monkeypatch, d.p.db)
+        for rid in runs:
+            with gitmemo.bounded(gitmemo.TICK_GIT_S):
+                d.finish_run(d.p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                             {"rc": 0, "started": 1.7e9, "ended": 1.7e9 + 60, "stopped": None})
+        rows[strict], rounds[strict] = _masked_rows(d.p.db), len(tx)
+    assert rounds[True] > rounds[False] == 2, rounds
+    for name in rows[False]:
+        assert rows[True][name] == rows[False][name], name
+
+
+@pytest.mark.parametrize("k", range(1, 11))
+def test_d_a_round_rolled_back_at_any_git_read_starts_its_probe_once(env, monkeypatch, k):
+    """A GitMiss at the k-th git read of a strict round (any k a real miss can come at: before the
+    point of no return) rolls the round back and the next one finishes it: the escalated wake's probe
+    starts once, and no event or log line is written twice."""
+    from ttp import daemon as dmod, gitmemo, probespawn
+    s, runs = _big_finish(env, monkeypatch, 20)
+    p = s.p
+    rid = runs[0]
+    p.db.x("UPDATE runs SET note=? WHERE id=?", (json.dumps({"wake": {"tier": "light"}}), rid))
+    (p.runs / str(rid) / "result.json").write_text(json.dumps(
+        {"status": "waiting", "summary": "found work", "waiting_for": "its build", "retry_after_s": 0,
+         "wake_tier": "standard", "retry_when": "true"}))
+    started = []
+
+    class Pending(probespawn.Pending):   # a subclass: callers check isinstance
+        def __init__(self, *a, **kw):
+            started.append(a)
+            super().__init__(*a, **kw)
+    monkeypatch.setattr(probespawn, "Pending", Pending)
+    seen, injected, real_run = [0], [], gitmemo.run
+
+    def run(argv, *, timeout=None, read=None, **kw):
+        rd = (a := gitmemo._att.get()) is not None and a.strict
+        if rd and rd.abort():
+            seen[0] += 1
+            if seen[0] == k:
+                injected.append(argv)
+                raise gitmemo.GitMiss(argv, kw, timeout, read, "injected", learn=True)
+        return real_run(argv, timeout=timeout, read=read, **kw)
+    monkeypatch.setattr(gitmemo, "run", run)
+    d = dmod.Daemon(p.base)
+    dlog = p.logs / "daemon.log"
+    log0 = len(dlog.read_text().splitlines()) if dlog.exists() else 0
+    tx = _timed_tx(monkeypatch, d.p.db)
+    with gitmemo.bounded(gitmemo.TICK_GIT_S):
+        d.finish_run(d.p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                     {"rc": 0, "started": time.time() - 60, "ended": time.time(), "stopped": None})
+    assert p.db.task(s.code)["status"] == "queued"
+    assert len(started) == 1, started
+    assert injected or k > 1, "the waiting finish reads no git before its probe starts"
+    if injected:
+        assert any(not ok for _, ok in tx), tx
+    events = [(e["kind"], e["text"]) for e in p.db.q("SELECT kind,text FROM events")]
+    assert len(events) == len(set(events)), events
+    new = [ln.split(" ", 1)[1] for ln in dlog.read_text().splitlines()[log0:]]
+    assert len(new) == len(set(new)), new
+
+
+def test_e_a_git_write_in_a_strict_round_keeps_its_own_cap(env, monkeypatch, tmp_path):
+    """A git write (a verb not in READS) in a strict round runs with its own cap, never cut to what is
+    left of the slice: a 0.5 s update-ref behind a 0.1 s slice, and another once the slice is spent,
+    both complete, and the first makes the round's point of no return."""
+    from ttp import gitmemo
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git_out(repo, "init", "-q")
+    _git_out(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "c")
+    _slow_git(tmp_path, monkeypatch, delay=0.0, slow="*update-ref*", slow_s=0.5)
+    with gitmemo.bounded(gitmemo.TICK_GIT_S), gitmemo.attempt(), gitmemo.strict(0.1) as rd:
+        for n in (1, 2):
+            r = gitmemo.run(["git", "-C", str(repo), "update-ref", f"refs/ttp/push/{n}", "HEAD"], timeout=10,
+                            capture_output=True, text=True)
+            assert r.returncode == 0 and rd.pnr, (n, r)
+            assert rd.left() <= 0, rd.live_s
+    assert _git_out(repo, "rev-parse", "refs/ttp/push/2") == _git_out(repo, "rev-parse", "HEAD")
+
+
+def test_g_a_read_that_never_settles_degrades_as_a_git_failure_in_the_final_round(env, monkeypatch):
+    """A read whose answer is never kept (the memo misses it every round) ends the rounds at MAX_ROUNDS;
+    the final round may not abort, so the read fails fast as a timed-out git does: the finish commits,
+    the review is not queued now, and sweep_unreviewed queues it later."""
+    from ttp import daemon as dmod, gitmemo, gitreplay
+    real_get = gitreplay.get
+    monkeypatch.setattr(gitmemo, "MAX_ROUNDS", 4)
+    monkeypatch.setattr(gitreplay, "get", lambda k, *a: None if "merge-base" in k.args else real_get(k, *a))
+    s, holds, lines, walls = _finish_holds(env, monkeypatch, True, slice_s=0.0, n=20, warm=False, delay=0.0)
+    assert s.p.db.task(s.code)["status"] == "done"
+    first = next(i for i, (_, ok) in enumerate(holds) if ok)
+    assert first == gitmemo.MAX_ROUNDS, holds   # the code task's rounds: MAX_ROUNDS rolled back, then the final one
+    reviews = s.p.db.q("SELECT id FROM tasks WHERE kind='review' AND status='queued' AND title LIKE ?",
+                       (f"Review #{s.code}:%",))
+    assert not reviews, "the code task's review was queued in the degraded round"
+    s.p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 3600, s.code))
+    s.p.db.update_task(s.review, status="cancelled")   # the fixture's review of an earlier head covers it
+    assert dmod.Daemon(s.p.base).sweep_unreviewed(force=True) == [s.code]
+
+
+def _masked_rows(db) -> dict:
+    """Every table's rows with what a retried round may change masked: times (epoch seconds, ISO stamps)."""
+    stamp = re.compile(r"\b1[6-9]\d{8}(\.\d+)?\b|\d{4}-\d\d-\d\dT\d\d:\d\d(:\d\d(\.\d+)?)?\S*")
+    out = {}
+    for (name,) in db.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
+        out[name] = [tuple("T" if isinstance(v, (int, float)) and v > 1.6e9 else
+                           stamp.sub("T", v) if isinstance(v, str) else v for v in row)
+                     for row in db.conn.execute(f"SELECT * FROM {name} ORDER BY rowid")]
+    return out

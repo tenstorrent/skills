@@ -268,7 +268,8 @@ def run(argv: list | tuple, *, timeout: float | None = None, read: bool | None =
         **kw: Any) -> subprocess.CompletedProcess:
     """The one way a runtime git helper runs git (subprocess.run's arguments): its own `timeout` is
     capped by timeout() for the verb argv names (`read` as there). Within an attempt a read's answer
-    is kept and replayed; within a strict round a miss runs live only within the slice."""
+    is kept and replayed; within a strict round a read's miss runs live only within the slice (a write
+keeps its own cap and makes the round's point of no return)."""
     from . import gitreplay
     args = git_args(argv)
     a = _att.get()
@@ -288,15 +289,15 @@ def run(argv: list | tuple, *, timeout: float | None = None, read: bool | None =
     check = bool(kw.pop("check", False))
     write = not (args[:1] and args[0] in READS) and not _pure(args)
     slice_binds = False
-    if rd:
+    if rd and write:
+        rd.pnr = True   # a write keeps its own cap: the slice never refuses, binds or kills it
+    elif rd:
         left = rd.left()
-        if left <= 0 or (write and rd.abort() and t is not None and t > left):
+        if left <= 0:
             if rd.abort():
                 raise GitMiss(argv, {**kw, "check": check}, timeout, read, "past the round's slice",
                               learn=k is not None)
             raise subprocess.TimeoutExpired(list(argv), 0)
-        if write:
-            rd.pnr = True
         slice_binds = t is None or t > left
         t = left if slice_binds else t
     if k is not None:
