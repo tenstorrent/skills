@@ -103,6 +103,17 @@ passed again for Claude Code with workers in the write fence (38 s, $0.12).
   On Linux the sandbox helper (read from the same build) runs the worker in a network namespace of
   its own with a private loopback, so the host's loopback services are out of reach. Workers do not need them: `ttp` commands and the hand-off write files under the
   project state, which `--add-dir` keeps writable.
+- Claude Code, known limitation: a mount race in the write fence (Linux, 2.1.296). For each fenced
+  Bash command the CLI mounts a placeholder over the repository's missing `.git/config.lock`,
+  which creates an empty file there, and deletes it afterwards. A sandbox that starts meanwhile
+  sees the file, it is gone by the time bwrap mounts it, and the command fails with
+  `bwrap: Can't get type of source path ...: No such file or directory`. tt-project cannot change
+  this; its hook tells the worker the failure is a transient mount race and to re-run the same
+  command unchanged. In a repro with 8 sandboxes running 60 commands each at once, 17-23% of
+  commands failed this way. Adding or removing a worktree in the shared `.git/worktrees` while
+  sandboxes start fails them the same way (88-92% of commands in that repro), so tt-project's own
+  short-lived checkouts (`ttp checks`' clean checkout, after_push) are scratch clones that borrow
+  the repository's objects, not worktrees: with them no command failed on a worktree path.
 - Codex: the harness hook runs only where hooks are on and no other hook source exists.
   Otherwise a worker sees an update only when it reads `steer.md` between steps.
 - Codex: the docs give no version for `developer_instructions` or
