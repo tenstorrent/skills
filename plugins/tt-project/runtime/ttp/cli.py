@@ -31,7 +31,7 @@ from . import __version__, poll_s
 from .db import CHANGES_NEEDED, chat_floor, task_outcome
 from . import outbox
 from .devq import unmask_devices
-from . import scriptwatch, sshcmd, timefmt
+from . import scriptwatch, sshcmd, timefmt, workerloss
 from . import schedule as sched
 from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
                       durable_append, durable_write, write_json, ACCOUNT_KEYS, DEFAULT_CONFIG, deep_merge,
@@ -2900,6 +2900,7 @@ def cmd_checks(a) -> None:
     timed_out, deadline, ran_since = None, None, 0.0   # the wall-time cap (checkwall) and its outcome
     ran_cpu = 0.0   # the CPU its children had used when its commands started (checkcap.record_cost)
     spilled = None   # the spill host's claim when the checks run there (checkspill)
+    worker_loss = None   # test workers lost again on the rerun: an infrastructure fault (workerloss)
     run_env: dict = {}   # what the checks run in, for the pass's envs (pushpass.check_envs)
     join_rec, joined = None, None   # this run's checkjoin record; the run it followed and how
     base = _checks_base(p, Path(top), cmds)
@@ -3169,13 +3170,22 @@ def cmd_checks(a) -> None:
                     out.flush()
                     check_start = out.tell()
                 began = time.monotonic()
+                loss_reruns = 0
                 try:
-                    rc = scriptwatch.rerun(
-                        lambda: _run_check(_low_priority(push.check_argv(c, cwd, env)), group, record=reap_rec, cwd=cwd,
-                                           stdout=out,
-                                           stderr=subprocess.STDOUT, env=env, timeout=checkwall.deadline_left(deadline),
-                                           silent_s=checkwall.silent_limit(c), pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ()),
-                        bool, None if push.remote_host(c) else str(c), cwd, env, said)
+                    while True:
+                        rc = scriptwatch.rerun(
+                            lambda: _run_check(_low_priority(push.check_argv(c, cwd, env)), group, record=reap_rec, cwd=cwd,
+                                               stdout=out,
+                                               stderr=subprocess.STDOUT, env=env, timeout=checkwall.deadline_left(deadline),
+                                               silent_s=checkwall.silent_limit(c), pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ()),
+                            bool, None if push.remote_host(c) else str(c), cwd, env, said)
+                        # A test worker lost mid-run is the host, not the change: once more (workerloss).
+                        if rc == 0 or push.remote_host(c) or loss_reruns >= workerloss.RERUNS:
+                            break
+                        if not workerloss.only(loss := workerloss.lost(_log_since(out, log, check_start))):
+                            break
+                        loss_reruns += 1
+                        said(workerloss.rerun_line(loss, str(c)))
                 except checkwall.Silent as e:
                     # No output for its silence limit: a hang, stopped as at the wall-time cap; never a pass.
                     passed, failed, rc = False, c, checkwall.RC
@@ -3194,11 +3204,10 @@ def cmd_checks(a) -> None:
                     break
                 if rc != 0:
                     passed, failed = False, c
+                    if loss_reruns and workerloss.infra(loss := workerloss.lost(_log_since(out, log, check_start))):
+                        worker_loss = loss
                     if cwd != top:   # what only this worktree has may be what the check missed
-                        out.flush()
-                        with open(log, "rb") as f:
-                            f.seek(check_start)
-                            output = f.read().decode("utf-8", errors="replace")
+                        output = _log_since(out, log, check_start)
                         if clean_note := cleantree.hint(cleantree.authoring_only(top, cwd, str(c), output)):
                             out.write(f"ttp checks: {clean_note}\n")
                     out.write(_check_took(c, rc, began))
@@ -3283,6 +3292,19 @@ def cmd_checks(a) -> None:
             if join_rec:   # the run here registers again; its followers queue again and join that one (checkjoin)
                 checkjoin.forget(p.state)
             return cmd_checks(a)
+        # Test workers lost again on the rerun: the host, never a failure of the change (workerloss).
+        if worker_loss is None:
+            workerloss.clear(run_dir)
+        elif not passed and not _CHECK_STOP.get("stopped"):
+            workerloss.write_marker(run_dir, worker_loss, str(failed))
+            said = (f"{workerloss.line(worker_loss, str(failed))}. Run the checks again later (a quieter host); "
+                    "the change is neither passed nor failed")
+            out.write(f"ttp checks: {said}\n")
+            write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": False,
+                                                             "commands": todo, "skipped": skipped, "ts": time.time(),
+                                                             "purpose": purpose, "infra_fault": "test-worker-lost"})
+            print(f"ttp checks: {said}", file=sys.stderr)
+            sys.exit(75)
         # A check host ssh could not reach (or that could not take the tree) is the environment, as a
         # missing runner is: wait for it, counting nothing against the change (envfault).
         if not passed and (fault := push.remote_fault(failed, rc, top)):
@@ -4136,6 +4158,14 @@ def _checks_stop(sig, _frame):
     raise SystemExit(128 + sig)
 
 
+def _log_since(out, log, start: int) -> str:
+    """What the checks log holds from `start`: a check's own output."""
+    out.flush()
+    with open(log, "rb") as f:
+        f.seek(start)
+        return f.read().decode("utf-8", errors="replace")
+
+
 def _check_took(c, rc: int, began: float) -> str:
     """checks.log's line for one check's wall-clock seconds, so a slow suite shows in the log."""
     return f"ttp checks: {c} took {time.monotonic() - began:.1f} s (exit {rc})\n"
@@ -4647,6 +4677,8 @@ def _checks_result(run_dir: Path) -> int:
     if rc_file.exists():
         if why := _checks_dropped(run_dir):
             print(f"ttp checks: dropped: {why}; nothing more runs, so run `ttp checks --detach` again")
+        if rc_file.read_text().strip() == "75" and (lost := workerloss.marker(run_dir)):
+            print(f"ttp checks: {workerloss.line(lost, lost['check'])}; run `ttp checks --detach` again")
         print(f"ttp checks: finished with exit code {rc_file.read_text().strip()}")
         print(f"ttp checks: full output ('$ cmd' lines, test results) in {run_dir / 'checks.log'}")
         from . import slowtests
