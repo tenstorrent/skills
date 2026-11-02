@@ -10480,6 +10480,7 @@ class Daemon:
                    and not (key == "lost_to_reboot" and n.get("shutdown") == "orderly"))
 
     def _start_probe(self, tid: int, probe: str, now: float, what: str = "retry_when") -> None:
+        gitmemo.no_return()   # what it starts and keeps here outlives a rolled-back finish round
         self._probed[tid] = now
         if ends.hides_test(probe):   # stored before it was refused: a broken probe, never a pass
             self._probe_rc[tid] = (ends.TRIVIAL_WHY, now, probe)

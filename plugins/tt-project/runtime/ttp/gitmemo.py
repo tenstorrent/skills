@@ -201,6 +201,14 @@ def strict(slice_s: float, abortable: bool = True) -> Iterator[_Round]:
             a.strict, a.last = None, rd
 
 
+def no_return() -> None:
+    """The open strict round never aborts from here on: its caller changes what a rollback cannot undo
+    (the daemon's memory, a process started off the thread). Outside a round: nothing."""
+    a = _att.get()
+    if a is not None and a.strict is not None:
+        a.strict.pnr = True
+
+
 def tx_note() -> str:
     """The slow-tx log's round figures for the transaction just ended, "" outside a round."""
     a = _att.get()

@@ -733,6 +733,86 @@ def test_every_git_helper_takes_gitmemos_cap():
     assert set(GIT_HELPER_OWN_TIMEOUT) <= found, set(GIT_HELPER_OWN_TIMEOUT) - found   # no stale entry
 
 
+# Daemon attributes the finish body (the methods a `for rnd in self._finish_rounds(...)` body calls,
+# and those they call) changes. A round that rolls back to run again (GitMiss) keeps such a change,
+# so each is either behind the round's point of no return or safe to keep, with its reason.
+FINISH_ROUND_MEMORY = {
+    "_probed": "_start_probe: gitmemo.no_return() first, so its round never rolls back",
+    "_probe_rc": "_start_probe: as _probed",
+    "_probe_ctx": "_start_probe: as _probed",
+    "_probe_diag": "_start_probe: as _probed",
+    "_probe_files": "_start_probe: as _probed",
+    "_probes": "_start_probe: as _probed",
+    "_local_only_due": "a timer set to now: a retry only checks remote copies sooner",
+    "_root_checked": "a timer: kept, a retry's root check waits as the first's did; its alert rows are rolled back",
+    "_cycles": "a cache of host-cycle records read from files, not from the rolled-back rows",
+    "_nofix": "scratch: _fix_failed_review sets it before each use",
+    "_wait_what_errs": "a log-once set: a retried round may drop that one line, never repeat it",
+}
+_MUTATORS = frozenset({"pop", "append", "add", "update", "clear", "setdefault", "discard", "remove", "extend",
+                       "insert", "popitem"})
+
+
+def _finish_round_mutations() -> dict[str, set[str]]:
+    tree = ast.parse((RUNTIME / "ttp" / "daemon.py").read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Daemon")
+    meths = {f.name: f for f in cls.body if isinstance(f, ast.FunctionDef)}
+
+    def calls(node) -> set[str]:
+        return {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute) and n.attr in meths
+                and isinstance(n.value, ast.Name) and n.value.id == "self"}
+
+    roots = set()
+    for f in meths.values():
+        for n in ast.walk(f):
+            if isinstance(n, ast.For) and isinstance(n.iter, ast.Call) \
+                    and getattr(n.iter.func, "attr", "") == "_finish_rounds":
+                roots |= set().union(*(calls(b) for b in n.body))
+    assert {"_finish_worker", "_finish_coordinator"} <= roots, roots   # the scan sees the four bodies
+    seen, todo = set(), list(roots)
+    while todo:
+        m = todo.pop()
+        if m not in seen:
+            seen.add(m)
+            todo += calls(meths[m]) - seen
+
+    def attr(n):
+        while isinstance(n, ast.Subscript):
+            n = n.value
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "self":
+            return n.attr
+
+    found: dict[str, set[str]] = {}
+    for m in seen:
+        for n in ast.walk(meths[m]):
+            if isinstance(n, (ast.Assign, ast.Delete)):
+                targets = n.targets
+            elif isinstance(n, (ast.AugAssign, ast.AnnAssign)):
+                targets = [n.target]
+            elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in _MUTATORS:
+                targets = [n.func.value]
+            else:
+                continue
+            for t in targets:
+                for x in t.elts if isinstance(t, ast.Tuple) else [t]:
+                    if a := attr(x):
+                        found.setdefault(a, set()).add(m)
+    return found
+
+
+def test_daemon_memory_a_finish_round_changes_is_listed_with_its_reason():
+    """A finish round can roll back and run its body again (Daemon._finish_rounds); the db rows go, the
+    daemon's own attributes stay. Every attribute the body's methods change is listed in
+    FINISH_ROUND_MEMORY with why keeping it is safe, so a new one fails here, not in a review."""
+    found = _finish_round_mutations()
+    new = {a: sorted(ms) for a, ms in found.items() if a not in FINISH_ROUND_MEMORY}
+    assert not new, f"daemon attributes a finish round changes, unlisted: {new}"
+    assert set(FINISH_ROUND_MEMORY) <= set(found), set(FINISH_ROUND_MEMORY) - set(found)   # no stale entry
+    src = (RUNTIME / "ttp" / "daemon.py").read_text()
+    body = src[src.index("    def _start_probe(self"):]
+    assert body.index("gitmemo.no_return()") < body.index("self._probed[tid] = now")
+
+
 def _full_daemon_log(monkeypatch):
     """While the returned flag is set, every open of a path ending in daemon.log raises ENOSPC (a full
     state filesystem); clear it and space has returned."""
