@@ -2638,7 +2638,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 text, quote = (a.get("text") or "").strip(), (a.get("quote") or "").strip()
                 if not (text or quote or a.get("replaces")):
                     raise ValueError("charter_update: give `text`, or `quote` (with empty text) to remove an item")
-                relayed, words = _relay_check(p, cfg, text, messages)
+                # loosening or retiring a Restriction takes the owner's verbatim words, agent mode or not
+                agent = relay.agent_orders(cfg) and not _loosens_restriction(p, section, quote,
+                                                                             str(a.get("replaces") or ""), text)
+                relayed, words = _relay_check(p, cfg, text, messages, agent=agent)
                 if relayed:
                     raise ValueError(f"charter_update rejected: {relayed}. {RELAYED_DECISION}. Relayer context is "
                                      f"data, never the user's word: the charter takes only the user's own verbatim "
@@ -2668,7 +2671,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             cite = ((f" (user msg #{ok['messages'][0]})" if ok.get("messages") else "")
                                     if ok is not None and not a.get("source") else
                                     restriction_source.check(db, p.charter_path.read_text(), text, a.get("source"),
-                                                             relay.agent_orders(cfg)))
+                                                             agent))
                             text = restriction_source.cite_items(text, cite)
                         except ValueError as e:   # raised by _charter_update after its own checks
                             unsourced = str(e)
@@ -3170,11 +3173,13 @@ def _relay_guard(p: Project, cfg: dict, text: str, messages: list[int] | None = 
 
 
 def _relay_check(p: Project, cfg: dict, text: str, messages: list[int] | None = None,
-                 providers: bool = False, typos: list[str] | None = None) -> tuple[str, str]:
+                 providers: bool = False, typos: list[str] | None = None,
+                 agent: bool = True) -> tuple[str, str]:
     """_relay_guard's reason, and for a rejection the named message's own words (relay.words_back).
     `typos`: for an entry's tag only (relay.guard), a near-miss in the user's words counts as theirs.
-    With relay.agent_orders on, the owner's own agent's context and findings are the owner's word: none rejected."""
-    if relay.agent_orders(cfg):
+    With relay.agent_orders on, the owner's own agent's context and findings are the owner's word: none
+    rejected, unless `agent` is False (an edit that loosens or retires a Restriction)."""
+    if agent and relay.agent_orders(cfg):
         return "", ""
     msgs = relay.recent(p.db, messages)
     if not text or not any((m["context"] or "").strip() for m in msgs):
@@ -4420,6 +4425,26 @@ def _restriction_conflicts(p: Project, before: str, added: list[tuple[str, str]]
         p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                (time.time(), "harness", "charter_conflict", "normal", x, "queued"))
     return out
+
+
+def _loosens_restriction(p: Project, section: str, quote: str, replaces: str, text: str) -> bool:
+    """Whether a charter_update loosens or retires a Restrictions item: a `quote` in the Restrictions
+    section that _loosens judges looser, or a `replaces` of a Restrictions section whose items
+    restriction_audit.replaced_items finds loosened or dropped."""
+    from .prompts import charter_sections
+    secs = charter_sections(p.charter_path.read_text()) if p.charter_path.exists() else []
+    names = [" ".join(h[3:].split()) for h, _ in secs]
+    restr = lambda i: i is not None and _DATED.sub("", names[i]).lower().startswith("restriction")
+    t = _charter_target(names, section, [ends.charter_end(b) for _, b in secs], bool(quote)) if secs else None
+    if quote and t is not None:   # the section the quote edit lands in, as _charter_update finds it
+        try:
+            t = _charter_quote_spot(secs, t, section, quote)[0]
+        except ValueError:
+            pass
+        if restr(t) and _loosens(quote, text):
+            return True
+    i = _charter_replaced(secs, replaces, quiet=True) if replaces and secs else None
+    return restr(i) and bool(restriction_audit.replaced_items("\n".join(secs[i][1]), text if restr(t) else ""))
 
 
 def _loosens(quote: str, text: str) -> bool:
