@@ -43,6 +43,23 @@ def test_worker_loss_alone_with_clean_exits_is_infra_and_nothing_else_is():
     assert errs["other"] == 1 and not workerloss.only(errs), "an error besides the loss is a real failure"
 
 
+def test_worker_loss_collector_reads_as_the_whole_output_and_keeps_no_quoted_line():
+    """A runner that keeps only its last lines feeds a Collector: lost() reads the same from it as from
+    the whole output; a diff or short-summary line quoting the runner's message never counts."""
+    from ttp import workerloss
+    quoted = ("_ test_parser _\n>       assert lost(x) is None\n"
+              "E       the test worker process 7 ended (wait status 0) before this test finished\n"
+              "FAILED tests/t.py::test_left_0 - no test worker was left to run this test\n")
+    for text in (_lost_log([0, 0], left=3), _lost_log([0, 9]), _lost_log([0], left=1, failed=3),
+                 quoted + "===== 1 failed in 1.00s =====\n", "lots of output\r\n" * 50 + _lost_log([0], left=2)):
+        c = workerloss.Collector()
+        for line in text.splitlines(keepends=True):
+            c.feed(line)
+        assert workerloss.lost(c.text()) == workerloss.lost(text.replace("\r\n", "\n")), text[-200:]
+        c.reset()
+        assert c.text() == "" and workerloss.lost(c.text()) is None
+
+
 def test_worker_loss_marker_round_trips_and_a_broken_one_reads_as_none(tmp_path):
     from ttp import workerloss
     loss = workerloss.lost(_lost_log([0, 0]))
@@ -167,12 +184,12 @@ def test_push_run_one_infra_hold_names_a_time_retry_when(tmp_path):
 
 
 def _loss_batch(env, monkeypatch, name, runs):
-    """A push queue batch of one entry whose push check prints `runs` (see _lost_check): (exit code,
-    marker, how many times the check ran)."""
+    """A push queue batch of one entry whose push check prints `runs` (see _lost_check) with the entry's
+    change and passes on the tip alone: (exit code, marker, how many times it ran with the change)."""
     d = env["tmp"] / name
     d.mkdir()
     argv, ran = _lost_check(d, runs)
-    p, repo, origin, other = _bump_setup(env, monkeypatch, [" ".join(argv)])
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [f"[ -e plugins/p/f1.txt ] || exit 0; {' '.join(argv)}"])
     rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})]), monkeypatch)
     return rc, m, ran()
 
@@ -199,13 +216,13 @@ def test_push_batch_holds_on_lost_workers_again_and_requeues_its_entries_not_fai
 
 def test_push_batch_a_crash_twice_or_a_loss_beside_real_failures_still_fails(env, monkeypatch, capsys):
     rc, m, ran = _loss_batch(env, monkeypatch, "crash", [_lost_log([0, 9])])
-    assert m["outcome"] != "worker_loss" and _statuses(m) == ["check_failed"] and ran >= 2, m
-    capsys.readouterr()
+    assert m["outcome"] != "worker_loss" and _statuses(m) == ["check_failed"] and ran == 2, m
+    assert capsys.readouterr().out.count("a test worker was lost mid-run") == 1, "rerun once, then a failure"
 
 
 def test_push_batch_a_loss_beside_real_failures_fails_without_a_rerun(env, monkeypatch, capsys):
     rc, m, ran = _loss_batch(env, monkeypatch, "real", [_lost_log([0], left=3, failed=6)])
-    assert m["outcome"] != "worker_loss" and _statuses(m) == ["check_failed"] and ran >= 1, m
+    assert m["outcome"] != "worker_loss" and _statuses(m) == ["check_failed"] and ran == 1, m
     assert "a test worker was lost mid-run" not in capsys.readouterr().out
 
 

@@ -3687,14 +3687,17 @@ def _kill_tree(pid: int) -> None:
 
 def _copy_out(stream, collect: workerloss.Collector) -> None:
     """A check's output into this process's output (the push log), each line also to `collect`."""
-    for raw in iter(stream.readline, b""):
-        line = raw.decode(errors="replace")
-        collect.feed(line)
-        try:
-            sys.stdout.write(line)
-            sys.stdout.flush()
-        except (OSError, ValueError):
-            pass
+    try:
+        for raw in iter(stream.readline, b""):
+            line = raw.decode(errors="replace")
+            collect.feed(line)
+            try:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            except (OSError, ValueError):
+                pass
+    finally:
+        stream.close()
 
 
 def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int:
