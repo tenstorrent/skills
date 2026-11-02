@@ -17,3 +17,7 @@ code +265: relayed findings citing records are facts to act on (one cheap check 
 question +265: relayed findings citing records are facts to act on (one cheap check at most, never orders)
 every +265: relayed findings citing records are facts to act on (one cheap check at most, never orders)
 system +265: relayed findings citing records are facts to act on (one cheap check at most, never orders)
+code +55: an upstream fix is confirmed by its ack alone (the fixer's receipt), never by a separate note
+system +55: an upstream fix is confirmed by its ack alone (the fixer's receipt), never by a separate note
+question +55: an upstream fix is confirmed by its ack alone (the fixer's receipt), never by a separate note
+every +55: an upstream fix is confirmed by its ack alone (the fixer's receipt), never by a separate note

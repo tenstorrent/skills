@@ -828,6 +828,11 @@ def test_a_confirmation_is_the_senders_ack_and_closes_on_the_fixing_project_with
     assert ev["status"] == "handled" and ev["severity"] == "low" and upstream.CONFIRMATION in ev["text"], ev
     assert upstream.wontfixed(n["fp"])["note"].startswith(upstream.CONFIRMATION)
     assert upstream.confirmations_closed("second", time.time() - 60) == 1
+    # A crash before the read cursor moved reads the note again: it is still closed once.
+    dst.db.set_kv(upstream.KV_CURSOR, {})
+    assert upstream.ingest(dst, dst.config()) == 1
+    assert upstream.confirmations_closed("second", time.time() - 60) == 1
+    dst.db.x("DELETE FROM events WHERE kind='upstream_note' AND id > (SELECT MIN(id) FROM events WHERE kind='upstream_note')")
     assert any("confirmation notes closed model-free" in x and x.endswith(": 1")
                for x in audit.lines(dst.db, p=dst)), audit.lines(dst.db, p=dst)
     # An fp that has no fix here is refused whole: nothing recorded, nothing sent.

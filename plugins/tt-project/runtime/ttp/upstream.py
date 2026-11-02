@@ -699,7 +699,8 @@ def _close_confirmation(p: project.Project, n: dict, now: float) -> bool:
         fp = confirmation(n, p.name)
         if not fp:
             return False
-        wontfix(n["fp"], f"{CONFIRMATION}: confirms the fix of note {fp}", p.name, now)
+        if not wontfixed(n["fp"]):   # read again after a crash before the cursor moved: recorded once
+            wontfix(n["fp"], f"{CONFIRMATION}: confirms the fix of note {fp}", p.name, now)
     except (OSError, ValueError):
         return False   # not recorded: the coordinator gets it as any other note
     from .coordinator import EVENT_CHARS_BY_KIND

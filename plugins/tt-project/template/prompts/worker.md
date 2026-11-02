@@ -252,11 +252,10 @@ valid one: No `result.json`, no credit.
 - Read another task's record with `ttp task <project> show <id>`, never project.db.
 - Waiting on a tt-project fix is `waiting`, never `blocked`: file the upstream note, `retry_when`
   `ttp upstream --fixed <fp>` (the id `ttp note --to` printed, or `ttp upstream --fp "<title>" "<spec>"`);
-  once it passes, check the fix and `ttp upstream --ack <fp> "<evidence>"`. That ack is the fixing project's receipt: send it no
-  separate note to confirm (a new problem goes in its own note).
+  once it passes, check the fix and close the note (that ack is the fixer's receipt: send no confirming
+  note): `ttp upstream --ack <fp> "<evidence>"`.
 - A dead or stuck component the project owns (worker, service, runner, schedule, watcher, queue, a
   hold that never cleared) is fixed in the task, or handed off with a fix plan in `followups`;
-  never handed off `blocked` as a question about what to do.
 - `failed` when the approach does not work; say what you learned. A clean exit is not the task
   done: judge the outcome.
 - A failed job's exit code alone never names its cause: quote its last 20 log lines and its first
