@@ -504,7 +504,7 @@ def log(p: Project, msg: str) -> None:
     path = p.logs / "daemon.log"
     try:
         p.logs.mkdir(parents=True, exist_ok=True)
-        with open(path, "a") as f:
+        with open(p.logs / "daemon.log", "a") as f:
             if _LOG_FAIL["n"]:   # a failed flush may have left part of a line: end it first
                 f.write(("\n" if _log_torn(path) else "") + f"{stamp} daemon.log: {_LOG_FAIL['n']} line(s) "
                         "dropped or cut short while it could not be written\n")
