@@ -339,3 +339,80 @@ def test_a_correction_followed_only_by_a_report_only_llm_schedule_keeps_its_line
     p.db.x("DELETE FROM task_class_fix")
     from ttp import coursecheck, push
     assert coursecheck.lines(p.db, cfg, p.state / push.DETACHED, now)[0] == []   # 0 turns it off
+
+
+_CC_ASK = ("May I push the widgets release branch? The charter policy keeps the widgets release branch frozen: check every run before "
+           "pushing, only the runs listed at https://github.com/acme-org/widgets.\n\nMy recommendation: approve "
+           "the frozen branch push.")
+
+
+def test_an_open_ask_and_a_new_request_sharing_only_common_words_boilerplate_and_a_url_part_is_no_answer(env):
+    """(1) A new request sharing only common words ('check', 'every', 'runs', 'only', 'before'), the ask's
+    boilerplate ('recommendation') and a URL part (an org name) is no answer: no rule clash line and no
+    correction flagged. (2) A reply sharing the ask's own terms, or a bare yes, is one."""
+    from ttp import correction
+    p = make(env)
+    now = time.time()
+    ask = _cc_msg(p, "out", "ask", _CC_ASK, now - 3000)
+    new = _cc_msg(p, "in", "user", "Actually, check every runs of https://github.com/acme-org/other only before "
+                  "lunch, with your recommendation for docs.acme-org.io/guide.", now - 1000)
+    assert not correction.answered_open_ask(p.db.one("SELECT text FROM messages WHERE id=?", (new,))["text"], _CC_ASK)
+    assert _cc(p, now)[0] == []
+    rows = p.db.q("SELECT * FROM messages WHERE id=?", (new,))
+    assert correction.flag(p.db, p.config(), rows, now) == {}
+    # (2) a real answer still matches.
+    real = _cc_msg(p, "in", "user", "Actually, the release branch may unfreeze: pushing widgets is fine now.", now - 500)
+    lines, ident = _cc(p, now)
+    assert len(lines) == 1 and f"ask #{ask} cites a rule that user message #{real}" in lines[0], lines
+    assert "branch, pushing, release, widgets" in lines[0]
+    for yes in ("yes", "No.", "go ahead", "Approved, do it"):
+        assert correction.answered_open_ask(yes, _CC_ASK), yes
+    assert correction.answered_open_ask("Unfreeze the release branch and push widgets.", _CC_ASK)
+    assert not correction.answered_open_ask("Please check the runs before every merge.", _CC_ASK)
+
+
+def test_recurring_drops_a_stored_open_ask_match_the_message_does_not_answer(env):
+    """(3) Correction records stored as answering an open ask ('answers open ask #<id>', class 'ask:<id>')
+    whose message shares only common words with it count for nothing in the recurring-mistake check, with
+    no state rewrite; a record whose message does answer the ask still counts."""
+    from ttp import correction
+    p = make(env)
+    now = time.time()
+    ask = _cc_msg(p, "out", "ask", _CC_ASK, now - 9000)
+    one = _cc_msg(p, "in", "user", "Check every runs before #42 only, per github.com/acme-org/tools.", now - 7200)
+    two = _cc_msg(p, "in", "user", "Only check every #42 runs before the next one.", now - 60)
+    recs = [{"msg": one, "ts": now - 7200, "why": f"answers open ask #{ask}", "class": ["#42"], "fix": "#50",
+             "shown": True},
+            {"msg": two, "ts": now - 60, "why": "answers open ask", "class": [f"ask:{ask}", "#42"], "fix": ""}]
+    p.db.set_kv(correction.KEY, recs)
+    assert _cc(p, now)[0] == []
+    assert p.db.kv(correction.KEY) == recs   # nothing rewritten
+    p.db.x("UPDATE messages SET text=? WHERE id=?", ("No: the widgets release branch stays frozen for #42.", two))
+    p.db.x("UPDATE messages SET text=? WHERE id=?", ("Unfreeze the widgets release branch for #42.", one))
+    lines = [x for x in _cc(p, now)[0] if "recurring mistake" in x]
+    assert len(lines) == 1 and f"correction #{two} repeats the class (#42) of correction #{one}" in lines[0], lines
+    # A record citing no ask, or an ask that is gone, is left as it was.
+    p.db.set_kv(correction.KEY, [{**recs[0], "why": "phrase"}, {**recs[1], "class": ["ask:99999", "#42"]}])
+    assert _cc(p, now)[1].endswith(f"recurring:{two}")
+
+
+def test_a_later_harness_task_is_a_corrections_class_fix_only_when_it_is_about_that_correction(env):
+    """(4) A harness task added after a correction is its class fix only when its title or spec cites the
+    message, names the class anchor or shares its subject words; the next unrelated harness task is not."""
+    from ttp import correction
+    p = make(env)
+    then = time.time() - 600
+    mid = _cc_msg(p, "in", "user", "You missed that the nightly widgets build of #42 hung on key cache.gc_days",
+                  then)
+    rec = {"msg": mid, "ts": then - 1, "why": "phrase 'you missed'", "class": ["#42", "key:cache.gc_days"]}
+    unrelated = p.db.add_task("upstream: chat relay drops a reply", "the relay loses a message on restart",
+                              kind="harness", origin="coordinator")
+    p.db.add_task("harness: #421 and cache.gc_days_max", "s", kind="harness", origin="coordinator")
+    p.db.add_task("plain work on the nightly widgets build hang", "s", kind="work", origin="coordinator")
+    assert unrelated and correction._later_fix(p.db, rec) == ""
+    for title, spec in (("harness: catch a hung build", f"from correction #{mid}"),
+                        ("harness: watch #42's builds", "s"), ("harness: check the cache.gc_days default", "s"),
+                        ("upstream: nightly widgets build hang detector", "s")):
+        tid = p.db.add_task(title, spec, kind="harness", origin="coordinator")
+        assert correction._later_fix(p.db, rec) == f"#{tid}", title
+        p.db.x("UPDATE tasks SET kind='work', title='x' WHERE id=?", (tid,))

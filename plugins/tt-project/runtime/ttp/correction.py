@@ -107,6 +107,23 @@ _QUOTED = re.compile(r'"([^"\n]{8,300})"|“([^”\n]{8,300})”')
 REFUSE_S = 7 * 86400   # a second 'none' for the same class this soon is refused
 CLASS_ANCHORS = ("#", "key:", "msg#")   # the anchors specific enough to name a correction's class
 _NOT = r"\s*:\s*not\s+a\s+correction\b"
+# The open-ask overlap test (ask_words, answered_open_ask): words that name no ask's subject. Common
+# words, the ask template's own (its recommendation, default and least-disruptive notes) and the words a
+# rule is cited with. URLs are dropped first: a host or org name in a link is no subject either.
+ASK_STOP = frozenset("""
+    about above after again against also already another anything back because been before being below both
+    could does doing done each either even every first from good have here into just keep keeps know last
+    less like look looks made make many more most much must need needs never next only other over please
+    really right same should since some still such sure than that their them then there these they thing
+    things think this those through time today under until very want wants well were what when where which
+    while will with within work works would your yours check checks checked run runs running ran
+    ask asks asked question answer answers reply recommend recommends recommended recommendation default
+    defaults decide decision approve option options blocking least disruptive considered reversible
+    alternative task tasks user project restriction restrictions charter policy policies rule rules allowed
+    forbids forbidden prohibits prohibited""".split())
+ASK_WORDS = 3   # shared subject words that make a message touch an open ask
+_URL = re.compile(r"\b(?:https?://|www\.)\S+|\b[\w-]+(?:\.[\w-]+)+/\S*", re.I)
+_ASK_CITE = re.compile(r"\bask\s*[#:]\s*(\d+)\b", re.I)   # a record naming the ask it answered
 CLAIM_KEYS = ("tried", "cells", "results", "rows")   # hand-off fields whose dict rows may name a run
 
 
@@ -267,16 +284,58 @@ def _pending(db: DB, now: float) -> list[dict]:
     for r in _records(db):
         if r.get("fix") or r.get("shown") and not r.get("refused") or now - float(r.get("ts") or 0) > DAY:
             continue
-        if _later_fix(db, float(r.get("ts") or 0)):
+        if _later_fix(db, r):
             continue
         out.append(r)
     return out
 
 
-def _later_fix(db: DB, since: float) -> str:
-    row = db.one(f"SELECT id FROM tasks WHERE created>=? AND (kind IN ({','.join('?' * len(FIX_KINDS))}) "
-                 "OR lower(title) LIKE 'upstream:%') ORDER BY id LIMIT 1", (since, *FIX_KINDS))
-    return f"#{row['id']}" if row else ""
+def _later_fix(db: DB, rec: dict) -> str:
+    """The first harness (or upstream:) task added since correction `rec` arrived that is about it: its
+    title or spec cites the message ('correction #<id>', 'msg #<id>', 'message #<id>'), names a class
+    anchor, or shares ASK_WORDS+ subject words with the message. Any other harness task is no fix of it."""
+    rows = db.q(f"SELECT id, title, spec FROM tasks WHERE created>=? AND (kind IN ({','.join('?' * len(FIX_KINDS))}) "
+                "OR lower(title) LIKE 'upstream:%') ORDER BY id", (float(rec.get("ts") or 0), *FIX_KINDS))
+    if not rows:
+        return ""
+    mid = int(rec["msg"])
+    said = db.one("SELECT text FROM messages WHERE id=?", (mid,))
+    words = ask_words(said["text"]) if said else set()
+    cite = re.compile(rf"\b(?:correction|msg|message)\s*#?{mid}\b", re.I)
+    terms = [a.removeprefix("key:") for a in _specific(rec.get("class")) if not a.startswith("msg#")]
+    for r in rows:
+        text = f"{r['title'] or ''}\n{r['spec'] or ''}"
+        if (cite.search(text) or any(re.search(rf"(?<![\w.]){re.escape(t)}(?![\w.]*\w)", text.lower()) for t in terms)
+                or len(words & ask_words(text)) >= ASK_WORDS):
+            return f"#{r['id']}"
+    return ""
+
+
+def ask_words(text: str) -> set[str]:
+    """The subject words of `text` an open ask can share: 4+ letters, outside URLs, not in ASK_STOP."""
+    return {w for w in re.findall(r"[a-z][a-z0-9_]{3,}", _URL.sub(" ", str(text or "").lower())) if w not in ASK_STOP}
+
+
+def answered_open_ask(text: str, ask_text: str) -> bool:
+    """Whether message `text` can answer the open ask `ask_text`: a short yes/no or hand-back to its
+    recommendation, or ASK_WORDS+ subject words shared with it (ask_words)."""
+    from . import unblock
+    t = str(text or "").strip()
+    if t and len(t.split()) <= unblock.BARE_MAX_WORDS and (unblock._BARE.search(t) or unblock.handback(t)):
+        return True
+    return len(ask_words(t) & ask_words(ask_text)) >= ASK_WORDS
+
+
+def false_ask_answer(db: DB, rec: dict) -> bool:
+    """Whether stored correction `rec` was recorded as answering an open ask (its why or class names
+    'ask #<id>' or 'ask:<id>') that its message does not answer (answered_open_ask). Unknown rows: False."""
+    m = next((x for x in map(_ASK_CITE.search, [str(rec.get("why") or ""), *map(str, rec.get("class") or ())]) if x),
+             None)
+    if not m:
+        return False
+    ask = db.one("SELECT text FROM messages WHERE id=? AND kind='ask' AND direction='out'", (int(m.group(1)),))
+    said = db.one("SELECT text FROM messages WHERE id=?", (int(rec["msg"]),))
+    return bool(ask and said) and not answered_open_ask(said["text"], ask["text"])
 
 
 def link_fix(p, tid: int, target: str, repo: str | None = None) -> str:
@@ -475,7 +534,7 @@ def settle(db: DB, note: dict, actions: list, summary: str, started: float, now:
         if not r.get("fix") and (not r.get("shown") or r.get("refused")) and float(r.get("ts") or 0) < started:
             r["shown"] = True
             r["fix"] = _refuse(recs, r, class_fix(db, actions, summary, int(r["msg"]), started, r.get("why") or "")
-                               or _later_fix(db, float(r["ts"])), now)
+                               or _later_fix(db, r), now)
     got = {int(k): v for k, v in (note.get("corrections") or {}).items()}
     texts = {int(r["id"]): r["text"] or "" for r in db.q(
         f"SELECT id, text FROM messages WHERE id IN ({','.join('?' * len(got))})", list(got))} if got else {}

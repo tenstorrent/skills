@@ -18590,7 +18590,10 @@ def test_correction_without_a_class_fix_gets_one_course_check_line_that_a_harnes
     mid4 = p.db.post("in", "Still failing, why hasn't anyone looked?", chat="c1")
     turn(5, {"messages": [mid4], "corrections": {str(mid4): "phrase 'why hasn't'"}}, reply)
     assert f"#{mid4} pointed out" in coord.digest(p, {}, [], [])
-    later = p.db.add_task("catch silent retries", "s", kind="harness", origin="coordinator")
+    p.db.add_task("catch silent retries", "s", kind="harness", origin="coordinator")   # about something else
+    assert f"#{mid4} pointed out" in coord.digest(p, {}, [], [])
+    later = p.db.add_task("catch unlooked-at failures", f"class fix of correction #{mid4}", kind="harness",
+                          origin="coordinator")
     assert "correction without a class fix" not in coord.digest(p, {}, [], [])
     turn(6, {}, [{"type": "noop"}])
     assert {r["msg"]: r["fix"] for r in p.db.kv(correction.KEY)}[mid4] == f"#{later}"
@@ -18739,10 +18742,11 @@ def test_a_second_none_for_the_same_class_within_a_week_is_refused_until_a_class
     correction.settle(p.db, {}, [], f"correction #{again}: still a one-off", now + 2, now + 3)
     assert correction.digest_lines(p.db, now + 4) == lines
     assert f"#{again} (phrase 'you missed') none (refused: same class as #{first})" in correction.audit_line(p.db, now - 60)
-    # A harness task for the class clears it.
-    tid = p.db.add_task("pin review effort", "s", kind="harness", origin="coordinator")
+    # A harness task for the class (it names #4100) clears it.
+    tid = p.db.add_task("pin review effort of #4100", "s", kind="harness", origin="coordinator")
     assert correction.digest_lines(p.db, now + 5) == []
-    correction.settle(p.db, {}, [{"type": "task_add", "kind": "harness", "title": "pin review effort", "spec": "s"}],
+    correction.settle(p.db, {}, [{"type": "task_add", "kind": "harness", "title": "pin review effort of #4100",
+                                  "spec": "s"}],
                       "handled", now + 4, now + 5)
     rec = {r["msg"]: r for r in p.db.kv(correction.KEY)}[again]
     assert rec["fix"] == f"#{tid}" and "refused" not in rec

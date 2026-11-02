@@ -44,11 +44,6 @@ RULE_WORDS = 3
 MAX_MARKERS = 400           # newest push markers read; each is a small JSON file
 DEFAULTS = {"missed_deadlines": 2, "same_wait": 2, "self_races": 2, "rule_clash": 1, "recurring": 1}
 _RULE = re.compile(r"\b(restrictions?|charter|polic(?:y|ies)|rules?|forbid\w*|prohibit\w*|not allowed)\b", re.I)
-_STOP = frozenset("about after again also before being could does doing each from have here into just more must "
-                  "never only other over same should since some still such than that their them then there these "
-                  "they this those through under until very what when where which while will with would your "
-                  "task tasks user project restriction restrictions charter policy policies rule rules allowed "
-                  "forbids forbidden prohibits prohibited".split())
 
 
 def _open_sql() -> tuple[str, tuple]:
@@ -187,7 +182,8 @@ def self_race(db: DB | None, folder: Path | None, at: float, now: float) -> list
 
 
 def _words(text: str) -> set[str]:
-    return {w for w in re.findall(r"[a-z][a-z0-9_]{3,}", str(text or "").lower()) if w not in _STOP}
+    from .correction import ask_words   # the open-ask overlap test: no URL, common or boilerplate word
+    return ask_words(text)
 
 
 def _rule_words(text: str) -> set[str]:
@@ -222,7 +218,8 @@ def recurring(db: DB, at: float) -> list[dict]:
     if not at:
         return []
     from . import correction
-    recs = sorted(correction._records(db), key=lambda r: float(r.get("ts") or 0))
+    recs = sorted((r for r in correction._records(db) if not correction.false_ask_answer(db, r)),
+                  key=lambda r: float(r.get("ts") or 0))   # a stored false open-ask match counts for nothing
     out, seen = [], set()
     for i, later in enumerate(recs):
         cls = correction._specific(later.get("class"))
