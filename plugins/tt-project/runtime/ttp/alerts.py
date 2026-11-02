@@ -96,7 +96,9 @@ CLEARED_SEVERITY = {"network": "low", "paused": "low", "coord-budget": "low", "a
 # account-mismatch: the provider's login has no plan readings of its own yet (budget.evaluate); its next
 # run reports them, or it turns out billed by use.
 # tick-step: a daemon tick step that keeps failing (Daemon._run_step); its next success clears it.
-STATUS_CONDITIONS = ("budget", "limit", "deploy", "deploy-behind", "daemon-hang", "account-mismatch", "tick-step")
+# chat-silent: a relay chat with no listener that stopped reading (chatgone.py); its next read clears it.
+STATUS_CONDITIONS = ("budget", "limit", "deploy", "deploy-behind", "daemon-hang", "account-mismatch", "tick-step",
+                     "chat-silent")
 
 
 def _urgent(severity: str | None) -> bool:
@@ -261,6 +263,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
     if key == "notifier":   # until a later desktop delivery on this machine succeeds
         from . import notifier
         return bool(notifier.failing())
+    if kind == "chat-silent":   # until the chat reads again (chatgone.check)
+        from . import chatgone
+        return chatgone.holds(db, arg)
     if kind == "tick-step":   # Daemon._run_step keeps the step while it keeps failing
         return arg in (db.kv("tick_steps_failing", {}) or {})
     if key == "daemon-hang":   # ttp.watchdog's incident lasts until a daemon completes a tick after it
@@ -294,7 +299,7 @@ def _checkable(key: str) -> bool:
                                          "schedule", "release-older", "integrity", "integrity-host", "pr-ready", "config",
                                          "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_tip_failing", "push_scope", "heal",
                                          "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "daemon-hang", "paused",
-                                         "coord-budget", "account-mismatch", "linger-off", "tick-step", "notifier")
+                                         "coord-budget", "account-mismatch", "linger-off", "tick-step", "notifier", "chat-silent")
 
 
 def _since(ep: dict) -> float:

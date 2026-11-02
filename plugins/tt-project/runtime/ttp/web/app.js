@@ -272,7 +272,7 @@ $("#chealth").addEventListener("click", async (e) => {
 
 async function refresh() {
   let st;
-  try { st = await api("/api/state"); } catch (e) {
+  try { st = await api(document.hidden ? "/api/state" : `/api/state?visible=1&seen=${lastMsg}`); } catch (e) {
     if (e.message === "auth") return;
     lastKey = "";
     // The page keeps its last data; say so rather than let it look current.
@@ -303,7 +303,8 @@ async function refresh() {
   banner([stuck ? `The daemon has not completed a tick for ${Math.round(hb.age / 60)} min: nothing new starts. ${fix}` : "",
           st.pause ? `This project is ${esc(st.pause.text)}. No new model runs start until it resumes.` : "",
           disk ? `Only ${disk.free_gb} GB free under ${esc(disk.path)}: only questions and plans start until ${st.disk && st.disk.resume_gb ? st.disk.resume_gb + " GB are" : "space is"} free.` : "",
-          h.undelivered ? `${h.undelivered.asks} question(s) not delivered to any chat since ${at(h.undelivered.since)}: is the chat relay running? Answer here meanwhile.${h.undelivered.below_floor ? ` ${h.undelivered.below_floor} of them are below every chat's severity floor.` : ""}` : ""].filter(Boolean).join("<br>"));
+          // Shown only while no ask is on screen: an ask in "Needs you now" already reached the user.
+          h.undelivered && !(st.attention || []).some((m) => m.kind === "ask") ? `${esc(h.undelivered.line)}.${h.undelivered.below_floor ? ` ${h.undelivered.below_floor} of the questions are below every chat's severity floor.` : ""}` : ""].filter(Boolean).join("<br>"));
   text($("#pname"), st.project.name);
   text($("#daemon"), st.paused ? "paused" : stuck ? "stuck" : (st.daemon && st.daemon.pid ? `running on ${st.daemon.host}` : "stopped"));
   $("#daemon").className = "pill " + (stuck ? "lv-red" : st.paused ? "lv-orange" : "lv-green");

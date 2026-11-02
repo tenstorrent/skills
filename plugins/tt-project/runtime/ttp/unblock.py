@@ -681,8 +681,10 @@ def asks(db: DB, since: float, now: float | None = None, chat_min: str | None = 
                                                "AND ext_id IS NOT NULL AND ts>=?", (sent[0]["ts"],))}
     resolved = db.kv(RESOLVED_KEY, {}) or {}
     # Relay chats: what each has read and its severity floor (a broadcast below it was skipped, not read).
-    readers = {r["id"]: (int(r["last_read"] or 0), SEVERITY_RANK.get(chat_floor(r["min_severity"], chat_min), 1))
-               for r in db.q("SELECT id, last_read, min_severity FROM chats WHERE id!='web'")}
+    # The web app's visible tab reads every message (web.web_seen).
+    readers = {r["id"]: (int(r["last_read"] or 0), 0 if r["id"] == "web" else
+                         SEVERITY_RANK.get(chat_floor(r["min_severity"], chat_min), 1))
+               for r in db.q("SELECT id, last_read, min_severity FROM chats")}
     rows = {a["id"]: {"id": a["id"], "blocking": (a["ref"] or "").split(":", 1)[1]
                       if (a["ref"] or "").startswith("blocking:") else "unset",
                       "answered": False, "handback": None, "how": None, "first": None, "answer": None} for a in sent}
@@ -705,7 +707,7 @@ def asks(db: DB, since: float, now: float | None = None, chat_min: str | None = 
     def delivered(a: dict, m: dict) -> bool:
         """Whether the ask is known to have reached the reply's chat: its own chat, Slack for a
         broadcast ask posted there (its ext_id), or a relay chat that read past a broadcast ask at or
-        above its floor. Any other chat (the web app) may only have seen it in a feed."""
+        above its floor; the web app once its visible tab showed it (web.web_seen)."""
         if a["chat"] == m["chat"]:
             return True
         if a["chat"] is not None:

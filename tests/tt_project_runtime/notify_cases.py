@@ -303,3 +303,140 @@ def test_a_desktop_preview_of_a_long_message_says_where_the_full_text_is():
     assert len(long) <= notifier.PREVIEW and long.endswith("(full text in the chat and web)")
     js = (RUNTIME / "ttp" / "web" / "app.js").read_text()
     assert 'preview(body, 240, "full text in the web chat")' in js and ".slice(0, 240)" not in js
+
+
+def _relay_chat(p, cid="c1", label="relay-a", created_ago=0.0, last_read=0):
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES(?,?,?,?,?)",
+           (cid, time.time() - created_ago, label, time.time() - created_ago, last_read))
+
+
+def _relay_line_clean(line):
+    assert "?" not in line and "`" not in line and "ttp listen" not in line, line
+
+
+def test_an_ask_the_web_apps_visible_tab_showed_reached_the_user(env):
+    from ttp.web import health, web_seen
+    p = make(env)
+    _relay_chat(p)
+    problems, ask = _ask(p, "Option A or B for the account?", blocking="access")
+    assert problems == []
+    assert health(p, p.db, now=ask["ts"] + 3600)["undelivered"]["asks"] == 1
+    web_seen(p.db, ask["id"] - 1)
+    assert health(p, p.db, now=ask["ts"] + 3600)["undelivered"]["asks"] == 1, "the tab had not shown the ask yet"
+    web_seen(p.db, ask["id"] + 10**6)   # never past the newest message
+    assert p.db.one("SELECT last_read FROM chats WHERE id='web'")["last_read"] == p.db.one(
+        "SELECT MAX(id) m FROM messages")["m"]
+    assert health(p, p.db, now=ask["ts"] + 3600)["undelivered"] is None
+    web_seen(p.db, 0)
+    assert health(p, p.db, now=ask["ts"] + 3600)["undelivered"] is None, "the web cursor went backwards"
+    app = (Path(__file__).resolve().parents[1] / "plugins/tt-project/runtime/ttp/web/app.js").read_text()
+    assert "/api/state?visible=1&seen=${lastMsg}" in app and "document.hidden ?" in app
+
+
+def test_the_relay_warning_counts_normal_alerts_and_asks_no_question(env):
+    from ttp.cli import status_text
+    from ttp.web import health
+    p = make(env)
+    _relay_chat(p)
+    top = p.db.one("SELECT COALESCE(MAX(id),0) m FROM messages")["m"]
+    p.db.x("UPDATE chats SET last_read=? WHERE id='c1'", (top,))
+    alert = p.db.post("out", "a service restarted twice", kind="alert", severity="normal")
+    p.db.post("out", "a status line", kind="alert", severity="low")
+    p.db.x("UPDATE messages SET ts=? WHERE id>?", (time.time() - 3600, top))
+    u = health(p, p.db)["undelivered"]
+    assert (u["asks"], u["alerts"]) == (0, 1), "a normal alert no reader got was not counted, or a low one was"
+    assert u["line"].startswith("0 question(s) and 1 alert(s) reached no chat or web view since ")
+    assert "; chat relay-a last read " in u["line"] and u["line"].endswith(", no listener running")
+    _relay_line_clean(u["line"])
+    out = status_text(p)
+    (line,) = [ln for ln in out.splitlines() if ln.startswith("chat relay:")]
+    _relay_line_clean(line)
+    p.db.x("UPDATE chats SET last_read=? WHERE id='c1'", (alert,))
+    assert health(p, p.db)["undelivered"] is None
+
+
+def test_a_chat_with_no_listener_silent_a_day_leaves_the_readers_with_one_status_line(env):
+    from ttp import alerts, chatgone
+    from ttp.daemon import Daemon
+    from ttp.web import health
+    p = make(env)
+    _relay_chat(p, created_ago=30 * 3600)
+    (p.state / "listen-c1.pid").write_text("999999999")   # a listener that is gone
+    problems, ask = _ask(p, "Option A or B for the account?", blocking="access")
+    assert problems == []
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 25 * 3600, ask["id"]))
+    (c,) = chatgone.chats(p, p.db, p.config(), time.time())
+    assert c["gone"] and not c["listener"]
+    u = health(p, p.db)["undelivered"]
+    assert u["asks"] == 1 and "chat relay-a last read" in u["line"] and "no listener running" in u["line"]
+    d = Daemon(p.base)
+    for _ in range(3):
+        d.check_chats()
+    (item,) = p.db.q("SELECT * FROM messages WHERE ref='chat-silent:c1'")
+    assert item["severity"] == "low" and item["kind"] == "alert" and item["chat"] is None
+    assert item["text"].startswith("chat relay-a has not read since ") and "(message #0)" in item["text"]
+    assert "asks and alerts reach the web app and desktop alerts" in item["text"]
+    _relay_line_clean(item["text"])
+    assert not alerts.sweep(p.db)
+    assert [m["state"] for m in alerts.feed(p.db, time.time()) if m["id"] == item["id"]] == ["status"]
+    # Its next read clears the line, and the chat counts as a reader again.
+    p.db.x("UPDATE chats SET last_read=? WHERE id='c1'", (ask["id"],))
+    (ep,) = alerts.sweep(p.db)
+    assert ep["key"] == "chat-silent:c1"
+    assert [m["state"] for m in alerts.feed(p.db, time.time()) if m["id"] == item["id"]] == ["cleared"]
+    assert health(p, p.db)["undelivered"] is None
+    d.check_chats()
+    assert len(p.db.q("SELECT id FROM messages WHERE ref='chat-silent:c1'")) == 1
+    assert not p.db.kv(chatgone.KV)
+
+
+def test_a_chat_with_a_live_listener_stays_a_reader_however_long_it_is_silent(env):
+    from ttp import chatgone
+    from ttp.daemon import Daemon
+    from ttp.web import health
+    p = make(env)
+    _relay_chat(p, created_ago=30 * 3600)
+    (p.state / "listen-c1.pid").write_text(str(os.getpid()))
+    problems, ask = _ask(p, "Option A or B for the account?", blocking="access")
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 25 * 3600, ask["id"]))
+    (c,) = chatgone.chats(p, p.db, p.config(), time.time())
+    assert c["listener"] and not c["gone"]
+    Daemon(p.base).check_chats()
+    assert not p.db.q("SELECT id FROM messages WHERE ref='chat-silent:c1'")
+    assert health(p, p.db)["undelivered"]["line"].endswith(", listener running")
+    p.db.x("UPDATE chats SET last_read=? WHERE id='c1'", (ask["id"],))
+    assert health(p, p.db)["undelivered"] is None, "a live chat that read the ask still counts as its reader"
+
+
+
+@needs_sockets
+def test_only_a_visible_web_poll_with_a_plain_id_moves_the_web_read_cursor(env):
+    from ttp import web
+    p = make(env)
+    port = _start_web(p)
+    top = p.db.one("SELECT MAX(id) m FROM messages")["m"]
+
+    def poll(query):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/state{query}", headers={"X-TTP-Token": web.token(p)})
+        assert urllib.request.urlopen(req, timeout=5).status == 200, query
+        row = p.db.one("SELECT last_read FROM chats WHERE id='web'")
+        return row and row["last_read"]
+
+    for query in ("", f"?seen={top}", f"?visible=0&seen={top}", "?visible=1&seen=x", "?visible=1&seen=-1",
+                  "?visible=1"):
+        assert not poll(query), f"{query!r} moved the web cursor"
+    assert poll(f"?visible=1&seen={top}") == top
+
+
+def test_gone_after_zero_keeps_every_chat_a_reader(env):
+    from ttp import chatgone
+    from ttp.daemon import Daemon
+    p = make(env)
+    _relay_chat(p, created_ago=30 * 3600)
+    problems, ask = _ask(p, "Option A or B for the account?", blocking="access")
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 25 * 3600, ask["id"]))
+    assert chatgone.chats(p, p.db, p.config(), time.time())[0]["gone"]
+    p.set_config("relay.gone_after_s", 0)
+    assert not chatgone.chats(p, p.db, p.config(), time.time())[0]["gone"]
+    Daemon(p.base).check_chats()
+    assert not p.db.q("SELECT id FROM messages WHERE ref='chat-silent:c1'")

@@ -8,12 +8,13 @@ from __future__ import annotations
 import json
 import secrets
 import socket
+import sqlite3
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import alerts, awake
+from . import alerts, awake, chatgone
 from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
@@ -350,24 +351,34 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     asks = db.q("SELECT id, ts, text FROM messages WHERE kind='ask' AND handled=0 ORDER BY id DESC LIMIT 5")
     top = db.one("SELECT source, ROUND(SUM(usd),2) usd FROM ledger WHERE ts>=? GROUP BY source ORDER BY SUM(usd) DESC "
                  "LIMIT 1", (now - WEEK,))
-    # A relay that stopped reading: questions the user has not seen, so nothing can be decided.
-    # A chat that read past an ask below its severity floor skipped it, so that does not count.
-    readers = [(int(r["last_read"] or 0),
-                SEVERITY_RANK.get(chat_floor(r["min_severity"], notify.get("chat_min_severity")), 1))
-               for r in db.q("SELECT last_read, min_severity FROM chats WHERE id!='web'")]
+    # Asks and alerts no reader got: relay chats still reading (a gone one, chatgone, no longer counts),
+    # the web app's visible tab, Slack. A chat that read past one below its severity floor skipped it.
+    relay = chatgone.chats(p, db, cfg, now)
+    readers = [(c["read_id"], c["floor"]) for c in relay if not c["gone"]]
+    web_read = db.one("SELECT last_read FROM chats WHERE id='web'")
+    if web_read:
+        readers.append((int(web_read["last_read"] or 0), 0))
     if notify.get("slack"):
         slack_floor = SEVERITY_RANK.get(notify.get("slack_min_severity", "high"), 2)
         readers.append((int(db.kv("slack_last_out", 0)), slack_floor))
     undelivered = None
-    if readers:
-        late = [a for a in db.q("SELECT id, ts, severity FROM messages WHERE kind='ask' AND handled=0 AND chat IS NULL "
-                                "AND ts>?", (now - 14 * DAY,))
-                if not any(seen >= a["id"] and SEVERITY_RANK.get(a["severity"], 1) >= floor for seen, floor in readers)]
+    if relay or notify.get("slack"):   # a project with no relay has no gap to report
+        late = [a for a in db.q("SELECT id, ts, kind, severity, ref FROM messages WHERE direction='out' AND chat IS NULL "
+                                "AND channel!='quiet' AND (kind='ask' AND handled=0 OR kind!='ask' AND severity IN "
+                                "('normal','high','critical')) AND ts>?", (now - 14 * DAY,))
+                if not any(seen >= a["id"] and SEVERITY_RANK.get(a["severity"], 1) >= floor for seen, floor in readers)
+                and not cleared(db, a, now)]
         since = min((a["ts"] for a in late), default=now)
         if late and since < now - RELAY_LATE_S:
-            lowest = min(floor for _, floor in readers)
-            undelivered = {"asks": len(late), "since": since,
-                           "below_floor": sum(SEVERITY_RANK.get(a["severity"], 1) < lowest for a in late)}
+            lowest = min((floor for _, floor in readers), default=0)
+            asks = [a for a in late if a["kind"] == "ask"]
+            silent = [c for c in relay if c["read_id"] < min(a["id"] for a in late)]
+            line = (f"{len(asks)} question(s) and {len(late) - len(asks)} alert(s) reached no chat or web view since "
+                    f"{at(since, now, tz)}" + "".join(
+                        f"; chat {c['label']} last read {at(c['read_at'], now, tz)}, "
+                        f"{'listener running' if c['listener'] else 'no listener running'}" for c in silent))
+            undelivered = {"asks": len(asks), "alerts": len(late) - len(asks), "since": since, "line": line,
+                           "below_floor": sum(SEVERITY_RANK.get(a["severity"], 1) < lowest for a in asks)}
     wake = idle_wake(p, cfg, gates, now, db=db) if last_turn else {"at": None, "held": None}
     next_wake = max(wake["at"], backoff, now) if wake["at"] else None
 
@@ -629,6 +640,20 @@ def archived_files(p: Project, task_id: int | None) -> list[dict]:
     return out
 
 
+def web_seen(db: DB, seen: int) -> None:
+    """A poll from the web app's visible tab, which has shown every message up to `seen` (its open
+    asks too): the 'web' chat's read cursor. Best effort: a busy database only delays it to the next poll."""
+    top = int(db.one("SELECT COALESCE(MAX(id),0) m FROM messages")["m"])
+    try:
+        with db.tx():
+            db.x("INSERT OR IGNORE INTO chats(id,created,label,last_active) VALUES('web',?, 'web app', ?)",
+                 (time.time(), time.time()))
+            db.x("UPDATE chats SET last_read=MAX(COALESCE(last_read,0), ?), last_active=? WHERE id='web'",
+                 (min(seen, top), time.time()))
+    except sqlite3.OperationalError:
+        pass
+
+
 def state_payload(p: Project, db: DB) -> dict:
     now = time.time()
     tz = timefmt.zone(p)
@@ -767,6 +792,9 @@ class Handler(BaseHTTPRequestHandler):
         db = DB(self._proj().state / "project.db")
         try:
             if url.path == "/api/state":
+                q = parse_qs(url.query)
+                if q.get("visible") == ["1"] and q.get("seen", [""])[0].isdigit():
+                    web_seen(db, int(q["seen"][0]))
                 return self._send(200, state_payload(self._proj(), db))
             if url.path == "/api/overview":
                 from . import overview

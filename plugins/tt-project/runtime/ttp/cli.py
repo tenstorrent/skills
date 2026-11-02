@@ -1505,10 +1505,9 @@ def status_text(p: Project, verbose: bool = False) -> str:
                      + (f" — {t['gate']['text']}" if t.get("gate") else ""))
     if h["undelivered"]:
         u = h["undelivered"]
-        lines.append(f"chat relay: {u['asks']} question(s) not delivered to any chat since {at(u['since'], now, tz)}; "
-                     f"is the chat's `ttp listen` running?")
+        lines.append(f"chat relay: {u['line']}")
         if u["below_floor"]:
-            lines.append(f"  {u['below_floor']} of them are below every chat's severity floor; lower "
+            lines.append(f"  {u['below_floor']} of the questions are below every chat's severity floor; lower "
                          f"notify.chat_min_severity or the chat's own floor to see them")
     recent = feed(db, now, limit=3)
     if recent:

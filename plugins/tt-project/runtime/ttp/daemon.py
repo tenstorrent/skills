@@ -1411,7 +1411,7 @@ class Daemon:
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause,
-                     self.check_linger, self.check_notifier, self.probe_mcp):
+                     self.check_linger, self.check_notifier, self.check_chats, self.probe_mcp):
             if step in lease_off:
                 continue
             self._run_step(step)
@@ -2863,6 +2863,11 @@ class Daemon:
             self.alert(notifier.ALERT_KEY, f"Desktop notifications on {hostname()} fail since {since} "
                        f"({bad.get('backend')}: {str(bad.get('error'))[:160]}). Alerts still reach this chat and "
                        f"the web app. `ttp notifier test` on {hostname()} shows the fix.", severity="normal")
+
+    def check_chats(self) -> None:
+        """One low status line per relay chat that stopped reading with no listener running (chatgone)."""
+        from . import chatgone
+        chatgone.check(self.p, self.p.db, self.cfg, time.time(), self.alert, lambda ts: timefmt.short(ts, self.p))
 
     def _tell_reboot(self) -> None:
         """Once per boot, after every run of an earlier boot is reaped: record the boot (when, the

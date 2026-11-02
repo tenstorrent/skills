@@ -1905,7 +1905,8 @@ def test_unblock_a_broadcast_asks_newest_answer_is_about_it_or_where_it_was_deli
 
 def test_unblock_a_broadcast_ask_read_by_a_relay_chat_links_its_plain_answer_there(env):
     """A relay chat that read past a broadcast ask at or above its severity floor got it: a plain
-    reply there links; one in a chat that has not read it, or skipped it below its floor, does not."""
+    reply there links; one in a chat that has not read it, or skipped it below its floor, does not.
+    The web app reads every message its visible tab showed (web.web_seen), whatever the floors."""
     from ttp import unblock
     p, now, msg = _ask_db(env)
     msg("out", "Start the sweep now?", 9500, "ask")
@@ -1914,7 +1915,7 @@ def test_unblock_a_broadcast_ask_read_by_a_relay_chat_links_its_plain_answer_the
     a = msg("out", "Which credential should the nightly run use?", 8000, "ask")   # broadcast, not on Slack
     p.db.x("DELETE FROM chats")
     for chat, read, floor in (("relay", a + 5, None), ("behind", a - 1, None), ("loud", a + 5, "high"),
-                              ("web", a + 5, None)):
+                              ("web", a - 1, "critical")):
         p.db.x("INSERT INTO chats(id,created,last_read,min_severity) VALUES(?,?,?,?)", (chat, now - 9999, read, floor))
     for chat in ("behind", "loud", "web"):
         msg("in", "the second one", 7000, chat=chat)
@@ -1924,6 +1925,9 @@ def test_unblock_a_broadcast_ask_read_by_a_relay_chat_links_its_plain_answer_the
     assert not unblock.asks(p.db, now - 86400, now, chat_min="high")[1]["answered"]
     row = unblock.asks(p.db, now - 86400, now)[1]
     assert row["id"] == a and row["how"] == "newest" and row["answer"] == "the second one", row
+    p.db.x("UPDATE chats SET last_read=? WHERE id='web'", (a + 5,))
+    row = unblock.asks(p.db, now - 86400, now, chat_min="high")[1]
+    assert row["answered"] and row["answered_at"] == now - 7000, "a reply in the web app that showed the ask did not link"
     assert unblock.replies_to("we're 5 minutes out", "'re #12'", "(re: 13)") == {12, 13}
 
 
@@ -7779,9 +7783,9 @@ def test_status_says_when_questions_are_not_reaching_any_chat(env):
     assert problems == []
     assert health(p, p.db, now=ask["ts"] + 60)["undelivered"] is None, "reported before the relay had a chance"
     late = health(p, p.db, now=ask["ts"] + 3600)["undelivered"]
-    assert late == {"asks": 1, "since": ask["ts"], "below_floor": 0}, "a relay that stopped delivering was not reported"
+    assert (late["asks"], late["since"], late["below_floor"]) == (1, ask["ts"], 0), "a relay that stopped delivering was not reported"
     p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 3600, ask["id"]))
-    assert "1 question(s) not delivered to any chat" in status_text(p)
+    assert "1 question(s) and 0 alert(s) reached no chat or web view since" in status_text(p)
     p.db.x("UPDATE chats SET last_read=? WHERE id='c1'", (ask["id"],))
     assert health(p, p.db)["undelivered"] is None
 
@@ -7796,7 +7800,7 @@ def test_a_chat_that_filtered_an_ask_out_did_not_deliver_it(env):
     assert problems == [] and ask["severity"] != "critical"
     p.db.x("UPDATE chats SET last_read=? WHERE id='c1'", (ask["id"],))
     late = health(p, p.db, now=ask["ts"] + 3600)["undelivered"]
-    assert late == {"asks": 1, "since": ask["ts"], "below_floor": 1}, "an ask a chat skipped counted as delivered"
+    assert (late["asks"], late["since"], late["below_floor"]) == (1, ask["ts"], 1), "an ask a chat skipped counted as delivered"
     p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 3600, ask["id"]))
     assert "below every chat's severity floor" in status_text(p)
     # The project floor applies to every chat, whatever the chat's own floor says.
