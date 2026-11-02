@@ -2490,8 +2490,10 @@ class Daemon:
                   budget_usd: float | None = None, timeout_s: float | None = None, read_only: bool = False,
                   schema: dict | None = None, system: str | None = None, append_system: str | None = None,
                   note: dict | None = None, resume: str | None = None,
-                  context: str | None = None, cache_ttl: str = "", min_effort: str | None = None) -> int:
-        """`context` (with `system`): stable text that follows the system prompt, sent as a block of
+                  context: str | None = None, cache_ttl: str = "", min_effort: str | None = None,
+                  handoff_guard: bool = True) -> int:
+        """`handoff_guard` (a task's worker or reviewer run): the provider's Stop hook refuses to end
+        the run without a valid result.json (ttp.hook.stop). `context` (with `system`): stable text that follows the system prompt, sent as a block of
         its own with a cache breakpoint after it where the provider can mark one (else it ends the
         system prompt). `cache_ttl` (`5m`, `1h`) sets the provider's prompt cache lifetime; `auto`
         picks it per coordinator turn (cachettl.py). Unset, every run but the coordinator's takes
@@ -2768,6 +2770,9 @@ class Daemon:
             # inherited "1" (the runner adds its own environment under this one).
             if task and role != "coordinator":
                 env["TTP_NO_DEVICE"] = "0" if holds_device(task, self.cfg) else "1"
+            if task and role in ("worker", "reviewer") and handoff_guard:
+                from .hook import HANDOFF_GUARD_ENV
+                env[HANDOFF_GUARD_ENV] = "1"
             # On a machine tagged `device` a direct open sees no device, whatever the task: `ttp lock` on
             # a device, devq and the broker (whose jobs never get the mask) are the ways to one.
             if machines.device_host():

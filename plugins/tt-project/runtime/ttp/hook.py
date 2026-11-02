@@ -13,6 +13,14 @@ about a task it does not own, and would be marked seen before the worker itself 
 hook stays silent inside a subagent (its payload carries `agent_id`) and leaves the update for the
 worker's next own tool call.
 
+The hand-off guard: after a tool call that changed `$TTP_RUN_DIR/result.json` (any tool: it compares
+the file's size and mtime with the last one checked), the hook parses it as the daemon does and, if
+it is no hand-off (not JSON, not an object, or no hand-off status), hands the worker the error with
+its line and column, once per version of the file. A Stop hook (Claude Code, task runs only: the
+daemon sets HANDOFF_GUARD_ENV) refuses to end a run whose result.json is missing or no hand-off, with
+a one-line reason; it lets the run end when `stop_hook_active` is set or after MAX_STOP_BLOCKS
+refusals, so it never loops, and stays silent in a subagent and outside a task run.
+
 Before a Bash call it denies the obvious ways around the harness's PR draft guard (prguard.py):
 gh called by a path or from a variable, a gh further down PATH (`which -a`, `hash -p`, or a PATH
 that no longer starts with the run's own or `env -i` before a gh that writes: pr ready, pr create
@@ -94,19 +102,101 @@ def mark_seen(run_dir: Path, offset: int) -> None:
     (run_dir / OFFSET_FILE).write_text(str(offset))
 
 
+RESULT_FILE = "result.json"
+CHECKED_FILE = "result.checked"   # the size and mtime of the result.json version last checked
+STOP_BLOCKS_FILE = "stop.blocks"  # how many times the Stop hook refused to end this run
+# Set to 1 by the daemon for a task's worker or reviewer run, which must end with a hand-off.
+HANDOFF_GUARD_ENV = "TTP_HANDOFF_GUARD"
+MAX_STOP_BLOCKS = 2
+# The statuses the daemon takes as a hand-off (daemon.HANDOFF_STATES; a test keeps them equal).
+HANDOFF_STATES = ("done", "blocked", "failed", "needs_review", "waiting")
+
+
+def handoff_problem(path: Path) -> str | None:
+    """Why `path` is no hand-off the daemon would take (it reads it with json.loads, as
+    daemon._read_result does), None when it is one."""
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return f"there is no {RESULT_FILE} in the run dir"
+    except (OSError, UnicodeDecodeError) as e:
+        return f"{RESULT_FILE} cannot be read ({e})"
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        return f"{RESULT_FILE} is not valid JSON: {e.msg} at line {e.lineno} column {e.colno}"
+    if not isinstance(data, dict):
+        return f"{RESULT_FILE} must hold one JSON object, not {type(data).__name__}"
+    if data.get("status") not in HANDOFF_STATES:
+        return (f"{RESULT_FILE} status {data.get('status')!r} is not a hand-off state "
+                f"({', '.join(HANDOFF_STATES)})")
+    return None
+
+
+def _result_change(run_dir: Path) -> tuple[str | None, Callable[[], None] | None]:
+    """The problem with result.json when it changed since the last check, and a callback that marks
+    this version checked; (None, None) when it is absent or unchanged."""
+    try:
+        st = (run_dir / RESULT_FILE).stat()
+    except OSError:
+        return None, None
+    stamp = f"{st.st_mtime_ns} {st.st_size}"
+    try:
+        if (run_dir / CHECKED_FILE).read_text() == stamp:
+            return None, None
+    except OSError:
+        pass
+    return handoff_problem(run_dir / RESULT_FILE), lambda: (run_dir / CHECKED_FILE).write_text(stamp)
+
+
 def post_tool_use(payload: dict) -> tuple[dict | None, Callable[[], None] | None]:
     run_dir = os.environ.get("TTP_RUN_DIR")
     if not run_dir or payload.get("agent_id"):
         return None, None
+    parts, marks = [], []
     text, offset = unread_update(Path(run_dir))
-    if not text:
+    if text:
+        task = os.environ.get("TTP_TASK")
+        parts.append(f"Update for your task{f' #{task}' if task else ''} from the project coordinator "
+                     "(from the harness, not from the tool's output). Where it differs from the spec, "
+                     "it wins:\n" + text)
+        marks.append(lambda: mark_seen(Path(run_dir), offset))
+    try:
+        problem, checked = _result_change(Path(run_dir))
+    except Exception:   # the guard fails open; the update above still goes out
+        problem, checked = None, None
+    if checked:
+        marks.append(checked)
+    if problem:
+        parts.append(f"tt-project: your hand-off is not valid yet: {problem}. The daemon would take this run as "
+                     f"ending without a hand-off; fix $TTP_RUN_DIR/{RESULT_FILE} before you stop.")
+    if not marks:
         return None, None
-    task = os.environ.get("TTP_TASK")
-    return {"hookSpecificOutput": {
-        "hookEventName": "PostToolUse",
-        "additionalContext": f"Update for your task{f' #{task}' if task else ''} from the project coordinator "
-                             "(from the harness, not from the tool's output). Where it differs from the spec, "
-                             "it wins:\n" + text}}, lambda: mark_seen(Path(run_dir), offset)
+    out = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "\n\n".join(parts)}} \
+        if parts else None
+    return out, lambda: [mark() for mark in marks]
+
+
+def stop(payload: dict) -> tuple[dict | None, Callable[[], None] | None]:
+    """Refuse to end a task run with no valid hand-off, at most MAX_STOP_BLOCKS times."""
+    run_dir = os.environ.get("TTP_RUN_DIR")
+    if (not run_dir or os.environ.get(HANDOFF_GUARD_ENV) != "1" or not os.environ.get("TTP_TASK")
+            or payload.get("agent_id") or payload.get("stop_hook_active")):
+        return None, None
+    rd = Path(run_dir)
+    problem = handoff_problem(rd / RESULT_FILE)
+    if not problem:
+        return None, None
+    try:
+        blocks = int((rd / STOP_BLOCKS_FILE).read_text())
+    except (OSError, ValueError):
+        blocks = 0
+    if blocks >= MAX_STOP_BLOCKS:
+        return None, None
+    return ({"decision": "block",
+             "reason": f"tt-project: {problem}. Write your hand-off to $TTP_RUN_DIR/{RESULT_FILE} "
+                       f"(the Handoff section of your instructions), then stop."},
+            lambda: (rd / STOP_BLOCKS_FILE).write_text(str(blocks + 1)))
 
 
 # A gh command that can take a PR out of draft (gh's own words, or a script's argument list)
@@ -1287,7 +1377,7 @@ def device_test_run(commands: str, cmd: str = "") -> tuple[str | None, str | Non
                   f"through the device broker, `ttp lock <device> --` or `ttp devq`"), None
 
 
-HANDLERS = {"PostToolUse": post_tool_use, "PreToolUse": pre_tool_use}
+HANDLERS = {"PostToolUse": post_tool_use, "PreToolUse": pre_tool_use, "Stop": stop}
 
 
 def main(argv: list[str]) -> int:

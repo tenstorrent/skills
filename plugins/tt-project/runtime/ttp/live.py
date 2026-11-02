@@ -227,7 +227,7 @@ def measure(provider: str, *, tier: str = "light", timeout_s: float = RUN_TIMEOU
         else:
             rid2 = d.start_run("worker", "What code word did I ask you to remember? Reply with only that word.",
                                provider, tier, str(repo), task=p.db.task(tid), budget_usd=cap(RESUME_USD),
-                               timeout_s=timeout_s, resume=u.session_id)
+                               timeout_s=timeout_s, resume=u.session_id, handoff_guard=False)
             exit2, u2 = _finish(d, prov, provider, rid2, timeout_s)
             ev["spend_usd"] += u2.cost_usd or 0
             ev["resume"] = {"recalled": word in (u2.final_text or ""),

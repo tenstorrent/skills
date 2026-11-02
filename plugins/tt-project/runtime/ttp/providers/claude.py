@@ -501,8 +501,8 @@ def _read_json(path: Path) -> dict:
 
 
 def hook_settings() -> dict:
-    """Route tool-use events through `ttp.hook`, so coordinator updates reach a running worker and
-    Bash calls cannot get around the PR draft guard.
+    """Route tool-use and Stop events through `ttp.hook`, so coordinator updates reach a running worker,
+    Bash calls cannot get around the PR draft guard and a task run does not end without a hand-off.
 
     Passed as JSON on the command line: nothing is written to the user's settings files, and one
     project never changes another's behavior.
@@ -514,7 +514,9 @@ def hook_settings() -> dict:
                       # Denies Bash calls that would get around the harness's PR draft guard, and edits
                       # to the harness's gh wrapper and gh.d pre-hooks outside a harness task.
                       "PreToolUse": [{"matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit",
-                                      "hooks": [{"type": "command", "command": f"{cmd} PreToolUse", "timeout": 20}]}]},
+                                      "hooks": [{"type": "command", "command": f"{cmd} PreToolUse", "timeout": 20}]}],
+                      # Refuses to end a task run whose result.json is missing or no hand-off (twice at most).
+                      "Stop": [{"hooks": [{"type": "command", "command": f"{cmd} Stop", "timeout": 20}]}]},
             "env": {"PYTHONPATH": runtime}}
 
 
