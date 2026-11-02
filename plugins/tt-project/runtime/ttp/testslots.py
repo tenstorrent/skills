@@ -78,7 +78,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import checkcap, locks, poll_s, project
+from . import checkcap, locks, poll_s, project, repoid
 
 RESOURCE = "test-slots"    # check-slots/test-slots.<i>.lock
 RUN_MAX = 8                # one run's most workers by default: past about 8 a suite's wall time gains little
@@ -453,8 +453,9 @@ def _common_dir(top) -> str:
     if not top:
         return ""
     try:
-        r = subprocess.run(["git", "-C", str(top), "rev-parse", "--git-common-dir"], capture_output=True,
-                           text=True, timeout=10)
+        args = ("rev-parse", "--git-common-dir")
+        r = repoid.read(top, args, lambda: subprocess.run(["git", "-C", str(top), *args], capture_output=True,
+                                                          text=True, timeout=10))
     except (OSError, subprocess.SubprocessError):
         return ""
     if r.returncode or not r.stdout.strip():

@@ -135,13 +135,15 @@ def identity(args: tuple | list) -> bool:
 
 
 def _ok(value: Any) -> bool:
-    return not isinstance(value, subprocess.CompletedProcess) or value.returncode == 0
+    if isinstance(value, subprocess.CompletedProcess):
+        return value.returncode == 0
+    return value is not None and value != ""   # a helper that answers "" or None for a failure
 
 
 def read(path: str | Path, args: tuple | list, fn: Callable[[], Any]) -> Any:
     """fn()'s result for the identity read `args` (git's arguments after `-C path`) in `path`: the
     kept one while its stamp holds, else fn() run again (and kept when it succeeded: a call that
-    raised, or a CompletedProcess that exited non-zero, is not)."""
+    raised, a CompletedProcess that exited non-zero, "" or None, is not)."""
     key = (os.path.abspath(path), tuple(args))
     s = stamp(path)
     if s is None:

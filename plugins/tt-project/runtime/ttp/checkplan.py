@@ -14,7 +14,7 @@ from pathlib import Path
 
 from . import push
 from .project import durable_write
-from . import gitmemo
+from . import gitmemo, repoid
 
 GIT_ERROR, IDENTITY_ERROR, INPUT_ERROR = 20, 65, 66
 _OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
@@ -29,7 +29,9 @@ class PlanError(Exception):
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, timeout=gitmemo.timeout(None, args))
+    run = lambda: subprocess.run(["git", "-C", str(repo), *args], capture_output=True,   # noqa: E731
+                                 timeout=gitmemo.timeout(None, args))
+    return repoid.read(repo, args, run) if repoid.identity(args) else run()
 
 
 def _read_git(repo: Path, *args: str) -> bytes:

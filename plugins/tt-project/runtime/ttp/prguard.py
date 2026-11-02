@@ -658,12 +658,15 @@ def _refuse_ready(prs: set[str], db, what: str, allowed: set | None, heads: dict
 
 
 def _git_out(cwd: str | None, *args: str) -> str:
-    from . import gitmemo
-    try:
-        return subprocess.run(["git", *args], capture_output=True, text=True, cwd=cwd,
-                              timeout=gitmemo.timeout(30, args)).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return ""
+    from . import gitmemo, repoid
+
+    def run() -> str:
+        try:
+            return subprocess.run(["git", *args], capture_output=True, text=True, cwd=cwd,
+                                  timeout=gitmemo.timeout(30, args)).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+    return repoid.read(cwd or os.getcwd(), args, run) if repoid.identity(args) else run()
 
 
 def candidate_record(rec: object) -> bool:
