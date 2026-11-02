@@ -23,7 +23,7 @@ Measured on 2026-10-09:
 | Session id | pass (assigned up front) | pass | not measured |
 | Usage | pass (reported cost) | pass (estimated from tokens) | not measured |
 | Structured output | pass | pass | not measured |
-| Write fence | unsupported: `bypassPermissions` runs without the Bash sandbox, which would need bubblewrap | pass (refused: read-only file system) | not measured |
+| Write fence | unsupported: `bypassPermissions` runs without the Bash sandbox, which would need bubblewrap | pass (refused: read-only file system) | built, not measured live: `--sandbox enabled` with `--add-dir` per writable root |
 | Resume | pass | pass | not measured |
 | Steer mid-run | pass (hook) | unsupported: no hook, the worker reads `steer.md` between steps | not measured |
 | Plan meter | pass (five-hour and seven-day) | pass (seven-day) | not measured |
@@ -73,6 +73,11 @@ $0.21). Cursor agent: installed, not measured (no login on the test machine).
   `review.sweep_after_s` (default 5 min) after its run ended; a `done` hand-off gets it at once.
 - Claude Code: workers have no write fence. They run with `bypassPermissions`, and the Bash
   sandbox that would fence them needs bubblewrap.
+- Cursor: the write fence is built, not measured live. Workers get `--sandbox enabled` and one
+  `--add-dir` per writable root (project state with the run dir, git metadata, temp and lock dirs)
+  when `agent --help` lists both flags and the host can run the sandbox (macOS; Linux 6.2+ with
+  unprivileged user namespaces allowed). Otherwise they run with `--force` alone and `ttp doctor`
+  names the reason. The harness never writes `.cursor/sandbox.json`.
 - Codex: the harness hook runs only where hooks are on and no other hook source exists.
   Otherwise a worker sees an update only when it reads `steer.md` between steps.
 - Codex: the docs give no version for `developer_instructions` or

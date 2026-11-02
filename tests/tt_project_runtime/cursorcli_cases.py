@@ -127,3 +127,62 @@ def test_cursor_adapter_reads_the_real_cli_help_and_logged_out_status(env, monke
     monkeypatch.setattr(Cursor, "available", lambda self: True)
     assert Cursor().login_check() is False and calls == [["/x/agent", "status"]]
     assert live.unavailable(Cursor()) == "logged out (run `agent login` there)"
+
+
+def test_cursor_sandbox_host_check(tmp_path):
+    from ttp.providers.cursor import sandbox_host_gap
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    assert sandbox_host_gap("Darwin", "23.1.0", str(proc)) == "", "macOS: Seatbelt, always"
+    assert sandbox_host_gap("Linux", "6.8.0-1-generic", str(proc)) == "", "both switches absent"
+    assert "6.1.0" in sandbox_host_gap("Linux", "6.1.0", str(proc))
+    assert "5.15" in sandbox_host_gap("Linux", "5.15.0-91-generic", str(proc))
+    assert sandbox_host_gap("Linux", "weird", str(proc)), "an unreadable release is not taken as new enough"
+    assert sandbox_host_gap("FreeBSD", "14.0", str(proc))
+    (proc / "apparmor_restrict_unprivileged_userns").write_text("1\n")
+    assert "apparmor_restrict_unprivileged_userns=1" in sandbox_host_gap("Linux", "6.8.0", str(proc))
+    (proc / "apparmor_restrict_unprivileged_userns").write_text("0\n")
+    assert sandbox_host_gap("Linux", "6.8.0", str(proc)) == ""
+    (proc / "unprivileged_userns_clone").write_text("0\n")
+    assert "unprivileged_userns_clone=0" in sandbox_host_gap("Linux", "10.0", str(proc))
+
+
+def test_cursor_workers_get_the_sandbox_only_when_the_build_and_host_allow_it(env, monkeypatch):
+    from ttp.providers import base, cursor
+    from ttp.providers.cursor import Cursor
+    monkeypatch.setattr(Cursor, "binary", lambda self: "/x/agent")
+    monkeypatch.setitem(base._CLI_OUTPUT, ("/x/agent", "--help"), CURSOR_REAL_HELP)
+    monkeypatch.setattr(cursor, "sandbox_host_gap", lambda: "")
+    roots = ["/s/state", "/r/.git"]
+    assert Cursor().writable_args(roots) == ["--sandbox", "enabled", "--add-dir", "/s/state", "--add-dir", "/r/.git"]
+    assert Cursor().write_fence() == "" and Cursor().writable_args([]) == []
+    # The host cannot run it: unfenced, and the reason is named.
+    monkeypatch.setattr(cursor, "sandbox_host_gap", lambda: "kernel 5.15 is older than the 6.2 the Cursor sandbox needs")
+    assert Cursor().writable_args(roots) == []
+    assert Cursor().write_fence() == "--force without --sandbox enabled: kernel 5.15 is older than the 6.2 the Cursor sandbox needs"
+    # A build without one of the flags: unfenced, the missing flag named.
+    monkeypatch.setattr(cursor, "sandbox_host_gap", lambda: "")
+    for gone in ("--sandbox", "--add-dir"):
+        monkeypatch.setitem(base._CLI_OUTPUT, ("/x/agent", "--help"), CURSOR_REAL_HELP.replace(f"  {gone} <", "  <"))
+        assert Cursor().writable_args(roots) == [], gone
+        assert Cursor().write_fence().endswith(f"lists no {gone}"), gone
+    # `--sandboxed` or `--add-dirs` in a description is not the flag.
+    monkeypatch.setitem(base._CLI_OUTPUT, ("/x/agent", "--help"), "  --sandboxed x\n  --add-dirs y\n  --no-sandbox z\n")
+    assert "lists no --sandbox or --add-dir" in Cursor().write_fence()
+
+
+def test_dispatched_cursor_worker_is_fenced_with_its_run_dir_writable(env, monkeypatch):
+    from ttp.providers import cursor
+    monkeypatch.setattr(cursor, "sandbox_host_gap", lambda: "")
+    p, run, task, argv, _ = _cli_run(env, monkeypatch, "cursor", _codex_events(*CURSOR_STREAM_OK),
+                                     result={"status": "done", "summary": "ok"}, help_text=CURSOR_REAL_HELP)
+    assert argv[argv.index("--sandbox") + 1] == "enabled" and "--force" in argv
+    added = [Path(argv[i + 1]) for i, a in enumerate(argv) if a == "--add-dir"]
+    run_dir = p.runs / str(run["id"])
+    assert any(run_dir.resolve().is_relative_to(d.resolve()) for d in added), (added, run_dir)
+    assert task["status"] == "done", "result.json reached the daemon"
+    assert not (env["repo"] / ".cursor").exists(), "the harness writes no Cursor config file"
+    # Coordinator turns and read-only runs answer only: no sandbox flags.
+    _, _, _, argv, _ = _cli_run(env, monkeypatch, "cursor", _codex_events(*CURSOR_STREAM_OK),
+                                role="coordinator", read_only=True, help_text=CURSOR_REAL_HELP)
+    assert "--sandbox" not in argv and "--add-dir" not in argv

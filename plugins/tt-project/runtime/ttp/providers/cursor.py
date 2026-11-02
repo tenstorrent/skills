@@ -8,8 +8,11 @@ Builds that offer `--output-format stream-json` stream one event per line, endin
 result object `json` prints alone. Streaming keeps the output file growing while the agent works,
 so the runner's stall guard sees progress and its budget check sees spend before the run ends.
 
-Write fence (from the docs; the CLI was not installed where this was probed). Workers run with
-`--force` and without `--sandbox enabled`, so they are unfenced today.
+Write fence (from the docs and `agent --help`; built, not measured live). Workers run with `--force`.
+When `--help` lists `--sandbox` and `--add-dir` and the host passes `sandbox_host_gap()`, they also
+get `--sandbox enabled` and one `--add-dir` per writable root (`writable_args`: the project state
+with the run dir, git metadata, temp and lock dirs), so result.json stays writable without the
+harness writing `.cursor/sandbox.json`. Otherwise they are unfenced and `write_fence()` says why.
 
 | Question | Linux | macOS |
 | :- | :- | :- |
@@ -58,6 +61,29 @@ def status_login(text: str) -> str:
     return who.strip(".,;:()[]").lower()
 
 
+def sandbox_host_gap(system: str = "", release: str = "", proc: str = "/proc/sys/kernel") -> str:
+    """Why this host cannot run Cursor's sandbox; "" when it can. macOS: Seatbelt, always. Linux:
+    Landlock + seccomp need kernel 6.2+ and unprivileged user namespaces (an AppArmor or Debian
+    switch may forbid them)."""
+    u = os.uname()
+    system, release = system or u.sysname, release or u.release
+    if system == "Darwin":
+        return ""
+    if system != "Linux":
+        return f"no Cursor sandbox on {system}"
+    m = re.match(r"(\d+)\.(\d+)", release)
+    if not m or (int(m[1]), int(m[2])) < (6, 2):
+        return f"kernel {release} is older than the 6.2 the Cursor sandbox needs"
+    for name, allowed in (("apparmor_restrict_unprivileged_userns", "0"), ("unprivileged_userns_clone", "1")):
+        try:
+            value = Path(proc, name).read_text().strip()
+        except OSError:
+            continue   # absent: the switch does not exist on this kernel
+        if value != allowed:
+            return f"unprivileged user namespaces are off (kernel.{name}={value})"
+    return ""
+
+
 def account_label(who: str) -> str:
     """The account label for login `who`: 'cursor:' and an opaque hash, never the login itself."""
     return f"cursor:{hashlib.sha256(who.encode()).hexdigest()[:12]}" if who else "cursor"
@@ -99,8 +125,27 @@ class Cursor(Provider):
             argv += ["--mode", "ask"]   # answers only: no edits and no commands
         return argv, {}
 
+    def _sandbox_gap(self) -> str:
+        """Why workers run without `--sandbox enabled`; "" when they get it."""
+        help_text = cli_output(self.binary() or "agent", "--help")
+        missing = [f for f in ("--sandbox", "--add-dir") if not re.search(rf"(?<![\w-]){f}\b", help_text)]
+        if missing:
+            return f"--force without --sandbox enabled: this build's `--help` lists no {' or '.join(missing)}"
+        gap = sandbox_host_gap()
+        return f"--force without --sandbox enabled: {gap}" if gap else ""
+
+    def writable_args(self, dirs):
+        # `--add-dir` makes each root a workspace root, writable inside the sandbox; the harness never
+        # writes `.cursor/sandbox.json` (`additionalReadwritePaths`) for this.
+        if not dirs or self._sandbox_gap():
+            return []
+        out = ["--sandbox", "enabled"]
+        for d in dirs:
+            out += ["--add-dir", str(d)]
+        return out
+
     def write_fence(self) -> str:
-        return "--force without --sandbox enabled"
+        return self._sandbox_gap()
 
     def resume_args(self, session_id: str) -> list[str]:
         # `--resume [chatId]` continues a chat; the id is the session_id every stream event carries.
