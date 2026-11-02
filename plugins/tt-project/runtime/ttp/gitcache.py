@@ -33,6 +33,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from . import gitmemo
+
 RACY_S = 2.0            # a config file changed this recently is read by git every time
 MAX_SET = 100_000       # ancestors kept per tip; more and the set is partial
 MAX_TIPS = 4            # ancestor sets kept at once
@@ -116,28 +118,31 @@ def _dirs(repo: Path | str) -> tuple[str, str] | None:
     return gitdir, common
 
 
-def _system_config() -> list[str]:
-    """Where this git keeps its system config (asked once per process)."""
+def _system_config() -> list[str] | None:
+    """Where this git keeps its system config (known once per process; a git too old to name it uses
+    /etc/gitconfig); None when git did not answer in time."""
     if not _system:
-        found = ""
         try:
-            r = subprocess.run(["git", "var", "GIT_CONFIG_SYSTEM"], capture_output=True, text=True, timeout=10,
-                               stdin=subprocess.DEVNULL)
-            calls["git"] += 1
-            found = r.stdout.strip() if r.returncode == 0 else ""
+            r = subprocess.run(["git", "var", "GIT_CONFIG_SYSTEM"], capture_output=True, text=True,
+                               timeout=gitmemo.timeout(10, read=True), stdin=subprocess.DEVNULL)
         except (OSError, subprocess.SubprocessError):
-            pass
+            return None
+        finally:
+            calls["git"] += 1
+        found = r.stdout.strip() if r.returncode == 0 else ""
         _system.extend(sorted({found, "/etc/gitconfig"} - {""}))
     return _system
 
 
-def _config_files(gitdir: str, common: str) -> list[str]:
+def _config_files(gitdir: str, common: str) -> list[str] | None:
     home = os.environ.get("HOME", "")
     xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
     glob = ([os.environ["GIT_CONFIG_GLOBAL"]] if "GIT_CONFIG_GLOBAL" in os.environ
             else [os.path.join(xdg, "git", "config"), os.path.join(home, ".gitconfig")])
     system = [] if os.environ.get("GIT_CONFIG_NOSYSTEM") else (
         [os.environ["GIT_CONFIG_SYSTEM"]] if "GIT_CONFIG_SYSTEM" in os.environ else _system_config())
+    if system is None:
+        return None
     return [*system, *glob, os.path.join(common, "config"), os.path.join(gitdir, "config.worktree")]
 
 
@@ -157,7 +162,10 @@ def _has_include(path: str, st: tuple) -> bool:
 
 def _config_stamp(dirs: tuple[str, str]) -> tuple | None:
     out = []
-    for f in _config_files(*dirs):
+    files = _config_files(*dirs)
+    if files is None:
+        return None
+    for f in files:
         st = _st(f)
         if st and _has_include(f, st):
             return None
@@ -204,7 +212,8 @@ def _keep(d: dict, key, value) -> None:
 
 def _git(repo: Path | str, *args: str, timeout: float | None) -> subprocess.CompletedProcess:
     calls["git"] += 1
-    return subprocess.run(["git", "-C", os.fspath(repo), *args], capture_output=True, text=True, timeout=timeout,
+    return subprocess.run(["git", "-C", os.fspath(repo), *args], capture_output=True, text=True,
+                          timeout=gitmemo.timeout(timeout, args),
                           stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
 
 

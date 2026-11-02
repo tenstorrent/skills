@@ -17,7 +17,7 @@ def _git_spy(monkeypatch):
     return seen
 
 
-def _line(tmp_path, n):
+def _ancestry_line(tmp_path, n):
     repo = tmp_path / "line"
     repo.mkdir()
     _git_out(repo, "init", "-q", "-b", "main")
@@ -26,7 +26,7 @@ def _line(tmp_path, n):
 
 def test_landed_ancestry_of_several_shas_against_one_tip_costs_one_git_call_then_none(env, tmp_path, monkeypatch):
     from ttp import gitcache, landed
-    repo, shas = _line(tmp_path, 5)
+    repo, shas = _ancestry_line(tmp_path, 5)
     tip = shas[-1]
     _git_out(repo, "checkout", "-q", "-b", "side", shas[1])
     side = _commit_file_in(repo, "side.txt")
@@ -52,7 +52,7 @@ def test_landed_ancestry_of_several_shas_against_one_tip_costs_one_git_call_then
 
 def test_landed_ancestry_of_an_abbreviated_or_missing_commit_still_asks_git(env, tmp_path, monkeypatch):
     from ttp import landed
-    repo, shas = _line(tmp_path, 2)
+    repo, shas = _ancestry_line(tmp_path, 2)
     seen = _git_spy(monkeypatch)
     missing = "0" * 40
     assert landed._git(repo, "merge-base", "--is-ancestor", missing, shas[1]).returncode not in (0, 1)
@@ -65,7 +65,7 @@ def test_git_remote_reads_are_kept_until_the_repository_config_changes(env, tmp_
     monkeypatch.setattr(gitcache, "RACY_S", -1.0)
     (tmp_path / "global").write_text("[gc]\n\tauto = 0\n")    # the tests' own global config includes others
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "global"))
-    repo, _ = _line(tmp_path, 1)
+    repo, _ = _ancestry_line(tmp_path, 1)
     _git_out(repo, "remote", "add", "origin", str(tmp_path / "a.git"))
     seen = _git_spy(monkeypatch)
     for _ in range(3):
@@ -122,3 +122,28 @@ def test_a_json_file_read_from_memory_is_a_private_copy(env, tmp_path, monkeypat
     first = statcache.load_json(f)
     first["a"]["b"].append(2)
     assert statcache.load_json(f) == {"a": {"b": [1]}}
+
+
+def test_gitcache_git_takes_the_scope_cap_and_a_failed_system_config_lookup_is_not_kept(env, tmp_path, monkeypatch):
+    from ttp import gitcache, gitmemo
+    monkeypatch.delenv("GIT_CONFIG_SYSTEM", raising=False)
+    monkeypatch.delenv("GIT_CONFIG_NOSYSTEM", raising=False)
+    monkeypatch.setattr(gitcache, "_system", [])
+    repo, shas = _ancestry_line(tmp_path, 2)
+    real, timeouts, hang = subprocess.run, [], [True]
+
+    def run(args, *a, **k):
+        if isinstance(args, (list, tuple)) and args[:1] == ["git"]:
+            timeouts.append((args[-1], k.get("timeout")))
+            if hang[0] and "var" in args:
+                raise subprocess.TimeoutExpired(args, k.get("timeout"))
+        return real(args, *a, **k)
+    monkeypatch.setattr(subprocess, "run", run)
+    with gitmemo.bounded(0.5):
+        assert gitcache._system_config() is None          # a hung lookup is not kept as "no system config"
+        assert gitcache._config_stamp(gitcache._dirs(repo)) is None
+        gitcache.ancestors(repo, shas, shas[-1])
+    assert timeouts and all(t is not None and t <= 0.5 for _, t in timeouts), timeouts
+    assert gitcache._system == []
+    hang[0] = False
+    assert gitcache._system_config() and gitcache._system      # asked again, and kept once git answers
