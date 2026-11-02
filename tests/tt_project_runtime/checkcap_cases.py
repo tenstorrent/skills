@@ -4865,3 +4865,123 @@ def test_a_wait_for_a_checks_slot_reads_pids_once_per_cycle_without_proc(env, tm
     assert calls, "the callbacks' pid reads ran `ps`"
     assert len(calls) <= len(cycles) + 1, \
         f"{len(calls)} ps calls for {len(cycles)} poll cycles of {len(pids)} pid reads"
+
+
+# A cancelled task's checks (jobstop.end_cancelled_checks): stopped at the cancel, their lane freed at once.
+
+def _cancel_holder(p, tmp_path, tid: int, name: str, repo: str = _LANE_REPO):
+    """A process of task `tid` holding one of project `p`'s checks lanes in a process group of its own, as an
+    attached `ttp checks` in a worker's tool shell does."""
+    got = tmp_path / f"held-{name}"
+    proc = subprocess.Popen([sys.executable, "-c", _DONE_HOLDER, p.name, str(got), repo, f"run {name}"],
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_TASK": str(tid)},
+                            start_new_session=True)
+    assert _wait_for(got.exists), "the holder never took its lane"
+    return proc
+
+
+def test_cancelling_a_task_stops_its_attached_and_detached_checks_at_once_and_frees_their_lane(
+        env, tmp_path, monkeypatch):
+    from ttp import cli, jobstop, locks, testslots
+    from ttp.daemon import Daemon
+    from ttp.runner import proc_start
+    p = make(env)
+    _lane_env(monkeypatch)
+    tid = p.db.add_task("t", "s", kind="code")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time(), "ok", str(run_dir)))
+    holder = _cancel_holder(p, tmp_path, tid, "attached")
+    # its detached checks: a group leader named in checks.pid (here waiting, holding no lane)
+    detached = subprocess.Popen([sys.executable, "-c", "import time\nwhile True: time.sleep(1)"],
+                                env={**os.environ, "TTP_TASK": str(tid)}, start_new_session=True)
+    try:
+        (run_dir / cli.CHECKS_PID).write_text(json.dumps({"pid": detached.pid, "started": proc_start(detached.pid)}))
+        lanes = [x for b in testslots.suite_bases(p.name) for x in testslots._lanes_of(b)
+                 if not locks.any_free([x])]
+        assert len(lanes) == 1
+        d = Daemon(p.base)
+        d.stop_cancelled_checks()   # first tick: nothing cancelled, nothing touched
+        assert holder.poll() is None and detached.poll() is None
+        assert p.db.cancel(tid) == ""
+        began = time.monotonic()
+        d.stop_cancelled_checks()
+        assert time.monotonic() - began < jobstop.CANCEL_TERM_S + 2 * jobstop.FREE_WAIT_S + 5, "the cancel stays fast"
+        assert holder.wait(10) is not None and detached.wait(10) is not None
+        assert locks.any_free(lanes), "the lane is free at the cancel, not when the check ends by itself"
+        texts = [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind=? AND task=?", (jobstop.EVENT, tid))]
+        assert len(texts) == 2 and all("cancelled task" in t and "SIGTERM" in t for t in texts), texts
+        assert any(f"freed checks lane {lanes[0].name}" in t for t in texts), texts
+        d.stop_cancelled_checks()   # nothing new: no second pass, no new event
+        assert jobstop.sweep_cancelled_checks(p) == [], "the backstop finds nothing left"
+    finally:
+        _stop(holder)
+        _stop(detached)
+
+
+def test_cancelling_a_task_never_stops_another_task_s_checks_or_an_open_review_s_precheck(
+        env, tmp_path, monkeypatch):
+    import shlex
+    from ttp import checklane, daemon, jobstop, locks, testslots, worktree
+    p = make(env)
+    _lane_env(monkeypatch)
+    tid = p.db.add_task("t", "s", kind="code")
+    other = p.db.add_task("o", "s", kind="code")
+    theirs = _cancel_holder(p, tmp_path, other, "theirs")
+    # a lane label naming the cancelled task on a process that runs for another one (a reused pid, a hand edit)
+    relabelled = _cancel_holder(p, tmp_path, other, "relabelled", "1" * 12)
+    lane = next(x for b in testslots.suite_bases(p.name) for x in testslots._lanes_of(b)
+                if any(r.get("pid") == relabelled.pid for r in locks.holder_records([x])))
+    lane.write_text(json.dumps({**json.loads(lane.read_text()), "task": str(tid)}))
+    # a check of the cancelled task whose process group also holds another task's process
+    shared = subprocess.Popen(["sh", "-c", f"TTP_TASK={other} sleep 600 & exec {shlex.quote(sys.executable)} -c "
+                               f"{shlex.quote(_DONE_HOLDER)} {p.name} {tmp_path / 'held-shared'} {'2' * 12} 'run shared'"],
+                              env={**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_TASK": str(tid)}, start_new_session=True)
+    assert _wait_for((tmp_path / "held-shared").exists)
+    # the daemon's review precheck of the cancelled task, run as that task, while its review is open
+    head = worktree._git(p.root, "rev-parse", "HEAD")
+    token = f"t{tid}-{head[:12]}"
+    p.db.add_task("review", "r", kind="review", labels=[checklane.PRECHECK_LABEL + token])
+    precheck = _cancel_holder(p, tmp_path, tid, token, "3" * 12)
+    try:
+        assert p.db.cancel(tid) == ""
+        assert jobstop.cancelled_checks(p, tid) == []
+        assert jobstop.end_cancelled_checks(p, tid, "test") == []
+        daemon.Daemon(p.base).stop_cancelled_checks()
+        assert jobstop.sweep_cancelled_checks(p) == []
+        assert all(x.poll() is None for x in (theirs, relabelled, shared, precheck))
+        p.db.cancel(other)   # the other task is cancelled too: only now its own checks stop
+        assert [r["pgid"] for r in jobstop.end_cancelled_checks(p, other, "test")] == [theirs.pid]
+        assert theirs.wait(10) is not None and precheck.poll() is None
+    finally:
+        for x in (theirs, relabelled, precheck):
+            _stop(x)
+        _kill_group(shared)
+
+
+def test_cancelling_a_task_whose_checks_group_already_ended_is_no_error(env, tmp_path, monkeypatch):
+    from ttp import cli, jobstop
+    from ttp.daemon import Daemon
+    from ttp.runner import proc_start
+    p = make(env)
+    _lane_env(monkeypatch)
+    tid = p.db.add_task("t", "s", kind="code")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time(), "ok", str(run_dir)))
+    gone = subprocess.Popen(["sleep", "0.3"], start_new_session=True)
+    started = proc_start(gone.pid)
+    gone.wait(10)
+    (run_dir / cli.CHECKS_PID).write_text(json.dumps({"pid": gone.pid, "started": started}))
+    assert p.db.cancel(tid) == ""
+    Daemon(p.base).stop_cancelled_checks()   # a checks.pid naming a process that ended
+    assert jobstop.end_cancelled_checks(p, tid, "test") == []
+    # a group found live that ends before its signal: no error, no signal, no wait past the grace
+    monkeypatch.setattr(jobstop, "cancelled_checks",
+                        lambda *a: [{"pgid": gone.pid, "pid": gone.pid, "lane": None, "rc": None, "since": 1.0}])
+    began = time.monotonic()
+    r = jobstop.end_cancelled_checks(p, tid, "test")
+    assert time.monotonic() - began < jobstop.FREE_WAIT_S + 1
+    assert len(r) == 1 and "already ended" in r[0]["text"], r

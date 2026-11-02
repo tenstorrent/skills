@@ -70,6 +70,7 @@ SWEEP_DAYS = 14
 FREE_WAIT_S = 2.0
 CHECKS_TERM_S = 15.0   # detached checks end their check command on SIGTERM, which may take a few seconds
 PUSH_TERM_S = 15.0     # likewise a detached push: it ends its check and writes its outcome
+CANCEL_TERM_S = 5.0    # a cancelled task's checks: SIGKILL this long after SIGTERM (nobody reads their result)
 QUEUE = "jobstop-queue"
 EVENT = "detached_job_stopped"
 BY = "jobstop"   # the sender component detach.signalled names
@@ -359,6 +360,135 @@ def end_checks(p: Project, run_dir: Path, why: str, task: int | None = None) -> 
     return out
 
 
+def _env_task(pid: int) -> str | None:
+    """The task a process runs for (TTP_TASK, else TTP_TASK_ID; "" for none), None when unreadable."""
+    env = _environ(pid)
+    return None if env is None else env.get("TTP_TASK") or env.get("TTP_TASK_ID") or ""
+
+
+def cancelled_checks(p: Project, task: int) -> list[dict]:
+    """The live process groups of cancelled task `task`'s `ttp checks`, attached or detached: each holder of
+    one of the project's checks lanes labelled with the task (but a daemon review precheck its open review
+    reads, checklane.open_precheck: never a finished task's holder), each waiter queued for one with such a
+    ticket, and the detached checks (checks.pid) of each of the task's runs. A group counts only when its
+    named process carries TTP_TASK (or TTP_TASK_ID) `task`, none of its members carries another task's, and
+    it holds no process this one guards (_guarded: itself, its ancestors, every running worker). Read only:
+    [{pgid, pid, lane (a lane file or None), rc (a detached checks.rc or None), since}]."""
+    from . import checkcap, checklane, testslots
+    from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
+    node, want, cands = os.uname().nodename, str(task), []
+    for base in testslots.suite_bases(p.name):
+        for path in testslots._lanes_of(base):
+            for rec in locks.holder_records([path]):
+                if (str(rec.get("task") or "") == want and rec.get("alive") is True and not rec.get("shared")
+                        and rec.get("node") in (None, node) and isinstance(rec.get("pid"), int)
+                        and not checklane.open_precheck(p.db, want, rec.get("holder"))):
+                    cands.append({"pid": rec["pid"], "lane": path, "rc": None, "since": rec.get("since")})
+        for t in locks.queued(checkcap.slot_dir(), base):
+            m = re.match(r"[\d.]+-(\d+)", t.name)
+            if m and checklane._ticket_task(t) == want:
+                try:
+                    holder = t.read_text()
+                except OSError:
+                    continue
+                if not checklane.open_precheck(p.db, want, holder):
+                    cands.append({"pid": int(m.group(1)), "lane": None, "rc": None, "since": locks._arrival(t)})
+    for r in p.db.q("SELECT DISTINCT dir FROM runs WHERE task=? AND dir IS NOT NULL", (task,)):
+        info = _read_checks_pid(Path(r["dir"]))
+        if _checks_alive(info):
+            cands.append({"pid": info["pid"], "lane": None, "rc": Path(r["dir"]) / CHECKS_RC,
+                          "since": info.get("started")})
+    guarded, mine, out = _guarded(p), os.getpgrp(), []
+    for c in cands:
+        st = _stat(c["pid"])
+        if st is None or st[0] <= 1 or st[0] == mine or _env_task(c["pid"]) != want:
+            continue
+        group = members(st[0])
+        if guarded & set(group) or any(_env_task(m) not in (None, "", want) for m in group):
+            continue
+        out.append({**c, "pgid": st[0]})
+    return out
+
+
+def end_cancelled_checks(p: Project, task: int, why: str, grace: float = CANCEL_TERM_S) -> list[dict]:
+    """Stop cancelled task `task`'s checks (cancelled_checks) at once: SIGTERM to each of their process
+    groups, SIGKILL to those still alive after `grace`, then wait at most FREE_WAIT_S for their checks lanes
+    to go free (a lane is an OS file lock: it frees as its holder ends). A group already gone is no error.
+    One event per group; [] when none ran."""
+    targets = cancelled_checks(p, task)
+    groups = sorted({t["pgid"] for t in targets})
+    sent: dict[int, list[int]] = {}
+    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, FREE_WAIT_S)):
+        live = [g for g in groups if members(g)]
+        for g in live:
+            try:
+                os.killpg(g, sig)
+                sent.setdefault(g, []).append(sig)
+            except OSError:   # ended meanwhile
+                pass
+        deadline = time.monotonic() + wait
+        while live and time.monotonic() < deadline:
+            live = [g for g in live if members(g)]
+            if live:
+                time.sleep(0.1)
+        if not live:
+            break
+    lanes = [t["lane"] for t in targets if t["lane"]]
+    deadline = time.monotonic() + FREE_WAIT_S
+    held = list(lanes)
+    while held and time.monotonic() < deadline:
+        held = [x for x in held if not locks.any_free([x])]
+        if held:
+            time.sleep(0.05)
+    out = []
+    for g in groups:
+        mine = [t for t in targets if t["pgid"] == g]
+        for t in mine:
+            for sig in sent.get(g, []) if t["rc"] else []:
+                detach.signalled(t["rc"], sig, g, "jobstop.end_cancelled_checks", why, by=BY, state=p.state, task=task)
+        freed = [t["lane"].name for t in mine if t["lane"] and t["lane"] not in held]
+        still = [t["lane"].name for t in mine if t["lane"] and t["lane"] in held]
+        text = (f"stopped the checks of cancelled task #{task}: {why}; "
+                f"{' then '.join(signal.Signals(x).name for x in sent.get(g, [])) or 'no signal (already ended)'} "
+                f"to group {g} from {BY} pid {os.getpid()}"
+                + (f"; freed checks lane {', '.join(freed)}" if freed else "")
+                + (f"; checks lane {', '.join(still)} still held" if still else ""))
+        fp = f"checks_cancel_stopped:{task}:{g}:{mine[0].get('since')}"
+        r = {"task": task, "job": "checks", "pgid": g, "freed": freed, "held": still, "text": text}
+        if not p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+            p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
+                   (time.time(), "daemon", EVENT, fp, "low", text, json.dumps(r), "handled", task))
+        out.append(r)
+    return out
+
+
+def lane_tasks(p: Project) -> set[int]:
+    """The tasks whose `ttp checks` hold or wait for one of the project's checks lanes now (their labels)."""
+    from . import checkcap, checklane, testslots
+    out = set()
+    for base in testslots.suite_bases(p.name):
+        out |= {str(r.get("task") or "") for r in locks.holder_records(testslots._lanes_of(base))}
+        out |= {checklane._ticket_task(t) for t in locks.queued(checkcap.slot_dir(), base)}
+    return {int(x) for x in out if x.isdigit()}
+
+
+def sweep_cancelled_checks(p: Project, after: float | None = None) -> list[dict]:
+    """end_cancelled_checks for each task cancelled (its row last updated) after `after`, and, with None, for
+    each cancelled task that holds or waits for a checks lane now (lane_tasks: the backstop of a cancel
+    missed, as across a daemon restart)."""
+    if after is None:
+        ids = sorted(lane_tasks(p))
+        marks = ",".join("?" * len(ids))
+        rows = p.db.q(f"SELECT id FROM tasks WHERE status='cancelled' AND id IN ({marks}) ORDER BY id", ids) if ids else []
+    else:
+        rows = p.db.q("SELECT id FROM tasks WHERE status='cancelled' AND updated>? ORDER BY id",
+                      (max(after, time.time() - SWEEP_DAYS * 86400),))
+    out = []
+    for row in rows:
+        out += end_cancelled_checks(p, row["id"], f"task #{row['id']} was cancelled")
+    return out
+
+
 def end_push(p: Project, marker: Path, why: str, task: int | None = None) -> dict | None:
     """Stop the detached `ttp push` of this marker while it is queued or runs: a queued one is recorded
     as failed under its run lock, so the daemon never starts it; a running one (its run lock held) gets
@@ -484,6 +614,7 @@ def sweep(p: Project, now: float | None = None) -> list[dict]:
     marks = ",".join("?" * len(ENDED))
     rows = p.db.q(f"SELECT r.dir, t.id, t.status FROM runs r JOIN tasks t ON t.id=r.task WHERE t.status IN ({marks}) "
                   "AND r.dir IS NOT NULL AND COALESCE(r.started, 0)>?", (*ENDED, now - SWEEP_DAYS * 86400))
+    out += sweep_cancelled_checks(p)
     seen = set()
     for row in rows:
         reg = Path(row["dir"]) / detach.REGISTRY

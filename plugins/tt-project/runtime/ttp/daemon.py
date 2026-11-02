@@ -2070,6 +2070,10 @@ class Daemon:
                 log(self.p, r["text"])
         except Exception:
             log(self.p, "stopping the detached jobs of ended tasks failed\n" + traceback.format_exc())
+        try:
+            self.stop_cancelled_checks()
+        except Exception:
+            log(self.p, "stopping the checks of cancelled tasks failed\n" + traceback.format_exc())
         try:   # `ttp detach --spend-cmd/--spend-cap`: model-free spend checks of running jobs (spendcap)
             from . import spendcap
             if time.monotonic() >= getattr(self, "_spend_due", 0.0):
@@ -6444,6 +6448,21 @@ class Daemon:
                 "net": "its provider's API host not resolving", "gate": "the spend gate (no new work)",
                 "optional": "the spend gate (optional work held)", "device": "every device task slot taken",
                 "budget": "its spent task budget", "caps": "the dollar caps"}.get(why, why)
+
+    def stop_cancelled_checks(self) -> None:
+        """Model-free, each tick: a task cancelled since the last tick (`ttp task cancel`, the coordinator, the
+        web app) gets its `ttp checks`, attached or detached, stopped at once and their checks lanes freed
+        (jobstop.end_cancelled_checks), not left holding a lane until they end by themselves. jobstop.sweep
+        repeats it for every cancelled task still holding or waiting for a lane."""
+        from . import jobstop
+        row = self.p.db.one("SELECT MAX(updated) AS m FROM tasks WHERE status='cancelled'")
+        last = float((row or {}).get("m") or 0.0)
+        seen = getattr(self, "_cancel_seen", None)
+        if seen is not None and last <= seen:
+            return
+        for r in jobstop.sweep_cancelled_checks(self.p, seen):   # first tick: those holding or waiting for a lane
+            log(self.p, r["text"])
+        self._cancel_seen = last
 
     def check_checks_owner(self, every_s: float = 60, now: float | None = None) -> None:
         """Model-free: a checks lane held by a check whose task has ended (checklane.finished_holders)
