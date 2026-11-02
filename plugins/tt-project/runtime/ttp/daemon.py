@@ -47,6 +47,7 @@ from . import userstep
 from . import anchors
 from . import pagesev
 from . import askrethink
+from . import selfblock
 from . import bursthold
 from . import audit
 from . import redact
@@ -1551,7 +1552,7 @@ class Daemon:
         core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
         cycle = self._run_step(lambda: self.host_cycle_held(now), "host_cycle_held", default=False)
         for step in (self.run_schedules, self.check_self_review, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_unstarted, self.check_checks_wait, self.check_checks_owner, self.check_cap_wait, self.check_progress, self.check_churn, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_unstarted, self.check_checks_wait, self.check_checks_owner, self.check_cap_wait, self.check_progress, self.check_churn, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.check_self_blocking, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -6974,6 +6975,20 @@ class Daemon:
                 log(self.p, f"ask {aid} has held work past coordinator.ask_rethink_h: raised to the coordinator")
         except Exception:   # a failed check must not stop the tick
             log(self.p, "ask rethink failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
+
+    def check_self_blocking(self) -> None:
+        """Raise work held for the user's word on a decision that is the coordinator's own
+        (selfblock.py), once per finding. Model-free; checked once a minute."""
+        now = time.time()
+        if now - getattr(self, "_selfblock_checked", 0.0) < 60:
+            return
+        self._selfblock_checked = now
+        try:
+            if found := selfblock.raise_due(self.p.db, now):
+                log(self.p, "self-blocking raised to the coordinator: "
+                    + ", ".join(f"{f['source']} {f['id']}" for f in found))
+        except Exception:   # a failed check must not stop the tick
+            log(self.p, "self-blocking check failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
 
     def blocker_sweep(self) -> None:
         """Queue a blocker sweep (sweep.py) when one is due: a tricky turn that re-checks every
