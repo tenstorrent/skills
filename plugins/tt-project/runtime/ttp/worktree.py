@@ -481,7 +481,10 @@ def _create(p: Project, task: dict, path: Path, branch: str, carried: str, timeo
         _git(p.root, "worktree", "add", str(path), branch, timeout=timeout, env=env)
         return
     # New, or left behind with nothing of its own by an attempt that timed out: (re)made at its start.
-    _git(p.root, "worktree", "add", "-B" if exists else "-b", branch, str(path), start, timeout=timeout, env=env)
+    # --no-track: never writes .git/config (branch.<name>.remote/merge), so a held config.lock (a
+    # sandbox's placeholder, another worktree being made) cannot refuse it; nothing reads that upstream.
+    _git(p.root, "worktree", "add", "--no-track", "-B" if exists else "-b", branch, str(path), start,
+         timeout=timeout, env=env)
     if started:
         record_rebase_start(p.root, task["id"], started)
 
@@ -1135,13 +1138,13 @@ def ensure_in(p: Project, task: dict, repo: Path) -> tuple[Path, str]:
             _git(repo, "worktree", "add", str(path), want, timeout=t, env=env)
             _git(path, "merge", "--ff-only", "--quiet", f"origin/{want}", check=False, timeout=t, env=env)
         else:
-            _git(repo, "worktree", "add", "-b", want, str(path), start, timeout=t, env=env)
+            _git(repo, "worktree", "add", "--no-track", "-b", want, str(path), start, timeout=t, env=env)
     else:
         if not (start := ref(want)):
             raise RuntimeError(f"branch {want or '(none)'} not found in {repo}")
         branch = f"ttp/t{task['id']}-{slug(task['title'])}"
         exists = _git(repo, "rev-parse", "--verify", "--quiet", branch, check=False, timeout=t)
-        _git(repo, "worktree", "add", *((str(path), branch) if exists else ("-b", branch, str(path), start)),
+        _git(repo, "worktree", "add", *((str(path), branch) if exists else ("--no-track", "-b", branch, str(path), start)),
              timeout=t, env=env)
     prepare(p, path, repo)
     return path, branch

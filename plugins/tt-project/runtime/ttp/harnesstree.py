@@ -123,7 +123,7 @@ def workdir(p: Project, tid: int) -> Path:
     if have:
         args = ["worktree", "add", "-q", str(own), branch(tid)]
     elif start := main_branch(p):
-        args = ["worktree", "add", "-q", "-b", branch(tid), str(own), start]
+        args = ["worktree", "add", "-q", "--no-track", "-b", branch(tid), str(own), start]
     else:
         raise RuntimeError(f"harness worktree for #{tid}: the harness repo has no main branch to start "
                            f"{branch(tid)} from (its checkout is on {on_branch(p.harness) or 'a detached HEAD'})")

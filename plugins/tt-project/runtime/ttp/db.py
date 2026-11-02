@@ -204,6 +204,7 @@ TERMINAL_TASK_STATES = ("done", "failed", "cancelled")
 OPEN_TASKS = "status NOT IN ('done','failed','cancelled')"
 NOT_ABANDONED_SQL = "id NOT IN (SELECT task FROM task_abandoned)"   # landed.abandon: left out of landing checks
 WORKSPACE_TRIES_KEY = "workspace_tries"   # kv: task id -> failed workspace attempts in a row (Daemon._workspace_failed)
+WORKSPACE_LOCK_TRIES_KEY = "workspace_lock_tries"   # kv: task id -> workspace refusals on a held git lock in a row
 # A review that asked for changes is a review that worked. It is stored 'failed', so the change it
 # reviewed stays gated (its fix and re-review follow), and its hand-off status says changes_needed:
 # readers show and count it on its own, never as a failure (task_outcome, DB.status_counts).
@@ -990,10 +991,11 @@ END""")
                 prev.pop("waiting_since", None)
                 prev.pop("stale_wakes", None)
                 self.x("UPDATE tasks SET result=? WHERE id=?", (dump_result(prev), task_id))
-            tries = self.kv(WORKSPACE_TRIES_KEY, {}) or {}
-            if str(task_id) in tries:
-                tries.pop(str(task_id))
-                self.set_kv(WORKSPACE_TRIES_KEY, tries)
+            for key in (WORKSPACE_TRIES_KEY, WORKSPACE_LOCK_TRIES_KEY):
+                tries = self.kv(key, {}) or {}
+                if str(task_id) in tries:
+                    tries.pop(str(task_id))
+                    self.set_kv(key, tries)
         return ""
 
     def cancel(self, task_id: int) -> str:

@@ -179,6 +179,7 @@ from .db import (
     PAUSE_BOOT_KEY,
     SEVERITY_RANK,
     TERMINAL_TASK_STATES,
+    WORKSPACE_LOCK_TRIES_KEY,
     WORKSPACE_TRIES_KEY,
     BranchIndex,
     assigned_tier,
@@ -513,6 +514,12 @@ CHAT_FALLBACK_CAP_KEY = "chat_fallback_cap_seen"   # kv: when Daemon._chat_fallb
 CHAT_FALLBACK_CAP_EVERY_S = 86400
 PLUGINS_DROPPED_KEY = "plugin_dirs_dropped"   # kv: provider -> [dirs, isolated] alerted as not loaded (Daemon._alert_plugins_dropped)
 WORKSPACE_RETRY_NOTE = "workspace retry"   # a queued task's note while its workspace is retried
+# A workspace refused on a held git lock file (.git/config.lock: a sandbox's empty placeholder, another
+# worktree being made) is contention, not a failure: retried after CONFIG_LOCK_BACKOFF_S without using
+# a worktree.create_retries try, at most CONFIG_LOCK_RETRIES times in a row (a stale lock still ends blocked).
+CONFIG_LOCK_ERRORS = ("could not lock config file", ".lock': File exists")
+CONFIG_LOCK_BACKOFF_S = 30
+CONFIG_LOCK_RETRIES = 12
 SLEPT_MIN_S = 60        # a run whose wall clock ran this much ahead of its monotonic clock overlapped a host sleep
 SLEEPS_KEPT_S = 7 * 86400
 SLEPT_LONG_S = 600      # a sleep this long is recorded as a `host_slept` event and tells the user once a day
@@ -13686,6 +13693,9 @@ class Daemon:
     def _workspace_tries(self, task_id: int, clear: bool = False) -> int:
         """How often making task `task_id`'s workspace failed in a row (WORKSPACE_TRIES_KEY); `clear`
         forgets it once one was made."""
+        if clear and str(task_id) in (held := self.p.db.kv(WORKSPACE_LOCK_TRIES_KEY, {}) or {}):
+            held.pop(str(task_id))
+            self.p.db.set_kv(WORKSPACE_LOCK_TRIES_KEY, held)
         tries = self.p.db.kv(WORKSPACE_TRIES_KEY, {}) or {}
         if clear and str(task_id) in tries:
             tries.pop(str(task_id))
@@ -13702,6 +13712,19 @@ class Daemon:
         db = self.p.db
         w = self.cfg.get("worktree") or {}
         limit = int(w.get("create_retries", 3) or 0)
+        if not getattr(e, "final", False) and any(m in str(e) for m in CONFIG_LOCK_ERRORS):
+            with db.tx():
+                held = db.kv(WORKSPACE_LOCK_TRIES_KEY, {}) or {}
+                k = held[str(task["id"])] = int(held.get(str(task["id"]), 0)) + 1
+                db.set_kv(WORKSPACE_LOCK_TRIES_KEY, held)
+                if k <= CONFIG_LOCK_RETRIES:
+                    db.update_task(task["id"], status="queued", not_before=time.time() + CONFIG_LOCK_BACKOFF_S,
+                                   blocked_reason=f"{WORKSPACE_RETRY_NOTE} (git lock held, {k}/{CONFIG_LOCK_RETRIES}): "
+                                                  f"{e}"[:400])
+            if k <= CONFIG_LOCK_RETRIES:
+                log(self.p, f"task {task['id']} workspace waits on a held git lock ({k}/{CONFIG_LOCK_RETRIES}): {e}")
+                return
+            # Held all along: a stale lock, counted as a failure below.
         with db.tx():
             tries = db.kv(WORKSPACE_TRIES_KEY, {}) or {}
             n = limit + 1 if getattr(e, "final", False) else int(tries.get(str(task["id"]), 0)) + 1
@@ -13731,6 +13754,11 @@ class Daemon:
                     if (db.task(int(k)) or {}).get("status", "cancelled") not in TERMINAL_TASK_STATES}
             if kept != tries:
                 db.set_kv(WORKSPACE_TRIES_KEY, kept)
+            held = db.kv(WORKSPACE_LOCK_TRIES_KEY, {}) or {}
+            live = {k: v for k, v in held.items()
+                    if (db.task(int(k)) or {}).get("status", "cancelled") not in TERMINAL_TASK_STATES}
+            if live != held:
+                db.set_kv(WORKSPACE_LOCK_TRIES_KEY, live)
         for t in db.q("SELECT * FROM tasks WHERE status='blocked' AND blocked_reason LIKE 'workspace:%'"):
             if anchors.anchor(t) or self._workspace_tries(t["id"]) >= limit:
                 continue

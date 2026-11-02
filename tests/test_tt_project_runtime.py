@@ -15996,7 +15996,7 @@ def test_a_half_made_workspace_is_removed_and_made_again(env, monkeypatch):
     task = p.db.task(p.db.add_task("slow checkout", "s", kind="code", tier="light", origin="user"))
     calls = _timed_out_add(monkeypatch, worktree, _half_made)
     path, branch = worktree.ensure(p, task)
-    assert len(calls) == 2 and calls[1][2] == "-B", "the branch left with nothing of its own was not remade"
+    assert len(calls) == 2 and "-B" in calls[1][:4], "the branch left with nothing of its own was not remade"
     assert _git_out(path, "status", "--porcelain") == "" and _git_out(path, "rev-parse", "--abbrev-ref", "HEAD") == branch
     assert "locked" not in _git_out(p.root, "worktree", "list", "--porcelain")
 
