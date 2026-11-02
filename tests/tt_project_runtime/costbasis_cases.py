@@ -197,7 +197,9 @@ def test_a_cut_off_codex_run_priced_from_its_rollout_tokens_is_booked_as_tokens(
     prov = get_provider("codex").use(run["model"], {"opus": [1.0, 0.1, 2.0]})
     priced = _priced_from_tokens(run_dir, exit_info, None, prov)
     assert priced and priced > 0, "the rollout's token counts should price the cut-off run"
-    assert priced == pytest.approx((6000 - 2000 - 2000) * 1.0 / 1e6 + 2000 * 0.1 / 1e6 + 500 * 2.0 / 1e6), priced
+    # the rollout's running totals cover the whole session: the count before the run's start is
+    # subtracted as the base, so the run is priced at last - base = (5000, 2000, 300)
+    assert priced == pytest.approx((5000 - 2000) * 1.0 / 1e6 + 2000 * 0.1 / 1e6 + 300 * 2.0 / 1e6), priced
     p.db.x("UPDATE runs SET status='running', cost_usd=0, cost_estimated=0, cost_basis=NULL WHERE id=?",
             (run["id"],))
     Daemon(p.base).finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (run["id"],)), exit_info)
