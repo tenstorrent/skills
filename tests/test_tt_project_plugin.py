@@ -1223,9 +1223,9 @@ def test_the_forked_test_runner_names_a_test_that_closes_or_replaces_its_workers
         "@pytest.mark.parametrize('i', range(60))\n"
         "def test_ok(i): pass\n"
         "def _replace(request, name, flags):\n"
-        "    fd = _fd(request, name)\n"
-        "    os.close(fd)\n"
-        "    assert os.open(os.devnull, flags) == fd\n"
+        "    new = os.open(os.devnull, flags)\n"   # dup2: a close-then-open may land on a lower free fd
+        "    os.dup2(new, _fd(request, name))\n"
+        "    os.close(new)\n"
         "def test_closes_out(request): os.close(_fd(request, 'out_w'))\n"
         "def test_replaces_out(request): _replace(request, 'out_w', os.O_WRONLY)\n"
         "def test_replaces_queue(request): _replace(request, 'work_r', os.O_RDONLY)\n")
