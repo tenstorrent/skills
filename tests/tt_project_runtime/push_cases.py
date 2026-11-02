@@ -11916,6 +11916,9 @@ def test_ttp_land_replays_a_reviewed_head_onto_a_moved_local_branch_and_records_
     assert [r["sha"] for r in p.db.q("SELECT sha FROM task_landings WHERE task=?", (rev["id"],))] == [new]
     assert len(_worktrees(p.root)) == n
     monkeypatch.setenv("TTP_PROJECT", str(p.base))   # this project, whatever folder the suite runs in
+    # The probe asks this project, never the one at the folder pytest runs in.
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(p.root)
     with pytest.raises(SystemExit) as e:
         cli.main(["landed", "--task", str(cid)])
     assert e.value.code == 0
