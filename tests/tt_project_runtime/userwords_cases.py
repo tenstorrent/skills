@@ -83,7 +83,7 @@ def test_contraction_fragments_match_no_unrelated_user_words(env):
     p = make(env)
     for text in ("If I don't answer within the hour, it's your call and you'll decide; don't wait for me.",
                  "A guard meant to catch loops shouldn't hold the queue; it's wrong, and they'd drop it.",
-                 "Then tell ltx-rt's coordinator it isn't done and don't let it's watcher stop."):
+                 "Then tell the other project's coordinator it isn't done and don't let it's watcher stop."):
         p.db.post("in", text, chat=None, kind="user", provenance="web-session")
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
     ask = ("Cursor sign-in for the live measurement: if you don't use it, tell me and I'll drop it. "
