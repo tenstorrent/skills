@@ -117,7 +117,10 @@ removal finds that entry and only removes the request. A request the ledger refu
 gone) is kept as `<id>.failed.json` with the reason, and logged. `ttp machines change edit` is queued the
 same way (op `edit`, or `test` for its --test or --no-test), checked against the ledger as read first, and
 keeps the entry's id; so are `ttp machines outage` and its --clear (ops `outage`, `outage_clear`). An edit
-records its request id in its `edits`, so a request applied twice edits once.
+records its request id in its `edits`, so a request applied twice edits once. Requests whose fields hold
+times computed from a relative --expires are named by the command's own arguments instead (an edit's also by
+the entry's edits so far, so a run after the daemon applied it edits anew). A queued clear withdraws the
+project's queued outage on that machine, and never ends an outage begun after the clear was made.
 
 A page is never lost nor sent twice: `route` records each due page as pending, with a text fixed for its
 step, and hands it to one daemon at a time (a claim that lapses after CLAIM_S); that daemon marks it
@@ -438,15 +441,18 @@ def restore_power_cycle(cid: int, was: dict, by: str, mark: str, now: float | No
 UNHASHED = ("added", "at", "expires", "since")
 
 
-def request_id(op: str, fields: dict) -> str:
-    """The id of request `op` with `fields`: the same command run again gets the same one."""
-    key = {k: v for k, v in fields.items() if k not in UNHASHED}
+def request_id(op: str, fields: dict, given: dict | None = None) -> str:
+    """The id of request `op` with `fields`: the same command run again gets the same one. `given`: the
+    command's own arguments, hashed instead of `fields` when these hold times computed from them (an edit's
+    or an outage's end from a relative --expires), which a run a moment later computes anew."""
+    key = given if given is not None else {k: v for k, v in fields.items() if k not in UNHASHED}
     return hashlib.sha256(json.dumps([op, key], sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
-def _queue(state: Path, op: str, fields: dict) -> dict:
-    """Queue `op` for the project daemon in `state` (once per request id); returns the request."""
-    rid = request_id(op, fields)
+def _queue(state: Path, op: str, fields: dict, given: dict | None = None, fresh: bool = False) -> dict:
+    """Queue `op` for the project daemon in `state` (once per request id: request_id with `given`); returns
+    the request. `fresh`: a request queued already is written again with these fields (a clear's time)."""
+    rid = request_id(op, fields, given)
     req = {"queued": rid, "op": op, "fields": fields}
     if op == "add":
         made = next((c for c in changes() if c.get("request") == rid), None)
@@ -454,7 +460,8 @@ def _queue(state: Path, op: str, fields: dict) -> dict:
             return made   # recorded already: a retry adds nothing
     path = Path(state) / REQUESTS / f"{rid}.json"
     try:
-        return {**json.loads(path.read_text()), "queued": rid}   # queued already
+        if not fresh:
+            return {**json.loads(path.read_text()), "queued": rid}   # queued already
     except (OSError, ValueError):
         pass
     try:
@@ -522,9 +529,12 @@ def apply_requests(state: Path, log: Callable[[str], None] = print) -> list[dict
                 c = {"alias": f["alias"], "outage": f["rec"]}
                 log(f"known outage on {f['alias']} recorded from queued request {rid}")
             elif req.get("op") == "outage_clear":
-                _clear_outage(f["alias"], f.get("by"), float(f.get("at") or time.time()))   # cleared already: no-op
-                c = {"alias": f["alias"], "outage": None}
-                log(f"known outage on {f['alias']} cleared from queued request {rid}")
+                at = float(f.get("at") or time.time())
+                _, newer = _clear_outage(f["alias"], f.get("by"), at, before=at)   # cleared already: no-op
+                c = {"alias": f["alias"], "outage": outages().get(f["alias"])}
+                log(f"known outage on {f['alias']} cleared from queued request {rid}" if not newer else
+                    f"queued request {rid} to clear the known outage on {f['alias']} left {', '.join(newer)}'s "
+                    f"in place: it began after the request was made")
             else:
                 raise ValueError(f"unknown request {req.get('op')!r}")
         except (ValueError, TypeError, KeyError) as e:
@@ -690,8 +700,11 @@ def edit_change(cid: int, by: str, what: str | None = None, undo: str | None = N
     except OSError as e:
         if queue is None or e.errno not in UNWRITABLE:
             raise
-    _edit(fields, where, dry=True)   # refuses here what the daemon would refuse (unknown, closed, no change)
-    return _queue(queue, "edit", fields)
+    cur = _edit(fields, where, dry=True)   # refuses here what the daemon would refuse (unknown, closed, no change)
+    # keyed on the arguments and the entry's edits so far: a repeat queues nothing more, a later run edits anew
+    given = {"id": cid, "by": by, "what": what, "undo": undo, "expires": expires, "until_probe": until_probe,
+             "until_task": until_task, "auto_undo": auto_undo, "edits": len(cur.get("edits") or [])}
+    return _queue(queue, "edit", fields, given)
 
 
 def _edit(f: dict, where=None, dry: bool = False, request: str | None = None) -> dict:
@@ -1004,7 +1017,8 @@ def set_outage(alias: str, why: str, by: str, expires: Any, owner: str = "", now
     except OSError as e:
         if queue is None or e.errno not in UNWRITABLE:
             raise
-    return _queue(queue, "outage", {"alias": alias, "by": by, "rec": rec})
+    given = {"alias": alias, "expires": expires, **{k: v for k, v in rec.items() if k not in ("since", "until")}}
+    return _queue(queue, "outage", {"alias": alias, "by": by, "rec": rec}, given)
 
 
 def _set_outage(alias: str, by: str, rec: dict) -> dict:
@@ -1032,35 +1046,50 @@ def outage_covers(covers: Any) -> list[str]:
 
 def clear_outage(alias: str, by: str | None = None, now: float | None = None, queue: Path | None = None) -> bool | dict:
     """End `by`'s outage entry on `alias` (None: every project's). Whether one was open. `queue`: as
-    add_change's: an open one is queued to clear (op `outage_clear`) and the request returned, with `queued`."""
+    add_change's: an open one, or one still queued in `queue` (op `outage`), is queued to clear (op
+    `outage_clear`, at `now`: it never ends an outage begun later) and the request returned, with `queued`;
+    a queued one is withdrawn (its request ids in `withdrawn`)."""
     now = time.time() if now is None else now
     try:
-        return _clear_outage(alias, by, now)
+        return _clear_outage(alias, by, now)[0]
     except OSError as e:
         if queue is None or e.errno not in UNWRITABLE:
             raise
     mine = outage_entries(now).get(alias) or {}
-    if not mine or (by is not None and by not in mine):
+    fields = {"alias": alias, "by": by, "at": now}
+    queued = pending(queue)
+    sets = [r for r in queued if r.get("op") == "outage" and r["fields"].get("alias") == alias
+            and (by is None or r["fields"].get("by") == by)]
+    again = any(r["queued"] == request_id("outage_clear", fields) for r in queued)   # a repeat: re-dated only
+    if not sets and not again and (not mine or (by is not None and by not in mine)):
         return False
-    return _queue(queue, "outage_clear", {"alias": alias, "by": by, "at": now})
+    for r in sets:
+        Path(queue, REQUESTS, r["queued"] + ".json").unlink(missing_ok=True)
+    # queued even when only a queued one was open: the daemon may have recorded it meanwhile
+    req = _queue(queue, "outage_clear", fields, fresh=True)
+    return {**req, "withdrawn": [r["queued"] for r in sets]}
 
 
-def _clear_outage(alias: str, by: str | None, now: float) -> bool:
+def _clear_outage(alias: str, by: str | None, now: float, before: float | None = None) -> tuple[bool, list[str]]:
+    """End `by`'s outage entry on `alias` (None: every project's): whether one was ended, and the projects
+    whose entry stays because it began after `before` (a queued clear's time)."""
     with _locked():
         doc = _read(ROUTES, {"conditions": {}})
         got = outage_entries(now, doc)
         mine = got.get(alias) or {}
         if not mine or (by is not None and by not in mine):
-            return False
-        if by is None:
+            return False, []
+        named = [b for b in mine if by is None or b == by]
+        newer = [b for b in named if before is not None and float(mine[b].get("since") or 0) > before]
+        if len(newer) == len(named):
+            return False, newer
+        for b in set(named) - set(newer):
+            mine.pop(b)
+        if not mine:
             got.pop(alias)
-        else:
-            mine.pop(by)
-            if not mine:
-                got.pop(alias)
         _store_outages(doc, got)
         _write(ROUTES, doc)
-    return True
+    return True, newer
 
 
 def outage_entries(now: float | None = None, doc: dict | None = None) -> dict[str, dict[str, dict]]:

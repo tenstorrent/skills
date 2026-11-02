@@ -7510,9 +7510,13 @@ def _queued_line(req: dict, where=None) -> str:
         f"known outage on {f['alias']}: {(f.get('rec') or {}).get('why')}{shown}" if req["op"] == "outage" else \
         f"clearing of {f.get('by') or 'every project'}'s known outage on {f['alias']}" if req["op"] == "outage_clear" else \
         f"machine change on {f['alias']}: {f['what']}{shown}"
+    if req.get("withdrawn"):
+        what += f", withdrawing its queued outage request {', '.join(req['withdrawn'])}"
+    # an edit is keyed on the entry's edits so far: once applied, the same command edits anew (as a direct one)
+    again = "before then " if req["op"] == "edit" else ""
     return (f"queued {what} (request {req['queued']}): the shared machine ledger is read-only here, so this "
             f"project's daemon records it on its next tick, within a few minutes while it runs; "
-            f"`ttp machines change list` shows it. Running the command again adds nothing.")
+            f"`ttp machines change list` shows it. Running the command again {again}adds nothing.")
 
 
 def _until_task_ok(p: Project | None, by: str, tid: int) -> None:

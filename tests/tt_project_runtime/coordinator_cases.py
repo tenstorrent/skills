@@ -17718,7 +17718,7 @@ def test_a_sandboxed_worker_queues_machine_change_edits_and_outages_for_its_daem
     with pytest.raises(SystemExit):
         cli.main(["machines", "outage", "box-z", "x", "--expires", "1h"])
     assert "no machine 'box-z'" in capsys.readouterr().err
-    cli.main(["machines", "outage", "box-a", "--clear"])
+    cli.main(["machines", "outage", "box-b", "--clear"])
     assert "no known outage from" in capsys.readouterr().out
     assert ml.outages() == {} and [r["op"] for r in ml.pending(p.state)] == ["edit", "outage"]
     monkeypatch.setattr(ml, "_locked", real)
@@ -17764,6 +17764,81 @@ def test_a_sandboxed_worker_queues_machine_change_edits_and_outages_for_its_daem
         cli.main(["machines", "outage", "box-a", "x", "--expires", "1h"])
     err = capsys.readouterr().err
     assert "read-only here" in err and "Traceback" not in err and len(err.strip().splitlines()) == 1, err
+
+
+def test_queued_machine_ledger_edits_and_outages_are_idempotent_and_a_queued_clear_never_ends_a_newer_outage(
+        env, monkeypatch, capsys):
+    """From a fenced worker (the shared ledger read-only), the same `ttp machines change edit --expires 6h` or
+    `ttp machines outage ... --expires 2d` run again a moment later queues no second request and records one
+    edit, as the CLI says; once applied, the same edit run later edits anew. A queued clear right after a
+    queued set finds and withdraws it; a clear queued before a newer outage was set leaves that one in place."""
+    import contextlib
+    import errno
+    from ttp import cli
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    for alias in ("box1", "box2"):
+        mm.add(alias, tags="device")
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(p.root)
+    real = ml._locked
+    now = time.time()
+    c = ml.add_change("box1", "drop-in", "rm drop-in", p.name, expires="1h", now=now)
+
+    @contextlib.contextmanager
+    def read_only():
+        raise OSError(errno.EROFS, "Read-only file system", str(ml._path(ml.LOCK)))
+        yield
+
+    monkeypatch.setattr(ml, "_locked", read_only)
+    for _ in range(2):
+        cli.main(["machines", "change", "edit", str(c["id"]), "--expires", "6h"])
+        assert "Running the command again before then adds nothing." in capsys.readouterr().out
+        cli.main(["machines", "outage", "box1", "fan repair", "--expires", "2d"])
+        assert "Running the command again adds nothing." in capsys.readouterr().out
+    [edit, outage] = ml.pending(p.state)
+    for t in (now + 30, now + 600):   # its end computed anew each time: still the same request
+        assert ml.edit_change(c["id"], p.name, expires="6h", now=t, queue=p.state)["queued"] == edit["queued"]
+        assert ml.set_outage("box1", "fan repair", p.name, "2d", now=t, queue=p.state)["queued"] == outage["queued"]
+    assert ml.set_outage("box1", "psu swap", p.name, "2d", queue=p.state)["queued"] != outage["queued"]
+    (p.state / ml.REQUESTS / f"{ml.pending(p.state)[-1]['queued']}.json").unlink()
+    assert len(ml.pending(p.state)) == 2
+    monkeypatch.setattr(ml, "_locked", real)
+    ml.apply_requests(p.state, log=lambda m: None)
+    [edited] = ml.changes()
+    assert len(edited["edits"]) == 1 and ml.outages()["box1"]["why"] == "fan repair"
+    # Applied, the same edit later is a new extension, as it is on the direct path.
+    monkeypatch.setattr(ml, "_locked", read_only)
+    assert ml.edit_change(c["id"], p.name, expires="6h", now=now + 3600, queue=p.state)["queued"] != edit["queued"]
+    (p.state / ml.REQUESTS / f"{ml.pending(p.state)[0]['queued']}.json").unlink()
+    # A clear right after a queued set finds it and withdraws it; run again, it queues nothing more.
+    cli.main(["machines", "outage", "box2", "disk swap", "--expires", "1d"])
+    capsys.readouterr()
+    [queued_set] = ml.pending(p.state)
+    for _ in range(2):
+        cli.main(["machines", "outage", "box2", "--clear"])
+        out = capsys.readouterr().out
+        assert out.startswith(f"queued clearing of {p.name}'s known outage on box2"), out
+        if _ == 0:
+            assert f"withdrawing its queued outage request {queued_set['queued']}" in out
+    [clear] = ml.pending(p.state)
+    assert clear["op"] == "outage_clear" and clear["fields"]["alias"] == "box2"
+    monkeypatch.setattr(ml, "_locked", real)
+    ml.apply_requests(p.state, log=lambda m: None)
+    assert "box2" not in ml.outages() and ml.pending(p.state) == []
+    # A clear queued before a newer outage was set directly leaves the newer one; an older one still ends.
+    ml.set_outage("box1", "bmc fault", "other", "2d", now=now)
+    monkeypatch.setattr(ml, "_locked", read_only)
+    assert ml.clear_outage("box1", None, now=now + 60, queue=p.state)["queued"]
+    monkeypatch.setattr(ml, "_locked", real)
+    ml.set_outage("box1", "new fault", p.name, "2d", now=now + 120)
+    logged = []
+    ml.apply_requests(p.state, log=logged.append)
+    assert list(ml.outage_entries(now + 130)["box1"]) == [p.name]
+    assert ml.outages(now + 130)["box1"]["why"] == "new fault"
+    assert f"left {p.name}'s in place" in logged[0], logged
+    assert not list((p.state / ml.REQUESTS).glob("*.failed.json"))
 
 
 def test_archive_never_retires_worker_memory_cut_from_worker_prompts(env):
