@@ -18,7 +18,29 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import checkdirs, batch, conflictfix, coordinator as coord, cyclenotice, envfault, locks, msgparts, overlap, pagesev, prhead, push, pushclaim, replymsg, reviewcap, runner, scopehold, sharedchecks, timefmt, upstream, urgent
+from . import (   # one name per line: two changes adding names merge without a conflict
+    checkdirs,
+    batch,
+    conflictfix,
+    coordinator as coord,
+    cyclenotice,
+    envfault,
+    locks,
+    msgparts,
+    overlap,
+    pagesev,
+    prhead,
+    push,
+    pushclaim,
+    replymsg,
+    reviewcap,
+    runner,
+    scopehold,
+    sharedchecks,
+    timefmt,
+    upstream,
+    urgent,
+)
 from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
                  pin_of, review_subject, reviewed_ids)
 from . import gitmemo

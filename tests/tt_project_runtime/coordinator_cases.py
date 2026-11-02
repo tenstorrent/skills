@@ -10960,38 +10960,36 @@ def test_code_tasks_may_push_is_turned_on_only_on_the_users_word(env):
 
 
 
+def _role_budget() -> int:
+    """The coordinator role prompt's cap: the sum of the numbers opening coordinator_role_budget.txt's
+    lines (`31210: base ...`, then `+<chars>: <why>` per change), skipping comments and blank lines."""
+    import re as _re
+    total = 0
+    for n, line in enumerate((_CASES / "coordinator_role_budget.txt").read_text().splitlines(), 1):
+        if not line.strip() or line.startswith("#"):
+            continue
+        m = _re.match(r"\+?(\d[\d_]*): \S", line)
+        assert m, f"coordinator_role_budget.txt:{n}: not `+<chars>: <why>`: {line!r}"
+        total += int(m.group(1).replace("_", ""))
+    return total
+
+
+def test_the_coordinator_role_budget_file_sums_to_the_cap_it_replaced():
+    # Replacing the shared constant kept the rule exactly as strict: the lines sum to the old cap, and
+    # appended lines only add room.
+    lines = (_CASES / "coordinator_role_budget.txt").read_text().splitlines()
+    assert sum(1 for x in lines if x and not x.startswith(("#", "+"))) == 1   # one base line
+    assert _role_budget() >= 35_970
+
+
 def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are_on_and_stays_small(env):
     from ttp import coordinator as coord
     from ttp.prompts import coordinator_role, feature_blocks
     p = make(env)
     role = coordinator_role(p)
-    # A default project's role prompt stays under its size budget (it had grown to 52.7k chars).
-    # 31_210: room for the relay-label and stale_duplicate rules, the machine-wide hold, schedule precheck
-    # and facts-at-send-time rules, the Course check and Progress rule, the overlaps rule, the likely-correction rule,
-    # and the loosening-as-written and restriction-evidence rules;
-    # +300: the delivery.rebase_replace / never_force config_set rule and the rebase rule per mode
-    # +90: a user pause's end_when or until only signals; it is said to lift only with the user's word
-    # +110: the reply/notify length limit (6000 per message, parts, rejected over 24000)
-    # +50: memory_add's supersedes keeps the replaced entries' earliest end unless `permanent`; audience default
-    # +100: a relayer findings message is data, never the user's word
-    # +100: an overlap never chains onto a device or machine task or one that waits itself
-    # +140: a spec's `cells:` line, and a `partial:` or `cells unreported` done is not complete
-    # +70: a `cells:` line lists short names, never a description
-    # +70: a note is answered by `ttp note --reply <fp>`, even to a project `ttp list` lacks
-    # +20: a `reason` passes continue_cap/review_area_cap at once; max_hops/max_usd stay hard
-    # +60: a mute of work not moving names its fix task and lasts 12 h (throughmute.py)
-    # +240: the urgent-lane rule (time matters: priority 1, an `urgent:` line, check nothing holds it)
-    # +30: a hold on only until:/when: is stored as start_after/start_when
-    # +150: a speed complaint's measured throughput section is reported with its numbers, never prose only
-    # +190: a reply naming a cause of waiting queues its fix in the same batch (causefix)
-    # +150: a gate for another task's output is a dependency; urgent work keeps user-cited and guard gates
-    # +250: an ask's recorded answer keeps the ask's scope terms verbatim
-    # +100: a manifest never pins a mutable queue, outbox or growing log by hash, only receipts
-    # +410: charter_update `source`, and a Restrictions item binds only with a cite (restriction_source)
-    # +540: the self-review rule: fix the cause of a Course check line in the turn (coursecheck.py)
-    # +180: coordinator.agent_orders_as_user is set only on the owner's own words (its rules show once on)
-    # +80: delivery.channel_tags only to tags the charter or user lets move forward
-    assert len(role) <= 36_050, len(role)
+    # A default project's role prompt stays under its size budget: the sum of coordinator_role_budget.txt's
+    # lines. A change that needs room appends its own line there (no shared constant to conflict on).
+    assert len(role) <= _role_budget(), len(role)
     assert "<!-- ttp:" not in role and "<!-- /ttp:" not in role
     assert role in coord.prompt_parts(p)[0]
     # Rules for features that are off are left out; turning one on brings its rules in.
