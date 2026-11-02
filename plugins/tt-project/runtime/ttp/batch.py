@@ -2003,9 +2003,11 @@ class Batch:
         rest is requeued "yielded", and the queue runs the urgent ones alone next (pushq.due), so they
         never wait out the rest of a bisect. The requeued ones are searched anew on the new tip: no entry
         is blamed on a tip it was not checked on, and the urgent ones are never in that search."""
-        if not self.yielded_to:
+        if not self.yielded_to and self._may_yield():
             try:
-                self.yielded_to = urgent.approvals_waiting(self.p.db, self.target)
+                skip = self.m.get("yield_skip") if isinstance(self.m.get("yield_skip"), dict) else {}
+                skip = set(skip.get("ids") or []) if self.tip and skip.get("tip") == self.tip else set()
+                self.yielded_to = [i for i in urgent.approvals_waiting(self.p.db, self.target) if i not in skip]
             except Exception as e:      # a queue it cannot read: the search goes on as before
                 say(f"cannot read the push queue for urgent approvals: {type(e).__name__}: {e}")
             if self.yielded_to:
@@ -2013,6 +2015,19 @@ class Batch:
                 say(f"urgent approval{'s' if n > 1 else ''} {', '.join(map(str, self.yielded_to))} "
                     f"wait{'s' if n == 1 else ''}: the search stops here and {'they go' if n > 1 else 'it goes'} next")
         return bool(self.yielded_to)
+
+    def _may_yield(self) -> bool:
+        """Whether this batch may stop its search for an urgent approval at all: never when every entry
+        is urgent itself (the ones waiting would only take its place), nor when it carries entries a
+        batch before it requeued for one (the marker's "after_yield"), so no two batches in a row stop
+        for the same set and the queue cannot loop on yields."""
+        if self.m.get("after_yield"):
+            return False
+        try:
+            return not all(urgent.covers_urgent(self.p.db, self.p.db.task(e.get("task"))) for e in self.entries)
+        except Exception as e:          # a queue it cannot read: no yield, the search goes on as before
+            say(f"cannot read the batch's tasks: {type(e).__name__}: {e}")
+            return False
 
     def _tip_red(self, tip: str, known: dict) -> tuple[int, None, None]:
         """tip_failed for a tip known to fail on its own, without checking it alone again."""

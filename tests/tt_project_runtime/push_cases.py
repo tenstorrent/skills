@@ -2041,6 +2041,51 @@ def test_the_entries_an_urgent_approval_stopped_a_search_for_are_searched_again_
     assert batch.EXIT["yielded"] == 0
 
 
+@pytest.mark.parametrize("why", ["after_yield", "yield_skip", "all_urgent", "skip_other_tip"])
+def test_a_batch_never_stops_its_search_for_an_urgent_approval_the_next_batch_would_not_take(env, monkeypatch, why):
+    """No yield loop: a batch stops its search only for an urgent approval the queue takes next, alone.
+    It finishes its search (entry 6 blamed) when it carries entries a batch before it requeued for an
+    urgent one ("after_yield"), when the waiting one was already tried on the failing tip it searches on
+    (pushq.due leaves those out while the tip is unchanged: "yield_skip"), or when every entry is urgent
+    itself. A "yield_skip" for another tip does not apply: the search stops as before."""
+    from ttp import push
+    from ttp.project import write_json
+    p, repo, origin, heads = _bad_sixth(env, monkeypatch)
+    _approved_mid_search(p, monkeypatch, 2, 1)
+    marker = _batch_marker(p, heads)
+    m = push._read(marker)
+    tip = _git_out(origin, "rev-parse", "proj")
+    if why == "after_yield":
+        m["after_yield"] = True
+    elif why in ("yield_skip", "skip_other_tip"):
+        m["yield_skip"] = {"tip": tip if why == "yield_skip" else "f" * 40, "ids": [99]}
+    else:
+        for e in m["entries"]:
+            e["task"] = p.db.add_task(f"fix {e['id']}", "s", kind="code", origin="coordinator", priority=1)
+    write_json(marker, m)
+    rc, m = _run_batch(p, marker, monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    if why == "skip_other_tip":
+        assert _statuses(m) == ["pushed"] * 4 + ["requeued"] * 4 and m["yielded_to"] == [99], m
+    else:
+        assert _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"] and not m.get("yielded_to"), m
+
+
+def test_a_batch_marker_records_what_its_search_must_not_yield_to(env, monkeypatch):
+    """pushq.start writes "after_yield" for rows a stopped search requeued, and the failing tip's tried
+    approvals as "yield_skip", so the batch's yield condition matches what due takes next."""
+    from ttp import push, pushq
+    s = _pq(env, monkeypatch, push_batch_s=10 ** 6, push_batch_max=5)
+    _pq_earlier(s)
+    row = _pq_review(s)[1]
+    s.p.db.x("UPDATE push_queue SET detail=? WHERE id=?", (json.dumps({"yielded": True}), row))
+    s.p.db.set_kv(pushq.KV, {"bad_tip": {"tip": "a" * 40, "fails": 1, "tried": [7]}})
+    rows = s.p.db.q("SELECT * FROM push_queue WHERE id=?", (row,))
+    bid = pushq.start(s.p, rows, "origin/proj")
+    m = push._read(s.p.state / push.DETACHED / f"{bid}.json")
+    assert m["after_yield"] is True and m["yield_skip"] == {"tip": "a" * 40, "ids": [7]}, m
+
+
 def test_after_a_batch_stopped_its_search_the_urgent_approval_goes_alone_then_the_requeued_ones(env, monkeypatch):
     from ttp import pushq
     s = _pq(env, monkeypatch, push_batch_s=10 ** 6, push_batch_max=5)

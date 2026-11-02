@@ -1104,6 +1104,12 @@ def start(p: Project, rows: list[dict], name: str, now: float | None = None) -> 
                           "ref": f"{REF_PREFIX}{r['id']}"} for r in rows]}
         if bad := _known_bad(db, rows):
             m["bad_tip"] = bad
+        if (st_bad := _state(db).get("bad_tip") or {}).get("tip") and st_bad.get("tried"):
+            # due leaves these out of its urgent-first pick while the tip is this one: the batch never
+            # stops its search for them (batch.Batch._yield_now), or the next batch would stop again
+            m["yield_skip"] = {"tip": st_bad["tip"], "ids": list(st_bad["tried"])}
+        if any(_detail(r).get("yielded") for r in rows):
+            m["after_yield"] = True     # requeued by a batch that stopped for an urgent one: never again
         m["check_run_dir"] = str(checkdirs.new(p.state, marker, push.scratch_need(p, p.root)))
         m["check_report_dir"] = str(checkdirs.reports(Path(m["check_run_dir"])))
         write_json(marker, m)
