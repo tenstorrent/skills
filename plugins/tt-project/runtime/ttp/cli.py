@@ -2401,7 +2401,8 @@ def _recorded_pass(p: Project | None, tree: str, cmds: list, purpose: str = "can
     and passed (the daemon's pre-started checks run the project's checks alone; a worker ran them with
     its own after `--`). A pass for the other purpose never counts (a record without one is candidate).
     With `envs` (pushpass.check_envs of the commands), only a pass recorded under the same
-    environment for each of them counts; one recorded without it never does."""
+    environment for each of them counts; one recorded without it never does. A suite pass of one
+    command (_suite_pass) is no pass of a call and never counts here."""
     if not p or not tree:
         return None
     try:
@@ -2410,9 +2411,30 @@ def _recorded_pass(p: Project | None, tree: str, cmds: list, purpose: str = "can
         return None
     key = _commands_hash(cmds)
     for e in reversed(passes if isinstance(passes, list) else []):
-        if isinstance(e, dict) and e.get("tree") == tree and e.get("purpose", "candidate") == purpose and (
+        if isinstance(e, dict) and not e.get("suite") and e.get("tree") == tree \
+                and e.get("purpose", "candidate") == purpose and (
                 e.get("commands") == key or key in (e.get("prefixes") or ())) and (
                 envs is None or (isinstance(e.get("envs"), list) and e["envs"][:len(envs)] == list(envs))):
+            return e
+    return None
+
+
+def _suite_pass(p: Project | None, tree: str, cmd, purpose: str, env: str | None) -> dict | None:
+    """The suite pass of the one command `cmd` on `tree` for `purpose` under its environment `env`
+    (pushpass.check_envs), or None: recorded the moment it passed in a call cut off later (in the rerun
+    of the added tests, or at a later command), so the next call runs it no more. Only cmd_checks reads
+    it, per command; it is never a pass of a call (_recorded_pass). A suite pass without an
+    environment never counts."""
+    if not p or not tree or not env:
+        return None
+    try:
+        passes = json.loads((p.state / CHECK_PASSES).read_text()).get("passes")
+    except (OSError, ValueError, AttributeError):
+        return None
+    key = _commands_hash([cmd])
+    for e in reversed(passes if isinstance(passes, list) else []):
+        if isinstance(e, dict) and e.get("suite") and e.get("tree") == tree and e.get("commands") == key \
+                and e.get("purpose", "candidate") == purpose and e.get("envs") == [env]:
             return e
     return None
 
@@ -2430,7 +2452,8 @@ def _env_miss(p: Project | None, tree: str, cmds: list, parts: list[dict], purpo
     from . import pushpass
     key, new = _commands_hash(cmds), [pushpass.part_digests(x) for x in parts]
     for e in reversed(passes if isinstance(passes, list) else []):
-        if isinstance(e, dict) and e.get("tree") == tree and e.get("purpose", "candidate") == purpose and (
+        if isinstance(e, dict) and not e.get("suite") and e.get("tree") == tree \
+                and e.get("purpose", "candidate") == purpose and (
                 e.get("commands") == key or key in (e.get("prefixes") or ())) and isinstance(e.get("env_parts"), list):
             why = sorted({part for old, now in zip(e["env_parts"], new)
                           for part in pushpass.differs(old, now).split(", ") if part})
@@ -2473,10 +2496,10 @@ def _check_envs(top: str | Path, cmds: list, run_env: dict) -> tuple[list[str] |
 
 
 def _record_pass(p: Project | None, tree: str, cmds: list, purpose: str = "candidate", run_dir: str | Path = "",
-                 envs: list[str] | None = None, parts: list[dict] | None = None) -> None:
+                 envs: list[str] | None = None, parts: list[dict] | None = None, suite: bool = False) -> None:
     """Only passes are recorded, with `envs` (pushpass.check_envs) when given, and the part_digests of
     their `parts` (pushpass.check_env_parts) to say what differs on a miss. A failed write is said
-    and never fails the checks."""
+    and never fails the checks. `suite`: one command's own pass in a call not yet passed (_suite_pass)."""
     if not p or not tree:
         return
     import fcntl
@@ -2491,6 +2514,11 @@ def _record_pass(p: Project | None, tree: str, cmds: list, purpose: str = "candi
             except (OSError, ValueError, AttributeError):
                 passes = None
             passes = [e for e in passes if isinstance(e, dict)] if isinstance(passes, list) else []
+            if not suite:   # the suite passes of these commands on this tree are kept in this pass now
+                mine = {_commands_hash([c]) for c in cmds}
+                passes = [e for e in passes if not (e.get("suite") and e.get("tree") == tree
+                                                    and e.get("purpose", "candidate") == purpose
+                                                    and e.get("commands") in mine)]
             passes.append({"tree": tree, "commands": _commands_hash(cmds),
                            "prefixes": [_commands_hash(cmds[:n]) for n in range(1, len(cmds))],
                            "run": os.environ.get("TTP_RUN_ID") or "?", "ts": time.time(),
@@ -2498,7 +2526,8 @@ def _record_pass(p: Project | None, tree: str, cmds: list, purpose: str = "candi
                            **({"envs": list(envs)} if envs is not None and len(envs) == len(cmds) else {}),
                            **({"env_parts": [pushpass.part_digests(x) for x in parts]}
                               if parts is not None and len(parts) == len(cmds) else {}),
-                           **({"purpose": purpose} if purpose != "candidate" else {})})
+                           **({"purpose": purpose} if purpose != "candidate" else {}),
+                           **({"suite": True} if suite else {})})
             write_json(path, {"passes": passes[-CHECK_PASSES_MAX:]})
     except OSError as e:
         print(f"ttp checks: could not record the pass in {path}: {e}", file=sys.stderr)
@@ -2637,7 +2666,10 @@ def cmd_checks(a) -> None:
     Once they passed, the tests the head adds compared with the push target (addedtests) run again,
     ROUNDS times each, through the first check that is one plain local pytest run: one that fails a
     round fails the checks, named with its pass count; past a cap the rerun is reported skipped,
-    never passed. With no added tests nothing more runs.
+    never passed. With no added tests nothing more runs. Each check's own pass is recorded the moment it
+    passes, as a suite pass (_suite_pass): a call cut off later (in that rerun, at a later check) is no
+    pass, but the next call on the same tree runs no check again that passed there under the same
+    environment, only the rest and the rerun. The call's pass is recorded only once all of it passed.
 
     `--detach` runs them in a session of their own that writes checks.rc in the run's directory
     however it ends, and prints a `--result` probe for `retry_when` that also answers once they were
@@ -2814,6 +2846,7 @@ def cmd_checks(a) -> None:
     clean_note = ""   # why a check found no clean checkout, or what only this worktree has
     fast_skipped, fast_cmds = [], []
     executed, selected, rerun = [], [], None
+    run_envs, run_parts, reused = None, None, []   # each check's environment; those a suite pass spared (_suite_pass)
     timed_out, deadline, ran_since = None, None, 0.0   # the wall-time cap (checkwall) and its outcome
     ran_cpu = 0.0   # the CPU its children had used when its commands started (checkcap.record_cost)
     spilled = None   # the spill host's claim when the checks run there (checkspill)
@@ -3051,8 +3084,21 @@ def cmd_checks(a) -> None:
                                     if last.get("silent_s") else "at the wall-time cap") + ": a timeout, not a pass")
                     print(f"ttp checks: {said_last}", flush=True)
                     out.write(f"ttp checks: {said_last}\n")
+            # Each check's pass is recorded as it passes (a suite pass): a call cut off later, in the rerun
+            # of the added tests or at a later check, leaves it, and the next call runs it no more.
+            if todo and passed and not (hit or handover):
+                run_envs, run_parts = _check_envs(top, todo, run_env)
             for c in [] if hit or handover or not passed else todo:
                 executed.append(c)
+                n = len(executed) - 1
+                if not a.fresh and (prior := _suite_pass(p, tree, c, purpose, run_envs[n] if run_envs else None)):
+                    reused.append(c)
+                    line = (f"{c} passed on {tree[:12]} in run {prior.get('run') or '?'} at "
+                            f"{timefmt.long(float(prior.get('ts') or 0), p)} in a call cut off after it (recorded); "
+                            "not run again, --fresh runs it")
+                    print(f"ttp checks: {line}", flush=True)
+                    out.write(f"ttp checks: {line}\n")
+                    continue
                 cwd = top if _in_place(c) else str(clean.path)
                 note = AUTHORING_NOTE if cleantree.authoring(c) and not push.remote_host(c) else ""
                 # A progress line per check: the commands' own output goes only to checks.log.
@@ -3108,6 +3154,8 @@ def cmd_checks(a) -> None:
                     out.write(_check_took(c, rc, began))
                     break
                 out.write(_check_took(c, rc, began))
+                if run_envs and run_parts:
+                    _record_pass(p, tree, [c], purpose, run_dir, [run_envs[n]], [run_parts[n]], suite=True)
             # The tests the diff adds, once more several times each: a timing-flaky one fails here.
             py_check = next((c for c in executed if not push.remote_host(c) and addedtests.eligible(str(c))), None)
             if passed and py_check is not None and (new_tests := addedtests.added(top, base, head)):
@@ -3159,11 +3207,12 @@ def cmd_checks(a) -> None:
             elif timed_out:
                 checkwall.record_timeout(p.state, os.environ.get("TTP_TASK"), timed_out)
             elif executed:
-                if not spilled:   # its cost on this host, process churn included, prices a check (checkcap.check_load)
-                    checkcap.record_cost(checkcap.child_cpu_s() - ran_cpu, time.time() - ran_since)
-                checkwall.record_run(p.state, time.time() - ran_since, passed,
-                                     _commands_hash(todo) if passed and executed == todo else "",
-                                     "" if spilled else "tmpfs" if shorttmp.on_tmpfs(run_env.get("TMPDIR")) else "disk")
+                if not reused:   # a run that skipped checks is no sample of their cost or wall time
+                    if not spilled:   # its cost on this host, process churn included, prices a check (checkcap.check_load)
+                        checkcap.record_cost(checkcap.child_cpu_s() - ran_cpu, time.time() - ran_since)
+                    checkwall.record_run(p.state, time.time() - ran_since, passed,
+                                         _commands_hash(todo) if passed and executed == todo else "",
+                                         "" if spilled else "tmpfs" if shorttmp.on_tmpfs(run_env.get("TMPDIR")) else "disk")
                 # A completed run no longer reports the task's old wall-time timeout (TIMEOUTS entry).
                 checkwall.clear_timeout(p.state, os.environ.get("TTP_TASK"))
         if slot and not passed:
@@ -3304,7 +3353,8 @@ def cmd_checks(a) -> None:
     # The push queue's passes count with this run's: recorded together, in the order they apply.
     rec = [c for c in selected if c in todo or c in queue_cmds] if queue_cmds else todo
     if rec:
-        _record_pass(p, tree, rec, purpose, run_dir, *_check_envs(top, rec, run_env))
+        _record_pass(p, tree, rec, purpose, run_dir,
+                     *((run_envs, run_parts) if run_envs and rec == todo else _check_envs(top, rec, run_env)))
     # Released only once the pass is recorded: a waiter for the same checks finds it the moment it may run.
     if slot:
         slot.close()

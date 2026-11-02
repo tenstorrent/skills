@@ -97,6 +97,89 @@ def test_ttp_checks_rerun_stopped_at_the_wall_cap_is_a_timeout_not_a_skip(env, t
     assert rec["passed"] is False and rec["timed_out"]["check"] == _ADDED_CHECK
 
 
+def _kill_in_rerun(monkeypatch, p):
+    # `ttp checks` killed in the rerun of the added tests: the rerun raises, and once it did, what the
+    # dead process held goes (its checks slot, its checkjoin record), as when its process ends.
+    from ttp import addedtests, checkjoin, cli
+    slots, real = [], cli._checks_slot
+    monkeypatch.setattr(cli, "_checks_slot", lambda *a, **k: slots.append(real(*a, **k)) or slots[-1])
+
+    def killed(*a, **k):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(addedtests, "run", killed)
+
+    def run(args):
+        with pytest.raises(KeyboardInterrupt):
+            cli.main(args)
+        for slot in slots:
+            if slot is not None:
+                slot.close()
+        checkjoin.forget(p.state)
+    return run
+
+
+def test_ttp_checks_cut_off_in_the_added_tests_rerun_keeps_the_suite_pass_and_reruns_only_them(
+        env, tmp_path, monkeypatch, capsys):
+    # The suite passes, then the call is killed in the rerun: no pass of the call, but the next call on
+    # the same tree runs only the rerun rounds, and only then records the call's pass.
+    from ttp import addedtests, cli
+    run, runs = _added_repo(env, tmp_path, monkeypatch, "\n\ndef test_new():\n    _bump()\n")
+    p = cli.Project(os.environ["TTP_PROJECT"])
+    tree = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], capture_output=True, text=True,
+                          cwd=os.getcwd()).stdout.strip()
+    real = addedtests.run
+    _kill_in_rerun(monkeypatch, p)(["checks", "--", _ADDED_CHECK])
+    assert runs() == 1, "only the suite ran"
+    passes = json.loads((p.state / cli.CHECK_PASSES).read_text())["passes"]
+    assert [e.get("suite") for e in passes] == [True] and passes[0]["tree"] == tree
+    assert cli._recorded_pass(p, tree, [_ADDED_CHECK]) is None, "a cut-off call was recorded as passed"
+    capsys.readouterr()
+    # A rerun that fails keeps no pass of the call either, and keeps the suite pass.
+    monkeypatch.setattr(addedtests, "run",
+                        lambda *a, **k: {"status": "failed", "why": "x", "rc": 1, "tests": [], "rounds": 5})
+    with pytest.raises(SystemExit):
+        cli.main(["checks", "--", _ADDED_CHECK])
+    assert runs() == 1 and "in a call cut off after it (recorded); not run again" in capsys.readouterr().out
+    assert cli._recorded_pass(p, tree, [_ADDED_CHECK]) is None
+    assert json.loads((run / "checks.json").read_text())["passed"] is False
+    monkeypatch.setattr(addedtests, "run", real)
+    cli.main(["checks", "--", _ADDED_CHECK])
+    out = capsys.readouterr().out
+    assert runs() == 6, "the 5 rerun rounds only, never the suite again"
+    assert "not run again" in out and "reran 1 added test(s) 5 times each: all passed" in out
+    assert json.loads((run / "checks.json").read_text())["passed"] is True
+    assert cli._recorded_pass(p, tree, [_ADDED_CHECK]), "the call's pass was not recorded"
+    passes = json.loads((p.state / cli.CHECK_PASSES).read_text())["passes"]
+    assert not any(e.get("suite") for e in passes), "the call's pass keeps the suite pass it covers"
+
+
+def test_ttp_checks_suite_pass_serves_only_the_same_command_environment_and_purpose(env, tmp_path, monkeypatch,
+                                                                                      capsys):
+    from ttp import addedtests, cli
+    run, runs = _added_repo(env, tmp_path, monkeypatch, "\n\ndef test_new():\n    _bump()\n")
+    p = cli.Project(os.environ["TTP_PROJECT"])
+    tree = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], capture_output=True, text=True,
+                          cwd=os.getcwd()).stdout.strip()
+    kill = _kill_in_rerun(monkeypatch, p)
+    kill(["checks", "--", _ADDED_CHECK])
+    entry = json.loads((p.state / cli.CHECK_PASSES).read_text())["passes"][0]
+    env_now = entry["envs"][0]
+    assert cli._suite_pass(p, tree, _ADDED_CHECK, "candidate", env_now)
+    assert not cli._suite_pass(p, tree, _ADDED_CHECK, "candidate", "other-env")
+    assert not cli._suite_pass(p, tree, _ADDED_CHECK, "candidate", None), "a pass without an environment"
+    assert not cli._suite_pass(p, tree, _ADDED_CHECK, "harness", env_now)
+    assert not cli._suite_pass(p, tree, _ADDED_CHECK + " -x", "candidate", env_now)
+    assert not cli._suite_pass(p, "u" * 40, _ADDED_CHECK, "candidate", env_now)
+    assert not cli._env_miss(p, tree, [_ADDED_CHECK], [{}]), "a suite pass named as a call's pass"
+    # Another environment (a pytest option the check reads) and --fresh both run the suite again.
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-q")
+    kill(["checks", "--", _ADDED_CHECK])
+    assert runs() == 2
+    monkeypatch.delenv("PYTEST_ADDOPTS")
+    kill(["checks", "--fresh", "--", _ADDED_CHECK])
+    assert runs() == 3
+
+
 def test_added_tests_rerun_past_its_time_cap_is_skipped_unless_a_round_already_failed(tmp_path):
     from ttp import addedtests
     out, tests = tmp_path / "rows.jsonl", [("tests/test_a.py", "test_a")]
