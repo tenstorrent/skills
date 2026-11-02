@@ -1904,12 +1904,15 @@ Workers can read Slack links you paste, using your Slack connector if you have o
 - Codex and Cursor report tokens but no cost; their spend is estimated from a price table. Set
   your own rates in project.json as `"pricing": {"codex": {"<model>": [input, cached input,
   output]}}` in $ per million tokens (`"default"` covers other models; same for `cursor`).
-- A Claude run cut off before its final report is estimated from its streamed tokens. Codex
-  reports usage per completed turn, so its mid-run budget check sees completed turns only. Cursor
+- A Claude run cut off before its final report is estimated from its streamed tokens. Codex's
+  mid-run budget check prices the running token total from its session rollout (`token_count`
+  events), so it stops a run mid-turn once it passes its budget, and a cut-off Codex run is
+  booked at that token price (a resumed session counts only what this run added). Cursor
   builds that offer `--output-format stream-json` stream their progress: the stall guard sees it,
   and until usage arrives the budget check uses a floor from the text written so far. Older
-  Cursor builds print nothing until the end, so set `stall_s` above their longest run. A run cut
-  off before reporting usage is booked at the elapsed share of its budget (flagged estimated).
+  Cursor builds print nothing until the end, so set `stall_s` above their longest run. A cut-off
+  Cursor run that reported no usage is booked at the elapsed share of its budget (flagged
+  estimated).
   A run that wrote no output and reported no tokens is booked at $0 (except on an older Cursor
   build, which prints nothing until it ends).
 - Codex workers run in Codex's workspace-write sandbox, with the project's state folder, the
