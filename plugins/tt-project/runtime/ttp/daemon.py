@@ -1606,6 +1606,7 @@ class Daemon:
         self._run_step(self.end_effort_ab)
         self._run_step(self.watch_cli_versions)
         self._run_step(self.reap_locks)
+        self._run_step(self.reap_task_records)
         settling = self._run_step(self.settling, default=False)
         core = self.cfg.get("core_provider") or "claude"
         core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
@@ -8420,6 +8421,32 @@ class Daemon:
                 alerts.close_key(db, ep["key"], "the wait ended", now=now,
                                  text="Cleared: " + alerts.CLEARED_TEXT["lock-wait"].format(
                                      arg=ep["key"].partition(":")[2]))
+
+    def reap_task_records(self) -> None:
+        """Every taskreap.SWEEP_EVERY_S, model-free (ttp.taskreap): release the reservations and device-queue
+        jobs kept in the name of a task that ended with no live run; one low alert and event per record."""
+        from . import devq, taskreap
+        now = time.time()
+        if now < getattr(self, "_taskreap_due", 0.0):
+            return
+        self._taskreap_due = now + taskreap.SWEEP_EVERY_S
+        dirs = [self.p.state / "locks"] + [shared.root() / r for r in sorted(shared.names(self.cfg))]
+        runners = ((self.cfg.get("device") or {}).get("runners")) or {}
+
+        def call(runner: str, rc: dict, task: str, why: str) -> tuple:
+            r = boundedchild.run(devq.host_call(runner, rc, "drop", [self.p.name, task, why], False),
+                                 INLINE_CHILD_S, input=devq.source(), grace=1)
+            return (r.rc if r.rc is not None else 1), r.out or ""
+        self._taskreap_state = getattr(self, "_taskreap_state", {})
+        got = taskreap.reservations(self.p, dirs, now) + \
+            taskreap.device_jobs(self.p, runners, call, now, state=self._taskreap_state)
+        for r in got:
+            text = (f"Released the {r['kind']} {r['name']} kept for task #{r['task']}, which is {r['status']} "
+                    f"with no live run.")
+            log(self.p, f"taskreap: {text}")
+            self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                        (now, "daemon", "task_record_released", "low", text[:500], "handled", r["task"]))
+            self.alert(f"task-record:{r['key']}", text, severity="low", every_s=0)
 
     def heal_harness_git(self) -> None:
         """Every harness_git.sweep_every_s, commit the charter and memory files a failed harness commit

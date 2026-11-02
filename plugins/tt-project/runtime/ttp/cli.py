@@ -6445,7 +6445,7 @@ def cmd_devq(a) -> None:
             timeout = ceiling
             print(f"devq submit: no --timeout; the job gets the project's device-job ceiling of {ceiling} s")
         spec = {"id": o.id, "config": o.config or o.id, "cmd": rest[0] if len(rest) == 1 else shlex.join(rest),
-                "task": os.environ.get("TTP_TASK", ""), "workdir": o.workdir, "timeout_s": timeout,
+                "task": os.environ.get("TTP_TASK", ""), "project": p.name, "workdir": o.workdir, "timeout_s": timeout,
                 "inputs": o.input, "cold_start_s": o.cold_start}
         if o.artifact:
             spec["artifact"] = o.artifact
@@ -6481,6 +6481,8 @@ def cmd_devq(a) -> None:
         print(f"ttp devq: the runner's host did not answer within {limit} s", file=sys.stderr)
         sys.exit(75 if a.op == "probe" else 1)
     if a.op == "submit" and r.returncode == 0:
+        from . import taskreap
+        taskreap.record_job(p, a.runner, spec)   # dropped once its task ends (taskreap.sweep)
         remote = bool(devq.settings(rc)["host"])
         print(f"hand off: status waiting, retry_when \"{_own_ttp_word(p)} devq probe {a.runner} {a.id}\", "
               f"wake_tier light{', survives_reboot true' if remote else ''}")

@@ -84,6 +84,7 @@ RUNNER_DEFAULTS = {
 }
 _CHOICES = {"script_lint": ("", "warn", "refuse"), "netfs_policy": ("warn", "refuse")}
 RUNNER_DOWN_RC = 3   # probe: the job is pending and no runner is alive (the daemon restarts it)
+CANCEL = ".cancel"   # running/<job>.cancel: drop asked the runner to stop the job (its text: why)
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 NAME_RE = ID_RE
 STATUSES = ("done", "failed", "skipped", "wedged")
@@ -1179,6 +1180,42 @@ def start(d: Path, cfg: dict) -> int:
     return 1
 
 
+def _owned(spec: dict, project: str, task: str) -> bool:
+    """Whether a job spec is this project's task's: both must match (a job queued before submit recorded
+    its project names none, and is never dropped, since another project may share the runner)."""
+    return bool(task) and str(spec.get("task") or "") == task and bool(project) and spec.get("project") == project
+
+
+def drop(d: Path, project: str, task: str, why: str) -> int:
+    """Drop every job of `project`'s task `task` (the project's daemon calls this once the task ended:
+    taskreap): a queued one ends `cancelled` before it starts, a running one gets a CANCEL marker that
+    its runner honours within poll_s (it stops the job's group and ends it `cancelled`). Prints the jobs
+    as JSON: [{"id", "was": "queued" | "running"}]."""
+    _dirs(d)
+    out = []
+    for q in sorted((d / "queue").glob("*.json")):
+        spec = _load(q)
+        if not _owned(spec, project, task):
+            continue
+        job = q.stem.split("-", 1)[1]
+        try:
+            q.replace(d / "done" / f"{job}.spec.json")
+        except FileNotFoundError:
+            continue   # the runner took it meanwhile: it is among the running ones below
+        marker = {"id": job, "status": "cancelled", "rc": None, "log": "", "reason": f"dropped before it started: {why}",
+                  "task": task, "config": spec.get("config", job), "attempts": 0, "drops": [], "started": None,
+                  "finished": _now(), "finished_utc": _utc(), "build": spec.get("build")}
+        _write(d / "done" / f"{job}.json", json.dumps(marker, indent=1))
+        _append(d / "runner.log", f"{_utc()} {job}: cancelled before it started: {why}\n")
+        out.append({"id": job, "was": "queued"})
+    for job in _running(d):
+        if _owned(_load(d / "running" / f"{job}.json"), project, task):
+            _write(d / "running" / f"{job}{CANCEL}", why)
+            out.append({"id": job, "was": "running"})
+    print(json.dumps(out))
+    return 0
+
+
 def clear(d: Path, config: str) -> int:
     f = d / "configs" / config
     if f.exists():
@@ -1323,7 +1360,8 @@ class Runner:
             marker["build_changed"] = changed
         _write(self.d / "done" / f"{job}.json.t", json.dumps(marker, indent=1))
         (self.d / "running" / f"{job}.json").replace(self.d / "done" / f"{job}.spec.json")
-        for leftover in [self.d / "running" / f"{job}.state.json", *(self.d / "running").glob(f"{job}.*.rc"),
+        for leftover in [self.d / "running" / f"{job}.state.json", self.d / "running" / f"{job}{CANCEL}",
+                         *(self.d / "running").glob(f"{job}.*.rc"),
                          *(self.d / "running").glob(f"{job}.*.lock")]:
             _rm(leftover)
         (self.d / "done" / f"{job}.json.t").replace(self.d / "done" / f"{job}.json")
@@ -1386,8 +1424,8 @@ class Runner:
 
     def wait(self, job: str, spec: dict, st: dict) -> tuple:
         """(rc, how) of the current attempt: how is "" (it ended), "timeout", "wedged" (its output matched
-        a wedge pattern, recorded in cur["wedge"]; it was stopped) or "interrupted" (it is gone without an
-        exit code: killed, or the host restarted)."""
+        a wedge pattern, recorded in cur["wedge"]; it was stopped), "cancelled" (drop asked for it; it was
+        stopped) or "interrupted" (it is gone without an exit code: killed, or the host restarted)."""
         cur = st["cur"]
         rcf, lockf = Path(cur["rc"]), Path(cur["lock"])
         limit = self.limit(spec)
@@ -1403,6 +1441,13 @@ class Runner:
                 child.poll()      # reap it (its keeper releases the lock once it ends)
             if self._keeper is not None:
                 self._keeper.poll()
+            if self.cancelled(job) is not None and not rcf.exists():
+                pid = cur.get("pid") or _lock_pid(lockf)
+                if pid and not _free(lockf):
+                    _kill_group(pid)
+                if child is not None:
+                    child.poll()
+                return None, "cancelled"
             if rcf.exists():
                 try:
                     return int(rcf.read_text().strip()), ""
@@ -1428,6 +1473,13 @@ class Runner:
                     _kill_group(pid)
                 return 124, "timeout"
             time.sleep(self.cfg["poll_s"])
+
+    def cancelled(self, job: str) -> str | None:
+        """The reason of a drop asked for this job (drop), else None."""
+        try:
+            return (self.d / "running" / f"{job}{CANCEL}").read_text().strip() or "its task ended"
+        except OSError:
+            return None
 
     def drops_in_a_row(self, config: str) -> list:
         f = self.d / "configs" / config
@@ -1457,6 +1509,10 @@ class Runner:
                 self.save(job, st)
         while True:
             if not st.get("cur"):
+                why = self.cancelled(job)
+                if why is not None:
+                    self.finish(job, st, "cancelled", None, f"dropped before it started: {why}")
+                    return
                 too_long = over_cap(spec, self.cfg)
                 if too_long:
                     self.finish(job, st, "failed", None, f"not started: {too_long}")
@@ -1486,6 +1542,9 @@ class Runner:
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     self._keeper.wait(timeout=10)
                 self._keeper = None
+            if how == "cancelled":
+                self.finish(job, st, "cancelled", None, f"stopped: {self.cancelled(job) or 'its task ended'}")
+                return
             evidence = ""
             if how == "interrupted":
                 evidence = "the job is gone without an exit code (killed, or the host restarted)"
@@ -1529,7 +1588,10 @@ class Runner:
         for q in sorted((self.d / "queue").glob("*.json"), key=lambda f: (not _urgent_job(f), f.name)):
             job = q.stem.split("-", 1)[1]
             with self.steady():
-                q.replace(self.d / "running" / f"{job}.json")
+                try:
+                    q.replace(self.d / "running" / f"{job}.json")
+                except FileNotFoundError:
+                    continue   # dropped meanwhile (drop)
                 self.log(f"{job}: dequeued")
             return job
         return ""
@@ -1627,7 +1689,7 @@ def _kill_group(pid: int) -> None:
 
 
 def main(argv: list) -> int:
-    """python3 devq.py <run|start|submit|probe|status|clear> <dir> [args]: the host side of `ttp devq`."""
+    """python3 devq.py <run|start|submit|probe|status|clear|drop> <dir> [args]: the host side of `ttp devq`."""
     if len(argv) < 2:
         print(main.__doc__, file=sys.stderr)
         return 2
@@ -1645,6 +1707,8 @@ def main(argv: list) -> int:
         return status(d, rest[0] if rest else "")
     if op == "clear":
         return clear(d, rest[0])
+    if op == "drop":
+        return drop(d, rest[0], rest[1], rest[2] if len(rest) > 2 else "its task ended")
     print(f"devq: unknown op {op}", file=sys.stderr)
     return 2
 
