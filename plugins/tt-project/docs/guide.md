@@ -758,7 +758,11 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    `"route_timeout_s"` next to a routed tier's `model` sets the time limit of its routed runs in
    place of the tier's `budget.run_timeout_s`; a start on the core provider keeps the tier default.
    Routed spend uses the `pricing.chat` row for the model (or its `default` row:
-   `[$/M input, cached input, output]`); with no row it is zero and labelled unpriced. `ttp status`
+   `[$/M input, cached input, output]`); with no row it is zero and labelled unpriced. Without a row
+   a chat run keeps Claude Code's `--max-budget-usd`, priced at its fallback rate for a model it does
+   not know, which can cut a run that has finished its work: `ttp doctor` and one low observation a
+   day say so. A row (zeros for a free endpoint) or `providers.chat.billing` `plan` drops that cap;
+   the run's time limit and stall guard still bound it. `ttp status`
    and the web budget line show the last 24 h as one phrase (`routed 24h: 6 runs to chat, 2 fell
    back (down 1, rate_limit 1)`), and `ttp stats --runs --tier light` lists each run's provider,
    model, outcome (with any fallback reason), wall time and cost.

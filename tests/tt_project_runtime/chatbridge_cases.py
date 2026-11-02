@@ -640,6 +640,82 @@ def test_chat_spend_is_repriced_from_pricing_chat_and_estimated_without_it(tmp_p
     assert plain.caps_budget and "--max-budget-usd" in plain.build(**kw)[0]
 
 
+def test_chat_declared_plan_or_a_zero_price_row_drops_the_fallback_rate_cap(tmp_path):
+    from ttp.providers import get_provider
+    out = _cb_stream(tmp_path / "output.jsonl")
+    kw = dict(role="worker", model="up-model", effort="high", cwd=str(tmp_path), budget_usd=3.0, read_only=False,
+              schema=None, restrictions={})
+    # A. billing plan, no price row: no --max-budget-usd, and the runner has no repriced figure to cap on.
+    plan = get_provider("chat").use("up-model", None, "plan")
+    assert not plan.caps_budget and "--max-budget-usd" not in plan.build(**kw)[0]
+    assert plan.cost_so_far(_cb_stream(tmp_path / "partial.jsonl", result=False)) is None
+    # B. a zero row (a free endpoint): no cap, $0 priced from tokens, not estimated.
+    for prices in ({"up-model": [0, 0, 0]}, {"default": [0.0, 0.0, 0.0]}):
+        for billing in ("auto", "usage", "plan"):
+            free = get_provider("chat").use("up-model", prices, billing)
+            assert not free.caps_budget and "--max-budget-usd" not in free.build(**kw)[0], (prices, billing)
+            u = free.parse(out)
+            assert u.cost_usd == 0 and not u.estimated and u.extra["cost_basis"] == "pricing", (prices, billing)
+    # C. no usable row under auto or usage (or an unknown kind, read as auto): Claude Code's cap stays.
+    for billing in ("auto", "usage", ""):
+        for prices in (None, {}, {"up-model": [1, 2]}, {"other": [1, 1, 1]}):
+            kept = get_provider("chat").use("up-model", prices, billing)
+            argv = kept.build(**kw)[0]
+            assert kept.caps_budget and argv[argv.index("--max-budget-usd") + 1] == "3.00", (billing, prices)
+    # D. Claude's own argv does not depend on the declared billing.
+    claude = [get_provider("claude").use("opus", None, b).build(**{**kw, "model": "opus"})[0]
+              for b in ("auto", "plan", "usage")]
+    assert claude[0] == claude[1] == claude[2] and "--max-budget-usd" in claude[0]
+    assert get_provider("claude").use("opus", None, "plan").caps_budget
+
+
+def test_chat_fallback_cap_is_one_low_observation_a_day_and_a_doctor_line(env, monkeypatch):
+    from ttp import daemon as dmod
+    from ttp.daemon import Daemon
+    from ttp.providers.chat import fallback_cap_line
+    p = make(env)
+    _chat_config(p)
+    seen, clock = [], [time.time()]
+    monkeypatch.setattr(dmod.time, "time", lambda: clock[0])
+
+    class Proc:   # never a real runner
+        pid = 4242
+    real = subprocess.Popen
+    monkeypatch.setattr(dmod.subprocess, "Popen",
+                        lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
+
+    def daemon():
+        d = Daemon(p.base)
+        monkeypatch.setattr(d, "observe", lambda source, text, hint=None, **k: seen.append((source, hint, k.get("key"))))
+        return d
+
+    def start(d):
+        tid = p.db.add_task("build it", "s", kind="code", tier="standard", origin="user", provider="chat")
+        cwd, _ = d._workdir_for(p.db.task(tid))
+        rid = d.start_run("worker", "go", "chat", "standard", cwd, task=p.db.task(tid), budget_usd=4.0)
+        return json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
+
+    d = daemon()
+    assert "--max-budget-usd" in start(d) and "--max-budget-usd" in start(d)
+    assert seen == [("daemon:chat-fallback-cap", "low", "chat-fallback-cap")], "once a day, not per run"
+    start(daemon())   # a daemon restart does not repeat it the same day
+    assert len(seen) == 1
+    clock[0] += 86400 + 1
+    start(d)
+    assert len(seen) == 2
+    line = fallback_cap_line(p.config())
+    assert "fallback rate" in line and "pricing.chat" in line and "billing" in line
+    # Declared plan, or a price row (zeros: a free endpoint): no cap, no observation, no doctor line.
+    for key, value in (("providers.chat.billing", "plan"), ("pricing", {"chat": {"default": [0, 0, 0]}})):
+        if key == "pricing":
+            p.set_config("providers.chat.billing", "auto")
+        p.set_config(key, value)
+        clock[0] += 86400 + 1
+        assert "--max-budget-usd" not in start(daemon()), key
+        assert len(seen) == 2 and fallback_cap_line(p.config()) == "", key
+    assert fallback_cap_line({"providers": {"claude": {}}}) == ""   # no chat provider: no line
+
+
 def test_claude_codex_and_cursor_spend_is_unchanged_by_pricing_chat(tmp_path):
     from ttp.providers import get_provider
     out = _cb_stream(tmp_path / "output.jsonl")

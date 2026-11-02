@@ -478,6 +478,8 @@ PRE_GRANT_REUSE_S = 30                # dispatch reuses a pre-grant check's answ
 PRE_GRANT_TICK_S = 5                  # a tick starts no new pre-grant check once its checks took this long
 PRE_GRANT_RERAISE_S = 6 * 3600        # a broken pre-grant check is raised again at most this often
 STALE_HOLDS_KEY = "holds_stale"   # kv: run -> its hold alerted as kept for a closed task (Daemon.alert_stale_holds)
+CHAT_FALLBACK_CAP_KEY = "chat_fallback_cap_seen"   # kv: when Daemon._chat_fallback_cap last observed (one a day)
+CHAT_FALLBACK_CAP_EVERY_S = 86400
 PLUGINS_DROPPED_KEY = "plugin_dirs_dropped"   # kv: provider -> [dirs, isolated] alerted as not loaded (Daemon._alert_plugins_dropped)
 WORKSPACE_RETRY_NOTE = "workspace retry"   # a queued task's note while its workspace is retried
 SLEPT_MIN_S = 60        # a run whose wall clock ran this much ahead of its monotonic clock overlapped a host sleep
@@ -2424,6 +2426,24 @@ class Daemon:
             return None
         return plan["deny"]
 
+    def _chat_fallback_cap(self, model: str) -> None:
+        """One keyed low observation a day per project: a chat run starts under Claude Code's own
+        --max-budget-usd, priced at its fallback rate for a model it does not know (no pricing.chat
+        row, billing auto or usage). That guess has cut runs that had finished their work."""
+        now = time.time()
+        try:
+            if now - float(self.p.db.kv(CHAT_FALLBACK_CAP_KEY, 0) or 0) < CHAT_FALLBACK_CAP_EVERY_S:
+                return
+            self.p.db.set_kv(CHAT_FALLBACK_CAP_KEY, now)
+            self.observe("daemon:chat-fallback-cap",
+                         f"A chat run (model {model or 'default'}) starts with Claude Code's --max-budget-usd cap, "
+                         "priced at its fallback rate for a model it does not know: a guess, not the endpoint's "
+                         "price, that can stop a run after it finished its work. Set pricing.chat (zeros for a "
+                         "free endpoint) or providers.chat.billing to plan.",
+                         "low", whole=True, key="chat-fallback-cap")
+        except Exception as e:
+            self._log_step_error("chat fallback cap observation", e)
+
     def start_run(self, role: str, prompt: str, provider: str, tier: str, cwd: str, *, task: dict | None = None,
                   budget_usd: float | None = None, timeout_s: float | None = None, read_only: bool = False,
                   schema: dict | None = None, system: str | None = None, append_system: str | None = None,
@@ -2474,7 +2494,9 @@ class Daemon:
                 if "effort" in pin:   # the runner checks the session runs the effort it starts with
                     pin["effort"] = lifted
         prices = (self.cfg.get("pricing") or {}).get(provider) or {}
-        prov = get_provider(provider).use(model, prices)
+        prov = get_provider(provider).use(model, prices, billing.declared(self.cfg, provider))
+        if provider == "chat" and prov.caps_budget and budget_usd is not None:
+            self._chat_fallback_cap(model)
         restrictions = self.cfg.get("restrictions", {})
         if read_only and prov.isolate_read_only:
             cwd = scratch_dir(str(self.p.base))

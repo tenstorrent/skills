@@ -9390,6 +9390,9 @@ def cmd_doctor(a) -> None:
     from .project import config_problems
     for line in config_problems(p.raw_config(), p.root):
         print(f"project.json: {line}")
+    from .providers.chat import fallback_cap_line
+    if line := fallback_cap_line(p.config()):
+        print(f"project.json: {line}")
     from . import push as _push
     _d = p.config().get("delivery") or {}
     if _push.lands_locally(_d.get("push_branch"), p.root, _push.allow_protected(_d)):

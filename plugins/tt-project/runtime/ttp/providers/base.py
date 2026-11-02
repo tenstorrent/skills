@@ -210,6 +210,7 @@ class Provider:
     caps_budget = False
     model = ""                       # the run's model and the project's price rows, for providers
     prices: dict = {}                # whose cost is estimated from tokens (see use())
+    billing = "auto"                 # the project's providers.<name>.billing (billing.declared)
     # Read-only turns run from scratch_dir(), not the project: this agent otherwise loads the
     # project's AGENTS.md or rules from its working directory into a decision-only turn.
     isolate_read_only = False
@@ -231,9 +232,10 @@ class Provider:
             return urlparse(base if "://" in base else "https://" + base).hostname or ""
         return self.api_host
 
-    def use(self, model: str = "", prices: dict | None = None) -> "Provider":
-        """Price this run's tokens with `model` and the project's `pricing.<provider>` rows."""
-        self.model, self.prices = model or "", dict(prices or {})
+    def use(self, model: str = "", prices: dict | None = None, billing: str = "auto") -> "Provider":
+        """Price this run's tokens with `model` and the project's `pricing.<provider>` rows, billed as
+        the project declares (`billing`: auto, plan or usage)."""
+        self.model, self.prices, self.billing = model or "", dict(prices or {}), billing or "auto"
         return self
 
     def binary(self) -> str | None:

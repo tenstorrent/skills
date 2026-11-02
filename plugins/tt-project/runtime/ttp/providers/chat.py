@@ -21,11 +21,13 @@ class Chat(Claude):
 
     # Claude Code prices a model name it does not know at its fallback rate. With pricing.chat rows
     # ({"<model id>" or "default": [input, cached input, output] in $ per million tokens}) a run is
-    # repriced from its tokens and the runner enforces its budget on that figure; without them its
-    # spend is Claude Code's figure, booked as estimated, and Claude Code's own cap stays.
+    # repriced from its tokens and the runner enforces its budget on that figure (a zero row: free,
+    # never cut); without them its spend is Claude Code's figure, booked as estimated, and Claude
+    # Code's own cap stays, a fallback-rate guess (fallback_cap_line), unless providers.chat.billing
+    # is plan: then no dollar cap at all, the runner's wall-clock and stall guards bound the run.
     @property
     def caps_budget(self) -> bool:
-        return not self.price()
+        return not self.price() and self.billing != "plan"
 
     def price(self) -> tuple[float, float, float] | None:
         from ..chatbridge import price_ok
@@ -34,7 +36,7 @@ class Chat(Claude):
         return tuple(float(x) for x in row) if row else None
 
     def build(self, *, budget_usd, **kw):
-        return super().build(budget_usd=None if self.price() else budget_usd, **kw)
+        return super().build(budget_usd=budget_usd if self.caps_budget else None, **kw)
 
     def parse(self, output_path, stderr_path=None):
         u = super().parse(output_path, stderr_path)
@@ -68,3 +70,19 @@ class Chat(Claude):
 
     account = Provider.account
     account_kind = Provider.account_kind
+
+
+def fallback_cap_line(cfg: dict) -> str:
+    """The doctor line for a project whose chat runs keep Claude Code's fallback-rate cap: a chat
+    provider entry, billing auto or usage and no pricing.chat row. "" otherwise."""
+    from ..billing import declared
+    from ..chatbridge import price_ok
+    if not isinstance((cfg.get("providers") or {}).get("chat"), dict) or declared(cfg, "chat") == "plan":
+        return ""
+    rows = (cfg.get("pricing") or {}).get("chat") if isinstance(cfg.get("pricing"), dict) else None
+    if isinstance(rows, dict) and any(price_ok(v) for v in rows.values()):
+        return ""
+    return ("providers.chat: no pricing.chat row, so chat runs keep Claude Code's --max-budget-usd cap, "
+            "priced at its fallback rate for a model it does not know: a guess that can cut finished work "
+            "short. Set pricing.chat (\"default\": [input, cached input, output] $ per million tokens; "
+            "zeros for a free endpoint) or providers.chat.billing to plan")
