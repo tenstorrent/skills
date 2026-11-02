@@ -1160,8 +1160,9 @@ def _big_finish(env, monkeypatch, n=200):
     return s, runs
 
 
-def _timed_tx(monkeypatch, db) -> list:
-    """Every write lock `db` takes from now on, committed or rolled back: [(seconds held, committed)]."""
+def _timed_tx(monkeypatch, db, held: list | None = None) -> list:
+    """Every write lock `db` takes from now on, committed or rolled back: [(seconds held, committed)].
+    `held` ([False]): held[0] is True while one is held."""
     holds, real = [], db.tx
 
     @contextlib.contextmanager
@@ -1173,7 +1174,13 @@ def _timed_tx(monkeypatch, db) -> list:
         t0, ok = time.monotonic(), False
         try:
             with real():
-                yield
+                if held is not None:
+                    held[0] = True
+                try:
+                    yield
+                finally:
+                    if held is not None:
+                        held[0] = False
             ok = True
         finally:
             holds.append((time.monotonic() - t0, ok))
@@ -1181,9 +1188,11 @@ def _timed_tx(monkeypatch, db) -> list:
     return holds
 
 
-def _finish_holds(env, monkeypatch, strict: bool, slice_s: float = 1.0, warm: bool = True, n: int = 200, **slow):
+def _finish_holds(env, monkeypatch, strict: bool, slice_s: float = 1.0, warm: bool = True, n: int = 200,
+                  spawns: list | None = None, **slow):
     """Finish _big_finish's two runs (strict rounds or not) with every write lock logged (db.SLOW_TX_S
-    0) behind a slow git (_slow_git); returns (s, every hold as _timed_tx records it, slow-tx lines, wall s per finish)."""
+    0) behind a slow git (_slow_git); returns (s, every hold as _timed_tx records it, slow-tx lines, wall s per finish).
+    `spawns` (a list): each git gitmemo spawns is appended as [argv text, under the write lock, "ran" or "cut"]."""
     from ttp import daemon as dmod, db as dbm, gitmemo
     s, runs = _big_finish(env, monkeypatch, n)
     _slow_git(env["tmp"], monkeypatch, **slow)
@@ -1194,7 +1203,20 @@ def _finish_holds(env, monkeypatch, strict: bool, slice_s: float = 1.0, warm: bo
     d = dmod.Daemon(s.p.base)
     if not warm:   # a warm-up that misses every read the body makes (what reviews #4292..#4382 kept finding)
         monkeypatch.setattr(d, "_prefetch_git", lambda task, result: None)
-    holds = _timed_tx(monkeypatch, d.p.db)
+    held = [False]
+    holds = _timed_tx(monkeypatch, d.p.db, held)
+    if spawns is not None:
+        real_spawn = gitmemo._spawn
+
+        def spawn(argv, t, kw):
+            rec = [" ".join(map(str, argv)), held[0], "ran"]
+            spawns.append(rec)
+            try:
+                return real_spawn(argv, t, kw)
+            except subprocess.TimeoutExpired:
+                rec[2] = "cut"
+                raise
+        monkeypatch.setattr(gitmemo, "_spawn", spawn)
     slow_log = s.p.logs / "slow-tx.log"
     slow_log.unlink(missing_ok=True)
     walls = []
@@ -1226,14 +1248,21 @@ def test_a_finish_on_a_big_project_behind_a_slow_git_holds_the_write_lock_at_mos
 
 def test_f_a_read_longer_than_the_slice_runs_outside_the_write_lock(env, monkeypatch):
     """A read the body makes that takes 2 s (the per-read cap 30 s, the slice 1 s) runs between rounds,
-    never while a round holds the lock, and the finish still uses its answer."""
-    s, holds, lines, walls = _finish_holds(env, monkeypatch, True, n=20, warm=False, delay=0.0,
+    never while a round holds the lock, and the finish still uses its answer. Checked by where each
+    spawn of it ran (under the lock or not) and how it ended, not by how long a hold took: a loaded host
+    stretches the rest of a round."""
+    spawns = []
+    s, holds, lines, walls = _finish_holds(env, monkeypatch, True, n=20, warm=False, delay=0.0, spawns=spawns,
                                            slow="*for-each-ref*refs/heads/*", slow_s=2.0)
-    assert max(h for h, _ in holds) <= 1.5, holds
     assert s.p.db.task(s.code)["status"] == "done"
     calls = [ln for ln in (env["tmp"] / "git-calls.log").read_text().splitlines() if "for-each-ref" in ln
              and "refs/heads/" in ln]
     assert calls, "the body made no for-each-ref read"
+    slow = [r for r in spawns if "for-each-ref" in r[0] and "refs/heads/" in r[0]]
+    assert len(slow) == len(calls), (slow, calls)   # every one went through gitmemo, none raw
+    assert all(how == "cut" for _, locked, how in slow if locked), slow
+    assert any(locked for _, locked, _ in slow), slow   # the round met it under the lock and cut it ...
+    assert any(how == "ran" and not locked for _, locked, how in slow), slow   # ... and it ran between rounds
     assert any(not ok for _, ok in holds), holds
 
 
