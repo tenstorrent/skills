@@ -1932,13 +1932,13 @@ def cmd_notify(a) -> None:
     """`ttp notify`: a worker's message for the user. The run cannot reach the daemon's database, so
     it is appended to the run's notify file, and the daemon posts it as an alert when the run ends
     (daemon.relay_worker_notifies): low or normal severity, a few per run, an identical text once. A
-    normal one from a run that ends blocked, waiting, failed or needs_review goes to the coordinator first
-    and reaches the user only if it does not take it up within notify.hold_s (workernotify).
+    normal one from a run that ends blocked, waiting, failed or needs_review with a hand-off that starts a
+    coordinator turn goes to the coordinator first and reaches the user only if it does not take it up
+    within notify.hold_s (workernotify).
     High goes to the coordinator, not the user: it is synced to the run's escalation file, which the
     daemon reads while the run lives and again at its end (daemon.relay_worker_escalations). Critical
     stays the coordinator's."""
     from .daemon import ESCALATE_FILE, ESCALATIONS_PER_RUN, NOTIFY_FILE
-    from . import workernotify
     run_dir = os.environ.get("TTP_RUN_DIR")
     if not run_dir:
         die("ttp notify only works inside a tt-project run")
@@ -1973,9 +1973,9 @@ def cmd_notify(a) -> None:
               + ("" if step.get("check") else " (give one: --check, a login or status command)"))
         return
     if a.severity == "normal":
-        print("queued for the user: it is sent when this run ends; if the run ends blocked, waiting, failed or "
-              "needs_review, it goes to the coordinator first and reaches the user unchanged after "
-              f"{workernotify.HOLD_S // 60} min (notify.hold_s) unless the coordinator takes it up; say so in the hand-off")
+        print("queued for the user: it is sent when this run ends; if the run's hand-off (blocked, failed or "
+              "needs_review) starts a coordinator turn, it goes to the coordinator first and reaches the user "
+              "unchanged after notify.hold_s unless the coordinator takes it up; say so in the hand-off")
         return
     print("queued for the user: it is sent when this run ends; say so in the hand-off")
 

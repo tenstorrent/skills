@@ -5,7 +5,8 @@ hand-off starts, never one of its own) and kept in a kv list. The coordinator ta
 reply or notify naming the task (#<id>), or drops it with a task_update whose text starts DROPPED
 (handled). Otherwise, once notify.hold_s has passed, post_due posts it unchanged and model-free. The
 list lives in kv and each post removes its entry in the same transaction, so a daemon restart during
-the hold neither loses nor doubles it."""
+the hold neither loses nor doubles it. A hand-off that queues no coordinator turn of its own (a waiting
+one, a routine or quiet one: recorded 'handled') has its notifies posted at once (release_unqueued)."""
 from __future__ import annotations
 
 import hashlib
@@ -87,18 +88,35 @@ def named(text: str) -> set[int]:
     return {int(m) for m in _TASK_REF.findall(str(text or ""))}
 
 
+def _post(db, entries: list[dict], due: list[dict], now: float) -> int:
+    for e in due:
+        text = str(e.get("text") or "")
+        if text and not db.one("SELECT id FROM messages WHERE direction='out' AND kind='alert' AND text=? "
+                               "AND ts>?", (text, now - 86400)):
+            db.post("out", text, chat=None, kind="alert", severity=e.get("severity") or "normal")
+    if due:
+        _close(db, [e for e in entries if e not in due], due)
+    return len(due)
+
+
 def post_due(db, now: float | None = None) -> int:
     """Post each held notify whose hold ended, unchanged, and close its coordinator item."""
     now = time.time() if now is None else now
     with db.tx():
         entries = _entries(db)
-        due = [e for e in entries if _due(e) <= now]
-        if not due:
+        return _post(db, entries, [e for e in entries if _due(e) <= now], now)
+
+
+def release_unqueued(db, task_id: int, now: float | None = None) -> int:
+    """Post task `task_id`'s held notifies now when no queued event of the task starts a coordinator
+    turn: a waiting hand-off and a routine or quiet one are recorded 'handled', so the ride-along item
+    would reach the coordinator only by chance and the user 15 min late (a sign-in link or device
+    code may lapse by then). Run after the run end commits; a crash before it leaves post_due."""
+    now = time.time() if now is None else now
+    with db.tx():
+        evs = db.q("SELECT severity, data FROM events WHERE task=? AND status='queued' AND kind!=?",
+                   (task_id, KIND))
+        if any(not pagesev.rides_along(dict(e)) for e in evs):
             return 0
-        for e in due:
-            text = str(e.get("text") or "")
-            if text and not db.one("SELECT id FROM messages WHERE direction='out' AND kind='alert' AND text=? "
-                                   "AND ts>?", (text, now - 86400)):
-                db.post("out", text, chat=None, kind="alert", severity=e.get("severity") or "normal")
-        _close(db, [e for e in entries if e not in due], due)
-    return len(due)
+        entries = _entries(db)
+        return _post(db, entries, [e for e in entries if e.get("task") == task_id], now)

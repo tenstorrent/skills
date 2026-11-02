@@ -2989,18 +2989,22 @@ def test_worker_low_and_normal_notify_are_unchanged_by_the_escalation_path(env, 
     assert not p.db.one("SELECT id FROM events WHERE fingerprint LIKE 'escalate:%'")
 
 
-def _held_notify_run(env, monkeypatch, p, title="sign in", status="blocked", sev="normal"):
-    """A task whose run left one `ttp notify` and then handed off with `status`; the run ended (_finish_worker)."""
+def _held_notify_run(env, monkeypatch, p, title="sign in", status="blocked", sev="normal", kind="work",
+                     priority=3, **extra):
+    """A task whose run left one `ttp notify` and then handed off with `status` (plus `extra`); the run
+    ended (_finish_worker, inside a transaction as every daemon call site runs it)."""
     from ttp import cli
     from ttp.daemon import Daemon
     from ttp.providers.base import RunUsage as Usage
-    tid = p.db.add_task(title, "spec", kind="work", tier="standard", origin="coordinator")
-    p.db.update_task(tid, status="running")
+    tid = p.db.add_task(title, "spec", kind=kind, tier="standard", origin="coordinator")
+    p.db.update_task(tid, status="running", priority=priority)
     run_dir = _note_run(env, monkeypatch, p, task=str(tid))
     cli.main(["notify", "--severity", sev, "please sign in again"])
     (run_dir / "result.json").write_text(json.dumps({"status": status, "summary": "needs a sign-in",
-                                                     "question": "sign in?", "retry_when": "true"}))
-    Daemon(p.base)._finish_worker({"task": tid}, Usage(cost_usd=0.1), "ok", run_dir)
+                                                     "question": "sign in?", "retry_when": "true", **extra}))
+    d = Daemon(p.base)
+    with d.p.db.tx():
+        d._finish_worker({"task": tid, "note": None}, Usage(cost_usd=0.1), "ok", run_dir)
     return tid, run_dir
 
 
@@ -3024,6 +3028,28 @@ def test_a_blocked_runs_normal_notify_goes_to_the_coordinator_first(env, monkeyp
     assert workernotify.post_due(p.db, time.time() + 10 * workernotify.HOLD_S) == 0
     assert [m["kind"] for m in p.db.q("SELECT kind FROM messages WHERE direction='out'")] == ["ask"]
     assert p.db.one("SELECT status FROM events WHERE id=?", (evs[0]["id"],))["status"] == "handled"
+
+
+def test_a_worker_notify_from_a_hand_off_that_starts_no_turn_is_posted_at_once(env, monkeypatch):
+    """A waiting hand-off (wait_kind user: a sign-in link or device code) and a routine needs_review one
+    (the daemon queues the review) record their event 'handled' and start no coordinator turn: their
+    normal notify reaches the user when the run ends, not 15 min later, and nothing stays held."""
+    from ttp import workernotify
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid, _ = _held_notify_run(env, monkeypatch, p, status="waiting", wait_kind="user", waiting_for="a sign-in")
+    assert p.db.one("SELECT status FROM events WHERE kind='task_waiting' AND task=?", (tid,))["status"] == "handled"
+    rid = p.db.add_task("Review", "spec", kind="review", tier="standard", origin="daemon")
+    monkeypatch.setattr(Daemon, "_auto_review", lambda self, task, summary, add=True: (rid, True))
+    monkeypatch.setattr(Daemon, "_fix_without_commits", lambda self, task: [])
+    code, _ = _held_notify_run(env, monkeypatch, p, title="code one", status="needs_review", kind="code", priority=1)
+    assert p.db.one("SELECT status FROM events WHERE kind='task_review' AND task=?", (code,))["status"] == "handled"
+    got = sorted(m["text"] for m in p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='alert'"))
+    assert got == [f"#{tid} sign in: please sign in again", f"#{code} code one: please sign in again"]
+    assert p.db.kv(workernotify.KV) == []
+    assert not p.db.one("SELECT id FROM events WHERE kind=? AND status='queued'", (workernotify.KIND,))
+    assert workernotify.post_due(p.db, time.time() + 10 * workernotify.HOLD_S) == 0
+    assert len(p.db.q("SELECT id FROM messages WHERE kind='alert'")) == 2, "posted once"
 
 
 def test_a_held_worker_notify_is_posted_once_after_the_hold_across_a_restart(env, monkeypatch):

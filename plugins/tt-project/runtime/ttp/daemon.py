@@ -14659,6 +14659,13 @@ def _reboot_wakes(task: dict) -> int:
         return 0
 
 
+def _release_unqueued(p: Project, task_id: int) -> None:
+    try:
+        workernotify.release_unqueued(p.db, task_id)
+    except Exception as e:   # post_due posts it once the hold ends
+        log(p, f"task #{task_id}: posting its held worker notify now failed: {e}")
+
+
 def relay_worker_notifies(p: Project, task: dict, run_dir: Path, handoff: dict | None = None) -> int:
     """Post the `ttp notify` lines a worker run left as alerts, the way the coordinator's `notify`
     action does: at most low or normal severity, the first NOTIFIES_PER_RUN, a text already sent in
@@ -14677,7 +14684,7 @@ def relay_worker_notifies(p: Project, task: dict, run_dir: Path, handoff: dict |
     res = handoff if handoff is not None else _read_result(run_dir / RESULT_FILE)
     end = res.get("status") if isinstance(res, dict) else None
     hold_for = workernotify.hold_s(p.config()) if end in workernotify.HELD_ENDS else 0.0
-    sent = 0
+    sent = held = 0
     for line in lines:
         try:
             n = json.loads(line)
@@ -14701,7 +14708,8 @@ def relay_worker_notifies(p: Project, task: dict, run_dir: Path, handoff: dict |
             continue
         sev = n.get("severity") if n.get("severity") in ("low", "normal") else "normal"
         if hold_for and sev == "normal":
-            sent += workernotify.hold(db, task, text, run_dir.name, end, hold_for)
+            n_held = workernotify.hold(db, task, text, run_dir.name, end, hold_for)
+            sent, held = sent + n_held, held + n_held
             continue
         db.post("out", text, chat=None, kind="alert", severity=sev)
         sent += 1
@@ -14713,6 +14721,8 @@ def relay_worker_notifies(p: Project, task: dict, run_dir: Path, handoff: dict |
 
     # Only once the posts commit: a rolled-back run end leaves the file to be posted next time.
     db.after_commit(mark_sent)
+    if held:   # the hand-off queued no coordinator turn (waiting, routine, quiet): posted now, not 15 min late
+        db.after_commit(lambda: _release_unqueued(p, task["id"]))
     return sent
 
 
