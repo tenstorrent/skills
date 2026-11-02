@@ -24794,6 +24794,32 @@ def test_codex_gets_no_trust_bypass_when_another_hook_source_exists(env, monkeyp
     assert "--dangerously-bypass-hook-trust" in worker()[1]
 
 
+@pytest.mark.parametrize("parser", ["tomllib", "tomli", None])
+def test_codex_hook_source_is_a_parsed_hooks_table_or_enabled_plugin(env, monkeypatch, parser):
+    """A real top-level hooks table or key, or an enabled plugin, is a source; comments, strings and
+    other tables are not. A file that does not parse, or no parser, keeps the cautious pattern."""
+    from ttp.providers.codex import config_has_hooks
+    if parser:
+        monkeypatch.setitem(sys.modules, "tomllib", pytest.importorskip(parser))
+    else:
+        monkeypatch.setitem(sys.modules, "tomllib", None)
+        monkeypatch.setitem(sys.modules, "tomli", None)
+    for text in ('[hooks]\n[[hooks.PreToolUse]]\nmatcher = "*"\n', '[[hooks.PostToolUse]]\nmatcher = "*"\n',
+                 'hooks.PreToolUse = []\n', '[plugins."lint@market"]\nenabled = true\n', '[plugins."lint@market"]\n'):
+        assert config_has_hooks('model = "m"\n' + text), (parser, text)
+    # Comments, strings and other tables: none is a source once parsed.
+    for text in ('# [hooks]\n# [[hooks.PreToolUse]]\n', 'note = "hooks = on"\n', '[profiles.x]\nmodel = "m"\n',
+                 '[features]\nhooks = true\n', 'note = """\n[hooks]\nhooks = 1\n"""\n',
+                 '[plugins."lint@market"]\nenabled = false\n'):
+        assert config_has_hooks('model = "m"\n' + text) is (parser is None and "[hooks]\nhooks" in text
+                                                             or parser is None and "features" in text
+                                                             or parser is None and "enabled = false" in text), \
+            (parser, text)
+    # A file that does not parse: the pattern decides, as before the parser.
+    assert config_has_hooks('model = \n[hooks]\n') and config_has_hooks('[plugins.x\nenabled = true\n')
+    assert not config_has_hooks('model = \n[profiles.x]\n') and not config_has_hooks("")
+
+
 def test_codex_isolated_workers_and_coordinator_turns_skip_the_users_config(env, monkeypatch, tmp_path):
     from ttp.providers import get_provider
     worker, home, _ = _codex_hooks(monkeypatch, tmp_path)

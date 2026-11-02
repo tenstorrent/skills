@@ -121,8 +121,10 @@ passed again for Claude Code with workers in the write fence (38 s, $0.12).
   without its instructions or compaction.
 - Codex: the cost is estimated from tokens and `pricing.codex`; the CLI reports no cost.
 - Codex: where rollouts are kept is not documented. If it changes, lost runs start fresh.
-- Codex: hook-source detection reads `config.toml` with simple patterns, so it errs towards
-  seeing a source and leaving the hook off.
+- Codex: hook-source detection parses `config.toml` (a top-level `hooks` table or key, or a
+  plugin not set `enabled = false`). Without `tomllib` (Python before 3.11) or `tomli`, or on a
+  file that does not parse, it falls back to simple patterns, which err towards seeing a source
+  and leaving the hook off. Not yet checked live.
 - Cursor: installed in user space on 2026-11-01 (PST) with the documented installer
   (`curl https://cursor.com/install`, reviewed before it ran; it needs no sudo and writes only
   under `~/.local`: the build in `~/.local/share/cursor-agent/versions/` and the `agent` and

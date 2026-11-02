@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -66,6 +67,7 @@ HOOK_TRUST_BYPASS = "--dangerously-bypass-hook-trust"
 IGNORE_USER_CONFIG = "--ignore-user-config"
 IGNORE_RULES = "--ignore-rules"
 # A config.toml line that may define a hook: a hooks table or key, or a plugin (plugins bundle hooks).
+# Only the fallback where no TOML parser loads or the file does not parse (see config_has_hooks).
 HOOK_CONFIG_RE = re.compile(r"^\s*(?:\[\[?\s*[\"']?(?:hooks|plugins)\b|[\"']?(?:hooks|plugins)[\"']?\s*[.=])", re.M)
 # User config the run cannot reach its model without (its provider, endpoint or login): ignoring it
 # would break every run.
@@ -655,11 +657,10 @@ def hook_sources(cwd: str, user_config: bool = True) -> list[str]:
     """Files besides the harness's own `-c` keys that may give a run in `cwd` hooks Codex would
     otherwise ask the user to trust: `hooks.json` in Codex's home, its `config.toml` when the run
     loads it (`user_config`), and a `.codex/` folder in `cwd` or any folder above it. Hooks or
-    plugins in a config.toml count, as plugins can bundle hooks. Read without a TOML parser, so a
-    doubtful line counts too: a false find only keeps the hook off, as before."""
+    plugins in a config.toml count, as plugins can bundle hooks (see config_has_hooks)."""
     home = codex_home()
     found = [str(home / "hooks.json")] if (home / "hooks.json").exists() else []
-    if user_config and HOOK_CONFIG_RE.search(_read(home / "config.toml")):
+    if user_config and config_has_hooks(_read(home / "config.toml")):
         found.append(str(home / "config.toml"))
     for d in [Path(cwd), *Path(cwd).parents]:
         dot = d / ".codex"
@@ -667,9 +668,29 @@ def hook_sources(cwd: str, user_config: bool = True) -> list[str]:
             continue   # Codex's own home (often ~/.codex), handled above
         if (dot / "hooks.json").exists():
             found.append(str(dot / "hooks.json"))
-        if HOOK_CONFIG_RE.search(_read(dot / "config.toml")):
+        if config_has_hooks(_read(dot / "config.toml")):
             found.append(str(dot / "config.toml"))
     return found
+
+
+def config_has_hooks(config_toml: str) -> bool:
+    """Whether a Codex config.toml may give a run hooks: a top-level `hooks` table or key, or a
+    plugin entry not set `enabled = false` (plugins can bundle hooks). Parsed with tomllib (3.11+)
+    or tomli; loaded by name, since the runtime supports 3.9. Without a parser, or on a file that
+    does not parse, HOOK_CONFIG_RE decides, so a doubtful line counts: a false find only keeps the
+    harness hook off."""
+    for name in ("tomllib", "tomli"):
+        try:
+            data = importlib.import_module(name).loads(config_toml)
+        except ImportError:
+            continue
+        except Exception:   # tomllib raises TOMLDecodeError (a ValueError); be cautious on any other
+            break
+        plugins = data.get("plugins")
+        enabled = [e for e in plugins.values() if not (isinstance(e, dict) and e.get("enabled") is False)] \
+            if isinstance(plugins, dict) else plugins
+        return "hooks" in data or bool(enabled)
+    return bool(HOOK_CONFIG_RE.search(config_toml))
 
 
 def hook_config_args() -> list[str]:
