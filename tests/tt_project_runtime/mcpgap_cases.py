@@ -304,7 +304,7 @@ def test_isolated_worker_without_a_listed_connector_keeps_todays_strict_args(env
     (p.state / "mcp_list.json").unlink()
     p.set_config("providers.claude.mcp_servers", ["docs", "claude.ai Gmail"])
     again, again_env = _iso_run(p, monkeypatch)
-    per_run = ("TTP_TASK", "TTP_TASK_ID", "TTP_RUN_ID", "TTP_RUN_DIR")
+    per_run = ("TTP_TASK", "TTP_TASK_ID", "TTP_RUN_ID", "TTP_RUN_DIR", "TMPDIR", "TMP", "TEMP")
     assert _shape(again) == _shape(argv)
     assert {k: v for k, v in again_env.items() if k not in per_run} == {k: v for k, v in run_env.items()
                                                                          if k not in per_run}

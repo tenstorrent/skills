@@ -381,6 +381,17 @@ class Provider:
         metadata); [] when the agent has no write sandbox. `restrictions`: the project's."""
         return []
 
+    fence_optional = False   # providers.<name>.write_fence can turn the fence off (fence_args)
+
+    def fence_args(self, argv: list[str], dirs: list[str], cwd: str = "", on: bool = True,
+                   restrictions: dict | None = None) -> tuple[list[str], bool]:
+        """`argv` with the write fence that also lets the worker write `dirs`, and whether the run is
+        fenced. `on` False: the project turned the fence off (providers.<name>.write_fence), where the
+        adapter's fence is optional; an adapter whose sandbox is part of its mode keeps it.
+        `restrictions`: the project's (see writable_args)."""
+        extra = self.writable_args(dirs, restrictions)
+        return (argv[:-1] + extra + ["-"] if argv[-1:] == ["-"] else argv + extra), bool(extra)
+
     def write_fence(self, restrictions: dict | None = None) -> str:
         """Why this provider's workers can write outside their writable dirs, as built today; ""
         when an OS sandbox fences them. Shown by `ttp doctor`; changes nothing."""

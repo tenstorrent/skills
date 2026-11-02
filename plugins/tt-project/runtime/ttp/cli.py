@@ -9442,8 +9442,10 @@ def cmd_doctor(a) -> None:
         print(f"provider {prov.name}: {'found ' + prov.binary() if prov.available() else 'not installed'}"
               + (f" · account {prov.account()}" if prov.available() and prov.account() else ""))
     rules = p.config().get("restrictions") or {}
-    gaps = [f"{prov.name} ({prov.write_fence(rules)})" for prov in all_providers()
-            if prov.name != "fake" and prov.available() and prov.write_fence(rules)]
+    fence_off = {n for n, c in p.config()["providers"].items() if isinstance(c, dict) and c.get("write_fence") is False}
+    gaps = [f"{prov.name} ({prov.write_fence(rules) or f'turned off: providers.{prov.name}.write_fence is false'})"
+            for prov in all_providers() if prov.name != "fake" and prov.available()
+            and (prov.write_fence(rules) or prov.name in fence_off and prov.fence_optional)]
     if gaps:
         print("unfenced providers (their workers can write anywhere, project.db included): " + ", ".join(gaps))
     from .coordinator import dir_list

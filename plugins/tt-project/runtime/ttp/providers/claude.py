@@ -4,8 +4,18 @@
 plan windows (utilization as a 0..1 fraction plus reset times), per-message usage, and a final
 `result` with the reported cost, the last message and any schema-validated output.
 
-Write fence (probed on CLI 2.1.285; Linux measured, macOS from the docs). Workers run with
-bypassPermissions and no OS sandbox, so they are unfenced today.
+Write fence (probed on CLI 2.1.285 and 2.1.296; Linux measured, macOS from the docs). Workers run
+with bypassPermissions and, where the sandbox can start (Linux with bubblewrap and socat, macOS), the
+Bash sandbox (fence_args, sandbox_settings): Bash writes only its cwd, the CLI's own temp dir and the
+`filesystem.allowWrite` roots. `providers.claude.write_fence: false` turns it off. Without a
+dependency the run goes unfenced, as before, and the daemon raises one observation.
+
+Measured on CLI 2.1.296 (Linux): only one `--settings` flag counts (a second replaced the first, sandbox
+and all), so the sandbox goes into the worker's settings JSON. Under bypassPermissions in `-p` the
+sandbox refused writes outside its roots from `touch` and `python3` (read-only file system) while
+HTTPS through its proxy, a Unix socket outside its roots, TMPDIR (set to the CLI's own temp dir) and
+`git commit` in the cwd worked; `ssh` could not resolve a host name (the sandbox has no network but
+its proxy), so the commands that reach other hosts are excluded by name (FENCE_EXCLUDED).
 
 | Question | Linux | macOS |
 | :- | :- | :- |
@@ -126,6 +136,7 @@ class Claude(Provider):
             return rc == 0
 
     caps_budget = True   # --max-budget-usd
+    fence_optional = True   # the Bash sandbox (fence_args)
 
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions,
               disallowed_tools=(), denied_reads=(), web=True):
@@ -257,11 +268,21 @@ class Claude(Provider):
         return [flag, text] if len(text.encode()) <= MAX_ARG_BYTES else []
 
     def write_fence(self, restrictions=None) -> str:
-        gap = "bypassPermissions without the Bash sandbox"
-        if sys.platform.startswith("linux"):
-            missing = [b for b in ("bwrap", "socat") if not find_binary(b)]
-            gap += f"; the sandbox would need {' and '.join(missing)}" if missing else ""
-        return gap
+        missing = fence_missing()
+        return f"bypassPermissions without the Bash sandbox, which needs {' and '.join(missing)}" if missing else ""
+
+    def fence_args(self, argv, dirs, cwd="", on=True, restrictions=None):
+        # The sandbox goes into the worker's one --settings JSON: a second --settings flag replaces it.
+        if not on or fence_missing() or "--settings" not in argv:
+            return list(argv), False
+        argv = list(argv)
+        i = argv.index("--settings") + 1
+        try:
+            settings = json.loads(argv[i])
+        except (IndexError, ValueError):
+            return argv, False   # a settings file, not JSON: leave it as it is
+        argv[i] = json.dumps({**settings, "sandbox": sandbox_settings([cwd, *dirs] if cwd else list(dirs))})
+        return argv, True
 
     def isolation_args(self) -> list[str]:
         # Flag settings (the harness hook) and --plugin-dir load whatever the sources are.
@@ -518,6 +539,43 @@ def hook_settings() -> dict:
                       # Refuses to end a task run whose result.json is missing or no hand-off (twice at most).
                       "Stop": [{"hooks": [{"type": "command", "command": f"{cmd} Stop", "timeout": 20}]}]},
             "env": {"PYTHONPATH": runtime}}
+
+
+# Commands that run outside the Bash sandbox: inside it only its HTTP proxy is reachable (measured: ssh
+# could not resolve a host name), so whatever reaches another host or a local service directly would
+# fail there. They write as the worker does without a fence.
+FENCE_EXCLUDED = ("ssh *", "scp *", "sftp *", "rsync *", "ttp machines *", "ttp devq *",
+                  "ttp detach --remote *")
+
+
+def fence_missing() -> list[str]:
+    """What this host lacks for the Bash sandbox ([] when it can start): bubblewrap and socat on Linux,
+    nothing on macOS (Seatbelt); the CLI has no sandbox elsewhere."""
+    if sys.platform == "darwin":
+        return []
+    if sys.platform.startswith("linux"):
+        return [b for b in ("bwrap", "socat") if not find_binary(b)]
+    return ["Linux or macOS"]
+
+
+def tool_caches() -> list[str]:
+    """Per-user download and build caches that package managers and compilers write (pip, uv, ccache,
+    pre-commit and the like under the cache dir; npm; cargo's registry), those that exist."""
+    home = Path.home()
+    dirs = [Path(os.environ.get("XDG_CACHE_HOME") or home / ".cache"), home / ".npm",
+            home / ".cargo" / "registry", home / ".cargo" / "git"]
+    return [str(d) for d in dirs if d.is_dir()]
+
+
+def sandbox_settings(dirs) -> dict:
+    """The worker's `sandbox` settings: Bash runs sandboxed without a prompt and never retries outside
+    it (allowUnsandboxedCommands false drops the dangerouslyDisableSandbox retry); it writes its cwd,
+    the CLI's temp dir, `dirs` and the tool caches. The network stays as bypassPermissions leaves it
+    (every host through the proxy); every Unix socket stays open (the harness's under state/)."""
+    return {"enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False,
+            "excludedCommands": list(FENCE_EXCLUDED),
+            "filesystem": {"allowWrite": list(dict.fromkeys(d for d in [*dirs, *tool_caches()] if d))},
+            "network": {"allowAllUnixSockets": True}}
 
 
 def worker_settings(denied_reads=()) -> dict:

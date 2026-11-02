@@ -2600,7 +2600,7 @@ class Daemon:
         mcp_env: dict = {}   # secrets of servers given as arguments (mcp_by_args): never in run.json
         resume_extra: list[str] = []
         private: list[str] = []   # files that may hold credentials, removed when the run ends
-        sandboxed = False   # the agent fences the worker's writes (see Provider.writable_args)
+        sandboxed = False   # the agent fences the worker's writes (see Provider.fence_args)
         if not read_only:
             # Skill plugins this project enabled for its workers only (never the user's own setup).
             dirs = [str(Path(os.path.expanduser(d))) for d in
@@ -2631,11 +2631,18 @@ class Daemon:
                 roots += list(dict.fromkeys([str(checkcap.slot_dir()), str(checkcap.slot_dir().resolve())]))
             except OSError:
                 pass   # `ttp checks` then says plainly that it cannot write the slots
-            fence = prov.writable_args(roots, restrictions)
-            sandboxed = bool(fence)
+            fence_on = self.cfg["providers"].get(provider, {}).get("write_fence", True) is not False
+            argv, sandboxed = prov.fence_args(argv, roots, cwd=str(cwd), on=fence_on,
+                                            restrictions=restrictions)
+            if fence_on and not sandboxed and prov.fence_optional and prov.write_fence(restrictions):
+                # One keyed issue per provider (screen.py), never a wake per run. Only an optional fence
+                # (one a missing dependency stops): Cursor runs unfenced by design outside no_internet.
+                self.observe("daemon:write-fence", f"{provider} workers run unfenced: {prov.write_fence(restrictions)}; install "
+                             f"it or set providers.{provider}.write_fence false", "low", whole=True,
+                             key=f"write-fence:{provider}")
             loaded = prov.plugin_args([d for d in dirs if d not in missing])
             self._alert_plugins_dropped(prov, provider, [d for d in dirs if d not in missing], loaded)
-            extra = fence + loaded
+            extra = loaded
             if self.cfg["providers"].get(provider, {}).get("worker_isolation"):
                 deny = self._connector_deny(prov, provider, cwd, [d for d in dirs if d not in missing])
                 kept = prov.keep_connectors(argv, deny) if deny is not None else None

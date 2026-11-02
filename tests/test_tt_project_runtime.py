@@ -6519,7 +6519,7 @@ def test_doctor_names_unfenced_providers(env, monkeypatch, capsys):
     assert codex.Codex().write_fence() == "", "workspace-write is a write fence"
     cli.cmd_doctor(types.SimpleNamespace(name="demo"))
     line = next(l for l in capsys.readouterr().out.splitlines() if l.startswith("unfenced providers"))
-    assert "claude (bypassPermissions without the Bash sandbox; the sandbox would need bwrap)" in line
+    assert "claude (bypassPermissions without the Bash sandbox, which needs bwrap)" in line
     assert "cursor (--force without --sandbox enabled: this build's `--help` lists no --sandbox or --add-dir)" in line
     assert "codex" not in line and "fake" not in line
     monkeypatch.setattr(base.Provider, "available", lambda self: False)
