@@ -1077,3 +1077,160 @@ def test_gitreplay_answers_a_kept_read_without_git_and_drops_it_when_its_branch_
     with gitmemo.attempt():
         gitmemo.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True)
     assert st.returncode == 0 and len(spawns) == n + 3, "a worktree read is kept only within its attempt"
+
+
+def _fast_import(repo, n_commits=2000, n_branches=200):
+    """`n_commits` commits on refs/heads/history off HEAD and `n_branches` task branches, one commit
+    each off a commit spread along it (git fast-import: one process, fixed dates)."""
+    base = _git_out(repo, "rev-parse", "HEAD")
+    out, when = [], 1_700_000_000
+    for i in range(1, n_commits + 1):
+        body = f"x = {i}\n"
+        out += [f"commit refs/heads/history", f"mark :{i}", f"committer t <t@t> {when + i} +0000",
+                f"data {len(f'history {i}')}", f"history {i}"]
+        out.append(f"from {base}" if i == 1 else f"from :{i - 1}")
+        out += [f"M 644 inline src/m{i % 50}.py", f"data {len(body)}", body.rstrip("\n")]
+    for b in range(n_branches):
+        body = f"feature = {b}\n"
+        out += [f"commit refs/heads/ttp/t{9000 + b}-work-{b}", f"committer t <t@t> {when + n_commits + b} +0000",
+                f"data {len(f'work {b}')}", f"work {b}", f"from :{(b * n_commits) // n_branches + 1}",
+                f"M 644 inline feat/f{b}.py", f"data {len(body)}", body.rstrip("\n")]
+    subprocess.run(["git", "-C", str(repo), "fast-import", "--quiet"], input="\n".join(out) + "\n",
+                   text=True, check=True)
+
+
+def _slow_git(tmp_path, monkeypatch, delay=0.02, slow="", slow_s=0.0):
+    """A `git` first on PATH that sleeps `delay` (`slow_s` on a command line matching the shell pattern
+    `slow`) and then runs the real git, logging each command line with its start time."""
+    bindir, log = tmp_path / "slowbin", tmp_path / "git-calls.log"
+    bindir.mkdir()
+    exe = bindir / "git"
+    case = f'case "$*" in {slow}) sleep {slow_s};; *) sleep {delay};; esac\n' if slow else f"sleep {delay}\n"
+    exe.write_text(f"#!/bin/sh\necho \"$(date +%s.%N) $*\" >> {log}\n{case}"
+                   f"PATH='{os.environ['PATH']}' exec {shutil.which('git')} \"$@\"\n")
+    exe.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    return log
+
+
+def _big_finish(env, monkeypatch, n=200):
+    """A project of realistic size (2,000 commits, `n` task branches and their tasks and runs, passed
+    and failed reviews, push-queue rows) whose code task's run has just handed off done with a follow-up,
+    and whose review (of an earlier head) approves a push. Returns (s, [the code run's id, the review's])."""
+    s = _pq(env, monkeypatch)
+    p = s.p
+    _fast_import(s.repo, n_branches=n)
+    now = time.time()
+    for b in range(n):
+        tid = p.db.add_task(f"work {b}", f"edit feat/f{b}.py and src/m{b % 50}.py", kind="code", tier="light",
+                            origin="coordinator")
+        p.db.update_task(tid, status="done" if b % 4 else "queued", branch=f"ttp/t{9000 + b}-work-{b}",
+                         result=json.dumps({"status": "done", "summary": f"work {b} done"}))
+        p.db.x("INSERT INTO runs(task,role,provider,model,started,ended,status,note) VALUES(?,?,?,?,?,?,?,?)",
+               (tid, "worker", "fake", "", now - 600, now - 300, "ok", "{}"))
+        if b % 5 == 0:
+            rev = p.db.add_task(f"Review #{tid}: work {b}", "review it", kind="review", tier="standard",
+                                origin="daemon", depends_on=[tid])
+            p.db.update_task(rev, status="done", result=json.dumps(
+                {"status": "done" if b % 10 else "failed", "summary": "verdict",
+                 "followups": [{"title": f"fix work {b}", "spec": f"fix src/m{b % 50}.py"}]}))
+        if b % 7 == 0:
+            p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+                   (tid, f"ttp/t{9000 + b}-work-{b}", "0" * 40, "origin/proj", "pushed" if b % 2 else "approved",
+                    now - 900, now - 900))
+    hop = p.db.add_task("continue: work 3 part 2", "edit src/m3.py further", kind="code", tier="light",
+                        origin="daemon", parent=4)
+    p.db.update_task(hop, status="done", branch="ttp/t9003-work-3")
+    runs = []
+    for tid, handoff in ((s.code, {"status": "done", "summary": "feature works", "followups": [
+                             {"title": "tidy feat/f7.py", "spec": "tidy feat/f7.py and src/m7.py"}]}),
+                         (s.review, {"status": "done", "summary": "looks good",
+                                     "push": [{"branch": s.branch, "head": s.head}]})):
+        p.db.update_task(tid, status="running")
+        rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,note) VALUES(?,?,?,?,?,?,?)",
+                     (tid, "worker", "fake", "", now - 60, "running", "{}"))
+        run_dir = p.runs / str(rid)
+        run_dir.mkdir(parents=True)
+        p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
+        (run_dir / "output.jsonl").write_text("")
+        (run_dir / "stderr.log").write_text("")
+        (run_dir / "result.json").write_text(json.dumps(handoff))
+        runs.append(rid)
+    return s, runs
+
+
+def _timed_tx(monkeypatch, db) -> list:
+    """Every write lock `db` takes from now on, committed or rolled back: [(seconds held, committed)]."""
+    holds, real = [], db.tx
+
+    @contextlib.contextmanager
+    def tx():
+        if db.conn.in_transaction:
+            with real():
+                yield
+            return
+        t0, ok = time.monotonic(), False
+        try:
+            with real():
+                yield
+            ok = True
+        finally:
+            holds.append((time.monotonic() - t0, ok))
+    monkeypatch.setattr(db, "tx", tx)
+    return holds
+
+
+def _finish_holds(env, monkeypatch, strict: bool, slice_s: float = 1.0, warm: bool = True, n: int = 200, **slow):
+    """Finish _big_finish's two runs (strict rounds or not) with every write lock logged (db.SLOW_TX_S
+    0) behind a slow git (_slow_git); returns (s, every hold as _timed_tx records it, slow-tx lines, wall s per finish)."""
+    from ttp import daemon as dmod, db as dbm, gitmemo
+    s, runs = _big_finish(env, monkeypatch, n)
+    _slow_git(env["tmp"], monkeypatch, **slow)
+    monkeypatch.setattr(dbm, "SLOW_TX_S", 0.0)
+    monkeypatch.setattr(dmod, "FINISH_STRICT", strict)
+    monkeypatch.setattr(gitmemo, "HOLD_SLICE_S", slice_s)
+    monkeypatch.setattr(gitmemo, "TICK_GIT_S", 30.0)   # the per-read cap above the slice
+    d = dmod.Daemon(s.p.base)
+    if not warm:   # a warm-up that misses every read the body makes (what reviews #4292..#4382 kept finding)
+        monkeypatch.setattr(d, "_prefetch_git", lambda task, result: None)
+    holds = _timed_tx(monkeypatch, d.p.db)
+    slow_log = s.p.logs / "slow-tx.log"
+    slow_log.unlink(missing_ok=True)
+    walls = []
+    for rid in runs:
+        t0 = time.monotonic()
+        with gitmemo.bounded(gitmemo.TICK_GIT_S):   # as in a tick step (Daemon._run_step)
+            d.finish_run(s.p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                         {"rc": 0, "started": time.time() - 60, "ended": time.time(), "stopped": None})
+        walls.append(time.monotonic() - t0)
+    lines = slow_log.read_text().splitlines() if slow_log.exists() else []
+    return s, holds, lines, walls
+
+
+@pytest.mark.parametrize("strict", [True, False], ids=["strict", "one_tx"])
+def test_a_finish_on_a_big_project_behind_a_slow_git_holds_the_write_lock_at_most_3s(env, monkeypatch, strict):
+    """sa28: a finish whose warm-up misses the body's reads (each read 0.4 s, the per-read cap 30 s,
+    above the 1 s slice) holds the write lock at most 3 s in strict rounds, rolled-back ones included;
+    the one-transaction finish (FINISH_STRICT False) holds it past 3 s, so the slice is what bounds it."""
+    s, holds, lines, walls = _finish_holds(env, monkeypatch, strict, warm=False, delay=0.4)
+    assert s.p.db.task(s.code)["status"] == "done" and s.p.db.task(s.review)["status"] == "pushing"
+    longest = max(h for h, _ in holds)
+    if strict:
+        assert longest <= 3.0, holds
+        assert any(not ok for _, ok in holds), "no round was rolled back: the fixture reads no git under the lock"
+        assert all("rounds " in ln and "live git " in ln for ln in lines), lines
+    else:
+        assert longest > 3.0, holds
+
+
+def test_f_a_read_longer_than_the_slice_runs_outside_the_write_lock(env, monkeypatch):
+    """A read the body makes that takes 2 s (the per-read cap 30 s, the slice 1 s) runs between rounds,
+    never while a round holds the lock, and the finish still uses its answer."""
+    s, holds, lines, walls = _finish_holds(env, monkeypatch, True, n=20, warm=False, delay=0.0,
+                                           slow="*for-each-ref*refs/heads/*", slow_s=2.0)
+    assert max(h for h, _ in holds) <= 1.5, holds
+    assert s.p.db.task(s.code)["status"] == "done"
+    calls = [ln for ln in (env["tmp"] / "git-calls.log").read_text().splitlines() if "for-each-ref" in ln
+             and "refs/heads/" in ln]
+    assert calls, "the body made no for-each-ref read"
+    assert any(not ok for _, ok in holds), holds
