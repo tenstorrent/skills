@@ -20,6 +20,15 @@ A lift that changes the stored tier moves the task's budget to the new tier's de
 old tier's default (an explicit budget stays), sets tier_source `conclusion_floor` and adds one spec
 note, e.g. '[tier floor] light->standard, effort low->high (conclusion: kind question)', which `ttp task
 show`, the coordinator digest and the web app show.
+
+Known gaps (accepted, settled area sa38):
+1) tests/tt_project_runtime/tierfloor_cases.py::test_a_conclusion_runs_effort_floor_lifts_a_low_tier_effort_as_the_provider_takes_it
+   checks only the effort passed to the provider build, not the runner spec's pin. Removing
+   `pin["effort"] = lifted` in Daemon.start_run would not fail it.
+2) LINE (^[ \t>*#\d.)-]*conclusion\s*:) also matches date- or number-prefixed lines such as
+   '2026-11-02 conclusion:'. Over-inclusion only lifts the run to the floor (a small extra cost, no lost work).
+3) The floor effort is resolved per provider (failover.kept_effort), not per pinned model, so a
+   pinned model that takes no 'high' effort could be refused by the runner's pin check.
 """
 from __future__ import annotations
 
