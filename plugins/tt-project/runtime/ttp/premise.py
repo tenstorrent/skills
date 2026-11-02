@@ -22,6 +22,10 @@ Model-free, from Daemon.reconcile_tasks and the start of each dispatch pass (ten
 - a pending question whose code task ended (done, failed, cancelled) and that has not started is
   cancelled: nobody reads its answer.
 
+While it waits, the code task's own check is no lane holder (lanewait.holders): it raises no
+lane_wait event. The question is a task of its own: a stuck run of it is stopped at its tier's
+stall_s and its no_progress key names it, and one dispatch never starts is Daemon.check_stall's.
+
 The question's own done event is handled (it starts no coordinator turn): what follows is the code
 task's own run or its close.
 """
@@ -55,6 +59,11 @@ def _labels(task: dict) -> list:
     except (TypeError, ValueError):
         return []
     return got if isinstance(got, list) else []
+
+
+def pending(task: dict) -> int | None:
+    """The id of the premise check `task` still waits on (its `premise:<id>` label, not yet settled), or None."""
+    return next((int(m.group(1)) for x in _labels(task) if (m := PENDING.match(str(x)))), None)
 
 
 def is_check(task: dict) -> bool:
@@ -157,7 +166,7 @@ def tend(db) -> list[tuple[int, str]]:
     for t in db.q("SELECT * FROM tasks WHERE kind='code' AND status IN ('queued','blocked') "
                   "AND (spec LIKE '%premise:%' OR labels LIKE '%\"premise:%')"):
         labels = [str(x) for x in _labels(t)]
-        pend = next((int(m.group(1)) for x in labels if (m := PENDING.match(x))), None)
+        pend = pending(t)
         if pend is not None:
             if (got := _settle(db, t, pend)) is not None:
                 done.append((t["id"], f"premise {got} (#{pend})"))

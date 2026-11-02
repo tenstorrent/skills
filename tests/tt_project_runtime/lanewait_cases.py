@@ -207,6 +207,32 @@ def test_a_wait_on_a_user_only_condition_raises_no_lane_wait(env, labels):
     assert not p.db.q("SELECT * FROM events WHERE kind='lane_wait'")
 
 
+@pytest.mark.parametrize("case", ["premise_only", "premise_and_other", "premise_settled", "premise_only_dup"])
+def test_a_code_task_waiting_on_its_own_premise_check_raises_no_lane_wait(env, case):
+    """A holder the waiting task's pending `premise:<id>` label names is its own check, no lane: alone it
+    raises nothing; with another holder, or once the premise settled, the other holder still counts."""
+    from ttp import lanewait, premise
+    p = make(env)
+    q = p.db.add_task("premise check", "s", kind="question", status="running", labels=[f"{premise.CHECK_LABEL}0"])
+    other = p.db.add_task("the holder", "s", kind="code", status="running")
+    label = f"{premise.LABEL}{q}" + (":holds" if case == "premise_settled" else "")
+    deps = {"premise_only": [q], "premise_only_dup": [q], "premise_and_other": [q, other],
+            "premise_settled": [q, other]}[case]
+    labels = [label] + ([f"waits_end:{q}"] if case == "premise_only_dup" else [])
+    if case == "premise_settled":
+        p.db.update_task(q, status="done")
+    dep = p.db.add_task("the waiter", "s", kind="code", status="queued", depends_on=deps, labels=labels)
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (time.time() - 3 * 3600, dep))
+    for _ in range(2):
+        lanewait.check(p.db, {}, time.time())
+    ev = p.db.q("SELECT * FROM events WHERE kind='lane_wait'")
+    if case.startswith("premise_only"):
+        assert not ev and not p.db.kv(lanewait.KEY, {})
+        return
+    assert len(ev) == 1 and ev[0]["task"] == dep and json.loads(ev[0]["data"])["holders"] == [other]
+    assert f"#{other} the holder (running" in ev[0]["text"] and f"#{q} " not in ev[0]["text"]
+
+
 def test_the_lane_wait_threshold_defaults_to_600_s_from_config(env):
     """Criterion 5: waiting.lane_wait_event_s, default 600, in the project defaults too."""
     from ttp import lanewait

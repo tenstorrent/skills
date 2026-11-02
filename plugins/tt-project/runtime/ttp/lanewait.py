@@ -18,7 +18,10 @@
   (600; 0: never) raises one event, naming both tasks, the holder's status and the hours so far. It
   wakes the coordinator once per wait and is cleared (handled) once the task starts or no longer
   waits on a task. A start_when with no task in it (a secret, a sign-in, a cadence: the user's say)
-  or a start_after still ahead is no lane wait. Known gap, accepted: a probe naming a task and
+  or a start_after still ahead is no lane wait. Nor is the task's own pending premise check (the
+  question its `premise:<id>` label names, premise.py): any other holder still counts. A premise
+  question that never ends is caught as any task is: a stuck run by its tier's stall_s and the
+  progress check's no_progress key, a question dispatch never starts by Daemon.check_stall. Known gap, accepted: a probe naming a task and
   something else counts as a lane wait."""
 from __future__ import annotations
 
@@ -107,6 +110,7 @@ def threshold(cfg: dict) -> float:
 def holders(db, t: dict, unmet: list, now: float) -> list[tuple[int, str]]:
     """(holder id, how) of each other task queued task `t` waits on; [] when it waits on something
     else too that is not a task (a start_when naming none, a start_after ahead)."""
+    from .premise import pending
     from .worktree import lineage_hold
     when = deferral(t).get("when")
     refs = [int(r) for r in landed.task_refs(when) if r.isdigit()]
@@ -118,7 +122,8 @@ def holders(db, t: dict, unmet: list, now: float) -> list[tuple[int, str]]:
         out.append((h, "waits_end"))
     # A failed, cancelled or missing holder is a dead wait, raised on its own (dead_dependency,
     # missing_task_ref, deferral_probe_broken).
-    return [x for x in dict.fromkeys(out) if x[0] != t["id"]
+    own = pending(t)   # its own premise check: no other task's lane
+    return [x for x in dict.fromkeys(out) if x[0] not in (t["id"], own)
             and (h := db.task(x[0])) and h["status"] not in ("failed", "cancelled")]
 
 
