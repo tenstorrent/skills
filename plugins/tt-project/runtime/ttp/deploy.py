@@ -138,11 +138,16 @@ def pending_cleared(db, name: str) -> str | None:
 
 
 def _post_pending(p, name: str, text: str, now: float) -> None:
-    """Post or update in place the project's one pending-deploy status line."""
+    """Post or update in place the project's one pending-deploy status line: a feed line (kind 'info',
+    housekeeping, never a user alert) that opens its own status episode, so the sweep clears it."""
+    from . import alerts
     key = pending_key(name)
     ep = p.db.one("SELECT id, message FROM alerts WHERE key=? AND cleared IS NULL ORDER BY id DESC LIMIT 1", (key,))
     if not ep:
-        p.db.post("out", text, kind="alert", severity="low", ref=key)
+        with p.db.tx():
+            mid = p.db.post("out", text, kind="info", severity="low", ref=key)
+            ts = p.db.one("SELECT ts FROM messages WHERE id=?", (mid,))["ts"]
+            alerts.open_episode(p.db, key, ts, mid, "low", text)
         return
     p.db.x("UPDATE alerts SET text=?, last=? WHERE id=?", (text[:2000], now, ep["id"]))
     if ep["message"]:

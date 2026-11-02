@@ -8033,7 +8033,7 @@ def test_after_push_with_every_lagging_project_owned_pending_exits_0_with_one_lo
         'self': 'done', 'alpha': 'pending', 'beta': 'pending', 'gamma': 'pending', 'delta': 'pending'}
     out = p.db.q("SELECT kind,severity,ref,text FROM messages WHERE direction='out' ORDER BY ref")
     assert [(m['kind'], m['severity'], m['ref']) for m in out] == [
-        ('alert', 'low', f'deploy-pending:{n}') for n in ('alpha', 'beta', 'delta', 'gamma')]
+        ('info', 'low', f'deploy-pending:{n}') for n in ('alpha', 'beta', 'delta', 'gamma')]
     assert all(m['text'].startswith(n) and '0.5.0' in m['text'] for n, m in zip(('alpha', 'beta', 'delta', 'gamma'), out))
     assert [a['severity'] for a in p.db.q('SELECT severity FROM alerts')] == ['low'] * 4
     p.db.x("INSERT INTO push_batches(id,marker,target,started) VALUES(?,?,?,?)",

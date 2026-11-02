@@ -2763,7 +2763,7 @@ def test_deploy_pending_is_one_live_line_per_project_that_a_newer_release_update
         result = deploy.record(p, overview.deployed(names=['alpha']), now + i)
         assert result['rc'] == 0 and result['projects'][0]['outcome'] == 'pending', result
     out = p.db.q("SELECT kind,severity,ref,text FROM messages WHERE direction='out'")
-    assert [(m['kind'], m['severity'], m['ref']) for m in out] == [('alert', 'low', 'deploy-pending:alpha')]
+    assert [(m['kind'], m['severity'], m['ref']) for m in out] == [('info', 'low', 'deploy-pending:alpha')]
     assert out[0]['text'].startswith('alpha will switch to tt-project 0.5.2 by ')
     assert f'(it waits for harness task #{tid} to finish).' in out[0]['text'] and '0.5.1' not in out[0]['text']
     eps = p.db.q('SELECT key,severity,cleared FROM alerts')

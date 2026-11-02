@@ -179,4 +179,4 @@ def test_a_pending_deploy_is_a_feed_line_not_an_alert(env, tmp_path):
     report = overview.deployed(names=['alpha'])
     report['projects'][0]['takeover_at'] = now + 3600
     assert deploy.record(p, report, now)['projects'][0]['outcome'] == 'pending'
-    _no_alert_and_in_feed(p, "deploy pending")
+    _no_alert_and_in_feed(p, "alpha will switch to tt-project 0.5.0 by")
