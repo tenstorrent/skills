@@ -6120,8 +6120,8 @@ def _ask_charter_approval(p: Project, section: str, quote: str, replaces: str, t
     remove (_REMOVAL_ASK_RE), never one to reword the item. Only the user's own verbatim words that
     resolved it count (_users_own, relay.split: never a relayer's context, a finding or the harness's
     own message), sent after the ask and within `days`. With relay.agent_orders on, the owner's own agent's
-    clear yes (its context or findings) counts too, recorded with `agent` set (relayer-ordered), unless the
-    ask is in a relay.HELD class (_held_ask). Recorded once as an approval of that change (`ask` set,
+    clear yes (its context or findings) counts too, recorded with `agent` set (relayer-ordered), only when
+    the answering messages hold no verbatim words of the owner's and the ask is in no relay.HELD class (_held_ask). Recorded once as an approval of that change (`ask` set,
     `from_ask`), so it is used once like any other; None if no such ask, or it is recorded."""
     db = p.db
     agent = relay.agent_orders(p.config())
@@ -6140,11 +6140,12 @@ def _ask_charter_approval(p: Project, section: str, quote: str, replaces: str, t
         if not row or not all(w and w in asked for w in wants) or not (text or _REMOVAL_ASK_RE.search(asked)):
             continue
         ids = [int(m) for m in r.get("messages") or []]
-        said = [m for m in (_users_own(db, ids) if not agent else [x["id"] for x in relay.recent(db, ids)]) if m > aid]
+        said = [m for m in (_users_own(db, ids) if not agent else   # never empty into relay.recent (whole window)
+                            [x["id"] for x in (relay.recent(db, ids) if ids else [])]) if m > aid]
         rows = db.q(f"SELECT ts, text, context FROM messages WHERE id IN ({','.join('?' * len(said))})",
                     said) if said else []
         words = " ".join(relay.split(m["text"], m["context"])[0] for m in rows).strip()
-        by_agent = agent and not (words and prguard.clear_yes(words)) and not _held_ask(row, text)
+        by_agent = agent and not words and not _held_ask(row, text)   # the owner's own words, any, outrank it
         if by_agent:   # the owner's agent's yes: the owner's (relay.agent_orders)
             words = " ".join(relay.split(m["text"], m["context"])[1] for m in rows).strip()
         if not words or not prguard.clear_yes(words) or time.time() - max(m["ts"] for m in rows) > days * 86400:

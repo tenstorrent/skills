@@ -11864,6 +11864,34 @@ def test_agent_mode_applies_the_owners_agents_order_and_refuses_each_held_class(
     assert chat in p.charter_path.read_text()
 
 
+
+def test_agent_mode_ask_approval_needs_its_own_messages_and_yields_to_the_owners_words(env):
+    """In agent mode the agent's yes approves a charter ask only from the messages that resolved it: an ask
+    resolved with none (messages []) never reads the last hour's relayed context, and the owner's own
+    verbatim words in the answer, if any and not a clear yes ('no, keep it', 'hmm'), outrank the agent's
+    'yes'. Empty verbatim words with the agent's yes still resolve it."""
+    from ttp import relay, unblock
+    from ttp import coordinator as coord
+    p = make(env)
+    db = p.db
+    db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    disk = "Never fill the scratch disk past half. (user msg #1)"
+    wide = "- Never fill the scratch disk past three quarters."
+    base = p.charter_path.read_text() + f"\n## Restrictions\n- {disk}\n"
+    p.set_config(relay.AGENT_KEY, True)
+    act = {"type": "charter_update", "section": "Restrictions", "quote": disk, "text": wide}
+    for n, (words, linked) in enumerate((("", False), ("no, keep it", True), ("hmm", True), ("", True))):
+        p.charter_path.write_text(base)
+        aid = db.post("out", f"May I change the Restrictions item '{disk}' to '{wide}'?", kind="ask")
+        mid = db.post("in", words, chat="cli", provenance="cli-legacy", context="yes, go ahead")
+        db.set_kv(unblock.RESOLVED_KEY, {str(aid): {"messages": [mid] if linked else []}})
+        problems = coord.apply(p, [act], turn=30 + n)
+        ordered = db.one("SELECT id FROM events WHERE kind=? AND text LIKE ?", (relay.ORDERED_KIND, f"%#{mid}%"))
+        if linked and not words:
+            assert problems == [] and wide in p.charter_path.read_text() and ordered, problems
+        else:
+            assert problems and disk in p.charter_path.read_text() and not ordered, (words, linked, problems)
+
 def test_removing_a_cited_restriction_in_a_user_turn_needs_a_source_from_that_turns_words(env):
     """A user turn removes or replaces a cited Restrictions item only with `source` {msg, quote} quoting
     that turn's verbatim user words (any wording), agent mode on or off: none, a quote found only in the
