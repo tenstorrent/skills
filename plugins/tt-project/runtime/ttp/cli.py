@@ -3493,6 +3493,8 @@ def _checks_report_joined(me: Path | None, run_dir: Path, out, joined: tuple, he
     how, lead = joined
     o = lead.get("outcome") or {}
     passed, ran = bool(o.get("passed")), str(o.get("head") or "")
+    if how == checkjoin.JOINED and lead.get("key") != (checkjoin.read(me) or {}).get("key"):
+        how = checkjoin.SUPERSEDED   # the run joined was itself superseded: another tree ran
     ran = head if how == checkjoin.JOINED else ran
     checkjoin.finish(me, passed=passed, head=ran, rc=int(o.get("rc") or (0 if passed else 1)),
                      failed=str(o.get("failed") or ""), timed_out=bool(o.get("timed_out")),

@@ -505,3 +505,32 @@ def test_a_waiting_full_checks_run_reads_pids_once_per_poll_cycle(env, tmp_path,
     finally:
         holder.kill()
         holder.wait()
+
+
+def test_a_run_that_joined_one_later_superseded_never_reports_the_newer_trees_pass_as_its_own(env, tmp_path,
+                                                                                            monkeypatch, capsys):
+    from ttp import checkjoin
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_TASK", "7")
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.02")
+    newer = "b" * 40
+    lead_proc = subprocess.Popen(["sleep", "300"])
+    try:
+        leads = _fake_lead(monkeypatch, tmp_path, lead_proc.pid, phase=checkjoin.WAITING)
+        ran = tmp_path / "ran"
+        t, got = _main_in_thread(["checks", "--", "sh", "-c", f"touch {ran}"])
+        assert _wait_for(lambda: checkjoin.JOINED in _join_phases(p), 30), _join_phases(p)
+        lead = checkjoin.read(leads[0])
+        top = checkjoin.register(p.state, task="8", head=newer, commit_ts=lead["commit_ts"] + 60, key="newer-key",
+                                 group="g8", run="run-new", arrived=lead["arrived"], pid=lead_proc.pid)
+        checkjoin.update(leads[0], phase=checkjoin.SUPERSEDED, follows=checkjoin.read(top)["id"])
+        checkjoin.finish(top, passed=True, head=newer, rc=0)
+        t.join(60)
+    finally:
+        lead_proc.kill()
+        lead_proc.wait()
+    own = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    assert got == [0] and not ran.exists()
+    res = json.loads((run / "checks.json").read_text())
+    assert res["head"] == newer != own and res["joined"]["how"] == "superseded", res
+    assert f"{own[:12]} itself was not checked" in capsys.readouterr().out
