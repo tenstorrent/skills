@@ -6,15 +6,13 @@ from __future__ import annotations
 
 def test_outbox_entry_after_a_torn_last_line_is_kept_and_the_fragment_moves_to_corrupt(env):
     from ttp import outbox
-    with outbox.locked("demo"):
-        e1 = outbox.add("demo", ["say", "one"], "id-1", None)
-        outbox.add("demo", ["say", "two"], "id-2", None)
+    e1 = outbox.add("demo", ["say", "one"], "id-1", None)
+    outbox.add("demo", ["say", "two"], "id-2", None)
     p = outbox.path("demo")
     line1 = p.read_bytes().split(b"\n")[0] + b"\n"
     os.truncate(p, len(line1) + 20)    # the power cut tore entry 2's line
     fragment = p.read_bytes()[len(line1):].decode()
-    with outbox.locked("demo"):
-        e3 = outbox.add("demo", ["say", "three"], "id-3", None)
+    e3 = outbox.add("demo", ["say", "three"], "id-3", None)
     assert outbox.entries("demo") == [e1, e3]
     with outbox.locked("demo"):
         outbox.drop("demo", "id-1")
@@ -29,8 +27,7 @@ def test_outbox_entry_after_a_torn_last_line_is_kept_and_the_fragment_moves_to_c
 
 def test_outbox_rejected_file_append_after_a_torn_tail_stays_parsable(env):
     from ttp import outbox
-    with outbox.locked("demo"):
-        outbox.add("demo", ["say", "one"], "id-1", None)
+    outbox.add("demo", ["say", "one"], "id-1", None)
     rej = outbox.folder() / "demo.rejected.jsonl"
     rej.write_text('{"id": "old", "rej')
     with outbox.locked("demo"):
