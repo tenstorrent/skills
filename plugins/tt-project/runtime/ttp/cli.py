@@ -700,6 +700,11 @@ def bootstrap(root: Path, name: str, brief: str, provider: str, home_tz: str | N
     _git(p.harness, "-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost", "commit", "-q",
          "-m", f"project {name}: charter and config")
     db = p.db
+    # project.json was written before the database existed: record its keys now, so they read as
+    # the harness's defaults, never as unknown.
+    from . import configwho
+    for key in cfg:
+        configwho.record(db, key, configwho.by("default", via="project creation"), after=cfg)
     for s in json.loads((template / "recurring.json").read_text()):
         sched.upsert(db, s["name"], s["kind"], s["every"], s.get("at"), s.get("enabled", True),
                      s.get("budget_usd_day"), s.get("description", ""), s.get("payload", {}), cfg[timefmt.KEY])

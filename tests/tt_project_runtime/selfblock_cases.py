@@ -490,3 +490,31 @@ def test_load_caps_migration_removing_two_keys_of_one_section_keeps_the_sections
     write_json(p.config_path, raw)
     assert "review.sweep_after_s 1800" in cli._migrate_load_caps(p)
     assert configwho.role(who("review.max_rounds")) == "unknown"
+
+
+def test_config_keys_project_creation_writes_read_as_default_not_unknown(env, monkeypatch):
+    make(env)
+    from ttp import configwho, timefmt
+    from ttp.cli import bootstrap
+    from ttp.project import write_json
+    monkeypatch.setattr("ttp.cli.load_secrets", lambda: {"slack": {"bot_token": "x"}})
+    repo2 = env["tmp"] / "repo2"
+    subprocess.run(["git", "clone", "-q", str(env["repo"]), str(repo2)], check=True)
+    q = bootstrap(repo2, "second", "Another project.", "fake", "Europe/Paris", "box-a")
+
+    def who(key):
+        return configwho.lookup(q.db, key, q.raw_config())
+
+    raw = q.raw_config()
+    assert raw["notify"] == {"slack": True} and raw[timefmt.KEY] == "Europe/Paris"
+    for key in list(raw) + ["notify.slack", "providers.claude.worker_isolation"]:
+        rec = who(key)
+        assert (configwho.role(rec), (rec or {}).get("via")) == ("default", "project creation"), (key, rec)
+    assert configwho.describe(who(timefmt.KEY)).startswith("default via project creation")
+    # A hand edit after creation: unknown; a later recorded user set: the user's.
+    raw["notify"] = {"slack": False}
+    write_json(q.config_path, raw)
+    assert configwho.role(who("notify.slack")) == "unknown"
+    q.set_config(timefmt.KEY, "Asia/Tokyo", by=configwho.by("user", via="cli"))
+    assert configwho.role(who(timefmt.KEY)) == "user"
+    assert configwho.role(who(timefmt.FROM_KEY)) == "default"
