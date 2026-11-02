@@ -13901,3 +13901,165 @@ def test_needed_index_agrees_with_needed_by():
         tasks = one("", **extra)
         assert worktree.NeededIndex(tasks).needed({"id": 7, "branch": None}) is tasks[0]
     assert worktree.NeededIndex(one("#9", id=9)).needed({"id": 9, "branch": None}) is None   # never itself
+
+
+def _carry_repo(env, monkeypatch, upstream: dict, own2: dict | None = None):
+    """A change (H1 on tip T1) writing src/a.py, then upstream commits writing `upstream` (T2) and the
+    change rebased onto T2 (H2), or `own2` written instead when given: (repo, T1, H1, T2, H2)."""
+    for var, val in (("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"),
+                     ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")):
+        monkeypatch.setenv(var, val)
+    repo = env["tmp"] / "carry"
+    repo.mkdir()
+    _git_out(repo, "init", "-q", "-b", "main")
+    for path, text in {"src/a.py": "a = 1\n", "docs/x.md": "x\n", "notes/n.md": "n\n"}.items():
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (repo / path).write_text(text)
+    _git_out(repo, "add", "-A")
+    _git_out(repo, "commit", "-qm", "base")
+    t1 = _git_out(repo, "rev-parse", "HEAD")
+
+    def commit(files, msg):
+        for path, text in files.items():
+            (repo / path).parent.mkdir(parents=True, exist_ok=True)
+            (repo / path).write_text(text)
+        _git_out(repo, "add", "-A")
+        _git_out(repo, "commit", "-qm", msg)
+        return _git_out(repo, "rev-parse", "HEAD")
+
+    _git_out(repo, "checkout", "-q", "-b", "change")
+    h1 = commit({"src/a.py": "a = 2\n"}, "change")
+    _git_out(repo, "checkout", "-q", "main")
+    t2 = commit(upstream, "upstream")
+    _git_out(repo, "checkout", "-q", "-b", "rebased")
+    h2 = commit(own2 or {"src/a.py": "a = 2\n"}, "change")
+    return repo, t1, h1, t2, h2
+
+
+@pytest.mark.parametrize("upstream, check, exclude, carries", [
+    ({"docs/x.md": "y\n"}, {"run": "pytest", "ignore_paths": ["docs/**"]}, [], True),
+    ({"docs/x.md": "y\n"}, {"run": "pytest", "ignore_paths": "docs"}, [], True),
+    ({"notes/n.md": "m\n"}, {"run": "pytest"}, ["notes/**"], True),            # push_exclude_paths
+    ({"docs/x.md": "y\n"}, {"run": "pytest", "if_changed": "src/**"}, [], True),   # outside if_changed
+    ({"docs/x.md": "y\n"}, {"run": "pytest"}, [], False),                      # covers everything
+    ({"src/b.py": "b\n"}, {"run": "pytest", "ignore_paths": ["docs/**"]}, [], False),
+    ({"src/b.py": "b\n"}, {"run": "pytest", "if_changed": "src/**"}, [], False),
+    ({"docs/x.md": "y\n", "src/b.py": "b\n"}, {"run": "pytest", "ignore_paths": ["docs/**"]}, [], False),
+])
+def test_a_check_pass_carries_across_a_rebase_only_when_the_delta_misses_what_it_covers(
+        env, monkeypatch, upstream, check, exclude, carries):
+    from ttp import push, verdictcarry
+    repo, t1, h1, t2, h2 = _carry_repo(env, monkeypatch, upstream)
+    (c,) = push.check_list([check])
+    got = verdictcarry.carry(repo, c, t1, h1, t2, h2, exclude)
+    assert (got is not None) == carries, got
+    if carries:
+        assert got == sorted(upstream)
+        assert verdictcarry.line(h1, got) == f"verdict carried from {h1[:10]}; upstream delta touched only: {', '.join(sorted(upstream))}"
+
+
+def test_a_check_pass_never_carries_when_the_rebase_changed_the_changes_own_diff(env, monkeypatch):
+    """The same delta, but the change rebased with other content (a conflict resolved by hand): the
+    check runs again, also when the own diff differs only in a path the check ignores, or only in
+    whitespace (patch ids ignore it; the byte comparison of covered files does not)."""
+    from ttp import push, verdictcarry
+    (c,) = push.check_list([{"run": "pytest", "ignore_paths": ["docs/**"]}])
+    for own2 in ({"src/a.py": "a = 3\n"}, {"src/a.py": "a = 2\n", "docs/x.md": "z\n"}, {"src/a.py": "a  = 2\n"}):
+        shutil.rmtree(env["tmp"] / "carry", ignore_errors=True)
+        repo, t1, h1, t2, h2 = _carry_repo(env, monkeypatch, {"docs/x.md": "y\n"}, own2)
+        assert verdictcarry.carry(repo, c, t1, h1, t2, h2) is None, own2
+    # A commit git cannot read never carries.
+    assert verdictcarry.carry(repo, c, t1, "0" * 40, t2, h2) is None
+    assert verdictcarry.carry(repo, c, "", h1, t2, h2) is None
+
+
+def test_ignore_paths_is_a_check_key_that_never_narrows_what_a_check_runs_on(env, monkeypatch):
+    from ttp import push
+    (c,) = push.check_list([{"run": "pytest -q tests", "ignore_paths": ["docs/**", "site"]}])
+    assert c.ignore_paths == ("docs/**", "site") and not c.if_changed
+    assert c.config() == {"run": "pytest -q tests", "ignore_paths": ["docs/**", "site"]}
+    assert push.check_problems([c.config()]) == []
+    for bad in ("/abs", "../out", [], ["ok", "/abs"], 5):
+        assert push.check_problems([{"run": "true", "ignore_paths": bad}]), bad
+    # A head touching only ignored paths still runs the check: ignore_paths decides only reuse.
+    p, repo, origin, other = _push_setup(env, monkeypatch, [{"run": "true", "ignore_paths": ["docs/**"]}])
+    (repo / "docs").mkdir()
+    _commit(repo, "docs/a.md", "d\n")
+    todo, skipped = push.applicable(repo, "HEAD", push.check_list(p.config()["delivery"]["push_checks"]),
+                                    lambda m: None, _git_out(repo, "rev-parse", "origin/proj"))
+    assert [str(t) for t in todo] == ["true"] and not skipped
+
+
+def _docs_mover(env, path="docs/late.md"):
+    """A check command that, the first time it runs, pushes a commit writing `path` to the target from
+    the second clone (someone else pushing during the checks)."""
+    once = env["tmp"] / "moved"
+    return (f"test -e {once} || (touch {once} && cd {env['tmp'] / 'other'} && git pull -q --rebase origin proj"
+            f" && mkdir -p $(dirname {path}) && echo x >> {path} && git add {path} && git commit -qm late"
+            " && git push -q origin HEAD:proj)")
+
+
+@pytest.mark.parametrize("ignored", [True, False])
+def test_ttp_push_carries_a_pass_onto_a_tip_that_moved_only_in_ignored_paths(env, monkeypatch, capsys, ignored):
+    """The tip moves during the checks by a commit touching only docs/: with docs/** ignored the next
+    round carries the pass (no rerun) and the push record says so; without, the check runs again."""
+    from ttp import push
+    log = env["tmp"] / "checked"
+    check = {"run": f"git rev-parse HEAD >> {log} && {_docs_mover(env)}"}
+    if ignored:
+        check["ignore_paths"] = ["docs/**"]
+    p, repo, origin, other = _push_setup(env, monkeypatch, [check])
+    _commit(repo, "mine.txt", "mine\n")
+    first = _git_out(repo, "rev-parse", "HEAD")
+    assert _ttp_push() == 0
+    err = capsys.readouterr().err
+    assert "round 2" in err
+    assert _git_out(origin, "show", "proj:docs/late.md") == "x" and _git_out(origin, "show", "proj:mine.txt") == "mine"
+    runs = log.read_text().split()
+    if ignored:
+        assert runs == [first], "the pass carried: the check did not run again"
+        line = f"verdict carried from {first[:10]}; upstream delta touched only: docs/late.md: {check['run']}"
+        assert line in err and push.last_carried == [line]
+    else:
+        assert len(runs) == 2 and "verdict carried" not in err and push.last_carried == []
+
+
+@pytest.mark.parametrize("ignored", [True, False])
+def test_a_push_batch_carries_a_pass_onto_a_tip_that_moved_only_in_ignored_paths(env, monkeypatch, capsys, ignored):
+    """The push queue's batch, its target moving during the checks by a docs-only commit: with docs/**
+    ignored the replayed head of round 2 carries the recorded pass and the marker shows it; the pass
+    is recorded for the new tree too. Without, the check runs again."""
+    log = env["tmp"] / "checked"
+    check = {"run": f"git rev-parse HEAD >> {log} && {_docs_mover(env)}"}
+    if ignored:
+        check["ignore_paths"] = ["docs/**"]
+    p, repo, origin, other = _push_setup(env, monkeypatch, [check])
+    heads = [_entry(repo, "e1", {"f1.txt": "1\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and m["rounds"] == 2, m
+    assert _git_out(origin, "show", "proj:docs/late.md") == "x" and _git_out(origin, "show", "proj:f1.txt") == "1"
+    runs = log.read_text().split()
+    out = capsys.readouterr().out
+    if ignored:
+        assert len(runs) == 1, "the pass carried: the check did not run again"
+        line = f"verdict carried from {runs[0][:10]}; upstream delta touched only: docs/late.md: {check['run']}"
+        assert m["checks"]["carried"] == [line] and line in out
+    else:
+        assert len(runs) == 2 and "carried" not in m["checks"]
+
+
+def test_the_coordinator_and_guide_state_the_verdict_carry_rule_without_a_user_step():
+    import re
+    root = Path(__file__).resolve().parents[1] / "plugins" / "tt-project"
+    prompt = (root / "template" / "prompts" / "coordinator.md").read_text()
+    guide = (root / "docs" / "guide.md").read_text()
+    for text in (prompt, guide):
+        flat = " ".join(text.split())
+        assert "ignore_paths" in flat and "not a rescoping" in flat
+    flat = " ".join(prompt.split())
+    para = flat[flat.index("A pass carries across a rebase"):][:600]
+    assert "set it yourself" in para and "never ask the user" in para
+    for text in (prompt, guide):
+        for sentence in re.split(r"(?<=[.;])\s", " ".join(text.split())):
+            if re.search(r"carr(y|ies|ied)|ignore_paths", sentence) and re.search(r"verdict|pass", sentence):
+                assert "user's word" not in sentence and "user's yes" not in sentence, sentence

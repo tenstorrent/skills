@@ -81,10 +81,13 @@ class Check(str):
     runs it in the worktree being checked instead, for a check that needs build outputs or a venv made
     there, and `ttp checks` labels its pass as not run from a clean tree. `"silent_s": <seconds>` is how long
     `ttp checks` lets it run with no new output before stopping it as hung (checkwall.SILENT_S by default; 0
-    turns it off), for a check that is silent longer by design. `wrap` (with_wrap, never part
-    of the config form) is the argv a local check runs behind: `checks.wrap_cmd` for the commands after `--`."""
+    turns it off), for a check that is silent longer by design. `"ignore_paths": "<glob or list>"` names
+    paths the check cannot be affected by: it decides only whether a pass carries across a rebase
+    (verdictcarry), never what the check covers or whether it runs on a fresh head. `wrap` (with_wrap,
+    never part of the config form) is the argv a local check runs behind: `checks.wrap_cmd` for the commands after `--`."""
     if_exists = ""
     if_changed: tuple[str, ...] = ()
+    ignore_paths: tuple[str, ...] = ()
     purpose = ""
     host = ""
     env: tuple[tuple[str, str], ...] = ()
@@ -97,7 +100,7 @@ class Check(str):
     def config(self) -> str | dict:
         """The form project.json keeps."""
         if not (self.if_exists or self.if_changed or self.purpose or self.host or self.env or not self.sandbox
-                or self.cwd or self.silent_s is not None):
+                or self.cwd or self.silent_s is not None or self.ignore_paths):
             return str(self)
         out: dict = {"run": str(self)}
         if self.if_exists:
@@ -116,10 +119,12 @@ class Check(str):
             out["cwd"] = self.cwd
         if self.silent_s is not None:
             out["silent_s"] = self.silent_s
+        if self.ignore_paths:
+            out["ignore_paths"] = list(self.ignore_paths)
         return out
 
 
-CHECK_KEYS = {"run", "if_exists", "if_changed", "purpose", "host", "env", "sandbox", "cwd", "silent_s"}
+CHECK_KEYS = {"run", "if_exists", "if_changed", "purpose", "host", "env", "sandbox", "cwd", "silent_s", "ignore_paths"}
 PURPOSES = ("candidate", "harness")   # `ttp checks --purpose`; candidate is the default and publication evidence
 
 
@@ -155,6 +160,7 @@ def _check(c: Any) -> Check | None:
         out.sandbox = c.get("sandbox") is not False
         out.cwd = "" if c.get("cwd") in (None, "clean") else c["cwd"]
         out.silent_s = c.get("silent_s")
+        out.ignore_paths = _globs(c.get("ignore_paths"))
     return out
 
 
@@ -328,7 +334,11 @@ def _if_exists(c: dict) -> str:
 
 def _if_changed(c: dict) -> tuple[str, ...]:
     """The check's `if_changed` globs (one string or a list), normalized as `_if_exists`."""
-    v = c.get("if_changed")
+    return _globs(c.get("if_changed"))
+
+
+def _globs(v: Any) -> tuple[str, ...]:
+    """Repo-relative globs from one string or a list, normalized as `_if_exists`."""
     globs = [v] if isinstance(v, str) else v if isinstance(v, list) else []
     return tuple(posixpath.normpath(g.strip()) for g in globs if isinstance(g, str) and g.strip())
 
@@ -1128,13 +1138,16 @@ def _form_problem(c: dict) -> str | None:
     extra = sorted(set(map(str, c)) - CHECK_KEYS)
     if extra:
         return (f"{c!r}: unknown key(s) {', '.join(extra)}; a check object takes only run, if_exists, if_changed, "
-                "purpose, host, env, sandbox, cwd and silent_s")
+                "purpose, host, env, sandbox, cwd, silent_s and ignore_paths")
     cond = c.get("if_exists")
     if cond is not None and not _inside(cond):
         return f"{c!r}: if_exists must be a path or glob inside the repository"
     cond = c.get("if_changed")
     if cond is not None and not (_inside(cond) or (isinstance(cond, list) and cond and all(map(_inside, cond)))):
         return f"{c!r}: if_changed must be a path or glob inside the repository, or a list of them"
+    cond = c.get("ignore_paths")
+    if cond is not None and not (_inside(cond) or (isinstance(cond, list) and cond and all(map(_inside, cond)))):
+        return f"{c!r}: ignore_paths must be a path or glob inside the repository, or a list of them"
     purpose = c.get("purpose")
     if purpose is not None and purpose not in PURPOSES:
         return f"{c!r}: purpose must be one of {', '.join(PURPOSES)} (leave it out to run it for both)"
@@ -3218,8 +3231,9 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
     lock = hold() if hold else None
     if hold and lock is None:
         return BUSY
-    global last_pushed, last_tip
+    global last_pushed, last_tip, last_carried
     last_pushed = last_tip = None
+    last_carried = []
     keep = published(repo, remote, branch)
     if keep:
         # The rebase would rewrite a branch the remote already has, and a later `ttp push --own` of
@@ -3241,6 +3255,7 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
 
 last_pushed: str | None = None   # the commit the last push() pushed; HEAD may be back on its branch
 last_tip: str | None = None      # the branch's tip that last push() pushed onto
+last_carried: list[str] = []     # verdictcarry.line of each check pass the last push() carried across a rebase
 last_reach: dict | None = None   # reach() of the last run(): whether it is on the branch it is meant to reach
 
 
@@ -3538,6 +3553,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             exclude: list[str] | None = None, check_run_dir: str | None = None, guard: bool = False) -> int:
     global last_pushed
     upstream = f"{remote}/{branch}"
+    passes: dict[str, tuple[str, str]] = {}   # check -> (tip, head) it last passed on in this push
     for rnd in range(1, rounds + 1):
         tip = _fetch(repo, remote, branch)
         if not tip:
@@ -3583,31 +3599,43 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         elif checks and not todo:
             say(f"{head[:10]}: {NONE_APPLY}; not pushing: {NONE_APPLY_FIX}")
             return CHECKS_FAILED
-        if todo and (why := runner_wait(todo, repo, check_env("target", tip, check_run_dir), say)):
+        # A pass from an earlier round carries when the rebase changed nothing the check covers.
+        run, carried = [], []
+        for cmd in todo:
+            was = passes.get(str(cmd))
+            delta = verdictcarry.carry(repo, cmd, *was, tip, head, exclude or []) if was else None
+            if delta is None:
+                run.append(cmd)
+            else:
+                carried.append(f"{verdictcarry.line(was[1], delta)}: {cmd}")
+                say(carried[-1])
+        if run and (why := runner_wait(run, repo, check_env("target", tip, check_run_dir), say)):
             return why
         try:
-            slot = check_slot(head, say, priority=priority_key(repo, remote, branch)) if todo else checkcap.Slot()
+            slot = check_slot(head, say, priority=priority_key(repo, remote, branch)) if run else checkcap.Slot()
         except checkcap.Unavailable as e:
             say(f"{e}; not pushing")
             return CHECKS_FAILED
         with slot:
             started = time.time()
             env = {**check_env("target", tip, check_run_dir), **slot.env()}
-            for line in sandbox_lines(todo):
+            for line in sandbox_lines(run):
                 say(line)
-            for cmd in todo:
+            for cmd in run:
                 if (rc := _run_one(cmd, repo, env, say)) != 0:
                     if rc != BUSY:
                         say(f"check failed on {head[:10]}: {cmd}{where(cmd)}; not pushing")
                     return rc
-        if todo and timed:
+        if run and not carried and timed:
             timed(time.time() - started)
+        passes = {str(cmd): (tip, head) for cmd in todo}
         if _fetch(repo, remote, branch) != tip:
             say(f"{upstream} moved during the checks; round {rnd + 1}")
             continue
         # Without --force the remote refuses anything that is not a fast-forward of what we tested on.
         if _git(repo, "push", remote, f"{head}:refs/heads/{branch}", quiet=False).returncode == 0:
             last_pushed, last_tip = head, tip
+            last_carried[:] = carried
             say(f"pushed {head[:10]} to {upstream}")
             return 0
         if _fetch(repo, remote, branch) == tip:
@@ -4185,6 +4213,8 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
     m.update(status="pushed" if rc == 0 else "failed", exit=rc, sha=sha, version=version, ended=time.time())
     if rc == 0 and not own and last_ff:
         m["fast_forward"] = last_ff
+    if rc == 0 and not own and last_carried:
+        m["carried"] = last_carried
     after = rc == 0 and not own and pending_after and after_set(p)
     if after:
         m["after_push"] = {"status": "running", "pid": os.getpid(), "started": time.time()}
@@ -4533,4 +4563,4 @@ def status_lines(p: Project) -> list[str]:
 # never inside a function: a push that outlives an upgrade of runtime/ must not import a newer batch
 # that calls into this older push (after_push would fail on a missing attribute). cli and pushpass
 # (for `ttp push --own` reusing a `ttp checks` pass) likewise: pushpass imports push at import time.
-from . import batch, cli, pushpass  # noqa: E402
+from . import batch, cli, pushpass, verdictcarry  # noqa: E402

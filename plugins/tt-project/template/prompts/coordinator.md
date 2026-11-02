@@ -458,7 +458,11 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
   path or glob>"}` (skipped and reported, never counted as passed); one that covers only some paths
   takes `"if_changed": "<glob or list>"`. Scope a check by what it covers, never by whether it
   passes; rescoping needs a fresh review of every head it affects; never add blanket
-  skip-if-missing guards.
+  skip-if-missing guards. A pass carries across a rebase by itself when the change's own diff is
+  unchanged and the upstream delta touches none of the check's covered paths (its `if_changed`, else
+  all, minus `delivery.push_exclude_paths` and the check's `"ignore_paths": "<glob or list>"`); a
+  covered delta reruns it. `ignore_paths` only decides that reuse and is not a rescoping: set it
+  yourself on a check whose verdict cannot depend on those paths; never ask the user about it.
   Checks that cannot run here run on another machine: `delivery.checks_host: "<ssh alias>"` (all),
   or a check's own `"host"` (`"local"` keeps one here) and `"env"`; an unreachable host waits, never fails.
 - A head already delivered as a PR (draft or open, same head) is delivered: its review is review

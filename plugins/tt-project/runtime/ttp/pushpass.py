@@ -9,7 +9,9 @@ they live) and the tip it was checked against, so another worktree of the same t
 passes are recorded: a failure, a check skipped by if_exists or if_changed and one never run leave nothing. The
 batch reads only what a batch recorded here, never the passes `ttp checks` records; it trusts the
 project's state as it trusts its own markers there, which name the heads it pushes. The store keeps
-the newest MAX entries younger than MAX_AGE_S.
+the newest MAX entries younger than MAX_AGE_S. A pass also keeps the head and tip it was checked on,
+so the same change rebased onto a newer tip can carry it (carriable, verdictcarry) when the rebase
+changed nothing the check covers.
 
 A check that is one plain pytest run also resumes (resumable): the ttp_pytest_resume plugin appends
 each test file whose every selected test passed to a file keyed the same way, and the next run of
@@ -37,7 +39,7 @@ from pathlib import Path
 from . import push
 from .project import Project, write_json
 
-STORE = "push_check_passes.json"     # under the project's state: {"passes": [{"key", "tree", "cmd", "batch", "ts", "parts"}]}
+STORE = "push_check_passes.json"     # under the project's state: {"passes": [{"key", "tree", "cmd", "batch", "ts", "parts", "head", "tip"}]}
 MAX, MAX_AGE_S = 200, 14 * 86400
 RESUME_DIR = "push_check_resume"     # under the project's state: <key>.txt, one passed test file per line
 RESUME_MAX, RESUME_MAX_AGE_S = 20, 3 * 86400
@@ -266,9 +268,24 @@ def missed(p: Project, tree: str, cmd: str, parts: dict) -> str:
     return ""
 
 
-def record(p: Project, tree: str, cmd: str, eid: str, batch: str, parts: dict | None = None) -> str:
-    """Record a pass (only ever a pass), with the part_digests of its env_parts when given; prune the
-    store. Returns why it could not, or ""."""
+def carriable(p: Project, cmd: str, parts: dict) -> list[dict]:
+    """The recorded passes of `cmd`, newest first, that keep their head and tip and ran in the
+    environment `parts` (env_parts) describes in every part but the tip: what verdictcarry may carry
+    to the same change on another tip."""
+    new = {k: v for k, v in part_digests(parts).items() if k != "tip"}
+    out = []
+    for e in reversed(_fresh(_load(p.state / STORE), time.time())):
+        old = e.get("parts")
+        if e.get("cmd") == cmd and e.get("head") and e.get("tip") and isinstance(old, dict) \
+                and {k: v for k, v in old.items() if k != "tip"} == new:
+            out.append(e)
+    return out
+
+
+def record(p: Project, tree: str, cmd: str, eid: str, batch: str, parts: dict | None = None,
+           head: str = "", tip: str = "") -> str:
+    """Record a pass (only ever a pass), with the part_digests of its env_parts and the head and tip
+    it was checked on when given; prune the store. Returns why it could not, or ""."""
     if not tree:
         return "no tree"
     path = p.state / STORE
@@ -278,7 +295,8 @@ def record(p: Project, tree: str, cmd: str, eid: str, batch: str, parts: dict | 
             fcntl.flock(guard, fcntl.LOCK_EX)
             now = time.time()
             entries = _load(path) + [{"key": key(tree, cmd, eid), "tree": tree, "cmd": cmd, "batch": batch, "ts": now,
-                                      **({"parts": part_digests(parts)} if parts else {})}]
+                                      **({"parts": part_digests(parts)} if parts else {}),
+                                      **({"head": head, "tip": tip} if head and tip else {})}]
             write_json(path, {"passes": _fresh(entries, now)})
     except OSError as e:
         return str(e)

@@ -1023,6 +1023,20 @@ queues behind routine work; nothing running is interrupted:
   catch-all check. If any of the skips came from `if_exists` instead, nothing checked the head and
   it fails as above. A check may set both keys; outside its declared scope it skips, but inside
   that scope a missing `if_exists` target fails rather than leaving the change unchecked.
+- A pass carries across a rebase without running again, decided by a fixed rule with no model and
+  no user step. When `ttp push` or the push queue rebases a change onto a tip that moved since its
+  checks passed, a check's pass on the old head counts for the new head if the change's own diff is
+  unchanged (same patch id, no conflict-resolution edits, the two heads differing only outside what
+  the check covers) and every file the new upstream commits changed lies outside what the check
+  covers. A check covers its `if_changed` globs if it has them, otherwise every path, and never a
+  path matched by `delivery.push_exclude_paths` or by its own `ignore_paths` (one glob or a list,
+  matched as `if_changed` is): `{"run": "pytest -q tests", "ignore_paths": ["docs/**"]}`. The push
+  output and the push record (the `carried` list of the push outcome; `checks.carried` in a push
+  queue batch marker) say `verdict carried from <sha>; upstream delta touched only: <paths>`. A
+  delta touching a covered path reruns the check as usual. `ignore_paths` only decides this reuse:
+  it never narrows what a check covers or whether it runs on a fresh head, so setting it is not a
+  rescoping and a coordinator may set it itself. Only passes the push or the push queue made carry,
+  never passes recorded by `ttp checks`.
 - Config warnings flag checks that pin a full commit SHA, use an absolute temporary environment,
   or name a target missing from the branch tip without `if_exists`. Declare applicability with
   `if_exists`/`if_changed` and retain coverage for the code the check protects. Warnings do not skip

@@ -49,7 +49,7 @@ from pathlib import Path
 
 from . import (checkcap, checkdirs, conflictfix, cyclenotice, envfault, locks, push, pushpass, runner, scopehold,
                scriptwatch,
-               sharedchecks, slowtests, suitecost, worktree)
+               sharedchecks, slowtests, suitecost, verdictcarry, worktree)
 from .project import Project, command_env, durable_write, write_json
 from . import gitmemo
 
@@ -66,6 +66,7 @@ NO_TESTS = 5                       # pytest's exit status when nothing was selec
 RERUN_S = 600.0                    # delivery.push_rerun_s: the time limit of one rerun of a failed check's failing tests
 RERUN_IDS = 10                     # a check failing more tests than this is not rerun: that is no flake
 TIP_RERUNS = 3                     # reruns on the tip alone of a blamed failure's failing tests: one failing clears the entry
+CARRY_TRIES = 5                    # recorded passes of one check on other tips tried for a carry (verdictcarry)
 OVER = re.compile(r"^E\s+assert (\d[\d_]*) <= (\d[\d_]*)\s*$")   # pytest's size-over-cap line
 SECTION = re.compile(r"^_{3,} (\S.*?) _{3,}$")                     # pytest's per-test failure header
 OVER_KEPT = 10                     # overshoot lines a check's tail keeps from its whole output
@@ -1139,6 +1140,11 @@ class Batch:
             if hit := pushpass.passed(self.p, tree, str(cmd), eid):
                 say(f"reused pass from {hit.get('batch') or '?'} (tree {tree[:10]}): {cmd}")
                 self.checks["reused"] = self.checks.get("reused", 0) + 1
+            elif carried := self._carried(head, cmd, parts):
+                say(f"{carried}: {cmd}")
+                self.checks.setdefault("carried", []).append(f"{carried}: {cmd}")
+                if why := pushpass.record(self.p, tree, str(cmd), eid, self.id, parts, head, self.tip or ""):
+                    say(f"could not record the pass of {cmd}: {why}")
             else:
                 if why := pushpass.missed(self.p, tree, str(cmd), parts):
                     say(f"not reusing a pass: {why}: {cmd}")
@@ -1180,7 +1186,7 @@ class Batch:
                             resume.unlink(missing_ok=True)
                         continue
                     return cmd, tail
-                if why := pushpass.record(self.p, tree, str(cmd), eid, self.id, parts):
+                if why := pushpass.record(self.p, tree, str(cmd), eid, self.id, parts, head, self.tip or ""):
                     say(f"could not record the pass of {cmd}: {why}")
                 if resume:
                     resume.unlink(missing_ok=True)
@@ -1195,6 +1201,18 @@ class Batch:
         except Exception as e:   # a cost note never fails a batch
             say(f"suite cost not recorded: {e}")
         return None
+
+    def _carried(self, head: str, cmd, parts: dict) -> str:
+        """The record line (verdictcarry.line) of a pass of `cmd` a batch recorded on another tip that
+        carries to `head` on this one, or "": the same change, and nothing the check covers changed."""
+        exclude = push.exclude_list(self.d.get("push_exclude_paths"))
+        for e in pushpass.carriable(self.p, str(cmd), parts)[:CARRY_TRIES]:
+            if e["tip"] == self.tip:
+                continue   # the same tip: only an exact tree match (pushpass.passed) reuses it
+            delta = verdictcarry.carry(self.wt, cmd, e["tip"], e["head"], self.tip or "", head, exclude)
+            if delta is not None:
+                return verdictcarry.line(e["head"], delta)
+        return ""
 
     def _rerun_ids(self, cmd, rc: int | None, tail: str, where: str) -> list[str]:
         """The failing pytest ids of a failed check to rerun once at `where` ("head" or "tip"): none when
