@@ -3712,12 +3712,13 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
     except ValueError:
         pass
 
-    def hold(key: str, n: int, **lane):
+    def hold(key: str, n, **lane):
         left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
         on_key = f"w{lane['lock']}" if lane.get("lock") else key
         return testslots.suite_hold(p.name if p else None, tell, left,
                                     lambda on: waiting(on, str(testslots.suite_path(p.name, on_key)),
-                                                       1 if lane.get("lock") else n),
+                                                       1 if lane.get("lock") else n if isinstance(n, int)
+                                                       else checklane.slots_now(p.name, on_key, cfg)),
                                     stop, f"run {run_dir.name}", prio, arrived,
                                     slots=n, repo=key,
                                     cost=checklane.cost(p.state if p else None, _commands_hash(cmds), cmds, cfg),
@@ -3734,7 +3735,9 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                 return None
         if suite is None and lock and _wrap_lane_after(cfg):
             suite = testslots.Grant()   # checks.wrap_lane "after": the step inside the wrapper takes the lane
-        if suite is None and (suite := hold(repo, checklane.slots(cfg), lock=lock, cap=checklane.project_cap(cfg),
+        # The repository's lanes are read again at every try: unset, they follow the host's load (checklane.capacity).
+        if suite is None and (suite := hold(repo, lambda held: checklane.slots(cfg, held), lock=lock,
+                                            cap=checklane.project_cap(cfg),
                                             worktree=top, headroom=checklane.headroom, pending=True)) is None:
             if tree is not None:
                 tree.close()

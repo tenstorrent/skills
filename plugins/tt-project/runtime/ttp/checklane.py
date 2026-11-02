@@ -16,9 +16,14 @@ Heavy lanes. Other runs take one of the project's `slots()` lanes (testslots.sui
 heavy checks of a project run at once, in task-priority order (#4065's order; one lane keeps the old
 one-at-a-time slot). Lanes are per repository under check (testslots.repo_key), so checks of unrelated
 repos never share them. `checks.slots` sets it (project, then account, then TTP_CHECKS_SLOTS); unset, it
-follows the machine (default_slots): the runs its test pool fits side by side, at least 2 (each run is
-isolated: its own clean checkout, scratch, output folder and port block, testslots.port_block), at most
-MAX_LANES, lowered only by little available memory. What runs cannot isolate keeps a lock of its own:
+follows the host now (capacity(), read again at every admission): the runs already holding a lane plus
+as many more as the spare cores (cores less the 1-minute load average) and the available memory fit,
+at one run's cores (its test grant, at least CORES_PER_LANE) and GIB_PER_LANE each, at most the runs
+the cores hold; never below default_slots(), its floor: the runs its test pool fits side by side, at
+least 2 (each run is isolated: its own clean checkout, scratch, output folder and port block,
+testslots.port_block), at most MAX_LANES, lowered only by little available memory. So a loaded or
+short-of-memory host admits no run past the floor (checks.load_extra 0 keeps the floor: checkcap). What runs
+cannot isolate keeps a lock of its own:
 checks run in the authoring worktree (cwd "authoring") also hold that worktree's one lane
 (testslots.tree_key). Runs behind checks.wrap_cmd take its wrapper lock's lane instead (below).
 
@@ -176,8 +181,30 @@ def default_slots(n_cores: int | None = None, mem_gib: float | None = None, cfg:
     return max(1, n)
 
 
-def slots(cfg: dict | None) -> int:
-    """The project's heavy lanes: checks.slots (project, then account), TTP_CHECKS_SLOTS, else default_slots()."""
+def capacity(cfg: dict | None = None, held: int = 0, n_cores: int | None = None, load: float | None = None,
+             mem_gib: float | None = None) -> dict:
+    """The lanes of one repository the host runs now with checks.slots unset (above): `held` running plus
+    the runs its spare cores (cores less the 1-minute load average, which counts the running ones) and
+    available memory fit, at one run's cores (`run_cores`: its test grant, testslots.sizes, at least
+    CORES_PER_LANE) and GIB_PER_LANE each; at most `top` (the runs the cores hold), never below `floor`
+    (default_slots()). An unreadable load average fits none, as does checks.load_extra 0 (nothing grows
+    with the load: checkcap.extra_max). Returns n and its inputs."""
+    c = checkcap.cores() if n_cores is None else n_cores
+    m = _mem_gib() if mem_gib is None else mem_gib
+    ld = checkcap._load() if load is None else load
+    floor = default_slots(c, m, cfg)
+    s = testslots.sizes(cfg, cores=c)
+    run = max(CORES_PER_LANE, s[1] if s else 0)
+    top = max(floor, c // run)
+    fit = int(max(0.0, c - ld) // run) if ld == ld and checkcap.extra_max() else 0
+    if m is not None:
+        fit = min(fit, int(max(0.0, m) // GIB_PER_LANE))
+    held = max(0, int(held or 0))
+    return {"n": max(floor, min(top, held + fit)), "floor": floor, "top": top, "held": held, "fit": fit,
+            "cores": c, "load": ld, "mem_gib": m, "run_cores": run, "run_gib": GIB_PER_LANE}
+
+
+def _explicit_slots(cfg: dict | None) -> int | None:
     for v in (setting(cfg, testslots.SLOTS_KEY), os.environ.get(SLOTS_ENV)):
         try:
             n = int(str(v).strip())
@@ -185,13 +212,44 @@ def slots(cfg: dict | None) -> int:
             continue
         if n >= 1:
             return n
-    return default_slots(cfg=cfg)
+    return None
+
+
+def slots(cfg: dict | None, held: int = 0) -> int:
+    """The project's heavy lanes per repository with `held` of them running: checks.slots (project, then
+    account), TTP_CHECKS_SLOTS, else capacity()."""
+    n = _explicit_slots(cfg)
+    return n if n is not None else capacity(cfg, held)["n"]
+
+
+def held_lanes(project_name: str, repo: str = "") -> int:
+    """How many of repository `repo`'s numbered lanes (not overflow ones) are held now."""
+    base = testslots.suite_base(project_name, repo)
+    return len([x for x in testslots._lanes_of(base) if not x.name.startswith(base + "-x") and locks._slot_labels([x])])
+
+
+def slots_now(project_name: str, repo: str, cfg: dict | None) -> int:
+    """slots() of repository `repo` with its lanes held now."""
+    return slots(cfg, held_lanes(project_name, repo))
+
+
+def slots_note(cfg: dict | None, held: int = 0) -> str:
+    """How slots() came to its number, for `ttp status` and the checks_slot_wait event."""
+    if (n := _explicit_slots(cfg)) is not None:
+        return f"{n} at a time per repository; checks.slots raises it"
+    k = capacity(cfg, held)
+    mem = f"{k['mem_gib']:.0f} GiB available" if k["mem_gib"] is not None else "memory unknown"
+    ld = f"load {k['load']:.1f}" if k["load"] == k["load"] and k["load"] != float("inf") else "load unknown"
+    return (f"{k['n']} per repository now, from the host (checks.slots unset): {k['held']} running + {k['fit']} "
+            f"more fit ({k['cores']} cores, {ld}, {mem}; one run {k['run_cores']} cores, {k['run_gib']} GiB), "
+            f"at least {k['floor']}, at most {k['top']}")
 
 
 def project_cap(cfg: dict | None) -> int:
     """The most of a project's checks that run at once (above): checks.test_project_max (project, then
     account), TTP_TEST_PROJECT_MAX, else the runs the host's test pool fits side by side, at least its lanes
-    per repository (slots()); 0 (unset with the test pool off): no cap."""
+    per repository (slots()) and, with checks.slots unset, the runs the host's cores hold (capacity()'s top,
+    whose lanes admit only what the load and memory fit); 0 (unset with the test pool off): no cap."""
     own = ((cfg or {}).get("checks") or {}) if isinstance((cfg or {}).get("checks"), dict) else {}
     for v in (own.get("test_project_max"), setting({}, "test_project_max"), os.environ.get("TTP_TEST_PROJECT_MAX")):
         try:
@@ -201,7 +259,7 @@ def project_cap(cfg: dict | None) -> int:
         if n >= 1:
             return n
     s = testslots.sizes(cfg)
-    return max(slots(cfg), s[0] // s[1]) if s else 0
+    return max(slots(cfg), s[0] // s[1], capacity(cfg)["top"] if _explicit_slots(cfg) is None else 0) if s else 0
 
 
 NAME_SUFFIX = ".name"   # beside a lane's files: its repository's or wrapper command's name (remember_name)
@@ -300,8 +358,8 @@ def _lane_waits_on(project_name: str, base: str, key: str, q: list, cfg: dict | 
     """What each waiter in lane `base`'s queue `q` (in turn order) waits on: the lane itself while its
     lanes are all held; with one free, the project cap (testslots.cap_turn: a waiter behind the lane's
     first ones waits for them, and they for the cap)."""
-    n = 1 if key.startswith("w") else max(1, slots(cfg))
-    held = len([x for x in locks.slot_paths(checkcap.slot_dir(), base, n) if locks._slot_labels([x])])
+    held = len([x for x in testslots._lanes_of(base) if not x.name.startswith(base + "-x") and locks._slot_labels([x])])
+    n = 1 if key.startswith("w") else max(1, slots(cfg, held))
     capped = project_cap(cfg) > 0
     return [label if held >= n else CAP_LABEL if capped else "nothing (about to start)" for _ in q]
 
@@ -620,8 +678,8 @@ def waits(project_name: str, cfg: dict | None, now: float | None = None, over_s:
     """The project's waiters for a lane that have waited over `over_s`, in queue order (the aging step
     of `cfg`, checks.priority_age_s — the order the lanes grant): task, waited_s, since (arrival),
     position (1-based), the lane's label (lane_labels), what it waits on (the lane, or the project cap:
-    _lane_waits_on), the limit holding it ("lanes" or "project_cap") and the holders' records (of the
-    lane, or of every lane for the cap)."""
+    _lane_waits_on), the limit holding it ("lanes" or "project_cap"), the holders' records (of the
+    lane, or of every lane for the cap) and how many lanes the repository has now (slots_note)."""
     now = time.time() if now is None else now
     age = priority_age_s(cfg)
     pre = f"{testslots.SUITE}.{locks.group_id(project_name)}"
@@ -635,13 +693,14 @@ def waits(project_name: str, cfg: dict | None, now: float | None = None, over_s:
             on = _lane_waits_on(project_name, base, key, q, cfg, labels[key]) if q else []
             lane_recs = locks.holder_records(testslots._lanes_of(base)) if q else []
             all_recs = locks.holder_records(testslots.project_held(project_name)) if q else []
+            note = slots_note(cfg, len([r for r in lane_recs if not r.get("overflow")])) if q else ""
             for i, t in enumerate(q):
                 waited = now - locks._arrival(t)
                 if waited > over_s:
                     out.append({"task": _ticket_task(t), "waited_s": waited, "since": locks._arrival(t),
                                 "position": i + 1, "of": len(q), "lane": labels[key], "waits_on": on[i],
                                 "holders": lane_recs if on[i] == labels[key] else all_recs,
-                                "limit": "lanes" if on[i] == labels[key] else "project_cap"})
+                                "limit": "lanes" if on[i] == labels[key] else "project_cap", "slots_note": note})
     except OSError:
         return []
     return out
@@ -678,8 +737,8 @@ def wait_events(project_name: str, cfg: dict | None, now: float | None = None) -
                              f"checks.slots per repository, one per checks.wrap_cmd lock, checks.test_project_max "
                              f"per project; a waiter cheaper than the holders gets a lane after checks.max_wait_s; "
                              f"light checks (ttp checks --light, checks.light_cmds) never wait. This wait was held "
-                             f"by " + ("the per-repository lane limit (checks.slots)." if w["limit"] == "lanes"
-                                       else "the project cap (checks.test_project_max)."))})
+                             f"by " + (f"the per-repository lane limit (checks.slots): {w['slots_note']}."
+                                       if w["limit"] == "lanes" else "the project cap (checks.test_project_max)."))})
     return out
 
 
@@ -849,8 +908,7 @@ def _who(x: dict) -> str:
 def _rule(r: dict, cfg: dict | None) -> str:
     if r["kind"] == "wrapper lock":
         return "" if "one at a time" in r["label"] else "one at a time, checks.wrap_cmd"
-    n = slots(cfg)
-    return f"{n} at a time per repository; checks.slots raises it"
+    return slots_note(cfg, len([h for h in r["lanes"] if not h["overflow"]]))
 
 
 def lane_lines(project_name: str, cfg: dict | None = None, now: float | None = None) -> list[str]:
@@ -891,8 +949,11 @@ def status_text(project_name: str, cfg: dict | None, here_repo: str = "", now: f
                 names: dict | None = None, db=None) -> str:
     """lane_status as lines for a person (`ttp checks status`)."""
     now = time.time() if now is None else now
-    n = slots(cfg)
-    lines = [f"checks lanes of {project_name}: {n} per repository (checks.slots), one per wrapper lock "
+    n = _explicit_slots(cfg)
+    lines = [f"checks lanes of {project_name}: "
+             + (f"{n} per repository (checks.slots)" if n is not None else "per repository as many as the host "
+                "fits now (checks.slots unset; each repository's line says how many)")
+             + ", one per wrapper lock "
              f"(checks.wrap_cmd), at most {project_cap(cfg) or 'any number'} at once (checks.test_project_max); "
              f"light checks never wait"]
     got = lane_status(project_name, now, cfg, names, db)
@@ -902,7 +963,9 @@ def status_text(project_name: str, cfg: dict | None, here_repo: str = "", now: f
         # The one naming rule: the row's group (its label, lane_labels; group_name when no run named it).
         where = r["group"] + (" (checks.wrap_cmd, one at a time)"
                               if r["kind"] == "wrapper lock" and "one at a time" not in r["group"] else "")
-        lines.append(f"  {where}" + (" (this one)" if r["id"] == here_repo else ""))
+        lines.append(f"  {where}" + (" (this one)" if r["id"] == here_repo else "")
+                     + (f": {slots_note(cfg, len([h for h in r['lanes'] if not h['overflow']]))}"
+                        if r["kind"] != "wrapper lock" and _explicit_slots(cfg) is None else ""))
         for h in r["lanes"]:
             alive = {True: "alive", False: "DEAD (its lane is reclaimed by the next waiter)"}.get(h["alive"], "alive unknown")
             run = (f", running {h['command']!r} for {mins(h['running_s'])}" if h["running_s"] is not None

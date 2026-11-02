@@ -18,7 +18,10 @@ and IO priority (low_priority()), so a host's live services win.
 
 Defaults (sizes()): the pool is half the host's usable cores, at least 2, so tests leave the other
 half to live work and builds; one run takes at most min(RUN_MAX, half the pool), at least 1, so two
-runs always fit side by side and no suite takes the pool. The account settings checks.test_pool and
+runs always fit side by side and no suite takes the pool. Unset, the test pool a run takes from also
+grows into spare cores (pool_now: the slots in use plus the cores the 1-minute load average leaves, at most
+the host's cores), so the extra lanes an idle host gives (checklane.capacity) get their workers; a busy
+host keeps the half, as does checks.load_extra 0. The account settings checks.test_pool and
 checks.test_run_max (or TTP_TEST_POOL / TTP_TEST_RUN_MAX) set them; checks.test_pool 0 turns the pool
 off. A project's own checks.test_pool / checks.test_run_max may only lower them.
 
@@ -155,6 +158,23 @@ def sizes(cfg: dict | None = None, cores: int | None = None, kind: Kind = TESTS)
     if (n := _number(own.get(kind.setting("run_max")[1]))):
         top = min(top, n)
     return pool, max(1, min(top, pool))
+
+
+def pool_now(cfg: dict | None, pool: int, held: int, cores: int | None = None, load: float | None = None,
+             kind: Kind = TESTS) -> int:
+    """The test pool a run may take from now: with checks.test_pool unset (account and project), the
+    `held` slots in use plus the host's spare cores (its cores less the 1-minute load average, which
+    counts the running ones), at most its cores, never below the default `pool`; so the half of the
+    cores the pool leaves serves more checks only while nothing else keeps it busy. An unreadable load
+    average, a set pool, checks.load_extra 0 (checkcap.extra_max) and the build pool keep `pool`."""
+    if kind is not TESTS or not checkcap.extra_max() or _setting(*kind.setting("pool")) is not None \
+            or _number(_section(cfg, "checks").get(kind.setting("pool")[1])):
+        return pool
+    c = checkcap.cores() if cores is None else cores
+    ld = checkcap._load() if load is None else load
+    if ld != ld or ld == float("inf"):
+        return pool
+    return max(pool, min(c, held + int(max(0.0, c - ld))))
 
 
 def project_max(cfg: dict | None = None, s: tuple[int, int] | None = None, kind: Kind = TESTS) -> int:
@@ -316,7 +336,11 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
             if s is None:
                 return Grant(kind=kind)
             pool, top = s
-            ps, own = paths(pool, kind), own_paths(name, project_max(cfg, s, kind), kind)
+            # Slots in use over every pool file there may be (a pool that shrank leaves holders past its end).
+            used = len(locks._slot_labels(paths(max(pool, checkcap.cores()), kind)))
+            pool = pool_now(cfg, pool, used, kind=kind)
+            room = max(0, min(top, pool - used))   # never more than the pool has left
+            ps, own = paths(pool, kind), own_paths(name, project_max(cfg, (pool, s[1]), kind), kind)
             k, files, why = 0, [], f"all {pool} are held"
             try:
                 ahead, extra = [], ({"priority": priority} if priority is not None else None)
@@ -345,7 +369,7 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                     locks.dequeue(ticket)
                     ticket, why = None, f"{len(ahead)} earlier waiter(s) of its project go first"
                 elif push_key:
-                    k, files = _take(ps, own, top, holder, what, extra)
+                    k, files = _take(ps, own, room, holder, what, extra)
                     if not k and (f := locks.try_take([reserved_path(push_key)], holder, "push test slot")):
                         k, files = 1, [f]
                 else:
@@ -353,7 +377,7 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                         ticket = locks.enqueue(checkcap.slot_dir(), kind.resource, holder, arrival, group=name)
                     q = locks.queued(checkcap.slot_dir(), kind.resource)
                     if q and q[0] == ticket:
-                        k, files = _take(ps, own, top, holder, what, extra)
+                        k, files = _take(ps, own, room, holder, what, extra)
                     elif q:
                         why = f"{q.index(ticket) if ticket in q else len(q)} ahead in the host's line"
             except OSError as e:
@@ -772,7 +796,7 @@ def _lane_beat() -> float:
 def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = None,
                wait_s: float | None = None, waiting: Callable[[bool], None] | None = None,
                stop: Callable[[], str] | None = None, who: str = "", priority: int | None = None,
-               since: float | None = None, slots: int = 1, repo: str = "", cost: dict | None = None,
+               since: float | None = None, slots: int | Callable[[int], int] = 1, repo: str = "", cost: dict | None = None,
                max_wait: float = 0.0, state=None, what: str = "full checks", lock: str = "", cap: int = 0,
                worktree: str = "", headroom: Callable[[], bool] | None = None,
                age: float | None = None, pending: bool = False, check: str = "",
@@ -805,16 +829,18 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     (age_s(), checks.priority_age_s; default the account's or SUITE_AGE_S). `pending`: the run takes its
     test slots after the lane, so the lane counts against `cap` only once slots_granted() marks it.
     `name`: the lane's name for status (the repository's directory name, or with `lock` the wrapper
-    command's: checklane.lane_labels)."""
+    command's: checklane.lane_labels). `slots` may be a function of the lanes held now (checklane.slots):
+    it is read again at every try, and a lane is free only while fewer than that many lane files of the
+    repository are held, so a count that fell under a holder's lane number admits nobody past it."""
     from . import checklane
     age = age_s() if age is None else age
     if not project_name or os.environ.get(HELD_ENV) or os.environ.get(checkcap.HELD_ENV):
         return Grant()
     if lock:   # one wrapper lock: its own single lane, never an overflow one
         repo, slots, max_wait, headroom = f"w{lock}", 1, 0.0, None
-    slots = max(1, int(slots or 1))
-    lanes = lane_paths(project_name, slots, repo)
-    extra_lanes = lane_paths(project_name, slots, repo, overflow=True)
+    count = slots if callable(slots) else (lambda _held, n=max(1, int(slots or 1)): n)
+    base = suite_base(project_name, repo)
+    extra_lanes = lane_paths(project_name, 1, repo, overflow=True)
     task = os.environ.get("TTP_TASK") or ""
     label = f"{project_name}: full checks ({who + ', ' if who else ''}pid {os.getpid()})"
     ns = locks._pid_ns()
@@ -836,13 +862,17 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     try:
         while True:
             project.ps_cycle()   # pids are read once per poll cycle, never one `ps` each (ps_snapshot)
-            held = [x for x in lanes + extra_lanes if locks._slot_labels([x])]
+            mine = [x for x in _lanes_of(base) if not x.name.startswith(base + "-x")]
+            held = [x for x in mine + extra_lanes if locks._slot_labels([x])]
             for x in held:
                 _reclaim(x, tell, state)
             # Free lanes before the queue: a lane freed after this count waits for the next turn, so the
             # queue that decides holds every waiter that arrived before it was freed.
+            n_held = len([x for x in mine if locks._slot_labels([x])])
+            slots = max(1, int(count(n_held) or 1))
+            lanes = lane_paths(project_name, max(slots, len(mine)), repo)
             recs = locks.holder_records(lanes + extra_lanes)
-            free = slots - len([x for x in lanes if locks._slot_labels([x])])
+            free = slots - n_held
             every = locks.queued(checkcap.slot_dir(), resource)
             if ticket not in every:   # removed under it: queue again at its place, never past the line
                 locks.dequeue(ticket)

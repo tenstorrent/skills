@@ -2255,7 +2255,7 @@ def test_checks_lanes_default_from_the_machine_and_follow_checks_slots(env, monk
     assert checklane.default_slots(64, 10) == 1, "little free memory keeps one lane"
     assert checklane.default_slots(16, None) == 2
     monkeypatch.delenv(checklane.SLOTS_ENV)
-    monkeypatch.setattr(checklane, "default_slots", lambda **_: 3)
+    monkeypatch.setattr(checklane, "default_slots", lambda *a, **k: 3)
     assert checklane.slots({}) == 3
     monkeypatch.setenv(checklane.SLOTS_ENV, "junk")
     assert checklane.slots({}) == 3
@@ -2263,6 +2263,73 @@ def test_checks_lanes_default_from_the_machine_and_follow_checks_slots(env, monk
     assert checklane.slots({}) == 2
     assert checklane.slots({"checks": {"slots": 1}}) == 1, "the project's setting wins"
     assert checklane.slots({"checks": {"slots": 0}}) == 3, "an invalid setting falls back to the machine's"
+
+
+def test_checks_lanes_follow_the_host_small_keeps_the_old_default_idle_large_gets_more(env, monkeypatch):
+    from ttp import checklane
+    monkeypatch.delenv(checklane.SLOTS_ENV)
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "2")
+    for c, mem in ((8, 30), (16, 60)):
+        cap = checklane.capacity({}, n_cores=c, load=0.0, mem_gib=mem)
+        assert cap["n"] == cap["floor"] == checklane.default_slots(c, mem), "a small host keeps the old default"
+    old = checklane.default_slots(64, 468)
+    cap = checklane.capacity({}, n_cores=64, load=0.0, mem_gib=468)
+    assert cap["n"] == cap["top"] == 8 > old, "an idle large host gets more lanes than the old default"
+    assert checklane.capacity({}, held=6, n_cores=64, load=50.0, mem_gib=468)["n"] == 7, "load counts the runs"
+    note = checklane.slots_note({}, held=0)
+    assert "checks.slots unset" in note and "cores, load" in note and "GiB" in note, note
+
+
+def test_checks_lanes_admit_no_new_run_on_high_load_or_low_memory_and_an_explicit_setting_wins(
+        env, monkeypatch):
+    from ttp import checklane, project
+    monkeypatch.delenv(checklane.SLOTS_ENV)
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "2")
+    floor = checklane.default_slots(64, 468)
+    for held in (floor, floor + 2):
+        for load, mem in ((70.0, 468), (63.5, 468), (0.0, 7.0), (float("inf"), 468)):
+            cap = checklane.capacity({}, held=held, n_cores=64, load=load, mem_gib=mem)
+            assert cap["n"] == held and cap["fit"] == 0, (held, load, mem, cap)
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    assert checklane.capacity({}, n_cores=64, load=0.0, mem_gib=468)["n"] == floor, "load_extra 0 keeps the floor"
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "2")
+    monkeypatch.setattr(checklane, "capacity", lambda *a, **k: {"n": 8})
+    assert checklane.slots({}, held=3) == 8
+    monkeypatch.setenv(checklane.SLOTS_ENV, "1")
+    assert checklane.slots({}, held=3) == 1, "TTP_CHECKS_SLOTS wins"
+    project.set_account_setting("checks.slots", 2)
+    assert checklane.slots({}, held=3) == 2, "the account's setting wins"
+    assert checklane.slots({"checks": {"slots": 3}}, held=0) == 3, "the project's setting wins"
+    assert "checks.slots raises it" in checklane.slots_note({"checks": {"slots": 3}})
+
+
+def test_test_pool_grows_only_into_spare_cores_and_a_set_pool_wins(env, monkeypatch):
+    from ttp import testslots
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "2")
+    assert testslots.pool_now({}, 32, 0, cores=64, load=1.0) == 63
+    assert testslots.pool_now({}, 32, 24, cores=64, load=60.0) == 32, "a busy host keeps the half"
+    assert testslots.pool_now({}, 32, 40, cores=64, load=60.0) == 44
+    assert testslots.pool_now({}, 32, 0, cores=64, load=float("inf")) == 32
+    assert testslots.pool_now({"checks": {"test_pool": 16}}, 16, 0, cores=64, load=0.0) == 16
+    assert testslots.pool_now({}, 32, 0, cores=64, load=0.0, kind=testslots.BUILDS) == 32
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    assert testslots.pool_now({}, 32, 0, cores=64, load=0.0) == 32
+
+
+def test_suite_hold_rereads_its_lane_count_at_each_admission(env, monkeypatch):
+    from ttp import testslots
+    _lane_env(monkeypatch)
+    n = [1]
+    a = testslots.suite_hold("pa", repo=_LANE_REPO, slots=lambda held: n[0], wait_s=0)
+    assert a and a.files
+    assert testslots.suite_hold("pa", repo=_LANE_REPO, slots=lambda held: n[0], wait_s=0.2) is None
+    n[0] = 2
+    b = testslots.suite_hold("pa", repo=_LANE_REPO, slots=lambda held: n[0], wait_s=0)
+    assert b and b.files, "a grown count admits the next run"
+    n[0] = 1
+    assert testslots.suite_hold("pa", repo=_LANE_REPO, slots=lambda held: n[0], wait_s=0.2) is None, \
+        "holders past a shrunk count still count"
+    a.close(), b.close()
 
 
 def test_two_lanes_let_two_runs_proceed_and_one_lane_keeps_priority_order(env, tmp_path, monkeypatch):

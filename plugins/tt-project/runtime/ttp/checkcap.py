@@ -37,7 +37,8 @@ turns in a row while other checks wait, so those still progress (locks.fair_orde
 While the host is lightly loaded (1-minute load average under half its cores) up to `checks.load_extra`
 slots (TTP_CHECKS_LOAD_EXTRA, default EXTRA_SLOTS; 0 turns it off) open beyond the cap: two below a quarter of the cores, one
 below half. A check on one keeps it until it ends, but no new one takes one once the load rises.
-They open beyond a default cap's ceiling too.
+They open beyond a default cap's ceiling too. checks.load_extra 0 also keeps a project's checks lanes
+per repository and the test pool at their floors (checklane.capacity, testslots.pool_now).
 
 Waiters take turns by project (locks.fair_order); within one, by task priority (1 first), then arrival.
 The checks of a task that is a required owner of an open obligation (obligations.owned_open: an urgent
