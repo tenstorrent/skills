@@ -13,8 +13,51 @@ def _ii_project(tmp_path, git: bool = False):
     return Project(root)
 
 
+# Cached per session so the probe (which spawns a --version) runs once, not per test.
+_II_RG = None
+
+
 def _ii_rg():
-    return shutil.which("rg")
+    """A usable ripgrep, or None.
+
+    PATH first, then Claude Code's bundled ripgrep (a `claude` binary that embeds
+    ripgrep and routes on argv0 'rg'), probed once per session and validated with
+    --version so the tests never run against something that is not ripgrep.
+    """
+    global _II_RG
+    if _II_RG is not None:
+        return _II_RG
+    import atexit, shutil, subprocess, tempfile
+    rg = shutil.which("rg")
+    if not rg:
+        # Claude Code's CLI embeds ripgrep and runs it when invoked with argv0 'rg'.
+        # A wrapper script execs the resolved `claude` on PATH with argv0 'rg'; its
+        # --version then prints a ripgrep version (the CLI's own version would not).
+        claude = shutil.which("claude")
+        if claude:
+            wrapper = os.path.join(tempfile.gettempdir(), f"ii-rg-{os.getpid()}")
+            try:
+                with open(wrapper, "w") as f:
+                    f.write(f'#!/bin/bash\nexec -a rg "{claude}" "$@"\n')
+                os.chmod(wrapper, 0o755)
+                out = subprocess.run([wrapper, "--version"], capture_output=True, text=True, timeout=30)
+                if out.returncode == 0 and "ripgrep" in out.stdout:
+                    rg = wrapper
+                    atexit.register(os.unlink, wrapper)
+                else:
+                    os.unlink(wrapper)
+            except OSError:
+                rg = None
+    if rg:
+        try:
+            v = subprocess.run([rg, "--version"], capture_output=True, text=True, timeout=30)
+            ok = v.returncode == 0 and "ripgrep" in v.stdout
+        except OSError:
+            ok = False
+        if not ok:
+            rg = None
+    _II_RG = rg or ""
+    return _II_RG or None
 
 
 def test_index_ignore_lists_the_bulky_folders_anchored_at_the_root(tmp_path):
@@ -91,7 +134,7 @@ def test_index_ignore_in_a_subfolder_of_a_repository_touches_no_exclude_file(tmp
     assert (exclude.read_text() if exclude.exists() else None) == before
 
 
-@pytest.mark.skipif(not shutil.which("rg"), reason="needs ripgrep")
+@pytest.mark.skipif(not _ii_rg(), reason="no ripgrep on PATH and none bundled with a CLI install")
 def test_index_ignore_stops_the_start_up_walk_but_not_searches_below_or_by_path(tmp_path):
     """The walk a CLI does at start-up (rg --no-config --files --hidden <cwd>) skips the listed folders
     from the root and the harness folder; a worktree cwd, an explicit path and --no-ignore still see them."""
@@ -114,7 +157,7 @@ def test_index_ignore_stops_the_start_up_walk_but_not_searches_below_or_by_path(
     assert "results/a/r.txt" in files(p.root, "--no-ignore")
 
 
-@pytest.mark.skipif(not shutil.which("rg"), reason="needs ripgrep")
+@pytest.mark.skipif(not _ii_rg(), reason="no ripgrep on PATH and none bundled with a CLI install")
 def test_index_ignore_cuts_the_start_up_walk_of_a_root_outside_git(tmp_path):
     """A project root that is no git repository reads no .gitignore: before the block the start-up walk
     lists every result, run folder and virtualenv file; after it, only the project's own files."""
@@ -149,6 +192,23 @@ def test_index_ignore_is_written_at_daemon_start(env, monkeypatch):
     monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
     assert d.run() == 0
     assert indexignore.BEGIN in (p.root / ".ignore").read_text()
+
+
+def test_index_ignore_is_written_at_bootstrap_new(env, monkeypatch):
+    """`ttp new` writes the managed .ignore block at bootstrap, before any daemon runs."""
+    from ttp import cli, indexignore
+    from ttp.project import Project
+
+    def none(*a, **k):
+        raise AssertionError("no daemon or web app here")
+    monkeypatch.setattr(cli, "_wait_for_daemon", none)
+    cli.main(["new", "ii-boot", "--dir", str(env["repo"]), "--provider", "fake", "--no-service"])
+    text = (env["repo"] / ".ignore").read_text()
+    assert indexignore.BEGIN in text and "/results/" in text
+    assert indexignore.ensure(Project(env["repo"])) == ""
+    # a second bootstrap of the same project neither duplicates nor loses the block
+    cli.main(["new", "ii-boot", "--dir", str(env["repo"]), "--provider", "fake", "--no-service"])
+    assert (env["repo"] / ".ignore").read_text().count(indexignore.BEGIN) == 1
 
 
 def test_index_ignore_never_raises_and_leaves_odd_files_and_home_alone(tmp_path, monkeypatch):
