@@ -2029,9 +2029,12 @@ def _note_to(a, run_dir: str) -> None:
                    else "and there is no other machine to ask (`ttp upstream --forward-status`)") + how)
     try:
         text = upstream.note_text(a.text)
+        upstream.check_placeholder(text)
     except upstream.NoteTooLong as e:
         die(f"not sent: {e}. Nothing was filed or cut. Shorten it, with the question or request first, "
             f"or put the whole text in the hand-off as a follow-up")
+    except upstream.NotePlaceholder as e:
+        die(f"not sent: {e}. Nothing was filed or queued")
     from . import taskfacts
     # The tasks it names, as the records show them now: what it states of them may be stale.
     text = taskfacts.note_suffix(me, text, upstream.SPEC_CHARS)
@@ -2091,9 +2094,12 @@ def _note_upstream(a, me) -> None:
         die("empty note")
     try:
         text = upstream.note_text(a.text)
+        upstream.check_placeholder(text)
     except upstream.NoteTooLong as e:
         die(f"not sent: {e}. Nothing was filed or cut. Shorten it, with the question or request first, "
             f"or put the whole text in the hand-off as a follow-up titled `upstream: ...`")
+    except upstream.NotePlaceholder as e:
+        die(f"not sent: {e}. Nothing was filed or queued")
     task = os.environ.get("TTP_TASK") or ""
     note = {"title": "upstream: " + upstream.cut_title(text), "spec": text}
     try:
@@ -2269,6 +2275,9 @@ def _answer_sender(rec: dict, me) -> None:
     try:
         got = (upstream.send_or_queue(me.state, source, task, to, text)[0] if me
                else upstream.send(source, task, to, text))
+    except upstream.NotePlaceholder as e:
+        print(f"{line}; answer not sent: {e}")
+        return
     except OSError as e:
         if not os.environ.get("TTP_RUN_DIR"):
             print(f"{line}; answer not sent: {e.strerror or e}")

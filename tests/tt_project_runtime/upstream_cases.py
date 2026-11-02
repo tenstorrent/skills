@@ -690,3 +690,60 @@ def test_upstream_resolve_fixed_in_refuses_a_version_without_the_fixing_tasks_la
     p.set_config("delivery.version_bump", None)
     rc, out = resolve(fps["pending"], "0.1.3")
     assert rc == 0 and "version 0.1.3 not checked: delivery.version_bump is not set" in out
+
+
+# The text of a reply that went out with its template slot unfilled (a shared text for several replies).
+_SLOT_REPLY = ("[note %s] Correction on the ack: the config key has existed since the 0.2.685 batch (commit "
+               "3ebcf99ba), and is in your installed 0.2.697 - it is off by default.")
+
+
+def test_a_note_or_reply_with_an_unfilled_placeholder_is_refused_before_anything_is_filed(env, monkeypatch, capsys):
+    """`ttp note --reply`, `--to` and a lesson for the maintainers refuse a text that still holds a template
+    placeholder (`[note %s]`, `[note <fp>]`, a bare `<text>`): a non-zero exit naming it, nothing filed or
+    queued. The shared send paths refuse it too: `send_or_queue`, `queue`, and a queued line `send_queued` meets."""
+    from ttp import cli, upstream
+    p = make(env)
+    _note_run(env, monkeypatch, p)
+    _fake_forward_ssh(env, monkeypatch)
+    upstream.set_forward_to(["farbox"])
+    remote = _pushed_note(p.name, "read from a far inbox", host="laptop")
+    p.db.set_kv(upstream.KV_ROUTES, {remote["fp"]: upstream._route(remote, "farbox", time.time())})
+    cases = [("--reply", remote["fp"], _SLOT_REPLY, "'[note %s]'"),
+             ("--to", "alpha@farbox", "[note <fp>] logs attached", "'[note <fp>]'"),
+             ("--to", "alpha@farbox", "answer to [note {fp}]", "'[note {fp}]'"),
+             ("--to", "alpha@farbox", "re [note $FP]: done", "'[note $FP]'"),
+             ("--reply", remote["fp"], '"<text>"', "'\"<text>\"'"),
+             ("--to", upstream.MAINTAINERS, "lesson [note ${fp}]", "'[note ${fp}]'")]
+    for flag, to, text, found in cases:
+        assert _note(cli, flag, to, text) != 0, text
+        err = capsys.readouterr().err
+        assert f"not sent: the note's text still holds the placeholder {found}" in err, err
+    assert not (env["home"] / "upstream.jsonl").exists(), "nothing was filed"
+    assert not (p.state / upstream.OUTBOX_FILE).exists(), "nothing was queued"
+    for fn in (lambda: upstream.send_or_queue(p.state, p.name, 3, "alpha", _SLOT_REPLY),
+               lambda: upstream.queue(env["home"], "alpha", _SLOT_REPLY)):
+        with pytest.raises(upstream.NotePlaceholder):
+            fn()
+    run = env["home"] / "slotrun"
+    run.mkdir()
+    (run / upstream.QUEUED_FILE).write_text(json.dumps({"to": "alpha", "text": _SLOT_REPLY}) + "\n")
+    assert upstream.send_queued(run, p.name, 3, p.state)["invalid"] == 1
+    assert not (env["home"] / "upstream.jsonl").exists()
+
+
+@pytest.mark.parametrize("text", [
+    "is a < b and c > d here?", 'the "<div>" and <b> tags render', "it costs $5 an hour",
+    "commit 3ebcf99ba fixed it, see #4965", "[note ce11b4d40c27f9f4] is answered",
+    "note 6e55bf9e40ef6c7b held a bad `[note %s]` tag", "retry_when: test \"$(date +%s)\" -ge 1",
+    "run `ttp note --reply <fp> \"<text>\"`", "[note: read this first] 100% done", "a <text> field"])
+def test_ordinary_note_text_is_not_taken_for_a_placeholder(env, monkeypatch, capsys, text):
+    """The placeholder guard is narrow: comparisons, HTML-like words, dollar amounts, hashes and ids, a real
+    `[note <16 hex>]` tag and placeholders quoted in backticks all go through."""
+    from ttp import cli, upstream
+    upstream.check_placeholder(text)
+    p = make(env)
+    _note_run(env, monkeypatch, p)
+    _fake_forward_ssh(env, monkeypatch)
+    upstream.set_forward_to(["farbox"])
+    assert _note(cli, "--to", "alpha@farbox", text) == 0, capsys.readouterr().err
+    assert _upstream_inbox(env)[-1]["spec"].startswith(" ".join(text.split()))

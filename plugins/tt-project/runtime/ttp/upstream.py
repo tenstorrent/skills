@@ -218,6 +218,33 @@ class NoteTooLong(ValueError):
         super().__init__(f"the note is {length} characters once whitespace is joined; the limit is {SPEC_CHARS}")
 
 
+# A template placeholder left in a note's text: a `[note X]` tag whose X is a printf, format, shell or
+# angle-bracket placeholder (or fp/id/...) rather than a note's 16-hex id, or a whole text that is only
+# `<text>`. Narrow on purpose: `a < b`, "<div>", $5, commit hashes and #ids pass. Code spans are skipped,
+# so a note can still quote a bad tag in backticks.
+_PLACEHOLDER_TOKEN = (r"%[-#0 +]*\d*(?:\.\d+)?[sdirxf]|%\(\w+\)[sdr]|<[^<>\s]{1,30}>|\{[\w.!:]*\}"
+                      r"|\$\{?[A-Za-z_]\w*\}?|fp|id|\.\.\.|…")
+_PLACEHOLDER_RES = (re.compile(r"\[note (?:" + _PLACEHOLDER_TOKEN + r")\]", re.I),
+                    re.compile(r"[\"']?<(?:text|note|message|reply|question)>[\"']?", re.I))
+
+
+class NotePlaceholder(ValueError):
+    def __init__(self, found: str):
+        self.found = found
+        super().__init__(f"the note's text still holds the placeholder {found!r}: fill it with the real value "
+                         f"(a note's id is its 16 hex characters) or quote it in backticks")
+
+
+def check_placeholder(text: str) -> None:
+    """Raise NotePlaceholder for a template placeholder left in a worker's note (`_PLACEHOLDER_RES`)."""
+    bare = re.sub(r"`[^`]*`", " ", str(text))
+    m = _PLACEHOLDER_RES[0].search(bare)
+    if m:
+        raise NotePlaceholder(m.group(0))
+    if _PLACEHOLDER_RES[1].fullmatch(bare.strip()):
+        raise NotePlaceholder(bare.strip())
+
+
 def cut(text: str, where: str) -> str:
     """`text` within SPEC_CHARS; a cut one says so, how much it kept and where the whole text is."""
     if len(text) <= SPEC_CHARS:
@@ -319,6 +346,7 @@ def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str
     Returns ("sent" | "duplicate" | "queued" | "full", the note's place in the outbox or 0)."""
     now = now or time.time()
     text = note_text(text)
+    check_placeholder(text)
     fp = note_id(to, text)
     with _outbox_lock(state):
         waiting = _outbox(state)
@@ -399,6 +427,7 @@ def queue(run_dir: Path, to: str, text: str, severity: str = "normal", at: str |
           back: str | None = None) -> None:
     """Keep a worker's note for project `to` in its run's directory, for a worker whose sandbox cannot
     write the inbox: its daemon files it with `send_queued` when the run ends."""
+    check_placeholder(text)
     line = json.dumps({"to": to, "text": note_text(text), "severity": severity, **({"at": at} if at else {}),
                        **({"back": back} if back and not at else {})}, sort_keys=True) + "\n"
     fd = os.open(Path(run_dir) / QUEUED_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -438,8 +467,8 @@ def send_queued(run_dir: Path, source: str, task: int | None, state: Path | None
             else:
                 r = send_or_queue(state, source, task, to, text, sev, at=_at(n), back=_at(n, "back"))[0]
                 got["limited" if r == "full" else r] += 1
-        except NoteTooLong:
-            got["invalid"] += 1   # `queue` refuses these: only a line written past it is this long
+        except (NoteTooLong, NotePlaceholder):
+            got["invalid"] += 1   # `queue` refuses these: only a line written past it holds one
     os.replace(src, src.with_name(QUEUED_FILE + ".filed"))
     return got
 
