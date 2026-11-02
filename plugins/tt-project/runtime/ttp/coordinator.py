@@ -77,6 +77,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     reviewcap,
     selfreview,
     reviewreuse,
+    selfblock,
     settinghold,
     settled,
     shared,
