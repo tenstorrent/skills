@@ -344,21 +344,19 @@ def dollar_caps(b: dict) -> bool:
     return any(float(b.get(k) or 0) > 0 for k in ("daily_usd", "weekly_usd", "global_daily_usd"))
 
 
-def caps_spend(n: dict, day_cap: float, week_cap: float, plan: bool = False, week: str = "per 7 days",
-               cents: bool = False) -> str:
+def caps_spend(n: dict, day_cap, week_cap, plan: bool = False, week: str = "per 7 days") -> str:
     """A caps-regime gate's spend against the project dollar caps: '$7.76 of $100 today, $89.95 of
     $200 per 7 days'. A cap that is unset (0) shows its spend as a plain figure, never 'of $0', and
     with neither set the line says so: 'no dollar cap (plan windows apply): $7.76 today, ...' (the
-    parenthesis only when `plan`, some provider on plan windows). Display only."""
-    def one(spent: float, cap: float, span: str) -> str:
-        if cap <= 0:
-            return f"${spent:.2f} {span}"
-        return f"${spent:.2f} of ${cap:.2f} {span}" if cents else f"${spent:.2f} of ${cap:g} {span}"
+    parenthesis only when `plan`, some provider on plan windows). A set cap shows as configured.
+    Display only."""
+    def one(spent: float, cap, span: str) -> str:
+        return f"${spent:.2f} {span}" if float(cap or 0) <= 0 else f"${spent:.2f} of ${cap} {span}"
     est = f" (${n['estimated_24h']:.2f} of it estimated)" if n.get("estimated_24h") else ""
     day = (one(n["spent_today"], day_cap, "today") if "spent_today" in n
            else one(n.get("spent_24h", 0), day_cap, "per 24h"))
     out = f"{day}{est}, {one(n.get('spent_7d', 0), week_cap, week)}"
-    if day_cap <= 0 and week_cap <= 0:
+    if float(day_cap or 0) <= 0 and float(week_cap or 0) <= 0:
         out = f"no dollar cap{' (plan windows apply)' if plan else ''}: {out}"
     return out
 

@@ -3957,7 +3957,7 @@ def test_the_caps_line_never_reads_of_zero_once_the_dollar_caps_are_unset(env):
         d = coord.digest(p, gates, [], [])
         return next(x for x in d.splitlines() if x.startswith("- codex:"))
 
-    for day, week in ((100.0, 2000.0), (0.0, 0.0), (0.0, 2000.0)):
+    for day, week in ((100, 2000), (0, 0), (0, 2000)):
         p.set_config("budget.daily_usd", day)
         p.set_config("budget.weekly_usd", week)
         g = caps_gate(day, week)

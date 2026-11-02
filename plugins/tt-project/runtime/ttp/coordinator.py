@@ -881,7 +881,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         else:
             plan = any(x.get("regime") == "windows" for x in gates.values())
             money = ("project caps (usage-billed providers together): "
-                     + bud.caps_spend(n, float(b.get("daily_usd") or 0), float(b.get("weekly_usd") or 0), plan))
+                     + bud.caps_spend(n, b.get("daily_usd"), b.get("weekly_usd"), plan))
             if "global_today" in n:
                 stale = f", {len(n['global_stale'])} machine(s) stale" if n.get("global_stale") else ""
                 money += (f" · global daily cap (whole account): ${n['global_today']:.2f} of "
