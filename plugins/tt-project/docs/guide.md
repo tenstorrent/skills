@@ -696,8 +696,11 @@ review, summary, digest, report or brief). The daemon lifts it at each start, af
 pick, so tasks already queued are lifted too; a lift that changes the tier moves a default budget
 to the new tier's default, sets `tier_source` to `conclusion_floor` and adds a spec line such as
 `[tier floor] light->standard (conclusion: kind question)`. Reviews keep their diff-sized tier,
-a pin the user's own words require (`pin_required`) stays, a light wake of a waiting task stays a
-check, and a failed try still retries a tier up. Set it per project with
+a pin the user's own words require (`pin_required`) stays, and a failed try still retries a tier
+up. A waiting conclusion task's wake whose wait is over runs at the floor too, since it may write
+the answer; a stale wake (the same wait handed back) stays a light check. When the budget gate
+allows only a tier below the floor, a conclusion run stays queued (`held: tier floor waits for the
+budget gate to allow standard`) and starts at the floor once the gate eases. Set it per project with
 `ttp config <name> coordinator.conclusion_floor deep/xhigh`, or `off`.
 
 ### OpenAI-compatible endpoints (the `chat` provider)

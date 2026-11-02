@@ -71,7 +71,8 @@ def test_an_already_queued_light_question_is_lifted_at_dispatch_with_a_visible_l
     assert t["spec"].endswith("[tier floor] light->standard (conclusion: kind question)")
     kw = started[0][1]
     assert kw["note"]["conclusion_floor"]["tier"] == "standard" and kw["budget_usd"] == 8.0
-    assert kw["min_effort"] is None, "claude's standard tier already runs at high"
+    assert kw["note"]["conclusion_floor"]["effort"] is None, "claude's standard tier already runs at high"
+    assert kw["min_effort"] == "high", "the run's effort floor (start_run never lowers an effort)"
     from ttp.cli import show_task
     assert "conclusion_floor" in show_task(t) and "[tier floor]" in show_task(t)
     # A second start adds no second line.
@@ -100,6 +101,60 @@ def test_the_floor_applies_after_jevs_pick_and_mechanical_light_work_stays_light
     assert p.db.one("SELECT avoided_usd FROM jev_calls WHERE ref=?", (f"task:{q}",))["avoided_usd"] == 0
     assert "conclusion_floor" not in started[1][1]["note"] and p.db.task(w)["tier"] == "light"
     assert "[tier floor]" not in p.db.task(w)["spec"]
+
+
+def test_a_budget_gate_below_the_floor_holds_a_conclusion_run_queued_and_clamps_mechanical_work(env, monkeypatch):
+    from ttp import budget as bud, tierfloor
+    p, d, started = _floor_daemon(env, monkeypatch)
+    q = p.db.add_task("Did the fix hold?", "Read the logs.", kind="question", tier="light", origin="coordinator",
+                      provider="claude", budget_usd=2.0)
+    w = p.db.add_task("Copy the log", "Copy the build log to the run folder.", kind="work", tier="standard",
+                      origin="coordinator", provider="claude", budget_usd=8.0, priority=4)
+    for level in ("orange", "red"):
+        d.gates = {"claude": bud.Gate(provider="claude", level=level, max_tier="light", max_parallel=2)}
+        started.clear()
+        d.dispatch()
+        assert p.db.task(q)["status"] == "queued" and p.db.task(q)["attempts"] == 0
+        assert p.db.task(q)["blocked_reason"] == f"{tierfloor.HELD_NOTE} standard"
+        if level == "orange":   # mechanical work keeps the clamp
+            assert [(a[3], k["task"]["id"]) for a, k in started] == [("light", w)]
+            p.db.update_task(w, status="done")
+        else:
+            assert started == []
+    d.gates = {"claude": bud.Gate(provider="claude", level="green", max_tier="deep", max_parallel=2)}
+    started.clear()
+    d.dispatch()
+    assert [(a[3], k["min_effort"]) for a, k in started] == [("standard", "high")]
+    assert not p.db.task(q)["blocked_reason"]
+    # The floor turned off: the gate clamps it to light again.
+    p.set_config("coordinator.conclusion_floor", "off")
+    d.cfg = p.config()
+    p.db.update_task(q, status="queued", tier="light")
+    d.gates = {"claude": bud.Gate(provider="claude", level="orange", max_tier="light", max_parallel=2)}
+    started.clear()
+    d.dispatch()
+    assert [(a[3], k["min_effort"]) for a, k in started] == [("light", None)]
+
+
+def test_a_conclusion_tasks_wake_whose_wait_is_over_runs_at_the_floor_and_a_check_stays_light(env, monkeypatch):
+    p, d, started = _floor_daemon(env, monkeypatch)
+    waits = {"status": "waiting", "summary": "checks run", "retry_when": "ttp checks --result /tmp/run/1",
+             "waiting_for": "checks"}
+    q = p.db.add_task("Is the suite green?", "x", kind="question", tier="light", origin="coordinator",
+                      provider="claude", budget_usd=2.0)
+    w = p.db.add_task("Copy the log", "x", kind="work", tier="standard", origin="coordinator",
+                      provider="claude", budget_usd=8.0, priority=4)
+    for t in (q, w):
+        p.db.update_task(t, result=json.dumps(waits))
+    d.dispatch()
+    got = {k["task"]["id"]: (a[3], k["min_effort"], k["note"]["wake"]["tier"]) for a, k in started}
+    assert got[q] == ("standard", "high", "standard"), "the wake may write the answer: it runs at the floor"
+    assert got[w] == ("light", None, "light"), "a mechanical task's wake stays a light check"
+    # A stale wake (the same wait handed back) only checks it: light, whatever the task is.
+    started.clear()
+    p.db.update_task(q, status="queued", result=json.dumps({**waits, "stale_wakes": 2}))
+    d.dispatch()
+    assert [(a[3], k["min_effort"]) for a, k in started] == [("light", None)]
 
 
 def test_retry_tier_up_still_applies_on_top_of_the_floor(env, monkeypatch):

@@ -7458,7 +7458,21 @@ class Daemon:
                 if (picked or {}).get("jev_call") and floor["tier"] != picked["tier"]:
                     # Jev's lower pick never ran: it avoided nothing.
                     db.x("UPDATE jev_calls SET avoided_usd=0 WHERE id=?", (picked["jev_call"],))
-            wake = bud.wake_tier(task["tier"], load_result(task["result"]), self.cfg, self.p.harness)
+            prev = load_result(task["result"])
+            wake = bud.wake_tier(task["tier"], prev, self.cfg, self.p.harness)
+            need = self._floor_need(task, wake, prev)
+            if need and wake:   # a wake whose wait is over may write the answer the user reads
+                wake = max(wake, need["tier"], key=bud.TIER_ORDER.index)
+            if need and bud.TIER_ORDER.index(gate.max_tier) < bud.TIER_ORDER.index(need["tier"]):
+                # The gate would clamp a conclusion run below its floor: it waits queued, unspent.
+                held = f"{tierfloor.HELD_NOTE} {need['tier']}"
+                if note != held:
+                    db.update_task(task["id"], blocked_reason=held)
+                fate[task["id"]] = "hold"
+                reached.discard(task["id"])
+                continue
+            if note.startswith(tierfloor.HELD_NOTE):
+                db.update_task(task["id"], blocked_reason=None)
             tier = bud.clamp_tier(wake or task["tier"], gate)
             # A tier routed to another provider (route.py) runs there unless it is cooling down.
             routed = self._route(task, tier, picked, now)
@@ -7546,7 +7560,7 @@ class Daemon:
                                         timeout_s=(routed or {}).get("timeout_s"),
                                         read_only=False, append_system=system, note=note,
                                         resume=lost["session"] if lost else None,
-                                        min_effort=(floor or {}).get("effort") if not wake else None)
+                                        min_effort=(need or {}).get("effort") or None)
                 if lease:   # the lease now names the run's supervisor in place of the daemon
                     self._route_lease(task, routed, tier, now, run_id=run_id)
             except Exception as e:
@@ -7749,6 +7763,17 @@ class Daemon:
             return None
         log(self.p, f"task {task['id']}: {tierfloor.note(got)}")
         return {**got, "task": task}
+
+    def _floor_need(self, task: dict, wake: str | None, prev: dict) -> dict | None:
+        """The floor ({tier, effort}, tierfloor.target) this start of a conclusion run must reach, or None.
+        A stale wake (the same wait handed back) only checks it, so it needs none."""
+        if wake and bud.stale_wakes(prev) and not prev.get("escalated_wake"):
+            return None
+        try:
+            return tierfloor.target(self.p.db, self.cfg, task)
+        except Exception as e:   # the floor must never hold a task back
+            log(self.p, f"task {task['id']}: tier floor not applied: {e}")
+            return None
 
     def _route(self, task: dict, tier: str, picked: dict | None, now: float) -> dict | None:
         """The run note's `route` entry for a worker run of a tier routed to another provider

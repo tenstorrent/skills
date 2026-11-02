@@ -10,8 +10,11 @@ spec has a line starting `conclusion:`; or it is a run of an llm schedule whose 
 user (the daily review, or a schedule named for a review, summary, digest, report or brief). Such a run
 gets tier max(its own, floor tier) and effort max(its own, floor effort), the nearest effort its
 provider takes. The floor is coordinator.conclusion_floor (default DEFAULT: standard, high). A review
-keeps its diff-sized tier; a task whose pin the user's own words require (pin_required) stays as it is;
-a waiting task's light wake (a check) and the budget gate's tier clamp still apply.
+keeps its diff-sized tier; a task whose pin the user's own words require (pin_required) stays as it is.
+A waiting conclusion task's wake whose wait is over may write the answer, so it runs at the floor too;
+only a stale wake (the same wait handed back) stays a light check. A budget gate whose max_tier is
+below the floor tier does not clamp a conclusion run: the run waits queued (HELD_NOTE) until the gate
+allows the floor, so it spends nothing extra and the gate keeps its cap.
 
 A lift that changes the stored tier moves the task's budget to the new tier's default when it held the
 old tier's default (an explicit budget stays), sets tier_source `conclusion_floor` and adds one spec
@@ -34,6 +37,7 @@ KINDS = ("question", "plan")
 LINE = re.compile(r"(?im)^[ \t>*#\d.)-]*conclusion\s*:")
 REPORT = re.compile(r"(?i)\b(review|summar(?:y|ies|ise|ize)|digest|reports?|brief(?:ing)?)\b")
 DAILY_REVIEW = "daily-review"
+HELD_NOTE = "held: tier floor waits for the budget gate to allow"   # + the floor tier (blocked_reason)
 
 
 def floor_of(v: Any) -> dict:
@@ -98,19 +102,26 @@ def _rank(effort: str | None) -> int:
     return EFFORT_RANK.index(e) if e in EFFORT_RANK else -1   # unset: the provider's own default, below any floor
 
 
-def lift(db, cfg: dict, task: dict, provider: str) -> dict | None:
-    """The floor for this start of `task` on `provider`, or None when none applies or nothing would move:
-    {tier, from, effort (the run's effort floor, or None), effort_from, why}."""
-    if task.get("kind") == "review":
-        return None
-    why = reasons(task)
-    if not why:
+def target(db, cfg: dict, task: dict) -> dict | None:
+    """The floor ({tier, effort}) `task` must start at, or None when it is no conclusion run, the floor is
+    off, it is a review or the user's own words require its pin."""
+    if task.get("kind") == "review" or not reasons(task):
         return None
     fl = floor(cfg)
     if fl["tier"] == "light" and not fl["effort"]:
         return None
     if required(db, task):
         return None   # the user's own words require its pin
+    return fl
+
+
+def lift(db, cfg: dict, task: dict, provider: str) -> dict | None:
+    """The floor for this start of `task` on `provider`, or None when none applies or nothing would move:
+    {tier, from, effort (the run's effort floor, or None), effort_from, why}."""
+    fl = target(db, cfg, task)
+    if not fl:
+        return None
+    why = reasons(task)
     own = task.get("tier") if task.get("tier") in TIERS else "standard"
     tier = max(own, fl["tier"], key=TIERS.index)
     tiers = ((cfg.get("providers") or {}).get(provider) or {}).get("tiers") or {}
