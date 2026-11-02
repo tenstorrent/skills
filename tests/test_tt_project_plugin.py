@@ -4896,14 +4896,32 @@ class FakeIrd:
         p.write_text(json.dumps(c))
 
 
+@pytest.fixture(scope="session")
+def _public_repo_template(tmp_path_factory) -> pathlib.Path:
+    """The one-commit repository _e2e's runs clone, made once per session: each test copies it."""
+    import subprocess
+    repo = tmp_path_factory.mktemp("public-repo-template") / "public-repo"
+    repo.mkdir()
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "t",
+           "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True, env=env)
+    git("init", "-q")
+    (repo / "README").write_text("hello\n")
+    git("add", "README")
+    git("commit", "-q", "-m", "init")
+    return repo
+
+
 @pytest.fixture
-def fake_ird(tmp_path, leaked_tmp_processes, reap_tmp_processes):
+def fake_ird(tmp_path, leaked_tmp_processes, reap_tmp_processes, _public_repo_template):
     import socket
     import time
     srv = socket.socket()
     srv.bind(("127.0.0.1", 0))
     srv.listen(128)  # every probe connects and is never accepted
-    yield FakeIrd(tmp_path, srv.getsockname()[1])
+    f = FakeIrd(tmp_path, srv.getsockname()[1])
+    f.public_repo_template = _public_repo_template
+    yield f
     srv.close()
     deadline = time.time() + 5  # a hanging stub ends within 0.1 s of its caller
     while (left := leaked_tmp_processes(tmp_path)) and time.time() < deadline:
@@ -5421,14 +5439,7 @@ def _e2e(fake_ird, tmp_path, include=True):
         (shims / name).write_text(body)
         (shims / name).chmod(0o755)
     repo = tmp_path / "public-repo"
-    repo.mkdir()
-    git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True,
-                                    env={**fake_ird.env, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
-                                         "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
-    git("init", "-q")
-    (repo / "README").write_text("hello\n")
-    git("add", "README")
-    git("commit", "-q", "-m", "init")
+    shutil.copytree(fake_ird.public_repo_template, repo, symlinks=True)
     if include:
         (fake_ird.home / ".ssh").mkdir()
         (fake_ird.home / ".ssh" / "config").write_text(f"Include {fake_ird.ird_dir}/ssh-hosts\n")
