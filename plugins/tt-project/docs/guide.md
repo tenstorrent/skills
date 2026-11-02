@@ -1082,7 +1082,10 @@ queues behind routine work; nothing running is interrupted:
   does not go) instead of running uncapped. Unset, the cap follows the load: as many checks as the
   cores left over the 1-minute load average hold at an assumed load of 4 each, at least one slot
   per 16 cores (and at least one), at most one per 8. Running checks count in that load, so the cap
-  shrinks as they load the host; a running check keeps its slot. A set cap wins: `ttp config
+  shrinks as they load the host; a running check keeps its slot. Whatever the cap, a check starts only
+  while the host's free cores now (busy cores read from /proc/stat over a few seconds) cover one check's
+  measured cores; with no check running one always starts. Its test grant is then at most those free
+  cores (at least 2); `checks.live_cores 0` turns both off. A set cap wins: `ttp config
   --account checks.host_max N` (0 turns the cap off) or `TTP_CHECKS_HOST_MAX`. While
   the 1-minute load average is under half the cores, up to `checks.load_extra` more slots open (default 2,
   0 turns them off); check commands run under `nice -n 10`/`ionice -c3` (idle IO) unless `checks.nice` is false (`checks.nice` N, 0-19, sets the level, else `runner.nice`; `checks.ionice` `idle` or `best-effort[:0-7]`; both per project or account). Each check

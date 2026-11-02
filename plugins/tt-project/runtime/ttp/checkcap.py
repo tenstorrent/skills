@@ -40,6 +40,12 @@ below half. A check on one keeps it until it ends, but no new one takes one once
 They open beyond a default cap's ceiling too. checks.load_extra 0 also keeps a project's checks lanes
 per repository and the test pool at their floors (checklane.capacity, testslots.pool_now).
 
+Whatever the cap, a slot (of the cap or beyond it) is taken only while the host's live free cores cover
+one check's price (cores_short: busy cores from /proc/stat over the last few seconds, less the price of
+each check granted within RAMP_S), so a saturated host starts no more suites; with no check running one
+always starts. The run's test grant then follows the same free cores (testslots.live_room).
+`checks.live_cores` 0 (TTP_CHECKS_LIVE_CORES) turns both off.
+
 Waiters take turns by project (locks.fair_order); within one, by task priority (1 first), then arrival.
 The checks of a task that is a required owner of an open obligation (obligations.owned_open: an urgent
 deliverable owed to the user) queue at OBLIGATION_PRIORITY, ahead of every task priority, until it has its
@@ -69,7 +75,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import locks, obligations, poll_s, project, timefmt
+from . import hostcpu, locks, obligations, poll_s, project, timefmt
 
 RESOURCE = "checks"
 OBLIGATION_PRIORITY = 0   # an open obligation's required owner: before every task priority (1 and up)
@@ -189,6 +195,57 @@ def default_limit() -> int:
     floor, top = default_range()
     fit = int(max(0.0, cores() - _load()) // check_load())
     return min(top, max(floor, fit))
+
+
+RAMP_S = 30.0   # a check or test worker granted this recently may not show in the busy cores yet
+LIVE_ENV = "TTP_CHECKS_LIVE_CORES"
+
+
+def live_cores_on() -> bool:
+    """The live-cores gate (cores_short, testslots.live_room): TTP_CHECKS_LIVE_CORES, else the account's
+    checks.live_cores, default on; 0 turns it off."""
+    for v in (os.environ.get(LIVE_ENV), (project.load_account_settings().get("checks") or {}).get("live_cores")):
+        if v not in (None, "") and (n := _number(v)) is not None:
+            return bool(n)
+    return True
+
+
+def free_cores() -> float | None:
+    """This host's cores no process keeps busy now: its cores less hostcpu.busy_cores() (/proc/stat over
+    the last few seconds), or less the 1-minute load average where /proc/stat cannot be read; None
+    with neither readable."""
+    busy = hostcpu.busy_cores()
+    if busy is None and ((busy := _load()) != busy or busy == float("inf")):
+        return None
+    return max(0.0, cores() - busy)
+
+
+def held_since(paths: list[Path]) -> list[float]:
+    """When each slot among `paths` taken right now was taken (its label's since; 0 when unreadable)."""
+    out = []
+    for path in paths:
+        if not locks._slot_labels([path]):
+            continue
+        try:
+            out.append(float(json.loads(path.read_text() or "{}").get("since") or 0))
+        except (OSError, ValueError, TypeError, AttributeError):
+            out.append(0.0)
+    return out
+
+
+def cores_short(every: list[Path], now: float | None = None) -> str:
+    """Why no check may start now for want of cores, else "": one starts only while the host's live
+    free cores (free_cores()), less check_load() for each check granted within RAMP_S (its workers may
+    not show yet), cover one check's price (check_load()). With no check running on the host one
+    always starts, so checks never starve; checks.live_cores 0 or no reading lets every one start."""
+    if not live_cores_on() or not (held := held_since(every)) or (free := free_cores()) is None:
+        return ""
+    now = time.time() if now is None else now
+    price = check_load()
+    left = free - price * sum(1 for s in held if now - s < RAMP_S)
+    if left >= price:
+        return ""
+    return f"{max(0.0, left):.0f} of {cores()} cores free now, one check takes {price:.0f}"
 
 
 def _number(v) -> int | None:
@@ -506,7 +563,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                     groups = len({locks.ticket_group(t) for t in q} | {locks.ticket_group(ticket)})
                     tell(f"queued for a host-wide checks slot: {len(locks.held_labels(every))} of {n + extra(n)} running, "
                          f"{ahead} ahead, {groups} project{'s' if groups != 1 else ''}"
-                         + (", first in its project as an open obligation's owner" if queued_as != holder else ""))
+                         + (", first in its project as an open obligation's owner" if queued_as != holder else "")
+                         + (f"; waiting for free cores: {short}" if (short := cores_short(every)) else ""))
                 if not told and waiting:
                     waiting(True)
                 told = time.time()
@@ -569,7 +627,7 @@ def _take(n: int, ps: list[Path], every: list[Path], holder: str, what: str, sam
     """A slot of the cap, else one load opened beyond it, while fewer than cap plus extra() are held.
     The cap's own slots are tried first, so two takers racing never pass the cap with no extra open."""
     room = _room(n, every) if room is None else room
-    if room <= 0:
+    if room <= 0 or cores_short(every):
         return None
     f = locks.try_take(ps, holder, what, key=same)
     if f is None and (x := extra(n)):

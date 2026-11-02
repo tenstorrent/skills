@@ -4624,3 +4624,103 @@ def test_a_review_precheck_waiting_for_test_slots_keeps_its_lane_while_its_revie
         assert len(h) == 1 and h[0]["task"] == str(tid), h
     finally:
         g.close()
+
+
+def test_hostcpu_busy_cores_reads_proc_stat_deltas_and_spawns_nothing(monkeypatch):
+    # Busy cores come from /proc/stat's aggregate counters over the last few seconds; no process spawns.
+    import subprocess
+    from ttp import hostcpu
+    monkeypatch.setattr(hostcpu, "_LAST", {})
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(AssertionError("spawned")))
+    clock, stats, slept = [100.0], [], []
+
+    def stat(busy, idle):   # user nice system idle iowait irq softirq steal guest guest_nice
+        return f"cpu  {busy} 0 0 {idle} 0 0 0 0 7 7\ncpu0 1 2 3 4\n"
+
+    def read():
+        return stats[0]
+
+    def sleep(s):
+        slept.append(s)
+        clock[0] += s
+        stats.pop(0)
+    stats[:] = [stat(1000, 1000), stat(1000 + 75, 1000 + 25)]
+    assert hostcpu.busy_cores(read, sleep, lambda: clock[0], cpus=64) == 48.0, "75% of 64 cores over a fresh window"
+    assert slept == [hostcpu.SAMPLE_S], "no earlier reading: one SAMPLE_S window"
+    assert hostcpu.busy_cores(read, sleep, lambda: clock[0], cpus=64) == 48.0, "under SAMPLE_S later: the last value"
+    clock[0] += 5.0
+    stats[:] = [stat(1075 + 10, 1025 + 90)]
+    assert hostcpu.busy_cores(read, sleep, lambda: clock[0], cpus=64) == 6.4, "since the last reading, no sleep"
+    assert slept == [hostcpu.SAMPLE_S]
+    clock[0] += hostcpu.FRESH_S + 1
+    stats[:] = [stat(5000, 5000), stat(5000, 5100)]
+    assert hostcpu.busy_cores(read, sleep, lambda: clock[0], cpus=64) == 0.0, "a stale reading starts a fresh window"
+    clock[0] += 5.0
+    assert hostcpu.busy_cores(lambda: (_ for _ in ()).throw(OSError()), sleep, lambda: clock[0]) is None
+    assert hostcpu.jiffies("intr 1 2\n") is None and hostcpu.jiffies("cpu  1 2\n") is None
+
+
+def test_checks_live_cores_gate_waits_on_a_saturated_host_and_always_admits_one(env, monkeypatch):
+    # A check slot starts a suite only while the host's live free cores cover one check's price; with no
+    # check running one always starts, so checks never starve.
+    from ttp import checkcap, hostcpu
+    monkeypatch.setenv("TTP_CHECKS_LIVE_CORES", "1")
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "8")
+    monkeypatch.setattr(checkcap, "POLL_S", 0.02)
+    monkeypatch.setattr(checkcap, "cores", lambda: 64)
+    monkeypatch.setattr(checkcap, "check_load", lambda: 8.0)
+    busy = [60.0]
+    monkeypatch.setattr(hostcpu, "busy_cores", lambda: busy[0])
+    first = checkcap.acquire("first")
+    try:
+        assert first.f is not None, "the floor: none running, so one starts on a saturated host"
+        told = []
+        assert checkcap.acquire("second", tell=told.append, max_wait_s=0.3) is None, "4 cores free: it waits"
+        # 4 free, less 8 for the first check granted within RAMP_S
+        assert any("waiting for free cores: 0 of 64 cores free now, one check takes 8" in x for x in told), told
+        busy[0] = 10.0
+        second = checkcap.acquire("second", max_wait_s=5)
+        assert second is not None and second.f is not None, "an idle host admits it"
+        busy[0] = 41.0   # 23 free, less 8 for each of the two checks granted within RAMP_S: 7
+        assert checkcap.acquire("third", max_wait_s=0.2) is None, "just-granted checks count before they show"
+        monkeypatch.setattr(checkcap, "RAMP_S", 0.0)
+        third = checkcap.acquire("third", max_wait_s=5)
+        assert third is not None and third.f is not None, "once they show in the busy cores, 23 free admit one"
+        third.close()
+        monkeypatch.setattr(hostcpu, "busy_cores", lambda: None)   # no /proc/stat: the load average
+        monkeypatch.setattr(checkcap.os, "getloadavg", lambda: (70.0, 0.0, 0.0))
+        assert checkcap.cores_short(checkcap.all_paths(8)) == "0 of 64 cores free now, one check takes 8"
+        monkeypatch.setattr(checkcap.os, "getloadavg", lambda: (_ for _ in ()).throw(OSError()))
+        assert checkcap.cores_short(checkcap.all_paths(8)) == "", "nothing readable: no gate"
+        monkeypatch.setattr(checkcap.os, "getloadavg", lambda: (70.0, 0.0, 0.0))
+        monkeypatch.setenv("TTP_CHECKS_LIVE_CORES", "0")
+        assert checkcap.cores_short(checkcap.all_paths(8)) == "", "checks.live_cores 0 turns it off"
+        second.close()
+    finally:
+        first.close()
+
+
+def test_test_slots_grant_follows_the_hosts_live_free_cores(env, monkeypatch):
+    # Each run's xdist workers are min(its share, the host's free cores less workers just granted), at least 2.
+    from ttp import checkcap, hostcpu, testslots
+    monkeypatch.setenv("TTP_CHECKS_LIVE_CORES", "1")
+    monkeypatch.setattr(checkcap, "cores", lambda: 64)
+    busy = [0.0]
+    monkeypatch.setattr(hostcpu, "busy_cores", lambda: busy[0])
+    assert testslots.sizes() == (32, 8)
+    with testslots.acquire("idle") as g:
+        assert g.k == 8 and g.env()[testslots.XDIST_ENV] == "8", "an idle host: the full share"
+    busy[0] = 58.5
+    told = []
+    with testslots.acquire("busy", tell=told.append) as g:
+        assert g.k == 5 and g.env()[testslots.XDIST_ENV] == "5", "5.5 cores free: 5 workers"
+        assert "sized to the host's free cores" in told[-1], told
+        busy[0] = 54.0   # 10 free, less the 5 workers granted just now
+        with testslots.acquire("next") as h:
+            assert h.k == 5 and h.env()[testslots.XDIST_ENV] == "5"
+    busy[0] = 64.0
+    with testslots.acquire("saturated") as g:
+        assert g.k == testslots.WORKERS_FLOOR == 2, "never below the floor"
+    monkeypatch.setenv("TTP_CHECKS_LIVE_CORES", "0")
+    with testslots.acquire("off") as g:
+        assert g.k == 8, "checks.live_cores 0: the share alone"

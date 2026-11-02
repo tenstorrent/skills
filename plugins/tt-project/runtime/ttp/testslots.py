@@ -21,7 +21,9 @@ half to live work and builds; one run takes at most min(RUN_MAX, half the pool),
 runs always fit side by side and no suite takes the pool. Unset, the test pool a run takes from also
 grows into spare cores (pool_now: the slots in use plus the cores the 1-minute load average leaves, at most
 the host's cores), so the extra lanes an idle host gives (checklane.capacity) get their workers; a busy
-host keeps the half, as does checks.load_extra 0. The account settings checks.test_pool and
+host keeps the half, as does checks.load_extra 0. A test grant is also at most the host's live free cores, less one for
+each worker granted in the last few seconds, at least WORKERS_FLOOR (live_room; checks.live_cores 0
+turns it off), so a run on a busy host starts fewer workers instead of oversubscribing it. The account settings checks.test_pool and
 checks.test_run_max (or TTP_TEST_POOL / TTP_TEST_RUN_MAX) set them; checks.test_pool 0 turns the pool
 off. A project's own checks.test_pool / checks.test_run_max may only lower them.
 
@@ -80,6 +82,7 @@ from . import checkcap, locks, poll_s, project
 
 RESOURCE = "test-slots"    # check-slots/test-slots.<i>.lock
 RUN_MAX = 8                # one run's most workers by default: past about 8 a suite's wall time gains little
+WORKERS_FLOOR = 2          # a run's fewest workers when the host's free cores are short (live_room)
 SLOTS_ENV = "TTP_TEST_SLOTS"
 XDIST_ENV = "PYTEST_XDIST_AUTO_NUM_WORKERS"
 HELD_ENV = "TTP_TEST_SLOTS_HELD"   # set for the commands of a run that holds slots: the grant
@@ -175,6 +178,17 @@ def pool_now(cfg: dict | None, pool: int, held: int, cores: int | None = None, l
     if ld != ld or ld == float("inf"):
         return pool
     return max(pool, min(c, held + int(max(0.0, c - ld))))
+
+
+def live_room(every: list) -> int | None:
+    """The test workers a run may start for the host's live free cores (checkcap.free_cores), less one
+    for each slot among `every` taken within checkcap.RAMP_S (those workers may not show yet), at least
+    WORKERS_FLOOR; None with checks.live_cores 0 or no reading."""
+    if not checkcap.live_cores_on() or (free := checkcap.free_cores()) is None:
+        return None
+    now = time.time()
+    young = sum(1 for s in checkcap.held_since(every) if now - s < checkcap.RAMP_S)
+    return max(WORKERS_FLOOR, int(free - young))
 
 
 def project_max(cfg: dict | None = None, s: tuple[int, int] | None = None, kind: Kind = TESTS) -> int:
@@ -340,6 +354,11 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
             used = len(locks._slot_labels(paths(max(pool, checkcap.cores()), kind)))
             pool = pool_now(cfg, pool, used, kind=kind)
             room = max(0, min(top, pool - used))   # never more than the pool has left
+            if kind is TESTS and room and (live := live_room(paths(max(pool, checkcap.cores()), kind))) is not None \
+                    and live < room:
+                room, sized = live, f", sized to the host's free cores (at least {WORKERS_FLOOR})"
+            else:
+                sized = ""
             ps, own = paths(pool, kind), own_paths(name, project_max(cfg, (pool, s[1]), kind), kind)
             k, files, why = 0, [], f"all {pool} are held"
             try:
@@ -389,7 +408,8 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
             if k:
                 tell(f"{what}: {k} granted of a host pool of {pool} (at most {top} per run"
                      + (f", {len(own)} per project" if own else "") + f") after {waited:.0f} s waiting; "
-                     + (f"builds run with MAKEFLAGS=-j{k}" if kind is BUILDS else f"tests run with {XDIST_ENV}={k}"))
+                     + (f"builds run with MAKEFLAGS=-j{k}" if kind is BUILDS else f"tests run with {XDIST_ENV}={k}")
+                     + sized)
                 return Grant(k, files, waited, kind)
             if stop and (why := stop()):
                 raise checkcap.Cancelled(why)

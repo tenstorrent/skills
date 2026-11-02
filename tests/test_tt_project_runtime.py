@@ -497,6 +497,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
                 "CMAKE_BUILD_PARALLEL_LEVEL"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")   # the checks cap never grows with this host's load
+    monkeypatch.setenv("TTP_CHECKS_LIVE_CORES", "0")   # nor waits on this host's busy cores
     monkeypatch.setenv("TTP_CHECKS_SLOTS", "1")   # one checks lane per repository, whatever this host's size
     # Tests may run from an ssh login: timefmt.in_ssh_login() is false unless a test sets it.
     for var in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"):
