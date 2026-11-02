@@ -5,11 +5,11 @@ from __future__ import annotations
 from ttp.db import load_result
 
 
-def _hand_off_waiting(env, p, d, monkeypatch, cmd, title="waits on its job"):
+def _hand_off_waiting(env, p, d, monkeypatch, cmd, title="waits on its job", probe="false"):
     """A fake worker run of a new task that hands off `waiting` with on_pass_cmd `cmd`; the task's row."""
     monkeypatch.setenv("TTP_FAKE_SESSION", "s1")
     monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({
-        "status": "waiting", "summary": "job runs", "waiting_for": "its job", "retry_when": "false",
+        "status": "waiting", "summary": "job runs", "waiting_for": "its job", "retry_when": probe,
         "retry_after_s": 600, "on_pass_cmd": cmd, "on_pass": {"status": "done", "summary": "job passed"}}))
     tid = p.db.add_task(title, "run the job", kind="work", tier="light", origin="user")
     d.dispatch()
@@ -140,3 +140,102 @@ def test_under_a_dry_run_ttp_note_notify_and_push_do_nothing_and_lock_is_refused
     # Without the variable, `ttp note` writes as before.
     assert _ttp_run(p, "note", "x", env={"TTP_RUN_DIR": str(run_dir)}).returncode == 0
     assert (run_dir / "progress.md").exists()
+
+
+def test_an_on_pass_cmd_that_exits_0_without_writing_ttp_result_is_handed_back_at_hand_off(env, monkeypatch):
+    # A passed probe of such a command never records done (it wakes a model run): caught when its run hands off.
+    p = make(env)
+    from ttp import onpassdry
+    from ttp.daemon import Daemon
+    _sessions(env, monkeypatch, "s1")
+    d = Daemon(p.base)
+    t = _hand_off_waiting(env, p, d, monkeypatch, "echo checked")
+    res = load_result(t["result"])
+    assert t["status"] == "queued" and res[onpassdry.KEY]["session"] == "s1" and "waiting_since" not in res
+    assert res[onpassdry.KEY]["no_result"] and "without writing a hand-off to $TTP_RESULT" in res["woke"]
+    got = json.loads((pathlib.Path(_last_run(p, t["id"])["dir"]) / onpassdry.FILE).read_text())
+    assert got["verdict"] == onpassdry.NO_RESULT and got["rc"] == 0 and got["wrote"] is None
+    assert d._resumable(t, "fake")["cause"] == "dry_run"
+    # The handed-back run hands off the same: it stands now, with the reason in its summary.
+    d.dispatch()
+    _finish_runs(p, d)
+    res = load_result(p.db.task(t["id"])["result"])
+    assert res.get("waiting_since") and onpassdry.KEY not in res
+    assert res["summary"].startswith("WARNING: on_pass_cmd dry run: it exited 0 without writing"), res["summary"]
+
+
+def test_a_valid_on_pass_cmd_passes_its_dry_run_and_still_records_done_model_free(env, monkeypatch):
+    p = make(env)
+    from ttp import onpassdry, daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    _sessions(env, monkeypatch, "s1")
+    d = dmod.Daemon(p.base)
+    cmd = 'printf \'{"status":"done","summary":"job verified"}\' > "$TTP_RESULT"'
+    t = _hand_off_waiting(env, p, d, monkeypatch, cmd, probe="true")
+    res = load_result(t["result"])
+    assert onpassdry.KEY not in res and onpassdry.NOTE_KEY not in res and res.get("waiting_since")
+    got = json.loads((pathlib.Path(_last_run(p, t["id"])["dir"]) / onpassdry.FILE).read_text())
+    assert got["verdict"] == "ok" and got["wrote"] == {"status": "done", "keys": ["status", "summary"]}
+    _settle_on_pass(d, t["id"])
+    task = p.db.task(t["id"])
+    res = load_result(task["result"])
+    assert task["status"] == "done" and res["run_status"] == "model-free" and res["summary"] == "job verified"
+    assert len(p.db.q("SELECT id FROM runs WHERE task=?", (t["id"],))) == 1
+
+
+def test_an_on_pass_cmd_that_sets_ttp_result_itself_is_not_dry_run_and_is_handed_back(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import onpassdry
+    from ttp.daemon import Daemon
+    _sessions(env, monkeypatch, "s1")
+    d = Daemon(p.base)
+    target = tmp_path / "hand-off.json"
+    t = _hand_off_waiting(env, p, d, monkeypatch, f"TTP_RESULT={target} bash -c 'echo {{}} > $TTP_RESULT'")
+    res = load_result(t["result"])
+    assert res[onpassdry.KEY]["no_result"] and "sets TTP_RESULT itself" in res["woke"]
+    assert not target.exists(), "the dry run must not write where the command points TTP_RESULT"
+    got = json.loads((pathlib.Path(_last_run(p, t["id"])["dir"]) / onpassdry.FILE).read_text())
+    assert got["verdict"] == onpassdry.NO_RESULT and onpassdry.said(got) == "not run"
+    # Bypasses: export, env, a quoted path; passing the daemon's own path on is fine.
+    for cmd in ("export TTP_RESULT=/x; run", "env TTP_RESULT=/x run", 'TTP_RESULT="/x" run', "a; TTP_RESULT=$HOME/r run"):
+        assert onpassdry.sets_result(cmd), cmd
+    for cmd in ('TTP_RESULT="$TTP_RESULT" run', "TTP_RESULT=${TTP_RESULT} run", "echo > $TTP_RESULT",
+                "MY_TTP_RESULT=/x run", 'printf x > "$TTP_RESULT"'):
+        assert not onpassdry.sets_result(cmd), cmd
+
+
+def test_an_exit_0_dry_run_is_judged_on_what_it_wrote_and_on_a_deliberate_early_exit(env, tmp_path):
+    from ttp import onpassdry
+    from ttp.daemon import WAIT_KEYS, _checks_result_wait
+    env_ = dict(os.environ)
+
+    def why(cmd, fallback=False):
+        return onpassdry.no_result(onpassdry.run(cmd, tmp_path, env_, 10), cmd, tmp_path, fallback, WAIT_KEYS)
+    assert "without writing a hand-off" in why("true")
+    assert why('printf \'{"status":"done","summary":"s"}\' > "$TTP_RESULT"') == ""
+    # A final hand-off that carries a wait is refused once the probe passes: so is its dry run.
+    assert "carries retry_after_s" in why('echo \'{"status":"done","summary":"s","retry_after_s":60}\' > "$TTP_RESULT"')
+    assert "no JSON object" in why('echo "[1]" > "$TTP_RESULT"') and "no JSON object" in why('echo x > "$TTP_RESULT"')
+    # A failed dry run stays inconclusive, as before; a `ttp checks --result` wait falls back to its on_pass.
+    assert why("exit 1") == "" and why("true", fallback=True) == ""
+    assert _checks_result_wait("ttp checks --result /r/1") and not _checks_result_wait("ttp checks --result /r/1 && true")
+    # A script that exits early on the dry run's variable on purpose, by absolute or relative path.
+    early = tmp_path / "on_pass.py"
+    early.write_text("import os, sys\nif os.environ.get('TTP_ON_PASS_DRY_RUN'):\n    sys.exit(0)\n")
+    plain = tmp_path / "plain.sh"
+    plain.write_text("echo nothing\n")
+    assert why(f"python3 {early}") == "" and why("python3 on_pass.py") == ""
+    assert "without writing" in why(f"bash {plain}") and "without writing" in why(f"true --script={plain}")
+    assert "without writing" in why("true " + "x" * 5000)   # a word too long for a path is no script
+
+
+def test_an_empty_on_pass_cmd_names_none_so_a_passed_check_records_on_pass(env, monkeypatch):
+    p = make(env)
+    from ttp import onpassdry
+    from ttp.daemon import Daemon
+    _sessions(env, monkeypatch, "s1")
+    d = Daemon(p.base)
+    t = _hand_off_waiting(env, p, d, monkeypatch, "  ")
+    res = load_result(t["result"])
+    assert "on_pass_cmd" not in res and res.get("waiting_since") and onpassdry.KEY not in res
+    assert res["on_pass"] == {"status": "done", "summary": "job passed"}
