@@ -65,8 +65,10 @@ gh workflow run "$WORKFLOW" -R "$REPO" \
   -f workflow=agentic
 ```
 
-Use the granted workflow as it is, with its default setup and cleanup. The job owns its runner,
-so do not fork, wrap or patch the workflow, and add no admission checks of your own.
+Use the granted workflow as it is, with its default setup and cleanup; do not fork, wrap or patch
+it. Other users share the runner pool: `max_parallel` is a ceiling, not machines waiting idle, so
+jobs may queue. Queueing is not a failure; never cancel a run only because it has no runner yet.
+Dispatch the first CI smoke early so the wait overlaps local work.
 
 No run id is returned: poll for the new run and register it before dispatching the next. The ledger
 is shared state when several explorers dispatch — register at launch, not at collection. Count
