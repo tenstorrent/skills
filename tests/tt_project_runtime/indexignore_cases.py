@@ -123,3 +123,28 @@ def test_index_ignore_is_written_at_daemon_start(env, monkeypatch):
     monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
     assert d.run() == 0
     assert indexignore.BEGIN in (p.root / ".ignore").read_text()
+
+
+def test_index_ignore_never_raises_and_leaves_odd_files_and_home_alone(tmp_path, monkeypatch):
+    from ttp import indexignore
+    from ttp.project import Project
+    p = _ii_project(tmp_path)
+    (p.root / ".ignore").mkdir()   # a folder by that name
+    assert indexignore.ensure(p) == "" and (p.root / ".ignore").is_dir()
+    (p.root / ".ignore").rmdir()
+    (tmp_path / "shared.ignore").write_text("x/\n")
+    (p.root / ".ignore").symlink_to(tmp_path / "shared.ignore")
+    assert indexignore.ensure(p) == "" and (tmp_path / "shared.ignore").read_text() == "x/\n"
+    (p.root / ".ignore").unlink()
+    (p.root / ".ignore").write_bytes(b"\xff\xfe\n")
+    assert indexignore.ensure(p).startswith("left ")
+    (p.root / ".ignore").unlink()
+    p.root.chmod(0o555)   # cannot write the root
+    try:
+        assert indexignore.ensure(p).startswith("left ") or os.geteuid() == 0
+    finally:
+        p.root.chmod(0o755)
+    home = tmp_path / "home"
+    (home / "tt-project").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    assert indexignore.ensure(Project(home)) == "" and not (home / ".ignore").exists()

@@ -66,9 +66,21 @@ def _exclude_locally(root: Path) -> None:
 
 
 def ensure(p: Project) -> str:
-    """Write or refresh the block; returns what it did ("" when nothing changed)."""
+    """Write or refresh the block; returns what it did ("" when nothing changed). Never raises for a
+    file it cannot read or write: no project start or daemon start waits on it."""
+    try:
+        return _ensure(p)
+    except (OSError, ValueError) as e:
+        return f"left {p.root / NAME} as it is: {e}"
+
+
+def _ensure(p: Project) -> str:
     path = p.root / NAME
-    text = path.read_text() if path.is_file() else None
+    if p.root.resolve() in (Path.home().resolve(), Path("/")):   # every rg search under it would skip them
+        return ""
+    if path.is_symlink() or (path.exists() and not path.is_file()):   # the project's own arrangement
+        return ""
+    text = path.read_text() if path.exists() else None
     if text is None:
         durable_write(path, block())
         _exclude_locally(p.root)
