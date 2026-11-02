@@ -898,6 +898,9 @@ def _clone_project(env, name):
     _rewrite_history(p.harness, snap)
     # The database as bootstrap fills it, at this time.
     db = p.db
+    from ttp import configwho
+    for key in cfg:
+        configwho.record(db, key, configwho.by("default", via="project creation"), after=cfg)
     for s in json.loads((cli.PLUGIN_ROOT / "template" / "recurring.json").read_text()):
         sched.upsert(db, s["name"], s["kind"], s["every"], s.get("at"), s.get("enabled", True),
                      s.get("budget_usd_day"), s.get("description", ""), s.get("payload", {}), cfg[timefmt.KEY])
@@ -929,6 +932,15 @@ def _project_picture(p) -> dict:
         return "<time>" if isinstance(v, (float, str)) and re.fullmatch(r"1[0-9]{9}(\.[0-9]*)?", str(v)) else v
     tables = {r["name"]: [{k: when(v) for k, v in row.items()} for row in p.db.q(f"SELECT * FROM [{r['name']}]")]
               for r in p.db.q("SELECT name FROM sqlite_master WHERE type='table'")}
+    from ttp import configwho
+    for row in tables.get("kv", []):
+        if row["key"] == configwho.KEY:   # setter records: their times, and digests checked against this config
+            full = json.loads(p.config_path.read_text())
+            recs = json.loads(row["value"])
+            for k, rec in recs.items():
+                assert rec.pop("h") == configwho.digest(configwho.at(full, k)), k
+                rec["ts"] = when(rec["ts"])
+            row["value"] = recs
     return {"files": files, "config": cfg, "db": tables,
             "log": git("log", "--graph", "--format=%s|%an|%ae|%cn|%ce", "--all", "--topo-order"),
             "reflogs": [len(git("reflog", "show", ref)[1].splitlines()) for ref in ("HEAD", "main", "upstream")],
