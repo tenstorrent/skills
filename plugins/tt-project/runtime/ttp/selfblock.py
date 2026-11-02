@@ -74,6 +74,10 @@ _NEGATED = re.compile(r"\b(?:no|without|not\s+an?y?)\s+(?:other\s+)?(?:tenants?|
                       r"other\s+projects?)\b|\bnobody\s+else\b|\bnot\s+(?:in\s+use|used\s+by\s+\w+)", re.I)
 
 
+# A cite said in the negative ("no longer waiting for your ok", "never held for the user's word").
+_DENIED = re.compile(r"\b(?:no|not|never|without|no\s+longer|instead\s+of|rather\s+than)\b[\w\s']{0,20}$", re.I)
+
+
 def gate(text: str) -> str | None:
     """The kind of real user gate `text` names (GATES), or None."""
     said = _NEGATED.sub(" ", (text or "").replace("’", "'"))
@@ -93,7 +97,7 @@ def finding(text: str, cite: bool = True) -> str | None:
     """The cited wording when `text` holds work for the user (or, with `cite` False, whatever it says)
     and names no real gate; None when it is quiet."""
     said = " ".join((text or "").replace("’", "'").split())
-    m = CITE.search(said)
+    m = next((m for m in CITE.finditer(said) if not _DENIED.search(said[max(0, m.start() - 36):m.start()])), None)
     if (cite and not m) or not said or gate(said):
         return None
     return m.group(0) if m else said[:80]
@@ -106,6 +110,17 @@ def _fp(source: str, ident, text: str) -> str:
 def _clip(s: str, n: int = 200) -> str:
     s = " ".join(str(s or "").split())
     return s if len(s) <= n else s[:n - 1].rstrip() + "…"
+
+
+def _waiting_for(t: dict) -> str:
+    """A waiting task's hand-off `waiting_for`, or ''."""
+    if t.get("status") != "waiting":
+        return ""
+    try:
+        res = json.loads(t.get("result") or "{}")
+    except (TypeError, ValueError):
+        return ""
+    return str(res.get("waiting_for") or "") if isinstance(res, dict) else ""
 
 
 def scan(db, now: float | None = None) -> list[dict]:
@@ -123,13 +138,14 @@ def scan(db, now: float | None = None) -> list[dict]:
 
     user_only = [aid for aid, a in asks.items() if blocking(a) in USER_ONLY_ASKS]
     out = []
-    for t in db.q("SELECT id, status, labels, blocked_reason FROM tasks WHERE status IN ('blocked','waiting') "
-                  "AND COALESCE(blocked_reason,'')!='' ORDER BY id"):
+    for t in db.q("SELECT id, status, labels, blocked_reason, result FROM tasks WHERE status IN ('blocked','waiting') "
+                  "ORDER BY id"):
         t = dict(t)
-        if held_key(t) or _held_ask(t) in user_only or any(_cites(t["blocked_reason"], aid) for aid in user_only):
+        why = " ".join(x for x in (t["blocked_reason"] or "", _waiting_for(t)) if x)
+        if not why or held_key(t) or _held_ask(t) in user_only or any(_cites(why, aid) for aid in user_only):
             continue
-        if (cited := finding(t["blocked_reason"])):
-            out.append({"source": "task", "id": t["id"], "text": t["blocked_reason"], "cited": cited})
+        if (cited := finding(why)):
+            out.append({"source": "task", "id": t["id"], "text": why, "cited": cited})
     for aid, a in asks.items():
         if blocking(a) in CHECKED_ASKS and (cited := finding(a["text"], cite=False)):
             out.append({"source": "ask", "id": aid, "text": a["text"], "cited": cited})

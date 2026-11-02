@@ -38,6 +38,11 @@ def test_selfblock_finding_fires_for_the_coordinators_own_call_and_is_quiet_for_
     assert selfblock.finding("waits for the broker queue to drain") is None
     assert selfblock.finding("In the user's words (verbatim): keep going") is None
     assert selfblock.finding("") is None
+    # Said in the negative, or with curly quotes and no apostrophe: read as written.
+    assert selfblock.finding("Decided the pacing myself, no longer waiting for your ok") is None
+    assert selfblock.finding("A project gate is never held for the user's word") is None
+    assert selfblock.finding("Held on the user’s say-so for the pacing")
+    assert selfblock.finding("blocked: the users word decides the hold scope")
 
 
 def test_selfblock_raises_one_event_per_finding_from_tasks_asks_and_replies(env):
@@ -93,6 +98,19 @@ def test_selfblock_quiet_for_a_setting_hold_and_a_queued_task(env):
     q = db.add_task("queued")
     db.update_task(q, blocked_reason=_SELF_BLOCKING[0])   # queued: no hold
     assert selfblock.scan(db) == []
+
+
+def test_selfblock_reads_a_waiting_tasks_hand_off_and_survives_a_torn_result(env):
+    p = make(env)
+    from ttp import selfblock
+    db = p.db
+    w = db.add_task("waits")
+    db.update_task(w, status="waiting", result=json.dumps({"waiting_for": "the user's ok on the landing order"}))
+    torn = db.add_task("torn")
+    db.update_task(torn, status="waiting", result="{not json")
+    signin = db.add_task("sign in")
+    db.update_task(signin, status="waiting", result=json.dumps({"waiting_for": "waits for the user to sign in"}))
+    assert [(f["source"], f["id"]) for f in selfblock.scan(db)] == [("task", w)]
 
 
 def test_daemon_self_blocking_check_raises_and_survives_a_failure(env, monkeypatch):
