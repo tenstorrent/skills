@@ -1260,7 +1260,11 @@ def device_test_run(commands: str, cmd: str = "") -> tuple[str | None, str | Non
             return (f"{lead}, and `ttp sandbox` hides the device nodes only while TTP_NO_DEVICE=1 reaches it: "
                     f"leave TTP_NO_DEVICE and the environment as they are (no `TTP_NO_DEVICE=`, `unset`, "
                     f"`env -u` or `env -i`). {tail}"), None, None
-        if os.environ.get(HOOK_REWRITE) == "1" and (new := _sandboxed_tail(cmd, raw, k, wrapped)):
+        try:   # a fault here refuses the call, as before: the hook fails open
+            new = _sandboxed_tail(cmd, raw, k, wrapped) if os.environ.get(HOOK_REWRITE) == "1" else None
+        except Exception:
+            new = None
+        if new:
             _log_refusal(cmd, kind="rewrite", rewritten=new)
             test = " ".join(raw[k:])[:120]
             return None, (f"tt-project: `{test}` ran in `ttp sandbox` ({lead}; the sandbox hides the device "

@@ -405,7 +405,7 @@ def test_the_hook_rewrites_a_trailing_no_device_test_run_into_the_sandbox(cmd, n
     "pytest -q 2>&1 | tail -5", "pytest -q > out.txt", "pytest -q && git status", "(cd x && pytest)",
     "for f in a b; do pytest $f; done", "bash -lc 'pytest -q'", "sudo pytest", "pytest a; pytest b",
     "a |\npytest", "pytest -q &", "case a in a) pytest;; esac", "echo $(\npytest)", "pytest - <<EOF\nx\nEOF",
-    "pytest -q \\\n  tests/x.py", "'pytest' -q", "cat <<EOF; pytest -q\nx\n",
+    "pytest -q \\\n  tests/x.py", "'pytest' -q", "cat <<EOF; pytest -q\nx\n", "bash <<EOF\npytest -q\nEOF",
 ])
 def test_the_hook_refuses_a_no_device_test_run_it_cannot_rewrite_alone(cmd, tmp_path, monkeypatch):
     from ttp import hook
@@ -420,6 +420,13 @@ def test_the_hook_never_rewrites_a_test_run_that_changes_ttp_no_device(cmd, tmp_
     out = _device_hook(monkeypatch, tmp_path, rewrite=True)(cmd)
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert "leave TTP_NO_DEVICE" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_a_fault_in_the_rewrite_refuses_the_call(tmp_path, monkeypatch):
+    from ttp import hook
+    call = _device_hook(monkeypatch, tmp_path, rewrite=True)
+    monkeypatch.setattr(hook, "_sandboxed_tail", lambda *a: 1 / 0)
+    assert call("pytest -q")["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 def test_the_hook_refuses_instead_of_rewriting_without_a_cli_that_applies_updated_input(tmp_path, monkeypatch):
