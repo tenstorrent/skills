@@ -711,7 +711,8 @@ def inventory_line(rows: list[dict]) -> str:
 def asks(db: DB, since: float, now: float | None = None, chat_min: str | None = None) -> list[dict]:
     """Asks sent since `since`: {id, blocking, answered, handback (the phrase or None), how (the
     first rule that linked an answer: named, thread, resolved, only_open or newest; None), answer
-    (the earliest linked answer's text, cut to 200 chars) and answered_at (its time)}. `chat_min` is the
+    (the earliest linked answer's text, cut to 200 chars), answered_at (its time), landed ({tasks, ts}
+    when close_landed closed it) and step ({task, ts} when close_step_done closed it)}. `chat_min` is the
     project's notify.chat_min_severity, the floor under every relay chat's own."""
     now = time.time() if now is None else now
     # Older asks still count as open when a plain reply is matched, so it is not given to a newer one.
@@ -802,13 +803,23 @@ def asks(db: DB, since: float, now: float | None = None, chat_min: str | None = 
                 and not off_topic(m["text"], open_[-1]["text"]):
             link(open_[-1], m, m["text"], "newest")
     return [{**{k: v for k, v in rows[a["id"]].items() if k != "first"}, "answered_at": rows[a["id"]]["first"],
-             "landed": _landed(resolved, a["id"])} for a in sent if a["ts"] >= since]
+             "landed": _landed(resolved, a["id"]), "step": _step(resolved, a["id"])} for a in sent if a["ts"] >= since]
 
 
 def _landed(resolved: dict, ask_id: int) -> dict | None:
     """{"tasks", "ts"} when close_landed closed the ask, else None."""
     r = resolved.get(str(ask_id))
     return {"tasks": list(r["landed"]), "ts": float(r.get("ts") or 0)} if isinstance(r, dict) and r.get("landed") else None
+
+
+def _step(resolved: dict, ask_id: int) -> dict | None:
+    """{"task", "ts"} when close_step_done closed the ask (that task's user step was done), else None
+    (also for a record that does not decode)."""
+    r = resolved.get(str(ask_id))
+    try:
+        return {"task": int(r["step"]), "ts": float(r.get("ts") or 0)} if isinstance(r, dict) and r.get("step") else None
+    except (TypeError, ValueError):
+        return None
 
 
 def asks_line(rows: list[dict]) -> str:

@@ -87,8 +87,14 @@ def asks(db: DB, since: float, now: float, p: Project | None = None) -> list[dic
         rec = m["text"].split(_REC_NOTE, 1)[1].split("\n\n")[0] if _REC_NOTE in m["text"] else ""
         out.append({**r, "question": _short(_ask_question(m["text"])), "recommendation": _short(rec, 100),
                     "wait_s": (r["answered_at"] - m["ts"]) if r.get("answered_at") else None,
-                    "open_s": None if r.get("answered_at") else (r["landed"]["ts"] if r.get("landed") else now) - m["ts"]})
+                    "open_s": None if r.get("answered_at") else _closed_at(r, now) - m["ts"]})
     return out
+
+
+def _closed_at(r: dict, now: float) -> float:
+    """When an unanswered ask stopped being open: its work landing or its user step being done, else now."""
+    closed = r.get("landed") or r.get("step")
+    return closed["ts"] if closed and closed.get("ts") else now
 
 
 def rejected_asks(db: DB, since: float) -> list[str]:
@@ -429,6 +435,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         elif a.get("landed"):
             how = (f"resolved: its work landed ({', '.join(f'#{t}' for t in a['landed']['tasks'])}), "
                    f"after {_dur(a['open_s'])} with no answer")
+        elif a.get("step"):
+            how = f"resolved: #{a['step']['task']}'s user step was done, after {_dur(a['open_s'])}"
         else:
             how = f"no answer yet, open {_dur(a['open_s'])}"
         out.append(f"ask {a['id']} ({a['blocking']}): \"{a['question']}\"{rec}; {how}")
@@ -439,8 +447,10 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
     back = [a for a in sent if a["handback"]]
     if sent:
         landed = sum(bool(a.get("landed")) and not a["answered"] for a in sent)
+        step = sum(bool(a.get("step")) and not a["answered"] and not a.get("landed") for a in sent)
         out.append(f"asks: {len(sent)} sent, {sum(a['answered'] for a in sent)} answered, {len(back)} handed back"
-                   + (f", {landed} resolved as their work landed" if landed else ""))
+                   + (f", {landed} resolved as their work landed" if landed else "")
+                   + (f", {step} resolved as their user step was done" if step else ""))
     if ordered := relay.ordered_line(db, since):   # changes made on the owner's agent's words alone
         out.append(ordered)
     fails = failed_runs(db, since)

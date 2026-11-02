@@ -352,3 +352,48 @@ def test_a_non_access_ask_still_closes_when_the_task_it_names_lands(env):
     a = _step_ask(p, f"May #{x} ship to the branch?", ref="blocking:review")
     p.db.update_task(x, status="done")
     assert unblock.close_landed(p.db, [x]) == [a] and a not in _step_open_asks(p)
+
+
+def test_the_daily_audit_shows_an_ask_closed_by_a_done_user_step_as_resolved_with_a_fixed_open_time(env):
+    """An access ask that close_step_done closed shows 'resolved: #<task>'s user step was done', its open
+    time ending at the close, a day later too. A landed ask and an answered one keep their lines."""
+    from ttp import audit, unblock
+    p = make(env)
+    now = time.time()
+    y = _add_deferred(p)
+    x = p.db.add_task("ship it", "s", kind="code", origin="coordinator")
+    step = _step_ask(p, f"Please sign in to the example tool so #{y} can run?", ago=3 * 3600)
+    landed = _step_ask(p, f"May #{x} ship to the branch?", ref="blocking:review", ago=3 * 3600)
+    answered = _step_ask(p, "Which example model should the run use?", ref="blocking:choice", ago=3 * 3600)
+    plain = _step_ask(p, "Grant the token the workflow scope?", ref="blocking:review", ago=3 * 3600)
+    p.db.x("INSERT INTO messages(ts,direction,kind,text) VALUES(?,?,?,?)",
+           (now - 3600, "in", "user", f"ask {answered}: the small one"))
+    p.db.update_task(y, status="done")
+    unblock.record_resolve(p.db, step, [], step=y)
+    p.db.update_task(x, status="done")
+    assert unblock.close_landed(p.db, [x]) == [landed]
+    resolved = p.db.kv(unblock.RESOLVED_KEY, {})
+    for aid in (step, landed):   # closed two hours after it was asked
+        resolved[str(aid)]["ts"] = now - 3600
+    p.db.set_kv(unblock.RESOLVED_KEY, resolved)
+    rows = {r["id"]: r for r in unblock.asks(p.db, now - 86400, now)}
+    assert rows[step]["step"] == {"task": y, "ts": now - 3600} and rows[step]["landed"] is None
+    assert rows[landed]["step"] is None and rows[answered]["step"] is None and rows[plain]["step"] is None
+    for later in (now, now + 6 * 3600):   # the open time stops at the close
+        a = {r["id"]: r for r in audit.asks(p.db, now - 86400, later)}
+        assert round(a[step]["open_s"]) == 7200 and round(a[landed]["open_s"]) == 7200
+        assert round(a[plain]["open_s"]) == round(later - now + 3 * 3600)
+        out = "\n".join(audit.lines(p.db, now=later, window_s=86400 + 6 * 3600))
+        assert f"ask {step} (access): \"Please sign in to the example tool so #{y} can run?\"; " \
+               f"resolved: #{y}'s user step was done, after 2.0 h" in out
+        assert "no answer yet" not in out.split(f"ask {step} (access)", 1)[1].split("\n", 1)[0]
+        assert f"ask {landed} (review): \"May #{x} ship to the branch?\"; " \
+               f"resolved: its work landed (#{x}), after 2.0 h with no answer" in out
+        assert f"ask {answered} (choice): \"Which example model should the run use?\"; " \
+               f"answered after 2.0 h: \"ask {answered}: the small one\"" in out
+        assert f"ask {plain} (review): \"Grant the token the workflow scope?\"; no answer yet, open" in out
+        assert "asks: 4 sent, 1 answered, 0 handed back, 1 resolved as their work landed, " \
+               "1 resolved as their user step was done" in out
+    resolved[str(step)]["step"] = "not a task"   # a broken record reads as no step, never a crash
+    p.db.set_kv(unblock.RESOLVED_KEY, resolved)
+    assert {r["id"]: r for r in unblock.asks(p.db, now - 86400, now)}[step]["step"] is None
