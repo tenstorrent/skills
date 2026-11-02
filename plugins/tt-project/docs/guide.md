@@ -1597,8 +1597,16 @@ queues behind routine work; nothing running is interrupted:
   `delivery.never_force` (default false), when true, refuses every forced push in a run: a raw
   `git push` with `--force`, `-f`, `--force-with-lease`, `--force-if-includes` or a `+refspec`, and
   a lease push by `--own`; config validation rejects it together with `lease`. It also refuses
-  moving an existing tag (a forced tag push, with or without a lease), so a project that moves a
-  release-channel tag forward from a run keeps `never_force` off, or moves the tag outside a run.
+  moving an existing tag, except a release-channel tag moved forward as below.
+- `delivery.channel_tags` (empty when unset) lists release-channel tags: tags a release cut moves
+  forward. `ttp push --move-tag <tag> <commit>` moves one, also under `never_force`: it pushes
+  `<commit>:refs/tags/<tag>` with `--no-follow-tags` and `--force-with-lease=refs/tags/<tag>:<old>`,
+  `<old>` the tag's value on the push remote read fresh. The run's git lets that one push through
+  only when the tag is listed, the push updates only that tag on the remote of
+  `delivery.push_branch`, the lease matches, the commit descends from the tagged one, and the
+  commit is on the remote push branch. A delete, a backward or sideways move, an unlisted tag, a
+  missing or stale lease or several refs stay refused. Exit 0 moved (or already there), 2 refused,
+  1 the push failed; each move is logged to `state/channel_tags.jsonl`. Creating a tag is unchanged.
   The coordinator may set `new_branch` and `never_force` true itself, `lease` only on the user's
   word.
 - `delivery.own_push` (`existing_only` when unset) says which remote branches besides the push branch

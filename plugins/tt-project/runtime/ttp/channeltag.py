@@ -10,8 +10,8 @@ of tag names; empty by default) names the tags a project moves forward. `ttp pus
     git push --no-follow-tags --force-with-lease=refs/tags/<tag>:<old> <remote> <new>:refs/tags/<tag>
 
 and only when every rule holds (refusal): the tag is listed; the push updates that one ref on the
-push remote (delivery.push_branch's); the lease is the tag's current value on the remote, read
-fresh; the new commit descends from the old tagged one (forward only); and the new commit is on
+push remote (delivery.push_branch's); the lease is the tag's current value where the remote pushes to,
+read fresh; the new commit descends from the old tagged one (forward only); and the new commit is on
 the remote push branch. Anything else forced stays refused: force pushes to a branch, tag deletes,
 backward or sideways moves, unlisted tags, a missing or stale lease, several refs at once. Each
 allowed move is logged to the project's state/channel_tags.jsonl (tag, old, new, time).
@@ -62,6 +62,12 @@ def problems(delivery: dict) -> list[str]:
     return []
 
 
+def plain_globals(globals_: list[str]) -> bool:
+    """Whether git's global options before `push` are only `-C <dir>`: a `-c` (a pushInsteadOf, a
+    remote's URL) could send the push somewhere the checks never read."""
+    return len(globals_) % 2 == 0 and all(globals_[i] == "-C" for i in range(0, len(globals_), 2))
+
+
 def parse(rest: list[str]) -> dict | None:
     """The move form's parts of `git push <rest>`: {remote, src, tag, lease}, or None when `rest` is
     anything else (another option, no or several leases, a `+`, a delete, several refspecs)."""
@@ -104,6 +110,18 @@ def remote_value(prefix: list[str], remote: str, tag: str) -> tuple[str, str] | 
     return raw, rows.get(f"refs/tags/{tag}^{{}}", raw)
 
 
+def push_url(prefix: list[str], remote: str) -> str | None:
+    """Where `git push <remote>` goes, for reading the tag and the push branch there: the remote's
+    name when it pushes where it fetches from, else its push URL (a pushurl or pushInsteadOf); None
+    with several push URLs (several refs updated) or no such remote."""
+    urls = _git(prefix, "remote", "get-url", "--push", "--all", remote)
+    fetch = _git(prefix, "remote", "get-url", remote)
+    found = urls.stdout.split() if urls.returncode == 0 else []
+    if len(found) != 1 or fetch.returncode:
+        return None
+    return remote if found == [fetch.stdout.strip()] else found[0]
+
+
 def _commit(prefix: list[str], rev: str) -> str:
     out = _git(prefix, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}")
     return out.stdout.strip() if out.returncode == 0 else ""
@@ -129,7 +147,10 @@ def refusal(prefix: list[str], move: dict, cfg: dict) -> tuple[str, dict]:
         return "no delivery.push_branch: a channel tag moves only to a commit on it", facts
     if move["remote"] != remote:
         return f"a channel tag moves only on the push remote {remote}, not {move['remote']}", facts
-    now = remote_value(prefix, remote, tag)
+    side = push_url(prefix, remote)
+    if side is None:
+        return f"{remote} has several push URLs or none: a channel tag moves on one remote only", facts
+    now = remote_value(prefix, side, tag)
     if now is None:
         return f"could not read refs/tags/{tag} on {remote}", facts
     raw, old = now
@@ -143,13 +164,13 @@ def refusal(prefix: list[str], move: dict, cfg: dict) -> tuple[str, dict]:
     if not new:
         return f"{move['src']} is not a commit here", facts
     facts.update(old=raw, new=new)
-    if not _commit(prefix, old) and _git(prefix, "fetch", "-q", "--no-tags", remote, f"refs/tags/{tag}").returncode:
+    if not _commit(prefix, old) and _git(prefix, "fetch", "-q", "--no-tags", side, f"refs/tags/{tag}").returncode:
         return f"could not fetch the commit {tag} tags now ({old[:12]})", facts
     if _git(prefix, "merge-base", "--is-ancestor", old, new).returncode:
         return f"{new[:12]} does not descend from {old[:12]}, where {tag} is now: a channel tag moves only forward", facts
     from .push import tracking_ref
-    track = tracking_ref(remote, branch)
-    if _git(prefix, "fetch", "-q", "--no-tags", remote, f"+refs/heads/{branch}:{track}").returncode:
+    track = tracking_ref(side, branch)
+    if _git(prefix, "fetch", "-q", "--no-tags", side, f"+refs/heads/{branch}:{track}").returncode:
         return f"could not fetch {remote}/{branch}", facts
     if _git(prefix, "merge-base", "--is-ancestor", new, track).returncode:
         return f"{new[:12]} is not on {remote}/{branch}: a channel tag moves only to a commit on the push branch", facts
@@ -180,7 +201,8 @@ def move(p, repo, tag: str, commit: str, say) -> int:
     prefix = ["git", "-C", str(repo)]
     tag = tag.removeprefix("refs/tags/")
     remote, _ = push_remote(prefix, cfg)
-    now = remote_value(prefix, remote, tag) if remote and tag in channel_tags(cfg) else None
+    side = push_url(prefix, remote) if remote and tag in channel_tags(cfg) else None
+    now = remote_value(prefix, side, tag) if side else None
     lease = now[0] if now else ""
     new = _commit(prefix, commit)
     if now and new and now[1] == new:

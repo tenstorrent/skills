@@ -103,7 +103,7 @@ def never_force_refusal(args: list[str], env: dict, git: str = "git") -> str:
     p = Project(base)
     if not (p.state / "project.db").is_file() or not never_force(cfg := p.config()):
         return ""
-    if (move := channeltag.parse(rest)) is not None:
+    if channeltag.plain_globals(globals_) and (move := channeltag.parse(rest)) is not None:
         why, facts = channeltag.refusal([git, *globals_], move, cfg)
         if not why:
             channeltag.log(p, facts, "allowed")

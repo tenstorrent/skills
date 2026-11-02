@@ -12694,7 +12694,8 @@ def test_channel_tag_moves_forward_under_never_force_with_a_fresh_lease(env, mon
 
 
 def test_channel_tag_move_refusals_under_never_force(env, monkeypatch, capsys):
-    """Every rule of the move: an unlisted tag, another ref or remote or several refs, a missing, short
+    """Every rule of the move: an unlisted tag, another ref or remote or several refs (also through a
+    `-c` global or several push URLs), a missing, short
     or stale lease, a backward or sideways move, a commit off the push branch, and a delete or a branch
     force push are refused, by `ttp push --move-tag` and by the run's git; the tag stays put."""
     from ttp import channeltag, gitguard, hook
@@ -12720,6 +12721,13 @@ def test_channel_tag_move_refusals_under_never_force(env, monkeypatch, capsys):
                  [lease, "origin", f"{m}:refs/tags/chan"], ["--all", *good]):
         refused(args, "never force-pushes")
     refused(channeltag.argv("mirror", "chan", a, m)[1:], "only on the push remote origin")
+    # a global option that could send the push elsewhere (a pushInsteadOf), or several push URLs
+    r = gitguard.never_force_refusal(["-c", f"url.{repo}.pushInsteadOf={origin}", "push", *good], dict(os.environ))
+    assert "never force-pushes" in r, r
+    for url in (origin, repo):
+        _git_out(repo, "remote", "set-url", "--add", "--push", "origin", str(url))
+    refused(good, "several push URLs")
+    _git_out(repo, "config", "--unset-all", "remote.origin.pushurl")
     # (3) the lease: none, no value, a short sha, a stale value
     for args in (["--no-follow-tags", "--force", "origin", f"{m}:refs/tags/chan"],
                  ["--no-follow-tags", "--force-with-lease", "origin", f"{m}:refs/tags/chan"],
