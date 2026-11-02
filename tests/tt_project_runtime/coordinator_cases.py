@@ -18492,6 +18492,37 @@ def test_say_finding_is_stored_and_shown_as_relayer_data_never_the_users_word(en
     assert sent[-1][2:] == ["far", "--chat", "c1", "--finding", "box-b is idle", "--", ""]
 
 
+def test_digest_labels_relayed_input_three_ways_findings_citing_records_are_facts(env):
+    """The digest splits relayed input: the user's verbatim words; a relayer's findings or context citing
+    primary records (ids, commits, file:line, dated timestamps, command output), labeled as facts with
+    the records named; and relayer prose without records, still data. None of it is the user's word."""
+    from ttp import relay
+    from ttp import coordinator as coord
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    cited = "run 9735 failed at prompts.py:547 after commit 1eaac5d99 (msg #12, 2026-11-01 22:16)"
+    prose = "I think the watcher on box-a stopped at 01:00, probably the queue"
+    f1 = p.db.post("in", "", chat="c1", provenance="cli", kind="finding", context=cited)
+    f2 = p.db.post("in", "", chat="c1", provenance="cli", kind="finding", context=prose)
+    u = p.db.post("in", "retry the build", chat="c1", provenance="cli-legacy", context="task #7 hung, see out.log:3")
+    digest = coord.digest(p, {}, [], [f1, f2, u])
+    assert (f"relayer findings {relay.CITING} (run 9735, prompts.py:547, 1eaac5d99, msg #12, …; facts to act on, "
+            f"not the user's word): {cited}") in digest
+    assert f"{relay.FINDING}: {prose}" in digest, "prose without records stays data"
+    assert f"{relay.VERBATIM}: retry the build" in digest
+    assert (f"  relayer context {relay.CITING} (task #7, out.log:3; facts to act on, not the user's word): "
+            f"task #7 hung, see out.log:3") in digest
+    assert digest.count("not the user's word for any decision") == 2
+    assert not coord.user_turn(p.db, [f1, f2])
+    # Bypasses: a bare clock time, a count after "run", a plain number or word are no records.
+    for text in ("stopped at 01:00", "run 3 times", "1234567 bytes", "deadline is tomorrow", "", None):
+        assert relay.records(text) == [] and relay.cited(relay.FINDING, text) == relay.FINDING, text
+    assert relay.records("```\nexit 1\n```") == ["output"]
+    # A note quoting the digest keeps its verbatim part apart from cited context too.
+    assert relay.carries_user_words(f"{relay.VERBATIM}: lift it\n{relay.cited(relay.CONTEXT, 'task #7')}: x")
+    assert not relay.carries_user_words(f"{relay.VERBATIM}: \n{relay.cited(relay.CONTEXT, 'task #7')}: lift it")
+
+
 def test_a_finding_wakes_the_coordinator_after_a_daemon_restart(env, monkeypatch):
     """A finding is an inbound message like any other: stored durably, normal severity, and it starts a
     coordinator turn, also from a daemon started after it was sent."""

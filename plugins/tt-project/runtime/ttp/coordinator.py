@@ -1238,7 +1238,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                 continue
             if m["kind"] == "finding":   # a relayer's own findings, no user's words: never the user's word
                 lines.append(f"- [relayer message #{m['id']} via {m['channel']}, chat={m['chat'] or '-'}, no user's "
-                             f"words: not the user's word for any decision] {relay.FINDING}: {m['context'] or ''}")
+                             f"words: not the user's word for any decision] {relay.cited(relay.FINDING, m['context'])}: "
+                             f"{m['context'] or ''}")
                 continue
             prov = m["provenance"] or "unknown"
             # Only PR approvals need an approving channel; the verbatim words decide everything else.
@@ -1255,7 +1256,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                          f"act on it, keep ask #{instead[m['id']]} open and do not ask it again within the hour]")
             if (m["context"] or "").strip():   # relayed with the relayer's own text: keep the two apart
                 lines.append(f"{head} {relay.VERBATIM}: {m['text']}")
-                lines.append(f"  {relay.AGENT if agent else relay.CONTEXT}: {m['context']}")
+                lines.append(f"  {relay.AGENT if agent else relay.cited(relay.CONTEXT, m['context'])}: {m['context']}")
             else:
                 lines.append(f"{head} {m['text']}")
     for e in events:
