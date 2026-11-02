@@ -71,6 +71,7 @@ from . import budget as bud
 from . import billing
 from . import budgetkind
 from . import pregrant
+from . import absentwait
 from . import deadwait
 from . import downwait
 from . import cachettl
@@ -6408,6 +6409,23 @@ class Daemon:
         for e in progress.check(self.p.db, self.cfg, self.p.state, now, where=self.p, current_probe=_current_probe,
                                 changes=changes):
             log(self.p, f"progress check: {e['kind']} for {', '.join(e['keys'])}")
+        self.close_absent_waits(now)
+
+    def close_absent_waits(self, now: float) -> None:
+        """A wait on an outside listing or resource already shown absent is closed now as unavailable,
+        model-free, with one reopen watch; the due reopen watches re-run their probe (absentwait.py)."""
+        db = self.p.db
+        try:
+            for c in absentwait.due(db, self.cfg, now, _current_probe):
+                if absentwait.close(db, c, now, where=self.p):
+                    for d in (self._probe_rc, self._start_rc, self._probed):
+                        d.pop(c["task"], None)
+                    log(self.p, f"absent wait: #{c['task']} closed {absentwait.OUTCOME}: {c['why']}")
+            for e in absentwait.run_watches(db, now, self._probe_now):
+                log(self.p, f"absent wait: #{e['task']} reopen watch {e['event']}"
+                            + (f", follow-up #{e['followup']}" if e.get("followup") else ""))
+        except Exception:
+            log(self.p, "absent wait check failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
 
     def check_stall(self, every_s: float = 60) -> None:
         """Model-free stall check: dispatch would start a queued task, yet nothing starts. Once no

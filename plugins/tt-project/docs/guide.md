@@ -546,6 +546,16 @@ prolonged whole-box outage.
   `landed_wait_dead` event naming the held tasks, judged from saved task rows only, so a restart
   neither clears nor repeats it. A `landed:#<id>` inside a longer probe is not judged; the blocker
   sweep covers it.
+- Absent outside waits (model-free, absentwait.py): a waiting task's retry_when or a queued task's
+  start_when that queries something outside (curl, wget, a URL, `gh api`, a package index) and
+  gives the same absent answer (HTTP 404, not found, not listed, withdrawn) `waiting.absent_close_n`
+  (3; 0: off) times in a row, or whose hand-off already cites settled evidence (repeated 404s, "not
+  listed") once it has said not yet, is closed now: done with outcome `unavailable`, one `task_done`
+  event, not held to its deadline. Credential, funds and quota-reset waits (budget, spend, rate
+  limit, a daily reset, login), time-only probes, the task's own job and reply waits, busy locks,
+  unreachable hosts and code and review tasks are exempt. Each close registers one reopen watch:
+  the same probe every 6 h for 14 days, off the tick; its first pass queues one `reopens:<id>`
+  follow-up with the closed task's spec.
 - Task-to-task waits (model-free, lanewait.py): a queued task whose start_when is exactly
   `landed:#<id>` starts as soon as that change is approved or batched in the push queue, branching
   from its approved head instead of the base, when the task gets a worktree of its own (code, or a

@@ -370,11 +370,14 @@ def note_probe(db: DB, tid: int, probe: str, rc: Any, reason: str, now: float | 
     after = _after(db.task(tid))
     if rec and rec.get("probe") == probe and rec.get("after") == after and now <= float(rec["last"]):
         return   # this verdict is counted already
+    norm = f"{rc}:{_norm(_clip(reason))}"   # `same` counts identical answers in a row (absentwait)
     if rec and rec.get("probe") == probe and rec.get("after") == after:
-        rec.update(n=int(rec["n"]) + 1, last=now, rc=rc, reason=_clip(reason) or rec.get("reason"))
+        same = int(rec.get("same") or 1) + 1 if rec.get("norm") == norm else 1
+        rec.update(n=int(rec["n"]) + 1, last=now, rc=rc, reason=_clip(reason) or rec.get("reason"), same=same,
+                   norm=norm)
     else:
         st["probes"][str(tid)] = {"probe": probe, "n": 1, "first": now, "last": now, "rc": rc,
-                                  "reason": _clip(reason), "after": after}
+                                  "reason": _clip(reason), "after": after, "same": 1, "norm": norm}
     _save(db, st)
 
 

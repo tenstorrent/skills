@@ -122,6 +122,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 # a landed:#<id> start_when whose producer is done, not landed, with nothing open that
                 # can land it, this long, is raised once per producer (deadwait.py; 0: at once)
                 "landed_wait_dead_s": 900,
+                # a wait whose outside probe gives the same absent answer (404, not listed) this many
+                # times in a row is closed as unavailable, with a reopen watch (absentwait.py; 0: off)
+                "absent_close_n": 3,
                 # a queued code or work task waiting on another task (landed:#, depends_on, waits_end:)
                 # this long raises one lane_wait event (lanewait.py; 0: never)
                 "lane_wait_event_s": 600,
