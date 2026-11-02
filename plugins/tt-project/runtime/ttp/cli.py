@@ -2158,6 +2158,15 @@ def _note_to(a, run_dir: str) -> None:
               f"{upstream.NOTES_PER_HOUR} of its notes an hour); its daemon files it as "
               f"{upstream.note_id(a.to, text)} when the limit allows{sent}. Nothing to wait for: keep working")
         return
+    earlier = (upstream.repeat_of(me.state, me.name, int(task) if task.isdigit() else None, a.to, text,
+                                  getattr(a, "confirms", None))
+               if got == "duplicate" and not upstream._filed(upstream.note_id(a.to, text)) else None)
+    if earlier:
+        print(f"note for {a.to} not sent: this task already sent it note {earlier} naming the same notes "
+              f"({', '.join(sorted(upstream.named_notes(text, getattr(a, 'confirms', None))))}) within "
+              f"{upstream.REPEAT_S // 3600} h, so this one only repeats it. Nothing to wait for: keep working; "
+              f"`ttp note --status {earlier}` shows whether {a.to} read it")
+        return
     print(f"note for {a.to} " + ("already in its inbox" if got == "duplicate" else "filed in its inbox")
           + f" as {upstream.note_id(a.to, text)}" + sent
           + (f"; this machine cannot reach {back}, so it waits here until {back}'s daemon takes it on its next "

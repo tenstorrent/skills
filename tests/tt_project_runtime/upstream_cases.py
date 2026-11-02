@@ -849,8 +849,8 @@ def test_a_confirmation_marker_survives_the_outbox_the_run_queue_and_forwarding(
     run_dir = _note_run(env, monkeypatch, src)
     upstream.queue(run_dir, "second", "works via the run queue", confirms=fp)
     upstream.send_queued(run_dir, src.name, 57, src.state)
-    for i in range(upstream.NOTES_PER_HOUR + 1):
-        upstream.send_or_queue(src.state, src.name, 57, "second", f"works {i}", confirms=fp)
+    for i in range(upstream.NOTES_PER_HOUR + 1):   # each from its own task: one task's repeats are dropped
+        upstream.send_or_queue(src.state, src.name, 100 + i, "second", f"works {i}", confirms=fp)
     assert all(n.get("confirms") == fp for n in upstream._outbox(src.state))
     upstream.drain_outbox(src.state, src.name, time.time() + 7200)
     notes = _upstream_inbox(env)
@@ -859,6 +859,80 @@ def test_a_confirmation_marker_survives_the_outbox_the_run_queue_and_forwarding(
     assert "confirms" not in upstream._valid({**notes[0], "confirms": "not-a-fingerprint"})
     assert upstream.send(src.name, 57, "second", "bad marker", now=time.time() + 4 * 3600, confirms="../x") == "sent"
     assert "confirms" not in _upstream_inbox(env)[-1]
+
+
+def test_a_tasks_repeat_note_naming_the_same_note_ids_in_other_words_is_dropped(env, monkeypatch, capsys):
+    """A note the same task already sent the same project within REPEAT_S, naming the same set of note ids
+    (in the text or as --confirms), is dropped as a duplicate in any wording: no inbox line, no event, and
+    `ttp note` names the earlier note. A new id, no id, another task, an older note, or a fix, regression
+    or wontfix recorded since all still send."""
+    from ttp import cli, upstream
+    src, dst, fp = _confirm_pair(env)
+    fp2 = upstream.fingerprint("upstream: b", "second note")
+    upstream.resolve(fp2, "0.2.1", "fixed too", "second")
+    _note_run(env, monkeypatch, src)
+    assert _note(cli, "--to", "second", f"Confirmed on 0.2.1: notes {fp} and {fp2} both work.") == 0
+    capsys.readouterr()
+    (first,) = _upstream_inbox(env)
+    for words in (f"{fp2} and {fp} still hold after a restart", f"[note {fp}] [note {fp2}] confirmed again",
+                  f"FYI: {fp}, {fp2} fine"):
+        assert _note(cli, "--to", "second", words) == 0
+        out = capsys.readouterr().out
+        assert f"not sent: this task already sent it note {first['fp']}" in out, out
+    # A --confirms marker counts as a named id: the same set in other words is the same repeat.
+    assert _note(cli, "--to", "second", "--confirms", fp, f"also {fp2}: fine") == 0
+    assert first["fp"] in capsys.readouterr().out
+    assert len(_upstream_inbox(env)) == 1
+    assert upstream.ingest(dst, dst.config()) == 1
+    now = time.time()
+    # Still sent: a new id, a subset, no id, another task, another project.
+    fp3 = upstream.fingerprint("upstream: c", "third note")
+    assert upstream.send(src.name, 57, "second", f"{fp} {fp2} {fp3} all fine", now=now) == "sent"
+    assert upstream.send(src.name, 57, "second", f"only {fp} checked", now=now) == "sent"
+    assert upstream.send(src.name, 57, "second", "no ids here", now=now) == "sent"
+    assert upstream.send(src.name, 57, "second", "no ids, other words", now=now) == "sent"
+    assert upstream.send(src.name, 58, "second", f"{fp} and {fp2} hold here too", now=now) == "sent"
+    assert upstream.send(src.name, 57, "tt-project", f"{fp} and {fp2} fine", now=now) == "sent"
+    # Not hex ids: a longer hash or an uppercase run names no note.
+    assert upstream.named_notes(f"commit {fp}{fp2} {fp.upper()} x{fp}") == frozenset()
+    # Past REPEAT_S the same set sends again; so does one after a record of news about one of the ids.
+    assert upstream.send(src.name, 57, "second", f"{fp} {fp2} day two", now=now + upstream.REPEAT_S + 1) == "sent"
+    assert upstream.send(src.name, 59, "second", f"{fp} {fp2} first", now=now) == "sent"
+    upstream.regress(fp2, "fails again", src.name, now=now + 5)
+    assert upstream.send(src.name, 59, "second", f"{fp2} regressed, {fp} fine", now=now + 10) == "sent"
+    assert upstream.send(src.name, 59, "second", f"{fp2} broke again; {fp} still ok", now=now + 20) == "duplicate"
+
+
+def test_a_tasks_repeat_note_is_dropped_on_the_outbox_and_run_queue_paths(env, monkeypatch):
+    """Past the hourly limit a repeat of a queued or filed note is dropped, not queued; the run queue a
+    sandboxed worker leaves counts it a duplicate too. Other notes queue as before."""
+    from ttp import upstream
+    src, dst, fp = _confirm_pair(env)
+    fp2 = upstream.fingerprint("upstream: b", "second note")
+    now = time.time()
+    for i in range(upstream.NOTES_PER_HOUR):
+        upstream.send(src.name, 1, "second", f"filler {i}", now=now)
+    assert upstream.send_or_queue(src.state, src.name, 57, "second", f"{fp} and {fp2} work", now=now) == ("queued", 1)
+    first = upstream._outbox(src.state)[0]["fp"]
+    assert upstream.send_or_queue(src.state, src.name, 57, "second", f"{fp2}, {fp}: confirmed", now=now) == ("duplicate", 0)
+    assert upstream.repeat_of(src.state, src.name, 57, "second", f"{fp2}, {fp}: confirmed", now=now) == first
+    assert upstream.send_or_queue(src.state, src.name, 57, "second", f"{fp} works", now=now) == ("queued", 2)
+    assert upstream.send_or_queue(src.state, src.name, 58, "second", f"{fp} and {fp2} hold", now=now) == ("queued", 3)
+    run_dir = _note_run(env, monkeypatch, src)
+    upstream.queue(run_dir, "second", f"again: {fp} {fp2}")
+    upstream.queue(run_dir, "second", f"new: {fp2}, {fp}, done")
+    got = upstream.send_queued(run_dir, src.name, 57, src.state)
+    assert got["duplicate"] == 2 and got["queued"] == 0, got
+    assert upstream.outbox_pending(src.state) == 3
+    # Drained to the inbox, a repeat behind a waiting note is still dropped there.
+    upstream.drain_outbox(src.state, src.name, now + 7200)
+    upstream.send(src.name, 1, "second", "after", now=now + 7200)
+    for i in range(upstream.NOTES_PER_HOUR):
+        upstream.send(src.name, 1, "second", f"more {i}", now=now + 7300)
+    assert upstream.send_or_queue(src.state, src.name, 60, "second", "wait", now=now + 7300)[0] == "queued"
+    assert upstream.send_or_queue(src.state, src.name, 57, "second", f"{fp} {fp2} ok", now=now + 7300) == ("duplicate", 0)
+    assert sum(n.get("task") == 57 and upstream.named_notes(n["spec"]) == {fp, fp2}
+               for n in _upstream_inbox(env)) == 1
 
 
 def test_a_confirmation_that_also_reports_a_problem_still_wakes_the_coordinator(env, monkeypatch):

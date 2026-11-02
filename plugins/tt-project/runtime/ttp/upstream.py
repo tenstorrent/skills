@@ -86,6 +86,7 @@ REMOTE = "~/.tt-project/upstream.jsonl"
 LOCAL = "@here"             # the cursor's key for this machine's inbox (never a host name)
 LOCAL_TO = "@here-to"       # and for a project that reads only the notes addressed to it
 NOTES_PER_HOUR = 10         # addressed notes one project may file an hour
+REPEAT_S = 86400            # a task's note naming the same note ids as one it sent this recently is a repeat
 NOTE_SEVERITIES = ("low", "normal", "high")
 FORWARD_EVERY_S = 60        # how often a daemon looks for notes to send on to other machines
 FORWARD_BUDGET_S = 120      # all sends of one pass; a target is started only if a send fits
@@ -269,7 +270,8 @@ def send(source: str, task: int | None, to: str, text: str, severity: str = "nor
          now: float | None = None, sender: str = "worker", at: str | None = None,
          extra: dict | None = None, back: str | None = None, confirms: str | None = None) -> str:
     """File a worker's note for project `to` in this machine's inbox. Returns "sent", "duplicate" (the
-    same text to the same project is already there) or "limited" (`source` filed NOTES_PER_HOUR
+    same text to the same project is already there, or this task's note naming the same note ids,
+    `_repeat`) or "limited" (`source` filed NOTES_PER_HOUR
     addressed notes in the last hour). `at`: the forward target that runs `to` when this machine's
     registry does not know it (`find_peer`); the forwarder sends the note there. `back`: the machine a
     reply goes back to on its own next call here (`reply_route`), never sent from here. `sender` "daemon": the source project's daemon routed it, model-free
@@ -287,7 +289,8 @@ def send(source: str, task: int | None, to: str, text: str, severity: str = "nor
         fcntl.flock(f, fcntl.LOCK_EX)
         f.seek(0)
         notes = _lines(f.read())[0]
-        if any(n["fp"] == fp for n in notes):
+        if any(n["fp"] == fp for n in notes) or (sender != "daemon"
+                                                 and _repeat(notes, source, task, to, text, confirms, now)):
             return "duplicate"
         # A daemon's page (bounded by its routing, once per step) is neither limited nor counted.
         if sender != "daemon" and sum(1 for n in notes if n.get("to") and n.get("project") == source
@@ -360,7 +363,7 @@ def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str
             got = send(source, task, to, text, severity, now, at=at, back=back, confirms=confirms)
             if got != "limited":
                 return got, 0
-        elif _filed(fp):
+        elif _filed(fp) or repeat_of(state, source, task, to, text, confirms, now, waiting):
             return "duplicate", 0
         if len(waiting) >= OUTBOX_MAX:
             return "full", 0
@@ -370,6 +373,52 @@ def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str
              **({"back": back} if back and not at else {}), **({"confirms": _confirms(confirms)} if _confirms(confirms) else {}),
              "severity": severity if severity in NOTE_SEVERITIES else "normal"}, sort_keys=True) + "\n")
         return "queued", len(waiting) + 1
+
+
+_NOTE_ID_RE = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{16}(?![0-9A-Za-z])")
+
+
+def named_notes(text: str, confirms: str | None = None) -> frozenset[str]:
+    """The note ids (16 hex) a note's text names, with the note it confirms (`--confirms`)."""
+    return frozenset(_NOTE_ID_RE.findall(str(text or ""))) | ({_confirms(confirms)} if _confirms(confirms) else set())
+
+
+def _repeat(notes: list[dict], source: str, task: int | None, to: str, text: str, confirms: str | None,
+            now: float) -> str | None:
+    """The id of a note in `notes` (inbox lines) this one only repeats in other words, or None: one the
+    same task of `source` sent `to` within REPEAT_S, naming the same set of note ids (`named_notes`), with
+    no resolution, regression or wontfix of one of them recorded since. A note naming none, or a new one,
+    or from another task, is never a repeat."""
+    ids = named_notes(text, confirms)
+    if task is None or not ids:
+        return None
+    recs = None
+    for n in reversed(notes):
+        ts = float(n.get("ts") or 0)
+        if (n.get("project") != source or n.get("task") != task or n.get("to") != to or n.get("from") == "daemon"
+                or not 0 <= now - ts < REPEAT_S or named_notes(n.get("spec"), n.get("confirms")) != ids):
+            continue
+        recs = _records() if recs is None else recs
+        if not any(r.get("kind") in ("resolve", "regression", "wontfix") and r.get("fp") in ids
+                   and float(r.get("ts") or 0) > ts for r in recs):
+            return n["fp"]
+    return None
+
+
+def repeat_of(state: Path, source: str, task: int | None, to: str, text: str, confirms: str | None = None,
+              now: float | None = None, waiting: list[dict] | None = None) -> str | None:
+    """`_repeat` over the project's outbox (`waiting`, read when None) and this machine's inbox: the id of
+    the note this one repeats, for `send_or_queue` to drop it and `ttp note` to name it."""
+    now = now or time.time()
+    waiting = _outbox(state) if waiting is None else waiting
+    try:
+        with open(path(), "rb") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            inbox = _lines(f.read())[0]
+    except FileNotFoundError:
+        inbox = []
+    return _repeat(inbox + [{**n, "project": source, "spec": n.get("text")} for n in waiting],
+                   source, task, to, note_text(text), confirms, now)
 
 
 def _filed(fp: str) -> bool:
