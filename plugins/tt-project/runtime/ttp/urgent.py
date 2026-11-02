@@ -23,11 +23,16 @@ A task is urgent when its priority is 1 (or better) or its spec has a line `urge
   task's lane has its own lane_wait event, not a second one here."""
 from __future__ import annotations
 
+import json
 import re
 
 PRIORITY = 1                    # a task at this priority or better is urgent
 # A spec line `urgent: <why>`; `urgent: no` (none, not, false, n/a) says it is not.
 LINE = re.compile(r"^[ \t]*urgent:[ \t]*(?!(?:no|none|not|false|n/?a)\b)(\S.*)$", re.I | re.M)
+SINCE_LABEL = "urgent_since:"   # when a task_update added the spec's `urgent:` line (else: the task's creation)
+STALE_S = 86400                 # an `urgent:` line this old shows its age (shown_why)
+# A claim that the user is there right now: true only when it was written.
+PRESENT_RE = re.compile(r"\b(?:the\s+)?user\s+is\s+(?:present|here|online|around|available|at the keyboard)(?:\s+(?:right\s+)?now)?\b", re.I)
 EXTRA_SLOTS = 1                 # default of budget.urgent_extra_slots
 RESERVE_SLOTS = 1               # default of budget.urgent_reserve_slots
 RESERVE_DUE_S = 3600            # a waiting urgent task due within this long keeps the reserve
@@ -53,6 +58,55 @@ def why(task: dict) -> str:
     """The spec's `urgent:` reason, else "priority 1"; "" for a task that is not urgent."""
     m = LINE.search(str(task.get("spec") or ""))
     return m.group(1).strip()[:160] if m else f"priority {_priority(task)}" if is_urgent(task) else ""
+
+
+def new_line(old_spec: str | None, new_spec: str | None) -> bool:
+    """A spec update that changes the spec's `urgent:` reason (the first such line) to a new one."""
+    m = LINE.search(str(new_spec or ""))
+    o = LINE.search(str(old_spec or ""))
+    return bool(m) and (not o or o.group(1).strip() != m.group(1).strip())
+
+
+def dated(labels: list, now: float) -> list:
+    """`labels` with the urgent line's date (SINCE_LABEL) set to `now`."""
+    return [x for x in labels if not str(x).startswith(SINCE_LABEL)] + [f"{SINCE_LABEL}{now:.0f}"]
+
+
+def line_since(task: dict) -> float | None:
+    """When the spec's `urgent:` line was written: its SINCE_LABEL, else when the task was made."""
+    try:
+        labels = json.loads(task.get("labels") or "[]")
+    except (TypeError, ValueError):
+        labels = []
+    for x in labels if isinstance(labels, list) else []:
+        if str(x).startswith(SINCE_LABEL):
+            try:
+                return float(str(x)[len(SINCE_LABEL):])
+            except ValueError:
+                pass
+    try:
+        return float(task.get("created") or 0) or None
+    except (TypeError, ValueError):
+        return None
+
+
+def _age(s: float) -> str:
+    h = int(s // 3600)
+    return f"{h // 24}d {h % 24}h" if h >= 48 else f"{h}h"
+
+
+def shown_why(db, task: dict, now: float) -> str:
+    """why() for the status board: an `urgent:` line STALE_S or older shows its age and whether a user
+    message came since, and never claims the user is there now (PRESENT_RE)."""
+    reason = why(task)
+    since = line_since(task) if LINE.search(str(task.get("spec") or "")) else None
+    if not since or now - since < STALE_S:
+        return reason
+    age = _age(now - since)
+    heard = (db.one("SELECT MAX(ts) ts FROM messages WHERE direction='in' AND kind='user' AND ts>?",
+                    (since,)) or {}).get("ts")
+    reason = PRESENT_RE.sub(f"the user was there {age} ago", reason)
+    return f"{reason} (written {age} ago" + ("" if heard else ", no user message since") + ")"
 
 
 def first(rows: list[dict]) -> list[dict]:

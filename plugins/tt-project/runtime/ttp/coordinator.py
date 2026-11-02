@@ -96,6 +96,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     watchdup,
     worktree,
 )
+from . import urgent
 from . import probevars
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
@@ -1445,6 +1446,9 @@ def _start_args(a: dict, cur: dict, p: Project | None = None) -> tuple[float | N
     A new probe gets static checks only (check_start_when)."""
     after = parse_start_after(a["start_after"], tz=timefmt.home(p) if p else None) \
         if a.get("start_after") is not None else cur.get("after")
+    if a.get("why") is not None:
+        from . import userstep
+        userstep.check_wait_text(a["why"], "why")
     when = a.get("start_when")
     if when is None:
         when = cur.get("when")
@@ -1734,6 +1738,9 @@ def check_probe(probe, what: str = "start_when") -> None:
     task at once."""
     if not isinstance(probe, str) or len(probe) > START_WHEN_CHARS:
         raise ValueError(f"{what} must be one shell command of at most {START_WHEN_CHARS} characters")
+    if what in ("start_when", "retry_when", "waits_on when"):
+        from . import userstep
+        userstep.check_wait_text(probe, what)   # prose for the user's next message: no probe sees it
     if re.match(r"\s*landed:", probe, re.I) and not re.fullmatch(r"\s*landed:\s*#?\d+\s*", probe):
         raise ValueError(f"{what} {probe.strip()[:60]!r} is not a landed probe: write it as landed:#<task id> "
                          f"(exactly `landed:#<id>`, one task id); to combine it with another check, use "
@@ -2498,6 +2505,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      f"cancel it and task_add a code task with continues={task['id']}")
                     if hit := settled.turn_note(p, spec, f"task_update: #{task['id']}"):
                         notes.append(hit)
+                    if urgent.new_line(task["spec"], upd["spec"]):   # dated, so a stale one shows its age
+                        upd["labels"] = urgent.dated(upd.get("labels", json.loads(task["labels"] or "[]")), time.time())
                     # A `pr_branch:` line it appends sets the branch as the field does: its label follows,
                     # so label readers (landed.carriers, worktree.fix_branches, the daemon) agree with
                     # worktree.recorded_pr_branch. Reviews and harness tasks go by their labels only.

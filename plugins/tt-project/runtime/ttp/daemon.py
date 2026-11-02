@@ -9508,6 +9508,10 @@ class Daemon:
         max_days = float(self.cfg["coordinator"].get("defer_max_days") or 14)
         deferred = db.q("SELECT * FROM tasks WHERE status='queued' AND labels LIKE '%\"start_when:%'")
         ids = {t["id"] for t in deferred}
+        try:   # one standing 'needs you' item per task deferred on a user-only step
+            userstep.sync_deferrals(db, deferred, now)
+        except Exception:
+            log(self.p, "user-step deferrals: " + traceback.format_exc().replace("\n", " | ")[:1000])
         for tid in [k for k in self._start_rc if k not in ids]:
             del self._start_rc[tid]   # started, cancelled or no longer deferred
         startgate.forget(db, keep=ids)
@@ -9720,6 +9724,8 @@ class Daemon:
             self.p.db.update_task(task["id"], labels=without_deferral(json.loads(task["labels"] or "[]")),
                                   not_before=None)
             log(self.p, f"task {task['id']} start_when passed; ready to start")
+            if d.get("when"):
+                userstep.probe_passed(self.p.db, task, {d["when"]}, now)   # its user step is done
         else:
             # Kept apart from _probe_rc, whose verdicts tasks on the same probe take and pop: the
             # network outage check reads it.

@@ -1502,7 +1502,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     hot = [t for t in db.q("SELECT * FROM tasks WHERE status IN ('queued','review') ORDER BY priority, id")
            if urgent.is_urgent(t)]
     for t in hot[:8]:   # the urgent lane: each waiting urgent task, with how long it has waited
-        row(t, f"{t['status']} ({urgent.mark(db, t, now)})", f"urgent: {urgent.why(t)}")
+        row(t, f"{t['status']} ({urgent.mark(db, t, now)})", f"urgent: {urgent.shown_why(db, t, now)}")
     for t in h["waiting"][:5]:
         why = re.sub(r";? *next try \S+$", "", t["blocked_reason"] or "").strip()
         row(t, f"waiting, next try {at(t['not_before'], now, tz)}", why,
@@ -6668,6 +6668,8 @@ def add_task(p, a) -> tuple[int, str]:
                         budget_usd=budget if budget is not None else task_default_usd(p.config(), a.tier),
                         labels=defer_labels(after, when, start_why(d, {}, when)), not_before=after)
     stale = marker_only_probe(when, p.root)
+    from . import userstep
+    userstep.sync_deferrals(p.db, [p.db.task(tid)])   # a user-only step's one standing item
     return tid, (f"; starts when: {when}" if when else "") \
         + (f"; starts after {timefmt.long(after, p)}" if after else "") + (f"; flagged: {stale}" if stale else "")
 
@@ -6775,6 +6777,9 @@ def _set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None =
             if on_pass_cmd is not None:
                 said.append("on_pass_cmd " + (f"set: {on_pass_cmd.strip()}" if on_pass_cmd.strip()
                                               else "cleared; a passed probe wakes it"))
+        if "start_when" in d:
+            from . import userstep
+            userstep.sync_deferrals(db, [db.task(tid)])   # a user-only step's one standing item
         return f"task #{tid} " + "; ".join(said)
 
 

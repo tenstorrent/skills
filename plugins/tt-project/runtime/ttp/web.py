@@ -692,7 +692,7 @@ def state_payload(p: Project, db: DB) -> dict:
         t["job_use"] = [f"job {j['name']}: {j['line']}" for j in job_use.values() if j.get("task") == t["id"]] or None
         t["review_since"] = in_review.get(t["id"])
         # The urgent lane (ttp/urgent.py): the spec is read for its `urgent:` line, never sent.
-        t["urgent"] = urgent.why(t) or None
+        t["urgent"] = urgent.shown_why(db, t, now) or None
         t["waited_s"] = round(urgent.waited_s(db, t, now)) if t["urgent"] else None
         t.pop("spec", None)
         t["outcome"] = task_outcome(t)   # changes_needed for a review that asked for changes
