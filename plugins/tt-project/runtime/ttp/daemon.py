@@ -13,6 +13,7 @@ Invariants:
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import copy
 import faulthandler
 import hashlib
@@ -25,6 +26,7 @@ import shutil
 import signal
 import socket
 import subprocess
+from typing import Iterator
 import sys
 import tempfile
 import threading
@@ -86,6 +88,7 @@ from . import correction
 from . import slowcomplaint
 from . import credits
 from . import gitmemo
+from . import gitreplay
 from . import globalcap as gcap
 from . import coordinator as coord
 from . import coordlimits
@@ -594,6 +597,9 @@ def _raised_at(e: BaseException) -> str:
 
 LOG_FAIL_S = 300   # a daemon.log that cannot be written says so on stderr at most this often
 _LOG_FAIL = {"t": float("-inf"), "n": 0}   # when stderr last said so; lines dropped since the last one written
+# A finish round's log lines (Daemon._finish_rounds): written once it commits or fails, dropped when
+# it rolls back to run again (GitMiss), so a retried round never logs a line twice.
+_LOG_BUF: contextvars.ContextVar[list | None] = contextvars.ContextVar("ttp_logbuf", default=None)
 
 
 def _log_torn(path: Path) -> bool:
@@ -610,6 +616,14 @@ def log(p: Project, msg: str) -> None:
     filesystem): the line is dropped, stderr says so once per LOG_FAIL_S, and the next line written
     says how many were dropped. The daemon rides it out; the failed tick step retries next tick."""
     stamp = time.strftime('%Y-%m-%dT%H:%M:%S')
+    buf = _LOG_BUF.get()
+    if buf is not None:
+        buf.append((p, stamp, msg))
+        return
+    _log_write(p, stamp, msg)
+
+
+def _log_write(p: Project, stamp: str, msg: str) -> None:
     line = f"{stamp} {redact.scrub(msg)}\n"
     path = p.logs / "daemon.log"
     try:
@@ -863,6 +877,44 @@ def disk_guard_bytes(disk: dict, path: Path) -> float:
     return min(pct / 100 * shutil.disk_usage(path).total, gb * 1e9)
 
 
+
+FINISH_STRICT = True   # finish transactions run as strict rounds (Daemon._finish_rounds)
+
+
+class _FinishRound:
+    """One round of Daemon._finish_rounds: attempt, memo scope, log buffer, db.tx, the TX_GIT_S
+    budget and gitmemo.strict, entered in that order. A GitMiss is kept in .miss and suppressed
+    after the rollback; any other exit flushes the buffered log lines."""
+
+    def __init__(self, db, memo: dict, att: gitmemo.Attempt, final: bool) -> None:
+        self.db, self.memo, self.att, self.final = db, memo, att, final
+        self.miss: gitmemo.GitMiss | None = None
+        self.buf: list = []
+
+    def __enter__(self) -> "_FinishRound":
+        self.keys = set(self.memo)
+        self.stack = contextlib.ExitStack()
+        self.stack.enter_context(gitmemo.attempt(self.att))
+        self.stack.enter_context(gitmemo.scope(self.memo))
+        token = _LOG_BUF.set(self.buf)
+        self.stack.callback(_LOG_BUF.reset, token)
+        self.stack.enter_context(self.db.tx())
+        self.stack.enter_context(gitmemo.bounded(gitmemo.TX_GIT_S, gitmemo.TX_GIT_S))
+        self.stack.enter_context(gitmemo.strict(gitmemo.HOLD_SLICE_S, abortable=not self.final))
+        return self
+
+    def __exit__(self, et, e, tb) -> bool:
+        done = self.stack.__exit__(et, e, tb)   # a GitMiss rolls the round back and comes back here
+        if isinstance(e, gitmemo.GitMiss):
+            self.miss = e
+            for k in set(self.memo) - self.keys:   # cached() facts read against the rolled-back rows
+                self.memo.pop(k, None)
+            return True
+        for p, stamp, msg in self.buf:
+            _log_write(p, stamp, msg)
+        return bool(done)
+
+
 class Daemon:
     def __init__(self, base: str | Path):
         self.p = Project(base)
@@ -981,6 +1033,7 @@ class Daemon:
         self._route_waits: dict[int, float] = {}   # task id -> since when it waits for a routed slot (route.wait_s)
         self._stall_probes: dict[str, list] = {}   # probe -> its stall re-check: [Pending, started, answer or None]
         self._git_memo: dict[int, dict] = {}   # task -> git facts its hand-off is judged by, read before the tx (_prefetch_git)
+        self._git_attempts: dict[int, gitmemo.Attempt] = {}   # task -> its finish's gitreplay attempt, from the warm-up
         self._start_rc: dict[int, tuple[int | str, float, str]] = {}   # a start_when's last not-yet or broken verdict
         self._checks_gone_at: dict[int, tuple[str, float]] = {}   # task -> probe on gone checks, first seen (checksgone)
         self._host_up: dict[str, tuple[bool, float]] = {}   # host a probe's 255 named -> ssh reached it, when
@@ -3910,58 +3963,59 @@ class Daemon:
         read_as = self._reading_account(r) if usage.extra.get("windows") else r["account"] or ""
         # The run's end, its spend and what it did to its task commit together: a daemon stopped
         # half way leaves the run "running", and the next tick processes it again from disk.
-        with self._finish_tx(r["task"] or 0):
-            db.x("UPDATE runs SET ended=?, status=?, exit_code=?, cost_usd=?, cost_estimated=?, cost_basis=?, "
-                 "input_tokens=?, output_tokens=?, cache_read_tokens=?, cache_write_tokens=?, note=?, "
-                 "session_id=COALESCE(NULLIF(?,''), session_id) WHERE id=?",
-                 (ended, status, exit_info.get("rc"), usage.cost_usd,
-                  int(usage.estimated), basis, usage.input_tokens, usage.output_tokens, usage.cache_read_tokens,
-                  usage.cache_write_tokens, json.dumps(note), usage.session_id or "", r["id"]))
-            db.spend(r["provider"], usage.cost_usd, source, account=r["account"] or "", estimated=usage.estimated,
-                     tokens_in=usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens,
-                     tokens_out=usage.output_tokens, ts=ended)
-            if r["task"]:
-                db.x("UPDATE tasks SET spent_usd=COALESCE(spent_usd,0)+? WHERE id=?", (usage.cost_usd, r["task"]))
-                runtimeload.clear(p, r["id"])   # finished once: a restart after this never finishes it again
-            self._record_readings(db, r["provider"], read_as, usage, ended)
-            if usage.limited:
-                until = time.time() + 3600
-                db.set_kv(f"limited:{r['provider']}", {"until": until, "note": usage.limit_note})
-                # Only an account out of funds needs the user; a usage or rate limit lifts by itself,
-                # so it is a self-clearing status line (alerts.STATUS_CONDITIONS), not "needs you".
-                if FUNDS_RE.search(usage.limit_note or ""):
-                    self.alert(f"limit:{r['provider']}",
-                               f"{r['provider']} refused work: {usage.limit_note}. Heavy work on it is paused for an "
-                               f"hour; the account ({r['account'] or 'unknown'}) needs more credits or a higher "
-                               f"spend limit.", "high")
+        for rnd in self._finish_rounds(r["task"] or 0):
+            with rnd:
+                db.x("UPDATE runs SET ended=?, status=?, exit_code=?, cost_usd=?, cost_estimated=?, cost_basis=?, "
+                     "input_tokens=?, output_tokens=?, cache_read_tokens=?, cache_write_tokens=?, note=?, "
+                     "session_id=COALESCE(NULLIF(?,''), session_id) WHERE id=?",
+                     (ended, status, exit_info.get("rc"), usage.cost_usd,
+                      int(usage.estimated), basis, usage.input_tokens, usage.output_tokens, usage.cache_read_tokens,
+                      usage.cache_write_tokens, json.dumps(note), usage.session_id or "", r["id"]))
+                db.spend(r["provider"], usage.cost_usd, source, account=r["account"] or "", estimated=usage.estimated,
+                         tokens_in=usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens,
+                         tokens_out=usage.output_tokens, ts=ended)
+                if r["task"]:
+                    db.x("UPDATE tasks SET spent_usd=COALESCE(spent_usd,0)+? WHERE id=?", (usage.cost_usd, r["task"]))
+                    runtimeload.clear(p, r["id"])   # finished once: a restart after this never finishes it again
+                self._record_readings(db, r["provider"], read_as, usage, ended)
+                if usage.limited:
+                    until = time.time() + 3600
+                    db.set_kv(f"limited:{r['provider']}", {"until": until, "note": usage.limit_note})
+                    # Only an account out of funds needs the user; a usage or rate limit lifts by itself,
+                    # so it is a self-clearing status line (alerts.STATUS_CONDITIONS), not "needs you".
+                    if FUNDS_RE.search(usage.limit_note or ""):
+                        self.alert(f"limit:{r['provider']}",
+                                   f"{r['provider']} refused work: {usage.limit_note}. Heavy work on it is paused for an "
+                                   f"hour; the account ({r['account'] or 'unknown'}) needs more credits or a higher "
+                                   f"spend limit.", "high")
+                    else:
+                        self.alert(f"limit:{r['provider']}",
+                                   f"{r['provider']} hit a limit: {usage.limit_note}. New work on it waits and resumes "
+                                   f"by itself when the limit lifts; other providers and running work go on.", "low")
+                if usage.auth_failed and not slept_auth:
+                    # Logged out is not a task failure and not worth retrying blindly: open the provider's
+                    # breaker (no run starts on it), say exactly how to fix it, and let check_logins ask
+                    # its CLI, without a model call, when it is logged in again.
+                    self.open_breaker(r["provider"], (usage.final_text or usage.error)[:200])
+                    self.alert(f"auth:{r['provider']}",
+                               f"{r['provider']} on {hostname()} is logged out ({(usage.final_text or usage.error)[:120]}). "
+                               f"Log in once on that machine ({prov.login_hint}). Nothing starts on it until then; "
+                               f"work resumes by itself once a login check passes, and queued work is kept.", "high")
+                if r["role"] == "coordinator":
+                    self._finish_coordinator(r, usage, status, note)
                 else:
-                    self.alert(f"limit:{r['provider']}",
-                               f"{r['provider']} hit a limit: {usage.limit_note}. New work on it waits and resumes "
-                               f"by itself when the limit lifts; other providers and running work go on.", "low")
-            if usage.auth_failed and not slept_auth:
-                # Logged out is not a task failure and not worth retrying blindly: open the provider's
-                # breaker (no run starts on it), say exactly how to fix it, and let check_logins ask
-                # its CLI, without a model call, when it is logged in again.
-                self.open_breaker(r["provider"], (usage.final_text or usage.error)[:200])
-                self.alert(f"auth:{r['provider']}",
-                           f"{r['provider']} on {hostname()} is logged out ({(usage.final_text or usage.error)[:120]}). "
-                           f"Log in once on that machine ({prov.login_hint}). Nothing starts on it until then; "
-                           f"work resumes by itself once a login check passes, and queued work is kept.", "high")
-            if r["role"] == "coordinator":
-                self._finish_coordinator(r, usage, status, note)
-            else:
-                # Before the hand-off, so its note on the root's dirty paths (_note_dirty_main) skips
-                # what this alert already reported.
-                try:
-                    if root_now:
-                        self.check_root_checkout(r, root_before, root_now)
-                except Exception:   # a report only: the run's end stands
-                    log(p, f"run {r['id']}: checking the project root's checkout failed\n" + traceback.format_exc())
-                self._finish_worker(r, usage, status, run_dir, cut_off if status == "ok" else None,
-                                    refused=refused, rebooted=bool(note.get("lost_to_reboot")),
-                                    orderly=note.get("shutdown") == "orderly",
-                                    slept=bool(note.get("lost_to_sleep") or note.get("lost_to_network")),
-                                    held=held, root_wake=root_wake)
+                    # Before the hand-off, so its note on the root's dirty paths (_note_dirty_main) skips
+                    # what this alert already reported.
+                    try:
+                        if root_now:
+                            self.check_root_checkout(r, root_before, root_now)
+                    except Exception:   # a report only: the run's end stands
+                        log(p, f"run {r['id']}: checking the project root's checkout failed\n" + traceback.format_exc())
+                    self._finish_worker(r, usage, status, run_dir, cut_off if status == "ok" else None,
+                                        refused=refused, rebooted=bool(note.get("lost_to_reboot")),
+                                        orderly=note.get("shutdown") == "orderly",
+                                        slept=bool(note.get("lost_to_sleep") or note.get("lost_to_network")),
+                                        held=held, root_wake=root_wake)
         self._check_price_table(r, usage)
         asleep = float(exit_info.get("slept_s") or 0)
         if asleep >= SLEPT_LONG_S:
@@ -4316,13 +4370,13 @@ class Daemon:
             from .providers.base import RunUsage
             usage = RunUsage(cost_usd=float(pv.get("cost") or 0.0), estimated=bool(pv.get("estimated")))
             self._prefetch_lint(tid, handoff, run_dir)
-            with self._finish_tx(tid):
-                t = db.task(tid)
-                if not t or t["status"] != "pushing" or pushclaim.KEY not in load_result(t["result"]):
-                    continue
-                self._finish_worker(dict(run) if run else {"id": pv.get("run"), "task": tid, "note": "{}"}, usage,
-                                    "ok", run_dir, pv.get("ended"), handoff=handoff,
-                                    push_verified=state == pushclaim.CONFIRMED)
+            for rnd in self._finish_rounds(tid):
+                with rnd:
+                    t = db.task(tid)
+                    if t and t["status"] == "pushing" and pushclaim.KEY in load_result(t["result"]):
+                        self._finish_worker(dict(run) if run else {"id": pv.get("run"), "task": tid, "note": "{}"},
+                                            usage, "ok", run_dir, pv.get("ended"), handoff=handoff,
+                                            push_verified=state == pushclaim.CONFIRMED)
 
     def audit_pushes(self) -> None:
         """Hourly, model-free: done tasks of the last days whose claimed pushes are not on the remote
@@ -4401,9 +4455,10 @@ class Daemon:
         if not task:
             return
         memo = self._git_memo[task["id"]] = {}
+        att = self._git_attempts[task["id"]] = gitmemo.Attempt()   # its reads replay in the rounds
         result = result if isinstance(result, dict) else {}
         try:
-            with gitmemo.scope(memo):
+            with gitmemo.attempt(att), gitmemo.scope(memo):
                 if task["kind"] == "review" and result.get("status") != "done":
                     self._review_area(dict(task, result=dump_result(result)))
                 fups = [f for f in result.get("followups") or [] if isinstance(f, dict)]
@@ -4448,6 +4503,44 @@ class Daemon:
         stack.enter_context(self.p.db.tx())
         stack.enter_context(gitmemo.bounded(gitmemo.TX_GIT_S, gitmemo.TX_GIT_S))
         return stack
+
+    def _finish_rounds(self, task_id: int) -> Iterator[contextlib.AbstractContextManager]:
+        """The finish transaction as rounds: `for rnd in self._finish_rounds(tid): with rnd: <body>`.
+        Each round is one db.tx running the body under gitmemo.strict(HOLD_SLICE_S): a git read the
+        attempt's memo (warmed by _prefetch_git) lacks runs live while the round's live git stays
+        within the slice; past it the read raises GitMiss before spawning, the round rolls back (its
+        rows, file undos, after_commit work and log lines go), the read runs here outside the lock
+        and the next round replays it. A round past its point of no return (a non-git spawn, a socket),
+        the one after MAX_ROUNDS or FINISH_WALL_S, or one after a miss that cannot be learned (raw git)
+        never aborts: a read past its slice fails fast and degrades as a git failure does. Each round
+        also keeps _finish_tx's TX_GIT_S budget. Off (FINISH_STRICT False), or inside a transaction
+        already open (no rollback to retry from): one _finish_tx round, as before."""
+        memo = self._git_memo.pop(task_id, None)
+        att = self._git_attempts.pop(task_id, None) or gitmemo.Attempt()
+        t0, final = time.monotonic(), False
+        try:
+            if not FINISH_STRICT or self.p.db.conn.in_transaction:
+                self._git_memo[task_id] = memo
+                yield self._finish_tx(task_id)
+                return
+            memo = {} if memo is None else memo
+            while True:
+                final = final or att.round >= gitmemo.MAX_ROUNDS or time.monotonic() - t0 >= gitmemo.FINISH_WALL_S
+                rnd = _FinishRound(self.p.db, memo, att, final)
+                yield rnd
+                miss = rnd.miss
+                if miss is None:
+                    return
+                if not miss.learn:   # raw git: no answer to keep, so another strict round cannot do better
+                    final = True
+                    continue
+                try:
+                    with gitmemo.attempt(att), gitmemo.bounded(gitmemo.TICK_GIT_S):
+                        gitmemo.run(miss.argv, timeout=miss.own, read=miss.read, **miss.kw)
+                except (OSError, subprocess.SubprocessError):   # kept (a timeout) or not: the round degrades
+                    pass
+        finally:
+            gitreplay.end(att.id)
 
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,
                        rebooted: bool = False, slept: bool = False, handoff: dict | None = None,
@@ -11144,8 +11237,9 @@ class Daemon:
             from .providers.base import RunUsage
             self._probe_rc.pop(task["id"], None)
             self._prefetch_remote(task["id"], on_pass, run_dir)
-            with self._finish_tx(task["id"]):
-                self._finish_worker(r, RunUsage(), "ok", run_dir, "model-free", handoff=on_pass)
+            for rnd in self._finish_rounds(task["id"]):
+                with rnd:
+                    self._finish_worker(r, RunUsage(), "ok", run_dir, "model-free", handoff=on_pass)
             log(self.p, f"task {task['id']} retry_when probe passed; its checks passed on {head[:12]}: "
                         f"recorded its on_pass ({on_pass['status']}) model-free")
             return
@@ -11658,8 +11752,9 @@ class Daemon:
                 from .providers.base import RunUsage
                 self._probe_rc.pop(tid, None)
                 self._prefetch_remote(tid, result, Path(r["dir"]))
-                with self._finish_tx(tid):
-                    self._finish_worker(r, RunUsage(), "ok", Path(r["dir"]), "model-free", handoff=result)
+                for rnd in self._finish_rounds(tid):
+                    with rnd:
+                        self._finish_worker(r, RunUsage(), "ok", Path(r["dir"]), "model-free", handoff=result)
                 log(self.p, f"task {tid} on_pass_cmd recorded {result['status']} model-free")
                 continue
             # Self-explaining: what it ran with goes next to its exit and output.
