@@ -26986,6 +26986,7 @@ DURABLE_EXEMPT = {
     ("daemon.py", "ON_PASS_LOG"): "a log (an on_pass command's output, read only for its tail)",
     ("daemon.py", 'open(self.p.state / STACKS_FILE, "a")'): "the stack-dump log when no dump is registered, a diagnostic",
     ("daemon.py", "pidfile.write_text"): "names a process, which a reboot ends",
+    ("live.py", 'os.replace(os.path.join(d, "rc.tmp")'): "the CLI watch's live row's exit code, written fsynced by its detached runner (WATCH_RUNNER, no runtime import); one lost to a crash is reported as a killed run once overdue",
     ("daemon.py", 'os.replace(os.path.join(d, "rc.tmp")'): "the shared tip rerun's exit code, written fsynced by its detached runner (TIP_RUNNER, no runtime import); one lost to a crash counts as a rerun that proves nothing",
     ("daemon.py", '"daemon.start"'): "names a process, which a reboot ends",
     ("daemon.py", 'os.fdopen(fd, "w")'): "a private temporary MCP config, removed when the run ends",
