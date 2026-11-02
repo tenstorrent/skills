@@ -11369,17 +11369,18 @@ def test_ttp_checks_with_its_runner_present_runs_as_before_and_records_no_fault(
     assert not envfault.open_faults(p) and not p.db.kv(envfault.KV) and not _env_events(p)
 
 
-def test_a_typod_extra_command_fails_the_check_and_is_no_host_fault(env, tmp_path, monkeypatch):
-    """A task's own extra command that is not on PATH is the command's failure: it fails as before,
-    records no fault and raises no event (it must never hold the push queue)."""
+def test_a_typod_extra_command_fails_the_check_and_is_no_host_fault(env, tmp_path, monkeypatch, capsys):
+    """A task's own extra command that is not on PATH is the command's failure: refused up front naming
+    the program, it records no fault and raises no event (it must never hold the push queue)."""
     from ttp import cli, envfault
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     for cmd in ("no-such-program-ttp", "FOO=1 no-such-program-ttp -q && true", "timeout 5 no-such-program-ttp"):
         assert envfault.runners(cmd, repo) == []
+        capsys.readouterr()
         with pytest.raises(SystemExit) as e:
             cli.main(["checks", "--fresh", "--", cmd])
-        assert e.value.code not in (0, 75), cmd
-        assert "not found" in (run / "checks.log").read_text()
+        assert e.value.code == 1, cmd
+        assert "'no-such-program-ttp' is not installed" in capsys.readouterr().err, cmd
     assert not p.db.kv("env_faults") and not _env_events(p)
     # The shared path's runners still are: a missing python, a bare pytest left as written.
     assert envfault.precheck(["python9.99 -m pytest"], repo)["sig"] == "env:missing-runner:python9.99"
