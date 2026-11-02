@@ -228,6 +228,12 @@ Company-wide practice; the long form is in the `tt-project:setup-box` skill's re
   run (no root, no NOPASSWD rule for it), no reset runs and the output says so.
 - Check sudo rights with `sudo -n -l` (or `sudo -n -l <command>`), never `sudo -n true`: a host
   may grant NOPASSWD only for specific commands.
+- A worker's sandbox cannot gain privileges, so sudo fails inside it ('no new privileges'). A
+  privileged command the project allows runs on the host through the daemon:
+  `ttp host-run -- <command...>` prints its output and exits with its code (126 refused, 124 timed
+  out). Only commands in config `runner.host_commands` run, each entry the command's first words
+  (name them fully, e.g. `sudo -n /usr/sbin/<tool> <read-only verb>`); the user or the coordinator
+  sets the list, never a worker. Each run goes to `state/host-run.jsonl` with its task id.
 - A reset or a single-host power cycle never affects other hosts: nothing waits on or snapshots
   them first. Only a quad serving a quad-wide workload goes down and up as a quad.
 - After a tray power drop, try glx_reset first, then the single-host BMC power cycle with op 0x3

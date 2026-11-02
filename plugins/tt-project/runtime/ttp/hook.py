@@ -1616,6 +1616,12 @@ MOUNT_RACE = re.compile(r"bwrap: Can't (?:get type of source(?: path)?|find sour
 MOUNT_RACE_HINT = ("tt-project: transient sandbox mount race (a path the sandbox binds vanished while it "
                    "started), not a fault of your command: re-run the same command unchanged.")
 
+NO_NEW_PRIVS = re.compile(r"no new privileges|sudo\.conf is owned by uid \d+|effective uid is not 0", re.I)
+NO_NEW_PRIVS_HINT = ("tt-project: your sandbox cannot gain privileges, so sudo fails inside it. A command the project "
+                     "allows runs on the host through the daemon: `ttp host-run -- <command...>` (config "
+                     "runner.host_commands, set by the user or the coordinator). Not listed: name the exact "
+                     "command in your hand-off.")
+
 
 def post_tool_use_failure(payload: dict) -> tuple[dict | None, Callable[[], None] | None]:
     """A failed tool call: the hint for a sandbox mount race, and any coordinator update or hand-off
@@ -1624,6 +1630,8 @@ def post_tool_use_failure(payload: dict) -> tuple[dict | None, Callable[[], None
     parts = [out["hookSpecificOutput"]["additionalContext"]] if out else []
     if MOUNT_RACE.search(str(payload.get("error") or "")):
         parts.insert(0, MOUNT_RACE_HINT)
+    if NO_NEW_PRIVS.search(str(payload.get("error") or "")):
+        parts.insert(0, NO_NEW_PRIVS_HINT)
     if not parts:
         return None, delivered
     return {"hookSpecificOutput": {"hookEventName": "PostToolUseFailure",

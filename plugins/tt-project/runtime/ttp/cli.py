@@ -5363,6 +5363,21 @@ def _lock_alternative(p, cfg: dict, names: list[str], a) -> str:
     return pick
 
 
+def cmd_host_run(a) -> None:
+    """`ttp host-run -- <cmd...>`: run a command config runner.host_commands allows on the host,
+    outside the worker's sandbox, through the daemon (hostrun.py); exits with the command's code."""
+    from . import hostrun
+    cmd = list(a.command or [])
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        die("usage: ttp host-run -- <command...>", 2)
+    p = here()
+    if p is None:
+        die("ttp host-run only works inside a tt-project run or project folder", 2)
+    sys.exit(hostrun.request(p, cmd))
+
+
 def cmd_lock(a) -> None:
     """Hold one slot of a shared resource while a command runs: `ttp lock <resource> -- <cmd...>`.
 
@@ -8183,6 +8198,12 @@ def cmd_config(a) -> None:
             val = checks_of(val) if a.key == "delivery.push_checks" else checks_by_repo_of(val)
         except ValueError as e:
             die(str(e) if a.key == "delivery.push_checks" else f"{a.key}: {e}")
+    if a.key.split(".")[:2] == ["runner", "host_commands"] or a.key == "runner" and isinstance(val, dict) \
+            and "host_commands" in val:
+        from . import configwho
+        if configwho.from_env()["by"] == "worker":
+            die("runner.host_commands (the commands `ttp host-run` may run outside the sandbox) is set only by "
+                "the user or the coordinator, never by a worker: name the exact command in your hand-off")
     if run and (k := _user_only_change(p.raw_config(), a.key, val)):
         # A run can be steered by text it reads; these change only in a coordinator turn that carries
         # the user's yes (coordinator.NEEDS_USER), as `ttp say` is refused inside a run.
@@ -10703,6 +10724,16 @@ def main(argv: list[str] | None = None) -> None:
                         "and the resume note after a reboot list it first")
     s.add_argument("command", nargs=argparse.REMAINDER, help="the command to run while holding it (after --)")
     s.set_defaults(fn=cmd_lock)
+
+    s = sub.add_parser("host-run", help="run a command config runner.host_commands allows (a sudo read, say) "
+                                        "outside the sandbox, through the daemon", description=(
+        "A sandboxed worker cannot gain privileges (sudo fails with 'no new privileges'). The daemon runs a "
+        "command listed in config runner.host_commands (each entry: the command's first words, which the "
+        "request must equal or start with; set by the user or the coordinator) on the host, under "
+        "runner.host_command_timeout_s, logs it to state/host-run.jsonl with the task id, and prints its "
+        "output; the exit code is the command's (126 refused, 124 timed out, 75 no answer from the daemon)."))
+    s.add_argument("command", nargs=argparse.REMAINDER, help="the command to run (after --)")
+    s.set_defaults(fn=cmd_host_run)
 
     s = sub.add_parser("ssh-preflight", help="exit 0 once a host answers over ssh, 255 while not (for "
                                              "retry_when), 10 host key not verified, 11 auth failed; "

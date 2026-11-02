@@ -2246,6 +2246,11 @@ class Daemon:
             detach.tend(self.p)
         except Exception:
             log(self.p, "starting queued detached jobs failed\n" + traceback.format_exc())
+        try:
+            from . import hostrun
+            hostrun.serve(self.p)
+        except Exception:
+            log(self.p, "serving ttp host-run requests failed\n" + traceback.format_exc())
         try:   # the jobs of tasks that ended without success, and `ttp detach --stop` requests (jobstop)
             from . import jobstop
             due = time.monotonic() >= getattr(self, "_jobstop_due", 0.0)

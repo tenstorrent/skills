@@ -523,7 +523,9 @@ EXTRA_KEYS = {
     "effort_ab": {"winner", "decided_at"},   # the end rule's result, written by effortab.conclude
     "power": {"keep_awake"},
     # device_timeout_max_s: a ceiling on device-job timeouts (off: unset); see device_timeout_max.
-    "runner": {"device_timeout_max_s"},
+    # host_commands, host_command_timeout_s: what `ttp host-run` may run outside a worker's sandbox and
+    # for how long (hostrun.py; none, 120 s).
+    "runner": {"device_timeout_max_s", "host_commands", "host_command_timeout_s"},
     # forbidden_patterns, forbidden_patterns_file: text memory and charter writes refuse (forbidden.py).
     "memory": {"forbidden_patterns", "forbidden_patterns_file"},
     # outage_owner_budget_min (60), outage_task_due_min (30), outage_escalate_min (30): when a shared
