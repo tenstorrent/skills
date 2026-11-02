@@ -2219,6 +2219,95 @@ def test_a_push_batch_still_sends_back_a_real_conflict_in_the_entry_own_commit(e
     assert _statuses(m) == ["conflict"], m
     assert m["results"][0]["detail"]["files"] == ["notes.txt"], m["results"]
 
+
+def _rewrite(cwd, of, files, message=None, later=60, args=()):
+    """Commit `files` in `cwd` as a rewrite of commit `of` (a rebase or amend): its author and author
+    date, its message unless `message`, and a committer date `later` seconds after its own."""
+    who = _git_out(cwd, "log", "-1", "--format=%an%x00%ae%x00%ad%x00%ct", "--date=raw", of).split("\0")
+    for path, text in files.items():
+        (cwd / path).write_text(text)
+        _git_out(cwd, "add", path)
+    env = {**os.environ, "GIT_AUTHOR_NAME": who[0], "GIT_AUTHOR_EMAIL": who[1], "GIT_AUTHOR_DATE": who[2],
+           "GIT_COMMITTER_DATE": f"{int(who[3]) + later} +0000"}
+    subprocess.run(["git", "-C", str(cwd), "commit", "-q", *args, "-m",
+                    message or _git_out(cwd, "log", "-1", "--format=%B", of)], env=env, check=True)
+    return _git_out(cwd, "rev-parse", "HEAD")
+
+
+@pytest.mark.parametrize("message, line", [(None, "B1 resolved"), ("first, reworded in its review", "B1")])
+def test_a_push_batch_drops_an_entry_commit_that_landed_rewritten_and_replays_the_rest(env, monkeypatch, capsys,
+                                                                                      message, line):
+    """The commit an entry is stacked on landed conflict-resolved (its patch changed, no trailer: the
+    same author, author date, subject and files, and a newer commit), or reworded (the same patch).
+    The entry replays only its own commit: no conflict, so its approval stands."""
+    p, repo, origin, other, a = _landed_fixture(env, monkeypatch)
+    _git_out(other, "pull", "-q", "--ff-only", "origin", "proj")
+    _git_out(other, "fetch", "-q", str(repo), "first")
+    landed_as = _rewrite(other, a, {"notes.txt": f"a\n{line}\nc\n"}, message=message)
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    head = _on_top(repo, a, "e1", {"more.txt": "own\n"})
+    rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed"], m
+    pushed = _git_out(origin, "rev-parse", "proj")
+    assert _git_out(origin, "show", f"{pushed}:notes.txt") == f"a\n{line}\nc", "the landing is kept"
+    assert _git_out(origin, "show", f"{pushed}:more.txt") == "own"
+    assert _git_out(origin, "rev-list", "--count", f"{landed_as}..{pushed}") == "1", "only its own commit"
+    assert f"({a[:10]} as {landed_as[:10]}); replaying the other 1" in capsys.readouterr().out
+
+
+def test_a_push_batch_replays_an_entry_commit_amended_after_its_landing(env, monkeypatch):
+    """The entry's commit is an amend (same author date and subject) of one that landed, made after
+    the landing and adding work: it is newer than the landed copy, so it is replayed, never dropped."""
+    p, repo, origin, other, a = _landed_fixture(env, monkeypatch)
+    _git_out(repo, "push", "-q", "origin", "first:proj")
+    _git_out(repo, "checkout", "-q", "-B", "e1", a)
+    head = _rewrite(repo, a, {"notes.txt": "a\nB1\nc\nadded by the amend\n"}, later=120, args=("--amend",))
+    rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed"], m
+    assert _git_out(origin, "show", "proj:notes.txt") == "a\nB1\nc\nadded by the amend", "the amend's work landed"
+
+
+def test_a_push_batch_sends_back_an_entry_whose_own_commit_edits_what_a_rewritten_landing_changed(env, monkeypatch):
+    """Dropping the commit that landed conflict-resolved leaves the entry's own commit, which edits the
+    very line the landed version resolved differently: a real conflict, and the entry goes back."""
+    p, repo, origin, other, a = _landed_fixture(env, monkeypatch)
+    _git_out(other, "pull", "-q", "--ff-only", "origin", "proj")
+    _git_out(other, "fetch", "-q", str(repo), "first")
+    _rewrite(other, a, {"notes.txt": "a\nB1 resolved\nc\n"})
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    head = _on_top(repo, a, "e1", {"notes.txt": "a\nB1 mine\nc\n"})
+    rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
+    assert _statuses(m) == ["conflict"], m
+    assert m["results"][0]["detail"]["files"] == ["notes.txt"], m["results"]
+
+
+@pytest.mark.parametrize("change", ["author", "date", "subject", "files", "older", "none"])
+def test_a_rewritten_landing_needs_the_same_author_date_subject_and_files_and_a_newer_commit(
+        tmp_path, change):
+    from ttp import batch
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git_out(repo, "init", "-q")
+    _git_out(repo, "config", "user.name", "T")
+    _git_out(repo, "config", "user.email", "t@example.com")
+    (repo / "f.txt").write_text("0\n")
+    _git_out(repo, "add", "f.txt")
+    _git_out(repo, "commit", "-qm", "base")
+    base = _git_out(repo, "rev-parse", "HEAD")
+    (repo / "f.txt").write_text("1\n")
+    _git_out(repo, "commit", "-qam", "one")
+    mine = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "checkout", "-q", "--detach", base)
+    # every task may commit as one author in one second: another subject on the same file is another commit
+    files = {"g.txt": "x\n"} if change == "files" else {"f.txt": "1 resolved\n"}
+    landed_as = _rewrite(repo, mine, files, message="other" if change == "subject" else None,
+                         later=-60 if change == "older" else 60)
+    if change in ("author", "date"):
+        _git_out(repo, "commit", "-q", "--amend", "--no-edit", *(
+            ["--author", "U <u@example.com>"] if change == "author" else ["--date", "1000000000 +0000"]))
+        landed_as = _git_out(repo, "rev-parse", "HEAD")
+    want = {mine: landed_as} if change == "none" else {}
+    assert batch._rewritten(repo, landed_as, base, [mine]) == want
 def test_the_push_queue_counts_conflicts_and_those_its_batches_resolved(env):
     from ttp import pushq
     p, rid = _pq_rows(env)

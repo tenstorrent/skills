@@ -629,11 +629,12 @@ def _idents(repo: Path, *revs: str) -> dict[str, tuple[str, str, frozenset, int]
 
 def _rewritten(repo: Path, onto: str, base: str, rest: list[str]) -> dict[str, str]:
     """{commit: its landed version} for the commits of `rest` that landed rewritten: a commit of
-    base..onto with the same author and author date (a rebase or amend keeps both), the same subject or
-    the same files, and a committer date no older than the commit's own. Such a commit landed reworded,
-    or with a conflict resolved in its own review, so neither a trailer nor its patch names it; the
-    landed version is the newer one. A commit rewritten after its landing (an amend that adds work) is
-    newer than the landed version, so it is replayed, never dropped."""
+    base..onto with the same author and author date (a rebase or amend keeps both), the same subject and
+    the same files, and a committer date no older than the commit's own. Such a commit landed with a
+    conflict resolved in its own review, so neither a trailer nor its patch names it; the landed version
+    is the newer one. Every task may commit as one author within one second, so a subject or the files
+    alone never match. A commit rewritten after its landing (an amend that adds work) is newer than the
+    landed version, so it is replayed, never dropped."""
     mine = _idents(repo, "--no-walk=unsorted", *rest)
     theirs: dict[str, list[tuple[str, str, frozenset, int]]] = {}
     for c, (who, subject, files, when) in _idents(repo, "--reverse", f"{base}..{onto}").items():
@@ -643,7 +644,7 @@ def _rewritten(repo: Path, onto: str, base: str, rest: list[str]) -> dict[str, s
         if not (m := mine.get(c)):
             continue
         for landed, subject, files, when in theirs.get(m[0], []):
-            if (subject == m[1] or (files and files == m[2])) and when >= m[3]:
+            if subject == m[1] and files == m[2] and when >= m[3]:
                 found[c] = landed
                 break
     return found
@@ -1060,7 +1061,7 @@ class Batch:
         """The commits of base..top (merges aside), and those of them already on `onto`, each with
         the commit there that carries it: one naming it in a REPLAYED trailer (a batch that settled
         its replay, or a squash that carries several), else one with the same patch (`git patch-id
-        --stable`, as git cherry), else a newer rewrite of it (_rewritten: it landed reworded or
+        --stable`, as git cherry), else a newer rewrite of it (_rewritten: it landed
         conflict-resolved). Replaying such a commit again could only conflict with its own landing.
         Oldest first; the first carrier found wins."""
         own = _git(self.repo, "rev-list", "--reverse", "--no-merges", f"{base}..{top}").stdout.split()
