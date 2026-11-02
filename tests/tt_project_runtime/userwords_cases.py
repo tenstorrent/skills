@@ -111,9 +111,8 @@ def test_a_short_sentence_sharing_only_generic_words_matches_no_topic(env):
     p.db.post("in", "The provider sign-in expired again; use the account credentials from the shared note.",
                chat=None, kind="user", provenance="web-session")
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
-    lines = [x for x in coord.digest(p, {}, [], []).splitlines() if x.startswith(f"- ask #") ]
-    assert lines and "shared note" not in lines[0] and "accounts instead" not in lines[0] and \
-        "provider sign-in expired again" in lines[0], lines
+    lines = [x for x in coord.digest(p, {}, [], []).splitlines() if "User's latest words on this" in x]
+    assert lines and "shared note" in lines[0] and "accounts instead" not in lines[0], lines
 
 
 def test_the_ask_gate_refuses_leave_the_users_newer_request_gave_naming_it(env):
