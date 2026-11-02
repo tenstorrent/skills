@@ -2501,7 +2501,7 @@ class Daemon:
                        f"{plan['why']}. They stay strict (no MCP server but the listed files) until that clears.",
                        severity="low", every_s=86400)
             return None
-        return plan["deny"]
+        return plan["deny"] if plan["connectors"] else None   # each listed one withheld: strict
 
     def _chat_fallback_cap(self, model: str) -> None:
         """One keyed low observation a day per project: a chat run starts under Claude Code's own

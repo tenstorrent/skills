@@ -165,9 +165,11 @@ def plan(claude_cfg: dict, entry: dict | None, scope: list[str] = (), plugin_dir
     No connector listed in mcp_servers: all empty, the run stays strict as it always was. A listed one
     on this host's trusted list: the run keeps those connectors, and every other name on the list or in
     `scope` (the config scopes' servers) but the listed file servers goes in "deny". Else "why" says why
-    the run stays strict: a run never leaves strict mode with an unknown set of servers."""
+    the run stays strict: a run never leaves strict mode with an unknown set of servers. A connector
+    also on mcp_withheld is never kept (chat inherits claude's withheld list: project.CHAT_INHERITS)."""
     names = _names(claude_cfg.get("mcp_servers"))
-    wanted = [n for n in names if _is_connector(n)]
+    withheld = {_key(n) for n in _names(claude_cfg.get("mcp_withheld"))}
+    wanted = [n for n in names if _is_connector(n) and _key(n) not in withheld]
     out = {"connectors": [], "deny": [], "why": ""}
     if not wanted:
         return out

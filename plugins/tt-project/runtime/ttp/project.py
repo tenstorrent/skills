@@ -2338,10 +2338,26 @@ def layered(raw: dict) -> dict:
     holding no object read as absent: bad_sections). budget.timezone set nowhere is the project's home zone (UTC without one)."""
     cfg = deep_merge(DEFAULT_CONFIG, load_account_settings())
     _merge_into(cfg, _without_bad_sections(raw))
+    _chat_inherits(cfg)
     if isinstance(cfg.get("budget"), dict) and not cfg["budget"].get("timezone"):
         from .timefmt import zone_name
         cfg["budget"]["timezone"] = zone_name(raw)
     return cfg
+
+
+# A chat worker is Claude Code too: unset, these keys take claude's value, so a routed model never
+# gets the user's plugins, MCP servers or withheld connectors that claude workers are kept from.
+CHAT_INHERITS = ("worker_isolation", "mcp_withheld")
+
+
+def _chat_inherits(cfg: dict) -> None:
+    provs = cfg.get("providers")
+    chat, claude = (provs.get("chat"), provs.get("claude")) if isinstance(provs, dict) else (None, None)
+    if not (isinstance(chat, dict) and isinstance(claude, dict)):
+        return
+    for key in CHAT_INHERITS:
+        if chat.get(key) is None and claude.get(key) is not None:
+            chat[key] = _copy_tree(claude[key])
 
 
 def account_settings_path() -> Path:

@@ -9675,6 +9675,14 @@ def cmd_doctor(a) -> None:
                  if Path(d).is_dir()]   # a missing one has its own alert
         if prov.name != "fake" and plugs and not prov.plugin_args(plugs):
             print("plugins: " + prov.plugin_dirs_gap(plugs, bool(pcfg.get("worker_isolation"))))
+    # Per provider: chat with no key of its own takes claude's (project.CHAT_INHERITS).
+    raw_provs = p.raw_config().get("providers")
+    raw_chat = raw_provs.get("chat") if isinstance(raw_provs, dict) else None
+    own = isinstance(raw_chat, dict) and raw_chat.get("worker_isolation") is not None
+    iso = [f"{prov.name} {'on' if (p.config()['providers'].get(prov.name) or {}).get('worker_isolation') else 'off'}"
+           + (" (from claude)" if prov.name == "chat" and not own else "")
+           for prov in all_providers() if prov.name != "fake" and prov.name in p.config()["providers"]]
+    print("worker isolation: " + ", ".join(iso))
     claude_cfg = p.config()["providers"].get("claude", {})
     from .coordinator import name_list
     from . import mcpgap   # a gap is already a status line above

@@ -811,6 +811,12 @@ Spend: Claude Code prices model names it does not know at its own fallback rate.
 a `"default"` row covers other models) and chat runs are booked at those rates from their token
 counts, with budget caps checked on that figure. Without it, chat spend is booked as estimated.
 
+Isolation: chat workers are Claude Code workers, so `providers.chat.worker_isolation` and
+`providers.chat.mcp_withheld` work as the `providers.claude` keys do (below). Unset, each takes
+the claude value: a routed model gets none of your MCP servers, plugins or withheld connectors
+that claude workers are kept from. Set either for chat to differ; `ttp doctor` prints isolation
+per provider, marking chat's when it comes from claude.
+
 ## Jev (optional add-on)
 
 Jev is a cheap outside decision model that screens watcher observations, picks task tiers and rates
@@ -1781,7 +1787,8 @@ queues behind routine work; nothing running is interrupted:
   Isolated workers get no claude.ai account connector unless `mcp_servers` lists it (below):
   `--strict-mcp-config` drops every server not passed in its own config file, and connectors are
   not defined in any file.
-  `ttp new` turns it on; projects created earlier keep it off until you set it.
+  `ttp new` turns it on; projects created earlier keep it off until you set it. Chat workers
+  take this value while `providers.chat.worker_isolation` is unset.
 - `providers.claude.mcp_servers: ["name", ...]` lists the MCP servers isolated workers still get.
   Each run copies just those entries from your Claude config (local, then `.mcp.json`, then user
   scope) into its own owner-only file in the temp directory, and deletes it when the run ends.

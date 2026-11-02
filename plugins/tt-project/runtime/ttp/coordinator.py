@@ -402,6 +402,8 @@ USER_SETTABLE = {
     # Workers load none of the user's own MCP servers, plugins, hooks or settings.
     "providers.claude.worker_isolation": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "providers.codex.worker_isolation": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    # Unset, chat takes the claude value (project.CHAT_INHERITS); set, it wins.
+    "providers.chat.worker_isolation": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # MCP servers from the user's own Claude config that isolated workers still get, by name.
     "providers.claude.mcp_servers": lambda v: name_list(v, strict=True),
     # Connected MCP servers kept from workers on purpose: ttp status no longer names them (mcpgap.py).

@@ -1607,3 +1607,128 @@ def test_route_phrase_counts_reruns_apart_from_real_fallbacks(env, monkeypatch):
     assert route.phrase(p.db) == "routed 24h: 2 runs to chat"
     seen["rows"] = [row("none"), row("rate_limit", "claude")]
     assert route.phrase(p.db) == "routed 24h: 1 run to chat, 1 fell back (rate_limit 1)"
+
+
+# A stand-in for Claude Code's init event: the user's MCP servers load unless --strict-mcp-config (or
+# deniedMcpServers names them), the user's plugins unless --setting-sources leaves out "user".
+_FAKE_INIT = r'''
+import json, sys
+a = sys.argv[1:]
+def val(flag, default):
+    return a[a.index(flag) + 1] if flag in a else default
+settings = json.loads(val("--settings", "{}"))
+denied = {d.get("serverName") for d in settings.get("deniedMcpServers") or []}
+servers = [] if "--strict-mcp-config" in a else [n for n in json.loads(sys.stdin.read()) if n not in denied]
+plugins = ["user-plugin"] if "user" in val("--setting-sources", "user,project,local").split(",") else []
+print(json.dumps({"type": "system", "subtype": "init", "mcp_servers": [{"name": n} for n in servers],
+                  "plugins": [{"name": n} for n in plugins]}))
+'''
+
+
+def _fake_init(argv, user_servers):
+    out = subprocess.run([sys.executable, "-c", _FAKE_INIT, *argv[1:]], input=json.dumps(user_servers),
+                         capture_output=True, text=True, check=True).stdout
+    event = json.loads(out)
+    return [s["name"] for s in event["mcp_servers"]], [x["name"] for x in event["plugins"]]
+
+
+def test_chat_workers_inherit_claude_worker_isolation_and_withheld_connectors(env, monkeypatch, tmp_path):
+    """providers.chat with no worker_isolation or mcp_withheld of its own takes claude's (project.CHAT_INHERITS):
+    a routed model gets none of the user's MCP servers or plugins that claude workers are kept from."""
+    from ttp import daemon as dmod
+    from ttp.daemon import Daemon
+    p = make(env)
+    _chat_config(p)
+    _claude_mcp_config(tmp_path, monkeypatch, p)
+    user_servers = ["docs", "other", "claude.ai Gmail"]
+
+    class Proc:   # never a real runner
+        pid = 4242
+    real = subprocess.Popen
+    monkeypatch.setattr(dmod.subprocess, "Popen",
+                        lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
+
+    def start():
+        d = Daemon(p.base)
+        monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+        tid = p.db.add_task("build it", "s", kind="code", tier="standard", origin="user", provider="chat")
+        cwd, _ = d._workdir_for(p.db.task(tid))
+        rid = d.start_run("worker", "go", "chat", "standard", cwd, task=p.db.task(tid), budget_usd=4.0)
+        p.db.x("UPDATE runs SET status='ok', ended=? WHERE status='running'", (time.time(),))
+        p.db.x("UPDATE tasks SET status='done' WHERE status!='done'")
+        return json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
+
+    def isolated(argv):
+        i = argv.index("--setting-sources") if "--setting-sources" in argv else -1
+        return "--strict-mcp-config" in argv and i >= 0 and argv[i + 1] == "project,local"
+
+    def denied(argv):
+        return {d["serverName"] for d in json.loads(argv[argv.index("--settings") + 1]).get("deniedMcpServers", [])}
+
+    # Isolation off everywhere: the chat run loads the user's servers and plugins, as before.
+    p.set_config("providers.claude.worker_isolation", False)
+    argv = start()
+    assert not isolated(argv) and _fake_init(argv, user_servers) == (user_servers, ["user-plugin"])
+    # Claude isolated, chat's key unset: chat is isolated too, and its init lists nothing of the user's.
+    p.set_config("providers.claude.worker_isolation", True)
+    assert p.config()["providers"]["chat"]["worker_isolation"] is True
+    assert "worker_isolation" not in p.raw_config()["providers"]["chat"], "inherited, never written"
+    argv = start()
+    assert isolated(argv), argv
+    assert _fake_init(argv, user_servers) == ([], [])
+    # An explicit chat false wins; an explicit chat true holds with claude off.
+    p.set_config("providers.chat.worker_isolation", False)
+    assert not isolated(start())
+    p.set_config("providers.claude.worker_isolation", False)
+    p.set_config("providers.chat.worker_isolation", True)
+    assert isolated(start())
+    # Connectors: a chat run keeps the ones providers.chat.mcp_servers asks for, minus claude's withheld
+    # list (inherited while chat's own is unset); every other server is denied by name.
+    _host_list(p)
+    p.set_config("providers.chat.mcp_servers", ["claude.ai Gmail", "claude.ai Example Notes"])
+    p.set_config("providers.claude.mcp_withheld", ["claude.ai Example Notes"])
+    assert p.config()["providers"]["chat"]["mcp_withheld"] == ["claude.ai Example Notes"]
+    argv = start()
+    assert "--strict-mcp-config" not in argv and argv[argv.index("--setting-sources") + 1] == "project,local"
+    assert "claude.ai Example Notes" in denied(argv) and "claude.ai Gmail" not in denied(argv)
+    assert _fake_init(argv, ["docs", "claude.ai Gmail", "claude.ai Example Notes"]) == (["claude.ai Gmail"], [])
+    # Chat's own list wins over the inherited one.
+    p.set_config("providers.chat.mcp_withheld", [])
+    argv = start()
+    assert not {"claude.ai Example Notes", "claude.ai Gmail"} & denied(argv)
+    # Every connector asked for is withheld (however it is written): the run stays strict.
+    p.set_config("providers.chat.mcp_withheld", ["claude.ai Gmail", "claude_ai_Example_Notes"])
+    assert isolated(start())
+
+
+def test_chat_inherits_only_into_a_configured_chat_provider():
+    from ttp.project import _chat_inherits
+    cfg = {"providers": {"claude": {"worker_isolation": True, "mcp_withheld": ["a"]}}}
+    _chat_inherits(cfg)
+    assert "chat" not in cfg["providers"], "no chat section is made up"
+    cfg["providers"]["chat"] = {"endpoint": "x", "mcp_withheld": None}
+    _chat_inherits(cfg)
+    assert cfg["providers"]["chat"] == {"endpoint": "x", "worker_isolation": True, "mcp_withheld": ["a"]}
+    cfg["providers"]["claude"]["mcp_withheld"].append("b")
+    assert cfg["providers"]["chat"]["mcp_withheld"] == ["a"], "a copy, never claude's own list"
+    for bad in ({"providers": {"chat": "x", "claude": {}}}, {"providers": ["chat"]}, {}):
+        _chat_inherits(bad)   # a broken section is left as it is
+
+
+def test_doctor_prints_worker_isolation_per_provider_and_the_coordinator_may_set_chats(env, monkeypatch, capsys):
+    import types
+    from ttp import cli
+    from ttp import coordinator as coord
+    p = make(env)
+    monkeypatch.setattr(cli, "need", lambda *a: p)
+    p.set_config("providers.claude.worker_isolation", True)
+
+    def line():
+        cli.cmd_doctor(types.SimpleNamespace(name="demo"))
+        return next(ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("worker isolation: "))
+    assert "chat" not in line(), "no chat line while chat is not configured"
+    _chat_config(p)
+    assert "claude on" in line() and "chat on (from claude)" in line()
+    assert coord.apply(p, [{"type": "config_set", "key": "providers.chat.worker_isolation", "value": "off"}]) == []
+    assert p.raw_config()["providers"]["chat"]["worker_isolation"] is False
+    assert "chat off" in line() and "(from claude)" not in line()
