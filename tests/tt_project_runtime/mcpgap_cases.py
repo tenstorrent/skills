@@ -342,7 +342,8 @@ def test_isolated_worker_with_a_listed_connector_keeps_it_and_keeps_every_other_
     # The feed names only connectors the project does not list.
     g = mcpgap.gap(p.config()["providers"]["claude"], mcpgap.read(p.state))
     assert g["connectors"] == ["claude.ai Example Notes"] and "claude.ai Gmail" not in g["line"]
-    assert "List one in providers.claude.mcp_servers" in g["line"]
+    assert "providers.claude" not in g["line"], "the default line gives no config instructions"
+    assert "List one in providers.claude.mcp_servers" in g["detail"]
 
 
 def test_isolated_worker_with_a_connector_stays_strict_without_a_trusted_host_list(env, monkeypatch, tmp_path,
@@ -391,8 +392,8 @@ def test_isolated_worker_with_a_connector_stays_strict_without_a_trusted_host_li
     # The feed names a listed connector that cannot be kept, with why.
     _host_list(p, at=time.time() - mcpgap.TRUST_S - 60)
     g = mcpgap.gap(p.config()["providers"]["claude"], mcpgap.read(p.state))
-    assert "listed in providers.claude.mcp_servers (claude.ai Gmail) do not reach isolated workers" in g["line"]
-    assert "h old" in g["line"]
+    assert "listed in providers.claude.mcp_servers (claude.ai Gmail) do not reach isolated workers" in g["detail"]
+    assert "h old" in g["detail"]
 
 
 def test_mcp_list_names_every_server_and_an_old_cache_is_probed_again(tmp_path):
