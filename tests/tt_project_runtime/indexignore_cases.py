@@ -35,7 +35,11 @@ def _ii_rg():
         # --version then prints a ripgrep version (the CLI's own version would not).
         claude = shutil.which("claude")
         if claude:
-            wrapper = os.path.join(tempfile.gettempdir(), f"ii-rg-{os.getpid()}")
+            # A unique name, not pid-based: in a sandboxed xdist run every worker maps to a low pid
+            # in its own PID namespace while /tmp is shared, so a pid-based name collides and one
+            # process's atexit unlink deletes another's wrapper mid-test.
+            import uuid
+            wrapper = os.path.join(tempfile.gettempdir(), f"ii-rg-{uuid.uuid4().hex[:12]}")
             try:
                 with open(wrapper, "w") as f:
                     f.write(f'#!/bin/bash\nexec -a rg "{claude}" "$@"\n')
