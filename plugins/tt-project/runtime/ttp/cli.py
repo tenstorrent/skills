@@ -6449,6 +6449,8 @@ def _set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None =
         if retry and (probe is not None or on_pass_cmd is not None):
             if probe is not None:
                 check_probe(probe, "retry_when")
+                from .probevars import pin
+                probe = pin(probe, "retry_when")   # a run's own $TTP_RUN_DIR is unset where probes run
                 check_task_refs(db, probe, "retry_when")
                 from .waitheal import always_passes
                 if on_pass_cmd is None and prev.get("on_pass_cmd") is not None and always_passes(probe):

@@ -51,6 +51,7 @@ from . import replica
 from . import schedlog
 from . import throughmute
 from . import probespawn
+from . import probevars
 from . import urgent
 from . import convgate
 from . import unstarted
@@ -4202,6 +4203,8 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "handoff_probe_refused", "normal", text, "queued", task["id"]))
             log(self.p, f"task {task['id']} hand-off: retry_when {bad} refused: no shell command")
+        if rstatus == "waiting" and isinstance(result.get("retry_when"), str):
+            result = self._pin_handoff_probe(task, r, run_dir, result)
         jobs = _detached_jobs(run_dir)
         if jobs and (rstatus is None and status in ("ok", "timeout", "stalled")
                      or rstatus == "waiting" and not result.get("retry_when")):
@@ -10982,6 +10985,31 @@ class Daemon:
             log(self.p, f"task {r['task']} on_pass_cmd dry run: {got['verdict']} ({onpassdry.said(got)})")
         except Exception as e:
             log(self.p, f"task {r['task']}: the on_pass_cmd dry run could not run: {type(e).__name__}: {e}")
+
+    def _pin_handoff_probe(self, task: dict, r: dict, run_dir: Path, result: dict) -> dict:
+        """A waiting hand-off's retry_when with the run's own variables ($TTP_RUN_DIR, ...: unset where
+        probes run) written in from the run's environment (probevars.pin), the run's text kept as
+        retry_when_orig (_same_probe). One without a value is dropped as no probe, said loudly."""
+        probe = result["retry_when"]
+        if "$" not in probe:
+            return result
+        spec = _read_result(run_dir / "run.json") or {}
+        env = {**(spec["env"] if isinstance(spec.get("env"), dict) else {}), "TTP_RUN_DIR": str(run_dir),
+               "TTP_RUN_ID": str(r.get("id") or ""), **task_env(task["id"])}
+        try:
+            pinned = probevars.pin(probe, "retry_when", env)
+        except ValueError as e:
+            text = f"#{task['id']} {task['title']}: its waiting hand-off's {e}; it was not stored, so the task " \
+                   f"wakes at its retry timer"
+            self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                        (time.time(), f"task:{task['id']}", "handoff_probe_refused", "normal", text[:1500],
+                         "queued", task["id"]))
+            log(self.p, f"task {task['id']} hand-off: retry_when refused: {e}")
+            return {**{k: v for k, v in result.items() if k != "retry_when"}, "retry_when_refused": probe[:200]}
+        if pinned == probe:
+            return result
+        log(self.p, f"task {task['id']} hand-off: retry_when's run variables written in: {pinned[:300]}")
+        return {**result, "retry_when": pinned, "retry_when_orig": result.get("retry_when_orig", probe)}
 
     def _probe_env(self) -> dict:
         """Probes and on_pass commands run `ttp` (e.g. `ttp lock --probe device-a`) as a worker would,

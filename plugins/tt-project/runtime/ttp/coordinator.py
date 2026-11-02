@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 
 from . import budget as bud, locks
 from . import ackwait, anchors, askauto, askrethink, broadcast, budgetkind, cachettl, causefix, cells, chaincap, convgate, chainprio, chatset, checkspill, correction, course, coursecheck, credits, deploy, echoes, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, loadcaps, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, reask, rejcool, relay, responsibilities, restriction_audit, restriction_source, reviewcap, selfreview, reviewreuse, settinghold, settled, shared, sharedchecks, startbreaker, sweep, throughmute, timefmt, tried, unblock, unstarted, upstream, verified, watchdup, worktree
+from . import probevars
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -1329,6 +1330,7 @@ def _start_args(a: dict, cur: dict, p: Project | None = None) -> tuple[float | N
         check_probe(when)
         if when.strip().lower() == "now":   # `now` clears the probe, as for start_after; never a command
             when = ""
+        when = probevars.pin(when, "start_when")   # a run's own $TTP_RUN_DIR is unset where probes run
         if when.strip() and when.strip() != cur.get("when"):
             check_start_when(when.strip(), p)
     return after, (when.strip() or None) if when else None
