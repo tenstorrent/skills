@@ -1414,6 +1414,18 @@ def test_a_git_write_in_an_attempt_drops_its_volatile_and_once_answers(tmp_path,
         assert git("rev-parse", "HEAD").stdout.strip() == head and len(spawns) == m, "a ref read stays"
         assert git("cat-file", "-t", "0" * 40).returncode == 128 and len(spawns) == m + 1, "once: dropped"
         assert m == n + 4, spawns[n:]
+        assert git("rev-parse", "--verify", "-q", "refs/ttp/z").returncode == 1 and len(spawns) == m + 2
+
+        def hung(argv, t, kw):
+            if "update-ref" in argv:
+                raise subprocess.TimeoutExpired(argv, t or 0)
+            return real(argv, t, kw)
+        monkeypatch.setattr(gitmemo, "_spawn", lambda argv, t, kw: spawns.append(argv) or hung(argv, t, kw))
+        with pytest.raises(subprocess.TimeoutExpired):
+            git("update-ref", "refs/ttp/z", "HEAD")
+        assert git("rev-parse", "--verify", "-q", "refs/ttp/z").returncode == 1 and len(spawns) == m + 4, \
+            "a write that timed out may still have written: its answers go too"
+        m += 3
     with gitmemo.attempt(other):
         assert git("status", "--porcelain").returncode == 0 and len(spawns) == m + 1, "another attempt's stays"
 

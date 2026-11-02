@@ -317,8 +317,6 @@ keeps its own cap and makes the round's point of no return)."""
     try:
         r = _spawn(argv, t, kw)
     except subprocess.TimeoutExpired:
-        if write:
-            gitreplay.end(a.id)
         if rd:
             rd.live_s += time.monotonic() - t0
             rd.live_n += 1
@@ -328,8 +326,9 @@ keeps its own cap and makes the round's point of no return)."""
         if k is not None and not (rd and slice_binds):
             gitreplay.put(k, None, a.id, a.round)   # its own timeout: the next round degrades the same
         raise
-    if write:
-        gitreplay.end(a.id)     # its own volatile and once answers may predate the write
+    finally:
+        if write:
+            gitreplay.end(a.id)     # its own volatile and once answers may predate the write
     if rd:
         rd.live_s += time.monotonic() - t0
         rd.live_n += 1
