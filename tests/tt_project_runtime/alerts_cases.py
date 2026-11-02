@@ -5027,3 +5027,71 @@ def test_the_daemon_tick_ends_the_mutes_of_a_finished_task(env):
     _failing_step_daemon(p.base, []).tick()
     assert [m["match"] for m in screen.mutes(p.db)] == ["#13"]
     assert p.db.q("SELECT 1 FROM events WHERE text LIKE 'mute ended:%#12%(task #12 ended)%'")
+
+
+def _codex_auth(home, account_id=None, mode="chatgpt", key=None, id_claims=None):
+    """A CODEX_HOME holding an auth.json like Codex writes (fake tokens only)."""
+    import base64
+    home.mkdir(parents=True, exist_ok=True)
+    tokens = {"access_token": "at-SECRET-access", "refresh_token": "rt-SECRET-refresh"}
+    if account_id:
+        tokens["account_id"] = account_id
+    if id_claims is not None:
+        body = base64.urlsafe_b64encode(json.dumps(id_claims).encode()).decode().rstrip("=")
+        tokens["id_token"] = f"eyJhbGciOiJub25lIn0.{body}.c2lnLVNFQ1JFVA"
+    auth = {"auth_mode": mode, "OPENAI_API_KEY": key, "tokens": None if mode == "api_key" else tokens}
+    (home / "auth.json").write_text(json.dumps(auth))
+    return home
+
+
+def test_codex_account_reads_codex_home_and_tells_accounts_apart_without_secrets(env, monkeypatch):
+    """The Codex label follows CODEX_HOME, differs per account id, repeats for the same one, and
+    carries neither the email nor a token: only the mode and a short opaque hash."""
+    from ttp.providers import get_provider
+    codex, tmp = get_provider("codex"), env["tmp"]
+    monkeypatch.setenv("HOME", str(tmp / "home"))   # a ~/.codex here must not be read
+    _codex_auth(tmp / "home" / ".codex", "acct-home-default")
+    labels = {}
+    for name, kw in (("a", {"account_id": "acct-1111"}), ("a2", {"account_id": "acct-1111"}),
+                     ("b", {"account_id": "acct-2222"}),
+                     ("jwt", {"id_claims": {"email": "someone@example.com", "sub": "user-x",
+                                            "https://api.openai.com/auth": {"chatgpt_account_id": "acct-3333"}}}),
+                     ("key1", {"mode": "api_key", "key": "sk-SECRET-one"}),
+                     ("key2", {"mode": "api_key", "key": "sk-SECRET-two"})):
+        monkeypatch.setenv("CODEX_HOME", str(_codex_auth(tmp / name, **kw)))
+        labels[name] = (codex.account(), codex.account_kind())
+    monkeypatch.setenv("CODEX_HOME", str(tmp / "home" / ".codex"))
+    labels["home"] = (codex.account(), codex.account_kind())
+    assert labels["a"] == labels["a2"] and labels["a"][0] != labels["b"][0], labels
+    assert len({v[0] for k, v in labels.items() if k != "a2"}) == 6, "two accounts share a label"
+    assert labels["a"][1] == labels["b"][1] == "codex (chatgpt)" and labels["key1"][1] == "codex (api_key)"
+    assert all(re.fullmatch(r"codex \((chatgpt|api_key)\) [0-9a-f]{10}", v[0]) for v in labels.values()), labels
+    text = json.dumps(labels)
+    assert not re.search(r"SECRET|@|acct-|sk-|user-x", text), text
+    monkeypatch.setenv("CODEX_HOME", str(tmp / "missing"))
+    assert codex.account() == codex.account_kind() == ""
+    (tmp / "bad").mkdir()
+    (tmp / "bad" / "auth.json").write_text("[1, 2]")
+    monkeypatch.setenv("CODEX_HOME", str(tmp / "bad"))
+    assert codex.account() == codex.account_kind() == ""
+
+
+def test_a_codex_login_back_on_another_chatgpt_account_is_an_account_switch(env, monkeypatch):
+    """Two ChatGPT logins used to share one label, so the breaker's account-switch hold missed the
+    switch: now the login back under another account id is held, the same one is not."""
+    p = make(env)
+    from ttp import alerts
+    from ttp.daemon import Daemon
+    from ttp.providers import get_provider
+    tmp = env["tmp"]
+    monkeypatch.setenv("CODEX_HOME", str(_codex_auth(tmp / "one", "acct-1111")))
+    p.db.x("INSERT INTO runs(role,provider,account,started,ended,status) VALUES('worker','codex',?,?,?,'ok')",
+           (get_provider("codex").account(), time.time() - 60, time.time() - 50))
+    d = Daemon(p.base)
+    d.open_breaker("codex", "401")
+    rec = alerts.breaker(p.db, "codex")
+    assert rec["account"] and rec["account_kind"] == "codex (chatgpt)"
+    assert d._account_switched("codex", rec) is None, "the same account was taken for a switch"
+    monkeypatch.setenv("CODEX_HOME", str(_codex_auth(tmp / "two", "acct-2222")))
+    assert d._account_switched("codex", rec) == {"from": "codex (chatgpt)", "to": "codex (chatgpt)"}
+    assert "acct-" not in json.dumps(alerts.breaker(p.db, "codex"))

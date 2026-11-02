@@ -30,6 +30,7 @@ Per-run plugins: not possible. Codex loads a plugin only from its install cache 
 plugin with `-c` alone loaded none of its skills (measured), and no `-c` key adds a skill folder."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -267,15 +268,17 @@ class Codex(Provider):
         return u
 
     def account(self) -> str:
-        try:
-            auth = json.loads(Path(os.path.expanduser("~/.codex/auth.json")).read_text())
-        except (OSError, ValueError):
+        """`codex (<mode>) <id>`: the login mode plus a short opaque hash of the account, so two
+        logins of one mode tell apart. Never the email or a token."""
+        auth = _auth()
+        if auth is None:
             return ""
-        mode = auth.get("auth_mode") or ("api_key" if auth.get("OPENAI_API_KEY") else "chatgpt")
-        return f"codex ({mode})"
+        who = _account_id(auth)
+        return f"codex ({_mode(auth)})" + (f" {hashlib.sha256(who.encode()).hexdigest()[:10]}" if who else "")
 
     def account_kind(self) -> str:
-        return self.account()
+        auth = _auth()
+        return "" if auth is None else f"codex ({_mode(auth)})"
 
     def meter(self) -> list:
         """Plan windows via the app-server protocol; spends no model tokens."""
@@ -337,6 +340,38 @@ class Codex(Provider):
 def codex_home() -> Path:
     """Where Codex keeps its login and saved sessions."""
     return Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
+
+
+def _auth() -> dict | None:
+    """CODEX_HOME's auth.json, or None when it is missing or unreadable."""
+    try:
+        auth = json.loads((codex_home() / "auth.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return auth if isinstance(auth, dict) else None
+
+
+def _mode(auth: dict) -> str:
+    return str(auth.get("auth_mode") or ("api_key" if auth.get("OPENAI_API_KEY") else "chatgpt"))
+
+
+def _account_id(auth: dict) -> str:
+    """A stable id of the logged-in account, to be hashed: the ChatGPT account id (from `tokens`, else
+    the id token's claims), else the API key itself. Empty when there is none."""
+    tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else {}
+    if tokens.get("account_id"):
+        return str(tokens["account_id"])
+    tok = tokens.get("id_token")
+    if isinstance(tok, str) and tok.count(".") == 2:
+        try:
+            body = tok.split(".")[1]
+            claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+            info = claims.get("https://api.openai.com/auth") or {}
+            if who := (info.get("chatgpt_account_id") if isinstance(info, dict) else None) or claims.get("sub"):
+                return str(who)
+        except (ValueError, AttributeError):
+            pass
+    return str(auth.get("OPENAI_API_KEY") or "")
 
 
 def _read(path: Path) -> str:
