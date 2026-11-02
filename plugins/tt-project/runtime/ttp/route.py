@@ -195,10 +195,8 @@ def write_served(state: Path, prov: str, ok: bool, check: str, ids: list[str] | 
     last = data.get(prov) if isinstance(data.get(prov), dict) else {}
     data[prov] = {"ids": list(ids or []) if ok else list(last.get("ids") or []), "checked": now, "ok": bool(ok),
                   "check": check, **({"listed": last.get("checked")} if not ok and last.get("checked") else {})}
-    path = Path(state) / MODELS_FILE
-    tmp = path.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(data, indent=1))
-    os.replace(tmp, path)
+    from .project import durable_write
+    durable_write(Path(state) / MODELS_FILE, json.dumps(data, indent=1))
 
 
 def refresh_served(state: Path, alias: str) -> bool:
