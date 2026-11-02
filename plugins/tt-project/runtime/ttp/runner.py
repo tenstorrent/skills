@@ -323,6 +323,20 @@ def check_instructions(prov, run_dir: Path, out_path: Path, argv: list[str], env
     return None
 
 
+def _env_files(spec: dict) -> dict[str, str]:
+    """The secret environment the daemon kept out of run.json (env_files: owner-only JSON files,
+    removed with the run's private files), e.g. Codex workers' MCP server tokens."""
+    out: dict[str, str] = {}
+    for path in spec.get("env_files") or []:
+        try:
+            got = json.loads(Path(path).read_text())
+        except (OSError, ValueError):
+            continue   # gone (a rerun after the run ended): the servers start without them
+        if isinstance(got, dict):
+            out.update({str(k): str(v) for k, v in got.items()})
+    return out
+
+
 def supervise(run_dir: Path) -> int:
     try:
         spec = json.loads((run_dir / "run.json").read_text())
@@ -338,7 +352,7 @@ def supervise(run_dir: Path) -> int:
     argv, env_extra, cwd = spec["argv"], spec.get("env", {}), spec["cwd"]
     timeout_s, budget = float(spec.get("timeout_s", 3600)), spec.get("budget_usd")
     stall_s = float(spec.get("stall_s") or 0)
-    env = {**os.environ, **env_extra}
+    env = {**os.environ, **env_extra, **_env_files(spec)}
     lease, out_path = run_dir / "lease", run_dir / "output.jsonl"
     started = time.time()
     if spec.get("pin") and not stop_reason(run_dir):

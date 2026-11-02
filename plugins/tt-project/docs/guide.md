@@ -1796,6 +1796,20 @@ queues behind routine work; nothing running is interrupted:
   the project needs them: `mcp_servers` names one (`"claude.ai <name>"`), or one of its runs called
   a connector's tool (in the 14 days before the first such worker, or any time since). Then all
   connectors load as before.
+- `providers.codex.mcp_servers: ["name", ...]` lists the MCP servers Codex workers and reviewers get,
+  with or without `worker_isolation`. Each comes from the project's `.mcp.json` (as Claude reads
+  it, `${VAR}` expanded in `env` and `headers`) and goes in as one `-c mcp_servers={...}` argument;
+  a server whose `command`, `args` or `url` names a variable is skipped, as its value would be on
+  the command line. A worker that still
+  reads your `config.toml` (isolation off, or a config that sets a model provider) keeps a listed
+  server defined there as it is, and every other server there is turned off (`enabled=false`).
+  Secrets never go in the arguments or run.json: a stdio server's `env` values reach it through the
+  worker's environment (`env_vars`), and an HTTP server's headers through variables
+  (`bearer_token_env_var`, `env_http_headers`), all from an owner-only file the run deletes when it
+  ends. Codex runs stdio and streamable HTTP servers only. A name it cannot give is skipped and named
+  by a low alert; `ttp doctor` runs `codex mcp list --json` with the workers' arguments (offline, no
+  sign-in) and prints what is on. With no list, Codex workers get your `config.toml` servers when
+  not isolated and none when isolated, as before.
 - Claude workers and reviewers get only the built-in tools workers use (`--tools`): Bash, Read,
   Edit, Write, Skill (the plugin skills) and ToolSearch (it loads MCP tools on demand). WebFetch and
   WebSearch come with every task kind but a review; a review gets them only when its title or spec

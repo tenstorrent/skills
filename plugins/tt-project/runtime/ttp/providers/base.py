@@ -329,6 +329,10 @@ class Provider:
         cannot (or not for text that long), and the text then leads the prompt."""
         return []
 
+    # The agent takes a worker's MCP servers as arguments (mcp_args), with or without isolation, in
+    # place of an isolated run's config file (mcp_servers, with_mcp_config).
+    mcp_by_args = False
+
     def isolation_args(self) -> list[str]:
         """Arguments that keep the user's own MCP servers, plugins, hooks and settings out of a
         worker (the project's approved plugins and the harness hook still load); [] if unsupported."""
@@ -352,6 +356,13 @@ class Provider:
     def with_mcp_config(self, argv: list[str], path: Path) -> list[str]:
         """`argv` that also loads the MCP servers in the config file `path`; unchanged if unsupported."""
         return argv
+
+    def mcp_args(self, names: list[str], dirs: list[str], argv: list[str]) -> tuple[list[str], dict, list[str]] | None:
+        """For an agent that takes a worker's MCP servers as arguments, not a config file: the arguments
+        that give the worker launched with `argv` exactly the servers `names` (looked up for `dirs`),
+        the environment holding their secrets (never logged) and the names it cannot give, each with
+        why. Called only when mcp_by_args is set."""
+        return None
 
     def connector_env(self, keep: bool) -> dict[str, str]:
         """Environment that leaves the user's account connectors (servers the agent's account adds,

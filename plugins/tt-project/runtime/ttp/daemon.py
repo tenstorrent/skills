@@ -2403,8 +2403,8 @@ class Daemon:
     def _approved_mcp(self, prov, provider: str, cwd: str) -> dict:
         """The project's allowlisted MCP servers (`providers.<p>.mcp_servers`) for an isolated run,
         looked up for the worktree and the project root."""
-        names = coord.name_list(self.cfg["providers"].get(provider, {}).get("mcp_servers") or [])
-        names = [n for n in names if not prov.is_connector(n)]   # no file defines one: _connector_deny
+        # No file defines a connector: _connector_deny keeps those.
+        names = [n for n in self._mcp_names(provider) if not prov.is_connector(n)]
         if not names:
             return {}
         found, unknown = prov.mcp_servers(names, self._mcp_dirs(cwd))
@@ -2415,6 +2415,9 @@ class Daemon:
                        "(servers from a plugin cannot be listed).",
                        severity="low", every_s=86400)
         return found
+
+    def _mcp_names(self, provider: str) -> list[str]:
+        return coord.name_list(self.cfg["providers"].get(provider, {}).get("mcp_servers") or [])
 
     def _mcp_dirs(self, cwd: str) -> list[str]:
         return list(dict.fromkeys(str(d) for d in (cwd, Path(cwd).resolve(), self.p.root, self.p.root.resolve())))
@@ -2581,6 +2584,7 @@ class Daemon:
             argv = _before_stdin(argv, prov.compact_args(int(window or 0)))
             argv = prov.cap_output(argv, int(self.cfg["budget"].get("bash_output_max_chars") or 0))
         mcp_servers: dict = {}
+        mcp_env: dict = {}   # secrets of servers given as arguments (mcp_by_args): never in run.json
         resume_extra: list[str] = []
         private: list[str] = []   # files that may hold credentials, removed when the run ends
         sandboxed = False   # the agent fences the worker's writes (see Provider.writable_args)
@@ -2626,9 +2630,17 @@ class Daemon:
                     extra += prov.isolation_args()
                 else:
                     argv = kept
-                mcp_servers = self._approved_mcp(prov, provider, cwd)
+                mcp_servers = {} if prov.mcp_by_args else self._approved_mcp(prov, provider, cwd)
             elif prov.connector_env(False):
                 env = {**env, **prov.connector_env(self._connectors_needed(prov, provider))}
+            if prov.mcp_by_args:
+                got, mcp_env, unknown = prov.mcp_args(self._mcp_names(provider), self._mcp_dirs(cwd), argv + extra)
+                extra += got
+                if unknown:
+                    self.alert(f"mcp_servers_unknown:{provider}",
+                               f"Workers run without these MCP servers from providers.{provider}.mcp_servers: "
+                               f"{', '.join(unknown)}. Define them in the project's .mcp.json, or fix the list "
+                               "in project.json.", severity="low", every_s=86400)
             # A continued session (see _resumable) gets the current system prompt again, below. Its
             # arguments go last: Codex takes them as a subcommand that must follow every option.
             resume_extra = prov.resume_args(resume) if resume else []
@@ -2684,6 +2696,13 @@ class Daemon:
                 with os.fdopen(fd, "w") as f:
                     json.dump({"mcpServers": mcp_servers}, f)
                 argv = prov.with_mcp_config(argv, Path(mcp_path))
+            env_files = []
+            if mcp_env:
+                fd, env_path = tempfile.mkstemp(prefix=f"ttp-mcpenv-{run_id}-", suffix=".json")
+                private.append(env_path)
+                env_files.append(env_path)
+                with os.fdopen(fd, "w") as f:
+                    json.dump(mcp_env, f)
             stdin = None
             if system is not None and context is not None:
                 cached = prov.cached_input(context, prompt, cache_ttl, log=lambda m: log(self.p, m))
@@ -2770,6 +2789,7 @@ class Daemon:
                        if task and _exclusive(task) and pregrant.command(self.cfg) else {}),
                     "holds": str(self.p.state / "holds"),   # where a hold kept for detached jobs is registered
                     "private_files": private, "tmp_dir": tmp_env.get("TMPDIR"),
+                    **({"env_files": env_files} if env_files else {}),   # the runner adds them to env
                     # Workers and reviewers run niced, and all they start with them; the coordinator not.
                     "nice": nice_level(self.cfg.get("runner"))[0] if role != "coordinator" else 0}
             durable_write(run_dir / "run.json", json.dumps(spec, indent=1))   # read again after a reboot

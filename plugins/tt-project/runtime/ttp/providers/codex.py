@@ -87,6 +87,7 @@ class Codex(Provider):
     # Codex sends the thread id as the request's prompt_cache_key: one `codex exec` per coordinator
     # turn read 0 cached tokens on most turns with a byte-identical prefix (measured on 0.160).
     cache_key_per_session = True
+    mcp_by_args = True   # `-c mcp_servers=...` (codexmcp.py): Codex has no per-run MCP config file
     # Whether build() left the harness hook out only because the user's config.toml defines hooks or
     # plugins; isolation_args() then adds it, as an isolated run ignores that file.
     _hook_held_by_user_config = ""
@@ -226,6 +227,33 @@ class Codex(Provider):
         if out and self._hook_held_by_user_config:
             out += self._hook_for(self._hook_held_by_user_config, user_config=False)
         return out
+
+    def mcp_args(self, names, dirs, argv):
+        # The servers go in as `-c` (codexmcp.py); a worker still reading config.toml gets the user's
+        # other servers turned off.
+        from . import codexmcp
+        isolated = IGNORE_USER_CONFIG in argv
+        users = [] if isolated else codexmcp.user_server_names(_read(codex_home() / "config.toml"))
+        return codexmcp.run_args(names, dirs, users, isolated)
+
+    def mcp_check(self, names: list[str], dirs: list[str], isolated: bool) -> tuple[dict[str, bool] | None, list[str]]:
+        """The servers a worker would get, as `codex mcp list --json` reads its arguments ({name:
+        enabled}; None if it did not answer), and the names it cannot give. Offline, no sign-in:
+        an isolated worker's view is read with an empty CODEX_HOME, as it ignores config.toml."""
+        import tempfile
+        from . import codexmcp
+        isolated = isolated and bool(self._ignore_user_config())
+        args, _, unknown = self.mcp_args(names, dirs, [IGNORE_USER_CONFIG] if isolated else [])
+        with tempfile.TemporaryDirectory(prefix="ttp-codex-mcp-") as home:
+            env = {**os.environ, **({"CODEX_HOME": home} if isolated else {})}
+            try:
+                r = subprocess.run([self.binary() or "codex", *args, "mcp", "list", "--json"], env=env,
+                                   capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+            except (OSError, subprocess.SubprocessError):
+                return None, unknown
+        if r.returncode != 0 or not r.stdout.strip().startswith("["):
+            return None, unknown
+        return codexmcp.parse_list(r.stdout), unknown
 
     def _exec_flag(self, flag: str) -> bool:
         return bool(re.search(rf"(?<![\w-]){re.escape(flag)}\b", cli_output(self.binary() or "codex", "exec", "--help")))

@@ -9442,6 +9442,24 @@ def cmd_doctor(a) -> None:
             print(f"claude.ai connectors for isolated workers: {', '.join(plan['connectors'])}, every other server "
                   f"kept out ({len(plan['deny'])} by name)" if not plan["why"] else
                   f"claude.ai connectors for isolated workers: none, workers stay strict ({plan['why']})")
+    codex_cfg = p.config()["providers"].get("codex", {})
+    if names := name_list(codex_cfg.get("mcp_servers") or []):
+        from .providers import get_provider
+        prov = get_provider("codex")
+        print(f"codex mcp servers for workers: {', '.join(names)}"
+              + ("" if prov.available() else " · not checked (codex is not installed)"))
+        if prov.available():
+            got, unknown = prov.mcp_check(names, [str(p.root), str(p.root.resolve())],
+                                          bool(codex_cfg.get("worker_isolation")))
+            if unknown:
+                print(f"  not given (define them in the project's .mcp.json): {', '.join(unknown)}")
+            if got is None:
+                print("  `codex mcp list --json` did not answer: the effective list is unknown")
+            else:
+                on = [n for n, enabled in got.items() if enabled]
+                print(f"  `codex mcp list` with the workers' arguments: {', '.join(on) or 'none'} enabled"
+                      + (f" · not listed but on: {', '.join(n for n in on if n not in names)}"
+                         if any(n not in names for n in on) else ""))
     sec = load_secrets()
     print(f"jev: {'key saved' if (sec.get('jev') or {}).get('key') else 'no key (rules-only screening)'}"
           f" · enabled in project: {p.config()['jev'].get('enabled')}")
