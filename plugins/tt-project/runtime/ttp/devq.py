@@ -85,6 +85,7 @@ RUNNER_DEFAULTS = {
 _CHOICES = {"script_lint": ("", "warn", "refuse"), "netfs_policy": ("warn", "refuse")}
 RUNNER_DOWN_RC = 3   # probe: the job is pending and no runner is alive (the daemon restarts it)
 CANCEL = ".cancel"   # running/<job>.cancel: drop asked the runner to stop the job (its text: why)
+CAN_CANCEL = "runner.cancel"   # the live runner's pid: it honours CANCEL (an older runner never writes it)
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 NAME_RE = ID_RE
 STATUSES = ("done", "failed", "skipped", "wedged")
@@ -1190,7 +1191,8 @@ def drop(d: Path, project: str, task: str, why: str) -> int:
     """Drop every job of `project`'s task `task` (the project's daemon calls this once the task ended:
     taskreap): a queued one ends `cancelled` before it starts, a running one gets a CANCEL marker that
     its runner honours within poll_s (it stops the job's group and ends it `cancelled`). Prints the jobs
-    as JSON: [{"id", "was": "queued" | "running"}]."""
+    as JSON: [{"id", "was": "queued" | "running" | "running-unsupported"}]: the last when the live runner
+    predates CANCEL (no CAN_CANCEL naming its pid), so the job runs on; a runner started later honours it."""
     _dirs(d)
     out = []
     for q in sorted((d / "queue").glob("*.json")):
@@ -1208,10 +1210,16 @@ def drop(d: Path, project: str, task: str, why: str) -> int:
         _write(d / "done" / f"{job}.json", json.dumps(marker, indent=1))
         _append(d / "runner.log", f"{_utc()} {job}: cancelled before it started: {why}\n")
         out.append({"id": job, "was": "queued"})
+    honoured = True
+    if runner_alive(d):
+        try:
+            honoured = (d / CAN_CANCEL).read_text().strip() == (d / "runner.pid").read_text().strip() != ""
+        except OSError:
+            honoured = False
     for job in _running(d):
         if _owned(_load(d / "running" / f"{job}.json"), project, task):
             _write(d / "running" / f"{job}{CANCEL}", why)
-            out.append({"id": job, "was": "running"})
+            out.append({"id": job, "was": "running" if honoured else "running-unsupported"})
     print(json.dumps(out))
     return 0
 
@@ -1606,6 +1614,7 @@ class Runner:
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(sig, self.stop)
         _write(self.d / "runner.pid", f"{os.getpid()}\n")
+        _write(self.d / CAN_CANCEL, f"{os.getpid()}\n")   # drop: this runner honours CANCEL
         self.log(f"runner started (pid {os.getpid()})")
         idle_since = _now()
         while True:

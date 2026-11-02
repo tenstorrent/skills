@@ -101,3 +101,66 @@ def _treap_pid_running(pid):
         return Path(f"/proc/{pid}/stat").read_text().split(")")[-1].split()[0] != "Z"
     except OSError:
         return True
+
+
+def test_taskreap_keeps_the_device_job_a_done_tasks_own_hand_off_names(env, devq_dir):
+    """A done task's `continue:` follow-up names its long device job: kept, as jobstop.HANDED_OFF keeps
+    detached jobs (a longer id such as j10 is not it)."""
+    from ttp import daemon as dm, taskreap
+    p, tid, res = _treap_setup(env, devq_dir, "done")
+    result = json.dumps({"status": "done", "followups": [{"title": "continue: `ttp devq probe r1 j1`, report"}]})
+    p.db.x("UPDATE tasks SET result=?, updated=? WHERE id=?", (result, time.time() - 600, tid))
+    assert not taskreap.names("continue: probe j10 and j1x", "j1")
+    dm.Daemon(p.base).reap_task_records()
+    assert len(list((devq_dir / "queue").glob("*.json"))) == 1
+    assert not (devq_dir / "done" / "j1.json").exists()
+    assert list((p.state / "devq-jobs").glob("*/*.json"))
+    assert not any("device-queue job" in m["text"] for m in _treap_alerts(p))
+    assert not res.exists()   # its reservation is still released
+
+
+@pytest.mark.parametrize("runner", ["old", "new"])
+def test_taskreap_releases_a_running_job_only_when_its_runner_honours_the_drop(env, devq_dir, runner):
+    """A live runner started before CANCEL existed (no runner.cancel naming its pid) runs the job on: the
+    ledger entry stays, no alert, asked again after RETRY_S. One that advertises it is released."""
+    import fcntl
+    from ttp import daemon as dm, devq, taskreap
+    p, tid, res = _treap_setup(env, devq_dir, "cancelled")
+    next((devq_dir / "queue").glob("*.json")).replace(devq_dir / "running" / "j1.json")
+    (devq_dir / "runner.pid").write_text("4242\n")
+    if runner == "new":
+        (devq_dir / devq.CAN_CANCEL).write_text("4242\n")
+    with open(devq_dir / "runner.lock", "a") as lock:   # the live runner holds its lock
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        d = dm.Daemon(p.base)
+        d.reap_task_records()
+    assert (devq_dir / "running" / "j1.cancel").exists()
+    jobs = [m["text"] for m in _treap_alerts(p) if "device-queue job" in m["text"]]
+    if runner == "old":
+        assert jobs == [] and list((p.state / "devq-jobs").glob("*/*.json"))
+        assert d._taskreap_state[("r1", tid)] > time.time() + taskreap.RETRY_S - 60
+    else:
+        assert len(jobs) == 1 and "(running)" in jobs[0], jobs
+        assert not list((p.state / "devq-jobs").glob("*/*.json"))
+
+
+def test_taskreap_a_job_submitted_through_ttp_devq_is_dropped_by_the_daemon_tick(env, devq_dir):
+    """The production path: `ttp devq submit` (spec project + ledger entry), the task ends, the daemon's
+    tick drops the running job. Removing any of those wirings fails this."""
+    from ttp import daemon as dm
+    p = make(env)
+    p.set_config("device", {"runners": {"r1": {"dir": str(devq_dir), **DEVQ_FAST}}})
+    tid = p.db.add_task("uses the device", kind="code")
+    r = _ttp_run(p, "devq", "submit", "r1", "--id", "j1", "--", "sleep", "60", env={"TTP_TASK": str(tid)})
+    assert r.returncode == 0, r.stderr
+    pid = _devq_job_pid(devq_dir, "j1", timeout=_load_scaled(20))
+    p.db.update_task(tid, status="cancelled")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 600, tid))
+    dm.Daemon(p.base).tick()
+    marker = _devq_marker(devq_dir, "j1", timeout=_load_scaled(20))
+    assert marker["status"] == "cancelled" and f"task #{tid} is cancelled" in marker["reason"], marker
+    deadline = time.time() + _load_scaled(10)
+    while time.time() < deadline and _treap_pid_running(pid):
+        time.sleep(0.05)
+    assert not _treap_pid_running(pid)
+    assert any("device-queue job (running)" in m["text"] for m in _treap_alerts(p))

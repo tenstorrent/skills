@@ -16,7 +16,11 @@ never frees them:
 A task's records are released once it is cancelled, failed, exhausted or done, no run of it is live
 (runs.status 'running': the daemon marks a dead run lost, so a daemon restart reaps the rest on its
 first sweeps) and its state is at least GRACE_S old, so a run still starting or a task requeued at once
-keeps them. A task with a device job an open task's hand-off names (its id in its result) keeps its jobs.
+keeps them. A task with a device job an open task's hand-off names (its id in its result), or a done task
+whose own hand-off names one (a `continue:` follow-up, as jobstop.HANDED_OFF keeps detached jobs), keeps its
+jobs. A running job is released only once the host says its runner honours the drop (devq.CAN_CANCEL): one
+started before that (old code, still running until idle_exit_s) leaves the ledger entry, asked again after
+RETRY_S, with no alert.
 sweep returns each released record once; the daemon logs it and sends one low alert.
 
 Gaps: a device job queued before submit recorded its project has no ledger entry and is never dropped
@@ -54,7 +58,7 @@ def record_job(p, runner: str, spec: dict) -> None:
 
 def ended(db, tid: int, now: float, grace_s: float = GRACE_S) -> dict | None:
     """The task row when it ended at least grace_s ago with no live run, else None."""
-    t = db.one("SELECT id, status, updated FROM tasks WHERE id=?", (tid,))
+    t = db.one("SELECT id, status, updated, result FROM tasks WHERE id=?", (tid,))
     if not t or t["status"] not in ENDED or now - float(t["updated"] or 0) < grace_s:
         return None
     if db.one("SELECT id FROM runs WHERE task=? AND status='running' LIMIT 1", (tid,)):
@@ -88,13 +92,17 @@ def reservations(p, dirs: list[Path], now: float, grace_s: float = GRACE_S) -> l
     return out
 
 
+def names(text, job: str) -> bool:
+    """Whether a hand-off's text names this device job id (a longer id such as <job>2 is not it)."""
+    import re
+    return bool(re.search(rf"(?<![\w.-]){re.escape(job)}(?![\w.-])", str(text or "")))
+
+
 def waited_on(db, job: str) -> int | None:
     """An open task whose hand-off names this device job id, else None."""
-    import re
-    rx = re.compile(rf"(?<![\w.-]){re.escape(job)}(?![\w.-])")
     for t in db.q("SELECT id, result FROM tasks WHERE status NOT IN (?,?,?,?) AND result LIKE ?",
                   (*ENDED, f"%{job}%")):
-        if rx.search(str(t["result"] or "")):
+        if names(t["result"], job):
             return t["id"]
     return None
 
@@ -127,6 +135,8 @@ def device_jobs(p, runners: dict, call, now: float, grace_s: float = GRACE_S, st
             continue
         if any(waited_on(p.db, f.stem) for f in files):
             continue   # an open task still waits on one: the host drops all of the task's jobs at once
+        if t["status"] == "done" and any(names(t["result"], f.stem) for f in files):
+            continue   # its own hand-off names one (a `continue:` follow-up): kept, as jobstop.HANDED_OFF
         if calls >= HOST_CALLS:
             break
         calls += 1
@@ -138,11 +148,17 @@ def device_jobs(p, runners: dict, call, now: float, grace_s: float = GRACE_S, st
         if not isinstance(dropped, list):
             state[(runner, tid)] = now + RETRY_S
             continue
-        state.pop((runner, tid), None)
+        # A running job on a runner that predates CANCEL keeps running: keep its entry, ask again later.
+        kept = {str(j.get("id")) for j in dropped if isinstance(j, dict) and j.get("was") == "running-unsupported"}
+        if kept:
+            state[(runner, tid)] = now + RETRY_S
+        else:
+            state.pop((runner, tid), None)
         for f in files:
-            f.unlink(missing_ok=True)
+            if f.stem not in kept:
+                f.unlink(missing_ok=True)
         for j in dropped:
-            if isinstance(j, dict) and j.get("id"):
+            if isinstance(j, dict) and j.get("id") and str(j["id"]) not in kept:
                 out.append({"kind": f"device-queue job ({j.get('was', '?')})", "name": f"{runner}/{j['id']}",
                             "task": tid, "status": t["status"], "key": f"{runner}/{j['id']}"})
     return out
