@@ -132,6 +132,11 @@ def test_a_notify_naming_a_sign_in_is_a_step_only_in_a_waiting_or_blocked_run(en
     _notify_run(env, monkeypatch, p, tid, 0, "The login page renders in 1.2 s",
                 result={"status": "done", "summary": "measured"})
     assert not _step_posts(p) and len(p.db.q("SELECT id FROM messages WHERE kind='alert'")) == 1
+    from ttp import userstep
+    for text in ("the login node is down", "sign-in is done", "The login page renders"):
+        assert userstep.kind_of({"text": text}) is None, text
+    assert [userstep.kind_of({"text": t}) for t in ("Run example-cli login", "enter the device code", "store the API key")] \
+        == ["sign-in", "device-code", "credential"]
     other = p.db.add_task("connect the tool", "s", kind="work", origin="coordinator")
     for i in range(3):
         _notify_run(env, monkeypatch, p, other, i, "Please sign in to the example tool",
@@ -141,6 +146,10 @@ def test_a_notify_naming_a_sign_in_is_a_step_only_in_a_waiting_or_blocked_run(en
     p.db.update_task(other, status="cancelled")
     closed = alerts.sweep(p.db)
     assert [c["key"] for c in closed] == [f"user-step:{other}:sign-in"] and not _open_steps(p)
+    # Its record goes once another step opens; the step of a new task is a new item.
+    third = p.db.add_task("third tool", "s", kind="work", origin="coordinator")
+    _notify_run(env, monkeypatch, p, third, 0, "--step", "sign-in", "--check", CHECK, "Sign in")
+    assert not userstep.for_task(p.db, other) and len(userstep.for_task(p.db, third)) == 1
 
 
 def test_notify_step_flags_are_checked(env, monkeypatch, capsys):

@@ -30,7 +30,7 @@ KEY = "user-step"      # alert condition kind
 KINDS = ("sign-in", "device-code", "credential")
 # A notify naming a step only the user can take, when the worker gave no --step.
 STEP_RE = (("device-code", re.compile(r"\bdevice[- ]code\b", re.I)),
-           ("sign-in", re.compile(r"\b(sign|log)[- ]?in\b(?!\s+(?:is|was)\s+(?:done|ok|back))", re.I)),
+           ("sign-in", re.compile(r"\b(sign|log)[- ]?in\b(?!\s+(?:node|host|shell|server|page|(?:is|was)\s+(?:done|ok|back)))", re.I)),
            ("credential", re.compile(r"\b(credential|api[- ]key|access token)s?\b", re.I)))
 # A retry_when that is prose for "when the user answers", not a model-free check.
 NEXT_MSG_RE = re.compile(r"\b(next|user(?:'s|’s)?|their)\s+(message|reply|answer|response)\b|\buser (?:replies|answers|signs)\b", re.I)
@@ -86,6 +86,10 @@ def relay(db: DB, task: dict, kind: str, n: dict, text: str, now: float | None =
             db.x("UPDATE messages SET text=? WHERE id=?", (text, ep["message"]))
         return False
     mid = db.post("out", text, chat=None, kind="alert", severity="normal", ref=f"{KEY}:{sid}")
+    for old, r in list(steps.items()):   # records of ended tasks (their items cleared on a sweep)
+        t = db.task(r["task"]) if isinstance(r, dict) and isinstance(r.get("task"), int) else None
+        if not t or t["status"] in TERMINAL_TASK_STATES:
+            steps.pop(old)
     steps[sid] = {**fields, "opened": now, "message": mid, "notifies": 1, "changes": 0}
     db.set_kv(STEPS, steps)
     return True
@@ -129,12 +133,14 @@ def probe_passed(db: DB, task: dict, probes: set, now: float | None = None) -> l
     """The task's retry_when passed: each open step it checks (the step's own check, or any step of
     the task that has none; `probes`: the retry_when as run and as the worker wrote it) is done. Its record goes and its item clears, told once. Returns the steps."""
     now = time.time() if now is None else now
-    steps, _ = db.kv_dict(STEPS)
-    done = [sid for sid, r in steps.items() if isinstance(r, dict) and r.get("task") == task["id"]
-            and (not r.get("check") or r.get("check") in probes)]
-    if not done:
-        return []
+    if not for_task(db, task["id"]):
+        return []   # the usual pass: no write lock taken
     with db.tx():
+        steps, _ = db.kv_dict(STEPS)
+        done = [sid for sid, r in steps.items() if isinstance(r, dict) and r.get("task") == task["id"]
+                and (not r.get("check") or r.get("check") in probes)]
+        if not done:
+            return []
         for sid in done:
             steps.pop(sid)
         db.set_kv(STEPS, steps)
