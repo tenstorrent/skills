@@ -47780,19 +47780,6 @@ def test_setup_defaults_show_the_account_level_global_cap(env, tmp_path, monkeyp
     assert "$777" in "\n".join(cli.new_project_defaults_lines())
 
 
-def test_upgrade_keeps_a_light_tier_model_coordinator(env):
-    from ttp import cli
-    p = make(env)
-    assert cli._keep_light_coordinator(p) == ""         # no override: follows the standard tier
-    p.set_config("providers.claude.tiers.light.model", "haiku")
-    note = cli._keep_light_coordinator(p)
-    assert "upgrade note" in note
-    assert p.config()["coordinator"]["model_tier"] == ""
-    p.set_config("coordinator.model_tier", "standard")   # the project's own choice stays
-    assert cli._keep_light_coordinator(p) == ""
-    assert p.config()["coordinator"]["model_tier"] == "standard"
-
-
 def test_watcher_distinct_episodes_of_one_key_count_as_churn(env, monkeypatch):
     from ttp import watchdup
     run, issues, p = _json_watcher(env, monkeypatch)

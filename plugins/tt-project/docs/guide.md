@@ -278,9 +278,20 @@ prolonged whole-box outage.
 - Each tier maps to a model and effort per provider (`providers.<name>.tiers`). The coordinator
   runs at `coordinator.tier` (light) unless `coordinator.model` or `coordinator.effort` is set:
   those pin the coordinator alone. Unset, it takes the model of `coordinator.model_tier`
-  (standard by default; "" uses its own tier's), so the cheaper light-tier model does not move the
-  coordinator, and xhigh effort (`coordinator.DEFAULT_EFFORT`), mapped to the provider's nearest
-  supported level. The model names one of `core_provider`'s models.
+  (`deep` by default: the strongest model in the provider's tier table, opus for Claude; "" uses
+  its own tier's), so the cheaper light-tier model does not move the coordinator, and xhigh effort
+  (`coordinator.DEFAULT_EFFORT`), mapped to the provider's nearest supported level. The model names
+  one of `core_provider`'s models. Coordinator turns never take a tier's route to another provider.
+  Each turn's run records the model and effort it asked for and the model the agent's session
+  reported; `ttp status` and the daily review show a `coordinator model:` line with the configured
+  route against the last turn's, ending in `MISMATCH` when they differ (a config change shows until
+  the next turn), and the review lists the coordinator's spend per day for the last 7 days.
+  `ttp upgrade` moves a coordinator still on the old default (no coordinator model or model_tier of
+  its own) to the strongest model, and also one holding the model_tier "" an earlier upgrade set for
+  a project overriding its light-tier model; any other coordinator model or model_tier is the
+  project's own choice and stays. The upgrade says once per project which it did. It cannot tell
+  that earlier upgrade's mark from a model_tier "" set by hand on such a project: that one moves
+  too, and `ttp config NAME coordinator.model MODEL` pins it back.
   `coordinator.turn_timeouts_s.<provider>.<effort>` sizes the turn after effort is resolved:
   low/medium/high/xhigh/max (or ultra) default to 300/600/900/1200/1500 seconds for Claude,
   and 300/600/1200/1800/2400 for Codex and Cursor; an unknown effort or provider gets 600.

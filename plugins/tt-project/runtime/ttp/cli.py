@@ -1360,7 +1360,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
         coord += f" · idle check {c['idle_held']}"
     lines.append(coord)
     lines.append(c["route_line"])
-    from . import budget
+    from . import budget, coordmodel
+    lines.append(coordmodel.line(p.config(), db, p))
     cache = budget.coordinator_cache(db, now)["24h"] if verbose else {}
     if cache.get("turns"):
         lines.append(budget.coordinator_cache_line(cache))
@@ -8089,9 +8090,8 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
         print(f"{p.name} is paused: merged its files without harness task #{parked['task']}, which is cancelled "
               f"(superseded); the daemon restarts and the project stays paused")
     release.clear_stuck(p)
-    keep_note = _keep_light_coordinator(p)
-    if keep_note:
-        print(keep_note)
+    if coord_note := _strongest_coordinator(p):
+        print(coord_note)
     if ttl_note := _auto_cache_ttl(p):
         print(ttl_note)
     if caps_note := _migrate_load_caps(p):
@@ -8115,29 +8115,33 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
                  else ""), chat=None, kind="info", severity="low")
 
 
-def _keep_light_coordinator(p: Project) -> str:
-    """Since coordinator.model_tier an unset coordinator.model follows the standard tier. A project that
-    overrides a provider's light-tier model to make its coordinator cheaper keeps that model: model_tier
-    is set to "" for it (once; an explicit model_tier is the project's own choice). Returns the note."""
+def _strongest_coordinator(p: Project) -> str:
+    """The coordinator runs on its provider's strongest model at xhigh by default (coordmodel.migrate):
+    one still on the old shipped default moves (the earlier upgrade's model_tier "" mark is set to the
+    strongest tier), a model or model_tier of the project's own stays. Says which, once per project."""
+    from . import coordinator as coord, coordmodel
     try:
         raw = p.raw_config()
+        if p.config_status == "unavailable" or p.db.kv(STRONGEST_COORD_KEY):
+            return ""
+        verdict, why = coordmodel.migrate(raw)
+        if verdict == "set":
+            p.set_config("coordinator.model_tier", coordmodel.STRONGEST)
+        route = coord.route_line(p.config()).removeprefix("coordinator: ")
+        p.db.set_kv(STRONGEST_COORD_KEY, {"ts": time.time(), "verdict": verdict or "already", "why": why})
     except Exception:
         return ""
-    coord = raw.get("coordinator")
-    if isinstance(coord, dict) and "model_tier" in coord:
-        return ""
-    provs = raw.get("providers")
-    if not isinstance(provs, dict) or not any(
-            isinstance(v, dict) and isinstance(((v.get("tiers") or {}).get("light") or {}), dict)
-            and ((v.get("tiers") or {}).get("light") or {}).get("model") for v in provs.values()):
-        return ""
-    try:
-        p.set_config("coordinator.model_tier", "")
-    except Exception:
-        return ""
-    return ("upgrade note: this project overrides the light-tier model, so coordinator.model_tier was set to "
-            "\"\" and its coordinator keeps the light-tier model; `ttp config %s coordinator.model_tier "
-            "standard` makes it follow the standard tier" % p.name)
+    if verdict in ("moved", "set"):
+        return (f"upgrade note: {p.name}'s coordinator moved to its provider's strongest model, {route} ({why}); "
+                f"`ttp config {p.name} coordinator.model MODEL` pins another")
+    if verdict == "kept":
+        return (f"upgrade note: {p.name}'s coordinator kept its own choice, {why}: {route}; "
+                f"`ttp config {p.name} coordinator.model_tier {coordmodel.STRONGEST}` (with coordinator.model \"\") "
+                f"moves it to the strongest model")
+    return ""
+
+
+STRONGEST_COORD_KEY = "upgrade_strongest_coordinator"   # kv: the upgrade's verdict, said once
 
 
 def _auto_cache_ttl(p: Project) -> str:

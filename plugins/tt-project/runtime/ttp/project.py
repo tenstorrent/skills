@@ -172,8 +172,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "shared_resources": [],             # resources whose slots and pause all the user's projects share
     # model / effort, when set, override the coordinator's defaults. Unset, every coordinator turn
     # runs at coordinator.DEFAULT_EFFORT (xhigh, or the provider's highest effort below it) on
-    # model_tier's model ("" = its own tier's), so the cheaper light-tier model for workers does not
-    # move the coordinator. A change applies at the next turn (coordinator.coordinator_route).
+    # model_tier's model: the strongest tier's ("deep", read from the provider's tier table; "" = its
+    # own tier's), so the cheaper light-tier model for workers does not move the coordinator. A change
+    # applies at the next turn (coordinator.coordinator_route); `ttp status` shows it against the last
+    # turn's (coordmodel.py).
     # Triggers (coordinator.effort_triggers) mark a tricky or blocking turn, which the turn gates never
     # skip. A task failing repeat_fails_24h times in
     # 24 h makes one, and so do its external waits when their reason, probe or owner changes, and once
@@ -182,7 +184,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # `ttp detach` jobs or `ttp lock` resources counts only past live_waits_max waits on the same ones
     # in 24 h or once a job's log stops growing (0: every such wait counts as before).
     # effort_skip_triggers: trigger labels (as recorded in the turn's note) that never count.
-    "coordinator": {"tier": "light", "model": "", "model_tier": "standard", "effort": "",
+    "coordinator": {"tier": "light", "model": "", "model_tier": "deep", "effort": "",
                     "repeat_fails_24h": 2, "repeat_waits_24h": 8, "live_waits_max": 6,
                     "effort_skip_triggers": [],
                     "debounce_s": 15, "max_events_per_turn": 40,

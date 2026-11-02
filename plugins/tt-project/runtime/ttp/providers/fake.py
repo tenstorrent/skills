@@ -56,6 +56,8 @@ class Fake(Provider):
         u.cost_usd = float(data.get("_cost", 0.0)) if isinstance(data, dict) else 0.0
         u.output_tokens = int(data.get("_output_tokens", 0)) if isinstance(data, dict) else 0
         u.session_id = str(data.get("_session") or "") if isinstance(data, dict) else ""
+        if isinstance(data, dict) and data.get("_model"):
+            u.extra["model"] = str(data["_model"])
         return u
 
 
@@ -99,6 +101,8 @@ def _main(role: str, args: list[str] | None = None) -> int:
         out = {"ok": True}
     out["_cost"] = cost
     out["_session"] = session
+    if os.environ.get("TTP_FAKE_MODEL"):   # the model the session reports (claude: its init event)
+        out["_model"] = os.environ["TTP_FAKE_MODEL"]
     sys.stdout.write(json.dumps(out))
     return 0
 

@@ -41,7 +41,7 @@ import json
 import time
 from typing import Any
 
-from . import budget, chaincap, checkprestage, correction, ends, obligations, quietgate, reviewstats, route, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
+from . import budget, chaincap, checkprestage, coordmodel, correction, ends, obligations, quietgate, reviewstats, route, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
 from .db import DB, continues_id
 from .project import Project
 
@@ -372,6 +372,11 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(f"coordinator turns: {turns['n']}, ${turns['usd']:.2f}; {noop}{part}; "
                    f"{turns['idle']} idle wakes (${turns['idle_usd']:.2f}), "
                    f"{turns['starve']} starve wakes (${turns['starve_usd']:.2f})")
+    if turns["n"]:   # what the next turn runs with against the last one, and $ per day (a model change's cost)
+        if p is not None:
+            out.append(coordmodel.line(p.config(), db, p))
+        if spend := coordmodel.spend_line(db, p, now):
+            out.append(spend)
     cache = budget.coordinator_cache(db, now, window_s)["window"]
     if cache["turns"]:
         out.append(budget.coordinator_cache_line(cache))

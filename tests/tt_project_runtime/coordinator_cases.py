@@ -9451,10 +9451,10 @@ def test_the_coordinator_model_and_effort_override_its_tier_and_leave_workers_al
             assert argv[argv.index("--model") + 1] == row["model"], "the CLI got another model than recorded"
         return row
 
-    # Unset: the coordinator keeps the standard tier's model at xhigh (coordinator.DEFAULT_EFFORT), so
-    # the cheaper light-tier model of workers and the tiers' efforts do not move it.
-    standard = p.config()["providers"]["claude"]["tiers"]["standard"]
-    assert p.config()["coordinator"]["model_tier"] == "standard" and light["model"] != standard["model"]
+    # Unset: the coordinator keeps the strongest (deep) tier's model at xhigh (coordinator.DEFAULT_EFFORT),
+    # so the cheaper light-tier model of workers and the tiers' efforts do not move it.
+    standard = p.config()["providers"]["claude"]["tiers"]["deep"]
+    assert p.config()["coordinator"]["model_tier"] == "deep" and light["model"] != standard["model"]
     d = Daemon(p.base)
     row = run(d, "coordinator")
     assert (row["model"], row["effort"]) == (standard["model"], "xhigh") and light["effort"] != "xhigh"
@@ -9490,7 +9490,7 @@ def test_coordinator_route_defaults_to_xhigh_and_an_explicit_effort_wins_as_each
     assert coord.DEFAULT_EFFORT == "xhigh" and DEFAULT_CONFIG["coordinator"]["effort"] == ""
     route = coord.coordinator_route(DEFAULT_CONFIG)
     assert route["provider"] == "claude" and route["effort"] == "xhigh"
-    assert route["model"] == DEFAULT_CONFIG["providers"]["claude"]["tiers"]["standard"]["model"]
+    assert route["model"] == DEFAULT_CONFIG["providers"]["claude"]["tiers"]["deep"]["model"] == "opus"
     want = {"claude": {"": "xhigh", "xhigh": "xhigh", "max": "max", "low": "low", "minimal": "low"},
             "codex": {"": "xhigh", "xhigh": "xhigh", "max": "xhigh", "low": "low", "minimal": "minimal"},
             "cursor": {"": "", "xhigh": "", "max": "", "low": "", "minimal": ""}}
@@ -9502,7 +9502,7 @@ def test_coordinator_route_defaults_to_xhigh_and_an_explicit_effort_wins_as_each
             assert effort == got, (provider, pin, effort)
             assert effort in takes or (not takes and effort == ""), (provider, pin, effort)
     assert coord.route_line(DEFAULT_CONFIG) == (
-        f"coordinator: claude/{DEFAULT_CONFIG['providers']['claude']['tiers']['standard']['model']} · xhigh")
+        f"coordinator: claude/{DEFAULT_CONFIG['providers']['claude']['tiers']['deep']['model']} · xhigh")
     cursor = {**DEFAULT_CONFIG, "core_provider": "cursor"}
     assert coord.route_line(cursor).endswith(" · no effort setting")
 
@@ -19932,3 +19932,123 @@ def test_task_show_and_status_export_the_blocker_sweep_read_only(env, capsys):
     assert status() is None and state_payload(p, db)["blocker_sweep"] is None
     js, _ = show(swept)
     assert js["current"] is None and js["outcomes"][0]["outcome"] == "still_blocked"
+
+
+def test_a_new_projects_coordinator_runs_on_the_strongest_tier_model_at_xhigh(env, monkeypatch, capsys):
+    """The default coordinator model is the provider's strongest tier-table model (model_tier deep), read
+    from the table, never a name in code; the effort is xhigh. A light tier routed to another provider
+    never moves a coordinator turn (route.py routes worker runs only)."""
+    from ttp import cli, coordinator as coord, weblink
+    from ttp.daemon import Daemon
+    from ttp.project import DEFAULT_CONFIG, Project
+    assert DEFAULT_CONFIG["coordinator"]["model_tier"] == "deep" and not DEFAULT_CONFIG["coordinator"]["model"]
+    assert coord.coordinator_route(DEFAULT_CONFIG) == {"provider": "claude", "model": "opus", "effort": "xhigh"}
+    for provider in ("codex", "cursor"):
+        cfg = {**DEFAULT_CONFIG, "core_provider": provider}
+        assert coord.coordinator_route(cfg)["model"] == DEFAULT_CONFIG["providers"][provider]["tiers"]["deep"]["model"]
+    moved = json.loads(json.dumps(DEFAULT_CONFIG))
+    moved["providers"]["claude"]["tiers"]["deep"]["model"] = "next-strongest"   # the table, not the code
+    assert coord.coordinator_route(moved)["model"] == "next-strongest"
+    monkeypatch.setattr(cli, "_wait_for_daemon", lambda *a, **k: None)
+    monkeypatch.setattr(weblink, "local", lambda *a, **k: ("", 0))
+    cli.main(["new", "solo", "--dir", str(env["repo"]), "--provider", "claude", "--no-service"])
+    p = Project(env["repo"])
+    assert "coordinator: claude/opus · xhigh" in capsys.readouterr().out
+    assert "coordinator" not in p.raw_config()   # the default stays unset, so a later default reaches it
+    p.set_config("providers.chat.tiers.light", {"model": "routed-model", "route": True})
+    rid = Daemon(p.base).start_run("coordinator", "go", "claude", "light", str(p.base), read_only=True)
+    (p.runs / str(rid) / "STOP").touch()
+    row = p.db.one("SELECT provider, model, effort, note FROM runs WHERE id=?", (rid,))
+    assert (row["provider"], row["model"], row["effort"]) == ("claude", "opus", "xhigh")
+    assert "route" not in json.loads(row["note"] or "{}")
+
+
+def test_upgrade_moves_only_a_coordinator_on_the_old_default_and_says_which(env):
+    """`ttp upgrade` (cli._strongest_coordinator): a coordinator with no model or model_tier of its own,
+    or with the model_tier "" mark an earlier upgrade set for a light-tier override, moves to the strongest
+    model; a model or model_tier set on purpose stays. Each project's note names it, once."""
+    from ttp import cli, coordmodel
+    p = make(env)
+    note = cli._strongest_coordinator(p)
+    assert note.startswith(f"upgrade note: {p.name}'s coordinator moved to its provider's strongest model"), note
+    assert cli._strongest_coordinator(p) == ""                       # said once
+    assert "coordinator" not in p.raw_config()                       # moved by the default, nothing written
+    light = {"providers": {"claude": {"tiers": {"light": {"model": "haiku"}}}}}
+    cases = [  # (raw, verdict)
+        ({}, "moved"),
+        ({"coordinator": {"tier": "light"}}, "moved"),
+        ({"coordinator": {"tier": "standard"}}, "moved"),
+        ({"coordinator": "broken", "providers": "broken"}, "moved"),
+        ({"coordinator": {"model_tier": "deep"}}, ""),
+        ({"coordinator": {"model": "opus"}}, "kept"),
+        ({"coordinator": {"model": "sonnet", "model_tier": ""}, **light}, "kept"),
+        ({"coordinator": {"model_tier": "standard"}}, "kept"),
+        ({"coordinator": {"model_tier": "light"}, **light}, "kept"),
+        ({"coordinator": {"model_tier": ""}}, "kept"),                # set by hand: no light override
+        ({"coordinator": {"model_tier": "", "tier": "standard"}, **light}, "kept"),
+        ({"coordinator": {"model_tier": ""}, **light}, "set"),        # the earlier upgrade's mark
+    ]
+    for raw, want in cases:
+        assert coordmodel.migrate(raw)[0] == want, raw
+    for raw, light_model, kept, model_tier in (
+            ({"model_tier": ""}, "", True, ""),
+            ({"model": "opus"}, "", True, "deep"),
+            ({"model_tier": ""}, "haiku", False, "deep")):
+        p.db.set_kv(cli.STRONGEST_COORD_KEY, None)   # as on another project's upgrade
+        p.set_config("coordinator", raw)
+        p.set_config("providers.claude.tiers.light.model", light_model)
+        note = cli._strongest_coordinator(p)
+        assert note.startswith(f"upgrade note: {p.name}'s coordinator ") and ("kept its own choice" in note) == kept, note
+        assert p.config()["coordinator"]["model_tier"] == model_tier, p.raw_config()
+        assert p.config()["coordinator"]["model"] == raw.get("model", "")
+        assert cli._strongest_coordinator(p) == ""
+
+
+def test_status_and_the_daily_review_show_configured_and_last_used_coordinator_model(env, monkeypatch):
+    """Each coordinator turn's run records the model and effort it ran with and the model its session
+    reported; `ttp status` and the daily review show them against the configured ones, flagging a
+    mismatch, and the review lists the coordinator's spend per day."""
+    from ttp import audit, cli, coordmodel
+    from ttp.daemon import Daemon
+    p = make(env)
+    # A finished turn keeps the session's reported model in its note (the fake reports it like claude's init).
+    monkeypatch.setenv("TTP_FAKE_MODEL", "fake-strong-1")
+    d = Daemon(p.base)
+    rid = d.start_run("coordinator", "go", "fake", "light", str(p.base), read_only=True)
+    assert _run_until(d, p, lambda: p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] != "running")
+    assert json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])["model_used"] == "fake-strong-1"
+    p.db.x("DELETE FROM runs")
+    p.set_config("core_provider", "claude")
+    assert coordmodel.line(p.config(), p.db, p) == "coordinator model: configured claude/opus · xhigh; no turn yet"
+    now = time.time()
+
+    def turn(model, effort, used, usd, ago=60.0):
+        return p.db.x("INSERT INTO runs(role,provider,model,effort,started,ended,status,cost_usd,note) "
+                      "VALUES('coordinator','claude',?,?,?,?,'ok',?,?)",
+                      (model, effort, now - ago, now - ago + 30, usd, json.dumps({"model_used": used})))
+    turn("sonnet", "high", "", 2.0, ago=86400 * 2 + 60)
+    turn("sonnet", "high", "", 9.0, ago=86400 * 9)       # older than the days listed
+    turn("opus", "xhigh", "claude-opus-9", 1.5, ago=90)
+    line = coordmodel.line(p.config(), p.db, p)
+    assert "configured claude/opus · xhigh; last turn" in line and "(claude-opus-9)" in line and "MISMATCH" not in line
+    assert line in cli.status_text(p).splitlines()
+    turn("opus", "xhigh", "claude-sonnet-9", 1.0, ago=80)   # asked for opus, the session ran another model
+    assert "MISMATCH: it ran with model claude-sonnet-9 (the session's)" in coordmodel.line(p.config(), p.db, p)
+    turn("sonnet", "high", "", 0.5, ago=70)
+    line = coordmodel.line(p.config(), p.db, p)
+    assert "MISMATCH: it ran with model sonnet, effort high" in line, line
+    p.set_config("coordinator.model", "sonnet")
+    p.set_config("coordinator.effort", "high")
+    assert "MISMATCH" not in coordmodel.line(p.config(), p.db, p)
+    p.set_config("core_provider", "codex")
+    assert "MISMATCH: it ran with provider claude" in coordmodel.line(p.config(), p.db, p)
+    days = coordmodel.spend_by_day(p.db, p, now)
+    assert [round(x["usd"], 2) for x in days] == [3.0, 2.0], days
+    assert days[0]["models"] == {"opus": 2, "sonnet": 1} and days[1]["turns"] == 1
+    review = audit.lines(p.db, now=now, p=p)
+    assert coordmodel.line(p.config(), p.db, p) in review
+    spend = next(x for x in review if x.startswith("coordinator spend per day"))
+    assert f"{days[0]['day']} $3.00 (3 turns: opus 2, sonnet 1)" in spend, spend
+    assert f"{days[1]['day']} $2.00 (1 turns: sonnet 1)" in spend and "$9.00" not in spend
+    # A day with no coordinator turn adds neither line.
+    assert not [x for x in audit.lines(p.db, now=now + 30 * 86400, p=p) if x.startswith("coordinator model")]
