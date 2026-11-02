@@ -11,7 +11,7 @@ running). The sweep (Reaper.sweep: every daemon tick, and each try of a waiting 
 - keeps it while any process of the holder's process group, or the `ttp lock` that took it, still
   holds it (a long, legitimate hold);
 - reaps the process(es) keeping it when every one is the harness's own from the holder's same run
-  (TTP_RUN_ID in its environment matches the label's run_id): SIGTERM, then SIGKILL on a later sweep;
+  (TTP_RUN_ID in its environment matches the label's run_id, and TTP_PROJECT its project when it names one): SIGTERM, then SIGKILL on a later sweep;
 - leaves it otherwise: the processes are named in the wait alert (long_waits).
 A label with no pid_start (an older release) counts as dead only when its pid is gone. A holder is
 judged dead on two sweeps GRACE_S apart before anything is reaped.
@@ -149,12 +149,17 @@ def label(path: Path) -> dict:
 
 def _same_run(h: dict, pid: int) -> bool:
     """Whether `pid` is the harness's own process of the label's run: its TTP_RUN_ID (and TTP_TASK,
-    when both say one) match the label's."""
+    when both say one) match the label's, and so does its project (TTP_PROJECT's folder name) when the
+    label names one: run ids are unique only per project. A label without project (an older release)
+    is judged on the run and task alone."""
     run = str(h.get("run_id") or "")
     if not run:
         return False
     env = environ(pid)
     if env.get("TTP_RUN_ID") != run:
+        return False
+    proj = str(h.get("project") or "")
+    if proj and Path(env.get("TTP_PROJECT") or "").name != proj:
         return False
     task = str(h.get("task_id") or "")
     return not (task and env.get("TTP_TASK") and env["TTP_TASK"] != task)

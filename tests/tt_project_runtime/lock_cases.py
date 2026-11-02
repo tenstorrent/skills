@@ -865,6 +865,23 @@ def test_a_sandboxed_take_names_its_runs_agent_never_its_own_low_namespace_pid(t
         assert (lbl["pid"], lbl["pidns"], lbl["pgid"]) == want
 
 
+def test_a_sandboxed_take_records_its_runs_agent_start_time_from_child_pid(tmp_path, monkeypatch):
+    from ttp import locks
+    monkeypatch.setattr(locks, "_pid_ns", lambda: "pid:[2]")
+    monkeypatch.setattr(locks.os, "getpid", lambda: 13)
+    monkeypatch.setattr(locks, "_pgid", lambda pid: 1)
+    monkeypatch.setattr(locks, "kthread", lambda pid, proc="/proc": False)
+    run = {"TTP_PIDNS": "pid:[1]", "TTP_RUN_DIR": str(tmp_path)}
+    (tmp_path / "child.pid").write_text("4321\n987654\n")   # as the runner writes it: pid, start time
+    got = locks.taker(run)
+    assert (got["pid"], got["pid_start"]) == (4321, "987654")
+    # an older runner's child.pid (no start time, or an empty line): no start time, as before
+    for text in ("4321\n", "4321", "4321\n\n", "4321\n  \n"):
+        (tmp_path / "child.pid").write_text(text)
+        got = locks.taker(run)
+        assert (got["pid"], got["pid_start"]) == (4321, None), text
+
+
 def test_a_take_whose_agent_is_a_kernel_thread_falls_back_to_itself_and_says_so(tmp_path, monkeypatch):
     from ttp import locks
     monkeypatch.setattr(locks, "_pid_ns", lambda: "pid:[2]")

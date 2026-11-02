@@ -161,7 +161,7 @@ def taker(env=None) -> dict:
     pgid, node and pidns. That is this process, except in a PID namespace other than its run's (TTP_PIDNS;
     a `ttp sandbox`), where its own pid (often 2 or 13: a kernel thread's on the host) means nothing to a
     reader there: it names the run's agent instead (child.pid in TTP_RUN_DIR, the leader of its own
-    process group) and keeps its own as ns_pid and ns_pidns. A candidate that is a kernel thread is never
+    process group, with the start time the runner recorded there as pid_start) and keeps its own as ns_pid and ns_pidns. A candidate that is a kernel thread is never
     named: the fields fall back to this process and say so in owner_fallback."""
     env = os.environ if env is None else env
     me = os.getpid()
@@ -170,12 +170,15 @@ def taker(env=None) -> dict:
     if not run_ns or run_ns == out["pidns"] or not env.get("TTP_RUN_DIR"):
         return out
     try:
-        agent = int((Path(env["TTP_RUN_DIR"]) / "child.pid").read_text().split()[0])
+        agent, *started = (Path(env["TTP_RUN_DIR"]) / "child.pid").read_text().split("\n", 1)
+        agent = int(agent)
     except (OSError, ValueError, IndexError):
         return out
     if agent <= 2 or kthread(agent):
         return {**out, "owner_fallback": f"the run's agent pid {agent} is a kernel thread"}
-    return {**out, "pid": agent, "pid_start": None, "pgid": agent, "pidns": run_ns, "ns_pid": me,
+    # the agent's start time as the runner saw it (child.pid's second line; empty from an older runner)
+    started = started[0].strip() if started else ""
+    return {**out, "pid": agent, "pid_start": started or None, "pgid": agent, "pidns": run_ns, "ns_pid": me,
             "ns_pidns": out["pidns"]}
 
 

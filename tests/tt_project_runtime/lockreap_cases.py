@@ -135,6 +135,57 @@ def test_lockreap_leaves_a_process_of_another_run_and_names_it(env, monkeypatch,
         f.close()
 
 
+def test_lockreap_releases_a_sandboxed_takes_lock_once_its_agent_pid_is_reused(env, monkeypatch, tmp_path):
+    from ttp import lockreap, locks
+    (tmp_path / "child.pid").write_text("4100\n11\n")
+    with monkeypatch.context() as m:   # a `ttp lock` in the run's sandbox: its label names the agent
+        m.setattr(locks, "_pgid", lambda pid: 1)
+        m.setattr(locks.os, "getpid", lambda: 13)
+        m.setattr(locks, "_pid_ns", lambda: "pid:[2]")
+        m.setattr(locks, "kthread", lambda pid, proc="/proc": False)
+        t = locks.taker({"TTP_PIDNS": "pid:[9]", "TTP_RUN_DIR": str(tmp_path)})
+    assert (t["pid"], t["pid_start"]) == (4100, "11")
+    path = tmp_path / "gate.0.lock"
+    f = _reap_slot(path, pid=t["pid"], pid_start=t["pid_start"], pgid=t["pgid"], run_id="70")
+    try:
+        fake = _ReapProcs(monkeypatch, {4100: {"start": "11", "pgid": 4100}, 5200: {"start": "90", "env": {"TTP_RUN_ID": "70"}}},
+                          [5200])
+        assert lockreap.verdict(lockreap.label(path))[0] == "alive"   # the agent itself still runs
+        fake.procs[4100] = {"start": "999", "pgid": 1}                  # same pid, another process
+        assert lockreap.verdict(lockreap.label(path))[0] == "dead"
+        assert [r["lock"] for r in _reap_sweep([path])["released"]] == ["gate.0.lock"]
+        assert [x[0] for x in fake.sent] == [5200]
+    finally:
+        f.close()
+
+
+def test_lockreap_same_run_compares_the_project_when_the_label_names_one(env, monkeypatch, tmp_path):
+    from ttp import lockreap
+    _ReapProcs(monkeypatch, {
+        1: {"env": {"TTP_RUN_ID": "70", "TTP_PROJECT": "/srv/a/alpha"}},
+        2: {"env": {"TTP_RUN_ID": "70", "TTP_PROJECT": "/srv/b/beta"}},
+        3: {"env": {"TTP_RUN_ID": "70"}}}, [])
+    lbl = {"run_id": "70", "project": "alpha"}
+    assert lockreap._same_run(lbl, 1)
+    assert not lockreap._same_run(lbl, 2)   # another project's run 70
+    assert not lockreap._same_run(lbl, 3)   # says no project: never reaped as alpha's
+    old = {"run_id": "70"}                  # an older release's label: run id alone, as before
+    assert all(lockreap._same_run(old, x) for x in (1, 2, 3))
+    assert not lockreap._same_run({"run_id": "71", "project": "alpha"}, 1)
+    # end to end: a dead holder's lock kept open by another project's run of the same id stays
+    path = tmp_path / "gate.0.lock"
+    f = _reap_slot(path, pid=4100, pid_start="11", pgid=4100, run_id="70", project="alpha")
+    try:
+        fake = _ReapProcs(monkeypatch, {5200: {"start": "1", "env": {"TTP_RUN_ID": "70", "TTP_PROJECT": "/srv/b/beta"}}},
+                          [5200])
+        got = _reap_sweep([path])
+        assert not got["released"] and not fake.sent and str(path) in got["kept"]
+        fake.procs[5200]["env"]["TTP_PROJECT"] = "/srv/a/alpha"
+        assert _reap_sweep([path])["released"] and [x[0] for x in fake.sent] == [5200]
+    finally:
+        f.close()
+
+
 def test_lockreap_sigkills_a_reaped_process_that_outlives_sigterm(env, monkeypatch, tmp_path):
     import signal as sg
     from ttp import lockreap
