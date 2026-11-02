@@ -5458,6 +5458,8 @@ def cmd_lock(a) -> None:
             except OSError:
                 pass
         os.kill(os.getpid(), info.si_signo)
+    from . import lockreap
+    reaper = lockreap.Reaper()
     tickets: list = []
     atexit.register(lambda: [lk.dequeue(t) for t in tickets])   # however this ends; a dead process's ticket is dropped too
     prio = _urgent_priority(p, own)   # an urgent task's waiter goes ahead of routine ones (urgent.py)
@@ -5551,11 +5553,11 @@ def cmd_lock(a) -> None:
 
             for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
                 signal.signal(sig, _forward)
-            # The command gets the lock's open files too (hold_fds), and a keeper holds them until it
-            # ends (keep_open: for a command that closes them, as ssh does): a SIGKILL or OOM kill of this
-            # process, which no handler sees, leaves the lock held until the command (and anything it
-            # left running with them) ends, and its label names the command (hand_to_command).
-            proc = subprocess.Popen(cmd, env=child_env, pass_fds=lk.hold_fds(fs))
+            # A keeper holds the lock's open files until the command ends (keep_open): a SIGKILL or OOM
+            # kill of this process, which no handler sees, leaves the lock held until the command ends,
+            # and its label names the command (hand_to_command). The command never gets them: a process
+            # it leaves running (a daemon, a `setsid ... &`) would keep the lock for as long as it lives.
+            proc = subprocess.Popen(cmd, env=child_env)
             started.append(proc)
             keeper = lk.keep_open(fs, proc.pid)
             lk.hand_to_command(fs, proc.pid)
@@ -5611,6 +5613,13 @@ def cmd_lock(a) -> None:
             die(f"{what} stayed busy for {timeout:.0f} s. Hand the task back now: result.json status "
                 f"`waiting`, waiting_for `{what}`, retry_when "
                 f"`ttp lock --probe{' --shared' if a.shared else ''} {what}`", 75)
+        # Each try also reaps what keeps a lock whose holder is dead (lockreap: the daemon does it too).
+        try:
+            got = reaper.sweep([x for L, _by in blocked for x in L.get("paths") or []])
+            if got["released"] and getattr(p, "db", None) is not None:
+                lockreap.record(p.db, got["released"])
+        except Exception as e:   # never ends the wait
+            print(f"ttp lock: stale-lock sweep failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
         _nap(poll_s(3))
 
 def cmd_land(a) -> None:

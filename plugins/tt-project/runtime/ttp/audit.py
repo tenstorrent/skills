@@ -522,6 +522,9 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
     from . import progress
     if stuck := progress.audit_line(db, since, now):
         out.append(stuck)
+    from . import lockreap
+    if n := lockreap.released_count(db, since):
+        out.append(f"stale locks released (holder dead): {n}")
     held = overrides(p, db, now, blocked_h)
     if held:
         out.append(f"overrides held long: {len(held)}: " + "; ".join(held[:TOP]) + _more(held))

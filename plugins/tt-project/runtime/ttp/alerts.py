@@ -54,6 +54,7 @@ WAITER_TTL = 1800.0     # a project's report into a logout claim counts this lon
 # What the chat hears once an episode clears.
 CLEARED_TEXT = {
     "budget": "Budget for {arg} is out of red; new work starts again.",
+    "lock-wait": "Nobody has waited long on lock {arg} any more.",
     "auth": "{arg} is logged in again; its queued work starts.",
     "limit": "{arg} accepts work again.",
     "coordinator": "The coordinator is working again: a turn succeeded.",
@@ -100,8 +101,9 @@ CLEARED_SEVERITY = {"network": "low", "paused": "low", "fleethold": "low", "coor
 # run reports them, or it turns out billed by use.
 # tick-step: a daemon tick step that keeps failing (Daemon._run_step); its next success clears it.
 # chat-silent: a relay chat with no listener that stopped reading (chatgone.py); its next read clears it.
+# lock-wait: a lock a waiter has waited on past locks.wait_alert_min (lockreap.py); the wait's end clears it.
 STATUS_CONDITIONS = ("budget", "limit", "deploy", "deploy-behind", "daemon-hang", "account-mismatch", "tick-step",
-                     "chat-silent")
+                     "chat-silent", "lock-wait")
 
 
 def _urgent(severity: str | None) -> bool:

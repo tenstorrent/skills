@@ -1205,7 +1205,7 @@ def test_ttp_lock_holds_until_its_command_ends_when_signalled_as_the_command_sta
             alive = False
         assert not alive, "ttp lock ended while its command still ran"
         assert "ended" not in marks.read_text(), "the signal was not passed on to the command"
-        # The `sleep` the killed sh left running has the lock open too (hold_fds): free once it ends.
+        # Free once the command is gone (the `sleep` it left running never had the lock's file).
         assert _until_true(lambda: _lock_probe(run_env, "board").returncode == 0)
     finally:
         if first.poll() is None:
@@ -1270,31 +1270,30 @@ def test_ttp_lock_stays_held_while_its_command_runs_after_ttp_lock_is_sigkilled(
 
 
 @pytest.mark.parametrize("mode", [(), ("--shared",)])
-def test_ttp_lock_stays_held_while_a_process_its_command_left_running_keeps_it_open(env, mode):
-    # The trade-off of handing the lock to the command: a process it leaves running in the background
-    # keeps the lock open, so the resource stays taken (and its holder shown) until that process ends.
-    # For a device that is right: it is still in use.
+def test_ttp_lock_is_free_once_its_command_ends_though_a_process_it_left_running_lives_on(env, mode):
+    # A process the command leaves running in the background (its own session: setsid, a daemon) used to
+    # inherit the lock's open file and keep the lock for as long as it lived, after the command, its
+    # process group and ttp lock were all gone: a gate stayed taken for days. The command never gets the
+    # lock's files now (only ttp lock's keeper holds them), so the lock ends with the command.
     p = make(env)
     pidf, go = env["tmp"] / "bg.pid", env["tmp"] / "go"
     bg = f"while [ ! -e {shlex.quote(str(go))} ]; do sleep 0.05; done"
-    script = f"sh -c {shlex.quote(bg)} > /dev/null 2>&1 & echo $! > {shlex.quote(str(pidf))}"
+    fds = env["tmp"] / "fds.txt"
+    script = (f"ls -l /proc/self/fd > {shlex.quote(str(fds))} 2>&1; "
+              f"setsid sh -c {shlex.quote(bg)} > /dev/null 2>&1 < /dev/null & echo $! > {shlex.quote(str(pidf))}")
     run_env = _lock_env(env, p)
     first = _lock(run_env, *mode, "board", cmd=("sh", "-c", script))
     try:
         assert first.wait(timeout=60) == 0, first.stderr.read()
         bg_pid = int(pidf.read_text())
-        r = _lock_probe(run_env, "board", extra=("--json",))
-        got = json.loads(r.stdout)
-        assert r.returncode == 75 and not got["free"], (r.returncode, r.stdout)
-        # The holder stays named, shared or not, and says why its gone command still has it taken.
-        assert [h.get("taker_pid") for h in got["holders"]] == [first.pid], got
-        assert got["holders"] and all("a process it left running keeps the lock" in h["note"]
-                                      for h in got["holders"]), got
-        assert "a process it left running keeps the lock" in _lock_probe(run_env, "board").stdout
+        assert not _cmd_ended(bg_pid, timeout=0.2), "the background process should still run"
+        if sys.platform.startswith("linux"):
+            assert "board.0.lock" not in fds.read_text(), fds.read_text()   # not inherited by the command
+        r = _lock_probe(run_env, "board")
+        assert r.returncode == 0, r.stdout
     finally:
         go.touch()
     assert _cmd_ended(bg_pid)
-    assert _until_true(lambda: _lock_probe(run_env, "board").returncode == 0), _lock_probe(run_env, "board").stdout
 
 
 def test_a_waiting_ttp_lock_logs_who_sent_it_sigterm_and_still_exits_143(env, tmp_path):

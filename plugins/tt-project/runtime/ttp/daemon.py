@@ -1602,6 +1602,7 @@ class Daemon:
         self._run_step(self.review_jev)
         self._run_step(self.end_effort_ab)
         self._run_step(self.watch_cli_versions)
+        self._run_step(self.reap_locks)
         settling = self._run_step(self.settling, default=False)
         core = self.cfg.get("core_provider") or "claude"
         core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
@@ -8356,6 +8357,39 @@ class Daemon:
             coord.reraise_charter_changes(self.p)
         except Exception:
             log(self.p, "charter re-raise: " + traceback.format_exc().replace("\n", " | ")[:1000])
+
+    def reap_locks(self) -> None:
+        """Every tick, model-free (ttp.lockreap): reap what keeps a harness lock whose holder is dead
+        (the project's slot locks, its shared resources' and the check slots), log each release as an
+        event, and raise one lock-wait:<name> alert per lock a waiter has waited on past
+        locks.wait_alert_min, naming its holder; it clears once nobody waits that long."""
+        from . import checkcap, lockreap
+        now, db = time.time(), self.p.db
+        own = [self.p.state / "locks"]
+        shared_dirs = [shared.root() / r for r in sorted(shared.names(self.cfg))]
+        reaper = getattr(self, "_lock_reaper", None) or lockreap.Reaper()
+        self._lock_reaper = reaper
+        got = reaper.sweep(lockreap.slot_files(own + shared_dirs + [checkcap.slot_dir()]), now)
+        if got["released"]:
+            lockreap.record(db, got["released"], now)
+            for r in got["released"]:
+                log(self.p, lockreap.release_text(r))
+        limit = lockreap.wait_alert_s(self.cfg)
+        mine = (lambda t: t.startswith(f"{self.p.name} "))
+        waits = lockreap.long_waits(own, limit, now) + lockreap.long_waits(shared_dirs, limit, now, mine=mine)
+        keys = set()
+        for w in waits:
+            key = f"lock-wait:{w['lock']}"
+            keys.add(key)
+            if db.one("SELECT id FROM alerts WHERE key=? AND cleared IS NULL LIMIT 1", (key,)):
+                db.x("UPDATE alerts SET last=? WHERE key=? AND cleared IS NULL", (now, key))
+                continue
+            self.alert(key, lockreap.wait_text(w, now, got["kept"]), severity="normal")
+        for ep in db.q("SELECT DISTINCT key FROM alerts WHERE key LIKE 'lock-wait:%' AND cleared IS NULL"):
+            if ep["key"] not in keys:
+                alerts.close_key(db, ep["key"], "the wait ended", now=now,
+                                 text="Cleared: " + alerts.CLEARED_TEXT["lock-wait"].format(
+                                     arg=ep["key"].partition(":")[2]))
 
     def heal_harness_git(self) -> None:
         """Every harness_git.sweep_every_s, commit the charter and memory files a failed harness commit

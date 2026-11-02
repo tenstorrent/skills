@@ -76,7 +76,7 @@ def try_take(paths: list[Path], holder: str, what: str = "", key: str = "", extr
         f.seek(0)
         f.truncate()
         f.write(json.dumps({"holder": holder, "since": time.time(), "command": what[:300], **({"key": key} if key else {}),
-                            **(extra or {}), **taker()}))
+                            **(extra or {}), **run_ids(), **taker()}))
         f.flush()
         return f
     return None
@@ -107,10 +107,34 @@ def _pid_ns() -> str | None:
         return None
 
 
+def start_time(pid, proc: str = "/proc") -> str | None:
+    """When process `pid` started, as text that differs for another process later given the same pid:
+    its starttime in clock ticks since boot (/proc/<pid>/stat field 22) on Linux, `ps -o lstart=`
+    elsewhere (macOS). None when it is gone or this cannot tell."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    if sys.platform.startswith("linux"):
+        try:
+            return Path(f"{proc}/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+        except (OSError, IndexError):
+            return None
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                             timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out or None
+
+
 def _owner(pid: int) -> dict:
-    """The fields a slot label gives the process that holds it: its pid, and where that pid means
-    something (host and PID namespace), so a reader elsewhere does not judge it."""
-    return {"pid": int(pid), "node": os.uname().nodename, "pidns": _pid_ns()}
+    """The fields a slot label gives the process that holds it: its pid and start time (start_time: a
+    reader tells a reused pid from it), and where that pid means something (host and PID namespace), so
+    a reader elsewhere does not judge it."""
+    return {"pid": int(pid), "pid_start": start_time(pid), "node": os.uname().nodename, "pidns": _pid_ns()}
 
 
 PF_KTHREAD = 0x00200000   # /proc/<pid>/stat flags: a kernel thread
@@ -151,7 +175,18 @@ def taker(env=None) -> dict:
         return out
     if agent <= 2 or kthread(agent):
         return {**out, "owner_fallback": f"the run's agent pid {agent} is a kernel thread"}
-    return {**out, "pid": agent, "pgid": agent, "pidns": run_ns, "ns_pid": me, "ns_pidns": out["pidns"]}
+    return {**out, "pid": agent, "pid_start": None, "pgid": agent, "pidns": run_ns, "ns_pid": me,
+            "ns_pidns": out["pidns"]}
+
+
+def run_ids(env=None) -> dict:
+    """The run, task and project a taker works for (TTP_RUN_ID, TTP_TASK, TTP_PROJECT), as run_id,
+    task_id and project: a stale-lock sweep (lockreap) reaps a process left holding the lock only when
+    it is of that same run."""
+    env = os.environ if env is None else env
+    out = {"run_id": env.get("TTP_RUN_ID"), "task_id": env.get("TTP_TASK"),
+           "project": Path(env["TTP_PROJECT"]).name if env.get("TTP_PROJECT") else None}
+    return {k: v for k, v in out.items() if v}
 
 
 def job_fields(env=None) -> dict:
@@ -198,10 +233,10 @@ def label_pid(f, pid: int, via: str = "keeper") -> None:
 
 def hold_fds(held: list) -> list[int]:
     """The fds of the open files that hold the locks in `held` (try_take's files, SharedHolds), for the
-    command a `ttp lock` runs (Popen pass_fds): a flock lives on the open file, so the lock stays held
-    while the command lives even when `ttp lock` itself is killed (SIGKILL, the OOM killer). The cost:
-    a process the command leaves running keeps it too, and the resource stays taken until that one ends
-    (for a device, right: it is still in use)."""
+    keeper of a `ttp lock` (keep_open, Popen pass_fds): a flock lives on the open file, so the lock stays
+    held while the command lives even when `ttp lock` itself is killed (SIGKILL, the OOM killer). Never
+    for the command itself: a process it leaves running would inherit them and keep the lock after the
+    command, its process group and `ttp lock` are all gone (open files are close-on-exec otherwise)."""
     return [g.fileno() for x in held for g in (x.files if isinstance(x, SharedHold) else [x])]
 
 
@@ -224,8 +259,8 @@ _KEEP_OPEN = (
 
 
 def keep_open(held: list, pid: int) -> subprocess.Popen | None:
-    """A small process that holds the open files of `held` (hold_fds) until the command `pid` ends, for a
-    command that closes the fds it inherits (ssh does): the lock then still outlives a killed `ttp lock`.
+    """A small process that holds the open files of `held` (hold_fds) until the command `pid` ends, which
+    the command itself never gets: the lock then outlives a killed `ttp lock`, never the command.
     It ignores SIGINT, SIGTERM and SIGHUP and waits on a pidfd of the command (a 0.5 s poll where there
     is none); the `ttp lock` that started it ends it once the command has ended. None if it cannot start."""
     try:
@@ -551,7 +586,7 @@ def try_take_shared(paths: list[Path], holder: str, what: str = "", extra: dict 
         lf = open(tmp, "a+")
         fcntl.flock(lf, fcntl.LOCK_EX)
         lf.write(json.dumps({"holder": holder + SHARED_MARK, "since": time.time(), "command": what[:300],
-                             **(extra or {}), **taker()}))
+                             **(extra or {}), **run_ids(), **taker()}))
         lf.flush()
         os.rename(tmp, d / name)
     except OSError:
