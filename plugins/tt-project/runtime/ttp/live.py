@@ -6,8 +6,8 @@ money (a few cents to a few tens of cents), so no test runs it against a real ag
 It makes a scratch project in a scratch git repository and starts its runs the way the daemon does
 (Daemon.start_run, the detached runner), then reads them back with the provider's own parser:
 
-- a tiny worker run: it runs one shell command, tries to write one file outside its writable
-  roots, and writes result.json. Right after it starts, steer.md gets an update for it.
+- a tiny worker run: it runs one shell command, writes one file in its worktree and tries to write
+  one in a sibling dir outside its writable roots, and writes result.json. Right after it starts, steer.md gets an update for it.
 - a resume of that run's session, asked for a code word only the first run was told;
 - a read-only coordinator turn with the coordinator's structured-output schema.
 
@@ -97,6 +97,8 @@ def judge(prov: Provider, ev: dict) -> dict[str, tuple[str, str]]:
         out["fence"] = (FAIL, "the worker wrote outside its writable roots")
     elif not w.get("result"):
         out["fence"] = (FAIL, "the worker could not write result.json in its run dir")
+    elif ev.get("inside_written") is False:
+        out["fence"] = (FAIL, "the worker could not write a file in its worktree")
     else:
         out["fence"] = (PASS, str((w.get("result") or {}).get("fence") or "")[:120])
     r = ev.get("resume") or {}
@@ -175,10 +177,11 @@ def measure(provider: str, *, tier: str = "light", timeout_s: float = RUN_TIMEOU
         d = Daemon(p.base)
         tid = p.db.add_task("live check", "conformance", kind="code", tier=tier, origin="user")
         word, steer_word, probe = f"W{uuid.uuid4().hex[:6]}", f"S{uuid.uuid4().hex[:6]}", outside / "probe.txt"
+        inside = repo / "fence-inside.txt"
         prompt = (
             "This is a harness conformance check. Do exactly these steps and nothing else.\n"
             f"1. Remember the code word {word}; you will be asked for it later.\n"
-            "2. Run this shell command once: echo live-check\n"
+            f"2. Run this shell command once: echo live-check > {inside}\n"
             f"3. Run this shell command once: echo probe > {probe}\n"
             "   It may be refused; that is expected. Note its outcome in a few words.\n"
             "4. If an update for your task arrived after a tool call, note the code word it gives.\n"
@@ -209,6 +212,7 @@ def measure(provider: str, *, tier: str = "light", timeout_s: float = RUN_TIMEOU
                         + (u.cache_read_tokens or 0), "result": result,
                         "steer_word_seen": steer_word in json.dumps(result or {})}
         ev["probe_written"] = probe.exists()
+        ev["inside_written"] = inside.exists()
         ev["steer_delivered"] = delivered
         ev["windows"] = [f"{w.get('window')}" for w in (u.extra.get("windows") or [])]
         if not ev["windows"] and type(prov).meter is not Provider.meter:

@@ -6583,6 +6583,8 @@ def test_live_check_judges_every_check_pass_fail_and_unsupported(env):
     assert st(full, coordinator={"skipped": "over budget"})["structured"] == "fail"
     # fence
     assert st(full, probe_written=True)["fence"] == "fail"
+    assert st(full, inside_written=False)["fence"] == "fail", "a fence must let the worker write its worktree"
+    assert st(full, inside_written=True)["fence"] == "pass"
     assert st(full, worker={"result": None})["fence"] == "fail"
     assert st(full, worker={"exit": {"rc": 2}})["fence"] == "fail"
     # resume
