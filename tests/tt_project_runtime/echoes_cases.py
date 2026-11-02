@@ -694,7 +694,7 @@ def test_a_dropped_duplicate_of_a_headed_brief_is_no_echo_and_a_user_replacement
     assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": cited,
                             "text": "Release once checks pass.",
                             "source": {"msg": said, "quote": "release once checks pass"}}],
-                       turn=4, user_turn=True) == []
+                       turn=4, user_turn=True, messages=[said]) == []
     lines = echoes.digest_lines(p)
     assert lines and lines[0] == echoes.RETIRED_HEADER, lines
     for where in ("charter section 'Goals'", f"memory [{mem.stem}]", f"task #{task} spec"):
