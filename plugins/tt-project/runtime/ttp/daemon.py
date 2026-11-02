@@ -4523,6 +4523,11 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "handoff_probe_refused", "normal", text, "queued", task["id"]))
             log(self.p, f"task {task['id']} hand-off: retry_when {bad} refused: no shell command")
+        if rstatus == "waiting" and isinstance(result.get("on_pass_cmd"), str) and not result["on_pass_cmd"].strip():
+            # An empty on_pass_cmd names none (as `ttp task set-when --on-pass-cmd ""` does): dropped, so a
+            # passed probe records its on_pass (or wakes it), never stops on "on_pass_cmd is not a command".
+            result = {k: v for k, v in result.items() if k != "on_pass_cmd"}
+            log(self.p, f"task {task['id']} hand-off: its empty on_pass_cmd names none; dropped")
         if rstatus == "waiting":
             # A wait on a user-only step wakes on the step's model-free check, never on the user's next message.
             result, how = userstep.handoff(db, task, result)
@@ -4716,7 +4721,8 @@ class Daemon:
                 result, summary = self._dry_run_verdict(r, task, result, run_dir, extra, summary)
                 if onpassdry.KEY in extra:
                     not_before = time.time()
-                    reason = "its on_pass_cmd dry run crashed; handed back to its session to fix"
+                    reason = (f"its on_pass_cmd dry run {'failed its contract' if extra[onpassdry.KEY].get('no_result') else 'crashed'}; "
+                              f"handed back to its session to fix")
             if new == "blocked":
                 # A block is the coordinator's to decide: whoever requeues it starts the count over.
                 extra["stale_wakes"] = 0
@@ -11165,7 +11171,7 @@ class Daemon:
         got = onpassdry.load(run_dir, result.get("on_pass_cmd"))
         if not got or got.get("verdict") == "ok":
             return result, summary
-        if got.get("verdict") != "crash":
+        if got.get("verdict") not in ("crash", onpassdry.NO_RESULT):
             extra[onpassdry.NOTE_KEY] = onpassdry.inconclusive(got)
             return result, summary
         if got.get("session") and not load_result(task["result"]).get(onpassdry.KEY):
@@ -11173,9 +11179,11 @@ class Daemon:
             wake = (json.loads(r["note"] or "{}").get("wake") or {}).get("tier")
             tier = wake if wake in bud.TIER_ORDER else task["tier"] if task["tier"] in bud.TIER_ORDER else "standard"
             extra.pop("waiting_since", None)
-            extra.update({onpassdry.KEY: {"run": r["id"], "session": got["session"], "text": text},
+            extra.update({onpassdry.KEY: {"run": r["id"], "session": got["session"], "text": text,
+                                          "no_result": got.get("verdict") == onpassdry.NO_RESULT},
                           "woke": text, "escalated_wake": True})
-            log(self.p, f"task {task['id']} on_pass_cmd dry run crashed; handed back to session {got['session']}")
+            log(self.p, f"task {task['id']} on_pass_cmd dry run {'crashed' if got['verdict'] == 'crash' else 'failed its contract'}; "
+                        f"handed back to session {got['session']}")
             return {**result, "wake_tier": tier}, summary
         warn = onpassdry.warning(got)
         extra[onpassdry.NOTE_KEY] = warn
@@ -11427,8 +11435,16 @@ class Daemon:
                 return
             if result.get("retry_when") is not None and not isinstance(result["retry_when"], str):
                 return   # a retry_when that is no shell command is refused: its on_pass_cmd never runs
-            got = onpassdry.run(cmd, self.p.root, self._on_pass_env(r["task"]), onpassdry.timeout_s(self.cfg))
-            if got["verdict"] == "crash" and session:
+            if onpassdry.sets_result(cmd):
+                got = onpassdry.refused(cmd, "it sets TTP_RESULT itself, but the daemon reads only the $TTP_RESULT "
+                                             "it sets (its on_pass folder), so what it writes is never recorded")
+            else:
+                got = onpassdry.run(cmd, self.p.root, self._on_pass_env(r["task"]), onpassdry.timeout_s(self.cfg))
+                why = onpassdry.no_result(got, cmd, self.p.root, _checks_result_wait(result.get("retry_when")),
+                                          WAIT_KEYS)
+                if why:
+                    got.update(verdict=onpassdry.NO_RESULT, why=why)
+            if got["verdict"] in ("crash", onpassdry.NO_RESULT) and session:
                 spec = _read_result(run_dir / "run.json") or {}
                 cwd, env = str(spec.get("cwd") or ""), spec.get("env") if isinstance(spec.get("env"), dict) else {}
                 prov = get_provider(r["provider"])
@@ -14413,15 +14429,21 @@ def on_pass_both_warning(result: dict) -> str:
     `ttp checks --result` wait, recorded when the command exits 0 without writing $TTP_RESULT."""
     if not isinstance(result, dict) or "on_pass" not in result or result.get("on_pass_cmd") is None:
         return ""
-    try:
-        words = shlex.split(str(result.get("retry_when") or ""))
-    except ValueError:
-        words = []
-    if len(words) == 4 and Path(words[0]).name == "ttp" and words[1:3] == ["checks", "--result"]:
+    if _checks_result_wait(result.get("retry_when")):
         return ("names both on_pass and on_pass_cmd: on_pass_cmd takes precedence; on_pass is recorded only "
                 "if its checks pass and the command exits 0 without writing a hand-off to $TTP_RESULT")
     return ("names both on_pass and on_pass_cmd, but its retry_when is no `ttp checks --result` wait: on_pass "
             "is ignored and only on_pass_cmd decides")
+
+
+def _checks_result_wait(retry_when) -> bool:
+    """Whether `retry_when` is a `ttp checks --result <run dir>` wait (Daemon._checks_wait): one whose
+    on_pass is recorded when its on_pass_cmd exits 0 without writing $TTP_RESULT."""
+    try:
+        words = shlex.split(str(retry_when or ""))
+    except ValueError:
+        return False
+    return len(words) == 4 and Path(words[0]).name == "ttp" and words[1:3] == ["checks", "--result"]
 
 
 def on_pass_problem(on_pass) -> str:

@@ -89,8 +89,9 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    with a `done` or `needs_review` hand-off at `$TTP_RESULT` ends the task; a failed or overrun
    command wakes it at its own tier, anything else wakes it as usual. A failed `ttp detach` job's
    wake carries its log's last 20 lines and first error line. An `on_pass_cmd` is dry-run once when
-   its run hands off (`onpassdry.py`, `waiting.on_pass_dry_run`, on by default): a crash hands the
-   run back to its own session to fix the command.
+   its run hands off (`onpassdry.py`, `waiting.on_pass_dry_run`, on by default): a crash, or an
+   exit 0 that would not record done (no hand-off at `$TTP_RESULT`, or one carrying a wait), hands
+   the run back to its own session to fix the command.
    A task that hands off `done`, or `blocked` with a hand-off naming none of its jobs, has the live
    `ttp detach` jobs of all its runs stopped by the daemon's jobstop sweep (`jobstop.py`), except a
    job its retry_when, on_pass_cmd, on_pass or next_step names (its .rc or `<run>/<name>`) or an
