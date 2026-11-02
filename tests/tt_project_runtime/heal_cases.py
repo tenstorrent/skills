@@ -2895,6 +2895,99 @@ def test_machine_change_test_flag_is_queued_from_a_read_only_ledger(env, monkeyp
     assert got["test"] is True and got["edits"] == [{"at": 100.0, "by": "alpha", "was": {"test": False}, "test": True}]
 
 
+def test_machines_set_and_add_from_a_read_only_home_are_queued_and_applied_once_by_the_daemon(
+        env, monkeypatch, capsys, tmp_path):
+    """`ttp machines set|add` from a sandbox that keeps the user's tt-project home read-only queue the checked
+    change in the project's state and exit 0; the daemon's tick saves it once (a replayed request changes
+    nothing, one the list refuses by then is kept with its reason). A refused request exits non-zero with
+    nothing queued; a write failure with nothing to queue in exits 1 with one line, never a traceback."""
+    import errno
+    from ttp import cli
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env, "alpha")
+    mm.add("box-a", tags="device")
+    mm.add("box-c")
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(p.root)
+    # A writable home: saved directly, as before.
+    cli.main(["machines", "set", "box-a", "--owner", "alpha"])
+    assert capsys.readouterr().out.startswith("saved box-a") and mm.load()["box-a"]["recovery_owner"] == "alpha"
+    assert ml.pending(p.state) == []
+    real = mm.project.durable_write
+
+    def ro(path, *a, **k):   # the home is read-only; the project's state is not
+        path = Path(path)
+        if path.parent == mm.project.HOME_DIR:
+            raise OSError(errno.EROFS, "Read-only file system", str(path.with_name(f".{path.name}.1.tmp")))
+        return real(path, *a, **k)
+    monkeypatch.setattr(mm.project, "durable_write", ro)
+    before = mm.load()
+    for _ in range(2):   # a retry queues nothing more
+        cli.main(["machines", "set", "box-a", "--owner", "beta", "--fallback", "alpha"])
+        out = capsys.readouterr().out
+        assert out.startswith("queued the change to machine box-a") and "read-only here" in out
+        assert out.count("\n") == 1
+    cli.main(["machines", "add", "box-b", "--tags", "device", "--note", "spare", "--until", "3d"])
+    assert capsys.readouterr().out.startswith("queued the change to machine box-b")
+    cli.main(["machines", "set", "box-c", "--owner", "alpha"])
+    capsys.readouterr()
+    assert mm.load() == before and len(ml.pending(p.state)) == 3
+    # Refused before anything is queued.
+    for bad, why in ((["set", "box-zz", "--owner", "alpha"], "no machine 'box-zz'"),
+                     (["set", "box-c", "--fallback", "beta", "--owner", ""], "a fallback needs an owner"),
+                     (["set", "box-a", "--owner", "not a name"], "not a project name"),
+                     (["add", "bad alias!"], "not a machine alias")):
+        with pytest.raises(SystemExit) as ex:
+            cli.main(["machines", *bad])
+        assert ex.value.code and why in capsys.readouterr().err
+    assert len(ml.pending(p.state)) == 3
+    cli.main(["machines", "change", "list"])
+    assert "queued for this project's daemon" in capsys.readouterr().out
+    # The daemon's tick saves each once; box-c, removed meanwhile, is refused and kept with its reason.
+    monkeypatch.setattr(mm.project, "durable_write", real)
+    [req_a] = [r for r in ml.pending(p.state) if r["fields"]["alias"] == "box-a"]
+    [req_b] = [r for r in ml.pending(p.state) if r["fields"]["alias"] == "box-b"]
+    mm.remove("box-c")
+    logged = []
+    ml.Probes(p, log=logged.append).tick()
+    got = mm.load()
+    assert (got["box-a"]["recovery_owner"], got["box-a"]["recovery_fallback"], got["box-a"]["tags"]) == \
+        ("beta", "alpha", ["device"])
+    assert got["box-b"]["note"] == "spare" and got["box-b"]["note_until"] == pytest.approx(time.time() + 3 * 86400, abs=60)
+    assert ml.pending(p.state) == [] and any("box-c" in m and "refused" in m for m in logged)
+    [failed] = (p.state / ml.REQUESTS).glob("*.failed.json")
+    assert "no machine 'box-c'" in json.loads(failed.read_text())["error"]
+    failed.unlink()
+    # A request replayed (a daemon killed before removing it) changes nothing.
+    for req in (req_a, req_b):
+        ml.project.write_json(p.state / ml.REQUESTS / f"{req['queued']}.json",
+                              {k: v for k, v in req.items() if k != "queued"})
+    ml.apply_requests(p.state, log=lambda m: None)
+    assert mm.load() == got and ml.pending(p.state) == [] and not list((p.state / ml.REQUESTS).glob("*.failed.json"))
+    # Nothing to queue in (outside a project), or the queue itself unwritable: exit 1, one line.
+    monkeypatch.setattr(mm.project, "durable_write", ro)
+    for outside in (True, False):
+        if outside:
+            monkeypatch.delenv("TTP_PROJECT")
+            monkeypatch.chdir(tmp_path)
+        else:
+            monkeypatch.setenv("TTP_PROJECT", str(p.base))
+            monkeypatch.chdir(p.root)
+            monkeypatch.setattr(mm.project, "durable_write",
+                                lambda *a, **k: (_ for _ in ()).throw(OSError(errno.EROFS, "Read-only file system")))
+        with pytest.raises(SystemExit) as ex:
+            cli.main(["machines", "set", "box-a", "--owner", "alpha"])
+        err = capsys.readouterr().err
+        assert ex.value.code == 1 and err.count("\n") == 1 and "read-only" in err and "Traceback" not in err
+    # Another write failure is no read-only home: one line too, never queued.
+    monkeypatch.setattr(mm.project, "durable_write",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError(errno.ENOSPC, "No space left on device")))
+    with pytest.raises(SystemExit) as ex:
+        cli.main(["machines", "set", "box-a", "--owner", "alpha"])
+    assert ex.value.code == 1 and "No space left" in capsys.readouterr().err and ml.pending(p.state) == []
+
+
 def test_ttr_caps_a_heal_incident_at_its_last_unhealthy_sample_plus_the_check_period(env, tmp_path):
     """A sparse check no longer stretches a short fault: a heal-sourced incident ends no later than the
     check's last unhealthy sample plus its period; another source keeping it open clears the cap, and rows

@@ -7431,16 +7431,25 @@ def cmd_machines(a) -> None:
         a.action = "add"
     if a.action == "add":
         recovery = a.owner is not None or a.fallback is not None
-        try:
-            if not recovery or any(v is not None for v in (a.tags, a.note, a.until, a.min_free_gb, a.hostname,
-                                                            a.shared)) or a.unshared:
-                entry = mm.add(a.alias, a.tags, a.note,
-                               ... if a.min_free_gb is None else a.min_free_gb, a.hostname,
-                               False if a.unshared else a.shared, a.until, where=here())
-            if recovery:   # only an owner or fallback: the machine must be known already
-                entry = mm.set_recovery(a.alias.strip(), a.owner, a.fallback)
+        args = None   # only an owner or fallback: the machine must be known already
+        if not recovery or any(v is not None for v in (a.tags, a.note, a.until, a.min_free_gb, a.hostname,
+                                                        a.shared)) or a.unshared:
+            args = {"tags": a.tags, "note": a.note, "hostname": a.hostname,
+                    "shared": False if a.unshared else a.shared, "until": a.until,
+                    **({} if a.min_free_gb is None else {"min_free_gb": a.min_free_gb})}
+        from . import machine_ledger as ml
+        p = here()
+        try:   # a sandbox that keeps the user's tt-project home read-only: queued for the daemon
+            entry = mm.update(a.alias, args, a.owner, a.fallback, queue=p.state if p else None, where=p)
+        except OSError as e:
+            die(_unwritable(e, mm.path()), 1)
+        except ml.QueueError as e:
+            die(str(e), 1)
         except ValueError as e:
             die(str(e))
+        if entry.get("queued"):
+            print(_queued_line(entry, p))
+            return   # nothing changed here yet: the daemon's copy to other hosts follows the next change
         print(f"saved {mm.line(a.alias.strip(), entry)}")
     elif a.action == "remove":
         try:
@@ -7581,7 +7590,7 @@ def _machine_change(a) -> None:
         for r in ml.pending(p.state) if p else []:
             print(f"queued for this project's daemon (request {r['queued']}): {r['op']} "
                   + (f"#{r['fields'].get('id')}" if r["op"] in ("close", "edit", "test") else
-                     f"{r['fields'].get('alias')}" if r["op"] in ("outage", "outage_clear") else
+                     f"{r['fields'].get('alias')}" if r["op"] in ("outage", "outage_clear", "machine") else
                      f"{r['fields'].get('alias')}: {r['fields'].get('what')}"))
         return
     p = here()
@@ -7662,14 +7671,15 @@ def _machine_change(a) -> None:
     print(_queued_line(c, p) if c.get("queued") else f"recorded {ml.change_line(c, where=p)}")
 
 
-def _unwritable(e: OSError) -> str:
-    """The one-line error for a shared machine-ledger write that failed outside a project (nothing to queue
-    in) or for another cause than a read-only ledger."""
+def _unwritable(e: OSError, what: Path | None = None) -> str:
+    """The one-line error for a shared machine-ledger write (or of `what`, the machines list) that failed
+    outside a project (nothing to queue in) or for another cause than a read-only ledger."""
     from . import machine_ledger as ml
+    name = "machines list" if what else "machine ledger"
     if e.errno in ml.UNWRITABLE:
-        return (f"the shared machine ledger is read-only here ({e.strerror}: {e.filename or ml._path(ml.LOCK)}) and "
-                f"no project's state to queue the request in: run it inside the project, or where the ledger is writable")
-    return f"could not write the shared machine ledger: {e.strerror or e}" + (f" ({e.filename})" if e.filename else "")
+        return (f"the shared {name} is read-only here ({e.strerror}: {e.filename or what or ml._path(ml.LOCK)}) and "
+                f"no project's state to queue the request in: run it inside the project, or where the {name} is writable")
+    return f"could not write the shared {name}: {e.strerror or e}" + (f" ({e.filename})" if e.filename else "")
 
 
 def _queued_line(req: dict, where=None) -> str:
@@ -7681,6 +7691,11 @@ def _queued_line(req: dict, where=None) -> str:
     if req["op"] == "outage":
         end = (f.get("rec") or {}).get("until")
     shown = f" (ends {ends.shown(float(end), where)} at the latest)" if isinstance(end, (int, float)) else ""
+    if req["op"] == "machine":
+        return (f"queued the change to machine {f['alias']} (request {req['queued']}): the machines list is "
+                f"read-only here, so this project's daemon saves it on its next tick, within a few minutes while it "
+                f"runs, and other hosts get it with the next copy (`ttp machines push`). Running the command again "
+                f"adds nothing.")
     what = f"close of machine change #{f['id']}" if req["op"] == "close" else \
         f"edit of machine change #{f['id']}{shown}" if req["op"] == "edit" else \
         f"known outage on {f['alias']}: {(f.get('rec') or {}).get('why')}{shown}" if req["op"] == "outage" else \

@@ -121,6 +121,9 @@ records its request id in its `edits`, so a request applied twice edits once. Re
 times computed from a relative --expires are named by the command's own arguments instead (an edit's also by
 the entry's edits so far, so a run after the daemon applied it edits anew). A queued clear withdraws the
 project's queued outage on that machine, and never ends an outage begun after the clear was made.
+`ttp machines add` and `set` queue their checked change to the machines list the same way (op `machine`, named
+by the command's arguments, a relative --until made absolute); the daemon applies it again on the list as it
+is then, unless the machine already reads as the queued entry (a request applied before its removal).
 
 A page is never lost nor sent twice: `route` records each due page as pending, with a text fixed for its
 step, and hands it to one daemon at a time (a claim that lapses after CLAIM_S); that daemon marks it
@@ -449,6 +452,10 @@ def request_id(op: str, fields: dict, given: dict | None = None) -> str:
     return hashlib.sha256(json.dumps([op, key], sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
+class QueueError(ValueError):
+    """A request that could not be queued: a write failure, not a refused request."""
+
+
 def _queue(state: Path, op: str, fields: dict, given: dict | None = None, fresh: bool = False) -> dict:
     """Queue `op` for the project daemon in `state` (once per request id: request_id with `given`); returns
     the request. `fresh`: a request queued already is written again with these fields (a clear's time)."""
@@ -467,7 +474,7 @@ def _queue(state: Path, op: str, fields: dict, given: dict | None = None, fresh:
     try:
         project.write_json(path, req, 0o600)
     except OSError as e:
-        raise ValueError(f"the shared machine ledger is read-only here ({_path(LEDGER).parent}) and the request "
+        raise QueueError(f"the shared machine ledger is read-only here ({_path(LEDGER).parent}) and the request "
                          f"could not be queued in {path.parent} ({e.strerror}): run the command where the "
                          f"ledger is writable, or ask the coordinator to") from None
     return req
@@ -535,6 +542,13 @@ def apply_requests(state: Path, log: Callable[[str], None] = print) -> list[dict
                 log(f"known outage on {f['alias']} cleared from queued request {rid}" if not newer else
                     f"queued request {rid} to clear the known outage on {f['alias']} left {', '.join(newer)}'s "
                     f"in place: it began after the request was made")
+            elif req.get("op") == "machine":
+                c = dict(f["entry"])
+                if machines.applied(f["alias"], c):   # saved already: by an earlier run of this request
+                    pass
+                else:
+                    c = machines.update(f["alias"], f.get("args"), f.get("owner"), f.get("fallback"))
+                    log(f"machine {f['alias']} saved in the machines list from queued request {rid}")
             else:
                 raise ValueError(f"unknown request {req.get('op')!r}")
         except (ValueError, TypeError, KeyError) as e:

@@ -118,18 +118,61 @@ def tag_names(v: Any) -> list[str]:
 
 
 def add(alias: str, tags: Any = None, note: str | None = None, min_free_gb: Any = ...,
-        hostname: str | None = None, shared: Any = None, until: str | None = None, where=None) -> dict:
+        hostname: str | None = None, shared: Any = None, until: str | None = None, where=None,
+        queue: Path | None = None) -> dict:
     """Add a machine, or update its tags, note, disk threshold or host name (one left out keeps the
     old value; a threshold or host name of "" removes it). `shared` names the resources on it that
     all of the user's projects share (shared.py): a list or "a,b"; "" the alias itself; False none.
     Left out, it keeps the old ones. `until` (a delay such as 3d or an ISO time) is when the note
     stops being true; past it the digest marks the note stale (a zone-less time is read in the home zone of
-    `where`, ends.parse_expires). A new note without one has none; "" removes it."""
+    `where`, ends.parse_expires). A new note without one has none; "" removes it. `queue`: see update."""
+    args = {"tags": tags, "note": note, "hostname": hostname, "shared": shared, "until": until}
+    if min_free_gb is not ...:
+        args["min_free_gb"] = min_free_gb
+    return update(alias, args, queue=queue, where=where)
+
+
+def update(alias: str, args: dict | None = None, owner: str | None = None, fallback: str | None = None,
+           queue: Path | None = None, where=None) -> dict:
+    """`ttp machines add|set`: add or change machine `alias` with add's `args` (None: leave them), then
+    name its recovery owner and fallback (set_recovery), saved once. Returns the entry. `queue`: a project
+    state dir; when the user's tt-project home is read-only here (a worker's sandbox) the checked change
+    is queued there for that project's daemon instead (machine_ledger: Queued requests), and the request
+    is returned, with `queued`."""
     alias = (alias or "").strip()
+    machines, removed = load(), dict(_part(_doc(), "removed"))
+    entry = None
+    if args is not None:
+        entry = _added(machines, removed, alias, where=where, **args)
+        if entry.get("note_until") and args.get("until"):   # a relative --until means the same end when applied
+            from datetime import datetime, timezone
+            args = {**args, "until": datetime.fromtimestamp(entry["note_until"], timezone.utc).isoformat()}
+    if args is None or owner is not None or fallback is not None:
+        entry = _recovery(machines, alias, owner, fallback)
+    try:
+        _save(machines, removed)
+    except OSError as e:
+        from . import machine_ledger as ml
+        if queue is None or e.errno not in ml.UNWRITABLE:
+            raise
+        given = {"alias": alias, "args": args, "owner": owner, "fallback": fallback}
+        return ml._queue(queue, "machine", {**given, "entry": entry}, given)
+    return entry
+
+
+def applied(alias: str, entry: dict) -> bool:
+    """Whether machine `alias` already reads as `entry` (a queued update), its times aside."""
+    def bare(m: dict | None) -> dict:
+        return {k: v for k, v in (m or {}).items() if k not in ("added", "updated")}
+    return bare(load().get(alias)) == bare(entry)
+
+
+def _added(machines: dict[str, dict], removed: dict[str, float], alias: str, tags: Any = None,
+           note: str | None = None, min_free_gb: Any = ..., hostname: str | None = None, shared: Any = None,
+           until: str | None = None, where=None) -> dict:
+    """add's change to `machines` and `removed`, in memory."""
     if not ALIAS_RE.fullmatch(alias):
         raise ValueError(f"not a machine alias: {alias!r} (letters, digits and _.@+- only)")
-    doc = _doc()
-    machines, removed = load(), dict(_part(doc, "removed"))
     old = machines.get(alias) or {}
     now = time.time()
     entry = {"tags": tag_list(tags) if tags is not None else old.get("tags", []),
@@ -161,7 +204,6 @@ def add(alias: str, tags: Any = None, note: str | None = None, min_free_gb: Any 
             entry[k] = old[k]
     machines[alias] = entry
     removed.pop(alias, None)
-    _save(machines, removed)
     return entry
 
 
@@ -521,11 +563,16 @@ RECOVERY = ("recovery_owner", "recovery_fallback")
 PROJECT_RE = re.compile(r"[\w.-]{1,100}")
 
 
-def set_recovery(alias: str, owner: str | None = None, fallback: str | None = None) -> dict:
+def set_recovery(alias: str, owner: str | None = None, fallback: str | None = None,
+                 queue: Path | None = None) -> dict:
     """Name the project that recovers machine `alias` when it stays down or held, and the one that
-    takes over when the owner cannot act (machine_ledger.py). None keeps a value, "" removes it."""
-    doc = _doc()
-    machines, removed = load(), dict(_part(doc, "removed"))
+    takes over when the owner cannot act (machine_ledger.py). None keeps a value, "" removes it.
+    `queue`: see update."""
+    return update(alias, None, owner, fallback, queue=queue)
+
+
+def _recovery(machines: dict[str, dict], alias: str, owner: str | None, fallback: str | None) -> dict:
+    """set_recovery's change to `machines`, in memory."""
     if alias not in machines:
         raise ValueError(f"no machine {alias!r} in `ttp machines list`")
     entry = dict(machines[alias])
@@ -543,7 +590,6 @@ def set_recovery(alias: str, owner: str | None = None, fallback: str | None = No
         raise ValueError("a fallback needs an owner: give --owner too")
     entry["updated"] = time.time()
     machines[alias] = entry
-    _save(machines, removed)
     return entry
 
 
