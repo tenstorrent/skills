@@ -11970,6 +11970,10 @@ class Daemon:
         cfg, db, done = self.cfg, self.p.db, []
         rules, d = cfg.get("review") or {}, cfg.get("delivery") or {}
         try:
+            self._release_split_reviews(now)
+        except Exception:
+            log(self.p, "split review release failed\n" + traceback.format_exc())
+        try:
             cap = loadcaps.unreviewed_per_pass(cfg)
             age = float(rules.get("unreviewed_max_age_h", UNREVIEWED_MAX_AGE_H)) * 3600
             waited = float(rules.get("unreviewed_wait_s", UNREVIEWED_WAIT_S) or 0)
@@ -12043,16 +12047,21 @@ class Daemon:
             return "superseded, landed or queued"
         # A task that waits on this one landing (a deploy or live check) carries none of its work: counted
         # as its continuation, a head no review lands would hold it forever.
+        # Nor does one that stalls on the user or a long deferral (chaincap.hop_stall): the head is reviewed now.
         if any(x["id"] != tid and (continues_id(x) == tid or x["branch"] == t["branch"])
-               and not self._waits_landing(x, tid) for x in live):
+               and not self._waits_landing(x, tid) and not chaincap.hop_stall(db.task(x["id"]), now) for x in live):
             return "an open task continues it"
         if chaincap.split_head(t) and any(
-                not self._waits_landing(x, tid) for x in db.q("SELECT id, labels FROM tasks WHERE labels LIKE ? "
-                                                              "AND status!='cancelled'", (f'%"continues:{tid}"%',))):
+                not self._waits_landing(x, tid) and not chaincap.hop_stall(x, now)
+                for x in db.q("SELECT * FROM tasks WHERE labels LIKE ? AND status!='cancelled'",
+                              (f'%"continues:{tid}"%',))):
             return "a later hop of its split chain carries it"
         tip = worktree._git(self.p.root, "rev-parse", "--verify", "--quiet", f"{t['branch']}^{{commit}}", check=False)
         if not tip:
             return "no branch"
+        cont = db.task(continues_id(t) or 0)
+        if cont and chaincap.split_head(cont) and tip == chaincap.split_head(cont):
+            return f"no commits past the split head of #{cont['id']} it continues"
         ended = db.one("SELECT MAX(ended) e FROM runs WHERE task=?", (tid,))["e"]
         start = float(ended or t["updated"] or 0)
         for r in reviews:
@@ -12075,6 +12084,63 @@ class Daemon:
         if self._landed_elsewhere(t):
             return "landed under other commits"
         return ""
+
+    def _release_split_reviews(self, now: float) -> list[int]:
+        """A queued review of a done split task that waits on its hop instead (task_add moved the split
+        task's dependents to the hop it added: coordinator._take_over_dependents) while that hop stalls
+        (chaincap.hop_stall: blocked, waiting on the user, a start_when or a long deferral) waits on the
+        split task again, labelled chaincap.SPLIT_REVIEW_LABEL: it reviews the delivered head now. The hop's
+        later commits get their own review when it delivers (_auto_review). Returns the reviews released."""
+        db, out = self.p.db, []
+        hops = db.q("SELECT * FROM tasks WHERE kind='code' AND status IN ('queued','blocked') AND labels LIKE ?",
+                    ('%"continues:%',))
+        reviews = db.q("SELECT * FROM tasks WHERE kind='review' AND status='queued' AND depends_on NOT IN ('', '[]')") \
+            if hops else []
+        for x in hops:
+            s = db.task(continues_id(x) or 0)
+            head = chaincap.split_head(s) if s and s["status"] == "done" else ""
+            why = chaincap.hop_stall(x, now) if head else ""
+            if not why:
+                continue
+            for r in reviews:
+                labels = push._labels(r)
+                if x["id"] not in dependency_ids(r) or not (f"auto_review:{s['id']}" in labels
+                                                            or r["title"].startswith(f"Review #{s['id']}:")):
+                    continue
+                deps = list(dict.fromkeys(s["id"] if d == x["id"] else d for d in dependency_ids(r)))
+                spec = (f"{r['spec'] or ''}\nIts continuation #{x['id']} {why}: this review covers #{s['id']}'s "
+                        f"delivered head {head[:12]} only. #{x['id']}'s own later commits get their own review "
+                        f"when it delivers.")
+                with db.tx():
+                    db.update_task(r["id"], depends_on=deps, spec=spec,
+                                   labels=[*labels, f"{chaincap.SPLIT_REVIEW_LABEL}{head}"])
+                    db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                         (now, "daemon", "observation", "low",
+                          f"Review #{r['id']} of split task #{s['id']} waited on its continuation #{x['id']}, which "
+                          f"{why}: it reviews #{s['id']}'s delivered head {head[:12]} now.", "handled", r["id"]))
+                r.update(db.task(r["id"]))   # another hop of the same split task reads it as it is now
+                log(self.p, f"review {r['id']}: waits on split task {s['id']} again, not its stalled hop {x['id']}")
+                out.append(r["id"])
+        return out
+
+    def _fold_split_review(self, task: dict) -> None:
+        """Done hop `task` delivered while a review of an earlier split head of its chain
+        (chaincap.SPLIT_REVIEW_LABEL) is still queued: that review waits on `task` instead and reviews the
+        whole chain at its head, the one review a split chain gets."""
+        db = self.p.db
+        hops = {h["id"] for h in chaincap.split_hops(db, task)} if task.get("status") == "done" else set()
+        if not hops:
+            return
+        for r in db.q("SELECT * FROM tasks WHERE kind='review' AND status='queued' AND labels LIKE ?",
+                      (f'%"{chaincap.SPLIT_REVIEW_LABEL}%',)):
+            if not hops & set(dependency_ids(r)):
+                continue
+            db.update_task(r["id"], depends_on=list(dict.fromkeys(task["id"] if d in hops else d
+                                                                  for d in dependency_ids(r))),
+                           labels=[lb for lb in push._labels(r) if not lb.startswith(chaincap.SPLIT_REVIEW_LABEL)],
+                           spec=f"{r['spec'] or ''}\n#{task['id']} delivered the rest of its split chain before this "
+                                f"review started: review the whole chain at #{task['id']}'s head instead.")
+            log(self.p, f"review {r['id']}: still queued, now reviews split chain to hop {task['id']}")
 
     def _waits_landing(self, x: dict, tid: int) -> bool:
         """Whether task `x` (a row with id and labels) waits on task `tid` landing: its start_when, or
@@ -12108,6 +12174,7 @@ class Daemon:
             return None
         branch = task.get("branch")
         try:
+            self._fold_split_review(task)
             ext = self._external_change(task)
             if ext and branch and worktree.diff_lines(self.p, [branch]):
                 ext = None   # a change in the project's own git is reviewed there, as before
@@ -12192,8 +12259,22 @@ class Daemon:
         if fups:
             lines.append("Its proposed follow-ups (the coordinator queues them separately; not part of this "
                          "change, so not a finding by themselves): " + "; ".join(fups[:MAX_FOLLOWUPS]))
-        # The last hop of a split chain: one review of the whole chain at its final head.
+        # A split head whose hop stalls is reviewed on its own now (_release_split_reviews).
+        own_split = chaincap.split_head(task)
+        stall = chaincap.stalled_hop(db, task["id"]) if own_split else None
+        if stall:
+            lines.append(f"Its continuation #{stall[0]['id']} {stall[1]}: this review covers its delivered head "
+                         f"{head} only. #{stall[0]['id']}'s own later commits get their own review when it delivers.")
+        # The last hop of a split chain: one review of the whole chain at its final head, or of the commits
+        # after the last split head a review of its own took up.
         hops = chaincap.split_hops(db, task)
+        if seen := chaincap.reviewed_split(db, hops) if hops else None:
+            base = chaincap.split_head(hops[seen[0]])
+            lines.append(f"Head {base[:12]} of split task #{hops[seen[0]]['id']} has a review of its own, "
+                         f"#{seen[1]['id']} (its continuation waited): review only the commits after it "
+                         f"(`git log -p {base}..{full}`). If review #{seen[1]['id']} has not passed when you start, "
+                         f"review the whole change.")
+            hops = hops[seen[0] + 1:]
         if hops:
             lines.append(f"It is the last hop of a split continue chain: " + ", ".join(
                 f"#{h['id']} (head {chaincap.split_head(h)[:12]})" for h in hops) + " ended unfinished, with no "
@@ -12324,7 +12405,8 @@ class Daemon:
         labels = [f"auto_review:{task['id']}"] + ([f"continues:{prior['id']}"] if prior else []) \
             + ([PRECHECK_LABEL + checks.name] if checks else []) + ([push.REVIEW_ONLY_LABEL] if elsewhere or off or never or ext else []) + ([push.LAND_LABEL] if lands else []) \
             + ([f"pr_branch:{elsewhere}"] if own_step else []) + reviewhold.labels(full, held) \
-            + ([extchange.HEAD_LABEL + ext["head"]] if ext else [])
+            + ([extchange.HEAD_LABEL + ext["head"]] if ext else []) \
+            + ([chaincap.SPLIT_REVIEW_LABEL + own_split] if stall else [])
         rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=min(chainprio.of(db, task), urgent.PRIORITY)
                           if urgent.is_urgent(task) else chainprio.of(db, task), origin="daemon",
                           budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),

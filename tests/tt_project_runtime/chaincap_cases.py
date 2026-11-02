@@ -342,6 +342,137 @@ def test_the_unreviewed_sweep_reviews_a_split_head_an_open_task_waits_on_to_land
     assert d.sweep_unreviewed(force=True) == [] and not _daemon_reviews(p, t3)
 
 
+def test_hop_stall_counts_the_user_a_start_when_a_block_and_a_long_deferral_only():
+    """A hop that runs or starts soon carries its split head (today's rule); one that waits on the user,
+    a start_when, a block or a deferral past HOP_WAIT_S does not."""
+    import time
+    from ttp import chaincap
+    now = time.time()
+
+    def hop(status="queued", result=None, labels=(), not_before=None, reason=None):
+        return {"status": status, "result": json.dumps(result) if result else None, "labels": json.dumps(
+            ["continues:1", *labels]), "not_before": not_before, "blocked_reason": reason}
+    for t in (hop(), hop("running", {"status": "waiting", "wait_kind": "user"}), hop("done"),
+              hop(result={"status": "waiting", "wait_kind": "self", "retry_when": "test -e x"}),
+              hop(result={"status": "waiting", "wait_kind": "external"}, not_before=now + 600),
+              hop(not_before=now + chaincap.HOP_WAIT_S - 60), hop(labels=["start_when:now"]), None):
+        assert chaincap.hop_stall(t, now) == "", t
+    assert "waits on the user (sign-in)" in chaincap.hop_stall(
+        hop(result={"status": "waiting", "wait_kind": "user", "waiting_for": "sign-in"}), now)
+    assert "waits on the user" in chaincap.hop_stall(hop(result={"status": "waiting", "wait_kind": "user-action"}), now)
+    assert "start_when (signed in)" in chaincap.hop_stall(
+        hop(labels=["start_when:tool status", "start_why:signed in"]), now)
+    assert "is blocked (needs a key)" in chaincap.hop_stall(hop("blocked", reason="needs a key"), now)
+    assert "is deferred 3.0 h" in chaincap.hop_stall(hop(not_before=now + 3 * 3600), now)
+    assert "is deferred" in chaincap.hop_stall(hop(labels=[f"start_after:{now + 3 * 3600:.0f}"]), now)
+
+
+def _hop_on(env, p, tid, title="continue: live step", commit=True):
+    """A code hop of split task `tid` on its own branch from the split head, with one commit when `commit`."""
+    from ttp import worktree
+    hid = p.db.add_task(title, "Carry on.", kind="code", origin="coordinator", labels=[f"continues:{tid}"])
+    path, branch = worktree.ensure(p, p.db.task(hid))
+    if commit:
+        (path / f"{hid}.py").write_text("more\n")
+        _git_out(path, "add", ".")
+        _git_out(path, *_IDENT, "commit", "-qm", title)
+    p.db.update_task(hid, branch=branch)
+    return hid, _git_out(path, "rev-parse", "HEAD").strip()
+
+
+def test_a_split_review_moved_to_a_hop_that_waits_on_the_user_reviews_the_delivered_head_now(env):
+    """The reported case, with generic names: a split task's review moved onto its `continue:` hop (task_add's
+    dependents take-over) while the hop waits on the user's sign-in. The review waits on the split task again
+    and covers its delivered head only; a hop that runs normally keeps it (one review of the chain), and a
+    review of the hop itself stays on the hop."""
+    from ttp import chaincap
+    from ttp import daemon as dm
+    p = make(env)
+    tid, _, head = _unreviewed(env, p, "split change")
+    _split_at(p, tid, head)
+    hop, _ = _hop_on(env, p, tid, commit=False)
+    rev = p.db.add_task(f"Review #{tid}: split change", "Review it.", kind="review", origin="daemon",
+                        depends_on=[hop], labels=[f"auto_review:{tid}"])
+    own = p.db.add_task(f"Review #{hop}: continue: live step", "Review it.", kind="review", origin="coordinator",
+                        depends_on=[hop])
+    d = dm.Daemon(p.base)
+    assert d.sweep_unreviewed(force=True) == []
+    assert json.loads(p.db.task(rev)["depends_on"]) == [hop]   # a running hop carries the split head
+    p.db.update_task(hop, result=json.dumps({"status": "waiting", "wait_kind": "user", "waiting_for": "sign-in",
+                                             "retry_when": "tool status"}))
+    assert d.sweep_unreviewed(force=True) == []   # the moved review is the split head's one review
+    r = p.db.task(rev)
+    assert json.loads(r["depends_on"]) == [tid] and f"{chaincap.SPLIT_REVIEW_LABEL}{head}" in r["labels"]
+    assert f"#{hop} waits on the user (sign-in)" in r["spec"] and f"head {head[:12]} only" in r["spec"]
+    assert json.loads(p.db.task(own)["depends_on"]) == [hop]
+    assert not p.db.unmet_dependencies([p.db.task(rev)]).get(rev)   # ready now: the split task is done
+    assert d.sweep_unreviewed(force=True) == [] and json.loads(p.db.task(rev)["depends_on"]) == [tid]
+    assert [e["task"] for e in p.db.q("SELECT task FROM events WHERE kind='observation' AND text LIKE ?",
+                                      (f"Review #{rev} of split task #{tid}%",))] == [rev]
+
+
+def test_a_split_head_with_no_review_whose_hop_stalls_gets_one_now_and_a_hop_starting_soon_does_not(env):
+    """A split head no review covers, whose only hop waits on a start_when or a long deferral, gets its review
+    from the sweep, labelled and worded as the split head's own; one whose hop is deferred briefly, or has no
+    commits past the split head while waiting on the user, gets none."""
+    import time
+    from ttp import chaincap
+    from ttp import daemon as dm
+    p = make(env)
+    d = dm.Daemon(p.base)
+    for title, labels, not_before in (("waits on sign-in", ["start_when:tool status"], None),
+                                      ("deferred long", [], time.time() + 3 * 3600)):
+        tid, _, head = _unreviewed(env, p, title)
+        _split_at(p, tid, head)
+        hop = p.db.add_task("continue: rest", "s", kind="code", origin="coordinator",
+                            labels=[f"continues:{tid}", *labels], not_before=not_before)
+        assert d.sweep_unreviewed(force=True) == [tid], title
+        (rev,) = _daemon_reviews(p, tid)
+        assert f"{chaincap.SPLIT_REVIEW_LABEL}{head}" in rev["labels"], title
+        assert f"Its continuation #{hop} " in rev["spec"] and "own later commits get their own review" in rev["spec"]
+    tid, _, head = _unreviewed(env, p, "deferred briefly")
+    _split_at(p, tid, head)
+    p.db.add_task("continue: rest", "s", kind="code", origin="coordinator", labels=[f"continues:{tid}"],
+                  not_before=time.time() + 600)
+    assert d.sweep_unreviewed(force=True) == [] and not _daemon_reviews(p, tid)
+    # A hop waiting on the user with no commit of its own past the split head: only the split head is reviewed.
+    tid, _, head = _unreviewed(env, p, "waits on the user")
+    _split_at(p, tid, head)
+    hop, hop_head = _hop_on(env, p, tid, commit=False)
+    assert hop_head == head
+    p.db.update_task(hop, status="queued", result=json.dumps({"status": "waiting", "wait_kind": "user"}))
+    assert d.sweep_unreviewed(force=True) == [tid] and not _daemon_reviews(p, hop)
+
+
+def test_the_hop_delivering_after_its_split_head_review_gets_a_review_of_only_its_new_commits(env):
+    """Once the split head's own review ran, the hop's later delivery gets a review of only the commits after
+    that head; while that review is still queued, it folds into the hop's review (one review of the chain)."""
+    from ttp import chaincap
+    from ttp import daemon as dm
+    p = make(env)
+    d = dm.Daemon(p.base)
+    for ran in (True, False):
+        tid, _, head = _unreviewed(env, p, f"split change {ran}")
+        _split_at(p, tid, head)
+        hop, hop_head = _hop_on(env, p, tid)
+        rev = p.db.add_task(f"Review #{tid}: split change", "Review it.", kind="review", origin="daemon",
+                            depends_on=[tid], labels=[f"auto_review:{tid}", f"{chaincap.SPLIT_REVIEW_LABEL}{head}"])
+        if ran:
+            p.db.update_task(rev, status="done")
+        p.db.update_task(hop, status="done", result=json.dumps({"status": "done", "summary": "measured"}))
+        got, added = d._auto_review(p.db.task(hop), "measured")
+        if ran:
+            assert added and got != rev
+            spec = p.db.task(got)["spec"]
+            assert f"git log -p {head}..{hop_head}" in spec and f"#{rev}" in spec
+            assert "review the chain's whole change as one" not in spec
+        else:
+            assert (got, added) == (rev, False)
+            r = p.db.task(rev)
+            assert json.loads(r["depends_on"]) == [hop] and chaincap.SPLIT_REVIEW_LABEL not in r["labels"]
+            assert f"#{hop} delivered the rest of its split chain" in r["spec"]
+
+
 def _failed_parent(p, d, raised, title="Port the parser"):
     """A coordinator code task queued at standard that failed; `raised`: its retry ran a tier up first."""
     import json

@@ -36,7 +36,10 @@ head is work in progress. It gets no review, and its hop takes the branch over (
 it starts from that head) and starts at once: a start_when `landed:` on a task of its own chain could
 never pass, as those commits land only with the hop's own work (own_wait refuses it). The open tasks
 that waited on the split task wait on the hop. The last hop, the first that ends without a split,
-gets the chain's one review (split_hops). The notice, and a local_only notice for a branch its review
+gets the chain's one review (split_hops). A hop that stalls (hop_stall: blocked, waiting on the user,
+on a start_when or deferred past HOP_WAIT_S) carries nothing to review: the split head is reviewed now
+(SPLIT_REVIEW_LABEL; a review moved to the hop waits on the split task again), and the last hop's review
+covers only the commits after it (reviewed_split). The notice, and a local_only notice for a branch its review
 still carries, go to the next digest (NOTICES_KEY) without waking the coordinator. Anything else
 still goes to it.
 
@@ -51,7 +54,7 @@ import re
 import time
 
 from . import gitmemo, headline
-from .db import DB, assigned_tier, continues_id, load_result
+from .db import DB, assigned_tier, continues_id, deferral, load_result
 
 CONT_TITLE = re.compile(r"(?i)^\s*(?:continue|mechanical)\s*:")
 # A hop that only runs checks, pushes or edits spec or PR text: queued at the light tier (hop_tier).
@@ -77,6 +80,8 @@ BRIEF_MAX_LINES = 40   # branch_brief's bound, its header and '+N more files' li
 BRIEF_MAX_RANGES = 8   # hunk ranges listed per file before '...'
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 SPLIT_LABEL = "split:"   # a done code task that ended as a split: split:<its head>
+SPLIT_REVIEW_LABEL = "split_review:"   # a review of a split head on its own, as its hop stalled: split_review:<head>
+HOP_WAIT_S = 3600   # a hop deferred longer than this stalls (hop_stall): its split head is reviewed without it
 # A split hand-off's own words: a summary that opens "Split at/here/..." or names the split line, a head
 # commit subject that says WIP.
 SPLIT_SUMMARY = re.compile(r"(?i)^\W*split\b(?=\s*(?:at|here|mid|after|before|because|per|on|by|[(:;,.]|$))"
@@ -374,6 +379,48 @@ def split_hops(db: DB, task: dict) -> list[dict]:
             break
         out.append(t)
     return out[::-1]
+
+
+def hop_stall(task: dict | None, now: float | None = None) -> str:
+    """Why open hop `task` (a task row) holds its split head's review back no longer, or '' while it runs or
+    starts soon: it is blocked, its waiting hand-off waits on the user's step (unblock.classify_wait), it
+    waits on a start_when probe (a hop otherwise starts at once), or it is deferred past HOP_WAIT_S."""
+    if not task or task.get("status") not in ("queued", "blocked"):
+        return ""
+    if task["status"] == "blocked":
+        return "is blocked (" + headline.clip(str(task.get("blocked_reason") or "no reason given"), 160) + ")"
+    from . import unblock
+    result = load_result(task.get("result"))
+    if result.get("status") == "waiting" and unblock.classify_wait(result)[0] == "user":
+        return "waits on the user (" + headline.clip(str(result.get("waiting_for") or result.get("retry_when")
+                                                         or "a step only the user can take"), 160) + ")"
+    d = deferral(task)
+    if d.get("when"):
+        return "waits on its start_when (" + headline.clip(str(d.get("why") or d["when"]), 160) + ")"
+    now = time.time() if now is None else now
+    later = max(float(task.get("not_before") or 0), float(d.get("after") or 0))
+    return f"is deferred {(later - now) / 3600:.1f} h" if later > now + HOP_WAIT_S else ""
+
+
+def stalled_hop(db: DB, task_id: int, now: float | None = None) -> tuple[dict, str] | None:
+    """The open hop of done split task `task_id` that stalls (hop_stall), with why; None when none does."""
+    for t in db.q("SELECT * FROM tasks WHERE labels LIKE ? AND status IN ('queued','blocked') ORDER BY id",
+                  (f'%"continues:{task_id}"%',)):
+        if continues_id(t) == task_id and (why := hop_stall(t, now)):
+            return t, why
+    return None
+
+
+def reviewed_split(db: DB, hops: list[dict]) -> tuple[int, dict] | None:
+    """(index in `hops`, review) of the last split hop whose head a review of its own (SPLIT_REVIEW_LABEL)
+    took up, running or passed; None when none did: the chain's last hop then reviews the whole chain."""
+    for i in range(len(hops) - 1, -1, -1):
+        head = split_head(hops[i])
+        r = db.one("SELECT * FROM tasks WHERE kind='review' AND status IN ('running','done') AND labels LIKE ? "
+                   "ORDER BY id DESC", (f'%"{SPLIT_REVIEW_LABEL}{head}"%',)) if head else None
+        if r:
+            return i, r
+    return None
 
 
 def own_wait(p, lineage: list[int], probe: str | None) -> str:
