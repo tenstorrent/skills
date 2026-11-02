@@ -27008,6 +27008,7 @@ DURABLE_EXEMPT = {
     ("service.py", "restart.log"): "a log",
     ("deploy.py", 'open(path, "a") as log'): "the takeover log (a host-side takeover's output and its outcome lines); its outcome is the target daemon's reported version",
     ("loopcheck.py", '(repo / "NOTES.md").write_text('): "seed file of doctor --loop's throwaway scratch repo, committed at once; the scratch project is deleted after the check",
+    ("applyff.py", "os.replace(req, taken)"): "claims a fast-forward request for the daemon; a claim lost to a crash only fails the waiting --apply, which leaves main as it was",
     ("service.py", "os.replace(req, taken)"): "claims a restart request for one process; a reboot restarts the daemon anyway",
     ("upstream.py", 'os.replace(src, src.with_name(QUEUED_FILE + ".filed"))'): "marks a run's queued notes filed; a rename lost to a crash only repeats sends that are dropped as duplicates",
     ("upstream.py", 'os.replace(src, src.with_name(ACKS_QUEUED + ".filed"))'): "marks a run's queued acks filed; a rename lost to a crash only records the same ack again, which still closes the item",
