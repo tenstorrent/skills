@@ -865,6 +865,28 @@ def test_a_stop_during_the_between_tick_wait_ends_it_at_once(env, monkeypatch):
     assert time.monotonic() - t0 < 1
 
 
+def test_the_stop_line_is_logged_before_stopping_is_set(env, monkeypatch):
+    # The stop line must be on disk before `stopping` flips: run() returns (and a caller may
+    # read the log) the moment the flag is set. Regression: _on_stop_signal set the flag first,
+    # so a stop asked for from a side thread let run() return before the line was written.
+    import signal as sig
+    from ttp import daemon as dm
+    d = dm.Daemon(make(env).base)
+    seen = []
+
+    def probe_log(proj, msg):
+        seen.append((d.stopping, msg))   # the flag must still be False while the line is written
+        real_log(proj, msg)
+
+    real_log = dm.log
+    monkeypatch.setattr(dm, "log", probe_log)
+    d._on_stop_signal(sig.SIGTERM)
+    assert d.stopping, "the handler did not set stopping"
+    flags = [flag for flag, msg in seen]
+    assert flags == [False], "the flag was set before the stop line was logged"
+    assert "daemon stop requested (SIGTERM, between tick steps)" in (d.p.logs / "daemon.log").read_text()
+
+
 def test_the_unit_gives_the_daemon_an_explicit_stop_timeout_and_keeps_workers(env):
     from ttp import service
     unit = service._unit_text(make(env))

@@ -1033,11 +1033,15 @@ class Daemon:
         """SIGTERM/SIGINT: stop at the end of the running tick step (_run_step skips the rest), and
         end the between-tick wait now, well inside the unit's TimeoutStopSec."""
         first = not self.stopping
-        self.stopping = True
+        # Log before the flag: a real handler runs on the main thread, but a stop may also be
+        # asked for from another thread (the tests do this); once `stopping` is set, run() can
+        # return and the log be read, so the line must already be written. Setting the flag also
+        # ends the between-tick wait, so the wait never ends before its own stop line is logged.
         if first:
             step = self._step_name if self._step_began is not None else ""
             log(self.p, f"daemon stop requested ({signal.Signals(signum).name}"
                         + (f", during tick step {step})" if step else ", between tick steps)"))
+        self.stopping = True
 
     # lifecycle ------------------------------------------------------------------------------------
     def run(self) -> int:
