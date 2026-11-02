@@ -32,6 +32,7 @@ ALERT_SITES = {
     ("userstep.py", "relay"): [("user-blocker", "a user-only step (a sign-in, a device code, a credential) opened")],
     ("watchdog.py", "_recover"): [("outages", "a hung daemon was restarted, or could not be"),
                                   ("outages", "the daemon hung repeatedly")],
+    ("workernotify.py", "_post"): [(WORKER_NOTIFY, "a worker's `ttp notify` held for the coordinator, posted unchanged once its hold ends")],
 }
 
 
