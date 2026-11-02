@@ -942,7 +942,12 @@ queues behind routine work; nothing running is interrupted:
   holds as a busy resource (no attempt spent; `ttp lock` exits 75 with the check's reason, and
   `ttp lock --probe <resource> --task <id>` asks it too; a lock that waited is asked again once taken);
   any other exit or no answer holds as well, for every task on the resource, and raises one observation
-  per resource and exit. The daemon's checks take at most about one timeout per tick. Config `device.locks` (opt-in) names one device by several names: all share the first name's lock and pause, tasks that use one
+  per resource and exit. The daemon's checks take at most about one timeout per tick. Every tick, and
+  each `ttp lock` waiter on every try, releases a harness lock whose recorded holder is dead (pid gone,
+  or reused per its recorded start time) and that no live process of the holder's group keeps; a
+  leftover process of the holder's own run is stopped, any other one is left and named. A waiter queued
+  past `locks.wait_alert_min` (30 min; 0 off) raises one `lock-wait:<lock>` alert per lock naming the
+  holder; it clears when the wait ends. Config `device.locks` (opt-in) names one device by several names: all share the first name's lock and pause, tasks that use one
   get the `needs_device` label, and at most `device.max_tasks` of them run at once (default: one per device resource the
   project has, at most `budget.max_parallel_workers`, at least 2; a set value is kept). A worker starts
   a long job with `ttp detach <name> -- <command>`; a run that ends without a hand-off, or waiting
