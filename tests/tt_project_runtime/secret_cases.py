@@ -1078,17 +1078,29 @@ def test_a_second_sigint_during_the_withdrawal_still_prints_the_report(env, monk
         return real_withdraw(*a, **k)
     monkeypatch.setattr(detach, "withdraw_unstarted", withdraw_with_a_second_sigint)
 
+    # A fresh `ttp` process's SIGINT handler, whatever an earlier test in this process left installed
+    old_int = signal.signal(signal.SIGINT, signal.default_int_handler)
+    queued, give_up = threading.Event(), threading.Event()
+
     def stop():
-        for _ in range(500):
-            if list(queue.glob("*.json")):
-                break
-            threading.Event().wait(0.01)
-        signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)   # as a single-threaded caller sees it
+        # Only once the request is queued (with SIGINT and SIGTERM held, so it waits for the handler):
+        # a signal sent earlier would reach the caller before it set up its own handling.
+        while not give_up.is_set() and not list(queue.glob("*.json")):
+            give_up.wait(0.01)
+        if not give_up.is_set():
+            queued.set()
+            signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)   # as a single-threaded caller sees it
     t = threading.Thread(target=stop, daemon=True)
     t.start()
-    code, out = _env_run(monkeypatch, capfd, "--secret", "jev:key=JK", "--", "true")
-    t.join(10)
+    try:
+        code, out = _env_run(monkeypatch, capfd, "--secret", "jev:key=JK", "--", "true")
+        int_after = signal.getsignal(signal.SIGINT)
+    finally:
+        give_up.set()
+        t.join(10)
+        signal.signal(signal.SIGINT, old_int)
+    assert queued.is_set(), f"the request was never queued: {out}"
     assert code == 128 + signal.SIGINT and "stopped by SIGINT" in out and "nothing ran" in out, out
     _never_ran(p, rd)
-    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler   # both handlers are restored
+    assert int_after is signal.default_int_handler   # both handlers are restored
     assert signal.getsignal(signal.SIGTERM) is not secretroute._raise_stopped
