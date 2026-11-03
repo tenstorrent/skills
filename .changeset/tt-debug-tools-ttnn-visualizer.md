@@ -15,8 +15,9 @@ Not verified on a device: the capture recipe and traps come from tt-metal and
 ttnn-visualizer source and docs, and the tools were exercised against a
 ttnn-visualizer demo report.
 
-`tt-ttnn-flags` now says the report database is written only under pytest, at
-test teardown, and points at the new skill for the keys it needs and how to
-read it; `tt-profiler` points there too. On the Claude host the eval
+`tt-ttnn-flags` now explains automatic report database generation at pytest
+teardown and points at the new skill for the required keys, manual capture
+and import outside pytest, and how to read the report; `tt-profiler` points
+there too. On the Claude host the eval
 harness now isolates the agent from the user's MCP servers and can hand it an
 explicit one with its tools pre-approved, with offline tests.
