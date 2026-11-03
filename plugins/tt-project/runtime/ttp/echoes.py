@@ -37,6 +37,11 @@ that rule still binds, so its copies are right. One the coordinator dropped on i
 WITHDRAWN, and one a record stored before the flag holds is UNVERIFIED (_unsourced). `export` is the read-only full list
 behind `ttp echoes`. Accepted gaps (settled weak-token set): a dashed config-style name with a decimal
 suffix ('max-ratio-1.5') counts as weak; a version joined by '_', '=' or '+' counts as strong (over-flag).
+
+A false positive (code using a name the retired text also holds) can be acknowledged: `ttp echoes --ack
+<retirement> <place>` (acknowledge, ACK_KEY) keeps that one match out of the digest's fix orders while the
+matched line's text is unchanged; it is still counted and listed as acknowledged, and a changed line lists
+it again. The strong/weak rules are untouched by it.
 """
 from __future__ import annotations
 
@@ -54,6 +59,8 @@ SEEN_KEY = "retired_echo_seen"       # kv: {"turn": last_coordinator_turn, "hits
                                      #      "historical": hits declared historical, not listed,
                                      #      "advisory": advisory hits, counted, not listed}
 WITHDRAWN, COMPACTED, SUPERSEDED = "withdrawn", "compacted", "superseded"   # retirement kinds (see the top)
+ACK_KEY = "retired_echo_acks"       # kv: {hit key: sha256 of the matched line when acknowledged}
+ACK_KEEP = 200
 UNVERIFIED = "unverified"
 KINDS = (WITHDRAWN, COMPACTED, SUPERSEDED, UNVERIFIED)
 HISTORICAL_INDEX = "echo_historical.json"   # harness/: {"historical": [{"path", "sha256", "retirement"}]}
@@ -377,6 +384,17 @@ def _line(text: str, phrase: str) -> str:
     return ("..." if start else "") + cut + ("..." if start + LINE_CHARS < len(ln) else "")
 
 
+def _line_sha(text: str, phrase: str) -> str:
+    """The sha256 of the whole line of `text` holding `phrase`, whitespace collapsed (all of it when it spans
+    lines): an acknowledgement holds while it is unchanged."""
+    for ln in text.splitlines():
+        if phrase in _flat(ln):
+            break
+    else:
+        ln = text
+    return hashlib.sha256(" ".join(ln.split()).encode()).hexdigest()
+
+
 def _lineno(text: str, phrase: str) -> int:
     """The 1-based line of `text` holding `phrase` (1 when it spans lines)."""
     for i, ln in enumerate(text.splitlines(), 1):
@@ -518,17 +536,21 @@ def records(p, now: float | None = None) -> list[dict]:
             if isinstance(r, dict) and now - r.get("at", 0) < RETIRED_DAYS * 86400]
 
 
-def scan(p, now: float | None = None, historical: list[dict] | None = None) -> list[dict]:
+def scan(p, now: float | None = None, historical: list[dict] | None = None,
+         acked: list[dict] | None = None) -> list[dict]:
     """The retired texts' echoes: [{"key", "label", "line", "phrase", "source", "retirement", "kind",
     "class", "why"}], newest retirement first. `class` is "directive" (a WITHDRAWN retirement's governing
     phrase: fix it) or "advisory" (another kind, only a _weak or _fragment phrase matched, or a dropped
     unsourced Restrictions item the Brief or a sourced item still states: `why` says which). A hit on
     a file the historical index declares historical for that retirement, with its bytes still hashing to
-    the recorded value, goes to `historical` instead (class "historical")."""
+    the recorded value, goes to `historical` instead (class "historical"); an acknowledged hit whose line is
+    unchanged (ACK_KEY) to `acked` (class "acknowledged")."""
     recs = records(p, now)
     if not recs:
         return []
     index = historical_index(p, recs)
+    acks = p.db.kv(ACK_KEY, {}) or {}
+    acks = acks if isinstance(acks, dict) else {}
     digests: dict[str, str] = {}
     pristine: list[str] = []
     where = [(key, label, text, _flat(text)) for key, label, text in places(p, pristine)]   # flattened once
@@ -564,7 +586,11 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None) -> l
                        else "only a file name, path, version or evidence reference matches")
                 hit = {"key": f"{rec['id']}:{key}", "label": label, "line": _line(text, ph), "phrase": ph,
                        "source": rec.get("source") or "", "retirement": rec["id"], "kind": rec["kind"],
-                       "class": "advisory" if why else "directive", "why": why}
+                       "class": "advisory" if why else "directive", "why": why, "sha": _line_sha(text, ph)}
+                if acks.get(hit["key"]) == hit["sha"]:
+                    if acked is not None:
+                        acked.append(dict(hit, **{"class": "acknowledged"}))
+                    continue
                 shas = index.get(key, {}).get(rec["id"])
                 if shas:
                     if key not in digests:
@@ -581,8 +607,9 @@ def digest_lines(p, now: float | None = None) -> list[str]:
     """The digest's Retired-rule echoes section, at most SECTION_LINES lines; [] when nothing echoes. A
     hit already shown in an earlier turn is marked. Never posts, wakes or holds anything."""
     hist: list[dict] = []
+    acked: list[dict] = []
     try:
-        found = scan(p, now, hist)
+        found = scan(p, now, hist, acked)
     except (OSError, ValueError, TypeError, KeyError, AttributeError):   # a notice never fails the turn
         return []
     hits = [h for h in found if h["class"] == "directive"]
@@ -599,7 +626,7 @@ def digest_lines(p, now: float | None = None) -> list[str]:
     if not hits:   # advisory and historical hits alone order nothing: no section
         return []
     mem = list(dict.fromkeys(h["key"].split(":", 2)[2] for h in hits if h["key"].split(":", 2)[1] == "memory"))
-    room = SECTION_LINES - 1 - bool(mem) - bool(hist) - bool(advisory)
+    room = SECTION_LINES - 1 - bool(mem) - bool(hist) - bool(advisory) - bool(acked)
     shown = hits if len(hits) <= room else hits[:room - 1]
     lines = [RETIRED_HEADER]
     for h in shown:
@@ -618,6 +645,9 @@ def digest_lines(p, now: float | None = None) -> list[str]:
         except ValueError:
             where = HISTORICAL_INDEX
         lines.append(f"- {len(hist)} historical line{'s' if len(hist) != 1 else ''} not shown (declared in {where})")
+    if acked:   # acknowledged as false positives: counted, never silently dropped
+        lines.append(f"- {len(acked)} acknowledged match{'es' if len(acked) != 1 else ''} not shown (`ttp echoes --ack`;"
+                     f" listed again once its line changes)")
     if advisory:   # counted, never a fix order
         lines.append(f"- {advisory} advisory match{'es' if advisory != 1 else ''} not shown: a compacted fact, a "
                      f"superseded coordinator decision, a retirement of unknown origin or only a file name, version "
@@ -626,19 +656,44 @@ def digest_lines(p, now: float | None = None) -> list[str]:
     return lines
 
 
+def acknowledge(p, retirement: str, where: str, now: float | None = None) -> dict:
+    """Acknowledge retirement `retirement`'s current match at `where` (a file's `<path>:<line>`, a place as
+    `ttp echoes` names it, or its key) as no echo: hidden while that line's text is unchanged, listed again
+    once it changes. Stored in the project's kv (ACK_KEY); acks of retirements no longer live are dropped.
+    Raises ValueError when no current match fits."""
+    where = " ".join(where.split())
+    acked: list[dict] = []
+    found = scan(p, now, [], acked)
+    for h in found + acked:
+        if h["retirement"] != retirement:
+            continue
+        place = h["key"].split(":", 1)[1]
+        label = h["label"][5:] if h["label"].startswith("file ") else h["label"]
+        if where in (h["label"], label, place):
+            live = {r.get("id") for r in records(p, now)}
+            acks = p.db.kv(ACK_KEY, {}) or {}
+            acks = {k: v for k, v in (acks if isinstance(acks, dict) else {}).items()
+                    if k.split(":", 1)[0] in live and k != h["key"]}
+            acks[h["key"]] = h["sha"]
+            p.db.set_kv(ACK_KEY, dict(list(acks.items())[-ACK_KEEP:]))
+            return h
+    raise ValueError(f"no current match of retirement {retirement} at {where} (see `ttp echoes`)")
+
+
 def export(p, now: float | None = None) -> dict:
     """Every live retirement and every hit, read-only (nothing stored, posted or counted):
     {"retirements": [{"id", "kind", "at", "source", "retired", "replaced_by", "phrases"}],
     "matches": [{"retirement", "where", "key", "phrase", "line", "class", "action", "why"}], "counts"}.
-    `action` is "fix" for a directive, "none" for an advisory or historical hit."""
+    `action` is "fix" for a directive, "none" for an advisory, historical or acknowledged hit."""
     hist: list[dict] = []
-    found = scan(p, now, hist)
+    acked: list[dict] = []
+    found = scan(p, now, hist, acked)
     recs = sorted(records(p, now), key=lambda r: -r.get("at", 0))
     matches = [{"retirement": h["retirement"], "where": h["label"], "key": h["key"].split(":", 1)[1],
                 "phrase": h["phrase"], "line": h["line"], "class": h["class"],
                 "action": "fix" if h["class"] == "directive" else "none", "why": h.get("why") or ""}
-               for h in found + hist]
-    counts = {c: sum(m["class"] == c for m in matches) for c in ("directive", "advisory", "historical")}
+               for h in found + hist + acked]
+    counts = {c: sum(m["class"] == c for m in matches) for c in ("directive", "advisory", "historical", "acknowledged")}
     return {"retirements": [{"id": r.get("id"), "kind": r["kind"], "at": r.get("at"), "source": r.get("source") or "",
                              "retired": r.get("old") or "", "replaced_by": r.get("new") or "",
                              "phrases": r.get("phrases") or []} for r in recs],
@@ -652,7 +707,7 @@ def export_text(data: dict, tz: str | None = None) -> str:
         return "no live retirements"
     c = data["counts"]
     out = [f"{len(data['retirements'])} retirements; matches: {c['directive']} to fix, {c['advisory']} advisory, "
-           f"{c['historical']} historical"]
+           f"{c['historical']} historical" + (f", {c['acknowledged']} acknowledged" if c.get("acknowledged") else "")]
     by: dict[str, list[dict]] = {}
     for m in data["matches"]:
         by.setdefault(m["retirement"], []).append(m)

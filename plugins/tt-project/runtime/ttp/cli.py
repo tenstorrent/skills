@@ -1830,11 +1830,18 @@ def cmd_audit(a) -> None:
 
 
 def cmd_echoes(a) -> None:
-    """Every retirement and every echo match, read-only (echoes.export): what the digest omits too."""
+    """Every retirement and every echo match (echoes.export): what the digest omits too; `--ack` hides one."""
     from . import echoes
     p = need(a.name, sys.argv[1:]) if a.name else here()
     if not p:
         die("no tt-project project here; name one: `ttp echoes <name>`")
+    if a.ack:
+        try:
+            h = echoes.acknowledge(p, *a.ack)
+        except ValueError as e:
+            die(str(e))
+        print(f"acknowledged: {h['label']} (retirement {h['retirement']}): hidden while that line is unchanged")
+        return
     data = echoes.export(p)
     print(json.dumps(data, indent=1, default=str) if a.json else echoes.export_text(data, timefmt.home(p)))
 
@@ -10335,9 +10342,13 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_audit)
 
     s = sub.add_parser("echoes", help="read-only: every retired rule (its kind, text, replacement, source, time) "
-                                      "and every match, directive, advisory or historical, the digest's omitted ones too")
+                                      "and every match, directive, advisory, historical or acknowledged, the digest's "
+                                      "omitted ones too; --ack hides one false positive")
     s.add_argument("name", nargs="?", help="the project (default: the one here)")
     s.add_argument("--json", action="store_true", help="print JSON")
+    s.add_argument("--ack", nargs=2, metavar=("RETIREMENT", "PLACE"),
+                   help="acknowledge one match as no echo: the retirement id and the place as listed (a file's "
+                        "<path>:<line>); stored in the project's state, hidden until that line's text changes")
     s.set_defaults(fn=cmd_echoes)
 
     s = sub.add_parser("replicate", help="backup copies of the project's state on a standby machine "

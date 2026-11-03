@@ -448,7 +448,7 @@ def test_ttp_echoes_exports_every_retirement_and_match_read_only_including_ones_
     seen = p.db.kv(echoes.SEEN_KEY)
     tasks = p.db.one("SELECT COUNT(*) AS n FROM tasks")["n"]
     data = echoes.export(p)
-    assert data["counts"] == {"directive": 15, "advisory": 15, "historical": 1}, data["counts"]
+    assert data["counts"] == {"directive": 15, "advisory": 15, "historical": 1, "acknowledged": 0}, data["counts"]
     assert {r["id"]: r["kind"] for r in data["retirements"]} == {rec["id"]: echoes.WITHDRAWN,
                                                                   old["id"]: echoes.COMPACTED}
     r0 = next(r for r in data["retirements"] if r["id"] == rec["id"])
@@ -699,3 +699,55 @@ def test_a_dropped_duplicate_of_a_headed_brief_is_no_echo_and_a_user_replacement
     assert lines and lines[0] == echoes.RETIRED_HEADER, lines
     for where in ("charter section 'Goals'", f"memory [{mem.stem}]", f"task #{task} spec"):
         assert any(x.startswith(f"- {where}:") for x in lines), (where, lines)
+
+
+def test_an_acknowledged_false_positive_is_hidden_counted_and_listed_again_once_its_line_changes(env, capsys):
+    import pytest as _pytest
+    from ttp import cli, echoes
+    p = make(env)
+    src = "charter 'Policies' quote replaced"   # withdrawn by the user
+    rec = echoes.record(p.db, src, "Hold every release for the `alpha_gate_flag` sign-off.")
+    other = echoes.record(p.db, src, "Route each build through `beta_field_name` first.")
+    code = p.root / "src" / "client.py"
+    code.parent.mkdir(parents=True)
+    code.write_text("def send(payload):\n    return payload['alpha_gate_flag'], payload['beta_field_name']\n")
+    p.set_config("coordinator.echo_paths", ["src"])
+    task = p.db.add_task("t", "Wait for the alpha_gate_flag before each release.")
+
+    def classes():
+        return {(m["retirement"], m["where"]): m["class"] for m in echoes.export(p)["matches"]}
+    where = "file src/client.py:2"
+    assert classes()[(rec["id"], where)] == "directive" and classes()[(other["id"], where)] == "directive"
+    # A wrong retirement or place is refused; nothing is stored.
+    for bad in ((rec["id"], "src/client.py:1"), ("nope", "src/client.py:2"), (rec["id"], "src/other.py:2")):
+        with _pytest.raises(SystemExit):
+            cli.main(["echoes", "demo", "--ack", *bad])
+    assert not p.db.kv(echoes.ACK_KEY)
+    capsys.readouterr()
+    cli.main(["echoes", "demo", "--ack", rec["id"], "src/client.py:2"])
+    assert "acknowledged: file src/client.py:2" in capsys.readouterr().out
+    # Hidden from the fix orders, still counted and listed as acknowledged; the other retirement's hit on the
+    # same line and the task's copy stay directives.
+    got = classes()
+    assert got[(rec["id"], where)] == "acknowledged" and got[(other["id"], where)] == "directive", got
+    assert got[(rec["id"], f"task #{task} spec")] == "directive", got
+    assert echoes.export(p)["counts"]["acknowledged"] == 1
+    assert where not in {h["label"] for h in echoes.scan(p) if h["retirement"] == rec["id"]}
+    sec = echoes.digest_lines(p)
+    assert not [ln for ln in sec if f"id {rec['id']}" in ln] and [ln for ln in sec if f"id {other['id']}" in ln], sec
+    assert any(ln.startswith("- 1 acknowledged match not shown") for ln in sec), sec
+    cli.main(["echoes", "demo"])
+    assert "1 acknowledged" in capsys.readouterr().out
+    # Acknowledging it again, or by another place form, keeps one entry.
+    echoes.acknowledge(p, rec["id"], where)
+    assert len(p.db.kv(echoes.ACK_KEY)) == 1
+    # The line moves but its text is unchanged: still acknowledged; a non-file place acknowledges by its label.
+    code.write_text("# client\n" + code.read_text())
+    assert classes()[(rec["id"], "file src/client.py:3")] == "acknowledged"
+    echoes.acknowledge(p, rec["id"], f"task #{task} spec")
+    assert classes()[(rec["id"], f"task #{task} spec")] == "acknowledged"
+    # The line's text changes: listed again as a directive.
+    code.write_text(code.read_text().replace("return payload", "return  dict(payload)"))
+    assert classes()[(rec["id"], "file src/client.py:3")] == "directive"
+    p.db.x("UPDATE tasks SET spec=? WHERE id=?", ("Wait for the alpha_gate_flag before every release.", task))
+    assert classes()[(rec["id"], f"task #{task} spec")] == "directive"
