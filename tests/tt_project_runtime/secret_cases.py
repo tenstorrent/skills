@@ -144,7 +144,7 @@ def test_endpoint_verify_never_forwards_the_key_on_a_cross_host_or_downgraded_re
     monkeypatch.setattr(urllib.request.HTTPHandler, "http_open",
                         lambda self, req: calls.append((req.full_url, req.get_header("Authorization"))))
     ok, msg = endpoint.verify(_EP_URL, _EP_KEY)
-    assert not ok and "302 redirect to" in msg and "key not sent" in msg and _EP_KEY not in msg, msg
+    assert not ok and "302 redirect; key not sent" in msg and "example" not in msg and "key not sent" in msg and _EP_KEY not in msg, msg
     assert calls == [(f"{_EP_URL}/models", f"Bearer {_EP_KEY}")]
 
 
@@ -221,7 +221,9 @@ def test_secret_check_lists_served_models_and_flags_a_missing_tier_model(env, mo
     assert _EP_KEY not in text and _EP_URL not in text and "api.example.com" not in text
     # A failed check names neither the key nor the URL or host either.
     for err in (urllib.error.HTTPError(_EP_URL, 404, "gone", {}, None),
-                urllib.error.URLError(f"cannot connect to {_EP_URL} with {_EP_KEY}")):
+                urllib.error.URLError(f"cannot connect to {_EP_URL} with {_EP_KEY}"),
+                urllib.error.URLError("certificate is not valid for 'api.example.com'"),
+                OSError("connect to api.example.com:443 failed")):
         class Bad:
             def open(self, req, timeout=0, _e=err):
                 raise _e
@@ -231,6 +233,42 @@ def test_secret_check_lists_served_models_and_flags_a_missing_tier_model(env, mo
     # Ids only: an answer that is not a list of models gives none, never its text.
     assert endpoint.model_ids({"data": [{"id": "a"}, {"name": "x"}, 3, "b"]}) == ["a", "b"]
     assert endpoint.model_ids({"error": "nope"}) == [] and endpoint.model_ids(None) == []
+
+
+def test_a_models_check_redirect_names_no_host_in_secret_check_or_the_served_record(env, monkeypatch, capsys):
+    """Review #5307: the redirect message named its target host, and only the exact base URL was scrubbed."""
+    import http.server
+    import threading
+    from ttp import cli, endpoint, project, route
+
+    class Moved(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{self.server.server_port}/elsewhere/models")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.HTTPServer(("127.0.0.1", 0), Moved)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        port = str(srv.server_port)
+        monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "redirect-home")
+        endpoint.save("tt-cloud", f"http://127.0.0.1:{port}/v1", _EP_KEY, True, "HTTP 200")
+        with pytest.raises(SystemExit) as e:
+            cli.main(["secret", "check", "tt-cloud"])
+        out = capsys.readouterr()
+        text = out.out + out.err
+        assert e.value.code == 1 and "302 redirect; key not sent" in text, text
+        p = make(env)
+        assert route.refresh_served(p.state, "tt-cloud")
+        raw = (p.state / route.MODELS_FILE).read_text()
+        assert "302 redirect" in raw, raw
+        for leak in ("127.0.0.1", port, _EP_KEY):
+            assert leak not in text and leak not in raw, (leak, text, raw)
+    finally:
+        srv.shutdown()
+        srv.server_close()
 
 
 def test_secret_env_hands_the_key_by_environment_and_masks_the_output(env, monkeypatch, capfd):

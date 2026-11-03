@@ -40,8 +40,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Never follow a redirect: the default handler would resend the Authorization header to the new target."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        host = urllib.parse.urlsplit(newurl).netloc or "another location"
-        raise urllib.error.URLError(f"HTTP {code} redirect to {host}; key not sent")
+        raise urllib.error.URLError(f"HTTP {code} redirect; key not sent")   # no target: it names a host
 
 
 def verify(url: str, key: str, timeout: float = VERIFY_TIMEOUT_S) -> tuple[bool, str]:
@@ -74,11 +73,14 @@ def list_models(url: str, key: str, timeout: float = VERIFY_TIMEOUT_S) -> tuple[
     except urllib.error.HTTPError as e:
         msg = f"HTTP {e.code}" + (f" {e.reason}" if e.reason else "")
     except urllib.error.URLError as e:
-        msg = str(e.reason) if "redirect to" in str(e.reason) else f"cannot reach the endpoint: {e.reason}"
+        msg = str(e.reason) if "redirect; key not sent" in str(e.reason) else f"cannot reach the endpoint: {e.reason}"
     except Exception as e:   # timeouts, bad responses
         msg = f"{type(e).__name__}: {e}"
     msg = msg.replace(key, "<key>") if key else msg
-    return (False, redact.scrub(msg.replace(url, "<url>") if url else msg), None)
+    parts = urllib.parse.urlsplit(url or "")
+    for part in (url, parts.netloc, parts.hostname):   # TLS and socket reasons name the host alone
+        msg = msg.replace(part, "<url>" if part == url else "<host>") if part else msg
+    return (False, redact.scrub(msg), None)
 
 
 def save(alias: str, url: str, key: str, verified: bool, check: str) -> None:
