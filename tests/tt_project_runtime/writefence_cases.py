@@ -79,7 +79,14 @@ def _claude_launch(env, p, cwd):
     tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
     rid = d.start_run("worker", "go", "claude", "light", str(cwd), task=p.db.task(tid))
     (p.runs / str(rid) / "STOP").touch()
-    return json.loads((p.runs / str(rid) / "run.json").read_text())
+    spec = json.loads((p.runs / str(rid) / "run.json").read_text())
+    pid = int((p.runs / str(rid) / "runner.pid").read_text().split()[0])
+    try:   # the launch is what is checked: stop the runner this test started (its own session)
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    os.waitpid(pid, 0)
+    return spec
 
 
 def test_daemon_fences_claude_workers_and_observes_a_missing_dependency_once(env, monkeypatch):
