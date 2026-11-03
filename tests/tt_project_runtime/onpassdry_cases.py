@@ -25,20 +25,20 @@ def _last_run(p, tid):
     return p.db.one("SELECT * FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
 
 
-def test_an_on_pass_cmd_whose_dry_run_crashes_hands_the_run_back_to_its_session_once(env, monkeypatch):
+def test_an_on_pass_cmd_that_cannot_run_as_written_hands_the_run_back_to_its_session_once(env, monkeypatch):
     p = make(env)
     from ttp import onpassdry
     from ttp.daemon import Daemon
     _sessions(env, monkeypatch, "s1")
     d = Daemon(p.base)
-    t = _hand_off_waiting(env, p, d, monkeypatch, "python3 -c 'import no_such_mod_xyz'")
+    t = _hand_off_waiting(env, p, d, monkeypatch, "bash no_such_script_xyz.sh")
     res = load_result(t["result"])
     assert t["status"] == "queued" and (t["not_before"] or 0) <= time.time() + 1, dict(t)
     assert res[onpassdry.KEY]["session"] == "s1" and "waiting_since" not in res
-    assert "ModuleNotFoundError" in res["woke"] and "no_such_mod_xyz" in res["woke"]
+    assert "no_such_script_xyz.sh: no such file" in res["woke"] and "cannot run as written" in res["woke"]
     first = _last_run(p, t["id"])
     got = json.loads((pathlib.Path(first["dir"]) / onpassdry.FILE).read_text())
-    assert got["verdict"] == "crash" and got["rc"] == 1 and got["session"] == "s1"
+    assert got["verdict"] == onpassdry.CRASH and got["rc"] is None and got["session"] == "s1"
     back = d._resumable(t, "fake")
     assert back["cause"] == "dry_run" and back["session"] == "s1" and back["run"] == first["id"]
     # Its next run continues the same session and is told why its hand-off was not taken.
@@ -48,66 +48,128 @@ def test_an_on_pass_cmd_whose_dry_run_crashes_hands_the_run_back_to_its_session_
     run_dir = pathlib.Path(run["dir"])
     assert json.loads((run_dir / "run.json").read_text())["argv"][-2:] == ["--resume", "s1"]
     prompt = (run_dir / "prompt.md").read_text()
-    assert "was not taken" in prompt and "ModuleNotFoundError" in prompt and "do not start them again" in prompt
+    assert "was not taken" in prompt and "no_such_script_xyz.sh" in prompt and "do not start them again" in prompt
     _finish_runs(p, d)
     # The handed-back run hands off the same: once per hand-off, so it stands now with a warning.
     t = p.db.task(t["id"])
     res = load_result(t["result"])
     assert t["status"] == "queued" and res.get("waiting_since"), dict(t)
-    assert onpassdry.KEY not in res and res[onpassdry.NOTE_KEY].startswith("WARNING: on_pass_cmd dry run crashed")
-    assert res["summary"].startswith("WARNING: on_pass_cmd dry run crashed (exit 1)"), res["summary"]
-    assert "WARNING: on_pass_cmd dry run crashed" in (run_dir / "progress.md").read_text()
+    assert onpassdry.KEY not in res and res[onpassdry.NOTE_KEY].startswith("WARNING: on_pass_cmd cannot run as written")
+    assert res["summary"].startswith("WARNING: on_pass_cmd cannot run as written"), res["summary"]
+    assert "WARNING: on_pass_cmd cannot run as written" in (run_dir / "progress.md").read_text()
     assert d._resumable(t, "fake") is None
 
 
-def test_a_crashing_dry_run_with_no_session_to_continue_keeps_the_hand_off_with_a_warning(env, monkeypatch):
+def test_a_failed_dry_run_with_no_session_to_continue_keeps_the_hand_off_with_a_warning(env, monkeypatch):
     p = make(env)
     from ttp import onpassdry
     from ttp.daemon import Daemon
     monkeypatch.delenv("TTP_FAKE_SESSIONS", raising=False)
     d = Daemon(p.base)
-    t = _hand_off_waiting(env, p, d, monkeypatch, "exit 127")
+    t = _hand_off_waiting(env, p, d, monkeypatch, "no_such_prog_xyz --publish")
     res = load_result(t["result"])
     assert t["status"] == "queued" and res.get("waiting_since") and onpassdry.KEY not in res
-    assert res[onpassdry.NOTE_KEY].startswith("WARNING: on_pass_cmd dry run crashed (exit 127)")
+    assert res[onpassdry.NOTE_KEY].startswith("WARNING: on_pass_cmd cannot run as written")
+    assert "no_such_prog_xyz: command not found" in res[onpassdry.NOTE_KEY]
     assert res["summary"].startswith("WARNING:") and "job runs" in res["summary"]
     assert (t["not_before"] or 0) > time.time() + 300, "the hand-off's retry_after_s stands"
 
 
-def test_a_dry_run_that_exits_early_on_its_variable_leaves_the_hand_off_as_is(env, monkeypatch):
+_WRITES_DONE = 'printf \'{"status":"done","summary":"published"}\' > "$TTP_RESULT"'
+
+
+def test_the_dry_run_never_runs_the_on_pass_cmd_even_one_that_checks_its_variable(env, monkeypatch, tmp_path):
+    # An on_pass_cmd is often a publish step: run at hand-off, it published a head whose checks then failed.
     p = make(env)
     from ttp import onpassdry
     from ttp.daemon import Daemon
     _sessions(env, monkeypatch, "s1")
     d = Daemon(p.base)
-    cmd = '[ "$TTP_ON_PASS_DRY_RUN" = 1 ] && exit 0; exit 1'
-    t = _hand_off_waiting(env, p, d, monkeypatch, cmd)
-    res = load_result(t["result"])
-    assert onpassdry.KEY not in res and onpassdry.NOTE_KEY not in res and res.get("waiting_since")
-    assert res["summary"] == "job runs"
-    got = json.loads((pathlib.Path(_last_run(p, t["id"])["dir"]) / onpassdry.FILE).read_text())
-    assert got["verdict"] == "ok" and got["rc"] == 0 and got["cmd"] == cmd
+    marker = tmp_path / "published"
+    for i, cmd in enumerate((f"touch {marker}; {_WRITES_DONE}",
+                             f'[ "$TTP_ON_PASS_DRY_RUN" = 1 ] && exit 0; touch {marker}; {_WRITES_DONE}')):
+        t = _hand_off_waiting(env, p, d, monkeypatch, cmd, title=f"case {i}")
+        res = load_result(t["result"])
+        assert not marker.exists(), f"the dry run ran {cmd!r}"
+        assert onpassdry.KEY not in res and onpassdry.NOTE_KEY not in res and res.get("waiting_since")
+        assert res["summary"] == "job runs"
+        got = json.loads((pathlib.Path(_last_run(p, t["id"])["dir"]) / onpassdry.FILE).read_text())
+        assert got["verdict"] == "ok" and got["rc"] is None and got["cmd"] == cmd, got
 
 
-def test_a_dry_run_that_fails_or_times_out_is_inconclusive_and_the_hand_off_stands(env, monkeypatch, tmp_path):
+def test_an_on_pass_cmd_runs_only_after_its_checks_pass_never_at_hand_off_or_after_they_fail(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import onpassdry, daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    marker = tmp_path / "published"
+    cmd = f"touch {marker}; {_WRITES_DONE}"
+    for rc in ("1", "killed", "0"):
+        # Handed off while its checks run (no checks.rc yet): the dry run reads the command, runs nothing.
+        tid, _ = _checks_wait_task(p, tmp_path, DONE_ON_PASS, rc=None, on_pass_cmd=cmd)
+        run_dir = tmp_path / f"run-{tid}"
+        from ttp import cli, runner
+        (run_dir / cli.CHECKS_PID).write_text(json.dumps({"pid": os.getpid(),   # still running
+                                                          "started": runner.proc_start(os.getpid())}))
+        d._dry_run_on_pass(dict(p.db.one("SELECT * FROM runs WHERE task=?", (tid,))), run_dir, "")
+        assert json.loads((run_dir / onpassdry.FILE).read_text())["verdict"] == "ok"
+        assert not marker.exists(), "the dry run ran the on_pass_cmd at hand-off"
+        _settle_on_pass(d, tid)
+        assert not marker.exists(), "it ran while its checks ran"
+        assert "woke" not in load_result(p.db.task(tid)["result"]), "its wait ended while its checks ran"
+        (run_dir / cli.CHECKS_PID).unlink()
+        (run_dir / "checks.rc").write_text(f"{rc}\n")
+        if rc == "0":
+            (run_dir / "checks.json").write_text(json.dumps({**json.loads((run_dir / "checks.json").read_text()),
+                                                             "passed": True}))
+        _settle_on_pass(d, tid)
+        task = p.db.task(tid)
+        if rc != "0":
+            assert not marker.exists(), f"it ran after its checks ended {rc}"
+            assert task["status"] != "done" and f"its checks failed" in load_result(task["result"])["woke"]
+        else:
+            assert marker.exists(), "it did not run once its checks passed"
+            assert task["status"] == "done" and load_result(task["result"])["summary"] == "published"
+
+
+def test_an_on_pass_cmd_never_runs_when_its_checks_left_no_record_or_none_for_its_head(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    marker = tmp_path / "published"
+    cmd = f"touch {marker}; {_WRITES_DONE}"
+    # No checks.pid and no checks.rc: `ttp checks --result` passes ("no detached checks recorded").
+    tid, _ = _checks_wait_task(p, tmp_path, DONE_ON_PASS, rc=None, on_pass_cmd=cmd)
+    _settle_on_pass(d, tid)
+    task = p.db.task(tid)
+    assert not marker.exists() and task["status"] == "queued"
+    assert "its checks left no passing result" in load_result(task["result"])["woke"]
+    # Exit 0 with no on_pass: it still runs only for a pass on the head still checked out.
+    tid, path = _checks_wait_task(p, tmp_path, rc="0", on_pass_cmd=cmd)
+    (path / "fix.txt").write_text("changed after its checks\n")
+    _settle_on_pass(d, tid)
+    task = p.db.task(tid)
+    assert not marker.exists() and task["status"] == "queued"
+    assert "its on_pass was not applied" in load_result(task["result"])["woke"]
+    (path / "fix.txt").write_text("fixed\n")
+    p.db.update_task(tid, status="queued", not_before=time.time() + 3600,
+                     result=json.dumps({k: v for k, v in load_result(task["result"]).items() if k != "woke"}))
+    _settle_on_pass(d, tid)
+    assert marker.exists() and p.db.task(tid)["status"] == "done"
+
+
+def test_a_dry_run_check_that_times_out_is_inconclusive_and_the_hand_off_stands(env, monkeypatch):
     p = make(env)
     from ttp import onpassdry
     from ttp.daemon import Daemon
     _sessions(env, monkeypatch, "s1")
     d = Daemon(p.base)
-    t = _hand_off_waiting(env, p, d, monkeypatch, "exit 1")
+    d.cfg["waiting"]["on_pass_dry_run_timeout_s"] = 1e-9
+    t = _hand_off_waiting(env, p, d, monkeypatch, "bash no_such_script_xyz.sh")
     res = load_result(t["result"])
-    assert res[onpassdry.NOTE_KEY] == "dry run inconclusive (exit 1)" and onpassdry.KEY not in res
-    assert res.get("waiting_since") and res["summary"] == "job runs"
-    # A timeout kills the command's whole group and is no crash.
-    got = onpassdry.run("sleep 5", tmp_path, dict(os.environ), timeout=0.5)
-    assert got["rc"] is None and got["verdict"] == "inconclusive" and got["took_s"] < 4
-    assert onpassdry.inconclusive(got).startswith("dry run inconclusive (timed out after")
-    # Crash signatures: output, or a shell's own exit codes; any other exit is not one.
-    assert onpassdry.classify(0, "Traceback (most recent call last):\n") == "crash"
-    assert onpassdry.classify(1, "sh: 1: nope: command not found") == "crash"
-    assert onpassdry.classify(2, "") == "crash" and onpassdry.classify(126, "") == "crash"
-    assert onpassdry.classify(3, "checks failed") == "inconclusive" and onpassdry.classify(0, "ok") == "ok"
+    assert res[onpassdry.NOTE_KEY].startswith("dry run inconclusive (its check timed out"), res
+    assert onpassdry.KEY not in res and res.get("waiting_since") and res["summary"] == "job runs"
 
 
 def test_the_dry_run_can_be_switched_off(env, monkeypatch):
@@ -117,7 +179,7 @@ def test_the_dry_run_can_be_switched_off(env, monkeypatch):
     _sessions(env, monkeypatch, "s1")
     d = Daemon(p.base)
     d.cfg["waiting"]["on_pass_dry_run"] = False
-    t = _hand_off_waiting(env, p, d, monkeypatch, "python3 -c 'import no_such_mod_xyz'")
+    t = _hand_off_waiting(env, p, d, monkeypatch, "bash no_such_script_xyz.sh")
     res = load_result(t["result"])
     assert not (pathlib.Path(_last_run(p, t["id"])["dir"]) / onpassdry.FILE).exists()
     assert onpassdry.KEY not in res and onpassdry.NOTE_KEY not in res and res.get("waiting_since")
@@ -156,16 +218,16 @@ def test_an_on_pass_cmd_that_exits_0_without_writing_ttp_result_is_handed_back_a
     t = _hand_off_waiting(env, p, d, monkeypatch, "echo checked")
     res = load_result(t["result"])
     assert t["status"] == "queued" and res[onpassdry.KEY]["session"] == "s1" and "waiting_since" not in res
-    assert res[onpassdry.KEY]["no_result"] and "without writing a hand-off to $TTP_RESULT" in res["woke"]
+    assert res[onpassdry.KEY]["no_result"] and "writes a hand-off to $TTP_RESULT" in res["woke"]
     got = json.loads((pathlib.Path(_last_run(p, t["id"])["dir"]) / onpassdry.FILE).read_text())
-    assert got["verdict"] == onpassdry.NO_RESULT and got["rc"] == 0 and got["wrote"] is None
+    assert got["verdict"] == onpassdry.NO_RESULT and got["rc"] is None and onpassdry.said(got) == "checked, not run"
     assert d._resumable(t, "fake")["cause"] == "dry_run"
     # The handed-back run hands off the same: it stands now, with the reason in its summary.
     d.dispatch()
     _finish_runs(p, d)
     res = load_result(p.db.task(t["id"])["result"])
     assert res.get("waiting_since") and onpassdry.KEY not in res
-    assert res["summary"].startswith("WARNING: on_pass_cmd dry run: it exited 0 without writing"), res["summary"]
+    assert res["summary"].startswith("WARNING: on_pass_cmd dry run: nothing in it"), res["summary"]
 
 
 def test_a_checks_result_wait_counts_its_on_pass_fallback_only_when_that_on_pass_is_valid(env, monkeypatch, tmp_path):
@@ -185,7 +247,7 @@ def test_a_checks_result_wait_counts_its_on_pass_fallback_only_when_that_on_pass
         got = json.loads((pathlib.Path(_last_run(p, t["id"])["dir"]) / onpassdry.FILE).read_text())
         if handed_back:
             assert got["verdict"] == onpassdry.NO_RESULT and res[onpassdry.KEY]["no_result"], (on_pass, got)
-            assert "without writing a hand-off to $TTP_RESULT" in res["woke"]
+            assert "writes a hand-off to $TTP_RESULT" in res["woke"]
         else:
             assert got["verdict"] == "ok" and onpassdry.KEY not in res and res.get("waiting_since"), (on_pass, got)
 
@@ -201,7 +263,7 @@ def test_a_valid_on_pass_cmd_passes_its_dry_run_and_still_records_done_model_fre
     res = load_result(t["result"])
     assert onpassdry.KEY not in res and onpassdry.NOTE_KEY not in res and res.get("waiting_since")
     got = json.loads((pathlib.Path(_last_run(p, t["id"])["dir"]) / onpassdry.FILE).read_text())
-    assert got["verdict"] == "ok" and got["wrote"] == {"status": "done", "keys": ["status", "summary"]}
+    assert got["verdict"] == "ok" and got["rc"] is None and "shell syntax" in got["checked"]
     _settle_on_pass(d, t["id"])
     task = p.db.task(t["id"])
     res = load_result(task["result"])
@@ -230,29 +292,44 @@ def test_an_on_pass_cmd_that_sets_ttp_result_itself_is_not_dry_run_and_is_handed
         assert not onpassdry.sets_result(cmd), cmd
 
 
-def test_an_exit_0_dry_run_is_judged_on_what_it_wrote_and_on_a_deliberate_early_exit(env, tmp_path):
+def test_the_dry_run_check_reads_programs_scripts_and_variables_without_running_them(env, tmp_path):
     from ttp import onpassdry
-    from ttp.daemon import WAIT_KEYS, _checks_result_wait
-    env_ = dict(os.environ)
+    e = {k: v for k, v in os.environ.items() if k not in ("TTP_RUN_DIR", "TTP_RUN_ID")}
+    e["HOME"] = str(tmp_path)
+    marker = tmp_path / "published"
 
-    def why(cmd, fallback=False):
-        return onpassdry.no_result(onpassdry.run(cmd, tmp_path, env_, 10), cmd, tmp_path, fallback, WAIT_KEYS)
-    assert "without writing a hand-off" in why("true")
-    assert why('printf \'{"status":"done","summary":"s"}\' > "$TTP_RESULT"') == ""
-    # A final hand-off that carries a wait is refused once the probe passes: so is its dry run.
-    assert "carries retry_after_s" in why('echo \'{"status":"done","summary":"s","retry_after_s":60}\' > "$TTP_RESULT"')
-    assert "no JSON object" in why('echo "[1]" > "$TTP_RESULT"') and "no JSON object" in why('echo x > "$TTP_RESULT"')
-    # A failed dry run stays inconclusive, as before; a `ttp checks --result` wait falls back to its on_pass.
-    assert why("exit 1") == "" and why("true", fallback=True) == ""
-    assert _checks_result_wait("ttp checks --result /r/1") and not _checks_result_wait("ttp checks --result /r/1 && true")
-    # A script that exits early on the dry run's variable on purpose, by absolute or relative path.
-    early = tmp_path / "on_pass.py"
-    early.write_text("import os, sys\nif os.environ.get('TTP_ON_PASS_DRY_RUN'):\n    sys.exit(0)\n")
-    plain = tmp_path / "plain.sh"
-    plain.write_text("echo nothing\n")
-    assert why(f"python3 {early}") == "" and why("python3 on_pass.py") == ""
-    assert "without writing" in why(f"bash {plain}") and "without writing" in why(f"true --script={plain}")
-    assert "without writing" in why("true " + "x" * 5000)   # a word too long for a path is no script
+    def verdict(cmd, fallback=False):
+        got = onpassdry.check(cmd, tmp_path, e, fallback, 30)
+        assert got["rc"] is None and not marker.exists(), (cmd, got)
+        return got["verdict"]
+
+    def script(name, text, mode=0o755):
+        (tmp_path / name).write_text(text)
+        (tmp_path / name).chmod(mode)
+    script("good.sh", f"#!/bin/sh\ntouch {marker}\n{_WRITES_DONE}\n")
+    script("good.py", f"import os\nopen({str(marker)!r}, 'w')\nopen(os.environ['TTP_RESULT'], 'w').write('{{}}')\n")
+    script("bad.sh", "#!/bin/sh\nif then\n")
+    script("bad.py", "def f(:\n")
+    script("noexec.sh", f"#!/bin/sh\n{_WRITES_DONE}\n", 0o644)
+    script("plain.sh", f"#!/bin/sh\ntouch {marker}\n")
+    for cmd in (f"touch {marker}; {_WRITES_DONE}", "bash good.sh", "./good.sh", "~/good.sh", "python3 good.py",
+                f"python3 -u {tmp_path}/good.py", "timeout -s KILL 60 env A=1 ./good.sh 2>&1 | tee log",
+                f'[ -n "$TTP_ON_PASS_DRY_RUN" ] || touch {marker}; ./good.sh', "true --script=good.py",
+                "python3 -m some_publisher", "x=$(cat good.sh); true", "cd sub && ./missing.sh"):
+        assert verdict(cmd) == "ok", cmd
+    # Cannot run as written: a parse error, a missing or non-executable program or script, a script
+    # that does not parse, a run-only variable (unset once its probe passes), a missing input.
+    for cmd in ("if true; then touch x", "bash missing.sh", "./missing.sh", "no_such_prog_xyz", "python3 bad.py",
+                "./bad.sh", "bash bad.sh", ". ./bad.sh", "./noexec.sh", "A=1 ./missing.sh > out 2>&1",
+                f"echo $TTP_RUN_DIR; {_WRITES_DONE}", f"echo ${{TTP_RUN_ID}}; {_WRITES_DONE}",
+                'cat < missing.json > "$TTP_RESULT"'):
+        assert verdict(cmd) == onpassdry.CRASH, cmd
+    # Nothing in it writes a hand-off; a `ttp checks --result` wait's valid on_pass is its fallback.
+    for cmd in ("true", "bash plain.sh", "python3 -c 'print(1)'", "true " + "x" * 5000):
+        assert verdict(cmd) == onpassdry.NO_RESULT, cmd
+    assert verdict("true", fallback=True) == "ok"
+    # A check that runs out of time is inconclusive, never a crash.
+    assert onpassdry.check("bash missing.sh", tmp_path, e, False, 0)["verdict"] == "inconclusive"
 
 
 def test_an_empty_on_pass_cmd_names_none_so_a_passed_check_records_on_pass(env, monkeypatch):

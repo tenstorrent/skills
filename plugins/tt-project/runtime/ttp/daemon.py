@@ -4875,7 +4875,7 @@ class Daemon:
                 result, summary = self._dry_run_verdict(r, task, result, run_dir, extra, summary)
                 if onpassdry.KEY in extra:
                     not_before = time.time()
-                    reason = (f"its on_pass_cmd dry run {'failed its contract' if extra[onpassdry.KEY].get('no_result') else 'crashed'}; "
+                    reason = (f"its on_pass_cmd dry run {'failed its contract' if extra[onpassdry.KEY].get('no_result') else 'found it cannot run'}; "
                               f"handed back to its session to fix")
             if new == "blocked":
                 # A block is the coordinator's to decide: whoever requeues it starts the count over.
@@ -8256,7 +8256,7 @@ class Daemon:
         real progress and its agent session can be continued in the same working directory: a fresh
         start would pay again for everything that run read and did. None otherwise: failed,
         timed-out and finished runs never resume, nor does a run whose hand-off stands, except one
-        handed back because its on_pass_cmd's dry run crashed (onpassdry.KEY)."""
+        handed back because its on_pass_cmd's dry run found it cannot run (onpassdry.KEY)."""
         back = load_result(task["result"]).get(onpassdry.KEY)
         if isinstance(back, dict):
             r = self.p.db.one("SELECT * FROM runs WHERE id=?", (back.get("run"),))
@@ -11280,6 +11280,11 @@ class Daemon:
                 return
         if got:
             why += f"; its on_pass was not applied: {got[1]}"
+        elif _checks_result_wait(load_result(task["result"]).get("retry_when")) \
+                and load_result(task["result"]).get("on_pass_cmd") is not None:
+            # A publish step waits on a pass: checks that left no exit code (never recorded, killed
+            # before they wrote one) or are not this task's are none.
+            why += "; its on_pass_cmd was not run: its checks left no passing result for this task"
         else:
             try:
                 started = self._start_on_pass(task, now, said=why)
@@ -11600,13 +11605,13 @@ class Daemon:
     def _dry_run_verdict(self, r: dict, task: dict, result: dict, run_dir: Path, extra: dict,
                          summary: str) -> tuple[dict, str]:
         """What a waiting hand-off's on_pass_cmd dry run (_dry_run_on_pass) does to it, in `extra`: a
-        crash hands the run back to its own session at once (onpassdry.KEY; once per hand-off), or,
-        where that cannot be, keeps the hand-off with a warning in its summary and the task's notes; a
-        timeout or other non-zero exit records 'dry run inconclusive'. Returns the result and summary."""
+        command that cannot run as written hands the run back to its own session at once (onpassdry.KEY;
+        once per hand-off), or, where that cannot be, keeps the hand-off with a warning in its summary and
+        the task's notes; a check that timed out records 'dry run inconclusive'. Returns the result and summary."""
         got = onpassdry.load(run_dir, result.get("on_pass_cmd"))
         if not got or got.get("verdict") == "ok":
             return result, summary
-        if got.get("verdict") not in ("crash", onpassdry.NO_RESULT):
+        if got.get("verdict") not in (onpassdry.CRASH, onpassdry.NO_RESULT):
             extra[onpassdry.NOTE_KEY] = onpassdry.inconclusive(got)
             return result, summary
         if got.get("session") and not load_result(task["result"]).get(onpassdry.KEY):
@@ -11617,7 +11622,7 @@ class Daemon:
             extra.update({onpassdry.KEY: {"run": r["id"], "session": got["session"], "text": text,
                                           "no_result": got.get("verdict") == onpassdry.NO_RESULT},
                           "woke": text, "escalated_wake": True})
-            log(self.p, f"task {task['id']} on_pass_cmd dry run {'crashed' if got['verdict'] == 'crash' else 'failed its contract'}; "
+            log(self.p, f"task {task['id']} on_pass_cmd dry run {'found it cannot run' if got['verdict'] == onpassdry.CRASH else 'failed its contract'}; "
                         f"handed back to session {got['session']}")
             return {**result, "wake_tier": tier}, summary
         warn = onpassdry.warning(got)
@@ -11831,11 +11836,12 @@ class Daemon:
             return None
         full = _read_result(run_dir / RESULT_FILE) or {}
         on_pass = full["on_pass"] if "on_pass" in full else default_on_pass(task, full)
-        if on_pass is None:
+        if on_pass is None and prev.get("on_pass_cmd") is None:
             return None
         if full.get("status") != "waiting" or not _same_probe(full, prev):
             return "unclear", "the run's result.json is not the hand-off the task waits on"
-        problem = on_pass_problem(on_pass)
+        # An on_pass_cmd with no on_pass still runs only for a pass on the head still checked out.
+        problem = on_pass_problem(on_pass) if on_pass is not None else ""
         if problem:
             return "unclear", problem
         head = _checked_head(run_dir, task)
@@ -11860,9 +11866,10 @@ class Daemon:
         return env
 
     def _dry_run_on_pass(self, r: dict, run_dir: Path, session: str) -> None:
-        """A run that handed off `waiting` with an on_pass_cmd: that command's dry run (onpassdry), now,
-        before the transaction that records the hand-off reads it, with whether the run's agent session
-        can be continued to fix a crash. Once per run and command; any error leaves the hand-off as is."""
+        """A run that handed off `waiting` with an on_pass_cmd: that command's dry run (onpassdry.check:
+        read, never run), now, before the transaction that records the hand-off reads it, with whether the
+        run's agent session can be continued to fix it. Once per run and command; any error leaves the
+        hand-off as is."""
         try:
             result = _read_result(run_dir / RESULT_FILE)
             cmd = result.get("on_pass_cmd") if isinstance(result, dict) else None
@@ -11875,15 +11882,14 @@ class Daemon:
                 got = onpassdry.refused(cmd, "it sets TTP_RESULT itself, but the daemon reads only the $TTP_RESULT "
                                              "it sets (its on_pass folder), so what it writes is never recorded")
             else:
-                got = onpassdry.run(cmd, self.p.root, self._on_pass_env(r["task"]), onpassdry.timeout_s(self.cfg))
                 # As at probe pass (_checks_wait): on_pass is its fallback only after a `ttp checks --result`
                 # wait, and only an on_pass that on_pass_problem accepts.
                 fallback = _checks_result_wait(result.get("retry_when")) and "on_pass" in result \
                     and not on_pass_problem(result["on_pass"])
-                why = onpassdry.no_result(got, cmd, self.p.root, fallback, WAIT_KEYS)
-                if why:
-                    got.update(verdict=onpassdry.NO_RESULT, why=why)
-            if got["verdict"] in ("crash", onpassdry.NO_RESULT) and session:
+                # Checked, never run: it may publish, and it must not before its probe passes.
+                got = onpassdry.check(cmd, self.p.root, self._on_pass_env(r["task"]), fallback,
+                                      onpassdry.timeout_s(self.cfg))
+            if got["verdict"] in (onpassdry.CRASH, onpassdry.NO_RESULT) and session:
                 spec = _read_result(run_dir / "run.json") or {}
                 cwd, env = str(spec.get("cwd") or ""), spec.get("env") if isinstance(spec.get("env"), dict) else {}
                 prov = get_provider(r["provider"])

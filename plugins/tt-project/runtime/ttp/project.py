@@ -147,7 +147,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "workstation": None,
                 # a waiting hand-off's on_pass_cmd, run model-free once its probe passes, is killed after
                 "on_pass_timeout_s": 600,
-                # and dry-run once (TTP_ON_PASS_DRY_RUN=1, this many seconds) when its run hands off, so a
+                # and dry-run once (checked, never run; this many seconds) when its run hands off, so a
                 # command that cannot run is fixed in that run's session, not after a wake (onpassdry.py)
                 "on_pass_dry_run": True, "on_pass_dry_run_timeout_s": 30,
                 # detached jobs' use of what they asked for (jobuse.py): sampled every sample_s; cores
