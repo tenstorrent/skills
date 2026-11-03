@@ -132,6 +132,12 @@ ASK_STOP = frozenset("""
     alternative task tasks user project restriction restrictions charter policy policies rule rules allowed
     forbids forbidden prohibits prohibited""".split())
 ASK_WORDS = 3   # shared subject words that make a message touch an open ask
+# A correction's subject test (_about) drops the project's common words first: the subject words of at
+# least COMMON_SHARE of its last COMMON_TASKS task titles and specs, and of COMMON_MIN+ of them
+# (the project's name, 'plugin', 'draft', 'device'). Sharing only those names no common subject.
+COMMON_TASKS = 200
+COMMON_SHARE = 0.1
+COMMON_MIN = 5
 _URL = re.compile(r"\b(?:https?://|www\.)\S+|\b[\w-]+(?:\.[\w-]+)+/\S*", re.I)
 _ASK_CITE = re.compile(r"\bask\s*[#:]\s*(\d+)\b", re.I)   # a record naming the ask it answered
 CLAIM_KEYS = ("tried", "cells", "results", "rows")   # hand-off fields whose dict rows may name a run
@@ -320,9 +326,10 @@ def _about(db: DB, mid: int, cls):
     """Whether a task's title and spec (one string) are about correction message `mid` of class `cls`:
     it cites the message ('correction #<id>', 'msg #<id>', 'message #<id>'), names a class anchor, or
     shares ASK_WORDS+ subject words with the message. A class of number anchors only ('#<n>', 'msg#<n>')
-    names no anchor a task can match: a task cites task and PR numbers for other reasons too."""
+    names no anchor a task can match: a task cites task and PR numbers for other reasons too. The
+    project's common words (_common) are no subject words."""
     said = db.one("SELECT text FROM messages WHERE id=?", (int(mid),))
-    words = ask_words(said["text"]) if said else set()
+    words = ask_words(said["text"]) - _common(db) if said else set()
     cite = re.compile(rf"\b(?:correction|msg|message)\s*#?{int(mid)}\b", re.I)
     cls = _specific(cls)
     terms = [a.removeprefix("key:") for a in cls if not a.startswith("msg#")] \
@@ -330,6 +337,18 @@ def _about(db: DB, mid: int, cls):
     return lambda text: bool(
         cite.search(text) or any(re.search(rf"(?<![\w.]){re.escape(t)}(?![\w.]*\w)", text.lower()) for t in terms)
         or len(words & ask_words(text)) >= ASK_WORDS)
+
+
+def _common(db: DB) -> set[str]:
+    """The subject words (ask_words) common across the project's recent tasks: in COMMON_MIN+ and at least
+    COMMON_SHARE of its last COMMON_TASKS titles and specs."""
+    rows = db.q("SELECT title, spec FROM tasks ORDER BY id DESC LIMIT ?", (COMMON_TASKS,))
+    seen: dict[str, int] = {}
+    for r in rows:
+        for w in ask_words(f"{r['title'] or ''}\n{r['spec'] or ''}"):
+            seen[w] = seen.get(w, 0) + 1
+    bar = max(COMMON_MIN, COMMON_SHARE * len(rows))
+    return {w for w, n in seen.items() if n >= bar}
 
 
 def _later_fix(db: DB, rec: dict) -> str:

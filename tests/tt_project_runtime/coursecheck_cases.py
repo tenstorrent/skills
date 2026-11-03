@@ -519,3 +519,29 @@ def test_recurring_counts_a_correction_only_when_said_after_the_prior_fix_and_no
         assert line() == [], title
         p.db.x("UPDATE tasks SET status='cancelled' WHERE id=?", (tid,))
     assert len(line()) == 1
+
+
+def test_a_correction_sharing_only_the_projects_common_words_with_a_task_credits_no_class_fix(env):
+    """Words most of the project's tasks use ('widgets', 'plugin', 'draft', 'device') name no correction's
+    subject: a task sharing only those with the correction is no class fix, by class_fix or _later_fix; a
+    task sharing its own subject words still is."""
+    from ttp import correction
+    p = make(env)
+    for i, topic in enumerate(("release notes", "install script", "chat relay", "spend report", "web page",
+                               "lock broker", "schedule", "checks runner", "push queue", "audit", "docs", "cache")):
+        p.db.add_task(f"work: widgets plugin {topic} {i}", "the draft for the device", kind="work",
+                      origin="coordinator")
+    since = time.time() - 5
+    mid = _cc_msg(p, "in", "user", "You missed that the widgets plugin draft lost the device profiler trace files",
+                  since)
+    rec = {"msg": mid, "ts": since - 1, "why": "phrase 'you missed'", "class": []}
+
+    def credit(title, spec):
+        tid = p.db.add_task(title, spec, kind="harness", origin="coordinator")
+        got = (correction.class_fix(p.db, [{"type": "task_add", "kind": "harness", "title": title}], "handled",
+                                    mid, since, "phrase", []), correction._later_fix(p.db, rec))
+        p.db.x("UPDATE tasks SET kind='work', title='x', spec='' WHERE id=?", (tid,))
+        assert got in ((f"#{tid}",) * 2, ("", "")), (title, got)
+        return bool(got[0])
+    assert credit("harness: widgets plugin draft watch list", "for each device") is False
+    assert credit("harness: catch lost profiler trace files", "in the widgets plugin")
