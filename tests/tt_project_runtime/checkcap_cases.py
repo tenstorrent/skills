@@ -859,14 +859,15 @@ def test_test_slots_a_full_run_waits_for_its_minimum_grant_others_start_with_one
     assert other.k == 6
     told, got = [], []
     # Grant.close() frees its slots one at a time: a waiter polling mid-close would rightly start with the
-    # 4..6 then free. So the test frees `other` only while the waiter is parked between polls.
-    gate, parked, real_poll = threading.Lock(), threading.Event(), testslots.poll_s
+    # 4..6 then free. So the test frees `other` only while the waiter is parked at `gate` between polls
+    # (it has entered the gate one more time than it has left it).
+    gate, at_gate, real_poll = threading.Lock(), [0, 0], testslots.poll_s
 
     def poll(s):
         if threading.current_thread() is t:
-            parked.set()
+            at_gate[0] += 1
             with gate:
-                pass
+                at_gate[1] += 1
         return real_poll(s)
     monkeypatch.setattr(testslots, "poll_s", poll)
     t = threading.Thread(target=lambda: got.append(testslots.acquire("full", told.append, cfg={"checks": {"test_run_min": 4,
@@ -880,8 +881,7 @@ def test_test_slots_a_full_run_waits_for_its_minimum_grant_others_start_with_one
         push.close()
     finally:
         with gate:
-            parked.clear()
-            _wait_for(parked.is_set)
+            assert _wait_for(lambda: at_gate[0] > at_gate[1]), "the waiter parks at its next poll"
             other.close()
     t.join(10)
     assert got and got[0].k == 7 and "granted" in told[-1], (got, told)
