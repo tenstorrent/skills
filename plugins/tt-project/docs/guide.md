@@ -1911,6 +1911,14 @@ queues behind routine work; nothing running is interrupted:
   tt-project folder (charter, memory, config, state) is skipped with an alert naming it and why; a
   directory that does not exist is skipped with a low alert, never created. Unset, the roots are
   unchanged.
+- Landing from inside the sandbox needs no setup. The Bash sandbox writes the project's `.git` but not
+  the project root's working tree, so a land or review task cannot fast-forward the push branch where
+  the project's main checkout has it checked out. `ttp land` then hands that fast-forward to the
+  running daemon (state/land-ff/), which does it on the host and reports back within 2 minutes. The
+  daemon checks again first: the checkout must belong to the project's repo, have the branch checked
+  out at the tip the landing started from, have no uncommitted changes, and the landed commit must
+  contain that tip. Otherwise nothing moves, nothing is overwritten and `ttp land` exits 5 (the
+  branch moved), 6 (uncommitted changes) or 1 (no daemon took the request, which is then withdrawn).
 - `providers.claude.disallowed_tools: ["mcp__<server>__<tool>", "mcp__<server>__*", ...]` lists tools
   Claude workers and reviewers may not call, on top of the tools the harness always denies them; a
   trailing `*` covers every tool whose name starts so, e.g. every tool of one server. Use it to keep
