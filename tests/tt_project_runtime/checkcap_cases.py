@@ -6015,3 +6015,35 @@ def test_a_full_runs_room_counts_a_priority_1_runs_urgent_slots_as_acquire_takes
         assert not testslots.pool_room({}, "A", full=True, priority=1), "no urgent slots past a priority-1 holder"
     finally:
         held.close()
+
+
+def test_push_checks_wait_for_the_load_guard_without_a_host_slot(env, monkeypatch):
+    """#5476: push checks (push.check_slot) waiting under testslots.load_guard() take no host-wide checks
+    slot, so other runs keep it; once the guard clears they take one, then their test slots."""
+    import threading
+    from ttp import checkcap, push, testslots
+    p = make(env)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "4")
+    _budget_of_one(monkeypatch)
+    guard = ["the host is overloaded"]
+    monkeypatch.setattr(testslots, "load_guard", lambda: guard[0])
+    before = len(checkcap.grant_records())
+    told, got = [], []
+    t = threading.Thread(target=lambda: got.append(push.check_slot("abc", told.append, proj=p)))
+    t.start()
+    try:
+        assert _wait_for(lambda: checkcap.PARKED_LINE in told), told
+        time.sleep(0.5)
+        assert checkcap.state()["running"] == [] and len(checkcap.grant_records()) == before, \
+            "no host slot is held or granted while the load guard holds"
+        other = checkcap.acquire("other project", project_name="other")
+        assert other is not None and other.f is not None, "another run takes the free host slot"
+        other.close()
+        guard[0] = ""
+        t.join(30)
+        assert got and got[0].f is not None and got[0].tests.k == 1
+    finally:
+        guard[0] = ""
+        t.join(30)
+        for s in got:
+            s.close()
