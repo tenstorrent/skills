@@ -13,7 +13,8 @@ out), and keeps it on later runs while it exists.
 When its run ends the daemon lands it (land): the branch's commits are merged into the harness
 checkout. The worktree and branch stay while the task is open (a waiting task's detached job may run
 in it, and its next run works there again); they are removed once the task ended (or is gone from the
-database), nothing uncommitted is left in them and no detached job or `ttp push` of it runs (held). A merge that
+database), nothing uncommitted is left in them and no detached job or `ttp push` of it runs (held). The
+daemon's own uncommitted memory writes there are committed first (_commit_memory). A merge that
 conflicts, or that git refuses over uncommitted changes there, is undone and kept for the next
 pass (sweep), and reported to the coordinator once per branch head (a refusal only while no harness
 run works in the checkout). A conflict is merged again only once its branch head or the harness HEAD
@@ -28,7 +29,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from .project import Project, durable_write, git_fsync_args
+from .project import MEMORY_PATHS, Project, durable_write, git_fsync_args
 from . import gitmemo
 
 DIR = "harness-worktrees"
@@ -173,6 +174,7 @@ def land(p: Project, tid: int) -> str:
     ahead = _git(p.harness, "rev-list", "--count", f"HEAD..{b}")
     outcome = ""
     if ahead.returncode == 0 and int(ahead.stdout.strip() or 0) > 0:
+        _commit_memory(p, tid)
         before = _git(p.harness, "rev-parse", "HEAD").stdout.strip()
         pair = [_git(p.harness, "rev-parse", b).stdout.strip(), before]
         last = (p.db.kv(CONFLICT_KEY, {}) or {}).get(str(tid))
@@ -210,6 +212,19 @@ def land(p: Project, tid: int) -> str:
     _git(p.harness, "branch", "-d", b)
     _set_conflicted(p, tid, None)
     return outcome or "merged"
+
+
+def _commit_memory(p: Project, tid: int) -> None:
+    """Commit the daemon's own uncommitted memory writes (MEMORY.md, memory/) before harness task `tid`'s
+    branch merges, so git never refuses the merge over them and a clash on one is a conflict the merge
+    reports, with both sides kept in commits. Left alone while another harness task's run works in
+    the checkout (its edits there are its own), and where sweep_harness leaves a file (a write that
+    looks cut, a boot the integrity check has not run on yet). Other uncommitted files are never
+    committed: git refuses over them as before."""
+    if checkout_busy(p, tid):
+        return
+    p.sweep_harness(min_age_s=0, paths=MEMORY_PATHS,
+                    message=f"memory: commit the daemon's writes before landing harness task #{tid}")
 
 
 def named_commits(task: dict) -> list[str]:

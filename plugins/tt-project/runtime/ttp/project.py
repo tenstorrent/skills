@@ -1137,6 +1137,10 @@ def hostname() -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "", raw) or "localhost"
 
 
+# The harness files only the daemon writes, which sweep_harness commits when a commit of them failed.
+SWEPT_PATHS = (":(glob)CHARTER*", "MEMORY.md", "memory")
+MEMORY_PATHS = ("MEMORY.md", "memory")   # of those, the memory index and entries
+
 # Memory kinds every prompt carries whatever the budget; decisions and facts fill what is left.
 PINNED_MEMORY_KINDS = ("restriction", "preference", "resource")
 # Memory each prompt carries, in characters of whole entries (see Project.memory_select). A worker's
@@ -1512,9 +1516,10 @@ class Project:
             self.sweep_harness()
         return True
 
-    def sweep_harness(self, min_age_s: float = 60) -> bool:
-        """Commit the charter and memory files (CHARTER*, MEMORY.md, memory/) a failed commit left
-        uncommitted, so it heals itself. A file changed in the last `min_age_s` is left to the commit
+    def sweep_harness(self, min_age_s: float = 60, paths: tuple[str, ...] = SWEPT_PATHS,
+                      message: str = "harness: commit files an earlier failed commit left") -> bool:
+        """Commit the charter and memory files (`paths`: CHARTER*, MEMORY.md, memory/) a failed commit
+        left uncommitted, so it heals itself. A file changed in the last `min_age_s` is left to the commit
         its writer is about to make. A file showing the marks of a cut write is never committed (see
         integrity.looks_cut), and nothing is swept on a boot whose integrity check has not run yet:
         after a power cut the uncommitted files are what that check puts back from the last commit.
@@ -1531,7 +1536,7 @@ class Project:
             return False
         try:
             out = subprocess.run(["git", "-C", str(self.harness), "status", "--porcelain=v1", "-z", "--no-renames",
-                                  "--untracked-files=all", "--", ":(glob)CHARTER*", "MEMORY.md", "memory"],
+                                  "--untracked-files=all", "--", *paths],
                                  capture_output=True, text=True, timeout=self._harness_git_cfg("timeout_s"))
         except (OSError, subprocess.SubprocessError) as e:
             self._git_log(f"sweep: status could not run: {e}")
@@ -1562,9 +1567,9 @@ class Project:
                           + ", ".join(cut)[:300])
         if not (rel or gone):
             return False
-        self._git_log(f"sweep: committing {len(rel) + len(gone)} file(s) a failed commit left: "
+        self._git_log(f"sweep: committing {len(rel) + len(gone)} file(s) ({message}): "
                       + ", ".join([*rel, *gone])[:300])
-        return self._git_commit(rel, "harness: commit files an earlier failed commit left", gone, sweep=False)
+        return self._git_commit(rel, message, gone, sweep=False)
 
     def add_memory(self, text: str, kind: str = "fact", title: str | None = None, key: str | None = None,
                    end: dict | None = None, standing: bool = False, audience: str | None = None,
