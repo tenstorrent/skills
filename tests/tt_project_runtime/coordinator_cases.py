@@ -18893,6 +18893,38 @@ def test_pr_numbers_and_message_ids_are_no_task_anchors_but_task_ids_are(env):
     assert correction.flag(p.db, p.config(), _rows(p, again)) == {again: f"repeats #{first}"}
 
 
+def test_a_pr_word_with_punctuation_or_words_before_its_list_and_an_outbound_message_id_are_no_task_anchors(env):
+    """'PR: #7, #8 and #16' and 'PR carrying #7, #8 and #16' name PRs, not tasks; a '#N' naming an
+    outbound message of the same chat (a reply id) is no task anchor either. 'task #N', 'review #N' and a
+    task id after a relational word ('the PR for #N') still anchor."""
+    from ttp import correction
+    p = make(env)
+    for text in ("the profiler PR: #7, #8 and #16 together", "one PR carrying #7, #8 and #16 together",
+                 "PRs numbered #7 and #8", "issue: #3, #4", "msg:#12", "the widgets PR\t: #7", "PR #7, #8 and #16",
+                 "acme/widgets#7"):
+        assert correction.anchors(text) == set(), text
+    assert correction.anchors("task #3207") == {"#3207"}
+    for text, want in (("PR review #7", {"#7"}), ("the PR for #9 and #10", {"#9", "#10"}),
+                       ("PR carrying task #7, #8", {"#7", "#8"}), ("issues with #4300", {"#4300"}),
+                       ("PR #7; review #9", {"#9"}), ("the PR. #9 next", {"#9"}),
+                       ("one PR carrying three widgets #7", {"#7"})):
+        assert correction.anchors(text) == want, text
+    # An outbound reply id cited by a later inbound message of the same chat names no task; one of
+    # another chat still anchors.
+    tid = max(p.db.add_task(f"example task {i}", "s", origin="user") for i in range(40))
+    out = _said(p, "Queued the widget order as asked", days=1, direction="out")
+    other = p.db.post("out", "A reply in another chat", chat="c2")
+    later = _said(p, f"Keep the order on #{out}, and #{other}, as for #{tid}")
+    assert tid not in {out, other, later}
+    cited = correction._cited(p.db, _rows(p, later))
+    assert correction._class("phrase 'as for'", _rows(p, later)[0]["text"], cited.get("c1", ())) == \
+        sorted({f"#{other}", f"#{tid}"})
+    now = time.time()
+    correction.settle(p.db, {"corrections": {str(later): "phrase 'as for'"}}, [], f"correction #{later}: none",
+                      now - 1, now)
+    assert {r["msg"]: r["class"] for r in p.db.kv(correction.KEY)}[later] == sorted({f"#{other}", f"#{tid}"})
+
+
 def test_a_refused_none_needs_the_same_first_message_task_or_key_and_not_a_correction_never_counts(env):
     """Review #4241: corrections sharing only a model family or effort level are unrelated and keep their
     reasons; the same repeated first message, task id or config key refuses the second; a 'not a

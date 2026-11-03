@@ -90,10 +90,13 @@ _KEY = re.compile(r"\b[a-z][a-z0-9_]+(?:\.[a-z][a-z0-9_]+)+\b")   # checks.wrap_
 NOT_KEYS = frozenset("py md json jsonl sh txt yaml yml toml js ts html css log cfg ini csv com org net io dev "
                      "ai".split())   # a file name or a domain, not a config key
 _TASK = re.compile(r"(?:#|\btask\s*#|\btask\s+)(\d+)\b")
-# A '#N' that names no task: a PR, issue, repo or message ref ('PRs #7, #8 and #16', 'owner/repo#7',
-# 'msg #12') and the rest of its list. A bare '#N' that is an inbound message id of the same chat is
-# none either (_cited); 'task #N' always is one.
-_NOT_TASK = re.compile(r"(?:\b(?:prs?|pulls?|pull\s+requests?|issues?|repos?|repositor(?:y|ies)|msgs?|messages?)\s*"
+# A '#N' that names no task: a PR, issue, repo or message ref ('PRs #7, #8 and #16', 'PR: #7',
+# 'PR carrying #7': up to two plain words between, none of them relational or naming a task) and the
+# rest of its list, or 'owner/repo#7'. A bare '#N' that is a message id of the same chat, either
+# direction, is none either (_cited); 'task #N' always is one.
+_NOT_TASK = re.compile(r"(?:\b(?:prs?|pulls?|pull\s+requests?|issues?|repos?|repositor(?:y|ies)|msgs?|messages?)"
+                       r"(?:[:\s]*|[:\s]+(?:(?!(?:tasks?|reviews?|for|with|about|on|in|of|from|to|by|at|see|"
+                       r"and|or|after|before)\b)[a-z]+[:\s]+){1,2}(?=#))"
                        r"|\b[\w.-]+/[\w.-]+\s*(?=#)|[\w.-](?<!\btask)(?=#))#?\d+\b"
                        r"(?:\s*(?:,\s*(?:and|or)\b|,|&|/|\band\b|\bor\b)\s*#\d+\b)*")
 ANCHOR_SHARE = 0.5
@@ -163,7 +166,7 @@ def _effort(level: str) -> str:
 
 def _anchored(text: str, msgs=()) -> tuple[frozenset, frozenset]:
     """(the anchors `text` names, the words those anchors are written with); a bare '#N' in `msgs` (the
-    inbound message ids of its chat) or in a PR, repo or message ref (_NOT_TASK) is no task anchor."""
+    message ids of its chat) or in a PR, repo or message ref (_NOT_TASK) is no task anchor."""
     low = str(text or "").lower().replace("’", "'")
     refs = [m.span() for m in _NOT_TASK.finditer(low)]
     ms = [(f"effort:{_effort(next(g for g in m.groups() if g))}", m) for m in _EFFORT.finditer(low)]
@@ -181,11 +184,12 @@ def anchors(text: str, msgs=()) -> frozenset:
 
 
 def _cited(db: DB, rows: list[dict]) -> dict:
-    """{chat: the inbound message ids of that chat a bare '#N' in `rows` (dicts with text and chat) names}."""
+    """{chat: the message ids of that chat, inbound or outbound (a reply cited back), a bare '#N' in `rows`
+    (dicts with text and chat) names}."""
     want = sorted({int(m.group(1)) for r in rows for m in _TASK.finditer(str(r.get("text") or ""))
                    if m.group(0).startswith("#")})
     out: dict = {}
-    for r in db.q("SELECT id, chat FROM messages WHERE direction='in' AND id IN (SELECT value FROM json_each(?))",
+    for r in db.q("SELECT id, chat FROM messages WHERE id IN (SELECT value FROM json_each(?))",
                   (json.dumps(want),)) if want else ():
         out.setdefault(r["chat"], set()).add(int(r["id"]))
     return out
