@@ -2990,6 +2990,47 @@ def test_machines_set_and_add_from_a_read_only_home_are_queued_and_applied_once_
     assert ex.value.code == 1 and "No space left" in capsys.readouterr().err and ml.pending(p.state) == []
 
 
+def test_machines_set_and_add_rerun_with_a_relative_until_from_a_read_only_home_queue_one_request(
+        env, monkeypatch, capsys):
+    """The queued request of `ttp machines set|add` is known by the command's own arguments: rerunning it with
+    a relative --until later (another absolute end) queues nothing more; another --until or note queues its own."""
+    import errno
+    from ttp import cli
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env, "alpha")
+    mm.add("box-a")
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(p.root)
+    real = mm.project.durable_write
+
+    def ro(path, *a, **k):   # the home is read-only; the project's state is not
+        path = Path(path)
+        if path.parent == mm.project.HOME_DIR:
+            raise OSError(errno.EROFS, "Read-only file system", str(path))
+        return real(path, *a, **k)
+    monkeypatch.setattr(mm.project, "durable_write", ro)
+    clock = [time.time()]
+    monkeypatch.setattr(mm.time, "time", lambda: clock[0])
+    runs = [["add", "box-b", "--note", "spare", "--until", "3d"],
+            ["set", "box-a", "--note", "busy", "--until", "3d"]]
+    for i, cmd in enumerate(runs, 1):
+        for _ in range(2):   # the same command a minute later: a new absolute end, the same request
+            clock[0] += 60
+            cli.main(["machines", *cmd])
+            assert capsys.readouterr().out.startswith("queued the change to machine")
+            assert len(ml.pending(p.state)) == i
+    for cmd in (["add", "box-b", "--note", "spare", "--until", "4d"],
+                ["add", "box-b", "--note", "other", "--until", "3d"]):
+        cli.main(["machines", *cmd])
+        capsys.readouterr()
+    assert len(ml.pending(p.state)) == 4
+    # The end applied is the absolute one computed when it was queued.
+    [req] = [r for r in ml.pending(p.state) if r["fields"]["alias"] == "box-a"]
+    assert req["fields"]["entry"]["note_until"] == pytest.approx(clock[0] - 60 + 3 * 86400, abs=1)   # its first run
+    assert req["fields"]["args"]["until"] != "3d"
+
+
 def test_ttr_caps_a_heal_incident_at_its_last_unhealthy_sample_plus_the_check_period(env, tmp_path):
     """A sparse check no longer stretches a short fault: a heal-sourced incident ends no later than the
     check's last unhealthy sample plus its period; another source keeping it open clears the cap, and rows

@@ -148,7 +148,7 @@ def update(alias: str, args: dict | None = None, owner: str | None = None, fallb
     is returned, with `queued`."""
     alias = (alias or "").strip()
     machines, removed = load(), dict(_part(_doc(), "removed"))
-    entry = None
+    entry, raw = None, args   # raw: the command's own arguments, which a queued request is known by
     if args is not None:
         entry = _added(machines, removed, alias, where=where, **args)
         if entry.get("note_until") and args.get("until"):   # a relative --until means the same end when applied
@@ -163,8 +163,8 @@ def update(alias: str, args: dict | None = None, owner: str | None = None, fallb
         from . import machine_ledger as ml
         if queue is None or e.errno not in ml.UNWRITABLE:
             raise
-        given = {"alias": alias, "args": args, "owner": owner, "fallback": fallback}
-        return ml._queue(queue, "machine", {**given, "entry": entry}, given)
+        fields = {"alias": alias, "args": args, "owner": owner, "fallback": fallback}
+        return ml._queue(queue, "machine", {**fields, "entry": entry}, {**fields, "args": raw})
     return entry
 
 
