@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+from pathlib import Path
 
 PRIVILEGED = {"sudo", "su", "doas", "pkexec", "run0"}
 SHELLS = {"sh", "bash", "dash", "zsh", "ksh", "mksh", "ash", "busybox"}
@@ -208,13 +209,45 @@ def lock_command(argv: list[str]) -> list[str] | None:
     return out or None
 
 
+def _prctl():
+    """libc's prctl, or None off Linux or where it cannot be found."""
+    if not os.uname().sysname == "Linux":
+        return None
+    try:
+        import ctypes
+        return ctypes.CDLL(None, use_errno=True).prctl
+    except (OSError, AttributeError):
+        return None
+
+
 def no_new_privs() -> bool:
     """Sets no_new_privs on this process (inherited by every child, never undone); False where the OS
     has no such flag or it could not be set."""
-    if not os.uname().sysname == "Linux":
-        return False
+    prctl = _prctl()
+    return prctl is not None and prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
+
+
+def no_new_privs_preexec():
+    """A Popen preexec_fn that sets no_new_privs in the child before it execs (as no_new_privs), so
+    nothing it starts can gain privileges; None off Linux. prctl is looked up here, in the parent, so
+    the forked child only calls it: no import, dlopen or lock after the fork, which keeps it safe in
+    the daemon, whose threads rule out a general preexec_fn (project.renice)."""
+    prctl = _prctl()
+    if prctl is None:
+        return None
+
+    def apply() -> None:
+        prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
+    return apply
+
+
+def fenced(pid: int | str = "self") -> bool | None:
+    """Whether process `pid` runs with no_new_privs set (NoNewPrivs in /proc/<pid>/status); None
+    where that cannot be read (off Linux, a pid gone or out of sight)."""
     try:
-        import ctypes
-        return ctypes.CDLL(None, use_errno=True).prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
-    except (OSError, AttributeError):
-        return False
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("NoNewPrivs:"):
+                return line.split(":", 1)[1].strip() == "1"
+    except (OSError, ValueError):
+        return None
+    return None

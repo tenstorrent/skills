@@ -236,8 +236,8 @@ Company-wide practice; the long form is in the `tt-project:setup-box` skill's re
   run (no root, no NOPASSWD rule for it), no reset runs and the output says so.
 - Check sudo rights with `sudo -n -l` (or `sudo -n -l <command>`), never `sudo -n true`: a host
   may grant NOPASSWD only for specific commands.
-- A worker's sandbox cannot gain privileges, so sudo fails inside it ('no new privileges'). A
-  privileged command the project allows runs on the host through the daemon:
+- A worker's sandbox and every `ttp detach` job cannot gain privileges ('no new privileges': sudo
+  fails). A privileged command the project allows runs on the host through the daemon:
   `ttp host-run -- <command...>` prints its output and exits with its code (126 refused, 124 timed
   out). Only commands in config `runner.host_commands` run, each entry the command's first words
   (name them fully, e.g. `sudo -n /usr/sbin/<tool> <read-only verb>`); the user or the coordinator

@@ -10633,6 +10633,10 @@ def cmd_doctor(a) -> None:
     print(web_line(p))
     from .service import service_line
     print(service_line(p))
+    from .daemon import _is_daemon, _read_pid
+    from . import hostrun
+    if (dpid := _read_pid(p.state / "daemon.pid")) and _is_daemon(dpid) and (fenced := hostrun.fence_problem(p, dpid)):
+        print(f"host-run: {fenced}")
     from . import sandbox
     print(f"process sandbox for checks: {sandbox.notice() or 'on (own PID namespace per check command)'}")
     from .project import config_problems

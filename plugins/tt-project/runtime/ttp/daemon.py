@@ -1188,6 +1188,12 @@ class Daemon:
                     f"harness_head={r['harness_head'] or 'none'} runtime_tree={r['runtime_tree'] or 'none'}")
         self.p.db.set_kv("daemon", {"pid": os.getpid(), "host": hostname(), "started": time.time(),
                                     "instance": r["instance"]})
+        try:   # inherited from whatever started it: host-run then cannot gain privileges (hostrun.py)
+            from . import hostrun
+            if fenced := hostrun.fence_problem(self.p):
+                log(self.p, f"host-run: {fenced}")
+        except Exception:
+            log(self.p, "host-run fence check error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         self._check_config()
         self.sync_schedules(start=True)
         from .web import serve

@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 
-def _hostrun_setup(env, monkeypatch, allow, by="user"):
-    from ttp import configwho
+def _hostrun_setup(env, monkeypatch, allow, by="user", unfenced=True):
+    from ttp import configwho, privlock
+    if unfenced:   # this test process stands in for the daemon, which runs unfenced (a sandbox sets the flag)
+        monkeypatch.setattr(privlock, "fenced", lambda pid="self": False)
     p = make(env)
     for k in ("TTP_RUN_ID", "TTP_RUN_DIR", "TTP_TASK", "TTP_TASK_ID"):
         monkeypatch.delenv(k, raising=False)
@@ -370,3 +372,55 @@ def test_host_run_cli_detach_status_and_timeout_flags(env, monkeypatch, capfd):
         with pytest.raises(SystemExit) as e:
             cli.main(bad)
         assert e.value.code == 2
+
+
+_READ_FLAG = [sys.executable, "-c", "import re; print(re.search(r'NoNewPrivs:\\s*(\\d)', open('/proc/self/status').read())[1])"]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="no_new_privs is Linux only")
+def test_host_run_leaves_its_command_unfenced(env, monkeypatch, capfd):
+    from ttp import privlock
+    if privlock.fenced():
+        pytest.skip("this test process already has no_new_privs: an unfenced child cannot be shown")
+    p = _hostrun_setup(env, monkeypatch, [shlex.join(_READ_FLAG)])
+    assert _hostrun_with_daemon(p, _READ_FLAG, []) == 0
+    assert capfd.readouterr().out.strip() == "0"
+
+
+def test_a_fenced_daemon_answers_host_run_with_the_plain_reason_and_runs_nothing(env, monkeypatch, capfd, tmp_path):
+    from ttp import hostrun, privlock
+    ran = tmp_path / "ran"
+    cmd = ["/bin/touch", str(ran)]
+    p = _hostrun_setup(env, monkeypatch, [shlex.join(cmd)], unfenced=False)
+    monkeypatch.setattr(privlock, "fenced", lambda pid="self": True)
+    assert _hostrun_with_daemon(p, cmd, []) == hostrun.REFUSED
+    err = capfd.readouterr().err
+    assert "did not run: the daemon" in err and "no_new_privs set" in err
+    assert f"restart the daemon through its service manager: `ttp restart {p.name}`" in err
+    assert not ran.exists()
+    assert json.loads((p.state / hostrun.LOG).read_text().splitlines()[-1])["why"] == "fenced"
+    # A detach request is checked first too: no supervisor starts and no <id>.rc is written.
+    started = []
+    monkeypatch.setattr(hostrun, "_start_supervisor", lambda *a: started.append(a) or 0)
+    assert _hostrun_with_daemon(p, cmd, [], detach=True) == hostrun.REFUSED
+    assert "did not run: the daemon" in capfd.readouterr().err
+    assert not started and not ran.exists() and not list((p.state / hostrun.QUEUE).glob("*.rc"))
+    assert json.loads((p.state / hostrun.LOG).read_text().splitlines()[-1])["why"] == "fenced"
+    p.set_config("runner.host_commands", [])
+    assert hostrun.fence_problem(p) == "", "nothing allowed: nothing to report"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="no_new_privs is Linux only")
+def test_fence_problem_reads_the_named_daemons_flag(env, monkeypatch, tmp_path):
+    """`ttp doctor` reads the daemon's pid, not its own: a real fenced process is reported, a gone one not."""
+    from ttp import hostrun, privlock
+    p = _hostrun_setup(env, monkeypatch, ["/usr/bin/id -u"], unfenced=False)
+    child = subprocess.Popen(["sleep", "30"], preexec_fn=privlock.no_new_privs_preexec())
+    try:
+        assert privlock.fenced(child.pid) is True
+        why = hostrun.fence_problem(p, child.pid)
+        assert f"the daemon (pid {child.pid}) runs with no_new_privs set" in why
+    finally:
+        child.kill()
+        child.wait()
+    assert hostrun.fence_problem(p, child.pid) == "" and privlock.fenced(child.pid) is None

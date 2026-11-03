@@ -24,6 +24,10 @@ restart, as the daemon's unit kills only its main process), which runs the comma
 and writes <id>.out.json (output and exit code) and then <id>.rc under state/host-run, kept DETACHED_KEEP_S.
 `ttp host-run --status <id>` polls it (exit 0 once it ended, 1 while queued or running, 4 when it
 is unknown or lost); `--result <id>` prints its output and exits with its code.
+
+The daemon runs the commands unfenced; only then can sudo work. A daemon that inherited no_new_privs
+(started from a fenced shell, or by a unit that implies it) runs none: each request is answered with
+fence_problem's plain reason (exit 126), which the daemon also logs once at start and `ttp doctor` prints.
 """
 from __future__ import annotations
 
@@ -38,7 +42,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import boundedchild
+from . import boundedchild, privlock
 from .project import Project, durable_append, durable_write, write_json
 
 QUEUE = "host-run"           # under the project's state: <id>.json requests, <id>.out.json answers
@@ -134,6 +138,16 @@ def allowed(argv: list[str], allow: list[list[str]]) -> bool:
     return bool(argv) and any(argv[:len(e)] == e for e in allow)
 
 
+def fence_problem(p: Project, pid: int | None = None) -> str:
+    """Why host-run cannot gain privileges: the daemon (this process, or `pid`) runs with no_new_privs
+    while config allows commands; "" when it does not, or none are allowed, or it cannot be read."""
+    pid = pid or os.getpid()
+    if not privlock.fenced("self" if pid == os.getpid() else pid) or not allowlist(p)[0]:
+        return ""
+    return (f"the daemon (pid {pid}) runs with no_new_privs set, so no command in config {KEY} can gain "
+            f"privileges (sudo fails); restart the daemon through its service manager: `ttp restart {p.name}`")
+
+
 def timeout_of(p: Project) -> int:
     v = (p.config().get("runner") or {}).get("host_command_timeout_s")
     if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
@@ -167,6 +181,9 @@ def _run(p: Project, rid: str, m: dict, ents: list[tuple[list[str], int | None]]
         elif not allowed(argv, [w for w, _ in ents]):
             out["stderr"] = (f"ttp host-run: refused: {shlex.join(argv)} is not in config {KEY}; ask the "
                              f"coordinator to add it (a worker cannot)\n")
+        elif fenced := fence_problem(p):   # sudo would only fail with its own, less plain error; checked
+            # before the detach branch, so a fenced daemon never starts a supervisor
+            why, out["stderr"] = "fenced", f"ttp host-run: did not run: {fenced}\n"
         elif m.get("detach"):   # the supervisor answers, removes the claim and logs the end
             limit = asked(limit_for(p, argv, ents), m.get("timeout"))[0]
             m = {**m, "limit": limit, "started": time.time()}
