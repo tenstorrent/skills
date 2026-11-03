@@ -2247,7 +2247,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   plan-window meter; without ask mode it has no
   read-only mode either.
 - Cursor has no reasoning-effort flag; tiers map to model names.
-- Context compaction per tier (`budget.compact_window_tokens`) works on Claude Code and Codex.
+- Context compaction per tier (`budget.compact_window_tokens`) works on Claude Code and Codex. A run
+  whose fixed prompt (system and task prompt, tool definitions) leaves too little room under its
+  tier's window gets a larger one, so it does not compact on every tool result; the run's record
+  and the daemon log say so.
 - On Claude Code, worker, reviewer and every other run but the coordinator's write the prompt cache
   at `budget.worker_cache_ttl`: `5m` by default (a write at 1.25x input instead of 2x; calls within a
   run are rarely 5 minutes apart), `1h`, or `off` (the agent's own default). The coordinator keeps

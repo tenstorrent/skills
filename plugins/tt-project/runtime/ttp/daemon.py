@@ -2729,6 +2729,14 @@ class Daemon:
         if role != "coordinator":
             window = self.cfg["budget"].get("compact_window_tokens") or 0   # 0: off for every tier
             window = window.get(tier) if isinstance(window, dict) else window
+            tier_window = int(window or 0)
+            fixed = sum(len(t or "") for t in (prompt, system, append_system, context))
+            window, fixed_tokens = fit_compact_window(tier_window, fixed)
+            if fixed_tokens is not None:   # recorded for the daily review: which runs needed it
+                note = {**(note or {}), "compact_window": {"tier_tokens": tier_window, "raised_to": window,
+                                                           "fixed_prompt_tokens": fixed_tokens}}
+                log(self.p, f"task {(task or {}).get('id', '-')} {role} run: compact window raised to {window} "
+                            f"for a fixed prompt of about {fixed_tokens} tokens ({tier} tier)")
             env = {**env, **prov.compact_env(int(window or 0))}
             argv = _before_stdin(argv, prov.compact_args(int(window or 0)))
             argv = prov.cap_output(argv, int(self.cfg["budget"].get("bash_output_max_chars") or 0))
@@ -15085,6 +15093,27 @@ def _watcher_timeout(payload: dict) -> int:
 def _precheck_cmd(payload: dict) -> str:
     """An llm schedule's `precheck` shell command, or "" when it has none."""
     return str(payload.get("precheck") or "").strip()
+
+
+# A worker's fixed prompt (system prompt, task prompt, tool definitions) is in every turn and no
+# compaction shrinks it. Claude Code compacts about COMPACT_MARGIN_TOKENS below its window, so a
+# window too close to the fixed prompt compacts on every tool result until the run dies.
+CHARS_PER_TOKEN = 4
+TOOL_ALLOWANCE_TOKENS = 20_000   # the agent's own system prompt and tool definitions
+COMPACT_MARGIN_TOKENS = 33_000
+COMPACT_HEADROOM_TOKENS = 40_000   # room for the run's own work before it compacts
+COMPACT_WINDOW_MAX = 1_000_000
+
+
+def fit_compact_window(window: int, fixed_chars: int) -> tuple[int, int | None]:
+    """The compact window for a run whose own prompt text is `fixed_chars` long, and the fixed
+    prompt's estimated tokens when the window had to be raised past `window` (else None). 0 (off)
+    stays off; a window already above the floor is kept; the raise stops at COMPACT_WINDOW_MAX."""
+    if window <= 0:
+        return window, None
+    fixed = max(0, int(fixed_chars)) // CHARS_PER_TOKEN + TOOL_ALLOWANCE_TOKENS
+    floor = min(fixed + COMPACT_MARGIN_TOKENS + COMPACT_HEADROOM_TOKENS, COMPACT_WINDOW_MAX)
+    return (floor, fixed) if floor > window else (window, None)
 
 
 def _before_stdin(argv: list[str], extra: list[str]) -> list[str]:
