@@ -985,7 +985,13 @@ queues behind routine work; nothing running is interrupted:
   A task waiting on `ttp devq probe <runner> <job>` alerts as `lock-wait:devq:<runner>`, naming the
   running job, its task and pid. The daemon's tick is what releases a dead holder's lock: waiters in a
   sandbox may not judge holders, and check-slot and devq waiters do not sweep, so a lock only its dead
-  holder's run keeps is freed within about 2 min. Config `device.locks` (opt-in) names one device by several names: all share the first name's lock and pause, tasks that use one
+  holder's run keeps is freed within about 2 min. One global lock order: take narrower locks (one host,
+  device or machine) before wider ones (site- or cluster-wide, such as a power-cycle or maintenance lock),
+  never wait for a narrower lock while holding a wider one; a script that needs both takes them in that
+  order or releases the wider one first. A lock-order cycle among `ttp lock` holders and waiters on the
+  host raises one critical `lock-cycle:<id>` alert at once to the projects in it, naming every party and
+  lock and the wait that breaks the order; a lock wrapper outside `ttp lock` is invisible to it
+  (skill reference resource-locks.md). Config `device.locks` (opt-in) names one device by several names: all share the first name's lock and pause, tasks that use one
   get the `needs_device` label, and at most `device.max_tasks` of them run at once (default: one per device resource the
   project has, at most `budget.max_parallel_workers`, at least 2; a set value is kept). A worker starts
   a long job with `ttp detach <name> -- <command>`; a run that ends without a hand-off, or waiting

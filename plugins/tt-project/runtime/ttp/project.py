@@ -178,8 +178,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # a project's own holds on top of the locks; it gets the resource and task id, exit 0 grants, 1 or
     # 75 holds, anything else or no answer in pre_grant_timeout_s holds and is raised once. "": off.
     # wait_alert_min: a waiter on a lock past this many minutes raises one lock-wait:<name> alert per
-    # lock, naming its holder (lockreap.py); 0: off.
-    "locks": {"pre_grant_check": "", "pre_grant_timeout_s": 10, "wait_alert_min": 30},
+    # lock, naming its holder (lockreap.py); 0: off. wide: lock names that count as site- or cluster-wide
+    # in the lock order a lock-cycle alert checks, beside the words of lockcycle.WIDE_WORDS.
+    "locks": {"pre_grant_check": "", "pre_grant_timeout_s": 10, "wait_alert_min": 30, "wide": []},
     "shared_resources": [],             # resources whose slots and pause all the user's projects share
     # model / effort, when set, override the coordinator's defaults. Unset, every coordinator turn
     # runs at coordinator.DEFAULT_EFFORT (xhigh, or the provider's highest effort below it) on
