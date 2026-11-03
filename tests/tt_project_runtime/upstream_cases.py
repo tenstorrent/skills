@@ -1115,3 +1115,29 @@ def test_a_high_severity_confirmation_is_filed_as_a_note_and_left_open(env, monk
     assert upstream.ingest(dst, dst.config()) == 2
     assert [e["status"] for e in _queued_notes(dst)] == ["queued", "handled", "handled"]
     assert upstream.confirmations_closed("second") == 2
+
+
+@pytest.mark.parametrize("title", ["test probe", "  upstream: test probe "])
+def test_upstream_fp_adds_the_prefix_a_filed_title_carries_and_files_nothing(env, monkeypatch, capsys, title):
+    """`ttp upstream --fp` hashed a bare title as given, an id no filed note (always `upstream: ...`)
+    can have, and a worker took the printed id for a filed note. It now adds the prefix, says on
+    stderr that nothing was filed, keeps stdout the bare id, and writes no inbox, notes or resolved file."""
+    from ttp import cli, upstream, project
+    p = make(env)
+    monkeypatch.chdir(p.base)
+    roots = {project.HOME_DIR, upstream.path().parent, upstream.resolved_path().parent}
+
+    def snapshot():
+        return {f: f.read_bytes() for r in roots if r.exists() for f in sorted(r.rglob("*")) if f.is_file()}
+
+    before = snapshot()
+    capsys.readouterr()
+    assert _upstream_cli(cli, "--fp", title, "spec") == 0
+    out = capsys.readouterr()
+    assert snapshot() == before, "ttp upstream --fp wrote a file"
+    assert not upstream.path().exists() and not upstream.resolved_path().exists()
+    upstream.append("demo", 4, [{"title": "upstream: test probe", "spec": "spec"}])
+    filed = [json.loads(line)["fp"] for line in upstream.path().read_text().splitlines()]
+    assert out.out == filed[0] + "\n", out.out
+    assert "a fingerprint only, no note was filed" in out.err, out.err
+    assert ("'upstream: test probe'" in out.err) == (title == "test probe"), out.err

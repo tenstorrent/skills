@@ -2233,7 +2233,8 @@ def cmd_upstream(a) -> None:
     not-a-bug note without a release, `--ack <fp>
     "<evidence>"` closes it for this project, `--regress <fp> "<reason>"` records that a shipped fix did not
     hold (its filer's note then never closes by silence, nor as filer unreachable), `--fp "<title>" "<spec>"` prints the id an `upstream: ...`
-    follow-up gets, and `--mine` / `--resolved` list this project's notes / every resolution. With no flag it
+    follow-up gets (a pure probe that files nothing; it adds the `upstream: ` prefix a filed title carries
+    when the title lacks it), and `--mine` / `--resolved` list this project's notes / every resolution. With no flag it
     lists the inbox's notes with each sender (project, host, task), open first, then the forward status;
     `--resolve` prints the sender and sends the answer to it once when it is another project on this machine."""
     from . import upstream
@@ -2249,9 +2250,16 @@ def cmd_upstream(a) -> None:
     if a.fp is not None:
         title, spec = a.fp
         task, me = os.environ.get("TTP_TASK") or "", here()
+        # Filed notes always carry the prefix (`ttp note`, upstream follow-ups): an id hashed without it
+        # could never match one.
+        added = not title.strip().lower().startswith("upstream:")
+        if added:
+            title = "upstream: " + title.strip()
         # As the daemon files it (upstream.append): a spec past the limit is cut naming the hand-off.
         print(upstream.fingerprint(title.strip()[:upstream.TITLE_CHARS], upstream.cut(
             spec.strip(), f"the hand-off of {me.name if me else '?'} #{task}" if task else "its hand-off")))
+        print("ttp upstream --fp: a fingerprint only, no note was filed"
+              + (f"; hashed as the filed title {title.strip()!r}" if added else ""), file=sys.stderr)
         return
     if a.resolve or a.fixed or a.ack or a.regress or a.mine or a.resolved or a.wontfix is not None:
         try:
@@ -10366,7 +10374,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--ack", nargs=2, metavar=("FP", "EVIDENCE"), help="close note FP: the fix works here")
     s.add_argument("--regress", nargs=2, metavar=("FP", "REASON"), help="record that note FP's shipped fix did not "
                                                                         "hold: blocks its close by silence")
-    s.add_argument("--fp", nargs=2, metavar=("TITLE", "SPEC"), help="print the id an `upstream: ...` follow-up gets")
+    s.add_argument("--fp", nargs=2, metavar=("TITLE", "SPEC"), help="print the id an `upstream: ...` follow-up gets "
+                                                                 "(adds the `upstream: ` prefix if missing; files nothing)")
     s.add_argument("--mine", action="store_true", help="this project's notes and where each stands")
     s.add_argument("--resolved", action="store_true", help="every resolved note and where it stands")
     s.add_argument("--has-project", metavar="NAME", help="print whether project NAME runs on this machine (JSON); "
