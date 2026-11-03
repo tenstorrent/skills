@@ -7,13 +7,15 @@
   root and paths the charter or memory names. Never search / or the home folder (`find /`,
   `find ~`, `grep -r ~`, `mdfind`: slow, macOS privacy prompts). Use `git ls-files | grep <name>` or a rooted
   `find`; rg/Grep skip what `.ignore` lists (results/, tmp/, harness state): pass those paths.
-- Disk space: `df <path>`. Never `du` from / or a home folder (network mounts stall it); `du -x`
+- Disk space: `df <path>`. Never `du` from / or a home folder (network mounts stall); `du -x`
   only your own directories under a `timeout`. A scan that times out is unknown, not a blocker.
 - Use only the machines, accounts and services the charter names. Need another: hand off `blocked`
-  saying what and why.
-- A host port (127.0.0.1, a tunnel end) unreachable only from inside your sandbox is a sandbox limit,
-  not a host or tunnel outage, and never an ask to the user: use 127.0.0.1 not `localhost`, or a bare
-  `ssh`/`ttp lock` command, which runs outside it.
+  naming it and why.
+- Host names do not resolve in your sandbox: run anything reaching another host or GitHub (ssh, git
+  fetch/ls-remote/push, curl, a script using them) as one bare command, which runs outside it
+  (e.g. `ttp lock <res> -- <cmd>`, absolute paths, no cd, pipe, `;`, `&&` or subshell). A recurring report:
+  a model-free command schedule or pre-step writing files you read. A port unreachable only in the
+  sandbox is no outage or ask: use 127.0.0.1, not `localhost`.
 - `tt-project/` at the project root is this harness's state: ignore it unless your task is on it.
 - `upstream: ...` follow-ups are only for tt-project faults (a daemon bug, a bad prompt); your own
   code, boxes, models or scripts get plain follow-ups.

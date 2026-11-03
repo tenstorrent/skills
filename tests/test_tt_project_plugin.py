@@ -6711,6 +6711,28 @@ def test_worker_prompt_and_harness_skill_state_the_glx_reset_only_practice():
         assert part in skill, part
 
 
+def test_prompts_and_harness_skill_run_host_reaching_commands_bare_or_from_a_model_free_pre_step():
+    """Host names do not resolve in the worker sandbox; only a bare excluded command (`ssh`, `git fetch`,
+    `ttp lock ...`) runs outside it, never one inside cd, a pipe, `;`, `&&`, a subshell or a script it
+    runs (upstream note fd7ddf9490b3ed3c). Workers, daily reviews, the blocker sweep and harness authors
+    read where such a command goes."""
+    prompts = PLUGIN / "template" / "prompts"
+    for path in (prompts / "worker.md", prompts / "daily-review.md", SKILLS / "tt-project-harness" / "SKILL.md"):
+        flat = re.sub(r"\s+", " ", path.read_text(encoding="utf-8"))
+        for part in ("Host names do not resolve in", "another host or GitHub", "git fetch/ls-remote/push",
+                     "one bare command", "`ttp lock <res> -- <cmd>`", "absolute paths, no cd, pipe, `;`, `&&` or subshell",
+                     "model-free", "pre-step writing files"):
+            assert part in flat, (path.name, part)
+    # The loopback hint it replaced stays.
+    assert "use 127.0.0.1, not `localhost`" in re.sub(r"\s+", " ", (prompts / "worker.md").read_text())
+    coordinator = re.sub(r"\s+", " ", (prompts / "coordinator.md").read_text(encoding="utf-8"))
+    sweep = coordinator[coordinator.index("A `Blocker sweep` turn"):]
+    sweep = sweep[:sweep.index(". A provider")]
+    for part in ("unresolved host name hit its sandbox", "bare (e.g. `ttp lock <res> -- <cmd>`",
+                 "model-free command schedule or pre-step"):
+        assert part in sweep, part
+
+
 def test_no_shipped_text_states_a_corrected_claim():
     import subprocess
     top = PLUGIN.parents[1]
