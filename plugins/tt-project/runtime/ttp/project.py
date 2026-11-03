@@ -2465,8 +2465,8 @@ def load_secrets() -> dict:
         return json.loads(secrets_path().read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
-    except OSError as e:
-        raise SecretsUnreadable(f"cannot read the secrets store at {secrets_path()}: {e.strerror or e}") from None
+    except (OSError, UnicodeDecodeError) as e:   # bad bytes: as unreadable as a hidden store
+        raise SecretsUnreadable(f"cannot read the secrets store at {secrets_path()}: {getattr(e, 'strerror', None) or e}") from None
 
 
 def secrets_state() -> dict:

@@ -875,7 +875,7 @@ def test_a_sandboxed_secret_env_gives_up_when_the_daemon_never_starts_it(env, mo
     assert not list((p.state / "detach-queue").glob("*.json"))      # withdrawn: no late start
 
 
-@pytest.mark.parametrize("damage", ["mode0", "directory"])
+@pytest.mark.parametrize("damage", ["mode0", "directory", "non-utf8"])
 def test_status_skips_an_unreadable_secret_store_and_secret_users_still_fail(env, monkeypatch, capsys, damage):
     """In a worker sandbox the secrets store cannot be read: `ttp status` and `ttp status --json` still
     report and the JSON marks the store unreadable; a caller that needs a secret still fails, clearly."""
@@ -886,6 +886,9 @@ def test_status_skips_an_unreadable_secret_store_and_secret_users_still_fail(env
     monkeypatch.setattr(redact, "_cache", {"sig": None, "pairs": []})
     if damage == "mode0":
         store.chmod(0)
+    elif damage == "non-utf8":
+        good = store.read_bytes()
+        store.write_bytes(b'{"x": "\xff\xfe"}')
     else:
         store.unlink()
         store.mkdir()
@@ -905,6 +908,8 @@ def test_status_skips_an_unreadable_secret_store_and_secret_users_still_fail(env
     finally:
         if store.is_dir():
             store.rmdir()
+        elif damage == "non-utf8":
+            store.write_bytes(good)
         else:
             store.chmod(0o600)
     cli.main(["status", p.name, "--json"])
