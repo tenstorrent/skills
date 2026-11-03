@@ -50,7 +50,7 @@
       "destination": "prompts/model_bringup_multigoal/06-full-model.txt",
       "blob": "bff9bb890a6052bfa0fff9f06f12891ce1ad0f10",
       "source_sha256": "9ffedb6e7af6dcbbd32fc8002b5add7cd599967ef163eb9e0191af47bb14cf09",
-      "packaged_sha256": "0757972aef5d99f9e6c0579f8449be6c3db792bb5d907217cfa1370c5ae042f1"
+      "packaged_sha256": "fb6ed32d707c84ae48069ce6fe533d870f84d599a11692fc375cefbae3138101"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/07-optimized-full-model.check.sh",
@@ -85,7 +85,7 @@
       "destination": "prompts/model_bringup_multigoal/09-vllm.txt",
       "blob": "fc930a5472158d07221c2c5440786a7c5aed9ed2",
       "source_sha256": "65e532c7e54a6e1bd348575f4471fa0708990fe93e91ef06bbfa9695c60ca727",
-      "packaged_sha256": "98d429478b968f106097b08cf0ff9277d0313f5f92332f12cbc4be134a79b0c7"
+      "packaged_sha256": "d5faa42f694802861d1e04130cbce98e9f29ca9cf3dad4b68c33d3695ef164e8"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/10-optimized-vllm.check.sh",
@@ -99,7 +99,7 @@
       "destination": "prompts/model_bringup_multigoal/10-optimized-vllm.txt",
       "blob": "7c661791b3c29bbad8de5ce8d50176d13633657f",
       "source_sha256": "6817dc59aa6d8cdc9c50404aa4e919240f1a07e3ce772dab04ae21d4561bec24",
-      "packaged_sha256": "0007c44ab04ef4415a8dc3297a0f755a63c6da16d276dadbd25a679308ab70a4"
+      "packaged_sha256": "dbfe798db148d294479654ed1034ed541afdf214946f1aef79ce9435fea5fafc"
     },
     {
       "source": ".agents/requirements.txt",
