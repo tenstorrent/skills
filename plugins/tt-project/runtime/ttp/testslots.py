@@ -52,10 +52,11 @@ or a reboot frees it. Its waiters queue (a locks.enqueue ticket each) and it goe
 task priority first (p1 before p2 ...; an obligation owner's 0 before all), then arrival (suite_order);
 a running holder is never pre-empted. A waiter without a task priority (no task, a task without one,
 an older runtime) ranks as NO_PRIORITY (p3). A waiter ages one priority step per `checks.priority_age_s`
-waited (default SUITE_AGE_S; checklane.priority_age_s), never past p1 (AGE_FLOOR; an obligation owner's
-0 stays 0), so a waiter of priority p waits at most (p - 1) aging steps plus the runs of those that
-arrived before it. Among equal ranks a native priority goes before an aged one (a native p1 before a p3
-aged to p1), until the aged one has waited FAIR_STEPS steps: then arrival decides (_order_key). Wait lines show each waiter's priority and its rank now (rank_text).
+waited (default SUITE_AGE_S; checklane.priority_age_s), never past p2 (AGE_FLOOR; an obligation owner's
+0 stays 0), so a p1 or urgent run (checkcap.task_rank) always goes before every routine one, even one that
+waited hours. Among equal ranks a native priority goes before an aged one (a native p2 before a p4 aged
+to p2), until the aged one has waited FAIR_STEPS steps: then arrival decides (_order_key). Accepted gap:
+a steady stream of p1 runs can hold routine runs back; p1s are rare and each runs once. Wait lines show each waiter's priority and its rank now (rank_text).
 A run holding it is stopped at the checks wall-time cap (checkwall); checklane.lane_lines shows the
 holder's time against that cap and each lane's waiters with what each waits on (`ttp status`).
 
@@ -106,7 +107,7 @@ POLL_S = 5.0
 HEAD_POLL_S = 1.0     # a suite waiter next in line checks this often, so a freed lane goes to it soon
 SUITE_AGE_S = 900.0   # default checks.priority_age_s: a suite waiter gains one priority step per this many seconds waited
 NO_PRIORITY = 3      # a ticket without a priority (no task, a task without one, an older runtime) ranks as p3
-AGE_FLOOR = 1        # aging never ranks a waiter above p1 (an obligation owner's 0 is its own, not aged to)
+AGE_FLOOR = 2        # aging never ranks a routine waiter above p2: native p1s and urgent runs go first
 FAIR_STEPS = 4       # a waiter past this many aging steps (1 h by default) goes by arrival among its rank
 TELL_S = 300.0
 NICE = 10
@@ -583,7 +584,7 @@ def suite_priority(ticket, now: float | None = None, age: float | None = None,
                    arrival: float | None = None) -> float:
     """A suite waiter's rank now: its task priority (NO_PRIORITY without one), one step more urgent
     per `age` seconds it has waited (default age_s()) since `arrival` (default its ticket's), never past
-    AGE_FLOOR (p1) nor its own priority."""
+    AGE_FLOOR (p2) nor its own priority."""
     prio = locks.ticket_priority(ticket)
     prio = NO_PRIORITY if prio == float("inf") else prio
     age = age_s() if age is None else age
@@ -612,9 +613,9 @@ def rank_text(ticket, now: float | None = None, age: float | None = None) -> str
 
 
 def _order_key(t, now: float | None = None, age: float | None = None, arrival: float | None = None) -> tuple:
-    """Rank (suite_priority), then native priority, then arrival: among equal ranks a native p1 goes
-    before a waiter that only aged up to p1. One that has waited FAIR_STEPS aging steps goes by arrival
-    among its rank (0 sorts it first: it arrived before all who have not), so native p1s never starve it.
+    """Rank (suite_priority), then native priority, then arrival: among equal ranks a native p2 goes
+    before a waiter that only aged up to p2. One that has waited FAIR_STEPS aging steps goes by arrival
+    among its rank (0 sorts it first: it arrived before all who have not), so native p2s never starve it.
     `arrival` overrides the ticket's own (a re-queued waiter keeps its place, waiter_sets)."""
     now = time.time() if now is None else now
     age = age_s() if age is None else age

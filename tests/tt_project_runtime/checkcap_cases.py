@@ -1816,13 +1816,14 @@ def test_suite_slot_order_is_task_priority_then_arrival_and_a_long_waiter_ages_u
     try:
         assert testslots.suite_order("pa", now=now) == [p1_new, p2_a, p2_b, p3_old, none], \
             "p1 before an earlier p3; equal priorities by arrival; no priority ranks as p3, by its arrival"
-        # No starvation: each SUITE_AGE_S waited is one step more urgent, down to p1, so a p5 waiter
-        # waits at most 4 steps plus the runs of those that arrived before it.
+        # No starvation among routine runs: each SUITE_AGE_S waited is one step more urgent, down to p2,
+        # so a p5 waiter waits at most 3 steps plus the p1s and the runs that arrived before it.
         p5_starved = _suite_ticket("pa", 5, now - 5 * age - 1)
         p5_aging = _suite_ticket("pa", 5, now - 2 * age - 1)
-        assert testslots.suite_priority(p5_starved, now) == 1 and testslots.suite_priority(p5_aging, now) == 3
+        assert testslots.suite_priority(p5_starved, now) == 2 and testslots.suite_priority(p5_aging, now) == 3
         order = testslots.suite_order("pa", now=now)
-        assert order[0] == p5_starved, "a waiter aged to p1 goes before any newer p1 (it arrived first)"
+        assert order[:2] == [p1_new, p5_starved], \
+            "a waiter aged to p2 goes before any newer p2 (it arrived first), never before a p1 (#5282)"
         assert order.index(p5_aging) > order.index(p2_b) and order[-3:] == [p3_old, none, p5_aging], \
             "aged to p3, it goes after the p2s and, under the fairness bound, after the native p3s (#4294)"
         assert other not in order
@@ -1945,10 +1946,10 @@ def test_suite_slot_status_line_shows_the_holder_s_time_against_its_cap_and_the_
         hold.close()
 
 
-def test_suite_slot_aging_step_is_checks_priority_age_s_and_never_ranks_past_p1(env, monkeypatch):
+def test_suite_slot_aging_step_is_checks_priority_age_s_and_never_ranks_past_p2(env, monkeypatch):
     # Aging is configurable (checks.priority_age_s: project, then account, else SUITE_AGE_S), judged on a
-    # test clock (`now`), never wall time; it ranks a waiter at most up to p1, and an obligation owner's
-    # 0 stays its own.
+    # test clock (`now`), never wall time; it ranks a routine waiter at most up to p2 (a native p1 always
+    # goes first), and an obligation owner's 0 stays its own.
     from ttp import checklane, cli, locks, testslots
     assert testslots.age_s() == testslots.SUITE_AGE_S == 900.0, "the documented default"
     for bad in (0, -5, "soon", "", "inf", "nan", None):
@@ -1963,47 +1964,69 @@ def test_suite_slot_aging_step_is_checks_priority_age_s_and_never_ranks_past_p1(
     owner = _suite_ticket("pa", 0, now - 10)      # an obligation owner
     try:
         assert testslots.suite_priority(p5, now, 900) == 5, "under one 15 min step: not aged"
-        assert testslots.suite_priority(p5, now, 120) == 1 and testslots.suite_priority(p5, now) == 1, \
-            "5 steps of 2 min would reach 0: aging stops at p1"
+        assert testslots.suite_priority(p5, now, 120) == 2 and testslots.suite_priority(p5, now) == 2, \
+            "5 steps of 2 min would reach 0: aging stops at p2"
         assert testslots.suite_priority(p5, now, 240) == 3, "two whole steps of 4 min"
         assert testslots.suite_priority(owner, now + 9000, 60) == 0 and testslots.suite_priority(p1, now + 9000, 60) == 1
         assert testslots.suite_order("pa", now=now, age=900) == [owner, p1, p2, p5]
         assert testslots.suite_order("pa", now=now, age=240) == [owner, p1, p2, p5], "aged to p3: still behind p2"
-        assert testslots.suite_order("pa", now=now, age=60) == [owner, p5, p1, p2], \
-            "aged to p1, it goes before the newer p1 by arrival, never before an obligation owner"
-        assert testslots.suite_order("pa", now=now) == [owner, p5, p1, p2], "the account's 120 s step by default"
-        assert testslots.rank_text(p5, now, 900) == "p5 ranked p5" and testslots.rank_text(p5, now, 60) == "p5 ranked p1 (aged)"
+        assert testslots.suite_order("pa", now=now, age=60) == [owner, p1, p5, p2], \
+            "aged to p2, it goes before the newer p2 by arrival, never before a p1 or an obligation owner"
+        assert testslots.suite_order("pa", now=now) == [owner, p1, p5, p2], "the account's 120 s step by default"
+        assert testslots.rank_text(p5, now, 900) == "p5 ranked p5" and testslots.rank_text(p5, now, 60) == "p5 ranked p2 (aged)"
     finally:
         for t in list(locks._TICKETS):
             locks.dequeue(t)
 
 
 def test_suite_slot_native_priority_breaks_an_aged_tie_until_the_fairness_bound(env):
-    # #4294: a native p3 aged to p1 (arrived 14:05, waited 38 min) took a lane before a native p1 that
-    # arrived at 14:08. Among equal ranks the native priority goes first; aging itself is unchanged, and a
-    # waiter past FAIR_STEPS aging steps (1 h by default) goes by arrival so a stream of p1s never starves it.
+    # #4294: among equal ranks the native priority goes first, and a waiter past FAIR_STEPS aging steps
+    # (1 h by default) goes by arrival among its rank so a stream of p2s never starves it. #5282: aging
+    # stops at p2, so a native p1 goes before every routine waiter however long it waited (the lane
+    # turned first-come, first-served once routine waits passed an hour).
     from ttp import locks, testslots
     age = testslots.SUITE_AGE_S
     assert testslots.FAIR_STEPS * age == 3600, "the documented 1 h default"
     now = 1_000_000.0
-    aged_p3 = _suite_ticket("pa", 3, now - 38 * 60)       # aged two steps, to p1
+    aged_p3 = _suite_ticket("pa", 3, now - 38 * 60)       # aged two steps, held at p2
     p1 = _suite_ticket("pa", 1, now - 35 * 60)
     p2 = _suite_ticket("pa", 2, now - 10 * 60)            # under one step: stays p2
     owner = _suite_ticket("pa", 0, now - 60)
     try:
-        assert testslots.suite_priority(aged_p3, now, age) == 1 == testslots.suite_priority(p1, now, age)
-        assert testslots.suite_order("pa", now=now, age=age) == [owner, p1, aged_p3, p2], \
-            "an obligation owner first; the native p1 before the earlier p3 aged to p1; the aged p3 before a native p2"
-        # Past the bound: arrival decides among its rank, before a newer native p1 (and still behind the owner).
-        assert testslots.suite_order("pa", now=now + 23 * 60, age=age) == [owner, aged_p3, p1, p2], \
-            "waited 61 min: by arrival among the p1s"
-        assert testslots.suite_order("pa", now=now + 21 * 60, age=age) == [owner, p1, p2, aged_p3], \
-            "59 min: not yet; the native p2, now aged to p1 too, also goes before the aged p3"
+        assert testslots.suite_priority(aged_p3, now, age) == 2 == testslots.suite_priority(p2, now, age)
+        assert testslots.suite_order("pa", now=now, age=age) == [owner, p1, p2, aged_p3], \
+            "an obligation owner first; then the p1; the native p2 before the earlier p3 aged to p2"
+        # Past the bound: arrival decides among its rank, before a newer native p2, never before the p1.
+        assert testslots.suite_order("pa", now=now + 23 * 60, age=age) == [owner, p1, aged_p3, p2], \
+            "waited 61 min: by arrival among the p2s"
+        assert testslots.suite_order("pa", now=now + 21 * 60, age=age) == [owner, p1, p2, aged_p3], "59 min: not yet"
         late_p1 = _suite_ticket("pa", 1, now + 22 * 60)   # a p1 arriving after the aged p3 passed the bound
-        assert testslots.suite_order("pa", now=now + 30 * 60, age=age)[:4] == [owner, aged_p3, p1, late_p1]
+        assert testslots.suite_order("pa", now=now + 30 * 60, age=age) == [owner, p1, late_p1, aged_p3, p2]
         # The bound scales with checks.priority_age_s: four 5-min steps.
-        assert testslots.suite_order("pa", now=now, age=300) == [owner, aged_p3, p1, late_p1, p2], \
-            "the p3 and the p1 past 20 min: by arrival; then native order: the new p1, then the p2 aged to p1"
+        assert testslots.suite_order("pa", now=now, age=300) == [owner, p1, late_p1, aged_p3, p2], \
+            "the p3 past 20 min goes by arrival among the p2s, behind both p1s"
+    finally:
+        for t in list(locks._TICKETS):
+            locks.dequeue(t)
+
+
+def test_suite_slot_p1_queued_after_hours_of_routine_waiters_starts_first_and_the_lane_line_says_so(env):
+    # #5282 (seen live): 19 waiters under a cap of 2, routine runs waiting hours; a p1 queued last sat at
+    # position 8 behind p2s, because aging ranked them all p1 and the fairness bound then went by arrival.
+    # The order the lanes grant (suite_order) and the position the wait report prints (checklane.waits)
+    # are one list: a new p1 is first in both, routine runs keep arrival order within their rank.
+    from ttp import checklane, locks, testslots
+    now = time.time()
+    routine = [_suite_ticket("pa", prio, now - (5 - i) * 3600, str(40 + i))
+               for i, prio in enumerate((3, 2, 3, 2, 4))]
+    p1 = _suite_ticket("pa", 1, now - 60, "50")
+    try:
+        order = testslots.suite_order("pa", now=now)
+        assert order[0] == p1, order
+        assert order[1:] == routine, "every routine waiter is past the fairness bound at p2: by arrival"
+        w = checklane.waits("pa", {}, now)
+        assert [x["task"] for x in w] == ["50", "40", "41", "42", "43", "44"], w
+        assert w[0]["position"] == 1 and w[0]["of"] == 6
     finally:
         for t in list(locks._TICKETS):
             locks.dequeue(t)
@@ -2755,10 +2778,10 @@ def test_long_wait_lines_order_by_the_project_s_priority_age_s_not_the_account_s
     cfg = p.config()
     assert checklane.priority_age_s(cfg) == 60
     now = time.time()
-    # A p3 that waited 3 project steps (180 s) ages to p1+ under the project's step, ahead of a
-    # newer p2 that arrived 30 s ago; under the account default (SUITE_AGE_S = 900) it would
-    # still rank p3, behind it.
-    old = _suite_ticket(p.name, 3, now - 3 * 60, "31")
+    # A p3 that waited 5 project steps (300 s) ages to p2 and passes the fairness bound under the
+    # project's step, ahead of a newer p2 that arrived 30 s ago; under the account default
+    # (SUITE_AGE_S = 900) it would still rank p3, behind it.
+    old = _suite_ticket(p.name, 3, now - 5 * 60, "31")
     new = _suite_ticket(p.name, 2, now - 30, "32")
     try:
         w = checklane.waits(p.name, cfg, now)
@@ -4556,13 +4579,13 @@ def test_status_lines_say_which_lane_or_cap_each_held_check_waits_on(env, tmp_pa
         assert set(by) == {"checks lane repository alpha", "checks lane repository beta",
                            "checks lane repository gamma"}, lines
         assert ("#12 p2 queued 0 min, running 0 min of its 1 h 0 min cap, 3 child processes alive; held: #31 p2 "
-                "ranked p1 (aged) 25 min, waits on repository alpha") \
+                "ranked p2 25 min, waits on repository alpha") \
             in by["checks lane repository alpha"], lines
         assert ("#14 p2 queued 0 min, has a lane 0 min, not running yet: waits on the host-wide checks slot, "
                 "3 child processes alive") \
             in by["checks lane repository beta"], lines
         assert by["checks lane repository gamma"].endswith(
-            "no holder; held: #32 p2 ranked p1 (aged) 26 min, waits on project cap (checks.test_project_max), "
+            "no holder; held: #32 p2 ranked p2 26 min, waits on project cap (checks.test_project_max), "
             "#33 p2 ranked p2 1 min, waits on project cap (checks.test_project_max)"), "behind a capped waiter: the cap"
         assert not any("full checks slot" in ln for ln in lines)
         long = checklane.long_wait_lines("pa", cfg, now)
