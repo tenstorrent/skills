@@ -18649,7 +18649,8 @@ def test_correction_without_a_class_fix_gets_one_course_check_line_that_a_harnes
     # A turn that adds a harness task for the class records it, and no line follows.
     mid2 = p.db.post("in", "Nobody noticed the watcher died", chat="c1")
     turn(3, {"messages": [mid2], "corrections": {str(mid2): "phrase 'nobody noticed'"}},
-         reply + [{"type": "task_add", "kind": "harness", "title": "detect a dead watcher", "spec": "s"}])
+         reply + [{"type": "task_add", "kind": "harness", "title": "detect a dead watcher",
+                   "spec": f"from correction #{mid2}"}])
     assert "correction without a class fix" not in coord.digest(p, {}, [], [])
     tid = p.db.one("SELECT id FROM tasks WHERE title='detect a dead watcher'")["id"]
     assert {r["msg"]: r["fix"] for r in p.db.kv(correction.KEY)} == {mid: "", mid2: f"#{tid}"}

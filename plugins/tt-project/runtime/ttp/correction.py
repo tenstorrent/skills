@@ -290,25 +290,28 @@ def _pending(db: DB, now: float) -> list[dict]:
     return out
 
 
+def _about(db: DB, mid: int, cls):
+    """Whether a task's title and spec (one string) are about correction message `mid` of class `cls`:
+    it cites the message ('correction #<id>', 'msg #<id>', 'message #<id>'), names a class anchor, or
+    shares ASK_WORDS+ subject words with the message."""
+    said = db.one("SELECT text FROM messages WHERE id=?", (int(mid),))
+    words = ask_words(said["text"]) if said else set()
+    cite = re.compile(rf"\b(?:correction|msg|message)\s*#?{int(mid)}\b", re.I)
+    terms = [a.removeprefix("key:") for a in _specific(cls) if not a.startswith("msg#")]
+    return lambda text: bool(
+        cite.search(text) or any(re.search(rf"(?<![\w.]){re.escape(t)}(?![\w.]*\w)", text.lower()) for t in terms)
+        or len(words & ask_words(text)) >= ASK_WORDS)
+
+
 def _later_fix(db: DB, rec: dict) -> str:
-    """The first harness (or upstream:) task added since correction `rec` arrived that is about it: its
-    title or spec cites the message ('correction #<id>', 'msg #<id>', 'message #<id>'), names a class
-    anchor, or shares ASK_WORDS+ subject words with the message. Any other harness task is no fix of it."""
+    """The first harness (or upstream:) task added since correction `rec` arrived that is about it
+    (_about). Any other harness task is no fix of it."""
     rows = db.q(f"SELECT id, title, spec FROM tasks WHERE created>=? AND (kind IN ({','.join('?' * len(FIX_KINDS))}) "
                 "OR lower(title) LIKE 'upstream:%') ORDER BY id", (float(rec.get("ts") or 0), *FIX_KINDS))
     if not rows:
         return ""
-    mid = int(rec["msg"])
-    said = db.one("SELECT text FROM messages WHERE id=?", (mid,))
-    words = ask_words(said["text"]) if said else set()
-    cite = re.compile(rf"\b(?:correction|msg|message)\s*#?{mid}\b", re.I)
-    terms = [a.removeprefix("key:") for a in _specific(rec.get("class")) if not a.startswith("msg#")]
-    for r in rows:
-        text = f"{r['title'] or ''}\n{r['spec'] or ''}"
-        if (cite.search(text) or any(re.search(rf"(?<![\w.]){re.escape(t)}(?![\w.]*\w)", text.lower()) for t in terms)
-                or len(words & ask_words(text)) >= ASK_WORDS):
-            return f"#{r['id']}"
-    return ""
+    about = _about(db, int(rec["msg"]), rec.get("class"))
+    return next((f"#{r['id']}" for r in rows if about(f"{r['title'] or ''}\n{r['spec'] or ''}")), "")
 
 
 def ask_words(text: str) -> set[str]:
@@ -472,18 +475,20 @@ def tag(why: str, mid: int | None = None) -> str:
     return f" [likely correction: {why}]"
 
 
-def class_fix(db: DB, actions: list, summary: str, mid: int, since: float, why: str = "") -> str:
-    """The turn's class fix for message `mid`: '#<task>' it added, 'reason' its summary gave, or ''.
-    For a repeated request (`why`) any queued change counts: a task of a kind not in NOT_FIX_KINDS."""
+def class_fix(db: DB, actions: list, summary: str, mid: int, since: float, why: str = "", cls=()) -> str:
+    """The turn's class fix for message `mid` of class `cls`: '#<task>' it added that is about it (_about),
+    'reason' its summary gave, or ''. For a repeated request (`why`) any queued change about it counts: a
+    task of a kind not in NOT_FIX_KINDS. A task about another correction of the turn is no fix of this one."""
     req = str(why or "").startswith(REQUEST)
     titles = [str(a.get("title") or "") for a in actions if isinstance(a, dict) and a.get("type") == "task_add"
               and (a.get("kind") in FIX_KINDS or str(a.get("title") or "").strip().lower().startswith("upstream:")
                    or (req and str(a.get("kind") or "work") not in NOT_FIX_KINDS))]
     if titles:
-        row = db.one(f"SELECT id FROM tasks WHERE created>=? AND title IN ({','.join('?' * len(titles))}) "
-                     "ORDER BY id LIMIT 1", (since, *titles))
-        if row:
-            return f"#{row['id']}"
+        about = _about(db, mid, cls)
+        for row in db.q(f"SELECT id, title, spec FROM tasks WHERE created>=? AND title IN "
+                        f"({','.join('?' * len(titles))}) ORDER BY id", (since, *titles)):
+            if about(f"{row['title'] or ''}\n{row['spec'] or ''}"):
+                return f"#{row['id']}"
     if re.search(rf"\bcorrection\s*#?{int(mid)}{_NOT}", summary or "", re.I):
         return "not"
     if re.search(rf"\bcorrection\s*#?{int(mid)}\b", summary or "", re.I):
@@ -533,18 +538,18 @@ def settle(db: DB, note: dict, actions: list, summary: str, started: float, now:
     for r in recs:
         if not r.get("fix") and (not r.get("shown") or r.get("refused")) and float(r.get("ts") or 0) < started:
             r["shown"] = True
-            r["fix"] = _refuse(recs, r, class_fix(db, actions, summary, int(r["msg"]), started, r.get("why") or "")
-                               or _later_fix(db, r), now)
+            r["fix"] = _refuse(recs, r, class_fix(db, actions, summary, int(r["msg"]), started, r.get("why") or "",
+                                                 r.get("class")) or _later_fix(db, r), now)
     got = {int(k): v for k, v in (note.get("corrections") or {}).items()}
     texts = {int(r["id"]): r["text"] or "" for r in db.q(
         f"SELECT id, text FROM messages WHERE id IN ({','.join('?' * len(got))})", list(got))} if got else {}
     for mid, why in got.items():
-        fix = class_fix(db, actions, summary, mid, started, str(why))
+        cls = by_msg[mid].get("class") if mid in by_msg else _class(str(why), texts.get(mid, ""))
+        fix = class_fix(db, actions, summary, mid, started, str(why), cls)
         if mid in by_msg:
             by_msg[mid]["fix"] = by_msg[mid].get("fix") or _refuse(recs, by_msg[mid], fix, now)
             continue
-        rec = {"msg": mid, "ts": now, "why": str(why)[:80], "class": _class(str(why), texts.get(mid, "")),
-               "shown": False}
+        rec = {"msg": mid, "ts": now, "why": str(why)[:80], "class": cls, "shown": False}
         rec["fix"] = _refuse(recs, rec, fix, now)
         recs.append(rec)
         by_msg[mid] = rec

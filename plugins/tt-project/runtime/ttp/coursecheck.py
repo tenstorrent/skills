@@ -19,7 +19,9 @@ so an idle project's digest does not grow. Each reuses a signal the harness alre
   user message touches (RULE_WORDS+ shared content words): the coordinator's reading of the rule may be
   blocking what the user asked more recently. Other cases of it are left to the prompt step.
 - recurring: a correction (correction.py) of the same class as an earlier one that got a class-fix task:
-  the mistake the project recorded a fix for happened again.
+  the mistake the project recorded a fix for happened again. Only a correction said (its message's ts)
+  after that fix task closed, or while it is open after it was created, counts; one a harness or
+  upstream: task added since cites (`correction|msg|message #<id>`) already has its own fix.
   A cancelled fix task whose class's later fix is recorded (`ttp task superseded <id> <task|sha>`) and
   still done counts as fixed.
 - report_only: a correction whose only follow-up is report-only: every enabled schedule citing it
@@ -220,17 +222,44 @@ def recurring(db: DB, at: float) -> list[dict]:
     from . import correction
     recs = sorted((r for r in correction._records(db) if not correction.false_ask_answer(db, r)),
                   key=lambda r: float(r.get("ts") or 0))   # a stored false open-ask match counts for nothing
+    said = {int(r["id"]): float(r["ts"] or 0) for r in db.q(
+        "SELECT id, ts FROM messages WHERE id IN (SELECT value FROM json_each(?))",
+        (json.dumps([int(r["msg"]) for r in recs]),))} if recs else {}
     out, seen = [], set()
     for i, later in enumerate(recs):
         cls = correction._specific(later.get("class"))
+        ts = said.get(int(later["msg"]), float(later.get("ts") or 0))   # when the user said it
+        if cls and _cited_fix(db, int(later["msg"]), min(ts, float(later.get("ts") or 0))):
+            continue
         for prior in recs[:i]:
             fix = str(prior.get("fix") or "")
             same = cls & correction._specific(prior.get("class")) or f"msg#{prior['msg']}" in cls
-            if fix.startswith("#") and same and later["msg"] not in seen and not _relinked(db, fix):
+            if (fix.startswith("#") and same and later["msg"] not in seen and not _relinked(db, fix)
+                    and _after_fix(db, fix, ts)):
                 seen.add(later["msg"])
                 out.append({"msg": later["msg"], "prior": prior["msg"], "fix": fix,
                             "cls": sorted(same)[0] if isinstance(same, set) else f"msg#{prior['msg']}"})
     return out
+
+
+def _after_fix(db: DB, fix: str, ts: float) -> bool:
+    """Whether a message said at `ts` came after fix task `fix` ('#<id>') finished (its last update once
+    closed), or while it is open, after it was created: an earlier one is no sign the fix did not hold."""
+    task = db.task(int(fix[1:])) if fix[1:].isdigit() else None
+    if not task:
+        return True
+    return ts > float((task["updated"] if task["status"] in TERMINAL_TASK_STATES else task["created"]) or 0)
+
+
+def _cited_fix(db: DB, mid: int, since: float) -> bool:
+    """Whether a harness or upstream: task created since `since`, not cancelled, cites correction `mid`
+    ('correction #<id>', 'msg #<id>', 'message #<id>'): that correction already has its own fix."""
+    from . import correction
+    cite = re.compile(rf"\b(?:correction|msg|message)\s*#?{int(mid)}\b", re.I)
+    kinds = correction.FIX_KINDS
+    return any(cite.search(f"{r['title'] or ''}\n{r['spec'] or ''}") for r in db.q(
+        f"SELECT title, spec FROM tasks WHERE created>=? AND status<>'cancelled' AND (kind IN "
+        f"({','.join('?' * len(kinds))}) OR lower(title) LIKE 'upstream:%')", (since, *kinds)))
 
 
 GATE_KINDS = ("harness", "code")   # a done task of these kinds citing the correction is its model-free gate

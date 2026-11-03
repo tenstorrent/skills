@@ -236,7 +236,7 @@ def _cc_cancelled_fix(p, now):
     """A correction class whose fix task was cancelled, and a later correction of that class."""
     from ttp import correction
     first = p.db.add_task("harness: catch the missed case", "s", kind="harness", origin="coordinator")
-    p.db.x("UPDATE tasks SET status='cancelled' WHERE id=?", (first,))
+    p.db.x("UPDATE tasks SET status='cancelled', created=?, updated=? WHERE id=?", (now - 7100, now - 7000, first))
     p.db.set_kv(correction.KEY, [
         {"msg": 10, "ts": now - 7200, "why": "phrase", "class": ["#42"], "fix": f"#{first}", "shown": True},
         {"msg": 20, "ts": now - 60, "why": "phrase", "class": ["#42"], "fix": "", "shown": False}])
@@ -416,3 +416,79 @@ def test_a_later_harness_task_is_a_corrections_class_fix_only_when_it_is_about_t
         tid = p.db.add_task(title, spec, kind="harness", origin="coordinator")
         assert correction._later_fix(p.db, rec) == f"#{tid}", title
         p.db.x("UPDATE tasks SET kind='work', title='x' WHERE id=?", (tid,))
+
+
+def test_a_turns_class_fix_task_counts_only_for_the_corrections_it_is_about(env):
+    """One turn settling corrections A and B with task_adds Y (about something else, added first) and X
+    (about B): A gets no class fix, B gets X; a task naming B's class anchor or sharing its subject words
+    counts too; with no task_add both get ''."""
+    from ttp import correction
+    p = make(env)
+    since = time.time() - 5
+    a = _cc_msg(p, "in", "user", "You missed that the nightly widgets build hung overnight", since)
+    b = _cc_msg(p, "in", "user", "Nobody noticed the gadget exporter dropped rows for #42", since)
+    note = {"corrections": {str(a): "phrase 'you missed'", str(b): "phrase 'nobody noticed'"}}
+    assert [correction.class_fix(p.db, [], "handled", m, since, "phrase", c) for m, c in ((a, []), (b, ["#42"]))] \
+        == ["", ""]
+    y = p.db.add_task("upstream: chat relay loses a reply", "on restart", kind="harness", origin="coordinator")
+    x = p.db.add_task("harness: catch dropped exporter rows", f"from msg #{b}", kind="harness", origin="coordinator")
+    acts = [{"type": "task_add", "kind": "harness", "title": "upstream: chat relay loses a reply"},
+            {"type": "task_add", "kind": "harness", "title": "harness: catch dropped exporter rows"}]
+    assert correction.class_fix(p.db, acts, "handled", a, since, "phrase", []) == ""
+    assert correction.class_fix(p.db, acts, "handled", b, since, "phrase", ["#42"]) == f"#{x}"
+    assert correction.class_fix(p.db, acts[:1], "handled", b, since, "phrase", ["#42"]) == ""
+    correction.settle(p.db, note, acts, "handled", since, time.time())
+    assert {r["msg"]: r["fix"] for r in p.db.kv(correction.KEY)} == {a: "", b: f"#{x}"}
+    assert y   # the first task_add of the turn credits no correction
+    # A repeated request credits only a queued change about it; a near id ('msg #<b>0') cites nothing.
+    req = f"{correction.REQUEST} 'already asked'"
+    for title, spec, want in (("work: speed up the docs site", f"see msg #{b}0", False),
+                              ("work: fix #42 exporter", "s", True),
+                              ("work: gadget exporter dropped rows", "s", True)):
+        tid = p.db.add_task(title, spec, kind="work", origin="coordinator")
+        got = correction.class_fix(p.db, [{"type": "task_add", "kind": "work", "title": title}], "handled", b,
+                                   since, req, ["#42"])
+        assert got == (f"#{tid}" if want else ""), title
+
+
+def test_recurring_counts_a_correction_only_when_said_after_the_prior_fix_and_not_already_fixed(env):
+    """Correction B of the class of A, whose fix task is T: no recurring line while B's message was said
+    before T was created, or before T finished once T is closed (the record ts does not count); none once a
+    harness or upstream: task added since B cites it ('msg #<B>'); a cancelled, older or near-id citation
+    keeps the line."""
+    from ttp import correction
+    p = make(env)
+    now = time.time()
+    t = p.db.add_task("harness: catch the missed widgets case", "s", kind="harness", origin="coordinator")
+    p.db.x("UPDATE tasks SET created=?, updated=? WHERE id=?", (now - 5000, now - 5000, t))
+    a = _cc_msg(p, "in", "user", "You missed the widgets case", now - 7200)
+    b = _cc_msg(p, "in", "user", "You missed the widgets case again", now - 6000)
+    p.db.set_kv(correction.KEY, [
+        {"msg": a, "ts": now - 7100, "why": "phrase", "class": ["#42", "key:cache.gc_days"], "fix": f"#{t}",
+         "shown": True},
+        {"msg": b, "ts": now - 60, "why": "phrase", "class": ["#42"], "fix": "reason", "shown": True}])
+
+    def line():
+        return [x for x in _cc(p, now)[0] if "recurring mistake" in x]
+    assert line() == []   # said before T was created
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (now - 4000, b))
+    assert len(line()) == 1   # T still open, said after it was created
+    p.db.x("UPDATE tasks SET status='done', updated=? WHERE id=?", (now - 3000, t))
+    assert line() == []   # said before T finished
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (now - 120, b))
+    assert len(line()) == 1 and f"correction #{b} repeats the class (#42) of correction #{a}" in line()[0]
+    for title, spec, created, status in (("harness: widgets case", f"from msg #{b}", now - 200, "done"),
+                                         ("harness: widgets case", f"from msg #{b}0", now - 60, "done"),
+                                         ("harness: widgets case", f"from msg #{b}", now - 60, "cancelled"),
+                                         ("plain work", f"from msg #{b}", now - 60, "done")):
+        tid = p.db.add_task(title, spec, kind="harness" if title.startswith("harness") else "work",
+                            origin="coordinator")
+        p.db.x("UPDATE tasks SET created=?, status=? WHERE id=?", (created, status, tid))
+        assert len(line()) == 1, (spec, created, status)
+    for title, spec in (("harness: widgets case", f"from msg #{b}"), (f"upstream: message #{b} again", "s")):
+        tid = p.db.add_task(title, spec, kind="harness" if title.startswith("harness") else "work",
+                            origin="coordinator")
+        p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+        assert line() == [], title
+        p.db.x("UPDATE tasks SET status='cancelled' WHERE id=?", (tid,))
+    assert len(line()) == 1
