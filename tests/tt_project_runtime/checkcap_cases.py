@@ -6047,3 +6047,131 @@ def test_push_checks_wait_for_the_load_guard_without_a_host_slot(env, monkeypatc
         t.join(30)
         for s in got:
             s.close()
+
+
+def test_checks_waiter_past_the_starve_bound_goes_before_a_later_priority_one_arrival(env, monkeypatch):
+    # A routine run that waited past checks.starve_s outranks later urgent (p1) arrivals for the next free
+    # slot; under the bound the bounded urgent turns still put the p1 first.
+    from ttp import checkcap, locks
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    held = checkcap.acquire("h")
+    now = time.time()
+    old = locks.enqueue(checkcap.slot_dir(), checkcap.RESOURCE, "old p2", since=now - 120, group="A", priority=2)
+    p1 = locks.enqueue(checkcap.slot_dir(), checkcap.RESOURCE, "new p1", since=now - 1, group="B", priority=1)
+    try:
+        monkeypatch.setenv(checkcap.STARVE_ENV, "600")
+        assert checkcap.state()["queued"] == ["new p1", "old p2"], "under the bound: urgent turns first"
+        monkeypatch.setenv(checkcap.STARVE_ENV, "60")
+        assert checkcap.state()["queued"] == ["old p2", "new p1"]
+        held.close()
+        every = checkcap.all_paths(1)
+        assert checkcap._take_in_turn(1, p1, checkcap.paths(1), every, "new p1", "", "") is None, \
+            "the p1 waits behind the aged run"
+        got = checkcap._take_in_turn(1, old, checkcap.paths(1), every, "old p2", "", "")
+        assert got is not None, "the aged run takes the next free slot"
+        got.close()
+        for bad in ("0", "-5", "inf", "nan", "x"):   # never off: the bound keeps routine runs from starving
+            monkeypatch.setenv(checkcap.STARVE_ENV, bad)
+            assert checkcap.starve_s() == checkcap.STARVE_S
+        monkeypatch.delenv(checkcap.STARVE_ENV)
+        assert checkcap.starve_s({"checks": {"starve_s": 900}}) == 900.0, "a project's checks.starve_s"
+    finally:
+        held.close()
+        locks.dequeue(old)
+        locks.dequeue(p1)
+
+
+def test_push_checks_hold_no_shared_test_slots_while_another_run_waits_for_them(env, monkeypatch):
+    # Back-to-back push checks took every test slot of their project's budget while a full run waited
+    # outside the checks queue for them. With any run waiting for test slots a push runs on its branch's
+    # reserved lane alone; with nobody waiting it takes pool slots as before.
+    from ttp import checkcap, locks, testslots
+    monkeypatch.setenv("TTP_TEST_POOL", "8")
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", "4")
+    push = testslots.acquire("push", project_name="pa", push_key="remote main", wait_s=0)
+    assert push.k == 4 and not locks.held_labels([testslots.reserved_path("remote main")]), "nobody waits: pool slots"
+    push.close()
+    for res in (checkcap.PARKED, testslots.TESTS.resource, f"{testslots.TESTS.own}.{locks.group_id('pa')}"):
+        waiter = locks.enqueue(checkcap.slot_dir(), res, "pa task #1 waiting", since=time.time() - 30, group="pa")
+        try:
+            assert testslots.others_wait("pa")
+            push = testslots.acquire("push", project_name="pa", push_key="remote main", wait_s=0)
+            assert push.k == 4 and push.files and \
+                locks.held_labels([testslots.reserved_path("remote main")]) == ["push"], res
+            pool = testslots.paths(8) + testslots.own_paths("pa", 8)
+            assert locks.held_labels(pool) == [], f"{res}: no pool or budget slot taken while a run waits"
+            push.close()
+        finally:
+            locks.dequeue(waiter)
+    assert not testslots.others_wait("pa")
+    other = locks.enqueue(checkcap.slot_dir(), f"{testslots.TESTS.own}.{locks.group_id('pb')}", "pb waiter", group="pb")
+    try:
+        assert not testslots.others_wait("pa"), "another project's budget line is not the push's to free"
+    finally:
+        locks.dequeue(other)
+
+
+def test_a_run_parked_past_the_starve_bound_gets_its_projects_next_test_slots(env, monkeypatch):
+    # A full run parked outside the queue (its test slots could not be taken) holds a PARKED ticket; once it
+    # has waited past checks.starve_s, later runs of its project find no room, it still does, other projects
+    # are not held, and the status line shows how long it has waited.
+    import threading
+    from ttp import checkcap, testslots
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    monkeypatch.setenv(checkcap.STARVE_ENV, "60")
+    monkeypatch.setenv("TTP_TEST_POOL", "8")
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", "4")
+    monkeypatch.setattr(testslots, "load_guard", lambda: "")
+    room, got = [False], []
+    since = time.time() - 120
+    rooms = []
+
+    def startable():
+        rooms.append(testslots.pool_room({}, "pa", since=since))   # what its own check reads
+        return room[0]
+
+    t = threading.Thread(target=lambda: got.append(checkcap.acquire(
+        "pa task #1 (run 9)", project_name="pa", since=since, startable=startable, max_wait_s=30)))
+    t.start()
+    try:
+        assert _wait_for(lambda: checkcap.state()["parked"])
+        assert [h for h, _ in checkcap.state()["parked"]] == ["pa task #1 (run 9)"]
+        assert "1 waiting outside the queue for test slots: pa task #1 (run 9) (waited 2.0 min)" in checkcap.line()
+        assert not testslots.pool_room({}, "pa"), "a later run of its project leaves it the next slots"
+        assert not testslots.pool_room({}, "pa", since=time.time() - 30)
+        assert testslots.pool_room({}, "pa", since=since - 1), "one that arrived before it is not held"
+        assert testslots.pool_room({}, "pb"), "another project is not held"
+        assert _wait_for(lambda: rooms) and rooms[-1], "the parked run itself is never held by its own ticket"
+        room[0] = True
+        t.join(30)
+        assert got and got[0].f is not None and not checkcap.state()["parked"], "it took a slot and left the line"
+        assert testslots.pool_room({}, "pa")
+    finally:
+        room[0] = True
+        t.join(30)
+        for s in got:
+            s and s.close()
+
+
+def test_checks_status_names_the_push_priority_holder_and_each_waiters_wait(env, monkeypatch):
+    import json
+    from ttp import checkcap, locks
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    held = checkcap.acquire("h")
+    key = "git@example:org/repo#main"
+    push = checkcap.acquire_priority(key, "proj push batch 5", "push checks")
+    path = checkcap.priority_path(key)
+    rec = json.loads(path.read_text())
+    path.write_text(json.dumps(rec | {"since": rec["since"] - 600}))   # it took the slot 10 min ago
+    w = locks.enqueue(checkcap.slot_dir(), checkcap.RESOURCE, "proj2 task #8 (run 3)", since=time.time() - 300,
+                      group="proj2", priority=2)
+    fresh = locks.enqueue(checkcap.slot_dir(), checkcap.RESOURCE, "proj3 task #9 (run 4)", group="proj3")
+    try:
+        line = checkcap.line()
+        assert "push priority slot: proj push batch 5 (held 10.0 min)" in line, line
+        assert "2 queued: proj2 task #8 (run 3) (waited 5.0 min); proj3 task #9 (run 4) (running: h)" in line, line
+    finally:
+        push.close()
+        held.close()
+        locks.dequeue(w)
+        locks.dequeue(fresh)

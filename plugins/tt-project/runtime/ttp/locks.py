@@ -1131,7 +1131,8 @@ def _served(locks_dir: Path, resource: str) -> dict[str, float]:
     return out
 
 
-def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urgent_max: int = 0) -> list[Path]:
+def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urgent_max: int = 0,
+               aged_before: float | None = None) -> list[Path]:
     """The waiters in the order a fair queue serves them: each next turn goes to the oldest waiter
     of the group that has waited longest since it last got the resource (since its oldest waiter
     arrived, if later), so one group's burst cannot starve the others. Within a group by task priority
@@ -1145,8 +1146,14 @@ def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urge
     Known gap: while some projects on a host still run a runtime from before fair ordering
     (arrival-order my_turn) or before urgent turns next to newer waiters, the orders can disagree on
     who goes first, so one slot may sit idle until another frees; this ends once every project on the
-    host is upgraded."""
+    host is upgraded.
+
+    `aged_before` (an epoch time): waiters that arrived at or before it have waited past their bound and go
+    first, by arrival, ahead of urgent ones and every turn above, so no waiter waits without a bound."""
     q = queued(locks_dir, resource) if q is None else q
+    aged = sorted((t for t in q if _arrival(t) <= aged_before), key=_arrival) if aged_before is not None else []
+    if aged:
+        q = [t for t in q if t not in aged]
     groups: dict[str, list[Path]] = {}
     for t in q:
         groups.setdefault(ticket_group(t), []).append(t)
@@ -1173,7 +1180,7 @@ def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urge
             key[g] = (1, len(out), "")
         else:
             del groups[g]
-    return out
+    return aged + out
 
 
 URGENT_PRIORITY = 1   # a waiter at this task priority or better is urgent in fair_order with urgent_max
@@ -1215,19 +1222,19 @@ def mark_turn(locks_dir: Path, resource: str, ticket: Path | None) -> None:
 
 
 def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool = False,
-            urgent_max: int = 0, past_multi: bool = False) -> bool:
+            urgent_max: int = 0, past_multi: bool = False, aged_before: float | None = None) -> bool:
     """Whether this ticket may take the resource now. An exclusive one: among the first `slots`
     waiters (urgent tickets, task priority URGENT_PRIORITY or better, before the rest), one per free
     slot, with no shared waiter ahead. A shared one: no exclusive waiter
     ahead, so it never jumps one. `fair`: waiters are counted in fair_order (with `urgent_max`), not
-    arrival order. `past_multi` (a waiter that holds locks already): waiters for several resources at
+    arrival order (and `aged_before` as there). `past_multi` (a waiter that holds locks already): waiters for several resources at
     once ahead are not counted, as one of them may wait for a lock this waiter's holder has: waiting
     behind it would never end."""
     q = queued(locks_dir, resource)
     if ticket not in q:
         return True
     if fair:
-        q = fair_order(locks_dir, resource, q, urgent_max)
+        q = fair_order(locks_dir, resource, q, urgent_max, aged_before)
     else:   # urgent waiters (an urgent task's) first, arrival order within: none, and it is plain arrival
         q = sorted(q, key=lambda t: not _urgent(t))
     ahead = [t for t in q[:q.index(ticket)] if not (past_multi and is_multi(t))]

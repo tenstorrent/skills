@@ -46,7 +46,9 @@ goes to the project's earliest waiter, never to whichever polls first. Checks ga
 a push to the push branch (`push_key`) never wait behind task checks or run short: with fewer than one
 run's grant free in the pool or their project's budget, they take that branch's reserved lane beyond
 both (RESERVED), which makes up one run's grant, holds for one push check of the branch at a time and
-which task checks never use.
+which task checks never use. While any other run waits for test slots (others_wait: a checks run parked
+for them, or a waiter in the host's or its project's line) they run on that lane alone and take none of
+the pool's or their project's slots, so back-to-back pushes never keep a waiting run out.
 
 A project's full checks (`ttp checks`) also hold its suite lock (suite_hold()): a second full run of
 the same project waits for the first, other projects never do. It is a file lock, so an exit, a crash
@@ -521,6 +523,10 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                     # An earlier waiter of its project goes back into the host's line first.
                     locks.dequeue(ticket)
                     ticket, why = None, f"{len(ahead)} earlier waiter(s) of its project go first"
+                elif push_key and kind is TESTS and others_wait(name) and \
+                        (f := locks.try_take([reserved_path(push_key)], holder, "push test slots", extra=extra)):
+                    # Others wait for the slots it would take: its branch's reserved lane alone (one run's grant).
+                    k, files, what = top, [f], f"{what} (its push branch's reserved lane alone: other runs wait for test slots)"
                 elif push_key:
                     k, files = _take(ps, own, room, holder, what, extra)
                     if k < top and (f := locks.try_take([reserved_path(push_key)], holder, "push test slots", extra=extra)):
@@ -830,7 +836,19 @@ def lane_waits(grant, what: str) -> None:
     _relabel_lanes(grant, {"waits": what})
 
 
-def pool_room(cfg: dict | None, project_name: str | None, full: bool = False, priority: int | None = None) -> bool:
+def others_wait(project_name: str | None) -> bool:
+    """Whether a run waits for test slots now: a checks run parked for them (checkcap.PARKED), or a waiter in
+    the host's line or `project_name`'s line (acquire)."""
+    d = checkcap.slot_dir()
+    try:
+        return bool(locks.queued(d, checkcap.PARKED) or locks.queued(d, TESTS.resource)
+                    or (project_name and locks.queued(d, f"{TESTS.own}.{locks.group_id(project_name)}")))
+    except OSError:
+        return False
+
+
+def pool_room(cfg: dict | None, project_name: str | None, full: bool = False, priority: int | None = None,
+              since: float | None = None) -> bool:
     """Whether a run could take its test slots now: the pool is off, or it has a slot free (pool_now)
     with nobody queued for one, and the project's budget (project_max) has one free. suite_hold's
     overflow lanes ask it, so a run takes one only once it can start beside the holders. With `full`
@@ -838,8 +856,11 @@ def pool_room(cfg: dict | None, project_name: str | None, full: bool = False, pr
     (load_guard) and the pool and the budget have run_min() free, so a run whose wait is bounded
     (checkspill.after_s) takes no host-wide checks slot only to hand it back at the bound. A priority-1
     run (`priority`) whose project's budget is held only by less urgent runs counts its urgent slots
-    instead (urgent_paths), as acquire takes them."""
+    instead (urgent_paths), as acquire takes them. A run of the project parked past checkcap.starve_s() that
+    arrived before `since` (this run's arrival; default now) goes first (checkcap.starved_ahead): no room."""
     if full and load_guard():
+        return False
+    if checkcap.starved_ahead(project_name, since):
         return False
     s = sizes(cfg)
     if s is None:

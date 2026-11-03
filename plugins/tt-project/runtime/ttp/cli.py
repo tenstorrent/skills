@@ -4235,7 +4235,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         if suite is None and (suite := hold(repo, lanes_now, lock=lock,
                                             cap=checklane.project_cap(cfg), cap_note=checklane.cap_note(cfg),
                                             worktree=top, headroom=checklane.headroom, pending=True, running=True,
-                                            startable=lambda: testslots.pool_room(cfg, p.name if p else None))) is None:
+                                            startable=lambda: testslots.pool_room(cfg, p.name if p else None, since=arrived))) is None:
             if tree is not None:
                 tree.close()
             return None
@@ -4247,7 +4247,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         # run (full=True below) it also waits for the load guard and checks.test_run_min free, so a wait
         # bounded by checkspill.after_s never takes and hands back a slot at each bound.
         startable = None if os.environ.get(testslots.HELD_ENV) else (
-            lambda: testslots.pool_room(cfg, p.name if p else None, full=True, priority=prio))
+            lambda: testslots.pool_room(cfg, p.name if p else None, full=True, priority=prio, since=arrived))
         while True:
             left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
             testslots.lane_waits(suite, "a host-wide checks slot")   # held, not running yet: status says why

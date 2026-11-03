@@ -34,6 +34,14 @@ at priority 1) go next: ahead of other waiters in the queue, taking turns by pro
 but at most `checks.priority_turns` (TTP_CHECKS_PRIORITY_TURNS, default PRIORITY_TURNS; 0 turns it off)
 turns in a row while other checks wait, so those still progress (locks.fair_order's `urgent_max`).
 
+No checks run waits without a bound: one that has waited `checks.starve_s` (TTP_CHECKS_STARVE_S, default
+STARVE_S, about one full suite run) goes ahead of every later arrival, priority-1 and obligation checks
+included, for the next free slot (locks.fair_order's `aged_before`). A run parked outside the queue for its
+test slots (acquire's `startable`) holds a PARKED ticket meanwhile, so the wait is visible: once it has
+waited that long, later runs of its project leave it their project's next free test slots
+(testslots.pool_room, starved_ahead), and push checks run on their branch's reserved test lane alone
+while any run waits for test slots (testslots.acquire), so a stream of pushes never holds them all.
+
 While the host is lightly loaded (1-minute load average under half its cores) up to `checks.load_extra`
 slots (TTP_CHECKS_LOAD_EXTRA, default EXTRA_SLOTS; 0 turns it off) open beyond the cap: two below a quarter of the cores, one
 below half. A check on one keeps it until it ends, but no new one takes one once the load rises.
@@ -73,6 +81,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -107,6 +116,9 @@ REEXEC_ENV = "TTP_CHECKS_REEXEC"
 UPGRADE_SETTLE_S = 10.0   # a newly installed version is adopted once seen this long (an install copies file by file)
 EXTRA_SLOTS = 2   # at most this many slots beyond the cap while the host is lightly loaded (extra())
 PRIORITY_TURNS = 3   # at most this many priority-1 turns in a row while other checks wait (priority_turns())
+PARKED = "checks-parked"   # the queue of runs waiting outside the checks queue for their test slots (acquire)
+STARVE_S = 3600.0   # default checks.starve_s: a run waiting this long goes before every later arrival (starve_s())
+STARVE_ENV = "TTP_CHECKS_STARVE_S"
 
 
 def slot_dir() -> Path:
@@ -305,6 +317,38 @@ def priority_turns() -> int:
     return PRIORITY_TURNS
 
 
+def starve_s(cfg: dict | None = None) -> float:
+    """Seconds a checks run waits at most before it outranks every later arrival (above): TTP_CHECKS_STARVE_S,
+    else checks.starve_s (the project's `cfg`, then the account's), else STARVE_S. Zero, negative or infinite
+    give the default: the bound is what keeps a routine run from starving."""
+    from . import checklane
+    try:
+        v = float(os.environ.get(STARVE_ENV) or checklane.setting(cfg, "starve_s") or STARVE_S)
+    except (TypeError, ValueError):
+        v = STARVE_S
+    return v if 0 < v < math.inf else STARVE_S
+
+
+def aged_before(now: float | None = None) -> float:
+    """The arrival time at or before which a waiter has waited past starve_s()."""
+    return (time.time() if now is None else now) - starve_s()
+
+
+def starved_ahead(project_name: str | None, since: float | None = None, now: float | None = None) -> list[Path]:
+    """The other parked runs of `project_name` (PARKED tickets) that have waited starve_s() or longer and arrived
+    before the asking run: its own PARKED ticket's arrival, else `since`, else now (a newcomer's)."""
+    now = time.time() if now is None else now
+    edge, gid = aged_before(now), locks.group_id(project_name)
+    try:
+        q = locks.queued(slot_dir(), PARKED)
+    except OSError:
+        return []
+    mine = getattr(_PARKS, "park", None)
+    me = locks._arrival(mine) if mine in q else now if since is None else since
+    return [t for t in q if t != mine and locks.ticket_group(t) == gid and locks._arrival(t) <= edge
+            and locks._arrival(t) < me]
+
+
 def _load() -> float:
     try:
         return os.getloadavg()[0]
@@ -416,17 +460,25 @@ def state() -> dict:
     n = limit()
     running = locks.held_labels(all_paths(n)) if n else []
     priority = locks.held_labels(priority_paths()) if n else []
-    queued, ahead, groups = [], {}, set()
-    for t in locks.fair_order(slot_dir(), RESOURCE, urgent_max=priority_turns()):
+    since = [float(r.get("since") or 0) for r in locks.holder_records(priority_paths())] if priority else []
+    queued, ahead, groups, arrived = [], {}, set(), []
+    for t in locks.fair_order(slot_dir(), RESOURCE, urgent_max=priority_turns(), aged_before=aged_before()):
         try:
             queued.append(t.read_text().strip())
         except OSError:
             continue
+        arrived.append(locks._arrival(t))
         if (g := locks.ticket_group(t) or t.name) not in groups:   # each project's next waiter
             groups.add(g)
             ahead[_project(queued[-1])] = len(queued) - 1
+    parked = []
+    for t in locks.queued(slot_dir(), PARKED) if n else []:
+        try:
+            parked.append((t.read_text().strip(), locks._arrival(t)))
+        except OSError:
+            continue
     return {"limit": n, "extra": extra(n), "running": running, "queued": queued, "priority": priority,
-            "ahead": ahead}
+            "ahead": ahead, "queued_at": arrived, "priority_since": since, "parked": parked}
 
 
 def _project(holder: str) -> str:
@@ -437,20 +489,30 @@ def _project(holder: str) -> str:
 def line() -> str:
     """One status line, or "" when nothing runs or waits."""
     s = state()
-    if not s["running"] and not s["queued"] and not s["priority"]:
+    if not s["running"] and not s["queued"] and not s["priority"] and not s["parked"]:
         return ""
+    now = time.time()
     cap = (f"cap {s['limit']}" + (f" +{s['extra']} while the load is low" if s["extra"] else "")
            if s["limit"] else "no cap")
     out = f"host checks: {len(s['running'])} running ({cap})"
     if s["priority"]:
-        out += f", push priority slot: {_some(s['priority'])}"
+        out += ", push priority slot: " + _some([_aged(h, t, now, "held") for h, t in
+                                                 zip(s["priority"], s["priority_since"] or [0.0] * len(s["priority"]))])
     if s["queued"]:
-        out += f", {len(s['queued'])} queued: " + _some(s["queued"])
+        out += f", {len(s['queued'])} queued: " + _some([_aged(h, t, now) for h, t in zip(s["queued"], s["queued_at"])])
+    if s["parked"]:
+        out += (f", {len(s['parked'])} waiting outside the queue for test slots: "
+                + _some([_aged(h, t, now) for h, t in s["parked"]]))
     if s["running"]:
         out += f" (running: {_some(s['running'])})"
     if s["ahead"]:
         out += "; next per project: " + ", ".join(f"{k} {v} ahead" for k, v in list(s["ahead"].items())[:6])
     return out
+
+
+def _aged(holder: str, at: float, now: float, verb: str = "waited") -> str:
+    """'holder (waited 12.0 min)', from a minute on; the bare holder before that or with no time."""
+    return f"{holder} ({verb} {_dur(now - at)})" if at and now - at >= 60 else holder
 
 
 def _some(labels: list[str]) -> str:
@@ -541,6 +603,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                                                    priority=priority)
         if parked and tell:   # told once a wait: its pool's room may come and go
             tell(PARKED_LINE)
+        park = _park(parked, None, queued_as, since, project_name, priority)
         if parked and parks:
             parks(True)
     except OSError as e:
@@ -556,6 +619,10 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                 raise Cancelled(why)
             twin = _running(every, same)
             was, parked = parked, not twin and bool(startable and not startable())
+            try:
+                park = _park(parked, park, queued_as, since, project_name, priority)
+            except OSError as e:
+                raise _unavailable(e) from e
             if parks and parked != was:
                 parks(parked)
             if (twin or parked) and ticket is not None:
@@ -590,7 +657,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                 return Slot(f)
             if time.time() - told >= TELL_S:
                 if tell and ticket is not None:
-                    q = locks.fair_order(slot_dir(), RESOURCE, urgent_max=priority_turns())
+                    q = locks.fair_order(slot_dir(), RESOURCE, urgent_max=priority_turns(), aged_before=aged_before())
                     ahead = q.index(ticket) if ticket in q else 0
                     groups = len({locks.ticket_group(t) for t in q} | {locks.ticket_group(ticket)})
                     tell(f"queued for a host-wide checks slot: {len(locks.held_labels(every))} of {n + extra(n)} running, "
@@ -606,8 +673,25 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             project.ps_cycle()   # pids are read once per poll cycle, never one `ps` each (ps_snapshot)
     finally:
         locks.dequeue(ticket)
+        _park(False, park, "", 0.0, None, None)
         if told and waiting:
             waiting(False)
+
+
+def _park(parked: bool, park: Path | None, holder: str, since: float, project_name: str | None,
+          priority: int | None) -> Path | None:
+    """The PARKED ticket a run holds while it waits outside the queue for its test slots (acquire), at its
+    arrival `since`; dropped once it no longer does."""
+    if parked and park is None:
+        park = _PARKS.park = locks.enqueue(slot_dir(), PARKED, holder, since, group=project_name, priority=priority)
+    elif not parked and park is not None:
+        _PARKS.park = None
+        locks.dequeue(park)
+        park = None
+    return park
+
+
+_PARKS = threading.local()   # .park: this thread's PARKED ticket, never in its own starved_ahead
 
 
 DONE_S = 30.0   # how often a waiter reads whether a recorded pass made its run needless
@@ -674,7 +758,8 @@ def _take(n: int, ps: list[Path], every: list[Path], holder: str, what: str, sam
 def _take_in_turn(n: int, ticket: Path, ps: list[Path], every: list[Path], holder: str, what: str, same: str):
     """locks.take_in_turn over the cap and the slots load opened beyond it."""
     room = _room(n, every)
-    if room <= 0 or not locks.my_turn(slot_dir(), RESOURCE, ticket, room, fair=True, urgent_max=priority_turns()):
+    if room <= 0 or not locks.my_turn(slot_dir(), RESOURCE, ticket, room, fair=True, urgent_max=priority_turns(),
+                                      aged_before=aged_before()):
         return None
     return _take(n, ps, every, holder, what, same, room)
 
