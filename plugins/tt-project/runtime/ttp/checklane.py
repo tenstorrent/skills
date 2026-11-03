@@ -434,6 +434,12 @@ def _pid_queued(pid) -> str:
     return ""
 
 
+def _parked(rec: dict) -> str:
+    """What a lane holder parked outside the host queue waits on (checkcap.acquire's `parks`, its lane
+    labelled testslots.PARKED_WAITS), else ""."""
+    return testslots.PARKED_WAITS + ", outside the host queue" if rec.get("waits") == testslots.PARKED_WAITS else ""
+
+
 def wrap_key(wrap) -> str:
     """The id of the wrapper lock a run's commands go behind (checks.wrap_cmd as argv words); "" for none.
     The one wrapper-lock detector: any wrapper, however it locks, gets its own single lane. A wrapper
@@ -952,7 +958,8 @@ def lane_status(project_name: str, now: float | None = None, cfg: dict | None = 
                           "command": str(r.get("command") or ""), "overflow": bool(r.get("overflow")), "urgent": bool(r.get("urgent")),
                           "cost": r.get("cost") or {}, "why": _why(r.get("holder")), **_task_state(db, r),
                           "stalled": _stalled(r, now, cfg),
-                          **({} if running is not None else {"waits_on": _pid_queued(r.get("pid")) or "no host queue (starting, or an older runtime)"})})
+                          **({} if running is not None else {"waits_on": _pid_queued(r.get("pid")) or _parked(r)
+                                                                or "no host queue (starting, or an older runtime)"})})
         q = testslots.suite_order(project_name, _live_tickets(base), now, age=age)
         on = _lane_waits_on(project_name, base, key, q, cfg, labels[key])
         waiters = []

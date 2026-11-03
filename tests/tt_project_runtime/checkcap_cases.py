@@ -5812,11 +5812,12 @@ def test_a_run_whose_projects_test_budget_is_full_takes_no_host_slot_and_keeps_i
     _budget_of_one(monkeypatch)
     a1_host, a1_tests = checkcap.acquire("a1"), testslots.acquire("a1", project_name="A")
     assert a1_tests.k == 1 and not testslots.pool_room({}, "A") and testslots.pool_room({}, "B")
-    told, got = [], {}
+    told, got, flips = [], {}, []
 
     def wait(name, project, since):
         got[name] = checkcap.acquire(name, tell=told.append, since=since, project_name=project, max_wait_s=30,
-                                     startable=lambda: testslots.pool_room({}, project))
+                                     startable=lambda: testslots.pool_room({}, project),
+                                     parks=lambda on: flips.append((name, on)))
     a2 = threading.Thread(target=wait, args=("a2", "A", 1000.0))
     a2.start()
     held, threads = [], [a2]
@@ -5838,6 +5839,7 @@ def test_a_run_whose_projects_test_budget_is_full_takes_no_host_slot_and_keeps_i
         got["b"].close()
         a2.join(30)
         assert got.get("a2") and got["a2"].f is not None, "A's run goes first: it kept its arrival"
+        assert flips == [("a2", True), ("a2", False)], "#5463: told once it parks and once it queues again"
         held.append(got["a2"])
         assert "c" not in got and checkcap.state()["queued"] == ["c"]
         a1_host.close()
@@ -5851,6 +5853,51 @@ def test_a_run_whose_projects_test_budget_is_full_takes_no_host_slot_and_keeps_i
             th.join(30)
         for s in held + list(got.values()):
             s and s.close()
+
+
+def test_a_checks_run_parked_for_its_test_budget_reads_so_in_status_until_it_starts(env, tmp_path, monkeypatch):
+    """#5463: while `ttp checks` (cli._checks_slot_take) waits outside the host queue for its project's
+    test-worker budget, its lane reads testslots.PARKED_WAITS through the real writer (checkcap.acquire's
+    `parks`), never 'a host-wide checks slot' or 'no host queue'; once it starts the label is cleared."""
+    import io
+    import threading
+    from ttp import checkcap, checklane, cli, locks, testslots
+    p = make(env)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "4")
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    monkeypatch.delenv("TTP_DETACHED", raising=False)
+    monkeypatch.delenv(testslots.HELD_ENV, raising=False)
+    monkeypatch.delenv(checkcap.HELD_ENV, raising=False)
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 30.0)
+    _budget_of_one(monkeypatch)
+    full = testslots.acquire("running", project_name=p.name)
+    got = []
+    t = threading.Thread(target=lambda: got.append(
+        cli._checks_slot(p, run_dir, io.StringIO(), "f" * 40, False, cmds=["true"], top=str(p.base))))
+
+    def holders():
+        return [h for lane in checklane.lane_status(p.name) for h in lane["lanes"]]
+    t.start()
+    try:
+        assert _wait_for(lambda: [h.get("waits_on") for h in holders()]
+                         == [testslots.PARKED_WAITS + ", outside the host queue"])
+        assert checkcap.state()["running"] == [] and checkcap.state()["queued"] == []
+        line = " ".join(checklane.lane_lines(p.name))
+        assert f"not running yet: waits on {testslots.PARKED_WAITS}, outside the host queue" in line
+        assert "a host-wide checks slot" not in line
+        assert "no host queue" not in line
+        full.close()
+        t.join(30)
+        assert got and got[0] is not None and got[0].f is not None, "it starts once its budget frees"
+        recs = [r for b in testslots.suite_bases(p.name) for r in locks.holder_records(testslots._lanes_of(b))]
+        assert recs and all(r.get("granted") and not r.get("waits") for r in recs), "started: its lane waits for nothing"
+        assert not any(testslots.PARKED_WAITS in str(h.get("waits_on")) for h in holders())
+    finally:
+        full.close()
+        t.join(30)
+        got and got[0] and got[0].close()
 
 
 def test_checks_and_push_checks_wait_for_their_projects_test_budget_without_a_host_slot(env, tmp_path, monkeypatch):

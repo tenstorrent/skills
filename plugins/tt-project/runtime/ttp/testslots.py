@@ -821,6 +821,9 @@ def slots_granted(grant) -> None:
     _relabel_lanes(grant, {"granted": True, "granted_at": time.time(), "waits": ""})
 
 
+PARKED_WAITS = "host test slots (project budget or pool full)"   # a lane's waits while checkcap.acquire parks it
+
+
 def lane_waits(grant, what: str) -> None:
     """Mark the lanes `grant` holds as waiting for `what` (a host-wide checks slot, host test slots)
     before they run: status says so (checklane.holder_text) and such a holder is no likely hang."""

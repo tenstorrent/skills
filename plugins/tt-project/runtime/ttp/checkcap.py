@@ -496,7 +496,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             priority: int | None = None, same: str = "", done: Callable[[], bool] | None = None,
             stop: Callable[[], str] | None = None, state: Path | None = None,
             owns: list[str] | tuple = (), cap: int | None = None, lane_at: float | None = None,
-            startable: Callable[[], bool] | None = None) -> Slot | None:
+            startable: Callable[[], bool] | None = None,
+            parks: Callable[[bool], None] | None = None) -> Slot | None:
     """Take a host-wide checks slot, waiting while all are held. Waiters take turns by project
     (`project_name`; none form their own group), within one by task priority (`priority`, 1 first;
     OBLIGATION_PRIORITY before it, its ticket marked OBLIGATION_MARK; none last), then arrival (locks.fair_order),
@@ -517,7 +518,9 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     A slot taken more than GRANT_TELL_S after `since` is told with its priority and arrival (grant_line),
     also when a relaunch that inherited `since` takes it at once. While `startable()` is false (the
     run's test slots could not be taken now: testslots.pool_room) it waits outside the queue as for
-    `same`, keeping `since`, so it holds no slot that only waits and the next project's waiter takes it."""
+    `same`, keeping `since`, so it holds no slot that only waits and the next project's waiter takes it;
+    `parks(True)` once it parks so and `parks(False)` once it leaves that wait (cli._checks_slot_take
+    relabels its lane: testslots.PARKED_WAITS)."""
     n = limit()
     if not n or os.environ.get(HELD_ENV):
         return Slot()
@@ -538,6 +541,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                                                    priority=priority)
         if parked and tell:   # told once a wait: its pool's room may come and go
             tell(PARKED_LINE)
+        if parked and parks:
+            parks(True)
     except OSError as e:
         raise _unavailable(e) from e
     started, told, checked, parked_told = time.time(), 0.0, time.time(), parked
@@ -550,7 +555,9 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             if stop and (why := stop()):
                 raise Cancelled(why)
             twin = _running(every, same)
-            parked = not twin and bool(startable and not startable())
+            was, parked = parked, not twin and bool(startable and not startable())
+            if parks and parked != was:
+                parks(parked)
             if (twin or parked) and ticket is not None:
                 # Same checks run now: wait for their result instead of a place a slot frees to. Its test
                 # slots cannot be taken now: a slot would only wait for them, so the next waiter takes it.

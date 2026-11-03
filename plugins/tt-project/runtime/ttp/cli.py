@@ -4256,7 +4256,9 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                                     waiting, left, arrived,
                                     p.name if p else None, prio, same, done, stop,
                                     p.state if p else None, owns, cap=checklane.project_cap(cfg), lane_at=lane_at,
-                                    startable=startable)
+                                    startable=startable,
+                                    parks=lambda on: testslots.lane_waits(
+                                        suite, testslots.PARKED_WAITS if on else "a host-wide checks slot"))
             if slot is None or slot.served:
                 suite.close()
                 return slot
