@@ -87,8 +87,9 @@ passed again for Claude Code with workers in the write fence (38 s, $0.12).
   `&&`, `;` or a pipe, also after `ttp lock <res> -- ssh ...`; a redirect to or from a file (`<`,
   `<<`, `> file`, `2>/dev/null`; `2>&1` is fine); `$(...)` or a backtick anywhere in the line, even
   inside quotes; ssh inside `bash -c` or `eval`; a script that runs ssh. There host names do not
-  resolve, and a refused 127.0.0.1 port is the sandbox's own loopback, not the host's: never a
-  sign that a host or tunnel is down. The hook refuses these forms. The workaround: a pipe goes
+  resolve, and 127.0.0.1 is the sandbox's own loopback: it reaches only the host ports forwarded
+  into it (see host loopback above), so a refused port there is a sandbox limit, never a sign that
+  a host or tunnel is down. The hook refuses these forms. The workaround: a pipe goes
   inside the quoted remote command (`ssh host 'cmd | tail -20'`), anything else into a local
   wrapper script (e.g. `ssh host 'bash -s' < remote.sh > out.txt`) run as
   `ttp lock <res> -- bash wrapper.sh`; `ttp lock <res> -- bash -c '...'` also works, while a plain

@@ -803,8 +803,9 @@ def fenced_ssh(segments: list[list[str]], cmd: str) -> str | None:
         f"{hit} reaches another host only as a simple command on its own. The sandbox frees `{hit} ...` "
         f"(also after `timeout N` or `ttp lock <res> --`) by name, but this line's {form} keeps the whole "
         f"line in the write fence, as does any `<`, `<<`, `> file`, `$(...)`, backtick, `bash -c` wrapper, "
-        f"`&&`, `;` or pipe (`2>&1` is fine). There host names do not resolve and a refused 127.0.0.1 "
-        f"port is the sandbox's own loopback, not the host's. Put a pipe inside the quoted remote command "
+        f"`&&`, `;` or pipe (`2>&1` is fine). There host names do not resolve and 127.0.0.1 is the "
+        f"sandbox's own loopback (only forwarded host ports answer), so a refusal is not a host or tunnel "
+        f"outage. Put a pipe inside the quoted remote command "
         f"(`ssh host 'cmd | tail -20'`), or write the line into a local wrapper script (e.g. "
         f"`ssh host 'bash -s' < remote.sh > out.txt`) and run `ttp lock <res> -- bash wrapper.sh`: a plain "
         f"`bash wrapper.sh` stays fenced")
