@@ -228,6 +228,12 @@ prolonged whole-box outage.
   number, or t390 for t39, never counts); a pid the hand-off lists in `leftover_procs`
   `[{pid, stop, ends}]` is left out. A project check that matches processes itself should compare
   the full resolved worktree path the same way, never a bare `t<id>`.
+  A harness task's checks also get the daemon's verdict on whether its commits land:
+  `TTP_HARNESS_LANDING` is `merged` (in the harness HEAD), `lands` (on the task's branch
+  `ttp/harness-t<id>`, which fast-forwards the harness HEAD: the daemon merges it when the run ends) or
+  `refused` (no harness commit named, one on neither line, or a branch that does not fast-forward),
+  with `TTP_HARNESS_LANDING_WHY` saying what the worker can do. A harness-landed check should fail only
+  on `refused`: a worker's sandbox cannot write the harness checkout, so it can never merge there itself.
 - A task that has ended (done, failed, cancelled, exhausted) can still leave processes behind. Its own
   ones are those of your user whose environment carries this project's `TTP_PROJECT`, the task's
   `TTP_TASK` and a `TTP_RUN_DIR` of one of its recorded runs. When such processes are the only ones with a

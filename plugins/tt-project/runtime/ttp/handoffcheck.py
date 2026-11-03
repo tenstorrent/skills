@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import shlex
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -127,6 +128,13 @@ def _run_one(p: Project, check: dict, task: dict, path: Path) -> tuple[int | str
     killed on a timeout."""
     env = dict(os.environ, TTP_RESULT_JSON=str(path), TTP_TASK_ID=str(task["id"]),
                TTP_TASK_KIND=str(task.get("kind") or "work"))
+    if task.get("kind") == "harness":   # the daemon's own verdict, so a check never asks for a merge the run cannot make
+        from . import harnesstree
+        try:
+            env["TTP_HARNESS_LANDING"], env["TTP_HARNESS_LANDING_WHY"] = harnesstree.handoff_landing(
+                p, dict(task, result=path.read_text()))   # the hand-off checked, not the stored one
+        except (OSError, subprocess.SubprocessError) as e:
+            env["TTP_HARNESS_LANDING"], env["TTP_HARNESS_LANDING_WHY"] = "", f"git could not tell: {e}"
     cmd = check["run"].replace("{result}", shlex.quote(str(path)))
     from . import boundedchild
     res = boundedchild.run(cmd, check["timeout_s"], shell=True, cwd=str(p.root), env=env, text=False,

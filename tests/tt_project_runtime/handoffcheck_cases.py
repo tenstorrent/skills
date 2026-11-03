@@ -318,3 +318,96 @@ def test_leftover_procs_as_a_hand_off_check_sends_back_only_for_a_live_process_i
     finally:
         stray.kill()
         stray.wait()
+
+
+# A project's harness-landed check, on the daemon's verdict (harnesstree.handoff_landing).
+_HARNESS_CHECK = ('echo "$TTP_HARNESS_LANDING|$TTP_HARNESS_LANDING_WHY" >> {log}; '
+                  'test "$TTP_HARNESS_LANDING" != refused || {{ echo "$TTP_HARNESS_LANDING_WHY"; exit 1; }}')
+
+
+def _hc_harness(env, p):
+    """A harness task with a worktree of its own (another harness run holds the checkout) and a check."""
+    from ttp import harnesstree
+    _harness_run(p, _harness_task(p, "other"))
+    tid = _hc_task(p, kind="harness")
+    own = harnesstree.workdir(p, tid)
+    assert own != p.harness
+    log = env["tmp"] / f"hl-{time.monotonic_ns()}.log"
+    cfg = json.loads(p.config_path.read_text())
+    cfg["worker"] = {"handoff_checks": [{"name": "harness landed", "kinds": ["harness"],
+                                         "run": _HARNESS_CHECK.format(log=shlex.quote(str(log)))}]}
+    p.config_path.write_text(json.dumps(cfg))
+    return tid, own, log
+
+
+def _read_only(root):
+    """Make every file and folder of the harness checkout's working tree read-only, as in a worker's
+    sandbox (its .git stays writable, as the daemon's merge needs); returns the undo."""
+    changed = []
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if x != ".git" or d != str(root)]
+        for x in [d, *(os.path.join(d, f) for f in files)]:
+            if not os.path.islink(x):
+                changed.append((x, os.stat(x).st_mode))
+                os.chmod(x, os.stat(x).st_mode & ~0o222)
+    return lambda: [os.chmod(x, m) for x, m in reversed(changed)]
+
+
+def test_a_harness_branch_that_fast_forwards_the_harness_passes_a_landed_check_in_a_read_only_checkout(env):
+    from ttp import harnesstree
+    p = make(env)
+    tid, own, log = _hc_harness(env, p)
+    _commit_in_harness_tree(own, "prompts/extra.md", "more\n", "prompt")
+    sha = _hgit(own, "rev-parse", "HEAD").strip()
+    head = _hgit(p.harness, "rev-parse", "HEAD").strip()
+    undo = _read_only(p.harness)
+    try:
+        t = _hc_hand_off(env, p, tid, {"status": "done", "summary": "tuned the prompt", "commit": sha})
+    finally:
+        undo()
+    assert t["status"] != "queued", t["result"]
+    [line] = log.read_text().splitlines()
+    assert line.startswith("lands|") and f"ttp/harness-t{tid}" in line and "merges it when the run ends" in line
+    assert _hgit(p.harness, "rev-parse", "HEAD").strip() == head, "the check merges nothing"
+    # Once the daemon merged it, the same hand-off reads as merged.
+    p.db.update_task(tid, status="done")
+    assert harnesstree.sweep(p, set()) == {tid: "merged"}
+    assert harnesstree.handoff_landing(p, p.db.task(tid))[0] == "merged"
+
+
+def test_a_diverged_harness_branch_or_an_unknown_commit_is_refused_with_steps_the_worker_can_take(env):
+    from ttp import harnesstree
+    p = make(env)
+    tid, own, log = _hc_harness(env, p)
+    _commit_in_harness_tree(own, "prompts/extra.md", "more\n", "prompt")
+    sha = _hgit(own, "rev-parse", "HEAD").strip()
+    _commit_in_harness_tree(p.harness, "prompts/other.md", "x\n", "main moved")
+    t = _hc_hand_off(env, p, tid, {"status": "done", "summary": "tuned", "commit": sha})
+    woke = json.loads(t["result"])["woke"]
+    assert t["status"] == "queued" and "does not fast-forward" in woke and "git rebase" in woke
+    assert "never merge into the harness checkout yourself" in woke and "--ff-only" not in woke
+    # rebased: it passes again
+    _hgit(own, "rebase", "-q", harnesstree.main_branch(p))
+    sha = _hgit(own, "rev-parse", "HEAD").strip()
+    task = dict(p.db.task(tid), result=json.dumps({"status": "done", "summary": "x", "commit": sha}))
+    assert harnesstree.handoff_landing(p, task)[0] == "lands"
+    # a commit the harness does not have, or none named, or one on neither line
+    for res in ({"summary": "commit deadbeefdeadbeef"}, {"summary": "no hash"}):
+        got, why = harnesstree.handoff_landing(p, dict(task, result=json.dumps(res)))
+        assert got == "refused" and "names no commit of the harness" in why
+    _hgit(p.harness, "checkout", "-q", "-b", "side")
+    _commit_in_harness_tree(p.harness, "prompts/side.md", "s\n", "side")
+    stray = _hgit(p.harness, "rev-parse", "HEAD").strip()
+    _hgit(p.harness, "checkout", "-q", "-")
+    got, why = harnesstree.handoff_landing(p, dict(task, result=json.dumps({"commit": stray})))
+    assert got == "refused" and f"neither in the harness HEAD nor on branch ttp/harness-t{tid}" in why
+
+
+def test_a_harness_landed_verdict_is_given_only_to_harness_tasks_checks(env):
+    p = make(env)
+    log = env["tmp"] / "kinds.log"
+    cfg = json.loads(p.config_path.read_text())
+    cfg["worker"] = {"handoff_checks": [{"name": "env", "run": f'echo "[$TTP_HARNESS_LANDING]" >> {shlex.quote(str(log))}'}]}
+    p.config_path.write_text(json.dumps(cfg))
+    _hc_hand_off(env, p, _hc_task(p), _GOOD)
+    assert log.read_text().splitlines() == ["[]"]
