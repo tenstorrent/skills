@@ -85,3 +85,224 @@ def test_daemon_logs_never_follow_a_symlink(env, tmp_path):
     with pytest.raises(OSError):
         dm.Daemon(p.base)._stacks_file()
     assert target.read_text() == "keep me\n"
+
+
+def _plant(path, target):
+    """A worker's planted symlink at `path`, aimed at `target` (kept as "keep me")."""
+    target.write_text("keep me\n")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
+    path.symlink_to(target)
+
+
+def _fake_popen(monkeypatch, module, started):
+    """`module`'s subprocess.Popen records its stdout instead of starting anything."""
+    def popen(argv, **kw):
+        started.append(kw.get("stdout"))
+        return types.SimpleNamespace(pid=os.getpid(), stdin=io.BytesIO(), wait=lambda *a, **k: 0)
+    monkeypatch.setattr(module.subprocess, "Popen", popen)
+
+
+def test_open_append_or_null_and_append_text_refuse_a_symlink_and_record_it_in_the_project(env, tmp_path):
+    from ttp import project as proj
+    p = make(env)
+    target = tmp_path / "victim.txt"
+    _plant(p.state / "x.log", target)
+    proj.refused_appends()
+    assert proj.append_text(p.state / "x.log", "one\n", p) is False
+    with proj.open_append_or_null(p.state / "x.log", "ab", "two\n") as f:
+        f.write(b"two\n")
+    assert target.read_text() == "keep me\n"
+    rows = p.db.q("SELECT data, status FROM events WHERE kind='append_refused'")
+    assert [json.loads(r["data"])["text"] for r in rows] == ["one\n"] and rows[0]["status"] == "handled"
+    assert [r["text"] for r in proj.refused_appends()] == ["two\n"], "kept for the daemon without a project"
+    assert proj.append_text(tmp_path / "plain.log", "ok\n") is True and (tmp_path / "plain.log").read_text() == "ok\n"
+
+
+def test_ttp_checks_log_and_its_handover_line_never_follow_a_symlink(env, tmp_path, monkeypatch, capsys):
+    from ttp import checkcap, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    target = tmp_path / "victim.txt"
+    _plant(run / "checks.log", target)
+    try:
+        cli.main(["checks", "--", "true"])
+    except SystemExit as e:
+        assert e.code in (0, None), capsys.readouterr()
+    assert target.read_text() == "keep me\n" and (run / "checks.log").is_symlink()
+    assert p.db.q("SELECT id FROM events WHERE kind='append_refused'"), "recorded in the project at once"
+    # The handover line (`ttp checks` in a tool call handing over to detached checks)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 0.2)
+    monkeypatch.setattr(cli, "_checks_detach", lambda *a, **k: None)
+    (repo / "b.txt").write_text("b\n")   # a new tree: no recorded pass to reuse
+    subprocess.run([*git, "add", "b.txt"], check=True)
+    subprocess.run([*git, "commit", "-qm", "b"], check=True)
+    holder = _cap_holder("other project task #3 (run 9)")
+    try:
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--", "true"])
+    finally:
+        holder.kill()
+        holder.wait()
+    assert e.value.code == 75 and cli.CHECKS_HANDOVER in capsys.readouterr().out
+    assert target.read_text() == "keep me\n"
+
+
+def test_checks_drop_notice_never_follows_a_symlink(tmp_path):
+    from ttp import cli, project as proj
+    run = tmp_path / "run"
+    run.mkdir()
+    target = tmp_path / "victim.txt"
+    _plant(run / "checks.log", target)
+    _plant(run / cli.CHECKS_OUT, target)
+    proj.refused_appends()
+    cli._checks_drop(run, "removed")
+    assert target.read_text() == "keep me\n"
+    assert (run / cli.CHECKS_RC).read_text().strip() == "1", "the drop is still recorded"
+    assert len(proj.refused_appends()) == 2
+
+
+def test_detached_checks_output_never_follows_a_symlink(env, tmp_path, monkeypatch):
+    from ttp import cli, project as proj
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    target = tmp_path / "victim.txt"
+    _plant(run / cli.CHECKS_OUT, target)
+    proj.refused_appends()
+    started = []
+    real = subprocess.Popen
+
+    def popen(argv, **kw):
+        if "--rc" not in argv:
+            return real(argv, **kw)
+        started.append(kw.get("stdout"))
+        return real(["true"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+    monkeypatch.setattr(cli.subprocess, "Popen", popen)
+    try:
+        cli.main(["checks", "--detach", "--", "true"])
+    except SystemExit:
+        pass
+    assert started and started[0].name == os.devnull, "the detached checks' output goes nowhere, not through it"
+    assert target.read_text() == "keep me\n"
+    assert any(r["path"] == str(run / cli.CHECKS_OUT) for r in proj.refused_appends())
+
+
+def test_checks_child_stop_line_never_follows_a_symlink(env, tmp_path, monkeypatch):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    target = tmp_path / "victim.txt"
+    _plant(run / "checks.log", target)
+    monkeypatch.setitem(cli._CHECK_STOP, "stopped", None)
+    handlers = {sig: signal.getsignal(sig) for sig in cli._CHECK_STOP_SIGNALS}
+    monkeypatch.setattr(cli, "cmd_checks", lambda _a: cli._checks_stop(signal.SIGTERM, None))
+    monkeypatch.setattr(cli.sys, "stdin", io.TextIOWrapper(io.BytesIO(b"go\n")))
+    monkeypatch.setenv("TTP_CHECK_OUTPUT_DIR", str(run))
+    monkeypatch.delenv("TTP_CHECKS_TMP_FD", raising=False)
+    try:
+        code = cli._checks_child(types.SimpleNamespace(rc=str(run / cli.CHECKS_RC)))
+    finally:
+        for sig, h in handlers.items():
+            signal.signal(sig, h)
+    assert code == 143 and (run / cli.CHECKS_RC).read_text().strip() == "143"
+    assert target.read_text() == "keep me\n"
+
+
+def test_upgrade_unfinished_merge_line_never_follows_a_symlinked_upgrade_log(env, tmp_path, monkeypatch, capsys):
+    p = make(env)
+    from ttp import cli, service
+    monkeypatch.setattr(service, "restart", lambda p: "restarted")
+    h = p.harness
+    ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
+    _git_out(h, "checkout", "-qb", "side")
+    (h / "prompts" / "worker.md").write_text("side change\n")
+    _git_out(h, *ident, "commit", "-qam", "side")
+    _git_out(h, "checkout", "-q", "-")
+    _git_out(h, *ident, "merge", "-q", "--no-commit", "--no-ff", "side")
+    _install_template(env)
+    target = tmp_path / "victim.txt"
+    _plant(p.logs / "upgrade.log", target)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    err = capsys.readouterr().err
+    assert e.value.code == 1 and "unfinished merge" in err and "refused to append to" in err
+    assert target.read_text() == "keep me\n"
+    rows = p.db.q("SELECT data FROM events WHERE kind='append_refused'")
+    assert rows and "unfinished merge" in json.loads(rows[0]["data"])["text"]
+
+
+def test_automatic_upgrade_launch_never_follows_a_symlinked_upgrade_log(env, tmp_path, monkeypatch):
+    from ttp import project as proj, release
+    p = make(env)
+    target = tmp_path / "victim.txt"
+    _plant(p.logs / "upgrade.log", target)
+    started = []
+    _fake_popen(monkeypatch, release, started)
+    proj.refused_appends()
+    release.launch(p)
+    assert started and started[0].name == os.devnull, "the upgrade still starts"
+    assert target.read_text() == "keep me\n"
+    assert "automatic upgrade" in proj.refused_appends()[0]["text"]
+
+
+def test_restart_request_never_follows_a_symlinked_restart_log(env, tmp_path, monkeypatch):
+    from ttp import project as proj, service
+    p = make(env)
+    target = tmp_path / "victim.txt"
+    _plant(p.logs / "restart.log", target)
+    started = []
+    _fake_popen(monkeypatch, service, started)
+    (p.state / "restart.request").write_text(json.dumps({"at": time.time(), "pid": 1, "why": "upgrade"}))
+    proj.refused_appends()
+    try:
+        assert service.take_restart_request(p, time.time() - 3600), "the restart still starts"
+    finally:
+        service._helpers.pop(str(p.base), None)
+    assert started and started[0].name == os.devnull
+    assert target.read_text() == "keep me\n"
+    assert "restart requested" in proj.refused_appends()[0]["text"]
+
+
+def test_takeover_log_lines_never_follow_a_symlink(env, tmp_path, monkeypatch):
+    from ttp import deploy, project as proj, release
+    p = make(env)
+    target = tmp_path / "victim.txt"
+    path = deploy.takeover_log(p, p.name)
+    _plant(path, target)
+    proj.refused_appends()
+    deploy._log(p, p.name, "takeover outcome")
+    started = []
+    _fake_popen(monkeypatch, deploy, started)
+    (tmp_path / "rel" / "bin").mkdir(parents=True)
+    (tmp_path / "rel" / "bin" / "ttp").write_text("")
+    monkeypatch.setattr(release, "installed", lambda: tmp_path / "rel")
+    deploy.launch_takeover(p, p.name, 7)
+    assert started and started[0].name == os.devnull, "the takeover still starts"
+    assert target.read_text() == "keep me\n"
+    texts = [r["text"] for r in proj.refused_appends()]
+    assert "takeover outcome" in texts[0] and "host-side takeover" in texts[1]
+
+
+def test_push_log_lines_and_push_output_never_follow_a_symlink(env, tmp_path, monkeypatch):
+    from ttp import checkdirs, locks, project as proj, push
+    p = make(env)
+    target = tmp_path / "victim.txt"
+    log = p.state / "pushes" / "1.log"
+    _plant(log, target)
+    proj.refused_appends()
+    push._log_line(log, "a push line")   # no fsync on the null device: it carries on
+    marker = p.state / "pushes" / "1.json"
+    m = {"id": "1", "log": str(log), "repo": str(tmp_path)}
+    marker.write_text(json.dumps(m))
+    for name, fn in {"restore": lambda *a: tmp_path, "take": lambda out: open(tmp_path / "guard", "a+"),
+                     "environment": lambda out, env: dict(env), "reports": lambda out: out,
+                     "finish": lambda *a, **k: None, "cleanup": lambda *a, **k: None}.items():
+        monkeypatch.setattr(checkdirs, name, fn)
+    started = []
+    _fake_popen(monkeypatch, push, started)
+    monkeypatch.setattr(locks, "label_pid", lambda *a, **k: None)
+    monkeypatch.setattr(push, "renice", lambda *a, **k: None)
+    with open(tmp_path / "run.lock", "a+") as lock:
+        assert push._start(p, marker, m, lock, dict(os.environ)) == os.getpid(), "the push still starts"
+    assert started and started[0].name == os.devnull
+    assert target.read_text() == "keep me\n"
+    texts = [r["text"] for r in proj.refused_appends()]
+    assert "a push line" in texts[0] and "starting the push process" in texts[1]

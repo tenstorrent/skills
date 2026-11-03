@@ -2313,6 +2313,59 @@ def refused_appends() -> list[dict]:
     return out
 
 
+def note_refused_append(path, why: str, text: str = "", p=None) -> None:
+    """A refused append (open_append): stderr says so and the text is kept for refused_appends, which the
+    daemon records as an append_refused event each tick. With project `p` (a process other than the
+    daemon) it goes into p's events at once: a refusal in a short-lived command is never only on its
+    stderr."""
+    print(f"ttp: refused to append to {path}: {why}", file=sys.stderr)
+    _REFUSED_APPENDS.append({"ts": time.time(), "path": str(path), "why": why, "text": text[:2000]})
+    del _REFUSED_APPENDS[:-REFUSED_KEEP]
+    if p is not None:
+        try:
+            record_refused_appends(p.db)
+        except Exception:
+            pass   # still kept in this process's list
+
+
+def record_refused_appends(db) -> list[dict]:
+    """Insert each refused append kept in this process as a handled append_refused event (no model runs
+    for it); returns them. One that fails to insert stays kept, with the ones after it."""
+    rows = refused_appends()
+    for i, r in enumerate(rows):
+        try:
+            db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+                 (r["ts"], "daemon", "append_refused", "normal",
+                  f"refused to append to {r['path']}: {r['why']}"[:500], json.dumps(r), "handled"))
+        except Exception:
+            _REFUSED_APPENDS[:0] = rows[i:]
+            raise
+    return rows
+
+
+def open_append_or_null(path: Path, mode: str = "a", text: str = "", p=None):
+    """open_append(path, mode), or, when it refuses the path (a symlink or special file a worker
+    planted), the null device opened in `mode`: the caller carries on and what it writes is dropped.
+    The refusal is noted with `text`, the line the caller meant to write (note_refused_append)."""
+    try:
+        return open_append(path, mode)
+    except AppendRefused as e:
+        note_refused_append(path, e.strerror, text, p)
+        return open(os.devnull, mode.replace("+", ""))
+
+
+def append_text(path: Path, text: str, p=None) -> bool:
+    """Append `text` to `path` through open_append; False when it refused the path (noted, never raised)."""
+    try:
+        f = open_append(path)
+    except AppendRefused as e:
+        note_refused_append(path, e.strerror, text, p)
+        return False
+    with f:
+        f.write(text)
+    return True
+
+
 def durable_append(path: Path, text: str) -> bool:
     """Append `text` and sync it, so an appended line that was reported written survives a power
     cut. A file this creates gets its directory synced as well. A last line a crash cut short (no
@@ -2324,9 +2377,7 @@ def durable_append(path: Path, text: str) -> bool:
     try:
         f = open_append(path, "ab+")
     except AppendRefused as e:
-        print(f"ttp: refused to append to {path}: {e.strerror}", file=sys.stderr)
-        _REFUSED_APPENDS.append({"ts": time.time(), "path": str(path), "why": e.strerror, "text": text[:2000]})
-        del _REFUSED_APPENDS[:-REFUSED_KEEP]
+        note_refused_append(path, e.strerror, text)
         return False
     with f:
         if f.seek(0, os.SEEK_END):

@@ -1556,3 +1556,55 @@ def test_worker_hook_points_sudo_under_ttp_lock_to_host_run(env, monkeypatch, tm
     for cmd in ("ttp lock r -- ssh box 'sudo -n tt-smi -s'", "ttp lock r -- ttp host-run -- sudo -n x",
                 "ttp lock --probe r", "ttp lock r -- make test"):
         assert "host-run" not in why(cmd), cmd
+
+
+def test_a_lock_wait_notice_never_follows_a_symlinked_progress_log(env, tmp_path):
+    p = make(env)
+    run_dir = tmp_path / "wrun"
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text(json.dumps({"stall_s": 2}))
+    target = tmp_path / "victim.txt"
+    target.write_text("keep me\n")
+    (run_dir / "progress.md").symlink_to(target)
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
+    held, release = tmp_path / "held", tmp_path / "release"
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sh", "-c",
+                               f"touch {shlex.quote(str(held))}; {shlex.join(_until(release))}"], env=run_env)
+    try:
+        _wait_for_file(held, holder)
+        r = subprocess.run([sys.executable, str(TTP), "lock", "board", "--", "true"], capture_output=True,
+                           text=True, env={**run_env, "TTP_RUN_DIR": str(run_dir)}, timeout=60)
+    finally:
+        release.touch()
+        holder.wait(timeout=30)
+    assert r.returncode == 75 and "refused to append to" in r.stderr, r.stderr
+    assert target.read_text() == "keep me\n"
+    rows = p.db.q("SELECT data FROM events WHERE kind='append_refused'")
+    assert rows and "waiting for board" in json.loads(rows[0]["data"])["text"]
+
+
+def test_a_signalled_lock_waiter_never_follows_a_symlinked_progress_log(env, tmp_path):
+    p = make(env)
+    run_env = _lock_env(env, p)
+    held, go, run_dir = tmp_path / "held", tmp_path / "go", tmp_path / "run"
+    run_dir.mkdir()
+    target = tmp_path / "victim.txt"
+    target.write_text("keep me\n")
+    (run_dir / "progress.md").symlink_to(target)
+    h = _lock(run_env, "rig-a", cmd=("sh", "-c", f"touch {shlex.quote(str(held))}; {shlex.join(_until(go))}"))
+    w = None
+    try:
+        _wait_for_file(held, h)
+        w = _lock(dict(run_env, TTP_TEST_POLL_S="30", TTP_RUN_DIR=str(run_dir)), "rig-a")
+        _stderr_until(w, "waiting for")
+        time.sleep(0.3)
+        w.send_signal(signal.SIGTERM)
+        assert w.wait(timeout=30) == 143, "the waiter still ends with the signal"
+        err = w.stderr.read()
+    finally:
+        go.touch()
+        if w and w.poll() is None:
+            w.kill()
+    assert h.wait(timeout=30) == 0
+    assert f"SIGTERM received by pid {w.pid}" in err and "refused to append to" in err, err
+    assert target.read_text() == "keep me\n"

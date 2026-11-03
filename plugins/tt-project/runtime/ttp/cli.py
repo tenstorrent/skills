@@ -36,7 +36,8 @@ from . import schedule as sched
 from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
                       durable_append, durable_write, write_json, ACCOUNT_KEYS, DEFAULT_CONFIG, deep_merge,
                       load_account_settings, set_account_setting, zombie, device_timeout_max, command_env,
-                      NOTE_RUN_ENV, in_run, replace_copy, sync_all, MEMORY_AUDIENCES)
+                      NOTE_RUN_ENV, in_run, replace_copy, sync_all, MEMORY_AUDIENCES, append_text,
+                      open_append_or_null)
 from . import gitmemo
 
 RUNTIME = Path(__file__).resolve().parent.parent              # .../runtime (plugin or project copy)
@@ -3084,7 +3085,7 @@ def cmd_checks(a) -> None:
     (Path(run_dir) / "check_failure.json").unlink(missing_ok=True)
     (Path(run_dir) / slowtests.FILE).unlink(missing_ok=True)   # this run's slowest tests only
     start = log.stat().st_size if log.exists() else 0
-    with open(log, "a") as out:
+    with open_append_or_null(log, text=f"ttp checks: in {top} on {head[:12]}\n", p=p) as out:
         out.write(f"ttp checks: in {top} on {head[:12]}" + (" (purpose harness)" if purpose == "harness" else "")
                   + "\n")
         if warn:
@@ -3513,8 +3514,7 @@ def cmd_checks(a) -> None:
         except OSError as e:
             die(f"ttp checks: {e}")
         # Told only once they were started: a failed start says so, never that they run.
-        with open(log, "a") as out:
-            out.write(f"ttp checks: {CHECKS_HANDOVER}\n")
+        append_text(log, f"ttp checks: {CHECKS_HANDOVER}\n", p)
         print(f"ttp checks: {CHECKS_HANDOVER}", flush=True)
         sys.exit(75)
     env_problem, also, not_executed = None, False, []
@@ -3806,8 +3806,7 @@ def _checks_drop(run_dir: Path, why: str, rc: bool = True) -> None:
         line = f"ttp checks: dropped from the checks queue: {why}; run `ttp checks --detach` again\n"
         for name in (CHECKS_OUT, "checks.log"):
             try:
-                with open(run_dir / name, "a") as f:
-                    f.write(line)
+                append_text(run_dir / name, line)
             except OSError:
                 pass
     durable_write(run_dir / CHECKS_DROPPED, json.dumps({"status": "dropped", "why": why[:300], "at": time.time()}))
@@ -4764,7 +4763,7 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
         (run_dir / CHECKS_SLOT_CANCEL).unlink(missing_ok=True)
         (run_dir / CHECKS_DROPPED).unlink(missing_ok=True)
         # Appended: a run's earlier checks (their wait lines) stay above this one's
-        with open(run_dir / CHECKS_OUT, "ab") as out:
+        with open_append_or_null(run_dir / CHECKS_OUT, "ab") as out:
             child = subprocess.Popen([sys.executable, "-m", "ttp", "checks", "--rc", str(run_dir / CHECKS_RC),
                                       *(["--fresh"] if a.fresh else []), *(["--full"] if getattr(a, "full", False) else []),
                                       *(["--light"] if getattr(a, "light", False) else []),
@@ -4843,15 +4842,13 @@ def _checks_child(a) -> int:
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
         if code > 128:
-            with open(rc_file.parent / "checks.log", "a") as log:
-                log.write(f"ttp checks: stopped by signal {code - 128}\n")
+            append_text(rc_file.parent / "checks.log", f"ttp checks: stopped by signal {code - 128}\n")
     finally:
         stopped = _CHECK_STOP["stopped"]
         if released and stopped and code != stopped:
             # A stop whose SystemExit something caught on the way still ends the checks as stopped.
             code = stopped
-            with open(rc_file.parent / "checks.log", "a") as log:
-                log.write(f"ttp checks: stopped by signal {code - 128}\n")
+            append_text(rc_file.parent / "checks.log", f"ttp checks: stopped by signal {code - 128}\n")
         if tmp_fd is not None:
             os.close(tmp_fd)
             from . import checkdirs
@@ -5711,8 +5708,7 @@ def cmd_lock(a) -> None:
         print(f"ttp lock: {line}", file=sys.stderr, flush=True)
         if run_dir:
             try:
-                with open(run_dir / "progress.md", "a") as pf:
-                    pf.write(f"{timefmt.clock()} {line}\n")
+                append_text(run_dir / "progress.md", f"{timefmt.clock()} {line}\n")
             except OSError:
                 pass
         os.kill(os.getpid(), info.si_signo)
@@ -5865,8 +5861,7 @@ def cmd_lock(a) -> None:
             print(f"ttp lock: {line}", file=sys.stderr, flush=True)
             if run_dir:
                 try:
-                    with open(run_dir / "progress.md", "a") as pf:
-                        pf.write(f"{timefmt.clock()} {line}\n")
+                    append_text(run_dir / "progress.md", f"{timefmt.clock()} {line}\n", p)
                 except OSError:
                     pass
             told = time.time()
@@ -9612,8 +9607,7 @@ def _refuse_unfinished_merge(p: Project, auto: bool) -> None:
                                         "there restores HEAD")
     else:
         p.logs.mkdir(parents=True, exist_ok=True)
-        with open(p.logs / "upgrade.log", "a") as log:
-            log.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} ttp upgrade\n{msg}\n")
+        append_text(p.logs / "upgrade.log", f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} ttp upgrade\n{msg}\n", p)
     die(msg, 1)
 
 

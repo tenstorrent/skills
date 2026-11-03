@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 
 from . import locks, timefmt
-from .project import HOME_DIR, Project, durable_write, fsync_dir
+from .project import HOME_DIR, Project, durable_write, fsync_dir, open_append_or_null
 
 CHECK_S = 3600          # how often the daemon compares the installed release with its harness
 HELD_RECHECK_S = 300    # a release held back by a push or an upgrade in flight is looked at again this soon
@@ -488,8 +488,9 @@ def launch(p: Project) -> None:
     daemon that started it (running workers are kept)."""
     p.logs.mkdir(parents=True, exist_ok=True)
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
-    with open(p.logs / "upgrade.log", "a") as log:
-        log.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} automatic upgrade\n")
+    line = f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} automatic upgrade\n"
+    with open_append_or_null(p.logs / "upgrade.log", text=line) as log:
+        log.write(line)
         log.flush()
         subprocess.Popen([sys.executable, str(installed() / "bin" / "ttp"), "upgrade", p.name, "--auto",
                           "--project-dir", str(p.base)], cwd=str(p.base), env=env, stdin=subprocess.DEVNULL,

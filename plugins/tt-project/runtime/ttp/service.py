@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 
 from . import poll_s
-from .project import Project, durable_write
+from .project import Project, durable_write, open_append_or_null
 from . import gitmemo
 
 
@@ -556,9 +556,10 @@ def take_restart_request(p: Project, started: float) -> bool:
     os.replace(req, taken)
     durable_write(taken, json.dumps({**info, "taken": time.time()}))   # before the helper exists to remove it
     p.logs.mkdir(parents=True, exist_ok=True)
-    with open(p.logs / "restart.log", "a") as log:
-        log.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} restart requested by pid {info.get('pid', '?')}: "
-                  f"{str(info.get('why') or '')[-300:]}\n")
+    line = (f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} restart requested by pid {info.get('pid', '?')}: "
+            f"{str(info.get('why') or '')[-300:]}\n")
+    with open_append_or_null(p.logs / "restart.log", text=line) as log:
+        log.write(line)
         log.flush()
         _helpers[str(p.base)] = subprocess.Popen(
             [sys.executable, "-m", "ttp.service", str(p.base)], cwd=str(p.base), env={**os.environ, **_env(p)},

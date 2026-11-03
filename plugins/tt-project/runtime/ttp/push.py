@@ -42,8 +42,8 @@ from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, g
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, code_tasks_may_push, durable_append, durable_write, git_fsync_env, hostname,
-                      load_registry, nice_level, own_creates_pr_branch, own_push, push_queue_on, rebase_replace,
-                      renice, write_json)
+                      load_registry, nice_level, open_append_or_null, own_creates_pr_branch, own_push, push_queue_on,
+                      rebase_replace, renice, write_json)
 from .project import never_force as never_force_on
 
 # Exit codes, distinct so a worker can say why it did not push. BUSY: another push to the same
@@ -4146,10 +4146,12 @@ def _boxed() -> bool:
 
 def _log_line(log: Path, text: str) -> None:
     """Append a line to a push's log and sync it, so the log of a push that dies is never empty."""
-    with open(log, "ab") as out:
-        out.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} {text}\n".encode())
+    line = f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} {text}\n"
+    with open_append_or_null(log, "ab", line) as out:
+        out.write(line.encode())
         out.flush()
-        os.fsync(out.fileno())
+        if out.name != os.devnull:   # refused (open_append_or_null): the null device takes no fsync
+            os.fsync(out.fileno())
 
 
 def retries_of(v: Any) -> int:
@@ -4207,7 +4209,7 @@ def _start(p: Project, marker: Path, m: dict, lock, env: dict, nice: int = 0) ->
         env.update(PYTHONPATH=str(Path(__file__).resolve().parents[1]), TTP_PROJECT=str(p.base),
                    TTP_CHECKS_TMP_FD=str(guard.fileno()), **{RUN_LOCK_FD_ENV: str(lock.fileno())})
         _log_line(log, f"starting the push process for marker {marker}")
-        with open(log, "ab") as out:
+        with open_append_or_null(log, "ab") as out:
             child = subprocess.Popen([sys.executable, "-m", "ttp", "push", "--marker", str(marker),
                                       *(["--own"] if m.get("own") else [])],
                                      cwd=m["repo"], env=env, stdin=subprocess.PIPE, stdout=out,

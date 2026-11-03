@@ -193,8 +193,7 @@ def _log(p, name: str, line: str) -> None:
         path = takeover_log(p, name) if p is not None else None
         if path:
             path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "a") as log:
-                log.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} {line}\n")
+            project.append_text(path, f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} {line}\n")
     except OSError:
         pass
 
@@ -211,9 +210,10 @@ def launch_takeover(p, name: str, task: int | None) -> subprocess.Popen:
     argv = [sys.executable, str(ttp), "upgrade", name] + (["--take-over-from", str(task)] if task else [])
     path = takeover_log(p, name)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a") as log:
-        log.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} ttp upgrade {' '.join(argv[3:])} (host-side takeover "
-                  f"by {p.name})\n")
+    line = (f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} ttp upgrade {' '.join(argv[3:])} (host-side takeover "
+            f"by {p.name})\n")
+    with project.open_append_or_null(path, text=line) as log:
+        log.write(line)
         log.flush()
         return subprocess.Popen(argv, cwd=str(p.base), env=env, stdin=subprocess.DEVNULL, stdout=log,
                                 stderr=subprocess.STDOUT, start_new_session=True)
