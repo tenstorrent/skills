@@ -2904,7 +2904,9 @@ def cmd_checks(a) -> None:
             die("no project found for the check gap probe")
         sys.exit(0 if checkgaps.ready(p, a.gap, getattr(a, "gap_config", None)) else 1)
     if a.result:
-        sys.exit(_checks_result(Path(a.result)))
+        sys.exit(_checks_passed(Path(a.result)) if a.passed else _checks_result(Path(a.result)))
+    if getattr(a, "settle", None):
+        sys.exit(_checks_settle(Path(a.settle), a.head))
     if bad := _checks_cmd_error(a):
         die(f"ttp checks: {bad}")
     if getattr(a, "slot_status", False) or a.cmd[:1] == ["status"]:
@@ -5061,6 +5063,36 @@ def _checks_killed(run_dir: Path) -> str:
     if not isinstance(rec, dict) or float(rec.get("ts") or 0) < float(_read_checks_pid(run_dir).get("ts") or 0):
         return ""   # an earlier run's record
     return str(rec.get("killed") or "")
+
+
+def _checks_settle(run_dir: Path, head: str | None) -> int:
+    """`ttp checks --settle <run dir> --head <sha>`, an on_pass_cmd (checksettle): on a pass of the
+    run's checks on `head`, write the final hand-off to $TTP_RESULT; else write nothing, exit 1."""
+    from . import checksettle
+    out = os.environ.get("TTP_RESULT")
+    if not out:
+        die("ttp checks --settle is an on_pass_cmd: it writes the hand-off to $TTP_RESULT, which is not set", 2)
+    if not head:
+        die("ttp checks --settle needs --head <sha>: the commit the checks must have passed on", 2)
+    rc, what, handoff = checksettle.settle(run_dir, head)
+    if handoff is not None:
+        write_json(Path(out), handoff)
+    print(f"ttp checks --settle: {what}")
+    return rc
+
+
+def _checks_passed(run_dir: Path) -> int:
+    """`ttp checks --result RUN_DIR --passed`: the same report, but exit 0 only when the run's checks
+    finished and passed (checks.rc 0); 1 when they failed, died or still run. A pass-only test for an
+    on_pass_cmd: plain --result exits 0 on a failure too, as a wait must."""
+    if _checks_result(run_dir) != 0:
+        return 1
+    try:
+        rc = (run_dir / CHECKS_RC).read_text().strip()
+    except OSError:
+        rc = ""
+    print(f"ttp checks: {'passed' if rc == '0' else 'not passed (exit code ' + (rc or 'none') + ')'}")
+    return 0 if rc == "0" else 1
 
 
 def _checks_result(run_dir: Path) -> int:
@@ -10857,6 +10889,13 @@ def main(argv: list[str] | None = None) -> None:
                    help="with --detach: skip delivery.check_prestage, the short foreground run before the full checks")
     s.add_argument("--result", metavar="RUN_DIR",
                    help="run nothing: exit 0 once a run's detached checks finished or died, 1 while they run")
+    s.add_argument("--passed", action="store_true",
+                   help="with --result: exit 0 only when they finished and passed, 1 when they failed, died "
+                        "or still run (for an on_pass_cmd; a wait keeps plain --result)")
+    s.add_argument("--settle", metavar="RUN_DIR",
+                   help="an on_pass_cmd: on a pass of the run's detached checks on --head, write the final "
+                        "hand-off to $TTP_RESULT; else exit 1 writing nothing")
+    s.add_argument("--head", metavar="SHA", help="with --settle: the commit the checks must have passed on")
     s.add_argument("--env-ok", nargs="*", metavar="SIG", default=None,
                    help="run nothing: exit 0 once the named environment faults (or, with none named, every "
                         "open one) no longer hit a missing check runner, 1 while one does")

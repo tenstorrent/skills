@@ -37,6 +37,7 @@ from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import ackwait
+from . import checksettle
 from . import checksgone
 from . import rejcool
 from . import stalegate
@@ -4791,6 +4792,9 @@ class Daemon:
                       f"one (a login or status check), or the task wakes only at its retry timer", "queued", task["id"]))
         if rstatus == "waiting" and isinstance(result.get("retry_when"), str):
             result = self._pin_handoff_probe(task, r, run_dir, result)
+            result, how = checks_settle_fill(task, result, run_dir, push._own_ttp(self.p))
+            if how:
+                log(self.p, f"task {task['id']} hand-off: its checks wait {how}")
         jobs = _detached_jobs(run_dir)
         if jobs and (rstatus is None and status in ("ok", "timeout", "stalled")
                      or rstatus == "waiting" and not result.get("retry_when")):
@@ -15290,7 +15294,7 @@ def on_pass_problem(on_pass) -> str:
 
 
 # A waiting hand-off's fields a default on_pass (default_on_pass) carries into the final hand-off.
-DEFAULT_ON_PASS_KEYS = ("artifacts", "metrics", "self_check", "resolves", "no_push", "published", "outcome", "tried")
+DEFAULT_ON_PASS_KEYS = checksettle.KEYS
 # Spec text that leaves a code worker work after its checks pass: a landing it runs itself.
 LANDS_ITSELF_RE = re.compile(r"\bttp\s+push\b|\bland\s+(?:it|this|the\s+change|on)\b", re.I)
 
@@ -15315,6 +15319,39 @@ def default_on_pass(task: dict, full: dict) -> dict | None:
     return {"status": "done",
             "summary": f"{summary.strip()} (Its `ttp checks` passed; recorded model-free, the hand-off named no on_pass.)",
             **{k: full[k] for k in DEFAULT_ON_PASS_KEYS if k in full}}
+
+
+def checks_settle_fill(task: dict, result: dict, run_dir: Path, ttp: str) -> tuple[dict, str]:
+    """A waiting hand-off on a `ttp checks --result` wait that names no on_pass or on_pass_cmd, where
+    default_on_pass records nothing: with `ttp checks --settle <dir> --head <sha>` (checksettle) filled
+    in as its on_pass_cmd when it asks for nothing after the pass, so a pass records `done` with no
+    model run. The head is its worktree's (checks.pid's, else the run's cwd) HEAD now; none found, or a
+    hand-off with a next_step, a PR, a wake_tier other than light, a review's verdict or a spec with a
+    PR or landing the worker runs, is kept as is (a model wakes for that work). Returns the hand-off
+    and what was done ('' when it is no such wait)."""
+    from .cli import _read_checks_pid
+    if not isinstance(result, dict) or result.get("status") != "waiting" or result.get("on_pass_cmd") is not None \
+            or "on_pass" in result or not _checks_result_wait(result.get("retry_when")):
+        return result, ""
+    if default_on_pass(task, result) is not None:
+        return result, ""
+    spec = str(task.get("spec") or "")
+    after = ("a next_step" if result.get("next_step") else "a PR" if result.get("pr")
+             else f"wake_tier {result['wake_tier']}" if result.get("wake_tier") not in (None, "", "light")
+             else "a review verdict" if task.get("kind") == "review"
+             else "a PR or landing in its spec" if prguard.delivery_instruction(spec) or LANDS_ITSELF_RE.search(spec)
+             else "")
+    if after:
+        return result, f"kept: it names {after}, so its pass wakes a model"
+    checks = Path(shlex.split(result["retry_when"])[3])
+    spec_file = _read_result(run_dir / "run.json") or {}
+    top = _read_checks_pid(checks).get("worktree") or spec_file.get("cwd")
+    head = checksettle._head_of(top) if isinstance(top, str) and top and Path(top).is_dir() else ""
+    if not head:
+        return result, "kept: no clean worktree head to settle on"
+    cmd = checksettle.command(ttp, checks, head)
+    # on_pass_cmd_orig None: the run's result.json named none, as after `ttp task set-when --on-pass-cmd`.
+    return {**result, "on_pass_cmd": cmd, "on_pass_cmd_orig": None}, f"got the on_pass_cmd `{cmd}` filled in"
 
 
 def push_on_pass(task: dict, full: dict) -> dict | None:
