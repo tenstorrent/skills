@@ -21246,7 +21246,8 @@ def test_agent_mode_test_scope_on_usable_machines_is_never_class_b_and_refusals_
 def test_charter_gate_reads_held_classes_only_from_the_clauses_an_edit_changes(env):
     """_held_lift on a quote edit (settled rule): clauses split at , ; : '.' and before ' and ' that starts a
     held step; a clause both sides keep is not read; every class runs on each changed clause, however
-    scope-like the edit; an added or dropped clause also reads its neighbours (fails closed); text the
+    scope-like the edit; an added or dropped clause also reads its neighbours and every clause of its
+    sentence on both sides (fails closed); text the
     split cannot separate is one clause, so its held words count."""
     from ttp import coordinator as coord
     assert coord._clauses("Run the test on box-a and post its summary; then stop. (user msg #3)") == [
@@ -21314,3 +21315,39 @@ def test_charter_gate_holds_a_plain_keep_pull_requests_in_draft_item_as_class_b(
     # a changed clause without draft or PR wording is unaffected
     wider = "Run the deployment test on box-a and box-b."
     assert edit(other, wider) == [] and wider in p.charter_path.read_text() and item in p.charter_path.read_text()
+
+
+def test_charter_gate_reads_a_dropped_clause_with_its_whole_sentence(env):
+    """Review #5589 case (1): a dropped clause ("never") is read with every clause of its sentence on both
+    sides, not only its one neighbour, so the merge it governed keeps the edit held."""
+    from ttp import coordinator as coord
+    cls, words, where = coord._held_lift("Restrictions", "Under any circumstances, merge a PR.",
+                                         "Never, under any circumstances, merge a PR.", "", "")
+    assert (cls, words) == ("speaks", "merge") and '"merge a pr"' in where and "same-sentence" in where
+    # a dropped sentence of its own reads only its neighbours, as before
+    assert coord._held_lift("Restrictions", "Run the test on box-a.", "Run the test on box-a. Then stop.",
+                            "", "")[0] == ""
+
+
+def test_charter_gate_reads_an_added_clause_with_its_whole_sentence(env):
+    """Review #5589 case (2): an ", except ..." clause inserted mid-sentence is read with every clause of its
+    sentence on both sides, so the ban two clauses away keeps the edit held."""
+    from ttp import coordinator as coord
+    cls, words, where = coord._held_lift(
+        "Restrictions", "Never merge PRs, on any repo, except when CI is green, in any case.",
+        "Never merge PRs, on any repo, in any case.", "", "")
+    assert (cls, words) == ("speaks", "merge") and '"never merge prs"' in where
+    # a '.' before a lower-case word ("e.g. box-a") ends no sentence: the ban stays in the sentence read
+    assert coord._held_lift("Restrictions", "Never merge PRs, e.g. on box-a, in any case, except when CI is green.",
+                            "Never merge PRs, e.g. on box-a, in any case.", "", "")[0] == "speaks"
+    # an added sentence after an unrelated one reads no held clause from other sentences
+    assert coord._held_lift("Restrictions", "Never merge PRs. Run the test on box-a, then stop.",
+                            "Never merge PRs. Run the test on box-a.", "", "")[0] == ""
+
+
+def test_charter_gate_reworded_clause_in_a_kept_sentence_is_the_documented_gap(env):
+    """Review #5589 case (3), the documented gap of the settled rule: a clause reworded inside a kept
+    sentence ("no exceptions" -> "exceptions when CI is green") reads only itself, so the edit goes in."""
+    from ttp import coordinator as coord
+    assert coord._held_lift("Restrictions", "Never merge PRs; this holds on every repo; exceptions when CI is green.",
+                            "Never merge PRs; this holds on every repo; no exceptions.", "", "") == ("", "", "")

@@ -4786,28 +4786,49 @@ def _held_lift(section: str, text: str, quote: str, replaced: str, gone: str) ->
 _CLAUSE_END = re.compile(r"[,;:](?=\s|$)|\.(?=\s|$)|\n")
 
 
-def _clauses(text: str) -> list[str]:
-    """`text` (source cites aside) split into clauses, compared loosely (_loose), empty ones dropped."""
-    out = []
-    for seg in _CLAUSE_END.split(restriction_source.bare(text)):
+def _clauses(text: str, sentences: bool = False) -> list:
+    """`text` (source cites aside) split into clauses, compared loosely (_loose), empty ones dropped.
+    `sentences`: (clause, the number of its sentence) pairs; a sentence ends only at a '.' before a capital
+    or the end ("e.g. box-a" goes on), so a doubtful end joins sentences (more is read: fails closed)."""
+    out, text = [], restriction_source.bare(text)
+    stops = [m.group(0) == "." and bool(re.match(r"\s*$|\s+[A-Z]", text[m.end():]))
+             for m in _CLAUSE_END.finditer(text)] + [False]
+    sent = 0
+    for seg, stop in zip(_CLAUSE_END.split(text), stops):
         cut = [m.start() for m in re.finditer(r"\s+and\s+", seg)
                if any(r.match(seg, m.end()) for r in relay._HELD_RE.values())]
-        out += [_loose(c) for c in (seg[a:b] for a, b in zip([0] + cut, cut + [len(seg)]))]
-    return [c for c in out if c]
+        out += [(_loose(c), sent) for c in (seg[a:b] for a, b in zip([0] + cut, cut + [len(seg)]))]
+        sent += stop
+    return [x if sentences else x[0] for x in out if x[0]]
 
 
 def _changed_clauses(old: str, new: str) -> list[tuple[str, str, str]]:
     """The clauses an edit from `old` to `new` changes, as (side, how, clause): those one side has and the
-    other does not keep in place. A clause only added or dropped (a list name cut off by a comma) cannot be
-    told apart from the clauses it sits between, so those are read as changed too: the check fails closed."""
-    o, n = _clauses(old), _clauses(new)
+    other does not keep in place. A clause only added or dropped (a "never" or an "except ..." cut off by
+    commas) may govern or be governed by any clause of its sentence, so every clause of that sentence is
+    read too, on both sides (and its neighbours across a sentence end): the check fails closed. A clause
+    reworded inside a kept sentence reads only itself (a documented gap)."""
+    o, n = _clauses(old, True), _clauses(new, True)
+    so, sn = [s for _, s in o], [s for _, s in n]
+    o, n = [c for c, _ in o], [c for c, _ in n]
     out: list[tuple[str, str, str]] = []
     for op, i1, i2, j1, j2 in difflib.SequenceMatcher(a=o, b=n, autojunk=False).get_opcodes():
         if op == "equal":
             continue
         out += [("the quoted item", "changed", c) for c in o[i1:i2]] + [("the new text", "changed", c) for c in n[j1:j2]]
-        if op != "replace":   # only added or dropped: its neighbours on both sides
-            out += [("the quoted item", "neighbouring", o[i]) for i in (i1 - 1, i2) if 0 <= i < len(o)]
+        if op == "replace":
+            continue
+        # only added or dropped: its neighbours, and every clause of its sentence on both sides
+        out += [("the quoted item", "neighbouring", o[i]) for i in (i1 - 1, i2) if 0 <= i < len(o)]
+        pairs = [(i, j) for i, j in ((i1 - 1, j1 - 1), (i2, j2)) if 0 <= i < len(o) and 0 <= j < len(n)]
+        if i1 < i2:   # dropped: its sentences, and those its kept neighbours sit in on the new side
+            ss_o = {so[i] for i in range(i1, i2)}
+            ss_n = {sn[j] for i, j in pairs if so[i] in ss_o}
+        else:   # added: the same the other way round
+            ss_n = {sn[j] for j in range(j1, j2)}
+            ss_o = {so[i] for i, j in pairs if sn[j] in ss_n}
+        out += [("the quoted item", "same-sentence", c) for i, c in enumerate(o) if so[i] in ss_o and not i1 <= i < i2]
+        out += [("the new text", "same-sentence", c) for j, c in enumerate(n) if sn[j] in ss_n and not j1 <= j < j2]
     return out
 
 

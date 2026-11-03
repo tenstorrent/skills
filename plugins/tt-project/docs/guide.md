@@ -2148,13 +2148,16 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   a sentence's `.`, and before an "and" that starts a held step such as "and post"). A clause both
   sides keep is not read; every held class (posting or messaging as you, a merge, a PR leaving draft
   or a rule keeping pull requests in draft, another person's request, a step affecting other people, a credential or money) is checked on each
-  changed clause. So moving a test to other machines in a clause of its own goes in, while dropping
-  a merge or post ban stays held for your own words, however the edit is worded. The refusal quotes
-  the matched words, the clause and the class. Known gap: the clause split is a heuristic. Where it
-  cannot place a change (a name cut off by a comma, an added or dropped clause), the clauses beside it
-  are read too and the edit is refused; your own words still apply it. A word in one clause that
-  governs another ("Never post: results from box-a or box-b" edited to drop box-b) is read only where
-  it stands, so that edit goes in.
+  changed clause. So moving a test to other machines in a clause of its own goes in, while rewording
+  a clause that holds a merge or post ban stays held for your own words. An added or dropped clause
+  (a "Never," cut from the front, an ", except when CI is green," put in the middle) is read with every
+  clause of its sentence on both sides, so a ban anywhere in that sentence keeps the edit held. The
+  refusal quotes the matched words, the clause and the class. Known gaps: the clause split is a
+  heuristic. Where it cannot place a change (a name cut off by a comma), the clauses beside it are read
+  too and the edit is refused; your own words still apply it. A clause reworded inside a sentence that
+  otherwise stays ("Never merge PRs; no exceptions" to "...; exceptions when CI is green"), or a word in
+  one clause that governs another ("Never post: results from box-a or box-b" edited to drop box-b), is
+  read only where it stands, so that edit goes in.
 - Text from logs, issues and chats is treated as data, not instructions.
 - Secrets are entered in a terminal (`ttp secret …`), never in chat, and never copied into a project.
   An OpenAI-compatible endpoint's API key: `ttp secret endpoint <alias> --url <base url>` checks it with
