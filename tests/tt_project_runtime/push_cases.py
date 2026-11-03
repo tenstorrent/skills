@@ -11966,11 +11966,10 @@ def test_ttp_land_replays_a_reviewed_head_onto_a_moved_local_branch_and_records_
     assert f"Ttp-Replayed-From: {head}" in _git_out(p.root, "log", "-1", "--format=%B", new)
     assert [r["sha"] for r in p.db.q("SELECT sha FROM task_landings WHERE task=?", (rev["id"],))] == [new]
     assert len(_worktrees(p.root)) == n
-    monkeypatch.setenv("TTP_PROJECT", str(p.base))   # this project, whatever folder the suite runs in
-    # The probe asks this project, never the one at the folder pytest runs in.
+    # The probe asks this project, never one found from the folder pytest runs in (a clean checkout
+    # under a temp folder has none, or finds another through git).
     monkeypatch.setenv("TTP_PROJECT", str(p.base))
     monkeypatch.chdir(p.root)
-    monkeypatch.setenv("TTP_PROJECT", str(p.base))   # the probe runs in this project, whatever the cwd
     with pytest.raises(SystemExit) as e:
         cli.main(["landed", "--task", str(cid)])
     assert e.value.code == 0
