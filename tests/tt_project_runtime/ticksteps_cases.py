@@ -1060,9 +1060,7 @@ def test_gitreplay_answers_a_kept_read_without_git_and_drops_it_when_its_branch_
     sh("commit", "-q", "--allow-empty", "-m", "one")
     first = sh("rev-parse", "HEAD")
     gitreplay.clear()
-    spawns = []
-    real = gitmemo._spawn
-    monkeypatch.setattr(gitmemo, "_spawn", lambda argv, t, kw: spawns.append(argv) or real(argv, t, kw))
+    spawns = _record_spawns(monkeypatch)
     rp = lambda rev: gitmemo.run(["git", "-C", str(repo), "rev-parse", rev], capture_output=True,   # noqa: E731
                                  text=True).stdout.strip()
     assert rp("main") == first and rp("main") == first and len(spawns) == 2, "outside an attempt: no memo"
@@ -1078,6 +1076,18 @@ def test_gitreplay_answers_a_kept_read_without_git_and_drops_it_when_its_branch_
     with gitmemo.attempt():
         gitmemo.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True)
     assert st.returncode == 0 and len(spawns) == n + 3, "a worktree read is kept only within its attempt"
+
+
+def _record_spawns(monkeypatch) -> list:
+    """Every git gitmemo spawns from here on. The system config lookup (gitcache._system_config, a
+    `git var` asked once per process, before the first kept read) is pinned, so the count does not
+    depend on whether an earlier test in this process already asked it."""
+    from ttp import gitcache, gitmemo
+    monkeypatch.setattr(gitcache, "_system", ["/etc/gitconfig"])
+    spawns = []
+    real = gitmemo._spawn
+    monkeypatch.setattr(gitmemo, "_spawn", lambda argv, t, kw: spawns.append(argv) or real(argv, t, kw))
+    return spawns
 
 
 def _fast_import(repo, n_commits=2000, n_branches=200):
@@ -1439,9 +1449,7 @@ def test_git_reflog_show_is_a_volatile_read_and_reflog_expire_or_delete_a_write(
     _git_out(repo, "init", "-q", "-b", "main")
     _git_out(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "c")
     gitreplay.clear()
-    spawns = []
-    real = gitmemo._spawn
-    monkeypatch.setattr(gitmemo, "_spawn", lambda argv, t, kw: spawns.append(argv) or real(argv, t, kw))
+    spawns = _record_spawns(monkeypatch)
     assert gitmemo.is_read(("reflog",)) and gitmemo.is_read(("reflog", "show", "main"))
     assert gitmemo.is_read(("reflog", "--format=%H", "main")) and gitmemo.is_read(("reflog", "exists", "main"))
     assert not gitmemo.is_read(("reflog", "expire", "--all")) and not gitmemo.is_read(("reflog", "delete", "x@{0}"))
