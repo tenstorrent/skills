@@ -148,13 +148,71 @@ def for_check(env: dict) -> dict:
 
 def _short(path: Path) -> str | None:
     """The short scratch the allocation's owner.json records, when it is still usable."""
-    from . import shorttmp
     try:
         with directory(path) as fd:
             tmp = _read(fd, OWNER).get('tmp')
-        return writable(tmp) if shorttmp.owned(tmp) else None
     except OSError:
         return None
+    return str(tmp) if _usable(tmp) else None
+
+
+def _usable(tmp) -> bool:
+    """`tmp` is a dir shorttmp.make() could have returned that exists here as a writable directory of
+    this user's (a push queued from a worker's sandbox may record one that exists only in there)."""
+    from . import shorttmp
+    if not shorttmp.owned(tmp):
+        return False
+    try:
+        with directory(tmp) as fd:
+            if os.fstat(fd).st_uid != os.getuid():
+                return False
+        writable(tmp)
+        return True
+    except OSError:
+        return False
+
+
+def short(path: Path, need=None) -> tuple[str | None, str]:
+    """Give the allocation `path` (its lifetime guard held) a short scratch usable by this process: the
+    one its owner.json records when _usable(), else a new one (shorttmp.make of `need`, a byte count or a
+    callable returning one), recorded there. Returns it and how: 'reused' or 'made'; (None, 'long') when
+    no short dir can be made or recorded, and the check keeps checks-tmp inside the allocation."""
+    from . import shorttmp
+    with directory(path) as fd:
+        owner = _read(fd, OWNER)
+        if not owner:
+            return None, 'long'   # nothing would remove a dir made for it
+        if _usable(owner.get('tmp')):
+            return str(owner['tmp']), 'reused'
+        tmp = shorttmp.make(need() if callable(need) else need)
+        owner['tmp'] = str(tmp) if tmp else None
+        try:
+            _write(fd, OWNER, owner)
+        except BaseException as e:
+            shorttmp.remove(tmp)
+            if not isinstance(e, OSError):
+                raise
+            return None, 'long'   # the old record stays, unusable here: _short() skips it
+        return (str(tmp), 'made') if tmp else (None, 'long')
+
+
+def _write(fd: int, name: str, data: dict) -> None:
+    """Replace `name` in the pinned directory `fd` with `data`, atomically and durably."""
+    part = f'.{name}-{uuid.uuid4().hex}'
+    out = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+    try:
+        with os.fdopen(out, 'w') as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(part, name, src_dir_fd=fd, dst_dir_fd=fd)
+    except BaseException:
+        try:
+            os.unlink(part, dir_fd=fd)
+        except OSError:
+            pass
+        raise
+    os.fsync(fd)
 
 
 def inherited() -> tuple[int, ...]:

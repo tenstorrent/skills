@@ -220,3 +220,97 @@ def test_the_ram_disk_test_hook_is_not_the_suites_tmpfs_opt_out(env, tmp_path, m
         tmp = shorttmp.make(4 * _GIB)
         assert tmp.parent == shorttmp.root() and not (tmp_path / "0").exists()
         shorttmp.remove(tmp)
+
+
+_BIND = ("import os, socket, sys, tempfile; t = tempfile.gettempdir(); "
+         "d = os.path.join(t, 'pytest-of-someone', 'pytest-12', 'test_a_check_that_binds_a_socket0'); "
+         "os.makedirs(d); s = socket.socket(socket.AF_UNIX)\n"
+         "try:\n    s.bind(os.path.join(d, 'sock')); ok = 'bound'\n"
+         "except OSError as e:\n    ok = 'failed'\n"
+         "open(sys.argv[1], 'w').write(t + '\\n' + ok + '\\n')")
+
+
+@pytest.mark.parametrize("recorded", ["missing", "reused", "none-possible"])
+def test_a_push_queued_from_a_sandbox_runs_its_checks_in_a_short_temp_dir(env, tmp_path, monkeypatch, capsys,
+                                                                          recorded):
+    """A push queued from a worker's sandbox records a short scratch that may exist only in there: the
+    daemon makes a new one when the recorded one is missing, reuses one that is still there and this
+    user's, and only when no short dir can be made logs and uses the long one under check-runs, where
+    an AF_UNIX socket under a pytest basetemp passes the path limit."""
+    from ttp import checkdirs, push, shorttmp
+    from ttp.project import Project
+    seen, script = tmp_path / "seen", tmp_path / "bind.py"
+    script.write_text(_BIND)
+    p, repo, origin, other = _push_setup(env, monkeypatch, [shlex.join([sys.executable, str(script), str(seen)])])
+    _commit(repo, "mine.txt", "mine\n")
+    monkeypatch.setattr(push, "_boxed", lambda: True)
+    assert _ttp("push", "--detach") == 0
+    marker = pathlib.Path(next(ln.split(": ", 1)[1] for ln in capsys.readouterr().out.splitlines()
+                               if ln.startswith("marker: ")))
+    output = pathlib.Path(push._read(marker)["check_run_dir"])
+    queued = json.loads((output / checkdirs.OWNER).read_text())["tmp"]
+    assert shorttmp.owned(queued) and pathlib.Path(queued).is_dir()
+    if recorded != "reused":
+        shorttmp.remove(queued)   # it was made in the worker's sandbox, gone with it
+    if recorded == "none-possible":
+        monkeypatch.setattr(shorttmp, "make", lambda need=None: None)
+    push.tend(Project(p.base))
+    result = _probe_until_done(p, push.result_probe(marker, p))
+    log = marker.with_suffix(".log").read_text()
+    assert "ttp push: pushed" in result.stdout, log
+    tmpdir, bound = seen.read_text().split()
+    line = next(ln for ln in log.splitlines() if "check scratch: " in ln)
+    if recorded == "none-possible":
+        assert pathlib.Path(tmpdir) == output / checkdirs.SCRATCH
+        assert f"check scratch: {output / checkdirs.SCRATCH} (long fallback" in line, line
+        return
+    assert "long fallback" not in log
+    assert pathlib.Path(tmpdir).parent == shorttmp.root() and shorttmp.owned(tmpdir)
+    assert (tmpdir == queued) is (recorded == "reused"), (tmpdir, queued)
+    assert f"check scratch: {tmpdir} (" in line
+    assert ("recorded when it was queued" if recorded == "reused" else "made at start") in line, line
+    assert len(tmpdir) < len(str(output / checkdirs.SCRATCH))
+    sock = len(os.path.join(tmpdir, "pytest-of-someone/pytest-12/test_a_check_that_binds_a_socket0/sock"))
+    if sock <= 104:   # the short test root itself may be long in a sandbox refusing /tmp
+        assert bound == "bound"
+    assert _wait_for(lambda: not pathlib.Path(tmpdir).exists()), "the push's short scratch was left behind"
+
+
+@pytest.mark.parametrize("recorded", ["file", "link", "foreign", "no-record"])
+def test_a_recorded_short_scratch_that_is_not_this_users_directory_is_replaced(env, tmp_path, monkeypatch,
+                                                                              recorded):
+    """The daemon never reuses a recorded short scratch that is a file, a link or another user's
+    directory: it makes and records a new one, leaving the old one alone. An allocation with no owner
+    record gets none, since nothing would remove it."""
+    from ttp import checkdirs, shorttmp
+    p = make(env)
+    output = checkdirs.new(p.state)
+    old = pathlib.Path(json.loads((output / checkdirs.OWNER).read_text())["tmp"])
+    if recorded in ("file", "link"):
+        old.rmdir()
+        if recorded == "file":
+            old.write_text("x")
+        else:
+            (tmp_path / "elsewhere").mkdir()
+            old.symlink_to(tmp_path / "elsewhere", target_is_directory=True)
+    elif recorded == "foreign":
+        ino, real = old.stat().st_ino, os.fstat
+
+        def fstat(fd):
+            st = real(fd)
+            return os.stat_result((*st[:4], st.st_uid + 1, *st[5:])) if st.st_ino == ino else st
+        monkeypatch.setattr(checkdirs.os, "fstat", fstat)
+    else:
+        (output / checkdirs.OWNER).unlink()
+    with checkdirs.take(output) as guard:
+        assert guard is not None
+        tmp, how = checkdirs.short(output, lambda: None)
+        if recorded == "no-record":
+            assert (tmp, how) == (None, "long") and not (output / checkdirs.OWNER).exists()
+            return
+        assert how == "made" and tmp != str(old) and shorttmp.owned(tmp) and pathlib.Path(tmp).is_dir()
+        assert json.loads((output / checkdirs.OWNER).read_text())["tmp"] == tmp
+        assert checkdirs.short(output) == (tmp, "reused")
+        assert os.path.lexists(old)   # not ours to remove
+    checkdirs.finish(output)
+    assert not pathlib.Path(tmp).exists()

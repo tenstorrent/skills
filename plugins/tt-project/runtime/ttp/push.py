@@ -4191,6 +4191,11 @@ def _note_retry(marker: Path, m: dict, cause: str, detail: str) -> dict:
     return m
 
 
+SCRATCH_HOW = {"reused": "the short temp dir recorded when it was queued",
+               "made": "a short temp dir made at start: the recorded one was missing or not this user's",
+               "long": "long fallback: no short temp dir could be made"}
+
+
 def _start(p: Project, marker: Path, m: dict, lock, env: dict, nice: int = 0) -> int:
     """Start the push process of `marker`, holding `lock` (its run lock, taken by the caller), `nice`
     levels below this process, write the marker as running, then give the go. Returns the pid."""
@@ -4202,6 +4207,9 @@ def _start(p: Project, marker: Path, m: dict, lock, env: dict, nice: int = 0) ->
     if guard is None:
         raise OSError("check scratch is busy")
     try:
+        # A push queued from a worker's sandbox recorded a short scratch that may exist only in there.
+        tmp, how = checkdirs.short(output, lambda: scratch_need(p, Path(m["repo"])))
+        _log_line(log, f"check scratch: {tmp or output / checkdirs.SCRATCH} ({SCRATCH_HOW[how]})")
         env = checkdirs.environment(output, env)
         # The guard is the check scratch's lifetime lock: the checks inherit it on purpose (checkdirs), so
         # their scratch outlives no process that uses it. The run lock is the push process's alone
