@@ -18841,11 +18841,11 @@ def test_a_second_none_for_the_same_class_within_a_week_is_refused_until_a_class
     correction.settle(p.db, {}, [], f"correction #{again}: still a one-off", now + 2, now + 3)
     assert correction.digest_lines(p.db, now + 4) == lines
     assert f"#{again} (phrase 'you missed') none (refused: same class as #{first})" in correction.audit_line(p.db, now - 60)
-    # A harness task for the class (it names #4100) clears it.
-    tid = p.db.add_task("pin review effort of #4100", "s", kind="harness", origin="coordinator")
+    # A harness task for the class (it cites the correction; #4100 alone names no number-only class) clears it.
+    title = f"pin review effort of #4100 (correction #{again})"
+    tid = p.db.add_task(title, "s", kind="harness", origin="coordinator")
     assert correction.digest_lines(p.db, now + 5) == []
-    correction.settle(p.db, {}, [{"type": "task_add", "kind": "harness", "title": "pin review effort of #4100",
-                                  "spec": "s"}],
+    correction.settle(p.db, {}, [{"type": "task_add", "kind": "harness", "title": title, "spec": "s"}],
                       "handled", now + 4, now + 5)
     rec = {r["msg"]: r for r in p.db.kv(correction.KEY)}[again]
     assert rec["fix"] == f"#{tid}" and "refused" not in rec

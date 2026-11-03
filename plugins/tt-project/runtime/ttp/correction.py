@@ -315,11 +315,14 @@ def _pending(db: DB, now: float) -> list[dict]:
 def _about(db: DB, mid: int, cls):
     """Whether a task's title and spec (one string) are about correction message `mid` of class `cls`:
     it cites the message ('correction #<id>', 'msg #<id>', 'message #<id>'), names a class anchor, or
-    shares ASK_WORDS+ subject words with the message."""
+    shares ASK_WORDS+ subject words with the message. A class of number anchors only ('#<n>', 'msg#<n>')
+    names no anchor a task can match: a task cites task and PR numbers for other reasons too."""
     said = db.one("SELECT text FROM messages WHERE id=?", (int(mid),))
     words = ask_words(said["text"]) if said else set()
     cite = re.compile(rf"\b(?:correction|msg|message)\s*#?{int(mid)}\b", re.I)
-    terms = [a.removeprefix("key:") for a in _specific(cls) if not a.startswith("msg#")]
+    cls = _specific(cls)
+    terms = [a.removeprefix("key:") for a in cls if not a.startswith("msg#")] \
+        if any(a.startswith("key:") for a in cls) else []
     return lambda text: bool(
         cite.search(text) or any(re.search(rf"(?<![\w.]){re.escape(t)}(?![\w.]*\w)", text.lower()) for t in terms)
         or len(words & ask_words(text)) >= ASK_WORDS)

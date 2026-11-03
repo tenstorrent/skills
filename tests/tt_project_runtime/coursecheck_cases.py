@@ -443,12 +443,39 @@ def test_a_turns_class_fix_task_counts_only_for_the_corrections_it_is_about(env)
     # A repeated request credits only a queued change about it; a near id ('msg #<b>0') cites nothing.
     req = f"{correction.REQUEST} 'already asked'"
     for title, spec, want in (("work: speed up the docs site", f"see msg #{b}0", False),
-                              ("work: fix #42 exporter", "s", True),
+                              ("work: fix #42 exporter", "s", False),   # a number-only class: anchors alone
                               ("work: gadget exporter dropped rows", "s", True)):
         tid = p.db.add_task(title, spec, kind="work", origin="coordinator")
         got = correction.class_fix(p.db, [{"type": "task_add", "kind": "work", "title": title}], "handled", b,
                                    since, req, ["#42"])
         assert got == (f"#{tid}" if want else ""), title
+
+
+def test_a_number_only_class_credits_a_task_only_for_its_subject_or_message_never_its_anchors(env):
+    """A correction whose class is task, PR or message numbers only ('#7', '#8', '#16', 'msg#<n>'): a task
+    citing those numbers for another reason (PR watching) is no class fix, by class_fix or _later_fix; one
+    sharing the correction's subject words or citing its message is. A class with a key still matches it."""
+    from ttp import correction
+    p = make(env)
+    since = time.time() - 5
+    first = _cc_msg(p, "in", "user", "first", since - 100)
+    mid = _cc_msg(p, "in", "user", "You missed that the gadget exporter dropped rows again, see #7 #8 #16", since)
+    cls = ["#16", "#7", "#8", f"msg#{first}"]
+    rec = {"msg": mid, "ts": since - 1, "why": "phrase 'you missed'", "class": cls}
+
+    def credit(title, spec, kind="harness", c=cls):
+        tid = p.db.add_task(title, spec, kind=kind, origin="coordinator")
+        got = (correction.class_fix(p.db, [{"type": "task_add", "kind": kind, "title": title}], "handled", mid,
+                                    since, "phrase", c), correction._later_fix(p.db, {**rec, "class": c}))
+        p.db.x("UPDATE tasks SET kind='work', title='x', spec='' WHERE id=?", (tid,))
+        assert got in ((f"#{tid}",) * 2, ("", "")), (title, got)
+        return bool(got[0])
+    for title, spec in (("harness: watch PRs #7 and #8 for review comments", "poll #16 too"),
+                        ("upstream: retry #7/#8 checks", f"after msg #{first}"), ("harness: #8", "#7 #16")):
+        assert credit(title, spec) is False, title
+    assert credit("harness: catch dropped gadget exporter rows", "s")
+    assert credit("harness: watch PRs #7 and #8", f"from correction #{mid}")
+    assert credit("upstream: retry #7/#8 checks", "s", c=[*cls, "key:cache.gc_days"])
 
 
 def test_recurring_counts_a_correction_only_when_said_after_the_prior_fix_and_not_already_fixed(env):
