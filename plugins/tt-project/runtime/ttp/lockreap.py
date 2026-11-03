@@ -158,10 +158,9 @@ def _held(path: Path) -> str:
 
 def label(path: Path) -> dict:
     try:
-        h = json.loads(Path(path).read_text() or "{}")
+        return locks.read_label(path)   # re-read when caught mid-rewrite
     except (OSError, ValueError):
         return {}
-    return h if isinstance(h, dict) else {}
 
 
 def _same_run(h: dict, pid: int) -> bool:

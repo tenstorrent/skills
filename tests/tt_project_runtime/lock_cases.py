@@ -851,6 +851,38 @@ def test_a_slot_label_rewrite_never_shows_a_held_slot_with_no_holder(tmp_path, m
         f.close()
 
 
+def test_a_held_slots_label_read_mid_rewrite_is_read_again_and_never_counts_the_slot_free(tmp_path, monkeypatch):
+    # A read that catches write_label mid-copy gets a torn label (new text over the old one's tail):
+    # it is read again, never skipped as if the slot were free (held_labels, so turn's free count and
+    # hold.covers; the reaper's label). One that never parses still counts the slot held.
+    import pathlib
+    from ttp import lockreap, locks
+    slot, other = tmp_path / "board.0.lock", tmp_path / "board.1.lock"
+    f = locks.try_take([slot], "task #2 (run 2)", "cmd")
+    good, torn, reads = slot.read_text(), [1], []
+    real = pathlib.Path.read_text
+
+    def read_text(self, *a, **kw):
+        if self != slot:
+            return real(self, *a, **kw)
+        reads.append(1)
+        if torn and torn[0] > 0:
+            torn[0] -= 1
+            return good[:len(good) // 2] + '"command": "cmd"}'   # the new text's start, the old one's tail
+        return real(self, *a, **kw)
+    monkeypatch.setattr(pathlib.Path, "read_text", read_text)
+    try:
+        assert locks.held_labels([slot, other]) == ["task #2 (run 2)"] and len(reads) == 2
+        torn[0] = 1
+        assert lockreap.label(slot)["holder"] == "task #2 (run 2)"
+        torn[0] = locks.LABEL_READS
+        assert locks.held_labels([slot, other]) == [""], "a held slot whose label never read counted free"
+        assert locks.turn(tmp_path, "board", tmp_path / "none", [slot]) is True   # not queued: its turn
+        assert len([x for x in locks.held_labels([slot]) if x is not None]) == 1
+    finally:
+        f.close()
+
+
 def test_a_runs_lock_passes_through_at_once_while_its_lineage_holds_the_resource(env, tmp_path):
     # The run's own whole-run hold (this run, or a detached job of it after a later run took it over):
     # its `ttp lock board` runs at once under the hold, without waiting. A pause still refuses it.

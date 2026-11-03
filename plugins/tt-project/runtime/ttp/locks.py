@@ -783,8 +783,29 @@ def probe_resources(cmd: str) -> list[str]:
     return [] if rest else [r for r, _ in found]
 
 
+LABEL_READS = 20   # read_label's reads of a label caught mid-rewrite, 1 ms apart
+
+
+def read_label(path: Path) -> dict:
+    """The label of slot file `path` ({} when empty or not an object). A read that catches its rewrite
+    (write_label) mid-copy does not parse: it is read again, LABEL_READS times at most; ValueError if it
+    never parses."""
+    for i in range(LABEL_READS):
+        text = Path(path).read_text()
+        try:
+            h = json.loads(text or "{}")
+        except ValueError:
+            if i == LABEL_READS - 1:
+                raise
+            time.sleep(0.001)
+            continue
+        return h if isinstance(h, dict) else {}
+    return {}
+
+
 def _slot_labels(paths: list[Path]) -> list[str]:
-    """The holder labels of the slots among paths whose lock is taken right now (not shared)."""
+    """The holder labels of the slots among paths whose lock is taken right now (not shared); "" for a
+    taken slot whose label does not read: it is held all the same."""
     out = []
     for path in paths:
         try:
@@ -794,8 +815,10 @@ def _slot_labels(paths: list[Path]) -> list[str]:
                     continue
                 except OSError:
                     pass
-            out.append(str(json.loads(path.read_text() or "{}").get("holder") or ""))
-        except (OSError, ValueError, AttributeError):
+            out.append(str(read_label(path).get("holder") or ""))
+        except ValueError:
+            out.append("")
+        except OSError:
             continue
     return out
 
