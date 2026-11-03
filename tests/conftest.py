@@ -35,6 +35,10 @@ other plugins' tests are untouched). It only dumps and kills nothing. The defaul
 slowest test call (about 30 s) and below `ttp checks`' silence limit (checkwall.SILENT_S, 10 min), so a
 hung test's stack is in the checks log before that limit ends the run. TTP_TEST_STACK_DUMP_S sets it (0:
 off); a faulthandler_timeout set in pytest's own config wins.
+
+Every test ends with the process's signal handlers and signal mask as they were before it
+(`_signals_kept`): a handler a test's in-process command installed and never restored (`ttp lock`'s
+wait exits 128 + the signal) made a later signal test in the same worker pass or fail by test order.
 """
 
 from __future__ import annotations
@@ -147,15 +151,36 @@ def stack_dump_s(config, path, environ=os.environ) -> float:
         return STACK_DUMP_S
 
 
+def _signals_kept():
+    """The Python-level signal handlers and the signal mask now; calling the result puts back any a
+    test changed (run in the main thread, where pytest runs the tests)."""
+    sigs = sorted(signal.valid_signals() - {signal.SIGKILL, signal.SIGSTOP})
+    handlers = {s: h for s in sigs if (h := signal.getsignal(s)) is not None}
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+
+    def restore() -> None:
+        for s, h in handlers.items():
+            try:
+                if signal.getsignal(s) is not h:
+                    signal.signal(s, h)
+            except (OSError, ValueError, TypeError):
+                pass
+        if signal.pthread_sigmask(signal.SIG_BLOCK, []) != mask:
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+    return restore
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_protocol(item, nextitem):
     import faulthandler
     t, fd = stack_dump_s(item.config, item.path), getattr(item.config, "_ttp_dump_fd", None)
     if t > 0 and fd is not None:
         faulthandler.dump_traceback_later(t, exit=False, file=fd)
+    restore = _signals_kept()
     try:
         yield
     finally:
+        restore()
         if t > 0 and fd is not None:
             faulthandler.cancel_dump_traceback_later()
 

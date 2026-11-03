@@ -1266,6 +1266,33 @@ def test_the_forked_test_runner_names_a_test_that_closes_or_replaces_its_workers
                         rf"finished: test {re.escape(nodeid)} closed or replaced the", failure), r.stdout
 
 
+@pytest.mark.parametrize("jobs", [1, 3])
+def test_the_test_runner_restores_the_signal_handlers_and_mask_a_test_left_changed(tmp_path, jobs):
+    """A SIGINT handler a test's in-process command left installed (`ttp lock`'s wait exits 130) made a
+    later signal test in the same worker fail by test order: every test starts with the handlers and
+    the signal mask the one before it started with, in one process and in forked workers."""
+    import shutil
+    import subprocess
+    shutil.copy(pathlib.Path(__file__).with_name("conftest.py"), tmp_path / "conftest.py")
+    (tmp_path / "test_tt_project_signals.py").write_text(
+        "import signal, sys, pytest\n"
+        "SIGS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGUSR1)\n"
+        "BEFORE = [signal.getsignal(s) for s in SIGS], signal.pthread_sigmask(signal.SIG_BLOCK, [])\n"
+        "@pytest.mark.parametrize('i', range(60))\n"
+        "def test_leaks(i):\n"
+        "    assert ([signal.getsignal(s) for s in SIGS], signal.pthread_sigmask(signal.SIG_BLOCK, [])) == BEFORE\n"
+        "    signal.signal(signal.SIGINT, lambda s, f: sys.exit(128 + s))\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "    signal.signal(signal.SIGHUP, lambda s, f: None)\n"
+        "    signal.signal(signal.SIGUSR1, signal.SIG_IGN)\n"
+        "    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGUSR2})\n")
+    env = {**os.environ, "TTP_TEST_JOBS": str(jobs)}
+    env.pop("CI", None)
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(tmp_path)],
+                       cwd=str(tmp_path), env=env, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0 and "60 passed" in r.stdout, r.stdout + r.stderr
+
+
 def _test_conftest():
     import importlib.util
     spec = importlib.util.spec_from_file_location("ttp_tests_conftest", pathlib.Path(__file__).with_name("conftest.py"))
