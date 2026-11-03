@@ -2999,8 +2999,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         and a.get("source") and restriction_source.turn_quote(db, a.get("source"), messages, False))
                     restr = _DATED.sub("", section.lstrip("# ")).lower().startswith("restriction") or (
                         _restriction_edit(p, section, quote, str(a.get("replaces") or "")))
-                    if by_agent and restr and (held := _held_lift(section, text, quote, replaced, gone)):
-                        raise ValueError(relay.held_refusal("charter_update", held) + "; a new ban the agent "
+                    held = _held_lift(section, text, quote, replaced, gone, _scope_names(p)) if (
+                        by_agent and restr) else ("", "", "")
+                    if held[0]:
+                        raise ValueError(relay.held_refusal("charter_update", *held) + "; a new ban the agent "
                                          "orders may still be added as its own item")
                     try:
                         target, extra, retired = _charter_update(p, section, text, quote, replaces, key,
@@ -3175,7 +3177,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 by_user = bool(said) if key in (MERGE_KEY, relay.AGENT_KEY) else user_turn
                 if key in NEEDS_USER and not by_user and not (key in SAFE_WHEN_OFF and ((value == OFF_VALUE[key]) if key in OFF_VALUE else value in (False, "", []))):
                     if key in HELD_SETTING and relay.agent_orders(cfg) and messages and relay.recent(db, messages):
-                        raise ValueError(relay.held_refusal(f"config_set {key}", HELD_SETTING[key]))
+                        raise ValueError(relay.held_refusal(f"config_set {key}", HELD_SETTING[key], key,
+                                                            "the setting name (HELD_SETTING)"))
                     open_ask = settinghold.asked(db, key)
                     raise ValueError(f"{key} needs the user's approval: "
                                      + (f"open ask #{open_ask} already asks; " if open_ask else
@@ -4758,20 +4761,74 @@ def _restriction_conflicts(p: Project, before: str, added: list[tuple[str, str]]
     return out
 
 
-def _held_lift(section: str, text: str, quote: str, replaced: str, gone: str) -> str:
-    """The relay.HELD class of what a charter_update may lift or permit, else "": the item a `quote`
-    edit rewords or removes (any rewording may loosen it in ways no judgment reliably sees, such as an
-    added scope), the items of a replaced Restrictions section `gone` the new text does not keep word
-    for word, or added text that may lift something (_may_lift). A new ban lifts nothing: the owner's
-    agent may always add one."""
+def _held_lift(section: str, text: str, quote: str, replaced: str, gone: str,
+               names: frozenset[str] = frozenset()) -> tuple[str, str, str]:
+    """(the relay.HELD class of what a charter_update may lift or permit, the words that matched its rule,
+    where they were found), else ("", "", ""): the item a `quote` edit rewords or removes (any rewording
+    may loosen it in ways no judgment reliably sees, such as an added scope), the items of a replaced
+    Restrictions section `gone` the new text does not keep word for word, or added text that may lift
+    something (_may_lift). A new ban lifts nothing: the owner's agent may always add one. An edit that
+    only changes which machines or resources (`names`, _scope_names) a test, job or run goes to speaks
+    for nobody: never class (b) (_scope_only); (a) and (c) are checked as for any edit."""
     norm = lambda t: " ".join(t.lower().split())
-    parts = [quote, text] if quote else []
+    parts = [("the quoted item", quote), ("the new text", text)] if quote else []
     if gone:
         kept = norm(text)
-        parts += [ln for ln in gone.splitlines() if ln.strip() and norm(ln) not in kept]
+        parts += [("a replaced line the new text drops or rewords", ln) for ln in gone.splitlines()
+                  if ln.strip() and norm(ln) not in kept]
     elif text and not quote and _may_lift(text):
-        parts += [replaced, text]
-    return relay.held_class(" ".join(parts))
+        parts += [("the replaced section", replaced), ("the new text", text)]
+    old = quote or "\n".join(t for w, t in parts if w != "the new text")
+    skip = ("speaks",) if old and _scope_only(old, text, names) else ()
+    whole, where = relay.held_match(" ".join(t for _, t in parts), skip), ""
+    if whole[0]:
+        where = next((w for w, t in parts if relay.held_match(t, skip)[0] == whole[0]), "")
+    return whole[0], whole[1], where
+
+
+# Words an edit that only re-scopes a test or job to other machines may change besides their names.
+_SCOPE_JOINERS = {"and", "or", "on", "to", "the", "a", "an", "of", "also", "plus", "both", "all", "each", "box",
+                  "boxes", "machine", "machines", "host", "hosts", "node", "nodes"}
+_JOB_RE = re.compile(r"\b(?:tests?|testing|jobs?|runs?|benchmarks?|builds?|workloads?|sweeps?|device runs?|ci)\b", re.I)
+_NAMEISH_RE = re.compile(r"[a-z0-9]+(?:[-_.][a-z0-9]+)+|[a-z]+\d[a-z0-9]*")
+
+
+def _scope_names(p: Project) -> frozenset[str]:
+    """The machines and resources the project may already use, lower case: the machine list's aliases and
+    host names, and the name-like words (with a digit, '-', '_' or '.') of the charter's Resources."""
+    from .prompts import charter_sections
+    out = {str(x).strip().lower() for a, m in machines.load().items() for x in (a, (m or {}).get("hostname")) if x}
+    for h, body in charter_sections(p.charter_path.read_text()):
+        if _DATED.sub("", h.lstrip("# ")).lower().startswith("resource"):
+            out.update(_NAMEISH_RE.findall("\n".join(body).lower()))
+    return frozenset(out - {""})
+
+
+def _scope_only(old: str, new: str, names: frozenset[str]) -> bool:
+    """Whether `new` differs from `old` (source cites aside) only in which machines or resources a test,
+    job or run goes to: each word it adds or drops is one of `names` or a joiner (or a dropped "only" next
+    to a name), at least one of `names` is added or dropped, and `new` names
+    a test, job or run. "run the test on box-a only" to "on box-a and box-b" is; "never merge" to
+    "merge", an added "except ..." or a name the project may not use is not."""
+    if not names or not _JOB_RE.search(new):
+        return False
+    o, n = (re.findall(r"[\w.-]*\w", _loose(restriction_source.bare(x))) for x in (old, new))
+    ops = [op for op in difflib.SequenceMatcher(a=o, b=n, autojunk=False).get_opcodes() if op[0] != "equal"]
+    if not ops:
+        return False
+    named = False
+    for _, i1, i2, j1, j2 in ops:
+        for w in n[j1:j2]:
+            if w not in names and w not in _SCOPE_JOINERS:
+                return False
+            named = named or w in names
+        for i in range(i1, i2):
+            w = o[i]
+            beside = {o[k] for k in (i - 1, i + 1) if 0 <= k < len(o)}
+            if not (w in names or w in _SCOPE_JOINERS or w == "only" and beside & names):
+                return False
+            named = named or w in names
+    return named
 
 
 def _restriction_edit(p: Project, section: str, quote: str, replaces: str) -> bool:

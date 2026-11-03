@@ -26,8 +26,9 @@ agent's context and findings count as the owner's word: the digest labels them A
 Charter changes (Restrictions too: adding, narrowing, widening, replacing or removing a cited item) and
 ask answers resting only on that agent's words apply as the owner's, cited "(relayer-ordered, msg #N)" and
 logged as a ORDERED_KIND event with the old text (ordered_line, the daily review). Never through it, the
-HELD classes (held_class, a refusal naming its class): a step that could affect people badly, one that
-speaks as the owner (a PR's ready or merge: the message's provenance decides; the merge list), and a
+HELD classes (held_match, a refusal naming its class and quoting the words that matched): a step that could
+affect people badly, one that speaks as the owner (a PR's ready or merge: the message's provenance decides; the
+merge list; never test or job scope on machines the project may use, coordinator._scope_only), and a
 credential, money or spend cap (the user-only settings, coordinator.NEEDS_USER). Nor text from anyone
 else (events, notes from other projects, PR comments, logs: none are messages and none reach this guard).
 """
@@ -119,14 +120,29 @@ _HELD_RE = {
                          r"purg\w*)\b", re.I)}
 
 
+def held_match(text: str, skip: tuple[str, ...] = ()) -> tuple[str, str]:
+    """(the HELD class `text` (what a change lifts or permits) falls in, checked (c), (b), (a), and the
+    words that matched its rule), else ("", ""). A record cite ("user msg #12", "message #40") is no
+    message sent: it is read as blank. `skip`: classes not checked."""
+    text = _RECORD.sub(" ", text or "")
+    for k in ("gate", "speaks", "people"):
+        m = None if k in skip else _HELD_RE[k].search(text)
+        if m:
+            return k, m.group(0)
+    return "", ""
+
+
 def held_class(text: str) -> str:
     """The HELD class `text` (what a change lifts or permits) falls in, checked (c), (b), (a), else ""."""
-    return next((k for k in ("gate", "speaks", "people") if _HELD_RE[k].search(text or "")), "")
+    return held_match(text)[0]
 
 
-def held_refusal(what: str, cls: str) -> str:
-    """The refusal of a step in HELD class `cls` that rests only on the owner's agent's words."""
-    return (f"{what} rejected: it falls in {HELD[cls]}, which the owner's own agent cannot order even with "
+def held_refusal(what: str, cls: str, words: str = "", where: str = "") -> str:
+    """The refusal of a step in HELD class `cls` that rests only on the owner's agent's words, quoting the
+    `words` that matched the class's rule (relay._HELD_RE[cls]) and `where` they were found."""
+    why = (f' (the words "{words}"{f" in {where}" if where else ""} matched class {HELD[cls][:3]}, its '
+           f'{cls!r} rule)' if words else "")
+    return (f"{what} rejected: it falls in {HELD[cls]}{why}, which the owner's own agent cannot order even with "
             f"{AGENT_KEY} on: it needs the owner's own words (the '{VERBATIM}' part of a message)")
 
 

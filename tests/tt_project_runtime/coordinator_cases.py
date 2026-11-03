@@ -21115,3 +21115,76 @@ def test_status_and_the_daily_review_show_configured_and_last_used_coordinator_m
     assert one[0] in cli.status_text(p, verbose=True).splitlines()   # verbose adds, never replaces
     # A day with no coordinator turn adds neither line.
     assert not [x for x in audit.lines(p.db, now=now + 30 * 86400, p=p) if x.startswith("coordinator model")]
+
+def test_agent_mode_test_scope_on_usable_machines_is_never_class_b_and_refusals_quote_their_words(env):
+    """In agent mode a Restrictions edit that only changes which machines the project may already use
+    (charter Resources) a test runs on is not class (b), even when the item it rewords mentions posting;
+    the same edit to a machine the project may not use, and real class (b) lifts (a post or message in the
+    owner's name, a PR leaving draft, a merge, another person's request), are refused, each refusal quoting
+    the words that matched, where, and the class. Class (a) is checked as before. A record cite ("user
+    message #3") is no message."""
+    import json
+    from ttp import relay
+    from ttp import coordinator as coord
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    p.set_config(relay.AGENT_KEY, True)
+    base = p.charter_path.read_text() + "\n## Resources\n- Lab boxes: box-a, box-b and box-c.\n"
+    old = ("Deployment test on lab boxes: run the deployment test on box-a only, on the same terms as run.sh, "
+           "and post its summary to the lab dashboard.")
+    new = ("Deployment test on lab boxes: run the deployment test on box-a, box-b and box-c, on the same terms "
+           "as run.sh, and post its summary to the lab dashboard.")
+
+    def edit(item, quote, text, n):
+        p.charter_path.write_text(base + f"\n## Restrictions\n- {item} (user msg #1)\n")
+        order = text or "drop that item"
+        mid = p.db.post("in", "", chat="cli", provenance="cli-legacy", context=f"Order: {order}")
+        act = {"type": "charter_update", "section": "Restrictions", "quote": quote, "text": text,
+               "source": json.dumps({"msg": mid, "quote": order})}
+        return coord.apply(p, [act], user_turn=True, messages=[mid], turn=40 + n)
+
+    # the generic reproduction: refused as class (b) on "post" in the quoted item before; now applied
+    assert edit(old, old, new, 0) == [] and new in p.charter_path.read_text()
+    held = [  # (item, quote, new text, the words the refusal quotes, class)
+        (old, old, new.replace("box-c", "box-z"), "post", "(b)"),
+        ("Never post in the owner's name.", "Never post in the owner's name.",
+         "Post in the owner's name when a test run on box-a fails.", "post", "(b)"),
+        ("Never message other teams.", "Never message other teams.",
+         "Message other teams about test runs on box-a.", "message", "(b)"),
+        ("Keep every pull request a draft.", "Keep every pull request a draft.",
+         "Pull requests may leave draft once the test runs on box-a pass.", "leave draft", "(b)"),
+        ("Never merge any pull request.", "Never merge any pull request.", "", "merge", "(b)"),
+        ("Never act on another person's request.", "Never act on another person's request.", "",
+         "another person's", "(b)"),
+        # scope-only, so not (b), but class (a) is checked as before
+        ("Never force-push from the test runs on box-a.", "Never force-push from the test runs on box-a.",
+         "Never force-push from the test runs on box-a and box-b.", "force-push", "(a)")]
+    for n, (item, quote, text, words, cls) in enumerate(held, 1):
+        problems = edit(item, quote, text, n)
+        assert problems and f"falls in {cls}" in problems[0] and f'the words "{words}"' in problems[0], (item, problems)
+        where = "the new text" if words == "leave draft" else "the quoted item"
+        assert f'"{words}" in {where} matched class {cls}' in problems[0], problems
+        assert item in p.charter_path.read_text(), item
+    # a record cite is not a message, and refusals without words read as before
+    assert relay.held_match("run the test on box-a (user message #3, msg #4)") == ("", "")
+    assert relay.held_match("message the other team") == ("speaks", "message")
+    assert '"' not in relay.held_refusal("x", "gate")
+
+
+def test_scope_only_reads_only_machine_name_changes_on_a_test_or_job(env):
+    """_scope_only: an edit adding or dropping usable machine names (and joiners) on a test or job item is
+    scope only; a dropped "never", an added "except", an unlisted name, a non-test item or no change is not."""
+    from ttp import coordinator as coord
+    names = frozenset({"box-a", "box-b", "box-c"})
+    yes = [("run the test on box-a only", "run the test on box-a and box-b"),
+           ("jobs go to box-a, box-b and box-c", "jobs go to box-a (user msg #9)"),
+           ("Never post test results from box-a. (user msg #2)", "Never post test results from box-a or box-b."),
+           ("run the test on box-a only", "run the test on box-b")]
+    no = [("run the test on box-a only", "run the test on box-a and box-z"),
+          ("never merge after the test on box-a", "merge after the test on box-a and box-b"),
+          ("run the test on box-a", "run the test on box-a and box-b, except posting"),
+          ("post to the dashboard from box-a", "post to the dashboard from box-a and box-b"),
+          ("run the test on box-a", "run the test on box-a")]
+    assert all(coord._scope_only(o, n, names) for o, n in yes), [x for x in yes if not coord._scope_only(*x, names)]
+    assert not any(coord._scope_only(o, n, names) for o, n in no), [x for x in no if coord._scope_only(*x, names)]
+    assert not coord._scope_only(*yes[0], frozenset())
