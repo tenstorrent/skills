@@ -51,7 +51,7 @@ import sys
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 from . import locks, loopproxy, machines, shorttmp
@@ -669,6 +669,34 @@ def withdraw(rc: Path) -> None:
         queued(rc).unlink(missing_ok=True)
 
 
+WITHDRAWN = "its caller withdrew its queued request before the daemon started it: it never ran"
+
+
+def withdraw_unstarted(rc: Path, why: str = WITHDRAWN) -> bool:
+    """Withdraw the job's queued request unless the daemon has claimed it: True when withdrawn (it never
+    runs, and <name>.lost says why), False when it started or is starting. Atomic with tend's claim: tend
+    takes the job lock, then checks the request is still queued under the queue lock (_still_queued);
+    here, under that lock, a held job lock means it is claimed."""
+    rc = Path(rc)
+    q, _ = _marker(rc)
+    with _locked(q.parent) if q is not None else nullcontext():
+        q, rid = _marker(rc)
+        if _began(rc, rid):
+            return False
+        if q is not None:
+            if q.exists() and _request_id(q) == rid:
+                q.unlink(missing_ok=True)
+            queued(rc).unlink(missing_ok=True)
+        _mark_lost_first(rc, why)
+        return True
+
+
+def _still_queued(q: Path, rid: str | None) -> bool:
+    """Whether request `rid` is still in the queue: tend's claim, made while it holds the job's lock."""
+    with _locked(q.parent):
+        return q.exists() and _request_id(q) == rid
+
+
 def _settle(q: Path, rc: Path, rid: str | None, lost_why: str = "") -> None:
     """Remove the request the daemon consumed, and its marker, only while they still name it: a
     newer request queued meanwhile stays for the next tick. `lost_why` records why it did not start,
@@ -792,8 +820,9 @@ def tend(p: Project) -> None:
             lock = locks.try_take([locks.job_lock(rc)], f"detached job {rc.stem}", " ".join(m["command"]))
             if lock is not None:   # else it already runs
                 try:
-                    pid = start(rc, log, list(m["command"]), m["cwd"], _job_env(m.get("env")), lock)
-                    renice(pid, nice_level(p.config().get("runner"))[0])
+                    if _still_queued(q, rid):   # else withdrawn meanwhile (withdraw_unstarted): never start it
+                        pid = start(rc, log, list(m["command"]), m["cwd"], _job_env(m.get("env")), lock)
+                        renice(pid, nice_level(p.config().get("runner"))[0])
                 except (OSError, ValueError, TypeError) as e:   # its folder went, say: never retried each tick
                     why = f"the daemon could not start it: {e}"
                 finally:

@@ -777,7 +777,7 @@ def _sandboxed_run(env, monkeypatch, capfd, *argv, p=None, run="9001"):
         monkeypatch.setenv(k, v)
     monkeypatch.delenv(secretroute.SERVED_ENV, raising=False)
     monkeypatch.setattr(secretroute, "POLL_S", 0.05)
-    monkeypatch.setattr(secretroute, "START_GRACE_S", 30 - detach.QUEUED_S)   # a broken tick fails, never hangs
+    monkeypatch.setattr(secretroute, "START_WAIT_S", 30)   # a broken tick fails, never hangs
     stop, errors = threading.Event(), []
 
     def daemon():
@@ -859,20 +859,94 @@ def test_secret_env_outside_a_sandbox_runs_the_command_itself(env, monkeypatch, 
     assert not (p.state / "secret-uses.jsonl").exists()
 
 
-def test_a_sandboxed_secret_env_gives_up_when_the_daemon_never_starts_it(env, monkeypatch, capfd):
-    from ttp import detach, secretroute
+def _queued_route(env, monkeypatch, capfd, run):
+    """A sandboxed worker's run folder with no daemon running: (project, run folder)."""
+    from ttp import secretroute
     _jev_store(env, monkeypatch, capfd)
     p = make(env)
-    rd = p.runs / "9003"
+    rd = p.runs / run
     rd.mkdir(parents=True)
     monkeypatch.setenv("TTP_RUN_DIR", str(rd))
     monkeypatch.setenv("SANDBOX_RUNTIME", "1")
+    monkeypatch.delenv(secretroute.SERVED_ENV, raising=False)
     monkeypatch.setattr(secretroute, "POLL_S", 0.01)
-    monkeypatch.setattr(detach, "QUEUED_S", 0)
-    monkeypatch.setattr(secretroute, "START_GRACE_S", 0.2)
+    return p, rd
+
+
+def _never_ran(p, rd):
+    """No request left, and a daemon pass that comes later starts nothing."""
+    from ttp import detach
+    assert not list((p.state / "detach-queue").glob("*.json"))
+    detach.tend(p)
+    assert not list(rd.glob("secret-env-*.started")) and not list(rd.glob("secret-env-*.rc"))
+    assert [f.read_text() for f in rd.glob("secret-env-*.lost")] and not list(rd.glob("secret-env-*.queued"))
+
+
+def test_a_sandboxed_secret_env_gives_up_when_the_daemon_never_starts_it(env, monkeypatch, capfd):
+    from ttp import secretroute
+    p, rd = _queued_route(env, monkeypatch, capfd, "9003")
+    monkeypatch.setattr(secretroute, "START_WAIT_S", 0.2)
     code, out = _env_run(monkeypatch, capfd, "--secret", "jev:key=JK", "--", "true")
-    assert code == 1 and "the daemon did not start the command" in out, out
-    assert not list((p.state / "detach-queue").glob("*.json"))      # withdrawn: no late start
+    assert code == 1 and "the daemon did not start the command" in out and "nothing ran" in out, out
+    _never_ran(p, rd)                                                 # withdrawn: no late start
+    assert "never ran" in next(rd.glob("secret-env-*.lost")).read_text()
+    # a retry runs it exactly once
+    marker = env["tmp"] / "ran.txt"
+    code, out, rd2, _ = _sandboxed_run(env, monkeypatch, capfd, "--secret", "jev:key=JK", "--", sys.executable,
+                                       "-c", f"open({str(marker)!r}, 'a').write('x')", p=p, run="9004")
+    from ttp import detach
+    detach.tend(p)
+    assert code == 0 and marker.read_text() == "x", out
+
+
+@pytest.mark.parametrize("sig", ["SIGTERM", "SIGINT"])
+def test_a_stopped_sandboxed_secret_env_withdraws_its_queued_request(env, monkeypatch, capfd, sig):
+    import signal
+    import threading
+    from ttp import secretroute
+    p, rd = _queued_route(env, monkeypatch, capfd, "9005")
+    monkeypatch.setattr(secretroute, "START_WAIT_S", 30)
+    queue = p.state / "detach-queue"
+
+    def stop():
+        for _ in range(500):
+            if list(queue.glob("*.json")):
+                break
+            threading.Event().wait(0.01)
+        os.kill(os.getpid(), getattr(signal, sig))
+    t = threading.Thread(target=stop, daemon=True)
+    t.start()
+    code, out = _env_run(monkeypatch, capfd, "--secret", "jev:key=JK", "--", "true")
+    t.join(10)
+    assert code == 128 + getattr(signal, sig) and f"stopped by {sig}" in out and "nothing ran" in out, out
+    _never_ran(p, rd)
+    assert signal.getsignal(signal.SIGTERM) is not secretroute._raise_stopped   # the handler is restored
+
+
+def test_withdrawing_a_request_never_races_the_daemon_into_a_late_start(env, monkeypatch, capfd):
+    """The daemon read the request, then the caller withdrew it before the daemon took the job's lock:
+    the daemon never starts it. Once the daemon holds the lock, a withdrawal reports it started."""
+    from ttp import detach, locks
+    p, rd = _queued_route(env, monkeypatch, capfd, "9006")
+    rc, log = rd / "secret-env-race.rc", rd / "secret-env-race.log"
+    detach.enqueue(p.state, rc, log, ["true"], str(rd), {})
+    real_take, said = locks.try_take, []
+
+    def take_after_withdrawal(paths, *a, **k):
+        said.append(detach.withdraw_unstarted(rc))
+        return real_take(paths, *a, **k)
+    monkeypatch.setattr(locks, "try_take", take_after_withdrawal)
+    detach.tend(p)
+    assert said == [True] and not rc.exists() and not detach.started(rc).exists()
+    assert detach.state(rc)[0] == "lost"
+
+    rc2 = rd / "secret-env-race2.rc"
+    detach.enqueue(p.state, rc2, rd / "secret-env-race2.log", ["true"], str(rd), {})
+    held = real_take([locks.job_lock(rc2)], "the daemon claiming it")
+    try:
+        assert detach.withdraw_unstarted(rc2) is False and detach.pending(rc2)   # claimed: left to start
+    finally:
+        held.close()
 
 
 @pytest.mark.parametrize("damage", ["mode0", "directory", "non-utf8"])
