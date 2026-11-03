@@ -194,6 +194,49 @@ def test_fenced_ssh_refusal_names_the_cause_and_the_wrapper_script(env, monkeypa
     assert "is fine)" not in why.split("(`2>&1` is fine)")[0], "ttp lock alone does not free any line"
 
 
+@pytest.mark.parametrize("cmd,name", [
+    ("FOO=x ssh host cmd", "ssh"), ("SSH_AUTH_SOCK=/a/b scp a host:b", "scp"), ("A=1 B=2 timeout 9 rsync -a h:x .", "rsync"),
+    ("FOO=x ttp lock res -- ssh host true", "ssh"), ("FOO= /usr/bin/ssh host 'a | b'", "ssh"), ("x+=1 sftp host", "sftp"),
+    ("FOO=x my-ssh host cmd", "my-ssh"), ("MY_SSH_OPTS=-v timeout 5 my-ssh host cmd", "my-ssh"),
+])
+def test_fenced_hook_refuses_an_assignment_prefixed_freed_command_with_advice_that_works(env, monkeypatch, cmd, name):
+    """No line that starts with `VAR=value` is freed (CLI 2.1.296): it runs fenced, where hosts do not resolve."""
+    from ttp import hook
+    monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"]))
+    monkeypatch.setenv("TTP_FENCE_BY_NAME", "1")
+    monkeypatch.setenv("TTP_FENCE_FREED", "my-ssh")
+    why = _decision(hook, cmd, env["tmp"])
+    assert why and f"{name} cannot reach another host from this line" in why, why
+    assert "Drop the prefix" in why and "option of the command" in why and "`ssh host 'FOO=x cmd'`" in why, why
+    assert "/a/b" not in why and "-v" not in why, "the refusal names the variable, never its value"
+    unprefixed = " ".join(w for w in cmd.split(" ") if not re.match(r"\w+\+?=", w))
+    assert not _decision(hook, unprefixed, env["tmp"]), f"unprefixed, {unprefixed!r} passes as before"
+    monkeypatch.delenv("TTP_FENCE_BY_NAME")
+    assert not _decision(hook, cmd, env["tmp"]), "unfenced: it runs anywhere"
+
+
+@pytest.mark.parametrize("cmd", [
+    "ssh host 'FOO=x cmd'", "ssh host FOO=x cmd", "timeout 9 ssh host 'A=1 B=2 make'", "ssh -o SendEnv=FOO host cmd",
+    "ttp lock res -- ssh host 'FOO=x cmd | tail'", "FOO=x make", "FOO=x git status", "my-ssh host 'FOO=x cmd'",
+    "git commit -m 'FOO=x ssh host'",
+])
+def test_fenced_hook_lets_an_assignment_in_the_remote_command_or_before_a_local_one_run(env, monkeypatch, cmd):
+    from ttp import hook
+    monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"]))
+    monkeypatch.setenv("TTP_FENCE_BY_NAME", "1")
+    monkeypatch.setenv("TTP_FENCE_FREED", "my-ssh")
+    assert not _decision(hook, cmd, env["tmp"])
+
+
+@pytest.mark.parametrize("cmd", ["FOO=1 scp a host:b && echo done", "FOO=x ssh host cmd | tail", "FOO=x bash -c 'ssh h x'"])
+def test_a_compound_line_refusal_also_names_its_assignment_prefix(env, monkeypatch, cmd):
+    from ttp import hook
+    monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"]))
+    monkeypatch.setenv("TTP_FENCE_BY_NAME", "1")
+    why = _decision(hook, cmd, env["tmp"])
+    assert "on its own" in why and "A leading `FOO=...`" in why and "Drop the prefix" in why, why
+
+
 def test_fence_frees_git_network_commands_by_name():
     from ttp.providers import claude
     excluded = claude.sandbox_settings(["/wt"])["excludedCommands"]

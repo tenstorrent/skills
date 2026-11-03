@@ -591,7 +591,7 @@ def _strip_prefix(argv: list[str], ttp_wrappers: list[list[str]] | None = None) 
             i += 2 if _xargs_takes_next(w) else 1
         elif w in OPTS_WITH_VALUE:   # env -u NAME, timeout -s KILL, nice -n 5 ...
             i += 2
-        elif re.match(r"^\w+=", w) or w.startswith("-") or re.fullmatch(r"\d+[smhd]?", w) \
+        elif re.match(r"^\w+\+?=", w) or w.startswith("-") or re.fullmatch(r"\d+[smhd]?", w) \
                 or os.path.basename(w) in WRAPPERS or w in RESERVED:
             xargs = os.path.basename(w) == "xargs"
             i += 1
@@ -763,6 +763,7 @@ FENCE_FREED = {"ssh", "scp", "sftp", "rsync"}
 SUBST_RE = re.compile(r"\$\(|`")
 FILE_REDIRECT_RE = re.compile(r"<|>(?!&)")   # `2>&1` and `>&2` duplicate a descriptor: fine
 SHELL_C_RE = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
+ASSIGN_RE = re.compile(r"[A-Za-z_]\w*\+?=")   # `FOO=x ssh ...`: no such line is freed (measured, CLI 2.1.296)
 
 
 def _freed_in(argv: list[str], depth: int = 0) -> str | None:
@@ -781,16 +782,21 @@ def _freed_in(argv: list[str], depth: int = 0) -> str | None:
 def fenced_ssh(segments: list[list[str]], cmd: str) -> str | None:
     """Why a fenced worker's command `cmd` (its simple commands: `segments`) that runs ssh (or scp,
     sftp, rsync, or a project's sandbox.fence_freed_commands) would stay in the fence: beside other commands, with a redirect to or from a file,
-    with a substitution, or in a `bash -c` not run by `ttp lock ... --`. None outside such a run
-    (TTP_FENCE_BY_NAME) or for a simple command."""
+    with a substitution, after a leading `VAR=value` assignment, or in a `bash -c` not run by `ttp lock ... --`.
+    None outside such a run (TTP_FENCE_BY_NAME) or for a simple command."""
     if not os.environ.get("TTP_FENCE_BY_NAME"):
         return None
-    hit, form = None, ""
+    hit, form, assign = None, "", ""
     for raw in _segments(cmd, strip=False):
         wrappers: list[list[str]] = []
         s = _strip_prefix(raw, wrappers)
         if s and (h := _freed_in(s)):
             hit = hit or h
+            if (m := ASSIGN_RE.match(raw[0])) and not assign:
+                assign = (f"A leading `{m[0].rstrip('+=')}=...` before {h} keeps the line in the write fence too: "
+                          f"the sandbox frees no line that starts with an assignment. Drop the prefix and pass the "
+                          f"value as an option of the command (e.g. `ssh -o Name=value host cmd`), or set it inside "
+                          f"the quoted remote command (`ssh host 'FOO=x cmd'`).")
             if os.path.basename(s[0]) != h and not any(w[:1] == ["lock"] for w in wrappers):
                 form = form or f"`{os.path.basename(s[0])} -c` wrapper"
     if not hit:
@@ -801,7 +807,11 @@ def fenced_ssh(segments: list[list[str]], cmd: str) -> str | None:
         form = "`$(...)` or backtick substitution"
     elif FILE_REDIRECT_RE.search("".join(" " if q else c for c, (q, _) in zip(cmd, _quoting(cmd)))):
         form = "redirect to or from a file"
-    return form and (
+    if not form:
+        return assign and (f"{hit} cannot reach another host from this line. {assign} There host names do not "
+                           f"resolve and 127.0.0.1 is the sandbox's own loopback, so a refusal is not a host or "
+                           f"tunnel outage.")
+    return (
         f"{hit} reaches another host only as a simple command on its own. The sandbox frees `{hit} ...` "
         f"(also after `timeout N` or `ttp lock <res> --`) by name, but this line's {form} keeps the whole "
         f"line in the write fence, as does any `<`, `<<`, `> file`, `$(...)`, backtick, `bash -c` wrapper, "
@@ -810,7 +820,7 @@ def fenced_ssh(segments: list[list[str]], cmd: str) -> str | None:
         f"outage. Put a pipe inside the quoted remote command "
         f"(`ssh host 'cmd | tail -20'`), or write the line into a local wrapper script (e.g. "
         f"`ssh host 'bash -s' < remote.sh > out.txt`) and run `ttp lock <res> -- bash wrapper.sh`: a plain "
-        f"`bash wrapper.sh` stays fenced")
+        f"`bash wrapper.sh` stays fenced" + (f". {assign}" if assign else ""))
 
 
 def lock_privileged(cmd: str) -> str | None:
