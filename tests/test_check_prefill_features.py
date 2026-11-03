@@ -270,3 +270,17 @@ def test_burst_arms_must_run_on_a_cold_prefix_cache(tmp_path):
     full_evidence(cold)
     assert run(cold, '--require-burst').returncode == 0
 
+
+def test_burst_arm_without_cold_cache_evidence_is_critical(tmp_path):
+    unknown = {'reset': False, 'queries': None, 'hits': None, 'hit_rate': None}
+    model = tmp_path / 'unknown'
+    full_evidence(model, burst=burst(burst_cache=unknown))
+    result = run(model, '--require-burst')
+    assert result.returncode == 2, result.stderr
+    assert 'burst arm has no cold-cache evidence' in result.stderr
+    reset_only = tmp_path / 'reset-only'
+    full_evidence(reset_only, burst=burst(burst_cache={'reset': True, 'queries': None, 'hits': None, 'hit_rate': None}))
+    assert run(reset_only, '--require-burst').returncode == 0
+    apc_off = tmp_path / 'apc-off'
+    full_evidence(apc_off, burst=burst(serial_cache={'reset': False, 'queries': 0, 'hits': 0, 'hit_rate': None}))
+    assert run(apc_off, '--require-burst').returncode == 0

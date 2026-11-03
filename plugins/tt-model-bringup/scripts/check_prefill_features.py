@@ -203,10 +203,17 @@ def check_burst(
             advisory.append(f"prefill burst records no prefix-cache state for the {arm} arm; rerun it with the current runner")
             continue
         hit_rate = state.get("hit_rate")
-        if isinstance(hit_rate, (int, float)) and hit_rate > BURST_WARM_HIT_RATE_MAX:
+        queries = state.get("queries")
+        if isinstance(hit_rate, (int, float)):
+            if hit_rate > BURST_WARM_HIT_RATE_MAX:
+                critical.append(
+                    f"prefill burst {arm} arm measured with a warm prefix cache (hit rate {hit_rate:.3f}); "
+                    "the TTFT ratio is not a batching measurement"
+                )
+        elif state.get("reset") is not True and not (isinstance(queries, (int, float)) and queries == 0):
             critical.append(
-                f"prefill burst {arm} arm measured with a warm prefix cache (hit rate {hit_rate:.3f}); "
-                "the TTFT ratio is not a batching measurement"
+                f"prefill burst {arm} arm has no cold-cache evidence (no reset, no counters); rerun with "
+                "VLLM_SERVER_DEV_MODE=1 or with prefix caching disabled so the arm records its cache state"
             )
     for key, limit, label in (("ttft_ratio_p99", ratio_max, "p99"), ("ttft_ratio_mean", mean_ratio_max, "mean")):
         ratio = reference.get(key)

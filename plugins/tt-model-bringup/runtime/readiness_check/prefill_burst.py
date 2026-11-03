@@ -46,6 +46,7 @@ def attach_serial_reference(
 ) -> dict[str, Any]:
     """Record burst/serial TTFT ratios. `serial` is read before the burst run so the same path is safe."""
     if serial is None:
+        summary_file.write_text(json.dumps(summary, indent=2) + "\n")
         return summary
     serial_ttft = serial.get("ttft_ms") or {}
     burst_ttft = summary.get("ttft_ms") or {}

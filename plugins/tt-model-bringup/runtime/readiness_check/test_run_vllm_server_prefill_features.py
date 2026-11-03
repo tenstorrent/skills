@@ -298,3 +298,26 @@ def test_attach_serial_reference_carries_the_serial_arm_cache_state(tmp_path):
     plain = attach_serial_reference(tmp_path / "plain.json", {"ttft_ms": {}, "config": dict(config)}, {"ttft_ms": {}, "config": config}, None)
     assert "serial_prefix_cache" not in plain["serial_reference"]
 
+
+def test_baseline_run_persists_its_cache_state_for_the_later_burst(tmp_path, monkeypatch):
+    _counter_sequence(
+        monkeypatch,
+        [
+            {"vllm:prefix_cache_queries": 0.0, "vllm:prefix_cache_hits": 0.0},
+            {"vllm:prefix_cache_queries": 4096.0, "vllm:prefix_cache_hits": 0.0},
+        ],
+    )
+    summary_file = tmp_path / "serial.json"
+
+    def benchmark():
+        data = {"ttft_ms": {"p99": 5000.0, "mean": 2500.0}, "config": {"num_requests": 32}}
+        summary_file.write_text(json.dumps(data))
+        return data
+
+    baseline = run_with_prefix_cache_state("http://server", benchmark)
+    attach_serial_reference(summary_file, baseline, None, None)
+    reloaded = json.loads(summary_file.read_text())
+    assert reloaded["prefix_cache"] == {"reset": True, "queries": 4096.0, "hits": 0.0, "hit_rate": 0.0}
+    burst_file = tmp_path / "burst.json"
+    burst_summary = attach_serial_reference(burst_file, {"ttft_ms": {"p99": 2000.0}, "config": {"num_requests": 32}}, reloaded, summary_file)
+    assert burst_summary["serial_reference"]["serial_prefix_cache"]["reset"] is True
