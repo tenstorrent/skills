@@ -287,7 +287,10 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   `ttp upgrade <name> --apply <commit>` (fast-forward only). A worker sandbox that cannot write the
   harness working tree hands the fast-forward to the daemon (state/apply.request, checked again
   there against the upgrade lock, the journal and both ancestries; withdrawn if not taken within
-  `applyff.APPLY_WAIT_S`), then restarts it as usual. A fast-forward that fails part-way puts every
+  `applyff.APPLY_WAIT_S`), then restarts it as usual. A daemon older than these requests that takes
+  restart requests is first restarted onto the runtime on disk (before the journal names the merge);
+  one that takes neither gets no sandboxed merge task: `ttp upgrade` exits 1 naming the `--apply`
+  command to run outside a sandbox. A fast-forward that fails part-way puts every
   file it touched back to main's version. A reference-transaction hook in the
   harness repo refuses every other update of `main` that newly takes in `upstream`.
   Runtime files `main` deleted, emptied or cut short are restored from `upstream`. A file that only

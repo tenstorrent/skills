@@ -8937,6 +8937,8 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
                          f"to queue a harness task for the merge.")
             sys.exit(1)
         target = f"{new_v} ({new_c})"
+        if not tid:
+            _refuse_unappliable_task(p, auto, problem)
         tid = tid or p.db.add_task(
             release.UPGRADE_TASK_TITLE, _UPGRADE_TASK.format(problem=problem, name=p.name, target=target,
                                                              state=shlex.quote(str(p.state))),
@@ -9443,6 +9445,24 @@ def _retarget_upgrade_task(p: Project, holder: dict, auto: bool) -> None:
     sys.exit(75)
 
 
+def _refuse_unappliable_task(p: Project, auto: bool, problem: str) -> None:
+    """Queue no merge task whose sandboxed `--apply` could never move main: its worker cannot write the
+    harness working tree and the running daemon takes neither fast-forward nor restart requests (or the
+    runtime a restart would start predates them). Says once, model-free, what to run outside a sandbox."""
+    from . import applyff, release
+    kind, why = applyff.route(p)
+    if kind != "none":
+        return
+    msg = (f"upgrade not applied; the running harness is unchanged. {problem}\nNo harness task was queued: its "
+           f"worker's sandbox cannot write the harness working tree and {why}, so its `--apply` could never "
+           f"move main. Outside a worker sandbox, merge `upstream` in a worktree of {p.harness}, commit, and "
+           f"run `ttp upgrade {p.name} --apply <commit>`: it moves main and restarts the daemon onto a runtime "
+           f"that takes these requests, and later upgrades queue their task as usual.")
+    if auto:
+        release.finish(p, "failed", why=f"no sandboxed merge task could apply it: {why}"[:300])
+    die(msg, 1)
+
+
 def _moved_template(h: Path, base: str) -> str:
     """Why main may not take the checked merge ("" = it may): since `base` someone else changed the
     template's files on it, or merged upstream into it. Only charter, memory and config commits of the
@@ -9477,9 +9497,15 @@ def _apply_upgrade(p: Project, commit: str) -> None:
             f"worktree: `git merge main`, check again, commit, then rerun with the new commit.", 1)
     from . import applyff
     base = _git(h, "rev-parse", "HEAD")
-    upjournal.step(p, "merging", base=base, merged=merged)
     # A worker sandbox writes the harness's .git but not its working tree: the daemon moves main instead.
+    # A daemon older than that is restarted onto the runtime on disk first, before the journal names the
+    # merge: the new daemon then finds no merge to recover.
     blocked = applyff.unwritable(h, base, merged)
+    if blocked and applyff.route(p)[0] == "restart":
+        print(f"--apply cannot write the harness working tree ({blocked})")
+        if (why := applyff.ready(p, merged)):
+            die(f"--apply: could not fast-forward main to {commit}: {why}. Main is still {base[:12]}", 1)
+    upjournal.step(p, "merging", base=base, merged=merged)
     why = "" if blocked else applyff.fast_forward(h, merged, release.GUARD_ENV)
     if blocked or applyff.no_write(why):
         print(f"--apply cannot write the harness working tree ({blocked or why}); asking the daemon to "
@@ -9568,7 +9594,8 @@ In this harness repo:
 5. `ttp upgrade {name} --apply <commit>`, run on its own (never piped or masked). It fast-forwards main
    to <commit> under the upgrade lock and restarts the daemon (it rolls the runtime back if the daemon
    does not start). Never merge upstream into main any other way: the harness refuses it.
-   Where the service manager is out of reach (a sandbox), it asks the running daemon to restart itself.
+   Where the service manager is out of reach (a sandbox), it asks the running daemon to restart itself
+   (a daemon too old to take its fast-forward request is restarted onto the runtime on disk first).
    Its exit code says what happened; act on it alone:
    - Exit 0: done, remove <tmp>.
    - Exit 75: busy, nothing was changed (the daemon is landing harness worktrees, or another upgrade
