@@ -404,6 +404,11 @@ class Provider:
         when an OS sandbox fences them. Shown by `ttp doctor`; changes nothing."""
         return "no write sandbox"
 
+    def fenced(self, on: bool = True, restrictions: dict | None = None) -> bool:
+        """Whether a worker run is write-fenced, as fence_args decides it: `on` False (fence_on) drops an
+        optional fence; a missing dependency or a mode without a sandbox (write_fence) leaves it off."""
+        return not self.write_fence(restrictions) and (on or not self.fence_optional)
+
     def compact_env(self, tokens: int) -> dict[str, str]:
         """Environment that makes the agent compact its context near `tokens`; {} when it has no
         such switch or `tokens` is 0."""

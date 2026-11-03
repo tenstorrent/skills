@@ -28,3 +28,8 @@ def get_provider(name: str) -> Provider:
 def all_providers() -> list[Provider]:
     _load_all()
     return [cls() for cls in _REGISTRY.values()]
+
+
+def fence_on(cfg: dict, name: str) -> bool:
+    """Whether the project leaves provider `name`'s write fence on (providers.<name>.write_fence)."""
+    return ((cfg.get("providers") or {}).get(name) or {}).get("write_fence", True) is not False

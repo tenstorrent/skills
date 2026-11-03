@@ -221,7 +221,7 @@ from .project import (
     push_allowed,
     zombie,
 )
-from .providers import get_provider
+from .providers import fence_on as provider_fence_on, get_provider
 from .providers.base import (
     FUNDS_RE,
     Provider,
@@ -2749,7 +2749,7 @@ class Daemon:
                 self.alert(f"write_dirs_missing:{provider}",
                            f"Skipped providers.{provider}.write_dirs entries (not created): {'; '.join(absent)}.",
                            severity="low", every_s=86400)
-            fence_on = self.cfg["providers"].get(provider, {}).get("write_fence", True) is not False
+            fence_on = provider_fence_on(self.cfg, provider)   # as cli._harness_worker_fenced reads it
             argv, sandboxed = prov.fence_args(argv, roots, cwd=str(cwd), on=fence_on,
                                             restrictions=restrictions)
             if fence_on and not sandboxed and prov.fence_optional and prov.write_fence(restrictions):

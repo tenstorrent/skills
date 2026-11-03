@@ -214,8 +214,12 @@ def test_a_daemon_taking_neither_request_gets_no_sandboxed_merge_task_and_a_clea
     move main: `ttp upgrade` queues no merge task that would sit stuck and says, model-free, what to run
     outside a sandbox."""
     from ttp import applyff, cli, release, service
+    from ttp.providers import claude
     p, restarts = _conflicting_upgrade(env, monkeypatch)
+    p.set_config("core_provider", "claude")
+    monkeypatch.setattr(claude, "fence_missing", lambda: [])   # the merge task's worker runs fenced
     h = p.harness
+    _git_out(h, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "config")   # main stays put
     (p.state / "heartbeat").write_text(json.dumps({"pid": 1, "takes": [], "receipt": {"version": "0.0.1"}}))
     base = _git_out(h, "rev-parse", "HEAD")
     with pytest.raises(SystemExit) as e:
@@ -231,6 +235,7 @@ def test_a_daemon_taking_neither_request_gets_no_sandboxed_merge_task_and_a_clea
     with pytest.raises(SystemExit):
         cli._refuse_unappliable_task(p, True, "a conflict")
     assert finished and finished[0][0] == "failed" and "nor restart requests" in finished[0][1], finished
+    assert finished[0][1].startswith("run `ttp upgrade demo --apply <commit>`"), finished
     # A stopped daemon's heartbeat stays behind: it is no route problem, as the next daemon starts on the
     # runtime on disk, which takes the requests; the merge task is queued as usual.
     old = time.time() - 3600
@@ -333,3 +338,36 @@ def test_the_daemon_refuses_a_fast_forward_request_no_running_apply_made(env, mo
     finally:
         upjournal.end(p)
         held.close()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes read-only directories")
+def test_a_daemon_taking_neither_request_still_gets_the_merge_task_of_an_unfenced_worker(
+        env, monkeypatch, tmp_path, capsys):
+    """No sandboxed route, but the merge task's worker would run unfenced (the project turned the fence
+    off, the sandbox's dependencies are missing, or its provider has no write sandbox): it writes the
+    harness tree, so its `--apply` fast-forwards main itself, and `ttp upgrade` queues the task as before."""
+    from ttp import applyff, cli
+    from ttp.providers import claude
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    (p.state / "heartbeat").write_text(json.dumps({"pid": 1, "takes": [], "receipt": {"version": "0.0.1"}}))
+    assert applyff.route(p)[0] == "none"
+    p.set_config("core_provider", "claude")
+    missing = []
+    monkeypatch.setattr(claude, "fence_missing", lambda: list(missing))
+    assert cli._harness_worker_fenced(p)
+    off = {**p.config()["providers"], "claude": {**p.config()["providers"].get("claude", {}), "write_fence": False}}
+    on = p.config()["providers"]
+    for unfence, refence in [(lambda: p.set_config("providers", off), lambda: p.set_config("providers", on)),
+                             (lambda: missing.append("bwrap"), missing.clear),
+                             (lambda: p.set_config("core_provider", "fake"),
+                              lambda: p.set_config("core_provider", "claude"))]:
+        unfence()
+        assert not cli._harness_worker_fenced(p)
+        with pytest.raises(SystemExit) as e:
+            cli.main(["upgrade", "demo"])
+        out = capsys.readouterr()
+        assert e.value.code == 75 and "No harness task was queued" not in out.err, out
+        assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE kind='harness'")["n"] == 1
+        refence()
+        assert cli._harness_worker_fenced(p)
+    assert not restarts

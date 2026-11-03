@@ -9451,16 +9451,27 @@ def _refuse_unappliable_task(p: Project, auto: bool, problem: str) -> None:
     runtime a restart would start predates them). Says once, model-free, what to run outside a sandbox."""
     from . import applyff, release
     kind, why = applyff.route(p)
-    if kind != "none":
-        return
+    if kind != "none" or not _harness_worker_fenced(p):
+        return   # an unfenced worker writes the harness tree, so its `--apply` fast-forwards main itself
     msg = (f"upgrade not applied; the running harness is unchanged. {problem}\nNo harness task was queued: its "
            f"worker's sandbox cannot write the harness working tree and {why}, so its `--apply` could never "
            f"move main. Outside a worker sandbox, merge `upstream` in a worktree of {p.harness}, commit, and "
            f"run `ttp upgrade {p.name} --apply <commit>`: it moves main and restarts the daemon onto a runtime "
            f"that takes these requests, and later upgrades queue their task as usual.")
     if auto:
-        release.finish(p, "failed", why=f"no sandboxed merge task could apply it: {why}"[:300])
+        release.finish(p, "failed", why=f"run `ttp upgrade {p.name} --apply <commit>` outside a worker sandbox: "
+                                         f"no sandboxed merge task could apply it, as {why}"[:300])
     die(msg, 1)
+
+
+def _harness_worker_fenced(p: Project) -> bool:
+    """Whether a harness task's worker runs write-fenced on every provider it may start on (the core
+    provider, or the one its tier is routed to), as the daemon's start_run decides the fence."""
+    from . import providers, route
+    cfg = p.config()
+    names = [cfg.get("core_provider") or "claude"] + [t[0] for t in [route.target(cfg, "standard")] if t]
+    return all(providers.get_provider(n).fenced(providers.fence_on(cfg, n), cfg.get("restrictions") or {})
+               for n in names)
 
 
 def _moved_template(h: Path, base: str) -> str:

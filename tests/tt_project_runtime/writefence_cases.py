@@ -393,3 +393,19 @@ def test_write_dirs_reach_the_fenced_worker_and_refusals_alert(env, monkeypatch)
     assert "gone:" in alerts["write_dirs_missing:claude"] and not (p.root / "gone").exists()
     from ttp.project import config_problems
     assert not [x for x in config_problems(p.raw_config()) if "write_dirs" in x], "a known key"
+
+
+def test_a_providers_fenced_answer_matches_the_fence_its_launch_gets(monkeypatch):
+    """Provider.fenced (what `ttp upgrade` reads before queueing a harness merge task) says what fence_args
+    gives the daemon's launch, for every provider, fence setting and sandbox dependency state."""
+    from ttp.providers import all_providers, claude
+    missing = []
+    monkeypatch.setattr(claude, "fence_missing", lambda: list(missing))
+    for deps in ([], ["bwrap"]):
+        missing[:] = deps
+        for prov in all_providers():
+            for on in (True, False):
+                for rules in ({}, {"no_internet": True}):
+                    _, sandboxed = prov.fence_args(["agent", "--settings", "{}", "-"], ["/tmp/x"], cwd="/tmp/w",
+                                                   on=on, restrictions=rules)
+                    assert prov.fenced(on, rules) == sandboxed, (prov.name, on, rules, deps)
