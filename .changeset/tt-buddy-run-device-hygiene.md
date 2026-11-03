@@ -12,5 +12,6 @@
 - Keep host work and kernel JIT out of the device reservation.
 - tt-device-mcp limits corrected: exec default 180s (max 600s), job timeout
   default 600s (hard max 1500s), `output_tail` and log-size caps.
-- No manual reset after a kill when the broker already resets and runs its
-  full health check; verify through `tt_device_queue_status`, not `tt-smi -s`.
+- No manual reset after a kill: the broker resets and runs its health check
+  after any kill, timeout or forced preemption; reset only when it asks.
+  Verify through `tt_device_queue_status`, not `tt-smi -s`.

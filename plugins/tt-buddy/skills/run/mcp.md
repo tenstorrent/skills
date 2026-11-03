@@ -42,14 +42,12 @@ Tools on the `tt-device-mcp` MCP server. Names per `tt-buddy:buddy` § Host mapp
 
 ## After a kill
 
-- The broker owes one reset plus the full health check, fabric included.
-- Owed after any kill, timeout or forced preemption, before the next job.
-- Applies when `tt_device_queue_status` has a `startup_verify` field.
+- The broker resets the device and runs its health check after any kill, timeout or forced preemption, before the next job.
 - A reset of your own doubles it while others wait.
 
 1. `tt_device_job_status` with the `job_id`: confirm `killed` or `timeout`.
 2. `tt_device_queue_status`: a `[broker]` row in `running` or non-empty `device_degraded` is the broker's own reset. Wait for it to clear. Add no reset.
-3. Call `tt_device_reset` only when the broker reports the device held or unhealthy, asks for a reset, and runs none of its own. Or on tt-device-mcp 1.0.0 (no `startup_verify` field): it owes no reset after a kill.
+3. Call `tt_device_reset` only when the broker reports the device held or unhealthy, asks for a reset, and runs none of its own.
 
 ## Env file
 

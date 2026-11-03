@@ -28,6 +28,15 @@ def test_reset_after_kill_is_conditional():
     assert "kill → reset → verify" not in SKILL_MD
 
 
+def test_post_kill_reset_rule_holds_on_released_brokers():
+    """Released tt-device-mcp already resets after a kill: no version gate or 1.0.0 exception."""
+    after_kill = MCP_MD.split("## After a kill", 1)[1].split("\n## ", 1)[0]
+    assert "startup_verify" not in MCP_MD
+    assert "1.0.0" not in after_kill
+    assert "any kill, timeout or forced preemption" in after_kill
+    assert "runs none of its own" in after_kill
+
+
 def test_verify_goes_through_the_broker():
     """Verify reads the broker's status: tt-smi reads the device outside the broker."""
     verify = substitution_row("4. Verify").strip()
