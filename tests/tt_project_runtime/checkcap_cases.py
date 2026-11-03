@@ -858,6 +858,17 @@ def test_test_slots_a_full_run_waits_for_its_minimum_grant_others_start_with_one
     other = testslots.acquire("other", cfg={"checks": {"test_run_max": 6}})
     assert other.k == 6
     told, got = [], []
+    # Grant.close() frees its slots one at a time: a waiter polling mid-close would rightly start with the
+    # 4..6 then free. So the test frees `other` only while the waiter is parked between polls.
+    gate, parked, real_poll = threading.Lock(), threading.Event(), testslots.poll_s
+
+    def poll(s):
+        if threading.current_thread() is t:
+            parked.set()
+            with gate:
+                pass
+        return real_poll(s)
+    monkeypatch.setattr(testslots, "poll_s", poll)
     t = threading.Thread(target=lambda: got.append(testslots.acquire("full", told.append, cfg={"checks": {"test_run_min": 4,
                                                                                      "test_run_max": 7}}, full=True)))
     t.start()
@@ -868,7 +879,10 @@ def test_test_slots_a_full_run_waits_for_its_minimum_grant_others_start_with_one
         assert push is not None and push.k == 8, "a push check never waits for the minimum"
         push.close()
     finally:
-        other.close()
+        with gate:
+            parked.clear()
+            _wait_for(parked.is_set)
+            other.close()
     t.join(10)
     assert got and got[0].k == 7 and "granted" in told[-1], (got, told)
     light = testslots.acquire("pre-stage", wait_s=1)   # 1 free, fewer than the minimum
