@@ -46,7 +46,8 @@ each check granted within RAMP_S), so a saturated host starts no more suites; wi
 always starts. The run's test grant then follows the same free cores (testslots.live_room).
 `checks.live_cores` 0 (TTP_CHECKS_LIVE_CORES) turns both off.
 
-Waiters take turns by project (locks.fair_order); within one, by task priority (1 first), then arrival.
+Waiters take turns by project (locks.fair_order); within one, by task priority (1 first;
+a spec's `urgent:` line counts as 1, urgent.is_urgent), then arrival; a running check is never stopped.
 The checks of a task that is a required owner of an open obligation (obligations.owned_open: an urgent
 deliverable owed to the user) queue at OBLIGATION_PRIORITY, ahead of every task priority, until it has its
 receipt or is dropped; the ticket and the status line mark them (OBLIGATION_MARK). Within the project
@@ -76,7 +77,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import hostcpu, locks, obligations, poll_s, project, timefmt
+from . import hostcpu, locks, obligations, poll_s, project, timefmt, urgent
 
 RESOURCE = "checks"
 OBLIGATION_PRIORITY = 0   # an open obligation's required owner: before every task priority (1 and up)
@@ -368,13 +369,16 @@ def task_priority(p) -> int | None:
 
 
 def task_rank(p) -> tuple[int | None, list[str]]:
-    """(task_priority(p), the ids of the open obligations behind an OBLIGATION_PRIORITY boost, else [])."""
+    """(task_priority(p), the ids of the open obligations behind an OBLIGATION_PRIORITY boost, else []).
+    An urgent task (urgent.is_urgent: an `urgent:` spec line) ranks at least urgent.PRIORITY."""
     task = os.environ.get("TTP_TASK") or ""
     if p is None or not task.isdigit():
         return None, []
     try:
         t = p.db.task(int(task))
         prio = int(t["priority"]) if t and t.get("priority") is not None else None
+        if t and urgent.is_urgent(t):
+            prio = urgent.PRIORITY if prio is None else min(prio, urgent.PRIORITY)
     except Exception:   # an unreadable database only loses the ordering, never the slot
         return None, []
     try:

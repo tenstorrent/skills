@@ -1862,6 +1862,62 @@ def test_suite_slot_frees_to_the_most_urgent_waiter_not_the_first_arrival(env, m
     assert got == ["p1 last", "p2 later", "p2 last", "p3 early"], got
 
 
+def test_suite_slot_ranks_an_urgent_spec_line_as_p1_ahead_of_earlier_p3s_fifo_within_a_priority(env, monkeypatch):
+    # A spec's `urgent:` line ranks a task's checks as p1 (urgent.is_urgent), via the rank the real
+    # callers pass (checkcap.task_rank); `urgent: no` does not; a running holder is never stopped.
+    import threading
+    from ttp import checkcap, checklane, locks, testslots
+    p = make(env)
+    add = lambda title, spec, prio: p.db.add_task(title, spec, kind="code", tier="light", origin="coordinator",
+                                                  priority=prio)
+    holder = add("holder", "s", 3)
+    early, later = add("p3 early", "s", 3), add("p3 later", "s", 3)
+    hot = add("urgent line", "fix it\nurgent: user waits on this\n", 3)
+    p1 = add("p1", "s", 1)
+    not_hot = add("not urgent", "urgent: no\n", 3)
+    rank = {}
+    for tid in (holder, early, later, hot, p1, not_hot):
+        monkeypatch.setenv("TTP_TASK", str(tid))
+        rank[tid] = checkcap.task_rank(p)[0]
+    assert rank == {holder: 3, early: 3, later: 3, hot: 1, p1: 1, not_hot: 3}, rank
+    monkeypatch.setenv("TTP_TASK", str(add("urgent p5", "urgent: deadline", 5)))
+    assert checkcap.task_rank(p) == (1, [])
+    monkeypatch.setenv("TTP_TASK", str(add("urgent p1", "urgent: x", 1)))
+    assert checkcap.task_rank(p) == (1, []), "never ranked below its own priority"
+
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    monkeypatch.delenv(testslots.HELD_ENV, raising=False)
+    monkeypatch.delenv(checkcap.HELD_ENV, raising=False)
+    monkeypatch.setenv("TTP_TASK", str(holder))
+    hold = testslots.suite_hold("pa", priority=rank[holder])
+    assert hold.files
+    got, lock = [], threading.Lock()
+
+    def wait(tid, since):
+        g = testslots.suite_hold("pa", priority=rank[tid], since=since, wait_s=30)
+        with lock:
+            got.append(tid)
+        time.sleep(0.3)
+        g.close()
+
+    now = time.time()
+    order = ((early, now - 600), (later, now - 500), (hot, now - 30), (not_hot, now - 20), (p1, now - 10))
+    ts = []
+    for tid, since in order:   # each waiter's ticket names its task, as a real run's does
+        monkeypatch.setenv("TTP_TASK", str(tid))
+        ts.append(threading.Thread(target=wait, args=(tid, since)))
+        ts[-1].start()
+        assert _wait_for(lambda: len(locks.queued(checkcap.slot_dir(), testslots._suite_resource("pa"))) == len(ts))
+    line, = checklane.lane_lines("pa", {}, time.time())
+    assert f"#{holder} p3" in line, "the lane-wait line still names the holder"
+    assert got == [], "a running holder is never pre-empted"
+    hold.close()
+    for t in ts:
+        t.join(30)
+    assert got == [hot, p1, early, later, not_hot], \
+        "p1 (an urgent line or priority 1) before earlier p3s; FIFO within a priority"
+
+
 def test_suite_slot_status_line_shows_the_holder_s_time_against_its_cap_and_the_waiting_order(env, monkeypatch):
     from ttp import checkcap, checklane, locks, testslots
     monkeypatch.delenv(testslots.HELD_ENV, raising=False)
