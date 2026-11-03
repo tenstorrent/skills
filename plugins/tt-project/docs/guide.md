@@ -440,7 +440,10 @@ prolonged whole-box outage.
   gives a fix order, and only where its governing words match as a whole: a compacted fact, a coordinator
   decision superseded by another, a retirement of unknown origin, or a match on a file name, path, version or
   evidence reference alone (or a name the retired text holds only inside one) is advisory, counted on one line. `ttp echoes [--json]` lists, read-only, every retirement (kind, text,
-  replacement, source, time) and every match with its class, including those the digest leaves out.
+  replacement, source, time) and every match with its class, including those the digest leaves out. A match that is no echo (code using a name or field the retired text also holds)
+  can be acknowledged: `ttp echoes --ack <retirement> <place>` (the retirement's id and the place as the listing names it, a file's `<path>:<line>` or a label such as a task spec).
+  The acknowledgement is stored in the project's kv store (`retired_echo_acks`) with a hash of the matched line; while that line's text is unchanged the match is listed as
+  `acknowledged` and gets no fix order. A changed line, or a new copy of it in the same place, lists the match again.
 - Progress and stall check: each minute the daemon checks, without a model, that work keeps yielding
   results (a task done, a worker hand-off, a driver's `result` report). It judges only work that has
   run. A `no_progress` event names a task with a worker run running, a resource running worker runs
