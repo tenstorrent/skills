@@ -319,13 +319,14 @@ def priority_turns() -> int:
     return PRIORITY_TURNS
 
 
-def starve_s(cfg: dict | None = None) -> float:
+def starve_s() -> float:
     """Seconds a checks run waits at most before it outranks every later arrival (above): TTP_CHECKS_STARVE_S,
-    else checks.starve_s (the project's `cfg`, then the account's), else STARVE_S. Zero, negative or infinite
-    give the default: the bound is what keeps a routine run from starving."""
-    from . import checklane
+    else the account's checks.starve_s, else STARVE_S. Account-level like priority_turns: every waiter on the
+    host orders the shared queue by it, so a per-project value would make them disagree on who is next. Zero,
+    negative or infinite give the default: the bound is what keeps a routine run from starving."""
     try:
-        v = float(os.environ.get(STARVE_ENV) or checklane.setting(cfg, "starve_s") or STARVE_S)
+        v = float(os.environ.get(STARVE_ENV)
+                  or (project.load_account_settings().get("checks") or {}).get("starve_s") or STARVE_S)
     except (TypeError, ValueError):
         v = STARVE_S
     return v if 0 < v < math.inf else STARVE_S

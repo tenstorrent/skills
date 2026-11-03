@@ -1410,7 +1410,12 @@ queues behind routine work; nothing running is interrupted:
   Waiters take turns by project, within one by task priority. Checks of priority-1 tasks (live-impact
   work: heal self-fixes and interim mitigations are filed at priority 1) go ahead of other projects'
   waiters, taking turns by project among themselves, but at most `checks.priority_turns` turns in a
-  row (default 3; 0 turns this off) while other checks wait, so the rest still progress. There is no
+  row (default 3; 0 turns this off) while other checks wait, so the rest still progress. No run waits
+  without a bound: one that has waited `checks.starve_s` seconds (account-level, env
+  `TTP_CHECKS_STARVE_S`, default 3600, about one full suite run; it cannot be turned off) goes ahead of
+  every later arrival, priority-1 and obligation checks included, for the next free slot, and later
+  runs of its project leave it their next free test slots; while any run waits for test slots, push
+  checks use only their branch's reserved test slot. There is no
   separate outage marker: priority 1 is the signal. Accepted gap: while a host mixes runtimes from
   before this, their waiters may disagree on who is next and a slot can sit idle until another frees.
   `ttp push --own` publishes a task's branch and queues like task checks.

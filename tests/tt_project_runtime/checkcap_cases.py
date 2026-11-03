@@ -6365,7 +6365,7 @@ def test_push_checks_wait_for_the_load_guard_without_a_host_slot(env, monkeypatc
 def test_checks_waiter_past_the_starve_bound_goes_before_a_later_priority_one_arrival(env, monkeypatch):
     # A routine run that waited past checks.starve_s outranks later urgent (p1) arrivals for the next free
     # slot; under the bound the bounded urgent turns still put the p1 first.
-    from ttp import checkcap, locks
+    from ttp import checkcap, locks, project
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
     held = checkcap.acquire("h")
     now = time.time()
@@ -6387,7 +6387,13 @@ def test_checks_waiter_past_the_starve_bound_goes_before_a_later_priority_one_ar
             monkeypatch.setenv(checkcap.STARVE_ENV, bad)
             assert checkcap.starve_s() == checkcap.STARVE_S
         monkeypatch.delenv(checkcap.STARVE_ENV)
-        assert checkcap.starve_s({"checks": {"starve_s": 900}}) == 900.0, "a project's checks.starve_s"
+        monkeypatch.setattr(project, "load_account_settings", lambda: {"checks": {"starve_s": 900}})
+        assert checkcap.starve_s() == 900.0, "the account's checks.starve_s"
+        monkeypatch.setenv(checkcap.STARVE_ENV, "300")
+        assert checkcap.starve_s() == 300.0, "the env wins over the account setting"
+        monkeypatch.delenv(checkcap.STARVE_ENV)
+        monkeypatch.setattr(project, "load_account_settings", lambda: {"checks": {"starve_s": "x"}})
+        assert checkcap.starve_s() == checkcap.STARVE_S, "an unreadable account value is the default"
     finally:
         held.close()
         locks.dequeue(old)
