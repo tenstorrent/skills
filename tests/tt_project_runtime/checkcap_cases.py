@@ -2382,6 +2382,11 @@ def test_checks_lanes_follow_the_test_pool_run_count_not_the_cores(env, monkeypa
     monkeypatch.setenv("TTP_TEST_POOL", "2")
     cap = checklane.capacity({}, n_cores=64, load=0.0, mem_gib=468, used=0)
     assert cap["top"] >= cap["floor"] >= 1 and cap["n"] >= 1, cap
+    # The pool only lowers the lanes: never above the cores' runs, and an explicit checks.slots still wins.
+    monkeypatch.setenv("TTP_TEST_POOL", "512")
+    cap = checklane.capacity({}, n_cores=64, load=0.0, mem_gib=468, used=0)
+    assert cap["top"] <= 64 // checklane.run_cores({}, 64), cap
+    assert checklane.slots({"checks": {"slots": 2}}, held=0) == 2
 
 
 def test_checks_lanes_admit_no_new_run_on_high_load_or_low_memory_and_an_explicit_setting_wins(
