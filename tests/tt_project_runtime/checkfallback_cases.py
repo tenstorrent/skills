@@ -16,7 +16,7 @@ def _lock_script(tmp_path, name: str):
     return script, pause, log
 
 
-def _ran(log) -> list[str]:
+def _lanes_ran(log) -> list[str]:
     return log.read_text().split() if log.exists() else []
 
 
@@ -35,7 +35,7 @@ def test_checks_fallback_lane_runs_paused_wrapped_commands_there_and_says_so(env
     cli.main(["checks", "--fresh", "--", f"touch {a}", f"touch {b}"])
     out = capsys.readouterr().out
     rec = json.loads((run / "checks.json").read_text())
-    assert a.exists() and b.exists() and _ran(log) == ["cpu", "cpu"], _ran(log)
+    assert a.exists() and b.exists() and _lanes_ran(log) == ["cpu", "cpu"], _lanes_ran(log)
     assert rec["passed"] is True and rec["fallback_lane"]["lane"] == str(cpu)
     assert rec["fallback_lane"]["paused"] == "dev" and rec["fallback_lane"]["commands"] == [f"touch {a}", f"touch {b}"]
     assert "2 ran on checks.fallback_lane" in out and "NOT behind checks.wrap_cmd" in out and "dev is paused" in out
@@ -47,7 +47,7 @@ def test_checks_fallback_lane_runs_paused_wrapped_commands_there_and_says_so(env
     dev_pause.unlink()
     cli.main(["checks", "--fresh", "--", f"touch {dev_pause}", f"touch {b}"])
     rec = json.loads((run / "checks.json").read_text())
-    assert b.exists() and _ran(log) == ["dev", "cpu"] and rec["fallback_lane"]["commands"] == [f"touch {b}"]
+    assert b.exists() and _lanes_ran(log) == ["dev", "cpu"] and rec["fallback_lane"]["commands"] == [f"touch {b}"]
     assert "1 ran on checks.fallback_lane" in capsys.readouterr().out
     # "unwrapped": no wrapper at all, with TTP_NO_DEVICE=1 set, a CPU-only run.
     log.unlink()
@@ -132,7 +132,7 @@ def test_checks_fallback_lane_unused_once_the_pause_lifts(env, tmp_path, monkeyp
     cli.main(["checks", "--fresh", "--", f"touch {a}"])
     out = capsys.readouterr().out
     rec = json.loads((run / "checks.json").read_text())
-    assert a.exists() and _ran(log) == ["dev"] and rec["passed"] is True and "fallback_lane" not in rec
+    assert a.exists() and _lanes_ran(log) == ["dev"] and rec["passed"] is True and "fallback_lane" not in rec
     assert "checks.fallback_lane" not in out
     # Only the fallback's pause lifting: the wrapper still paused, the run goes to the fallback.
     a.unlink()
@@ -141,4 +141,4 @@ def test_checks_fallback_lane_unused_once_the_pause_lifts(env, tmp_path, monkeyp
     cpu_pause.unlink()
     cli.main(["checks", "--fresh", "--", f"touch {a}"])
     rec = json.loads((run / "checks.json").read_text())
-    assert a.exists() and _ran(log) == ["cpu"] and rec["fallback_lane"]["paused"] == "dev"
+    assert a.exists() and _lanes_ran(log) == ["cpu"] and rec["fallback_lane"]["paused"] == "dev"
