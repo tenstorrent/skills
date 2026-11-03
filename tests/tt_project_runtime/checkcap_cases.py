@@ -3605,6 +3605,139 @@ def test_a_lane_counts_against_the_project_cap_only_once_its_run_has_its_test_sl
         waiting.close()
 
 
+def test_runs_waiting_for_their_host_grants_hold_neither_the_cap_nor_the_lane_and_running_stays_capped(
+        env, monkeypatch):
+    """A project cap and a repository's lanes full of runs only waiting in the host gates: the next run
+    still takes a lane and queues in those gates, and claim_running keeps every running bound."""
+    from ttp import testslots
+    _slot_sizes(monkeypatch, 32, 4, TTP_TEST_PROJECT_MAX=2)
+    two = lambda _held: 2   # noqa: E731
+    hold = lambda **k: testslots.suite_hold("pa", repo=_LANE_REPO, slots=two, cap=2, wait_s=0,   # noqa: E731
+                                            pending=True, **k)
+    waiting = [hold(running=True), hold(running=True)]
+    assert hold() is None, "without `running` the waiting runs keep the lanes (the old behaviour)"
+    later = [hold(running=True), hold(running=True)]
+    try:
+        assert all(g and g.files for g in waiting + later), "runs waiting for their grants keep nobody out"
+        assert testslots.project_held("pa") == [] and testslots._numbered_held(
+            testslots.suite_base("pa", _LANE_REPO), running=True) == 0
+        assert testslots.claim_running(later[1], "pa", two, 2), "the run granted first starts first"
+        assert testslots.claim_running(waiting[0], "pa", two, 2)
+        assert not testslots.claim_running(later[0], "pa", two, 2), "two running: the bound holds"
+        assert not testslots.claim_running(later[0], "pa", two, 2, mark=False)
+        assert len(testslots.project_held("pa")) == 2, "a refused claim marks nothing"
+        assert testslots._pending(Path(later[0].files[0].name))
+        waiting[0].close()
+        assert testslots.claim_running(later[0], "pa", two, 2, mark=False), "room once a running suite ends"
+        assert testslots.claim_running(later[0], "pa", two, 2)
+        assert not testslots.claim_running(waiting[1], "pa", two, 3), "the repository's 2 lanes, under a cap of 3"
+        assert len(testslots.project_held("pa")) == 2
+    finally:
+        for g in waiting + later:
+            g.close()
+    assert testslots.project_held("pa") == []
+
+
+def test_claim_running_bounds_only_repository_lanes_and_never_counts_a_worktree_lane_or_its_own_twice(
+        env, tmp_path, monkeypatch):
+    from ttp import locks, testslots
+    _lane_env(monkeypatch)
+    one = lambda _held: 1   # noqa: E731
+    tree = testslots.suite_hold("pa", repo=testslots.tree_key(tmp_path), wait_s=0, pending=True, running=True)
+    suite = testslots.suite_hold("pa", repo=_LANE_REPO, slots=one, cap=1, wait_s=0, pending=True, running=True)
+    wrap = testslots.suite_hold("pa", repo=_LANE_REPO, lock="0123456789ab", cap=2, wait_s=0, pending=True,
+                                running=True)
+    try:
+        suite.files += tree.files
+        assert testslots.claim_running(suite, "pa", one, 1), "its worktree lane is not a second check on the cap"
+        assert len(testslots.project_held("pa")) == 1
+        rec = locks.holder_records([Path(wrap.files[0].name)])[0]
+        assert "running" not in rec, "a wrapper lock's one lane keeps its own bound"
+        assert not testslots.claim_running(wrap, "pa", one, 1), "the project's cap of 1 is full"
+        assert testslots.claim_running(wrap, "pa", one, 2), "its lock lane, never the repository's lanes"
+    finally:
+        for g in (suite, wrap):
+            g.close()
+
+
+def test_ttp_checks_granted_with_its_running_bound_full_hands_its_grants_back_and_runs_once_there_is_room(
+        env, tmp_path, monkeypatch, capsys):
+    from ttp import checkcap, cli, testslots
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _slot_sizes(monkeypatch, 6, 3)
+    from ttp import locks
+    real, calls = testslots.claim_running, []
+
+    def claim(grant, *a, mark=True, **k):
+        calls.append((mark, len(locks.held_labels(checkcap.all_paths(8))), len(locks_held(testslots))))
+        return real(grant, *a, mark=mark, **k) if len(calls) > 2 else False   # full twice
+
+    monkeypatch.setattr(testslots, "claim_running", claim)
+    seen = tmp_path / "seen"
+    cli.main(["checks", "--", "sh", "-c", f'echo "$TTP_TEST_SLOTS" > {seen}'])
+    assert seen.read_text().strip() == "3", "it ran with its grant once there was room"
+    assert [c[0] for c in calls] == [True, False, False, True], calls   # refused, waits, room, claims
+    assert calls[0][1:] != (0, 0) and calls[1][1:] == (0, 0), \
+        "granted it held its slots; waiting for room it holds no checks or test slot, only its lane"
+    assert "handed its grants back" in (run / "checks.log").read_text()
+    assert not locks_held(testslots) and not locks.held_labels(checkcap.all_paths(8)), "released at the end"
+
+
+_RUNNING_HOLDER = """
+import os, signal, sys, time
+from pathlib import Path
+from ttp import checklane, testslots
+checklane.HEARTBEAT_S = 3600.0
+g = testslots.suite_hold("pa", repo=sys.argv[1], slots=1, cap=1, wait_s=0, pending=True, running=True)
+assert testslots.claim_running(g, "pa", lambda _held: 1, 1)
+Path(sys.argv[2]).write_text("running")
+while not Path(sys.argv[2] + ".end").exists():
+    time.sleep(0.05)
+how = Path(sys.argv[2] + ".end").read_text()
+if how == "exit":
+    g.close()
+    sys.exit(0)
+if how == "crash":
+    raise RuntimeError("the suite crashed")
+os.kill(os.getpid(), signal.SIGKILL)
+"""
+
+
+@pytest.mark.parametrize("how", ["exit", "crash", "kill"])
+def test_a_run_counts_once_from_its_grant_and_frees_its_lane_on_exit_crash_or_sigkill(
+        env, tmp_path, monkeypatch, how):
+    from ttp import testslots
+    _lane_env(monkeypatch)
+    one = lambda _held: 1   # noqa: E731
+    mine = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, cap=1, wait_s=0, pending=True, running=True)
+    try:
+        assert testslots.claim_running(mine, "pa", one, 1) and testslots.claim_running(mine, "pa", one, 1)
+        assert len(testslots.project_held("pa")) == 1, "a second claim of the same run never counts twice"
+    finally:
+        mine.close()
+    assert testslots.project_held("pa") == []
+    got = tmp_path / "holder"
+    proc = subprocess.Popen([sys.executable, "-c", _RUNNING_HOLDER, _LANE_REPO, str(got)],
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_TASK": "12"},
+                            stderr=subprocess.DEVNULL)
+    nxt = None
+    try:
+        assert _wait_for(got.exists), "the holder never started running"
+        assert len(testslots.project_held("pa")) == 1
+        hold = lambda: testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, cap=1, wait_s=0,   # noqa: E731
+                                            pending=True, running=True)
+        assert hold() is None, "a running holder keeps its lane and the cap"
+        (tmp_path / "holder.end").write_text(how)
+        proc.wait(10)
+        assert proc.returncode == {"exit": 0, "crash": 1, "kill": -9}[how]
+        assert testslots.project_held("pa") == [], "the kernel drops its lane with the process"
+        nxt = hold()
+        assert nxt and testslots.claim_running(nxt, "pa", one, 1)
+    finally:
+        _stop(proc)
+        nxt and nxt.close()
+
+
 def test_a_waiter_at_its_projects_budget_keeps_its_place_and_is_never_passed_by_a_later_one(env, monkeypatch):
     import threading
     from ttp import checkcap, locks, testslots

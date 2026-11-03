@@ -4185,9 +4185,12 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         if suite is None and lock and _wrap_lane_after(cfg):
             suite = testslots.Grant()   # checks.wrap_lane "after": the step inside the wrapper takes the lane
         # The repository's lanes are read again at every try: unset, they follow the host's load (checklane.capacity).
-        if suite is None and (suite := hold(repo, lambda held: checklane.slots(cfg, held), lock=lock,
+        lanes_now = lambda held: checklane.slots(cfg, held)   # noqa: E731
+        # Its repository's lanes bound running suites only: while it waits for its grants below, the next
+        # waiter takes a lane and queues in those gates too (most urgent first); claim_running keeps the bound.
+        if suite is None and (suite := hold(repo, lanes_now, lock=lock,
                                             cap=checklane.project_cap(cfg), cap_note=checklane.cap_note(cfg),
-                                            worktree=top, headroom=checklane.headroom, pending=True,
+                                            worktree=top, headroom=checklane.headroom, pending=True, running=True,
                                             startable=lambda: testslots.pool_room(cfg, p.name if p else None))) is None:
             if tree is not None:
                 tree.close()
@@ -4195,28 +4198,45 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         if tree is not None:
             suite.files += tree.files
             tree = None
-        left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
-        testslots.lane_waits(suite, "a host-wide checks slot")   # held, not running yet: status says why
-        slot = checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell, waiting,
-                                left, arrived,
-                                p.name if p else None, prio, same, done, stop,
-                                p.state if p else None, owns, cap=checklane.project_cap(cfg))
-        if slot is None or slot.served:
-            suite.close()
-            return slot
-        # Then the run's share of the host's test-worker slots (testslots), held with the checks slot;
-        # in the foreground none free by the end of the same wait hands over to detached checks too.
-        left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
-        testslots.lane_waits(suite, "host test slots")
-        slot.tests = testslots.acquire(checkcap.label(p.name if p else None), tell, left,
-                                       p.config() if p else {}, p.name if p else "", priority=prio, stop=stop,
-                                       since=arrived, full=True,   # a full run waits for checks.test_run_min
-                                       waits=lambda w: testslots.lane_waits(suite, w))
-        if slot.tests is None:
+        while True:
+            left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
+            testslots.lane_waits(suite, "a host-wide checks slot")   # held, not running yet: status says why
+            slot = checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell,
+                                    waiting, left, arrived,
+                                    p.name if p else None, prio, same, done, stop,
+                                    p.state if p else None, owns, cap=checklane.project_cap(cfg))
+            if slot is None or slot.served:
+                suite.close()
+                return slot
+            # Then the run's share of the host's test-worker slots (testslots), held with the checks slot;
+            # in the foreground none free by the end of the same wait hands over to detached checks too.
+            left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
+            testslots.lane_waits(suite, "host test slots")
+            slot.tests = testslots.acquire(checkcap.label(p.name if p else None), tell, left,
+                                           p.config() if p else {}, p.name if p else "", priority=prio, stop=stop,
+                                           since=arrived, full=True,   # a full run waits for checks.test_run_min
+                                           waits=lambda w: testslots.lane_waits(suite, w))
+            if slot.tests is None:
+                slot.close()
+                suite.close()
+                return None
+            # Only now does its lane count against the project's cap and its repository's lanes, if both
+            # have room; else its grants go back and it waits for a running suite to end, then queues again.
+            if testslots.claim_running(suite, p.name if p else None, lanes_now, checklane.project_cap(cfg)):
+                break
             slot.close()
-            suite.close()
-            return None
-        testslots.slots_granted(suite)   # only now does its lane count against the project's cap
+            slot = None
+            testslots.lane_waits(suite, "a running suite of its repository or project to end")
+            tell and tell(f"granted, but its repository's lanes or the project's cap of running checks are full: "
+                 f"handed its grants back to wait for a running suite to end")
+            while not testslots.claim_running(suite, p.name if p else None, lanes_now,
+                                              checklane.project_cap(cfg), mark=False):
+                if stop and (why := stop()):
+                    raise checkcap.Cancelled(why)
+                if limit is not None and time.time() - t0 >= limit:
+                    suite.close()
+                    return None
+                time.sleep(testslots.poll_s(testslots.POLL_S))
         slot.tests.files += suite.files   # the suite lock ends with the run's test slots
         slot.suite = suite   # its label shows the run's wall-time cap (testslots.suite_running)
         if not os.environ.get(testslots.HELD_ENV) and (ports := testslots.port_block(checkcap.label(p.name if p else None))):

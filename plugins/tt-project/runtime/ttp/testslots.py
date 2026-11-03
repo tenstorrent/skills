@@ -832,9 +832,48 @@ def _lane_guard(base: str):
         yield
 
 
-def _numbered_held(base: str) -> int:
-    """How many of `base`'s numbered lane files are held now, past any count too."""
-    return sum(1 for x in _lanes_of(base) if not x.name.startswith(base + "-x") and locks._slot_labels([x]))
+def _numbered_held(base: str, running: bool = False) -> int:
+    """How many of `base`'s numbered lane files are held now, past any count too; with `running` only
+    those whose run has its test slots (not _pending)."""
+    return sum(1 for x in _lanes_of(base) if not x.name.startswith(base + "-x") and locks._slot_labels([x])
+               and not (running and _pending(x)))
+
+
+def claim_running(grant, project_name: str | None, slots: Callable[[int], int], cap: int = 0,
+                  mark: bool = True) -> bool:
+    """Mark the lanes `grant` (suite_hold's, taken `pending`) holds as running (slots_granted) once its run
+    has its host grants, if that keeps every bound: fewer than `cap` (checklane.project_cap; 0: none) of
+    the project's lanes running, unless its lane went past the cap ("over_cap"), and for a lane taken with
+    `running`, fewer than `slots(n)` of its repository's numbered lanes running (n of them now). Counted
+    and marked under the same guards suite_hold takes its lanes under, so two runs granted at once never
+    pass a bound. False, with nothing marked, while a bound is full: the caller hands its grants back
+    and waits for room (`mark` False: only says whether there is room now)."""
+    lanes = [f for f in getattr(grant, "files", None) or []
+             if os.path.basename(getattr(f, "name", "")).startswith(SUITE + ".")]
+    recs = {f.name: (locks.holder_records([Path(f.name)]) or [{}])[0] for f in lanes}
+    waiting = [f for f in lanes if recs[f.name].get("granted") is False]
+    if not project_name or not waiting:
+        mark and slots_granted(grant)
+        return True
+    with contextlib.ExitStack() as guards:
+        guards.enter_context(_cap_guard(project_name, cap))
+        for base in sorted({_LANE_FILE.sub("", os.path.basename(f.name)) for f in waiting}):
+            guards.enter_context(_lane_guard(base))
+        counted = {str(x) for x in lane_paths(project_name, repo=None)}   # a worktree lane is not (tree_key)
+        if cap > 0 and any(f.name in counted and not recs[f.name].get("over_cap") for f in waiting) \
+                and len(project_held(project_name)) >= cap:
+            return False
+        for f in waiting:
+            base = _LANE_FILE.sub("", os.path.basename(f.name))
+            if recs[f.name].get("running") and not base.endswith("-x"):
+                n = _numbered_held(base, running=True)
+                if n >= max(1, int(slots(n) or 1)):
+                    return False
+        mark and slots_granted(grant)
+    return True
+
+
+_LANE_FILE = re.compile(r"\.\d+\.lock$")
 
 
 def cap_turn(project_name: str, cap: int, ticket, slots: int, now: float | None = None,
@@ -975,7 +1014,8 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                max_wait: float = 0.0, state=None, what: str = "full checks", lock: str = "", cap: int = 0,
                cap_note: str = "", worktree: str = "", headroom: Callable[[], bool] | None = None,
                age: float | None = None, pending: bool = False, check: str = "",
-               repo_name: str = "", name: str = "", startable: Callable[[], bool] | None = None) -> Grant | None:
+               repo_name: str = "", name: str = "", startable: Callable[[], bool] | None = None,
+               running: bool = False) -> Grant | None:
     """Hold one of project `project_name`'s `slots` checks lanes in repository `repo` (repo_key) for its
     full checks (above), waiting while its other runs there hold them all or a more urgent waiter is ahead
     (suite_order); Grant(0) holding one, Grant() with no project or nested in a check, None once `wait_s`
@@ -1009,7 +1049,10 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     it is read again at every try, and a lane is free only while fewer than that many lane files of the
     repository are held, so a count that fell under a holder's lane number admits nobody past it.
     `startable()` (pool_room): an overflow lane (cheaper, urgent, past the cap) is taken only while it
-    says the run can start now, so no extra lane is held by a run that waits for test slots."""
+    says the run can start now, so no extra lane is held by a run that waits for test slots.
+    `running` (with `pending`): the repository's lanes bound only running suites: a lane whose run still
+    waits for its host grants leaves its place to the next waiter, which queues in those gates beside it
+    (most urgent first there), and claim_running checks the bound when a run gets its grants."""
     from . import checklane
     age = age_s() if age is None else age
     if not project_name or os.environ.get(HELD_ENV) or os.environ.get(checkcap.HELD_ENV):
@@ -1034,7 +1077,8 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     fields = {**({"task": task} if task.isdigit() else {}), **({"priority": priority} if priority is not None else {}),
               **({"cost": cost} if cost else {}), **({"lock": lock} if lock else {}),
               **({"worktree": str(worktree)} if worktree else {}), **({"granted": False} if pending else {}),
-              **({"repo_name": repo_name} if repo_name else {}), "hb": checklane.HEARTBEAT_S,
+              **({"repo_name": repo_name} if repo_name else {}), **({"running": True} if running and pending and not lock else {}),
+              "hb": checklane.HEARTBEAT_S,
               "queued": arrival}   # the holder's queue age, apart from its run time (checklane.holder_times)
     start, told = time.time(), 0.0
     try:
@@ -1046,11 +1090,14 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                 _reclaim(x, tell, state)
             # Free lanes before the queue: a lane freed after this count waits for the next turn, so the
             # queue that decides holds every waiter that arrived before it was freed.
-            n_held = len([x for x in mine if locks._slot_labels([x])])
+            n_all = len([x for x in mine if locks._slot_labels([x])])
+            only_running = running and pending and not lock
+            n_held = len([x for x in mine if locks._slot_labels([x]) and not _pending(x)]) if only_running else n_all
             slots = max(1, int(count(n_held) or 1))
             # Take only from the first `slots` files: with fewer holders, one of them is free. Holders past a
-            # shrunk count still count, here and for the cheaper and urgent checks below.
-            lanes = lane_paths(project_name, slots, repo)
+            # shrunk count still count, here and for the cheaper and urgent checks below. Holders still
+            # waiting for their grants (`running`) take files past those, one more than are held.
+            lanes = lane_paths(project_name, max(slots, n_all + 1) if only_running else slots, repo)
             recs = locks.holder_records(lane_paths(project_name, max(slots, len(mine)), repo) + extra_lanes)
             free = slots - n_held
             every = locks.queued(checkcap.slot_dir(), resource)
@@ -1091,7 +1138,7 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                     over = False
                     # Recount under the guard: a run that took a lane since the count above (and left the
                     # queue) is not free room, so a stale count never admits past the bound.
-                    free = min(free, slots - _numbered_held(base)) if free > 0 else free
+                    free = min(free, slots - _numbered_held(base, only_running)) if free > 0 else free
                     if free > 0 and pos < free:
                         if cap_turn(project_name, cap, ticket, slots, age=age):
                             f = locks.try_take(lanes, label, what, extra=fields)
