@@ -656,3 +656,53 @@ def test_lock_cycle_groups_nested_holders_outside_a_task_and_skips_cycles_of_oth
     finally:
         for f in fs:
             f.close()
+
+
+def test_lock_cycle_needs_both_reads_and_skips_shared_waits_behind_shared_holders(tmp_path, monkeypatch):
+    import fcntl
+    from ttp import lockcycle
+    _ReapProcs(monkeypatch, {4101: {"start": "11"}, 4102: {"start": "11"}}, None)
+    _cycle_procs(monkeypatch, {})
+    d = tmp_path / "locks"
+    fs = _cycle_party(d, "p", None, "task #1 (run 1)", 4101, task=1) + [_cycle_ticket(d, "q", "task #1 (run 1)", 7001)]
+    d.mkdir(parents=True, exist_ok=True)
+    g = open(d / "q.0.lock", "a+")   # task 2 holds q shared
+    fcntl.flock(g, fcntl.LOCK_SH)
+    g.write(json.dumps({"holder": "task #2 (run 2)", "pid": 4102, "pid_start": "11", "task_id": "2"}))
+    g.flush()
+    fs += [g, _cycle_ticket(d, "p", "task #2 (run 2)", 7002)]
+    try:
+        assert lockcycle.find([(d, "demo")])   # p is held exclusively: task 2's exclusive wait is stuck
+        fs[-1].close()
+        fs.append(_cycle_ticket(d, "p-x", "task #2 (run 2)", 7002))   # not a wait for p any more
+        (d / "p.queue").rename(d / "p-old.queue")
+        sw = d / "p.queue"
+        sw.mkdir()
+        h = open(sw / f"{time.time():017.6f}-7003{__import__('ttp').locks.SHARED_TICKET}", "a+")
+        fcntl.flock(h, fcntl.LOCK_EX)
+        h.write("task #2 (run 2)")
+        h.flush()
+        fs.append(h)
+        assert lockcycle.find([(d, "demo")])   # a shared wait behind an exclusive holder is stuck too
+        # 1 waits for q, held only shared by 2: an exclusive waiter is stuck behind it; a shared one is not.
+        fs[1].close()
+        q = d / "q.queue"
+        for x in q.iterdir():
+            x.unlink()
+        s1 = open(q / f"{time.time():017.6f}-7004{__import__('ttp').locks.SHARED_TICKET}", "a+")
+        fcntl.flock(s1, fcntl.LOCK_EX)
+        s1.write("task #1 (run 1)")
+        s1.flush()
+        fs.append(s1)
+        assert not lockcycle.find([(d, "demo")])
+        # A cycle seen in one read only (a release and a new wait read between two files) raises nothing.
+        monkeypatch.setattr(lockcycle, "graph", lambda dirs: next(seen))
+        fake = {"parties": {"a": {"id": "a", "holds": {"x"}, "waits": {"y"}}, "b": {"id": "b", "holds": {"y"}, "waits": {"x"}}},
+                "edges": [("a", "b", "y"), ("b", "a", "x")]}
+        seen = iter([fake, {"parties": {}, "edges": []}])
+        assert not lockcycle.find([(d, "demo")])
+        seen = iter([fake, fake])
+        assert len(lockcycle.find([(d, "demo")])) == 1
+    finally:
+        for f in fs:
+            f.close()
