@@ -5464,14 +5464,15 @@ def test_no_suite_starts_while_the_host_is_overloaded_and_its_lane_says_why(env,
     lane = testslots.suite_hold("pb", repo=_LANE_REPO, slots=1, cap=1, wait_s=0, pending=True)
     notes, got = [], {}
     t = threading.Thread(target=lambda: got.setdefault("g", testslots.acquire(
-        "waiter", project_name="pb", wait_s=20, waits=lambda w: (notes.append(w), testslots.lane_waits(lane, w)))))
+        "waiter", project_name="pb", wait_s=20, waits=lambda w: (testslots.lane_waits(lane, w), notes.append(w)))))
     t.start()
     try:
-        for _ in range(200):
-            if notes:
+        recs = []
+        for _ in range(200):  # the lane label is rewritten (truncate, then write): poll until it reads whole
+            recs = locks.holder_records([Path(f.name) for f in lane.files]) if notes else []
+            if recs and "overloaded" in (recs[0].get("waits") or ""):
                 break
             time.sleep(0.02)
-        recs = locks.holder_records([Path(f.name) for f in lane.files])
         assert notes and notes[0].startswith("host load: ") and "overloaded" in recs[0]["waits"], (notes, recs)
         load[0] = 60.0
         t.join(20)
