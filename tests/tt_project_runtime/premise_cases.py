@@ -78,7 +78,8 @@ def test_a_failed_premise_closes_the_code_task_as_not_needed_with_a_done_event(e
     cid = _code(p)
     premise.tend(p.db)
     qid = p.db.one("SELECT id FROM tasks WHERE kind='question'")["id"]
-    _end_check(p, qid, premise="fails", summary="Already there: cli.py:40 prints the retry line since abc123.")
+    _end_check(p, qid, premise="fails", summary="Already there: cli.py:40 prints the retry line since abc123.",
+               covered=[{"condition": "ttp task show prints a retry line", "at": "runtime/ttp/cli.py:40"}])
     assert premise.tend(p.db) == [(cid, f"premise fails (#{qid})")]
     code = p.db.task(cid)
     res = json.loads(code["result"])
@@ -88,6 +89,81 @@ def test_a_failed_premise_closes_the_code_task_as_not_needed_with_a_done_event(e
     ev = p.db.one("SELECT * FROM events WHERE kind='task_done' AND task=?", (cid,))
     assert ev["status"] == "queued" and "done, not run" in ev["text"] and "abc123" in ev["text"]
     assert not p.db.q("SELECT 1 FROM runs WHERE task=?", (cid,)), "no code run was spent"
+
+
+def test_a_fails_answer_closes_the_code_task_only_with_file_line_cover_for_every_named_condition(env):
+    from ttp import premise
+    p = _premise_project(env)
+    disk = {"condition": "check scratch on disk", "at": "runtime/ttp/checks.py:210"}
+    ram = {"condition": "check scratch on the RAM disk", "at": "runtime/ttp/checks.py:180"}
+    partial = {
+        "one condition uncited": dict(covered=[ram, {"condition": "check scratch on disk", "at": ""}]),
+        "an uncovered list": dict(covered=[ram], uncovered=["check scratch on disk"]),
+        "an uncovered string": dict(covered=[ram], uncovered="check scratch on disk"),
+        "no covered list": dict(),
+        "an empty covered list": dict(covered=[]),
+        "a cite with no line": dict(covered=[ram, {"condition": "check scratch on disk", "at": "checks.py"}]),
+        "a host:port, no file": dict(covered=[ram, {"condition": "check scratch on disk", "at": "localhost:8080"}]),
+        "a cite with no condition": dict(covered=[ram, {"at": "runtime/ttp/checks.py:210"}]),
+        "a bare string with no cite": dict(covered=["check scratch on disk: handled"]),
+        "covered not a list": dict(covered="runtime/ttp/checks.py:180"),
+    }
+    full = {"dicts": dict(covered=[ram, disk]),
+            "strings": dict(covered=["RAM disk: runtime/ttp/checks.py:180", "on disk: checks.py:210-214"]),
+            "empty uncovered": dict(covered=[ram, disk], uncovered=[])}
+    answers = {**partial, **{"full " + k: v for k, v in full.items()}}
+    cids = {how: _code(p) for how in answers}
+    premise.tend(p.db)
+    cases = {how: (cid, int(json.loads(p.db.task(cid)["labels"])[0].split(":")[1])) for how, cid in cids.items()}
+    for how, (cid, qid) in cases.items():
+        _end_check(p, qid, premise="fails", summary="Already exists: checks.py:180 keeps the scratch.", **answers[how])
+    got = dict(premise.tend(p.db))
+    for how in partial:
+        cid, qid = cases[how]
+        code = p.db.task(cid)
+        assert got[cid] == f"premise holds (#{qid})", how
+        assert code["status"] == "queued" and json.loads(code["labels"]) == [f"premise:{qid}:holds"], how
+        assert "without file:line cover for every condition" in code["spec"], how
+        assert "Already exists: checks.py:180 keeps the scratch." in code["spec"], how
+        assert not p.db.q("SELECT 1 FROM events WHERE kind='task_done' AND task=?", (cid,)), how
+    assert "uncovered: check scratch on disk" in p.db.task(cases["an uncovered list"][0])["spec"]
+    assert "no file:line for: check scratch on disk" in p.db.task(cases["one condition uncited"][0])["spec"]
+    for how in full:
+        cid, qid = cases["full " + how]
+        code = p.db.task(cid)
+        assert got[cid] == f"premise fails (#{qid})", how
+        assert code["status"] == "done" and json.loads(code["result"])["outcome"] == "rejected", how
+    assert {t["id"] for t in p.db.ready_tasks()} == {cases[h][0] for h in partial}
+
+
+def test_a_fails_answer_naming_a_missing_target_closes_the_code_task_without_cover(env):
+    from ttp import premise
+    p = _premise_project(env)
+    answers = {"missing list": (dict(missing=["runtime/ttp/holdhook.py:_allowed"]), "fails"),
+               "missing string": (dict(missing="runtime/ttp/holdhook.py"), "fails"),
+               "missing but uncovered": (dict(missing=["x.py"], uncovered=["on-disk case"]), "holds"),
+               "empty missing": (dict(missing=["", " "]), "holds")}
+    cids = {how: _code(p) for how in answers}
+    premise.tend(p.db)
+    for how, cid in cids.items():
+        qid = int(json.loads(p.db.task(cid)["labels"])[0].split(":")[1])
+        _end_check(p, qid, premise="fails", summary="No such function at the base ref.", **answers[how][0])
+    got = dict(premise.tend(p.db))
+    for how, cid in cids.items():
+        assert got[cid].startswith(f"premise {answers[how][1]} "), how
+        assert p.db.task(cid)["status"] == ("done" if answers[how][1] == "fails" else "queued"), how
+
+
+def test_the_premise_check_prompt_asks_a_fails_answer_to_cite_cover_for_every_named_condition(env):
+    from ttp import premise
+    p = _premise_project(env)
+    _code(p)
+    premise.tend(p.db)
+    spec = p.db.one("SELECT spec FROM tasks WHERE kind='question'")["spec"]
+    assert "every condition, case or branch the premise or the spec below names" in spec
+    assert '"covered": [{"condition": "...", "at": "path/file.py:123"}]' in spec
+    assert 'answer "holds" and list the rest in "uncovered"' in spec
+    assert 'A "fails" with any condition uncited is read as "holds" and the code task runs.' in spec
 
 
 def test_a_premise_check_with_no_verdict_or_a_dead_end_still_runs_the_code_task(env):

@@ -14,8 +14,12 @@ Model-free, from Daemon.reconcile_tasks and the start of each dispatch pass (ten
 - settle, once the question ended (the code task still queued or blocked on it):
   - its hand-off says `"premise": "holds"`: the code spec gets the question's summary under a
     `Premise check #<id>` line, so the code run does not redo the check, and the task runs;
-  - `"premise": "fails"`: the code task is closed done as not needed (outcome rejected), the question's
-    summary as its result, with the usual task_done event for the coordinator (and a chat reply);
+  - `"premise": "fails"` with full cover (`gaps`: a `covered` entry, each naming a condition and a
+    file:line, for every condition, case or branch the premise or code spec names, and no `uncovered`):
+    the code task is closed done as not needed (outcome rejected), the question's summary as its
+    result, with the usual task_done event for the coordinator (and a chat reply). A "fails" short of
+    that settles as holds and the code spec names the uncovered conditions: a wrong "already exists"
+    would drop real work. A "fails" naming absent targets in `missing` (and no `uncovered`) needs no cover;
   - no verdict, or the question failed or was cancelled: the code task runs anyway and its spec says
     the check gave no verdict, so the code run checks the premise itself (no work is lost).
   The label becomes `premise:<id>:holds|fails|unknown`, so each code task is settled once.
@@ -43,6 +47,7 @@ LABEL = "premise:"                # on the code task: + the question's id, then 
 PENDING = re.compile(r"^premise:(\d+)$")
 VERDICTS = {"holds": "holds", "held": "holds", "true": "holds", "yes": "holds",
             "fails": "fails", "failed": "fails", "false": "fails", "no": "fails"}
+CITE = re.compile(r"[\w+-][\w./+-]*[./][\w+-]+:\d+")   # file:line, a path with a dot or a slash
 SPEC_CHARS = 1500   # of the code spec quoted in the question, for context
 SUMMARY_CHARS = 800  # of the question's summary carried into the code spec
 
@@ -81,6 +86,34 @@ def verdict(result: dict) -> str:
     return VERDICTS.get(str(v or "").strip().lower(), "")
 
 
+def gaps(result: dict) -> list[str]:
+    """Why a "fails" hand-off does not prove the code already covers the premise, or [] when it does: it
+    needs a non-empty `covered` list whose every entry names a condition and cites file:line (a dict
+    with `condition` and `at`, or a string holding both), and an empty `uncovered`. A "fails" because a
+    named target is absent at the base ref (or a note path lies outside the repository) instead lists those
+    targets in `missing`, with an empty `uncovered`: there is no code to cite."""
+    out = []
+    unc = result.get("uncovered")
+    unc = [unc] if isinstance(unc, str) else unc if isinstance(unc, list) else []
+    out += [f"uncovered: {str(x).strip()[:200]}" for x in unc if str(x).strip()]
+    miss = result.get("missing")
+    miss = [miss] if isinstance(miss, str) else miss if isinstance(miss, list) else []
+    if not out and any(str(x).strip() for x in miss):
+        return []   # a named target absent at the base ref: there is no code to cite
+    cov = result.get("covered")
+    if not isinstance(cov, list) or not cov:
+        return out + ["no `covered` list citing file:line per condition"]
+    for x in cov:
+        if isinstance(x, dict):
+            what = str(x.get("condition") or "").strip()
+            at = str(x.get("at") or "").strip()
+        else:
+            what = at = str(x or "").strip()
+        if not what or not CITE.search(at):
+            out.append(f"no file:line for: {what[:200] or '(unnamed condition)'}")
+    return out
+
+
 def question_spec(task: dict, check: str) -> str:
     spec = task.get("spec") or ""
     if len(spec) > SPEC_CHARS:
@@ -99,7 +132,15 @@ def question_spec(task: dict, check: str) -> str:
             f"(records, commits, file:line, output) in \"summary\", 2-4 sentences. Say \"fails\" only when "
             f"the evidence shows it does not hold (for example a named target is missing, the feature "
             f"already exists or there is nothing to fix); when unsure, \"holds\": the code task then runs "
-            f"and reads your summary.\n\n"
+            f"and reads your summary.\n"
+            f"A \"fails\" for a named target that is absent at the base ref, or a note path outside this "
+            f"repository, lists each such target in \"missing\": [\"...\"]. Any other \"fails\" must prove "
+            f"full cover: list every condition, case or branch the premise or the "
+            f"spec below names (each storage, platform, mode, path or error case) in \"covered\": "
+            f"[{{\"condition\": \"...\", \"at\": \"path/file.py:123\"}}], each with the file:line of the "
+            f"code that already handles it. Code covering only some of them is no \"fails\": answer "
+            f"\"holds\" and list the rest in \"uncovered\". A \"fails\" with any condition uncited is "
+            f"read as \"holds\" and the code task runs.\n\n"
             f"The code task's spec, for context:\n{spec}")
 
 
@@ -133,6 +174,9 @@ def _settle(db, task: dict, qid: int) -> str | None:
         return None
     res = load_result(q["result"]) if q else {}
     got = verdict(res) if q and q["status"] == "done" else ""
+    short = gaps(res) if got == "fails" else []
+    if short:
+        got = "holds"   # a "fails" short of full cover drops no work: the code task runs
     summary = str(res.get("summary") or "").strip()
     now = time.time()
     with db.tx():
@@ -156,7 +200,11 @@ def _settle(db, task: dict, qid: int) -> str | None:
                   f"#{t['id']} {t['title']} → done, not run ({line_})"[:1500], "queued", t["id"]))
             pushq._reply(db, t, "done", result["summary"])
             return got
-        if got == "holds":
+        if short:
+            note = (f"Premise check #{qid}: answered fails without file:line cover for every condition, so "
+                    f"it counts as holds; check these yourself: {'; '.join(short)[:SUMMARY_CHARS]}. "
+                    f"Its summary: {summary[:SUMMARY_CHARS]}").strip()
+        elif got == "holds":
             note = f"Premise check #{qid}: holds. {summary[:SUMMARY_CHARS]}".strip()
         else:
             why = "gave no verdict" if q and q["status"] == "done" else f"ended {q['status'] if q else 'missing'}"
