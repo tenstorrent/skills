@@ -1213,9 +1213,10 @@ queues behind routine work; nothing running is interrupted:
   `ttp push --own`, the local branch for `ttp land`, empty for `ttp checks`; a check that refuses
   content by destination reads it, not the branch checked out. A check that should only gate the push branch tests
   `[ "$TTP_PUSH_MODE" != target ] || ...`. `ttp push --own` may instead reuse a
-  `ttp checks` pass recorded on exactly HEAD's tree (run with mode `checks` and an empty tip), so
-  logic that only runs in mode `own`, or that depends on `TTP_PUSH_TIP`, cannot count on running
-  there; the push queue (`target`) always runs its checks. In the other direction, `ttp checks` may
+  `ttp checks` pass recorded on exactly HEAD's tree (run with mode `checks`, an empty tip and an
+  empty `TTP_PUSH_BRANCH`), so logic that only runs in mode `own`, or that depends on
+  `TTP_PUSH_TIP` or `TTP_PUSH_BRANCH`, cannot count on running there; the push queue (`target`)
+  always runs its checks. In the other direction, `ttp checks` may
   reuse a push-queue pass of a plain pytest check for the same tree, command and environment:
   that pass ran in mode `target` with that batch's tip, not `checks` with an empty tip.
   `env_id` does not cover CHECK_ENV_VARS (`PYTEST_ADDOPTS` and similar), so a reused
