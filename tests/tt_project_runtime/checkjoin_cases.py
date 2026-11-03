@@ -249,6 +249,44 @@ def test_checkjoin_replaced_is_only_the_same_tasks_older_head_running_in_another
     assert cj.replaced({**me, "run": f"t7-{'b' * 12}"}, [old]) == []
 
 
+def test_a_tasks_older_head_waiting_with_other_commands_yields_and_the_newer_run_takes_its_place(tmp_path):
+    # The task's earlier attempt queued checks with other commands on an older head; they still wait when
+    # its newer head's checks arrive. The older waiter is superseded (whatever its commands) and the newer
+    # run queues at its arrival. Another task's waiter, a review precheck and the same head are untouched.
+    import io
+    import types
+    from ttp import checkjoin as cj, cli
+    old = {**_join_rec("old", arrived=10.0, group="g-other-cmds"), "run": "501", "lane": "L"}
+    me = {**_join_rec("me", head="b" * 40, commit_ts=200.0, key="k-b", arrived=40.0), "run": "502", "lane": "L"}
+    assert cj.target(old, [old, me]) == (me, cj.SUPERSEDED)
+    assert cj.displaced(me, [old, me]) == [old]
+    # Never: another task, lane or a record without one, a precheck on either side, the same or a newer
+    # head, a later arrival, a dead, finished or running one (running: replaced, not displaced).
+    pre = f"t7-{'b' * 12}"
+    for other in ({**old, "task": "8"}, {**old, "lane": "L2"}, {**old, "lane": None}, {**old, "run": f"t7-{'a' * 12}"},
+                  {**old, "head": me["head"]}, {**old, "commit_ts": 300.0}, {**old, "arrived": 50.0},
+                  {**old, "alive": False}, {**old, "outcome": {"passed": True}}, {**old, "phase": "running"}):
+        assert cj.displaced(me, [other, me]) == [], other
+    for other in ({**old, "task": "8"}, {**old, "lane": "L2"}, {**old, "lane": None}, {**old, "run": f"t7-{'a' * 12}"},
+                  {**old, "commit_ts": 300.0}):
+        assert cj.target(other, [other, me]) is None, other
+    assert cj.target(old, [old, {**me, "run": pre}]) is None and cj.displaced({**me, "run": pre}, [old]) == []
+    # The same head with the same checks still joins the one running.
+    same = {**old, "id": "same", "key": old["key"], "phase": "running", "arrived": 5.0}
+    assert cj.target(old, [old, same]) == (same, cj.JOINED)
+    # Through the queueing step: the newer run takes the older waiter's arrival and says so.
+    state = tmp_path / "state"
+    o = cj.register(state, task="7", head="a" * 40, commit_ts=100.0, key="k", group="g-other-cmds", run="501",
+                    arrived=10.0, pid=os.getpid(), lane="L")
+    n = cj.register(state, task="7", head="b" * 40, commit_ts=200.0, key="k-b", group="g", run="502",
+                    arrived=40.0, pid=os.getpid(), lane="L")
+    out = io.StringIO()
+    assert cli._checks_replace(types.SimpleNamespace(state=state, db=None), n, out, 40.0) == 10.0
+    assert cj.read(n)["arrived"] == 10.0 and "waiting checks on older head aaaaaaaaaaaa in run 501 yield" in out.getvalue()
+    got = cj.target(cj.read(o) | {"alive": True}, cj.records(state))
+    assert got and got[1] == cj.SUPERSEDED and got[0]["run"] == "502"
+
+
 def test_a_newer_head_in_a_new_worker_run_stops_the_tasks_running_older_checks_and_takes_their_lane(
         env, tmp_path, monkeypatch):
     # The task's previous attempt left its detached checks running on an older head; the next attempt's

@@ -1284,7 +1284,8 @@ queues behind routine work; nothing running is interrupted:
   the same task's checks with the same head, commands, purpose and environment that already wait ahead of it or
   run now. It leaves the queue, runs nothing and reports that run's outcome (passed, failed or timed out, exit 1
   on a failure). A waiter is superseded when the same task queues the same checks on a newer head (a later commit
-  time): it reports the newer head's result, naming that head and saying its own head was not checked, never a
+  time), or, in a worker run, any checks of the same purpose in the same repository (the newer run takes
+  the waiter's place in the queue; a review precheck neither yields nor takes a place this way): it reports the newer head's result, naming that head and saying its own head was not checked, never a
   pass of its own. A newer head's checks that ended before the waiter queued supersede nothing: an older head
   queued later (after a reset, or a second worktree) runs its own checks. A run that has started is stopped only when the same task starts checks of the same
   purpose in the same repository on a newer head in another worker run (an earlier attempt's detached checks):

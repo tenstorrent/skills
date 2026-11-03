@@ -3843,7 +3843,8 @@ def _checks_replace(p: Project | None, me: Path | None, out, arrived: float) -> 
     purpose and repository on an older head in another worker run), so one task never holds two of its repository's lanes: each one's
     detached `ttp checks` (checks.pid of its run, the runs row of the same task) ends through
     jobstop.end_checks, recorded with both heads and this run. Returns the arrival to queue at: the
-    earliest of this run's and the replaced runs', so this run takes the lane they free ahead of later
+    earliest of this run's, the replaced runs' and the waiting older-head runs' it displaces
+    (checkjoin.displaced: they yield by themselves), so this run takes the lane they free ahead of later
     waiters. A run it cannot match to its own run's detached checks is left alone."""
     from . import checkjoin, jobstop
     if not p or me is None or (rec := checkjoin.read(me)) is None:
@@ -3862,6 +3863,12 @@ def _checks_replace(p: Project | None, me: Path | None, out, arrived: float) -> 
                          superseded_by={"id": rec["id"], "run": rec["run"], "head": rec["head"]})
         line = (f"replaced: stopped this task's running checks on older head {str(old.get('head'))[:12]} in run "
                 f"{old['run']} (pid {old.get('pid')}); these on {str(rec['head'])[:12]} take their place in the queue")
+        out.write(f"ttp checks: {line}\n")
+        print(f"ttp checks: {line}", flush=True)
+        arrived = min(arrived, float(old.get("arrived") or arrived))
+    for old in checkjoin.displaced(rec, checkjoin.records(p.state)):
+        line = (f"replaced: this task's waiting checks on older head {str(old.get('head'))[:12]} in run "
+                f"{old['run']} yield; these on {str(rec['head'])[:12]} take their place in the queue")
         out.write(f"ttp checks: {line}\n")
         print(f"ttp checks: {line}", flush=True)
         arrived = min(arrived, float(old.get("arrived") or arrived))

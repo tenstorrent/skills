@@ -10,8 +10,10 @@ and stops waiting when
 
 - the same checks on the same tree wait ahead of it or run now, in any task of the project (a worker's
   own run, its detached rerun, the daemon's review precheck, a reviewer's run): it joins them;
-- the same task queued the same checks on a newer head (a later commit time) that runs, waits or ended
-  while this one waited: it is superseded (a newer head that ended before this run queued is not).
+- the same task queued the same checks, or as a worker run any checks in the same lane (lane: repository
+  and purpose, whatever the commands), on a newer head (a later commit time) that runs, waits or ended
+  while this one waited: it is superseded (a newer head that ended before this run queued is not), and
+  that newer run took its place in the queue (displaced).
 
 Either way it leaves the queue, follows that run (through any run it joined in turn) and reports that
 run's outcome (finish) as its own: passed, failed or timed out. A joined run reports it for its own
@@ -185,14 +187,15 @@ def _while_waiting(r: dict, me: dict) -> bool:
 
 def target(me: dict, recs: list[dict]) -> tuple[dict, str] | None:
     """(the run this waiting run should follow, joined or superseded), or None to keep waiting.
-    Superseded: the same task's group on another head with a later commit time, live now or ended
+    Superseded: the same task's group, or its lane when both are worker runs (whatever their commands),
+    on another head with a later commit time, live now or ended
     while this run waited (never one that ended before it queued: that older head runs its own checks).
     Joined: the same key (any task's), waiting ahead of it or running now (a running one first)."""
     if not me.get("task"):
         return None
     every = [r for r in recs if r.get("id") != me.get("id")]
     others = [r for r in every if r.get("task") == me.get("task")]
-    newer = [r for r in others if r.get("group") == me.get("group")
+    newer = [r for r in others if (r.get("group") == me.get("group") or _same_lane(r, me))
              and r.get("head") != me.get("head") and float(r.get("commit_ts") or 0) > float(me.get("commit_ts") or 0)
              and _while_waiting(r, me)]
     if newer:
@@ -210,6 +213,23 @@ def worker_run(rec: dict) -> bool:
     """Whether a record is a worker run's own checks (a numeric run token, its run folder state/runs/<id>),
     never a daemon review precheck (run folder prechecks/t<id>-<head>) or a run outside a worker."""
     return str(rec.get("run") or "").isdigit()
+
+
+def _same_lane(r: dict, me: dict) -> bool:
+    """Whether r and me are worker runs' own checks in the same lane (task, repository and purpose)."""
+    return bool(me.get("lane")) and r.get("lane") == me.get("lane") and worker_run(r) and worker_run(me)
+
+
+def displaced(me: dict, recs: list[dict]) -> list[dict]:
+    """The waiting checks this newly queued run `me` displaces: the same task's worker-run checks in its
+    lane (whatever their commands) on another head no newer than its own, live, waiting and queued before
+    it. They yield to `me` by themselves (target, superseded); `me` takes their place in the queue. Read only."""
+    if not me.get("task"):
+        return []
+    return [r for r in recs if r.get("id") != me.get("id") and r.get("task") == me.get("task") and _same_lane(r, me)
+            and r.get("head") != me.get("head") and r.get("phase") == WAITING and r.get("alive")
+            and not r.get("outcome") and float(r.get("commit_ts") or 0) < float(me.get("commit_ts") or 0)
+            and _order(r) < _order(me)]
 
 
 def replaced(me: dict, recs: list[dict]) -> list[dict]:
