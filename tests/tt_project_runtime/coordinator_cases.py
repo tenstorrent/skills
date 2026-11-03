@@ -14184,6 +14184,35 @@ def test_sweep_action_records_one_validated_outcome_per_item(env):
 
 
 
+def test_blocker_sweep_leaves_out_finished_tasks_and_drops_outcomes_on_them(env):
+    p = make(env)
+    from ttp import coordinator as coord, sweep
+    db, now = p.db, time.time()
+    done, gone, failed, blocked = (db.add_task(n) for n in ("finished", "cancelled", "failed", "still stuck"))
+    for t in (done, gone, failed, blocked):
+        db.update_task(t, status="blocked", blocked_reason="waits on the vendor's key")
+    eid = sweep.start(db, p.config(), "every 6h", now)   # the sweep listed all four while they were stuck
+    db.set_kv(sweep.OUTCOMES_KEY, {f"task:{t}": {"outcome": "still_blocked", "ts": now, "until": "", "probe": "",
+                                                "why": "x"} for t in (done, gone, blocked)})
+    db.update_task(done, status="done")
+    db.update_task(gone, status="cancelled")
+    db.update_task(failed, status="failed")
+    assert [i["key"] for i in sweep.items(db, now)] == [f"task:{blocked}"]
+    lines = sweep.digest_lines(db, [eid], now, p.config())
+    assert not any(f"#{t} " in ln for t in (done, gone, failed) for ln in lines)
+    assert any(ln.startswith(f"- #{blocked} ") for ln in lines)
+    # A turn naming a finished task records nothing on it, and closes the stale outcome it had.
+    assert coord.apply(p, [{"type": "sweep", "id": done, "outcome": "still_blocked",
+                            "until": "the vendor sends the signed key", "start_after": "6h"},
+                           {"type": "sweep", "id": failed, "outcome": "human_indispensable", "why": "only the owner"}]) == []
+    assert set(db.kv(sweep.OUTCOMES_KEY)) == {f"task:{blocked}"}
+    db.set_kv(sweep.OUTCOMES_KEY, {**db.kv(sweep.OUTCOMES_KEY), f"task:{gone}": {"outcome": "still_blocked", "ts": now}})
+    sweep.start(db, p.config(), "every 6h", now + 7 * 3600)   # the next sweep closes one left behind too
+    assert set(db.kv(sweep.OUTCOMES_KEY)) == {f"task:{blocked}"}
+    assert json.loads(db.one("SELECT data FROM events WHERE kind=? ORDER BY id DESC", (sweep.SWEEP_KIND,))["data"])[
+        "items"] == [f"task:{blocked}"]
+
+
 def test_sweep_unblocked_keeps_a_pending_deferral_unless_the_turn_clears_it(env):
     p = make(env)
     from ttp import coordinator as coord, sweep

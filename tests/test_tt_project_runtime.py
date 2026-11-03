@@ -42577,6 +42577,31 @@ def test_ref_wait_parser_names_asks_and_tasks_not_prs_or_itself():
     assert refs("ask #12 and task #34, then #56", own=99) == [("ask", 12), ("task", 34), ("task", 56)]
     assert refs("PR #55 and issue #9 and run #3") == []
     assert refs("task #7 lands", own=7) == []
+    # A PR or issue number is never a task, however it is written; task refs still are.
+    for pr in ("org/repo PR #8 to merge", "PR: #8", "the PR (#8) to merge", "PR [#8]", "PRs #8 and #16",
+               "PR #8, #16 or #17", "pull request #8", "org/repo#8", "org/repo #8", "issue: #8"):
+        assert refs(pr) == [], pr
+    assert refs("PR #8 and task #9") == [("task", 9)] and refs("PR #8 lands; then #9") == [("task", 9)]
+    assert refs("task #8") == [("task", 8)] and refs("landed:#8") == [("task", 8)] and refs("wait #8 and #9") == [
+        ("task", 8), ("task", 9)]
+
+
+def test_a_pr_number_is_no_task_for_a_wait_note_or_a_landing_wait(env):
+    p = make(env)
+    from ttp import daemon as dmod, landwait
+    d = dmod.Daemon(p.base)
+    eight = p.db.add_task("same number as the PR", "s", kind="work", origin="user")
+    while eight < 8:
+        eight = p.db.add_task("filler", "s", kind="work", origin="user")
+    p.db.update_task(eight, status="done")
+    pr, _ = _ref_wait(p, f"review of org/repo PR: #{eight}", probe="false")
+    task, _ = _ref_wait(p, f"task #{eight} to finish", probe="false")
+    d.refresh_ref_waits()
+    assert f"task #{eight} is done" not in (p.db.task(pr)["blocked_reason"] or "")
+    assert f"task #{eight} is done" in p.db.task(task)["blocked_reason"]
+    for text in (f"PR: #{eight} merged", f"pull request #{eight} merged", f"org/repo #{eight} merged"):
+        assert landwait.named_task(text) is None, text
+    assert landwait.named_task(f"task #{eight} lands") == eight
 
 
 def test_a_resolved_ask_refreshes_a_waits_note_and_reruns_its_probe_now(env, monkeypatch):
@@ -43506,8 +43531,8 @@ def test_sweep_upgrade_keeps_items_resolved_before_prepare(env):
     p.db.update_task(tid, status="blocked", blocked_reason="needs a fix")
     p.db.set_kv(PAUSED_RESOURCES_KEY, {"box-a": {"since": now - 3600, "by": "user", "reason": "maintenance"}})
     eid = _snapshotless_sweep(p, now)
-    # Both clear before the upgraded runtime prepares the event.
-    p.db.update_task(tid, status="done")
+    # Both clear before the upgraded runtime prepares the event (a finished task is no item at all).
+    p.db.update_task(tid, status="running")
     p.db.set_kv(PAUSED_RESOURCES_KEY, {})
     later = p.db.add_task("stuck later")
     p.db.update_task(later, status="blocked", blocked_reason="new")
@@ -43517,7 +43542,7 @@ def test_sweep_upgrade_keeps_items_resolved_before_prepare(env):
         assert sorted(data["items"]) == sorted([f"task:{tid}", "resource:box-a"])
         assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind=?", (sweep.SWEEP_KIND,))["n"] == 1
     text = "\n".join(sweep.digest_lines(p.db, [eid], now))
-    assert f"#{tid} stuck one | resolved" in text and "no longer stuck (now done)" in text
+    assert f"#{tid} stuck one | resolved" in text and "no longer stuck (now running)" in text
     assert "resource box-a | resumed" in text and f"#{later} " not in text
     # The turn can record how each ended.
     assert sweep.record(p.db, {"id": tid, "outcome": "closed"}, None, now) == f"task:{tid}"
@@ -43545,7 +43570,7 @@ def test_sweep_upgrade_continuations_stay_disjoint_with_resolved_items(env):
         assert len(text) <= 2048 and len([ln for ln in text.splitlines() if ln.startswith("- ")]) == len(keys)
         seen.extend(keys)
         p.db.x("UPDATE events SET status='handled' WHERE id=?", (event["id"],))
-    assert sorted(seen) == sorted(f"task:{t}" for t in tids) and eid
+    assert sorted(seen) == sorted(f"task:{t}" for t in tids if t not in tids[::3]) and eid   # done ones left out
 
 # Provider credits and free window resets (credits.py) ------------------------------------------------
 def _credit_answer(**over):

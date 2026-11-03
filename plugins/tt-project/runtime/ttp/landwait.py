@@ -5,7 +5,7 @@ question and summary together:
 - name exactly one task (`#<id>`, or its `ttp/t<id>-` branch) that exists in this project and is not
   the task itself, with land/landed/pushed/merged wording;
 - hold no '?' at all: any question may be a real one, so it reaches the coordinator;
-- name no other `#<n>` style ref (`PR #n`, `owner/repo#n`, ...) and no other blocker (a credential,
+- name no other `#<n>` style ref (`PR #n`, `PR: #n`, `pull request #n`, `owner/repo#n`, `owner/repo #n`, ...) and no other blocker (a credential,
   access, funds, a decision);
 and the named task has not failed or been cancelled and is not already on the local push-branch ref.
 Anything else stays `blocked`, unchanged.
@@ -24,7 +24,8 @@ REF_RE = re.compile(r"(?:#|\bttp/t)([0-9]+)\b")
 LAND_RE = re.compile(r"\b(?:land(?:s|ed|ing)?|pushed|merged)\b", re.I)
 
 
-OTHER_REF_RE = re.compile(r"(?:[\w/]|\b(?:pr|issue|ask|msg|message) )#[0-9]+\b", re.I)
+OTHER_REF_RE = re.compile(r"(?:[\w/]|\b(?:prs?|pull requests?|issues?|ask|msg|message)[\s:(\[{'\"`*_‘“-]*"
+                          r"|[\w.-]/[\w.-]+\s+)#[0-9]+\b", re.I)
 OTHER_BLOCKER_RE = re.compile(
     r"credential|access|password|token|permission|funds|budget|approv|decid|decision|your call|should i|\bor\b",
     re.I)

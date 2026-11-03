@@ -12,8 +12,10 @@ on once per wait (the hand-off's waiting_since, or the deferral's since).
 
 Known gap, on purpose: a wait with no probe is never woken early. Its note is refreshed and it waits for
 its normal retry, since evidence from before the wait began would otherwise wake it after every hand-off.
-A bare `#N` that is really a PR or issue may be read as a task; that only refreshes text or reruns a
-model-free probe.
+A bare `#N` is no task when a word before it names something else (`PR #8`, `PR: #8`, `the PR (#8)`,
+`pull request #8`, `issue #8`), when it follows an owner/repo (`org/repo#8`, `org/repo #8`), or when it
+continues a list such a word starts (`PRs #8 and #16`). Any other bare `#N` that is really a PR or issue
+may still be read as a task; that only refreshes text or reruns a model-free probe.
 """
 from __future__ import annotations
 
@@ -26,8 +28,9 @@ ASK_RE = re.compile(r"\basks?\s*#?\s*([0-9]+)\b", re.I)
 TASK_RE = re.compile(r"\btasks?\s*#?\s*([0-9]+)\b", re.I)
 # A bare `#N` counts as a task unless a word before it says it is something else (a PR, an issue, an ask).
 BARE_RE = re.compile(r"(?<![\w#/])#([0-9]+)\b")
-NOT_TASK_RE = re.compile(r"\b(asks?|prs?|pull|pulls|requests?|issues?|bugs?|tickets?|runs?|steps?|items?|"
-                         r"lines?|no\.?|number|change|turns?|commits?)\s*$", re.I)
+NOT_TASK_RE = re.compile(r"(?:\b(asks?|prs?|pull|pulls|requests?|issues?|bugs?|tickets?|runs?|steps?|items?|"
+                         r"lines?|no\.?|number|change|turns?|commits?)|[\w.-]/[\w.-]+)[\s:(\[{'\"`*_‘“-]*$", re.I)
+LIST_GAP_RE = re.compile(r"[\s,;&/)\]}'\"`*_’”]*(?:\b(?:and|or)\b)?[\s(\[{'\"`*_‘“]*$", re.I)
 
 
 def refs(text: str, own: int | None = None) -> list[tuple[str, int]]:
@@ -38,9 +41,11 @@ def refs(text: str, own: int | None = None) -> list[tuple[str, int]]:
         found.append((m.start(), "ask", int(m.group(1))))
     for m in TASK_RE.finditer(s):
         found.append((m.start(), "task", int(m.group(1))))
+    other = -1   # where the last bare `#N` that is no task ended
     for m in BARE_RE.finditer(s):
         before = s[max(0, m.start() - 24):m.start()]
-        if NOT_TASK_RE.search(before):
+        if NOT_TASK_RE.search(before) or (other >= 0 and LIST_GAP_RE.fullmatch(s, other, m.start())):
+            other = m.end()
             continue
         found.append((m.start(), "task", int(m.group(1))))
     out: list[tuple[str, int]] = []

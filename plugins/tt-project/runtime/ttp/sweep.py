@@ -7,7 +7,8 @@ one SWEEP_KIND event while anything is stuck. That event makes the coordinator's
 one (coordinator.EFFORT_EVENT_TRIGGERS) and adds a 'Blocker sweep' section to its digest: every
 blocked, waiting, in-review, setting-held and deferred task and every paused resource, with its age,
 its reason and its last re-check. The coordinator records exactly one outcome per item with the
-`sweep` action (OUTCOMES). `still_blocked` needs a re-checkable condition (`until_probe`, or an
+`sweep` action (OUTCOMES). A done, failed or cancelled task is never an item, even one that finished after
+the sweep listed it, and an outcome naming one is dropped and any left on one closed (_finished). `still_blocked` needs a re-checkable condition (`until_probe`, or an
 `until` that is not only "keep it blocked") and a next check (`start_after`); `human_indispensable`
 needs a `why`. An item the next sweep finds without an outcome since the last one, or whose
 `still_blocked` had no re-checkable condition or passed its next check, or that an ask has held past
@@ -71,7 +72,7 @@ import time
 from typing import Any, Callable
 
 from . import askrethink, credits, failover, holdloops, mitigate, obligations, outagetask, prguard, settinghold, timefmt, unblock, userpause
-from .db import DB, deferral, dependency_ids, load_result
+from .db import DB, TERMINAL_TASK_STATES, deferral, dependency_ids, load_result
 from .coordlimits import positive
 
 SWEEP_KIND = "blocker_sweep"
@@ -162,6 +163,18 @@ def outcomes(db: DB) -> dict[str, dict]:
     """The recorded sweep outcomes; an entry in another (older) format is dropped: its item is re-judged."""
     outs = db.kv(OUTCOMES_KEY, {}) or {}
     return {k: v for k, v in outs.items() if isinstance(v, dict)} if isinstance(outs, dict) else {}
+
+
+def _finished(db: DB, key: str) -> bool:
+    """A task item whose task is done, failed or cancelled: it is no sweep item, and an outcome on it
+    is dropped, never recorded or carried (nothing is left to check)."""
+    kind, _, ident = key.partition(":")
+    t = db.task(int(ident)) if kind == "task" and ident.isdigit() else None
+    return bool(t and t["status"] in TERMINAL_TASK_STATES)
+
+
+def _drop_finished(db: DB, outs: dict[str, dict]) -> dict[str, dict]:
+    return {k: v for k, v in outs.items() if not _finished(db, k)}
 
 
 def _pause_fp(row: dict) -> str:
@@ -738,6 +751,8 @@ def start(db: DB, cfg: dict, why: str, now: float | None = None,
              and i["key"] not in flagged and carried(outs.get(i["key"]), i, now)]
     n = int(state.get("n") or 0) + 1
     with db.tx():
+        if (kept := _drop_finished(db, outs)) != outs:   # close outcomes left on finished tasks
+            db.set_kv(OUTCOMES_KEY, kept)
         db.set_kv(STATE_KEY, {"last": now, "n": n, "why": why, "flags": flagged, "loops": loops, "reviews": reviews,
                               "carried": carry, "paused": [i["resource"] for i in live if i["kind"] == "paused"],
                               "seen": _seen(state, live), "items": {i["key"]: _snap(i) for i in live},
@@ -792,6 +807,9 @@ def record(db: DB, a: dict, next_at: float | None, now: float | None = None, whe
     key = _item_key(a)
     if key.startswith("task:") and not db.task(int(key[5:])):
         raise ValueError(f"no task #{key[5:]}")
+    if _finished(db, key):   # finished since the sweep listed it: dropped, and any old outcome on it closed
+        db.set_kv(OUTCOMES_KEY, _drop_finished(db, outcomes(db)))
+        return key
     if outcome == "unblocked" and key.startswith("task:") and (held := still_deferred(db, int(key[5:]), now, where)):
         raise ValueError(f"#{key[5:]} is still deferred ({held}): `unblocked` keeps that deferral, so it would "
                          f"not start. Record still_blocked with its start as the next check, or clear the deferral "
@@ -835,7 +853,7 @@ def record(db: DB, a: dict, next_at: float | None, now: float | None = None, whe
         if len(ids) == 1 and next(iter(ids)) in _open_asks(db) and snap:   # held only by that ask (ask_held)
             o.update(ask=next(iter(ids)), item=snap, **({"ask_pause": _pause_fp(row)} if row else {}))
     o["why"] = _clip(a.get("why") or a.get("reason") or a.get("text") or "", 300)
-    outs = outcomes(db)
+    outs = _drop_finished(db, outcomes(db))
     outs[key] = o
     db.set_kv(OUTCOMES_KEY, {k: v for k, v in outs.items() if now - _num(v.get("ts")) < KEPT_DAYS * 86400})
     return key
@@ -997,7 +1015,7 @@ def _covered(db: DB, data: dict, now: float, where=None) -> list[dict]:
     # Retain an identity even if an earlier batch unblocked it; the next batch can record closed.
     by_key = {i["key"]: i for i in data.get("snapshot", [])}
     by_key.update({i["key"]: i for i in items(db, now, where)})
-    return [by_key.get(k) or _settled(db, k) for k in data.get("items", [])]
+    return [by_key.get(k) or _settled(db, k) for k in data.get("items", []) if not _finished(db, k)]
 
 
 def prepare(db: DB, event_id: int, cfg: dict, now: float | None = None) -> None:
