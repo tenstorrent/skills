@@ -276,10 +276,21 @@ def _send_say(entry: dict, argv: list[str], client_id: str, capture: bool = Fals
         return _send_say(entry, _fold_broadcast(argv), client_id, capture)
     if r.returncode == 2 and "--context" in (r.stderr or "") and "--context" in argv:
         return _send_say(entry, _fold_context(argv), client_id, capture)
+    if r.returncode == 2 and "--wait" in (r.stderr or "") and _drop_wait(argv) != argv:   # older: send, no wait
+        return _send_say(entry, _drop_wait(argv), client_id, capture)
     if r.returncode == 2 and "--caller" in (r.stderr or "") and "--caller" in argv:   # no reply chats there
         i = argv.index("--caller")
         return _send_say(entry, argv[:i] + argv[i + 2:], client_id, capture)
     return r
+
+
+def _drop_wait(argv: list[str]) -> list[str]:
+    """A `ttp say` argv without its `--wait SECONDS` option (never a word of the message after `--`)."""
+    end = argv.index("--") if "--" in argv else len(argv)
+    if "--wait" not in argv[:end]:
+        return argv
+    i = argv.index("--wait")
+    return argv[:i] + argv[i + 2:]
 
 
 def _fold_broadcast(argv: list[str]) -> list[str]:
@@ -343,12 +354,14 @@ def say_remote(name: str, entry: dict, text: str, chat: str | None, context: str
 
 
 def _say_remote(name: str, entry: dict, text: str, chat: str | None, context: str = "",
-                broadcast: str | None = None, finding: bool = False, caller: str = "") -> tuple[int, str]:
+                broadcast: str | None = None, finding: bool = False, caller: str = "",
+                wait: float = 0) -> tuple[int, str]:
     """say_remote's exit code and where the message went: `client:<id>` (delivered) or
     `queued:<host>`. A broadcast's client id is its broadcast id: a resend is a no-op there.
     `finding`: `context` is a relayer's own findings, sent with no user's words."""
     # No chat: the caller's label goes along, so the reply chat there is named for this side.
     who = ["--caller", caller] if caller and not chat else []
+    who += ["--wait", f"{wait:g}"] if wait and who else []
     argv = (["say", name, *(["--chat", chat] if chat else []), *who, "--finding", context, "--", ""] if finding else
             ["say", name, *(["--chat", chat] if chat else []), *who, *(["--context", context] if context else []),
              *(["--broadcast", broadcast] if broadcast else []), "--", text])
@@ -359,6 +372,7 @@ def _say_remote(name: str, entry: dict, text: str, chat: str | None, context: st
             if r.stderr:
                 sys.stderr.write(r.stderr)
             return r.returncode, f"client:{cid}"
+    argv = _drop_wait(argv)   # a queued message goes out later with no one waiting for its reply
     outbox.add(name, argv, cid, chat)
     print(f"queued on this machine; delivered once {name} is reachable (#{cid})")
     return 0, f"queued:{entry.get('host')}"
@@ -986,6 +1000,9 @@ def cmd_say(a) -> None:
         return _say_all(a)
     if getattr(a, "except_", None):
         die("--except goes with --all")
+    a.wait = min(max(float(getattr(a, "wait", 0) or 0), 0.0), SAY_WAIT_MAX)
+    if a.wait and a.chat:
+        die(f"--wait reads the caller's reply chat; with --chat, read replies with `ttp listen {a.name} --chat {a.chat}`")
     p, entry = resolve(a.name)
     # Only the user's verbatim words are the message; what a relayer adds is kept apart (relay.py).
     text, context = relay.split(a.text if a.text != "-" else sys.stdin.read(), a.context)
@@ -998,7 +1015,7 @@ def cmd_say(a) -> None:
     bid = getattr(a, "broadcast", None)
     if entry:
         rc, ref = _say_remote(a.name, entry, text, a.chat, context, bid, finding=bool(finding),
-                              caller="" if bid else say_caller(a, a.name))
+                              caller="" if bid else say_caller(a, a.name), wait=a.wait)
         if rc == 0 and not finding:
             broadcast.note_delivery(text, a.name, ref, bid)
         sys.exit(rc)
@@ -1008,17 +1025,23 @@ def cmd_say(a) -> None:
         caller = say_caller(a, p.name)
         a.chat, label = say_chat(caller)
         a.new_chat = (label, caller)
+    # The caller's unread replies are read (no write) and shown before the send, and marked read
+    # only after it: reading them never delays or loses the message.
+    unread = _say_unread(p, a.chat) if label else None
     seen, mid = _say_local_or_die(p, a, text, context, bid, kind="finding" if finding else "user")
+    if unread:
+        _say_mark_read(p, a.chat, unread)
     if finding:
         print(f"{'already received' if seen else 'sent'} (#{mid}) as {relay.FINDING}")
-        _print_reply_chat(p, a, label)
-        return
-    # A plain say is recorded too: telling the projects one at a time builds the same record.
-    broadcast.note_delivery(text, a.name, f"#{mid}", bid)
-    if seen:
-        print(f"already received (#{mid})")
     else:
-        print(f"sent (#{mid}); the coordinator answers in this chat when it has decided")
+        # A plain say is recorded too: telling the projects one at a time builds the same record.
+        broadcast.note_delivery(text, a.name, f"#{mid}", bid)
+        if seen:
+            print(f"already received (#{mid})")
+        else:
+            print(f"sent (#{mid}); the coordinator answers in this chat when it has decided")
+    if label and a.wait:
+        _say_wait(p, a.chat, mid, a.wait)
     _print_reply_chat(p, a, label)
 
 
@@ -1046,7 +1069,62 @@ def say_chat(caller: str) -> tuple[str, str]:
 
 def _print_reply_chat(p: Project, a, label: str | None) -> None:
     if label:
-        print(f"replies go to chat {a.chat} ({label}); read them with: ttp listen {p.name} --chat {a.chat} --once")
+        print(f"replies go to chat {a.chat} ({label}); the next ttp say shows them, or: "
+              f"ttp listen {p.name} --chat {a.chat} --once")
+
+
+SAY_REPLIES_MAX = 20   # unread messages one `ttp say` shows; the rest wait for the next say or `ttp listen`
+SAY_WAIT_MAX = 300.0   # the longest `ttp say --wait`, in seconds
+
+
+def _say_unread(p: Project, chat: str) -> tuple[list[dict], int] | None:
+    """Print the say chat's unread messages (oldest first, at most SAY_REPLIES_MAX), as `ttp listen`
+    does, and return them with how many more wait. Reads only. A failure says so on stderr and
+    returns None: the message is still sent."""
+    from .web import cleared
+    try:
+        row = p.db.one("SELECT last_read, min_severity FROM chats WHERE id=?", (chat,))
+        if not row:
+            return None
+        floor = chat_floor(row["min_severity"], p.config()["notify"].get("chat_min_severity"))
+        msgs = [m for m in p.db.unread_for_chat(chat, int(row["last_read"] or 0), floor)
+                if not cleared(p.db, m, time.time())]
+    except Exception as e:   # noqa: BLE001 - showing replies is best effort; the send is not
+        print(f"ttp: unread replies in chat {chat} not shown ({type(e).__name__}: {e}); sending anyway",
+              file=sys.stderr)
+        return None
+    shown, more = msgs[:SAY_REPLIES_MAX], max(0, len(msgs) - SAY_REPLIES_MAX)
+    for m in shown:
+        print(_listen_line(p, m), flush=True)
+    if more:
+        print(f"{more} more unread in chat {chat}: the next ttp say shows them, or ttp listen {p.name} --chat {chat} --once")
+    return (shown, more) if shown else None
+
+
+def _say_mark_read(p: Project, chat: str, unread: tuple[list[dict], int]) -> None:
+    """Move the say chat's read position to the last message shown, never past it nor back."""
+    try:
+        _listen_write(p.db, "UPDATE chats SET last_read=MAX(COALESCE(last_read,0), ?), last_active=? WHERE id=?",
+                      (int(unread[0][-1]["id"]), time.time(), chat), "marking the shown replies read")
+    except Exception as e:   # noqa: BLE001 - the replies come back on the next say
+        print(f"ttp: shown replies not marked read ({type(e).__name__}: {e}); the next ttp say shows them again",
+              file=sys.stderr)
+
+
+def _say_wait(p: Project, chat: str, mid: int, wait: float) -> None:
+    """`ttp say --wait`: show the say chat's new messages until a reply after message #mid arrives,
+    or `wait` seconds pass."""
+    deadline = time.time() + wait
+    while True:
+        unread = _say_unread(p, chat)
+        if unread:
+            _say_mark_read(p, chat, unread)
+            if any(m["chat"] == chat and m["id"] > mid for m in unread[0]):
+                return
+        if time.time() >= deadline:
+            print(f"no reply within {wait:g} s; the next ttp say shows it")
+            return
+        time.sleep(min(poll_s(2), max(0.0, deadline - time.time())))
 
 
 NO_WORDS = ("no user's words: --context alone is not a message; send a relayer's own findings alone with "
@@ -1359,9 +1437,7 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
         top = db.one("SELECT COALESCE(MAX(id),0) m FROM messages")["m"]
         msgs = [m for m in db.unread_for_chat(a.chat, after, floor, upto=top) if not cleared(db, m, time.time())]
         for m in msgs:
-            kind = f"ask {m['id']}" if m["kind"] == "ask" else m["kind"]   # "ask N": "#N" reads as a task
-            who = "coordinator" if m["chat"] else f"{p.name} ({kind}, {m['severity']})"
-            print(f"[#{m['id']} {who}] {m['text']}", flush=True)
+            print(_listen_line(p, m), flush=True)
         if top > after:
             after = top
             # With --ack, only an acknowledgement marks messages read, so what was printed to a
@@ -1375,6 +1451,12 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
         if deadline and time.time() > deadline:
             return
         time.sleep(poll_s(2))
+
+
+def _listen_line(p: Project, m: dict) -> str:
+    kind = f"ask {m['id']}" if m["kind"] == "ask" else m["kind"]   # "ask N": "#N" reads as a task
+    who = "coordinator" if m["chat"] else f"{p.name} ({kind}, {m['severity']})"
+    return f"[#{m['id']} {who}] {m['text']}"
 
 
 def _listen_write(db, sql: str, args: tuple, what: str) -> None:
@@ -10705,6 +10787,9 @@ def main(argv: list[str] | None = None) -> None:
                    "chat kept for the caller, and its `ttp listen` line is printed")
     s.add_argument("--caller", default="", help="who sends it, naming the caller's reply chat when there is "
                    "no --chat (default: the calling project, else this host)")
+    s.add_argument("--wait", type=float, default=0, metavar="SECONDS",
+                   help="without --chat: after sending, wait up to this long (at most 300) for the reply and "
+                   "print it. A say without --chat always first prints the caller's unread replies")
     s.add_argument("--context", default="", help="a relayer's own context (data, never the user's word); "
                    "kept apart from the user's words")
     s.add_argument("--finding", default="", help="a relayer's own findings, sent with no user's words; shown to "

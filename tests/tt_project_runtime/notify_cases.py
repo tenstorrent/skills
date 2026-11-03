@@ -580,6 +580,126 @@ def test_a_remote_say_sends_the_callers_label_and_drops_it_for_an_older_runtime(
     assert "--caller" not in sent[0], "a chat given: no caller label"
 
 
+def _say_from_relay(p, capsys, *argv):
+    """`ttp say demo <argv>`: the newest inbound message, stdout and stderr."""
+    from ttp import cli
+    capsys.readouterr()
+    cli.main(["say", "demo", *argv])
+    cap = capsys.readouterr()
+    return p.db.one("SELECT id, chat FROM messages WHERE direction='in' ORDER BY id DESC LIMIT 1"), cap.out, cap.err
+
+
+def test_a_say_shows_the_callers_unread_replies_and_marks_read_only_those_it_showed(env, monkeypatch, capsys):
+    from ttp import cli
+    from ttp.web import health
+    p = make(env)
+    monkeypatch.setattr(cli, "here", lambda: None)
+    monkeypatch.setenv("TTP_CLIENT_HOST", "relay-host")
+    m1, out, _ = _say_from_relay(p, capsys, "--", "first")
+    chat = m1["chat"]
+    assert "[#" not in out and "the next ttp say shows them" in out, "nothing unread yet"
+    reply = p.db.post("out", "done: the fix landed", chat=chat, kind="reply")
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 3600, reply))
+    assert health(p, p.db)["undelivered"]["alerts"] == 1
+    m2, out, _ = _say_from_relay(p, capsys, "--", "second")
+    assert f"[#{reply} coordinator] done: the fix landed" in out
+    assert out.index("done: the fix landed") < out.index(f"sent (#{m2['id']})"), "replies first, then the send"
+    assert health(p, p.db)["undelivered"] is None, "the reply reached the caller"
+    assert p.db.one("SELECT last_read FROM chats WHERE id=?", (chat,))["last_read"] == reply
+    m3, out, _ = _say_from_relay(p, capsys, "--", "third")
+    assert "fix landed" not in out, "a shown reply is not shown again"
+    # More than one say shows: the read position stops at the last one shown; the rest come next time.
+    monkeypatch.setattr(cli, "SAY_REPLIES_MAX", 2)
+    r = [p.db.post("out", f"reply {i}", chat=chat, kind="reply") for i in range(3)]
+    other = p.db.post("out", "for another chat", chat="c9", kind="reply")
+    _, out, _ = _say_from_relay(p, capsys, "--", "fourth")
+    assert "reply 0" in out and "reply 1" in out and "reply 2" not in out and "1 more unread" in out
+    assert p.db.one("SELECT last_read FROM chats WHERE id=?", (chat,))["last_read"] == r[1]
+    _, out, _ = _say_from_relay(p, capsys, "--", "fifth")
+    assert "reply 2" in out and "reply 1" not in out and "for another chat" not in out
+    assert p.db.one("SELECT last_read FROM chats WHERE id=?", (chat,))["last_read"] == r[2] < other
+    # A say with --chat leaves the say chat alone.
+    p.db.post("out", "later", chat=chat, kind="reply")
+    _, out, _ = _say_from_relay(p, capsys, "--chat", "c9", "--", "sixth")
+    assert "later" not in out and p.db.one("SELECT last_read FROM chats WHERE id=?", (chat,))["last_read"] == r[2]
+
+
+def test_a_say_is_sent_when_showing_or_marking_its_replies_fails(env, monkeypatch, capsys):
+    import sqlite3
+    from ttp import cli
+    p = make(env)
+    monkeypatch.setattr(cli, "here", lambda: None)
+    monkeypatch.setenv("TTP_CLIENT_HOST", "relay-host")
+    m1, _, _ = _say_from_relay(p, capsys, "--", "first")
+    chat = m1["chat"]
+    reply = p.db.post("out", "the answer", chat=chat, kind="reply")
+    before = p.db.one("SELECT last_read FROM chats WHERE id=?", (chat,))["last_read"]
+
+    def broken(*a, **k):
+        raise sqlite3.DatabaseError("database disk image is malformed")
+    unread_for_chat = type(p.db).unread_for_chat
+    monkeypatch.setattr(type(p.db), "unread_for_chat", broken)
+    m2, out, err = _say_from_relay(p, capsys, "--", "second")
+    assert m2["id"] > m1["id"] and f"sent (#{m2['id']})" in out and "not shown" in err and "sending anyway" in err
+    assert p.db.one("SELECT last_read FROM chats WHERE id=?", (chat,))["last_read"] == before, "nothing shown, nothing read"
+    monkeypatch.setattr(type(p.db), "unread_for_chat", unread_for_chat)
+    monkeypatch.setattr(cli, "_listen_write", broken)
+    m3, out, err = _say_from_relay(p, capsys, "--", "third")
+    assert m3["id"] > m2["id"] and "the answer" in out and "not marked read" in err
+    assert p.db.one("SELECT last_read FROM chats WHERE id=?", (chat,))["last_read"] == before
+
+
+def test_say_wait_shows_the_reply_to_the_message_just_sent_or_gives_up_after_its_time(env, monkeypatch, capsys):
+    from ttp import cli
+    p = make(env)
+    monkeypatch.setattr(cli, "here", lambda: None)
+    monkeypatch.setenv("TTP_CLIENT_HOST", "relay-host")
+    m1, _, _ = _say_from_relay(p, capsys, "--", "first")
+    chat = m1["chat"]
+    naps = []
+
+    def nap(s):   # the coordinator answers while the say waits
+        naps.append(s)
+        if len(naps) == 2:
+            p.db.post("out", "answer to second", chat=chat, kind="reply")
+    monkeypatch.setattr(cli.time, "sleep", nap)
+    m2, out, _ = _say_from_relay(p, capsys, "--wait", "30", "--", "second")
+    assert "answer to second" in out and out.index(f"sent (#{m2['id']})") < out.index("answer to second")
+    assert len(naps) == 2 and "no reply within" not in out
+    reply = p.db.one("SELECT MAX(id) n FROM messages WHERE direction='out'")["n"]
+    assert p.db.one("SELECT last_read FROM chats WHERE id=?", (chat,))["last_read"] == reply
+    # No reply in time: it says so, and the next say shows the reply.
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    _, out, _ = _say_from_relay(p, capsys, "--wait", "0.01", "--", "third")
+    assert "no reply within 0.01 s" in out
+    with pytest.raises(SystemExit):
+        cli.main(["say", "demo", "--chat", "c9", "--wait", "5", "--", "x"])
+    assert "--wait reads the caller's reply chat" in capsys.readouterr().err
+
+
+def test_a_remote_say_forwards_wait_and_drops_it_for_an_older_runtime_or_a_queued_message(env, monkeypatch):
+    from ttp import cli
+    sent = []
+
+    def fake(entry, argv, capture=False):
+        sent.append(list(argv))
+        unknown = "--wait" in argv[:argv.index("--")] and len(sent) == 1
+        return subprocess.CompletedProcess(argv, 2 if unknown else 0, "", "unrecognized arguments: --wait 5"
+                                           if unknown else "")
+    monkeypatch.setattr(cli, "_ssh", fake)
+    monkeypatch.setattr(cli, "flush_outbox", lambda name, entry: None)
+    monkeypatch.setattr(cli.outbox, "entries", lambda name: [])
+    rc, _ = cli._say_remote("demo", {"host": "far", "dir": "/x"}, "--wait", None, caller="relay", wait=5)
+    assert rc == 0 and sent[0][sent[0].index("--wait") + 1] == "5"
+    assert sent[-1][-2:] == ["--", "--wait"] and "--wait" not in sent[-1][:-1], "the message text is kept"
+    assert cli._drop_wait(["say", "demo", "--", "--wait", "3"]) == ["say", "demo", "--", "--wait", "3"]
+    queued = []
+    monkeypatch.setattr(cli, "flush_outbox", lambda name, entry: 1)
+    monkeypatch.setattr(cli.outbox, "add", lambda name, argv, cid, chat: queued.append(argv))
+    cli._say_remote("demo", {"host": "far", "dir": "/x"}, "hi", None, caller="relay", wait=5)
+    assert queued and "--wait" not in queued[0], "nobody waits on a message sent later"
+
+
 def test_status_puts_holds_then_the_relay_backlog_above_waiting_and_a_cut_hold_line_keeps_how_to_lift(env):
     """`ttp status`: what stops work (a machine-wide hold) comes right after the needs-you lines, then
     alerts no chat read, and only then the waiting list; a hold line cut short loses its reason, not

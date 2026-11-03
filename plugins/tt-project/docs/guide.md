@@ -20,8 +20,11 @@ and preferences you add later become part of the project's charter and memory.
 From a shell inside a git repository, `ttp new demo --describe "Keep the README accurate."` creates a
 project and ends with a link to its web app, `http://127.0.0.1:<port>/#token=<token>`; `ttp web demo`
 prints it again. `ttp say demo "<your words>"` and `ttp status demo` talk to it without a chat: a
-`ttp say` without `--chat` keeps one reply chat per caller (the calling project, else the host) and
-prints the `ttp listen demo --chat <id> --once` line that reads the coordinator's answer.
+`ttp say` without `--chat` keeps one reply chat per caller (the calling project, else the host). Each
+such say first prints that chat's unread replies (up to 20, oldest first) and marks read only the ones
+it printed, then sends; `--wait <seconds>` (at most 300) also waits for the answer to the message just
+sent. A failure to read replies is reported on stderr and never stops the message. `ttp listen demo
+--chat <id> --once`, printed after each say, reads the chat without sending.
 
 ## How it works
 
