@@ -123,18 +123,24 @@ def update(path: Path | None, **fields) -> None:
         pass
 
 
-def alive(rec: dict) -> bool:
-    """Whether the record's process still runs: same pid and start, in this PID namespace."""
+def alive(rec: dict) -> bool | None:
+    """Whether the record's process still runs (same pid and start), or None when this process cannot
+    tell: the record was written in another PID namespace (a sandboxed worker's `ttp checks` reading a
+    host run's record, or the reverse). Such a run is never pruned, counted lost or joined."""
+    from .liveness import DEAD, UNKNOWN, pid_state
     from .runner import proc_start
     pid = rec.get("pid")
-    if not isinstance(pid, int) or (rec.get("pidns") or "") != _pid_ns():
+    if not isinstance(pid, int) or not rec.get("pidns"):
         return False
-    return rec.get("started") is not None and proc_start(pid) == rec.get("started")
+    state = pid_state(pid, ns=rec["pidns"])
+    if state == UNKNOWN:
+        return None
+    return state != DEAD and rec.get("started") is not None and proc_start(pid) == rec.get("started")
 
 
 @ps_snapshot()   # one `ps` for every record's pid where there is no /proc
 def records(state: Path, now: float | None = None, prune: bool = True) -> list[dict]:
-    """Every record, each with "alive". With `prune`, records of dead runs without an outcome and
+    """Every record, each with "alive" (True, False, or None: unknown here). With `prune`, records of dead runs without an outcome and
     outcomes older than KEEP_S are removed."""
     now = time.time() if now is None else now
     out = []
@@ -148,7 +154,7 @@ def records(state: Path, now: float | None = None, prune: bool = True) -> list[d
             continue
         rec["alive"] = alive(rec)
         done = rec.get("outcome")
-        stale = (not done and not rec["alive"]) or (done and now - float(done.get("ts") or 0) > KEEP_S)
+        stale = (not done and rec["alive"] is False) or (done and now - float(done.get("ts") or 0) > KEEP_S)
         if stale and prune:
             path.unlink(missing_ok=True)
             continue
@@ -182,7 +188,7 @@ def _while_waiting(r: dict, me: dict) -> bool:
     `me` registered (it ran and ended between two polls). One that ended before `me` queued is not."""
     if done := r.get("outcome"):
         return float(done.get("ts") or 0) > float(me.get("ts") or 0)
-    return bool(r.get("alive"))
+    return r.get("alive") is True
 
 
 def target(me: dict, recs: list[dict]) -> tuple[dict, str] | None:
@@ -190,7 +196,9 @@ def target(me: dict, recs: list[dict]) -> tuple[dict, str] | None:
     Superseded: the same task's group, or its lane when both are worker runs (whatever their commands),
     on another head with a later commit time, live now or ended
     while this run waited (never one that ended before it queued: that older head runs its own checks).
-    Joined: the same key (any task's), waiting ahead of it or running now (a running one first)."""
+    Joined: the same key (any task's), waiting ahead of it or running now (a running one first). A run
+    whose liveness is unknown here (another PID namespace) is never followed: if it died, nothing here
+    would see it end, so this run queues on its own."""
     if not me.get("task"):
         return None
     every = [r for r in recs if r.get("id") != me.get("id")]
@@ -200,7 +208,7 @@ def target(me: dict, recs: list[dict]) -> tuple[dict, str] | None:
              and _while_waiting(r, me)]
     if newer:
         return max(newer, key=lambda r: (float(r.get("commit_ts") or 0), _order(r))), SUPERSEDED
-    same = [r for r in every if r.get("key") == me.get("key") and r.get("alive") and not r.get("outcome")
+    same = [r for r in every if r.get("key") == me.get("key") and r.get("alive") is True and not r.get("outcome")
             and r.get("phase") in (WAITING, RUNNING)]
     if running := [r for r in same if r.get("phase") == RUNNING]:
         return min(running, key=_order), JOINED
@@ -257,15 +265,17 @@ def resolve(rid: str, recs: list[dict]) -> tuple[str, dict | None]:
     first = by.get(rid)
     for _ in range(DEPTH):
         r = by.get(rid)
-        if r is None or not (r.get("outcome") or r.get("alive")):
+        if r is None or not (r.get("outcome") or r.get("alive") is not False):
             break
         if r.get("outcome"):
             return "done", r
+        if r.get("alive") is None:   # another PID namespace's: maybe alive, never lost
+            return "wait", r
         if r.get("phase") in (JOINED, SUPERSEDED) and r.get("follows"):
             rid = r["follows"]
             continue
         return "wait", r
-    if first is not None and first.get("alive") and not first.get("outcome"):
+    if first is not None and first.get("alive") is not False and not first.get("outcome"):
         return "wait", first
     return "lost", None
 
@@ -328,16 +338,19 @@ def result_line(how: str, mine: str, leader: dict, not_run: list | None = None) 
 
 
 def status_lines(state: Path, now: float | None = None) -> list[str]:
-    """One line per live follower (joined or superseded), for `ttp checks status` and `ttp status`."""
+    """One line per live follower (joined or superseded), for `ttp checks status` and `ttp status`; one
+    whose liveness this process cannot judge (another PID namespace) is named so."""
+    from .liveness import FOREIGN
     now = time.time() if now is None else now
     recs = records(state, now, prune=False)
     by = {r.get("id"): r for r in recs}
     out = []
     for r in recs:
-        if not r.get("alive") or r.get("outcome") or r.get("phase") not in (JOINED, SUPERSEDED):
+        if r.get("alive") is False or r.get("outcome") or r.get("phase") not in (JOINED, SUPERSEDED):
             continue
         lead = by.get(r.get("follows")) or {}
-        who = f"#{r.get('task')} run {r.get('run') or '?'} pid {r.get('pid')}"
+        who = f"#{r.get('task')} run {r.get('run') or '?'} pid {r.get('pid')}" + \
+            (f" {FOREIGN}" if r.get("alive") is None else "")
         waited = max(0.0, now - float(r.get("since") or r.get("ts") or now))
         if r.get("phase") == JOINED:
             out.append(f"  joined: {who} on {str(r.get('head'))[:12]} follows run {lead.get('run') or '?'} "

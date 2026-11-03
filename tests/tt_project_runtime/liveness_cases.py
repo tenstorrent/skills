@@ -116,3 +116,42 @@ def test_listener_state_never_signals_a_pid_it_cannot_place(pidns):
         mine.kill()
         other.wait()
         mine.wait()
+
+
+def _ns_join_rec(tmp_path, rid, pid, ns, **extra):
+    from ttp import checkjoin
+    d = checkjoin.folder(tmp_path)
+    d.mkdir(parents=True, exist_ok=True)
+    rec = {"id": rid, "pid": pid, "started": 1.0, "pidns": ns, "task": "7", "head": "a" * 40, "commit_ts": 1.0,
+           "key": "k", "group": "g", "run": "1", "arrived": 1.0, "ts": time.time(), "phase": "running", **extra}
+    (d / f"{rid}.json").write_text(json.dumps(rec))
+    return d / f"{rid}.json"
+
+
+def test_checkjoin_keeps_and_never_joins_a_record_of_another_pid_namespace(gone_pid, pidns, tmp_path):
+    from ttp import checkjoin, liveness
+    foreign = pidns == "foreign"
+    path = _ns_join_rec(tmp_path, "lead", gone_pid, "pid:[1]" if foreign else liveness.pid_ns())
+    recs = checkjoin.records(tmp_path, prune=True)
+    assert path.exists() is foreign and len(recs) == int(foreign)
+    me = {"id": "me", "task": "8", "key": "k", "group": "g8", "head": "b" * 40, "commit_ts": 2.0,
+          "arrived": 2.0, "ts": time.time(), "phase": "waiting"}
+    assert checkjoin.target(me, recs) is None
+    if foreign:
+        assert recs[0]["alive"] is None
+        assert checkjoin.resolve("lead", recs) == ("wait", recs[0])   # never lost
+        _ns_join_rec(tmp_path, "fol", gone_pid, "pid:[1]", phase="joined", follows="lead")
+        assert any(liveness.FOREIGN in line for line in checkjoin.status_lines(tmp_path))
+
+
+def test_devq_wait_line_never_says_gone_for_a_pid_it_cannot_place(gone_pid, pidns, tmp_path):
+    from ttp import devq
+    d = tmp_path / "devq"
+    for sub in ("queue", "running", "done"):
+        (d / sub).mkdir(parents=True)
+    (d / "queue" / f"{int(time.time() * 1e9):020d}-jb.json").write_text("{}")
+    (d / "running" / "ja.json").write_text("{}")
+    (d / "running" / "ja.state.json").write_text(json.dumps({"cur": {"pid": gone_pid}}))
+    line = devq.wait_line(d, "jb")
+    assert ("gone" in line) is (pidns == "same") and ("unknown" in line) is (pidns == "foreign"), line
+    assert devq.parse_wait(line)["holder"]["alive"] is (None if pidns == "foreign" else False)

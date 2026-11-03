@@ -992,17 +992,13 @@ def probe(d: Path, job: str) -> int:
 
 
 WAIT_RE = re.compile(r"^(?P<job>\S+): queued (?P<waited>\d+) s, (?P<ahead>\d+) ahead; running: (?:none|(?P<rid>\S+)"
-                     r"(?: task #(?P<task>\d+))?(?: for (?P<run>\d+) s)?(?:, pid (?P<pid>\d+) (?P<alive>alive|gone))?)$")
+                     r"(?: task #(?P<task>\d+))?(?: for (?P<run>\d+) s)?(?:, pid (?P<pid>\d+) (?P<alive>alive|gone|unknown))?)$")
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:   # another user's: it exists
-        return True
-    return True
+def _pid_alive(pid: int) -> str:
+    """liveness.pid_state: "unknown" from a sandbox with a PID namespace other than the daemon's."""
+    from .liveness import pid_state
+    return pid_state(pid)
 
 
 def wait_line(d: Path, job: str) -> str:
@@ -1026,7 +1022,8 @@ def wait_line(d: Path, job: str) -> str:
     if isinstance(started, (int, float)):
         out += f" for {max(0, int(now - started))} s"
     if isinstance(cur.get("pid"), int) and cur["pid"] > 0:
-        out += f", pid {cur['pid']} {'alive' if _pid_alive(cur['pid']) else 'gone'}"
+        seen = {"alive": "alive", "dead": "gone"}.get(_pid_alive(cur["pid"]), "unknown")
+        out += f", pid {cur['pid']} {seen}"
     return out
 
 
@@ -1041,7 +1038,7 @@ def parse_wait(text: str):
         if m["rid"]:
             holder = {"job": m["rid"], "task": m["task"], "run_s": int(m["run"]) if m["run"] else None,
                       "pid": int(m["pid"]) if m["pid"] else None,
-                      "alive": None if not m["alive"] else m["alive"] == "alive"}
+                      "alive": {"alive": True, "gone": False}.get(m["alive"] or "")}
         return {"job": m["job"], "waited_s": int(m["waited"]), "ahead": int(m["ahead"]), "holder": holder}
     return None
 

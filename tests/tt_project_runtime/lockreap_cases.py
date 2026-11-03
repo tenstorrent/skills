@@ -351,8 +351,9 @@ def _devq_dir(tmp_path, waiting="jb", arrived_ago=31 * 60, running="ja", task="1
 
 
 def test_the_devq_probe_says_how_long_a_queued_job_waited_and_behind_which_job(tmp_path, monkeypatch, capsys):
-    from ttp import devq
+    from ttp import devq, liveness
     monkeypatch.setattr(devq, "runner_alive", lambda d: True)
+    monkeypatch.setenv("TTP_PIDNS", liveness.pid_ns() or "")   # the runner's namespace is this one
     d = _devq_dir(tmp_path, pid=os.getpid())
     assert devq.probe(d, "jb") == 1
     out = capsys.readouterr().out
