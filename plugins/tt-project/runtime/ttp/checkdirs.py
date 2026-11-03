@@ -133,13 +133,20 @@ def environment(path: Path, env: dict) -> dict:
     return env
 
 
-def for_check(env: dict) -> dict:
-    """Assign managed scratch only at the guarded check subprocess boundary."""
+def scratch(env: dict) -> str | None:
+    """The managed scratch of a guarded check run (`env` holds its guard and output dir), else None."""
     if env.get('TTP_CHECKS_TMP_FD') and env.get('TTP_CHECK_OUTPUT_DIR'):
         output = Path(env['TTP_CHECK_OUTPUT_DIR'])
         folder = output.parent.parent / FOLDER
-        scratch = _short(folder / output.name) or writable(folder / output.name / SCRATCH)
-        env.update({k: scratch for k in ('TMPDIR', 'TMP', 'TEMP')})
+        return _short(folder / output.name) or writable(folder / output.name / SCRATCH)
+    return None
+
+
+def for_check(env: dict) -> dict:
+    """Assign managed scratch only at the guarded check subprocess boundary."""
+    if tmp := scratch(env):
+        folder = Path(env['TTP_CHECK_OUTPUT_DIR']).parent.parent / FOLDER
+        env.update({k: tmp for k in ('TMPDIR', 'TMP', 'TEMP')})
         # Preserve user ceilings; this one only bounds discovery beneath check-runs.
         inherited = env.get('GIT_CEILING_DIRECTORIES', '')
         env['GIT_CEILING_DIRECTORIES'] = os.pathsep.join(filter(None, (inherited, str(folder))))

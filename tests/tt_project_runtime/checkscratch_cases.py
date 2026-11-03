@@ -314,3 +314,59 @@ def test_a_recorded_short_scratch_that_is_not_this_users_directory_is_replaced(e
         assert os.path.lexists(old)   # not ours to remove
     checkdirs.finish(output)
     assert not pathlib.Path(tmp).exists()
+
+
+def test_detached_checks_off_the_ram_disk_keep_their_clean_tree_and_tmpdir_out_of_the_callers_tmpdir(
+        env, tmp_path, monkeypatch):
+    """With the scratch on disk (no RAM disk), a detached run made its clean checkout in the launching
+    session's TMPDIR: that session ending mid-run removed the tree and the run showed test failures.
+    The tree and the checks' TMPDIR go in the managed scratch, so removing the caller's TMPDIR after
+    the start fails nothing."""
+    from ttp import cli, shorttmp
+    p, repo, run, git, tmp = _clean_repo(env, tmp_path, monkeypatch)
+    assert shorttmp.tmpfs_root() is None
+    caller = tmp_path / "caller-tmp"
+    caller.mkdir()
+    monkeypatch.setenv("TMPDIR", str(caller))
+    seen = tmp_path / "seen"
+    cli.main(["checks", "--detach", "--fresh", "--",
+              f"sh -c 'echo $TMPDIR; pwd; rm -rf {caller}; sleep 0.2; cat tests/test_a.txt' > {seen}"])
+    assert _wait_precheck(run) == "0", (run / cli.CHECKS_OUT).read_text()
+    tmpdir, cwd, data = seen.read_text().split()
+    assert not pathlib.Path(tmpdir).is_relative_to(caller) and not pathlib.Path(cwd).is_relative_to(caller)
+    assert pathlib.Path(cwd).is_relative_to(tmpdir) and pathlib.Path(cwd).name == "tree" and data == "a"
+    assert not caller.exists()
+
+
+@pytest.mark.parametrize("how", ["check", "added-tests"])
+def test_a_clean_tree_removed_under_a_detached_check_reports_killed_not_test_failures(env, tmp_path, monkeypatch,
+                                                                                      capsys, how):
+    """A check whose clean checkout went while it ran failed with what the missing files made of it
+    (FAILED lines, files 'present only in the authoring worktree'). It is killed: rc `killed`, so the
+    waits run the checks again, and the report names the removed tree only."""
+    from ttp import addedtests, cli
+    p, repo, run, git, tmp = _clean_repo(env, tmp_path, monkeypatch)
+    (repo / "tests" / "fixture.log").write_text("data\n")   # only in the authoring worktree
+    gone = "rm -rf \"$PWD\"; echo FAILED tests/test_x.py::test_y; cat tests/fixture.log; exit 1"
+    if how == "added-tests":   # the tree goes on the rerun of the tests the diff adds
+        monkeypatch.setattr(addedtests, "added", lambda *a: [("tests/test_x.py", "test_y")])
+        monkeypatch.setattr(addedtests, "eligible", lambda c: True)
+        cmd = f"sh -c 'test -n \"$TTP_ADDED_TESTS_RUN\" || exit 0; {gone}'"
+        monkeypatch.setattr(addedtests, "run", lambda tests, c, run_check, path, e: (
+            run_check({**e, "TTP_ADDED_TESTS_RUN": "1"}, None),
+            {"status": "failed", "rc": 1, "flaky": [], "tests": tests, "rounds": 1, "why": "exit 1"})[1])
+        with pytest.raises(SystemExit) as e:   # in the foreground: 75, neither passed nor failed
+            cli.main(["checks", "--fresh", "--", cmd])
+        assert e.value.code == 75 and isinstance(e.value, cli.ChecksKilled)
+        err = capsys.readouterr().err
+    else:
+        cli.main(["checks", "--detach", "--fresh", "--", f"sh -c '{gone}'"])
+        assert _wait_precheck(run) == "killed", (run / cli.CHECKS_OUT).read_text()
+        assert cli._checks_result(run) == 0
+        err = capsys.readouterr().out + (run / cli.CHECKS_OUT).read_text()
+    assert f"ttp checks: {cli.TREE_GONE}: " in err
+    assert not [l for l in err.splitlines() if l.startswith("FAILED")]
+    assert "present only in the authoring worktree" not in err
+    assert json.loads((run / "checks.json").read_text())["killed"].startswith(cli.TREE_GONE)
+    assert not (run / "check_failure.json").exists()
+    _no_checkouts(repo, tmp)

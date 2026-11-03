@@ -3079,6 +3079,7 @@ def cmd_checks(a) -> None:
     ran_cpu = 0.0   # the CPU its children had used when its commands started (checkcap.record_cost)
     spilled = None   # the spill host's claim when the checks run there (checkspill)
     worker_loss = None   # test workers lost again on the rerun: an infrastructure fault (workerloss)
+    tree_gone = ""   # the clean checkout was removed under a check: killed, never a failure of the change
     run_env: dict = {}   # what the checks run in, for the pass's envs (pushpass.check_envs)
     join_rec, joined = None, None   # this run's checkjoin record; the run it followed and how
     base = _checks_base(p, Path(top), cmds)
@@ -3273,8 +3274,11 @@ def cmd_checks(a) -> None:
         try:
             if not (hit or handover) and any(not _in_place(c) for c in todo):
                 try:
-                    # On the RAM disk with the check's scratch when that is there (shorttmp)
-                    clean = cleantree.Checkout(top, head, shorttmp.on_tmpfs(run_env.get("TMPDIR")))
+                    # A detached run's in its managed scratch (on the RAM disk when there is room,
+                    # shorttmp), never the launching session's TMPDIR, which may go while it runs
+                    guarded = os.environ.get("TTP_CHECKS_TMP_FD") and run_env.get("TMPDIR")
+                    clean = cleantree.Checkout(top, head, run_env["TMPDIR"] if guarded
+                                               else shorttmp.on_tmpfs(run_env.get("TMPDIR")))
                     if p:
                         worktree.prepare(p, clean.path)   # the .venv a check may run, as the push queue's
                     said = f"running in a clean checkout of {head[:12]}: files only on disk in {top} are not seen"
@@ -3383,6 +3387,11 @@ def cmd_checks(a) -> None:
                     break
                 if rc != 0:
                     passed, failed = False, c
+                    if cwd != top and not clean.path.is_dir():
+                        tree_gone = _tree_gone(clean, c, head)
+                        out.write(f"ttp checks: {tree_gone}\n")
+                        out.write(_check_took(c, rc, began))
+                        break
                     if loss_reruns and workerloss.infra(loss := workerloss.lost(_log_since(out, log, check_start))):
                         worker_loss = loss
                     if cwd != top:   # what only this worktree has may be what the check missed
@@ -3426,6 +3435,9 @@ def cmd_checks(a) -> None:
                     out.write(f"ttp checks: {line}\n")
                 if rerun["status"] in ("flaky", "failed"):
                     passed, failed, rc = False, py_check, rerun.get("rc") or 1
+                    if cwd != top and not clean.path.is_dir():
+                        tree_gone = _tree_gone(clean, py_check, head)
+                        out.write(f"ttp checks: {tree_gone}\n")
                 elif wall_hit:
                     passed, failed, rc = False, py_check, checkwall.RC
                     timed_out = {"check": str(py_check), "cap_s": wall, "how": wall_how, "head": head,
@@ -3471,6 +3483,14 @@ def cmd_checks(a) -> None:
             if join_rec:   # the run here registers again; its followers queue again and join that one (checkjoin)
                 checkjoin.forget(p.state)
             return cmd_checks(a)
+        # Its clean checkout went while a check ran (its TMPDIR removed, a sweep): the run was killed,
+        # so the waits run the checks again; no test it reports failed says anything of the change.
+        if tree_gone and not passed and not _CHECK_STOP.get("stopped"):
+            write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": False,
+                                                             "commands": todo, "skipped": skipped, "ts": time.time(),
+                                                             "purpose": purpose, "killed": tree_gone})
+            print(f"ttp checks: {tree_gone}", file=sys.stderr)
+            raise ChecksKilled(75)
         # Test workers lost again on the rerun: the host, never a failure of the change (workerloss).
         if worker_loss is None:
             workerloss.clear(run_dir)
@@ -3636,6 +3656,16 @@ def cmd_checks(a) -> None:
 
 
 HARNESS_SKIPPED = "every purpose harness check was skipped as not applicable"
+TREE_GONE = "checks killed: clean tree removed"
+
+
+class ChecksKilled(SystemExit):
+    """`ttp checks` ended killed (exit 75 in the foreground): a detached run writes `killed` as its rc."""
+
+
+def _tree_gone(clean, c, head: str) -> str:
+    return (f"{TREE_GONE}: {clean.path} went while {str(c)!r} ran, so its result says nothing about "
+            f"{head[:12]}; neither passed nor failed: run `ttp checks --detach` again")
 AUTHORING_NOTE = " (in the authoring worktree, not a clean checkout)"
 
 
@@ -4896,6 +4926,8 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
         # The supervisor records checks.log/rc in the original run; commands get the report dir.
         env['TTP_RUN_DIR'] = str(run_dir)
         env['TTP_CHECKS_TMP_FD'] = str(guard.fileno())
+        # The child's own temporary files (and cleantree.prune) stay out of the caller's TMPDIR
+        env.update(dict.fromkeys(('TMPDIR', 'TMP', 'TEMP'), checkdirs.scratch(env)))
         env[checkcap.ARRIVED_ENV] = repr(arrived)
         (run_dir / CHECKS_RC).unlink(missing_ok=True)
         (run_dir / CHECKS_SLOT_WAIT).unlink(missing_ok=True)
@@ -4981,6 +5013,8 @@ def _checks_child(a) -> int:
     except OSError as e:
         print(f"ttp checks: {e}", file=sys.stderr, flush=True)
         code = 1
+    except ChecksKilled:
+        code = "killed"   # the probe answers and the waits run them again, no failed attempt counted
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
         if code > 128:
@@ -5015,6 +5049,18 @@ def _checks_env_ok(p: Project | None, sigs: list | None = None) -> int:
     if not still:
         print("ttp checks: no check runner is missing")
     return 1 if still else 0
+
+
+def _checks_killed(run_dir: Path) -> str:
+    """Why the checks recorded in `run_dir` were killed, as their checks.json says, else ""."""
+    from . import prguard
+    try:
+        rec = json.loads((run_dir / prguard.CHECKS_FILE).read_text())
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(rec, dict) or float(rec.get("ts") or 0) < float(_read_checks_pid(run_dir).get("ts") or 0):
+        return ""   # an earlier run's record
+    return str(rec.get("killed") or "")
 
 
 def _checks_result(run_dir: Path) -> int:
@@ -5086,6 +5132,8 @@ def _checks_result(run_dir: Path) -> int:
             print(f"ttp checks: dropped: {why}; nothing more runs, so run `ttp checks --detach` again")
         if rc_file.read_text().strip() == "75" and (lost := workerloss.marker(run_dir)):
             print(f"ttp checks: {workerloss.line(lost, lost['check'])}; run `ttp checks --detach` again")
+        if rc_file.read_text().strip() == "killed" and (why := _checks_killed(run_dir)):
+            print(f"ttp checks: {why}")
         print(f"ttp checks: finished with exit code {rc_file.read_text().strip()}")
         print(f"ttp checks: full output ('$ cmd' lines, test results) in {run_dir / 'checks.log'}")
         from . import slowtests
