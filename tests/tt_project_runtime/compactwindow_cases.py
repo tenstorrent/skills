@@ -1,9 +1,15 @@
-def test_a_worker_run_sizes_its_compact_window_above_its_fixed_prompt(env):
+def test_a_worker_run_sizes_its_compact_window_above_its_fixed_prompt(env, monkeypatch):
     """A light window of 100k compacts near 67k: a run whose fixed prompt is about 70k tokens compacted
     on its first tool result and thrashed until it died. The window is raised to fit the fixed prompt,
     the compaction margin and some headroom; the raise is recorded on the run."""
-    p = make(env)
     from ttp import daemon as dmod
+
+    class Proc:   # never a real runner
+        pid = 4242
+    real = subprocess.Popen
+    monkeypatch.setattr(dmod.subprocess, "Popen",
+                        lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
+    p = make(env)
     d = dmod.Daemon(p.base)
     p.set_config("budget.compact_window_tokens", {"light": 100000, "standard": 150000, "deep": 400000})
     d.cfg = p.config()
@@ -11,7 +17,6 @@ def test_a_worker_run_sizes_its_compact_window_above_its_fixed_prompt(env):
     def run(tier, prompt, **kw):
         tid = p.db.add_task(f"t {tier} {len(prompt)}", "s", kind="code", tier=tier, origin="user")
         rid = d.start_run("worker", prompt, "claude", tier, str(p.root), task=p.db.task(tid), **kw)
-        (p.runs / str(rid) / "STOP").touch()
         env_ = json.loads((p.runs / str(rid) / "run.json").read_text())["env"]
         note = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"] or "{}")
         return int(env_.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW") or 0), note
