@@ -72,10 +72,10 @@ def test_claude_fence_survives_connector_isolation(monkeypatch):
     assert s["sandbox"]["enabled"] and s["deniedMcpServers"] == [{"serverName": "some-server"}]
 
 
-def _claude_launch(env, p, cwd):
+def _claude_launch(env, p, cwd, d=None):
     from ttp.providers import claude
     from ttp.daemon import Daemon
-    d = Daemon(p.base)
+    d = d or Daemon(p.base)
     tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
     rid = d.start_run("worker", "go", "claude", "light", str(cwd), task=p.db.task(tid))
     (p.runs / str(rid) / "STOP").touch()
@@ -409,3 +409,145 @@ def test_a_providers_fenced_answer_matches_the_fence_its_launch_gets(monkeypatch
                     _, sandboxed = prov.fence_args(["agent", "--settings", "{}", "-"], ["/tmp/x"], cwd="/tmp/w",
                                                    on=on, restrictions=rules)
                     assert prov.fenced(on, rules) == sandboxed, (prov.name, on, rules, deps)
+
+
+def _harness_bin_tool(base, name, mode=0o755):
+    tool = Path(base) / "harness" / "bin" / name
+    tool.parent.mkdir(parents=True, exist_ok=True)
+    tool.write_text("#!/bin/sh\nexec ssh \"$@\"\n")
+    tool.chmod(mode)
+    return tool
+
+
+def test_fence_freed_commands_take_only_executables_in_the_harness_bin(tmp_path):
+    """sandbox.fence_freed_commands: a name counts only as an executable file in the harness's bin/;
+    a path, a plain file, a missing one, a shell or wrapper and the harness's own commands are left
+    out with why, and the hook's shells and wrappers stay in the refused set."""
+    from ttp import fencefree, hook
+    _harness_bin_tool(tmp_path, "my-ssh")
+    _harness_bin_tool(tmp_path, "plain", 0o644)
+    for name in ("git", "bash", "ttp"):
+        _harness_bin_tool(tmp_path, name)
+    (tmp_path / "harness" / "bin" / "dir").mkdir()
+    (tmp_path / "elsewhere").write_text("#!/bin/sh\n")
+    (tmp_path / "elsewhere").chmod(0o755)
+    freed, refused = fencefree.commands(tmp_path, [
+        "my-ssh", {"command": "my-ssh", "env": ["MY_SSH_OPTS"]}, "plain", "gone", "dir", "git", "bash", "ttp",
+        "../elsewhere", str(tmp_path / "elsewhere"), "-x", "", 5, {"command": "my-ssh", "env": ["BAD VAR"]},
+        {"env": ["A"]}])
+    assert freed == [("my-ssh", ("MY_SSH_OPTS",))], freed
+    assert len(refused) == 13, refused
+    assert any(r.startswith("plain: no executable") for r in refused)
+    assert any(r.startswith("gone: no executable") for r in refused)
+    assert sum("frees all it runs" in r for r in refused) == 3
+    assert sum("not a command name" in r for r in refused) == 6, refused
+    assert any("env is not a list" in r for r in refused)
+    assert fencefree.commands(tmp_path, "my-ssh") == ([], ['"my-ssh": not a list of command names'])
+    assert fencefree.commands(tmp_path, None) == ([], [])
+    assert hook.SHELLS | hook.WRAPPERS | {"eval"} <= fencefree.REFUSED
+    assert fencefree.patterns(freed) == ["my-ssh *", "MY_SSH_OPTS=* my-ssh *"]
+
+
+def test_fence_freed_commands_reach_the_sandbox_and_the_hook_of_a_fenced_worker(env, monkeypatch):
+    from ttp.providers import claude
+    monkeypatch.setattr(claude.Claude, "binary", lambda self: "/usr/bin/true")   # never a real agent
+    monkeypatch.setattr(claude.sys, "platform", "linux")
+    monkeypatch.setattr(claude, "find_binary", lambda b: f"/usr/bin/{b}")
+    p = make(env)
+    wt = env["tmp"] / "wt"
+    subprocess.run(["git", "-C", str(env["repo"]), "worktree", "add", "-q", str(wt)], check=True)
+    spec = _claude_launch(env, p, wt)
+    assert _settings(spec["argv"])["sandbox"]["excludedCommands"] == list(claude.FENCE_EXCLUDED), "unset: built-ins"
+    assert "TTP_FENCE_FREED" not in spec["env"]
+    _harness_bin_tool(p.base, "my-ssh")
+    p.set_config("sandbox", {"fence_freed_commands": ["my-ssh", "gone"]})
+    from ttp.project import config_problems
+    assert not [x for x in config_problems(p.raw_config()) if "sandbox" in x], "a known key"
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    for _ in range(2):
+        spec = _claude_launch(env, p, wt, d)
+        excluded = _settings(spec["argv"])["sandbox"]["excludedCommands"]
+        assert excluded == [*claude.FENCE_EXCLUDED, "my-ssh *"], excluded
+        assert spec["env"].get("TTP_FENCE_FREED") == "my-ssh", "the hook checks it as it checks ssh"
+    lines = [l for l in (p.logs / "daemon.log").read_text().splitlines() if "fence_freed_commands" in l]
+    assert len(lines) == 1 and "left out gone: no executable" in lines[0], "one line per daemon, not per run"
+    p.set_config("providers", {**p.config()["providers"], "claude": {**p.config()["providers"].get("claude", {}),
+                                                                      "write_fence": False}})
+    spec = _claude_launch(env, p, wt)
+    assert "sandbox" not in _settings(spec["argv"]) and "TTP_FENCE_FREED" not in spec["env"], "unfenced"
+
+
+@pytest.mark.parametrize("cmd,refused", [
+    ("my-ssh host cmd", False), ("timeout 5 my-ssh host cmd", False), ("my-ssh host 'a && b | tail'", False),
+    ("ttp lock res -- my-ssh host cmd", False), ("my-ssh host cmd 2>&1", False),
+    ("my-ssh host x && y", True), ("my-ssh host x | tail -5", True), ("y; my-ssh host x", True),
+    ("my-ssh host x > out.txt", True), ("my-ssh host \"$(cat cmd)\"", True), ("bash -c 'my-ssh host x'", True),
+    ("timeout 5 /abs/harness/bin/my-ssh host x && y", True), ("eval 'my-ssh host x'", True),
+])
+def test_fenced_hook_checks_a_projects_freed_command_as_it_checks_ssh(env, monkeypatch, cmd, refused):
+    from ttp import hook
+    monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"]))
+    monkeypatch.setenv("TTP_FENCE_BY_NAME", "1")
+    monkeypatch.setenv("TTP_FENCE_FREED", "my-ssh")
+    why = _decision(hook, cmd, env["tmp"])
+    assert bool(why) == refused and (not why or "my-ssh reaches another host only as a simple command" in why), why
+    monkeypatch.setenv("TTP_FENCE_FREED", "")
+    assert not _decision(hook, cmd, env["tmp"]), "a name the project did not free is not checked"
+    monkeypatch.setenv("TTP_FENCE_FREED", "my-ssh")
+    monkeypatch.delenv("TTP_FENCE_BY_NAME")
+    assert not _decision(hook, cmd, env["tmp"]), "unfenced: it runs anywhere"
+
+
+@pytest.mark.parametrize("cmd", ["my-ssh host cat {tok}", "timeout 5 my-ssh host cat {tok}",
+                                 "my-ssh host 'cat {tok}' && y", "ttp lock res -- my-ssh host cat {tok}"])
+def test_a_freed_command_naming_the_web_token_is_still_refused(env, monkeypatch, cmd):
+    """sa1: freeing a command from the write fence never exempts it from the web token check."""
+    from ttp import hook
+    monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"]))
+    monkeypatch.setenv("TTP_FENCE_BY_NAME", "1")
+    monkeypatch.setenv("TTP_FENCE_FREED", "my-ssh")
+    why = _decision(hook, cmd.format(tok="tt-project/state/" + "web" + ".token"), env["tmp"])
+    assert why and ("web token" in why or "simple command" in why), why
+    if "&&" not in cmd:
+        assert "web token" in why, why
+
+
+def test_an_upgrade_merges_cleanly_where_the_project_frees_its_command_by_config(env, monkeypatch, capsys):
+    """A project frees its own ssh wrapper in project.json, not in hook.py or providers/claude.py, and the
+    next template changes the FENCE_FREED and FENCE_EXCLUDED lines: the upgrade applies with no merge task
+    and keeps the project's key."""
+    p = make(env)
+    from ttp import cli, service
+    restarts = []
+    monkeypatch.setattr(service, "restart", lambda p: restarts.append(1) or "restarted")
+    lib = env["home"] / "lib" / "current" / "runtime" / "ttp"
+    h = p.harness
+    _install_template(env)
+    cli.main(["upgrade", "demo"])
+    _harness_bin_tool(p.base, "my-ssh")
+    p.set_config("sandbox", {"fence_freed_commands": ["my-ssh"]})
+    _git_out(h, "add", "-A")
+    _git_out(h, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "local: free my-ssh")
+    _install_template(env)
+    for rel, old, new in (("hook.py", 'FENCE_FREED = {"ssh", "scp", "sftp", "rsync"}',
+                           'FENCE_FREED = {"ssh", "scp", "sftp", "rsync", "mosh"}'),
+                          ("providers/claude.py", 'FENCE_EXCLUDED = ("ssh *", ', 'FENCE_EXCLUDED = ("ssh *", "mosh *", ')):
+        text = (lib / rel).read_text()
+        assert old in text, rel
+        (lib / rel).write_text(text.replace(old, new))
+    _next_release(env)
+    restarts.clear()
+    capsys.readouterr()
+    cli.main(["upgrade", "demo", "--auto"])
+    assert '"mosh"}' in (h / "runtime" / "ttp" / "hook.py").read_text()
+    assert '"mosh *"' in (h / "runtime" / "ttp" / "providers" / "claude.py").read_text()
+    assert p.config()["sandbox"]["fence_freed_commands"] == ["my-ssh"]
+    assert restarts == [1] and not p.db.q("SELECT id FROM tasks WHERE kind='harness'")
+    assert p.db.kv("upgrade_auto")["outcome"] == "applied"
+
+
+def test_the_upgrade_task_names_the_config_key_for_freed_commands():
+    from ttp import cli
+    text = cli._UPGRADE_TASK.format(problem="x", name="demo", target="1.2.3", state="/s")
+    assert "sandbox.fence_freed_commands" in text and "FENCE_FREED" in text

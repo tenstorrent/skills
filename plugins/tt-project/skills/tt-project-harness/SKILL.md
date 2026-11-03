@@ -237,6 +237,15 @@ Company-wide practice; the long form is in the `tt-project:setup-box` skill's re
   out). Only commands in config `runner.host_commands` run, each entry the command's first words
   (name them fully, e.g. `sudo -n /usr/sbin/<tool> <read-only verb>`); the user or the coordinator
   sets the list, never a worker. Each run goes to `state/host-run.jsonl` with its task id.
+- A fenced Claude worker's `ssh`, `scp`, `sftp`, `rsync` and `ttp lock` run outside the Bash sandbox
+  only as a simple command on its own (also after `timeout N`); the hook refuses them beside `&&`, `;`,
+  a pipe, a file redirect or a substitution. A project's own host-reaching command (a script in its
+  harness `bin/` that wraps ssh) is freed the same way by config `sandbox.fence_freed_commands`
+  (`["my-ssh"]`, or `{"command": "my-ssh", "env": ["VAR"]}` to free `VAR=... my-ssh ...` too), never
+  by editing FENCE_FREED in hook.py or FENCE_EXCLUDED in providers/claude.py: those lines belong to
+  the template, and a local edit there turns each upgrade that changes them into a merge task. A
+  name that is not an executable in the harness's `bin/`, or is a shell, wrapper, `ttp`, `git` or
+  `gh`, is left out with one daemon log line.
 - A reset or a single-host power cycle never affects other hosts: nothing waits on or snapshots
   them first. Only a quad serving a quad-wide workload goes down and up as a quad.
 - After a tray power drop, try glx_reset first, then the single-host BMC power cycle with op 0x3

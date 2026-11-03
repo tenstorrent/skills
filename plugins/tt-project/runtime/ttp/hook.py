@@ -758,6 +758,7 @@ def harness_gh_edit(payload: dict) -> str | None:
 # Commands the Claude Code fence frees by name (providers/claude.py FENCE_EXCLUDED, also after `timeout N`):
 # only a simple command; a redirect to or from a file, a substitution anywhere in the line, a shell
 # wrapper, `&&`, `;` or a pipe keep the whole line sandboxed, where they cannot reach a host (measured).
+# A project adds its own in project.json (sandbox.fence_freed_commands, fencefree), never here.
 FENCE_FREED = {"ssh", "scp", "sftp", "rsync"}
 SUBST_RE = re.compile(r"\$\(|`")
 FILE_REDIRECT_RE = re.compile(r"<|>(?!&)")   # `2>&1` and `>&2` duplicate a descriptor: fine
@@ -766,8 +767,9 @@ SHELL_C_RE = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
 
 def _freed_in(argv: list[str], depth: int = 0) -> str | None:
     """The ssh-like command `argv` runs: itself, or one in its `bash -c` or `eval` script."""
+    from . import fencefree
     name = os.path.basename(argv[0])
-    if name in FENCE_FREED:
+    if name in FENCE_FREED or name in fencefree.names():
         return name
     if name not in SHELLS and name != "eval" or depth > 2:
         return None
@@ -778,7 +780,7 @@ def _freed_in(argv: list[str], depth: int = 0) -> str | None:
 
 def fenced_ssh(segments: list[list[str]], cmd: str) -> str | None:
     """Why a fenced worker's command `cmd` (its simple commands: `segments`) that runs ssh (or scp,
-    sftp, rsync) would stay in the fence: beside other commands, with a redirect to or from a file,
+    sftp, rsync, or a project's sandbox.fence_freed_commands) would stay in the fence: beside other commands, with a redirect to or from a file,
     with a substitution, or in a `bash -c` not run by `ttp lock ... --`. None outside such a run
     (TTP_FENCE_BY_NAME) or for a simple command."""
     if not os.environ.get("TTP_FENCE_BY_NAME"):

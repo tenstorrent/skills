@@ -1925,6 +1925,14 @@ queues behind routine work; nothing running is interrupted:
   127.0.0.1), and macOS gets no forwarders. For anything still blocked, a bare `ssh` or `ttp lock`
   command runs outside the sandbox, and so do daemon-run command schedules. Codex workers are
   unchanged: their workspace-write sandbox runs with network access on.
+- `sandbox.fence_freed_commands: ["my-ssh", ...]` frees a project's own host-reaching commands (an
+  executable in its harness `bin/`, such as a script that wraps ssh) by name, as ssh is freed: the
+  Claude sandbox runs `my-ssh ...` (also after `timeout N`) outside the fence as a simple command,
+  and the hook refuses it beside `&&`, `;`, a pipe, a file redirect or a substitution. An entry
+  `{"command": "my-ssh", "env": ["VAR"]}` also adds the pattern `VAR=* my-ssh *`. A name that is
+  not an executable file in the harness's `bin/`, or is a shell, a wrapper, `ttp`, `git` or `gh`, is
+  left out with one daemon log line saying why. Set it here, never by editing the template's
+  FENCE_FREED (hook.py) or FENCE_EXCLUDED (providers/claude.py): those edits make upgrades conflict.
 - `providers.<name>.write_dirs: ["notes", ...]` adds directories inside the project root to the
   write fence's writable roots for that provider's workers, while the fence stays on for everything
   else. Each entry is relative to the project root or an absolute path inside it, symlinks resolved.

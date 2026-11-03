@@ -177,6 +177,7 @@ from . import schedrun
 from . import screen as scr
 from . import shared
 from . import shorttmp
+from . import fencefree
 from . import worktree
 from . import db as dbmod
 from .db import (
@@ -1056,6 +1057,7 @@ class Daemon:
         self._spec_deferred: set[int] = set()   # tasks whose spec change sleeps until their wait ends (logged once)
         self._spec_coalesced: set[int] = set()   # tasks whose wake_now waits for the coalesce window (logged once)
         self._wait_what_errs: set[str] = set()   # causes of lock-probe errors already logged (_wait_what)
+        self._fence_freed_said: set[str] = set()   # sandbox.fence_freed_commands entries left out, logged
         # Exclusive slot reservations (_slot_reservations): canonical lock -> {"task", "holder", "free_since"},
         # the (lock, task) pairs whose reservation timed out, and the pass's reservers while dispatch runs.
         self._slot_resv: dict[str, dict] = {}
@@ -2768,8 +2770,16 @@ class Daemon:
                            f"Skipped providers.{provider}.write_dirs entries (not created): {'; '.join(absent)}.",
                            severity="low", every_s=86400)
             fence_on = provider_fence_on(self.cfg, provider)   # as cli._harness_worker_fenced reads it
+            # The project's own host-reaching commands, freed by name like ssh (fencefree).
+            freed, left_out = fencefree.commands(self.p.base, (self.cfg.get("sandbox") or {}).get("fence_freed_commands"))
+            for why in left_out:
+                if why not in self._fence_freed_said:
+                    self._fence_freed_said.add(why)
+                    log(self.p, f"sandbox.fence_freed_commands: left out {why}")
             argv, sandboxed = prov.fence_args(argv, roots, cwd=str(cwd), on=fence_on,
-                                            restrictions=restrictions)
+                                            restrictions=restrictions, freed=freed)
+            if sandboxed and prov.fence_by_name and freed:
+                env = {**env, fencefree.ENV: " ".join(name for name, _ in freed)}   # the hook checks them as ssh
             if fence_on and not sandboxed and prov.fence_optional and prov.write_fence(restrictions):
                 # One keyed issue per provider (screen.py), never a wake per run. Only an optional fence
                 # (one a missing dependency stops): Cursor runs unfenced by design outside no_internet.

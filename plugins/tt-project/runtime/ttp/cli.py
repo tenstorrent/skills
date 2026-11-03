@@ -9629,6 +9629,10 @@ In this harness repo:
    the file, after its `# --- project-local imports below ---` line where it ends with one, never inside
    or next to upstream's `from . import ...` lists, and keep upstream's lists as upstream ships them:
    later upgrades then merge cleanly with no task.
+   A command this project added to the sandbox's freed set (FENCE_FREED in runtime/ttp/hook.py,
+   FENCE_EXCLUDED in runtime/ttp/providers/claude.py: a script in harness bin/ that reaches other hosts)
+   goes into project.json's `sandbox.fence_freed_commands` instead (`ttp config {name}
+   sandbox.fence_freed_commands '["<name>"]'`): take upstream's lines there whole.
 3. Check in <tmp>: `python3 -m compileall -q runtime` and `PYTHONPATH=runtime python3 -c "import ttp.daemon, ttp.cli"`.
 4. Commit, then in <tmp>: `git merge main` (main may have moved meanwhile; resolve and check again).
 5. `ttp upgrade {name} --apply <commit>`, run on its own (never piped or masked). It fast-forwards main

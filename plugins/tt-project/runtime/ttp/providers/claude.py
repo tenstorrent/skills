@@ -46,6 +46,7 @@ from pathlib import Path
 
 from . import register
 from ..budget import Window
+from .. import fencefree
 from .base import (AUTH_RE, LIMIT_RE, MAX_ARG_BYTES, MAX_CACHE_BREAKPOINTS, Provider, RunUsage, cap_cache_breakpoints,
                    cli_output, find_binary, request_rejected, status_check, strict_schema, drop_nulls)
 
@@ -278,7 +279,7 @@ class Claude(Provider):
         missing = fence_missing()
         return f"bypassPermissions without the Bash sandbox, which needs {' and '.join(missing)}" if missing else ""
 
-    def fence_args(self, argv, dirs, cwd="", on=True, restrictions=None):
+    def fence_args(self, argv, dirs, cwd="", on=True, restrictions=None, freed=()):
         # The sandbox goes into the worker's one --settings JSON: a second --settings flag replaces it.
         if not on or fence_missing() or "--settings" not in argv:
             return list(argv), False
@@ -288,7 +289,7 @@ class Claude(Provider):
             settings = json.loads(argv[i])
         except (IndexError, ValueError):
             return argv, False   # a settings file, not JSON: leave it as it is
-        argv[i] = json.dumps({**settings, "sandbox": sandbox_settings([cwd, *dirs] if cwd else list(dirs))})
+        argv[i] = json.dumps({**settings, "sandbox": sandbox_settings([cwd, *dirs] if cwd else list(dirs), freed)})
         return argv, True
 
     def isolation_args(self) -> list[str]:
@@ -571,6 +572,7 @@ def hook_settings() -> dict:
 FENCE_EXCLUDED = ("ssh *", "scp *", "sftp *", "rsync *", "ttp lock *", "ttp machines *", "ttp devq *",
                   "ttp detach --remote *", "git fetch *", "git pull *", "git push *", "git ls-remote *",
                   "git clone *", "git remote update *", "git submodule update *")
+# A project frees its own such commands in project.json (sandbox.fence_freed_commands, fencefree), never here.
 
 # Paths the Bash sandbox mounts over in its cwd so that no command writes them (shell and git start-up
 # files, editor and agent config), relative to the cwd. Where one does not exist, bubblewrap first
@@ -604,13 +606,14 @@ def tool_caches() -> list[str]:
     return [str(d) for d in dirs if d.is_dir()]
 
 
-def sandbox_settings(dirs) -> dict:
+def sandbox_settings(dirs, freed=()) -> dict:
     """The worker's `sandbox` settings: Bash runs sandboxed without a prompt and never retries outside
     it (allowUnsandboxedCommands false drops the dangerouslyDisableSandbox retry); it writes its cwd,
-    the CLI's temp dir, `dirs` and the tool caches. The network stays as bypassPermissions leaves it
+    the CLI's temp dir, `dirs` and the tool caches. `freed`: the project's own commands run outside it
+    too (fencefree.commands). The network stays as bypassPermissions leaves it
     (every host through the proxy); every Unix socket stays open (the harness's under state/)."""
     return {"enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False,
-            "excludedCommands": list(FENCE_EXCLUDED),
+            "excludedCommands": list(dict.fromkeys([*FENCE_EXCLUDED, *fencefree.patterns(freed)])),
             "filesystem": {"allowWrite": list(dict.fromkeys(d for d in [*dirs, *tool_caches()] if d))},
             "network": {"allowAllUnixSockets": True}}
 
