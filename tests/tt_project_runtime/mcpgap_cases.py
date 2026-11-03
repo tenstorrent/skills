@@ -266,6 +266,11 @@ def _host_list(p, at=None, **extra):
 
 
 def _iso_run(p, monkeypatch, **kw):
+    from ttp import loopproxy
+    # The run env lists the host's live listeners (TTP_LOOPBACK_PORTS); pin them so two runs compare
+    # equal while other processes open and close ports between them.
+    monkeypatch.setattr(loopproxy, "listening", lambda net=None: [8080])
+    monkeypatch.setattr(loopproxy, "ssh_ports", lambda path=None: [2222])
     argv, run_dir, _ = _dispatch_claude_worker(p, monkeypatch, {}, **kw)
     # Ended, with its task, so the next dispatch is not held by the parallel-run cap.
     p.db.x("UPDATE runs SET status='ok', ended=? WHERE status='running'", (time.time(),))
