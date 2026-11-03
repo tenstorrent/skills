@@ -3956,15 +3956,17 @@ class _ReExec(BaseException):
     """What the stand-in for os.execv raises: the process would be replaced here."""
 
 
-def _upgrade_child_checks(monkeypatch, upgrade) -> list:
+def _upgrade_child_checks(monkeypatch, upgrade, handover: bool = False) -> list:
     # cli.main's `ttp checks` as the detached child runs it (own_group: _checks_slot's `detached`), with
-    # checkcap.upgraded answering `upgrade()` and os.execv recorded instead of run.
+    # checkcap.upgraded answering `upgrade()` and os.execv recorded instead of run. With `handover` the
+    # kept lane and slot fds are duplicated as an exec keeps them, so a second cli.main in this process
+    # can adopt them as the re-executed run does while the old run's file objects close.
     from ttp import checkcap, checkspill, cli, testslots
     real = cli._checks_slot
     monkeypatch.setattr(cli, "_checks_slot",
                         lambda p, run_dir, out, head, detached=False, *a, **k: real(p, run_dir, out, head, True, *a, **k))
     monkeypatch.setattr(checkcap, "upgraded", upgrade)
-    keys = (checkcap.ARRIVED_ENV, checkcap.REEXEC_ENV, checkspill.OFF_ENV, testslots.LANE_ENV)
+    keys = (checkcap.ARRIVED_ENV, checkcap.REEXEC_ENV, checkspill.OFF_ENV, testslots.LANE_ENV, checkcap.KEPT_ENV)
     for k in keys:
         monkeypatch.setenv(k, "")   # restored after the test, whatever the re-exec set
     execs = []
@@ -3975,6 +3977,12 @@ def _upgrade_child_checks(monkeypatch, upgrade) -> list:
                   json.loads(pathlib.Path(name).read_text()).get("pid"))
                  for fd, name in json.loads(os.environ.get(testslots.LANE_ENV) or "[]")]
         execs.append((path, list(argv), {k: os.environ.get(k) for k in keys}, lanes))
+        if handover:
+            if spec := os.environ.get(testslots.LANE_ENV):
+                os.environ[testslots.LANE_ENV] = json.dumps([[os.dup(fd), name] for fd, name in json.loads(spec)])
+            if spec := os.environ.get(checkcap.KEPT_ENV):
+                fd, name = json.loads(spec)
+                os.environ[checkcap.KEPT_ENV] = json.dumps([os.dup(fd), name])
         raise _ReExec()
     monkeypatch.setattr(os, "execv", execv)
     return execs
@@ -4100,6 +4108,198 @@ def test_adopt_lanes_takes_only_the_open_lane_files_it_names(env, tmp_path):
     g.close()
     a.close()
     assert locks.try_take([tmp_path / "lane-a"], "run 2") is not None
+
+
+def _rival_checks_slot(got: list):
+    # Another project's run queued for the host-wide checks slot now: it appends the time it got one.
+    import threading
+    from ttp import checkcap
+
+    def rival():
+        s = checkcap.acquire("rival ttp checks", "rival", max_wait_s=60, project_name="rival")
+        got.append(time.time())
+        if s is not None:
+            s.close()
+    t = threading.Thread(target=rival)
+    t.start()
+    return t
+
+
+def test_a_checks_run_granted_its_host_wide_slot_keeps_it_across_an_upgrade_reexec(env, tmp_path, monkeypatch):
+    # A run granted the host's checks slot that still waits for test slots re-executes for an upgraded
+    # runtime (note 44bd0bbfdb6de827: it gave the slot back and queued again at the back, four times): the
+    # re-executed run holds the same slot, and a waiter queued meanwhile never gets it until the run ended.
+    import threading
+    from ttp import checkcap, cli, testslots
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    new = []
+    execs = _upgrade_child_checks(
+        monkeypatch, lambda: new[0] if new and os.environ.get(checkcap.REEXEC_ENV) != new[0] else "", handover=True)
+    monkeypatch.setenv(checkcap.ARRIVED_ENV, repr(time.time() - 600))
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_TEST_POOL", "2")
+    monkeypatch.setattr(testslots, "pool_room", lambda *a, **k: True)   # the slot is granted, then test slots wait
+    held = [testslots.acquire("other 1", project_name="px"), testslots.acquire("other 2", project_name="px")]
+    ran, ended, got = tmp_path / "ran", [], []
+    log = lambda: (run / "checks.log").read_text() if (run / "checks.log").exists() else ""   # noqa: E731
+
+    def go():
+        try:
+            cli.main(["checks", "--", "sh", "-c", f"touch {ran}"])
+        except _ReExec:
+            ended.append("exec")
+        except SystemExit as e:
+            ended.append(e.code)
+    t = threading.Thread(target=go)
+    t.start()
+    rival = None
+    try:
+        assert _wait_for(lambda: "waiting for a host-wide" in log() and checkcap.state()["running"]), log()
+        slot_label = checkcap.state()["running"]
+        rival = _rival_checks_slot(got)
+        assert _wait_for(lambda: checkcap.state()["queued"])
+        new.append("99.0.0")
+        t.join(30)
+        assert not t.is_alive() and ended == ["exec"] and not ran.exists()
+        (_, _, envs, _), = execs
+        fd, name = json.loads(envs[checkcap.KEPT_ENV])
+        assert json.loads(pathlib.Path(name).read_text()).get("pid") == os.getpid()
+        assert "keeping its checks lane and its host-wide checks slot" in log()
+        assert checkcap.state()["running"] == slot_label and not got, "held through the exec: the rival waits"
+        # The re-executed run adopts its slot and lane and waits only for its test slots.
+        t = threading.Thread(target=go)
+        t.start()
+        assert _wait_for(lambda: log().count("waiting for a host-wide") >= 2), log()
+        assert checkcap.state()["running"] == slot_label and not got
+        assert len(checkcap.state()["queued"]) == 1, "only the rival queues for a checks slot"
+        for g in held:
+            g.close()
+        t.join(30)
+        assert not t.is_alive() and ran.exists() and ended[1:] in ([], [0], [None]), ended
+        rival.join(30)
+        assert got and got[0] >= ran.stat().st_mtime, "the rival got the slot only once the run had ended"
+        assert log().count("host-wide checks slot taken") <= 1, "the kept slot is never granted again"
+    finally:
+        for g in held:
+            g.close()
+        t.join(30)
+        rival and rival.join(60)
+
+
+def test_a_waiting_checks_run_reexecuted_for_an_upgrade_queues_again_at_its_first_arrival(env, tmp_path, monkeypatch):
+    # A run still waiting for the checks slot when it re-executes queues again at its first arrival and
+    # priority, so its ageing counts from then, never from the re-execution.
+    import threading
+    from ttp import checkcap, cli, locks
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    new = []
+    execs = _upgrade_child_checks(
+        monkeypatch, lambda: new[0] if new and os.environ.get(checkcap.REEXEC_ENV) != new[0] else "", handover=True)
+    arrived = time.time() - 600
+    monkeypatch.setenv(checkcap.ARRIVED_ENV, repr(arrived))
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    other = checkcap.acquire("other")
+    ran, ended = tmp_path / "ran", []
+    log = lambda: (run / "checks.log").read_text() if (run / "checks.log").exists() else ""   # noqa: E731
+    tickets = lambda: [t.name for t in locks.queued(checkcap.slot_dir(), checkcap.RESOURCE)]   # noqa: E731
+
+    def go():
+        try:
+            cli.main(["checks", "--", "sh", "-c", f"touch {ran}"])
+        except _ReExec:
+            ended.append("exec")
+    t = threading.Thread(target=go)
+    t.start()
+    try:
+        assert _wait_for(lambda: tickets())
+        first, = tickets()
+        assert first.startswith(f"{arrived:017.6f}-{os.getpid()}")
+        new.append("99.0.0")
+        t.join(30)
+        assert ended == ["exec"] and not tickets()
+        (_, _, envs, _), = execs
+        assert not envs[checkcap.KEPT_ENV], "it held no checks slot to keep"
+        t = threading.Thread(target=go)
+        t.start()
+        assert _wait_for(lambda: tickets())
+        assert tickets() == [first], "the same place: arrival, pid and priority"
+        other.close()
+        t.join(30)
+        assert not t.is_alive() and ran.exists()
+        waited = re.search(r"host-wide checks slot taken after ([0-9.]+) min", log())
+        assert waited and float(waited.group(1)) >= 10.0, log()
+    finally:
+        other.close()
+        t.join(30)
+
+
+def test_a_kept_checks_slot_is_freed_when_the_reexec_fails_or_its_process_dies(env, tmp_path, monkeypatch):
+    import threading
+    from ttp import checkcap, cli, testslots
+    # (1) The exec fails: the run lets its slot go at once and waits on with its code (queued ahead of the
+    # rival by its arrival, it takes a slot again: a new grant, never the kept one).
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    new = []
+    _upgrade_child_checks(monkeypatch, lambda: new[0] if new and os.environ.get(checkcap.REEXEC_ENV) != new[0] else "")
+
+    def execv(path, argv):
+        raise OSError(8, "Exec format error")
+    monkeypatch.setattr(os, "execv", execv)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_TEST_POOL", "2")
+    monkeypatch.setattr(testslots, "pool_room", lambda *a, **k: True)
+    held = [testslots.acquire("other 1", project_name="px"), testslots.acquire("other 2", project_name="px")]
+    ran, got = tmp_path / "ran", []
+    log = lambda: (run / "checks.log").read_text() if (run / "checks.log").exists() else ""   # noqa: E731
+    t = threading.Thread(target=lambda: cli.main(["checks", "--", "sh", "-c", f"touch {ran}"]))
+    t.start()
+    rival = None
+    try:
+        assert _wait_for(lambda: "waiting for a host-wide" in log() and checkcap.state()["running"]), log()
+        rival = _rival_checks_slot(got)
+        assert _wait_for(lambda: checkcap.state()["queued"])
+        since = lambda: [json.loads(f.read_text() or "{}").get("since") for f in checkcap.all_paths(1)   # noqa: E731
+                         if f.exists()]
+        before = since()
+        new.append("99.0.0")
+        assert _wait_for(lambda: "could not re-execute" in log()), log()
+        assert _wait_for(lambda: since() != before), "let go, then taken anew"
+        assert log().count("re-executing with it") == 1 and not os.environ.get(checkcap.KEPT_ENV)
+    finally:
+        for g in held:
+            g.close()
+        rival and rival.join(30)
+        t.join(30)
+    assert ran.exists(), "it waited on and ran"
+    # (2) A process holding a kept slot dies (here after a real exec that kept it): the slot is free again.
+    slot = tmp_path / "slot"
+    code = ("import json, os, sys\n"
+            "from ttp import checkcap, locks\n"
+            "f = locks.try_take([__import__('pathlib').Path(sys.argv[1])], 'holder')\n"
+            "os.environ[checkcap.KEPT_ENV] = checkcap.keep_slot(checkcap.Slot(f))\n"
+            "os.execv(sys.executable, [sys.executable, '-c', 'import os, sys, time\\n"
+            "from ttp import checkcap\\n"
+            "s = checkcap.adopt_slot(os.environ[checkcap.KEPT_ENV])\\n"
+            "print(\"adopted\" if s else \"lost\", flush=True)\\n"
+            "time.sleep(60)'])\n")
+    proc = subprocess.Popen([sys.executable, "-c", code, str(slot)], cwd=str(RUNTIME), stdout=subprocess.PIPE,
+                            text=True, env={**os.environ, "PYTHONPATH": str(RUNTIME)})
+    try:
+        assert proc.stdout.readline().strip() == "adopted"
+        assert _slot_try(slot) is None, "held by the re-executed process"
+    finally:
+        proc.kill()
+        proc.wait(30)
+    f = _slot_try(slot)
+    assert f is not None, "its death freed it"
+    f.close()
+    assert checkcap.adopt_slot("") is None and checkcap.adopt_slot("not json") is None
+    assert checkcap.adopt_slot(json.dumps([999, str(slot)])) is None, "an fd that is not open"
+
+
+def _slot_try(path):
+    from ttp import locks
+    return locks.try_take([path], "probe")
 
 
 def test_test_slots_waiter_queues_at_its_arrival_and_a_stop_ends_its_wait_leaving_no_ticket(env, monkeypatch):

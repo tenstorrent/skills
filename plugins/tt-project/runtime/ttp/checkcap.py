@@ -113,6 +113,8 @@ FOREGROUND_WAIT_S = 60.0
 ARRIVED_ENV = "TTP_CHECKS_ARRIVED"
 # The runtime version a waiting detached `ttp checks` re-executed itself for (upgraded()): never again for it.
 REEXEC_ENV = "TTP_CHECKS_REEXEC"
+# The host-wide checks slot a re-executing `ttp checks` was granted and keeps: [fd, path] (keep_slot).
+KEPT_ENV = "TTP_CHECKS_KEPT_SLOT"
 UPGRADE_SETTLE_S = 10.0   # a newly installed version is adopted once seen this long (an install copies file by file)
 EXTRA_SLOTS = 2   # at most this many slots beyond the cap while the host is lightly loaded (extra())
 PRIORITY_TURNS = 3   # at most this many priority-1 turns in a row while other checks wait (priority_turns())
@@ -549,6 +551,49 @@ class Slot:
 
     def __exit__(self, *_):
         self.close()
+
+
+def keep_slot(slot) -> str:
+    """The host-wide checks slot `slot` holds, made to survive this process's exec (cli._checks_reexec):
+    its open file becomes inheritable and the returned text (for KEPT_ENV) names it for adopt_slot, else "".
+    The slot's lock belongs to that open file and its label to this pid, which exec keeps, so no other
+    waiter can take it in between; a failed exec or a dead process frees it as any holder's."""
+    f = getattr(slot, "f", None)
+    if f is None:
+        return ""
+    try:
+        os.set_inheritable(f.fileno(), True)
+        return json.dumps([f.fileno(), f.name])
+    except (OSError, ValueError):
+        return ""
+
+
+def adopt_slot(spec: str) -> Slot | None:
+    """The Slot keep_slot() named in `spec`, taken over after the exec (no longer inherited by the
+    commands it starts); None when there is none or the fd is not the open, still locked slot file it
+    names (then a matching fd is closed, freeing the slot: the run queues for one again)."""
+    try:
+        fd, path = json.loads(spec or "null") or (None, None)
+        fd, path = int(fd), str(path)
+    except (ValueError, TypeError):
+        return None
+    try:
+        st, own = os.fstat(fd), os.stat(path)
+    except (OSError, ValueError):
+        return None
+    if (st.st_dev, st.st_ino) != (own.st_dev, own.st_ino):
+        return None   # an fd that is no longer the slot's (exec closed it, the number was reused): not ours
+    f = None
+    try:
+        f = os.fdopen(fd, "a+")
+        f.buffer.raw.name = path   # named as try_take's are
+        os.set_inheritable(fd, False)
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)   # its own lock: taken again at once
+    except (OSError, ValueError):
+        if f is not None:
+            f.close()
+        return None
+    return Slot(f)
 
 
 @project.ps_snapshot()
