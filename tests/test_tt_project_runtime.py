@@ -4182,20 +4182,21 @@ def test_one_listener_per_chat(env):
     cmd = [sys.executable, str(TTP), "listen", "demo", "--chat", "c1", "--timeout", "60"]
     first = subprocess.Popen(cmd, env=run_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
-        deadline = time.time() + 15
+        # Generous bounds: suites run at nice 19, so a cold listener start can take seconds on a busy host.
+        deadline = time.time() + 60
         while time.time() < deadline and not lock.exists():
             time.sleep(0.05)
         assert lock.exists(), "the first listener never took the chat"
         second = subprocess.Popen(cmd, env=run_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            first.wait(timeout=15)
-            deadline = time.time() + 10     # the new listener writes its id just after the old one dies
+            first.wait(timeout=60)
+            deadline = time.time() + 30     # the new listener writes its id just after the old one dies
             while time.time() < deadline and lock.exists() and lock.read_text().strip() != str(second.pid):
                 time.sleep(0.05)
             assert lock.read_text().strip() == str(second.pid), "the newest listener does not own the chat"
             p.db.post("out", "hello", chat="c1", kind="reply")
             out = ""
-            deadline = time.time() + 15
+            deadline = time.time() + 30
             while time.time() < deadline and "hello" not in out:
                 time.sleep(0.05)
                 out = p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] and "hello" or ""
