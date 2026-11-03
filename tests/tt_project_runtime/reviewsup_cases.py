@@ -22,15 +22,6 @@ def _changes_needed_chain(env, p):
     return p.db.task(rev["id"]), p.db.task(re1["id"]), re2, branch
 
 
-def _ttp_task(p, *args):
-    from ttp import cli
-    try:
-        cli.main(["task", p.name, *args])
-    except SystemExit as e:
-        return e.code
-    return 0
-
-
 def test_a_passing_re_review_supersedes_the_failed_reviews_of_its_chain(env, capsys):
     """Auto: once the last re-review of a chain passes, every earlier changes_needed review in it is
     recorded superseded by it with its approved head, model-free; the verdict is kept, readers show
