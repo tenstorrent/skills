@@ -185,6 +185,8 @@ read the one for the lever you change.
 - Store a value of your own with `ttp secret set <name> < file` (stdin only), or a set of fresh random
   tokens with `ttp secret generate <name> --keys a,b,c`; neither prints a value.
   Give one to a command with `ttp secret env --secret <name>[:<key>]=<VAR> -- <command>`.
+  A built-in one goes only by a field: `--secret jev:key=<VAR>`. In the sandbox, `ttp secret env`
+  has the daemon run the command; you get its masked output and exit code, never the value.
 
 ## CPU-only runs never open a device
 

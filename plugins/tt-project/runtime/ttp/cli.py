@@ -11230,7 +11230,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--user-id", help="with slack: your Slack user id (instead of --email)")
     s.add_argument("--secret", action="append", metavar="NAME[:KEY]=VAR",
                    help="with env (repeatable): put a secret made with set or generate (one key of it with "
-                        ":KEY) in the command's environment as VAR; the command line carries only names")
+                        ":KEY), or a built-in one's field (jev:key=VAR), in the command's environment as VAR; "
+                        "the command line carries only names")
     s.add_argument("--cmd-word", action="append", help=argparse.SUPPRESS)
     s.add_argument("--force", action="store_true",
                    help="with jev or endpoint: save the key even if the check fails; with generate: "

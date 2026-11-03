@@ -2069,6 +2069,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   JSON object (`--force` replaces one). Neither prints a value; both are masked like the others.
   `ttp secret env --secret <name>[:<key>]=<VAR> -- <command>` (repeatable) runs a command with one in
   `VAR`, its output masked and its exit code passed on; the command line carries only names.
+  A built-in secret goes only by a field (`--secret jev:key=<VAR>`); `jev=<VAR>` is refused. From a
+  sandboxed worker, which cannot read the secrets store, the daemon runs the command outside the
+  sandbox and the worker gets its masked output and exit code; `state/secret-uses.jsonl` records
+  only the secret names, the task and the time.
 - No `ttp` command prints a saved key. `ttp secret check [alias]` tests one (reachable, auth ok or
   auth failed), lists the model ids it serves and marks each `providers.<p>.tiers.*.model` of the
   current project it does not serve, with no key, URL or host in its output, and `ttp secret env <alias> -- <command>` gives it to a command in `OPENAI_API_KEY`
