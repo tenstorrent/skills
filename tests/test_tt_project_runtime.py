@@ -43123,7 +43123,7 @@ def test_deployed_counts_a_deferred_merge_as_pending_with_owner_and_resume_time(
     _deploy_project(tmp_path, "alpha", "0.5.0")
     base, db = _deploy_project(tmp_path, "beta", "0.4.9")   # its merge conflicted: files stay old
     until = time.time() + 7 * 3600
-    db.set_kv(release.KV_AUTO, {"key": "0.5.0 x", "to": "0.5.0", "outcome": "deferred", "until": until,
+    db.set_kv(release.KV_AUTO, {"key": f"0.5.0 {DEPLOY_C}", "to": "0.5.0", "outcome": "deferred", "until": until,
                                 "why": "the merge conflicts in prompts/worker.md"})
     r = overview.deployed()
     beta = next(x for x in r["projects"] if x["name"] == "beta")
@@ -43141,6 +43141,47 @@ def test_deployed_counts_a_deferred_merge_as_pending_with_owner_and_resume_time(
     assert beta["state"] == 1 and f"merge held by harness task #{tid} (queued)" in beta["line"], beta["line"]
     assert beta["line"].endswith(f"owner: harness task #{tid}"), beta["line"]
     assert "resumes when it ends, or at " in beta["line"]
+    db.close()
+
+
+def test_deployed_names_a_pending_projects_own_blocker_not_an_older_releases_failure(env, tmp_path):
+    """An upgrade failure recorded for an older release does not explain a newer pending deploy: that
+    project gets the normal line, owned by its daemon. An unfinished merge in its harness is named as
+    the blocker. A failure of the target release still shows, owned by that project, not the deploy."""
+    import subprocess
+    from ttp import overview, release
+    _deploy_lib("0.5.0")
+    base, db = _deploy_project(tmp_path, "beta", "0.4.9")
+    db.set_kv(release.KV_RELEASE, {"seen": "0.5.0"})
+    db.set_kv(release.KV_AUTO, {"key": "0.4.8 0123456789ab", "to": "0.4.8", "outcome": "failed",
+                                "why": "an unfinished merge is in the live harness", "ts": time.time() - 86400})
+    beta = overview.deployed(names=["beta"])["projects"][0]
+    assert beta["state"] == 1 and "files at 0.4.9: not upgraded yet" in beta["line"], beta["line"]
+    assert beta["line"].endswith("owner: this project's daemon"), beta["line"]
+    assert "(its next release check)" in beta["line"], beta["line"]
+    assert "failed" not in beta["line"] and "`ttp upgrade" not in beta["line"] and "coordinator" not in beta["line"]
+    assert "upgrade_error" not in beta and beta["merge_pending"], beta
+    # an unfinished merge in its live harness is the blocker, owned by its daemon
+    h = base / "harness"
+    git = lambda *a: subprocess.run(["git", "-C", str(h), *a], check=True, capture_output=True)  # noqa: E731
+    git("init", "-q")
+    git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "x")
+    (h / ".git" / "MERGE_HEAD").write_text("fedcba9876543210fedcba9876543210fedcba98\n")
+    old = time.time() - 2 * 86400
+    os.utime(h / ".git" / "MERGE_HEAD", (old, old))
+    beta = overview.deployed(names=["beta"])["projects"][0]
+    assert "files at 0.4.9: harness mid-merge (MERGE_HEAD fedcba987654, 2 d old)" in beta["line"], beta["line"]
+    assert beta["line"].endswith("(its next release check), owner: this project's daemon"), beta["line"]
+    (h / ".git" / "MERGE_HEAD").unlink()
+    # a failure of the target release still shows, owned by that project's coordinator
+    for key in ("0.5.0 " + DEPLOY_C[:12], "0.5.0"):
+        db.set_kv(release.KV_AUTO, {"key": key, "to": "0.5.0", "outcome": "failed", "why": "merge conflicts"})
+        beta = overview.deployed(names=["beta"])["projects"][0]
+        assert "files at 0.4.9: the last upgrade failed (merge conflicts)" in beta["line"], beta["line"]
+        assert beta["line"].endswith("owner: beta's coordinator") and beta["upgrade_error"] == "merge conflicts"
+    # another commit of the target version is history too
+    db.set_kv(release.KV_AUTO, {"key": "0.5.0 1234567890ab", "to": "0.5.0", "outcome": "failed", "why": "x"})
+    assert "not upgraded yet" in overview.deployed(names=["beta"])["projects"][0]["line"]
     db.close()
 
 
@@ -44427,7 +44468,7 @@ def test_after_push_deploy_daemon_owned_upgrade_is_pending_until_its_check_then_
         due = float(seen) + release.CHECK_S
     elif how == 'deferred':
         due = now + 7 * 3600
-        db.set_kv(release.KV_AUTO, {'key': '0.5.0 x', 'outcome': 'deferred', 'until': due, 'why': 'busy'})
+        db.set_kv(release.KV_AUTO, {'key': f'0.5.0 {DEPLOY_C}', 'outcome': 'deferred', 'until': due, 'why': 'busy'})
     else:
         due = now + release.CHECK_S
     row = overview.deployed(names=['alpha'])['projects'][0]

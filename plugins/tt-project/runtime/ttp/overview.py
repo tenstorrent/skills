@@ -272,11 +272,39 @@ def _paused(db: _RO) -> bool:
     return bool(r and r["value"] in ("true", "1"))
 
 
-def _behind(name: str, db: _RO, state: Path, files: str, now: float, where) -> tuple[str, str, str]:
-    """(reason, owner, resumes) for a project whose harness files are not at the target yet."""
+def _merge_head(harness: Path) -> tuple[str, float] | None:
+    """(sha, mtime) of the MERGE_HEAD an unfinished merge left in the live harness checkout, else None."""
+    import subprocess
+    if not (harness / ".git").exists():     # not its own checkout: never read an enclosing repository's
+        return None
+    try:
+        r = subprocess.run(["git", "-C", str(harness), "rev-parse", "--git-path", "MERGE_HEAD"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    rel = r.stdout.strip()
+    if r.returncode != 0 or not rel:
+        return None
+    path = Path(rel) if Path(rel).is_absolute() else harness / rel
+    try:
+        return path.read_text().split()[0], path.stat().st_mtime
+    except (OSError, IndexError):
+        return None
+
+
+def _age(s: float) -> str:
+    return _ago(s) if s < 3600 else f"{int(s // 3600)} h" if s < 86400 else f"{int(s // 86400)} d"
+
+
+def _behind(name: str, db: _RO, state: Path, files: str, now: float, where, target: str,
+            commit: str | None) -> tuple[str, str, str]:
+    """(reason, owner, resumes) for a project whose harness files are not at the `target` (`commit`) yet.
+    The owner is one that can act on that project: its daemon, task or coordinator, never the deploy's."""
     from . import timefmt
     from .release import CHECK_S, KV_AUTO, KV_RELEASE, STALE_S, task_activity
     at = lambda ts: timefmt.short(max(ts, now), where, now)  # noqa: E731
+    _, seen = db.kv(KV_RELEASE)
+    next_check = f"at {at(seen + CHECK_S)} (its next release check)" if seen else "at its next release check (hourly)"
     tid = _holder(db, state)
     if tid:
         t, last = task_activity(db, tid)
@@ -291,19 +319,23 @@ def _behind(name: str, db: _RO, state: Path, files: str, now: float, where) -> t
         return (f"files at {files}: paused; not upgraded yet", "the host-side takeover (project paused)",
                 f"at the deploy's host-side `ttp upgrade {name}`, or when {name} is resumed")
     rec, _ = db.kv(KV_AUTO)
+    if not _concerns(rec, target, commit):
+        rec = {}        # an older release's record is history: it does not explain this deploy
+    if rec.get("outcome") == "running":     # its own try briefly leaves MERGE_HEAD in the live checkout
+        return f"files at {files}: upgrading now", "this project's daemon", "when the upgrade ends"
+    mh = _merge_head(state.parent / "harness")
+    if mh:              # an unfinished merge in the live checkout holds every release, whatever failed before
+        return (f"files at {files}: harness mid-merge (MERGE_HEAD {mh[0][:12]}, {_age(max(now - mh[1], 0))} old)",
+                "this project's daemon", next_check)
     if rec.get("outcome") == "deferred":
         why = " ".join(str(rec.get("why") or "").split())[:160]
         return (f"files at {files}: merge deferred" + (f" ({why})" if why else ""), "this project's daemon",
                 f"at {at(float(rec.get('until') or 0))}")
-    if rec.get("outcome") == "running":
-        return f"files at {files}: upgrading now", "this project's daemon", "when the upgrade ends"
     if rec.get("outcome") == "failed":
         why = " ".join(str(rec.get("why") or "see logs/upgrade.log").split())[:160]
-        return (f"files at {files}: the last upgrade failed ({why})", "this project's coordinator",
+        return (f"files at {files}: the last upgrade failed ({why})", f"{name}'s coordinator",
                 "once the failure is fixed")
-    _, seen = db.kv(KV_RELEASE)
-    return (f"files at {files}: not upgraded yet", f"the deploy (`ttp upgrade {name}`) or this project's daemon",
-            f"at {at(seen + CHECK_S)} (its next release check)" if seen else "at its next release check (hourly)")
+    return f"files at {files}: not upgraded yet", "this project's daemon", next_check
 
 
 def _concerns(auto: dict, target: str, commit: str | None) -> bool:
@@ -354,7 +386,8 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
         row["merge_pending"] = bool(tid and not at_target)
         row["paused"] = _paused(db)
         auto, _ = db.kv(KV_AUTO)
-        if auto.get("outcome") == "failed" and _concerns(auto, target, commit):
+        cur = auto if _concerns(auto, target, commit) else {}   # an older release's record is history
+        if cur.get("outcome") == "failed":
             row["upgrade_error"] = auto.get("why") or "the last upgrade failed"
         # Its own upgrade restarts the daemon: down meanwhile is a step, not a fault (as release.line).
         row["upgrading"] = (auto.get("outcome") == "running" and bool(auto.get("key")) and
@@ -369,19 +402,19 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
             # Nothing upgrades a paused project by itself: the host-side takeover merges its files now.
             row.update(merge_pending=True, merge_owner="the host-side takeover (project paused)", takeover_at=now)
         elif (not at_target and row["daemon_alive"] and (where.get("upgrade") or {}).get("auto", True)
-              and auto.get("outcome") not in ("running", "failed")):
+              and cur.get("outcome") not in ("running", "failed")):
             # Its live daemon merges the release by itself: at its next release check, or when a deferred
             # merge's wait ends. Past that deadline deploy.assess reports it missed.
             from .release import CHECK_S, KV_RELEASE
-            if auto.get("outcome") == "deferred":
-                at = float(auto.get("until") or 0) or now + CHECK_S
+            if cur.get("outcome") == "deferred":
+                at = float(cur.get("until") or 0) or now + CHECK_S
             else:
                 _, seen = db.kv(KV_RELEASE)
                 at = seen + CHECK_S if seen else now + CHECK_S
             row.update(merge_pending=True, merge_owner="this project's daemon", takeover_at=at)
         if not pid:
             if not at_target:
-                return done(PENDING, *_behind(name, db, state, files, now, where))
+                return done(PENDING, *_behind(name, db, state, files, now, where, target, commit))
             return done(PENDING, f"files at {files}, daemon {daemon}", "this project's service", "when its daemon starts")
         r = identity.running(state, pid)
         if not r:
@@ -393,7 +426,7 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
         if not (allow_newer and is_newer(rv, target)) and (rv != target or (commit and not _same_commit(rc, commit))):
             running = f"{rv} ({(rc or '?')[:12]})"
             if not at_target:
-                reason, owner, resumes = _behind(name, db, state, files, now, where)
+                reason, owner, resumes = _behind(name, db, state, files, now, where, target, commit)
                 return done(PENDING, f"{reason}; daemon runs {running}", owner, resumes)
             row["settling"] = True   # its own daemon finishes it: deploy.assess gives it a bounded deadline
             return done(PENDING, f"files at {files}, daemon still runs {running}: restart pending",
