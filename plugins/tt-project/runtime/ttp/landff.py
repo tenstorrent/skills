@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from . import applyff, poll_s
 
 DIR = "land-ff"
 TAKES = "land_requests"     # the daemon's heartbeat lists it once it takes these requests
+_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")   # full commit ids only: never an option or a ref name
 WAIT_S = 120                # how long `ttp land` waits for the daemon to take the request, then for its result
 
 
@@ -77,7 +79,8 @@ def _holds(root: Path, wt: str, branch: str) -> bool:
 def _why_not(p, info: dict) -> str:
     """Why the daemon must not carry out request `info` as it is now ("" when it may)."""
     wt, branch, base, new = (str(info.get(k) or "") for k in ("worktree", "branch", "base", "new"))
-    if not (wt and branch and base and new) or time.time() - float(info.get("at") or 0) > WAIT_S:
+    if not (wt and branch and _SHA.fullmatch(base) and _SHA.fullmatch(new)) \
+            or time.time() - float(info.get("at") or 0) > WAIT_S:
         return "the request is malformed or older than its requester waits"
     h = Path(wt)
     if not _holds(p.root, wt, branch):

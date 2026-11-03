@@ -16019,6 +16019,7 @@ def test_ttp_land_through_the_daemon_never_overwrites_a_dirty_or_moved_checkout_
     assert "diverged" in ask(new=_git_out(repo, "commit-tree", f"{base}^{{tree}}", "-m", "unrelated"))
     assert "not a checkout of proj" in ask(worktree=str(env["tmp"]))
     assert "malformed" in ask(new="")
+    assert "malformed" in ask(new="--output=x") and "malformed" in ask(base="proj")
     assert "malformed" in ask(at=time.time() - 10 * landff.WAIT_S)
     # No daemon takes it: withdrawn, so no later daemon moves the branch for a run that gave up.
     monkeypatch.setattr(landff.request, "__defaults__", (0.3,))
