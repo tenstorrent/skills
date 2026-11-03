@@ -290,7 +290,7 @@ def send(source: str, task: int | None, to: str, text: str, severity: str = "nor
         f.seek(0)
         notes = _lines(f.read())[0]
         if any(n["fp"] == fp for n in notes) or (sender != "daemon"
-                                                 and _repeat(notes, source, task, to, text, confirms, now)):
+                                                 and _repeat(notes, source, task, to, text, confirms, now, severity)):
             return "duplicate"
         # A daemon's page (bounded by its routing, once per step) is neither limited nor counted.
         if sender != "daemon" and sum(1 for n in notes if n.get("to") and n.get("project") == source
@@ -363,7 +363,7 @@ def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str
             got = send(source, task, to, text, severity, now, at=at, back=back, confirms=confirms)
             if got != "limited":
                 return got, 0
-        elif _filed(fp) or repeat_of(state, source, task, to, text, confirms, now, waiting):
+        elif _filed(fp) or repeat_of(state, source, task, to, text, confirms, now, waiting, severity):
             return "duplicate", 0
         if len(waiting) >= OUTBOX_MAX:
             return "full", 0
@@ -383,12 +383,17 @@ def named_notes(text: str, confirms: str | None = None) -> frozenset[str]:
     return frozenset(_NOTE_ID_RE.findall(str(text or ""))) | ({_confirms(confirms)} if _confirms(confirms) else set())
 
 
+def _rank(severity) -> int:
+    return NOTE_SEVERITIES.index(severity if severity in NOTE_SEVERITIES else "normal")
+
+
 def _repeat(notes: list[dict], source: str, task: int | None, to: str, text: str, confirms: str | None,
-            now: float) -> str | None:
+            now: float, severity: str = "normal") -> str | None:
     """The id of a note in `notes` (inbox lines) this one only repeats in other words, or None: one the
-    same task of `source` sent `to` within REPEAT_S, naming the same set of note ids (`named_notes`), with
-    no resolution, regression or wontfix of one of them recorded since. A note naming none, or a new one,
-    or from another task, is never a repeat."""
+    same task of `source` sent `to` within REPEAT_S, naming the same set of note ids (`named_notes`), at
+    the same or a higher severity, with no resolution, regression or wontfix of one of them recorded since.
+    A note naming none, or a new one, or from another task, is never a repeat; nor is an escalation (a
+    higher severity than every such note): it asks for attention."""
     ids = named_notes(text, confirms)
     if task is None or not ids:
         return None
@@ -396,7 +401,8 @@ def _repeat(notes: list[dict], source: str, task: int | None, to: str, text: str
     for n in reversed(notes):
         ts = float(n.get("ts") or 0)
         if (n.get("project") != source or n.get("task") != task or n.get("to") != to or n.get("from") == "daemon"
-                or not 0 <= now - ts < REPEAT_S or named_notes(n.get("spec"), n.get("confirms")) != ids):
+                or not 0 <= now - ts < REPEAT_S or named_notes(n.get("spec"), n.get("confirms")) != ids
+                or _rank(n.get("severity")) < _rank(severity)):
             continue
         recs = _records() if recs is None else recs
         if not any(r.get("kind") in ("resolve", "regression", "wontfix") and r.get("fp") in ids
@@ -406,7 +412,7 @@ def _repeat(notes: list[dict], source: str, task: int | None, to: str, text: str
 
 
 def repeat_of(state: Path, source: str, task: int | None, to: str, text: str, confirms: str | None = None,
-              now: float | None = None, waiting: list[dict] | None = None) -> str | None:
+              now: float | None = None, waiting: list[dict] | None = None, severity: str = "normal") -> str | None:
     """`_repeat` over the project's outbox (`waiting`, read when None) and this machine's inbox: the id of
     the note this one repeats, for `send_or_queue` to drop it and `ttp note` to name it."""
     now = now or time.time()
@@ -418,7 +424,7 @@ def repeat_of(state: Path, source: str, task: int | None, to: str, text: str, co
     except FileNotFoundError:
         inbox = []
     return _repeat(inbox + [{**n, "project": source, "spec": n.get("text")} for n in waiting],
-                   source, task, to, note_text(text), confirms, now)
+                   source, task, to, note_text(text), confirms, now, severity)
 
 
 def _filed(fp: str) -> bool:

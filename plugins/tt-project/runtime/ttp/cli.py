@@ -2159,7 +2159,7 @@ def _note_to(a, run_dir: str) -> None:
               f"{upstream.note_id(a.to, text)} when the limit allows{sent}. Nothing to wait for: keep working")
         return
     earlier = (upstream.repeat_of(me.state, me.name, int(task) if task.isdigit() else None, a.to, text,
-                                  getattr(a, "confirms", None))
+                                  getattr(a, "confirms", None), severity=a.severity)
                if got == "duplicate" and not upstream._filed(upstream.note_id(a.to, text)) else None)
     if earlier:
         print(f"note for {a.to} not sent: this task already sent it note {earlier} naming the same notes "

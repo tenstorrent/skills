@@ -935,6 +935,46 @@ def test_a_tasks_repeat_note_is_dropped_on_the_outbox_and_run_queue_paths(env, m
                for n in _upstream_inbox(env)) == 1
 
 
+@pytest.mark.parametrize("first,second,sent", [("low", "high", True), ("normal", "high", True),
+                                                 ("normal", "normal", False), ("high", "low", False)])
+def test_a_tasks_repeat_note_at_a_higher_severity_is_an_escalation_and_is_filed(env, first, second, sent):
+    """A task's repeat naming the same note ids at a higher severity than its earlier note asks for
+    attention: it is filed and surfaced like a first note. One at the same or a lower severity is dropped."""
+    from ttp import upstream
+    src, dst, fp = _confirm_pair(env)
+    fp2 = upstream.fingerprint("upstream: b", "second note")
+    now = time.time()
+    assert upstream.send(src.name, 57, "second", f"{fp} and {fp2} look off", severity=first, now=now) == "sent"
+    got = upstream.send(src.name, 57, "second", f"{fp2}, {fp}: now blocking", severity=second, now=now + 60)
+    assert got == ("sent" if sent else "duplicate")
+    assert upstream.ingest(dst, dst.config()) == (2 if sent else 1)
+    if sent:
+        assert _queued_notes(dst)[-1]["severity"] == "high" and _queued_notes(dst)[-1]["status"] == "queued"
+        # Once escalated, a repeat at the same severity is dropped again.
+        assert upstream.send(src.name, 57, "second", f"{fp} {fp2} still blocking", severity="high",
+                             now=now + 120) == "duplicate"
+
+
+def test_a_higher_severity_repeat_is_queued_on_the_outbox_and_run_queue_paths(env, monkeypatch):
+    """Past the hourly limit, a task's escalation of a queued or filed note queues; a same-severity repeat
+    is still dropped, and `repeat_of` names no earlier note for the escalation."""
+    from ttp import upstream
+    src, dst, fp = _confirm_pair(env)
+    now = time.time()
+    for i in range(upstream.NOTES_PER_HOUR):
+        upstream.send(src.name, 1, "second", f"filler {i}", now=now)
+    assert upstream.send_or_queue(src.state, src.name, 57, "second", f"{fp} looks off", "low", now=now) == ("queued", 1)
+    assert upstream.repeat_of(src.state, src.name, 57, "second", f"{fp} blocks", now=now, severity="high") is None
+    assert upstream.send_or_queue(src.state, src.name, 57, "second", f"{fp} blocks", "high", now=now) == ("queued", 2)
+    assert upstream.send_or_queue(src.state, src.name, 57, "second", f"{fp} still blocks", "high",
+                                  now=now) == ("duplicate", 0)
+    run_dir = _note_run(env, monkeypatch, src)
+    upstream.queue(run_dir, "second", f"{fp}: low again", "low")
+    got = upstream.send_queued(run_dir, src.name, 57, src.state)
+    assert got["duplicate"] == 1 and got["queued"] == 0, got
+    assert [n["severity"] for n in upstream._outbox(src.state)] == ["low", "high"]
+
+
 def test_a_confirmation_that_also_reports_a_problem_still_wakes_the_coordinator(env, monkeypatch):
     """Only the marker of a clean fix here closes a note: words alone never do, nor a marker of a note
     with no release fix, one resolved by another project, one closed as wontfix, or one the sender
