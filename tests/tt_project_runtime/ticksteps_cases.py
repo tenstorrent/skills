@@ -1443,11 +1443,12 @@ def test_a_git_write_in_an_attempt_drops_its_volatile_and_once_answers(tmp_path,
 def test_git_reflog_show_is_a_volatile_read_and_reflog_expire_or_delete_a_write(tmp_path, monkeypatch):
     """`git reflog` and `git reflog show` only read: in a strict round they never make its point of no
     return, are capped as reads and kept as volatile answers. `reflog expire` and `reflog delete` write."""
-    from ttp import gitmemo, gitreplay
+    from ttp import gitcache, gitmemo, gitreplay
     repo = tmp_path / "r"
     repo.mkdir()
     _git_out(repo, "init", "-q", "-b", "main")
     _git_out(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "c")
+    gitcache._system_config()  # its once-per-process lookup is not this test's spawn
     gitreplay.clear()
     spawns = _record_spawns(monkeypatch)
     assert gitmemo.is_read(("reflog",)) and gitmemo.is_read(("reflog", "show", "main"))
