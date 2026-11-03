@@ -502,6 +502,22 @@ def test_fence_freed_commands_take_only_executables_in_the_harness_bin(tmp_path)
     assert fencefree.patterns(freed) == ["my-ssh *", "MY_SSH_OPTS=* my-ssh *"]
 
 
+def test_fence_freed_commands_leave_out_loader_and_shell_startup_env_names(tmp_path):
+    """sandbox.fence_freed_commands: an env name that makes the freed command load or run other code
+    (the loader, a shell's start-up, an interpreter's search path) is left out with one line each;
+    the command and its other names stay freed."""
+    from ttp import fencefree
+    _harness_bin_tool(tmp_path, "my-ssh")
+    bad = ["PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_", "DYLD_INSERT_LIBRARIES", "BASH_ENV", "ENV", "SHELLOPTS",
+           "BASHOPTS", "IFS", "PYTHONPATH", "PYTHONSTARTUP", "PERLLIB", "RUBYOPT", "NODE_OPTIONS"]
+    freed, refused = fencefree.commands(tmp_path, [{"command": "my-ssh", "env": ["MY_SSH_OPTS", *bad, "LDFLAGS"]},
+                                                   {"command": "my-ssh", "env": "BASH_ENV"}])
+    assert freed == [("my-ssh", ("MY_SSH_OPTS", "LDFLAGS"))], freed
+    assert len(refused) == len(bad) + 1 and all(r.startswith("my-ssh: env ") for r in refused), refused
+    assert {r.split()[2] for r in refused} == set(bad)
+    assert fencefree.patterns(freed) == ["my-ssh *", "MY_SSH_OPTS=* my-ssh *", "LDFLAGS=* my-ssh *"]
+
+
 def test_fence_freed_commands_reach_the_sandbox_and_the_hook_of_a_fenced_worker(env, monkeypatch):
     from ttp.providers import claude
     monkeypatch.setattr(claude.Claude, "binary", lambda self: "/usr/bin/true")   # never a real agent

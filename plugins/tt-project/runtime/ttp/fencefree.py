@@ -5,9 +5,13 @@ them in project.json, never in those template-owned lines: a local edit there tu
 template changes them into a merge task.
 
 Each entry is a command name (`"my-ssh"`) or `{"command": "my-ssh", "env": ["MY_SSH_OPTS"]}`, which also
-frees `MY_SSH_OPTS=... my-ssh ...`. Only a name that is an executable file in the harness's bin/ counts
-(workers cannot write there): any other entry is left out, with one daemon log line saying why. Names the
-plugin ships there (ttp, git, gh) and shells or wrappers are refused: freeing one frees all it runs.
+adds the pattern `MY_SSH_OPTS=* my-ssh *`. CLI 2.1.296 frees no line that starts with an assignment
+(measured: neither `FOO=* my-ssh *` nor `FOO=x my-ssh *` freed `FOO=x my-ssh y`), though `*` matches
+across words (`my-ssh * end` freed `my-ssh a b end`). An env name that makes a command load or run other
+code (PATH, LD_*, BASH_ENV and the like: CODE_ENV) is left out of an entry. Only a name that is an
+executable file in the harness's bin/ counts (workers cannot write there): any other entry is left out,
+with one daemon log line saying why. Names the plugin ships there (ttp, git, gh) and shells or wrappers
+are refused: freeing one frees all it runs.
 The daemon reads the key at each worker start and passes the names to the hook (TTP_FENCE_FREED)."""
 from __future__ import annotations
 
@@ -24,6 +28,11 @@ VAR_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # (hook.SHELLS and hook.WRAPPERS).
 REFUSED = {"ttp", "git", "gh", "eval", "sh", "bash", "dash", "zsh", "ksh", "env", "nohup", "setsid", "nice",
            "exec", "command", "time", "stdbuf", "ionice", "timeout", "xargs", "sudo"}
+# Env names that make a command load or run other code (the loader, a shell's start-up, an interpreter's
+# search path or options): freeing `NAME=... cmd` for one would run that code outside the sandbox too.
+CODE_ENV = {"PATH", "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "IFS", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME",
+            "PERLLIB", "PERL5LIB", "PERL5OPT", "RUBYOPT", "RUBYLIB", "NODE_OPTIONS"}
+CODE_ENV_RE = re.compile(r"(?:LD|DYLD)_\w*")
 
 
 def commands(base: Path | str, value: Any) -> tuple[list[tuple[str, tuple[str, ...]]], list[str]]:
@@ -50,7 +59,9 @@ def commands(base: Path | str, value: Any) -> tuple[list[tuple[str, tuple[str, .
         elif not isinstance(env, list) or not all(isinstance(v, str) and VAR_RE.fullmatch(v) for v in env):
             refused.append(f"{shown}: env is not a list of variable names")
         else:
-            freed[name] = tuple(dict.fromkeys([*freed.get(name, ()), *env]))
+            code = [v for v in env if v in CODE_ENV or CODE_ENV_RE.fullmatch(v)]
+            refused += [f"{name}: env {v} makes it load or run other code (freeing it frees that code)" for v in code]
+            freed[name] = tuple(dict.fromkeys([*freed.get(name, ()), *(v for v in env if v not in code)]))
     return list(freed.items()), refused
 
 

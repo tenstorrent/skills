@@ -1929,7 +1929,10 @@ queues behind routine work; nothing running is interrupted:
   executable in its harness `bin/`, such as a script that wraps ssh) by name, as ssh is freed: the
   Claude sandbox runs `my-ssh ...` (also after `timeout N`) outside the fence as a simple command,
   and the hook refuses it beside `&&`, `;`, a pipe, a file redirect or a substitution. An entry
-  `{"command": "my-ssh", "env": ["VAR"]}` also adds the pattern `VAR=* my-ssh *`. A name that is
+  `{"command": "my-ssh", "env": ["VAR"]}` also adds the pattern `VAR=* my-ssh *` (Claude Code
+  2.1.296 frees no line that starts with an assignment, so it frees nothing there yet); an env name
+  that makes a command load or run other code (`PATH`, `LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`, `IFS`,
+  `PYTHONPATH`, `NODE_OPTIONS` and the like) is left out with a log line. A name that is
   not an executable file in the harness's `bin/`, or is a shell, a wrapper, `ttp`, `git` or `gh`, is
   left out with one daemon log line saying why. Set it here, never by editing the template's
   FENCE_FREED (hook.py) or FENCE_EXCLUDED (providers/claude.py): those edits make upgrades conflict.
