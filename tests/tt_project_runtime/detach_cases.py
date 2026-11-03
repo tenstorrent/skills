@@ -1703,3 +1703,75 @@ def test_a_detached_jobs_lock_is_kept_by_a_process_it_left_running_until_that_en
         os.kill(child, signal.SIGKILL)
     assert _until_true(lambda: locks.any_free([locks.job_lock(rc)])), "free once its last process ended"
     detach.reap_children()
+
+
+_PROXY_URL = "http://user:s3cr3t@127.0.0.1:41234"
+
+
+def test_sandbox_only_names_loopback_proxies_in_either_case_and_keeps_others():
+    from ttp import loopproxy
+    env = {"HTTPS_PROXY": _PROXY_URL, "https_proxy": "http://localhost:3128", "HTTP_PROXY": "127.8.9.10:80",
+           "http_proxy": "http://[::1]:3128/", "ALL_PROXY": "socks5h://LOCALHOST:1080",
+           "all_proxy": "http://[::ffff:127.0.0.1]:8080", "NO_PROXY": "127.0.0.1,localhost"}
+    assert sorted(loopproxy.sandbox_only(env)) == sorted(k for k in env if k != "NO_PROXY")
+    others = {"HTTPS_PROXY": "http://proxy.example.com:3128", "https_proxy": "http://127.0.0.1.example.com:1",
+              "HTTP_PROXY": "http://localhost.example.com:1", "http_proxy": "http://10.0.0.1:3128",
+              "ALL_PROXY": "http://user:127.0.0.1@proxy.example.com:1", "all_proxy": "",
+              "no_proxy": "localhost", "FTP_PROXY": _PROXY_URL}
+    assert loopproxy.sandbox_only(others) == []
+    assert loopproxy.sandbox_only({"HTTPS_PROXY": "http://[bad"}) == []
+
+
+def test_a_queued_job_leaves_loopback_proxies_out_and_never_logs_their_url(env, tmp_path, monkeypatch, capsys):
+    """A job queued from a sandboxed command starts at the daemon without the sandbox's loopback proxy
+    variables (upper and lower case), with the daemon's own proxy, a non-loopback one and NO_PROXY kept;
+    the URL appears in no output and no queue file. A record queued before the fix is cleaned too."""
+    from ttp import detach
+    p = make(env)
+    run_dir = p.runs / "proxy"
+    run_dir.mkdir(parents=True)
+    job = {"HTTPS_PROXY": _PROXY_URL, "https_proxy": _PROXY_URL, "ALL_PROXY": _PROXY_URL,
+           "http_proxy": "http://proxy.example.com:3128", "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "x"}
+    for k in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY",
+              "no_proxy"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("all_proxy", "http://daemon-proxy.example.com:1")
+    rcs = []
+    for name in ("new", "old"):
+        rc, out = run_dir / f"{name}.rc", run_dir / f"{name}.env"
+        q = detach.enqueue(p.state, rc, run_dir / f"{name}.log", ["sh", "-c", f"env >{out}"], str(tmp_path), job)
+        if name == "old":   # as queued before loopback proxies were dropped
+            m = json.loads(q.read_text())
+            m["env"] = {**m["env"], **job}
+            q.write_text(json.dumps(m))
+        else:
+            assert _PROXY_URL not in q.read_text()
+        rcs.append((rc, out))
+    err = capsys.readouterr().err
+    assert "HTTPS_PROXY" in err and "https_proxy" in err and "ALL_PROXY" in err
+    assert "127.0.0.1" not in err and "s3cr3t" not in err and "proxy.example.com" not in err
+    detach.tend(p)
+    for rc, out in rcs:
+        assert _wait_for_path(rc) and rc.read_text().strip() == "0"
+        got = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
+        assert not {"HTTPS_PROXY", "https_proxy", "ALL_PROXY"} & set(got)
+        assert got["http_proxy"] == "http://proxy.example.com:3128"
+        assert got["all_proxy"] == "http://daemon-proxy.example.com:1"
+        assert got["NO_PROXY"] == "127.0.0.1,localhost" and got["no_proxy"] == "x"
+    out = capsys.readouterr()
+    assert "s3cr3t" not in out.out + out.err
+
+
+def test_a_resumable_job_relaunched_by_the_daemon_leaves_loopback_proxies_out(env, tmp_path):
+    from ttp import detach
+    p = make(env)
+    run_dir = p.runs / "proxyresume"
+    run_dir.mkdir(parents=True)
+    rc, out = run_dir / "job.rc", run_dir / "job.env"
+    detach.save_resume(rc, run_dir / "job.log", ["sh", "-c", f"env >{out}"], str(tmp_path),
+                       {"HTTPS_PROXY": _PROXY_URL, "http_proxy": "http://proxy.example.com:3128"}, "boot-a")
+    assert _PROXY_URL not in detach.resume_file(rc).read_text()
+    why, pid = detach.relaunch(rc, "boot-b")
+    assert not why and pid > 1 and _wait_for_path(rc)
+    got = out.read_text()
+    assert "s3cr3t" not in got and "http_proxy=http://proxy.example.com:3128" in got

@@ -54,7 +54,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import locks, machines, shorttmp
+from . import locks, loopproxy, machines, shorttmp
 from .project import FOLDER, Project, durable_append, durable_write, nice_level, renice, write_json
 
 QUEUE = "detach-queue"   # under the project's state: <run>-<name>.json per job a sandboxed command queued
@@ -252,6 +252,9 @@ def enqueue(state: Path, rc: Path, log: Path, cmd: list, cwd: str, env: dict, *,
     rc = Path(rc)
     q = Path(state) / QUEUE / f"{rc.parent.name}-{rc.stem}.json"
     keep = _kept_env(env)
+    if dropped := loopproxy.sandbox_only(env):   # names only: a proxy URL may carry credentials
+        print(f"ttp detach: the queued job leaves out {', '.join(dropped)} (a loopback proxy of this "
+              f"sandbox; the daemon's own environment applies)", file=sys.stderr)
     rid = uuid.uuid4().hex
     with _locked(q.parent):
         write_json(q, {"rc": str(rc), "log": str(log), "command": cmd, "cwd": cwd, "env": keep, "id": rid,
@@ -261,7 +264,17 @@ def enqueue(state: Path, rc: Path, log: Path, cmd: list, cwd: str, env: dict, *,
 
 
 def _kept_env(env: dict) -> dict:
-    return {k: v for k, v in env.items() if k not in _SKIP_ENV and not _SECRET_ENV.search(k)}
+    """What a queued or resumable job keeps of `env`: no sandbox markers, secrets or loopback proxies
+    (loopproxy.sandbox_only: the sandbox's bridge, unreachable where the daemon starts the job; the
+    daemon's own environment supplies its proxies, if any)."""
+    drop = set(loopproxy.sandbox_only(env))
+    return {k: v for k, v in env.items() if k not in _SKIP_ENV and k not in drop and not _SECRET_ENV.search(k)}
+
+
+def _job_env(saved) -> dict:
+    """The daemon's environment with a queued or resume record's `env` over it, loopback proxies left
+    out of the record's (one written before _kept_env dropped them)."""
+    return machines.mask_devices({**os.environ, **_kept_env(saved if isinstance(saved, dict) else {})})
 
 
 def save_resume(rc: Path, log: Path, cmd: list, cwd: str, env: dict, boot: str) -> None:
@@ -308,7 +321,7 @@ def relaunch(rc: Path, boot: str, nice: int = 0) -> tuple[str, int]:
             write_json(resume_file(rc), {**m, "boot": boot, "cut_boot": m.get("boot"), "relaunches": n,
                                          "relaunched": time.time()}, mode=0o600)
         pid = start(rc, log, [str(c) for c in m["command"]], m["cwd"],
-                    machines.mask_devices({**os.environ, **(m.get("env") or {})}), lock)
+                    _job_env(m.get("env")), lock)
         # Before the lock goes: a daemon that dies after this still finds the job to stop
         # (running_pid; the wrapper's <name>.started covers the instant before).
         _restamp(rc, pid, boot)
@@ -756,7 +769,7 @@ def tend(p: Project) -> None:
                 lost(rc).unlink(missing_ok=True)
                 pid = _checks_start(Namespace(cmd=c["cmd"], fresh=c["fresh"], full=c.get("full", False),
                                               purpose=c.get("purpose")), rc.parent, c["worktree"],
-                                    c["head"], machines.mask_devices({**os.environ, **(m.get("env") or {})}), rid or "",
+                                    c["head"], _job_env(m.get("env")), rid or "",
                                     c.get("need") if isinstance(c.get("need"), int) else None)
                 renice(pid, nice_level(p.config().get("runner"))[0])
             except (OSError, ValueError, TypeError, KeyError) as e:
@@ -765,7 +778,7 @@ def tend(p: Project) -> None:
             lock = locks.try_take([locks.job_lock(rc)], f"detached job {rc.stem}", " ".join(m["command"]))
             if lock is not None:   # else it already runs
                 try:
-                    pid = start(rc, log, list(m["command"]), m["cwd"], machines.mask_devices({**os.environ, **(m.get("env") or {})}), lock)
+                    pid = start(rc, log, list(m["command"]), m["cwd"], _job_env(m.get("env")), lock)
                     renice(pid, nice_level(p.config().get("runner"))[0])
                 except (OSError, ValueError, TypeError) as e:   # its folder went, say: never retried each tick
                     why = f"the daemon could not start it: {e}"

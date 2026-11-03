@@ -21,6 +21,7 @@ from pathlib import Path
 
 PROXY_VARS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
               "FTP_PROXY", "ftp_proxy")
+JOB_PROXY_VARS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy")
 LOOPBACK = "127.0.0.1"
 SCRIPT = Path(__file__).with_name("loopproxy.sh")
 PREV_ENV = "TTP_PREV_CLAUDE_ENV_FILE"   # an inherited CLAUDE_ENV_FILE, sourced after the rewrite
@@ -49,6 +50,30 @@ def fixed(env: dict) -> dict[str, str]:
         if isinstance(v, str) and v and (new := loopback(v)) != v:
             out[k] = new
     return out
+
+
+def _loopback_host(value: str) -> bool:
+    """Whether the proxy URL (or bare host:port) `value` names a loopback host."""
+    import ipaddress
+    from urllib.parse import urlsplit
+    try:
+        host = (urlsplit(value if "://" in value else "http://" + value).hostname or "").lower()
+    except ValueError:
+        return False
+    if host in LOOPBACK_NAMES:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or bool(getattr(ip, "ipv4_mapped", None) and ip.ipv4_mapped.is_loopback)
+
+
+def sandbox_only(env: dict) -> list[str]:
+    """The proxy variables of `env` (HTTP(S)_PROXY, ALL_PROXY, either case) whose host is a loopback
+    address: in a sandboxed command that is the sandbox's own bridge, which a job the daemon starts
+    outside the sandbox cannot reach. Names only: the values may carry the proxy's credentials."""
+    return [k for k in JOB_PROXY_VARS if isinstance(env.get(k), str) and env[k] and _loopback_host(env[k])]
 
 
 def env_file(environ: dict) -> dict[str, str]:
