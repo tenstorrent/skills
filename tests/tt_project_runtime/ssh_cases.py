@@ -220,7 +220,7 @@ esac
 """
 
 
-def _fake_ssh_g(tmp_path, monkeypatch):
+def _fake_ssh_resolve(tmp_path, monkeypatch):
     bin_ = tmp_path / "fake-ssh-bin"
     bin_.mkdir()
     (bin_ / "ssh").write_text(_FAKE_SSH_G)
@@ -236,7 +236,7 @@ def test_machines_add_refuses_an_ssh_alias_that_resolves_nowhere_and_saves_a_def
     import socket
     from ttp import cli
     from ttp import machines as mm
-    _fake_ssh_g(tmp_path, monkeypatch)
+    _fake_ssh_resolve(tmp_path, monkeypatch)
     real = socket.getaddrinfo
     looked: list[str] = []
 
