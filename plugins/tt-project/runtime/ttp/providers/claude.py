@@ -566,6 +566,8 @@ def hook_settings() -> dict:
 # never one inside `&&`, `;` or a pipe, nor one a script runs. git starts ssh for an SSH remote, so its
 # network commands are freed by name too (measured: an excluded `git ls-remote git@host:...` resolved;
 # `X *` also frees a bare `X`; `git -C dir fetch` is not matched). The run's bin/git still runs them.
+# `ttp lock` is freed for its lock only: it runs a worker's command with no_new_privs and refuses sudo
+# and the like there (privlock.py); a privileged command goes through `ttp host-run`.
 FENCE_EXCLUDED = ("ssh *", "scp *", "sftp *", "rsync *", "ttp lock *", "ttp machines *", "ttp devq *",
                   "ttp detach --remote *", "git fetch *", "git pull *", "git push *", "git ls-remote *",
                   "git clone *", "git remote update *", "git submodule update *")

@@ -1463,3 +1463,96 @@ def test_lock_alternatives_take_an_unpaused_one_and_a_pause_of_all_says_held_by_
     r = subprocess.run([sys.executable, str(TTP), "lock", "box-a|box-b,box-c", "--", *touch], env=run_env,
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 2 and not ran.exists(), r
+
+
+# A worker's `ttp lock` is freed from the sandbox for the lock only (providers/claude.py FENCE_EXCLUDED):
+# a privileged command goes through `ttp host-run`'s allowlist, never around it (privlock.py).
+def _priv_stubs(tmp_path):
+    """A bin folder of sudo, su, doas, pkexec and ssh stand-ins, each appending its name and words to a log."""
+    bin_dir, log = tmp_path / "privbin", tmp_path / "priv.log"
+    bin_dir.mkdir()
+    for name in ("sudo", "su", "doas", "pkexec", "ssh"):
+        f = bin_dir / name
+        f.write_text(f'#!/bin/sh\necho "{name} $*" >> {shlex.quote(str(log))}\n')
+        f.chmod(0o755)
+    return bin_dir, log
+
+
+def test_worker_ttp_lock_refuses_a_privileged_command_and_points_to_host_run(env, tmp_path):
+    p = make(env)
+    bin_dir, log = _priv_stubs(tmp_path)
+    run_dir = p.base / "state" / "runs" / "9"
+    run_dir.mkdir(parents=True)
+    path = f"{bin_dir}:{os.environ['PATH']}"
+    worker = _lock_env(env, p, TTP_TASK="7", TTP_RUN_DIR=str(run_dir), PATH=path)
+    for cmd in (["sudo", "-n", "tt-smi", "-glx_reset"], [str(bin_dir / "sudo"), "true"], ["bash", "-c", "sudo true"],
+                ["sh", "-c", "echo a; doas true"], ["bash", "-lc", "x=$(pkexec id)"], ["sh", "-c", "eval su -c id"],
+                ["env", "A=1", "timeout", "-s", "KILL", "5", "nohup", "su", "-c", "id"], ["sh", "-c", "true\nsudo id"],
+                ["bash", "-c", "bash -c 'sudo id'"], ["--disruptive", "--", "sudo", "id"]):
+        r = subprocess.run([sys.executable, str(TTP), "lock", "rig", "--", *cmd], env=worker, capture_output=True,
+                           text=True, timeout=60)
+        assert r.returncode == 2 and "ttp host-run" in r.stderr, (cmd, r)
+        assert not log.exists() and _queue_len(p, "rig") == 0, cmd
+        assert _lock_probe(worker, "rig").returncode == 0, cmd
+    # A non-privileged command still runs under the lock, a remote sudo (the remote host's business)
+    # too, and so does `ttp host-run`, which the daemon checks against runner.host_commands.
+    out = tmp_path / "out"
+    r = subprocess.run([sys.executable, str(TTP), "lock", "rig", "--", "bash", "-c", f"echo ok > {out}; echo sudo"],
+                       env=worker, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and out.read_text() == "ok\n", r
+    r = subprocess.run([sys.executable, str(TTP), "lock", "rig", "--", "ssh", "box", "sudo -n tt-smi -s"],
+                       env=worker, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and log.read_text() == "ssh box sudo -n tt-smi -s\n", r
+    from ttp import privlock
+    assert privlock.refusal(["ttp", "host-run", "--", "sudo", "-n", "tt-smi", "-s"]) is None
+    # Outside a run (the user's own shell) the lock runs what it is given.
+    user = {k: v for k, v in _lock_env(env, p, PATH=path).items()
+            if k not in ("TTP_RUN_DIR", "TTP_RUN_ID", "TTP_NOTE_RUN_DIR")}
+    r = subprocess.run([sys.executable, str(TTP), "lock", "rig", "--", "sudo", "true"], env=user,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and log.read_text().splitlines()[-1] == "sudo true", r
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="no_new_privs is a Linux flag")
+def test_worker_ttp_lock_runs_its_command_without_new_privileges(env, tmp_path):
+    # Whatever route the command takes to a setuid program (a script, an interpreter), it gains nothing.
+    p = make(env)
+    run_dir = p.base / "state" / "runs" / "9"
+    run_dir.mkdir(parents=True)
+    worker = _lock_env(env, p, TTP_TASK="7", TTP_RUN_DIR=str(run_dir))
+    r = subprocess.run([sys.executable, str(TTP), "lock", "rig", "--", "grep", "^NoNewPrivs", "/proc/self/status"],
+                       env=worker, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and r.stdout.split() == ["NoNewPrivs:", "1"], r
+
+
+def test_privileged_finds_sudo_in_command_position_only():
+    from ttp import privlock
+    hits = {"sudo": [["sudo", "x"], ["/usr/bin/sudo", "x"], ["nice", "-n", "5", "sudo", "x"], ["xargs", "-I", "{}", "sudo", "x"],
+                     ["sh", "-c", "a && `sudo b`"], ["sh", "-c", "a | sudo tee f"], ["zsh", "-ec", "{ sudo x; }"],
+                     ["busybox", "sh", "-c", "sudo x"], ["sh", "-c", "if true; then sudo x; fi"], ["bash", "-c", "'sudo x"]],
+            "run0": [["run0", "x"]], "doas": [["stdbuf", "-oL", "doas", "x"]]}
+    for name, cases in hits.items():
+        for argv in cases:
+            assert privlock.privileged(argv) == name, argv
+    for argv in (["ssh", "h", "sudo x"], ["bash", "-c", "ssh h 'a; sudo b'"], ["sh", "-c", "echo sudo"],
+                 ["grep", "sudo", "f"], ["python3", "-c", "print(1)"], ["bash", "-c"], ["ttp", "host-run", "--", "sudo", "x"]):
+        assert privlock.privileged(argv) is None, argv
+    assert privlock.lock_command(["ttp", "lock", "--timeout", "5", "r", "--disruptive", "--", "sudo", "x"]) == ["sudo", "x"]
+    assert privlock.lock_command(["ttp", "lock", "a", "--", "ttp", "lock", "b", "--", "su"]) == ["su"]
+    assert privlock.lock_command(["ttp", "lock", "--probe", "r"]) is None
+
+
+def test_worker_hook_points_sudo_under_ttp_lock_to_host_run(env, monkeypatch, tmp_path):
+    from ttp import hook
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+
+    def why(cmd):
+        out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(tmp_path)})
+        return (out or {}).get("hookSpecificOutput", {}).get("permissionDecisionReason") or ""
+    for cmd in ("ttp lock r -- sudo tt-smi -glx_reset", "timeout 60 ttp lock r -- bash -c 'sudo x'",
+                "ttp lock --timeout 5 r --disruptive -- su -c y", "ttp lock a -- ttp lock b -- doas z",
+                "ttp lock r pkexec z"):
+        assert "ttp host-run" in why(cmd), cmd
+    for cmd in ("ttp lock r -- ssh box 'sudo -n tt-smi -s'", "ttp lock r -- ttp host-run -- sudo -n x",
+                "ttp lock --probe r", "ttp lock r -- make test"):
+        assert "host-run" not in why(cmd), cmd

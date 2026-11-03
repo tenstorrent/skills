@@ -811,6 +811,18 @@ def fenced_ssh(segments: list[list[str]], cmd: str) -> str | None:
         f"`bash wrapper.sh` stays fenced")
 
 
+def lock_privileged(cmd: str) -> str | None:
+    """Why a worker's `ttp lock <res> -- sudo ...` (or su, doas, pkexec, run0; also in a `sh -c` string) is
+    refused: `ttp lock` itself refuses it (privlock.py), and a privileged command goes through `ttp host-run`."""
+    from . import privlock
+    for seg in _segments(cmd, strip=False):
+        i = next((j for j, w in enumerate(seg) if os.path.basename(w) == "ttp" and seg[j + 1:j + 2] == ["lock"]), None)
+        inner = privlock.lock_command(seg[i:]) if i is not None else None
+        if inner and (why := privlock.refusal(inner)):
+            return why
+    return None
+
+
 # git's network commands the fence frees by name (FENCE_EXCLUDED); git runs ssh for an SSH remote.
 GIT_NET = {"fetch", "pull", "push", "ls-remote", "clone"}
 SSH_URL_RE = re.compile(r"^(?:(?:git\+)?ssh://|[\w.-]+@[\w.-]+:)")   # an argument: `HEAD:main` is a refspec
@@ -902,6 +914,8 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         why = git_push_bypass(segments)
     if not why:
         why = fenced_ssh(segments, commands) or fenced_git(segments, str(payload.get("cwd") or os.getcwd()))
+    if not why:
+        why = lock_privileged(cmd)
     if not why:
         from . import killguard
         why = killguard.refusal(cmd, str(payload.get("cwd") or os.getcwd()))
