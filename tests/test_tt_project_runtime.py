@@ -43169,9 +43169,33 @@ def test_deployed_names_a_pending_projects_own_blocker_not_an_older_releases_fai
     (h / ".git" / "MERGE_HEAD").write_text("fedcba9876543210fedcba9876543210fedcba98\n")
     old = time.time() - 2 * 86400
     os.utime(h / ".git" / "MERGE_HEAD", (old, old))
+    from ttp import harnesstree
+    mid = "files at 0.4.9: harness mid-merge (MERGE_HEAD fedcba987654, 2 d old)"
+    foreign = "once `git merge --abort` runs in its harness, owner: beta's coordinator"
+    # a merge nobody of ours started (no MERGE_MSG, or a hand-run one): every upgrade refuses it, so its
+    # coordinator owns it, alone and alongside a failure of the target release
+    for msg in (None, "Merge branch 'main' of somewhere\n"):
+        if msg:
+            (h / ".git" / "MERGE_MSG").write_text(msg)
+        for rec in ({}, {"key": "0.5.0 " + DEPLOY_C[:12], "to": "0.5.0", "outcome": "failed", "why": "x"}):
+            db.set_kv(release.KV_AUTO, rec)
+            beta = overview.deployed(names=["beta"])["projects"][0]
+            assert mid in beta["line"] and beta["line"].endswith(foreign), beta["line"]
+            assert "this project's daemon" not in beta["line"] and "`ttp upgrade" not in beta["line"], beta["line"]
+    # its own worktree landing: the daemon's sweep ends it
+    (h / ".git" / "MERGE_MSG").write_text(harnesstree.MERGE_MSG + " t12\n")
     beta = overview.deployed(names=["beta"])["projects"][0]
-    assert "files at 0.4.9: harness mid-merge (MERGE_HEAD fedcba987654, 2 d old)" in beta["line"], beta["line"]
+    assert mid in beta["line"], beta["line"]
+    assert beta["line"].endswith("when its harness worktree landing ends, owner: this project's daemon"), beta["line"]
+    # a `ttp upgrade` cut short mid-merge (a dead journal): the daemon rolls it back at its release check
+    (h / ".git" / "MERGE_MSG").write_text("Merge tag 'upstream'\n")
+    (base / "state" / "upgrade.journal").write_text(json.dumps(
+        {"pid": 2 ** 22 + 7, "boot": "another-boot", "step": "merging"}))
+    beta = overview.deployed(names=["beta"])["projects"][0]
+    assert mid in beta["line"], beta["line"]
     assert beta["line"].endswith("(its next release check), owner: this project's daemon"), beta["line"]
+    (base / "state" / "upgrade.journal").unlink()
+    db.set_kv(release.KV_AUTO, {})
     (h / ".git" / "MERGE_HEAD").unlink()
     # a failure of the target release still shows, owned by that project's coordinator
     for key in ("0.5.0 " + DEPLOY_C[:12], "0.5.0"):

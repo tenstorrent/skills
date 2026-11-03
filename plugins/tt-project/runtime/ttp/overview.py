@@ -323,10 +323,19 @@ def _behind(name: str, db: _RO, state: Path, files: str, now: float, where, targ
         rec = {}        # an older release's record is history: it does not explain this deploy
     if rec.get("outcome") == "running":     # its own try briefly leaves MERGE_HEAD in the live checkout
         return f"files at {files}: upgrading now", "this project's daemon", "when the upgrade ends"
-    mh = _merge_head(state.parent / "harness")
+    harness = state.parent / "harness"
+    mh = _merge_head(harness)
     if mh:              # an unfinished merge in the live checkout holds every release, whatever failed before
-        return (f"files at {files}: harness mid-merge (MERGE_HEAD {mh[0][:12]}, {_age(max(now - mh[1], 0))} old)",
-                "this project's daemon", next_check)
+        from types import SimpleNamespace
+        from . import harnesstree, upjournal
+        why = f"files at {files}: harness mid-merge (MERGE_HEAD {mh[0][:12]}, {_age(max(now - mh[1], 0))} old)"
+        if harnesstree.landing_merge(harness):      # its own landing: the daemon's sweep aborts it
+            return why, "this project's daemon", "when its harness worktree landing ends"
+        journal = upjournal.read(SimpleNamespace(state=state))
+        if journal is not None:     # a `ttp upgrade` mid-merge: it ends, or the daemon rolls a dead one back
+            return why, "this project's daemon", next_check if upjournal.dead(journal) else "when the upgrade ends"
+        # anyone else's merge: every upgrade refuses it until someone aborts it there
+        return why, f"{name}'s coordinator", "once `git merge --abort` runs in its harness"
     if rec.get("outcome") == "deferred":
         why = " ".join(str(rec.get("why") or "").split())[:160]
         return (f"files at {files}: merge deferred" + (f" ({why})" if why else ""), "this project's daemon",
