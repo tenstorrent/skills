@@ -305,7 +305,7 @@ def test_push_log_lines_and_push_output_never_follow_a_symlink(env, tmp_path, mo
     assert started and started[0].name == os.devnull
     assert target.read_text() == "keep me\n"
     texts = [r["text"] for r in proj.refused_appends()]
-    assert "a push line" in texts[0] and "starting the push process" in texts[1]
+    assert "a push line" in texts[0] and "check scratch:" in texts[1] and "starting the push process" in texts[2], texts
 
 
 def test_durable_write_never_follows_or_removes_a_symlink_planted_at_its_temp_name(tmp_path, monkeypatch):
