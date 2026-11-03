@@ -8903,7 +8903,6 @@ def _recover_setup() -> str:
 def _recover_setup_held() -> str:
     """_recover_setup's work, run under the setup lock (cmd_setup holds it already)."""
     from .project import HOME_DIR
-    from .release import point_current, runtime_version
     from .runner import boot_id, same_boot
     jr = HOME_DIR / "lib" / SETUP_JOURNAL
     try:
@@ -8920,6 +8919,26 @@ def _recover_setup_held() -> str:
             return ""       # it still runs, or may (another PID namespace): never roll back under it
     if rec:     # the recoverer from now on: a ttp too old to take the lock sees a live setup and skips
         durable_write(jr, json.dumps({**rec, "pid": os.getpid(), "boot": boot_id()}))
+    try:
+        what = _recover_setup_from(rec)
+    except BaseException:
+        # A failed copy (ENOSPC, a vanished source) must not leave this live process named: the next `ttp` retries.
+        if rec:
+            try:
+                durable_write(jr, json.dumps(rec))
+            except OSError:
+                pass
+        raise
+    jr.unlink(missing_ok=True)
+    line = f"an earlier `ttp setup` was cut short (a reboot?); {what}"
+    print(line, file=sys.stderr)
+    return line
+
+
+def _recover_setup_from(rec: dict) -> str:
+    """Finish or roll back the setup the journal `rec` describes; returns what it did."""
+    from .project import HOME_DIR
+    from .release import point_current, runtime_version
     lib, src = Path(rec.get("lib") or "/nonexistent"), Path(rec.get("source") or "/nonexistent")
     # The plugin folder updated meanwhile holds another version than the folder setup named: roll back.
     if lib.parent == HOME_DIR / "lib" and (src / "runtime" / "ttp").is_dir() and (src / "template").is_dir() \
@@ -8938,10 +8957,7 @@ def _recover_setup_held() -> str:
             shutil.rmtree(lib, ignore_errors=True)
         what = (f"rolled back to {prev.name}" if str(rec.get("prev") or "") else "rolled back") + \
             "; rerun `ttp setup` from the plugin"
-    jr.unlink(missing_ok=True)
-    line = f"an earlier `ttp setup` was cut short (a reboot?); {what}"
-    print(line, file=sys.stderr)
-    return line
+    return what
 
 
 def cmd_upgrade(a) -> None:

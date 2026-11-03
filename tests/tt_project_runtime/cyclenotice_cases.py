@@ -380,6 +380,38 @@ def test_two_concurrent_setup_recoveries_copy_once_and_the_recoverer_records_its
     assert cli._recover_setup() == "" and len(copies) == 1
 
 
+def test_a_failed_setup_recovery_restores_the_journal_so_the_next_ttp_retries_it(env, tmp_path):
+    """The recoverer names itself in the journal, then its copy (or its rollback) raises: the journal gets back
+    the dead setup's pid and boot, so a later `ttp` (another process, while this one lives on as a daemon)
+    retries instead of skipping a live pid. Both the finish and the rollback path."""
+    import errno
+    import shutil
+    from ttp import __version__, cli, release
+    from ttp.runner import boot_id
+    lib_dir = env["home"] / "lib"
+    lib = lib_dir / __version__
+    journal = lib_dir / cli.SETUP_JOURNAL
+    plugin = _plugin_copy(tmp_path)
+    old = lib_dir / "0.0.1"
+    (old / "runtime").mkdir(parents=True)
+    dead = _cn_exited_pid()
+    for source, patch, done in ((plugin, "_install_parts", "finished"), (tmp_path / "gone", "point_current", "rolled back")):
+        shutil.rmtree(lib, ignore_errors=True)
+        (lib / "runtime" / "ttp").mkdir(parents=True)
+        body = json.dumps({"pid": dead, "boot": boot_id(), "source": str(source), "lib": str(lib),
+                           "commit": "abc123", "existed": False, "prev": str(old)})
+        journal.write_text(body)
+
+        def boom(*_a, **_k):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(cli if patch == "_install_parts" else release, patch, boom)
+            with pytest.raises(OSError):
+                cli._recover_setup()
+        assert json.loads(journal.read_text()) == json.loads(body), "the dead setup's pid and boot are back"
+        assert done in cli._recover_setup() and not journal.exists()
+
+
 def test_setup_recovery_skips_while_another_process_holds_the_setup_lock(env, tmp_path):
     """`ttp setup` (or another recovery) in another process holds the lock: a `ttp` command neither copies
     nor rolls back, and the journal stays for the holder."""
