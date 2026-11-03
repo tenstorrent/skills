@@ -1800,6 +1800,8 @@ def test_every_checks_key_the_runtime_reads_is_an_account_key_and_settable(env):
     from ttp import cli, project, testslots
     src = "".join(f.read_text() for f in Path(project.__file__).parent.glob("*.py"))
     read = set(re.findall(r'["\']checks\.([a-z_]+)["\']', src))
+    # and the keys read as cfg.get("checks") or {}).get("<key>"), which name no 'checks.<key>' literal
+    read |= set(re.findall(r'get\("checks"\) or \{\}\)\.get\("([a-z_]+)"', src))
     for kind in (testslots.TESTS, testslots.BUILDS):
         read |= {kind.setting(s)[1] for s in ("pool", "run_max", "project_max")}
     read -= {"dropped", "json", "log", "out", "pid", "queued", "rc", "stalled"}   # file names (checks.json), not keys
@@ -1811,7 +1813,7 @@ def test_every_checks_key_the_runtime_reads_is_an_account_key_and_settable(env):
     missing = read - project.ACCOUNT_KEYS["checks"]
     assert not missing, f"checks keys read but not account keys: {sorted(missing)}"
     for k in ("test_project_max", "test_pool", "test_run_max", "build_pool", "build_run_max",
-              "build_project_max", "nice", "ionice"):
+              "build_project_max", "nice", "ionice", "starve_s"):
         cli.main(["config", "--account", f"checks.{k}", "idle" if k == "ionice" else "3"])
     assert testslots.project_max({"checks": {"test_project_max": 1}}) >= 1
 
@@ -6387,12 +6389,12 @@ def test_checks_waiter_past_the_starve_bound_goes_before_a_later_priority_one_ar
             monkeypatch.setenv(checkcap.STARVE_ENV, bad)
             assert checkcap.starve_s() == checkcap.STARVE_S
         monkeypatch.delenv(checkcap.STARVE_ENV)
-        monkeypatch.setattr(project, "load_account_settings", lambda: {"checks": {"starve_s": 900}})
+        project.set_account_setting("checks.starve_s", 900)   # the writer behind `ttp config --account`
         assert checkcap.starve_s() == 900.0, "the account's checks.starve_s"
         monkeypatch.setenv(checkcap.STARVE_ENV, "300")
         assert checkcap.starve_s() == 300.0, "the env wins over the account setting"
         monkeypatch.delenv(checkcap.STARVE_ENV)
-        monkeypatch.setattr(project, "load_account_settings", lambda: {"checks": {"starve_s": "x"}})
+        project.set_account_setting("checks.starve_s", "x")
         assert checkcap.starve_s() == checkcap.STARVE_S, "an unreadable account value is the default"
     finally:
         held.close()
