@@ -94,9 +94,9 @@ def entry(e) -> tuple[list[str], int | None, str]:
         if v is not None:
             if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v:
                 return [], None, f"timeout_s must be a number of seconds, not {json.dumps(v)}"
-            if v <= 0 or v > ENTRY_MAX_TIMEOUT_S:
+            if v < 1 or v > ENTRY_MAX_TIMEOUT_S:
                 return [], None, f"timeout_s {v:g} is outside 1..{ENTRY_MAX_TIMEOUT_S} s"
-            limit = max(1, int(v))
+            limit = int(v)
     if not isinstance(cmd, str):
         return [], None, "the command must be a string (or {\"cmd\": ..., \"timeout_s\": N})"
     try:
@@ -177,7 +177,8 @@ def _run(p: Project, rid: str, m: dict, ents: list[tuple[list[str], int | None]]
                 why, out = "ran", {"rc": 127, "stdout": "", "stderr": f"ttp host-run: could not start: {e}\n"}
             else:
                 if not (folder / f"{rid}.rc").exists():   # else it already ended (and dropped the claim)
-                    write_json(folder / f"{rid}.running", {**m, "pid": pid})
+                    from .runner import boot_id   # the boot tells a live pid from a reused one (live_detached)
+                    write_json(folder / f"{rid}.running", {**m, "pid": pid, "boot": boot_id()})
                 _log(p, m, None, "detached", 0)
                 claim = False
                 return
@@ -346,6 +347,37 @@ def _detached_started(folder: Path, rid: str) -> bool:
         return "pid" in json.loads((folder / f"{rid}.running").read_text())
     except (OSError, ValueError, AttributeError):
         return False
+
+
+def live_detached(p: Project) -> list[dict]:
+    """The detached runs still running on this host, as hostcycle.running_jobs lists jobs: what a reboot
+    would cut short (a power cycle midway). A claim counts while its supervisor's pid is alive on this boot,
+    it has no rc file and it is within its limit; a dead, earlier-boot or overdue one (status: lost) does not."""
+    from .runner import same_boot
+    folder, now, out = p.state / QUEUE, time.time(), []
+    for f in sorted(folder.glob("*.running")) if folder.is_dir() else []:
+        rid = f.name.split(".")[0]
+        try:
+            m = json.loads(f.read_text())
+            pid, limit = int(m["pid"]), float(m.get("limit") or MAX_TIMEOUT_S)
+            age = now - float(m.get("started") or f.stat().st_mtime)
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            continue   # no supervisor (yet), or not a claim
+        if not ID_RE.match(rid) or pid <= 0 or (folder / f"{rid}.rc").exists() or age > limit + QUEUE_WAIT_S \
+                or ("boot" in m and not same_boot(m["boot"])):
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            pass   # alive, another user's
+        argv = m.get("argv") if isinstance(m.get("argv"), list) else []
+        task = m.get("task")
+        out.append({"name": f"host-run {rid}", "run": m.get("run"),
+                    "task": int(task) if str(task or "").isdigit() else None, "rc": str(folder / f"{rid}.rc"),
+                    "log": str(folder / f"{rid}.out.json"), "command": shlex.join(map(str, argv))})
+    return out
 
 
 def status(p: Project, rid: str, result: bool = False) -> int:

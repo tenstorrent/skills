@@ -2185,7 +2185,7 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   limited by `runner.host_command_timeout_s` (default 120 s, at most 600 s), or
   `{"cmd": "<command>", "timeout_s": N}`, which gives that command its own limit of up to 3600 s,
   for example `{"cmd": "sudo -n /usr/local/sbin/power-cycle", "timeout_s": 1200}`. An entry whose
-  `timeout_s` is over 3600, zero or below, or not a number, or that is otherwise malformed, is
+  `timeout_s` is over 3600, below 1, or not a number, or that is otherwise malformed, is
   refused by `ttp config` and, when read, named in each refusal; it is never clamped. The longest
   matching entry sets the limit; `--timeout S` asks for less, and a longer ask is cut to the
   entry's limit with a note. A command that may run past about 9 minutes (a worker's tool call
@@ -2195,7 +2195,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   (output and exit code), then `<id>.rc`; both are kept for a day. `ttp host-run --status <id>` exits
   0 once it ended, 1 while it is queued or running, and 4 when it is unknown or lost (no answer
   past its limit, e.g. after a reboot), so it serves as a `retry_when`; `ttp host-run --result <id>`
-  prints its output and exits with its code. Every run goes to `state/host-run.jsonl`.
+  prints its output and exits with its code. A detached run still running counts as a detached job
+  for `ttp drain` (listed, waited for with `--jobs`, recorded as interrupted with `--reboot`), so a
+  planned host cycle does not cut it midway; a claim whose supervisor is gone, from an earlier boot
+  or past its limit does not. Every run goes to `state/host-run.jsonl`.
 - No `ttp` command prints a saved key. `ttp secret check [alias]` tests one (reachable, auth ok or
   auth failed), lists the model ids it serves and marks each `providers.<p>.tiers.*.model` of the
   current project it does not serve, with no key, URL or host in its output, and `ttp secret env <alias> -- <command>` gives it to a command in `OPENAI_API_KEY`

@@ -185,6 +185,8 @@ def test_host_run_plain_entry_keeps_the_600_s_cap_and_a_dict_entry_sets_its_own(
 @pytest.mark.parametrize("bad, says", [
     ({"cmd": "/bin/power-cycle", "timeout_s": 3601}, "outside 1..3600"),
     ({"cmd": "/bin/power-cycle", "timeout_s": 0}, "outside 1..3600"),
+    ({"cmd": "/bin/power-cycle", "timeout_s": 0.5}, "outside 1..3600"),
+    ({"cmd": "/bin/power-cycle", "timeout_s": 0.999}, "outside 1..3600"),
     ({"cmd": "/bin/power-cycle", "timeout_s": -5}, "outside 1..3600"),
     ({"cmd": "/bin/power-cycle", "timeout_s": "900"}, "must be a number"),
     ({"cmd": "/bin/power-cycle", "timeout_s": True}, "must be a number"),
@@ -231,6 +233,7 @@ def test_host_run_a_dict_entry_limit_above_600_s_is_honoured(env, monkeypatch, c
 
 def test_host_run_detached_writes_its_rc_file_survives_its_caller_and_polls_running_then_the_rc(env, monkeypatch, capfd, tmp_path):
     from ttp import hostrun
+    from ttp.runner import boot_id
     gate = tmp_path / "go"
     script = f"import os, time, sys\nwhile not os.path.exists({str(gate)!r}): time.sleep(0.05)\nprint('cycled'); sys.exit(5)"
     cmd = [sys.executable, "-c", script]
@@ -258,7 +261,7 @@ def test_host_run_detached_writes_its_rc_file_survives_its_caller_and_polls_runn
     rid = re.search(r"started ([0-9a-f]{32}) \(limit 900 s\)", caller.stdout).group(1)
     assert f"ttp host-run --status {rid}" in caller.stdout
     claim = json.loads((q / f"{rid}.running").read_text())
-    assert claim["limit"] == 900 and claim["pid"] != os.getpid()
+    assert claim["limit"] == 900 and claim["pid"] != os.getpid() and claim["boot"] == boot_id()
     assert hostrun.status(p, rid) == 1 and "is running" in capfd.readouterr().out
     assert hostrun.status(p, rid, result=True) == hostrun.NO_ANSWER
     capfd.readouterr()
@@ -300,6 +303,53 @@ def test_host_run_detached_run_keeps_its_entry_limit_and_a_lost_one_says_so(env,
     (q / f"{lost}.running").write_text(json.dumps({"limit": 5, "pid": 1, "started": time.time() - 300}))
     assert hostrun.status(p, lost) == hostrun.UNKNOWN and "lost" in capfd.readouterr().err
     assert hostrun.status(p, "../x") == hostrun.UNKNOWN
+
+
+def test_a_live_detached_host_run_holds_a_drain_and_a_stale_claim_does_not(env, monkeypatch, capsys):
+    # A planned host cycle must not reboot midway through a detached host-run (a power cycle): its live
+    # supervisor counts as a running job; a dead, earlier-boot, overdue or ended claim never holds it.
+    from ttp import cli, hostcycle, hostrun
+    from ttp.runner import boot_id
+    p = _hostrun_setup(env, monkeypatch, ["/bin/true"])
+    q = p.state / hostrun.QUEUE
+    q.mkdir(parents=True, exist_ok=True)
+    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    try:
+        now = time.time()
+        claim = {"argv": ["/bin/power-cycle"], "task": "7", "detach": True, "limit": 900, "boot": boot_id()}
+        rids = {k: secrets.token_hex(16) for k in ("live", "dead", "earlier", "overdue", "ended", "unstarted")}
+        stale = {"dead": {"pid": dead.pid, "started": now},
+                 "earlier": {"pid": live.pid, "started": now, "boot": "an-earlier-boot"},
+                 "overdue": {"pid": live.pid, "started": now - 900 - hostrun.QUEUE_WAIT_S - 5},
+                 "ended": {"pid": live.pid, "started": now}}
+        for k, extra in stale.items():
+            (q / f"{rids[k]}.running").write_text(json.dumps({**claim, **extra}))
+        (q / f"{rids['ended']}.rc").write_text("0\n")
+        (q / f"{rids['unstarted']}.running").write_text(json.dumps({**claim, "started": now}))   # no pid
+        cli.main(["drain", "demo", "--jobs", "--wait", "0.2"])
+        assert "drained" in capsys.readouterr().out, "a stale claim held the drain"
+        assert hostcycle.running_jobs(p) == []
+        (q / f"{rids['live']}.running").write_text(json.dumps({**claim, "pid": live.pid, "started": now}))
+        (job,) = hostcycle.running_jobs(p)
+        assert job["name"] == f"host-run {rids['live']}" and job["task"] == 7 and job["command"] == "/bin/power-cycle"
+        with pytest.raises(SystemExit) as e:
+            cli.main(["drain", "demo", "--jobs", "--wait", "0.2"])
+        err = capsys.readouterr().err
+        assert e.value.code == 1 and "not drained" in err and "1 detached job(s)" in err and rids["live"] in err, err
+        # A plain drain names it as a job a reboot would end; a --reboot drain records it as interrupted.
+        cli.main(["drain", "demo", "--reboot", "a planned power cycle"])
+        (f,) = (p.state / hostcycle.FOLDER).glob("*/record.json")
+        assert [j["name"] for j in json.loads(f.read_text())["interrupted"]] == [f"host-run {rids['live']}"]
+        capsys.readouterr()
+        live.kill()
+        live.wait()
+        cli.main(["drain", "demo", "--jobs", "--wait", "0.2"])
+        assert "drained" in capsys.readouterr().out, "a claim whose supervisor died still held the drain"
+    finally:
+        live.kill()
+        live.wait()
 
 
 def test_host_run_cli_detach_status_and_timeout_flags(env, monkeypatch, capfd):

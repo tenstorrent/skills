@@ -90,8 +90,10 @@ def planned(p: Project | None, boot: str | None, boot_at: float | None) -> dict 
 
 
 def running_jobs(p: Project, days: float = 7) -> list[dict]:
-    """The project's `ttp detach` jobs still running (or queued for the daemon) on this boot: what a
-    reboot of this host would end. A job driven by `ttp detach --remote` lives on the other host."""
+    """The project's `ttp detach` jobs still running (or queued for the daemon) on this boot, and its live
+    `ttp host-run --detach` runs (hostrun.live_detached): what a reboot of this host would end. A job driven
+    by `ttp detach --remote` lives on the other host."""
+    from . import hostrun
     from .detach import state
     from .runner import boot_ids
     boots = set(boot_ids())
@@ -108,7 +110,7 @@ def running_jobs(p: Project, days: float = 7) -> list[dict]:
             if state(Path(j["rc"]))[0] in ("running", "queued"):
                 out.append({"name": j.get("name"), "run": r["id"], "task": r["task"], "rc": j["rc"],
                             "log": j.get("log"), "command": j.get("command")})
-    return out
+    return out + hostrun.live_detached(p)
 
 
 def record(p: Project, reason: str, left_running: list[dict], jobs: list[dict], intent: int | None = None,
