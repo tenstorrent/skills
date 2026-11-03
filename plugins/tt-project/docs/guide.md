@@ -581,6 +581,11 @@ prolonged whole-box outage.
   `waiting.lane_wait_event_s` (600; 0: never) raises one `lane_wait` event naming both tasks, the
   holder's status and the hours so far; it clears once the task starts. Waits on anything else (a
   secret, a sign-in, a cadence) raise none.
+- Spec-wake hold (model-free): after a spec wake (an urgent task's spec change or a `wake_now`)
+  whose run hands back the same wait (`waiting_for`, `retry_when`, branch head), later spec wakes
+  of that task sleep on its `retry_when` for `waiting.spec_wake_hold_s` (7200, 2 hours; 0: off) or
+  until its own retry time, and its row says until when. Its probe, its timer, a changed wait and
+  every other wake still wake it. Urgent spec wakes within 5 minutes of the last one share one wake.
 - Provider failover (model-free): a queued, deferred or waiting task whose provider cannot start
   new work (logged out, a limit pause, or a red gate such as a plan window at the line) for longer
   than `coordinator.provider_failover_after_h` (4; 0 turns it off) moves to the first usable

@@ -172,8 +172,9 @@ read the one for the lever you change.
   `urgent:` line) or a `task_update` with `wake_now: true` wakes once at once, unless another hold
   (a dependency, start_after, start_when, a paused or busy resource, a gate) still holds it. No
   watcher or extra wake task. `wake_now` may name a tier (`light`/`standard`/`deep`, capped at the
-  task's own); requests before the run starts, or within 30 minutes of the last spec wake, share one
-  wake at the highest tier asked (an urgent task wakes at once).
+  task's own); requests before the run starts, or within 30 minutes of the last spec wake (5 for an
+  urgent task), share one wake at the highest tier asked. A spec wake whose run hands back the same
+  wait holds later spec wakes for `waiting.spec_wake_hold_s` (2 h) or until its retry time.
 - See "Liveness, progress and deploys" in `docs/design.md`.
 
 ## Stored secrets never reach tool output

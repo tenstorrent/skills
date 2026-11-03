@@ -305,7 +305,8 @@ ESCALATIONS_PER_RUN = 2
 ESCALATE_READ_MAX = 1 << 16       # bytes of ESCALATE_FILE read; lines past it count as nothing
 # What a waiting hand-off keeps across a run the account refused (limit, auth).
 WAIT_KEYS = ("retry_when", "retry_after_s", "waiting_for", "wake_tier", "next_step", "survives_reboot", "waits",
-             "waiting_since", "stale_wakes", "wait_key", "on_pass_cmd", refwaits.FACTS_KEY, "spec_seen", "spec_wakes")
+             "waiting_since", "stale_wakes", "wait_key", "on_pass_cmd", refwaits.FACTS_KEY, "spec_seen", "spec_wakes",
+             "spec_hold")
 MAX_FOLLOWUPS, FOLLOWUP_SPEC_CHARS = 12, 4000   # per hand-off; each follow-up is its own event
 # What a review the daemon queues repeats of the code task's spec and hand-off.
 AUTO_REVIEW_SPEC_CHARS, AUTO_REVIEW_SUMMARY_CHARS = 2000, 1000
@@ -432,10 +433,17 @@ HARNESS_HEAD_S = 10
 # once (Daemon._spec_wake). The hand-off keeps the spec's digest it slept on (SPEC_SEEN_KEY) and its recent
 # at-once wakes (SPEC_WAKES_KEY), at most SPEC_WAKES_PER_H an hour (a loop guard). A wake_now within
 # SPEC_WAKE_COALESCE_S of the last such wake waits for that window to end, so the updates in it share one
-# wake; an urgent task does not wait.
+# wake; an urgent task waits the shorter SPEC_WAKE_URGENT_COALESCE_S. A spec wake (SPEC_WOKE_KEY: when) whose
+# run hands back the same wait (wait key and branch head) changed nothing: its hand-off keeps SPEC_HOLD_KEY
+# ({"until", "key"}), and further spec wakes of the task sleep on its retry_when until then
+# (waiting.spec_wake_hold_s, SPEC_WAKE_HOLD_S by default; 0: off). Its probe, timer and every other wake
+# still wake it. Such a wake does not count harder against SPEC_WAKES_PER_H: the hold already keeps the
+# next spec wake out for longer than the cap's hour, so weighting it again would only double count.
 SPEC_SEEN_KEY, SPEC_WAKES_KEY, SPEC_WAKES_PER_H = "spec_seen", "spec_wakes", 3
 SPEC_WAKE_NOW_KEY = "wake_now"
 SPEC_WAKE_COALESCE_S = 1800
+SPEC_WAKE_URGENT_COALESCE_S = 300
+SPEC_WOKE_KEY, SPEC_HOLD_KEY, SPEC_WAKE_HOLD_S = "spec_woke", "spec_hold", 7200
 # Why a spec change woke a task. The wake runs at the task's own tier, not as a light check of its wait: a
 # light wake whose wait was over handed off the old work as done without the change.
 SPEC_WOKE = ("its spec changed: act on what the change adds (the spec's latest `## Update`) before you hand "
@@ -1057,6 +1065,7 @@ class Daemon:
         self._spec_capped: set[int] = set()   # tasks whose spec-change wake the loop guard holds (logged once)
         self._spec_deferred: set[int] = set()   # tasks whose spec change sleeps until their wait ends (logged once)
         self._spec_coalesced: set[int] = set()   # tasks whose wake_now waits for the coalesce window (logged once)
+        self._spec_held: set[int] = set()   # tasks whose spec wakes a same-wait hand-back holds (logged once)
         self._wait_what_errs: set[str] = set()   # causes of lock-probe errors already logged (_wait_what)
         self._fence_freed_said: set[str] = set()   # sandbox.fence_freed_commands entries left out, logged
         # Exclusive slot reservations (_slot_reservations): canonical lock -> {"task", "holder", "free_since"},
@@ -4988,6 +4997,10 @@ class Daemon:
                 # An update the run never read keeps the spec it started on, so its next run gets that change.
                 extra[SPEC_SEEN_KEY] = missed["started"] if missed else spec_digest(self.p.db.task(task["id"]) or task)
                 extra[SPEC_WAKES_KEY] = _recent_spec_wakes(prev_res, time.time())
+                hold_s = float((self.cfg.get("waiting") or {}).get("spec_wake_hold_s", SPEC_WAKE_HOLD_S) or 0)
+                if hold := _spec_hold_after(prev_res, key, hold_s, not_before):
+                    extra[SPEC_HOLD_KEY] = hold
+                    reason = f"{reason}; {_spec_hold_text(hold, self.p)}"
         if missed and new in ("done", "review"):
             # The spec changed during the run and the update carrying it stayed unread: the hand-off is
             # not accepted, the task runs again now with the change (its next run starts on that spec).
@@ -5156,6 +5169,7 @@ class Daemon:
              **({k: v for k, v in result.items()
                  if k not in ("summary", "waits", "waiting_since", "woke", "reboot_wakes", "escalated_wake",
                               "stale_wakes", "wait_key", SPEC_SEEN_KEY, SPEC_WAKES_KEY, SPEC_WAKE_NOW_KEY,
+                              SPEC_WOKE_KEY, SPEC_HOLD_KEY,
                               handoffcheck.KEY, ROOT_WAKE_KEY)}
                 if isinstance(result, dict) else {})})}
         if reason:
@@ -11383,8 +11397,10 @@ class Daemon:
         once and a re-sleep on that spec stays asleep. Another hold keeps it asleep with the old digest
         (_spec_wake_hold): it wakes once that hold is over, if the probe has not woken it first. At most
         SPEC_WAKES_PER_H an hour. A wake_now wakes at the tier it asked (bud.wake_now_tier: never above the
-        task's own); within SPEC_WAKE_COALESCE_S of the last spec wake it waits for that window to end
-        unless urgent, and the requests that came meanwhile wake once. True when it woke."""
+        task's own); within SPEC_WAKE_COALESCE_S of the last spec wake (SPEC_WAKE_URGENT_COALESCE_S when
+        urgent) it waits for that window to end, and the requests that came meanwhile wake once. After a
+        spec wake whose run handed back the same wait (SPEC_HOLD_KEY) it sleeps on until that hold ends,
+        noted on its row; only an urgent wake_now on a changed wait key goes past it. True when it woke."""
         from .prompts import spec_digest
         seen, sha, tid = prev.get(SPEC_SEEN_KEY), spec_digest(t), t["id"]
         asked = prev.get(SPEC_WAKE_NOW_KEY)
@@ -11394,11 +11410,23 @@ class Daemon:
         if not isinstance(seen, str) and not asked:   # a hand-off from before the digest: this spec is its baseline
             self.p.db.update_task(tid, result=dump_result({**prev, SPEC_SEEN_KEY: sha}))
             return False
-        if not asked and not urgent.is_urgent(t):
+        hurry = urgent.is_urgent(t)
+        if not asked and not hurry:
             if tid not in self._spec_deferred:
                 self._spec_deferred.add(tid)
                 log(self.p, f"task {tid}: its spec changed; it sleeps on its retry_when and runs with the "
                             f"change at its own tier when its wait ends")
+            return False
+        hold = prev.get(SPEC_HOLD_KEY)
+        if isinstance(hold, dict) and isinstance(hold.get("until"), (int, float)) and now < hold["until"] \
+                and not (hurry and asked and _wait_key(prev) != hold.get("key")):
+            if tid not in self._spec_held:
+                self._spec_held.add(tid)
+                log(self.p, f"task {tid}: its last spec wake handed back the same wait; this one sleeps on its "
+                            f"retry_when until {timefmt.short(hold['until'], self.p)}")
+            said = _spec_hold_text(hold, self.p)
+            if said not in (t["blocked_reason"] or ""):
+                self.p.db.update_task(tid, blocked_reason=f"{t['blocked_reason'] or 'waiting'}; {said}"[:500])
             return False
         wakes = _recent_spec_wakes(prev, now)
         if len(wakes) >= SPEC_WAKES_PER_H:
@@ -11407,11 +11435,12 @@ class Daemon:
                 log(self.p, f"task {tid}: its spec changed, but it woke {len(wakes)} times in the last hour "
                             f"on spec changes; it sleeps on its retry_when until that falls under {SPEC_WAKES_PER_H}")
             return False
-        if asked and wakes and now - max(wakes) < SPEC_WAKE_COALESCE_S and not urgent.is_urgent(t):
+        window = SPEC_WAKE_URGENT_COALESCE_S if hurry else SPEC_WAKE_COALESCE_S
+        if wakes and now - max(wakes) < window:
             if tid not in self._spec_coalesced:
                 self._spec_coalesced.add(tid)
-                log(self.p, f"task {tid}: wake_now came within {SPEC_WAKE_COALESCE_S // 60} min of its last spec "
-                            f"wake; it wakes once that window ends, with every update since")
+                log(self.p, f"task {tid}: {'an urgent spec wake' if hurry else 'wake_now'} came within "
+                            f"{window // 60} min of its last spec wake; it wakes once that window ends, with every update since")
             return False
         try:
             held = self._spec_wake_hold(t, probe, now)
@@ -11422,9 +11451,10 @@ class Daemon:
         self._spec_capped.discard(tid)
         self._spec_deferred.discard(tid)
         self._spec_coalesced.discard(tid)
+        self._spec_held.discard(tid)
         tier = bud.wake_now_tier(asked, _own_tier(t)) if asked else _own_tier(t)
         self._wake_waiting(t, SPEC_WOKE if seen != sha else "a task_update asked to wake it now", now, extra={SPEC_SEEN_KEY: sha, SPEC_WAKES_KEY: wakes + [now],
-                                                     "wake_tier": tier, "escalated_wake": True})
+                                                     SPEC_WOKE_KEY: now, "wake_tier": tier, "escalated_wake": True})
         self.p.db.update_task(tid, blocked_reason=f"woken: {'its spec changed' if seen != sha else 'wake_now'}"
                                                   f"; it runs by rank, before its probe passes")
         return True
@@ -15739,6 +15769,24 @@ def _recent_spec_wakes(prev: dict, now: float) -> list[float]:
     """The times of a waiting task's spec-change wakes within the last hour (Daemon._spec_wake)."""
     got = prev.get(SPEC_WAKES_KEY)
     return [x for x in got if isinstance(x, (int, float)) and 0 <= now - x < 3600] if isinstance(got, list) else []
+
+
+def _spec_hold_after(prev: dict, key: dict, hold_s: float, not_before: float) -> dict | None:
+    """The spec-wake hold (SPEC_HOLD_KEY) a waiting hand-off keeps, or None: only when the run was a spec
+    wake (`prev`, the result it woke from, has SPEC_WOKE_KEY) and hands back the wait (`key`: wait key and
+    branch head) it slept on before that wake. It ends after `hold_s`, or at the hand-off's own retry
+    time (`not_before`) if sooner."""
+    if not hold_s or not isinstance(prev, dict) or not isinstance(prev.get(SPEC_WOKE_KEY), (int, float)):
+        return None
+    before = prev.get("wait_key")
+    if not isinstance(before, dict) or before.get("key") != key.get("key") or before.get("head") != key.get("head"):
+        return None
+    return {"until": min(time.time() + hold_s, not_before), "key": key.get("key")}
+
+
+def _spec_hold_text(hold: dict, p) -> str:
+    """The row note of a spec-wake hold (Daemon._spec_wake), so the coordinator sees why it sleeps."""
+    return f"spec wakes held until {timefmt.short(hold['until'], p)}: its last spec wake handed back the same wait"
 
 
 def _same_probe(full: dict, prev: dict, key: str = "retry_when") -> bool:

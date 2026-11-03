@@ -552,8 +552,14 @@ def test_a_wake_now_inside_the_coalesce_window_waits_for_it_to_end(env, monkeypa
     assert "wake_now" not in res and "edit 2" in t["spec"] and "edit 3" in t["spec"]
 
 
-def test_an_urgent_or_p1_wake_now_skips_the_coalesce_window_but_not_the_hourly_guard(env, monkeypatch):
+def _age_spec_wakes(p, tid, by):
+    res = json.loads(p.db.task(tid)["result"])
+    p.db.update_task(tid, result=json.dumps({**res, "spec_wakes": [x - by for x in res.get("spec_wakes", [])]}))
+
+
+def test_an_urgent_or_p1_wake_now_takes_the_short_coalesce_window_and_the_hourly_guard(env, monkeypatch):
     from ttp import daemon as dmod
+    assert dmod.SPEC_WAKE_URGENT_COALESCE_S < dmod.SPEC_WAKE_COALESCE_S
     for how in ("urgent line", "priority 1"):
         p = make(env)
         tid = _spec_sleeper(p)
@@ -564,6 +570,132 @@ def test_an_urgent_or_p1_wake_now_skips_the_coalesce_window_but_not_the_hourly_g
             spec = f"urgent: edit {i}" if how == "urgent line" else f"edit {i}"
             _update(p, tid, spec=spec, wake_now=True)
             d.probe_waiting()
+            if i:   # inside the short window it waits; just past it (still inside the normal one) it wakes
+                assert _asleep(p, tid), (how, i, "an urgent spec wake skipped the coalesce window")
+                _age_spec_wakes(p, tid, dmod.SPEC_WAKE_URGENT_COALESCE_S + 1)
+                d.probe_waiting()
             assert (not _asleep(p, tid)) == (i < dmod.SPEC_WAKES_PER_H), (how, i)
             _sleep_again(p, tid)
         assert len(json.loads(p.db.task(tid)["result"])["spec_wakes"]) == dmod.SPEC_WAKES_PER_H, how
+
+
+def test_urgent_spec_changes_without_wake_now_coalesce_too(env, monkeypatch):
+    from ttp import daemon as dmod
+    p = make(env)
+    tid = _spec_sleeper(p)
+    p.db.update_task(tid, priority=1)
+    d = _spec_daemon(p, monkeypatch)
+    _edit_spec(p, tid, "edit 1", wake_now=False)
+    d.probe_waiting()
+    assert not _asleep(p, tid)
+    _sleep_again(p, tid)
+    _edit_spec(p, tid, "edit 2", wake_now=False)
+    d.probe_waiting()
+    assert _asleep(p, tid), "a second urgent spec change inside the window woke it again"
+    _age_spec_wakes(p, tid, dmod.SPEC_WAKE_URGENT_COALESCE_S + 1)
+    d.probe_waiting()
+    assert not _asleep(p, tid)
+
+
+def _spec_wake_flow(p, monkeypatch, tmp_path, second=None):
+    """A task that ran once and handed off waiting on a file, then was woken by a wake_now spec update
+    and ran again, handing back `second` (default: the same wait). Returns (daemon, tid, flag, runs, idle)."""
+    from ttp import daemon as dmod
+    d, tid, flag, runs, idle = _deferred_flow(p, monkeypatch, tmp_path)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 3600)   # its probe ran; ticks here only check the spec
+    if second is not None:
+        monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps(second))
+    _edit_spec(p, tid, "also report the peak memory")
+    assert _run_until(d, p, lambda: runs() == 2 and idle()), "the wake_now did not start a run"
+    # Past the coalesce window, so only the spec-wake hold can keep the next wake out.
+    _age_spec_wakes(p, tid, dmod.SPEC_WAKE_COALESCE_S + 1)
+    return d, tid, flag, runs, idle
+
+
+def test_a_spec_wake_that_hands_back_the_same_wait_holds_the_next_spec_wakes_until_the_hold_ends(env, monkeypatch, tmp_path):
+    from ttp import daemon as dmod
+    p = make(env)
+    d, tid, flag, runs, idle = _spec_wake_flow(p, monkeypatch, tmp_path)
+    res = json.loads(p.db.task(tid)["result"])
+    hold = res["spec_hold"]
+    assert 0 < hold["until"] - time.time() <= dmod.SPEC_WAKE_HOLD_S and hold["key"] == res["wait_key"]["key"], res
+    assert "spec_woke" not in res, "the spec-wake mark outlived the run it marked"
+    assert "spec wakes held until" in p.db.task(tid)["blocked_reason"]
+    for text in ("and the wall time", "and the disk use"):
+        _edit_spec(p, tid, text)
+        for _ in range(3):
+            d.tick()
+            time.sleep(0.05)
+        assert runs() == 2 and idle(), "a spec wake inside the hold started a run"
+    t = p.db.task(tid)
+    assert t["blocked_reason"].count("spec wakes held until") == 1, t["blocked_reason"]
+    assert json.loads(t["result"])["wake_now"], "the held wake_now was dropped, not kept for the hold's end"
+    # The hold ends: the held wake_now wakes it once, with every update since.
+    res = json.loads(t["result"])
+    p.db.update_task(tid, result=json.dumps({**res, "spec_hold": {**res["spec_hold"], "until": time.time() - 1}}))
+    assert _run_until(d, p, lambda: runs() == 3), "the wake_now held through the hold did not wake it after"
+
+
+def test_a_spec_wake_that_hands_back_a_different_wait_holds_nothing(env, monkeypatch, tmp_path):
+    p = make(env)
+    # A worker cannot write the hold, or the mark that its run was a spec wake, itself.
+    other = {"status": "waiting", "summary": "job queued", "waiting_for": "the job's second stage",
+             "retry_after_s": 3600, "retry_when": f"test -e {tmp_path / 'stage-two'}",
+             "spec_woke": time.time(), "spec_hold": {"until": time.time() + 7200, "key": "forged"}}
+    d, tid, flag, runs, idle = _spec_wake_flow(p, monkeypatch, tmp_path, second=other)
+    assert "spec_hold" not in json.loads(p.db.task(tid)["result"])
+    _edit_spec(p, tid, "and the wall time")
+    assert _run_until(d, p, lambda: runs() == 3), "a changed wait kept the next spec wake out"
+
+
+def test_the_spec_wake_hold_leaves_the_tasks_own_retry_when_wake_alone(env, monkeypatch, tmp_path):
+    from ttp import daemon as dmod
+    p = make(env)
+    d, tid, flag, runs, idle = _spec_wake_flow(p, monkeypatch, tmp_path)
+    assert json.loads(p.db.task(tid)["result"])["spec_hold"]
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    flag.write_text("")
+    assert _run_until(d, p, lambda: runs() == 3), "the hold kept its own probe pass from waking it"
+
+
+def test_the_spec_wake_hold_is_a_setting_and_zero_turns_it_off(env, monkeypatch, tmp_path):
+    from ttp import project as proj
+    p = make(env)
+    assert proj.DEFAULT_CONFIG["waiting"]["spec_wake_hold_s"] == 7200
+    p.set_config("waiting.spec_wake_hold_s", 0)
+    d, tid, flag, runs, idle = _spec_wake_flow(p, monkeypatch, tmp_path)
+    assert "spec_hold" not in json.loads(p.db.task(tid)["result"])
+
+
+def test_an_urgent_wake_now_on_a_changed_wait_goes_past_the_spec_wake_hold(env, monkeypatch):
+    from ttp import daemon as dmod
+    for urgent_, changed, wakes, hold in ((False, False, False, None), (False, True, False, None),
+                                          (True, False, False, None), (True, True, True, None),
+                                          (False, False, True, "garbled"), (False, False, True, {"until": "soon"}),
+                                          (False, False, True, {"until": time.time() - 1})):
+        p = make(env)
+        tid = _spec_sleeper(p)
+        if urgent_:
+            p.db.update_task(tid, priority=1)
+        res = json.loads(p.db.task(tid)["result"])
+        key = dmod._wait_key(res)
+        res["spec_hold"] = hold or {"until": time.time() + 3600, "key": key if not changed else "0" * 16}
+        p.db.update_task(tid, result=json.dumps(res))
+        _update(p, tid, spec="also report the peak memory", wake_now=True)
+        _spec_daemon(p, monkeypatch).probe_waiting()
+        assert (not _asleep(p, tid)) == wakes, (urgent_, changed, hold)
+
+
+def test_spec_hold_after_needs_a_spec_wake_and_the_same_wait_and_head():
+    from ttp import daemon as dmod
+    key = {"key": "k1", "head": "h1"}
+    woke = {"spec_woke": time.time() - 60, "wait_key": dict(key)}
+    nb = time.time() + 99999
+    assert dmod._spec_hold_after(woke, key, 7200, nb)["key"] == "k1"
+    assert dmod._spec_hold_after({**woke, "spec_woke": None}, key, 7200, nb) is None, "not a spec wake"
+    assert dmod._spec_hold_after(woke, {**key, "key": "k2"}, 7200, nb) is None, "a changed wait"
+    assert dmod._spec_hold_after(woke, {**key, "head": "h2"}, 7200, nb) is None, "a new commit"
+    assert dmod._spec_hold_after({**woke, "wait_key": None}, key, 7200, nb) is None, "no wait before"
+    assert dmod._spec_hold_after(woke, key, 0, nb) is None, "off"
+    soon = time.time() + 600
+    assert dmod._spec_hold_after(woke, key, 7200, soon)["until"] == soon, "its own retry time ends it first"

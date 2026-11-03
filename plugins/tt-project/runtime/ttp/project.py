@@ -134,6 +134,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 # this long raises one lane_wait event (lanewait.py; 0: never)
                 "lane_wait_event_s": 600,
                 "max_stale_wakes": 3,           # max_stale_wakes: 0 = off
+                # after a spec wake (urgent or wake_now) whose run hands back the same wait, later spec
+                # wakes of that task sleep on its retry_when this long (Daemon._spec_wake; 0: off)
+                "spec_wake_hold_s": 7200,
                 # the wait-wake gate (waitgate.py): a due wake of a waiting task first checks model-free
                 # rules (job, lock, checks or push still pending; same probe answer) then Jev, and re-defers
                 # with a doubling backoff instead of a model turn that would only hand the wait back. Any

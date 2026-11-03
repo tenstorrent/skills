@@ -80,7 +80,13 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    such wakes an hour wake one task. `wake_now` may name a tier (`light`, `standard`, `deep`): the
    wake runs at it, never above the task's own (`true`: its own). Requests before the wake run
    starts make one wake at the highest tier asked, and a `wake_now` within 30 minutes of the last
-   spec wake waits for that window to end (SPEC_WAKE_COALESCE_S) unless the task is urgent.
+   spec wake waits for that window to end (SPEC_WAKE_COALESCE_S; 5 minutes when the task is urgent).
+   A spec wake whose run hands back the same wait (`waiting_for`, `retry_when`, branch head)
+   changed nothing: later spec wakes of that task sleep on its `retry_when` for
+   `waiting.spec_wake_hold_s` (default 7200, 2 hours; 0: off) or until its own retry time, and its
+   row says so. Its probe, its timer, a dependency or resource change and every other wake still
+   wake it; a `wake_now` during the hold waits for it to end unless the task is urgent and its
+   wait has changed.
    A queued wait whose note names an ask or task (`ask #12`, `task #34`, `#34`) is kept current:
    once that ask is resolved or that task is done, the note says so and its probe (retry_when or
    start_when) runs again at once. Its probe, dependencies, start_when, not_before and attempts
