@@ -10,6 +10,8 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
+import threading
 from pathlib import Path
 
 from harness import SkipEval
@@ -105,16 +107,77 @@ def server_command() -> str:
     return command
 
 
-def loaded_handle(call: dict) -> str:
-    """The handle a successful load_report call returned."""
+def loaded(call: dict) -> dict:
+    """What a successful load_report call returned: at least its handle."""
     assert not call["is_error"] and call["result"], f"load_report failed: {call}"
     try:
-        handle = json.loads(call["result"]).get("handle")
-    except (json.JSONDecodeError, AttributeError):
+        result = json.loads(call["result"])
+    except json.JSONDecodeError:
+        result = None
+    if not isinstance(result, dict):
         m = re.search(r'"handle"\s*:\s*"([^"]+)"', call["result"])
-        handle = m and m.group(1)
-    assert handle, f"load_report returned no handle: {call['result'][:300]}"
-    return handle
+        result = {"handle": m.group(1)} if m else {}
+    assert result.get("handle"), f"load_report returned no handle: {call['result'][:300]}"
+    return result
+
+
+def grade_mcp_peak(calls: list[dict], offered: list[str]) -> None:
+    """Visualizer calls (`AgentResult.tool_calls()` shape) follow the skill: no
+    other visualizer tool before the first successful load_report, then a
+    successful peak read on the handle it returned. The peak tool is l1_peak
+    where the report's `answerable` (else the server's tool list) has it, and
+    memory_profile otherwise."""
+    calls = [c for c in calls if c["name"].startswith(MCP_PREFIX)]
+    names = [c["name"][len(MCP_PREFIX):] for c in calls]
+    first = next((i for i, c in enumerate(calls) if names[i] == "load_report"
+                  and not c["is_error"] and c["result"]), None)
+    assert first is not None, f"no successful load_report: {names}"
+    early = [n for n in names[:first] if n != "load_report"]
+    assert not early, f"called before load_report succeeded: {early}"
+    result = loaded(calls[first])
+    answerable = result.get("answerable")
+    has_peak = ("l1_peak" in answerable if isinstance(answerable, list)
+                else f"{MCP_PREFIX}l1_peak" in offered)
+    peak_tool = "l1_peak" if has_peak else "memory_profile"
+    reads = [c for c in calls[first + 1:] if c["name"] == MCP_PREFIX + peak_tool
+             and not c["is_error"] and c["input"].get("handle") == result["handle"]]
+    assert reads, f"no successful {peak_tool} on handle {result['handle']!r}: {names}"
+
+
+def server_starts(command: str, timeout: float = 30) -> bool:
+    """Whether the stdio server answers an MCP initialize — checked before a
+    paid run, since one that cannot start costs a whole run to discover."""
+    request = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18", "capabilities": {},
+        "clientInfo": {"name": "tt-debug-tools-eval", "version": "0"}}}
+    try:
+        proc = subprocess.Popen([command], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True)
+    except OSError:
+        return False
+    reply = []
+    reader = threading.Thread(target=lambda: reply.append(proc.stdout.readline()), daemon=True)
+    try:
+        proc.stdin.write(json.dumps(request) + "\n")
+        proc.stdin.flush()
+        reader.start()
+        reader.join(timeout)
+    except OSError:
+        pass
+    finally:
+        proc.kill()
+        proc.wait()
+    try:
+        return bool(reply) and json.loads(reply[0]).get("id") == 1
+    except json.JSONDecodeError:
+        return False
+
+
+def require_claude(agent) -> None:
+    """The "without the server" evals rely on --strict-mcp-config, which only
+    the Claude host gets; on Codex a registered server would still be seen."""
+    if agent.host != "claude":
+        raise SkipEval(f"MCP isolation is claude-only; got --host={agent.host}")
 
 
 def report_paths() -> tuple[str, str]:
@@ -199,7 +262,10 @@ def eval_hang_is_not_this_skill(agent):
 def eval_memory_fallback_without_server(agent):
     """Without the MCP server an L1 question goes to the visualizer app, on
     localhost, or to the user registering the server — never tt-perf-report,
-    never SQL against db.sqlite, and the agent installs nothing itself."""
+    never SQL against db.sqlite, and the agent installs nothing itself. Bans
+    apply to the command and tool calls, not prose, so "don't use sqlite3"
+    passes."""
+    require_claude(agent)
     res = agent.ask(
         "I have a TTNN memory report folder with db.sqlite from a pytest that "
         "hit an L1 allocation failure. Which operation held the L1 peak? Tell "
@@ -207,16 +273,16 @@ def eval_memory_fallback_without_server(agent):
     )
 
     res.assert_dispatched("tt-ttnn-visualizer")
-    body = res.text()
-    assert "--profiler-path" in body or "ttnn-visualizer-mcp" in body, body
-    assert "tt-perf-report" not in body.lower(), body
-    assert "sqlite3" not in body, body
+    command = res.answer["command"]
+    assert "--profiler-path" in command or "ttnn-visualizer-mcp" in res.text(), res.answer
+    assert "tt-perf-report" not in command and "sqlite3" not in command, command
     assert_left_to_user(res)
 
 
 def eval_perf_fallback_without_server(agent):
     """Without the MCP server "which op dominates" goes to tt-perf-report or
     to the user registering the server, never to SQL."""
+    require_claude(agent)
     res = agent.ask(
         "I have a Tenstorrent profiler report folder with an "
         "ops_perf_results CSV. Which op dominates device time? Give me the "
@@ -227,14 +293,14 @@ def eval_perf_fallback_without_server(agent):
         assert res.skill in ("tt-ttnn-visualizer", "tt-profiler"), res.skill
     body = res.text()
     assert "tt-perf-report" in body or "ttnn-visualizer-mcp" in body, body
-    assert "sqlite3" not in body, body
+    assert "sqlite3" not in res.answer["command"], res.answer["command"]
     assert_left_to_user(res)
 
 
 def eval_uses_mcp_when_present(agent):
-    """With the server running and a real report on disk, the agent calls
-    load_report before any other visualizer tool, reads the L1 peak with the
-    handle load_report returned, and names the right operation. Graded on
+    """With the server running and a real report on disk, the agent loads the
+    report before any other visualizer tool, reads the L1 peak with the handle
+    load_report returned, and names the right operation. Graded on
     successful results, not attempted calls, and only against a known answer.
     Skill dispatch is not asserted: the server's own instructions can carry an
     agent straight to the tools, and the tool sequence is what this grades."""
@@ -243,6 +309,9 @@ def eval_uses_mcp_when_present(agent):
     if not expected:
         raise SkipEval(f"{EXPECTED_OP_ENV} not set: no answer to grade against")
     command = server_command()
+    require_claude(agent)
+    if not server_starts(command):
+        raise SkipEval(f"{SERVER} did not answer initialize ({command})")
     res = agent.ask(
         f"Which operation holds the L1 peak in this TTNN run? Memory report: "
         f"{profiler}. Performance report: {performance}. Put the operation's "
@@ -253,14 +322,6 @@ def eval_uses_mcp_when_present(agent):
     if not _server_offered(res):
         raise SkipEval(f"{SERVER} did not connect ({command})")
 
-    calls = [c for c in res.tool_calls() if c["name"].startswith(MCP_PREFIX)]
-    names = [c["name"][len(MCP_PREFIX):] for c in calls]
-    assert names and names[0] == "load_report", names
-    handle = loaded_handle(calls[0])
-    peak_tool = "l1_peak" if f"{MCP_PREFIX}l1_peak" in res.offered_tools() else "memory_profile"
-    # memory_profile is the fallback for releases without l1_peak.
-    peak_reads = [c for c in calls if c["name"] == MCP_PREFIX + peak_tool
-                  and not c["is_error"] and c["input"].get("handle") == handle]
-    assert peak_reads, f"no successful {peak_tool} on handle {handle!r}: {calls}"
+    grade_mcp_peak(res.tool_calls(), res.offered_tools())
     assert expected.lower() in res.answer["primary_signal"].lower(), res.answer
     assert_left_to_user(res)

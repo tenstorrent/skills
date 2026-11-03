@@ -213,44 +213,23 @@ class AgentResult:
         (`tt_device_job_logs`, `tt_device_job_status`, ...) matches by tool
         name."""
         rx = re.compile(pattern)
-        matched, denied = [], []
-        pending_id = None
-        for ev in self.events:
-            typ = ev.get("type")
-            if typ == "assistant":
-                for block in ev.get("message", {}).get("content", []):
-                    if block.get("type") != "tool_use":
-                        continue
-                    name = block.get("name") or ""
-                    inp = block.get("input") or {}
-                    if name == "Bash":
-                        needle = inp.get("command") or ""
-                    else:
-                        needle = (inp.get("command")
-                                  or (inp.get("params") or {}).get("command")
-                                  or name)
-                    if rx.search(needle):
-                        pending_id = block.get("id")
-                        matched.append(needle)
-            elif typ == "user" and pending_id is not None:
-                for block in ev.get("message", {}).get("content", []):
-                    if (block.get("type") == "tool_result"
-                            and block.get("tool_use_id") == pending_id):
-                        content = block.get("content", "")
-                        if isinstance(content, list):
-                            content = " ".join(str(c.get("text", "")) for c in content)
-                        pending_id = None
-                        if "Permission" in content and "denied" in content:
-                            denied.append(matched[-1])
-                            matched.pop()
-                        else:
-                            return
+        denied = []
+        for call in self.tool_calls():
+            inp = call["input"]
+            needle = (inp.get("command") or "" if call["name"] == "Bash"
+                      else _command_of(inp) or call["name"])
+            if not rx.search(needle) or call["result"] is None:
+                continue
+            if "Permission" in call["result"] and "denied" in call["result"]:
+                denied.append(needle)
+                continue
+            return
         # Dump every tool call the agent did make; without this the failure
         # cannot distinguish "agent used a tool I did not name" from "agent
         # made nothing up but did nothing at all".
         seen = []
         for name, inp in self.tool_uses():
-            cmd = inp.get("command") or (inp.get("params") or {}).get("command") or ""
+            cmd = _command_of(inp)
             summary = cmd[:120] if cmd else json.dumps(inp)[:120]
             seen.append(f"{name}({summary})")
         raise AssertionError(
@@ -274,14 +253,7 @@ class AgentResult:
 
     def tool_uses(self) -> list[tuple[str, dict]]:
         """Every tool call the agent attempted, in order, as (name, input)."""
-        calls = []
-        for ev in self.events:
-            if ev.get("type") != "assistant":
-                continue
-            for block in ev.get("message", {}).get("content", []):
-                if block.get("type") == "tool_use":
-                    calls.append((block.get("name") or "", block.get("input") or {}))
-        return calls
+        return [(c["name"], c["input"]) for c in self.tool_calls()]
 
     def tool_calls(self) -> list[dict]:
         """Every tool call attempted, in order, paired with its result:
@@ -289,7 +261,12 @@ class AgentResult:
         text, or None when no result came back."""
         calls, by_id = [], {}
         for ev in self.events:
-            for block in ev.get("message", {}).get("content", []) or []:
+            # Not every stream event carries a message dict with a block list:
+            # a user prompt's content is a plain string, and some events'
+            # message is not a dict at all.
+            message = ev.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            for block in content if isinstance(content, list) else []:
                 if not isinstance(block, dict):
                     continue
                 if ev.get("type") == "assistant" and block.get("type") == "tool_use":
@@ -313,6 +290,12 @@ class AgentResult:
         """Tool names the host offered the agent, from the init event; MCP
         tools appear here only once their server connected."""
         return _init_event(self.events).get("tools", [])
+
+
+def _command_of(inp: dict) -> str:
+    """The command an MCP or Bash tool input carries: top-level as in
+    `tt_device_job_run`, or under `params` as in `tt_device_exec`."""
+    return inp.get("command") or (inp.get("params") or {}).get("command") or ""
 
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]

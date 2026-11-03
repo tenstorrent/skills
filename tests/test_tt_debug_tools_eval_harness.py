@@ -76,6 +76,9 @@ def test_tool_calls_pair_each_call_with_its_result():
             {"type": "tool_result", "tool_use_id": "unknown", "content": "x"},
         ]}},
         tool_use("Read"),
+        {"type": "user", "message": {"content": "a plain prompt string"}},
+        {"type": "assistant", "message": "not a dict"},
+        {"type": "result", "message": None},
     ]
     assert result(events).tool_calls() == [
         {"name": "mcp__s__load_report", "input": {"p": 1}, "result": '{"handle": "h"}',
@@ -84,6 +87,35 @@ def test_tool_calls_pair_each_call_with_its_result():
          "is_error": True},
         {"name": "Read", "input": {}, "result": None, "is_error": False},
     ]
+
+
+def bash_result(id_, text):
+    return {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": id_, "content": text}]}}
+
+
+def test_assert_invoked_tool_checks_every_matching_call_in_a_message():
+    events = [
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "a", "name": "Bash", "input": {"command": "tt-triage"}},
+            {"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": "tt-triage -v"}},
+        ]}},
+        bash_result("a", "ran fine"),
+        bash_result("b", "Permission to use Bash has been denied"),
+    ]
+    result(events).assert_invoked_tool(r"tt-triage")
+
+
+def test_assert_invoked_tool_fails_when_every_match_was_denied_or_unanswered():
+    events = [tool_use("Bash", {"command": "tt-triage"}), {"type": "user", "message":
+              {"content": "a plain prompt string"}}]
+    with pytest.raises(AssertionError):
+        result(events).assert_invoked_tool(r"tt-triage")
+    events = [{"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "a", "name": "Bash", "input": {"command": "tt-triage"}}]}},
+        bash_result("a", "Permission to use Bash has been denied")]
+    with pytest.raises(AssertionError, match="denied"):
+        result(events).assert_invoked_tool(r"tt-triage")
 
 
 def test_offered_tools_reads_the_init_event():
@@ -187,13 +219,77 @@ def test_assert_left_to_user_passes_reads_and_a_local_app_command():
         result(events, command="ttnn-visualizer --host 127.0.0.1 --profiler-path 'x'"))
 
 
-def test_loaded_handle_reads_a_successful_result_only():
-    ok = {"name": "mcp__ttnn-visualizer__load_report", "input": {},
-          "result": json.dumps({"handle": "report-1"}), "is_error": False}
-    assert viz.loaded_handle(ok) == "report-1"
-    for bad in (dict(ok, is_error=True), dict(ok, result=None), dict(ok, result="{}")):
+VIZ = "mcp__ttnn-visualizer__"
+
+
+def call(name, inp=None, result=None, is_error=False):
+    return {"name": VIZ + name, "input": inp or {}, "result": result, "is_error": is_error}
+
+
+def loaded_call(handle="h1", **extra):
+    return call("load_report", result=json.dumps({"handle": handle, **extra}))
+
+
+def test_loaded_reads_a_successful_result_only():
+    assert viz.loaded(loaded_call("r1"))["handle"] == "r1"
+    text = call("load_report", result='Loaded. {"handle": "r-9", "x": 1')
+    assert viz.loaded(text) == {"handle": "r-9"}
+    for bad in (loaded_call() | {"is_error": True}, call("load_report"),
+                call("load_report", result="{}"), call("load_report", result='["x"]')):
         with pytest.raises(AssertionError):
-            viz.loaded_handle(bad)
+            viz.loaded(bad)
+
+
+OFFERED = [VIZ + "load_report", VIZ + "l1_peak", VIZ + "memory_profile"]
+
+
+def test_grade_mcp_peak_accepts_the_skill_read_order():
+    viz.grade_mcp_peak([loaded_call(), call("errors", {"handle": "h1"}, "[]"),
+                        call("l1_peak", {"handle": "h1"}, "{}")], OFFERED)
+
+
+def test_grade_mcp_peak_accepts_a_load_report_retried_after_an_error():
+    viz.grade_mcp_peak([call("load_report", result="bad path", is_error=True),
+                        loaded_call("h2"), call("l1_peak", {"handle": "h2"}, "{}")], OFFERED)
+
+
+def test_grade_mcp_peak_follows_answerable_over_the_tool_list():
+    viz.grade_mcp_peak([loaded_call(answerable=["memory_profile"]),
+                        call("memory_profile", {"handle": "h1"}, "{}")], OFFERED)
+    viz.grade_mcp_peak([loaded_call(), call("memory_profile", {"handle": "h1"}, "{}")],
+                       [VIZ + "load_report", VIZ + "memory_profile"])
+
+
+@pytest.mark.parametrize("calls", [
+    [call("errors", {"handle": "h1"}, "[]"), loaded_call(),
+     call("l1_peak", {"handle": "h1"}, "{}")],
+    [loaded_call(), call("l1_peak", {"handle": "other"}, "{}")],
+    [loaded_call(), call("l1_peak", {"handle": "h1"}, "boom", is_error=True)],
+    [loaded_call(), call("memory_profile", {"handle": "h1"}, "{}")],
+    [call("load_report", result="bad", is_error=True)],
+])
+def test_grade_mcp_peak_rejects_runs_off_the_skill(calls):
+    with pytest.raises(AssertionError):
+        viz.grade_mcp_peak(calls, OFFERED)
+
+
+def test_server_starts_needs_an_initialize_reply(tmp_path):
+    good = tmp_path / "good"
+    good.write_text(f"#!{sys.executable}\nimport sys, json\nsys.stdin.readline()\n"
+                    'print(json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}), flush=True)\n')
+    silent = tmp_path / "silent"
+    silent.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(30)\n")
+    for script in (good, silent):
+        script.chmod(0o755)
+    assert viz.server_starts(str(good), timeout=10) is True
+    assert viz.server_starts(str(silent), timeout=1) is False
+    assert viz.server_starts(str(tmp_path / "missing"), timeout=1) is False
+
+
+def test_require_claude_skips_other_hosts(tmp_path):
+    viz.require_claude(harness.Agent("claude", None, EVALS, cwd=tmp_path))
+    with pytest.raises(harness.SkipEval):
+        viz.require_claude(harness.Agent("codex", None, EVALS, cwd=tmp_path))
 
 
 def make_report(root, profiler="R1", performance="P1"):

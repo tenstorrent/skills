@@ -17,6 +17,6 @@ ttnn-visualizer demo report.
 
 `tt-ttnn-flags` now says the report database is written only under pytest, at
 test teardown, and points at the new skill for the keys it needs and how to
-read it; `tt-profiler` points there too. The eval harness now isolates the
-agent from the user's MCP servers and can hand it an explicit one with its
-tools pre-approved, with offline tests.
+read it; `tt-profiler` points there too. On the Claude host the eval
+harness now isolates the agent from the user's MCP servers and can hand it an
+explicit one with its tools pre-approved, with offline tests.

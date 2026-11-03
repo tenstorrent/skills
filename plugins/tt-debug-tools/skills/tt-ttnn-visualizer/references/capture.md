@@ -41,11 +41,14 @@ ttnn.graph.end_graph_capture_to_file("report.json")
 ```
 
 ```bash
-python -m ttnn.graph_report report.json <report folder>
+python -m ttnn.graph_report 'report.json' '<new empty folder>'
 ```
 
-Capture still needs `enable_fast_runtime_mode: false`. The import writes
-`db.sqlite` into `<report folder>`, the `profiler_path`.
+Import into a **new, empty** folder: the importer silently deletes a
+`db.sqlite` already there if its schema is older or it cannot be read. Quote
+paths as for the app command (`references/fallback.md`). Capture still needs
+`enable_fast_runtime_mode: false`. The folder, now holding `db.sqlite`, is the
+`profiler_path`.
 Graph-capture detail: `tt-ttnn-flags` (`references/graph-capture.md`).
 
 ## Performance report (CSV)

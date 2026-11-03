@@ -42,9 +42,11 @@ res = agent.ask(prompt, mcp_servers={"<server>": {"type": "stdio", "command": "<
                 allowed_tools=["mcp__<server>"])   # Claude only
 ```
 
-The agent runs `--restricted --strict-mcp-config`, so it sees no MCP server
-you have registered — only those an eval passes in `mcp_servers`, whose tools
-`allowed_tools` then pre-approves.
+On Claude, `ask` runs the agent `--restricted --strict-mcp-config`, so it sees
+no MCP server you have registered — only those an eval passes in
+`mcp_servers`, whose tools `allowed_tools` then pre-approves. Codex gets no
+such isolation, so evals that depend on it skip there. Device evals (`hang`)
+keep your registered servers: they need `tt-device-mcp`.
 
 `res` is an `AgentResult` with:
 
