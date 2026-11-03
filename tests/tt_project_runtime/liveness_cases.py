@@ -155,3 +155,12 @@ def test_devq_wait_line_never_says_gone_for_a_pid_it_cannot_place(gone_pid, pidn
     line = devq.wait_line(d, "jb")
     assert ("gone" in line) is (pidns == "same") and ("unknown" in line) is (pidns == "foreign"), line
     assert devq.parse_wait(line)["holder"]["alive"] is (None if pidns == "foreign" else False)
+
+
+def test_checkjoin_judges_a_record_without_a_namespace_here(monkeypatch, tmp_path):
+    """No /proc (macOS) records no namespace: the run is judged in this process, alive while it runs."""
+    from ttp import checkjoin
+    from ttp.runner import proc_start
+    monkeypatch.delenv("TTP_PIDNS", raising=False)
+    _ns_join_rec(tmp_path, "mac", os.getpid(), "", started=proc_start(os.getpid()))
+    assert [r["alive"] for r in checkjoin.records(tmp_path)] == [True]

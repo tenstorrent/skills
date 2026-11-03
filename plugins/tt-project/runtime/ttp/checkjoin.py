@@ -130,9 +130,9 @@ def alive(rec: dict) -> bool | None:
     from .liveness import DEAD, UNKNOWN, pid_state
     from .runner import proc_start
     pid = rec.get("pid")
-    if not isinstance(pid, int) or not rec.get("pidns"):
+    if not isinstance(pid, int):
         return False
-    state = pid_state(pid, ns=rec["pidns"])
+    state = pid_state(pid, ns=rec.get("pidns") or None)   # no /proc (macOS): no namespace, judged here
     if state == UNKNOWN:
         return None
     return state != DEAD and rec.get("started") is not None and proc_start(pid) == rec.get("started")
