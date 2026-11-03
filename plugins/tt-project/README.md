@@ -28,7 +28,7 @@ satisfied that everything's been thoroughly checked.
 The project is run by a coordinator agent running as a background service and waking up periodically to check on the project. So it runs independently of your chat whenever the machine is on, but you interact with it through your chat. You give it instructions or ask it questions and it responds when it needs to update you in the chat. The background coordinator listens to your instructions from chat, plans the work, hands it to headless workers in isolated git worktrees, watches pull requests and Jira and output logs to find and auto-fix issues, whatever responsibilities you gave it. It never stops, it keeps finding valid work to do, and if it finds it, it does it, unless you give it a reachable goal state or ask it to stop.
 
 Features:
-- Supports: Claude Code, Cursor and Codex.
+- Supports: Claude Code and Codex (both tested live); Cursor support is built but not yet tested live ([Providers](docs/providers.md)).
 - Manage many projects at the same time from many chats.
 - It's a meta-harness that generates a custom harness for each of your projects.
 - Very flexible, so it can manage software, legal, or finance projects.
