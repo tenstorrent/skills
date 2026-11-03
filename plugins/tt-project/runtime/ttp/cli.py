@@ -10348,7 +10348,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--json", action="store_true", help="print JSON")
     s.add_argument("--ack", nargs=2, metavar=("RETIREMENT", "PLACE"),
                    help="acknowledge one match as no echo: the retirement id and the place as listed (a file's "
-                        "<path>:<line>); stored in the project's state, hidden until that line's text changes")
+                        "<path>:<line>); stored in the project's state, listed as acknowledged, never a fix order, until that "
+                        "line changes or a new copy appears there")
     s.set_defaults(fn=cmd_echoes)
 
     s = sub.add_parser("replicate", help="backup copies of the project's state on a standby machine "
