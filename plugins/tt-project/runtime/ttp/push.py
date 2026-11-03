@@ -12,7 +12,7 @@ its first fetch to its push, so two reviewers never race each other through roun
 OS file lock (locks.py): a killed push or a reboot frees it. A waiting push waits as long as the
 last measured check run takes, with a margin, up to 2 h (`delivery.push_wait_s` overrides it).
 Each check runs at most four times the last measured check run, at least 4 h
-(`delivery.push_checks_timeout_s` overrides it, 0 for no limit): one past it is ended and fails the push.
+(`delivery.push_checks_timeout_s` overrides it, 0 for no limit), counting run time only (checkwait): one running past it is ended and fails the push; one still waiting for a grant at the limit plus the push wait exits 75, queued, not run.
 
 With `delivery.version_bump` set, the push also owns the version bump: after each rebase it sets the
 listed files one patch version above the tip's and adds a changeset, in one commit of its own. The
@@ -30,13 +30,14 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, checklane, cleantree, envfault, gitcache, gitmemo, landed, locks, machines, prguard, prhead, remotecheck, repoid, runner,
+from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gitcache, gitmemo, landed, locks, machines, prguard, prhead, remotecheck, repoid, runner,
                sandbox, scriptwatch, settinghold, shorttmp, testslots, timefmt, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
@@ -54,6 +55,9 @@ WAIT_MARGIN_S = 60          # on top of two check runs: the holder may start ove
 MAX_DEFAULT_WAIT_S = 7200  # the measured wait's ceiling; only an explicit push_wait_s waits longer
 CHECK_LIMIT_FLOOR_S = 4 * 3600   # a push check's time limit with no measured check run, and its floor otherwise
 CHECK_LIMIT_FACTOR = 4           # times the last measured check run
+CHECK_POLL_S = 5.0               # how often a timed check's waits for a grant are read (checkwait)
+QUEUED = 1075                    # once()'s answer for a check still queued at its outer bound: never a process's code
+QUEUED_RETRY_S = 1800            # a push whose check stayed queued is tried again after this
 TIMINGS = "push_checks.json"   # under the project's state: how long the last full check run took
 BUMP_TRAILER = "Ttp-Version-Bump"   # marks the bump commit ttp push made, so a rerun replaces it
 VERSION_RE = re.compile(r"""(version(?:__)?["']?\s*[:=]\s*["'])(\d+)\.(\d+)\.(\d+)(["'])""", re.I)
@@ -3747,6 +3751,38 @@ def _copy_out(stream, collect: workerloss.Collector) -> None:
         stream.close()
 
 
+def _timed_wait(proc: subprocess.Popen, waits: Path, cmd: Any, say: Callable[[str], None]) -> int:
+    """Wait for check `proc`; its exit code. Its time limit (check_limit_s) counts only its run time: the
+    time since it started less its waits for a grant (a `ttp lock`, a checks lane, a host-wide checks slot)
+    that it recorded in `waits` (checkwait). Past the limit while it runs it is ended: 124, a failed check.
+    Still waiting for a grant once its limit plus the push's own wait bound (check_queue_s) have gone by
+    since it started, it is ended without having run: QUEUED, a transient answer, never a failure."""
+    if check_limit_s is None:
+        return proc.wait()
+    started = time.time()
+    while True:
+        now = time.time()
+        waited, queued = checkwait.state(waits, started, now)
+        ran = now - started - waited
+        if queued and now - started >= check_limit_s + check_queue_s:
+            _kill_tree(proc.pid)
+            proc.wait()
+            say(f"check still waiting for a grant (a lock, a checks lane or a checks slot) after "
+                f"{(now - started) / 60:.0f} min and was ended before it ran: {cmd}{where(cmd)}")
+            return QUEUED
+        if not queued and ran >= check_limit_s:
+            _kill_tree(proc.pid)
+            proc.wait()
+            say(f"check ran past its limit of {check_limit_s:.0f} s and was ended: {cmd}{where(cmd)} "
+                f"({ran:.0f} s run, {waited:.0f} s waiting for a grant not counted; delivery.push_checks_timeout_s; "
+                "unset: 4x the last measured check run, at least 4 h)")
+            return 124
+        try:
+            return proc.wait(timeout=min(CHECK_POLL_S, max(check_limit_s - ran, 0.05)))
+        except subprocess.TimeoutExpired:
+            pass
+
+
 def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int:
     """Run one push check: 0 when it passes, CHECKS_FAILED when it fails, BUSY when its check host
     could not run it (an environment fault, recorded as runner_wait records a missing runner) or its
@@ -3759,29 +3795,30 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
         collect.reset()
         sys.stdout.flush()
         sys.stderr.flush()
-        proc = subprocess.Popen(testslots.low_priority(check_argv(cmd, repo, env)), cwd=repo, env=env,
+        waits = Path(tempfile.mkdtemp(prefix="check-waits-", dir=env.get("TTP_RUN_DIR") or None)).resolve()
+        proc = subprocess.Popen(testslots.low_priority(check_argv(cmd, repo, env)), cwd=repo,
+                                env={**env, checkwait.ENV: str(waits)},
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, pass_fds=checkdirs.inherited())
         reader = threading.Thread(target=_copy_out, args=(proc.stdout, collect), daemon=True)
         reader.start()
         try:
-            return proc.wait(timeout=check_limit_s)
-        except subprocess.TimeoutExpired:
-            _kill_tree(proc.pid)
-            proc.wait()
-            say(f"check timed out after {check_limit_s:.0f} s and was ended: {cmd}{where(cmd)} "
-                "(delivery.push_checks_timeout_s; unset: 4x the last measured check run, at least 4 h)")
-            return 124
+            return _timed_wait(proc, waits, cmd, say)
         except BaseException:   # stopped (run_detached's SIGTERM): the check ends with it, as run() did
             proc.kill()
             proc.wait()
             raise
         finally:
             reader.join(timeout=10)   # a child that left the group may keep the pipe open; do not wait on it
+            shutil.rmtree(waits, ignore_errors=True)
     reruns = 0
     while True:
         rc = scriptwatch.rerun(once, bool, None if remote_host(cmd) else str(cmd), repo, env, say, on_pass=True)
         if rc == 0:
             return 0
+        if rc == QUEUED:   # it never ran: the host's queue, not the change
+            say(f"queued, not run: {cmd}{where(cmd)}; not pushing. Hand off `waiting`; retry_when: "
+                f"test \"$(date +%s)\" -ge {int(time.time()) + QUEUED_RETRY_S}")
+            return BUSY
         # A test worker lost mid-run is the host, not the change: once more (workerloss).
         if remote_host(cmd) or reruns >= workerloss.RERUNS or not workerloss.only(loss := workerloss.lost(collect.text())):
             break
@@ -3897,9 +3934,9 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
     except ValueError as e:
         print(f"ttp push: {e}", file=sys.stderr)
         return REFUSED
-    global last_ff, last_reach, last_after, pending_after, check_limit_s
+    global last_ff, last_reach, last_after, pending_after, check_limit_s, check_queue_s
     last_ff, last_reach, last_after, pending_after = [], None, None, None
-    check_limit_s = limit_s
+    check_limit_s, check_queue_s = limit_s, wait_s
     if own:   # delivery.push_exclude_paths guards the push branch only
         say_target(repo, remote, branch)
         # The docs-only test, if_changed scopes and the project's own checks may all compare with the
@@ -3962,6 +3999,7 @@ def run_after(p: Project, repo: Path) -> dict | None:
 
 
 check_limit_s: float | None = None   # the time limit of each check of the current run() (check_limit_of)
+check_queue_s: float = 0.0   # how much longer than check_limit_s a check may wait for a grant (the run()'s push wait)
 last_ff: list[str] = []   # the fast_forward outcome of the last run(): `ff`/`not ff` and `mirror`/`not mirrored` lines
 last_after: dict | None = None   # the after_push outcome of the last run() (batch.after_ordinary_push)
 pending_after: tuple[str, str, str] | None = None   # (sha, target, tip) whose after_push run() left to run

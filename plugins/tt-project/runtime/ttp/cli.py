@@ -31,7 +31,7 @@ from . import __version__, poll_s
 from .db import CHANGES_NEEDED, SUPERSEDED, chat_floor, task_outcome
 from . import outbox
 from .devq import unmask_devices
-from . import chatgone, scriptwatch, sshcmd, timefmt, workerloss
+from . import chatgone, checkwait, scriptwatch, sshcmd, timefmt, workerloss
 from . import schedule as sched
 from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
                       durable_append, durable_write, write_json, ACCOUNT_KEYS, DEFAULT_CONFIG, deep_merge,
@@ -5666,11 +5666,15 @@ def cmd_lock(a) -> None:
     wait_dir = None if detached else run_dir
     started, told = time.time(), 0.0
     wait_key = f"{os.getpid()}:{started}"
+    check_wait = None   # inside a push check: its wait, which is not the check's run time (checkwait)
 
     def _end_wait(*_):
         # Cleared first: a signal arriving while this records would otherwise take the record's
         # flock a second time in this process and hang.
-        nonlocal waiting
+        nonlocal waiting, check_wait
+        if check_wait:
+            token, check_wait = check_wait, None
+            checkwait.end(token)
         if waiting:
             waiting = False
             lk.record_wait(wait_dir, wait_key, started, time.time())
@@ -5822,6 +5826,8 @@ def cmd_lock(a) -> None:
                         f.close()
 
             sys.exit(_logged("shared" if a.shared else "lock", todo, _wait))
+        if check_wait is None:
+            check_wait = checkwait.begin(f"ttp lock {what}") or ()
         if wait_dir and not waiting:
             # The run's wall clock stops while it waits here; the supervisor reads this record.
             # A signal ends the wait through _end_wait, so the record never stays open.

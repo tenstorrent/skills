@@ -77,7 +77,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import hostcpu, locks, obligations, poll_s, project, timefmt, urgent
+from . import checkwait, hostcpu, locks, obligations, poll_s, project, timefmt, urgent
 
 RESOURCE = "checks"
 OBLIGATION_PRIORITY = 0   # an open obligation's required owner: before every task priority (1 and up)
@@ -522,6 +522,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     if not n or os.environ.get(HELD_ENV):
         return Slot()
     since = time.time() if since is None else since
+    waiting = checkwait.chain(waiting, "host-wide checks slot")   # inside a push check: not its run time
     ps, every = paths(n), all_paths(n)
     queued_as = holder + (OBLIGATION_MARK if priority is not None and priority < 1 else "")
     try:

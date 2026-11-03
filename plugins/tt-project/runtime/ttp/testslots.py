@@ -87,7 +87,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import checkcap, locks, poll_s, project, repoid
+from . import checkcap, checkwait, locks, poll_s, project, repoid
 
 RESOURCE = "test-slots"    # check-slots/test-slots.<i>.lock
 RUN_MAX = 8                # one run's most workers by default: past about 8 a suite's wall time gains little
@@ -1086,6 +1086,7 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     age = age_s() if age is None else age
     if not project_name or os.environ.get(HELD_ENV) or os.environ.get(checkcap.HELD_ENV):
         return Grant()
+    waiting = checkwait.chain(waiting, "checks lane")   # inside a push check: not its run time
     if lock:   # one wrapper lock: its own single lane, never an overflow one
         repo, slots, max_wait, headroom = f"w{lock}", 1, 0.0, None
     count = slots if callable(slots) else (lambda _held, n=max(1, int(slots or 1)): n)

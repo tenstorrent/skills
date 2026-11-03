@@ -14137,7 +14137,7 @@ def test_a_push_check_past_its_time_limit_is_ended_and_fails_the_push_loudly(env
         return [d for d in pathlib.Path("/proc").glob("[0-9]*")
                 if (d / "cmdline").exists() and _safe_read(d / "cmdline") == b"sleep\x0061.7\x00"]
     assert _wait_for(lambda: not sleeping(), 5), "the timed-out check's children outlived it"
-    assert "check timed out after 1 s and was ended" in err and "push_checks_timeout_s" in err, err
+    assert "check ran past its limit of 1 s and was ended" in err and "push_checks_timeout_s" in err, err
     assert _git_out(origin, "rev-parse", "proj") == before
     # Unset: four times the last measured check run, never under 4 h; 0 is no limit; nonsense is refused.
     assert push.check_limit_of(None, None) == push.check_limit_of("", 60.0) == 4 * 3600
