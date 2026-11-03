@@ -6717,7 +6717,9 @@ def test_prompts_and_harness_skill_run_host_reaching_commands_bare_or_from_a_mod
     runs (upstream note fd7ddf9490b3ed3c). Workers, daily reviews, the blocker sweep and harness authors
     read where such a command goes."""
     prompts = PLUGIN / "template" / "prompts"
-    for path in (prompts / "worker.md", prompts / "daily-review.md", SKILLS / "tt-project-harness" / "SKILL.md"):
+    harness = SKILLS / "tt-project-harness"
+    assert "](references/host-reaching-commands.md)" in (harness / "SKILL.md").read_text(encoding="utf-8")
+    for path in (prompts / "worker.md", prompts / "daily-review.md", harness / "references" / "host-reaching-commands.md"):
         flat = re.sub(r"\s+", " ", path.read_text(encoding="utf-8"))
         for part in ("Host names do not resolve in", "another host or GitHub", "git fetch/ls-remote/push",
                      "one bare command", "`ttp lock <res> -- <cmd>`", "absolute paths, no cd, pipe, `;`, `&&` or subshell",
