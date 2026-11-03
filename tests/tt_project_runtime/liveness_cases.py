@@ -97,3 +97,22 @@ def test_recover_setup_never_rolls_back_under_a_foreign_namespace_setup(gone_pid
         assert line == "" and jr.exists()
     else:
         assert "rolled back" in line and not jr.exists()
+
+
+def test_listener_state_never_signals_a_pid_it_cannot_place(pidns):
+    """From a foreign namespace a listener pid that names some other local process is UNKNOWN (its number
+    may be a host listener's), so a new listener neither signals it nor waits on it; one that is a
+    listener for the chat here is this namespace's own and ALIVE. In the daemon's namespace: as before."""
+    from ttp import cli, liveness
+    other = subprocess.Popen(["sleep", "60"])
+    mine = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "listen", "c1"])
+    try:
+        want = liveness.UNKNOWN if pidns == "foreign" else liveness.DEAD
+        assert cli._listener_state(other.pid, "c1") == want
+        assert cli._listener_alive(other.pid, "c1") is (pidns == "foreign")
+        assert cli._listener_state(mine.pid, "c1") == liveness.ALIVE
+    finally:
+        other.kill()
+        mine.kill()
+        other.wait()
+        mine.wait()

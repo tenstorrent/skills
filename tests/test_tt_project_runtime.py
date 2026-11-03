@@ -27901,6 +27901,7 @@ def test_a_zombie_child_counts_as_gone(monkeypatch, proc):
     if proc and not project._PROC:
         pytest.skip("no /proc here")
     monkeypatch.setattr(project, "_PROC", proc)      # False: the `ps` path macOS takes
+    monkeypatch.delenv("TTP_PIDNS", raising=False)   # run from a sandboxed worker: judged in this namespace
     child = subprocess.Popen(["sleep", "60"])
     try:
         assert daemon._alive(child.pid) and not project.zombie(child.pid)

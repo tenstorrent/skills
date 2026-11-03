@@ -1265,13 +1265,18 @@ def cmd_listen(a) -> None:
     tmp = lock.with_name(f"{lock.name}.{os.getpid()}")
     tmp.write_text(str(os.getpid()))
     os.replace(tmp, lock)
-    if other and other != os.getpid() and _listener_alive(other, a.chat):
+    from .liveness import ALIVE, UNKNOWN, FOREIGN
+    st = _listener_state(other, a.chat) if other and other != os.getpid() else ""
+    if st == UNKNOWN:
+        # Its pid number means nothing here: never signal it, nor wait for it to end.
+        print(f"ttp: an older listener for chat {a.chat} (pid {other}) is {FOREIGN}; not stopped", file=sys.stderr)
+    elif st == ALIVE:
         try:
             os.kill(other, signal.SIGTERM)
         except OSError:
             pass
         for _ in range(50):
-            if not _listener_alive(other, a.chat):
+            if _listener_state(other, a.chat) != ALIVE:
                 break
             time.sleep(0.1)
         print(f"ttp: replaced an older listener for chat {a.chat} (pid {other})", file=sys.stderr)
@@ -1311,21 +1316,34 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _listener_alive(pid: int, chat: str) -> bool:
-    """True if pid is a live `ttp listen` for this chat (not a recycled pid), or may be: one this process
-    cannot see from its PID namespace (liveness.UNKNOWN) is never taken for gone."""
-    from .liveness import pid_state, DEAD, UNKNOWN
+    """True if pid is a live `ttp listen` for this chat (not a recycled pid), or may be (_listener_state
+    UNKNOWN): one this process cannot see from its PID namespace is never taken for gone."""
+    from .liveness import DEAD
+    return _listener_state(pid, chat) != DEAD
+
+
+def _listener_state(pid: int, chat: str) -> str:
+    """liveness ALIVE, DEAD or UNKNOWN for a `ttp listen` of this chat. From another PID namespace than
+    the daemon's, a pid that is a listener for this chat here is one of this namespace's (ALIVE); any
+    other is UNKNOWN: its number may name a process this namespace cannot see."""
+    from .liveness import pid_state, ALIVE, DEAD, UNKNOWN
     if (st := pid_state(pid)) == DEAD:
-        return False
+        return DEAD
     if st == UNKNOWN:
-        return True
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return UNKNOWN
     if zombie(pid):
-        return False
+        return UNKNOWN if st == UNKNOWN else DEAD
     try:
         cmd = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)], capture_output=True,
                              text=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
-        return True
-    return "listen" in cmd and chat in cmd
+        return st
+    if "listen" in cmd and chat in cmd:
+        return ALIVE
+    return UNKNOWN if st == UNKNOWN else DEAD
 
 
 def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
