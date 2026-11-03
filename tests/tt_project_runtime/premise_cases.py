@@ -188,3 +188,15 @@ def test_the_audit_counts_code_runs_with_no_code_change_and_premise_closes(env):
     assert audit.report(p.db, now)["no_change_code"]["n"] == 2
     p.db.x("UPDATE tasks SET updated=? WHERE kind='code'", (now - 3 * 86400,))
     assert "code runs with no code change" not in "\n".join(audit.lines(p.db, now))
+
+
+def test_a_premise_check_spec_requires_named_targets_to_exist_at_the_base_ref(env):
+    from ttp import premise
+    p = _premise_project(env)
+    _code(p, spec="Goal: fix the hold hook.\npremise: runtime/ttp/holdhook.py's _allowed misses a form\n"
+                   "Change: fix it. [note abc123]")
+    premise.tend(p.db)
+    spec = p.db.one("SELECT spec FROM tasks WHERE kind='question'")["spec"]
+    assert "git ls-tree" in spec and "git grep" in spec and "base ref" in spec, "(a) confirm each named target exists"
+    assert "adjacent" in spec and "found instead" in spec, "(b) a nearby function is no match: fails, naming it"
+    assert "upstream note" in spec and "outside the plugin" in spec and "won't-fix" in spec, "(c) foreign paths"

@@ -88,10 +88,18 @@ def question_spec(task: dict, check: str) -> str:
     return (f"Premise check for code task #{task['id']} \"{task['title']}\", before it is run. Check only "
             f"by reading (records, files, git history, command output): change no file, commit, push or "
             f"queue nothing.\nThe premise to check: {check}\n"
+            f"First confirm that each file, function or symbol the premise, the spec or its upstream note "
+            f"names exists at the base ref the code task branches from (the project's push branch), with "
+            f"git ls-tree or git grep on that ref. When a named target is absent and only an adjacent "
+            f"or similarly named one exists, the premise fails: say \"fails\" and name what you found "
+            f"instead, never pass it by pointing at the nearby code. When an upstream note names paths "
+            f"outside the plugin or this repository (such as the sending project's own harness files), "
+            f"say so, answer \"fails\" and recommend closing the note won't-fix.\n"
             f"Hand off status done with \"premise\": \"holds\" or \"fails\" in result.json and the evidence "
             f"(records, commits, file:line, output) in \"summary\", 2-4 sentences. Say \"fails\" only when "
-            f"the evidence shows it does not hold (for example the feature already exists or there is "
-            f"nothing to fix); when unsure, \"holds\": the code task then runs and reads your summary.\n\n"
+            f"the evidence shows it does not hold (for example a named target is missing, the feature "
+            f"already exists or there is nothing to fix); when unsure, \"holds\": the code task then runs "
+            f"and reads your summary.\n\n"
             f"The code task's spec, for context:\n{spec}")
 
 
