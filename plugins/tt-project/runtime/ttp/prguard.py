@@ -163,6 +163,13 @@ def pr_key(text: str) -> str | None:
     return f"{m.group(1)}/{m.group(2)}#{int(m.group(3))}".lower() if m else None
 
 
+def is_pr(url) -> bool:
+    """True when `url` names a pull request: a .../<owner>/<repo>/pull/<n> URL or owner/repo#N. Anything
+    else ('none', a branch tree URL) never gets a signature, so it would be re-read, and fail, every run."""
+    v = url.strip() if isinstance(url, str) else ""
+    return bool(pr_key(v) and (PR_URL_RE.match(v) or PR_REF_RE.fullmatch(v)))
+
+
 def safe_pr_url(text) -> str:
     """`text` when it is an https:// PR URL (pr_key parses it from its start, no spaces or quotes), else ''.
     A hand-off's `pr` is stored and shown as a link only then: never a javascript: or other URL."""

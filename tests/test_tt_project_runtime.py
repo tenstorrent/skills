@@ -40028,16 +40028,16 @@ def test_responsibility_inventory_lists_runners_schedules_prs_and_remote_jobs(en
     sched.upsert(p.db, "nightly", "command", "1d", payload={"command": "make nightly"})
     p.db.x("UPDATE schedules SET enabled=0 WHERE name='pr-watch'")
     tid = p.db.add_task("t", "s")
-    p.db.update_task(tid, status="waiting", pr_url="https://example.invalid/pr/1",
+    p.db.update_task(tid, status="waiting", pr_url="https://example.invalid/example-org/example-repo/pull/1",
                      result=json.dumps({"retry_when": "ttp detach --check --host box-c /tmp/x/job"}))
     items = {(i["kind"], i["name"]): i["covered_by"] for i in rs.inventory(p)}
     assert items[("runner", "q1")] == []
     assert items[("schedule", "nightly")] and items[("remote job", f"task #{tid} on box-c")]
-    assert items[("pr", "https://example.invalid/pr/1")] == [], "no PR watcher: not covered"
+    assert items[("pr", "https://example.invalid/example-org/example-repo/pull/1")] == [], "no PR watcher: not covered"
     p.db.x("UPDATE schedules SET enabled=1 WHERE name='pr-watch'")
     items = {(i["kind"], i["name"]): i["covered_by"] for i in rs.inventory(p)}
-    assert items[("pr", "https://example.invalid/pr/1")] == ["builtin: PR watcher pr-watch"]
-    p.db.set_kv("pr_signatures", {"https://example.invalid/pr/1": {"state": "MERGED"}})
+    assert items[("pr", "https://example.invalid/example-org/example-repo/pull/1")] == ["builtin: PR watcher pr-watch"]
+    p.db.set_kv("pr_signatures", {"https://example.invalid/example-org/example-repo/pull/1": {"state": "MERGED"}})
     assert not [i for i in rs.inventory(p) if i["kind"] == "pr"]
     sched.upsert(p.db, "q1-alive", "command", "5m", payload={"heal": {"check": "ssh box-c true", "outage": True}})
     items = {(i["kind"], i["name"]): i["covered_by"] for i in rs.inventory(p)}

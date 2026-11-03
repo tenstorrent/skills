@@ -50,7 +50,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import heal, machines, project
+from . import heal, machines, prguard, project
 
 KV = "responsibilities"            # kv: {"at", "items": [{kind, name, covered_by}], "line"}
 TOLD_KV = "responsibilities_told"  # kv: the missing list the coordinator's digest last named
@@ -193,7 +193,8 @@ def inventory(p, cfg: dict | None = None, db=None, now: float | None = None) -> 
     seen = db.kv("pr_signatures", {}) or {}
     urls = sorted({t["pr_url"] for t in db.q("SELECT pr_url FROM tasks WHERE pr_url IS NOT NULL AND pr_url!='' "
                                              "AND status!='cancelled'")
-                   if str((seen.get(t["pr_url"]) or {}).get("state") or "").upper() not in DONE_PR})
+                   if prguard.is_pr(t["pr_url"])
+                   and str((seen.get(t["pr_url"]) or {}).get("state") or "").upper() not in DONE_PR})
     for url in urls:
         items.append({"kind": "pr", "name": url, "covered_by": [f"builtin: PR watcher {prs_on[0]}"] if prs_on else []})
     for t in db.q("SELECT id, result FROM tasks WHERE status='waiting' ORDER BY id"):

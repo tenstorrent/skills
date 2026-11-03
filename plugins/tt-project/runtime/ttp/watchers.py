@@ -108,9 +108,9 @@ def pr_bounds(daemon, payload: dict) -> tuple[int, float]:
 
 
 def _pr_rows(db) -> list[dict]:
-    """The tasks naming a PR, oldest first (cancelled ones are not watched)."""
-    return db.q("SELECT id, title, pr_url, status FROM tasks WHERE pr_url IS NOT NULL AND pr_url!='' "
-                "AND status NOT IN ('cancelled') ORDER BY id")
+    """The tasks naming a PR, oldest first (cancelled ones are not watched; a pr_url that is no PR is skipped)."""
+    return [t for t in db.q("SELECT id, title, pr_url, status FROM tasks WHERE pr_url IS NOT NULL AND pr_url!='' "
+                            "AND status NOT IN ('cancelled') ORDER BY id") if prguard.is_pr(t["pr_url"])]
 
 
 def _one_per_pr(rows: list[dict], seen: dict) -> list[dict]:

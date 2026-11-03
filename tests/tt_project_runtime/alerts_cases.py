@@ -1376,6 +1376,49 @@ def test_pr_watch_drops_flags_for_cancelled_tasks_and_prs_it_cannot_read(env, mo
 
 
 
+def test_pr_watch_reads_only_real_pr_urls_and_a_hand_off_stores_no_other(env, monkeypatch):
+    """Only a /pull/<n> URL or owner/repo#N is watched and counted as a PR: 'none', a branch tree URL or
+    an empty value never gets a signature, so it is skipped before any gh call, not re-read every run.
+    A hand-off's `pr` that is no PR URL leaves pr_url empty; its text stays in the hand-off record."""
+    from ttp import prguard, responsibilities, watchers
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    p = make(env)
+    good = ["https://github.com/example-org/example-repo/pull/7", "example-org/example-repo#8"]
+    bad = ["none", "https://github.com/example-org/example-repo/tree/feature-x", "", " ",
+           "see https://github.com/example-org/example-repo/pull/9", "example-org/example-repo#9 and more"]
+    for url in good + bad:
+        p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
+               ("t", "code", "done", url, time.time()))
+    assert not [u for u in bad if prguard.is_pr(u)] and all(prguard.is_pr(u) for u in good)
+    viewed = []
+
+    def gh(args, cwd):
+        if args[0] == "api":
+            return None
+        viewed.append(args[2])
+        return {"url": args[2], "state": "OPEN", "title": "t", "isDraft": True, "headRefOid": HEAD}
+    monkeypatch.setattr(watchers, "_gh", gh)
+    p.db.set_kv("pr_signatures", {})
+    rows = watchers._pr_rows(p.db)
+    assert sorted(t["pr_url"] for t in watchers._one_per_pr(rows, {})) == sorted(good)
+    d = Daemon(p.base)
+    for _ in range(2):
+        watchers.watch_prs(d)
+    assert viewed and set(viewed) <= set(good), viewed
+    assert sorted(i["name"] for i in responsibilities.inventory(p) if i["kind"] == "pr") == sorted(good)
+    for pr in ("none", "https://github.com/example-org/example-repo/tree/feature-x"):
+        tid = p.db.add_task("h", "spec", kind="code", tier="light", origin="coordinator")
+        p.db.update_task(tid, status="running")
+        run_dir = env["tmp"] / f"run-nonpr-{tid}"
+        run_dir.mkdir()
+        (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "ok", "pr": pr}))
+        d._finish_worker({"task": tid}, Usage(cost_usd=0.1), "ok", run_dir)
+        task = p.db.task(tid)
+        assert not task["pr_url"] and json.loads(task["result"])["pr"] == pr
+    assert len(watchers._pr_rows(p.db)) == len(good)
+
+
 def test_pr_watch_stops_at_its_deadline_keeps_what_it_read_and_resumes_there(env, monkeypatch):
     """Slow gh calls: a builtin run stops at its total deadline, keeps the PRs it read, reports one error
     that it was cut short (one issue however many runs are cut), and the next run starts at the PR it
