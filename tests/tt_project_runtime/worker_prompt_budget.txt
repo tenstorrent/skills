@@ -21,3 +21,4 @@ code +55: an upstream fix is confirmed by its ack alone (the fixer's receipt), n
 system +55: an upstream fix is confirmed by its ack alone (the fixer's receipt), never by a separate note
 question +55: an upstream fix is confirmed by its ack alone (the fixer's receipt), never by a separate note
 every +55: an upstream fix is confirmed by its ack alone (the fixer's receipt), never by a separate note
+code +20: a hand-written on_pass_cmd tests a checks pass with `ttp checks --result --passed`
