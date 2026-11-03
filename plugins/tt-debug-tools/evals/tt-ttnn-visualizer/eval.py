@@ -94,11 +94,6 @@ def assert_left_to_user(res) -> None:
         assert "--server" not in command, command
 
 
-def visualizer_calls(res) -> list[str]:
-    return [name[len(MCP_PREFIX):] for name, _ in res.tool_uses()
-            if name.startswith(MCP_PREFIX)]
-
-
 def _server_offered(res) -> bool:
     return any(t.startswith(MCP_PREFIX) for t in res.offered_tools())
 
@@ -108,6 +103,18 @@ def server_command() -> str:
     if not command:
         raise SkipEval(f"ttnn-visualizer-mcp not on PATH and {SERVER_COMMAND_ENV} not set")
     return command
+
+
+def loaded_handle(call: dict) -> str:
+    """The handle a successful load_report call returned."""
+    assert not call["is_error"] and call["result"], f"load_report failed: {call}"
+    try:
+        handle = json.loads(call["result"]).get("handle")
+    except (json.JSONDecodeError, AttributeError):
+        m = re.search(r'"handle"\s*:\s*"([^"]+)"', call["result"])
+        handle = m and m.group(1)
+    assert handle, f"load_report returned no handle: {call['result'][:300]}"
+    return handle
 
 
 def report_paths() -> tuple[str, str]:
@@ -226,10 +233,15 @@ def eval_perf_fallback_without_server(agent):
 
 def eval_uses_mcp_when_present(agent):
     """With the server running and a real report on disk, the agent calls
-    load_report before any other visualizer tool and reads the L1 peak. Skill
-    dispatch is not asserted: the server's own instructions can carry an agent
-    straight to the tools, and the tool sequence is what this eval grades."""
+    load_report before any other visualizer tool, reads the L1 peak with the
+    handle load_report returned, and names the right operation. Graded on
+    successful results, not attempted calls, and only against a known answer.
+    Skill dispatch is not asserted: the server's own instructions can carry an
+    agent straight to the tools, and the tool sequence is what this grades."""
     profiler, performance = report_paths()
+    expected = os.environ.get(EXPECTED_OP_ENV)
+    if not expected:
+        raise SkipEval(f"{EXPECTED_OP_ENV} not set: no answer to grade against")
     command = server_command()
     res = agent.ask(
         f"Which operation holds the L1 peak in this TTNN run? Memory report: "
@@ -241,14 +253,14 @@ def eval_uses_mcp_when_present(agent):
     if not _server_offered(res):
         raise SkipEval(f"{SERVER} did not connect ({command})")
 
-    calls = visualizer_calls(res)
-    assert calls and calls[0] == "load_report", calls
-    if f"{MCP_PREFIX}l1_peak" in res.offered_tools():
-        assert "l1_peak" in calls, calls
-    else:
-        # Releases without l1_peak: the skill falls back to memory_profile.
-        assert "memory_profile" in calls, calls
-    expected = os.environ.get(EXPECTED_OP_ENV)
-    if expected:
-        assert expected.lower() in res.answer["primary_signal"].lower(), res.answer
+    calls = [c for c in res.tool_calls() if c["name"].startswith(MCP_PREFIX)]
+    names = [c["name"][len(MCP_PREFIX):] for c in calls]
+    assert names and names[0] == "load_report", names
+    handle = loaded_handle(calls[0])
+    peak_tool = "l1_peak" if f"{MCP_PREFIX}l1_peak" in res.offered_tools() else "memory_profile"
+    # memory_profile is the fallback for releases without l1_peak.
+    peak_reads = [c for c in calls if c["name"] == MCP_PREFIX + peak_tool
+                  and not c["is_error"] and c["input"].get("handle") == handle]
+    assert peak_reads, f"no successful {peak_tool} on handle {handle!r}: {calls}"
+    assert expected.lower() in res.answer["primary_signal"].lower(), res.answer
     assert_left_to_user(res)

@@ -63,6 +63,29 @@ def test_tool_uses_lists_calls_in_order_and_tolerates_missing_input():
     assert result(events).tool_uses() == [("mcp__s__a", {"x": 1}), ("Read", {})]
 
 
+def test_tool_calls_pair_each_call_with_its_result():
+    events = [
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "a", "name": "mcp__s__load_report", "input": {"p": 1}},
+            {"type": "tool_use", "id": "b", "name": "mcp__s__l1_peak", "input": {"handle": "h"}},
+        ]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "a",
+             "content": [{"type": "text", "text": '{"handle": "h"}'}]},
+            {"type": "tool_result", "tool_use_id": "b", "content": "boom", "is_error": True},
+            {"type": "tool_result", "tool_use_id": "unknown", "content": "x"},
+        ]}},
+        tool_use("Read"),
+    ]
+    assert result(events).tool_calls() == [
+        {"name": "mcp__s__load_report", "input": {"p": 1}, "result": '{"handle": "h"}',
+         "is_error": False},
+        {"name": "mcp__s__l1_peak", "input": {"handle": "h"}, "result": "boom",
+         "is_error": True},
+        {"name": "Read", "input": {}, "result": None, "is_error": False},
+    ]
+
+
 def test_offered_tools_reads_the_init_event():
     init = {"type": "system", "subtype": "init", "tools": ["Read", "mcp__s__a"]}
     assert result([init]).offered_tools() == ["Read", "mcp__s__a"]
@@ -164,10 +187,13 @@ def test_assert_left_to_user_passes_reads_and_a_local_app_command():
         result(events, command="ttnn-visualizer --host 127.0.0.1 --profiler-path 'x'"))
 
 
-def test_visualizer_calls_strip_the_prefix_and_ignore_other_tools():
-    events = [tool_use("Read", {}), tool_use("mcp__ttnn-visualizer__load_report", {}),
-              tool_use("mcp__other__load_report", {}), tool_use("mcp__ttnn-visualizer__errors", {})]
-    assert viz.visualizer_calls(result(events)) == ["load_report", "errors"]
+def test_loaded_handle_reads_a_successful_result_only():
+    ok = {"name": "mcp__ttnn-visualizer__load_report", "input": {},
+          "result": json.dumps({"handle": "report-1"}), "is_error": False}
+    assert viz.loaded_handle(ok) == "report-1"
+    for bad in (dict(ok, is_error=True), dict(ok, result=None), dict(ok, result="{}")):
+        with pytest.raises(AssertionError):
+            viz.loaded_handle(bad)
 
 
 def make_report(root, profiler="R1", performance="P1"):

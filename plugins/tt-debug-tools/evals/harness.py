@@ -283,6 +283,32 @@ class AgentResult:
                     calls.append((block.get("name") or "", block.get("input") or {}))
         return calls
 
+    def tool_calls(self) -> list[dict]:
+        """Every tool call attempted, in order, paired with its result:
+        `{"name", "input", "result", "is_error"}`, with `result` the result's
+        text, or None when no result came back."""
+        calls, by_id = [], {}
+        for ev in self.events:
+            for block in ev.get("message", {}).get("content", []) or []:
+                if not isinstance(block, dict):
+                    continue
+                if ev.get("type") == "assistant" and block.get("type") == "tool_use":
+                    call = {"name": block.get("name") or "", "input": block.get("input") or {},
+                            "result": None, "is_error": False}
+                    calls.append(call)
+                    by_id[block.get("id")] = call
+                elif ev.get("type") == "user" and block.get("type") == "tool_result":
+                    call = by_id.get(block.get("tool_use_id"))
+                    if call is None:
+                        continue
+                    content = block.get("content", "")
+                    if isinstance(content, list):
+                        content = " ".join(str(c.get("text", "")) for c in content
+                                           if isinstance(c, dict))
+                    call["result"] = content
+                    call["is_error"] = bool(block.get("is_error"))
+        return calls
+
     def offered_tools(self) -> list[str]:
         """Tool names the host offered the agent, from the init event; MCP
         tools appear here only once their server connected."""

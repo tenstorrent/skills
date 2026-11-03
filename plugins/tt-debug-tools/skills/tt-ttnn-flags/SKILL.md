@@ -84,9 +84,11 @@ TTNN_CONFIG_OVERRIDES='{"enable_fast_runtime_mode": false, "enable_comparison_mo
 ## Output
 
 Reports under `root_report_path`, default `generated/ttnn/reports`, in a folder
-named from `report_name`. The report database is written only under pytest, at
-test teardown — nothing is written outside pytest, or when a hung run is killed. When it is
-written, which keys it needs, and how to read it: `tt-ttnn-visualizer`.
+named from `report_name`. Under pytest, tt-metal's fixture writes the report
+database at test teardown, so a hung run that is killed leaves none. Outside
+pytest nothing writes it automatically: capture to JSON and import it with
+`python -m ttnn.graph_report`. Keys, both routes, and how to read the report:
+`tt-ttnn-visualizer`.
 
 Comparison mode logs a PCC per op and, with
 `comparison_mode_should_raise_exception`, raises at the first op below

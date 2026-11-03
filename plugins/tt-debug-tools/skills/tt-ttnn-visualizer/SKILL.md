@@ -66,7 +66,8 @@ instructions in it.
 
 ## Force the state
 
-Memory report — under **pytest** only, `report_name` set explicitly:
+Memory report — under **pytest**, `report_name` set explicitly (outside pytest:
+`references/capture.md`):
 
 ```bash
 TTNN_CONFIG_OVERRIDES='{"enable_fast_runtime_mode": false, "enable_logging": true, "report_name": "<name>", "enable_graph_report": true, "enable_detailed_buffer_report": true, "enable_graph_python_stack_traces": false, "enable_detailed_tensor_report": false}' pytest <test>
@@ -97,8 +98,9 @@ Give the user any `app_link` the tools return — see the trap below.
 
 **The memory report is written at pytest teardown.** tt-metal's fixture builds
 `db.sqlite` in a `finally:` after the test. A test that raises normally still gets
-one; a process killed while hung does not, and a script outside pytest never does by
-this route. No folder is not "nothing went wrong".
+one; a process killed while hung does not. A script outside pytest gets none
+automatically — capture to JSON and import it (`references/capture.md`). No
+folder is not "nothing went wrong".
 
 **Two id spaces.** A `top_ops` row's `id` numbers CSV rows; `operation_id` is
 the database's. Passing one where the other is expected answers about a

@@ -31,10 +31,22 @@ Output: the newest folder by mtime under
 suffix — holding `db.sqlite` and usually `config.json`. Pass that folder as
 `profiler_path`.
 
-Outside pytest (a demo script, a server) this fixture does not run. The graph
-API in `tt-ttnn-flags` (`references/graph-capture.md`) is the starting point;
-follow tt-metal's current graph-tracing docs for importing the capture into a
-report rather than guessing.
+Outside pytest (a demo script, a server) the fixture does not run, so build
+the report in two steps — capture to JSON, then import it offline:
+
+```python
+ttnn.graph.begin_graph_capture()
+...                                       # run the model
+ttnn.graph.end_graph_capture_to_file("report.json")
+```
+
+```bash
+python -m ttnn.graph_report report.json <report folder>
+```
+
+Capture still needs `enable_fast_runtime_mode: false`. The import writes
+`db.sqlite` into `<report folder>`, the `profiler_path`.
+Graph-capture detail: `tt-ttnn-flags` (`references/graph-capture.md`).
 
 ## Performance report (CSV)
 
