@@ -8843,7 +8843,7 @@ def _cycle_hold(paths: list[str], a, where=None, auto_rec: Project | None = None
         f"(--ignore-cycle-notice proceeds anyway)", cyclenotice.BUSY)
 
 
-SETUP_JOURNAL = ".setup.journal"     # in HOME_DIR/lib while `ttp setup` copies a release in (_recover_setup)
+from .release import SETUP_JOURNAL  # noqa: E402  (release.hold_reason holds automatic upgrades while it exists)
 SETUP_PARTS = ("runtime", "template", "bin", "skills")    # skills: readable by workers of any project
 
 
@@ -9123,7 +9123,14 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
     _untrack_placeholders(p, ident)
     base = _git(h, "rev-parse", "HEAD")     # the merge is checked against this; main must not move meanwhile
     upjournal.step(p, "committed", base=base)
-    _snapshot_upstream(p, src, new_v, new_c, ident)
+    try:
+        _snapshot_upstream(p, src, new_v, new_c, ident)
+    except OSError as e:    # shutil.Error too: a setup copying a release in meanwhile, a full disk
+        if not auto:
+            raise
+        held = release.copy_failed(p, e)
+        die(f"upgrade {'held' if held else 'failed'}: copying the release onto upstream failed: "
+            f"{type(e).__name__}: {e}" + ("; the daemon retries" if held else ""), 75 if held else 1)
     kept: dict[str, str] = {}
     merged, problem = _merge_upstream(h, p.state / "upgrade-merge", ident, base, kept)
     if problem and parked:      # the open task is retargeted (exit 75); nothing is queued while paused
@@ -9811,20 +9818,23 @@ def _refuse_unfinished_merge(p: Project, auto: bool) -> None:
         if auto:
             release.finish(p, "held", why="a harness worktree merge is in progress; the daemon retries")
         die(f"upgrade deferred: harness merge in progress in {h}, daemon retries; nothing was changed", 75)
-    if subprocess.run(["git", "-C", str(h), "rev-parse", "-q", "--verify", "MERGE_HEAD"],
-                      capture_output=True).returncode != 0:
+    sha = release.merge_head(h)
+    if not sha:
         return
     files = _git(h, "diff", "--name-only", "HEAD").splitlines()
     shown = ", ".join(files[:20]) + (f" and {len(files) - 20} more" if len(files) > 20 else "")
     msg = (f"upgrade not applied: an unfinished merge is in the live harness {h} (MERGE_HEAD is set)"
            + (f"; files: {shown}" if shown else "")
            + f". `git -C {shlex.quote(str(h))} merge --abort` restores HEAD; then rerun `ttp upgrade {p.name}`.")
+    try:    # a merge that ends by itself needs no task: the project's own daemon retries (check_release)
+        release.hold_merge(p, sha)
+        msg += f" Held: {p.name}'s daemon retries on its own once the merge ends."
+    except Exception as e:      # a read-only state (a sandbox) records nothing; the refusal stands
+        print(f"could not record the hold in {p.name}'s state: {type(e).__name__}: {e}", file=sys.stderr)
     if auto:            # stderr already goes to logs/upgrade.log; the status line shows the reason
-        release.finish(p, "failed", why="an unfinished merge is in the live harness; `git merge --abort` "
-                                        "there restores HEAD")
-    else:
-        p.logs.mkdir(parents=True, exist_ok=True)
-        append_text(p.logs / "upgrade.log", f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} ttp upgrade\n{msg}\n", p)
+        die(msg, 75)
+    p.logs.mkdir(parents=True, exist_ok=True)
+    append_text(p.logs / "upgrade.log", f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} ttp upgrade\n{msg}\n", p)
     die(msg, 1)
 
 

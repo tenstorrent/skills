@@ -26,6 +26,9 @@ TASK_EVERY_H = 6        # upgrade.task_every_h: at most one upgrade task per pro
 STALE_S = 6 * 3600      # a finish task blocked, or with no run or update this long, no longer holds off a host upgrade
 MERGE_RETRY_H = 6       # upgrade.merge_retry_h: a host-side upgrade queues a merge task once the last ended this long ago
 KV_RELEASE, KV_AUTO = "release", "upgrade_auto"
+SETUP_JOURNAL = ".setup.journal"   # in HOME_DIR/lib while `ttp setup` copies a release in (cli._recover_setup)
+COPY_TRIES = 3          # an --auto upgrade whose template copy fails is held and retried, failed at the third
+RECHECK = "rechecked soon"   # the tail of a hold_reason line check_release looks at again in HELD_RECHECK_S
 
 
 def installed() -> Path:
@@ -454,6 +457,58 @@ def push_in_flight(p: Project) -> bool:
     return any(h.startswith("push:") for h in locks.held(p.state / "locks"))
 
 
+def merge_head(h: Path) -> str:
+    """The live harness's MERGE_HEAD sha ("" when no merge is in progress there)."""
+    r = subprocess.run(["git", "-C", str(h), "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def hold_merge(p: Project, sha: str) -> None:
+    """An unfinished merge (MERGE_HEAD `sha`) in the live harness refused an upgrade, --auto or by hand (a
+    deploy, a push batch): record a hold for the installed release that this project's daemon rechecks
+    every HELD_RECHECK_S and starts once the merge is gone; `since` stays while the same sha does
+    (expire_merge_hold fails it past STALE_S)."""
+    rec = p.db.kv(KV_AUTO) or {}
+    d = drift(p)
+    same = rec.get("outcome") == "held" and rec.get("merge_head") == sha and rec.get("since")
+    if d and rec.get("key") != d["key"]:    # a refusal by hand after another release's try: this one's record
+        rec = {"key": d["key"], "from": d["current"], "to": d["installed"], "ts": time.time()}
+    p.db.set_kv(KV_AUTO, {**rec, "outcome": "held", "ended": time.time(),
+                          "why": f"an unfinished merge is in the live harness (MERGE_HEAD {sha[:12]})",
+                          "merge_head": sha, "since": float(rec["since"]) if same else time.time()})
+
+
+def expire_merge_hold(p: Project) -> str:
+    """check_release, before hold_reason: a merge hold whose MERGE_HEAD is still the same sha past STALE_S
+    is recorded failed; returns the one alert line then ("" otherwise). A new sha restarts the clock."""
+    rec = p.db.kv(KV_AUTO) or {}
+    if rec.get("outcome") != "held" or not rec.get("merge_head"):
+        return ""
+    cur = merge_head(p.harness)
+    if cur and cur != rec["merge_head"]:
+        hold_merge(p, cur)
+    if not cur or cur != rec["merge_head"] or time.time() - float(rec.get("since") or 0) < STALE_S:
+        return ""
+    why = (f"an unfinished merge (MERGE_HEAD {cur[:12]}) has been in the live harness for over "
+           f"{STALE_S // 3600} h; `git -C {p.harness} merge --abort` restores HEAD, then `ttp upgrade {p.name}`")
+    finish(p, "failed", why=why)
+    return why
+
+
+def copy_failed(p: Project, e: BaseException) -> bool:
+    """An --auto upgrade's template copy raised `e` (a setup mid-copy, a full disk): held and retried after
+    HELD_RECHECK_S, recorded failed at the COPY_TRIES-th. True while it is held."""
+    rec = p.db.kv(KV_AUTO) or {}
+    tries = int(rec.get("copy_tries") or 0) + 1
+    why = f"copying the release failed ({type(e).__name__}: {str(e)[:160]})"
+    if tries >= COPY_TRIES:
+        finish(p, "failed", why=f"{why}, {tries} tries", copy_tries=tries)
+        return False
+    finish(p, "held", why=why, copy_tries=tries, until=time.time() + HELD_RECHECK_S)
+    return True
+
+
 def hold_reason(p: Project, d: dict) -> str:
     """Why the daemon must not start an automatic upgrade to `d` now ("" = go)."""
     from . import cyclenotice
@@ -464,7 +519,14 @@ def hold_reason(p: Project, d: dict) -> str:
         return "an upgrade is in flight"
     if push_in_flight(p):
         return "a push is in flight"
+    if (HOME_DIR / "lib" / SETUP_JOURNAL).exists():   # its copy would race ours; any `ttp` run recovers it
+        return f"a `ttp setup` (or its recovery) is copying a release in; {RECHECK}"
     rec = p.db.kv(KV_AUTO) or {}
+    if rec.get("outcome") == "held" and rec.get("merge_head") and merge_head(p.harness):
+        return (f"an unfinished merge is in the live harness since {timefmt.long(float(rec.get('since') or 0), p)}"
+                f"; {RECHECK}")
+    if rec.get("key") == d["key"] and rec.get("outcome") == "held" and time.time() < float(rec.get("until") or 0):
+        return f"{rec.get('why') or 'held'}; retry {int(rec.get('copy_tries') or 0) + 1} of {COPY_TRIES}, {RECHECK}"
     h = finish_holder(p)
     if h:       # a newer release than it targets: `ttp upgrade --auto` retargets the task (once per release)
         if h["key"] == d["key"] or rec.get("key") == d["key"]:
@@ -500,9 +562,10 @@ def launch(p: Project) -> None:
 def start(p: Project, d: dict) -> None:
     """Record the try first, so a crash or a conflict is never retried for the same release."""
     old = p.db.kv(KV_AUTO) or {}
-    cut = int(old.get("interrupted") or 0) if old.get("key") == d["key"] else 0   # upjournal: cuts in a row
+    same = old.get("key") == d["key"]     # upjournal's cuts and copy_failed's tries count in a row
+    kept = {k: int(old[k]) for k in ("interrupted", "copy_tries") if same and old.get(k)}
     p.db.set_kv(KV_AUTO, {"key": d["key"], "from": d["current"], "to": d["installed"], "ts": time.time(),
-                          "outcome": "running", **({"interrupted": cut} if cut else {})})
+                          "outcome": "running", **kept})
     launch(p)
 
 
@@ -536,4 +599,6 @@ def line(p: Project, db, cfg: dict) -> str:
                            f"owner: this project's daemon; resumes at {at})")
         if rec.get("outcome") == "failed":
             return text + f" (the automatic upgrade failed: {rec.get('why') or 'see logs/upgrade.log'})"
+        if rec.get("outcome") == "held" and rec.get("why"):
+            return text + f" (held: {rec['why']}; this project's daemon retries)"
     return text

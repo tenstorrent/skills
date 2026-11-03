@@ -11280,7 +11280,7 @@ def test_upgrade_stops_clearly_on_an_unfinished_merge_in_the_live_harness(env, m
     with pytest.raises(SystemExit):
         cli.main(["upgrade", "demo", "--auto", "--project-dir", str(p.base)])
     rec = p.db.kv(release.KV_AUTO)
-    assert rec["outcome"] == "failed" and "unfinished merge" in rec["why"]
+    assert rec["outcome"] == "held" and "unfinished merge" in rec["why"] and rec["merge_head"]
     # Once the merge is aborted, the upgrade goes through.
     _git_out(h, "merge", "--abort")
     cli.main(["upgrade", "demo"])

@@ -8910,6 +8910,10 @@ class Daemon:
         if getattr(self, "_release_paused", False) and not paused:
             self._release_due = 0.0
         self._release_paused = paused
+        rec = self.p.db.kv(release.KV_AUTO) or {}
+        if rec.get("outcome") == "held" and rec.get("ended") != getattr(self, "_release_held_at", None):
+            self._release_held_at = rec.get("ended")    # a hold another process recorded (a deploy refused
+            self._release_due = min(self._release_due, now + release.HELD_RECHECK_S)   # by a merge): soon
         if now < self._release_due:
             return
         self._release_due = now + release.CHECK_S
@@ -8933,9 +8937,18 @@ class Daemon:
             log(self.p, f"finish-task escalation failed: {type(e).__name__}: {e}")
         if not release.retried(d, self.cfg) or db.kv("paused", False):
             return
+        try:        # the same unfinished merge in the harness past release.STALE_S: failed, one alert
+            stuck = release.expire_merge_hold(self.p)
+        except Exception as e:
+            stuck = ""
+            log(self.p, f"merge-hold check failed: {type(e).__name__}: {e}")
+        if stuck:
+            log(self.p, f"automatic upgrade to {d['installed']} failed: {stuck}")
+            self.alert("upgrade-merge-stuck", f"The automatic upgrade to tt-project {d['installed']} failed: "
+                                              f"{stuck}.", "normal", every_s=0)
         why = release.hold_reason(self.p, d)
         if why:
-            soon = why.endswith(("in flight", release.CYCLE_HELD))
+            soon = why.endswith(("in flight", release.CYCLE_HELD, release.RECHECK))
             if soon:
                 self._release_due = now + release.HELD_RECHECK_S
             if (db.kv(release.KV_AUTO) or {}).get("key") != d["key"] or soon:
