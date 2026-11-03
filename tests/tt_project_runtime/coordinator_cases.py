@@ -21215,3 +21215,7 @@ def test_charter_gate_reads_held_classes_only_from_the_clauses_an_edit_changes(e
     assert [lift(o, n) for o, n in refused] == ["speaks"] * len(refused)
     assert lift("Never force-push after the test on box-a.", "Force-push after the test on box-a.") == "people"
     assert lift("Never spend money on the test on box-a.", "Spend money on the test on box-a.") == "gate"
+    assert lift("Never post results from box-a (user msg #4).", "never   post results from box-a") == ""   # same clause
+    # documented gap (guide, settled rule): a word in one clause that governs another is read where it stands
+    assert lift("Never post: results from box-a or box-b.", "Never post: results from box-a.") == ""
+    assert lift("From box-a or box-b, never post results.", "From box-a, never post results.") == ""

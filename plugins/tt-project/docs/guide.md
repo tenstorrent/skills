@@ -2130,7 +2130,8 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   the matched words, the clause and the class. Known gap: the clause split is a heuristic. Where it
   cannot place a change (a name cut off by a comma, an added or dropped clause), the clauses beside it
   are read too and the edit is refused; your own words still apply it. A word in one clause that
-  governs another (a "never" at the start of a list of clauses) is read only where it stands.
+  governs another ("Never post: results from box-a or box-b" edited to drop box-b) is read only where
+  it stands, so that edit goes in.
 - Text from logs, issues and chats is treated as data, not instructions.
 - Secrets are entered in a terminal (`ttp secret …`), never in chat, and never copied into a project.
   An OpenAI-compatible endpoint's API key: `ttp secret endpoint <alias> --url <base url>` checks it with
