@@ -369,10 +369,18 @@ def test_a_harness_branch_that_fast_forwards_the_harness_passes_a_landed_check_i
     [line] = log.read_text().splitlines()
     assert line.startswith("lands|") and f"ttp/harness-t{tid}" in line and "merges it when the run ends" in line
     assert _hgit(p.harness, "rev-parse", "HEAD").strip() == head, "the check merges nothing"
-    # Once the daemon merged it, the same hand-off reads as merged.
-    p.db.update_task(tid, status="done")
-    assert harnesstree.sweep(p, set()) == {tid: "merged"}
-    assert harnesstree.handoff_landing(p, p.db.task(tid))[0] == "merged"
+    # A named commit already in HEAD while the branch holds more: still lands, not merged.
+    _commit_in_harness_tree(own, "prompts/more.md", "m\n", "more")
+    task = dict(p.db.task(tid), result=json.dumps({"commit": head}))
+    assert harnesstree.handoff_landing(p, task)[0] == "lands"
+    # Once the daemon merged it (the open task keeps its branch), it reads as merged, also after the
+    # harness moved past the branch.
+    p.db.update_task(tid, status="review")
+    assert harnesstree.sweep(p, set()) == {tid: "kept"}
+    task = dict(task, result=json.dumps({"commit": sha}))
+    assert harnesstree.handoff_landing(p, task)[0] == "merged"
+    _commit_in_harness_tree(p.harness, "prompts/later.md", "l\n", "main moved on")
+    assert harnesstree.handoff_landing(p, task)[0] == "merged"
 
 
 def test_a_diverged_harness_branch_or_an_unknown_commit_is_refused_with_steps_the_worker_can_take(env):

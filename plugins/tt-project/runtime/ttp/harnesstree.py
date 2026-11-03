@@ -269,8 +269,9 @@ def handoff_landing(p: Project, task: dict) -> tuple[str, str]:
     """Whether harness task `task`'s hand-off commits land, for a hand-off check (handoffcheck): ("merged",
     why) when each named commit the harness has is in its HEAD; ("lands", why) when some are only on the
     task's branch and that branch fast-forwards HEAD (land merges it once the run ended: the worker's
-    sandbox cannot write the harness checkout); ("refused", what the worker can do) for no named commit
-    the harness has, one on neither, or a branch that does not fast-forward HEAD; ("", "") with no
+    sandbox cannot write the harness checkout), also when the branch holds commits HEAD lacks beyond the
+    named ones; ("refused", what the worker can do) for no named commit the harness has, one on neither,
+    or a branch that neither fast-forwards HEAD nor is in it; ("", "") with no
     harness repo. Unlike merged_commit, which lets dependents start, "lands" is not merged yet."""
     if not _is_repo(p):
         return "", ""
@@ -280,7 +281,9 @@ def handoff_landing(p: Project, task: dict) -> tuple[str, str]:
     rebase = (f"rebase it onto {main} in your worktree {own} (`git rebase {main}` there), commit and hand off "
               f"again; the daemon merges it when your run ends (never merge into the harness checkout yourself: "
               f"your run cannot write it)")
-    if has_b and not fwd:
+    behind = has_b and not fwd and _git(p.harness, "merge-base", "--is-ancestor", f"refs/heads/{b}",
+                                        "HEAD").returncode == 0   # merged already, the harness moved on
+    if has_b and not fwd and not behind:
         return "refused", f"branch {b} does not fast-forward the harness HEAD: {rebase}"
     found, lands = [], False
     for c in named_commits(task):
@@ -299,7 +302,7 @@ def handoff_landing(p: Project, task: dict) -> tuple[str, str]:
     if not found:
         return "refused", (f"the hand-off names no commit of the harness: put the commit on {b} (or in the "
                            f"harness HEAD) in its `commit` field")
-    if lands:
+    if lands or (fwd and unmerged(p, task["id"]) > 0):   # its branch has more for the daemon to merge
         return "lands", (f"{', '.join(found)} on branch {b}, which fast-forwards the harness HEAD: the daemon "
                          f"merges it when the run ends")
     return "merged", f"{', '.join(found)} in the harness HEAD"
