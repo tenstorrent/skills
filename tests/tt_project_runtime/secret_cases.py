@@ -815,8 +815,10 @@ def _files_text(*roots) -> str:
 
 def test_a_sandboxed_secret_env_runs_through_the_daemon_and_the_value_stays_out(env, monkeypatch, capfd):
     store = _jev_store(env, monkeypatch, capfd)
-    code, out, rd, p = _sandboxed_run(env, monkeypatch, capfd, "--secret", "jev:key=JK",
-                                      "--secret", "peer-set:beta=PB", "--", sys.executable, "-c",
+    long_path = os.pathsep.join(str(env["tmp"] / f"no-such-dir-{'x' * 60}-{i}") for i in range(5))
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [os.environ.get("PYTHONPATH"), long_path])))
+    code, out, rd, p = _sandboxed_run(env, monkeypatch, capfd, "--secret", "jev:key=JK",   # a long PYTHONPATH,
+                                      "--secret", "peer-set:beta=PB", "--", sys.executable, "-c",  # as push checks
                                       _PRINT_JEV.replace("sys.exit(5)", "print('pb=' + os.environ['PB']); sys.exit(5)"))
     values = [_JEV_KEY, *store["peer-set"].values(), _CUSTOM]
     assert code == 5, out                                              # the command's exit code
@@ -828,7 +830,8 @@ def test_a_sandboxed_secret_env_runs_through_the_daemon_and_the_value_stays_out(
     rows = [json.loads(x) for x in (p.state / "secret-uses.jsonl").read_text().splitlines()]
     assert rows == [{"at": rows[0]["at"], "task": "77", "run": "9001", "secrets": ["jev:key", "peer-set:beta"]}]
     jobs = json.loads((rd / "detached.json").read_text())
-    assert [j["status"] for j in jobs] == ["queued"] and "jev:key=JK" in jobs[0]["command"]
+    assert [j["status"] for j in jobs] == ["queued"]                # the job list shows what the worker ran
+    assert jobs[0]["command"].startswith("ttp secret env --secret=jev:key=JK --secret=peer-set:beta=PB -- ")
     assert not list((p.state / "detach-queue").glob("*.json"))      # the request was consumed
 
 

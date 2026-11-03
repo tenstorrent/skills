@@ -72,7 +72,13 @@ def job_command(alias: str | None, specs: list[str], argv: list[str]) -> list[st
     from .cli import RUNTIME
     path = os.pathsep.join([str(RUNTIME), *filter(None, [os.environ.get("PYTHONPATH")])])
     return ["env", "-u", SANDBOX_ENV, f"{SERVED_ENV}=1", f"PYTHONPATH={path}", sys.executable, "-m", "ttp",
-            "secret", "env", *([alias] if alias else []), *(f"--secret={s}" for s in specs), "--", *argv]
+            *_shown(alias, specs, argv)[1:]]
+
+
+def _shown(alias: str | None, specs: list[str], argv: list[str]) -> list[str]:
+    """The command as the worker gave it, for the run folder's job list: the launcher prefix (a PYTHONPATH
+    of any length) would push the secrets and the command past the list's 300-character cut."""
+    return ["ttp", "secret", "env", *([alias] if alias else []), *(f"--secret={s}" for s in specs), "--", *argv]
 
 
 def run(alias: str | None, specs: list[str], argv: list[str], out=None) -> int:
@@ -86,7 +92,8 @@ def run(alias: str | None, specs: list[str], argv: list[str], out=None) -> int:
     detach.enqueue(state, rc, log, cmd, os.getcwd(), dict(os.environ))
     with detach.registry(rd) as jobs:
         jobs.append({"name": name, "rc": str(rc), "log": str(log), "pid": None, "started": time.time(),
-                     "queued": True, "status": "queued", "command": " ".join(cmd)[:300]})
+                     "queued": True, "status": "queued",
+                     "command": " ".join(_shown(alias, specs, argv))[:300]})
     print(f"ttp secret env: the sandbox cannot read the secrets store; the daemon runs the command "
           f"(log {log})", file=sys.stderr)
     deadline, pos = time.time() + detach.QUEUED_S + START_GRACE_S, 0
