@@ -75,7 +75,8 @@ def record(f: Path, line: dict, cache: dict, warn: Callable[[str], None]) -> boo
             size = 0
         if size and size + len(data) > MAX_BYTES:
             os.replace(f, f.with_name(OLD))
-        with open(f, "ab") as fh:
+        from .project import open_append
+        with open_append(f, "ab") as fh:
             fh.write(data)
         cache["last"], cache["failed"] = key, False
         return True

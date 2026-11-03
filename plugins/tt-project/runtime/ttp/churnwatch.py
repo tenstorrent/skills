@@ -218,7 +218,8 @@ def record(f: Path, obs: dict, now: float | None, cache: dict, warn: Callable[[s
             size = 0
         if size and size + len(data) > MAX_BYTES:
             os.replace(f, f.with_name(f.name + ".1"))
-        with open(f, "ab") as fh:
+        from .project import open_append
+        with open_append(f, "ab") as fh:
             fh.write(data)
         cache["failed"] = False
         return True

@@ -211,6 +211,7 @@ from .project import (
     disk_resume_gb,
     durable_append,
     durable_write,
+    open_append,
     git_fsync_env,
     file_tail,
     hostname,
@@ -633,7 +634,7 @@ def _log_write(p: Project, stamp: str, msg: str) -> None:
     path = p.logs / "daemon.log"
     try:
         p.logs.mkdir(parents=True, exist_ok=True)
-        with open(p.logs / "daemon.log", "a") as f:
+        with open_append(p.logs / "daemon.log") as f:
             if _LOG_FAIL["n"]:   # a failed flush may have left part of a line: end it first
                 f.write(("\n" if _log_torn(path) else "") + f"{stamp} daemon.log: {_LOG_FAIL['n']} line(s) "
                         "dropped or cut short while it could not be written\n")
@@ -1414,7 +1415,7 @@ class Daemon:
         """The open STACKS_FILE (register_stack_dump), else state/STACKS_FILE opened for appending."""
         if _STACK_FILE and not _STACK_FILE[0].closed:
             return contextlib.nullcontext(_STACK_FILE[0])
-        return open(self.p.state / STACKS_FILE, "a")
+        return open_append(self.p.state / STACKS_FILE)
 
     def _watch_ticks(self, every_s: float = 30) -> None:
         """A thread that dumps every thread's stack when a tick overruns (check_overrun)."""
@@ -2235,6 +2236,17 @@ class Daemon:
         except Exception:
             log(self.p, "checking observation mute ends failed\n" + traceback.format_exc())
 
+    def record_refused_appends(self) -> None:
+        """Each append durable_append refused this daemon (a symlink or special file planted where a
+        state log goes): a daemon.log line and a handled event keeping the text, so nothing is lost
+        unseen and no model runs for it."""
+        from .project import refused_appends
+        for r in refused_appends():
+            text = f"refused to append to {r['path']}: {r['why']}"
+            log(self.p, text)
+            self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+                        (r["ts"], "daemon", "append_refused", "normal", text[:500], json.dumps(r), "handled"))
+
     def tend_pushes(self) -> None:
         """Start the detached pushes and jobs queued from inside a sandbox; record the dead pushes as failed. Then
         the push queue's bookkeeping, also while paused: approvals whose review moved on, a queue
@@ -2256,6 +2268,10 @@ class Daemon:
             hostrun.serve(self.p)
         except Exception:
             log(self.p, "serving ttp host-run requests failed\n" + traceback.format_exc())
+        try:
+            self.record_refused_appends()
+        except Exception:
+            log(self.p, "recording refused appends failed\n" + traceback.format_exc())
         try:   # the jobs of tasks that ended without success, and `ttp detach --stop` requests (jobstop)
             from . import jobstop
             due = time.monotonic() >= getattr(self, "_jobstop_due", 0.0)
@@ -15837,7 +15853,7 @@ def register_stack_dump(state: Path):
     try:
         if path.exists() and path.stat().st_size > STACKS_MAX_BYTES:
             path.replace(path.with_name(path.name + ".1"))
-        f = open(path, "a")
+        f = open_append(path)
         faulthandler.register(signal.SIGUSR1, file=f, all_threads=True)
     except (OSError, ValueError, AttributeError, RuntimeError):
         return None

@@ -827,7 +827,7 @@ def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: floa
                 h.close()
             if mark:
                 locks.unreserve(mark, mine)
-            with open(run_dir / "progress.md", "a") as pf:
+            with project.open_append(run_dir / "progress.md") as pf:
                 pf.write(f"{_clock(env)} {got.line}; the run did not start\n")
             return True
 
@@ -861,7 +861,7 @@ def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: floa
                 locks.reserve(mark, mine)
             _touch(run_dir / "lease")
             if time.time() - told >= 120:
-                with open(run_dir / "progress.md", "a") as pf:
+                with project.open_append(run_dir / "progress.md") as pf:
                     pf.write(f"{_clock(env)} waiting for {res['resource']} "
                              f"(held by {', '.join(locks.holders_now(paths, where)) or 'another task'})\n")
                 told = time.time()

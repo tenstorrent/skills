@@ -819,14 +819,16 @@ def _full_daemon_log(monkeypatch):
     state filesystem); clear it and space has returned."""
     import builtins
     import errno
-    real, full = builtins.open, threading.Event()
+    import functools
+    real, real_os, full = builtins.open, os.open, threading.Event()
     full.set()
 
-    def fake(file, *a, **k):
+    def fake(file, *a, real=real, **k):
         if full.is_set() and str(file).endswith("daemon.log"):
             raise OSError(errno.ENOSPC, "No space left on device", str(file))
         return real(file, *a, **k)
     monkeypatch.setattr(builtins, "open", fake)
+    monkeypatch.setattr(os, "open", functools.partial(fake, real=real_os))   # project.open_append
     return full
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import difflib
+import errno
 import fcntl
 import json
 import math
@@ -12,6 +13,7 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -1382,7 +1384,7 @@ class Project:
         print(f"ttp: {msg}", file=sys.stderr)
         try:
             self.logs.mkdir(parents=True, exist_ok=True)
-            with open(self.logs / "daemon.log", "a") as f:
+            with open_append(self.logs / "daemon.log") as f:
                 f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}\n")
         except OSError:
             pass
@@ -1442,7 +1444,7 @@ class Project:
         """A line in the daemon's log, which every process of the project may append to."""
         try:
             self.logs.mkdir(parents=True, exist_ok=True)
-            with open(self.logs / "daemon.log", "a") as f:
+            with open_append(self.logs / "daemon.log") as f:
                 f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} harness git: {msg}\n")
         except OSError:
             pass
@@ -2275,13 +2277,58 @@ def replace_copy(src: str | Path, dst: str | Path, *, follow_symlinks: bool = Tr
     return str(dst)
 
 
-def durable_append(path: Path, text: str) -> None:
+class AppendRefused(OSError):
+    """An append target that is a symlink or not a regular file: never followed, never written."""
+
+
+_REFUSED_APPENDS: list[dict] = []   # refused durable_append calls, until the daemon records them
+REFUSED_KEEP = 200
+
+
+def open_append(path: Path, mode: str = "a", **kw):
+    """open(path, mode) for appending ("a", "ab", "a+", "ab+") that never follows a symlink at `path`
+    and opens nothing but a regular file (a FIFO would hang the writer): those raise AppendRefused.
+    Workers can write the state and run folders, and the daemon appends there outside the sandbox: a
+    planted symlink would aim the text it appends at any file the user can write."""
+    flags = os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_RDWR if "+" in mode else os.O_WRONLY)
+    try:
+        fd = os.open(path, flags, 0o666)
+    except OSError as e:
+        if os.path.islink(path) or e.errno == errno.ENXIO:   # ELOOP (EMLINK on BSD); ENXIO: a FIFO
+            raise AppendRefused(e.errno, "a symlink or special file is never appended to", str(path)) from None
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise AppendRefused(errno.EINVAL, "not a regular file: never appended to", str(path))
+        return os.fdopen(fd, mode, **kw)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def refused_appends() -> list[dict]:
+    """The appends durable_append refused in this process since the last call, oldest first."""
+    out = _REFUSED_APPENDS[:]
+    del _REFUSED_APPENDS[:len(out)]
+    return out
+
+
+def durable_append(path: Path, text: str) -> bool:
     """Append `text` and sync it, so an appended line that was reported written survives a power
     cut. A file this creates gets its directory synced as well. A last line a crash cut short (no
-    newline at the end) gets one first, so it never swallows this entry."""
+    newline at the end) gets one first, so it never swallows this entry. A symlink or special file
+    at `path` is refused (open_append): stderr says so, the text is kept for refused_appends (the
+    daemon records it as an event) and False comes back; other write failures raise."""
     path = Path(path)
-    new = not path.exists()
-    with open(path, "ab+") as f:
+    new = not os.path.lexists(path)
+    try:
+        f = open_append(path, "ab+")
+    except AppendRefused as e:
+        print(f"ttp: refused to append to {path}: {e.strerror}", file=sys.stderr)
+        _REFUSED_APPENDS.append({"ts": time.time(), "path": str(path), "why": e.strerror, "text": text[:2000]})
+        del _REFUSED_APPENDS[:-REFUSED_KEEP]
+        return False
+    with f:
         if f.seek(0, os.SEEK_END):
             f.seek(-1, os.SEEK_END)
             if f.read(1) != b"\n":
@@ -2291,6 +2338,7 @@ def durable_append(path: Path, text: str) -> None:
         os.fsync(f.fileno())
     if new:
         fsync_dir(path.parent)
+    return True
 
 
 _git_version: tuple[int, ...] | None = None
