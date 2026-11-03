@@ -155,15 +155,23 @@ def fingerprint(title: str, spec: str) -> str:
 
 
 def _lines(raw: bytes) -> tuple[list[dict], int]:
-    """The complete lines of `raw` as notes, and how many bytes they took. A torn last line waits."""
+    """The complete lines of `raw` as notes, and how many bytes they took. A torn last line waits.
+    An escalation line (`escalate`) raises the severity of the note before it with its fingerprint and
+    is not a note of its own; one whose note is not in `raw` (read from a cursor) stands for it."""
     end = raw.rfind(b"\n") + 1
-    notes = []
+    notes, at = [], {}
     for ln in raw[:end].splitlines():
         try:
             n = json.loads(ln)
         except ValueError:
             continue
         if isinstance(n, dict) and n.get("fp"):
+            i = at.get(n["fp"]) if n.get("escalation") else None
+            if i is not None:
+                if _rank(n.get("severity")) > _rank(notes[i].get("severity")):
+                    notes[i] = {**notes[i], "severity": n["severity"], "escalated": n.get("escalated") or n.get("ts")}
+                continue
+            at.setdefault(n["fp"], len(notes))
             notes.append(n)
     return notes, end
 
@@ -270,14 +278,15 @@ def send(source: str, task: int | None, to: str, text: str, severity: str = "nor
          now: float | None = None, sender: str = "worker", at: str | None = None,
          extra: dict | None = None, back: str | None = None, confirms: str | None = None) -> str:
     """File a worker's note for project `to` in this machine's inbox. Returns "sent", "duplicate" (the
-    same text to the same project is already there, or this task's note naming the same note ids,
-    `_repeat`) or "limited" (`source` filed NOTES_PER_HOUR
+    same text to the same project is already there at the same or a higher severity, or this task's note
+    naming the same note ids, `_repeat`) or "limited" (`source` filed NOTES_PER_HOUR
     addressed notes in the last hour). `at`: the forward target that runs `to` when this machine's
     registry does not know it (`find_peer`); the forwarder sends the note there. `back`: the machine a
     reply goes back to on its own next call here (`reply_route`), never sent from here. `sender` "daemon": the source project's daemon routed it, model-free
     (machine_ledger.py); such a page is not limited and does not count against the workers' notes, and
     `extra` (a daemon's only) adds fields such as an `outage` record (outagetask.py) the target files.
-    `confirms`: the fingerprint of a note `to` resolved, which this note only confirms (`confirmation`)."""
+    `confirms`: the fingerprint of a note `to` resolved, which this note only confirms (`confirmation`).
+    The same text at a higher severity than the note filed is an escalation (`escalate`): "sent"."""
     now = now or time.time()
     # A daemon's page is cut, saying so; a worker's note past the limit raises (`note_text`).
     text = note_text(cut(" ".join(str(text).split()), "the source daemon's log") if sender == "daemon" else text)
@@ -289,8 +298,13 @@ def send(source: str, task: int | None, to: str, text: str, severity: str = "nor
         fcntl.flock(f, fcntl.LOCK_EX)
         f.seek(0)
         notes = _lines(f.read())[0]
-        if any(n["fp"] == fp for n in notes) or (sender != "daemon"
-                                                 and _repeat(notes, source, task, to, text, confirms, now, severity)):
+        had = next((n for n in notes if n["fp"] == fp), None)
+        if (had is not None and sender != "daemon" and severity in NOTE_SEVERITIES
+                and _rank(severity) > _rank(had.get("severity"))):
+            f.write(escalate(had, severity, now))
+            f.flush()
+            return "sent"
+        if had is not None or (sender != "daemon" and _repeat(notes, source, task, to, text, confirms, now, severity)):
             return "duplicate"
         # A daemon's page (bounded by its routing, once per step) is neither limited nor counted.
         if sender != "daemon" and sum(1 for n in notes if n.get("to") and n.get("project") == source
@@ -307,6 +321,15 @@ def send(source: str, task: int | None, to: str, text: str, severity: str = "nor
                             sort_keys=True) + "\n").encode())
         f.flush()
     return "sent"
+
+
+def escalate(n: dict, severity: str, now: float) -> bytes:
+    """The inbox line that raises filed note `n` to `severity`: the note again, marked `escalation`. The
+    inbox is only appended to (readers and forwarders keep byte cursors), so the note is not rewritten:
+    every reader folds this line into it (`_lines`), and a project that read the note gets it once more
+    as an escalation (`_file`); the forwarder sends it on like a note (`_append_received`)."""
+    return (json.dumps({**{k: v for k, v in n.items() if k not in ("escalated", "escalation")},
+                        "severity": severity, "escalation": True, "escalated": now}, sort_keys=True) + "\n").encode()
 
 
 OUTBOX_FILE = "notes-outbox.jsonl"   # in a project's state/: its addressed notes past the hourly limit
@@ -349,7 +372,8 @@ def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str
     """`send`, except that a note past the hourly limit, or behind notes already waiting, is appended to
     the project's outbox (state/OUTBOX_FILE) for its daemon to file in order as the limit allows
     (`drain_outbox`): the limit caps how fast notes reach the inbox, never the worker that wrote one.
-    Returns ("sent" | "duplicate" | "queued" | "full", the note's place in the outbox or 0)."""
+    Returns ("sent" | "duplicate" | "queued" | "full", the note's place in the outbox or 0).
+    The same text at a higher severity raises a waiting note in place, and a filed one at once (`send`)."""
     now = now or time.time()
     text = note_text(text)
     check_placeholder(text)
@@ -358,12 +382,15 @@ def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str
         waiting = _outbox(state)
         for i, n in enumerate(waiting, 1):
             if n["fp"] == fp:
+                if severity in NOTE_SEVERITIES and _rank(severity) > _rank(n.get("severity")):
+                    n["severity"] = severity
+                    _rewrite(Path(state) / OUTBOX_FILE, waiting)
                 return "queued", i
-        if not waiting:
+        if not waiting or _filed(fp):
             got = send(source, task, to, text, severity, now, at=at, back=back, confirms=confirms)
             if got != "limited":
                 return got, 0
-        elif _filed(fp) or repeat_of(state, source, task, to, text, confirms, now, waiting, severity):
+        elif repeat_of(state, source, task, to, text, confirms, now, waiting, severity):
             return "duplicate", 0
         if len(waiting) >= OUTBOX_MAX:
             return "full", 0
@@ -659,7 +686,8 @@ def ingest(p: project.Project, cfg: dict, now: float | None = None, force_remote
 
 def _file(p: project.Project, sources, offsets: dict, known: set, seen: list, now: float, only_to: bool = False) -> int:
     """New notes in `sources` as events for `p`'s coordinator; moves `offsets` and `seen`. Notes
-    addressed to a project are for that project only; `only_to` keeps just those."""
+    addressed to a project are for that project only; `only_to` keeps just those. A note read before
+    and since raised (`escalate`) comes once more, as an escalation, once per severity."""
     added = 0
     me = (p.name, project.hostname())
     from .coordinator import EVENT_CHARS_BY_KIND
@@ -676,10 +704,19 @@ def _file(p: project.Project, sources, offsets: dict, known: set, seen: list, no
             to = n.get("to")
             if (to or only_to) and (to != p.name or src not in (LOCAL, LOCAL_TO)):
                 continue      # addressed to another project (or not addressed): not this project's to read
+            esc = f"{n['fp']}:{n.get('severity')}" if to and n.get("escalated") else ""
             if n["fp"] in known:
+                if esc and esc not in known:
+                    known.add(esc)
+                    seen.append(esc)
+                    head = f"escalated to {n.get('severity')} (a note this project already has, sent again): "
+                    sev, text = _event(n, cap - len(head))
+                    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                           (now, "upstream", "upstream_note", sev, head + text, "queued"))
+                    added += 1
                 continue
-            known.add(n["fp"])
-            seen.append(n["fp"])
+            known.update({n["fp"], esc} - {""})
+            seen.extend([n["fp"]] + ([esc] if esc else []))
             if not to and (n.get("project"), n.get("host")) == me:
                 continue      # this project's own notes reached its coordinator with the hand-off
             if to and n.get("from") == "worker" and _close_confirmation(p, n, now):
@@ -1719,8 +1756,11 @@ def _valid(n) -> dict | None:
     out = {"ts": ts, "project": n["project"], "host": n["host"], "task": task, "title": title, "spec": spec, "fp": fp}
     if to is not None:
         sev = n.get("severity")
+        up = n.get("escalated")
         out.update({"to": to, "from": "worker", "severity": sev if sev in NOTE_SEVERITIES else "normal",
-                    **({"confirms": n["confirms"]} if _confirms(n.get("confirms")) else {})})
+                    **({"confirms": n["confirms"]} if _confirms(n.get("confirms")) else {}),
+                    **({"escalation": True, "escalated": up if isinstance(up, (int, float)) and not isinstance(up, bool)
+                        else time.time()} if n.get("escalation") is True else {})})
     return out
 
 
@@ -1765,20 +1805,21 @@ def receive(stream: bytes, via: str, now: float | None = None) -> tuple[dict, in
 
 def _append_received(notes: list[dict], via: str) -> tuple[int, int]:
     """File notes another machine sent (`_valid` ones) in this machine's inbox with `via`, skipping the
-    fingerprints it has: (accepted, duplicates)."""
+    fingerprints it has, except an escalation above the severity filed (`escalate`): (accepted, duplicates)."""
     accepted = duplicates = 0
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
     fd = os.open(path(), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(fd, "rb+") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         f.seek(0)
-        have = {n["fp"] for n in _lines(f.read())[0]}
+        have = {n["fp"]: n for n in _lines(f.read())[0]}
         out = b""
         for n in notes:
-            if n["fp"] in have:
+            old = have.get(n["fp"])
+            if old is not None and not (n.get("escalation") and _rank(n["severity"]) > _rank(old.get("severity"))):
                 duplicates += 1
             else:
-                have.add(n["fp"])
+                have[n["fp"]] = n if old is None else {**old, "severity": n["severity"]}
                 out += (json.dumps({**n, "via": via}, sort_keys=True) + "\n").encode()
                 accepted += 1
         if out:

@@ -975,6 +975,104 @@ def test_a_higher_severity_repeat_is_queued_on_the_outbox_and_run_queue_paths(en
     assert [n["severity"] for n in upstream._outbox(src.state)] == ["low", "high"]
 
 
+def _addressed(env, fp):
+    """The inbox as its readers see it (`_lines`): the notes with id `fp`."""
+    from ttp import upstream
+    return [n for n in upstream._lines((env["home"] / "upstream.jsonl").read_bytes())[0] if n["fp"] == fp]
+
+
+@pytest.mark.parametrize("first,second,raised", [("low", "high", True), ("normal", "high", True),
+                                                  ("normal", "normal", False), ("high", "low", False)])
+def test_the_same_note_again_at_a_higher_severity_raises_the_stored_note_and_surfaces_once(env, first, second, raised):
+    """The same text to the same project at a strictly higher severity raises the stored note's severity:
+    still one note to every reader, surfaced once more as an escalation. At the same or a lower severity
+    it is dropped as a duplicate."""
+    from ttp import upstream
+    src, dst, _ = _confirm_pair(env)
+    text = "the forwarder stalls on a full outbox"
+    assert upstream.send(src.name, 57, "second", text, severity=first) == "sent"
+    assert upstream.ingest(dst, dst.config()) == 1
+    assert upstream.send(src.name, 57, "second", text, severity=second) == ("sent" if raised else "duplicate")
+    (n,) = _addressed(env, upstream.note_id("second", text))
+    assert n["severity"] == (second if raised else first)
+    assert upstream.ingest(dst, dst.config()) == (1 if raised else 0)
+    assert upstream.ingest(dst, dst.config()) == 0
+    events = _queued_notes(dst)
+    assert len(events) == (2 if raised else 1)
+    if raised:
+        assert events[-1]["severity"] == "high" and events[-1]["text"].startswith("escalated to high")
+        assert text in events[-1]["text"]
+        # Once raised, the same text at that severity is a duplicate again.
+        assert upstream.send(src.name, 57, "second", text, severity="high") == "duplicate"
+
+
+def test_a_note_and_its_escalation_read_together_surface_once_at_the_higher_severity(env):
+    """A reader that meets the note and its escalation in one read files one event, at the raised severity."""
+    from ttp import upstream
+    src, dst, _ = _confirm_pair(env)
+    assert upstream.send(src.name, 57, "second", "builds hang", severity="low") == "sent"
+    assert upstream.send(src.name, 57, "second", "builds hang", severity="high") == "sent"
+    assert upstream.ingest(dst, dst.config()) == 1
+    (ev,) = _queued_notes(dst)
+    assert ev["severity"] == "high" and "builds hang" in ev["text"]
+
+
+def test_the_same_note_at_a_higher_severity_raises_it_on_the_outbox_and_run_queue_paths(env, monkeypatch):
+    """Past the hourly limit: the same text as a waiting outbox note raises that entry in place (one entry);
+    as a note already filed it raises the filed note at once (an escalation is not limited), from a worker
+    and from a run's queue; at the same or a lower severity it stays dropped."""
+    from ttp import upstream
+    src, dst, _ = _confirm_pair(env)
+    now = time.time()
+    assert upstream.send(src.name, 57, "second", "filed note", severity="normal", now=now) == "sent"
+    assert upstream.send(src.name, 57, "second", "queued run note", severity="low", now=now) == "sent"
+    for i in range(upstream.NOTES_PER_HOUR - 2):
+        upstream.send(src.name, 1, "second", f"filler {i}", now=now)
+    assert upstream.send_or_queue(src.state, src.name, 57, "second", "waiting note", "low", now=now) == ("queued", 1)
+    assert upstream.send_or_queue(src.state, src.name, 57, "second", "waiting note", "high", now=now) == ("queued", 1)
+    assert upstream.send_or_queue(src.state, src.name, 57, "second", "waiting note", "normal", now=now) == ("queued", 1)
+    assert [n["severity"] for n in upstream._outbox(src.state)] == ["high"]
+    assert upstream.send_or_queue(src.state, src.name, 57, "second", "filed note", "high", now=now) == ("sent", 0)
+    assert upstream.send_or_queue(src.state, src.name, 57, "second", "filed note", "normal", now=now) == ("duplicate", 0)
+    assert [n["severity"] for n in _addressed(env, upstream.note_id("second", "filed note"))] == ["high"]
+    run_dir = _note_run(env, monkeypatch, src)
+    upstream.queue(run_dir, "second", "queued run note", "high")
+    upstream.queue(run_dir, "second", "filed note", "low")
+    got = upstream.send_queued(run_dir, src.name, 57, src.state)
+    assert (got["sent"], got["duplicate"], got["queued"]) == (1, 1, 0), got
+    assert [n["severity"] for n in _addressed(env, upstream.note_id("second", "queued run note"))] == ["high"]
+    assert upstream.outbox_pending(src.state) == 1
+
+
+def test_only_a_workers_note_at_a_known_higher_severity_raises_the_filed_note(env):
+    """A daemon's page with the same text, or a worker's at a severity that is not one, stays a duplicate."""
+    from ttp import upstream
+    src, dst, _ = _confirm_pair(env)
+    assert upstream.send(src.name, 57, "second", "disk nearly full", severity="low") == "sent"
+    assert upstream.send(src.name, None, "second", "disk nearly full", "high", sender="daemon") == "duplicate"
+    assert upstream.send(src.name, 57, "second", "disk nearly full", severity="urgent") == "duplicate"
+    assert [n["severity"] for n in _addressed(env, upstream.note_id("second", "disk nearly full"))] == ["low"]
+    assert len((env["home"] / "upstream.jsonl").read_text().splitlines()) == 1
+
+
+def test_an_escalation_forwarded_from_another_machine_raises_the_received_note(env):
+    """The forwarder sends an escalation like any line; the receiver raises the note it has (one note,
+    higher severity), counts a repeat of it as a duplicate, and files it as the note if it lacks one."""
+    from ttp import upstream
+    sent = _pushed_note("second", "the sweep logs are gone")
+    up = {**sent, "severity": "high", "escalation": True, "escalated": time.time()}
+    ack, rc = upstream.receive((json.dumps(sent) + "\n" + json.dumps(up) + "\n").encode(), "laptop")
+    assert (rc, ack["accepted"], ack["duplicates"], ack["rejected"]) == (0, 2, 0, 0)
+    ack, rc = upstream.receive((json.dumps(up) + "\n").encode(), "laptop")
+    assert (rc, ack["accepted"], ack["duplicates"]) == (0, 0, 1)
+    (n,) = _addressed(env, sent["fp"])
+    assert n["severity"] == "high" and n["via"] == "laptop"
+    other = _pushed_note("second", "a note only its escalation reached")
+    assert upstream.receive((json.dumps({**other, "severity": "high", "escalation": True}) + "\n").encode(),
+                            "laptop")[0]["accepted"] == 1
+    assert [n["severity"] for n in _addressed(env, other["fp"])] == ["high"]
+
+
 def test_a_confirmation_that_also_reports_a_problem_still_wakes_the_coordinator(env, monkeypatch):
     """Only the marker of a clean fix here closes a note: words alone never do, nor a marker of a note
     with no release fix, one resolved by another project, one closed as wontfix, or one the sender
