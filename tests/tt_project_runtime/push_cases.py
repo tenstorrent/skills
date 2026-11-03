@@ -16036,3 +16036,34 @@ def test_ttp_land_through_the_daemon_never_overwrites_a_dirty_or_moved_checkout_
     (p.state / "heartbeat").write_text(json.dumps({"pid": 1, "takes": ["apply_requests"]}))
     assert landff.request(p, repo, "proj", base, head, "")[0] == "failed"
     assert not list((p.state / landff.DIR).glob("*.req"))
+
+
+def test_push_queue_batch_checks_run_at_nice_19_and_idle_io_like_ttp_checks(env, monkeypatch, tmp_path):
+    """The push queue's batch checks (its run, rerun and cap probe) start under testslots.low_priority,
+    as `ttp push` and `ttp checks` suites do: a check's own process reports nice 19 and idle IO."""
+    import ast
+    import inspect
+    import textwrap
+    from ttp import batch, push, testslots
+    monkeypatch.setattr(testslots, "_cfg", lambda: None)
+    src = inspect.getsource(batch)
+    calls = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "check_argv"]
+    assert len(calls) == 1, "every batch check argv comes from batch._check_argv"
+    streamed = [n.args[0] for n in ast.walk(ast.parse(src))
+                if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "_stream" and n.args]
+    checks = [a for a in streamed if isinstance(a, ast.Call)]
+    assert len(checks) == 3 and all(getattr(a.func, "id", "") == "_check_argv" for a in checks), \
+        "the batch run, rerun and cap probe all stream a _check_argv"
+    argv = batch._check_argv("x", tmp_path)
+    assert argv[len(argv) - len(push.check_argv("x", tmp_path)):] == push.check_argv("x", tmp_path)
+    if not (shutil.which("nice") and shutil.which("ionice")):
+        return   # the live check needs both tools (`nice -n 19` reaches 19 from any lower level)
+    probe = tmp_path / "probe.py"
+    probe.write_text(textwrap.dedent("""
+        import os, subprocess
+        print("nice", os.nice(0))
+        print("io", subprocess.run(["ionice", "-p", str(os.getpid())], capture_output=True, text=True).stdout.strip())
+    """))
+    rc, tail, _ = batch._stream(batch._check_argv(f"{shlex.quote(sys.executable)} {probe}", tmp_path), tmp_path)
+    assert rc == 0, tail
+    assert "nice 19" in tail and "io idle" in tail, tail
