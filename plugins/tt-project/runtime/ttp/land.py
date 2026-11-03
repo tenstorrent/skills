@@ -7,8 +7,8 @@ between a review and its landing costs a rebase task and a re-review.
 It replays the head's commits that the branch lacks (git cherry) onto the branch's tip in a scratch
 worktree, each with a Ttp-Replayed-From trailer naming the reviewed commit, runs delivery.push_checks
 there, and fast-forwards the branch to the result (in the worktree that has it checked out, when
-one does). The landing is recorded for the task (task_landings), so `landed:#<id>` passes for it and
-the review that ran it, and the review's verdict covers the landed commit too (reviewreuse).
+one does; the daemon does that when a worker sandbox cannot write the checkout, see landff). The
+landing is recorded for the task (task_landings), so `landed:#<id>` passes for it and the review that ran it, and the review's verdict covers the landed commit too (reviewreuse).
 
 A commit that becomes empty on the branch's tip (its change is already there) is dropped. When the
 branch moves during the checks or the fast-forward, it starts over on the new tip, up to MOVE_TRIES
@@ -41,7 +41,7 @@ from typing import Callable
 
 from . import push, reviewreuse
 from .project import Project, push_allowed
-from . import gitmemo, repoid
+from . import applyff, gitmemo, landff, repoid
 
 LANDED, FAILED, REFUSED, CONFLICT, CHECKS_FAILED, MOVED, DIRTY, BUSY = 0, 1, push.REFUSED, push.CONFLICT, \
     push.CHECKS_FAILED, push.KEPT_MOVING, push.REJECTED, push.BUSY
@@ -181,9 +181,10 @@ def _checks(p: Project, wt: Path, new: str, base: str, say: Callable[[str], None
     return 0
 
 
-def _move(repo: Path, branch: str, base: str, new: str, say: Callable[[str], None]) -> int:
+def _move(p: Project, repo: Path, branch: str, base: str, new: str, say: Callable[[str], None]) -> int:
     """Fast-forward local branch `branch` from `base` to `new`: in the worktree that has it checked
-    out (only while it has no uncommitted changes), else the ref itself, guarded by `base`."""
+    out (only while it has no uncommitted changes), else the ref itself, guarded by `base`. A checkout
+    this process cannot write (a worker sandbox) is fast-forwarded by the daemon instead (landff)."""
     if push._local_tip(repo, branch) != base:
         say(f"local branch {branch} moved off {base[:10]} during the checks; nothing landed. Run `ttp land` again")
         return MOVED
@@ -194,7 +195,17 @@ def _move(repo: Path, branch: str, base: str, new: str, say: Callable[[str], Non
             say(f"{branch} is checked out in {held} with uncommitted changes: fast-forwarding it there would mix "
                 f"them with this work; nothing landed. Commit or discard them there, then run `ttp land` again")
             return DIRTY
-        r = _git(wt, "merge", "--ff-only", "--quiet", new)
+        # A worker sandbox writes .git but not the project root's working tree: the daemon moves it then.
+        blocked = applyff.unwritable(wt, base, new)
+        r = None if blocked else _git(wt, "merge", "--ff-only", "--quiet", new)
+        if r is None or r.returncode != 0 and applyff.no_write(r.stderr or r.stdout):
+            say(f"cannot write {held} here ({blocked or (r.stderr or r.stdout).strip()[-200:]}); asking the "
+                f"daemon to fast-forward {branch} there")
+            outcome, text = landff.request(p, wt, branch, base, new, os.environ.get("TTP_TASK") or "")
+            if outcome == "done" or push._local_tip(repo, branch) == new:
+                return LANDED
+            say(text)
+            return MOVED if push._local_tip(repo, branch) != base else DIRTY if "uncommitted" in text else FAILED
         if r.returncode != 0 and push._local_tip(repo, branch) != base:
             say(f"local branch {branch} moved off {base[:10]} in {held}; nothing landed. Run `ttp land` again")
             return MOVED
@@ -324,7 +335,7 @@ def _land(p: Project, repo: Path, branch: str, base: str, full: str, commits: li
                 return LANDED
             if rc := _checks(p, wt, new, base, say):
                 return rc
-            if rc := _move(repo, branch, base, new, say):
+            if rc := _move(p, repo, branch, base, new, say):
                 return rc
         finally:
             _git(repo, "worktree", "remove", "--force", str(wt))

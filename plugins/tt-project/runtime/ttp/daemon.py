@@ -45,7 +45,7 @@ from . import lanewait
 from . import chainprio
 from . import churnwatch
 from . import alerts
-from . import applyff
+from . import applyff, landff
 from . import userstep
 from . import workernotify
 from . import anchors
@@ -1189,6 +1189,7 @@ class Daemon:
                 except Exception:  # never in the way of a new restart request
                     log(self.p, "restart reap error: " + traceback.format_exc().replace("\n", " | ")[:2000])
                 applyff.take(self.p)          # a sandboxed `ttp upgrade --apply` asks for its fast-forward
+                landff.take(self.p)           # a sandboxed `ttp land` asks for the fast-forward of a checkout
                 self._restart_on_moved_runtime()
                 service.take_restart_request(self.p, self._started)   # a sandboxed `ttp upgrade --apply` asked
             except Exception:  # a bad tick must never kill the daemon
@@ -1384,7 +1385,7 @@ class Daemon:
         held = shared.held(self.p, self.cfg)
         if not self._healthy or held != self._held:
             durable_write(hb, json.dumps({"pid": os.getpid(), "host": hostname(), "started": self._started,
-                                          "boot": self.boot, "held": held, "takes": ["restart_requests", "apply_requests"],
+                                          "boot": self.boot, "held": held, "takes": ["restart_requests", "apply_requests", landff.TAKES],
                                           "receipt": self.identity}))
             self._held = held
         else:

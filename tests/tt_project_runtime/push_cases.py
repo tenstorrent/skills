@@ -15921,3 +15921,117 @@ def test_a_scratch_clone_of_a_shallow_or_grafted_repository_has_a_whole_history(
     r = subprocess.run(["git", "-C", str(grafted), "-c", "advice.graftFileDeprecated=false", "log", "--oneline"],
                        capture_output=True, text=True)
     assert r.returncode == 0 and r.stdout == want and len(want.splitlines()) == 2
+
+
+def _land_daemon(p, before=None):
+    """A stand-in daemon on another thread: once `ttp land` writes its request it runs before() (which
+    gives the tree back its write access, as the host has) and takes the request (landff.take)."""
+    import threading
+    from ttp import landff
+    (p.state / "heartbeat").write_text(json.dumps({"pid": 1, "takes": [landff.TAKES]}))
+    done = []
+
+    def run():
+        end = time.time() + 30
+        while time.time() < end and not list((p.state / landff.DIR).glob("*.req")):
+            time.sleep(0.05)
+        if before:
+            before()
+        done.append(landff.take(p))
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t, done
+
+
+def _checkout_dirs(repo):
+    """The working tree's directories a worker sandbox cannot write: all but .git and the project's
+    state, which lives under the root here and which the sandbox writes."""
+    return [d for d in _tree_dirs(repo) if "tt-project" not in d.relative_to(repo).parts]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes read-only directories")
+def test_ttp_land_in_a_sandbox_that_cannot_write_the_main_checkout_hands_the_fast_forward_to_the_daemon(
+        env, monkeypatch):
+    """The project's main checkout has the push branch checked out and a worker sandbox writes its .git
+    but not its working tree (simulated with directory modes): `ttp land` asks the daemon to
+    fast-forward it there. The branch, HEAD and the files all end on the landed commit, clean."""
+    from ttp import landff
+    land, p, repo, t, head = _land_setup(env, monkeypatch, ["true"])
+    assert Path(p.root).resolve() == Path(repo).resolve()
+    _git_out(repo, "checkout", "-q", "proj")
+    dirs = _checkout_dirs(repo)
+    _read_only(dirs)
+    said = []
+    try:
+        th, done = _land_daemon(p, before=lambda: _writable(dirs))
+        rc = land.land(p, repo, head, t, said.append)
+        th.join(10)
+    finally:
+        _writable(dirs)
+    assert rc == 0 and done == [1], said
+    assert any("asking the daemon to fast-forward proj" in m for m in said), said
+    assert _git_out(repo, "rev-parse", "proj") == _git_out(repo, "rev-parse", "HEAD") == head
+    assert (repo / "a.txt").read_text() == "a\n" and _clean(repo)
+    assert [r["sha"] for r in p.db.q("SELECT sha FROM task_landings WHERE task=?", (t,))] == [head]
+    assert not list((p.state / landff.DIR).iterdir()), "request and result are cleaned up"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes read-only directories")
+def test_ttp_land_through_the_daemon_never_overwrites_a_dirty_or_moved_checkout_and_withdraws_an_untaken_request(
+        env, monkeypatch):
+    """The daemon checks the request again: a checkout that got uncommitted changes, a branch that
+    moved or a commit that does not descend from its tip, a path outside the project's repo or a
+    malformed request lands nothing and loses nothing. With no daemon taking it, the request is
+    withdrawn and nothing moves."""
+    from ttp import landff
+    land, p, repo, t, head = _land_setup(env, monkeypatch, ["true"])
+    _git_out(repo, "checkout", "-q", "proj")
+    base = _git_out(repo, "rev-parse", "proj")
+    dirs = _checkout_dirs(repo)
+
+    def dirty():
+        _writable(dirs)
+        (repo / "README.md").write_text("my edit\n")
+    _read_only(dirs)
+    said = []
+    try:
+        th, done = _land_daemon(p, before=dirty)
+        rc = land.land(p, repo, head, t, said.append)
+        th.join(10)
+    finally:
+        _writable(dirs)
+    assert rc == land.DIRTY and done == [1], said
+    assert any("uncommitted changes" in m and "nothing landed" in m for m in said), said
+    assert (repo / "README.md").read_text() == "my edit\n" and _git_out(repo, "rev-parse", "proj") == base
+    _git_out(repo, "checkout", "-q", "--", "README.md")
+
+    def ask(**kw):
+        d = p.state / landff.DIR
+        d.mkdir(parents=True, exist_ok=True)
+        info = {"at": time.time(), "worktree": str(repo), "branch": "proj", "base": base, "new": head, **kw}
+        (d / "x.req").write_text(json.dumps(info))
+        assert landff.take(p) == 1
+        out = json.loads((d / "x.result").read_text())
+        (d / "x.result").unlink()
+        assert out["outcome"] == "failed" and _git_out(repo, "rev-parse", "proj") == base and _clean(repo), out
+        return out["text"]
+    assert "moved off" in ask(base=head)
+    assert "diverged" in ask(new=_git_out(repo, "commit-tree", f"{base}^{{tree}}", "-m", "unrelated"))
+    assert "not a checkout of proj" in ask(worktree=str(env["tmp"]))
+    assert "malformed" in ask(new="")
+    assert "malformed" in ask(at=time.time() - 10 * landff.WAIT_S)
+    # No daemon takes it: withdrawn, so no later daemon moves the branch for a run that gave up.
+    monkeypatch.setattr(landff.request, "__defaults__", (0.3,))
+    (p.state / "heartbeat").write_text(json.dumps({"pid": 1, "takes": [landff.TAKES]}))
+    _read_only(dirs)
+    said = []
+    try:
+        rc = land.land(p, repo, head, t, said.append)
+    finally:
+        _writable(dirs)
+    assert rc == land.FAILED and any("did not take the landing request" in m for m in said), said
+    assert not list((p.state / landff.DIR).glob("*.req")) and _git_out(repo, "rev-parse", "proj") == base
+    # An older daemon that does not take landing requests: refused at once, nothing written.
+    (p.state / "heartbeat").write_text(json.dumps({"pid": 1, "takes": ["apply_requests"]}))
+    assert landff.request(p, repo, "proj", base, head, "")[0] == "failed"
+    assert not list((p.state / landff.DIR).glob("*.req"))
