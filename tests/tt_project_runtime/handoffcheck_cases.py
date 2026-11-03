@@ -340,7 +340,7 @@ def _hc_harness(env, p):
     return tid, own, log
 
 
-def _read_only(root):
+def _freeze_harness_tree(root):
     """Make every file and folder of the harness checkout's working tree read-only, as in a worker's
     sandbox (its .git stays writable, as the daemon's merge needs); returns the undo."""
     changed = []
@@ -360,7 +360,7 @@ def test_a_harness_branch_that_fast_forwards_the_harness_passes_a_landed_check_i
     _commit_in_harness_tree(own, "prompts/extra.md", "more\n", "prompt")
     sha = _hgit(own, "rev-parse", "HEAD").strip()
     head = _hgit(p.harness, "rev-parse", "HEAD").strip()
-    undo = _read_only(p.harness)
+    undo = _freeze_harness_tree(p.harness)
     try:
         t = _hc_hand_off(env, p, tid, {"status": "done", "summary": "tuned the prompt", "commit": sha})
     finally:
