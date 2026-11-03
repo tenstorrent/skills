@@ -231,6 +231,17 @@ def test_a_daemon_taking_neither_request_gets_no_sandboxed_merge_task_and_a_clea
     with pytest.raises(SystemExit):
         cli._refuse_unappliable_task(p, True, "a conflict")
     assert finished and finished[0][0] == "failed" and "nor restart requests" in finished[0][1], finished
+    # A stopped daemon's heartbeat stays behind: it is no route problem, as the next daemon starts on the
+    # runtime on disk, which takes the requests; the merge task is queued as usual.
+    old = time.time() - 3600
+    os.utime(p.state / "heartbeat", (old, old))
+    assert applyff.route(p)[0] == "down"
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE kind='harness'")["n"] == 1, capsys.readouterr()
+    # ... unless that runtime on disk predates them too
+    monkeypatch.setattr(applyff, "_disk_takes", lambda p: "")
+    assert applyff.route(p)[0] == "none"
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root writes read-only directories")

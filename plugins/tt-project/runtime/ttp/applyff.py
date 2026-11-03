@@ -135,16 +135,17 @@ def _disk_takes(p) -> str:
 def route(p) -> tuple[str, str]:
     """How a sandboxed --apply gets main moved, and why: "apply" (the running daemon takes fast-forward
     requests), "restart" (it predates them but takes restart requests, and the runtime on disk it would
-    restart onto takes them), "down" (no daemon heartbeat; one started later runs the runtime on disk,
+    restart onto takes them), "down" (no daemon runs; one started later runs the runtime on disk,
     which takes them) or "none" (no way from a sandbox)."""
-    from .daemon import heartbeat
+    from .daemon import HEARTBEAT_STALE_S, heartbeat
     hb = heartbeat(p) or {}
     takes = hb.get("takes") or []
     if "apply_requests" in takes:
         return "apply", ""
     disk = _disk_takes(p)
-    if not hb:
-        return ("down" if disk else "none"), f"no daemon of {p.name} runs (no heartbeat)"
+    if not hb or hb.get("age", 0) > HEARTBEAT_STALE_S:
+        # a stopped daemon's heartbeat stays behind: the next one starts on the runtime on disk
+        return ("down" if disk else "none"), f"no daemon of {p.name} runs"
     ran = (hb.get("receipt") or {}).get("version") or "an older runtime"
     who = f"the running daemon of {p.name} (pid {hb.get('pid', '?')}, ttp {ran}) does not take fast-forward requests"
     if "restart_requests" not in takes:

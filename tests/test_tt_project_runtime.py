@@ -44754,7 +44754,8 @@ def test_the_after_push_deploy_takes_a_paused_projects_stuck_merge_over_and_name
     p.db.set_kv("daemon", {"pid": pid, "host": "testhost", "started": old})
     (p.state / "heartbeat").write_text(json.dumps({"pid": pid, "host": "testhost", "receipt": {
         "version": overview.runtime_version(rt), "commit": release.runtime_commit(rt), "runtime": str(rt),
-        "pid": pid, "started": old, "instance": "inst-demo", "provenance": "verified"}}))
+        "pid": pid, "started": old, "instance": "inst-demo", "provenance": "verified"},
+        "takes": ["restart_requests", "apply_requests"]}))   # as that release's daemon writes it
     (p.state / "tick_done").write_text(json.dumps({"instance": "inst-demo", "pid": pid}))
     now = time.time()
     report = deploy.record(p, overview.deployed(names=["demo"]), now)
