@@ -130,3 +130,39 @@ def test_superseded_by_hand_takes_a_passed_re_review_or_a_reachable_commit(env, 
     assert "go with superseded" in capsys.readouterr().err
     del obranch
 
+
+
+def test_the_unhandled_failed_review_check_skips_a_superseded_review(env):
+    """Daemon._raise_unhandled_failed_reviews raises a task in review whose latest review asked for
+    changes an hour ago (control), but not once that review is recorded superseded."""
+    from ttp import reviewsup
+    from ttp.daemon import Daemon
+    from ttp.db import SUPERSEDED, task_outcome
+    p = make(env)
+    d = Daemon(p.base)
+    db, now = p.db, time.time()
+
+    def stuck(title):
+        code = db.add_task(title, "s", kind="code", origin="user")
+        db.update_task(code, status="review")
+        rev = db.add_task(f"Review #{code}: {title}", "s", kind="review", origin="daemon",
+                          labels=[f"auto_review:{code}"])
+        db.update_task(rev, status="failed", result=json.dumps(
+            {"status": "changes_needed", "summary": "no", "followups": [{"title": "Add a test", "spec": "x"}]}))
+        db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+             (now - 2 * 3600, f"task:{rev}", "task_changes_needed", "normal", "review ended", "handled", rev))
+        return code, rev
+
+    def raised():
+        return [r["task"] for r in db.q("SELECT task FROM events WHERE kind='review_failed_unhandled'")]
+    kept, _ = stuck("parser change")
+    gone, rev = stuck("cache change")
+    assert reviewsup._record(db, rev, {"by_review": None, "sha": "a" * 40, "ref": "main", "how": "manual",
+                                       "ts": now})
+    assert task_outcome(db.task(rev)) == SUPERSEDED
+    d._raise_unhandled_failed_reviews(now)
+    assert raised() == [kept], raised()
+    # Without the record the same review is raised.
+    db.x("UPDATE tasks SET result=? WHERE id=?", (json.dumps({"status": "changes_needed", "summary": "no"}), rev))
+    d._raise_unhandled_failed_reviews(now)
+    assert sorted(raised()) == sorted([kept, gone]), raised()

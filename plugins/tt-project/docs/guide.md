@@ -311,6 +311,12 @@ prolonged whole-box outage.
   project may word the rule that way. The rule sits in its own block of `prompts/kind-review.md`,
   between `<!-- ttp:result-rule -->` marker lines the prompt leaves out: a project that rewords it
   keeps its wording through template upgrades without merge conflicts.
+- A failed or `changes_needed` review is closed as superseded, keeping its verdict: automatically,
+  model-free, once a later re-review in its chain passes; or by hand with
+  `ttp task <project> superseded <id> --by-review <passed re-review id>` or
+  `ttp task <project> superseded <id> <covering commit> [--ref <ref>]` (the commit must be on the push
+  branch or `--ref`). Without evidence it is refused. Superseded reviews leave the open lists and the
+  unhandled-failed-review check; `ttp task show` names what superseded them.
 - Each tier maps to a model and effort per provider (`providers.<name>.tiers`). The coordinator
   runs at `coordinator.tier` (light) unless `coordinator.model` or `coordinator.effort` is set:
   those pin the coordinator alone. Unset, it takes the model of `coordinator.model_tier`
