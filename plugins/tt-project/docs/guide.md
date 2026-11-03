@@ -975,7 +975,10 @@ queues behind routine work; nothing running is interrupted:
   per resource and exit. The daemon's checks take at most about one timeout per tick. Every tick, and
   each `ttp lock` waiter on every try, releases a harness lock whose recorded holder is dead (pid gone,
   or reused per its recorded start time) and that no live process of the holder's group keeps; a
-  leftover process of the holder's own run is stopped, any other one is left and named. A waiter queued
+  leftover process of the holder's own run is stopped, any other one is left and named. A slot labelled
+  for a detached job that wrote its .rc, has no process left and whose task is done, failed or cancelled
+  is freed even from a leftover of the holder's group; `ttp detach --reap` and `--stop` on that job free
+  it at once (never while the holder lives or this host cannot judge it). A waiter queued
   past `locks.wait_alert_min` (30 min; 0 off) raises one `lock-wait:<lock>` alert per lock naming the
   holder; it clears when the wait ends. A `ttp checks` slot waiter alerts only while a holder is not
   judged alive (dead, reused pid, or one the daemon cannot judge): a queue behind live checks is normal.

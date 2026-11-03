@@ -9,7 +9,9 @@ belongs to a process with another start time: a reused pid) while the lock is st
 process has the lock's file open: one that inherited it (a process an older `ttp lock` command left
 running). The sweep (Reaper.sweep: every daemon tick, and each try of a waiting `ttp lock`) then
 - keeps it while any process of the holder's process group, or the `ttp lock` that took it, still
-  holds it (a long, legitimate hold);
+  holds it (a long, legitimate hold), unless the label names a detached job that is over (ended_job:
+  its .rc written, no process of the job left, its task done, failed or cancelled): then a process of
+  its group that keeps it is a leftover, reaped as below;
 - reaps the process(es) keeping it when every one is the harness's own from the holder's same run
   (TTP_RUN_ID in its environment matches the label's run_id, and TTP_PROJECT its project when it names one): SIGTERM, then SIGKILL on a later sweep;
 - leaves it otherwise: the processes are named in the wait alert (long_waits).
@@ -42,6 +44,7 @@ from . import locks
 WAIT_ALERT_MIN = 30   # config locks.wait_alert_min: a lock wait longer than this raises lock-wait:<name>
 GRACE_S = 60.0        # a holder seen dead this long (two sweeps) before what keeps its lock is reaped
 KILL_AFTER_S = 10.0   # a reaped process still there this long after SIGTERM gets SIGKILL
+FREE_WAIT_S = 3.0     # free_ended (`ttp detach --reap/--stop`) waits this long after each signal for a slot to go free
 EVENT_KIND = "lock_released"
 # While the daemon runs, a dead holder's lock that only its own run keeps is released this soon: the first
 # tick that sees it dead, GRACE_S later the SIGTERM, KILL_AFTER_S after that the SIGKILL, plus tick slack.
@@ -203,8 +206,9 @@ class Reaper:
     """Remembers, across sweeps of one long-lived process (the daemon, a waiting `ttp lock`), when each
     lock's holder was first seen dead and which processes it sent SIGTERM."""
 
-    def __init__(self, grace_s: float = GRACE_S):
+    def __init__(self, grace_s: float = GRACE_S, ended=None):
         self.grace_s, self.dead_since, self.termed = grace_s, {}, {}
+        self.ended = ended   # label -> why its detached job and task are over ("" if not): ended_job
 
     def sweep(self, paths, now: float | None = None) -> dict:
         """Judge each slot file in `paths` (see the module doc). Returns {"released": [...], "kept":
@@ -237,12 +241,15 @@ class Reaper:
                 continue
             pg = h.get("pgid")
             group = [x for x in procs if pg and _pgid(x) == pg]
-            if group:   # a live member of its process group holds it: a legitimate hold
+            over = (self.ended(h) if self.ended and h.get("job_rc") else "") or ""
+            if group and not over:   # a live member of its process group holds it: a legitimate hold
                 self.dead_since.pop(key, None)
                 continue
+            if over:
+                why = f"{why}; {over}"
             if not procs:
                 continue   # let go meanwhile
-            own = [x for x in procs if _same_run(h, x)]
+            own = [x for x in procs if _same_run(h, x) or x in group]
             survivors = [{"pid": x, "command": cmdline(x), "same_run": x in own} for x in procs]
             if len(own) < len(procs):
                 out["kept"][key] = {**info, "dead_why": why, "survivors": survivors,
@@ -262,6 +269,63 @@ class Reaper:
             if reaped:
                 out["released"].append({**info, "dead_why": why, "reaped": reaped})
         return out
+
+
+def ended_job(p, h: dict) -> str:
+    """Why slot label `h` names a detached job of project `p` that is over, else "": its .rc (job_rc,
+    under the project's state) is written, no process of the job holds its job lock, and its task
+    (task_id) is done, failed or cancelled. Another project's label, or a task still running or queued
+    to retry, gives "". What else keeps the slot then is a leftover of the job (Reaper.sweep)."""
+    from .db import TERMINAL_TASK_STATES
+    rc, task = str(h.get("job_rc") or ""), str(h.get("task_id") or "")
+    if not rc or not task.isdigit() or (h.get("project") and h["project"] != Path(p.base).name):
+        return ""
+    try:
+        rc = Path(rc).resolve()
+        if not rc.is_relative_to(Path(p.state).resolve()) or not rc.exists():
+            return ""
+    except (OSError, ValueError):
+        return ""
+    if not locks.any_free([locks.job_lock(rc)]):
+        return ""   # a process of the job still lives: jobstop ends it
+    row = p.db.one("SELECT status FROM tasks WHERE id=?", (int(task),))
+    if not row or row["status"] not in TERMINAL_TASK_STATES:
+        return ""
+    return f"its detached job {rc.stem} ended (exit code written, no process left) and its task #{task} is {row['status']}"
+
+
+def free_ended(p, rc: Path) -> dict:
+    """`ttp detach --reap` and `--stop` on a job that is over: free now, without the sweep's grace, each
+    slot whose label names this job (jobstop.job_slots) and that ended_job judges over, by reaping its
+    leftovers as the sweep would (SIGTERM, then SIGKILL after KILL_AFTER_S). Logs each release as an
+    event. Returns {"freed": [...], "held": {slot: why}} by slot name."""
+    from .jobstop import job_slots
+    slots = job_slots(p, Path(rc).resolve())
+    r, t0 = Reaper(grace_s=0, ended=lambda h: ended_job(p, h)), time.time()
+    released, kept = [], {}
+    for step in (0.0, KILL_AFTER_S):   # the sweep's clock: SIGTERM first, SIGKILL once KILL_AFTER_S "passed"
+        left = [s for s in slots if _held(s) == "held"]
+        if not left:
+            break
+        got = r.sweep(left, t0 + step)
+        released += got["released"]
+        kept.update(got["kept"])
+        end = time.monotonic() + FREE_WAIT_S
+        while got["released"] and time.monotonic() < end and any(_held(s) == "held" for s in left):
+            time.sleep(0.1)
+    record(p.db, released)
+    held = {}
+    for s in slots:
+        if _held(s) != "held":
+            continue
+        h = label(s)
+        if str(s) in kept:
+            held[s.name] = kept[str(s)]["left"]
+        elif not ended_job(p, h):
+            held[s.name] = "its job or its task is not over"
+        else:
+            held[s.name] = f"its holder is {verdict(h)[0]} ({verdict(h)[1]})"
+    return {"freed": [s.name for s in slots if s.name not in held], "held": held, "released": released}
 
 
 def holder_info(path: Path, h: dict | None = None) -> dict:

@@ -430,3 +430,76 @@ def test_a_devq_wait_ends_when_its_task_stops_waiting_on_that_probe(env):
     d.reap_locks()
     assert not p.db.one("SELECT id FROM alerts WHERE key='lock-wait:devq:r1' AND cleared IS NULL")
     assert not p.db.kv(lockreap.DEVQ_WAITS_KEY)
+
+
+def _ended_job_slot(p, tmp_path, status, **label):
+    """A slot held for detached job `job` of a task with `status`, its .rc written, and labelled for its
+    command (pid 4100, group 4100, run 70) unless `label` says otherwise. Returns (open file, slot path)."""
+    tid = p.db.add_task("uses the rig", kind="code")
+    p.db.x("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+    rc = p.runs / "70" / "job.rc"
+    rc.parent.mkdir(parents=True, exist_ok=True)
+    rc.write_text("0\n")
+    path = p.state / "locks" / "rig-z.0.lock"
+    fields = {"pid": 4100, "pid_start": "11", "pgid": 4100, "via": "command", "run_id": "70", "task_id": str(tid),
+              "project": p.base.name, "job": "job", "job_rc": str(rc.resolve()), **label}
+    return _reap_slot(path, **fields), path
+
+
+@pytest.mark.parametrize("case", ["freed", "holder alive", "taker alive", "task running", "task queued", "unknown pid",
+                                  "no rc", "job lives", "other project"])
+def test_lockreap_frees_a_slot_an_ended_detached_jobs_leftover_keeps_only_once_job_and_task_are_over(
+        env, monkeypatch, tmp_path, case):
+    """A slot whose label names a detached job that wrote its .rc, has no process holding its job lock and
+    whose task ended: a leftover of the holder's process group that keeps it is reaped (it was a
+    'legitimate hold' before). Any live, unknown or unfinished part keeps the hold and signals nothing."""
+    import fcntl
+    import signal as sg
+    from ttp import lockreap, locks
+    p = make(env)
+    label = {"taker alive": {"taker_pid": 4000}, "unknown pid": {"node": "elsewhere"},
+             "other project": {"project": "another"}}.get(case, {})
+    status = {"task running": "running", "task queued": "queued"}.get(case, "cancelled")
+    f, path = _ended_job_slot(p, tmp_path, status, **label)
+    rc = p.runs / "70" / "job.rc"
+    held = []
+    if case == "no rc":
+        rc.unlink()
+    if case == "job lives":   # a process of the job still holds the job's own lock
+        held.append(open(locks.job_lock(rc), "a+"))
+        fcntl.flock(held[0], fcntl.LOCK_EX | fcntl.LOCK_NB)
+    procs = {4101: {"start": "12", "pgid": 4100, "env": {}, "cmd": "keeper"}}   # a leftover of the group, no run env
+    if case == "holder alive":
+        procs[4100] = {"start": "11", "pgid": 4100}
+    if case == "taker alive":
+        procs[4000] = {"start": "5", "pgid": 4100}
+    try:
+        fake = _ReapProcs(monkeypatch, procs, [4101])
+        r = lockreap.Reaper(ended=lambda h: lockreap.ended_job(p, h))
+        assert not r.sweep([path], 1000.0)["released"]
+        got = r.sweep([path], 1000.0 + lockreap.GRACE_S + 1)
+        if case != "freed":
+            assert not got["released"] and not fake.sent, got
+            return
+        assert fake.sent == [(4101, sg.SIGTERM)]
+        [rel] = got["released"]
+        assert "job ended" in rel["dead_why"] and "is cancelled" in rel["dead_why"], rel
+        assert "is cancelled" in lockreap.release_text(rel)
+        # Without the ended-job check (an older daemon) the same leftover is a legitimate group hold.
+        fake.sent.clear()
+        assert not _reap_sweep([path])["released"] and not fake.sent
+    finally:
+        f.close()
+        for x in held:
+            x.close()
+
+
+@pytest.mark.parametrize("status", ["done", "failed"])
+def test_lockreap_ended_job_counts_every_ended_task_state(env, tmp_path, status):
+    from ttp import lockreap
+    p = make(env)
+    f, path = _ended_job_slot(p, tmp_path, status)
+    try:
+        assert f"is {status}" in lockreap.ended_job(p, lockreap.label(path))
+    finally:
+        f.close()

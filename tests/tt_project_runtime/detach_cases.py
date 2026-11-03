@@ -555,6 +555,67 @@ def test_detach_reap_closes_an_ended_job_refuses_a_live_one_and_is_idempotent(en
     assert "--reap" in _ttp_run(p, "detach", "--help").stdout
 
 
+def _leftover_slot(p, rc, res, tid):
+    """Slot `res` of the project held by a real leftover process (no run in its environment, in a session
+    of its own that the label names as the holder's group), its label naming detached job `rc` of task
+    `tid` and a command pid that is gone: the hold an older sweep kept as a live group member's. Returns
+    the leftover."""
+    import fcntl
+    from ttp import locks
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    path = p.state / "locks" / f"{res}.0.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("TTP_")}
+        left = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], pass_fds=[f.fileno()],
+                                start_new_session=True, env=env)
+        f.truncate(0)
+        f.write(json.dumps({"holder": f"task #{tid} (run 7)", "since": time.time(), "pid": gone.pid, "pid_start": "1",
+                            "pgid": left.pid, "via": "command", "node": os.uname().nodename, "pidns": locks._pid_ns(),
+                            "run_id": "7", "task_id": str(tid), "project": p.base.name, "job": rc.stem,
+                            "job_rc": str(rc)}))
+        f.flush()
+    return left
+
+
+def test_detach_reap_and_stop_free_the_slot_a_finished_jobs_leftover_holds_once_its_task_ended(env, tmp_path):
+    """A job that wrote its .rc, no process of it left, a leftover still holding a lock slot labelled for it:
+    `ttp detach --reap` and `--stop` keep the slot while the job's task is open and free it (stopping the
+    leftover) once the task is cancelled."""
+    from ttp import locks
+    p = make(env)
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    tid = p.db.add_task("uses the rig", kind="code")
+    rc = _detach_job(p, run_dir, env, "job", ["sh", "-c", "exit 0"])
+    assert _until_true(lambda: rc.exists() and locks.any_free([locks.job_lock(rc)]))
+    e = _lock_job_env(env, p, run_dir)
+    lefts = [_leftover_slot(p, rc, "rig-z", tid), _leftover_slot(p, rc, "rig-y", tid)]
+    try:
+        r = _ttp_run(p, "detach", "--reap", "job", env=e)
+        assert r.returncode == 0 and "rig-z.0.lock stays held: its job or its task is not over" in r.stdout, r.stdout
+        assert all(x.poll() is None for x in lefts)
+        p.db.x("UPDATE tasks SET status='cancelled' WHERE id=?", (tid,))
+        r = _ttp_run(p, "detach", "--reap", "job", env=e)
+        assert r.returncode == 0 and "freed the lock slots its leftovers held: rig-y.0.lock, rig-z.0.lock" in r.stdout, \
+            (r.stdout, r.stderr)
+        assert all(x.wait(timeout=20) is not None for x in lefts)
+        assert locks.any_free([p.state / "locks" / "rig-z.0.lock"]) and locks.any_free([p.state / "locks" / "rig-y.0.lock"])
+        ev = p.db.one("SELECT text FROM events WHERE kind='lock_released' ORDER BY id DESC LIMIT 1")
+        assert ev and "is cancelled" in ev["text"], ev
+        lefts = [_leftover_slot(p, rc, "rig-x", tid)]
+        r = _ttp_run(p, "detach", "--stop", str(rc), env=e)
+        assert r.returncode == 0 and "not running" in r.stdout and "rig-x.0.lock" in r.stdout, (r.stdout, r.stderr)
+        assert lefts[0].wait(timeout=20) is not None and locks.any_free([p.state / "locks" / "rig-x.0.lock"])
+    finally:
+        for x in lefts:
+            if x.poll() is None:
+                x.kill()
+                x.wait()
+
+
 def test_detach_lock_job_closed_as_died_leaves_no_lock_held_or_shown_held(env, tmp_path):
     from ttp import activity, detach
     p = make(env)

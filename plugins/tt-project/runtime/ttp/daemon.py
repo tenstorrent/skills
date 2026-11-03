@@ -8638,8 +8638,8 @@ class Daemon:
             log(self.p, "charter re-raise: " + traceback.format_exc().replace("\n", " | ")[:1000])
 
     def reap_locks(self) -> None:
-        """Every tick, model-free (ttp.lockreap): reap what keeps a harness lock whose holder is dead
-        (the project's slot locks, its shared resources' and the check slots), log each release as an
+        """Every tick, model-free (ttp.lockreap): reap what keeps a harness lock whose holder is dead,
+        or that a detached job of this project left once it and its task ended (the project's slot locks, its shared resources' and the check slots), log each release as an
         event, and raise one lock-wait:<name> alert per lock a waiter has waited on past
         locks.wait_alert_min, naming its holder; it clears once nobody waits that long. The checks-slot
         queue counts only while a holder is not judged alive; a waiting task's device-queue job counts
@@ -8648,7 +8648,7 @@ class Daemon:
         now, db = time.time(), self.p.db
         own = [self.p.state / "locks"]
         shared_dirs = [shared.root() / r for r in sorted(shared.names(self.cfg))]
-        reaper = getattr(self, "_lock_reaper", None) or lockreap.Reaper()
+        reaper = getattr(self, "_lock_reaper", None) or lockreap.Reaper(ended=lambda h: lockreap.ended_job(self.p, h))
         self._lock_reaper = reaper
         got = reaper.sweep(lockreap.slot_files(own + shared_dirs + [checkcap.slot_dir()]), now)
         if got["released"]:

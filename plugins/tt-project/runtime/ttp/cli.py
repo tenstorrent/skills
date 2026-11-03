@@ -5654,7 +5654,7 @@ def cmd_lock(a) -> None:
                 pass
         os.kill(os.getpid(), info.si_signo)
     from . import lockreap
-    reaper = lockreap.Reaper()
+    reaper = lockreap.Reaper(ended=(lambda h: lockreap.ended_job(p, h)) if getattr(p, "db", None) is not None else None)
     tickets: list = []
     atexit.register(lambda: [lk.dequeue(t) for t in tickets])   # however this ends; a dead process's ticket is dropped too
     prio = _urgent_priority(p, own)   # an urgent task's waiter goes ahead of routine ones (urgent.py)
@@ -6142,7 +6142,23 @@ def _detach_reap(what: str) -> int:
     ex = "?" if e.get("exit") is None else e["exit"]
     print(f"{rc.stem}: {e['status']} rc={ex} at {time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime(e['ended']))}"
           + (f" ({e['why']})" if e.get("why") else ""))
+    _free_ended_slots(rc)
     return 0
+
+
+def _free_ended_slots(rc: Path) -> None:
+    """For `ttp detach --reap` and `--stop` on a job that no longer runs: free the lock slots its leftovers
+    still hold once its task ended too (lockreap.free_ended), and say what was freed or why one stays held."""
+    from . import lockreap
+    base = rc.parent.parent.parent.parent if rc.parent.parent.name == "runs" else None
+    if base is None or not (base / "state").is_dir():
+        return
+    r = lockreap.free_ended(Project(base), rc)
+    if r["freed"]:
+        print(f"{rc.stem}: freed the lock slots its leftovers held: {', '.join(r['freed'])}")
+    for name, why in r["held"].items():
+        print(f"{rc.stem}: {name} stays held: {why} (the daemon frees it once its job and task are over and "
+              f"it can see its holder gone)")
 
 
 def _detach_stop(what: str) -> int:
@@ -6165,6 +6181,7 @@ def _detach_stop(what: str) -> int:
     p = Project(base)
     if not jobstop.running(rc):
         print(f"{rc.stem}: not running; nothing to stop")
+        _free_ended_slots(rc)
         return 0
     caller = os.environ.get("TTP_TASK") or ""
     ok, why = jobstop.may_stop(p, rc, caller)
