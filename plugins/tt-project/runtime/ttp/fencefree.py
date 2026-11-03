@@ -4,13 +4,13 @@ FENCE_EXCLUDED), and that the worker hook checks as it checks ssh (hook.fenced_s
 them in project.json, never in those template-owned lines: a local edit there turns each upgrade whose
 template changes them into a merge task.
 
-Each entry is a command name (`"my-ssh"`) or `{"command": "my-ssh", "env": ["MY_SSH_OPTS"]}`, which also
-adds the pattern `MY_SSH_OPTS=* my-ssh *`. CLI 2.1.296 frees no line that starts with an assignment
-(measured: neither `FOO=* my-ssh *` nor `FOO=x my-ssh *` freed `FOO=x my-ssh y`), though `*` matches
-across words (`my-ssh * end` freed `my-ssh a b end`). An env name that makes a command load or run other
-code (PATH, LD_*, BASH_ENV and the like: CODE_ENV) is left out of an entry. Only a name that is an
-executable file in the harness's bin/ counts (workers cannot write there): any other entry is left out,
-with one daemon log line saying why. Names the plugin ships there (ttp, git, gh) and shells or wrappers
+Each entry is a command name (`"my-ssh"`); an older `{"command": "my-ssh", "env": [...]}` entry frees
+the name alone. The Claude sandbox frees no line that starts with an assignment (measured on CLI
+2.1.296: `BAZ=1 my-ssh *` did not free `BAZ=1 my-ssh y`, nor `FOO=* my-ssh *` `FOO=x my-ssh y`, while
+`my-ssh *` freed `my-ssh y`), so an env part adds no pattern and gets one daemon log line. `*` matches
+across words (`my-ssh * end` freed `my-ssh a b end`). Only a name that is an executable file in the
+harness's bin/ counts (workers cannot write there): any other entry is left out, with one daemon log
+line saying why. Names the plugin ships there (ttp, git, gh) and shells or wrappers
 are refused: freeing one frees all it runs.
 The daemon reads the key at each worker start and passes the names to the hook (TTP_FENCE_FREED)."""
 from __future__ import annotations
@@ -23,22 +23,16 @@ from typing import Any
 
 ENV = "TTP_FENCE_FREED"
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
-VAR_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # What freeing would free every command of: the harness's own wrappers, shells and command wrappers
 # (hook.SHELLS and hook.WRAPPERS).
 REFUSED = {"ttp", "git", "gh", "eval", "sh", "bash", "dash", "zsh", "ksh", "env", "nohup", "setsid", "nice",
            "exec", "command", "time", "stdbuf", "ionice", "timeout", "xargs", "sudo"}
-# Env names that make a command load or run other code (the loader, a shell's start-up, an interpreter's
-# search path or options): freeing `NAME=... cmd` for one would run that code outside the sandbox too.
-CODE_ENV = {"PATH", "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "IFS", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME",
-            "PERLLIB", "PERL5LIB", "PERL5OPT", "RUBYOPT", "RUBYLIB", "NODE_OPTIONS"}
-CODE_ENV_RE = re.compile(r"(?:LD|DYLD)_\w*")
 
 
-def commands(base: Path | str, value: Any) -> tuple[list[tuple[str, tuple[str, ...]]], list[str]]:
-    """The project's (tt-project folder `base`) fence_freed_commands `value`: ([(name, env var names)],
-    ["entry: why" left out])."""
-    freed: dict[str, tuple[str, ...]] = {}
+def commands(base: Path | str, value: Any) -> tuple[list[str], list[str]]:
+    """The project's (tt-project folder `base`) fence_freed_commands `value`: ([freed command names],
+    ["entry: why" left out or ignored])."""
+    freed: list[str] = []
     refused: list[str] = []
     if value in (None, [], ""):
         return [], refused
@@ -46,9 +40,8 @@ def commands(base: Path | str, value: Any) -> tuple[list[tuple[str, tuple[str, .
         return [], [f"{json.dumps(value)[:60]}: not a list of command names"]
     bin_dir = Path(base) / "harness" / "bin"
     for entry in value:
-        name, env = (entry, []) if isinstance(entry, str) else \
-            (entry.get("command"), entry.get("env", [])) if isinstance(entry, dict) else (None, [])
-        env = [env] if isinstance(env, str) else env
+        name, env = (entry, None) if isinstance(entry, str) else \
+            (entry.get("command"), entry.get("env")) if isinstance(entry, dict) else (None, None)
         shown = json.dumps(entry)[:60]
         if not isinstance(name, str) or not NAME_RE.fullmatch(name):
             refused.append(f"{shown}: not a command name (a file name in the harness's bin/, no path)")
@@ -56,18 +49,18 @@ def commands(base: Path | str, value: Any) -> tuple[list[tuple[str, tuple[str, .
             refused.append(f"{name}: a shell, wrapper or harness command (freeing it frees all it runs)")
         elif not ((bin_dir / name).is_file() and os.access(bin_dir / name, os.X_OK)):
             refused.append(f"{name}: no executable {bin_dir / name}")
-        elif not isinstance(env, list) or not all(isinstance(v, str) and VAR_RE.fullmatch(v) for v in env):
-            refused.append(f"{shown}: env is not a list of variable names")
         else:
-            code = [v for v in env if v in CODE_ENV or CODE_ENV_RE.fullmatch(v)]
-            refused += [f"{name}: env {v} makes it load or run other code (freeing it frees that code)" for v in code]
-            freed[name] = tuple(dict.fromkeys([*freed.get(name, ()), *(v for v in env if v not in code)]))
-    return list(freed.items()), refused
+            if env:
+                refused.append(f"{name} env {json.dumps(env)[:60]}: ignored, the Claude sandbox never frees a command "
+                               f"line that starts with an assignment ({name} alone stays freed)")
+            if name not in freed:
+                freed.append(name)
+    return freed, refused
 
 
 def patterns(freed) -> list[str]:
-    """excludedCommands patterns for `freed` ([(name, env var names)]), in the built-in ones' form."""
-    return [p for name, env in freed for p in (f"{name} *", *(f"{v}=* {name} *" for v in env))]
+    """excludedCommands patterns for `freed` (command names), in the built-in ones' form."""
+    return [f"{name} *" for name in freed]
 
 
 def names() -> set[str]:

@@ -2779,7 +2779,7 @@ class Daemon:
             argv, sandboxed = prov.fence_args(argv, roots, cwd=str(cwd), on=fence_on,
                                             restrictions=restrictions, freed=freed)
             if sandboxed and prov.fence_by_name and freed:
-                env = {**env, fencefree.ENV: " ".join(name for name, _ in freed)}   # the hook checks them as ssh
+                env = {**env, fencefree.ENV: " ".join(freed)}   # the hook checks them as ssh
             if fence_on and not sandboxed and prov.fence_optional and prov.write_fence(restrictions):
                 # One keyed issue per provider (screen.py), never a wake per run. Only an optional fence
                 # (one a missing dependency stops): Cursor runs unfenced by design outside no_internet.

@@ -250,7 +250,7 @@ Company-wide practice; the long form is in the `tt-project:setup-box` skill's re
   only as a simple command on its own (also after `timeout N`); the hook refuses them beside `&&`, `;`,
   a pipe, a file redirect or a substitution. A project's own host-reaching command (a script in its
   harness `bin/` that wraps ssh) is freed the same way by config `sandbox.fence_freed_commands`
-  (`["my-ssh"]`, or `{"command": "my-ssh", "env": ["VAR"]}` to free `VAR=... my-ssh ...` too), never
+  (`["my-ssh"]`; the sandbox never frees `VAR=... my-ssh ...`, so an entry's `env` part is ignored), never
   by editing FENCE_FREED in hook.py or FENCE_EXCLUDED in providers/claude.py: those lines belong to
   the template, and a local edit there turns each upgrade that changes them into a merge task. A
   name that is not an executable in the harness's `bin/`, or is a shell, wrapper, `ttp`, `git` or

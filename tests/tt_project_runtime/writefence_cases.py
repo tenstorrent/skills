@@ -487,35 +487,35 @@ def test_fence_freed_commands_take_only_executables_in_the_harness_bin(tmp_path)
     (tmp_path / "elsewhere").chmod(0o755)
     freed, refused = fencefree.commands(tmp_path, [
         "my-ssh", {"command": "my-ssh", "env": ["MY_SSH_OPTS"]}, "plain", "gone", "dir", "git", "bash", "ttp",
-        "../elsewhere", str(tmp_path / "elsewhere"), "-x", "", 5, {"command": "my-ssh", "env": ["BAD VAR"]},
-        {"env": ["A"]}])
-    assert freed == [("my-ssh", ("MY_SSH_OPTS",))], freed
-    assert len(refused) == 13, refused
+        "../elsewhere", str(tmp_path / "elsewhere"), "-x", "", 5, {"env": ["A"]}])
+    assert freed == ["my-ssh"], freed
+    assert len(refused) == 13 and "ignored, the Claude sandbox" in refused[0], refused
     assert any(r.startswith("plain: no executable") for r in refused)
     assert any(r.startswith("gone: no executable") for r in refused)
     assert sum("frees all it runs" in r for r in refused) == 3
     assert sum("not a command name" in r for r in refused) == 6, refused
-    assert any("env is not a list" in r for r in refused)
     assert fencefree.commands(tmp_path, "my-ssh") == ([], ['"my-ssh": not a list of command names'])
     assert fencefree.commands(tmp_path, None) == ([], [])
     assert hook.SHELLS | hook.WRAPPERS | {"eval"} <= fencefree.REFUSED
-    assert fencefree.patterns(freed) == ["my-ssh *", "MY_SSH_OPTS=* my-ssh *"]
+    assert fencefree.patterns(freed) == ["my-ssh *"]
 
 
-def test_fence_freed_commands_leave_out_loader_and_shell_startup_env_names(tmp_path):
-    """sandbox.fence_freed_commands: an env name that makes the freed command load or run other code
-    (the loader, a shell's start-up, an interpreter's search path) is left out with one line each;
-    the command and its other names stay freed."""
+def test_fence_freed_commands_ignore_an_env_part_with_one_line_per_entry(tmp_path):
+    """sandbox.fence_freed_commands: the Claude sandbox never frees a line that starts with an assignment
+    (CLI 2.1.296), so an entry's env part, well formed or not, adds no `VAR=* name *` pattern: the command
+    alone stays freed and each such entry gets one line saying so. An empty env says nothing."""
     from ttp import fencefree
     _harness_bin_tool(tmp_path, "my-ssh")
-    bad = ["PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_", "DYLD_INSERT_LIBRARIES", "BASH_ENV", "ENV", "SHELLOPTS",
-           "BASHOPTS", "IFS", "PYTHONPATH", "PYTHONSTARTUP", "PERLLIB", "RUBYOPT", "NODE_OPTIONS"]
-    freed, refused = fencefree.commands(tmp_path, [{"command": "my-ssh", "env": ["MY_SSH_OPTS", *bad, "LDFLAGS"]},
-                                                   {"command": "my-ssh", "env": "BASH_ENV"}])
-    assert freed == [("my-ssh", ("MY_SSH_OPTS", "LDFLAGS"))], freed
-    assert len(refused) == len(bad) + 1 and all(r.startswith("my-ssh: env ") for r in refused), refused
-    assert {r.split()[2] for r in refused} == set(bad)
-    assert fencefree.patterns(freed) == ["my-ssh *", "MY_SSH_OPTS=* my-ssh *", "LDFLAGS=* my-ssh *"]
+    _harness_bin_tool(tmp_path, "other")
+    freed, said = fencefree.commands(tmp_path, [
+        {"command": "my-ssh", "env": ["MY_SSH_OPTS", "LD_PRELOAD"]}, {"command": "my-ssh", "env": "BASH_ENV"},
+        {"command": "other", "env": ["BAD VAR"]}, {"command": "other", "env": []}, {"command": "gone", "env": ["A"]}])
+    assert freed == ["my-ssh", "other"], freed
+    assert fencefree.patterns(freed) == ["my-ssh *", "other *"]
+    assert not any("=" in p for p in fencefree.patterns(freed))
+    env_lines = [r for r in said if "never frees a command line that starts with an assignment" in r]
+    assert len(env_lines) == 3 and [r.split()[0] for r in env_lines] == ["my-ssh", "my-ssh", "other"], said
+    assert len(said) == 4 and any(r.startswith("gone: no executable") for r in said), "a missing one: why, no env line"
 
 
 def test_fence_freed_commands_reach_the_sandbox_and_the_hook_of_a_fenced_worker(env, monkeypatch):
@@ -530,7 +530,7 @@ def test_fence_freed_commands_reach_the_sandbox_and_the_hook_of_a_fenced_worker(
     assert _settings(spec["argv"])["sandbox"]["excludedCommands"] == list(claude.FENCE_EXCLUDED), "unset: built-ins"
     assert "TTP_FENCE_FREED" not in spec["env"]
     _harness_bin_tool(p.base, "my-ssh")
-    p.set_config("sandbox", {"fence_freed_commands": ["my-ssh", "gone"]})
+    p.set_config("sandbox", {"fence_freed_commands": ["my-ssh", "gone", {"command": "my-ssh", "env": ["OPTS"]}]})
     from ttp.project import config_problems
     assert not [x for x in config_problems(p.raw_config()) if "sandbox" in x], "a known key"
     from ttp.daemon import Daemon
@@ -541,7 +541,8 @@ def test_fence_freed_commands_reach_the_sandbox_and_the_hook_of_a_fenced_worker(
         assert excluded == [*claude.FENCE_EXCLUDED, "my-ssh *"], excluded
         assert spec["env"].get("TTP_FENCE_FREED") == "my-ssh", "the hook checks it as it checks ssh"
     lines = [l for l in (p.logs / "daemon.log").read_text().splitlines() if "fence_freed_commands" in l]
-    assert len(lines) == 1 and "left out gone: no executable" in lines[0], "one line per daemon, not per run"
+    assert len(lines) == 2 and "left out gone: no executable" in lines[0], "one line per daemon, not per run"
+    assert "my-ssh env [\"OPTS\"]: ignored" in lines[1] and "starts with an assignment" in lines[1], lines
     p.set_config("providers", {**p.config()["providers"], "claude": {**p.config()["providers"].get("claude", {}),
                                                                       "write_fence": False}})
     spec = _claude_launch(env, p, wt)
