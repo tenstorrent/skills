@@ -791,6 +791,66 @@ def test_a_runs_lock_never_passes_a_lost_hold_whose_slot_another_task_took(env, 
         assert r.returncode == 75 and not ran.exists(), r
 
 
+def test_a_slot_label_rewrite_never_shows_a_held_slot_with_no_holder(tmp_path, monkeypatch):
+    # A held slot's label is rewritten in place: a take over the last holder's label, relabel, and
+    # label_pid (a `ttp lock` handing its slot to its command, a run handing its hold to its keeper).
+    # A reader between two steps of that write (held_labels, so hold.covers and the test above) sees the
+    # old label or the new one, never the slot held with an empty label: hold.covers took that for
+    # another holder's, and the test above saw its label come and go.
+    import builtins
+    from ttp import locks
+    slot, seen, busy = tmp_path / "board.0.lock", [], []
+
+    def look():
+        if not busy:
+            busy.append(1)
+            try:
+                seen.append(tuple(locks.held_labels([slot])))
+            finally:
+                busy.pop()
+
+    class Watched:   # the slot's open file, read from another open file before and after each call
+        def __init__(self, f):
+            self._f = f
+
+        def __getattr__(self, name):
+            got = getattr(self._f, name)
+            if not callable(got):
+                return got
+
+            def step(*args, **kw):
+                look()
+                try:
+                    return got(*args, **kw)
+                finally:
+                    look()
+            return step
+
+    def opened(file, *args, **kw):
+        f = builtins.open(file, *args, **kw)
+        return Watched(f) if not busy and Path(file) == slot else f
+    monkeypatch.setattr(locks, "open", opened, raising=False)
+    for name in ("pwrite", "ftruncate"):
+        real = getattr(os, name)
+        monkeypatch.setattr(locks.os, name, lambda *a, _real=real: (look(), _real(*a), look())[1])
+    old, new = "task #1 (run 1)", "task #2 (run 2)"
+    f = locks.try_take([slot], old, "a long command " * 20)
+    f.close()
+    seen.clear()
+    f = locks.try_take([slot], new, "short")   # its label is shorter than the one it writes over
+    try:
+        assert seen and set(seen) <= {(), (old,), (new,)} and seen[-1] == (new,), seen
+        for rewrite in (lambda: locks.relabel(f, {"run_since": 1.0}), lambda: locks.label_pid(f, os.getpid(), "command")):
+            seen.clear()
+            rewrite()
+            assert seen and set(seen) == {(new,)}, seen
+        h = json.loads(slot.read_text())
+        assert (h["holder"], h["command"], h["run_since"], h["via"]) == (new, "short", 1.0, "command")
+        assert slot.read_text() == json.dumps(h), "the label kept the padding of the longer one it replaced"
+    finally:
+        f.close()
+
+
 def test_a_runs_lock_passes_through_at_once_while_its_lineage_holds_the_resource(env, tmp_path):
     # The run's own whole-run hold (this run, or a detached job of it after a later run took it over):
     # its `ttp lock board` runs at once under the hold, without waiting. A pause still refuses it.

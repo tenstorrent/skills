@@ -172,10 +172,7 @@ def keep(run_dir: Path, spec: dict, held: list, wanted: list[dict], inherited: l
         except ValueError:
             was = {}
         owner = {k: was[k] for k in ("pid", "node", "pidns") if isinstance(was, dict) and k in was}
-        f.seek(0)
-        f.truncate()
-        f.write(json.dumps({"holder": label(holder, run, LABEL), "since": time.time(), "command": LABEL, **owner}))
-        f.flush()
+        locks.write_label(f, {"holder": label(holder, run, LABEL), "since": time.time(), "command": LABEL, **owner})
     rec = {"task": task, "run": run, "since": time.time(), "state": "holding", "resources": resources,
            "jobs": jobs}
     _write(run_dir, rec)

@@ -73,11 +73,8 @@ def try_take(paths: list[Path], holder: str, what: str = "", key: str = "", extr
         except OSError:
             f.close()
             continue
-        f.seek(0)
-        f.truncate()
-        f.write(json.dumps({"holder": holder, "since": time.time(), "command": what[:300], **({"key": key} if key else {}),
-                            **(extra or {}), **run_ids(), **taker()}))
-        f.flush()
+        write_label(f, {"holder": holder, "since": time.time(), "command": what[:300], **({"key": key} if key else {}),
+                        **(extra or {}), **run_ids(), **taker()})
         return f
     return None
 
@@ -87,12 +84,26 @@ def relabel(f, fields: dict) -> None:
     try:
         f.seek(0)
         h = json.loads(f.read() or "{}")
-        f.seek(0)
-        f.truncate()
-        f.write(json.dumps({**(h if isinstance(h, dict) else {}), **fields}))
-        f.flush()
+        write_label(f, {**(h if isinstance(h, dict) else {}), **fields})
     except (OSError, ValueError, TypeError):
         pass
+
+
+def write_label(f, label: dict) -> None:
+    """Writes `label` as the label of the held slot file `f` (opened "a+", as try_take does) without
+    ever leaving it empty or cut: the new text, padded with spaces to the old one's length (JSON
+    whitespace), goes over the old from offset 0, then the file is cut to the new text. A reader
+    (held_labels, hold.covers, holders) sees the old label or the new one, never an empty one it would
+    take for no holder: a truncate before the write left that window open."""
+    data = json.dumps(label).encode()
+    f.flush()
+    fd = f.fileno()
+    fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+    if fl & os.O_APPEND:   # pwrite on an O_APPEND file writes at its end, not at 0
+        fcntl.fcntl(fd, fcntl.F_SETFL, fl & ~os.O_APPEND)
+    os.pwrite(fd, data + b" " * max(os.fstat(fd).st_size - len(data), 0), 0)
+    os.ftruncate(fd, len(data))
+    f.seek(0)
 
 
 def _pid_ns() -> str | None:
@@ -229,11 +240,8 @@ def label_pid(f, pid: int, via: str = "keeper") -> None:
         h = json.loads(f.read() or "{}")
         taker = h.get("ns_pid") or h.get("pid")
         h = {k: v for k, v in h.items() if k not in ("ns_pid", "ns_pidns", "owner_fallback")}   # the taker's
-        f.seek(0)
-        f.truncate()
-        f.write(json.dumps({**h, **_owner(pid), "pgid": _pgid(pid), "via": via,
-                            **({"taker_pid": taker} if taker and taker != pid else {})}))
-        f.flush()
+        write_label(f, {**h, **_owner(pid), "pgid": _pgid(pid), "via": via,
+                        **({"taker_pid": taker} if taker and taker != pid else {})})
     except (OSError, ValueError, TypeError):
         pass
 
