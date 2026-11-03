@@ -13,7 +13,7 @@ def _cp_events(p, kind="charter_unsent"):
 
 def test_a_reply_announcing_a_charter_change_without_a_charter_update_queues_an_event_once(env):
     """The reported case: the reply goes out, one queued event quotes it and asks for the change or a
-    correction; the same turn applied again adds none; a notify is checked the same way."""
+    correction; the same message checked again adds none; a notify is checked the same way."""
     from ttp import charterpromise, coordinator as coord
     p = make(env)
     p.charter_path.write_text(_CP_CHARTER)
@@ -25,8 +25,8 @@ def test_a_reply_announcing_a_charter_change_without_a_charter_update_queues_an_
     assert f"reply #{mid}" in text and "I'm adding the Restrictions item now" in text, text
     assert "Send that charter_update now, or tell the chat it is not being made" in text
     assert coord.EFFORT_EVENT_TRIGGERS[charterpromise.EVENT] == "conflict"
-    coord.apply(p, [{"type": "reply", "text": _CP_ANNOUNCE, "chat": "c1"}], turn=1)
-    assert len(_cp_events(p)) == len({e["fingerprint"] for e in _cp_events(p)})
+    assert charterpromise.check(p.db, [(mid, "reply", _CP_ANNOUNCE)], [], turn=1) == []
+    assert len(_cp_events(p)) == 1
     coord.apply(p, [{"type": "notify", "text": "I'll record that in the charter."}], turn=2)
     assert "notify #" in _cp_events(p)[-1]["text"]
 
@@ -57,6 +57,9 @@ def test_the_charter_announcement_matcher_catches_first_person_present_and_futur
         "Thanks. I'm also retiring the old policy item.",
         "I'm adding them to the Restrictions now.",
         "I'll go ahead and add it to the charter.",
+        "I'm adding that line into the project's charter now.",
+        "I'll update the charter's Goals today.",
+        "Removing the old restriction, then queuing the run.",
     ]
     for t in hits:
         assert cp.announces(t), t
@@ -77,6 +80,16 @@ def test_the_charter_announcement_matcher_catches_first_person_present_and_futur
         "I'll update you on the restriction.",                 # update you
         "I'm adding a retry; the box has access restrictions beyond our control for now and later.",
         "I'm adding the retry to the run script and the Restrictions stay as they are.",   # object too far
+        "Updating #5550's spec per the Restrictions.",         # referred to, not changed
+        "Changing the run order per the charter.",
+        "I'm removing the stale lock, as the charter allows.",
+        "I'm adding a check for the push restriction.",
+        "I'll update the dashboard to show the charter.",
+        "I'll write up the restriction conflict for you.",
+        "I'll update the restrictions after your yes.",        # conditional on the user
+        "I'm adding the retry under the Policies section rules.",
+        "I'll change the timeout, about the charter: nothing.",
+        "Once I have your approval I'll add the restriction.",
         "",
     ]
     for t in skips:

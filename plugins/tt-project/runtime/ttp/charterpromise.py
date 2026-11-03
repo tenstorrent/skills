@@ -13,11 +13,16 @@ names the batch's announcing replies instead (`quote_lines`).
 
 The matcher is narrow (`announces`): a change verb in the first person present or future ("I'm
 adding", "I will record", "let me add", a clause opening with "Adding"), then a charter object
-(charter, Restrictions, Policies, a Goals or Policy item) at most NEAR words on, in one clause.
-Skipped: past tense ("I added", "I've recorded"), negations ("I'm not adding", "I won't"),
-questions, offers conditional on the user ("once you confirm, I'll add"), quoted text (the charter
-quoted back, in quotes, backticks or `>` lines), a task or memory about the charter ("I'm adding a
-task to update the charter") and "update you"."""
+(charter, Restrictions, Policies, a Goals or Policy item) at most NEAR words on, in one clause, that
+is what is changed: the verb's direct object ("adding the Restrictions item", "remove that
+restriction") or where the change lands ("record that in the charter", "add it to the
+Restrictions"). Skipped: past tense ("I added", "I've recorded"), negations ("I'm not adding", "I
+won't"), questions, offers conditional on the user ("once you confirm, I'll add", "after your yes"),
+quoted text (the charter quoted back, in quotes, backticks or `>` lines), a task or memory about the
+charter ("I'm adding a task to update the charter"), "update you", and a charter only referred to:
+a comma or a word such as per, as, for or about between the verb and the object ("changing the run
+order per the charter"), a clause after "to" ("update the dashboard to show the charter") or the
+charter naming another noun ("write up the restriction conflict")."""
 from __future__ import annotations
 
 import hashlib
@@ -43,8 +48,22 @@ OBJECT = re.compile(r"\b(?:charter|restrictions?|policies|(?:polic(?:y|ies)|goal
                     re.I)
 # Words between the verb and the object that make the charter something else's subject.
 NOT_THE_CHANGE = re.compile(r"\b(?:tasks?|workers?|followups?|memory|you|the\s+user)\b", re.I)
+# A comma or one of these words between the verb and the object: the charter is referred to, not changed.
+REFERS = re.compile(r",|\b(?:per|as|under|for|about|against|by|with|from|of|via|regarding|according|following|"
+                    r"despite|within|without|than|like)\b", re.I)
+# Where the change lands: "to/in/into/onto/on" then only these words before the object.
+LANDS = re.compile(r"\b(?:to|in|into|onto|on)\s+(?:(?:the|a|an|our|its|this|that|your|project's|project|"
+                   r"current|new|same|main)\s+)*$", re.I)
+# Any other place word between the verb and the object: not the direct object, not where it lands.
+PLACE = re.compile(r"\b(?:to|in|into|onto|on|at)\b", re.I)
+# The word after the object, when there is one, keeps the charter the noun changed ("the Restrictions
+# item now", "the charter's Goals"); any other ("the restriction conflict") makes it a modifier.
+AFTER_OK = re.compile(r"(?:items?|sections?|lists?|entry|entries|lines?|rules?|file|now|today|tonight|too|also|"
+                      r"right|then|and|so|to|for|in|into|on|at|before|after|this|next|here|there|with|by|first|"
+                      r"again|once|soon|later|immediately|accordingly|as|that|which|or|'s?)$", re.I)
 CONDITIONAL = re.compile(r"\b(?:if|once|when|after|should|unless)\s+(?:you|the\s+user)\b|\bwant\s+me\s+to\b|"
-                         r"\b(?:shall|should)\s+i\b|\bwith\s+your\s+(?:ok|okay|yes|approval)\b", re.I)
+                         r"\b(?:shall|should)\s+i\b|\b(?:with|after|once|when|on|upon|given|(?:if|once|when|after)\s+i\s+(?:have|get))\s+your\s+"
+                         r"(?:ok|okay|yes|go[-\s]ahead|approval|confirmation|sign[-\s]?off)\b", re.I)
 QUOTED = re.compile(r"\"[^\"\n]*\"|“[^”\n]*”|`[^`\n]*`|^\s*>.*$", re.M)
 WORD = re.compile(r"[\w'’-]+")
 
@@ -65,7 +84,13 @@ def announces(text: str) -> str:
             obj = OBJECT.search(rest)
             if not obj or len(WORD.findall(rest[:obj.start()])) > NEAR:
                 continue
-            if NOT_THE_CHANGE.search(rest[:obj.start()]):
+            between = rest[:obj.start()]
+            if NOT_THE_CHANGE.search(between) or REFERS.search(between):
+                continue
+            if PLACE.search(between) and not LANDS.search(between):
+                continue
+            after = WORD.findall(rest[obj.end():])
+            if after and not rest[obj.end():].lstrip().startswith((".", "!", ",")) and not AFTER_OK.match(after[0]):
                 continue
             return " ".join(s.split())
     return ""
