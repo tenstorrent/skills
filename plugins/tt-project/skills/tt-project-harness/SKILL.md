@@ -236,7 +236,16 @@ Company-wide practice; the long form is in the `tt-project:setup-box` skill's re
   `ttp host-run -- <command...>` prints its output and exits with its code (126 refused, 124 timed
   out). Only commands in config `runner.host_commands` run, each entry the command's first words
   (name them fully, e.g. `sudo -n /usr/sbin/<tool> <read-only verb>`); the user or the coordinator
-  sets the list, never a worker. Each run goes to `state/host-run.jsonl` with its task id.
+  sets the list, never a worker. Each run goes to `state/host-run.jsonl` with its task id. A plain
+  entry runs under `runner.host_command_timeout_s` (at most 600 s); an entry
+  `{"cmd": "<command>", "timeout_s": N}` sets its own limit, up to 3600 s (over it, or malformed:
+  refused and named, never clamped); `--timeout S` asks for less. Anything that may run past about
+  9 minutes (a tool call stops at 10): `ttp host-run --detach -- <command...>` returns its id at once
+  and the run goes on without the worker; hand off `waiting` with retry_when
+  `ttp host-run --status <id>` (0 ended, 1 running, 4 unknown or lost), then read
+  `ttp host-run --result <id>` (its output, its exit code). A lock that must cover the whole run:
+  `ttp detach <name> --lock <res> -- ttp host-run -- <command...>`, not `ttp lock` around `--detach`
+  (which frees the lock once the run started).
 - A fenced Claude worker's `ssh`, `scp`, `sftp`, `rsync` and `ttp lock` run outside the Bash sandbox
   only as a simple command on its own (also after `timeout N`); the hook refuses them beside `&&`, `;`,
   a pipe, a file redirect or a substitution. A project's own host-reaching command (a script in its

@@ -2134,6 +2134,25 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   only the secret names, the task and the time. A request the daemon has not started within 90 s, or
   when the worker's call is stopped (SIGINT or SIGTERM), is withdrawn and never runs later; one
   already started keeps running.
+- A sandboxed worker cannot gain privileges (sudo fails with 'no new privileges'). A privileged
+  command the project allows runs on the host through the daemon: `ttp host-run -- <command...>`
+  prints its output and exits with its code (126 refused, 124 timed out, 75 no answer from the
+  daemon). Only commands in config `runner.host_commands` run, set by the user or the coordinator,
+  never a worker. An entry is a command string (the words a request must equal or start with),
+  limited by `runner.host_command_timeout_s` (default 120 s, at most 600 s), or
+  `{"cmd": "<command>", "timeout_s": N}`, which gives that command its own limit of up to 3600 s,
+  for example `{"cmd": "sudo -n /usr/local/sbin/power-cycle", "timeout_s": 1200}`. An entry whose
+  `timeout_s` is over 3600, zero or below, or not a number, or that is otherwise malformed, is
+  refused by `ttp config` and, when read, named in each refusal; it is never clamped. The longest
+  matching entry sets the limit; `--timeout S` asks for less, and a longer ask is cut to the
+  entry's limit with a note. A command that may run past about 9 minutes (a worker's tool call
+  stops at 10) runs as `ttp host-run --detach -- <command...>`: it returns once the daemon started
+  it and prints its id. A supervisor in a session of its own runs it under the same limit, so
+  neither the worker's end nor a daemon restart stops it, and writes `state/host-run/<id>.out.json`
+  (output and exit code), then `<id>.rc`; both are kept for a day. `ttp host-run --status <id>` exits
+  0 once it ended, 1 while it is queued or running, and 4 when it is unknown or lost (no answer
+  past its limit, e.g. after a reboot), so it serves as a `retry_when`; `ttp host-run --result <id>`
+  prints its output and exits with its code. Every run goes to `state/host-run.jsonl`.
 - No `ttp` command prints a saved key. `ttp secret check [alias]` tests one (reachable, auth ok or
   auth failed), lists the model ids it serves and marks each `providers.<p>.tiers.*.model` of the
   current project it does not serve, with no key, URL or host in its output, and `ttp secret env <alias> -- <command>` gives it to a command in `OPENAI_API_KEY`

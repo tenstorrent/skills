@@ -5579,18 +5579,26 @@ def _lock_alternative(p, cfg: dict, names: list[str], a) -> str:
 
 
 def cmd_host_run(a) -> None:
-    """`ttp host-run -- <cmd...>`: run a command config runner.host_commands allows on the host,
-    outside the worker's sandbox, through the daemon (hostrun.py); exits with the command's code."""
+    """`ttp host-run [--detach] [--timeout S] -- <cmd...>`: run a command config runner.host_commands
+    allows on the host, outside the worker's sandbox, through the daemon (hostrun.py); exits with the
+    command's code. `--status <id>` / `--result <id>` poll a detached run."""
     from . import hostrun
     cmd = list(a.command or [])
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
-    if not cmd:
-        die("usage: ttp host-run -- <command...>", 2)
+    look = a.status or a.result
+    if look and cmd:
+        die("ttp host-run: --status and --result take an id, not a command", 2)
+    if not cmd and not look:
+        die("usage: ttp host-run [--detach] [--timeout S] -- <command...> | --status <id> | --result <id>", 2)
+    if a.timeout is not None and not (a.timeout > 0 and a.timeout == a.timeout):
+        die("ttp host-run: --timeout takes a number of seconds above 0", 2)
     p = here()
     if p is None:
         die("ttp host-run only works inside a tt-project run or project folder", 2)
-    sys.exit(hostrun.request(p, cmd))
+    if look:
+        sys.exit(hostrun.status(p, look, result=bool(a.result)))
+    sys.exit(hostrun.request(p, cmd, timeout=a.timeout, detach=a.detach))
 
 
 def cmd_lock(a) -> None:
@@ -8451,6 +8459,11 @@ def cmd_config(a) -> None:
         if configwho.from_env()["by"] == "worker":
             die("runner.host_commands (the commands `ttp host-run` may run outside the sandbox) is set only by "
                 "the user or the coordinator, never by a worker: name the exact command in your hand-off")
+        from . import hostrun
+        listed = val.get("host_commands") if a.key == "runner" else val
+        for i, e in enumerate(listed if isinstance(listed, list) else [], 1):
+            if err := hostrun.entry(e)[2]:
+                die(f"runner.host_commands entry {i} {json.dumps(e)[:160]}: {err}", 2)
     if run and (k := _user_only_change(p.raw_config(), a.key, val)):
         # A run can be steered by text it reads; these change only in a coordinator turn that carries
         # the user's yes (coordinator.NEEDS_USER), as `ttp say` is refused inside a run.
@@ -11096,8 +11109,18 @@ def main(argv: list[str] | None = None) -> None:
         "A sandboxed worker cannot gain privileges (sudo fails with 'no new privileges'). The daemon runs a "
         "command listed in config runner.host_commands (each entry: the command's first words, which the "
         "request must equal or start with; set by the user or the coordinator) on the host, under "
-        "runner.host_command_timeout_s, logs it to state/host-run.jsonl with the task id, and prints its "
-        "output; the exit code is the command's (126 refused, 124 timed out, 75 no answer from the daemon)."))
+        "runner.host_command_timeout_s (at most 600 s; an entry {\"cmd\": ..., \"timeout_s\": N} sets its own, "
+        "at most 3600 s), logs it to state/host-run.jsonl with the task id, and prints its output; the exit "
+        "code is the command's (126 refused, 124 timed out, 75 no answer from the daemon). A command that may "
+        "run past about 9 minutes (a tool call's limit is 10): --detach returns once it started and prints "
+        "its id; `--status <id>` exits 0 once it ended, 1 while it runs, 4 unknown or lost (a retry_when); "
+        "`--result <id>` prints its output and exits with its code."))
+    s.add_argument("--detach", action="store_true",
+                   help="return once the daemon started it; it keeps running after this call and run end")
+    s.add_argument("--timeout", type=float, metavar="S",
+                   help="a shorter limit than the entry's (a longer one is cut to the entry's, with a note)")
+    s.add_argument("--status", metavar="ID", help="a detached run's state: 0 ended, 1 running, 4 unknown or lost")
+    s.add_argument("--result", metavar="ID", help="a detached run's output; exits with its code (75 still running)")
     s.add_argument("command", nargs=argparse.REMAINDER, help="the command to run (after --)")
     s.set_defaults(fn=cmd_host_run)
 
