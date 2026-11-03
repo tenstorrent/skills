@@ -11999,6 +11999,46 @@ def test_ttp_land_a_conflict_or_a_failing_check_lands_nothing(env, monkeypatch):
         assert len(_worktrees(repo)) == n and not p.db.q("SELECT * FROM task_landings")
 
 
+def test_push_checks_see_the_target_branch_by_its_short_name_whatever_is_checked_out(env, monkeypatch, tmp_path):
+    """TTP_PUSH_BRANCH is the branch on the remote a push goes to, without refs/heads/: the push
+    branch for `ttp push` (from a checkout on another branch), the task's own branch for --own, and
+    empty for `ttp checks`, which pushes nothing."""
+    log = env["tmp"] / "branches"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [f'echo "$TTP_PUSH_MODE ${{TTP_PUSH_BRANCH-unset}}" >> {log}'])
+    seen = lambda: log.read_text().splitlines()[-1]
+    _git_out(repo, "checkout", "-q", "-b", "elsewhere")
+    _commit(repo, "mine.dat", "mine\n")
+    assert _ttp_push() == 0 and seen() == "target proj"
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t30-exp")
+    monkeypatch.setenv("TTP_TASK", "30")
+    _commit(repo, "own.dat", "1\n")
+    assert _ttp("push", "--own") == 0 and seen() == "own ttp/t30-exp"
+    assert _git_out(origin, "rev-parse", "ttp/t30-exp") == _git_out(repo, "rev-parse", "HEAD")
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    from ttp import cli, push
+    cli.main(["checks", "--fresh"])
+    assert seen() == "checks "
+    assert push.check_env("target", branch="refs/heads/proj")["TTP_PUSH_BRANCH"] == "proj"
+
+
+def test_push_queue_checks_see_the_target_branch(env, monkeypatch):
+    """A push-queue batch's checks see the branch of its target (origin/proj: proj)."""
+    log = env["tmp"] / "branches"
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [f'echo "$TTP_PUSH_BRANCH" >> {log}'])
+    heads = [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    assert set(log.read_text().split()) == {"proj"}
+
+
+def test_ttp_land_checks_see_the_local_branch_it_moves(env, monkeypatch):
+    log2 = env["tmp"] / "landed"
+    land, p, repo, t, head = _land_setup(env, monkeypatch, [f'echo "$TTP_PUSH_BRANCH" >> {log2}'])
+    said = []
+    assert land.land(p, repo, head, t, said.append) == 0, said
+    assert log2.read_text().split() == ["proj"]
+
+
 def test_ttp_land_drops_a_commit_already_on_the_branch_and_tells_other_git_failures_from_conflicts(
         env, monkeypatch):
     """A commit whose change the branch already has under another commit becomes empty on its tip: it
@@ -12046,10 +12086,10 @@ def test_ttp_land_starts_over_while_the_branch_moves_and_stops_after_its_tries(e
     land, p, repo, t, head = _land_setup(env, monkeypatch, ["true"])
     real, moves = land._checks, []
 
-    def moving(p_, wt, new, base, say):
+    def moving(p_, wt, new, base, say, branch=""):
         if len(moves) < want:
             moves.append(_on_proj(repo, f"m{len(moves)}-{want}.txt", "m\n"))
-        return real(p_, wt, new, base, say)
+        return real(p_, wt, new, base, say, branch)
     monkeypatch.setattr(land, "_checks", moving)
     want = 1
     said = []
@@ -12255,10 +12295,10 @@ def test_ttp_land_root_lands_on_master_in_a_temp_clone_and_the_projects_own_mast
     _git_out(clone, "branch", "-f", "master", tip)
     real, moves = land._checks, []
 
-    def moving(p_, wt, new, base, say):
+    def moving(p_, wt, new, base, say, branch=""):
         if not moves:
             moves.append(on_master("m.txt", "m\n"))
-        return real(p_, wt, new, base, say)
+        return real(p_, wt, new, base, say, branch)
     monkeypatch.setattr(land, "_checks", moving)
     said = []
     assert land.land(p, clone, head, t, said.append, recorded=False) == 0, said

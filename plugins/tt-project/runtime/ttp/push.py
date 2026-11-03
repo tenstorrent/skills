@@ -817,16 +817,26 @@ def priority_key(repo: Path, remote: str, branch: str) -> str:
     return f"{url}#{branch}"
 
 
-def check_env(mode: str, tip: str = "", run_dir: str | None = None) -> dict[str, str]:
+def check_env(mode: str, tip: str = "", run_dir: str | None = None, branch: str = "") -> dict[str, str]:
     """The environment push_checks run in. TTP_PUSH_MODE says what they gate: `target` (`ttp push`
     or the push queue, to delivery.push_branch), `own` (`ttp push --own`, the task's own branch) or
     `checks` (`ttp checks`, which pushes nothing). TTP_PUSH_TIP is the tip of the branch pushed to,
-    as fetched before the checks; empty when there is none (a new branch, or `ttp checks`)."""
+    as fetched before the checks; empty when there is none (a new branch, or `ttp checks`).
+    TTP_PUSH_BRANCH is the name of that branch on the remote (or the local branch `ttp land` moves),
+    short, without refs/heads/, so a check can refuse content by where it goes rather than by the
+    branch checked out; empty for `ttp checks`."""
     output = checkdirs.writable(run_dir if run_dir is not None else os.environ.get("TTP_RUN_DIR"))
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
     if pp := check_pythonpath(os.environ):
         env["PYTHONPATH"] = pp
-    return checkdirs.for_check({**env, "TTP_RUN_DIR": output, "TTP_PUSH_MODE": mode, "TTP_PUSH_TIP": tip or ""})
+    return checkdirs.for_check({**env, "TTP_RUN_DIR": output, "TTP_PUSH_MODE": mode, "TTP_PUSH_TIP": tip or "",
+                               "TTP_PUSH_BRANCH": short_branch(branch)})
+
+
+def short_branch(ref: str) -> str:
+    """`ref` as a short branch name: refs/heads/ dropped."""
+    ref = str(ref or "")
+    return ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
 
 
 def check_pythonpath(env) -> str:
@@ -3461,7 +3471,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             say(f"{head[:10]}: every project check was skipped; running the {len(todo)} command(s) "
                 f"`ttp checks` recorded passing on this commit: {'; '.join(todo)}")
         tip = (_local_tip(repo, branch) if local else _existing_tip(repo, remote, branch)) if todo else ""
-        if todo and (why := runner_wait(todo, repo, check_env("own", tip, check_run_dir), say)):
+        if todo and (why := runner_wait(todo, repo, check_env("own", tip, check_run_dir, branch), say)):
             return why
         try:
             slot = check_slot(head, say) if todo else checkcap.Slot()
@@ -3470,7 +3480,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             return CHECKS_FAILED
         with slot:
             started = time.time()
-            env = {**check_env("own", tip, check_run_dir), **slot.env()}
+            env = {**check_env("own", tip, check_run_dir, branch), **slot.env()}
             for line in sandbox_lines(todo):
                 say(line)
             for cmd in todo:
@@ -3681,7 +3691,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             else:
                 carried.append(f"{verdictcarry.line(was[1], delta)}: {cmd}")
                 say(carried[-1])
-        if run and (why := runner_wait(run, repo, check_env("target", tip, check_run_dir), say)):
+        if run and (why := runner_wait(run, repo, check_env("target", tip, check_run_dir, branch), say)):
             return why
         try:
             slot = check_slot(head, say, priority=priority_key(repo, remote, branch)) if run else checkcap.Slot()
@@ -3690,7 +3700,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             return CHECKS_FAILED
         with slot:
             started = time.time()
-            env = {**check_env("target", tip, check_run_dir), **slot.env()}
+            env = {**check_env("target", tip, check_run_dir, branch), **slot.env()}
             for line in sandbox_lines(run):
                 say(line)
             for cmd in run:

@@ -1573,7 +1573,7 @@ class Batch:
             return push.NONE_APPLY, ""
         say(f"checking {head[:10]}")
         self.checks["runs"] += 1
-        env = push.check_env("target", self.tip, self.check_run_dir)
+        env = push.check_env("target", self.tip, self.check_run_dir, self.branch)
         tree, run = pushpass.tree_of(self.wt, head), []
         for cmd in todo:
             parts = pushpass.env_parts(self.wt, cmd, env, self.tip or "")
@@ -1741,7 +1741,7 @@ class Batch:
             return None
         say(f"rerunning the {len(ids)} failing test(s) on the tip {tip[:10]} alone, up to {TIP_RERUNS} times: "
             f"{' '.join(ids)}")
-        env = push.check_env("target", self.tip, self.check_run_dir)
+        env = push.check_env("target", self.tip, self.check_run_dir, self.branch)
         self._runners([cmd], env)
         slot = push.check_slot(tip, say, checkcap.label(self.p.name, f"push batch {self.id}"),
                                priority=push.priority_key(self.repo, self.remote, self.branch), proj=self.p)
@@ -1788,7 +1788,7 @@ class Batch:
         todo = [c for c in todo if pushpass.resumable(c)]
         if not todo:
             return False
-        env = push.check_env("target", self.tip, self.check_run_dir)
+        env = push.check_env("target", self.tip, self.check_run_dir, self.branch)
         self._runners(todo, env)
         tree, slot, started = pushpass.tree_of(self.wt, plain), None, time.time()
         try:

@@ -1208,7 +1208,10 @@ queues behind routine work; nothing running is interrupted:
 - Checks run with `TTP_PUSH_MODE` set to `target` (`ttp push` or the push queue, to
   `delivery.push_branch`), `own` (`ttp push --own`) or `checks` (`ttp checks`), and `TTP_PUSH_TIP`
   set to the tip of the branch pushed to as fetched before the checks (empty for a new branch and
-  for `ttp checks`). A check that should only gate the push branch tests
+  for `ttp checks`). `TTP_PUSH_BRANCH` names that branch as the remote calls it, short (no
+  `refs/heads/`): the push branch for `ttp push` and the push queue, the task's own branch for
+  `ttp push --own`, the local branch for `ttp land`, empty for `ttp checks`; a check that refuses
+  content by destination reads it, not the branch checked out. A check that should only gate the push branch tests
   `[ "$TTP_PUSH_MODE" != target ] || ...`. `ttp push --own` may instead reuse a
   `ttp checks` pass recorded on exactly HEAD's tree (run with mode `checks` and an empty tip), so
   logic that only runs in mode `own`, or that depends on `TTP_PUSH_TIP`, cannot count on running

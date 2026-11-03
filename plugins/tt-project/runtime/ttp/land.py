@@ -138,7 +138,7 @@ def _replay(wt: Path, commits: list[str], say: Callable[[str], None]) -> int:
     return 0
 
 
-def _checks(p: Project, wt: Path, new: str, base: str, say: Callable[[str], None]) -> int:
+def _checks(p: Project, wt: Path, new: str, base: str, say: Callable[[str], None], branch: str = "") -> int:
     """delivery.push_checks on `new` in scratch worktree `wt`, as `ttp push` runs them on its rebased
     head: 0 when they pass. With none configured, only a docs-only change passes."""
     d = p.config().get("delivery") or {}
@@ -159,7 +159,7 @@ def _checks(p: Project, wt: Path, new: str, base: str, say: Callable[[str], None
             return 0
         say(f"{new[:10]}: {push.NONE_APPLY}; not landing: {push.NONE_APPLY_FIX}")
         return CHECKS_FAILED
-    env = push.check_env("target", base)
+    env = push.check_env("target", base, branch=branch)
     if why := push.runner_wait(todo, wt, env, say, p):
         return why
     try:
@@ -333,7 +333,7 @@ def _land(p: Project, repo: Path, branch: str, base: str, full: str, commits: li
                 say(f"every commit of {full[:10]} is already on local branch {branch}")
                 record(p, tid, full, base, branch)
                 return LANDED
-            if rc := _checks(p, wt, new, base, say):
+            if rc := _checks(p, wt, new, base, say, branch):
                 return rc
             if rc := _move(p, repo, branch, base, new, say):
                 return rc
