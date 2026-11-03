@@ -665,11 +665,8 @@ def test_lock_cycle_needs_both_reads_and_skips_shared_waits_behind_shared_holder
     _cycle_procs(monkeypatch, {})
     d = tmp_path / "locks"
     fs = _cycle_party(d, "p", None, "task #1 (run 1)", 4101, task=1) + [_cycle_ticket(d, "q", "task #1 (run 1)", 7001)]
-    d.mkdir(parents=True, exist_ok=True)
-    g = open(d / "q.0.lock", "a+")   # task 2 holds q shared
-    fcntl.flock(g, fcntl.LOCK_SH)
-    g.write(json.dumps({"holder": "task #2 (run 2)", "pid": 4102, "pid_start": "11", "task_id": "2"}))
-    g.flush()
+    from ttp import locks
+    g = locks.try_take_shared([d / "q.0.lock"], "task #2 (run 2)")   # task 2 holds q shared
     fs += [g, _cycle_ticket(d, "p", "task #2 (run 2)", 7002)]
     try:
         assert lockcycle.find([(d, "demo")])   # p is held exclusively: task 2's exclusive wait is stuck
@@ -703,6 +700,33 @@ def test_lock_cycle_needs_both_reads_and_skips_shared_waits_behind_shared_holder
         assert not lockcycle.find([(d, "demo")])
         seen = iter([fake, fake])
         assert len(lockcycle.find([(d, "demo")])) == 1
+    finally:
+        for f in fs:
+            f.close()
+
+
+def test_lock_cycle_takes_shared_holders_from_their_own_labels_not_the_stale_slot_label(tmp_path, monkeypatch):
+    # A shared hold (`ttp lock --shared`) labels itself under <res>.shared; the slot file keeps the
+    # label of its last exclusive holder, who may hold nothing now.
+    from ttp import lockcycle, locks
+    _cycle_procs(monkeypatch, {})
+    d = tmp_path / "locks"
+    q, r = d / "q.0.lock", d / "r.0.lock"
+    locks.try_take([q], "task #1 (run 1)").close()     # task 1 held q and let go
+    fs = [locks.try_take_shared([q], "task #2 (run 2)"),  # task 2 holds q shared
+          locks.try_take([r], "task #3 (run 3)"),          # task 3 holds r
+          _cycle_ticket(d, "r", "task #1 (run 1)", 7001),  # task 1 waits for r
+          _cycle_ticket(d, "q", "task #3 (run 3)", 7003)]  # task 3 waits for q (exclusive)
+    try:
+        g = lockcycle.graph([(d, "demo")])
+        assert ("demo task #3", "demo task #2", "q") in g["edges"]
+        assert not any(h == "demo task #1" for _, h, _ in g["edges"])
+        assert not lockcycle.find([(d, "demo")]), "task 1 holds nothing: no deadlock"
+        fs.append(_cycle_ticket(d, "r", "task #2 (run 2)", 7002))   # task 2 now waits for r: a real cycle
+        [cyc] = lockcycle.find([(d, "demo")])
+        assert [m["id"] for m in cyc["members"]] == ["demo task #2", "demo task #3"]
+        assert cyc["locks"] == ["q", "r"]
+        assert "task #2 (run 2" in lockcycle.text(cyc) and "(shared)" not in lockcycle.text(cyc)
     finally:
         for f in fs:
             f.close()

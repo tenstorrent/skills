@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Lock-order deadlocks among `ttp lock` holders and waiters, model-free.
 
-A wait-for graph from what `ttp lock` records on this host: each held slot's label (locks.try_take)
+A wait-for graph from what `ttp lock` records on this host: each held slot's label (locks.try_take),
+each shared holder's label (locks.try_take_shared)
 and each live queue ticket (locks.enqueue), in the project's own lock dir and every shared resource's
 dir (shared.root(), all projects). A node is a party: a task (project and task id: every run, keeper
 and detached job of it) or, outside any task, a process tree (a holder's command, its `ttp lock`, and
@@ -109,16 +110,23 @@ def graph(dirs: list[tuple[Path, str | None]]) -> dict:
             states = [(s, _held(s)) for s in slots]
             if not states or any(st in ("free", "") for _, st in states):
                 continue   # a free slot: its waiters wait on the queue, not on a holder
+            # An exclusive holder labels its slot; a shared one labels itself under <res>.shared (the
+            # slot keeps the last exclusive holder's label, which is stale).
+            labels = [(label(s), True) for s, st in states if st == "held"]
+            shared = [s for s, st in states if st == "shared"]
+            if shared:
+                labels += [(h, False) for h in locks.shared_holders(shared)]
             held = []
-            for s, st in states:
-                h = label(s)
+            for h, excl in labels:
                 text = str(h.get("holder") or "")
+                if not excl and text.endswith(locks.SHARED_MARK):
+                    text = text[:-len(locks.SHARED_MARK)]
                 rec = {"lock": res, "h": h, "text": text, "project": _project_of(text, h, proj),
                        "task": _task_of(text, h, proj)}
                 if not rec["task"]:
                     rec["pids"] = {int(x) for x in (h.get("pid"), h.get("taker_pid")) if str(x or "").isdigit()}
                     procs.append(rec)
-                held.append((rec, st == "held"))
+                held.append((rec, excl))
             locks_seen.append((res, held, [(t, locks.is_shared(t), proj) for t in tickets]))
     # Process holders below another's pid (a nested `ttp lock` in its command) are one party.
     for rec in procs:
