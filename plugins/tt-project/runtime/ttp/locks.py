@@ -864,13 +864,21 @@ def unreserve(path: Path, holder: str) -> None:
 
 
 WAITS_FILE = "lock_waits.json"
+_WAITS_HELD: dict[tuple[str, str], int] = {}   # this process's open waits: the fd locking each one's live file
+
+
+def _live_name(key: str) -> str:
+    return f"{WAITS_FILE}.{hashlib.sha256(key.encode()).hexdigest()[:16]}.live"
 
 
 def record_wait(run_dir: Path, key: str, start: float, end: float | None) -> None:
     """Record one `ttp lock` wait of a run: open (end None) while it waits, closed once it ends.
     Several commands of one run may wait at once; the flock keeps their updates from overwriting
-    each other, and the rename keeps readers from seeing half a file."""
+    each other, and the rename keeps readers from seeing half a file. While open, the waiter holds an
+    exclusive flock on a live file of its own, which ends with its process: readers test that, never
+    its pid, which inside a PID-namespace sandbox (ttp sandbox, bwrap) names another process outside."""
     run_dir = Path(run_dir)
+    held = (str(run_dir), key)
     try:
         with open(run_dir / f"{WAITS_FILE}.lock", "a") as guard:
             fcntl.flock(guard, fcntl.LOCK_EX)
@@ -878,29 +886,77 @@ def record_wait(run_dir: Path, key: str, start: float, end: float | None) -> Non
                 waits = json.loads((run_dir / WAITS_FILE).read_text())
             except (OSError, ValueError):
                 waits = {}
-            waits[key] = {"start": start, "end": end, "pid": os.getpid()}
+            rec = {"start": start, "end": end, "pid": os.getpid()}
+            if end is None:
+                try:
+                    if held not in _WAITS_HELD:
+                        fd = os.open(run_dir / _live_name(key), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+                        fcntl.flock(fd, fcntl.LOCK_EX)
+                        _WAITS_HELD[held] = fd
+                    rec["live"] = _live_name(key)
+                except OSError:
+                    pass    # no live file: readers fall back to the pid
+            waits[key] = rec
             durable_write(run_dir / WAITS_FILE, json.dumps(waits))
     except OSError:
         pass    # a missing record only costs the run its extension, never the command
+    if end is not None and (fd := _WAITS_HELD.pop(held, None)) is not None:
+        # Released only after the closed record is written: a reader that finds the lock free
+        # re-reads the record and sees it closed (wait_spans).
+        try:
+            os.unlink(run_dir / _live_name(key))
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def _wait_alive(run_dir: Path, w: dict) -> bool:
+    """An open wait's process still waits: it holds its live file's flock (any PID namespace)."""
+    live = w.get("live")
+    if not isinstance(live, str) or "/" in live:
+        return _alive(int(w.get("pid") or 0))   # a record without one (an older ttp)
+    try:
+        fd = os.open(Path(run_dir) / live, os.O_RDONLY | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+
+
+def wait_spans(run_dir: Path) -> list[tuple[float, float | None]]:
+    """(start, end) of each wait recorded in `run_dir`: end None while it waits; an open one whose
+    process is gone ends at its start (counts nothing). Rows with bad fields are skipped."""
+    def read() -> dict:
+        try:
+            waits = json.loads((Path(run_dir) / WAITS_FILE).read_text())
+        except (OSError, ValueError):
+            return {}
+        return waits if isinstance(waits, dict) else {}
+    waits, again, out = read(), None, []
+    for key, w in waits.items():
+        try:
+            start, end = float(w["start"]), w.get("end")
+            if end is None and not _wait_alive(run_dir, w):
+                # It may have closed between the read and the test: its closed record is written first.
+                again = read() if again is None else again
+                w2 = again.get(key)
+                end = w2.get("end") if isinstance(w2, dict) and w2.get("end") is not None else start
+            out.append((start, None if end is None else float(end)))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+    return out
 
 
 def waited(run_dir: Path, now: float | None = None) -> float:
     """Seconds the run has spent waiting in `ttp lock`, overlapping waits counted once. A wait still
     going counts up to now; one whose process died without closing it counts nothing."""
     now = time.time() if now is None else now
-    try:
-        waits = json.loads((Path(run_dir) / WAITS_FILE).read_text())
-    except (OSError, ValueError):
-        return 0.0
-    spans = []
-    for w in waits.values():
-        try:
-            start, end = float(w["start"]), w.get("end")
-            if end is None:
-                end = now if _alive(int(w.get("pid") or 0)) else start
-            spans.append((start, min(float(end), now)))
-        except (KeyError, TypeError, ValueError):
-            continue
+    spans = [(start, min(now if end is None else end, now)) for start, end in wait_spans(run_dir)]
     total, reach = 0.0, float("-inf")
     for start, end in sorted(spans):
         if end > reach:

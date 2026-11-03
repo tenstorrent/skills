@@ -14165,11 +14165,19 @@ def _waiting_check(env, name, wait_s, run_s):
     return f"{sys.executable} {script}"
 
 
+def _sandboxed_checks(monkeypatch):
+    """Push checks run in their PID-namespace sandbox as on a host, not as a no-op under the suite's own."""
+    from ttp import sandbox
+    monkeypatch.setattr(sandbox, "inside", lambda: False)
+    if not sandbox.status()[0]:
+        pytest.skip(f"no PID-namespace sandbox here: {sandbox.status()[1]}")
+
 def test_a_push_check_time_limit_counts_run_time_not_its_wait_for_a_grant(env, monkeypatch, capsys):
     """A check that waits 3 s for a checks lane and then runs 0.2 s passes under a 1 s limit; one that waits
     and then runs past the limit fails, saying the wait was not counted."""
     from ttp import push
     monkeypatch.setattr(push, "CHECK_POLL_S", 0.1)
+    _sandboxed_checks(monkeypatch)
     p, repo, origin, other = _push_setup(env, monkeypatch, [_waiting_check(env, "quick", 3, 0.2)])
     p.set_config("delivery.push_checks_timeout_s", 1)
     p.set_config("delivery.push_wait_s", 60)
@@ -14193,6 +14201,7 @@ def test_a_push_check_still_waiting_for_a_grant_at_its_outer_bound_is_queued_not
     exits 75 (queued, not run) with a retry_when, never a failed check that would open a fix task."""
     from ttp import batch, push
     monkeypatch.setattr(push, "CHECK_POLL_S", 0.1)
+    _sandboxed_checks(monkeypatch)
     p, repo, origin, other = _push_setup(env, monkeypatch, [_waiting_check(env, "stuck", 60, 0)])
     p.set_config("delivery.push_checks_timeout_s", 1)
     p.set_config("delivery.push_wait_s", 1)
@@ -14260,6 +14269,95 @@ def test_checkwait_records_only_inside_a_push_check_and_chain_keeps_the_callback
     waited, live = checkwait.state(d, t0)
     assert not live and 0.15 <= waited < 5 and seen == [True, True, False, False]
     assert checkwait.chain(None, "x") is not None   # records even without a callback of its own
+
+
+def test_checkwait_state_reads_a_wait_from_another_pid_namespace_by_its_lock_not_its_pid(tmp_path, monkeypatch):
+    """A push check runs in a PID-namespace sandbox: the pid its wait records names another process here.
+    Live while its waiter waits; counts nothing once the waiter is SIGKILLed open."""
+    import json
+    from ttp import checkwait, locks, sandbox
+    monkeypatch.setattr(sandbox, "inside", lambda: False)   # the suite's own sandbox would make wrap a no-op
+    d = tmp_path / "waits"
+    d.mkdir()
+    die = tmp_path / "die"
+    script = tmp_path / "waiter.py"
+    script.write_text(
+        "import os, signal, sys, time\n"
+        f"sys.path.insert(0, {str(RUNTIME)!r})\n"
+        "from ttp import checkwait\n"
+        "checkwait.begin('lane')\n"
+        "print(os.getpid(), flush=True)\n"
+        f"while not os.path.exists({str(die)!r}):\n"
+        "    time.sleep(0.05)\n"
+        "os.kill(os.getpid(), signal.SIGKILL)\n")
+    argv = [sys.executable, str(script)]
+    wrapped = sandbox.wrap(argv)
+    if wrapped == argv:
+        pytest.skip(f"no PID-namespace sandbox here: {sandbox.status()[1]}")
+    t0 = time.time()
+    proc = subprocess.Popen(wrapped, env={**os.environ, checkwait.ENV: str(d)}, stdout=subprocess.PIPE,
+                            text=True, start_new_session=True)
+    try:
+        inner = int(proc.stdout.readline())
+        rec = next(iter(json.loads((d / locks.WAITS_FILE).read_text()).values()))
+        assert rec["pid"] == inner != proc.pid   # a pid of the sandbox's own namespace
+        time.sleep(0.3)
+        waited, live = checkwait.state(d, t0)
+        assert live and waited >= 0.2
+        die.touch()
+        proc.wait(timeout=30)
+        assert checkwait.state(d, t0) == (0.0, False)
+        assert locks.waited(d) == 0.0
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def test_an_open_wait_is_live_by_its_lock_whatever_process_its_pid_names(tmp_path, monkeypatch):
+    """A recorded pid that names a live process here reads dead once nobody holds the wait's lock; a dead
+    pid reads live while its lock is held. A wait that closes between the read and the test counts its span."""
+    import fcntl
+    import json
+    from ttp import checkwait, locks
+    d = tmp_path / "waits"
+    d.mkdir()
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    (d / "held.live").touch()
+    (d / "free.live").touch()
+    waits = {"held": {"start": 110, "end": None, "pid": dead.pid, "live": "held.live"},
+             "free": {"start": 150, "end": None, "pid": os.getpid(), "live": "free.live"},
+             "gone": {"start": 150, "end": None, "pid": os.getpid(), "live": "missing.live"}}
+    (d / locks.WAITS_FILE).write_text(json.dumps(waits))
+    with open(d / "held.live") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        assert checkwait.state(d, 100, 200) == (90.0, True)
+        assert locks.waited(d, 200) == 90.0
+    assert checkwait.state(d, 100, 200) == (0.0, False)
+    # Closed between the read and the lock test: its closed record is written before the lock goes.
+    real = locks._wait_alive
+
+    def closes(run_dir, w):
+        (d / locks.WAITS_FILE).write_text(json.dumps({"held": {**w, "end": 130}}))
+        return real(run_dir, w)
+    (d / locks.WAITS_FILE).write_text(json.dumps({"held": waits["held"]}))
+    monkeypatch.setattr(locks, "_wait_alive", closes)
+    assert checkwait.state(d, 100, 200) == (20.0, False)
+
+
+def test_record_wait_holds_the_live_lock_only_while_the_wait_is_open(tmp_path):
+    import json
+    from ttp import locks
+    locks.record_wait(tmp_path, "k", 10, None)
+    w = json.loads((tmp_path / locks.WAITS_FILE).read_text())["k"]
+    assert w["live"] and locks._wait_alive(tmp_path, w)
+    locks.record_wait(tmp_path, "k", 10, None)   # re-opened by the same process: still one lock
+    assert locks._wait_alive(tmp_path, w)
+    locks.record_wait(tmp_path, "k", 10, 20)
+    assert not (tmp_path / w["live"]).exists() and not locks._wait_alive(tmp_path, w)
+    assert locks.wait_spans(tmp_path) == [(10.0, 20.0)]
 
 
 def test_ttp_lock_inside_a_push_check_records_its_wait_for_the_grant(env, tmp_path):

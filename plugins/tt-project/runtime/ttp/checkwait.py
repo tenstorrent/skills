@@ -6,11 +6,10 @@ The push gives each check a folder of its own in TTP_CHECK_WAITS. Each wait for 
 records itself there while it lasts: a `ttp lock` (also a project's own gate behind one), a checks lane
 (testslots.suite_hold, the wrapper lane step) and a host-wide checks slot (checkcap.acquire). A record is
 open while its process waits, closed once it is granted or gives up, and counts nothing once its process
-is gone (locks.record_wait, locks.waited). The push reads it with state(): the seconds waited since the
+is gone (locks.record_wait, locks.wait_spans). The push reads it with state(): the seconds waited since the
 check started and whether it waits now."""
 from __future__ import annotations
 
-import json
 import os
 import time
 from pathlib import Path
@@ -57,23 +56,17 @@ def chain(waiting: Callable[[bool], None] | None, what: str = "") -> Callable[[b
 
 def state(d: str | Path, since: float, now: float | None = None) -> tuple[float, bool]:
     """(seconds the check with folder `d` waited for grants since `since`, overlapping waits counted once;
-    whether one of its waits is open now, its process alive). A wait whose process died open counts nothing."""
+    whether one of its waits is open now, its process alive). A wait whose process died open counts nothing.
+    Liveness is the waiter's flock on its live file (locks.record_wait), never its pid: a check runs in a
+    PID-namespace sandbox, so the pid it records names another process here."""
     now = time.time() if now is None else now
-    try:
-        waits = json.loads((Path(d) / locks.WAITS_FILE).read_text())
-    except (OSError, ValueError):
-        return 0.0, False
     spans, live = [], False
-    for w in waits.values() if isinstance(waits, dict) else ():
-        try:
-            start, end_ = max(float(w["start"]), since), w.get("end")
-            if end_ is None:
-                alive = locks._alive(int(w.get("pid") or 0))
-                live, end_ = live or alive, now if alive else start
-            if min(float(end_), now) > start:   # one that ended before `since` counts nothing
-                spans.append((start, min(float(end_), now)))
-        except (KeyError, TypeError, ValueError, AttributeError):
-            continue
+    for start, end_ in locks.wait_spans(Path(d)):
+        start = max(start, since)
+        live = live or end_ is None
+        end_ = now if end_ is None else min(end_, now)
+        if end_ > start:   # one that ended before `since` counts nothing
+            spans.append((start, end_))
     total, reach = 0.0, float("-inf")
     for start, end_ in sorted(spans):
         if end_ > reach:
