@@ -36,6 +36,7 @@ with its `run`) carry what that run used, read from its runs row (`check_claims`
 flagged in the result and the hand-off's digest notes."""
 from __future__ import annotations
 
+import json
 import re
 import time
 
@@ -88,7 +89,13 @@ _MODEL = re.compile(r"\b(opus|sonnet|haiku|fable|codex|gemini|composer|gpt-?\d[\
 _KEY = re.compile(r"\b[a-z][a-z0-9_]+(?:\.[a-z][a-z0-9_]+)+\b")   # checks.wrap_cmd; e.g. and i.e. are too short
 NOT_KEYS = frozenset("py md json jsonl sh txt yaml yml toml js ts html css log cfg ini csv com org net io dev "
                      "ai".split())   # a file name or a domain, not a config key
-_TASK = re.compile(r"(?:#|\btask\s+#?)(\d+)\b")
+_TASK = re.compile(r"(?:#|\btask\s*#|\btask\s+)(\d+)\b")
+# A '#N' that names no task: a PR, issue, repo or message ref ('PRs #7, #8 and #16', 'owner/repo#7',
+# 'msg #12') and the rest of its list. A bare '#N' that is an inbound message id of the same chat is
+# none either (_cited); 'task #N' always is one.
+_NOT_TASK = re.compile(r"(?:\b(?:prs?|pulls?|pull\s+requests?|issues?|repos?|repositor(?:y|ies)|msgs?|messages?)\s*"
+                       r"|\b[\w.-]+/[\w.-]+\s*(?=#)|[\w.-](?<!\btask)(?=#))#?\d+\b"
+                       r"(?:\s*(?:,\s*(?:and|or)\b|,|&|/|\band\b|\bor\b)\s*#\d+\b)*")
 ANCHOR_SHARE = 0.5
 ANCHOR_MIN = 2
 STOP = frozenset("a an the to of for on in at and or is are be it its this that these those with by from as "
@@ -154,30 +161,44 @@ def _effort(level: str) -> str:
     return "xhigh" if level.startswith("extra") else level
 
 
-def _anchored(text: str) -> tuple[frozenset, frozenset]:
-    """(the anchors `text` names, the words those anchors are written with)."""
+def _anchored(text: str, msgs=()) -> tuple[frozenset, frozenset]:
+    """(the anchors `text` names, the words those anchors are written with); a bare '#N' in `msgs` (the
+    inbound message ids of its chat) or in a PR, repo or message ref (_NOT_TASK) is no task anchor."""
     low = str(text or "").lower().replace("’", "'")
+    refs = [m.span() for m in _NOT_TASK.finditer(low)]
     ms = [(f"effort:{_effort(next(g for g in m.groups() if g))}", m) for m in _EFFORT.finditer(low)]
     ms += [(f"model:{m.group(1)}", m) for m in _MODEL.finditer(low)]
     ms += [(f"key:{m.group(0)}", m) for m in _KEY.finditer(low) if m.group(0).rsplit(".", 1)[1] not in NOT_KEYS]
-    ms += [(f"#{m.group(1)}", m) for m in _TASK.finditer(low)]
+    ms += [(f"#{m.group(1)}", m) for m in _TASK.finditer(low)
+           if not (m.group(0).startswith("#") and (int(m.group(1)) in msgs or any(a <= m.start() < b for a, b in refs)))]
     return (frozenset(a for a, _ in ms),
             frozenset(w for _, m in ms for w in re.findall(r"[a-z0-9]+", m.group(0))))
 
 
-def anchors(text: str) -> frozenset:
+def anchors(text: str, msgs=()) -> frozenset:
     """The anchors `text` names: 'model:<family>', 'effort:<level>', 'key:<dotted.key>', '#<task id>'."""
-    return _anchored(text)[0]
+    return _anchored(text, msgs)[0]
 
 
-def clauses(text: str) -> list[tuple[tuple[str, ...], frozenset, bool, frozenset]]:
+def _cited(db: DB, rows: list[dict]) -> dict:
+    """{chat: the inbound message ids of that chat a bare '#N' in `rows` (dicts with text and chat) names}."""
+    want = sorted({int(m.group(1)) for r in rows for m in _TASK.finditer(str(r.get("text") or ""))
+                   if m.group(0).startswith("#")})
+    out: dict = {}
+    for r in db.q("SELECT id, chat FROM messages WHERE direction='in' AND id IN (SELECT value FROM json_each(?))",
+                  (json.dumps(want),)) if want else ():
+        out.setdefault(r["chat"], set()).add(int(r["id"]))
+    return out
+
+
+def clauses(text: str, msgs=()) -> list[tuple[tuple[str, ...], frozenset, bool, frozenset]]:
     """`text`'s clauses of any length: (its words, its anchors, whether it is a question, its content
     words other than the anchors' own, a plural 's' dropped)."""
     out = []
     for part in _CLAUSE.split(str(text or "").replace("’", "'")):
         words = tuple(re.findall(r"[a-z0-9]+(?:'[a-z]+)?", part.lower()))
         if words:
-            anc, own = _anchored(part)
+            anc, own = _anchored(part, msgs)
             rest = frozenset(w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w
                              for w in _content(words) - own)
             out.append((words, anc, part.rstrip().endswith("?"), rest))
@@ -201,8 +222,9 @@ def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tup
                   and (m.get("text") or "").strip()), key=lambda m: int(m["id"]))
     if not new:
         return {}
-    rows = db.q("SELECT id, ts, text FROM messages WHERE direction='in' AND kind!='finding' AND ts>=? AND id<? "
+    rows = db.q("SELECT id, ts, text, chat FROM messages WHERE direction='in' AND kind!='finding' AND ts>=? AND id<? "
                 "ORDER BY id DESC LIMIT ?", (now - REPEAT_S, int(new[-1]["id"]), REPEAT_ROWS))[::-1]
+    cited = _cited(db, [*map(dict, rows), *new])
     first: dict[tuple, tuple[int, str]] = {}   # normalized sentence: (first id, its words)
     last: dict[tuple, float] = {}              # normalized sentence: when it was last said
     recent: list[tuple[frozenset, tuple]] = []
@@ -216,7 +238,7 @@ def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tup
                     first[s] = (int(rows[i]["id"]), " ".join(s))
                     recent.append((frozenset(s), s))
                 last[s] = float(rows[i]["ts"] or 0)
-            for words, anc, ask, rest in clauses(rows[i]["text"]):
+            for words, anc, ask, rest in clauses(rows[i]["text"], cited.get(rows[i]["chat"], ())):
                 for a in anc if not ask else ():
                     got = by_anchor.setdefault(a, [])
                     got.append((int(rows[i]["id"]), float(rows[i]["ts"] or 0), rest, " ".join(words), anc))
@@ -234,7 +256,7 @@ def repeats(db: DB, msgs: list[dict], now: float | None = None) -> dict[int, tup
                 break
         if mid in out:
             continue
-        for words, anc, ask, said in clauses(m.get("text") or ""):
+        for words, anc, ask, said in clauses(m.get("text") or "", cited.get(m.get("chat"), ())):
             if ask or not anc or len(_content(words)) < 2:
                 continue
             cands = sorted({c for a in anc for c in by_anchor.get(a, ())},
@@ -500,10 +522,10 @@ def _specific(cls) -> set:
     return {a for a in cls or () if a.startswith(CLASS_ANCHORS)}
 
 
-def _class(why: str, text: str) -> list[str]:
+def _class(why: str, text: str, msgs=()) -> list[str]:
     """A correction's class: its message's task ids and config keys, and for a repeat the message it
     repeats (CLASS_ANCHORS); a model family or effort level alone names no class."""
-    out = _specific(anchors(text))
+    out = _specific(anchors(text, msgs))
     if m := re.fullmatch(r"repeats #(\d+)", str(why or "")):
         out.add(f"msg#{m.group(1)}")
     return sorted(out)
@@ -541,10 +563,12 @@ def settle(db: DB, note: dict, actions: list, summary: str, started: float, now:
             r["fix"] = _refuse(recs, r, class_fix(db, actions, summary, int(r["msg"]), started, r.get("why") or "",
                                                  r.get("class")) or _later_fix(db, r), now)
     got = {int(k): v for k, v in (note.get("corrections") or {}).items()}
-    texts = {int(r["id"]): r["text"] or "" for r in db.q(
-        f"SELECT id, text FROM messages WHERE id IN ({','.join('?' * len(got))})", list(got))} if got else {}
+    rows = [dict(r) for r in db.q(f"SELECT id, text, chat FROM messages WHERE id IN ({','.join('?' * len(got))})",
+                                  list(got))] if got else []
+    texts, chats, cited = {r["id"]: r["text"] or "" for r in rows}, {r["id"]: r["chat"] for r in rows}, _cited(db, rows)
     for mid, why in got.items():
-        cls = by_msg[mid].get("class") if mid in by_msg else _class(str(why), texts.get(mid, ""))
+        cls = (by_msg[mid].get("class") if mid in by_msg
+               else _class(str(why), texts.get(mid, ""), cited.get(chats.get(mid), ())))
         fix = class_fix(db, actions, summary, mid, started, str(why), cls)
         if mid in by_msg:
             by_msg[mid]["fix"] = by_msg[mid].get("fix") or _refuse(recs, by_msg[mid], fix, now)

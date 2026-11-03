@@ -18866,6 +18866,32 @@ def test_an_anchored_clause_repeats_only_on_words_beyond_its_anchors_and_a_dotte
         again: (plan, "use osus 5 5 low for ref")}
 
 
+def test_pr_numbers_and_message_ids_are_no_task_anchors_but_task_ids_are(env):
+    """A '#N' after a PR, issue, repo or message word (and the rest of its list), or naming an inbound
+    message of the chat, is no task anchor: two messages listing one repo's PRs and citing each other's
+    ids are no repeat and share no class. 'task #N' and a bare '#N' naming a task still anchor."""
+    from ttp import correction
+    p = make(env)
+    tid = max(p.db.add_task(f"example task {i}", "s", origin="user") for i in range(40))
+    start = _said(p, "What is the status of the widgets release?", days=2)
+    a = _said(p, f"Merge PRs #7, #8 and #16 of acme/widgets together, see #{start}", days=1)
+    b = _said(p, f"Merge acme/widgets#7, #8 and #16 together, as #{a} and msg #{start} said")
+    assert tid not in {a, b, start}
+    assert correction.flag(p.db, p.config(), _rows(p, b)) == {}
+    now = time.time()
+    correction.settle(p.db, {"corrections": {str(b): "phrase 'as said'"}}, [], f"correction #{b}: none", now - 1, now)
+    assert {r["msg"]: r["class"] for r in p.db.kv(correction.KEY)}[b] == []
+    for text in ("PRs #7, #8 and #16", "pull request #7/#8", "issues #3 & #4", "acme/widgets #7, #8, and #16",
+                 "messages #3 and #4", "repo #7 or #8"):
+        assert correction.anchors(text) == set(), text
+    assert correction.anchors(f"task #12, task#13 and #{tid}; PR #7 and #8") == {"#12", "#13", f"#{tid}"}
+    assert correction.anchors(f"task #{a} and #{start}", {a, start}) == {f"#{a}"}
+    # A bare task id still anchors a repeat.
+    first = _said(p, f"Run the benchmarks for #{tid} at night", days=1)
+    again = _said(p, f"Run the benchmarks for #{tid} tonight")
+    assert correction.flag(p.db, p.config(), _rows(p, again)) == {again: f"repeats #{first}"}
+
+
 def test_a_refused_none_needs_the_same_first_message_task_or_key_and_not_a_correction_never_counts(env):
     """Review #4241: corrections sharing only a model family or effort level are unrelated and keep their
     reasons; the same repeated first message, task id or config key refuses the second; a 'not a
