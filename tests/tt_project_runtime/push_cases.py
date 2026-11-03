@@ -14151,6 +14151,150 @@ def test_a_push_check_past_its_time_limit_is_ended_and_fails_the_push_loudly(env
     assert _ttp("push") == push.REFUSED and "push_checks_timeout_s" in capsys.readouterr().err
 
 
+def _waiting_check(env, name, wait_s, run_s):
+    """A push check that waits `wait_s` for a grant (recorded through checkwait), then runs `run_s`."""
+    script = env["tmp"] / f"{name}.py"
+    script.write_text(
+        "import sys, time\n"
+        f"sys.path.insert(0, {str(RUNTIME)!r})\n"
+        "from ttp import checkwait\n"
+        "t = checkwait.begin('lane')\n"
+        f"time.sleep({wait_s})\n"
+        "checkwait.end(t)\n"
+        f"time.sleep({run_s})\n")
+    return f"{sys.executable} {script}"
+
+
+def test_a_push_check_time_limit_counts_run_time_not_its_wait_for_a_grant(env, monkeypatch, capsys):
+    """A check that waits 3 s for a checks lane and then runs 0.2 s passes under a 1 s limit; one that waits
+    and then runs past the limit fails, saying the wait was not counted."""
+    from ttp import push
+    monkeypatch.setattr(push, "CHECK_POLL_S", 0.1)
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_waiting_check(env, "quick", 3, 0.2)])
+    p.set_config("delivery.push_checks_timeout_s", 1)
+    p.set_config("delivery.push_wait_s", 60)
+    _commit(repo, "mine.txt", "mine\n")
+    assert _ttp("push") == 0, capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", "proj") == _git_out(repo, "rev-parse", "HEAD")
+    capsys.readouterr()
+    p.set_config("delivery.push_checks", [_waiting_check(env, "slow", 2, 30)])
+    before = _git_out(origin, "rev-parse", "proj")
+    _commit(repo, "more.txt", "more\n")
+    t0 = time.time()
+    assert _ttp("push") == push.CHECKS_FAILED
+    err = capsys.readouterr().err
+    assert time.time() - t0 < 25
+    assert "check ran past its limit of 1 s" in err and "waiting for a grant not counted" in err, err
+    assert _git_out(origin, "rev-parse", "proj") == before
+
+
+def test_a_push_check_still_waiting_for_a_grant_at_its_outer_bound_is_queued_not_failed(env, monkeypatch, capsys):
+    """Still waiting for a grant once its limit plus the push wait have gone by, the check never ran: the push
+    exits 75 (queued, not run) with a retry_when, never a failed check that would open a fix task."""
+    from ttp import batch, push
+    monkeypatch.setattr(push, "CHECK_POLL_S", 0.1)
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_waiting_check(env, "stuck", 60, 0)])
+    p.set_config("delivery.push_checks_timeout_s", 1)
+    p.set_config("delivery.push_wait_s", 1)
+    before = _git_out(origin, "rev-parse", "proj")
+    _commit(repo, "mine.txt", "mine\n")
+    t0 = time.time()
+    assert _ttp("push") == push.BUSY
+    err = capsys.readouterr().err
+    assert time.time() - t0 < 25
+    assert "queued, not run" in err and "retry_when: " in err and "check failed" not in err, err
+    assert _git_out(origin, "rev-parse", "proj") == before
+    # The push queue's busy outcome is the same transient code: requeued, not a failed tip.
+    assert batch.EXIT["busy"] == push.BUSY != batch.EXIT["tip_failed"]
+
+
+def test_checkwait_state_counts_waits_since_the_check_started_once_each(tmp_path):
+    import json
+    from ttp import checkwait, locks
+    d = tmp_path / "waits"
+    d.mkdir()
+    assert checkwait.state(d, 0, 100) == (0.0, False)   # nothing recorded yet
+    me = os.getpid()
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    waits = {
+        "a": {"start": 90, "end": 105, "pid": me},    # began before the check: clipped to since=100
+        "b": {"start": 110, "end": 120, "pid": me},
+        "c": {"start": 115, "end": 125, "pid": me},   # overlaps b: counted once
+        "d": {"start": 50, "end": 80, "pid": me},     # ended before the check started: nothing
+        "e": {"start": 130, "end": None, "pid": dead.pid},   # its process died waiting: nothing
+    }
+    (d / locks.WAITS_FILE).write_text(json.dumps(waits))
+    assert checkwait.state(d, 100, 200) == (20.0, False)
+    waits["f"] = {"start": 190, "end": None, "pid": me}   # open and alive: counts up to now, and waits now
+    (d / locks.WAITS_FILE).write_text(json.dumps(waits))
+    assert checkwait.state(d, 100, 200) == (30.0, True)
+    # Bypasses: a garbled file, a list instead of a map and rows with bad fields count nothing.
+    for bad in ("{", "[1, 2]", json.dumps({"x": {"start": "soon", "end": 1}, "y": "z", "w": {"end": 3}})):
+        (d / locks.WAITS_FILE).write_text(bad)
+        assert checkwait.state(d, 0, 200) == (0.0, False)
+    # A future end counts only up to now.
+    (d / locks.WAITS_FILE).write_text(json.dumps({"g": {"start": 150, "end": 900, "pid": me}}))
+    assert checkwait.state(d, 100, 200) == (50.0, False)
+
+
+def test_checkwait_records_only_inside_a_push_check_and_chain_keeps_the_callback(tmp_path, monkeypatch):
+    from ttp import checkwait
+    monkeypatch.delenv(checkwait.ENV, raising=False)
+    seen = []
+    cb = seen.append
+    assert checkwait.begin("lane") is None and checkwait.chain(cb) is cb and checkwait.chain(None) is None
+    checkwait.end(None)
+    d = tmp_path / "waits"
+    d.mkdir()
+    monkeypatch.setenv(checkwait.ENV, str(d))
+    t0 = time.time()
+    chained = checkwait.chain(cb, "slot")
+    chained(True)
+    chained(True)   # a repeated "waiting" opens no second record
+    waited, live = checkwait.state(d, t0)
+    assert live and seen == [True, True]
+    time.sleep(0.2)
+    chained(False)
+    chained(False)   # a repeated "granted" closes nothing twice
+    waited, live = checkwait.state(d, t0)
+    assert not live and 0.15 <= waited < 5 and seen == [True, True, False, False]
+    assert checkwait.chain(None, "x") is not None   # records even without a callback of its own
+
+
+def test_ttp_lock_inside_a_push_check_records_its_wait_for_the_grant(env, tmp_path):
+    p = make(env)
+    from ttp import checkwait
+    waits = tmp_path / "waits"
+    waits.mkdir()
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sleep", "30"], env=run_env,
+                              start_new_session=True)
+    try:
+        slot = p.state / "locks" / "board.0.lock"
+        deadline = time.time() + 20
+        while time.time() < deadline and not (slot.exists() and slot.read_text()):
+            time.sleep(0.05)
+        t0 = time.time()
+        waiter = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "true"],
+                                  env={**run_env, checkwait.ENV: str(waits)}, stderr=subprocess.PIPE, text=True,
+                                  start_new_session=True)
+        assert "waiting for board" in waiter.stderr.readline()
+        assert _wait_for(lambda: checkwait.state(waits, t0)[1], 10), "the open wait is not recorded"
+        os.killpg(holder.pid, signal.SIGTERM)
+        holder.wait(timeout=30)
+        waiter.communicate(timeout=30)
+        assert waiter.returncode == 0
+        waited, live = checkwait.state(waits, t0)
+        assert not live and waited > 0, "the wait stays open once the lock was granted"
+    finally:
+        for proc in (holder,):
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+
 def test_task_show_prints_a_superseded_record_with_its_commit_and_whether_it_is_on_the_push_branch(env, monkeypatch, capsys):
     import json
     from ttp import landed
