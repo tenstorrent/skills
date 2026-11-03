@@ -208,8 +208,8 @@ def named_shas(task: dict) -> list[str]:
 def code_commits(p, hop: dict, earlier=(), now: float | None = None) -> int:
     """The commits code hop `hop` made: committer time inside its runs (run_windows), read from its own
     worktree or clone, its branch and pr_branch (each where it resolves: the worktree, the project
-    root) less the base and the `earlier` tasks' branches it started from, and the shas its hand-off
-    names. A source git cannot read adds none."""
+    root) less the base (in a standalone clone, its origin/HEAD) and the `earlier` tasks' branches it
+    started from, and the shas its hand-off names. A source git cannot read adds none."""
     from . import worktree
     wins = run_windows(p.db, hop, now)
     lo = min(a for a, _ in wins)
@@ -237,9 +237,12 @@ def code_commits(p, hop: dict, earlier=(), now: float | None = None) -> int:
         base = ""
     not_ = [f"^refs/heads/{b}" for b in dict.fromkeys(earlier) if b and worktree.valid_branch(b)]
     for repo in repos:
-        shared = base and (repo == p.root or common(repo) == common(p.root))
+        same = repo == p.root or (p.root in repos and common(repo) == common(p.root))
+        # a standalone clone: less its upstream default branch (commits pulled in are not the hop's own);
+        # not every remote ref, as the hop's own pushed branch still counts
+        less = [base] if base and same else [] if same else ["^refs/remotes/origin/HEAD"]
         if refs := (["HEAD"] if repo == own else []) + [f"refs/heads/{b}" for b in branches]:
-            log(repo, f"--since=@{lo}", "--max-count=500", *refs, *not_, *([base] if shared else []))
+            log(repo, f"--since=@{lo}", "--max-count=500", *refs, *not_, *less)
         if shas:
             log(repo, "--no-walk=unsorted", *shas)
     return sum(1 for ct in found.values() if any(a <= ct <= b for a, b in wins))

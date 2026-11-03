@@ -1052,6 +1052,53 @@ def test_code_hop_commits_read_its_clone_run_windows_and_named_shas_where_the_ro
     assert chaincap.progress(q, chaincap.chain(p.db, work), 2) == "new evidence: latency_ms"
 
 
+def _upstream_clone(tmp_path, q, hop):
+    """An upstream repo with one old commit, cloned to the hop's worktree path (origin/HEAD set by the
+    clone), then a new upstream commit pulled into it: (upstream, clone)."""
+    up = _own_clone(types.SimpleNamespace(worktrees=tmp_path), "upstream", commit_now=False)
+    path = q.worktrees / f"t{hop}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "clone", "-q", str(up), str(path)], check=True)
+    (up / "upstream.py").write_text("upstream\n")
+    _git_out(up, "add", ".")
+    _git_out(up, *_IDENT, "commit", "-qm", "upstream")
+    _git_out(path, *_IDENT, "pull", "-q", "--ff-only")
+    return up, path
+
+
+def test_a_code_hop_clone_does_not_count_upstream_commits_it_pulled_during_its_run(env, tmp_path):
+    """A standalone clone (the project root is no git repo): upstream commits pulled during the run are
+    not the hop's own (its upstream default branch is left out), while its own commit counts even when
+    pushed to its remote task branch; a clone with no origin/HEAD still reads and keeps today's count."""
+    from ttp import chaincap
+    p = make(env)
+    plain = tmp_path / "plain-root"
+    plain.mkdir()
+    q = types.SimpleNamespace(db=p.db, root=plain, worktrees=tmp_path / "wts")
+    root = _chain_root(p, "port", 1.0)
+    hop = _chain_hop(p, root, "continue: port", 1.0)
+    p.db.update_task(hop, result=json.dumps({"status": "done", "metrics": {"passed": 3}}))
+    up, path = _upstream_clone(tmp_path, q, hop)
+    assert _git_out(path, "symbolic-ref", "refs/remotes/origin/HEAD")
+    # (a) clone_upstream_merge_zero: only the pulled upstream commit is new.
+    assert chaincap.code_commits(q, p.db.task(hop)) == 0
+    assert chaincap.progress(q, chaincap.chain(p.db, hop), 1) == ""
+    # (b) clone_own_pushed_commit_counts: its own commit, also pushed to its remote task branch, counts.
+    (path / "own.py").write_text("own\n")
+    _git_out(path, "add", ".")
+    _git_out(path, *_IDENT, "commit", "-qm", "own")
+    _git_out(path, "push", "-q", "origin", f"HEAD:refs/heads/ttp/t{hop}-port")
+    _git_out(path, "fetch", "-q", "origin")
+    assert _git_out(path, "rev-parse", f"origin/ttp/t{hop}-port") == _git_out(path, "rev-parse", "HEAD")
+    assert chaincap.code_commits(q, p.db.task(hop)) == 1
+    assert chaincap.progress(q, chaincap.chain(p.db, hop), 1) == "1 new commit"
+    # (c) clone_no_origin_head: no crash, today's count (nothing is left out).
+    _git_out(path, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+    assert chaincap.code_commits(q, p.db.task(hop)) == 2
+    _git_out(path, "remote", "remove", "origin")
+    assert chaincap.code_commits(q, p.db.task(hop)) == 2
+
+
 def test_a_non_code_hop_with_new_metrics_still_gets_its_continue_queued(env):
     from ttp import chaincap
     p = make(env)
