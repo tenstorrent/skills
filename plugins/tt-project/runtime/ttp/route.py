@@ -84,6 +84,7 @@ COOLDOWN_S = 900
 MISSING = "route_model_missing:"   # kv per routed tier: {"model", "since", "run"} while its model is not served
 MODELS_FILE = "endpoint-models.json"   # under the project state dir: {provider: {"ids", "checked", "ok", "check"}}
 MODELS_EVERY_S = 3600       # the daemon's model-free /models check runs at most this often per provider
+RETRY_QUIET_S = 86400       # a re-hold of the same model this soon after its quiet retry sends no new notice
 FAULTS = ("down", "error", "rate_limit", "auth", "malformed", "model_missing")
 RUN_CAUSES = ("timeout", "failed", "no_handoff")   # a routed run's own end without a hand-off (own_cause)
 OWN_CAUSE_WORDS = ("timed out", "stalled", "exited without", "result.json", "exit ")   # fallback_line shows these
@@ -141,18 +142,22 @@ def cool(db, cfg: dict, prov: str, reason: str, run_id: int | None, now: float) 
 
 
 def held(db, cfg: dict, tier: str) -> str:
-    """The model a routed tier's hold is for while that model is still the configured one, else ''."""
+    """The model a routed tier's hold is for while that model is still the configured one, else ''
+    (a retry record, release's quiet hourly try, holds nothing)."""
     h = db.kv(MISSING + tier) or {}
     to = target(cfg, tier)
-    return str(h.get("model") or "") if h and to and to[1] == h.get("model") else ""
+    return str(h.get("model") or "") if h and not h.get("retry") and to and to[1] == h.get("model") else ""
 
 
 def hold(db, tier: str, model: str, run_id: int | None, now: float) -> bool:
-    """Hold the tier's route: its endpoint does not serve `model`. True when the hold is new."""
-    if (db.kv(MISSING + tier) or {}).get("model") == model:
+    """Hold the tier's route: its endpoint does not serve `model`. True when the hold is new (the user
+    is told); a re-hold of the same model within RETRY_QUIET_S of its quiet retry (release) is not."""
+    h = db.kv(MISSING + tier) or {}
+    if h.get("model") == model and not h.get("retry"):
         return False
+    quiet = h.get("model") == model and now - float(h.get("at") or 0) < RETRY_QUIET_S
     db.set_kv(MISSING + tier, {"model": model, "since": now, "run": run_id})
-    return True
+    return not quiet
 
 
 def holds(db) -> dict[str, dict]:
@@ -162,17 +167,33 @@ def holds(db) -> dict[str, dict]:
 
 
 def release(db, cfg: dict, served: dict, now: float) -> list[tuple[str, str, str]]:
-    """End each hold whose tier's configured model changed (or is no longer routed) or that the last
-    /models check (`served`, read_served) lists again after the hold began: [(tier, model, why)]."""
+    """End each hold whose tier's configured model changed (or is no longer routed), or once a /models
+    check (`served`, read_served) after the hold began left the model out and a later one lists it
+    again: [(tier, model, why)]. A check after the hold that still lists the refused model contradicts
+    nothing it proves: the tier tries one routed run again (a quiet retry record) without a new notice
+    for RETRY_QUIET_S, so a model the endpoint lists but refuses costs one run an hour and one notice."""
     out = []
     for tier, h in holds(db).items():
         model = str(h.get("model") or "")
         to = target(cfg, tier)
         rec = (served or {}).get(to[0] if to else TO) or {}
+        fresh = rec.get("ok") and float(rec.get("checked") or 0) > float(h.get("since") or 0)
         if not to or to[1] != model:
             why = f"the configured model is now {to[1]}" if to else "the tier is no longer routed"
-        elif rec.get("ok") and model in (rec.get("ids") or []) and float(rec.get("checked") or 0) > float(h.get("since") or 0):
+        elif h.get("retry"):
+            if now - float(h.get("at") or 0) < RETRY_QUIET_S:
+                continue
+            why = "its quiet retry ended"
+        elif fresh and model not in (rec.get("ids") or []):
+            if not h.get("gone"):
+                db.set_kv(MISSING + tier, {**h, "gone": rec.get("checked")})
+            continue
+        elif fresh and h.get("gone") and float(rec.get("checked") or 0) > float(h["gone"]):
             why = "the endpoint lists it again"
+        elif fresh and not h.get("gone"):
+            db.set_kv(MISSING + tier, {"model": model, "retry": True, "at": now})
+            out.append((tier, model, "the endpoint still lists it; one routed run tries it again"))
+            continue
         else:
             continue
         db.x("DELETE FROM kv WHERE key=?", (MISSING + tier,))

@@ -1277,6 +1277,64 @@ def test_a_routed_run_refused_its_model_by_claude_code_holds_the_tier_with_one_n
     assert route.fell_back("failed", {}, "the worker read about unrecognized models") == ""
 
 
+def test_a_refused_model_the_endpoint_still_lists_retries_hourly_with_one_notice(env, monkeypatch, mock_chat):
+    """Review #5307: a hold made while /models still lists the model ended at the next hourly check, the
+    next routed run was refused again and a new notice went out every hour. One notice per tier and
+    model; the tier still tries one routed run per hourly check."""
+    from ttp import endpoint, project, route
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "models-home")
+    up = mock_chat()
+    up.models = [_RT_MODEL]
+    endpoint.save("placeholder", up.url, _CB_KEY, True, "HTTP 200")
+    p = make(env)
+    p.set_config("providers.chat", {"endpoint": "placeholder", "base_url": up.url,
+                                    "tiers": {"light": {"model": _RT_MODEL, "route": True}}})
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    alerts = []
+    monkeypatch.setattr(d, "alert", lambda key, text, severity="high", **k: alerts.append((key, severity)))
+    monkeypatch.delenv("TTP_TEST_NO_MODELS_PROBE", raising=False)
+    refused = '[claude-code:unrecognized_model] {"model":"%s"}' % _RT_MODEL
+
+    def refused_run(n):
+        tid = p.db.add_task(f"build{n}", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+        p.db.update_task(tid, status="running")
+        rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) "
+                     "VALUES(?,'worker','chat',?,?,'running',?,?)", (tid, _RT_MODEL, time.time() - 30, d.boot,
+                     json.dumps({"route": {"tier": "light", "to": "chat", "model": _RT_MODEL, "fallback": "none"}})))
+        rd = p.runs / str(rid)
+        rd.mkdir(parents=True)
+        (rd / "output.jsonl").write_text(json.dumps({"type": "result", "subtype": "error_during_execution",
+                                                     "is_error": True, "total_cost_usd": 0.0, "usage": {},
+                                                     "result": refused, "session_id": "s-1"}) + "\n")
+        p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(rd), rid))
+        d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                     {"rc": 1, "started": time.time() - 30, "ended": time.time(), "bridge": {"last_fault": "error"}})
+        p.db.update_task(tid, status="done")
+
+    def hourly_check():
+        rec = route.read_served(p.state).get("chat")
+        if rec:   # the last check was an hour ago
+            (p.state / route.MODELS_FILE).write_text(json.dumps({"chat": {**rec, "checked": time.time() - route.MODELS_EVERY_S}}))
+        d._models_tried = 0.0
+        d.check_route_models()
+        if d._models_probe:
+            d._models_probe.join(10)
+        time.sleep(0.01)
+        d.check_route_models()
+
+    refused_run(0)
+    assert route.held(p.db, d.cfg, "light") == _RT_MODEL
+    for n in (1, 2):
+        hourly_check()
+        assert _RT_MODEL in route.read_served(p.state)["chat"]["ids"]
+        assert route.held(p.db, d.cfg, "light") == ""   # one routed run tries it again
+        refused_run(n)
+        assert route.held(p.db, d.cfg, "light") == _RT_MODEL
+    assert alerts == [("route-model-missing:light", "normal")], alerts
+
+
 def test_a_model_missing_hold_ends_when_the_endpoint_lists_it_or_the_config_changes(env, monkeypatch, mock_chat):
     from ttp import endpoint, project, route
     from ttp.daemon import Daemon
