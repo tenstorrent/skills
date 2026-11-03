@@ -91,7 +91,7 @@ peers names the bound.
 
 `PM FPU UTIL (%)` cannot settle compute-bound versus bandwidth-bound: it is a
 perf-model estimate, ~0 on ops with no model and high on some data-movement
-ops. Measured per-engine counters: `references/perf-counters.md`.
+ops. Measured per-engine counters: `perf-counters.md`.
 
 ## Matmul: op-level DRAM% × FLOPs%
 

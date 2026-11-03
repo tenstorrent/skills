@@ -19,13 +19,14 @@ source <tt-metal venv>/bin/activate
 source <tt-npe>/ENV_SETUP
 
 python -m tracy -p -r --collect-noc-traces -m pytest <test> -k <filter>
-python tools/tracy/process_ops_logs.py --analyze-noc-traces
 ```
 
-`--collect-noc-traces` has the device record per-op NoC event traces.
-`--analyze-noc-traces` runs tt-npe over them and fills the columns. If
-post-processing warns `Could not import tt-npe module`, `ENV_SETUP` was not
-sourced in that shell.
+`--collect-noc-traces` has the device record per-op NoC event traces, and
+`-r` post-processing then runs tt-npe over them itself and fills the columns:
+no second step is needed. If post-processing warns `Could not import tt-npe
+module`, `ENV_SETUP` was not sourced in that shell. To redo only the tt-npe
+step later on existing logs, source `ENV_SETUP` and run
+`python tools/tracy/process_ops_logs.py -o <output-dir> --analyze-noc-traces`.
 
 ## Cost
 
