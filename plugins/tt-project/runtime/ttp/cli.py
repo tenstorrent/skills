@@ -1735,6 +1735,9 @@ def cmd_status(a) -> None:
         print(json.dumps(state_payload(p, p.db), default=str, indent=1))
     else:
         print(status_text(p, verbose=a.verbose))
+        from .project import secrets_state
+        if not (sec := secrets_state())["readable"]:
+            print(f"secrets store: unreadable, skipped ({sec['error']})")
         from . import throughput
         if ln := throughput.status_line(p.db):
             print(ln)
@@ -11380,7 +11383,11 @@ def main(argv: list[str] | None = None) -> None:
         _recover_setup()     # a `ttp setup` a reboot cut short: finished or rolled back before anything else
     except Exception as e:
         print(f"ttp: could not recover an interrupted `ttp setup`: {e}", file=sys.stderr)
-    a.fn(a)
+    from .project import SecretsUnreadable
+    try:
+        a.fn(a)
+    except SecretsUnreadable as e:   # a command that needs a secret: a clear message, not a traceback
+        die(str(e))
 
 
 def dry_run_stub(a) -> None:

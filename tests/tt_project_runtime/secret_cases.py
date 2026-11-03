@@ -731,7 +731,6 @@ def test_secret_env_masks_each_line_of_a_multi_line_secret(env, monkeypatch, cap
                          "import os; print(os.environ['PEM'])")
     assert code == 0 and "line-one" not in out and "line-two" not in out and "[secret:pem-key]" in out, out
 
-
 _JEV_KEY = "fake-jev-key-0123456789abcdef"
 
 
@@ -874,3 +873,39 @@ def test_a_sandboxed_secret_env_gives_up_when_the_daemon_never_starts_it(env, mo
     code, out = _env_run(monkeypatch, capfd, "--secret", "jev:key=JK", "--", "true")
     assert code == 1 and "the daemon did not start the command" in out, out
     assert not list((p.state / "detach-queue").glob("*.json"))      # withdrawn: no late start
+
+
+@pytest.mark.parametrize("damage", ["mode0", "directory"])
+def test_status_skips_an_unreadable_secret_store_and_secret_users_still_fail(env, monkeypatch, capsys, damage):
+    """In a worker sandbox the secrets store cannot be read: `ttp status` and `ttp status --json` still
+    report and the JSON marks the store unreadable; a caller that needs a secret still fails, clearly."""
+    p = make(env)
+    from ttp import cli, endpoint, project, redact
+    endpoint.save("tt-cloud", _EP_URL, _EP_KEY, True, "HTTP 200")   # in the home the project is registered in
+    store = project.secrets_path()
+    monkeypatch.setattr(redact, "_cache", {"sig": None, "pairs": []})
+    if damage == "mode0":
+        store.chmod(0)
+    else:
+        store.unlink()
+        store.mkdir()
+    try:
+        if damage == "mode0" and os.access(store, os.R_OK):
+            pytest.skip("running as root: mode 0 is still readable")
+        cli.main(["status", p.name, "--json"])
+        sec = json.loads(capsys.readouterr().out)["secrets"]
+        assert sec["readable"] is False and sec["path"] == str(store) and sec["error"]
+        cli.main(["status", p.name])
+        assert "secrets store: unreadable" in capsys.readouterr().out
+        with pytest.raises(project.SecretsUnreadable, match="cannot read the secrets store"):
+            endpoint.credentials("tt-cloud")
+        with pytest.raises(SystemExit):
+            cli.main(["secret", "check", "tt-cloud"])
+        assert "cannot read the secrets store" in capsys.readouterr().err
+    finally:
+        if store.is_dir():
+            store.rmdir()
+        else:
+            store.chmod(0o600)
+    cli.main(["status", p.name, "--json"])
+    assert json.loads(capsys.readouterr().out)["secrets"] == {"readable": True, "path": str(store)}

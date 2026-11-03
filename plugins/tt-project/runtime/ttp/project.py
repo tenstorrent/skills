@@ -2452,13 +2452,31 @@ def secrets_path() -> Path:
     return HOME_DIR / "secrets.json"
 
 
+class SecretsUnreadable(OSError):
+    """The secrets store is there but cannot be read: a worker sandbox hides it, or its owner, mode or
+    type is wrong."""
+
+
 def load_secrets() -> dict:
     """Per-user credentials shared by every project of this user on this machine (mode 0600).
-    Never copied into a project folder, never printed."""
+    Never copied into a project folder, never printed. A store that is there but cannot be read raises
+    SecretsUnreadable, so a caller that needs a secret fails clearly; read-only status uses secrets_state."""
     try:
         return json.loads(secrets_path().read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+    except OSError as e:
+        raise SecretsUnreadable(f"cannot read the secrets store at {secrets_path()}: {e.strerror or e}") from None
+
+
+def secrets_state() -> dict:
+    """For read-only status (`ttp status`, its --json, the web state): {"readable": True, "path"}, or
+    readable False with the error, never raising."""
+    try:
+        load_secrets()
+    except SecretsUnreadable as e:
+        return {"readable": False, "path": str(secrets_path()), "error": str(e)}
+    return {"readable": True, "path": str(secrets_path())}
 
 
 def save_secret(key: str, value: Any) -> None:

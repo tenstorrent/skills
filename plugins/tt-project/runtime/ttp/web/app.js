@@ -182,7 +182,7 @@ $("#notify").onclick = () => {
   document.querySelector('#tabs button[data-tab="overview"]').click(); $("#notifycard").scrollIntoView();
 };
 $("#notifytest").onclick = async () => {
-  const slack = !!slackState && !["not_configured", "no_token"].includes(slackState.state);
+  const slack = !!slackState && !["not_configured", "no_token", "unreadable"].includes(slackState.state);
   text($("#notifyresult"), "sending…");
   const r = await api("/api/notify/test", slack ? { slack: true } : {}), s = notifyState(window), out = [];
   if (s !== "on") out.push(`Browser: not sent, notifications are ${s === "ask" ? "not allowed yet" : s}.`);

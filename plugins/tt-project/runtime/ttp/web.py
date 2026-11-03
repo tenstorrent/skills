@@ -26,7 +26,7 @@ from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREE
 from .alerts import cleared  # noqa: F401  (readers import it from here)
 from .db import (DB, NOT_ABANDONED_SQL, SEVERITY_RANK, chat_floor, continues_id, deferral, dependency_ids, dump_result, host_line,
                  load_result, task_outcome)
-from .project import Project, durable_write
+from .project import Project, durable_write, secrets_state
 from .providers import get_provider
 from .providers.base import FUNDS_RE
 from .watchdog import settings as watchdog_settings
@@ -744,6 +744,7 @@ def state_payload(p: Project, db: DB) -> dict:
         "schedules": sched.with_costs(db, timefmt.home(p)),
         "attention": attention(db, now, p),
         "notify": notify_state(p, db),
+        "secrets": secrets_state(),
         "feed": sorted(alerts.feed(db, now) + uncommitted_feed(db) + startgate.feed(db, warn_s, now)
                        + sweepskip.feed(db, now, tz) + slots_feed(now, p), key=lambda m: -float(m["ts"] or 0)),
         "offline_help": offline_help(p.name),

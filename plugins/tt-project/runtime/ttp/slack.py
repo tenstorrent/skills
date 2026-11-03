@@ -199,9 +199,13 @@ SETUP = ("`ttp secret slack --email <your Slack email>` saves a bot token for th
 def status(cfg: dict, last_error: dict | None = None) -> dict:
     """Slack for one project, for the web app and `ttp doctor`: {"state", "line"}. state is on, error
     (on, but its last send failed: `last_error`, cleared by the next good send), off (a bot is saved
-    but this project does not use it), no_token (on in the config, no bot saved) or not_configured."""
-    from .project import load_secrets
-    saved = bool((load_secrets().get("slack") or {}).get("bot_token"))
+    but this project does not use it), no_token (on in the config, no bot saved), not_configured or
+    unreadable (the secrets store cannot be read here, as in a worker sandbox)."""
+    from .project import SecretsUnreadable, load_secrets
+    try:
+        saved = bool((load_secrets().get("slack") or {}).get("bot_token"))
+    except SecretsUnreadable:   # read-only status in a worker sandbox: skip what it cannot read
+        return {"state": "unreadable", "line": "Slack: unknown here (the secrets store cannot be read)"}
     notify = cfg.get("notify") or {}
     if notify.get("slack") and saved:
         line = f"Slack: on; messages at {notify.get('slack_min_severity', 'high')} severity and above go to your Slack DM"
