@@ -605,7 +605,8 @@ def test_without_proc_one_ps_answers_every_pid_of_a_poll_cycle(tmp_path, monkeyp
     if ps_ok:
         assert len(calls) == 1 and "-A" in calls[0], f"one `ps` for every pid, got {calls}"
     else:
-        assert len(calls) == 7 and "-A" in calls[0], "ps -A failed: then each pid asked alone, as before"
+        # dead pids are ruled out by kill(pid, 0) without a fork; only the two live records ask ps alone
+        assert len(calls) == 3 and "-A" in calls[0], f"ps -A failed: then each live pid asked alone, got {calls}"
     calls.clear()
     with project.ps_snapshot():
         assert runner.proc_start(os.getpid()) == me
