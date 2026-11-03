@@ -4523,7 +4523,9 @@ def _checks_reaped(out, tok: str, record, clean, rc) -> None:
         if record is not None:
             record.exit(rc)
         found, left = checkreap.reap(tok, record.data["pgids"] if record is not None else (),
-                                     str(clean.dir) if clean is not None else "")
+                                     str(clean.dir) if clean is not None else "",
+                                     state=record.dir.parent.parent if record is not None else None,
+                                     why="the end of its own check run")
     except OSError:
         pass
     finally:

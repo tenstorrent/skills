@@ -169,3 +169,26 @@ def test_a_reaped_process_counts_until_it_is_gone_not_until_it_stops_showing_its
         assert proc.wait(timeout=10) == -signal.SIGTERM
     finally:
         _reap_kill(proc)
+
+
+def test_a_sweep_kill_writes_a_job_signals_row_naming_the_process(env, tmp_path, monkeypatch):
+    """The daemon's sweep drops its counts, so each signal it sends must leave a job-signals.jsonl row
+    (who sent it, why, and the ended process's command line): no reap of a check process is silent."""
+    from ttp import checkreap, detach
+    tmp = _reap_tmp(tmp_path, monkeypatch)
+    p = make(env)
+    tree = tmp / f"{_reap_prefix()}rows"
+    tree.mkdir()
+    proc = subprocess.Popen(["sleep", "61"], cwd=tree, start_new_session=True)
+    try:
+        rec = checkreap.Record(p.state, checkreap.token(), str(tree))
+        rec.group(proc.pid)
+        rec.exit(0)
+        assert checkreap.sweep(p.state, grace_s=0, term_s=10) == (1, 1)
+        assert proc.wait(timeout=10) == -signal.SIGTERM
+        rows = [json.loads(x) for x in (p.state / detach.SIGNALS).read_text().splitlines()]
+        assert [(r["pid"], r["signal"], r["by"], r["reason"]) for r in rows] == \
+            [(proc.pid, "SIGTERM", "checkreap", "checkreap.reap")]
+        assert "sleep 61" in rows[0]["target_cmd"] and rec.tok in rows[0]["why"] and "ended" in rows[0]["why"]
+    finally:
+        _reap_kill(proc)

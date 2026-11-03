@@ -114,12 +114,34 @@ def members(tok: str, pgids=(), root: str = "") -> list[int]:
     return out
 
 
-def reap(tok: str, pgids=(), root: str = "", grace_s: float = GRACE_S) -> tuple[int, int]:
+def _cmdline(pid: int) -> str:
+    try:
+        return (PROC / str(pid) / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()[:200]
+    except OSError:
+        return ""
+
+
+def _logged(state, tok: str, pid: int, sig: int, why: str, cmd: str) -> None:
+    """One job-signals.jsonl row (detach.signals_file) for a signal sent to `pid`, so no reap is silent."""
+    from .detach import SIGNALS, _me
+    from .project import durable_append
+    row = {"ts": time.time(), "job": "checkreap", "rc": "", "pid": pid, "group": False,
+           "signal": signal.Signals(sig).name, "reason": "checkreap.reap", "why": why or f"tied to check run {tok}",
+           "by": "checkreap", "by_pid": os.getpid(), "by_cmd": _me(), "target_cmd": cmd, "task": None}
+    try:
+        durable_append(Path(state) / SIGNALS, json.dumps(row) + "\n")
+    except OSError:
+        pass
+
+
+def reap(tok: str, pgids=(), root: str = "", grace_s: float = GRACE_S, state=None, why: str = "") -> tuple[int, int]:
     """End every process tied to run `tok`: SIGTERM, up to `grace_s` for them to go, then SIGKILL
     those still there. Returns (processes found, processes still there, e.g. stuck in D state).
     A found process counts as there until it is gone or a zombie, by its pid and start time: one
-    that is exiting no longer shows its environment, yet still runs."""
+    that is exiting no longer shows its environment, yet still runs. With a project `state`, each
+    signal sent writes a job-signals.jsonl row naming the process (`why`: the caller's reason)."""
     found = {pid: _start(pid) for pid in members(tok, pgids, root)}
+    cmds = {pid: _cmdline(pid) for pid in found} if state is not None else {}
 
     def there(pid: int) -> bool:
         st = _stat(pid)
@@ -132,7 +154,9 @@ def reap(tok: str, pgids=(), root: str = "", grace_s: float = GRACE_S) -> tuple[
             try:
                 os.kill(pid, sig)
             except OSError:
-                pass
+                continue
+            if state is not None:
+                _logged(state, tok, pid, sig, why, cmds.get(pid, ""))
         deadline = time.monotonic() + wait
         while left and time.monotonic() < deadline:
             # A zombie has ended: never reaped here, so whoever started it still gets its exit code.
@@ -240,7 +264,8 @@ def sweep(state: Path, grace_s: float = SWEEP_GRACE_S, term_s: float = GRACE_S) 
             continue   # still running
         left = 0
         if this_boot:
-            found, left = reap(d.name, info.get("pgids") or (), str(info.get("tree") or ""), term_s)
+            found, left = reap(d.name, info.get("pgids") or (), str(info.get("tree") or ""), term_s, state=state,
+                                   why=f"sweep: check run {d.name} of pid {pid} " + ("ended" if ended.exists() else "has a dead runner"))
             procs += found
         trees += _remove_tree(str(info.get("tree") or ""), str(info.get("top") or ""))
         if not left:
