@@ -495,7 +495,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             since: float | None = None, project_name: str | None = None,
             priority: int | None = None, same: str = "", done: Callable[[], bool] | None = None,
             stop: Callable[[], str] | None = None, state: Path | None = None,
-            owns: list[str] | tuple = (), cap: int | None = None, lane_at: float | None = None) -> Slot | None:
+            owns: list[str] | tuple = (), cap: int | None = None, lane_at: float | None = None,
+            startable: Callable[[], bool] | None = None) -> Slot | None:
     """Take a host-wide checks slot, waiting while all are held. Waiters take turns by project
     (`project_name`; none form their own group), within one by task priority (`priority`, 1 first;
     OBLIGATION_PRIORITY before it, its ticket marked OBLIGATION_MARK; none last), then arrival (locks.fair_order),
@@ -514,7 +515,9 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     logged host-wide (record_grant); `cap` (the project cap the run's lane was held under) goes in
     the project's record. `owns`: the ids behind a boost to OBLIGATION_PRIORITY (task_rank).
     A slot taken more than GRANT_TELL_S after `since` is told with its priority and arrival (grant_line),
-    also when a relaunch that inherited `since` takes it at once."""
+    also when a relaunch that inherited `since` takes it at once. While `startable()` is false (the
+    run's test slots could not be taken now: testslots.pool_room) it waits outside the queue as for
+    `same`, keeping `since`, so it holds no slot that only waits and the next project's waiter takes it."""
     n = limit()
     if not n or os.environ.get(HELD_ENV):
         return Slot()
@@ -522,32 +525,41 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     ps, every = paths(n), all_paths(n)
     queued_as = holder + (OBLIGATION_MARK if priority is not None and priority < 1 else "")
     try:
-        f = None if locks.queued(slot_dir(), RESOURCE) or _running(every, same) else _take(n, ps, every, holder, what, same)
+        parked = bool(startable and not startable())
+        f = (None if parked or locks.queued(slot_dir(), RESOURCE) or _running(every, same)
+             else _take(n, ps, every, holder, what, same))
         if f:
             locks.mark_served(slot_dir(), RESOURCE, project_name)
             locks.mark_turn(slot_dir(), RESOURCE, None)
             _granted(tell, state, project_name, priority, owns, since, cap=cap, lane_at=lane_at)
             return Slot(f)
-        ticket = locks.enqueue(slot_dir(), RESOURCE, queued_as, since, group=project_name, priority=priority)
+        ticket = None if parked else locks.enqueue(slot_dir(), RESOURCE, queued_as, since, group=project_name,
+                                                   priority=priority)
+        if parked and tell:   # told once a wait: its pool's room may come and go
+            tell(PARKED_LINE)
     except OSError as e:
         raise _unavailable(e) from e
-    started, told, checked = time.time(), 0.0, time.time()
+    started, told, checked, parked_told = time.time(), 0.0, time.time(), parked
     try:
         while True:
-            if done and (ticket is None or time.time() - checked >= DONE_S):
+            if done and ((ticket is None and not parked) or time.time() - checked >= DONE_S):
                 checked = time.time()
                 if done():
                     return Slot(served=True)
             if stop and (why := stop()):
                 raise Cancelled(why)
             twin = _running(every, same)
-            if twin and ticket is not None:
-                # Same checks run now: wait for their result instead of a place a slot frees to.
+            parked = not twin and bool(startable and not startable())
+            if (twin or parked) and ticket is not None:
+                # Same checks run now: wait for their result instead of a place a slot frees to. Its test
+                # slots cannot be taken now: a slot would only wait for them, so the next waiter takes it.
                 locks.dequeue(ticket)
                 ticket = None
-                if tell:
-                    tell(f"the same checks run now ({twin}); waiting for their result, keeping this place in the queue")
-            elif not twin and ticket is None:
+                if tell and (twin or not parked_told):
+                    tell(f"the same checks run now ({twin}); waiting for their result, keeping this place in the queue"
+                         if twin else PARKED_LINE)
+                parked_told = parked_told or parked
+            elif not twin and not parked and ticket is None:
                 try:
                     ticket = locks.enqueue(slot_dir(), RESOURCE, queued_as, since, group=project_name,
                                            priority=priority)
@@ -591,6 +603,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
 
 
 DONE_S = 30.0   # how often a waiter reads whether a recorded pass made its run needless
+PARKED_LINE = ("no test slots free for this run (its project's test-worker budget or the host's pool is full): "
+               "waiting outside the queue for a host-wide checks slot, keeping this place")
 GRANT_TELL_S = 5.0   # a slot taken longer than this after its arrival is told (grant_line)
 
 

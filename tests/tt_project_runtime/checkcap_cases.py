@@ -3984,7 +3984,7 @@ def test_a_waiting_detached_checks_run_reexecutes_with_an_upgraded_runtime_and_k
     else:
         monkeypatch.setenv("TTP_TEST_POOL", "2")
         held = [testslots.acquire("other 1", project_name="px"), testslots.acquire("other 2", project_name="px")]
-        marker = "waiting for a host-wide test slot"
+        marker = checkcap.PARKED_LINE   # #5452: it waits for them before it takes a host-wide checks slot
     ran, ended = tmp_path / "ran", []
 
     def go():
@@ -4047,9 +4047,11 @@ def test_a_checks_run_waiting_for_test_slots_is_cancelled_and_frees_its_lane(env
     t = threading.Thread(target=go)
     t.start()
     try:
-        assert _wait_for(lambda: "waiting for a host-wide test slot" in (run / "checks.log").read_text()
+        # #5452: it waits for them before it takes a host-wide checks slot (checkcap.PARKED_LINE)
+        assert _wait_for(lambda: checkcap.PARKED_LINE in (run / "checks.log").read_text()
                          if (run / "checks.log").exists() else False)
         assert locks.holder_records(testslots.lane_paths(p.name, None, None)), "it waits holding its lane"
+        assert checkcap.state()["running"] == [], "and no host-wide checks slot"
         (run / cli.CHECKS_SLOT_CANCEL).write_text(json.dumps(
             {"pid": os.getpid(), "started": proc_start(os.getpid()), "why": "task #3 ended (done)"}))
         t.join(30)
@@ -5776,3 +5778,96 @@ def test_no_suite_starts_while_the_host_is_overloaded_and_its_lane_says_why(env,
     monkeypatch.delenv("TTP_CHECKS_LOAD_GUARD")
     project.set_account_setting("checks.load_guard", 2)
     assert testslots.load_guard() == "", "the account setting"
+
+
+def _budget_of_one(monkeypatch):
+    """A test pool of 4 where each project's budget is one run's single slot (testslots.project_max)."""
+    monkeypatch.setenv("TTP_TEST_POOL", "4")
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", "1")
+    monkeypatch.setenv("TTP_TEST_PROJECT_SLOTS", "1")
+    monkeypatch.setenv("TTP_TEST_RUN_MIN", "1")
+
+
+def test_a_run_whose_projects_test_budget_is_full_takes_no_host_slot_and_keeps_its_arrival(env, monkeypatch):
+    """#5452: a run of project A whose test-worker budget is full waits outside the host queue
+    (testslots.pool_room), so project B's later waiter takes the free host slot; once A's budget frees,
+    A's run queues again at its own arrival and goes ahead of a later waiter of project C."""
+    import threading
+    from ttp import checkcap, locks, testslots
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    _budget_of_one(monkeypatch)
+    a1_host, a1_tests = checkcap.acquire("a1"), testslots.acquire("a1", project_name="A")
+    assert a1_tests.k == 1 and not testslots.pool_room({}, "A") and testslots.pool_room({}, "B")
+    told, got = [], {}
+
+    def wait(name, project, since):
+        got[name] = checkcap.acquire(name, tell=told.append, since=since, project_name=project, max_wait_s=30,
+                                     startable=lambda: testslots.pool_room({}, project))
+    a2 = threading.Thread(target=wait, args=("a2", "A", 1000.0))
+    a2.start()
+    held, threads = [], [a2]
+    try:
+        assert _wait_for(lambda: checkcap.PARKED_LINE in told)
+        assert checkcap.state()["queued"] == [] and checkcap.state()["running"] == ["a1"], "A's run holds nothing"
+        b = threading.Thread(target=wait, args=("b", "B", 2000.0))
+        threads.append(b)
+        b.start()
+        b.join(30)
+        assert got.get("b") and got["b"].f is not None, "the other project's later waiter takes the host slot"
+        held.append(got["b"])
+        c = threading.Thread(target=wait, args=("c", "C", 3000.0))
+        threads.append(c)
+        c.start()
+        assert _wait_for(lambda: checkcap.state()["queued"] == ["c"]), "a waiter with room queues as before"
+        a1_tests.close()   # A's budget frees while every host slot is held: A's run queues again
+        assert _wait_for(lambda: len(locks.queued(checkcap.slot_dir(), checkcap.RESOURCE)) == 2)
+        got["b"].close()
+        a2.join(30)
+        assert got.get("a2") and got["a2"].f is not None, "A's run goes first: it kept its arrival"
+        held.append(got["a2"])
+        assert "c" not in got and checkcap.state()["queued"] == ["c"]
+        a1_host.close()
+        c.join(30)
+        held.append(got.get("c"))
+        assert got["c"].f is not None
+    finally:
+        a1_tests.close()
+        a1_host.close()
+        for th in threads:
+            th.join(30)
+        for s in held + list(got.values()):
+            s and s.close()
+
+
+def test_checks_and_push_checks_wait_for_their_projects_test_budget_without_a_host_slot(env, tmp_path, monkeypatch):
+    """#5452: `ttp checks` (cli._checks_slot) and push checks (push.check_slot) of a project whose
+    test-worker budget is full take no host-wide checks slot while they wait: no grant is logged and
+    the foreground wait hands over with nothing held; push checks take their slot once the budget frees."""
+    import io
+    import threading
+    from ttp import checkcap, cli, push, testslots
+    p = make(env)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "4")
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    monkeypatch.delenv("TTP_DETACHED", raising=False)
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 1.0)
+    _budget_of_one(monkeypatch)
+    full = testslots.acquire("running", project_name=p.name)
+    before = len(checkcap.grant_records())
+    out = io.StringIO()
+    try:
+        assert cli._checks_slot(p, run_dir, out, "f" * 40, False, cmds=["true"], top=str(p.base)) is None
+        assert checkcap.PARKED_LINE in out.getvalue() and checkcap.state()["running"] == []
+        assert len(checkcap.grant_records()) == before, "no host slot was granted and handed back"
+        told, got = [], []
+        t = threading.Thread(target=lambda: got.append(push.check_slot("abc", told.append, proj=p)))
+        t.start()
+        assert _wait_for(lambda: checkcap.PARKED_LINE in told) and checkcap.state()["running"] == []
+        full.close()
+        t.join(30)
+        assert got and got[0].f is not None and got[0].tests.k == 1
+        got[0].close()
+    finally:
+        full.close()

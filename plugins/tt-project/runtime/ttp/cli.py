@@ -4243,6 +4243,10 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         if tree is not None:
             suite.files += tree.files
             tree = None
+        # The host slot is taken only once its test slots could be (pool_room): it never holds one that
+        # only waits for its project's test workers while another project's waiter could run.
+        startable = None if os.environ.get(testslots.HELD_ENV) else (
+            lambda: testslots.pool_room(cfg, p.name if p else None))
         while True:
             left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
             testslots.lane_waits(suite, "a host-wide checks slot")   # held, not running yet: status says why
@@ -4250,7 +4254,8 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
             slot = checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell,
                                     waiting, left, arrived,
                                     p.name if p else None, prio, same, done, stop,
-                                    p.state if p else None, owns, cap=checklane.project_cap(cfg), lane_at=lane_at)
+                                    p.state if p else None, owns, cap=checklane.project_cap(cfg), lane_at=lane_at,
+                                    startable=startable)
             if slot is None or slot.served:
                 suite.close()
                 return slot
