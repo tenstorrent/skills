@@ -115,6 +115,7 @@ TELL_S = 300.0
 NICE = 19            # checks run at the lowest CPU priority by default: every other process goes first
 PROJECT_WORKERS_MAX = 8       # default checks.test_project_workers: at most this many test workers per project ...
 CORES_PER_PROJECT_WORKER = 8  # ... and one per this many cores, at least WORKERS_FLOOR (project_workers)
+SPARE_LOAD = 0.75    # unset, a project's test-worker ceiling grows by the cores its load leaves under this x the cores
 LOAD_GUARD = 1.0     # default checks.load_guard: no suite starts while the 1-minute load is above this x the cores
 IONICE = ["-c3"]    # idle class: a live service's IO always goes first
 
@@ -214,17 +215,34 @@ def live_room(every: list) -> int | None:
 
 def project_workers(cfg: dict | None = None, cores: int | None = None) -> int:
     """The most test workers one project runs at once over all its suites (0: no such ceiling):
-    TTP_TEST_PROJECT_WORKERS, else the account's checks.test_project_workers, else the smaller of
-    PROJECT_WORKERS_MAX and one per CORES_PER_PROJECT_WORKER cores, at least WORKERS_FLOOR; a project's
-    own checks.test_project_workers only lowers it. So a project's suites take a small fixed share of the
-    host however many of them run at once."""
+    TTP_TEST_PROJECT_WORKERS, else the account's checks.test_project_workers, else the base (the smaller of
+    PROJECT_WORKERS_MAX and one per CORES_PER_PROJECT_WORKER cores, at least WORKERS_FLOOR) plus the cores
+    the load leaves under SPARE_LOAD x the cores, at most half the cores (spare_workers); a project's own
+    checks.test_project_workers only lowers it. So a project's suites take a small share of a busy host
+    however many of them run at once, and more of an idle one."""
     top = _setting(*TESTS.setting("project_workers"))
     if top is None:
         c = checkcap.cores() if cores is None else cores
         top = max(WORKERS_FLOOR, min(PROJECT_WORKERS_MAX, c // CORES_PER_PROJECT_WORKER))
+        top = max(top, min(c // 2, top + spare_workers(c)))
     if (mine := _number(_section(cfg, "checks").get("test_project_workers"))) and mine > 0:
         top = min(top, mine) if top else mine
     return max(0, top)
+
+
+def spare_workers(c: int) -> int:
+    """The cores the host's load leaves under SPARE_LOAD x its `c` cores, by the larger of its 1- and
+    5-minute load averages (so the ceiling grows slowly and shrinks fast); 0 with checks.load_extra 0 or an
+    unreadable load. A shrink bounds new grants only: holders above it still count (_own_free)."""
+    if not checkcap.extra_max():
+        return 0
+    try:
+        ld = max(os.getloadavg()[:2])
+    except (OSError, ValueError):
+        return 0
+    if ld != ld or ld == float("inf"):
+        return 0
+    return max(0, int(c * SPARE_LOAD - ld))
 
 
 def load_guard() -> str:
@@ -370,6 +388,13 @@ def _free(ps: list) -> int:
     return len(ps) - len(locks._slot_labels(ps))
 
 
+def _own_free(project_name: str | None, own: list, kind: Kind = TESTS) -> int:
+    """How many of a project's budget slots `own` it may still take: their number less every slot of its
+    budget held, those past a budget that shrank (project_workers) included."""
+    span = own_paths(project_name, max(len(own), checkcap.cores()), kind)
+    return max(0, len(own) - len(locks._slot_labels(span)))
+
+
 def _take(ps: list, own: list, top: int, holder: str, what: str = "test slots",
           extra: dict | None = None) -> tuple[int, list]:
     """(k, files): up to `top` pool slots, each paired with one of the project's (`own`, when it has a budget)."""
@@ -452,6 +477,7 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
             else:
                 sized = ""
             ps, own = paths(pool, kind), own_paths(name, project_max(cfg, (pool, s[1]), kind), kind)
+            own_free = _own_free(name, own, kind) if own else 0
             if own:   # a project's test-worker ceiling (project_workers) also bounds one run's grant
                 top, room = min(top, len(own)), min(room, len(own))
             # A full run's fewest slots, at most what the pool and its budget can ever give (no deadlock).
@@ -469,17 +495,20 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                     step = age_s(cfg)
                     line = sorted(locks.queued(checkcap.slot_dir(), line_of), key=lambda t: _order_key(t, age=step))
                     ahead = line[:line.index(mine)] if mine in line else line
-                    if (not ahead and _free(own) < min(want, len(own)) and priority is not None and priority <= 1
+                    if (not ahead and own_free < min(want, len(own)) and priority is not None and priority <= 1
                             and (recs := locks.holder_records(own))
                             and all(_rank(r) > 1 for r in recs) and locks.any_free(urgent := urgent_paths(name, top, kind))):
-                        own, what = urgent, f"{kind.name} slots (urgent: its project's budget is held by less urgent runs)"
+                        own, own_free = urgent, _free(urgent)
+                        what = f"{kind.name} slots (urgent: its project's budget is held by less urgent runs)"
+                if own:   # never more than its budget has left, holders past a budget that shrank counted
+                    room = min(room, own_free)
                 short = False   # its project's budget has fewer free than a full run's fewest slots
                 if want > 1:
                     need = min(want, len(own)) if own else want
                     if own:
-                        mine_free = _free(own)
+                        mine_free = own_free
                         free, short = min(free, mine_free), mine_free < need
-                if own and not push_key and (short or not locks.any_free(own)):
+                if own and not push_key and (short or not own_free):
                     # At its project's budget: out of the host's line so others go first, keeping its
                     # place in its project's line.
                     locks.dequeue(ticket)
@@ -810,7 +839,7 @@ def pool_room(cfg: dict | None, project_name: str | None) -> bool:
     if used >= pool or locks.queued(checkcap.slot_dir(), TESTS.resource):
         return False
     own = own_paths(project_name, project_max(cfg, (pool, s[1])))
-    return not own or locks.any_free(own)
+    return not own or _own_free(project_name, own) > 0
 
 
 @contextlib.contextmanager

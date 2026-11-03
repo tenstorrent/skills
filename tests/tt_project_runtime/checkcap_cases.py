@@ -5578,6 +5578,7 @@ def test_a_project_s_test_worker_ceiling_defaults_to_min_8_and_cores_over_8_at_l
     from ttp import checkcap, project, testslots
     monkeypatch.delenv("TTP_TEST_PROJECT_WORKERS", raising=False)
     monkeypatch.setattr(checkcap, "cores", lambda: cores)
+    monkeypatch.setattr(testslots.os, "getloadavg", lambda: (cores, cores, cores))   # busy: no spare cores
     assert testslots.project_workers() == want
     project.set_account_setting("checks.test_project_workers", 12)
     assert testslots.project_workers() == 12, "the account sets it"
@@ -5585,6 +5586,104 @@ def test_a_project_s_test_worker_ceiling_defaults_to_min_8_and_cores_over_8_at_l
     assert testslots.project_workers({"checks": {"test_project_workers": 30}}) == 12, "and never raises it"
     monkeypatch.setenv("TTP_TEST_PROJECT_WORKERS", "0")
     assert testslots.project_workers() == 0, "0: no ceiling"
+
+
+def _spare_load(monkeypatch, cores: int, load1: float, load5: float | None = None):
+    from ttp import checkcap, testslots
+    monkeypatch.delenv("TTP_TEST_PROJECT_WORKERS", raising=False)
+    monkeypatch.delenv("TTP_CHECKS_LOAD_EXTRA", raising=False)
+    monkeypatch.setattr(checkcap, "cores", lambda: cores)
+    monkeypatch.setattr(testslots.os, "getloadavg", lambda: (load1, load1 if load5 is None else load5, 0.0))
+
+
+@pytest.mark.parametrize("load,want", [(0, 32), (16, 32), (30, 26), (32, 24), (47, 9), (48, 8), (60, 8)])
+def test_a_project_s_test_worker_ceiling_grows_into_spare_cores_up_to_half_the_host(env, monkeypatch, load, want):
+    """Unset, the ceiling is the base (min(8, cores // 8)) plus the cores the load leaves under 0.75 x the
+    cores, at most half the cores; at or above 0.75 x the cores it is the base."""
+    from ttp import testslots
+    _spare_load(monkeypatch, 64, load)
+    assert testslots.project_workers() == want
+    assert 8 <= testslots.project_workers() <= 32
+
+
+def test_a_project_s_test_worker_ceiling_grows_slowly_and_shrinks_fast(env, monkeypatch):
+    """The larger of the 1- and 5-minute load averages sizes it: a load that just dropped (high 5-minute)
+    keeps the base, one that just rose (high 1-minute) shrinks it at once."""
+    from ttp import testslots
+    _spare_load(monkeypatch, 64, 0.0, 48.0)
+    assert testslots.project_workers() == 8, "a 5-minute load at 0.75 x the cores: no growth yet"
+    _spare_load(monkeypatch, 64, 40.0, 0.0)
+    assert testslots.project_workers() == 16, "a 1-minute load of 40 shrinks it at once"
+    _spare_load(monkeypatch, 64, 0.0, 0.0)
+    assert testslots.project_workers() == 32
+
+
+def test_load_extra_0_or_a_set_test_worker_ceiling_keeps_it_fixed(env, monkeypatch):
+    from ttp import project, testslots
+    _spare_load(monkeypatch, 64, 0.0)
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    assert testslots.project_workers() == 8, "checks.load_extra 0: today's fixed base"
+    monkeypatch.delenv("TTP_CHECKS_LOAD_EXTRA")
+    project.set_account_setting("checks.load_extra", 0)
+    assert testslots.project_workers() == 8, "the account's checks.load_extra 0 too"
+    project.set_account_setting("checks.load_extra", 2)
+    assert testslots.project_workers() == 32
+    project.set_account_setting("checks.test_project_workers", 12)
+    assert testslots.project_workers() == 12, "the account's setting wins over the spare cores"
+    monkeypatch.setenv("TTP_TEST_PROJECT_WORKERS", "6")
+    assert testslots.project_workers() == 6
+
+
+def test_a_project_s_own_test_worker_setting_still_only_lowers_the_grown_ceiling(env, monkeypatch):
+    from ttp import testslots
+    _spare_load(monkeypatch, 64, 0.0)
+    assert testslots.project_workers({"checks": {"test_project_workers": 3}}) == 3
+    assert testslots.project_workers({"checks": {"test_project_workers": 20}}) == 20
+    assert testslots.project_workers({"checks": {"test_project_workers": 50}}) == 32, "never above the grown one"
+
+
+def test_an_unreadable_load_gives_the_base_test_worker_ceiling(env, monkeypatch):
+    from ttp import testslots
+    _spare_load(monkeypatch, 64, 0.0)
+    monkeypatch.setattr(testslots.os, "getloadavg", lambda: (_ for _ in ()).throw(OSError()))
+    assert testslots.project_workers() == 8
+    monkeypatch.setattr(testslots.os, "getloadavg", lambda: (float("nan"), 0.0, 0.0))
+    assert testslots.project_workers() == 8, "a NaN load never grows it"
+    for cores, want in ((1, 2), (4, 2), (16, 2)):
+        _spare_load(monkeypatch, cores, float("inf"))
+        assert testslots.project_workers() == want, "never below WORKERS_FLOOR"
+
+
+def test_grants_follow_the_grown_ceiling_and_holders_past_a_shrunk_one_still_count(env, monkeypatch):
+    """project_max() and acquire() bound grants by the ceiling of the moment; once it shrinks, a run
+    above it keeps its slots and they still count, so no new grant goes past the new ceiling even when
+    the low budget slots themselves are free."""
+    from ttp import testslots
+    _slot_sizes(monkeypatch, 64, 32, TTP_TEST_PROJECT_SLOTS=64, TTP_CHECKS_LIVE_CORES=0)
+    load = [48.0]
+    _spare_load(monkeypatch, 64, 0.0)
+    monkeypatch.setattr(testslots.os, "getloadavg", lambda: (load[0], load[0], 0.0))
+    assert testslots.project_max() == 8
+    a = testslots.acquire("a", project_name="pa", wait_s=0)
+    assert a and a.k == 8, "busy host: the base"
+    load[0] = 0.0
+    assert testslots.project_max() == 32
+    b = testslots.acquire("b", project_name="pa", wait_s=0)
+    assert b and b.k == 24, "idle host: up to the grown ceiling of 32, a's 8 counted"
+    a.close()
+    load[0] = 48.0
+    told = []
+    assert testslots.acquire("c", told.append, project_name="pa", wait_s=0.2) is None, \
+        "b's 24 past the shrunk ceiling of 8 still count, though slots 0-7 are free"
+    assert any("its project holds its 8" in t for t in told), told
+    assert not testslots.pool_room(None, "pa")
+    o = testslots.acquire("o", project_name="pb", wait_s=0)
+    assert o and o.k == 8, "another project has its own ceiling"
+    b.close()
+    c = testslots.acquire("c", project_name="pa", wait_s=0)
+    assert c and c.k == 8, "once b ends, new grants get the shrunk ceiling"
+    for g in (c, o):
+        g.close()
 
 
 def test_a_project_s_concurrent_suites_share_its_worker_ceiling_and_its_push_lane_stays_inside_one_grant(
