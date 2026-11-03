@@ -3164,6 +3164,7 @@ def cmd_checks(a) -> None:
         # The task's same checks queued twice run one suite; a newer head's supersede an older waiter (checkjoin).
         if todo and not hit and not light:
             join_rec = _checks_join_register(p, str(top), head, todo, purpose, pre_env, Path(run_dir), arrived)
+            arrived = _checks_replace(p, join_rec, out, arrived)
         while todo and not hit:
             try:
                 if join_rec:
@@ -3797,9 +3798,41 @@ def _checks_join_register(p: Project | None, top: str, head: str, todo: list, pu
         return checkjoin.register(p.state, task=task, head=head, commit_ts=commit_ts,
                                   key=checkjoin.key(repo, tree, cmds, purpose, envs),
                                   group=checkjoin.group(task, repo, cmds, purpose, envs),
-                                  run=run_dir.name, arrived=arrived)
+                                  run=run_dir.name, arrived=arrived, lane=checkjoin.lane(task, repo, purpose))
     except OSError:
         return None
+
+
+def _checks_replace(p: Project | None, me: Path | None, out, arrived: float) -> float:
+    """Stop the task's older running checks this run replaces (checkjoin.replaced: its checks of the same
+    purpose and repository on an older head in another worker run), so one task never holds two of its repository's lanes: each one's
+    detached `ttp checks` (checks.pid of its run, the runs row of the same task) ends through
+    jobstop.end_checks, recorded with both heads and this run. Returns the arrival to queue at: the
+    earliest of this run's and the replaced runs', so this run takes the lane they free ahead of later
+    waiters. A run it cannot match to its own run's detached checks is left alone."""
+    from . import checkjoin, jobstop
+    if not p or me is None or (rec := checkjoin.read(me)) is None:
+        return arrived
+    for old in checkjoin.replaced(rec, checkjoin.records(p.state)):
+        row = p.db.one("SELECT dir, task FROM runs WHERE id=?", (int(old["run"]),))
+        if not row or not row["dir"] or str(row["task"]) != str(rec["task"]):
+            continue
+        if _read_checks_pid(Path(row["dir"])).get("pid") != old.get("pid"):
+            continue
+        why = (f"superseded by run {rec['run']} of the same task on newer head {str(rec['head'])[:12]} "
+               f"(this run checked {str(old.get('head'))[:12]}): one task holds one checks lane")
+        if jobstop.end_checks(p, Path(row["dir"]), why, int(rec["task"])) is None:
+            continue
+        checkjoin.update(Path(checkjoin.folder(p.state)) / f"{old['id']}.json", phase=checkjoin.SUPERSEDED,
+                         superseded_by={"id": rec["id"], "run": rec["run"], "head": rec["head"]})
+        line = (f"replaced: stopped this task's running checks on older head {str(old.get('head'))[:12]} in run "
+                f"{old['run']} (pid {old.get('pid')}); these on {str(rec['head'])[:12]} take their place in the queue")
+        out.write(f"ttp checks: {line}\n")
+        print(f"ttp checks: {line}", flush=True)
+        arrived = min(arrived, float(old.get("arrived") or arrived))
+    if arrived < float(rec.get("arrived") or arrived):
+        checkjoin.update(me, arrived=arrived)
+    return arrived
 
 
 def _checks_yield(p: Project | None, me: Path | None) -> str:

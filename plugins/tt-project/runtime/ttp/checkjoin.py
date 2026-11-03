@@ -17,7 +17,10 @@ Either way it leaves the queue, follows that run (through any run it joined in t
 run's outcome (finish) as its own: passed, failed or timed out. A joined run reports it for its own
 head (the same tree ran), a superseded one names the newer head that ran, never a pass of its own head.
 A joined run whose outcome is of another tree (the run it joined was superseded; ran_key) queues again.
-A run that has started is never stopped: only waiters look. A different tree, command, environment,
+A run that has started is stopped only when the same task starts checks of the same purpose in the
+same repository on a newer head in
+another worker run (replaced; cli._checks_replace): that newer run takes its place in the queue, so one
+task never holds two of the repository's lanes; a review precheck is never stopped this way. A different tree, command, environment,
 purpose or repository is never a duplicate. A failed outcome is only passed to the runs that joined
 while it ran: a later request for the same key runs again (only passes are recorded and reused). When the followed run ends without an
 outcome (killed, handed over, cancelled), the follower queues again. `ttp checks status` and `ttp status`
@@ -62,6 +65,12 @@ def group(task: str, repo: str, cmds_hash: str, purpose: str, envs) -> str:
     return _digest("group", task, repo, cmds_hash, purpose, json.dumps(envs or []))
 
 
+def lane(task: str, repo: str, purpose: str) -> str:
+    """One task's checks of one purpose in one repository, whatever the head, commands or environment:
+    of these, a newer head's run replaces an older running one (replaced)."""
+    return _digest("lane", task, repo, purpose)
+
+
 def folder(state: Path) -> Path:
     return Path(state) / FOLDER
 
@@ -79,7 +88,7 @@ def _pid_ns() -> str:
 
 
 def register(state: Path, *, task: str, head: str, commit_ts: float, key: str, group: str, run: str,
-             arrived: float, pid: int | None = None, now: float | None = None) -> Path:
+             arrived: float, pid: int | None = None, now: float | None = None, lane: str = "") -> Path:
     """This run's record, phase waiting. Raises OSError when the state folder cannot be written."""
     from .runner import proc_start
     pid = os.getpid() if pid is None else pid
@@ -89,7 +98,8 @@ def register(state: Path, *, task: str, head: str, commit_ts: float, key: str, g
     path = d / f"{rid}.json"
     _write(path, {"id": rid, "pid": pid, "started": proc_start(pid), "pidns": _pid_ns(), "task": str(task),
                   "head": head, "commit_ts": float(commit_ts), "key": key, "group": group, "run": str(run),
-                  "arrived": float(arrived), "ts": time.time() if now is None else now, "phase": WAITING})
+                  "arrived": float(arrived), "ts": time.time() if now is None else now, "phase": WAITING,
+                  **({"lane": lane} if lane else {})})
     return path
 
 
@@ -194,6 +204,29 @@ def target(me: dict, recs: list[dict]) -> tuple[dict, str] | None:
     if ahead := [r for r in same if _order(r) < _order(me)]:
         return min(ahead, key=_order), JOINED
     return None
+
+
+def worker_run(rec: dict) -> bool:
+    """Whether a record is a worker run's own checks (a numeric run token, its run folder state/runs/<id>),
+    never a daemon review precheck (run folder prechecks/t<id>-<head>) or a run outside a worker."""
+    return str(rec.get("run") or "").isdigit()
+
+
+def replaced(me: dict, recs: list[dict]) -> list[dict]:
+    """The running checks this newly queued run `me` replaces: the same task's checks of the same purpose
+    in the same repository (lane; whatever their commands), in another worker run, on another head no
+    newer than its own (commit time), live and started before it.
+    Both must be worker runs' own checks (worker_run): a review precheck is never replaced nor replaces.
+    A waiting one is not here: it yields by itself (target). The same head is never replaced (its same
+    checks are joined: target). Read only."""
+    if not me.get("task") or not worker_run(me):
+        return []
+    return [r for r in recs if r.get("id") != me.get("id") and r.get("task") == me.get("task")
+            and me.get("lane") and r.get("lane") == me.get("lane") and worker_run(r)
+            and str(r.get("run")) != str(me.get("run"))
+            and r.get("head") != me.get("head") and r.get("phase") == RUNNING and r.get("alive")
+            and not r.get("outcome") and float(r.get("commit_ts") or 0) <= float(me.get("commit_ts") or 0)
+            and _order(r) < _order(me)]
 
 
 def resolve(rid: str, recs: list[dict]) -> tuple[str, dict | None]:

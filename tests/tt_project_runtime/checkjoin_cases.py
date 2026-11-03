@@ -201,6 +201,7 @@ def test_another_tasks_checks_on_the_same_tree_join_the_running_suite_and_only_a
 
 
 def test_a_newer_head_does_not_stop_a_running_check_and_a_different_head_is_not_joined(env, tmp_path, monkeypatch):
+    # Run folders outside a worker run (no numeric run id): the running one is not replaced (checkjoin.replaced).
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     count, go = tmp_path / "count", tmp_path / "go"
     cmd = f"echo x >> {count}; while [ ! -e {go} ]; do {_nap()}; done"
@@ -224,6 +225,89 @@ def test_a_newer_head_does_not_stop_a_running_check_and_a_different_head_is_not_
     assert first.returncode == 0 and second.returncode == 0, (out1, out2)
     assert count.read_text().splitlines() == ["x", "x"], "each head ran its own suite; the running one ran to the end"
     assert "superseded" not in out1 + out2 and "joined:" not in out1 + out2
+
+
+def test_checkjoin_replaced_is_only_the_same_tasks_older_head_running_in_another_worker_run():
+    from ttp import checkjoin as cj
+    me = {**_join_rec("me", head="b" * 40, commit_ts=200.0, key="k-b", arrived=40.0), "run": "502", "lane": "L"}
+    old = {**_join_rec("old", phase="running", arrived=10.0, group="g-other-cmds"), "run": "501", "lane": "L"}
+    # (a) the same task's checks (whatever their commands) running on an older head in another worker run.
+    assert cj.replaced(me, [me, old]) == [old]
+    # (b) the same head is joined, never replaced; a waiting one yields by itself (target).
+    assert cj.replaced(me, [me, {**old, "head": me["head"], "key": "k-b"}]) == []
+    assert cj.replaced(me, [me, {**old, "phase": "waiting"}]) == []
+    # (c) another task's run, a dead or finished one, a newer head, a later arrival,
+    # the same run folder: untouched.
+    # Another repository or purpose (lane), or records without one (an older runtime's), are untouched too.
+    for other in ({**old, "task": "8"}, {**old, "lane": "L2"}, {**old, "lane": None}, {**old, "alive": False},
+                  {**old, "outcome": {"passed": True}}, {**old, "commit_ts": 300.0}, {**old, "arrived": 50.0},
+                  {**old, "run": "502"}):
+        assert cj.replaced(me, [me, other]) == [], other
+    # A daemon review precheck (run folder t<id>-<head>) is never replaced, nor does it replace (sa24).
+    pre = f"t7-{'a' * 12}"
+    assert cj.replaced(me, [me, {**old, "run": pre}]) == []
+    assert cj.replaced({**me, "run": f"t7-{'b' * 12}"}, [old]) == []
+
+
+def test_a_newer_head_in_a_new_worker_run_stops_the_tasks_running_older_checks_and_takes_their_lane(
+        env, tmp_path, monkeypatch):
+    # The task's previous attempt left its detached checks running on an older head; the next attempt's
+    # checks on a newer head stop them and run in their place instead of holding a second lane. Another
+    # task's running checks are untouched.
+    from ttp import checkjoin, jobstop
+    from ttp.runner import proc_start
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setattr(jobstop, "CHECKS_TERM_S", 5.0)
+    count, go = tmp_path / "count", tmp_path / "go"
+    cmd = f"echo x >> {count}; while [ ! -e {go} ]; do {_nap()}; done"
+    old_dir, new_dir, other_dir = tmp_path / "501", tmp_path / "502", tmp_path / "503"
+    for rid, task, d in ((501, 7, old_dir), (502, 7, new_dir), (503, 8, other_dir)):
+        d.mkdir()
+        p.db.x("INSERT INTO runs(id,task,role,dir,status) VALUES(?,?,'worker',?,'running')", (rid, task, str(d)))
+
+    def detached(d, task, c):
+        e = {**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_PROJECT": str(p.base), "TTP_RUN_DIR": str(d),
+             "TTP_RUN_ID": d.name, "TTP_TASK": str(task), "TTP_TEST_POLL_S": "0.05"}
+        proc = subprocess.Popen([sys.executable, "-m", "ttp", "checks", "--", "sh", "-c", c], cwd=str(repo), env=e,
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        (d / "checks.pid").write_text(json.dumps({"pid": proc.pid, "started": proc_start(proc.pid)}))
+        return proc
+
+    old = other = new = None
+    try:
+        old = detached(old_dir, 7, cmd)
+        assert _wait_for(count.exists, 60), "the older head's checks started"
+        # Another task's live checks (a stand-in process with that task's record): never stopped.
+        other = subprocess.Popen(["sleep", "300"], start_new_session=True)
+        (other_dir / "checks.pid").write_text(json.dumps({"pid": other.pid, "started": proc_start(other.pid)}))
+        rec = checkjoin.read(next(checkjoin.folder(p.state).glob("*.json")))
+        oth = checkjoin.register(p.state, task="8", head=rec["head"], commit_ts=rec["commit_ts"], key=rec["key"] + "8",
+                                 group=rec["group"] + "8", run="503", arrived=rec["arrived"] - 1, pid=other.pid)
+        checkjoin.update(oth, phase=checkjoin.RUNNING)
+        (repo / "a.txt").write_text("b\n")
+        subprocess.run([*git, "commit", "-qam", "newer"], check=True,
+                       env={**os.environ, "GIT_COMMITTER_DATE": "@4000000000"})
+        # The older run is still unreaped (this test is its parent): alive means a state other than zombie.
+        st = f"$(cut -d' ' -f3 /proc/{old.pid}/stat 2>/dev/null)"
+        new = _checks_proc(p, repo, new_dir, 7, f'case "{st}" in ""|Z) ;; *) echo both > {count}.both;; esac; '
+                                                f"echo y >> {count}")
+        out_new = new.communicate(timeout=120)[0]
+        old_out = old.communicate(timeout=60)[0]
+        assert other.poll() is None, "another task's checks still run"
+    finally:
+        go.touch()
+        for proc in (old, new, other):
+            if proc and proc.poll() is None:
+                proc.kill()
+                proc.wait()
+    assert new.returncode == 0, out_new
+    assert old.returncode != 0, old_out
+    assert "replaced: stopped this task's running checks on older head" in out_new and "run 501" in out_new, out_new
+    assert not (tmp_path / "count.both").exists(), "the newer run never ran beside the older one"
+    assert count.read_text().splitlines() == ["x", "y"]
+    ev = p.db.one("SELECT text FROM events WHERE kind=? AND task=7", (jobstop.EVENT,))
+    assert ev and "superseded by run 502" in ev["text"], ev
+    assert not p.db.one("SELECT id FROM events WHERE kind=? AND task=8", (jobstop.EVENT,)), "another task untouched"
 
 
 def _fake_lead(monkeypatch, tmp_path, lead_pid, **over):
