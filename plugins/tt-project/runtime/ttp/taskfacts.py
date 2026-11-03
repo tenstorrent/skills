@@ -32,7 +32,7 @@ _WORD_BEFORE = re.compile(r"([A-Za-z][\w'-]*)([.:]?)\s*$")
 _IS_TASK = re.compile(r"(?:tasks?|code|reviews?|plans?|questions?|work|research)", re.I)
 _NOT_TASK = re.compile(r"(?:msgs?|messages?|prs?|pulls?|requests?|issues?|changes?|entry|entries|ledgers?|notes?|"
                        r"steps?|items?|rows?|lines?|comments?|no|nos|num|number|numbers|batch(?:es)?|asks?|alerts?|"
-                       r"holds?|commits?|runs?|jobs?|tickets?|bugs?|slots?|chips?|trays?|attempts?|wakes?|goals?|"
+                       r"holds?|commits?|runs?|jobs?|tickets?|bugs?|slots?|chips?|tray(?:s)?|attempts?|wakes?|goals?|"
                        r"reservations?|events?|points?|options?|phases?|rounds?)", re.I)
 # Words that do not name what the number is: a bare `#<id>` after them is a task, as before.
 _PLAIN = frozenset("""a an the its their this that these those and or but nor so then also too both either not
