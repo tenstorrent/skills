@@ -730,3 +730,144 @@ def test_secret_env_masks_each_line_of_a_multi_line_secret(env, monkeypatch, cap
     code, out = _env_run(monkeypatch, capfd, "--secret", "pem-key=PEM", "--", sys.executable, "-c",
                          "import os; print(os.environ['PEM'])")
     assert code == 0 and "line-one" not in out and "line-two" not in out and "[secret:pem-key]" in out, out
+
+
+_JEV_KEY = "fake-jev-key-0123456789abcdef"
+
+
+def _jev_store(env, monkeypatch, capfd):
+    """A store with the fake endpoint key, the custom secrets and a fake Jev key, in TTP_HOME too, so a
+    command the daemon starts in a child process reads the same store."""
+    home = env["tmp"] / "secrets-home"
+    monkeypatch.setenv("TTP_HOME", str(home))
+    store = _custom_store(env, monkeypatch, capfd)
+    from ttp import project
+    project.save_secret("jev", {"via": "direct", "key": _JEV_KEY})
+    return store
+
+
+_PRINT_JEV = ("import os, sys; v = os.environ['JK']; print('jk=' + v); print('err=' + v, file=sys.stderr); "
+              "print('len', len(v)); sys.exit(5)")
+
+
+def test_secret_env_gives_a_built_in_secret_only_by_its_field(env, monkeypatch, capfd):
+    _jev_store(env, monkeypatch, capfd)
+    monkeypatch.delenv("SANDBOX_RUNTIME", raising=False)
+    code, out = _env_run(monkeypatch, capfd, "--secret", "jev:key=JK", "--", sys.executable, "-c", _PRINT_JEV)
+    assert code == 5 and "jk=[secret:jev]" in out and "err=[secret:jev]" in out, out
+    assert f"len {len(_JEV_KEY)}" in out and _JEV_KEY not in out
+    # a field the store's scrub does not count as secret is masked too once given
+    code, out = _env_run(monkeypatch, capfd, "--secret", "jev:via=V", "--", sys.executable, "-c",
+                         "import os; print('via=' + os.environ['V'])")
+    assert code == 0 and "via=direct" in out   # shorter than a maskable value: not a secret
+    for spec, why in (("jev=X", "secret jev is built in"), ("jev:nope=X", "secret jev has no key nope"),
+                      ("endpoint:key=X", "secret endpoint is built in"), ("show:key=X", "secret show is built in")):
+        code, out = _env_run(monkeypatch, capfd, "--secret", spec, "--", "true")
+        assert code != 0 and why in out and _JEV_KEY not in out, (spec, out)
+
+
+def _sandboxed_run(env, monkeypatch, capfd, *argv, p=None, run="9001"):
+    """`ttp secret env ...` as a sandboxed worker of a project runs it, the daemon's tick (detach.tend)
+    running beside it: (exit code, output, run folder, project)."""
+    import threading
+    from ttp import detach, secretroute
+    p = p or make(env)
+    rd = p.runs / run
+    rd.mkdir(parents=True)
+    for k, v in (("TTP_RUN_DIR", str(rd)), ("SANDBOX_RUNTIME", "1"), ("TTP_TASK_ID", "77"), ("TTP_RUN_ID", run)):
+        monkeypatch.setenv(k, v)
+    monkeypatch.delenv(secretroute.SERVED_ENV, raising=False)
+    monkeypatch.setattr(secretroute, "POLL_S", 0.05)
+    monkeypatch.setattr(secretroute, "START_GRACE_S", 30 - detach.QUEUED_S)   # a broken tick fails, never hangs
+    stop, errors = threading.Event(), []
+
+    def daemon():
+        while not stop.is_set():
+            try:
+                detach.tend(p)
+            except Exception as e:
+                errors.append(e)
+            if len(list(rd.glob("secret-env-*.started"))) > 1:   # the served copy queued itself again
+                errors.append("requeued")
+                for f in rd.glob("secret-env-*.started"):
+                    f.with_suffix(".rc").write_text("99\n")   # ends every waiting copy
+                return
+            stop.wait(0.1)
+    t = threading.Thread(target=daemon, daemon=True)
+    t.start()
+    try:
+        code, out = _env_run(monkeypatch, capfd, *argv)
+    finally:
+        stop.set()
+        t.join(10)
+    assert not errors, errors
+    return code, out, rd, p
+
+
+def _files_text(*roots) -> str:
+    out = []
+    for root in roots:
+        for f in pathlib.Path(root).rglob("*"):
+            if f.is_file() and f.name != "secrets.json":
+                out.append(f.read_bytes().decode(errors="replace"))
+    return "\n".join(out)
+
+
+def test_a_sandboxed_secret_env_runs_through_the_daemon_and_the_value_stays_out(env, monkeypatch, capfd):
+    store = _jev_store(env, monkeypatch, capfd)
+    code, out, rd, p = _sandboxed_run(env, monkeypatch, capfd, "--secret", "jev:key=JK",
+                                      "--secret", "peer-set:beta=PB", "--", sys.executable, "-c",
+                                      _PRINT_JEV.replace("sys.exit(5)", "print('pb=' + os.environ['PB']); sys.exit(5)"))
+    values = [_JEV_KEY, *store["peer-set"].values(), _CUSTOM]
+    assert code == 5, out                                              # the command's exit code
+    assert "jk=[secret:jev]" in out and "err=[secret:jev]" in out and "pb=[secret:peer-set]" in out, out
+    assert f"len {len(_JEV_KEY)}" in out and "the daemon runs the command" in out
+    assert not any(v in out for v in values)                           # not in the returned output
+    seen = _files_text(p.state, p.root / "tt-project")                 # run folder, queue, records, logs
+    assert not any(v in seen for v in values)
+    rows = [json.loads(x) for x in (p.state / "secret-uses.jsonl").read_text().splitlines()]
+    assert rows == [{"at": rows[0]["at"], "task": "77", "run": "9001", "secrets": ["jev:key", "peer-set:beta"]}]
+    jobs = json.loads((rd / "detached.json").read_text())
+    assert [j["status"] for j in jobs] == ["queued"] and "jev:key=JK" in jobs[0]["command"]
+    assert not list((p.state / "detach-queue").glob("*.json"))      # the request was consumed
+
+
+def test_a_sandboxed_secret_env_checks_names_before_queueing_and_passes_store_errors_back(env, monkeypatch, capfd):
+    _jev_store(env, monkeypatch, capfd)
+    code, out, rd, p = _sandboxed_run(env, monkeypatch, capfd, "--secret", "jev=X", "--", "true")
+    assert code != 0 and "secret jev is built in" in out and not (rd / "detached.json").exists(), out
+    code, out, rd, p = _sandboxed_run(env, monkeypatch, capfd, "--secret", "jev:nope=X", "--", "true", p=p, run="2")
+    assert code != 0 and "secret jev has no key nope" in out and _JEV_KEY not in out, out
+    code, out, rd, p = _sandboxed_run(env, monkeypatch, capfd, "tt-cloud", "--", sys.executable, "-c",
+                                      "import os; print('k=' + os.environ['OPENAI_API_KEY'])", p=p, run="3")
+    assert code == 0 and f"k={_MASK}" in out and _EP_KEY not in out, out
+
+
+def test_secret_env_outside_a_sandbox_runs_the_command_itself(env, monkeypatch, capfd):
+    from ttp import detach
+    _jev_store(env, monkeypatch, capfd)
+    p = make(env)
+    rd = p.runs / "9002"
+    rd.mkdir(parents=True)
+    monkeypatch.setenv("TTP_RUN_DIR", str(rd))
+    monkeypatch.delenv("SANDBOX_RUNTIME", raising=False)
+    monkeypatch.setattr(detach, "enqueue", lambda *a, **k: pytest.fail("queued outside a sandbox"))
+    code, out = _env_run(monkeypatch, capfd, "--secret", "jev:key=JK", "--", sys.executable, "-c", _PRINT_JEV)
+    assert code == 5 and "jk=[secret:jev]" in out and "daemon" not in out and not (rd / "detached.json").exists()
+    assert not (p.state / "secret-uses.jsonl").exists()
+
+
+def test_a_sandboxed_secret_env_gives_up_when_the_daemon_never_starts_it(env, monkeypatch, capfd):
+    from ttp import detach, secretroute
+    _jev_store(env, monkeypatch, capfd)
+    p = make(env)
+    rd = p.runs / "9003"
+    rd.mkdir(parents=True)
+    monkeypatch.setenv("TTP_RUN_DIR", str(rd))
+    monkeypatch.setenv("SANDBOX_RUNTIME", "1")
+    monkeypatch.setattr(secretroute, "POLL_S", 0.01)
+    monkeypatch.setattr(detach, "QUEUED_S", 0)
+    monkeypatch.setattr(secretroute, "START_GRACE_S", 0.2)
+    code, out = _env_run(monkeypatch, capfd, "--secret", "jev:key=JK", "--", "true")
+    assert code == 1 and "the daemon did not start the command" in out, out
+    assert not list((p.state / "detach-queue").glob("*.json"))      # withdrawn: no late start

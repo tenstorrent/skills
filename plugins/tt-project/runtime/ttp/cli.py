@@ -8330,11 +8330,12 @@ def cmd_secret_custom(a) -> None:
 ENV_VAR_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
-def _secret_env_vars(specs: list[str]) -> dict[str, str]:
-    """{VAR: stored value} for each `--secret <name>[:<key>]=<VAR>` (custom secrets only). Errors name
-    the secret and key only once they are valid names, and never a value."""
+def _secret_env_specs(specs: list[str]) -> list[tuple[str, str, str, str, str]]:
+    """(name, colon, key, VAR, label) for each `--secret <name>[:<key>]=<VAR>`, checked without the store:
+    custom secrets, or a built-in one (jev, slack) only by a field, `<builtin>:<field>=<VAR>`. Errors
+    name the secret and key only once they are valid names, and never a value."""
     from . import redact
-    store, out, by = load_secrets(), {}, {}
+    out, by = [], {}
     for spec in specs:
         ref, eq, var = spec.partition("=")
         name, colon, key = ref.partition(":")
@@ -8345,13 +8346,23 @@ def _secret_env_vars(specs: list[str]) -> dict[str, str]:
         if colon and not SECRET_NAME_RE.fullmatch(key):
             die(f"bad key name for secret {name}: lowercase letters, digits, '-' and '_'")
         label = f"{name}:{key}" if colon else name
-        if name in SECRET_KINDS or not redact.custom(name):
-            die(f"secret {name} is built in (`ttp secret {name}`); --secret gives only secrets made with "
-                "`ttp secret set` or `ttp secret generate`")
+        if (name in SECRET_KINDS or not redact.custom(name)) and not (colon and name in redact.BUILTIN):
+            die(f"secret {name} is built in (`ttp secret {name}`); --secret gives secrets made with "
+                "`ttp secret set` or `ttp secret generate`, and a built-in one only by a field: "
+                "--secret jev:key=<VAR>")
         if not ENV_VAR_RE.fullmatch(var):
             die(f"bad variable name for {label}: letters, digits and '_', not starting with a digit")
         if var in by:
             die(f"{by[var]} and {label} set the same variable")
+        out.append((name, colon, key, var, label))
+        by[var] = label
+    return out
+
+
+def _secret_env_vars(specs: list[str]) -> dict[str, str]:
+    """{VAR: stored value} for each `--secret` (_secret_env_specs). Errors never name a value."""
+    store, out = load_secrets(), {}
+    for name, colon, key, var, label in _secret_env_specs(specs):
         if name not in store:
             die(f"no secret {name}: store it with `ttp secret set {name}` or `ttp secret generate {name} --keys ...`")
         v = store[name]
@@ -8365,15 +8376,17 @@ def _secret_env_vars(specs: list[str]) -> dict[str, str]:
         v = v[key] if colon else v
         if not isinstance(v, str) or "\0" in v:
             die(f"secret {label} is not a text value")
-        out[var], by[var] = v, label
+        out[var] = v
     return out
 
 
 def cmd_secret_env(a) -> None:
     """`ttp secret env <alias> -- <command>`: runs the command with the endpoint's key and URL in its
     environment (OPENAI_API_KEY, OPENAI_BASE_URL), its output passed on with every stored secret masked.
-    `--secret <name>[:<key>]=<VAR>` (repeatable, with or without an alias) adds a custom secret as VAR."""
-    from . import endpoint, redact
+    `--secret <name>[:<key>]=<VAR>` (repeatable, with or without an alias) adds a custom secret as VAR, and
+    `--secret <builtin>:<field>=<VAR>` a built-in one's field. In a sandboxed run the daemon runs the
+    command (secretroute)."""
+    from . import endpoint, redact, secretroute
     if a.secret:
         argv = [w[1:] for w in a.cmd_word or []]
         if a.command:   # more than one word before `--`
@@ -8383,6 +8396,14 @@ def cmd_secret_env(a) -> None:
     if not (a.alias or a.secret) or not argv:
         die("usage: ttp secret env <alias> -- <command...>, or "
             "ttp secret env [alias] --secret <name>[:<key>]=<VAR> ... -- <command...>")
+    if secretroute.routed():
+        if a.alias:
+            try:
+                endpoint.slot(a.alias)
+            except ValueError as e:
+                die(str(e))
+        _secret_env_specs(a.secret or [])
+        sys.exit(secretroute.run(a.alias, a.secret or [], argv))
     env = dict(os.environ)
     if a.alias:
         try:
@@ -8391,10 +8412,12 @@ def cmd_secret_env(a) -> None:
             die(f"{e}: `ttp secret endpoint {a.alias} --url <base url>`")
     given = _secret_env_vars(a.secret or [])
     env.update(given)
-    # A multi-line value is masked line by line too: the output is passed on one line at a time.
+    secretroute.record_use([*([a.alias] if a.alias else []), *(s.partition("=")[0] for s in a.secret or [])])
+    # Each given value is masked, a multi-line one line by line too (the output is passed on one line at
+    # a time): the store's scrub leaves out a built-in field it does not count as secret.
     parts = sorted({(p.strip(), spec.partition("=")[0].partition(":")[0])
                     for spec, v in zip(a.secret or [], given.values())
-                    for p in v.splitlines() if "\n" in v.strip() and len(p.strip()) >= redact.MIN_LEN},
+                    for p in [v, *v.splitlines()] if len(p.strip()) >= redact.MIN_LEN},
                    key=lambda x: -len(x[0]))
     try:
         child = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
