@@ -825,6 +825,60 @@ def lock_privileged(cmd: str) -> str | None:
     return None
 
 
+# An argv element or command string naming an ssh-like command in a non-shell script (`["ssh", host]`)
+QUOTED_FREED_RE = re.compile(r"""["'](?:ssh|scp|sftp|rsync)(?:["']|\s)""")
+
+
+def _script_reaches_host(text: str) -> str | None:
+    """The ssh-like command (FENCE_FREED) a script's text runs: a shell command (also in `bash -c`,
+    after wrappers or `ttp lock ... --`), or a quoted argv element or command string, else None."""
+    commands, _ = _split(text)
+    lines = "\n".join(line for line in commands.split("\n") if not line.lstrip().startswith("#"))
+    hit = next((h for s in _segments(lines) if (h := _freed_in(s))), None)
+    m = hit or QUOTED_FREED_RE.search(lines)
+    return hit or (m and re.sub(r"""["'\s]""", "", m[0]))
+
+
+def fenced_script(segments: list[list[str]], cmd: str, cwd: str) -> str | None:
+    """A hint for a fenced worker's command `cmd` (its simple commands: `segments`) that runs a script
+    calling ssh (or scp, sftp, rsync) inside the fence: any line but a simple `ttp lock <res> -- <script>`
+    (in a call by itself, no redirect to a file, substitution or subshell). fenced_ssh covers ssh named
+    on the line itself. None outside such a run (TTP_FENCE_BY_NAME), for `ttp detach` (the job runs
+    elsewhere) or when no script the line runs names one."""
+    if not os.environ.get("TTP_FENCE_BY_NAME"):
+        return None
+    raws = _segments(cmd, strip=False)
+    wrappers: list[list[str]] = []
+    for raw in raws:
+        _strip_prefix(raw, wrappers)
+    if any(w[:1] == ["detach"] for w in wrappers):
+        return None
+    unquoted = "".join(" " if q else c for c, (q, _) in zip(cmd, _quoting(cmd)))
+    if len(segments) == 1 and not SUBST_RE.search(cmd) and not FILE_REDIRECT_RE.search(unquoted) \
+            and "(" not in unquoted and any(w[:1] == ["lock"] for w in wrappers):
+        return None
+    gdir = cwd
+    for s in segments:
+        if os.path.basename(s[0]) == "cd" and len(s) > 1:
+            gdir = os.path.join(gdir, os.path.expanduser(s[1]))
+        for f in _scripts([s], gdir):
+            try:
+                hit = _script_reaches_host(f.read_text(errors="replace"))
+            except OSError:
+                continue
+            if hit:
+                name = os.path.basename(s[0])
+                run = f"{name} {f}" if _interpreter_args(s) is not None else \
+                    f"bash {f}" if name in ("source", ".") else str(f)
+                return (f"{f.name} runs {hit}, which reaches another host only from a simple command on its own. "
+                        f"Run from this line (a plain script run, cd, `&&`, `;`, a pipe, a redirect to a file, "
+                        f"`$(...)` or a subshell) it stays in the sandbox's write fence, where host names do not "
+                        f"resolve, so an unresolved host is not an outage. Run it in a call by itself as "
+                        f"`ttp lock <res> -- {run}` (absolute path, nothing else on the line; put a pipe or "
+                        f"redirect inside the script), and the next step in another call")
+    return None
+
+
 # git's network commands the fence frees by name (FENCE_EXCLUDED); git runs ssh for an SSH remote.
 GIT_NET = {"fetch", "pull", "push", "ls-remote", "clone"}
 SSH_URL_RE = re.compile(r"^(?:(?:git\+)?ssh://|[\w.-]+@[\w.-]+:)")   # an argument: `HEAD:main` is a refspec
@@ -946,7 +1000,8 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if not why:
         why, hint, rewrite = device_test_run(commands, cmd)
     if not why:
-        hint = "\n\n".join(h for h in (hint, wide_read(commands, str(payload.get("cwd") or os.getcwd()))) if h)
+        cwd = str(payload.get("cwd") or os.getcwd())
+        hint = "\n\n".join(h for h in (hint, fenced_script(segments, commands, cwd), wide_read(commands, cwd)) if h)
         out = {"hookEventName": "PreToolUse", **({"additionalContext": hint} if hint else {})}
         if rewrite:
             # The whole input goes back: the CLI replaces it, and drops what it does not know.

@@ -247,6 +247,60 @@ def test_fenced_hook_lets_git_on_its_own_or_over_https_run(env, monkeypatch, cmd
     assert not _decision(hook, cmd.format(ssh=ssh, https=https), ssh if where == "ssh" else https)
 
 
+def _scripts_dir(tmp):
+    d = tmp / "bin"
+    d.mkdir(exist_ok=True)
+    (d / "remote.sh").write_text("#!/bin/bash\nset -e\nttp lock res -- ssh host 'make 2>&1 | tail'\n")
+    (d / "copy.sh").write_text("for h in a b; do timeout 9 rsync -a out/ $h:out/; done\n")
+    (d / "wrap.sh").write_text("bash -c 'scp f host:f'\n")
+    (d / "pull.py").write_text("import subprocess\nsubprocess.run(['ssh', host, 'cat log'])\n")
+    (d / "local.sh").write_text("# ssh host would go here\nssh-keygen -l -f k.pub\necho 'use ssh later'\n"
+                                "git log --grep ssh | head\n")
+    (d / "notes.sh").write_text("cat > n.md <<'X'\nssh a && scp b\nX\n")
+    return d
+
+
+def _hint(hook, cmd, cwd):
+    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(cwd)})
+    assert not out or out["hookSpecificOutput"].get("permissionDecision") != "deny", out
+    return (out or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
+
+
+@pytest.mark.parametrize("cmd,name", [
+    ("cd bin && ./remote.sh", "remote.sh"), ("bash bin/remote.sh | tail -5", "remote.sh"),
+    ("bash bin/remote.sh; echo done", "remote.sh"), ("(bash bin/copy.sh)", "copy.sh"),
+    ("bash bin/copy.sh > out.txt", "copy.sh"), ("bash bin/wrap.sh 2>&1 | tail", "wrap.sh"),
+    ("python3 bin/pull.py && echo ok", "pull.py"), ("ttp lock res -- bash bin/remote.sh | tail", "remote.sh"),
+    ("ttp lock res -- bash bin/remote.sh > log", "remote.sh"), ("bash bin/remote.sh", "remote.sh"),
+    ("timeout 60 bash {d}/copy.sh", "copy.sh"), ("echo $(bash bin/remote.sh)", "remote.sh"),
+])
+def test_fenced_hook_hints_a_script_that_reaches_a_host_from_a_fenced_line(env, monkeypatch, cmd, name):
+    from ttp import hook
+    d = _scripts_dir(env["tmp"])
+    monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"]))
+    monkeypatch.setenv("TTP_FENCE_BY_NAME", "1")
+    hint = _hint(hook, cmd.format(d=d), env["tmp"])
+    assert hint.startswith(name) and "host names do not resolve" in hint, hint
+    run = f"python3 {d / name}" if name.endswith(".py") else f"{d / name}" if "./" in cmd else f"bash {d / name}"
+    assert f"`ttp lock <res> -- {run}`" in hint, hint
+    monkeypatch.delenv("TTP_FENCE_BY_NAME")
+    assert "write fence" not in _hint(hook, cmd.format(d=d), env["tmp"]), "unfenced: a script reaches any host"
+
+
+@pytest.mark.parametrize("cmd", [
+    "ttp lock res -- bash {d}/remote.sh", "ttp lock res -- python3 bin/pull.py", "timeout 9 ttp lock res -- ./bin/copy.sh",
+    "ttp lock res -- bash bin/remote.sh 2>&1", "bash bin/local.sh | tail", "cd bin && bash notes.sh",
+    "ttp detach --remote host job -- bash bin/remote.sh", "ttp detach job -- bash bin/remote.sh",
+    "cat bin/remote.sh | head", "bash missing.sh && echo ok", "git commit -m 'bash bin/remote.sh && x'",
+])
+def test_fenced_hook_gives_no_script_hint_to_a_freed_line_or_a_local_script(env, monkeypatch, cmd):
+    from ttp import hook
+    d = _scripts_dir(env["tmp"])
+    monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"]))
+    monkeypatch.setenv("TTP_FENCE_BY_NAME", "1")
+    assert "write fence" not in _hint(hook, cmd.format(d=d), env["tmp"])
+
+
 RACE = ("bwrap: Can't get type of source path /r/.git/worktrees/tree/commondir: No such file or directory")
 
 
