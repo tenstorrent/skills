@@ -568,6 +568,7 @@ STALE_OPEN = ("queued", "waiting", "blocked")   # a hop not under way, that a la
 STALE_REVIEWS_PER_PASS = 20   # queued reviews whose subject is looked up on the push branch per pass
 KV_KEPT_MESSAGES = "kept_messages"   # kv: user message ids kept unhandled once after a fixable task_add rejection
 REVIEW_SWEEP_EVERY_S = 300   # how often sweep_reviews looks for code and harness tasks left in review with no review
+REVIEW_UNQUEUED = "review_unqueued"   # a code task in review the review sweep can queue no review for
 HARNESS_UNMERGED = "harness_review_unmerged"   # event: a harness task passed review but its branch is not merged
 HARNESS_OFF_BRANCH = "harness_off_branch"   # event: a harness task's work is on a branch not its own
 # sweep_unreviewed: a done (or long externally waiting) code task with an unlanded head and no review
@@ -12657,7 +12658,10 @@ class Daemon:
         review (known gap: one review each, no work lost). A harness task in 'review' is swept too
         (_sweep_harness_review): one whose commit is merged into the harness is closed as done, else it
         gets one review. Every pass first records the harness tasks in review whose commit is merged
-        (_mark_harness_merged), so their dependents start."""
+        (_mark_harness_merged), so their dependents start. A task in review with no run on record (set to
+        review by hand, or a run row lost to a crash) counts from when it entered review. A code task it can
+        queue no review for raises one review_unqueued event (_raise_unqueued_review), never silently. One
+        task's error is logged and skips only that task."""
         now = time.time()
         if now - self._review_swept < REVIEW_SWEEP_EVERY_S:
             return
@@ -12685,39 +12689,51 @@ class Daemon:
                 rows.setdefault(x["task"], []).append(x)
             covers: dict[int, set[int]] = {}
             for t in todo:
-                ended = db.one("SELECT MAX(ended) e FROM runs WHERE task=?", (t["id"],))["e"]
-                if ended is None or now - float(ended) < (0 if urgent.is_urgent(t) else after):
-                    continue
-                if t["kind"] == "harness":
-                    self._sweep_harness_review(t, reviews, float(since.get(t["id"]) or 0), merged.get(str(t["id"])), now)
-                    continue
-                # A change that landed under another task's commits needs no review of its own; the
-                # task is closed as superseded (it may have had its say from a review already).
-                if self._landed_elsewhere(t):
-                    continue
-                start = float(since.get(t["id"]) or 0)
-                for r in reviews:
-                    if r["id"] not in covers:
-                        covers[r["id"]] = pushq._covers(db, r, rows.get(r["id"], []), code, follow=False)
-                # A review that passed but pushed nothing, as the branch already is on the push branch.
-                if self._reviewed_on_push_branch(t, reviews, covers, start):
-                    continue
-                # A review that ran or still runs since the task entered review had its say: what it
-                # found is the coordinator's (or the push queue's) to act on, not a second review's.
-                seen = False
-                for r in reviews:
-                    if r["id"] not in covers:
-                        covers[r["id"]] = pushq._covers(db, r, rows.get(r["id"], []), code, follow=False)
-                    if t["id"] in covers[r["id"]] and (r["status"] not in ("done", "failed")
-                                                       or float(r["updated"] or 0) >= start):
-                        seen = True
-                        break
-                if seen:
-                    continue
-                review = self._auto_review(t, str(load_result(t["result"]).get("summary") or ""), add=True)
-                self._swept(t, review, start, now)
+                try:
+                    self._sweep_review(t, since, reviews, rows, code, covers, merged, after, now)
+                except Exception:
+                    log(self.p, f"review sweep of task {t['id']} failed\n" + traceback.format_exc())
         except Exception:
             log(self.p, "review sweep failed\n" + traceback.format_exc())
+
+    def _sweep_review(self, t: dict, since: dict, reviews: list[dict], rows: dict, code, covers: dict,
+                      merged: dict, after: float, now: float) -> None:
+        """sweep_reviews' step for one task `t` in review."""
+        db = self.p.db
+        last = db.one("SELECT MAX(ended) e, MAX(id) r FROM runs WHERE task=?", (t["id"],))
+        ended = last["e"] if last["e"] is not None else float(since.get(t["id"]) or 0)
+        if now - float(ended) < (0 if urgent.is_urgent(t) else after):
+            return
+        if t["kind"] == "harness":
+            self._sweep_harness_review(t, reviews, float(since.get(t["id"]) or 0), merged.get(str(t["id"])), now)
+            return
+        # A change that landed under another task's commits needs no review of its own; the
+        # task is closed as superseded (it may have had its say from a review already).
+        if self._landed_elsewhere(t):
+            return
+        start = float(since.get(t["id"]) or 0)
+        for r in reviews:
+            if r["id"] not in covers:
+                covers[r["id"]] = pushq._covers(db, r, rows.get(r["id"], []), code, follow=False)
+        # A review that passed but pushed nothing, as the branch already is on the push branch.
+        if self._reviewed_on_push_branch(t, reviews, covers, start):
+            return
+        # A review that ran or still runs since the task entered review had its say: what it
+        # found is the coordinator's (or the push queue's) to act on, not a second review's.
+        seen = False
+        for r in reviews:
+            if r["id"] not in covers:
+                covers[r["id"]] = pushq._covers(db, r, rows.get(r["id"], []), code, follow=False)
+            if t["id"] in covers[r["id"]] and (r["status"] not in ("done", "failed")
+                                               or float(r["updated"] or 0) >= start):
+                seen = True
+                break
+        if seen:
+            return
+        review = self._auto_review(t, str(load_result(t["result"]).get("summary") or ""), add=True)
+        self._swept(t, review, start, now)
+        if review is None:
+            self._raise_unqueued_review(t, start, last["r"], now)
 
     def _swept(self, t: dict, review: tuple[int, bool] | None, start: float, now: float) -> None:
         """Log and record (review_swept) a review the sweep queued now for task `t`, in review since `start`."""
@@ -12728,6 +12744,34 @@ class Daemon:
                         (now, "daemon", "review_swept", "normal",
                          f"#{t['id']} {t['title']} sat in review with no review; review #{review[0]} queued "
                          f"by the daemon.", "handled", t["id"]))
+
+    def _raise_unqueued_review(self, t: dict, start: float, run: int | None, now: float) -> None:
+        """A code task in review the sweep could queue no review for (_auto_review gave None): one queued
+        review_unqueued event to the coordinator per hand-off (its last run `run`; one with no run, once),
+        never a user alert and never once per tick. Its causes: no branch on record and no PR or
+        `published` change in the hand-off (a change made in another repository's clone), a branch that is
+        gone or changes nothing, or no review step in delivery. A full review task cap is a wait the next
+        pass retries: no event."""
+        db = self.p.db
+        fp = f"{REVIEW_UNQUEUED}:{t['id']}:{run or 0}"
+        if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+            return
+        rules, d = self.cfg.get("review") or {}, self.cfg.get("delivery") or {}
+        if not rules.get("auto", True) or not (d.get("review_before_pr", True) or d.get("push_branch")):
+            why = "review.auto is off or delivery has no review step"
+        elif coord.next_task_slot(db, coord.task_cap(self.cfg, True), review=True) is not None:
+            return
+        else:
+            why = sweep.review_diagnosis(db, t["id"], now)
+        db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+             (now, "daemon", REVIEW_UNQUEUED, fp, "normal",
+              f"#{t['id']} {t['title'][:120]} has been in review {(now - start) / 3600:.1f}h and the daemon cannot "
+              f"queue its review: {why}. Nothing reviews, lands or reports it until you act. Options: queue its "
+              f"review naming the repository, branch and head; requeue it to hand off its PR or a `published` "
+              f"change (repo, branch, head); mark it done once its work is verified; or cancel it.",
+              "queued", t["id"]))
+        log(self.p, f"task {t['id']}: in review with no review and none can be queued ({why}); raised to the "
+                    f"coordinator")
 
     def _mark_harness_merged(self) -> dict[str, str]:
         """Record (HARNESS_MERGED_KEY) each harness task in 'review' whose hand-off commit is merged into
