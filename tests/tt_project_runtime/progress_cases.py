@@ -1720,3 +1720,38 @@ def test_a_queued_wait_stale_for_a_wait_a_no_op_turn_met_is_settled_without_a_tu
                    (time.time(), "daemon", "wait_stale", "normal", "old style, no data", "queued", tid))
     rows = p.db.q("SELECT id, ts, kind, severity, task, source, data FROM events WHERE id=?", (other,))
     assert [e["id"] for e in d._stale_queued(rows, time.time())] == [other]   # no snapshot: kept
+
+
+def test_a_wait_on_a_resource_the_user_paused_raises_no_probe_stall_until_the_lift_restarts_its_clock(env):
+    """A wait whose probe is only `ttp lock --probe` of a resource the user paused (or a machine the user
+    held for every project) ends only on the user's Resume: no probe stall. A coordinator's pause still counts. Once the user's pause lifts, the clock
+    starts again from the lift, so the not-yets from before it never raise a stall."""
+    from ttp import coordinator, fleethold, lockprobe, machines, progress
+    p = make(env)
+    now = time.time()
+    ids = {r: _handed_off_waiting(p, f"ttp lock --probe box-{r}") for r in ("user", "coord", "lifted", "fleet")}
+    for r, by in (("user", "user"), ("coord", "coordinator"), ("lifted", "user")):
+        coordinator.pause_resource(p, f"box-{r}", True, reason="maintenance", by=by)
+        assert p.db.paused_resources()[f"box-{r}"]["by"] == by
+    machines.add("box-fleet", tags="device")   # a machine the user held for every project
+    fleethold.set_hold("box-fleet", "weekend", "user", "beta", now=now)
+    assert lockprobe.pause_in(p.db, p.config(), "box-fleet")["fleet"]
+
+    def check(at):
+        got = progress.check(p.db, p.config(), p.state, at, where=p,
+                             current_probe=lambda t: json.loads(t["result"] or "{}").get("retry_when"))
+        return {k for e in got for k in e["keys"]}
+
+    for i in range(21):
+        for r, tid in ids.items():
+            progress.note_probe(p.db, tid, f"ttp lock --probe box-{r}", 75, "box paused", now - 4000 + i * 180)
+    assert check(now) == {f"probe:#{ids['coord']}"}
+    coordinator.pause_resource(p, "box-lifted", False, by="user")
+    lifted = now + 60
+    for i in range(21):   # not yet for other reasons, right after the lift
+        progress.note_probe(p.db, ids["lifted"], "ttp lock --probe box-lifted", 75, "busy", lifted + 1 + i)
+    assert f"probe:#{ids['lifted']}" not in check(lifted + 30)
+    assert float(progress.load(p.db)["probes"][str(ids["lifted"])]["first"]) >= lifted
+    for i in range(21):
+        progress.note_probe(p.db, ids["lifted"], "ttp lock --probe box-lifted", 75, "busy", lifted + 60 + i * 180)
+    assert f"probe:#{ids['lifted']}" in check(lifted + 60 + 21 * 180)

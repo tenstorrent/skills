@@ -16,14 +16,19 @@ def pause(p, cfg: dict, resource: str) -> dict | None:
     """The pause that holds `resource` (a user pause of any of the device's names, or a fleet hold of its
     machine), else None. An unreadable database is no pause: it must not stop device commands."""
     try:
-        from . import fleethold
-        paused = p.db.paused_resources()
-        res, hold = locks.canonical(cfg, resource), fleethold.covering(resource)
-        return paused.get(resource) or next((v for k, v in paused.items() if locks.canonical(cfg, k) == res), None) \
-            or (fleethold.entry(hold) if hold else None)
+        return pause_in(p.db, cfg, resource)
     except Exception as e:
         print(f"ttp lock: could not check for a pause of {resource}: {e}", file=sys.stderr, flush=True)
         return None
+
+
+def pause_in(db, cfg: dict, resource: str) -> dict | None:
+    """pause's lookup in project database `db`; errors propagate."""
+    from . import fleethold
+    paused = db.paused_resources()
+    res, hold = locks.canonical(cfg, resource), fleethold.covering(resource)
+    return paused.get(resource) or next((v for k, v in paused.items() if locks.canonical(cfg, k) == res), None) \
+        or (fleethold.entry(hold) if hold else None)
 
 
 def line(resource: str, free: bool, locks_dir: Path, res: str, paths: list[Path], where=None) -> str:

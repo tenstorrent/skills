@@ -566,6 +566,18 @@ def _user_wait(db: DB, t: dict, res: dict) -> bool:
     return str(t["id"]) in _open_owners(_load(db))
 
 
+def _user_paused(db: DB, cfg: dict | None, probe: str) -> bool:
+    """Whether `probe` waits only on `ttp lock --probe` resources and a pause the user set (a resource
+    pause or a fleet hold of its machine; lockprobe.pause_in, the lookup `ttp lock` itself uses) holds
+    one of them."""
+    from . import lockprobe, locks
+    try:
+        return any((lockprobe.pause_in(db, cfg or {}, r) or {}).get("by") == "user"
+                   for r in locks.probe_resources(probe))
+    except Exception:
+        return False   # an unreadable pause is no pause, as for `ttp lock`
+
+
 def probe_stalls(db: DB, s: dict, st: dict, now: float, current_probe: Callable[[dict], str | None],
                  cfg: dict | None = None, gone: set | None = None, harness=None) -> list[dict]:
     """Probe stalls; adds to `gone` the raised keys whose count was dropped as no longer valid. `harness`:
@@ -594,6 +606,13 @@ def probe_stalls(db: DB, s: dict, st: dict, now: float, current_probe: Callable[
             continue   # only the user's step ends it: no worker can speed it up (the probe keeps counting)
         if userpause.is_probe(rec["probe"], cfg):
             continue   # a user pause: only the user's word ends it, so saying not yet is no stall
+        if _user_paused(db, cfg, rec["probe"]):
+            rec["held"] = True   # a resource or machine the user paused: its Resume (or pause_end_due) ends it
+            if gone is not None:
+                gone.add(f"stall:probe:#{k}")
+            continue
+        if rec.pop("held", None):
+            rec.update(first=now, n=0)   # the user's pause lifted: the clock starts again from the lift
         if not s["probe_n"] or OWN_WAIT_RE.search(rec["probe"]) or ackwait.is_probe(rec["probe"], cfg, harness) \
                 or int(rec["n"]) < s["probe_n"] \
                 or now - float(rec["first"]) < s["probe_h"] * 3600:
