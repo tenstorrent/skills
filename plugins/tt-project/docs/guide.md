@@ -987,7 +987,8 @@ queues behind routine work; nothing running is interrupted:
   per resource and exit. The daemon's checks take at most about one timeout per tick. Every tick, and
   each `ttp lock` waiter on every try, releases a harness lock whose recorded holder is dead (pid gone,
   or reused per its recorded start time) and that no live process of the holder's group keeps; a
-  leftover process of the holder's own run is stopped, any other one is left and named. A slot labelled
+  leftover process of the holder's own run that this project owns (its `TTP_PROJECT`, or a
+  `TTP_RUN_DIR` inside the project's folder) is stopped, any other one is left and named. A slot labelled
   for a detached job that wrote its .rc, has no process left and whose task is done, failed or cancelled
   is freed even from a leftover of the holder's group; `ttp detach --reap` and `--stop` on that job free
   it at once (never while the holder lives or this host cannot judge it). A waiter queued
@@ -2236,6 +2237,14 @@ Workers can read Slack links you paste, using your Slack connector if you have o
 - The worker hook's kill guard refuses a Bash call with `pkill` or `killall` (unless scoped with `-P`,
   `-g` or `-s` to the task's own processes) and `kill` of a pid or group outside the task's own
   process tree, also through wrappers, `sh -c` and ssh; it is always on. See `runtime/ttp/killguard.py`.
+- Which project owns a process: every worker, daemon-run command, `ttp detach` job and `ttp checks`
+  command carries `TTP_PROJECT` (the full path of `<project root>/tt-project`) and `TTP_RUN_DIR` (a
+  run or check-run folder inside it). A project's reaper or cleanup script signals only processes it
+  can prove are its own: that marker, or its own run record with the pid and its start time. Never pick
+  one by a task or run id in its environment, command line, run folder name or log: ids are numbered
+  per project and overlap across projects on one host, and every project's folder is named
+  `tt-project`. It also skips a process still writing output. The harness's lock reaper and its stop of
+  a cancelled task's checks follow this rule (`runtime/ttp/procowner.py`).
 - `ttp svcscan <script>` flags service unit changes before a worker runs a driver on a shared
   machine: any `systemctl` verb but a read-only query (`stop`, `mask`, `reboot`, `daemon-reload`,
   `set-property`, ... also under `sudo -n`, in Python argv lists and across backslash-continued

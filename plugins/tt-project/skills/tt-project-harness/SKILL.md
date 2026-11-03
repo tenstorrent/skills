@@ -218,6 +218,10 @@ read the one for the lever you change.
   local check in a process sandbox: its own PID namespace and /proc, so it sees and can signal only
   its own process tree, and nothing it starts outlives it.
 - Run other test commands the same way: `ttp sandbox -- <command>`.
+- A reaper or cleanup script signals only processes it can prove are this project's: `TTP_PROJECT`
+  (the full path of `<root>/tt-project`) or a `TTP_RUN_DIR` inside it, or its own run record with pid
+  and start time. Never by a task or run id in an env, command line, run folder name or log: ids
+  overlap across projects. Skip processes still writing output.
 - It needs unprivileged user namespaces and `unshare` or `bwrap`. Where the host allows none, checks
   run as before and say why; `ttp doctor` names the setting. `"sandbox": false` on a push_checks
   entry is only for a check that needs the host's process table, and is reported each run.
