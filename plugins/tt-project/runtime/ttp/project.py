@@ -569,10 +569,13 @@ def _known_keys(path: list[str]) -> set[str] | None:
         # no_device_cmds: commands that need no device, run without wrap_cmd (checklane.no_device).
         # slots, light_cmds, max_wait_s, wait_event_s, wait_escalate_s, wait_hang_factor, priority_age_s,
         # test_project_max, done_holder_flag_s, done_holder_grace_s: the checks lanes (checklane);
-        # test_project_slots: the project's test-worker budget (testslots.project_max);
+        # test_project_slots: the project's test-worker budget (testslots.project_max); test_project_workers:
+        # its ceiling on test workers over all its suites (testslots.project_workers); test_run_max: one
+        # suite's most workers, only lowering the account's (testslots.sizes);
         # stall_s: a running check's log silence that makes it stalled (checkstall.stall_s).
         return {"nice", "ionice", "wall_cap_s", "wrap_cmd", "wrap_lane", "no_device_cmds", "slots", "light_cmds", "max_wait_s", "wait_event_s",
                 "wait_escalate_s", "wait_hang_factor", "priority_age_s", "test_project_max", "test_project_slots",
+                "test_project_workers", "test_run_max",
                 "done_holder_flag_s", "done_holder_grace_s", "stall_s"}
     if len(path) == 1 and isinstance(DEFAULT_CONFIG.get(path[0]), dict):
         return set(DEFAULT_CONFIG[path[0]]) | EXTRA_KEYS.get(path[0], set())
@@ -2347,7 +2350,7 @@ def unregister(name: str) -> None:
 ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_spend_to"}, "pricing": {"claude"},
                 "route": {"host_max"},   # routed runs per provider at once on this host (route.host_limit)
                 "checks": {"host_max", "load_extra", "live_cores", "nice", "ionice", "priority_turns", "test_pool", "test_run_max",
-                           "test_project_max", "test_project_slots", "build_pool", "build_run_max", "build_project_max", "wall_cap_s",
+                           "test_project_max", "test_project_slots", "test_project_workers", "load_guard", "build_pool", "build_run_max", "build_project_max", "wall_cap_s",
                            "slots", "light_cmds", "max_wait_s", "wait_event_s", "priority_age_s",
                            "wait_escalate_s", "wait_hang_factor", "done_holder_flag_s", "done_holder_grace_s", "stall_s"}}
 

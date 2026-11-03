@@ -1201,7 +1201,7 @@ queues behind routine work; nothing running is interrupted:
   cores (at least 2); `checks.live_cores 0` turns both off. A set cap wins: `ttp config
   --account checks.host_max N` (0 turns the cap off) or `TTP_CHECKS_HOST_MAX`. While
   the 1-minute load average is under half the cores, up to `checks.load_extra` more slots open (default 2,
-  0 turns them off); check commands run under `nice -n 10`/`ionice -c3` (idle IO) unless `checks.nice` is false (`checks.nice` N, 0-19, sets the level, else `runner.nice`; `checks.ionice` `idle` or `best-effort[:0-7]`; both per project or account). Each check
+  0 turns them off); check commands run under `nice -n 19`/`ionice -c3` (idle IO) unless `checks.nice` is false (`checks.nice` N, 0-19, sets the level; `checks.ionice` `idle` or `best-effort[:0-7]`; both per project or account). Each check
   run also takes test-worker slots from a host pool shared by all projects (testslots: default half the cores, at
   least 2; at most min(8, half the pool) per run; `checks.test_pool`, `checks.test_run_max`, 0 pool turns it off;
   a project may only lower them; a full `ttp checks` run waits until `checks.test_run_min` are free, default
@@ -1209,6 +1209,11 @@ queues behind routine work; nothing running is interrupted:
   suite's `-n auto` uses the whole grant). A project's test-worker budget is its checks at once
   (`checks.test_project_max`, below) times one run's grant, at most the pool, so every check under that cap gets its
   workers (3 checks at once with a grant of 8 make a budget of 24: each run gets 8, never the whole budget); `checks.test_project_slots` (chat-settable, a whole number of at least 1) sets the budget outright.
+  Both stay within `checks.test_project_workers` (chat-settable, per project or account; default the smaller of 8 and
+  one per 8 cores, at least 2), the most test workers one project's suites run at once, which also bounds one run's
+  grant. No new suite starts while the host's 1-minute load is above its cores (`checks.load_guard`, a factor of the
+  cores, default 1; 0 turns it off): it waits and its lane's wait note says why; running suites go on. Heavy suites
+  belong on another host where a project has one allowed (`delivery.checks_host`).
   Waiters are served first-come: one whose project is at its budget lets other projects go first but keeps its
   place in its project's line, where the most urgent task priority goes first, then arrival, so that waiter gets
   the next freed slots. A priority-1 check whose project's budget is held only by less urgent runs takes one extra

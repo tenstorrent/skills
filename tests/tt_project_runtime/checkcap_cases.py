@@ -264,9 +264,9 @@ def test_check_commands_run_niced_where_nice_and_ionice_exist_unless_turned_off(
     from ttp import cli, project
     have = {"nice"}
     monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}" if name in have else None)
-    assert cli._low_priority(["pytest"]) == ["nice", "-n", "10", "pytest"]
+    assert cli._low_priority(["pytest"]) == ["nice", "-n", "19", "pytest"]
     have.add("ionice")
-    assert cli._low_priority(["pytest"]) == ["nice", "-n", "10", "ionice", "-c3", "pytest"]
+    assert cli._low_priority(["pytest"]) == ["nice", "-n", "19", "ionice", "-c3", "pytest"]
     have.clear()
     assert cli._low_priority(["pytest"]) == ["pytest"], "neither found: run as it is"
     have.update({"nice", "ionice"})
@@ -1738,7 +1738,7 @@ def _argv_with(monkeypatch, settings=None, runner=None):
 
 
 def test_check_priority_defaults_are_unchanged_without_settings(env, monkeypatch):
-    assert _argv_with(monkeypatch) == ["nice", "-n", "10", "ionice", "-c3", "pytest"]
+    assert _argv_with(monkeypatch) == ["nice", "-n", "19", "ionice", "-c3", "pytest"]
 
 
 def test_check_priority_follows_checks_nice_and_ionice_settings(env, monkeypatch):
@@ -1751,8 +1751,10 @@ def test_check_priority_follows_checks_nice_and_ionice_settings(env, monkeypatch
     assert testslots.low_priority(["x"])[2] == "19", "clamped to 0..19"
 
 
-def test_check_priority_falls_back_to_runner_nice(env, monkeypatch):
-    assert _argv_with(monkeypatch, runner={"nice": 15})[:3] == ["nice", "-n", "15"]
+def test_check_priority_ignores_runner_nice(env, monkeypatch):
+    """A worker's runner.nice is not the checks': they stay at the lowest priority unless checks.nice says."""
+    assert _argv_with(monkeypatch, runner={"nice": 15})[:3] == ["nice", "-n", "19"]
+    assert _argv_with(monkeypatch, {"checks.nice": 15}, runner={"nice": 5})[:3] == ["nice", "-n", "15"]
 
 
 def test_check_priority_follows_the_project_s_checks_ionice(env, monkeypatch):
@@ -1769,7 +1771,7 @@ def test_check_priority_follows_the_project_s_checks_ionice(env, monkeypatch):
 
 def test_check_priority_invalid_values_fall_back_to_the_defaults(env, monkeypatch):
     got = _argv_with(monkeypatch, {"checks.nice": "soon", "checks.ionice": "bogus:9"}, runner={"nice": "x"})
-    assert got == ["nice", "-n", "10", "ionice", "-c3", "pytest"]
+    assert got == ["nice", "-n", "19", "ionice", "-c3", "pytest"]
     from ttp import project, testslots
     project.set_account_setting("checks.ionice", "best-effort:9")
     assert testslots.ionice_args() == ["-c3"]
@@ -2351,6 +2353,7 @@ def _stop(proc):
 def _lane_env(monkeypatch):
     from ttp import checkcap, testslots
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    monkeypatch.setenv("TTP_TEST_PROJECT_WORKERS", "0")   # lanes' own mechanics, no worker ceiling (testslots.project_workers)
     for k in (testslots.HELD_ENV, checkcap.HELD_ENV):
         monkeypatch.delenv(k, raising=False)
 
@@ -3526,6 +3529,7 @@ def _slot_sizes(monkeypatch, pool: int, run: int, **more):
     monkeypatch.setenv("TTP_TEST_POOL", str(pool))
     monkeypatch.setenv("TTP_TEST_RUN_MAX", str(run))
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.02")
+    monkeypatch.setenv("TTP_TEST_PROJECT_WORKERS", "0")   # the budget's own rules, no worker ceiling (project_workers)
     for k in ("TTP_TEST_PROJECT_MAX", "TTP_TEST_PROJECT_SLOTS", testslots.HELD_ENV, checkcap.HELD_ENV):
         monkeypatch.delenv(k, raising=False)
     for k, v in more.items():
@@ -5368,3 +5372,126 @@ def test_daemon_marks_a_silent_checks_run_stalled_once_and_stops_it_only_when_it
         assert len(events()) == 2 and len(stops) == 1, "checks.stall_s 0 turns it off"
     finally:
         g.close()
+
+
+def test_check_commands_start_at_nice_19_and_idle_io_by_default_and_skip_a_missing_ionice(env, monkeypatch):
+    """Every check command (and so its children) starts at the lowest CPU priority and idle IO; a host
+    without ionice (macOS) runs it under nice alone, quietly."""
+    import subprocess
+    from ttp import testslots
+    monkeypatch.setattr(testslots, "_cfg", lambda: None)
+    assert testslots.NICE == 19 and testslots.IONICE == ["-c3"]
+    argv = testslots.low_priority([sys.executable, "-c", "import os; print(os.nice(0))"])
+    if shutil.which("nice"):
+        assert argv[:3] == ["nice", "-n", "19"]
+        if os.nice(0) <= 19:
+            assert subprocess.run(argv, capture_output=True, text=True).stdout.strip() == "19"
+    real = shutil.which
+    monkeypatch.setattr(testslots.shutil, "which", lambda n, *a, **k: None if n == "ionice" else "/usr/bin/nice")
+    assert testslots.low_priority(["pytest"]) == ["nice", "-n", "19", "pytest"]
+    monkeypatch.setattr(testslots.shutil, "which", real)
+
+
+@pytest.mark.parametrize("cores,want", [(1, 2), (4, 2), (16, 2), (32, 4), (64, 8), (256, 8)])
+def test_a_project_s_test_worker_ceiling_defaults_to_min_8_and_cores_over_8_at_least_2(env, monkeypatch, cores, want):
+    from ttp import checkcap, project, testslots
+    monkeypatch.delenv("TTP_TEST_PROJECT_WORKERS", raising=False)
+    monkeypatch.setattr(checkcap, "cores", lambda: cores)
+    assert testslots.project_workers() == want
+    project.set_account_setting("checks.test_project_workers", 12)
+    assert testslots.project_workers() == 12, "the account sets it"
+    assert testslots.project_workers({"checks": {"test_project_workers": 3}}) == 3, "a project's own lowers it"
+    assert testslots.project_workers({"checks": {"test_project_workers": 30}}) == 12, "and never raises it"
+    monkeypatch.setenv("TTP_TEST_PROJECT_WORKERS", "0")
+    assert testslots.project_workers() == 0, "0: no ceiling"
+
+
+def test_a_project_s_concurrent_suites_share_its_worker_ceiling_and_its_push_lane_stays_inside_one_grant(
+        env, monkeypatch):
+    """The ceiling bounds the project's workers over all its suites and one run's grant, through the
+    environment (the check command's text is unchanged); other projects keep theirs. A push check's
+    reserved lane makes up only the project's per-run grant, never the account's run_max."""
+    from ttp import testslots
+    _slot_sizes(monkeypatch, 32, 8, TTP_TEST_PROJECT_WORKERS=4)
+    assert testslots.project_max() == 4
+    a = testslots.acquire("a", project_name="pa", wait_s=0)
+    assert a and a.k == 4 and a.env()[testslots.XDIST_ENV] == "4" and a.env()[testslots.SLOTS_ENV] == "4"
+    told = []
+    assert testslots.acquire("a2", told.append, project_name="pa", wait_s=0.2) is None, "at the project's ceiling"
+    assert any("checks.test_project_workers" in t for t in told), told
+    b = testslots.acquire("b", project_name="pb", wait_s=0)
+    assert b and b.k == 4, "another project has its own ceiling"
+    push = testslots.acquire("push", project_name="pa", push_key="origin feature", wait_s=0)
+    assert push and push.k == 4, "the reserved push lane makes up one per-run grant (4), not run_max (8)"
+    assert testslots.worker_env(None)[testslots.XDIST_ENV] == "4", "a worker's own shell starts at most the ceiling"
+    cmd = "python3 -m pytest -q -n auto tests"
+    assert testslots.clamp_for(cmd, a.env()) == cmd, "the command text stays: -n auto reads the environment"
+    for g in (a, b, push):
+        g.close()
+
+
+def test_a_project_can_set_its_own_test_run_max(env):
+    from ttp import project, testslots
+    p = make(env)
+    assert project.unknown_key_hint("checks.test_run_max") is None
+    assert project.unknown_key_hint("checks.test_project_workers") is None
+    p.set_config("checks.test_run_max", 2)
+    assert testslots.sizes(p.config())[1] == 2
+
+
+def test_no_suite_starts_while_the_host_is_overloaded_and_its_lane_says_why(env, monkeypatch):
+    """Above checks.load_guard x the cores no run takes test slots, priority-1 and push runs included;
+    it waits saying why (its lane's wait note too), running grants are left alone, and once the load
+    drops it starts. A nested run keeps its parent's grant; 0 or an unreadable load never holds one."""
+    import threading
+    from ttp import checkcap, locks, project, testslots
+    _slot_sizes(monkeypatch, 32, 4)
+    monkeypatch.delenv("TTP_CHECKS_LOAD_GUARD", raising=False)
+    load = [10.0]
+    monkeypatch.setattr(checkcap, "cores", lambda: 64)
+    monkeypatch.setattr(checkcap, "_load", lambda: load[0])
+    running = testslots.acquire("running", project_name="pa", wait_s=0)
+    assert running and running.k == 4
+    load[0] = 82.0
+    told = []
+    for kw in ({}, {"priority": 1}, {"push_key": "origin feature"}):
+        assert testslots.acquire("new", told.append, wait_s=0.2, project_name="pb", **kw) is None, kw
+    assert told and all("overloaded" in t and "82.0" in t and "64 cores" in t for t in told), told
+    assert locks._slot_labels([Path(running.files[0].name)]), "a running suite keeps its slots"
+    monkeypatch.setenv(testslots.HELD_ENV, "3")
+    assert testslots.acquire("nested", wait_s=0).k == 3, "a nested run uses its parent's grant at once"
+    monkeypatch.delenv(testslots.HELD_ENV)
+    lane = testslots.suite_hold("pb", repo=_LANE_REPO, slots=1, cap=1, wait_s=0, pending=True)
+    notes, got = [], {}
+    t = threading.Thread(target=lambda: got.setdefault("g", testslots.acquire(
+        "waiter", project_name="pb", wait_s=20, waits=lambda w: (notes.append(w), testslots.lane_waits(lane, w)))))
+    t.start()
+    try:
+        for _ in range(200):
+            if notes:
+                break
+            time.sleep(0.02)
+        recs = locks.holder_records([Path(f.name) for f in lane.files])
+        assert notes and notes[0].startswith("host load: ") and "overloaded" in recs[0]["waits"], (notes, recs)
+        load[0] = 60.0
+        t.join(20)
+        assert got["g"] and got["g"].k == 4 and notes[-1] == "host test slots", notes
+    finally:
+        load[0] = 0.0
+        t.join(20)
+        for g in (running, got.get("g"), lane):
+            if g is not None:
+                g.close()
+    load[0] = 100.0
+    monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "2")
+    assert testslots.load_guard() == "", "100 is under 2 x 64"
+    monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "0")
+    assert testslots.load_guard() == "", "0 turns it off"
+    monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "1")
+    assert testslots.load_guard()
+    load[0] = float("inf")
+    assert testslots.load_guard() == "", "an unreadable load average holds no suite"
+    load[0] = 100.0
+    monkeypatch.delenv("TTP_CHECKS_LOAD_GUARD")
+    project.set_account_setting("checks.load_guard", 2)
+    assert testslots.load_guard() == "", "the account setting"

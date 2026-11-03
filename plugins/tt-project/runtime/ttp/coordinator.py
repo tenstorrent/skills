@@ -359,6 +359,8 @@ USER_SETTABLE = {
     "checks.test_project_max": lambda v: _checks_project_max(v, auto=True),
     # The project's test-worker budget (testslots.project_max; unset: test_project_max x one run's grant).
     "checks.test_project_slots": lambda v: _checks_project_max(v, "checks.test_project_slots"),
+    # The most test workers the project's suites run at once (testslots.project_workers; unset: min(8, cores/8), at least 2).
+    "checks.test_project_workers": lambda v: _checks_project_max(v, "checks.test_project_workers"),
     # How many full checks of one project and repository run at once (checklane.slots; unset: sized to the host).
     "checks.slots": lambda v: _checks_slots(v),
     # Where code tasks branch from: the project's working branch once it has one.

@@ -476,6 +476,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setenv("TTP_TEST_LOCAL_TZ", "UTC")   # home zones: never the zone of the machine running the tests
     monkeypatch.setenv("TTP_TEST_CLEAR_HOLD_S", "0")   # alerts clear on the first healthy sweep (alerts_cases tests the window)
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")   # wait loops (runner, ttp lock, listen) check often
+    monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "0")   # suites never wait on the load of the host running the tests (loadguard tests set it)
     monkeypatch.setenv("TTP_TEST_DISK_MOUNT", str(tmp_path))   # the disk guard's du stays in the test folder
     monkeypatch.setenv("TTP_TEST_SSH_CONFIG", str(tmp_path / "ssh_config"))   # never the user's own ssh config
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))   # `ttp setup` never writes the user's own skills

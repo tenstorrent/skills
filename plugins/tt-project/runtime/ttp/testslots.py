@@ -14,7 +14,9 @@ The grant reaches the command as PYTEST_XDIST_AUTO_NUM_WORKERS (what xdist's `-n
 `-n logical` use) and TTP_TEST_SLOTS (for any other runner), and an explicit `-n N` or
 `--numprocesses N` above it in a pytest command is lowered to it (clamp()). A `ttp checks` nested in
 a check keeps its parent's grant (HELD_ENV) instead of taking more. Checks also run at a lower CPU
-and IO priority (low_priority()), so a host's live services win.
+and IO priority (low_priority(): nice 19, idle IO), so a host's live services win. One project's suites run
+at most project_workers() test workers at once between them, and no new suite takes slots while the host's
+1-minute load is above its cores (load_guard()); running ones are never stopped.
 
 Defaults (sizes()): the pool is half the host's usable cores, at least 2, so tests leave the other
 half to live work and builds; one run takes at most min(RUN_MAX, half the pool), at least 1, so two
@@ -110,7 +112,10 @@ NO_PRIORITY = 3      # a ticket without a priority (no task, a task without one,
 AGE_FLOOR = 2        # aging never ranks a routine waiter above p2: native p1s and urgent runs go first
 FAIR_STEPS = 4       # a waiter past this many aging steps (1 h by default) goes by arrival among its rank
 TELL_S = 300.0
-NICE = 10
+NICE = 19            # checks run at the lowest CPU priority by default: every other process goes first
+PROJECT_WORKERS_MAX = 8       # default checks.test_project_workers: at most this many test workers per project ...
+CORES_PER_PROJECT_WORKER = 8  # ... and one per this many cores, at least WORKERS_FLOOR (project_workers)
+LOAD_GUARD = 1.0     # default checks.load_guard: no suite starts while the 1-minute load is above this x the cores
 IONICE = ["-c3"]    # idle class: a live service's IO always goes first
 
 
@@ -207,11 +212,50 @@ def live_room(every: list) -> int | None:
     return max(WORKERS_FLOOR, int(free - young))
 
 
+def project_workers(cfg: dict | None = None, cores: int | None = None) -> int:
+    """The most test workers one project runs at once over all its suites (0: no such ceiling):
+    TTP_TEST_PROJECT_WORKERS, else the account's checks.test_project_workers, else the smaller of
+    PROJECT_WORKERS_MAX and one per CORES_PER_PROJECT_WORKER cores, at least WORKERS_FLOOR; a project's
+    own checks.test_project_workers only lowers it. So a project's suites take a small fixed share of the
+    host however many of them run at once."""
+    top = _setting(*TESTS.setting("project_workers"))
+    if top is None:
+        c = checkcap.cores() if cores is None else cores
+        top = max(WORKERS_FLOOR, min(PROJECT_WORKERS_MAX, c // CORES_PER_PROJECT_WORKER))
+    if (mine := _number(_section(cfg, "checks").get("test_project_workers"))) and mine > 0:
+        top = min(top, mine) if top else mine
+    return max(0, top)
+
+
+def load_guard() -> str:
+    """Why no new suite may start now, or "": the host's 1-minute load is above checks.load_guard
+    (TTP_CHECKS_LOAD_GUARD, else the account's setting, else LOAD_GUARD) times its cores. 0 turns the
+    guard off; an unreadable load average never holds a suite."""
+    factor: float = LOAD_GUARD
+    for v in (os.environ.get("TTP_CHECKS_LOAD_GUARD"), (project.load_account_settings().get("checks") or {}).get("load_guard")):
+        if v in (None, "") or isinstance(v, bool):
+            continue
+        try:
+            factor = max(0.0, float(v))
+            break
+        except (TypeError, ValueError):
+            continue
+    if not factor:
+        return ""
+    ld, c = checkcap._load(), checkcap.cores()
+    if ld != ld or ld == float("inf") or ld <= factor * c:
+        return ""
+    return (f"the host is overloaded: its 1-minute load {ld:.1f} is above "
+            + (f"its {c} cores" if factor == 1.0 else f"{factor:g} x its {c} cores")
+            + " (checks.load_guard); no new suite starts until it drops, running ones go on")
+
+
 def project_max(cfg: dict | None = None, s: tuple[int, int] | None = None, kind: Kind = TESTS) -> int:
     """The most slots one project holds at once over all its runs (above): tests, its checks at once
     (checklane.project_cap) times one run's grant; builds, twice a run's share. An explicit slot budget
     (checks.test_project_slots, checks.build_project_max) wins, a project's own one only lowering the
-    account's; never below one run's grant, never above the pool. `s` is sizes(cfg)."""
+    account's; never below one run's grant, never above the pool. Tests: never above project_workers()
+    either, which then also bounds one run's grant (acquire). `s` is sizes(cfg)."""
     from . import checklane
     s = s or sizes(cfg, kind=kind) or (0, 0)
     if not s[0]:
@@ -222,7 +266,10 @@ def project_max(cfg: dict | None = None, s: tuple[int, int] | None = None, kind:
     top = top or (min(s[0], 2 * s[1]) if kind is BUILDS else max(1, checklane.project_cap(cfg)) * s[1])
     if mine:
         top = min(top, mine)
-    return max(s[1], min(top, s[0]))
+    top = max(s[1], min(top, s[0]))
+    if kind is TESTS and (w := project_workers(cfg)):
+        top = min(top, w)
+    return top
 
 
 def own_paths(project_name: str | None, n: int, kind: Kind = TESTS) -> list:
@@ -284,7 +331,8 @@ def build_env(k: int) -> dict[str, str]:
 def worker_env(cfg: dict | None) -> dict[str, str]:
     """A worker's environment: tests and builds it runs directly in its shell start at most one run's share."""
     s, b = sizes(cfg), sizes(cfg, kind=BUILDS)
-    return {**({XDIST_ENV: str(s[1]), SLOTS_ENV: str(s[1])} if s else {}), **(build_env(b[1]) if b else {})}
+    k = min(s[1], project_max(cfg, s)) if s else 0
+    return {**({XDIST_ENV: str(k), SLOTS_ENV: str(k)} if s else {}), **(build_env(b[1]) if b else {})}
 
 
 def paths(pool: int, kind: Kind = TESTS):
@@ -342,7 +390,7 @@ def _take(ps: list, own: list, top: int, holder: str, what: str = "test slots",
 def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: float | None = None,
             cfg: dict | None = None, project_name: str | None = None, push_key: str = "",
             kind: Kind = TESTS, priority: int | None = None, stop: Callable[[], str] | None = None,
-            since: float | None = None, full: bool = False) -> Grant | None:
+            since: float | None = None, full: bool = False, waits: Callable[[str], None] | None = None) -> Grant | None:
     """Take this run's test slots (above); waits while none is free, first-come, telling why every
     TELL_S. None only once `wait_s` passed with none free (a foreground caller hands over). Nested in a
     run that holds slots, its grant at once; with the pool off, Grant() (no limit, nothing set).
@@ -356,7 +404,10 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
     slots, so it never waits behind a long, less urgent check and stops none. `stop` as for suite_hold
     (a reason ends the wait with checkcap.Cancelled); `since`: the arrival to queue at (default now),
     kept by a run that hands over or re-executes itself (checkcap.Upgraded). `full` (a full `ttp checks`
-    run): it starts only once run_min() slots are free (above)."""
+    run): it starts only once run_min() slots are free (above). A run that is no nested one
+    takes no test slots while the host is overloaded (load_guard), push and priority-1 runs included:
+    it waits, telling why and passing the reason to `waits` (its lanes' wait note, lane_waits), and
+    `waits` gets "host test slots" again once the load drops."""
     tell = tell or (lambda _line: None)
     what = f"{kind.name} slots"
     for env in (kind.held_env, HELD_ENV):   # HELD_ENV: a build in a check builds on the check's slots
@@ -366,9 +417,27 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
     name = _project_name() if project_name is None else project_name
     start, told, ticket, mine = time.time(), 0.0, None, None
     arrival = start if since is None else since
+    guarded = ""
     try:
         while True:
             project.ps_cycle()
+            if kind is TESTS and (load := load_guard()):
+                if not guarded and waits:
+                    waits(f"host load: {load}")
+                if not guarded or time.time() - told >= TELL_S:
+                    told = time.time()
+                    tell(f"waiting to start: {load}")
+                guarded = load
+                if stop and (why := stop()):
+                    raise checkcap.Cancelled(why)
+                if wait_s is not None and time.time() - start >= wait_s:
+                    return None
+                time.sleep(poll_s(POLL_S))
+                continue
+            if guarded:
+                guarded, told = "", 0.0
+                if waits:
+                    waits("host test slots")
             s = sizes(cfg, kind=kind)
             if s is None:
                 return Grant(kind=kind)
@@ -383,6 +452,8 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
             else:
                 sized = ""
             ps, own = paths(pool, kind), own_paths(name, project_max(cfg, (pool, s[1]), kind), kind)
+            if own:   # a project's test-worker ceiling (project_workers) also bounds one run's grant
+                top, room = min(top, len(own)), min(room, len(own))
             # A full run's fewest slots, at most what the pool and its budget can ever give (no deadlock).
             want = min(run_min(cfg, top), pool) if full and kind is TESTS and not push_key else 1
             need = 1
@@ -413,7 +484,8 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                     # place in its project's line.
                     locks.dequeue(ticket)
                     ticket, why = None, (f"its project holds its {len(own)} (checks.{kind.setting(kind.budget)[1]}"
-                                         + (", or checks.test_project_max x one run's grant" if kind is TESTS else "")
+                                         + (", or checks.test_project_max x one run's grant, within"
+                                            " checks.test_project_workers" if kind is TESTS else "")
                                          + ")" + (f"; a full run starts with at least {need} free (checks.{RUN_MIN_KEY})"
                                                   if short else ""))
                 elif ahead:
@@ -1386,9 +1458,10 @@ def _section(cfg: dict | None, name: str) -> dict:
 
 def nice_level(cfg: dict | None = None) -> int:
     """The nice level 0-19 of check commands: checks.nice (a number; the project's, then the account's),
-    else runner.nice, else NICE. A value that is no whole number falls back to the next source."""
+    else NICE (the lowest priority; a worker's runner.nice is not the checks'). A value that is no whole
+    number falls back to the next source."""
     acct = project.load_account_settings().get("checks") or {}
-    for v in (_section(cfg, "checks").get("nice"), acct.get("nice"), _section(cfg, "runner").get("nice")):
+    for v in (_section(cfg, "checks").get("nice"), acct.get("nice")):
         if isinstance(v, bool) or v in (None, ""):
             continue
         try:
