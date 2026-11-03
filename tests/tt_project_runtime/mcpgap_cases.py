@@ -315,6 +315,32 @@ def test_isolated_worker_without_a_listed_connector_keeps_todays_strict_args(env
                                                                          if k not in per_run}
 
 
+def test_iso_run_envs_compare_equal_while_the_hosts_listeners_change(env, monkeypatch, tmp_path):
+    """The strict-args test compares two runs' envs; a port opened between them on the host must not
+    change TTP_LOOPBACK_PORTS (it did once in the full suite)."""
+    from ttp import loopproxy
+    net = tmp_path / "net"
+    net.mkdir()
+    head = "  sl  local_address rem_address   st\n"
+
+    def host_listens(port):
+        (net / "tcp").write_text(head + f"   0: 0100007F:{port:04X} 00000000:0000 0A\n")
+
+    # The host's discovery reads this net dir; it sees each change (the race the pin closes).
+    monkeypatch.setattr(loopproxy.ports_env, "__defaults__", (None, net, tmp_path / "no-ssh-config"))
+    host_listens(5001)
+    first = loopproxy.ports_env()
+    host_listens(5002)
+    assert loopproxy.ports_env() != first
+    p = make(env)
+    _claude_mcp_config(tmp_path, monkeypatch, p)
+    host_listens(5003)
+    _, a_env = _iso_run(p, monkeypatch)
+    host_listens(5004)
+    _, b_env = _iso_run(p, monkeypatch)
+    assert a_env[loopproxy.PORTS_ENV] == b_env[loopproxy.PORTS_ENV] == "2222 8080"
+
+
 def test_isolated_worker_with_a_listed_connector_keeps_it_and_keeps_every_other_server_out(env, monkeypatch,
                                                                                            tmp_path):
     from ttp import mcpgap
