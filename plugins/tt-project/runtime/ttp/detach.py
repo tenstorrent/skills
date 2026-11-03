@@ -248,7 +248,10 @@ def reap_children() -> int:
 
 def enqueue(state: Path, rc: Path, log: Path, cmd: list, cwd: str, env: dict, *, checks: dict | None = None) -> Path:
     """Queue the job for the daemon to start, replacing a request of the same job not started yet;
-    returns the queue file. The request and its marker are published together, under the lock."""
+    returns the queue file. The request and its marker are published together, under the lock, the
+    marker first: a signal between the two writes (a caller with other threads is not masked) leaves at
+    most a marker without its request, which withdraw_unstarted and pending clear, never a request
+    no marker names."""
     rc = Path(rc)
     q = Path(state) / QUEUE / f"{rc.parent.name}-{rc.stem}.json"
     keep = _kept_env(env)
@@ -257,9 +260,9 @@ def enqueue(state: Path, rc: Path, log: Path, cmd: list, cwd: str, env: dict, *,
               f"sandbox; the daemon's own environment applies)", file=sys.stderr)
     rid = uuid.uuid4().hex
     with _locked(q.parent):
+        durable_write(queued(rc), f"{q}\n{rid}\n")
         write_json(q, {"rc": str(rc), "log": str(log), "command": cmd, "cwd": cwd, "env": keep, "id": rid,
                        "queued": time.time(), **({"checks": checks} if checks is not None else {})}, mode=0o600)
-        durable_write(queued(rc), f"{q}\n{rid}\n")
     return q
 
 

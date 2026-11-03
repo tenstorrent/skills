@@ -913,7 +913,7 @@ def test_a_stopped_sandboxed_secret_env_withdraws_its_queued_request(env, monkey
             if list(queue.glob("*.json")):
                 break
             threading.Event().wait(0.01)
-        os.kill(os.getpid(), getattr(signal, sig))
+        signal.pthread_kill(threading.main_thread().ident, getattr(signal, sig))   # as a single-threaded caller sees it
     t = threading.Thread(target=stop, daemon=True)
     t.start()
     code, out = _env_run(monkeypatch, capfd, "--secret", "jev:key=JK", "--", "true")
@@ -988,3 +988,25 @@ def test_status_skips_an_unreadable_secret_store_and_secret_users_still_fail(env
             store.chmod(0o600)
     cli.main(["status", p.name, "--json"])
     assert json.loads(capsys.readouterr().out)["secrets"] == {"readable": True, "path": str(store)}
+
+
+@pytest.mark.parametrize("cut", ["marker", "request"])
+def test_a_signal_inside_enqueue_never_leaves_a_request_withdraw_cannot_find(env, monkeypatch, capfd, cut):
+    """A signal lands between enqueue's two writes (a caller with other threads is not masked): no
+    request is left that no marker names, so withdraw_unstarted clears it and the daemon starts nothing."""
+    from ttp import detach
+    p, rd = _queued_route(env, monkeypatch, capfd, "9007")
+    rc = rd / "secret-env-cut.rc"
+    name = "durable_write" if cut == "marker" else "write_json"
+    real = getattr(detach, name)
+
+    def interrupted(*a, **k):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(detach, name, interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        detach.enqueue(p.state, rc, rd / "secret-env-cut.log", ["true"], str(rd), {})
+    monkeypatch.setattr(detach, name, real)
+    assert detach.withdraw_unstarted(rc) is True and not detach.pending(rc)
+    assert not list((p.state / "detach-queue").glob("*.json"))
+    detach.tend(p)
+    assert not rc.exists() and not detach.started(rc).exists()
