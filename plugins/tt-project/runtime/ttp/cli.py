@@ -3544,7 +3544,8 @@ def cmd_checks(a) -> None:
     if join_rec:   # the outcome the runs that joined this one report (checkjoin)
         from . import checkjoin, trim
         checkjoin.finish(join_rec, passed=passed, head=head, rc=0 if passed else 1, failed=str(failed or ""),
-                         timed_out=bool(timed_out), summary="" if passed else trim.summary(text), log=str(log))
+                         timed_out=bool(timed_out), summary="" if passed else trim.summary(text), log=str(log),
+                         commands=todo)
     source = ("the default harness plan" if any(str(c) == str(failed) for c in defaults)
               else source if any(str(c) == str(failed) for c in own) else "ttp checks --")
     _note_checks_env(p, str(failed) if env_problem else None, env_problem, head, source, also)
@@ -3959,16 +3960,22 @@ def _checks_report_joined(me: Path | None, run_dir: Path, out, joined: tuple, he
     o = lead.get("outcome") or {}
     passed, ran = bool(o.get("passed")), str(o.get("head") or "")
     ran = head if how == checkjoin.JOINED else ran
+    mine = checkjoin.read(me) if me else None
+    # A superseding lead in the lane may have run other commands: record only those, never this run's own.
+    cmds, not_run = checkjoin.ran_commands(mine or {}, lead, todo) if how == checkjoin.SUPERSEDED else (todo, [])
     checkjoin.finish(me, passed=passed, head=ran, rc=int(o.get("rc") or (0 if passed else 1)),
                      failed=str(o.get("failed") or ""), timed_out=bool(o.get("timed_out")),
                      summary=str(o.get("summary") or ""), log=str(o.get("log") or ""),
-                     ran_key=checkjoin.ran_key(lead))
-    line = checkjoin.result_line(how, head, lead)
-    write_json(run_dir / prguard.CHECKS_FILE, {"head": ran, "worktree": top, "passed": passed, "commands": todo,
-                                               "skipped": skipped, "ts": time.time(), "purpose": purpose,
-                                               "joined": {"how": how, "run": lead.get("run"), "pid": lead.get("pid"),
-                                                          "own_head": head},
-                                               **({"timed_out": True} if o.get("timed_out") else {})})
+                     ran_key=checkjoin.ran_key(lead), commands=cmds)
+    line = checkjoin.result_line(how, head, lead, not_run)
+    # A lead in this same run folder wrote its own true checks.json: this follower leaves it as is.
+    if not (mine and str(lead.get("run") or "") and str(lead.get("run")) == str(mine.get("run") or "")):
+        write_json(run_dir / prguard.CHECKS_FILE, {"head": ran, "worktree": top, "passed": passed, "commands": cmds,
+                                                   "skipped": skipped, "ts": time.time(), "purpose": purpose,
+                                                   "joined": {"how": how, "run": lead.get("run"), "pid": lead.get("pid"),
+                                                              "own_head": head},
+                                                   **({"own_commands_not_run": not_run} if not_run else {}),
+                                                   **({"timed_out": True} if o.get("timed_out") else {})})
     out.write(f"ttp checks: {line}\n")
     out.flush()
     if passed:

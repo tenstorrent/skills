@@ -287,6 +287,48 @@ def test_a_tasks_older_head_waiting_with_other_commands_yields_and_the_newer_run
     assert got and got[1] == cj.SUPERSEDED and got[0]["run"] == "502"
 
 
+def test_a_superseded_follower_never_records_or_reports_commands_its_lead_did_not_run(tmp_path):
+    # A follower with commands [checks, X] is superseded by its task's newer head running only [checks] in
+    # the lane. Its checks.json and outcome name only the lead's commands, its result line names X as not
+    # run, and in the lead's own run folder the lead's true checks.json stays as written.
+    import io
+    from ttp import checkjoin as cj, cli, prguard
+    state = tmp_path / "state"
+    lead = cj.register(state, task="7", head="b" * 40, commit_ts=200.0, key="k-b", group="g", run="502",
+                       arrived=10.0, pid=os.getpid(), lane="L")
+    cj.finish(lead, passed=True, head="b" * 40, rc=0, commands=["checks"])
+    lead_rec = cj.read(lead)
+
+    def follow(run, run_dir, group="g-x", cmds=("checks", "pytest -q x.py")):
+        me = cj.register(state, task="7", head="a" * 40, commit_ts=100.0, key="k", group=group, run=run,
+                         arrived=5.0, pid=os.getpid(), lane="L")
+        out = io.StringIO()
+        cli._checks_report_joined(me, run_dir, out, (cj.SUPERSEDED, lead_rec), "a" * 40, str(tmp_path),
+                                  list(cmds), [], "candidate")
+        return me, out.getvalue()
+
+    other = tmp_path / "501"
+    other.mkdir()
+    me, said = follow("501", other)
+    rec = json.loads((other / prguard.CHECKS_FILE).read_text())
+    assert rec["commands"] == ["checks"] and rec["own_commands_not_run"] == ["pytest -q x.py"], rec
+    assert cj.read(me)["outcome"]["commands"] == ["checks"]
+    assert "pytest -q x.py did not run" in said and "superseded" in said
+    # The same run folder as its lead: the lead's record is untouched.
+    same = tmp_path / "502"
+    same.mkdir()
+    true = {"head": "b" * 40, "passed": True, "commands": ["checks"], "purpose": "candidate"}
+    (same / prguard.CHECKS_FILE).write_text(json.dumps(true))
+    follow("502", same)
+    assert json.loads((same / prguard.CHECKS_FILE).read_text()) == true
+    # A lead with no recorded commands: its own group ran the follower's; another group ran none of them.
+    bare = {**lead_rec, "outcome": {k: v for k, v in lead_rec["outcome"].items() if k != "commands"}}
+    assert cj.ran_commands({"group": "g"}, bare, ["checks"]) == (["checks"], [])
+    assert cj.ran_commands({"group": "g-x"}, bare, ["checks", "X"]) == ([], ["checks", "X"])
+    # The same commands: nothing is named as not run.
+    assert "did not run" not in follow("503", tmp_path, group="g", cmds=("checks",))[1]
+
+
 def test_a_newer_head_in_a_new_worker_run_stops_the_tasks_running_older_checks_and_takes_their_lane(
         env, tmp_path, monkeypatch):
     # The task's previous attempt left its detached checks running on an older head; the next attempt's

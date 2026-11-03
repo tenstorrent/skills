@@ -271,12 +271,23 @@ def resolve(rid: str, recs: list[dict]) -> tuple[str, dict | None]:
 
 
 def finish(path: Path | None, *, passed: bool, head: str, rc: int, failed: str = "", timed_out: bool = False,
-           summary: str = "", log: str = "", ran_key: str = "") -> None:
+           summary: str = "", log: str = "", ran_key: str = "", commands: list | None = None) -> None:
     """Record this run's outcome for its followers (a run that ran its checks, or followed another;
-    `ran_key`: the key of the run that ran them, when not this run's own)."""
+    `ran_key`: the key of the run that ran them, when not this run's own; `commands`: the commands that ran)."""
     update(path, outcome={"passed": bool(passed), "head": head, "rc": int(rc), "failed": failed,
                           "timed_out": bool(timed_out), "summary": summary[-4000:], "log": log, "ts": time.time(),
-                          **({"key": ran_key} if ran_key else {})})
+                          **({"key": ran_key} if ran_key else {}),
+                          **({"commands": [str(c) for c in commands]} if commands is not None else {})})
+
+
+def ran_commands(me: dict, leader: dict, mine: list) -> tuple[list, list]:
+    """(the commands the run `leader` ran, those of this follower's own `mine` it did not run). A lead
+    of another group (a superseding run in the lane, other commands) that recorded none ran none of them."""
+    cmds = (leader.get("outcome") or {}).get("commands")
+    if cmds is None:
+        cmds = [str(c) for c in mine] if leader.get("group") == me.get("group") else []
+    cmds = [str(c) for c in cmds]
+    return cmds, [str(c) for c in mine if str(c) not in cmds]
 
 
 def ran_key(rec: dict) -> str:
@@ -298,8 +309,9 @@ def said(how: str, mine: str, leader: dict) -> str:
             f"in {who}; waiting for their result instead of running a second suite")
 
 
-def result_line(how: str, mine: str, leader: dict) -> str:
-    """The outcome a follower reports: the run it followed; a superseded one's is never a pass of its own head."""
+def result_line(how: str, mine: str, leader: dict, not_run: list | None = None) -> str:
+    """The outcome a follower reports: the run it followed; a superseded one's is never a pass of its own head,
+    nor of its own commands that run did not run (`not_run`)."""
     o = leader.get("outcome") or {}
     ran = str(o.get("head") or leader.get("head") or "")
     what = ("passed" if o.get("passed") else "TIMED OUT" if o.get("timed_out")
@@ -307,6 +319,8 @@ def result_line(how: str, mine: str, leader: dict) -> str:
     base = f"run {leader.get('run') or '?'}'s checks {what} on {ran[:12]}"
     if how == SUPERSEDED:
         base += f"; {mine[:12]} itself was not checked (superseded by that newer head)"
+        if not_run:
+            base += f"; that run had other commands: {', '.join(not_run)} did not run"
     else:
         base += (f", the same tree as {mine[:12]}" if ran and not ran.startswith(mine[:12]) else "") + \
             " (joined: no second suite ran)"
