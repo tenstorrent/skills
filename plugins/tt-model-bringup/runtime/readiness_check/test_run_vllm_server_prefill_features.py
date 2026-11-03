@@ -5,18 +5,15 @@ import json
 
 import pytest
 
-from readiness_check import run_vllm_server
-from readiness_check.run_vllm_server import (
-    ALL_STAGES,
-    DEFAULT_STAGES,
+from readiness_check import prefix_cache_check, run_vllm_server
+from readiness_check.prefill_burst import attach_serial_reference
+from readiness_check.prefix_cache_check import (
     PREFIX_CACHE_THRESHOLDS,
-    _attach_serial_reference,
     _counter_delta,
     _parse_prometheus_counters,
-    _parse_stages,
     _prefix_cache_verdict,
-    _server_command,
 )
+from readiness_check.run_vllm_server import ALL_STAGES, DEFAULT_STAGES, _parse_stages, _server_command
 
 METRICS = """
 # HELP vllm:prefix_cache_queries_total Prefix cache queries, in terms of number of queried tokens.
@@ -174,8 +171,8 @@ def test_resume_suffix_differs_from_the_prefix(tmp_path):
     prompts = tmp_path / "prompts.txt"
     prompts.write_text("alpha beta gamma\n\ndelta epsilon zeta\n\neta theta iota\n")
     tokenizer = _WordTokenizer()
-    prompt, count = run_vllm_server._build_prefix_cache_prompt(tokenizer, prompts, 5)
-    suffix = run_vllm_server._build_resume_suffix(tokenizer, prompts, 4)
+    prompt, count = prefix_cache_check._build_prefix_cache_prompt(tokenizer, prompts, 5)
+    suffix = prefix_cache_check._build_resume_suffix(tokenizer, prompts, 4)
     assert count == 5
     assert prompt.split()[:3] == ["alpha", "beta", "gamma"]
     assert suffix.split()[:3] == ["eta", "theta", "iota"]
@@ -195,14 +192,14 @@ def test_attach_serial_reference_records_ttft_ratios_and_config_match(tmp_path):
     serial = {"ttft_ms": {"p50": 2000.0, "p99": 5000.0, "mean": 2500.0}, "config": config}
     summary_file = tmp_path / "burst.json"
     summary = {"ttft_ms": {"p50": 1000.0, "p99": 2000.0, "mean": 1000.0}, "config": dict(config)}
-    result = _attach_serial_reference(summary_file, summary, serial, tmp_path / "serial.json")
+    result = attach_serial_reference(summary_file, summary, serial, tmp_path / "serial.json")
     assert result["serial_reference"]["ttft_ratio_p99"] == pytest.approx(0.4)
     assert result["serial_reference"]["ttft_ratio_mean"] == pytest.approx(0.4)
     assert result["serial_reference"]["config_matches"] is True
     assert json.loads(summary_file.read_text())["serial_reference"]["ttft_ratio_p50"] == pytest.approx(0.5)
-    mismatched = _attach_serial_reference(summary_file, {"ttft_ms": {}, "config": {**config, "concurrency": 8}}, serial, None)
+    mismatched = attach_serial_reference(summary_file, {"ttft_ms": {}, "config": {**config, "concurrency": 8}}, serial, None)
     assert mismatched["serial_reference"]["config_matches"] is False
-    assert _attach_serial_reference(summary_file, {"ttft_ms": {}}, None, None) == {"ttft_ms": {}}
+    assert attach_serial_reference(summary_file, {"ttft_ms": {}}, None, None) == {"ttft_ms": {}}
 
 
 def test_run_summary_merges_hold_open_and_attached_runs(tmp_path):
@@ -222,7 +219,7 @@ def test_run_summary_merges_hold_open_and_attached_runs(tmp_path):
 
 
 def test_module_constants_name_the_counters_the_check_reads():
-    assert run_vllm_server.PREFIX_CACHE_COUNTERS == ("vllm:prefix_cache_queries", "vllm:prefix_cache_hits")
+    assert prefix_cache_check.PREFIX_CACHE_COUNTERS == ("vllm:prefix_cache_queries", "vllm:prefix_cache_hits")
 
 
 def test_output_dir_defaults_to_the_gate_root_and_can_be_redirected(tmp_path):

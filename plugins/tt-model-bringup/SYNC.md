@@ -147,7 +147,10 @@ compares resumed prefill with full prefill over a position window and requires i
 and `fresh_suffix` controls to fail. `run_vllm_server.py` gains `--enable-prefix-caching`,
 `--server-log`, the opt-in `prefix_cache` and `prefill_burst` stages, and writes
 `vllm_run_summary.json` on every run. `scripts/check_prefill_features.py` is authored in this
-plugin and runs last in the stage 9 and stage 10 gates; stage 10 passes `--require-burst`.
+plugin and runs last in the stage 9 and stage 10 gates; stage 10 passes `--require-burst`. The served
+prefix-cache check and the burst serial-reference comparison live in the authored modules
+`runtime/readiness_check/prefix_cache_check.py` and `runtime/readiness_check/prefill_burst.py`;
+the runner only dispatches to them.
 
 Only packaged hashes for three edited stage prompts, two edited check scripts, six edited skills,
 `contract.py` and `run_vllm_server.py` change in `sync-source.json`; the original import
