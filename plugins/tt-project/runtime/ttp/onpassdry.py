@@ -35,10 +35,10 @@ import os
 import re
 import shlex
 import shutil
-import subprocess
 import time
 from pathlib import Path
 
+from . import boundedchild
 from .probevars import RUN_VARS, _REF
 from .project import clean_line, durable_write
 
@@ -205,15 +205,14 @@ def check(cmd: str, cwd: Path, env: dict, fallback: bool, timeout: float) -> dic
     started = time.monotonic()
     problems, checked, reads, unknown = [], [], [], False
 
-    def run(argv: list[str]) -> subprocess.CompletedProcess:
+    def run(argv: list[str]) -> boundedchild.Result:
         left = timeout - (time.monotonic() - started)
         if left <= 0:
-            raise _Deadline
-        try:
-            return subprocess.run(argv, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL, capture_output=True,
-                                  text=True, errors="replace", timeout=left, start_new_session=True)
-        except subprocess.TimeoutExpired:
-            raise _Deadline from None
+            raise _Deadline(f"its check timed out after {round(time.monotonic() - started, 1)} s")
+        got = boundedchild.run(argv, left, cwd=str(cwd), env=env)
+        if got.rc is None:   # timed out, or the checker itself could not start: not knowable, not broken
+            raise _Deadline(f"its check {got.error or 'ended without an exit code'}")
+        return got
 
     def parses(kind: str, exe: str, path: Path) -> None:
         if kind == "sh":
@@ -223,9 +222,9 @@ def check(cmd: str, cwd: Path, env: dict, fallback: bool, timeout: float) -> dic
         else:
             return
         checked.append(f"{what} of {path}")
-        if got.returncode:
-            tail = [x for x in (got.stderr or "").splitlines() if x.strip()][-3:]
-            problems.append(f"{path} does not parse ({what}): {clean_line(' | '.join(tail), 300) or f'exit {got.returncode}'}")
+        if got.rc:
+            tail = [x for x in (got.err or "").splitlines() if x.strip()][-3:]
+            problems.append(f"{path} does not parse ({what}): {clean_line(' | '.join(tail), 300) or f'exit {got.rc}'}")
 
     def file_at(word: str, moved: bool, what: str) -> Path | None:
         """The file `word` names, checked to exist (None: missing, said, or not knowable without running)."""
@@ -245,8 +244,8 @@ def check(cmd: str, cwd: Path, env: dict, fallback: bool, timeout: float) -> dic
         shell = "/bin/sh" if os.path.exists("/bin/sh") else "sh"   # the real run's shell (shell=True)
         got = run([shell, "-n", "-c", cmd])
         checked.append("shell syntax")
-        if got.returncode:
-            problems.append(f"it does not parse: {clean_line((got.stderr or '').strip(), 300) or f'exit {got.returncode}'}")
+        if got.rc:
+            problems.append(f"it does not parse: {clean_line((got.err or '').strip(), 300) or f'exit {got.rc}'}")
         for m in _REF.finditer(cmd):
             name = m.group(1) or m.group(2)
             if name in RUN_VARS and name not in ON_PASS_VARS and not env.get(name):
@@ -301,9 +300,9 @@ def check(cmd: str, cwd: Path, env: dict, fallback: bool, timeout: float) -> dic
                     problems.append(f"{prog}: its interpreter {bang[1]} is not there")
                 elif not _execs_early(exe):
                     parses(kind, bexe, exe)
-    except _Deadline:
+    except _Deadline as e:
         took = round(time.monotonic() - started, 1)
-        return {"cmd": cmd, "rc": None, "verdict": "inconclusive", "why": f"its check timed out after {took} s",
+        return {"cmd": cmd, "rc": None, "verdict": "inconclusive", "why": str(e),
                 "output": "\n".join(problems) or "(not run)", "checked": checked, "took_s": took}
     out = {"cmd": cmd, "rc": None, "output": "\n".join(problems) or "(not run)", "checked": checked}
     if problems:
