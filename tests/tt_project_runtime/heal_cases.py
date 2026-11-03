@@ -2963,7 +2963,9 @@ def test_machines_set_and_add_from_a_read_only_home_are_queued_and_applied_once_
     for req in (req_a, req_b):
         ml.project.write_json(p.state / ml.REQUESTS / f"{req['queued']}.json",
                               {k: v for k, v in req.items() if k != "queued"})
-    ml.apply_requests(p.state, log=lambda m: None)
+    replayed = []
+    ml.apply_requests(p.state, log=replayed.append)
+    assert not [m for m in replayed if "saved" in m], replayed   # a relative --until reads the same end again
     assert mm.load() == got and ml.pending(p.state) == [] and not list((p.state / ml.REQUESTS).glob("*.failed.json"))
     # Nothing to queue in (outside a project), or the queue itself unwritable: exit 1, one line.
     monkeypatch.setattr(mm.project, "durable_write", ro)

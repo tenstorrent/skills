@@ -147,6 +147,7 @@ def update(alias: str, args: dict | None = None, owner: str | None = None, fallb
         if entry.get("note_until") and args.get("until"):   # a relative --until means the same end when applied
             from datetime import datetime, timezone
             args = {**args, "until": datetime.fromtimestamp(entry["note_until"], timezone.utc).isoformat()}
+            entry["note_until"] = datetime.fromisoformat(args["until"]).timestamp()   # as applying reads it
     if args is None or owner is not None or fallback is not None:
         entry = _recovery(machines, alias, owner, fallback)
     try:
