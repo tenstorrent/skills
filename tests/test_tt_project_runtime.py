@@ -3545,6 +3545,16 @@ def test_runner_ends_its_agent_when_the_run_dir_is_deleted(env, tmp_path):
             proc.wait()
 
 
+def _watchdog_of(runner_pid: int) -> int | None:
+    """The pid of the runner's watchdog: its child running the _WATCHDOG script."""
+    rows = subprocess.run(["ps", "-A", "-ww", "-o", "pid=,ppid=,args="], capture_output=True, text=True).stdout
+    for row in rows.splitlines():
+        pid, ppid, *args = row.split(None, 2) + [""]
+        if ppid == str(runner_pid) and "killpg" in args[0]:
+            return int(pid)
+    return None
+
+
 @pytest.mark.parametrize("pdeathsig", [True, False], ids=["pdeathsig", "watchdog"])
 def test_agent_ends_when_its_runner_dies(env, tmp_path, pdeathsig):
     # A runner killed outright (OOM killer, kill -9) must not leave its agent or the agent's tools
@@ -3561,13 +3571,22 @@ def test_agent_ends_when_its_runner_dies(env, tmp_path, pdeathsig):
                             env={**os.environ, "PYTHONPATH": str(RUNTIME)})
     agent = tool = None
     try:
+        # child.pid is written only once the watchdog runs: a runner killed before that has none.
         assert _wait_for(lambda: pid_file.exists() and pid_file.read_text().strip()
-                         and tool_file.exists() and tool_file.read_text().strip())
+                         and tool_file.exists() and tool_file.read_text().strip()
+                         and (run_dir / "child.pid").exists(), _load_scaled(30))
         agent, tool = int(pid_file.read_text()), int(tool_file.read_text())
+        from ttp import runner as runner_mod
+        watchdog = _watchdog_of(proc.pid)
+        assert watchdog, "the runner started no watchdog"
         proc.kill()
         proc.wait()
-        assert _wait_for(lambda: _pid_gone(agent), 15), "the agent outlived its runner"
-        assert _wait_for(lambda: _pid_gone(tool), 15), "the agent's tool outlived its runner"
+        # The watchdog exits once the group is gone, or after its TERM and KILL graces: wait on that,
+        # not on a fixed slice of wall time a loaded host can overrun.
+        grace = 2 * runner_mod.KILL_AFTER_S
+        assert _wait_for(lambda: _pid_gone(watchdog), _load_scaled(grace + 30)), "the watchdog never ended"
+        assert _pid_gone(agent), "the agent outlived its runner"
+        assert _pid_gone(tool), "the agent's tool outlived its runner"
     finally:
         if proc.poll() is None:
             proc.kill()
