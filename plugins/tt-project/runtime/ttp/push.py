@@ -250,6 +250,54 @@ def wrap_lane_of(cfg: dict | None) -> str:
     return v.strip().lower()
 
 
+FALLBACK_KEY = "checks.fallback_lane"
+UNWRAPPED = "unwrapped"
+
+
+def fallback_lane_of(cfg: dict | None, cwd: str | Path | None = ".", env: dict | None = None) -> tuple[str, tuple[str, ...], str]:
+    """`checks.fallback_lane`: where the commands behind checks.wrap_cmd run while that wrapper's lock is
+    paused (`ttp lock`: "held by pause on"). Default "": off, they wait for the pause. A wrapper command
+    (parsed as wrap_cmd is; a CPU pool's `ttp lock` for example), or "unwrapped": no wrapper, with
+    TTP_NO_DEVICE=1 set (a CPU-only run). Returns (its label, its wrapper argv, why it cannot serve or
+    ""): one that does not parse, is not executable here or is checks.wrap_cmd itself cannot, and the
+    checks wait for the pause then (never fail). One level only: a paused fallback waits too. With `cwd`
+    None (config_problems) the wrapper is not looked for."""
+    sec = (cfg or {}).get("checks")
+    v = sec.get("fallback_lane") if isinstance(sec, dict) else None
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return "", (), ""
+    if not isinstance(v, str):
+        return str(v), (), f"{FALLBACK_KEY} must be a wrapper command or {UNWRAPPED!r}, not {type(v).__name__}"
+    if v.strip().lower() == UNWRAPPED:
+        return UNWRAPPED, (), ""
+    try:
+        wrap = tuple(shlex.split(v))
+    except ValueError as e:
+        return v, (), f"{FALLBACK_KEY} {v!r} does not parse: {e}"
+    try:
+        if wrap == wrap_of(cfg):
+            return v, (), f"{FALLBACK_KEY} is {WRAP_KEY} itself, whose lock is the paused one"
+    except ValueError:
+        pass
+    if cwd is not None and (why := wrap_problem(wrap, cwd, env)):
+        return v, (), why.replace(WRAP_KEY, FALLBACK_KEY, 1).split(", so ")[0]
+    return v, wrap, ""
+
+
+def to_fallback(checks: list, wrapped: set, wrap: tuple[str, ...], lane: tuple[str, ...] = ()) -> list:
+    """Moves each of `checks` named in `wrapped` (run behind checks.wrap_cmd) onto the fallback lane, in
+    place: behind `wrap` (and its lane step `lane`), or, with no `wrap` ("unwrapped"), with no wrapper and
+    TTP_NO_DEVICE=1. Returns the commands moved."""
+    moved = []
+    for c in checks:
+        if str(c) in wrapped and isinstance(c, Check):
+            c.wrap, c.lane = tuple(wrap), tuple(lane) if wrap else ()
+            if not wrap:
+                c.env = tuple(sorted({**dict(getattr(c, "env", None) or ()), "TTP_NO_DEVICE": "1"}.items()))
+            moved.append(str(c))
+    return moved
+
+
 def with_wrap(checks: list, wrap: tuple[str, ...], lane: tuple[str, ...] = (), skip=lambda c: False) -> list:
     """`checks` with each one that runs on this machine behind `wrap` (check_argv); one with a check
     host runs there unwrapped, as the wrapper is this machine's, and so does one `skip` names (a check

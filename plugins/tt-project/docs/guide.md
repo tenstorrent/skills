@@ -1386,7 +1386,11 @@ queues behind routine work; nothing running is interrupted:
   (seconds) sets that limit for a check that is silent longer by design, and 0 turns it off. A full run of
   the tt-project test suite lists its 15 slowest test calls just above its `ttp-suite:` line. `checks.wrap_cmd` (project setting, default unset) runs each command given after `ttp checks --`
   behind the project's own lock or queue command, the command passed as separate arguments; a missing wrapper
-  fails the checks, and `delivery.push_checks` never go through it. A pytest `-n N` above
+  fails the checks, and `delivery.push_checks` never go through it. `checks.fallback_lane` (project setting,
+  default "", off) is where those commands run while the wrapper's lock is paused (`held by pause on`): a
+  wrapper command (a CPU pool's `ttp lock`, say) or `unwrapped` (no wrapper, TTP_NO_DEVICE=1 set). The pass
+  line and checks.json (`fallback_lane`) name the lane and the pause; off, or with the fallback paused or
+  unable to serve, the run waits on the pause (exit 75), never fails. A pytest `-n N` above
   the grant is lowered with a line saying so; a worker's own pytest above TTP_TEST_SLOTS is refused. Builds
   (make, ninja, `cmake --build`) take slots of a second host pool of the same size, the build pool (`checks.build_pool`,
   `checks.build_run_max`, `checks.build_project_max`; 0 pool turns it off), so a long build never takes a test slot: workers

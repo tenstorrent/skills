@@ -613,13 +613,15 @@ def _known_keys(path: list[str]) -> set[str] | None:
         # behind (push.wrap_of; default "", none); delivery.push_checks never go through it.
         # wrap_lane: where those runs take its lane, before the wrapper starts or after (push.wrap_lane_of).
         # no_device_cmds: commands that need no device, run without wrap_cmd (checklane.no_device).
+        # fallback_lane: where those run while wrap_cmd's lock is paused, a wrapper or "unwrapped" (push.fallback_lane_of;
+        # default "", off: they wait for the pause).
         # slots, light_cmds, max_wait_s, wait_event_s, wait_escalate_s, wait_hang_factor, priority_age_s,
         # test_project_max, done_holder_flag_s, done_holder_grace_s: the checks lanes (checklane);
         # test_project_slots: the project's test-worker budget (testslots.project_max); test_project_workers:
         # its ceiling on test workers over all its suites (testslots.project_workers); test_run_max: one
         # suite's most workers, only lowering the account's (testslots.sizes);
         # stall_s: a running check's log silence that makes it stalled (checkstall.stall_s).
-        return {"nice", "ionice", "wall_cap_s", "wrap_cmd", "wrap_lane", "no_device_cmds", "slots", "light_cmds", "max_wait_s", "wait_event_s",
+        return {"nice", "ionice", "wall_cap_s", "wrap_cmd", "wrap_lane", "fallback_lane", "no_device_cmds", "slots", "light_cmds", "max_wait_s", "wait_event_s",
                 "wait_escalate_s", "wait_hang_factor", "priority_age_s", "test_project_max", "test_project_slots",
                 "test_project_workers", "test_run_max",
                 "done_holder_flag_s", "done_holder_grace_s", "stall_s"}
@@ -927,12 +929,13 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     from .push import (allow_protected, applicability_problems, backup_problem, by_repo_problems,   # push imports this module
                        bump_problems, check_problems,
                        fast_forward_check, lands_locally, mirror_check, push_branch_problem, scalar_problem, wrap_lane_of,
-                       wrap_of)
+                       wrap_of, fallback_lane_of)
     for read in (wrap_of, wrap_lane_of):
         try:
             read(raw)
         except ValueError as e:
             out.append(str(e))
+    out += [why for why in [fallback_lane_of(raw, None)[2]] if why]
     delivery = raw.get("delivery") or {}
     out += [why for why in [backup_problem(delivery)] if why]
     if not lands_locally(delivery.get("push_branch"), root, allow_protected(delivery)):

@@ -3082,6 +3082,8 @@ def cmd_checks(a) -> None:
                 + f" (`command -v {prog}` finds nothing), so {str(c)!r} after `--` cannot run; nothing was "
                 "started. Install it, or leave that command out", 1)
     wrapped, wrap = set(), ()
+    # checks.fallback_lane: where the wrapped commands run while the wrapper's lock is paused (off: they wait).
+    fallback, fb_lane, fell_back = ("", (), ""), (), {}
     if mine:   # checks.wrap_cmd: the project's own lock or queue wrapper (never the project checks)
         try:
             wrap, after = push.wrap_of(cfg), push.wrap_lane_of(cfg) == "after"
@@ -3101,6 +3103,8 @@ def cmd_checks(a) -> None:
             if why := push.wrap_problem(wrap, top, {**os.environ, **venv_vars}):
                 die(f"ttp checks: {why}", 1)
             print(f"ttp checks: the commands after `--` run behind {push.WRAP_KEY}: {shlex.join(wrap)}")
+            fallback = push.fallback_lane_of(cfg, top, {**os.environ, **venv_vars})
+            fb_lane = _wrap_lane_step(p, Path(run_dir), fallback[1]) if fallback[1] and after and p else ()
         if wrap and (remote := [c for c in mine if push.remote_host(c)]):
             print(f"ttp checks: {', '.join(map(repr, map(str, remote)))} run on their check host without "
                   f"{push.WRAP_KEY}, which wraps only commands run on this machine")
@@ -3447,6 +3451,16 @@ def cmd_checks(a) -> None:
                                                stderr=subprocess.STDOUT, env=env, timeout=checkwall.deadline_left(deadline),
                                                silent_s=checkwall.silent_limit(c), pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ()),
                             bool, None if push.remote_host(c) else str(c), cwd, env, said)
+                        # The wrapper's lock refused it as paused: it and the other wrapped commands run on
+                        # checks.fallback_lane once, never on the paused resource (a paused fallback waits).
+                        if (rc == 75 and fallback[0] and not fallback[2] and not fell_back and str(c) in wrapped
+                                and (on := _pause_hold(_log_since(out, log, check_start)))):
+                            fell_back = {"lane": fallback[0], "paused": on,
+                                         "commands": push.to_fallback(todo[len(executed) - 1:], wrapped, fallback[1],
+                                                                          fb_lane)}
+                            said(f"{push.WRAP_KEY}'s lock {on} is paused: {c!r} and the other wrapped commands run "
+                                 f"on {push.FALLBACK_KEY} {fallback[0]!r} instead")
+                            continue
                         # A test worker lost mid-run is the host, not the change: once more (workerloss).
                         if rc == 0 or push.remote_host(c) or loss_reruns >= workerloss.RERUNS:
                             break
@@ -3604,13 +3618,22 @@ def cmd_checks(a) -> None:
             sys.exit(75)
         # The wrapper's lock refused it as paused (`ttp lock`: "held by pause on <resource>"): the pause, never
         # a failure of the change nor a busy lock; it says so and what to wait on.
+        # With checks.fallback_lane paused too (or unable to serve), the wait names both; it never fails.
         if not passed and rc == 75 and str(failed) in wrapped and (held := _pause_hold(_log_since(out, log, check_start))):
-            said = (f"held by pause on {held}: {failed!r} ran behind {push.WRAP_KEY}, whose lock is paused; the "
-                    f"change is neither passed nor failed. Hand off `waiting`; retry_when: ttp lock --probe {shlex.quote(held)}")
+            first = fell_back.get("paused") or held
+            also_on = (f"; {push.FALLBACK_KEY} {fallback[0]!r} is paused too (held by pause on {held})" if fell_back
+                       else f"; {push.FALLBACK_KEY} {fallback[0]!r} cannot serve: {fallback[2]}" if fallback[0] else "")
+            probe = f"{first}|{held}" if fell_back and held != first else first
+            said = (f"held by pause on {first}: {failed!r} ran behind {push.WRAP_KEY}, whose lock is paused{also_on}; the "
+                    f"change is neither passed nor failed. Hand off `waiting`; retry_when: ttp lock --probe {shlex.quote(probe)}")
             out.write(f"ttp checks: {said}\n")
             write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": False,
                                                              "commands": todo, "skipped": skipped, "ts": time.time(),
-                                                             "purpose": purpose, "held_by_pause": held})
+                                                             "purpose": purpose, "held_by_pause": first,
+                                                             **({"fallback_lane": {**fell_back, "held_by_pause": held}}
+                                                                if fell_back else {"fallback_lane": {
+                                                                    "lane": fallback[0], "problem": fallback[2]}}
+                                                                if fallback[0] else {})})
             print(f"ttp checks: {said}", file=sys.stderr)
             sys.exit(75)
     if handover:
@@ -3673,6 +3696,7 @@ def cmd_checks(a) -> None:
                                                      **({"env_problem": env_problem} if env_problem else {}),
                                                      **({"hosts": hosts} if (hosts := push.hosts_of(todo)) else {}),
                                                      **({"spilled_to": spilled.host} if spilled else {}),
+                                                     **({"fallback_lane": fell_back} if fell_back else {}),
                                                      **({"authoring_tree": in_authoring} if in_authoring else {}),
                                                      **({"added_tests": rerun} if rerun else {})})
     if join_rec:   # the outcome the runs that joined this one report (checkjoin)
@@ -3735,6 +3759,10 @@ def cmd_checks(a) -> None:
         more += f"; the rerun of the added tests was SKIPPED ({rerun['why']}), not passed"
     if harness_unset:
         more += f"; {push.HARNESS_UNSET}: the built-in harness default ran, not the code repo's checks"
+    if fell_back:
+        more += (f"; {len(fell_back['commands'])} ran on {push.FALLBACK_KEY} {fell_back['lane']!r}, NOT behind "
+                 f"{push.WRAP_KEY}, as its lock {fell_back['paused']} is paused: "
+                 f"{', '.join(map(repr, fell_back['commands']))}")
     print(f"ttp checks: {len(todo)} check(s) passed on {head[:12]}{more}; "
           + ("recorded as a harness qualification only: it never counts for a PR, an on_pass hand-off or a push"
              if purpose == "harness" else "recorded for the draft PR") + f" (full output: {log})")
