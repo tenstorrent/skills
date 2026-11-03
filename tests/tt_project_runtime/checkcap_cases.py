@@ -524,7 +524,9 @@ def test_each_checks_slot_taken_logs_its_wait_durably_in_the_takers_project_stat
     real = project.durable_append
     monkeypatch.setattr(project, "durable_append", lambda path, text: synced.append(path) or real(path, text))
     log = p.state / checkcap.WAITS_LOG
-    first = checkcap.acquire("A task #7", since=time.time() - 30, project_name=p.name, priority=2, state=p.state)
+    arrived = time.time() - 30
+    first = checkcap.acquire("A task #7", since=arrived, project_name=p.name, priority=2, state=p.state,
+                             lane_at=arrived + 10)
     got = []
     t = threading.Thread(target=lambda: got.append(checkcap.acquire("A task #7 again", project_name=p.name,
                                                                     priority=None, state=p.state)))
@@ -540,6 +542,7 @@ def test_each_checks_slot_taken_logs_its_wait_durably_in_the_takers_project_stat
     rows = [json.loads(x) for x in log.read_text().splitlines()]
     assert [(r["project"], r["task"], r["priority"], r["slot"]) for r in rows] == [(p.name, 7, 2, "queue"), (p.name, 7, None, "queue")]
     assert 29 <= rows[0]["granted_at"] - rows[0]["queued_at"] < 60, "the wait counts from the place in the queue"
+    assert rows[0]["lane_at"] == round(arrived + 10, 3) and "lane_at" not in rows[1], "when its lane was granted"
     assert rows[1]["granted_at"] - rows[1]["queued_at"] >= 0.3
     grants = checkcap.grants_dir() / checkcap.GRANTS_LOG
     assert synced == [log, grants, log, grants], "each line is appended with a sync, here and host-wide"

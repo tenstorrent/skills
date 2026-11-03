@@ -4225,10 +4225,11 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         while True:
             left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
             testslots.lane_waits(suite, "a host-wide checks slot")   # held, not running yet: status says why
+            lane_at = time.time()   # the waits log counts only the time after it as the host's (throughput)
             slot = checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell,
                                     waiting, left, arrived,
                                     p.name if p else None, prio, same, done, stop,
-                                    p.state if p else None, owns, cap=checklane.project_cap(cfg))
+                                    p.state if p else None, owns, cap=checklane.project_cap(cfg), lane_at=lane_at)
             if slot is None or slot.served:
                 suite.close()
                 return slot

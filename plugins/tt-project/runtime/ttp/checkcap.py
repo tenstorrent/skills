@@ -495,7 +495,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             since: float | None = None, project_name: str | None = None,
             priority: int | None = None, same: str = "", done: Callable[[], bool] | None = None,
             stop: Callable[[], str] | None = None, state: Path | None = None,
-            owns: list[str] | tuple = (), cap: int | None = None) -> Slot | None:
+            owns: list[str] | tuple = (), cap: int | None = None, lane_at: float | None = None) -> Slot | None:
     """Take a host-wide checks slot, waiting while all are held. Waiters take turns by project
     (`project_name`; none form their own group), within one by task priority (`priority`, 1 first;
     OBLIGATION_PRIORITY before it, its ticket marked OBLIGATION_MARK; none last), then arrival (locks.fair_order),
@@ -526,7 +526,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
         if f:
             locks.mark_served(slot_dir(), RESOURCE, project_name)
             locks.mark_turn(slot_dir(), RESOURCE, None)
-            _granted(tell, state, project_name, priority, owns, since, cap=cap)
+            _granted(tell, state, project_name, priority, owns, since, cap=cap, lane_at=lane_at)
             return Slot(f)
         ticket = locks.enqueue(slot_dir(), RESOURCE, queued_as, since, group=project_name, priority=priority)
     except OSError as e:
@@ -566,7 +566,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             if f:
                 locks.mark_served(slot_dir(), RESOURCE, project_name)
                 locks.mark_turn(slot_dir(), RESOURCE, ticket)
-                _granted(tell, state, project_name, priority, owns, since, bool(told), cap)
+                _granted(tell, state, project_name, priority, owns, since, bool(told), cap, lane_at)
                 return Slot(f)
             if time.time() - told >= TELL_S:
                 if tell and ticket is not None:
@@ -608,10 +608,10 @@ def grant_line(priority: int | None, owns, since: float, now: float | None = Non
 
 
 def _granted(tell, state, project_name, priority, owns, since: float, told: bool = False,
-             cap: int | None = None) -> None:
+             cap: int | None = None, lane_at: float | None = None) -> None:
     """Log a slot taken (record_wait) and tell it when it waited, here or before a relaunch."""
     now = time.time()
-    record_wait(state, project_name, priority, since, now, owns=owns, cap=cap)
+    record_wait(state, project_name, priority, since, now, owns=owns, cap=cap, lane_at=lane_at)
     if tell and (told or now - since > GRANT_TELL_S):
         tell(grant_line(priority, owns, since, now))
 
@@ -700,17 +700,21 @@ WAITS_WINDOW_S = 24 * 3600
 
 def record_wait(state: Path | None, project_name: str | None, priority: int | None, queued_at: float,
                 granted_at: float, slot: str = "queue", owns: list[str] | tuple = (),
-                cap: int | None = None) -> None:
+                cap: int | None = None, lane_at: float | None = None) -> None:
     """Append one slot wait to `state`/WAITS_LOG and sync it, and the grant to the host-wide log
     (record_grant). Never raises: a log that cannot be written must not cost the checks their slot.
     No `state`: only the host-wide line is logged. `cap`: the project cap in force (checklane.project_cap,
-    0: none), stored as "cap" so throughput judges the wait by it; None (no project lane): no field."""
+    0: none), stored as "cap" so throughput judges the wait by it; None (no project lane): no field.
+    `lane_at`: when the run got its repository's lane (`ttp checks` queues for it before this slot, from
+    the same `queued_at`), stored as "lane_at": only the time after it waited for the host."""
     task = os.environ.get("TTP_TASK") or ""
     rec = {"project": project_name, "task": int(task) if task.isdigit() else None,
            "run": os.environ.get("TTP_RUN_ID") or None, "priority": priority, "slot": slot,
            "queued_at": round(queued_at, 3), "granted_at": round(granted_at, 3)}
     if cap is not None:
         rec["cap"] = int(cap)
+    if lane_at is not None:
+        rec["lane_at"] = round(lane_at, 3)
     if state is not None:
         _append(Path(state), WAITS_LOG, WAITS_OLD, WAITS_LOCK, WAITS_MAX_BYTES, rec)
     record_grant(rec, owns)

@@ -360,11 +360,11 @@ def _tp_review(p, code_created, run_end, queued, started, labels=()):
     return code, rv
 
 
-def _tp_slot_wait(p, monkeypatch, task, queued_at, granted_at):
+def _tp_slot_wait(p, monkeypatch, task, queued_at, granted_at, **kw):
     """A checks slot wait of `task`, logged by checkcap's own writer as the task's checks log it."""
     from ttp import checkcap
     monkeypatch.setenv("TTP_TASK", str(task))
-    checkcap.record_wait(Path(p.db.path).parent, p.name, 3, queued_at, granted_at)
+    checkcap.record_wait(Path(p.db.path).parent, p.name, 3, queued_at, granted_at, **kw)
     monkeypatch.delenv("TTP_TASK")
 
 
@@ -945,8 +945,9 @@ def test_throughput_judges_a_checks_wait_by_the_cap_its_record_stored_else_the_e
 
 def _tp_host_scene(p, monkeypatch, tmp_path, d, now, at_cap=False, other_grant=False):
     """Two priority 1 checks waits of 999 s, each queued 900 s for a slot (checkcap's own waits log), behind
-    one of the project's own checks runs under its cap of 3, or three runs at the cap (`at_cap`); with
-    `other_grant` another project's host slot grant (checkcap.record_wait's host-wide line) inside each."""
+    one of the project's own checks runs under its cap of 3, or three runs at the cap (`at_cap`), its lane
+    granted at once (lane_at); with `other_grant` another project's host slot grant (checkcap.record_wait's
+    host-wide line) inside each."""
     from ttp import checkcap
     monkeypatch.setattr(checkcap, "grants_dir", lambda: tmp_path / "host")
     p.set_config("checks.test_project_max", 3)
@@ -955,7 +956,7 @@ def _tp_host_scene(p, monkeypatch, tmp_path, d, now, at_cap=False, other_grant=F
         t = _tp_checks_requeue(p, d, monkeypatch, tmp_path, f"checks wait {i}", w0, 999)
         for _ in range(3 if at_cap else 1):
             _tp_checks_run(p, monkeypatch, w0 - 60, 1200)
-        _tp_slot_wait(p, monkeypatch, t, w0, w0 + 900)
+        _tp_slot_wait(p, monkeypatch, t, w0, w0 + 900, lane_at=w0)
         if other_grant:
             checkcap.record_wait(None, "other-project", 2, w0 - 30, w0 + 400)
         out.append(t)
@@ -993,6 +994,52 @@ def test_throughput_checks_waits_the_host_held_name_that_holder_and_raise_nothin
     assert not p.db.q("SELECT 1 FROM tasks WHERE title LIKE 'throughput: %'")
 
 
+@pytest.mark.parametrize("lane_at", [None, 600])
+def test_throughput_checks_waits_on_the_projects_own_lanes_name_checks_slots_not_the_host(env, monkeypatch,
+                                                                                         tmp_path, lane_at):
+    """Review #5379: `ttp checks` queues for its repository's lane before the host-wide slot, from the same
+    arrival, so a waits-log record also spans the lane wait. Under the project cap 3 with both of checks.slots
+    2 held by the project's own runs, two p1 waits of 700 s (no checks_slot_wait event yet) are the project's
+    own lanes: from an older record with no lane_at (its own runs filled the lanes), or one whose lane came
+    late (lane_at 600 s in). Never the host's free-cores gate."""
+    from ttp import checkcap, throughput
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(checkcap, "grants_dir", lambda: tmp_path / "host")
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    p.set_config("checks.test_project_max", 3)
+    p.set_config("checks.slots", 2)
+    for i, w0 in enumerate((now - 5 * 3600, now - 3 * 3600)):
+        t = _tp_checks_requeue(p, d, monkeypatch, tmp_path, f"lane wait {i}", w0, 700)
+        _tp_checks_run(p, monkeypatch, w0 - 60, 750)     # the own runs holding the repository's two lanes
+        _tp_checks_run(p, monkeypatch, w0 - 30, 900)
+        _tp_slot_wait(p, monkeypatch, t, w0, w0 + 690, cap=3, **({} if lane_at is None else {"lane_at": w0 + lane_at}))
+    ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
+    assert ck["slow"] and ck["count"] == 2 and ck["held_by"]["own"] == 2, ck
+    assert "holder" not in ck and ck["limit_key"] == "checks.slots", ck
+
+
+def test_throughput_a_checks_wait_mostly_after_its_lane_is_the_hosts_even_with_the_lanes_full(
+        env, monkeypatch, tmp_path):
+    """Only a record's time before lane_at is the project's own lanes: a wait granted its lane 100 s in
+    and then held 590 s for the host-wide slot is the host's, though its own runs filled checks.slots."""
+    from ttp import checkcap, throughput
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(checkcap, "grants_dir", lambda: tmp_path / "host")
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    p.set_config("checks.test_project_max", 3)
+    p.set_config("checks.slots", 2)
+    w0 = now - 3 * 3600
+    t = _tp_checks_requeue(p, d, monkeypatch, tmp_path, "host wait", w0, 700)
+    _tp_checks_run(p, monkeypatch, w0 - 60, 750)
+    _tp_checks_run(p, monkeypatch, w0 - 30, 900)
+    _tp_slot_wait(p, monkeypatch, t, w0, w0 + 690, cap=3, lane_at=w0 + 100)
+    ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
+    assert ck["held_by"] == {"own": 0, throughput.HOST_CORES: 1, throughput.OTHER_PROJECTS: 0}, ck
+    assert (ck["holder"], ck["limit_key"]) == (throughput.HOST_CORES, None), ck
+
+
 def test_throughput_checks_waits_at_the_projects_own_cap_still_name_its_limit(env, monkeypatch, tmp_path):
     """Own-cap waits keep the checks setting and its advice (a kept entry with a key, so a follow-up),
     even beside another project's grant inside them; a host-held wait beside one at the cap is only
@@ -1005,7 +1052,7 @@ def test_throughput_checks_waits_at_the_projects_own_cap_still_name_its_limit(en
     w2 = now - 3600   # one more wait the host held: one own run under the cap, no other grant
     t = _tp_checks_requeue(p, d, monkeypatch, tmp_path, "host held", w2, 999)
     _tp_checks_run(p, monkeypatch, w2 - 60, 1200)
-    _tp_slot_wait(p, monkeypatch, t, w2, w2 + 900)
+    _tp_slot_wait(p, monkeypatch, t, w2, w2 + 900, lane_at=w2)
     rep = throughput.measure(p.db, p.config(), now=now, gates={})
     ck = _tp_lane(rep, "checks_slots")
     assert (ck["count"], ck["at_limit"], ck["idle"]) == (3, 2, 1), ck

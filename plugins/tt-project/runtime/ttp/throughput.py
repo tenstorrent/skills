@@ -402,6 +402,7 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
         slot_host.setdefault(e["task"], []).append((float(e["ts"]), host_held(e["text"] or "")))
     slot_log: dict[int, list[tuple[float, float]]] = {}
     slot_cap: dict[tuple[int, float, float], int] = {}   # the cap in force a record stored at its grant
+    slot_lane: dict[tuple[int, float, float], float] = {}   # when the record's run got its repository's lane
     own_names, others = {cfg.get("name")}, []   # other projects' host slot grants (times), from the host log
     try:
         from . import checkcap
@@ -411,6 +412,8 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                 slot_log.setdefault(r["task"], []).append((r["queued_at"], r["granted_at"]))
                 if isinstance(r.get("cap"), int) and not isinstance(r["cap"], bool) and r["cap"] >= 0:
                     slot_cap[(r["task"], r["queued_at"], r["granted_at"])] = r["cap"]
+                if isinstance(r.get("lane_at"), (int, float)) and not isinstance(r["lane_at"], bool):
+                    slot_lane[(r["task"], r["queued_at"], r["granted_at"])] = float(r["lane_at"])
         others = [g["ts"] for g in checkcap.grant_records(now, now - t0 + DAY)
                   if g.get("project") and g.get("project") not in own_names]
     except Exception:
@@ -477,12 +480,28 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
         """Who held `task`'s checks wait in [w0, w1] that cap_wait() judged `state`: "own" (at the project's
         cap, its own queue served one run at a time, its own lane holders running per its checks_slot_wait
         events, or known only from its reason text, the legacy default), else HOST_CORES or
-        OTHER_PROJECTS. A wait the host held (its waits-log time before the grant, or events whose lane
-        holders all waited for a host-wide gate) is OTHER_PROJECTS when another project's host slot grant
-        fell inside it (checkcap.grant_records), else the host's free-cores gate."""
+        OTHER_PROJECTS. A waits-log record's time before its run got the repository's lane ("lane_at") is
+        the project's own lanes (checks.slots); one with no lane_at is all own when the project's recorded
+        runs filled checks.slots in it; a wait mostly held so is own. A wait the host held (its waits-log
+        time from the lane to the grant, or events whose lane holders all waited for a host-wide gate) is
+        OTHER_PROJECTS when another project's host slot grant fell inside it (checkcap.grant_records), else
+        the host's free-cores gate."""
         if state in ("at_limit", "serialized"):
             return "own"
-        spans = [(max(q, w0), min(g, w1)) for q, g in slot_log.get(task, ()) if min(g, w1) > max(q, w0)]
+        spans, own_s = [], 0.0
+        for q, g in slot_log.get(task, ()):
+            a, b = max(q, w0), min(g, w1)
+            if b <= a:
+                continue
+            if (lane_at := slot_lane.get((task, q, g))) is not None:
+                h = min(max(lane_at, a), b)
+            else:
+                h = b if lanes_n and ck_peak(a, b) >= lanes_n else a
+            own_s += h - a
+            if b > h:
+                spans.append((h, b))
+        if own_s and own_s >= sum(b - a for a, b in spans):
+            return "own"
         evs = [h for ts, h in slot_host.get(task, ()) if w0 <= ts <= w1]
         if evs and not all(evs):
             return "own"
