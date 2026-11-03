@@ -306,3 +306,57 @@ def test_push_log_lines_and_push_output_never_follow_a_symlink(env, tmp_path, mo
     assert target.read_text() == "keep me\n"
     texts = [r["text"] for r in proj.refused_appends()]
     assert "a push line" in texts[0] and "starting the push process" in texts[1]
+
+
+def test_durable_write_never_follows_or_removes_a_symlink_planted_at_its_temp_name(tmp_path, monkeypatch):
+    from ttp import project as proj
+    target = tmp_path / "victim.txt"
+    target.write_text("keep me\n")
+    path = tmp_path / "state.json"
+    path.write_text("old\n")
+    path.chmod(0o640)
+    names = iter(["planted", "planted", "fresh"])
+    monkeypatch.setattr(proj, "_tmp_suffix", lambda: next(names))
+    planted = tmp_path / f".state.json.{os.getpid()}.planted.tmp"
+    planted.symlink_to(target)
+    proj.durable_write(path, "new\n")
+    assert target.read_text() == "keep me\n", "the symlink's target is never written"
+    assert planted.is_symlink(), "a file it did not create is never removed"
+    assert path.read_text() == "new\n" and not path.is_symlink()
+    assert path.stat().st_mode & 0o777 == 0o640
+    assert not (tmp_path / f".state.json.{os.getpid()}.fresh.tmp").exists()
+    monkeypatch.setattr(proj, "_tmp_suffix", lambda: "planted")
+    with pytest.raises(FileExistsError):
+        proj.durable_write(path, "never\n")
+    assert path.read_text() == "new\n" and target.read_text() == "keep me\n" and planted.is_symlink()
+
+
+def test_concurrent_refused_appends_are_all_recorded(tmp_path):
+    import threading
+    from ttp import project as proj
+    link = tmp_path / "log.jsonl"
+    link.symlink_to(tmp_path / "victim")
+    proj.refused_appends()
+    seen, n_threads, each = [], 8, 20
+    start = threading.Barrier(n_threads + 1)
+
+    def refuse(i):
+        start.wait()
+        for j in range(each):
+            assert proj.durable_append(link, f"{i}-{j}\n") is False
+
+    def drain():
+        start.wait()
+        for _ in range(200):
+            seen.extend(proj.refused_appends())
+
+    threads = [threading.Thread(target=refuse, args=(i,)) for i in range(n_threads)]
+    threads.append(threading.Thread(target=drain))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    seen.extend(proj.refused_appends())
+    texts = [r["text"] for r in seen]
+    assert sorted(texts) == sorted(f"{i}-{j}\n" for i in range(n_threads) for j in range(each))
+    assert not (tmp_path / "victim").exists()

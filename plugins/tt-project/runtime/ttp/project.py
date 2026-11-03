@@ -2290,6 +2290,13 @@ def sync_all() -> None:
         os.sync()
 
 
+TMP_TRIES = 8
+
+
+def _tmp_suffix() -> str:
+    return os.urandom(6).hex()
+
+
 def durable_write(path: Path, text: str | bytes, mode: int | None = None, sync: bool = True) -> None:
     """Replace `path` with `text` so a power cut leaves the old content or the new, never an empty
     or half-written file: a temporary file in the same directory is written and synced, renamed over
@@ -2305,16 +2312,25 @@ def durable_write(path: Path, text: str | bytes, mode: int | None = None, sync: 
             mode = path.stat().st_mode & 0o7777
         except OSError:
             pass
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if mode is not None else 0o666)
+    # A fresh name opened O_EXCL|O_NOFOLLOW: workers can write the state and run folders, and a
+    # symlink or file planted at the temporary name is never followed, written or removed.
+    for tries in range(TMP_TRIES):
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{_tmp_suffix()}.tmp")
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600 if mode is not None else 0o666)
+            break
+        except FileExistsError:
+            if tries == TMP_TRIES - 1:
+                raise
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
             f.flush()
             if sync:
                 os.fsync(f.fileno())
-        if mode is not None:
-            os.chmod(tmp, mode)
+            if mode is not None:
+                os.fchmod(f.fileno(), mode)
         os.replace(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)
@@ -2340,6 +2356,7 @@ class AppendRefused(OSError):
 
 
 _REFUSED_APPENDS: list[dict] = []   # refused durable_append calls, until the daemon records them
+_REFUSED_LOCK = threading.Lock()
 REFUSED_KEEP = 200
 
 
@@ -2366,8 +2383,9 @@ def open_append(path: Path, mode: str = "a", **kw):
 
 def refused_appends() -> list[dict]:
     """The appends durable_append refused in this process since the last call, oldest first."""
-    out = _REFUSED_APPENDS[:]
-    del _REFUSED_APPENDS[:len(out)]
+    with _REFUSED_LOCK:
+        out = _REFUSED_APPENDS[:]
+        del _REFUSED_APPENDS[:]
     return out
 
 
@@ -2377,8 +2395,9 @@ def note_refused_append(path, why: str, text: str = "", p=None) -> None:
     daemon) it goes into p's events at once: a refusal in a short-lived command is never only on its
     stderr."""
     print(f"ttp: refused to append to {path}: {why}", file=sys.stderr)
-    _REFUSED_APPENDS.append({"ts": time.time(), "path": str(path), "why": why, "text": text[:2000]})
-    del _REFUSED_APPENDS[:-REFUSED_KEEP]
+    with _REFUSED_LOCK:
+        _REFUSED_APPENDS.append({"ts": time.time(), "path": str(path), "why": why, "text": text[:2000]})
+        del _REFUSED_APPENDS[:-REFUSED_KEEP]
     if p is not None:
         try:
             record_refused_appends(p.db)
@@ -2396,7 +2415,8 @@ def record_refused_appends(db) -> list[dict]:
                  (r["ts"], "daemon", "append_refused", "normal",
                   f"refused to append to {r['path']}: {r['why']}"[:500], json.dumps(r), "handled"))
         except Exception:
-            _REFUSED_APPENDS[:0] = rows[i:]
+            with _REFUSED_LOCK:
+                _REFUSED_APPENDS[:0] = rows[i:]
             raise
     return rows
 
