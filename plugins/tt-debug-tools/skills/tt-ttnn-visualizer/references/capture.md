@@ -35,10 +35,20 @@ Outside pytest (a demo script, a server) the fixture does not run, so build
 the report in two steps — capture to JSON, then import it offline:
 
 ```python
+was_tracing = ttnn.graph.is_detailed_buffer_tracing_enabled()
+ttnn.graph.enable_detailed_buffer_tracing()  # full L1 figures, as the fixture
 ttnn.graph.begin_graph_capture()
-...                                       # run the model
-ttnn.graph.end_graph_capture_to_file("report.json")
+try:
+    ...                                   # run the model
+finally:                                  # keep the capture if it raises
+    ttnn.graph.end_graph_capture_to_file("report.json")
+    if not was_tracing:
+        ttnn.graph.disable_detailed_buffer_tracing()
 ```
+
+`ttnn.graph.full_graph_capture("report.json")` does the same as a context
+manager, but writes nothing if the model raises — fine only for runs expected
+to finish.
 
 ```bash
 python -m ttnn.graph_report 'report.json' '<new empty folder>'
