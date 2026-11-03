@@ -71,7 +71,7 @@ import re
 import time
 from typing import Any, Callable
 
-from . import askrethink, credits, failover, holdloops, mitigate, obligations, outagetask, prguard, settinghold, timefmt, unblock, userpause
+from . import askrethink, credits, failover, holdloops, mitigate, obligations, outagetask, prguard, reviewsup, settinghold, timefmt, unblock, userpause
 from .db import DB, TERMINAL_TASK_STATES, deferral, dependency_ids, load_result
 from .coordlimits import positive
 
@@ -537,6 +537,8 @@ def review_diagnosis(db: DB, tid: int, now: float, hold_of: Callable[[dict], str
     if r["status"] == "running":
         return f"review #{r['id']} running{started}"
     summary = _clip(load_result(r["result"]).get("summary") or r["blocked_reason"] or "", 160)
+    if r["status"] == "failed" and (sup := reviewsup.record_of(r)):
+        return f"review #{r['id']} failed{started}, superseded {reviewsup.words(sup)}: its findings are covered"
     if r["status"] in ("failed", "cancelled", "blocked", "waiting"):
         return f"review #{r['id']} {r['status']}{started}" + (f": {summary}" if summary else "")
     return f"review #{r['id']} {r['status']}{started}; its verdict is not acted on yet" + (

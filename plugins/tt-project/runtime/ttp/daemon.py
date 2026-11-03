@@ -149,6 +149,7 @@ from . import reviewcap
 from . import reviewhold
 from . import reviewreuse
 from . import reviewstats
+from . import reviewsup
 from . import runner
 from . import schedule as sched
 from . import service
@@ -184,6 +185,7 @@ from .db import (
     NOT_ABANDONED_SQL,
     PAUSE_BOOT_KEY,
     SEVERITY_RANK,
+    SUPERSEDED,
     TERMINAL_TASK_STATES,
     WORKSPACE_LOCK_TRIES_KEY,
     WORKSPACE_TRIES_KEY,
@@ -3558,7 +3560,7 @@ class Daemon:
             "SELECT task, MAX(ts) ts FROM events WHERE kind IN ('task_failed','task_changes_needed') "
             "AND task IS NOT NULL AND ts>? GROUP BY task", (now - reviewcap.LOOKBACK_S,))}
         failed = [r for r in db.q("SELECT * FROM tasks WHERE kind='review' AND status='failed' ORDER BY id DESC")
-                  if r["id"] in ended and now - ended[r["id"]] >= wait_s]
+                  if r["id"] in ended and now - ended[r["id"]] >= wait_s and task_outcome(r) != SUPERSEDED]
         if not failed:
             return
         index = BranchIndex(in_review)
@@ -5213,6 +5215,13 @@ class Daemon:
                 reviewstats.record(self.p, task, outcome)
             except Exception as e:
                 log(self.p, f"review {task['id']}: its stats were not recorded: {e}")
+        if task["kind"] == "review" and new in reviewsup.PASSED and not rejects:
+            try:   # the failed reviews earlier in its chain are covered: they leave the open lists
+                if marked := reviewsup.auto(db, {**task, "status": new}):
+                    log(self.p, f"review {task['id']} passed: earlier review(s) "
+                                f"{', '.join(f'#{i}' for i in marked)} recorded as superseded by it")
+            except Exception as e:   # a miss never stops the hand-off
+                log(self.p, f"review {task['id']}: earlier reviews not marked superseded: {e}")
         if task["reply_chat"] and new in ("done", "failed", "blocked"):
             text = replymsg.text(result) if new == "done" else f"(task #{task['id']} {outcome}) {summary}"
             need = upd.get("blocked_reason") if new == "blocked" else None

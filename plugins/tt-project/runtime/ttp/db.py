@@ -214,6 +214,10 @@ WORKSPACE_LOCK_TRIES_KEY = "workspace_lock_tries"   # kv: task id -> workspace r
 # reviewed stays gated (its fix and re-review follow), and its hand-off status says changes_needed:
 # readers show and count it on its own, never as a failure (task_outcome, DB.status_counts).
 CHANGES_NEEDED = "changes_needed"
+# A failed review whose findings a later passing review or a reviewed commit covers (reviewsup.py):
+# readers show it as superseded, its verdict kept, and leave it out of open changes_needed lists.
+SUPERSEDED = "superseded"
+SUPERSEDED_KEY = "review_superseded"   # tasks.result of such a review: {by_review, sha, ref, how, ts}
 # The push queue (pushq.py). A review whose approval waits in it has the task status 'pushing'.
 PUSH_QUEUE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS push_queue(
@@ -1026,16 +1030,18 @@ END""")
         return self.one("SELECT * FROM tasks WHERE id=?", (task_id,))
 
     def status_counts(self) -> dict[str, int]:
-        """Tasks by status, with reviews that asked for changes counted as changes_needed, not failed."""
+        """Tasks by status, with reviews that asked for changes counted as changes_needed and superseded
+        reviews as superseded, not failed."""
         counts = {r["status"]: r["n"] for r in self.q("SELECT status, COUNT(*) n FROM tasks GROUP BY status")}
-        n = sum(task_outcome(t) == CHANGES_NEEDED for t in self.q(
-            "SELECT status, kind, result FROM tasks WHERE status='failed' AND kind='review' AND result LIKE ?",
-            (f"%{CHANGES_NEEDED}%",)))
-        if n:
-            counts["failed"] -= n
-            if not counts["failed"]:
-                del counts["failed"]
-            counts[CHANGES_NEEDED] = n
+        shown = [task_outcome(t) for t in self.q(
+            "SELECT status, kind, result FROM tasks WHERE status='failed' AND kind='review' "
+            "AND (result LIKE ? OR result LIKE ?)", (f"%{CHANGES_NEEDED}%", f"%{SUPERSEDED_KEY}%"))]
+        for outcome in (CHANGES_NEEDED, SUPERSEDED):
+            if n := shown.count(outcome):
+                counts["failed"] -= n
+                if not counts["failed"]:
+                    del counts["failed"]
+                counts[outcome] = n
         return counts
 
     def ready_tasks(self, later: bool = False) -> list[dict]:
@@ -1438,10 +1444,14 @@ def _clip(value: Any, cap: int) -> Any:
 
 
 def task_outcome(task: dict) -> str:
-    """The task's status as readers show it: changes_needed for a review that asked for changes."""
-    if task.get("status") == "failed" and task.get("kind") == "review" \
-            and load_result(task.get("result")).get("status") == CHANGES_NEEDED:
-        return CHANGES_NEEDED
+    """The task's status as readers show it: changes_needed for a review that asked for changes,
+    superseded for a failed review a later passing review or a reviewed commit covers (reviewsup)."""
+    if task.get("status") == "failed" and task.get("kind") == "review":
+        result = load_result(task.get("result"))
+        if isinstance(result.get(SUPERSEDED_KEY), dict):
+            return SUPERSEDED
+        if result.get("status") == CHANGES_NEEDED:
+            return CHANGES_NEEDED
     return task.get("status") or ""
 
 

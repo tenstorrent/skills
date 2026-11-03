@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 
 from . import __version__, poll_s
-from .db import CHANGES_NEEDED, chat_floor, task_outcome
+from .db import CHANGES_NEEDED, SUPERSEDED, chat_floor, task_outcome
 from . import outbox
 from .devq import unmask_devices
 from . import chatgone, scriptwatch, sshcmd, timefmt, workerloss
@@ -6825,7 +6825,7 @@ def list_tasks(p, a) -> tuple[list[dict], int, int | None]:
     want = {s.strip() for s in (a.status or "").split(",") if s.strip()}
     limit = None if a.all else a.limit if a.limit is not None else None if want else TASK_LIST_LIMIT
     if want:
-        stored = sorted(want | ({"failed"} if CHANGES_NEEDED in want else set()))
+        stored = sorted(want | ({"failed"} if want & {CHANGES_NEEDED, SUPERSEDED} else set()))
         rows = [t for t in p.db.q(f"{cols} WHERE status IN ({','.join('?' * len(stored))}) ORDER BY id DESC",
                                   stored) if task_outcome(t) in want]
         return rows[:limit] if limit is not None else rows, len(rows), limit
@@ -6846,8 +6846,8 @@ def cmd_task(a) -> None:
         die("--budget goes with add")
     if a.action != "set-when" and a.on_pass_cmd is not None:
         die("--on-pass-cmd goes with set-when")
-    if a.action != "superseded" and (a.ref is not None or a.repo is not None):
-        die("--ref and --repo go with superseded")
+    if a.action != "superseded" and (a.ref is not None or a.repo is not None or a.by_review is not None):
+        die("--ref, --repo and --by-review go with superseded")
     if a.action != "list" and (a.status, a.all, a.limit) != (None, False, None):
         die("--status, --all and --limit go with list")
     if a.all and a.limit is not None:
@@ -6877,7 +6877,7 @@ def cmd_task(a) -> None:
         if not t:
             die(f"no task #{int(a.title)} in {p.name}", 1)
         from .landed import abandoned, superseded_rows
-        from . import sweep
+        from . import reviewsup, sweep
         gone = abandoned(p.db, t["id"])
         sup = superseded_rows(p, t["id"])
         swept = sweep.task_view(p.db, t["id"])
@@ -6885,8 +6885,9 @@ def cmd_task(a) -> None:
             print(json.dumps({**t, **({"abandoned": {"why": gone[0], "ts": gone[1]}} if gone else {}),
                               **({"superseded": sup} if sup else {}), "blocker_sweep": swept}, indent=2, default=str))
         else:
-            lines = [f"superseded by {r['sha'][:10]} ({'on' if r['on_push_branch'] else 'not on' if r['on_push_branch'] is False else 'cannot read'}"
-                     f" the push branch), recorded {timefmt.long(r['ts'], p)}" for r in sup]
+            lines = ([sup_line] if (sup_line := reviewsup.show_line(t, lambda ts: timefmt.long(ts, p))) else [])
+            lines += [f"superseded by {r['sha'][:10]} ({'on' if r['on_push_branch'] else 'not on' if r['on_push_branch'] is False else 'cannot read'}"
+                      f" the push branch), recorded {timefmt.long(r['ts'], p)}" for r in sup]
             if gone:
                 lines.append(f"abandoned {timefmt.long(gone[1], p)}: {gone[0]}")
             lines += sweep.task_lines(swept, p)
@@ -6937,9 +6938,19 @@ def cmd_task(a) -> None:
             raise SystemExit(rc)
     elif a.action == "superseded":
         from .landed import record_superseded
+        from . import reviewsup
+        target = p.db.task(int(a.title)) if a.title.strip().isdigit() else None
+        if target and target["kind"] == "review" and target["status"] == "failed":
+            try:   # a failed (changes_needed) review: its findings covered by a passed re-review or a commit
+                print(reviewsup.manual(p, target["id"], (a.probe or "").strip(), a.ref, a.by_review, a.repo))
+            except ValueError as e:
+                die(str(e))
+            return
+        if a.by_review is not None:
+            die("--by-review goes with a failed review only")
         if not a.title.strip().isdigit() or not a.probe:
             die("superseded needs a task id and the commit that carries its work (on the push branch, or --ref)")
-        cancelled = (p.db.task(int(a.title)) or {}).get("status") == "cancelled"
+        cancelled = (target or {}).get("status") == "cancelled"
         if cancelled and a.ref:
             die("--ref does not go with a cancelled task: name its correction class's fix task or commit")
         try:
@@ -10977,7 +10988,8 @@ def main(argv: list[str] | None = None) -> None:
                                     "set-when re-points a task not yet started; superseded records a done task's "
                                     "work as landed under another commit (also a code task in review whose work "
                                     "landed, or a harness task in review whose commit is merged into the harness: "
-                                    "it is then closed as done); abandon records that a done code task's "
+                                    "it is then closed as done; a failed review whose findings are fixed, with --by-review <passed re-review> "
+                                    "or a commit on the push branch or --ref, is recorded superseded, its verdict kept); abandon records that a done code task's "
                                     "work will never land (its branch is kept), so local-only, push-audit and landed "
                                     "checks leave it out; rejudge reruns the daemon's hand-off checks on a done or "
                                     "failed task's stored hand-off and corrects a wrong partial mark")
@@ -10989,16 +11001,19 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("probe", nargs="?", help="set-when: the new retry_when/start_when command (\"\" clears it); "
                    "superseded: the commit on the push branch that carries the task's work (for a harness task: "
                    "the commit merged into the harness; for a cancelled correction-class fix task: the done task '#<id>' "
-                   "or commit that fixed the class instead); abandon: why its work will never land")
+                   "or commit that fixed the class instead; for a failed review: a commit on the push branch or --ref that "
+                   "fixes its findings, optional with --by-review); abandon: why its work will never land")
     s.add_argument("--ref", help="superseded: the ref that holds the commit (default: the push branch; in a "
                    "second repository the task worked in, any of its branches); for a task with no branch on record, "
                    "required: the branch of a second repository that holds its work, or a ref the commit is on; a commit already on that "
                    "local or remote-tracking ref skips the file-overlap check")
     s.add_argument("--repo", help="superseded: a repository path to search first for the branch and the commit "
                    "(then the repository of the current directory, the repositories the task's runs worked in, the project root)")
+    s.add_argument("--by-review", type=int, help="superseded: for a failed (changes_needed) review, a passed "
+                   "re-review of the same change chain that covers its findings")
     s.add_argument("--json", action="store_true", help="list: JSON rows with start_when/retry_when; show: the task record with its blocker_sweep")
     s.add_argument("--status", help="list: only tasks in these statuses, comma-separated (queued,running,waiting,"
-                   "blocked,review,done,failed,changes_needed,cancelled, ...); filtered before any cap, so every match "
+                   "blocked,review,done,failed,changes_needed,superseded,cancelled, ...); filtered before any cap, so every match "
                    "shows unless --limit is given")
     s.add_argument("--all", action="store_true", help="list: every task, not only the newest 50")
     s.add_argument("--limit", type=int, help="list: at most this many, newest first (default 50 with no --status; "
