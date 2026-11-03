@@ -3683,6 +3683,51 @@ def test_ttp_checks_granted_with_its_running_bound_full_hands_its_grants_back_an
     assert not locks_held(testslots) and not locks.held_labels(checkcap.all_paths(8)), "released at the end"
 
 
+def test_lane_waits_name_the_project_cap_when_the_repository_s_other_lanes_only_wait_for_their_grants(
+        env, monkeypatch):
+    """Reader and writer agree: suite_hold with `running` counts only running suites against a
+    repository's lanes, so waits(), held_lanes and the slots note count the same, and a waiter in a
+    repository with a free running lane is held by the full project cap, not by its lanes."""
+    from ttp import checkcap, checklane, locks, testslots
+    _slot_sizes(monkeypatch, 32, 4, TTP_TEST_PROJECT_MAX=2)
+    p = make(env)
+    p.set_config("checks.slots", 3)
+    cfg = p.config()
+    three = lambda _held: 3   # noqa: E731
+    other = "abcdef012345"
+    hold = lambda repo, cap=2: testslots.suite_hold(p.name, repo=repo, slots=three, cap=cap, wait_s=0,   # noqa: E731
+                                                    pending=True, running=True, who="run 1")
+    a = [hold(_LANE_REPO) for _ in range(3)]
+    b = hold(other)
+    ticket = None
+    try:
+        assert all(g and g.files for g in a + [b])
+        assert testslots.claim_running(a[0], p.name, three, 2) and testslots.claim_running(b, p.name, three, 2)
+        assert len(testslots.project_held(p.name)) == 2, "the project cap of 2 is full of running suites"
+        assert checklane.held_lanes(p.name, _LANE_REPO) == 1, "two of A's three lanes only wait for grants"
+        wait = lambda: locks.enqueue(checkcap.slot_dir(), testslots._suite_resource(p.name, _LANE_REPO),  # noqa: E731
+                                     "task #41 x", time.time() - 60, priority=2)
+        ticket = wait()
+        w = [x for x in checklane.waits(p.name, cfg) if x["task"] == "41"]
+        assert len(w) == 1 and w[0]["limit"] == "project_cap", w
+        assert w[0]["waits_on"] == checklane.CAP_LABEL
+        a[0].close()
+        b.close()
+        assert checklane.held_lanes(p.name, _LANE_REPO) == 0
+        assert testslots.claim_running(a[1], p.name, three, 2) and testslots.claim_running(a[2], p.name, three, 2)
+        locks.dequeue(ticket)
+        a.append(hold(_LANE_REPO, cap=3))
+        ticket = wait()
+        assert a[-1] and testslots.claim_running(a[-1], p.name, three, 3), "the third running lane"
+        w = [x for x in checklane.waits(p.name, cfg) if x["task"] == "41"]
+        assert w[0]["limit"] == "lanes" and len(w[0]["holders"]) == 3, w
+        assert all(h.get("granted") is not False for h in w[0]["holders"])
+    finally:
+        ticket and locks.dequeue(ticket)
+        for g in a + [b]:
+            g and g.close()
+
+
 _RUNNING_HOLDER = """
 import os, signal, sys, time
 from pathlib import Path

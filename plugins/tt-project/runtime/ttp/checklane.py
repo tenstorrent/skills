@@ -236,10 +236,22 @@ def slots(cfg: dict | None, held: int = 0) -> int:
     return n if n is not None else capacity(cfg, held)["n"]
 
 
+def _awaits_grants(rec: dict) -> bool:
+    """Whether a lane holder's record is a run taken with `running` still waiting for its host grants:
+    testslots.suite_hold does not count such a lane against its repository's lanes (n_held)."""
+    return bool(rec.get("running")) and rec.get("granted") is False
+
+
+def _held_numbered(base: str) -> int:
+    """How many of lane resource `base`'s numbered lanes count as held the way suite_hold counts them:
+    every held one, less those whose `running` run still waits for its grants."""
+    return sum(1 for x in testslots._lanes_of(base) if not x.name.startswith(base + "-x") and locks._slot_labels([x])
+               and not _awaits_grants((locks.holder_records([x]) or [{}])[0]))
+
+
 def held_lanes(project_name: str, repo: str = "") -> int:
-    """How many of repository `repo`'s numbered lanes (not overflow ones) are held now."""
-    base = testslots.suite_base(project_name, repo)
-    return len([x for x in testslots._lanes_of(base) if not x.name.startswith(base + "-x") and locks._slot_labels([x])])
+    """How many of repository `repo`'s numbered lanes (not overflow ones) are held now (_held_numbered)."""
+    return _held_numbered(testslots.suite_base(project_name, repo))
 
 
 def slots_now(project_name: str, repo: str, cfg: dict | None) -> int:
@@ -404,7 +416,7 @@ def _lane_waits_on(project_name: str, base: str, key: str, q: list, cfg: dict | 
     """What each waiter in lane `base`'s queue `q` (in turn order) waits on: the lane itself while its
     lanes are all held; with one free, the project cap (testslots.cap_turn: a waiter behind the lane's
     first ones waits for them, and they for the cap)."""
-    held = len([x for x in testslots._lanes_of(base) if not x.name.startswith(base + "-x") and locks._slot_labels([x])])
+    held = _held_numbered(base)
     n = 1 if key.startswith("w") else max(1, slots(cfg, held))
     capped = project_cap(cfg) > 0
     return [label if held >= n else CAP_LABEL if capped else "nothing (about to start)" for _ in q]
@@ -769,7 +781,7 @@ def waits(project_name: str, cfg: dict | None, now: float | None = None, over_s:
             key = base[len(pre) + 1:]
             q = testslots.suite_order(project_name, now=now, repo=key, age=age)
             on = _lane_waits_on(project_name, base, key, q, cfg, labels[key]) if q else []
-            lane_recs = locks.holder_records(testslots._lanes_of(base)) if q else []
+            lane_recs = [r for r in locks.holder_records(testslots._lanes_of(base)) if not _awaits_grants(r)] if q else []
             all_recs = locks.holder_records(testslots.project_held(project_name)) if q else []
             note = slots_note(cfg, len([r for r in lane_recs if not r.get("overflow")])) if q else ""
             for i, t in enumerate(q):
