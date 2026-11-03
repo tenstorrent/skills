@@ -43,6 +43,10 @@ are inflated. The test has to iterate at least twice; analyse only the
 second iteration. This is not a `tt-perf-report` flag — it is how the test
 must be written.
 
+Device columns are not immune: a whole-process capture also counts one-time
+weight preparation, which can top the ranking. Rank a warm window only:
+`warm-window.md`.
+
 ## Analyse
 
 ```bash
