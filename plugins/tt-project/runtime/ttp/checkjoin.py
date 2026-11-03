@@ -36,10 +36,17 @@ import time
 import uuid
 from pathlib import Path
 
+from .checkwall import CEILING_S
 from .project import ps_snapshot
 
 FOLDER = "checks-joins"
 KEEP_S = 6 * 3600.0     # a record with an outcome stays this long for its followers
+# A record without an outcome whose liveness this process cannot judge (another PID namespace) is
+# dropped once its last write is this old: a run's commands end within the default wall cap (at most
+# checkwall.CEILING_S after it starts running), and a follower's leader within that plus its own slot
+# wait; four times the ceiling (24 h) leaves room for a long queue before either. A run still alive
+# past it (a raised checks.wall_cap_s) only loses its record: its followers queue again.
+FOREIGN_S = 4 * CEILING_S
 DEPTH = 8               # the longest chain of followers resolved
 WAITING, RUNNING, JOINED, SUPERSEDED = "waiting", "running", "joined", "superseded"
 
@@ -138,10 +145,17 @@ def alive(rec: dict) -> bool | None:
     return state != DEAD and rec.get("started") is not None and proc_start(pid) == rec.get("started")
 
 
+def _orphan(rec: dict, now: float) -> bool:
+    """A record without an outcome of another PID namespace, last written more than FOREIGN_S ago: its run
+    was killed before writing one (a sandbox gone), and nothing that could see its pid is left to prune it."""
+    last = max(float(rec.get(k) or 0) for k in ("ts", "since", "run_since"))
+    return rec.get("alive") is None and not rec.get("outcome") and now - last > FOREIGN_S
+
+
 @ps_snapshot()   # one `ps` for every record's pid where there is no /proc
 def records(state: Path, now: float | None = None, prune: bool = True) -> list[dict]:
-    """Every record, each with "alive" (True, False, or None: unknown here). With `prune`, records of dead runs without an outcome and
-    outcomes older than KEEP_S are removed."""
+    """Every record, each with "alive" (True, False, or None: unknown here). With `prune`, records of dead runs without an outcome, of
+    another PID namespace's runs without one past FOREIGN_S (_orphan) and outcomes older than KEEP_S are removed."""
     now = time.time() if now is None else now
     out = []
     try:
@@ -154,7 +168,8 @@ def records(state: Path, now: float | None = None, prune: bool = True) -> list[d
             continue
         rec["alive"] = alive(rec)
         done = rec.get("outcome")
-        stale = (not done and rec["alive"] is False) or (done and now - float(done.get("ts") or 0) > KEEP_S)
+        stale = (not done and (rec["alive"] is False or _orphan(rec, now))) or \
+            (done and now - float(done.get("ts") or 0) > KEEP_S)
         if stale and prune:
             path.unlink(missing_ok=True)
             continue
@@ -346,7 +361,8 @@ def status_lines(state: Path, now: float | None = None) -> list[str]:
     by = {r.get("id"): r for r in recs}
     out = []
     for r in recs:
-        if r.get("alive") is False or r.get("outcome") or r.get("phase") not in (JOINED, SUPERSEDED):
+        if r.get("alive") is False or r.get("outcome") or r.get("phase") not in (JOINED, SUPERSEDED) or \
+                _orphan(r, now):
             continue
         lead = by.get(r.get("follows")) or {}
         who = f"#{r.get('task')} run {r.get('run') or '?'} pid {r.get('pid')}" + \

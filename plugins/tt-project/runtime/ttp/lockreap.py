@@ -455,6 +455,7 @@ def devq_waits(db, threshold_s: float, now: float | None = None, current=None) -
     """Each device runner a waiting task's job has been queued on for threshold_s or more (note_devq_wait),
     shaped like long_waits' answers (lock `devq:<runner>`). `current(task)`: the probe the task waits on
     now; an entry whose task no longer waits on its probe is dropped."""
+    from .liveness import FOREIGN
     now = time.time() if now is None else now
     waits = db.kv(DEVQ_WAITS_KEY, {}) or {}
     keep, by = {}, {}
@@ -474,7 +475,8 @@ def devq_waits(db, threshold_s: float, now: float | None = None, current=None) -
         holders = []
         for h in {(w.get("holder") or {}).get("job"): w.get("holder") for w in ws if w.get("holder")}.values():
             state, why = ("alive", f"pid {h['pid']} alive") if h.get("alive") else \
-                ("dead", f"its pid {h['pid']} is gone") if h.get("alive") is False else ("unknown", "no pid recorded yet")
+                ("dead", f"its pid {h['pid']} is gone") if h.get("alive") is False else \
+                ("unknown", f"its pid {h['pid']} is {FOREIGN}") if h.get("pid") else ("unknown", "no pid recorded yet")
             holders.append({"lock": f"devq:{runner}", "path": "", "holder": f"device job {h['job']}",
                             "pid": h.get("pid"), "command": "", "task": h.get("task"), "run": None,
                             "project": None, "since": float(h["since"]) if h.get("since") else 0.0,

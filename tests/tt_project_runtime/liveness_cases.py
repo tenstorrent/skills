@@ -164,3 +164,46 @@ def test_checkjoin_judges_a_record_without_a_namespace_here(monkeypatch, tmp_pat
     monkeypatch.delenv("TTP_PIDNS", raising=False)
     _ns_join_rec(tmp_path, "mac", os.getpid(), "", started=proc_start(os.getpid()))
     assert [r["alive"] for r in checkjoin.records(tmp_path)] == [True]
+
+
+def test_checkjoin_prunes_an_old_foreign_record_without_an_outcome_and_keeps_a_fresh_one(gone_pid, pidns, tmp_path):
+    """A sandboxed run killed before its outcome leaves a record no process can judge: past FOREIGN_S it is
+    pruned (and no longer listed); a fresh one, a live one and a foreign one with an outcome stay."""
+    from ttp import checkjoin, liveness
+    from ttp.runner import proc_start
+    foreign = pidns == "foreign"
+    ns = "pid:[1]" if foreign else liveness.pid_ns()
+    now = time.time()
+    old = now - checkjoin.FOREIGN_S - 60
+    gone = _ns_join_rec(tmp_path, "gone", gone_pid, ns, ts=old, since=old, phase="joined", follows="x")
+    fresh = _ns_join_rec(tmp_path, "fresh", gone_pid, ns, ts=old, since=now - 60, phase="joined", follows="x")
+    live = _ns_join_rec(tmp_path, "live", os.getpid(), liveness.pid_ns(), ts=old, started=proc_start(os.getpid()))
+    done = _ns_join_rec(tmp_path, "done", gone_pid, ns, ts=old, outcome={"passed": True, "ts": now - 60})
+    lines = checkjoin.status_lines(tmp_path, now)
+    assert len(lines) == int(foreign) and all(liveness.FOREIGN in ln for ln in lines), lines   # not the old one
+    recs = {r["id"]: r for r in checkjoin.records(tmp_path, now, prune=True)}
+    assert not gone.exists() and "gone" not in recs
+    assert fresh.exists() is foreign and live.exists() and done.exists()
+    if foreign:
+        assert recs["fresh"]["alive"] is None and recs["done"]["alive"] is None
+    assert recs["live"]["alive"] is True
+
+
+def test_devq_waits_names_a_holder_pid_it_cannot_place_as_of_another_pid_namespace(gone_pid, pidns, tmp_path):
+    from ttp import devq, liveness, lockreap
+    d = tmp_path / "devq"
+    for sub in ("queue", "running", "done"):
+        (d / sub).mkdir(parents=True)
+    (d / "queue" / f"{int(time.time() * 1e9):020d}-jb.json").write_text("{}")
+    (d / "running" / "ja.json").write_text("{}")
+    (d / "running" / "ja.state.json").write_text(json.dumps({"cur": {"pid": gone_pid}}))
+    kv = {}
+    db = types.SimpleNamespace(kv=lambda k, default=None: kv.get(k, default), set_kv=kv.__setitem__,
+                               task=lambda tid: {"id": tid, "status": "queued"})
+    lockreap.note_devq_wait(db, 5, "r1", "ttp devq probe r1 jb", devq.wait_line(d, "jb"), 1)
+    [w] = lockreap.devq_waits(db, 60, time.time() + 3600)
+    [h] = w["holders"]
+    if pidns == "foreign":
+        assert (h["state"], h["why"]) == ("unknown", f"its pid {gone_pid} is {liveness.FOREIGN}")
+    else:
+        assert (h["state"], h["why"]) == ("dead", f"its pid {gone_pid} is gone")
