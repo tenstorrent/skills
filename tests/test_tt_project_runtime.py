@@ -22312,6 +22312,14 @@ def test_a_malformed_checks_pid_does_not_stop_other_tasks_waking(env, tmp_path):
     assert not any(_relaunches(p, x) for x in bad)
 
 
+def _job_lock_free(rc, timeout):
+    from ttp import locks
+    deadline = time.time() + _load_scaled(timeout)
+    while not locks.any_free([locks.job_lock(rc)]) and time.time() < deadline:
+        time.sleep(0.05)
+    return locks.any_free([locks.job_lock(rc)])
+
+
 def _resumable_job_cut_by_reboot(p, tmp_path, tid, name="job", resumable=True):
     """Task tid waits on `ttp detach [--resumable] <name>` of its own run; a reboot cut it short: no
     .rc, its resume record and registry entry name an earlier boot. Returns (rc, counter file)."""
@@ -22326,6 +22334,9 @@ def _resumable_job_cut_by_reboot(p, tmp_path, tid, name="job", resumable=True):
                      env={"TTP_RUN_DIR": str(run_dir), "MY_API_TOKEN": "s3cret"}, timeout=HANG_S)
         assert r.returncode == 0, r.stderr
         assert _wait_for_path(rc, HANG_S)
+        # The job writes its .rc before its wrapper exits and frees the job lock: wait for that too,
+        # else a relaunch right after this sees the job "still running" on a loaded host.
+        assert _job_lock_free(rc, 30), "the finished job still holds its lock"
     rc = rc.resolve()
     rc.unlink()
     if resumable:
