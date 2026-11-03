@@ -27091,6 +27091,7 @@ DURABLE_EXEMPT = {
     ("schedlog.py", "os.replace(f, f.with_name(OLD))"): "rotates the bounded scheduler log; a rename lost to a crash leaves the log one generation longer",
     ("machines.py", 'open(log, "a")'): "the background copy's stdout; a log cut by a crash has no done line, so its failures are not reported, never misreported",
     ("checkcap.py", 'open(d / lock, "a")'): "a flock guard file, never written",
+    ("checkcap.py", 'os.fdopen(fd, "a+")'): "re-wraps a kept checks slot's flock guard file after a re-exec, never written",
     ("checkcap.py", "os.replace(log, d / old)"): "rotates a bounded checks slot log (waits, grants); a rename lost to a crash leaves the log one generation longer",
     ("shared.py", '.guard", "a")'): "a flock guard file, never written",
     ("globalcap.py", 'global-spend.lock", "a")'): "a flock guard file, never written",
