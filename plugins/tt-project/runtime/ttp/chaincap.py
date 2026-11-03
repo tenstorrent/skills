@@ -13,7 +13,8 @@ Progress (a done hop, against the task before it in the chain; the root against 
 - new passing evidence: a `metrics` entry in its hand-off that is new or changed against the
   previous task's.
 A code hop counts commits only (code_commits): ones whose committer time falls inside its runs, read
-from its own worktree or clone (worktrees/t<id>, also where the project root is no git repository),
+from its own worktree or clone (own_trees: the work tree its runs recorded, worktrees/t<id>, or one
+named t<id> a few levels under the project root; also where the project root is no git repository),
 its branch and pr_branch, and the shas its hand-off names. Metrics alone are never a code hop's
 progress. A code hop with no new commit whose only proposal is a `continue:` gets no hop queued: one
 NO_COMMIT_EVENT (NO_COMMIT_TRIGGER) names the task and its continue, and the coordinator decides.
@@ -57,8 +58,10 @@ orientation. It is bounded (BRIEF_MAX_LINES) and left out when the parent has no
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
+from pathlib import Path
 
 from . import gitmemo, headline
 from .db import DB, assigned_tier, continues_id, deferral, load_result
@@ -83,6 +86,8 @@ NO_COMMIT_EVENT = "continue_no_commit"   # a code hop with no new commit asked f
 NO_COMMIT_TRIGGER = "re-plan: no new commit"
 HANDOFF_SHA = re.compile(r"(?<![\w-])[0-9a-f]{7,40}(?![\w-])")
 MAX_NAMED = 10   # hand-off shas read per hop
+TREE_DEPTH = 3     # levels under the project root own_trees looks for a hop's t<id> work tree
+TREE_SCAN = 1000   # directories own_trees lists at most
 FOLLOWS = "follows:"   # label of a task_add that `continues` a done task: a lineage link that takes nothing over
 NOTICES_KEY = "chain_notices"   # kv: [{ts, text}]: hops the daemon queued, shown once in the next digest
 MAX_CHAIN = 200
@@ -205,11 +210,55 @@ def named_shas(task: dict) -> list[str]:
     return [c for c in dict.fromkeys(named) if HANDOFF_SHA.fullmatch(c)][:MAX_NAMED]
 
 
+def own_trees(p, hop: dict) -> list[Path]:
+    """The git work trees code hop `hop` worked in, never the project root: the top level of the
+    working directory its runs recorded (run.json cwd) under the project root, and worktrees/t<id> or
+    a directory named t<id> at most TREE_DEPTH levels under the project root (a worktree outside the
+    default folder) that is its own top level. The search skips hidden and symlinked directories and
+    the harness folder, and lists at most TREE_SCAN directories."""
+    from . import worktree
+    root, name = Path(p.root).resolve(), f"t{hop['id']}"
+    cwds, named = [], [Path(p.worktrees) / name]
+    for r in p.db.q("SELECT dir FROM runs WHERE task=? AND dir IS NOT NULL", (hop["id"],)):
+        try:
+            cwd = json.loads((Path(r["dir"]) / "run.json").read_text()).get("cwd")
+        except (OSError, ValueError, AttributeError):
+            continue
+        cwds += [Path(cwd)] if isinstance(cwd, str) and cwd else []
+    skip = {Path(b).resolve() for b in (getattr(p, "base", None), p.worktrees) if b}
+    level, listed = [root], 0
+    for _ in range(TREE_DEPTH):
+        nxt: list[Path] = []
+        for d in level:
+            if listed >= TREE_SCAN:
+                break
+            listed += 1
+            try:
+                with os.scandir(d) as it:
+                    subs = [Path(e.path) for e in it if not e.name.startswith(".") and e.is_dir(follow_symlinks=False)]
+            except OSError:
+                continue
+            named += [s for s in subs if s.name == name]
+            nxt += [s for s in subs if s.name != name and s not in skip]
+        level = nxt
+
+    def top(d: Path) -> Path | None:
+        try:
+            if d.is_dir() and worktree.is_git(d):
+                return Path(worktree._git(d, "rev-parse", "--show-toplevel", check=False)).resolve()
+        except Exception:
+            pass
+        return None
+    trees = [t for d in cwds if (t := top(d)) and t != root and t.is_relative_to(root)]
+    trees += [t for d in named if (t := top(d)) and t == d.resolve()]
+    return list(dict.fromkeys(trees))
+
+
 def code_commits(p, hop: dict, earlier=(), now: float | None = None) -> int:
     """The commits code hop `hop` made: committer time inside its runs (run_windows), read from its own
-    worktree or clone, its branch and pr_branch (each where it resolves: the worktree, the project
-    root) less the base (in a standalone clone, its origin/HEAD) and the `earlier` tasks' branches it
-    started from, and the shas its hand-off names. A source git cannot read adds none."""
+    worktree or clone (own_trees), its branch and pr_branch (each where it resolves: the worktree, the
+    project root) less the base (in a standalone clone, its origin/HEAD) and the `earlier` tasks' branches
+    it started from, and the shas its hand-off names. A source git cannot read adds none."""
     from . import worktree
     wins = run_windows(p.db, hop, now)
     lo = min(a for a, _ in wins)
@@ -225,11 +274,11 @@ def code_commits(p, hop: dict, earlier=(), now: float | None = None) -> int:
             if ct.isdigit():
                 found[sha] = int(ct)
 
-    own = p.worktrees / f"t{hop['id']}"
+    own = own_trees(p, hop)
     pr = worktree.recorded_pr_branch(hop) or ""
     branches = [b for b in dict.fromkeys((hop.get("branch") or "", pr)) if b and worktree.valid_branch(b)]
     shas = named_shas(hop)
-    repos = [r for r in (own, p.root) if r.is_dir() and worktree.is_git(r)]
+    repos = [*own, *([p.root] if p.root.is_dir() and worktree.is_git(p.root) else [])]
     common = lambda r: worktree._git(r, "rev-parse", "--path-format=absolute", "--git-common-dir", check=False)  # noqa: E731
     try:   # the base only in the root's own refs (a linked worktree shares them; a clone's same name is its own)
         base = f"^{worktree.resolve_base(p)}" if p.root in repos else ""
@@ -241,7 +290,7 @@ def code_commits(p, hop: dict, earlier=(), now: float | None = None) -> int:
         # a standalone clone: less its upstream default branch (commits pulled in are not the hop's own);
         # not every remote ref, as the hop's own pushed branch still counts
         less = [base] if base and same else [] if same else ["^refs/remotes/origin/HEAD"]
-        if refs := (["HEAD"] if repo == own else []) + [f"refs/heads/{b}" for b in branches]:
+        if refs := (["HEAD"] if repo in own else []) + [f"refs/heads/{b}" for b in branches]:
             log(repo, f"--since=@{lo}", "--max-count=500", *refs, *not_, *less)
         if shas:
             log(repo, "--no-walk=unsorted", *shas)

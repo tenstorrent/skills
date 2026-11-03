@@ -1099,6 +1099,91 @@ def test_a_code_hop_clone_does_not_count_upstream_commits_it_pulled_during_its_r
     assert chaincap.code_commits(q, p.db.task(hop)) == 2
 
 
+def _old_repo_at(path):
+    """A git repo at `path` with one old commit (outside every run window)."""
+    old = {**os.environ, "GIT_COMMITTER_DATE": "@1000000000 +0000", "GIT_AUTHOR_DATE": "@1000000000 +0000"}
+    path.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(path)], check=True)
+    (path / "base.py").write_text("base\n")
+    _git_out(path, "add", ".")
+    subprocess.run(["git", "-C", str(path), *_IDENT, "commit", "-qm", "base"], check=True, env=old)
+    return path
+
+
+def _commit_now_in(path, name):
+    (path / name).write_text(name + "\n")
+    _git_out(path, "add", ".")
+    _git_out(path, *_IDENT, "commit", "-qm", name)
+
+
+def test_code_hop_commits_are_found_in_a_worktree_outside_the_default_folder(env, tmp_path):
+    """The project root is no git repo and no branch is recorded: the hop's linked worktree at
+    <root>/<other>/t<id> counts its in-window commits; the repo's own upstream commits and its
+    out-of-window base do not; a hop with no commit there counts 0."""
+    from ttp import chaincap
+    p = make(env)
+    plain = tmp_path / "plain-root"
+    repo = _old_repo_at(plain / "src")
+    q = types.SimpleNamespace(db=p.db, root=plain, worktrees=plain / "tt-project" / "worktrees")
+    root = _chain_root(p, "port", 1.0)
+    hop = _chain_hop(p, root, "continue: port", 1.0)
+    idle = _chain_hop(p, hop, "continue: port more", 1.0)
+    for tid in (hop, idle):
+        _git_out(repo, "worktree", "add", "-q", "-b", f"work-{tid}", str(plain / "other" / f"t{tid}"))
+    _commit_now_in(repo, "upstream.py")   # upstream in the window, on no hop's branch
+    _commit_now_in(plain / "other" / f"t{hop}", "mine.py")
+    assert [t.name for t in chaincap.own_trees(q, p.db.task(hop))] == [f"t{hop}"]
+    assert chaincap.code_commits(q, p.db.task(hop)) == 1
+    assert chaincap.progress(q, chaincap.chain(p.db, hop), 1) == "1 new commit"
+    assert chaincap.code_commits(q, p.db.task(idle)) == 0
+    assert chaincap.progress(q, chaincap.chain(p.db, idle), 2) == ""
+    # A run that ended before the commit: out of the window, so nothing counts.
+    now = time.time()
+    p.db.x("INSERT INTO runs(task, role, started, ended) VALUES(?,?,?,?)", (hop, "worker", now - 600, now - 300))
+    assert chaincap.code_commits(q, p.db.task(hop)) == 0
+
+
+def test_code_hop_commits_read_the_work_tree_its_run_recorded_and_no_lookalike_directory(env, tmp_path):
+    """The run's recorded cwd (any name, any depth under the root) is the hop's work tree; a t<id>
+    directory that is a plain folder inside another repo, a hidden or symlinked one, one deeper than
+    TREE_DEPTH, and a recorded cwd outside the project root or at it add nothing."""
+    from ttp import chaincap
+    p = make(env)
+    plain = tmp_path / "plain-root"
+    repo = _old_repo_at(plain / "src")
+    outside = _old_repo_at(tmp_path / "elsewhere" / "repo")
+    q = types.SimpleNamespace(db=p.db, root=plain, worktrees=plain / "tt-project" / "worktrees")
+    root = _chain_root(p, "port", 1.0)
+    hop = _chain_hop(p, root, "continue: port", 1.0)
+    name = f"t{hop}"
+    _commit_now_in(repo, "upstream.py")
+    (repo / name).mkdir()   # a plain folder inside another repo: its HEAD is not the hop's
+    hidden = _old_repo_at(plain / ".cache" / name)
+    deep = _old_repo_at(plain / "a" / "b" / "c" / name)
+    real = _old_repo_at(tmp_path / "linked" / name)
+    (plain / "link").mkdir()
+    (plain / "link" / name).symlink_to(real)
+    _commit_now_in(outside, "outside.py")
+    for d in (hidden, deep, real):
+        _commit_now_in(d, "lookalike.py")
+    assert chaincap.own_trees(q, p.db.task(hop)) == []
+    assert chaincap.code_commits(q, p.db.task(hop)) == 0
+    # Recorded working directories: one outside the root and the root itself add nothing; the one
+    # deep under the root, named anything, is the hop's own.
+    work = _old_repo_at(plain / "x" / "y" / "z" / "w" / "mywork")
+    _commit_now_in(work, "mine.py")
+    (work / "sub").mkdir()
+    now = time.time()
+    for i, cwd in enumerate((outside, plain, work / "sub")):
+        d = tmp_path / f"run-{i}"
+        d.mkdir()
+        (d / "run.json").write_text(json.dumps({"cwd": str(cwd)}))
+        p.db.x("INSERT INTO runs(task, role, started, ended, dir) VALUES(?,?,?,?,?)",
+               (hop, "worker", now - 60, now + 60, str(d)))
+    assert chaincap.own_trees(q, p.db.task(hop)) == [work.resolve()]
+    assert chaincap.code_commits(q, p.db.task(hop)) == 1
+
+
 def test_a_non_code_hop_with_new_metrics_still_gets_its_continue_queued(env):
     from ttp import chaincap
     p = make(env)
