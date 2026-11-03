@@ -147,6 +147,12 @@ def compare_logits(reference: torch.Tensor, candidate: torch.Tensor) -> Dict[str
 
 def evaluate_case(stats: Dict[str, Any], thresholds: Dict[str, float]) -> List[str]:
     reasons = []
+    for name in ("pcc_mean", "pcc_min", "top1_agreement"):
+        value = stats[name]
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            reasons.append(f"{name} is not a finite number ({value!r})")
+    if reasons:
+        return reasons
     if stats["pcc_mean"] < thresholds["pcc_mean_min"]:
         reasons.append(f"pcc_mean {stats['pcc_mean']:.4f} < {thresholds['pcc_mean_min']}")
     if stats["pcc_min"] < thresholds["pcc_min_min"]:

@@ -6,7 +6,8 @@ import json
 import pytest
 
 from readiness_check import prefix_cache_check, run_vllm_server
-from readiness_check.prefill_burst import attach_serial_reference
+from readiness_check import prefill_burst
+from readiness_check.prefill_burst import attach_serial_reference, run_with_prefix_cache_state
 from readiness_check.prefix_cache_check import (
     PREFIX_CACHE_THRESHOLDS,
     _counter_delta,
@@ -231,3 +232,69 @@ def test_output_dir_defaults_to_the_gate_root_and_can_be_redirected(tmp_path):
         ["--model-dir", str(tmp_path / "model"), "--hf-model", "org/model", "--output-dir", str(tmp_path / "tracked")]
     )
     assert run_vllm_server.resolve_output_dir(redirected.model_dir, redirected.output_dir) == (tmp_path / "tracked").resolve()
+
+
+def test_attached_stage_without_server_url_is_a_usage_error(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["run_vllm_server", "--stages", "prefill_burst", "--model-dir", "m", "--hf-model", "org/model"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        run_vllm_server._main()
+    assert exc.value.code == 2
+    assert "--server-url is required when `serve` is not in --stages" in capsys.readouterr().err
+
+
+def _counter_sequence(monkeypatch, values, *, reset=True):
+    calls = iter(values)
+    monkeypatch.setattr(prefix_cache_check, "_reset_prefix_cache", lambda url: reset)
+    monkeypatch.setattr(prefix_cache_check, "_fetch_prefix_cache_counters", lambda url: next(calls))
+
+
+def test_burst_arm_records_a_cold_prefix_cache(monkeypatch):
+    _counter_sequence(
+        monkeypatch,
+        [
+            {"vllm:prefix_cache_queries": 100.0, "vllm:prefix_cache_hits": 50.0},
+            {"vllm:prefix_cache_queries": 4196.0, "vllm:prefix_cache_hits": 50.0},
+        ],
+    )
+    order = []
+    summary = run_with_prefix_cache_state("http://server", lambda: order.append("run") or {"ttft_ms": {"p99": 1.0}})
+    assert order == ["run"]
+    assert summary["prefix_cache"] == {"reset": True, "queries": 4096.0, "hits": 0.0, "hit_rate": 0.0}
+
+
+def test_burst_arm_records_a_warm_cache_and_a_missing_metrics_endpoint(monkeypatch):
+    _counter_sequence(
+        monkeypatch,
+        [
+            {"vllm:prefix_cache_queries": 0.0, "vllm:prefix_cache_hits": 0.0},
+            {"vllm:prefix_cache_queries": 4096.0, "vllm:prefix_cache_hits": 4000.0},
+        ],
+        reset=False,
+    )
+    warm = run_with_prefix_cache_state("http://server", lambda: {})
+    assert warm["prefix_cache"]["reset"] is False
+    assert warm["prefix_cache"]["hit_rate"] == pytest.approx(4000 / 4096)
+
+    def unreachable(url):
+        raise RuntimeError("no /metrics")
+
+    monkeypatch.setattr(prefix_cache_check, "_fetch_prefix_cache_counters", unreachable)
+    absent = run_with_prefix_cache_state("http://server", lambda: {})
+    assert absent["prefix_cache"] == {"reset": False, "queries": None, "hits": None, "hit_rate": None}
+
+
+def test_attach_serial_reference_carries_the_serial_arm_cache_state(tmp_path):
+    config = {"prompt_len": 128, "output_len": 32, "num_requests": 32, "concurrency": 32}
+    serial = {
+        "ttft_ms": {"p99": 5000.0, "mean": 2500.0},
+        "config": config,
+        "prefix_cache": {"reset": True, "queries": 4096, "hits": 0, "hit_rate": 0.0, "extra": "dropped"},
+    }
+    summary = attach_serial_reference(tmp_path / "burst.json", {"ttft_ms": {"p99": 2000.0}, "config": dict(config)}, serial, None)
+    assert summary["serial_reference"]["serial_prefix_cache"] == {"reset": True, "queries": 4096, "hits": 0, "hit_rate": 0.0}
+    plain = attach_serial_reference(tmp_path / "plain.json", {"ttft_ms": {}, "config": dict(config)}, {"ttft_ms": {}, "config": config}, None)
+    assert "serial_prefix_cache" not in plain["serial_reference"]
+

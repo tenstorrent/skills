@@ -31,17 +31,26 @@ def contract(status='supported', reason=None):
 def resume(status='pass', control_failed=True, thresholds=None):
     if thresholds is None:
         thresholds = {'pcc_mean_min': 0.99, 'pcc_min_min': 0.98, 'top1_min': 0.98, 'control_min_window': 64}
+    control = {'top1_agreement': 0.1 if control_failed else 0.99, 'failed_as_expected': control_failed}
     return {'status': status, 'reasons': [], 'thresholds': thresholds, 'cases': [
         {'length': 2560, 'start': 128, 'kind': 'lcm_aligned', 'pass': status == 'pass',
-         'controls': {'no_history': {'top1_agreement': 0.1 if control_failed else 0.99,
-                                     'failed_as_expected': control_failed}}}]}
+         'controls': {'no_history': dict(control), 'fresh_suffix': dict(control)}}]}
 
 
-def burst(ratio=0.4, completed=32, with_reference=True, mean_ratio=None, config_matches=True):
+def cold_cache(hit_rate=0.0):
+    return {'reset': True, 'queries': 4096, 'hits': int(4096 * hit_rate), 'hit_rate': hit_rate}
+
+
+def burst(ratio=0.4, completed=32, with_reference=True, mean_ratio=None, config_matches=True,
+          burst_cache=cold_cache(), serial_cache=cold_cache()):
     data = {'completed_requests': completed, 'config': {'num_requests': 32}, 'ttft_ms': {'p99': 1000.0}}
+    if burst_cache is not None:
+        data['prefix_cache'] = burst_cache
     if with_reference:
         data['serial_reference'] = {'ttft_ratio_p99': ratio, 'ttft_ratio_mean': ratio if mean_ratio is None else mean_ratio,
                                     'config_matches': config_matches}
+        if serial_cache is not None:
+            data['serial_reference']['serial_prefix_cache'] = serial_cache
     return data
 
 
@@ -207,3 +216,57 @@ def test_unreadable_json_is_a_checker_error(tmp_path):
     write(model / 'readiness_vllm/prefix_cache_check.json', '{not json')
     assert run(model).returncode == 3
     assert run(model, '--stage', 'bogus').returncode == 3
+
+
+def test_malformed_artifact_schemas_are_checker_errors(tmp_path):
+    listed = tmp_path / 'listed'
+    full_evidence(listed, summary=[])
+    result = run(listed)
+    assert result.returncode == 3, result.stderr
+    assert 'vllm_run_summary.json: top level must be a JSON dict' in result.stderr
+    assert 'Traceback' not in result.stderr
+    bad_case = resume()
+    bad_case['cases'] = ['not a case']
+    cased = tmp_path / 'cased'
+    full_evidence(cased, resume=bad_case)
+    result = run(cased)
+    assert result.returncode == 3, result.stderr
+    assert 'cases[0] must be a JSON dict' in result.stderr
+
+
+def test_final_resume_evidence_needs_both_negative_controls(tmp_path):
+    one = resume()
+    del one['cases'][0]['controls']['fresh_suffix']
+    model = tmp_path / 'one-control'
+    full_evidence(model, resume=one)
+    result = run(model)
+    assert result.returncode == 2, result.stderr
+    assert "without ['fresh_suffix']" in result.stderr
+    narrow = resume()
+    narrow['cases'].append({'length': 400, 'start': 399, 'kind': 'last_token', 'pass': True, 'controls': {}})
+    both = tmp_path / 'narrow-extra'
+    full_evidence(both, resume=narrow)
+    assert run(both).returncode == 0
+
+
+def test_burst_arms_must_run_on_a_cold_prefix_cache(tmp_path):
+    warm = tmp_path / 'warm'
+    full_evidence(warm, burst=burst(burst_cache=cold_cache(0.9)))
+    result = run(warm, '--stage', 'vllm')
+    assert result.returncode == 2, result.stderr
+    assert 'burst arm measured with a warm prefix cache' in result.stderr
+    warm_serial = tmp_path / 'warm-serial'
+    full_evidence(warm_serial, burst=burst(serial_cache=cold_cache(0.5)))
+    result = run(warm_serial, '--require-burst')
+    assert result.returncode == 2
+    assert 'serial arm measured with a warm prefix cache' in result.stderr
+    absent = tmp_path / 'absent'
+    full_evidence(absent, burst=burst(burst_cache=None, serial_cache=None))
+    result = run(absent, '--require-burst')
+    assert result.returncode == 1, result.stderr
+    assert 'no prefix-cache state for the burst arm' in result.stderr
+    assert 'no prefix-cache state for the serial arm' in result.stderr
+    cold = tmp_path / 'cold'
+    full_evidence(cold)
+    assert run(cold, '--require-burst').returncode == 0
+

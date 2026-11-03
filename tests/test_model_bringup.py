@@ -221,7 +221,9 @@ def test_gates_fail_critical_for_malformed_serving_contract(installed, stage, fi
         [{'prompt': 'p', 'greedy_completion': completion, 'sampled_completion': completion}]))
     (model / 'readiness_vllm/vllm_prefill_burst_benchmark.json').write_text(json.dumps(
         {'completed_requests': 32, 'config': {'num_requests': 32}, 'ttft_ms': {'p99': 1000.0},
-         'serial_reference': {'ttft_ratio_p99': 0.4, 'ttft_ratio_mean': 0.4, 'config_matches': True}}))
+         'prefix_cache': {'reset': True, 'queries': 4096, 'hits': 0, 'hit_rate': 0.0},
+         'serial_reference': {'ttft_ratio_p99': 0.4, 'ttft_ratio_mean': 0.4, 'config_matches': True,
+                              'serial_prefix_cache': {'reset': True, 'queries': 4096, 'hits': 0, 'hit_rate': 0.0}}}))
     (doc / 'context_contract.json').write_text(json.dumps({'hf_advertised_context': 8192, 'current_supported_context': 8192}))
     contract = valid_serving_contract()
     (doc / 'full_model/logprobs.log').write_text('ok')

@@ -50,13 +50,28 @@ def resolve_model_dir(model_dir: Optional[str], hf_model: Optional[str]) -> Path
     raise CheckError("pass --model-dir or --hf-model")
 
 
-def load_json(path: Path) -> Optional[Any]:
+def load_json(path: Path) -> Optional[dict]:
     if not path.is_file():
         return None
     try:
-        return json.loads(path.read_text())
+        data = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         raise CheckError(f"{path}: unreadable JSON ({exc})") from exc
+    return expect(data, dict, path, "top level")
+
+
+def expect(value: Any, kind: type, path: Path, field: str) -> Any:
+    if not isinstance(value, kind):
+        raise CheckError(f"{path}: {field} must be a JSON {kind.__name__}, got {type(value).__name__}")
+    return value
+
+
+def optional(value: Any, kind: type, path: Path, field: str) -> Any:
+    return None if value is None else expect(value, kind, path, field)
+
+
+RESUME_CONTROLS = ("no_history", "fresh_suffix")
+BURST_WARM_HIT_RATE_MAX = 0.05
 
 
 def prefix_cache_row(contract: Any) -> Optional[dict]:
@@ -80,7 +95,8 @@ def exclusion_in(reason: Any) -> Optional[str]:
 def check_prefix_cache(model_dir: Path, row: dict, critical: list[str], advisory: list[str]) -> None:
     summary = load_json(model_dir / RUN_SUMMARY_PATH)
     served = load_json(model_dir / PREFIX_CACHE_PATH)
-    resume = load_json(model_dir / RESUME_CHECK_PATH)
+    resume_path = model_dir / RESUME_CHECK_PATH
+    resume = load_json(resume_path)
 
     if summary is None:
         critical.append(f"{RUN_SUMMARY_PATH} is missing; rerun run_vllm_server with the prefix_cache stage")
@@ -98,8 +114,8 @@ def check_prefix_cache(model_dir: Path, row: dict, critical: list[str], advisory
     else:
         if served.get("status") != "pass":
             critical.append(f"served prefix-cache check status is {served.get('status')!r}: {served.get('reasons')}")
-        long_resume = served.get("long_resume")
-        if not (isinstance(long_resume, dict) and long_resume.get("checked")):
+        long_resume = optional(served.get("long_resume"), dict, model_dir / PREFIX_CACHE_PATH, "long_resume")
+        if not (long_resume and long_resume.get("checked")):
             advisory.append(
                 "served check covered only one-token resumes (no long-resume comparison); "
                 "the generator-level resume check is the long-continuation proof. Set VLLM_SERVER_DEV_MODE=1 "
@@ -112,8 +128,8 @@ def check_prefix_cache(model_dir: Path, row: dict, critical: list[str], advisory
         status = resume.get("status")
         if status != "pass":
             critical.append(f"resumed-prefill check status is {status!r}: {resume.get('reasons')}")
-        thresholds = resume.get("thresholds")
-        if not isinstance(thresholds, dict):
+        thresholds = optional(resume.get("thresholds"), dict, resume_path, "thresholds")
+        if thresholds is None:
             advisory.append("resumed-prefill check records no thresholds; rerun it with the current runner")
         else:
             lowered = {
@@ -126,15 +142,30 @@ def check_prefix_cache(model_dir: Path, row: dict, critical: list[str], advisory
                     f"resumed-prefill check passed with thresholds below the defaults {RESUME_DEFAULT_THRESHOLDS}: "
                     f"{lowered}; keep a default-threshold run and margin probes beside it"
                 )
-        for case in resume.get("cases") or []:
-            for name, control in (case.get("controls") or {}).items():
+        cases = optional(resume.get("cases"), list, resume_path, "cases") or []
+        complete_cases = 0
+        for index, case in enumerate(cases):
+            expect(case, dict, resume_path, f"cases[{index}]")
+            controls = optional(case.get("controls"), dict, resume_path, f"cases[{index}].controls") or {}
+            label = f"L={case.get('length')} s={case.get('start')}"
+            for name, control in controls.items():
+                expect(control, dict, resume_path, f"cases[{index}].controls[{name}]")
                 if control.get("failed_as_expected") is False:
-                    critical.append(
-                        f"resume control {name} did not fail at L={case.get('length')} s={case.get('start')}; "
-                        "the check cannot detect a broken resume"
-                    )
-        if not any(case.get("controls") for case in resume.get("cases") or []):
-            critical.append("resumed-prefill check ran no negative control; widen --window or add a longer length")
+                    critical.append(f"resume control {name} did not fail at {label}; the check cannot detect a broken resume")
+            if not controls:
+                continue
+            missing = [name for name in RESUME_CONTROLS if "failed_as_expected" not in (controls.get(name) or {})]
+            if missing:
+                critical.append(
+                    f"resume case {label} ran controls {sorted(controls)} without {missing}; "
+                    "the final evidence must run both no_history and fresh_suffix"
+                )
+            else:
+                complete_cases += 1
+        if complete_cases == 0:
+            critical.append(
+                "resumed-prefill check ran no case with both negative controls; widen --window or add a longer length"
+            )
 
 
 def check_burst(
@@ -145,22 +176,38 @@ def check_burst(
     critical: list[str],
     advisory: list[str],
 ) -> None:
-    burst = load_json(model_dir / BURST_PATH)
+    burst_path = model_dir / BURST_PATH
+    burst = load_json(burst_path)
     sink = critical if require else advisory
     if burst is None:
         sink.append(f"{BURST_PATH} is missing; run the prefill_burst stage")
         return
     completed = burst.get("completed_requests")
-    requested = (burst.get("config") or {}).get("num_requests")
+    requested = (optional(burst.get("config"), dict, burst_path, "config") or {}).get("num_requests")
+    optional(burst.get("ttft_ms"), dict, burst_path, "ttft_ms")
     if completed != requested:
         critical.append(f"prefill burst completed {completed} of {requested} requests")
-    reference = burst.get("serial_reference")
-    if not isinstance(reference, dict):
+    reference = optional(burst.get("serial_reference"), dict, burst_path, "serial_reference")
+    if reference is None:
         sink.append("prefill burst has no serial_reference; rerun with --prefill-burst-serial-result <serial summary>")
         return
+    optional(reference.get("serial_ttft_ms"), dict, burst_path, "serial_reference.serial_ttft_ms")
     if reference.get("config_matches") is False:
         sink.append("prefill burst serial_reference was measured with a different workload config; rerun the serial pass")
         return
+    for arm, state in (
+        ("burst", optional(burst.get("prefix_cache"), dict, burst_path, "prefix_cache")),
+        ("serial", optional(reference.get("serial_prefix_cache"), dict, burst_path, "serial_reference.serial_prefix_cache")),
+    ):
+        if state is None:
+            advisory.append(f"prefill burst records no prefix-cache state for the {arm} arm; rerun it with the current runner")
+            continue
+        hit_rate = state.get("hit_rate")
+        if isinstance(hit_rate, (int, float)) and hit_rate > BURST_WARM_HIT_RATE_MAX:
+            critical.append(
+                f"prefill burst {arm} arm measured with a warm prefix cache (hit rate {hit_rate:.3f}); "
+                "the TTFT ratio is not a batching measurement"
+            )
     for key, limit, label in (("ttft_ratio_p99", ratio_max, "p99"), ("ttft_ratio_mean", mean_ratio_max, "mean")):
         ratio = reference.get(key)
         if not isinstance(ratio, (int, float)):
@@ -173,6 +220,7 @@ def run(model_dir: Path, *, stage: str, require_burst: bool, ratio_max: float, m
     contract = load_json(model_dir / CONTRACT_PATH)
     if contract is None:
         raise CheckError(f"Missing serving contract {model_dir / CONTRACT_PATH}")
+    expect(contract.get("rows"), list, model_dir / CONTRACT_PATH, "rows")
     row = prefix_cache_row(contract)
     critical: list[str] = []
     advisory: list[str] = []

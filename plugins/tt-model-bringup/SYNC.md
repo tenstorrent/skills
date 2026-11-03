@@ -204,3 +204,4 @@ watcher probe over every prepared batched shape, commit hooks before the first d
 commit, and `--output-dir` on the vLLM runner (`run_vllm_server.py`) so a tracked or A/B run does
 not overwrite the gate's `readiness_vllm/` artifacts.
 
+Review fixes: the runner keeps its parser for argument errors, the resumed-prefill gate rejects non-finite statistics, `check_prefill_features.py` returns a checker error on malformed artifacts and requires both negative controls, and the burst stage records the prefix-cache state of each arm so a warm cache cannot pass as a batching gain.

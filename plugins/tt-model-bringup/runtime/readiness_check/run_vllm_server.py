@@ -116,7 +116,7 @@ import requests
 from transformers import AutoTokenizer
 
 from readiness_check.mesh_device import MESH_SHAPES
-from readiness_check.prefill_burst import attach_serial_reference
+from readiness_check.prefill_burst import attach_serial_reference, run_with_prefix_cache_state
 from readiness_check.prefix_cache_check import (
     DEFAULT_PREFIX_CACHE_OUTPUT_TOKENS,
     DEFAULT_PREFIX_CACHE_PROMPT_TOKENS,
@@ -1143,7 +1143,8 @@ def resolve_output_dir(model_dir: Path, output_dir: Optional[Path]) -> Path:
 
 
 def _main() -> None:
-    args = _build_parser().parse_args()
+    parser = _build_parser()
+    args = parser.parse_args()
 
     stages: List[str] = args.stages
     serve_locally = STAGE_SERVE in stages
@@ -1337,24 +1338,27 @@ def _main() -> None:
             elif stage == STAGE_PREFILL_BURST:
                 serial_path = args.prefill_burst_serial_result.resolve() if args.prefill_burst_serial_result else None
                 serial = json.loads(serial_path.read_text()) if serial_path else None
-                burst_summary = _run_serving_benchmark(
-                    server_url=server_url,
-                    hf_model=args.hf_model,
-                    output_dir=output_dir,
-                    profile_name="prefill_burst",
-                    comparison_scope=(
-                        "32 short prompts submitted at once so the scheduler forms multi-row prefill steps. "
-                        "Compare TTFT against the same workload with batched prefill disabled; not a decode number."
+                burst_summary = run_with_prefix_cache_state(
+                    server_url,
+                    lambda: _run_serving_benchmark(
+                        server_url=server_url,
+                        hf_model=args.hf_model,
+                        output_dir=output_dir,
+                        profile_name="prefill_burst",
+                        comparison_scope=(
+                            "32 short prompts submitted at once so the scheduler forms multi-row prefill steps. "
+                            "Compare TTFT against the same workload with batched prefill disabled; not a decode number."
+                        ),
+                        raw_result_filename="vllm_prefill_burst_result.json",
+                        summary_filename="vllm_prefill_burst_benchmark.json",
+                        log_filename="vllm_prefill_burst_benchmark.log",
+                        prompt_len=DEFAULT_BURST_PROMPT_LEN,
+                        output_len=DEFAULT_BURST_OUTPUT_LEN,
+                        num_requests=DEFAULT_BURST_NUM_REQUESTS,
+                        concurrency=DEFAULT_BURST_CONCURRENCY,
+                        temperature=0.0,
+                        additional_args=additional_benchmark_args,
                     ),
-                    raw_result_filename="vllm_prefill_burst_result.json",
-                    summary_filename="vllm_prefill_burst_benchmark.json",
-                    log_filename="vllm_prefill_burst_benchmark.log",
-                    prompt_len=DEFAULT_BURST_PROMPT_LEN,
-                    output_len=DEFAULT_BURST_OUTPUT_LEN,
-                    num_requests=DEFAULT_BURST_NUM_REQUESTS,
-                    concurrency=DEFAULT_BURST_CONCURRENCY,
-                    temperature=0.0,
-                    additional_args=additional_benchmark_args,
                 )
                 attach_serial_reference(
                     output_dir / "vllm_prefill_burst_benchmark.json", burst_summary, serial, serial_path

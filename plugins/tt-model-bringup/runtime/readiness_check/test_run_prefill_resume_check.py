@@ -7,6 +7,8 @@ import torch
 from readiness_check.run_prefill_resume_check import (
     DEFAULT_THRESHOLDS,
     compare_logits,
+    evaluate_case,
+    evaluate_control,
     resume_points,
     run_case,
     summarize,
@@ -258,3 +260,13 @@ def test_output_on_pass_only_keeps_the_canonical_artifact(tmp_path, monkeypatch,
     else:
         assert json.loads(output.read_text())["status"] == "fail"
         assert not failed.exists()
+
+
+def test_non_finite_statistics_fail_the_gate_and_count_as_a_failed_control():
+    stats = {"pcc_mean": float("nan"), "pcc_min": float("nan"), "top1_agreement": 1.0, "last_top1_equal": True}
+    reasons = evaluate_case(stats, DEFAULT_THRESHOLDS)
+    assert reasons == ["pcc_mean is not a finite number (nan)", "pcc_min is not a finite number (nan)"]
+    assert evaluate_control(stats, DEFAULT_THRESHOLDS) is True
+    infinite = {"pcc_mean": 1.0, "pcc_min": 1.0, "top1_agreement": float("inf"), "last_top1_equal": True}
+    assert evaluate_case(infinite, DEFAULT_THRESHOLDS) == ["top1_agreement is not a finite number (inf)"]
+
