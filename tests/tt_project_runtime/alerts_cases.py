@@ -3626,7 +3626,8 @@ def test_a_restarted_daemon_kills_the_groups_its_predecessors_runs_left_and_runs
     assert p.db.one("SELECT last_run FROM schedules WHERE name='long'")["last_run"] is None
     d2 = dm.Daemon(p.base)   # d1 is gone: its tick never records that run
     row = _settle(d2, "long")
-    assert not _proc_alive(pid), "the earlier daemon's command was killed"
+    # SIGKILL lands asynchronously: on a loaded host the process can outlive the kill call briefly.
+    assert _wait_for(lambda: not _proc_alive(pid), 10), "the earlier daemon's command was killed"
     assert row["last_status"] == "ok (0 observations)", "the schedule ran once more, recorded once"
 
 

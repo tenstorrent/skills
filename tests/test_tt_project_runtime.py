@@ -45840,16 +45840,21 @@ def test_ps_cputime_parses():
 @pytest.mark.skipif(not pathlib.Path("/proc/self/stat").exists(), reason="needs /proc")
 def test_sampling_reads_the_cpu_time_of_the_jobs_own_process_tree():
     from ttp import jobuse
-    proc = subprocess.Popen([sys.executable, "-c", "import time\nt=time.time()\nwhile time.time()-t<0.5: pass\n"
-                             "time.sleep(30)"], start_new_session=True)
+    # The child burns until its own CPU time reaches 0.5 s (not for a fixed wall time: a loaded host gives
+    # it less CPU per second), bounded at 30 s, then says so and idles.
+    proc = subprocess.Popen([sys.executable, "-c", "import time\nt=time.time()\n"
+                             "while time.process_time()<0.5 and time.time()-t<30: pass\n"
+                             "print('burnt', flush=True)\ntime.sleep(60)"],
+                            stdout=subprocess.PIPE, text=True, start_new_session=True)
     try:
-        time.sleep(0.8)
+        assert proc.stdout.readline().strip() == "burnt"
         got = jobuse.sample(proc.pid)
         assert got and got["cpu"] >= 0.3 and got["start"] and got["dev"] is None
         assert jobuse.sample(proc.pid, ["/nonexistent/dev*"])["dev"] == 0
     finally:
         proc.kill()
         proc.wait()
+        proc.stdout.close()
 
 
 def _job_of_waiting_task(p, tid, requested, next_in=3.7 * 3600):
