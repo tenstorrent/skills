@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
 """A worker's `ttp lock <res> -- <cmd...>` is no way around `ttp host-run`'s allowlist.
 
 The Claude provider frees `ttp lock *` from the Bash sandbox by name (providers/claude.py FENCE_EXCLUDED)
@@ -10,6 +12,8 @@ worker (project.in_run):
 - the command it runs gets the kernel's no-new-privileges flag (no_new_privs), as in the sandbox: no
   setuid program it starts, by whatever route (a script, an interpreter), gains privileges. ssh, scp,
   rsync and broker clients need none."""
+from __future__ import annotations
+
 import os
 import re
 import shlex
