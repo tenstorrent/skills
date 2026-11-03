@@ -37,6 +37,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     cells,
     chaincap,
     channeltag,
+    charterpromise,
     configwho,
     convgate,
     chainprio,
@@ -512,6 +513,7 @@ EFFORT_EVENT_TRIGGERS = {
     "push_tip_failed": "costly",
     # conflicting instructions: an appended rule a standing Restrictions item would override
     "charter_conflict": "conflict", "charter_retry": "conflict", "grant_mismatch": "conflict",
+    charterpromise.EVENT: "conflict",
     "restriction_tools": "conflict",
     # the limits the plan was made against changed: re-plan (budgetkind.py)
     budgetkind.KIND: "budget",
@@ -2122,9 +2124,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     batch_obls: list[str] = []
     delivered: list[tuple[int, str | None, list]] = []   # replies with `delivers` (obligations.deliver)
     explicit: set[int] = set()   # replies naming `owners` or `delivers`: their promise is never auto-attached
-    # config_set goes first so a cap raised in this turn counts for this turn's task_add actions.
+    # config_set goes first so a cap raised in this turn counts for this turn's task_add actions, then
+    # charter_update so a task added or updated in this turn reads the new charter.
     # The index stays the original one so replay keys do not change.
-    order = sorted(enumerate(actions), key=lambda ia: (ia[1] or {}).get("type") != "config_set")
+    first = {"config_set": 0, "charter_update": 1}
+    order = sorted(enumerate(actions), key=lambda ia: first.get((ia[1] or {}).get("type"), 2))
+    announced = charterpromise.announcing(actions)   # named in a refused charter_update's charter_retry
     turn_asks: list[tuple[int, int]] = []   # (position in order, ask id) of this turn's asks, for `waits_on ask:new`
     new_ask_holds: list[tuple[int, dict, dict]] = []   # (position, task before, update) waiting for a later ask
     cfg_refused: dict[str, str] = {}   # config_set key -> why it was rejected (sorted first, so memory_add sees it)
@@ -3278,7 +3283,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if isinstance(e, DraftGateRejection) else ""
             problems.append(f"{t}: {e}{sent_as}"[:RESEND_CHARS] if sent_as else f"{t}: {e}")
             if t == "charter_update":
-                _charter_retry_now(p, a, str(e), key)
+                _charter_retry_now(p, a, str(e), key, announced)
             if t == "config_set" and a.get("key"):
                 cfg_refused[str(a["key"])] = str(e)
     for k, before, upd in new_ask_holds:
@@ -3310,6 +3315,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                        [a for i, a in enumerate(actions) if i not in failed and isinstance(a, dict)], turn=turn)
     except Exception as e:
         notes.append(f"cause check not recorded: {type(e).__name__}: {str(e)[:200]}")
+    try:   # flag only: a reply announcing a charter change with no charter_update in its batch
+        charterpromise.check(db, [(mid, "reply" if mid in replies else "notify", text) for mid, _, text in sent],
+                             actions, turn=turn)
+    except Exception as e:
+        notes.append(f"charter announcement not checked: {type(e).__name__}: {str(e)[:200]}")
     try:   # flag only: a reply that does not answer first or leans on internal terms (plainreply)
         plainreply.check(db, [(mid, "reply" if mid in replies else "notify", text) for mid, _, text in sent],
                          p.config(), turn=turn)
@@ -6492,12 +6502,15 @@ CHARTER_RETRY_NOW_MAX = 2   # immediate retries per change: a resend refused aga
 _CHARTER_FIXABLE_RE = re.compile(r"\bresend\b|send that text|`both_hold`|quote the exact text", re.I)
 
 
-def _charter_retry_now(p: Project, a: dict, err: str, key: str | None) -> str:
+def _charter_retry_now(p: Project, a: dict, err: str, key: str | None,
+                       announced: list[tuple[str, str]] | None = None) -> str:
     """Queue a charter_retry event for a refused charter_update whose error names a fix the
     coordinator can apply (_CHARTER_FIXABLE_RE), so the next turn makes it at once instead of the
     change waiting for a digest or a day (reraise_charter_changes). At most CHARTER_RETRY_NOW_MAX
     per change (section, quote, replaces, text), once per turn: it cannot loop. A refusal that needs
-    the user's word or concerns relayed text is left to the digest. Returns the event text, or ""."""
+    the user's word or concerns relayed text is left to the digest. `announced`: the batch's replies
+    that told the chat the change was being made (charterpromise.announcing), named in the event.
+    Returns the event text, or ""."""
     if not _CHARTER_FIXABLE_RE.search(err) or "Relayer context" in err:
         return ""
     cid = hashlib.sha256("\n".join(_ws(str(a.get(k) or "")) for k in ("section", "quote", "replaces", "text"))
@@ -6518,7 +6531,7 @@ def _charter_retry_now(p: Project, a: dict, err: str, key: str | None) -> str:
         msg = (f"A charter_update was refused ({sent}): "
                f"{clip(err, RESEND_CHARS if RESEND_MARK in err else 1200)}. Apply the fix that error names "
                f"now, in this turn (immediate retry {mine['n']} of {CHARTER_RETRY_NOW_MAX}); if the user has since "
-               "said otherwise, leave it.")
+               "said otherwise, leave it." + charterpromise.quote_lines(announced or []))
         db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
              (time.time(), "harness", "charter_retry", "normal", msg, "queued"))
     return msg

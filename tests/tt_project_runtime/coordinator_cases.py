@@ -16802,7 +16802,8 @@ def test_forbidden_data_patterns_refuse_memory_and_charter_writes_and_never_reac
         {"type": "memory_add", "text": "A pointer only", "title": "WidgetCo totals"},
         {"type": "charter_update", "section": "Policies", "text": "Spend at most $900 a month."}], turn=2)
     assert len(probs) == 3 and all("refused" in x and "nothing was written" in x for x in probs), probs
-    assert "'client names'" in probs[0] and "forbidden.txt line pattern 1" in probs[1]
+    mem = [x for x in probs if x.startswith("memory_add")]   # charter_update applies first (batch order)
+    assert "'client names'" in mem[0] and "forbidden.txt line pattern 1" in mem[1], probs
     assert not any(s in x for x in probs for s in ("ACME", "WidgetCo", "$900"))
     with pytest.raises(SystemExit), contextlib.redirect_stdout(io.StringIO()):
         cli.main(["memory", "demo", "Merged: paid $77.", "--supersedes", next(p.memory_dir.glob("*rig*.md")).stem])
