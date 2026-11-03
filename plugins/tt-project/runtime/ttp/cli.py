@@ -3817,12 +3817,12 @@ def _checks_replace(p: Project | None, me: Path | None, out, arrived: float) -> 
         row = p.db.one("SELECT dir, task FROM runs WHERE id=?", (int(old["run"]),))
         if not row or not row["dir"] or str(row["task"]) != str(rec["task"]):
             continue
-        if _read_checks_pid(Path(row["dir"])).get("pid") != old.get("pid"):
+        if (info := _read_checks_pid(Path(row["dir"]))).get("pid") != old.get("pid"):
             continue
         why = (f"superseded by run {rec['run']} of the same task on newer head {str(rec['head'])[:12]} "
                f"(this run checked {str(old.get('head'))[:12]}): one task holds one checks lane")
-        if jobstop.end_checks(p, Path(row["dir"]), why, int(rec["task"])) is None:
-            continue
+        if jobstop.end_checks(p, Path(row["dir"]), why, int(rec["task"])) is None or _checks_alive(info):
+            continue   # not running, or it could not be stopped (another PID namespace): it keeps its lane
         checkjoin.update(Path(checkjoin.folder(p.state)) / f"{old['id']}.json", phase=checkjoin.SUPERSEDED,
                          superseded_by={"id": rec["id"], "run": rec["run"], "head": rec["head"]})
         line = (f"replaced: stopped this task's running checks on older head {str(old.get('head'))[:12]} in run "
