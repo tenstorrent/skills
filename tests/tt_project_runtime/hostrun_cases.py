@@ -141,3 +141,21 @@ def test_sudo_failing_in_the_sandbox_names_the_host_run_route(monkeypatch, error
         assert out is None
         return
     assert "ttp host-run --" in out["hookSpecificOutput"]["additionalContext"]
+
+
+def test_host_run_covers_a_read_only_sudo_netns_bmc_query_and_refuses_its_other_verbs(env, monkeypatch, capfd, tmp_path):
+    # The shape a project allows for a read-only BMC query: sudo, then a network namespace, then
+    # ipmitool reads. A stand-in `sudo` records its argv, so no real privilege is needed.
+    from ttp import hostrun
+    sudo = tmp_path / "sudo"
+    sudo.write_text(f"#!{sys.executable}\nimport sys\nprint('ran:', ' '.join(sys.argv[1:]))\n")
+    sudo.chmod(0o755)
+    reads = [[str(sudo), "-n", "ip", "netns", "exec", "mgmt", "ipmitool", *verb] for verb in (["mc", "info"], ["sel", "info"])]
+    p = _hostrun_setup(env, monkeypatch, [shlex.join(r) for r in reads])
+    for r in reads:
+        assert _hostrun_with_daemon(p, r, []) == 0
+        assert "ran: -n ip netns exec mgmt ipmitool " + " ".join(r[-2:]) in capfd.readouterr().out
+    for other in (["chassis", "power", "cycle"], ["mc", "reset", "cold"], ["sel", "clear"]):
+        assert hostrun.request(p, reads[0][:-2] + other) == hostrun.REFUSED
+        assert "refused" in capfd.readouterr().err
+    assert hostrun.request(p, [str(sudo), "-n", "ip", "netns", "exec", "other", "ipmitool", "mc", "info"]) == hostrun.REFUSED
