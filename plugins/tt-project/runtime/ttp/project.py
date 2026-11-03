@@ -544,8 +544,9 @@ OPEN_SECTIONS = {"resources"}           # any name below is fine
 # write_fence: false runs the provider's workers without its optional write fence (Claude's Bash
 # sandbox, Provider.fence_args); default on where the host can run it.
 # loopback_ports: extra host loopback ports fenced workers reach (loopproxy.ports_env), or false for none.
+# write_dirs: extra directories inside the project root fenced workers may write (write_dirs below).
 PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "write_fence", "mcp_servers", "mcp_withheld",
-                 "disallowed_tools", "loopback_ports",
+                 "disallowed_tools", "loopback_ports", "write_dirs",
                  # providers.chat only (chatbridge.py): the `ttp secret endpoint` alias holding the key,
                  # the base URL saved with it, a max_tokens cap and the model's context_window (also per tier).
                  # route_cooldown_s: how long a tier routed to it (tiers.<tier>.route, route.py) runs on the
@@ -554,6 +555,39 @@ PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "write_f
                  # slot before it starts on the core provider (route.wait_s).
                  "endpoint", "base_url", "max_tokens", "context_window", "route_cooldown_s", "effort_fields",
                  "route_wait_s"}
+
+
+def write_dirs(root: Path, guard: Path, value: Any) -> tuple[list[str], list[str], list[str]]:
+    """providers.<name>.write_dirs: (paths granted, "entry: why" refused, "entry: why" skipped as missing).
+    Each entry is relative to the project `root` or absolute inside it, symlinks resolved. Refused: one
+    outside the root, the root itself, or one inside or holding `guard` (the tt-project folder with the
+    charter, memory, config and state). A missing directory is skipped, never created."""
+    granted: list[str] = []
+    refused: list[str] = []
+    missing: list[str] = []
+    if value in (None, [], ""):
+        return granted, refused, missing
+    if not isinstance(value, list):
+        return granted, [f"{json.dumps(value)[:60]}: not a list of paths"], missing
+    root, guard = root.resolve(), guard.resolve()
+    for entry in value:
+        if not isinstance(entry, str) or not entry.strip():
+            refused.append(f"{json.dumps(entry)[:60]}: not a path")
+            continue
+        given = Path(os.path.expanduser(entry.strip()))
+        given = given if given.is_absolute() else root / given
+        real = given.resolve()
+        if real == root:
+            refused.append(f"{entry}: the project root itself (that would turn the write fence off)")
+        elif root not in real.parents:
+            refused.append(f"{entry}: resolves to {real}, outside the project root {root}")
+        elif real == guard or guard in real.parents or real in guard.parents:
+            refused.append(f"{entry}: covers the project's charter, memory, config or state ({guard})")
+        elif not real.is_dir():
+            missing.append(f"{entry}: {real} is not an existing directory")
+        else:
+            granted += [p for p in dict.fromkeys([str(real), str(given)]) if p not in granted]
+    return granted, refused, missing
 
 
 def _known_keys(path: list[str]) -> set[str] | None:

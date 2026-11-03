@@ -1898,6 +1898,13 @@ queues behind routine work; nothing running is interrupted:
   127.0.0.1), and macOS gets no forwarders. For anything still blocked, a bare `ssh` or `ttp lock`
   command runs outside the sandbox, and so do daemon-run command schedules. Codex workers are
   unchanged: their workspace-write sandbox runs with network access on.
+- `providers.<name>.write_dirs: ["notes", ...]` adds directories inside the project root to the
+  write fence's writable roots for that provider's workers, while the fence stays on for everything
+  else. Each entry is relative to the project root or an absolute path inside it, symlinks resolved.
+  An entry that resolves outside the project root, is the project root itself, or covers the
+  tt-project folder (charter, memory, config, state) is skipped with an alert naming it and why; a
+  directory that does not exist is skipped with a low alert, never created. Unset, the roots are
+  unchanged.
 - `providers.claude.disallowed_tools: ["mcp__<server>__<tool>", "mcp__<server>__*", ...]` lists tools
   Claude workers and reviewers may not call, on top of the tools the harness always denies them; a
   trailing `*` covers every tool whose name starts so, e.g. every tool of one server. Use it to keep

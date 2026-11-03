@@ -327,3 +327,62 @@ def test_audit_counts_claude_runs_that_hit_the_mount_race(env, tmp_path):
     assert (got["runs"], got["hit"], got["ids"]) == (7, 2, ids[:2])
     assert any(ln.startswith("sandbox mount races: 2 of 7 Claude runs (29%)") for ln in audit.lines(p.db, now, p=p))
     assert audit.report(p.db, now, p=p)["mount_races"]["hit"] == 2
+
+def test_write_dirs_grants_only_directories_inside_the_project_root(tmp_path):
+    from ttp.project import write_dirs
+    root = tmp_path / "proj"
+    base = root / "tt-project"
+    for d in ("notes", "data/out", "tt-project/harness/memory", "tt-project/state"):
+        (root / d).mkdir(parents=True)
+    (tmp_path / "elsewhere").mkdir()
+    (root / "link-out").symlink_to(tmp_path / "elsewhere")
+    (root / "link-in").symlink_to(root / "notes")
+    (root / "link-state").symlink_to(base / "state")
+    (root / "file.txt").write_text("x")
+    assert write_dirs(root, base, None) == ([], [], []), "unset: no extra roots"
+    granted, refused, missing = write_dirs(root, base, [
+        "notes", str(root / "data/out"), "link-in", "link-out", "../elsewhere", str(tmp_path / "elsewhere"), ".",
+        str(root), "data/..", "tt-project", "tt-project/state", "tt-project/harness/memory", "link-state",
+        "absent", "file.txt", 3])
+    assert granted == [str((root / "notes").resolve()), str((root / "data/out").resolve()), str(root / "link-in")]
+    why = {r.split(": ", 1)[0]: r.split(": ", 1)[1] for r in refused}
+    for e in ("link-out", "../elsewhere", str(tmp_path / "elsewhere")):
+        assert "outside the project root" in why[e], (e, why)
+    for e in (".", str(root), "data/.."):
+        assert "project root itself" in why[e], (e, why)
+    for e in ("tt-project", "tt-project/state", "tt-project/harness/memory", "link-state"):
+        assert "charter, memory, config or state" in why[e], (e, why)
+    assert "3" in why and len(refused) == 11
+    assert [m.split(":")[0] for m in missing] == ["absent", "file.txt"]
+    assert not (root / "absent").exists(), "a missing directory is never created"
+    assert write_dirs(root, base, "notes")[1] == ['"notes": not a list of paths']
+
+
+def test_write_dirs_reach_the_fenced_worker_and_refusals_alert(env, monkeypatch):
+    from ttp.providers import claude
+    monkeypatch.setattr(claude.Claude, "binary", lambda self: "/usr/bin/true")   # never a real agent
+    monkeypatch.setattr(claude.sys, "platform", "linux")
+    monkeypatch.setattr(claude, "find_binary", lambda b: f"/usr/bin/{b}")
+    from ttp.daemon import Daemon
+    alerts: dict = {}
+    monkeypatch.setattr(Daemon, "alert", lambda self, key, text, **kw: alerts.__setitem__(key, (text, kw)))
+    p = make(env)
+    wt = env["tmp"] / "wt"
+    subprocess.run(["git", "-C", str(env["repo"]), "worktree", "add", "-q", str(wt)], check=True)
+    before = _settings(_claude_launch(env, p, wt)["argv"])["sandbox"]["filesystem"]["allowWrite"]
+    assert not alerts, "unset: nothing to say"
+    (p.root / "notes").mkdir()
+    p.set_config("providers", {**p.config()["providers"], "claude": {
+        **p.config()["providers"].get("claude", {}), "write_dirs": ["notes", "..", "tt-project/harness", "gone"]}})
+    spec = _claude_launch(env, p, wt)
+    sandbox = _settings(spec["argv"])["sandbox"]
+    allow = sandbox["filesystem"]["allowWrite"]
+    assert [a for a in allow if a not in before] == [str((p.root / "notes").resolve())], "only the allowed dir is added"
+    assert set(before) <= set(allow)
+    assert sandbox.get("enabled", True) is not False and spec["env"].get("TMPDIR"), "the fence stays on"
+    alerts = {k: v[0] for k, v in alerts.items() if k.startswith("write_dirs")}
+    assert set(alerts) == {"write_dirs_refused:claude", "write_dirs_missing:claude"}, alerts
+    assert "..: " in alerts["write_dirs_refused:claude"] and "tt-project/harness: covers" in alerts["write_dirs_refused:claude"]
+    assert "gone:" in alerts["write_dirs_missing:claude"] and not (p.root / "gone").exists()
+    from ttp.project import config_problems
+    assert not [x for x in config_problems(p.raw_config()) if "write_dirs" in x], "a known key"

@@ -59,6 +59,8 @@ them keeps the older behaviour.
 
 The project chooses which plugin directories load, per provider, in
 `providers.<name>.plugin_dirs`.
+Extra directories inside the project root that fenced workers may write go in
+`providers.<name>.write_dirs` (see the guide); the fence stays on for the rest.
 
 ## Open gaps
 

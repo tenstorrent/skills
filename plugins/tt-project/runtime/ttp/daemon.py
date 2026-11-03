@@ -201,7 +201,7 @@ from .db import (
     unplanned_abrupt,
     without_deferral,
 )
-from .project import rebase_replace
+from .project import rebase_replace, write_dirs
 from .project import (
     Project,
     bad_sections,
@@ -2732,6 +2732,18 @@ class Daemon:
                 roots += list(dict.fromkeys([str(checkcap.slot_dir()), str(checkcap.slot_dir().resolve())]))
             except OSError:
                 pass   # `ttp checks` then says plainly that it cannot write the slots
+            # The project's own extra write roots (providers.<name>.write_dirs), never its tt-project folder.
+            extra, refused, absent = write_dirs(self.p.root, self.p.base,
+                                                self.cfg["providers"].get(provider, {}).get("write_dirs"))
+            roots += [r for r in extra if r not in roots]
+            if refused:
+                self.alert(f"write_dirs_refused:{provider}",
+                           f"Workers run without these providers.{provider}.write_dirs entries: "
+                           f"{'; '.join(refused)}. Fix them in project.json.", severity="normal", every_s=86400)
+            if absent:
+                self.alert(f"write_dirs_missing:{provider}",
+                           f"Skipped providers.{provider}.write_dirs entries (not created): {'; '.join(absent)}.",
+                           severity="low", every_s=86400)
             fence_on = self.cfg["providers"].get(provider, {}).get("write_fence", True) is not False
             argv, sandboxed = prov.fence_args(argv, roots, cwd=str(cwd), on=fence_on,
                                             restrictions=restrictions)
