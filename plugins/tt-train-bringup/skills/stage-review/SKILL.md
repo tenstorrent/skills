@@ -167,8 +167,10 @@ Optimisation loop:
   swept or recorded as a rejected candidate;
 - a subset-depth MFU run, a projection or a Tracy table appears in the result table or the report
   as a result rather than as ranking evidence;
-- `doc/perf_analysis.md` deviates from the optimisation-loop document format (prose longer than
-  three lines, sentences in table cells, review caveats appended instead of cells corrected);
+- `doc/perf_analysis.md` or the README deviates from the optimisation-loop document format and
+  report style: a "what changed" cell that names a path or a file instead of the mechanism, a
+  result without its ΔMFU, prose longer than three lines, sentences in table cells, narrative of
+  attempts without a number, review caveats appended instead of cells corrected;
 - a result row reports MFU at the delivered clock, lacks the per-chip clock and critical chip, or
   rests on an A/B of standalone numbers from different processes;
 - `git add -u` or a commit touched a submodule pointer, or a tracked evidence file is over 500 KB,
@@ -274,6 +276,11 @@ Verdict: clean-pass | more-work-needed
 ```
 
 Only `clean-pass` with no required work satisfies this skill.
+
+Write the verdict in the loop's report style: a finding is one line of what is wrong with the
+number or cell that shows it, and one line of what to do. No restated method, no praise, no
+hedging. A verdict under forty lines is the norm; findings the phase owner cannot act on in one
+commit are not findings.
 
 ## Main-Agent Follow-Up
 

@@ -78,11 +78,16 @@ chain whose measured cost beats the kernel's expected gain.
    on a multi-chip layout), loss match at the plan's layout, MFU rerun with the baseline command,
    Tracy diff showing the targeted ops gone and nothing new.
 9. Append a row to the result table and update the ranked cost table in the
-   [document format](#document-format). Record rejected candidates with their cost, the attempted
-   fix, the reason and the condition under which to retry them.
+   [document format](#document-format) and [report style](#report-style): what changed and by
+   how much, in words and numbers, not a path. Record rejected candidates with their cost, the
+   attempted fix, the reason and the condition under which to retry them.
 10. Commit the iteration on its own (code, tests, docs, evidence), then continue with the next item.
     A stage review runs every eight iterations or at a milestone (a kernel landed, a target
     crossed, a close claimed), not after every iteration.
+
+Steps 5 to 10 for one candidate are one scoped subagent's job (see [Delegation](#delegation));
+the main agent runs steps 1 to 4 once per iteration from the returned rows and picks the next
+candidate.
 
 ## Op classes
 
@@ -260,26 +265,58 @@ all, NoC-bound, imbalance), and the next structural fix, not as a win.
 
 `doc/optimization/README.md`, `doc/perf_analysis.md` and `work_log.md` are read by skimming and
 updated once per iteration, three places and no more (the reference bring-up kept four, with
-placeholder tokens, and spent 19 commits on their hygiene). Header, sub-headers, short bullets; no
-paragraph longer than three lines; numbers in tables; no placeholder or `*_PENDING` tokens (a row
-is written when its number exists). Fixed layout:
+placeholder tokens, and spent 19 commits on their hygiene). Numbers in tables; no placeholder or
+`*_PENDING` tokens (a row is written when its number exists). Fixed layout:
 
-1. `doc/optimization/README.md`: the hard-constraints block, then `## Results`: one table, seven
-   columns (iteration, change, ms/step, MFU at nominal peak, critical-chip clock, verification
-   pass/fail, evidence path). A row is one line; a cell holds a number or a name, never a sentence.
-   Nothing else.
+1. `doc/optimization/README.md`: the hard-constraints block, then `## Results`: one table, columns
+   iteration, what changed, ms/step, ΔMFU (points against the previous row), MFU, critical-chip
+   clock, verified (yes/no). "What changed" is the mechanism in a few words, never a path. Nothing
+   else in the file.
 2. `doc/perf_analysis.md`: `# Performance analysis` with one line of setup (model, recipe, metric,
-   denominator); `## Ranked cost table` (the current table, class per row, ms/step at full depth,
-   kernel source for math rows); `## Rejected` (candidate, cost, attempt, reason, retry when);
-   `## Ledger` (anomalies, one bullet each). Tables are replaced each iteration, not appended.
-3. `work_log.md`: one bullet per iteration: `N: <change> | <ms/step, MFU> | <rows moved, numbers> |
-   <harness, loss: pass/fail> | <commit> | <evidence path>`. Anything longer goes into a file under
-   `evidence/` and is linked.
+   denominator); `## Ranked cost table` (op or chain, class, ms/step, % of step, kernel name,
+   status: open / landed N / rejected N); `## Rejected` (candidate, cost, what was tried, why it
+   failed, retry when); `## Ledger` (anomalies, one bullet each). Tables are replaced each
+   iteration, not appended.
+3. `work_log.md`: one bullet per iteration, three lines at most:
+   `N: <what changed and how> | <ms/step, ΔMFU> | harness <pass/fail>, loss <pass/fail> | <sha>`.
+   A path only when there is a figure or table worth opening.
 4. `evidence/`: compact files only (gzip CSV, PNG at 70 dpi, compact JSON), every file under 500 KB.
    Tracy dumps and raw profiler directories stay outside the repository tree; the evidence directory
    holds the per-op summary CSV and the command that produced it.
 
 A review finding is fixed by correcting the bullet or table cell, not by adding a caveat paragraph.
+
+### Report style
+
+Every row and bullet answers three questions and nothing else: what changed (the mechanism, in
+words a kernel engineer reads once), how much (ms/step and ΔMFU in points, with the clock when it
+moved), and whether it is in (verified, landed) or out (rejected, why). Important stays, the rest
+goes: no method restated, no hedging, no narrative of the attempts that produced no number, no
+link in place of the content, no caveat paragraphs. Short full words; exact op, kernel and knob
+names; no invented abbreviations.
+
+| bad | good |
+|---|---|
+| Improved the attention backward kernel, see `evidence/iter17_sdpa_bw.md` for details and analysis | sdpa_bw: K/V multicast within core group, 2 query rows per work item |
+| Investigated the gating path and applied a fusion that removes several ops | gate mul fused into rmsnorm epilogue; 3 binary ops gone per layer |
+| Tuned the matmul configuration to improve utilisation | gate_up matmul: in0_block_w 4 to 8, 2D mcast grid 8x11 |
+| MFU went from 29.4 % to 30.1 % as measured by the full-model run | 436.1 ms, +0.7 pt, 30.1 % |
+
+The same style holds for the composite README, the plan's tables and the review verdicts: a
+finding is one line of what is wrong and one line of what to do.
+
+## Delegation
+
+The main agent keeps the state and stays small: the hard-constraints block, the result table, the
+ranked table, the next candidate. It does not read Tracy CSVs, logs, review reports or kernel
+sources into its own context; a context that fills up gets compressed and the reasoning degrades
+(the reference bring-up ran 51 iterations in one context). Each unit of work runs in a scoped
+subagent, one or two candidates per agent, with a brief that holds: the candidate row and its
+number, the hard constraints, the exact MFU, harness and profile commands, the files it may touch,
+what was already tried and ruled out, and the row format to return. The subagent returns the
+result row, the ranked-table rows that moved, the commit SHA and a one-line verdict, not the logs.
+Analysis and code work for independent candidates may run in parallel; device runs are serialised
+(one device user at a time, see `tt-device-usage`). A stage review is always its own subagent.
 
 ## Adding a kernel
 
