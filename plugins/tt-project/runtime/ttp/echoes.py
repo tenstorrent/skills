@@ -384,15 +384,12 @@ def _line(text: str, phrase: str) -> str:
     return ("..." if start else "") + cut + ("..." if start + LINE_CHARS < len(ln) else "")
 
 
-def _line_sha(text: str, phrase: str) -> str:
-    """The sha256 of the whole line of `text` holding `phrase`, whitespace collapsed (all of it when it spans
-    lines): an acknowledgement holds while it is unchanged."""
-    for ln in text.splitlines():
-        if phrase in _flat(ln):
-            break
-    else:
-        ln = text
-    return hashlib.sha256(" ".join(ln.split()).encode()).hexdigest()
+def _line_sha(text: str, phrases_: list[str]) -> str:
+    """The sha256 of every line of `text` holding one of `phrases_`, whitespace collapsed, in order (all of it
+    when none does: a phrase across lines): an acknowledgement holds while they are unchanged, so an edited
+    line or a new copy elsewhere in the place lists the match again. Moving them keeps it."""
+    lines = [" ".join(ln.split()) for ln in text.splitlines() if any(ph in _flat(ln) for ph in phrases_)]
+    return hashlib.sha256("\n".join(lines or [" ".join(text.split())]).encode()).hexdigest()
 
 
 def _lineno(text: str, phrase: str) -> int:
@@ -586,7 +583,7 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
                        else "only a file name, path, version or evidence reference matches")
                 hit = {"key": f"{rec['id']}:{key}", "label": label, "line": _line(text, ph), "phrase": ph,
                        "source": rec.get("source") or "", "retirement": rec["id"], "kind": rec["kind"],
-                       "class": "advisory" if why else "directive", "why": why, "sha": _line_sha(text, ph)}
+                       "class": "advisory" if why else "directive", "why": why, "sha": _line_sha(text, own)}
                 if acks.get(hit["key"]) == hit["sha"]:
                     if acked is not None:
                         acked.append(dict(hit, **{"class": "acknowledged"}))

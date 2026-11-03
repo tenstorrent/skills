@@ -746,6 +746,12 @@ def test_an_acknowledged_false_positive_is_hidden_counted_and_listed_again_once_
     assert classes()[(rec["id"], "file src/client.py:3")] == "acknowledged"
     echoes.acknowledge(p, rec["id"], f"task #{task} spec")
     assert classes()[(rec["id"], f"task #{task} spec")] == "acknowledged"
+    # A new copy of the rule elsewhere in the place lists it again; removing it hides it again.
+    before = code.read_text()
+    code.write_text(before + "# hold every release for the `alpha_gate_flag` sign-off\n")
+    assert classes()[(rec["id"], "file src/client.py:3")] == "directive"
+    code.write_text(before)
+    assert classes()[(rec["id"], "file src/client.py:3")] == "acknowledged"
     # The line's text changes: listed again as a directive.
     code.write_text(code.read_text().replace("return payload", "return  dict(payload)"))
     assert classes()[(rec["id"], "file src/client.py:3")] == "directive"
