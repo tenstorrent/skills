@@ -407,7 +407,7 @@ def overrides(p: Project | None, db: DB, now: float, hours: float) -> list[str]:
         for item in ends.temporaries(p):
             first = listed.get(item["key"])
             if item["key"] in broken or (first is not None and now - float(first) >= ends.RECHECK_S):
-                states = ends.task_states(p, item["end"].get("until") or "")
+                states = ends.end_states(p, item["end"])
                 out.append(f"{item['what']} possibly over ({_short(ends.describe(item['end'], p), 100)}"
                            + (f"; now {states}" if states else "")
                            + (f"; its probe is broken: {_short(broken[item['key']], 60)}" if item["key"] in broken else "")

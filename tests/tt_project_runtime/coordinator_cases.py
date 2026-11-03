@@ -4039,6 +4039,47 @@ def test_an_end_only_a_model_can_judge_is_listed_as_possibly_over_once_a_day(env
 
 
 
+def test_a_pull_request_or_issue_number_in_an_until_is_not_read_as_a_task(env):
+    """'until the example/repo PR #N is merged' was listed every day as '(now #N: done)' because this
+    project's task #N was done. A '#N' after PR, pull request, issue or a repository is no local task;
+    an end with its own until_probe is judged by the probe, never by the tasks its text names. A plain
+    'task #N' or bare '#N' still shows its task's state."""
+    p = make(env)
+    from ttp import audit
+    from ttp import ends
+    tid = p.db.add_task("finished", "s", kind="code", status="done")
+    for text in (f"PR #{tid} is merged", f"pull request #{tid} is merged", f"example/repo#{tid} is merged",
+                 f"the repo PR #{tid} is merged or closed", f"example/repo #{tid} is closed",
+                 f"issue #{tid} is closed", f"PRs #{tid + 1} and #{tid} are merged", f"repo#{tid} lands",
+                 f"pull-request #{tid} is merged", f"PR: #{tid} is merged"):
+        assert ends.task_states(p, text) == "", text
+    for text in (f"task #{tid} is reviewed", f"#{tid} is reviewed", f"PR #{tid + 1} and task #{tid} land",
+                 f"11/3 #{tid} is reviewed"):
+        assert ends.task_states(p, text) == f"#{tid}: done", text
+    for i, until in enumerate((f"the example/repo PR #{tid} is merged", f"task #{tid} is reviewed",
+                               f"#{tid} is reviewed")):
+        p.add_memory(f"Hold step {i}.", "decision", f"hold {i}", end={"until": until})
+    p.add_memory("Hold step 3.", "decision", "hold 3",
+                 end={"until": f"the example/repo PR #{tid} is merged or closed", "probe": "test -e merged"})
+    now = time.time()
+    ends.digest_lines(p, now, now)
+    lines = "\n".join(ends.digest_lines(p, now, now + ends.RECHECK_S))
+    assert f"until the example/repo PR #{tid} is merged\n" in lines + "\n" and "hold-3" not in lines
+    assert f"PR #{tid} is merged (now" not in lines, "a pull request read as this project's task"
+    assert f"until task #{tid} is reviewed (now #{tid}: done)" in lines
+    assert f"until #{tid} is reviewed (now #{tid}: done)" in lines
+    assert "hold-3" not in lines, "an entry whose own probe has not passed listed as possibly over"
+    key = next(t["key"] for t in ends.temporaries(p) if "hold-3" in t["key"])
+    p.db.set_kv(ends.BROKEN_KEY, {key: "exit 2: gh: not logged in"})
+    ends.digest_lines(p, now, now + ends.RECHECK_S + 1)   # first seen broken: listed a day later
+    held = "\n".join(audit.overrides(p, p.db, now + 2 * ends.RECHECK_S + 2, 12))
+    lines = "\n".join(ends.digest_lines(p, now, now + 2 * ends.RECHECK_S + 2))
+    for out in (lines, held):
+        assert "hold-3]" in out and "probe is broken" in out, out
+        assert f"#{tid}: done" not in "".join(x for x in out.splitlines() if "hold-3]" in x), out
+    assert f"#{tid}: done" in "".join(x for x in held.splitlines() if "hold-1]" in x)
+
+
 def _tick_until_retired(e, now: float) -> list:
     """Ends.tick until the probes it starts have answered: the retirements of the last tick."""
     from ttp import ends

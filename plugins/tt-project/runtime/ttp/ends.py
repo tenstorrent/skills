@@ -312,6 +312,11 @@ def from_action(a: dict, now: float | None = None, where=None) -> dict:
 _TASK_END = re.compile(r"(?:task\s+)?#(\d+)\s+(?:(?P<landed>(?:has\s+)?landed)|is\s+done|has\s+reported|(?:has\s+)?finished)\.?",
                        re.I)
 _TASK_ID = re.compile(r"(?<![\w#])#(\d+)\b")
+# A '#N' that names a GitHub pull request or issue, not this project's task: after 'PR', 'pull request' or
+# 'issue' (plural too), or a repository ('owner/repo #N'; 'repo#N' never matches _TASK_ID), with the
+# '#M' it lists after it ('PRs #1 and #2').
+_EXTERNAL_REF = re.compile(r"(?:\b(?:PRs?|pull[\s-]+requests?|issues?)[\s:]*|(?<![\w/.-])[A-Za-z][\w.-]*/[\w.-]+\s*)"
+                           r"#\d+\b(?:\s*(?:,|and|or|&)\s*#\d+\b)*", re.I)
 
 
 def task_probe(until: str, where=None) -> str:
@@ -330,15 +335,24 @@ def task_probe(until: str, where=None) -> str:
 
 def task_states(p: Project, text: str) -> str:
     """'#3885: done; #4197: landed' for the task ids `text` names (at most 8): each task's status, or
-    landed / abandoned where its landing or abandonment is recorded; "" when it names none."""
+    landed / abandoned where its landing or abandonment is recorded; "" when it names none. A pull
+    request or issue ('PR #257', 'owner/repo#257', _EXTERNAL_REF) is no task of this project: left out."""
     from . import landed
     out = []
-    for tid in list(dict.fromkeys(int(x) for x in _TASK_ID.findall(text or "")))[:8]:
+    for tid in list(dict.fromkeys(int(x) for x in _TASK_ID.findall(_EXTERNAL_REF.sub(" ", text or ""))))[:8]:
         t = p.db.task(tid)
         state = ("no such task" if not t else "abandoned" if landed.abandoned(p.db, tid)
                  else "landed" if landed.recorded(p.db, tid)[0] else str(t.get("status") or "unknown"))
         out.append(f"#{tid}: {state}")
     return "; ".join(out)
+
+
+def end_states(p: Project, end: dict) -> str:
+    """task_states of `end`'s `until`, for an end listed as possibly over; "" when it has a probe of its
+    own (not the one task_probe derives): that probe judges the end, never the tasks its text names."""
+    if end.get("probe") and end["probe"] != task_probe(end.get("until") or "", p):
+        return ""
+    return task_states(p, end.get("until") or "")
 
 
 def derived_waits_on_ended(p: Project, end: dict) -> bool:
@@ -720,7 +734,7 @@ def digest_lines(p: Project, since: float, now: float | None = None) -> list[str
             listed[key] = now
             cond = end.get("until") or "its probe passes"
             note = f"; its until_probe is broken ({broken[key][-500:]}): fix it with a restated entry" if key in broken else ""
-            states = task_states(p, end.get("until") or "")
+            states = end_states(p, end)
             due.append(f"- {item['what']}: until {cond}" + (f" (now {states})" if states else "") + note)
     listed = {k: v for k, v in listed.items() if k in live}
     if listed != (db.kv(LISTED_KEY) or {}):
