@@ -1010,3 +1010,75 @@ def test_a_signal_inside_enqueue_never_leaves_a_request_withdraw_cannot_find(env
     assert not list((p.state / "detach-queue").glob("*.json"))
     detach.tend(p)
     assert not rc.exists() and not detach.started(rc).exists()
+
+
+def test_a_secret_env_request_past_its_own_start_deadline_is_lost_never_started(env, monkeypatch, capfd):
+    """A caller killed by SIGKILL withdraws nothing: its request carries its own start deadline, and the
+    daemon records it lost past that, well before QUEUED_S. Other queued jobs keep QUEUED_S."""
+    import time
+    from ttp import detach, secretroute
+    p, rd = _queued_route(env, monkeypatch, capfd, "9007")
+    rc, plain = rd / "secret-env-killed.rc", rd / "plain.rc"
+    q = detach.enqueue(p.state, rc, rd / "secret-env-killed.log", ["true"], str(rd), {},
+                       start_within=secretroute.START_WAIT_S + secretroute.START_MARGIN_S)
+    m = json.loads(q.read_text())
+    assert m["start_by"] == m["queued"] + secretroute.START_WAIT_S + secretroute.START_MARGIN_S
+    q2 = detach.enqueue(p.state, plain, rd / "plain.log", ["true"], str(rd), {})
+    assert "start_by" not in json.loads(q2.read_text())
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + secretroute.START_WAIT_S + secretroute.START_MARGIN_S + 1)
+    held = []   # nothing may start: the plain job's start is stubbed out to stay synchronous
+    monkeypatch.setattr(detach, "start", lambda rc_, *a, **k: held.append(Path(rc_)) or 0)
+    monkeypatch.setattr(detach, "renice", lambda *a, **k: None)
+    detach.tend(p)
+    assert not rc.exists() and not detach.started(rc).exists() and rc not in held
+    st, why = detach.state(rc)
+    assert st == "lost" and "start deadline" in why and "never ran" in why, why
+    assert not q.exists() and not detach.queued(rc).exists()
+    assert held == [plain]   # well inside QUEUED_S: the job with no deadline of its own still starts
+
+
+@pytest.mark.parametrize("damaged", ["soon", [1], {"at": 1}])
+def test_a_damaged_start_deadline_never_starts_the_request(env, monkeypatch, capfd, damaged):
+    from ttp import detach
+    p, rd = _queued_route(env, monkeypatch, capfd, "9008")
+    rc = rd / "secret-env-damaged.rc"
+    q = detach.enqueue(p.state, rc, rd / "secret-env-damaged.log", ["true"], str(rd), {}, start_within=60)
+    m = json.loads(q.read_text())
+    m["start_by"] = damaged
+    q.write_text(json.dumps(m))
+    monkeypatch.setattr(detach, "start", lambda *a, **k: pytest.fail("started"))
+    monkeypatch.setattr(detach, "renice", lambda *a, **k: None)
+    detach.tend(p)
+    assert detach.state(rc)[0] == "lost"
+
+
+def test_a_second_sigint_during_the_withdrawal_still_prints_the_report(env, monkeypatch, capfd):
+    """Ctrl-C twice: the second one, held while the request is withdrawn, never cuts the report short."""
+    import signal
+    import threading
+    from ttp import detach, secretroute
+    p, rd = _queued_route(env, monkeypatch, capfd, "9009")
+    monkeypatch.setattr(secretroute, "START_WAIT_S", 30)
+    queue = p.state / "detach-queue"
+    real_withdraw = detach.withdraw_unstarted
+
+    def withdraw_with_a_second_sigint(*a, **k):
+        signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)   # held by _held_signals until the block ends
+        return real_withdraw(*a, **k)
+    monkeypatch.setattr(detach, "withdraw_unstarted", withdraw_with_a_second_sigint)
+
+    def stop():
+        for _ in range(500):
+            if list(queue.glob("*.json")):
+                break
+            threading.Event().wait(0.01)
+        signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)   # as a single-threaded caller sees it
+    t = threading.Thread(target=stop, daemon=True)
+    t.start()
+    code, out = _env_run(monkeypatch, capfd, "--secret", "jev:key=JK", "--", "true")
+    t.join(10)
+    assert code == 128 + signal.SIGINT and "stopped by SIGINT" in out and "nothing ran" in out, out
+    _never_ran(p, rd)
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler   # both handlers are restored
+    assert signal.getsignal(signal.SIGTERM) is not secretroute._raise_stopped

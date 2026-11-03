@@ -31,6 +31,8 @@ SANDBOX_ENV = "SANDBOX_RUNTIME"    # set by the Claude Code Bash sandbox
 USES = "secret-uses.jsonl"         # under the project's state: {"at", "task", "run", "secrets"} per served command
 START_WAIT_S = 90                  # unstarted by then: the daemon is down or stuck; withdraw it, well inside a
                                    # 10-min tool call, so a killed call never leaves it to run late or twice
+START_MARGIN_S = 30                # the request's own start deadline is START_WAIT_S plus this: past it the daemon
+                                   # never starts it, even when its caller was killed (SIGKILL) and withdrew nothing
 POLL_S = 0.2
 
 
@@ -114,13 +116,15 @@ def run(alias: str | None, specs: list[str], argv: list[str], out=None) -> int:
     name = f"secret-env-{uuid.uuid4().hex[:8]}"
     rc, log = rd / f"{name}.rc", rd / f"{name}.log"
     cmd = job_command(alias, specs, argv)
+    old_int = None
     try:
         old_term = signal.signal(signal.SIGTERM, _raise_stopped)
     except ValueError:   # not the main thread: SIGTERM keeps its handler
         old_term = None
     try:
         with _held_signals():   # a stop mid-enqueue would leave a request without the marker that withdraws it
-            detach.enqueue(state, rc, log, cmd, os.getcwd(), dict(os.environ))
+            # its own start deadline: a caller killed without withdrawing it (SIGKILL) never sees a late start
+            detach.enqueue(state, rc, log, cmd, os.getcwd(), dict(os.environ), start_within=START_WAIT_S + START_MARGIN_S)
             with detach.registry(rd) as jobs:
                 jobs.append({"name": name, "rc": str(rc), "log": str(log), "pid": None, "started": time.time(),
                              "queued": True, "status": "queued",
@@ -130,8 +134,9 @@ def run(alias: str | None, specs: list[str], argv: list[str], out=None) -> int:
         return _wait(rc, log, out, time.time() + START_WAIT_S)
     except (KeyboardInterrupt, _Stopped) as e:
         sig = e.sig if isinstance(e, _Stopped) else signal.SIGINT
-        if old_term is not None:
-            signal.signal(signal.SIGTERM, signal.SIG_IGN)   # stopping already: a second SIGTERM never cuts the report
+        if old_term is not None:   # stopping already: a second SIGINT or SIGTERM never cuts the report
+            old_int = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
         with _held_signals():   # a second stop never cuts the withdrawal short
             withdrawn = detach.withdraw_unstarted(rc, f"{detach.WITHDRAWN} (its caller got {signal.Signals(sig).name})")
         if withdrawn:
@@ -148,6 +153,8 @@ def run(alias: str | None, specs: list[str], argv: list[str], out=None) -> int:
     finally:
         if old_term is not None:
             signal.signal(signal.SIGTERM, old_term)
+            if old_int is not None:
+                signal.signal(signal.SIGINT, old_int)
 
 
 def _wait(rc: Path, log: Path, out, deadline: float) -> int:

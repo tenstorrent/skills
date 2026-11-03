@@ -246,12 +246,14 @@ def reap_children() -> int:
     return n
 
 
-def enqueue(state: Path, rc: Path, log: Path, cmd: list, cwd: str, env: dict, *, checks: dict | None = None) -> Path:
+def enqueue(state: Path, rc: Path, log: Path, cmd: list, cwd: str, env: dict, *, checks: dict | None = None,
+            start_within: float | None = None) -> Path:
     """Queue the job for the daemon to start, replacing a request of the same job not started yet;
     returns the queue file. The request and its marker are published together, under the lock, the
     marker first: a signal between the two writes (a caller with other threads is not masked) leaves at
     most a marker without its request, which withdraw_unstarted and pending clear, never a request
-    no marker names."""
+    no marker names. `start_within` (seconds) gives the request its own start deadline in place of
+    QUEUED_S: one its caller stopped waiting for, even if killed without withdrawing it, never starts late."""
     rc = Path(rc)
     q = Path(state) / QUEUE / f"{rc.parent.name}-{rc.stem}.json"
     keep = _kept_env(env)
@@ -259,10 +261,12 @@ def enqueue(state: Path, rc: Path, log: Path, cmd: list, cwd: str, env: dict, *,
         print(f"ttp detach: the queued job leaves out {', '.join(dropped)} (a loopback proxy of this "
               f"sandbox; the daemon's own environment applies)", file=sys.stderr)
     rid = uuid.uuid4().hex
+    now = time.time()
     with _locked(q.parent):
         durable_write(queued(rc), f"{q}\n{rid}\n")
         write_json(q, {"rc": str(rc), "log": str(log), "command": cmd, "cwd": cwd, "env": keep, "id": rid,
-                       "queued": time.time(), **({"checks": checks} if checks is not None else {})}, mode=0o600)
+                       "queued": now, **({"checks": checks} if checks is not None else {}),
+                       **({"start_by": now + start_within} if start_within is not None else {})}, mode=0o600)
     return q
 
 
@@ -800,7 +804,10 @@ def tend(p: Project) -> None:
         elif _superseded(rc, m):
             _settle(q, rc, rid)
             continue
-        if time.time() - float(m.get("queued") or 0) > QUEUED_S:
+        if m.get("start_by") is not None and time.time() > _num(m["start_by"]):
+            why = ("the daemon did not start it by its start deadline; its caller had stopped waiting "
+                   "for it, so it never ran")
+        elif time.time() - float(m.get("queued") or 0) > QUEUED_S:
             why = (f"the daemon did not start it within {QUEUED_S // 60} min of it being queued "
                    f"(was the daemon down?)")
         elif "checks" in m:
@@ -831,6 +838,14 @@ def tend(p: Project) -> None:
                 finally:
                     lock.close()
         _settle(q, rc, rid, why)
+
+
+def _num(v) -> float:
+    """A queue entry's time; a damaged one reads as long past, so its request never starts."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _superseded(rc: Path, m: dict) -> bool:
