@@ -2165,20 +2165,41 @@ def fix_branches(p: Project, task: dict, refs: list[str]) -> dict[str, str]:
     return {b: ref for ref, (_, b) in sorted(newest.items(), key=lambda kv: kv[1][0])}
 
 
-def diff_lines(p: Project, refs: list[str]) -> dict[str, int | None] | None:
-    """Lines changed per file by `refs` since they left the base branch (None for a binary file),
-    or None when they change nothing measurable, such as a commit already on the base."""
-    base = resolve_base(p)
+def diff_lines(p: Project, refs: list[str], base: str = "", root: Path | None = None) -> dict[str, int | None] | None:
+    """Lines changed per file by `refs` since they left the base branch (or `base`; in repo `root`,
+    default the project root) (None for a binary file), or None when they change nothing measurable,
+    such as a commit already on the base."""
+    root = root or p.root
+    base = base or resolve_base(p)
     out: dict[str, int | None] = {}
     for ref in refs:
-        if not _git(p.root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False):
+        if not _git(root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False):
             continue
-        for line in _git(p.root, "diff", "--numstat", "--no-renames", f"{base}...{ref}").splitlines():
+        for line in _git(root, "diff", "--numstat", "--no-renames", f"{base}...{ref}").splitlines():
             added, deleted, path = line.split("\t", 2)
             prev = out.get(path, 0)
             n = None if added == "-" else int(added) + int(deleted)
             out[path] = None if n is None or prev is None else max(n, prev)
     return out or None
+
+
+REFLOG_SCAN = 50   # reflog entries landed_from reads at most, newest first
+
+
+def contains(root: Path, tip: str, commit: str) -> bool:
+    """Whether commit `commit` is `tip` or an ancestor of it, in repo `root`."""
+    return gitmemo.run(["git", "-C", str(root), "merge-base", "--is-ancestor", commit, tip],
+                       capture_output=True, timeout=120, read=True).returncode == 0
+
+
+def landed_from(root: Path, base: str, head: str) -> str:
+    """The tip `base` had just before `head` landed on it, from its reflog in repo `root`: of the
+    entries, newest first (REFLOG_SCAN at most), the first that does not contain `head`; '' when the
+    reflog does not reach back that far or `base` has none."""
+    for sha in _git(root, "reflog", "show", "--format=%H", f"-n{REFLOG_SCAN}", base, "--", check=False).split():
+        if not contains(root, sha, head):
+            return sha
+    return ""
 
 
 def delta_lines(p: Project, failed: str, new: str) -> tuple[dict[str, int | None] | None, str]:

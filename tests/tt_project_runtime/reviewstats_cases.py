@@ -437,3 +437,84 @@ def test_a_deep_re_review_stays_deep_and_an_unrecorded_failed_head_stays_standar
     p, d, _, _, rereview, _ = _rereview_setup(env)
     task, pick = d._size_review(rereview())
     assert task["tier"] == "standard" and "no fix delta" in pick["rule"], pick
+
+
+def _land_on_base(p, branch):
+    """Fast-forward the base branch to `branch` (its reflog gains an entry), as a push that landed it."""
+    from ttp import worktree
+    base = worktree.resolve_base(p)
+    before = _git_out(p.root, "rev-parse", base)
+    _git_out(p.root, "update-ref", "-m", "landed", f"refs/heads/{base}", _git_out(p.root, "rev-parse", branch))
+    return base, before
+
+
+def test_an_approved_review_whose_head_already_landed_keeps_its_size(env):
+    """An approved review's head is often on the base when its row is written: `base...head` is then
+    empty. It is measured against the base tip it landed on (from the reflog), and a later verdict
+    that measures nothing keeps the row's known size."""
+    from ttp import reviewstats
+    p = make(env)
+    _, branch, _, (rev,) = _finish_code(env, p, "landed", {"app.py": 30, "tests/test_app.py": 5})
+    head = _git_out(p.root, "rev-parse", branch)
+    base, _ = _land_on_base(p, branch)
+    _fail_review(env, p, rev["id"], status="done", summary="fine")
+    row = p.db.one("SELECT * FROM review_stats WHERE task=?", (rev["id"],))
+    assert (row["head"], row["lines"], row["code_lines"], row["outcome"]) == (head, 35, 30, "approved"), row
+    assert row["areas"] == "runtime,tests-docs", row
+    # The reflog is gone: a later verdict of the same review replaces the row and keeps its size.
+    _git_out(p.root, "reflog", "expire", "--expire=now", "--all")
+    again = reviewstats.record(p, p.db.task(rev["id"]), "failed")
+    row = p.db.one("SELECT * FROM review_stats WHERE task=?", (rev["id"],))
+    assert again["outcome"] == "failed" and (row["lines"], row["code_lines"], row["outcome"]) == (35, 30, "failed")
+    assert row["areas"] == "runtime,tests-docs", row
+
+
+def test_a_landed_head_is_measured_against_the_push_queues_pre_push_tip(env):
+    from ttp import reviewstats
+    p = make(env)
+    _, branch, _, (rev,) = _finish_code(env, p, "queued", {"app.py": 12})
+    head = _git_out(p.root, "rev-parse", branch)
+    base, before = _land_on_base(p, branch)
+    _git_out(p.root, "reflog", "expire", "--expire=now", "--all")   # only the push queue knows the tip
+    p.db.x("INSERT INTO push_batches(id,marker,target,started,tip) VALUES('b1','m','t',0,?)", (before,))
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,batch,created,updated) "
+           "VALUES(?,?,?,'t','pushed','b1',0,0)", (rev["id"], branch, head))
+    row = reviewstats.record(p, p.db.task(rev["id"]), "done")
+    assert (row["head"], row["lines"], row["code_lines"]) == (head, 12, 12), row
+    # A recorded tip that already contains the head measures nothing: no size, not a zero.
+    p.db.x("DELETE FROM review_stats")
+    p.db.x("UPDATE push_batches SET tip=?", (head,))
+    assert reviewstats.record(p, p.db.task(rev["id"]), "done")["lines"] is None
+
+
+def test_a_review_whose_subject_has_no_branch_measures_the_commit_its_title_or_spec_names(env):
+    from ttp import reviewstats
+    p = make(env)
+    _, branch, _, _ = _finish_code(env, p, "side", {"lib.py": 7})
+    head = _git_out(p.root, "rev-parse", branch)
+    by_title = p.db.add_task(f"Review {head[:12]}: the side change", "check it", kind="review")
+    row = reviewstats.record(p, p.db.task(by_title), "done")
+    assert (row["head"], row["lines"]) == (head, 7), row
+    by_spec = p.db.add_task("Review the side change", f"Review commit {head[:10]} for regressions.", kind="review")
+    row = reviewstats.record(p, p.db.task(by_spec), "done")
+    assert (row["head"], row["lines"]) == (head, 7), row
+    none = p.db.add_task("Review the side change", "nothing named", kind="review")
+    assert reviewstats.record(p, p.db.task(none), "done")["head"] is None
+
+
+def test_a_harness_task_review_is_measured_in_the_harness_repo_against_its_main_line(env):
+    from ttp import harnesstree, reviewstats
+    p = make(env)
+    tid = p.db.add_task("tune a prompt", "s", kind="harness")
+    h, b = p.harness, harnesstree.branch(tid)
+    _git_out(h, "branch", b, harnesstree.main_branch(p))
+    wt = env["tmp"] / "harness-wt"
+    _git_out(h, "worktree", "add", "-q", str(wt), b)
+    (wt / "prompts").mkdir(exist_ok=True)
+    (wt / "prompts" / "extra.md").write_text("".join(f"line {i}\n" for i in range(9)))
+    _git_out(wt, "add", ".")
+    _git_out(wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "prompt")
+    rid = p.db.add_task(f"Review #{tid}: tune a prompt", "s", kind="review", labels=[f"auto_review:{tid}"])
+    row = reviewstats.record(p, p.db.task(rid), "done")
+    assert (row["head"], row["lines"], row["areas"]) == (
+        _git_out(h, "rev-parse", b), 9, "skills-prompts-config"), row

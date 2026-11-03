@@ -85,40 +85,87 @@ def has_self_check(db: DB, review: dict) -> int | None:
     return 0
 
 
-def _reviewed(p, review: dict) -> tuple[str, str]:
+def _where(p, subject: dict | None) -> tuple[Any, str]:
+    """(repo, base) a review's subject is measured in: a harness task's in the harness repo against its
+    main line, any other's in the project root against the base branch; base '' when it has none."""
+    from . import harnesstree, worktree
+    if (subject or {}).get("kind") == "harness":
+        return p.harness, harnesstree.main_branch(p)
+    try:
+        return p.root, worktree.resolve_base(p)
+    except RuntimeError:
+        return p.root, ""
+
+
+def _reviewed(p, review: dict, subject: dict | None, repo) -> tuple[str, str]:
     """(branch, full head) the review reviewed: the head it approved for the push queue, else the
-    tip of its subject's branch now; ('', '') when it names none."""
-    from . import worktree
+    tip of its subject's branch now (a harness task's own branch when it records none), else the
+    first commit its title, then its spec, names that resolves in `repo`; ('', '') when none."""
+    from . import harnesstree, worktree
     db = p.db
     q = db.one("SELECT branch, head FROM push_queue WHERE task=? ORDER BY id DESC LIMIT 1", (review["id"],))
-    subject = review_subject(review)
-    t = db.task(subject) if subject is not None else None
-    branch = (t or {}).get("branch") or (q["branch"] if q else "") or ""
+    branch = (subject or {}).get("branch") or (q["branch"] if q else "") or ""
+    if not branch and (subject or {}).get("kind") == "harness":
+        branch = harnesstree.branch(subject["id"])
     if q and q["head"]:
         return branch, q["head"]
-    if not branch:
-        return "", ""
-    return branch, worktree._git(p.root, "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}", check=False)
+    rev = lambda ref: worktree._git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False)  # noqa: E731
+    if branch and (head := rev(branch)):
+        return branch, head
+    for text in (review.get("title") or "", review.get("spec") or ""):
+        for sha in worktree._HEX.findall(text):
+            if head := rev(sha):
+                return branch, head
+    return "", ""
+
+
+def _pushed_onto(p, review: dict, repo, head: str) -> str:
+    """The target tip the push queue checked the review's approval on before pushing it (its batch's
+    tip), when that resolves and does not yet contain `head`; '' otherwise."""
+    from . import worktree
+    r = p.db.one("SELECT b.tip FROM push_queue q JOIN push_batches b ON b.id=q.batch WHERE q.task=? "
+                 "AND b.tip IS NOT NULL AND b.tip!='' ORDER BY q.id DESC LIMIT 1", (review["id"],))
+    tip = worktree._git(repo, "rev-parse", "--verify", "--quiet", f"{r['tip']}^{{commit}}", check=False) if r else ""
+    return tip if tip and not worktree.contains(repo, tip, head) else ""
+
+
+def _measure(p, review: dict, repo, base: str, head: str) -> dict[str, int | None] | None:
+    """Lines changed per file by `head` against the merge-base with `base`; once `head` has landed on
+    `base` (that diff is empty), against the tip it landed on: the push queue's pre-push tip
+    (_pushed_onto), else the reflog's (worktree.landed_from)."""
+    from . import worktree
+    changes = worktree.diff_lines(p, [head], base=base, root=repo)
+    if changes is None and worktree.contains(repo, base, head):
+        before = _pushed_onto(p, review, repo, head) or worktree.landed_from(repo, base, head)
+        changes = worktree.diff_lines(p, [head], base=before, root=repo) if before else None
+    return changes
 
 
 def record(p, review: dict, outcome: str, now: float | None = None) -> dict | None:
-    """Write the review's row: its head, changed lines against the merge-base (all, and code_lines),
-    areas, tier, re-review flag, outcome (OUTCOMES), cost so far and self-check flag (has_self_check).
-    Git trouble leaves lines and areas empty."""
-    from . import worktree
+    """Write the review's row: its head, changed lines against the merge-base (all, and code_lines;
+    a head already landed is measured against the tip it landed on, see _measure), areas, tier,
+    re-review flag, outcome (OUTCOMES), cost so far and self-check flag (has_self_check).
+    Git trouble leaves lines and areas empty, or as an earlier row of the same review had them: a
+    later verdict never drops a known size."""
     db = p.db
     if review.get("kind") != "review":
         return None
     head, lines, code, touched = "", None, None, []
     try:
-        _, head = _reviewed(p, review)
-        changes = worktree.diff_lines(p, [head]) if head else None
+        subject_id = review_subject(review)
+        subject = db.task(subject_id) if subject_id is not None else None
+        repo, base = _where(p, subject)
+        _, head = _reviewed(p, review, subject, repo)
+        changes = _measure(p, review, repo, base, head) if head and base else None
         if changes is not None:
             lines = sum(n or 0 for n in changes.values())
             code = code_lines(changes)
             touched = areas(changes)
     except Exception:
         pass
+    old = db.one("SELECT lines, code_lines, areas FROM review_stats WHERE task=?", (review["id"],))
+    if lines is None and old and old["lines"] is not None:
+        lines, code, touched = old["lines"], old["code_lines"], [a for a in (old["areas"] or "").split(",") if a]
     t = db.task(review["id"]) or review
     row = {"task": review["id"], "ts": time.time() if now is None else now, "head": head[:40] or None,
            "lines": lines, "code_lines": code, "areas": ",".join(touched), "tier": t.get("tier") or "standard",
