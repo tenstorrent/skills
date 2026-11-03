@@ -59,6 +59,7 @@ WAITER_TTL = 1800.0     # a project's report into a logout claim counts this lon
 CLEARED_TEXT = {
     "budget": "Budget for {arg} is out of red; new work starts again.",
     "lock-wait": "Nobody has waited long on lock {arg} any more.",
+    "lock-cycle": "The lock-order cycle {arg} broke: a party let go, the others go on.",
     "auth": "{arg} is logged in again; its queued work starts.",
     "limit": "{arg} accepts work again.",
     "coordinator": "The coordinator is working again: a turn succeeded.",

@@ -504,3 +504,155 @@ def test_lockreap_ended_job_counts_every_ended_task_state(env, tmp_path, status)
         assert f"is {status}" in lockreap.ended_job(p, lockreap.label(path))
     finally:
         f.close()
+
+
+def _cycle_ticket(d, res, text, pid, since=None):
+    """A live queue ticket of `res` in lock dir `d` from waiter process `pid` (an flock this process holds)."""
+    import fcntl
+    q = d / f"{res}.queue"
+    q.mkdir(parents=True, exist_ok=True)
+    f = open(q / f"{(since or time.time()):017.6f}-{pid}", "a+")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    f.write(text)
+    f.flush()
+    return f
+
+
+def _cycle_party(d, held, waits, text, pid, project=None, task=None, since=None, **label):
+    """A party that holds lock `held` (None: nothing) and waits for lock `waits` (None: nothing)."""
+    fs = []
+    if held:
+        fs.append(_reap_slot(d / f"{held}.0.lock", holder=text, pid=pid, pid_start="11", pgid=pid,
+                             **({"task_id": str(task)} if task else {}), **({"project": project} if project else {}),
+                             **label))
+    if waits:
+        fs.append(_cycle_ticket(d, waits, text, label.get("waiter_pid") or pid, since))
+    return fs
+
+
+def _cycle_procs(monkeypatch, parents: dict, cmds: dict | None = None):
+    from ttp import lockcycle
+    monkeypatch.setattr(lockcycle, "_ppid", lambda pid: parents.get(pid))
+    monkeypatch.setattr(lockcycle, "cmdline", lambda pid: (cmds or {}).get(pid, ""))
+
+
+def test_lock_cycle_two_parties_task_and_command_outside_a_task_one_critical_alert_folds_waits_and_clears(
+        env, monkeypatch):
+    # A task holds a per-host lock and waits for a site-wide one; a recovery command outside any task
+    # holds the site-wide lock and waits for the per-host one (its waiter runs below its command).
+    from ttp import daemon as dm, lockcycle
+    p = make(env)
+    d = p.state / "locks"
+    _ReapProcs(monkeypatch, {4100: {"start": "11", "pgid": 4100}, 5200: {"start": "11", "pgid": 5200}}, [4100])
+    _cycle_procs(monkeypatch, {5300: 5250, 5250: 5200, 5200: 5199, 4300: 4100}, {5300: "ttp lock host-a -- reset"})
+    old = time.time() - 40 * 60   # past locks.wait_alert_min: the lock-wait alerts fold into the cycle's
+    fs = _cycle_party(d, "host-a", "site-cycle", "task #12 (run 99)", 4100, task=12, since=old, waiter_pid=4300,
+                      command="run-tests host-a")
+    fs += _cycle_party(d, "site-cycle", "host-a", "task #? (run ?)", 5200, since=old, waiter_pid=5300,
+                       command="recover.sh host-a", taker_pid=5199)
+
+    def sent(like):
+        return p.db.q("SELECT text, severity FROM messages WHERE direction='out' AND ref LIKE ?", (like,))
+    try:
+        dmn = dm.Daemon(p.base)
+        dmn.reap_locks()
+        dmn.reap_locks()
+        dm.Daemon(p.base).reap_locks()
+        [msg] = sent("lock-cycle:%")                 # once, not per check
+        assert msg["severity"] == "critical"
+        for want in (f"project {p.name} task #12", "run 99", "pid 4100", "a command outside any task (pid 5200",
+                     "recover.sh host-a", "host-a", "site-cycle",
+                     "waits for narrower lock host-a while holding wider lock site-cycle"):
+            assert want in msg["text"], (want, msg["text"])
+        assert "task #12 (run 99, pid 4100" in msg["text"] and "waits for narrower lock site-cycle" not in msg["text"]
+        assert not sent("lock-wait:%"), "the per-lock waits fold into the cycle alert"
+        assert p.db.one("SELECT id FROM alerts WHERE key LIKE 'lock-cycle:%' AND cleared IS NULL")
+    finally:
+        fs[0].close()   # the task lets go of host-a: the cycle breaks
+    dm.Daemon(p.base).reap_locks()
+    assert not p.db.one("SELECT id FROM alerts WHERE key LIKE 'lock-cycle:%' AND cleared IS NULL")
+    dm.Daemon(p.base).reap_locks()
+    assert len(sent("lock-cycle:%")) == 2 and "Cleared" in sent("lock-cycle:%")[-1]["text"]   # no repeat
+    for f in fs[1:]:
+        f.close()
+    assert lockcycle.width("host-a") == "narrow" and lockcycle.width("site-cycle") == "wide"
+    assert lockcycle.width("bay-7", {"locks": {"wide": ["bay-7"]}}) == "wide"
+
+
+def test_lock_cycle_of_three_tasks_across_shared_dirs_is_one_cycle_with_every_party(tmp_path, monkeypatch):
+    from ttp import lockcycle
+    _ReapProcs(monkeypatch, {4101: {"start": "11"}, 4102: {"start": "11"}, 4103: {"start": "11"}}, None)
+    _cycle_procs(monkeypatch, {})
+    a, b, c = (tmp_path / n for n in ("lock-a", "lock-b", "lock-c"))
+    fs = (_cycle_party(a, "lock-a", None, "alpha task #1 (run 10)", 4101, task=1)
+          + _cycle_party(b, "lock-b", None, "beta task #2 (run 20)", 4102, task=2)
+          + _cycle_party(c, "lock-c", None, "alpha task #3 (run 30)", 4103, task=3)
+          + [_cycle_ticket(b, "lock-b", "alpha task #1 (run 10)", 7001),
+             _cycle_ticket(c, "lock-c", "beta task #2 (run 20)", 7002),
+             _cycle_ticket(a, "lock-a", "alpha task #3 (run 30)", 7003)])
+    try:
+        [cyc] = lockcycle.find([(a, None), (b, None), (c, None)])
+        assert [m["id"] for m in cyc["members"]] == ["alpha task #1", "alpha task #3", "beta task #2"]
+        assert cyc["locks"] == ["lock-a", "lock-b", "lock-c"] and cyc["projects"] == ["alpha", "beta"]
+        text = lockcycle.text(cyc)
+        assert "3 parties" in text and "project beta task #2 (run 20, pid 4102" in text
+        assert "of one width" in text   # no wide lock: no wait breaks the documented order
+        assert lockcycle.key(cyc) == lockcycle.key(lockcycle.find([(c, None), (a, None), (b, None)])[0])
+    finally:
+        for f in fs:
+            f.close()
+
+
+def test_lock_cycle_a_plain_chain_and_a_free_slot_raise_nothing(env, monkeypatch):
+    from ttp import daemon as dm, lockcycle
+    p = make(env)
+    d = p.state / "locks"
+    _ReapProcs(monkeypatch, {4101: {"start": "11"}, 4102: {"start": "11"}, 4103: {"start": "11"}}, None)
+    _cycle_procs(monkeypatch, {})
+    # 1 holds l1 and waits for l2; 2 holds l2 and waits for l3; 3 holds l3 and waits for nothing.
+    fs = (_cycle_party(d, "l1", "l2", "task #1 (run 1)", 4101, task=1)
+          + _cycle_party(d, "l2", "l3", "task #2 (run 2)", 4102, task=2)
+          + _cycle_party(d, "l3", None, "task #3 (run 3)", 4103, task=3))
+    try:
+        g = lockcycle.graph([(d, p.name)])
+        assert sorted(e[:2] for e in g["edges"]) == [(f"{p.name} task #1", f"{p.name} task #2"),
+                                                      (f"{p.name} task #2", f"{p.name} task #3")]
+        dm.Daemon(p.base).reap_locks()
+        assert not p.db.q("SELECT id FROM messages WHERE ref LIKE 'lock-cycle:%'")
+        # 3 also waits for l1, but l1 has a second, free slot: 3 is not stuck behind 1.
+        free = d / "l1.1.lock"
+        free.write_text("{}")
+        fs.append(_cycle_ticket(d, "l1", "task #3 (run 3)", 4103))
+        assert not lockcycle.find([(d, p.name)])
+        free.unlink()
+        assert lockcycle.find([(d, p.name)])
+    finally:
+        for f in fs:
+            f.close()
+
+
+def test_lock_cycle_groups_nested_holders_outside_a_task_and_skips_cycles_of_other_projects(env, monkeypatch):
+    from ttp import daemon as dm, lockcycle
+    p = make(env)
+    d = p.state / "locks"
+    _ReapProcs(monkeypatch, {6100: {"start": "11"}, 6200: {"start": "11"}, 6300: {"start": "11"}}, None)
+    # One script holds x, and inside it a nested `ttp lock y`; its waiter for z runs below both. Another
+    # script holds z and waits for x: a two-party cycle, the nested holder in the first party.
+    _cycle_procs(monkeypatch, {6200: 6150, 6150: 6100, 6250: 6200, 6350: 6300})
+    fs = (_cycle_party(d, "x", None, "task #? (run ?)", 6100)
+          + _cycle_party(d, "y", "z", "task #? (run ?)", 6200, waiter_pid=6250)
+          + _cycle_party(d, "z", "x", "task #? (run ?)", 6300, waiter_pid=6350)
+          + [_cycle_ticket(d, "y", "task #? (run ?)", 6400)])   # a bystander waits for y: its holder counts
+    try:
+        [cyc] = lockcycle.find([(d, p.name)])
+        assert [m["id"] for m in cyc["members"]] == ["pid 6100", "pid 6300"]
+        assert cyc["members"][0]["holds"] == {"x", "y"}
+        other = lockcycle.find([(d, "elsewhere")])
+        assert other and other[0]["projects"] == ["elsewhere"]
+        # The daemon of a project that is in no party of the cycle raises nothing for it.
+        monkeypatch.setattr(lockcycle, "find", lambda dirs: other)
+        dm.Daemon(p.base).reap_locks()
+        assert not p.db.q("SELECT id FROM messages WHERE ref LIKE 'lock-cycle:%'")
+    finally:
+        for f in fs:
+            f.close()

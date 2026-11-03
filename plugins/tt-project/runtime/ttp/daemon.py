@@ -8690,8 +8690,11 @@ class Daemon:
         waits += lockreap.long_waits([checkcap.slot_dir()], limit, now, mine=mine, only={checkcap.RESOURCE},
                                      stuck_only=True)
         waits += lockreap.devq_waits(db, limit, now, current=_current_probe)
+        folded = self.alert_lock_cycles(now)
         keys = set()
         for w in waits:
+            if w["lock"] in folded:
+                continue   # the lock-cycle alert names it
             key = f"lock-wait:{w['lock']}"
             keys.add(key)
             if db.one("SELECT id FROM alerts WHERE key=? AND cleared IS NULL LIMIT 1", (key,)):
@@ -8700,9 +8703,47 @@ class Daemon:
             self.alert(key, lockreap.wait_text(w, now, got["kept"]), severity="normal")
         for ep in db.q("SELECT DISTINCT key FROM alerts WHERE key LIKE 'lock-wait:%' AND cleared IS NULL"):
             if ep["key"] not in keys:
-                alerts.close_key(db, ep["key"], "the wait ended", now=now,
-                                 text="Cleared: " + alerts.CLEARED_TEXT["lock-wait"].format(
+                lock = ep["key"].partition(":")[2]
+                alerts.close_key(db, ep["key"], "folded into a lock-cycle alert" if lock in folded else "the wait ended",
+                                 now=now, text=f"Lock {lock}: its wait is part of a lock-order cycle, alerted on its own."
+                                 if lock in folded else "Cleared: " + alerts.CLEARED_TEXT["lock-wait"].format(arg=lock))
+
+    def alert_lock_cycles(self, now: float) -> set[str]:
+        """Every tick, model-free (ttp.lockcycle): one critical lock-cycle:<hash> alert, at once, per
+        lock-order cycle among `ttp lock` holders and waiters on this host (the project's own locks and
+        every shared resource's) that a party of this project is in, naming every party and lock and the
+        wait that breaks the lock order; it clears once the cycle breaks. Returns the locks of the
+        cycles alerted, whose lock-wait alerts fold into them."""
+        from . import lockcycle
+        db = self.p.db
+        try:
+            dirs = [(self.p.state / "locks", self.p.name)] + [(d, None) for d in sorted(shared.root().iterdir())
+                                                               if d.is_dir()]
+        except OSError:
+            dirs = [(self.p.state / "locks", self.p.name)]
+        folded, keys = set(), set()
+        try:
+            found = lockcycle.find(dirs)
+        except Exception:   # the lock-wait alerts still go out; open cycle alerts stay as they are
+            log(self.p, "lock-cycle check: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            return set()
+        for c in found:
+            if self.p.name not in c["projects"]:
+                continue   # routed to the projects in it
+            key = lockcycle.key(c)
+            keys.add(key)
+            folded.update(c["locks"])
+            if db.one("SELECT id FROM alerts WHERE key=? AND cleared IS NULL LIMIT 1", (key,)):
+                db.x("UPDATE alerts SET last=? WHERE key=? AND cleared IS NULL", (now, key))
+                continue
+            self.alert(key, lockcycle.text(c, self.cfg), severity="critical", every_s=0)
+            log(self.p, f"{key}: lock-order cycle over {', '.join(c['locks'])} alerted")
+        for ep in db.q(f"SELECT DISTINCT key FROM alerts WHERE key LIKE '{lockcycle.KEY}:%' AND cleared IS NULL"):
+            if ep["key"] not in keys:
+                alerts.close_key(db, ep["key"], "the cycle broke", now=now,
+                                 text="Cleared: " + alerts.CLEARED_TEXT[lockcycle.KEY].format(
                                      arg=ep["key"].partition(":")[2]))
+        return folded
 
     def reap_task_records(self) -> None:
         """Every taskreap.SWEEP_EVERY_S, model-free (ttp.taskreap): release the reservations and device-queue
