@@ -1084,8 +1084,8 @@ def test_chatbridge_stats_keep_the_scrubbed_upstream_status_and_error_code(mock_
         st500 = b.stats()
         _post(b, hi)
         ok = b.stats()
-    # A missing model and a 5xx are the same fault kind, told apart by the upstream status and code.
-    assert st404["last_fault"] == st500["last_fault"] == "error"
+    # A missing model is model_missing (#5194), a 5xx an error; each keeps its upstream status and code.
+    assert (st404["last_fault"], st500["last_fault"]) == ("model_missing", "error")
     assert st404["upstream"] == {"status": 404, "code": "model_not_found"}
     assert st500["upstream"] == {"status": 500}
     assert "upstream" not in ok and ok["last_fault"] == ""   # a good answer clears it
