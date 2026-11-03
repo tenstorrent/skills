@@ -50,7 +50,7 @@ from collections import Counter, deque
 from pathlib import Path
 
 from . import (checkcap, checkdirs, cleantree, conflictfix, cyclenotice, envfault, locks, push, pushpass, runner, scopehold,
-               scriptwatch, workerloss, urgent,
+               scriptwatch, testslots, workerloss, urgent,
                sharedchecks, slowtests, suitecost, verdictcarry, worktree)
 from .project import Project, command_env, durable_write, write_json
 from . import gitmemo
@@ -190,6 +190,12 @@ def _kill(proc: subprocess.Popen) -> None:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         pass
+
+
+def _check_argv(cmd, wt: Path) -> list[str]:
+    """How a batch check runs: push.check_argv at a low CPU and IO priority (testslots.low_priority),
+    as `ttp push` (push._run_one) and `ttp checks` run theirs."""
+    return testslots.low_priority(push.check_argv(cmd, wt))
 
 
 def _stream(cmd: str | list[str], cwd: Path, env: dict | None = None, timeout: float | None = None,
@@ -1642,7 +1648,7 @@ class Batch:
 
         def once():
             collect.reset()
-            return _stream(push.check_argv(cmd, self.wt), self.wt, env=run_env, pass_fds=checkdirs.inherited(),
+            return _stream(_check_argv(cmd, self.wt), self.wt, env=run_env, pass_fds=checkdirs.inherited(),
                            collect=collect)
         reruns = 0
         while True:
@@ -1697,7 +1703,7 @@ class Batch:
         self._checkout(at)
         rx = "^(?:" + "|".join(re.escape(n) for n in sorted({i.rpartition("::")[2] for i in ids})) + ")$"
         self.checks["reruns"] = self.checks.get("reruns", 0) + 1
-        rc, tail, late = _stream(push.check_argv(cmd, self.wt), self.wt,
+        rc, tail, late = _stream(_check_argv(cmd, self.wt), self.wt,
                                  env={**env, **pushpass.select_env(rx, env), **slot_env},
                                  timeout=_seconds(self.d.get("push_rerun_s"), RERUN_S), group=True,
                                  pass_fds=checkdirs.inherited())
@@ -1800,7 +1806,7 @@ class Batch:
                                                priority=push.priority_key(self.repo, self.remote, self.branch), proj=self.p)
                         started = time.time()
                     say(f"cap probe of {head[:10]}: {cmd}")
-                    rc, tail, _ = _stream(push.check_argv(cmd, self.wt), self.wt,
+                    rc, tail, _ = _stream(_check_argv(cmd, self.wt), self.wt,
                                           env={**env, **pushpass.select_env(rx, env), **slot.env()},
                                           pass_fds=checkdirs.inherited())
                     if fault := push.remote_fault(cmd, rc, self.wt):
