@@ -32343,10 +32343,10 @@ def test_a_daemon_queued_continue_hop_carries_its_parent_branch_head_and_changed
     wide = hop2["spec"].partition("\n\n")[2].splitlines()
     assert len(wide) == chaincap.BRIEF_MAX_LINES and wide[-1] == f"+{60 - (len(wide) - 3)} more files", wide
     assert "60 files" in wide[1] and wide[2] == "- m00.py (+1 -0): 1"
-    # No branch to read (its ref is gone): the hop is queued, its spec as the follow-up wrote it.
+    # No branch to read (its ref is gone): the commit in its own worktree still queues the hop, its spec
+    # as the follow-up wrote it.
     gone = lambda tid, _head: p.db.update_task(tid, branch="no-such-branch")
     root3, *_ = _finish_code(env, p, "gone", {"c.py": 2}, result=_cont("gone"), before=gone)
-    assert chaincap.auto_hop(p, p.config(), p.db.task(root3), _cont("gone")["followups"][0], "1 new commit")
     (hop3,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root3,))
     assert hop3["spec"] == "Carry on with gone from its branch.", hop3["spec"]
     assert chaincap.branch_brief(p, {"branch": None}) == chaincap.branch_brief(p, {"branch": "nope"}) == ""
@@ -32402,12 +32402,10 @@ def test_a_continue_hop_with_progress_is_queued_by_the_daemon_without_a_coordina
     assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (hop2["id"],)), "a hop without progress was continued"
     assert p.db.one("SELECT status FROM events WHERE task=? AND kind='task_done'", (hop2["id"],))["status"] == "queued"
     assert p.db.one("SELECT status FROM events WHERE task=? AND kind='followup_proposed'", (hop2["id"],))["status"] == "queued"
-    # New passing evidence is progress: a metric that is new or changed against the previous hop's.
+    # Metrics alone are no code hop's progress (a non-code hop's: chaincap_cases).
     ch = chaincap.chain(p.db, hop2["id"])
     assert chaincap.progress(p, ch, 2) == ""
     p.db.update_task(hop2["id"], result=json.dumps({"status": "done", "metrics": {"passed": 12}}))
-    assert chaincap.progress(p, chaincap.chain(p.db, hop2["id"]), 2) == "new evidence: passed"
-    p.db.update_task(hop1["id"], result=json.dumps({"status": "done", "metrics": {"passed": 12}}))
     assert chaincap.progress(p, chaincap.chain(p.db, hop2["id"]), 2) == ""
     line = next(x for x in audit.lines(p.db) if x.startswith("continue chains"))
     assert f"#{root} feature: 2 hops to #{hop2['id']}" in line and "2 auto" in line
@@ -32562,10 +32560,11 @@ def test_a_daemon_queued_code_hop_whose_predecessor_already_landed_starts_at_onc
     assert not reviews and p.db.one("SELECT 1 FROM task_superseded WHERE task=?", (root,))
     assert not any(x.startswith("start_when:") for x in _labels(p, hop["id"])) and _ready(p, hop["id"])
     assert f"Continue hop #{hop['id']} queued by the daemon (1 new commit)." in done["text"]
-    # A code hop that committed nothing has nothing to land: its next hop starts at once too.
+    # A code hop that committed nothing gets no next hop on its metrics alone: the coordinator decides.
+    from ttp import chaincap
     _hop(env, p, hop["id"], {}, dict(_cont("feature, part 2"), metrics={"passed": 3}))
-    (nxt,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (hop["id"],))
-    assert not any(x.startswith("start_when:") for x in _labels(p, nxt["id"])) and _ready(p, nxt["id"])
+    assert not p.db.q("SELECT * FROM tasks WHERE parent=?", (hop["id"],))
+    assert p.db.one("SELECT status FROM events WHERE kind=? AND task=?", (chaincap.NO_COMMIT_EVENT, hop["id"]))
 
 
 def test_a_daemon_queued_code_hop_waits_for_no_landing_where_its_review_pushes_nothing(env, monkeypatch):

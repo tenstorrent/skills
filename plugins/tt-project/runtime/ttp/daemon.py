@@ -4514,7 +4514,7 @@ class Daemon:
                     self._review_area(dict(task, result=dump_result(result)))
                 fups = [f for f in result.get("followups") or [] if isinstance(f, dict)]
                 if result.get("status") == "done":
-                    self._prefetch_hop(task, fups)
+                    self._prefetch_hop(dict(task, result=dump_result(result)), fups)
                 if result.get("status") == "done" and self._lone_continue(task, fups) \
                         and isinstance(fups[0].get("spec"), str) and fups[0]["spec"].strip():
                     spec = chaincap.hop_spec(self.p, task, fups[0])   # the one hop the body may queue
@@ -4539,7 +4539,7 @@ class Daemon:
         if self._lone_continue(task, fups):
             ch = chaincap.chain(self.p.db, task["id"])
             if ch and ch[-1]["id"] == task["id"]:
-                ch[-1] = dict(ch[-1], status="done")   # as it is inside the transaction
+                ch[-1] = dict(ch[-1], status="done", result=task.get("result"))   # as it is inside the transaction
             for i in range(len(ch)):   # hop_ready's progress, and its stalls cap's
                 chaincap.progress(self.p, ch, i)
 
@@ -5341,6 +5341,13 @@ class Daemon:
         refused: list[str] = []
         hop = self._auto_continue(db.task(task["id"]) or dict(task, **upd), fups, ready, refused) \
             if ready and not fix and (review or split or not changes or landed_now) else None
+        if not ready and new == "done" and task["kind"] == "code" and not approval and not notes \
+                and sev == "normal" and self._lone_continue(task, fups):
+            try:   # metrics alone never queue a code hop: the coordinator decides (chaincap.NO_COMMIT_EVENT)
+                if chaincap.no_commit_event(self.p, self.cfg, db.task(task["id"]) or dict(task, **upd), fups[0]):
+                    text += f"\n{chaincap.NO_COMMIT_TRIGGER}: its continue was not queued."
+            except Exception:
+                log(self.p, f"no-commit check after #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
         if hop:
             folded.add(id(fups[0]))
             text += f"\nContinue hop #{hop[0]} queued by the daemon ({hop[1]})" + (

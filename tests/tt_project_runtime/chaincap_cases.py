@@ -950,3 +950,112 @@ def test_a_follow_up_that_only_mentions_ttp_push_own_keeps_its_kind(env):
         (t,) = p.db.q("SELECT * FROM tasks WHERE title=?", (f"Look at the dial run {i}",))
         assert t["kind"] == "harness" and "pr_branch" not in (t["labels"] or ""), (spec, t["labels"])
         assert publishkind.resolve(p.db, "harness", spec) is None
+
+
+def _own_clone(p, tid, commit_now):
+    """A standalone clone at task `tid`'s worktree path (as a worker makes one where the project root is
+    no git repo): one old commit, and one made now when `commit_now`."""
+    path = p.worktrees / f"t{tid}"
+    path.mkdir(parents=True)
+    old = {**os.environ, "GIT_COMMITTER_DATE": "@1000000000 +0000", "GIT_AUTHOR_DATE": "@1000000000 +0000"}
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    (path / "base.py").write_text("base\n")
+    for args, e in ((["add", "."], None), ([*_IDENT, "commit", "-qm", "base"], old)):
+        subprocess.run(["git", "-C", str(path), *args], check=True, env=e)
+    if commit_now:
+        (path / "more.py").write_text("more\n")
+        _git_out(path, "add", ".")
+        _git_out(path, *_IDENT, "commit", "-qm", "more")
+    return path
+
+
+def _code_hop_done(env, p, commit_now, metrics=None):
+    """A done code root and a hop of it with no branch recorded, run in its own clone, that hands off a
+    `continue:` and `metrics`: (root, hop)."""
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    root = _chain_root(p, "port the parser", 1.0)
+    hop = p.db.add_task("continue: port the parser", "Carry on.", kind="code", origin="coordinator",
+                        labels=[f"continues:{root}"])
+    p.db.update_task(hop, status="running")
+    _own_clone(p, hop, commit_now)
+    run_dir = env["tmp"] / f"run-{hop}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps(
+        {"status": "done", "summary": "parser: part done", "metrics": metrics or {"passed": 3},
+         "followups": [{"title": "continue: port the parser", "spec": "Carry on with the parser."}]}))
+    Daemon(p.base)._finish_worker({"task": hop}, Usage(cost_usd=1.0), "ok", run_dir)
+    return root, hop
+
+
+def test_a_code_hop_whose_own_clone_has_a_new_commit_gets_its_continue_queued(env):
+    """No branch recorded (a project root that is no git repo): the commit made in the hop's own clone
+    during its run is its progress, and its continue is queued by the daemon."""
+    from ttp import chaincap
+    p = make(env)
+    root, hop = _code_hop_done(env, p, commit_now=True)
+    (nxt,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (hop,))
+    assert nxt["title"] == "continue: port the parser" and nxt["status"] == "queued"
+    assert chaincap.progress(p, chaincap.chain(p.db, hop), 1) == "1 new commit"
+    assert not p.db.q("SELECT id FROM events WHERE kind=?", (chaincap.NO_COMMIT_EVENT,))
+
+
+def test_a_code_hop_with_new_metrics_but_no_commit_raises_one_replan_event_and_no_continue(env):
+    """Metrics alone are no code hop's progress: no continue is queued (the commit in its clone predates
+    its run) and exactly one NO_COMMIT_EVENT names the task and its continue for the coordinator."""
+    from ttp import chaincap
+    from ttp import coordinator as coord
+    p = make(env)
+    root, hop = _code_hop_done(env, p, commit_now=False, metrics={"passed": 12})
+    assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (hop,)), "metrics alone queued a code hop"
+    (ev,) = p.db.q("SELECT * FROM events WHERE kind=?", (chaincap.NO_COMMIT_EVENT,))
+    assert ev["status"] == "queued" and ev["task"] == hop and ev["text"].startswith(chaincap.NO_COMMIT_TRIGGER)
+    assert f"#{hop}" in ev["text"] and "'continue: port the parser'" in ev["text"]
+    data = json.loads(ev["data"])
+    assert data["continue"] == "continue: port the parser" and data["root"] == root and data["task"] == hop
+    assert chaincap.progress(p, chaincap.chain(p.db, hop), 1) == ""
+    # Once only: the same hand-off checked again raises no second event.
+    fup = {"title": "continue: port the parser", "spec": "Carry on."}
+    assert not chaincap.no_commit_event(p, p.config(), p.db.task(hop), fup)
+    assert len(p.db.q("SELECT id FROM events WHERE kind=?", (chaincap.NO_COMMIT_EVENT,))) == 1
+    assert chaincap.NO_COMMIT_TRIGGER in coord.effort_triggers(p.db, p.config(), [ev["id"]], None)[0]
+
+
+def test_code_hop_commits_read_its_clone_run_windows_and_named_shas_where_the_root_is_no_git_repo(env, tmp_path):
+    """Where the project root is no git repo: only commits inside the hop's runs count, from its own
+    clone's HEAD or a sha its hand-off names; a non-code hop keeps metrics as evidence."""
+    from ttp import chaincap
+    p = make(env)
+    plain = tmp_path / "plain-root"
+    plain.mkdir()
+    q = types.SimpleNamespace(db=p.db, root=plain, worktrees=tmp_path / "wts")
+    root = _chain_root(p, "port", 1.0)
+    hop = _chain_hop(p, root, "continue: port", 1.0)
+    p.db.update_task(hop, result=json.dumps({"status": "done", "metrics": {"passed": 3}}))
+    path = _own_clone(q, hop, commit_now=True)
+    ch = chaincap.chain(p.db, hop)
+    assert chaincap.progress(q, ch, 1) == "1 new commit"
+    # A run that ended before the commit: nothing counts, metrics or not.
+    now = time.time()
+    p.db.x("INSERT INTO runs(task, role, started, ended) VALUES(?,?,?,?)", (hop, "worker", now - 600, now - 300))
+    assert chaincap.code_commits(q, p.db.task(hop)) == 0 and chaincap.progress(q, chaincap.chain(p.db, hop), 1) == ""
+    # A named sha inside a run counts even off HEAD (the clone moved on to another branch).
+    p.db.x("UPDATE runs SET ended=? WHERE task=?", (now + 60, hop))
+    head = _git_out(path, "rev-parse", "HEAD").strip()
+    _git_out(path, "checkout", "-q", "HEAD~1")
+    p.db.update_task(hop, result=json.dumps({"status": "done", "summary": f"committed {head[:12]}"}))
+    assert chaincap.named_shas(p.db.task(hop)) == [head[:12]]
+    assert chaincap.code_commits(q, p.db.task(hop)) == 1
+    # A non-code hop: new metrics are still its evidence.
+    work = p.db.add_task("measure", "s", kind="work", origin="daemon", labels=[f"continues:{hop}"])
+    p.db.update_task(work, status="done", result=json.dumps({"status": "done", "metrics": {"latency_ms": 9}}))
+    assert chaincap.progress(q, chaincap.chain(p.db, work), 2) == "new evidence: latency_ms"
+
+
+def test_a_non_code_hop_with_new_metrics_still_gets_its_continue_queued(env):
+    from ttp import chaincap
+    p = make(env)
+    fup = {"title": "continue: check the gate", "spec": "Check the next gate."}
+    tid = _harness_done(env, p, "check the gate", fup, metrics={"checked": 4})
+    assert p.db.q("SELECT id FROM tasks WHERE parent=?", (tid,)), "a non-code hop with new metrics was not continued"
+    assert not p.db.q("SELECT id FROM events WHERE kind=?", (chaincap.NO_COMMIT_EVENT,))

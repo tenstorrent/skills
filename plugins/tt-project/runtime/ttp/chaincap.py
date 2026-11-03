@@ -12,6 +12,11 @@ Progress (a done hop, against the task before it in the chain; the root against 
   earlier task in the lineage, that the base does not contain; or
 - new passing evidence: a `metrics` entry in its hand-off that is new or changed against the
   previous task's.
+A code hop counts commits only (code_commits): ones whose committer time falls inside its runs, read
+from its own worktree or clone (worktrees/t<id>, also where the project root is no git repository),
+its branch and pr_branch, and the shas its hand-off names. Metrics alone are never a code hop's
+progress. A code hop with no new commit whose only proposal is a `continue:` gets no hop queued: one
+NO_COMMIT_EVENT (NO_COMMIT_TRIGGER) names the task and its continue, and the coordinator decides.
 
 Caps (`chains` in project.json; 0 turns one off): max_hops (DEFAULTS: 8), max_stalls (2 failed or
 no-progress hops in a row) and max_usd (40 for the whole lineage). Once one is reached, or while
@@ -74,6 +79,10 @@ CAP_EVENT = "continue_cap"
 OVERRIDE_EVENT = "continue_cap_override"
 AUTO_EVENT = "continue_auto"
 TRIGGER = "continue chain over its cap"
+NO_COMMIT_EVENT = "continue_no_commit"   # a code hop with no new commit asked for its continue (no_commit_event)
+NO_COMMIT_TRIGGER = "re-plan: no new commit"
+HANDOFF_SHA = re.compile(r"(?<![\w-])[0-9a-f]{7,40}(?![\w-])")
+MAX_NAMED = 10   # hand-off shas read per hop
 FOLLOWS = "follows:"   # label of a task_add that `continues` a done task: a lineage link that takes nothing over
 NOTICES_KEY = "chain_notices"   # kv: [{ts, text}]: hops the daemon queued, shown once in the next digest
 MAX_CHAIN = 200
@@ -176,12 +185,80 @@ def _metrics(task: dict | None) -> dict:
     return m if isinstance(m, dict) else {}
 
 
+def run_windows(db: DB, task: dict, now: float | None = None) -> list[tuple[int, int]]:
+    """The whole seconds `task`'s runs spanned (a running one up to now); with no run recorded, from its
+    creation to now."""
+    now = time.time() if now is None else now
+    rows = db.q("SELECT started, ended FROM runs WHERE task=? AND started IS NOT NULL", (task["id"],))
+    spans = [(float(r["started"]), float(r["ended"] or now)) for r in rows] or [(float(task.get("created") or 0), now)]
+    return [(int(a), -int(-b // 1)) for a, b in spans]
+
+
+def named_shas(task: dict) -> list[str]:
+    """The commit hashes `task`'s hand-off names: `commit`, `head`, `sha`, a `commits` list, then any in
+    its summary (unresolved, at most MAX_NAMED)."""
+    res = load_result(task.get("result"))
+    named = [str(res.get(k) or "").strip() for k in ("commit", "head", "sha")]
+    commits = res.get("commits")
+    named += [str(c).strip() for c in commits] if isinstance(commits, list) else []
+    named += HANDOFF_SHA.findall(str(res.get("summary") or ""))
+    return [c for c in dict.fromkeys(named) if HANDOFF_SHA.fullmatch(c)][:MAX_NAMED]
+
+
+def code_commits(p, hop: dict, earlier=(), now: float | None = None) -> int:
+    """The commits code hop `hop` made: committer time inside its runs (run_windows), read from its own
+    worktree or clone, its branch and pr_branch (each where it resolves: the worktree, the project
+    root) less the base and the `earlier` tasks' branches it started from, and the shas its hand-off
+    names. A source git cannot read adds none."""
+    from . import worktree
+    wins = run_windows(p.db, hop, now)
+    lo = min(a for a, _ in wins)
+    found: dict[str, int] = {}
+
+    def log(repo, *args: str) -> None:   # missing revs add nothing (--ignore-missing)
+        try:
+            out = worktree._git(repo, "log", "--ignore-missing", "--format=%H %ct", *args, check=False)
+        except Exception:
+            return
+        for line in out.splitlines():
+            sha, _, ct = line.partition(" ")
+            if ct.isdigit():
+                found[sha] = int(ct)
+
+    own = p.worktrees / f"t{hop['id']}"
+    pr = worktree.recorded_pr_branch(hop) or ""
+    branches = [b for b in dict.fromkeys((hop.get("branch") or "", pr)) if b and worktree.valid_branch(b)]
+    shas = named_shas(hop)
+    repos = [r for r in (own, p.root) if r.is_dir() and worktree.is_git(r)]
+    common = lambda r: worktree._git(r, "rev-parse", "--path-format=absolute", "--git-common-dir", check=False)  # noqa: E731
+    try:   # the base only in the root's own refs (a linked worktree shares them; a clone's same name is its own)
+        base = f"^{worktree.resolve_base(p)}" if p.root in repos else ""
+    except Exception:
+        base = ""
+    not_ = [f"^refs/heads/{b}" for b in dict.fromkeys(earlier) if b and worktree.valid_branch(b)]
+    for repo in repos:
+        shared = base and (repo == p.root or common(repo) == common(p.root))
+        if refs := (["HEAD"] if repo == own else []) + [f"refs/heads/{b}" for b in branches]:
+            log(repo, f"--since=@{lo}", "--max-count=500", *refs, *not_, *([base] if shared else []))
+        if shas:
+            log(repo, "--no-walk=unsorted", *shas)
+    return sum(1 for ct in found.values() if any(a <= ct <= b for a, b in wins))
+
+
 def progress(p, ch: list[dict], i: int) -> str:
     """Why hop `ch[i]` made progress (see the module's rule), or '' when it did not."""
     from . import worktree
     hop = ch[i]
     if hop["status"] != "done":
         return ""
+    if hop.get("kind") == "code":   # commits only: metrics alone are no code hop's progress
+        try:
+            earlier = tuple(t.get("branch") or "" for t in ch[:i])
+            n = gitmemo.cached(("chaincap.code_commits", hop["id"], hop.get("branch") or "", earlier,
+                                tuple(named_shas(hop))), lambda: code_commits(p, hop, earlier))
+        except Exception:
+            n = 0
+        return f"{n} new commit{'' if n == 1 else 's'}" if n else ""
     def count() -> str:
         base = worktree.resolve_base(p)
         refs = [b for t in ch[:i + 1] if (b := t.get("branch"))
@@ -303,6 +380,29 @@ def hop_ready(p, cfg: dict, task: dict, fup: dict) -> str:
     if not ch or refusal(p, cfg, ch):
         return ""
     return progress(p, ch, len(ch) - 1)
+
+
+def no_commit_event(p, cfg: dict, task: dict, fup: dict) -> bool:
+    """For done code task `task` whose only proposal is the `continue:` follow-up `fup` and that hop_ready
+    refused for no new commit alone (auto on, its lineage under every cap): one NO_COMMIT_EVENT naming
+    the task and that continue, so the coordinator decides. Whether one was raised now."""
+    if task.get("kind") != "code" or not caps(cfg)["auto"] or not CONT_TITLE.match(str(fup.get("title") or "")):
+        return False
+    ch = chain(p.db, task["id"])
+    if not ch or refusal(p, cfg, ch) or progress(p, ch, len(ch) - 1):
+        return False
+    fp = f"{NO_COMMIT_EVENT}:{task['id']}"
+    if p.db.one("SELECT 1 FROM events WHERE fingerprint=?", (fp,)):
+        return False
+    title, spec = str(fup.get("title") or "").strip()[:200], str(fup.get("spec") or "").strip()[:500]
+    text = (f"{NO_COMMIT_TRIGGER}: code task #{task['id']} ({str(task['title'])[:80]}) ended with no new commit "
+            f"in its runs, so its continue was not queued: {title!r}. Queue it with continues #{task['id']} "
+            f"if work is left, re-plan it, or drop it.")
+    p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
+           (time.time(), f"task:{task['id']}", NO_COMMIT_EVENT, fp, "normal", text,
+            json.dumps({"root": ch[0]["id"], "task": task["id"], "hops": len(ch) - 1, "continue": title, "spec": spec}),
+            "queued", task["id"]))
+    return True
 
 
 def marked_split(result: dict, subject: str = "") -> bool:

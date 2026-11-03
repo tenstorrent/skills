@@ -3806,6 +3806,9 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
     # A continue chain at its cap: another hop needs a reason that names what changed (chaincap).
     if any(r["kind"] == chaincap.CAP_EVENT for r in rows):
         add(chaincap.TRIGGER)
+    # A code hop with no new commit asked for its continue: the coordinator decides on it (chaincap).
+    if any(r["kind"] == chaincap.NO_COMMIT_EVENT for r in rows):
+        add(chaincap.NO_COMMIT_TRIGGER)
     # Holds that wait on nothing anyone will act on (anchors.py): the daemon raises each new set once.
     if any(r["kind"] == anchors.STALE_EVENT for r in rows):
         add(anchors.TRIGGER)
