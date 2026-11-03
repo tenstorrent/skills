@@ -157,6 +157,9 @@ def held(p: Project, tid: int) -> str | None:
     return None
 
 
+LAND_LOCK_WAIT_S = 5.0   # land's wait for the memory index lock (Project.memory_locked) before 'busy'
+
+
 def land(p: Project, tid: int) -> str:
     """Merge harness task `tid`'s worktree branch into the harness checkout (call it when no run of
     the task is live); remove the worktree and branch once nothing is left in them and nothing holds
@@ -174,18 +177,25 @@ def land(p: Project, tid: int) -> str:
     ahead = _git(p.harness, "rev-list", "--count", f"HEAD..{b}")
     outcome = ""
     if ahead.returncode == 0 and int(ahead.stdout.strip() or 0) > 0:
-        _commit_memory(p, tid)
-        before = _git(p.harness, "rev-parse", "HEAD").stdout.strip()
-        pair = [_git(p.harness, "rev-parse", b).stdout.strip(), before]
-        last = (p.db.kv(CONFLICT_KEY, {}) or {}).get(str(tid))
-        if last == pair + ["conflict"]:
-            return "conflict-known"     # the same two commits conflict again: no merge until one moves
-        r = _git(p.harness, "merge", "--no-edit", "-m", f"{MERGE_MSG} #{tid} ({b})", b, timeout=120)
+        # The memory commit and the merge hold the memory index lock: an index write waits for both,
+        # so none lands between git's look at MEMORY.md and the merge rewriting it.
+        with p.memory_locked(LAND_LOCK_WAIT_S) as locked:
+            if not locked:
+                return "busy"   # a writer holds it past the bound: the next pass tries again
+            _commit_memory(p, tid)
+            before = _git(p.harness, "rev-parse", "HEAD").stdout.strip()
+            pair = [_git(p.harness, "rev-parse", b).stdout.strip(), before]
+            last = (p.db.kv(CONFLICT_KEY, {}) or {}).get(str(tid))
+            if last == pair + ["conflict"]:
+                return "conflict-known"     # the same two commits conflict again: no merge until one moves
+            r = _git(p.harness, "merge", "--no-edit", "-m", f"{MERGE_MSG} #{tid} ({b})", b, timeout=120)
+            conflicted = False
+            if r.returncode != 0:
+                conflicted = bool(_git(p.harness, "diff", "--name-only", "--diff-filter=U").stdout.strip())
+                if conflicted:
+                    _git(p.harness, "merge", "--abort")
         if r.returncode != 0:
             said = (r.stdout + r.stderr).strip()
-            conflicted = bool(_git(p.harness, "diff", "--name-only", "--diff-filter=U").stdout.strip())
-            if conflicted:
-                _git(p.harness, "merge", "--abort")
             # a refusal over files another live run is editing passes when it commits; else it needs a hand
             if conflicted or ("would be overwritten" in said and not checkout_busy(p, tid)):
                 # a refusal leaves no MERGE_HEAD and passes once the checkout's changes go: tried each pass

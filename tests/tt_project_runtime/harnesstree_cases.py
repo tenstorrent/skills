@@ -260,3 +260,102 @@ def test_a_harness_merge_leaves_memory_files_alone_while_another_harness_run_wor
     assert harnesstree.land(p, b) == "busy"
     assert _hgit(p.harness, "rev-parse", "HEAD").strip() == head and entry.exists()
     assert _hgit(p.harness, "status", "--porcelain", "--", "MEMORY.md", "memory").strip()
+
+
+def _ht_write_during_merge(p, monkeypatch, write):
+    """Run `write(project)` on another thread (its own Project and database connection) once land
+    starts its merge, giving it 0.5 s to finish before the merge runs. Returns the record: `early`
+    True when the write finished before the merge (nothing made it wait), `err` its exception."""
+    from ttp import harnesstree
+    from ttp.project import Project
+    real, seen = harnesstree._git, {}
+
+    def run():
+        try:
+            write(Project(p.base))
+        except Exception as e:   # pragma: no cover - surfaced by the test's assertion
+            seen["err"] = e
+
+    def git(cwd, *args, **kw):
+        if args[:1] == ("merge",) and "--abort" not in args and "t" not in seen:
+            seen["t"] = threading.Thread(target=run)
+            seen["t"].start()
+            seen["t"].join(0.5)
+            seen["early"] = not seen["t"].is_alive()
+        return real(cwd, *args, **kw)
+    monkeypatch.setattr(harnesstree, "_git", git)
+    return seen
+
+
+def test_a_memory_append_during_a_harness_merge_of_memory_md_waits_and_survives(env, monkeypatch):
+    """Before: an append landing while land merged a branch that changed MEMORY.md made git refuse the
+    merge (or lose the line); now the append waits for the merge and lands on the merged index."""
+    p = make(env)
+    from ttp import harnesstree
+    a, b = _harness_task(p, "a"), _harness_task(p, "b")
+    _harness_run(p, a)
+    own = harnesstree.workdir(p, b)   # a works in the checkout: b gets a worktree
+    p.db.x("UPDATE runs SET status='done'")
+    _ht_memory_index_edit(p, own)
+    p.db.update_task(b, status="done")
+    got = {}
+    seen = _ht_write_during_merge(p, monkeypatch, lambda q: got.setdefault("e", q.add_memory("learned mid-merge")))
+    assert harnesstree.land(p, b) == "merged"
+    seen["t"].join(30)
+    assert not seen.get("err") and seen["early"] is False   # the append waited for the merge
+    index = (p.harness / "MEMORY.md").read_text()
+    assert "(edited by the task)" in index and f"memory/{got['e'].name}" in index
+    assert f"memory/{got['e'].name}" in _hgit(p.harness, "show", "HEAD:MEMORY.md")   # and in a commit
+    assert not _hgit(p.harness, "status", "--porcelain", "--", "MEMORY.md", "memory").strip()
+
+
+def test_a_memory_retirement_during_a_harness_merge_of_memory_md_waits_for_it(env, monkeypatch):
+    p = make(env)
+    from ttp import harnesstree
+    a, b = _harness_task(p, "a"), _harness_task(p, "b")
+    _harness_run(p, a)
+    own = harnesstree.workdir(p, b)   # a works in the checkout: b gets a worktree
+    p.db.x("UPDATE runs SET status='done'")
+    _ht_memory_index_edit(p, own)
+    gone = p.add_memory("retired mid-merge", kind="fact")   # committed on the main line, below b's edit
+    p.db.update_task(b, status="done")
+    seen = _ht_write_during_merge(p, monkeypatch, lambda q: q.forget_memory(gone.stem, why="test"))
+    assert harnesstree.land(p, b) == "merged"
+    seen["t"].join(30)
+    assert not seen.get("err") and seen["early"] is False   # the rewrite waited for the merge
+    index = (p.harness / "MEMORY.md").read_text()
+    assert "(edited by the task)" in index and gone.name not in index and "older 3" in index
+    assert (p.memory_dir / "archive" / gone.name).exists() and not gone.exists()
+    assert not _hgit(p.harness, "status", "--porcelain", "--", "MEMORY.md", "memory").strip()
+
+
+def test_a_memory_lock_held_past_its_bound_never_deadlocks_land_or_the_writers(env, monkeypatch):
+    import fcntl
+    from ttp import harnesstree, project
+    p = make(env)
+    a, b = _harness_task(p, "a"), _harness_task(p, "b")
+    _harness_run(p, a)
+    own = harnesstree.workdir(p, b)
+    p.db.x("UPDATE runs SET status='done'")
+    _ht_memory_index_edit(p, own)
+    old = p.add_memory("retired past the stuck lock", kind="fact")
+    p.db.update_task(b, status="done")
+    with p.memory_locked() as outer, p.memory_locked() as inner:
+        assert outer and inner   # re-entrant in one thread
+    monkeypatch.setattr(project, "MEMORY_LOCK_WAIT_S", 0.2)
+    monkeypatch.setattr(harnesstree, "LAND_LOCK_WAIT_S", 0.2)
+    fd = os.open(str(p.state / project.MEMORY_LOCK), os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)   # a hung holder: never lets go on its own
+        head, t0 = _hgit(p.harness, "rev-parse", "HEAD"), time.monotonic()
+        assert harnesstree.land(p, b) == "busy" and _hgit(p.harness, "rev-parse", "HEAD") == head
+        entry = p.add_memory("written past the stuck lock", commit=False)   # waits, then writes anyway
+        p.forget_memory(old.stem, why="test")
+        assert time.monotonic() - t0 < 10
+        index = (p.harness / "MEMORY.md").read_text()
+        assert f"memory/{entry.name}" in index and old.name not in index
+    finally:
+        os.close(fd)
+    assert harnesstree.land(p, b) == "merged"   # the next pass, once the holder let go
+    index = (p.harness / "MEMORY.md").read_text()
+    assert "(edited by the task)" in index and f"memory/{entry.name}" in index and old.name not in index

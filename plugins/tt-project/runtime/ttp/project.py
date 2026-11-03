@@ -1142,6 +1142,11 @@ def hostname() -> str:
 # The harness files only the daemon writes, which sweep_harness commits when a commit of them failed.
 SWEPT_PATHS = (":(glob)CHARTER*", "MEMORY.md", "memory")
 MEMORY_PATHS = ("MEMORY.md", "memory")   # of those, the memory index and entries
+# Project.memory_locked: one flock in state/ (never in the checkout git sees) for MEMORY.md writes and the
+# harness merge; how long a writer waits for it before it writes anyway.
+MEMORY_LOCK = "memory-index.lock"
+MEMORY_LOCK_WAIT_S = 20.0
+_MEMORY_HELD = threading.local()   # .paths: {lock path: depth} this thread holds
 
 # Memory kinds every prompt carries whatever the budget; decisions and facts fill what is left.
 PINNED_MEMORY_KINDS = ("restriction", "preference", "resource")
@@ -1278,6 +1283,55 @@ class Project:
 
     def exists(self) -> bool:
         return self.config_path.is_file()
+
+    @contextmanager
+    def memory_locked(self, wait_s: float | None = None) -> Iterator[bool]:
+        """Hold the memory index lock for one MEMORY.md write or a harness merge (harnesstree.land), so an
+        index write never lands between git's look at the file and its rewrite by the merge. Held only
+        for the write or merge, never across a model call. Waits up to `wait_s` (MEMORY_LOCK_WAIT_S),
+        polling; yields True once held, False past the bound or when the lock file cannot be opened:
+        the caller goes on (a writer writes anyway, never dropping its entry; land answers 'busy' and
+        tries next pass).
+        Re-entrant in one thread; a dead holder's flock goes with it."""
+        lock = str(self.state / MEMORY_LOCK)
+        held = _MEMORY_HELD.__dict__.setdefault("paths", {})
+        if held.get(lock):
+            held[lock] += 1
+            try:
+                yield True
+            finally:
+                held[lock] -= 1
+            return
+        try:
+            self.state.mkdir(parents=True, exist_ok=True)
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            fd = None
+        wait_s = MEMORY_LOCK_WAIT_S if wait_s is None else wait_s
+        got, end = False, time.monotonic() + max(wait_s, 0)
+        try:
+            while fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    got = True
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= end:
+                        self._git_log(f"memory index lock busy past {wait_s:g}s: going on without it")
+                        break
+                except OSError:   # a file system without flock: as before the lock
+                    break
+                time.sleep(0.05)
+            if got:
+                held[lock] = 1
+            try:
+                yield got
+            finally:
+                if got:
+                    held.pop(lock, None)
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     @property
     def db(self) -> DB:
@@ -1609,16 +1663,17 @@ class Project:
                 n += 1
         if dry_run:
             return path
-        if not same:
-            durable_write(path, f"---\nkind: {kind}\ncreated: {_stamp(time.time())}\n{front_matter(end or {})}"
-                                f"{'standing: true' + chr(10) if standing else ''}"
-                                f"{f'audience: {audience}' + chr(10) if audience in MEMORY_AUDIENCES else ''}{tag}"
-                                f"---\n{text}\n")
-        index = self.memory_index.read_text() if self.memory_index.exists() else ""
-        line = None
-        if f"](memory/{path.name})" not in index:
-            line = f"- [{title}](memory/{path.name}) ({kind}{', standing' if standing else ''})\n"
-            durable_append(self.memory_index, line)
+        with self.memory_locked():   # the entry and its line, never split by a harness merge
+            if not same:
+                durable_write(path, f"---\nkind: {kind}\ncreated: {_stamp(time.time())}\n{front_matter(end or {})}"
+                                    f"{'standing: true' + chr(10) if standing else ''}"
+                                    f"{f'audience: {audience}' + chr(10) if audience in MEMORY_AUDIENCES else ''}"
+                                    f"{tag}---\n{text}\n")
+            index = self.memory_index.read_text() if self.memory_index.exists() else ""
+            line = None
+            if f"](memory/{path.name})" not in index:
+                line = f"- [{title}](memory/{path.name}) ({kind}{', standing' if standing else ''})\n"
+                durable_append(self.memory_index, line)
 
         def undo() -> None:   # the transaction this ran in rolled back: so does the entry
             if not same:
@@ -1635,17 +1690,18 @@ class Project:
         """Undo an index change of a rolled-back transaction: the text `before` it while the index is
         still the `after` it wrote, else take out the lines `drop` and put back the lines `add`,
         leaving every other line (one another process wrote meanwhile) as it is."""
-        text = self.memory_index.read_text() if self.memory_index.exists() else ""
-        if before is not None and text == after:
-            durable_write(self.memory_index, before)
-            return
-        lines = text.splitlines(keepends=True)
-        for x in drop:
-            if x in lines:
-                lines.remove(x)
-        lines += [x for x in add if x not in lines]
-        if "".join(lines) != text:
-            durable_write(self.memory_index, "".join(lines))
+        with self.memory_locked():
+            text = self.memory_index.read_text() if self.memory_index.exists() else ""
+            if before is not None and text == after:
+                durable_write(self.memory_index, before)
+                return
+            lines = text.splitlines(keepends=True)
+            for x in drop:
+                if x in lines:
+                    lines.remove(x)
+            lines += [x for x in add if x not in lines]
+            if "".join(lines) != text:
+                durable_write(self.memory_index, "".join(lines))
 
     def _memory_entries(self) -> list[dict]:
         """Live memory entries, oldest first: `name` (the file stem shown in prompts), `kind`, `line`,
@@ -1886,12 +1942,14 @@ class Project:
         fsync_dir(self.memory_dir / "archive")
         fsync_dir(self.memory_dir)
         dropped, before, after = [], None, None
-        if moved and self.memory_index.exists():
-            before = self.memory_index.read_text()
-            lines = before.splitlines(keepends=True)
-            dropped = [x for x in lines if any(f"](memory/{n}.md)" in x for n in moved)]
-            after = "".join(x for x in lines if x not in dropped)
-            durable_write(self.memory_index, after)
+        if moved:
+            with self.memory_locked():   # read and rewrite as one step: no append or merge in between
+                if self.memory_index.exists():
+                    before = self.memory_index.read_text()
+                    lines = before.splitlines(keepends=True)
+                    dropped = [x for x in lines if any(f"](memory/{n}.md)" in x for n in moved)]
+                    after = "".join(x for x in lines if x not in dropped)
+                    durable_write(self.memory_index, after)
 
         def undo() -> None:   # the transaction this ran in rolled back: so does the retirement
             for n in moved:
