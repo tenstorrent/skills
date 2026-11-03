@@ -27124,6 +27124,7 @@ DURABLE_EXEMPT = {
     ("replica.py", 'open(out, "wb") as g'): "the gzipped database copy in state/replica-stage, a scratch folder removed after each snapshot and never read after a crash",
     ("replica.py", 'open(state / "project.db", "wb")'): "restore writes into a new, empty project folder; one cut off leaves the folder non-empty, which a rerun refuses, saying to remove it",
     ("conflictfix.py", 'with open(path, "w", encoding="utf-8", newline="") as f'): "git merge-file's inputs for the model-free conflict settler, in a temporary directory removed after",
+    ("hostrun.py", 'os.replace(q, folder / f"{rid}.running")'): "claims a queued host-run request (a rename, no new data): one lost to a crash leaves the request queued, and the restarted daemon runs it or drops it once its client gave up",
 }
 
 

@@ -21,13 +21,13 @@ import json
 import os
 import re
 import shlex
-import subprocess
 import sys
 import threading
 import time
 import uuid
 from pathlib import Path
 
+from . import boundedchild
 from .project import Project, durable_append, write_json
 
 QUEUE = "host-run"           # under the project's state: <id>.json requests, <id>.out.json answers
@@ -99,15 +99,14 @@ def _run(p: Project, rid: str, m: dict, allow: list[list[str]]) -> None:
                              f"coordinator to add it (a worker cannot)\n")
         else:
             why, limit = "ran", timeout_of(p)
-            try:
-                r = subprocess.run(argv, capture_output=True, timeout=limit, stdin=subprocess.DEVNULL,
-                                   cwd=str(p.state), start_new_session=True)
-                out = {"rc": r.returncode, "stdout": r.stdout[-OUT_CAP:].decode(errors="replace"),
-                       "stderr": r.stderr[-OUT_CAP:].decode(errors="replace")}
-            except subprocess.TimeoutExpired:
+            r = boundedchild.run(argv, limit, cwd=str(p.state), text=False)   # its group is killed past the limit
+            if r.timed_out:
                 out = {"rc": TIMED_OUT, "stdout": "", "stderr": f"ttp host-run: timed out after {limit} s\n"}
-            except OSError as e:
-                out = {"rc": 127, "stdout": "", "stderr": f"ttp host-run: {e}\n"}
+            elif r.rc is None:
+                out = {"rc": 127, "stdout": "", "stderr": f"ttp host-run: {r.error}\n"}
+            else:
+                out = {"rc": r.rc, "stdout": r.out[-OUT_CAP:].decode(errors="replace"),
+                       "stderr": r.err[-OUT_CAP:].decode(errors="replace")}
         write_json(folder / f"{rid}.out.json", out)
         _log(p, m, out["rc"], why, time.time() - t0)
     finally:
