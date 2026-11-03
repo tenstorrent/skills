@@ -5885,3 +5885,86 @@ def test_checks_and_push_checks_wait_for_their_projects_test_budget_without_a_ho
         got[0].close()
     finally:
         full.close()
+
+
+def _spill_rounds(env, tmp_path, monkeypatch, rounds: int = 2):
+    """cli._checks_slot of a detached, spillable full run whose project spills after 0.3 s, with
+    checkspill.pick finding no host for `rounds` bounded waits and then a claim: the pick count and the
+    host-wide checks slots granted meanwhile (checkcap.grant_records)."""
+    import io
+    from ttp import checkcap, checkspill, cli
+    p = make(env)
+    p.set_config("delivery.checks_spill_hosts", ["check-host-a"])
+    p.set_config("delivery.checks_spill_after_s", 0.3)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "4")
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    picks = []
+
+    def pick(*_a, **_k):
+        picks.append(time.time())
+        return None if len(picks) < rounds + 1 else {"host": "check-host-a"}
+    monkeypatch.setattr(checkspill, "pick", pick)
+    before = len(checkcap.grant_records())
+    slot = cli._checks_slot(p, run_dir, io.StringIO(), "f" * 40, True, cmds=["true"], top=str(p.base), spill=True)
+    assert slot is not None and slot.spill == {"host": "check-host-a"} and slot.f is None
+    return len(picks), len(checkcap.grant_records()) - before
+
+
+def test_a_spill_bounded_checks_wait_under_the_load_guard_takes_no_host_slot(env, tmp_path, monkeypatch):
+    """#5460: while the host's load is above checks.load_guard no suite may start (testslots.load_guard),
+    so a run whose wait is bounded by checkspill.after_s takes no host-wide checks slot only to hand it
+    back at each bound: its spill rounds log no grant (once each round re-granted it)."""
+    from ttp import checkcap, testslots
+    monkeypatch.delenv("TTP_CHECKS_LOAD_GUARD", raising=False)
+    monkeypatch.setattr(checkcap, "cores", lambda: 64)
+    monkeypatch.setattr(checkcap, "_load", lambda: 900.0)
+    monkeypatch.setenv("TTP_TEST_POOL", "4")
+    assert testslots.load_guard() and testslots.pool_room({}, "px") and not testslots.pool_room({}, "px", full=True)
+    picks, grants = _spill_rounds(env, tmp_path, monkeypatch)
+    assert picks == 3 and grants == 0, (picks, grants)
+
+
+def test_a_spill_bounded_full_run_waiting_for_run_min_takes_no_host_slot(env, tmp_path, monkeypatch):
+    """#5460: a full run starts only with checks.test_run_min slots free; with fewer free (pool_room's one
+    free slot is not enough) a run bounded by checkspill.after_s waits outside the host queue, so its spill
+    rounds log no grant; once enough are free it may start (pool_room full=True)."""
+    from ttp import testslots
+    monkeypatch.setenv("TTP_TEST_POOL", "4")
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", "1")   # two other runs of one slot each: two of four free
+    others = [testslots.acquire(f"other {i}", project_name="px", wait_s=0) for i in (1, 2)]
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", "4")
+    monkeypatch.setenv("TTP_TEST_RUN_MIN", "3")
+    try:
+        assert [g.k for g in others] == [1, 1]
+        assert testslots.pool_room({}, "py") and not testslots.pool_room({}, "py", full=True)
+        picks, grants = _spill_rounds(env, tmp_path, monkeypatch)
+        assert picks == 3 and grants == 0, (picks, grants)
+    finally:
+        others[0].close()
+    assert testslots.pool_room({}, "py", full=True), "with run_min free it may start"
+    others[1].close()
+
+
+def test_a_full_runs_room_counts_a_priority_1_runs_urgent_slots_as_acquire_takes_them(env, monkeypatch):
+    """#5460: pool_room(full=True) asks what acquire would start: a priority-1 run whose project's budget
+    is held only by less urgent runs has room in its urgent slots (urgent_paths); a less urgent run, or
+    one behind a priority-1 holder, does not."""
+    from ttp import testslots
+    _budget_of_one(monkeypatch)
+    held = testslots.acquire("routine", project_name="A", priority=3)
+    try:
+        assert held.k == 1 and not testslots.pool_room({}, "A", full=True)
+        assert not testslots.pool_room({}, "A", full=True, priority=3)
+        assert testslots.pool_room({}, "A", full=True, priority=1), "its urgent slots are free"
+        urgent = testslots.acquire("urgent", project_name="A", priority=1, wait_s=0, full=True)
+        assert urgent and urgent.k == 1, "acquire agrees"
+        urgent.close()
+    finally:
+        held.close()
+    held = testslots.acquire("urgent holder", project_name="A", priority=1)
+    try:
+        assert not testslots.pool_room({}, "A", full=True, priority=1), "no urgent slots past a priority-1 holder"
+    finally:
+        held.close()

@@ -827,10 +827,17 @@ def lane_waits(grant, what: str) -> None:
     _relabel_lanes(grant, {"waits": what})
 
 
-def pool_room(cfg: dict | None, project_name: str | None) -> bool:
+def pool_room(cfg: dict | None, project_name: str | None, full: bool = False, priority: int | None = None) -> bool:
     """Whether a run could take its test slots now: the pool is off, or it has a slot free (pool_now)
     with nobody queued for one, and the project's budget (project_max) has one free. suite_hold's
-    overflow lanes ask it, so a run takes one only once it can start beside the holders."""
+    overflow lanes ask it, so a run takes one only once it can start beside the holders. With `full`
+    (a full `ttp checks` run, as acquire's), also only while the host's load lets a suite start
+    (load_guard) and the pool and the budget have run_min() free, so a run whose wait is bounded
+    (checkspill.after_s) takes no host-wide checks slot only to hand it back at the bound. A priority-1
+    run (`priority`) whose project's budget is held only by less urgent runs counts its urgent slots
+    instead (urgent_paths), as acquire takes them."""
+    if full and load_guard():
+        return False
     s = sizes(cfg)
     if s is None:
         return True
@@ -839,7 +846,16 @@ def pool_room(cfg: dict | None, project_name: str | None) -> bool:
     if used >= pool or locks.queued(checkcap.slot_dir(), TESTS.resource):
         return False
     own = own_paths(project_name, project_max(cfg, (pool, s[1])))
-    return not own or _own_free(project_name, own) > 0
+    top = min(s[1], len(own)) if own else s[1]
+    # As acquire counts a full run's fewest slots (at most what the pool and its budget can ever give),
+    # holders past a budget that shrank counted (_own_free).
+    need = min(min(run_min(cfg, top), pool), len(own) or pool) if full else 1
+    own_free = _own_free(project_name, own) if own else 0
+    if (own and priority is not None and priority <= 1 and own_free < need
+            and (recs := locks.holder_records(own)) and all(_rank(r) > 1 for r in recs)
+            and locks.any_free(urgent := urgent_paths(project_name, top))):
+        own_free = _free(urgent)
+    return min(s[1], pool - used, own_free if own else pool) >= need
 
 
 @contextlib.contextmanager

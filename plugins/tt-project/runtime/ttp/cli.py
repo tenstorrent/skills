@@ -4243,9 +4243,11 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
             suite.files += tree.files
             tree = None
         # The host slot is taken only once its test slots could be (pool_room): it never holds one that
-        # only waits for its project's test workers while another project's waiter could run.
+        # only waits for its project's test workers while another project's waiter could run. As a full
+        # run (full=True below) it also waits for the load guard and checks.test_run_min free, so a wait
+        # bounded by checkspill.after_s never takes and hands back a slot at each bound.
         startable = None if os.environ.get(testslots.HELD_ENV) else (
-            lambda: testslots.pool_room(cfg, p.name if p else None))
+            lambda: testslots.pool_room(cfg, p.name if p else None, full=True, priority=prio))
         while True:
             left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
             testslots.lane_waits(suite, "a host-wide checks slot")   # held, not running yet: status says why

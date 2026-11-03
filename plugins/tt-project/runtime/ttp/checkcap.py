@@ -604,7 +604,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
 
 
 DONE_S = 30.0   # how often a waiter reads whether a recorded pass made its run needless
-PARKED_LINE = ("no test slots free for this run (its project's test-worker budget or the host's pool is full): "
+PARKED_LINE = ("no test slots free for this run (its project's test-worker budget or the host's pool is full, "
+               "fewer than checks.test_run_min are free, or the host's load is above checks.load_guard): "
                "waiting outside the queue for a host-wide checks slot, keeping this place")
 GRANT_TELL_S = 5.0   # a slot taken longer than this after its arrival is told (grant_line)
 
