@@ -1222,6 +1222,23 @@ queues behind routine work; nothing running is interrupted:
   that pass ran in mode `target` with that batch's tip, not `checks` with an empty tip.
   `env_id` does not cover CHECK_ENV_VARS (`PYTEST_ADDOPTS` and similar), so a reused
   push-queue pass ran under the daemon's values of those variables.
+- A waiting hand-off on the run's own detached checks (`retry_when` `ttp checks --result <run dir>`)
+  wakes a model only on a failure, a broken probe or a timeout. With an `on_pass` the pass records it;
+  a plain code task with a summary and nothing left records `done` (the default on_pass). Any other
+  such hand-off that names no `on_pass` or `on_pass_cmd` and asks for nothing after the pass (no
+  `next_step`, PR, `wake_tier` other than light, review verdict, or PR or landing in its spec) gets the
+  on_pass_cmd `ttp checks --settle <run dir> --head <sha>` filled in, with the worktree's clean HEAD
+  when it handed off (log line `hand-off: its checks wait got the on_pass_cmd ... filled in`; one that
+  asks for more is logged `kept` and wakes on the pass). `ttp checks --settle` writes the hand-off's
+  `on_pass` or, without one, a `done` hand-off from its summary (artifacts, metrics, self_check,
+  resolves and similar fields carried over) to `$TTP_RESULT` only when checks.rc is 0, checks.json
+  records a passed candidate run on that head, the worktree still has it checked out clean, and the
+  run's result.json is the waiting hand-off on this wait with no `next_step`; otherwise it writes
+  nothing and exits 1, so the task wakes. A pass on another head never records anything. A worker can
+  name it itself as its `on_pass_cmd`. A hand-written on_pass_cmd tests for a pass with
+  `ttp checks --result <run dir> --passed`: exit 0 only once the checks finished and passed, 1 when
+  they failed, died or still run (plain `--result` exits 0 on a failure too, as a wait must), e.g.
+  `ttp checks --result <run dir> --passed && <command writing the hand-off to $TTP_RESULT>`.
 - `ttp checks` runs, and the checks of `ttp push` and the push queue, share a host-wide cap, across
   every project on the machine: each takes one of
   a few slots under `~/.tt-project/check-slots` before its commands run, and a run over the cap

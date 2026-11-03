@@ -210,7 +210,10 @@ valid one: No `result.json`, no credit.
   prefer absolute paths). Exit 0 with a `done` or `needs_review` hand-off in
   `$TTP_RESULT` (else `on_pass`) ends the task; anything else wakes it with the output tail. It may use `ttp note` (also `--to`), nothing else that needs a run, and
   never acts as the user. Make it safe to run twice. Prefer `on_pass_cmd` to a light-wake `next_step`
-  when the check is mechanical.
+  when the check is mechanical. On your own `ttp checks --result <run dir>` wait with nothing
+  after the pass, the daemon fills in `ttp checks --settle <run dir> --head <sha>`: done from your
+  summary on a pass of that head, else you wake. Your own command tests a pass with
+  `ttp checks --result <run dir> --passed` (plain `--result` exits 0 on a failure too).
 <!-- ttp:if remote -->
   For a job on another machine (a device job goes through a device runner instead, when one is
   listed), start its driver there with `ttp detach --remote <ssh alias> <name> -- <command...>`
