@@ -672,6 +672,12 @@ def test_say_wait_shows_the_reply_to_the_message_just_sent_or_gives_up_after_its
     monkeypatch.setattr(cli.time, "sleep", lambda s: None)
     _, out, _ = _say_from_relay(p, capsys, "--wait", "0.01", "--", "third")
     assert "no reply within 0.01 s" in out
+    for bad in ("nan", "-5"):   # never an endless or negative wait
+        _, out, _ = _say_from_relay(p, capsys, "--wait", bad, "--", "fourth")
+        assert "no reply within" not in out and "sent (#" in out
+    monkeypatch.setattr(cli, "SAY_WAIT_MAX", 0.02)
+    _, out, _ = _say_from_relay(p, capsys, "--wait", "inf", "--", "fifth")
+    assert "no reply within 0.02 s" in out, "capped at SAY_WAIT_MAX"
     with pytest.raises(SystemExit):
         cli.main(["say", "demo", "--chat", "c9", "--wait", "5", "--", "x"])
     assert "--wait reads the caller's reply chat" in capsys.readouterr().err

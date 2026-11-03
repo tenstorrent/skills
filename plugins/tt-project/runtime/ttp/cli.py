@@ -1000,7 +1000,8 @@ def cmd_say(a) -> None:
         return _say_all(a)
     if getattr(a, "except_", None):
         die("--except goes with --all")
-    a.wait = min(max(float(getattr(a, "wait", 0) or 0), 0.0), SAY_WAIT_MAX)
+    a.wait = float(getattr(a, "wait", 0) or 0)
+    a.wait = min(max(a.wait, 0.0), SAY_WAIT_MAX) if a.wait == a.wait else 0.0   # NaN never waits forever
     if a.wait and a.chat:
         die(f"--wait reads the caller's reply chat; with --chat, read replies with `ttp listen {a.name} --chat {a.chat}`")
     p, entry = resolve(a.name)
