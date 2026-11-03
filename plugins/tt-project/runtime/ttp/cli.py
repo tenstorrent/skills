@@ -8742,30 +8742,33 @@ def cmd_setup(a) -> None:
         die(f"ttp {installed} is installed, newer than this ttp {__version__}: not downgrading it. "
             f"Run setup from the newer plugin, or add --force to install {__version__} anyway", 1)
     stale_install_warning()
-    _recover_setup()
-    commit = source_commit()
-    before = recorded_commit(lib / "runtime") if (lib / "runtime").is_dir() else ""
-    cur = HOME_DIR / "lib" / "current"
-    jr = HOME_DIR / "lib" / SETUP_JOURNAL
-    if RUNTIME.resolve() != (lib / "runtime").resolve():
-        from .runner import boot_id
-        lib.parent.mkdir(parents=True, exist_ok=True)
-        durable_write(jr, json.dumps({"pid": os.getpid(), "boot": boot_id(), "source": str(PLUGIN_ROOT),
-                                      "lib": str(lib), "commit": commit, "existed": lib.exists(),
-                                      "prev": os.readlink(cur) if cur.is_symlink() else ""}))
-        _install_parts(PLUGIN_ROOT, lib)
-    durable_write(lib / "runtime" / "ttp" / SOURCE_FILE, commit + "\n", sync=False)
-    sync_all()    # a reboot now must not leave empty files that upgrades take in as upstream
-    # The marker goes first: a daemon check between the two steps must not undo a deliberate downgrade.
-    if is_newer(installed, __version__):    # a deliberate downgrade: daemons must not undo it
-        durable_write(forced_mark(), __version__ + "\n")
-    elif forced_version() != __version__:  # re-running setup of the forced version keeps it forced
-        forced_mark().unlink(missing_ok=True)
-    if cur.exists() and not cur.is_symlink():
-        shutil.rmtree(cur) if cur.is_dir() else cur.unlink()
-    from .release import point_current
-    point_current(lib)       # in one step: a `ttp` starting meanwhile finds the old release or this one
-    jr.unlink(missing_ok=True)
+    lock = _setup_lock(wait=True)       # one setup or setup recovery at a time
+    try:
+        _recover_setup_held()
+        commit = source_commit()
+        before = recorded_commit(lib / "runtime") if (lib / "runtime").is_dir() else ""
+        cur = HOME_DIR / "lib" / "current"
+        jr = HOME_DIR / "lib" / SETUP_JOURNAL
+        if RUNTIME.resolve() != (lib / "runtime").resolve():
+            from .runner import boot_id
+            durable_write(jr, json.dumps({"pid": os.getpid(), "boot": boot_id(), "source": str(PLUGIN_ROOT),
+                                          "lib": str(lib), "commit": commit, "existed": lib.exists(),
+                                          "prev": os.readlink(cur) if cur.is_symlink() else ""}))
+            _install_parts(PLUGIN_ROOT, lib)
+        durable_write(lib / "runtime" / "ttp" / SOURCE_FILE, commit + "\n", sync=False)
+        sync_all()    # a reboot now must not leave empty files that upgrades take in as upstream
+        # The marker goes first: a daemon check between the two steps must not undo a deliberate downgrade.
+        if is_newer(installed, __version__):    # a deliberate downgrade: daemons must not undo it
+            durable_write(forced_mark(), __version__ + "\n")
+        elif forced_version() != __version__:  # re-running setup of the forced version keeps it forced
+            forced_mark().unlink(missing_ok=True)
+        if cur.exists() and not cur.is_symlink():
+            shutil.rmtree(cur) if cur.is_dir() else cur.unlink()
+        from .release import point_current
+        point_current(lib)       # in one step: a `ttp` starting meanwhile finds the old release or this one
+        jr.unlink(missing_ok=True)
+    finally:
+        os.close(lock)
     bindir = Path(a.bin_dir).expanduser()
     bindir.mkdir(parents=True, exist_ok=True)
     shim = bindir / "ttp"
@@ -8853,14 +8856,55 @@ def _install_parts(src_root: Path, lib: Path) -> None:
         f.chmod(0o755)
 
 
+SETUP_LOCK = ".setup.lock"      # in HOME_DIR/lib: its flock holder runs `ttp setup` or _recover_setup
+
+
+def _setup_lock(wait: bool) -> int | None:
+    """An fd holding the flock that serializes `ttp setup` and _recover_setup (the caller closes it).
+    wait=False: None when another process holds it or the lock file cannot be opened (a sandbox)."""
+    import fcntl
+    from .project import HOME_DIR
+    path = HOME_DIR / "lib" / SETUP_LOCK
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError:
+        if wait:
+            raise
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+    except OSError:
+        os.close(fd)
+        if wait:
+            raise
+        return None
+    return fd
+
+
 def _recover_setup() -> str:
     """A `ttp setup` cut short (a reboot mid-copy) leaves its journal: the next `ttp` command finishes it
     (the copy is redone from the same plugin folder, then lib/current points at it) or, with that folder
     gone or updated to another version, rolls it back (lib/current points at the release it did before, and a release folder the run
-    created is removed). Returns the line it printed ("" when there was nothing to do)."""
+    created is removed). Only the process holding the setup lock does it: while a `ttp setup` or another
+    recovery holds it, this one skips. Returns the line it printed ("" when there was nothing to do)."""
+    from .project import HOME_DIR
+    if not os.path.lexists(HOME_DIR / "lib" / SETUP_JOURNAL):
+        return ""       # every `ttp` command comes here: no lock file is touched without a journal
+    lock = _setup_lock(wait=False)
+    if lock is None:
+        return ""
+    try:
+        return _recover_setup_held()
+    finally:
+        os.close(lock)
+
+
+def _recover_setup_held() -> str:
+    """_recover_setup's work, run under the setup lock (cmd_setup holds it already)."""
     from .project import HOME_DIR
     from .release import point_current, runtime_version
-    from .runner import same_boot
+    from .runner import boot_id, same_boot
     jr = HOME_DIR / "lib" / SETUP_JOURNAL
     try:
         rec = json.loads(jr.read_text())
@@ -8874,6 +8918,8 @@ def _recover_setup() -> str:
         from .liveness import pid_state, DEAD
         if pid_state(pid) != DEAD:
             return ""       # it still runs, or may (another PID namespace): never roll back under it
+    if rec:     # the recoverer from now on: a ttp too old to take the lock sees a live setup and skips
+        durable_write(jr, json.dumps({**rec, "pid": os.getpid(), "boot": boot_id()}))
     lib, src = Path(rec.get("lib") or "/nonexistent"), Path(rec.get("source") or "/nonexistent")
     # The plugin folder updated meanwhile holds another version than the folder setup named: roll back.
     if lib.parent == HOME_DIR / "lib" and (src / "runtime" / "ttp").is_dir() and (src / "template").is_dir() \
@@ -9035,8 +9081,9 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
     task holds the merge: a clean merge supersedes it and lands (the daemon restarts, still paused); a
     conflict retargets it and exits 75, the task finishing it once the project is resumed."""
     from . import release, upjournal
-    from .project import HOME_DIR
-    src = HOME_DIR / "lib" / "current"
+    # The release lib/current names now, resolved once: a `ttp setup` meanwhile re-points the link (and its
+    # recovery may re-copy a release), so the snapshot never reads files through the moving link.
+    src = release.installed().resolve()
     if not (src / "runtime").is_dir():
         die("no installed template; run `ttp setup` from the plugin first")
     h = p.harness
@@ -9545,9 +9592,14 @@ def _tell_harness_tasks(p: Project, sha: str, files: list[str]) -> None:
         print(f"told harness task #{t['id']} that {sha[:12]} holds the harness's uncommitted changes")
 
 
+class ReleaseMoved(RuntimeError):
+    """The release an upgrade snapshot copied from changed under it (a `ttp setup` or its recovery)."""
+
+
 def _snapshot_upstream(p: Project, src: Path, new_v: str, new_c: str, ident: list[str]) -> None:
-    """Commit the installed template onto the harness's `upstream` branch (pristine snapshots); main is
-    not touched. No commit when upstream already holds it."""
+    """Commit the installed template at `src` (a resolved release folder, never the lib/current link) onto
+    the harness's `upstream` branch (pristine snapshots); main is not touched. No commit when upstream
+    already holds it. ReleaseMoved when `src` no longer holds `new_v` and `new_c` after the copy."""
     h = p.harness
     tmp = p.state / "upgrade-wt"
     if tmp.exists():
@@ -9562,6 +9614,11 @@ def _snapshot_upstream(p: Project, src: Path, new_v: str, new_c: str, ident: lis
         for f in HARNESS_ROOT_FILES:
             if (src / "template" / f).is_file() and not (f == "pytest.ini" and own):
                 shutil.copy2(src / "template" / f, tmp / f)
+        from .release import runtime_version      # "unknown" for a release removed meanwhile
+        now_v, now_c = runtime_version(src / "runtime"), recorded_commit(src / "runtime")
+        if (now_v, now_c) != (new_v, new_c):    # re-copied or removed under the copy: nothing is committed
+            raise ReleaseMoved(f"the installed release {src} changed during the upgrade snapshot (was {new_v} "
+                               f"({new_c}), now {now_v} ({now_c})); nothing was committed: rerun the upgrade")
         _git(tmp, "add", "-A")
         if _git(tmp, "status", "--porcelain"):
             _git(tmp, *ident, "commit", "-q", "-m", f"tt-project template {new_v} ({new_c})")
@@ -9580,8 +9637,7 @@ def _retarget_upgrade_task(p: Project, holder: dict, auto: bool) -> None:
     Exits 75 (deferred): the open task lands it."""
     from . import release
     from .coordinator import _append_update
-    from .project import HOME_DIR
-    src = HOME_DIR / "lib" / "current"
+    src = release.installed().resolve()     # once, as in _upgrade
     tid = holder["task"]
     if not (src / "runtime").is_dir():
         return

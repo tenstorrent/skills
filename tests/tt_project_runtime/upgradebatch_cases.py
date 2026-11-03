@@ -230,3 +230,75 @@ def test_every_runtime_module_ending_in_an_import_ends_with_the_project_imports_
             lines = text.splitlines()
             assert lines[-1] == cli.LOCAL_IMPORTS and not lines[-2].strip(), f
     assert "push.py" in ending
+
+
+def _linked_releases(env):
+    """lib/current a link to release a; release b beside it, the same but for one worker.md line."""
+    import shutil
+    _install_template(env)
+    lib = env["home"] / "lib"
+    a, b = lib / "rel-a", lib / "rel-b"
+    (lib / "current").rename(a)
+    shutil.copytree(a, b)
+    w = b / "template" / "prompts" / "worker.md"
+    w.write_text(w.read_text() + "\nRELEASE B ONLY\n")
+    (lib / "current").symlink_to(a)
+    return lib, a, b
+
+
+def test_an_upgrade_snapshot_reads_the_release_resolved_once_while_setup_re_points_lib_current(env, monkeypatch):
+    """A `ttp setup` re-points lib/current while the upgrade copies the release onto `upstream`: every
+    file still comes from the release the link named when the upgrade began."""
+    from ttp import cli, release, service
+    p = make(env)
+    monkeypatch.setattr(service, "restart", lambda p: "restarted")
+    lib, a, b = _linked_releases(env)
+    real, moved = cli.replace_copy, []
+
+    def copy(src, dst, **kw):
+        if not moved:
+            moved.append(1)
+            release.point_current(b)
+        return real(src, dst, **kw)
+    monkeypatch.setattr(cli, "replace_copy", copy)
+    cli.main(["upgrade", "demo", "--auto", "--project-dir", str(p.base)])
+    assert moved and os.readlink(lib / "current") == str(b)
+    assert "RELEASE B ONLY" not in _git_out(p.harness, "show", "upstream:prompts/worker.md")
+    assert p.db.kv(release.KV_AUTO)["outcome"] == "applied"
+
+
+@pytest.mark.parametrize("change", ["commit", "version", "removed"])
+def test_an_upgrade_snapshot_whose_release_changes_under_the_copy_commits_nothing_and_fails(env, monkeypatch, change):
+    """The resolved release is re-copied with another commit or version (or removed) after its runtime was
+    copied: the snapshot is refused before any commit, upstream stays where it was and --auto records the failure."""
+    import re as _re
+    import shutil
+    from ttp import cli, release, service
+    p = make(env)
+    monkeypatch.setattr(service, "restart", lambda p: pytest.fail("a refused snapshot restarted the daemon"))
+    lib, a, b = _linked_releases(env)
+    before = _git_out(p.harness, "rev-parse", "upstream").strip()
+    head = _git_out(p.harness, "rev-parse", "HEAD").strip()
+    real, done = cli.replace_copy, []
+
+    def copy(src, dst, **kw):
+        out = real(src, dst, **kw)
+        if not done and "template" in Path(src).relative_to(a).parts:     # the runtime part is copied
+            done.append(1)
+            ttp = a / "runtime" / "ttp"
+            if change == "commit":
+                (ttp / cli.SOURCE_FILE).write_text("another-commit\n")
+            elif change == "version":
+                init = ttp / "__init__.py"
+                init.write_text(_re.sub(r'__version__ = "[^"]+"', '__version__ = "99.0.0"', init.read_text()))
+            else:
+                shutil.rmtree(a / "runtime")
+        return out
+    monkeypatch.setattr(cli, "replace_copy", copy)
+    with pytest.raises(cli.ReleaseMoved):
+        cli.main(["upgrade", "demo", "--auto", "--project-dir", str(p.base)])
+    assert done
+    assert _git_out(p.harness, "rev-parse", "upstream").strip() == before, "nothing went onto upstream"
+    assert _git_out(p.harness, "rev-parse", "HEAD").strip() == head
+    rec = p.db.kv(release.KV_AUTO)
+    assert rec["outcome"] == "failed" and "ReleaseMoved" in rec["why"], rec

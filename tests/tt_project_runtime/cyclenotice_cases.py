@@ -340,3 +340,65 @@ def test_a_push_batch_after_push_waits_for_the_notice_and_the_daemon_resumes_it_
     assert m["after_push"]["status"] == "ok" and len(deploys.read_text().split()) == 1, m.get("after_push")
     assert s.p.db.one("SELECT after_tries FROM push_batches WHERE id=?", (bid,))["after_tries"] == 0
     assert not s.p.db.one("SELECT id FROM events WHERE kind='after_push_failed'")
+
+
+def test_two_concurrent_setup_recoveries_copy_once_and_the_recoverer_records_itself(env, tmp_path):
+    """A journal from an earlier boot (no liveness check applies) found by two `ttp` commands at once: only
+    the setup lock's holder re-copies the release; the other skips. The holder writes its own pid and boot
+    into the journal first, and a third call after it finished finds nothing to do."""
+    import threading
+    from ttp import __version__, cli
+    from ttp.runner import boot_id
+    lib_dir = env["home"] / "lib"
+    lib = lib_dir / __version__
+    (lib / "runtime" / "ttp").mkdir(parents=True)
+    journal = lib_dir / cli.SETUP_JOURNAL
+    plugin = _plugin_copy(tmp_path)
+    journal.write_text(json.dumps({"pid": _cn_exited_pid(), "boot": "an-earlier-boot", "source": str(plugin),
+                                   "lib": str(lib), "commit": "abc123", "existed": False, "prev": ""}))
+    real, copies, inside, go = cli._install_parts, [], threading.Event(), threading.Event()
+    seen = {}
+
+    def install(src, dst):
+        copies.append(dst)
+        seen.update(json.loads(journal.read_text()))
+        inside.set()
+        assert go.wait(30)
+        real(src, dst)
+    out = []
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(cli, "_install_parts", install)
+        t = threading.Thread(target=lambda: out.append(cli._recover_setup()))
+        t.start()
+        assert inside.wait(30)
+        assert cli._recover_setup() == "", "the second caller skips while the first recovers"
+        go.set()
+        t.join(30)
+    assert len(copies) == 1 and "finished" in out[0]
+    assert seen["pid"] == os.getpid() and seen["boot"] == boot_id() and seen["lib"] == str(lib)
+    assert not journal.exists() and os.readlink(lib_dir / "current") == str(lib)
+    assert cli._recover_setup() == "" and len(copies) == 1
+
+
+def test_setup_recovery_skips_while_another_process_holds_the_setup_lock(env, tmp_path):
+    """`ttp setup` (or another recovery) in another process holds the lock: a `ttp` command neither copies
+    nor rolls back, and the journal stays for the holder."""
+    import subprocess
+    import sys as _sys
+    from ttp import __version__, cli
+    lib_dir = env["home"] / "lib"
+    lib_dir.mkdir(parents=True, exist_ok=True)
+    journal = lib_dir / cli.SETUP_JOURNAL
+    body = json.dumps({"pid": _cn_exited_pid(), "boot": "an-earlier-boot", "source": str(tmp_path / "gone"),
+                       "lib": str(lib_dir / __version__), "existed": False, "prev": ""})
+    journal.write_text(body)
+    holder = subprocess.Popen([_sys.executable, "-c", "import fcntl, sys; f = open(sys.argv[1], 'a'); "
+                               "fcntl.flock(f, fcntl.LOCK_EX); print('held', flush=True); sys.stdin.read()",
+                               str(lib_dir / cli.SETUP_LOCK)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        assert cli._recover_setup() == "" and journal.read_text() == body
+    finally:
+        holder.stdin.close()
+        holder.wait(30)
+    assert "rolled back" in cli._recover_setup() and not journal.exists()
