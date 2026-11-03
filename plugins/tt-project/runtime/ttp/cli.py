@@ -4350,9 +4350,13 @@ def _checks_reexec(new: str, arrived: float | None, prio, spill: bool, tell, out
          f"{timefmt.clock(now=arrived) if arrived is not None else 'now'} and priority {prio if prio is not None else '-'}")
     for f in (out, sys.stdout, sys.stderr):
         f.flush()
+    namer = _CHECK_NAMER["on"] and _CHECK_NAMER["rc"]
+    _checks_names_off(unblock=False)   # a stop it took ends these checks here, not lost in the exec
     try:
         os.execv(sys.executable, [sys.executable, "-m", "ttp", *sys.argv[1:]])
     except OSError as e:
+        if namer:
+            _checks_name_senders(namer)
         os.environ.pop(testslots.LANE_ENV, None)
         if lanes is not None:
             lanes.close()   # the wait starts again from its lane
@@ -4414,6 +4418,111 @@ _CHECK_STOP: dict = {"defer": False, "pending": None, "stopped": None}
 _CHECK_STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 
 
+# The detached checks take their stop signals in a thread of their own (sigtimedwait, Linux), which names
+# the sender: a job-signals row and a checks.log line for each stop, which then goes on to the main thread
+# (_CHECK_FORWARD) and its handler there as before. Check commands start with the stop signals unblocked.
+_CHECK_NAMER: dict = {"on": False, "queue": [], "gen": 0, "lock": None, "rc": None}
+_CHECK_FORWARD = signal.SIGRTMIN + 3 if hasattr(signal, "SIGRTMIN") else None
+_SENDER_PARENTS = 6   # the sender's ancestors a received stop names
+
+
+def _sender_parents(pid: int) -> list[str]:
+    """'<pid> <command>' for each ancestor of `pid` (its parent first, up to _SENDER_PARENTS), from /proc."""
+    from .detach import sender
+    out: list[str] = []
+    while pid > 1 and len(out) < _SENDER_PARENTS:
+        try:
+            pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            break
+        if pid > 0:
+            out.append(f"{pid} {sender(pid)[:120]}")
+    return out
+
+
+def _checks_sender_seen(sig: int, pid: int, uid: int, rc_file: Path) -> None:
+    """Record a stop signal the detached checks of `rc_file` received from `pid`: a job-signals row (with
+    the sender's ancestors and the run's folder) and a checks.log line."""
+    from . import detach
+    parents = _sender_parents(pid) if pid > 0 else []
+    line = detach.received(sig, pid, uid, "ttp checks --detach", job={"job": "checks", "job_rc": str(rc_file)},
+                           state=detach.signals_file(rc_file).parent,
+                           extra={"from_parents": parents, "run_dir": str(rc_file.parent)})
+    append_text(rc_file.parent / "checks.log", f"ttp checks: {line}"
+                + (f"; its parents: {' <- '.join(parents)}" if parents else "") + "\n")
+
+
+def _checks_forwarded(_sig, frame) -> None:
+    """The main thread's end of _checks_name_senders: each stop signal taken goes to its own handler."""
+    while _CHECK_NAMER["queue"]:
+        sig = _CHECK_NAMER["queue"].pop(0)
+        handler = signal.getsignal(sig)
+        if not callable(handler):
+            raise SystemExit(128 + sig)
+        handler(sig, frame)
+
+
+def _checks_name_senders(rc_file: Path) -> bool:
+    """Take the stop signals of these detached checks (`rc_file`'s) with their sender (_CHECK_NAMER);
+    False where that cannot be done (no sigtimedwait, or not the main thread): the handlers take them."""
+    import threading
+    if _CHECK_NAMER["on"] or _CHECK_FORWARD is None or not hasattr(signal, "sigtimedwait") \
+            or threading.current_thread() is not threading.main_thread():
+        return False
+    main, gen, lock = threading.get_ident(), _CHECK_NAMER["gen"] + 1, threading.Lock()
+    _CHECK_NAMER.update(gen=gen, queue=[], lock=lock, rc=rc_file)
+    signal.signal(_CHECK_FORWARD, _checks_forwarded)
+    # Blocked before the thread starts, so it and every later thread inherit the mask: only sigtimedwait takes them.
+    signal.pthread_sigmask(signal.SIG_BLOCK, _CHECK_STOP_SIGNALS)
+
+    def take() -> None:
+        while _CHECK_NAMER["gen"] == gen:   # until _checks_names_off
+            info = signal.sigtimedwait(_CHECK_STOP_SIGNALS, 1.0)
+            if info is None:
+                continue
+            try:
+                _checks_sender_seen(info.si_signo, info.si_pid, info.si_uid, rc_file)
+            except Exception:   # naming the sender never keeps the stop from the checks
+                pass
+            with lock:
+                if _CHECK_NAMER["gen"] == gen:
+                    _CHECK_NAMER["queue"].append(info.si_signo)
+                    signal.pthread_kill(main, _CHECK_FORWARD)
+                    continue
+            # Ended meanwhile (a re-exec, the run's end): sent again, it waits for the next taker.
+            os.kill(os.getpid(), info.si_signo)
+
+    threading.Thread(target=take, name="ttp-checks-stop-signals", daemon=True).start()
+    _CHECK_NAMER["on"] = True
+    return True
+
+
+def _checks_names_off(*, unblock: bool = True) -> None:
+    """End _checks_name_senders: its thread stops within a second, and the main thread takes the stop
+    signals again itself (its handlers). A stop already taken is handled now; one taken after this is sent
+    again. With `unblock` False (before a re-exec) they stay blocked: one then pending goes to the next
+    image's sender capture."""
+    if _CHECK_NAMER["on"]:
+        with _CHECK_NAMER["lock"]:
+            _CHECK_NAMER.update(on=False, gen=_CHECK_NAMER["gen"] + 1)
+        if unblock:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, _CHECK_STOP_SIGNALS)
+        _checks_forwarded(None, None)
+
+
+def _check_popen(argv: list, **kw) -> subprocess.Popen:
+    """Popen for a check command: with the stop signals unblocked while it forks, as the command must get
+    them (a stop of the checks ends their command with SIGTERM). Meanwhile a stop goes to the main
+    thread's handler, unnamed."""
+    if not _CHECK_NAMER["on"]:
+        return subprocess.Popen(argv, **kw)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, _CHECK_STOP_SIGNALS)
+    try:
+        return subprocess.Popen(argv, **kw)
+    finally:
+        signal.pthread_sigmask(signal.SIG_BLOCK, _CHECK_STOP_SIGNALS)
+
+
 def _checks_stop(sig, _frame):
     """The detached checks' stop handler: exit 128+sig, deferred while a check starts or is ended."""
     _CHECK_STOP["stopped"] = _CHECK_STOP["stopped"] or 128 + sig
@@ -4451,7 +4560,7 @@ def _run_check(argv: list, group: bool, record=None, timeout: float | None = Non
     try:
         if _CHECK_STOP["stopped"]:   # stopped checks start no further command
             raise SystemExit(_CHECK_STOP["stopped"])
-        proc = subprocess.Popen(argv, start_new_session=group, **kw)
+        proc = _check_popen(argv, start_new_session=group, **kw)
         if group and record is not None:
             record.group(proc.pid)
         _CHECK_STOP["defer"] = False
@@ -4830,8 +4939,11 @@ def _checks_child(a) -> int:
         signal.signal(sig, _checks_stop)
     try:
         # A stop signal blocked in the launcher stays blocked here and in the check commands: the
-        # checks could then never be stopped, and a stop would record their exit code instead.
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, _CHECK_STOP_SIGNALS)
+        # checks could then never be stopped, and a stop would record their exit code instead. The
+        # sender capture takes them first (one pending since a re-exec too, with its sender); without
+        # it they are unblocked for the handler.
+        if not _checks_name_senders(rc_file):
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, _CHECK_STOP_SIGNALS)
         released = _checks_released(sys.stdin.buffer.read(), rc_file.parent)
         if not released:
             # A newer launch may own checks.rc: this unrecorded child leaves it alone.
@@ -4864,6 +4976,7 @@ def _checks_child(a) -> int:
             _checks_tmp_cleanup(rc_file.parent)
         if released:
             durable_write(rc_file, f"{code}\n")
+        _checks_names_off()
     return code if isinstance(code, int) else 1
 
 

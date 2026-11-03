@@ -429,10 +429,11 @@ def sender(pid: int) -> str:
 
 
 def received(sig: int, pid: int, uid: int, reason: str, *, job: dict | None = None,
-             state: Path | None = None) -> str:
+             state: Path | None = None, extra: dict | None = None) -> str:
     """Record a signal a tt-project process received from `pid` (sigtimedwait names it): one row in the
     project's job-signal stream (under `state`, or that of the detached job `job` names, as
-    locks.job_fields gives it) with the sender's pid, uid and command line. Returns the line to log."""
+    locks.job_fields gives it) with the sender's pid, uid and command line, and the fields of `extra`.
+    Returns the line to log."""
     try:
         name = signal.Signals(sig).name
     except ValueError:
@@ -440,7 +441,8 @@ def received(sig: int, pid: int, uid: int, reason: str, *, job: dict | None = No
     cmd = sender(pid) if pid > 0 else ""
     job = job or {}
     row = {"ts": time.time(), "received": True, "signal": name, "pid": os.getpid(), "reason": reason,
-           "from_pid": pid, "from_uid": uid, "from_cmd": cmd, "job": job.get("job"), "rc": job.get("job_rc")}
+           "from_pid": pid, "from_uid": uid, "from_cmd": cmd, "job": job.get("job"), "rc": job.get("job_rc"),
+           **(extra or {})}
     if state is not None or (job.get("job_rc") and _markable(job["job_rc"], quiet=True)):
         try:
             durable_append(signals_file(Path(job.get("job_rc") or "."), state), json.dumps(row) + "\n")

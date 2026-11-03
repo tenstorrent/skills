@@ -4184,6 +4184,98 @@ def test_a_real_detached_checks_child_reexecutes_in_place_after_an_install_and_s
             os.killpg(pid, signal.SIGKILL)
 
 
+def _received_rows(run):
+    from ttp import cli, detach
+    f = detach.signals_file(run / cli.CHECKS_RC)
+    return [r for r in map(json.loads, f.read_text().splitlines()) if r.get("received")] if f.exists() else []
+
+
+def test_a_parked_detached_checks_run_survives_its_probe_and_sweep_and_names_who_stopped_it(
+        env, tmp_path, monkeypatch, capsys):
+    # Parked for the host-wide checks slot: neither its --result probe nor a sweep of earlier, ended check
+    # runs (one recorded its group) ends it. A SIGTERM then stops it with exit 143, and the run names its
+    # sender: a job-signals row with the sender's pid, ancestors and the run's folder, and a checks.log line.
+    import signal
+    from ttp import checkcap, checkreap, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    held = checkcap.acquire("other")
+    pid = None
+    try:
+        pid = _detached_checks(run, capsys, "true")
+        assert _wait_for(lambda: (run / cli.CHECKS_SLOT_WAIT).exists())
+        with pytest.raises(SystemExit) as probe:
+            cli.main(["checks", "--result", str(run)])
+        assert probe.value.code == 1, "still running"
+        capsys.readouterr()
+        for tok, pgids in ((checkreap.token(), [os.getpgid(pid)]), (checkreap.token(), [])):
+            d = p.state / checkreap.FOLDER / tok
+            d.mkdir(parents=True)
+            (d / checkreap.RECORD).write_text(json.dumps({"token": tok, "pid": 1, "started": "1", "boot": "", "pidns": "",
+                                                          "tree": "", "top": str(repo), "pgids": pgids, "ts": 0}))
+            (d / checkreap.EXIT).write_text(json.dumps({"rc": 0, "ts": 0}))
+        checkreap.sweep(p.state, grace_s=0, term_s=0.5)
+        time.sleep(0.3)
+        assert not _gone_pid(pid) and not (run / cli.CHECKS_RC).exists(), "the probe and the sweep leave it waiting"
+        assert not _received_rows(run)
+        os.kill(pid, signal.SIGTERM)
+        assert _wait_for(lambda: (run / cli.CHECKS_RC).exists())
+        assert (run / cli.CHECKS_RC).read_text().strip() == "143"
+        rows = _received_rows(run)
+        assert len(rows) == 1 and rows[0]["signal"] == "SIGTERM" and rows[0]["pid"] == pid, rows
+        assert rows[0]["from_pid"] == os.getpid() and rows[0]["from_uid"] == os.getuid(), rows
+        assert rows[0]["from_parents"] and rows[0]["from_parents"][0].startswith(f"{os.getppid()} "), rows
+        assert rows[0]["run_dir"] == str(run) and rows[0]["job"] == "checks", rows
+        log = (run / "checks.log").read_text()
+        assert f"SIGTERM received by pid {pid} (ttp checks --detach) from pid {os.getpid()}" in log, log[-800:]
+        assert "its parents: " in log and "stopped by signal 15" in log, log[-800:]
+    finally:
+        held.close()
+        if pid and not _gone_pid(pid):
+            os.killpg(pid, signal.SIGKILL)
+
+
+def test_a_running_check_command_gets_the_stop_signals_unblocked_and_ends_with_its_named_stop(
+        env, tmp_path, monkeypatch, capsys):
+    # The checks take their stop signals in a thread that names the sender: their check command must still
+    # start with SIGTERM, SIGINT and SIGHUP unblocked, so a stop of the checks ends it.
+    import signal
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    status, cpid = tmp_path / "status", tmp_path / "cmd.pid"
+    pid = None
+    try:
+        # Not sh: dash clears its blocked signals itself, most commands keep the mask they start with.
+        pid = _detached_checks(run, capsys, sys.executable, "-c", (
+            "import os, pathlib, time; pathlib.Path(%r).write_text(str(os.getpid())); "
+            "pathlib.Path(%r).write_text(open('/proc/self/status').read().split('SigBlk:')[1].split()[0]); "
+            "time.sleep(60)") % (str(cpid), str(status)))
+        assert _wait_for(lambda: status.exists() and status.read_text().strip() and cpid.exists())
+        blocked = int(status.read_text(), 16)
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            assert not blocked & (1 << (sig - 1)), (sig, hex(blocked))
+        cmd = int(cpid.read_text())
+        os.kill(pid, signal.SIGTERM)
+        assert _wait_for(lambda: (run / cli.CHECKS_RC).exists())
+        assert (run / cli.CHECKS_RC).read_text().strip() == "143"
+        assert _wait_for(lambda: not os.path.exists(f"/proc/{cmd}") or
+                         pathlib.Path(f"/proc/{cmd}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z")
+        assert [r["from_pid"] for r in _received_rows(run)] == [os.getpid()]
+    finally:
+        if pid and not _gone_pid(pid):
+            os.killpg(pid, signal.SIGKILL)
+
+
+def test_checks_child_in_process_leaves_the_stop_signals_unblocked(env, tmp_path, monkeypatch):
+    # Called in this process (as tests do), the sender capture ends with the child: its mask is restored.
+    import signal
+    from ttp import cli
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(buffer=io.BytesIO(b"")))
+    before = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+    assert cli._checks_child(types.SimpleNamespace(rc=str(tmp_path / cli.CHECKS_RC))) == 1
+    assert signal.pthread_sigmask(signal.SIG_BLOCK, []) == before and not cli._CHECK_NAMER["on"]
+
 def _queue_events(n, waited_s=1000.0, holders=None, start=13):
     now = time.time()
     holders = [{"task": "12", "pid": 4242, "run_since": now - 600, "command": "pytest -q"}] if holders is None \
