@@ -28,6 +28,14 @@ Viewing that from another machine needs **both** ports forwarded — 8080 for HT
 and 8081 for the WebSocket — to the same ports on the remote loopback interface.
 Forwarding only 8080 gives a page that loads and never connects.
 
+The viewer outlives the run. In headless or scripted runs, turn it off with
+`--no-web-server` or `TRACY_NO_WEB_SERVER=1` where the tree has it
+(`python -m tracy --help`). On an older tree, pass `--web-app-port <free port>`,
+then kill only the pid whose command line is `serve_wasm.py --port <port>` and
+whose owner is you. Never kill by name or by a bare port number: other users'
+viewers run the same command. Under a job broker that cleans up after each job,
+leave it to the broker.
+
 ## 3. `tracy-capture`
 
 The client that writes a `.tracy` file for later, rather than serving a viewer.
@@ -71,6 +79,11 @@ tt::tt_metal::detail::ReadDeviceProfilerResults(device);
 
 Place it after the program you care about. It signals the device to sync results,
 which then reach both the CSV and the Tracy client.
+
+Under `python -m tracy`, raise `--op-support-count` first (it sets
+`TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT`). From Python, drain with
+`ttnn.ReadDeviceProfiler(device)` at a coarse cadence, never after every op. A
+traced replay cannot be drained mid-trace.
 
 `TT_METAL_PROFILER_MID_RUN_DUMP` is the environment-variable equivalent for a
 long-lived process — a serving job that never closes its device otherwise never

@@ -16,6 +16,9 @@ metadata:
     - repo: tenstorrent/tt-metal
       ref: 058b93d450f21b9b86a6ddf58f6f8f2c7744f8f1
       path: tt_metal/llrt/rtoptions.cpp
+    - repo: tenstorrent/tt-metal
+      ref: 8b53dfa87b68638895c1f48ad5eef24f62d54808
+      path: tools/tracy/perf_counter_multipass.py
 ---
 
 # tt-profiler
@@ -57,7 +60,9 @@ For the workflow question "which op dominates?" the answer is the ranked
 `tt-perf-report` on the ops-perf-results CSV that Tracy writes with
 `-p -r -v -m pytest`, one folder per run under
 `generated/profiler/reports/<timestamp>/`. Recipe, pandas fallback and the
-per-RISC bottleneck tags: `references/op-report.md`.
+per-RISC bottleneck tags: `references/op-report.md`. For measured FPU, SFPU and
+Math utilisation per op (not the estimated `PM FPU UTIL (%)`):
+`references/perf-counters.md`.
 
 In-kernel, after `#include <tools/profiler/kernel_profiler.hpp>`:
 
