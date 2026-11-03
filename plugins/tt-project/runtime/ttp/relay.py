@@ -28,7 +28,7 @@ ask answers resting only on that agent's words apply as the owner's, cited "(rel
 logged as a ORDERED_KIND event with the old text (ordered_line, the daily review). Never through it, the
 HELD classes (held_match, a refusal naming its class and quoting the words that matched): a step that could
 affect people badly, one that speaks as the owner (a PR's ready or merge: the message's provenance decides; the
-merge list; never test or job scope on machines the project may use, coordinator._scope_only), and a
+merge list; a charter edit is read by the clauses it changes, coordinator._changed_clauses), and a
 credential, money or spend cap (the user-only settings, coordinator.NEEDS_USER). Nor text from anyone
 else (events, notes from other projects, PR comments, logs: none are messages and none reach this guard).
 """

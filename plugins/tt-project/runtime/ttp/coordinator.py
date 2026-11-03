@@ -2999,7 +2999,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         and a.get("source") and restriction_source.turn_quote(db, a.get("source"), messages, False))
                     restr = _DATED.sub("", section.lstrip("# ")).lower().startswith("restriction") or (
                         _restriction_edit(p, section, quote, str(a.get("replaces") or "")))
-                    held = _held_lift(section, text, quote, replaced, gone, _scope_names(p)) if (
+                    held = _held_lift(section, text, quote, replaced, gone) if (
                         by_agent and restr) else ("", "", "")
                     if held[0]:
                         raise ValueError(relay.held_refusal("charter_update", *held) + "; a new ban the agent "
@@ -4761,74 +4761,54 @@ def _restriction_conflicts(p: Project, before: str, added: list[tuple[str, str]]
     return out
 
 
-def _held_lift(section: str, text: str, quote: str, replaced: str, gone: str,
-               names: frozenset[str] = frozenset()) -> tuple[str, str, str]:
+def _held_lift(section: str, text: str, quote: str, replaced: str, gone: str) -> tuple[str, str, str]:
     """(the relay.HELD class of what a charter_update may lift or permit, the words that matched its rule,
-    where they were found), else ("", "", ""): the item a `quote` edit rewords or removes (any rewording
-    may loosen it in ways no judgment reliably sees, such as an added scope), the items of a replaced
+    where they were found), else ("", "", ""). A `quote` edit is read by the clauses it changes
+    (_changed_clauses): every class is run on each clause of the quoted item or the new text that the
+    other side does not keep, so a held word in a clause the edit leaves as it was does not class it, and
+    one in a changed clause always does (no scope or word exemption). Also read: the items of a replaced
     Restrictions section `gone` the new text does not keep word for word, or added text that may lift
-    something (_may_lift). A new ban lifts nothing: the owner's agent may always add one. An edit that
-    only changes which machines or resources (`names`, _scope_names) a test, job or run goes to speaks
-    for nobody: never class (b) (_scope_only); (a) and (c) are checked as for any edit."""
+    something (_may_lift). A new ban lifts nothing: the owner's agent may always add one."""
     norm = lambda t: " ".join(t.lower().split())
-    parts = [("the quoted item", quote), ("the new text", text)] if quote else []
+    parts = [(f'the {w} clause "{c}" of {side}', c) for side, w, c in _changed_clauses(quote, text)] if quote else []
     if gone:
         kept = norm(text)
         parts += [("a replaced line the new text drops or rewords", ln) for ln in gone.splitlines()
                   if ln.strip() and norm(ln) not in kept]
     elif text and not quote and _may_lift(text):
         parts += [("the replaced section", replaced), ("the new text", text)]
-    old = quote or "\n".join(t for w, t in parts if w != "the new text")
-    skip = ("speaks",) if old and _scope_only(old, text, names) else ()
-    whole, where = relay.held_match(" ".join(t for _, t in parts), skip), ""
-    if whole[0]:
-        where = next((w for w, t in parts if relay.held_match(t, skip)[0] == whole[0]), "")
-    return whole[0], whole[1], where
+    hits = [(relay.held_match(t), w) for w, t in parts]
+    return next(((cls, words, w) for k in ("gate", "speaks", "people") for (cls, words), w in hits if cls == k),
+                ("", "", ""))
 
 
-# Words an edit that only re-scopes a test or job to other machines may change besides their names.
-_SCOPE_JOINERS = {"and", "or", "on", "to", "the", "a", "an", "of", "also", "plus", "both", "all", "each", "box",
-                  "boxes", "machine", "machines", "host", "hosts", "node", "nodes"}
-_JOB_RE = re.compile(r"\b(?:tests?|testing|jobs?|runs?|benchmarks?|builds?|workloads?|sweeps?|device runs?|ci)\b", re.I)
-_NAMEISH_RE = re.compile(r"[a-z0-9]+(?:[-_.][a-z0-9]+)+|[a-z]+\d[a-z0-9]*")
+# A clause ends at , ; : a sentence's '.', a line end, or before ' and ' that starts a held step ("and post").
+_CLAUSE_END = re.compile(r"[,;:](?=\s|$)|\.(?=\s|$)|\n")
 
 
-def _scope_names(p: Project) -> frozenset[str]:
-    """The machines and resources the project may already use, lower case: the machine list's aliases and
-    host names, and the name-like words (with a digit, '-', '_' or '.') of the charter's Resources."""
-    from .prompts import charter_sections
-    out = {str(x).strip().lower() for a, m in machines.load().items() for x in (a, (m or {}).get("hostname")) if x}
-    for h, body in charter_sections(p.charter_path.read_text()):
-        if _DATED.sub("", h.lstrip("# ")).lower().startswith("resource"):
-            out.update(_NAMEISH_RE.findall("\n".join(body).lower()))
-    return frozenset(out - {""})
+def _clauses(text: str) -> list[str]:
+    """`text` (source cites aside) split into clauses, compared loosely (_loose), empty ones dropped."""
+    out = []
+    for seg in _CLAUSE_END.split(restriction_source.bare(text)):
+        cut = [m.start() for m in re.finditer(r"\s+and\s+", seg)
+               if any(r.match(seg, m.end()) for r in relay._HELD_RE.values())]
+        out += [_loose(c) for c in (seg[a:b] for a, b in zip([0] + cut, cut + [len(seg)]))]
+    return [c for c in out if c]
 
 
-def _scope_only(old: str, new: str, names: frozenset[str]) -> bool:
-    """Whether `new` differs from `old` (source cites aside) only in which machines or resources a test,
-    job or run goes to: each word it adds or drops is one of `names` or a joiner (or a dropped "only" next
-    to a name), at least one of `names` is added or dropped, and `new` names
-    a test, job or run. "run the test on box-a only" to "on box-a and box-b" is; "never merge" to
-    "merge", an added "except ..." or a name the project may not use is not."""
-    if not names or not _JOB_RE.search(new):
-        return False
-    o, n = (re.findall(r"[\w.-]*\w", _loose(restriction_source.bare(x))) for x in (old, new))
-    ops = [op for op in difflib.SequenceMatcher(a=o, b=n, autojunk=False).get_opcodes() if op[0] != "equal"]
-    if not ops:
-        return False
-    named = False
-    for _, i1, i2, j1, j2 in ops:
-        for w in n[j1:j2]:
-            if w not in names and w not in _SCOPE_JOINERS:
-                return False
-            named = named or w in names
-        for i in range(i1, i2):
-            w = o[i]
-            beside = {o[k] for k in (i - 1, i + 1) if 0 <= k < len(o)}
-            if not (w in names or w in _SCOPE_JOINERS or w == "only" and beside & names):
-                return False
-            named = named or w in names
-    return named
+def _changed_clauses(old: str, new: str) -> list[tuple[str, str, str]]:
+    """The clauses an edit from `old` to `new` changes, as (side, how, clause): those one side has and the
+    other does not keep in place. A clause only added or dropped (a list name cut off by a comma) cannot be
+    told apart from the clauses it sits between, so those are read as changed too: the check fails closed."""
+    o, n = _clauses(old), _clauses(new)
+    out: list[tuple[str, str, str]] = []
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(a=o, b=n, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        out += [("the quoted item", "changed", c) for c in o[i1:i2]] + [("the new text", "changed", c) for c in n[j1:j2]]
+        if op != "replace":   # only added or dropped: its neighbours on both sides
+            out += [("the quoted item", "neighbouring", o[i]) for i in (i1 - 1, i2) if 0 <= i < len(o)]
+    return out
 
 
 def _restriction_edit(p: Project, section: str, quote: str, replaces: str) -> bool:
@@ -6475,12 +6455,12 @@ def _use_charter_approval(p: Project, rid: str, key: str | None) -> None:
 # with it: a test fails when the source of CHARTER_GUARD_FUNCS no longer has CHARTER_GUARD_PIN's
 # sha256. A user's change that failed under an older guard for another reason than the guard
 # (reraise_charter_changes) is then raised at once.
-CHARTER_GUARD_VERSION = 13
+CHARTER_GUARD_VERSION = 14
 CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_overlaps", "_on_object", "_quote_hits",
                        "_item_quote_hits", "_items", "_norm", "_may_lift", "_lifts_item", "_companion_clause",
                        "_ref_ids", "_companion_exception", "_changed_sentences", "_quoted_news",
                        "_charter_approval", "_ask_charter_approval")
-CHARTER_GUARD_PIN = (13, "61a8471fb7bd3bf5228ac37ce59d2be30d3141073a493e83da9814042f25d7fc")
+CHARTER_GUARD_PIN = (14, "61a8471fb7bd3bf5228ac37ce59d2be30d3141073a493e83da9814042f25d7fc")
 CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
 
 

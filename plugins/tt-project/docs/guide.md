@@ -2120,6 +2120,17 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   the old item's terms; it never edits them. The charter guard's refusal says a user's loosening
   goes in as written, and offers the temporary-exception route only when the user's own words make
   it temporary.
+- A Restrictions edit resting only on your agent's words (`coordinator.agent_orders_as_user`) is read
+  by the clauses it changes. The quoted item and the new text are split into clauses (at `,` `;` `:`,
+  a sentence's `.`, and before an "and" that starts a held step such as "and post"). A clause both
+  sides keep is not read; every held class (posting or messaging as you, a merge, a PR leaving draft,
+  another person's request, a step affecting other people, a credential or money) is checked on each
+  changed clause. So moving a test to other machines in a clause of its own goes in, while dropping
+  a merge or post ban stays held for your own words, however the edit is worded. The refusal quotes
+  the matched words, the clause and the class. Known gap: the clause split is a heuristic. Where it
+  cannot place a change (a name cut off by a comma, an added or dropped clause), the clauses beside it
+  are read too and the edit is refused; your own words still apply it. A word in one clause that
+  governs another (a "never" at the start of a list of clauses) is read only where it stands.
 - Text from logs, issues and chats is treated as data, not instructions.
 - Secrets are entered in a terminal (`ttp secret …`), never in chat, and never copied into a project.
   An OpenAI-compatible endpoint's API key: `ttp secret endpoint <alias> --url <base url>` checks it with

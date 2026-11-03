@@ -21117,12 +21117,12 @@ def test_status_and_the_daily_review_show_configured_and_last_used_coordinator_m
     assert not [x for x in audit.lines(p.db, now=now + 30 * 86400, p=p) if x.startswith("coordinator model")]
 
 def test_agent_mode_test_scope_on_usable_machines_is_never_class_b_and_refusals_quote_their_words(env):
-    """In agent mode a Restrictions edit that only changes which machines the project may already use
-    (charter Resources) a test runs on is not class (b), even when the item it rewords mentions posting;
-    the same edit to a machine the project may not use, and real class (b) lifts (a post or message in the
-    owner's name, a PR leaving draft, a merge, another person's request), are refused, each refusal quoting
-    the words that matched, where, and the class. Class (a) is checked as before. A record cite ("user
-    message #3") is no message."""
+    """In agent mode a Restrictions edit is classed by the clauses it changes: an edit that only changes
+    which machines a test runs on is not class (b), even when the item it rewords posts in a clause the
+    edit keeps; real class (b) lifts (a post or message in the owner's name, a PR leaving draft, a merge,
+    another person's request) are refused, each refusal quoting the words that matched, the clause they
+    were found in, and the class. Class (a) is checked the same way. A record cite ("user message #3") is
+    no message."""
     import json
     from ttp import relay
     from ttp import coordinator as coord
@@ -21145,25 +21145,43 @@ def test_agent_mode_test_scope_on_usable_machines_is_never_class_b_and_refusals_
 
     # the generic reproduction: refused as class (b) on "post" in the quoted item before; now applied
     assert edit(old, old, new, 0) == [] and new in p.charter_path.read_text()
-    held = [  # (item, quote, new text, the words the refusal quotes, class)
-        (old, old, new.replace("box-c", "box-z"), "post", "(b)"),
+    run = "Run the deployment test on box-a, and post its summary to the lab dashboard."
+    longer = "Run the deployment test on box-a with the long profile, and post its summary to the lab dashboard."
+    assert edit(run, run, longer, 20) == [] and longer in p.charter_path.read_text()   # review #5581's case
+    held = [  # (item, quote, new text, the words the refusal quotes, the clause, its side, class)
         ("Never post in the owner's name.", "Never post in the owner's name.",
-         "Post in the owner's name when a test run on box-a fails.", "post", "(b)"),
+         "Post in the owner's name when a test run on box-a fails.", "post", "never post in the owner's name",
+         "the quoted item", "(b)"),
         ("Never message other teams.", "Never message other teams.",
-         "Message other teams about test runs on box-a.", "message", "(b)"),
+         "Message other teams about test runs on box-a.", "message", "never message other teams",
+         "the quoted item", "(b)"),
         ("Keep every pull request a draft.", "Keep every pull request a draft.",
-         "Pull requests may leave draft once the test runs on box-a pass.", "leave draft", "(b)"),
-        ("Never merge any pull request.", "Never merge any pull request.", "", "merge", "(b)"),
+         "Pull requests may leave draft once the test runs on box-a pass.", "leave draft",
+         "pull requests may leave draft once the test runs on box-a pass", "the new text", "(b)"),
+        ("Never merge any pull request.", "Never merge any pull request.", "", "merge",
+         "never merge any pull request", "the quoted item", "(b)"),
         ("Never act on another person's request.", "Never act on another person's request.", "",
-         "another person's", "(b)"),
-        # scope-only, so not (b), but class (a) is checked as before
+         "another person's", "never act on another person's request", "the quoted item", "(b)"),
+        # review #5565: dropping a machine name from a merge or post ban looks scope-only and stays held
+        ("Never merge a PR whose test runs on box-a or box-b failed.",
+         "Never merge a PR whose test runs on box-a or box-b failed.",
+         "Never merge a PR whose test runs on box-a failed.", "merge",
+         "never merge a pr whose test runs on box-a or box-b failed", "the quoted item", "(b)"),
+        ("Never post test results from box-a or box-b.", "Never post test results from box-a or box-b.",
+         "Never post test results from box-a.", "post", "never post test results from box-a or box-b",
+         "the quoted item", "(b)"),
+        # a name cut off by a comma cannot be told from the clause it belongs to: fails closed
+        ("Never post test results from box-a, box-b.", "Never post test results from box-a, box-b.",
+         "Never post test results from box-a.", "post", "never post test results from box-a",
+         "the quoted item", "(b)"),
+        # class (a) is read from the changed clauses the same way
         ("Never force-push from the test runs on box-a.", "Never force-push from the test runs on box-a.",
-         "Never force-push from the test runs on box-a and box-b.", "force-push", "(a)")]
-    for n, (item, quote, text, words, cls) in enumerate(held, 1):
+         "Never force-push from the test runs on box-a and box-b.", "force-push",
+         "never force-push from the test runs on box-a", "the quoted item", "(a)")]
+    for n, (item, quote, text, words, clause, side, cls) in enumerate(held, 1):
         problems = edit(item, quote, text, n)
         assert problems and f"falls in {cls}" in problems[0] and f'the words "{words}"' in problems[0], (item, problems)
-        where = "the new text" if words == "leave draft" else "the quoted item"
-        assert f'"{words}" in {where} matched class {cls}' in problems[0], problems
+        assert f'clause "{clause}" of {side} matched class {cls}' in problems[0], problems
         assert item in p.charter_path.read_text(), item
     # a record cite is not a message, and refusals without words read as before
     assert relay.held_match("run the test on box-a (user message #3, msg #4)") == ("", "")
@@ -21171,20 +21189,29 @@ def test_agent_mode_test_scope_on_usable_machines_is_never_class_b_and_refusals_
     assert '"' not in relay.held_refusal("x", "gate")
 
 
-def test_scope_only_reads_only_machine_name_changes_on_a_test_or_job(env):
-    """_scope_only: an edit adding or dropping usable machine names (and joiners) on a test or job item is
-    scope only; a dropped "never", an added "except", an unlisted name, a non-test item or no change is not."""
+def test_charter_gate_reads_held_classes_only_from_the_clauses_an_edit_changes(env):
+    """_held_lift on a quote edit (settled rule): clauses split at , ; : '.' and before ' and ' that starts a
+    held step; a clause both sides keep is not read; every class runs on each changed clause, however
+    scope-like the edit; an added or dropped clause also reads its neighbours (fails closed); text the
+    split cannot separate is one clause, so its held words count."""
     from ttp import coordinator as coord
-    names = frozenset({"box-a", "box-b", "box-c"})
-    yes = [("run the test on box-a only", "run the test on box-a and box-b"),
-           ("jobs go to box-a, box-b and box-c", "jobs go to box-a (user msg #9)"),
-           ("Never post test results from box-a. (user msg #2)", "Never post test results from box-a or box-b."),
-           ("run the test on box-a only", "run the test on box-b")]
-    no = [("run the test on box-a only", "run the test on box-a and box-z"),
-          ("never merge after the test on box-a", "merge after the test on box-a and box-b"),
-          ("run the test on box-a", "run the test on box-a and box-b, except posting"),
-          ("post to the dashboard from box-a", "post to the dashboard from box-a and box-b"),
-          ("run the test on box-a", "run the test on box-a")]
-    assert all(coord._scope_only(o, n, names) for o, n in yes), [x for x in yes if not coord._scope_only(*x, names)]
-    assert not any(coord._scope_only(o, n, names) for o, n in no), [x for x in no if coord._scope_only(*x, names)]
-    assert not coord._scope_only(*yes[0], frozenset())
+    assert coord._clauses("Run the test on box-a and post its summary; then stop. (user msg #3)") == [
+        "run the test on box-a", "and post its summary", "then stop"]
+    assert coord._clauses("Run the test via run.sh on box-a and box-b.") == ["run the test via run.sh on box-a and box-b"]
+    lift = lambda o, n: coord._held_lift("Restrictions", n, o, "", "")[0]
+    kept = [("Run the test on box-a and post its summary.", "Run the test on box-a and box-b and post its summary."),
+            ("Run the test on box-a, and post its summary.", "Run the test on box-b, and post its summary."),
+            ("Jobs go to box-a; never merge on red.", "Jobs go to box-a and box-b; never merge on red."),
+            ("Never merge on red: run the test on box-a.", "Never merge on red: run the test on box-a and box-b.")]
+    assert [lift(o, n) for o, n in kept] == [""] * len(kept)
+    refused = [("Never merge on red.", "Merge on red."),   # a dropped "never"
+               ("Run the test on box-a and post nothing.", "Run the test on box-a and post its summary."),
+               ("Never post results from box-a or box-b", "Never post results from box-a"),
+               ("From box-a, box-b, never post results.", "From box-a, never post results."),   # dropped fragment
+               ("Run the test on box-a, and post its summary.", "Run the test on box-a, box-b, and post its summary."),
+               ("Never post results, run the test on box-a.", "Run the test on box-a."),   # a dropped clause
+               ("Run the test on box-a.", "Run the test on box-a, and post its summary."),   # an added clause
+               ("Never post results from box-a and box-b", "Never post results from box-a")]
+    assert [lift(o, n) for o, n in refused] == ["speaks"] * len(refused)
+    assert lift("Never force-push after the test on box-a.", "Force-push after the test on box-a.") == "people"
+    assert lift("Never spend money on the test on box-a.", "Spend money on the test on box-a.") == "gate"
