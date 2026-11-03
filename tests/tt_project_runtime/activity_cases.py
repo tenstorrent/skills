@@ -151,6 +151,9 @@ def test_an_open_take_whose_pid_is_a_kernel_thread_or_another_namespaces_is_unkn
     k1, k2 = [k for k in (2, 13, 14) if k != me][:2]   # under `ttp sandbox` this test may be pid 2 itself
     monkeypatch.setattr(locks, "kthread", lambda pid, proc="/proc": int(pid) in (k1, k2))
     monkeypatch.setattr(activity, "_same_boot", lambda boot: boot == "b")
+    # The daemon's namespace is this test's own: a run's TTP_PIDNS names the daemon's, which differs from
+    # this one under `ttp sandbox`, and would make every pid here read as another namespace's.
+    monkeypatch.setenv("TTP_PIDNS", ns or "")
     recs = [{"ev": "take", "id": "old13", "host": "h", "start": 1, "pid": k2, "boot": b},   # logged before pidns
             {"ev": "take", "id": "ns2", "host": "h", "start": 2, "pid": k1, "pidns": ns, "boot": b},
             {"ev": "take", "id": "other", "host": "h", "start": 3, "pid": me, "pidns": "pid:[other]", "boot": b},
