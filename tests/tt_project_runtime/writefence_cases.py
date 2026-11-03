@@ -137,6 +137,15 @@ def test_doctor_names_a_claude_fence_turned_off(env, monkeypatch, capsys):
     "cd /w && ssh host 'make'", "ssh host 'cat log' | tail -5", "ssh host true; echo ok", "ssh host a\nssh host b",
     "timeout 60 /usr/bin/ssh host x | grep y", "FOO=1 scp a host:b && echo done", "ls | xargs rsync -a h:/x",
     "ttp lock box -- ssh host x 2>&1 | tail", "echo hi && sftp host",
+    # Forms the fence keeps sandboxed though only one command runs: a redirect to or from a file,
+    # a substitution anywhere in the line, ssh inside a shell not run by `ttp lock ... --`.
+    "ssh -o BatchMode=yes host 'bash -s' < /dev/null", "ttp lock res -- ssh host 'bash -s' < remote.sh",
+    "ssh host 'bash -s' <<'EOF'\nhostname\nEOF", "ssh host 'cat log' > out.txt", "ssh host true 2>/dev/null",
+    "timeout 60 rsync -a host:x . &>/dev/null", "ssh host 'echo $(hostname)'", 'ssh host "$(cat cmd.txt)"',
+    "ssh host 'echo `hostname`'", "ttp lock res -- bash -c 'ssh host \"$(cat f)\"'", "bash -c 'ssh host hostname'",
+    "sh -ec 'timeout 9 ssh host true'", "ttp clip -- bash -lc 'ssh host true'", "bash -c \"bash -c 'scp a host:b'\"",
+    "eval 'ssh host true'",
+    "ttp lock res -- ssh host true | tail", "ttp lock res -- bash -c 'ssh host true' | tail",
 ])
 def test_fenced_hook_refuses_ssh_beside_other_commands(env, monkeypatch, cmd):
     from ttp import hook
@@ -154,6 +163,9 @@ def test_fenced_hook_refuses_ssh_beside_other_commands(env, monkeypatch, cmd):
     "ssh host 'cat log | tail -5'", "timeout 60 ssh host 'a && b'", "ttp lock box -- ssh host 'make 2>&1 | tail'",
     "ssh host cmd 2>&1", "git log --grep ssh | head -3", "ssh-keygen -l -f k.pub && echo ok",
     "git commit -m 'ssh && scp; rsync'", "cat > notes.md <<'X'\nssh a && ssh b\nX",
+    "ssh host hostname", "ttp lock res -- bash -c 'ssh host hostname'", "ttp lock res -- bash wrapper.sh",
+    "ttp lock res -- bash -c 'ssh host \"bash -s\" < remote.sh > out.txt'", "ssh host 'cat < f > g'",
+    "ssh host x >&2", "bash -c 'echo $(hostname)' > out.txt", "ssh host bash -c 'hostname'", "bash wrapper.sh",
 ])
 def test_fenced_hook_lets_ssh_on_its_own_and_ssh_as_data_run(env, monkeypatch, cmd):
     from ttp import hook
@@ -161,6 +173,18 @@ def test_fenced_hook_lets_ssh_on_its_own_and_ssh_as_data_run(env, monkeypatch, c
     monkeypatch.setenv("TTP_FENCE_BY_NAME", "1")
     out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(env["tmp"])})
     assert not out or out["hookSpecificOutput"].get("permissionDecision") != "deny", out
+
+
+@pytest.mark.parametrize("cmd", ["ssh host 'bash -s' < /dev/null", "bash -c 'ssh host true'",
+                                 "ttp lock res -- ssh host true | tail"])
+def test_fenced_ssh_refusal_names_the_cause_and_the_wrapper_script(env, monkeypatch, cmd):
+    from ttp import hook
+    monkeypatch.setenv("TTP_RUN_DIR", str(env["tmp"]))
+    monkeypatch.setenv("TTP_FENCE_BY_NAME", "1")
+    why = _decision(hook, cmd, env["tmp"])
+    assert "simple command" in why and "own loopback" in why, why
+    assert "ttp lock <res> -- bash wrapper.sh" in why and "plain `bash wrapper.sh` stays fenced" in why, why
+    assert "is fine)" not in why.split("(`2>&1` is fine)")[0], "ttp lock alone does not free any line"
 
 
 def test_fence_frees_git_network_commands_by_name():

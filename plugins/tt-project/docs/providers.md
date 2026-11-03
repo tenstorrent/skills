@@ -82,10 +82,17 @@ passed again for Claude Code with workers in the write fence (38 s, $0.12).
 - A code task's plain `needs_review` hand-off gets its review from the daemon's review sweep,
   `review.sweep_after_s` (default 5 min) after its run ended; a `done` hand-off gets it at once.
 - Claude Code: a host without bubblewrap or socat (Linux) runs workers unfenced and raises one
-  low issue. The fence frees ssh and its kin by name only when they run on their own (also under
-  `timeout N` or `ttp lock <res> --`), never inside `&&`, `;` or a pipe, nor from a script: there
-  host names do not resolve. The hook refuses such a compound command and says to run ssh by
-  itself, with any pipe inside the quoted remote command; a script that runs ssh still fails.
+  low issue. The fence frees ssh and its kin by name only as a simple command on its own (also
+  under `timeout N` or `ttp lock <res> --`). Any of these keeps the whole line fenced (measured):
+  `&&`, `;` or a pipe, also after `ttp lock <res> -- ssh ...`; a redirect to or from a file (`<`,
+  `<<`, `> file`, `2>/dev/null`; `2>&1` is fine); `$(...)` or a backtick anywhere in the line, even
+  inside quotes; ssh inside `bash -c` or `eval`; a script that runs ssh. There host names do not
+  resolve, and a refused 127.0.0.1 port is the sandbox's own loopback, not the host's: never a
+  sign that a host or tunnel is down. The hook refuses these forms. The workaround: a pipe goes
+  inside the quoted remote command (`ssh host 'cmd | tail -20'`), anything else into a local
+  wrapper script (e.g. `ssh host 'bash -s' < remote.sh > out.txt`) run as
+  `ttp lock <res> -- bash wrapper.sh`; `ttp lock <res> -- bash -c '...'` also works, while a plain
+  `bash wrapper.sh` stays fenced.
   git over an SSH remote (`git@host:...`, `ssh://`) is the same: `git fetch ...` on its own reaches
   the host (measured, `git ls-remote`), but not inside a compound command or after `git -C`, which
   the hook refuses. It tells an explicit URL's kind from the URL, else refuses when any remote of

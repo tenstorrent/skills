@@ -755,21 +755,59 @@ def harness_gh_edit(payload: dict) -> str | None:
     return None if _harness_task() else HARNESS_GH_WHY
 
 
-# Commands the Claude Code fence frees by name (providers/claude.py FENCE_EXCLUDED): only when run on
-# their own; inside `&&`, `;` or a pipe the whole line stays sandboxed, where they cannot reach a host.
+# Commands the Claude Code fence frees by name (providers/claude.py FENCE_EXCLUDED, also after `timeout N`):
+# only a simple command; a redirect to or from a file, a substitution anywhere in the line, a shell
+# wrapper, `&&`, `;` or a pipe keep the whole line sandboxed, where they cannot reach a host (measured).
 FENCE_FREED = {"ssh", "scp", "sftp", "rsync"}
+SUBST_RE = re.compile(r"\$\(|`")
+FILE_REDIRECT_RE = re.compile(r"<|>(?!&)")   # `2>&1` and `>&2` duplicate a descriptor: fine
+SHELL_C_RE = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
 
 
-def fenced_ssh(segments: list[list[str]]) -> str | None:
-    """Why a fenced worker's command that runs ssh (or scp, sftp, rsync) beside other commands would
-    fail; None outside such a run (TTP_FENCE_BY_NAME) or for one command on its own."""
-    if not os.environ.get("TTP_FENCE_BY_NAME") or len(segments) < 2:
+def _freed_in(argv: list[str], depth: int = 0) -> str | None:
+    """The ssh-like command `argv` runs: itself, or one in its `bash -c` or `eval` script."""
+    name = os.path.basename(argv[0])
+    if name in FENCE_FREED:
+        return name
+    if name not in SHELLS and name != "eval" or depth > 2:
         return None
-    hit = next((os.path.basename(s[0]) for s in segments if os.path.basename(s[0]) in FENCE_FREED), None)
-    return hit and (f"{hit} reaches another host only when it runs on its own: inside `&&`, `;` or a pipe the "
-                    f"whole command stays in the write fence, where host names do not resolve. Run `{hit} ...` as "
-                    f"a command by itself (under `timeout N` or `ttp lock <res> --` is fine) and put any pipe "
-                    f"inside the quoted remote command, e.g. `ssh host 'cmd | tail -20'`")
+    script = " ".join(argv[1:]) if name == "eval" else \
+        next((argv[i + 1] for i in range(1, len(argv) - 1) if SHELL_C_RE.fullmatch(argv[i])), None)
+    return script and next((h for s in _segments(script) if (h := _freed_in(s, depth + 1))), None)
+
+
+def fenced_ssh(segments: list[list[str]], cmd: str) -> str | None:
+    """Why a fenced worker's command `cmd` (its simple commands: `segments`) that runs ssh (or scp,
+    sftp, rsync) would stay in the fence: beside other commands, with a redirect to or from a file,
+    with a substitution, or in a `bash -c` not run by `ttp lock ... --`. None outside such a run
+    (TTP_FENCE_BY_NAME) or for a simple command."""
+    if not os.environ.get("TTP_FENCE_BY_NAME"):
+        return None
+    hit, form = None, ""
+    for raw in _segments(cmd, strip=False):
+        wrappers: list[list[str]] = []
+        s = _strip_prefix(raw, wrappers)
+        if s and (h := _freed_in(s)):
+            hit = hit or h
+            if os.path.basename(s[0]) != h and not any(w[:1] == ["lock"] for w in wrappers):
+                form = form or f"`{os.path.basename(s[0])} -c` wrapper"
+    if not hit:
+        return None
+    if len(segments) > 1:
+        form = "`&&`, `;` or pipe"
+    elif SUBST_RE.search(cmd):
+        form = "`$(...)` or backtick substitution"
+    elif FILE_REDIRECT_RE.search("".join(" " if q else c for c, (q, _) in zip(cmd, _quoting(cmd)))):
+        form = "redirect to or from a file"
+    return form and (
+        f"{hit} reaches another host only as a simple command on its own. The sandbox frees `{hit} ...` "
+        f"(also after `timeout N` or `ttp lock <res> --`) by name, but this line's {form} keeps the whole "
+        f"line in the write fence, as does any `<`, `<<`, `> file`, `$(...)`, backtick, `bash -c` wrapper, "
+        f"`&&`, `;` or pipe (`2>&1` is fine). There host names do not resolve and a refused 127.0.0.1 "
+        f"port is the sandbox's own loopback, not the host's. Put a pipe inside the quoted remote command "
+        f"(`ssh host 'cmd | tail -20'`), or write the line into a local wrapper script (e.g. "
+        f"`ssh host 'bash -s' < remote.sh > out.txt`) and run `ttp lock <res> -- bash wrapper.sh`: a plain "
+        f"`bash wrapper.sh` stays fenced")
 
 
 # git's network commands the fence frees by name (FENCE_EXCLUDED); git runs ssh for an SSH remote.
@@ -862,7 +900,7 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if not why:
         why = git_push_bypass(segments)
     if not why:
-        why = fenced_ssh(segments) or fenced_git(segments, str(payload.get("cwd") or os.getcwd()))
+        why = fenced_ssh(segments, commands) or fenced_git(segments, str(payload.get("cwd") or os.getcwd()))
     if not why:
         from . import killguard
         why = killguard.refusal(cmd, str(payload.get("cwd") or os.getcwd()))
