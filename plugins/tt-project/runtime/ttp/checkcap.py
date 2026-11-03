@@ -762,21 +762,33 @@ def record_grant(rec: dict, owns: list[str] | tuple = ()) -> None:
 def wait_records(state: Path, now: float | None = None, window_s: float = WAITS_WINDOW_S) -> list[dict]:
     """The records (record_wait's) that `state`'s log holds for slots taken in the last `window_s`,
     with "queued_at" and "granted_at" as floats."""
+    return _records(Path(state), (WAITS_OLD, WAITS_LOG), ("queued_at", "granted_at"), now, window_s)
+
+
+def grant_records(now: float | None = None, window_s: float = WAITS_WINDOW_S) -> list[dict]:
+    """The host-wide grants (record_grant's rows, any project) taken in the last `window_s`, with "ts"
+    and "since" as floats."""
+    return _records(grants_dir(), (GRANTS_OLD, GRANTS_LOG), ("since", "ts"), now, window_s)
+
+
+def _records(d: Path, names: tuple, keys: tuple[str, str], now: float | None, window_s: float) -> list[dict]:
+    """The JSON lines of `d`/`names` whose two times `keys` (arrival, grant) read as floats, the grant
+    in the last `window_s`."""
     now = time.time() if now is None else now
     out = []
-    for name in (WAITS_OLD, WAITS_LOG):
+    for name in names:
         try:
-            text = (Path(state) / name).read_text()
+            text = (d / name).read_text()
         except OSError:
             continue
         for raw in text.splitlines():
             try:
                 r = json.loads(raw)
-                q, g = float(r["queued_at"]), float(r["granted_at"])
+                q, g = float(r[keys[0]]), float(r[keys[1]])
             except (ValueError, KeyError, TypeError):
                 continue
             if now - window_s <= g <= now:
-                out.append({**r, "queued_at": q, "granted_at": g})
+                out.append({**r, keys[0]: q, keys[1]: g})
     return out
 
 

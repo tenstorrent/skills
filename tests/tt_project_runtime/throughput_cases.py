@@ -941,3 +941,126 @@ def test_throughput_judges_a_checks_wait_by_the_cap_its_record_stored_else_the_e
     p.set_config("checks.test_project_max", 4)
     ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
     assert (ck["count"], ck["at_limit"], ck["idle"]) == (3, 2, 1), ck
+
+
+def _tp_host_scene(p, monkeypatch, tmp_path, d, now, at_cap=False, other_grant=False):
+    """Two priority 1 checks waits of 999 s, each queued 900 s for a slot (checkcap's own waits log), behind
+    one of the project's own checks runs under its cap of 3, or three runs at the cap (`at_cap`); with
+    `other_grant` another project's host slot grant (checkcap.record_wait's host-wide line) inside each."""
+    from ttp import checkcap
+    monkeypatch.setattr(checkcap, "grants_dir", lambda: tmp_path / "host")
+    p.set_config("checks.test_project_max", 3)
+    out = []
+    for i, w0 in enumerate((now - 5 * 3600, now - 3 * 3600)):
+        t = _tp_checks_requeue(p, d, monkeypatch, tmp_path, f"checks wait {i}", w0, 999)
+        for _ in range(3 if at_cap else 1):
+            _tp_checks_run(p, monkeypatch, w0 - 60, 1200)
+        _tp_slot_wait(p, monkeypatch, t, w0, w0 + 900)
+        if other_grant:
+            checkcap.record_wait(None, "other-project", 2, w0 - 30, w0 + 400)
+        out.append(t)
+    return out
+
+
+@pytest.mark.parametrize("other", [False, True])
+def test_throughput_checks_waits_the_host_held_name_that_holder_and_raise_nothing(env, monkeypatch, tmp_path, other):
+    """[note 2da6abee8b25431c]: checks waits queued for a host-wide slot while the project's own checks ran
+    under its cap (at_limit 0) were blamed on checks.slots. Held by the host's free-cores gate (no other
+    project's grant inside them) or by other projects' host test grants, the lane names that holder,
+    no checks setting, and plan() keeps it as information only: no raise advice and no throughput task."""
+    from ttp import slowcomplaint, throughput
+    from ttp.daemon import Daemon
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    _tp_host_scene(p, monkeypatch, tmp_path, d, now, other_grant=other)
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    ck = _tp_lane(rep, "checks_slots")
+    who = throughput.OTHER_PROJECTS if other else throughput.HOST_CORES
+    assert ck["slow"] and (ck["count"], ck["at_limit"], ck["idle"]) == (2, 0, 2), ck
+    assert ck["held_by"] == {"own": 0, throughput.HOST_CORES: 0, throughput.OTHER_PROJECTS: 0, who: 2}, ck
+    assert (ck["holder"], ck["limit_key"], ck["limit"]) == (who, None, None), ck
+    assert "config_set" not in ck["note"] and "raise the one" not in ck["note"], ck["note"]
+    assert ("other projects' host test grants" if other else "free-cores gate") in ck["note"]
+    assert "does not help" in ck["note"] if not other else "No per-project raise helps" in ck["note"]
+    changes, kept = throughput.plan(p.db, p.config(), rep)
+    assert not [c for c in changes if c["key"].startswith("checks.")], changes
+    (k,) = [k for k in kept if k["lane"] == "checks_slots"]
+    assert k["info"] and k["key"] is None and k["why"] == ck["note"], k
+    line = next(x for x in throughput.text({**rep, "kept": kept}).splitlines() if x.startswith("- checks_slots"))
+    assert f"held by {throughput.HOLDERS[who]}, not a project limit" in line and "checks.slots" not in line, line
+    made = slowcomplaint._followups(p.db, {**rep, "kept": kept}, [1])
+    assert made["opened"] is None and made["listed"] is None, made
+    assert not p.db.q("SELECT 1 FROM tasks WHERE title LIKE 'throughput: %'")
+
+
+def test_throughput_checks_waits_at_the_projects_own_cap_still_name_its_limit(env, monkeypatch, tmp_path):
+    """Own-cap waits keep the checks setting and its advice (a kept entry with a key, so a follow-up),
+    even beside another project's grant inside them; a host-held wait beside one at the cap is only
+    counted in the note, never the holder."""
+    from ttp import slowcomplaint, throughput
+    from ttp.daemon import Daemon
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    _tp_host_scene(p, monkeypatch, tmp_path, d, now, at_cap=True, other_grant=True)
+    w2 = now - 3600   # one more wait the host held: one own run under the cap, no other grant
+    t = _tp_checks_requeue(p, d, monkeypatch, tmp_path, "host held", w2, 999)
+    _tp_checks_run(p, monkeypatch, w2 - 60, 1200)
+    _tp_slot_wait(p, monkeypatch, t, w2, w2 + 900)
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    ck = _tp_lane(rep, "checks_slots")
+    assert (ck["count"], ck["at_limit"], ck["idle"]) == (3, 2, 1), ck
+    assert ck["held_by"] == {"own": 2, throughput.HOST_CORES: 1, throughput.OTHER_PROJECTS: 0}, ck
+    assert "holder" not in ck and ck["limit_key"] in ("checks.slots", "checks.test_project_max"), ck
+    assert "config_set" in ck["note"] and "1 wait(s) held by the host's free-cores gate, not by" in ck["note"]
+    _, kept = throughput.plan(p.db, p.config(), rep)
+    (k,) = [k for k in kept if k["lane"] == "checks_slots"]
+    assert k["key"] and not k.get("info"), k
+    fid = slowcomplaint._followups(p.db, {**rep, "kept": kept}, [1])["opened"]
+    assert fid and "lane checks_slots slow: 3 wait(s)" in p.db.one("SELECT spec FROM tasks WHERE id=?", (fid,))["spec"]
+
+
+def test_throughput_a_checks_slot_wait_event_names_the_host_only_when_every_lane_holder_waits_for_it(
+        env, monkeypatch):
+    """A checks_slot_wait event (checklane.wait_events) is host-held only when every lane holder it names
+    has its lane but waits for a host-wide gate (testslots.lane_waits); a running holder, no holder, or a
+    text with no holder list is the project's own lane. A wait known only from such events is classified
+    by them: the host gate, never checks.slots."""
+    from ttp import checkcap, checklane, locks, testslots, throughput
+    p = make(env)
+
+    def event_text(task, waits):
+        _lane_env(monkeypatch)
+        monkeypatch.setenv("TTP_TASK", "12")
+        hold = testslots.suite_hold(p.name, repo=_LANE_REPO, slots=1, lock="", what="pytest -q tests/a.py")
+        monkeypatch.delenv("TTP_TASK")
+        if waits:
+            testslots.lane_waits(hold, "a host-wide checks slot")
+        ticket = locks.enqueue(checkcap.slot_dir(), testslots.suite_base(p.name, _LANE_REPO),
+                               f"task #{task} {p.name}: full checks (run 9, pid 1)", time.time() - 1000, priority=2)
+        try:
+            (ev,) = [e for e in checklane.wait_events(p.name, {}) if e["task"] == task]
+        finally:
+            locks.dequeue(ticket)
+            hold.close()
+        return ev["text"]
+
+    now = time.time()
+    t = _tp_task(p, "checks wait", now - 3 * 3600, prio=1)
+    waiting = event_text(t, True)
+    assert "not running yet (waiting for a host-wide checks slot)" in waiting, waiting
+    assert throughput.host_held(waiting) and not throughput.host_held(event_text(t, False))
+    assert not throughput.host_held("Checks lane wait: #3 has waited 20 min on lanes, behind no holder "
+                                    "(lanes free, about to start). Lanes: ...")
+    assert not throughput.host_held("not running yet (waiting for a host-wide checks slot)")   # no holder list
+    assert not throughput.host_held(waiting.replace("; ", "", 0).replace(
+        "behind ", "behind #4 'pytest' queued 1 min, running 1 min, no child process; ", 1))
+    p.db.x("INSERT INTO runs(task, role, started, ended, status, note) VALUES(?,?,?,?,?,?)",
+           (t, "worker", now - 3 * 3600, now - 2 * 3600, "ok", "{}"))
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+           (now - 2 * 3600, f"task:{t}", "task_waiting", "low", f"#{t} waits: the project's other full checks",
+            "handled", t))
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+           (now - 1.5 * 3600, "daemon", "checks_slot_wait", "low", waiting, "handled", t))
+    p.db.x("UPDATE tasks SET status='queued', blocked_reason='waiting for the checks slot' WHERE id=?", (t,))
+    ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
+    assert (ck["holder"], ck["limit_key"], ck["at_limit"]) == (throughput.HOST_CORES, None, 0), ck
