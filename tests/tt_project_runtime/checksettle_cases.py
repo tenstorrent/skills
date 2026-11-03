@@ -196,3 +196,45 @@ def test_a_worker_hand_off_on_its_own_checks_gets_settle_filled_in_and_a_pass_en
     assert task["status"] == "done" and res["run_status"] == "model-free", (task["status"], res)
     assert res["summary"].startswith("table rebuilt") and res["artifacts"] == ["fix.txt"]
     assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
+
+
+def test_the_settle_fill_runs_no_raw_git_under_the_finish_write_lock(env, monkeypatch, tmp_path):
+    """The fill runs inside the finish transaction: its head read goes through gitmemo (memo, round
+    slice, TX_GIT_S budget), never a raw subprocess git that could hold the write lock for its timeout."""
+    from ttp import daemon as dmod, db as dbmod, gitmemo
+    raw, memo, depth, dbs = [], [], [0], []
+    real_run, real_memo, real_init = subprocess.run, gitmemo.run, dbmod.DB.__init__
+
+    def init(self, *a, **kw):
+        real_init(self, *a, **kw)
+        dbs.append(self)
+
+    def in_tx():
+        return any(getattr(o, "conn", None) is not None and o.conn.in_transaction for o in dbs)
+
+    def run(argv, *a, **kw):
+        if isinstance(argv, list) and argv[:1] == ["git"] and not depth[0] and in_tx():
+            raw.append(argv)
+        return real_run(argv, *a, **kw)
+
+    def memo_run(argv, *a, **kw):
+        if in_tx():
+            memo.append(argv)
+        depth[0] += 1
+        try:
+            return real_memo(argv, *a, **kw)
+        finally:
+            depth[0] -= 1
+
+    monkeypatch.setattr(dbmod.DB, "__init__", init)
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(gitmemo, "run", memo_run)
+    test_a_worker_hand_off_on_its_own_checks_gets_settle_filled_in_and_a_pass_ends_it_model_free(
+        env, monkeypatch, tmp_path)
+    assert not raw, f"raw git under the DB write lock: {raw}"
+    assert any("rev-parse" in a for a in memo), memo
+    # Outside git or a worktree with no commit yet: no head to settle on.
+    plain, empty = tmp_path / "plain", tmp_path / "empty"
+    plain.mkdir()
+    subprocess.run(["git", "init", "-q", str(empty)], check=True, capture_output=True)
+    assert dmod._clean_head(str(plain)) == "" and dmod._clean_head(str(empty)) == ""

@@ -15346,12 +15346,25 @@ def checks_settle_fill(task: dict, result: dict, run_dir: Path, ttp: str) -> tup
     checks = Path(shlex.split(result["retry_when"])[3])
     spec_file = _read_result(run_dir / "run.json") or {}
     top = _read_checks_pid(checks).get("worktree") or spec_file.get("cwd")
-    head = checksettle._head_of(top) if isinstance(top, str) and top and Path(top).is_dir() else ""
+    head = _clean_head(top) if isinstance(top, str) and top and Path(top).is_dir() else ""
     if not head:
         return result, "kept: no clean worktree head to settle on"
     cmd = checksettle.command(ttp, checks, head)
     # on_pass_cmd_orig None: the run's result.json named none, as after `ttp task set-when --on-pass-cmd`.
     return {**result, "on_pass_cmd": cmd, "on_pass_cmd_orig": None}, f"got the on_pass_cmd `{cmd}` filled in"
+
+
+def _clean_head(top: str) -> str:
+    """The worktree's HEAD when it has no uncommitted changes to tracked files, else "". Through
+    worktree._git (gitmemo): checks_settle_fill runs inside the finish write transaction."""
+    try:
+        head = worktree._git(Path(top), "rev-parse", "HEAD", check=False)
+        if not checksettle.HEAD_RE.fullmatch(head) or len(head) < 40:
+            return ""
+        status = worktree._git(Path(top), "status", "--porcelain", "--untracked-files=no", check=True)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return ""
+    return "" if status else head
 
 
 def push_on_pass(task: dict, full: dict) -> dict | None:
