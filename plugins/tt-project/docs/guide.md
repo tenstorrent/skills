@@ -2146,8 +2146,8 @@ Workers can read Slack links you paste, using your Slack connector if you have o
 - A Restrictions edit resting only on your agent's words (`coordinator.agent_orders_as_user`) is read
   by the clauses it changes. The quoted item and the new text are split into clauses (at `,` `;` `:`,
   a sentence's `.`, and before an "and" that starts a held step such as "and post"). A clause both
-  sides keep is not read; every held class (posting or messaging as you, a merge, a PR leaving draft,
-  another person's request, a step affecting other people, a credential or money) is checked on each
+  sides keep is not read; every held class (posting or messaging as you, a merge, a PR leaving draft
+  or a rule keeping pull requests in draft, another person's request, a step affecting other people, a credential or money) is checked on each
   changed clause. So moving a test to other machines in a clause of its own goes in, while dropping
   a merge or post ban stays held for your own words, however the edit is worded. The refusal quotes
   the matched words, the clause and the class. Known gap: the clause split is a heuristic. Where it

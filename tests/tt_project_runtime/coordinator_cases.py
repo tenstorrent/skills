@@ -21210,8 +21210,8 @@ def test_agent_mode_test_scope_on_usable_machines_is_never_class_b_and_refusals_
          "Message other teams about test runs on box-a.", "message", "never message other teams",
          "the quoted item", "(b)"),
         ("Keep every pull request a draft.", "Keep every pull request a draft.",
-         "Pull requests may leave draft once the test runs on box-a pass.", "leave draft",
-         "pull requests may leave draft once the test runs on box-a pass", "the new text", "(b)"),
+         "Pull requests may leave draft once the test runs on box-a pass.", "pull request a draft",
+         "keep every pull request a draft", "the quoted item", "(b)"),
         ("Never merge any pull request.", "Never merge any pull request.", "", "merge",
          "never merge any pull request", "the quoted item", "(b)"),
         ("Never act on another person's request.", "Never act on another person's request.", "",
@@ -21273,3 +21273,44 @@ def test_charter_gate_reads_held_classes_only_from_the_clauses_an_edit_changes(e
     # documented gap (guide, settled rule): a word in one clause that governs another is read where it stands
     assert lift("Never post: results from box-a or box-b.", "Never post: results from box-a.") == ""
     assert lift("From box-a or box-b, never post results.", "From box-a, never post results.") == ""
+
+
+def test_charter_gate_holds_a_plain_keep_pull_requests_in_draft_item_as_class_b(env):
+    """A Restrictions item that keeps pull requests in draft (draft with pull request or PR wording, no
+    'leave draft') is class (b): removing or loosening it on the owner's agent's words is refused, quoting
+    the matched words; the owner's own verbatim words still change it; a changed clause without draft or
+    PR wording is not held by it."""
+    import json
+    from ttp import relay
+    from ttp import coordinator as coord
+    for text in ("Keep every pull request a draft.", "PRs stay drafts.", "Open draft PRs only.",
+                 "Pull-requests remain in draft until tests pass.", "Draft-only pull requests.",
+                 "Drafts of pull requests only."):
+        assert relay.held_match(text)[0] == "speaks", text
+    assert relay.held_match("Keep the design notes a draft.") == ("", "")
+    assert relay.held_match("Run the PR test suite on box-a.") == ("", "")
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    p.set_config(relay.AGENT_KEY, True)
+    base = p.charter_path.read_text()
+    item = "Keep every pull request a draft."
+    other = "Run the deployment test on box-a."
+
+    def edit(quote, text, own=False):
+        p.charter_path.write_text(base + f"\n## Restrictions\n- {item} (user msg #1)\n- {other} (user msg #1)\n")
+        said = text or "drop that item"
+        mid = (p.db.post("in", f"Order: {said}", chat="cli", provenance="cli-legacy") if own else
+               p.db.post("in", "", chat="cli", provenance="cli-legacy", context=f"Order: {said}"))
+        act = {"type": "charter_update", "section": "Restrictions", "quote": quote, "text": text,
+               "source": json.dumps({"msg": mid, "quote": said})}
+        return coord.apply(p, [act], user_turn=True, messages=[mid])
+
+    for text in ("", "Keep pull requests a draft until the test on box-a passes."):   # removed, loosened
+        problems = edit(item, text)
+        assert problems and "falls in (b)" in problems[0] and '"pull request a draft"' in problems[0], problems
+        assert item in p.charter_path.read_text(), text
+    # the owner's own verbatim words still remove it
+    assert edit(item, "", own=True) == [] and item not in p.charter_path.read_text()
+    # a changed clause without draft or PR wording is unaffected
+    wider = "Run the deployment test on box-a and box-b."
+    assert edit(other, wider) == [] and wider in p.charter_path.read_text() and item in p.charter_path.read_text()

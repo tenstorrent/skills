@@ -111,6 +111,7 @@ _HELD_RE = {
                        r"log[- ]?ins?|funds?|money|payments?|billing|purchas\w*|invoices?|spend(?:ing)?[ _-]?(?:caps?|"
                        r"limits?)|budget|daily_usd|weekly_usd|usd)\b|\$\d", re.I),
     "speaks": re.compile(r"\b(?:merg\w*|ready for review|(?:leav\w*|out of|remov\w*) (?:the )?draft|"
+                         r"(?:pull[ -]?requests?|prs?)\b[^.;:,\n]{0,60}?\bdraft\w*|draft[\w-]*(?: of)? (?:pull[ -]?requests?|prs?)|"
                          r"undraft\w*|reviewers?|post\w*|messag\w*|emails?|slack|announc\w*|in (?:the owner's|"
                          r"the user's|their|my) name|as the (?:owner|user)|on (?:the owner's|the user's|my) behalf|"
                          r"another person's|someone else's request)\b", re.I),
