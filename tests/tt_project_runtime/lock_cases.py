@@ -1513,9 +1513,46 @@ def test_worker_ttp_lock_refuses_a_privileged_command_and_points_to_host_run(env
     assert r.returncode == 0 and log.read_text().splitlines()[-1] == "sudo true", r
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="no_new_privs is a Linux flag")
-def test_worker_ttp_lock_runs_its_command_without_new_privileges(env, tmp_path):
-    # Whatever route the command takes to a setuid program (a script, an interpreter), it gains nothing.
+def test_worker_ttp_lock_runs_its_command_without_new_privileges(env, monkeypatch):
+    # Whatever route the command takes to a setuid program (a script, an interpreter), it gains nothing:
+    # cmd_lock sets no_new_privs for a worker's command (a sandboxed runner has it already, so spy on it).
+    from ttp import cli, privlock
+    p = make(env)
+    run_dir = p.base / "state" / "runs" / "9"
+    run_dir.mkdir(parents=True)
+    calls = []
+
+    class _Set(Exception):
+        pass
+
+    def spy():
+        calls.append(1)
+        raise _Set   # stop before the lock: the call is what this checks
+    monkeypatch.setattr(privlock, "no_new_privs", spy)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_TASK", "7")
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    with pytest.raises(_Set):
+        cli.main(["lock", "rig", "--", "true"])
+    assert calls == [1]
+    # Outside a run (the user's own shell) the command runs as given.
+    for k in ("TTP_RUN_DIR", "TTP_RUN_ID", "TTP_NOTE_RUN_DIR"):
+        monkeypatch.delenv(k, raising=False)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["lock", "rig", "--", "true"])
+    assert e.value.code in (0, None) and calls == [1]
+
+
+def _no_new_privs_here() -> str:
+    try:
+        return next((ln.split()[1] for ln in open("/proc/self/status") if ln.startswith("NoNewPrivs:")), "")
+    except OSError:
+        return ""
+
+
+@pytest.mark.skipif(_no_new_privs_here() != "0", reason="the kernel flag shows only where the test runner lacks "
+                    "it (a sandboxed runner has NoNewPrivs 1 already) and on Linux; the spy test covers the call")
+def test_worker_ttp_lock_child_shows_no_new_privs(env, tmp_path):
     p = make(env)
     run_dir = p.base / "state" / "runs" / "9"
     run_dir.mkdir(parents=True)
@@ -1525,11 +1562,87 @@ def test_worker_ttp_lock_runs_its_command_without_new_privileges(env, tmp_path):
     assert r.returncode == 0 and r.stdout.split() == ["NoNewPrivs:", "1"], r
 
 
+def test_root_client_refuses_state_changing_clients_of_root_services(monkeypatch):
+    # A root-owned service's unix socket is another way around host-run's allowlist; user-scoped and
+    # read-only use stays allowed.
+    from ttp import privlock
+    monkeypatch.setattr(privlock.os, "geteuid", lambda: 1000)
+    refused = {"docker run": [["docker", "run", "img"], ["/usr/bin/docker", "run", "img"], ["docker", "-H", "unix:///s", "run", "x"],
+                              ["docker", "--context=c", "run", "x"], ["env", "A=1", "docker", "run", "x"],
+                              ["nice", "-n", "5", "docker", "run", "x"], ["ionice", "-c", "3", "docker", "run", "x"],
+                              ["timeout", "5", "docker", "run", "x"], ["stdbuf", "-oL", "docker", "run", "x"],
+                              ["nohup", "docker", "run", "x"], ["sh", "-c", "docker run x"], ["bash", "-c", "docker ps; docker run x"],
+                              ["bash", "-lc", "y=$(docker run x)"], ["env", "-S", "docker run x"], ["env", "-Sdocker run x"],
+                              ["env", "--split-string=docker run x"], ["env", "-S", "A=1", "docker", "run", "x"]],
+               "docker exec": [["docker", "exec", "c", "sh"]], "docker container rm": [["docker", "container", "rm", "c"]],
+               "podman run": [["podman", "--remote", "run", "x"], ["podman", "-r", "run", "x"], ["podman", "--url", "unix:///s", "run", "x"],
+                              ["podman", "--connection=root", "run", "x"], ["sh", "-c", "podman --remote run x"]],
+               "systemctl restart": [["systemctl", "restart", "u"], ["systemctl", "--system", "restart", "u"],
+                                     ["systemctl", "--user", "--system", "restart", "u"], ["systemctl", "-H", "status", "restart", "u"],
+                                     ["timeout", "9", "systemctl", "restart", "u"], ["bash", "-c", "systemctl restart u"]],
+               "systemctl enable": [["systemctl", "--global", "enable", "u"]],
+               "systemctl start": [["sh", "-c", "systemctl status u && systemctl start u"]],
+               "service ssh restart": [["service", "ssh", "restart"]], "busctl call": [["busctl", "call", "a", "/b", "c", "d"]],
+               "loginctl terminate-user": [["loginctl", "terminate-user", "x"]], "loginctl enable-linger": [["loginctl", "enable-linger"]],
+               "machinectl poweroff": [["machinectl", "poweroff", "m"]], "machinectl read-only": [["machinectl", "read-only", "i"]]}
+    for hit, cases in refused.items():
+        for argv in cases:
+            assert privlock.root_client(argv) == hit, argv
+            assert privlock.refusal(argv).startswith(f"ttp lock does not run `{hit}` for a worker"), argv
+            assert "ttp host-run" in privlock.refusal(argv), argv
+    allowed = [["systemctl", "--user", "restart", "u"], ["systemctl", "restart", "--user", "u"], ["systemctl", "status", "u"],
+               ["systemctl", "is-active", "u"], ["systemctl", "is-enabled", "u"], ["systemctl", "show", "-p", "MainPID", "u"],
+               ["systemctl", "cat", "u"], ["systemctl", "list-units"], ["systemctl", "--no-pager", "list-timers"], ["systemctl"],
+               ["systemctl", "-n", "50", "status", "u"], ["timeout", "5", "systemctl", "status", "u"],
+               ["docker", "ps"], ["docker", "images"], ["docker", "inspect", "c"], ["docker", "logs", "-f", "c"],
+               ["docker", "version"], ["docker", "info"], ["docker", "--help"], ["docker", "-H", "unix:///s", "ps"],
+               ["docker", "container", "ls"], ["sh", "-c", "docker ps"], ["podman", "run", "x"], ["podman", "build", "."],
+               ["podman", "--remote", "ps"], ["service", "ssh", "status"], ["service", "--status-all"],
+               ["busctl", "--user", "call", "a", "/b", "c", "d"], ["busctl", "list"], ["busctl", "tree", "a"],
+               ["loginctl", "list-sessions"], ["loginctl", "show-user", "x"], ["loginctl", "session-status"], ["loginctl"],
+               ["machinectl", "list"], ["machinectl", "status", "m"], ["ssh", "box", "docker run x"], ["bash", "-c", "ssh h 'systemctl restart u'"],
+               ["echo", "docker", "run"], ["grep", "systemctl restart", "f"], ["ttp", "host-run", "--", "systemctl", "restart", "u"]]
+    for argv in allowed:
+        assert privlock.root_client(argv) is None and privlock.refusal(argv) is None, argv
+    # podman run as root uses the root socket and storage.
+    monkeypatch.setattr(privlock.os, "geteuid", lambda: 0)
+    assert privlock.root_client(["podman", "run", "x"]) == "podman run"
+    assert privlock.root_client(["podman", "ps"]) is None
+
+
+def test_worker_ttp_lock_refuses_a_root_service_client_and_the_user_shell_runs_it(env, tmp_path):
+    p = make(env)
+    bin_dir, log = tmp_path / "svcbin", tmp_path / "svc.log"
+    bin_dir.mkdir()
+    for name in ("docker", "systemctl"):
+        f = bin_dir / name
+        f.write_text(f'#!/bin/sh\necho "{name} $*" >> {shlex.quote(str(log))}\n')
+        f.chmod(0o755)
+    run_dir = p.base / "state" / "runs" / "9"
+    run_dir.mkdir(parents=True)
+    path = f"{bin_dir}:{os.environ['PATH']}"
+    worker = _lock_env(env, p, TTP_TASK="7", TTP_RUN_DIR=str(run_dir), PATH=path)
+    for cmd in (["docker", "run", "x"], ["env", "A=1", "systemctl", "restart", "u"], ["sh", "-c", "systemctl stop u"]):
+        r = subprocess.run([sys.executable, str(TTP), "lock", "rig", "--", *cmd], env=worker, capture_output=True,
+                           text=True, timeout=60)
+        assert r.returncode == 2 and "ttp host-run" in r.stderr and "root-owned service" in r.stderr, (cmd, r)
+        assert not log.exists() and _queue_len(p, "rig") == 0, cmd
+    for cmd in (["systemctl", "--user", "restart", "u"], ["docker", "ps"]):
+        r = subprocess.run([sys.executable, str(TTP), "lock", "rig", "--", *cmd], env=worker, capture_output=True,
+                           text=True, timeout=60)
+        assert r.returncode == 0 and log.read_text().splitlines()[-1] == " ".join(cmd), (cmd, r)
+    user = {k: v for k, v in _lock_env(env, p, PATH=path).items()
+            if k not in ("TTP_RUN_DIR", "TTP_RUN_ID", "TTP_NOTE_RUN_DIR")}
+    r = subprocess.run([sys.executable, str(TTP), "lock", "rig", "--", "docker", "run", "x"], env=user,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and log.read_text().splitlines()[-1] == "docker run x", r
+
+
 def test_privileged_finds_sudo_in_command_position_only():
     from ttp import privlock
     hits = {"sudo": [["sudo", "x"], ["/usr/bin/sudo", "x"], ["nice", "-n", "5", "sudo", "x"], ["xargs", "-I", "{}", "sudo", "x"],
                      ["sh", "-c", "a && `sudo b`"], ["sh", "-c", "a | sudo tee f"], ["zsh", "-ec", "{ sudo x; }"],
-                     ["busybox", "sh", "-c", "sudo x"], ["sh", "-c", "if true; then sudo x; fi"], ["bash", "-c", "'sudo x"]],
+                     ["busybox", "sh", "-c", "sudo x"], ["env", "-S", "sudo x"], ["sh", "-c", "if true; then sudo x; fi"], ["bash", "-c", "'sudo x"]],
             "run0": [["run0", "x"]], "doas": [["stdbuf", "-oL", "doas", "x"]]}
     for name, cases in hits.items():
         for argv in cases:

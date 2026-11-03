@@ -568,7 +568,10 @@ def hook_settings() -> dict:
 # network commands are freed by name too (measured: an excluded `git ls-remote git@host:...` resolved;
 # `X *` also frees a bare `X`; `git -C dir fetch` is not matched). The run's bin/git still runs them.
 # `ttp lock` is freed for its lock only: it runs a worker's command with no_new_privs and refuses sudo
-# and the like there (privlock.py); a privileged command goes through `ttp host-run`.
+# and the like there (privlock.py); a privileged command goes through `ttp host-run`. A root-owned
+# service's unix socket (docker, system systemd) is another way around host-run: ttp lock refuses the
+# known clients by name so a worker does not use it this way by accident, but any program could still
+# open the socket. Accepted gap: the sandbox is the fence.
 FENCE_EXCLUDED = ("ssh *", "scp *", "sftp *", "rsync *", "ttp lock *", "ttp machines *", "ttp devq *",
                   "ttp detach --remote *", "git fetch *", "git pull *", "git push *", "git ls-remote *",
                   "git clone *", "git remote update *", "git submodule update *")

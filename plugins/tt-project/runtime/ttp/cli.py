@@ -5450,8 +5450,10 @@ def cmd_lock(a) -> None:
     resource exits 75 as well. In a `ttp detach` job, or a background (`nohup ... &`) driver that no longer
     runs under the run's agent, there is no cap.
     A worker's `ttp lock` (project.in_run) is freed from the sandbox for the lock only (privlock.py): it
-    refuses, exit 2, a command that runs sudo, su, doas, pkexec or run0 on this host (`ttp host-run` runs
-    the ones config runner.host_commands allows), and runs any other with no_new_privs set.
+    refuses, exit 2, a command that runs sudo, su, doas, pkexec or run0 on this host, or a root-owned
+    service's client that can change its state (docker, root podman, system-scope systemctl, service,
+    busctl, loginctl, machinectl; `ttp host-run` runs the ones config runner.host_commands allows), and
+    runs any other with no_new_privs set.
     `ttp lock --probe <resource>` exits 0 when the resource is free, not paused, not reserved and
     nobody queues for it, else 75; with --shared, when no exclusive holder or waiter has it and it is
     neither paused nor reserved. Outside any project, `--probe` answers for a resource `ttp machines`
@@ -5483,7 +5485,7 @@ def cmd_lock(a) -> None:
         if why := privlock.refusal(cmd):
             die(why, 2)
         privlock.no_new_privs()
-    names =list(dict.fromkeys(n for n in a.resource.split(",") if n))
+    names = list(dict.fromkeys(n for n in a.resource.split(",") if n))
     if not names:
         die("usage: ttp lock [--disruptive] <resource>[,<resource>...] -- <command...>", 2)
     base = os.environ.get("TTP_PROJECT")
