@@ -3800,6 +3800,22 @@ def test_a_run_counts_once_from_its_grant_and_frees_its_lane_on_exit_crash_or_si
         nxt and nxt.close()
 
 
+class _SlowClose:
+    """A slot file whose close pauses after letting go, so a grant's release spans several waiter polls."""
+
+    def __init__(self, f):
+        self.f = f
+
+    def close(self):
+        self.f.close()
+        time.sleep(0.1)
+
+
+def _slow_release(grant):
+    grant.files = [_SlowClose(f) for f in grant.files]
+    return grant
+
+
 def test_a_waiter_at_its_projects_budget_keeps_its_place_and_is_never_passed_by_a_later_one(env, monkeypatch):
     import threading
     from ttp import checkcap, locks, testslots
@@ -3837,12 +3853,13 @@ def test_a_waiter_at_its_projects_budget_keeps_its_place_and_is_never_passed_by_
         ts.append(threading.Thread(target=wait, args=(name,)))
         ts[-1].start()
         queued(n)   # "l" arrives only once "e" holds its place
-    g.close()
+    # A release spans several polls (_slow_release): no waiter takes part of it while a later one takes the rest.
+    _slow_release(g).close()
     ts[0].join(30)
-    assert order == ["e"] and got["e"].k == 2, "the earlier waiter is granted first"
-    got["e"].close()
+    assert order == ["e"] and got["e"].k == 2, "the earlier waiter is granted first, its whole grant"
+    _slow_release(got["e"]).close()
     ts[1].join(30)
-    assert order == ["e", "l"]
+    assert order == ["e", "l"] and got["l"].k == 2
     got["l"].close()
 
 

@@ -374,15 +374,31 @@ class Grant:
         return {XDIST_ENV: str(self.k), SLOTS_ENV: str(self.k), HELD_ENV: str(self.k), **self.extra}
 
     def close(self) -> None:
-        for f in self.files:
-            f.close()
-        self.files = []
+        guard = _grant_guard(self.kind) if self.files else None
+        try:
+            for f in self.files:
+                f.close()
+            self.files = []
+        finally:
+            guard and guard.close()
 
     def __enter__(self):
         return self
 
     def __exit__(self, *_):
         self.close()
+
+
+def _grant_guard(kind: Kind):
+    """The held guard (an open file; closing it lets go) serializing a grant's release (Grant.close)
+    with a waiter's count-and-take (acquire), so no waiter sees a grant half released and takes part of
+    it while a later one takes the rest; None where the slot directory cannot be written."""
+    try:
+        g = open(checkcap.slot_dir() / f"{kind.resource}.grant.guard", "a+")
+    except OSError:
+        return None
+    fcntl.flock(g, fcntl.LOCK_EX)
+    return g
 
 
 def _free(ps: list) -> int:
@@ -442,7 +458,7 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
             return Grant(held, kind=kind)
     cfg = _cfg() if cfg is None else cfg
     name = _project_name() if project_name is None else project_name
-    start, told, ticket, mine = time.time(), 0.0, None, None
+    start, told, ticket, mine, guard = time.time(), 0.0, None, None, None
     arrival = start if since is None else since
     guarded = ""
     try:
@@ -469,6 +485,7 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
             if s is None:
                 return Grant(kind=kind)
             pool, top = s
+            guard = _grant_guard(kind)   # let go once it took its slots or found none (below)
             # Slots in use over every pool file there may be (a pool that shrank leaves holders past its end).
             used = len(locks._slot_labels(paths(max(pool, checkcap.cores()), kind)))
             pool = pool_now(cfg, pool, used, kind=kind)
@@ -554,6 +571,7 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                     f.close()
                 tell(f"{what} unavailable ({e.strerror or e}): running with 1 {kind.unit}")
                 return Grant(1, waited=time.time() - start, kind=kind)
+            guard = guard and guard.close()
             waited = time.time() - start
             if k:
                 tell(f"{what}: {k} granted of a host pool of {pool} (at most {top} per run"
@@ -570,6 +588,7 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                 tell(f"waiting for a host-wide {kind.name} slot: {why} ({checkcap._some(locks.held_labels(ps))})")
             time.sleep(poll_s(POLL_S))
     finally:
+        guard and guard.close()
         locks.dequeue(ticket)
         locks.dequeue(mine)
 
