@@ -157,7 +157,9 @@ def test_spec_change_wakes_of_one_task_are_capped_per_hour(env, monkeypatch):
         woke = not _asleep(p, tid)
         assert woke == (i < dmod.SPEC_WAKES_PER_H), (i, woke)
         res = json.loads(p.db.task(tid)["result"])
-        p.db.update_task(tid, not_before=time.time() + 3600, result=json.dumps({**res, "woke": ""}))
+        # Each wake ages past the coalesce window, so only the hourly guard holds the next one.
+        aged = [min(x, time.time() - dmod.SPEC_WAKE_COALESCE_S - 1) for x in res.get("spec_wakes", [])]
+        p.db.update_task(tid, not_before=time.time() + 3600, result=json.dumps({**res, "woke": "", "spec_wakes": aged}))
     assert len(json.loads(p.db.task(tid)["result"])["spec_wakes"]) == dmod.SPEC_WAKES_PER_H
     # An hour on, the guard lets the change that waited through it wake the task.
     res = json.loads(p.db.task(tid)["result"])
@@ -456,3 +458,112 @@ def test_a_task_update_cannot_set_the_status_waiting_nothing_would_wake(env):
         assert (after["status"], after["result"], after["not_before"]) == \
             (before["status"], before["result"], before["not_before"])
     assert [t["id"] for t in p.db.ready_tasks()] == [fresh]
+
+
+def _update(p, tid, **act):
+    from ttp import coordinator as coord
+    assert coord.apply(p, [{"type": "task_update", "id": tid, **act}]) == []
+
+
+def _sleep_again(p, tid):
+    """Back to sleep after a wake, as its run's new waiting hand-off would leave it (keeping its wake times)."""
+    res = json.loads(p.db.task(tid)["result"])
+    res = {k: v for k, v in res.items() if k not in ("woke", "wake_tier", "escalated_wake")}
+    p.db.update_task(tid, not_before=time.time() + 3600, result=json.dumps(res))
+
+
+def test_wake_now_takes_a_tier_capped_at_the_tasks_own(env, monkeypatch):
+    from ttp import budget as bud
+    for own, asked, want in (("standard", True, "standard"), ("standard", "light", "light"),
+                             ("standard", "deep", "standard"), ("light", "deep", "light"),
+                             ("deep", "standard", "standard"), ("light", True, "light")):
+        p = make(env)
+        tid = _spec_sleeper(p)
+        p.db.update_task(tid, tier=own)
+        d = _spec_daemon(p, monkeypatch)
+        _update(p, tid, spec="also report the peak memory", wake_now=asked)
+        d.probe_waiting()
+        res = json.loads(p.db.task(tid)["result"])
+        assert not _asleep(p, tid) and res["wake_tier"] == want, (own, asked, res)
+        assert bud.wake_tier(own, res) == want, (own, asked)
+
+
+def test_the_wake_now_schema_takes_true_or_a_tier_and_stays_strict_valid():
+    from ttp import coordinator as coord
+    from ttp.providers.base import strict_schema
+    sub = coord.ACTIONS_SCHEMA["properties"]["actions"]["items"]["properties"]["wake_now"]
+    assert sub == {"anyOf": [{"type": "boolean"}, {"type": "string", "enum": ["light", "standard", "deep"]}]}
+    wire = strict_schema(coord.ACTIONS_SCHEMA)["properties"]["actions"]["items"]["properties"]["wake_now"]
+    assert {"type": "null"} in wire["anyOf"], wire
+
+
+def test_wake_now_with_an_unknown_tier_is_ignored(env, monkeypatch):
+    p = make(env)
+    tid = _spec_sleeper(p)
+    _update(p, tid, spec="also report the peak memory", wake_now="max")
+    assert "wake_now" not in json.loads(p.db.task(tid)["result"])
+    _spec_daemon(p, monkeypatch).probe_waiting()
+    assert _asleep(p, tid)
+
+
+def test_wake_now_requests_before_the_run_starts_make_one_wake_at_the_highest_tier(env, monkeypatch):
+    p = make(env)
+    tid = _spec_sleeper(p)
+    p.db.update_task(tid, tier="deep")
+    d = _spec_daemon(p, monkeypatch)
+    _update(p, tid, spec="also report the peak memory", wake_now="light")
+    _update(p, tid, spec="and the wall time", wake_now="standard")   # between ticks: merged
+    _update(p, tid, wake_now="light")   # a lower ask never lowers it
+    d.probe_waiting()
+    res = json.loads(p.db.task(tid)["result"])
+    assert not _asleep(p, tid) and res["wake_tier"] == "standard" and len(res["spec_wakes"]) == 1, res
+    # Woken, its run not started: another request rides on that wake and raises its tier, still capped.
+    _update(p, tid, spec="and the disk use", wake_now="deep")
+    d.probe_waiting()
+    t = p.db.task(tid)
+    res = json.loads(t["result"])
+    assert res["wake_tier"] == "deep" and len(res["spec_wakes"]) == 1 and "wake_now" not in res, res
+    assert "and the disk use" in t["spec"] and "also report the peak memory" in t["spec"]
+    from ttp import coordinator as coord
+    assert not any(f"#{tid} wake_now ignored" in n for n in (p.db.kv(coord.NOTES_KEY) or []))
+
+
+def test_a_wake_now_inside_the_coalesce_window_waits_for_it_to_end(env, monkeypatch):
+    from ttp import daemon as dmod
+    p = make(env)
+    tid = _spec_sleeper(p)
+    d = _spec_daemon(p, monkeypatch)
+    _update(p, tid, spec="edit 1", wake_now=True)
+    d.probe_waiting()
+    assert not _asleep(p, tid)
+    _sleep_again(p, tid)
+    _update(p, tid, spec="edit 2", wake_now="light")
+    _update(p, tid, spec="edit 3", wake_now=True)
+    for _ in range(3):
+        d.probe_waiting()
+    res = json.loads(p.db.task(tid)["result"])
+    assert _asleep(p, tid) and res["wake_now"] == "standard" and len(res["spec_wakes"]) == 1, res
+    # The window ends: one wake carries both requests, at the highest tier asked.
+    p.db.update_task(tid, result=json.dumps({**res, "spec_wakes": [x - dmod.SPEC_WAKE_COALESCE_S - 1 for x in res["spec_wakes"]]}))
+    d.probe_waiting()
+    t = p.db.task(tid)
+    res = json.loads(t["result"])
+    assert not _asleep(p, tid) and res["wake_tier"] == "standard" and len(res["spec_wakes"]) == 2, res
+    assert "wake_now" not in res and "edit 2" in t["spec"] and "edit 3" in t["spec"]
+
+
+def test_an_urgent_or_p1_wake_now_skips_the_coalesce_window_but_not_the_hourly_guard(env, monkeypatch):
+    from ttp import daemon as dmod
+    for how in ("urgent line", "priority 1"):
+        p = make(env)
+        tid = _spec_sleeper(p)
+        d = _spec_daemon(p, monkeypatch)
+        if how == "priority 1":
+            p.db.update_task(tid, priority=1)
+        for i in range(dmod.SPEC_WAKES_PER_H + 1):
+            spec = f"urgent: edit {i}" if how == "urgent line" else f"edit {i}"
+            _update(p, tid, spec=spec, wake_now=True)
+            d.probe_waiting()
+            assert (not _asleep(p, tid)) == (i < dmod.SPEC_WAKES_PER_H), (how, i)
+            _sleep_again(p, tid)
+        assert len(json.loads(p.db.task(tid)["result"])["spec_wakes"]) == dmod.SPEC_WAKES_PER_H, how

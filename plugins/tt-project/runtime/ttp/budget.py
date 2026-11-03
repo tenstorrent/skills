@@ -724,6 +724,14 @@ def estimate_cost(db: DB, cfg: dict, provider: str, model: str, tokens: dict[str
 TIER_ORDER = ("light", "standard", "deep")
 
 
+def wake_now_tier(asked, own, *more) -> str:
+    """The tier a task_update `wake_now` wakes a task at: the highest asked (`asked` and `more`, each true
+    for the task's own tier or a TIER_ORDER name; others count as true), never above its own tier `own`."""
+    own = own if own in TIER_ORDER else "standard"
+    got = [a if a in TIER_ORDER else own for a in (asked, *more) if a]
+    return min(max(got or [own], key=TIER_ORDER.index), own, key=TIER_ORDER.index)
+
+
 def clamp_tier(tier: str, gate: Gate) -> str:
     tier = tier if tier in TIER_ORDER else "standard"
     return tier if TIER_ORDER.index(tier) <= TIER_ORDER.index(gate.max_tier) else gate.max_tier

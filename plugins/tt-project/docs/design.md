@@ -77,7 +77,10 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    run reads the new spec at the task's own tier. Only an urgent task (priority 1 or an `urgent:`
    line) or a `task_update` with `wake_now: true` wakes once at once; another hold (a dependency,
    start_after, start_when, a paused or busy resource, a gate) still holds it first, and at most 3
-   such wakes an hour wake one task.
+   such wakes an hour wake one task. `wake_now` may name a tier (`light`, `standard`, `deep`): the
+   wake runs at it, never above the task's own (`true`: its own). Requests before the wake run
+   starts make one wake at the highest tier asked, and a `wake_now` within 30 minutes of the last
+   spec wake waits for that window to end (SPEC_WAKE_COALESCE_S) unless the task is urgent.
    A queued wait whose note names an ask or task (`ask #12`, `task #34`, `#34`) is kept current:
    once that ask is resolved or that task is done, the note says so and its probe (retry_when or
    start_when) runs again at once. Its probe, dependencies, start_when, not_before and attempts

@@ -211,7 +211,8 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "start_after": {"type": "string", "pattern": START_AFTER_RE}, "start_when": {"type": "string"},
             "waits_on": {"type": "string"}, "outcome": {"type": "string", "enum": list(sweep.OUTCOMES)},
             "clear_fields": {"type": "array", "items": {"type": "string", "enum": list(NULL_OPERATIONS)}},
-            "heal": HEAL_SCHEMA, "pr_branch": {"type": "string"}, "wake_now": {"type": "boolean"},
+            "heal": HEAL_SCHEMA, "pr_branch": {"type": "string"},
+            "wake_now": {"anyOf": [{"type": "boolean"}, {"type": "string", "enum": list(bud.TIER_ORDER)}]},
             "owners": {"type": "array", "items": {"type": "integer"}}, "evidence": {"type": "string"},
             "milestone": {"type": "string"}, "promise": {"type": "string"},
             "delivers": {"type": "array", "items": {"type": "string"}},
@@ -2635,14 +2636,22 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if a.get("pr_branch") is None and upd.get("kind", task["kind"]) not in worktree.NEVER_OWN_KINDS \
                             and (named := worktree.spec_line_branch(spec)) is not None:
                         upd["labels"] = _branch_labels(upd.get("labels", json.loads(task["labels"] or "[]")), named)
-                if a.get("wake_now") is True:
+                if (asked := a.get("wake_now")) is True or asked in bud.TIER_ORDER:
                     # A spec change alone lets a task asleep on its retry_when sleep on (Daemon._spec_wake):
-                    # this asks the daemon to wake it at once, at its own tier.
+                    # this asks the daemon to wake it, at the tier asked (true: its own), never above its own.
+                    # Requests before the wake run starts make one wake at the highest tier asked.
                     prev = load_result(upd.get("result") or task["result"])
                     asleep = (upd.get("not_before", task["not_before"]) or 0) > time.time()
-                    if upd.get("status", task["status"]) == "queued" and asleep and prev.get("status") == "waiting" \
-                            and str(prev.get("retry_when") or "").strip() and not deferral(task).get("when"):
-                        upd["result"] = dump_result({**prev, "wake_now": True})
+                    own = upd.get("tier", task["tier"])
+                    if upd.get("status", task["status"]) == "queued" and prev.get("status") == "waiting" \
+                            and str(prev.get("retry_when") or "").strip() and not deferral(task).get("when") \
+                            and (asleep or prev.get("woke") and prev.get("escalated_wake")):
+                        if asleep:
+                            tier = bud.wake_now_tier(asked, own, prev.get("wake_now"))
+                            upd["result"] = dump_result({**prev, "wake_now": tier})
+                        else:   # woken, its run not started yet: it runs once, at the highest tier asked
+                            tier = bud.wake_now_tier(asked, own, prev.get("wake_tier"))
+                            upd["result"] = dump_result({**prev, "wake_tier": tier})
                     else:
                         notes.append(f"task_update: #{task['id']} wake_now ignored: it is not asleep on a retry_when "
                                      f"(a start_when deferral wakes by `start_when` \"\"; a blocked task by status queued)")
