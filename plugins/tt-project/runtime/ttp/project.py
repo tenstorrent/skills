@@ -586,7 +586,7 @@ def write_dirs(root: Path, guard: Path, value: Any) -> tuple[list[str], list[str
         elif not real.is_dir():
             missing.append(f"{entry}: {real} is not an existing directory")
         else:
-            granted += [p for p in dict.fromkeys([str(real), str(given)]) if p not in granted]
+            granted += [str(real)] if str(real) not in granted else []   # never the link: it may be retargeted
     return granted, refused, missing
 
 

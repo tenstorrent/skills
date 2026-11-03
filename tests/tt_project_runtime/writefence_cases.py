@@ -344,7 +344,7 @@ def test_write_dirs_grants_only_directories_inside_the_project_root(tmp_path):
         "notes", str(root / "data/out"), "link-in", "link-out", "../elsewhere", str(tmp_path / "elsewhere"), ".",
         str(root), "data/..", "tt-project", "tt-project/state", "tt-project/harness/memory", "link-state",
         "absent", "file.txt", 3])
-    assert granted == [str((root / "notes").resolve()), str((root / "data/out").resolve()), str(root / "link-in")]
+    assert granted == [str((root / "notes").resolve()), str((root / "data/out").resolve())], "a link grants its target"
     why = {r.split(": ", 1)[0]: r.split(": ", 1)[1] for r in refused}
     for e in ("link-out", "../elsewhere", str(tmp_path / "elsewhere")):
         assert "outside the project root" in why[e], (e, why)
