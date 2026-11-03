@@ -265,6 +265,7 @@ def test_grade_mcp_peak_follows_answerable_over_the_tool_list():
      call("l1_peak", {"handle": "h1"}, "{}")],
     [loaded_call(), call("l1_peak", {"handle": "other"}, "{}")],
     [loaded_call(), call("l1_peak", {"handle": "h1"}, "boom", is_error=True)],
+    [loaded_call(), call("l1_peak", {"handle": "h1"})],  # never answered
     [loaded_call(), call("memory_profile", {"handle": "h1"}, "{}")],
     [call("load_report", result="bad", is_error=True)],
 ])

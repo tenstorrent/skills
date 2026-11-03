@@ -140,7 +140,8 @@ def grade_mcp_peak(calls: list[dict], offered: list[str]) -> None:
                 else f"{MCP_PREFIX}l1_peak" in offered)
     peak_tool = "l1_peak" if has_peak else "memory_profile"
     reads = [c for c in calls[first + 1:] if c["name"] == MCP_PREFIX + peak_tool
-             and not c["is_error"] and c["input"].get("handle") == result["handle"]]
+             and not c["is_error"] and c["result"]
+             and c["input"].get("handle") == result["handle"]]
     assert reads, f"no successful {peak_tool} on handle {result['handle']!r}: {names}"
 
 
