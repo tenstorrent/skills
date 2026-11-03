@@ -1072,6 +1072,142 @@ def test_detach_stop_is_allowed_for_ended_tasks_and_priority_one_resource_holder
         _end_group(pgid2)
 
 
+def _add_run(p, tid, name):
+    """A run of task tid (its own run dir); its id."""
+    d = p.runs / name
+    d.mkdir(parents=True, exist_ok=True)
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time(), "running", str(d)))
+    return p.db.one("SELECT id FROM runs WHERE dir=?", (str(d),))["id"]
+
+
+def _as(tid, run):
+    return {"TTP_TASK": str(tid), "TTP_RUN_ID": str(run), "TTP_PIDNS": "", "TTP_CGROUP": ""}
+
+
+def test_detach_stop_lets_the_owning_task_stop_its_own_job_from_an_earlier_run_and_records_why(env, tmp_path):
+    """(a) An open task stops the job an earlier run of it started: allowed, and .lost and the stop event name
+    who stopped it, the run that started it, the caller's run and the reason (--why)."""
+    from ttp import locks as lk
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, tid, broker, status="running")
+    try:
+        started = p.db.one("SELECT id FROM runs WHERE dir=?", (str(rc.parent),))["id"]
+        now = _add_run(p, tid, "soak-now")
+        r = _ttp_run(p, "detach", "--stop", str(rc), "--why", "the driver stalled", env=_as(tid, now))
+        assert r.returncode == 0 and "stopped detached job loop" in r.stdout, r.stderr
+        assert lk.any_free([lk.job_lock(rc)])
+        lost = rc.with_suffix(".lost").read_text()
+        assert f"stopped by owning task #{tid} (run {now}) from an earlier run, run {started}" in lost, lost
+        assert "the driver stalled" in lost, lost
+        (ev,) = _stopped_events(p)
+        data = json.loads(ev["data"])
+        assert (data["stopped_by"], data["job_run"], data["caller_run"]) == (tid, started, now), data
+        assert "the driver stalled" in data["why"] and ev["task"] == tid
+        assert p.db.task(tid)["status"] == "running", "the stop changed the task"
+    finally:
+        _end_group(pgid)
+    # No --why: the default reason alone.
+    rc2, pgid2 = _locked_job(p, tid, broker, name="again", status="running")
+    try:
+        started2 = p.db.one("SELECT MAX(id) id FROM runs WHERE dir=?", (str(rc2.parent),))["id"]
+        r = _ttp_run(p, "detach", "--stop", str(rc2), env=_as(tid, now))
+        assert r.returncode == 0, r.stderr
+        assert rc2.with_suffix(".lost").read_text().strip() == \
+            f"stopped by owning task #{tid} (run {now}) from an earlier run, run {started2} via `ttp detach --stop`"
+    finally:
+        _end_group(pgid2)
+    r = _ttp_run(p, "detach", "--why", "x", "loop", "--", "true", env={"TTP_RUN_DIR": str(rc.parent)})
+    assert r.returncode != 0 and "--why goes with --stop" in r.stderr, r.stderr
+
+
+def test_detach_stop_lets_the_owning_task_stop_a_job_of_its_current_run(env, tmp_path):
+    """(b) The run that started the job stops it (by name, from $TTP_RUN_DIR)."""
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, tid, broker, status="running")
+    try:
+        run = p.db.one("SELECT id FROM runs WHERE dir=?", (str(rc.parent),))["id"]
+        r = _ttp_run(p, "detach", "--stop", "loop", env={**_as(tid, run), "TTP_RUN_DIR": str(rc.parent)})
+        assert r.returncode == 0 and "stopped detached job loop" in r.stdout, r.stderr
+        assert f"(run {run}) from its current run" in rc.with_suffix(".lost").read_text()
+    finally:
+        _end_group(pgid)
+
+
+def test_detach_stop_still_refuses_another_task_or_a_caller_without_a_task_identity(env, tmp_path):
+    """(c) Only the job's own task, with a run the project records for it, may stop a job of an open task:
+    another task, no task, a task id without a run, a run of another task, or another task claiming the
+    owner's run are refused with the same message as before, and the job runs on."""
+    from ttp import jobstop, locks as lk
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    other = p.db.add_task("other", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, tid, broker, status="running")
+    try:
+        mine = p.db.one("SELECT id FROM runs WHERE dir=?", (str(rc.parent),))["id"]
+        theirs = _add_run(p, other, "other-now")
+        refused = (f"refused: its task #{tid} is running; only a job of an ended task, or one holding a resource "
+                   "of the calling open priority-1 task, may be stopped")
+        for e in (_as(other, theirs), _as("", ""), _as(tid, ""), _as(tid, theirs), _as(other, mine),
+                  _as(tid, "999999"), _as(f" {tid}", mine)):
+            r = _ttp_run(p, "detach", "--stop", str(rc), env=e)
+            assert r.returncode == 3 and r.stderr.strip() == f"ttp detach --stop: {refused}", (e, r.stderr)
+        assert not lk.any_free([lk.job_lock(rc)]) and not rc.with_suffix(".lost").exists()
+        # The queued path (a sandboxed caller) checks the same identity again.
+        jobstop.request(p, rc, str(other), str(mine), "forged")
+        assert jobstop.serve_requests(p) == [] and not lk.any_free([lk.job_lock(rc)])
+        jobstop.request(p, rc, str(tid), str(mine), "queued by its own run")
+        (out,) = jobstop.serve_requests(p)
+        assert out["stopped_by"] == tid and out["caller_run"] == mine and lk.any_free([lk.job_lock(rc)])
+        assert "queued by its own run" in rc.with_suffix(".lost").read_text()
+    finally:
+        _end_group(pgid)
+
+
+def test_a_job_its_own_task_stopped_is_not_relaunched_at_boot(env, tmp_path):
+    """(d) A resumable job its task stopped is never started again by the reboot relaunch, even with its
+    .lost written on this boot: the task wakes instead."""
+    from ttp import detach
+    p = make(env)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    run_dir = p.runs / f"jobs-{tid}"
+    run_dir.mkdir(parents=True)
+    run = _add_run(p, tid, f"jobs-{tid}")
+    counter = tmp_path / "runs"
+    r = _ttp_run(p, "detach", "--resumable", "job", "--", "sh", "-c", f"echo run >>{counter}; sleep 60",
+                 env={"TTP_RUN_DIR": str(run_dir)})
+    assert r.returncode == 0, r.stderr
+    rc = (run_dir / "job.rc").resolve()
+    assert _wait_for_path(counter)
+    pgid = int(rc.with_suffix(".started").read_text().split()[0])
+    try:
+        p.db.update_task(tid, status="running")
+        r = _ttp_run(p, "detach", "--stop", str(rc), env=_as(tid, run))
+        assert r.returncode == 0, r.stderr
+        assert json.loads(detach.resume_file(rc).read_text())["stopped"]
+        assert not rc.exists()
+        m = json.loads(detach.resume_file(rc).read_text())
+        detach.resume_file(rc).write_text(json.dumps({**m, "boot": "an-earlier-boot"}))
+        reg = run_dir / "detached.json"
+        reg.write_text(json.dumps([{**j, "boot": "an-earlier-boot"} for j in json.loads(reg.read_text())]))
+        p.db.update_task(tid, status="queued", not_before=time.time() + 3600, result=json.dumps(
+            {"status": "waiting", "summary": "job running", "retry_after_s": 3600,
+             "retry_when": f"ttp detach --check {rc}", "waiting_since": time.time() - 900}))
+        _boot_daemon(p)
+        assert _woken(p, tid), "the task slept on a job that was stopped"
+        assert not _job_relaunches(p, tid)
+        assert detach.relaunch(rc, "a-later-boot")[0].startswith("it was stopped")
+        time.sleep(0.3)
+        assert counter.read_text().split() == ["run"], "the stopped job ran again"
+    finally:
+        _end_group(pgid)
+
+
 def test_the_daemon_reaps_the_wrappers_relaunch_started(env, tmp_path):
     from ttp import detach
     p = make(env)

@@ -1015,6 +1015,10 @@ queues behind routine work; nothing running is interrupted:
   running or queued, 2 no record names it). Each signal tt-project sends a detached job (a stop: SIGSTOP
   then SIGKILL of its group, with `<name>.lost`) adds a line to the job's log and a row to
   `state/job-signals.jsonl` naming the code path and sender; a waiting `ttp lock` logs who signalled it.
+  `ttp detach --stop <name|rc> [--why <reason>]` stops a job of an ended task, a job of the caller's own
+  task (from any of its runs; its .lost and stop event name the caller's task and run, the run that
+  started the job and the reason), or one holding a resource of the calling open priority-1 task;
+  anyone else is refused (exit 3). A stopped job is never relaunched at boot.
   `ttp detach --stop <name>` with no job recorded stops a driver
   the project's own launcher started: NAME.pid in the path's folder, $TTP_RUN_DIR or the task's t<id>
   folder, once its pid is verified (start time, user, project), gets a STOP file beside it, then SIGTERM and

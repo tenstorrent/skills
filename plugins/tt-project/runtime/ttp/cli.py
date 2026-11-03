@@ -6020,8 +6020,10 @@ def cmd_detach(a) -> None:
             sys.exit(_detach_check_remote(a.host, a.check, rows, after or 0, mirror))
     if getattr(a, "reap", None):
         sys.exit(_detach_reap(a.reap))
+    if getattr(a, "why", None) and not getattr(a, "stop", None):
+        die("--why goes with --stop: the reason a stop records")
     if getattr(a, "stop", None):
-        sys.exit(_detach_stop(a.stop))
+        sys.exit(_detach_stop(a.stop, getattr(a, "why", None)))
     if getattr(a, "stop_pids", None):
         sys.exit(_detach_stop_pids(a.stop_pids))
     if a.check is None:
@@ -6207,9 +6209,10 @@ def _free_ended_slots(rc: Path) -> None:
               f"it can see its holder gone)")
 
 
-def _detach_stop(what: str) -> int:
-    """`ttp detach --stop <rc|name>`: stop a running job as the daemon stops those of ended tasks (jobstop.end):
-    0 once stopped or when it no longer runs, 2 when no record names it, 3 when refused (jobstop.may_stop).
+def _detach_stop(what: str, given: str | None = None) -> int:
+    """`ttp detach --stop <rc|name> [--why TEXT]`: stop a running job as the daemon stops those of ended tasks
+    (jobstop.end), recording `given` with why it was allowed: 0 once stopped or when it no longer runs, 2 when
+    no record names it, 3 when refused (jobstop.may_stop).
     A sandboxed caller, which cannot signal it, queues the stop for the daemon. A bare name is a job of
     $TTP_RUN_DIR; with no job recorded, a driver a project's own launcher started (_launcher_stop)."""
     from . import detach, jobstop
@@ -6229,17 +6232,19 @@ def _detach_stop(what: str) -> int:
         print(f"{rc.stem}: not running; nothing to stop")
         _free_ended_slots(rc)
         return 0
-    caller = os.environ.get("TTP_TASK") or ""
-    ok, why = jobstop.may_stop(p, rc, caller)
+    caller, run = os.environ.get("TTP_TASK") or "", os.environ.get("TTP_RUN_ID") or ""
+    ok, why = jobstop.may_stop(p, rc, caller, run)
     if not ok:
         print(f"ttp detach --stop: {why}", file=sys.stderr)
         return 3
     if _boxed():
-        jobstop.request(p, rc, caller)
+        jobstop.request(p, rc, caller, run, given)
         print(f"{rc.stem}: queued; the daemon stops it within seconds ({why})")
         return 0
     t = jobstop.task_of(p, rc)
-    r = jobstop.end(p, rc, f"stopped by `ttp detach --stop` ({why})", t["id"] if t else None, "ttp detach --stop")
+    text = jobstop.stop_why(why, given)
+    r = jobstop.end(p, rc, text, t["id"] if t else None, "ttp detach --stop",
+                    fields=jobstop.stop_fields(p, rc, caller, run, text))
     print(r["text"] if r else f"{rc.stem}: not running; nothing to stop")
     return 0
 
@@ -10839,10 +10844,12 @@ def main(argv: list[str] | None = None) -> None:
                    "with its exit code, or died when gone without one; refuses (exit 1) while it runs; idempotent")
     s.add_argument("--stop", metavar="RC|NAME",
                    help="stop a running job (its group, its matching broker jobs, its lock slots), logged; allowed "
-                   "when its task has ended, or for an open priority-1 task whose resources its locks hold; "
-                   "refused (exit 3) otherwise; idempotent. With no job recorded, a driver a launcher of the "
+                   "when its task has ended, for the job's own task (from any of its runs; it records who stopped "
+                   "it, both runs and --why), or for an open priority-1 task whose resources its locks hold; "
+                   "refused (exit 3) otherwise; idempotent; never relaunched at boot afterwards. With no job recorded, a driver a launcher of the "
                    "project's own started: NAME.pid in the path's folder, $TTP_RUN_DIR or the task's t<id> folder "
                    "gets a STOP file beside it, then SIGTERM and SIGKILL if it does not exit (exit 2: none found)")
+    s.add_argument("--why", metavar="TEXT", help="with --stop: the reason recorded in the job's .lost and stop event")
     s.add_argument("--stop-pids", metavar="FILE",
                    help="stop the processes the calling task's own driver listed in a pid file (one pid per line, "
                    "optional start=<token>) under one of the task's results dirs (its run dirs, or a folder t<id>, "

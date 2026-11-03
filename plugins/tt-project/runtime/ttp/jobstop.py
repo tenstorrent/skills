@@ -37,9 +37,13 @@ mid-stop finds it still running on its next tick and finishes the stop; a stoppe
 logs nothing new.
 
 `ttp detach --stop <rc>` is the manual form: allowed for a job whose task has ended (cancelled, failed,
-exhausted or done), or for an open priority-1 caller task (TTP_TASK) whose resources include one the
-job's held slots hold. A sandboxed caller, which cannot signal the job, queues the request (QUEUE) and
-the daemon carries it out on its next tick, checking it again.
+exhausted or done), for the job's own task (TTP_TASK, with a TTP_RUN_ID the project records as a run of
+that task: one of its runs, this or an earlier one, started the job), or for an open priority-1 caller
+task whose resources include one the job's held slots hold. Anyone else is refused while the job's task
+is open. A stop by the owner records who stopped it, the run that started the job, the caller's run and
+why (`--why`, else a default) in <name>.lost and the stop event. A sandboxed caller, which cannot signal
+the job, queues the request (QUEUE) and the daemon carries it out on its next tick, checking it again.
+A stopped job is never relaunched at boot: its resume record is marked stopped (detach.mark_stopped).
 """
 from __future__ import annotations
 
@@ -285,10 +289,12 @@ def _free(slots: list[Path], pgid: int, pids: set[int], note=None) -> tuple[list
 
 # The stop ---------------------------------------------------------------------------------------
 
-def end(p: Project, rc: Path, why: str, task: int | None = None, reason: str = "jobstop.end") -> dict | None:
+def end(p: Project, rc: Path, why: str, task: int | None = None, reason: str = "jobstop.end",
+        fields: dict | None = None) -> dict | None:
     """Stop the running job at this .rc (steps 1-5 above). Its summary, also logged as an event, or None
     when it no longer runs (nothing done, nothing logged). Each signal sent is logged (detach.signalled)
-    in the job's log and the project's job-signal stream, naming `reason`, the calling code path."""
+    in the job's log and the project's job-signal stream, naming `reason`, the calling code path. `fields`
+    (who stopped it and why) go into the summary and event as they are."""
     rc = Path(rc)
     if not running(rc):
         return None
@@ -297,6 +303,7 @@ def end(p: Project, rc: Path, why: str, task: int | None = None, reason: str = "
     if not pgid and p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
         return None   # its holder left the group: said once, nothing more to do
     slots = [locks.job_lock(rc), *job_slots(p, rc)]
+    detach.mark_stopped(rc, why)   # first: a reboot right after the kill never relaunches it
     pids: list[int] = []
     if pgid:
         try:
@@ -312,7 +319,7 @@ def end(p: Project, rc: Path, why: str, task: int | None = None, reason: str = "
         rc, signal.SIGKILL, pid, reason, f"{why}; it still held {s.name}", by=BY, group=False, state=p.state,
         task=task))
     out = {"task": task, "job": rc.stem, "rc": str(rc), "pgid": pgid, "broker_jobs": ids, "freed": freed,
-           "held": held, "note": note if pgid else "no live process group found for it"}
+           "held": held, "note": note if pgid else "no live process group found for it", **(fields or {})}
     text = (f"stopped detached job {rc.stem}" + (f" (task #{task})" if task else "") + f": {why}; "
             + (f"SIGSTOP then SIGKILL to group {pgid} from {BY} pid {os.getpid()} ({reason})" if pgid else "group ?")
             + f"; broker jobs ended: {', '.join(ids) or 'none'}; locks freed: {', '.join(freed) or 'none'}"
@@ -605,6 +612,13 @@ def task_of(p: Project, rc: Path) -> dict | None:
                     (str(d), str(d.resolve())))
 
 
+def run_of(p: Project, rc: Path) -> int | None:
+    """The id of the run that started the job at this .rc."""
+    d = Path(rc).parent
+    r = p.db.one("SELECT id FROM runs WHERE dir IN (?,?) ORDER BY id DESC LIMIT 1", (str(d), str(d.resolve())))
+    return r["id"] if r else None
+
+
 def sweep(p: Project, now: float | None = None) -> list[dict]:
     """The daemon's pass: stop each running job, detached checks and detached push of a task in ENDED that
     no open task waits on, then carry out queued `ttp detach --stop` requests. The summaries of the jobs
@@ -680,14 +694,17 @@ def job_resources(p: Project, rc: Path) -> set[str]:
     return {locks.canonical(cfg, _resource(s)) for s in job_slots(p, rc)}
 
 
-def may_stop(p: Project, rc: Path, caller: str | None) -> tuple[bool, str]:
-    """(allowed, why) for `ttp detach --stop` of the job at rc by caller task id (TTP_TASK, may be empty)."""
+def may_stop(p: Project, rc: Path, caller: str | None, caller_run: str | None = None) -> tuple[bool, str]:
+    """(allowed, why) for `ttp detach --stop` of the job at rc by caller task id (TTP_TASK, may be empty)
+    from its run (TTP_RUN_ID, may be empty)."""
     from .coordinator import task_resources
     t = task_of(p, rc)
     if t is None:
         return False, f"no task of this project started the job at {rc}"
     if t["status"] in STOPPABLE:
         return True, f"task #{t['id']} is {t['status']}"
+    if (own := _own_stop(p, rc, t, caller, caller_run)) is not None:
+        return True, own
     me = p.db.task(int(caller)) if caller and str(caller).isdigit() else None
     if me is None or me["status"] in OPEN_WAITER_SKIP or int(me["priority"]) != 1:
         return False, (f"refused: its task #{t['id']} is {t['status']}; only a job of an ended task, or one holding "
@@ -701,11 +718,41 @@ def may_stop(p: Project, rc: Path, caller: str | None) -> tuple[bool, str]:
     return True, f"priority-1 task #{me['id']} needs {', '.join(common)}"
 
 
-def request(p: Project, rc: Path, caller: str | None) -> Path:
+def _own_stop(p: Project, rc: Path, t: dict, caller: str | None, caller_run: str | None) -> str | None:
+    """Why the job's own task may stop it, or None when the caller is not that task: TTP_TASK names the
+    job's task and TTP_RUN_ID a run the project records for that same task (an id alone, set by hand,
+    or a run of another task never counts)."""
+    if not (caller and str(caller).isdigit() and int(caller) == int(t["id"])):
+        return None
+    if not (caller_run and str(caller_run).isdigit()):
+        return None
+    if not p.db.one("SELECT id FROM runs WHERE id=? AND task=?", (int(caller_run), int(t["id"]))):
+        return None
+    started = run_of(p, rc)
+    when = "its current run" if started == int(caller_run) else "an earlier run"
+    return f"stopped by owning task #{t['id']} (run {caller_run}) from {when}, run {started if started else '?'}"
+
+
+def stop_why(why: str, given: str | None) -> str:
+    """The reason a stop records: may_stop's, plus the caller's own `--why` when given."""
+    given = " ".join(str(given or "").split())[:300]
+    text = f"{why} via `ttp detach --stop`" if why.startswith("stopped by ") else f"stopped by `ttp detach --stop` ({why})"
+    return text + (f": {given}" if given else "")
+
+
+def stop_fields(p: Project, rc: Path, caller: str | None, caller_run: str | None, why: str) -> dict:
+    """Who stopped the job, the run that started it, the caller's run and why: kept in the stop event."""
+    return {"stopped_by": int(caller) if caller and str(caller).isdigit() else None,
+            "job_run": run_of(p, rc), "caller_run": int(caller_run) if caller_run and str(caller_run).isdigit()
+            else None, "why": why}
+
+
+def request(p: Project, rc: Path, caller: str | None, caller_run: str | None = None, why: str | None = None) -> Path:
     """Queue a stop for the daemon (a sandboxed caller cannot signal the job)."""
     q = p.state / QUEUE / f"{Path(rc).parent.name}-{Path(rc).stem}.json"
     q.parent.mkdir(parents=True, exist_ok=True)
-    write_json(q, {"rc": str(rc), "caller": caller or "", "at": time.time()})
+    write_json(q, {"rc": str(rc), "caller": caller or "", "run": caller_run or "", "why": why or "",
+                   "at": time.time()})
     return q
 
 
@@ -728,10 +775,13 @@ def serve_requests(p: Project) -> list[dict]:
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             q.unlink(missing_ok=True)
             continue
-        ok, why = may_stop(p, rc, m.get("caller"))
+        caller, run = m.get("caller"), m.get("run")
+        ok, why = may_stop(p, rc, caller, run)
         if ok:
             t = task_of(p, rc)
-            r = end(p, rc, f"stopped by `ttp detach --stop` ({why})", t["id"] if t else None, "ttp detach --stop")
+            text = stop_why(why, m.get("why"))
+            r = end(p, rc, text, t["id"] if t else None, "ttp detach --stop",
+                    fields=stop_fields(p, rc, caller, run, text))
             if r:
                 out.append(r)
         q.unlink(missing_ok=True)

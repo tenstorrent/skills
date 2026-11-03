@@ -294,6 +294,18 @@ def read_resume(rc: Path) -> dict | None:
     return m if ok else None
 
 
+def mark_stopped(rc: Path, why: str) -> None:
+    """Record in a resumable job's resume record that it was stopped on purpose (jobstop.end), so no
+    reboot relaunches it. A job without one has nothing to mark."""
+    m = read_resume(rc)
+    if m is None or m.get("stopped"):
+        return
+    try:
+        write_json(resume_file(rc), {**m, "stopped": time.time(), "stopped_why": why}, mode=0o600)
+    except OSError:
+        pass
+
+
 def relaunch(rc: Path, boot: str, nice: int = 0) -> tuple[str, int]:
     """Start a resumable job a reboot cut short again, with the command, cwd and environment it was
     started with (secrets from the caller's own environment). Its old log is kept as <name>.log.<n>.
@@ -302,6 +314,8 @@ def relaunch(rc: Path, boot: str, nice: int = 0) -> tuple[str, int]:
     m = read_resume(rc)
     if m is None:
         return "it has no resume record", 0
+    if m.get("stopped"):
+        return f"it was stopped ({m.get('stopped_why') or 'by request'})", 0
     if rc.exists():
         return "it already ended", 0
     lock = locks.try_take([locks.job_lock(rc)], f"detached job {rc.stem}", " ".join(map(str, m["command"])))

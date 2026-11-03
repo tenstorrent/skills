@@ -10457,8 +10457,8 @@ class Daemon:
             if rc.exists():
                 continue
             lost = detach.lost(rc)
-            if m is None or lost.exists() and lost.stat().st_mtime < (self.boot_at or 0):
-                wake(f"detached job {rc.stem} is not resumable or was lost before this boot")
+            if m is None or m.get("stopped") or lost.exists() and lost.stat().st_mtime < (self.boot_at or 0):
+                wake(f"detached job {rc.stem} is not resumable, was stopped or was lost before this boot")
                 return False, cut
             loss = self._abrupt_cut(m.get("boot"))
             cut = cut or loss
