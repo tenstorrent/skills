@@ -184,11 +184,15 @@ def taker(env=None) -> dict:
 
 def run_ids(env=None) -> dict:
     """The run, task and project a taker works for (TTP_RUN_ID, TTP_TASK, TTP_PROJECT), as run_id,
-    task_id and project: a stale-lock sweep (lockreap) reaps a process left holding the lock only when
-    it is of that same run."""
+    task_id, project (the folder's name, for display) and project_root (its resolved path, which tells
+    projects apart): a stale-lock sweep (lockreap) reaps a process left holding the lock only when it is
+    of that same run and the sweeping project's own."""
+    from .procowner import base_of
     env = os.environ if env is None else env
+    root = base_of(env.get("TTP_PROJECT"))
     out = {"run_id": env.get("TTP_RUN_ID"), "task_id": env.get("TTP_TASK"),
-           "project": Path(env["TTP_PROJECT"]).name if env.get("TTP_PROJECT") else None}
+           "project": Path(env["TTP_PROJECT"]).name if env.get("TTP_PROJECT") else None,
+           "project_root": str(root) if root else None}
     return {k: v for k, v in out.items() if v}
 
 

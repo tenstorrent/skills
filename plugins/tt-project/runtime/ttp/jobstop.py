@@ -58,7 +58,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import detach, locks
+from . import detach, locks, procowner
 from .db import load_result
 from .project import Project, durable_write, write_json
 
@@ -378,8 +378,11 @@ def cancelled_checks(p: Project, task: int) -> list[dict]:
     one of the project's checks lanes labelled with the task (but a daemon review precheck its open review
     reads, checklane.open_precheck: never a finished task's holder), each waiter queued for one with such a
     ticket, and the detached checks (checks.pid) of each of the task's runs. A group counts only when its
-    named process carries TTP_TASK (or TTP_TASK_ID) `task`, none of its members carries another task's, and
-    it holds no process this one guards (_guarded: itself, its ancestors, every running worker). Read only:
+    named process carries TTP_TASK (or TTP_TASK_ID) `task` and is provably this project's (a lane holder or
+    waiter: procowner.owns, as task ids overlap across projects sharing the host's lanes; a detached checks:
+    its run's checks.pid with its start time), none of its members carries another task's or another
+    project's TTP_PROJECT, and it holds no process this one guards (_guarded: itself, its ancestors, every
+    running worker). Read only:
     [{pgid, pid, lane (a lane file or None), rc (a detached checks.rc or None), since}]."""
     from . import checkcap, checklane, testslots
     from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
@@ -410,8 +413,11 @@ def cancelled_checks(p: Project, task: int) -> list[dict]:
         st = _stat(c["pid"])
         if st is None or st[0] <= 1 or st[0] == mine or _env_task(c["pid"]) != want:
             continue
+        if not (c["rc"] or procowner.owns(p.base, c["pid"])):
+            continue   # the same task id in another project's lane or ticket
         group = members(st[0])
-        if guarded & set(group) or any(_env_task(m) not in (None, "", want) for m in group):
+        if guarded & set(group) or any(_env_task(m) not in (None, "", want) or procowner.foreign_env(p.base, _environ(m))
+                                       for m in group):
             continue
         out.append({**c, "pgid": st[0]})
     return out

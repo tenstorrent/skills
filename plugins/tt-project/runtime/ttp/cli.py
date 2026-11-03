@@ -5914,7 +5914,8 @@ def cmd_lock(a) -> None:
                 pass
         os.kill(os.getpid(), info.si_signo)
     from . import lockreap
-    reaper = lockreap.Reaper(ended=(lambda h: lockreap.ended_job(p, h)) if getattr(p, "db", None) is not None else None)
+    reaper = lockreap.Reaper(ended=(lambda h: lockreap.ended_job(p, h)) if getattr(p, "db", None) is not None else None,
+                              project=getattr(p, "base", None))
     tickets: list = []
     atexit.register(lambda: [lk.dequeue(t) for t in tickets])   # however this ends; a dead process's ticket is dropped too
     prio = _urgent_priority(p, own)   # an urgent task's waiter goes ahead of routine ones (urgent.py)
@@ -6322,6 +6323,7 @@ def cmd_detach(a) -> None:
     state = rd.parent.parent if rd.parent.name == "runs" else None
     if state is not None:   # the wrapper appends the job's end to the project's activity log
         job_env.update({activity.ENV_LOG: str(activity.log_path(state)), activity.ENV_ID: aid})
+        job_env.setdefault("TTP_PROJECT", str(state.parent))   # whose job it is (procowner)
     if getattr(a, "resumable", False):   # before it starts: a reboot right after still finds it
         detach.save_resume(rc, logf, cmd, os.getcwd(), job_env, boot_id())
     if _boxed() and state is not None:   # this command's sandbox would end the job: the daemon starts it

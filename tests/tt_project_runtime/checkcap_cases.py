@@ -5634,12 +5634,13 @@ def test_a_wait_for_a_checks_slot_reads_pids_once_per_cycle_without_proc(env, tm
 
 # A cancelled task's checks (jobstop.end_cancelled_checks): stopped at the cancel, their lane freed at once.
 
-def _cancel_holder(p, tmp_path, tid: int, name: str, repo: str = _LANE_REPO):
+def _cancel_holder(p, tmp_path, tid: int, name: str, repo: str = _LANE_REPO, project=None):
     """A process of task `tid` holding one of project `p`'s checks lanes in a process group of its own, as an
-    attached `ttp checks` in a worker's tool shell does."""
+    attached `ttp checks` in a worker's tool shell does (carrying its project's TTP_PROJECT, or `project`'s)."""
     got = tmp_path / f"held-{name}"
     proc = subprocess.Popen([sys.executable, "-c", _DONE_HOLDER, p.name, str(got), repo, f"run {name}"],
-                            env={**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_TASK": str(tid)},
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_TASK": str(tid),
+                                 "TTP_PROJECT": str(p.base if project is None else project)},
                             start_new_session=True)
     assert _wait_for(got.exists), "the holder never took its lane"
     return proc
@@ -5709,18 +5710,21 @@ def test_cancelling_a_task_never_stops_another_task_s_checks_or_an_open_review_s
     token = f"t{tid}-{head[:12]}"
     p.db.add_task("review", "r", kind="review", labels=[checklane.PRECHECK_LABEL + token])
     precheck = _cancel_holder(p, tmp_path, tid, token, "3" * 12)
+    # another project's checks with the same task id (ids are per project) in a lane of the shared folder
+    foreign = _cancel_holder(p, tmp_path, tid, "foreign", "4" * 12, project=tmp_path / "other" / "tt-project")
+    anon = _cancel_holder(p, tmp_path, tid, "anon", "5" * 12, project="")   # says no project: never provably ours
     try:
         assert p.db.cancel(tid) == ""
         assert jobstop.cancelled_checks(p, tid) == []
         assert jobstop.end_cancelled_checks(p, tid, "test") == []
         daemon.Daemon(p.base).stop_cancelled_checks()
         assert jobstop.sweep_cancelled_checks(p) == []
-        assert all(x.poll() is None for x in (theirs, relabelled, shared, precheck))
+        assert all(x.poll() is None for x in (theirs, relabelled, shared, precheck, foreign, anon))
         p.db.cancel(other)   # the other task is cancelled too: only now its own checks stop
         assert [r["pgid"] for r in jobstop.end_cancelled_checks(p, other, "test")] == [theirs.pid]
-        assert theirs.wait(10) is not None and precheck.poll() is None
+        assert theirs.wait(10) is not None and precheck.poll() is None and foreign.poll() is None and anon.poll() is None
     finally:
-        for x in (theirs, relabelled, precheck):
+        for x in (theirs, relabelled, precheck, foreign, anon):
             _stop(x)
         _kill_group(shared)
 

@@ -17,17 +17,22 @@ def _reap_slot(path, **label):
     return f
 
 
+_OWN = "/srv/own/tt-project"   # the sweeping project's folder (Reaper project=); a fake process is its own
+                                # unless its env names another TTP_PROJECT
+
+
 class _ReapProcs:
     """A fake process table: pid -> {"start", "pgid", "env", "cmd"}; `fds` lists who has each lock open."""
 
     def __init__(self, monkeypatch, procs: dict, fds: list | None):
-        from ttp import lockreap, locks
+        from ttp import lockreap, locks, procowner
         self.procs, self.fds, self.sent = procs, fds, []
         monkeypatch.setattr(locks, "_alive", lambda pid: int(pid) in self.procs)
         monkeypatch.setattr(locks, "kthread", lambda pid, proc="/proc": False)
         monkeypatch.setattr(locks, "start_time", lambda pid, proc="/proc": (self.procs.get(int(pid)) or {}).get("start"))
         monkeypatch.setattr(lockreap, "_pgid", lambda pid: (self.procs.get(pid) or {}).get("pgid"))
         monkeypatch.setattr(lockreap, "environ", lambda pid: (self.procs.get(pid) or {}).get("env") or {})
+        monkeypatch.setattr(procowner, "environ", lambda pid: {"TTP_PROJECT": _OWN, **((self.procs.get(pid) or {}).get("env") or {})})
         monkeypatch.setattr(lockreap, "cmdline", lambda pid: (self.procs.get(pid) or {}).get("cmd") or "")
         monkeypatch.setattr(lockreap, "fd_holders", lambda path: None if self.fds is None else list(self.fds))
 
@@ -41,7 +46,7 @@ class _ReapProcs:
 
 def _reap_sweep(paths, now0=1000.0):
     from ttp import lockreap
-    r = lockreap.Reaper()
+    r = lockreap.Reaper(project=_OWN)
     first = r.sweep(paths, now0)
     assert not first["released"], "nothing is reaped before the grace"
     return r.sweep(paths, now0 + lockreap.GRACE_S + 1)
@@ -159,29 +164,54 @@ def test_lockreap_releases_a_sandboxed_takes_lock_once_its_agent_pid_is_reused(e
         f.close()
 
 
-def test_lockreap_same_run_compares_the_project_when_the_label_names_one(env, monkeypatch, tmp_path):
+def test_lockreap_same_run_compares_the_project_root_when_the_label_names_one(env, monkeypatch, tmp_path):
+    """Every project's folder is named tt-project: the label's resolved project_root tells them apart."""
     from ttp import lockreap
     _ReapProcs(monkeypatch, {
-        1: {"env": {"TTP_RUN_ID": "70", "TTP_PROJECT": "/srv/a/alpha"}},
-        2: {"env": {"TTP_RUN_ID": "70", "TTP_PROJECT": "/srv/b/beta"}},
-        3: {"env": {"TTP_RUN_ID": "70"}}}, [])
-    lbl = {"run_id": "70", "project": "alpha"}
-    assert lockreap._same_run(lbl, 1)
-    assert not lockreap._same_run(lbl, 2)   # another project's run 70
-    assert not lockreap._same_run(lbl, 3)   # says no project: never reaped as alpha's
-    old = {"run_id": "70"}                  # an older release's label: run id alone, as before
+        1: {"env": {"TTP_RUN_ID": "70", "TTP_PROJECT": "/srv/a/tt-project"}},
+        2: {"env": {"TTP_RUN_ID": "70", "TTP_PROJECT": "/srv/b/tt-project"}},
+        3: {"env": {"TTP_RUN_ID": "70"}},
+        4: {"env": {"TTP_RUN_ID": "70", "TTP_PROJECT": "/srv/a"}}}, [])   # a project root names the same project
+    lbl = {"run_id": "70", "project": "tt-project", "project_root": "/srv/a/tt-project"}
+    assert lockreap._same_run(lbl, 1) and lockreap._same_run(lbl, 4)
+    assert not lockreap._same_run(lbl, 2)   # another project's run 70, same folder name
+    assert not lockreap._same_run(lbl, 3)   # says no project: never reaped as a's
+    old = {"run_id": "70", "project": "tt-project"}   # an older release's label: run id alone
     assert all(lockreap._same_run(old, x) for x in (1, 2, 3))
-    assert not lockreap._same_run({"run_id": "71", "project": "alpha"}, 1)
-    # end to end: a dead holder's lock kept open by another project's run of the same id stays
+    assert not lockreap._same_run({"run_id": "71", "project_root": "/srv/a/tt-project"}, 1)
+
+
+@pytest.mark.parametrize("label_root", [None, _OWN, "/srv/other/tt-project"])
+def test_lockreap_never_signals_another_projects_process_with_the_same_run_and_task(env, monkeypatch, tmp_path, label_root):
+    """Run and task ids overlap across projects sharing the host's lock folders: a dead holder's slot kept
+    open by another project's process with the same TTP_RUN_ID and TTP_TASK is left and named, whatever
+    the label says; this project's own stale holder still is reaped (when the label is its own or old)."""
+    import signal as sg
+    from ttp import lockreap
     path = tmp_path / "gate.0.lock"
-    f = _reap_slot(path, pid=4100, pid_start="11", pgid=4100, run_id="70", project="alpha")
+    extra = {"project_root": label_root} if label_root else {}
+    f = _reap_slot(path, pid=4100, pid_start="11", pgid=4100, run_id="70", task_id="7", project="tt-project", **extra)
     try:
-        fake = _ReapProcs(monkeypatch, {5200: {"start": "1", "env": {"TTP_RUN_ID": "70", "TTP_PROJECT": "/srv/b/beta"}}},
-                          [5200])
+        theirs = {"TTP_RUN_ID": "70", "TTP_TASK": "7", "TTP_TASK_ID": "7", "TTP_PROJECT": "/srv/other/tt-project",
+                  "TTP_RUN_DIR": "/srv/other/tt-project/state/runs/70"}
+        fake = _ReapProcs(monkeypatch, {5200: {"start": "1", "pgid": 5200, "env": theirs}}, [5200])
         got = _reap_sweep([path])
-        assert not got["released"] and not fake.sent and str(path) in got["kept"]
-        fake.procs[5200]["env"]["TTP_PROJECT"] = "/srv/a/alpha"
-        assert _reap_sweep([path])["released"] and [x[0] for x in fake.sent] == [5200]
+        assert not got["released"] and not fake.sent and "left running" in got["kept"][str(path)]["left"]
+        # a run dir alone inside another project is not ours either, nor is a process with no project at all
+        fake.procs[5200]["env"] = {**theirs, "TTP_PROJECT": ""}
+        assert not _reap_sweep([path])["released"] and not fake.sent
+        # no sweeping project (an older caller): nothing is reaped
+        fake.procs[5200]["env"] = {"TTP_RUN_ID": "70", "TTP_TASK": "7"}
+        r = lockreap.Reaper()
+        r.sweep([path], 0)
+        assert not r.sweep([path], lockreap.GRACE_S + 1)["released"] and not fake.sent
+        # this project's own stale holder, by TTP_PROJECT or by a run dir in its folder
+        for mine in ({"TTP_PROJECT": _OWN}, {"TTP_PROJECT": "", "TTP_RUN_DIR": _OWN + "/state/runs/70"}):
+            fake.procs[5200]["env"] = {"TTP_RUN_ID": "70", "TTP_TASK": "7", **mine}
+            fake.sent.clear()
+            got = _reap_sweep([path])
+            want = [] if label_root == "/srv/other/tt-project" else [(5200, sg.SIGTERM)]
+            assert fake.sent == want, (mine, got)
     finally:
         f.close()
 
@@ -193,7 +223,7 @@ def test_lockreap_sigkills_a_reaped_process_that_outlives_sigterm(env, monkeypat
     f = _reap_slot(path, pid=4100, pid_start="11", run_id="70")
     try:
         fake = _ReapProcs(monkeypatch, {5200: {"start": "1", "env": {"TTP_RUN_ID": "70"}}}, [5200])
-        r = lockreap.Reaper()
+        r = lockreap.Reaper(project=_OWN)
         r.sweep([path], 0)
         r.sweep([path], 61)
         r.sweep([path], 62)                                   # still within KILL_AFTER_S: nothing more
@@ -267,7 +297,7 @@ def test_lockreap_never_reaps_a_detached_jobs_lock(env, monkeypatch, tmp_path):
     try:
         fake = _ReapProcs(monkeypatch, {5200: {"start": "90", "pgid": 5200, "env": {"TTP_RUN_ID": "70", "TTP_TASK": "7"},
                                            "cmd": "build-server --daemon"}}, [5200])
-        r = lockreap.Reaper()
+        r = lockreap.Reaper(project=_OWN)
         for t in (1000.0, 1000.0 + lockreap.GRACE_S + 1, 1000.0 + 2 * lockreap.GRACE_S):
             assert r.sweep([path], t) == {"released": [], "kept": {}}
         assert fake.sent == []
@@ -476,7 +506,7 @@ def test_lockreap_frees_a_slot_an_ended_detached_jobs_leftover_keeps_only_once_j
         procs[4000] = {"start": "5", "pgid": 4100}
     try:
         fake = _ReapProcs(monkeypatch, procs, [4101])
-        r = lockreap.Reaper(ended=lambda h: lockreap.ended_job(p, h))
+        r = lockreap.Reaper(ended=lambda h: lockreap.ended_job(p, h), project=_OWN)
         assert not r.sweep([path], 1000.0)["released"]
         got = r.sweep([path], 1000.0 + lockreap.GRACE_S + 1)
         if case != "freed":
@@ -730,3 +760,51 @@ def test_lock_cycle_takes_shared_holders_from_their_own_labels_not_the_stale_slo
     finally:
         for f in fs:
             f.close()
+
+
+def test_procowner_proves_a_process_is_this_projects_by_its_full_path_never_by_name_or_ids(tmp_path):
+    """TTP_PROJECT (root or folder, symlinks resolved) or a TTP_RUN_DIR inside the folder proves ownership;
+    the same folder name elsewhere, the same task and run ids, a run dir outside or no identity never do."""
+    from ttp import procowner
+    mine, theirs = tmp_path / "a" / "tt-project", tmp_path / "b" / "tt-project"
+    for d in (mine / "state" / "runs" / "7", theirs / "state" / "runs" / "7"):
+        d.mkdir(parents=True)
+    (tmp_path / "link").symlink_to(tmp_path / "a")
+    ids = {"TTP_TASK": "7", "TTP_TASK_ID": "7", "TTP_RUN_ID": "7"}
+    assert procowner.owns_env(mine, {**ids, "TTP_PROJECT": str(mine)})
+    assert procowner.owns_env(mine.parent, {"TTP_PROJECT": str(tmp_path / "link")})   # a root, via a symlink
+    assert procowner.owns_env(mine, {"TTP_RUN_DIR": str(mine / "state" / "runs" / "7")})
+    assert not procowner.owns_env(mine, {**ids, "TTP_PROJECT": str(theirs)})          # same name, other root
+    assert not procowner.owns_env(mine, {**ids, "TTP_RUN_DIR": str(theirs / "state" / "runs" / "7")})
+    assert not procowner.owns_env(mine, {"TTP_RUN_DIR": str(tmp_path / "a-tt-project-run")})
+    assert not procowner.owns_env(mine, ids) and not procowner.owns_env(mine, {}) and not procowner.owns_env(mine, None)
+    assert not procowner.owns_env(None, {"TTP_PROJECT": str(mine)})
+    assert procowner.foreign_env(mine, {"TTP_PROJECT": str(theirs)})
+    assert not procowner.foreign_env(mine, {"TTP_PROJECT": str(mine.parent)}) and not procowner.foreign_env(mine, ids)
+
+
+def test_procowner_reads_a_live_processs_identity_and_none_for_a_gone_one(tmp_path):
+    import subprocess
+    import sys
+    from ttp import procowner
+    if not Path("/proc/self/environ").exists():
+        pytest.skip("no /proc")
+    base = tmp_path / "tt-project"
+    proc = subprocess.Popen([sys.executable, "-c", "import time; print(1, flush=True); time.sleep(30)"],
+                            env={"PATH": os.environ.get("PATH", ""), "TTP_PROJECT": str(base), "TTP_TASK": "7"},
+                            stdout=subprocess.PIPE)
+    try:
+        proc.stdout.readline()   # past its exec: /proc shows its own environment
+        assert procowner.owns(base, proc.pid) and procowner.owns(tmp_path, proc.pid)
+        assert not procowner.owns(tmp_path / "other" / "tt-project", proc.pid)
+    finally:
+        proc.kill()
+        proc.wait()
+    assert procowner.environ(proc.pid) is None and not procowner.owns(base, proc.pid)
+
+
+def test_lock_labels_name_the_holders_full_project_root(env, monkeypatch, tmp_path):
+    from ttp import locks
+    monkeypatch.setenv("TTP_PROJECT", str(tmp_path / "proj"))
+    monkeypatch.setenv("TTP_RUN_ID", "7")
+    assert locks.run_ids()["project_root"] == os.path.realpath(tmp_path / "proj" / "tt-project")

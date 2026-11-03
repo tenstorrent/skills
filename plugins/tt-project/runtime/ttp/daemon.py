@@ -8712,7 +8712,7 @@ class Daemon:
         now, db = time.time(), self.p.db
         own = [self.p.state / "locks"]
         shared_dirs = [shared.root() / r for r in sorted(shared.names(self.cfg))]
-        reaper = getattr(self, "_lock_reaper", None) or lockreap.Reaper(ended=lambda h: lockreap.ended_job(self.p, h))
+        reaper = getattr(self, "_lock_reaper", None) or lockreap.Reaper(ended=lambda h: lockreap.ended_job(self.p, h), project=self.p.base)
         self._lock_reaper = reaper
         got = reaper.sweep(lockreap.slot_files(own + shared_dirs + [checkcap.slot_dir()]), now)
         if got["released"]:
