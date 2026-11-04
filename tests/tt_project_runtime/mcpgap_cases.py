@@ -267,8 +267,11 @@ def _host_list(p, at=None, **extra):
 
 def _iso_run(p, monkeypatch, **kw):
     from ttp import loopproxy
+    from ttp.providers import claude
     # The run env lists the host's live listeners (TTP_LOOPBACK_PORTS); pin them so two runs compare
-    # equal while other processes open and close ports between them.
+    # equal while other processes open and close ports between them. Only a fenced run gets them:
+    # fenced whatever sandbox tools (bwrap, socat) this host has.
+    monkeypatch.setattr(claude, "fence_missing", lambda: [])
     monkeypatch.setattr(loopproxy, "listening", lambda net=None: [8080])
     monkeypatch.setattr(loopproxy, "ssh_ports", lambda path=None: [2222])
     argv, run_dir, _ = _dispatch_claude_worker(p, monkeypatch, {}, **kw)
