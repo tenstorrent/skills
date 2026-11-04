@@ -37,3 +37,4 @@
 +170: a held worker_notify item and what settles it (workernotify.py)
 +33: relayer context's agent-mode exception named in the relayed-messages and loosening rules
 +294: plain replies: answer first, short, what the harness does rather than its internal names (plainreply.py)
++210: an urgent goal splits into independent tasks that start at once (no chain without a new file or symbol)

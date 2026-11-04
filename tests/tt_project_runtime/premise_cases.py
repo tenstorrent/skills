@@ -276,3 +276,40 @@ def test_a_premise_check_spec_requires_named_targets_to_exist_at_the_base_ref(en
     assert "git ls-tree" in spec and "git grep" in spec and "base ref" in spec, "(a) confirm each named target exists"
     assert "adjacent" in spec and "found instead" in spec, "(b) a nearby function is no match: fails, naming it"
     assert "upstream note" in spec and "outside the plugin" in spec and "won't-fix" in spec, "(c) foreign paths"
+
+
+def test_an_urgent_code_task_checks_its_premise_in_its_own_run_and_drops_a_queued_check(env):
+    """An urgent code task (priority 1 or an `urgent:` line) gets no separate premise question first:
+    its spec says to check the premise as its first step and it is ready at once. A question queued
+    before it turned urgent is cancelled if it never started; one that started settles as usual."""
+    from ttp import premise
+    p = _premise_project(env)
+    p1 = _code(p, priority=1)
+    line = _code(p, spec="Goal: add the retry.\nurgent: the user is waiting\npremise: no retry line yet")
+    routine = _code(p, priority=2)
+    got = dict(premise.tend(p.db))
+    assert got[p1] == got[line] == "premise checked in its own run"
+    qs = p.db.q("SELECT * FROM tasks WHERE kind='question'")
+    assert [json.loads(q["labels"]) for q in qs] == [[f"premise-check:{routine}"]], "only the routine one splits"
+    for tid, check in ((p1, "`ttp task show` has no retry line yet"), (line, "no retry line yet")):
+        t = p.db.task(tid)
+        assert json.loads(t["labels"]) == ["premise:self"] and json.loads(t["depends_on"] or "[]") == []
+        assert f"as your first step, check that it holds: {check}." in t["spec"]
+    assert {p1, line} <= {t["id"] for t in p.db.ready_tasks()}
+    assert premise.tend(p.db) == [] and p.db.task(p1)["spec"].count("as your first step") == 1, "once"
+    # Turned urgent after its check was queued: the unstarted check is cancelled, the task freed.
+    qid = qs[0]["id"]
+    p.db.update_task(routine, priority=1)
+    assert premise.tend(p.db) == [(routine, f"premise checked in its own run (#{qid} cancelled)")]
+    t = p.db.task(routine)
+    assert p.db.task(qid)["status"] == "cancelled" and json.loads(t["depends_on"]) == []
+    assert json.loads(t["labels"]) == [f"premise:{qid}:self"] and premise.pending(t) is None
+    # A check that already started is settled as usual.
+    late = _code(p, priority=2)
+    premise.tend(p.db)
+    q2 = p.db.one("SELECT id FROM tasks WHERE kind='question' AND status='queued'")["id"]
+    p.db.x("INSERT INTO runs(task,role,started,status) VALUES(?,?,?,?)", (q2, "worker", time.time(), "running"))
+    p.db.update_task(late, priority=1)
+    assert premise.tend(p.db) == [] and p.db.task(q2)["status"] == "queued"
+    _end_check(p, q2, premise="holds", summary="no retry line")
+    assert premise.tend(p.db) == [(late, f"premise holds (#{q2})")]

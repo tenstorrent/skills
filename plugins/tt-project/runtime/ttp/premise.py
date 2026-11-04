@@ -23,6 +23,10 @@ Model-free, from Daemon.reconcile_tasks and the start of each dispatch pass (ten
   - no verdict, or the question failed or was cancelled: the code task runs anyway and its spec says
     the check gave no verdict, so the code run checks the premise itself (no work is lost).
   The label becomes `premise:<id>:holds|fails|unknown`, so each code task is settled once.
+- urgent (urgent.is_urgent: priority 1 or an `urgent:` line): no separate question first. The code
+  task's spec gets a note to check the premise as its own first step (and to change nothing if it
+  fails), its label becomes `premise:self` (`premise:<id>:self` for a question queued before it
+  turned urgent, which is cancelled if it never started; one that started is settled as above).
 - a pending question whose code task ended (done, failed, cancelled) and that has not started is
   cancelled: nobody reads its answer.
 
@@ -40,6 +44,7 @@ import re
 import time
 
 from .db import TERMINAL_TASK_STATES, dump_result, load_result
+from .urgent import is_urgent
 
 LINE = re.compile(r"(?im)^[ \t]*(?:[-*][ \t]+)?premise:[ \t]*(\S.*?)[ \t]*$")
 CHECK_LABEL = "premise-check:"   # on the question: + the code task's id
@@ -216,6 +221,48 @@ def _settle(db, task: dict, qid: int) -> str | None:
     return got or "unknown"
 
 
+SELF = "self"   # verdict label of an urgent task that checks its premise in its own run
+
+
+def _self(db, task: dict, check: str, qid: int | None = None) -> bool:
+    """Make urgent `task` check its premise as its own first step: a spec note and the `premise:self`
+    label (`premise:<qid>:self`: its queued question `qid`, never started, is cancelled). False when
+    another pass did already, or the question started meanwhile."""
+    now = time.time()
+    with db.tx():
+        t = db.task(task["id"])
+        labels = _labels(t) if t else []
+        if not t or t["status"] not in ("queued", "blocked"):
+            return False
+        if qid is None:
+            if any(str(x).startswith(LABEL) for x in labels):
+                return False
+            labels = [*labels, f"{LABEL}{SELF}"]
+        else:
+            q = db.task(qid)
+            if f"{LABEL}{qid}" not in labels or not q or q["status"] != "queued" or db.one(
+                    "SELECT 1 FROM runs WHERE task=? LIMIT 1", (qid,)):
+                return False
+            db.x("UPDATE tasks SET status='cancelled', updated=? WHERE id=? AND status='queued'", (now, qid))
+            labels = [f"{LABEL}{qid}:{SELF}" if x == f"{LABEL}{qid}" else x for x in labels]
+        try:
+            deps = json.loads(t["depends_on"] or "[]")
+        except ValueError:
+            deps = []
+        deps = [d for d in (deps if isinstance(deps, list) else [deps]) if qid is None or str(d) != str(qid)]
+        note = (f"Premise (urgent: no separate check first): as your first step, check that it holds: {check}. "
+                f"If it does not, change no file and hand off done with outcome rejected and the evidence.")
+        upd = {"spec": f"{t['spec'].rstrip()}\n\n{note}", "labels": labels, "depends_on": deps}
+        if t["status"] == "blocked" and str(t["blocked_reason"] or "").startswith(f"dependency #{qid} "):
+            upd.update(status="queued", blocked_reason=None)
+        db.update_task(t["id"], **upd)
+        db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+             (now, "daemon", "premise_check", "low",
+              f"#{t['id']} {t['title']}: urgent, so it checks its premise as its own first step"
+              + (f" (question #{qid} cancelled)" if qid is not None else ""), "handled", t["id"]))
+    return True
+
+
 def tend(db) -> list[tuple[int, str]]:
     """Split, settle and clean up premise checks (see the module doc); (code task id, what) per action."""
     done: list[tuple[int, str]] = []
@@ -224,7 +271,9 @@ def tend(db) -> list[tuple[int, str]]:
         labels = [str(x) for x in _labels(t)]
         pend = pending(t)
         if pend is not None:
-            if (got := _settle(db, t, pend)) is not None:
+            if is_urgent(t) and (check := line(t["spec"])) and _self(db, t, check, pend):
+                done.append((t["id"], f"premise checked in its own run (#{pend} cancelled)"))
+            elif (got := _settle(db, t, pend)) is not None:
                 done.append((t["id"], f"premise {got} (#{pend})"))
             continue
         if t["status"] != "queued" or any(x.startswith((LABEL, "continues:")) for x in labels) \
@@ -232,7 +281,10 @@ def tend(db) -> list[tuple[int, str]]:
             continue
         if db.one("SELECT 1 FROM runs WHERE task=? AND role!='coordinator' LIMIT 1", (t["id"],)):
             continue
-        if (qid := _split(db, t, check)) is not None:
+        if is_urgent(t):
+            if _self(db, t, check):
+                done.append((t["id"], "premise checked in its own run"))
+        elif (qid := _split(db, t, check)) is not None:
             done.append((t["id"], f"premise check #{qid} queued"))
     for q in db.q("SELECT * FROM tasks WHERE kind='question' AND status='queued' AND labels LIKE ?",
                   (f'%"{CHECK_LABEL}%',)):

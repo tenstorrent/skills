@@ -26,6 +26,8 @@ charter requires, so a speedup that breaks quality is caught.
 
 - Tasks that can run side by side, each with a self-contained spec, acceptance criteria and the
   measurement that decides it. Dependencies only where one task truly needs another's output.
+- An urgent goal (priority 1 or an `urgent:` line): every task starts at once. No chain between its
+  tasks unless one needs another's new file or symbol; give each the goal's priority and `urgent:` line.
 - Findings worth keeping: put them in `findings`, one fact each, with its source.
 - Knowledge that would help but is out of reach (access, a missing connector, a person to ask):
   say what and why.

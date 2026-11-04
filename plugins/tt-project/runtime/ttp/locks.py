@@ -12,7 +12,9 @@ whose process is gone is dropped.
 
 A landing waiter (a `ttp lock` run inside the checks of a landing: `ttp push` to the push branch, the
 push queue's batch checks, `ttp land`, in any project) goes ahead of other waiters, in arrival order
-within each class. Only the harness marks one: the check runner (push._run_one for `ttp push` and `ttp
+within each class, except that an urgent waiter (task priority URGENT_PRIORITY or better) goes ahead of
+a routine landing: urgent landings, then urgent non-landing waiters, then routine landings. Only the
+harness marks one: the check runner (push._run_one for `ttp push` and `ttp
 land`, batch._stream for the push queue's batches) holds a landing mark (landmark.py) and
 `ttp lock` counts as landing only if that mark is held by one of its own ancestors, so a forged
 environment gets normal ordering. The bound: a waiter that has waited LANDING_AGE_S is no longer
@@ -1271,12 +1273,15 @@ def holder_kind(h: dict) -> str:
 
 def landing_first(q: list[Path], now: float | None = None) -> list[Path]:
     """`q` with landing waiters (is_landing) moved ahead of the rest, by arrival, along with every waiter
-    that has waited LANDING_AGE_S or longer: a later landing never passes it, so no waiter waits on a
-    stream of landings without a bound. The rest keep their order. Without a landing waiting, `q`."""
+    that has waited LANDING_AGE_S or longer (first): a later landing never passes it, so no waiter waits
+    on a stream of landings without a bound. Urgent waiters (_urgent) join the front ahead of routine
+    landings, urgent landings first: an urgent run never waits behind routine work. The rest keep their
+    order. Without a landing waiting, `q` (urgent ones already lead it: my_turn)."""
     if not any(map(is_landing, q)):
         return q
     edge = (time.time() if now is None else now) - LANDING_AGE_S
-    front = sorted((t for t in q if is_landing(t) or _arrival(t) <= edge), key=_arrival)
+    front = sorted((t for t in q if is_landing(t) or _urgent(t) or _arrival(t) <= edge),
+                   key=lambda t: (_arrival(t) > edge, not _urgent(t), not is_landing(t), _arrival(t)))
     return front + [t for t in q if t not in front]
 
 

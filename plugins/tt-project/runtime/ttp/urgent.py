@@ -15,7 +15,10 @@ A task is urgent when its priority is 1 (or better) or its spec has a line `urge
 - Push queue: an approved head of an urgent review or of the urgent task it reviews starts its batch
   at once (pushq.due); the guard against a running batch or deploy stays.
 - Waiting lists: exclusive-resource reservations (Daemon._slot_plan), `ttp lock` waiters
-  (locks.my_turn) and device runner queues (devq.Runner.next_job) serve urgent waiters first.
+  (locks.my_turn, also ahead of routine landings: locks.landing_first) and device runner queues
+  (devq.Runner.next_job) serve urgent waiters first.
+- Premise: an urgent code task checks its `premise:` line in its own run, not in a question first
+  (premise.tend). The coordinator and plan prompts split an urgent goal into tasks that start at once.
   Held locks, holds, pauses and recovery owners are untouched.
 - Visibility: `ttp status` and the web app mark urgent tasks with how long each has waited
   (waited_s); Daemon.check_slot_wait raises one event when a ready urgent task has been held by

@@ -2035,9 +2035,10 @@ def test_a_ttp_lock_waiter_whose_run_ended_leaves_the_queue_and_exits_75(env, tm
 
 
 def test_a_later_landing_lock_waiter_goes_first_fifo_within_each_class_and_a_long_waiter_keeps_its_place(tmp_path):
-    """locks.my_turn: landing waiters (LANDING_TICKET) go ahead of every non-landing one, urgent ones
-    included, in arrival order among themselves, in both the arrival and the fair order; the rest keep
-    their order. A waiter that has waited LANDING_AGE_S is not passed by a later landing: no starvation."""
+    """locks.my_turn: landing waiters (LANDING_TICKET) go ahead of every routine non-landing one, in
+    arrival order among themselves, in both the arrival and the fair order; an urgent waiter goes ahead of
+    routine landings; the rest keep their order. A waiter that has waited LANDING_AGE_S is not passed by a
+    later landing: no starvation."""
     from ttp import locks
     q = tmp_path / "q"
     now = time.time()
@@ -2052,8 +2053,9 @@ def test_a_later_landing_lock_waiter_goes_first_fifo_within_each_class_and_a_lon
         assert locks.is_multi(land2) and locks.ticket_priority(land2) == 3 and locks.ticket_group(land2), \
             "older readers' fields still parse"
         for fair in (False, True):
-            assert [locks.my_turn(q, "gate", t, 1, fair=fair) for t in every] == [False, False, True, False], fair
-            assert [locks.my_turn(q, "gate", t, 2, fair=fair) for t in every] == [False, False, True, True], fair
+            assert [locks.my_turn(q, "gate", t, 1, fair=fair) for t in every] == [False, True, False, False], fair
+            assert [locks.my_turn(q, "gate", t, 2, fair=fair) for t in every] == [False, True, True, False], fair
+            assert [locks.my_turn(q, "gate", t, 3, fair=fair) for t in every] == [False, True, True, True], fair
         assert locks.my_turn(q, "gate", hot, 3) and not locks.my_turn(q, "gate", routine, 3), "urgent, then arrival"
         locks.dequeue(land1)
         locks.dequeue(land2)
@@ -2062,10 +2064,39 @@ def test_a_later_landing_lock_waiter_goes_first_fifo_within_each_class_and_a_lon
         late = locks.enqueue(q, "gate", "proj-b landing", since=now, group="proj-b", landing=True)
         every += (old, late)
         assert locks.my_turn(q, "gate", old, 1) and not locks.my_turn(q, "gate", late, 1), "aged: not passed"
-        assert locks.my_turn(q, "gate", late, 2) and not locks.my_turn(q, "gate", hot, 2)
+        assert locks.my_turn(q, "gate", hot, 2) and not locks.my_turn(q, "gate", late, 2), "urgent first"
+        assert locks.my_turn(q, "gate", late, 3) and not locks.my_turn(q, "gate", routine, 3)
         shared = locks.enqueue(q, "gate", "proj-d landing", shared=True, landing=True)
         every += (shared,)
         assert locks.is_landing(shared) and locks.is_shared(shared)
+    finally:
+        for t in every:
+            locks.dequeue(t)
+
+
+def test_an_urgent_lock_waiter_goes_ahead_of_routine_landings_and_an_urgent_landing_first(tmp_path):
+    """locks.landing_first: with a landing waiting, urgent waiters (priority 1) go ahead of routine
+    landings, urgent landings first, both by arrival; routine landings, then the rest. The aged bound
+    still leads. A running holder is never stopped: only the queue order changes."""
+    from ttp import locks
+    q = tmp_path / "q"
+    now = time.time()
+    every = (routine := locks.enqueue(q, "gate", "a suite", since=now - 50, priority=3, group="a"),
+             land := locks.enqueue(q, "gate", "b landing", since=now - 40, priority=3, group="b", landing=True),
+             hot := locks.enqueue(q, "gate", "c urgent suite", since=now - 30, priority=1, group="c"),
+             hot_land := locks.enqueue(q, "gate", "d urgent landing", since=now - 20, priority=1, group="d",
+                                       landing=True))
+    try:
+        for fair in (False, True):
+            order = [t for n in range(1, 5) for t in every
+                     if locks.my_turn(q, "gate", t, n, fair=fair, urgent_max=2)
+                     and not locks.my_turn(q, "gate", t, n - 1, fair=fair, urgent_max=2)]
+            assert order == [hot_land, hot, land, routine], fair
+        assert locks.landing_first([routine, land, hot], now) == [hot, land, routine]
+        assert locks.landing_first([routine, hot], now) == [routine, hot], "no landing: unchanged"
+        old = locks.enqueue(q, "gate", "e long suite", since=now - locks.LANDING_AGE_S - 60, group="e")
+        every += (old,)
+        assert locks.landing_first(locks.queued(q, "gate"), now)[:2] == [old, hot_land], "aged still leads"
     finally:
         for t in every:
             locks.dequeue(t)
