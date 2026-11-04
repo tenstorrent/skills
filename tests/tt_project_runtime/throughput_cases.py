@@ -1127,7 +1127,7 @@ def test_throughput_checks_waits_under_a_small_test_worker_budget_name_that_budg
     monkeypatch.setattr(checkcap, "cores", lambda: 64)
     for k in ("POOL", "RUN_MAX", "RUN_MIN", "PROJECT_SLOTS", "PROJECT_WORKERS"):
         monkeypatch.delenv(f"TTP_TEST_{k}", raising=False)
-    monkeypatch.setattr(testslots, "project_workers", lambda cfg=None, cores=None: 32)
+    monkeypatch.setattr(testslots, "project_workers", lambda cfg=None, cores=None, project_name=None: 32)
     p = make(env)
     d, now = Daemon(p.base), time.time()
     p.set_config("checks.test_project_max", 4)
