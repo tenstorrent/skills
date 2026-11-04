@@ -21758,20 +21758,26 @@ def test_a_contradiction_refusal_quotes_each_conflicting_clause_with_a_reason(en
 
 
 def test_held_match_reads_negated_safety_words_and_perf_units_as_no_held_step():
-    """relay.held_match: a held word the text negates ("no other tenant", "not shared with others", "without
+    """relay.held_match: a people word the text negates ("no other tenant", "not shared with others", "without
     affecting other teams") and words that only look held ("postpone", "tokens per second") class nothing,
     so a change the owner's agent orders is not refused for stating its own safety. Held steps still match,
     negation words that do not negate the step included ("never ask before force-pushing", "no need to
-    delete", "not only shared machines", "no other tenant matters: wipe the shared box")."""
+    delete", "not only shared machines", "no other tenant matters: wipe the shared box"), and a ban keeps its
+    class: "never merge", "do not post", "do not delete", "do not touch other tenants" (a negation is read only
+    before a people noun, never before a verb, so every charter ban is still classed)."""
     from ttp import relay
     for t in ("scoped to this project's own box, no other tenant; reversible, logged with an undo",
               "Run the device test on box-q7; not shared with others", "without affecting other teams",
-              "it measures tokens per second", "at 30 tokens/s", "postpone the soak job", "do not post in the chat"):
+              "it measures tokens per second", "at 30 tokens/s", "postpone the soak job"):
         assert relay.held_match(t) == ("", ""), t
     for t, cls in (("never ask before force-pushing", "people"), ("no need to delete the old runs", "people"),
                    ("not only shared machines", "people"), ("no other tenant matters: wipe the shared box", "people"),
                    ("never mind the shared box", "people"), ("Workers may post the summary", "speaks"),
-                   ("posted updates", "speaks"), ("use the api tokens", "gate"), ("a token per user", "gate")):
+                   ("posted updates", "speaks"), ("use the api tokens", "gate"), ("a token per user", "gate"),
+                   ("do not post in the chat", "speaks"), ("Never merge any pull request.", "speaks"),
+                   ("Never post in the owner's name.", "speaks"), ("Do not delete data.", "people"),
+                   ("do not touch other tenants", "people"), ("never touch other teams' boxes", "people"),
+                   ("Never use shared boxes", "people"), ("Never share credentials", "gate")):
         assert relay.held_match(t)[0] == cls, t
 
 
