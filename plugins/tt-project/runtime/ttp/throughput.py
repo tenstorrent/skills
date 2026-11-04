@@ -52,7 +52,9 @@ to its first run, or to now for one still queued:
   for a host-wide gate, show it: other projects' host test grants when another project's grant
   (checkcap.grant_records) fell inside it, else the host's free-cores gate; with none at the limit and
   none held by the project's own limits the lane names that `holder` instead of a checks setting, and
-  plan() reports it as information only: no raise, no task), own_job (its own detached job or checks,
+  plan() reports it as information only: no raise, no task; a set test-worker budget,
+  checks.test_project_slots, that admits fewer full runs at once than both checks limits is the lane's
+  limit instead, reported, never raised), own_job (its own detached job or checks,
   or a retry_when on its own driver: no limit), the resource rule above only with a dispatch hold recorded
   in the wait, a deferral or provider hold, else retry_wait (its own retry
   condition, then a slot, not told apart: no limit, never counted against worker slots).
@@ -679,6 +681,29 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     elif host:
         ck_lane["note"] += "".join(f"; {n} wait(s) {HELD_NOTE[k].split(':')[0]}, not by the project's limits"
                                    for k, n in host.items())
+    # A set test-worker budget (checks.test_project_slots: the project's, the account's or its environment
+    # variable) that admits fewer full runs at once than both checks limits holds the lane instead: each
+    # full run starts with at least checks.test_run_min workers (testslots.run_min), so raising
+    # checks.slots or checks.test_project_max changes nothing. Reported, never raised here.
+    if ck_lane["waits"] and not ck_lane.get("holder") and lanes_n and cap_n:
+        try:
+            from . import testslots
+            env, key = testslots.TESTS.setting(testslots.TESTS.budget)
+            s = testslots.sizes(cfg)
+            set_ = testslots._number(_cfg(cfg, f"checks.{key}", None)) or testslots._setting(env, key)
+            budget = testslots.project_max(cfg, s) if s and set_ else 0
+            fits = budget // testslots.run_min(cfg, s[1]) if budget else 0
+        except Exception:
+            budget = fits = 0
+        if budget and fits < min(lanes_n, cap_n):
+            ck_lane.update(limit_key=f"checks.{key}", limit=budget, budget_runs=max(1, fits))
+            ck_lane["limits"][f"checks.{key}"] = budget
+            ck_lane["note"] = (
+                f"the project's test-worker budget (checks.{key} {budget}) admits only {max(1, fits)} full run(s) "
+                f"at once (each starts with at least checks.test_run_min {testslots.run_min(cfg, s[1])} workers), "
+                f"fewer than checks.slots {lanes_n} and checks.test_project_max {cap_n}: it holds the lane, so "
+                f"raising those changes nothing; raise or unset checks.{key} (unset, it follows the host's spare "
+                "cores); " + ck_lane["note"])
     peak = _peak(spans, t0, now)
     out = []
     for ln in lanes.values():

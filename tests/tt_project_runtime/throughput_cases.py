@@ -1111,3 +1111,51 @@ def test_throughput_a_checks_slot_wait_event_names_the_host_only_when_every_lane
     p.db.x("UPDATE tasks SET status='queued', blocked_reason='waiting for the checks slot' WHERE id=?", (t,))
     ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
     assert (ck["holder"], ck["limit_key"], ck["at_limit"]) == (throughput.HOST_CORES, None, 0), ck
+
+
+@pytest.mark.parametrize("budget,where,holds", [(8, "project", True), (8, "env", True), (24, "project", False),
+                                                (None, None, False)])
+def test_throughput_checks_waits_under_a_small_test_worker_budget_name_that_budget(env, monkeypatch, tmp_path,
+                                                                                   budget, where, holds):
+    """Task #5710: a set test-worker budget (checks.test_project_slots 8) with full runs of at least 4 workers
+    (checks.test_run_min, half of a run's 8) admits 2 runs at once, fewer than checks.slots 3 and the cap 4,
+    so it held the lane: the lane names it and says raising checks.slots changes nothing. One that fits as
+    many runs as both limits (24), or none set (the default follows the host's spare cores), keeps checks.slots."""
+    from ttp import checkcap, slowcomplaint, testslots, throughput
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(checkcap, "grants_dir", lambda: tmp_path / "host")
+    monkeypatch.setattr(checkcap, "cores", lambda: 64)
+    for k in ("POOL", "RUN_MAX", "RUN_MIN", "PROJECT_SLOTS", "PROJECT_WORKERS"):
+        monkeypatch.delenv(f"TTP_TEST_{k}", raising=False)
+    monkeypatch.setattr(testslots, "project_workers", lambda cfg=None, cores=None: 32)
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    p.set_config("checks.test_project_max", 4)
+    p.set_config("checks.slots", 3)
+    if where == "project":
+        p.set_config("checks.test_project_slots", budget)
+    elif where == "env":
+        monkeypatch.setenv("TTP_TEST_PROJECT_SLOTS", str(budget))
+    for i, w0 in enumerate((now - 5 * 3600, now - 3 * 3600)):
+        t = _tp_checks_requeue(p, d, monkeypatch, tmp_path, f"budget wait {i}", w0, 2400)
+        _tp_checks_run(p, monkeypatch, w0 - 60, 2500)   # one run at a time: the budget, not the lanes
+        _tp_slot_wait(p, monkeypatch, t, w0, w0 + 2390, cap=4, lane_at=w0 + 2300)
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    ck = _tp_lane(rep, "checks_slots")
+    assert ck["slow"] and ck["count"] == 2 and "holder" not in ck, ck
+    if not holds:
+        assert ck["limit_key"] == "checks.slots" and "budget_runs" not in ck, ck
+        assert "test-worker budget" not in ck["note"], ck["note"]
+        return
+    assert (ck["limit_key"], ck["limit"], ck["budget_runs"]) == ("checks.test_project_slots", 8, 2), ck
+    assert ck["limits"]["checks.test_project_slots"] == 8, ck
+    assert ck["note"].startswith("the project's test-worker budget (checks.test_project_slots 8) admits only 2 "
+                                 "full run(s)") and "raising those changes nothing" in ck["note"], ck["note"]
+    _, kept = throughput.plan(p.db, p.config(), rep)
+    (k,) = [k for k in kept if k["lane"] == "checks_slots"]
+    assert k["key"] == "checks.test_project_slots" and not k.get("info"), k
+    assert not [c for c in throughput.plan(p.db, p.config(), rep)[0] if "test_project" in c["key"]]
+    fid = slowcomplaint._followups(p.db, {**rep, "kept": kept}, [1])["opened"]
+    t = p.db.one("SELECT title, spec FROM tasks WHERE id=?", (fid,))
+    assert "checks.test_project_slots not raised" in t["title"], t["title"]
+    assert "limit checks.test_project_slots=8" in t["spec"], t["spec"]
