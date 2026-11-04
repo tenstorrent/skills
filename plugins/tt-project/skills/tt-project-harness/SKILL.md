@@ -265,7 +265,7 @@ Company-wide practice; the long form is in the `tt-project:setup-box` skill's re
 - Neighbours, a `serving` tag or a site rule the harness infers never hold a reset, power cycle,
   run or install, nor make it an ask: only a user-set hold or allowlist (with the user's message
   as its source), a lock or device hold, a pause, a spend cap, a charter Restriction or a live
-  tenant on that box does (setup-box `recovery.md`).
+  tenant on that box does (setup-box recovery reference).
 - After a tray power drop, try glx_reset first, then the single-host BMC power cycle with op 0x3
   only (op 0x0 also resets the PCIe retimers carrying NVMe). Tray temperatures read right after a
   power loss are junk.
