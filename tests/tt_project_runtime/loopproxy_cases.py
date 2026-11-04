@@ -250,8 +250,14 @@ def test_loopback_script_forwards_only_from_another_namespace(tmp_path):
         if not want:
             assert calls == [], netns
             continue
-        assert calls == [f"TCP-LISTEN:{p},bind=127.0.0.1,fork,reuseaddr "
-                         f"PROXY:127.0.0.1:localhost:{p},proxyport=3128,proxyauth=user:pw" for p in (40001, 40002)]
+        # The forwarders start in the background: under load their lines land late and in either order.
+        deadline = time.monotonic() + 10
+        while len(calls) < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+            calls = log.read_text().splitlines() if log.exists() else []
+        assert sorted(calls) == [f"TCP-LISTEN:{p},bind=127.0.0.1,fork,reuseaddr "
+                                 f"PROXY:127.0.0.1:localhost:{p},proxyport=3128,proxyauth=user:pw"
+                                 for p in (40001, 40002)]
     log.unlink(missing_ok=True)
     out = subprocess.run(["bash", "-c", '. "$1"', "sh", str(SCRIPT)], capture_output=True, text=True, timeout=60,
                          env={**base, NETNS_ENV: "net:[1]", "HTTPS_PROXY": "http://proxy.example.com:3128"})
