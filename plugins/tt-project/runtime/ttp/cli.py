@@ -2237,8 +2237,10 @@ def _note_to(a, run_dir: str) -> None:
             die(f"unknown project {a.to}: not on this machine (`ttp list`), "
                 + (f"nor on the machines notes are sent on to: {'; '.join(checked)}" if checked
                    else "and there is no other machine to ask (`ttp upstream --forward-status`)") + how)
+    # A reply is marked with the note it answers (upstream.reply_text): its id and every copy keep it.
+    reply = upstream._check_fp(a.reply) if getattr(a, "reply", None) else None
     try:
-        text = upstream.note_text(a.text)
+        text = upstream.note_text(upstream.reply_text(a.text, reply))
         upstream.check_placeholder(text)
     except upstream.NoteTooLong as e:
         die(f"not sent: {e}. Nothing was filed or cut. Shorten it, with the question or request first, "
@@ -2253,11 +2255,12 @@ def _note_to(a, run_dir: str) -> None:
     try:
         got, place = upstream.send_or_queue(me.state, me.name, int(task) if task.isdigit() else None, a.to,
                                             text, a.severity, at=at, back=back,
-                                            confirms=getattr(a, "confirms", None))
+                                            confirms=getattr(a, "confirms", None), reply_to=reply)
     except OSError as e:
         # A sandbox that cannot write the inbox (read-only home): the run's directory keeps the note,
         # and this project's daemon files it when the run ends (upstream.send_queued).
-        upstream.queue(Path(run_dir), a.to, text, a.severity, at=at, back=back, confirms=getattr(a, "confirms", None))
+        upstream.queue(Path(run_dir), a.to, text, a.severity, at=at, back=back, confirms=getattr(a, "confirms", None),
+                       reply_to=reply)
         print(f"note for {a.to} queued in this run's directory ({e.strerror or e}); this project's daemon files "
               f"it in its inbox as {upstream.note_id(a.to, text)} when the run ends{sent}")
         return

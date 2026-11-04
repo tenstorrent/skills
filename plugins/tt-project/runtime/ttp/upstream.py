@@ -246,7 +246,7 @@ class NotePlaceholder(ValueError):
 
 def check_placeholder(text: str) -> None:
     """Raise NotePlaceholder for a template placeholder left in a worker's note (`_PLACEHOLDER_RES`)."""
-    bare = re.sub(r"`[^`]*`", " ", str(text))
+    bare = re.sub(r"`[^`]*`", " ", _REPLY_RE.sub("", str(text), count=1))
     m = _PLACEHOLDER_RES[0].search(bare)
     if m:
         raise NotePlaceholder(m.group(0))
@@ -269,14 +269,33 @@ def receipt(text: str) -> str:
     return f"{len(text)} characters, sha256 {hashlib.sha256(text.encode()).hexdigest()[:12]}"
 
 
-def note_id(to: str, text: str) -> str:
+def note_id(to: str, text: str, reply_to: str | None = None) -> str:
     """The id (`fp`) of the inbox entry `send` files, or found already there, for this note."""
-    return fingerprint(f"to:{to}", note_text(text))
+    return fingerprint(f"to:{to}", note_text(reply_text(text, reply_to)))
+
+
+_REPLY_RE = re.compile(r"^\[reply to note ([0-9a-f]{16})\] ")
+
+
+def reply_text(text: str, reply_to: str | None) -> str:
+    """`text` as a reply to note `reply_to` (`ttp note --reply`) is stored: marked at its start, so its
+    id (`note_id`) and every copy of it (queued, outbox, inbox, forwarded, on any version) keep the note
+    it answers, and the same words to two notes are two replies. No `reply_to`, or marked: `text`."""
+    text = " ".join(str(text).split())
+    fp = _confirms(reply_to)
+    return text if not fp or reply_of(text) == fp else f"[reply to note {fp}] {text}"
+
+
+def reply_of(text) -> str | None:
+    """The note a note's text answers (`reply_text`), or None."""
+    m = _REPLY_RE.match(str(text or ""))
+    return m.group(1) if m else None
 
 
 def send(source: str, task: int | None, to: str, text: str, severity: str = "normal",
          now: float | None = None, sender: str = "worker", at: str | None = None,
-         extra: dict | None = None, back: str | None = None, confirms: str | None = None) -> str:
+         extra: dict | None = None, back: str | None = None, confirms: str | None = None,
+         reply_to: str | None = None) -> str:
     """File a worker's note for project `to` in this machine's inbox. Returns "sent", "duplicate" (the
     same text to the same project is already there at the same or a higher severity, or this task's note
     naming the same note ids, `_repeat`) or "limited" (`source` filed NOTES_PER_HOUR
@@ -286,10 +305,12 @@ def send(source: str, task: int | None, to: str, text: str, severity: str = "nor
     (machine_ledger.py); such a page is not limited and does not count against the workers' notes, and
     `extra` (a daemon's only) adds fields such as an `outage` record (outagetask.py) the target files.
     `confirms`: the fingerprint of a note `to` resolved, which this note only confirms (`confirmation`).
-    The same text at a higher severity than the note filed is an escalation (`escalate`): "sent"."""
+    The same text at a higher severity than the note filed is an escalation (`escalate`): "sent".
+    `reply_to`: the note this one answers (`reply_text`), part of its id."""
     now = now or time.time()
     # A daemon's page is cut, saying so; a worker's note past the limit raises (`note_text`).
-    text = note_text(cut(" ".join(str(text).split()), "the source daemon's log") if sender == "daemon" else text)
+    text = note_text(cut(" ".join(str(text).split()), "the source daemon's log") if sender == "daemon"
+                     else reply_text(text, reply_to))
     title = f"note to {to}"
     fp = note_id(to, text)
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
@@ -315,6 +336,7 @@ def send(source: str, task: int | None, to: str, text: str, severity: str = "nor
                              "from": "daemon" if sender == "daemon" else "worker", "to": to, "severity": severity if severity in NOTE_SEVERITIES
                              else "normal", "title": title, "spec": text, "fp": fp, **({"at": at} if at else {}),
                              **({"back": back} if back and not at else {}),
+                             **({"reply_to": reply_of(text)} if reply_of(text) else {}),
                              **({"confirms": _confirms(confirms)} if _confirms(confirms) and sender != "daemon" else {}),
                              **({k: v for k, v in extra.items() if k in ("outage", "page_fp")}
                                 if extra and sender == "daemon" else {})},
@@ -368,16 +390,17 @@ def outbox_pending(state: Path) -> int:
 
 def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str, severity: str = "normal",
                   now: float | None = None, at: str | None = None, back: str | None = None,
-                  confirms: str | None = None) -> tuple[str, int]:
+                  confirms: str | None = None, reply_to: str | None = None) -> tuple[str, int]:
     """`send`, except that a note past the hourly limit, or behind notes already waiting, is appended to
     the project's outbox (state/OUTBOX_FILE) for its daemon to file in order as the limit allows
     (`drain_outbox`): the limit caps how fast notes reach the inbox, never the worker that wrote one.
     Returns ("sent" | "duplicate" | "queued" | "full", the note's place in the outbox or 0).
     The same text at a higher severity raises a waiting note in place, and a filed one at once (`send`)."""
     now = now or time.time()
-    text = note_text(text)
+    text = note_text(reply_text(text, reply_to))
     check_placeholder(text)
     fp = note_id(to, text)
+    reply_to = reply_of(text)
     with _outbox_lock(state):
         waiting = _outbox(state)
         for i, n in enumerate(waiting, 1):
@@ -387,7 +410,7 @@ def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str
                     _rewrite(Path(state) / OUTBOX_FILE, waiting)
                 return "queued", i
         if not waiting or _filed(fp):
-            got = send(source, task, to, text, severity, now, at=at, back=back, confirms=confirms)
+            got = send(source, task, to, text, severity, now, at=at, back=back, confirms=confirms, reply_to=reply_to)
             if got != "limited":
                 return got, 0
         elif repeat_of(state, source, task, to, text, confirms, now, waiting, severity):
@@ -398,7 +421,7 @@ def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str
         durable_append(box, json.dumps(
             {"ts": now, "task": task, "to": to, "text": text, "fp": fp, **({"at": at} if at else {}),
              **({"back": back} if back and not at else {}), **({"confirms": _confirms(confirms)} if _confirms(confirms) else {}),
-             "severity": severity if severity in NOTE_SEVERITIES else "normal"}, sort_keys=True) + "\n")
+             **({"reply_to": reply_to} if reply_to else {}), "severity": severity if severity in NOTE_SEVERITIES else "normal"}, sort_keys=True) + "\n")
         return "queued", len(waiting) + 1
 
 
@@ -406,8 +429,9 @@ _NOTE_ID_RE = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{16}(?![0-9A-Za-z])")
 
 
 def named_notes(text: str, confirms: str | None = None) -> frozenset[str]:
-    """The note ids (16 hex) a note's text names, with the note it confirms (`--confirms`)."""
-    return frozenset(_NOTE_ID_RE.findall(str(text or ""))) | ({_confirms(confirms)} if _confirms(confirms) else set())
+    """The note ids (16 hex) a note's text names, with the note it confirms (`--confirms`); the note it
+    answers (`reply_text`) is not named but compared on its own (`_repeat`)."""
+    return frozenset(_NOTE_ID_RE.findall(_REPLY_RE.sub("", str(text or ""), count=1))) | ({_confirms(confirms)} if _confirms(confirms) else set())
 
 
 def _rank(severity) -> int:
@@ -418,8 +442,8 @@ def _repeat(notes: list[dict], source: str, task: int | None, to: str, text: str
             now: float, severity: str = "normal") -> str | None:
     """The id of a note in `notes` (inbox lines) this one only repeats in other words, or None: one the
     same task of `source` sent `to` within REPEAT_S, naming the same set of note ids (`named_notes`), at
-    the same or a higher severity, with no resolution, regression or wontfix of one of them recorded since.
-    A note naming none, or a new one, or from another task, is never a repeat; nor is an escalation (a
+    the same or a higher severity, answering the same note or none (`reply_of`), with no resolution,
+    regression or wontfix of one of them recorded since. A note naming none, or a new one, or from another task, is never a repeat; nor is an escalation (a
     higher severity than every such note): it asks for attention."""
     ids = named_notes(text, confirms)
     if task is None or not ids:
@@ -429,6 +453,7 @@ def _repeat(notes: list[dict], source: str, task: int | None, to: str, text: str
         ts = float(n.get("ts") or 0)
         if (n.get("project") != source or n.get("task") != task or n.get("to") != to or n.get("from") == "daemon"
                 or not 0 <= now - ts < REPEAT_S or named_notes(n.get("spec"), n.get("confirms")) != ids
+                or reply_of(n.get("spec")) != reply_of(text)
                 or _rank(n.get("severity")) < _rank(severity)):
             continue
         recs = _records() if recs is None else recs
@@ -478,7 +503,8 @@ def drain_outbox(state: Path, source: str, now: float | None = None) -> tuple[in
         while waiting:
             n = waiting[0]
             if send(source, n.get("task"), n["to"], n["text"], str(n.get("severity") or "normal"), now,
-                    at=_at(n), back=_at(n, "back"), confirms=_confirms(n.get("confirms"))) == "limited":
+                    at=_at(n), back=_at(n, "back"), confirms=_confirms(n.get("confirms")),
+                    reply_to=_confirms(n.get("reply_to"))) == "limited":
                 break
             waiting.pop(0)
             filed += 1
@@ -515,12 +541,14 @@ def _confirms(fp) -> str | None:
 
 
 def queue(run_dir: Path, to: str, text: str, severity: str = "normal", at: str | None = None,
-          back: str | None = None, confirms: str | None = None) -> None:
+          back: str | None = None, confirms: str | None = None, reply_to: str | None = None) -> None:
     """Keep a worker's note for project `to` in its run's directory, for a worker whose sandbox cannot
     write the inbox: its daemon files it with `send_queued` when the run ends."""
     check_placeholder(text)
-    line = json.dumps({"to": to, "text": note_text(text), "severity": severity, **({"at": at} if at else {}),
+    text = note_text(reply_text(text, reply_to))
+    line = json.dumps({"to": to, "text": text, "severity": severity, **({"at": at} if at else {}),
                        **({"back": back} if back and not at else {}),
+                       **({"reply_to": reply_of(text)} if reply_of(text) else {}),
                        **({"confirms": _confirms(confirms)} if _confirms(confirms) else {})}, sort_keys=True) + "\n"
     fd = os.open(Path(run_dir) / QUEUED_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
@@ -556,10 +584,10 @@ def send_queued(run_dir: Path, source: str, task: int | None, state: Path | None
         try:
             if state is None:
                 got[send(source, task, to, text, sev, at=_at(n), back=_at(n, "back"),
-                         confirms=_confirms(n.get("confirms")))] += 1
+                         confirms=_confirms(n.get("confirms")), reply_to=_confirms(n.get("reply_to")))] += 1
             else:
                 r = send_or_queue(state, source, task, to, text, sev, at=_at(n), back=_at(n, "back"),
-                                  confirms=_confirms(n.get("confirms")))[0]
+                                  confirms=_confirms(n.get("confirms")), reply_to=_confirms(n.get("reply_to")))[0]
                 got["limited" if r == "full" else r] += 1
         except (NoteTooLong, NotePlaceholder):
             got["invalid"] += 1   # `queue` refuses these: only a line written past it holds one
@@ -1759,6 +1787,7 @@ def _valid(n) -> dict | None:
         up = n.get("escalated")
         out.update({"to": to, "from": "worker", "severity": sev if sev in NOTE_SEVERITIES else "normal",
                     **({"confirms": n["confirms"]} if _confirms(n.get("confirms")) else {}),
+                    **({"reply_to": reply_of(spec)} if reply_of(spec) else {}),
                     **({"escalation": True, "escalated": up if isinstance(up, (int, float)) and not isinstance(up, bool)
                         else time.time()} if n.get("escalation") is True else {})})
     return out

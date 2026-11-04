@@ -1141,3 +1141,81 @@ def test_upstream_fp_adds_the_prefix_a_filed_title_carries_and_files_nothing(env
     assert out.out == filed[0] + "\n", out.out
     assert "a fingerprint only, no note was filed" in out.err, out.err
     assert ("'upstream: test probe'" in out.err) == (title == "test probe"), out.err
+
+
+def test_replies_with_the_same_words_to_two_notes_are_two_linked_notes_on_every_path(env, monkeypatch, capsys):
+    """`ttp note --reply <fp>` marks the reply with the note it answers (`reply_text`), and the mark is part
+    of its id: the same words to two notes are two replies, each linked to its own, filed directly, queued
+    in the run's directory (a read-only sandbox) or in the outbox (the hourly limit), and read so by the
+    project it answers. The same words to the same note stay one; a plain `--to` note keeps its old id;
+    a queued row written before the mark (no `reply_to`) is still filed."""
+    from ttp import cli, upstream
+    src, dst, _ = _confirm_pair(env)
+    a = upstream.send("second", 4, src.name, "is the cache stale?")
+    b = upstream.send("second", 5, src.name, "is the log rotated?")
+    assert (a, b) == ("sent", "sent")
+    fa, fb = (upstream.note_id(src.name, t) for t in ("is the cache stale?", "is the log rotated?"))
+    run_dir = _note_run(env, monkeypatch, src)
+    words = "won't fix: by design, see note 0123456789abcdef"
+    printed = []
+    for fp in (fa, fb, fa):
+        assert _note(cli, "--reply", fp, words) == 0
+        printed.append(re.search(r" as ([0-9a-f]{16})", capsys.readouterr().out).group(1))
+    replies = [n for n in _upstream_inbox(env) if n.get("project") == src.name]
+    assert [n["reply_to"] for n in replies] == [fa, fb], "the second is not a repeat, the third is a duplicate"
+    assert printed == [replies[0]["fp"], replies[1]["fp"], replies[0]["fp"]] and printed[0] != printed[1]
+    assert all(n["spec"] == f"[reply to note {n['reply_to']}] {words}" for n in replies)
+    assert replies[0]["fp"] == upstream.note_id("second", words, fa) != upstream.note_id("second", words)
+    # A plain note: no mark, its id as before.
+    assert _note(cli, "--to", "second", words) == 0
+    plain = _upstream_inbox(env)[-1]
+    assert plain["spec"] == words and "reply_to" not in plain and plain["fp"] == upstream.fingerprint("to:second", words)
+    # The project answered reads each reply linked to its note, also through a forwarded line's check.
+    assert upstream.ingest(dst, dst.config()) == 3
+    texts = [r["text"] for r in dst.db.q("SELECT text FROM events WHERE kind='upstream_note' ORDER BY id")]
+    assert f"[reply to note {fa}] {words}" in texts[0] and f"[reply to note {fb}] {words}" in texts[1]
+    assert upstream._valid(replies[1])["reply_to"] == fb and "reply_to" not in upstream._valid(plain)
+    # A read-only sandbox: the run's queue keeps the target, and the daemon files each reply linked.
+    def ro(*_a, **_k):
+        raise PermissionError(30, "Read-only file system")
+    words2 = "closing as answered"
+    printed, _ = [], capsys.readouterr()
+    with monkeypatch.context() as m:
+        m.setattr(upstream, "send_or_queue", ro)
+        for fp in (fa, fb, fb):
+            assert _note(cli, "--reply", fp, words2) == 0
+            printed.append(re.search(r" as ([0-9a-f]{16})", capsys.readouterr().out).group(1))
+    rows = [json.loads(x) for x in (run_dir / upstream.QUEUED_FILE).read_text().splitlines()]
+    assert [r["reply_to"] for r in rows] == [fa, fb, fb] and len(set(printed)) == 2
+    # A row an older version queued, without the mark, is still filed as it was.
+    with open(run_dir / upstream.QUEUED_FILE, "a") as f:
+        f.write(json.dumps({"to": "second", "text": "an old queued note", "severity": "normal"}) + "\n")
+    got = upstream.send_queued(run_dir, src.name, 57, src.state)
+    assert (got["sent"], got["duplicate"], got["invalid"]) == (3, 1, 0)
+    filed = {n["fp"]: n for n in _upstream_inbox(env)}
+    assert [filed[fp].get("reply_to") for fp in printed] == [fa, fb, fb]
+    assert filed[upstream.fingerprint("to:second", "an old queued note")]["spec"] == "an old queued note"
+    # The outbox keeps the target past the hourly limit, and draining it files each reply linked.
+    now = time.time()
+    for i in range(upstream.NOTES_PER_HOUR):
+        upstream.send(src.name, 200 + i, "second", f"filler {i}", now=now)
+    for fp in (fa, fb, fa):
+        assert upstream.send_or_queue(src.state, src.name, 300, "second", "one more thing", now=now, reply_to=fp)[0] == "queued"
+    assert [n["reply_to"] for n in upstream._outbox(src.state)] == [fa, fb]
+    assert upstream.drain_outbox(src.state, src.name, now + 7200)[0] == 2
+    assert {n["reply_to"] for n in _upstream_inbox(env) if n["spec"].endswith("one more thing")} == {fa, fb}
+
+
+def test_a_reply_mark_is_not_a_named_note_and_never_hides_a_placeholder():
+    """The mark names the note answered, not a note the text is about: a reply naming no note is no
+    repeat of the task's last reply to that note (`named_notes`), and a reply that is only a template
+    placeholder is still refused. A fingerprint that is not 16 hex marks nothing."""
+    from ttp import upstream
+    fp = "0123456789abcdef"
+    marked = upstream.reply_text("thanks", fp)
+    assert marked == f"[reply to note {fp}] thanks" and upstream.reply_text(marked, fp) == marked
+    assert upstream.reply_of(marked) == fp and upstream.named_notes(marked) == frozenset()
+    assert upstream.reply_text("thanks", "../x") == "thanks" and upstream.reply_of("thanks") is None
+    for bad in ('"<text>"', "<reply>"):
+        with pytest.raises(upstream.NotePlaceholder):
+            upstream.check_placeholder(upstream.reply_text(bad, fp))
