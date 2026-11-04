@@ -6809,3 +6809,20 @@ def test_no_shipped_text_states_a_corrected_claim():
             continue
         found += [(rel, n, hit) for n, hit in corrected_claims_in(text)]
     assert found == [], found
+
+
+def test_coordinator_prompt_and_harness_skill_run_approved_work_while_the_charter_paperwork_catches_up():
+    """(e) Once the user's yes (or, in agent mode, the owner's agent's order) is on record, the work it
+    approves is queued at once citing it; a refused charter_update never holds it and is never re-asked."""
+    coordinator = " ".join((PLUGIN / "template" / "prompts" / "coordinator.md").read_text(encoding="utf-8").split())
+    for want in ("Approved work runs at once: once the user's yes (or, with agent mode on, the owner's agent's order) "
+                 "is on record, queue the work it approves in that turn, citing that message; the charter paperwork "
+                 "(`charter_update`) catches up after.",
+                 "A refused `charter_update` never holds approved work and is never re-asked"):
+        assert want in coordinator, want
+    guard = " ".join((SKILLS / "tt-project-harness" / "references" / "charter-guard.md").read_text(
+        encoding="utf-8").split())
+    for want in ("is never refused for its wording or the form of its cite", "runtime `yesask.py`",
+                 "Approved work never waits on this: the coordinator queues it at once citing the approval, and a "
+                 "refused change is never re-asked."):
+        assert want in guard, want

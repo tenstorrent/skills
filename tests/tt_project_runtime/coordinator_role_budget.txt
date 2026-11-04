@@ -39,3 +39,4 @@
 +294: plain replies: answer first, short, what the harness does rather than its internal names (plainreply.py)
 +210: an urgent goal splits into independent tasks that start at once (no chain without a new file or symbol)
 +70: asks and lulls never for inferred neighbours, serving tags or site rules (user msg #1571)
++473: approved work runs at once while a refused charter_update's paperwork catches up (yesask.py repair)
