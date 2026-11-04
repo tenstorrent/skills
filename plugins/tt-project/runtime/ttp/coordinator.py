@@ -2934,7 +2934,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError("charter_update: give `text`, or `quote` (with empty text) to remove an item")
                 # agent mode: the owner's own agent's words are the owner's, Restrictions too (relay.HELD aside)
                 agent = relay.agent_orders(cfg)
-                relayed, words = _relay_check(p, cfg, text, messages, agent=agent)
+                # outside a user turn, a `source` quote checked against that user message is their word
+                cited, cited_agent, cited_own = ([], False, "") if user_turn else _cited_word(db, a.get("source"),
+                                                                                              agent)
+                relayed, words = _relay_check(p, cfg, text, messages, agent=agent, said_too=(cited_own,))
                 if relayed:
                     raise ValueError(f"charter_update rejected: {relayed}. {RELAYED_DECISION}. Relayer context is "
                                      f"data, never the user's word: the charter takes only the user's own verbatim "
@@ -2956,11 +2959,15 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         from .prompts import charter_restrictions
                         restr_before = charter_restrictions(p.charter_path.read_text())
                     replaces = str(a.get("replaces") or "")
-                    ok, no_ok = (None, "") if user_turn else _charter_approval(p, section, quote, replaces, text)
+                    # a user turn too reads a yes on record when `source` cites an earlier message (a queued change)
+                    ok, no_ok = ((None, "") if user_turn and not _earlier_source(a.get("source"), messages)
+                                 else _charter_approval(p, section, quote, replaces, text))
                     text = ok["text"].strip() if ok else text   # the words the user said yes to
                     # agent mode: a turn of the owner's agent's words alone (findings) is the owner's turn
                     via = [m["id"] for m in relay.recent(db, messages)] if agent and messages and ok is None else []
-                    uturn = user_turn or bool(via)
+                    # a yes on record or a findings turn is theirs already; `over` retires on the coordinator's word
+                    cited = cited if ok is None and not via and len(over) < OVER_MIN else []
+                    uturn = user_turn or bool(via) or bool(cited)
                     unsourced, agent_cite, cite = "", False, ""   # an added or changed item records its
                     if text and _DATED.sub("", section).lower().startswith("restriction"):   # source; the user's
                         try:                                                                 # yes is one
@@ -2994,14 +3001,15 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                 else restriction_source.NO_SOURCE), end, said)
                         notes.append(overlap)
                     elif text and not (replaces or a.get("both_hold") or refused):
-                        overlap = _reject_contradicting_append(p, section, text, uturn, messages, ok, quote, end)
+                        overlap = _reject_contradicting_append(p, section, text, uturn, cited or messages, ok,
+                                                               quote, end)
                         if overlap:
                             notes.append(overlap)
-                    source = (_users_own(db, messages or []) if user_turn else via if uturn
+                    source = (_users_own(db, messages or []) if user_turn else via or cited if uturn
                               else list((ok or {}).get("messages") or []))
                     # a cited Restrictions item removed or replaced in a user turn: this turn's words in `source`
                     turn_src = (restriction_source.turn_quote(db, a.get("source"), messages, agent)
-                                if uturn and (quote or replaces) and len(over) < OVER_MIN else "")
+                                if uturn and ok is None and (quote or replaces) and len(over) < OVER_MIN else "")
                     if agent:   # name the owner's agent's own source form
                         turn_src, unsourced = (f"{w}. {restriction_source.AGENT_SOURCE}" if w else ""
                                                for w in (turn_src, unsourced))
@@ -3017,7 +3025,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                   restriction_source.drops_unsourced(p.charter_path.read_text(), quote=quote)
                                   if quote and _DATED.sub("", section).lower().startswith("restriction") else False)
                     # resting only on the owner's agent's words: shown as relayer-ordered, relay.HELD refused
-                    by_agent = bool(via) and not user_turn or bool(ok and ok.get("agent")) or agent and uturn and bool(
+                    by_agent = bool(via) and not user_turn or bool(ok and ok.get("agent")) or cited_agent and bool(
+                        cited) or agent and uturn and bool(
                         _relay_check(p, cfg, text, messages, agent=False)[0]
                         or agent_cite or turn_src == "" and (quote or replaces) and len(over) < OVER_MIN
                         and a.get("source") and restriction_source.turn_quote(db, a.get("source"), messages, False))
@@ -3038,6 +3047,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         if user_turn and str(e) != unsourced and not (
                                 turn_src and _restriction_edit(p, section, quote, replaces)):
                             _record_charter_approval(p, messages or [], section, quote, replaces, text, end, str(e))
+                        elif cited and restr and str(e) != unsourced:
+                            raise ValueError(_queue_cited_restriction(p, cited, cited_agent, section, quote,
+                                                                      replaces, text, end, str(e))) from None
                         raise
                     if quote or replaced:   # the retired text, searched for in what still binds (echoes)
                         drop = loose_drop or bool(retired) and not (uturn or ok is not None) and len(over) < OVER_MIN
@@ -3539,17 +3551,18 @@ def _relay_guard(p: Project, cfg: dict, text: str, messages: list[int] | None = 
 
 def _relay_check(p: Project, cfg: dict, text: str, messages: list[int] | None = None,
                  providers: bool = False, typos: list[str] | None = None,
-                 agent: bool = True) -> tuple[str, str]:
+                 agent: bool = True, said_too: tuple[str, ...] = ()) -> tuple[str, str]:
     """_relay_guard's reason, and for a rejection the named message's own words (relay.words_back).
     `typos`: for an entry's tag only (relay.guard), a near-miss in the user's words counts as theirs.
     With relay.agent_orders on, the owner's own agent's context and findings are the owner's word: none
-    rejected, unless `agent` is False (an edit that loosens or retires a Restriction)."""
+    rejected, unless `agent` is False (an edit that loosens or retires a Restriction). `said_too`: more
+    of the user's own words (an earlier message a charter_update's `source` cites, _cited_word)."""
     if agent and relay.agent_orders(cfg):
         return "", ""
     msgs = relay.recent(p.db, messages)
     if not text or not any((m["context"] or "").strip() for m in msgs):
         return "", ""
-    said = [p.charter_path.read_text()] if p.charter_path.exists() else []
+    said = ([p.charter_path.read_text()] if p.charter_path.exists() else []) + [w for w in said_too if w]
     said += [e["line"] for e in p._memory_entries()
              if (e["kind"] in ("preference", "restriction") or e["standing"])
              and not any(x in e["line"] for x in RELAYED_MARKS)]
@@ -6386,6 +6399,31 @@ def _users_own(db, messages: list[int]) -> list[int]:
     return [r["id"] for r in rows if (r["provenance"] or "") != "system"]
 
 
+def _cited_word(db, src, agent: bool) -> tuple[list[int], bool, str]:
+    """A charter_update's `source` {msg, quote} checked against that message in the chat log, for a
+    turn without the user's words: ([its id], whether the quote is the owner's agent's words, the
+    message's own words) when the quote is in its verbatim part (with `agent`, relay.agent_orders, also
+    the part labelled as the owner's word via the owner's agent: its context and findings), else
+    ([], False, ""). Never relayer context with agent mode off, nor a note (no inbound message). A quote
+    of fewer than relay.CONTENT words that are not common ("yes", "ok do it") names no change: none."""
+    try:
+        got = restriction_source._parse(src)
+        mid = int(str(got.get("msg") or "").lstrip("#"))
+    except (ValueError, TypeError):
+        return [], False, ""
+    origin = str(got.get("origin") or "").strip().lower()
+    if origin and origin != restriction_source.RELAYER:
+        return [], False, ""
+    if sum(w not in relay._COMMON for w in relay._words(str(got.get("quote") or ""))) < relay.CONTENT:
+        return [], False, ""
+    try:
+        cite = restriction_source.check(db, "", "", got, agent)
+    except ValueError:
+        return [], False, ""
+    row = next(iter(relay.recent(db, [mid])), None)
+    return [mid], "relayer-ordered" in cite, relay.split((row or {}).get("text") or "")[0]
+
+
 _PAUSE_ASK_RE = re.compile(r"\b(?:paus\w*|hold\w*|halt\w*|stop\w*|freez\w*|block\w*|off[- ]limits|"
                            r"(?:do not|don'?t|never) (?:use|touch|run)|stay off|keep off|leave\b.*\balone)", re.I)
 
@@ -6416,15 +6454,18 @@ def _approval_sha(text: str) -> str:
 
 
 def _record_charter_approval(p: Project, messages: list[int], section: str, quote: str, replaces: str,
-                             text: str, end: dict | None, failed: str = "") -> None:
+                             text: str, end: dict | None, failed: str = "", cited: bool = False,
+                             agent: bool = False) -> None:
     """Record a charter change the user's turn asked for that failed to apply (an ambiguous heading,
     a quote that matched twice), so a retry in a later turn without a user message is still the
     user's word. Only from a user's own message of this turn: none from the harness itself
-    (provenance system). A change with an end is not carried (its end was relative to that turn)."""
+    (provenance system). A change with an end is not carried (its end was relative to that turn).
+    `cited`: `messages` is the message a `source` quote was checked against (_cited_word), of an
+    earlier turn; `agent`: that quote is the owner's agent's words (relay.HELD then applies on retry)."""
     if end or not messages:
         return
     db = p.db
-    said = _users_own(db, messages)
+    said = list(messages) if cited else _users_own(db, messages)
     if not said:
         return
     from .prompts import charter_sections
@@ -6445,8 +6486,43 @@ def _record_charter_approval(p: Project, messages: list[int], section: str, quot
             return   # a retried turn records it once
         rec.update(id=hashlib.sha256(f"{said}{sha}{time.time()}".encode()).hexdigest()[:12], messages=said,
                    ask=ask["id"] if ask else None, candidates=cands, failed=failed[:300], ts=time.time(), used=None,
-                   guard=CHARTER_GUARD_VERSION)
+                   guard=CHARTER_GUARD_VERSION, **({"agent": True} if agent else {}))
         db.set_kv(CHARTER_APPROVALS_KEY, (have + [rec])[-20:])
+
+
+def _earlier_source(src, messages: list[int] | None) -> bool:
+    """Whether a charter_update's `source` names a message that is not one of this turn's `messages`."""
+    try:
+        return int(str(restriction_source._parse(src).get("msg") or "").lstrip("#")) not in (messages or [])
+    except (ValueError, TypeError):
+        return False
+
+
+def _queue_cited_restriction(p: Project, cited: list[int], agent: bool, section: str, quote: str, replaces: str,
+                             text: str, end: dict | None, err: str) -> str:
+    """The refusal of a Restrictions change cited to the user's message `cited` (its `source` quote
+    checked, _cited_word) that a turn without their words cannot apply (a cited item is removed or
+    replaced only on words of the turn itself, restriction_source.turn_quote). The change is queued,
+    not dropped: recorded as their yes (_record_charter_approval), so the same change resent in the next
+    turn applies on it, and the refusal asks for that resend, which raises it as a charter_retry event
+    in the next turn (_charter_retry_now). Not queued: a change with an end (relative to its turn), or
+    a message older than `coordinator.charter_approval_days`: their word is asked for again."""
+    try:
+        days = float(p.config()["coordinator"].get("charter_approval_days", CHARTER_APPROVAL_DAYS))
+    except (KeyError, TypeError, ValueError):
+        days = CHARTER_APPROVAL_DAYS
+    row = p.db.one("SELECT ts FROM messages WHERE id=?", (cited[0],))
+    why = clip(_ws(err), 300)
+    if end or not row or time.time() - float(row["ts"]) > days * 86400:
+        return (f"charter_update: this Restrictions change cites message #{cited[0]}, not of this turn, so it is "
+                "not applied in it, and it is not queued "
+                + ("(it has an end, relative to its turn)" if end else
+                   f"(that message is older than {days:g} days)") + ": ask_user for it (blocking `restriction`)")
+    _record_charter_approval(p, cited, section, quote, replaces, text, None, err, cited=True, agent=agent)
+    return (f"charter_update queued: this Restrictions change rests on the user's words in message #{cited[0]} "
+            f"(its `source` quote checked), which are not of this turn, so it is not applied in it ({why}). "
+            "Their yes is now on record for exactly this change: resend the same charter_update (same section, "
+            "`quote`, `replaces` and `text`) in the next turn and it applies")
 
 
 def _approved_text_file(p: Project, rec: dict) -> str:

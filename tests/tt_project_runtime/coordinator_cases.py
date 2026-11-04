@@ -2152,10 +2152,13 @@ def test_a_restrictions_section_replaced_with_looser_words_names_the_tools_of_th
     assert coord.apply(p, [{**looser, "text": f"* {item}\n* {keep}"}], turn=42, user_turn=True,
                        messages=msgs) == []
     assert tools() == []
-    # (c) outside the user's word, with no `over`: refused, the charter as it was, nothing named.
+    # (c) outside the user's turn, with no `over`: not applied, the charter as it was, nothing named;
+    # its `source` quotes the user's logged words, so it is queued for the next turn (dropped here).
     p.charter_path.write_text(base)
-    assert coord.apply(p, [looser], turn=43, user_turn=False)
+    err = coord.apply(p, [looser], turn=43, user_turn=False)
+    assert len(err) == 1 and "charter_update queued" in err[0], err
     assert p.charter_path.read_text() == base and tools() == []
+    p.db.set_kv(coord.CHARTER_APPROVALS_KEY, [])
     # `over` retiring the section: the loosened item's tool is named, with the end that passed.
     over = "the serving fleet was retired on 2026-10-01, so the rule's case is gone"
     assert coord.apply(p, [{**looser, "over": over}], turn=44, user_turn=False) == []
@@ -3814,6 +3817,118 @@ def test_a_duty_that_shares_words_with_bans_and_loosens_nothing_is_not_refused(e
         assert text in " ".join(p.charter_path.read_text().split())
     assert not coord._may_lift("A harness upgrade can never be blocked.")
     assert coord._may_lift("Workers may push to main.")
+
+
+
+_HOLD_CHARTER = ("# demo\n\n## Goals\nShip it.\n\n## Restrictions\n"
+                 "- Never power cycle the demo box while the user holds it (user msg #1).\n\n"
+                 "## Policies\nReview first.\n")
+_RELEASE = "the demo box is released from my hold, power cycle it routinely tonight"
+_CYCLE_GOAL = "Power cycle the demo box tonight: the user released it from their hold."
+
+
+def test_a_charter_update_quoting_a_users_message_passes_in_a_turn_without_their_words(env):
+    """Replays a gate miss: a user's message released a box from their hold and ordered a power cycle; the
+    coordinator wrote the matching goal in a relayer-findings turn, and the gate took it as the
+    coordinator's own text (only 'loosens no Restriction' would pass). A `source` quote checked against
+    that message in the chat log makes it the user's word in any turn."""
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    p.charter_path.write_text(_HOLD_CHARTER)
+    said = db.post("in", _RELEASE, chat=None, channel="web", kind="user", provenance="web-session")
+    found = db.post("in", "", chat=None, kind="finding", context="The demo box shows no tenant since noon.")
+    goal = {"type": "charter_update", "section": "Goals", "text": _CYCLE_GOAL}
+    # No source: the coordinator's own text, refused while it shares the item's action and object.
+    err = coord.apply(p, [goal], turn=1, messages=[found])
+    assert len(err) == 1 and "contradicts the Restrictions item" in err[0], err
+    # Quoting the user's message verbatim (JSON text or an object): it goes in, cited to that message.
+    for turn, src in ((2, json.dumps({"msg": said, "quote": "released from my hold, power cycle it"})),
+                      (3, {"msg": f"#{said}", "quote": "Released from my HOLD,  power cycle it"})):
+        p.charter_path.write_text(_HOLD_CHARTER)
+        assert coord.apply(p, [{**goal, "source": src}], turn=turn, messages=[found]) == []
+        assert _CYCLE_GOAL in p.charter_path.read_text()
+        assert f"user message #{said}" in (p.harness / coord.CHARTER_HISTORY).read_text().split("### ")[-1]
+    assert "Never power cycle the demo box" in p.charter_path.read_text()
+
+
+def test_a_charter_update_quote_that_is_not_the_users_verbatim_word_is_refused(env):
+    """A `source` quote outside a user turn counts only once it is in the cited message's verbatim part:
+    not a mismatch, not a relayer's context or findings (agent mode off), not a note, a harness
+    message or a quote too short to name a change. With agent mode on, the owner's agent's part counts."""
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    p.charter_path.write_text(_HOLD_CHARTER)
+    said = db.post("in", "please look at the demo box", chat=None, channel="web", kind="user",
+                   provenance="web-session", context=_RELEASE)
+    found = db.post("in", "", chat=None, kind="finding", context=_RELEASE)
+    harness = db.post("in", _RELEASE, chat=None, channel="system", kind="user", provenance="system")
+    note = db.post("out", _RELEASE, chat=None, kind="reply")
+    yes = db.post("in", "yes do it", chat=None, channel="web", kind="user", provenance="web-session")
+    goal = {"type": "charter_update", "section": "Goals", "text": _CYCLE_GOAL}
+    for src in ({"msg": said, "quote": "released from my hold, power cycle it"},   # relayer context only
+                {"msg": said, "quote": "please power cycle the demo box"},          # not its words
+                {"msg": found, "quote": "released from my hold, power cycle it"},   # findings
+                {"msg": harness, "quote": "released from my hold, power cycle it"},  # the harness's own
+                {"msg": note, "quote": "released from my hold, power cycle it"},     # outbound
+                {"msg": 9999, "quote": "released from my hold, power cycle it"},     # no such message
+                {"msg": yes, "quote": "yes do it"},                                   # names no change
+                {"origin": "brief", "msg": said, "quote": "please look at the demo box"},
+                "not json"):
+        err = coord.apply(p, [{**goal, "source": src}], turn=1, messages=[found])
+        assert len(err) == 1 and "contradicts the Restrictions item" in err[0], (src, err)
+        assert _CYCLE_GOAL not in p.charter_path.read_text()
+    own = db.post("in", "orders from my agent count as mine", chat=None, channel="web", kind="user",
+                  provenance="web-session")
+    assert coord.apply(p, [{"type": "config_set", "key": coord.relay.AGENT_KEY, "value": True}], turn=2,
+                       user_turn=True, messages=[own]) == [] and coord.relay.agent_orders(p.config())
+    for turn, mid in ((3, said), (4, found)):   # the owner's agent's part, in agent mode
+        p.charter_path.write_text(_HOLD_CHARTER)
+        assert coord.apply(p, [{**goal, "source": {"origin": "relayer", "msg": mid,
+                                                   "quote": "released from my hold, power cycle it"}}],
+                           turn=turn, messages=[]) == []
+        assert _CYCLE_GOAL in p.charter_path.read_text()
+        assert db.one("SELECT 1 FROM events WHERE kind=?", (coord.relay.ORDERED_KIND,)), "not logged as ordered"
+
+
+def test_a_restrictions_change_cited_to_a_user_message_outside_their_turn_is_queued_not_dropped(env):
+    """A cited Restrictions item is removed or replaced only on words of the turn itself. Cited to an
+    earlier user message (its quote checked) in a turn without their words, the change is queued: their
+    yes recorded for it and a charter_retry event raised, so the same change resent next turn applies."""
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    p.charter_path.write_text(_HOLD_CHARTER)
+    said = db.post("in", _RELEASE, chat=None, channel="web", kind="user", provenance="web-session")
+    item = "Never power cycle the demo box while the user holds it (user msg #1)."
+    lift = {"type": "charter_update", "section": "Restrictions", "quote": item, "text": "",
+            "source": json.dumps({"msg": said, "quote": "the demo box is released from my hold"})}
+    # A mismatched quote is refused as before, and nothing is queued for it.
+    err = coord.apply(p, [{**lift, "source": {"msg": said, "quote": "lift every hold on every box"}}], turn=0)
+    assert len(err) == 1 and "needs the user's word" in err[0], err
+    assert not db.q("SELECT 1 FROM events WHERE kind='charter_retry'")
+    err = coord.apply(p, [lift], turn=1, messages=[])
+    assert len(err) == 1 and "charter_update queued" in err[0] and f"message #{said}" in err[0], err
+    assert item in p.charter_path.read_text(), "applied outside the user's turn"
+    retry = db.q("SELECT text FROM events WHERE kind='charter_retry' AND status='queued'")
+    assert len(retry) == 1 and "resend the same charter_update" in retry[0]["text"], retry
+    # The next turn (here one of an unrelated user message, then one without) resends it: it applies, once.
+    other = db.post("in", "how is the build going", chat=None, channel="web", kind="user", provenance="web-session")
+    assert coord.apply(p, [lift], turn=2, user_turn=True, messages=[other]) == []
+    assert item not in p.charter_path.read_text()
+    p.charter_path.write_text(_HOLD_CHARTER)
+    err = coord.apply(p, [lift], turn=3, messages=[])
+    assert len(err) == 1 and "charter_update queued" in err[0], "a used yes applied twice"
+    assert item in p.charter_path.read_text()
+    p.db.set_kv(coord.CHARTER_APPROVALS_KEY, [])
+    # A message older than the approval window is not queued: the user is asked again.
+    db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 30 * 86400, said))
+    p.charter_path.write_text(_HOLD_CHARTER)
+    err = coord.apply(p, [{**lift, "source": {"msg": said, "quote": "the demo box is released"
+                                                                    " from my hold, power cycle it"}}], turn=5)
+    assert len(err) == 1 and "not queued" in err[0] and "ask_user" in err[0], err
+    assert item in p.charter_path.read_text()
 
 
 
