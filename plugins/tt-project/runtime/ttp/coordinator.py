@@ -217,7 +217,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "heal": HEAL_SCHEMA, "pr_branch": {"type": "string"},
             "wake_now": {"anyOf": [{"type": "boolean"}, {"type": "string", "enum": list(bud.TIER_ORDER)}]},
             "owners": {"type": "array", "items": {"type": "integer"}}, "evidence": {"type": "string"},
-            "milestone": {"type": "string"}, "promise": {"type": "string"},
+            "milestone": {"type": "string"}, "promise": {"type": "string"}, "justify": {"type": "string"},
             "delivers": {"type": "array", "items": {"type": "string"}},
             "milestones": {"type": "array", "items": {"type": "object", "properties": {
                 "key": {"type": "string", "pattern": r"^[a-zA-Z0-9_-]{1,64}$"},
