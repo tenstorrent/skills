@@ -185,7 +185,7 @@ def _push_lock(p, name="push:origin%2Fmain", age_s=0.0, pid=None):
     return f
 
 
-def _gone_pid():
+def _exited_pid():
     child = subprocess.Popen(["true"])
     child.wait()
     return child.pid
@@ -195,7 +195,7 @@ def test_a_push_lock_whose_holder_process_is_gone_does_not_hold_the_upgrade(env,
     """A process that inherited a push's lock file keeps it taken after the push died: that holds nothing."""
     from ttp import release
     p, d, launches = _release_daemon(env, monkeypatch)
-    f = _push_lock(p, "push:run-x", pid=_gone_pid())
+    f = _push_lock(p, "push:run-x", pid=_exited_pid())
     try:
         assert release.live_pushes(p) == [] and release.hold_reason(p, release.drift(p)) == ""
         d.check_release()
