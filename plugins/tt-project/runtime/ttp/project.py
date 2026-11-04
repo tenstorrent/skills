@@ -632,7 +632,8 @@ def _known_keys(path: list[str]) -> set[str] | None:
         # suite's most workers, only lowering the account's (testslots.sizes);
         # stall_s: a running check's log silence that makes it stalled (checkstall.stall_s);
         # push_load_wait_s: push checks' longest wait under the load guard (testslots.push_load_wait_s).
-        return {"nice", "ionice", "wall_cap_s", "wrap_cmd", "wrap_lane", "fallback_lane", "no_device_cmds", "slots", "light_cmds", "max_wait_s", "wait_event_s",
+        # wrap_needs_device: false says the commands behind wrap_cmd need no device, so they may spill (checkspill).
+        return {"nice", "ionice", "wall_cap_s", "wrap_cmd", "wrap_lane", "wrap_needs_device", "fallback_lane", "no_device_cmds", "slots", "light_cmds", "max_wait_s", "wait_event_s",
                 "wait_escalate_s", "wait_hang_factor", "priority_age_s", "test_project_max", "test_project_slots",
                 "test_project_workers", "test_run_max",
                 "done_holder_flag_s", "done_holder_grace_s", "stall_s", "push_load_wait_s"}
@@ -974,8 +975,8 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     if delivery.get("checks_host") not in (None, ""):
         from .remotecheck import host_problem
         out += [f"delivery.checks_host: {p}" for p in [host_problem(delivery["checks_host"])] if p]
-    from .checkspill import problems as spill_problems
-    out += spill_problems(delivery)
+    from .checkspill import problems as spill_problems, wrap_problems
+    out += spill_problems(delivery) + wrap_problems(raw.get("checks"))
     out += bump_problems(delivery.get("version_bump"))
     coord = raw.get("coordinator")
     if isinstance(coord, dict) and "cache_ttl" in coord and not str(coord["cache_ttl"] or "").strip():
@@ -2593,7 +2594,10 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_sp
                            "test_project_max", "test_project_slots", "test_project_workers", "load_guard", "build_pool", "build_run_max", "build_project_max", "wall_cap_s",
                            "slots", "light_cmds", "max_wait_s", "wait_event_s", "priority_age_s",
                            "wait_escalate_s", "wait_hang_factor", "done_holder_flag_s", "done_holder_grace_s", "stall_s", "starve_s",
-                           "push_load_wait_s"}}
+                           "push_load_wait_s",
+                           "spill_hosts"}}   # the spill pool every project's checks may use (checkspill.account_hosts)
+# Account keys a run may only clear (ttp config --account refuses setting them inside a run).
+ACCOUNT_USER_ONLY = {"checks.spill_hosts"}
 
 
 def layered(raw: dict) -> dict:

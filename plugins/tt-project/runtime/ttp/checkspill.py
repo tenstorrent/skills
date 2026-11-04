@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Checks that spill to other machines when this one's check slots are busy: `delivery.checks_spill_hosts`.
 
-A project may list, in order, the ssh aliases of other machines its checks may run on. Unset or
-empty, checks never leave this machine. A `ttp checks` run that has waited `delivery.checks_spill_after_s`
+A project may list, in order, the ssh aliases of other machines its checks may run on. The account's
+pool, `checks.spill_hosts` in the account settings (`ttp config --account checks.spill_hosts '["pool-a"]'`,
+which a run may only clear), follows that list in every project on this machine, so each spills
+without a list of its own. A project's own empty list (`[]`) keeps its checks here, the pool too;
+with neither, checks never leave this machine. A `ttp checks` run that has waited `delivery.checks_spill_after_s`
 (default SPILL_AFTER_S) for a slot here (its project's lane, a host-wide checks slot, test-worker
 slots) tries the listed hosts in order and runs on the first that is allowed, reachable and has a
 free slot, as a check with a check host does (remotecheck: a copy of exactly the commit, its output
@@ -11,7 +14,8 @@ streamed back). With none, it keeps its place in the queue here and tries them a
 bound. The run says where it went, checks.json records it (`hosts`, `spilled_to`), and `ttp status`
 and `ttp checks status` show it while it runs (status_lines).
 
-Allowed: named in the project's charter and in the user's machines list (not retired), and not
+Allowed: named in the project's charter (a host of the account's pool needs no charter line: the
+account setting is the user's word for every project) and in the user's machines list (not retired), and not
 paused (a pause of its alias, or a fleet hold of the machine), and its machine lock (`ttp lock <alias>`)
 neither held nor reserved by anyone else. The run holds that lock while it runs, shared where the
 resource allows it (several spilled checks share it; an exclusive holder or waiter keeps them off),
@@ -25,8 +29,10 @@ counted by neither, so the host can take one run more than its slots in that gap
 
 Only a run whose every check would run here spills: none with a host of its own (`host`,
 delivery.checks_host), none run in the authoring worktree ("cwd": "authoring"), none behind
-checks.wrap_cmd (the project's lock or queue wrapper, which may hold a device or a machine here), and
-never a light run (it never waits). A run that does not pass on a spill host runs again here (OFF_ENV):
+checks.wrap_cmd (the project's lock or queue wrapper, which may hold a device or a machine here) unless
+the project says its wrappers need no device (`checks.wrap_needs_device: false`; unset or true: the
+need is unknown or real, so it stays here; on a spill host it runs without the wrapper, which is this
+machine's), and never a light run (it never waits). A run that does not pass on a spill host runs again here (OFF_ENV):
 a spill host's own environment never fails a change, only a pass there counts.
 """
 from __future__ import annotations
@@ -43,6 +49,8 @@ from typing import Any
 from . import remotecheck
 
 KEY = "checks_spill_hosts"
+ACCOUNT_KEY = "checks.spill_hosts"   # the account's pool (project.ACCOUNT_KEYS), after a project's own list
+NO_DEVICE_KEY = "wrap_needs_device"   # checks.wrap_needs_device false: a wrapped run needs no device and may spill
 AFTER_KEY = "checks_spill_after_s"
 SPILL_AFTER_S = 60.0
 OFF_ENV = "TTP_CHECKS_NO_SPILL"   # set for the local rerun of a run that did not pass on a spill host
@@ -94,12 +102,48 @@ def problems(delivery: dict) -> list[str]:
     return out
 
 
-def hosts(cfg: dict | None) -> list[str]:
-    """The project's spill hosts in order; [] when unset or malformed (config_problems names it)."""
+def account_hosts() -> list[str]:
+    """The account's pool (checks.spill_hosts in the account settings) in order; [] when unset or malformed."""
+    from . import project
     try:
-        return hosts_of(((cfg or {}).get("delivery") or {}).get(KEY) or [])
+        return hosts_of((project.load_account_settings().get("checks") or {}).get("spill_hosts") or [])
     except ValueError:
         return []
+
+
+def hosts(cfg: dict | None) -> list[str]:
+    """The project's spill hosts in order, then the account's pool; [] when the project's own list is
+    empty (it keeps its checks here) or malformed (config_problems names it)."""
+    own = ((cfg or {}).get("delivery") or {}).get(KEY)
+    try:
+        mine = hosts_of(own) if own is not None else []
+    except ValueError:
+        return []
+    if own is not None and not mine:
+        return []
+    return list(dict.fromkeys([*mine, *account_hosts()]))
+
+
+def _source(cfg: dict | None, alias: str) -> str:
+    """Which setting lists `alias`: the project's own list, else the account's pool."""
+    try:
+        own = hosts_of(((cfg or {}).get("delivery") or {}).get(KEY) or [])
+    except ValueError:
+        own = []
+    return f"delivery.{KEY}" if alias in own else f"{ACCOUNT_KEY}, the account's pool"
+
+
+def wrapped_ok(cfg: dict | None) -> bool:
+    """Whether the project says the commands behind its wrappers need no device (checks.wrap_needs_device
+    false); unset, true or anything else: unknown, so a wrapped run stays here."""
+    checks = (cfg or {}).get("checks")
+    return isinstance(checks, dict) and checks.get(NO_DEVICE_KEY) is False
+
+
+def wrap_problems(checks: Any) -> list[str]:
+    """Config check of checks.wrap_needs_device."""
+    v = checks.get(NO_DEVICE_KEY) if isinstance(checks, dict) else None
+    return [] if v is None or isinstance(v, bool) else [f"checks.{NO_DEVICE_KEY}: {v!r} is not true or false"]
 
 
 def after_of(v: Any) -> float:
@@ -119,11 +163,14 @@ def after_s(cfg: dict | None) -> float:
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else SPILL_AFTER_S
 
 
-def spillable(cmds: list) -> bool:
-    """Whether every check of `cmds` would run on this machine, unwrapped, in a clean checkout."""
+def spillable(cmds: list, cfg: dict | None = None) -> bool:
+    """Whether every check of `cmds` would run on this machine, in a clean checkout, and unwrapped unless
+    `cfg` says its wrappers need no device (wrapped_ok)."""
     from . import cleantree, push
+    wrapped = wrapped_ok(cfg)
     return bool(cmds) and all(not push.remote_host(c) and getattr(c, "host", "") != remotecheck.LOCAL
-                              and not cleantree.authoring(c) and not getattr(c, "wrap", ()) for c in cmds)
+                              and not cleantree.authoring(c) and (wrapped or not getattr(c, "wrap", ()))
+                              for c in cmds)
 
 
 def _charter_names(p, alias: str) -> bool:
@@ -142,7 +189,7 @@ def allowed(p, cfg: dict, alias: str) -> str:
         return "not in the machines list (ttp machines add)"
     if machines.retired(known.get(alias)):
         return "retired in the machines list"
-    if not _charter_names(p, alias):
+    if not _charter_names(p, alias) and alias not in account_hosts():
         return "not named in the charter"
     if (held := lockprobe.pause(p, cfg, alias)) is not None:
         return f"paused{': ' + str(held.get('reason')) if isinstance(held, dict) and held.get('reason') else ''}"
@@ -263,7 +310,7 @@ def pick(p, cfg: dict, tell, what: str = "") -> Claim | None:
                 skipped.append(f"{alias} (busy: its lock was taken just now)")
                 continue
             tell(f"spilling to {alias}: the slots here stayed busy for {after_s(cfg):g} s "
-                 f"(delivery.{KEY}); the checks run there on a copy of the commit"
+                 f"({_source(cfg, alias)}); the checks run there on a copy of the commit"
                  + (f"; skipped: {'; '.join(skipped)}" if skipped else ""))
             return got
         skipped.append(f"{alias} ({why or 'this machine holds its free slots'})")

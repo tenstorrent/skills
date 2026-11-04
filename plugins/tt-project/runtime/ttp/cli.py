@@ -38,7 +38,7 @@ from .devq import unmask_devices
 from . import chatgone, checkwait, scriptwatch, sshcmd, timefmt, workerloss
 from . import schedule as sched
 from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
-                      durable_append, durable_write, write_json, ACCOUNT_KEYS, DEFAULT_CONFIG, deep_merge,
+                      durable_append, durable_write, write_json, ACCOUNT_KEYS, ACCOUNT_USER_ONLY, DEFAULT_CONFIG, deep_merge,
                       load_account_settings, set_account_setting, zombie, device_timeout_max, command_env,
                       NOTE_RUN_ENV, in_run, replace_copy, sync_all, MEMORY_AUDIENCES, append_text,
                       open_append_or_null)
@@ -3352,7 +3352,7 @@ def cmd_checks(a) -> None:
         from . import checkjoin, checklane, checkspill
         # A rerun here of checks that did not pass on a spill host never spills again (checkspill).
         no_spill = bool(os.environ.pop(checkspill.OFF_ENV, ""))
-        spill_ok = not no_spill and checkspill.spillable(todo)
+        spill_ok = not no_spill and checkspill.spillable(todo, cfg)
         fresh_ok = not a.fresh
         slot = None
         light = bool(todo) and checklane.all_light(todo, cfg, mine if getattr(a, "light", False) else ())
@@ -8530,9 +8530,15 @@ def cmd_account_config(key: str, value: str | None) -> None:
         val = json.loads(value)
     except ValueError:
         val = value
+    from . import checkspill
     from .globalcap import setting_problems
     sec, _, k = key.partition(".")
     bad = setting_problems({k: val}) if sec == "budget" and val not in ("", None) else []
+    if key == checkspill.ACCOUNT_KEY and val not in ("", None):
+        try:
+            val = checkspill.hosts_of(val) or ""   # an empty pool is no pool: removed
+        except ValueError as e:
+            bad = [str(e).replace(f"delivery.{checkspill.KEY}", key)]
     if bad:
         die(bad[0])
     try:
@@ -8613,6 +8619,9 @@ def cmd_config(a) -> None:
         from .coordinator import NEEDS_USER
         if run and a.key is not None and a.name in NEEDS_USER:
             # A run can be steered by text it reads; spend caps change only on the user's word.
+            _refuse_user_only_in_run(a.name)
+        if run and a.key not in (None, "", "[]") and a.name in ACCOUNT_USER_ONLY:
+            # The account's spill pool sends every project's code to those machines: only clearing it is a run's.
             _refuse_user_only_in_run(a.name)
         return cmd_account_config(a.name, a.key)
     if a.why:

@@ -542,6 +542,116 @@ def test_no_spill_hosts_keeps_todays_wait_and_unspillable_checks_never_spill(env
     assert not checkspill.spillable([])
 
 
+def test_the_account_pool_spills_every_project_after_its_own_list_and_an_empty_own_list_keeps_it_here(
+        env, tmp_path, monkeypatch):
+    """checks.spill_hosts in the account settings: a project with no list of its own spills to the pool,
+    which needs no charter line (the account setting is the user's word for every project) but still the
+    machines list; a narrower own list is tried first, then the pool; an own [] keeps every run here."""
+    from ttp import checkspill, cli, machines, project
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, [], charter=())
+    p.raw_config()
+    raw = json.loads(p.config_path.read_text())
+    raw["delivery"].pop("checks_spill_hosts")
+    p.config_path.write_text(json.dumps(raw))
+    assert checkspill.hosts(p.config()) == []
+    project.set_account_setting(checkspill.ACCOUNT_KEY, ["pool-a", "pool-b"])
+    machines.add("pool-b")
+    assert checkspill.hosts(p.config()) == ["pool-a", "pool-b"]
+    assert checkspill.allowed(p, p.config(), "pool-a").startswith("not in the machines list")
+    assert checkspill.allowed(p, p.config(), "pool-b") == "", "the pool needs no charter line"
+    log = tmp_path / "where.log"
+    p.set_config("delivery.push_checks", [f"pwd >> {log}"])
+    lane = _spill_lane(p, repo)
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        lane.close()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "pool-b", rec
+    text = (run / "checks.log").read_text()
+    assert "pool-a (not in the machines list" in text and "checks.spill_hosts, the account's pool" in text, text
+    # A narrower own list goes first and the pool follows it; outside the pool the charter still decides.
+    p.set_config("delivery.checks_spill_hosts", ["check-host-a", "pool-b"])
+    assert checkspill.hosts(p.config()) == ["check-host-a", "pool-b", "pool-a"]
+    machines.add("check-host-a")
+    assert checkspill.allowed(p, p.config(), "check-host-a") == "not named in the charter"
+    assert checkspill._source(p.config(), "pool-b") == "delivery.checks_spill_hosts"
+    # An own empty list opts out of the pool; a malformed own list spills nowhere.
+    p.set_config("delivery.checks_spill_hosts", [])
+    assert checkspill.hosts(p.config()) == []
+    for bad in ("pool-a", ["a b"]):
+        assert checkspill.hosts({"delivery": {"checks_spill_hosts": bad}}) == [], bad
+    project.set_account_setting(checkspill.ACCOUNT_KEY, "pool-a")   # malformed pool: none
+    assert checkspill.account_hosts() == [] and checkspill.hosts({}) == []
+
+
+def test_ttp_config_account_sets_the_spill_pool_validated_and_a_run_may_only_clear_it(env, capsys, monkeypatch):
+    from ttp import checkspill, cli, project
+    cli.main(["config", "--account", "checks.spill_hosts", '["pool-a", "pool-b", "pool-a"]'])
+    assert checkspill.account_hosts() == ["pool-a", "pool-b"]
+    for bad in ("pool-a", '["a b"]', '["local"]', "3"):
+        with pytest.raises(SystemExit):
+            cli.main(["config", "--account", "checks.spill_hosts", bad])
+        assert "checks.spill_hosts" in capsys.readouterr().err, bad
+    assert checkspill.account_hosts() == ["pool-a", "pool-b"]
+    monkeypatch.setenv("TTP_RUN_ID", "7")
+    for value in ('["pool-c"]', "pool-c"):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["config", "--account", "checks.spill_hosts", value])
+        assert e.value.code == 2 and "only the user may change" in capsys.readouterr().err
+    assert checkspill.account_hosts() == ["pool-a", "pool-b"]
+    cli.main(["config", "--account", "checks.spill_hosts", "[]"])   # clearing is the safe direction
+    assert checkspill.account_hosts() == [] and "spill_hosts" not in (project.load_account_settings().get("checks") or {})
+
+
+def test_a_wrapped_run_spills_only_when_its_project_says_the_wrapper_needs_no_device(env, tmp_path, monkeypatch):
+    """checks.wrap_needs_device false: a run behind checks.wrap_cmd may spill and runs there without the
+    wrapper (it is this machine's); unset, true or not a bool, the need is unknown and the run stays here."""
+    import threading
+    from ttp import checklane, checkspill, cli, project, push, testslots
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    mark, log = tmp_path / "wrapped.log", tmp_path / "where.log"
+    wrapper = tmp_path / "wrap.sh"
+    wrapper.write_text(f'#!/bin/sh\necho wrapped >> {mark}\nexec "$@"\n')
+    wrapper.chmod(0o755)
+    p.set_config("checks.wrap_cmd", str(wrapper))
+    p.set_config("delivery.push_checks", ["true"])
+    cmd = f"pwd >> {log}"
+
+    def lane():
+        g = testslots.suite_hold(p.name, wait_s=0, slots=1, repo=testslots.repo_key(str(repo)),
+                                 lock=checklane.wrap_key(push.wrap_of(p.config())))
+        assert g is not None and g.files
+        return g
+    p.set_config("checks.wrap_needs_device", False)
+    held = lane()
+    try:
+        cli.main(["checks", "--fresh", "--", cmd])
+    finally:
+        held.close()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "check-host-a", rec
+    assert "/ttp-check." in log.read_text() and not mark.exists(), "it ran there, without the wrapper"
+    # Unset (unknown) or true (needs a device): it waits here, then runs here behind the wrapper.
+    raw = json.loads(p.config_path.read_text())
+    raw["checks"].pop("wrap_needs_device")
+    p.config_path.write_text(json.dumps(raw))
+    log.unlink()
+    held = lane()
+    threading.Timer(1.5, held.close).start()
+    cli.main(["checks", "--fresh", "--", cmd])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and "spilled_to" not in rec, rec
+    assert "/ttp-check." not in log.read_text() and mark.read_text() == "wrapped\n"
+    c = push.with_wrap(push.check_list(["make test"]), (str(wrapper),))
+    for v in (None, True, "false", 0):
+        assert not checkspill.spillable(c, {"checks": {"wrap_needs_device": v}}), v
+    assert checkspill.spillable(c, {"checks": {"wrap_needs_device": False}})
+    assert not checkspill.spillable(push.with_host(c, "check-host-a"), {"checks": {"wrap_needs_device": False}})
+    assert not project.config_problems({"checks": {"wrap_needs_device": False}})
+    assert any("checks.wrap_needs_device" in x for x in project.config_problems({"checks": {"wrap_needs_device": "no"}}))
+
+
 def test_spill_settings_are_validated_and_a_scalar_is_refused():
     from ttp import coordinator, project
     ok = {"delivery": {"checks_spill_hosts": ["check-host-a", "check-host-b"], "checks_spill_after_s": 30}}
