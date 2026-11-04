@@ -6382,6 +6382,8 @@ _IDLE_RESET_THROUGH = [
     ("Power cycle box-a? It is idle.", {}, "fleet-hold"),                                # a machine hold on it
     ("Power cycle box-a? It is idle.", {}, "charter-hold"),                              # a user hold names it
     ("Power cycle box-a? It is idle.", {}, "charter-allowlist"),                         # outside a user allowlist
+    ("Power cycle box-a-device? It is idle.", {}, "charter-hold"),                       # a user hold names its machine
+    ("Power cycle box-a-device? It is idle.", {}, "charter-allowlist-s"),                # its machine outside an allowlist
     ("Power cycle box-a? It is idle.", {}, "lock"),                                      # a lock held on it
     ("Power cycle box-a? It is idle.", {}, "shared-lock"),                               # another project's lock
     ("Power cycle box-a? It is idle.", {}, "pause"),                                     # a pause on it
@@ -6421,6 +6423,10 @@ def test_an_ask_to_reset_goes_through_when_the_gate_cannot_tell(env, text, field
         p.charter_path.write_text("## Restrictions\n- Never reset or power-cycle box-a (user msg #7).\n")
     elif setup == "charter-allowlist":
         p.charter_path.write_text("## Restrictions\n- Use only box-s and box-h (user msg #7).\n")
+    elif setup == "charter-allowlist-s":
+        p.charter_path.write_text("## Restrictions\n- Use only box-s (user msg #7).\n")
+    if "box-a-device" in text:
+        p.set_config("device.locks", ["box-a-device"])
     a = {"blocking": "human", **fields}
     try:
         assert coord._idle_reset_ask(p, p.config(), a, text, str(a.get("least_disruptive") or "")) == ""
@@ -6429,6 +6435,24 @@ def test_an_ask_to_reset_goes_through_when_the_gate_cannot_tell(env, text, field
             held.close()
     if setup is None:
         assert coord._idle_reset_ask(p, p.config(), {"blocking": "human"}, "Power cycle box-a? It is idle.", "")   # the control
+
+
+def test_a_user_rule_naming_a_machine_covers_its_device_lock_and_no_other(env):
+    """Review #5803: a Restriction naming a machine (its alias or hostname) covers its device lock."""
+    from ttp import coordinator as coord, machines
+    p = make(env)
+    machines.add("box-a", tags="device", hostname="hosta.example")
+    machines.add("box-ab", tags="device")
+    p.set_config("device.locks", ["box-a-device", "box-ab-device"])
+    ask = lambda t: coord._idle_reset_ask(p, p.config(), {"blocking": "human"}, f"Power cycle {t}? It is idle.", "")
+    p.charter_path.write_text("## Restrictions\n- Never power-cycle hosta.example (user msg #7).\n")
+    assert ask("box-a-device") == ""             # hostname names its machine
+    assert ask("box-ab-device")                  # another machine: still decided by the project
+    p.charter_path.write_text("## Restrictions\n- Never power-cycle box-ab (user msg #7).\n")
+    assert ask("box-a-device"), "box-ab must not cover box-a-device"
+    assert ask("box-ab-device") == ""
+    p.charter_path.write_text("## Restrictions\n- Never push to main.\n")
+    assert ask("box-a-device")
 
 
 @pytest.mark.parametrize("target,least", [

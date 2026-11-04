@@ -1902,8 +1902,8 @@ def lull_note(where: str, labels: list, why: str | None, *texts: str) -> str | N
             or not effort.device_task({"labels": json.dumps(labels)}):
         return None
     return (f"{where} deferred on a device resource for {cue.group(0)!r}: device jobs behind a broker are "
-            f"enqueued now (it orders them; a resource pause holds its tasks itself); a lull is only for "
-            f"disruptive work (restart, upgrade, rollout, reboot, power cycle)")
+            f"enqueued now (it orders them; a resource pause or the user's own hold holds its tasks itself); "
+            f"a lull, live traffic or a neighbour is no reason to wait")
 
 
 def _file_overlaps(p: Project, kind: str, spec: str, skip: set) -> list[dict]:
@@ -6056,15 +6056,17 @@ _ONLY_RE = re.compile(r"\bonly\b", re.I)
 
 
 def _user_machine_rule(p: Project, target: str, names: dict[str, str]) -> str:
-    """The charter Restriction line (the user's own holds and allowlists, as data) that names `target`, or
-    an allowlist line (it says "only") naming machines in `names` but not `target`; else ""."""
+    """The charter Restriction line (the user's own holds and allowlists, as data) that names `target` or the
+    machine it is on, or an allowlist line (it says "only") naming machines in `names` but neither; else ""."""
     from .prompts import charter_restrictions
     try:
         text = charter_restrictions(p.charter_path.read_text()) if p.charter_path.exists() else ""
     except OSError:
         return ""
     words = lambda s: {w.lower().rstrip(".-") for w in re.findall(r"[A-Za-z0-9][\w.+-]*", s)}
-    own = {target.lower()} | {n for n, alias in names.items() if alias == target}
+    from . import machine_ledger
+    on = {alias for alias in machines.load() if machine_ledger.on_machine(alias)(target)}   # box-a for box-a-device
+    own = {target.lower()} | {n for n, alias in names.items() if alias == target or alias in on}
     for line in text.splitlines():
         got = words(line)
         if got & own or (_ONLY_RE.search(line) and got & set(names)):

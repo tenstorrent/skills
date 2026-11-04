@@ -397,7 +397,8 @@ def test_a_deferred_device_task_waiting_for_a_lull_or_ack_gets_the_enqueue_now_a
     t = p.db.one("SELECT * FROM tasks WHERE title=?", ("run the device tests",))
     assert t["not_before"]   # applied as usual
     note = next(n for n in p.db.kv(coord.NOTES_KEY) if n.startswith(f"task_add: #{t['id']} deferred"))
-    assert "device jobs behind a broker are enqueued now" in note and "a lull is only for disruptive work" in note
+    assert "device jobs behind a broker are enqueued now" in note and "no reason to wait" in note
+    assert "lull is only for" not in note and not re.search(r"reboot|power cycle|restart", note), note   # user msg #1571
     # The same deferral set by task_update advises too.
     tid = p.db.add_task("run the bench", "Bench it.", kind="work", labels=["resource:board-device"])
     assert coord.apply(p, [{"type": "task_update", "id": tid, "start_after": "3h", "why": why}]) == []
