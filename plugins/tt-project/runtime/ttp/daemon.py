@@ -37,6 +37,7 @@ from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import ackwait
+from . import urgentfup
 from . import checksettle
 from . import checksgone
 from . import rejcool
@@ -5436,7 +5437,11 @@ class Daemon:
         refused: list[str] = []
         hop = self._auto_continue(db.task(task["id"]) or dict(task, **upd), fups, ready, refused) \
             if ready and not fix and (review or split or not changes or landed_now) else None
-        if not ready and new == "done" and task["kind"] == "code" and not approval and not notes \
+        # An urgent task's (or an obligation owner's) next steps are queued now, under the same caps (urgentfup).
+        quick, unqueued = self._urgent_followups(db.task(task["id"]) or dict(task, **upd), fups,
+                                                 {id(fups[0])} if hop else set()) \
+            if new == "done" and not approval and task["kind"] != "review" and fups else ([], {})
+        if not ready and not quick and new == "done" and task["kind"] == "code" and not approval and not notes \
                 and sev == "normal" and self._lone_continue(task, fups):
             try:   # metrics alone never queue a code hop: the coordinator decides (chaincap.NO_COMMIT_EVENT)
                 if chaincap.no_commit_event(self.p, self.cfg, db.task(task["id"]) or dict(task, **upd), fups[0]):
@@ -5447,22 +5452,32 @@ class Daemon:
             folded.add(id(fups[0]))
             text += f"\nContinue hop #{hop[0]} queued by the daemon ({hop[1]})" + (
                 f"; it builds on #{task['id']}'s branch and starts now." if split else ".")
-        elif new == "done" and any(chaincap.CONT_TITLE.match(str(f["title"])) for f in fups):
+        for f, nid in quick:
+            folded.add(id(f))
+            text += f"\nFollow-up #{nid} queued by the daemon ({urgentfup.why(db, task)}): {str(f['title'])[:120]}."
+        left = [f for f in fups if chaincap.CONT_TITLE.match(str(f["title"])) and id(f) not in folded]
+        if hop or quick and not left:
+            pass
+        elif new == "done" and left:
             # A post-landing live step (a deploy, install or rollout) is no hop: it is proposed as deploy tasks.
-            deploys = [d for f in fups if chaincap.CONT_TITLE.match(str(f["title"]))
-                       and (d := chaincap.deploy_proposal(f, task["id"]))]
+            deploys = [d for f in left if (d := chaincap.deploy_proposal(f, task["id"]))]
             mismatch = next((x for x in refused if publishkind.MISMATCH in x), "")
+            held = unqueued.get(id(left[0]), "")
             text += f"\nContinue follow-up {UNQUEUED_TAG}: " + (
                 deploys[0] + "." if deploys else f"{mismatch}." if mismatch else
+                f"{held}; add it with continues #{task['id']} or drop it." if held else
                 f"add it with continues #{task['id']} or drop it.")
-        elif split:
+        elif split and not quick:
             text += (f"\nNo continue hop finishes its split head: add one with continues #{task['id']} (it builds "
                      f"on this branch), or a review of it if the work is complete.")
-        routine = ((review is not None and plain) or fix is not None or hop is not None) and not stale
+        # Every proposal queued as an urgent next step and nothing else to read: no turn either.
+        settled = bool(quick) and len(fups) <= MAX_FOLLOWUPS and all(id(f) in folded for f in fups) \
+            and not notes and sev == "normal" and not hcheck_text
+        routine = ((review is not None and plain) or fix is not None or hop is not None or settled) and not stale
         # The summary takes what the digest's cap leaves after the header, push note and daemon lines.
         room = min(1200, coord.EVENT_CHARS - len(head) - len(push_note) - len(text))
         text = f"{head}{_cut(summary, max(200, room), where)}{push_note}{text}"
-        if hop:
+        if hop or quick:
             chaincap.add_notice(db, text)
         if not approval:   # an approval has its push_queued event; the batch's outcome closes the task
             # A plain needs_review hand-off: the daemon reviews it, so it raises no effort (coordinator._routine_review).
@@ -5489,9 +5504,10 @@ class Daemon:
             start = "; ".join(f"{k}: {str(f[k])[:300]}" for k in ("start_after", "start_when") if f.get(k))
             # A `continue:` follow-up the daemon did not queue as the next hop says so: only a task_add
             # with `continues` starts it (else continue_unqueued is raised, check_unqueued_continues).
+            held = f"{unqueued[id(f)]}; " if id(f) in unqueued else ""
             tag = f" ({UNQUEUED_TAG}: " + (chaincap.deploy_proposal(f, task["id"])
-                                            or f"add it with continues #{task['id']} or drop it") + ")" \
-                if id(f) not in folded and chaincap.CONT_TITLE.match(str(f["title"])) else ""
+                                            or f"{held}add it with continues #{task['id']} or drop it") + ")" \
+                if id(f) not in folded and (chaincap.CONT_TITLE.match(str(f["title"])) or held) else ""
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "followup_proposed", "normal",
                   f"proposed follow-up{tag}: "
@@ -13975,6 +13991,15 @@ class Daemon:
                        labels=publishkind.labels(labels if isinstance(labels, list) else [], pub))
         log(self.p, f"task {task['id']}: {publishkind.note(task['id'], task['kind'], pub)}")
         return db.task(task["id"])
+
+    def _urgent_followups(self, task: dict, fups: list[dict], skip: set[int]) -> tuple[list, dict]:
+        """urgentfup.queue for done `task` under its provider's gate; nothing queued when it cannot be read."""
+        try:
+            gate = self.gates.get(task.get("provider") or self.cfg.get("core_provider", "claude"))
+            return urgentfup.queue(self.p, self.cfg, task, fups, skip, gate)
+        except Exception:
+            log(self.p, f"urgent follow-ups of #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            return [], {}
 
     def _auto_continue(self, task: dict, fups: list[dict], why: str,
                        refused: list | None = None) -> tuple[int, str] | None:

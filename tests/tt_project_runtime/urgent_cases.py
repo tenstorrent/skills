@@ -455,3 +455,95 @@ def test_the_coordinator_and_plan_prompts_split_an_urgent_goal_into_tasks_that_s
     plan = " ".join((RUNTIME.parent / "template" / "prompts" / "kind-plan.md").read_text().split())
     assert ("An urgent goal (priority 1 or an `urgent:` line): every task starts at once. No chain between its "
             "tasks unless one needs another's new file or symbol") in plan
+
+
+def _urgent_done(env, p, title, fups, spec="", priority=3, labels=(), reply_chat=None, metrics=None, setup=None):
+    """A harness task (spec `spec`, `labels`, `reply_chat`) that handed off done with `fups`; its id."""
+    import json
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    tid = p.db.add_task(title, spec or f"spec of {title}", kind="harness", tier="deep", origin="coordinator",
+                        priority=priority, labels=list(labels))
+    p.db.update_task(tid, status="running", **({"reply_chat": reply_chat} if reply_chat else {}))
+    if setup:
+        setup(tid)
+    run_dir = env["tmp"] / f"run-{tid}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": f"{title}: checked",
+                                                     "metrics": metrics or {}, "followups": fups}))
+    Daemon(p.base)._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir)
+    return tid
+
+
+def _proposed(p, tid):
+    return p.db.q("SELECT * FROM events WHERE kind='followup_proposed' AND task=? ORDER BY id", (tid,))
+
+
+def test_an_urgent_tasks_next_steps_are_queued_at_once_with_what_it_carries(env):
+    """An urgent task's `continue:` and `next step:` follow-ups (no progress metric needed) are queued by the
+    daemon in its hand-off step: priority, the `urgent:` line, resource labels, reply_chat; the digest notice
+    names them and nothing waits on the coordinator. Its upstream note keeps its own handling."""
+    import json
+    from ttp import chaincap
+    p = make(env)
+    tid = _urgent_done(env, p, "Bring the board up", [
+        {"title": "continue: bring the board up, part 2", "spec": "Flash the rest."},
+        {"title": "next step: rerun the sweep", "spec": "Sweep again."}],
+        spec="Bring it up.\nurgent: the user is waiting on the board", priority=2,
+        labels=["resource:boxq", "exclusive:boxq-dev"], reply_chat="chat-9")
+    kids = p.db.q("SELECT * FROM tasks WHERE parent=? ORDER BY id", (tid,))
+    assert [k["title"] for k in kids] == ["continue: bring the board up, part 2", "next step: rerun the sweep"]
+    for k in kids:
+        assert k["priority"] == 2 and k["status"] == "queued" and k["reply_chat"] == "chat-9", dict(k)
+        assert "urgent: the user is waiting on the board" in k["spec"]
+        assert {"resource:boxq", "exclusive:boxq-dev", f"follows:{tid}"} <= set(json.loads(k["labels"]))
+    assert all(e["status"] == "handled" for e in _proposed(p, tid)), [dict(e) for e in _proposed(p, tid)]
+    (done,) = p.db.q("SELECT * FROM events WHERE kind='task_done' AND task=?", (tid,))
+    assert f"Follow-up #{kids[0]['id']} queued by the daemon (urgent: the user is waiting" in done["text"]
+    assert "NOT queued" not in done["text"] and done["status"] == "handled", dict(done)
+    assert any(f"#{kids[1]['id']}" in n for n in chaincap.notices(p.db))
+
+
+def test_an_obligation_owners_follow_up_is_queued_and_attached_to_it(env):
+    from ttp import obligations
+    p = make(env)
+    held = {}
+    tid = _urgent_done(env, p, "Measure the link", [{"title": "continue: measure the link, part 2", "spec": "More."}],
+                       setup=lambda t: held.setdefault("o", obligations.add(p, "the link numbers", owners=[t])))
+    (kid,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (tid,))
+    assert kid["status"] == "queued" and kid["priority"] == 3
+    assert str(kid["id"]) in obligations.get(p.db, held["o"])["owners"], obligations.get(p.db, held["o"])
+    (done,) = p.db.q("SELECT text FROM events WHERE kind='task_done' AND task=?", (tid,))
+    assert f"queued by the daemon (owner of obligation {held['o']})" in done["text"], done["text"]
+
+
+def test_a_routine_tasks_continue_stays_proposed_and_wakes_the_coordinator(env):
+    """Not urgent, owning nothing, no progress metric: the old path, proposed and NOT queued."""
+    p = make(env)
+    tid = _urgent_done(env, p, "Tidy the docs", [{"title": "continue: tidy the docs, part 2", "spec": "More."}])
+    assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (tid,))
+    (ev,) = _proposed(p, tid)
+    assert ev["status"] == "queued" and "NOT queued by the daemon" in ev["text"], dict(ev)
+
+
+def test_a_refused_urgent_follow_up_stays_proposed_with_its_reason(env):
+    """The chain caps, a pause and the setting still hold: each keeps the follow-up proposed, with the reason in
+    its followup_proposed event, which wakes the coordinator."""
+    p = make(env)
+    spec = "Do it.\nurgent: the user is waiting"
+    fup = [{"title": "continue: do it, part 2", "spec": "More."}]
+    p.set_config("chains.max_usd", 0.5)
+    tid = _urgent_done(env, p, "Capped work", fup, spec=spec, setup=lambda t: p.db.update_task(t, spent_usd=2.0))
+    assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (tid,))
+    (ev,) = _proposed(p, tid)
+    assert ev["status"] == "queued" and "NOT queued by the daemon" in ev["text"] and "max_usd" in ev["text"], ev["text"]
+    p.set_config("chains.max_usd", 40)
+    p.db.set_kv("paused", True)
+    tid = _urgent_done(env, p, "Paused work", fup, spec=spec)
+    assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (tid,))
+    assert "the project is paused" in _proposed(p, tid)[0]["text"]
+    p.db.set_kv("paused", False)
+    p.set_config("chains.urgent_followups", False)
+    tid = _urgent_done(env, p, "Opted out", fup, spec=spec)
+    assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (tid,))
+    assert _proposed(p, tid)[0]["status"] == "queued"
