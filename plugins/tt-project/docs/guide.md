@@ -872,7 +872,8 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
 ## Asks
 
 The project asks the user only when a step could affect people badly (destroy someone's work or
-data, disturb a machine or service others use) or would speak to people as the user (a post or
+data, disturb a machine or service others use: concrete harm only, never neighbours, serving tags
+or site rules the harness infers) or would speak to people as the user (a post or
 message in their name, a PR leaving draft, a merge, another person's request). A restriction that
 forbids every route found, a credential only the user holds, and money also go to the user.
 Everything else is decided: pick the route, act, record the decision (`memory_add`) and notify low.

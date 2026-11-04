@@ -9,7 +9,8 @@ broker where it has one.
 - Candidates are the machines in `ttp machines list` tagged `device` that the site file routes as
   `bare` (`site.md`). Your project's charter may limit which ones it uses; it never widens that.
 - Read each candidate's tags and note:
-  - `serving`: it runs a service for others. Use it last, and only while that service is idle.
+  - `serving`: it runs a service for others. The tag stops nothing: only what `recovery.md`
+    lists (a user-set hold or allowlist, a lock or device hold, a pause, a live tenant) does.
   - `unstable`: known to be unreliable. Prefer another box; read its note first.
   - A note with an end (`ttp machines add <box-alias> --note ... --until <when>`) holds until then;
     past it, the note is stale, so check the box instead of trusting it.

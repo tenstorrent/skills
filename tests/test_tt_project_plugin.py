@@ -2033,7 +2033,7 @@ def test_setup_box_bare_check_ready_box(tmp_path):
     (dict(lock_rc=2), (), 1, "lock: could not probe"),
     (dict(lock_rc=3), (), 0, "lock <box-alias>-device: n/a (no project here; not a shared lock)"),
     (dict(ssh_down=True, lock_rc=75), (), 255, "ssh: connection to <box-alias> failed (exit 255) connection refused"),
-    (dict(machines={"<box-alias>": {"tags": ["device", "serving", "unstable"]}}), (), 0, "use it last"),
+    (dict(machines={"<box-alias>": {"tags": ["device", "serving", "unstable"]}}), (), 0, "the tag stops nothing"),
     (dict(machines={}), (), 0, "not in `ttp machines list`"),
 ])
 def test_setup_box_bare_check_problems(tmp_path, kw, args, rc, expect):
@@ -6598,6 +6598,9 @@ def test_worker_prompt_guards_paid_model_api_spend_in_detached_jobs():
 #     container, never a power reading; fabric-manager and DRA agents are plumbing.
 #  9. A cable short keeps a tray off from power-on; a bus bar drops it under load.
 # 10. Act on answers the user already gave: never re-ask one because it was relayed.
+# 11. (user msg #1571) Neighbours, serving state or site rules the harness infers never hold a
+#     reset, power cycle, run or install: only the user's own holds and allowlists, a lock, a pause,
+#     a spend cap, a Restriction or a live tenant on that box do.
 # Text that quotes a claim only to call it false carries CLAIM_OK within 300 characters before it;
 # `sudo -n true` right after "never" or "not" is that kind of quote too.
 CLAIM_OK = "corrected-claim-ok"
@@ -6624,6 +6627,13 @@ CORRECTED_CLAIMS = {
     10: [r"re-?ask.{0,40}(?:because|since|as) (?:it|they) (?:was|were) relayed",
          r"relayed (?:answer|reply|replies|answers) (?:must|should) be re-?asked",
          r"settled answer.{0,30}\bre-?ask(?!ed)\b(?<!never re-ask)"],
+    11: [r"\bserving\b.{0,80}\buse it last", r"only (?:for|on) a host serving nothing",
+         r"only while (?:that|the|its) service is idle",
+         r"lulls? \(`?start_when`?\) (?:are|is) for [^.;]{0,60}power[- ]cycles?",
+         r"(?:wait|hold|skip|ask)\w* (?:for|on|because of|until) (?:the |its |a )?"
+         r"(?:neighbou?r(?:ing host)?s?|site rules?|serving (?:hosts?|state|tag))\b",
+         r"(?:skip|defer|avoid)\w*\b.{0,30}\bon (?:a |the )?serving (?:hosts?|box(?:es)?|machines?)",
+         r"\bserving (?:others|a service)\b.{0,40}\b(?:defer|wait|hold|skip)\w*"],
 }
 CLAIM_SUFFIXES = {".md", ".json", ".toml", ".yaml", ".yml", ".txt", ".py", ".sh", ""}
 
@@ -6642,8 +6652,7 @@ TRUE_PRACTICE = {
                    "Where glx_reset cannot run, no reset runs and the output says so."],
     "rescan and recount": ["After glx_reset, rescan the PCIe root ports and recount the chips by BDF and tray"],
     "tray drop": ["After a tray power drop, still try glx_reset first, then the single-host BMC power cycle.",
-                  "The single-host power cycle is only for a host serving nothing (no tenant); on a host "
-                  "that serves one, the tenant's owner decides.",
+                  "On a host with a live tenant (below), the tenant's owner decides; otherwise run it.",
                   "Resets and single-host power cycles never affect other hosts: no gate, snapshot or "
                   "serving-down check on neighbouring hosts.",
                   "Only a quad serving a quad-wide workload goes down and up as a quad."],
@@ -6657,6 +6666,12 @@ TRUE_PRACTICE = {
                 "On a box a tenant is using, only reads that open no device may run",
                 "Anything that opens a `/dev/tenstorrent` handle, resets or reloads the driver waits for the "
                 "tenant's owner."],
+    "what stops a box action": [
+        "Only a hold or allowlist the user set (recorded with the user's message as its source in the "
+        "project's charter, memory, machine entry or local config), a lock or device hold, a pause, a "
+        "spend cap, a charter Restriction, or a live tenant on that same box",
+        "Neighbouring hosts, a `serving` or similar tag, a site's habits or any rule the harness infers by "
+        "itself stop none of these and are no reason to ask or wait."],
     "cable and bus bar": ["A cable short keeps a tray off from power-on; a bus bar drops it under load."],
 }
 
@@ -6683,9 +6698,13 @@ def test_corrected_claims_patterns_catch_the_claim_and_spare_the_true_practice()
              6: "BMC op 0x0 is a safe fallback.", 7: "RT0 at 121 C at the drop means a retimer overheat.",
              8: "Chip power above idle watts means a tenant.",
              9: "A bad cable gives the same signature as a bus bar.",
-             10: "A settled answer must be re-asked because it was relayed."}
+             10: "A settled answer must be re-asked because it was relayed.",
+             11: "serving: it runs a service for others; use it last, only while that service is idle"}
     for n, line in false.items():
         assert n in {k for k, _ in corrected_claims_in(line)}, (n, line)
+    for line in ("Skip it on serving hosts.", "Box is serving others; defer the cycle until idle.",
+                 "Hold until neighbouring hosts drain.", "Ask because of site rules first."):
+        assert 11 in {k for k, _ in corrected_claims_in(line)}, line
     for line in ("`tt-smi -r` drops chips; tt-smi -r as a fallback only.", "Else fall back to tt-smi -r."):
         assert 2 in {k for k, _ in corrected_claims_in(line)}, line
     true = ["Check with `sudo -n -l`, never `sudo -n true`.", "On BH Galaxy use `tt-smi -glx_reset`.",
@@ -6696,6 +6715,9 @@ def test_corrected_claims_patterns_catch_the_claim_and_spare_the_true_practice()
             "A cable short keeps the tray off from power-on; a bus bar drops it under load.",
             "Act on answers the user already gave; never re-ask.", "A no is never re-asked.",
             "scriptwatch keeps watching every neighbour script.",
+            "The tag stops nothing: only a user-set hold or allowlist, a lock, a pause or a live tenant does.",
+            "concrete harm only, never neighbours, serving tags or site rules you infer",
+            "a box reset or single-host power cycle waits for no lull, only for a user-set hold.",
             f"<!-- {CLAIM_OK} --> The old note said 'BMC op 0x0 is a safe fallback'; it is false."]
     for line in true:
         assert corrected_claims_in(line) == [], line

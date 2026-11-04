@@ -16,17 +16,24 @@ General device recovery is tt-buddy's (`skills/run/recovery.md`); this page adds
 
 - glx_reset's IPMI step needs root or a NOPASSWD sudo rule for its exact commands; the root-port
   rescan needs root.
-- Where such rules are granted (exabox, shared serving hosts), they cover the exact glx_reset IPMI
-  commands and the diagnostics `dmesg -T`, `journalctl -k -b` and `lspci -d 1e52:`; on serving
-  hosts also `tt-smi` and `ipmitool`.
+- Where such rules are granted, they cover the exact glx_reset IPMI commands and the diagnostics
+  `dmesg -T`, `journalctl -k -b` and `lspci -d 1e52:`; on some hosts also `tt-smi` and `ipmitool`.
 - Check with `sudo -n -l`, never `sudo -n true`: a rule covers named commands, not a shell.
 - Where glx_reset cannot run, no reset runs and the output says so.
+
+## What can stop a reset, power cycle, run or install
+
+- Only a hold or allowlist the user set (recorded with the user's message as its source in the
+  project's charter, memory, machine entry or local config), a lock or device hold, a pause, a
+  spend cap, a charter Restriction, or a live tenant on that same box (below), whose work it would
+  destroy.
+- Neighbouring hosts, a `serving` or similar tag, a site's habits or any rule the harness infers by
+  itself stop none of these and are no reason to ask or wait. Nothing here is hardcoded per site.
 
 ## A tray that dropped
 
 - After a tray power drop, still try glx_reset first, then the single-host BMC power cycle.
-  The single-host power cycle is only for a host serving nothing (no tenant); on a host that
-  serves one, the tenant's owner decides.
+  On a host with a live tenant (below), the tenant's owner decides; otherwise run it.
 - Resets and single-host power cycles never affect other hosts: no gate, snapshot or serving-down
   check on neighbouring hosts. Only a quad serving a quad-wide workload goes down and up as a quad.
 - For the BMC power cycle use op 0x3 only: op 0x0 also resets the PCIe retimers carrying NVMe.
