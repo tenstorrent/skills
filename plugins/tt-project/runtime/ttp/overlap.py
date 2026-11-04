@@ -55,6 +55,11 @@ _PLAIN = re.compile(r"(?<![\w./:@-])((?:[\w.-]+/)+[\w-][\w.-]*)(?![\w/-])")
 _CALL = re.compile(r"(?<![\w.])((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*)\(\)")
 _TICK = re.compile(r"`((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*)`")
 MAX_SYMBOLS = 8               # symbols of one spec looked up on the base and the branches
+# The end of a path a spec names in full: no more name, folder or glob follows (tests/test_x_*.py is no path).
+_WHOLE_END = r"(?![\w/*?\[\]{}-]|\.[\w*?\[{])"
+# A spec says it creates a path: one of these words earlier in the path's sentence, or "(new" right after it.
+_CREATES = re.compile(r"\b(?:add(?:s|ed|ing)?|creat(?:e|es|ed|ing)|new|introduc(?:e|es|ed|ing)|writ(?:e|es|ing)|"
+                      r"generat(?:e|es|ed|ing)|split(?:s|ting)?|mov(?:e|es|ed|ing)|renam(?:e|es|ed|ing))\b", re.I)
 _ls_cache: dict[str, tuple[float, list[str]]] = {}
 
 
@@ -489,11 +494,34 @@ def _contains(p, head: str, ref: str) -> bool:
         p.root, "merge-base", "--is-ancestor", head, ref).returncode == 0)
 
 
+def _whole(text: str, f: str) -> bool:
+    """`text` names path `f` in full at least once: not cut off by a glob or more of a name (a prefix
+    such as tests/test_tt_project_ of tests/test_tt_project_*.py is no path)."""
+    return any(m for m in re.finditer(r"(?<![\w-])" + re.escape(f) + _WHOLE_END, text or ""))
+
+
+def _cut(f: str, files: list[str]) -> bool:
+    """`f` is only the start of a name in `files` (tests/test_x_ of tests/test_x_a.py): a prefix, never a file."""
+    return any(("/" + f) in ("/" + x) and not same(f, x) for x in files)
+
+
+def creates(text: str, f: str, root: Path) -> bool:
+    """`text` (a task's spec) says it creates path `f`: it names `f` (or a path naming the same file) in
+    full, with a word such as add, create or new earlier in that sentence or "(new" right after it."""
+    for t in (t for t in spec_paths(text, root) if same(f, t)):
+        for m in re.finditer(r"(?<![\w-])" + re.escape(t) + _WHOLE_END, text):
+            before = re.split(r"[.;:!?](?:\s|$)|\n", text[max(0, m.start() - 160):m.start()])[-1]
+            if _CREATES.search(before) or re.match(r"[`'\"]?\s*\(\s*(?:a\s+)?new\b", text[m.end():], re.I):
+                return True
+    return False
+
+
 def chain(p, hits: list[dict], spec: str = "", now: float | None = None, lineage: set[int] | None = None,
           skip=(), start: str | None = None) -> tuple[int, str] | None:
     """(id, why) of the newest open or unlanded task the new one needs the work of: a path the new
     spec shares with it (`hits`, find) that is not on the base branch yet and that task adds (its
-    branch adds it; with no branch, its folder or top folder is on the base), or a
+    branch adds it; with no branch, its folder or top folder is on the base and its spec says it
+    creates it: creates), or a
     symbol the spec names (symbols) that the base lacks and that task's branch has. None otherwise: a
     shared file alone never chains. A task in the new one's `lineage`, or waiting on it (waits_on),
     is passed over: its work lands only with the new task's. An exempt one (exempt) is passed over too,
@@ -521,12 +549,15 @@ def chain(p, hits: list[dict], spec: str = "", now: float | None = None, lineage
 
     def adds(h: dict, f: str, new: bool) -> bool:
         """`h`'s task adds repo file `f`: its branch adds it, or (no branch yet) `f` is missing from the
-        base under a folder the base has. A run dir, harness state or another repo's file never counts."""
-        if any(same(f, x) for x in on_base):
+        base under a folder the base has and `h`'s spec says it creates `f`. Only a complete path counts:
+        one the new spec names in full, never a prefix or glob of a file on the base (_whole, _cut). A
+        run dir, harness state or another repo's file never counts."""
+        if any(same(f, x) for x in on_base) or _cut(f, on_base) or (spec and not _whole(spec, f)):
             return False
         if h.get("head"):
             return new
-        return f.rsplit("/", 1)[0] in dirs or f.split("/", 1)[0] in tops
+        return (f.rsplit("/", 1)[0] in dirs or f.split("/", 1)[0] in tops) \
+            and creates((p.db.task(h["id"]) or {}).get("spec") or "", f, p.root)
     mine = base_files(p, start) if start else []
 
     def built_on(head: str | None) -> bool:

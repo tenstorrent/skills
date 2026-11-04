@@ -351,6 +351,54 @@ def test_task_add_chains_only_on_a_new_file_or_symbol_of_another_task(env):
         "bc_d", "retry_twice", "foo_bar"]
 
 
+def test_task_add_never_chains_on_a_path_prefix_or_glob_only_on_a_complete_new_path(env):
+    """A task was chained after another for 'tests/test_tt_project_', only the prefix of
+    tests/test_tt_project_*.py, files the base has. The chain counts only a complete path the base
+    lacks and the other task's spec says it creates: a prefix, a glob, a cut-off name or a missing path
+    no spec creates never chains, though the overlap note still names the shared path. A real new
+    file still chains."""
+    from ttp import coordinator as coord, overlap
+    from ttp.db import deferral, dependency_ids
+    p = make(env)
+    p.set_config("delivery.landed_probe", "test -e landed/{id}")
+    _on_base(p, "tests/test_tt_project_plugin.py", "tests/test_tt_project_runtime.py", "runtime/ttp/relay.py")
+
+    def add(title, spec):
+        assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec}]) == []
+        return p.db.one("SELECT * FROM tasks WHERE title=?", (title,))
+    glob = "tests/test_tt_project_*.py"
+    for i, (theirs, ours) in enumerate((
+            (f"Add a check to {glob}.", f"Run {glob} after the change."),            # the glob, as on 11-04
+            (f"Add tests/test_tt_project_[a-z]*.py cases.", f"Fix {glob}."),        # another glob form
+            ("Add tests/test_tt_project_ cases.", "Fix tests/test_tt_project_ ones."),  # a bare prefix
+            ("Change runtime/ttp/stall.py.", "Call runtime/ttp/stall.py."),           # no spec creates it
+            ("Add runtime/ttp/rel.py.", "Call runtime/ttp/rel.py?x"))):             # complete, cut-off here
+        other = p.db.add_task(f"other {i}", theirs, kind="code", status="running")
+        t = add(f"user {i}", ours)
+        assert not deferral(t) and dependency_ids(t) == [], (i, deferral(t), t["depends_on"])
+        assert not any(f"chained after #{other}" in n for n in p.db.kv(coord.NOTES_KEY)), i
+        if i < 3:   # the shared prefix still gets the overlap note
+            assert any(lb.startswith(f"overlap:{other}:overlaps #{other} (tests/test_tt_project_")
+                       for lb in json.loads(t["labels"])), (i, t["labels"])
+        for tid in (other, t["id"]):
+            p.db.update_task(tid, status="cancelled")
+    # A complete new path one spec says it adds, and another names exactly: chained.
+    maker = p.db.add_task("maker", "Add tests/test_tt_project_stall.py with stall cases.", kind="code",
+                          status="running")
+    t = add("user", "Extend tests/test_tt_project_stall.py with a soak case.")
+    assert deferral(t)["when"] == f"landed:#{maker}", deferral(t)
+    assert any(n.startswith(f"task_add: #{t['id']} chained after #{maker} (start_when landed:#{maker}): it needs "
+                            "tests/test_tt_project_stall.py, which #") for n in p.db.kv(coord.NOTES_KEY))
+    root = p.root
+    assert overlap.creates("Add `runtime/ttp/x.py`.", "runtime/ttp/x.py", root)
+    assert overlap.creates("Wire runtime/ttp/x.py (new) into the sweep.", "runtime/ttp/x.py", root)
+    assert not overlap.creates("Add a check. Fix runtime/ttp/x.py.", "runtime/ttp/x.py", root)
+    assert not overlap.creates("Add runtime/ttp/x_*.py.", "runtime/ttp/x_", root)
+    assert overlap._whole("see tests/a.py.", "tests/a.py") and not overlap._whole("tests/a_*.py", "tests/a_")
+    assert overlap._cut("tests/test_tt_project_", ["tests/test_tt_project_plugin.py"])
+    assert not overlap._cut("tests/test_tt_project_stall.py", ["tests/test_tt_project_plugin.py"])
+
+
 def test_task_add_checks_the_branch_a_task_starts_from_before_chaining_on_a_new_file_or_symbol(env):
     """A continue hop was chained on landed:#X for a file the base lacked, though the branch it starts
     from (its predecessor's, built on X's head) had it. The chain looks at the commit the task starts
@@ -454,19 +502,19 @@ def test_overlap_chain_never_waits_on_a_task_that_waits_on_the_new_tasks_own_lin
         assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec, **kw}]) == []
         return p.db.one("SELECT * FROM tasks WHERE title=?", (title,))
 
-    a = p.db.add_task("A", f"Change {hot}.", kind="code", status="done")
+    a = p.db.add_task("A", f"Add {hot}.", kind="code", status="done")
     _failed_review(p, a)
-    b = p.db.add_task("B", f"Change {hot}.", kind="code", status="queued",
+    b = p.db.add_task("B", f"Add {hot}.", kind="code", status="queued",
                       labels=[f"start_when:landed:#{a}"])
     fix = add("Fix A", f"Fix {hot}.", continues=a)
     assert not deferral(fix), deferral(fix)
     p.db.update_task(fix["id"], status="cancelled")
-    c = p.db.add_task("C", f"Change {hot}.", kind="code", status="queued", depends_on=[b])
+    c = p.db.add_task("C", f"Add {hot}.", kind="code", status="queued", depends_on=[b])
     fix = add("Fix A again", f"Fix {hot}.", continues=a)
     assert not deferral(fix), deferral(fix)
     p.db.update_task(fix["id"], status="cancelled")
     # Only C and B wait on A: an unrelated open task newer than them is still the one chained after.
-    d = p.db.add_task("D", f"Change {hot}.", kind="code", status="queued")
+    d = p.db.add_task("D", f"Add {hot}.", kind="code", status="queued")
     fix = add("Fix A third", f"Fix {hot}.", continues=a)
     assert deferral(fix)["when"] == f"landed:#{d}"
     # A task outside A's lineage never chains after C or B either: each waits itself (overlap.exempt).
@@ -496,14 +544,14 @@ def test_an_automatic_chain_uses_depends_on_where_no_landing_can_be_checked(env,
                "landed:#" not in n for n in p.db.kv(coord.NOTES_KEY)), p.db.kv(coord.NOTES_KEY)
     assert overlap.digest_note(t) == ""   # it waits on the task its label names
     assert "landed:#" not in overlap.warning(overlap.find(p, f"Extend {hot}."), landing=False)
-    # With a landed probe, or a push branch, the chain is a landed wait as before.
+    # With a landed probe, or a push branch, the chain is a landed wait on the task that adds the file.
     p.set_config("delivery.landed_probe", "test -e landed/{id}")
     t = add("with a landed probe", f"Extend {calm}.")
-    assert deferral(t)["when"] == f"landed:#{t['id'] - 1}" and dependency_ids(t) == []
+    assert deferral(t)["when"] == f"landed:#{open_}" and dependency_ids(t) == []
     p.set_config("delivery.landed_probe", "")
     p.set_config("delivery.push_branch", "tt/push")
     t = add("with a push branch", f"Extend {calm}.")
-    assert deferral(t)["when"] == f"landed:#{t['id'] - 1}" and dependency_ids(t) == []
+    assert deferral(t)["when"] == f"landed:#{open_}" and dependency_ids(t) == []
 
 
 def test_overlap_never_chains_or_suggests_depends_on_onto_device_or_waiting_tasks(env, monkeypatch):
@@ -523,7 +571,7 @@ def test_overlap_never_chains_or_suggests_depends_on_onto_device_or_waiting_task
         assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec, **kw}]) == []
         return p.db.one("SELECT * FROM tasks WHERE title=?", (title,))
 
-    ordinary = p.db.add_task("ordinary", f"Change {hot}.", kind="code", status="queued")
+    ordinary = p.db.add_task("ordinary", f"Add {hot}.", kind="code", status="queued")
     other = p.db.add_task("unrelated", "Write the notes.", kind="work", status="queued")
     cases = [("device run", "running", {"labels": ["exclusive:box-device"]}, "holds or waits for box-device"),
              ("board job", "queued", {"labels": ["resource:board0"]}, "holds or waits for board0"),
@@ -531,7 +579,7 @@ def test_overlap_never_chains_or_suggests_depends_on_onto_device_or_waiting_task
              ("deferred", "queued", {"labels": ["start_when:test -e /tmp/never"]}, "is deferred"),
              ("waits", "queued", {"depends_on": [other]}, f"waits on #{other}")]
     for i, (name, status, kw, why) in enumerate(cases):
-        h = p.db.add_task(name, f"Change {hot}.", kind="code", status=status, **kw)
+        h = p.db.add_task(name, f"Add {hot}.", kind="code", status=status, **kw)
         t = add(f"new {i}", f"Extend {hot}.")
         # No landing to check here: an automatic chain would be depends_on.
         assert dependency_ids(t) == [ordinary] and not deferral(t), (i, t["depends_on"], deferral(t))
