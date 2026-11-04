@@ -13980,7 +13980,7 @@ def test_start_when_probes_back_off_on_a_long_healthy_wait_within_a_cap(env):
     assert startgate.every(probe, 2, 6 * 3600) == base, "a broken probe is not backed off"
     for prompt in ("landed:#12", "ttp landed --task 12", "ttp detach --check run/x", "ttp checks --result ab",
                    "ttp ci --repo o/r --branch b", "ttp ack-wait probe --from a --hash 1",
-                   "ttp upstream --fixed ab", 'test "$(date +%s)" -ge 1900000000'):
+                   "ttp upstream --fixed ab", 'test "$(date +%s)" -ge 1900000000', "ttp lock --probe board-a"):
         assert startgate.every(prompt, 1, 6 * 3600) == base, prompt
     assert startgate.every(probe, 1, 6 * 3600, base=0) == 0, "a zero base (tests) stays zero"
 

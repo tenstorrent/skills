@@ -925,6 +925,10 @@ queues behind routine work; nothing running is interrupted:
   or deploy still goes first.
 - Waiting lists: resource reservations, `ttp lock` waiters and device runner queues serve urgent
   waiters first. Held locks, holds, pauses and recovery owners stay as they are.
+- Waits: a waiting urgent task whose `retry_when` is not a bare clock gate sleeps at most
+  `waiting.urgent_retry_cap_s` (300 s; 0 turns it off) per timer, whatever `retry_after_s` it asked
+  for; a timer that ends while its probe still says not yet puts it back to sleep with no model call.
+  Every task's probe runs every `waiting.poll_s` (90 s) and a pass wakes it at once.
 - `ttp status` and the web app mark urgent tasks with how long each has waited.
 - Start gates: an urgent task whose dependencies are met never sleeps on a convenience gate. Its
   `start_after`, `start_when` or `landed:#<id>` chain stays only when the gate's `why` (or the probe)
@@ -2026,7 +2030,7 @@ is open raises one `cap_wait` event naming the key.
 | `delivery.push_batch_s` | 300 s, none after a clean batch | changes gathered into one push | convenience |
 | `delivery.push_batch_max` | 8 | most changes in one push batch (a full batch starts at once; a backlog after a clean batch grows it up to 3x) | convenience |
 | `coordinator.burst_window_s` | 120 s (0: off) | high events after a turn high events woke, until one follow-up turn reads them all; never user messages, critical or safety-class events | convenience |
-| `retry_when` / `start_when` probe (`PROBE_EVERY_S`) | 180 s; only a `start_when` probe of an arbitrary command that keeps saying not-yet backs off, to at most 600 s (`MAX_EVERY_S`) with the wait's length; landing (`landed:#`, ttp landed), job (detach --check), checks --result, push --result, CI, ack-wait, upstream --fixed and date (`test "$(date ...`) probes, and every `retry_when` probe, keep 180 s | a waiting or deferred task before its probe runs again | convenience |
+| `retry_when` / `start_when` probe (`waiting.poll_s`) | 90 s (20-180 s); only a `start_when` probe of an arbitrary command that keeps saying not-yet backs off, to at most 600 s (`MAX_EVERY_S`) with the wait's length; landing (`landed:#`, ttp landed), job (detach --check), checks --result, push --result, lock --probe, CI, ack-wait, upstream --fixed and date (`test "$(date ...`) probes, and every `retry_when` probe, keep `waiting.poll_s`; a pass wakes the task at once whatever its timer | a waiting or deferred task before its probe runs again | convenience |
 | auth re-probe (`AUTH_PROBE_S`) | 900 s | work for a logged-out provider with no login check, before one run checks it | safety (spend) |
 | `ttp lock` on a device | one command at a time | device commands | safety |
 | suite lock | one full suite per worktree | a second run of the same suite | safety |
