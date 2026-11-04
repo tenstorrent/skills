@@ -6082,7 +6082,8 @@ def cmd_lock(a) -> None:
 
     job = lk.job_fields()   # inside a `ttp detach` job (its --lock): the label names the job and its pid
     from . import landmark
-    landed_check = landmark.verified()   # inside a landing's checks (a verified mark): ahead of non-landing waiters
+    mark = landmark.label()   # inside a landing's checks (a verified mark): ahead of non-landing waiters
+    landed_check = mark is not None
     if landed_check:
         job = {**job, "landing": True}
 
@@ -6117,6 +6118,9 @@ def cmd_lock(a) -> None:
     tickets: list = []
     atexit.register(lambda: [lk.dequeue(t) for t in tickets])   # however this ends; a dead process's ticket is dropped too
     prio = _urgent_priority(p, own)   # an urgent task's waiter goes ahead of routine ones (urgent.py)
+    if prio is None and mark and mark.get("urgent") is True:   # an urgent batch's landing (its verified mark)
+        from . import urgent
+        prio = urgent.PRIORITY
     for L in todo:
         try:   # one arrival time on every lock: no two waiters can be ahead of each other on different ones
             L["ticket"] = lk.enqueue(L["where"], L["res"], L["who"], since=started, shared=a.shared,

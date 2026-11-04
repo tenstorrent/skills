@@ -199,7 +199,8 @@ def _check_argv(cmd, wt: Path) -> list[str]:
 
 
 def _stream(cmd: str | list[str], cwd: Path, env: dict | None = None, timeout: float | None = None,
-            group: bool = False, pass_fds: tuple = (), collect: workerloss.Collector | None = None) -> tuple[int | None, str, bool]:
+            group: bool = False, pass_fds: tuple = (), collect: workerloss.Collector | None = None,
+            urgent_mark: bool = False) -> tuple[int | None, str, bool]:
     """Run `cmd` (a shell string, or an argv run without a shell), copying its output into this
     process's output (the batch log): (exit code, the last lines of its output, whether it ran out of time and was killed). `group` starts it in a
     process group of its own, which a timeout kills whole. The tail starts with up to OVER_KEPT
@@ -207,10 +208,11 @@ def _stream(cmd: str | list[str], cwd: Path, env: dict | None = None, timeout: f
     anywhere in the output: a prompt size cap's measured overshoot (conflictfix.cap_failure). `collect`
     gets every line (workerloss.Collector). A check gating the push branch (env TTP_PUSH_MODE `target`)
     runs under a landing mark this process holds until it ends, as push._run_one's do (landmark.py); no
-    other command inherits one."""
+    other command inherits one. `urgent_mark` labels it urgent (Batch._urgent_mark): its `ttp lock`
+    waiters then keep the urgent rank a batch's checks have no TTP_TASK to give them."""
     sys.stdout.flush()
     sys.stderr.flush()
-    mark = landmark.hold() if env and env.get("TTP_PUSH_MODE") == "target" else None
+    mark = landmark.hold(urgent=urgent_mark) if env and env.get("TTP_PUSH_MODE") == "target" else None
     if env is not None or landmark.ENV in os.environ:
         env = {**{k: v for k, v in (os.environ if env is None else env).items() if k != landmark.ENV},
                **({landmark.ENV: str(mark.path)} if mark else {})}
@@ -1664,7 +1666,7 @@ class Batch:
         def once():
             collect.reset()
             return _stream(_check_argv(cmd, self.wt), self.wt, env=run_env, pass_fds=checkdirs.inherited(),
-                           collect=collect)
+                           collect=collect, urgent_mark=self._urgent_mark())
         reruns = 0
         while True:
             rc, tail, _ = scriptwatch.rerun(once, lambda r: r[0] != 0, None if push.remote_host(cmd) else str(cmd),
@@ -1721,7 +1723,7 @@ class Batch:
         rc, tail, late = _stream(_check_argv(cmd, self.wt), self.wt,
                                  env={**env, **pushpass.select_env(rx, env), **slot_env},
                                  timeout=_seconds(self.d.get("push_rerun_s"), RERUN_S), group=True,
-                                 pass_fds=checkdirs.inherited())
+                                 pass_fds=checkdirs.inherited(), urgent_mark=self._urgent_mark())
         return (None if late else rc), tail
 
     def _flaky(self, head: str, cmd, rc: int, tail: str, env: dict, slot_env: dict) -> bool:
@@ -1823,7 +1825,7 @@ class Batch:
                     say(f"cap probe of {head[:10]}: {cmd}")
                     rc, tail, _ = _stream(_check_argv(cmd, self.wt), self.wt,
                                           env={**env, **pushpass.select_env(rx, env), **slot.env()},
-                                          pass_fds=checkdirs.inherited())
+                                          pass_fds=checkdirs.inherited(), urgent_mark=self._urgent_mark())
                     if fault := push.remote_fault(cmd, rc, self.wt):
                         raise envfault.Fault(fault)
                     ok = rc in (0, NO_TESTS)
@@ -2034,6 +2036,15 @@ class Batch:
                 say(f"urgent approval{'s' if n > 1 else ''} {', '.join(map(str, self.yielded_to))} "
                     f"wait{'s' if n == 1 else ''}: the search stops here and {'they go' if n > 1 else 'it goes'} next")
         return bool(self.yielded_to)
+
+    def _urgent_mark(self) -> bool:
+        """Whether this batch's checks run under an urgent landing mark (_stream): one of its entries is
+        an urgent approval (urgent.covers_urgent), as pushq.due starts it at once for."""
+        try:
+            return any(urgent.covers_urgent(self.p.db, self.p.db.task(e.get("task"))) for e in self.entries)
+        except Exception as e:          # a queue it cannot read: a routine mark, the checks run as before
+            say(f"cannot read the batch's tasks: {type(e).__name__}: {e}")
+            return False
 
     def _may_yield(self) -> bool:
         """Whether this batch may stop its search for an urgent approval at all: never when every entry

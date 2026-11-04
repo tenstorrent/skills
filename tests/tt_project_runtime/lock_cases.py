@@ -2102,6 +2102,54 @@ def test_an_urgent_lock_waiter_goes_ahead_of_routine_landings_and_an_urgent_land
             locks.dequeue(t)
 
 
+@pytest.mark.parametrize("hot_batch", [True, False], ids=["urgent-batch", "routine-batch"])
+def test_a_push_batch_carrying_an_urgent_approval_lands_ahead_of_an_earlier_urgent_waiter(env, tmp_path, hot_batch):
+    """A push batch's checks have no TTP_TASK: Batch._urgent_mark (an entry covers an urgent approval)
+    labels the landing mark batch._stream holds urgent, and its `ttp lock` waiter, verified under that
+    mark, carries the urgent rank: it goes ahead of an earlier urgent non-landing waiter. A routine
+    batch's landing still goes after it (locks.landing_first). A forged mark gives no rank at all
+    (landmark.label is the verified one: test_only_a_held_landing_mark_of_an_ancestor_makes_a_landing_waiter)."""
+    import threading
+    import types
+    from ttp import batch, landmark
+    p = make(env)
+    hot = p.db.add_task("hot", "s\nurgent: the user is waiting", kind="code", origin="coordinator")
+    routine = p.db.add_task("routine", "s", kind="code", origin="coordinator")
+    shape = types.SimpleNamespace(p=p, entries=[{"task": routine}] + ([{"task": hot}] if hot_batch else []))
+    assert batch.Batch._urgent_mark(shape) is hot_batch
+    marks, go, go_b = tmp_path / "marks", tmp_path / "go", tmp_path / "go-b"
+    env_b = _lock_env(env, p, PYTHONPATH=str(RUNTIME), TTP_PUSH_MODE="target")
+    env_b.pop("TTP_TASK", None)
+    late = [sys.executable, str(TTP), "lock", "gate", "--", *_mark(marks, "land", go_b)]
+    got = []
+    t = threading.Thread(target=lambda: got.append(batch._stream(late, tmp_path, env=env_b, urgent_mark=hot_batch)),
+                         daemon=True)
+    holder = _lock(_lock_env(env, p), "gate", cmd=_mark(marks, "holder", go))
+    procs = [holder]
+    try:
+        _until_or_ended(lambda: marks.exists() and "start holder" in marks.read_text(), procs)
+        procs.append(_lock(_lock_env(env, p, TTP_TASK=str(hot)), "gate", cmd=_mark(marks, "hot")))
+        _until_or_ended(lambda: _queue_len(p, "gate") == 1, procs)
+        t.start()
+        _until_or_ended(lambda: _queue_len(p, "gate") == 2, procs)
+        go.touch()
+        _until_or_ended(lambda: "start land" in marks.read_text() or "start hot" in marks.read_text(), procs[1:])
+        go_b.touch()
+        t.join(60)
+        assert not t.is_alive() and got and got[0][0] == 0, got
+        assert _ended(procs) == [0, 0]
+    finally:
+        go.touch()
+        go_b.touch()
+        for x in procs:
+            if x.poll() is None:
+                x.kill()
+        t.join(60)
+    starts = [ln.split()[1] for ln in marks.read_text().splitlines() if ln.startswith("start ")]
+    assert starts == (["holder", "land", "hot"] if hot_batch else ["holder", "hot", "land"]), starts
+    assert list(landmark.marks_dir().iterdir()) == []
+
+
 def _mark_holder(env):
     """A process outside the waiter's ancestry holding a real landing mark; (process, mark path)."""
     proc = subprocess.Popen([sys.executable, "-c", "import sys, time\nfrom ttp import landmark\nm = landmark.hold()\n"
