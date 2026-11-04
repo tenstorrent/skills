@@ -480,6 +480,111 @@ def test_a_cited_restriction_name_never_shields_a_users_own_retirement_or_an_uns
     assert got == {"drain-lane": "directive", "bulk-lane": "directive"}, got
 
 
+def _old_said(p, text, age=3600):
+    import time as _time
+    return p.db.x("INSERT INTO messages(ts,direction,kind,text) VALUES(?,'in','user',?)", (_time.time() - age, text))
+
+
+def _pool_project(env):
+    """A project with a user-cited Restrictions sub-heading whose source message predates its memory."""
+    p = make(env)
+    src = _old_said(p, "Keep two hosts free in the pool, always.")
+    p.charter_path.write_text("# demo\n\n## Brief\nShip it.\n\n## Restrictions\n"
+                              f"### Spare-pool hosts (user msg #{src})\n- Keep two hosts free at all times.\n")
+    return p, src
+
+
+def _pool_places(p):
+    """A task spec and a harness script quoting the heading, and a task spec naming a test assertion."""
+    spec = p.db.add_task("merge", "Respect the Spare-pool hosts restriction while merging.")
+    ident = p.db.add_task("suite", "Run assert_pool_free in the nightly suite.")
+    script = p.harness / "bin" / "pool-check"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("#!/bin/sh\n# Follow the Spare-pool hosts restriction: refuse a merge while the pool is short\nexit 0\n")
+    rel = script.resolve().relative_to(p.root.resolve()).as_posix()
+    return {"charter:Restrictions", f"task:{spec}:spec", f"file:{rel}"}, f"task:{ident}:spec"
+
+
+@pytest.mark.parametrize("where", ["text", "why", "off_turn"])
+def test_a_coordinator_decision_superseded_by_another_citing_an_older_user_message_orders_no_fix(env, where):
+    """One coordinator decision superseded by another that cites only the user message a current
+    Restrictions item came from (older than the decision), in its text or its `why`, on the user's turn or
+    off it, is no withdrawal by the user: the Restrictions heading in the charter, a task spec and a
+    harness script quoting it, and a test-assertion name in a task spec are advisory, never a fix order."""
+    from ttp import coordinator as coord, echoes
+    p, src = _pool_project(env)
+    old = p.add_memory("Keep the `Spare-pool hosts` free; gate merges on assert_pool_free first.", kind="decision")
+    said = _echo_said(p, "Thanks, carry on.")
+    cite = f" (user msg #{src})"
+    act = {"type": "memory_add", "memory_kind": "decision", "supersedes": [old.stem],
+           "text": "Merges follow the Restrictions items" + (cite if where == "text" else "") + "."}
+    if where != "text":
+        act["why"] = "restated per the Restrictions item" + cite
+    turn = {} if where == "off_turn" else {"user_turn": True, "messages": [said]}
+    assert coord.apply(p, [act], turn=1, **turn) == []
+    assert [r["kind"] for r in echoes.records(p)] == [echoes.SUPERSEDED]
+    quotes, ident = _pool_places(p)
+    hits = {h["key"].split(":", 1)[1]: h for h in echoes.scan(p)}
+    assert quotes | {ident} <= set(hits), hits
+    assert all(h["class"] == "advisory" for h in hits.values()), hits
+    assert echoes.digest_lines(p) == [] and _echoes(p) == ""
+
+
+def test_a_user_withdrawal_quoting_a_current_restriction_heading_flags_only_the_retired_wording(env):
+    """A supersede on the user's word (here, a message newer than the decision) keeps its fix orders, but
+    a current cited Restrictions item still states what it states: the heading quoted with naming words or
+    with its item, and an item under a cited sub-heading, are advisory wherever they are quoted; the
+    retired decision's own identifier and wording are fix orders."""
+    from ttp import coordinator as coord, echoes
+    p, src = _pool_project(env)
+    old = p.add_memory("Keep two hosts free at all times. Quote it as `the Spare-pool hosts restriction` "
+                       "and `Spare-pool hosts: keep two hosts free`; gate merges on assert_pool_free first.",
+                       kind="decision")
+    said = _echo_said(p, "Drop the merge gate, merge whenever the suite is green.")
+    assert coord.apply(p, [{"type": "memory_add", "memory_kind": "decision", "supersedes": [old.stem],
+                            "text": f"Merge whenever the suite is green (user msg #{said})."}],
+                       user_turn=True, turn=1, messages=[said]) == []
+    assert [r["kind"] for r in echoes.records(p)] == [echoes.WITHDRAWN]
+    quotes, ident = _pool_places(p)
+    body = p.db.add_task("body", "Keep two hosts free at all times; Spare-pool hosts: keep two hosts free.")
+    hits = {h["key"].split(":", 1)[1]: h for h in echoes.scan(p)}
+    assert hits[ident]["class"] == "directive" and hits[ident]["phrase"] == "assert_pool_free", hits[ident]
+    advisory = quotes | {f"task:{body}:spec"}
+    assert advisory <= set(hits), hits
+    assert all(hits[k]["class"] == "advisory" and "current Restrictions item" in hits[k]["why"]
+               for k in advisory), hits
+    assert echoes.digest_lines(p)[0] == echoes.RETIRED_HEADER
+    # Not a quote: other words between the heading's, or the words reordered.
+    units = echoes._current(p.charter_path.read_text())
+    assert echoes._states(units, "the spare-pool hosts restriction")
+    assert echoes._states(units, "spare-pool hosts: keep two hosts free")
+    assert not echoes._states(units, "spare-pool spare hosts")
+    assert not echoes._states(units, "hosts spare-pool")
+    assert not echoes._states(units, "keep hosts free")
+    assert not echoes._states(units, "the hosts rule")   # one word, not the unit's whole wording
+
+
+def test_a_supersede_citing_a_user_message_is_a_withdrawal_unless_every_cited_message_predates_the_entry(env):
+    from ttp import coordinator as coord
+    p = make(env)
+    older = _old_said(p, "Keep two hosts free.")
+    entry = p.add_memory("Gate merges on `pool-gate`.", kind="decision")
+    since = coord._stamp_ts(next(e for e in p._memory_entries() if e["name"] == entry.stem)["created"])
+    newer = _echo_said(p, "Merge any time.")
+    body = "Gate merges on `pool-gate`."
+
+    def w(why=None, new="", turn=True):
+        return coord._withdrawn(p.db, body, turn, why, new, [newer], since=since)
+
+    assert not w(f"per user msg #{older}") and not w(new=f"Merges follow the items (user msg #{older}).")
+    assert w(f"user msg #{newer} changed it") and w(new=f"Merge any time (user msg #{newer}).")
+    assert w(f"user msgs #{older} and user msg #{newer}")   # one later message is enough
+    assert w("user msg #99999 changed it")   # not in the chat log: still the user's word
+    assert w("the user's words ended it") and w(new="Merge any time (user's words).")   # no message named
+    assert not w(f"per user msg #{older}", turn=False) and w(f"user msg #{newer} changed it", turn=False)
+    assert coord._withdrawn(p.db, body, True, f"per user msg #{older}", "", [newer])   # no `since`: as before
+
+
 def test_ttp_echoes_exports_every_retirement_and_match_read_only_including_ones_the_digest_omits(env, capsys):
     import hashlib as _hashlib
     import json as _json

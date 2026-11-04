@@ -35,8 +35,11 @@ its source (_kind), and an unknown kind or source is UNVERIFIED. A hit of an uns
 the user, with `over` or not: restriction_source.drops_unsourced) is advisory while the Brief or a sourced item still states it (restriction_audit.still_stated):
 that rule still binds, so its copies are right. Likewise a memory entry's retirement (superseded or withdrawn)
 never retires a phrase a current Restrictions item with its source (a user cite, origin: Brief or harness gate)
-or its heading holds whole: a hit on it is advisory (_current), wherever it stands; a user Correction or a charter
-replacement keeps its fix orders. One the coordinator dropped on its own is SUPERSEDED, never
+or its heading states (_states: holds it whole, or as one run of its words apart from naming words and cites,
+such as 'the X restriction' or a heading quoted with its item): a hit on it is advisory (_current), wherever it
+stands; a user Correction or a charter replacement keeps its fix orders. A supersede whose only user cite names
+messages older than the entry it retires (where a rule came from, such as a current item's source) is one
+coordinator entry replacing another: SUPERSEDED (coordinator._withdrawn `since`). One the coordinator dropped on its own is SUPERSEDED, never
 WITHDRAWN, and one a record stored before the flag holds is UNVERIFIED (_unsourced). `export` is the read-only full list
 behind `ttp echoes`. Accepted gaps (settled weak-token set): a dashed config-style name with a decimal
 suffix ('max-ratio-1.5') counts as weak; a version joined by '_', '=' or '+' counts as strong (over-flag).
@@ -533,7 +536,8 @@ _MEMORY_RETIRED = re.compile(r"memory \[[^\]]+\] (?:superseded by \[|withdrawn$)
 
 def _current(charter: str) -> list[str]:
     """The flattened text of each current Restrictions item that binds (restriction_source.sourced: a user
-    cite, the Brief or a harness gate), with the heading (section or sub-heading) it stands under."""
+    cite, the Brief or a harness gate, its own or its sub-heading's), with the heading (section or
+    sub-heading) it stands under, alone and followed by the item."""
     from .prompts import charter_sections
     from .restriction_source import sourced, split_items
     out: list[str] = []
@@ -541,25 +545,46 @@ def _current(charter: str) -> list[str]:
         name = head[3:].strip()
         if not name.lower().startswith("restriction"):
             continue
+        cited = False
         for it in split_items("\n".join(body)):
             text = " ".join(" ".join(it).split())
             if text.startswith("#"):
                 name = text.lstrip("#").strip()
-                if sourced(name):   # a cite on the sub-heading itself
+                cited = sourced(name)   # a cite on the sub-heading itself covers its items
+                if cited:
                     out.append(_flat(name))
-            elif sourced(text):
-                out += [_flat(text), _flat(name)]
+            elif cited or sourced(text):
+                out += [_flat(text), _flat(name), _flat(f"{name} {text}")]
     return list(dict.fromkeys(out))
 
 
+_WORD = re.compile(r"\w+(?:[-.']\w+)*")
+_NAMING = {"a", "an", "the", "of", "in", "on", "and", "or", "to", "for", "per", "under", "item", "items", "rule",
+           "rules", "restriction", "restrictions", "heading", "section"}   # words that name an item, not state one
+_CITE = re.compile(r"\([^()]*(?:\b(?:user|msgs?|origin|relayer)\b|#\d)[^()]*\)")   # '(user msg #4)', '(origin: Brief)'
+
+
 def _states(units: list[str], ph: str) -> bool:
-    """Whether a current cited Restrictions item or its heading (`units`, _current) holds phrase `ph` whole."""
+    """Whether a current cited Restrictions item or its heading (`units`, _current) states phrase `ph`: holds
+    it whole, or holds its words as one run once the words that only name an item (_NAMING: 'the X
+    restriction') and cites (_CITE) are left out, such as a heading quoted with its item: two words
+    or more, or the unit's whole wording. Never a reordering or a run with other words between."""
     for u in units:
         i = u.find(ph)
         while i >= 0:
             if not _inside(u, i, ph):
                 return True
             i = u.find(ph, i + 1)
+
+    def run(text: str) -> list[str]:
+        return [w for w in _WORD.findall(_CITE.sub(" ", text)) if w not in _NAMING]
+
+    words = run(ph)
+    n = len(words)
+    for u in units if words else ():
+        held = run(u)
+        if held == words or n >= 2 and any(held[i:i + n] == words for i in range(len(held) - n + 1)):
+            return True
     return False
 
 
