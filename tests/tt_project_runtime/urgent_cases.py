@@ -333,3 +333,113 @@ def test_a_review_keeps_its_dependency_on_a_code_task_that_changes_its_subject(e
     for r, dep in zip(rs, (fix, hx, br)):
         assert dep in dependency_ids(p.db.task(r)), (r, dep)
     assert not p.db.q("SELECT id FROM events WHERE fingerprint LIKE 'review_suite_gate:%'")
+
+
+def _urgent_sleeper(p, probe, retry_s=3600, urgent_line=True):
+    """A task asleep on a worker's `retry_after_s` of `retry_s` with `probe` as its retry_when."""
+    now = time.time()
+    tid = p.db.add_task("finish the step", "do it\nurgent: the user is waiting" if urgent_line else "do it",
+                        kind="work", tier="standard", origin="user")
+    p.db.update_task(tid, not_before=now + retry_s, result=json.dumps(
+        {"status": "waiting", "summary": "step running", "waiting_for": "the step", "retry_after_s": retry_s,
+         "retry_when": probe, "waiting_since": now - 60}))
+    return tid
+
+
+def _one_poll_later(d, tid):
+    """The daemon's clock one waiting.poll_s past the probe's last run, then a pass of the probe loop."""
+    from ttp import waitpoll
+    d._probed[tid] = time.time() - waitpoll.poll_s(d.cfg)
+    _settle_probe(d, tid)
+
+
+def test_wait_polls_default_to_minutes_and_cap_only_urgent_state_waits():
+    from ttp import waitpoll
+    assert 60 <= waitpoll.poll_s({}) <= 120 and waitpoll.urgent_cap_s({}) == 300
+    assert waitpoll.poll_s({"waiting": {"poll_s": 1}}) == waitpoll.MIN_POLL_S
+    assert waitpoll.poll_s({"waiting": {"poll_s": 9999}}) == waitpoll.MAX_POLL_S
+    assert waitpoll.poll_s({"waiting": {"poll_s": "x"}}) == waitpoll.POLL_S
+    hot, cold = {"priority": 1}, {"priority": 3, "spec": "routine"}
+    job = {"retry_when": "ttp detach --check run/job.rc"}
+    assert waitpoll.capped({}, hot, job, 3600) == 300
+    assert waitpoll.capped({}, {"priority": 3, "spec": "urgent: now"}, job, 3600) == 300
+    assert waitpoll.capped({}, hot, job, 200) == 200, "a shorter retry stays"
+    assert waitpoll.capped({}, cold, job, 3600) == 3600, "routine work keeps its backoff"
+    assert waitpoll.capped({}, hot, {}, 3600) == 3600, "no probe: nothing the daemon can read"
+    assert waitpoll.capped({}, hot, {"retry_when": 'test "$(date +%s)" -ge 1900000000'}, 3600) == 3600
+    assert waitpoll.capped({"waiting": {"urgent_retry_cap_s": 0}}, hot, job, 3600) == 3600, "0: off"
+    assert waitpoll.capped({"waiting": {"urgent_retry_cap_s": 120}}, hot, job, 3600) == 120
+
+
+@pytest.mark.parametrize("urgent_line,probe,capped", [
+    (True, "exit 1", True), (False, "exit 1", False),
+    (True, 'test "$(date +%s)" -ge 1900000000', False)])
+def test_an_urgent_waiting_hand_off_caps_a_60_min_retry(env, monkeypatch, urgent_line, probe, capped):
+    """An urgent worker's hour-long retry on state the daemon can read sleeps at most the cap; routine work
+    and a bare clock gate keep the worker's timer."""
+    from ttp.daemon import Daemon
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps(
+        {"status": "waiting", "summary": "step runs", "waiting_for": "the step", "retry_after_s": 3600,
+         "retry_when": probe}))
+    p = make(env)
+    tid = p.db.add_task("finish the step", "do it\nurgent: the user is waiting" if urgent_line else "do it",
+                        kind="work", tier="light", origin="user")
+    d = Daemon(p.base)
+    assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "queued" and p.db.task(tid)["not_before"]
+                      and not p.db.q("SELECT id FROM runs WHERE status='running'"))
+    left = p.db.task(tid)["not_before"] - time.time()
+    assert (left <= 300 + 5) == capped and left > 200, left
+
+
+def test_an_urgent_task_wakes_within_one_poll_of_its_lock_freeing_and_sleeps_model_free_until(env, tmp_path):
+    from ttp import daemon as dmod
+    p = make(env)
+    d = dmod.Daemon(p.base)
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
+    held, release = tmp_path / "held", tmp_path / "release"
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sh", "-c",
+                               f"touch {shlex.quote(str(held))}; {shlex.join(_until(release))}"], env=run_env)
+    try:
+        _wait_for_file(held, holder)
+        tid = _urgent_sleeper(p, "ttp lock --probe board")
+        _settle_probe(d, tid)
+        assert not _ready(p, tid), "a busy lock is not yet"
+        # Its capped timer runs out with the lock still busy: back to sleep for the cap, no run.
+        p.db.update_task(tid, not_before=time.time() - 1)
+        d.probe_waiting()
+        task = p.db.task(tid)
+        assert not _ready(p, tid) and 200 < task["not_before"] - time.time() <= 300 + 5
+        assert "woke" not in json.loads(task["result"]) and not p.db.q("SELECT id FROM runs WHERE task=?", (tid,))
+    finally:
+        release.touch()
+        holder.wait(timeout=30)
+    d._probed[tid] = time.time() - 5
+    d.probe_waiting()
+    assert tid not in d._probes and not _ready(p, tid), "the next poll waits its interval"
+    _one_poll_later(d, tid)
+    assert _ready(p, tid), "the freed lock did not wake it within one poll"
+
+
+def test_an_urgent_task_wakes_within_one_poll_of_its_detached_job_ending(env, tmp_path):
+    from ttp import daemon as dmod
+    p = make(env)
+    d = dmod.Daemon(p.base)
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    flag = tmp_path / "end"
+    r = _ttp_run(p, "detach", "job", "--", *_until(flag), env={
+        "TTP_HOME": str(env["home"]), "TTP_HOST": "testhost", "TTP_RUN_DIR": str(run_dir),
+        "TTP_TASK": "41", "TTP_RUN_ID": "7"})
+    assert r.returncode == 0, r.stderr
+    rc = (run_dir / "job.rc").resolve()
+    tid = _urgent_sleeper(p, f"ttp detach --check {rc}")
+    try:
+        for _ in range(2):
+            _one_poll_later(d, tid)
+            assert not _ready(p, tid), "a running job is not yet"
+        assert not p.db.q("SELECT id FROM runs WHERE task=?", (tid,)), "polls that saw no change ran no model"
+    finally:
+        flag.touch()
+    assert _until_true(rc.exists), "the job did not end"
+    _one_poll_later(d, tid)
+    assert _ready(p, tid), "the ended job did not wake it within one poll"
