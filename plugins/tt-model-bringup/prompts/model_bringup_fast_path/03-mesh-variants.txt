@@ -1,0 +1,16 @@
+/goal Use $fast-path, $multichip, $tt-enable-tracing, and $tt-device-usage for the HF_MODEL served model in the current tt-metal checkout.
+
+As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
+
+Extend the fused batch-1 decode from the streaming-decode goal to every other mesh the authorized hardware serves (on QuietBox 2: one chip and two chips). Work on a branch off the integration branch.
+
+Goal completion requirements:
+- Each served mesh ends `fused` (default on), `opt_in` (behind a profile switch, with its trade-off stated), `stock` or `unsupported`, decided from roofline numbers and measurements recorded in the work log. `stock` and `unsupported` carry the measured reason.
+- When decode-only copies do not fit next to the served KV pool (typically one chip), use one shared streaming layout for decode and prefill as the $fast-path mesh-variants reference describes, rather than shrinking the KV pool.
+- When a mesh's copies or collectives cost another workload (for example batch-8 throughput on two chips), ship that mesh as opt-in, never as a slower default.
+- Each fused or opt-in mesh meets the streaming-decode gates: per-op and per-layer checks, faster short-context step and no more than 2% slower at long context, accuracy at 512 or more positions within 0.5/0.3 points of stock, KV blocks kept, clean traces, faster served c=1 TPOT, and a served smoke on the mesh's own profile.
+- Before merging into the integration branch, run the fast checks of the $fast-path validation reference: width-1 step and accuracy on every served mesh plus one served smoke. Revert a merge that moves any of them more than 2% the wrong way or fails an accuracy bar, and record why.
+- Write doc/fast_path/mesh_variants.json in the schema of the $fast-path validation reference (the primary mesh may point at streaming_decode), update the condition table, and run `python ${TT_MODEL_BRINGUP_ROOT}/scripts/check_fast_path.py --model-dir <model dir> --phase mesh_variants` until it exits 0.
+- $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
+
+Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.

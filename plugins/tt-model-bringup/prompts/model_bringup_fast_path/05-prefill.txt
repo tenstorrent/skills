@@ -1,0 +1,18 @@
+/goal Use $fast-path, $optimize, $vllm-integration, and $tt-device-usage for the HF_MODEL served model in the current tt-metal checkout.
+
+As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
+
+Cut time to first token without changing prefill numerics, and add an opt-in bit-reproducible prefill when served prefill is not reproducible. Work on a branch off the integration branch.
+
+Goal completion requirements:
+- Profile TTFT at the benchmark prompt lengths on every served mesh and rank the causes by milliseconds: host routing and dispatch stalls, padding waste, zero-fill, unfused activations, group counts, bucket choice.
+- A change that keeps the math leaves logit and greedy-text digests bit-identical at the fixed reference positions. A change that alters numerics says so and meets the streaming-decode accuracy bars instead.
+- TTFT at every measured length is at most 103% of before plus 5 ms, and at least one length is 3% faster, or the work log shows why nothing paid.
+- Rerun the $vllm-integration resumed-prefill, prefix-cache and prefill-burst checks; they still pass.
+- Serve the same prompt on a fresh server three times. If the outputs differ, implement a deterministic collective (for example one all-reduce in place of reduce-scatter plus all-gather) behind a switch, prove three bit-identical runs with it and state its TTFT cost. If default runs are already identical, record `not_needed` with the runs.
+- Every prefill bucket is warmed before the first trace capture; the program cache does not grow during served traffic.
+- Run the fast checks of the $fast-path validation reference before merging.
+- Write doc/fast_path/prefill.json in the schema of the $fast-path validation reference and run `python ${TT_MODEL_BRINGUP_ROOT}/scripts/check_fast_path.py --model-dir <model dir> --phase prefill` until it exits 0.
+- $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
+
+Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.
