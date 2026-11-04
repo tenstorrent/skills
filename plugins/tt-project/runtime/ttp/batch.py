@@ -49,7 +49,7 @@ import tokenize
 from collections import Counter, deque
 from pathlib import Path
 
-from . import (checkcap, checkdirs, cleantree, conflictfix, cyclenotice, envfault, locks, push, pushpass, runner, scopehold,
+from . import (checkcap, checkdirs, cleantree, conflictfix, cyclenotice, envfault, landmark, locks, push, pushpass, runner, scopehold,
                scriptwatch, testslots, workerloss, urgent,
                sharedchecks, slowtests, suitecost, verdictcarry, worktree)
 from .project import Project, command_env, durable_write, write_json
@@ -205,9 +205,24 @@ def _stream(cmd: str | list[str], cwd: Path, env: dict | None = None, timeout: f
     process group of its own, which a timeout kills whole. The tail starts with up to OVER_KEPT
     pytest `assert <size> <= <cap>` lines where the size is over, each naming its test, from
     anywhere in the output: a prompt size cap's measured overshoot (conflictfix.cap_failure). `collect`
-    gets every line (workerloss.Collector)."""
+    gets every line (workerloss.Collector). A check gating the push branch (env TTP_PUSH_MODE `target`)
+    runs under a landing mark this process holds until it ends, as push._run_one's do (landmark.py); no
+    other command inherits one."""
     sys.stdout.flush()
     sys.stderr.flush()
+    mark = landmark.hold() if env and env.get("TTP_PUSH_MODE") == "target" else None
+    if env is not None or landmark.ENV in os.environ:
+        env = {**{k: v for k, v in (os.environ if env is None else env).items() if k != landmark.ENV},
+               **({landmark.ENV: str(mark.path)} if mark else {})}
+    try:
+        return _streamed(cmd, cwd, env, timeout, group, pass_fds, collect)
+    finally:
+        if mark:
+            mark.close()
+
+
+def _streamed(cmd, cwd: Path, env: dict | None, timeout: float | None, group: bool, pass_fds: tuple,
+              collect: workerloss.Collector | None) -> tuple[int | None, str, bool]:
     proc = subprocess.Popen(cmd, shell=isinstance(cmd, str), cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=group, pass_fds=pass_fds)
     tail: deque[str] = deque(maxlen=push.LOG_TAIL)

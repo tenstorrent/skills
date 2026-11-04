@@ -830,7 +830,8 @@ def check_slot(head: str, say: Callable[[str], None], who: str = "", priority: s
     """A host-wide checks slot (checkcap) held while the push checks run, so `ttp push --own` counts
     toward the same cap as `ttp checks`. Checks gating a push to the push branch (`ttp push` and the
     push queue) pass `priority` (priority_key): they hold the push lock, so they take that branch's
-    priority slot beyond the cap instead of queueing behind task checks. Nested in a check that holds
+    priority slot beyond the cap instead of queueing behind task checks; `ttp land` passes its local
+    branch's. Nested in a check that holds
     one already (checkcap.HELD_ENV), it does not wait. Slots it cannot write raise checkcap.Unavailable.
     The slot's wait is logged in the state of `proj` (default: TTP_PROJECT's project)."""
     if proj is None and (base := os.environ.get("TTP_PROJECT")):

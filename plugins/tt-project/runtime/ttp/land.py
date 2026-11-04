@@ -140,7 +140,9 @@ def _replay(wt: Path, commits: list[str], say: Callable[[str], None]) -> int:
 
 def _checks(p: Project, wt: Path, new: str, base: str, say: Callable[[str], None], branch: str = "") -> int:
     """delivery.push_checks on `new` in scratch worktree `wt`, as `ttp push` runs them on its rebased
-    head: 0 when they pass. With none configured, only a docs-only change passes."""
+    head: 0 when they pass. With none configured, only a docs-only change passes. They take the priority
+    slot of local branch `branch` of the repository `wt` belongs to on the host checks queue, as a push
+    to the push branch does (_slot_key)."""
     d = p.config().get("delivery") or {}
     checks = push.with_host(push.check_list(push.repo_checks(d, wt, p)[0]), d.get("checks_host"))
     if not checks:
@@ -163,7 +165,7 @@ def _checks(p: Project, wt: Path, new: str, base: str, say: Callable[[str], None
     if why := push.runner_wait(todo, wt, env, say, p):
         return why
     try:
-        slot = push.check_slot(new, say, proj=p)
+        slot = push.check_slot(new, say, proj=p, priority=_slot_key(wt, branch))
     except push.checkcap.Unavailable as e:
         say(f"{e}; not landing")
         return CHECKS_FAILED
@@ -179,6 +181,13 @@ def _checks(p: Project, wt: Path, new: str, base: str, say: Callable[[str], None
                 return rc
     push.record_check_s(p, time.time() - started)
     return 0
+
+
+def _slot_key(wt: Path, branch: str) -> str:
+    """The host checks queue's priority key of local branch `branch`: the path of the repository whose
+    scratch worktree `wt` is (its common git folder's parent; `wt` itself when git cannot say) and the branch."""
+    common = _git(wt, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+    return push.priority_key(Path(common).parent if common else wt, "", branch)
 
 
 def _move(p: Project, repo: Path, branch: str, base: str, new: str, say: Callable[[str], None]) -> int:

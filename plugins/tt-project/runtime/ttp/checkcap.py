@@ -26,7 +26,8 @@ set, so a `ttp checks` nested in them runs at once instead of waiting for the sl
 Push checks (the push queue's batches and `ttp push` to the push branch) hold the push lock, so every
 approved change waits on them: they never queue behind task checks. Each push branch has one priority
 slot of its own beyond the cap (`acquire_priority`), keyed by the remote and branch so it is one per
-branch host-wide, across projects. Task checks keep their cap and their order: the priority slot never
+branch host-wide, across projects. `ttp land`'s checks take one too, keyed by the repository's path
+and the local branch it moves (push.priority_key with no remote). Task checks keep their cap and their order: the priority slot never
 takes one of theirs. It is an OS file lock like the others, so a killed push frees it too.
 
 Checks of priority-1 tasks (the daemon files live-impact work, heal self-fixes and interim mitigations,

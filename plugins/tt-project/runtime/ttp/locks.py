@@ -12,7 +12,8 @@ whose process is gone is dropped.
 
 A landing waiter (a `ttp lock` run inside the checks of a landing: `ttp push` to the push branch, the
 push queue's batch checks, `ttp land`, in any project) goes ahead of other waiters, in arrival order
-within each class. Only the harness marks one: the check runner holds a landing mark (landmark.py) and
+within each class. Only the harness marks one: the check runner (push._run_one for `ttp push` and `ttp
+land`, batch._stream for the push queue's batches) holds a landing mark (landmark.py) and
 `ttp lock` counts as landing only if that mark is held by one of its own ancestors, so a forged
 environment gets normal ordering. The bound: a waiter that has waited LANDING_AGE_S is no longer
 passed by later landings. A landing never preempts a holder; it only moves up the queue. A waiting

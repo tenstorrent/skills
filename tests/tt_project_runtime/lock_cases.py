@@ -2198,3 +2198,52 @@ def test_only_a_landing_check_runs_under_a_landing_mark(env, tmp_path):
         inherited.close()
     assert out.read_text().split() == ["True", "False", "False"]
     assert list(landmark.marks_dir().iterdir()) == []
+
+
+@pytest.mark.parametrize("mode", ["target", "own"])
+def test_a_push_batch_checks_ttp_lock_goes_ahead_of_an_earlier_suite_waiter_only_for_the_push_branch(env, tmp_path, mode):
+    """batch._stream (every push batch check: Batch._run_check, its reruns and cap probes): a check in
+    TTP_PUSH_MODE target runs under a landing mark the batch process holds, so its `ttp lock` from another
+    project is queued as a landing and takes a shared lock before an earlier suite waiter. Any other check
+    waits in arrival order, even given a held mark of the batch process; the mark is gone once it ends."""
+    import threading
+    from ttp import batch, landmark
+    a, b = make(env, "proj-a"), _second_project(env, "proj-b")
+    for p in (a, b):
+        p.set_config("shared_resources", ["gate"])
+    marks, go, go_b = tmp_path / "marks", tmp_path / "go", tmp_path / "go-b"
+    env_a = _lock_env(env, a)
+    inherited = landmark.hold()
+    env_b = _lock_env(env, b, PYTHONPATH=str(RUNTIME), TTP_PUSH_MODE=mode, **{landmark.ENV: str(inherited.path)})
+    late = [sys.executable, str(TTP), "lock", "gate", "--", *_mark(marks, "late", go_b)]
+    got = []
+    t = threading.Thread(target=lambda: got.append(batch._stream(late, tmp_path, env=env_b)), daemon=True)
+    holder = _lock(env_a, "gate", cmd=_mark(marks, "holder", go))
+    procs = [holder]
+    try:
+        _until_or_ended(lambda: marks.exists() and "start holder" in marks.read_text(), procs)
+        procs.append(_lock(env_a, "gate", cmd=_mark(marks, "suite")))
+        _until_or_ended(lambda: _queue_len(a, "gate") == 1, procs)
+        t.start()
+        _until_or_ended(lambda: _queue_len(a, "gate") == 2, procs)
+        if mode == "target":
+            assert len(list(landmark.marks_dir().iterdir())) == 2, "the batch process holds a mark while it runs"
+        go.touch()
+        _until_or_ended(lambda: "start late" in marks.read_text() or "start suite" in marks.read_text(), procs[1:])
+        seen = marks.read_text()
+        assert (seen.find("start late") % 10**6 < seen.find("start suite") % 10**6) == (mode == "target"), seen
+        go_b.touch()
+        t.join(60)
+        assert not t.is_alive() and got and got[0][0] == 0, got
+        assert _ended(procs) == [0, 0]
+    finally:
+        go.touch()
+        go_b.touch()
+        for x in procs:
+            if x.poll() is None:
+                x.kill()
+        t.join(60)
+        inherited.close()
+    starts = [ln.split()[1] for ln in marks.read_text().splitlines() if ln.startswith("start ")]
+    assert starts == (["holder", "late", "suite"] if mode == "target" else ["holder", "suite", "late"]), starts
+    assert list(landmark.marks_dir().iterdir()) == []

@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Landing marks: how a `ttp lock` waiter inside a landing's checks goes ahead of other waiters.
 
-The landing checks runner (push._run_one for checks in TTP_PUSH_MODE `target`: the push queue's batches,
-`ttp push` to the push branch and `ttp land`) holds a mark while each check runs: an OS file lock in
-marks_dir() (under the host's check-slot folder), labelled with the runner's pid and start time, its path
-given to the check in ENV. A `ttp lock` in the check counts as a landing (verified) only when that file
+Each runner of a check in TTP_PUSH_MODE `target` holds a mark while the check runs: push._run_one
+(`ttp push` to the push branch and `ttp land`) and batch._stream (the push queue's batch checks, their
+reruns and cap probes; the batch process holds it). Each strips an inherited ENV first. The mark is
+an OS file lock in marks_dir() (under the host's check-slot folder), labelled with the runner's pid and
+start time, its path given to the check in ENV. A `ttp lock` in the check counts as a landing (verified) only when that file
 is in marks_dir(), held right now, and its holder is one of the waiter's own ancestors in this PID
 namespace with the start time the label records. A worker that sets ENV itself, names another push's
 mark or a file nobody holds waits as a non-landing waiter (locks.landing_first orders the queue).

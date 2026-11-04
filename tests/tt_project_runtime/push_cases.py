@@ -12080,6 +12080,41 @@ def test_ttp_land_drops_a_commit_already_on_the_branch_and_tells_other_git_failu
     assert _git_out(repo, "rev-parse", "proj") == new and "not a conflict" in " ".join(said)
 
 
+def test_ttp_land_checks_take_their_branch_priority_slot_ahead_of_an_earlier_waiting_task_check(env, monkeypatch):
+    """`ttp land`'s checks take the host checks queue's priority slot of the local branch (keyed by the
+    repository's path, whichever worktree runs them), as push batches and `ttp push` do: with the cap full
+    and another project's task check waiting since earlier, the landing runs and lands at once, and the
+    earlier task check keeps its place in the fair queue."""
+    import threading
+    from ttp import checkcap, locks, push
+    from ttp.project import Project
+    land, p, repo, t, head = _land_setup(env, monkeypatch, ["true"])
+    key = push.priority_key(repo, "", "proj")
+    side = env["tmp"] / "side-wt"
+    _git_out(repo, "worktree", "add", "-q", "--detach", str(side))
+    assert land._slot_key(repo, "proj") == land._slot_key(side, "proj") == key == f"{repo.resolve()}#proj"
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    held = checkcap.acquire("suite of another project", project_name="other")
+    earlier = locks.enqueue(checkcap.slot_dir(), checkcap.RESOURCE, "earlier task check", since=1000.0, group="other")
+    said, got = [], []
+
+    def run():
+        try:
+            got.append(land.land(Project(p.base), repo, head, t, said.append))   # its own db connection
+        except BaseException as e:
+            got.append(e)
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    try:
+        th.join(60)
+        assert not th.is_alive() and got == [0], said
+        assert locks.queued(checkcap.slot_dir(), checkcap.RESOURCE) == [earlier], "the earlier waiter kept its place"
+    finally:
+        held.close()
+        locks.dequeue(earlier)
+        th.join(60)
+
+
 def test_ttp_land_starts_over_while_the_branch_moves_and_stops_after_its_tries(env, monkeypatch):
     """The branch moving during the checks starts the landing over on its new tip; one that keeps
     moving exits 5 after MOVE_TRIES. A dirty checkout that has the branch exits 6 and lands once clean."""
