@@ -9107,10 +9107,12 @@ class Daemon:
             self.alert("upgrade-merge-stuck", f"The automatic upgrade to tt-project {d['installed']} failed: "
                                               f"{stuck}.", "normal", every_s=0)
         why = release.hold_reason(self.p, d)
+        release.note_push_hold(self.p, d["key"], why)
         if why:
             soon = why.endswith(("in flight", release.CYCLE_HELD, release.RECHECK))
-            if soon:
-                self._release_due = now + release.HELD_RECHECK_S
+            if soon:    # past upgrade.push_hold_min a push step's end is looked for sooner
+                self._release_due = now + (release.PUSH_STEP_RECHECK_S if why.startswith(release.PUSH_HELD)
+                                           and why.endswith(release.RECHECK) else release.HELD_RECHECK_S)
             if (db.kv(release.KV_AUTO) or {}).get("key") != d["key"] or soon:
                 log(self.p, f"automatic upgrade to {d['installed']} held: {why}")
             return

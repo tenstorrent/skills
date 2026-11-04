@@ -45,6 +45,7 @@ from .project import (Project, code_tasks_may_push, durable_append, durable_writ
                       load_registry, nice_level, open_append_or_null, own_creates_pr_branch, own_push, push_queue_on,
                       rebase_replace, renice, write_json)
 from .project import never_force as never_force_on
+from .release import UPGRADE_RESOURCE, _taken as _lock_taken
 
 # Exit codes, distinct so a worker can say why it did not push. BUSY: another push to the same
 # branch kept the lock past `delivery.push_wait_s`; the task hands back `waiting`.
@@ -3356,6 +3357,45 @@ def take(p: Project, remote: str, branch: str, wait_s: float, poll_s: float = 1.
     return None
 
 
+UPGRADE_WAIT_S = 900   # a push step waits at most this long for an automatic upgrade that runs now
+
+
+class Steps:
+    """The steps of a push (a rebase, the checks, the push itself) named in the label of its held branch
+    lock: past upgrade.push_hold_min an automatic upgrade waits only for a push inside a step
+    (release.push_hold), so it starts between steps, never in one. A step marks itself first and then
+    reads the upgrade lock; the upgrade takes that lock first and then reads the marks, so the two never
+    both go: a step that finds an upgrade running unmarks itself and waits for it (UPGRADE_WAIT_S at most)."""
+
+    def __init__(self, lock, say: Callable[[str], None] = lambda m: None, poll_s: float = 1.0):
+        name = getattr(lock, "name", None)
+        self.lock = lock if isinstance(name, str) else None
+        self.up = Path(name).parent / f"{UPGRADE_RESOURCE}.0.lock" if self.lock else None
+        self.say, self.poll_s = say, poll_s
+
+    def _upgrading(self) -> bool:
+        return _lock_taken(self.up)
+
+    def go(self, step: str) -> None:
+        if not self.lock:
+            return
+        waited = 0.0
+        while True:
+            locks.relabel(self.lock, {"step": step, "step_since": time.time()})
+            if not self._upgrading() or waited >= UPGRADE_WAIT_S:
+                return
+            self.between()
+            if not waited:
+                self.say(f"an automatic tt-project upgrade is running; the {step} step waits for it")
+            while self._upgrading() and waited < UPGRADE_WAIT_S:
+                time.sleep(self.poll_s)
+                waited += self.poll_s
+
+    def between(self) -> None:
+        if self.lock:
+            locks.relabel(self.lock, {"step": ""})
+
+
 def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = DEFAULT_ROUNDS,
          say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr),
          hold: Callable[[], Any] | None = None, version_bump: dict | None = None,
@@ -3392,7 +3432,7 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
         _git(repo, "switch", "--detach", "--quiet")
     try:
         return _rounds(repo, remote, branch, checks, rounds, say, version_bump, timed, keep, exclude, check_run_dir,
-                       guard, landed)
+                       guard, landed, Steps(lock, say))
     finally:
         if keep:
             if Path(_git(repo, "rev-parse", "--absolute-git-dir").stdout.strip(), "rebase-merge").is_dir():
@@ -3505,6 +3545,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
     lock = hold() if hold else None
     if hold and lock is None:
         return BUSY
+    Steps(lock, say).go("own push")    # its checks and push, one step: no rebase to pause between
     try:
         head = _git(repo, "rev-parse", "HEAD").stdout.strip()
         try:
@@ -3764,11 +3805,13 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             say: Callable[[str], None], version_bump: dict | None = None,
             timed: Callable[[float], None] | None = None, keep: str = "",
             exclude: list[str] | None = None, check_run_dir: str | None = None, guard: bool = False,
-            landed: dict[str, str] | None = None) -> int:
+            landed: dict[str, str] | None = None, steps: Steps | None = None) -> int:
     global last_pushed
     upstream = f"{remote}/{branch}"
     passes: dict[str, tuple[str, str]] = {}   # check -> (tip, head) it last passed on in this push
+    steps = steps or Steps(None)
     for rnd in range(1, rounds + 1):
+        steps.go("rebase")
         tip = _fetch(repo, remote, branch)
         if not tip:
             say(f"cannot fetch {upstream}")
@@ -3829,6 +3872,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             else:
                 carried.append(f"{verdictcarry.line(was[1], delta)}: {cmd}")
                 say(carried[-1])
+        steps.between()   # waiting for a checks runner or slot: an upgrade may go now
         if run and (why := runner_wait(run, repo, check_env("target", tip, check_run_dir, branch), say)):
             return why
         try:
@@ -3837,6 +3881,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             say(f"{e}; not pushing")
             return CHECKS_FAILED
         with slot:
+            steps.go("checks")
             started = time.time()
             env = {**check_env("target", tip, check_run_dir, branch), **slot.env()}
             for line in sandbox_lines(run):
@@ -3849,6 +3894,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         if run and not carried and timed:
             timed(time.time() - started)
         passes = {str(cmd): (tip, head) for cmd in todo}
+        steps.go("push")
         if _fetch(repo, remote, branch) != tip:
             say(f"{upstream} moved during the checks; round {rnd + 1}")
             continue

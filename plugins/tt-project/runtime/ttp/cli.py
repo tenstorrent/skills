@@ -9473,9 +9473,11 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
               + (f"\n{p.name} paused; upgrades when resumed: task #{tid} runs once {p.name} is resumed "
                  f"(the pause was left as it is)." if p.db.kv("paused", False) else ""))
         sys.exit(75)        # deferred: the project's own harness task takes it on
-    if auto and release.push_in_flight(p):   # a push started while this merged: never swap under it
-        release.finish(p, "held", why="a push is in flight")
-        print("upgrade held: a push is in flight; the running harness is unchanged and the daemon retries later")
+    # A push started while this merged, or one inside a step (push.Steps waits for this lock before
+    # a step, which it marks first): never swap under it.
+    if auto and (pushing := release.push_hold(p, (p.db.kv(release.KV_AUTO) or {}).get("key", ""))):
+        release.finish(p, "held", why=pushing)
+        print(f"upgrade held: {pushing}; the running harness is unchanged and the daemon retries later")
         sys.exit(75)
     moved = _moved_template(h, base)
     if moved:

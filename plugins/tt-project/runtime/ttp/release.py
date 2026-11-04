@@ -29,6 +29,10 @@ KV_RELEASE, KV_AUTO = "release", "upgrade_auto"
 SETUP_JOURNAL = ".setup.journal"   # in HOME_DIR/lib while `ttp setup` copies a release in (cli._recover_setup)
 COPY_TRIES = 3          # an --auto upgrade whose template copy fails is held and retried, failed at the third
 RECHECK = "rechecked soon"   # the tail of a hold_reason line check_release looks at again in HELD_RECHECK_S
+PUSH_HOLD_MIN = 30      # upgrade.push_hold_min: past this, pushes hold an automatic upgrade only while one is inside a step
+PUSH_STEP_RECHECK_S = 60   # a release held past that bound by a push step is looked at again this soon
+KV_PUSH_HOLD = "upgrade_push_hold"   # {key, since, why}: the automatic upgrade pushes hold now, for line()
+PUSH_HELD = "a push is "   # the start of every push_hold line
 
 
 def installed() -> Path:
@@ -457,6 +461,70 @@ def push_in_flight(p: Project) -> bool:
     return any(h.startswith("push:") for h in locks.held(p.state / "locks"))
 
 
+def push_hold_s(cfg: dict) -> float:
+    try:
+        v = float((cfg.get("upgrade") or {}).get("push_hold_min", PUSH_HOLD_MIN))
+    except (TypeError, ValueError):
+        v = PUSH_HOLD_MIN
+    return (v if v > 0 else PUSH_HOLD_MIN) * 60
+
+
+def live_pushes(p: Project) -> list[dict]:
+    """The label of each `push:` lock taken now by a live process. One whose label names a process that is
+    gone holds nothing: a process that inherited the file keeps it taken, not the push."""
+    out = []
+    for path in sorted((p.state / "locks").glob("push:*.lock")):
+        if not _taken(path):
+            continue
+        try:
+            h = locks.read_label(path)
+        except (OSError, ValueError):
+            h = {}
+        if locks.pid_alive(h) is not False:
+            out.append(h)
+    return out
+
+
+def push_hold(p: Project, key: str = "", cfg: dict | None = None) -> str:
+    """Why pushes hold an automatic upgrade now ("" = they do not). Within upgrade.push_hold_min of the
+    first push hold of release `key` (KV_PUSH_HOLD) or of the oldest live push, any live push holds it;
+    past that only one inside a step (push.Steps: a rebase, the checks, the push itself), so the upgrade
+    starts between steps and never in the middle of one."""
+    holds = live_pushes(p)
+    if not holds:
+        return ""
+    now = time.time()
+    first = min(float(h.get("since") or now) for h in holds)
+    rec = p.db.kv(KV_PUSH_HOLD) or {}
+    if key and rec.get("key") == key and rec.get("since"):
+        first = min(first, float(rec["since"]))
+    bound = push_hold_s(p.config() if cfg is None else cfg)
+    if now - first < bound:
+        return f"{PUSH_HELD}in flight"
+    steps = [h for h in holds if h.get("step")]
+    if not steps:
+        return ""
+    h = steps[0]
+    return (f"{PUSH_HELD}in its {h['step']} step since {timefmt.long(float(h.get('step_since') or now), p)}; "
+            f"past the {bound / 60:g} min bound it waits only for that step to end, {RECHECK}")
+
+
+def note_push_hold(p: Project, key: str, why: str) -> None:
+    """check_release, with its hold_reason `why`: record a push hold for line(), `since` kept while pushes
+    keep holding the same release. Another hold clears it; so does none, unless a push still runs: the
+    upgrade's own check at its swap (cmd_upgrade) then counts the bound from the same `since`."""
+    rec = p.db.kv(KV_PUSH_HOLD) or {}
+    if not why.startswith(PUSH_HELD):
+        if rec and (why or not live_pushes(p)):
+            p.db.x("DELETE FROM kv WHERE key=?", (KV_PUSH_HOLD,))
+        elif rec.get("why"):
+            p.db.set_kv(KV_PUSH_HOLD, {**rec, "why": ""})   # no longer held: line() drops it
+        return
+    since = float(rec["since"]) if rec.get("key") == key and rec.get("since") else time.time()
+    if rec.get("why") != why or rec.get("key") != key:
+        p.db.set_kv(KV_PUSH_HOLD, {"key": key, "since": since, "why": why})
+
+
 def merge_head(h: Path) -> str:
     """The live harness's MERGE_HEAD sha ("" when no merge is in progress there)."""
     r = subprocess.run(["git", "-C", str(h), "rev-parse", "-q", "--verify", "MERGE_HEAD"],
@@ -517,8 +585,8 @@ def hold_reason(p: Project, d: dict) -> str:
         return cyclenotice.line(h, p) + "; " + CYCLE_HELD
     if _taken(upgrade_lock(p)):
         return "an upgrade is in flight"
-    if push_in_flight(p):
-        return "a push is in flight"
+    if why := push_hold(p, d["key"]):
+        return why
     if (HOME_DIR / "lib" / SETUP_JOURNAL).exists():   # its copy would race ours; any `ttp` run recovers it
         return f"a `ttp setup` (or its recovery) is copying a release in; {RECHECK}"
     rec = p.db.kv(KV_AUTO) or {}
@@ -588,6 +656,10 @@ def line(p: Project, db, cfg: dict) -> str:
     if h:
         return text + f" (the merge needs harness task #{h['task']}; {holder_line(p, h, db)})"
     rec = db.kv(KV_AUTO) or {}
+    ph = db.kv(KV_PUSH_HOLD) or {}
+    if ph.get("key") == d["key"] and ph.get("why") and rec.get("outcome") != "running":
+        return text + (f" (upgrade held since {timefmt.long(float(ph.get('since') or 0), p)}: {ph['why']}; "
+                       f"this project's daemon retries)")
     if rec.get("key") == d["key"]:
         if rec.get("outcome") == "running":
             if _taken(upgrade_lock(p)) or time.time() - float(rec.get("ts") or 0) < 900:
