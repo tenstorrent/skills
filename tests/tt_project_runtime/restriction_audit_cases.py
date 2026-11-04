@@ -284,7 +284,7 @@ def test_every_two_word_hit_needs_a_rare_word(env):
 _SOAK_BANS = ("# demo\n\n## Restrictions\n"
               "- Never run the soak test on a shared rack. (user msg #7)\n"
               "- Never open pull requests. (user msg #1)\n")
-_SOAK = "Never run the soak test on a shared rack."
+_GUARD_SOAK = "Never run the soak test on a shared rack."
 
 
 def _soak_guard(env):
@@ -308,7 +308,7 @@ def test_a_scoped_exception_queues_one_update_task_naming_the_guard_still_enforc
     from ttp import coordinator as coord, restriction_audit
     p, tasks = _soak_guard(env)
     mids, src = _turn_said(p, "the soak test may run on rack-a with soak_leg.sh")
-    act = {"type": "charter_update", "section": "Restrictions", "excepts": _SOAK,
+    act = {"type": "charter_update", "section": "Restrictions", "excepts": _GUARD_SOAK,
            "text": "Workers may run the soak test on rack-a with `soak_leg.sh`.", "source": src}
     assert coord.apply(p, [act], turn=1, user_turn=True, messages=mids) == []
     assert "Exception to \"Never run the soak test on a shared rack.\"" in p.charter_path.read_text()
@@ -316,7 +316,7 @@ def test_a_scoped_exception_queues_one_update_task_naming_the_guard_still_enforc
     assert len(got) == 1, got
     t = got[0]
     assert t["priority"] == 1 and t["kind"] == "harness" and t["status"] == "queued", t
-    assert "bin/soak-guard.sh:2" in t["spec"] and _SOAK in t["spec"] and "rack-a" in t["spec"], t["spec"]
+    assert "bin/soak-guard.sh:2" in t["spec"] and _GUARD_SOAK in t["spec"] and "rack-a" in t["spec"], t["spec"]
     assert "pre.sh" not in t["spec"] and "never loosen past the new text" in t["spec"], t["spec"]
     assert "exception" in t["spec"] and "keep enforcing the rest" in t["spec"], t["spec"]
     ev = [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind='restriction_tools'")]
@@ -341,7 +341,7 @@ def test_restriction_tools_queues_no_task_without_a_matching_tool_or_for_an_unre
     p, tasks = _soak_guard(env)
     (p.root / "bin" / "soak-guard.sh").write_text("#!/bin/sh\necho 'refused: disk almost full'; exit 1\n")
     mids, src = _turn_said(p, "the soak test may run on rack-a with soak_leg.sh")
-    act = {"type": "charter_update", "section": "Restrictions", "excepts": _SOAK,
+    act = {"type": "charter_update", "section": "Restrictions", "excepts": _GUARD_SOAK,
            "text": "Workers may run the soak test on rack-a with `soak_leg.sh`.", "source": src}
     assert coord.apply(p, [act], turn=1, user_turn=True, messages=mids) == []
     assert tasks() == []
@@ -361,7 +361,7 @@ def test_a_loosened_item_queues_one_task_naming_a_guard_file_and_a_task_probe(en
     p, tasks = _soak_guard(env)
     held = p.db.add_task("soak leg", "run it", kind="work", labels=["start_when:bin/soak-guard.sh --cite 'user msg #7'"])
     mids, src = _turn_said(p, "the soak test may run on a shared rack at night")
-    act = {"type": "charter_update", "section": "Restrictions", "quote": _SOAK + " (user msg #7)",
+    act = {"type": "charter_update", "section": "Restrictions", "quote": _GUARD_SOAK + " (user msg #7)",
            "text": "Run the soak test on a shared rack only at night.", "source": src}
     assert coord.apply(p, [act], turn=1, user_turn=True, messages=mids) == []
     got = tasks()
@@ -381,4 +381,4 @@ def test_a_lifting_both_hold_text_queues_the_update_task_too(env):
            "text": "Workers may run the soak test on rack-a with `soak_leg.sh`.", "source": src}
     assert coord.apply(p, [act], turn=1, user_turn=True, messages=mids) == []
     got = tasks()
-    assert len(got) == 1 and "bin/soak-guard.sh:2" in got[0]["spec"] and _SOAK in got[0]["spec"], got
+    assert len(got) == 1 and "bin/soak-guard.sh:2" in got[0]["spec"] and _GUARD_SOAK in got[0]["spec"], got
