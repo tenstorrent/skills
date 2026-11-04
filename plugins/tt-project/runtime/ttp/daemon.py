@@ -1707,7 +1707,7 @@ class Daemon:
         core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
         cycle = self._run_step(lambda: self.host_cycle_held(now), "host_cycle_held", default=False)
         for step in (self.run_schedules, self.check_self_review, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_unstarted, self.check_checks_wait, self.check_checks_owner, self.check_checks_stall, self.check_cap_wait, self.check_progress, self.check_churn, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.check_route_models, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.check_self_blocking, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_unstarted, self.check_checks_wait, self.check_checks_owner, self.check_checks_stall, self.check_cap_wait, self.check_progress, self.check_churn, self.check_host_load, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.check_route_models, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.check_self_blocking, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -6578,6 +6578,13 @@ class Daemon:
                              + "\n".join(f"- {line}" for line in gone))
             except Exception as e:   # nor must the machine ledger
                 log(self.p, f"quiet outage lines failed: {type(e).__name__}: {e}")
+            try:
+                from . import hostload
+                spec += ("\n\nCheck runs per host now, with this host's load (hostload; an overloaded host "
+                         "with no spill host taking runs needs runs moved off it):\n"
+                         + "\n".join(f"- {line}" for line in hostload.lines(self.cfg)))
+            except Exception as e:   # nor must the host-load reading
+                log(self.p, f"host load lines failed: {type(e).__name__}: {e}")
         if payload.get("audit_report", s["name"] == "daily-review"):
             try:
                 recover = ttr.review_lines(self.p)
@@ -6846,6 +6853,34 @@ class Daemon:
             churnwatch.record(self.p.logs / churnwatch.FILE, obs, now, self.__dict__.setdefault("_churn_log", {}),
                               lambda m: log(self.p, m))
             self.observe("daemon:process-churn", obs["text"], obs["severity"], whole=True, key=obs["key"])
+
+    def check_host_load(self) -> None:
+        """Model-free host-load watch (hostload): this host's 5-minute load above the load guard's threshold
+        while local check runs sit at or near the checks cap and no spill host takes any, for
+        hostload.HOLD_S, raises one normal observation keyed hostload.KEY per episode; its issue closes once
+        that no longer holds. Read-only."""
+        from . import hostload
+        now = time.time()
+        if now - getattr(self, "_host_load_checked", 0.0) < hostload.CHECK_S:
+            return
+        self._host_load_checked = now
+        w = self.__dict__.setdefault("_host_load", hostload.Watch())
+        got = w.step(hostload.snapshot(self.cfg), now)
+        if not got:
+            return
+        if got[0] == "raise":
+            log(self.p, got[1]["text"][:300])
+            self.observe(hostload.SOURCE, got[1]["text"], "normal", whole=True, key=got[1]["key"],
+                         episode=got[1]["episode"])
+            return
+        db = self.p.db
+        for r in db.q("SELECT id, history FROM issues WHERE source=? AND watch_key=? AND status='open'",
+                      (hostload.SOURCE, hostload.KEY)):
+            history = json.loads(r["history"] or "[]") + [{"ts": now, "action": "closed", "by": "daemon",
+                                                           "why": hostload.CLEARED}]
+            db.x("UPDATE issues SET status='fixed', closed=?, cleared_why=?, history=? WHERE id=?",
+                 (now, hostload.CLEARED, json.dumps(history), r["id"]))
+            log(self.p, f"checks host overloaded: issue {r['id']} closed, {hostload.CLEARED}")
 
     def _gated_urgent(self, now: float) -> list[dict]:
         """Queued urgent tasks whose dependencies are met, held only from dispatch by a start gate

@@ -260,19 +260,23 @@ def _own_held(project_name: str, c: int) -> int:
         return 0
 
 
-def load_guard() -> str:
-    """Why no new suite may start now, or "": the host's 1-minute load is above checks.load_guard
-    (TTP_CHECKS_LOAD_GUARD, else the account's setting, else LOAD_GUARD) times its cores. 0 turns the
-    guard off; an unreadable load average never holds a suite."""
-    factor: float = LOAD_GUARD
+def load_guard_factor() -> float:
+    """checks.load_guard: TTP_CHECKS_LOAD_GUARD, else the account's setting, else LOAD_GUARD; 0 is off."""
     for v in (os.environ.get("TTP_CHECKS_LOAD_GUARD"), (project.load_account_settings().get("checks") or {}).get("load_guard")):
         if v in (None, "") or isinstance(v, bool):
             continue
         try:
-            factor = max(0.0, float(v))
-            break
+            return max(0.0, float(v))
         except (TypeError, ValueError):
             continue
+    return LOAD_GUARD
+
+
+def load_guard() -> str:
+    """Why no new suite may start now, or "": the host's 1-minute load is above checks.load_guard
+    (load_guard_factor()) times its cores. 0 turns the guard off; an unreadable load average never
+    holds a suite."""
+    factor = load_guard_factor()
     if not factor:
         return ""
     ld, c = checkcap._load(), checkcap.cores()

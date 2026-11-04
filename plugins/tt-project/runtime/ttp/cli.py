@@ -4239,7 +4239,8 @@ def _checks_cmd_error(a) -> str:
 
 def _checks_lane_status(as_json: bool) -> int:
     """`ttp checks status` (also --slot-status): the project's checks lanes, their holders and waiters
-    (checklane.lane_status). Read only: it never queues, takes or writes a lock, or starts a check."""
+    (checklane.lane_status), and the check runs per host with this host's load (hostload.lines). Read only:
+    it never queues, takes or writes a lock, or starts a check."""
     from . import checklane, testslots
     p = here()
     if not p:
@@ -4247,20 +4248,24 @@ def _checks_lane_status(as_json: bool) -> int:
     top = subprocess.run(["git", "-C", str(Path.cwd()), "rev-parse", "--show-toplevel"], capture_output=True,
                          text=True).stdout.strip()
     here_repo = testslots.repo_key(top) if top else ""
-    from . import checkjoin, checkspill
+    from . import checkjoin, checkspill, hostload
     followers = checkjoin.status_lines(p.state)   # joined or superseded waiters: they run no suite of their own
+    load = hostload.snapshot(p.config())
     names = {"": p.root.name, **({here_repo: testslots.repo_name(top) or here_repo} if here_repo else {})}
     if as_json:
         print(json.dumps({"project": p.name, "slots": checklane.slots(p.config()),
                           "project_max": checklane.project_cap(p.config()), "this_repo": here_repo,
                           "repos": checklane.lane_status(p.name, cfg=p.config(), names=names, db=p.db),
                           "spilled": checkspill.holders(p.name),
+                          "hosts": {**load, "overloaded": hostload.overloaded(load)},
                           "followers": [x.strip() for x in followers]},
                          indent=2))
     else:
         print(checklane.status_text(p.name, p.config(), here_repo, names=names, db=p.db))
         for line in checkspill.status_lines(p.name):
             print(f"  {line}")
+        print("check runs per host:")
+        print("\n".join(f"  {line}" for line in hostload.lines(s=load)))
         if followers:
             print("following another run of their task (checkjoin), no suite of their own:")
             print("\n".join(followers))
