@@ -1278,8 +1278,8 @@ queues behind routine work; nothing running is interrupted:
   (`checks.test_project_max`, below) times one run's grant, at most the pool, so every check under that cap gets its
   workers (3 checks at once with a grant of 8 make a budget of 24: each run gets 8, never the whole budget); `checks.test_project_slots` (chat-settable, a whole number of at least 1) sets the budget outright.
   Both stay within `checks.test_project_workers` (chat-settable, per project or account; default the smaller of 8 and
-  one per 8 cores, at least 2, plus the cores the larger of the 1- and 5-minute load leaves under 0.75 x the cores, at most
-  half the cores; `checks.load_extra` 0 keeps the base; a shrink bounds new grants only), the most test workers one project's suites run at once, which also bounds one run's
+  one per 8 cores, at least 2, plus the cores the larger of the 1- and 5-minute load, less one per test slot the project itself holds, leaves under
+  0.75 x the cores, at most half the cores, so its own suites never shrink it; `checks.load_extra` 0 keeps the base; a shrink bounds new grants only), the most test workers one project's suites run at once, which also bounds one run's
   grant. No new suite starts while the host's 1-minute load is above its cores (`checks.load_guard`, a factor of the
   cores, default 1; 0 turns it off): it waits and its lane's wait note says why; running suites go on. Push
   checks wait there at most `checks.push_load_wait_s` seconds (default 300; `off`: no bound), then start on

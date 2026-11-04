@@ -5999,6 +5999,44 @@ def test_an_unreadable_load_gives_the_base_test_worker_ceiling(env, monkeypatch)
         assert testslots.project_workers() == want, "never below WORKERS_FLOOR"
 
 
+def test_a_project_s_own_held_suites_never_shrink_its_test_worker_ceiling(env, monkeypatch):
+    """The load its own held test slots add (one worker each) is taken out before the spare term: with
+    only its own suite loading the host its ceiling stays the idle one, so its next suite still gets the
+    rest of it; another project, which holds none of those slots, sees the whole load."""
+    from ttp import testslots
+    _slot_sizes(monkeypatch, 64, 28, TTP_TEST_PROJECT_SLOTS=64, TTP_CHECKS_LIVE_CORES=0)
+    load = [0.0]
+    _spare_load(monkeypatch, 64, 0.0)
+    monkeypatch.setattr(testslots.os, "getloadavg", lambda: (load[0], load[0], 0.0))
+    assert testslots.project_workers(project_name="pa") == 32 and testslots.project_max(project_name="pa") == 32
+    a = testslots.acquire("a", project_name="pa", wait_s=0)
+    assert a and a.k == 28
+    load[0] = 28.0   # a's own 28 workers only
+    assert testslots.project_workers(project_name="pa") == 32, "its own load leaves its ceiling alone"
+    assert testslots.project_max(project_name="pa") == 32
+    assert testslots.project_workers() == 28 and testslots.project_workers(project_name="pb") == 28, \
+        "with no project (or another one) the whole load counts"
+    b = testslots.acquire("b", project_name="pa", wait_s=0)
+    assert b and b.k == 4, "its own load never holds its next suite below the idle ceiling of 32"
+    for g in (a, b):
+        g.close()
+
+
+@pytest.mark.parametrize("others,want", [(0, 32), (30, 26), (40, 16), (48, 8), (60, 8)])
+def test_others_load_still_shrinks_a_project_s_test_worker_ceiling_beside_its_own_held_suites(
+        env, monkeypatch, others, want):
+    """Load beyond its own held slots' is others', and shrinks its ceiling as before (the host's pool
+    and load guard still bound the total)."""
+    from ttp import testslots
+    _slot_sizes(monkeypatch, 64, 8, TTP_TEST_PROJECT_SLOTS=64, TTP_CHECKS_LIVE_CORES=0)
+    _spare_load(monkeypatch, 64, 0.0)
+    a = testslots.acquire("a", project_name="pa", wait_s=0)
+    assert a and a.k == 8
+    _spare_load(monkeypatch, 64, float(others + 8))
+    assert testslots.project_workers(project_name="pa") == want
+    a.close()
+
+
 def test_grants_follow_the_grown_ceiling_and_holders_past_a_shrunk_one_still_count(env, monkeypatch):
     """project_max() and acquire() bound grants by the ceiling of the moment; once it shrinks, a run
     above it keeps its slots and they still count, so no new grant goes past the new ceiling even when
@@ -6016,7 +6054,7 @@ def test_grants_follow_the_grown_ceiling_and_holders_past_a_shrunk_one_still_cou
     b = testslots.acquire("b", project_name="pa", wait_s=0)
     assert b and b.k == 24, "idle host: up to the grown ceiling of 32, a's 8 counted"
     a.close()
-    load[0] = 48.0
+    load[0] = 72.0   # others' 48 plus b's own 24 (its own load never shrinks its ceiling)
     told = []
     assert testslots.acquire("c", told.append, project_name="pa", wait_s=0.2) is None, \
         "b's 24 past the shrunk ceiling of 8 still count, though slots 0-7 are free"
@@ -6025,6 +6063,7 @@ def test_grants_follow_the_grown_ceiling_and_holders_past_a_shrunk_one_still_cou
     o = testslots.acquire("o", project_name="pb", wait_s=0)
     assert o and o.k == 8, "another project has its own ceiling"
     b.close()
+    load[0] = 56.0   # others' 48 plus o's 8
     c = testslots.acquire("c", project_name="pa", wait_s=0)
     assert c and c.k == 8, "once b ends, new grants get the shrunk ceiling"
     for g in (c, o):

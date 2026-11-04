@@ -217,26 +217,29 @@ def live_room(every: list) -> int | None:
     return max(WORKERS_FLOOR, int(free - young))
 
 
-def project_workers(cfg: dict | None = None, cores: int | None = None) -> int:
+def project_workers(cfg: dict | None = None, cores: int | None = None, project_name: str | None = None) -> int:
     """The most test workers one project runs at once over all its suites (0: no such ceiling):
     TTP_TEST_PROJECT_WORKERS, else the account's checks.test_project_workers, else the base (the smaller of
     PROJECT_WORKERS_MAX and one per CORES_PER_PROJECT_WORKER cores, at least WORKERS_FLOOR) plus the cores
     the load leaves under SPARE_LOAD x the cores, at most half the cores (spare_workers); a project's own
     checks.test_project_workers only lowers it. So a project's suites take a small share of a busy host
-    however many of them run at once, and more of an idle one."""
+    however many of them run at once, and more of an idle one. The load `project_name`'s own held test
+    slots add is not counted (_own_held): its own suites never shrink its ceiling, others' load does, and
+    the host's pool and load guard still bound the total."""
     top = _setting(*TESTS.setting("project_workers"))
     if top is None:
         c = checkcap.cores() if cores is None else cores
         top = max(WORKERS_FLOOR, min(PROJECT_WORKERS_MAX, c // CORES_PER_PROJECT_WORKER))
-        top = max(top, min(c // 2, top + spare_workers(c)))
+        top = max(top, min(c // 2, top + spare_workers(c, _own_held(project_name, c) if project_name else 0)))
     if (mine := _number(_section(cfg, "checks").get("test_project_workers"))) and mine > 0:
         top = min(top, mine) if top else mine
     return max(0, top)
 
 
-def spare_workers(c: int) -> int:
+def spare_workers(c: int, own: int = 0) -> int:
     """The cores the host's load leaves under SPARE_LOAD x its `c` cores, by the larger of its 1- and
-    5-minute load averages (so the ceiling grows slowly and shrinks fast); 0 with checks.load_extra 0 or an
+    5-minute load averages (so the ceiling grows slowly and shrinks fast) less `own`, the load one worker
+    per slot the asking project holds puts there (never below 0); 0 with checks.load_extra 0 or an
     unreadable load. A shrink bounds new grants only: holders above it still count (_own_free)."""
     if not checkcap.extra_max():
         return 0
@@ -246,7 +249,15 @@ def spare_workers(c: int) -> int:
         return 0
     if ld != ld or ld == float("inf"):
         return 0
-    return max(0, int(c * SPARE_LOAD - ld))
+    return max(0, int(c * SPARE_LOAD - max(0.0, ld - own)))
+
+
+def _own_held(project_name: str, c: int) -> int:
+    """How many test slots `project_name` holds now, its budget's and its urgent ones (one worker each)."""
+    try:
+        return len(locks._slot_labels(own_paths(project_name, c) + urgent_paths(project_name, c)))
+    except OSError:
+        return 0
 
 
 def load_guard() -> str:
@@ -293,12 +304,14 @@ def push_load_wait_s(cfg: dict | None = None) -> float | None:
     return PUSH_LOAD_WAIT_S
 
 
-def project_max(cfg: dict | None = None, s: tuple[int, int] | None = None, kind: Kind = TESTS) -> int:
+def project_max(cfg: dict | None = None, s: tuple[int, int] | None = None, kind: Kind = TESTS,
+                project_name: str | None = None) -> int:
     """The most slots one project holds at once over all its runs (above): tests, its checks at once
     (checklane.project_cap) times one run's grant; builds, twice a run's share. An explicit slot budget
     (checks.test_project_slots, checks.build_project_max) wins, a project's own one only lowering the
     account's; never below one run's grant, never above the pool. Tests: never above project_workers()
-    either, which then also bounds one run's grant (acquire). `s` is sizes(cfg)."""
+    either (`project_name`'s, its own held slots' load not counted), which then also bounds one run's
+    grant (acquire). `s` is sizes(cfg)."""
     from . import checklane
     s = s or sizes(cfg, kind=kind) or (0, 0)
     if not s[0]:
@@ -310,7 +323,7 @@ def project_max(cfg: dict | None = None, s: tuple[int, int] | None = None, kind:
     if mine:
         top = min(top, mine)
     top = max(s[1], min(top, s[0]))
-    if kind is TESTS and (w := project_workers(cfg)):
+    if kind is TESTS and (w := project_workers(cfg, project_name=project_name)):
         top = min(top, w)
     return top
 
@@ -532,7 +545,7 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                 room, sized = live, f", sized to the host's free cores (at least {WORKERS_FLOOR})"
             else:
                 sized = ""
-            ps, own = paths(pool, kind), own_paths(name, project_max(cfg, (pool, s[1]), kind), kind)
+            ps, own = paths(pool, kind), own_paths(name, project_max(cfg, (pool, s[1]), kind, name), kind)
             own_free = _own_free(name, own, kind) if own else 0
             if own:   # a project's test-worker ceiling (project_workers) also bounds one run's grant
                 top, room = min(top, len(own)), min(room, len(own))
@@ -945,7 +958,7 @@ def pool_room(cfg: dict | None, project_name: str | None, full: bool = False, pr
     pool = pool_now(cfg, s[0], used)
     if used >= pool or locks.queued(checkcap.slot_dir(), TESTS.resource):
         return False
-    own = own_paths(project_name, project_max(cfg, (pool, s[1])))
+    own = own_paths(project_name, project_max(cfg, (pool, s[1]), project_name=project_name))
     top = min(s[1], len(own)) if own else s[1]
     # As acquire counts a full run's fewest slots (at most what the pool and its budget can ever give),
     # holders past a budget that shrank counted (_own_free).
