@@ -12220,6 +12220,41 @@ def test_agent_mode_applies_the_owners_agents_order_and_refuses_each_held_class(
 
 
 
+def test_agent_mode_a_relayer_ordered_restrictions_change_in_a_later_turn_runs_the_held_check(env):
+    """In agent mode a Restrictions change cited relayer-ordered runs the held check in a later turn with no
+    messages too, not only in the agent's own turn: a scoped exception (`excepts`) or a `both_hold` item that
+    lets workers post as the owner is refused as class (b) and not stored; a non-held relayer-ordered item in
+    a later turn still applies."""
+    import json
+    from ttp import relay
+    from ttp import coordinator as coord
+    p = make(env)
+    db = p.db
+    db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    chat = "Never post in the team chat. (user msg #1)"
+    base = p.charter_path.read_text() + f"\n## Restrictions\n- {chat}\n"
+    p.set_config(relay.AGENT_KEY, True)
+    words = "post the summary in the team chat on channel-a"
+    post = "Workers may post the summary in the team chat on channel-a."
+
+    def order(said: str) -> str:
+        fid = db.post("in", "", chat="cli", kind="finding", provenance="cli-legacy", context=f"Order: {said}")
+        return json.dumps({"msg": fid, "origin": "relayer", "quote": said})
+
+    for k, form in enumerate(({"excepts": "Never post in the team chat."}, {"both_hold": True})):
+        p.charter_path.write_text(base)
+        err = coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "text": post,
+                               "source": order(words), **form}], turn=7 + k, user_turn=False)
+        assert len(err) == 1 and "(b) a step that speaks to people as the owner" in err[0], (form, err)
+        assert "owner's own words" in err[0] and "channel-a" not in p.charter_path.read_text(), form
+    p.charter_path.write_text(base)
+    calm = "Never run nightly builds on box Q at weekends."
+    fid_src = order("never run nightly builds on box Q at weekends")
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "text": f"- {calm}",
+                            "source": fid_src}], turn=9, user_turn=False) == []
+    assert f"{calm} (relayer-ordered, msg #{json.loads(fid_src)['msg']})" in p.charter_path.read_text()
+
+
 def test_agent_mode_ask_approval_needs_its_own_messages_and_yields_to_the_owners_words(env):
     """In agent mode the agent's yes approves a charter ask only from the messages that resolved it: an ask
     resolved with none (messages []) never reads the last hour's relayed context, and the owner's own

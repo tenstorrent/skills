@@ -3025,11 +3025,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     loose_drop = (restriction_source.drops_unsourced("", body=gone) if gone else
                                   restriction_source.drops_unsourced(p.charter_path.read_text(), quote=quote)
                                   if quote and _DATED.sub("", section).lower().startswith("restriction") else False)
-                    # resting only on the owner's agent's words: shown as relayer-ordered, relay.HELD refused
+                    # resting only on the owner's agent's words: shown as relayer-ordered, relay.HELD refused;
+                    # a relayer-ordered cite counts in any turn, a later one with no messages too
                     by_agent = bool(via) and not user_turn or bool(ok and ok.get("agent")) or cited_agent and bool(
-                        cited) or agent and uturn and bool(
+                        cited) or agent and agent_cite or agent and uturn and bool(
                         _relay_check(p, cfg, text, messages, agent=False)[0]
-                        or agent_cite or turn_src == "" and (quote or replaces) and len(over) < OVER_MIN
+                        or turn_src == "" and (quote or replaces) and len(over) < OVER_MIN
                         and a.get("source") and restriction_source.turn_quote(db, a.get("source"), messages, False))
                     restr = _DATED.sub("", section.lstrip("# ")).lower().startswith("restriction") or (
                         _restriction_edit(p, section, quote, str(a.get("replaces") or "")))
