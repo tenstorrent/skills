@@ -6496,3 +6496,30 @@ def test_checks_status_names_the_push_priority_holder_and_each_waiters_wait(env,
         held.close()
         locks.dequeue(w)
         locks.dequeue(fresh)
+
+
+def test_detached_checks_waiting_for_a_slot_keep_their_place_after_their_worker_run_hands_off(
+        env, tmp_path, monkeypatch, capsys):
+    # A real `ttp checks --detach` parks for the host-wide slot, then its worker run ends (exit.json): another
+    # reader of the queue keeps its ticket (it outlives the run by design), and it gets the slot in turn.
+    import signal
+    from ttp import checkcap, cli, locks
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    held = checkcap.acquire("other")
+    pid = None
+    try:
+        pid = _detached_checks(run, capsys, "true")
+        assert _wait_for(lambda: (run / cli.CHECKS_SLOT_WAIT).exists())
+        waiting = locks.queued(checkcap.slot_dir(), checkcap.RESOURCE)
+        assert len(waiting) == 1 and json.loads(locks._owner_file(waiting[0]).read_text())["pid"] == pid
+        (run / "exit.json").write_text("{}")   # the worker handed off `waiting` on these checks
+        assert locks.queued(checkcap.slot_dir(), checkcap.RESOURCE) == waiting
+        assert checkcap.state()["queued"] and not (run / cli.CHECKS_RC).exists()
+        held.close()
+        assert _wait_precheck(run) == "0"
+    finally:
+        held.close()
+        if pid and not _gone_pid(pid):
+            os.killpg(pid, signal.SIGKILL)

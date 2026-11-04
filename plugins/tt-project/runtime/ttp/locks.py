@@ -1064,6 +1064,8 @@ def queue_dir(locks_dir: Path, resource: str) -> Path:
 
 
 _TICKETS: dict[Path, object] = {}   # this process's tickets: the open file that holds each one's lock
+# Set where a process outlives the run whose TTP_RUN_DIR it carries (the detached `ttp checks`): no run ties its tickets
+OUTLIVES_RUN_ENV = "TTP_OUTLIVES_RUN"
 _TICKET_RUNS: dict[Path, str] = {}   # and the folder of the run each waits for ("" for none: _waits_for_run)
 
 
@@ -1149,10 +1151,10 @@ def _ticket_owner(env=None) -> dict:
 
 def _waits_for_run(env=None) -> str:
     """The folder of the run this process waits for (TTP_RUN_DIR) while that run is going; "" in a `ttp
-    detach` job (it outlives its run by design) and where the run had ended already when it began (a
-    hand-off's check the daemon runs later with the run's variables)."""
+    detach` job or detached `ttp checks` (OUTLIVES_RUN_ENV: they outlive their run by design) and where the
+    run had ended already when it began (a hand-off's check the daemon runs later with the run's variables)."""
     env = os.environ if env is None else env
-    run = "" if env.get("TTP_DETACHED") else str(env.get("TTP_RUN_DIR") or "")
+    run = "" if env.get("TTP_DETACHED") or env.get(OUTLIVES_RUN_ENV) else str(env.get("TTP_RUN_DIR") or "")
     return "" if not run or (Path(run) / "exit.json").exists() else run
 
 

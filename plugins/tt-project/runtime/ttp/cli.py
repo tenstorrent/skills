@@ -4996,7 +4996,7 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
     host-wide slot hand their place in the queue to this launch (_checks_place)."""
     from .push import pid_ns
     from .runner import boot_id, proc_start
-    from . import checkcap, checkdirs, checktree
+    from . import checkcap, checkdirs, checktree, locks
     checkdirs.writable(str(run_dir))
     old = _read_checks_pid(run_dir)
     arrived = _checks_place(run_dir, old, env)
@@ -5042,6 +5042,7 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
         env = checkdirs.environment(output, env)
         # The supervisor records checks.log/rc in the original run; commands get the report dir.
         env['TTP_RUN_DIR'] = str(run_dir)
+        env[locks.OUTLIVES_RUN_ENV] = "1"   # they wait for slots past the run's hand-off: its end drops no ticket
         env['TTP_CHECKS_TMP_FD'] = str(guard.fileno())
         # The child's own temporary files (and cleantree.prune) stay out of the caller's TMPDIR
         env.update(dict.fromkeys(('TMPDIR', 'TMP', 'TEMP'), checkdirs.scratch(env)))

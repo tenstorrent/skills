@@ -48,7 +48,7 @@ STUBBED = ("maybe_coordinate", "run_schedules", "review_jev", "check_release", "
 ENDED = ("failed", "blocked", "cancelled")
 # A run's identity, when the check itself runs inside one: the scratch project's runs get their own.
 RUN_VARS = ("TTP_RUN_DIR", "TTP_TASK", "TTP_TASK_ID", "TTP_RUN_ID", "TTP_PROJECT", "TTP_PIDNS", "TTP_CGROUP",
-            "TTP_LOCKS_HELD", "TTP_DETACHED")
+            "TTP_LOCKS_HELD", "TTP_DETACHED", "TTP_OUTLIVES_RUN")
 
 
 def ticker(base: str) -> None:

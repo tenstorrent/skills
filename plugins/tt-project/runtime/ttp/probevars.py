@@ -18,7 +18,7 @@ import re
 # `ttp detach`); a probe's environment (Daemon._probe_env) has none of them.
 RUN_VARS = ("TTP_RUN_DIR", "TTP_RUN_ID", "TTP_TASK", "TTP_TASK_ID", "TTP_TASK_KIND", "TTP_RESULT",
             "TTP_RESULT_JSON", "TTP_NOTE_RUN_DIR", "TTP_CHECK_OUTPUT_DIR", "TTP_LEASE_EPOCH", "TTP_PIDNS",
-            "TTP_CGROUP", "TTP_LOCKS_HELD", "TTP_LOCKS_SHARED", "TTP_DETACHED", "TTP_NO_DEVICE",
+            "TTP_CGROUP", "TTP_LOCKS_HELD", "TTP_LOCKS_SHARED", "TTP_DETACHED", "TTP_OUTLIVES_RUN", "TTP_NO_DEVICE",
             "TTP_TEST_SLOTS", "TTP_PYTHON")
 _NAMES = "|".join(RUN_VARS)
 _REF = re.compile(rf"(?<!\\)\$(?:\{{({_NAMES})\}}|({_NAMES})(?![A-Za-z0-9_]))")
