@@ -4085,17 +4085,24 @@ def test_runner_stops_a_codex_run_mid_turn_on_budget(env, tmp_path, monkeypatch)
     home, sid = tmp_path / "codex", "0199eeee-ffff"
     roll = home / "sessions" / "2026" / "11" / "01" / f"rollout-2026-11-01T10-00-00-{sid}.jsonl"
     roll.parent.mkdir(parents=True)
+    # The child crosses the $0.50 budget at its 6th token count and stops counting at the 10th ($1.00),
+    # then stays busy until stopped: however late the runner reads (a loaded host, here each read 1.5 s
+    # late), the booked cost is the rollout's when it stopped, not what a still-counting child added since.
+    from ttp.providers.codex import Codex
+    read = Codex.cost_so_far
+    monkeypatch.setattr(Codex, "cost_so_far", lambda *a, **k: (time.sleep(1.5), read(*a, **k))[1])
     child = tmp_path / "child.py"
     child.write_text(
         "import json, sys, time\n"
         f"print(json.dumps({{'type': 'thread.started', 'thread_id': {sid!r}}}), flush=True)\n"
-        "for n in range(1, 300):\n"
+        "for n in range(1, 11):\n"
         f"    with open({str(roll)!r}, 'a') as f:\n"
         "        stamp = time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime(time.time() + 1))\n"
         "        f.write(json.dumps({'timestamp': stamp, 'type': 'event_msg', 'payload': {'type': 'token_count',\n"
         "            'info': {'total_token_usage': {'input_tokens': n * 100000, 'cached_input_tokens': 0,\n"
         "                                           'output_tokens': 0}}}}) + '\\n')\n"
-        "    time.sleep(0.05)\n")
+        "    time.sleep(0.05)\n"
+        "time.sleep(120)\n")
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     (run_dir / "prompt.md").write_text("x")

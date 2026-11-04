@@ -70,6 +70,7 @@ INSTRUCTIONS_EVERY_S = 5
 ROLLOUT_WAIT_S = 120
 TOOL_GRACE_S = 60     # past a pending tool call's own timeout before its silence counts as a stall
 WAIT_SHARE = 0.9      # waits_idle: this share of stall_s spent in wait calls is a stall
+TEST_CLOCK_ENV = "TTP_TEST_AWAKE_FILE"   # the test suite's FileClock; unset (always, in real use): AwakeClock
 SLEEP_GAP_S = 600     # polls are POLL_S apart: a gap this long between two can only be a host sleep
 PDEATHSIG = sys.platform.startswith("linux")   # the kernel also signals the agent itself if the runner dies
 PR_SET_PDEATHSIG = 1
@@ -405,7 +406,7 @@ def supervise(run_dir: Path) -> int:
                               "stopped": stop_reason(run_dir) or "resource_busy", "launched": False})
         return 1
     started, mono_start = time.time(), time.monotonic()
-    awake = AwakeClock()
+    awake = FileClock(os.environ[TEST_CLOCK_ENV]) if os.environ.get(TEST_CLOCK_ENV) else AwakeClock()
     prompt = open(run_dir / (spec.get("stdin") or "prompt.md"), "rb")
     out = open(out_path, "wb")
     err = open(run_dir / "stderr.log", "wb")
@@ -689,6 +690,22 @@ class AwakeClock:
                 self.awake += step
             self._mono, self._wall = mono, wall
             return self.awake
+
+
+class FileClock:
+    """Test only (TEST_CLOCK_ENV names the file): the awake time is the number in that file, which a fake
+    agent advances, so the limit and the stall guard see the time the test lets pass, not a loaded
+    host's scheduling delays. A missing or unreadable file keeps the last reading; it never goes back."""
+
+    def __init__(self, path: str):
+        self.path, self.awake = Path(path), 0.0
+
+    def tick(self) -> float:
+        try:
+            self.awake = max(self.awake, float(self.path.read_text()))
+        except (OSError, ValueError):
+            pass
+        return self.awake
 
 
 class ProgressWatch:

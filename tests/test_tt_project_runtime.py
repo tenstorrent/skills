@@ -15503,6 +15503,8 @@ from pathlib import Path
 if "--help" in sys.argv[1:] or sys.argv[1:3] == ["features", "list"]:
     print(os.environ.get("FAKE_CLI_HELP", ""))
     sys.exit(0)
+slow = float(os.environ.get("FAKE_CLI_SLOW") or 0)   # a loaded host: real delays at start-up and mid-stream
+time.sleep(slow)
 log = Path(os.environ["FAKE_CLI_LOG"])
 log.mkdir(parents=True, exist_ok=True)
 if sys.argv[1:2] == ["app-server"]:
@@ -15540,11 +15542,24 @@ if os.environ.get("FAKE_CLI_RESULT"):
     (Path(os.environ["TTP_RUN_DIR"]) / "result.json").write_text(os.environ["FAKE_CLI_RESULT"])
 pace, streaming = float(os.environ.get("FAKE_CLI_PACE") or 0), "stream-json" in sys.argv
 lines = os.environ.get("FAKE_CLI_STDOUT", "").splitlines(keepends=True)
+clock = os.environ.get("TTP_TEST_AWAKE_FILE")
+
+def work(s):
+    # With the runner's test clock, work takes clock time only: real delays (a loaded host) never count.
+    if not clock:
+        time.sleep(s)
+        return
+    now = float(Path(clock).read_text()) if Path(clock).exists() else 0.0
+    Path(clock + ".tmp").write_text(str(now + s))
+    os.replace(clock + ".tmp", clock)
 if pace and not streaming:
-    time.sleep(pace * len(lines))
+    work(pace * len(lines))
+    if clock:
+        time.sleep(60)   # busy until the runner's stall guard ends it, however late it looks
 for i, line in enumerate(lines):
     if pace and streaming and i:
-        time.sleep(pace)
+        work(pace)
+        time.sleep(slow if i == len(lines) // 2 else 0)
     sys.stdout.write(line)
     sys.stdout.flush()
 sys.stderr.write(os.environ.get("FAKE_CLI_STDERR", ""))
@@ -15572,6 +15587,11 @@ def _cli_run(env, monkeypatch, provider, stdout, *, stderr="", rc=0, result=None
     monkeypatch.setenv("FAKE_CLI_RESULT", json.dumps(result) if result else "")
     monkeypatch.setenv("FAKE_CLI_HELP", help_text)
     monkeypatch.setenv("FAKE_CLI_PACE", str(pace))
+    if pace:   # paced output runs on the runner's test clock, so a loaded host cannot stall it
+        monkeypatch.setenv("TTP_TEST_AWAKE_FILE", str(env["tmp"] / "awake-clock"))
+        (env["tmp"] / "awake-clock").unlink(missing_ok=True)
+    for stale in ("argv.json", "stdin.txt"):   # never read an earlier run's record as this one's
+        (log_dir / stale).unlink(missing_ok=True)
     monkeypatch.setenv("FAKE_CLI_SESSION", session if isinstance(session, str) else json.dumps(session or {}))
     p = make(env)
     if before:
@@ -15846,7 +15866,9 @@ def test_cursor_streams_when_its_cli_can(env, monkeypatch):
 
 def test_streaming_cursor_run_is_not_killed_as_stalled(env, monkeypatch):
     # Nine events 0.25 s apart (2 s in all), with a 1 s stall limit: only a CLI that streams shows
-    # progress. The first event comes at once, so start-up under load is not counted as a gap.
+    # progress. The runner's test clock advances only with the fake CLI's work, so a loaded host's
+    # delays (here 1.5 s at start-up and mid-stream, longer than the limit) are never a stall.
+    monkeypatch.setenv("FAKE_CLI_SLOW", "1.5")
     events = CURSOR_STREAM_OK + [CURSOR_STREAM_OK[3], CURSOR_STREAM_OK[4]]
     stall = lambda p: p.set_config("budget.stall_s", {"light": 1})   # noqa: E731
     _, run, _, argv, _ = _cli_run(env, monkeypatch, "cursor", _codex_events(*events), before=stall,

@@ -296,6 +296,7 @@ def test_chatbridge_key_is_bound_to_its_saved_url(env, monkeypatch):
 _CB_AGENT = r'''
 import json, os, sys, time, urllib.request
 out = sys.argv[1]
+time.sleep(float(os.environ.get("CB_AGENT_SLOW") or 0))   # a loaded host: a slow start-up
 url, token = os.environ["ANTHROPIC_BASE_URL"], os.environ["ANTHROPIC_AUTH_TOKEN"]
 req = urllib.request.Request(url + "/v1/messages?beta=true", data=json.dumps({
     "model": "claude-x", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}).encode(),
@@ -306,6 +307,11 @@ with open(out + ".tmp", "w") as f:
 os.rename(out + ".tmp", out)
 print(json.dumps({"type": "result", "result": reply["content"][0]["text"]}), flush=True)
 if len(sys.argv) > 2:
+    clock = os.environ.get("TTP_TEST_AWAKE_FILE")
+    if clock:   # the runner's test clock: its limit counts this work, not start-up delays
+        with open(clock + ".tmp", "w") as f:
+            f.write(sys.argv[2])
+        os.replace(clock + ".tmp", clock)
     time.sleep(float(sys.argv[2]))
 '''
 
@@ -359,6 +365,9 @@ def test_runner_runs_a_chat_agent_through_its_bridge_and_stops_it_at_the_end(env
 def test_runner_stops_the_chat_bridge_on_timeout_and_when_killed(env, tmp_path, mock_chat):
     up = mock_chat(*[(200, {"choices": [{"message": {"content": "pong"}}]})] * 2)
     run_dir, seen, run_env = _chat_run(tmp_path / "t", up, extra=("120",), timeout_s=1) if (tmp_path / "t").mkdir() is None else None
+    # The 1 s limit runs on the runner's test clock, which only the agent's own work advances: a start-up
+    # slower than the limit (a loaded host, here 1.5 s) never times the agent out before it has the bridge.
+    run_env.update(TTP_TEST_AWAKE_FILE=str(tmp_path / "t" / "awake-clock"), CB_AGENT_SLOW="1.5")
     subprocess.run([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME), env=run_env,
                    timeout=_load_scaled(120))
     assert json.loads((run_dir / "exit.json").read_text())["stopped"] == "timeout"
