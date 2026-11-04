@@ -38,3 +38,4 @@
 +33: relayer context's agent-mode exception named in the relayed-messages and loosening rules
 +294: plain replies: answer first, short, what the harness does rather than its internal names (plainreply.py)
 +210: an urgent goal splits into independent tasks that start at once (no chain without a new file or symbol)
++70: asks and lulls never for inferred neighbours, serving tags or site rules (user msg #1571)

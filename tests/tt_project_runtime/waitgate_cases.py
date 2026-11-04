@@ -382,8 +382,8 @@ def test_the_daily_review_reports_the_wake_gate(env):
 def test_the_coordinator_prompt_keeps_a_lull_for_disruptive_work_and_enqueues_device_jobs_now():
     rule = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
     assert "Device jobs behind a broker or cooperative queue: enqueue now, not after a lull or ack." in rule
-    assert "Lulls (`start_when`) are for restarts, upgrade rollouts and reboots of a host or service others " \
-        "are using now; a box reset or single-host power cycle waits for no lull" in rule
+    assert "Lulls (`start_when`) are for restarts, upgrade rollouts and reboots of a host or service in " \
+        "use; a box reset or power cycle waits for no lull." in rule
     assert "Work that would disturb others: run it in a lull" not in rule
 
 
