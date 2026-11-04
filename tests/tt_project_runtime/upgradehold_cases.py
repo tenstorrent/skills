@@ -174,3 +174,117 @@ def test_a_refusal_that_cannot_record_its_hold_still_refuses_and_promises_no_ret
     err = capsys.readouterr().err
     assert e.value.code == 1 and "unfinished merge" in err and "could not record the hold" in err
     assert "retries on its own" not in err and p.db.kv(release.KV_AUTO) is None
+
+
+def _push_lock(p, name="push:origin%2Fmain", age_s=0.0, pid=None):
+    """A push lock held by this process, as `ttp push` holds its branch's turn, taken `age_s` ago; `pid`
+    names another holder process in its label."""
+    from ttp import locks
+    f = locks.try_take(locks.slot_paths(p.state / "locks", name, 1), "task #7 (run 9)", "ttp push")
+    locks.relabel(f, {"since": time.time() - age_s, **({"pid": pid} if pid else {})})
+    return f
+
+
+def _gone_pid():
+    child = subprocess.Popen(["true"])
+    child.wait()
+    return child.pid
+
+
+def test_a_push_lock_whose_holder_process_is_gone_does_not_hold_the_upgrade(env, monkeypatch):
+    """A process that inherited a push's lock file keeps it taken after the push died: that holds nothing."""
+    from ttp import release
+    p, d, launches = _release_daemon(env, monkeypatch)
+    f = _push_lock(p, "push:run-x", pid=_gone_pid())
+    try:
+        assert release.live_pushes(p) == [] and release.hold_reason(p, release.drift(p)) == ""
+        d.check_release()
+        assert launches == [p.base] and _harness_commit(p) == "bbbb2222"
+        assert p.db.kv(release.KV_AUTO)["outcome"] == "applied"
+    finally:
+        f.close()
+
+
+def test_a_live_push_inside_the_bound_holds_the_upgrade_and_status_shows_since_when(env, monkeypatch):
+    from ttp import release, timefmt
+    p, d, launches = _release_daemon(env, monkeypatch)
+    f = _push_lock(p, age_s=60)
+    try:
+        d.check_release()
+        assert not launches and d._release_due - time.time() <= release.HELD_RECHECK_S
+        rec = p.db.kv(release.KV_PUSH_HOLD)
+        assert rec["why"] == "a push is in flight" and rec["key"] == release.drift(p)["key"]
+        line = release.line(p, p.db, p.config())
+        assert f"upgrade held since {timefmt.long(rec['since'], p)}: a push is in flight" in line, line
+        d._release_due = 0
+        d.check_release()
+        assert p.db.kv(release.KV_PUSH_HOLD)["since"] == rec["since"], "since stays while it holds"
+    finally:
+        f.close()
+    d._release_due = 0
+    d.check_release()
+    assert launches == [p.base] and p.db.kv(release.KV_PUSH_HOLD) is None
+    assert "held" not in release.line(p, p.db, p.config())
+
+
+def test_past_the_bound_only_a_push_step_holds_and_the_upgrade_applies_between_steps(env, monkeypatch, capsys):
+    from ttp import cli, push, release
+    p, d, launches = _release_daemon(env, monkeypatch)
+    old = release.PUSH_HOLD_MIN * 60 + 60
+    run = _push_lock(p, "push:run-y", age_s=old)     # its turn came long ago: a step is running
+    f = _push_lock(p, age_s=old)
+    steps = push.Steps(f)
+    try:
+        steps.go("checks")
+        why = release.hold_reason(p, release.drift(p))
+        assert why.startswith("a push is in its checks step since") and why.endswith(release.RECHECK)
+        d.check_release()
+        assert not launches and d._release_due - time.time() <= release.PUSH_STEP_RECHECK_S
+        assert "a push is in its checks step" in release.line(p, p.db, p.config())
+        p.db.set_kv(release.KV_AUTO, {"key": release.drift(p)["key"], "outcome": "running"})
+        with pytest.raises(SystemExit) as e:          # the swap's own check: never inside a step
+            cli.main(["upgrade", p.name, "--auto", "--project-dir", str(p.base)])
+        assert e.value.code == 75 and "checks step" in capsys.readouterr().out
+        p.db.set_kv(release.KV_AUTO, {**p.db.kv(release.KV_AUTO), "outcome": "held"})
+        steps.between()            # e.g. waiting for a checks slot
+        d._release_due = 0
+        d.check_release()
+        assert launches == [p.base] and _harness_commit(p) == "bbbb2222"
+        assert p.db.kv(release.KV_AUTO)["outcome"] == "applied"
+    finally:
+        f.close()
+        run.close()
+
+
+def test_a_push_step_waits_for_a_running_upgrade_and_marks_itself_first(env):
+    """The upgrade takes its lock, then reads the marks; a step marks itself, then reads the lock."""
+    from ttp import locks, push, release
+    p = make(env)
+    f = _push_lock(p)
+    up = locks.try_take([release.upgrade_lock(p)], "ttp upgrade", "ttp upgrade")
+    said, t = [], None
+    try:
+        steps = push.Steps(f, said.append, poll_s=0.01)
+        t = threading.Thread(target=steps.go, args=("push",))
+        t.start()
+        deadline = time.time() + 10
+        while not said and time.time() < deadline:
+            time.sleep(0.01)
+        assert said and "the push step waits" in said[0] and t.is_alive()
+        assert not locks.read_label(pathlib.Path(f.name)).get("step"), "unmarked while it waits"
+    finally:
+        up.close()
+        if t:
+            t.join(10)
+    try:
+        assert not t.is_alive() and locks.read_label(pathlib.Path(f.name))["step"] == "push"
+    finally:
+        f.close()
+
+
+def test_the_push_hold_bound_is_configurable():
+    from ttp import release
+    assert release.push_hold_s({}) == release.PUSH_HOLD_MIN * 60
+    assert release.push_hold_s({"upgrade": {"push_hold_min": 5}}) == 300
+    for bad in (0, -1, "x", None):
+        assert release.push_hold_s({"upgrade": {"push_hold_min": bad}}) == release.PUSH_HOLD_MIN * 60

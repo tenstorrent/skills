@@ -2111,7 +2111,10 @@ and run it again.
 Each project starts from this plugin's template and then improves its own harness from
 experience. When a newer tt-project is installed (`ttp setup` from the updated plugin; the skill does
 it on first use after an update), each project's daemon merges it into its own harness within an hour
-and restarts, keeping running work. `ttp config <name> upgrade.auto false` turns that off;
+and restarts, keeping running work. A push in flight holds it for `upgrade.push_hold_min` (30)
+minutes at most; after that it waits only for a push step (a rebase, the checks, the push itself)
+to end and starts between steps. A push whose process is gone holds nothing. While it is held,
+`ttp status` and the web app say why and since when. `ttp config <name> upgrade.auto false` turns that off;
 `ttp upgrade <name>` then merges by hand. `ttp upgrade` exits 75 when it changed nothing and the
 project finishes the upgrade itself (a merge conflict handed to its harness task, or retried by its
 daemon under `upgrade.auto`, which retries only a newer version), or when another upgrade or the
