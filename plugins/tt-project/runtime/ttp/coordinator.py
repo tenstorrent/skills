@@ -6019,7 +6019,9 @@ def _held_route_ask(cfg: dict, a: dict, text: str) -> str:
 # Fail open (settled): sent unless the ask states it is idle, its text and not_covered hold only resets, idle
 # statements, target names and plain words, and nothing names a tenant, a person's work, money, a credential,
 # a user-only step, another person's request, a post, merge or other one-way step; sent too for an unnamed or
-# unknown target, a serving, shared or paused one, or a live lock or reservation on it. Accepted gaps:
+# unknown target, a paused or held one, a live lock or reservation on it, or one the user's own rules name (a charter
+# Restriction naming it: a hold or an allowlist, or an allowlist ("only") of machines leaving it out). A serving,
+# shared or production tag, neighbours, live traffic or a site is no reason to ask (user msg #1571). Accepted gaps:
 # - an idle-reset ask that does not say it is idle, or adds any word outside _PLAIN_WORDS (a cause, a duration), is sent;
 # - least_disruptive and recommendation get only the tenant word lists, not the clause check;
 # - an idle statement about a different machine than the reset's target counts for it.
@@ -6032,9 +6034,11 @@ _NOT_IDLE_RE = re.compile(r"(?:\b(?:not|never|no\s+longer)|n't)\s+(?:\w+\s+)?idl
 _CLAUSE_RE = re.compile(r"[,;:!?\n()\[\]—–]+|\s-+\s|\.(?=\s|$)|\b(?:and|but|or|nor|yet|so|while|whilst|although|though|because|since|"
                         r"unless|until|except|apart|besides|than|that|which|who|whom|whose|where|when|as|if|with|"
                         r"without|for)\b", re.I)
-_TENANT_RE = re.compile(r"\b(?:serv(?:ing|es)|production|prod|live|traffic|tenants?|customers?|demo|someone|somebody|"
+# Someone on the target: a tenant (an open device handle or tenant process), a person, a user. Serving state
+# (serving, production, live traffic, shared) is no tenant: the harness never asks on it (user msg #1571).
+_TENANT_RE = re.compile(r"\b(?:tenants?|customers?|someone|somebody|"
                         r"(?:other|another)\s+(?:users?|people|persons?|teams?|projects?)|in\s+use|being\s+used|"
-                        r"shared|logged[- ]in|users?\s+(?:on|of)\s+it)\b", re.I)
+                        r"logged[- ]in|users?\s+(?:on|of)\s+it)\b", re.I)
 _OWN_POSSESSOR = ("project", "task", "worker", "run", "machine", "box", "node", "broker", "daemon", "coordinator",
                   "harness", "it", "system", "host", "device", "chip", "tray", "board", "service", "scheduler", "queue")
 _PERSON_WORK_RE = re.compile(rf"\b(?!(?:{'|'.join(_OWN_POSSESSOR)})'s\b)[A-Za-z][\w-]*'s\s+(?:[\w-]+\s+)?"
@@ -6048,13 +6052,30 @@ _PLAIN_WORDS = {"a", "all", "again", "an", "are", "back", "be", "board", "box", 
                 "do", "fully", "has", "host", "i", "is", "it", "its", "machine", "may", "me", "my", "node", "now", "ok",
                 "okay", "on", "once", "our", "please", "safe", "server", "shall", "should", "the", "this", "to", "too",
                 "tray", "we", "would"}
-_TENANT_TAGS = {"serving", "shared", "production", "prod", "live", "public", "demo", "customer"}
+_ONLY_RE = re.compile(r"\bonly\b", re.I)
+
+
+def _user_machine_rule(p: Project, target: str, names: dict[str, str]) -> str:
+    """The charter Restriction line (the user's own holds and allowlists, as data) that names `target`, or
+    an allowlist line (it says "only") naming machines in `names` but not `target`; else ""."""
+    from .prompts import charter_restrictions
+    try:
+        text = charter_restrictions(p.charter_path.read_text()) if p.charter_path.exists() else ""
+    except OSError:
+        return ""
+    words = lambda s: {w.lower().rstrip(".-") for w in re.findall(r"[A-Za-z0-9][\w.+-]*", s)}
+    own = {target.lower()} | {n for n, alias in names.items() if alias == target}
+    for line in text.splitlines():
+        got = words(line)
+        if got & own or (_ONLY_RE.search(line) and got & set(names)):
+            return line.strip()
+    return ""
 
 
 def _idle_reset_ask(p: Project, cfg: dict, a: dict, text: str, least: str) -> str:
     """Why an ask to reset, reboot, power-cycle or restart a machine or resource this project holds,
     which it states is idle with no other tenant, is the project's to do, or "". Targets: machine aliases or host
-    names in the machines list, and the project's own (not shared) device locks, named in a sentence
+    names in the machines list, and the project's device locks (shared ones too), named in a sentence
     of text, least_disruptive or not_covered that also names the reset. Review, merge, funds and spend
     asks pass; so does a restriction ask whose least_disruptive names the restriction."""
     blocking = a.get("blocking")
@@ -6075,8 +6096,7 @@ def _idle_reset_ask(p: Project, cfg: dict, a: dict, text: str, least: str) -> st
     known = machines.load()
     hosts = {alias.lower(): alias for alias in known}
     hosts |= {str(m.get("hostname")).lower(): alias for alias, m in known.items() if (m or {}).get("hostname")}
-    shared_names = shared.names(cfg)
-    own = {r.lower(): r for r in locks.device_locks(cfg) if r not in shared_names}
+    own = {r.lower(): r for r in locks.device_locks(cfg)}
     targets: set[str] = set()
     for sentence in re.split(r"[.;:!?\n]+", f"{text}\n{least}\n{nc}"):
         if not _RESET_RE.search(sentence):
@@ -6091,10 +6111,14 @@ def _idle_reset_ask(p: Project, cfg: dict, a: dict, text: str, least: str) -> st
             return ""                   # any word besides a reset, an idle statement, a target or a plain word
     paused = set((p.db.kv(PAUSED_RESOURCES_KEY) or {})) | set(shared.paused(cfg))
     taken = locks.held(p.state / "locks", p)
+    from . import fleethold
+    try:
+        holds = fleethold.active()
+    except Exception:
+        holds = {}
     for t in targets:
-        m = known.get(t) or {}
-        if m.get("shared") or _TENANT_TAGS & set(machines.tag_names(m.get("tags"))) or t in shared_names:
-            return ""
+        if fleethold.covering(t, holds) or _user_machine_rule(p, t, hosts | own):
+            return ""                   # a machine hold (`ttp pause --machine`) or the user's own rule on it
         near = lambda res: res == t or res.startswith(f"{t}-")   # a machine's resources: <alias>-device
         try:
             dirs = [d for d in shared.root().iterdir() if d.is_dir() and near(d.name)]
@@ -6108,8 +6132,9 @@ def _idle_reset_ask(p: Project, cfg: dict, a: dict, text: str, least: str) -> st
     to = f" Its recovery owner is {', '.join(owners)}: send it there with `ttp note --to <project>`." if owners else ""
     return (f"a reset, reboot, power cycle or restart of {', '.join(sorted(targets))}, which this project holds and "
             "nothing shows anyone else using, cannot harm people or speak as the user: decide it, do it, record it "
-            "with memory_add and report it at severity low." + to + " Ask only when another tenant, a serving or "
-            "shared use, a lock, a pause or a person's work is on it, and name it in the ask")
+            "with memory_add and report it at severity low." + to + " A serving, shared or production tag, "
+            "neighbours, live traffic or a site rule are no reason to ask. Ask only when another tenant, a lock, "
+            "a pause, a person's work or the user's own hold or allowlist is on it, and name it in the ask")
 
 
 # The status-quo and reversible-step checks only flag: a flagged ask is sent as usual, and the flag is

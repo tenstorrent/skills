@@ -224,7 +224,8 @@ def test_convgate_keeps_user_cited_and_restriction_gates_before_device_words():
         assert convgate.safety_class(why, when) == cls, (why, when)
         assert convgate.judge(p1, None, when or "true", why) == (False, cls), (why, when)
     for why, when in (("later is tidier", "test -e /tmp/ready"), (None, "landed:#7"),
-                      ("the users table is nicer sorted", None), ("message the team after", None)):
+                      ("the users table is nicer sorted", None), ("message the team after", None),
+                      ("wait for a lull in live traffic", None)):   # a lull is no safety class (user msg #1571)
         assert convgate.judge(p1, None, when or "true", why) == (True, None), (why, when)
     # A bare claim of the user's word cites no message of theirs: it drops, or files under a class it names.
     for why in ("waits for the user's ok on the pacing", "until the user decides the landing order",

@@ -7,9 +7,9 @@ dependencies are met starts now. Its start gate (a `start_after` delay, a `start
 `landed:#<id>` chain) stays only when the gate's `why` (or the probe itself) names a safety class
 (CLASSES): the user's own word (a cited user message, project.USER_CITE, or a `test -e
 <dir>/user-<x>` probe; a bare "until the user's ok" cites none); a charter Restriction (a guard, Restriction or charter rule); data loss; a
-spend cap or provider window; a shared device or machine (a lock, hold or pause, a lull for a
-restart, upgrade, reboot or power cycle); another person's work; a real dependency on another task's
-new file or symbol. The user's word and a Restriction come first, so a gate citing either is filed
+spend cap or provider window; a shared device or machine (a lock, hold or pause, a restart, upgrade,
+reboot or power cycle; a lull, live traffic or a neighbour alone is a convenience: user msg #1571);
+another person's work; a real dependency on another task's new file or symbol. The user's word and a Restriction come first, so a gate citing either is filed
 under it before any device word. Any other gate is a convenience and is dropped:
 
 - task_add and task_update (coordinator._start_args callers, deferral_update) drop it at once, the
@@ -57,7 +57,7 @@ CLASSES = (   # the user's word and a Restriction first: a gate citing either fi
                                      r"|\b(?:provider|usage|billing|token|rate|5[- ]?h(?:our)?) windows?\b"
                                      r"|\blimits? resets?\b|\bttp (?:budget|spend)\b"),
     ("shared device or machine", r"\bdevices?\b|\bmachines?\b|\bbox(?:es)?\b|\bnodes?\b|\bbrokers?\b|\blocks?\b"
-                                 r"|\bholds?\b|\bpause[sd]?\b|\blulls?\b|\brestart\w*|\bupgrad\w*|\breboot\w*"
+                                 r"|\bholds?\b|\bpause[sd]?\b|\brestart\w*|\bupgrad\w*|\breboot\w*"
                                  r"|\bpower[ -]?cycl\w*|\breservations?\b|\ballocations?\b|\bmaintenance\b"
                                  r"|\bbroker-released\b|\bdevq\b"),
     ("another person's work", r"\b(?:another|other) (?:person|people|user|developer|engineer|team|contributor)s?\b"

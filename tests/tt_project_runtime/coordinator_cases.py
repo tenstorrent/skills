@@ -6379,8 +6379,9 @@ _IDLE_RESET_THROUGH = [
     ("Is box-a idle? Reboot box-a if so.", {}, None),                                    # asks, not states
     ("Power cycle box-z? It is idle.", {}, None),                                        # unknown machine
     ("Power cycle the second machine?", {}, None),                                       # no target named
-    ("Power cycle box-s? It is idle.", {}, None),                                        # a serving tag
-    ("Power cycle box-h? It is idle.", {}, None),                                        # shared by all projects
+    ("Power cycle box-a? It is idle.", {}, "fleet-hold"),                                # a machine hold on it
+    ("Power cycle box-a? It is idle.", {}, "charter-hold"),                              # a user hold names it
+    ("Power cycle box-a? It is idle.", {}, "charter-allowlist"),                         # outside a user allowlist
     ("Power cycle box-a? It is idle.", {}, "lock"),                                      # a lock held on it
     ("Power cycle box-a? It is idle.", {}, "shared-lock"),                               # another project's lock
     ("Power cycle box-a? It is idle.", {}, "pause"),                                     # a pause on it
@@ -6402,7 +6403,7 @@ _IDLE_RESET_THROUGH = [
 
 @pytest.mark.parametrize("text,fields,setup", _IDLE_RESET_THROUGH)
 def test_an_ask_to_reset_goes_through_when_the_gate_cannot_tell(env, text, fields, setup):
-    from ttp import coordinator as coord, locks, machines, shared
+    from ttp import coordinator as coord, fleethold, locks, machines, shared
     p = make(env)
     machines.add("box-a", tags="device")
     machines.add("box-s", tags="device,serving")
@@ -6414,6 +6415,12 @@ def test_an_ask_to_reset_goes_through_when_the_gate_cannot_tell(env, text, field
         held = locks.try_take(locks.slot_paths(shared.root() / "box-a-device", "box-a-device", 1), "other task #4")
     elif setup == "pause":
         p.db.set_kv(coord.PAUSED_RESOURCES_KEY, {"box-a-device": {"reason": "test", "since": 1, "by": "user"}})
+    elif setup == "fleet-hold":
+        fleethold.set_hold("box-a", "the user's hold", "user", "user")
+    elif setup == "charter-hold":
+        p.charter_path.write_text("## Restrictions\n- Never reset or power-cycle box-a (user msg #7).\n")
+    elif setup == "charter-allowlist":
+        p.charter_path.write_text("## Restrictions\n- Use only box-s and box-h (user msg #7).\n")
     a = {"blocking": "human", **fields}
     try:
         assert coord._idle_reset_ask(p, p.config(), a, text, str(a.get("least_disruptive") or "")) == ""
@@ -6422,6 +6429,38 @@ def test_an_ask_to_reset_goes_through_when_the_gate_cannot_tell(env, text, field
             held.close()
     if setup is None:
         assert coord._idle_reset_ask(p, p.config(), {"blocking": "human"}, "Power cycle box-a? It is idle.", "")   # the control
+
+
+@pytest.mark.parametrize("target,least", [
+    ("box-s", _RESET_LEAST),                                         # a serving tag
+    ("box-h", _RESET_LEAST),                                         # shared by all projects
+    ("box-a", "wait for a lull in live traffic and its neighbours to finish"),   # serving state, neighbours
+    ("dev-h", _RESET_LEAST),                                         # a shared device lock
+])
+def test_a_reset_ask_is_refused_whatever_the_serving_tag_neighbours_or_site(env, target, least):
+    """User msg #1571: serving or shared tags, neighbours, live traffic and site rules never make a reset the
+    user's to decide; only the user's own holds and allowlists do (the THROUGH cases fleet-hold and charter-*)."""
+    from ttp import coordinator as coord, machines
+    p = make(env)
+    p.set_config("device.locks", ["dev-a", "dev-h"])
+    p.set_config("shared_resources", ["dev-h"])
+    machines.add("box-a", tags="device,production")
+    machines.add("box-s", tags="device,serving")
+    machines.add("box-h", tags="device", shared="")
+    machines.add("box-n", tags="device")   # a busy neighbour: another project's lock on its device
+    held = locks_take(env, "box-n-device")
+    p.charter_path.write_text("## Restrictions\n- Never push to main.\n- Use only the scheduler on clusters.\n")
+    try:
+        why = coord._idle_reset_ask(p, p.config(), {"blocking": "human"}, f"Power cycle {target}? It is idle.", least)
+    finally:
+        held.close()
+    assert "cannot harm people or speak as the user" in why and target in why, why
+    assert "serving, shared or production tag" in why and "allowlist" in why
+
+
+def locks_take(env, res):
+    from ttp import locks, shared
+    return locks.try_take(locks.slot_paths(shared.root() / res, res, 1), "other task #4")
 
 
 def test_a_reset_ask_naming_a_tenant_is_sent(env):
