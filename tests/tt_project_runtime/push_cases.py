@@ -2477,6 +2477,84 @@ def test_ttp_push_rebases_a_child_onto_the_tip_past_its_landed_parents_approved_
         assert rc == push.CONFLICT and _git_out(origin, "rev-parse", "proj") == landed, err
 
 
+def test_a_push_batch_drops_a_childs_copy_of_a_parent_head_its_review_sent_back_and_landed_reworked(
+        env, monkeypatch, capsys):
+    """The case of a docs change built on another review's approved head: that head was sent back as a
+    push conflict, its review landed a reworked head the child does not contain. The landed-task
+    mapping maps the sent-back head to that landing (same review, same branch), so the child replays
+    only its own commit: no conflict, its approval stands."""
+    from ttp import push
+    p, repo, origin, other, a = _landed_fixture(env, monkeypatch)
+    landed = _land_as(other, {"notes.txt": "a\nB1 reworked\nc\n"}, "first, reworked after its push conflict")
+    rework = _on_top(repo, "origin/proj~1", "first", {"notes.txt": "a\nB1 reworked\nc\n"})
+    now = time.time()
+    for head, status, sha in ((a, "conflict", None), (rework, "pushed", landed)):
+        p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated, landed_sha) "
+               "VALUES(?,?,?,?,?,?,?,?)", (7, "first", head, "origin/proj", status, now, now, sha))
+    head = _on_top(repo, a, "e1", {"more.txt": "own\n"})
+    rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed"], m
+    pushed = _git_out(origin, "rev-parse", "proj")
+    assert _git_out(origin, "rev-list", "--count", f"{landed}..{pushed}") == "1", "only its own commit"
+    assert _git_out(origin, "show", f"{pushed}:notes.txt") == "a\nB1 reworked\nc"
+    assert f"as {landed[:10]}); replaying the other 1" in capsys.readouterr().out
+    # Only the same review's heads on the same branch approved before the landing map to it; a row's
+    # own landing wins.
+    other_branch, later, own = "b" * 40, "c" * 40, "d" * 40
+    for head, branch, status, sha in ((other_branch, "elsewhere", "conflict", None), (later, "first", "approved", None),
+                                      (own, "first", "pushed", "e" * 40)):
+        p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated, landed_sha) "
+               "VALUES(?,?,?,?,?,?,?,?)", (7, branch, head, "origin/proj", status, now, now, sha))
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated, landed_sha) "
+           "VALUES(?,?,?,?,?,?,?,?)", (7, "first", "f" * 40, "origin/proj", "pushed", now, now, "9" * 40))
+    heads = push.landed_heads(p.db)
+    assert heads[a] == heads[later] == "9" * 40 and heads[rework] == landed and heads[own] == "e" * 40, heads
+    assert other_branch not in heads
+
+
+def test_an_approval_built_on_another_reviews_sent_back_head_waits_for_its_landing(env, monkeypatch):
+    """A child approval whose head contains a head another open review approved and got sent back (a
+    push conflict) is not batched, where it could only conflict on the parent's files and lose its
+    approval: it waits until that review lands its rework, ends, approves a head still carrying the
+    old one (stacked in one batch), or DEP_WAIT_S passes."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_s=0)
+    now = time.time()
+    parent = s.p.db.add_task("review parent", "r", kind="review", origin="coordinator")
+    s.p.db.update_task(parent, status="ready")
+    s.p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated) VALUES(?,?,?,?,?,?,?)",
+             (parent, "parent", s.head, "origin/proj", "conflict", now, now))
+    _commit(s.path, "docs.txt", "docs\n")
+    child_head = _git_out(s.path, "rev-parse", "HEAD")
+    s.p.db.update_task(s.review, status="pushing")
+    with s.p.db.tx():
+        [child] = pushq.approve(s.p, s.review, None, {"entries": [{"branch": s.branch, "head": child_head}],
+                                                      "target": "origin/proj"})
+    got, why = pushq.due(s.p, now + 1)
+    assert got == [] and f"waits for review #{parent} to land its sent-back head {s.head[:7]}" in why, why
+    s.p.db.x("UPDATE push_queue SET branch=? WHERE task=?", (s.branch, parent))
+    assert [r["id"] for r in pushq.due(s.p, now + 1)[0]] == [child], "a head on the same branch is its own lineage"
+    s.p.db.x("UPDATE push_queue SET branch='parent' WHERE task=?", (parent,))
+    # A rework that drops the old head still waits; one that carries it is stacked in one batch.
+    _git_out(s.path, "checkout", "-q", "-b", "rework", f"{s.head}~1")
+    _commit(s.path, "feature.txt", "feature reworked\n")
+    rework = _git_out(s.path, "rev-parse", "HEAD")
+    s.p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated) VALUES(?,?,?,?,?,?,?)",
+             (parent, "parent", rework, "origin/proj", "held", now, now))
+    assert pushq.due(s.p, now + 1)[0] == []
+    s.p.db.x("UPDATE push_queue SET head=? WHERE head=?", (child_head, rework))
+    assert [r["id"] for r in pushq.due(s.p, now + 1)[0]] == [child]
+    s.p.db.x("DELETE FROM push_queue WHERE task=? AND status='held'", (parent,))
+    assert pushq.due(s.p, now + 1)[0] == []
+    assert [r["id"] for r in pushq.due(s.p, now + pushq.DEP_WAIT_S + 2)[0]] == [child], "bounded"
+    s.p.db.update_task(parent, status="cancelled")
+    assert [r["id"] for r in pushq.due(s.p, now + 1)[0]] == [child], "the parent's review ended"
+    s.p.db.update_task(parent, status="ready")
+    s.p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated, landed_sha) "
+             "VALUES(?,?,?,?,?,?,?,?)", (parent, "parent", rework, "origin/proj", "pushed", now, now, rework))
+    assert [r["id"] for r in pushq.due(s.p, now + 1)[0]] == [child], "the parent landed: the mapping drops its copies"
+
+
 def test_a_push_batch_replays_an_entry_commit_amended_after_its_landing(env, monkeypatch):
     """The entry's commit is an amend (same author date and subject) of one that landed, made after
     the landing and adding work: it is newer than the landed copy, so it is replayed, never dropped."""

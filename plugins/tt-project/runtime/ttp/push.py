@@ -3662,11 +3662,16 @@ LANDED_HEADS_MAX = 200   # the newest landed push queue rows landed_heads maps
 
 def landed_heads(db) -> dict[str, str]:
     """{approved head: the commit it landed as} of the newest push queue rows that landed
-    (LANDED_HEADS_MAX): the landed-task mapping landed_deps reads. {} when the queue cannot be read."""
+    (LANDED_HEADS_MAX): the landed-task mapping landed_deps reads. A head the same review approved
+    on the same branch before that landing (sent back as a conflict or failed checks, then reworked)
+    maps to the landing too: a branch built on that older head carries copies the landing replaced.
+    A row's own landing wins over a later one. {} when the queue cannot be read."""
     try:
-        rows = db.q("SELECT head, COALESCE(landed_sha, pushed_sha) AS sha FROM push_queue "
-                    "WHERE status IN ('pushed','landed') AND COALESCE(landed_sha, pushed_sha) IS NOT NULL "
-                    "ORDER BY id DESC LIMIT ?", (LANDED_HEADS_MAX,))
+        rows = db.q("SELECT l.id = o.id AS own, o.head, COALESCE(l.landed_sha, l.pushed_sha) AS sha "
+                    "FROM (SELECT * FROM push_queue WHERE status IN ('pushed','landed') "
+                    "AND COALESCE(landed_sha, pushed_sha) IS NOT NULL ORDER BY id DESC LIMIT ?) l "
+                    "JOIN push_queue o ON o.task = l.task AND o.branch = l.branch AND o.id <= l.id "
+                    "ORDER BY own DESC, l.id DESC, o.id DESC", (LANDED_HEADS_MAX,))
     except Exception:   # noqa: BLE001 - no mapping only loses the drop, never a push
         return {}
     out: dict[str, str] = {}

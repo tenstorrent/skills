@@ -106,6 +106,12 @@ TIPS_TOLD = 20                  # tip_failed shas remembered, so each tip is rep
 FLAKY_EVENT = "push_flaky_test"   # a batch's failing tests passed on a rerun at the same head (batch._flaky)
 FLAKY_TOLD_S = 86400.0          # a flaky test id is reported once in this long ("flaky_told")
 DROPPED_EVENT = "push_dropped_as_resolved"   # a batch left out a commit only on a landing's conflict resolution
+# An approval whose head is built on another review's approved head that was sent back (conflict or
+# failed checks) waits for that review to land its rework (push.landed_heads then drops the stale
+# copies), not tried and sent back with it: at most this long after the send-back, and only while
+# that review is open and has no open approval containing the old head (one the batch stacks as usual).
+DEP_SENT_BACK = ("conflict", "check_failed")
+DEP_WAIT_S = 7200
 STACK_ROWS = 12                 # the newest open rows status reads for the stack depth (stack_depth)
 STACK_GIT_S = 5                 # ... each ancestry check bounded, as `ttp status` and the web app wait for it
 RATE_S = 86400                  # status counts the batches that landed approvals in this long
@@ -798,6 +804,30 @@ def _approved(db, name: str) -> list[dict]:
                 "AND t.status='pushing' AND q.target=? ORDER BY t.priority, q.id", (name,))
 
 
+def dep_waits(p: Project, rows: list[dict], now: float) -> dict[int, dict]:
+    """{row id: the sent-back row (of another review) its head is built on} for `rows` that wait
+    for that review's landing (DEP_SENT_BACK, DEP_WAIT_S). A git answer it cannot get holds nothing."""
+    db = p.db
+    sent = db.q("SELECT q.id, q.task, q.branch, q.head FROM push_queue q JOIN tasks t ON t.id=q.task "
+                f"WHERE q.status IN ({','.join('?' * len(DEP_SENT_BACK))}) AND q.updated>=? "
+                f"AND t.status NOT IN ({','.join('?' * len(TERMINAL_TASK_STATES))}) "
+                "AND NOT EXISTS (SELECT 1 FROM push_queue l WHERE l.task=q.task AND l.id>q.id "
+                "AND l.status IN ('pushed','landed')) ORDER BY q.id DESC",
+                (*DEP_SENT_BACK, now - DEP_WAIT_S, *TERMINAL_TASK_STATES)) if rows else []
+    out: dict[int, dict] = {}
+    for s in sent:
+        reworks = [o["head"] for o in db.q(
+            f"SELECT head FROM push_queue WHERE task=? AND id>? AND status IN ({','.join('?' * len(OPEN_ROWS))})",
+            (s["task"], s["id"], *OPEN_ROWS))]
+        if any(h == s["head"] or _ancestor(p, s["head"], h) for h in reworks):
+            continue   # its open approval still carries the old head: stacked in one batch as usual
+        for r in rows:
+            if r["id"] not in out and r["task"] != s["task"] and r["branch"] != s["branch"] \
+                    and r["head"] != s["head"] and _ancestor(p, s["head"], r["head"]):   # never its own lineage
+                out[r["id"]] = s
+    return out
+
+
 def _tracking_tip(p: Project, remote: str, branch: str) -> str:
     """The target's tip as last fetched: no network in the tick."""
     return _commit(p, f"refs/remotes/{remote}/{branch}")
@@ -841,6 +871,12 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     rows = _approved(db, f"{remote}/{branch}")
     if not rows:
         return [], "nothing approved"
+    if deps := dep_waits(p, rows, now):
+        waiting, rows = [r for r in rows if r["id"] in deps], [r for r in rows if r["id"] not in deps]
+        if not rows:
+            return [], "; ".join(f"review #{r['task']}'s approval waits for review #{deps[r['id']]['task']} to "
+                                 f"land its sent-back head {_short(deps[r['id']]['head'])}, which it is built on"
+                                 for r in waiting)
     paused = db.paused_resources()
     if push.lock_name(remote, branch) in paused or "push" in paused:
         return [], "the push resource is paused"
