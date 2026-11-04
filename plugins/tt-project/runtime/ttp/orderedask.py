@@ -7,9 +7,13 @@ for a step that the user or that agent already ordered in a logged inbound messa
 coordinator sends the change itself (a Restrictions charter_update with `source`, the agent's words as
 origin relayer) or acts. refusal() is model-free and runs only in agent mode; with it off nothing changes.
 
-What it refuses: a restriction ask (blocking restriction, or classify restriction_change) or an irreversible
-ask worded as a permission question (_PERMISSION_RE), when the ask cites a logged inbound message's id or
-shares a phrase (relay.SHINGLE words, relay.CONTENT of them not common) with its words, verbatim or relayed.
+What it refuses: a restriction ask (blocking restriction, or classify restriction_change) that cites a logged
+inbound message's id or shares a phrase (relay.SHINGLE words, relay.CONTENT of them not common) with its
+words, verbatim or relayed, and an irreversible ask worded as a permission question (_PERMISSION_RE) that
+cites such a message's id (the coordinator saying that message ordered it). A shared phrase is no intent: it
+may come from a prohibition ("do not reset ..."), so it never refuses an irreversible ask, and a restriction
+change it steers to is still checked against its source by the Restrictions gate. Every refusal is worded
+conditionally: if the message did not order the step or forbade it, the ask goes out with `not_covered`.
 Ids and phrases the charter already holds (a ban's own cite and words) do not count: quoting the ban asked
 about is no order. What still goes to the owner: funds, spend, review, merge, access (credential) and human
 (another person's request) asks, an ask in a relay.HELD class (a step that could affect people badly, one
@@ -34,10 +38,10 @@ def _content(phrase: tuple[str, ...]) -> bool:
     return sum(w not in relay._COMMON for w in phrase) >= relay.CONTENT
 
 
-def order(p, said: str, now: float | None = None) -> tuple[int, str, bool] | None:
+def order(p, said: str, now: float | None = None, phrases: bool = True) -> tuple[int, str, bool] | None:
     """(message id, the words of it the ask repeats or "", whether they are the owner's agent's and not the
-    user's verbatim words) of the newest logged inbound message of the last DAYS that `said` cites or shares
-    a phrase with, ids and phrases of the charter aside; else None."""
+    user's verbatim words) of the newest logged inbound message of the last DAYS that `said` cites or (with
+    `phrases`) shares a phrase with, ids and phrases of the charter aside; else None."""
     charter = p.charter_path.read_text() if p.charter_path.exists() else ""
     known = {int(x) for x in re.findall(r"#(\d+)", charter)}
     known_phrases = relay._shingles(relay._words(charter))
@@ -49,7 +53,7 @@ def order(p, said: str, now: float | None = None) -> tuple[int, str, bool] | Non
         if m["id"] in known:
             continue
         own, ctx = relay.split(m["text"] or "", m["context"])
-        for words, agent in ((own, False), (ctx, True)):
+        for words, agent in ((own, False), (ctx, True)) if phrases else ():
             hit = sorted(h for h in (mine & relay._shingles(relay._words(words))) - known_phrases if _content(h))
             if hit:
                 return m["id"], " ".join(hit[0]), agent
@@ -70,7 +74,7 @@ def refusal(p, cfg: dict, a: dict, text: str, least: str, not_covered_min: int) 
     restr = a.get("blocking") == "restriction" or a.get("classify") == "restriction_change"
     if not restr and not _PERMISSION_RE.search(text):
         return None
-    got = order(p, said)
+    got = order(p, said, phrases=restr)
     if not got:
         return None
     mid, words, agent = got
@@ -82,9 +86,10 @@ def refusal(p, cfg: dict, a: dict, text: str, least: str, not_covered_min: int) 
            "exception, or `both_hold` with an end (`expires` or `until`) for a temporary one" if restr else
            "act on it (task_add or the action), memory_add the decision and notify at severity low")
     return ("already ordered",
-            f"message #{mid} already ordered this ({whose}" + (f': "{words}"' if words else "") + f"), and with "
-            f"{relay.AGENT_KEY} on that order is the owner's: never ask the owner for permission to do what they "
-            f"or their agent ordered. Instead, {act}. A refusal of that change names its own fix: apply it and "
-            f"resend. Only a step that could affect people badly, speaks as the owner, or needs money or a "
-            f"credential goes to the owner. If the order does not cover this ask, resend with not_covered saying "
-            f"what differs (at least {not_covered_min} characters)")
+            f"message #{mid} ({whose}" + (f', sharing the words "{words}"' if words else ", which this ask cites")
+            + f") may already order this. If message #{mid} ordered this step: with {relay.AGENT_KEY} on that "
+            f"order is the owner's, so never ask the owner for permission to do what they or their agent ordered; "
+            f"instead, {act}. A refusal of that change names its own fix: apply it and resend. If message #{mid} "
+            f"did not order this step or forbade it, do not act on it: resend this ask with not_covered saying so "
+            f"(at least {not_covered_min} characters). Only a step that could affect people badly, speaks as the "
+            f"owner, or needs money or a credential goes to the owner either way")

@@ -3056,8 +3056,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     held = _held_lift(section, text, quote, replaced, gone) if (
                         by_agent and restr) else ("", "", "")
                     if held[0]:
+                        note = held[0] == "people" and relay.agent_orders(cfg) and all(
+                            new for (c, _), _, new in _held_hits(text, quote, replaced, gone) if c)
                         raise ValueError(relay.held_refusal("charter_update", *held) + "; a new ban the agent "
-                                         "orders may still be added as its own item")
+                                         "orders may still be added as its own item" + (_SAFETY_NOTE_FIX if note else ""))
                     try:
                         target, extra, retired = _charter_update(p, section, text, quote, replaces, key,
                                                                  uturn or ok is not None, over, end, no_ok,
@@ -4842,17 +4844,31 @@ def _held_lift(section: str, text: str, quote: str, replaced: str, gone: str) ->
     one in a changed clause always does (no scope or word exemption). Also read: the items of a replaced
     Restrictions section `gone` the new text does not keep word for word, or added text that may lift
     something (_may_lift). A new ban lifts nothing: the owner's agent may always add one."""
+    hits = _held_hits(text, quote, replaced, gone)
+    return next(((cls, words, w) for k in ("gate", "speaks", "people") for (cls, words), w, _ in hits if cls == k),
+                ("", "", ""))
+
+
+def _held_hits(text: str, quote: str, replaced: str, gone: str) -> list[tuple[tuple[str, str], str, bool]]:
+    """_held_lift's reads: (relay.held_match of a part, where it is, whether it is the new text's)."""
     norm = lambda t: " ".join(t.lower().split())
-    parts = [(f'the {w} clause "{c}" of {side}', c) for side, w, c in _changed_clauses(quote, text)] if quote else []
+    parts = [(f'the {w} clause "{c}" of {side}', c, side == "the new text")
+             for side, w, c in _changed_clauses(quote, text)] if quote else []
     if gone:
         kept = norm(text)
-        parts += [("a replaced line the new text drops or rewords", ln) for ln in gone.splitlines()
+        parts += [("a replaced line the new text drops or rewords", ln, False) for ln in gone.splitlines()
                   if ln.strip() and norm(ln) not in kept]
     elif text and not quote and _may_lift(text):
-        parts += [("the replaced section", replaced), ("the new text", text)]
-    hits = [(relay.held_match(t), w) for w, t in parts]
-    return next(((cls, words, w) for k in ("gate", "speaks", "people") for (cls, words), w in hits if cls == k),
-                ("", "", ""))
+        parts += [("the replaced section", replaced, False), ("the new text", text, True)]
+    return [(relay.held_match(t), w, new) for w, t, new in parts]
+
+
+# Agent mode: a class (a) refusal whose held words are all in the new text, of a change the owner's agent
+# ordered, may only be a safety note the text states ("no other tenant"): the class is still read (no word
+# exemption), and the refusal names the resend.
+_SAFETY_NOTE_FIX = ("; if those words are only a safety note the text states (such as 'no other tenant' or 'not "
+                    "shared'), resend the item without it, naming only the scope and the end, and record the note "
+                    "with memory_add or in the machine change ledger (`ttp machines change add`)")
 
 
 # A clause ends at , ; : a sentence's '.', a line end, or before ' and ' that starts a held step ("and post").

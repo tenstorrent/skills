@@ -121,28 +121,15 @@ _HELD_RE = {
                          r"purg\w*)\b", re.I)}
 
 
-# A people word (class (a)) the text itself negates ("no other tenant", "not shared", "without affecting other teams")
-# states what the step does not do: it is no held step. Only a noun negation and filler words may come between, so
-# a ban keeps its class: "never merge", "do not delete", "no need to delete" and "never touch other teams' boxes"
-# still match, and no other class is read this way.
-_NEGATED = re.compile(r"(?:\b(?:no|without|nor|none|nothing)|(?<!\bdo )(?<!\bdoes )(?<!\bdid )(?<!\bmust )"
-                      r"(?<!\bshould )(?<!\bwill )(?<!\bcan )(?<!\bmay )\bnot)"
-                      r"(?:\s+(?:a|an|the|any|one|other|another|else|else's|to|on|in|of|by|for|with|affecting|"
-                      r"touching|disturbing|impacting|harming|shared))*\s+$", re.I)
-_NEGATABLE = re.compile(r"(?:other|others|someone|another|shared|tenants?)\b", re.I)
-
-
 def held_match(text: str, skip: tuple[str, ...] = ()) -> tuple[str, str]:
     """(the HELD class `text` (what a change lifts or permits) falls in, checked (c), (b), (a), and the
     words that matched its rule), else ("", ""). A record cite ("user msg #12", "message #40") is no
-    message sent: it is read as blank, and so is a people word the text negates (_NEGATED: "no other tenant").
-    `skip`: classes not checked."""
+    message sent: it is read as blank. `skip`: classes not checked."""
     text = _RECORD.sub(" ", text or "")
     for k in ("gate", "speaks", "people"):
-        for m in () if k in skip else _HELD_RE[k].finditer(text):
-            if not (k == "people" and _NEGATABLE.match(m.group(0))
-                    and _NEGATED.search(re.split(r"[,;:.!?()\n]", text[:m.start()])[-1])):
-                return k, m.group(0)
+        m = None if k in skip else _HELD_RE[k].search(text)
+        if m:
+            return k, m.group(0)
     return "", ""
 
 

@@ -21757,38 +21757,40 @@ def test_a_contradiction_refusal_quotes_each_conflicting_clause_with_a_reason(en
     assert "Keep content generic" not in err[0], err
 
 
-def test_held_match_reads_negated_safety_words_and_perf_units_as_no_held_step():
-    """relay.held_match: a people word the text negates ("no other tenant", "not shared with others", "without
-    affecting other teams") and words that only look held ("postpone", "tokens per second") class nothing,
-    so a change the owner's agent orders is not refused for stating its own safety. Held steps still match,
-    negation words that do not negate the step included ("never ask before force-pushing", "no need to
-    delete", "not only shared machines", "no other tenant matters: wipe the shared box"), and a ban keeps its
-    class: "never merge", "do not post", "do not delete", "do not touch other tenants" (a negation is read only
-    before a people noun, never before a verb, so every charter ban is still classed)."""
+def test_held_match_keeps_every_people_word_and_reads_perf_units_and_postpone_as_no_held_step():
+    """relay.held_match (settled rule: no word or phrase exemption): a people word is class (a) whatever the
+    words before it, a safety note ("no other tenant", "not shared with others") and a negated ban ("no other
+    tenant's job is protected") alike, so a change the owner's agent orders cannot lift a people ban by negating
+    its noun. Words that only look held ("postpone", "tokens per second", "tokens/s") class nothing, and a ban
+    keeps its class."""
     from ttp import relay
-    for t in ("scoped to this project's own box, no other tenant; reversible, logged with an undo",
-              "Run the device test on box-q7; not shared with others", "without affecting other teams",
-              "it measures tokens per second", "at 30 tokens/s", "postpone the soak job"):
+    for t in ("it measures tokens per second", "at 30 tokens/s", "postpone the soak job"):
         assert relay.held_match(t) == ("", ""), t
-    for t, cls in (("never ask before force-pushing", "people"), ("no need to delete the old runs", "people"),
-                   ("not only shared machines", "people"), ("no other tenant matters: wipe the shared box", "people"),
-                   ("never mind the shared box", "people"), ("Workers may post the summary", "speaks"),
-                   ("posted updates", "speaks"), ("use the api tokens", "gate"), ("a token per user", "gate"),
-                   ("do not post in the chat", "speaks"), ("Never merge any pull request.", "speaks"),
-                   ("Never post in the owner's name.", "speaks"), ("Do not delete data.", "people"),
-                   ("do not touch other tenants", "people"), ("never touch other teams' boxes", "people"),
-                   ("Never use shared boxes", "people"), ("Never share credentials", "gate")):
+    for t, cls in (("scoped to this project's own box, no other tenant", "people"),
+                   ("Run the device test on box-q7; not shared with others", "people"),
+                   ("without affecting other teams", "people"), ("no other tenant's job is protected", "people"),
+                   ("none of the other tenants matter", "people"), ("nothing shared is off limits", "people"),
+                   ("no shared-machine limits", "people"), ("no other projects' limits apply", "people"),
+                   ("no other tenant is protected any more", "people"),
+                   ("never ask before force-pushing", "people"), ("no need to delete the old runs", "people"),
+                   ("Workers may post the summary", "speaks"), ("posted updates", "speaks"),
+                   ("use the api tokens", "gate"), ("a token per user", "gate"), ("do not post in the chat", "speaks"),
+                   ("Never merge any pull request.", "speaks"), ("Never post in the owner's name.", "speaks"),
+                   ("Do not delete data.", "people"), ("do not touch other tenants", "people"),
+                   ("never touch other teams' boxes", "people"), ("Never use shared boxes", "people"),
+                   ("Never share credentials", "gate")):
         assert relay.held_match(t)[0] == cls, t
 
 
 def test_agent_mode_accepts_the_owners_agents_restrictions_change_as_the_owners_own_words(env):
     """With coordinator.agent_orders_as_user on, a Restrictions change whose `source` is origin relayer and quotes
     the part labelled as the owner's word via the owner's agent applies exactly as the user's own words would:
-    a loosening (`quote` + `text`), a scoped exception (`excepts`) and a temporary exception (`both_hold`), even
-    when the text states its own safety ("no other tenant"), which the held check used to read as harm and
-    refuse as needing the owner's own words. Still refused: a genuinely held change, a quote in no part of the
-    message (its refusal names the relayer-origin resend, never an ask), a harness-posted message's context, and
-    with the setting off a relayer-only quote (behaviour unchanged)."""
+    a loosening (`quote` + `text`), a scoped exception (`excepts`) and a temporary exception (`both_hold`), each
+    naming only its scope and end. Still refused: a genuinely held change; text stating a safety note ("no other
+    tenant") is still class (a), its refusal naming the resend without the note (memory_add or the machine change
+    ledger); a relayer-only both_hold beside a people ban that negates its noun ("no other tenant's job is
+    protected"); a quote in no part of the message (its refusal names the relayer-origin resend, never an ask);
+    a harness-posted message's context; and with the setting off a relayer-only quote (behaviour unchanged)."""
     import json
     from ttp import relay
     from ttp import coordinator as coord
@@ -21798,12 +21800,11 @@ def test_agent_mode_accepts_the_owners_agents_restrictions_change_as_the_owners_
     ban = "Never run device tests. (user msg #1)"
     base = p.charter_path.read_text() + f"\n## Restrictions\n- {ban}\n"
     order = "run the top priority device test on box-q7 until 2026-12-01"
-    safe = " (scoped to this project's own box, no other tenant; reversible, logged with an undo)"
-    forms = (("loosen", {"quote": ban, "text": "- Never run device tests, except on box-q7" + safe + "."}),
+    forms = (("loosen", {"quote": ban, "text": "- Never run device tests, except on box-q7 until 2026-12-01."}),
              ("excepts", {"excepts": "Never run device tests.",
-                          "text": "- Device tests may run on box-q7 until 2026-12-01" + safe + "."}),
+                          "text": "- Device tests may run on box-q7 until 2026-12-01."}),
              ("both_hold", {"both_hold": True, "expires": "2026-12-01",
-                            "text": "- Device tests may run on box-q7" + safe + "."}))
+                            "text": "- Device tests may run on box-q7."}))
     n = [100]
 
     def send(form: dict, quote: str = order, verbatim: str = "", context: str = f"Order: {order}",
@@ -21837,6 +21838,28 @@ def test_agent_mode_accepts_the_owners_agents_restrictions_change_as_the_owners_
                   quote="let device tests wipe the shared scratch disk",
                   context="Order: let device tests wipe the shared scratch disk")
     assert len(err) == 1 and "(a) a step that could affect people badly" in err[0] and ban in p.charter_path.read_text()
+    # A safety note in the new text is still class (a); the refusal names the resend without it.
+    _, err = send({"both_hold": True, "expires": "2026-12-01",
+                   "text": "- Device tests may run on box-q7 (no other tenant; not shared)."})
+    assert len(err) == 1 and "(a) a step that could affect people badly" in err[0], err
+    assert "resend the item without it" in err[0] and "machine change ledger" in err[0], err
+    assert "box-q7" not in p.charter_path.read_text()
+    # Negating a people ban's noun lifts nothing: the both_hold item is refused by class (a).
+    tenants = "Never preempt other tenants' jobs on a box. (user msg #1)"
+    for t in ("- Device tests may run on any box; no other tenant's job is protected.",
+              "- Device tests may run on any box; none of the other tenants matter.",
+              "- Device tests may run on any box; nothing shared is off limits."):
+        base_t = base.replace(f"- {ban}", f"- {tenants}")
+        mid = db.post("in", "", chat="cli", provenance="cli-legacy", context=f"Order: {t[2:]}")
+        p.charter_path.write_text(base_t)
+        n[0] += 1
+        err = coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "both_hold": True,
+                               "expires": "2026-12-01", "text": t,
+                               "source": json.dumps({"origin": "relayer", "msg": mid, "quote": t[2:]})}],
+                          user_turn=coord.user_turn(db, [mid]), messages=[mid], turn=n[0])
+        text = p.charter_path.read_text()
+        assert len(err) == 1 and "(a) a step that could affect people badly" in err[0], (t, err)
+        assert "any box" not in text and tenants in text, t
     # A quote in no part of the message: the refusal names the relayer-origin resend, never an ask.
     _, err = send(forms[0][1], quote="something nobody said at all here")
     assert err and '"origin": "relayer"' in err[0] and "ask the user" not in err[0] and ban in p.charter_path.read_text()
@@ -21848,10 +21871,12 @@ def test_agent_mode_accepts_the_owners_agents_restrictions_change_as_the_owners_
 def test_agent_mode_refuses_a_permission_ask_for_what_was_already_ordered(env):
     """With coordinator.agent_orders_as_user on, an ask seeking permission for what a logged message already
     ordered (the owner's agent's words or the user's own) is refused with the fix (send the charter_update with
-    the right `source`, or act): a restriction ask and an irreversible permission ask. Still sent: asks in a
-    held class (people, speaking as the owner, money, a credential), funds and human asks, one whose
-    not_covered says what differs, one that only quotes the ban asked about, and with the setting off any of
-    them (behaviour unchanged)."""
+    the right `source`, or act), worded conditionally (if it did not order this or forbade it, resend with
+    not_covered): a restriction ask citing the message or sharing a phrase with it, and an irreversible permission
+    ask citing its id. Still sent: an irreversible ask sharing only a phrase, an irreversible ask after a
+    prohibition of the same step ("do not reset ..."), asks in a held class (people, speaking as the owner, money,
+    a credential), funds and human asks, one whose not_covered says what differs, one that only quotes the ban
+    asked about, and with the setting off any of them (behaviour unchanged)."""
     from ttp import orderedask, relay
     from ttp import coordinator as coord
     p = make(env)
@@ -21876,7 +21901,7 @@ def test_agent_mode_refuses_a_permission_ask_for_what_was_already_ordered(env):
         return coord.apply(p, [a], turn=n[0])
 
     def ordered(err: list[str]) -> bool:
-        return any("already ordered" in e for e in err)
+        return any("may already order this" in e for e in err)
 
     # Off: nothing changes.
     for a in (restr, irrev):
@@ -21886,8 +21911,17 @@ def test_agent_mode_refuses_a_permission_ask_for_what_was_already_ordered(env):
     err = ask(restr)
     assert len(err) == 1 and ordered(err) and f"message #{mid}" in err[0], err
     assert '"origin": "relayer"' in err[0] and "`excepts`" in err[0] and "`both_hold`" in err[0], err
-    err = ask(irrev)
-    assert len(err) == 1 and ordered(err) and "act on it" in err[0], err
+    assert "did not order this step or forbade it" in err[0] and "not_covered" in err[0], err
+    # Irreversible: a shared phrase alone is no order; citing the ordering message's id is.
+    assert not ordered(ask(irrev))
+    err = ask({**irrev, "text": f"Per message #{mid}, may I proceed to run the top priority device test on box-q7 now?"})
+    assert len(err) == 1 and ordered(err) and "act on it" in err[0] and "forbade it" in err[0], err
+    # A prohibition is no order: the irreversible ask sharing its words goes out.
+    db.post("in", "do not reset the soak counters on box-q7 before Friday", chat="cli", provenance="cli-legacy")
+    forbid = {**irrev, "text": "May I reset the soak counters on box-q7 today to start the benchmark?"}
+    assert not ordered(ask(forbid))
+    assert orderedask.refusal(p, p.config(), forbid, forbid["text"], forbid["least_disruptive"],
+                              coord.NOT_COVERED_MIN) is None
     # The user's own verbatim order: the fix names the plain {msg, quote} source.
     own = db.post("in", "rerun the nightly widget benchmark on box-q7 tonight", chat="cli", provenance="cli-legacy")
     err = ask({**restr, "text": "May I lift the ban to rerun the nightly widget benchmark on box-q7 tonight?"})
