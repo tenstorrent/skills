@@ -465,10 +465,10 @@ def _urgent_done(env, p, title, fups, spec="", priority=3, labels=(), reply_chat
     p.db.update_task(tid, status="running", **({"reply_chat": reply_chat} if reply_chat else {}))
     if setup:
         setup(tid)
-    return _hand_off(env, p, tid, title, fups, metrics)
+    return _urgent_hand_off(env, p, tid, title, fups, metrics)
 
 
-def _hand_off(env, p, tid, title, fups, metrics=None):
+def _urgent_hand_off(env, p, tid, title, fups, metrics=None):
     """Running task `tid` hands off done with `fups` and `metrics`, at a cost of $1; its id."""
     import json
     from ttp.daemon import Daemon
@@ -568,7 +568,7 @@ def test_a_two_wide_urgent_fan_out_stays_within_max_usd_in_total(env):
         if kid is None:
             break
         p.db.update_task(kid["id"], status="running", spent_usd=1.0)
-        _hand_off(env, p, kid["id"], kid["title"], [
+        _urgent_hand_off(env, p, kid["id"], kid["title"], [
             {"title": f"continue: wide work #{kid['id']}, part {k}", "spec": "More."} for k in "ab"], {"progress": n})
     spent = p.db.one("SELECT COUNT(*) n, SUM(spent_usd) usd FROM tasks")
     assert spent["usd"] <= 4 and spent["n"] <= 4, dict(spent)
