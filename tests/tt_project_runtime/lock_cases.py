@@ -1901,13 +1901,13 @@ def _queue_waiter(d, res, since, run_env, fork=False):
     return w
 
 
-def _ask(w):
+def _queue_ask(w):
     w.stdin.write("?\n")
     w.stdin.flush()
     return w.stdout.readline().split()
 
 
-def _plain_env():
+def _queue_plain_env():
     return {k: v for k, v in os.environ.items() if k not in ("TTP_RUN_DIR", "TTP_DETACHED", "PYTHONPATH")}
 
 
@@ -1916,8 +1916,8 @@ def test_a_killed_waiters_queue_entry_is_dropped_even_when_a_child_keeps_its_loc
     from ttp import locks
     monkeypatch.delenv("TTP_RUN_DIR", raising=False)
     d, res = tmp_path / "locks", "suite"
-    plain = _queue_waiter(d, res, 1.0, _plain_env())
-    forked = _queue_waiter(d, res, 2.0, _plain_env(), fork=True)
+    plain = _queue_waiter(d, res, 1.0, _queue_plain_env())
+    forked = _queue_waiter(d, res, 2.0, _queue_plain_env(), fork=True)
     mine = locks.enqueue(d, res, "next", since=3.0)
     try:
         assert [t.name.split("-")[0] for t in locks.queued(d, res)] == ["0000000001.000000", "0000000002.000000",
@@ -1945,17 +1945,17 @@ def test_a_waiter_whose_run_ended_loses_its_queue_place_and_never_takes_a_turn_b
     monkeypatch.delenv("TTP_RUN_DIR", raising=False)
     d, res, run = tmp_path / "locks", "suite", tmp_path / "run"
     run.mkdir()
-    in_run = _queue_waiter(d, res, 1.0, {**_plain_env(), "TTP_RUN_DIR": str(run)})
-    job = _queue_waiter(d, res, 2.0, {**_plain_env(), "TTP_RUN_DIR": str(run), "TTP_DETACHED": "1"})
+    in_run = _queue_waiter(d, res, 1.0, {**_queue_plain_env(), "TTP_RUN_DIR": str(run)})
+    job = _queue_waiter(d, res, 2.0, {**_queue_plain_env(), "TTP_RUN_DIR": str(run), "TTP_DETACHED": "1"})
     mine = locks.enqueue(d, res, "next", since=3.0)
     try:
-        assert len(locks.queued(d, res)) == 3 and _ask(in_run) == ["False", "False", "True"]
+        assert len(locks.queued(d, res)) == 3 and _queue_ask(in_run) == ["False", "False", "True"]
         (run / "exit.json").write_text("{}")
         q = locks.queued(d, res)
         assert len(q) == 2 and q[1] == mine and locks._arrival(q[0]) == 2.0, q
         # the ended run's waiter, still alive, has no place and never takes a turn; it knows why
-        assert _ask(in_run) == ["True", "True", "False"]
-        assert _ask(job) == ["False", "False", "True"]
+        assert _queue_ask(in_run) == ["True", "True", "False"]
+        assert _queue_ask(job) == ["False", "False", "True"]
         assert not locks.my_turn(d, res, mine, 1) and locks.my_turn(d, res, mine, 2)
         # a check the daemon runs after the run ended, with the run's variables, is not tied to it
         assert locks._waits_for_run({"TTP_RUN_DIR": str(run)}) == ""
