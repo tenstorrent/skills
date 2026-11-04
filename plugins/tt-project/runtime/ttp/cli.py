@@ -1628,6 +1628,12 @@ def status_text(p: Project, verbose: bool = False) -> str:
     if h.get("coverage") and (verbose or "missing:" in h["coverage"]):
         lines.append(h["coverage"])
     lines.extend(h.get("obligations") or [])
+    from . import eta
+    try:   # urgent tasks and open promises with their expected finish (critical path)
+        if got := eta.state_lines(db, p, now)[1:]:
+            lines += ["expected finish (critical path, measured medians):"] + ["  " + x[2:] for x in got]
+    except Exception as e:
+        lines.append(f"expected finish: not read ({type(e).__name__})")
     from . import mitigate
     lines.extend(mitigate.status_lines(db, now, tz))
     from . import sweepskip
@@ -1976,6 +1982,26 @@ def cmd_ttr(a) -> None:
     got = ttr.lines(p.db, timefmt.home(p), a.alias, a.days, project=p.name)
     print("\n".join(got) if got else f"no machine incidents in {a.days:g} d"
           + (f" on {a.alias}" if a.alias else ""))
+
+
+def cmd_eta(a) -> None:
+    """Expected finish of a task or obligation from its critical path (eta.py): measured medians, no padding.
+    Workers read it before setting a retry or deadline wake."""
+    from . import eta, obligations
+    p = need(a.name, sys.argv[1:]) if a.name else here()
+    if not p:
+        die("no tt-project project here; name one: `ttp eta <task> <name>`")
+    ref, now = str(a.target).lstrip("#"), time.time()
+    if ref.isdigit():
+        e = eta.estimate(p.db, int(ref), now)
+    elif (o := obligations.get(p.db, ref)) is not None:
+        e = eta.obligation_estimate(p.db, o, now)
+    else:
+        die(f"not a task id or obligation: {a.target}")
+    if a.json:
+        print(json.dumps({**e, "wake_at": eta.wake_at(e), "field": eta.field(e, p, now)}, indent=1))
+    else:
+        print(eta.text(e, p, now))
 
 
 def cmd_push_audit(a) -> None:
@@ -10710,7 +10736,7 @@ COMMAND_GROUPS = (
                   "machines", "logs", "doctor")),
     ("inside a run", ("note", "notify", "progress", "checks", "lock", "host-run", "detach", "devq", "push", "land",
                       "clip", "sandbox", "skill", "killscan", "svcscan", "leftover-procs", "said")),
-    ("probes (retry_when, start_when)", ("landed", "ci", "ack-wait", "ssh-preflight", "broker-released",
+    ("probes (retry_when, start_when)", ("landed", "eta", "ci", "ack-wait", "ssh-preflight", "broker-released",
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
@@ -11108,6 +11134,13 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--days", type=float, default=2, help="done tasks updated within this many days")
     s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_push_audit)
+
+    s = sub.add_parser("eta", help="expected finish of a task or obligation from its critical path (measured "
+                                   "medians): quote it, and set retry and deadline wakes at it")
+    s.add_argument("target", help="a task id (#12 or 12) or an obligation key (o5)")
+    s.add_argument("name", nargs="?", help="the project (default: the one here)")
+    s.add_argument("--json", action="store_true", help="print JSON (wake_at: the epoch to wake at)")
+    s.set_defaults(fn=cmd_eta)
 
     s = sub.add_parser("ttr", help="how long each machine took to recover from problems: incidents, median, "
                                    "90th percentile and longest time, and the ones still open")

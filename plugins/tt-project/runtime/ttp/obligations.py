@@ -232,7 +232,7 @@ def _milestones(o: dict, milestones) -> None:
                 raise ValueError(f"milestone {key} already exists with a different due time or required evidence")
             continue
         saved[key] = {"key": key, "due": due, "evidence_required": required, "receipt": None,
-                      "episode": 0, "raised": None}
+                      "episode": 0, "raised": None, "added": time.time()}
 
 
 def add_milestones(p, oid: str, milestones: list[dict]) -> None:
@@ -1327,7 +1327,7 @@ def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int,
                     continue   # the same turn applied again
                 pr["message"] = mid
                 if due is not None and due != pr["due"]:
-                    pr.update(due=due, timed=True, raised=None)
+                    pr.update(due=due, timed=True, raised=None, set_at=now)   # set_at: when this due was promised
                 notes.append(f"promise {same['id']} in chat {chat} updated from message #{mid}")
                 continue
             oid = f"o{st['next']}"

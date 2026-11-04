@@ -184,7 +184,9 @@ valid one: No `result.json`, no credit.
   and cells another open task's `cells:` line names; with none left, no hop.
 <!-- /ttp:if cells -->
 - `waiting` when a resource is busy (a reservation, a queue, a review): back after `retry_after_s`,
-  not an attempt. Save what you learned first. Always give a `retry_when`, run model-free every few
+  not an attempt. On urgent work a retry, deadline wake or promised time sits at the expected finish of
+  what it waits on: read `ttp eta <task>` (critical path, measured medians; `--json` gives `wake_at`),
+  never a padded worst case or hours out. Save what you learned first. Always give a `retry_when`, run model-free every few
   minutes in the project root: read-only, under a minute, printing a line naming its wait; exit 0
   once the wait is over whatever the outcome, 1 while it is not (75, a busy `ttp lock`, or 255, ssh
   not reaching the host, also keep it asleep); other exits wake it as broken. A failing remote command

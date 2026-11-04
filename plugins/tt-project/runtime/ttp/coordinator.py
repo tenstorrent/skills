@@ -50,6 +50,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     credits,
     deploy,
     echoes,
+    eta,
     effort,
     ends,
     failover,
@@ -883,6 +884,14 @@ def join_prompt(head: str, context: str) -> str:
     return f"{head}\n\n{context}"
 
 
+def safe_eta(fn, default):
+    """An expected-finish read (eta.py) for the digest: one that fails on bad state is skipped, never the digest."""
+    try:
+        return fn()
+    except Exception:
+        return default
+
+
 def clip(text: Any, n: int) -> str:
     """`text` on one line, at most `n` characters, cut at a word where one is near."""
     s = " ".join(str(text or "").split())
@@ -1196,6 +1205,10 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     if unfixed := causefix.digest_lines(db, now):
         course_lines = (course_lines or [course.HEADER]) + unfixed
         course_id += "\ncausefix:" + unfixed[0].split(" | ")[0]
+    if long_due := safe_eta(lambda: eta.course_lines(db, p.config(), now), ([], [])):
+        if long_due[0]:
+            course_lines = (course_lines or [course.HEADER]) + long_due[0]
+            course_id += "\n" + "\n".join(long_due[1])
     if unplain := plainreply.digest_lines(db, now):
         course_lines = (course_lines or [course.HEADER]) + unplain
         course_id += "\nplainreply:" + unplain[0].split(" | ")[0]
@@ -1310,6 +1323,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("user_words", lines, "\n".join(lines[1:]),
             f"## The user's latest words on blocked items: {len(lines) - 1} lines (as last turn; apply them)")
     section("promises", obligations.promise_lines(db, now, home))
+    section("eta", safe_eta(lambda: eta.state_lines(db, p, now), []))
     lines = []
     sent = db.q("SELECT * FROM messages WHERE direction='out' AND kind IN ('reply','ask','alert') "
                 "ORDER BY id DESC LIMIT ?", (RECENT_OUT * msgparts.MAX_PARTS,))
@@ -3248,6 +3262,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                                      milestone=a.get("milestone")))
                 elif str(a.get("why") or "").strip():
                     notes.append(obligations.drop(p, oid, str(a["why"]), by="coordinator"))
+                elif str(a.get("justify") or "").strip():
+                    notes.append(eta.justify(p, oid, str(a["justify"])))
                 elif (owners or a.get("milestones")) and (obligations.get(db, oid) or {}).get("receipt"):
                     # Delivered already: an owner or milestone more changes nothing owed (no rejection).
                     notes.append(f"obligation {oid} already has its receipt: owners and milestones not added, "
@@ -3261,7 +3277,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             batch_obls.append(oid)
                 else:
                     raise ValueError("obligation needs `text` (new), or `key` with `owners` (attach), "
-                                     "`milestones` (add), `evidence` (receipt, optional `milestone`) or `why` (drop)")
+                                     "`milestones` (add), `evidence` (receipt, optional `milestone`), `why` (drop) "
+                                     "or `justify` (the critical path behind a long due on urgent work)")
             elif t == "resource_pause":
                 if not isinstance(a.get("paused"), bool):
                     raise ValueError("resource_pause needs `paused`: true or false")

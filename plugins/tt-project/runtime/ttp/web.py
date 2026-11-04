@@ -18,7 +18,7 @@ from . import alerts, awake, chatgone
 from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
-from . import credits, fleethold, heal, identity, lockprobe, mcpgap, obligations, outagetask, projpause, pushq, release, responsibilities, route, sweep, timefmt, urgent, waits
+from . import credits, eta, fleethold, heal, identity, lockprobe, mcpgap, obligations, outagetask, projpause, pushq, release, responsibilities, route, sweep, timefmt, urgent, waits
 from . import schedule as sched
 from . import pauseends, selfreview, startgate, sweepskip, timefmt, trend, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
@@ -696,12 +696,17 @@ def state_payload(p: Project, db: DB) -> dict:
     paused = db.paused_resources()
     entered = sweep.entered_map(db, [t for t in tasks if t["status"] == "blocked"], now)
     cfg, probed = p.config(), {}
+    est = eta._Est(db, now)
     for t in tasks:
         t["job_use"] = [f"job {j['name']}: {j['line']}" for j in job_use.values() if j.get("task") == t["id"]] or None
         t["review_since"] = in_review.get(t["id"])
         # The urgent lane (ttp/urgent.py): the spec is read for its `urgent:` line, never sent.
         t["urgent"] = urgent.shown_why(db, t, now) or None
         t["waited_s"] = round(urgent.waited_s(db, t, now)) if t["urgent"] else None
+        try:   # expected finish from the critical path (eta.py), for urgent tasks
+            t["eta"] = eta.field(est.task(t["id"]), cfg, now) if t["urgent"] else None
+        except Exception:
+            t["eta"] = None
         t.pop("spec", None)
         t["outcome"] = task_outcome(t)   # changes_needed for a review that asked for changes
         result = load_result(t["result"])
