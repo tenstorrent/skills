@@ -1248,6 +1248,51 @@ def _cmd_ended(pid, timeout=30):
     return _until_true(_done, timeout)
 
 
+_CMD_HANG_S = 600   # only a hang guard: _cmd_end_waiter's wait ends as the process does
+
+
+def _cmd_end_waiter(pid):
+    """For a process pid that is alive now (and not this one's child): a call that returns whether it
+    ended, once it has. It waits on a pidfd opened now, which is readable as soon as the process exits,
+    reaped or not, whoever adopted it, so a loaded host only delays the answer: a 30 s poll of it timed
+    out on a busy host while the command was still on its way out. No pidfd (macOS): _cmd_ended."""
+    try:
+        pfd = os.pidfd_open(pid)
+    except (AttributeError, OSError):
+        return lambda: _cmd_ended(pid)
+
+    def _wait():
+        import select
+        try:
+            return bool(select.select([pfd], [], [], _CMD_HANG_S)[0])
+        finally:
+            os.close(pfd)
+    return _wait
+
+
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="no pidfd: _cmd_end_waiter polls as _cmd_ended")
+def test_cmd_end_waiter_waits_for_an_adopted_process_however_long_it_is_held_up_and_sees_a_zombie(tmp_path):
+    # The sigkilled test below polled its orphaned command for 30 s; on a loaded host the command was not
+    # gone yet. A stopped process stands in for one the host starves past that poll: the waiter answers
+    # once it ends, whoever reaps it, and an unreaped zombie counts as ended.
+    pidf = tmp_path / "pid"
+    sh = subprocess.Popen(["sh", "-c", f"sleep 30 & echo $! > {shlex.quote(str(pidf))}"])
+    sh.wait()   # the sleep is adopted by init (or a subreaper): not this process's child
+    pid = int(pidf.read_text())
+    ended = _cmd_end_waiter(pid)
+    os.kill(pid, signal.SIGSTOP)
+    assert not _cmd_ended(pid, timeout=0.3), "a held-up process reads as running to a timed poll"
+    os.kill(pid, signal.SIGKILL)
+    assert ended()
+    from ttp import locks
+    child = subprocess.Popen(["true"])
+    ended = _cmd_end_waiter(child.pid)
+    try:
+        assert ended() and locks.zombie(child.pid)
+    finally:
+        child.wait()
+
+
 @pytest.mark.parametrize("closes", [False, True])
 @pytest.mark.parametrize("mode", [(), ("--shared",)])
 def test_ttp_lock_stays_held_while_its_command_runs_after_ttp_lock_is_sigkilled(env, mode, closes):
@@ -1267,6 +1312,7 @@ def test_ttp_lock_stays_held_while_its_command_runs_after_ttp_lock_is_sigkilled(
     try:
         assert _until_true(lambda: pidf.exists()), first.stderr.read()
         pid = int(pidf.read_text())
+        ended = _cmd_end_waiter(pid)   # the command waits for go: alive until then
         first.kill()
         first.wait(timeout=30)
         os.kill(pid, 0)   # the command outlives its ttp lock
@@ -1282,7 +1328,7 @@ def test_ttp_lock_stays_held_while_its_command_runs_after_ttp_lock_is_sigkilled(
         assert f"pid {pid} alive" in _lock_probe(run_env, "board").stdout
     finally:
         go.touch()
-    assert pid and _cmd_ended(pid)
+    assert pid and ended()
     assert _until_true(lambda: _lock_probe(run_env, "board").returncode == 0), _lock_probe(run_env, "board").stdout
 
 
