@@ -50,6 +50,31 @@ detect workspace → load recipe → research target → route → execute → r
 - Host: Bash. Build, git, file I/O, pip, health checks.
 - In doubt: needs a TT device → MCP.
 
+## Long-run watchdog
+
+Three layers guard a stalled device job:
+
+1. **Armed:** the auto-triage op-timeout (`execution.md` § Auto-triage).
+   Only runs through `tt-buddy:run` carry it.
+2. **Bounded:** job timeout = the run's envelope (`execution.md` § Job-timeout envelope).
+   It catches host-side hangs the op-timeout misses.
+3. **Supervised:** watch progress and wedge signatures (`recovery.md` § Detect the wedge early).
+
+- **Compile is not a wedge.** New log lines and growing caches are progress.
+- Cold JIT and trace capture can run for minutes. NEVER kill them.
+- Wedge: output flat for minutes past the envelope.
+- Envelope comes from history (`tt-buddy:note`, `tt-buddy:learn`), not a guess.
+- Past the envelope, output flat: triage while the process lives.
+- Then follow `recovery.md`. NEVER kill a foreign job.
+
+## Low contention
+
+- A device job holds the shared device for its whole run.
+- Build, data prep, weight conversion, analysis: Bash, outside the job.
+- Kernel JIT compile is host work too.
+- Cold cache: compiling inside the job can exceed its timeout.
+- Tree supports it: warm the cache off-device before submitting.
+
 ## Progressive Load Table
 
 | Sub-task | Load |
@@ -57,9 +82,11 @@ detect workspace → load recipe → research target → route → execute → r
 | Detect workspace, repo, platform, arch | `workspace-detect.md` |
 | Workspace setup and activation | `<plugin-root>/recipes/workspace.md` |
 | Command routing, env sources, auto-triage contract | `execution.md` |
-| Full device recovery (triage → kill → reset → verify → cache) | `recovery.md` |
+| Full device recovery (triage → kill → reset if needed → verify → cache) | `recovery.md` |
 | Test invocation for detected repo | `<plugin-root>/recipes/<repo>/test.md` |
 | Server lifecycle (vllm-tt-plugin only) | `<plugin-root>/recipes/vllm-tt-plugin/server.md` |
 | Benchmark (vllm-tt-plugin only) | `<plugin-root>/recipes/vllm-tt-plugin/benchmark.md` |
 | Environment variables | `<plugin-root>/recipes/<repo>/env.md` |
 | Target env vars, constraints, config params | invoke `tt-buddy:learn("<target> env vars and config params")` |
+| Job running long: compile or wedge, when to act | this file § Long-run watchdog |
+| Cut device contention: keep compile off the job | this file § Low contention |
