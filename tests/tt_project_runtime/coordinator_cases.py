@@ -3130,6 +3130,10 @@ def test_a_restrictions_item_without_a_valid_source_is_rejected_with_the_memory_
                      ({"origin": "nobody"}, "must be brief or gate"),
                      ({"origin": "relayer"}, "relayer counts only with")):
         err = coord.apply(p, [{**add, **({"source": src} if src is not None else {})}], turn=2)
+        if why == "a relayer's context does not count":   # a readable user message: its filled resend instead
+            assert len(err) == 1 and "refused; resend this" in err[0] and "box B" not in err[0].split(" -- why")[0] \
+                and '\\"quote\\": \\"Never push tags before CI passes.\\"' in err[0], (src, err)
+            continue
         assert len(err) == 1 and why in err[0] and "memory_add" in err[0], (src, err)
     # Not in the user's turn either, and a missing source is no approval to record.
     err = coord.apply(p, [add], turn=3, user_turn=True, messages=[said])
@@ -3216,6 +3220,9 @@ def test_a_restrictions_source_sent_as_a_json_string_is_read_on_both_paths(env):
                     {**add, "quote": "Never push tags before CI passes. (user msg #%d)" % said,
                      "text": "- Never skip CI.", "source": src}):
             err = coord.apply(p, [act], turn=4, user_turn=True, messages=[said])
+            if src.startswith('{"msg": %d' % said):   # a readable user message: its filled resend, the why after it
+                assert len(err) == 1 and err[0].startswith("charter_update: refused; resend this") and why in err[0]
+                continue
             assert len(err) == 1 and why in err[0] and "sent as a string" in err[0] and "memory_add" in err[0], (src, err)
             assert ("needs `source`" in err[0]) == (why == "needs `source`"), (src, err)
     assert p.charter_path.read_text() == before

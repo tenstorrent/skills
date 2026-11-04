@@ -3025,9 +3025,6 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         _restriction_edit(p, section, quote, str(a.get("replaces") or "")))
                     held = _held_lift(section, text, quote, replaced, gone) if (
                         by_agent and restr) else ("", "", "")
-                    if held[0] and chartertemplate.user_covers(db, a.get("source"), text, quote, gone,
-                                                                replaced):
-                        held = ("", "", "")   # `source` is the user's own verbatim words, every held word in them
                     if held[0]:
                         raise ValueError(relay.held_refusal("charter_update", *held) + "; a new ban the agent "
                                          "orders may still be added as its own item")
@@ -3306,8 +3303,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if isinstance(e, DraftGateRejection) else ""
             problems.append(f"{t}: {e}{sent_as}"[:RESEND_CHARS] if sent_as else f"{t}: {e}")
             if t == "charter_update":
-                # a Restrictions change citing a readable user message: a filled resend first, the reason after
-                filled = None if str(e).startswith("charter_update queued") else chartertemplate.template(db, a)
+                # a source refusal of a change citing a readable user message: a filled resend first, then why
+                filled = chartertemplate.template(db, a, str(e))
                 why = chartertemplate.reason(str(e)) if filled else ""
                 if filled:
                     problems[-1] = f"{t}: {chartertemplate.refusal(filled[0], filled[1], why)}"

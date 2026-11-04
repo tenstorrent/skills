@@ -18,9 +18,9 @@ alert() tells the chat the cited message came from (the relayer's chat) that the
 the reason in one line, and that the coordinator was handed the template. Once per item and refusal cause
 (kv ALERTS_KEY); landed() clears it with one low line to that chat once the item lands.
 
-user_covers() lets the user's own word cover a relay.HELD class (coordinator._held_lift): a change whose
-`source` is a user message's verbatim words, and whose every held word is in those words, is not the
-owner's agent's order.
+Only a source refusal is templated (SOURCE_REFUSAL: no `source`, or one the gate could not check): a filled
+`source` fixes nothing else, so any other refusal (an ambiguous `replaces`, a missing approval, a contradiction,
+a held class, a queued change) keeps its full error.
 """
 from __future__ import annotations
 
@@ -37,6 +37,8 @@ QUOTE_MAX = 400   # a longer message is quoted by its sentence that best matches
 _DATED = re.compile(r"\s*\(added [^)]*\)$", re.I)
 _NUM = re.compile(r"#(\d+)")
 _SENTENCE = re.compile(r"(?<=[.;!?])\s+|\n+")
+SOURCE_REFUSAL = re.compile(r"^charter_update rejected: (?:a Restrictions item needs `source`|`source`|`text` cites|"
+                            r"(?:quote|message|origin) check failed)")
 _CAUSE_NOISE = re.compile(r"\d+|\"[^\"]*\"|'[^'\s][^']*'|`[^`]*`")
 
 
@@ -93,10 +95,11 @@ def _quote(own: str, sent: str, text: str) -> str:
     return max(parts, key=lambda s: len(want & set(relay._words(s))), default=own.strip())
 
 
-def template(db, a: dict) -> tuple[dict, int, str | None] | None:
-    """(the filled charter_update, the cited message id, its chat) for a refused Restrictions change that
-    names a readable user message (module doc), else None."""
-    if not restrictions(a.get("section") or ""):
+def template(db, a: dict, err: str) -> tuple[dict, int, str | None] | None:
+    """(the filled charter_update, the cited message id, its chat) for a Restrictions change refused for its
+    source (`err`, SOURCE_REFUSAL) that names a readable user message (module doc), else None."""
+    if not (restrictions(a.get("section") or "") and SOURCE_REFUSAL.match(str(err or ""))) or (
+            restriction_source.TURN_SOURCE[:60] in str(err)):   # this turn's words: no older message fills it
         return None
     mid = cited_msg(a)
     got = _own(db, mid) if mid is not None else None
@@ -174,28 +177,3 @@ def landed(db, a: dict) -> int | None:
                               f"the charter: \"{rec['item']}\".", chat=rec["chat"], kind="resolved",
                        severity="low", ref=f"charter-refused:{key}")
 
-
-def user_covers(db, src, *texts: str) -> bool:
-    """Whether `src` is a user message's verbatim words (an exact quote of them, at least relay.CONTENT
-    uncommon words) holding every relay.HELD word found in `texts`: the change rests on the user's own word,
-    not their agent's. A quote of a ban covers no lift: when a text may lift something
-    (coordinator._may_lift), so must the quote. Fails closed: no held word, a relayer origin, or one held
-    word the quote does not hold."""
-    from .coordinator import _may_lift
-    try:
-        got = restriction_source._parse(src)
-        mid = int(str(got.get("msg") or "").lstrip("#"))
-    except (ValueError, TypeError):
-        return False
-    quote = str(got.get("quote") or "")
-    own = _own(db, mid) if not got.get("origin") else None
-    loose = restriction_source._loose
-    if own is None or loose(quote) not in loose(own[0]) or sum(
-            w not in relay._COMMON for w in relay._words(quote)) < relay.CONTENT:
-        return False
-    if any(_may_lift(t or "") for t in texts) and not _may_lift(quote):
-        return False
-    said = loose(quote)
-    held = [m.group(0) for t in texts for rx in relay._HELD_RE.values()
-            for m in rx.finditer(relay._RECORD.sub(" ", t or ""))]
-    return bool(held) and all(any(v in said for v in (loose(w), loose(w).rstrip("s'"))) for w in held)
