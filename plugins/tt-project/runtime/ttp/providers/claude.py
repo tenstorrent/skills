@@ -500,7 +500,7 @@ class Claude(Provider):
 
     def account(self) -> str:
         try:
-            data = json.loads(Path(os.path.expanduser("~/.claude.json")).read_text())
+            data = json.loads(claude_config_path().read_text())
         except (OSError, ValueError):
             return ""
         acct = data.get("oauthAccount") or {}
@@ -511,7 +511,7 @@ class Claude(Provider):
 
     def account_kind(self) -> str:
         try:
-            data = json.loads(Path(os.path.expanduser("~/.claude.json")).read_text())
+            data = json.loads(claude_config_path().read_text())
         except (OSError, ValueError):
             return ""
         return str((data.get("oauthAccount") or {}).get("billingType") or data.get("billingType") or "")

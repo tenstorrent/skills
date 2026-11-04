@@ -299,6 +299,30 @@ def test_plan_readings_of_another_plan_account_stop_counting_at_once(env):
 
 
 
+def _login(env, who, billing, org=""):
+    """The machine's Claude login, in the config folder the tests point CLAUDE_CONFIG_DIR at: never
+    the login of the host running the tests."""
+    folder = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"])
+    folder.mkdir(parents=True, exist_ok=True)
+    acct = {"emailAddress": who, "billingType": billing, **({"organizationName": org} if org else {})}
+    (folder / ".claude.json").write_text(json.dumps({"oauthAccount": acct}))
+
+
+def test_the_claude_login_is_read_from_the_config_folder_claude_code_uses(env, monkeypatch, tmp_path):
+    """CLAUDE_CONFIG_DIR's .claude.json, else the home folder's: a host's own login never stands in
+    for the one the runs use."""
+    from ttp.providers.claude import Claude
+    monkeypatch.setenv("HOME", str(tmp_path / "h"))
+    (tmp_path / "h").mkdir()
+    (tmp_path / "h" / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "home",
+                                                                              "billingType": "plan"}}))
+    assert Claude().account() == "" and Claude().account_kind() == ""
+    _login(env, "acct-a", "usage-billed", org="org")
+    assert Claude().account() == "acct-a | org | usage-billed" and Claude().account_kind() == "usage-billed"
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+    assert Claude().account() == "home | plan" and Claude().account_kind() == "plan"
+
+
 def test_a_switch_to_a_usage_billed_account_drops_plan_windows_before_its_first_run(env):
     """plan -> usage-billed: the daemon's look at the login is enough; the gate applies the dollar
     caps to spend after the old plan's last reading, and the budget line shows no plan window."""
@@ -307,6 +331,7 @@ def test_a_switch_to_a_usage_billed_account_drops_plan_windows_before_its_first_
     from ttp.web import budget_line
     now = time.time()
     _old_plan(p, now)
+    _login(env, "acct-a", "usage-billed", org="org")
     bud.note_account(p.db, "claude", "acct-a | org | usage-billed")
     assert bud.current_accounts(p.db) == {"claude": "acct-a | org | usage-billed"}
     assert bud.plan_windows(p.db, now) == []
@@ -314,7 +339,7 @@ def test_a_switch_to_a_usage_billed_account_drops_plan_windows_before_its_first_
     g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
     assert g.regime == "caps" and g.numbers["spent_24h"] == 70.0 and g.level == "yellow", (g.numbers, g.reasons)
     line = budget_line(p.db, now, "claude", g.as_dict())
-    assert line == "24h $70.00 this project, $0.00 of $200 global", "the old plan's spend was never billed: " + line
+    assert line == "24h $70.00 this project, $70.00 of $200 global", "the old plan's spend was never billed: " + line
     # a run that started earlier under the plan account does not bring its windows back
     _run(p, "acct-a | plan", now - 7300)
     assert bud.plan_windows(p.db, now) == []
@@ -328,6 +353,7 @@ def test_account_switch_mid_window_counts_only_billed_spend(env):
     from ttp import budget as bud
     from ttp.web import budget_line
     now = time.time()
+    _login(env, "acct-b", "billed")
     _plan_then_billed(p, now)
     assert round(p.db.spent_since(now - 86400), 2) == 255.0
     assert round(p.db.spent_since(now - 86400, billed=True), 2) == 15.0
@@ -335,8 +361,12 @@ def test_account_switch_mid_window_counts_only_billed_spend(env):
     g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
     assert g.regime == "caps" and g.numbers["spent_24h"] == 15.0 and g.numbers["spent_7d"] == 15.0, g.numbers
     assert g.level == "green" and g.allow_new_work, (g.level, g.reasons)
-    assert budget_line(p.db, now, "claude", g.as_dict()) == "24h $15.00 this project, $0.00 of $200 global"
+    assert budget_line(p.db, now, "claude", g.as_dict()) == "24h $15.00 this project, $15.00 of $200 global"
     assert budget_line(p.db, now, "claude") == "24h $15.00 actual"
+    _login(env, "acct-c", "billed")   # the global total is the machine's own login's: another one spent nothing
+    other = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
+    assert budget_line(p.db, now, "claude", other.as_dict()) == "24h $15.00 this project, $0.00 of $200 global"
+    _login(env, "acct-b", "billed")
     # B's run still going counts; a run that started under A before the switch does not
     _run(p, "acct-b | billed", now - 300, None, 2.5)
     _run(p, "acct-a | plan", now - 7 * 3600 - 300, None, 7.0)
