@@ -164,6 +164,19 @@ def test_a_stopped_remote_check_stops_its_command_on_the_host(tmp_path):
     assert not marker.exists() and _rc_left(tmp_path) == []
 
 
+def test_a_remote_checks_command_starts_with_ctrl_c_and_quit_at_their_default(tmp_path):
+    """A non-interactive shell starts a background job with SIGINT and SIGQUIT ignored, and a shell
+    cannot undo a signal ignored at its start: the host's launch resets both, so a command (a test
+    sending Ctrl-C) behaves on a check host as it does here."""
+    repo = _rc_repo(tmp_path)
+    seen = tmp_path / "seen"
+    probe = ("import signal; print(*(signal.getsignal(s) is signal.SIG_IGN "
+             "for s in (signal.SIGINT, signal.SIGQUIT)))")
+    rc, said = _rc_run(tmp_path, repo, f"{shlex.quote(sys.executable)} -c {shlex.quote(probe)} > {seen}")
+    assert rc == 0, said
+    assert seen.read_text().split() == ["False", "False"], "INT and QUIT not ignored on the host"
+
+
 def test_ttp_checks_on_a_check_host_names_it_and_waits_when_it_cannot_reach_it(env, tmp_path, monkeypatch):
     """delivery.checks_host: `ttp checks` runs there, and checks.json and checks.log say so. A host ssh
     cannot reach (found by the probe, or mid-run) exits 75 with env_fault env:check-host:<host>, records

@@ -116,7 +116,7 @@ def exports(env: dict) -> str:
 
 def _run_script(q: str, exports_: str, cmd: str, mark: str) -> str:
     """The host's side of a check run in directory `q`: the command in a process group of its own
-    (setsid, else perl's setpgrp), with stdin from /dev/null, and a watcher that stops that group (TERM,
+    (setsid, else perl's setpgrp), with stdin from /dev/null and Ctrl-C and quit at their default, and a watcher that stops that group (TERM,
     then KILL after STOP_GRACE_S) once ssh's stdin ends: without a tty, ssh signals nothing when the
     local side stops or dies, and the command would run on. Then the exit-code marker, and the
     directory is removed."""
@@ -125,6 +125,12 @@ def _run_script(q: str, exports_: str, cmd: str, mark: str) -> str:
             f"if command -v bash >/dev/null 2>&1; then set -- {run}; else set -- sh -e -c {shlex.quote(cmd)}; fi\n"
             # A background job's stdin is /dev/null unless redirected: the watcher reads ssh's from fd 3.
             "exec 3<&0\n"
+            # It also starts with SIGINT and SIGQUIT ignored, which no shell can undo: reset both first.
+            "if command -v perl >/dev/null 2>&1; then "
+            "set -- perl -e '$SIG{INT}=$SIG{QUIT}=\"DEFAULT\"; exec {$ARGV[0]} @ARGV or exit 127' \"$@\"\n"
+            "elif command -v python3 >/dev/null 2>&1; then set -- python3 -c 'import os, signal, sys\n"
+            "for s in (signal.SIGINT, signal.SIGQUIT): signal.signal(s, signal.SIG_DFL)\n"
+            "os.execvp(sys.argv[1], sys.argv[1:])' \"$@\"\nfi\n"
             "if command -v setsid >/dev/null 2>&1; then setsid \"$@\" </dev/null 3<&- &\n"
             "elif command -v perl >/dev/null 2>&1; then perl -e 'setpgrp(0,0); exec @ARGV or exit 127' \"$@\" </dev/null 3<&- &\n"
             "else \"$@\" </dev/null 3<&- &\nfi\n"
