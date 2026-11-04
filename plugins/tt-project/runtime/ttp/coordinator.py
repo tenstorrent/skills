@@ -38,6 +38,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     chaincap,
     channeltag,
     charterpromise,
+    chartertemplate,
     configwho,
     convgate,
     chainprio,
@@ -3024,6 +3025,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         _restriction_edit(p, section, quote, str(a.get("replaces") or "")))
                     held = _held_lift(section, text, quote, replaced, gone) if (
                         by_agent and restr) else ("", "", "")
+                    if held[0] and chartertemplate.user_covers(db, a.get("source"), text, quote, gone,
+                                                                replaced):
+                        held = ("", "", "")   # `source` is the user's own verbatim words, every held word in them
                     if held[0]:
                         raise ValueError(relay.held_refusal("charter_update", *held) + "; a new ban the agent "
                                          "orders may still be added as its own item")
@@ -3088,6 +3092,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         elif quote:
                             _tell_running_workers(db, f"Binding restriction retired: {quote}", key)
                 p.commit_harness([p.charter_path, p.harness / CHARTER_HISTORY], msg)
+                chartertemplate.landed(db, a)   # a refusal alert told to the relayer's chat clears
             elif t == "schedule_set":
                 sched.before_change(p)
                 old = db.one("SELECT * FROM schedules WHERE name=?", (a.get("name"),))
@@ -3301,7 +3306,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if isinstance(e, DraftGateRejection) else ""
             problems.append(f"{t}: {e}{sent_as}"[:RESEND_CHARS] if sent_as else f"{t}: {e}")
             if t == "charter_update":
-                _charter_retry_now(p, a, str(e), key, announced)
+                # a Restrictions change citing a readable user message: a filled resend first, the reason after
+                filled = None if str(e).startswith("charter_update queued") else chartertemplate.template(db, a)
+                why = chartertemplate.reason(str(e)) if filled else ""
+                if filled:
+                    problems[-1] = f"{t}: {chartertemplate.refusal(filled[0], filled[1], why)}"
+                    chartertemplate.alert(db, a, filled[1], filled[2], why)
+                _charter_retry_now(p, a, str(e), key, announced, filled=(filled[0], why) if filled else None)
             if t == "config_set" and a.get("key"):
                 cfg_refused[str(a["key"])] = str(e)
     for k, before, upd in new_ask_holds:
@@ -6629,15 +6640,17 @@ _CHARTER_FIXABLE_RE = re.compile(r"\bresend\b|send that text|`both_hold`|quote t
 
 
 def _charter_retry_now(p: Project, a: dict, err: str, key: str | None,
-                       announced: list[tuple[str, str]] | None = None) -> str:
+                       announced: list[tuple[str, str]] | None = None,
+                       filled: tuple[dict, str] | None = None) -> str:
     """Queue a charter_retry event for a refused charter_update whose error names a fix the
     coordinator can apply (_CHARTER_FIXABLE_RE), so the next turn makes it at once instead of the
     change waiting for a digest or a day (reraise_charter_changes). At most CHARTER_RETRY_NOW_MAX
     per change (section, quote, replaces, text), once per turn: it cannot loop. A refusal that needs
     the user's word or concerns relayed text is left to the digest. `announced`: the batch's replies
     that told the chat the change was being made (charterpromise.announcing), named in the event.
-    Returns the event text, or ""."""
-    if not _CHARTER_FIXABLE_RE.search(err) or "Relayer context" in err:
+    `filled`: (the filled resend, the one-line reason) of a change citing a user message (chartertemplate):
+    always raised, the template first. Returns the event text, or ""."""
+    if not filled and (not _CHARTER_FIXABLE_RE.search(err) or "Relayer context" in err):
         return ""
     cid = hashlib.sha256("\n".join(_ws(str(a.get(k) or "")) for k in ("section", "quote", "replaces", "text"))
                          .encode()).hexdigest()[:16]
@@ -6654,10 +6667,14 @@ def _charter_retry_now(p: Project, a: dict, err: str, key: str | None,
                 + (f", `quote` {clip(_ws(str(a['quote'])), 300)!r}" if a.get("quote") else "")
                 + (f", `replaces` {_ws(str(a['replaces']))!r}" if a.get("replaces") else "")
                 + (f", `text` {clip(_ws(str(a['text'])), 400)!r}" if a.get("text") else ""))
-        msg = (f"A charter_update was refused ({sent}): "
+        msg = ((f"Resend this charter_update now, in this turn (immediate retry {mine['n']} of "
+                f"{CHARTER_RETRY_NOW_MAX}; the gate checks its `source` quote again): "
+                f"{json.dumps(filled[0], ensure_ascii=False)}\nIt was refused ({sent}): {filled[1]}. If the user "
+                "has since said otherwise, leave it.") if filled else
+               f"A charter_update was refused ({sent}): "
                f"{clip(err, RESEND_CHARS if RESEND_MARK in err else 1200)}. Apply the fix that error names "
                f"now, in this turn (immediate retry {mine['n']} of {CHARTER_RETRY_NOW_MAX}); if the user has since "
-               "said otherwise, leave it." + charterpromise.quote_lines(announced or []))
+               "said otherwise, leave it.") + charterpromise.quote_lines(announced or [])
         db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
              (time.time(), "harness", "charter_retry", "normal", msg, "queued"))
     return msg
