@@ -514,6 +514,8 @@ EXTRA_KEYS = {
     # push_checks_by_repo: a check list per repo ("harness", a repo path or folder name), push.repo_checks.
     # own_push_remote: where `ttp push --own` publishes task branches (a remote's name, a URL, or a map
     # keyed by repo path or folder name); unset: the push branch's remote, else origin (push.own_push_remote).
+    # own_push_reserved_lane: `ttp push --own` checks take the remote's own-branch push lane (push.own_lane_key;
+    # default on, false: an ordinary turn behind task checks).
     # deploy_restart_wait_s: how long `ttp deployed --after-push` lets a daemon restart onto new files (deploy.py).
     # plugin_version_guard: refuse a change that edits plugins/<name>/ but keeps the tip's manifest version (off).
     # push_solo_paths: pathspecs a batch takes at most one routine change touching (pushq.SOLO_PATHS, off); push_cap_tests:
@@ -529,7 +531,7 @@ EXTRA_KEYS = {
                  "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "push_landing_alert_h", "after_push",
                  "push_solo_paths", "push_cap_tests", "push_rerun_s",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
-                 "allow_protected_push_branch", "own_push", "own_push_remote", "deploy_restart_wait_s", "plugin_version_guard",
+                 "allow_protected_push_branch", "own_push", "own_push_remote", "own_push_reserved_lane", "deploy_restart_wait_s", "plugin_version_guard",
                  "checks_fast_globs", "checks_fast_exclude",   # these two: `ttp checks` fast path (push.FAST_GLOBS),
                  "checks_host",   # where checks run (remotecheck)
                  "checks_spill_hosts", "checks_spill_after_s",   # where busy checks may spill to (checkspill)
@@ -628,11 +630,12 @@ def _known_keys(path: list[str]) -> set[str] | None:
         # test_project_slots: the project's test-worker budget (testslots.project_max); test_project_workers:
         # its ceiling on test workers over all its suites (testslots.project_workers); test_run_max: one
         # suite's most workers, only lowering the account's (testslots.sizes);
-        # stall_s: a running check's log silence that makes it stalled (checkstall.stall_s).
+        # stall_s: a running check's log silence that makes it stalled (checkstall.stall_s);
+        # push_load_wait_s: push checks' longest wait under the load guard (testslots.push_load_wait_s).
         return {"nice", "ionice", "wall_cap_s", "wrap_cmd", "wrap_lane", "fallback_lane", "no_device_cmds", "slots", "light_cmds", "max_wait_s", "wait_event_s",
                 "wait_escalate_s", "wait_hang_factor", "priority_age_s", "test_project_max", "test_project_slots",
                 "test_project_workers", "test_run_max",
-                "done_holder_flag_s", "done_holder_grace_s", "stall_s"}
+                "done_holder_flag_s", "done_holder_grace_s", "stall_s", "push_load_wait_s"}
     if len(path) == 1 and isinstance(DEFAULT_CONFIG.get(path[0]), dict):
         return set(DEFAULT_CONFIG[path[0]]) | EXTRA_KEYS.get(path[0], set())
     return None
@@ -2589,7 +2592,8 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_sp
                 "checks": {"host_max", "load_extra", "live_cores", "nice", "ionice", "priority_turns", "test_pool", "test_run_max",
                            "test_project_max", "test_project_slots", "test_project_workers", "load_guard", "build_pool", "build_run_max", "build_project_max", "wall_cap_s",
                            "slots", "light_cmds", "max_wait_s", "wait_event_s", "priority_age_s",
-                           "wait_escalate_s", "wait_hang_factor", "done_holder_flag_s", "done_holder_grace_s", "stall_s", "starve_s"}}
+                           "wait_escalate_s", "wait_hang_factor", "done_holder_flag_s", "done_holder_grace_s", "stall_s", "starve_s",
+                           "push_load_wait_s"}}
 
 
 def layered(raw: dict) -> dict:

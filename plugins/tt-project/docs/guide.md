@@ -1281,7 +1281,9 @@ queues behind routine work; nothing running is interrupted:
   one per 8 cores, at least 2, plus the cores the larger of the 1- and 5-minute load leaves under 0.75 x the cores, at most
   half the cores; `checks.load_extra` 0 keeps the base; a shrink bounds new grants only), the most test workers one project's suites run at once, which also bounds one run's
   grant. No new suite starts while the host's 1-minute load is above its cores (`checks.load_guard`, a factor of the
-  cores, default 1; 0 turns it off): it waits and its lane's wait note says why; running suites go on. Heavy suites
+  cores, default 1; 0 turns it off): it waits and its lane's wait note says why; running suites go on. Push
+  checks wait there at most `checks.push_load_wait_s` seconds (default 300; `off`: no bound), then start on
+  their branch's reserved lane alone, one per lane at a time. Heavy suites
   belong on another host where a project has one allowed (`delivery.checks_host`).
   Waiters are served first-come: one whose project is at its budget lets other projects go first but keeps its
   place in its project's line, where the most urgent task priority goes first, then arrival, so that waiter gets
@@ -1422,7 +1424,10 @@ queues behind routine work; nothing running is interrupted:
   checks use only their branch's reserved test slot. There is no
   separate outage marker: priority 1 is the signal. Accepted gap: while a host mixes runtimes from
   before this, their waiters may disagree on who is next and a slot can sit idle until another frees.
-  `ttp push --own` publishes a task's branch and queues like task checks.
+  `ttp push --own` publishes a task's branch; by default its checks take its remote's own-branch
+  push lane (one priority slot and reserved test lane shared by every own-branch push, one at a time),
+  so they never wait behind long task checks; `delivery.own_push_reserved_lane` false queues them like
+  task checks.
   Waiters take turns by project, and within a project by task priority, then arrival; a task that
   is a required owner of an open obligation goes first in its project (its queue entry in `ttp status`
   says so) until the obligation has its receipt or is dropped. Turns between projects do not change.

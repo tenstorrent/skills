@@ -831,7 +831,7 @@ def check_slot(head: str, say: Callable[[str], None], who: str = "", priority: s
     toward the same cap as `ttp checks`. Checks gating a push to the push branch (`ttp push` and the
     push queue) pass `priority` (priority_key): they hold the push lock, so they take that branch's
     priority slot beyond the cap instead of queueing behind task checks; `ttp land` passes its local
-    branch's. Nested in a check that holds
+    branch's, `ttp push --own` its remote's own-branch lane (own_lane_key). Nested in a check that holds
     one already (checkcap.HELD_ENV), it does not wait. Slots it cannot write raise checkcap.Unavailable.
     The slot's wait is logged in the state of `proj` (default: TTP_PROJECT's project)."""
     if proj is None and (base := os.environ.get("TTP_PROJECT")):
@@ -864,6 +864,22 @@ def priority_key(repo: Path, remote: str, branch: str) -> str:
     url = _git(repo, "remote", "get-url", remote).stdout.strip() if remote else ""
     url = re.sub(r"(\.git)?/*$", "", url) if url else str(Path(repo).resolve() / remote)
     return f"{url}#{branch}"
+
+
+# The key of the reserved lane every `ttp push --own` of one remote shares (own_lane_key): no git branch
+# name holds a space, so it never names a real branch's lane.
+OWN_LANE = "own-branch pushes"
+
+
+def own_lane_key(repo: Path, remote: str, cfg: dict | None) -> str:
+    """The push lane `ttp push --own` takes its checks slot through (check_slot's `priority`): one
+    priority slot and reserved test lane per remote shared by every own-branch push, so own pushes
+    never wait behind task checks in the host cap or their project's test budget, and run one at a
+    time. "" (an ordinary turn, as before) with delivery.own_push_reserved_lane off (false, 0, "off")."""
+    v = ((cfg or {}).get("delivery") or {}).get("own_push_reserved_lane")
+    if v is False or str(v).strip().lower() in ("0", "false", "off", "no"):
+        return ""
+    return priority_key(repo, remote, OWN_LANE)
 
 
 def check_env(mode: str, tip: str = "", run_dir: str | None = None, branch: str = "") -> dict[str, str]:
@@ -3523,7 +3539,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
         if todo and (why := runner_wait(todo, repo, check_env("own", tip, check_run_dir, branch), say)):
             return why
         try:
-            slot = check_slot(head, say) if todo else checkcap.Slot()
+            slot = check_slot(head, say, priority=own_lane_key(repo, remote, cfg)) if todo else checkcap.Slot()
         except checkcap.Unavailable as e:
             say(f"{e}; not pushing")
             return CHECKS_FAILED

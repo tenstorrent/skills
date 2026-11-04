@@ -6523,3 +6523,97 @@ def test_detached_checks_waiting_for_a_slot_keep_their_place_after_their_worker_
         held.close()
         if pid and not _gone_pid(pid):
             os.killpg(pid, signal.SIGKILL)
+
+
+def test_own_push_checks_take_the_own_branch_lane_at_once_while_a_long_run_holds_the_budget(env, monkeypatch, tmp_path):
+    """`ttp push --own` (push.publish) takes its checks slot through its remote's own-branch push lane
+    (push.own_lane_key) by default: with the host cap and its project's test budget held by a long
+    `ttp checks` run, it runs its checks at once. delivery.own_push_reserved_lane false restores the
+    ordinary turn: it waits until that run ends."""
+    import threading
+    from ttp import checkcap, push, testslots
+    p, repo, origin, other = _push_setup(env, monkeypatch, [])
+    (tmp_path / "run").mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path / "run"))
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    monkeypatch.setattr(testslots, "load_guard", lambda: "")
+    _budget_of_one(monkeypatch)
+    _git_out(repo, "checkout", "-q", "-b", "own")
+    key = push.own_lane_key(repo, "origin", p.config())
+    assert key.endswith("#" + push.OWN_LANE) and push.own_lane_key(repo, "origin", None) == key, "on by default"
+    long_slot = checkcap.acquire("long checks", project_name=p.name)
+    long_tests = testslots.acquire("long checks", project_name=p.name)
+    assert long_slot.f is not None and long_tests.k == 1
+    seen = tmp_path / "slots"
+    checks = push.check_list([f"echo $TTP_TEST_SLOTS >> {seen}"])
+    try:
+        for n, name in enumerate(("a.txt", "b.txt")):
+            _commit(repo, name, "x\n")
+            said, rc = [], []
+            t = threading.Thread(target=lambda: rc.append(push.publish(repo, "origin", "own", checks, say=said.append,
+                                                                       cfg=p.config())))
+            t0 = time.time()
+            t.start()
+            t.join(30)
+            assert rc == [0] and time.time() - t0 < 30, said
+            assert seen.read_text().split() == ["1"] * (n + 1), "its test slots came from the reserved lane"
+            assert any("push priority slot" in m for m in said), said
+        # Off: an ordinary turn behind the long run, as before.
+        p.set_config("delivery.own_push_reserved_lane", False)
+        assert push.own_lane_key(repo, "origin", p.config()) == ""
+        _commit(repo, "c.txt", "x\n")
+        said, rc = [], []
+        t = threading.Thread(target=lambda: rc.append(push.publish(repo, "origin", "own", checks, say=said.append,
+                                                                   cfg=p.config())))
+        t.start()
+        t.join(1.5)
+        assert t.is_alive() and not rc, "it waits for the long run's slots"
+        long_tests.close()
+        long_slot.close()
+        t.join(30)
+        assert rc == [0], said
+    finally:
+        long_tests.close()
+        long_slot.close()
+
+
+def test_a_push_lanes_load_guard_wait_ends_at_its_bound_on_the_reserved_lane_alone(env, monkeypatch):
+    """Push checks (testslots.acquire's push_key) wait under load_guard at most checks.push_load_wait_s
+    (default 300 s), then start on their branch's reserved lane alone, one per lane at a time. Task
+    checks, priority-1 ones included, keep waiting; "off" restores the unbounded wait."""
+    from ttp import locks, project, testslots
+    _slot_sizes(monkeypatch, 8, 2)
+    monkeypatch.delenv(testslots.PUSH_LOAD_WAIT_ENV, raising=False)
+    monkeypatch.setattr(testslots, "load_guard", lambda: "the host is overloaded")
+    assert testslots.push_load_wait_s({}) == testslots.PUSH_LOAD_WAIT_S == 300.0, "bounded by default"
+    assert testslots.acquire("push", project_name="pa", push_key="remote b", wait_s=0.3) is None, \
+        "under the default bound it still waits"
+    monkeypatch.setenv(testslots.PUSH_LOAD_WAIT_ENV, "0.3")
+    told = []
+    t0 = time.time()
+    push = testslots.acquire("push", told.append, project_name="pa", push_key="remote b", wait_s=20)
+    try:
+        assert push is not None and push.k == 2 and 0.3 <= time.time() - t0 < 10, told
+        assert locks.held_labels([testslots.reserved_path("remote b")]) == ["push"]
+        assert not locks._slot_labels(testslots.paths(8)), "no pool slot is taken"
+        assert any("reserved lane alone" in m and "push_load_wait_s" in m for m in told), told
+        assert testslots.acquire("push 2", project_name="pb", push_key="remote b", wait_s=0.8) is None, \
+            "one push check per lane at a time"
+        other = testslots.acquire("push 3", project_name="pb", push_key="remote c", wait_s=20)
+        assert other is not None, "another branch's lane is its own"
+        other.close()
+        for kw in ({}, {"priority": 1}, {"full": True}):
+            assert testslots.acquire("task", project_name="pc", wait_s=0.8, **kw) is None, kw
+    finally:
+        push and push.close()
+    for off in ("off", False):
+        assert testslots.push_load_wait_s({"checks": {"push_load_wait_s": off}}) is None
+    assert testslots.acquire("push", project_name="pa", push_key="remote b", wait_s=0.8,
+                             cfg={"checks": {"push_load_wait_s": "off"}}) is None, "off: the unbounded wait"
+    monkeypatch.delenv(testslots.PUSH_LOAD_WAIT_ENV)
+    for bad, want in (("x", 300.0), (-1, 300.0), ("inf", 300.0), (0, 0.0), ("45", 45.0)):
+        assert testslots.push_load_wait_s({"checks": {"push_load_wait_s": bad}}) == want, bad
+    project.set_account_setting("checks.push_load_wait_s", 60)
+    assert testslots.push_load_wait_s({}) == 60.0, "the account's setting"
+    assert testslots.push_load_wait_s({"checks": {"push_load_wait_s": 30}}) == 30.0, "the project's wins"

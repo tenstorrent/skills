@@ -119,6 +119,8 @@ PROJECT_WORKERS_MAX = 8       # checks.test_project_workers base: at most this m
 CORES_PER_PROJECT_WORKER = 8  # ... and one per this many cores, at least WORKERS_FLOOR (project_workers)
 SPARE_LOAD = 0.75    # unset, a project's test-worker ceiling grows by the cores its load leaves under this x the cores
 LOAD_GUARD = 1.0     # default checks.load_guard: no suite starts while the 1-minute load is above this x the cores
+PUSH_LOAD_WAIT_S, PUSH_LOAD_WAIT_KEY, PUSH_LOAD_WAIT_ENV = 300.0, "push_load_wait_s", "TTP_CHECKS_PUSH_LOAD_WAIT_S"
+# (push_load_wait_s) the longest push checks wait under load_guard before their branch's reserved lane
 IONICE = ["-c3"]    # idle class: a live service's IO always goes first
 
 
@@ -268,6 +270,27 @@ def load_guard() -> str:
     return (f"the host is overloaded: its 1-minute load {ld:.1f} is above "
             + (f"its {c} cores" if factor == 1.0 else f"{factor:g} x its {c} cores")
             + " (checks.load_guard); no new suite starts until it drops, running ones go on")
+
+
+def push_load_wait_s(cfg: dict | None = None) -> float | None:
+    """The longest push checks (acquire's `push_key`) wait under load_guard: checks.push_load_wait_s (the
+    project's, then TTP_CHECKS_PUSH_LOAD_WAIT_S, then the account's), default PUSH_LOAD_WAIT_S. Past it they
+    start on their branch's reserved lane alone, one push check per lane at a time. None ("off" or false):
+    they wait while the load stays high, as other runs do. A value that is no number of at least 0 falls
+    back to the next source."""
+    for v in (_section(cfg, "checks").get(PUSH_LOAD_WAIT_KEY), os.environ.get(PUSH_LOAD_WAIT_ENV),
+              (project.load_account_settings().get("checks") or {}).get(PUSH_LOAD_WAIT_KEY)):
+        if v is False or str(v).strip().lower() in ("off", "false"):
+            return None
+        if v in (None, "") or isinstance(v, bool):
+            continue
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            continue
+        if n >= 0 and n != float("inf"):
+            return n
+    return PUSH_LOAD_WAIT_S
 
 
 def project_max(cfg: dict | None = None, s: tuple[int, int] | None = None, kind: Kind = TESTS) -> int:
@@ -450,7 +473,8 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
     run): it starts only once run_min() slots are free (above). A run that is no nested one
     takes no test slots while the host is overloaded (load_guard), push and priority-1 runs included:
     it waits, telling why and passing the reason to `waits` (its lanes' wait note, lane_waits), and
-    `waits` gets "host test slots" again once the load drops."""
+    `waits` gets "host test slots" again once the load drops. A push check's wait there is bounded
+    (push_load_wait_s): past it, it starts on its branch's reserved lane alone."""
     tell = tell or (lambda _line: None)
     what = f"{kind.name} slots"
     for env in (kind.held_env, HELD_ENV):   # HELD_ENV: a build in a check builds on the check's slots
@@ -465,6 +489,19 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
         while True:
             project.ps_cycle()
             if kind is TESTS and (load := load_guard()):
+                if push_key and (bound := push_load_wait_s(cfg)) is not None and time.time() - start >= bound \
+                        and (f := locks.try_take([reserved_path(push_key)], holder, "push test slots",
+                                                 extra={"priority": priority} if priority is not None else None)):
+                    # Past the bound a push check starts anyway, on its branch's reserved lane alone (one
+                    # run's grant, one push check per lane at a time), taking none of the pool's slots.
+                    s = sizes(cfg, kind=kind)
+                    k = s[1] if s else 0
+                    tell(f"{what}: started after {time.time() - start:.0f} s under the load guard "
+                         f"(checks.{PUSH_LOAD_WAIT_KEY} {bound:g} s) on its push branch's reserved lane alone"
+                         + (f": {k} granted, tests run with {XDIST_ENV}={k}" if k else "") + f"; {load}")
+                    if guarded and waits:
+                        waits("host test slots")
+                    return Grant(k, [f], time.time() - start, kind)
                 if not guarded and waits:
                     waits(f"host load: {load}")
                 if not guarded or time.time() - told >= TELL_S:

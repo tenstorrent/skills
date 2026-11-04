@@ -28618,9 +28618,19 @@ def test_checks_host_cap_gates_push_checks_and_nested_runs_do_not_wait_again(env
     finally:
         holder.kill()
         holder.wait()
-    # `ttp push --own` publishes a task's branch: it queues like task checks.
+    # `ttp push --own` publishes a task's branch on its remote's own-branch lane: at once over the cap.
     _git_out(repo, "checkout", "-q", "-b", "ttp/t30-exp")
     monkeypatch.setenv("TTP_TASK", "30")
+    _commit(repo, "own.txt", "x\n")
+    holder = _cap_holder("other")
+    try:
+        assert _ttp("push", "--own") == 0
+        assert log.read_text().splitlines() == ["1", "1"], "it holds the own-branch lane's slot"
+    finally:
+        holder.kill()
+        holder.wait()
+    # delivery.own_push_reserved_lane off: it queues like task checks.
+    p.set_config("delivery.own_push_reserved_lane", False)
     _commit(repo, "2.txt", "x\n")
     holder = _cap_holder("other")
     done = []
@@ -28629,7 +28639,7 @@ def test_checks_host_cap_gates_push_checks_and_nested_runs_do_not_wait_again(env
     try:
         assert _wait_for(lambda: any("ttp push" in q for q in checkcap.state()["queued"]))
         time.sleep(0.3)
-        assert len(log.read_text().splitlines()) == 1, "no push --own check runs over the cap"
+        assert len(log.read_text().splitlines()) == 2, "no push --own check runs over the cap"
     finally:
         holder.kill()
         holder.wait()
