@@ -59,20 +59,29 @@ def tool_terms(old: str, new: str, charter: str = "",
     fewer than two, or all of them (a removal or retirement), the words are all of the changed
     sentences' but only the distinctive ones (distinctive_words over the scanned tool `lines`), and
     `exact` holds the changed sentences' quoted phrases and user-message cites (exact_terms), which
-    hit on their own; else `exact` is empty."""
+    hit on their own; else `exact` is empty. A new text whose rule words are all citation words
+    (CITE_STEMS: "(User's word, 2026-10-05.)") keeps no rule: a removal."""
     from .coordinator import _changed_sentences, _rule_words
     changed = " ".join(_changed_sentences(old, new)) or old
     ids = tool_term_ids(changed)
     ids = {t for t in ids if t not in new and t not in charter and not re.fullmatch(r"[\d./-]+", t)}
-    every = _rule_words(changed)
-    words = every - _rule_words(new)
-    if 2 <= len(words) < len(every):
+    every, kept = _rule_words(changed), _rule_words(new)
+    words = every - kept
+    if 2 <= len(words) < len(every) and not kept <= CITE_STEMS:
         return ids, words, set()
     return ids, distinctive_words(every, lines), exact_terms(changed, new + "\n" + charter)
 
 
-COMMON_SHARE = 0.05   # a stem on more than this share of the scanned tool lines is too common to match
-COMMON_MIN = 3        # ... and on more than this many lines (a small tool tree cuts nothing)
+# A stem on more than this share of the scanned tool lines is too common to match. An absolute share,
+# not the N rarest stems: a rank keeps N stems of an item whose words are all common. Measured on a tool
+# tree of about 20,000 lines, whose commonest stems were each under 3.5%: a 5% cut dropped nothing,
+# 1% still flagged 33 files, 0.5% flagged 7 including every real citer, 0.2% lost the real citers.
+COMMON_SHARE = 0.005
+COMMON_MIN = 20       # ... and on more than this many lines: on a small tool tree 0.5% is a line or two,
+                      # and the harness's own scripts alone name 'reset' or 'host' on ten
+# Stems (_rule_words) of a citation rather than a rule: "(user msg #12)", "the user's word, October 5".
+CITE_STEMS = frozenset({"user", "word", "msg", "messag", "january", "february", "march", "april", "jun", "july",
+                        "august", "september", "october", "november", "december"})
 
 
 def distinctive_words(words: set[str], lines: list[str] | tuple) -> set[str]:
@@ -119,9 +128,11 @@ def enabled_schedules(text: str) -> str:
         i = end
 
 
-def tool_hit(line: str, ids: set[str], words: set[str], exact: set[str] = frozenset()) -> list[str]:
+def tool_hit(line: str, ids: set[str], words: set[str], exact: set[str] = frozenset(),
+             rare: set[str] | None = None) -> list[str]:
     """What a line names of the old item: an identifier, a quoted phrase or user-message cite of
-    `exact` (exact_terms), or else two or more of its rule words (as word starts); [] when none."""
+    `exact` (exact_terms), or else two or more of its rule words (as word starts), one of them in
+    `rare` (distinctive_words) when given; [] when none."""
     from .restriction_source import CITE_RE
     got = sorted(t for t in ids if t in line)
     low = line.lower()
@@ -132,7 +143,7 @@ def tool_hit(line: str, ids: set[str], words: set[str], exact: set[str] = frozen
     if got:
         return got
     got = sorted(w for w in words if re.search(rf"\b{re.escape(w)}", low))
-    return got if len(got) >= 2 else []
+    return got if len(got) >= 2 and (rare is None or rare & set(got)) else []
 
 
 def still_stated(charter: str, old: str) -> str:
@@ -192,7 +203,8 @@ def restriction_tools(p: Project, loosened: list[tuple], batch: list[int]) -> li
     the old wording: files under bin/ and hooks/ (project root and harness), harness/schedules.json,
     and the command and heal check of each enabled schedule, whose lines name an identifier of the old item
     or two of its dropped rule words (tool_terms; an identifier the current charter still states anywhere
-    is not one; a removed or retired item matches only its distinctive words, quoted phrases and cites),
+    is not one; a removed or retired item matches only its distinctive words, quoted phrases and cites;
+    two words hit only with one distinctive word among them),
     each named with the terms it matched. A disabled schedule, in the table or its schedules.json entry, is left out. `loosened`: (old item, new text, over[,
     advisory]), `over` empty for the user's word, else the end that retired the item; `advisory`: the dropped
     items were all unsourced (restriction_source.drops_unsourced), so whoever dropped them and with any `over`,
@@ -239,10 +251,13 @@ def restriction_tools(p: Project, loosened: list[tuple], batch: list[int]) -> li
     for old, new, over, *advisory in loosened:
         if (over == "unsourced" or any(advisory)) and still_stated(charter, old):
             continue   # a dropped advisory copy of a rule the Brief or a sourced item still binds: tools stay right
-        ids, words, exact = tool_terms(old, new, charter, [x for _, t in files for x in t.splitlines()])
+        lines = [x for _, t in files for x in t.splitlines()]
+        ids, words, exact = tool_terms(old, new, charter, lines)
+        rare = distinctive_words(words, lines)
         hits = []
         for label, text in files:
-            line, got = next(((n, g) for n, x in enumerate(text.splitlines(), 1) if (g := tool_hit(x, ids, words, exact))),
+            line, got = next(((n, g) for n, x in enumerate(text.splitlines(), 1)
+                              if (g := tool_hit(x, ids, words, exact, rare))),
                              (0, []))
             if not line or label in named or (not label.startswith("schedule ") and Path(label).name in named):
                 continue

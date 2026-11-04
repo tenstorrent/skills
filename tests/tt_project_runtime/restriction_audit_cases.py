@@ -212,3 +212,69 @@ def test_a_quoted_phrase_and_a_short_item_still_hit(env):
     p.charter_path.write_text("# demo\n\n## Restrictions\n- Never merge. (user msg #1)\n")
     out = restriction_audit.restriction_tools(p, [(short, "", "the farm is gone")], [])
     assert len(out) == 1 and "bin/farm.sh:2 (farm, reboot)" in out[0], out
+
+
+# A large tool tree where every stem of the item is under 5% of the lines, but some are on many of them.
+_ITEM = ("Never let a worker build or queue a nightly job while the fleet is offline; drain it first and "
+         "keep the 'cold spare' idle (user msg #77).")
+
+
+def _big_tree(p):
+    """bin/: 1000 filler lines, 30 lines each naming 'worker', 'build' and 'queue' (3%), one tool citing
+    the item, one draining the fleet and one keeping the quoted phrase."""
+    (p.root / "bin").mkdir(exist_ok=True)
+    (p.root / "bin" / "filler.sh").write_text("".join(f"echo step {i} ok\n" for i in range(1000)))
+    for i in range(30):
+        (p.root / "bin" / f"common{i}.sh").write_text("# the worker may build the queue now\n")
+    (p.root / "bin" / "cite.sh").write_text("#!/bin/sh\n# enforces user msg #77\n")
+    (p.root / "bin" / "drain.sh").write_text("#!/bin/sh\n# drain the fleet before it goes offline\n")
+    (p.root / "bin" / "spare.sh").write_text("#!/bin/sh\n# leave the Cold  Spare alone\n")
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never merge. (user msg #1)\n")
+
+
+def test_stems_under_five_percent_but_common_are_cut_and_the_citing_tools_still_match(env):
+    """The distinctive cut is a 0.5% share (or COMMON_MIN lines): 'worker', 'build' and 'queue' on 3% of
+    the lines match nothing, the tools citing or enforcing the item by its cite, rare words or quoted
+    phrase still do."""
+    from ttp import restriction_audit
+    p = make(env)
+    _big_tree(p)
+    assert restriction_audit.COMMON_SHARE <= 0.01
+    out = restriction_audit.restriction_tools(p, [(_ITEM, "", "the fleet was retired")], [])
+    assert len(out) == 1, out
+    assert "bin/cite.sh:2 (#77)" in out[0] and "bin/drain.sh:2 (drain, fleet, offlin)" in out[0], out
+    assert "bin/spare.sh:2 (cold spare)" in out[0] and "common" not in out[0] and "filler" not in out[0], out
+
+
+def test_a_citation_only_new_text_is_a_removal(env):
+    """A new text whose rule words are only citation words (user, word, msg, message, month names, dates)
+    removes the item: distinctive words, quoted phrases and cites, not every dropped stem uncut."""
+    from ttp import restriction_audit
+    lines = ["echo step %d ok" % i for i in range(1000)] + ["# the worker may build the queue now"] * 30
+    removed = restriction_audit.tool_terms(_ITEM, "", "", lines)
+    assert "#77" in removed[2] and "cold spare" in removed[2] and not {"worker", "build", "queu"} & removed[1]
+    for new in ("(User's word, 2026-10-05.)", "(user msg #77)", "Per the user's words (msgs #77, #78), October 5.",
+                "User message, 5 November 2026."):
+        assert restriction_audit.tool_terms(_ITEM, new, "", lines) == removed, new
+    # The spec's short case: 'loosen' and 'rul' dropped, 'user' and 'word' kept as a cite: still a removal.
+    short = "Only the user's word loosens a rule."
+    assert restriction_audit.tool_terms(short, "(User's word, 2026-10-05.)", "", [])[1] == {"user", "word", "loosen", "rul"}
+    # A new text keeping one real rule word is a loosening: its dropped words, no exact terms.
+    ids, words, exact = restriction_audit.tool_terms(_ITEM, "A worker may build at night (user msg #80).", "", lines)
+    assert exact == set() and "worker" not in words and {"queu", "drain", "fleet"} <= words, words
+
+
+def test_every_two_word_hit_needs_a_rare_word(env):
+    """A loosening keeps its dropped words uncut, but a line with two common ones only is no hit; one
+    rare word among them is. restriction_tools passes the rare set."""
+    from ttp import restriction_audit
+    ids, words, exact = restriction_audit.tool_terms(_ITEM, "A worker may run at night (user msg #80).", "", [])
+    rare = {"drain", "fleet"}
+    assert restriction_audit.tool_hit("build the queue", ids, words, exact) == ["build", "queu"]
+    assert restriction_audit.tool_hit("build the queue", ids, words, exact, rare) == []
+    assert restriction_audit.tool_hit("Queue the fleet", ids, words, exact, rare) == ["fleet", "queu"]
+    assert restriction_audit.tool_hit("fleet", ids, words, exact, rare) == []
+    p = make(env)
+    _big_tree(p)
+    out = restriction_audit.restriction_tools(p, [(_ITEM, "A worker may run at night (user msg #80).", "")], [])
+    assert len(out) == 1 and "bin/drain.sh:2" in out[0] and "common" not in out[0], out
