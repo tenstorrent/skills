@@ -860,6 +860,12 @@ def ship_runtime(host: str) -> str:
     return f"~/{stage}/bin/ttp"
 
 
+def remote_words(args: list) -> str:
+    """args as one remote shell command: every word quoted, so empty or spaced words survive the
+    remote shell; a leading `~/` becomes "$HOME"/ so the remote shell still expands it to that home."""
+    return " ".join('"$HOME"/' + shlex.quote(x[2:]) if x.startswith("~/") else shlex.quote(x) for x in args)
+
+
 def new_remote(a, brief: str) -> None:
     """Ship this runtime to the other machine and create the project there."""
     if not a.dir:
@@ -880,7 +886,7 @@ def new_remote(a, brief: str) -> None:
     from . import coordinator as coord
     if a.coordinator_effort != coord.DEFAULT_EFFORT:
         args += ["--coordinator-effort", a.coordinator_effort]
-    remote = " ".join(shlex.quote(x) if not x.startswith("~/") else x for x in args) + " --describe-file -"
+    remote = remote_words(args) + " --describe-file -"
     from . import weblink
     r = subprocess.run(["ssh", "-o", "BatchMode=yes", host, remote], input=brief, text=True, stdout=subprocess.PIPE)
     _echo_without_web(r.stdout)

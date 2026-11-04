@@ -294,3 +294,33 @@ def test_an_ssh_name_that_does_not_exist_is_a_broken_route_never_an_unreachable_
         assert f"ssh cannot resolve {gone}" in why and "not an outage" in why and not asked, why
     else:
         assert why == "" and asked == ["box-a"], "still confirmed against the host"
+
+
+def test_ttp_new_on_another_host_quotes_every_forwarded_word_so_empty_or_spaced_ones_survive(env, monkeypatch, tmp_path):
+    import shlex
+    import subprocess as sp
+    from types import SimpleNamespace
+    from ttp import cli, coordinator, machines, timefmt
+    words = ["~/my project/root", "", "a b", "x;touch pwned", "$HOME", "~/", "plain"]
+    remote = cli.remote_words(words)
+    assert shlex.split(remote) == [("$HOME/" + w[2:]) if w.startswith("~/") else w for w in words], remote
+    # the remote shell sees the same words, with only the leading ~/ expanded to its home
+    out = sp.run(["bash", "-c", f"printf '<%s>\\n' {remote}"], env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
+                 capture_output=True, text=True, check=True).stdout
+    assert out.splitlines() == [f"<{tmp_path}/my project/root>", "<>", "<a b>", "<x;touch pwned>", "<$HOME>",
+                                f"<{tmp_path}/>", "<plain>"], out
+    # new_remote forwards --dir, --name and --provider through it
+    seen = []
+    monkeypatch.setattr(cli, "ship_runtime", lambda host: "~/stage dir/bin/ttp")
+    monkeypatch.setattr(cli, "load_secrets", lambda: {})
+    monkeypatch.setattr(machines, "push", lambda host: "machines: pushed")
+    monkeypatch.setattr(timefmt, "in_ssh_login", lambda: True)
+    monkeypatch.setattr(cli, "register", lambda name, entry: None)
+    monkeypatch.setattr(cli.subprocess, "run", lambda argv, **k: seen.append(argv)
+                        or SimpleNamespace(returncode=0, stdout="", stderr=""))
+    a = SimpleNamespace(dir="~/my project/root", host="host-a", no_secrets=False, name="demo", provider="",
+                        no_service=True, coordinator_effort=coordinator.DEFAULT_EFFORT)
+    monkeypatch.setattr(cli, "detect_provider", lambda: "")
+    cli.new_remote(a, "brief")
+    assert shlex.split(seen[-1][-1]) == ["$HOME/stage dir/bin/ttp", "new", "demo", "--dir", "$HOME/my project/root",
+                                         "--provider", "", "--no-service", "--describe-file", "-"], seen[-1]
