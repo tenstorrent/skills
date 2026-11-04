@@ -208,7 +208,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "end_when": {"type": "string"}, "report_from": {"type": "string"},
             "source": {"type": "string"}, "match": {"type": "string"}, "hours": {"type": "number"},
             "escalate_after_h": {"type": "number"}, "below": {"type": "string"}, "why": {"type": "string"},
-            "quote": {"type": "string"},
+            "quote": {"type": "string"}, "excepts": {"type": "string"},
             "start_after": {"type": "string", "pattern": START_AFTER_RE}, "start_when": {"type": "string"},
             "waits_on": {"type": "string"}, "outcome": {"type": "string", "enum": list(sweep.OUTCOMES)},
             "clear_fields": {"type": "array", "items": {"type": "string", "enum": list(NULL_OPERATIONS)}},
@@ -2960,9 +2960,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     # agent mode: a turn of the owner's agent's words alone (findings) is the owner's turn
                     via = [m["id"] for m in relay.recent(db, messages)] if agent and messages and ok is None else []
                     uturn = user_turn or bool(via)
-                    unsourced, agent_cite = "", False   # an added or changed item records its source; the
-                    if text and _DATED.sub("", section).lower().startswith("restriction"):   # user's yes is one
-                        try:
+                    unsourced, agent_cite, cite = "", False, ""   # an added or changed item records its
+                    if text and _DATED.sub("", section).lower().startswith("restriction"):   # source; the user's
+                        try:                                                                 # yes is one
                             cite = ((f" (user msg #{ok['messages'][0]})" if ok.get("messages") else "")
                                     if ok is not None and not a.get("source") else
                                     restriction_source.check(db, p.charter_path.read_text(), text, a.get("source"),
@@ -2974,7 +2974,25 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     # a Restrictions item edited without the user's word or `over` is refused below anyway
                     refused = (quote and _DATED.sub("", section).lower().startswith("restriction")
                                and not (uturn or ok or len(over) >= OVER_MIN))
-                    if text and not (replaces or a.get("both_hold") or refused):
+                    excepts = " ".join(str(a.get("excepts") or "").split())
+                    if excepts:   # a scoped exception to one standing ban, on the user's verbatim words
+                        if quote or replaces or not (text and _DATED.sub("", section).lower().startswith("restriction")):
+                            raise ValueError("`excepts` goes with new Restrictions `text` only, "
+                                             "never with `quote` or `replaces`")
+                        verbatim = bool(a.get("source")) and bool(re.search(r"user msg #\d+|relayer-ordered", cite))
+                        said = ""   # the source message's words: the user's own, the agent's too in agent mode
+                        if verbatim and not unsourced:
+                            mid = int(str(restriction_source._parse(a["source"]).get("msg")).lstrip("#"))
+                            row = next(r for r in relay.recent(db, [mid]) if r["id"] == mid)
+                            own, ctx = relay.split(row["text"] or "", row["context"])
+                            said = own + ("\n" + ctx if agent else "")
+                        text, overlap = _scoped_exception(
+                            p.charter_path.read_text(), section, text, excepts,
+                            "" if verbatim and not unsourced else unsourced or (
+                                "a Brief or harness-gate source is not the user's words" if a.get("source")
+                                else restriction_source.NO_SOURCE), end, said)
+                        notes.append(overlap)
+                    elif text and not (replaces or a.get("both_hold") or refused):
                         overlap = _reject_contradicting_append(p, section, text, uturn, messages, ok, quote, end)
                         if overlap:
                             notes.append(overlap)
@@ -3057,7 +3075,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         if why is not None and gone:
                             into = text if target.lower().startswith("restriction") else ""
                             loosened += [(o, n, why, loose_drop) for o, n in restriction_audit.replaced_items(gone, into)]
-                    elif text and not quote and not a.get("both_hold"):
+                    elif text and not quote and not a.get("both_hold") and not excepts:
                         rules_added.append((target, text))
                     if retired:
                         db.post("out", f"Retired the charter restriction {retired}: "
@@ -5125,13 +5143,17 @@ def restriction_pairs(charter: str) -> list[dict]:
     item are never paired (an item may state its own exception in a second sentence), nor is a ban
     that names its own exception (_OWN_EXCEPTION_RE)."""
     items = _restriction_items(charter)
+    whole: dict[int, str] = {}
+    for x, _, n in items:
+        whole[n] = whole.get(n, "") + " " + _loose(x)
     out, seen = [], set()
     for f, fsec, fn in items:
         if not _BAN_RE.search(f) or _OWN_EXCEPTION_RE.search(f):
             continue
+        excepted = _loose(SCOPED_EXCEPTION.split("{clause}")[0] + restriction_source.bare(f).strip())
         for a, asec, an in items:
             if (an == fn or not _PERMIT_RE.search(a) or frozenset((f, a)) in seen
-                    or not _overlaps(f, a, strict=True)):
+                    or not _overlaps(f, a, strict=True) or excepted in whole[an]):   # a scoped exception to f
                 continue
             seen.add(frozenset((f, a)))
             key = hashlib.sha256(f"{' '.join(f.split())}\n{' '.join(a.split())}".encode()).hexdigest()[:12]
@@ -5364,9 +5386,9 @@ def _reject_contradicting_append(p: Project, section: str, text: str, user_turn:
     first = hits[0]
     raise ValueError(
         f"charter_update: {clip(text, 200)!r} contradicts the Restrictions item "
-        + "; ".join(f"\"{clip(i, 200)}\" (section {s!r})" for i, s in hits)
-        + ", which would stay standing, and workers obey it as binding. Pick by what the user meant, three "
-          "fixes: if this text replaces that item, resend with section "
+        + "; ".join(f"\"{clip(i, 200)}\" (section {s!r}): {_conflict_reason(i, text, quote)}" for i, s in hits)
+        + ". Each named item, which would stay standing, binds workers as written. Pick by what the user meant, "
+          "three fixes: if this text replaces that item, resend with section "
           f"{first[1]!r}, `quote` \"{first[0]}\" and this `text`"
         + (" (the user's yes is on record for it; their words in any wording are enough, no `over` and no end "
            "they did not give)" if said else ", with `over` naming the user's word that changed it")
@@ -5377,7 +5399,110 @@ def _reject_contradicting_append(p: Project, section: str, text: str, user_turn:
           f"in section {first[1]!r} (`quote` the item, `text` the same item plus \", except as <the exception, by its ask id> "
           "allows\"), which passes on the same yes; if both hold (this text only adds a limit, a ban, a "
           "condition or a duty, or is not about the same thing), resend with `both_hold`: true, or say in the "
-          "text that it loosens no restriction. Never drop a restriction the user did not change")
+          "text that it loosens no restriction. If the user's verbatim words allow it only for a named scope (hosts, "
+          "resources, actions, a time window) while that item still holds elsewhere, resend it in Restrictions with "
+          "`excepts` set to that item's clause and `source` their words. Never drop a restriction the user did not "
+          "change")
+
+
+def _conflict_reason(item: str, text: str, quote: str = "") -> str:
+    """One line on why `text` conflicts with a Restrictions sentence `item`: what the item bans that a
+    sentence of the text may permit, or what both rule on (their shared action and object words)."""
+    news = _quoted_news(quote, _sentences(text.splitlines())) or [text]
+    lift = next((x for x in news if _may_lift(x) and _lifts_item(item, x)), "")
+    s = lift or next((x for x in news if _overlaps(item, x)), news[0])
+    (ia, io), (sa, so) = (_target(restriction_source.bare(x), conditions=False) for x in (item, s))
+    shared = ", ".join(sorted((ia & sa | io & so) - {_ANY})[:4])
+    what = f" ({shared})" if shared else ""
+    if lift:
+        return f"it bans what this text may permit{what}"
+    return f"both rule on the same thing{what}; workers obey both, so the stricter wins"
+
+
+# A scoped exception (charter_update `excepts`, _scoped_exception) lifts a ban for named things only.
+# Words that make it general: it then lifts the ban everywhere, which is a rewrite of the item (`quote`).
+_GENERAL_RE = re.compile(r"\b(?:any|anywhere|everywhere|every|all|always|whatever|whichever|in general|"
+                         r"no longer|lift(?:s|ed)?|anymore|any ?more)\b", re.I)
+# The stored exception names its clause and precedence, with no sentence break before its own text.
+SCOPED_EXCEPTION = ("Exception to \"{clause}\" ({section}), which holds everywhere except inside this scope, where "
+                    "this item wins: ")
+
+
+def _scope_names(text: str) -> set[str]:
+    """The named things a rule lists (its scope): `backticked` names, and words with a digit, an
+    underscore, a slash, a file suffix or a one-letter hyphen part (host-a, node3, run_cycles.sh, a
+    date). Source cites and message or ask ids ("#12") name nothing."""
+    bare = re.sub(r"#\d+", " ", restriction_source.bare(text))
+    out = {" ".join(m[1].lower().split()) for m in re.finditer(r"`([^`\n]+)`", bare)}
+    for w in re.findall(r"[A-Za-z0-9](?:[\w./-]*[A-Za-z0-9])?", re.sub(r"`[^`\n]*`", " ", bare)):
+        if (re.search(r"\d|_|/|[A-Za-z]{2}\.[A-Za-z]{1,4}$", w)
+                or "-" in w and any(len(x) == 1 for x in w.split("-"))):
+            out.add(w.lower())
+    return out
+
+
+def _scoped_exception(charter: str, section: str, text: str, clause: str, sourced: str,
+                      end: dict | None, said: str = "") -> tuple[str, str]:
+    """Check a Restrictions charter_update sent with `excepts` (the clause of a standing Restrictions
+    item it narrows) and return (the text to store, a note) or raise ValueError naming the clause and
+    why. It passes when the clause is a standing ban; `sourced` is the user's verbatim words (a
+    `source` cite to a user message, or relayer-ordered with agent mode on), else `sourced` is the
+    reason it is not; the text may permit what the clause bans; it names a scope the clause does not
+    (_scope_names: hosts, resources, actions, a time window, or an end) and no general word
+    (_GENERAL_RE); and no other standing ban it may lift names a thing in that scope (an exception
+    wider than a ban another item keeps); every name of that scope is in the user's words `said`.
+    Other bans it may lift that name none of its scope hold
+    alongside (the note lists them). The stored text names the clause and its precedence
+    (SCOPED_EXCEPTION); the clause's own item is never edited."""
+    items = _restriction_items(charter)
+    want = _loose(restriction_source.bare(clause))
+    want = want if len(want.split()) >= 3 else ""   # a clause, not a word every ban has
+    mark = _loose(SCOPED_EXCEPTION.split("{clause}")[0])
+    found = next(((s, sec) for s, sec, _ in items if want and want in _loose(restriction_source.bare(s))
+                  and _BAN_RE.search(s) and not _loose(s).startswith(mark)), None)
+    head = f"scoped exception {clip(text, 160)!r} refused: "
+    if found is None:
+        raise ValueError(head + f"`excepts` \"{clip(clause, 160)}\" is no clause of a standing Restrictions "
+                         "item that bans something; resend with `excepts` set to that clause word for word")
+    item, sec = found
+    named = f"\"{clip(restriction_source.bare(item).strip(), 200)}\" (section {sec!r})"
+    bullet = re.match(r"\s*(?:[-*+]|\d+[.)])\s+", text.strip())
+    text = text.strip()[bullet.end() if bullet else 0:]   # stored as an item of its own, bulleted
+    if "\n" in text:
+        raise ValueError(head + f"{named}: send one exception as one item (one line)")
+    if sourced:
+        raise ValueError(head + f"{named}: no verbatim user source ({clip(sourced, 300)}). Only the user's own "
+                         "words (`source` {msg, quote}) make an exception, never a relayer's, worker's or "
+                         "project's note")
+    if not _may_lift(text):
+        raise ValueError(head + f"{named}: the text permits nothing; a new ban goes in without `excepts`")
+    if not _overlaps(item, text):
+        raise ValueError(head + f"{named}: the text is not about what that clause bans")
+    names = _scope_names(text) - _scope_names(item)
+    general = _GENERAL_RE.search(restriction_source.bare(text))
+    if general or not (names or end):
+        why = (f"\"{general[0]}\" lifts it in general" if general
+               else "it names no host, resource, action or time window the clause does not")
+        raise ValueError(head + f"{named}: {why}; an exception names the scope it covers, and lifting a ban "
+                         "everywhere replaces the item (`quote` it)")
+    unsaid = sorted(n for n in names if _loose(n) not in _loose(said))
+    if unsaid:
+        raise ValueError(head + f"{named}: the user's words in `source` do not name {', '.join(unsaid)}; an "
+                         "exception covers only what they named")
+    wider = [(s, sc, sorted(_scope_names(s) & names)) for s, sc in _append_conflicts(charter, section, text,
+                                                                                  lifts_only=True)
+             if s != item and _scope_names(s) & names]
+    if wider:
+        raise ValueError(head + "it is wider than a ban another item keeps: " + "; ".join(
+            f"\"{clip(restriction_source.bare(s).strip(), 200)}\" (section {sc!r}): it still bans "
+            f"{', '.join(n)}, which the exception covers" for s, sc, n in wider)
+            + f". Narrow it to what only {named} bans, or the user changes those items too")
+    rest = [s for s, _ in _append_conflicts(charter, section, text, lifts_only=True) if s != item]
+    stored = (bullet[0] if bullet else "- ") + SCOPED_EXCEPTION.format(clause=restriction_source.bare(item).strip(), section=sec) + text
+    note = (f"charter_update: scoped exception to {named} went in" + (
+        "; these items name none of its scope and still hold: " + "; ".join(f"\"{clip(s, 120)}\"" for s in rest)
+        if rest else ""))
+    return stored, note
 
 
 def _append_update(steer: Path, text: str, key: str | None = None) -> None:
@@ -6486,12 +6611,13 @@ def _use_charter_approval(p: Project, rid: str, key: str | None) -> None:
 # with it: a test fails when the source of CHARTER_GUARD_FUNCS no longer has CHARTER_GUARD_PIN's
 # sha256. A user's change that failed under an older guard for another reason than the guard
 # (reraise_charter_changes) is then raised at once.
-CHARTER_GUARD_VERSION = 14
+CHARTER_GUARD_VERSION = 15
 CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_overlaps", "_on_object", "_quote_hits",
                        "_item_quote_hits", "_items", "_norm", "_may_lift", "_lifts_item", "_companion_clause",
                        "_ref_ids", "_companion_exception", "_changed_sentences", "_quoted_news",
-                       "_charter_approval", "_ask_charter_approval")
-CHARTER_GUARD_PIN = (14, "61a8471fb7bd3bf5228ac37ce59d2be30d3141073a493e83da9814042f25d7fc")
+                       "_charter_approval", "_ask_charter_approval", "_conflict_reason", "_scope_names",
+                       "_scoped_exception")
+CHARTER_GUARD_PIN = (15, "ed818b83809c38c89b55c6b337cbc9a1851bde00095fa1106673709b90fb6fd7")
 CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
 
 

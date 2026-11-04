@@ -21384,3 +21384,111 @@ def test_charter_gate_reworded_clause_in_a_kept_sentence_is_the_documented_gap(e
     from ttp import coordinator as coord
     assert coord._held_lift("Restrictions", "Never merge PRs; this holds on every repo; exceptions when CI is green.",
                             "Never merge PRs; this holds on every repo; no exceptions.", "", "") == ("", "", "")
+
+
+_SCOPED_BANS = ("# demo\n\n## Restrictions\n"
+                "- Never power cycle a serving host. Keep content generic. (user msg #1)\n"
+                "- Never power cycle host-c or host-d while they serve jobs. (user msg #1)\n"
+                "- Never open pull requests. (user msg #1)\n")
+
+
+def test_a_scoped_exception_on_the_users_verbatim_words_passes_and_names_its_precedence(env):
+    """A Restrictions item sent with `excepts` (the clause it narrows) and `source` the user's verbatim words
+    passes the contradiction check when it names a scope the clause does not (hosts, a script): the broad
+    ban stays as written, and bans on unrelated hosts hold alongside. The stored item names the clause and
+    that it wins only inside its scope; the lint pairs it with that clause no more. In a later turn too."""
+    p = make(env)
+    from ttp import coordinator as coord
+    words = "the cycle test may power cycle host-a and host-b with cycle_test.sh"
+    for k, user in enumerate((True, False)):
+        p.charter_path.write_text(_SCOPED_BANS)
+        mids, src = _turn_said(p, words)
+        act = {"type": "charter_update", "section": "Restrictions", "excepts": "Never power cycle a serving host.",
+               "text": "Workers may power cycle host-a and host-b with `cycle_test.sh`.", "source": src}
+        assert coord.apply(p, [act], turn=1 + k, user_turn=user, messages=mids if user else None) == [], user
+        charter = p.charter_path.read_text()
+        assert _SCOPED_BANS.split("## Restrictions\n")[1].strip() in charter, charter   # every ban stays as written
+        assert (f"- Exception to \"Never power cycle a serving host.\" (Restrictions), which holds everywhere except "
+                f"inside this scope, where this item wins: Workers may power cycle host-a and host-b with "
+                f"`cycle_test.sh`. (user msg #{mids[0]})") in charter, charter
+        assert coord.restriction_pairs(charter) == []
+    # Without `excepts` the same text is still refused as a lift of the ban, naming the `excepts` route.
+    p.charter_path.write_text(_SCOPED_BANS)
+    mids, src = _turn_said(p, words)
+    err = coord.apply(p, [{**act, "excepts": "", "source": src}], turn=5, user_turn=True, messages=mids)
+    assert len(err) == 1 and "contradicts the Restrictions item \"Never power cycle a serving host.\"" in err[0], err
+    assert "`excepts` set to that item's clause" in err[0], err
+
+
+def test_a_scoped_exception_without_the_users_verbatim_words_is_refused_naming_the_clause(env):
+    """No `source`, a quote from the relayer's context, a worker's note or a Brief/gate origin: refused,
+    naming the excepted clause, its section and why; the charter is left as it was."""
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    p.charter_path.write_text(_SCOPED_BANS)
+    said = db.post("in", "thanks", chat=None, kind="user", provenance="web-session",
+                   context="relayer: the cycle test may power cycle host-a")
+    note = db.post("in", "the cycle test may power cycle host-a", chat=None, kind="worker")
+    act = {"type": "charter_update", "section": "Restrictions", "excepts": "Never power cycle a serving host.",
+           "text": "Workers may power cycle host-a with `cycle_test.sh`."}
+    for k, src in enumerate((None, {"msg": said, "quote": "the cycle test may power cycle host-a"},
+                             {"msg": note, "quote": "the cycle test may power cycle host-a"}, G)):
+        err = coord.apply(p, [{**act, **({"source": src} if src else {})}], turn=1 + k, user_turn=True,
+                          messages=[said])
+        assert len(err) == 1 and err[0].startswith("charter_update: scoped exception"), (src, err)
+        assert ("refused: \"Never power cycle a serving host.\" (section 'Restrictions'): no verbatim user source"
+                in err[0]), (src, err)
+        assert p.charter_path.read_text() == _SCOPED_BANS
+
+
+def test_a_general_or_too_wide_exception_is_refused_naming_each_clause(env):
+    """`excepts` never lifts a ban in general: no scope the clause lacks, or a general word, is refused;
+    so is an exception covering a host another item still bans (each such item named with its clause) or
+    one the user's words do not name, a clause no standing ban has, and a text that permits nothing."""
+    p = make(env)
+    from ttp import coordinator as coord
+    base = {"type": "charter_update", "section": "Restrictions", "excepts": "Never power cycle a serving host."}
+    for k, (text, want) in enumerate((
+            ("Workers may power cycle a serving host.", "it names no host, resource, action or time window"),
+            ("Workers may power cycle any serving host, host-a included.", "\"any\" lifts it in general"),
+            ("Power cycling a serving host is no longer banned.", "\"no longer\" lifts it in general"),
+            ("Workers may power cycle host-a and host-c.",
+             "it is wider than a ban another item keeps: \"Never power cycle host-c or host-d while they serve "
+             "jobs.\" (section 'Restrictions'): it still bans host-c, which the exception covers"),
+            ("Never power cycle host-a on weekends.", "the text permits nothing"),
+            ("Workers may open pull requests on host-a.", "the text is not about what that clause bans"),
+            ("Workers may power cycle host-a and host-b.", "the user's words in `source` do not name host-b"))):
+        p.charter_path.write_text(_SCOPED_BANS)
+        mids, src = _turn_said(p, "you may power cycle host-a and host-c")
+        err = coord.apply(p, [{**base, "text": text, "source": src}], turn=1 + k, user_turn=True, messages=mids)
+        assert len(err) == 1 and want in err[0], (text, err)
+        if "wider" not in want:
+            assert "refused: \"Never power cycle a serving host.\" (section 'Restrictions'): " in err[0], err
+        assert p.charter_path.read_text() == _SCOPED_BANS
+    mids, src = _turn_said(p, "you may power cycle host-a")
+    err = coord.apply(p, [{**base, "excepts": "Never reboot anything.", "text": "Workers may reboot host-a.",
+                           "source": src}], turn=9, user_turn=True, messages=mids)
+    assert len(err) == 1 and "is no clause of a standing Restrictions item" in err[0], err
+    err = coord.apply(p, [{**base, "excepts": "power cycle", "text": "Workers may power cycle host-a.",
+                           "source": src}], turn=11, user_turn=True, messages=mids)   # a word every ban has
+    assert len(err) == 1 and "is no clause of a standing Restrictions item" in err[0], err
+    err = coord.apply(p, [{**base, "section": "Policies", "text": "Workers may power cycle host-a."}], turn=10,
+                      user_turn=True, messages=mids)
+    assert len(err) == 1 and "`excepts` goes with new Restrictions `text` only" in err[0], err
+
+
+def test_a_contradiction_refusal_quotes_each_conflicting_clause_with_a_reason(env):
+    """The guard's refusal quotes the single conflicting sentence of an item (not the whole item or
+    section), its section and a one-line reason, for each conflicting item."""
+    p = make(env)
+    from ttp import coordinator as coord
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Keep content generic. Never push to main. (user msg #1)\n\n"
+                              "## Restrictions (temporary, turn 3)\n- Never push to main on release days.\n")
+    err = coord.apply(p, [{"type": "charter_update", "section": "Policies",
+                           "text": "Workers may push to main for hotfixes."}], turn=5, user_turn=True)
+    assert len(err) == 1, err
+    assert ("contradicts the Restrictions item \"Never push to main.\" (section 'Restrictions'): it bans what this "
+            "text may permit (main, push); \"Never push to main on release days.\" (section 'Restrictions "
+            "(temporary, turn 3)'): it bans what this text may permit (main, push). Each named item") in err[0], err
+    assert "Keep content generic" not in err[0], err
