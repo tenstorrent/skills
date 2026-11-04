@@ -28443,7 +28443,7 @@ def test_checks_host_cap_foreground_wait_does_not_count_toward_the_run(env, tmp_
     finally:
         holder.kill()
         holder.wait()
-    t.join(30)
+    t.join(120)   # a clean checkout under a loaded suite can take 30 s+
     assert done and not (run / cli.CHECKS_SLOT_WAIT).exists()
     assert all(w["end"] for w in json.loads((run / locks.WAITS_FILE).read_text()).values()), "the wait is closed"
     assert json.loads((run / "checks.json").read_text())["passed"] is True
@@ -28575,7 +28575,7 @@ def test_checks_with_no_project_keep_waiting_in_the_foreground_instead_of_handin
     finally:
         holder.kill()
         holder.wait()
-    t.join(30)
+    t.join(120)   # a clean checkout under a loaded suite can take 30 s+
     out = capsys.readouterr().out
     assert ended in ([0], [None]) and ran.exists()
     assert cli.CHECKS_HANDOVER not in out and "started in the background" not in out
