@@ -1874,3 +1874,161 @@ def test_a_signalled_lock_waiter_never_follows_a_symlinked_progress_log(env, tmp
     assert h.wait(timeout=30) == 0
     assert f"SIGTERM received by pid {w.pid}" in err and "refused to append to" in err, err
     assert target.read_text() == "keep me\n"
+
+
+_QUEUE_WAITER = r'''
+import os, sys
+from pathlib import Path
+from ttp import locks
+d, res, since, fork = Path(sys.argv[1]), sys.argv[2], float(sys.argv[3]), sys.argv[4] == "1"
+t = locks.enqueue(d, res, "waiter", since=since)
+if fork and os.fork() == 0:   # a child that keeps the ticket's open file, and so its lock, until stdin closes
+    os.read(0, 1)
+    os._exit(0)
+print("ready", flush=True)
+for _line in sys.stdin:
+    print(locks.dropped(t), locks.run_ended(t), locks.my_turn(d, res, t, 99), flush=True)
+'''
+
+
+def _queue_waiter(d, res, since, run_env, fork=False):
+    """A process queued on res (arrival `since`) once it says so; each line it reads, it answers whether
+    its ticket was dropped, whether its run ended and whether it is its turn."""
+    w = subprocess.Popen([sys.executable, "-c", _QUEUE_WAITER, str(d), res, str(since), "1" if fork else "0"],
+                         env={**run_env, "PYTHONPATH": str(RUNTIME)}, stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    assert w.stdout.readline() == "ready\n", w.stderr.read()
+    return w
+
+
+def _ask(w):
+    w.stdin.write("?\n")
+    w.stdin.flush()
+    return w.stdout.readline().split()
+
+
+def _plain_env():
+    return {k: v for k, v in os.environ.items() if k not in ("TTP_RUN_DIR", "TTP_DETACHED", "PYTHONPATH")}
+
+
+def test_a_killed_waiters_queue_entry_is_dropped_even_when_a_child_keeps_its_lock_and_the_next_waiter_goes(
+        tmp_path, monkeypatch):
+    from ttp import locks
+    monkeypatch.delenv("TTP_RUN_DIR", raising=False)
+    d, res = tmp_path / "locks", "suite"
+    plain = _queue_waiter(d, res, 1.0, _plain_env())
+    forked = _queue_waiter(d, res, 2.0, _plain_env(), fork=True)
+    mine = locks.enqueue(d, res, "next", since=3.0)
+    try:
+        assert [t.name.split("-")[0] for t in locks.queued(d, res)] == ["0000000001.000000", "0000000002.000000",
+                                                                       "0000000003.000000"]
+        assert not locks.my_turn(d, res, mine, 1)
+        stale = [t for t in locks.queued(d, res) if t != mine]
+        for w in (plain, forked):
+            w.kill()
+            w.wait(timeout=60)
+        assert locks._ticket_live(stale[1]), "the forked child no longer holds the killed waiter's lock"
+        assert locks.queued(d, res) == [mine]
+        assert not any(t.exists() or locks._owner_file(t).exists() for t in stale)
+        assert locks.my_turn(d, res, mine, 1)
+    finally:
+        locks.dequeue(mine)
+        for w in (plain, forked):
+            w.kill()
+            w.stdin.close()
+            w.wait(timeout=60)
+
+
+def test_a_waiter_whose_run_ended_loses_its_queue_place_and_never_takes_a_turn_but_a_detached_job_keeps_its(
+        tmp_path, monkeypatch):
+    from ttp import locks
+    monkeypatch.delenv("TTP_RUN_DIR", raising=False)
+    d, res, run = tmp_path / "locks", "suite", tmp_path / "run"
+    run.mkdir()
+    in_run = _queue_waiter(d, res, 1.0, {**_plain_env(), "TTP_RUN_DIR": str(run)})
+    job = _queue_waiter(d, res, 2.0, {**_plain_env(), "TTP_RUN_DIR": str(run), "TTP_DETACHED": "1"})
+    mine = locks.enqueue(d, res, "next", since=3.0)
+    try:
+        assert len(locks.queued(d, res)) == 3 and _ask(in_run) == ["False", "False", "True"]
+        (run / "exit.json").write_text("{}")
+        q = locks.queued(d, res)
+        assert len(q) == 2 and q[1] == mine and locks._arrival(q[0]) == 2.0, q
+        # the ended run's waiter, still alive, has no place and never takes a turn; it knows why
+        assert _ask(in_run) == ["True", "True", "False"]
+        assert _ask(job) == ["False", "False", "True"]
+        assert not locks.my_turn(d, res, mine, 1) and locks.my_turn(d, res, mine, 2)
+        # a check the daemon runs after the run ended, with the run's variables, is not tied to it
+        assert locks._waits_for_run({"TTP_RUN_DIR": str(run)}) == ""
+    finally:
+        locks.dequeue(mine)
+        for w in (in_run, job):
+            w.kill()
+            w.wait(timeout=60)
+
+
+def test_a_reused_pid_never_keeps_a_queue_entry_and_a_live_or_unjudgeable_waiter_keeps_its_place(tmp_path,
+                                                                                                monkeypatch):
+    import fcntl
+    from ttp import locks
+    monkeypatch.delenv("TTP_RUN_DIR", raising=False)
+    d, res = tmp_path / "locks", "suite"
+    qd = locks.queue_dir(d, res)
+    qd.mkdir(parents=True)
+    me = locks._owner(os.getpid())
+    held = []
+
+    def ticket(since, rec):
+        # a ticket whose lock this test holds (as a process that inherited it would), with owner record rec
+        path = qd / f"{since:017.6f}-{os.getpid()}"
+        f = open(path, "a+")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        held.append(f)
+        if rec is not None:
+            locks._owner_file(path).write_text(json.dumps(rec))
+        return path
+
+    try:
+        reused = ticket(1.0, {**me, "pid_start": "1"})              # its pid now names another process
+        live = ticket(2.0, me)                                     # the very process
+        other_ns = ticket(3.0, {**me, "pid": 999999, "pidns": "pid:[1]"})   # another PID namespace: cannot tell
+        other_host = ticket(4.0, {**me, "pid_start": "1", "node": me["node"] + "-elsewhere"})
+        no_record = ticket(5.0, None)                              # an older runtime's ticket
+        gone = ticket(6.0, {**me, "pid": 999999})                  # no such process
+        mine = locks.enqueue(d, res, "mine", since=7.0)
+        q = locks.queued(d, res)
+        assert q == [live, other_ns, other_host, no_record, mine], q
+        assert not reused.exists() and not gone.exists() and not locks._owner_file(reused).exists()
+        assert locks.queued(d, res) == q   # read again: nobody moves
+        assert [locks.my_turn(d, res, t, 2) for t in q] == [True, True, False, False, False]
+        orphan = qd / f".{0.5:017.6f}-1{locks.OWNER_TICKET}"
+        orphan.write_text("{}")
+        locks.queued(d, res)
+        assert not orphan.exists() and locks._owner_file(live).exists()
+    finally:
+        locks.dequeue(locks.queued(d, res)[-1])
+        for f in held:
+            f.close()
+
+
+def test_a_ttp_lock_waiter_whose_run_ended_leaves_the_queue_and_exits_75(env, tmp_path):
+    p = make(env)
+    run_env = _lock_env(env, p)
+    run_env.pop("TTP_DETACHED", None)
+    go, started, run = tmp_path / "go", tmp_path / "started", tmp_path / "run"
+    run.mkdir()
+    (run / "run.json").write_text("{}")
+    holder = _lock({k: v for k, v in run_env.items() if k != "TTP_RUN_DIR"}, "board",
+                   cmd=("bash", "-c", f": > {shlex.quote(str(started))}; {_until(go)[-1]}"))
+    procs = [holder]
+    try:
+        _until_or_ended(started.exists, procs)
+        w = _lock({**run_env, "TTP_RUN_DIR": str(run)}, "board")
+        procs.append(w)
+        _until_or_ended(lambda: _queue_len(p, "board") == 1, procs)
+        (run / "exit.json").write_text("{}")
+        assert _queue_len(p, "board") == 0
+        assert w.wait(timeout=60) == 75
+        assert "the run this waited for has ended" in w.stderr.read()
+    finally:
+        go.touch()
+    assert holder.wait(timeout=60) == 0

@@ -1064,6 +1064,7 @@ def queue_dir(locks_dir: Path, resource: str) -> Path:
 
 
 _TICKETS: dict[Path, object] = {}   # this process's tickets: the open file that holds each one's lock
+_TICKET_RUNS: dict[Path, str] = {}   # and the folder of the run each waits for ("" for none: _waits_for_run)
 
 
 SHARED_TICKET = "-shared"   # ends a shared waiter's ticket name
@@ -1105,19 +1106,89 @@ def enqueue(locks_dir: Path, resource: str, holder: str, since: float | None = N
     path = d / name
     os.rename(tmp, path)
     _TICKETS[path] = f
+    owner = _ticket_owner()
+    _TICKET_RUNS[path] = owner.get("run_dir") or ""
+    try:   # written once the ticket is in: a ticket read without its record is judged by its lock alone
+        _owner_file(path).write_text(json.dumps(owner))
+    except OSError:
+        pass
     return path
 
 
 def dequeue(ticket: Path | None) -> None:
     if ticket is None:
         return
-    try:
-        ticket.unlink()
-    except OSError:
-        pass
+    for path in (ticket, _owner_file(ticket)):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    _TICKET_RUNS.pop(ticket, None)
     f = _TICKETS.pop(ticket, None)
     if f is not None:
         f.close()
+
+
+OWNER_TICKET = ".who"   # beside a ticket, hidden (".<ticket>.who"): its waiter's owner record (_ticket_owner)
+
+
+def _owner_file(ticket: Path) -> Path:
+    return ticket.with_name(f".{ticket.name}{OWNER_TICKET}")
+
+
+def _ticket_owner(env=None) -> dict:
+    """What a ticket records of its waiter, so a reader drops it once that waiter can no longer take its
+    turn (_waiter_gone), though its lock is still held (a child that inherited the open file): this process
+    (_owner: pid, start time, node, PID namespace) and the folder of the run it waits for (_waits_for_run)."""
+    out = _owner(os.getpid())
+    if (run := _waits_for_run(env)):
+        out["run_dir"] = run
+    return out
+
+
+def _waits_for_run(env=None) -> str:
+    """The folder of the run this process waits for (TTP_RUN_DIR) while that run is going; "" in a `ttp
+    detach` job (it outlives its run by design) and where the run had ended already when it began (a
+    hand-off's check the daemon runs later with the run's variables)."""
+    env = os.environ if env is None else env
+    run = "" if env.get("TTP_DETACHED") else str(env.get("TTP_RUN_DIR") or "")
+    return "" if not run or (Path(run) / "exit.json").exists() else run
+
+
+def run_ended(ticket: Path | None) -> bool:
+    """Whether the run a ticket of this process was queued for has ended since (exit.json in its folder)."""
+    run = _TICKET_RUNS.get(ticket) if ticket is not None else ""
+    return bool(run) and (Path(run) / "exit.json").exists()
+
+
+def _waiter_gone(ticket: Path) -> bool:
+    """Whether a ticket whose lock is held has no waiter left: its record (_ticket_owner) is of this host and
+    names a run that has ended (exit.json in its folder), or a process of this PID namespace that is gone or
+    whose pid another process now has (another start time). False whenever it cannot tell (no record,
+    another host or namespace, a process this one may not see): a live waiter is never dropped."""
+    try:
+        rec = json.loads(_owner_file(ticket).read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(rec, dict) or rec.get("node") != os.uname().nodename:
+        return False
+    run = rec.get("run_dir")
+    if isinstance(run, str) and run and (Path(run) / "exit.json").exists():
+        return True
+    if not rec.get("pidns") or rec["pidns"] != _pid_ns() or not rec.get("pid_start"):
+        return False
+    now = start_time(rec.get("pid"))
+    if now is None:   # not in /proc: gone, or hidden from this user (then it answers the signal test)
+        try:
+            return not _alive(int(rec.get("pid") or 0))
+        except (TypeError, ValueError):
+            return False
+    return now != str(rec["pid_start"])
+
+
+def dropped(ticket: Path | None) -> bool:
+    """Whether a ticket of this process was taken out of its queue under it (queued: its run ended)."""
+    return ticket is not None and ticket in _TICKETS and not os.path.lexists(ticket)
 
 
 def _ticket_live(path: Path) -> bool:
@@ -1133,22 +1204,32 @@ def _ticket_live(path: Path) -> bool:
 
 
 def queued(locks_dir: Path, resource: str) -> list[Path]:
-    """Live tickets in arrival order; tickets whose process is gone are removed."""
+    """Live tickets in arrival order; tickets whose waiter is gone are removed: its lock is free, or its
+    owner record says its process or run has ended though another process keeps the lock (_waiter_gone).
+    So are owner records left without their ticket."""
     d = queue_dir(locks_dir, resource)
     out = []
     try:
-        names = sorted(n for n in os.listdir(d) if not n.startswith("."))
+        names = sorted(os.listdir(d))
     except OSError:
         return out
     for name in names:
         path = d / name
-        if path in _TICKETS or _ticket_live(path):
+        if name.startswith("."):
+            if name.endswith(OWNER_TICKET) and not os.path.lexists(d / name[1:-len(OWNER_TICKET)]):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            continue
+        if path in _TICKETS or (_ticket_live(path) and not _waiter_gone(path)):
             out.append(path)
         else:
-            try:
-                path.unlink()
-            except OSError:
-                pass
+            for f in (path, _owner_file(path)):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
     return out
 
 
@@ -1313,8 +1394,8 @@ def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool
     once ahead are not counted, as one of them may wait for a lock this waiter's holder has: waiting
     behind it would never end."""
     q = queued(locks_dir, resource)
-    if ticket not in q:
-        return True
+    if ticket not in q:   # none queued, unless it was this process's and was dropped (its run ended): never
+        return not dropped(ticket)
     if fair:
         q = fair_order(locks_dir, resource, q, urgent_max, aged_before)
     else:   # urgent waiters (an urgent task's) first, arrival order within: none, and it is plain arrival

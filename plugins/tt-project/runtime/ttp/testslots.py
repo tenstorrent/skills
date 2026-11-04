@@ -1191,6 +1191,8 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
             free = slots - n_held
             every = locks.queued(checkcap.slot_dir(), resource)
             if ticket not in every:   # removed under it: queue again at its place, never past the line
+                if locks.dropped(ticket) and locks.run_ended(ticket):   # its run ended (locks.queued)
+                    raise checkcap.Cancelled("its run has ended, so its place in the checks queue was dropped")
                 locks.dequeue(ticket)
                 try:
                     ticket = locks.enqueue(checkcap.slot_dir(), resource, text, arrival, priority=priority)

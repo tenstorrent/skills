@@ -294,7 +294,7 @@ def _current(alias: str, owner: str, d: Path, view: dict, projects: dict | None 
             except OSError:
                 continue
             for t in tickets:
-                if _held(path / t):
+                if _held(path / t) and not locks._waiter_gone(path / t):
                     try:
                         who = (path / t).read_text().strip()
                     except OSError:

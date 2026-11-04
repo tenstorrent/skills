@@ -909,13 +909,14 @@ def log_reclaim(state: Path | None, rec: dict, why: str) -> None:
 
 
 def _live_tickets(base: str) -> list[Path]:
-    """Lane resource `base`'s live waiter tickets, read only: a dead one is skipped, never removed."""
+    """Lane resource `base`'s live waiter tickets, read only: a dead one (or one whose waiter's run ended:
+    locks._waiter_gone) is skipped, never removed."""
     d = locks.queue_dir(checkcap.slot_dir(), base)
     try:
         names = sorted(n for n in os.listdir(d) if not n.startswith("."))
     except OSError:
         return []
-    return [d / n for n in names if locks._ticket_live(d / n)]
+    return [d / n for n in names if locks._ticket_live(d / n) and not locks._waiter_gone(d / n)]
 
 
 def _run_of(text: str) -> str:

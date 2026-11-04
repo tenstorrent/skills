@@ -6180,6 +6180,9 @@ def cmd_lock(a) -> None:
                         f.close()
 
             sys.exit(_logged("shared" if a.shared else "lock", todo, _wait))
+        if any(lk.dropped(t) for t in tickets):   # its run ended: a reader took its place out of the queue
+            _end_wait()
+            die(f"the run this waited for has ended, so its place in the queue for {what} was dropped", 75)
         if check_wait is None:
             check_wait = checkwait.begin(f"ttp lock {what}") or ()
         if wait_dir and not waiting:
