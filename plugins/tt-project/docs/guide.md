@@ -1344,7 +1344,15 @@ queues behind routine work; nothing running is interrupted:
   list of its own; its hosts need no charter line but must be in the machines list. A project's own `[]` keeps
   its runs here, pool included. Runs with a check host or the authoring tree never spill; runs behind
   `checks.wrap_cmd` spill only when the project sets `checks.wrap_needs_device: false` (they run there without
-  the wrapper; unset or true, the run stays here). A run that does not pass on a spill host runs again here, and that result
+  the wrapper; unset or true, the run stays here). Two settings drop the wrapper, for different cases.
+  `checks.no_device_cmds` (or `ttp checks --no-device` for one run) names commands that never need a device or
+  the wrapper's lock (lint, unit tests): they run without the wrapper here too, and a run of only such commands
+  may spill (`ttp config <project> checks.no_device_cmds '["ruff", "pytest -q tests/unit"]'`).
+  `checks.wrap_needs_device: false` (project-wide) is for a wrapper that only serializes this machine's CPU test
+  runs: here every command still runs behind it, and a run that waits may spill and runs there without it
+  (`ttp config <project> checks.wrap_needs_device false`); never set it for a wrapper that holds a device. Both
+  set: the named commands skip the wrapper everywhere, the rest keep it here, and a run with any wrapped command
+  spills only because of `checks.wrap_needs_device: false`. A run that does not pass on a spill host runs again here, and that result
   counts. `checks.json` (`spilled_to`), `ttp status` and `ttp checks status` name the host.
   `ttp checks status` (also `--slot-status`, `--json`) prints each repository's lane holders (pid, task, run,
   age, alive or dead, what it checks and whether its task has finished) and its waiters in queue order, the next
