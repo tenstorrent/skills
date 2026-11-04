@@ -6346,6 +6346,103 @@ def test_a_full_runs_room_counts_a_priority_1_runs_urgent_slots_as_acquire_takes
         held.close()
 
 
+def test_a_run_waiting_for_its_test_slots_keeps_its_project_s_next_run_off_the_host_checks_slots(env, monkeypatch):
+    """A run that holds a host-wide checks slot and still waits for its test slots (its lane labelled by
+    the real writers: lane_waits(SLOT_WAITS), acquire's load-guard label; or its ticket in its project's
+    line) goes first: pool_room(full=True) gives no other run of its project a checks slot only to queue
+    behind it (one project's waiters filled every host-wide slot). Another project, a more urgent run
+    and a non-full ask still have room; a lane still waiting for its checks slot, or running, blocks none."""
+    from ttp import checkcap, checklane, locks, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.setenv("TTP_TEST_POOL", "4")
+    monkeypatch.setenv("TTP_TEST_RUN_MIN", "1")
+    monkeypatch.setattr(testslots, "load_guard", lambda: "")
+    monkeypatch.setenv("TTP_TASK", "12")
+    lane = testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, wait_s=0, pending=True, running=True, priority=2)
+    monkeypatch.delenv("TTP_TASK")
+    line = None
+    try:
+        assert lane and lane.files and testslots.pool_room({}, "pa", full=True, priority=2)
+        testslots.lane_waits(lane, testslots.SLOT_WAITS)   # cli's label once it holds its checks slot
+        assert not testslots.pool_room({}, "pa", full=True, priority=2)
+        assert not testslots.pool_room({}, "pa", full=True), "a run without a priority ranks last"
+        assert testslots.pool_room({}, "pa", full=True, priority=1), "a more urgent run is not behind it"
+        assert testslots.pool_room({}, "pa") and testslots.pool_room({}, "pb", full=True)
+        testslots.lane_waits(lane, "a host-wide checks slot")
+        assert testslots.pool_room({}, "pa", full=True, priority=2), "still waiting for its own checks slot"
+        monkeypatch.setattr(testslots, "load_guard", lambda: "load 99 over 64 cores")
+        assert testslots.acquire("run 12", project_name="pa", wait_s=0.3, priority=2,
+                                 waits=lambda w: testslots.lane_waits(lane, w)) is None
+        monkeypatch.setattr(testslots, "load_guard", lambda: "")
+        rec = locks.holder_records([Path(f.name) for f in lane.files])[0]
+        assert str(rec.get("waits")).startswith(testslots.LOAD_WAITS), rec
+        assert not testslots.pool_room({}, "pa", full=True, priority=2), "the load just dropped: it goes first"
+        testslots.lane_waits(lane, "a host-wide checks slot")
+        line = locks.enqueue(checkcap.slot_dir(), f"{testslots.TESTS.own}.{locks.group_id('pa')}", "run 12",
+                             priority=2)   # acquire's ticket in its project's line
+        assert not testslots.pool_room({}, "pa", full=True, priority=2)
+        assert testslots.pool_room({}, "pa", full=True, priority=1)
+        on = checklane.lane_status("pa", time.time(), {})[0]["lanes"][0]["waits_on"]
+        assert on.startswith("its project's test-worker budget (checks.test_project_slots)"), on
+        locks.dequeue(line)
+        line = None
+        testslots.lane_waits(lane, testslots.SLOT_WAITS)
+        testslots.slots_granted(lane)
+        assert testslots.pool_room({}, "pa", full=True, priority=2), "a running suite counts only by its slots"
+    finally:
+        line and locks.dequeue(line)
+        lane.close()
+
+
+def test_a_lane_whose_run_waits_for_test_slots_or_the_load_guard_holds_no_place_under_the_cap(env, monkeypatch):
+    """Lanes whose runs still wait (for test slots under their project's budget, parked, or under the load
+    guard) count against neither the project's cap nor its repository's running lanes: a third run
+    starts under a cap of 1 and then holds it."""
+    from ttp import testslots
+    _lane_env(monkeypatch)
+    waiting = [testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, cap=1, wait_s=0, pending=True, running=True)
+               for _ in range(3)]
+    try:
+        assert all(g and g.files for g in waiting)
+        for g, what in zip(waiting, (testslots.SLOT_WAITS, testslots.PARKED_WAITS, testslots.LOAD_WAITS + "load 99")):
+            testslots.lane_waits(g, what)
+        assert testslots.project_held("pa") == []
+        third = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, cap=1, wait_s=0, pending=True, running=True)
+        assert third and third.files, "the waiting runs hold no place under the cap"
+        try:
+            assert testslots.claim_running(third, "pa", lambda n: 1, cap=1)
+            assert len(testslots.project_held("pa")) == 1
+            assert not testslots.claim_running(waiting[0], "pa", lambda n: 1, cap=1), "the cap of 1 is now full"
+        finally:
+            third.close()
+    finally:
+        for g in waiting:
+            g and g.close()
+
+
+def test_a_never_started_lane_whose_process_is_gone_is_released(env, tmp_path, monkeypatch):
+    """A lane whose run never started (still waiting for its test slots) and whose labelled process is gone,
+    its lock kept open by a stray child, is no place under the cap and the next waiter reclaims it."""
+    from ttp import locks, testslots
+    _lane_env(monkeypatch)
+    state = tmp_path / "state"
+    state.mkdir()
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    g = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, wait_s=0, pending=True)
+    try:
+        testslots.lane_waits(g, testslots.SLOT_WAITS)
+        for f in g.files:
+            locks.relabel(f, {"pid": gone.pid})
+        assert testslots.project_held("pa") == []
+        told = []
+        h = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, wait_s=5, state=state, tell=told.append)
+        assert h and h.files and any("reclaimed a checks lane" in x for x in told), told
+        h.close()
+    finally:
+        g.close()
+
+
 def test_push_checks_wait_for_the_load_guard_without_a_host_slot(env, monkeypatch):
     """#5476: push checks (push.check_slot) waiting under testslots.load_guard() take no host-wide checks
     slot, so other runs keep it; once the guard clears they take one, then their test slots."""

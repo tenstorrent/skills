@@ -4468,7 +4468,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
             # Then the run's share of the host's test-worker slots (testslots), held with the checks slot;
             # in the foreground none free by the end of the same wait hands over to detached checks too.
             left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
-            testslots.lane_waits(suite, "host test slots")
+            testslots.lane_waits(suite, testslots.SLOT_WAITS)
             slot.tests = testslots.acquire(checkcap.label(p.name if p else None), tell, left,
                                            p.config() if p else {}, p.name if p else "", priority=prio, stop=stop,
                                            since=arrived, full=True,   # a full run waits for checks.test_run_min

@@ -422,11 +422,14 @@ def _lane_waits_on(project_name: str, base: str, key: str, q: list, cfg: dict | 
     return [label if held >= n else CAP_LABEL if capped else "nothing (about to start)" for _ in q]
 
 
-def _pid_queued(pid) -> str:
-    """What a lane holder that is not running yet waits on: the host-wide checks slot or the host's
-    test-worker slots (its ticket in their queue), else "" (it is starting, or an older runtime holds it)."""
+def _pid_queued(pid, project_name: str = "") -> str:
+    """What a lane holder that is not running yet waits on: the host-wide checks slot, the host's
+    test-worker slots or its project's test-worker budget (its ticket in their queue), else "" (it is
+    starting, or an older runtime holds it)."""
     for res, what in ((checkcap.RESOURCE, "the host-wide checks slot"),
-                      (testslots.TESTS.resource, "the host's test-worker slots")):
+                      (testslots.TESTS.resource, "the host's test-worker slots"),
+                      *(((f"{testslots.TESTS.own}.{locks.group_id(project_name)}",
+                          f"its project's test-worker budget (checks.{testslots.TESTS.setting(testslots.TESTS.budget)[1]})"),) if project_name else ())):
         for t in _live_tickets(res):
             m = re.match(r"\d+(?:\.\d+)?-(\d+)", t.name)
             if pid and m and int(m.group(1)) == pid:
@@ -959,7 +962,7 @@ def lane_status(project_name: str, now: float | None = None, cfg: dict | None = 
                           "command": str(r.get("command") or ""), "overflow": bool(r.get("overflow")), "urgent": bool(r.get("urgent")),
                           "cost": r.get("cost") or {}, "why": _why(r.get("holder")), **_task_state(db, r),
                           "stalled": _stalled(r, now, cfg),
-                          **({} if running is not None else {"waits_on": _pid_queued(r.get("pid")) or _parked(r)
+                          **({} if running is not None else {"waits_on": _pid_queued(r.get("pid"), project_name) or _parked(r)
                                                                 or "no host queue (starting, or an older runtime)"})})
         q = testslots.suite_order(project_name, _live_tickets(base), now, age=age)
         on = _lane_waits_on(project_name, base, key, q, cfg, labels[key])

@@ -500,10 +500,10 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                          f"(checks.{PUSH_LOAD_WAIT_KEY} {bound:g} s) on its push branch's reserved lane alone"
                          + (f": {k} granted, tests run with {XDIST_ENV}={k}" if k else "") + f"; {load}")
                     if guarded and waits:
-                        waits("host test slots")
+                        waits(SLOT_WAITS)
                     return Grant(k, [f], time.time() - start, kind)
                 if not guarded and waits:
-                    waits(f"host load: {load}")
+                    waits(f"{LOAD_WAITS}{load}")
                 if not guarded or time.time() - told >= TELL_S:
                     told = time.time()
                     tell(f"waiting to start: {load}")
@@ -517,7 +517,7 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
             if guarded:
                 guarded, told = "", 0.0
                 if waits:
-                    waits("host test slots")
+                    waits(SLOT_WAITS)
             s = sizes(cfg, kind=kind)
             if s is None:
                 return Grant(kind=kind)
@@ -883,6 +883,8 @@ def slots_granted(grant) -> None:
     _relabel_lanes(grant, {"granted": True, "granted_at": time.time(), "waits": ""})
 
 
+SLOT_WAITS = "host test slots"   # a lane's waits while its run, past its host-wide checks slot, waits for test slots
+LOAD_WAITS = "host load: "   # its prefix while that wait is under the load guard (acquire)
 PARKED_WAITS = "host test slots (project budget or pool full)"   # a lane's waits while checkcap.acquire parks it
 
 
@@ -890,6 +892,22 @@ def lane_waits(grant, what: str) -> None:
     """Mark the lanes `grant` holds as waiting for `what` (a host-wide checks slot, host test slots)
     before they run: status says so (checklane.holder_text) and such a holder is no likely hang."""
     _relabel_lanes(grant, {"waits": what})
+
+
+def admitted_ahead(project_name: str | None, priority: int | None = None) -> bool:
+    """Whether a run of the project at least as urgent as `priority` already holds a host-wide checks slot
+    and still waits for its test slots: its lane says so (SLOT_WAITS, or LOAD_WAITS under the load guard)
+    or its ticket is in the project's line (acquire). It goes first, so pool_room(full=True) gives no other
+    run of the project a checks slot only to queue behind it: such runs filled the host-wide slots."""
+    if not project_name:
+        return False
+    mine = NO_PRIORITY if priority is None else priority
+    for r in locks.holder_records(lane_paths(project_name, repo=None)):
+        w = str(r.get("waits") or "")
+        if r.get("granted") is False and _rank(r) <= mine and (w == SLOT_WAITS or w.startswith(LOAD_WAITS)):
+            return True
+    return any(min(locks.ticket_priority(t), NO_PRIORITY) <= mine
+               for t in locks.queued(checkcap.slot_dir(), f"{TESTS.own}.{locks.group_id(project_name)}"))
 
 
 def others_wait(project_name: str | None) -> bool:
@@ -917,6 +935,8 @@ def pool_room(cfg: dict | None, project_name: str | None, full: bool = False, pr
     if full and load_guard():
         return False
     if checkcap.starved_ahead(project_name, since):
+        return False
+    if full and admitted_ahead(project_name, priority):
         return False
     s = sizes(cfg)
     if s is None:
