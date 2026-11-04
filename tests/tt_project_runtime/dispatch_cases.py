@@ -1433,3 +1433,129 @@ def test_an_urgent_task_reserves_an_exclusive_slot_over_an_obligation_owner(env,
     assert d._slot_reservers(time.time()) == {"board": hot}
     monkeypatch.setattr(d, "_slot_contenders", lambda now: ({"board": [rows[owner], rows[hot]]}, {}))
     assert d._slot_reservers(time.time()) == {}, "an owner first outranks no urgent contender"
+
+
+def _resume_setup(env, monkeypatch, tmp_path, reap_tmp_processes, **more):
+    """One worker slot. An older backlog task (p3, queued before the waiter), a waiter (p3) that handed
+    off waiting on a file probe (and the hand-off fields `more`) and a holder (p3) running in the only
+    slot. Returns (p, d, drain, go, backlog, waiter, holder, flag): touching flag passes the probe."""
+    p, d, drain, go = _board_setup(env, monkeypatch, tmp_path, board=1)
+    backlog = p.db.add_task("older backlog, never started", "s", kind="work", tier="light", origin="user", priority=3)
+    p.db.update_task(backlog, status="blocked")   # out of the way while the waiter runs
+    waiter = p.db.add_task("waits on its checks", "s", kind="work", tier="light", origin="user", priority=3)
+    flag = tmp_path / "checks-passed"
+    _board_waiting(p, d, tmp_path, waiter, probe=f"test -e {shlex.quote(str(flag))}", **more)
+    p.set_config("budget.max_parallel_workers", 1)
+    d.cfg = p.config()
+    d.update_gates()
+    holder = p.db.add_task("routine work holding the slot", "s", kind="work", tier="light", origin="user",
+                           priority=3)
+    d.dispatch()
+    assert _slot_tasks(p) == [holder]
+    p.db.update_task(backlog, status="queued")
+    return p, d, drain, go, backlog, waiter, holder, flag
+
+
+def _probe_until(p, d, tid, done):
+    """Run probe_waiting until done(task) holds (its probe runs in the background)."""
+    assert _until_true(lambda: d.probe_waiting() or done(p.db.task(tid))), p.db.task(tid)
+
+
+def test_a_passed_wait_outranks_older_new_work_of_its_priority_under_a_full_worker_cap(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """The reported case: every worker slot is taken; a task's checks wait passes while an older,
+    never-started task of the same priority is queued. The woken task is first in line, and takes
+    the slot when it frees."""
+    p, d, drain, go, backlog, waiter, holder, flag = _resume_setup(env, monkeypatch, tmp_path, reap_tmp_processes)
+    try:
+        assert [t["id"] for t in p.db.ready_tasks()] == [backlog]
+        flag.touch()
+        _probe_until(p, d, waiter, lambda t: json.loads(t["result"]).get("woke"))
+        assert [t["id"] for t in p.db.ready_tasks()] == [waiter, backlog], "the passed wait queued behind new work"
+        d.dispatch()
+        assert _slot_tasks(p) == [holder], "the full cap let a task start"
+        go(holder)
+        d.dispatch()
+        assert _slot_tasks(p) == [waiter], "the freed slot went to new work before the passed wait"
+        assert p.db.task(backlog)["status"] == "queued"
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_ready_to_resume_order_keeps_priority_levels_and_puts_the_longest_ready_first(env):
+    """Within a priority the woken waits go first, the one ready longest first; across levels priority
+    (and urgency) still wins: a p2 new task beats a p3 resume, a p1 beats everything."""
+    p = make(env)
+    p.db.x("UPDATE tasks SET status='done'")
+    now = time.time()
+
+    def add(title, prio, woke_at=None):
+        tid = p.db.add_task(title, "s", kind="work", tier="light", origin="user", priority=prio)
+        if woke_at is not None:
+            p.db.update_task(tid, not_before=woke_at, result=json.dumps(
+                {"status": "waiting", "summary": "checks", "retry_when": "true", "woke": "probe passed"}))
+        return tid
+
+    new3 = add("new p3", 3)
+    new2 = add("new p2", 2)
+    late3 = add("p3 woke a minute ago", 3, now - 60)
+    early3 = add("p3 woke an hour ago", 3, now - 3600)
+    res4 = add("p4 woke long ago", 4, now - 7200)
+    new4 = add("new p4", 4)
+    urgent = add("new p1", 1)
+    asleep = add("p3 still waiting", 3)
+    p.db.update_task(asleep, not_before=now - 30, result=json.dumps(
+        {"status": "waiting", "summary": "checks", "retry_when": "true"}))   # its timer ran out, no wake
+    assert [t["id"] for t in p.db.ready_tasks()] == [urgent, new2, early3, late3, new3, asleep, res4, new4]
+
+
+def test_a_passed_wait_with_an_on_pass_cmd_settles_model_free_while_every_slot_is_taken(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """The worker cap is full; the waiter's probe passes and its hand-off names an on_pass_cmd. The
+    daemon runs that command itself and records done: no worker slot, no model run."""
+    cmd = """printf '{"status": "done", "summary": "checks passed; settled"}' > "$TTP_RESULT\""""
+    p, d, drain, go, backlog, waiter, holder, flag = _resume_setup(env, monkeypatch, tmp_path, reap_tmp_processes,
+                                                                   on_pass_cmd=cmd)
+    try:
+        runs = p.db.one("SELECT COUNT(*) AS n FROM runs WHERE task=?", (waiter,))["n"]
+        flag.touch()
+        _probe_until(p, d, waiter, lambda t: waiter in d._on_pass or t["status"] == "done")
+        assert _slot_tasks(p) == [holder], "the settle step took a worker slot"
+        assert _until_true(lambda: d._poll_on_pass(time.time()) or p.db.task(waiter)["status"] == "done"), \
+            p.db.task(waiter)
+        assert json.loads(p.db.task(waiter)["result"])["summary"].startswith("checks passed; settled")
+        assert p.db.one("SELECT COUNT(*) AS n FROM runs WHERE task=?", (waiter,))["n"] == runs, "a model run started"
+        assert _slot_tasks(p) == [holder]
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_resume_wait_fires_once_for_a_passed_wait_not_started_in_15_min_naming_its_hold(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    p, d, drain, go, backlog, waiter, holder, flag = _resume_setup(env, monkeypatch, tmp_path, reap_tmp_processes)
+    try:
+        flag.touch()
+        _probe_until(p, d, waiter, lambda t: json.loads(t["result"]).get("woke"))
+        start = p.db.task(waiter)["not_before"]
+
+        def check(minutes):
+            d._resume_wait_checked = 0.0
+            monkeypatch.setattr(time, "time", lambda: start + minutes * 60)
+            d.check_resume_wait()
+            monkeypatch.undo()
+            return p.db.q("SELECT * FROM events WHERE kind='observation' AND fingerprint LIKE 'resume_wait:%'")
+
+        assert check(0) == [] and check(14) == []
+        events = check(15)
+        assert [e["task"] for e in events] == [waiter], "only the passed wait, not the backlog task"
+        assert f"#{waiter} waits on its checks (p3)" in events[0]["text"] and "slot taken" in events[0]["text"]
+        assert len(check(30)) == 1 and len(check(120)) == 1, "raised again for the same wait"
+        p.set_config("coordinator.resume_wait_min", 0)
+        d.cfg = p.config()
+        p.db.x("DELETE FROM events WHERE fingerprint LIKE 'resume_wait:%'")
+        assert check(60) == [], "resume_wait_min 0 did not turn it off"
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"

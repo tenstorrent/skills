@@ -1048,14 +1048,16 @@ END""")
         """Queued tasks whose dependencies are all finished, in dispatch's pick order: urgent tasks
         first (urgent.is_urgent: priority 1 or an `urgent:` spec line), then required owners
         of an open obligation (its earliest due milestone first, obligations.owner_due), then best
-        priority, then oldest. Read afresh on every call: no order outlives a dispatch pass or a daemon
+        priority, then within a priority a woken wait first (resumefirst.order: the one ready longest
+        first), then oldest. Read afresh on every call: no order outlives a dispatch pass or a daemon
         restart. A task deferred with `start_when` is not ready until its probe passes (see deferral).
         With `later`, also the ones whose retry timer (not_before) has not come yet, in the same order."""
         rows = self.q("SELECT * FROM tasks WHERE status='queued' ORDER BY priority, id") if later else \
             self.q("SELECT * FROM tasks WHERE status='queued' AND (not_before IS NULL OR not_before<=?) "
                    "ORDER BY priority, id", (time.time(),))
         if rows:
-            from . import obligations
+            from . import obligations, resumefirst
+            rows = resumefirst.order(rows)   # within a priority, a woken wait first (resumefirst.py)
             try:
                 due = obligations.owner_due(self)
             except Exception:   # unreadable obligations only lose the boost, never the queue

@@ -623,6 +623,12 @@ prolonged whole-box outage.
   task (below) raises one once it has waited that long since it was queued and anything holds it
   (slots, the spend or auth gate, a pause, a lock, a branch), naming the hold. One per task until it
   runs again.
+- Ready to resume goes first: within one priority, dispatch picks a task whose wait is over (its
+  `retry_when` passed, or its checks, job or on_pass_cmd woke it) before any other queued task, the
+  one ready longest first; priority still wins across levels. A passed wait whose on_pass or
+  on_pass_cmd settles it is recorded by the daemon itself, model-free, with no worker slot. One that
+  is still not started `coordinator.resume_wait_min` (15; 0 turns it off) after it became ready
+  raises one `resume_wait` observation naming it and what holds it.
 - Announced, not started (model-free, observation only): each open promise, each task announced
   in a reply (`reply_chat`) and each `ready:` follow-up (below) that no owner task has started a
   run for within 10 min (5 min when an owner has priority 1) raises one `announced_not_started`

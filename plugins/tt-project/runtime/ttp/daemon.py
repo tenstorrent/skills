@@ -40,6 +40,7 @@ from . import ackwait
 from . import urgentfup
 from . import checksettle
 from . import checksgone
+from . import resumefirst
 from . import rejcool
 from . import stalegate
 from . import indexignore
@@ -1707,7 +1708,7 @@ class Daemon:
         core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
         cycle = self._run_step(lambda: self.host_cycle_held(now), "host_cycle_held", default=False)
         for step in (self.run_schedules, self.check_self_review, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_unstarted, self.check_checks_wait, self.check_checks_owner, self.check_checks_stall, self.check_cap_wait, self.check_progress, self.check_churn, self.check_host_load, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.check_route_models, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.check_self_blocking, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_unstarted, self.check_resume_wait, self.check_checks_wait, self.check_checks_owner, self.check_checks_stall, self.check_cap_wait, self.check_progress, self.check_churn, self.check_host_load, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.check_route_models, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.check_self_blocking, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -7055,6 +7056,52 @@ class Daemon:
         for r in db.q("SELECT fingerprint, task FROM events WHERE kind=? AND status='queued'", (unstarted.READY_KIND,)):
             if r["task"] not in self._unstarted_seen and r["task"] not in self._unstarted_held:
                 obligations._retire(db, now, "started or left the queue", r["fingerprint"])
+
+    def check_resume_wait(self, every_s: float = 60) -> None:
+        """Model-free starvation guard for ready-to-resume work (resumefirst.py): a woken wait still
+        queued coordinator.resume_wait_min (default resumefirst.WAIT_MIN, 0: off) after it became ready
+        raises one `observation` naming it and what holds it now (_start_hold, in words). One per wait
+        (keyed on its last run); none for a wait already raised as slot_wait or ready_not_started, or
+        held by a pause, a logout or the network, which say so themselves. The clock is its record
+        (resumefirst.ready_at), so a daemon restart keeps it. Observation only: dispatch never reads it."""
+        now = time.time()
+        if now - getattr(self, "_resume_wait_checked", 0.0) < every_s:
+            return
+        self._resume_wait_checked = now
+        mins = float(self.cfg["coordinator"].get("resume_wait_min", resumefirst.WAIT_MIN) or 0)
+        if mins <= 0 or self.cfg_status == "unavailable" or self.settling():
+            return
+        db = self.p.db
+        late = [(t, at) for t in db.ready_tasks() if (at := resumefirst.ready_at(t)) is not None
+                and now - at >= mins * 60]
+        if not late:
+            return
+        core = self.cfg.get("core_provider", "claude")
+        ctx = {"now": now, "paused": db.paused_resources(), "committed": None,
+               "busy": {r["provider"]: r["n"] for r in db.q(
+                   "SELECT provider, COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running' "
+                   "GROUP BY provider")},
+               "logged_out": {prov: self._logged_out(prov) for prov in {t["provider"] or core for t, _ in late}}}
+        for t, at in late:
+            tid = t["id"]
+            ran = (db.one("SELECT MAX(id) id FROM runs WHERE task=?", (tid,)) or {}).get("id") or 0
+            fp = f"{resumefirst.FP}:{tid}:{ran}"
+            if db.one("SELECT id FROM events WHERE fingerprint IN (?,?,?)",
+                      (fp, f"slot_wait:{tid}:{ran}", f"{unstarted.READY_KIND}:{tid}:{ran}")):
+                continue
+            why = self._start_hold(t, t["provider"] or core, ctx)
+            if why in ("paused", "logged_out", "net"):
+                continue
+            held = self._hold_words(t, why, ctx) if why else (
+                f"nothing dispatch records as a hold ({t['blocked_reason'][:160]})" if t["blocked_reason"]
+                else "nothing dispatch records as a hold: see the daemon log for its start")
+            text = (f"Resume wait: #{tid} {t['title'][:80]} (p{t['priority']}) finished its wait "
+                    f"{(now - at) / 60:.0f} min ago and has not resumed; held by {held}. It goes before "
+                    f"new work of its priority once that clears: clear the hold if it is ours to clear, "
+                    f"else say why it must wait.")
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                 (now, "daemon", "observation", fp, "normal", text[:4000], "queued", tid))
+            log(self.p, f"resume wait: task {tid} ready {(now - at) / 60:.0f} min, held by {held[:200]}")
 
     # Holds with an alert of their own, or no free slot: ready_not_started leaves them out.
     SKIP_HOLDS = frozenset({"paused", "resource", "device", "logged_out", "net", "gate", "optional", "caps"})

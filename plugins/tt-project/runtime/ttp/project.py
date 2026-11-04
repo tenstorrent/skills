@@ -231,6 +231,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # worker slot is taken: one observation per task names it and the running tasks
                     # holding the slots (Daemon.check_slot_wait; 0: off).
                     "urgent_slot_wait_min": 10,
+                    # A woken wait (its probe passed) not started this long after it became ready:
+                    # one resume_wait observation names what holds it (Daemon.check_resume_wait; 0: off).
+                    "resume_wait_min": 15,
                     # A device resource of the project idle this long while a slot is free, the gate is
                     # green or yellow and nothing queued would start: one idle_capacity event (idlecap.py;
                     # 0: off). Still idle after it: raised again after the rearm, doubling up to 48 h.
