@@ -131,6 +131,11 @@ def check(db, charter: str, text: str, src, agent: bool = False) -> str:
     if agent and len(quote) >= 3 and _loose(quote) in _loose(ctx) and (origin == RELAYER or _loose(quote) not in _loose(own)):
         return _own_cite(text, RELAYER_CITE.format(mid), charter)
     if len(quote) < 3 or _loose(quote) not in _loose(own):
+        if agent:   # the owner's agent's words count: name that fix, never an ask
+            raise ValueError(f"charter_update rejected: quote check failed: `source.quote` is not in message #{mid}'s "
+                             f"words (the source itself was read). Resend with `source` {{\"origin\": \"relayer\", "
+                             f"\"msg\": {mid}, \"quote\": \"<its words, exactly>\"}}: with {relay.AGENT_KEY} on, the "
+                             f"part labelled '{relay.AGENT}' counts as the owner's own words; no ask is needed")
         raise ValueError(f"charter_update rejected: quote check failed: `source.quote` is not in the user's own words "
                          f"of message #{mid} (the source itself was read; a relayer's context does not count); quote "
                          f"them exactly. {SOURCE_FORMS}")

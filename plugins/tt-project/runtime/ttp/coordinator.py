@@ -66,6 +66,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     mitigate,
     msgparts,
     obligations,
+    orderedask,
     outagemsg,
     pauseends,
     plainreply,
@@ -2730,6 +2731,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      f"charter_update (section Restrictions, `quote` it, empty `text`; no user word "
                                      f"or `over` needed) and go on")
                 why = _unclassified_ask(a, least)
+                if why:
+                    _count_refusal(db, key, why[0], text)
+                    raise ValueError(f"ask_user rejected: {why[1]}")
+                why = orderedask.refusal(p, cfg, a, text, least, NOT_COVERED_MIN)   # agent mode: ordered already
                 if why:
                     _count_refusal(db, key, why[0], text)
                     raise ValueError(f"ask_user rejected: {why[1]}")

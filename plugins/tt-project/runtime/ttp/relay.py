@@ -107,12 +107,12 @@ HELD = {"people": "(a) a step that could affect people badly (someone else's wor
                   "draft, a merge, another person's request)",
         "gate": "(c) a hard gate (a credential or money only the owner holds, a spend cap)"}
 _HELD_RE = {
-    "gate": re.compile(r"\b(?:credentials?|passwords?|secrets?|tokens?|api[ _-]?keys?|ssh keys?|sign[- ]?ins?|"
+    "gate": re.compile(r"\b(?:credentials?|passwords?|secrets?|tokens?(?!\s*(?:/\s*s(?:ec)?|per\s+s(?:ec(?:ond)?)?)\b)|api[ _-]?keys?|ssh keys?|sign[- ]?ins?|"
                        r"log[- ]?ins?|funds?|money|payments?|billing|purchas\w*|invoices?|spend(?:ing)?[ _-]?(?:caps?|"
                        r"limits?)|budget|daily_usd|weekly_usd|usd)\b|\$\d", re.I),
     "speaks": re.compile(r"\b(?:merg\w*|ready for review|(?:leav\w*|out of|remov\w*) (?:the )?draft|"
                          r"(?:pull[ -]?requests?|prs?)\b[^.;:,\n]{0,60}?\bdraft\w*|draft[\w-]*(?: of)? (?:pull[ -]?requests?|prs?)|"
-                         r"undraft\w*|reviewers?|post\w*|messag\w*|emails?|slack|announc\w*|in (?:the owner's|"
+                         r"undraft\w*|reviewers?|post(?:s|ed|ing)?|messag\w*|emails?|slack|announc\w*|in (?:the owner's|"
                          r"the user's|their|my) name|as the (?:owner|user)|on (?:the owner's|the user's|my) behalf|"
                          r"another person's|someone else's request)\b", re.I),
     "people": re.compile(r"\b(?:other (?:people|users?|teams?|tenants?|projects?)|others'?|someone else'?s?|"
@@ -121,15 +121,24 @@ _HELD_RE = {
                          r"purg\w*)\b", re.I)}
 
 
+# A held word the text itself negates ("no other tenant", "not shared", "without affecting other teams") states
+# what the step does not do: it is no held step. Only a negation and filler words may come between: "never ask
+# before force-pushing" or "no need to delete" still match.
+_NEGATED = re.compile(r"\b(?:no|not|never|without|nor|none|nothing|don't|doesn't|do not|does not)"
+                      r"(?:\s+(?:a|an|the|any|one|other|another|else|else's|to|on|in|of|by|for|with|affecting|"
+                      r"touching|disturbing|impacting|harming|using|shared))*\s+$", re.I)
+
+
 def held_match(text: str, skip: tuple[str, ...] = ()) -> tuple[str, str]:
     """(the HELD class `text` (what a change lifts or permits) falls in, checked (c), (b), (a), and the
     words that matched its rule), else ("", ""). A record cite ("user msg #12", "message #40") is no
-    message sent: it is read as blank. `skip`: classes not checked."""
+    message sent: it is read as blank, and so is a held word the text negates (_NEGATED: "no other tenant").
+    `skip`: classes not checked."""
     text = _RECORD.sub(" ", text or "")
     for k in ("gate", "speaks", "people"):
-        m = None if k in skip else _HELD_RE[k].search(text)
-        if m:
-            return k, m.group(0)
+        for m in () if k in skip else _HELD_RE[k].finditer(text):
+            if not _NEGATED.search(re.split(r"[,;:.!?()\n]", text[:m.start()])[-1]):
+                return k, m.group(0)
     return "", ""
 
 
