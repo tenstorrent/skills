@@ -64,7 +64,10 @@ def _fetch_prefix_cache_counters(server_url: str) -> dict[str, float]:
     resp = requests.get(f"{server_url.rstrip('/')}/metrics", timeout=30)
     resp.raise_for_status()
     counters = _parse_prometheus_counters(resp.text)
-    return {name: counters.get(name, 0.0) for name in PREFIX_CACHE_COUNTERS}
+    missing = set(PREFIX_CACHE_COUNTERS) - counters.keys()
+    if missing:
+        raise RuntimeError(f"Missing prefix-cache counters: {sorted(missing)}")
+    return {name: counters[name] for name in PREFIX_CACHE_COUNTERS}
 
 
 def _counter_delta(before: dict[str, float], after: dict[str, float]) -> dict[str, Any]:

@@ -1,10 +1,13 @@
 """Exit-code contract for the prefill features gate."""
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -68,6 +71,52 @@ def full_evidence(model: Path, **overrides) -> None:
 def run(model: Path, *extra):
     return subprocess.run([sys.executable, str(CHECKER), '--model-dir', str(model), *extra],
                           text=True, capture_output=True)
+
+
+@pytest.fixture
+def prefill_probe(monkeypatch):
+    # Load the real probe and counter parser with only HTTP and model dependencies stubbed.
+    package = ModuleType('readiness_check')
+    http = SimpleNamespace(get=Mock(), post=Mock(return_value=SimpleNamespace(status_code=404)))
+    with monkeypatch.context() as imports:
+        imports.setitem(sys.modules, 'requests', http)
+        imports.setitem(sys.modules, 'transformers', SimpleNamespace(AutoTokenizer=None))
+        imports.setitem(sys.modules, 'readiness_check', package)
+        for name in ('prefix_cache_check', 'prefill_burst'):
+            spec = importlib.util.spec_from_file_location(
+                name, PLUGIN / 'runtime/readiness_check' / f'{name}.py')
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            setattr(package, name, module)
+    return package.prefill_burst, http
+
+
+@pytest.mark.parametrize('metrics', [
+    '',
+    'vllm:num_requests_running 0\n',
+    'vllm:prefix_cache_queries_total 0\n',
+    'vllm:prefix_cache_hits_total 0\n',
+    'vllm:prefix_cache_queries_total 0\nvllm:prefix_cache_hits_total 0\n',
+])
+@pytest.mark.parametrize('scrape', [0, 1])
+@pytest.mark.parametrize('arm', ['burst', 'serial'])
+def test_burst_gate_requires_observed_cache_counters(tmp_path, prefill_probe, metrics, scrape, arm):
+    probe, http = prefill_probe
+    zero_counters = 'vllm:prefix_cache_queries_total 0\nvllm:prefix_cache_hits_total 0\n'
+    snapshots = [zero_counters, zero_counters]
+    snapshots[scrape] = metrics
+    http.get.side_effect = [SimpleNamespace(text=text, raise_for_status=Mock()) for text in snapshots]
+    measured = probe.run_with_prefix_cache_state('http://server', lambda: {})
+    model = tmp_path / 'model'
+    full_evidence(model, burst=burst(**{f'{arm}_cache': measured['prefix_cache']}))
+    result = run(model, '--require-burst')
+    if metrics == zero_counters:
+        assert result.returncode == 0, result.stderr
+        assert measured['prefix_cache'] == {'reset': False, 'queries': 0, 'hits': 0, 'hit_rate': None}
+    else:
+        assert result.returncode == 2, result.stderr
+        assert f'{arm} arm has no cold-cache evidence' in result.stderr
+        assert measured['prefix_cache'] == {'reset': False, 'queries': None, 'hits': None, 'hit_rate': None}
 
 
 def test_missing_contract_is_critical(tmp_path):
