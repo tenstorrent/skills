@@ -51,17 +51,51 @@ def tool_term_ids(text: str) -> set[str]:
     return out
 
 
-def tool_terms(old: str, new: str, charter: str = "") -> tuple[set[str], set[str]]:
-    """The old item's distinctive terms for restriction_tools: identifiers (_TOOL_TERM_RE) of its
-    changed sentences that neither the new text nor the current `charter` (any section) still has,
-    and its rule words (_rule_words) the new text dropped (all of the changed sentences' when it
-    dropped fewer than two)."""
+def tool_terms(old: str, new: str, charter: str = "",
+               lines: list[str] | tuple = ()) -> tuple[set[str], set[str], set[str]]:
+    """The old item's distinctive terms for restriction_tools, as (ids, words, exact): identifiers
+    (_TOOL_TERM_RE) of its changed sentences that neither the new text nor the current `charter` (any
+    section) still has, and its rule words (_rule_words) the new text dropped. When the new text dropped
+    fewer than two, or all of them (a removal or retirement), the words are all of the changed
+    sentences' but only the distinctive ones (distinctive_words over the scanned tool `lines`), and
+    `exact` holds the changed sentences' quoted phrases and user-message cites (exact_terms), which
+    hit on their own; else `exact` is empty."""
     from .coordinator import _changed_sentences, _rule_words
     changed = " ".join(_changed_sentences(old, new)) or old
     ids = tool_term_ids(changed)
     ids = {t for t in ids if t not in new and t not in charter and not re.fullmatch(r"[\d./-]+", t)}
-    words = _rule_words(changed) - _rule_words(new)
-    return ids, (words if len(words) >= 2 else _rule_words(changed))
+    every = _rule_words(changed)
+    words = every - _rule_words(new)
+    if 2 <= len(words) < len(every):
+        return ids, words, set()
+    return ids, distinctive_words(every, lines), exact_terms(changed, new + "\n" + charter)
+
+
+COMMON_SHARE = 0.05   # a stem on more than this share of the scanned tool lines is too common to match
+COMMON_MIN = 3        # ... and on more than this many lines (a small tool tree cuts nothing)
+
+
+def distinctive_words(words: set[str], lines: list[str] | tuple) -> set[str]:
+    """The stems of `words` found (as word starts) on at most COMMON_SHARE of the non-blank `lines`,
+    or on at most COMMON_MIN of them: 'work', 'project' or 'fail' of a long item match almost any line."""
+    low = [x.lower() for x in lines if x.strip()]
+    most = max(COMMON_MIN, COMMON_SHARE * len(low))
+    return {w for w in words
+            if sum(1 for x in low if re.search(rf"\b{re.escape(w)}", x)) <= most}
+
+
+_QUOTED = re.compile(r"[\"“]([^\"”\n]{4,80})[\"”]|(?<!\w)['‘]([^'’\n]{4,80})['’](?!\w)")
+
+
+def exact_terms(changed: str, kept: str = "") -> set[str]:
+    """What a tool enforcing the item would carry word for word: its quoted phrases of two or more words
+    (lowercased, spaces folded) that `kept` (the new text and charter) no longer has, and its user-message
+    cites, as "#N" (restriction_source.CITE_RE)."""
+    from .restriction_source import CITE_RE
+    keep = " ".join(kept.lower().split())
+    out = {p for m in _QUOTED.finditer(changed) if len((p := " ".join((m[1] or m[2]).lower().split())).split()) >= 2
+           and p not in keep}
+    return out | {"#" + re.search(r"\d+$", m.group())[0] for m in CITE_RE.finditer(changed)}
 
 
 def enabled_schedules(text: str) -> str:
@@ -85,12 +119,20 @@ def enabled_schedules(text: str) -> str:
         i = end
 
 
-def tool_hit(line: str, ids: set[str], words: set[str]) -> bool:
-    """A line names an identifier of the old item, or two of its rule words (as word starts)."""
-    if any(t in line for t in ids):
-        return True
+def tool_hit(line: str, ids: set[str], words: set[str], exact: set[str] = frozenset()) -> list[str]:
+    """What a line names of the old item: an identifier, a quoted phrase or user-message cite of
+    `exact` (exact_terms), or else two or more of its rule words (as word starts); [] when none."""
+    from .restriction_source import CITE_RE
+    got = sorted(t for t in ids if t in line)
     low = line.lower()
-    return sum(bool(re.search(rf"\b{re.escape(w)}", low)) for w in words) >= 2
+    if exact:
+        folded = " ".join(low.split())
+        cites = {"#" + re.search(r"\d+$", m.group())[0] for m in CITE_RE.finditer(line)}
+        got += sorted(t for t in exact if (t in cites if t.startswith("#") else t in folded))
+    if got:
+        return got
+    got = sorted(w for w in words if re.search(rf"\b{re.escape(w)}", low))
+    return got if len(got) >= 2 else []
 
 
 def still_stated(charter: str, old: str) -> str:
@@ -150,7 +192,8 @@ def restriction_tools(p: Project, loosened: list[tuple], batch: list[int]) -> li
     the old wording: files under bin/ and hooks/ (project root and harness), harness/schedules.json,
     and the command and heal check of each enabled schedule, whose lines name an identifier of the old item
     or two of its dropped rule words (tool_terms; an identifier the current charter still states anywhere
-    is not one). A disabled schedule, in the table or its schedules.json entry, is left out. `loosened`: (old item, new text, over[,
+    is not one; a removed or retired item matches only its distinctive words, quoted phrases and cites),
+    each named with the terms it matched. A disabled schedule, in the table or its schedules.json entry, is left out. `loosened`: (old item, new text, over[,
     advisory]), `over` empty for the user's word, else the end that retired the item; `advisory`: the dropped
     items were all unsourced (restriction_source.drops_unsourced), so whoever dropped them and with any `over`,
     one the Brief or a sourced item still states is left out, as is `over` "unsourced". A file a task of this batch
@@ -196,13 +239,15 @@ def restriction_tools(p: Project, loosened: list[tuple], batch: list[int]) -> li
     for old, new, over, *advisory in loosened:
         if (over == "unsourced" or any(advisory)) and still_stated(charter, old):
             continue   # a dropped advisory copy of a rule the Brief or a sourced item still binds: tools stay right
-        ids, words = tool_terms(old, new, charter)
+        ids, words, exact = tool_terms(old, new, charter, [x for _, t in files for x in t.splitlines()])
         hits = []
         for label, text in files:
-            line = next((n for n, x in enumerate(text.splitlines(), 1) if tool_hit(x, ids, words)), 0)
+            line, got = next(((n, g) for n, x in enumerate(text.splitlines(), 1) if (g := tool_hit(x, ids, words, exact))),
+                             (0, []))
             if not line or label in named or (not label.startswith("schedule ") and Path(label).name in named):
                 continue
-            hits.append(label + (f":{line}" if not label.startswith("schedule ") else ""))
+            hits.append(label + (f":{line}" if not label.startswith("schedule ") else "")
+                        + f" ({', '.join(clip(g, 40) for g in got[:4])})")
         if not hits:
             continue
         x = ((f"`over` retired the Restrictions item \"{clip(old, 200)}\" ({clip(over, 150)})" if over

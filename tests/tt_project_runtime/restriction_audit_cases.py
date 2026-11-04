@@ -148,3 +148,67 @@ def test_a_text_about_the_ban_or_quoting_the_item_cites_it_and_the_line_lists_th
     p.config_path.write_text(json.dumps(cfg))
     (line,) = _audit(p)
     assert line.endswith(f"(cited by tasks #11 and asks {ask_id})"), line
+
+
+# restriction_tools on a long retired item: only its distinctive words, quoted phrases and cite match.
+_LONG = ("Never restart a worker service or take a project build offline while the nightly fleet queue keeps "
+         "failing jobs; hold the 'quiet window' until the queue drains, the power budget recovers and the old "
+         "workers keep serving (user msg #42).")
+_COMMON = ("# keep the project build working\n", "echo \"job failed: retry the queue later\"\n",
+           "restart the service when power is back\n", "take the lock, then hold it until done\n",
+           "# a quiet run; the window budget is fine\n")
+
+
+def _long_tree(p, n=40):
+    """`n` bin/ tools of lines that share only common words with _LONG, and two that enforce it."""
+    (p.root / "bin").mkdir(exist_ok=True)
+    (p.harness / "hooks").mkdir(exist_ok=True)
+    for i in range(n):
+        (p.root / "bin" / f"tool{i}.sh").write_text("#!/bin/sh\n" + "".join(_COMMON))
+    (p.root / "bin" / "hold.sh").write_text("#!/bin/sh\n# enforces user msg #42\nexit 0\n")
+    (p.harness / "hooks" / "drain.sh").write_text("#!/bin/sh\nwait for the fleet to drain before going offline\n")
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never merge. (user msg #1)\n")
+
+
+def test_a_long_retired_item_flags_only_the_tools_citing_or_enforcing_it(env):
+    """A long retired item's common stems ('work', 'project', 'fail', 'keep', 'serv') are on most tool
+    lines: only its distinctive words and its cite match, and each file is named with what it matched."""
+    from ttp import restriction_audit
+    p = make(env)
+    _long_tree(p)
+    out = restriction_audit.restriction_tools(p, [(_LONG, "", "the fleet was retired")], [])
+    assert len(out) == 1, out
+    assert "bin/hold.sh:2 (#42)" in out[0], out
+    assert "hooks/drain.sh:2 (drain, fleet, offlin)" in out[0] and "bin/tool" not in out[0] and " more" not in out[0], out
+    # A cite of another message is no cite of this item; a line of common stems alone matches nothing.
+    ids, words, exact = restriction_audit.tool_terms(_LONG, "", "", [x for i in range(40) for x in _COMMON])
+    assert "#42" in exact and not {"work", "project", "fail", "keep", "serv", "queue"} & words, words
+    assert restriction_audit.tool_hit("see user msg #420", ids, words, exact) == []
+    assert restriction_audit.tool_hit("see user msg #42.", ids, words, exact) == ["#42"]
+    assert restriction_audit.tool_hit(_COMMON[1] + _COMMON[2], ids, words, exact) == []
+
+
+def test_a_quoted_phrase_and_a_short_item_still_hit(env):
+    """A quoted phrase of the item hits word for word even when its words are common; a short item on a
+    small tool tree keeps every rule word, and a partial loosening keeps its dropped words as before."""
+    from ttp import restriction_audit
+    lines = [x for i in range(40) for x in _COMMON]
+    ids, words, exact = restriction_audit.tool_terms(_LONG, "", "", lines)
+    assert "quiet window" in exact and not {"quiet", "window"} & words
+    assert restriction_audit.tool_hit("  # keep the  Quiet\tWindow open", ids, words, exact) == ["quiet window"]
+    assert restriction_audit.tool_hit("a quiet night by the window", ids, words, exact) == []
+    # The charter still quoting the phrase keeps it out.
+    assert "quiet window" not in restriction_audit.tool_terms(_LONG, "", "the 'quiet window' holds", lines)[2]
+    short = "Never reboot the build farm (user msg #7)."
+    ids, words, exact = restriction_audit.tool_terms(short, "", "", ["#!/bin/sh", "skip reboot on the farm"])
+    assert {"reboot", "farm", "build"} <= words and exact == {"#7"}
+    assert restriction_audit.tool_hit("skip reboot on the farm", ids, words, exact) == ["farm", "reboot"]
+    # A loosening that dropped two or more of the words (not all) matches those, uncut, as before.
+    got = restriction_audit.tool_terms(_LONG, "Workers may restart a service; hold the 'quiet window'.", "", lines)
+    assert "work" not in got[1] and {"project", "fail"} <= got[1] and got[2] == set(), got
+    p = make(env)
+    (p.root / "bin").mkdir(exist_ok=True)
+    (p.root / "bin" / "farm.sh").write_text("#!/bin/sh\n# skip reboot while the farm is busy\n")
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never merge. (user msg #1)\n")
+    out = restriction_audit.restriction_tools(p, [(short, "", "the farm is gone")], [])
+    assert len(out) == 1 and "bin/farm.sh:2 (farm, reboot)" in out[0], out
