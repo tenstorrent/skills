@@ -933,6 +933,38 @@ def test_a_stopped_sandboxed_secret_env_withdraws_its_queued_request(env, monkey
     assert signal.getsignal(signal.SIGTERM) is not secretroute._raise_stopped   # the handler is restored
 
 
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+@pytest.mark.parametrize("sig", ["SIGTERM", "SIGINT"])
+def test_a_stop_a_finalizer_swallowed_still_withdraws_the_queued_request(env, monkeypatch, capfd, sig):
+    """A stop handled while a finalizer runs (a __del__ the garbage collector called mid-wait) raises
+    there, and Python drops that exception: the wait still ends on it at once, not at its deadline."""
+    import signal
+    from ttp import detach, secretroute
+    p, rd = _queued_route(env, monkeypatch, capfd, "9007")
+    monkeypatch.setattr(secretroute, "START_WAIT_S", 30)
+    old_int = signal.signal(signal.SIGINT, signal.default_int_handler)
+    real_state, fired = detach.state, []
+
+    class Finalized:
+        def __del__(self):
+            fired.append(sig)
+            signal.raise_signal(getattr(signal, sig))   # its exception ends here, ignored
+
+    def state(rc):
+        if not fired:
+            Finalized()
+        return real_state(rc)
+    monkeypatch.setattr(detach, "state", state)
+    try:
+        code, out = _env_run(monkeypatch, capfd, "--secret", "jev:key=JK", "--", "true")
+    finally:
+        signal.signal(signal.SIGINT, old_int)
+    assert fired == [sig], out
+    assert code == 128 + getattr(signal, sig) and f"stopped by {sig}" in out and "nothing ran" in out, out
+    _never_ran(p, rd)
+    assert secretroute._raise_stopped not in (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT))
+
+
 def test_withdrawing_a_request_never_races_the_daemon_into_a_late_start(env, monkeypatch, capfd):
     """The daemon read the request, then the caller withdrew it before the daemon took the job's lock:
     the daemon never starts it. Once the daemon holds the lock, a withdrawal reports it started."""

@@ -86,12 +86,16 @@ def _shown(alias: str | None, specs: list[str], argv: list[str]) -> list[str]:
     return ["ttp", "secret", "env", *([alias] if alias else []), *(f"--secret={s}" for s in specs), "--", *argv]
 
 
-class _Stopped(Exception):
+class _Stopped(BaseException):   # as KeyboardInterrupt: no `except Exception` takes it
     def __init__(self, sig: int):
         self.sig = sig
 
 
+_SEEN: list[int] = []   # stops _raise_stopped took in this run: one whose exception was dropped still ends the wait
+
+
 def _raise_stopped(sig, frame):
+    _SEEN.append(sig)
     raise _Stopped(sig)
 
 
@@ -116,11 +120,14 @@ def run(alias: str | None, specs: list[str], argv: list[str], out=None) -> int:
     name = f"secret-env-{uuid.uuid4().hex[:8]}"
     rc, log = rd / f"{name}.rc", rd / f"{name}.log"
     cmd = job_command(alias, specs, argv)
-    old_int = None
+    old_int = old_term = None
+    _SEEN.clear()
     try:
         old_term = signal.signal(signal.SIGTERM, _raise_stopped)
-    except ValueError:   # not the main thread: SIGTERM keeps its handler
-        old_term = None
+        if signal.getsignal(signal.SIGINT) is signal.default_int_handler:   # a caller's own SIGINT handling stays
+            old_int = signal.signal(signal.SIGINT, _raise_stopped)
+    except ValueError:   # not the main thread: SIGTERM and SIGINT keep their handlers
+        pass
     try:
         with _held_signals():   # a stop mid-enqueue would leave a request without the marker that withdraws it
             # its own start deadline: a caller killed without withdrawing it (SIGKILL) never sees a late start
@@ -135,7 +142,8 @@ def run(alias: str | None, specs: list[str], argv: list[str], out=None) -> int:
     except (KeyboardInterrupt, _Stopped) as e:
         sig = e.sig if isinstance(e, _Stopped) else signal.SIGINT
         if old_term is not None:   # stopping already: a second SIGINT or SIGTERM never cuts the report
-            old_int = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            int_now = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            old_int = int_now if old_int is None else old_int   # the caller's, put back below
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
         with _held_signals():   # a second stop never cuts the withdrawal short
             withdrawn = detach.withdraw_unstarted(rc, f"{detach.WITHDRAWN} (its caller got {signal.Signals(sig).name})")
@@ -162,6 +170,8 @@ def _wait(rc: Path, log: Path, out, deadline: float) -> int:
     while True:
         pos = _copy(log, pos, out)
         st, why = detach.state(rc)
+        if _SEEN:   # a stop raised inside a finalizer (Python drops that exception): acted on here
+            raise _Stopped(_SEEN[0])
         if st == "ended":
             _copy(log, pos, out)
             return int(why) if why.lstrip("-").isdigit() else 1
