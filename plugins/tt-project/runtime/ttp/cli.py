@@ -1630,8 +1630,11 @@ def status_text(p: Project, verbose: bool = False) -> str:
     lines.extend(h.get("obligations") or [])
     from . import eta
     try:   # urgent tasks and open promises with their expected finish (critical path)
-        if got := eta.state_lines(db, p, now)[1:]:
-            lines += ["expected finish (critical path, measured medians):"] + ["  " + x[2:] for x in got]
+        lane = {t["id"] for t in db.q("SELECT id FROM tasks WHERE status IN ('queued','review')")}
+        got = ["  " + x[2:] for x in eta.state_lines(db, p, now)[1:]   # the urgent lane below shows its own
+               if not (m := re.match(r"- #(\d+) ", x)) or int(m[1]) not in lane]
+        if got:
+            lines += ["expected finish (critical path, measured medians):"] + got
     except Exception as e:
         lines.append(f"expected finish: not read ({type(e).__name__})")
     from . import mitigate
@@ -1687,8 +1690,16 @@ def status_text(p: Project, verbose: bool = False) -> str:
         r["extra"] += extra or []
     hot = [t for t in db.q("SELECT * FROM tasks WHERE status IN ('queued','review') ORDER BY priority, id")
            if urgent.is_urgent(t)]
-    for t in hot[:8]:   # the urgent lane: each waiting urgent task, with how long it has waited
-        row(t, f"{t['status']} ({urgent.mark(db, t, now)})", f"urgent: {urgent.shown_why(db, t, now)}")
+    try:
+        est = eta._Est(db, now)
+    except Exception:
+        est = None
+    for t in hot[:8]:   # the urgent lane: each waiting urgent task, with how long it has waited and its ETA
+        try:
+            fin = f", {eta.field(e, p, now)}" if est and (e := est.task(t["id"]))["end"] else ""
+        except Exception:
+            fin = ""
+        row(t, f"{t['status']} ({urgent.mark(db, t, now)}{fin})", f"urgent: {urgent.shown_why(db, t, now)}")
     for t in h["waiting"][:5]:
         why = re.sub(r";? *next try \S+$", "", t["blocked_reason"] or "").strip()
         row(t, f"waiting, next try {at(t['not_before'], now, tz)}", why,
