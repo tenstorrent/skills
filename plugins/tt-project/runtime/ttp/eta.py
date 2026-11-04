@@ -14,7 +14,8 @@ last WINDOW_S days), never a worst case or padding:
 - review and landing: a code task then waits the median review (hand-off to review done) and the
   median push-queue row from approval to pushed or landed, each only when the project did one in the
   window (else the leg is not part of its path). A task in review or with an approved row has only
-  what is left of those.
+  what is left of those; a done one whose open review task (db.reviews_task) has not approved it yet
+  lands at that review task's own estimate plus the landing leg.
 A blocked, failed or cancelled task on the path, or a leg with no measured sample, gives no
 estimate ('no estimate yet', with why): never a guess.
 
@@ -96,6 +97,7 @@ class _Est:
         self.h = history(db, now) if hist is None else hist
         self.memo: dict[int, dict] = {}
         self._review_since = None
+        self._reviews = None
 
     def _run(self, t: dict) -> list[float]:
         return self.h["run"].get((t["kind"], t["tier"])) or self.h["kind"].get(t["kind"]) or []
@@ -114,6 +116,32 @@ class _Est:
         out = self._task(t, tid, seen + (tid,))
         self.memo[tid] = out
         return out
+
+    def _open_review(self, t: dict) -> int | None:
+        """The open review task (db.reviews_task) of a done code task: it is not landed until that review
+        approves it and its push-queue row lands."""
+        from .db import reviews_task
+        if self._reviews is None:
+            self._reviews = self.db.q("SELECT * FROM tasks WHERE kind='review' AND status NOT IN (?,?,?) ORDER BY id",
+                                      CLOSED)
+        return next((r["id"] for r in self._reviews if reviews_task(r, t)), None)
+
+    def _after_review(self, tid: int, rv: int, seen: tuple) -> dict:
+        """A done code task awaiting review task `rv`: done now, landed at that review's end plus the median
+        landing (when the project has one)."""
+        if rv in seen:
+            return self._none(tid, f"#{tid} has a dependency cycle")
+        # The review depends on this task, which is done: it may start now (task() replaces this memo).
+        self.memo[tid] = {"done": self.now, "end": self.now, "path": [tid], "legs": [], "why": None, "overrun": False}
+        e = self.task(rv, tuple(x for x in seen if x != tid))
+        if e["why"]:
+            return {**self._none(tid, e["why"]), "path": [tid] + e["path"]}
+        legs, end = list(e["legs"]), e["end"]
+        if self.h["land"]:
+            legs.append(("landing", _med(self.h["land"])))
+            end += legs[-1][1]
+        return {"done": self.now, "end": end, "path": [tid] + e["path"], "legs": legs, "why": None,
+                "overrun": e["overrun"]}
 
     def _none(self, tid, why: str) -> dict:
         return {"done": None, "end": None, "path": [tid], "legs": [], "why": why, "overrun": False}
@@ -135,6 +163,8 @@ class _Est:
                     row = self.db.one("SELECT created, status FROM push_queue WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
                 except Exception:
                     row = None
+            if not row and code and st == "done" and (rv := self._open_review(t)):
+                return self._after_review(tid, rv, seen)
             if not row or row["status"] in PUSH_FINAL:
                 return {"done": now, "end": now, "path": [tid], "legs": [], "why": None, "overrun": False}
             if not self.h["land"]:

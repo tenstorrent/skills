@@ -481,7 +481,8 @@ EXTRA_KEYS = {
     # promise_default_h: when a chat promise that names no time is due (obligations.py; default 6).
     # mitigation_due_h: when a live-impact mitigation is due after it is filed (mitigate.py; default 4, 0 off).
     # course_check: thresholds of the digest's Course check ({"fails_24h", "queued_h", "spend_ratio", ...}; course.py;
-    #   self-review: "missed_deadlines", "same_wait", "self_races", "rule_clash", "recurring"; coursecheck.py).
+    #   self-review: "missed_deadlines", "same_wait", "self_races", "rule_clash", "recurring"; coursecheck.py;
+    #   "long_promise_h": a promise on urgent work due later than this is flagged, eta.py, default 2).
     # progress_check: thresholds of the progress and stall check ({"task_h", "probe_n", "repeat_n", ...}; progress.py).
     # probe_stall_dispose_h: when the blocker sweep settles a probe stall model-free (sweep.py; default 1, 0 off).
     # echo_paths: more files or folders (relative to the project root) the retired-rule echo scan reads,

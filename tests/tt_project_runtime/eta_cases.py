@@ -61,6 +61,35 @@ def test_eta_code_task_adds_measured_review_and_landing_and_overrun(env):
     assert e["overrun"] and e["done"] == pytest.approx(now) and "overrunning" in eta.field(e, p, now)
 
 
+def test_eta_done_code_task_awaiting_its_review_is_not_landed(env):
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    _eta_history(p, now, kind="code", runs=(1000,), wait=100)
+    _eta_history(p, now, kind="review", runs=(1700,), wait=100)
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+           (1, "b", "h", "t", "pushed", now - 3000, now - 2400))   # median landing 600
+    t = p.db.add_task("the fix", "s", kind="code", status="done", reply_chat="c1")
+    # Handed off, no push row yet: its queued review (which depends on it) still runs, then it lands.
+    rv = p.db.add_task(f"Review #{t}: the fix", "s", kind="review", depends_on=[t], labels=[f"auto_review:{t}"])
+    e = eta.estimate(p.db, t, now)
+    assert e["why"] is None and e["path"] == [t, rv]
+    assert [k for k, _ in e["legs"]] == ["queue", "run", "landing"]
+    assert e["done"] == pytest.approx(now) and e["end"] == pytest.approx(now + 100 + 1700 + 600) and e["end"] > now
+    o = _eta_promise(p, t, "c1", "I'll post here when it's live.", now)
+    assert eta.obligation_estimate(p.db, o, now)["end"] > now
+    # A review task of another task, or a closed review, leaves it landed (delivered another way).
+    p.db.update_task(rv, status="done")
+    assert eta.estimate(p.db, t, now)["end"] == pytest.approx(now)
+    other = p.db.add_task("other fix", "s", kind="code", status="done")
+    p.db.add_task(f"Review #{other}: other", "s", kind="review", depends_on=[other])
+    assert eta.estimate(p.db, t, now)["end"] == pytest.approx(now)
+    # An approved row means the review is over: only the landing left.
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+           (other, "b2", "h", "t", "queued", now, now))
+    assert [k for k, _ in eta.estimate(p.db, other, now)["legs"]] == ["landing"]
+
+
 def test_eta_no_history_says_no_estimate_yet(env):
     from ttp import eta
     p = make(env)
