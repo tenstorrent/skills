@@ -2966,7 +2966,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     # agent mode: a turn of the owner's agent's words alone (findings) is the owner's turn
                     via = [m["id"] for m in relay.recent(db, messages)] if agent and messages and ok is None else []
                     # a yes on record or a findings turn is theirs already; `over` retires on the coordinator's word
-                    cited = cited if ok is None and not via and len(over) < OVER_MIN else []
+                    queue = cited if ok is None and len(over) < OVER_MIN else []   # a findings turn queues it too
+                    cited = [] if via else queue
                     uturn = user_turn or bool(via) or bool(cited)
                     unsourced, agent_cite, cite = "", False, ""   # an added or changed item records its
                     if text and _DATED.sub("", section).lower().startswith("restriction"):   # source; the user's
@@ -3047,8 +3048,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         if user_turn and str(e) != unsourced and not (
                                 turn_src and _restriction_edit(p, section, quote, replaces)):
                             _record_charter_approval(p, messages or [], section, quote, replaces, text, end, str(e))
-                        elif cited and restr and str(e) != unsourced:
-                            raise ValueError(_queue_cited_restriction(p, cited, cited_agent, section, quote,
+                        elif queue and restr and str(e) != unsourced:
+                            raise ValueError(_queue_cited_restriction(p, queue, cited_agent, section, quote,
                                                                       replaces, text, end, str(e))) from None
                         raise
                     if quote or replaced:   # the retired text, searched for in what still binds (echoes)

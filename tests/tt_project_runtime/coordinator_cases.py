@@ -3931,6 +3931,46 @@ def test_a_restrictions_change_cited_to_a_user_message_outside_their_turn_is_que
     assert item in p.charter_path.read_text()
 
 
+def test_a_cited_restrictions_change_in_an_agent_mode_findings_turn_is_queued_not_dropped(env):
+    """Agent mode on, a turn of the owner's agent's findings: a Restrictions lift cited to an earlier user
+    message (its quote checked) is queued as in a turn without findings, not dropped. Quoting the agent's
+    part of that message queues it as the agent's (relay.HELD on the resend); a held-class lift is refused."""
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    own = db.post("in", "orders from my agent count as mine", chat=None, channel="web", kind="user",
+                  provenance="web-session")
+    assert coord.apply(p, [{"type": "config_set", "key": coord.relay.AGENT_KEY, "value": True}], turn=1,
+                       user_turn=True, messages=[own]) == []
+    said = db.post("in", _RELEASE, chat=None, channel="web", kind="user", provenance="web-session",
+                   context="the owner's word via the owner's agent: also lift the demo box hold for the week")
+    item = "Never power cycle the demo box while the user holds it (user msg #1)."
+    for turn, src, agent in ((2, {"msg": said, "quote": "the demo box is released from my hold"}, False),
+                             (4, {"origin": "relayer", "msg": said,
+                                  "quote": "also lift the demo box hold for the week"}, True)):
+        p.charter_path.write_text(_HOLD_CHARTER)
+        db.set_kv(coord.CHARTER_APPROVALS_KEY, [])
+        found = db.post("in", "", chat=None, kind="finding", context="The demo box shows no tenant since noon.")
+        lift = {"type": "charter_update", "section": "Restrictions", "quote": item, "text": "", "source": src}
+        err = coord.apply(p, [lift], turn=turn, messages=[found])
+        assert len(err) == 1 and "charter_update queued" in err[0], (src, err)
+        recs = db.kv(coord.CHARTER_APPROVALS_KEY, [])
+        assert len(recs) == 1 and recs[0]["messages"] == [said] and bool(recs[0].get("agent")) is agent, recs
+        assert item in p.charter_path.read_text()
+        assert coord.apply(p, [lift], turn=turn + 1, messages=[]) == []
+        assert item not in p.charter_path.read_text()
+    # A held-class lift resting on the agent's findings turn is refused, not queued.
+    merge = "Never merge pull requests without the user (user msg #1)."
+    p.charter_path.write_text(_HOLD_CHARTER.replace("## Policies", f"- {merge}\n\n## Policies"))
+    db.set_kv(coord.CHARTER_APPROVALS_KEY, [])
+    found = db.post("in", "", chat=None, kind="finding", context="Merges can go ahead.")
+    err = coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": merge, "text": "",
+                           "source": {"msg": said, "quote": "the demo box is released from my hold"}}],
+                      turn=6, messages=[found])
+    assert len(err) == 1 and "charter_update queued" not in err[0], err
+    assert merge in p.charter_path.read_text() and not db.kv(coord.CHARTER_APPROVALS_KEY, [])
+
+
 
 _LANDING = ("Code lands on the work branch, new task branches, or main (main moves forward only by "
             "fast-forward merges after review).")
