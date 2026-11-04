@@ -241,7 +241,8 @@ def _board_waiting(p, d, tmp_path, tid, probe="ttp lock --probe board", **more):
     assert _until_true(lambda: d.reap_runs() or p.db.task(tid)["status"] == "queued" and tid not in _slot_tasks(p))
     res.unlink()
     t = p.db.task(tid)
-    assert json.loads(t["result"])["status"] == "waiting" and t["not_before"] > time.time() + 3000, t
+    # a priority-1 task's hour-long timer is capped at waiting.urgent_retry_cap_s: still far off for the test
+    assert json.loads(t["result"])["status"] == "waiting" and t["not_before"] > time.time() + 240, t
 
 
 def test_a_freed_exclusive_slot_goes_to_the_higher_priority_task_waiting_for_it(env, monkeypatch, tmp_path,

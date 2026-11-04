@@ -4357,7 +4357,7 @@ def test_a_task_waiting_on_a_down_machine_runs_its_heal_fix_at_once_and_retries_
     _ssh_255(p, up=True)
     d._probed[tid] -= downwait.BACKOFF_S[1] + 1
     _settle_probe(d, tid)
-    assert _ready(p, tid) and downwait.episodes(p.db) == {} and d._probe_gap(tid) == dmod.PROBE_EVERY_S
+    assert _ready(p, tid) and downwait.episodes(p.db) == {} and d._probe_gap(tid) == d._poll_s()
 
 
 def test_a_down_machine_is_not_acted_on_under_a_pause_a_held_lock_or_an_open_machine_change(env):
