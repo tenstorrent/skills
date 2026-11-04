@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Urgent lane: a time-sensitive task never waits behind routine work.
 
-A task is urgent when its priority is 1 (or better) or its spec has a line `urgent: <why>`.
+A task is urgent when its priority is 1 (or better) or its spec has a line `urgent: <why>`, and so is
+the harness task finishing a template merge after an upgrade (leads): until it ends the project runs
+an older release, so it leads the lane, ahead of priority-1 work. One holds the merge at a time
+(release.take_finish_lock), so it cannot starve other work.
 
 - Worker start: db.ready_tasks puts urgent tasks before every other ready task (obligation owners
   included). With every worker slot of its provider taken, an urgent task starts in up to
@@ -29,6 +32,8 @@ from __future__ import annotations
 import json
 import re
 
+from .release import UPGRADE_TASK_TITLE
+
 PRIORITY = 1                    # a task at this priority or better is urgent
 # A spec line `urgent: <why>`; `urgent: no` (none, not, false, n/a) says it is not.
 LINE = re.compile(r"^[ \t]*urgent:[ \t]*(?!(?:no|none|not|false|n/?a)\b)(\S.*)$", re.I | re.M)
@@ -50,17 +55,26 @@ def _priority(task: dict) -> int:
         return 3
 
 
+def leads(task: dict | None) -> bool:
+    """The harness task finishing a template merge after an upgrade (release.UPGRADE_TASK_TITLE)."""
+    return bool(task) and task.get("kind") == "harness" and task.get("title") == UPGRADE_TASK_TITLE
+
+
 def is_urgent(task: dict | None) -> bool:
-    """Priority 1 or better, or an `urgent: <why>` line in the spec."""
+    """Priority 1 or better, an `urgent: <why>` line in the spec, or the template-merge task (leads)."""
     if not task:
         return False
-    return _priority(task) <= PRIORITY or bool(LINE.search(str(task.get("spec") or "")))
+    return _priority(task) <= PRIORITY or bool(LINE.search(str(task.get("spec") or ""))) or leads(task)
 
 
 def why(task: dict) -> str:
     """The spec's `urgent:` reason, else "priority 1"; "" for a task that is not urgent."""
     m = LINE.search(str(task.get("spec") or ""))
-    return m.group(1).strip()[:160] if m else f"priority {_priority(task)}" if is_urgent(task) else ""
+    if m:
+        return m.group(1).strip()[:160]
+    if leads(task) and _priority(task) > PRIORITY:
+        return "finishes a template upgrade"
+    return f"priority {_priority(task)}" if is_urgent(task) else ""
 
 
 def new_line(old_spec: str | None, new_spec: str | None) -> bool:
@@ -113,8 +127,9 @@ def shown_why(db, task: dict, now: float) -> str:
 
 
 def first(rows: list[dict]) -> list[dict]:
-    """`rows` with the urgent ones first, each part in its own order (a stable sort)."""
-    return sorted(rows, key=lambda r: not is_urgent(r))
+    """`rows` with the urgent ones first, the template-merge task (leads) before the rest of them, each
+    part in its own order (a stable sort)."""
+    return sorted(rows, key=lambda r: (not is_urgent(r), not leads(r)))
 
 
 def extra_slots(cfg: dict) -> int:

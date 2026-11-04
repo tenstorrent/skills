@@ -25,6 +25,24 @@ def test_a_task_is_urgent_at_priority_one_or_with_an_urgent_spec_line_only():
     assert urgent.extra_slots({"budget": {"urgent_extra_slots": "x"}}) == 1
 
 
+def test_only_the_harness_template_merge_task_leads_the_urgent_lane():
+    """urgent.leads: the harness task `ttp upgrade` queues to finish a template merge is urgent at its
+    priority 2 and sorts before priority-1 work; the same title on another kind, a near title, or another
+    harness task is not."""
+    from ttp import release, urgent
+    merge = {"id": 9, "kind": "harness", "title": release.UPGRADE_TASK_TITLE, "priority": 2, "spec": "s"}
+    assert urgent.leads(merge) and urgent.is_urgent(merge) and urgent.why(merge) == "finishes a template upgrade"
+    assert urgent.why({**merge, "spec": "urgent: a demo"}) == "a demo"
+    for t in ({**merge, "kind": "work"}, {**merge, "kind": "code"}, {**merge, "title": release.UPGRADE_TASK_TITLE + "!"},
+              {**merge, "title": release.UPGRADE_TASK_TITLE.lower()}, {**merge, "title": "Fix schedule x"},
+              {**merge, "title": None}, {}, None):
+        assert not urgent.leads(t), t
+        assert not urgent.is_urgent(t), t
+    p1 = [{"id": i, "kind": "work", "title": "p1", "priority": 1, "spec": "s"} for i in (1, 2)]
+    routine = {"id": 3, "kind": "work", "title": "r", "priority": 2, "spec": "s"}
+    assert [r["id"] for r in urgent.first(p1 + [routine, merge])] == [9, 1, 2, 3]
+
+
 def test_an_urgent_code_task_gets_its_review_at_priority_one_on_a_needs_review_hand_off_too(env):
     p = make(env)
     _with_origin(env, clone=False)

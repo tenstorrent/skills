@@ -915,8 +915,10 @@ never held for "the user's word".
 
 ## Urgent lane
 
-A task is urgent when its priority is 1 or its spec has a line `urgent: <why>`. Urgent work never
-queues behind routine work; nothing running is interrupted:
+A task is urgent when its priority is 1 or its spec has a line `urgent: <why>`. The harness task
+that finishes a template merge after an upgrade is urgent too and starts before other urgent work:
+until it ends, the project runs an older release. Urgent work never queues behind routine work;
+nothing running is interrupted:
 
 - Workers: urgent tasks start first. With every slot taken, an urgent task may take
   `budget.urgent_extra_slots` (1; 0 turns it off) more. The spend gate, auth gate, pauses and locks

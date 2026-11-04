@@ -1046,7 +1046,8 @@ END""")
 
     def ready_tasks(self, later: bool = False) -> list[dict]:
         """Queued tasks whose dependencies are all finished, in dispatch's pick order: urgent tasks
-        first (urgent.is_urgent: priority 1 or an `urgent:` spec line), then required owners
+        first (urgent.is_urgent: priority 1, an `urgent:` spec line or the template-merge task, which leads
+        them: urgent.leads), then required owners
         of an open obligation (its earliest due milestone first, obligations.owner_due), then best
         priority, then within a priority a woken wait first (resumefirst.order: the one ready longest
         first), then oldest. Read afresh on every call: no order outlives a dispatch pass or a daemon

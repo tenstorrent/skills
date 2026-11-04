@@ -1559,3 +1559,55 @@ def test_resume_wait_fires_once_for_a_passed_wait_not_started_in_15_min_naming_i
     finally:
         drain(d)
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def _merge_task(p, **kw):
+    """The harness task `ttp upgrade` queues to finish a template merge, as it queues it (cli.upgrade)."""
+    from ttp import release
+    return p.db.add_task(release.UPGRADE_TASK_TITLE, "merge upstream", kind="harness", tier="standard",
+                         priority=2, origin="user", **kw)
+
+
+def test_a_template_merge_task_starts_ahead_of_queued_p1_work_and_the_gates_still_hold_it(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """With every slot taken by priority-1 work, the queued template-merge task starts in the urgent extra
+    slot before an older queued priority-1 task (urgent.leads), and leads db.ready_tasks; one at a time holds
+    the merge, so routine work is not starved. A paused resource it names or a spend gate allowing no new
+    work still holds it."""
+    import dataclasses
+    from ttp import coordinator as coord, urgent
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
+    core = d.cfg.get("core_provider", "claude")
+    try:
+        running = [p.db.add_task(f"p1 work {i}", "s", kind="work", tier="light", origin="user", priority=1)
+                   for i in range(2)]
+        d.dispatch()
+        assert _slot_tasks(p) == running
+        older_p1 = p.db.add_task("older queued p1", "s", kind="work", tier="light", origin="user", priority=1)
+        merge = _merge_task(p)
+        assert urgent.is_urgent(p.db.task(merge)) and urgent.why(p.db.task(merge)) == "finishes a template upgrade"
+        assert [t["id"] for t in p.db.ready_tasks()] == [merge, older_p1], "the merge task leads the queue"
+        d.dispatch()
+        assert _slot_tasks(p) == running + [merge], "the merge task waited behind p1 work for a slot"
+        settle(d)
+        p.db.update_task(merge, status="done")
+        d.dispatch()
+        assert older_p1 in _slot_tasks(p), "the p1 task starts once the merge is under way"
+        settle(d)
+        p.db.x("UPDATE tasks SET status='done' WHERE status='queued'")
+
+        coord.pause_resource(p, "board", True, reason="maintenance", by="user")
+        held = _merge_task(p, labels=["resource:board"])
+        d.dispatch()
+        assert _slot_tasks(p) == [], "a paused resource let the merge task start"
+        coord.pause_resource(p, "board", False, by="user")
+        gate = d.gates[core]
+        d.gates[core] = dataclasses.replace(gate, allow_new_work=False)
+        d.dispatch()
+        assert _slot_tasks(p) == [], "the spend gate let the merge task start"
+        d.gates[core] = gate
+        d.dispatch()
+        assert _slot_tasks(p) == [held]
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
