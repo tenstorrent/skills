@@ -338,8 +338,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # failed or no-progress hops in a row or max_usd spent (0 turns one off), or one in an area under
     # review.area_fail_cap, is refused unless its `reason` names what changed in a tricky turn.
     # With auto, a done hop with progress whose only proposal is the next `continue:` hop gets it
-    # queued by the daemon, with no coordinator turn.
-    "chains": {"max_hops": 8, "max_stalls": 2, "max_usd": 40.0, "auto": True},
+    # queued by the daemon, with no coordinator turn. With urgent_followups, an urgent task's (or an
+    # obligation owner's) continue and next-step follow-ups are queued at once under the same caps (urgentfup).
+    "chains": {"max_hops": 8, "max_stalls": 2, "max_usd": 40.0, "auto": True, "urgent_followups": True},
     # Each Jev use (e.g. "screen") is switched off once its net saving over window_days is not
     # positive, judged after min_calls calls or once its first call is a window old, or once idle_calls
     # calls in the window changed none of the rules' decisions; uses.<use> = "on" or "off" forces it

@@ -1,0 +1,7 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: work on an urgent goal no longer stalls between hops. When a task that is urgent (priority 1, or a spec `urgent:` line) or that owns an open obligation hands off `done`, the daemon queues its `continue:`, `next step:` and `mechanical:` follow-ups at once. Before, they came back as proposed and waited for a coordinator turn. Each queued follow-up keeps the task's priority, its `urgent:` line, resource and exclusive labels, reply chat, pin and obligation. The duplicate check, chain caps (`chains.max_hops`, `chains.max_stalls`, `chains.max_usd`), the budget gate and pauses still apply. A follow-up they refuse stays proposed with its reason and wakes the coordinator. Each queued follow-up is listed in the next digest, and setting it to `cancelled` with `task_update` cancels it. `upstream:` follow-ups are handled as before. Set `chains.urgent_followups` to false to turn this off (it is on by default).
+
+A refused Restrictions `charter_update` that cites an order now goes back to the coordinator at once as a `charter_retry` event carrying the full error. Before, it waited for the next routine turn. The order can be a logged user message, or the owner's agent's order with `coordinator.agent_orders_as_user` on. This covers refusals that a filled `source` cannot fix, such as an ambiguous `replaces`, a contradiction or a missing word of the user's. The event says to ask the user when the fix needs their word. It stays within the existing caps: two immediate retries per change, and one per turn.

@@ -1402,8 +1402,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     for x in db.kv(NOTES_KEY, []) or []:
         lines.append(f"- [note on your previous turn's action: applied, nothing to fix] {x[:500]}")
     for x in chaincap.notices(db):
-        lines.append(f"- [continue hop queued by the daemon (progress, under the chain caps): nothing to decide] "
-                     f"{x[:800]}")
+        lines.append(f"- [continue hop queued by the daemon (progress or an urgent task's follow-up, under the chain "
+                     f"caps): nothing to decide; task_update it to cancelled to cancel one] {x[:800]}")
     if not msg_ids and not event_ids and not rejected:
         lines.append("- (none: periodic check — keep work flowing if the charter has unfinished goals)")
     lines.append("\nRespond with the JSON actions object only.")
@@ -6731,6 +6731,23 @@ CHARTER_RETRY_NOW_MAX = 2   # immediate retries per change: a resend refused aga
 _CHARTER_FIXABLE_RE = re.compile(r"\bresend\b|send that text|`both_hold`|quote the exact text", re.I)
 
 
+def _cited_order(p: Project, a: dict) -> bool:
+    """Whether a charter_update is a Restrictions change citing an order: a readable inbound user message
+    (chartertemplate) or, with agent mode on (relay.agent_orders), the owner's agent's (a relayer-origin
+    `source`, a relayer-ordered cite)."""
+    if not chartertemplate.restrictions(a.get("section") or ""):
+        return False
+    try:
+        relayer = str(restriction_source._parse(a.get("source")).get("origin") or "").strip().lower() \
+            == restriction_source.RELAYER
+    except (ValueError, TypeError, AttributeError):
+        relayer = False
+    if (relayer or "relayer-ordered" in str(a.get("text") or "")) and relay.agent_orders(p.config()):
+        return True
+    mid = chartertemplate.cited_msg(a)
+    return mid is not None and chartertemplate._own(p.db, mid) is not None
+
+
 def _charter_retry_now(p: Project, a: dict, err: str, key: str | None,
                        announced: list[tuple[str, str]] | None = None,
                        filled: tuple[dict, str] | None = None) -> str:
@@ -6741,8 +6758,12 @@ def _charter_retry_now(p: Project, a: dict, err: str, key: str | None,
     the user's word or concerns relayed text is left to the digest. `announced`: the batch's replies
     that told the chat the change was being made (charterpromise.announcing), named in the event.
     `filled`: (the filled resend, the one-line reason) of a change citing a user message (chartertemplate):
-    always raised, the template first. Returns the event text, or ""."""
-    if not filled and (not _CHARTER_FIXABLE_RE.search(err) or "Relayer context" in err):
+    always raised, the template first. A Restrictions change carrying the user's or the owner's agent's
+    cited order (_cited_order) is raised for any refusal, its full error as the fix (an ambiguous `replaces`,
+    a contradiction, a missing word: ask_user then). Returns the event text, or ""."""
+    # a queued change raises its own charter_retry (_queue_cited_restriction)
+    ordered = not filled and not err.startswith("charter_update queued") and _cited_order(p, a)
+    if not filled and not ordered and (not _CHARTER_FIXABLE_RE.search(err) or "Relayer context" in err):
         return ""
     cid = hashlib.sha256("\n".join(_ws(str(a.get(k) or "")) for k in ("section", "quote", "replaces", "text"))
                          .encode()).hexdigest()[:16]
@@ -6765,8 +6786,10 @@ def _charter_retry_now(p: Project, a: dict, err: str, key: str | None,
                 "has since said otherwise, leave it.") if filled else
                f"A charter_update was refused ({sent}): "
                f"{clip(err, RESEND_CHARS if RESEND_MARK in err else 1200)}. Apply the fix that error names "
-               f"now, in this turn (immediate retry {mine['n']} of {CHARTER_RETRY_NOW_MAX}); if the user has since "
-               "said otherwise, leave it.") + charterpromise.quote_lines(announced or [])
+               f"now, in this turn (immediate retry {mine['n']} of {CHARTER_RETRY_NOW_MAX}); "
+               + ("it carries a cited order: if the fix needs the user's word, ask_user now with the exact change; "
+                  if ordered else "")
+               + "if the user has since said otherwise, leave it.") + charterpromise.quote_lines(announced or [])
         db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
              (time.time(), "harness", "charter_retry", "normal", msg, "queued"))
     return msg

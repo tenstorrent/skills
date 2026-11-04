@@ -3907,7 +3907,9 @@ def test_a_restrictions_change_cited_to_a_user_message_outside_their_turn_is_que
     # A mismatched quote is refused as before, and nothing is queued for it.
     err = coord.apply(p, [{**lift, "source": {"msg": said, "quote": "lift every hold on every box"}}], turn=0)
     assert len(err) == 1 and "needs the user's word" in err[0], err
-    assert not db.q("SELECT 1 FROM events WHERE kind='charter_retry'")
+    now = [r["text"] for r in db.q("SELECT text FROM events WHERE kind='charter_retry'")]
+    assert len(now) == 1 and "immediate retry 1 of" in now[0] and "ask_user" in now[0], now   # a cited order
+    db.x("UPDATE events SET status='handled' WHERE kind='charter_retry'")
     err = coord.apply(p, [lift], turn=1, messages=[])
     assert len(err) == 1 and "charter_update queued" in err[0] and f"message #{said}" in err[0], err
     assert item in p.charter_path.read_text(), "applied outside the user's turn"
@@ -16197,6 +16199,7 @@ def test_a_refused_resend_carries_the_whole_approved_charter_text_to_the_next_tu
     act = {"type": "charter_update", "section": "Restrictions", "replaces": "Restrictions (added", "text": approved,
            "source": {"msg": said, "quote": "goals: as below"}}
     assert "matches 2" in coord.apply(p, [act], turn=1, user_turn=True, messages=[said])[0]
+    db.x("UPDATE events SET status='handled' WHERE kind='charter_retry'")   # its own immediate retry (a cited order)
     # A later turn rewords it: refused, with the approved text whole and the file that holds it.
     err = coord.apply(p, [{**act, "replaces": "Restrictions (added 2026-10-01, turn 3.0)", "text": approved[:-1] + "!"}], turn=2)
     assert len(err) == 1 and "was for other text" in err[0] and repr(approved) in err[0], err

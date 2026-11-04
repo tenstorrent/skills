@@ -120,6 +120,45 @@ def test_only_a_source_refusal_is_templated(env):
         assert (chartertemplate.template(p.db, act, err) is not None) is want, err
 
 
+def test_a_refused_cited_restriction_order_returns_to_the_coordinator_at_once(env):
+    """A Restrictions change citing a readable user message, refused for something a filled `source` does not
+    fix (an ambiguous `replaces`), raises one charter_retry event at once carrying the full error and the
+    ask_user fallback, under the per-turn and per-change caps. With no readable cited order (no cite, an
+    unknown message, another section, a relayer order with agent mode off) nothing is raised."""
+    import json
+    from ttp import relay
+    from ttp import coordinator as coord
+    p, mid = _ct_setup(env)
+    p.charter_path.write_text(_CT_CHARTER + "\n## Restrictions (added 2026-10-01, turn 3.0)\n- Never rename box C.\n")
+    act = {"type": "charter_update", "section": "Restrictions", "replaces": "Restrictions",
+           "text": f"- Run long jobs on box Q only at night. (user msg #{mid})"}
+
+    def events():
+        return [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind='charter_retry' ORDER BY id")]
+
+    out = coord.apply(p, [act], user_turn=False)
+    assert out and "needs the user's word" in out[0], out
+    ev = events()
+    assert len(ev) == 1 and "needs the user's word" in ev[0] and "`replaces` 'Restrictions'" in ev[0], ev
+    assert "immediate retry 1 of" in ev[0] and "ask_user" in ev[0], ev
+    err = out[0].removeprefix("charter_update: ")
+    assert coord._charter_retry_now(p, act, err, "t1") and coord._charter_retry_now(p, act, err, "t1") == ""
+    assert coord._charter_retry_now(p, act, err, "t2") == "" and len(events()) == 2   # CHARTER_RETRY_NOW_MAX
+    fid = p.db.post("in", "", chat="relay-chat", kind="finding", provenance="cli-legacy", context=f"Order: {_CT_SAID}")
+    others = ({**act, "text": "- Run long jobs on box Q only at night."},
+              {**act, "text": "- Run long jobs on box Q only at night. (user msg #99999)"},
+              {**act, "section": "Policies"},
+              {**act, "text": f"- Run long jobs on box Q only at night. (relayer-ordered, msg #{fid})"},
+              {**act, "text": "- Run long jobs on box Q only at night.",
+               "source": json.dumps({"msg": fid, "origin": "relayer", "quote": _CT_SAID})})
+    for other in others:
+        assert coord._charter_retry_now(p, other, err, "t3") == "", other
+    p.set_config(relay.AGENT_KEY, True)
+    for other in others[3:]:
+        assert "ask_user" in coord._charter_retry_now(p, other, err, "t4"), other
+    queued = "charter_update queued: this Restrictions change rests on the user's words in message #1"
+    assert coord._charter_retry_now(p, {**act, "replaces": ""}, queued, "t5") == ""
+
 def test_a_user_sourced_restriction_passes_the_people_rule_the_agents_words_do_not(env):
     """Agent mode: an item lifting something with 'other projects' and 'tenant' in it falls in relay.HELD's
     people class. Resting on the owner's agent's words (a relayer-origin source, a findings-only turn) it is
