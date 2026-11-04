@@ -4234,20 +4234,34 @@ def test_one_listener_per_chat(env):
         if first.poll() is None:
             first.terminate()
             first.wait(timeout=10)
-    # A listener whose parent dies (a lost background task, a dropped ssh session) exits on its own.
-    starter = subprocess.run(["/bin/sh", "-c", " ".join(shlex.quote(x) for x in cmd) + " >/dev/null 2>&1 & echo $!; sleep 1"],
-                             env=run_env, capture_output=True, text=True, timeout=30)
-    orphan = int(starter.stdout.split()[0])
-    deadline = time.time() + 60    # generous: an orphaned listener exits on its own poll; heavy suite load slows it
-    while time.time() < deadline:
-        try:
-            os.kill(orphan, 0)
-        except OSError:
-            break
-        time.sleep(0.05)
-    else:
-        os.kill(orphan, 15)
-        raise AssertionError("an orphaned listener kept running")
+    # A listener whose parent dies (a lost background task, a dropped ssh session) exits on its own, also
+    # when the parent dies while the listener still starts up: here while it waits for an older listener
+    # (one that ignores SIGTERM) to end. The starter exits as soon as the new listener holds the chat.
+    stuck = subprocess.Popen([sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                              "print(1, flush=True); time.sleep(300)", "listen", "c1"], stdout=subprocess.PIPE, text=True)
+    try:
+        stuck.stdout.readline()
+        lock.write_text(str(stuck.pid))
+        orphan_cmd = cmd[:-1] + ["600"]     # far past the deadline below: only the lost parent ends it in time
+        starter = subprocess.run(["/bin/sh", "-c", " ".join(shlex.quote(x) for x in orphan_cmd) + " >/dev/null 2>&1 & pid=$!; "
+                                  f"echo $pid; until [ \"$(cat {shlex.quote(str(lock))} 2>/dev/null)\" = \"$pid\" ]; do "
+                                  "kill -0 $pid 2>/dev/null || exit 1; sleep 0.05; done"],
+                                 env=run_env, capture_output=True, text=True, timeout=120)
+        assert starter.returncode == 0, "the orphan listener never took the chat"
+        orphan = int(starter.stdout.split()[0])
+        deadline = time.time() + 60    # generous: an orphaned listener exits on its own poll; heavy suite load slows it
+        while time.time() < deadline:
+            try:
+                os.kill(orphan, 0)
+            except OSError:
+                break
+            time.sleep(0.05)
+        else:
+            os.kill(orphan, 15)
+            raise AssertionError("an orphaned listener kept running")
+    finally:
+        stuck.kill()
+        stuck.wait()
 
 
 def test_newest_listener_claims_chat_before_old_one_exits(env):

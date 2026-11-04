@@ -27,7 +27,11 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import __version__, poll_s
+# Who started this process, read before the slow imports and setup: a listener whose starter dies
+# while it starts up must still see it gone (_listen_loop).
+_STARTED_BY = (os.getpid(), os.getppid())
+
+from . import __version__, poll_s  # noqa: E402
 from .db import CHANGES_NEEDED, SUPERSEDED, chat_floor, task_outcome
 from . import outbox
 from .devq import unmask_devices
@@ -1429,7 +1433,7 @@ def _listener_state(pid: int, chat: str) -> str:
 def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
     from .web import cleared
     deadline = time.time() + a.timeout if a.timeout else None
-    parent = os.getppid()
+    parent = _STARTED_BY[1] if _STARTED_BY[0] == os.getpid() else os.getppid()
     while True:
         if os.getppid() != parent:
             return      # whoever started this listener is gone; nobody would read what it prints
