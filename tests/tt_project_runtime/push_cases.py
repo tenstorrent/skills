@@ -2444,6 +2444,20 @@ def test_a_push_batch_never_drops_commits_under_an_approved_head_whose_landing_i
     assert _statuses(m) == ["conflict"], m
 
 
+def test_the_landed_task_mapping_counts_only_landed_rows_with_full_shas_newest_first(env):
+    """Open rows (approved, batched, held) and sent-back ones map nothing, nor does a short sha; the
+    newest landing of a head wins."""
+    from ttp import push
+    p = make(env)
+    h, a, b = "a" * 40, "b" * 40, "c" * 40
+    rows = [(h, "pushed", a), (h, "landed", b), ("d" * 40, "approved", a), ("e" * 40, "batched", a),
+            ("f" * 40, "conflict", a), ("1234567", "pushed", a), ("9" * 40, "pushed", "abc")]
+    for i, (head, status, sha) in enumerate(rows):
+        p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated, landed_sha) "
+               "VALUES(?,?,?,?,?,?,?,?)", (i + 1, "x", head, "origin/proj", status, 1.0, 1.0, sha))
+    assert push.landed_heads(p.db) == {h: b}
+
+
 @pytest.mark.parametrize("own, ok", [({"more.txt": "own\n"}, True), ({"notes.txt": "a\nB1 mine\nc\n"}, False)])
 def test_ttp_push_rebases_a_child_onto_the_tip_past_its_landed_parents_approved_head(env, monkeypatch, capsys,
                                                                                     own, ok):
