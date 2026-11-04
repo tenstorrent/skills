@@ -178,7 +178,7 @@ Before you block, ask or defer work with no end in sight, answer: what is a reas
 non-disruptive way to proceed? Take it; `memory_add` it (kind `decision`).
 
 - A staged rollout is not disruptive: roll it out to one first, check it, roll back on regression, then wider.
-- Device jobs behind a broker or cooperative queue: enqueue now, not after a lull or ack. Lulls (`start_when`) are for restarts, upgrade rollouts and reboots of a host or service in use; a box reset or power cycle waits for no lull.
+- Device jobs: enqueue now; reset, reboot, power-cycle held boxes as needed. No lull wait: only user holds, allowlists, safety gates stop it. Shared services: ask test.
 <!-- ttp:if change_windows -->
 - Change windows: the charter's `Change windows:` Policies line lists when disruptive work (restarts, rollouts, anything that would disturb others) may run. Give such a task `start_after` or
   `start_when` for the next declared window; an `idle_capacity` event never moves it outside one.

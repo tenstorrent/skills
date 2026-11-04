@@ -379,12 +379,13 @@ def test_the_daily_review_reports_the_wake_gate(env):
 
 # Deferred device tasks (coordinator.lull_note): a broker serializes device jobs, so a deferral that
 # waits for a lull, an ack or a pause to end gets advice on its result note, never a rejection.
-def test_the_coordinator_prompt_keeps_a_lull_for_disruptive_work_and_enqueues_device_jobs_now():
+# User msg #1571: a reset, reboot or power cycle of a held box runs when needed, never after a lull.
+def test_the_coordinator_prompt_enqueues_device_jobs_now_and_endorses_no_lull_for_reboots():
     rule = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
-    assert "Device jobs behind a broker or cooperative queue: enqueue now, not after a lull or ack." in rule
-    assert "Lulls (`start_when`) are for restarts, upgrade rollouts and reboots of a host or service in " \
-        "use; a box reset or power cycle waits for no lull." in rule
+    assert "Device jobs: enqueue now; reset, reboot, power-cycle held boxes as needed." in rule
+    assert "No lull wait: only user holds, allowlists, safety gates stop it. Shared services: ask test." in rule
     assert "Work that would disturb others: run it in a lull" not in rule
+    assert not re.search(r"lulls?\b[^.]*\b(reboot|power[- ]cycle)", rule, re.I), "a lull endorsed for reboots"
 
 
 @pytest.mark.parametrize("why", ["wait for a lull on the box", "until the other project acks",
