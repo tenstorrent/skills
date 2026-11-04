@@ -5174,6 +5174,15 @@ def _claims(fake_ird):
     return sorted(p.name for p in (fake_ird.ird_dir / "claims").glob("*.json"))
 
 
+def _ctrl_c_default():
+    """Popen preexec_fn: the command starts with Ctrl-C and quit at their default, as from a terminal.
+    A suite run as a background job of a non-interactive shell (an older spill host's wrapper, nohup)
+    starts with both ignored, which the child inherits and a shell's trap cannot undo."""
+    import signal
+    for s in (signal.SIGINT, signal.SIGQUIT):
+        signal.signal(s, signal.SIG_DFL)
+
+
 def test_setup_box_ird_reserve_claims_a_completed_reservation_despite_rc_1_and_noise(fake_ird):
     rc, out = fake_ird.run("reserve", "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00",
                            "--machine", "m-idle", FAKE_IRD_RC="1", FAKE_IRD_NOISE="1")
@@ -5271,7 +5280,7 @@ def test_setup_box_ird_reserve_releases_what_landed_when_interrupted(fake_ird, t
     p = subprocess.Popen([sys.executable, str(BOX_PY), "--site", str(fake_ird.site), "ird", "reserve",
                           "<ird-box>", "--arch", "<arch>", "--timeout", "01:00:00", "--wait", "60"],
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                         env={**fake_ird.env, "FAKE_IRD_HANG": str(marker)})
+                         env={**fake_ird.env, "FAKE_IRD_HANG": str(marker)}, preexec_fn=_ctrl_c_default)
     deadline = time.time() + 30
     while not marker.exists() and time.time() < deadline:
         time.sleep(0.05)
@@ -5695,7 +5704,7 @@ def test_setup_box_ird_e2e_trap_releases_only_its_own_reservation(fake_ird, tmp_
     marker = tmp_path / "smi-started"
     env.update({"FAKE_SMI_FAIL": "1"} if how == "fail" else {"FAKE_SMI_HANG": str(marker)})
     p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
-                         start_new_session=True)
+                         start_new_session=True, preexec_fn=_ctrl_c_default)
     if how == "ctrl-c":
         deadline = time.time() + 60
         while not marker.exists() and time.time() < deadline and p.poll() is None:

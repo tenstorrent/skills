@@ -4480,15 +4480,16 @@ def test_a_running_check_command_gets_the_stop_signals_unblocked_and_ends_with_i
     pid = None
     try:
         # Not sh: dash clears its blocked signals itself, most commands keep the mask they start with.
-        pid = _detached_checks(run, capsys, sys.executable, "-c", (
-            "import os, pathlib, time; pathlib.Path(%r).write_text(str(os.getpid())); "
-            "pathlib.Path(%r).write_text(open('/proc/self/status').read().split('SigBlk:')[1].split()[0]); "
-            "time.sleep(60)") % (str(cpid), str(status)))
+        code = ("import os, pathlib, time; pathlib.Path(%r).write_text(str(os.getpid())); "
+                "pathlib.Path(%r).write_text(open('/proc/self/status').read().split('SigBlk:')[1].split()[0]); "
+                "time.sleep(60)") % (str(cpid), str(status))
+        pid = _detached_checks(run, capsys, sys.executable, "-c", code)
         assert _wait_for(lambda: status.exists() and status.read_text().strip() and cpid.exists())
         blocked = int(status.read_text(), 16)
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             assert not blocked & (1 << (sig - 1)), (sig, hex(blocked))
-        cmd = int(cpid.read_text())
+        # Where the checks sandbox works (this suite not already in one), its os.getpid() is a namespace pid.
+        cmd = _host_pid([sys.executable, "-c", code])
         os.kill(pid, signal.SIGTERM)
         assert _wait_for(lambda: (run / cli.CHECKS_RC).exists())
         assert (run / cli.CHECKS_RC).read_text().strip() == "143"
