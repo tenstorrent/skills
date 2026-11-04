@@ -792,11 +792,13 @@ def test_a_runs_lock_never_passes_a_lost_hold_whose_slot_another_task_took(env, 
 
 
 def test_a_slot_label_rewrite_never_shows_a_held_slot_with_no_holder(tmp_path, monkeypatch):
-    # A held slot's label is rewritten in place: a take over the last holder's label, relabel, and
-    # label_pid (a `ttp lock` handing its slot to its command, a run handing its hold to its keeper).
-    # A reader between two steps of that write (held_labels, so hold.covers and the test above) sees the
-    # old label or the new one, never the slot held with an empty label: hold.covers took that for
-    # another holder's, and the test above saw its label come and go.
+    # A held slot's label is rewritten in place by relabel and label_pid (a `ttp lock` handing its slot
+    # to its command, a run handing its hold to its keeper): a reader between two steps of that write
+    # (held_labels, so hold.covers and the test above) sees the old label or the new one, never the slot
+    # held with an empty label. A take writes over the last holder's label, which a slot keeps after
+    # release: it builds its label (run_ids, taker) before the take and cuts the old one in the step
+    # right after, so a reader sees the old holder on the newly held slot for that one step at most
+    # (where hold.covers could pass a lost run of the old holder), then no holder (still held).
     import builtins
     from ttp import locks
     slot, seen, busy = tmp_path / "board.0.lock", [], []
@@ -833,13 +835,26 @@ def test_a_slot_label_rewrite_never_shows_a_held_slot_with_no_holder(tmp_path, m
     for name in ("pwrite", "ftruncate"):
         real = getattr(os, name)
         monkeypatch.setattr(locks.os, name, lambda *a, _real=real: (look(), _real(*a), look())[1])
+    built = []   # what a reader sees while the take builds its label: never the old holder on a held slot
+
+    def building(real):
+        def call(*a, **kw):
+            look(), built.append(seen[-1:])
+            got = real(*a, **kw)
+            look(), built.append(seen[-1:])
+            return got
+        return call
+    for name in ("run_ids", "taker"):
+        monkeypatch.setattr(locks, name, building(getattr(locks, name)))
     old, new = "task #1 (run 1)", "task #2 (run 2)"
     f = locks.try_take([slot], old, "a long command " * 20)
     f.close()
     seen.clear()
     f = locks.try_take([slot], new, "short")   # its label is shorter than the one it writes over
     try:
-        assert seen and set(seen) <= {(), (old,), (new,)} and seen[-1] == (new,), seen
+        assert seen and set(seen) <= {(), (old,), ("",), (new,)} and seen[-1] == (new,), seen
+        assert built and [(old,)] not in built, f"the slot showed its old holder while the take built its label: {seen}"
+        assert (old,) not in seen[seen.index(("",)):], seen   # the old label is cut once, never seen again
         for rewrite in (lambda: locks.relabel(f, {"run_since": 1.0}), lambda: locks.label_pid(f, os.getpid(), "command")):
             seen.clear()
             rewrite()

@@ -64,7 +64,12 @@ def slot_paths(locks_dir: Path, resource: str, slots: int) -> list[Path]:
 
 def try_take(paths: list[Path], holder: str, what: str = "", key: str = "", extra: dict | None = None):
     """The open file of the first free slot, now held and labelled with its holder (and `key`, what
-    the holder runs, when given, and the fields of `extra`, such as job_fields); None if all are taken."""
+    the holder runs, when given, and the fields of `extra`, such as job_fields); None if all are taken.
+    A slot file keeps its last holder's label after release, so the label is built before the take and
+    the old one cut right after it: a reader (hold.covers) sees the old holder on the newly held slot only
+    for that one step, then no holder (held all the same) until the new label is written."""
+    label = {"holder": holder, "since": time.time(), "command": what[:300], **({"key": key} if key else {}),
+             **(extra or {}), **run_ids(), **taker()}
     for path in paths:
         path.parent.mkdir(parents=True, exist_ok=True)
         f = open(path, "a+")
@@ -73,8 +78,8 @@ def try_take(paths: list[Path], holder: str, what: str = "", key: str = "", extr
         except OSError:
             f.close()
             continue
-        write_label(f, {"holder": holder, "since": time.time(), "command": what[:300], **({"key": key} if key else {}),
-                        **(extra or {}), **run_ids(), **taker()})
+        os.ftruncate(f.fileno(), 0)
+        write_label(f, label)
         return f
     return None
 
