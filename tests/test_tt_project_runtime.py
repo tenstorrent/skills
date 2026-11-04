@@ -7281,7 +7281,7 @@ def test_a_review_task_nothing_waits_on_is_not_raised(env):
 def test_the_coordinator_looks_for_a_non_disruptive_way_before_blocking():
     text = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
     assert "# Unblocking" in text and "what is a reasonably non-disruptive way to proceed?" in text
-    for idea in ("roll it out to one first", "roll back on regression", "lull", "cooperative queue",
+    for idea in ("roll it out to one first", "roll back on regression", "lull", "Device jobs: enqueue now",
                  "is not a blocker and not a reason to `ask_user`"):
         assert idea in text, idea
 
