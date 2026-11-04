@@ -130,7 +130,7 @@ class _Est:
         """A done code task awaiting review task `rv`: done now, landed at that review's end plus the median
         landing (when the project has one)."""
         if rv in seen:
-            return self._none(tid, f"#{tid} has a dependency cycle")
+            return self._cycle(tid, seen, rv)
         # The review depends on this task, which is done: it may start now (task() replaces this memo).
         self.memo[tid] = {"done": self.now, "end": self.now, "path": [tid], "legs": [], "why": None, "overrun": False}
         e = self.task(rv, tuple(x for x in seen if x != tid))
@@ -142,6 +142,9 @@ class _Est:
             end += legs[-1][1]
         return {"done": self.now, "end": end, "path": [tid] + e["path"], "legs": legs, "why": None,
                 "overrun": e["overrun"]}
+
+    def _cycle(self, tid, seen: tuple, d: int) -> dict:
+        return self._none(tid, "dependency cycle " + "→".join(f"#{i}" for i in seen[seen.index(d):] + (d,)))
 
     def _none(self, tid, why: str) -> dict:
         return {"done": None, "end": None, "path": [tid], "legs": [], "why": why, "overrun": False}
@@ -188,8 +191,10 @@ class _Est:
             for d in dependency_ids(t):
                 if d is None:
                     return self._none(tid, f"#{tid} names a dependency that is not a task id")
+                if (dt := self.db.task(d)) and dt["status"] in ("done", "pushing"):
+                    continue   # finished: its dependants may start now, and the walk ends there
                 if d in seen:
-                    return self._none(tid, f"#{tid} has a dependency cycle")
+                    return self._cycle(tid, seen, d)
                 e = self.task(d, seen)
                 if e["why"]:
                     return {**self._none(tid, e["why"]), "path": [tid] + e["path"]}

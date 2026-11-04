@@ -90,6 +90,32 @@ def test_eta_done_code_task_awaiting_its_review_is_not_landed(env):
     assert [k for k, _ in eta.estimate(p.db, other, now)["legs"]] == ["landing"]
 
 
+def test_eta_a_finished_task_ends_the_walk_and_an_open_cycle_names_its_members(env):
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    _eta_history(p, now, kind="review", runs=(1700,), wait=100)
+    # Two done code tasks that depend on each other (a fix and its continue task) and the open review of one.
+    a = p.db.add_task("the fix", "s", kind="code", status="done")
+    b = p.db.add_task("continue: the fix", "s", kind="code", status="done", depends_on=[a])
+    p.db.x("UPDATE tasks SET depends_on=? WHERE id=?", (json.dumps([b]), a))
+    rv = p.db.add_task(f"Review #{a}: the fix", "s", kind="review", depends_on=[a], labels=[f"auto_review:{a}"],
+                       reply_chat="c1")
+    e = eta.estimate(p.db, rv, now)
+    assert e["why"] is None and e["end"] == pytest.approx(now + 100 + 1700) and e["path"] == [rv]
+    o = _eta_promise(p, rv, "c1", "I'll post here once it's reviewed.", now)
+    assert eta.obligation_estimate(p.db, o, now)["end"] == pytest.approx(now + 100 + 1700)
+    assert eta.estimate(p.db, a, now)["why"] is None and eta.estimate(p.db, b, now)["end"] == pytest.approx(now)
+    # A cycle among open tasks gives no estimate and names the tasks in it.
+    x = p.db.add_task("step x", "s", kind="review")
+    y = p.db.add_task("step y", "s", kind="review", depends_on=[x])
+    z = p.db.add_task("step z", "s", kind="review", depends_on=[y])
+    p.db.x("UPDATE tasks SET depends_on=? WHERE id=?", (json.dumps([y]), x))
+    e = eta.estimate(p.db, z, now)
+    assert e["end"] is None and f"dependency cycle #{y}→#{x}→#{y}" in e["why"]
+    assert f"#{x}" in eta.field(eta.estimate(p.db, x, now), p, now) and "cycle" in eta.estimate(p.db, x, now)["why"]
+
+
 def test_eta_no_history_says_no_estimate_yet(env):
     from ttp import eta
     p = make(env)
