@@ -1108,8 +1108,9 @@ def enqueue(locks_dir: Path, resource: str, holder: str, since: float | None = N
     _TICKETS[path] = f
     owner = _ticket_owner()
     _TICKET_RUNS[path] = owner.get("run_dir") or ""
-    try:   # written once the ticket is in: a ticket read without its record is judged by its lock alone
-        _owner_file(path).write_text(json.dumps(owner))
+    try:   # written once the ticket is in: a ticket read without its record is judged by its lock alone;
+        # unsynced: the record matters only while its waiter holds the ticket's lock, which a power cut ends
+        durable_write(_owner_file(path), json.dumps(owner), sync=False)
     except OSError:
         pass
     return path
