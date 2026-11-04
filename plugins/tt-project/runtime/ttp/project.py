@@ -119,6 +119,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # A waiting task whose `retry_when` probe still says "not yet" sleeps on. This long after its
     # hand-off the coordinator is asked once (`wait_stale`) to fix the probe or cancel; it still sleeps.
     "waiting": {"max_hold_s": 21600,
+                # a wait's retry_when / start_when probe runs model-free this often, 20-180 s; a pass
+                # wakes the task at once (waitpoll.py)
+                "poll_s": 90,
+                # an urgent task waiting on a probe that is not a bare clock gate sleeps at most this long
+                # per timer; a "not yet" re-sleeps it with no model call (waitpoll.py; 0: off)
+                "urgent_retry_cap_s": 300,
                 # a queued task whose start_when says not yet this long while it names a device or
                 # serving resource is raised once (0: never)
                 "start_resource_stale_s": 10800,

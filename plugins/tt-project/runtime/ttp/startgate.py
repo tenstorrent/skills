@@ -12,9 +12,9 @@ producer is abandoned, failed or cancelled, whose change is pushed yet the gate 
 yet, or that nothing open can land (deadwait.path). A `landed:#<id>` gate whose producer is approved
 or in a batch in the push queue names that instead: it is waiting, not stale.
 
-Cadence (every): a start_when probe runs every PROBE_EVERY_S at first; a healthy not-yet of an
+Cadence (every): a start_when probe runs every waiting.poll_s (waitpoll.py) at first; a healthy not-yet of an
 arbitrary command (a remote head, an API) backs off with the wait's length, up to MAX_EVERY_S. A
-gate on a landing, a time, the task's own job or another local clock never backs off, and a
+gate on a landing, a time, the task's own job, a lock or another local clock never backs off, and a
 landing gate reruns on the tick after the push queue records a push (Daemon._start_probe_due).
 Model-free."""
 from __future__ import annotations
@@ -33,8 +33,8 @@ NOT_YET = (1, 75, 255)   # daemon.NOT_YET_RCS: a healthy not-yet
 PROBE_EVERY_S = 180      # daemon.PROBE_EVERY_S: a start_when probe's first cadence
 MAX_EVERY_S = 600        # the longest a healthy not-yet of an arbitrary command waits between runs
 BACKOFF_DIV = 6          # its interval: the wait so far over this, between the two above
-# Gates that never back off: a landing, a time, the task's own job, a push, checks, CI, a reply, a fix.
-_PROMPT_RE = re.compile(r"^\s*landed:|ttp landed|detach --check|checks --result|push --result|\bttp ci\b|"
+# Gates that never back off: a landing, a time, the task's own job, a push, checks, CI, a lock, a reply, a fix.
+_PROMPT_RE = re.compile(r"^\s*landed:|ttp landed|detach --check|checks --result|push --result|\bttp ci\b|lock --probe|"
                         r"ack-wait|upstream --fixed|^\s*test \"\$\(date")
 _DEAD = ("failed", "cancelled")
 _STATES = {"review": "in review", "pushing": "being pushed", "done": "done, not on the branch yet"}
@@ -124,12 +124,12 @@ def stuck(db, when: str, rc) -> str:
 
 def every(when: str, rc, waited_s: float, base: float = PROBE_EVERY_S) -> float:
     """Seconds between runs of start_when probe `when` whose last verdict is `rc` after `waited_s` of
-    saying not yet: `base` (the daemon's PROBE_EVERY_S), backing off to MAX_EVERY_S / PROBE_EVERY_S
-    times it for a healthy not-yet of an arbitrary command (module doc). A broken verdict keeps the
+    saying not yet: `base` (waiting.poll_s), backing off with the wait's length up to MAX_EVERY_S for a
+    healthy not-yet of an arbitrary command (module doc). A broken verdict keeps the
     first cadence: a fix to its probe shows soon."""
     if rc not in NOT_YET or _PROMPT_RE.search(when or "") or landed.probe_command(when) != when:
         return base
-    return base * min(MAX_EVERY_S / PROBE_EVERY_S, max(1.0, waited_s / BACKOFF_DIV / PROBE_EVERY_S))
+    return max(base, min(MAX_EVERY_S, waited_s / BACKOFF_DIV)) if base else base
 
 
 def push_state(db, when: str) -> str | None:

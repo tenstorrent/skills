@@ -48,6 +48,7 @@ from . import churnwatch
 from . import alerts
 from . import applyff, landff
 from . import userstep
+from . import waitpoll
 from . import workernotify
 from . import anchors
 from . import pagesev
@@ -5001,7 +5002,7 @@ class Daemon:
                 extra["woke"] = "the host rebooted"
                 reason = f"waiting for {what}; the host rebooted, so it runs again now"
             else:
-                not_before = time.time() + _retry_s(result)
+                not_before = time.time() + waitpoll.capped(self.cfg, task, result, _retry_s(result))
                 extra["waiting_since"] = time.time()
                 reason = f"waiting for {what}; next try {timefmt.short(not_before, self.p)}"
             if new == "queued" and "waiting_since" in extra and isinstance(result.get("on_pass_cmd"), str):
@@ -9767,7 +9768,7 @@ class Daemon:
                                  f"keeps running; decide: task_update waits_on with a fixed probe, requeue the "
                                  f"task, or cancel it.", "queued", tid))
                     log(self.p, f"task {tid} hold_probe_broken ({why}); raised to the coordinator")
-        if tid not in self._probes and now - self._probed.get(tid, 0) >= PROBE_EVERY_S:
+        if tid not in self._probes and now - self._probed.get(tid, 0) >= self._poll_s():
             self._start_probe(tid, probe, now, "waits_on when")
         return ""
 
@@ -10099,7 +10100,7 @@ class Daemon:
         g = gate if gate and gate.get("when") == when else {}
         # A probe on a confirmed-down host keeps downwait's seconds-scale gap, never the backed-off one.
         every = self._probe_gap(tid) if self._down_n.get(tid) else \
-            startgate.every(when, g.get("rc"), now - float(g.get("since") or now), PROBE_EVERY_S)
+            startgate.every(when, g.get("rc"), now - float(g.get("since") or now), self._poll_s())
         if now - last >= every:
             return True
         landing = landed.probe_command(when, self.p) != when
@@ -10164,10 +10165,15 @@ class Daemon:
             log(self.p, f"task {tid} probe is broken, not waiting on an unreachable host: {why}")
         return why or netwait.UNREACHABLE_RC
 
+    def _poll_s(self) -> float:
+        """Seconds between model-free runs of a wait's probe: waiting.poll_s (waitpoll), at most PROBE_EVERY_S,
+        the freshness unit a verdict is judged by."""
+        return min(waitpoll.poll_s(self.cfg), PROBE_EVERY_S)
+
     def _probe_gap(self, tid: int) -> float:
-        """How long after its last run a task's probe runs again: PROBE_EVERY_S, or seconds while it
-        waits on a down host (downwait.gap)."""
-        return downwait.gap(self._down_n.get(tid, 0), PROBE_EVERY_S)
+        """How long after its last run a task's probe runs again: waiting.poll_s (waitpoll), or seconds
+        while it waits on a down host (downwait.gap)."""
+        return downwait.gap(self._down_n.get(tid, 0), self._poll_s())
 
     def _host_down(self, tid: int, probe: str, out: str, rc, now: float) -> None:
         """downwait: a probe whose 255 is ssh's own (rc stays UNREACHABLE_RC after _own_255) shortens its
@@ -11047,7 +11053,8 @@ class Daemon:
                 self._stale_wait_event(task, prev, start, max_hold)
                 self._flag_never_passes(task, str(prev.get("retry_when") or ""), rc,
                                         (self._probe_out.get(tid) or ("",))[0], stale=True)
-            nb = now + _retry_s(prev) if held else min(now + _retry_s(prev), start + max_hold)
+            retry = waitpoll.capped(self.cfg, task, prev, _retry_s(prev))
+            nb = now + retry if held else min(now + retry, start + max_hold)
             what = self._wait_what(tid, prev)
             says = "host unreachable" if rc == 255 else "not yet"
             db = self.p.db
