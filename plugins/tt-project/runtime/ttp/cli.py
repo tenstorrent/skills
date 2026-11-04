@@ -6211,10 +6211,10 @@ def cmd_lock(a) -> None:
                 if by:
                     return f"{L['name']} (reserved for {by})"
                 ahead = len(lk.queued(L["where"], L["res"])) - 1
-                lands = [r for r in lk.holder_records(L["paths"], p) if r.get("landing")]
+                kinds = "; ".join(map(lk.holder_kind, lk.holder_records(L["paths"], p)))
                 return (f"{L['name']}{' (shared)' if a.shared else ''} (held by "
                         f"{', '.join(lk.holders_now(L['paths'], p)) or 'another task'}"
-                        f"{'; holder is a landing' if lands else '; holder is not a landing'}"
+                        f"{f'; holder: {kinds}' if kinds else ''}"
                         f"{f'; {ahead} ahead in queue' if ahead > 0 else ''})")
             line = ("waiting as a landing for " if landed_check else "waiting for ") \
                 + "; ".join(_why(L, by) for L, by in blocked)

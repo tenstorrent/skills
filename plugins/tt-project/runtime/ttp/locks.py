@@ -15,7 +15,9 @@ push queue's batch checks, `ttp land`, in any project) goes ahead of other waite
 within each class. Only the harness marks one: the check runner holds a landing mark (landmark.py) and
 `ttp lock` counts as landing only if that mark is held by one of its own ancestors, so a forged
 environment gets normal ordering. The bound: a waiter that has waited LANDING_AGE_S is no longer
-passed by later landings. A landing never preempts a holder; it only moves up the queue.
+passed by later landings. A landing never preempts a holder; it only moves up the queue. A waiting
+`ttp lock`'s wait line names each holder's project (from its record's project_root) and whether it is a
+landing (holder_kind).
 
 A shared holder (`ttp lock --shared`, for read-only work) takes a read lock on every slot instead
 of one slot's write lock, and labels itself in <resource>.shared: shared holders run together, and
@@ -1254,6 +1256,16 @@ def is_multi(ticket: Path) -> bool:
 def is_landing(ticket: Path) -> bool:
     head = ticket.name.removesuffix(SHARED_TICKET).split("-", 1)[-1]
     return LANDING_TICKET in head.partition(GROUP_TICKET)[0].partition(PRIORITY_TICKET)[0]
+
+
+def holder_kind(h: dict) -> str:
+    """Whether lock record `h` (holder_records) is a landing's, and the project it works for, as a wait line
+    names it: from the record's own project_root (the project's resolved path), never its project field,
+    which may name only the harness folder. Text only: nothing stops, requeues or preempts that holder."""
+    root = h.get("project_root")
+    whose = (f"project at {Path(root).parent if Path(root).name == FOLDER else root}" if root
+             else "no project recorded")
+    return f"{'a landing' if h.get('landing') else 'not a landing'}, {whose}"
 
 
 def landing_first(q: list[Path], now: float | None = None) -> list[Path]:

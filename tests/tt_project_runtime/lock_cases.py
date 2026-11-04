@@ -2117,12 +2117,26 @@ def test_only_a_held_landing_mark_of_an_ancestor_makes_a_landing_waiter(env, tmp
     assert _verified(dict(run_env, **{landmark.ENV: str(mine.path)})) == "False", "let go: no landing"
 
 
+def test_a_wait_line_names_a_holders_project_from_its_root_not_its_project_field(tmp_path):
+    """locks.holder_kind: the project comes from the record's project_root (a lock's tt-project folder or a
+    bare root), never from its project field, which may name only the harness folder; a record with no root
+    says so. Whether it is a landing comes only from the label's landing field."""
+    from ttp import locks
+    root = tmp_path / "proj-x"
+    rec = {"holder": "tt-project #7 run 9", "project": "tt-project", "project_root": str(root / "tt-project")}
+    assert locks.holder_kind(rec) == f"not a landing, project at {root}"
+    assert locks.holder_kind({**rec, "landing": True}) == f"a landing, project at {root}"
+    assert locks.holder_kind({**rec, "project_root": str(root)}) == f"not a landing, project at {root}"
+    assert locks.holder_kind({"holder": "x", "project": "proj-y"}) == "not a landing, no project recorded"
+    assert locks.holder_kind({"landing": "yes", "project_root": ""}) == "a landing, no project recorded"
+
+
 @pytest.mark.parametrize("real", [True, False], ids=["landing", "forged"])
 def test_a_landing_ttp_lock_from_another_project_takes_a_shared_lock_before_an_earlier_suite_waiter(env, tmp_path, real):
     """Two projects share a lock. Project A's suite waits first, project B's waiter queues later: it gets the
     lock first when it runs under a real landing mark of its parent (and its label says landing), and in
     arrival order when its marker is forged (a mark another process holds)."""
-    from ttp import landmark
+    from ttp import landmark, locks
     a, b = make(env, "proj-a"), _second_project(env, "proj-b")
     for p in (a, b):
         p.set_config("shared_resources", ["gate"])
@@ -2148,6 +2162,7 @@ def test_a_landing_ttp_lock_from_another_project_takes_a_shared_lock_before_an_e
         if real:
             row = json.loads(_lock_probe(env_a, "gate", extra=("--json",)).stdout)
             assert [h.get("landing") for h in row["holders"]] == [True], row
+            assert locks.holder_kind(row["holders"][0]) == f"a landing, project at {b.root.resolve()}", row
         go_b.touch()
         assert _ended(procs) == [0, 0, 0]
     finally:
