@@ -7,7 +7,8 @@ cannot move main itself. It then asks the running daemon, which runs on the host
 fast-forward: it writes APPLY_REQUEST in state/, the daemon takes it after a tick (renaming it to
 `.taken`), checks it again and writes APPLY_RESULT. The requester keeps the upgrade lock throughout and
 restarts the daemon itself afterwards, as when it moves main on its own. Either way a fast-forward that
-fails part-way puts every file it touched back to main's version: never a half-applied tree.
+fails part-way puts every file it touched back to main's version, except local edits made before it: never a
+half-applied tree.
 
 A daemon older than these requests (its heartbeat's `takes` lacks apply_requests) that takes restart
 requests is first asked to restart onto the harness runtime on disk, when that one takes them (route):
@@ -73,11 +74,14 @@ def no_write(text: str) -> bool:
 
 def fast_forward(h: Path, merged: str, guard_env: str) -> str:
     """Fast-forward main in `h` to `merged`; "" when done, else why not. On a failure every file it
-    touched is put back to main's version, so the tree is as it was."""
-    from .upjournal import _put_back, _touched
+    touched that matched main before it is put back to main's version, so the tree is as it was: a local
+    edit made before the merge is kept."""
+    from .upjournal import _differs, _put_back, _touched
     base = _git(h, "rev-parse", "HEAD").stdout.strip()
     if not base:
         return "could not read main's commit"
+    touched = _touched(h, base, merged)
+    clean = [f for f in touched if f not in _differs(h, touched)]
     r = _git(h, "merge", "--ff-only", merged, env={**os.environ, guard_env: "1"})
     if r.returncode == 0:
         return ""
@@ -85,7 +89,7 @@ def fast_forward(h: Path, merged: str, guard_env: str) -> str:
     if _git(h, "rev-parse", "HEAD").stdout.strip() == merged:
         return ""                           # git moved the branch last: main holds it whole
     try:
-        put = _put_back(h, _touched(h, base, merged))
+        put = _put_back(h, clean)
     except OSError as e:
         return f"{why}; putting its files back failed too ({e})"
     return why + (f"; put back {len(put)} file(s) it had written" if put else "")

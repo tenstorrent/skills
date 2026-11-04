@@ -443,3 +443,34 @@ def test_apply_to_a_target_main_moved_past_fails_cleanly_and_leaves_the_checkout
     assert why and "put back" not in why, why
     assert _git_out(h, "rev-parse", "HEAD") == head and not restarts
     assert _local_edits(p) == edits and _git_out(h, "status", "--porcelain") == status
+
+
+def test_a_fast_forward_git_refuses_over_a_local_edit_keeps_that_edit_byte_for_byte(env, monkeypatch, tmp_path):
+    """The checkout holds an uncommitted edit to a runtime file the upgrade changes: git refuses the
+    fast-forward without writing, and the cleanup puts back nothing over that edit (it only puts back files
+    that matched main before the merge)."""
+    from ttp import applyff, release
+    p, merged, base, restarts = _landed_template_branch(env, monkeypatch, tmp_path)
+    h, rel = p.harness, "runtime/ttp/restriction_audit.py"
+    assert rel in _git_out(h, "diff", "--name-only", "--diff-filter=M", base, merged).split()
+    edit = (h / rel).read_bytes() + b"# a local edit\r\n\x00"
+    (h / rel).write_bytes(edit)
+    status = _git_out(h, "status", "--porcelain")
+    why = applyff.fast_forward(h, merged, release.GUARD_ENV)
+    assert why and "would be overwritten" in why and "put back" not in why, why
+    assert _git_out(h, "rev-parse", "HEAD") == base and not restarts
+    assert (h / rel).read_bytes() == edit and _git_out(h, "status", "--porcelain") == status
+    # A staged edit, and an untracked file where the upgrade adds one, are kept the same way.
+    _hgit(h, "add", rel)
+    wt = tmp_path / "merge"
+    (wt / "runtime" / "ttp" / "added.py").write_text("upstream's new file\n")
+    _hgit(wt, "add", "-A")
+    _hgit(wt, "commit", "-qm", "add a runtime file")
+    merged = _git_out(wt, "rev-parse", "HEAD")
+    (h / "runtime" / "ttp" / "added.py").write_text("a local file\n")
+    status = _git_out(h, "status", "--porcelain")
+    why = applyff.fast_forward(h, merged, release.GUARD_ENV)
+    assert why and "put back" not in why, why
+    assert _git_out(h, "rev-parse", "HEAD") == base and _git_out(h, "status", "--porcelain") == status
+    assert (h / rel).read_bytes() == edit
+    assert (h / "runtime" / "ttp" / "added.py").read_text() == "a local file\n"
