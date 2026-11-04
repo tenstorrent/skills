@@ -425,6 +425,61 @@ def test_a_supersedes_on_the_users_turn_is_a_withdrawal_only_when_it_cites_new_u
                      why="user msg #9 changed it") == [echoes.WITHDRAWN]
 
 
+def test_a_superseded_entry_naming_a_current_cited_restriction_never_orders_its_name_fixed(env):
+    """A coordinator decision quoting the name of a current, user-cited Restrictions item is superseded
+    (on the user's turn, the new text citing the user: WITHDRAWN). The item's name, heading or wording
+    in the charter, a task spec, a harness script or a later fact restating it is advisory, never a fix
+    order; the retired decision's own wording still is."""
+    from ttp import coordinator as coord, echoes
+    p = make(env)
+    p.charter_path.write_text("# demo\n\n## Brief\nShip it.\n\n## Restrictions\n"
+                              "- **Quiet-hours gate**: never restart a shared service while the `quiet-gate` "
+                              "check reports a holder (user msg #4).\n### Spare-pool hosts\n"
+                              "- Keep two hosts free at all times. (origin: harness gate)\n"
+                              "### Night-batch window (user msg #6)\n- Batch jobs start after 22:00.\n")
+    old = p.add_memory("Run the `quiet-gate` check, then use the `spare-pool hosts` for each service restart "
+                       "outside the `night-batch window`.",
+                       kind="decision")
+    said = _echo_said(p, "Thanks, carry on.")
+    assert coord.apply(p, [{"type": "memory_add", "memory_kind": "decision", "supersedes": [old.stem],
+                            "text": "Service restarts follow the Restrictions items (user msg #4)."}],
+                       user_turn=True, turn=1, messages=[said]) == []
+    assert [r["kind"] for r in echoes.records(p)] == [echoes.WITHDRAWN]
+    fact = p.add_memory("The `quiet-gate` restriction is current (user msg #4).", kind="fact")
+    spec = p.db.add_task("restart", "Check the `quiet-gate` before restarting; the spare-pool hosts stay free.")
+    pool = p.db.add_task("pool", "Leave the spare-pool hosts alone during the night-batch window.")
+    script = p.harness / "bin" / "quiet-gate-check"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("#!/bin/sh\n# quiet-gate: refuse a restart while a holder is listed\nexit 0\n")
+    rel = script.resolve().relative_to(p.root.resolve()).as_posix()
+    hits = {h["key"].split(":", 1)[1]: h for h in echoes.scan(p)}
+    assert {"charter:Restrictions", f"task:{spec}:spec", f"task:{pool}:spec", f"file:{rel}",
+            f"memory:{fact.stem}"} <= set(hits), hits
+    assert all(h["class"] == "advisory" and "current Restrictions item" in h["why"] for h in hits.values()), hits
+    assert echoes.digest_lines(p) == []
+    # The retired decision's own wording, copied into a task spec, is still a fix order.
+    copy = p.db.add_task("copy", "Run the `quiet-gate` check, then use the `spare-pool hosts` for each service "
+                                 "restart outside the `night-batch window`.")
+    hit = next(h for h in echoes.scan(p) if h["label"] == f"task #{copy} spec")
+    assert hit["class"] == "directive" and hit["phrase"].startswith("run the"), hit
+    assert echoes.digest_lines(p)[0] == echoes.RETIRED_HEADER
+
+
+def test_a_cited_restriction_name_never_shields_a_users_own_retirement_or_an_unsourced_item(env):
+    """Only a memory entry's retirement yields to a current cited Restrictions item: a user Correction's
+    wrong part stays a fix order wherever it is copied, and an unsourced item shields nothing."""
+    from ttp import echoes
+    p = make(env)
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never use the `drain-lane` path (user msg #2).\n"
+                              "- Prefer the `bulk-lane` path.\n")
+    echoes.record(p.db, "memory [corr] (user correction)", "use the `drain-lane` path", negated=True,
+                  found=["drain-lane"])
+    echoes.record(p.db, "memory [old] superseded by [new]", "Send jobs down the `bulk-lane` path.", "Use any lane.")
+    spec = p.db.add_task("lanes", "Send jobs down the drain-lane and the bulk-lane.")
+    got = {h["phrase"]: h["class"] for h in echoes.scan(p) if h["label"] == f"task #{spec} spec"}
+    assert got == {"drain-lane": "directive", "bulk-lane": "directive"}, got
+
+
 def test_ttp_echoes_exports_every_retirement_and_match_read_only_including_ones_the_digest_omits(env, capsys):
     import hashlib as _hashlib
     import json as _json

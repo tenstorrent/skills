@@ -33,7 +33,10 @@ advisory: counted on one line, never a fix order. A fourth kind, UNVERIFIED (its
 shows the user withdrew that rule), is advisory too: a record stored before kinds existed gets one from
 its source (_kind), and an unknown kind or source is UNVERIFIED. A hit of an unsourced Restrictions item dropped (by the coordinator or
 the user, with `over` or not: restriction_source.drops_unsourced) is advisory while the Brief or a sourced item still states it (restriction_audit.still_stated):
-that rule still binds, so its copies are right. One the coordinator dropped on its own is SUPERSEDED, never
+that rule still binds, so its copies are right. Likewise a memory entry's retirement (superseded or withdrawn)
+never retires a phrase a current Restrictions item with its source (a user cite, origin: Brief or harness gate)
+or its heading holds whole: a hit on it is advisory (_current), wherever it stands; a user Correction or a charter
+replacement keeps its fix orders. One the coordinator dropped on its own is SUPERSEDED, never
 WITHDRAWN, and one a record stored before the flag holds is UNVERIFIED (_unsourced). `export` is the read-only full list
 behind `ttp echoes`. Accepted gaps (settled weak-token set): a dashed config-style name with a decimal
 suffix ('max-ratio-1.5') counts as weak; a version joined by '_', '=' or '+' counts as strong (over-flag).
@@ -525,6 +528,41 @@ def _unsourced(rec: dict) -> bool:
     return bool(items) and not any(sourced(x) for x in items)
 
 
+_MEMORY_RETIRED = re.compile(r"memory \[[^\]]+\] (?:superseded by \[|withdrawn$)")
+
+
+def _current(charter: str) -> list[str]:
+    """The flattened text of each current Restrictions item that binds (restriction_source.sourced: a user
+    cite, the Brief or a harness gate), with the heading (section or sub-heading) it stands under."""
+    from .prompts import charter_sections
+    from .restriction_source import sourced, split_items
+    out: list[str] = []
+    for head, body in charter_sections(charter):
+        name = head[3:].strip()
+        if not name.lower().startswith("restriction"):
+            continue
+        for it in split_items("\n".join(body)):
+            text = " ".join(" ".join(it).split())
+            if text.startswith("#"):
+                name = text.lstrip("#").strip()
+                if sourced(name):   # a cite on the sub-heading itself
+                    out.append(_flat(name))
+            elif sourced(text):
+                out += [_flat(text), _flat(name)]
+    return list(dict.fromkeys(out))
+
+
+def _states(units: list[str], ph: str) -> bool:
+    """Whether a current cited Restrictions item or its heading (`units`, _current) holds phrase `ph` whole."""
+    for u in units:
+        i = u.find(ph)
+        while i >= 0:
+            if not _inside(u, i, ph):
+                return True
+            i = u.find(ph, i + 1)
+    return False
+
+
 def records(p, now: float | None = None) -> list[dict]:
     """The live retirements (kept RETIRED_DAYS), each with its kind (see _kind; _unsourced)."""
     now = time.time() if now is None else now
@@ -556,6 +594,7 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
         charter = p.charter_path.read_text()
     except OSError:
         charter = ""
+    units = _current(charter)
     out, seen = [], set()
     for rec in sorted(recs, key=lambda r: -r.get("at", 0)):
         own = [ph for ph in rec.get("phrases") or [] if rec.get("negated") or not _generic(ph, vocab)]
@@ -566,7 +605,9 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
             from .restriction_audit import still_stated
             stated = still_stated(charter, rec.get("old") or "")
         weak = {ph for ph in own if _weak(ph) or _fragment(ph, rec.get("old") or "")}
-        own.sort(key=lambda ph: ph in weak)   # a governing phrase first: a hit rests on it when it can
+        # A memory entry's retirement never retires what a current cited Restrictions item still states.
+        cur = {ph for ph in own if _states(units, ph)} if _MEMORY_RETIRED.match(rec.get("source") or "") else set()
+        own.sort(key=lambda ph: ph in weak or ph in cur)   # a governing phrase first: a hit rests on it when it can
         skip = set(rec.get("skip") or ())
         for key, label, text, flat in where:
             if key in skip or (rec["id"], key) in seen or _BRIEF.match(key):   # the user's own words, never one
@@ -577,6 +618,7 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
                 if key.startswith("file:"):
                     label += f":{_lineno(text, ph)}"
                 why = (f"still stated in {stated}: no action" if stated else
+                       "a current Restrictions item with its source states it: no action" if ph in cur else
                        "" if rec["kind"] == WITHDRAWN and ph not in weak else
                        "origin not recorded: nothing shows the user withdrew this rule" if rec["kind"] == UNVERIFIED
                        else f"retired as {rec['kind']}, not withdrawn by the user" if rec["kind"] != WITHDRAWN
@@ -647,7 +689,8 @@ def digest_lines(p, now: float | None = None) -> list[str]:
                      f" listed again once its line changes)")
     if advisory:   # counted, never a fix order
         lines.append(f"- {advisory} advisory match{'es' if advisory != 1 else ''} not shown: a compacted fact, a "
-                     f"superseded coordinator decision, a retirement of unknown origin or only a file name, version "
+                     f"superseded coordinator decision, a retirement of unknown origin, a name a current cited "
+                     f"Restrictions item states or only a file name, version "
                      f"or evidence reference, never a rule the user withdrew; change nothing for them (all: "
                      f"`ttp echoes`)")
     return lines
