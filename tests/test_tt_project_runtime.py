@@ -495,7 +495,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     statcache.clear()
     # Tests may run inside a live run, detached checks, `ttp detach` (no in-run lock-wait cap) or `ttp lock`.
     # The outer checks' output directory and lifetime descriptor belong to that invocation.
-    for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT", "TTP_DETACHED", "TTP_CHECK_WAITS", "TTP_LOCKS_HELD", "TTP_PIDNS",
+    for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT", "TTP_DETACHED", "TTP_OUTLIVES_RUN", "TTP_CHECK_WAITS", "TTP_LOCKS_HELD", "TTP_PIDNS",
                 "TTP_CGROUP", "TTP_CHECK_OUTPUT_DIR", "TTP_CHECKS_TMP_FD", "TTP_PUSH_OWN_BRANCH", "TTP_DETACH_RC",
                 "TTP_CHECKS_SLOT", "TTP_CHECKS_HOST_MAX", "TTP_ROUTE_HOST_MAX", "TTP_WAITS_IDLE", "TTP_TEST_SLOTS_HELD", "TTP_TEST_POOL", "TTP_TEST_RUN_MAX",
                 "TTP_BUILD_SLOTS_HELD", "TTP_BUILD_POOL", "TTP_BUILD_RUN_MAX", "TTP_BUILD_PROJECT_MAX", "MAKEFLAGS",

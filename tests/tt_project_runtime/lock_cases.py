@@ -1908,7 +1908,7 @@ def _queue_ask(w):
 
 
 def _queue_plain_env():
-    return {k: v for k, v in os.environ.items() if k not in ("TTP_RUN_DIR", "TTP_DETACHED", "PYTHONPATH")}
+    return {k: v for k, v in os.environ.items() if k not in ("TTP_RUN_DIR", "TTP_DETACHED", "TTP_OUTLIVES_RUN", "PYTHONPATH")}
 
 
 def test_a_killed_waiters_queue_entry_is_dropped_even_when_a_child_keeps_its_lock_and_the_next_waiter_goes(
