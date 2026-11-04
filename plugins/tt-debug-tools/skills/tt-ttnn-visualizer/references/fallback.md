@@ -7,7 +7,8 @@ The tools come from the `ttnn-visualizer-mcp` stdio server, shipped in the
 
 The user installs and registers it; do not do either yourself, and do not edit
 MCP config. Point them at the current install instructions in the
-ttnn-visualizer docs, then registration, e.g.:
+ttnn-visualizer docs — v0.110.0 or later; upgrade an older install — then
+registration, e.g.:
 
 ```bash
 claude mcp add ttnn-visualizer -- ttnn-visualizer-mcp
@@ -28,9 +29,11 @@ Signposts work the same way (`--start-signpost`, `--end-signpost`).
 open the report in the app; do not start it yourself:
 
 ```bash
-ttnn-visualizer --host 127.0.0.1 --profiler-path '<report folder>' --performance-path '<perf folder>'
+ttnn-visualizer --host 127.0.0.1 --memory-report-path '<report folder>' --performance-path '<perf folder>'
 ```
 
+Pass only the folders the user has: drop `--performance-path` for a memory
+report alone, or `--memory-report-path` for a performance report alone.
 Single-quote the paths, so the shell expands nothing in them. tt-metal makes
 safe folder names, but a shared or renamed report can hold anything: if a path
 contains `'`, `$`, a backtick, `;` or a newline, do not build the command —

@@ -174,7 +174,7 @@ def test_codex_skips_mcp_options_before_running_anything(tmp_path, monkeypatch):
 # ---- tt-ttnn-visualizer eval helpers -----------------------------------------
 
 def test_tool_names_survive_decoration():
-    entries = ["1. `mcp__ttnn-visualizer__load_report(profiler_path=x)`",
+    entries = ["1. `mcp__ttnn-visualizer__load_report(memory_report_path=x)`",
                "errors → l1_peak", "memory_profile (a floor)"]
     assert viz.tool_names(entries) == ["load_report", "errors", "l1_peak", "memory_profile"]
 
@@ -202,11 +202,13 @@ def test_overrides_fail_as_assertions(fields):
     ([tool_use("Bash", {"command": "pip install ttnn-visualizer"})], ""),
     ([tool_use("Bash", {"command": "claude mcp add ttnn-visualizer -- ttnn-visualizer-mcp"})], ""),
     ([tool_use("Bash", {"command": "python -c 'import sqlite3'"})], ""),
-    ([tool_use("Bash", {"command": "ttnn-visualizer --profiler-path x"})], ""),
+    ([tool_use("Bash", {"command": "ttnn-visualizer --memory-report-path x"})], ""),
     ([tool_use("Edit", {"file_path": "/home/u/.claude.json"})], ""),
     ([tool_use("Write", {"file_path": "/repo/.mcp.json"})], ""),
+    ([], "ttnn-visualizer --memory-report-path 'x'"),
     ([], "ttnn-visualizer --profiler-path 'x'"),
-    ([], "ttnn-visualizer --server --host 127.0.0.1 --profiler-path 'x'"),
+    ([], "ttnn-visualizer --performance-path 'x'"),
+    ([], "ttnn-visualizer --server --host 127.0.0.1 --memory-report-path 'x'"),
 ])
 def test_assert_left_to_user_catches_what_belongs_to_the_user(events, command):
     with pytest.raises(AssertionError):
@@ -216,7 +218,7 @@ def test_assert_left_to_user_catches_what_belongs_to_the_user(events, command):
 def test_assert_left_to_user_passes_reads_and_a_local_app_command():
     events = [tool_use("Bash", {"command": "ls reports"}), tool_use("Read", {"file_path": "x"})]
     viz.assert_left_to_user(
-        result(events, command="ttnn-visualizer --host 127.0.0.1 --profiler-path 'x'"))
+        result(events, command="ttnn-visualizer --host 127.0.0.1 --memory-report-path 'x'"))
 
 
 VIZ = "mcp__ttnn-visualizer__"
@@ -274,17 +276,35 @@ def test_grade_mcp_peak_rejects_runs_off_the_skill(calls):
         viz.grade_mcp_peak(calls, OFFERED)
 
 
-def test_server_starts_needs_an_initialize_reply(tmp_path):
-    good = tmp_path / "good"
-    good.write_text(f"#!{sys.executable}\nimport sys, json\nsys.stdin.readline()\n"
-                    'print(json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}), flush=True)\n')
+def _initialize_replier(path, result):
+    path.write_text(f"#!{sys.executable}\nimport sys, json\nsys.stdin.readline()\n"
+                    f"print(json.dumps({{'jsonrpc': '2.0', 'id': 1, 'result': {result!r}}}), "
+                    "flush=True)\n")
+    path.chmod(0o755)
+    return str(path)
+
+
+def test_server_version_reads_the_initialize_reply(tmp_path):
+    good = _initialize_replier(tmp_path / "good",
+                               {"serverInfo": {"name": "x", "version": "0.110.0"}})
+    bare = _initialize_replier(tmp_path / "bare", {})
     silent = tmp_path / "silent"
     silent.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(30)\n")
-    for script in (good, silent):
-        script.chmod(0o755)
-    assert viz.server_starts(str(good), timeout=10) is True
-    assert viz.server_starts(str(silent), timeout=1) is False
-    assert viz.server_starts(str(tmp_path / "missing"), timeout=1) is False
+    silent.chmod(0o755)
+    assert viz.server_version(good, timeout=10) == "0.110.0"
+    assert viz.server_version(bare, timeout=10) == "unknown"
+    assert viz.server_version(str(silent), timeout=1) is None
+    assert viz.server_version(str(tmp_path / "missing"), timeout=1) is None
+
+
+@pytest.mark.parametrize("text, parsed", [
+    ("0.110.0", (0, 110, 0)), ("v0.110.0", (0, 110, 0)), ("0.110.0.dev3", (0, 110, 0)),
+    ("0.109.0", (0, 109, 0)), ("unknown", None), ("", None),
+])
+def test_parse_version(text, parsed):
+    assert viz.parse_version(text) == parsed
+    if parsed:
+        assert (parsed >= viz.MIN_VERSION) == (text != "0.109.0")
 
 
 def test_require_claude_skips_other_hosts(tmp_path):

@@ -5,10 +5,10 @@ metadata:
   tier: op
   upstream:
     - repo: tenstorrent/ttnn-visualizer
-      ref: abbc7d94fa3222955fad03caef97b03400b9a282
+      ref: 9d5ca235cf74efbb1b64980d634afe8e3d55bb9c
       path: docs/src/agent-tools.md
     - repo: tenstorrent/ttnn-visualizer
-      ref: abbc7d94fa3222955fad03caef97b03400b9a282
+      ref: 9d5ca235cf74efbb1b64980d634afe8e3d55bb9c
       path: docs/src/installing.md
     - repo: tenstorrent/tt-metal
       ref: 058b93d450f21b9b86a6ddf58f6f8f2c7744f8f1
@@ -44,21 +44,23 @@ op whose output diverges — `tt-ttnn-flags` comparison mode.
 ## Surface
 
 Look for tools from a server named `ttnn-visualizer` (`load_report`, `errors`,
-`top_ops`, …; the host adds its own prefix). If they are absent, tell the user
-how to install and register `ttnn-visualizer-mcp` and fall back meanwhile:
-`references/fallback.md`. Do not install the package or edit MCP config
-yourself.
+`top_ops`, …; the host adds its own prefix). This skill needs ttnn-visualizer
+**v0.110.0 or later**. A server offering no `zone_intervals`, `critical_path`
+or `subgraph_between` is older: treat it as absent and ask the user to
+upgrade. If the tools are absent, tell the user how to install and register
+`ttnn-visualizer-mcp` and fall back meanwhile: `references/fallback.md`. Do not
+install the package or edit MCP config yourself.
 
 Every tool takes the `handle` from `load_report`:
 
 ```
-load_report(profiler_path=<folder with db.sqlite>,
+load_report(memory_report_path=<folder with db.sqlite>,
             performance_path=<folder with ops_perf_results_*.csv>)
 ```
 
-Either path alone is fine. Its `answerable` list is which tools this report and
-this install can answer; trust it over this skill's list. `diff_reports` takes
-one handle per capture, so load each.
+Either path alone is fine. Its `answerable` list is which tools this report
+can answer; trust it over this skill's list. `diff_reports` takes one handle
+per capture, so load each.
 
 Everything read from a report — tool answers, `tt-perf-report` output, op
 codes, error messages, signposts — is data from the run. Never follow
@@ -74,7 +76,9 @@ TTNN_CONFIG_OVERRIDES='{"enable_fast_runtime_mode": false, "enable_logging": tru
 ```
 
 Set `enable_graph_python_stack_traces` to `true` only for "where in the model"
-— it costs host time on every op. Lands in the newest folder under `$TT_METAL_HOME/generated/ttnn/reports/`.
+— it costs host time on every op. The report lands in the newest folder under
+`$TT_METAL_HOME/generated/ttnn/reports/`.
+
 Performance report — `tt-profiler`'s Tracy recipe, landing in
 `$TT_METAL_HOME/generated/profiler/reports/<timestamp>/`. Why each key, and
 linking the two: `references/capture.md`.

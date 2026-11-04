@@ -3,12 +3,17 @@
 All read-only. `load_report` first: it returns the `handle` the rest take, and
 `answerable` / `unanswerable` lists that save probing tool by tool.
 
-Not every ttnn-visualizer release ships every tool below, recent ones
-included — `l1_peak`, `critical_path` and `subgraph_between` especially. If
-`load_report` does not list one, use the nearest one it does (`memory_profile`
-plus `operation_detail` for L1) and say the answer is weaker for it.
+ttnn-visualizer v0.110.0, the minimum this skill supports, ships every tool
+below. A report can still leave one unanswerable — a truncated capture
+missing the tables a tool reads, say. Then use the nearest one `load_report` lists
+(`memory_profile` plus `operation_detail` for L1) and say the answer is weaker
+for it.
 
-## Database tools (`profiler_path`, `db.sqlite`)
+`load_report` takes the memory report folder as `memory_report_path`. Its
+answer still names it `profiler_path`, and `device_count.profiler` counts the
+memory report's devices.
+
+## Database tools (`memory_report_path`, `db.sqlite`)
 
 | Tool | Answers | Watch for |
 |---|---|---|
@@ -31,6 +36,7 @@ plus `operation_detail` for L1) and say the answer is weaker for it.
 | `program_cache` | Repeat calls that rebuilt their program. | Needs a run that repeats ops. |
 | `core_spread` | Per-core imbalance inside an op. | |
 | `zone_timings` | Per-zone, per-RISC device totals. | |
+| `zone_intervals` | Start-to-start time of a zone that recurs within one kernel run — per loop iteration, the steady-state time: median, min and max per device and per RISC. | Listed only when the device log marks zone starts and ends and names its chip frequency; never pooled across devices. Flags runs that filled the profiler's L1 buffer. |
 | `diff_reports` | Per-op-code change between two captures, above a noise threshold. | Pass `repeats_a` / `repeats_b` for medians; one capture each side is anecdote. |
 
 `top_ops`, `op_breakdown` and `diff_reports` take `start_signpost` /

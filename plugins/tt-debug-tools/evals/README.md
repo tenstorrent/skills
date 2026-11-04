@@ -79,8 +79,9 @@ measure agreement with itself, not correctness.
 
 `tt-ttnn-visualizer` reads a real report instead of a fixture: set
 `TT_VIZ_EVAL_REPORT` to an unzipped report from a trusted source, such as
-ttnn-visualizer's `demo-reports/n300-llama.zip`, and optionally
+ttnn-visualizer's `demo-reports/n300-llama.zip`, and
 `TT_VIZ_EVAL_EXPECTED_L1_PEAK_OP` to the op that holds its L1 peak
 (`paged_scaled_dot_product_attention_decode` for that demo). It starts
-`ttnn-visualizer-mcp` from `PATH`, or from `TT_VIZ_EVAL_MCP_COMMAND`. Without a
-report or a server command, that eval skips.
+`ttnn-visualizer-mcp` (v0.110.0 or later) from `PATH`, or from
+`TT_VIZ_EVAL_MCP_COMMAND`. Without a report, an expected op or a server
+command, or with an older server, that eval skips.

@@ -37,7 +37,8 @@ data rather than failing. Each skill names its conflicts.
 
 `tt-ttnn-visualizer` reads reports through the read-only MCP server that ships
 with the `ttnn-visualizer` Python package. This plugin does not register it.
-Install the current release per the ttnn-visualizer docs, then:
+It needs ttnn-visualizer v0.110.0 or later. Install the current release per
+the ttnn-visualizer docs, then:
 
 ```bash
 claude mcp add ttnn-visualizer -- ttnn-visualizer-mcp     # Claude Code

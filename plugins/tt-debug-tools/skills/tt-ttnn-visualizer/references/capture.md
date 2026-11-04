@@ -29,7 +29,7 @@ Every missing condition fails silently: no report, no error, often no folder.
 Output: the newest folder by mtime under
 `$TT_METAL_HOME/generated/ttnn/reports/` — name is `report_name` plus a date
 suffix — holding `db.sqlite` and usually `config.json`. Pass that folder as
-`profiler_path`.
+`memory_report_path`.
 
 Outside pytest (a demo script, a server) the fixture does not run, so build
 the report in two steps — capture to JSON, then import it offline:
@@ -58,7 +58,7 @@ Import into a **new, empty** folder: the importer silently deletes a
 `db.sqlite` already there if its schema is older or it cannot be read. Quote
 paths as for the app command (`references/fallback.md`). Capture still needs
 `enable_fast_runtime_mode: false`. The folder, now holding `db.sqlite`, is the
-`profiler_path`.
+`memory_report_path`.
 Graph-capture detail: `tt-ttnn-flags` (`references/graph-capture.md`).
 
 ## Performance report (CSV)

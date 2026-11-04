@@ -27,11 +27,14 @@ EXPECTED_OP_ENV = "TT_VIZ_EVAL_EXPECTED_L1_PEAK_OP"
 # The ttnn-visualizer-mcp executable, when it is not on PATH. The harness hands
 # it to the agent explicitly: --restricted ignores servers the user registered.
 SERVER_COMMAND_ENV = "TT_VIZ_EVAL_MCP_COMMAND"
+# The oldest ttnn-visualizer release the skill supports.
+MIN_VERSION = (0, 110, 0)
 
 TOOLS = ("load_report", "errors", "l1_peak", "memory_profile", "operation_detail",
          "dram_fallbacks", "find_operations", "operation_provenance", "top_ops",
          "op_breakdown", "core_spread", "program_cache", "diff_reports",
-         "zone_timings", "tensor_flow", "critical_path", "subgraph_between")
+         "zone_timings", "zone_intervals", "tensor_flow", "critical_path",
+         "subgraph_between")
 # Not \b: an mcp__server__ prefix joins the name with `_`, a word character.
 TOOL_RE = re.compile(r"(?<![A-Za-z0-9])(" + "|".join(TOOLS) + r")(?![A-Za-z0-9_])")
 
@@ -47,6 +50,8 @@ HOST_CONFIG = re.compile(r"\.mcp\.json$|\.claude\.json$|\.claude/settings[^/]*\.
                          r"|\.codex/config\.toml$")
 
 PLAIN_NAME = re.compile(r"[\w.-]+")
+# The app command's report flags, current and deprecated.
+APP_PATH_FLAG = re.compile(r"--(memory-report|profiler|performance)-path(?![-\w])")
 
 
 def tool_names(entries) -> list[str]:
@@ -91,7 +96,7 @@ def assert_left_to_user(res) -> None:
             path = inp.get("file_path") or inp.get("notebook_path") or ""
             assert not HOST_CONFIG.search(path), f"edited host config: {path}"
     command = res.answer["command"]
-    if "--profiler-path" in command:
+    if APP_PATH_FLAG.search(command):
         assert "--host 127.0.0.1" in command, command
         assert "--server" not in command, command
 
@@ -145,9 +150,17 @@ def grade_mcp_peak(calls: list[dict], offered: list[str]) -> None:
     assert reads, f"no successful {peak_tool} on handle {result['handle']!r}: {names}"
 
 
-def server_starts(command: str, timeout: float = 30) -> bool:
-    """Whether the stdio server answers an MCP initialize — checked before a
-    paid run, since one that cannot start costs a whole run to discover."""
+def parse_version(text: str) -> tuple[int, ...] | None:
+    """`0.110.0`, `v0.110.0` or `0.110.0.dev3` as (0, 110, 0); None when it
+    does not start with three numbers, as for `unknown`."""
+    m = re.match(r"v?(\d+)\.(\d+)\.(\d+)", text or "")
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
+def server_version(command: str, timeout: float = 30) -> str | None:
+    """The `serverInfo.version` a stdio server answers an MCP initialize with,
+    or None if it does not answer — checked before a paid run, since a server
+    that cannot start, or is too old, costs a whole run to discover."""
     request = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
         "protocolVersion": "2025-06-18", "capabilities": {},
         "clientInfo": {"name": "tt-debug-tools-eval", "version": "0"}}}
@@ -155,7 +168,7 @@ def server_starts(command: str, timeout: float = 30) -> bool:
         proc = subprocess.Popen([command], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, text=True)
     except OSError:
-        return False
+        return None
     reply = []
     reader = threading.Thread(target=lambda: reply.append(proc.stdout.readline()), daemon=True)
     try:
@@ -169,9 +182,15 @@ def server_starts(command: str, timeout: float = 30) -> bool:
         proc.kill()
         proc.wait()
     try:
-        return bool(reply) and json.loads(reply[0]).get("id") == 1
+        message = json.loads(reply[0]) if reply else None
     except json.JSONDecodeError:
-        return False
+        return None
+    if not isinstance(message, dict) or message.get("id") != 1:
+        return None
+    result = message.get("result")
+    info = result.get("serverInfo") if isinstance(result, dict) else None
+    version = info.get("version") if isinstance(info, dict) else None
+    return version if isinstance(version, str) and version else "unknown"
 
 
 def require_claude(agent) -> None:
@@ -275,7 +294,8 @@ def eval_memory_fallback_without_server(agent):
 
     res.assert_dispatched("tt-ttnn-visualizer")
     command = res.answer["command"]
-    assert "--profiler-path" in command or "ttnn-visualizer-mcp" in res.text(), res.answer
+    assert ("--memory-report-path" in command
+            or "ttnn-visualizer-mcp" in res.text()), res.answer
     assert "tt-perf-report" not in command and "sqlite3" not in command, command
     assert_left_to_user(res)
 
@@ -311,8 +331,13 @@ def eval_uses_mcp_when_present(agent):
         raise SkipEval(f"{EXPECTED_OP_ENV} not set: no answer to grade against")
     command = server_command()
     require_claude(agent)
-    if not server_starts(command):
+    version = server_version(command)
+    if version is None:
         raise SkipEval(f"{SERVER} did not answer initialize ({command})")
+    parsed = parse_version(version)
+    if parsed is not None and parsed < MIN_VERSION:
+        raise SkipEval(f"{SERVER} {version} predates the supported minimum "
+                       f"{'.'.join(map(str, MIN_VERSION))}")
     res = agent.ask(
         f"Which operation holds the L1 peak in this TTNN run? Memory report: "
         f"{profiler}. Performance report: {performance}. Put the operation's "

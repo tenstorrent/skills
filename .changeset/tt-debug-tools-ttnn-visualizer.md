@@ -4,12 +4,13 @@
 
 Add `tt-ttnn-visualizer`: read TTNN memory reports (`db.sqlite`) and profiler
 ops-perf CSVs through TT-NN Visualizer's read-only MCP server — which op crashed
-or ran out of L1 and why, L1 footprint (the peak and its residents where the
-installed release has `l1_peak`), likely DRAM fallbacks, model-code provenance,
-why an op is slow, and noise-aware diffs between captures. The skill follows
-the tools `load_report` says are available rather than assuming a release. The
-plugin does not register the server; the skill tells the user how to, and falls
-back to `tt-perf-report` and the visualizer app without it.
+or ran out of L1 and why, the L1 peak and its residents, likely DRAM
+fallbacks, model-code provenance, why an op is slow, and noise-aware diffs
+between captures. It needs ttnn-visualizer v0.110.0 or later, which names the
+memory report path `memory_report_path` / `--memory-report-path`, and follows
+the tools `load_report` says a report can answer. The plugin does not register
+the server; the skill tells the user how to, and falls back to `tt-perf-report`
+and the visualizer app without it.
 
 Not verified on a device: the capture recipe and traps come from tt-metal and
 ttnn-visualizer source and docs, and the tools were exercised against a
