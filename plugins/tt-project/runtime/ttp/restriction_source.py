@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import re
 
-from . import relay
+from . import relay, yesask
 
 CITE_RE = re.compile(r"\b(?:user(?:['’]s)?\s+(?:(?:msgs?|messages?)\s+)?|relayer-ordered,\s*msgs?\s+)#\d+", re.I)
 RELAYER = "relayer"   # `source.origin`: the owner's own agent's words (relay.agent_orders), cited RELAYER_CITE
@@ -121,6 +121,8 @@ def check(db, charter: str, text: str, src, agent: bool = False) -> str:
     except ValueError:
         raise ValueError(f"charter_update rejected: message check failed: `source.msg` must be a user message id, "
                          f"got {src.get('msg')!r}. {SOURCE_FORMS}") from None
+    if db.one("SELECT 1 FROM messages WHERE id=? AND kind='ask' AND direction='out'", (mid,)):
+        mid = yesask.reply_to(db, mid) or mid   # an ask's id: the plain yes that answered it is the source
     rows = relay.recent(db, [mid])
     row = next((r for r in rows if r["id"] == mid), None)
     kind = db.one("SELECT kind FROM messages WHERE id=?", (mid,))
@@ -128,6 +130,9 @@ def check(db, charter: str, text: str, src, agent: bool = False) -> str:
         raise ValueError(f"charter_update rejected: message check failed: message #{mid} is not a message from the "
                          f"user. {SOURCE_FORMS}")
     own, ctx = relay.split(row["text"] or "", row["context"])
+    asked = yesask.scope(db, mid, own) if len(quote) >= 3 and _loose(quote) not in _loose(own) else ""
+    if asked and _loose(quote) in _loose(asked):   # the rule, quoted from the ask a plain yes answers
+        return _own_cite(text, f" (user msg #{mid})", charter)
     if agent and len(quote) >= 3 and _loose(quote) in _loose(ctx) and (origin == RELAYER or _loose(quote) not in _loose(own)):
         return _own_cite(text, RELAYER_CITE.format(mid), charter)
     if len(quote) < 3 or _loose(quote) not in _loose(own):

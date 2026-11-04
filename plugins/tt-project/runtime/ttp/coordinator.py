@@ -102,6 +102,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     verified,
     watchdup,
     worktree,
+    yesask,
 )
 from . import urgent
 from . import probevars
@@ -2999,6 +3000,17 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             agent_cite = "relayer-ordered" in cite
                         except ValueError as e:   # raised by _charter_update after its own checks
                             unsourced = str(e)
+                            if "which `source` does not name" in unsourced and not _parse_origin(a.get("source")):
+                                try:
+                                    bare = restriction_source.bare(text)
+                                    cite = restriction_source.check(db, p.charter_path.read_text(), bare,
+                                                                    a.get("source"), agent)
+                                    notes.append(f"charter_update repaired: dropped the cites in `text` that "
+                                                 f"`source` does not name and cited{cite}")
+                                    text, unsourced = restriction_source.cite_items(bare, cite), ""
+                                    agent_cite = "relayer-ordered" in cite
+                                except ValueError:
+                                    pass
                     # a Restrictions item edited without the user's word or `over` is refused below anyway
                     refused = (quote and _DATED.sub("", section).lower().startswith("restriction")
                                and not (uturn or ok or len(over) >= OVER_MIN))
@@ -3008,12 +3020,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             raise ValueError("`excepts` goes with new Restrictions `text` only, "
                                              "never with `quote` or `replaces`")
                         verbatim = bool(a.get("source")) and bool(re.search(r"user msg #\d+|relayer-ordered", cite))
-                        said = ""   # the source message's words: the user's own, the agent's too in agent mode
-                        if verbatim and not unsourced:
-                            mid = int(str(restriction_source._parse(a["source"]).get("msg")).lstrip("#"))
-                            row = next(r for r in relay.recent(db, [mid]) if r["id"] == mid)
-                            own, ctx = relay.split(row["text"] or "", row["context"])
-                            said = own + ("\n" + ctx if agent else "")
+                        # the source message's words: the user's own, the agent's too in agent mode, a yes's ask
+                        said = _verbatim_said(db, cite, agent) if verbatim and not unsourced else ""
                         text, overlap = _scoped_exception(
                             p.charter_path.read_text(), section, text, excepts,
                             "" if verbatim and not unsourced else unsourced or (
@@ -3021,10 +3029,22 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                 else restriction_source.NO_SOURCE), end, said)
                         notes.append(overlap)
                     elif text and not (replaces or a.get("both_hold") or refused):
-                        overlap = _reject_contradicting_append(p, section, text, uturn, cited or messages, ok,
-                                                               quote, end)
-                        if overlap:
+                        # the user's verbatim words (or agent-ordered) behind a lift: the harness fixes its form
+                        fixed, why_not = (_repair_lift(p, section, text, end, _verbatim_said(db, cite, agent))
+                                          if not (quote or unsourced) and re.search(r"user msg #\d+|relayer-ordered",
+                                                                                    cite) else ("", ""))
+                        if fixed:
+                            text, overlap = fixed
                             notes.append(overlap)
+                        else:
+                            try:
+                                overlap = _reject_contradicting_append(p, section, text, uturn, cited or messages,
+                                                                       ok, quote, end)
+                            except ValueError as e:
+                                raise ValueError(f"{e}. Not repaired as a scoped exception: {why_not}" if why_not
+                                                 else str(e)) from None
+                            if overlap:
+                                notes.append(overlap)
                     source = (_users_own(db, messages or []) if user_turn else via or cited if uturn
                               else list((ok or {}).get("messages") or []))
                     # a cited Restrictions item removed or replaced in a user turn: this turn's words in `source`
@@ -5564,6 +5584,48 @@ def _scoped_exception(charter: str, section: str, text: str, clause: str, source
         "; these items name none of its scope and still hold: " + "; ".join(f"\"{clip(s, 120)}\"" for s in rest)
         if rest else ""))
     return stored, note
+
+
+def _parse_origin(src) -> str:
+    """A `source`'s origin (brief, gate, relayer), "" for a message's words or one that does not parse."""
+    try:
+        return str(restriction_source._parse(src).get("origin") or "").strip().lower()
+    except (ValueError, TypeError):
+        return ""
+
+
+def _verbatim_said(db, cite: str, agent: bool) -> str:
+    """The words a checked Restrictions `cite` ("(user msg #N)", or relayer-ordered) rests on: that
+    message's own words, the owner's agent's too in agent mode, and for a plain yes the question of the
+    ask it answers (yesask.scope), whose scope the yes approves."""
+    m = re.search(r"(?:user msg|relayer-ordered, msg) #(\d+)", cite)
+    row = next(iter(relay.recent(db, [int(m[1])])), None) if m else None
+    if not row:
+        return ""
+    own, ctx = relay.split(row["text"] or "", row["context"])
+    return "\n".join(x for x in (own, ctx if agent else "", yesask.scope(db, row["id"], own)) if x)
+
+
+def _repair_lift(p: Project, section: str, text: str, end: dict | None, said: str) -> tuple[tuple[str, str] | str, str]:
+    """A new Restrictions `text` resting on the user's verbatim words (or the owner's agent's order in
+    agent mode) that may lift a standing ban (_append_conflicts, lifts_only) goes in as a scoped
+    exception to that ban (_scoped_exception, as `excepts` would) instead of being refused for its
+    wording: ((the text to store, a note), "") once that passes, else ("", why not), and ("", "") when
+    nothing is lifted. A lift the user's words do not cover (a scope they did not name, a general
+    lift, a ban another item keeps) stays refused, with the reason."""
+    charter = p.charter_path.read_text()
+    if not said or " ".join(text.split()) in " ".join(charter.split()):
+        return "", ""
+    lifts = _append_conflicts(charter, section, text, "", lifts_only=True)
+    if not lifts:
+        return "", ""
+    clause = restriction_source.bare(lifts[0][0]).strip()
+    try:
+        stored, note = _scoped_exception(charter, section, text, clause, "", end, said)
+    except ValueError as e:
+        return "", str(e)
+    return (stored, f"charter_update repaired: the source's words allow it within its scope, so it went in as a "
+                    f"scoped exception (`excepts` \"{clip(clause, 160)}\") instead of being refused. " + note), ""
 
 
 def _append_update(steer: Path, text: str, key: str | None = None) -> None:
