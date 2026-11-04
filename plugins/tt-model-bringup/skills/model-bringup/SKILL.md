@@ -13,6 +13,9 @@ or replace acceptance criteria with a review plugin's criteria.
 
 1. Resolve this plugin root from this file: two directories above its skill directory. Set
    `TT_MODEL_BRINGUP_ROOT` to that absolute path. Keep the installed package read-only.
+   The `SKILL.md` files on disk under that root are the authority; if the host's skill tool
+   serves text from a different version than `.claude-plugin/plugin.json` records, read the
+   files directly.
    For a new Codex multigoal run, follow [automatic telemetry setup](references/telemetry-setup.md):
    use an enabled integration or quietly check access to `tenstorrent/ar-dashboard`
    and automatically install/use its telemetry plugin when accessible. Continue silently
@@ -25,7 +28,9 @@ or replace acceptance criteria with a review plugin's criteria.
    - Claude Code: `/plugin install tt-autodebug@tenstorrent-skills`
    Never install it automatically or use a stray source checkout in place of an enabled plugin.
 3. Resolve `TT_AUTODEBUG_ROOT` from that installed plugin's skill path (two directories above the
-   `autodebug` skill directory). Validate the package and prepare the shell environment:
+   `autodebug` skill directory). On Codex that path comes from the plugin inventory command; on
+   Claude Code it is the enabled installation's directory recorded in the host's plugin inventory
+   (`claude plugin list` shows it as "Read from"). Validate the package and prepare the shell environment:
 
    ```bash
    # Set these two paths from the host's enabled installation inventory first.
@@ -46,7 +51,9 @@ or replace acceptance criteria with a review plugin's criteria.
    changes belong in the target checkout; workflow fixes belong in this plugin. Changes to the
    TT vLLM plugin or vLLM follow [plugin changes](../vllm-integration/references/plugin-changes.md).
    Record exact commands, commits, hardware identity and evidence. Keep weights, credentials and
-   private logs out of published commits.
+   private logs out of published commits. Run the repository's commit hooks (formatters, file-size
+   limit) before the first device run of each commit so the evidence SHA is the shipped code;
+   server logs over the size limit go in gzipped.
 
 ## Dependency selection
 
@@ -75,6 +82,10 @@ The eleven [goal templates](../../prompts/model_bringup_multigoal) run in order:
 
 For an optional standalone TTI release handoff once serving is ready, use
 [`tti-release`](../tti-release/SKILL.md).
+
+When the authorized hardware is one chip, stages 4 and 5 are recorded as skipped by the
+operator in the run record and the full-model goal starts from `tt/optimized_decoder.py`;
+single-chip is then the target topology, not a fallback, and the later stages say so.
 
 `tt-device-usage`, `tt-enable-tracing`, `qualitative-check` and `stage-review` provide shared
 requirements. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Implementation
@@ -156,7 +167,11 @@ checker errors once and stops by default; it runs bounded remediation goals for 
 
 The readiness runtime provides generator/serving contracts, HF reference generation, prefill,
 traced teacher-forcing, autoregressive and vLLM runners. Use `python -m readiness_check.<runner>`
-after startup. Hardware runners require the active tt-metal/TTNN environment plus torch,
+after startup. The runners open the mesh with the runtime's default trace region;
+`READINESS_TRACE_REGION_SIZE=<bytes>` overrides it for generators whose split-sampling path holds
+more than one trace. The runners write no provenance: keep a sidecar JSON with the commit and
+chip for every run. The vLLM runner takes `--output-dir` for a run that must not overwrite the
+gate's `readiness_vllm/` artifacts (tracked or A/B runs); the gates read only `readiness_vllm/`. Hardware runners require the active tt-metal/TTNN environment plus torch,
 transformers, requests and openai as applicable. Book/AIME input corpora are read from the target
 checkout's documented `models/` paths; generated references belong under `bringup/references/`.
 No reference tensors or experiment outputs are bundled.

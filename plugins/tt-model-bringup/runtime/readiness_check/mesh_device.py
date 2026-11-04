@@ -6,7 +6,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 from typing import Any
+
+TRACE_REGION_SIZE_ENV = "READINESS_TRACE_REGION_SIZE"
 
 #: Label → (mesh rows, mesh cols). N300 (2 chips) is openable as N150 by
 #: requesting (1, 1) — the device manager picks one of the two chips. T3K
@@ -61,6 +64,9 @@ def open_readiness_mesh_device(mesh_device_label: str, fabric_config: str | None
         }[fabric_config]
         ttnn.set_fabric_config(fabric)
 
+    trace_region_size = os.environ.get(TRACE_REGION_SIZE_ENV)
+    if trace_region_size:
+        return ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(*shape), trace_region_size=int(trace_region_size))
     return ttnn.open_mesh_device(mesh_shape=ttnn.MeshShape(*shape))
 
 

@@ -24,6 +24,22 @@ Stages:
                 profile as a secondary CI/capacity artifact. Defaults to greedy
                 ``--temperature 0.0``; opt into exact server-generation-config
                 behavior with ``--benchmark-use-server-generation-config``.
+  prefix_cache  Send one 2305-token prompt cold, then warm, reset the prefix
+                cache, and repeat; then append a 256-token new suffix so the
+                resume is a long continuation and compare it with a cold run
+                after another reset (needs VLLM_SERVER_DEV_MODE=1 on the server
+                for /reset_prefix_cache). Records /metrics prefix-cache counter
+                deltas, TTFT, first-token logprobs and greedy output per
+                request, runs the shared-prefix ``vllm bench serve`` workload,
+                and writes ``prefix_cache_check.json`` with a pass/fail verdict.
+  prefill_burst Run 32 x 128-token prompts at concurrency 32 so the scheduler
+                forms multi-row prefill steps; writes
+                ``vllm_prefill_burst_benchmark.json``. Pass
+                ``--prefill-burst-serial-result`` to record TTFT ratios against
+                the same workload measured with batched prefill disabled.
+
+Every run writes ``vllm_run_summary.json`` with the server command, the
+prefix-caching flag, and the prefix-caching state read from the server log.
 
 Default: ``--stages serve,sampling,qualitative,benchmark`` (launch, run all
 checks, shut down). Full launch with the typical tuning flags:
@@ -100,6 +116,15 @@ import requests
 from transformers import AutoTokenizer
 
 from readiness_check.mesh_device import MESH_SHAPES
+from readiness_check.prefill_burst import attach_serial_reference, run_with_prefix_cache_state
+from readiness_check.prefix_cache_check import (
+    DEFAULT_PREFIX_CACHE_OUTPUT_TOKENS,
+    DEFAULT_PREFIX_CACHE_PROMPT_TOKENS,
+    DEFAULT_PREFIX_CACHE_RESUME_SUFFIX_TOKENS,
+    PREFIX_CACHE_THRESHOLDS,
+    _server_log_apc_state,
+    run_prefix_cache_check,
+)
 
 DEFAULT_PORT = 8000
 DEFAULT_BLOCK_SIZE = 64
@@ -113,8 +138,17 @@ STAGE_SERVE = "serve"
 STAGE_SAMPLING = "sampling"
 STAGE_QUALITATIVE = "qualitative"
 STAGE_BENCHMARK = "benchmark"
-ALL_STAGES: tuple[str, ...] = (STAGE_SERVE, STAGE_SAMPLING, STAGE_QUALITATIVE, STAGE_BENCHMARK)
-DEFAULT_STAGES: tuple[str, ...] = ALL_STAGES
+STAGE_PREFIX_CACHE = "prefix_cache"
+STAGE_PREFILL_BURST = "prefill_burst"
+DEFAULT_STAGES: tuple[str, ...] = (STAGE_SERVE, STAGE_SAMPLING, STAGE_QUALITATIVE, STAGE_BENCHMARK)
+ALL_STAGES: tuple[str, ...] = (*DEFAULT_STAGES, STAGE_PREFIX_CACHE, STAGE_PREFILL_BURST)
+
+# Prefill burst: many short prompts at once so the scheduler forms multi-row
+# prefill steps. Compared against a serial-prefill run of the same shape.
+DEFAULT_BURST_PROMPT_LEN = 128
+DEFAULT_BURST_OUTPUT_LEN = 32
+DEFAULT_BURST_NUM_REQUESTS = 32
+DEFAULT_BURST_CONCURRENCY = 32
 
 # Primary benchmark shape: single-user decode, used for headline t/s/u.
 # We force greedy temperature for readiness t/s/u unless the caller explicitly
@@ -231,24 +265,18 @@ def _check_port_available(port: int) -> None:
         sock.close()
 
 
-def _launch_server(
+def _server_command(
     *,
     hf_model: str,
-    mesh_device: str,
     max_num_seqs: int,
     block_size: int,
     port: int,
-    log_file: Path,
     max_model_len: Optional[int],
     tt_config: dict[str, Any],
     additional_args: List[str],
-) -> subprocess.Popen:
-    """
-    Launch vLLM via `python -m vllm.entrypoints.openai.api_server`.
-
-    Mirrors `vllm-tt-plugin/examples/server_example_tt.py` (which is what the
-    nightly CI runs) but inlined — the example is just argv-munging + runpy.
-    """
+    enable_prefix_caching: Optional[bool] = None,
+) -> List[str]:
+    """Build the server argv. `enable_prefix_caching=None` leaves the vLLM default."""
     cmd: List[str] = [
         sys.executable,
         "-m",
@@ -264,11 +292,47 @@ def _launch_server(
     ]
     if max_model_len is not None:
         cmd += ["--max_model_len", str(max_model_len)]
+    if enable_prefix_caching is True:
+        cmd.append("--enable-prefix-caching")
+    elif enable_prefix_caching is False:
+        cmd.append("--no-enable-prefix-caching")
     # Pass TT plugin config as a single JSON dict so JSON quoting can't be
     # mangled by intermediate shells. The dict already has
     # `sample_on_device_mode` enforced; callers extend via `tt_config`.
     cmd += ["--additional-config", json.dumps({"tt": tt_config})]
     cmd += additional_args
+    return cmd
+
+
+def _launch_server(
+    *,
+    hf_model: str,
+    mesh_device: str,
+    max_num_seqs: int,
+    block_size: int,
+    port: int,
+    log_file: Path,
+    max_model_len: Optional[int],
+    tt_config: dict[str, Any],
+    additional_args: List[str],
+    enable_prefix_caching: Optional[bool] = None,
+) -> subprocess.Popen:
+    """
+    Launch vLLM via `python -m vllm.entrypoints.openai.api_server`.
+
+    Mirrors `vllm-tt-plugin/examples/server_example_tt.py` (which is what the
+    nightly CI runs) but inlined — the example is just argv-munging + runpy.
+    """
+    cmd = _server_command(
+        hf_model=hf_model,
+        max_num_seqs=max_num_seqs,
+        block_size=block_size,
+        port=port,
+        max_model_len=max_model_len,
+        tt_config=tt_config,
+        additional_args=additional_args,
+        enable_prefix_caching=enable_prefix_caching,
+    )
 
     env = {
         **os.environ,
@@ -560,6 +624,7 @@ def _write_normalized_vllm_benchmark_summary(
     num_requests: int,
     concurrency: Optional[int],
     temperature: Optional[float],
+    dataset_name: str = "random",
 ) -> dict[str, Any]:
     total_output_tokens = _json_number(raw, "total_output_tokens")
     requested_output_tokens = output_len * num_requests
@@ -581,7 +646,7 @@ def _write_normalized_vllm_benchmark_summary(
             "concurrency": concurrency,
             "temperature": temperature,
             "generation_config_mode": "server_default" if temperature is None else "explicit",
-            "dataset_name": "random",
+            "dataset_name": dataset_name,
             "ignore_eos": True,
         },
         "elapsed_s": _json_number(raw, "duration"),
@@ -638,12 +703,15 @@ def _run_serving_benchmark(
     concurrency: Optional[int],
     temperature: Optional[float],
     additional_args: List[str],
+    dataset_args: Optional[List[str]] = None,
+    dataset_name: str = "random",
 ) -> dict[str, Any]:
     """
     Run one vLLM serving benchmark profile.
 
     The primary caller writes `vllm_result.json` and `vllm_benchmark.json`;
-    secondary profiles use distinct filenames.
+    secondary profiles use distinct filenames. `dataset_args` replaces the
+    default random-dataset arguments when a profile needs another dataset.
     """
     print(f"\n=== Running vLLM serving benchmark: {profile_name} ===")
     print(
@@ -671,12 +739,11 @@ def _run_serving_benchmark(
         server_url.rstrip("/"),
         "--endpoint",
         "/v1/completions",
-        "--dataset-name",
-        "random",
-        "--random-input-len",
-        str(prompt_len),
-        "--random-output-len",
-        str(output_len),
+        *(
+            dataset_args
+            if dataset_args is not None
+            else ["--dataset-name", "random", "--random-input-len", str(prompt_len), "--random-output-len", str(output_len)]
+        ),
         "--num-prompts",
         str(num_requests),
         "--ignore-eos",
@@ -725,6 +792,7 @@ def _run_serving_benchmark(
         num_requests=num_requests,
         concurrency=concurrency,
         temperature=temperature,
+        dataset_name=dataset_name,
     )
 
     def _fmt(v: Optional[float], unit: str) -> str:
@@ -740,6 +808,27 @@ def _run_serving_benchmark(
     print(f"  Raw      : {raw_result_file}")
     print(f"  Summary  : {summary_file}")
     return summary
+
+
+def _write_run_summary(path: Path, summary: dict[str, Any]) -> None:
+    """Merge into an existing summary so a hold-open server and attached check runs share one file."""
+    existing: dict[str, Any] = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    merged = dict(existing)
+    for key, value in summary.items():
+        if key == "outputs":
+            merged["outputs"] = {**(existing.get("outputs") or {}), **value}
+        elif key == "stages":
+            merged["stages"] = sorted(set(existing.get("stages") or []) | set(value))
+        elif value is None and existing.get(key) is not None:
+            continue
+        else:
+            merged[key] = value
+    path.write_text(json.dumps(merged, indent=2) + "\n")
 
 
 def _shutdown(proc: subprocess.Popen, log_file: Path) -> None:
@@ -802,9 +891,15 @@ def _parse_stages(raw: str) -> List[str]:
     return deduped
 
 
-def _main() -> None:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the vLLM server readiness check.")
     parser.add_argument("--model-dir", type=Path, required=True)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory for this run's outputs. Default: <model_dir>/readiness_vllm, the root the stage gates read.",
+    )
     parser.add_argument("--hf-model", type=str, required=True)
     parser.add_argument(
         "--stages",
@@ -987,6 +1082,68 @@ def _main() -> None:
             'Quoted, e.g. "--request-rate 0.25 --metric-percentiles 50,90,99".'
         ),
     )
+    parser.add_argument(
+        "--enable-prefix-caching",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Pass --enable-prefix-caching or --no-enable-prefix-caching to the launched server. "
+            "Default leaves the vLLM default, which the TT plugin gates on model_capabilities."
+        ),
+    )
+    parser.add_argument(
+        "--server-log",
+        type=Path,
+        default=None,
+        help="Server log to read the prefix-caching state from when attaching with --server-url.",
+    )
+    parser.add_argument(
+        "--prefix-cache-prompt-tokens",
+        type=int,
+        default=DEFAULT_PREFIX_CACHE_PROMPT_TOKENS,
+        help=f"Prompt length for the prefix_cache stage (default {DEFAULT_PREFIX_CACHE_PROMPT_TOKENS}).",
+    )
+    parser.add_argument(
+        "--prefix-cache-output-tokens",
+        type=int,
+        default=DEFAULT_PREFIX_CACHE_OUTPUT_TOKENS,
+        help=f"Greedy output length for the prefix_cache stage (default {DEFAULT_PREFIX_CACHE_OUTPUT_TOKENS}).",
+    )
+    parser.add_argument(
+        "--prefix-cache-resume-suffix-tokens",
+        type=int,
+        default=DEFAULT_PREFIX_CACHE_RESUME_SUFFIX_TOKENS,
+        help=(
+            "New-suffix length appended to the shared prefix for the long-resume comparison "
+            f"(default {DEFAULT_PREFIX_CACHE_RESUME_SUFFIX_TOKENS}). Needs /reset_prefix_cache, which vLLM "
+            "exposes with VLLM_SERVER_DEV_MODE=1."
+        ),
+    )
+    parser.add_argument(
+        "--prefix-cache-shared-bench",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also run the shared-prefix `vllm bench serve` workload in the prefix_cache stage.",
+    )
+    parser.add_argument(
+        "--prefill-burst-serial-result",
+        type=Path,
+        default=None,
+        help=(
+            "Normalized summary JSON of the same prefill_burst workload measured with batched prefill "
+            "disabled. It is read before the burst runs, so the stage's own output path is accepted; "
+            "the stage records burst/serial TTFT ratios and whether the workload configs match."
+        ),
+    )
+    return parser
+
+
+def resolve_output_dir(model_dir: Path, output_dir: Optional[Path]) -> Path:
+    return (output_dir if output_dir is not None else model_dir / "readiness_vllm").resolve()
+
+
+def _main() -> None:
+    parser = _build_parser()
     args = parser.parse_args()
 
     stages: List[str] = args.stages
@@ -1012,7 +1169,7 @@ def _main() -> None:
     benchmark_temperature = None if args.benchmark_use_server_generation_config else args.benchmark_temperature
 
     model_dir = args.model_dir.resolve()
-    output_dir = model_dir / "readiness_vllm"
+    output_dir = resolve_output_dir(model_dir, args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     server_log = output_dir / "server.log"
     sampling_log = output_dir / "sampling_tests.log"
@@ -1024,10 +1181,40 @@ def _main() -> None:
     if STAGE_SAMPLING in stages:
         _find_plugin_tests_dir()
 
+    apc_log_source = server_log if serve_locally else args.server_log
+    if not serve_locally and args.enable_prefix_caching is not None:
+        parser.error("--enable-prefix-caching only applies when `serve` is in --stages; use --server-log to record an external server")
+    run_summary: dict[str, Any] = {
+        "stages": stages,
+        "hf_model": args.hf_model,
+        "server_url": args.server_url,
+        "server_command": None,
+        "mesh_device": args.mesh_device,
+        "max_num_seqs": args.max_num_seqs,
+        "max_model_len": args.max_model_len,
+        "block_size": args.block_size,
+        "tt_config": merged_tt_config,
+        "enable_prefix_caching": args.enable_prefix_caching if serve_locally else None,
+        "apc_log_enabled": None,
+        "apc_log_source": str(apc_log_source) if apc_log_source else None,
+        "outputs": {},
+    }
+    run_summary_file = output_dir / "vllm_run_summary.json"
+
     server_proc: Optional[subprocess.Popen] = None
     try:
         if serve_locally:
             _check_port_available(args.port)
+            run_summary["server_command"] = _server_command(
+                hf_model=args.hf_model,
+                max_num_seqs=args.max_num_seqs,
+                block_size=args.block_size,
+                port=args.port,
+                max_model_len=args.max_model_len,
+                tt_config=merged_tt_config,
+                additional_args=additional_server_args,
+                enable_prefix_caching=args.enable_prefix_caching,
+            )
             server_proc = _launch_server(
                 hf_model=args.hf_model,
                 mesh_device=args.mesh_device,
@@ -1038,6 +1225,7 @@ def _main() -> None:
                 max_model_len=args.max_model_len,
                 tt_config=merged_tt_config,
                 additional_args=additional_server_args,
+                enable_prefix_caching=args.enable_prefix_caching,
             )
             _wait_for_server(
                 proc=server_proc,
@@ -1130,6 +1318,52 @@ def _main() -> None:
                         }
                     }
                     (output_dir / "vllm_benchmark.json").write_text(json.dumps(primary_summary, indent=2) + "\n")
+                run_summary["outputs"]["benchmark"] = str(output_dir / "vllm_benchmark.json")
+            elif stage == STAGE_PREFIX_CACHE:
+                run_prefix_cache_check(
+                    server_url=server_url,
+                    hf_model=args.hf_model,
+                    output_dir=output_dir,
+                    prompts_file=args.prompts.resolve(),
+                    prompt_tokens=args.prefix_cache_prompt_tokens,
+                    output_tokens=args.prefix_cache_output_tokens,
+                    thresholds=PREFIX_CACHE_THRESHOLDS,
+                    server_log=apc_log_source,
+                    shared_prefix_bench=args.prefix_cache_shared_bench,
+                    additional_benchmark_args=additional_benchmark_args,
+                    resume_suffix_tokens=args.prefix_cache_resume_suffix_tokens,
+                    run_serving_benchmark=_run_serving_benchmark,
+                )
+                run_summary["outputs"]["prefix_cache"] = str(output_dir / "prefix_cache_check.json")
+            elif stage == STAGE_PREFILL_BURST:
+                serial_path = args.prefill_burst_serial_result.resolve() if args.prefill_burst_serial_result else None
+                serial = json.loads(serial_path.read_text()) if serial_path else None
+                burst_summary = run_with_prefix_cache_state(
+                    server_url,
+                    lambda: _run_serving_benchmark(
+                        server_url=server_url,
+                        hf_model=args.hf_model,
+                        output_dir=output_dir,
+                        profile_name="prefill_burst",
+                        comparison_scope=(
+                            "32 short prompts submitted at once so the scheduler forms multi-row prefill steps. "
+                            "Compare TTFT against the same workload with batched prefill disabled; not a decode number."
+                        ),
+                        raw_result_filename="vllm_prefill_burst_result.json",
+                        summary_filename="vllm_prefill_burst_benchmark.json",
+                        log_filename="vllm_prefill_burst_benchmark.log",
+                        prompt_len=DEFAULT_BURST_PROMPT_LEN,
+                        output_len=DEFAULT_BURST_OUTPUT_LEN,
+                        num_requests=DEFAULT_BURST_NUM_REQUESTS,
+                        concurrency=DEFAULT_BURST_CONCURRENCY,
+                        temperature=0.0,
+                        additional_args=additional_benchmark_args,
+                    ),
+                )
+                attach_serial_reference(
+                    output_dir / "vllm_prefill_burst_benchmark.json", burst_summary, serial, serial_path
+                )
+                run_summary["outputs"]["prefill_burst"] = str(output_dir / "vllm_prefill_burst_benchmark.json")
 
         print("\n" + "=" * 60)
         print(f"vLLM checks complete. Results in {output_dir}")
@@ -1137,6 +1371,9 @@ def _main() -> None:
     finally:
         if server_proc is not None:
             _shutdown(server_proc, server_log)
+        run_summary["apc_log_enabled"] = _server_log_apc_state(apc_log_source)
+        _write_run_summary(run_summary_file, run_summary)
+        print(f"Run summary: {run_summary_file}")
 
 
 if __name__ == "__main__":

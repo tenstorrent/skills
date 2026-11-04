@@ -40,6 +40,7 @@ from readiness_check.contract import (
     BuildGeneratorFn,
     Generator,
 )
+from readiness_check.build_kwargs import add_build_kwargs_args, parse_build_kwargs
 from readiness_check.mesh_device import (
     add_mesh_device_args,
     close_readiness_mesh_device,
@@ -213,6 +214,7 @@ def _main() -> None:
         help=f"Path to the prompt file. Default: {DEFAULT_PROMPT_FILE}",
     )
     add_mesh_device_args(parser)
+    add_build_kwargs_args(parser)
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -237,6 +239,7 @@ def _main() -> None:
             hf_model_id=args.hf_model,
             prompt_file=args.prompt_file.resolve(),
             mesh_device=mesh_device,
+            build_kwargs=parse_build_kwargs(args),
             output_dir=output_dir.resolve(),
             max_new_tokens=args.max_new_tokens,
         )
