@@ -457,16 +457,22 @@ def test_the_coordinator_and_plan_prompts_split_an_urgent_goal_into_tasks_that_s
             "tasks unless one needs another's new file or symbol") in plan
 
 
-def _urgent_done(env, p, title, fups, spec="", priority=3, labels=(), reply_chat=None, metrics=None, setup=None):
-    """A harness task (spec `spec`, `labels`, `reply_chat`) that handed off done with `fups`; its id."""
-    import json
-    from ttp.daemon import Daemon
-    from ttp.providers.base import RunUsage as Usage
-    tid = p.db.add_task(title, spec or f"spec of {title}", kind="harness", tier="deep", origin="coordinator",
+def _urgent_done(env, p, title, fups, spec="", priority=3, labels=(), reply_chat=None, metrics=None, setup=None,
+                 kind="harness"):
+    """A `kind` task (spec `spec`, `labels`, `reply_chat`) that handed off done with `fups`; its id."""
+    tid = p.db.add_task(title, spec or f"spec of {title}", kind=kind, tier="deep", origin="coordinator",
                         priority=priority, labels=list(labels))
     p.db.update_task(tid, status="running", **({"reply_chat": reply_chat} if reply_chat else {}))
     if setup:
         setup(tid)
+    return _hand_off(env, p, tid, title, fups, metrics)
+
+
+def _hand_off(env, p, tid, title, fups, metrics=None):
+    """Running task `tid` hands off done with `fups` and `metrics`, at a cost of $1; its id."""
+    import json
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
     run_dir = env["tmp"] / f"run-{tid}"
     run_dir.mkdir()
     (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": f"{title}: checked",
@@ -547,3 +553,52 @@ def test_a_refused_urgent_follow_up_stays_proposed_with_its_reason(env):
     tid = _urgent_done(env, p, "Opted out", fup, spec=spec)
     assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (tid,))
     assert _proposed(p, tid)[0]["status"] == "queued"
+
+
+def test_a_two_wide_urgent_fan_out_stays_within_max_usd_in_total(env):
+    """Each queued follow-up is urgent too: chains.max_usd bounds the whole tree under the chain root (each
+    unfinished task counted at its budget), not one path. The follow-ups past it stay proposed with the reason."""
+    p = make(env)
+    p.set_config("chains.max_usd", 4)
+    tid = _urgent_done(env, p, "Wide work", [{"title": f"continue: wide work, part {k}", "spec": "More."} for k in "ab"],
+                       spec="Do it.\nurgent: the user is waiting", metrics={"progress": 1},
+                       setup=lambda t: p.db.update_task(t, budget_usd=1.0, spent_usd=1.0))
+    for n in range(2, 40):
+        (kid,) = p.db.q("SELECT * FROM tasks WHERE status='queued' ORDER BY id LIMIT 1") or (None,)
+        if kid is None:
+            break
+        p.db.update_task(kid["id"], status="running", spent_usd=1.0)
+        _hand_off(env, p, kid["id"], kid["title"], [
+            {"title": f"continue: wide work #{kid['id']}, part {k}", "spec": "More."} for k in "ab"], {"progress": n})
+    spent = p.db.one("SELECT COUNT(*) n, SUM(spent_usd) usd FROM tasks")
+    assert spent["usd"] <= 4 and spent["n"] <= 4, dict(spent)
+    texts = [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='followup_proposed' AND status='queued'")]
+    assert any(f"the follow-up tree of #{tid}" in t and "chains.max_usd is $4" in t for t in texts), texts
+
+
+def test_an_urgent_split_code_task_queues_its_carrying_continue_not_a_next_step_first(env):
+    """On a split code task only the continue that carries the change takes the branch over, even listed after
+    a `next step:`; the next step stays proposed with the reason."""
+    import json
+    from ttp import chaincap
+    p = make(env)
+    tid = _urgent_done(env, p, "Split work", [
+        {"title": "next step: measure the link", "spec": "Measure."},
+        {"title": "continue: split work, part 2", "spec": "Finish the change."}], kind="code",
+        spec="Do it.\nurgent: the user is waiting", labels=[f"{chaincap.SPLIT_LABEL}{'a' * 40}"])
+    kids = p.db.q("SELECT * FROM tasks WHERE parent=? AND kind!='review' ORDER BY id", (tid,))
+    assert [k["title"] for k in kids] == ["continue: split work, part 2"], [dict(k) for k in kids]
+    assert f"continues:{tid}" in json.loads(kids[0]["labels"])
+    (ev,) = [e for e in _proposed(p, tid) if "measure the link" in e["text"]]
+    assert ev["status"] == "queued" and f"#{tid} is a split" in ev["text"], ev["text"]
+
+
+def test_an_urgent_follow_up_of_another_kind_stays_with_the_coordinator(env):
+    """auto_hop queues the parent's kind: a follow-up asking for another kind stays proposed with the reason."""
+    p = make(env)
+    tid = _urgent_done(env, p, "Kind work", [
+        {"title": "next step: ask which board to use", "spec": "Ask.", "kind": "question"},
+        {"title": "next step: rerun it", "spec": "Again."}], spec="Do it.\nurgent: the user is waiting")
+    assert [k["title"] for k in p.db.q("SELECT title FROM tasks WHERE parent=?", (tid,))] == ["next step: rerun it"]
+    (ev,) = [e for e in _proposed(p, tid) if "which board" in e["text"]]
+    assert ev["status"] == "queued" and "its kind question is not" in ev["text"], ev["text"]
