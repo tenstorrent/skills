@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: when a Restrictions item changes, the project's own tools that still enforce the old wording now get an update task, not just a one-time digest hint. This covers a loosened, removed or retired item, and now also a scoped exception (`excepts`) or a `both_hold` text that permits what a ban forbids. The daemon scans the project's `bin/` and `hooks/` files, `schedules.json`, schedule commands, prechecks and heal checks, and open tasks' `start_when` probes. A tool matches when it names the old item's identifiers, distinctive words, quoted phrases or cited user messages. If anything matches, the daemon queues one priority-1 harness task per change. The task names the files and lines, the old item and the new text, and says to allow exactly what the new wording allows and keep enforcing the rest. Applying the same change again queues no second task. While the task is open, the coordinator's digest shows a "Guards behind the charter" line. No tool is ever edited by this check, and it makes no model calls.

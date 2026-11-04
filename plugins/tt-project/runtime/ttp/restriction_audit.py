@@ -4,8 +4,10 @@
 
 After the user's word loosens or removes a Restrictions item (a quoted edit, or a `replaces` of a
 whole Restrictions section with looser wording), or `over` retires one, the project's own tools
-(bin/, hooks/, schedules) may still carry the old rule. restriction_tools names them in a queued
-`restriction_tools` event for the next digest; it never edits anything. coordinator.apply() calls it
+(bin/, hooks/, schedules, task probes) may still carry the old rule; so may they after a scoped exception
+(`excepts`, or a lifting `both_hold` text) narrows one. restriction_tools queues one priority-1 task per
+change to update them, names them in a queued `restriction_tools` event for the next digest, and
+digest_lines shows that task while it is open; it never edits a tool. coordinator.apply() calls it
 once per turn, with the turn's tasks, so a tool a task of that batch already names is left out. An
 unsourced (advisory) item dropped, by anyone and with any `over` or none, whose words the Brief or a sourced Restrictions item
 still states (still_stated) is left out too: that rule still binds, so its tools are right.
@@ -16,6 +18,7 @@ for the coordinator's one-time ask to loosen it. Only the user's own words loose
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -209,9 +212,12 @@ def restriction_tools(p: Project, loosened: list[tuple], batch: list[int]) -> li
     advisory]), `over` empty for the user's word, else the end that retired the item; `advisory`: the dropped
     items were all unsourced (restriction_source.drops_unsourced), so whoever dropped them and with any `over`,
     one the Brief or a sourced item still states is left out, as is `over` "unsourced". A file a task of this batch
-    names (its title or spec has the file's path or name) is left out. One queued restriction_tools
-    event per item with such files, for the next digest: model-free, it edits nothing. Returns the
-    event texts."""
+    names (its title or spec has the file's path or name) is left out. Open tasks' start_when probes and
+    schedule prechecks are scanned too. `loosened` entries may carry a fifth field, `exception`: the new
+    text excepts the item, which still stands, so its own terms (identifiers, distinctive words, quotes,
+    cites) match. Per item with such files: one priority-1 harness task naming them (label TASK_LABEL +
+    a key of the change: a change that already queued one queues none) and one queued restriction_tools
+    event for the next digest. Model-free; it edits no tool. Returns the event texts."""
     from .coordinator import clip
     files: list[tuple[str, str]] = []   # (label, text)
     seen = 0
@@ -240,42 +246,77 @@ def restriction_tools(p: Project, loosened: list[tuple], batch: list[int]) -> li
     for r in p.db.q("SELECT name, payload FROM schedules WHERE enabled=1"):
         payload = json.loads(r["payload"] or "{}")
         heal_block = payload.get("heal") or {}
-        cmds = [payload.get("command")] + [heal_block.get(k) for k in ("check", "fix", "suppress")]
+        cmds = [payload.get("command"), payload.get("precheck")] + [heal_block.get(k) for k in ("check", "fix", "suppress")]
         files.append((f"schedule {r['name']}", "\n".join(str(c) for c in cmds if c)))
+    from .db import OPEN_TASKS, deferral
+    for t in p.db.q(f"SELECT id, labels FROM tasks WHERE {OPEN_TASKS} AND labels LIKE '%start_when:%' LIMIT 500"):
+        if when := deferral(t).get("when"):
+            files.append((f"task #{t['id']} start_when", when))
     named = " ".join(f"{t['title']} {t['spec']}" for t in (p.db.task(i) for i in batch) if t)
     try:
         charter = p.charter_path.read_text()
     except OSError:
         charter = ""
     out = []
-    for old, new, over, *advisory in loosened:
-        if (over == "unsourced" or any(advisory)) and still_stated(charter, old):
+    for old, new, over, *rest in loosened:
+        advisory, exception = bool(rest and rest[0]), len(rest) > 1 and bool(rest[1])
+        if (over == "unsourced" or advisory) and still_stated(charter, old):
             continue   # a dropped advisory copy of a rule the Brief or a sourced item still binds: tools stay right
         lines = [x for _, t in files for x in t.splitlines()]
-        ids, words, exact = tool_terms(old, new, charter, lines)
+        # an exception leaves the item standing: its own identifiers, distinctive words, quotes and cites
+        ids, words, exact = tool_terms(old, "", "", lines) if exception else tool_terms(old, new, charter, lines)
         rare = distinctive_words(words, lines)
         hits = []
         for label, text in files:
             line, got = next(((n, g) for n, x in enumerate(text.splitlines(), 1)
                               if (g := tool_hit(x, ids, words, exact, rare))),
                              (0, []))
-            if not line or label in named or (not label.startswith("schedule ") and Path(label).name in named):
+            probe = label.startswith(("schedule ", "task #"))   # no file: no line number
+            if not line or label in named or (not probe and Path(label).name in named):
                 continue
-            hits.append(label + (f":{line}" if not label.startswith("schedule ") else "")
+            hits.append(label + (f":{line}" if not probe else "")
                         + f" ({', '.join(clip(g, 40) for g in got[:4])})")
         if not hits:
             continue
-        x = ((f"`over` retired the Restrictions item \"{clip(old, 200)}\" ({clip(over, 150)})" if over
-              else f"The user's word loosened the Restrictions item \"{clip(old, 200)}\"")
-             + f", but these project tools still name its terms and no task of that batch names them: "
-             + ", ".join(hits[:10])
-             + (f" and {len(hits) - 10} more" if len(hits) > 10 else "")
-             + ". Queue a priority-1 task updating every tool that enforces the old wording, or say in "
-               "`summary` why these do not enforce it.")
+        from .restriction_source import bare
+        key = "\0".join(" ".join(bare(x).lower().split()) for x in (old, new, over))   # cites aside
+        label = TASK_LABEL + hashlib.sha256(key.encode()).hexdigest()[:12]
+        if p.db.q("SELECT 1 FROM tasks WHERE labels LIKE ? LIMIT 1", (f'%"{label}"%',)):
+            continue   # this change already queued its update task: idempotent per change
+        how = (f"`over` retired the Restrictions item \"{clip(old, 200)}\" ({clip(over, 150)})" if over
+               else f"The user's word added an exception to the Restrictions item \"{clip(old, 200)}\"" if exception
+               else f"The user's word loosened the Restrictions item \"{clip(old, 200)}\"")
+        listed = ", ".join(hits[:10]) + (f" and {len(hits) - 10} more" if len(hits) > 10 else "")
+        tid = p.db.add_task(
+            "Update project tools still enforcing a changed Restrictions item",
+            f"{how}" + (f"; it now reads: \"{clip(new, 400)}\"" if new else "; it was removed")
+            + f". These project tools still name its terms: {listed}. Update each tool to allow exactly what "
+            "the new wording allows and keep enforcing the rest; never loosen past the new text. Add or adjust "
+            "the tool's tests if it has any. A tool that does not enforce the item: say so in `summary` and "
+            "change nothing. Edit only this project's own tools.",
+            kind="harness", tier="standard", priority=1, origin="daemon", labels=[label])
+        x = (f"{how}, but these project tools still name its terms and no task of that batch names them: {listed}"
+             f". Queued priority-1 task #{tid} to update every tool that enforces the old wording; cancel it "
+             "and say in `summary` why if these do not enforce it.")
         out.append(x)
         p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                (time.time(), "harness", "restriction_tools", "normal", x, "queued"))
     return out
+
+
+TASK_LABEL = "restriction_tools:"   # + a 12-hex key per change: the queued update task's label
+
+
+def digest_lines(p: Project) -> list[str]:
+    """One line per open restriction_tools update task (at most 3): a guard is behind its charter."""
+    from .db import OPEN_TASKS
+    rows = p.db.q(f"SELECT id, status, spec FROM tasks WHERE {OPEN_TASKS} AND labels LIKE ? ORDER BY id",
+                  (f'%"{TASK_LABEL}%',))
+    out = [f"- #{r['id']} ({r['status']}): " + (r["spec"] or "").split(" Update each tool")[0][:400] for r in rows[:3]]
+    if len(rows) > 3:
+        out.append(f"- and {len(rows) - 3} more open")
+    return (["## Guards behind the charter (project tools still enforce a Restrictions item the user changed; "
+             "their update task is open: keep it first in line)"] + out) if out else []
 
 
 # The daily review's 7-day count per Restrictions item: evidence for the coordinator's one-time ask

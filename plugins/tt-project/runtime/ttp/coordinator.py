@@ -1190,6 +1190,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("memory_recent_added", delta)
     section("charter_conflicts", charter_conflict_lines(charter_conflicts(p)))
     section("retired_echoes", echoes.digest_lines(p, now))
+    section("guards_behind", restriction_audit.digest_lines(p))
     section("ends", ends.digest_lines(p, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("heal", heal.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("noisy_watchers", watchdup.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
@@ -2131,8 +2132,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     restr_before: str | None = None
     rules_added: list[tuple[str, str]] = []
     restr_edited = False
-    # (old item, new text, over, advisory) of Restrictions items loosened or retired; advisory: only unsourced
-    loosened: list[tuple[str, str, str, bool]] = []   # items dropped (restriction_source.drops_unsourced)
+    # (old item, new text, over, advisory[, exception]) of Restrictions items loosened or retired; advisory: only
+    loosened: list[tuple] = []   # unsourced items dropped (drops_unsourced); exception: `text` excepts the item
     replies: list[int] = []
     # Promises (obligations.record_promises): what this batch sent, the tasks it added or updated with
     # their reply_chat, and the obligations it recorded or attached owners to.
@@ -3015,6 +3016,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     refused = (quote and _DATED.sub("", section).lower().startswith("restriction")
                                and not (uturn or ok or len(over) >= OVER_MIN))
                     excepts = " ".join(str(a.get("excepts") or "").split())
+                    lifted: list[str] = []   # Restrictions items this exception narrows, for restriction_audit
                     if excepts:   # a scoped exception to one standing ban, on the user's verbatim words
                         if quote or replaces or not (text and _DATED.sub("", section).lower().startswith("restriction")):
                             raise ValueError("`excepts` goes with new Restrictions `text` only, "
@@ -3022,12 +3024,16 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         verbatim = bool(a.get("source")) and bool(re.search(r"user msg #\d+|relayer-ordered", cite))
                         # the source message's words: the user's own, the agent's too in agent mode, a yes's ask
                         said = _verbatim_said(db, cite, agent) if verbatim and not unsourced else ""
+                        lifted = [x[0] for x in [_excepted_item(p.charter_path.read_text(), excepts)] if x]
                         text, overlap = _scoped_exception(
                             p.charter_path.read_text(), section, text, excepts,
                             "" if verbatim and not unsourced else unsourced or (
                                 "a Brief or harness-gate source is not the user's words" if a.get("source")
                                 else restriction_source.NO_SOURCE), end, said)
                         notes.append(overlap)
+                    elif text and a.get("both_hold") and not (quote or replaces) and _may_lift(text):
+                        lifted = [x for x, _ in _append_conflicts(p.charter_path.read_text(), section, text,
+                                                                   lifts_only=True)]
                     elif text and not (replaces or a.get("both_hold") or refused):
                         # the user's verbatim words (or agent-ordered) behind a lift: the harness fixes its form
                         fixed, why_not = (_repair_lift(p, section, text, end, _verbatim_said(db, cite, agent))
@@ -3133,6 +3139,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             loosened += [(o, n, why, loose_drop) for o, n in restriction_audit.replaced_items(gone, into)]
                     elif text and not quote and not a.get("both_hold") and not excepts:
                         rules_added.append((target, text))
+                    if lifted and (excepts or uturn or ok is not None) and target.lower().startswith("restriction"):
+                        # an exception on the user's word: tools enforcing the excepted item still refuse it
+                        loosened += [(x, text, "", False, True) for x in lifted]
                     if retired:
                         db.post("out", f"Retired the charter restriction {retired}: "
                                        f"{over or 'it cited no user message, the Brief or a harness gate'}."
@@ -5522,6 +5531,15 @@ def _scope_names(text: str) -> set[str]:
     return out
 
 
+def _excepted_item(charter: str, clause: str) -> tuple[str, str] | None:
+    """The standing Restrictions ban (item, section) whose text has `clause` (an `excepts`), or None."""
+    want = _loose(restriction_source.bare(clause))
+    want = want if len(want.split()) >= 3 else ""   # a clause, not a word every ban has
+    mark = _loose(SCOPED_EXCEPTION.split("{clause}")[0])
+    return next(((s, sec) for s, sec, _ in _restriction_items(charter) if want and want in _loose(restriction_source.bare(s))
+                 and _BAN_RE.search(s) and not _loose(s).startswith(mark)), None)
+
+
 def _scoped_exception(charter: str, section: str, text: str, clause: str, sourced: str,
                       end: dict | None, said: str = "") -> tuple[str, str]:
     """Check a Restrictions charter_update sent with `excepts` (the clause of a standing Restrictions
@@ -5535,12 +5553,7 @@ def _scoped_exception(charter: str, section: str, text: str, clause: str, source
     Other bans it may lift that name none of its scope hold
     alongside (the note lists them). The stored text names the clause and its precedence
     (SCOPED_EXCEPTION); the clause's own item is never edited."""
-    items = _restriction_items(charter)
-    want = _loose(restriction_source.bare(clause))
-    want = want if len(want.split()) >= 3 else ""   # a clause, not a word every ban has
-    mark = _loose(SCOPED_EXCEPTION.split("{clause}")[0])
-    found = next(((s, sec) for s, sec, _ in items if want and want in _loose(restriction_source.bare(s))
-                  and _BAN_RE.search(s) and not _loose(s).startswith(mark)), None)
+    found = _excepted_item(charter, clause)
     head = f"scoped exception {clip(text, 160)!r} refused: "
     if found is None:
         raise ValueError(head + f"`excepts` \"{clip(clause, 160)}\" is no clause of a standing Restrictions "

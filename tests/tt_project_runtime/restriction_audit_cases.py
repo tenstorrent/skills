@@ -278,3 +278,107 @@ def test_every_two_word_hit_needs_a_rare_word(env):
     _big_tree(p)
     out = restriction_audit.restriction_tools(p, [(_ITEM, "A worker may run at night (user msg #80).", "")], [])
     assert len(out) == 1 and "bin/drain.sh:2" in out[0] and "common" not in out[0], out
+
+
+# restriction_tools after a Restrictions change: one priority-1 update task per change naming the tools.
+_SOAK_BANS = ("# demo\n\n## Restrictions\n"
+              "- Never run the soak test on a shared rack. (user msg #7)\n"
+              "- Never open pull requests. (user msg #1)\n")
+_SOAK = "Never run the soak test on a shared rack."
+
+
+def _soak_guard(env):
+    """A project with the soak ban and its own guard script citing it, an unrelated hook, and the
+    queued restriction_tools update tasks (by id) as a function."""
+    p = make(env)
+    p.charter_path.write_text(_SOAK_BANS)
+    (p.root / "bin").mkdir(exist_ok=True)
+    (p.root / "bin" / "soak-guard.sh").write_text(
+        "#!/bin/sh\necho 'refused: the soak test on a shared rack is banned (user msg #7)'; exit 1\n")
+    (p.harness / "hooks").mkdir(exist_ok=True)
+    (p.harness / "hooks" / "pre.sh").write_text("#!/bin/sh\necho unrelated\n")
+    return p, lambda: [dict(r) for r in p.db.q("SELECT * FROM tasks WHERE labels LIKE '%restriction_tools:%'")]
+
+
+def test_a_scoped_exception_queues_one_update_task_naming_the_guard_still_enforcing_the_item(env):
+    """An `excepts` exception on the user's words leaves the item standing, but a guard script citing it
+    still refuses what the exception allows: one priority-1 harness task names the file, line, old item
+    and new exception, a restriction_tools event says so, and the digest shows it while it is open. The
+    guard is never edited; the same change again queues no second task."""
+    from ttp import coordinator as coord, restriction_audit
+    p, tasks = _soak_guard(env)
+    mids, src = _turn_said(p, "the soak test may run on rack-a with soak_leg.sh")
+    act = {"type": "charter_update", "section": "Restrictions", "excepts": _SOAK,
+           "text": "Workers may run the soak test on rack-a with `soak_leg.sh`.", "source": src}
+    assert coord.apply(p, [act], turn=1, user_turn=True, messages=mids) == []
+    assert "Exception to \"Never run the soak test on a shared rack.\"" in p.charter_path.read_text()
+    got = tasks()
+    assert len(got) == 1, got
+    t = got[0]
+    assert t["priority"] == 1 and t["kind"] == "harness" and t["status"] == "queued", t
+    assert "bin/soak-guard.sh:2" in t["spec"] and _SOAK in t["spec"] and "rack-a" in t["spec"], t["spec"]
+    assert "pre.sh" not in t["spec"] and "never loosen past the new text" in t["spec"], t["spec"]
+    assert "exception" in t["spec"] and "keep enforcing the rest" in t["spec"], t["spec"]
+    ev = [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind='restriction_tools'")]
+    assert len(ev) == 1 and f"task #{t['id']}" in ev[0], ev
+    assert "exit 1" in (p.root / "bin" / "soak-guard.sh").read_text(), "the check never edits a tool"
+    lines = restriction_audit.digest_lines(p)
+    assert len(lines) == 2 and lines[0].startswith("## Guards behind the charter") and f"#{t['id']}" in lines[1]
+    assert "Guards behind the charter" in dict(coord.digest_parts(p, {}, [], [])[0]).get("guards_behind", "")
+    # The same change again (the exception already stored): no second task, no second event.
+    stored = [x for x in p.charter_path.read_text().splitlines() if x.startswith("- Exception")]
+    assert coord.apply(p, [act], turn=2, user_turn=True, messages=mids) is not None
+    assert len(tasks()) == 1 and stored, tasks()
+    # Once its task is done, the digest line goes.
+    p.db.update_task(t["id"], status="done")
+    assert restriction_audit.digest_lines(p) == []
+
+
+def test_restriction_tools_queues_no_task_without_a_matching_tool_or_for_an_unrelated_addition(env):
+    """No tool naming the excepted item's terms: no task. A new unrelated Restrictions item, a plain ban
+    added on the user's word, narrows nothing: no task, though a guard cites the soak item."""
+    from ttp import coordinator as coord
+    p, tasks = _soak_guard(env)
+    (p.root / "bin" / "soak-guard.sh").write_text("#!/bin/sh\necho 'refused: disk almost full'; exit 1\n")
+    mids, src = _turn_said(p, "the soak test may run on rack-a with soak_leg.sh")
+    act = {"type": "charter_update", "section": "Restrictions", "excepts": _SOAK,
+           "text": "Workers may run the soak test on rack-a with `soak_leg.sh`.", "source": src}
+    assert coord.apply(p, [act], turn=1, user_turn=True, messages=mids) == []
+    assert tasks() == []
+    p, tasks = _soak_guard(env)
+    mids, src = _turn_said(p, "never delete the release notes")
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions",
+                            "text": "Never delete the release notes.", "source": src}],
+                       turn=3, user_turn=True, messages=mids) == []
+    assert "release notes" in p.charter_path.read_text() and tasks() == []
+    assert not p.db.q("SELECT 1 FROM events WHERE kind='restriction_tools'")
+
+
+def test_a_loosened_item_queues_one_task_naming_a_guard_file_and_a_task_probe(env):
+    """A quoted edit on the user's word that narrows the ban queues one task naming the guard file and an
+    open task's start_when probe still citing the old item; re-applying the same change queues none."""
+    from ttp import coordinator as coord, restriction_audit
+    p, tasks = _soak_guard(env)
+    held = p.db.add_task("soak leg", "run it", kind="work", labels=["start_when:bin/soak-guard.sh --cite 'user msg #7'"])
+    mids, src = _turn_said(p, "the soak test may run on a shared rack at night")
+    act = {"type": "charter_update", "section": "Restrictions", "quote": _SOAK + " (user msg #7)",
+           "text": "Run the soak test on a shared rack only at night.", "source": src}
+    assert coord.apply(p, [act], turn=1, user_turn=True, messages=mids) == []
+    got = tasks()
+    assert len(got) == 1 and "bin/soak-guard.sh:2" in got[0]["spec"], got
+    assert f"task #{held} start_when" in got[0]["spec"], got[0]["spec"]
+    restriction_audit.restriction_tools(p, [(act["quote"], act["text"], "")], [])
+    assert len(tasks()) == 1
+
+
+def test_a_lifting_both_hold_text_queues_the_update_task_too(env):
+    """A Restrictions text sent with `both_hold` on the user's word that permits what a standing ban
+    forbids (an exception in effect) queues the same one update task for the guard still citing it."""
+    from ttp import coordinator as coord
+    p, tasks = _soak_guard(env)
+    mids, src = _turn_said(p, "the soak test may run on rack-a with soak_leg.sh")
+    act = {"type": "charter_update", "section": "Restrictions", "both_hold": True,
+           "text": "Workers may run the soak test on rack-a with `soak_leg.sh`.", "source": src}
+    assert coord.apply(p, [act], turn=1, user_turn=True, messages=mids) == []
+    got = tasks()
+    assert len(got) == 1 and "bin/soak-guard.sh:2" in got[0]["spec"] and _SOAK in got[0]["spec"], got

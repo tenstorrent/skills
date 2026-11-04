@@ -2180,9 +2180,12 @@ Workers can read Slack links you paste, using your Slack connector if you have o
 - Workers run with your permissions, in their own worktree; restrictions in the charter are
   passed to every worker and enforced by the provider where it can (for example, no web tools).
 - When the user loosens or removes a Restrictions item (a quoted edit, or a `replaces` of a whole
-  Restrictions section, judged item by item), or `over` retires one, a `restriction_tools` event
-  names the project's tool files (bin/, hooks/, schedule commands and heal checks) that still carry
-  the old item's terms; it never edits them. The charter guard's refusal says a user's loosening
+  Restrictions section, judged item by item), adds a scoped exception to one (`excepts`, or a
+  `both_hold` text that permits what it bans), or `over` retires one, the daemon queues one
+  priority-1 harness task per change naming the project's tools (bin/, hooks/, schedule commands,
+  prechecks and heal checks, open tasks' `start_when` probes) that still carry the old item's terms,
+  and a `restriction_tools` event says so; the digest shows a "Guards behind the charter" line while
+  that task is open. It never edits a tool. The charter guard's refusal says a user's loosening
   goes in as written, and offers the temporary-exception route only when the user's own words make
   it temporary.
 - A Restrictions edit resting only on your agent's words (`coordinator.agent_orders_as_user`) is read

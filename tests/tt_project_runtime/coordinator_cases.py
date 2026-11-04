@@ -2080,6 +2080,7 @@ def test_a_users_loosening_of_a_restriction_names_the_tools_still_enforcing_the_
     assert "restriction_tools" in coord.UNBLOCK_KINDS
     # A task of the same batch that names a tool covers it; the rest are still named.
     p.db.x("DELETE FROM events")
+    p.db.x("DELETE FROM tasks")   # the update tasks queued above: the same change queues no second one
     p.charter_path.write_text(base)
     assert coord.apply(p, [{"type": "task_add", "kind": "code", "priority": 1, "title": "update reset-gate.sh",
                             "spec": "drop the serving check from bin/reset-gate.sh"}, loosen],
