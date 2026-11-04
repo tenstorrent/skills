@@ -363,6 +363,42 @@ def test_spill_skips_hosts_that_are_not_allowed_busy_or_down_and_keeps_waiting_h
     assert checkspill.allowed(p, p.config(), "check-host-a") == ""
 
 
+def test_spill_skips_a_host_another_project_paused_by_alias_or_host_name_until_the_pause_lifts(env, tmp_path,
+                                                                                                    monkeypatch):
+    """A pause this project's own lookup does not see still keeps the spill picker off the host: another
+    project's own pause of the alias or of the machine's host name, or a shared pause file of a name this
+    project does not share. The run says so on one line and runs here; once the pause lifts the host is
+    allowed again. An unreadable other project is no pause."""
+    import threading
+    from ttp import checkspill, cli, db as dbm, machines, shared
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b", "down"])
+    machines.add("check-host-b", hostname="check-host-b.example")
+    other = _second_project(env, "other")
+    other.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {"check-host-a": {"reason": "lent out", "by": "user", "since": 1}})
+    assert checkspill.allowed(p, p.config(), "check-host-a") == "paused by other: lent out"
+    other.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {"check-host-b.example": {"reason": "repair", "by": "user"}})
+    assert checkspill.allowed(p, p.config(), "check-host-b") == "paused by other: repair", "its host name"
+    assert checkspill.allowed(p, p.config(), "check-host-a") == "", "the lifted pause frees it"
+    shared.update_pause("check-host-a", lambda was: {"reason": "held", "since": time.time(), "project": "third"})
+    assert checkspill.allowed(p, p.config(), "check-host-a") == "paused by third: held", "a shared pause file"
+    log = tmp_path / "where.log"
+    cmd = f"pwd >> {log}"
+    p.set_config("delivery.push_checks", [cmd])
+    lane = _spill_lane(p, repo)
+    threading.Timer(1.5, lane.close).start()
+    cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and "spilled_to" not in rec, rec
+    text = (run / "checks.log").read_text()
+    assert "check-host-a (paused by third: held); check-host-b (paused by other: repair)" in text, text
+    assert "/ttp-check." not in log.read_text(), "it ran here"
+    shared.update_pause("check-host-a", lambda was: None)
+    other.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {})
+    assert checkspill.allowed(p, p.config(), "check-host-a") == checkspill.allowed(p, p.config(), "check-host-b") == ""
+    (Path(other.root) / "tt-project" / "state" / "project.db").write_bytes(b"not a database")
+    assert checkspill.paused_elsewhere(p, "check-host-a") is None
+
+
 def test_spill_hosts_set_while_a_run_waits_take_it_at_its_next_bound(env, tmp_path, monkeypatch):
     """delivery.checks_spill_hosts set after a run began waiting here: the run reads the setting again
     at its next bound and spills, without waiting for the lane here to free. It still runs and records

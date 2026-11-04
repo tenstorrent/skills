@@ -16,7 +16,8 @@ and `ttp checks status` show it while it runs (status_lines).
 
 Allowed: named in the project's charter (a host of the account's pool needs no charter line: the
 account setting is the user's word for every project) and in the user's machines list (not retired), and not
-paused (a pause of its alias, or a fleet hold of the machine), and its machine lock (`ttp lock <alias>`)
+paused (a pause of its alias, or a fleet hold of the machine, or a pause of its alias or host name that any
+of the user's projects here set, shared or not: paused_elsewhere), and its machine lock (`ttp lock <alias>`)
 neither held nor reserved by anyone else. The run holds that lock while it runs, shared where the
 resource allows it (several spilled checks share it; an exclusive holder or waiter keeps them off),
 exclusively on a device lock. A host that is not allowed, whose lock is busy, that ssh does not reach,
@@ -193,7 +194,48 @@ def allowed(p, cfg: dict, alias: str) -> str:
         return "not named in the charter"
     if (held := lockprobe.pause(p, cfg, alias)) is not None:
         return f"paused{': ' + str(held.get('reason')) if isinstance(held, dict) and held.get('reason') else ''}"
+    if got := paused_elsewhere(p, alias, known.get(alias)):
+        who, held = got
+        return f"paused by {who}{': ' + str(held.get('reason')) if held.get('reason') else ''}"
     return ""
+
+
+def paused_elsewhere(p, alias: str, machine: Any = None) -> tuple[str, dict] | None:
+    """(who, pause) of a pause of `alias` or its machine's host name (`hostname`, short name too) that this project's own lookup
+    (lockprobe.pause) does not see: a shared pause file of a name this project does not share, or
+    another project's own pause, read-only from each registered project on this machine. None when none;
+    an unreadable project is skipped, never a pause."""
+    from . import globalcap, project, shared
+    from .db import PAUSED_RESOURCES_KEY
+    host = str(machine.get("hostname") or "") if isinstance(machine, dict) else ""
+    names = [n for n in dict.fromkeys([alias, host, host.split(".")[0]]) if n]
+    for n in names:
+        try:
+            pz = shared.read_pause(n)
+        except Exception:
+            pz = None
+        if isinstance(pz, dict):
+            return str(pz.get("project") or "a shared pause"), pz
+    for name, e in sorted((project.load_registry().get("projects") or {}).items()):
+        if name == p.name or not isinstance(e, dict) or not e.get("dir") \
+                or e.get("host") not in (None, project.hostname()):
+            continue
+        db_path = Path(str(e["dir"])) / project.FOLDER / "state" / "project.db"
+        try:
+            if not db_path.is_file():
+                continue
+            conn = globalcap.connect_ro(db_path)
+            try:
+                r = conn.execute("SELECT value FROM kv WHERE key=?", (PAUSED_RESOURCES_KEY,)).fetchone()
+            finally:
+                conn.close()
+            paused = json.loads(r[0]) if r and r[0] else {}
+        except Exception:
+            continue
+        for n in names:
+            if isinstance(paused, dict) and isinstance(pz := paused.get(n), dict):
+                return name, pz
+    return None
 
 
 def probe(alias: str) -> tuple[int, str]:
