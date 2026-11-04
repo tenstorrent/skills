@@ -4,7 +4,11 @@ A code task that works in a clone of another repository has no diff in the proje
 hand-off names the branch and head it published there, `{"repo": "<owner/name or remote URL>",
 "branch": "<branch>", "head": "<sha>"}`, and the daemon queues a review-only review of exactly that
 head (daemon._auto_review). An invalid entry is ignored with its reason, never raised. No git, no
-network: the reviewer fetches it."""
+network: the reviewer fetches it.
+
+A task with no branch on record, no PR and no `published` entry (its project root is not a git
+repository) may name its change in top-level hand-off fields instead: `branch` and `head`, and
+optionally `repo` (top_level). It is reviewed the same way; the summary's prose is never parsed."""
 from __future__ import annotations
 
 import re
@@ -17,6 +21,7 @@ _HEAD = re.compile(r"[0-9a-f]{7,64}")
 _OWNER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+")
 _URL = re.compile(r"(?:https?|ssh|git)://(?:[A-Za-z0-9._~%-]+@)?[A-Za-z0-9.-]+(?::\d+)?(?:/[A-Za-z0-9._~%+-]+)+/?")
 _SCP = re.compile(r"[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[A-Za-z0-9._~%+-]+(?:/[A-Za-z0-9._~%+-]+)*")
+_TOP_HEAD = re.compile(r"[0-9a-f]{7,40}")
 _BRANCH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._/+-]{0,199}")
 
 
@@ -45,6 +50,28 @@ def parse(value) -> tuple[dict | None, str]:
     return {"repo": repo, "branch": branch, "head": head}, ""
 
 
+def top_level(result) -> tuple[dict | None, str]:
+    """The change a hand-off names in its top-level `branch` + `head` (+ optional `repo`), validated as a
+    `published` entry is, its head a 7 to 40 digit hex sha: (change, ""), (None, why), or (None, "")
+    when it names neither. A change with no repo has repo ""."""
+    if not isinstance(result, dict):
+        return None, ""
+    branch, head, repo = (result.get(k) for k in ("branch", "head", "repo"))
+    if branch in (None, "") and head in (None, ""):
+        return None, ""
+    if isinstance(head, str) and not _TOP_HEAD.fullmatch(head.strip().lower()):
+        return None, f"head {head.strip()[:80]!r} is not a hex commit sha (7 to 40 digits)"
+    if repo in (None, ""):
+        ch, why = parse({"repo": "o/r", "branch": branch, "head": head})
+        return (dict(ch, repo="") if ch else None), why
+    return parse({"repo": repo, "branch": branch, "head": head})
+
+
+def place(ch: dict) -> str:
+    """'repo R, branch B', or 'branch B' for a change whose hand-off named no repo."""
+    return (f"repo {ch['repo']}, " if ch.get("repo") else "") + f"branch {ch['branch']}"
+
+
 def same_head(a: str, b: str) -> bool:
     """True when two full or abbreviated shas name the same commit (one is a prefix of the other)."""
     a, b = (a or "").lower(), (b or "").lower()
@@ -58,6 +85,12 @@ def heads(labels: list[str]) -> list[str]:
 
 def fetch_line(ch: dict, where: str = "your own worktree") -> str:
     """How a reviewer gets exactly the published head: read-only, into a scratch clone of its own."""
+    if not ch.get("repo"):
+        return (f"Its change is not in this project's git, and its hand-off names no repository: branch "
+                f"{ch['branch']}, head {ch['head']}. Find the repository its spec and hand-off name, fetch it "
+                f"read-only into a scratch clone under {where} (`git -C scratch fetch origin {ch['branch']}`, then "
+                f"`git -C scratch checkout --detach {ch['head']}`) and review exactly head {ch['head']}, even if "
+                f"the branch has moved on (say so if it has).")
     clone = (f"gh repo clone {ch['repo']} scratch -- --no-checkout" if _OWNER_NAME.fullmatch(ch["repo"])
              else f"git clone --no-checkout {ch['repo']} scratch")
     return (f"Its change lives in an external repository, not in this project's git: repo {ch['repo']}, branch "

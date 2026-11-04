@@ -21,7 +21,9 @@ command unchanged; `ttp audit` counts the runs that hit it.
 The hand-off guard: after a tool call that changed `$TTP_RUN_DIR/result.json` (any tool: it compares
 the file's size and mtime with the last one checked), the hook parses it as the daemon does and, if
 it is no hand-off (not JSON, not an object, or no hand-off status), hands the worker the error with
-its line and column, once per version of the file. A Stop hook (Claude Code, task runs only: the
+its line and column, once per version of the file. A valid done or needs_review hand-off of a code task
+with no branch on record (NO_BRANCH_ENV) that names no PR, `published` change or top-level `branch` +
+`head` gets a warning naming those fields, since the daemon could queue no review of it. A Stop hook (Claude Code, task runs only: the
 daemon sets HANDOFF_GUARD_ENV) refuses to end a run whose result.json is missing or no hand-off, with
 a one-line reason; it lets the run end when `stop_hook_active` is set or after MAX_STOP_BLOCKS
 refusals, so it never loops, and stays silent in a subagent and outside a task run.
@@ -114,6 +116,9 @@ STOP_BLOCKS_FILE = "stop.blocks"  # how many times the Stop hook refused to end 
 # Set to 1 by the daemon for a task's worker or reviewer run, which must end with a hand-off.
 HANDOFF_GUARD_ENV = "TTP_HANDOFF_GUARD"
 MAX_STOP_BLOCKS = 2
+# Set to 1 by the daemon for a code task's worker run with no branch on record (its project root is not
+# a git repository): its hand-off must name the change for the daemon to queue its review.
+NO_BRANCH_ENV = "TTP_NO_BRANCH_ON_RECORD"
 # The statuses the daemon takes as a hand-off (daemon.HANDOFF_STATES; a test keeps them equal).
 HANDOFF_STATES = ("done", "blocked", "failed", "needs_review", "waiting")
 
@@ -139,6 +144,34 @@ def handoff_problem(path: Path) -> str | None:
     return None
 
 
+def handoff_warning(path: Path) -> str | None:
+    """Why the daemon could queue no review for this hand-off, None when it can (or need not): a code
+    task with no branch on record (NO_BRANCH_ENV) handing off done or needs_review with no PR, no
+    valid `published` entry and no valid top-level `branch` + `head`. A branch or sha named only in
+    the summary does not count: the daemon never reads prose."""
+    if os.environ.get(NO_BRANCH_ENV) != "1":
+        return None
+    from . import extchange
+    from .prguard import PR_URL_RE
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or data.get("status") not in ("done", "needs_review"):
+        return None
+    if isinstance(data.get("pr"), str) and PR_URL_RE.search(data["pr"]):
+        return None
+    pub, pub_why = extchange.parse(data.get(extchange.FIELD))
+    top, top_why = extchange.top_level(data) if pub is None and not pub_why else (None, "")
+    if pub or top:
+        return None
+    why = pub_why and f" (`{extchange.FIELD}` ignored: {pub_why})" or top_why and f" (ignored: {top_why})" or ""
+    return (f"this task has no branch on record, so the daemon can queue no review of your change{why}. If it "
+            f"changed code, name it in {RESULT_FILE}: `\"{extchange.FIELD}\": {{\"repo\": ..., \"branch\": ..., "
+            f"\"head\": ...}}`, or top-level `\"branch\"` + `\"head\"` (a 7-40 digit sha; optional `\"repo\"`). "
+            f"A branch or sha named only in the summary is not read")
+
+
 def _result_change(run_dir: Path) -> tuple[str | None, Callable[[], None] | None]:
     """The problem with result.json when it changed since the last check, and a callback that marks
     this version checked; (None, None) when it is absent or unchanged."""
@@ -153,6 +186,13 @@ def _result_change(run_dir: Path) -> tuple[str | None, Callable[[], None] | None
     except OSError:
         pass
     return handoff_problem(run_dir / RESULT_FILE), lambda: (run_dir / CHECKED_FILE).write_text(stamp)
+
+
+def _quiet(check: Callable[[Path], str | None], path: Path) -> str | None:
+    try:
+        return check(path)
+    except Exception:   # a warning fails open
+        return None
 
 
 def post_tool_use(payload: dict) -> tuple[dict | None, Callable[[], None] | None]:
@@ -176,6 +216,8 @@ def post_tool_use(payload: dict) -> tuple[dict | None, Callable[[], None] | None
     if problem:
         parts.append(f"tt-project: your hand-off is not valid yet: {problem}. The daemon would take this run as "
                      f"ending without a hand-off; fix $TTP_RUN_DIR/{RESULT_FILE} before you stop.")
+    elif checked and (warning := _quiet(handoff_warning, Path(run_dir) / RESULT_FILE)):
+        parts.append(f"tt-project: {warning}.")
     if not marks:
         return None, None
     out = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "\n\n".join(parts)}} \

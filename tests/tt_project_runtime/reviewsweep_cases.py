@@ -132,3 +132,47 @@ def test_one_task_s_error_skips_only_that_task_in_the_review_sweep(env, monkeypa
     _sweep(Daemon(p.base))
     assert len(_daemon_reviews(p, good)) == 1 and not _daemon_reviews(p, bad)
     assert "review sweep of task %d failed" % bad in (p.logs / "daemon.log").read_text()
+
+
+def test_a_branchless_hand_off_s_top_level_branch_and_head_queue_exactly_one_review_of_that_head(env):
+    """A code task in a project root that is no git repository has no branch on record: its hand-off's
+    top-level `branch` + `head` (+ optional `repo`) are taken as its `published` change. A branch with
+    no head, a malformed head, or a branch and sha named only in the summary queue nothing."""
+    from ttp.daemon import Daemon
+    from ttp import extchange
+    p = make(env)
+    head = "c0ffee" * 6 + "abcd"
+    bad = [{"branch": "fix/y"}, {"branch": "fix/y", "head": "xyz1234"}, {"branch": "fix/y", "head": "ab" * 32},
+           {"branch": "fix/y", "head": "abc12"}, {"head": head}, {"branch": "a..b", "head": head},
+           {"branch": "fix/y", "head": head, "repo": "not a repo"},
+           {"summary": f"Pushed {head} on branch fix/y of example/other."}]
+    tids = []
+    for i, extra in enumerate(bad):
+        tid = p.db.add_task(f"branchless {i}", "spec", kind="code", origin="coordinator")
+        p.db.update_task(tid, status="review", result=json.dumps({"status": "done", "summary": "ok", **extra}))
+        _ran(p, tid, time.time() - 1900)
+        tids.append(tid)
+    good = p.db.add_task("branchless good", "spec", kind="code", origin="coordinator")
+    p.db.update_task(good, status="review", result=json.dumps({
+        "status": "done", "summary": "ok", "branch": "fix/y", "head": head.upper()}))
+    _ran(p, good, time.time() - 1900)
+    named = p.db.add_task("branchless with repo", "spec", kind="code", origin="coordinator")
+    p.db.update_task(named, status="review", result=json.dumps({
+        "status": "done", "summary": "ok", "repo": "example/other", "branch": "feat/z", "head": head[:12]}))
+    _ran(p, named, time.time() - 1900)
+    d = Daemon(p.base)
+    _sweep(d)
+    _sweep(d)
+    for tid in tids:
+        assert not _daemon_reviews(p, tid) and len(_unqueued(p, tid)) == 1, tid
+    (rev,) = _daemon_reviews(p, good)
+    assert f"branch fix/y, head {head[:12]}" in rev["spec"] and "repo " not in rev["spec"].split("\n")[0]
+    assert extchange.HEAD_LABEL + head in rev["labels"]
+    assert "names no repository" in rev["spec"] and not _unqueued(p, good)
+    (rev2,) = _daemon_reviews(p, named)
+    assert "repo example/other, branch feat/z" in rev2["spec"] and extchange.REVIEW_ONLY in rev2["spec"]
+    # A task with a branch on record never takes the top-level fields: its own branch is its change.
+    other = p.db.add_task("has a branch", "spec", kind="code", origin="coordinator")
+    p.db.update_task(other, branch="ttp/none-such", result=json.dumps({
+        "status": "done", "summary": "ok", "branch": "fix/y", "head": head}))
+    assert d._external_change(p.db.task(other)) is None

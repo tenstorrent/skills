@@ -2968,8 +2968,13 @@ class Daemon:
             if task and role != "coordinator":
                 env["TTP_NO_DEVICE"] = "0" if holds_device(task, self.cfg) else "1"
             if task and role in ("worker", "reviewer") and handoff_guard:
-                from .hook import HANDOFF_GUARD_ENV
+                from .hook import HANDOFF_GUARD_ENV, NO_BRANCH_ENV
                 env[HANDOFF_GUARD_ENV] = "1"
+                # Its hook warns a code hand-off that names no change the daemon could review (hook.handoff_warning).
+                env.pop(NO_BRANCH_ENV, None)   # never an inherited value
+                if role == "worker" and task.get("kind") == "code" \
+                        and not (self.p.db.task(task["id"]) or task).get("branch"):
+                    env[NO_BRANCH_ENV] = "1"
             # On a machine tagged `device` a direct open sees no device, whatever the task: `ttp lock` on
             # a device, devq and the broker (whose jobs never get the mask) are the ways to one.
             if machines.device_host():
@@ -13027,7 +13032,7 @@ class Daemon:
               f"#{t['id']} {t['title'][:120]} has been in review {(now - start) / 3600:.1f}h and the daemon cannot "
               f"queue its review: {why}. Nothing reviews, lands or reports it until you act. Options: queue its "
               f"review naming the repository, branch and head; requeue it to hand off its PR or a `published` "
-              f"change (repo, branch, head); mark it done once its work is verified; or cancel it.",
+              f"change (repo, branch, head) or top-level `branch` + `head`; mark it done once its work is verified; or cancel it.",
               "queued", t["id"]))
         log(self.p, f"task {t['id']}: in review with no review and none can be queued ({why}); raised to the "
                     f"coordinator")
@@ -13478,7 +13483,7 @@ class Daemon:
         tier = "standard" if prior or ext else bud.review_tier(changes, cfg)
         pr = "" if ext else pr_url or task.get("pr_url")
         lines = [f"Independently review the change of code task #{task['id']} ({task['title']}): "
-                 + (f"repo {ext['repo']}, " if ext else "") + "branch "
+                 + (f"repo {ext['repo']}, " if ext and ext["repo"] else "") + "branch "
                  f"{published['ref'] if published else ext['branch'] if ext else branch}, head {head}"
                  + (f", PR {pr}" if pr else "") + "."]
         if ext:
@@ -13654,10 +13659,16 @@ class Daemon:
 
     def _external_change(self, task: dict) -> dict | None:
         """The change code task `task`'s hand-off names as published in another repository
-        (extchange.parse), or None; an invalid entry is logged with its reason and ignored."""
-        ch, why = extchange.parse(load_result(task.get("result")).get(extchange.FIELD))
+        (extchange.parse), or None; an invalid entry is logged with its reason and ignored. A task with no
+        branch on record, no PR and no `published` entry takes its hand-off's top-level `branch` + `head`
+        (+ optional `repo`, extchange.top_level) as that entry, never a branch or sha named in prose."""
+        res = load_result(task.get("result"))
+        ch, why = extchange.parse(res.get(extchange.FIELD))
+        field = extchange.FIELD
+        if ch is None and not why and not task.get("branch") and not prguard.task_pr(task):
+            (ch, why), field = extchange.top_level(res), "branch` + `head"
         if why:
-            log(self.p, f"task {task['id']}: hand-off `{extchange.FIELD}` ignored: {why}")
+            log(self.p, f"task {task['id']}: hand-off `{field}` ignored: {why}")
         return ch
 
     def _reviewed_external(self, task: dict, ch: dict) -> int | None:
@@ -14291,7 +14302,7 @@ class Daemon:
         rtier = "deep" if review["tier"] == "deep" else "standard"
         found = "\n".join(f"{n}. {str(f['title'])[:200]}: {coord.clip(f.get('spec'), FOLLOWUP_SPEC_CHARS)}"
                           for n, f in enumerate(fups, 1))
-        where = f"repo {ch['repo']}, branch {ch['branch']}"
+        where = extchange.place(ch)
         with db.tx():
             fid = db.add_task(f"Fix review #{review['id']}: {base_title}"[:200], "", kind="code", tier=tier,
                               tier_source=tsrc, priority=chainprio.of(db, code, review), origin="daemon",
@@ -14316,8 +14327,10 @@ class Daemon:
                 f"#{code['id']} ({code['title']}).",
                 f"Its change lives in an external repository: {where}, head {ch['head']}. Work in your own "
                 f"clone of it on top of that head, then publish the fix to the same branch {ch['branch']} of "
-                f"{ch['repo']} (a fast-forward, never a force-push), and name the new head in your hand-off: "
-                f'"{extchange.FIELD}": {{"repo": "{ch["repo"]}", "branch": "{ch["branch"]}", "head": "<new head sha>"}}. '
+                f"{ch['repo'] or 'that repository'} (a fast-forward, never a force-push), and name the new head in "
+                f"your hand-off: " + (f'"{extchange.FIELD}": {{"repo": "{ch["repo"]}", "branch": "{ch["branch"]}", '
+                                      f'"head": "<new head sha>"}}. ' if ch["repo"] else
+                                      f'"branch": "{ch["branch"]}", "head": "<new head sha>" (top level). ') +
                 f"Push nothing to this project's push branch, and open no pull request. Re-review #{rid} "
                 f"checks each finding once this task is done.",
                 f"Findings to fix:\n{found}",
