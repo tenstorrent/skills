@@ -16,8 +16,9 @@ state, with one coordinator observation per fault however many tasks hit it; it 
 command, run again where it was found, no longer hits it, or once that checkout is gone.
 
 A check with a host (push.remote_host, remotecheck) needs no local runner: its fault is the host,
-env:check-host:<host>, when ssh cannot reach it or it lacks git or tar (probed before the checks,
-or the check exits remotecheck.FAULT_RC mid-run). It clears once ssh reaches the host again."""
+env:check-host:<host>, when it is paused (remotecheck.paused: probed with no ssh), ssh cannot reach
+it or it lacks git or tar (probed before the checks, or the check exits remotecheck.FAULT_RC mid-run).
+It clears once the pause lifts and ssh reaches the host again."""
 from __future__ import annotations
 
 import os
@@ -229,7 +230,8 @@ def probe(r: dict, env: dict | None = None) -> dict | None:
     timeout, an interpreter that crashes) is no fault: the check runs and says what it says."""
     if r.get("kind") == "host":
         from . import remotecheck
-        why = remotecheck.reachable(str(r.get("host") or ""))
+        host = str(r.get("host") or "")
+        why = remotecheck.paused(host, r.get("cwd") or None) or remotecheck.reachable(host)
         return {**r, "why": why} if why else None
     path = str(r.get("path") or os.defpath)
     if r.get("kind") == "program":
@@ -279,6 +281,8 @@ def line(f: dict) -> str:
     what = (f"{f['python']} has {f['runner']} {f['version']}, below the repository's minversion {f.get('min')}"
             if f.get("version") else
             f"{f['python']} cannot import {f['runner']}" if f.get("kind") == "module" and f.get("python")
+            else f"check host {f.get('host')} is {f['why']}" if f.get("kind") == "host"
+            and str(f.get("why") or "").startswith("paused by ")
             else f"check host {f.get('host')} cannot run checks over ssh"
             + (f" ({f['why']})" if f.get("why") else "") if f.get("kind") == "host"
             else f"{f.get('runner')} is not on PATH or not executable")

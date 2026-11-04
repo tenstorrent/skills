@@ -8,9 +8,11 @@ _RC_FAKE_SSH = r'''#!/bin/sh
 # A fake ssh: drops -o options and the host, runs the last argument with sh -c. Host "down" is
 # unreachable; FAKE_SSH_FAIL=<text> exits 255 at once on a script holding it (reading nothing);
 # FAKE_SSH_DROP=<text> runs such a script, then drops the connection before its exit-code marker.
+# FAKE_SSH_LOG=<file> gets one line per call naming the host.
 while [ "$1" = "-o" ]; do shift 2; done
 host=$1
 shift
+[ -n "$FAKE_SSH_LOG" ] && echo "$host" >> "$FAKE_SSH_LOG"
 if [ "$host" = down ]; then echo "ssh: connect to host down port 22: Connection refused" >&2; exit 255; fi
 [ -n "$FAKE_REMOTE_TMP" ] && export TMPDIR="$FAKE_REMOTE_TMP"
 case "$1" in *"${FAKE_SSH_FAIL:-@none@}"*) echo "ssh: connection to $host lost" >&2; exit 255;; esac
@@ -250,6 +252,76 @@ def test_a_push_batch_runs_on_the_check_host_and_holds_on_its_fault(env, monkeyp
     rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e2", {"plugins/p/f2.txt": "2\n"})], bid="b2"), monkeypatch)
     assert rc == push.BUSY and m["outcome"] == "env_fault" and _statuses(m) == ["requeued"], m
     assert envfault.open_faults(p)["env:check-host:box1"]["queue"] is True
+
+
+def test_a_paused_fixed_check_host_is_a_fault_with_no_ssh_and_runs_again_once_the_pause_lifts(
+        env, tmp_path, monkeypatch, capsys):
+    """delivery.checks_host paused (this project's pause, another project's of its alias or host name, or a
+    shared pause file) is env:check-host:<host> with 'paused by <who>: <reason>': `ttp checks` (its probe)
+    and the remote check itself (mid-run route) exit 75 and never ssh there, and nothing passes or fails.
+    Once the pause lifts the check runs there. A "local" check is unaffected; an unreadable other project
+    is no pause."""
+    from ttp import cli, db as dbm, envfault, machines, remotecheck, shared
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    bin_, remote = _rc_fake_ssh(tmp_path)
+    calls = tmp_path / "ssh.calls"
+    monkeypatch.setenv("PATH", f"{bin_}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_REMOTE_TMP", str(remote))
+    monkeypatch.setenv("FAKE_SSH_LOG", str(calls))
+    ssh_calls = lambda: calls.read_text().splitlines() if calls.exists() else []
+    machines.add("check-host-a", hostname="check-host-a.example")
+    log = tmp_path / "where.log"
+    cmd = f"pwd >> {log}"
+    p.set_config("delivery.push_checks", [cmd])
+    p.set_config("delivery.checks_host", "check-host-a")
+    other = _second_project(env, "other")
+    pauses = [
+        (lambda on: p.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {"check-host-a": {"reason": "lent out", "by": "user"}}
+                                if on else {}), f"paused by {p.name}: lent out"),
+        (lambda on: other.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {"check-host-a": {"reason": "lent", "by": "user"}}
+                                    if on else {}), "paused by other: lent"),
+        (lambda on: other.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {"check-host-a.example": {"reason": "repair"}}
+                                    if on else {}), "paused by other: repair"),
+        (lambda on: shared.update_pause("check-host-a", lambda was: {"reason": "held", "since": time.time(),
+                                                                       "project": "third"} if on else None),
+         "paused by third: held"),
+    ]
+    for pause, said in pauses:
+        pause(True)
+        assert remotecheck.paused("check-host-a", repo) == said
+        (run / "checks.json").unlink(missing_ok=True)
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--fresh"])
+        assert e.value.code == 75, said
+        rec = json.loads((run / "checks.json").read_text())
+        assert rec["passed"] is False and rec["env_fault"] == "env:check-host:check-host-a", rec
+        assert not (run / "check_failure.json").exists()
+        got = capsys.readouterr()
+        assert f"check host check-host-a is {said}" in got.out + got.err, got
+        rc, out = _rc_run(tmp_path, repo, cmd, host="check-host-a")
+        assert rc == remotecheck.FAULT_RC and f"{remotecheck.SIG}check-host-a: {said}." in out, out
+        assert out.count("\n") == 1, "one line"
+        f = envfault.probe(remotecheck.fault("check-host-a", cmd, str(repo)))
+        assert f and f["why"] == said, "the fault stays open while paused"
+        assert ssh_calls() == [] and not log.exists(), (said, ssh_calls())
+        pause(False)
+    assert remotecheck.paused("check-host-a", repo) == ""
+    assert envfault.probe(remotecheck.fault("check-host-a", cmd, str(repo))) is None, "the lifted pause clears it"
+    (run / "checks.json").unlink()
+    cli.main(["checks", "--fresh"])
+    assert json.loads((run / "checks.json").read_text())["passed"] is True
+    assert "/ttp-check." in log.read_text() and ssh_calls(), "it ran there"
+    pauses[0][0](True)
+    p.set_config("delivery.push_checks", [{"run": cmd, "host": "local"}])
+    n = len(ssh_calls())
+    (run / "checks.json").unlink()
+    cli.main(["checks", "--fresh"])
+    assert json.loads((run / "checks.json").read_text())["passed"] is True and len(ssh_calls()) == n, "local"
+    pauses[0][0](False)
+    (Path(other.root) / "tt-project" / "state" / "project.db").write_bytes(b"not a database")
+    assert remotecheck.paused("check-host-a", repo) == "", "an unreadable other project is no pause"
+    rc, out = _rc_run(tmp_path, repo, cmd, host="check-host-a")
+    assert rc == 0, out
 
 
 def test_check_host_settings_are_validated_and_local_keeps_a_check_here():

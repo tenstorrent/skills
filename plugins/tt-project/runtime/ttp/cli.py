@@ -37,6 +37,7 @@ from . import outbox
 from .devq import unmask_devices
 from . import chatgone, checkwait, scriptwatch, sshcmd, timefmt, workerloss
 from . import schedule as sched
+from .project import here as project_here
 from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
                       durable_append, durable_write, write_json, ACCOUNT_KEYS, ACCOUNT_USER_ONLY, DEFAULT_CONFIG, deep_merge,
                       load_account_settings, set_account_setting, zombie, device_timeout_max, command_env,
@@ -1763,20 +1764,8 @@ def daemon_state(p: Project) -> str:
 
 
 def here() -> Project | None:
-    """The project this process runs in: its run's project, else the one at the folder it was started
-    in or above it (its git top level included), else, in a git worktree, the one at its main checkout."""
-    if os.environ.get("TTP_PROJECT") and Project(os.environ["TTP_PROJECT"]).exists():
-        return Project(os.environ["TTP_PROJECT"])
-    if p := next((c for d in [Path.cwd(), *Path.cwd().parents] if (c := Project(d)).exists()), None):
-        return p
-    try:
-        r = subprocess.run(["git", "rev-parse", "--git-common-dir"], capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    common = (Path.cwd() / r.stdout.strip()).resolve() if r.returncode == 0 and r.stdout.strip() else None
-    if common and common.name == ".git" and (c := Project(common.parent)).exists():
-        return c
-    return None
+    """The project this process runs in (project.here)."""
+    return project_here()
 
 
 # Commands whose first positional is the project: with none given, it is the one here().

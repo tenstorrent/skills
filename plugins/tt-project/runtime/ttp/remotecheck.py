@@ -11,7 +11,8 @@ output streams back and its exit code is the check's. A stopped check (a timeout
 its command there too (_run_script). The temporary directory is always removed.
 
 ssh failing (an unreachable host, a refused key, a dropped connection) or a host that cannot take
-the tree is an environment fault, not the change's: this exits FAULT_RC, which the callers
+the tree is an environment fault, not the change's, and so is a host that is paused (paused: this
+project's, a shared or another project's pause; nothing reaches it over ssh): this exits FAULT_RC, which the callers
 (`ttp checks`, `ttp push`, the push queue) treat as envfault does a missing runner. A command's own
 exit FAULT_RC is reported as 1, so it never reads as a fault.
 
@@ -70,6 +71,28 @@ def argv(cmd: str, host: str, env: dict | None = None, commit: str = "") -> list
 def _ssh(host: str, script: str) -> list[str]:
     # The login shell parses the command line: hand it one quoted word for sh, whatever that shell is.
     return [*SSH, host, f"sh -c {shlex.quote(script)}"]
+
+
+def paused(host: str, where: str | Path | None = None) -> str:
+    """"paused by <who>: <reason>" when check host `host` is paused, else "": a pause of this project or
+    a shared one (lockprobe.pause), or one another project set on its alias or host name
+    (checkspill.paused_elsewhere). The project is the one the check runs in (project.here, from
+    `where` else this folder); with none, or one it cannot read, nothing is paused."""
+    from . import checkspill, lockprobe, machines, project
+    try:
+        p = project.here(where)
+        if p is None:
+            return ""
+        held = lockprobe.pause(p, p.config(), host)
+        who = (held.get("project") if isinstance(held, dict) else "") or p.name
+        if held is None and (got := checkspill.paused_elsewhere(p, host, machines.load().get(host))):
+            who, held = got
+    except Exception:
+        return ""
+    if held is None:
+        return ""
+    reason = held.get("reason") if isinstance(held, dict) else ""
+    return f"paused by {who}{f': {reason}' if reason else ''}"
 
 
 def reachable(host: str) -> str:
@@ -164,6 +187,9 @@ def main(args: list[str]) -> int:
     if host_problem(host) or host == LOCAL or env_problem(env) or not cmd:
         _say(f"usage: --host <ssh alias> [--env <json>] -- <command> ({host_problem(host) or env_problem(env)})")
         return 2
+    # A paused host may be lent to others: no ssh to it until the pause lifts.
+    if why := paused(host):
+        return _fault(host, why)
     # The commit given, never the checkout's HEAD in its place: that may have moved since the run began.
     top = _git("rev-parse", "--show-toplevel")
     head = "" if commit.startswith("-") else _git("rev-parse", "--verify", "-q", f"{commit or 'HEAD'}^{{commit}}")

@@ -2185,6 +2185,28 @@ OUTPUT_TAIL = 2000   # chars of a failed daemon-run command's output kept for it
 NOTE_RUN_ENV = "TTP_NOTE_RUN_DIR"
 
 
+def here(start: str | Path | None = None) -> Project | None:
+    """The project this process runs in: its run's project, else the one at the folder it was started
+    in (`start`, else the current folder) or above it (its git top level included), else, in a git
+    worktree, the one at its main checkout."""
+    cwd = Path(start) if start else Path.cwd()
+    if os.environ.get("TTP_PROJECT") and Project(os.environ["TTP_PROJECT"]).exists():
+        return Project(os.environ["TTP_PROJECT"])
+    if p := next((c for d in [cwd, *cwd.parents] if (c := Project(d)).exists()), None):
+        return p
+    if not cwd.is_dir():
+        return None
+    try:
+        r = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=cwd, capture_output=True, text=True,
+                           timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    common = (cwd / r.stdout.strip()).resolve() if r.returncode == 0 and r.stdout.strip() else None
+    if common and common.name == ".git" and (c := Project(common.parent)).exists():
+        return c
+    return None
+
+
 def in_run(env=None) -> bool:
     """Whether a command runs for a worker (a run, or a completion command with note-only context):
     it may not act as the user (post a user message, change user-only settings)."""
