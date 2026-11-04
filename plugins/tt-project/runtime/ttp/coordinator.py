@@ -6371,7 +6371,13 @@ def _echo_kind(entry: dict, withdrawn: bool) -> str:
     return echoes.SUPERSEDED
 
 
-_USER_MSG_ID = re.compile(r"\buser(?:'s)?\s+(?:msgs?|messages?)\s+#?(\d+)", re.I)
+_USER_MSG_ID = re.compile(r"\buser(?:'s)?\s+(?:msgs?|messages?)\s+#?\d+(?:\s*(?:,|&|\band\b)\s*(?:and\s+)?#\d+)*", re.I)
+
+
+def _user_msg_ids(text: str) -> set[str]:
+    """Every user message id `text` cites, a cite list included ('user msgs #A, #B and #C'). A later
+    list item needs its '#', so a date after a cite ('user msg #5, 2026-10-13') is no id."""
+    return {i for m in _USER_MSG_ID.finditer(text) for i in re.findall(r"\d+", m.group())}
 
 
 def _withdrawn(db, old: str, user_turn: bool, why: str | None, new: str = "",
@@ -6394,11 +6400,11 @@ def _withdrawn(db, old: str, user_turn: bool, why: str | None, new: str = "",
                     [*map(int, ids), since])
         return ids - {str(r["id"]) for r in rows}
 
-    if USER_CITE.search(why) and (later(ids := set(_USER_MSG_ID.findall(why))) or not ids):
+    if USER_CITE.search(why) and (later(ids := _user_msg_ids(why)) or not ids):
         return True
     if not user_turn:
         return False
-    cited, before = set(_USER_MSG_ID.findall(new)), set(_USER_MSG_ID.findall(old))
+    cited, before = _user_msg_ids(new), _user_msg_ids(old)
     if USER_CITE.search(new) and (later(cited - before)
                                   or not USER_CITE.search(old) and (later(cited) or not cited)):
         return True

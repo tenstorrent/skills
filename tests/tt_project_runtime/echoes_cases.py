@@ -579,6 +579,11 @@ def test_a_supersede_citing_a_user_message_is_a_withdrawal_unless_every_cited_me
     assert not w(f"per user msg #{older}") and not w(new=f"Merges follow the items (user msg #{older}).")
     assert w(f"user msg #{newer} changed it") and w(new=f"Merge any time (user msg #{newer}).")
     assert w(f"user msgs #{older} and user msg #{newer}")   # one later message is enough
+    for cite in (f"user msgs #{older}, #{newer}", f"user msgs #{older} and #{newer}", f"user msgs #{older} & #{newer}",
+                 f"user msgs #{older}, and #{newer}"):   # every id of a cite list counts
+        assert w(cite) and w(cite, turn=False), cite
+    assert w(new=f"Merge any time (user msgs #{older}, #{newer}).")
+    assert not w(f"per user msg #{older}, 2026-10-13", turn=False)   # a date after the cite is no id
     assert w("user msg #99999 changed it")   # not in the chat log: still the user's word
     assert w("the user's words ended it") and w(new="Merge any time (user's words).")   # no message named
     assert not w(f"per user msg #{older}", turn=False) and w(f"user msg #{newer} changed it", turn=False)
