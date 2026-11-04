@@ -67,13 +67,12 @@ def wtmp_shutdown(after: float, before: float | None, path: str | None = None) -
 
 
 def note_stop_signal(state: Path, boot: str | None, signame: str) -> None:
-    """Record that the daemon on boot `boot` was asked to stop by `signame`, now (atomic replace).
-    Called from the signal handler: a plain file, never the database (the interrupted code may hold
-    a transaction)."""
+    """Record that the daemon on boot `boot` was asked to stop by `signame`, now (durable replace,
+    so the record outlasts the power-off that may follow). Called from the signal handler: a plain
+    file, never the database (the interrupted code may hold a transaction)."""
+    from .project import durable_write
     try:
-        tmp = state / f".{STOP_FILE}.{os.getpid()}"
-        tmp.write_text(json.dumps({"boot": boot, "ts": time.time(), "signal": signame}))
-        os.replace(tmp, state / STOP_FILE)
+        durable_write(state / STOP_FILE, json.dumps({"boot": boot, "ts": time.time(), "signal": signame}))
     except OSError:
         pass
 
