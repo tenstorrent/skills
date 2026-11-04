@@ -1267,7 +1267,8 @@ queues behind routine work; nothing running is interrupted:
   while the host's free cores now (busy cores read from /proc/stat over a few seconds) cover one check's
   measured cores; with no check running one always starts. Its test grant is then at most those free
   cores (at least 2); `checks.live_cores 0` turns both off. A set cap wins: `ttp config
-  --account checks.host_max N` (0 turns the cap off) or `TTP_CHECKS_HOST_MAX`. While
+  --account checks.host_max N` (0 turns the cap off) or `TTP_CHECKS_HOST_MAX`; it is one value for every
+  project (a project's own copy is ignored and `ttp config checks.host_max` shows the account's). While
   the 1-minute load average is under half the cores, up to `checks.load_extra` more slots open (default 2,
   0 turns them off); check commands run under `nice -n 19`/`ionice -c3` (idle IO) unless `checks.nice` is false (`checks.nice` N, 0-19, sets the level; `checks.ionice` `idle` or `best-effort[:0-7]`; both per project or account). Each check
   run also takes test-worker slots from a host pool shared by all projects (testslots: default half the cores, at

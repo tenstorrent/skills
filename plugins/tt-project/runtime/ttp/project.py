@@ -1415,6 +1415,9 @@ class Project:
                                f"restore it before changing settings")
         if why := section_value_problem(dotted, value):
             raise ValueError(why)
+        if dotted in HOST_WIDE_KEYS:
+            raise ValueError(f"{dotted} is host-wide, one value for every project on this machine: "
+                             f"ttp config --account {dotted} VALUE")
         before = copy.deepcopy(raw)
         node = raw
         parts = dotted.split(".")
@@ -2598,13 +2601,24 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_sp
                            "spill_hosts"}}   # the spill pool every project's checks may use (checkspill.account_hosts)
 # Account keys a run may only clear (ttp config --account refuses setting them inside a run).
 ACCOUNT_USER_ONLY = {"checks.spill_hosts"}
+# Host-wide account keys the runtime reads only from the account settings: a project's own copy would
+# show a value nothing uses, so layered() shows the account's in every project and set_config refuses one.
+HOST_WIDE_KEYS = {"checks.host_max", "route.host_max", "checks.spill_hosts"}
 
 
 def layered(raw: dict) -> dict:
     """A project's settings: the defaults, then the account-level ones, then its project.json (a section
     holding no object read as absent: bad_sections). budget.timezone set nowhere is the project's home zone (UTC without one)."""
-    cfg = deep_merge(DEFAULT_CONFIG, load_account_settings())
+    account = load_account_settings()
+    cfg = deep_merge(DEFAULT_CONFIG, _copy_tree(account))   # the merge below would write into account's sections
     _merge_into(cfg, _without_bad_sections(raw))
+    for dotted in HOST_WIDE_KEYS:
+        sec, _, key = dotted.partition(".")
+        if isinstance(cfg.get(sec), dict):
+            if key in (account.get(sec) or {}):
+                cfg[sec][key] = _copy_tree(account[sec][key])
+            else:
+                cfg[sec].pop(key, None)
     _chat_inherits(cfg)
     if isinstance(cfg.get("budget"), dict) and not cfg["budget"].get("timezone"):
         from .timefmt import zone_name

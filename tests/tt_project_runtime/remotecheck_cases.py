@@ -652,6 +652,48 @@ def test_a_wrapped_run_spills_only_when_its_project_says_the_wrapper_needs_no_de
     assert any("checks.wrap_needs_device" in x for x in project.config_problems({"checks": {"wrap_needs_device": "no"}}))
 
 
+def test_a_wrapped_project_with_a_narrower_own_list_spills_to_the_rest_of_the_account_pool(
+        env, tmp_path, monkeypatch):
+    """A project whose own list holds one of the account pool's hosts and whose checks run behind a
+    no-device wrapper: the pool's other host follows its list, so a busy run spills there."""
+    from ttp import checkspill, cli, machines, project
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["down"], charter=("down",))
+    project.set_account_setting(checkspill.ACCOUNT_KEY, ["down", "pool-b"])
+    machines.add("pool-b")
+    assert checkspill.hosts(p.config()) == ["down", "pool-b"]
+    wrapper = tmp_path / "wrap.sh"
+    wrapper.write_text('#!/bin/sh\nexec "$@"\n')
+    wrapper.chmod(0o755)
+    p.set_config("checks.wrap_cmd", str(wrapper))
+    p.set_config("checks.wrap_needs_device", False)
+    p.set_config("delivery.push_checks", ["true"])
+    lane = _spill_lane(p, repo)
+    try:
+        cli.main(["checks", "--fresh", "--", "true"])
+    finally:
+        lane.close()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "pool-b", rec
+
+
+def test_host_wide_settings_show_the_account_value_in_every_project_and_a_project_copy_is_refused(env):
+    """checks.host_max (and the other HOST_WIDE_KEYS) is read only from the account settings: a project's
+    own copy in project.json never shows, and setting one in a project is refused with the account command."""
+    from ttp import project
+    p = make(env)
+    project.set_account_setting("checks.host_max", 12)
+    raw = json.loads(p.config_path.read_text())
+    raw.setdefault("checks", {})["host_max"] = 4
+    raw["checks"]["spill_hosts"] = ["pool-z"]
+    p.config_path.write_text(json.dumps(raw))
+    assert p.config()["checks"]["host_max"] == 12
+    assert "spill_hosts" not in p.config()["checks"], "no account pool: a project's own copy shows nothing"
+    with pytest.raises(ValueError, match="ttp config --account checks.host_max"):
+        p.set_config("checks.host_max", 4)
+    project.set_account_setting("checks.host_max", None)
+    assert "host_max" not in p.config()["checks"]
+
+
 def test_spill_settings_are_validated_and_a_scalar_is_refused():
     from ttp import coordinator, project
     ok = {"delivery": {"checks_spill_hosts": ["check-host-a", "check-host-b"], "checks_spill_after_s": 30}}
