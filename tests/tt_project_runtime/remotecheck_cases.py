@@ -333,6 +333,54 @@ def test_spill_skips_hosts_that_are_not_allowed_busy_or_down_and_keeps_waiting_h
     assert checkspill.allowed(p, p.config(), "check-host-a") == ""
 
 
+def test_spill_hosts_set_while_a_run_waits_take_it_at_its_next_bound(env, tmp_path, monkeypatch):
+    """delivery.checks_spill_hosts set after a run began waiting here: the run reads the setting again
+    at its next bound and spills, without waiting for the lane here to free."""
+    import threading
+    from ttp import cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, [])
+    log = tmp_path / "where.log"
+    cmd = f"pwd >> {log}"
+    p.set_config("delivery.push_checks", [cmd])
+    lane = _spill_lane(p, repo)
+    threading.Timer(0.8, lambda: p.set_config("delivery.checks_spill_hosts", ["check-host-a"])).start()
+    late = threading.Timer(20.0, lane.close)
+    late.start()
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        late.cancel()
+        lane.close()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "check-host-a", rec
+    assert "spilling to check-host-a" in (run / "checks.log").read_text()
+    assert "/ttp-check." in log.read_text()
+
+
+def test_a_run_with_no_spill_hosts_keeps_waiting_here_in_bounds(env, tmp_path, monkeypatch):
+    """No spill hosts set for the whole wait: the run waits here across several bounds, never tries a
+    spill host, and runs here once the lane frees."""
+    import threading
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, [])
+    picks = []
+    monkeypatch.setattr(checkspill, "pick", lambda *a, **k: picks.append(a) or None)
+    reads = []
+    real = type(p).config
+    monkeypatch.setattr(type(p), "config", lambda self: reads.append(1) or real(self))
+    log = tmp_path / "where.log"
+    cmd = f"pwd >> {log}"
+    p.set_config("delivery.push_checks", [cmd])
+    lane = _spill_lane(p, repo)
+    threading.Timer(1.5, lane.close).start()
+    cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and "spilled_to" not in rec, rec
+    assert picks == [] and "spilling" not in (run / "checks.log").read_text()
+    assert "/ttp-check." not in log.read_text(), "it ran here"
+    assert len(reads) >= 4, "the spill settings are read again at each bound"
+
+
 def test_a_run_that_does_not_pass_on_a_spill_host_runs_again_here(env, tmp_path, monkeypatch):
     """A spill host's own environment never fails a change: a fault there (ssh lost mid-run) or a
     failure there reruns the checks here, without spilling again, and only that result counts; no

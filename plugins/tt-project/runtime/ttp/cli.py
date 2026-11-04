@@ -4288,7 +4288,8 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     for that wrapper lock's one lane, at most checklane.project_cap of the project's at once, told with
     the holder and the queue position each minute. With `spill` and delivery.checks_spill_hosts set, a
     wait past delivery.checks_spill_after_s tries those hosts (checkspill.pick) and keeps its place here
-    when none can take the run: a slot whose `spill` claim names the host the checks then run on.
+    when none can take the run: a slot whose `spill` claim names the host the checks then run on. Both
+    settings are read again at each bound: hosts set while a run waits take it at its next bound.
     `yielder()`, asked while it waits, raises checkjoin.Yield when the task's same checks run or wait
     ahead, or a newer head's do: the wait ends holding nothing."""
     from . import checkcap, checkjoin, checklane, checkspill, locks as lk
@@ -4335,12 +4336,15 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     # `lock` its wrapper lock's one lane, taken before the checks slot so a run never holds one of the
     # host's slots while it waits. Its wait is told, recorded and cancellable as the checks slot's is; the
     # foreground wait for all of them together ends after FOREGROUND_WAIT_S.
-    spill_to = bool(spill and p and checkspill.hosts(cfg))
+    # A run that may spill reads the spill settings again at each bound, so hosts set while it waits
+    # take it too; with none set it still waits in bounds of checks_spill_after_s, in the same place.
+    spill_to = bool(spill and p)
     told: set[str] = set()
     while True:
         limit = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
+        spill_cfg = p.config() if spill_to else {}
         if spill_to:   # a bounded wait here, then the spill hosts, then wait again in the same place
-            limit = checkspill.after_s(cfg) if limit is None else min(limit, checkspill.after_s(cfg))
+            limit = checkspill.after_s(spill_cfg) if limit is None else min(limit, checkspill.after_s(spill_cfg))
         try:
             slot = _checks_slot_take(p, run_dir, out, head, tell, waiting, limit, arrived, same, done, prio, owns,
                                      cfg, repo, cmds, what, top, lock, restart=detached, yielder=yielder)
@@ -4352,9 +4356,10 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             continue   # it could not re-execute: wait again with the code it runs
         if slot is not None or not spill_to:
             return slot
+        spill_cfg = p.config()   # as set now, not when the wait began
         # The same hosts skipped for the same reasons are told once, not after every bound.
-        if (claim := checkspill.pick(p, cfg, lambda line: line in told or (told.add(line), tell(line)),
-                                     what)) is not None:
+        if checkspill.hosts(spill_cfg) and (claim := checkspill.pick(
+                p, spill_cfg, lambda line: line in told or (told.add(line), tell(line)), what)) is not None:
             slot = checkcap.Slot()
             slot.spill = claim
             return slot
