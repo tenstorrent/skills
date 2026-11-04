@@ -3360,14 +3360,16 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
          say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr),
          hold: Callable[[], Any] | None = None, version_bump: dict | None = None,
          timed: Callable[[float], None] | None = None, exclude: list[str] | None = None,
-         allow: bool = False, check_run_dir: str | None = None, guard: bool = False) -> int:
+         allow: bool = False, check_run_dir: str | None = None, guard: bool = False,
+         landed: dict[str, str] | None = None) -> int:
     """Rebase HEAD onto remote/branch, run `checks` on the result, and push it if the remote did not
     move meanwhile; if it did, start over, at most `rounds` times. With no checks only a change that
     touches nothing but docs goes through, and none that adds or modifies a file `exclude` matches
     (delivery.push_exclude_paths, `excluded`). `hold` takes the push lock once the quick refusals
     passed: it returns the held lock, or None when it stayed busy (BUSY). `version_bump` (bump_of)
     bumps the version after each rebase; `timed` gets the seconds of each full, passing check run.
-    `allow` (allow_protected) lets it publish to main, master or the remote's default branch."""
+    `allow` (allow_protected) lets it publish to main, master or the remote's default branch.
+    `landed` (landed_heads) maps landed approved heads: a HEAD built on one rebases --onto it."""
     repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
     if _git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip():
         say("uncommitted changes; commit first")
@@ -3390,7 +3392,7 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
         _git(repo, "switch", "--detach", "--quiet")
     try:
         return _rounds(repo, remote, branch, checks, rounds, say, version_bump, timed, keep, exclude, check_run_dir,
-                       guard)
+                       guard, landed)
     finally:
         if keep:
             if Path(_git(repo, "rev-parse", "--absolute-git-dir").stdout.strip(), "rebase-merge").is_dir():
@@ -3655,20 +3657,78 @@ def squash_merge(repo: Path, tip: str, head: str = "HEAD") -> str:
     return _git(repo, "commit-tree", tree, "-p", tip, "-m", subject, "-m", body).stdout.strip()
 
 
-def _rebase(repo: Path, tip: str) -> bool:
-    """Rebase HEAD onto `tip`. A branch with merge commits (a review combining several branches)
-    keeps them (--rebase-merges), and the conflicts they resolved are resolved again the same way
-    rather than coming back; a conflict nothing resolved still stops it. False on a conflict, with
-    the rebase left for the caller to abort. HEAD already on `tip` stays as it is (a fast-forward):
-    rebasing it could only rewrite its commits."""
+LANDED_HEADS_MAX = 200   # the newest landed push queue rows landed_heads maps
+
+
+def landed_heads(db) -> dict[str, str]:
+    """{approved head: the commit it landed as} of the newest push queue rows that landed
+    (LANDED_HEADS_MAX): the landed-task mapping landed_deps reads. {} when the queue cannot be read."""
+    try:
+        rows = db.q("SELECT head, COALESCE(landed_sha, pushed_sha) AS sha FROM push_queue "
+                    "WHERE status IN ('pushed','landed') AND COALESCE(landed_sha, pushed_sha) IS NOT NULL "
+                    "ORDER BY id DESC LIMIT ?", (LANDED_HEADS_MAX,))
+    except Exception:   # noqa: BLE001 - no mapping only loses the drop, never a push
+        return {}
+    out: dict[str, str] = {}
+    for r in rows:
+        head, sha = str(r.get("head") or ""), str(r.get("sha") or "")
+        if re.fullmatch(r"[0-9a-f]{40,64}", head) and re.fullmatch(r"[0-9a-f]{40,64}", sha):
+            out.setdefault(head, sha)
+    return out
+
+
+def dependency_heads(repo: Path, base: str, top: str, onto: str, heads: dict[str, str]) -> dict[str, str]:
+    """{approved head: landed commit} of the `heads` (landed_heads) inside base..top whose landing is
+    on `onto`: a branch built on another task's approved head before that task landed. Its commits up
+    to that head are the dependency's, already on `onto`; a dependency that landed rebased and changed
+    (a review fix rewording or reworking a commit) leaves its old copies unmatched by patch or author
+    date, so only this mapping drops them."""
+    if not heads or not base:
+        return {}
+    mine = set(_git(repo, "rev-list", f"{base}..{top}").stdout.split())
+    return {d: sha for d, sha in heads.items() if d in mine and descends(repo, sha, onto)}
+
+
+def landed_deps(repo: Path, base: str, top: str, onto: str, heads: dict[str, str]) -> dict[str, str]:
+    """{commit: the landed commit carrying it} for the non-merge commits of base..top under a
+    dependency_heads head: a replay leaves them out, as a rebase --onto <tip> <that head> would."""
+    out: dict[str, str] = {}
+    for d, sha in dependency_heads(repo, base, top, onto, heads).items():
+        for c in _git(repo, "rev-list", "--no-merges", f"{base}..{d}").stdout.split():
+            out.setdefault(c, sha)
+    return out
+
+
+def _dependency(repo: Path, tip: str, heads: dict[str, str], say: Callable[[str], None]) -> str:
+    """The landed dependency head (dependency_heads) HEAD's rebase onto `tip` starts after (--onto
+    <tip> <head>): the one every other such head is under. "" when there is none, or when several are
+    on separate lines (then none covers the others' commits, and the rebase goes as before)."""
+    base = _git(repo, "merge-base", tip, "HEAD").stdout.strip()
+    deps = dependency_heads(repo, base, "HEAD", tip, heads)
+    top = next((d for d in deps if all(o == d or descends(repo, o, d) for o in deps)), "")
+    if top:
+        n = _git(repo, "rev-list", "--count", "--no-merges", f"{base}..{top}").stdout.strip()
+        say(f"HEAD is built on approved head {top[:10]}, which landed as {deps[top][:10]}: rebasing with "
+            f"--onto, leaving out its {n} commit(s)")
+    return top
+
+
+def _rebase(repo: Path, tip: str, upstream: str = "") -> bool:
+    """Rebase HEAD onto `tip`; with `upstream` (a landed dependency's approved head: _dependency) only
+    the commits after it (--onto <tip> <upstream>). A branch with merge commits (a review combining
+    several branches) keeps them (--rebase-merges), and the conflicts they resolved are resolved again
+    the same way rather than coming back; a conflict nothing resolved still stops it. False on a
+    conflict, with the rebase left for the caller to abort. HEAD already on `tip` stays as it is (a
+    fast-forward): rebasing it could only rewrite its commits."""
     if descends(repo, tip, "HEAD"):
         return True
-    merges = [line.split() for line in
-              _git(repo, "rev-list", "--merges", "--parents", "HEAD", f"^{tip}").stdout.splitlines()]
+    onto = ["--onto", tip, upstream] if upstream else [tip]
+    merges = [line.split() for line in _git(repo, "rev-list", "--merges", "--parents", "HEAD", f"^{tip}",
+                                            *([f"^{upstream}"] if upstream else [])).stdout.splitlines()]
     if not merges:
-        return _git(repo, "rebase", tip, quiet=False).returncode == 0
+        return _git(repo, "rebase", *onto, quiet=False).returncode == 0
     _learn_merges(repo, merges)
-    if _git(repo, *RERERE, "rebase", "--rebase-merges", tip, quiet=False).returncode == 0:
+    if _git(repo, *RERERE, "rebase", "--rebase-merges", *onto, quiet=False).returncode == 0:
         return True
     editor = {**os.environ, "GIT_EDITOR": "true"}   # keep each recreated merge's own message
     for _ in range(MAX_REPLAYED):
@@ -3698,7 +3758,8 @@ def _land_squashed(repo: Path, tip: str, upstream: str, say: Callable[[str], Non
 def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int,
             say: Callable[[str], None], version_bump: dict | None = None,
             timed: Callable[[float], None] | None = None, keep: str = "",
-            exclude: list[str] | None = None, check_run_dir: str | None = None, guard: bool = False) -> int:
+            exclude: list[str] | None = None, check_run_dir: str | None = None, guard: bool = False,
+            landed: dict[str, str] | None = None) -> int:
     global last_pushed
     upstream = f"{remote}/{branch}"
     passes: dict[str, tuple[str, str]] = {}   # check -> (tip, head) it last passed on in this push
@@ -3718,7 +3779,13 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         if bad := excluded(repo, tip, "HEAD", exclude or []):
             say(excluded_refusal(bad, upstream))
             return REFUSED
-        if not _rebase(repo, tip):
+        # A head built on a landed dependency's approved head leaves out its stale copies (--onto);
+        # a conflict in its own commits then goes the usual way.
+        ok = bool(dep := _dependency(repo, tip, landed or {}, say)) and _rebase(repo, tip, dep)
+        if dep and not ok:
+            _git(repo, "rebase", "--abort")
+            say(f"the rebase --onto {upstream} {dep[:10]} conflicts; rebasing onto {upstream} as before")
+        if not ok and not _rebase(repo, tip):
             _git(repo, "rebase", "--abort")
             if not _land_squashed(repo, tip, upstream, say):
                 if keep:
@@ -4045,7 +4112,7 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
         rc = push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
                   version_bump=version_bump, timed=lambda s: record_check_s(p, s),
                   exclude=exclude_list(d.get("push_exclude_paths")), allow=allow_protected(d), check_run_dir=output,
-                  guard=version_guard(d))
+                  guard=version_guard(d), landed=landed_heads(p.db))
         if rc == 0 and last_pushed and (also := fast_forward_list(d.get("fast_forward_also"))):
             last_ff = fast_forward(repo, remote, last_pushed, also, branch)
         if rc == 0 and last_pushed and (mirrors := mirror_list(d.get("mirror_remotes"))):

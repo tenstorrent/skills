@@ -1020,6 +1020,7 @@ class Batch:
         self.status: dict[int, str] = {}       # entry index -> status
         self.detail: dict[int, dict] = {}
         self.landed_at: dict[int, str] = {}    # entry index -> its own commit on the branch (pushed or landed)
+        self._heads: dict[str, str] | None = None   # push.landed_heads, read once per batch
         self.check_run_dir = m.get("check_run_dir")
         self.checks = {"runs": 0, "seconds": 0.0, "flaky": False}
         self.tip = self.pushed_sha = self.version = None
@@ -1424,7 +1425,8 @@ class Batch:
                 resolved: dict[str, list[str]] | None = None) -> tuple[list[str], dict[str, str]]:
         """The commits of base..top (merges aside), and those of them already on `onto`, each with
         the commit there that carries it: one naming it in a REPLAYED trailer (a batch that settled
-        its replay, or a squash that carries several), else one with the same patch (`git patch-id
+        its replay, or a squash that carries several), else the landing of another task's approved
+        head the entry was built on (push.landed_deps: --onto <tip> <that head>), else one with the same patch (`git patch-id
         --stable`, as git cherry), else a newer rewrite of it (_rewritten: it landed
         conflict-resolved; `resolved` gets those found only through a conflict the landing resolved).
         Replaying such a commit again could only conflict with its own landing. Oldest first; the first
@@ -1438,6 +1440,10 @@ class Batch:
             sha, _, body = chunk.partition("\n")
             for c in re.findall(rf"^{REPLAYED}: ([0-9a-f]{{40,64}})[ \t]*$", body, re.M):
                 gone.setdefault(c, sha)
+        if getattr(self, "_heads", None) is None:
+            self._heads = push.landed_heads(self.p.db) if getattr(self, "p", None) else {}
+        for c, sha in push.landed_deps(self.repo, base, top, onto, self._heads).items():
+            gone.setdefault(c, sha)
         if rest := [c for c in own if c not in gone]:
             mine = _patch_ids(self.repo, ["--no-walk=unsorted", *rest])
             theirs = {pid: c for c, pid in reversed(_patch_ids(self.repo, ["--reverse", f"{base}..{onto}"]).items())}

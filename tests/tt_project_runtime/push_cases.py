@@ -2395,6 +2395,74 @@ def test_a_push_batch_drops_an_entry_commit_that_landed_rewritten_and_replays_th
     assert f"({a[:10]} as {landed_as[:10]}); replaying the other 1" in capsys.readouterr().out
 
 
+def _dependency_landed_reworked(env, monkeypatch, child_files):
+    """A parent task's approved head `a` lands rebased and reworked in its review (a new subject,
+    author date and patch: no trailer, patch id or rewrite matches it), recorded in the push queue;
+    a child branch built on `a` adds `child_files`. (p, repo, origin, landed sha, child head)."""
+    p, repo, origin, other, a = _landed_fixture(env, monkeypatch)
+    _land_as(other, {"later.txt": "x\n"}, "another change")
+    landed = _land_as(other, {"notes.txt": "a\nB1 reworked\nc\n"}, "first, reworked after its review")
+    now = time.time()
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated, landed_sha) "
+           "VALUES(?,?,?,?,?,?,?,?)", (7, "first", a, "origin/proj", "pushed", now, now, landed))
+    head = _on_top(repo, a, "e1", child_files)
+    return p, repo, origin, landed, head
+
+
+def test_a_push_batch_lands_a_child_built_on_a_landed_parents_approved_head_without_a_conflict(env, monkeypatch,
+                                                                                             capsys):
+    """The parent landed rebased and changed: the batch leaves out the child's stale copy of the
+    parent's commit through the landed-task mapping (as rebase --onto <tip> <parent's approved head>)
+    and replays only the child's own commit: no conflict, so its approval stands and no review runs."""
+    p, repo, origin, landed, head = _dependency_landed_reworked(env, monkeypatch, {"more.txt": "own\n"})
+    rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed"], m
+    pushed = _git_out(origin, "rev-parse", "proj")
+    assert _git_out(origin, "show", f"{pushed}:notes.txt") == "a\nB1 reworked\nc", "the landing is kept"
+    assert _git_out(origin, "show", f"{pushed}:more.txt") == "own"
+    assert _git_out(origin, "rev-list", "--count", f"{landed}..{pushed}") == "1", "only its own commit"
+    assert f"as {landed[:10]}); replaying the other 1" in capsys.readouterr().out
+
+
+def test_a_push_batch_still_sends_back_a_child_whose_own_commit_conflicts_with_its_landed_parent(env, monkeypatch):
+    """The child's own commit edits the line the parent's landing reworked: a real conflict, sent back."""
+    p, repo, origin, landed, head = _dependency_landed_reworked(env, monkeypatch, {"notes.txt": "a\nB1 mine\nc\n"})
+    rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
+    assert _statuses(m) == ["conflict"], m
+    assert m["results"][0]["detail"]["files"] == ["notes.txt"], m["results"]
+
+
+def test_a_push_batch_never_drops_commits_under_an_approved_head_whose_landing_is_not_on_the_target(
+        env, monkeypatch):
+    """The mapping counts only a landing on the target: a row naming a commit the target lacks drops
+    nothing, so the stale copy is replayed (here: the usual conflict)."""
+    p, repo, origin, landed, head = _dependency_landed_reworked(env, monkeypatch, {"more.txt": "own\n"})
+    _git_out(repo, "checkout", "-q", "-B", "elsewhere", head)
+    _commit(repo, "x.txt", "x\n")
+    p.db.x("UPDATE push_queue SET landed_sha=?", (_git_out(repo, "rev-parse", "HEAD"),))
+    rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
+    assert _statuses(m) == ["conflict"], m
+
+
+@pytest.mark.parametrize("own, ok", [({"more.txt": "own\n"}, True), ({"notes.txt": "a\nB1 mine\nc\n"}, False)])
+def test_ttp_push_rebases_a_child_onto_the_tip_past_its_landed_parents_approved_head(env, monkeypatch, capsys,
+                                                                                    own, ok):
+    """`ttp push` of a child built on a landed parent's approved head rebases --onto the tip past
+    that head: it lands only its own commit; a conflict in its own commit is still a conflict."""
+    from ttp import push
+    p, repo, origin, landed, head = _dependency_landed_reworked(env, monkeypatch, own)
+    rc = push.run(p, repo)
+    err = capsys.readouterr().err
+    assert f"which landed as {landed[:10]}: rebasing with --onto" in err
+    if ok:
+        assert rc == 0, err
+        pushed = _git_out(origin, "rev-parse", "proj")
+        assert _git_out(origin, "rev-list", "--count", f"{landed}..{pushed}") == "1", "only its own commit"
+        assert _git_out(origin, "show", f"{pushed}:notes.txt") == "a\nB1 reworked\nc"
+    else:
+        assert rc == push.CONFLICT and _git_out(origin, "rev-parse", "proj") == landed, err
+
+
 def test_a_push_batch_replays_an_entry_commit_amended_after_its_landing(env, monkeypatch):
     """The entry's commit is an amend (same author date and subject) of one that landed, made after
     the landing and adding work: it is newer than the landed copy, so it is replayed, never dropped."""
