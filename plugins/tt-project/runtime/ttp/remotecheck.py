@@ -3,7 +3,7 @@
 """A check that runs on another machine over ssh: `delivery.checks_host`, or a check's own `host`.
 
 Some projects may not run test suites on the machine that coordinates them. A check with a host
-runs there instead: the exact commit being checked (HEAD of the checkout the check runs in) is
+runs there instead: the exact commit being checked (--commit, else HEAD of the checkout) is
 copied with `git archive` over ssh into a fresh temporary directory, made a git checkout (`git init`
 and one commit of that tree, so tests that need a repository work), and the command runs in it with
 the check's `env` exported (values expand in the remote shell, e.g. "$HOME/.local/bin:$PATH"). Its
@@ -60,10 +60,11 @@ def env_problem(v) -> str:
     return ""
 
 
-def argv(cmd: str, host: str, env: dict | None = None) -> list[str]:
-    """The local command that runs check `cmd` on `host` (main)."""
+def argv(cmd: str, host: str, env: dict | None = None, commit: str = "") -> list[str]:
+    """The local command that runs check `cmd` on `host` (main): on `commit` when given (the commit a
+    `ttp checks` run records), else on the checkout's HEAD."""
     return [sys.executable, "-c", _BOOT, str(Path(__file__).resolve().parents[1]), "--host", host,
-            "--env", json.dumps(env or {}, sort_keys=True), "--", cmd]
+            "--env", json.dumps(env or {}, sort_keys=True), *(["--commit", commit] if commit else []), "--", cmd]
 
 
 def _ssh(host: str, script: str) -> list[str]:
@@ -144,20 +145,25 @@ def _stop(_sig, _frame) -> None:
 
 
 def main(args: list[str]) -> int:
-    host, env = "", {}
+    host, env, commit = "", {}, ""
     while args and args[0] != "--":
         flag, value, args = args[0], args[1] if len(args) > 1 else "", args[2:]
         if flag == "--host":
             host = value
         elif flag == "--env":
             env = json.loads(value or "{}")
+        elif flag == "--commit":
+            commit = value
     cmd = " ".join(args[1:])
     if host_problem(host) or host == LOCAL or env_problem(env) or not cmd:
         _say(f"usage: --host <ssh alias> [--env <json>] -- <command> ({host_problem(host) or env_problem(env)})")
         return 2
-    top, head = _git("rev-parse", "--show-toplevel"), _git("rev-parse", "HEAD")
+    # The commit given, never the checkout's HEAD in its place: that may have moved since the run began.
+    top = _git("rev-parse", "--show-toplevel")
+    head = "" if commit.startswith("-") else _git("rev-parse", "--verify", "-q", f"{commit or 'HEAD'}^{{commit}}")
     if not top or not head:
-        _say("not in a git checkout with a commit; nothing to copy")
+        _say(f"no commit {commit[:12]} in this checkout; nothing to copy" if commit and top
+             else "not in a git checkout with a commit; nothing to copy")
         return 2
     for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(s, _stop)

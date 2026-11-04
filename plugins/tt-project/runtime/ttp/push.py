@@ -494,12 +494,13 @@ def outside_scope(checks: list[Check], skipped: list[str]) -> bool:
             and all(getattr(s, "scoped", False) for s in own))
 
 
-def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None, isolate: bool = True) -> list[str]:
+def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None, isolate: bool = True,
+               commit: str = "") -> list[str]:
     """How a check command runs: first-failure semantics, so `a; b` fails when `a` fails and a
     pipeline fails when any stage does (bash `-e -o pipefail`; plain `sh -e` where bash is missing).
     With `top` (the worktree it runs in), a bare pytest runs with the repository's venv, else the one
     `env` (the check's environment; default this process's) has active (venv_cmd). A check with a host
-    (remote_host) runs there instead, on a copy of the checkout's HEAD (remotecheck). A local check runs
+    (remote_host) runs there instead, on a copy of `commit`, else of the checkout's HEAD (remotecheck). A local check runs
     in a process sandbox (sandbox.wrap) unless it opts out or `isolate` is false; sandbox_lines says
     when one cannot."""
     exports = dict(getattr(cmd, "env", ()) or ())
@@ -507,7 +508,7 @@ def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None,
     lane = tuple(getattr(cmd, "lane", ()) or ()) if wrap else ()
     isolate = isolate and getattr(cmd, "sandbox", True) is not False
     if host := remote_host(cmd):
-        return remotecheck.argv(str(cmd), host, exports)
+        return remotecheck.argv(str(cmd), host, exports, commit)
     cmd = venv_cmd(cmd, top, env) if top else cmd
     cmd = remotecheck.exports(exports) + testslots.clamp_for(cmd, env)
     bash = shutil.which("bash")

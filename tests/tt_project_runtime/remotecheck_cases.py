@@ -43,13 +43,13 @@ def _rc_repo(tmp_path, big=False):
     return repo
 
 
-def _rc_run(tmp_path, repo, cmd, host="box1", env=None, wait=True, **fake):
+def _rc_run(tmp_path, repo, cmd, host="box1", env=None, wait=True, commit="", **fake):
     """remotecheck run as callers run it (push.check_argv's argv) in `repo` against the fake ssh:
     (exit code, output); with wait=False the Popen."""
     from ttp import remotecheck
     bin_, remote = _rc_fake_ssh(tmp_path)
     penv = {**os.environ, "PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}", "FAKE_REMOTE_TMP": str(remote), **fake}
-    proc = subprocess.Popen(remotecheck.argv(cmd, host, env), cwd=repo, env=penv, stdout=subprocess.PIPE,
+    proc = subprocess.Popen(remotecheck.argv(cmd, host, env, commit), cwd=repo, env=penv, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True)
     if not wait:
         return proc
@@ -86,6 +86,23 @@ def test_a_remote_check_runs_on_a_git_checkout_of_exactly_head_and_cleans_up(tmp
     assert _rc_run(tmp_path, repo, "exit 3")[0] == 3
     rc, said = _rc_run(tmp_path, repo, "exit 75")
     assert rc == 1 and "reported as 1" in said
+    assert _rc_left(tmp_path) == []
+
+
+def test_a_remote_check_given_a_commit_copies_that_commit_not_the_moved_head(tmp_path):
+    """--commit (the commit a `ttp checks` run records): the host gets that commit though HEAD moved
+    since; a commit this checkout lacks, or an option-like value, copies nothing and fails (exit 2)."""
+    repo = _rc_repo(tmp_path)
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    first = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    (repo / "a.txt").write_text("moved\n")
+    subprocess.run([*git, "commit", "-qam", "moved"], check=True)
+    rc, said = _rc_run(tmp_path, repo, "cat a.txt", commit=first)
+    assert rc == 0 and "a\n" in said and "moved" not in said and f"checking {first[:12]}" in said, said
+    assert "moved" in _rc_run(tmp_path, repo, "cat a.txt")[1], "no commit given: HEAD, as before"
+    for bad in ("0" * 40, "--output=x", "-q"):
+        rc, said = _rc_run(tmp_path, repo, "echo ran", commit=bad)
+        assert rc == 2 and "ran" not in said.replace("nothing to copy", ""), (bad, said)
     assert _rc_left(tmp_path) == []
 
 
@@ -335,15 +352,24 @@ def test_spill_skips_hosts_that_are_not_allowed_busy_or_down_and_keeps_waiting_h
 
 def test_spill_hosts_set_while_a_run_waits_take_it_at_its_next_bound(env, tmp_path, monkeypatch):
     """delivery.checks_spill_hosts set after a run began waiting here: the run reads the setting again
-    at its next bound and spills, without waiting for the lane here to free."""
+    at its next bound and spills, without waiting for the lane here to free. It still runs and records
+    only the commit it began on, though the worktree took a new commit while it waited."""
+    import subprocess
     import threading
     from ttp import cli
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, [])
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
     log = tmp_path / "where.log"
-    cmd = f"pwd >> {log}"
+    cmd = f"pwd >> {log}; cat a.txt >> {log}"
     p.set_config("delivery.push_checks", [cmd])
     lane = _spill_lane(p, repo)
-    threading.Timer(0.8, lambda: p.set_config("delivery.checks_spill_hosts", ["check-host-a"])).start()
+
+    def mid_wait():
+        (repo / "a.txt").write_text("moved\n")
+        subprocess.run([*git, "commit", "-qam", "moved"], check=True)
+        p.set_config("delivery.checks_spill_hosts", ["check-host-a"])
+    threading.Timer(0.8, mid_wait).start()
     late = threading.Timer(20.0, lane.close)
     late.start()
     try:
@@ -353,8 +379,10 @@ def test_spill_hosts_set_while_a_run_waits_take_it_at_its_next_bound(env, tmp_pa
         lane.close()
     rec = json.loads((run / "checks.json").read_text())
     assert rec["passed"] is True and rec["spilled_to"] == "check-host-a", rec
+    assert rec["head"] == head, rec
     assert "spilling to check-host-a" in (run / "checks.log").read_text()
-    assert "/ttp-check." in log.read_text()
+    ran = log.read_text()
+    assert "/ttp-check." in ran and "a\n" in ran and "moved" not in ran, ran
 
 
 def test_a_run_with_no_spill_hosts_keeps_waiting_here_in_bounds(env, tmp_path, monkeypatch):

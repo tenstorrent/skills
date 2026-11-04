@@ -3497,7 +3497,7 @@ def cmd_checks(a) -> None:
                 try:
                     while True:
                         rc = scriptwatch.rerun(
-                            lambda: _run_check(_low_priority(push.check_argv(c, cwd, env)), group, record=reap_rec, cwd=cwd,
+                            lambda: _run_check(_low_priority(push.check_argv(c, cwd, env, commit=head)), group, record=reap_rec, cwd=cwd,
                                                stdout=out,
                                                stderr=subprocess.STDOUT, env=env, timeout=checkwall.deadline_left(deadline),
                                                silent_s=checkwall.silent_limit(c), pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ()),
