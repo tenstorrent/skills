@@ -691,7 +691,9 @@ def test_chat_declared_plan_or_a_zero_price_row_drops_the_fallback_rate_cap(tmp_
 def test_chat_fallback_cap_is_one_low_observation_a_day_and_a_doctor_line(env, monkeypatch):
     from ttp import daemon as dmod
     from ttp.daemon import Daemon
+    from ttp.providers import claude
     from ttp.providers.chat import fallback_cap_line
+    monkeypatch.setattr(claude, "fence_missing", lambda: [])   # fenced runs, whatever this host has installed
     p = make(env)
     _chat_config(p)
     seen, clock = [], [time.time()]
