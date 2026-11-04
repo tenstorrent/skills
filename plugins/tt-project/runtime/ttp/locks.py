@@ -10,6 +10,13 @@ Waiters queue in arrival order (a ticket file per waiting process under <resourc
 first `slots` live tickets may take a slot, so a waiter is never starved by later arrivals. A ticket
 whose process is gone is dropped.
 
+A landing waiter (a `ttp lock` run inside the checks of a landing: `ttp push` to the push branch, the
+push queue's batch checks, `ttp land`, in any project) goes ahead of other waiters, in arrival order
+within each class. Only the harness marks one: the check runner holds a landing mark (landmark.py) and
+`ttp lock` counts as landing only if that mark is held by one of its own ancestors, so a forged
+environment gets normal ordering. The bound: a waiter that has waited LANDING_AGE_S is no longer
+passed by later landings. A landing never preempts a holder; it only moves up the queue.
+
 A shared holder (`ttp lock --shared`, for read-only work) takes a read lock on every slot instead
 of one slot's write lock, and labels itself in <resource>.shared: shared holders run together, and
 any slot's exclusive holder keeps them all out, as they keep it out. The queue stays in arrival
@@ -1073,6 +1080,8 @@ SHARED_TICKET = "-shared"   # ends a shared waiter's ticket name
 GROUP_TICKET = ".g"         # then a fair queue's group id: <arrival>-<pid>[.p<priority>].g<id>
 MULTI_TICKET = ".m"         # after the pid, a waiter for several resources at once (`ttp lock A,B`)
 PRIORITY_TICKET = ".p"      # before it, the waiter's task priority (lowest first; checkcap uses 0 for obligation owners)
+LANDING_TICKET = ".l"       # right after the pid, a waiter inside a landing's checks (landmark.verified; landing_first)
+LANDING_AGE_S = 3600.0      # a waiter that has waited this long is no longer passed by later landings (landing_first)
 SERVED_KEEP_S = 86400.0     # a group's last-served time older than this no longer changes its turn
 
 
@@ -1083,7 +1092,7 @@ def group_id(group: str | None) -> str:
 
 def enqueue(locks_dir: Path, resource: str, holder: str, since: float | None = None,
             shared: bool = False, group: str | None = None, priority: int | None = None,
-            multi: bool = False) -> Path:
+            multi: bool = False, landing: bool = False) -> Path:
     """A ticket for this process in the resource's arrival queue. Like a slot, it is an OS file lock
     held by this process, so it ends with it (a crash, a kill, a reboot) whatever its pid becomes.
     Not written durably: a power cut ends every waiter with it. Remove it with `dequeue`. `since`
@@ -1092,12 +1101,14 @@ def enqueue(locks_dir: Path, resource: str, holder: str, since: float | None = N
     (fair_order) takes turns between; waiters without one form their own group. `priority` (the task's;
     lower first) orders the waiters within a group; it goes before the group id, so older runtimes
     still read the group. `multi`: one of the tickets of a waiter for several resources at once
-    (MULTI_TICKET after the pid), which a waiter that holds locks already does not wait behind (my_turn)."""
+    (MULTI_TICKET after the pid), which a waiter that holds locks already does not wait behind (my_turn).
+    `landing`: a waiter inside a landing's checks (LANDING_TICKET); only a verified one (landmark.verified)."""
     d = queue_dir(locks_dir, resource)
     d.mkdir(parents=True, exist_ok=True)
     gid = group_id(group)
     prio = f"{PRIORITY_TICKET}{int(priority)}" if priority is not None else ""
-    name = (f"{time.time() if since is None else since:017.6f}-{os.getpid()}{MULTI_TICKET if multi else ''}{prio}"
+    name = (f"{time.time() if since is None else since:017.6f}-{os.getpid()}{LANDING_TICKET if landing else ''}"
+            f"{MULTI_TICKET if multi else ''}{prio}"
             f"{GROUP_TICKET + gid if gid else ''}{SHARED_TICKET if shared else ''}")
     # Locked under a hidden name first, then renamed in: `queued` never sees it unlocked.
     tmp = d / f".{name}.tmp"
@@ -1238,6 +1249,22 @@ def queued(locks_dir: Path, resource: str) -> list[Path]:
 
 def is_multi(ticket: Path) -> bool:
     return MULTI_TICKET in ticket.name.partition(PRIORITY_TICKET)[0].partition(GROUP_TICKET)[0]
+
+
+def is_landing(ticket: Path) -> bool:
+    head = ticket.name.removesuffix(SHARED_TICKET).split("-", 1)[-1]
+    return LANDING_TICKET in head.partition(GROUP_TICKET)[0].partition(PRIORITY_TICKET)[0]
+
+
+def landing_first(q: list[Path], now: float | None = None) -> list[Path]:
+    """`q` with landing waiters (is_landing) moved ahead of the rest, by arrival, along with every waiter
+    that has waited LANDING_AGE_S or longer: a later landing never passes it, so no waiter waits on a
+    stream of landings without a bound. The rest keep their order. Without a landing waiting, `q`."""
+    if not any(map(is_landing, q)):
+        return q
+    edge = (time.time() if now is None else now) - LANDING_AGE_S
+    front = sorted((t for t in q if is_landing(t) or _arrival(t) <= edge), key=_arrival)
+    return front + [t for t in q if t not in front]
 
 
 def is_shared(ticket: Path) -> bool:
@@ -1393,7 +1420,8 @@ def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool
     waiters (urgent tickets, task priority URGENT_PRIORITY or better, before the rest), one per free
     slot, with no shared waiter ahead. A shared one: no exclusive waiter
     ahead, so it never jumps one. `fair`: waiters are counted in fair_order (with `urgent_max`), not
-    arrival order (and `aged_before` as there). `past_multi` (a waiter that holds locks already): waiters for several resources at
+    arrival order (and `aged_before` as there). Either way landing waiters go first (landing_first). `past_multi`
+    (a waiter that holds locks already): waiters for several resources at
     once ahead are not counted, as one of them may wait for a lock this waiter's holder has: waiting
     behind it would never end."""
     q = queued(locks_dir, resource)
@@ -1403,6 +1431,7 @@ def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool
         q = fair_order(locks_dir, resource, q, urgent_max, aged_before)
     else:   # urgent waiters (an urgent task's) first, arrival order within: none, and it is plain arrival
         q = sorted(q, key=lambda t: not _urgent(t))
+    q = landing_first(q)
     ahead = [t for t in q[:q.index(ticket)] if not (past_multi and is_multi(t))]
     if is_shared(ticket):
         return all(is_shared(t) for t in ahead)

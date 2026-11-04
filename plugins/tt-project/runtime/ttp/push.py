@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gitcache, gitmemo, landed, locks, machines, prguard, prhead, remotecheck, repoid, runner,
+from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gitcache, gitmemo, landed, landmark, locks, machines, prguard, prhead, remotecheck, repoid, runner,
                sandbox, scriptwatch, settinghold, shorttmp, testslots, timefmt, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
@@ -3856,9 +3856,18 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
         sys.stdout.flush()
         sys.stderr.flush()
         waits = Path(tempfile.mkdtemp(prefix="check-waits-", dir=env.get("TTP_RUN_DIR") or None)).resolve()
-        proc = subprocess.Popen(testslots.low_priority(check_argv(cmd, repo, env)), cwd=repo,
-                                env={**env, checkwait.ENV: str(waits)},
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, pass_fds=checkdirs.inherited())
+        # A landing's check (to the push branch, or `ttp land`) runs under a landing mark: a `ttp lock`
+        # in it goes ahead of non-landing waiters (landmark.py). No other check inherits one.
+        mark = landmark.hold() if env.get("TTP_PUSH_MODE") == "target" else None
+        try:
+            proc = subprocess.Popen(testslots.low_priority(check_argv(cmd, repo, env)), cwd=repo,
+                                    env={**{k: v for k, v in env.items() if k != landmark.ENV}, checkwait.ENV: str(waits),
+                                         **({landmark.ENV: str(mark.path)} if mark else {})},
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, pass_fds=checkdirs.inherited())
+        except BaseException:
+            if mark:
+                mark.close()
+            raise
         reader = threading.Thread(target=_copy_out, args=(proc.stdout, collect), daemon=True)
         reader.start()
         try:
@@ -3870,6 +3879,8 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
         finally:
             reader.join(timeout=10)   # a child that left the group may keep the pipe open; do not wait on it
             shutil.rmtree(waits, ignore_errors=True)
+            if mark:
+                mark.close()
     reruns = 0
     while True:
         rc = scriptwatch.rerun(once, bool, None if remote_host(cmd) else str(cmd), repo, env, say, on_pass=True)

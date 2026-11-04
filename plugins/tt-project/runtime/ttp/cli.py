@@ -6035,6 +6035,10 @@ def cmd_lock(a) -> None:
             lk.record_wait(wait_dir, wait_key, started, time.time())
 
     job = lk.job_fields()   # inside a `ttp detach` job (its --lock): the label names the job and its pid
+    from . import landmark
+    landed_check = landmark.verified()   # inside a landing's checks (a verified mark): ahead of non-landing waiters
+    if landed_check:
+        job = {**job, "landing": True}
 
     def _nap(secs: float) -> None:
         # Sleep; a SIGTERM, SIGINT or SIGHUP meanwhile is taken with its sender (sigtimedwait, Linux),
@@ -6070,7 +6074,7 @@ def cmd_lock(a) -> None:
     for L in todo:
         try:   # one arrival time on every lock: no two waiters can be ahead of each other on different ones
             L["ticket"] = lk.enqueue(L["where"], L["res"], L["who"], since=started, shared=a.shared,
-                                     multi=len(todo) > 1, priority=prio)
+                                     multi=len(todo) > 1, priority=prio, landing=landed_check)
         except OSError as e:
             _unwritable(e, L)
         tickets.append(L["ticket"])
@@ -6207,10 +6211,13 @@ def cmd_lock(a) -> None:
                 if by:
                     return f"{L['name']} (reserved for {by})"
                 ahead = len(lk.queued(L["where"], L["res"])) - 1
+                lands = [r for r in lk.holder_records(L["paths"], p) if r.get("landing")]
                 return (f"{L['name']}{' (shared)' if a.shared else ''} (held by "
                         f"{', '.join(lk.holders_now(L['paths'], p)) or 'another task'}"
+                        f"{'; holder is a landing' if lands else '; holder is not a landing'}"
                         f"{f'; {ahead} ahead in queue' if ahead > 0 else ''})")
-            line = "waiting for " + "; ".join(_why(L, by) for L, by in blocked)
+            line = ("waiting as a landing for " if landed_check else "waiting for ") \
+                + "; ".join(_why(L, by) for L, by in blocked)
             print(f"ttp lock: {line}", file=sys.stderr, flush=True)
             if run_dir:
                 try:

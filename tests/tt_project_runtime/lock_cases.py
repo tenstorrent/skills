@@ -2032,3 +2032,154 @@ def test_a_ttp_lock_waiter_whose_run_ended_leaves_the_queue_and_exits_75(env, tm
     finally:
         go.touch()
     assert holder.wait(timeout=60) == 0
+
+
+def test_a_later_landing_lock_waiter_goes_first_fifo_within_each_class_and_a_long_waiter_keeps_its_place(tmp_path):
+    """locks.my_turn: landing waiters (LANDING_TICKET) go ahead of every non-landing one, urgent ones
+    included, in arrival order among themselves, in both the arrival and the fair order; the rest keep
+    their order. A waiter that has waited LANDING_AGE_S is not passed by a later landing: no starvation."""
+    from ttp import locks
+    q = tmp_path / "q"
+    now = time.time()
+    routine = locks.enqueue(q, "gate", "proj-a suite", since=now - 30, group="proj-a")
+    hot = locks.enqueue(q, "gate", "proj-a urgent suite", since=now - 20, priority=1, group="proj-a")
+    land1 = locks.enqueue(q, "gate", "proj-b landing", since=now - 10, group="proj-b", landing=True)
+    land2 = locks.enqueue(q, "gate", "proj-c landing", since=now - 5, group="proj-c", landing=True, multi=True,
+                          priority=3)
+    every = (routine, hot, land1, land2)
+    try:
+        assert [locks.is_landing(t) for t in every] == [False, False, True, True]
+        assert locks.is_multi(land2) and locks.ticket_priority(land2) == 3 and locks.ticket_group(land2), \
+            "older readers' fields still parse"
+        for fair in (False, True):
+            assert [locks.my_turn(q, "gate", t, 1, fair=fair) for t in every] == [False, False, True, False], fair
+            assert [locks.my_turn(q, "gate", t, 2, fair=fair) for t in every] == [False, False, True, True], fair
+        assert locks.my_turn(q, "gate", hot, 3) and not locks.my_turn(q, "gate", routine, 3), "urgent, then arrival"
+        locks.dequeue(land1)
+        locks.dequeue(land2)
+        assert locks.my_turn(q, "gate", hot, 1) and not locks.my_turn(q, "gate", routine, 1), "no landing: as before"
+        old = locks.enqueue(q, "gate", "proj-a long suite", since=now - locks.LANDING_AGE_S - 60, group="proj-a")
+        late = locks.enqueue(q, "gate", "proj-b landing", since=now, group="proj-b", landing=True)
+        every += (old, late)
+        assert locks.my_turn(q, "gate", old, 1) and not locks.my_turn(q, "gate", late, 1), "aged: not passed"
+        assert locks.my_turn(q, "gate", late, 2) and not locks.my_turn(q, "gate", hot, 2)
+        shared = locks.enqueue(q, "gate", "proj-d landing", shared=True, landing=True)
+        every += (shared,)
+        assert locks.is_landing(shared) and locks.is_shared(shared)
+    finally:
+        for t in every:
+            locks.dequeue(t)
+
+
+def _mark_holder(env):
+    """A process outside the waiter's ancestry holding a real landing mark; (process, mark path)."""
+    proc = subprocess.Popen([sys.executable, "-c", "import sys, time\nfrom ttp import landmark\nm = landmark.hold()\n"
+                             "print(m.path, flush=True)\nsys.stdin.read()"], env=env, stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, text=True)
+    return proc, proc.stdout.readline().strip()
+
+
+def _verified(env):
+    r = subprocess.run([sys.executable, "-c", "from ttp import landmark; print(landmark.verified())"], env=env,
+                       capture_output=True, text=True, timeout=60)
+    return r.stdout.strip()
+
+
+def test_only_a_held_landing_mark_of_an_ancestor_makes_a_landing_waiter(env, tmp_path):
+    """landmark.verified: true only for a process under the mark's holder; no mark, a file nobody holds, a held
+    file outside the marks folder, another process's mark or a label naming the waiter's ancestor written
+    into a file nobody holds are all non-landing."""
+    import fcntl
+    from ttp import landmark, locks
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), PYTHONPATH=str(RUNTIME))
+    mine = landmark.hold()
+    assert mine is not None and mine.path.parent == landmark.marks_dir()
+    other, theirs = _mark_holder(run_env)
+    loose = landmark.marks_dir() / "forged.lock"
+    loose.write_text(json.dumps({"since": time.time(), **locks._owner(os.getpid())}))
+    outside = tmp_path / "outside.lock"
+    held_outside = open(outside, "a+")
+    fcntl.flock(held_outside, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    held_outside.write(json.dumps(locks._owner(os.getpid())))
+    held_outside.flush()
+    try:
+        assert _verified(dict(run_env, **{landmark.ENV: str(mine.path)})) == "True"
+        assert not landmark.verified({landmark.ENV: str(mine.path)}), "the holder itself is no waiter under it"
+        for forged in ("", str(loose), str(outside), theirs, str(landmark.marks_dir() / "missing.lock")):
+            assert _verified(dict(run_env, **{landmark.ENV: forged})) == "False", forged
+    finally:
+        other.stdin.close()
+        other.wait(timeout=60)
+        held_outside.close()
+        loose.unlink()
+        mine.close()
+    assert not mine.path.exists()
+    assert _verified(dict(run_env, **{landmark.ENV: str(mine.path)})) == "False", "let go: no landing"
+
+
+@pytest.mark.parametrize("real", [True, False], ids=["landing", "forged"])
+def test_a_landing_ttp_lock_from_another_project_takes_a_shared_lock_before_an_earlier_suite_waiter(env, tmp_path, real):
+    """Two projects share a lock. Project A's suite waits first, project B's waiter queues later: it gets the
+    lock first when it runs under a real landing mark of its parent (and its label says landing), and in
+    arrival order when its marker is forged (a mark another process holds)."""
+    from ttp import landmark
+    a, b = make(env, "proj-a"), _second_project(env, "proj-b")
+    for p in (a, b):
+        p.set_config("shared_resources", ["gate"])
+    marks, go, go_b = tmp_path / "marks", tmp_path / "go", tmp_path / "go-b"
+    env_a, env_b = _lock_env(env, a), _lock_env(env, b, PYTHONPATH=str(RUNTIME))
+    other = mark = None
+    if real:
+        mark = landmark.hold()
+        env_b[landmark.ENV] = str(mark.path)
+    else:
+        other, env_b[landmark.ENV] = _mark_holder(env_b)
+    holder = _lock(env_a, "gate", cmd=_mark(marks, "holder", go))
+    procs = [holder]
+    try:
+        _until_or_ended(lambda: marks.exists() and "start holder" in marks.read_text(), procs)
+        procs.append(_lock(env_a, "gate", cmd=_mark(marks, "suite")))
+        _until_or_ended(lambda: _queue_len(a, "gate") == 1, procs)
+        procs.append(_lock(env_b, "gate", cmd=_mark(marks, "late", go_b)))
+        _until_or_ended(lambda: _queue_len(a, "gate") == 2, procs)
+        go.touch()
+        first = "start late" if real else "start suite"
+        _until_or_ended(lambda: first in marks.read_text(), procs[1:])
+        if real:
+            row = json.loads(_lock_probe(env_a, "gate", extra=("--json",)).stdout)
+            assert [h.get("landing") for h in row["holders"]] == [True], row
+        go_b.touch()
+        assert _ended(procs) == [0, 0, 0]
+    finally:
+        go.touch()
+        go_b.touch()
+        for x in procs:
+            if x.poll() is None:
+                x.kill()
+        if other:
+            other.stdin.close()
+            other.wait(timeout=60)
+        if mark:
+            mark.close()
+    starts = [ln.split()[1] for ln in marks.read_text().splitlines() if ln.startswith("start ")]
+    assert starts == (["holder", "late", "suite"] if real else ["holder", "suite", "late"]), starts
+
+
+def test_only_a_landing_check_runs_under_a_landing_mark(env, tmp_path):
+    """push._run_one: a check in TTP_PUSH_MODE target (the push branch, the push queue, `ttp land`) runs under
+    a landing mark a `ttp lock` in it verifies; an own-branch check does not, nor does it pass on a mark it
+    was given; the mark is gone once the check ends."""
+    from ttp import landmark, push
+    out = tmp_path / "seen"
+    cmd = push.Check(f"{shlex.quote(sys.executable)} -c 'from ttp import landmark; print(landmark.verified())' "
+                     f">> {shlex.quote(str(out))}")
+    cmd.sandbox = False
+    inherited = landmark.hold()
+    base = dict(os.environ, TTP_HOME=str(env["home"]), PYTHONPATH=str(RUNTIME), **{landmark.ENV: str(inherited.path)})
+    try:
+        for mode in ("target", "own", "checks"):
+            assert push._run_one(cmd, tmp_path, dict(base, TTP_PUSH_MODE=mode), lambda m: None) == 0, mode
+    finally:
+        inherited.close()
+    assert out.read_text().split() == ["True", "False", "False"]
+    assert list(landmark.marks_dir().iterdir()) == []
