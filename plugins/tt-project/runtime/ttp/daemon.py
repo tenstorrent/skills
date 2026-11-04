@@ -115,6 +115,7 @@ from . import headline
 from . import pauseends
 from . import hold
 from . import initiator
+from . import shutrec
 from . import identity
 from . import idlecap
 from . import integrity
@@ -1135,6 +1136,9 @@ class Daemon:
             step = self._step_name if self._step_began is not None else ""
             log(self.p, f"daemon stop requested ({signal.Signals(signum).name}"
                         + (f", during tick step {step})" if step else ", between tick steps)"))
+            # On disk at once: a stop killed past its timeout never writes the clean-stop record,
+            # and the next boot still tells an ordered shutdown from a crash (shutrec.orderly_by).
+            shutrec.note_stop_signal(self.p.state, self.boot, signal.Signals(signum).name)
         self.stopping = True
 
     # lifecycle ------------------------------------------------------------------------------------
@@ -1149,6 +1153,7 @@ class Daemon:
         # reboot that finds none of this boot's was abrupt.
         self._last_stop = self.p.db.kv(CLEAN_STOP_KEY) or {}   # for schedules' gap causes (_schedule_gaps)
         self.p.db.x("DELETE FROM kv WHERE key=?", (CLEAN_STOP_KEY,))
+        shutrec.clear_stop_signal(self.p.state)
         self._note_down()
         # Kept here rather than in the environment, which runs and their tools would inherit.
         self._notify = os.environ.pop("NOTIFY_SOCKET", None)
@@ -1359,9 +1364,10 @@ class Daemon:
         """On a new boot, keep what the earlier boot's last heartbeat said (when, and the resources
         held then) before this daemon's first tick overwrites it; the boot event is written from it
         once the runs the reboot cut short are reaped. The earlier boot ended orderly when the daemon
-        recorded a clean stop on it (a shutdown stops the service first), abrupt otherwise (a crash,
-        a power cut, a hardware reset). Who or what started the shutdown is read here too, before any
-        transaction (initiator.find: bounded, best effort)."""
+        recorded a clean stop on it (a shutdown stops the service first), or after its last heartbeat
+        it got a stop signal or wtmp holds a shutdown record (shutrec.orderly_by: a stop killed past
+        its timeout); abrupt otherwise (a crash, a power cut, a hardware reset). Who or what started
+        the shutdown is read here too, before any transaction (initiator.find: bounded, best effort)."""
         try:
             db = self.p.db
             if self._this_boot((db.kv("boot_prev") or {}).get("boot")):
@@ -1371,11 +1377,15 @@ class Daemon:
             prev = hb.get("boot") or db.kv("reboot_told")
             if not prev or self._this_boot(prev):
                 return
-            clean = (db.kv(CLEAN_STOP_KEY) or {}).get("boot") == prev
             last = time.time() - hb["age"] if "age" in hb else None
-            db.set_kv("boot_prev", {"boot": self.boot, "prev_boot": prev, "held": hb.get("held") or [],
-                                    "last_heartbeat": last, "shutdown": "orderly" if clean else "abrupt",
-                                    "initiator": initiator.find(self.p, prev, self.boot_at, last)})
+            by = "clean stop" if (db.kv(CLEAN_STOP_KEY) or {}).get("boot") == prev else \
+                shutrec.orderly_by(self.p.state, prev, last, self.boot_at)
+            rec = {"boot": self.boot, "prev_boot": prev, "held": hb.get("held") or [],
+                   "last_heartbeat": last, "shutdown": "orderly" if by else "abrupt",
+                   "initiator": initiator.find(self.p, prev, self.boot_at, last)}
+            if by:
+                rec["orderly_by"] = by
+            db.set_kv("boot_prev", rec)
         except Exception:
             log(self.p, "boot record: " + traceback.format_exc().replace("\n", " | ")[:1000])
 

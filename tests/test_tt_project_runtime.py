@@ -486,6 +486,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setenv("TTP_TEST_NO_NOTIFIER", "1")   # setup, upgrade and status never restart or test the account's own notifier
     monkeypatch.setenv("TTP_TEST_NO_SSH_CHECK", "1")   # `ttp machines add` never asks this host's own ssh config
     monkeypatch.setenv("TTP_TEST_NO_JOURNAL", "1")   # a reboot record never reads this host's own journal (initiator.py)
+    monkeypatch.setenv("TTP_TEST_WTMP", str(tmp_path / "no-wtmp"))   # nor its own wtmp (shutrec.py)
     monkeypatch.setenv("TTP_TEST_CYCLE_NOTICES", str(tmp_path / "no-cycle-notice.json"))   # never the real /run notice (cyclenotice.py)
     from ttp import probespawn
     monkeypatch.setattr(probespawn, "_timeouts", {})   # a probe's timeouts in a row never carry over from another test

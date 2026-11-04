@@ -1230,3 +1230,79 @@ def test_a_boot_with_no_shutdown_marker_says_no_clean_shutdown_and_names_the_las
     # No unit lines at all: the wording alone. A limited read never claims an unclean boot.
     assert initiator.parse(_j(-2, "kernel line", ident="kernel"), full=True) == (None, initiator.NO_SHUTDOWN)
     assert initiator.parse(cut, full=False) == (None, None)
+
+
+def _wtmp(path, records):
+    """A wtmp fixture: (ut_type, ut_user, seconds) records in the Linux utmp layout."""
+    from ttp import shutrec
+    with open(path, "wb") as f:
+        for kind, user, sec in records:
+            f.write(shutrec._UTMP.pack(kind, 0, b"~", b"~~", user.encode(), b"6.8.0", 0, 0, 0, int(sec), 0,
+                                       0, 0, 0, 0, b""))
+    return path
+
+
+def test_wtmp_shutdown_reads_only_a_shutdown_record_in_the_window_and_never_raises(tmp_path):
+    from ttp import shutrec
+    now = time.time()
+    path = _wtmp(tmp_path / "wtmp", [(2, "reboot", now - 9000), (1, "shutdown", now - 5000),
+                                     (7, "user", now - 400), (2, "reboot", now - 100)])
+    assert shutrec.wtmp_shutdown(now - 6000, now, str(path)) == float(int(now - 5000))
+    assert shutrec.wtmp_shutdown(now - 4000, now, str(path)) is None   # only a login and a boot since
+    assert shutrec.wtmp_shutdown(now - 6000, now - 5500, str(path)) is None   # after this boot: not the one before it
+    with open(path, "ab") as f:
+        f.write(b"\0" * 100)   # a torn last record is skipped
+    assert shutrec.wtmp_shutdown(now - 6000, now, str(path)) == float(int(now - 5000))
+    (tmp_path / "dir").mkdir()
+    for bad in (tmp_path / "missing", tmp_path / "dir", _wtmp(tmp_path / "empty", [])):
+        assert shutrec.wtmp_shutdown(0, None, str(bad)) is None
+
+
+@pytest.mark.parametrize("cell", ["wtmp-shutdown", "orderly-stop", "no-record", "wtmp-unreadable",
+                                  "wtmp-stale", "stop-then-restart"])
+def test_a_reboot_after_a_shutdown_record_requeues_the_cut_short_run_that_held_a_device(env, tmp_path, monkeypatch, cell):
+    """A shutdown that outlived the daemon's stop timeout leaves no clean-stop record: wtmp's shutdown
+    record or the daemon's own stop-signal record still make the reboot orderly, so the run it cut
+    short is requeued. Neither (or an unreadable wtmp, a record from before the last heartbeat, a
+    restart on the same boot after the signal) keeps the abrupt path, which blocks a device holder."""
+    import signal
+    from ttp.daemon import CLEAN_STOP_KEY, Daemon
+    p = make(env)
+    tid = p.db.add_task("flash the board", "s", kind="work", tier="light", origin="user")
+    now = time.time()
+    last, booted = now - 600, now - 60
+    if cell == "orderly-stop" or cell == "stop-then-restart":
+        _boot_as(monkeypatch, "an-earlier-boot")
+        d0 = Daemon(p.base)
+        d0._on_stop_signal(signal.SIGTERM)   # then killed past its stop timeout: no clean-stop record
+        if cell == "stop-then-restart":
+            _run_once(Daemon(p.base), monkeypatch, crash=True)
+    if cell == "wtmp-shutdown":
+        monkeypatch.setenv("TTP_TEST_WTMP", str(_wtmp(tmp_path / "wtmp", [(2, "reboot", now - 90000),
+                                                                           (1, "shutdown", last + 5)])))
+    elif cell == "wtmp-stale":
+        monkeypatch.setenv("TTP_TEST_WTMP", str(_wtmp(tmp_path / "wtmp", [(1, "shutdown", now - 90000),
+                                                                           (2, "reboot", now - 89000)])))
+    elif cell == "wtmp-unreadable":
+        (tmp_path / "wtmp").mkdir()
+        monkeypatch.setenv("TTP_TEST_WTMP", str(tmp_path / "wtmp"))
+    hb = p.state / "heartbeat"
+    hb.write_text(json.dumps({"boot": "an-earlier-boot", "held": [f"board: task #{tid} (run 1) since 10:02 PDT"]}))
+    os.utime(hb, (last, last))
+    assert p.db.kv(CLEAN_STOP_KEY) is None
+    _boot_as(monkeypatch, "boot-b", booted)
+    d = Daemon(p.base)
+    rec = p.db.kv("boot_prev")
+    orderly = cell in ("wtmp-shutdown", "orderly-stop")
+    assert rec["prev_boot"] == "an-earlier-boot" and rec["shutdown"] == ("orderly" if orderly else "abrupt"), rec
+    assert rec.get("orderly_by") == {"wtmp-shutdown": "wtmp shutdown record",
+                                     "orderly-stop": "stop signal (SIGTERM)"}.get(cell), rec
+    run_dir = _lost_to_reboot(p, d, tmp_path, tid)
+    t = p.db.task(tid)
+    assert t["attempts"] == 0, dict(t)
+    if orderly:
+        assert t["status"] == "queued" and tid in [x["id"] for x in p.db.ready_tasks()], dict(t)
+        assert run_dir.is_dir()   # its folder and notes stay for the resume
+    else:
+        assert t["status"] == "blocked", dict(t)
+        assert t["blocked_reason"].startswith("the host rebooted abruptly while this task held board"), t
