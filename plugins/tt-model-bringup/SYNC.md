@@ -205,3 +205,27 @@ commit, and `--output-dir` on the vLLM runner (`run_vllm_server.py`) so a tracke
 not overwrite the gate's `readiness_vllm/` artifacts.
 
 Review fixes: the runner keeps its parser for argument errors, the resumed-prefill gate rejects non-finite statistics, `check_prefill_features.py` returns a checker error on malformed artifacts and requires both negative controls, and the burst stage records the prefix-cache state of each arm so a warm cache cannot pass as a batching gain.
+
+## Fast path (0.1.23)
+
+The eleven stages end with a served model that is correct and tuned with stock ops. On Blackhole
+that leaves most of the DRAM bandwidth unused at batch 1: the reference model, gpt-oss-20b, decoded
+one user at 18% of peak on four chips with stock ops. The `fast-path` skill and the seven goal
+templates in `prompts/model_bringup_fast_path/` are authored in this plugin and have no upstream
+source entry. They distill three rounds of work on that model on a QuietBox 2: the fused decode in
+tt-metal's `models/demos/gpt_oss/tt/fused_decode/` (merged in
+[tt-metal #60161](https://github.com/tenstorrent/tt-metal/pull/60161)), the one-chip, two-chip,
+multi-row, batched, prefill and speculative work in the pull requests the case study links, and the
+TT vLLM plugin's speculative-decoding contract (`docs/SPEC_DECODE_CONTRACT.md` in the plugin
+checkout).
+
+`scripts/check_fast_path.py` is authored in this plugin. Each goal's check script runs it on the
+goal's `doc/fast_path/<phase>.json`; goals 2 to 7 also rerun the context-contract check, and goal 5
+reruns the prefill-features check with `--require-burst`. Every check runs and the most severe exit
+wins. The thresholds are the ones the reference model shipped under: top-1 and top-5 within 0.5 and
+0.3 points at 512 or more teacher-forced positions, ladder rows at 97% of before or better, TTFT at
+most 103% of before plus 5 ms, and speculation at 1.10x or more with identical greedy output on 12 or
+more prompts. The calculators under `skills/fast-path/scripts/` need only the Python standard library
+(`expert_union.py` uses numpy for `.npy` input).
+
+The track is optional. The eleven stage goals, their checks and `sync-source.json` are unchanged.

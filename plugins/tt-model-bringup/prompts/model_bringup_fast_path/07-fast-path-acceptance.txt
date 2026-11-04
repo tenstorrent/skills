@@ -1,0 +1,17 @@
+/goal Use $fast-path, $benchmark-model, $qualitative-check, and $tt-device-usage for the HF_MODEL served model in the current tt-metal checkout.
+
+As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
+
+Accept the merged fast path against the previous release before the benchmark stage or packaging. Do not add optimizations here.
+
+Goal completion requirements:
+- One integration commit holds every kept goal. Every fast path has a switch and a default, and the condition table in doc/fast_path/README.md says which path serves each request shape and what it falls back to.
+- The previous release is the optimized-vLLM build or the last published build. Measure it and the integration commit on the same day with the same harness and server settings.
+- Served ladder on every profile (each mesh, plain and opt-in) at the benchmark input lengths and concurrency 1, 8 and 32: decode tokens per second per user and output tokens per second at least 97% of before, TTFT at most 103% of before plus 5 ms.
+- Full GSM8K and IFEval on the main profile, paired with the baseline on identical prompts the same day, within 1.0 and 1.5 points, with a McNemar test for paired differences. GSM8K-250 and IFEval-100 at concurrency 1 on each fast-path profile within 5 points of the full-set baseline.
+- Smoke on every profile: chat, the context limits of doc/context_contract.json (the longest prompt is accepted, one token over is rejected cleanly), and tool calling and reasoning separation when the model declares them. Qualitative outputs are judged per $qualitative-check.
+- The bandwidth table gives, per mesh and width, step time, GB per token, GB/s per chip and % of peak, before and after.
+- Write doc/fast_path/acceptance.json in the schema of the $fast-path validation reference. README.md leads with the ladder and the bandwidth table and records each profile's switches, environment and KV capacity for the packaging owner. Run `python ${TT_MODEL_BRINGUP_ROOT}/scripts/check_fast_path.py --model-dir <model dir> --phase acceptance` until it exits 0.
+- $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
+
+Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.

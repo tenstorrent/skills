@@ -1,0 +1,7 @@
+interface:
+  display_name: "Fast Path"
+  short_description: "Make a served TTNN model as fast as Blackhole allows"
+  default_prompt: "Use $fast-path to measure the decode roofline of this served TTNN model, then build and gate a fused batch-1 decode, the other QuietBox 2 meshes, multi-user decode, faster prefill with an opt-in deterministic mode, and opt-in speculative decoding, each with exactness, accuracy and release evidence."
+
+policy:
+  allow_implicit_invocation: true
