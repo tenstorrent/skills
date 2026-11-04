@@ -88,6 +88,7 @@ class Gate:
     allow_optional: bool = True # recurring improvement work, exploration, nice-to-haves
     allow_new_work: bool = True # anything but replies to a user's direct message
     numbers: dict[str, Any] = field(default_factory=dict)
+    cause: str = ""             # the reason that set the current level (slot_words)
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -117,8 +118,44 @@ def red_share(g: Gate, cls: str) -> float | None:
 
 def _raise(g: Gate, level: str, reason: str) -> None:
     if LEVELS.index(level) > LEVELS.index(g.level):
-        g.level = level
+        g.level, g.cause = level, reason
     g.reasons.append(reason)
+
+
+def gate_slots(gate: Gate | dict | None, configured: int) -> str:
+    """The budget gate's cut of a provider's worker slots in words, '' when it allows all
+    `configured` (budget.max_parallel_workers): 'the budget gate allows 6 at yellow: 63% of cap used'."""
+    g = gate.as_dict() if isinstance(gate, Gate) else gate or {}
+    allowed = g.get("max_parallel")
+    if allowed is None or int(allowed) >= configured and g.get("allow_new_work", True):
+        return ""
+    allowed = int(allowed) if g.get("allow_new_work", True) else 0
+    why = g.get("cause") or next(iter(g.get("reasons") or []), "")
+    return (f"the budget gate allows {allowed or 'none'} at {g.get('level') or 'green'}"
+            + (f": {why[:160]}" if why else ""))
+
+
+def slot_lines(gates: dict | None, configured: int, running: dict | None = None) -> list[str]:
+    """One line per provider whose budget gate allows fewer worker slots than `configured`, for
+    `ttp status` and `ttp overview`: 'claude worker slots: 7 running; 12 configured; the budget gate
+    allows 6 at yellow: 63% of cap used'. `running` maps a provider to its running workers."""
+    out = []
+    for prov, g in sorted((gates or {}).items()):
+        if isinstance(g, (dict, Gate)) and (cut := gate_slots(g, configured)):
+            n = (running or {}).get(prov)
+            out.append(f"{prov} worker slots: " + (f"{n} running; " if n is not None else "")
+                       + f"{configured} configured; {cut}")
+    return out
+
+
+def slot_words(gate: Gate | dict | None, configured: int, extra: int = 0, reserve: int = 0) -> str:
+    """Why a task's worker slots differ from budget.max_parallel_workers, '' when they do not:
+    '12 configured; the budget gate allows 6 at yellow: 63% of cap used; +1 urgent'. `extra` is the
+    urgent extra slots it may take, `reserve` the slots routine work leaves for urgent work."""
+    cut = gate_slots(gate, configured)
+    parts = ([cut] if cut else []) + ([f"+{extra} urgent"] if extra else []) + \
+        ([f"{reserve} held back for urgent work"] if reserve else [])
+    return f"{configured} configured; " + "; ".join(parts) if parts else ""
 
 
 def in_flight(db: DB, provider: str | None = None, exclude: set[str] | None = None,

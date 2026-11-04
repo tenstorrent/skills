@@ -150,6 +150,101 @@ def test_slot_wait_fires_once_per_urgent_task_only_while_every_slot_is_taken(env
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
 
 
+def _gate_cut_wait(env, monkeypatch, tmp_path, level, allowed, cause, extra):
+    """Two routine runs hold slots under a green gate with 4 configured; then the budget gate drops to
+    `level` allowing `allowed` (cause `cause`) and a priority-1 task waits ten minutes with
+    budget.urgent_extra_slots = `extra`. Returns (p, d, drain, the slot-wait event's text)."""
+    import dataclasses
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=4)
+    d.cfg["budget"]["urgent_extra_slots"] = extra
+    core = d.cfg.get("core_provider", "claude")
+    for i in range(2):
+        p.db.add_task(f"routine work {i}", "s", kind="work", tier="light", origin="user", priority=3)
+    d.dispatch()
+    assert len(_slot_tasks(p)) == 2
+    d.gates[core] = dataclasses.replace(d.gates[core], level=level, regime="caps", max_parallel=allowed,
+                                        cause=cause, reasons=["billed by use since 01:00 PST", cause])
+    hot = p.db.add_task("urgent fix", "s", kind="work", tier="light", origin="user", priority=1)
+    d.dispatch()
+    assert len(_slot_tasks(p)) == 2 and hot not in _slot_tasks(p), "the gate's cut let the urgent task start"
+    start = time.time()
+    d._slot_wait_checked = start + 9 * 60
+    monkeypatch.setattr(time, "time", lambda: start + 10 * 60)
+    d.check_slot_wait()
+    monkeypatch.undo()
+    (ev,) = _slot_wait_events(p)
+    assert ev["task"] == hot
+    return p, d, drain, ev["text"]
+
+
+def test_slot_wait_names_the_budget_gates_halving_at_yellow_under_the_caps(env, monkeypatch, tmp_path,
+                                                                           reap_tmp_processes):
+    """Yellow under the dollar caps halves budget.max_parallel_workers (budget.evaluate): the slot wait
+    names that cut and its cause, not only 'all 2 are taken', and `ttp status` and `ttp overview`
+    show the same slots line from the saved gates."""
+    from ttp import overview
+    from ttp.cli import status_text
+    p, d, drain, text = _gate_cut_wait(env, monkeypatch, tmp_path, "yellow", 2, "63% of cap used", 0)
+    try:
+        assert "all 2 are taken (4 configured; the budget gate allows 2 at yellow: 63% of cap used)." in text
+        core = d.cfg.get("core_provider", "claude")
+        p.db.set_kv("gates", {core: d.gates[core].as_dict()})
+        want = (f"{core} worker slots: 2 running; 4 configured; the budget gate allows 2 at yellow: "
+                "63% of cap used")
+        assert want in status_text(p).splitlines()
+        with sqlite3.connect(p.state / "project.db") as conn:
+            assert overview._gate_slots(conn, 4) == [want]
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_slot_wait_names_the_budget_gates_one_slot_at_orange_and_the_urgent_extra(env, monkeypatch, tmp_path,
+                                                                                  reap_tmp_processes):
+    p, d, drain, text = _gate_cut_wait(env, monkeypatch, tmp_path, "orange", 1, "90% of cap used", 1)
+    try:
+        assert ("all 2 are taken (4 configured; the budget gate allows 1 at orange: 90% of cap used; "
+                "+1 urgent).") in text
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_slot_wait_words_name_the_slot_held_back_for_urgent_work(env, monkeypatch, tmp_path):
+    """An obligation owner that is not urgent leaves budget.urgent_reserve_slots to a ready urgent task:
+    its slot count names that reserve; with no cut and no reserve nothing is added."""
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
+    core = d.cfg.get("core_provider", "claude")
+    owner = p.db.task(p.db.add_task("owes a deliverable", "s", kind="work", tier="light", origin="user",
+                                        priority=2))
+    _owe(p, owner["id"], time.time() + 3600)
+    ctx = {"now": time.time(), "paused": {}, "committed": None, "busy": {core: 1}, "logged_out": {}}
+    assert d._start_hold(owner, core, ctx) is None, "a free slot with no urgent task due"
+    p.db.add_task("urgent fix", "s", kind="work", tier="light", origin="user", priority=1)
+    ctx = {"now": time.time(), "paused": {}, "committed": None, "busy": {core: 1}, "logged_out": {}}
+    assert d._start_hold(owner, core, ctx) == "gate"
+    assert ctx["full"][owner["id"]] == 1
+    assert ctx["full_why"][owner["id"]] == "2 configured; 1 held back for urgent work"
+    assert d._hold_words(owner, "gate", ctx) == f"every {core} slot taken (1; 2 configured; 1 held back for urgent work)"
+
+
+def test_budget_slot_words_name_the_gate_cut_only_when_it_lowers_the_configured_slots():
+    from ttp import budget as bud
+    g = bud.Gate(provider="claude", max_parallel=6)
+    assert bud.gate_slots(g, 6) == "" and bud.slot_words(g, 6) == "" and bud.slot_lines({"claude": g}, 6) == []
+    bud._raise(g, "yellow", "5h window at 80%, 10.0 points under the 90% line: room for 3 workers")
+    bud._raise(g, "yellow", "a later yellow reason")
+    g.max_parallel = 3
+    assert bud.slot_words(g, 6, extra=1) == ("6 configured; the budget gate allows 3 at yellow: 5h window at 80%, "
+                                             "10.0 points under the 90% line: room for 3 workers; +1 urgent")
+    bud._raise(g, "red", "cap reached: $2000.00/today of $2000")
+    g.allow_new_work = False
+    assert bud.gate_slots(g.as_dict(), 6) == "the budget gate allows none at red: cap reached: $2000.00/today of $2000"
+    old = {k: v for k, v in g.as_dict().items() if k != "cause"}   # saved by a version without `cause`
+    assert bud.gate_slots(old, 6).startswith("the budget gate allows none at red: 5h window at 80%")
+    assert bud.slot_lines({"claude": old}, 6, {"claude": 4})[0].startswith("claude worker slots: 4 running; 6 configured; ")
+
+
 def test_slot_wait_is_off_at_zero(env, monkeypatch, tmp_path, reap_tmp_processes):
     p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
     try:

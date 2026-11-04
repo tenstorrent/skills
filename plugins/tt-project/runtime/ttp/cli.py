@@ -1563,6 +1563,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     if lease_line := lease.status_line(p, p.config(), now):
         lines.append(lease_line)
     lines.append("budget: " + h["spend"]["headline"])
+    lines += h["spend"].get("slot_lines") or []
     c = h["coordinator"]
     from . import budget, coordmodel
     # One line: the route it runs with, when it last turned, and how that differs from the configured

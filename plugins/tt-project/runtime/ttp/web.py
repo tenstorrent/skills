@@ -485,6 +485,10 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     spend["bases_line"] = audit.bases_text(spend["bases_7d"]) if spend["bases_7d"] else ""
     spend["headline"] = budget_line(db, now, core, g, spend["spent_24h"], gates)
     spend["route_line"] = route.phrase(db, now)   # routing stats: the Budget tab and ttp status --verbose
+    # A provider whose budget gate allows fewer worker slots than budget.max_parallel_workers: ttp status
+    spend["slot_lines"] = bud.slot_lines(gates, int(cfg["budget"].get("max_parallel_workers", 6) or 0), {
+        r["provider"]: r["n"] for r in db.q("SELECT provider, COUNT(*) n FROM runs WHERE status='running' "
+                                             "AND role!='coordinator' GROUP BY provider")})
     spend["detail"] = gate_detail(g, now, tz, gates) if g else ""
     # The project caps once, with the 7 days' plan-paid spend beside the billed figure (budget.caps_line).
     spend["caps_line"] = bud.caps_line(db, gates or {}, p.config()["budget"], now)

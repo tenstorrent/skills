@@ -63,6 +63,20 @@ def _gate_global(conn: sqlite3.Connection) -> tuple[float, dict]:
     return (float(r[1] or 0) if r else 0.0), out
 
 
+def _gate_slots(conn: sqlite3.Connection, configured: int) -> list[str]:
+    """budget.slot_lines from the daemon's last gates: each provider whose budget gate allows fewer
+    worker slots than budget.max_parallel_workers, with its running workers."""
+    from . import budget as bud
+    try:
+        r = conn.execute("SELECT value FROM kv WHERE key='gates'").fetchone()
+        gates = json.loads(r[0]) if r else {}
+        running = dict(conn.execute("SELECT provider, COUNT(*) FROM runs WHERE status='running' "
+                                    "AND role!='coordinator' GROUP BY provider").fetchall())
+    except (sqlite3.Error, ValueError):   # an older schema or a torn value: no slot line
+        return []
+    return bud.slot_lines(gates if isinstance(gates, dict) else {}, configured, running)
+
+
 class _ReadOnly:
     """What waits.blocked reads of a project (q, paused_resources) over a read-only connection, so
     the overview counts 'waiting on you' as `ttp status` and the web app do. Shared pauses are the
@@ -137,6 +151,7 @@ def project_status(name: str, entry: dict, now: float, here: str, lib_v: str, wi
                    daily_cap=float(b.get("daily_usd") or 0))
         row["global_rows"] = gcap._rows(conn, *window)
         row["gate_ts"], row["gate_global"] = _gate_global(conn)
+        row["slots"] = _gate_slots(conn, int(b.get("max_parallel_workers", 6) or 0))
         row["ok"] = True
     except sqlite3.Error as e:
         row["note"] = f"database unreadable: {e}"
@@ -197,7 +212,8 @@ def line(r: dict) -> str:
         v += " (running version unverified)"
     return (f"{r['name']}\tdaemon {r['daemon']} · v{v}"
             f" · waiting on you: {r['waiting_on_user']} ({r['wait_asks']} ask{'s' if r['wait_asks'] != 1 else ''},"
-            f" {r['wait_tasks']} task{'s' if r['wait_tasks'] != 1 else ''}) · {r['running']} running · {spend(r)}")
+            f" {r['wait_tasks']} task{'s' if r['wait_tasks'] != 1 else ''}) · {r['running']} running · {spend(r)}"
+            + "".join(f" · {x}" for x in r.get("slots") or []))
 
 
 def footer(g: dict) -> str:

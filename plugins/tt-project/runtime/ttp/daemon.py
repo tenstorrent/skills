@@ -6937,7 +6937,8 @@ class Daemon:
                      else f"run {h['run']} (no task)" for h in holders]
             text = (f"Slot wait: #{tid} {t['title'][:80]} ({why}) is ready but has waited "
                     f"{(now - self._slot_waits[tid]) / 60:.0f} min for a {provider} worker slot: all "
-                    f"{ctx['full'][tid]} are taken. It starts first when one frees. To start it sooner, end or "
+                    f"{ctx['full'][tid]} are taken" + (f" ({w})" if (w := ctx.get("full_why", {}).get(tid)) else "")
+                    + ". It starts first when one frees. To start it sooner, end or "
                     f"pause lower-priority work holding a slot:\n" + "\n".join(f"- {x}" for x in lines[:STALL_LIST_MAX]))
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
                  (now, "daemon", "observation", fp, "high" if owns else "normal", text[:4000], "queued", tid))
@@ -7112,6 +7113,13 @@ class Daemon:
             who = ", ".join(f"#{x}" for x in h.get("tasks") or []) or ", ".join(
                 str(x.get("holder")) for x in h.get("holders") or [] if x.get("holder"))
             return f"{h.get('kind')} on resource {h.get('resource')}" + (f" ({who})" if who else "")
+        if why == "gate" and (g := ctx.get("gate")) is not None:   # the gate _start_hold just read for it
+            if tid in ctx.get("full", {}):
+                w = ctx.get("full_why", {}).get(tid)
+                return f"every {ctx.get('slot', {}).get(tid) or 'worker'} slot taken ({ctx['full'][tid]}" \
+                    + (f"; {w}" if w else "") + ")"
+            if not g.allow_new_work and (why_g := g.cause or next(iter(g.reasons), "")):
+                return f"the spend gate (no new work at {g.level}: {why_g[:160]})"
         return {"held": "a disk guard or its review's pre-checks", "paused": "a paused resource",
                 "logged_out": f"the {task['provider'] or 'core'} provider's login (auth gate)",
                 "net": "its provider's API host not resolving", "gate": "the spend gate (no new work)",
@@ -8339,8 +8347,9 @@ class Daemon:
         (device task slots), 'budget' (task budget spent), 'caps' (dollar caps) or 'resource' (busy,
         including `ttp lock` and device-lock aliases). With 'paused' or 'resource' it records what holds
         the task in ctx["holds"][task id] (_resource_hold's data): the one record check_stall reads. With
-        'gate' because every worker slot is taken it records ctx["full"][task id] = max_parallel
-        (check_slot_wait reads it). The one copy of dispatch's checks, in its order,
+        'gate' because every worker slot is taken it records ctx["full"][task id] = its slots and
+        ctx["full_why"][task id] = how they differ from budget.max_parallel_workers (budget.slot_words:
+        the budget gate's cut, urgent extra, urgent reserve; '' when they do not; check_slot_wait reads both). The one copy of dispatch's checks, in its order,
         so check_stall counts exactly what dispatch would start. Nothing changes but with `reserve`
         (_resource_hold) and ctx's caches: ctx holds now, paused, logged_out (provider -> bool), busy
         (provider -> running), committed (dollars running work may still spend under the caps; None:
@@ -8350,6 +8359,7 @@ class Daemon:
         now = ctx["now"]
         ctx.setdefault("holds", {}).pop(task["id"], None)
         ctx.setdefault("full", {}).pop(task["id"], None)
+        ctx.setdefault("full_why", {}).pop(task["id"], None)
         ctx.setdefault("branch", {}).pop(task["id"], None)
         if "live" not in ctx:
             ctx["live"] = self._live_claims()
@@ -8372,16 +8382,20 @@ class Daemon:
         gate = ctx["gate"] = self.gates.get(provider) or \
             bud.evaluate(self.p.db, self.cfg, provider, bud.plan_windows(self.p.db))
         # An urgent task may take budget.urgent_extra_slots beyond them, unless the gate allows no slot.
-        slots = gate.max_parallel + (urgent.extra_slots(self.cfg) if gate.max_parallel > 0
-                                     and urgent.is_urgent(task) else 0)
+        extra = urgent.extra_slots(self.cfg) if gate.max_parallel > 0 and urgent.is_urgent(task) else 0
+        slots, kept = gate.max_parallel + extra, 0
         if not urgent.is_urgent(task):   # routine work leaves a slot for urgent work ready or due soon
             if "reserve" not in ctx:   # read once per ctx; reserve_slots drops those started since
                 ctx["reserve"] = urgent.reserve_due(self.p.db, now)
-            slots -= urgent.reserve_slots(self.cfg, self.p.db, now, gate.max_parallel, provider=provider,
-                                          held=lambda t: self._precheck_holds(t, now), due=ctx["reserve"])
+            kept = urgent.reserve_slots(self.cfg, self.p.db, now, gate.max_parallel, provider=provider,
+                                        held=lambda t: self._precheck_holds(t, now), due=ctx["reserve"])
+            slots -= kept
         if not gate.allow_new_work or ctx["busy"].get(provider, 0) >= slots:
             if gate.allow_new_work:   # held only because every worker slot is taken (check_slot_wait)
                 ctx.setdefault("full", {})[task["id"]] = slots
+                # what set that number, so the slot wait names a budget gate cut (budget.slot_words)
+                ctx.setdefault("full_why", {})[task["id"]] = bud.slot_words(
+                    gate, int(self.cfg["budget"].get("max_parallel_workers", 6)), extra, kept)
             return "gate"
         if ctx.get("route_wait", {}).get(task["id"]) == provider:   # the host's routed slots are full
             return "gate"
