@@ -448,6 +448,50 @@ def test_a_run_that_does_not_pass_on_a_spill_host_runs_again_here(env, tmp_path,
         assert not any(k.startswith("env:check-host:") for k in envfault.open_faults(p))
 
 
+def test_a_spilled_run_copies_the_commit_it_checks_even_when_the_worktree_moved_while_it_waited(
+        env, tmp_path, monkeypatch):
+    """A run that spills after its wait here copies the commit it started on (the one its pass names),
+    never the worktree's HEAD at spill time: a commit made while it waited is not what it checked."""
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    log = tmp_path / "where.log"
+    cmd = f"cat a.txt >> {log}"
+    p.set_config("delivery.push_checks", [cmd])
+    real_pick = checkspill.pick
+
+    def moved_then_pick(*args, **kw):
+        (repo / "a.txt").write_text("moved\n")
+        subprocess.run([*git, "commit", "-qam", "moved"], check=True)
+        return real_pick(*args, **kw)
+
+    monkeypatch.setattr(checkspill, "pick", moved_then_pick)
+    lane = _spill_lane(p, repo)
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        lane.close()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["spilled_to"] == "check-host-a" and rec["head"] == head, rec
+    assert log.read_text() == "a\n", "the spill host ran the commit the run checks, not the moved HEAD"
+
+
+def test_a_remote_check_given_a_commit_it_cannot_resolve_copies_nothing(env, tmp_path, monkeypatch, capsys):
+    """--commit naming no commit of the checkout (unknown, malformed, a tree, an option): it fails
+    closed with 2 before any ssh, never falling back to the worktree's HEAD."""
+    from ttp import remotecheck
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    tree = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"], capture_output=True,
+                          text=True).stdout.strip()
+    monkeypatch.chdir(repo)
+    for bad in ("0" * 40, "no such ref", tree, "--all"):
+        assert remotecheck.main(["--host", "check-host-a", "--commit", bad, "--", "true"]) == 2, bad
+        said = capsys.readouterr()
+        assert "nothing to copy" in said.out + said.err and "usage" not in said.out + said.err, said
+    assert _rc_left(tmp_path) == []
+
+
 def _spill_lock_paths(p, alias):
     from ttp import locks, shared
     cfg = p.config()
