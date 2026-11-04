@@ -13816,7 +13816,7 @@ def _rerun_stub(monkeypatch, tip, plan, fail_out=None):
     from ttp import batch
     calls = []
 
-    def fake(cmd, cwd, env=None, timeout=None, group=False, pass_fds=(), collect=None):
+    def fake(cmd, cwd, env=None, timeout=None, group=False, pass_fds=(), collect=None, urgent_mark=False):
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(cwd), capture_output=True, text=True).stdout.strip()
         where, selected = "tip" if head == tip else "head", (env or {}).get("TTP_PYTEST_SELECT")
         calls.append((where, selected))
