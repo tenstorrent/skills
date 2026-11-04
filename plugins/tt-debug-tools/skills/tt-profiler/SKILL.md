@@ -16,6 +16,12 @@ metadata:
     - repo: tenstorrent/tt-metal
       ref: 058b93d450f21b9b86a6ddf58f6f8f2c7744f8f1
       path: tt_metal/llrt/rtoptions.cpp
+    - repo: tenstorrent/tt-metal
+      ref: 8b53dfa87b68638895c1f48ad5eef24f62d54808
+      path: tools/tracy/perf_counter_multipass.py
+    - repo: tenstorrent/tt-metal
+      ref: 8b53dfa87b68638895c1f48ad5eef24f62d54808
+      path: tools/tracy/process_ops_logs.py
 ---
 
 # tt-profiler
@@ -57,7 +63,14 @@ For the workflow question "which op dominates?" the answer is the ranked
 `tt-perf-report` on the ops-perf-results CSV that Tracy writes with
 `-p -r -v -m pytest`, one folder per run under
 `generated/profiler/reports/<timestamp>/`. Recipe, pandas fallback and the
-per-RISC bottleneck tags: `references/op-report.md`.
+per-RISC bottleneck tags: `references/op-report.md`. For measured FPU, SFPU and
+Math utilisation per op (not the estimated `PM FPU UTIL (%)`):
+`references/perf-counters.md`. NoC, DRAM and Ethernet bandwidth columns, which
+need tt-npe: `references/noc-bandwidth.md`.
+
+Profile a warm forward, not model load: `references/warm-window.md`. Long runs,
+traced replay and many-chip meshes, where the buffer overflows:
+`references/long-runs.md`.
 
 In-kernel, after `#include <tools/profiler/kernel_profiler.hpp>`:
 
@@ -110,6 +123,8 @@ data collected".
 **Results are read at device close.** Nothing lands until `CloseDevice`, and past
 roughly 1000 kernel runs the buffer needs draining sooner —
 `detail::ReadDeviceProfilerResults(device)` after the program of interest.
+A run that logs `markers were dropped` produced a partial report: the missing
+ops read as zero. Discard it and re-capture (`references/long-runs.md`).
 
 **`DeviceZoneScopedN` costs time.** Timings from heavily annotated code include
 the annotation overhead. Instrument selectively, and do not compare an annotated
@@ -122,3 +137,15 @@ rather than assuming positions.
 
 **Volume.** `test_full_buffer` alone produces over 1.6 million rows. Filter by
 zone name and core before reading, and never open it whole in an agent context.
+
+## When the numbers look wrong
+
+| Symptom | Likely cause |
+|---|---|
+| All device durations are 0 | Watcher or DPRINT set in the same run (first trap above) |
+| Only a handful of ops in the report | Buffer overflow; see `references/long-runs.md` |
+| Permutes or weight tilizes lead the ranking | The capture includes model load; profile warm (`references/warm-window.md`) |
+| `NOC` / `DRAM` / `ETH BW UTIL` blank | tt-npe did not run; blank is not zero (`references/noc-bandwidth.md`) |
+| `PM FPU UTIL` ≈ 0 on a heavy op | The op has no perf model; capture counters (`references/perf-counters.md`) |
+| Huge `OP TO OP LATENCY`, device log tens of GB | Per-op `ReadDeviceProfiler` flushes on a mesh; drop them, raise `--op-support-count` |
+| Numbers vary a lot between runs | Program-cache miss in the measured iteration, or other work on the device |

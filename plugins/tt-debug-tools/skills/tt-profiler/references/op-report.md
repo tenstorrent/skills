@@ -43,6 +43,10 @@ are inflated. The test has to iterate at least twice; analyse only the
 second iteration. This is not a `tt-perf-report` flag — it is how the test
 must be written.
 
+Device columns are not immune: a whole-process capture also counts one-time
+weight preparation, which can top the ranking. Rank a warm window only:
+`warm-window.md`.
+
 ## Analyse
 
 ```bash
@@ -84,6 +88,10 @@ peers names the bound.
 | `NOC-stall` | BRISC and NCRISC both high, TRISC low. Data movement saturates the NoC. |
 | `under-parallelized` | Low `CORE COUNT` versus device grid, high per-core duration. Reach for sharding or a wider dispatch grid. |
 | `host-dominated` | `FW` short but `HOST DURATION [ns]` large past the first iteration. Points to Python or dispatch overhead, not the kernel. |
+
+`PM FPU UTIL (%)` cannot settle compute-bound versus bandwidth-bound: it is a
+perf-model estimate, ~0 on ops with no model and high on some data-movement
+ops. Measured per-engine counters: `perf-counters.md`.
 
 ## Matmul: op-level DRAM% × FLOPs%
 
