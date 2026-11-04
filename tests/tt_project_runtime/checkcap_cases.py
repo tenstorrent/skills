@@ -2856,7 +2856,18 @@ def test_checks_status_reads_the_lanes_and_never_queues_or_writes(env, tmp_path,
     key = testslots.repo_key(repo)
     holder = _lane_holder(tmp_path, p.name, key)
     monkeypatch.setenv("TTP_TASK", "13")
-    waiter = threading.Thread(target=lambda: testslots.suite_hold(p.name, repo=key, priority=3, wait_s=3))
+    # Snapshot only once the waiter is settled: waiting(True) comes after its ticket's owner record and
+    # lane name are written (which a snapshot taken as soon as the ticket shows would catch landing).
+    # No wait_s: a waiter timing out under load would dequeue between the snapshots; done stops it.
+    settled, done = threading.Event(), threading.Event()
+
+    def wait():
+        try:
+            testslots.suite_hold(p.name, repo=key, priority=3, waiting=lambda on: on and settled.set(),
+                                 stop=lambda: "test over" if done.is_set() else "")
+        except checkcap.Cancelled:
+            pass
+    waiter = threading.Thread(target=wait)
     waiter.start()
 
     def snap():
@@ -2864,8 +2875,9 @@ def test_checks_status_reads_the_lanes_and_never_queues_or_writes(env, tmp_path,
         return {str(x): (x.stat().st_mtime_ns, x.stat().st_size, x.read_bytes() if x.is_file() else b"")
                 for x in sorted(d.rglob("*")) if not x.name.startswith(".")}
     try:
-        assert _wait_for(lambda: any(".queue/" in k and not k.rsplit("/", 1)[1].startswith(".") for k in snap()))
+        assert settled.wait(30), "the waiter never queued"
         before = snap()
+        assert any(".queue/" in k and not k.rsplit("/", 1)[1].startswith(".") for k in before), before
         assert _ttp("checks", "status") == 0
         out = capsys.readouterr().out
         assert f"pid {holder.pid} for full checks, alive" in out and "#12" in out and "(this one)" in out, out
@@ -2881,8 +2893,10 @@ def test_checks_status_reads_the_lanes_and_never_queues_or_writes(env, tmp_path,
         assert snap() == before, "status queued, took or wrote a lane or queue file"
         assert not (run / "checks.log").exists(), "status started no check"
     finally:
-        _stop(holder)
+        done.set()
         waiter.join(10)
+        _stop(holder)
+        assert not waiter.is_alive()
 
 
 _WRAP_A, _WRAP_B = "aaaaaaaaaaaa", "bbbbbbbbbbbb"   # two wrapper locks (checklane.wrap_key)
