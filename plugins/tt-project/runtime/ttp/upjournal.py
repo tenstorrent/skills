@@ -114,12 +114,17 @@ def _touched(h: Path, base: str, merged: str) -> list[str]:
     return [f for f in r.stdout.splitlines() if f] if r.returncode == 0 else []
 
 
+def _differs(h: Path, files: list[str]) -> set[str]:
+    """Those of `files` that differ from HEAD in the working tree or index, or that HEAD lacks."""
+    if not files:
+        return set()
+    changed = set(_git(h, "diff", "--name-only", "--no-renames", "HEAD", "--", *files).stdout.split())
+    return changed | set(_git(h, "ls-files", "--others", "--exclude-standard", "--", *files).stdout.split())
+
+
 def _put_back(h: Path, files: list[str]) -> list[str]:
     """Put each file back to HEAD's version (deleting one HEAD lacks); the ones that differed."""
-    if not files:
-        return []
-    changed = set(_git(h, "diff", "--name-only", "--no-renames", "HEAD", "--", *files).stdout.split())
-    changed |= set(_git(h, "ls-files", "--others", "--exclude-standard", "--", *files).stdout.split())
+    changed = _differs(h, files)
     out = []
     for f in sorted(changed):
         if _git(h, "cat-file", "-e", f"HEAD:{f}").returncode == 0:

@@ -188,12 +188,19 @@ def land(p: Project, tid: int) -> str:
             last = (p.db.kv(CONFLICT_KEY, {}) or {}).get(str(tid))
             if last == pair + ["conflict"]:
                 return "conflict-known"     # the same two commits conflict again: no merge until one moves
+            from .upjournal import _differs, _put_back, _touched
+            touched = _touched(p.harness, before, b)
+            clean = [f for f in touched if f not in _differs(p.harness, touched)]
             r = _git(p.harness, "merge", "--no-edit", "-m", f"{MERGE_MSG} #{tid} ({b})", b, timeout=120)
             conflicted = False
             if r.returncode != 0:
                 conflicted = bool(_git(p.harness, "diff", "--name-only", "--diff-filter=U").stdout.strip())
-                if conflicted:
+                if conflicted or landing_merge(p.harness):
                     _git(p.harness, "merge", "--abort")
+                if _git(p.harness, "rev-parse", "HEAD").stdout.strip() == before:
+                    # git refused only after writing them (the template guard on main refuses a branch that
+                    # holds a template merge): left there, they fail `ttp upgrade --apply`'s fast-forward
+                    _put_back(p.harness, clean)
         if r.returncode != 0:
             said = (r.stdout + r.stderr).strip()
             # a refusal over files another live run is editing passes when it commits; else it needs a hand

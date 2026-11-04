@@ -371,3 +371,75 @@ def test_a_daemon_taking_neither_request_still_gets_the_merge_task_of_an_unfence
         refence()
         assert cli._harness_worker_fenced(p)
     assert not restarts
+
+
+def _landed_template_branch(env, monkeypatch, tmp_path):
+    """A conflicting upgrade whose release also changes a runtime file. The merge task merged upstream on
+    its own harness worktree branch, as a worker may, and the daemon then tried to land that branch: the
+    template guard on main refused it after git had written its files. The merge task's checked commit
+    (merged) takes in one more runtime change to that file, as when a newer release retargets it.
+    The coordinator then edited CHARTER and MEMORY without committing. (p, merged, base, restarts)."""
+    from ttp import harnesstree
+    lib = env["home"] / "lib" / "current" / "runtime" / "ttp" / "restriction_audit.py"
+    real = _install_template
+
+    def install(env, edit=None):
+        real(env, edit)
+        lib.write_text(lib.read_text() + "# a newer release\n")
+    monkeypatch.setitem(globals(), "_install_template", install)
+    p, merged, base, restarts = _apply_ready(env, monkeypatch, tmp_path)
+    h, tid = p.harness, int(os.environ["TTP_TASK"])
+    own = harnesstree.path(p, tid)
+    _hgit(h, "worktree", "add", "-q", "-b", harnesstree.branch(tid), str(own), "main")
+    subprocess.run(["git", "-C", str(own), "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-X", "theirs",
+                    "upstream"], capture_output=True)
+    _hgit(own, "add", "-A")
+    subprocess.run(["git", "-C", str(own), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "m"],
+                   capture_output=True)
+    assert "runtime/ttp/restriction_audit.py" in _git_out(h, "diff", "--name-only", base, harnesstree.branch(tid))
+    wt = tmp_path / "merge"
+    (wt / "runtime" / "ttp" / "restriction_audit.py").write_text(lib.read_text() + "# the next release\n")
+    _hgit(wt, "commit", "-qam", "merge the next release")
+    merged = _git_out(wt, "rev-parse", "HEAD")
+    assert harnesstree.land(p, tid) == "busy"       # the guard refused it: main stays
+    assert _git_out(h, "rev-parse", "HEAD") == base
+    p.charter_path.write_text(p.charter_path.read_text() + "\nA coordinator edit.\n")
+    p.memory_index.write_text(p.memory_index.read_text() + "- a coordinator note\n")
+    return p, merged, base, restarts
+
+
+def _local_edits(p):
+    return p.charter_path.read_text(), p.memory_index.read_text()
+
+
+def test_apply_fast_forwards_runtime_files_a_refused_harness_landing_had_written(env, monkeypatch, tmp_path):
+    """The refused landing puts back what git wrote before the guard stopped it, so the merge task's
+    `--apply` fast-forwards main over runtime files with only CHARTER and MEMORY edited in the checkout."""
+    from ttp import cli
+    p, merged, base, restarts = _landed_template_branch(env, monkeypatch, tmp_path)
+    h, edits = p.harness, _local_edits(p)
+    cli.main(["upgrade", "demo", "--apply", merged])
+    assert _git_out(h, "rev-parse", "HEAD") == merged and restarts
+    assert _git_out(h, "status", "--porcelain", "--untracked-files=no").split()[1::2] == [
+        p.charter_path.relative_to(h).as_posix(), p.memory_index.relative_to(h).as_posix()]
+    assert _local_edits(p) == edits
+    assert (h / "runtime" / "ttp" / "restriction_audit.py").read_text().endswith("# the next release\n")
+
+
+def test_apply_to_a_target_main_moved_past_fails_cleanly_and_leaves_the_checkout_as_it_was(
+        env, monkeypatch, tmp_path, capsys):
+    """Main moved after the merge task's checked commit: --apply refuses, and the fast-forward itself (as the
+    daemon would run it) fails without writing, putting nothing back over the checkout's own edits."""
+    from ttp import applyff, cli, release
+    p, merged, base, restarts = _landed_template_branch(env, monkeypatch, tmp_path)
+    h = p.harness
+    _commit_in_harness_tree(h, "prompts/moved.md", "moved\n", "main moved")
+    head, edits = _git_out(h, "rev-parse", "HEAD"), _local_edits(p)
+    status = _git_out(h, "status", "--porcelain")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo", "--apply", merged])
+    assert e.value.code == 1 and "main moved" in capsys.readouterr().err
+    why = applyff.fast_forward(h, merged, release.GUARD_ENV)
+    assert why and "put back" not in why, why
+    assert _git_out(h, "rev-parse", "HEAD") == head and not restarts
+    assert _local_edits(p) == edits and _git_out(h, "status", "--porcelain") == status
