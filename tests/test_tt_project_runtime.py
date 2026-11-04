@@ -451,14 +451,16 @@ def _git_session(tmp_path_factory):
     subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
     subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "i"],
                    check=True)
-    # The account's git settings, minus the automatic gc check each commit starts in a child git.
+    # The account's git settings, minus the automatic gc check each commit starts in a child git, and
+    # with a test identity of its own: a host with no git identity, or another one, commits the same.
     config = base / "gitconfig"
     home = pathlib.Path(os.environ.get("HOME", "/"))
     xdg = pathlib.Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config")
     own = [os.environ["GIT_CONFIG_GLOBAL"]] if os.environ.get("GIT_CONFIG_GLOBAL") else \
         [str(f) for f in (xdg / "git" / "config", home / ".gitconfig") if f.is_file()]
     config.write_text("".join(f"[include]\n\tpath = {f}\n" for f in own)
-                      + "[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n")
+                      + "[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n"
+                      + "[user]\n\tname = t\n\temail = test@example.invalid\n")
     # An empty bare repository, as `git init --bare` makes it under the tests' git settings: tests copy it.
     bare = base / "bare.git"
     subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True,

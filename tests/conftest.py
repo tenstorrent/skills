@@ -73,6 +73,35 @@ os.environ.setdefault("TTP_ALLOW_VOLATILE_BASE", "1")   # the suite runs on tmpf
 os.environ.setdefault("TTP_DEVICE_NODES", "")   # no host device node changes what a test sees; tests set their own
 
 
+def _git_identity_fallback() -> None:
+    """Tests commit with the identity git resolves; on a host with none (a fresh test host) every such
+    commit fails. There, the suite and every process it starts get a global git config of a test
+    identity that includes the account's own; a host with an identity keeps it unchanged."""
+    try:
+        # Outside any repository: the checkout running the suite may set an identity of its own.
+        if subprocess.run(["git", "var", "GIT_COMMITTER_IDENT"], capture_output=True, cwd=os.sep,
+                          env={k: v for k, v in os.environ.items() if not k.startswith("GIT_DIR")}).returncode == 0:
+            return
+    except OSError:
+        return   # no git: the tests that need it say so
+    import atexit
+    import shutil
+    import tempfile
+    home = Path(os.environ.get("HOME", "/"))
+    xdg = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config")
+    own = [os.environ["GIT_CONFIG_GLOBAL"]] if os.environ.get("GIT_CONFIG_GLOBAL") else \
+        [str(f) for f in (xdg / "git" / "config", home / ".gitconfig") if f.is_file()]
+    folder = tempfile.mkdtemp(prefix="ttp-test-git-")
+    atexit.register(shutil.rmtree, folder, True)
+    config = Path(folder) / "gitconfig"
+    config.write_text("[user]\n\tname = t\n\temail = test@example.invalid\n"
+                      + "".join(f"[include]\n\tpath = {f}\n" for f in own))
+    os.environ["GIT_CONFIG_GLOBAL"] = str(config)
+
+
+_git_identity_fallback()
+
+
 def _jobs(config, items) -> int:
     raw = os.environ.get("TTP_TEST_JOBS", "").strip()
     opt = config.option
