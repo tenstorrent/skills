@@ -75,13 +75,13 @@ def _task_of(text: str, h: dict, project: str | None) -> dict | None:
     if got:
         return {"project": got["project"] or project, "task": got["task"], "run": got["run"]}
     if str(h.get("task_id") or "").isdigit():
-        return {"project": h.get("project") or project, "task": int(h["task_id"]), "run": h.get("run_id")}
+        return {"project": project or locks.project_of(h), "task": int(h["task_id"]), "run": h.get("run_id")}
     return None
 
 
 def _project_of(text: str, h: dict, project: str | None) -> str | None:
     m = _PROJECT_RE.match(text or "")
-    return (m and m["project"]) or h.get("project") or project
+    return (m and m["project"]) or project or locks.project_of(h)
 
 
 def graph(dirs: list[tuple[Path, str | None]]) -> dict:

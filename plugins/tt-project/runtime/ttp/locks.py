@@ -39,7 +39,7 @@ import time
 from pathlib import Path
 
 from . import timefmt
-from .project import durable_write, zombie
+from .project import FOLDER, durable_write, zombie
 
 RESERVE_STALE_S = 120
 
@@ -200,16 +200,58 @@ def taker(env=None) -> dict:
 
 def run_ids(env=None) -> dict:
     """The run, task and project a taker works for (TTP_RUN_ID, TTP_TASK, TTP_PROJECT), as run_id,
-    task_id, project (the folder's name, for display) and project_root (its resolved path, which tells
-    projects apart): a stale-lock sweep (lockreap) reaps a process left holding the lock only when it is
-    of that same run and the sweeping project's own."""
+    task_id, project (its registered name, as `ttp list` shows it, with project_from "registry"; left out
+    when the registry does not name it) and project_root (its resolved path, which tells projects apart):
+    a stale-lock sweep (lockreap) reaps a process left holding the lock only when it is of that same run
+    and the sweeping project's own."""
     from .procowner import base_of
     env = os.environ if env is None else env
     root = base_of(env.get("TTP_PROJECT"))
-    out = {"run_id": env.get("TTP_RUN_ID"), "task_id": env.get("TTP_TASK"),
-           "project": Path(env["TTP_PROJECT"]).name if env.get("TTP_PROJECT") else None,
-           "project_root": str(root) if root else None}
+    name = registered_name(root) if root else None
+    out = {"run_id": env.get("TTP_RUN_ID"), "task_id": env.get("TTP_TASK"), "project": name,
+           "project_from": "registry" if name else None, "project_root": str(root) if root else None}
     return {k: v for k, v in out.items() if v}
+
+
+def registered_name(base) -> str | None:
+    """The registry's name for the project on this host whose tt-project folder is `base` (or whose
+    root it is); None when no entry names it."""
+    from .procowner import base_of
+    from .project import hostname, load_registry
+    want = base_of(base)
+    if want is None:
+        return None
+    here = hostname()
+    try:   # an unreadable or malformed registry names nobody; it never fails a lock
+        entries = sorted((load_registry().get("projects") or {}).items())
+    except Exception:
+        return None
+    for name, e in entries:
+        if isinstance(e, dict) and e.get("host") in (None, here) and e.get("dir") and base_of(e["dir"]) == want:
+            return str(name)
+    return None
+
+
+def project_of(h: dict, locks_dir=None) -> str | None:
+    """Which project lock record `h` (a slot label or shared hold) works for: the registered name of its
+    project_root, or for an older record without one, of the project whose state/locks is `locks_dir`;
+    a name recorded from the registry (project_from) when the registry no longer has that root; else
+    "unknown project at <root>", never the folder name an older record kept as its project. None for a
+    record taken outside any project."""
+    if not isinstance(h, dict) or not (h.get("project") or h.get("project_root")):
+        return None
+    root = h.get("project_root")
+    d = Path(locks_dir) if locks_dir else None
+    if not root and d is not None and d.name == "locks" and d.parent.name == "state" \
+            and d.parent.parent.name == FOLDER:
+        root = str(d.parent.parent)
+    name = registered_name(root) if root else None
+    if name:
+        return name
+    if h.get("project_from") == "registry" and h.get("project"):
+        return str(h["project"])
+    return f"unknown project at {Path(root).parent if Path(root).name == FOLDER else root}" if root \
+        else "unknown project"
 
 
 def job_fields(env=None) -> dict:

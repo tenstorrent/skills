@@ -291,7 +291,15 @@ def ended_job(p, h: dict) -> str:
     to retry, gives "". What else keeps the slot then is a leftover of the job (Reaper.sweep)."""
     from .db import TERMINAL_TASK_STATES
     rc, task = str(h.get("job_rc") or ""), str(h.get("task_id") or "")
-    if not rc or not task.isdigit() or (h.get("project") and h["project"] != Path(p.base).name):
+    if not rc or not task.isdigit():
+        return ""
+    if h.get("project_root"):   # the root tells projects apart, whatever their names
+        try:
+            if Path(h["project_root"]).resolve() != Path(p.base).resolve():
+                return ""
+        except (OSError, ValueError):
+            return ""
+    elif h.get("project") and h["project"] != Path(p.base).name:   # an older label: its folder's name
         return ""
     try:
         rc = Path(rc).resolve()
@@ -347,7 +355,7 @@ def holder_info(path: Path, h: dict | None = None) -> dict:
     since = float(h.get("since") or 0) if isinstance(h.get("since"), (int, float)) else 0.0
     return {"lock": Path(path).name, "path": str(path), "holder": str(h.get("holder") or "?"),
             "pid": h.get("pid"), "command": str(h.get("command") or "")[:200], "task": h.get("task_id"),
-            "run": h.get("run_id"), "project": h.get("project"), "since": since}
+            "run": h.get("run_id"), "project": locks.project_of(h, Path(path).parent), "since": since}
 
 
 def slot_files(dirs) -> list[Path]:

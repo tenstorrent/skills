@@ -808,3 +808,83 @@ def test_lock_labels_name_the_holders_full_project_root(env, monkeypatch, tmp_pa
     monkeypatch.setenv("TTP_PROJECT", str(tmp_path / "proj"))
     monkeypatch.setenv("TTP_RUN_ID", "7")
     assert locks.run_ids()["project_root"] == os.path.realpath(tmp_path / "proj" / "tt-project")
+
+
+def test_lock_records_and_the_lock_wait_alert_name_the_registered_project_not_the_harness_folder(
+        env, monkeypatch, tmp_path):
+    # Every project's harness folder is named tt-project: a holder or waiter record names the project as
+    # registered (`ttp list`), and the lock-wait alert built on it does too.
+    from ttp import lockreap, locks
+    p = make(env, "alpha")
+    assert p.base.name == "tt-project"
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_RUN_ID", "70")
+    monkeypatch.setenv("TTP_TASK", "7")
+    ids = locks.run_ids()
+    assert ids["project"] == "alpha" and ids["project_from"] == "registry"
+    assert ids["project_root"] == os.path.realpath(p.base)
+    d = tmp_path / "shared" / "gate"
+    f = locks.try_take(locks.slot_paths(d, "gate", 1), "alpha task #7 (run 70)", "run-gate")
+    sh = locks.try_take_shared(locks.slot_paths(d, "rig", 1), "alpha task #7 (run 70)", "use-rig")
+    t = locks.enqueue(d, "gate", "alpha task #8 (run 80)", since=time.time() - 31 * 60)
+    try:
+        assert json.loads((d / "gate.0.lock").read_text())["project"] == "alpha"
+        [rec] = locks.shared_holders(locks.slot_paths(d, "rig", 1))
+        assert rec["project"] == "alpha"
+        [w] = lockreap.long_waits([d], 30 * 60)
+        assert w["holders"][0]["project"] == "alpha"
+        text = lockreap.wait_text(w)
+        assert "project alpha" in text and "project tt-project" not in text, text
+    finally:
+        locks.dequeue(t)
+        sh.close()
+        f.close()
+    # Outside any project: no project at all, not a guess.
+    monkeypatch.delenv("TTP_PROJECT")
+    assert "project" not in locks.run_ids() and locks.project_of(locks.run_ids()) is None
+
+
+def test_an_old_lock_record_resolves_its_project_through_the_registry_or_says_unknown(env, monkeypatch, tmp_path):
+    from ttp import locks
+    p = make(env, "alpha")
+    old = {"holder": "task #7 (run 70)", "project": "tt-project"}   # an older release: the folder's name
+    assert locks.project_of({**old, "project_root": str(p.base)}) == "alpha"
+    assert locks.project_of(old, p.state / "locks") == "alpha"     # from the project's own lock dir
+    gone = tmp_path / "gone" / "tt-project"
+    assert locks.project_of({**old, "project_root": str(gone)}) == f"unknown project at {gone.parent}"
+    assert locks.project_of(old, tmp_path / "shared" / "gate") == "unknown project"
+    # A name recorded from the registry stands once the registry no longer has its root.
+    assert locks.project_of({"project": "beta", "project_from": "registry", "project_root": str(gone)}) == "beta"
+    assert locks.project_of({"holder": "task #7 (run 70)"}) is None
+    from ttp.project import registry_path
+    for bad in ("[1, 2]", '{"projects": [1]}', "not json"):   # a malformed registry names nobody, fails no lock
+        registry_path().write_text(bad)
+        assert locks.project_of({**old, "project_root": str(p.base)}) == f"unknown project at {p.root}"
+        monkeypatch.setenv("TTP_PROJECT", str(p.base))
+        assert "project" not in locks.run_ids()
+
+
+def test_two_projects_with_same_named_harness_folders_are_told_apart_in_lock_records(env, monkeypatch, tmp_path):
+    from ttp import lockcycle, lockreap, locks
+    from ttp.project import register
+    a, b_base = make(env, "alpha"), tmp_path / "beta" / "tt-project"
+    b_base.mkdir(parents=True)
+    register("beta", {"host": "testhost", "dir": str(b_base.parent)})
+    assert a.base.name == b_base.name
+    for name, base in (("alpha", a.base), ("beta", b_base)):
+        monkeypatch.setenv("TTP_PROJECT", str(base))
+        assert locks.run_ids()["project"] == name
+        # Old-format records (both "tt-project") resolve by their roots.
+        old = {"project": "tt-project", "project_root": str(base), "task_id": "3", "run_id": "30"}
+        assert locks.project_of(old) == name
+        assert lockcycle._task_of("", old, None)["project"] == name   # a shared lock's party
+        assert lockcycle._project_of("", old, None) == name
+    # A detached job's slot of beta is never alpha's to free, though both folders share a name.
+    rc = a.runs / "70" / "job.rc"
+    rc.parent.mkdir(parents=True, exist_ok=True)
+    rc.write_text("0\n")
+    tid = a.db.add_task("uses the rig", kind="code")
+    a.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+    h = {"job_rc": str(rc), "task_id": str(tid), "project": "tt-project"}
+    assert lockreap.ended_job(a, {**h, "project_root": str(a.base)})
+    assert not lockreap.ended_job(a, {**h, "project_root": str(b_base)})
