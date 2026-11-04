@@ -12,6 +12,7 @@ WORKER_NOTIFY = "decisions, reviews, merges, funds, outages"
 # Every runtime call that posts kind='alert': (file, function) -> one (class, why) per call site, in
 # source order. A new site, or one more in a listed function, fails test_every_alert_post_site_is_classed.
 ALERT_SITES = {
+    ("chartertemplate.py", "alert"): [("decisions", "a charter Restrictions item the user ordered was refused; once per item and cause, cleared when it lands")],
     ("coordinator.py", "apply"): [
         (WORKER_NOTIFY, "the coordinator's notify action; its prompt and gates limit it to these"),
         ("decisions", "a charter restriction retired")],
