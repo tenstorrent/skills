@@ -41,6 +41,24 @@ def test_ctxblock_order_words_verbatim_with_relayer_context_labelled_data_and_sy
     assert ctxblock.prompt_block(p, p.db.task(other)) == ""
 
 
+def test_ctxblock_message_ids_take_only_hash_ids_so_a_date_or_count_after_one_is_not_a_message(env):
+    from ttp import ctxblock, obligations
+    assert ctxblock.message_ids("Goal (user msg #1785, 2026-11-05; more)") == [1785]
+    assert ctxblock.message_ids("msg #5 and 3 more") == [5]
+    assert ctxblock.message_ids("msgs #714, #719") == [714, 719]
+    assert ctxblock.message_ids("user msgs #1, #2 and #3 or #4 & #5") == [1, 2, 3, 4, 5]
+    # A bare number after the run stays a task id candidate, not part of the message span.
+    assert ctxblock.task_ids("user msg #7, #8 and 3 tasks, see #42") == {42}
+    p = make(env)
+    mid = _ctx_msg(p, ORDER_WORDS)
+    other = _ctx_msg(p, "an unrelated user message that is no part of the order")
+    tid = p.db.add_task("dated cite", "Do it.", kind="code")
+    obligations.add(p, f"X (user msg #{mid}, {other}-11-05)", owners=[tid])
+    assert [m["id"] for _, m in ctxblock.order_messages(p.db, tid)] == [mid]
+    out = ctxblock.prompt_block(p, p.db.task(tid))
+    assert ORDER_WORDS in out and "unrelated user message" not in out
+
+
 def test_ctxblock_lineage_names_summaries_reasons_failed_review_findings_and_result_paths(env, tmp_path):
     from ttp import ctxblock
     p = make(env)
