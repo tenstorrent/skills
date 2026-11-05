@@ -112,6 +112,7 @@ from . import screen as scr
 from . import schedule as sched
 from . import workernotify
 from . import provallow
+from . import hostrun
 from .db import (
     PAUSED_RESOURCES_KEY,
     SEVERITY_RANK,
@@ -359,6 +360,8 @@ USER_SETTABLE = {
     "effort_ab.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "effort_ab.jev_pick": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "runner.pin_verify": pin_verify_mode,
+    # What `ttp host-run` may run on the host outside the sandbox: stored only as a list hostrun accepts.
+    "runner.host_commands": hostrun.check_list,
     # Check commands' CPU and IO priority (testslots.nice_level, ionice_args): nice 0-19; ionice idle or best-effort[:0-7].
     "checks.nice": lambda v: _checks_nice(v),
     "checks.ionice": lambda v: _checks_ionice(v),

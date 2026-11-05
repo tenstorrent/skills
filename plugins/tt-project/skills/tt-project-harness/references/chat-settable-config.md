@@ -14,6 +14,9 @@ Besides the fixed list (budget, notify, delivery, review, coordinator and a few 
 - `providers.chat.endpoint`: the alias of an endpoint already saved on this host with `ttp secret endpoint <alias> --url <base url>`; refused when none is saved, or for a URL.
 - `providers.chat.effort_fields`: model -> effort (or `*`) -> plain request fields, each a number, true/false or a short word, such as `{"<model>": {"low": {"reasoning_effort": "low"}}}`; no objects, lists, URLs, conversation fields, or field names naming a URL, host, key, token or header.
 
+The fixed list also holds `runner.host_commands`, the commands `ttp host-run` runs on the host outside the sandbox: a JSON list whose every entry is a command string (the words a request must equal or start with) or `{"cmd": "<command>", "timeout_s": N}` (1 to 3600).
+A plain shell string, a non-list, or any entry `ttp host-run` would refuse (empty, not a string, a bad `timeout_s`, an unknown key, a quote that does not close) is refused, naming the entry, and nothing is stored.
+
 Never from chat: any `providers.<p>.base_url`.
 Worker runs carry internal code, so the bridge sends them only to the base URL saved with the endpoint's key; leave `base_url` unset.
 The key itself never goes in config: only the alias does.

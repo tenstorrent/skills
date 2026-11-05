@@ -2263,8 +2263,9 @@ Workers can read Slack links you paste, using your Slack connector if you have o
 - A sandboxed worker cannot gain privileges (sudo fails with 'no new privileges'). A privileged
   command the project allows runs on the host through the daemon: `ttp host-run -- <command...>`
   prints its output and exits with its code (126 refused, 124 timed out, 75 no answer from the
-  daemon). Only commands in config `runner.host_commands` run, set by the user or the coordinator,
-  never a worker. An entry is a command string (the words a request must equal or start with),
+  daemon). Only commands in config `runner.host_commands` run, set by the user or the coordinator
+  (`ttp config`, or chat's `config_set`), never a worker; both store only a JSON list of entries
+  `ttp host-run` accepts, refusing a shell string or a bad entry by name. An entry is a command string (the words a request must equal or start with),
   limited by `runner.host_command_timeout_s` (default 120 s, at most 600 s), or
   `{"cmd": "<command>", "timeout_s": N}`, which gives that command its own limit of up to 3600 s,
   for example `{"cmd": "sudo -n /usr/local/sbin/power-cycle", "timeout_s": 1200}`. An entry whose

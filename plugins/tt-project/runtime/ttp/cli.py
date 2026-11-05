@@ -8718,10 +8718,13 @@ def cmd_config(a) -> None:
             die("runner.host_commands (the commands `ttp host-run` may run outside the sandbox) is set only by "
                 "the user or the coordinator, never by a worker: name the exact command in your hand-off")
         from . import hostrun
-        listed = val.get("host_commands") if a.key == "runner" else val
-        for i, e in enumerate(listed if isinstance(listed, list) else [], 1):
-            if err := hostrun.entry(e)[2]:
-                die(f"runner.host_commands entry {i} {json.dumps(e)[:160]}: {err}", 2)
+        try:   # the list itself (a JSON list of valid entries, as config_set takes it), or one entry under it
+            if a.key == "runner" or a.key == hostrun.KEY:
+                hostrun.check_list(val.get("host_commands") if a.key == "runner" else val)
+            elif err := hostrun.entry(val)[2]:
+                raise ValueError(f"{a.key} {json.dumps(val)[:160]}: {err}")
+        except ValueError as e:
+            die(str(e), 2)
     if run and (k := _user_only_change(p.raw_config(), a.key, val)):
         # A run can be steered by text it reads; these change only in a coordinator turn that carries
         # the user's yes (coordinator.NEEDS_USER), as `ttp say` is refused inside a run.

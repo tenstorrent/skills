@@ -424,3 +424,69 @@ def test_fence_problem_reads_the_named_daemons_flag(env, monkeypatch, tmp_path):
         child.kill()
         child.wait()
     assert hostrun.fence_problem(p, child.pid) == "" and privlock.fenced(child.pid) is None
+
+
+def test_the_coordinator_sets_the_host_run_allowlist_through_config_set_and_chat_settable_accepts_it(
+        env, monkeypatch, capsys):
+    from ttp import cli, configwho, hostrun
+    from ttp import coordinator as coord
+    p = _hostrun_setup(env, monkeypatch, [])
+    good = ["sudo -n /usr/sbin/tool status", {"cmd": "/usr/local/sbin/power-cycle", "timeout_s": 900}]
+    assert coord.apply(p, [{"type": "config_set", "key": hostrun.KEY, "value": good}]) == []
+    assert p.config()["runner"]["host_commands"] == good
+    assert configwho.lookup(p.db, hostrun.KEY, p.raw_config())["by"] == "coordinator"
+    assert hostrun.entries(p) == ([(["sudo", "-n", "/usr/sbin/tool", "status"], None),
+                                   (["/usr/local/sbin/power-cycle"], 900)], "")
+    # A JSON list given as text is the same list; an empty list allows nothing.
+    assert coord.USER_SETTABLE[hostrun.KEY](json.dumps(good)) == good
+    assert coord.USER_SETTABLE[hostrun.KEY]([]) == []
+
+    def ask(*argv):
+        try:
+            cli.main(["config", "--chat-settable", hostrun.KEY, *argv])
+            rc = 0
+        except SystemExit as e:
+            rc = e.code
+        return rc, capsys.readouterr().out
+    assert ask() == (0, f"{hostrun.KEY}: accepted\n")
+    assert ask(json.dumps(good))[0] == 0
+    assert ask("sudo -n /usr/sbin/tool status")[0] == 1
+
+
+@pytest.mark.parametrize("bad, says", [
+    ("sudo -n /usr/sbin/tool status", "not one shell string"),        # a shell string, not a list
+    ('"sudo -n /usr/sbin/tool status"', "not one shell string"),      # the same as a JSON string
+    ({"cmd": "/bin/true"}, "give a JSON list"),                         # one entry, not a list
+    (17, "give a JSON list"),
+    (None, "give a JSON list"),
+    ([""], "entry 1 "),                                                 # empty
+    (["/bin/true", "   "], "entry 2 "),
+    ([["/bin/true"]], "must be a string"),                              # an argv list as an entry
+    ([None], "must be a string"),
+    (["/bin/true", "sudo -n 'unclosed"], "does not split"),
+    ([{"cmd": "/bin/true", "timeout_s": 0}], "outside 1..3600"),
+    ([{"cmd": "/bin/true", "timeout_s": 9000}], "outside 1..3600"),
+    ([{"cmd": "/bin/true", "timeout_s": True}], "must be a number"),
+    ([{"cmd": "/bin/true", "shell": True}], "unknown key shell"),
+    ([{"timeout_s": 60}], "must be a string"),
+])
+def test_config_set_and_ttp_config_never_store_a_host_run_list_hostrun_would_refuse(env, monkeypatch, capsys,
+                                                                                      bad, says):
+    from ttp import cli, hostrun
+    from ttp import coordinator as coord
+    p = _hostrun_setup(env, monkeypatch, ["/bin/true"])
+    errs = coord.apply(p, [{"type": "config_set", "key": hostrun.KEY, "value": bad}])
+    assert len(errs) == 1 and hostrun.KEY in errs[0] and says in errs[0], errs
+    assert p.config()["runner"]["host_commands"] == ["/bin/true"], "nothing is stored"
+    try:
+        cli.main(["config", "--chat-settable", hostrun.KEY, bad if isinstance(bad, str) else json.dumps(bad)])
+        rc = 0
+    except SystemExit as e:
+        rc = e.code
+    assert rc == 1 and says in capsys.readouterr().out
+    # `ttp config` refuses the same value (it used to store a non-list), as the whole key and under `runner`.
+    for key, value in ((hostrun.KEY, bad), ("runner", {"host_commands": bad})):
+        with pytest.raises(SystemExit):
+            cli.main(["config", "demo", key, value if isinstance(value, str) else json.dumps(value)])
+        assert says in capsys.readouterr().err
+    assert p.config()["runner"]["host_commands"] == ["/bin/true"]

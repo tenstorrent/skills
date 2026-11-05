@@ -14,7 +14,9 @@ command runs with shell=False, the daemon's own environment and cwd (never the w
 {"cmd": "<command>", "timeout_s": N}: that command's own limit, up to ENTRY_MAX_TIMEOUT_S; an entry over
 it, at or below zero, not a number or otherwise malformed is refused when read, named in the refusal,
 never clamped. The longest matching entry gives the limit; a caller's --timeout below it wins, above it
-is cut to it (and told so). Only the user or the coordinator sets the list: `ttp config` refuses it in a worker run, and the daemon runs nothing
+is cut to it (and told so). Only the user or the coordinator sets the list (`ttp config`, or the coordinator's
+config_set, which chat may use): both store only a list check_list accepts, refusing a shell string, a non-list or
+any entry entry() refuses, named. `ttp config` refuses it in a worker run, and the daemon runs nothing
 while configwho records a worker as its setter. Every request, run or refused, goes to
 state/host-run.jsonl with its task id, run id, words, exit code and length.
 
@@ -108,6 +110,27 @@ def entry(e) -> tuple[list[str], int | None, str]:
     except ValueError as err:
         return [], None, f"the command does not split as a shell would ({err})"
     return (words, limit, "") if words else ([], None, "the command is empty")
+
+
+def check_list(v) -> list:
+    """A runner.host_commands value as `ttp config` and the coordinator's config_set store it: a JSON list
+    whose every entry entry() accepts (an empty list allows nothing). Anything else raises ValueError naming
+    the bad entry, so a list hostrun would refuse is never stored. A value given as a string must be a JSON
+    list: one shell command line is refused, never split into entries."""
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except ValueError:
+            v = None
+        if not isinstance(v, list):
+            raise ValueError(f"{KEY}: give a JSON list of commands (e.g. [\"sudo -n /usr/sbin/<tool> <verb>\"]), "
+                             f"not one shell string")
+    if not isinstance(v, list):
+        raise ValueError(f"{KEY}: give a JSON list of commands, not {json.dumps(v)[:160]}")
+    for i, e in enumerate(v, 1):
+        if err := entry(e)[2]:
+            raise ValueError(f"{KEY} entry {i} {json.dumps(e)[:160]}: {err}")
+    return v
 
 
 def allowlist(p: Project) -> tuple[list[list[str]], str]:

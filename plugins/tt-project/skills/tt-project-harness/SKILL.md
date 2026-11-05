@@ -241,7 +241,7 @@ Company-wide practice; the long form is in the `tt-project:setup-box` skill's re
   `ttp host-run -- <command...>` prints its output and exits with its code (126 refused, 124 timed
   out). Only commands in config `runner.host_commands` run, each entry the command's first words
   (name them fully, e.g. `sudo -n /usr/sbin/<tool> <read-only verb>`); the user or the coordinator
-  sets the list, never a worker. Each run goes to `state/host-run.jsonl` with its task id. A plain
+  sets the list (`ttp config` or chat's `config_set`, each refusing a shell string or a bad entry by name), never a worker. Each run goes to `state/host-run.jsonl` with its task id. A plain
   entry runs under `runner.host_command_timeout_s` (at most 600 s); an entry
   `{"cmd": "<command>", "timeout_s": N}` sets its own limit, up to 3600 s (over it, or malformed:
   refused and named, never clamped); `--timeout S` asks for less. Anything that may run past about
