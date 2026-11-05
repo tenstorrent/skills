@@ -1304,6 +1304,7 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
     real, repo, out = tmp_path / "realhome", tmp_path / "repo", tmp_path / "out"
     (real / ".config" / "systemd" / "user").mkdir(parents=True)
     (real / ".bashrc").write_text("mine\n")
+    (real / ".gitconfig").write_text("[t]\n\tmine = 1\n")
     out.mkdir()
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     (repo / ".gitignore").write_text("__pycache__/\n")
@@ -1319,6 +1320,9 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
         "    sh = 'echo \"$HOME\"; cd ~ && printf x > .bashrc && git config --global t.k v'\n"
         "    if i == 0:\n"
         "        sh += ' && python3 -c \"import pytest\"'   # the account's user packages still import\n"
+        "        # The account's git config, copied: git's answer cache keeps nothing while one has an include.\n"
+        "        assert '[include' not in (home / '.gitconfig').read_text()\n"
+        "        assert subprocess.run(['git', 'config', '--global', 't.mine'], capture_output=True, text=True).stdout == '1\\n'\n"
         "    r = subprocess.run(['sh', '-c', sh], capture_output=True, text=True)\n"
         "    assert r.returncode == 0 and r.stdout.strip() == str(home), r.stderr\n"
         "    pathlib.Path(os.environ['OUT'], f'home-{i}').write_text(str(home))\n"
@@ -1328,7 +1332,7 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
         "        pathlib.Path(REAL, '.config/systemd/user/x.service').write_text('')\n"
         "        pathlib.Path('left.txt').write_text('x')\n")
     env = {**os.environ, "HOME": str(real), "REAL": str(real), "OUT": str(out), "TTP_TEST_JOBS": "3"}
-    for var in ("CI", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
+    for var in ("CI", "GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
         env.pop(var, None)
 
     def run(*args, **extra):
@@ -1339,7 +1343,8 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
     assert r.returncode == 0 and "61 passed" in r.stdout, r.stdout + r.stderr
     homes = {(out / f"home-{i}").read_text() for i in range(60)}
     assert len(homes) == 60, "tests shared a HOME"
-    assert sorted(p.name for p in real.iterdir()) == [".bashrc", ".config"] and (real / ".bashrc").read_text() == "mine\n"
+    assert sorted(p.name for p in real.iterdir()) == [".bashrc", ".config", ".gitconfig"] and (real / ".bashrc").read_text() == "mine\n"
+    assert (real / ".gitconfig").read_text() == "[t]\n\tmine = 1\n"
     assert not list((real / ".config" / "systemd" / "user").iterdir())
     assert "wrote outside" not in r.stdout
     # A test that still writes there, by an absolute path or relative to its working folder.

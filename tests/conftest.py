@@ -77,8 +77,9 @@ def _git_global_config() -> None:
     """Every test runs with HOME in a temp folder (_temp_home), so git would find neither the account's
     global config nor its identity there, and a test's `git config --global` would write the account's
     own ~/.gitconfig without it. The suite and every process it starts get a global git config of their
-    own instead, a session file that includes the account's (read only), with a test identity under
-    it where git resolves none (a fresh test host)."""
+    own instead, a session file holding a copy of the account's (read only), with a test identity
+    under it where git resolves none (a fresh test host). It copies rather than includes: the runtime's
+    git answer cache (gitcache, gitreplay) keeps nothing while a global config has an include."""
     import atexit
     import shutil
     import tempfile
@@ -95,8 +96,17 @@ def _git_global_config() -> None:
     folder = tempfile.mkdtemp(prefix="ttp-test-git-")
     atexit.register(shutil.rmtree, folder, True)
     config = Path(folder) / "gitconfig"
+    texts = []
+    for f in own:
+        try:
+            text = Path(f).read_text(errors="replace")
+        except OSError:
+            continue
+        # One with includes of its own stays included by path, so its relative include paths resolve.
+        texts.append(f"[include]\n\tpath = {f}\n" if re.search(r"^\s*\[\s*include", text, re.I | re.M)
+                     else text.rstrip("\n") + "\n")
     config.write_text(("" if ident else "[user]\n\tname = t\n\temail = test@example.invalid\n")
-                      + "".join(f"[include]\n\tpath = {f}\n" for f in own)
+                      + "".join(texts)
                       # Signing keys live in the account's home folder, which tests never see.
                       + "[commit]\n\tgpgSign = false\n[tag]\n\tgpgSign = false\n")
     os.environ["GIT_CONFIG_GLOBAL"] = str(config)
@@ -146,10 +156,23 @@ def _temp_home(tmp_path_factory, monkeypatch):
     if _USER_BASE and not os.environ.get("PYTHONUSERBASE"):
         monkeypatch.setenv("PYTHONUSERBASE", _USER_BASE)
     if os.environ.get("GIT_CONFIG_GLOBAL"):   # a `git config --global` of its own: tests never share one
-        own = Path(home, ".gitconfig")
-        own.write_text(f"[include]\n\tpath = {os.environ['GIT_CONFIG_GLOBAL']}\n")
+        own = Path(home, ".gitconfig")   # a copy, not an include: see _git_global_config
+        own.write_bytes(_session_git_config(os.environ["GIT_CONFIG_GLOBAL"]))
         monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(own))
     return Path(home)
+
+
+_GIT_CONFIG_TEXT: dict[str, bytes] = {}
+
+
+def _session_git_config(path: str) -> bytes:
+    """The session's global git config (read once per path; tests never write it)."""
+    if path not in _GIT_CONFIG_TEXT:
+        try:
+            _GIT_CONFIG_TEXT[path] = Path(path).read_bytes()
+        except OSError:
+            _GIT_CONFIG_TEXT[path] = f"[include]\n\tpath = {path}\n".encode()
+    return _GIT_CONFIG_TEXT[path]
 
 
 def home_marks(home: str | Path) -> dict[str, object]:
