@@ -15,7 +15,6 @@ since the last turn started); the daily review lists the day's fixes grouped by 
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 from pathlib import Path
@@ -48,10 +47,8 @@ def declare(run_dir: str | Path, why: str, serves_ref: str, undo: str) -> dict:
     if not undo:
         raise ValueError("--undo: the command or steps that undo it (`none: <why>` when nothing can)")
     rec = {"ts": time.time(), "why": why[:500], "serves": serves(serves_ref), "undo": undo[:500]}
-    path = Path(run_dir) / INTENT
-    tmp = path.with_name(f".{INTENT}.{os.getpid()}")
-    tmp.write_text(json.dumps(rec))
-    tmp.replace(path)
+    from .project import durable_write
+    durable_write(Path(run_dir) / INTENT, json.dumps(rec))
     return rec
 
 
