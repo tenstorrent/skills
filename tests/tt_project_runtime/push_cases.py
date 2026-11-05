@@ -16219,6 +16219,58 @@ def test_an_append_append_push_conflict_is_settled_model_free(tmp_path):
         assert conflictfix.try_model_free(root, {**cf, **more}, 42) is None
 
 
+_APPEND_FILE = "tests/rt/area_cases.py"
+_APPEND_BASE = "import pytest\n\n\ndef test_a(env):\n    p = env.project()\n    assert p\n"
+
+
+def _appended(name, assertion="assert p.db"):
+    return (_APPEND_BASE + f"\n\n@pytest.mark.slow\ndef {name}(env, monkeypatch):\n    p = env.project()\n"
+            f"    {assertion}\n")
+
+
+@pytest.mark.parametrize("case", ["append", "edit", "same_name", "check_fails"])
+def test_a_push_batch_settles_tests_both_sides_append_to_one_case_file_and_keeps_the_approval(env, monkeypatch,
+                                                                                               capsys, case):
+    """Two approved changes each append a new test to one shared case file (shared body lines and
+    decorators included): the batch's own rebase keeps both, the tip's first, runs the push checks on
+    the result and pushes both, with no model and the second approval kept; the batch log names the
+    settled file. A changed line, or the same test name added on both sides, stays a conflict (a
+    conflict fix and a re-review); a check failing on the settled result keeps the change out and
+    drops the approval as a conflict whose merged checks failed."""
+    both = f"! (grep -q test_tip {_APPEND_FILE} && grep -q test_change {_APPEND_FILE})"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [both if case == "check_fails" else "true"])
+    (other / "tests/rt").mkdir(parents=True)
+    _commit(other, _APPEND_FILE, _APPEND_BASE)
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    second = {"append": _appended("test_change"), "check_fails": _appended("test_change"),
+              # another signature: only the name repeats, which would shadow the tip's test
+              "same_name": _appended("test_tip", "assert not p.db").replace("(env, monkeypatch)", "(env)"),
+              "edit": _appended("test_change").replace("    assert p\n", "    assert p.root\n", 1)}[case]
+    tip = _appended("test_tip")
+    if case == "edit":
+        tip = tip.replace("    assert p\n", "    assert p.state\n", 1)
+    heads = [_entry(repo, "e1", {_APPEND_FILE: tip}), _entry(repo, "e2", {_APPEND_FILE: second})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    out = capsys.readouterr().out
+    if case == "append":
+        assert rc == 0 and m["outcome"] == "pushed" and _statuses(m) == ["pushed", "pushed"], m
+        assert m["results"][1]["detail"]["settled"] == [_APPEND_FILE], m
+        assert f"settled {_APPEND_FILE} (lines both sides added)" in out, out
+        got = _git_out(origin, "show", f"proj:{_APPEND_FILE}")
+        assert got.index("def test_tip") < got.index("def test_change") and got.count("@pytest.mark.slow") == 2
+        __import__("ast").parse(got)
+    elif case == "check_fails":
+        # its detail names the failing checks: pushq._settle sends it to a standard conflict fix (no kept approval)
+        assert _statuses(m) == ["pushed", "conflict"], m
+        d = m["results"][1]["detail"]
+        assert d["settled"] == [_APPEND_FILE] and d["cmd"] == both and d["files"] == [_APPEND_FILE], d
+        assert "test_change" not in _git_out(origin, "show", f"proj:{_APPEND_FILE}")
+    else:
+        assert _statuses(m) == ["pushed", "conflict"], m
+        assert m["results"][1]["detail"]["files"] == [_APPEND_FILE], m
+        assert "test_change" not in _git_out(origin, "show", f"proj:{_APPEND_FILE}")
+
+
 def test_two_names_added_to_a_one_name_per_line_import_list_settle_model_free_and_hot_files_keep_that_layout():
     import ast
     from ttp import conflictfix
