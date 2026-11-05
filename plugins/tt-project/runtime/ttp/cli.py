@@ -1989,6 +1989,17 @@ def cmd_ttr(a) -> None:
           + (f" on {a.alias}" if a.alias else ""))
 
 
+def cmd_hostcheck(a) -> None:
+    """One read-only check from a fixed catalogue on a host (hostcheck.py); exits with the check's code."""
+    from . import hostcheck
+    p = here()
+    if not p:
+        die("no tt-project project here: run `ttp hostcheck` in a project folder")
+    rc, out = hostcheck.run(p.config(), p.root, a.alias, a.check, a.args)
+    print(out)
+    sys.exit(rc)
+
+
 def cmd_eta(a) -> None:
     """Expected finish of a task or obligation from its critical path (eta.py): measured medians, no padding.
     Workers read it before setting a retry or deadline wake."""
@@ -10819,7 +10830,7 @@ COMMAND_GROUPS = (
                   "memory", "obligation", "config", "pause", "resume", "drain", "alerts", "issues", "mute",
                   "machines", "logs", "doctor")),
     ("inside a run", ("note", "notify", "progress", "checks", "lock", "host-run", "detach", "devq", "push", "land",
-                      "clip", "sandbox", "skill", "killscan", "svcscan", "leftover-procs", "said")),
+                      "clip", "sandbox", "skill", "killscan", "svcscan", "leftover-procs", "said", "hostcheck")),
     ("probes (retry_when, start_when)", ("landed", "eta", "ci", "ack-wait", "ssh-preflight", "broker-released",
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
@@ -11225,6 +11236,14 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("name", nargs="?", help="the project (default: the one here)")
     s.add_argument("--json", action="store_true", help="print JSON (wake_at: the epoch to wake at)")
     s.set_defaults(fn=cmd_eta)
+
+    s = sub.add_parser("hostcheck", help="one read-only check from a fixed catalogue on a host (`local`, this host "
+                                         "or a ttp machines alias, through the project's own access)")
+    s.add_argument("alias", help="`local` or a ttp machines alias")
+    s.add_argument("check", help="reachable, uptime, unit-active, process-alive, file-exists, disk-free, git-head, "
+                                 "git-log, git-show, lock-holder, broker-job, log-tail, tt-smi or squeue")
+    s.add_argument("args", nargs=argparse.REMAINDER, help="the check's arguments (plain words)")
+    s.set_defaults(fn=cmd_hostcheck)
 
     s = sub.add_parser("ttr", help="how long each machine took to recover from problems: incidents, median, "
                                    "90th percentile and longest time, and the ones still open")

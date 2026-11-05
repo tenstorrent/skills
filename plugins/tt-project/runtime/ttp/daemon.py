@@ -97,6 +97,7 @@ from . import gitreplay
 from . import globalcap as gcap
 from . import coordinator as coord
 from . import coordlimits
+from . import coordtools
 from . import detach
 from . import progress
 from . import downtime
@@ -2715,6 +2716,10 @@ class Daemon:
             timeout_s = coordlimits.turn_timeout(self.cfg, provider, effort, prompt_bytes)
             note = {**(note or {}), "turn": {"prompt_bytes": prompt_bytes, "provider": provider,
                     "model": model, "effort": effort, "timeout_s": timeout_s}}
+            if coordtools.session_on(self.cfg):
+                # A session wake stops at its dollar or time limit, whichever comes first (coordtools).
+                budget_usd, timeout_s = coordtools.wake_budget(self.cfg, budget_usd, timeout_s)
+                note["turn"].update(timeout_s=timeout_s, wake_budget={"usd": budget_usd, "s": timeout_s})
         pin: dict = {}
         if role != "coordinator" and task:
             # The task's own pin (task_add model/effort) wins over its tier: a tier change (an effort
@@ -2745,9 +2750,10 @@ class Daemon:
         denied = coord.tool_list(self.cfg["providers"].get(provider, {}).get("disallowed_tools") or [])
         from .project import secrets_path
         from .web import token_path
+        no_reads = [str(token_path(self.p).resolve()), str(secrets_path().resolve())]
         argv, env = prov.build(role=role, model=model, effort=effort, cwd=cwd, budget_usd=budget_usd,
                                read_only=read_only, schema=schema, restrictions=restrictions,
-                               disallowed_tools=denied, denied_reads=[str(token_path(self.p).resolve()), str(secrets_path().resolve())],
+                               disallowed_tools=denied, denied_reads=no_reads,
                                web=role == "coordinator" or web_needed(role, task))
         cache_fp = None
         if role != "coordinator" and not cache_ttl:
@@ -2964,7 +2970,10 @@ class Daemon:
             if system is not None:
                 (run_dir / "system.md").write_text(system)
                 if provider == "claude":
-                    argv, inline = _with_system_prompt(prov, argv, run_dir / "system.md")
+                    tools = (coordtools.session_tool_args(self.cfg, project=self.p.name, root=str(self.p.root),
+                                                          denied_reads=no_reads)
+                             if role == "coordinator" else [])
+                    argv, inline = _with_system_prompt(prov, argv, run_dir / "system.md", tools)
                     if not inline:   # too long for the command line: it leads what the agent reads
                         if stdin is not None:
                             stdin = _lead_input(stdin, system)
@@ -15505,15 +15514,19 @@ def _before_stdin(argv: list[str], extra: list[str]) -> list[str]:
     return argv[:-1] + extra + ["-"] if argv[-1:] == ["-"] else argv + extra
 
 
-def _with_system_prompt(prov, argv: list[str], path: Path) -> tuple[list[str], bool]:
+def _with_system_prompt(prov, argv: list[str], path: Path, tools: list[str] | None = None) -> tuple[list[str], bool]:
     """`argv` for a run whose system prompt is the text in `path`, and whether the text is in it. The
     CLI reads the file itself where it can (--system-prompt-file): text past the per-argument limit
     on the command line fails the exec (E2BIG) before the agent starts. Where it cannot and the text
-    is too long, it is left out and leads what the agent reads instead (stdin has no limit)."""
+    is too long, it is left out and leads what the agent reads instead (stdin has no limit).
+    No tools, unless `tools` gives a session coordinator its read-only ones (coordtools); that run
+    leaves out --safe-mode, which turns hooks off, so its tool hook runs (--restricted still ignores
+    the user's and project's settings files)."""
     if prov.name != "claude":
         return argv, False
     sys_args = prov.system_prompt_args(path)
-    return argv + ["--safe-mode", "--strict-mcp-config", "--tools", "", *sys_args], bool(sys_args)
+    head = ["--strict-mcp-config", *tools] if tools else ["--safe-mode", "--strict-mcp-config", "--tools", ""]
+    return argv + [*head, *sys_args], bool(sys_args)
 
 
 def _lead_input(stdin: str, text: str) -> str:

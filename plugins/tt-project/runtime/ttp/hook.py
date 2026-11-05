@@ -1804,12 +1804,25 @@ HANDLERS = {"PostToolUse": post_tool_use, "PostToolUseFailure": post_tool_use_fa
             "PreToolUse": pre_tool_use, "Stop": stop}
 
 
+def _coord_pre_tool_use(payload: dict):
+    try:
+        from . import coordtools
+    except Exception as e:   # fails closed, unlike the worker hooks
+        return _deny(f"the coordinator tool check could not load ({type(e).__name__})"), None
+    return coordtools.pre_tool_use(payload)
+
+
+HANDLERS[COORD_EVENT := "CoordPreToolUse"] = _coord_pre_tool_use   # a session coordinator's tools (coordtools.py)
+
+
 def main(argv: list[str]) -> int:
     event = argv[1] if len(argv) > 1 else ""
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except ValueError:
-        return 0
+        if event != COORD_EVENT:
+            return 0
+        payload = {}   # the coordinator's check fails closed: no tool named is a denied tool
     handler = HANDLERS.get(event or payload.get("hook_event_name") or "")
     if not handler:
         return 0
