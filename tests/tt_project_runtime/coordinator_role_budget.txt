@@ -40,3 +40,4 @@
 +210: an urgent goal splits into independent tasks that start at once (no chain without a new file or symbol)
 +70: asks and lulls never for inferred neighbours, serving tags or site rules (user msg #1571)
 +473: approved work runs at once while a refused charter_update's paperwork catches up (yesask.py repair)
++190: a device or machine action reads as under way only once STATE shows it on the host; stops only once the jobs are gone

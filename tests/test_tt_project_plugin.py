@@ -6552,6 +6552,12 @@ def test_docs_say_each_line_once():
         assert not re.findall(r"[a-z,;)] (?:Set|Use|Run|Add|Keep) `", prompt.read_text(encoding="utf-8")), prompt.name
 
 
+def test_the_coordinator_prompt_states_the_on_host_rule():
+    text = " ".join((PLUGIN / "template" / "prompts" / "coordinator.md").read_text(encoding="utf-8").split())
+    assert "A machine or device action is under way only once STATE shows its task `on <resource> since`; " \
+           "before that say 'queued for a worker, ETA X', and a stop is 'stop requested' until its jobs are gone." in text
+
+
 def test_coordinator_prompt_names_the_reply_length_limit():
     """A reply or notify over the chat's 6000 chars goes as parts; over 24000 it is rejected (msgparts)."""
     coordinator = " ".join((PLUGIN / "template" / "prompts" / "coordinator.md").read_text(encoding="utf-8").split())

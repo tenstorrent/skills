@@ -6024,6 +6024,8 @@ def cmd_lock(a) -> None:
     def _logged(mode: str, ls: list[dict], run) -> int:
         # Each take and release goes to the project's activity log (`ttp machines activity`).
         ids = [activity.new_id() for _ in ls]
+        from . import onhost
+        onhost.record(run_dir, [L["res"] for L in ls])   # its task's work starts on the host now
         for aid, L in zip(ids, ls):
             activity.append(p.state, activity.base(p.name, ev="take", id=aid, resource=L["res"], mode=mode,
                                                    cmd=activity.head(cmd), start=time.time(),
@@ -6990,6 +6992,9 @@ def _detach_remote(a, ttp: str) -> None:
             mirror = f" --mirror {shlex.quote(str(rd))}"
         except OSError:
             pass
+    if os.environ.get("TTP_RUN_DIR"):
+        from . import onhost
+        onhost.record(os.environ["TTP_RUN_DIR"], [a.remote], "remote")   # its task's first command on that machine
     if p := here():   # its end is known only on that host: the log keeps the start
         activity.append(p.state, activity.base(p.name, ev="job", id=activity.new_id(), job=a.name,
                                                machine=a.remote, cmd=activity.head(cmd), start=time.time()))

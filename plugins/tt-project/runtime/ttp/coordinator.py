@@ -106,6 +106,7 @@ from . import (   # one name per line: two changes adding names merge without a 
 )
 from . import urgent
 from . import probevars
+from . import onhost
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -1238,6 +1239,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
             held_on.setdefault(held, []).append(t)
     held_on = {k: ts for k, ts in held_on.items() if len(ts) > 1}
     grouped = {t["id"]: k for k, ts in held_on.items() for t in ts}
+    host_est = safe_eta(lambda: eta._Est(db, now), None) if any(onhost.resources(t) for t in rows) else None
     for t in rows:
         if setting_held and settinghold.held_key(t):
             continue
@@ -1251,6 +1253,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         note = f"{anchors.describe(*held, p)}: {note}" if held else note
         clash = file_overlap.digest_note(t)
         note = f"{clash}; {note}" if clash and note else clash or note
+        if host := onhost.line(p, t, now, host_est):   # what may be said of its work on the host
+            note = f"{host}; {note}" if note else host
         cont = continues_id(t)
         title = clip(t["title"], TITLE_CHARS) + (f" (continues #{cont})" if cont else "")
         starts = (starts_text(t, now, where=p, db=db) if t["status"] == "queued" else
@@ -1327,7 +1331,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("user_words", lines, "\n".join(lines[1:]),
             f"## The user's latest words on blocked items: {len(lines) - 1} lines (as last turn; apply them)")
     section("promises", obligations.promise_lines(db, now, home))
-    section("eta", safe_eta(lambda: eta.state_lines(db, p, now), []))
+    section("eta", safe_eta(lambda: eta.state_lines(db, p, now, host=lambda t: onhost.line(p, t, now)), []))
+    section("stops", safe_eta(lambda: onhost.stop_lines(p, now), []))
     lines = []
     sent = db.q("SELECT * FROM messages WHERE direction='out' AND kind IN ('reply','ask','alert') "
                 "ORDER BY id DESC LIMIT ?", (RECENT_OUT * msgparts.MAX_PARTS,))
@@ -2115,6 +2120,27 @@ def _clock(ts: float, where=None) -> str:
     return t.strftime("%H:%M %Z" if t.date() == today.date() else "%Y-%m-%d %H:%M %Z")
 
 
+def _onhost_checked(p: Project, text: str, chat: str | None, a: dict, rest: list, batch_tasks: dict,
+                    notes: list) -> str:
+    """A reply or notify as onhost.guard posts it: a claim that work is under way or done on a host where its
+    task has not started (or was stopped while its jobs run) is sent marked as planned, with the honest
+    status appended. `rest`: the batch's actions not applied yet (task_add and task_update it covers).
+    Any fault posts the text unchanged: a message is never lost to this check."""
+    try:
+        later = [b for _, b in rest if isinstance(b, dict)]
+        updates = {int(b["id"]): b for b in later if b.get("type") == "task_update" and str(b.get("id") or "").isdigit()}
+        tasks = onhost.scope(p, text, chat, a.get("owners") or [], [*batch_tasks, *updates],
+                             onhost.pending(later, p.config()))
+        for t in tasks:
+            if str((updates.get(t.get("id")) or {}).get("status") or "") == "cancelled":
+                t["status"] = "cancelled"   # cancelled later in this batch: its jobs still run until the sweep
+        text, why = onhost.guard(p, text, tasks)
+        notes += why
+    except Exception as e:
+        notes.append(f"onhost: the started-on-host check failed ({type(e).__name__}: {e}); the message went unchecked")
+    return text
+
+
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
           turn: int | None = None, messages: list[int] | None = None, lean: bool = False) -> list[str]:
     """Apply validated actions. Returns human-readable notes about rejected ones, fed back next turn.
@@ -2172,6 +2198,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why := msgparts.too_long(a["text"], "reply"):
                     raise ValueError(why)
                 chat = a.get("chat") or default_chat
+                a["text"] = _onhost_checked(p, a["text"], None if chat in (None, "all") else chat, a, order[k + 1:],
+                                            batch_tasks, notes)
                 replies.append(msgparts.post(db, a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
                                              severity=_norm_severity(a.get("severity") or "normal"))[0])
                 sent.append((replies[-1], chat, a["text"]))
@@ -2873,6 +2901,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError(f"notify rejected: {why}")
                 if why := msgparts.too_long(a["text"], "notify"):
                     raise ValueError(why)
+                a["text"] = _onhost_checked(p, a["text"], None, a, order[k + 1:], batch_tasks, notes)
                 sent.append((msgparts.post(db, a["text"], chat=None, kind="alert",
                                            severity=_norm_severity(a.get("severity")))[0], None, a["text"]))
                 workernotify.handled(db, workernotify.named(a["text"]))

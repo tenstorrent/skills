@@ -385,6 +385,9 @@ def supervise(run_dir: Path) -> int:
         wait_s = min(float(spec.get("exclusive_wait_s") or 600), timeout_s)
         held = _take_exclusive(run_dir, spec.get("exclusive") or [], spec.get("env", {}), started + wait_s,
                                spec.get("holds"), inherited, spec.get("pre_grant"))
+        if held:
+            from . import onhost
+            onhost.record(run_dir, [w.get("resource") for w in spec.get("exclusive") or [] if isinstance(w, dict)])
     def let_go(held: list) -> None:
         if held:
             # The slots may have been handed over from an earlier run's keeper: its jobs keep them.

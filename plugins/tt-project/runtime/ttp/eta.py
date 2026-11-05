@@ -177,6 +177,7 @@ class _Est:
                     "overrun": over}
         legs, path, over = [], [tid], False
         start = now
+        begin = None
         if st == "review":
             if self._review_since is None:
                 self._review_since = self.db.review_since()
@@ -220,6 +221,7 @@ class _Est:
                     if wait is None:
                         return {**self._none(tid, "no measured queue wait yet"), "path": path}
                     legs.append(("queue " + ",".join(locks) if waits else "queue", wait))
+                begin = start + sum(x for _, x in legs)   # when a worker is expected to start it
                 legs.append(("run", _med(runs)))
             done = start + sum(x for _, x in legs)
             if code and self.h["review"]:
@@ -228,7 +230,7 @@ class _Est:
         if code and self.h["land"]:
             legs.append(("landing", _med(self.h["land"])))
             end += legs[-1][1]
-        return {"done": done, "end": end, "path": path, "legs": legs, "why": None, "overrun": over}
+        return {"done": done, "end": end, "path": path, "legs": legs, "why": None, "overrun": over, "start": begin}
 
 
 def estimate(db, tid: int, now: float | None = None, hist: dict | None = None) -> dict:
@@ -368,8 +370,9 @@ def justify(p, oid: str, why: str, now: float | None = None) -> str:
     return f"obligation {oid}: long due justified ({why[:120]})"
 
 
-def state_lines(db, where, now: float | None = None) -> list[str]:
-    """The STATE section: each urgent open task and each open promise with its expected finish."""
+def state_lines(db, where, now: float | None = None, host=None) -> list[str]:
+    """The STATE section: each urgent open task and each open promise with its expected finish. `host`:
+    a task's started-on-host state (onhost.line), shown after its estimate."""
     from . import urgent
     from .obligations import open_promises
     now = time.time() if now is None else now
@@ -380,6 +383,8 @@ def state_lines(db, where, now: float | None = None) -> list[str]:
         return []
     est = _Est(db, now)
     out = ["## Expected finish (critical path, measured medians; quote these, never padded worst cases)"]
-    out += [f"- #{t['id']} {t['title'][:80]}: {field(est.task(t['id']), where, now)}" for t in hot[:10]]
+    for t in hot[:10]:
+        on = host(t) if host else ""
+        out.append(f"- #{t['id']} {t['title'][:80]}: {field(est.task(t['id']), where, now)}" + (f"; {on}" if on else ""))
     out += [f"- promise {o['id']}: {field(obligation_estimate(db, o, now, est), where, now)}" for o in proms[:10]]
     return out
