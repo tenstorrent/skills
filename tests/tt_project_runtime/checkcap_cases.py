@@ -7389,7 +7389,7 @@ def test_a_workers_account_checks_cap_change_is_queued_for_the_daemon_which_appl
     assert len(accountset.apply_requests(p.state, logged.append)) == 1
     assert project.load_account_settings()["checks"]["host_max"] == 2
     rec = _json.loads(accountset.log_path().read_text().splitlines()[-1])
-    assert (rec["by"], rec["task"], rec["new"]) == ("worker", "42", 2) and "undo" in rec
+    assert (rec["by"], rec["task"], rec["new"]) == ("worker", 42, 2) and "undo" in rec
     assert not list((p.state / accountset.REQUESTS).glob("*.json")) and logged
     # A request the user's later value refuses is kept with the reason.
     accountset.queue(p.state, "checks.host_max", 1, {"by": "worker", "task": "43"})

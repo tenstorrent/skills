@@ -20991,7 +20991,7 @@ def test_config_set_still_refuses_every_key_it_refused_before(env):
 
 def test_chat_settable_query_answers_without_setting_and_the_skill_lists_it(env, monkeypatch, capsys):
     _cs_home(env, monkeypatch)
-    from ttp import chatset, cli, endpoint
+    from ttp import accountset, chatset, cli, endpoint
     from ttp.coordinator import USER_SETTABLE
 
     def ask(*argv):
@@ -21002,7 +21002,7 @@ def test_chat_settable_query_answers_without_setting_and_the_skill_lists_it(env,
             rc = e.code
         return rc, capsys.readouterr().out
     rc, out = ask("list")
-    assert rc == 0 and out.split() == [*sorted(USER_SETTABLE), *chatset.PATTERNS]
+    assert rc == 0 and out.split() == [*sorted([*USER_SETTABLE, *accountset.KEYS]), *chatset.PATTERNS]
     assert ask("providers.chat.tiers.light.route_timeout_s", "2700") == (
         0, "providers.chat.tiers.light.route_timeout_s: accepted as 2700\n")
     assert ask("providers.chat.base_url")[0] == 1 and "never set from chat" in ask("providers.chat.base_url")[1]
