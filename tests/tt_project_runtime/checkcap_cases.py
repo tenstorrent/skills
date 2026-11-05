@@ -7534,3 +7534,110 @@ def test_a_workers_account_checks_cap_change_is_queued_for_the_daemon_which_appl
     failed = list((p.state / accountset.REQUESTS).glob("*.failed.json"))
     assert len(failed) == 1 and "set by the user" in _json.loads(failed[0].read_text())["error"]
     assert project.load_account_settings()["checks"]["host_max"] == 6
+
+
+def test_an_urgent_checks_run_takes_a_free_pool_host_at_once_with_every_slot_busy(env, tmp_path, monkeypatch):
+    """#6149 (a): an urgent run (priority 0) with every host-wide slot busy goes to a free host of the
+    account's test pool at once, not after checkspill.after_s."""
+    import io
+    from ttp import checkcap, checkspill, cli
+    p = make(env)
+    p.set_config("delivery.checks_spill_hosts", ["check-host-a"])
+    p.set_config("delivery.checks_spill_after_s", 60)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    monkeypatch.setattr(checkcap, "task_rank", lambda _p: (0, []))
+    monkeypatch.setattr(checkspill, "pick", lambda *_a, **_k: {"host": "check-host-a"})
+    held = checkcap.acquire("routine", priority=3)
+    try:
+        t0 = time.time()
+        slot = cli._checks_slot(p, run_dir, io.StringIO(), "f" * 40, True, cmds=["true"], top=str(p.base), spill=True)
+        assert slot is not None and slot.spill == {"host": "check-host-a"} and slot.f is None
+        assert time.time() - t0 < 20, "no wait for the 60 s spill bound"
+        assert not checkcap.state()["urgent"], "the pool host took it: no urgent slot here"
+    finally:
+        held.close()
+
+
+def test_an_urgent_checks_run_takes_the_reserved_urgent_slot_beyond_a_full_cap(env, monkeypatch):
+    """#6149 (b): with every slot of the cap held (or the run parked), an urgent run takes the reserved
+    urgent slot at once; one only (checks.urgent_slots), never a routine run's, and 0 turns it off."""
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.delenv(checkcap.URGENT_SLOTS_ENV, raising=False)
+    assert checkcap.urgent_slots() == checkcap.URGENT_SLOTS == 1
+    held = checkcap.acquire("routine", priority=3)
+    told = []
+    try:
+        assert checkcap.acquire("late routine", priority=3, urgent=True, max_wait_s=0.5) is None
+        u = checkcap.acquire("urgent", priority=0, urgent=True, tell=told.append, max_wait_s=30)
+        assert u is not None and u.urgent and u.f is not None and checkcap.URGENT_LINE in told
+        assert checkcap.state()["urgent"] == ["urgent"] and "urgent slot beyond the cap: urgent" in checkcap.line()
+        assert checkcap.urgent_key(u).startswith("urgent:"), "its test lane is the reserved one"
+        monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "0")   # with none free a second one does not get one
+        assert checkcap.acquire("urgent 2", priority=0, urgent=True, max_wait_s=0.5) is None
+        u.close()
+        parked = checkcap.acquire("urgent parked", priority=0, urgent=True, startable=lambda: False, max_wait_s=0.5)
+        assert parked is None, "turned off: it waits as before"
+        monkeypatch.delenv(checkcap.URGENT_SLOTS_ENV)
+        parked = checkcap.acquire("urgent parked", priority=0, urgent=True, startable=lambda: False, max_wait_s=30)
+        assert parked is not None and parked.urgent, "a parked urgent run takes it too"
+        parked.close()
+    finally:
+        held.close()
+
+
+def test_an_urgent_checks_run_with_no_urgent_slot_preempts_the_lowest_priority_routine_run(env, monkeypatch):
+    """#6149 (c): no urgent slot free, an urgent run asks the lowest-priority preemptible routine run on a
+    slot of the cap to give it up (never an urgent one) and takes the slot it frees."""
+    import threading
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "3")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "0")
+    monkeypatch.setattr(checkcap, "POLL_S", 0.1)
+    hold = [checkcap.acquire("urgent other", priority=0, preemptible=True),
+            checkcap.acquire("routine 2", priority=2, preemptible=True),
+            checkcap.acquire("routine 5", priority=5, preemptible=True)]
+    told, got = [], []
+    t = threading.Thread(target=lambda: got.append(checkcap.acquire("urgent", priority=0, urgent=True,
+                                                                    tell=told.append, max_wait_s=30)))
+    t.start()
+    try:
+        assert _wait_for(lambda: any(checkcap.PREEMPT_LINE.format("routine 5") == m for m in told)), told
+        assert checkcap.preempted(hold[2].since) == "urgent"
+        assert checkcap.preempted(time.time() + 60) == "", "a request older than the slot is not for it"
+        hold[2].close()
+        t.join(30)
+        assert got and got[0] is not None and got[0].f is not None and not got[0].urgent
+    finally:
+        checkcap.clear_preempt()
+        for h in hold + got:
+            if h is not None:
+                h.close()
+
+
+def test_a_preempted_routine_checks_run_requeues_at_its_old_place_and_runs_again(env, tmp_path, monkeypatch, capsys):
+    """#6149 (c): a routine run asked for its slot (checkcap.preempt) ends its command, frees the slot and
+    queues again at its first arrival, then runs to its result."""
+    from ttp import checkcap, checkwall, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setattr(checkwall, "POLL_S", 0.1)
+    real, arrivals = checkcap.acquire, []
+    monkeypatch.setattr(checkcap, "acquire",
+                        lambda *a, **k: arrivals.append((a[5] if len(a) > 5 else k.get("since"), k.get("preemptible")))
+                        or real(*a, **k))
+    mark, req = tmp_path / "ran-once", checkcap.slot_dir() / f"{checkcap.PREEMPT}.{os.getpid()}.json"
+    script = (f'if [ -e {mark} ]; then exit 0; fi; touch {mark}; '
+              f'printf \'{{"by": "urgent u", "at": %s}}\' "$(($(date +%s) + 1))" > {req}; sleep 60')
+    t0 = time.time()
+    cli.main(["checks", "--", "sh", "-c", script])
+    out = capsys.readouterr().out
+    assert time.time() - t0 < 45, "its command ended once asked"
+    assert "urgent u (urgent) needed this host-wide checks slot" in out, out
+    assert len(arrivals) == 2 and arrivals[0] == arrivals[1] and arrivals[0][1], "it queued again at its old place"
+    assert not req.exists() and checkcap.line() == ""
+    assert mark.exists()

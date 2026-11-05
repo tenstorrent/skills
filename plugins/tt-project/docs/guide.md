@@ -1558,7 +1558,16 @@ running work is interrupted only by the preemption below:
   project leave it their next free test slots. More urgent runs keep their precedence under a backlog,
   but once `checks.priority_turns` N of them (default 3 when it is unset; 0 lets the aged run go first)
   started while it waited, the aged run takes the next turn, so it still starts within a bound; priority-0
-  runs are never held by a less urgent one. While any run waits for test slots, push
+  runs are never held by a less urgent one. An urgent run (priority 0 or 1: a task owed to the user,
+  live-impact work) that would wait with every slot busy starts within about a minute, in this order:
+  on a free host of the account's test pool at once (no `checks_spill_after_s` wait first; a paused
+  host is never picked); else on a reserved urgent slot beyond the cap, with a reserved test lane past
+  its project's cap (`checks.urgent_slots`, account-level, env `TTP_CHECKS_URGENT_SLOTS`, default 1, so
+  at most that many urgent runs above the cap at once; 0 turns them off); else it asks the
+  lowest-priority routine run on a cap slot to step back. That run ends its current command, frees its
+  slots and queues again at its old arrival, keeping its place and every pass and log it recorded, and
+  the urgent run takes the freed slot. Another urgent run or a push check is never asked; `ttp status`
+  shows `urgent slot beyond the cap: ...` while one runs. While any run waits for test slots, push
   checks use only their branch's reserved test slot. There is no
   separate outage marker: priority 1 is the signal. Accepted gap: while a host mixes runtimes from
   before this, their waiters may disagree on who is next and a slot can sit idle until another frees.

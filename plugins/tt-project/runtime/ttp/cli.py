@@ -3536,6 +3536,10 @@ def cmd_checks(a) -> None:
         handover = bool(todo) and not hit and slot is None
         # The slots here stayed busy and a spill host took the run: its checks run there (remotecheck).
         spilled = getattr(slot, "spill", None) if slot is not None and not hit else None
+        # A routine run on a slot of the cap gives it up when an urgent run asks (checkcap.preempt).
+        preempted_by = ""
+        if slot is not None and not hit and not spilled and getattr(slot, "f", None) and not slot.urgent:
+            _CHECK_PREEMPT["since"] = slot.since
         if spilled:
             if slurm := getattr(spilled, "slurm", None):   # one batch job per check, --time from the run's median
                 minutes = slurmcheck.time_min(checklane.median_s(p.state, _commands_hash(todo)), slurm)
@@ -3752,7 +3756,12 @@ def cmd_checks(a) -> None:
                     timed_out = {"check": str(py_check), "cap_s": wall, "how": wall_how, "head": head,
                                  "run": os.environ.get("TTP_RUN_ID") or "?"}
                     out.write(f"ttp checks: {checkwall.said(str(py_check), wall, wall_how, head)}\n")
+        except checkcap.Preempted as e:
+            preempted_by = str(e)
         finally:
+            if _CHECK_PREEMPT["since"] is not None:   # a request it never saw is for no later run
+                _CHECK_PREEMPT["since"] = None
+                checkcap.clear_preempt()
             if reap_tok:
                 _checks_reaped(out, reap_tok, reap_rec, clean, rc)
             elif clean is not None:
@@ -3761,6 +3770,23 @@ def cmd_checks(a) -> None:
                 signal.signal(sig, h)
             if stop_handlers:
                 _CHECK_STOP["stopped"] = None
+        if preempted_by:
+            # What it recorded stays (passes, logs); the command it ran ended, and the run queues again at
+            # its arrival, its old place, as a spill host's rerun does.
+            checkcap.clear_preempt()
+            said = (f"{preempted_by} (urgent) needed this host-wide checks slot: these checks stopped and queue "
+                    f"again at their arrival {timefmt.clock(now=arrived)}")
+            out.write(f"ttp checks: {said}\n")
+            out.flush()
+            print(f"ttp checks: {said}", flush=True)
+            if slot:
+                slot.close()
+            os.environ[checkcap.ARRIVED_ENV] = str(arrived)
+            if no_spill:
+                os.environ[checkspill.OFF_ENV] = "1"
+            if join_rec:
+                checkjoin.forget(p.state)
+            return cmd_checks(a)
         if ran_since and p:
             if timed_out and spilled:
                 pass   # a spill host's wall time (a slower host, a stalled link) is no timeout of the task's: rerun here
@@ -4522,6 +4548,10 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     spill_to = bool(spill and p)
     told: set[str] = set()
     first = True
+    # An urgent run never waits behind routine ones (checkcap: urgent slots): it tries the pool's hosts at once
+    # (a first bound of 0 s here), then, with none free, a reserved urgent slot here, before the Slurm overflow.
+    urgent = checkcap.is_urgent(prio)
+    pool_first = urgent and spill_to and bool(checkspill.hosts(cfg))
     moved = _HeadMoved(top, head)   # its task replacing the head while it waits drops the run
     while True:
         limit = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
@@ -4537,11 +4567,12 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
                 return slot
         first = False
         if spill_to:   # a bounded wait here, then the spill hosts, then wait again in the same place
-            limit = checkspill.after_s(spill_cfg) if limit is None else min(limit, checkspill.after_s(spill_cfg))
+            bound = 0.0 if pool_first else checkspill.after_s(spill_cfg)
+            limit = bound if limit is None else min(limit, bound)
         try:
             slot = _checks_slot_take(p, run_dir, out, head, tell, waiting, limit, arrived, same, done, prio, owns,
                                      cfg, repo, cmds, what, top, lock, restart=detached, yielder=yielder,
-                                     moved=moved)
+                                     moved=moved, urgent=urgent and not pool_first)
         except checkcap.Upgraded as e:
             if p:   # its checkjoin record goes: the re-executed run registers again at the same arrival
                 checkjoin.forget(p.state)
@@ -4557,6 +4588,9 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             slot = checkcap.Slot()
             slot.spill = claim
             return slot
+        if pool_first:   # no pool host free: an urgent slot here next, the overflow only after it
+            pool_first = False
+            continue
         # No pool host could take it: the account's Slurm overflow (slurmcheck), urgent runs first. Its batch
         # job runs no spill wrapper and a wrapped check never runs unwrapped, so a wrapped run waits here.
         if not _spill_wrapped(cmds, spill_cfg) and (claim := slurmcheck.pick(p, spill_cfg, lambda line: line in told or (told.add(line), tell(line)),
@@ -4610,7 +4644,7 @@ def _git_out(top: str, *args: str) -> str:
 
 def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: float | None, arrived, same: str,
                       done, prio, owns, cfg: dict, repo: str, cmds: list, what: str, top: str = "",
-                      lock: str = "", restart: bool = False, yielder=None, moved=None):
+                      lock: str = "", restart: bool = False, yielder=None, moved=None, urgent: bool = False):
     """One wait of _checks_slot for the repository's lane (or `lock`'s), a host-wide checks slot and
     test-worker slots, at most `limit` seconds (None: no limit): the slot, or None once `limit` passed.
     With `restart` (detached checks), a newer runtime installed while it waits (checkcap.upgraded) ends the
@@ -4618,7 +4652,9 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
     the slot is granted and the commands may start. A host-wide checks slot granted before such an
     upgrade is kept across the re-execution with its lane (checkcap.keep_slot). `yielder()` as for _checks_slot: its checkjoin.Yield
     ends the wait with all it held let go. `moved()` (_HeadMoved), asked with the cancel request, names why
-    the run is dropped once its task replaced the head it waits for: the wait ends as a cancel does."""
+    the run is dropped once its task replaced the head it waits for: the wait ends as a cancel does. With
+    `urgent` an urgent run that would wait for the host-wide slot takes a reserved urgent one (checkcap.acquire),
+    with its reserved test lane and past its project's cap and repository's lanes of running checks."""
     from . import checkcap, checkjoin, checklane, cleantree, push, testslots
     t0 = time.time()
 
@@ -4709,7 +4745,8 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                                     p.state if p else None, owns, cap=checklane.project_cap(cfg), lane_at=lane_at,
                                     startable=startable,
                                     parks=lambda on: testslots.lane_waits(
-                                        suite, testslots.PARKED_WAITS if on else "a host-wide checks slot"))
+                                        suite, testslots.PARKED_WAITS if on else "a host-wide checks slot"),
+                                    urgent=urgent, preemptible=True)
             kept_slot = None
             if slot is None or slot.served:
                 suite.close()
@@ -4719,7 +4756,8 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
             left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
             testslots.lane_waits(suite, testslots.SLOT_WAITS)
             slot.tests = testslots.acquire(checkcap.label(p.name if p else None), tell, left,
-                                           p.config() if p else {}, p.name if p else "", priority=prio, stop=stop,
+                                           p.config() if p else {}, p.name if p else "",
+                                           push_key=checkcap.urgent_key(slot), priority=prio, stop=stop,
                                            since=arrived, full=True,   # a full run waits for checks.test_run_min
                                            waits=lambda w: testslots.lane_waits(suite, w))
             if slot.tests is None:
@@ -4728,6 +4766,8 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                 return None
             # Only now does its lane count against the project's cap and its repository's lanes, if both
             # have room; else its grants go back and it waits for a running suite to end, then queues again.
+            if slot.urgent and testslots.claim_running(suite, p.name if p else None, lambda n: n + 1, 0):
+                break   # its reserved slot is beyond every cap: no bound of running checks holds it
             if testslots.claim_running(suite, p.name if p else None, lanes_now, checklane.project_cap(cfg)):
                 break
             slot.close()
@@ -4990,6 +5030,18 @@ def _check_popen(argv: list, **kw) -> subprocess.Popen:
         signal.pthread_sigmask(signal.SIG_BLOCK, _CHECK_STOP_SIGNALS)
 
 
+# When the running checks' slot of the cap was granted, while an urgent run may ask for it (checkcap.preempt).
+_CHECK_PREEMPT: dict = {"since": None}
+
+
+def _checks_preempt_stop() -> None:
+    """checkwall.wait's `stop` for the running checks: raises checkcap.Preempted once an urgent run asked
+    for their slot."""
+    from . import checkcap
+    if (since := _CHECK_PREEMPT["since"]) is not None and (by := checkcap.preempted(since)):
+        raise checkcap.Preempted(by)
+
+
 def _checks_stop(sig, _frame):
     """The detached checks' stop handler: exit 128+sig, deferred while a check starts or is ended."""
     _CHECK_STOP["stopped"] = _CHECK_STOP["stopped"] or 128 + sig
@@ -5095,7 +5147,8 @@ def _run_check(argv: list, group: bool, record=None, timeout: float | None = Non
         _CHECK_STOP["defer"] = False
         if _CHECK_STOP["pending"]:
             raise SystemExit(_CHECK_STOP["pending"])
-        rc = checkwall.wait(proc, kw.get("stdout"), timeout, silent_s)
+        rc = checkwall.wait(proc, kw.get("stdout"), timeout, silent_s,
+                            stop=_checks_preempt_stop if _CHECK_PREEMPT["since"] is not None else None)
         _reap_check(proc, group, kw)
         return rc
     except BaseException:

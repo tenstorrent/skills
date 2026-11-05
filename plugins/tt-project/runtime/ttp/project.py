@@ -2648,7 +2648,7 @@ def unregister(name: str) -> None:
 # project's own project.json, so the projects on a machine agree unless one overrides a key.
 ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_spend_to"}, "pricing": {"claude"},
                 "route": {"host_max"},   # routed runs per provider at once on this host (route.host_limit)
-                "checks": {"host_max", "load_extra", "live_cores", "nice", "ionice", "priority_turns", "test_pool", "test_run_max",
+                "checks": {"host_max", "load_extra", "live_cores", "nice", "ionice", "priority_turns", "urgent_slots", "test_pool", "test_run_max",
                            "test_project_max", "test_project_slots", "test_project_workers", "load_guard", "build_pool", "build_run_max", "build_project_max", "wall_cap_s",
                            "slots", "light_cmds", "max_wait_s", "wait_event_s", "priority_age_s",
                            "wait_escalate_s", "wait_hang_factor", "done_holder_flag_s", "done_holder_grace_s", "stall_s", "starve_s",

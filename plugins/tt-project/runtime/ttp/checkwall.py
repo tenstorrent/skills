@@ -149,19 +149,20 @@ def silent_limit(check) -> float:
     return SILENT_S if v is None else float(v)
 
 
-def wait(proc: subprocess.Popen, out, timeout: float | None, silent_s: float) -> int:
+def wait(proc: subprocess.Popen, out, timeout: float | None, silent_s: float, stop=None) -> int:
     """`proc`'s exit code. subprocess.TimeoutExpired past `timeout` seconds; Silent once the file `out`
-    (its output) has not grown for `silent_s` seconds (0, or an `out` with no file, watches nothing)."""
+    (its output) has not grown for `silent_s` seconds (0, or an `out` with no file, watches nothing).
+    `stop()`, called every POLL_S while it runs, may raise to end the wait (checkcap.Preempted)."""
     try:
         fd = out.fileno() if silent_s > 0 and out is not None else None
     except (AttributeError, OSError, ValueError):
         fd = None
-    if fd is None:
+    if fd is None and stop is None:
         return proc.wait(timeout=timeout)
 
     def size() -> int:
         try:
-            return os.fstat(fd).st_size
+            return os.fstat(fd).st_size if fd is not None else 0
         except OSError:
             return -1
 
@@ -177,6 +178,10 @@ def wait(proc: subprocess.Popen, out, timeout: float | None, silent_s: float) ->
         now = clock()
         if end is not None and now >= end:
             raise subprocess.TimeoutExpired(proc.args, timeout)
+        if stop is not None:
+            stop()
+        if fd is None:
+            continue
         if (grown := size()) != last:
             last, quiet_since = grown, now
         elif now - quiet_since >= silent_s:
