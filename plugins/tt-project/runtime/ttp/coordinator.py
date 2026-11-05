@@ -452,6 +452,8 @@ USER_SETTABLE = {
     "providers.codex.worker_isolation": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # Unset, chat takes the claude value (project.CHAT_INHERITS); set, it wins.
     "providers.chat.worker_isolation": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    # The worker sandbox: false runs workers unfenced. Set only in a turn carrying the user's word (NEEDS_USER).
+    **{f"providers.{n}.write_fence": lambda v: str(v).lower() in ("1", "true", "yes", "on") for n in chatset.PROVIDERS},
     # MCP servers from the user's own Claude config that isolated workers still get, by name.
     "providers.claude.mcp_servers": lambda v: name_list(v, strict=True),
     # Connected MCP servers kept from workers on purpose: ttp status no longer names them (mcpgap.py).
@@ -1509,6 +1511,11 @@ NEEDS_USER = {"budget.daily_usd": "spend", "budget.weekly_usd": "spend", "budget
               "delivery.allow_protected_push_branch": "restriction", "delivery.own_push": "restriction",
               "delivery.rebase_replace": "restriction", "delivery.never_force": "restriction",
               MERGE_KEY: "merge", relay.AGENT_KEY: "restriction"}
+# The worker sandbox (providers.<name>.write_fence) is the user's, both ways: a harness-wide order of theirs
+# (such as unsandboxed runs) sets it for every project, and no project turns it back on or off on its own
+# judgement. `ttp config` refuses it inside a run, as every NEEDS_USER key.
+SANDBOX_KEYS = {f"providers.{n}.write_fence" for n in chatset.PROVIDERS}
+NEEDS_USER.update(dict.fromkeys(SANDBOX_KEYS, "restriction"))
 SAFE_WHEN_OFF = {relay.AGENT_KEY, "delivery.code_tasks_may_push", "budget.reset_credits_auto", "delivery.backup_remote", "delivery.fast_forward_also",
                  "delivery.mirror_remotes",
                  "delivery.allow_protected_push_branch", "delivery.own_push", "delivery.rebase_replace",
@@ -1517,7 +1524,7 @@ SAFE_WHEN_OFF = {relay.AGENT_KEY, "delivery.code_tasks_may_push", "budget.reset_
 # spend and access are hard gates, the merge list speaks as the owner, the rest change what may land on or
 # overwrite a branch other people use. The agent-orders trust itself is the owner's to turn on.
 HELD_SETTING = {k: {"spend": "gate", "access": "gate", "merge": "speaks"}.get(v, "people")
-                for k, v in NEEDS_USER.items() if k != relay.AGENT_KEY}
+                for k, v in NEEDS_USER.items() if k != relay.AGENT_KEY and k not in SANDBOX_KEYS}
 # The value that turns a SAFE_WHEN_OFF key off (the safe side), where it is not False, "" or [].
 OFF_VALUE = {"delivery.own_push": "off", "delivery.rebase_replace": "new_branch", "delivery.never_force": True}
 

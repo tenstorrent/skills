@@ -254,6 +254,10 @@ Company-wide practice; the long form is in the `tt-project:setup-box` skill's re
   `ttp host-run --result <id>` (its output, its exit code). A lock that must cover the whole run:
   `ttp detach <name> --lock <res> -- ttp host-run -- <command...>`, not `ttp lock` around `--detach`
   (which frees the lock once the run started).
+- The worker sandbox (`providers.<name>.write_fence`) is the user's setting: `ttp config` refuses it
+  inside a run and the coordinator sets it only in a turn carrying the user's word. A user's
+  harness-wide order (such as unsandboxed runs) applies to every project; a project never opts out
+  on its own judgement: it records the workaround it relied on instead.
 - A fenced Claude worker's `ssh`, `scp`, `sftp`, `rsync` and `ttp lock` run outside the Bash sandbox
   only as a simple command on its own (also after `timeout N`); the hook refuses them beside `&&`, `;`,
   a pipe, a file redirect or a substitution. A project's own host-reaching command (a script in its

@@ -44,3 +44,4 @@
 +70: wake_now only when the worker must act before its wait ends; priority 1 alone is no spec wake (#5955)
 +140: user_msg marks a task as the user's newer order on a resource (userorder.py)
 +480: a user order and reply/notify claims in the ledger; Must act now items are acted on in the same turn (mustact.py)
++230: the worker sandbox is the user's (config_set row): a harness-wide order binds every project, no opt-out
