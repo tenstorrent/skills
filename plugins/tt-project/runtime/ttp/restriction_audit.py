@@ -106,8 +106,10 @@ def tool_terms(old: str, new: str, charter: str = "",
     words = clause_words(changed)
     if not new:
         words = distinctive_words(words, lines)
-    # A cite the new text keeps names the item as it now stands: no sign of its old wording.
-    exact = {t for t in exact_terms(changed, new + "\n" + charter) if not re.search(rf"{t}(?!\d)", new)}
+    # A cite the new text keeps names the item as it now stands: no sign of its old wording. Only "#N" cites:
+    # exact_terms already drops a phrase `new` keeps, and a phrase is user text, never a regex.
+    exact = {t for t in exact_terms(changed, new + "\n" + charter)
+             if not (t.startswith("#") and re.search(rf"{re.escape(t)}(?!\d)", new))}
     return ids, words, exact
 
 

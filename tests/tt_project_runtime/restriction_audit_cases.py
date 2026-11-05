@@ -458,6 +458,27 @@ def test_a_change_touching_three_items_queues_exactly_one_task(env):
     assert len(p.db.q("SELECT 1 FROM tasks WHERE labels LIKE '%restriction_tools:%'")) == 1
 
 
+def test_a_changed_clause_quoting_regex_metacharacters_still_yields_its_terms_and_one_task(env):
+    """A quoted phrase is user text, never a regex: an unbalanced '(', a backslash, a leading '*' or a '+'
+    in a changed clause still gives its phrase as an exact term, a cite the new text keeps is still no term,
+    and restriction_tools queues its one task."""
+    from ttp import restriction_audit
+    old = ('Never run "stress (all chips" or "dump c:\\logs\\x" or "*glob all" or "a+ b" on a shared rack.'
+           ' (user msg #7)')
+    new = "Run stress only at night. (user msg #7)"
+    ids, words, exact = restriction_audit.tool_terms(old, new)
+    assert {"stress (all chips", "dump c:\\logs\\x", "*glob all", "a+ b"} <= exact, exact
+    assert "#7" not in exact, exact
+    assert restriction_audit.tool_hit('# refuse "stress (all chips" here', ids, words, exact) == ["stress (all chips"]
+    p = make(env)
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- " + new + "\n")
+    (p.root / "bin").mkdir(exist_ok=True)
+    (p.root / "bin" / "stress.sh").write_text('#!/bin/sh\n# refuse "stress (all chips" on a shared rack\nexit 1\n')
+    out = restriction_audit.restriction_tools(p, [(old, new, "")], [])
+    assert len(out) == 1 and "bin/stress.sh:2" in out[0], out
+    assert len(p.db.q("SELECT 1 FROM tasks WHERE labels LIKE '%restriction_tools:%'")) == 1
+
+
 # The audit runs on the daemon's tick thread (coordinator.apply in reap_runs): it tokenizes the tool lines
 # once and is bounded by AUDIT_BUDGET_S, failing open with a note.
 def _synthetic_words(n):
