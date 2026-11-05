@@ -40,7 +40,7 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
 
 def _temp_roots() -> list[Path]:
     out = []
-    for d in (os.environ.get("TMPDIR"), tempfile.gettempdir(), "/tmp", "/var/tmp"):
+    for d in (os.environ.get("TMPDIR"), tempfile.gettempdir(), "/tmp", "/var/tmp", "/dev/shm"):
         if d:
             try:
                 out.append(Path(d).resolve())
@@ -79,6 +79,9 @@ def transient(text: str, cwd: str | Path, base: str | None, head: str = "HEAD") 
         return []
     temps = _temp_roots()
     for name in named:
+        if not os.path.isabs(name) and top and (changed is None or any(c == name or c.endswith(f"/{name}")
+                                                                        for c in changed)):
+            return []   # relative to a folder the check may have changed to: perhaps a file the change touches
         path = Path(name) if os.path.isabs(name) else cwd / name
         try:
             if not path.is_file():
