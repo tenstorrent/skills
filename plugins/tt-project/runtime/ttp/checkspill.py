@@ -289,14 +289,10 @@ def lock_busy(p, cfg: dict, alias: str) -> str:
     return "" if rc == 0 else str(said).split(": ", 1)[-1]
 
 
-def device_locks_of(cfg: dict, alias: str, known: dict | None = None) -> list[str]:
-    """The `ttp lock` resources that are `alias`'s device: `<alias>-device`, the device names its
-    machines-list `shared` entry gives, and the config's device.locks on it (the alias, `<alias>-...` or
-    `<alias>:...`), each under its own name (another project holds it so in the shared locks) and, when that
-    is also a name of `alias` or device.hosts or device.runners puts it there, as the lock this project's
-    `ttp lock` takes for it (locks.canonical). A canonical lock of another host is not probed: its hold
-    would keep `alias` off the pool for no device job there."""
-    from . import hostmap, locks, machines
+def _device_names(cfg: dict, alias: str, known: dict | None = None) -> list[str]:
+    """`alias`'s device names: `<alias>-device`, the device names its machines-list `shared` entry gives, and
+    the config's device.locks on it (the alias, `<alias>-...` or `<alias>:...`)."""
+    from . import locks, machines
     known = machines.load() if known is None else known
     dev = locks.device_locks(cfg)
     names = [alias + DEVICE_SUFFIX]
@@ -304,19 +300,23 @@ def device_locks_of(cfg: dict, alias: str, known: dict | None = None) -> list[st
     if isinstance(got, list):
         names += [x for x in got if isinstance(x, str) and x and x != alias and (x.endswith(DEVICE_SUFFIX) or x in dev)]
     names += sorted(d for d in dev if d == alias or d.startswith((alias + "-", alias + ":")))
-    tab = hostmap.table(cfg)
-    out = []
-    for n in names:
-        c = locks.canonical(cfg, n)
-        out += [n] + ([c] if c in names or tab.get(c) == alias else [])
-    return list(dict.fromkeys(out))
+    return list(dict.fromkeys(names))
 
 
-def _lock_held(p, cfg: dict, res: str) -> str:
+def device_locks_of(cfg: dict, alias: str, known: dict | None = None) -> list[str]:
+    """The `ttp lock` resources that are `alias`'s device: each of its device names (_device_names) under its
+    own name (another project holds it so in the shared locks) and as the lock this project's `ttp lock`
+    takes for it (locks.canonical, device.locks' first name)."""
+    from . import locks
+    return list(dict.fromkeys(r for n in _device_names(cfg, alias, known) for r in (n, locks.canonical(cfg, n))))
+
+
+def _lock_held(p, cfg: dict, res: str, shared_too: bool = True) -> str:
     """"" when nobody holds, reserves or waits for lock `res`, here (where this project's `ttp lock` takes
-    it) or in the user's shared locks (another project that shares it), else the probe's line."""
+    it) or, with `shared_too`, in the user's shared locks (another project that shares it), else the probe's
+    line."""
     from . import lockprobe, locks, shared
-    dirs = list(dict.fromkeys([shared.locks_dir(p, res, cfg), shared.root() / res]))
+    dirs = list(dict.fromkeys([shared.locks_dir(p, res, cfg), *([shared.root() / res] if shared_too else [])]))
     for d in dirs:
         paths = list(dict.fromkeys([*locks.slot_paths(d, res, shared.slots(p, res, cfg)),
                                     *sorted(Path(d).glob(f"{res}.*.lock"))]))
@@ -378,9 +378,12 @@ def broker_job(p, alias: str) -> str:
 def device_busy(p, cfg: dict, alias: str) -> str:
     """"" when no device job runs on `alias` as far as this machine can tell, else why: a device lock of it
     held, reserved or waited for (device_locks_of), or a running job its broker reports (broker_job)."""
-    for res in device_locks_of(cfg, alias):
-        try:
-            if said := _lock_held(p, cfg, res):
+    from . import machines
+    known = machines.load()
+    names = _device_names(cfg, alias, known)
+    for res in device_locks_of(cfg, alias, known):
+        try:   # a canonical lock that is no device name of alias: only where this project's `ttp lock` takes it
+            if said := _lock_held(p, cfg, res, shared_too=res in names):
                 return f"a device job runs there: {said}"
         except OSError as e:
             return f"its device lock {res} cannot be read: {e}"

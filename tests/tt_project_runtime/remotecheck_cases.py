@@ -741,36 +741,35 @@ def test_spill_device_gate_sees_every_device_lock_of_the_host_and_only_that_host
 def test_spill_device_gate_probes_the_hosts_shared_device_lock_when_device_locks_lists_another_name_first(
         env, tmp_path, monkeypatch):
     """device.locks lists another name first, so this project's `ttp lock <alias>-device` takes that
-    name's lock. Another project's hold of `<alias>-device` in the shared locks still keeps the host off
-    the pool, and a hold of only the other name does not, unless device.hosts puts that name on the host."""
-    from ttp import checkspill, shared
+    name's lock (locks.canonical). That hold keeps the host off the pool, and so does another project's
+    hold of `<alias>-device` in the shared locks. Another project's hold of only the other name in the
+    shared locks, a name this project does not share, does not."""
+    from ttp import checkspill, locks, shared
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
     p.set_config("device.locks", ["other-device", "check-host-a-device"])
     cfg = p.config()
-    assert checkspill.device_locks_of(cfg, "check-host-a") == ["check-host-a-device"]
+    canon = locks.canonical(cfg, "check-host-a-device")
+    assert canon == "other-device"
+    assert checkspill.device_locks_of(cfg, "check-host-a") == ["check-host-a-device", "other-device"]
     told: list[str] = []
-    h = _device_hold(p, "check-host-a-device", shared.root() / "check-host-a-device", "otherproj task #9 (run 1)")
-    try:
-        assert "check-host-a-device: busy (held by" in checkspill.device_busy(p, cfg, "check-host-a")
-        assert checkspill.pick(p, cfg, told.append, "pytest -q") is None, "the only host is skipped"
-        assert "check-host-a (a device job runs there: check-host-a-device: busy" in told[-1], told
-    finally:
-        h.close()
-    for where in (None, shared.root() / "other-device"):   # this project's hold, then another project's
-        h = _device_hold(p, "other-device", where)
+    for res, where, who in (
+            (canon, None, "task #4 (run 2)"),   # this project's `ttp lock check-host-a-device -- <job>`
+            ("check-host-a-device", shared.root() / "check-host-a-device", "otherproj task #9 (run 1)")):
+        h = _device_hold(p, res, where, who)
         try:
-            assert checkspill.device_busy(p, cfg, "check-host-a") == "", where
-            got = checkspill.pick(p, cfg, told.append, "pytest -q")
-            assert got is not None and got.host == "check-host-a", told
-            got.close()
+            assert f"{res}: busy (held by" in checkspill.device_busy(p, cfg, "check-host-a"), res
+            assert checkspill.pick(p, cfg, told.append, "pytest -q") is None, "the only host is skipped"
+            assert f"check-host-a (a device job runs there: {res}: busy" in told[-1], told
         finally:
             h.close()
-    p.set_config("device.hosts", {"other-device": "check-host-a"})   # the other name is this host after all
-    cfg = p.config()
-    assert checkspill.device_locks_of(cfg, "check-host-a") == ["check-host-a-device", "other-device"]
-    h = _device_hold(p, "other-device")
+        assert checkspill.device_busy(p, cfg, "check-host-a") == ""
+    assert shared.locks_dir(p, "other-device", cfg) != shared.root() / "other-device"
+    h = _device_hold(p, "other-device", shared.root() / "other-device", "otherproj task #9 (run 1)")
     try:
-        assert "other-device: busy (held by" in checkspill.device_busy(p, cfg, "check-host-a")
+        assert checkspill.device_busy(p, cfg, "check-host-a") == ""
+        got = checkspill.pick(p, cfg, told.append, "pytest -q")
+        assert got is not None and got.host == "check-host-a", told
+        got.close()
     finally:
         h.close()
 
