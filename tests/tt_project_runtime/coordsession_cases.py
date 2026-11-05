@@ -168,6 +168,15 @@ def test_coordsession_a_fresh_prompt_above_the_old_140k_default_still_resumes(tm
     assert (st["context_tokens"], st["base_tokens"]) == (186348, 145065)
     assert cs.limit(_cs_cfg(), st, "m") == 245065
     assert cs.decide(_cs_cfg(), st, "k1", "m", "high", lambda s: True, 20.0) == ("resume", "continued")
+    # Observed first calls per wake (stateless 139.7k and 140.1k, fresh sessions 142.5k-153.9k):
+    # a five-call turn sums to 700k+, yet its last call stays well under the limit.
+    for first in (139700, 140100, 142500, 148500, 153900):
+        use = Claude().parse(_cs_stream(tmp_path / f"w{first}.jsonl",
+                                        [(first + 3000 * n, 600) for n in range(5)]))
+        assert use.input_tokens + use.cache_read_tokens + use.cache_write_tokens + use.output_tokens > 700000
+        st = cs.record(None, use, "", turn, True, 10.0)
+        assert (st["context_tokens"], st["base_tokens"]) == (first + 12600, first)
+        assert cs.decide(_cs_cfg(), st, "k1", "m", "high", lambda s: True, 20.0) == ("resume", "continued")
 
 
 def test_coordsession_mode_is_chat_settable(env, capsys):
